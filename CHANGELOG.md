@@ -85,6 +85,14 @@
   - *Goose (schema 16).* Titles from `name`; `metadata_json` usage/model; `document` and
     `error` blocks; bare-array and rmcp-3 tool results; millisecond timestamps.
   - *Gemini/Qwen.* Second (sandbox) storage root; cwd from `projects.json`/`.project_root`.
+  - *OpenClaw.* Live sessions and transcripts moved to `agents/<id>/agent/openclaw-agent.sqlite`
+    on 2026-07-11; discovery now reads `session_windows`/`session_nodes` and replays
+    `transcript_events` (each row is the old JSONL line) through the same parser, deduping
+    legacy JSONL twins; v4 `leaf`/`appendMode: side` branch controls are followed (a port of
+    OpenClaw's tree navigation) so only the visible branch is emitted in lean passes;
+    `compaction`/`reset`/`branch_summary`/`custom_message` become System notes,
+    `session_info.name` the title, `model_change` the model; checkpoint/trajectory/archive
+    siblings are excluded from discovery.
 
 ## 0.10.0 (2026-07-17)
 
