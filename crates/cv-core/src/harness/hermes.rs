@@ -295,13 +295,18 @@ fn latest_of(stamps: [Option<f64>; 3]) -> Option<DateTime<Utc>> {
         .and_then(secs_to_dt)
 }
 
-/// One `SessionRef` per LISTABLE session, mirroring Hermes's own picker
-/// (`hermes_state_sessions.py _session_filter_where` + `_LISTABLE_CHILD_SQL`): `archived = 0 AND
-/// hidden = 0` where those columns exist, no delegate sub-agent runs (`model_config._delegate_from`),
-/// and no compression ANCESTORS — a session that ended in compression and has a continuation is
-/// listed once, as its tip, whose parse merges the whole chain (Hermes lists the root and resumes
-/// to the tip; cv's `parse` walks upward from the ref, so the tip is the one to list). Branch and
-/// reset children are user-visible conversations and stay listed.
+/// One `SessionRef` per CONVERSATION. Excluded: delegate sub-agent runs
+/// (`model_config._delegate_from` — Hermes's own picker hides them too, and cv has no sub-agent
+/// forest for Hermes yet, so they are reachable only through their parent's markers; follow-up) and
+/// compression ANCESTORS — a session that ended in compression and has a continuation is listed
+/// once, as its tip, whose parse merges the whole chain (Hermes lists the root and resumes to the
+/// tip; cv's `parse` walks upward from the ref, so the tip is the one to list). Archived and hidden
+/// sessions ARE listed: Hermes keeps both resumable (`set_session_hidden`: "still resumable"; the
+/// archived view is its recovery surface), and a session cv does not list is one `cv show <id>`
+/// cannot reach at all — checked against a store written by Hermes's own code. Their flags ride in
+/// `Session.extra[hermes_session]` (`archived`, `hidden`, `pinned`). Branch and reset children are
+/// user-visible conversations and stay listed. An untitled compression tip takes its root's title,
+/// as Hermes's listing does (`COALESCE(tip.title, s.title)`, `hermes_state_sessions.py:1137`).
 fn discover_conn(conn: &Connection, path: &Path) -> Result<Vec<SessionRef>> {
     let expr = |col: &str| {
         if session_has_col(conn, col) {
@@ -310,21 +315,10 @@ fn discover_conn(conn: &Connection, path: &Path) -> Result<Vec<SessionRef>> {
             "NULL".to_string()
         }
     };
-    let mut filters: Vec<&str> = Vec::new();
-    if session_has_col(conn, "archived") {
-        filters.push("archived = 0");
-    }
-    if session_has_col(conn, "hidden") {
-        filters.push("hidden = 0");
-    }
-    let where_clause = if filters.is_empty() {
-        String::new()
-    } else {
-        format!(" WHERE {}", filters.join(" AND "))
-    };
+    let has_parent = session_has_col(conn, "parent_session_id");
     let sql = format!(
         "SELECT id, {title}, started_at, ended_at, message_count, {cwd}, {last}, {model_config} \
-         FROM sessions{where_clause} ORDER BY started_at DESC",
+         FROM sessions ORDER BY started_at DESC",
         title = expr("title"),
         cwd = expr("cwd"),
         last = expr("last_activity_at"),
@@ -362,6 +356,11 @@ fn discover_conn(conn: &Connection, path: &Path) -> Result<Vec<SessionRef>> {
         if lineage_markers(model_config.as_deref()).contains_key("_delegate_from") {
             continue;
         }
+        let title = title.filter(|t| !t.is_empty()).or_else(|| {
+            has_parent
+                .then(|| inherited_title(conn, &session_lineage_root_to_tip(conn, &id)))
+                .flatten()
+        });
         out.push(SessionRef {
             id,
             harness: Harness::Hermes,
@@ -374,6 +373,25 @@ fn discover_conn(conn: &Connection, path: &Path) -> Result<Vec<SessionRef>> {
         });
     }
     Ok(out)
+}
+
+/// Hermes titles a compression chain `COALESCE(tip.title, root.title)` (`hermes_state_sessions.py:1137`):
+/// the title is carried root→tip only after the publish transaction, so an untitled tip is the normal
+/// state right after a rotation (a real 0.21.3 store: `publish_compression_child` leaves the child's
+/// `title` NULL). Given a root→tip `chain` (see [`session_lineage_root_to_tip`]), the nearest titled
+/// ancestor, root first; `None` for a chain of one.
+fn inherited_title(conn: &Connection, chain: &[String]) -> Option<String> {
+    let Some((_, ancestors)) = chain.split_last() else {
+        return None;
+    };
+    ancestors.iter().find_map(|id| {
+        conn.query_row("SELECT title FROM sessions WHERE id = ?1", [id], |row| {
+            row.get::<_, Option<String>>(0)
+        })
+        .ok()
+        .flatten()
+        .filter(|t| !t.is_empty())
+    })
 }
 
 /// Per-session columns with no first-class IR home. Captured into `Session.extra[SESSION_META_KEY]`
@@ -394,6 +412,10 @@ const SESSION_META_TEXT_COLS: &[&str] = &[
     "git_repo_root",
 ];
 const SESSION_META_INT_COLS: &[&str] = &[
+    // Listing flags (non-zero only, like the counters): the user tucked the session away or pinned it.
+    "archived",
+    "hidden",
+    "pinned",
     "tool_call_count",
     "input_tokens",
     "output_tokens",
@@ -469,6 +491,18 @@ fn read_session_extra(
         }
     }
     let mut out = serde_json::Map::new();
+    // A foreign import (`hermes sessions import --from claude|codex`, `hermes_cli/foreign_sessions.py`)
+    // records its provenance in `origin_json.imported_from{tool, path, foreign_session_id}` — the
+    // very transcript cv also parses natively. Surface it top-level so consumers can dedupe.
+    if let Some(imported) = meta
+        .get("origin_json")
+        .and_then(Value::as_str)
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .and_then(|origin| origin.get("imported_from").cloned())
+        .filter(Value::is_object)
+    {
+        out.insert("imported_from".into(), imported);
+    }
     if !meta.is_empty() {
         out.insert(SESSION_META_KEY.into(), Value::Object(meta));
     }
@@ -546,7 +580,10 @@ fn stream_conn(conn: &Connection, r: &SessionRef, opts: &ParseOptions, sink: &mu
             .filter(|c| !c.is_empty())
             .map(PathBuf::from)
             .or_else(|| r.cwd.clone()),
-        title: title.or_else(|| r.title.clone()),
+        title: title
+            .filter(|t| !t.is_empty())
+            .or_else(|| r.title.clone())
+            .or_else(|| inherited_title(conn, &lineage)),
         created_at: started.and_then(secs_to_dt).or(r.created_at),
         updated_at: latest_of([ended, last_activity, started]).or(r.updated_at),
         model,
@@ -1844,6 +1881,8 @@ mod tests {
         let conn = mk_conn(SCHEMA_V30);
         insert_session(&conn, "root", None, Some("compression"), 1000.0, Some(1500.0));
         insert_session(&conn, "tip", Some("root"), None, 1600.0, None);
+        conn.execute("UPDATE sessions SET title = NULL WHERE id = 'tip'", [])
+            .unwrap();
         conn.execute(
             "INSERT INTO sessions (id, source, started_at, archived) VALUES ('arch', 'cli', 1700.0, 1)",
             [],
@@ -1870,8 +1909,14 @@ mod tests {
         let ids: Vec<&str> = refs.iter().map(|r| r.id.as_str()).collect();
         assert_eq!(
             ids,
-            vec!["plain", "tip"],
-            "tip lists (root is its compression ancestor); archived/hidden/delegate do not"
+            vec!["plain", "hid", "arch", "tip"],
+            "tip lists (root is its compression ancestor) and so do archived/hidden (Hermes keeps \
+             them resumable); the delegate run does not"
+        );
+        assert_eq!(
+            refs.iter().find(|r| r.id == "tip").unwrap().title.as_deref(),
+            Some("T"),
+            "an untitled tip is titled by its compression root"
         );
         let plain = &refs[0];
         assert_eq!(plain.cwd.as_deref(), Some(Path::new("/work/proj")));
@@ -1971,5 +2016,147 @@ mod tests {
         assert_eq!(refs[0].id, "b");
         assert_eq!(refs[0].message_count, 5);
         assert_eq!(refs[1].id, "a");
+    }
+
+    /// `tests/fixtures/hermes/state-v30.db` was written by Hermes's OWN store code (hermes-agent
+    /// `6d8a8bebf7`, `SCHEMA_VERSION = 30`) through `SessionDB` — `create_session`, `append_message`,
+    /// `append_messages_batch`, `archive_and_compact` (in place, `tail_count=2`),
+    /// `publish_compression_child` (rotation), `update_system_prompt`, `promote_to_session_reset`,
+    /// `set_session_{title,archived,hidden}`, `append_delegation_delivery`, and
+    /// `hermes_cli.foreign_sessions.import_foreign_session` — never raw SQL; only the derived FTS
+    /// tables/triggers were dropped to keep it small (cv never reads them). Ten sessions: A compacted
+    /// in place (+ steer / hidden / async_delegation_complete rows), R root with a `/branch` child B,
+    /// a reset child S and a delegate child D, a rotation chain C1→C2, X archived, Y hidden, and F, a
+    /// Claude Code import. Every assertion below was first checked against Hermes's own views
+    /// (`list_sessions_rich`, `get_messages(include_compacted=True)`, `get_messages_as_conversation`).
+    #[test]
+    fn real_v30_store_written_by_hermes() {
+        const A: &str = "20260919_161227_a657eb";
+        const R: &str = "20260919_161227_3b223a";
+        const B: &str = "20260919_161227_3584d9";
+        const S: &str = "20260919_161227_804285";
+        const D: &str = "20260919_161227_65066f";
+        const C1: &str = "20260919_161227_f36517";
+        const C2: &str = "20260919_161227_bbce2d";
+        const X: &str = "20260919_161227_12996c";
+        const Y: &str = "20260919_161227_f94c97";
+        const F: &str = "20260919_161227_212153";
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/hermes/state-v30.db");
+        let conn = Hermes::open_path(&path).unwrap();
+        let version: i64 = conn
+            .query_row("SELECT MAX(version) FROM schema_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 30);
+
+        // Discovery: every conversation once — the same six Hermes's picker lists, plus the archived
+        // and hidden ones it keeps resumable; not the delegate run, not the merged compression root.
+        let refs = discover_conn(&conn, &path).unwrap();
+        let ids: HashSet<&str> = refs.iter().map(|r| r.id.as_str()).collect();
+        for want in [A, R, B, S, C2, X, Y, F] {
+            assert!(ids.contains(want), "{want} is listed");
+        }
+        assert!(
+            !ids.contains(D),
+            "a delegate sub-agent run is not a top-level conversation"
+        );
+        assert!(!ids.contains(C1), "a compression ancestor lists as its tip");
+        let by_id = |id: &str| refs.iter().find(|r| r.id == id).unwrap();
+        assert_eq!(by_id(A).title.as_deref(), Some("Fix the flaky test"));
+        assert_eq!(by_id(B).title.as_deref(), Some("Design the cache (branch)"));
+        assert_eq!(
+            by_id(C2).title.as_deref(),
+            Some("Long migration"),
+            "an untitled rotation tip is titled by its root, as Hermes lists it"
+        );
+        assert!(by_id(F)
+            .title
+            .as_deref()
+            .unwrap()
+            .starts_with("Imported from Claude Code"));
+        assert_eq!(by_id(A).cwd, Some(PathBuf::from("/tmp/proj")));
+        assert_eq!(
+            by_id(A).message_count,
+            8,
+            "Hermes's message_count is the ACTIVE row count"
+        );
+
+        // A: the display view — each carried message once, in id order, the summary as a system turn.
+        let a = parse_conn(&conn, &sref(A)).unwrap();
+        let t = texts(&a);
+        assert_eq!(a.messages.len(), 13, "{t:?}");
+        // Index by message (the tool-result turn has no text, so `t` is one shorter).
+        let txt = |i: usize| a.messages[i].text().unwrap_or_default();
+        assert_eq!(txt(0), "fix the flaky test in tests/sched.py");
+        assert_eq!(txt(1), "Let me look at the test.");
+        assert_eq!(a.messages[2].role, Role::Tool);
+        assert_eq!(a.messages[4].role, Role::System);
+        assert_eq!(a.messages[4].extra["subtype"], "compact_boundary");
+        assert_eq!(a.messages[5].extra["isCompactSummary"], true);
+        assert!(txt(5).starts_with("[CONTEXT COMPACTION"), "{}", txt(5));
+        assert_eq!(
+            t.iter().filter(|x| x.as_str() == "ok do it").count(),
+            1,
+            "the carried tail is not duplicated"
+        );
+        assert_eq!(txt(6), "ok do it");
+        assert_eq!(txt(8), "now run the suite");
+        assert_eq!(a.messages[10].role, Role::User, "a steer stays a user turn");
+        assert_eq!(a.messages[10].extra["display_kind"], "steer");
+        assert_eq!(a.messages[11].role, Role::System, "a hidden diagnostic is a notice");
+        assert_eq!(a.messages[12].role, Role::System);
+        assert_eq!(a.messages[12].extra["display_kind"], "async_delegation_complete");
+        assert_eq!(a.model.as_deref(), Some("anthropic/claude-sonnet-4.5"));
+        assert_eq!(a.cwd, Some(PathBuf::from("/tmp/proj")));
+        let sp = a.extra[SESSION_META_KEY]["system_prompt"].as_str().unwrap();
+        assert!(
+            sp.ends_with("Context was compacted once."),
+            "system prompt resolved via system_prompts: {sp}"
+        );
+        // complete: the superseded originals of the carried tail are present, tagged as rewind rows.
+        let ac = parse_conn_with(&conn, &sref(A), &ParseOptions::complete()).unwrap();
+        assert!(ac.messages.len() > a.messages.len());
+        // (Flags are recorded as non-default values only: a superseded original carries
+        // `active: false` and no `compacted` key — the same shape as a rewound row.)
+        assert!(ac
+            .messages
+            .iter()
+            .any(|m| m.extra.get("active") == Some(&Value::Bool(false)) && !m.extra.contains_key("compacted")));
+
+        // C2: the rotation chain reads root→tip, titled by the root, the carried tail once.
+        let c2 = parse_conn(&conn, &sref(C2)).unwrap();
+        assert_eq!(c2.title.as_deref(), Some("Long migration"));
+        let t = texts(&c2);
+        assert_eq!(t[0], "step 0: migrate table t0");
+        assert_eq!(t.iter().filter(|x| x.as_str() == "migrated t3").count(), 1);
+        assert!(t.iter().any(|x| x.starts_with("[CONTEXT COMPACTION")));
+        assert_eq!(t.last().map(String::as_str), Some("migrated t4"));
+
+        // Lineage: branch / reset / delegate children stand alone with their markers.
+        let b = parse_conn(&conn, &sref(B)).unwrap();
+        assert_eq!(
+            b.messages.len(),
+            4,
+            "a branch owns its copied transcript; never merged with R"
+        );
+        assert_eq!(b.extra[LINEAGE_KEY]["_branched_from"], R);
+        let s = parse_conn(&conn, &sref(S)).unwrap();
+        assert_eq!(s.extra[LINEAGE_KEY]["_reset_from"], R);
+        assert_eq!(s.messages.len(), 2);
+        let d = parse_conn(&conn, &sref(D)).unwrap();
+        assert_eq!(d.extra[LINEAGE_KEY]["_delegate_from"], R);
+
+        // Flags and provenance.
+        assert_eq!(
+            parse_conn(&conn, &sref(X)).unwrap().extra[SESSION_META_KEY]["archived"],
+            1
+        );
+        assert_eq!(
+            parse_conn(&conn, &sref(Y)).unwrap().extra[SESSION_META_KEY]["hidden"],
+            1
+        );
+        let f = parse_conn(&conn, &sref(F)).unwrap();
+        assert_eq!(f.extra["imported_from"]["tool"], "claude-code");
+        assert_eq!(f.extra[SESSION_META_KEY]["source"], "claude-code");
+        assert_eq!(texts(&f)[0], "Reply with exactly: ONE");
     }
 }
