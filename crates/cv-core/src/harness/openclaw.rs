@@ -105,7 +105,13 @@ pub struct OpenClaw {
 impl OpenClaw {
     pub fn new() -> Self {
         let mut roots = Vec::new();
+        // `OPENCLAW_STATE_DIR` overrides the state dir wholesale (`src/config/state-dir.ts`
+        // `resolveStateDir`); otherwise `~/.openclaw` (and the elide-home variant).
+        let override_dir = std::env::var_os("OPENCLAW_STATE_DIR")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from);
         for base in [
+            override_dir,
             dirs::home_dir().map(|h| h.join(".openclaw")),
             dirs::home_dir().map(|h| h.join("elide-home").join(".openclaw")),
         ]
@@ -334,7 +340,13 @@ fn stream_rows<I: Iterator<Item = Row>>(
             // `complete`.
             "session_info" => {
                 if let Some(name) = v.get("name").and_then(Value::as_str).filter(|n| !n.trim().is_empty()) {
-                    s.title = Some(crate::ir::truncate(name, 80));
+                    // Discovery already applied OpenClaw's own precedence (store label /
+                    // display_name first, then this name — what its session list shows), so a
+                    // titled ref keeps its title and `cv ls` and `cv show` agree; the name is
+                    // still first-class in `extra`. A bare JSONL parse has no ref title.
+                    if s.title.is_none() {
+                        s.title = Some(crate::ir::truncate(name, 80));
+                    }
                     s.extra.insert("openclaw_session_name".into(), Value::from(name));
                 }
                 carrier_if_complete(&v, opts)
@@ -1572,6 +1584,149 @@ mod tests {
         assert_eq!(si.extra["openclaw_entry_type"], "session_info");
         assert_eq!(si.extra["openclaw_entry"]["name"], "Named session");
         assert!(si.content.is_empty());
+        fs::remove_dir_all(agents.parent().unwrap()).ok();
+    }
+
+    /// The store under `tests/fixtures/openclaw/openclaw-agent.sqlite` was written by OpenClaw's OWN
+    /// code (`0e9181234a`, 2026-09-19): `generate-openclaw-agent-sqlite.mts` next to it drives
+    /// `upsertSessionEntryCore` + `appendTranscriptMessage` + `SessionManager` (`appendSessionInfo`,
+    /// `appendModelChange`, `appendLabelChange`, `appendCompaction`, `branch`, `appendLeafControl`
+    /// with and without `appendMode: "side"`, `appendResetBoundary`, `createBranchedSession`) and
+    /// lands the user's legacy v3 JSONL through `replaceTranscriptEventsSync`; the transcript tables
+    /// were then copied verbatim (`.dump`), `PRAGMA user_version` 21. The expected visible path below
+    /// is what OpenClaw's `selectVisibleTranscriptEvents` returned for the same rows.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn real_openclaw_store_matches_openclaws_own_visible_path() {
+        let agents = tmp_agents();
+        let agent_dir = agents.join("main").join("agent");
+        fs::create_dir_all(&agent_dir).unwrap();
+        let src = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/openclaw")
+            .join("openclaw-agent.sqlite");
+        let db = agent_dir.join("openclaw-agent.sqlite");
+        fs::copy(&src, &db).unwrap();
+        let adapter = OpenClaw {
+            roots: vec![agents.clone()],
+        };
+
+        let refs = adapter.discover().unwrap();
+        let by_id = |id: &str| {
+            refs.iter()
+                .find(|r| r.id == id)
+                .unwrap_or_else(|| panic!("{id} discovered"))
+        };
+        assert_eq!(refs.len(), 3, "main + fork + migrated legacy window");
+        let main = by_id("cvfix-main-0001");
+        assert_eq!(main.path, db);
+        assert_eq!(main.cwd, Some(PathBuf::from("/Users/ember/dev/cv")));
+        assert_eq!(
+            main.title.as_deref(),
+            Some("cv fixture"),
+            "the store label, as OpenClaw's list shows"
+        );
+        assert_eq!(main.message_count, 13, "every message row, branches included");
+        let fork = by_id("01a0bb4e-2bea-749a-8ec2-c494636244d1");
+        assert_eq!(fork.message_count, 12);
+        let legacy = by_id("3f28190c-96fa-4d73-b37c-251dcccb3f9b");
+        assert_eq!(legacy.cwd, Some(PathBuf::from("/Users/ember/ocfid/proj")));
+        assert_eq!(legacy.message_count, 5);
+
+        // OpenClaw's visible path for the main window (session_info/model_change/label are
+        // session facts, not turns): 4 turns, compaction, 2 turns, 2 turns, reset, 2 turns.
+        let s = adapter.parse(main).unwrap();
+        assert_eq!(s.title.as_deref(), Some("cv fixture"), "`cv ls` and `cv show` agree");
+        assert_eq!(s.extra["openclaw_session_name"], "cv fixture session");
+        assert_eq!(s.extra["openclaw_labels"]["a2"], "good answer");
+        assert_eq!(s.model.as_deref(), Some("claude-sonnet-4.6"));
+        let ids: Vec<&str> = s.messages.iter().filter_map(|m| m.id.as_deref()).collect();
+        assert_eq!(
+            ids,
+            [
+                "u1",
+                "a1",
+                "t1",
+                "a2",
+                "a8809d72-24a8-48f1-af6e-96d73cdaea5e",
+                "4f9b3064-6b25-4ab4-82fc-9267b84f8674",
+                "8aa23aa2-040c-404e-872f-73a4225f184b",
+                "cdb5934d-842c-4b9d-b31a-50ab73e44a2d",
+                "dadcbccc-cecb-4f1a-97c8-b396b5e2cf7f",
+                "7320572f-1b0e-4e42-bcaf-205f8b5d81f3",
+                "0ca1dba7-abc2-46fa-8acb-d6b142a2373c",
+                "9c7327ea-0d4d-4b4a-94d2-cbe37776ee5f",
+            ]
+        );
+        let texts: Vec<String> = s.messages.iter().filter_map(|m| m.text()).collect();
+        for gone in [
+            "branch: rename README",
+            "branch answer: renamed.",
+            "side note appended in side mode",
+        ] {
+            assert!(
+                !texts.iter().any(|t| t.contains(gone)),
+                "{gone} is off the visible path"
+            );
+        }
+        let compaction = &s.messages[4];
+        assert_eq!(compaction.role, Role::System);
+        assert_eq!(compaction.extra["openclaw_entry_type"], "compaction");
+        assert_eq!(compaction.extra["tokens_before"], 4321);
+        assert_eq!(compaction.extra["first_kept_entry_id"], "u1");
+        assert!(compaction.text().unwrap().starts_with("Summary: the user asked"));
+        let reset = &s.messages[9];
+        assert_eq!(reset.extra["openclaw_entry_type"], "reset");
+        assert_eq!(reset.extra["reason"], "reset");
+        // the assistant turn carries thinking + the tool call; the tool result names its tool
+        assert!(s.messages[1]
+            .content
+            .iter()
+            .any(|b| matches!(b, Block::Thinking { .. })));
+        assert!(s.messages[1]
+            .content
+            .iter()
+            .any(|b| matches!(b, Block::ToolUse { name, .. } if name == "bash")));
+        assert_eq!(s.messages[2].role, Role::Tool);
+
+        // complete: the abandoned branch, the side-mode note and the leaf controls ride along, tagged
+        let mut sink = crate::stream::CollectSink::default();
+        adapter.stream(main, &ParseOptions::complete(), &mut sink).unwrap();
+        let inactive: Vec<String> = sink
+            .messages
+            .iter()
+            .filter(|m| m.extra.get("openclaw_inactive_branch") == Some(&Value::Bool(true)))
+            .filter_map(|m| m.text())
+            .collect();
+        assert!(inactive.iter().any(|t| t.contains("branch: rename README")));
+        assert!(inactive.iter().any(|t| t.contains("side note appended in side mode")));
+        assert_eq!(
+            sink.messages
+                .iter()
+                .filter(|m| m.extra.get("openclaw_entry_type").and_then(Value::as_str) == Some("leaf"))
+                .count(),
+            3,
+            "three leaf controls in the store"
+        );
+
+        // the fork: v4 header with `parentSession`, the inherited prefix, then its own turns
+        let f = adapter.parse(fork).unwrap();
+        assert_eq!(f.extra["openclaw_parent_session"], "cvfix-main-0001");
+        let ftexts: Vec<String> = f.messages.iter().filter_map(|m| m.text()).collect();
+        assert!(ftexts.iter().any(|t| t == "post-reset answer"));
+        assert_eq!(ftexts.last().map(String::as_str), Some("fork answer"));
+        // `createBranchedSession` copies only the visible path, so the fork has no abandoned
+        // branch: its 12 message rows plus the compaction and reset notes, all on the path.
+        assert_eq!(f.messages.len(), 14);
+        assert!(!f
+            .messages
+            .iter()
+            .any(|m| m.extra.contains_key("openclaw_inactive_branch")));
+
+        // the legacy v3 transcript, as a migration lands it
+        let l = adapter.parse(legacy).unwrap();
+        assert_eq!(l.messages.len(), 5);
+        assert_eq!(l.messages[2].role, Role::Assistant);
+        assert_eq!(l.messages[3].role, Role::Tool);
         fs::remove_dir_all(agents.parent().unwrap()).ok();
     }
 
