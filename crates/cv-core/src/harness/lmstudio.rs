@@ -144,6 +144,8 @@ impl Adapter for LmStudio {
             messages: Vec::new(),
             source_path: Some(r.path.clone()),
             extra,
+            system_prompt: None,
+            lineage: crate::ir::Lineage::default(),
         };
 
         // `model` is backfilled from the first genInfo seen while iterating turns, so hand the
@@ -766,6 +768,8 @@ fn parse_usage(stats: Option<&Value>) -> Option<Usage> {
         output_tokens: output,
         cache_read_tokens: None,
         cache_creation_tokens: None,
+        reasoning_tokens: None,
+        cost_usd: None,
     })
 }
 
@@ -916,6 +920,8 @@ mod tests {
             output_tokens: Some(34),
             cache_read_tokens: None,
             cache_creation_tokens: None,
+            reasoning_tokens: None,
+            cost_usd: None,
         });
 
         let session = Session {
@@ -930,6 +936,8 @@ mod tests {
             messages: vec![user, assistant],
             source_path: None,
             extra: serde_json::Map::new(),
+            system_prompt: None,
+            lineage: crate::ir::Lineage::default(),
         };
 
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);

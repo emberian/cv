@@ -256,6 +256,8 @@ impl Adapter for OpenCode {
             messages: Vec::new(),
             source_path: Some(r.path.clone()),
             extra: serde_json::Map::new(),
+            system_prompt: None,
+            lineage: crate::ir::Lineage::default(),
         };
 
         // Order message files by `time/created` (same ordering as before) while holding only the
@@ -465,6 +467,8 @@ mod db {
         let mut s = Session {
             id: r.id.clone(),
             harness: Harness::OpenCode,
+            system_prompt: None,
+            lineage: crate::ir::Lineage::default(),
             cwd: row.get("directory").and_then(Value::as_str).map(PathBuf::from),
             title: row
                 .get("title")
@@ -673,6 +677,7 @@ fn tool_blocks(part: &Value) -> (Block, Vec<Block>) {
         id: call_id.clone(),
         name,
         input: part.pointer("/state/input").cloned().unwrap_or(Value::Null),
+        namespace: None,
     };
 
     // A completed tool carries `output`; an error tool carries `error`.
@@ -844,6 +849,8 @@ fn parse_tokens(v: Option<&Value>) -> Option<Usage> {
         output_tokens: v.get("output").and_then(Value::as_u64),
         cache_read_tokens: v.pointer("/cache/read").and_then(Value::as_u64),
         cache_creation_tokens: v.pointer("/cache/write").and_then(Value::as_u64),
+        reasoning_tokens: None,
+        cost_usd: None,
     })
 }
 

@@ -261,6 +261,8 @@ mod tests {
                 summary("b2", "SUMMARY TWO"),                  // 5
                 plain_user("after"),                           // 6
             ],
+            system_prompt: None,
+            lineage: crate::ir::Lineage::default(),
         };
         let comps = detect_in_session(&session, true);
         assert_eq!(comps.len(), 2, "two boundaries");
@@ -301,6 +303,8 @@ mod tests {
             source_path: None,
             extra: Default::default(),
             messages: vec![boundary("bx", "manual", 100), sum],
+            system_prompt: None,
+            lineage: crate::ir::Lineage::default(),
         };
         let comps = detect_in_session(&session, true);
         assert_eq!(comps.len(), 1);
@@ -322,6 +326,8 @@ mod tests {
             source_path: None,
             extra: Default::default(),
             messages: vec![boundary("b", "manual", 100), summary("b", "text")],
+            system_prompt: None,
+            lineage: crate::ir::Lineage::default(),
         };
         let comps = detect_in_session(&session, false);
         assert_eq!(comps.len(), 1);

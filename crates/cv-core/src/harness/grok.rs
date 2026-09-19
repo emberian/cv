@@ -117,6 +117,8 @@ impl Adapter for Grok {
             messages: Vec::new(),
             source_path: Some(dir.clone()),
             extra: serde_json::Map::new(),
+            system_prompt: None,
+            lineage: crate::ir::Lineage::default(),
         };
 
         // Sidecar enrichment: tool_call / tool_call_update entries from the ACP update stream.
@@ -306,7 +308,12 @@ fn chat_message(v: &Value, enrich: &HashMap<String, ToolEnrich>) -> Option<Messa
                     }
                 }
             }
-            m.content.push(Block::ToolUse { id, name, input });
+            m.content.push(Block::ToolUse {
+                id,
+                name,
+                input,
+                namespace: None,
+            });
         }
     }
 
@@ -450,7 +457,7 @@ mod tests {
         // thinking + tool_use (content empty so no text block)
         assert!(matches!(m.content[0], Block::Thinking { .. }));
         match &m.content[1] {
-            Block::ToolUse { id, name, input } => {
+            Block::ToolUse { id, name, input, .. } => {
                 assert_eq!(id, "call-1");
                 assert_eq!(name, "read_file");
                 assert_eq!(input["target_file"], "a.rs");

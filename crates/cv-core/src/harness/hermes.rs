@@ -594,6 +594,8 @@ fn stream_conn(conn: &Connection, r: &SessionRef, opts: &ParseOptions, sink: &mu
         messages: Vec::new(),
         source_path: Some(r.path.clone()),
         extra,
+        system_prompt: None,
+        lineage: crate::ir::Lineage::default(),
     };
 
     let cols = present_msg_cols(conn);
@@ -1149,7 +1151,12 @@ fn parse_tool_calls(raw: &str) -> Vec<Block> {
                 .and_then(|a| serde_json::from_str::<Value>(a).ok())
                 .or_else(|| tc.pointer("/function/arguments").cloned())
                 .unwrap_or(Value::Null);
-            Block::ToolUse { id, name, input }
+            Block::ToolUse {
+                id,
+                name,
+                input,
+                namespace: None,
+            }
         })
         .collect()
 }

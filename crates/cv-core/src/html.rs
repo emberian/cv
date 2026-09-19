@@ -1016,12 +1016,15 @@ mod tests {
             id: "t1".into(),
             name: "Bash".into(),
             input: serde_json::json!({ "command": "echo <x> & done" }),
+            namespace: None,
         });
         assistant.usage = Some(Usage {
             input_tokens: Some(42),
             output_tokens: Some(7),
             cache_read_tokens: None,
             cache_creation_tokens: None,
+            reasoning_tokens: None,
+            cost_usd: None,
         });
 
         let mut tool = Message::new(Role::Tool);
@@ -1064,6 +1067,8 @@ mod tests {
             messages: vec![system, user, assistant, tool],
             source_path: None,
             extra: serde_json::Map::new(),
+            system_prompt: None,
+            lineage: crate::ir::Lineage::default(),
         }
     }
 

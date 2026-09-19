@@ -79,7 +79,7 @@ fn chatgpt_tool_call_links_to_result() {
     let msgs = chatgpt_messages(&conv);
     assert_eq!(msgs.len(), 2);
     // the call
-    let Block::ToolUse { id, name, input } = &msgs[0].content[0] else {
+    let Block::ToolUse { id, name, input, .. } = &msgs[0].content[0] else {
         panic!("expected ToolUse")
     };
     assert_eq!(id, "call");

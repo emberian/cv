@@ -539,6 +539,8 @@ mod tests {
             ],
             source_path: None,
             extra: Default::default(),
+            system_prompt: None,
+            lineage: cv_core::ir::Lineage::default(),
         }
     }
 
@@ -628,6 +630,7 @@ mod tests {
             id: "t2".into(),
             name: "Bash".into(),
             input: serde_json::json!({"command": "ls"}),
+            namespace: None,
         });
         s.messages.push(asst);
 

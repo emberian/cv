@@ -240,7 +240,7 @@ fn roo_assistant_blocks(content: &[Block]) -> Vec<Value> {
                     out.push(Value::Object(m));
                 }
             }
-            Block::ToolUse { id, name, input } => out.push(json!({
+            Block::ToolUse { id, name, input, .. } => out.push(json!({
                 "type": "tool_use",
                 "id": id,
                 "name": name,
@@ -356,6 +356,7 @@ mod tests {
                 id: "toolu_42".into(),
                 name: "write_to_file".into(),
                 input: serde_json::json!({ "path": "src/lib.rs" }),
+                namespace: None,
             },
         ];
 
@@ -381,6 +382,8 @@ mod tests {
             messages: vec![user, asst, tool],
             source_path: None,
             extra: Map::new(),
+            system_prompt: None,
+            lineage: crate::ir::Lineage::default(),
         };
 
         // ── emit to a unique temp dir (no tempfile crate) ──

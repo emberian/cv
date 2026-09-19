@@ -259,6 +259,8 @@ pub fn parse_str(id: &str, text: &str, is_jsonl: bool, source_path: Option<PathB
         messages: Vec::new(),
         source_path,
         extra: serde_json::Map::new(),
+        system_prompt: None,
+        lineage: crate::ir::Lineage::default(),
     };
 
     if is_jsonl {
@@ -471,6 +473,8 @@ pub fn stream_jsonl<R: BufRead>(
         messages: Vec::new(),
         source_path,
         extra: serde_json::Map::new(),
+        system_prompt: None,
+        lineage: crate::ir::Lineage::default(),
     };
     let mut scratch: Vec<Message> = Vec::new();
     let mut ctx = CodexCtx::for_opts(opts);
@@ -590,6 +594,8 @@ fn stream_spans_core(
         messages: Vec::new(),
         source_path,
         extra: serde_json::Map::new(),
+        system_prompt: None,
+        lineage: crate::ir::Lineage::default(),
     };
     if start_off as usize >= data.len() {
         if emit_meta {
@@ -1234,6 +1240,8 @@ fn parse_usage(v: &Value) -> Option<Usage> {
         output_tokens: u64f("output_tokens"),
         cache_read_tokens: u64f("cached_input_tokens"),
         cache_creation_tokens: u64f("cache_write_input_tokens"),
+        reasoning_tokens: None,
+        cost_usd: None,
     };
     if u.input_tokens.is_none() && u.output_tokens.is_none() && u.cache_read_tokens.is_none() {
         return None;
@@ -1437,6 +1445,7 @@ fn handle_item(
                 id: call_id,
                 name,
                 input,
+                namespace: None,
             });
             out.push(m);
         }
@@ -1486,6 +1495,7 @@ fn handle_item(
                 id: call_id,
                 name: "tool_search".into(),
                 input: Value::Object(input),
+                namespace: None,
             });
             out.push(m);
         }
@@ -1522,6 +1532,7 @@ fn handle_item(
                 id: call_id,
                 name: "web_search".into(),
                 input,
+                namespace: None,
             });
             out.push(m);
         }
@@ -2038,7 +2049,7 @@ mod tests {
             r#"{"timestamp":"2026-01-01T00:00:01Z","type":"response_item","payload":{"type":"function_call_output","call_id":"c1","output":{"output":"boom","metadata":{"exit_code":1}}}}"#,
         ]);
         match first_block(&s, |b| matches!(b, Block::ToolUse { .. })) {
-            Block::ToolUse { id, name, input } => {
+            Block::ToolUse { id, name, input, .. } => {
                 assert_eq!(id, "c1");
                 assert_eq!(name, "shell");
                 assert_eq!(input["command"][0], "ls");
@@ -2084,7 +2095,7 @@ mod tests {
             r#"{"timestamp":"2026-01-01T00:00:00Z","type":"response_item","payload":{"type":"local_shell_call","id":"ls1","status":"completed","action":{"type":"exec","command":["echo","hi"],"timeout_ms":1000}}}"#,
         ]);
         match &s.messages[0].content[0] {
-            Block::ToolUse { id, name, input } => {
+            Block::ToolUse { id, name, input, .. } => {
                 assert_eq!(id, "ls1");
                 assert_eq!(name, "local_shell");
                 assert_eq!(input["action"]["command"][1], "hi");

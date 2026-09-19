@@ -359,6 +359,8 @@ fn stream_global(conn: &Connection, r: &SessionRef, sink: &mut dyn MessageSink) 
         messages: Vec::new(),
         source_path: Some(r.path.clone()),
         extra: serde_json::Map::new(),
+        system_prompt: None,
+        lineage: crate::ir::Lineage::default(),
     };
     // Note: the composer's `unifiedMode` (chat/agent/edit) has no home on the IR Session (no
     // free-form Session.extra). Each bubble's own `unifiedMode` is preserved in Message.extra
@@ -483,6 +485,8 @@ fn bubble_to_message(b: &Value) -> Option<Message> {
                 output_tokens: output,
                 cache_read_tokens: None,
                 cache_creation_tokens: None,
+                reasoning_tokens: None,
+                cost_usd: None,
             });
         }
     }
@@ -522,6 +526,7 @@ fn push_tool_former(m: &mut Message, tf: &Value) {
         id: id.clone(),
         name,
         input,
+        namespace: None,
     });
 
     // Result: a JSON string (or nested obj) plus a status/error flag.
@@ -660,6 +665,8 @@ fn stream_legacy(conn: &Connection, r: &SessionRef, tab_id: &str, sink: &mut dyn
         messages: Vec::new(),
         source_path: Some(r.path.clone()),
         extra: serde_json::Map::new(),
+        system_prompt: None,
+        lineage: crate::ir::Lineage::default(),
     };
     sink.meta(&session);
     if let Some(bubbles) = tab.get("bubbles").and_then(Value::as_array) {
@@ -794,7 +801,7 @@ mod tests {
         assert_eq!(a.text().as_deref(), Some("Here is how."));
         // tool use + result
         let tu = a.content.iter().find_map(|b| match b {
-            Block::ToolUse { name, input, id } => Some((name.clone(), input.clone(), id.clone())),
+            Block::ToolUse { name, input, id, .. } => Some((name.clone(), input.clone(), id.clone())),
             _ => None,
         });
         let (name, input, tid) = tu.expect("tool use");

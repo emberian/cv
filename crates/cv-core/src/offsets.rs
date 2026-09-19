@@ -204,6 +204,8 @@ fn meta_session(r: &SessionRef, row: &db::SeekRow, start: usize) -> Session {
         messages: Vec::new(),
         source_path: Some(r.path.clone()),
         extra: serde_json::Map::new(),
+        system_prompt: None,
+        lineage: crate::ir::Lineage::default(),
     };
     if row.meta_idx.is_some() {
         s.title = row.meta_title.clone();
@@ -679,6 +681,8 @@ mod tests {
             messages: vec![],
             source_path: None,
             extra: serde_json::Map::new(),
+            system_prompt: None,
+            lineage: crate::ir::Lineage::default(),
         };
         MessageSink::meta(&mut sink, &s);
         s.model = Some("other".to_string()); // later meta calls are ignored

@@ -1024,6 +1024,7 @@ mod tests {
             id: "t1".into(),
             name: name.into(),
             input,
+            namespace: None,
         }
     }
 

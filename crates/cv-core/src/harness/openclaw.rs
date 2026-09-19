@@ -308,6 +308,8 @@ fn stream_rows<I: Iterator<Item = Row>>(
         messages: Vec::new(),
         source_path: Some(r.path.clone()),
         extra: serde_json::Map::new(),
+        system_prompt: None,
+        lineage: crate::ir::Lineage::default(),
     };
     let mut header_version: Option<i64> = None;
     let mut meta_sent = false;
@@ -785,6 +787,8 @@ fn parse_usage(usage: &Value) -> Option<Usage> {
         output_tokens: get("output"),
         cache_read_tokens: get("cacheRead"),
         cache_creation_tokens: get("cacheWrite"),
+        reasoning_tokens: None,
+        cost_usd: None,
     };
     let any = u.input_tokens.is_some()
         || u.output_tokens.is_some()
@@ -896,6 +900,7 @@ fn content_block(item: &Value) -> Option<Block> {
             id: item.get("id").and_then(Value::as_str).unwrap_or("").to_string(),
             name: item.get("name").and_then(Value::as_str).unwrap_or("").to_string(),
             input: item.get("arguments").cloned().unwrap_or(Value::Null),
+            namespace: None,
         }),
         "image" => Some(Block::Image {
             media_type: item.get("mimeType").and_then(Value::as_str).map(str::to_string),

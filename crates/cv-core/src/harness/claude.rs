@@ -241,6 +241,8 @@ fn new_session(id: &str, source_path: Option<PathBuf>) -> Session {
         messages: Vec::new(),
         source_path,
         extra: serde_json::Map::new(),
+        system_prompt: None,
+        lineage: crate::ir::Lineage::default(),
     }
 }
 
@@ -915,6 +917,8 @@ fn parse_message(ty: &str, v: &Value, opts: &ParseOptions, span: Option<&SpanCtx
         content: blocks,
         usage,
         extra,
+        kind: crate::ir::MessageKind::for_role(role),
+        origin: crate::ir::Origin::for_role(role),
     })
 }
 
@@ -1034,6 +1038,8 @@ fn system_msg(v: &Value, text: Text, subtype: &str, opts: &ParseOptions) -> Opti
         content: vec![Block::Text { text }],
         usage: None,
         extra,
+        kind: crate::ir::MessageKind::for_role(Role::System),
+        origin: crate::ir::Origin::for_role(Role::System),
     })
 }
 
@@ -1238,6 +1244,7 @@ fn parse_block(item: &Value, span_field: Option<(&RawValue, &SpanCtx)>) -> Optio
             id: item.get("id").and_then(Value::as_str).unwrap_or("").to_string(),
             name: item.get("name").and_then(Value::as_str).unwrap_or("").to_string(),
             input: item.get("input").cloned().unwrap_or(Value::Null),
+            namespace: None,
         }),
         "tool_result" => {
             let cv = item.get("content");
@@ -1449,6 +1456,8 @@ fn parse_usage(v: &Value) -> Usage {
         output_tokens: get("output_tokens"),
         cache_read_tokens: get("cache_read_input_tokens"),
         cache_creation_tokens: get("cache_creation_input_tokens"),
+        reasoning_tokens: None,
+        cost_usd: None,
     }
 }
 

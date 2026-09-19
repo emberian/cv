@@ -271,6 +271,8 @@ fn parse_ref(kind: Kind, r: &SessionRef) -> Result<Session> {
         },
         source_path: Some(r.path.clone()),
         extra: Map::new(),
+        system_prompt: None,
+        lineage: crate::ir::Lineage::default(),
     };
     if s.title.is_none() {
         s.title = s.first_user_text().map(|t| truncate(&t, 80));
@@ -325,6 +327,7 @@ fn chatgpt_messages(conv: &Value) -> Vec<Message> {
                 id: node_id.clone(),
                 name: recipient.to_string(),
                 input: msg.get("content").cloned().unwrap_or(Value::Null),
+                namespace: None,
             });
             last_call.insert(recipient.to_string(), node_id.clone());
         } else if role == Role::Tool {
@@ -458,6 +461,7 @@ fn claude_content_blocks(m: &Value) -> Vec<Block> {
                     id: b.get("id").and_then(Value::as_str).unwrap_or("").to_string(),
                     name: b.get("name").and_then(Value::as_str).unwrap_or("").to_string(),
                     input: b.get("input").cloned().unwrap_or(Value::Null),
+                    namespace: None,
                 }),
                 Some("tool_result") => out.push(Block::ToolResult {
                     tool_use_id: b.get("tool_use_id").and_then(Value::as_str).unwrap_or("").to_string(),

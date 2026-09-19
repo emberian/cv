@@ -448,6 +448,8 @@ fn build_source(hit: &cv_search::Hit, task: &str, llm_model: Option<&Option<Stri
             messages: Vec::new(),
             source_path: None,
             extra: Default::default(),
+            system_prompt: None,
+            lineage: cv_core::ir::Lineage::default(),
         };
         for (role, text) in &excerpt {
             let mut m = Message::new(*role);
@@ -859,6 +861,8 @@ fn emit_pack_session(
         messages: vec![user, ack],
         source_path: None,
         extra: Default::default(),
+        system_prompt: None,
+        lineage: cv_core::ir::Lineage::default(),
     };
     crate::cmd::convert::emit_session(&session, to_h, out, EmitOptions::default())
 }

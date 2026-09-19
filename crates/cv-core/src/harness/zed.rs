@@ -297,6 +297,8 @@ fn stream_thread(conn: &Connection, r: &SessionRef, sink: &mut dyn MessageSink) 
         messages: Vec::new(),
         source_path: Some(r.path.clone()),
         extra,
+        system_prompt: None,
+        lineage: crate::ir::Lineage::default(),
     };
     // All session metadata is known up front; hand it to the sink before the body.
     sink.meta(&s);
@@ -493,6 +495,7 @@ fn legacy_message(m: &Value, tool_names: &mut HashMap<String, String>, f: &mut d
             id,
             name,
             input: tu.get("input").cloned().unwrap_or(Value::Null),
+            namespace: None,
         });
     }
 
@@ -734,6 +737,7 @@ fn agent_content_block(item: &Value) -> Option<Block> {
             id: tu.get("id").and_then(Value::as_str).unwrap_or("").to_string(),
             name: tu.get("name").and_then(Value::as_str).unwrap_or("").to_string(),
             input: tu.get("input").cloned().unwrap_or(Value::Null),
+            namespace: None,
         });
     }
     None
@@ -988,7 +992,7 @@ mod tests {
         assert!(matches!(&a.content[0], Block::Thinking { text, signature, .. }
             if text == "let me look" && signature.as_deref() == Some("sig1")));
         assert!(matches!(&a.content[1], Block::Text { text } if text == "Checking the test now."));
-        assert!(matches!(&a.content[2], Block::ToolUse { id, name, input }
+        assert!(matches!(&a.content[2], Block::ToolUse { id, name, input , ..}
             if id == "toolu_1" && name == "read_file"
             && input.get("path").and_then(Value::as_str) == Some("foo.rs")));
         let t = &s.messages[2];

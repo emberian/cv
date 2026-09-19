@@ -286,6 +286,8 @@ pub fn stream_task_dir(
         messages: Vec::new(),
         source_path: Some(dir.to_path_buf()),
         extra: Map::new(),
+        system_prompt: None,
+        lineage: crate::ir::Lineage::default(),
     };
 
     // Sidecar metadata is small; resolve timestamps up front. cwd-from-metadata is only a *fallback*
@@ -418,6 +420,8 @@ pub fn parse_history_str(id: &str, text: &str, harness: Harness, source_path: Op
         messages: Vec::new(),
         source_path,
         extra: Map::new(),
+        system_prompt: None,
+        lineage: crate::ir::Lineage::default(),
     };
 
     // Borrow the array structure as raw items; tolerate corrupt / non-array documents.
@@ -520,6 +524,7 @@ fn parse_block(item: &Value) -> Option<Block> {
             id: item.get("id").and_then(Value::as_str).unwrap_or("").to_string(),
             name: item.get("name").and_then(Value::as_str).unwrap_or("").to_string(),
             input: item.get("input").cloned().unwrap_or(Value::Null),
+            namespace: None,
         }),
         "tool_result" => Some(Block::ToolResult {
             tool_use_id: item
@@ -771,7 +776,7 @@ fn emit_blocks(content: &[Block]) -> Vec<Value> {
                     out.push(Value::Object(m));
                 }
             }
-            Block::ToolUse { id, name, input } => out.push(json!({
+            Block::ToolUse { id, name, input, .. } => out.push(json!({
                 "type": "tool_use",
                 "id": id,
                 "name": name,
@@ -1073,6 +1078,8 @@ mod tests {
             messages: Vec::new(),
             source_path: None,
             extra: Map::new(),
+            system_prompt: None,
+            lineage: crate::ir::Lineage::default(),
         };
 
         let mut user = Message::new(Role::User);
@@ -1090,6 +1097,7 @@ mod tests {
                 id: "toolu_1".to_string(),
                 name: "read_file".to_string(),
                 input: json!({ "path": "a.rs" }),
+                namespace: None,
             },
         ];
         session.messages.push(asst);

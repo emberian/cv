@@ -56,6 +56,7 @@ fn sample_session(harness: Harness) -> Session {
         id: "call_1".into(),
         name: "run_shell".into(),
         input: serde_json::json!({ "cmd": "ls" }),
+        namespace: None,
     });
 
     let mut tool = Message::new(Role::Tool);
@@ -84,6 +85,8 @@ fn sample_session(harness: Harness) -> Session {
         messages: vec![sys, user, asst, tool],
         source_path: None,
         extra: serde_json::Map::new(),
+        system_prompt: None,
+        lineage: cv_core::ir::Lineage::default(),
     }
 }
 

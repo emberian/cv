@@ -709,6 +709,8 @@ fn parse_logs_str(text: &str, source_path: Option<PathBuf>) -> Vec<Session> {
             messages: Vec::new(),
             source_path: source_path.clone(),
             extra: serde_json::Map::new(),
+            system_prompt: None,
+            lineage: crate::ir::Lineage::default(),
         };
         for e in items {
             let role = match e.get("type").and_then(Value::as_str) {
@@ -801,6 +803,8 @@ fn record_metadata(rec: &serde_json::Map<String, Value>, source_path: Option<Pat
         messages: Vec::new(),
         source_path,
         extra: serde_json::Map::new(),
+        system_prompt: None,
+        lineage: crate::ir::Lineage::default(),
     }
 }
 
@@ -874,6 +878,7 @@ fn emit_record_message(
                         id: call_id.clone(),
                         name: name.to_string(),
                         input,
+                        namespace: None,
                     });
                     let status = c.get("status").and_then(Value::as_str);
                     let is_error = status.map(|s| s.eq_ignore_ascii_case("error")).unwrap_or(false);
@@ -1010,6 +1015,7 @@ fn push_part(out: &mut Vec<Block>, part: &Value) {
             id,
             name: name.to_string(),
             input: fc.get("args").cloned().unwrap_or(Value::Null),
+            namespace: None,
         });
         return;
     }
@@ -1128,6 +1134,8 @@ fn parse_tokens(v: &Value) -> Option<Usage> {
         output_tokens: get("output"),
         cache_read_tokens: get("cached"),
         cache_creation_tokens: None,
+        reasoning_tokens: None,
+        cost_usd: None,
     })
 }
 
@@ -1192,6 +1200,8 @@ fn parse_checkpoint(text: &str, file_name: &str, source_path: Option<PathBuf>) -
         messages,
         source_path,
         extra: serde_json::Map::new(),
+        system_prompt: None,
+        lineage: crate::ir::Lineage::default(),
     })
 }
 

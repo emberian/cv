@@ -752,6 +752,8 @@ mod tests {
             messages,
             source_path: None,
             extra: Default::default(),
+            system_prompt: None,
+            lineage: cv_core::ir::Lineage::default(),
         }
     }
 
@@ -816,6 +818,7 @@ mod tests {
             id: "t1".into(),
             name: "Bash".into(),
             input: serde_json::json!({"command": "cargo test"}),
+            namespace: None,
         });
         let mut toolm = Message::new(Role::Tool);
         toolm.content.push(Block::ToolResult {

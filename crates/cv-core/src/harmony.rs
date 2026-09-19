@@ -86,6 +86,7 @@ pub fn decode_content(text: &str) -> Vec<Block> {
                         id: String::new(),
                         name: name.to_string(),
                         input: parse_input(msg.body),
+                        namespace: None,
                     });
                 } else {
                     // Plain commentary (preamble) → text, if non-empty.
@@ -105,6 +106,7 @@ pub fn decode_content(text: &str) -> Vec<Block> {
                         id: String::new(),
                         name: strip_tool_prefix(recipient).to_string(),
                         input: parse_input(msg.body),
+                        namespace: None,
                     });
                 } else {
                     let body = msg.body.trim();
@@ -286,7 +288,7 @@ mod tests {
             other => panic!("expected Thinking, got {other:?}"),
         }
         match &blocks[1] {
-            Block::ToolUse { name, input, id } => {
+            Block::ToolUse { name, input, id, .. } => {
                 assert_eq!(name, "get_weather", "functions. prefix stripped");
                 assert!(id.is_empty());
                 assert_eq!(input["location"], "SF");

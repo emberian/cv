@@ -343,6 +343,8 @@ mod tests {
             content: blocks,
             usage: None,
             extra: serde_json::Map::new(),
+            kind: crate::ir::MessageKind::for_role(role),
+            origin: crate::ir::Origin::for_role(role),
         }
     }
 
@@ -359,6 +361,8 @@ mod tests {
             messages,
             source_path: None,
             extra: serde_json::Map::new(),
+            system_prompt: None,
+            lineage: crate::ir::Lineage::default(),
         }
     }
 
@@ -384,6 +388,7 @@ mod tests {
                         id: "1".into(),
                         name: "Bash".into(),
                         input: json!({"cmd": "grep x"}),
+                        namespace: None,
                     },
                 ],
             ),
@@ -440,6 +445,7 @@ mod tests {
                         id: "1".into(),
                         name: "Bash".into(),
                         input: json!({"command": "export TOKEN=plain", "auth": "Bearer abcdef1234567890XYZ"}),
+                        namespace: None,
                     },
                 ],
             ),

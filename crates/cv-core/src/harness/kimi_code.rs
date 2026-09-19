@@ -178,6 +178,8 @@ impl Adapter for KimiCode {
         let mut s = Session {
             id: r.id.clone(),
             harness: Harness::KimiCode,
+            system_prompt: None,
+            lineage: crate::ir::Lineage::default(),
             cwd: r
                 .cwd
                 .clone()
@@ -636,6 +638,7 @@ impl Ctx<'_> {
                         id,
                         name,
                         input: e.get("args").cloned().unwrap_or(Value::Null),
+                        namespace: None,
                     });
                 }
                 Flow::Continue
@@ -805,6 +808,8 @@ fn usage_from(u: &Value) -> Usage {
         output_tokens: get("output"),
         cache_read_tokens: get("inputCacheRead"),
         cache_creation_tokens: get("inputCacheCreation"),
+        reasoning_tokens: None,
+        cost_usd: None,
     }
 }
 
@@ -1018,7 +1023,7 @@ mod tests {
             matches!(&step1.content[0], Block::Thinking { text, .. } if text.as_ref() as &str == "Look at the test first.")
         );
         assert!(
-            matches!(&step1.content[1], Block::ToolUse { id, name, input } if id == "tool_A" && name == "Read" && input["path"] == "/Users/u/proj/tests/flaky.rs")
+            matches!(&step1.content[1], Block::ToolUse { id, name, input , ..} if id == "tool_A" && name == "Read" && input["path"] == "/Users/u/proj/tests/flaky.rs")
         );
         assert!(matches!(&step1.content[2], Block::ToolUse { name, .. } if name == "Bash"));
         let u = step1.usage.as_ref().unwrap();

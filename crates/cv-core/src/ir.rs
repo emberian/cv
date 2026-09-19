@@ -130,16 +130,68 @@ pub struct Session {
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub git: Option<GitInfo>,
+    /// The system prompt the harness sent, when the store keeps it (Hermes, Kimi Code, OpenClaw,
+    /// Claude `prompt_snapshot`, Codex `base_instructions`). Session-level; NOT a message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
+    /// Where this session came from and where it went (fork, parent, continuation).
+    #[serde(default, skip_serializing_if = "Lineage::is_empty")]
+    pub lineage: Lineage,
     pub messages: Vec<Message>,
     /// Where this session was read from on disk.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_path: Option<PathBuf>,
-    /// Session-level metadata that doesn't have a first-class home yet.
+    /// Harness-specific session facts, nested under the harness name — `extra["claude"]["custom_title"]`,
+    /// `extra["codex"]["history_mode"]` — never flat. Shared concepts have first-class fields
+    /// (`system_prompt`, `lineage`, …). See `docs/INTERFACE-V2.md` §4.
     #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
+/// Where a session came from and where it went. Every field is a session id in the SAME harness
+/// unless the harness records otherwise; `None` means "the store does not say".
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Lineage {
+    /// The session this one was forked or branched from (Codex `forked_from_id`, OpenClaw fork,
+    /// Hermes `_branched_from`, Claude `--fork-session`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forked_from: Option<String>,
+    /// The session that owns this one as a sub-agent (Codex `parent_thread_id`, the parent of a
+    /// Claude `agent-*` transcript, Kimi `parentAgentId`, Hermes `_delegate_from`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    /// The tool call in the parent that spawned this session (Claude `toolUseId`), if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawned_by_tool_use: Option<String>,
+    /// The session this one continued in (Claude `continued-in`, Hermes compression rotation).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continued_in: Option<String>,
+    /// The session this one continues (the inverse pointer, when the store records it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continues: Option<String>,
+    /// Sub-agent path or nickname when the harness has one (Codex `agent_path`, Kimi `agent-N`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_path: Option<String>,
+}
+
+impl Lineage {
+    pub fn is_empty(&self) -> bool {
+        self == &Lineage::default()
+    }
+}
+
 impl Session {
+    /// The harness-specific fact bag for `h` — `extra[h.as_str()]` as an object, created on demand.
+    /// Adapters write here, never at the top level of `extra`.
+    pub fn harness_extra_mut(&mut self, h: Harness) -> &mut serde_json::Map<String, serde_json::Value> {
+        harness_bag_mut(&mut self.extra, h)
+    }
+
+    /// The harness-specific fact bag for `h`, if any facts were recorded.
+    pub fn harness_extra(&self, h: Harness) -> Option<&serde_json::Map<String, serde_json::Value>> {
+        self.extra.get(h.as_str()).and_then(serde_json::Value::as_object)
+    }
+
     /// First non-empty user text, used as a fallback title / preview.
     pub fn first_user_text(&self) -> Option<String> {
         self.messages
@@ -245,14 +297,141 @@ pub enum Role {
     Tool,
 }
 
+/// What a message IS — every adapter sets it, every emitter reads it (`docs/INTERFACE-V2.md` §4).
+/// `Role` says who speaks; `MessageKind` says what the turn is; `Origin` says where it came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageKind {
+    /// A human's typed prompt (`Role::User`, `Origin::Human`).
+    Prompt,
+    /// The model's reply (`Role::Assistant`): text, thinking and tool calls.
+    Reply,
+    /// Tool output fed back to the model (`Role::Tool`).
+    ToolResult,
+    /// Context the HARNESS injected into the model's input: Claude attachments / system reminders,
+    /// Kimi injections, Goose `<turn-context>`, Codex `<environment_context>`, hook stdout.
+    InjectedContext,
+    /// The system prompt, when the store keeps it as a message (Kimi `profile.bind`, Hermes system
+    /// row, OpenClaw). The session-level copy is `Session::system_prompt`.
+    SystemPrompt,
+    /// A harness notice shown to the user, not sent to the model: slash-command output, task
+    /// terminated, turn aborted, "usage limit reset", Codex `item_completed` notes.
+    Notice,
+    /// The point where the harness compacted the context.
+    CompactionBoundary,
+    /// The summary that seeds the next window after a compaction.
+    CompactionSummary,
+    /// The model (or effort) changed from here on; `Message::model` holds the new one.
+    ModelChange,
+    /// An error the model never answered: API error, refusal fallback, retry exhaustion.
+    Error,
+    /// A sub-agent was spawned here (the `Agent` / `spawn` call).
+    SubagentSpawn,
+    /// A sub-agent's final return, delivered to the parent.
+    SubagentReturn,
+    /// A branch / rewind / reset marker: what follows does not continue what precedes.
+    Branch,
+    /// A verbatim non-conversational record carried only under `ParseOptions::complete`.
+    Carrier,
+}
+
+impl MessageKind {
+    /// The kind a bare role implies when an adapter has not said otherwise: User→Prompt,
+    /// Assistant→Reply, Tool→ToolResult, System→Notice. Adapters MUST set the precise kind; this
+    /// exists for `Message::new` and for legacy IR JSON that predates `kind`.
+    pub fn for_role(role: Role) -> Self {
+        match role {
+            Role::User => MessageKind::Prompt,
+            Role::Assistant => MessageKind::Reply,
+            Role::Tool => MessageKind::ToolResult,
+            Role::System => MessageKind::Notice,
+        }
+    }
+
+    /// The canonical snake_case name (what `--json` prints).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MessageKind::Prompt => "prompt",
+            MessageKind::Reply => "reply",
+            MessageKind::ToolResult => "tool_result",
+            MessageKind::InjectedContext => "injected_context",
+            MessageKind::SystemPrompt => "system_prompt",
+            MessageKind::Notice => "notice",
+            MessageKind::CompactionBoundary => "compaction_boundary",
+            MessageKind::CompactionSummary => "compaction_summary",
+            MessageKind::ModelChange => "model_change",
+            MessageKind::Error => "error",
+            MessageKind::SubagentSpawn => "subagent_spawn",
+            MessageKind::SubagentReturn => "subagent_return",
+            MessageKind::Branch => "branch",
+            MessageKind::Carrier => "carrier",
+        }
+    }
+
+    /// Was this turn part of what the model actually saw or said (as opposed to a harness-side
+    /// notice, marker or carrier)? Prompts, replies, tool results, injected context and the
+    /// system prompt are; everything else is bookkeeping around the conversation.
+    pub fn is_model_visible(self) -> bool {
+        matches!(
+            self,
+            MessageKind::Prompt
+                | MessageKind::Reply
+                | MessageKind::ToolResult
+                | MessageKind::InjectedContext
+                | MessageKind::SystemPrompt
+                | MessageKind::CompactionSummary
+        )
+    }
+}
+
+/// Where a message came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Origin {
+    /// Typed by a person.
+    Human,
+    /// Produced by the model.
+    Model,
+    /// Produced by the harness itself (reminders, notices, compaction, environment context).
+    Harness,
+    /// A user-configured hook's output.
+    Hook,
+    /// Cron / loop wakeups and other automation.
+    Scheduler,
+    /// Another agent: inter-agent messages, sub-agent returns.
+    Subagent,
+    /// Imported from another harness by the harness (Goose / Hermes importers).
+    Import,
+    /// The store does not say.
+    #[default]
+    Unknown,
+}
+
+impl Origin {
+    /// The origin a bare role implies: User→Human, Assistant→Model, Tool→Harness (the harness ran
+    /// the tool), System→Harness. Adapters override when the store says otherwise.
+    pub fn for_role(role: Role) -> Self {
+        match role {
+            Role::User => Origin::Human,
+            Role::Assistant => Origin::Model,
+            Role::Tool | Role::System => Origin::Harness,
+        }
+    }
+}
+
 /// One message/turn in a conversation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Message {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<String>,
+    /// WHO speaks.
     pub role: Role,
+    /// WHAT the turn is. See [`MessageKind`].
+    pub kind: MessageKind,
+    /// WHERE it came from. See [`Origin`].
+    pub origin: Origin,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timestamp: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -260,23 +439,107 @@ pub struct Message {
     pub content: Vec<Block>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
-    /// Harness-specific fields preserved verbatim for lossless-ish round-tripping.
+    /// Harness-specific message facts, nested under the harness name
+    /// (`extra["claude"]["attachment_type"]`). The only other top-level key allowed is
+    /// [`CARRIER_KEY`](crate::harness::claude::CARRIER_KEY) (`"_record"`, the verbatim record under
+    /// `ParseOptions::complete`). Shared concepts are first-class (`kind`, `origin`, `usage`,
+    /// `Block::ToolResult::details`). See `docs/INTERFACE-V2.md` §4.
     #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
+/// Deserialize with `kind` / `origin` optional: IR JSON written before they existed (and
+/// hand-written test fixtures) get the role-implied defaults instead of failing.
+impl<'de> Deserialize<'de> for Message {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Wire {
+            #[serde(default)]
+            id: Option<String>,
+            #[serde(default)]
+            parent_id: Option<String>,
+            role: Role,
+            #[serde(default)]
+            kind: Option<MessageKind>,
+            #[serde(default)]
+            origin: Option<Origin>,
+            #[serde(default)]
+            timestamp: Option<DateTime<Utc>>,
+            #[serde(default)]
+            model: Option<String>,
+            #[serde(default)]
+            content: Vec<Block>,
+            #[serde(default)]
+            usage: Option<Usage>,
+            #[serde(default)]
+            extra: serde_json::Map<String, serde_json::Value>,
+        }
+        let w = Wire::deserialize(d)?;
+        Ok(Message {
+            id: w.id,
+            parent_id: w.parent_id,
+            role: w.role,
+            kind: w.kind.unwrap_or_else(|| MessageKind::for_role(w.role)),
+            origin: w.origin.unwrap_or_else(|| Origin::for_role(w.role)),
+            timestamp: w.timestamp,
+            model: w.model,
+            content: w.content,
+            usage: w.usage,
+            extra: w.extra,
+        })
+    }
+}
+
+/// `extra[h.as_str()]` as a mutable object, created on demand. Shared by [`Session`] and
+/// [`Message`]; a non-object value already under that key is replaced (it can only be a bug).
+fn harness_bag_mut(
+    extra: &mut serde_json::Map<String, serde_json::Value>,
+    h: Harness,
+) -> &mut serde_json::Map<String, serde_json::Value> {
+    let slot = extra
+        .entry(h.as_str())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if !slot.is_object() {
+        *slot = serde_json::Value::Object(serde_json::Map::new());
+    }
+    slot.as_object_mut().expect("just ensured an object")
+}
+
 impl Message {
+    /// A message with the role-implied `kind` and `origin` (`MessageKind::for_role`,
+    /// `Origin::for_role`). Adapters refine both once they know better.
     pub fn new(role: Role) -> Self {
         Message {
             id: None,
             parent_id: None,
             role,
+            kind: MessageKind::for_role(role),
+            origin: Origin::for_role(role),
             timestamp: None,
             model: None,
             content: Vec::new(),
             usage: None,
             extra: serde_json::Map::new(),
         }
+    }
+
+    /// A message of an explicit kind, with the role that kind conventionally carries.
+    pub fn of_kind(role: Role, kind: MessageKind, origin: Origin) -> Self {
+        let mut m = Message::new(role);
+        m.kind = kind;
+        m.origin = origin;
+        m
+    }
+
+    /// The harness-specific fact bag for `h` — `extra[h.as_str()]` as an object, created on demand.
+    /// Adapters write here, never at the top level of `extra`.
+    pub fn harness_extra_mut(&mut self, h: Harness) -> &mut serde_json::Map<String, serde_json::Value> {
+        harness_bag_mut(&mut self.extra, h)
+    }
+
+    /// The harness-specific fact bag for `h`, if any facts were recorded.
+    pub fn harness_extra(&self, h: Harness) -> Option<&serde_json::Map<String, serde_json::Value>> {
+        self.extra.get(h.as_str()).and_then(serde_json::Value::as_object)
     }
 
     /// Resolve this message's lazy content spans in place against `resolver`, so its content is owned
@@ -346,9 +609,10 @@ impl Message {
     }
 }
 
-/// A unit of message content. Tagged so it (de)serializes to clean JSON.
+/// A unit of message content. Tagged by `type` — the word every harness uses on the wire — so a
+/// block's `type` is never confused with its message's `kind`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum Block {
     Text {
         text: crate::lazy::Text,
@@ -369,6 +633,10 @@ pub enum Block {
         id: String,
         name: String,
         input: serde_json::Value,
+        /// The tool's namespace when the harness has one (Codex `collaboration`, MCP server names).
+        /// `name` stays the bare tool name so tool statistics keep grouping.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        namespace: Option<String>,
     },
     /// The result of a tool/function call.
     ToolResult {
@@ -426,6 +694,12 @@ pub struct Usage {
     pub cache_read_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_creation_tokens: Option<u64>,
+    /// Reasoning / thinking tokens when the provider reports them separately from `output_tokens`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u64>,
+    /// Provider-reported cost in USD, when the harness stores it (Goose, OpenCode, Codex).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
 }
 
 /// A lightweight handle to a session discovered on disk, cheap to produce for listings/search
@@ -575,6 +849,8 @@ mod tests {
             messages: vec![user("<system-reminder>noise</system-reminder>\n\nask about otters")],
             source_path: None,
             extra: Default::default(),
+            system_prompt: None,
+            lineage: crate::ir::Lineage::default(),
         };
         // Explicit title wins.
         assert_eq!(s.synth_title().as_deref(), Some("explicit"));

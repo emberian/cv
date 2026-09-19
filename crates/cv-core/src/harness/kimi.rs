@@ -176,6 +176,8 @@ impl Adapter for Kimi {
             messages: Vec::new(),
             source_path: Some(r.path.clone()),
             extra: serde_json::Map::new(),
+            system_prompt: None,
+            lineage: crate::ir::Lineage::default(),
         };
 
         // Sidecar enrichment from wire.jsonl (tolerant: absent/empty/malformed ⇒ empty). The
@@ -477,7 +479,7 @@ fn tool_calls(content: &[Block]) -> Vec<Value> {
     content
         .iter()
         .filter_map(|b| match b {
-            Block::ToolUse { id, name, input } => Some(serde_json::json!({
+            Block::ToolUse { id, name, input, .. } => Some(serde_json::json!({
                 "type": "function",
                 "id": id,
                 "function": {
@@ -732,7 +734,12 @@ fn context_message(v: &Value, enrich: &WireEnrich) -> Option<Message> {
                         .unwrap_or("")
                         .to_string();
                     let input = parse_arguments(func.and_then(|f| f.get("arguments")));
-                    m.content.push(Block::ToolUse { id, name, input });
+                    m.content.push(Block::ToolUse {
+                        id,
+                        name,
+                        input,
+                        namespace: None,
+                    });
                 }
             }
             (!m.content.is_empty()).then_some(m)
@@ -951,6 +958,8 @@ fn wire_usage(tu: &Value) -> Usage {
         output_tokens: g("output"),
         cache_read_tokens: g("input_cache_read"),
         cache_creation_tokens: g("input_cache_creation"),
+        reasoning_tokens: None,
+        cost_usd: None,
     }
 }
 
@@ -1190,7 +1199,7 @@ mod tests {
         }
         assert!(matches!(&m.content[1], Block::Text { text } if text == "Let me look."));
         match &m.content[2] {
-            Block::ToolUse { id, name, input } => {
+            Block::ToolUse { id, name, input, .. } => {
                 assert_eq!(id, "tool_1");
                 assert_eq!(name, "Shell");
                 assert_eq!(input["command"], "cat .gitmodules");
@@ -1434,6 +1443,8 @@ mod tests {
             output_tokens: Some(42),
             cache_read_tokens: None,
             cache_creation_tokens: None,
+            reasoning_tokens: None,
+            cost_usd: None,
         });
         asst.content.push(Block::Thinking {
             text: "let me think".into(),
@@ -1448,6 +1459,7 @@ mod tests {
             id: "tool_1".into(),
             name: "Shell".into(),
             input: serde_json::json!({ "command": "ls" }),
+            namespace: None,
         });
 
         let mut tool = Message::new(Role::Tool);
@@ -1472,6 +1484,8 @@ mod tests {
             messages: vec![sys, user, asst, tool],
             source_path: None,
             extra: serde_json::Map::new(),
+            system_prompt: None,
+            lineage: crate::ir::Lineage::default(),
         };
 
         let out = emit_temp_dir();
@@ -1518,7 +1532,7 @@ mod tests {
             .iter()
             .any(|b| matches!(b, Block::Text { text } if text == "Running ls.")));
         match a.content.iter().find(|b| matches!(b, Block::ToolUse { .. })).unwrap() {
-            Block::ToolUse { id, name, input } => {
+            Block::ToolUse { id, name, input, .. } => {
                 assert_eq!(id, "tool_1");
                 assert_eq!(name, "Shell");
                 assert_eq!(input["command"], "ls");

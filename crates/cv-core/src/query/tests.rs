@@ -257,6 +257,8 @@ fn thread_matches_message_path() {
         content: blocks,
         usage: None,
         extra: serde_json::Map::new(),
+        kind: crate::ir::MessageKind::for_role(role),
+        origin: crate::ir::Origin::for_role(role),
     };
     let text = |t: &str| Block::Text { text: t.into() };
     // u1("please refactor") -> a1(assistant) -> t1(tool Bash)
@@ -280,11 +282,14 @@ fn thread_matches_message_path() {
                     id: "x".into(),
                     name: "Bash".into(),
                     input: serde_json::json!({}),
+                    namespace: None,
                 }],
             ),
         ],
         source_path: None,
         extra: serde_json::Map::new(),
+        system_prompt: None,
+        lineage: crate::ir::Lineage::default(),
     };
 
     assert!(q(r#"thread:"text:refactor > assistant""#).matches_session(&s));
@@ -423,6 +428,8 @@ fn msgs_counts_user_assistant_only_in_matches_session() {
         content: vec![],
         usage: None,
         extra: serde_json::Map::new(),
+        kind: crate::ir::MessageKind::for_role(role),
+        origin: crate::ir::Origin::for_role(role),
     };
     s.messages.push(extra(Role::User));
     s.messages.push(extra(Role::Tool));
@@ -454,9 +461,13 @@ fn sess(primary: Option<&str>, turn_models: &[Option<&str>]) -> Session {
                 content: vec![],
                 usage: None,
                 extra: serde_json::Map::new(),
+                kind: crate::ir::MessageKind::for_role(Role::Assistant),
+                origin: crate::ir::Origin::for_role(Role::Assistant),
             })
             .collect(),
         source_path: None,
         extra: serde_json::Map::new(),
+        system_prompt: None,
+        lineage: crate::ir::Lineage::default(),
     }
 }

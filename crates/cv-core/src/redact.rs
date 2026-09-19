@@ -1035,6 +1035,8 @@ mod tests {
             messages: Vec::new(),
             source_path: None,
             extra: serde_json::Map::new(),
+            system_prompt: None,
+            lineage: crate::ir::Lineage::default(),
         }
     }
 
@@ -1262,6 +1264,7 @@ mod tests {
             id: "1".into(),
             name: "bash".into(),
             input,
+            namespace: None,
         });
         sess.messages.push(m);
 

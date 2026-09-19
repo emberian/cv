@@ -91,6 +91,8 @@ pub fn splice(spans: &[Span<'_>], new_id: Option<String>, harness: Harness) -> S
         messages,
         source_path: None,
         extra,
+        system_prompt: None,
+        lineage: crate::ir::Lineage::default(),
     }
 }
 
@@ -152,6 +154,8 @@ mod tests {
             messages,
             source_path: Some("/tmp/orig.jsonl".into()),
             extra: serde_json::Map::new(),
+            system_prompt: None,
+            lineage: crate::ir::Lineage::default(),
         }
     }
 

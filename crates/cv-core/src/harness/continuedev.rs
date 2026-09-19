@@ -139,6 +139,8 @@ impl Adapter for Continue {
             messages: Vec::new(),
             source_path: Some(r.path.clone()),
             extra: serde_json::Map::new(),
+            system_prompt: None,
+            lineage: crate::ir::Lineage::default(),
         };
 
         // Map (or read) the file's raw bytes; the borrowed `Doc` slices into them.
@@ -375,7 +377,7 @@ fn history_item(msg: &Message, session_model: Option<&str>) -> Value {
                             }));
                         }
                     }
-                    Block::ToolUse { id, name, input } => {
+                    Block::ToolUse { id, name, input, .. } => {
                         tool_calls.push(json!({
                             "id": id,
                             "type": "function",
@@ -619,7 +621,12 @@ fn history_item_to_message(item: &Value, model: &mut Option<String>) -> Option<M
                             .unwrap_or("")
                             .to_string();
                         let input = parse_arguments(func.and_then(|f| f.get("arguments")));
-                        m.content.push(Block::ToolUse { id, name, input });
+                        m.content.push(Block::ToolUse {
+                            id,
+                            name,
+                            input,
+                            namespace: None,
+                        });
                     }
                 }
             }
@@ -838,7 +845,7 @@ mod tests {
         assert_eq!(m.role, Role::Assistant);
         assert_eq!(m.text().as_deref(), Some("let me check"));
         match m.content.iter().find(|b| matches!(b, Block::ToolUse { .. })) {
-            Some(Block::ToolUse { id, name, input }) => {
+            Some(Block::ToolUse { id, name, input, .. }) => {
                 assert_eq!(id, "call_1");
                 assert_eq!(name, "read_file");
                 assert_eq!(input["path"], "a.rs");
@@ -968,6 +975,8 @@ mod tests {
             messages: Vec::new(),
             source_path: None,
             extra: serde_json::Map::new(),
+            system_prompt: None,
+            lineage: crate::ir::Lineage::default(),
         };
 
         let mut user = Message::new(Role::User);
@@ -982,6 +991,7 @@ mod tests {
             id: "call_1".into(),
             name: "read_file".into(),
             input: json!({ "path": "a.rs" }),
+            namespace: None,
         });
         session.messages.push(asst);
 

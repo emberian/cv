@@ -624,7 +624,7 @@ fn claude_assistant_blocks(content: &[Block]) -> Vec<Value> {
                 }
                 out.push(Value::Object(m));
             }
-            Block::ToolUse { id, name, input } => out.push(json!({
+            Block::ToolUse { id, name, input, .. } => out.push(json!({
                 "type": "tool_use",
                 "id": id,
                 "name": name,
@@ -914,7 +914,7 @@ fn emit_codex(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<E
                             }
                             lines.push(codex_response_item(&ts, Value::Object(p)));
                         }
-                        Block::ToolUse { id, name, input } => {
+                        Block::ToolUse { id, name, input, .. } => {
                             let args = serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string());
                             lines.push(codex_response_item(
                                 &ts,
@@ -1129,7 +1129,7 @@ fn emit_grok(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Em
                     .content
                     .iter()
                     .filter_map(|b| match b {
-                        Block::ToolUse { id, name, input } => Some(json!({
+                        Block::ToolUse { id, name, input, .. } => Some(json!({
                             "id": id,
                             "name": name,
                             "arguments": serde_json::to_string(input)
@@ -1351,7 +1351,7 @@ fn emit_opencode(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Resul
                     }
                     write_part(Value::Object(p))?;
                 }
-                Block::ToolUse { id, name, input } => {
+                Block::ToolUse { id, name, input, .. } => {
                     let mut state = Map::new();
                     state.insert("input".into(), input.clone());
                     // Attach the paired result, if we have one.
@@ -1576,7 +1576,7 @@ fn openclaw_content_blocks(content: &[Block]) -> Value {
                 }
                 out.push(Value::Object(m));
             }
-            Block::ToolUse { id, name, input } => out.push(json!({
+            Block::ToolUse { id, name, input, .. } => out.push(json!({
                 "type": "toolCall",
                 "id": id,
                 "name": name,
@@ -1719,7 +1719,7 @@ fn emit_gemini(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<
                 // the reader emits a proper Tool turn for it.
                 let mut calls = Vec::new();
                 for b in &msg.content {
-                    if let Block::ToolUse { id, name, input } = b {
+                    if let Block::ToolUse { id, name, input, .. } = b {
                         let mut call = Map::new();
                         call.insert("id".into(), json!(id));
                         call.insert("name".into(), json!(name));
@@ -2200,7 +2200,7 @@ fn emit_hermes(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<
                 .content
                 .iter()
                 .filter_map(|b| match b {
-                    Block::ToolUse { id, name, input } => Some(json!({
+                    Block::ToolUse { id, name, input, .. } => Some(json!({
                         "id": id,
                         "type": "function",
                         "function": {
@@ -2301,6 +2301,7 @@ mod tests {
             id: "call_1".into(),
             name: "run_shell".into(),
             input: serde_json::json!({ "cmd": "ls" }),
+            namespace: None,
         });
 
         let mut tool = Message::new(Role::Tool);
@@ -2329,6 +2330,8 @@ mod tests {
             messages: vec![sys, user, asst, tool],
             source_path: None,
             extra: serde_json::Map::new(),
+            system_prompt: None,
+            lineage: crate::ir::Lineage::default(),
         }
     }
 
@@ -3116,6 +3119,8 @@ mod tests {
             messages: vec![user, asst],
             source_path: None,
             extra: serde_json::Map::new(),
+            system_prompt: None,
+            lineage: crate::ir::Lineage::default(),
         }
     }
 

@@ -380,6 +380,8 @@ fn stream_db(conn: &Connection, r: &SessionRef, sink: &mut dyn MessageSink) -> R
         messages: Vec::new(),
         source_path: Some(r.path.clone()),
         extra,
+        system_prompt: None,
+        lineage: crate::ir::Lineage::default(),
     };
     // All session metadata is known up front, so hand it to the sink before the body.
     sink.meta(&s);
@@ -485,6 +487,8 @@ fn apply_metadata(m: &mut Message, meta: Value) {
             output_tokens: get("outputTokens"),
             cache_read_tokens: get("cacheReadTokens"),
             cache_creation_tokens: get("cacheWriteTokens"),
+            reasoning_tokens: None,
+            cost_usd: None,
         };
         if usage.input_tokens.is_some() || usage.output_tokens.is_some() {
             m.usage = Some(usage);
@@ -604,6 +608,8 @@ fn stream_legacy(name: &str, path: &Path, sink: &mut dyn MessageSink) -> Result<
         messages: Vec::new(),
         source_path: Some(path.to_path_buf()),
         extra: serde_json::Map::new(),
+        system_prompt: None,
+        lineage: crate::ir::Lineage::default(),
     };
     sink.meta(&s);
 
@@ -734,7 +740,12 @@ fn item_to_block(item: &Value, tool_names: &mut HashMap<String, String>) -> Opti
             if !id.is_empty() && !name.is_empty() {
                 tool_names.insert(id.clone(), name.clone());
             }
-            Some(Block::ToolUse { id, name, input })
+            Some(Block::ToolUse {
+                id,
+                name,
+                input,
+                namespace: None,
+            })
         }
         "toolResponse" => {
             let id = item.get("id").and_then(Value::as_str).unwrap_or("").to_string();
@@ -1077,7 +1088,7 @@ mod tests {
         );
         assert!(matches!(&a.content[1], Block::Text { text } if text == "Working on it"));
         assert!(
-            matches!(&a.content[2], Block::ToolUse { name, id, input } if name == "shell" && id == "call_1" && input.get("command").and_then(Value::as_str) == Some("ls"))
+            matches!(&a.content[2], Block::ToolUse { name, id, input , ..} if name == "shell" && id == "call_1" && input.get("command").and_then(Value::as_str) == Some("ls"))
         );
         assert_eq!(a.usage.as_ref().unwrap().output_tokens, Some(42));
 
