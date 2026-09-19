@@ -1,4 +1,5 @@
-//! Hermes (Nous Research) adapter — `~/.hermes/state.db` (SQLite, schema v14).
+//! Hermes (Nous Research) adapter — `~/.hermes/state.db` (SQLite, schema v30; back-compatible to the
+//! pre-v11 tables).
 //!
 //! See `docs/FORMATS.md`. One DB holds all sessions: a `sessions` table (metadata) and a `messages`
 //! table (OpenAI-shaped rows: role, content, tool_calls JSON, reasoning, …). cwd is NOT persisted
@@ -27,6 +28,26 @@
 //! root→tip and merges all messages (mirroring Hermes's own
 //! `get_messages_as_conversation(include_ancestors=True)`), deduplicating the replayed first user
 //! message at each compression boundary, so a resumed/compressed conversation reads as one transcript.
+//! Only COMPRESSION parents are merged (`_COMPRESSION_CHILD_SQL`): a `/branch` copy
+//! (`model_config._branched_from`) owns a copied transcript and stands alone, and reset
+//! (`_reset_from`) / delegate sub-agent (`_delegate_from`) children are separate conversations that
+//! merely record their lineage (`hermes_state_common.py:151-216`); merging them duplicated the parent
+//! under every child.
+//!
+//! Since 2026-07 (schema v11→v30) compaction is IN PLACE under one session id
+//! (`hermes_state_messages.py archive_and_compact`): the summarized rows get `active=0, compacted=1`
+//! (still displayed as history), the summary is inserted as a fresh active row with
+//! `_compressed_summary=1` (`display_kind='hidden'` for a standalone handoff), the carried tail is
+//! column-cloned to fresh ids and its originals — like rewound rows — get `active=0, compacted=0`.
+//! Hermes's display projection is `(active = 1 OR compacted = 1) ORDER BY id`
+//! (`_DISPLAY_ACTIVE_CLAUSE`; "timestamps are not monotonic and would break tool-call adjacency"),
+//! generation-deduped by `(role, content, timestamp, tool_call_id, tool_calls, tool_name)`. The lean
+//! passes mirror that exactly; `complete` reads every row and tags `active`/`compacted` instead. A
+//! summary row becomes a `compact_boundary` System marker + an `isCompactSummary` System message, the
+//! same shape the Claude adapter produces, so `cv compaction`/doctor see Hermes compactions too.
+//! Display sidecars (`api_content` = the verbatim provider view of a user row, `display_kind`,
+//! `display_metadata`, `effect_disposition`) ride in `extra`; harness-injected `display_kind` notices
+//! (`auto_continue`, `model_switch`, `internal_notification`, …) are System turns, not prompts.
 
 use super::Adapter;
 use crate::ir::*;
@@ -68,7 +89,60 @@ const OPTIONAL_MSG_COLS: &[&str] = &[
     "codex_message_items",
     "platform_message_id",
     "observed",
+    // v11+ (2026-07, `hermes_cli/session_schema_history.py`): tool-effect classification, the
+    // in-place compaction flags, and the display sidecars.
+    "effect_disposition",
+    "active",
+    "compacted",
+    "_compressed_summary",
+    "api_content",
+    "display_kind",
+    "display_metadata",
 ];
+
+/// `display_kind` values Hermes stamps on rows IT injected (not typed by the human): a hidden
+/// compaction handoff, auto-continue nudges, model-switch / delegation / process notices. They read
+/// as System turns so titles, first-prompt previews and turn counts stay honest; `steer` (a human
+/// mid-turn steer) keeps its user role.
+const HARNESS_DISPLAY_KINDS: &[&str] = &[
+    "hidden",
+    "auto_continue",
+    "model_switch",
+    "async_delegation_complete",
+    "process_complete",
+    "internal_notification",
+];
+
+/// `Session.extra` key holding this session's lineage facts: the `model_config` markers
+/// (`_branched_from` / `_reset_from` / `_delegate_from`, `hermes_state_common.py:151-216`) and its
+/// `parent_session_id` when the parent was NOT merged into this transcript (branch/reset/delegate
+/// children, or a parent that did not end in compression).
+pub const LINEAGE_KEY: &str = "hermes_lineage";
+const LINEAGE_MARKERS: &[&str] = &["_branched_from", "_reset_from", "_delegate_from"];
+
+/// The `model_config` JSON lineage markers present on a session row, if any.
+fn lineage_markers(model_config: Option<&str>) -> serde_json::Map<String, Value> {
+    let mut out = serde_json::Map::new();
+    let Some(Value::Object(cfg)) = model_config.and_then(|m| serde_json::from_str::<Value>(m).ok()) else {
+        return out;
+    };
+    for k in LINEAGE_MARKERS {
+        if let Some(v) = cfg.get(*k).filter(|v| !v.is_null()) {
+            out.insert((*k).into(), v.clone());
+        }
+    }
+    out
+}
+
+/// True if the DB has a table of this name (`system_prompts` arrived with schema v25).
+fn table_exists(conn: &Connection, name: &str) -> bool {
+    conn.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        [name],
+        |_| Ok(()),
+    )
+    .is_ok()
+}
 
 pub struct Hermes {
     /// Every Hermes `state.db` we can read: the top-level `<home>/state.db` PLUS one per
@@ -158,11 +232,11 @@ impl Adapter for Hermes {
         crate::stream::collect(self, r)
     }
 
-    fn stream(&self, r: &SessionRef, _opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
+    fn stream(&self, r: &SessionRef, opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
         // Route by the ref's own DB path (set at discovery time), NOT a single self.db — this is
         // what lets one Hermes adapter span many profile DBs without id collisions.
         let conn = Self::open_path(&r.path)?;
-        stream_conn(&conn, r, sink)
+        stream_conn(&conn, r, opts, sink)
     }
 }
 
@@ -194,8 +268,9 @@ fn session_has_col(conn: &Connection, col: &str) -> bool {
     found
 }
 
-/// Row shape of the per-session metadata SELECT in [`discover_conn`] (columns guarded by
-/// `session_has_col`, absent ones selected as NULL).
+/// Row shape of the per-session metadata SELECT in [`stream_conn`] (columns guarded by
+/// `session_has_col`, absent ones selected as NULL): model, started_at, ended_at, title, source,
+/// parent_session_id, end_reason, cwd, git_branch, last_activity_at, model_config.
 type SessionMetaRow = (
     Option<String>,
     Option<f64>,
@@ -204,16 +279,69 @@ type SessionMetaRow = (
     Option<String>,
     Option<String>,
     Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<f64>,
+    Option<String>,
 );
 
+/// The most recent of a session's activity stamps: Hermes bumps `last_activity_at` on every turn
+/// while `ended_at` stays NULL for a live session, so it is the honest `updated_at`.
+fn latest_of(stamps: [Option<f64>; 3]) -> Option<DateTime<Utc>> {
+    stamps
+        .into_iter()
+        .flatten()
+        .fold(None, |acc: Option<f64>, t| Some(acc.map_or(t, |a| a.max(t))))
+        .and_then(secs_to_dt)
+}
+
+/// One `SessionRef` per LISTABLE session, mirroring Hermes's own picker
+/// (`hermes_state_sessions.py _session_filter_where` + `_LISTABLE_CHILD_SQL`): `archived = 0 AND
+/// hidden = 0` where those columns exist, no delegate sub-agent runs (`model_config._delegate_from`),
+/// and no compression ANCESTORS — a session that ended in compression and has a continuation is
+/// listed once, as its tip, whose parse merges the whole chain (Hermes lists the root and resumes
+/// to the tip; cv's `parse` walks upward from the ref, so the tip is the one to list). Branch and
+/// reset children are user-visible conversations and stay listed.
 fn discover_conn(conn: &Connection, path: &Path) -> Result<Vec<SessionRef>> {
-    // `title` predates several columns but has existed a long time; guard it anyway.
-    let has_title = session_has_col(conn, "title");
-    let title_expr = if has_title { "title" } else { "NULL" };
+    let expr = |col: &str| {
+        if session_has_col(conn, col) {
+            col.to_string()
+        } else {
+            "NULL".to_string()
+        }
+    };
+    let mut filters: Vec<&str> = Vec::new();
+    if session_has_col(conn, "archived") {
+        filters.push("archived = 0");
+    }
+    if session_has_col(conn, "hidden") {
+        filters.push("hidden = 0");
+    }
+    let where_clause = if filters.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", filters.join(" AND "))
+    };
     let sql = format!(
-        "SELECT id, {title_expr}, started_at, ended_at, message_count \
-         FROM sessions ORDER BY started_at DESC"
+        "SELECT id, {title}, started_at, ended_at, message_count, {cwd}, {last}, {model_config} \
+         FROM sessions{where_clause} ORDER BY started_at DESC",
+        title = expr("title"),
+        cwd = expr("cwd"),
+        last = expr("last_activity_at"),
+        model_config = expr("model_config"),
     );
+    // Compression ancestors: parents (ended in compression) that some session continues from.
+    let mut compression_parents: HashSet<String> = HashSet::new();
+    if session_has_col(conn, "parent_session_id") && session_has_col(conn, "end_reason") {
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT DISTINCT p.id FROM sessions p JOIN sessions c ON c.parent_session_id = p.id \
+             WHERE p.end_reason IN ('compression', 'orphaned_compression')",
+        ) {
+            if let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) {
+                compression_parents.extend(rows.flatten());
+            }
+        }
+    }
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([], |row| {
         let id: String = row.get(0)?;
@@ -221,20 +349,29 @@ fn discover_conn(conn: &Connection, path: &Path) -> Result<Vec<SessionRef>> {
         let started: Option<f64> = row.get(2).ok().flatten();
         let ended: Option<f64> = row.get(3).ok().flatten();
         let count: Option<i64> = row.get(4).ok().flatten();
-        Ok(SessionRef {
+        let cwd: Option<String> = row.get(5).ok().flatten();
+        let last: Option<f64> = row.get(6).ok().flatten();
+        let model_config: Option<String> = row.get(7).ok().flatten();
+        Ok((id, title, started, ended, count, cwd, last, model_config))
+    })?;
+    let mut out = Vec::new();
+    for (id, title, started, ended, count, cwd, last, model_config) in rows.flatten() {
+        if compression_parents.contains(&id) {
+            continue;
+        }
+        if lineage_markers(model_config.as_deref()).contains_key("_delegate_from") {
+            continue;
+        }
+        out.push(SessionRef {
             id,
             harness: Harness::Hermes,
             path: path.to_path_buf(),
-            cwd: None,
+            cwd: cwd.filter(|c| !c.is_empty()).map(PathBuf::from),
             title: title.map(|t| crate::ir::truncate(&t, 80)),
             created_at: started.and_then(secs_to_dt),
-            updated_at: ended.and_then(secs_to_dt).or_else(|| started.and_then(secs_to_dt)),
+            updated_at: latest_of([ended, last, started]),
             message_count: count.unwrap_or(0).max(0) as usize,
-        })
-    })?;
-    let mut out = Vec::new();
-    for r in rows.flatten() {
-        out.push(r);
+        });
     }
     Ok(out)
 }
@@ -244,7 +381,18 @@ fn discover_conn(conn: &Connection, path: &Path) -> Result<Vec<SessionRef>> {
 /// columns map to JSON strings; the aggregate counters to JSON numbers (see [`SESSION_META_INT_COLS`]).
 /// `source` / `end_reason` are read by the metadata SELECT already and passed in (so we don't re-probe
 /// them); everything here is probed independently to stay graceful on older schemas.
-const SESSION_META_TEXT_COLS: &[&str] = &["user_id", "model_config", "system_prompt"];
+const SESSION_META_TEXT_COLS: &[&str] = &[
+    "user_id",
+    "model_config",
+    "system_prompt",
+    // v11+: where the transcript came from and how it is labelled/routed.
+    "display_name",
+    "origin_json",
+    "title_source",
+    "profile_name",
+    "transport_profile",
+    "git_repo_root",
+];
 const SESSION_META_INT_COLS: &[&str] = &[
     "tool_call_count",
     "input_tokens",
@@ -300,6 +448,26 @@ fn read_session_extra(
             meta.insert((*col).into(), Value::Number(v.into()));
         }
     }
+    // Schema v25 hollowed `sessions.system_prompt` out into `system_prompts(hash, prompt)` keyed by
+    // `system_prompt_hash` (`hermes_state_schema.py:180-199`); Hermes reads
+    // `COALESCE(sp.prompt, s.system_prompt)`. Same key as before, so emit round-trips it unchanged.
+    if !meta.contains_key("system_prompt")
+        && session_has_col(conn, "system_prompt_hash")
+        && table_exists(conn, "system_prompts")
+    {
+        let v: Option<String> = conn
+            .query_row(
+                "SELECT sp.prompt FROM sessions s JOIN system_prompts sp ON sp.hash = s.system_prompt_hash \
+                 WHERE s.id = ?1",
+                [id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten();
+        if let Some(v) = v.filter(|s| !s.is_empty()) {
+            meta.insert("system_prompt".into(), Value::String(v));
+        }
+    }
     let mut out = serde_json::Map::new();
     if !meta.is_empty() {
         out.insert(SESSION_META_KEY.into(), Value::Object(meta));
@@ -307,25 +475,31 @@ fn read_session_extra(
     out
 }
 
-fn stream_conn(conn: &Connection, r: &SessionRef, sink: &mut dyn MessageSink) -> Result<Session> {
+fn stream_conn(conn: &Connection, r: &SessionRef, opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
     // session-level metadata (guard optional columns for historical schemas).
-    let has_model = session_has_col(conn, "model");
-    let has_title = session_has_col(conn, "title");
-    let has_source = session_has_col(conn, "source");
+    let expr = |col: &str| {
+        if session_has_col(conn, col) {
+            col.to_string()
+        } else {
+            "NULL".to_string()
+        }
+    };
     let has_parent = session_has_col(conn, "parent_session_id");
-    let has_end_reason = session_has_col(conn, "end_reason");
-
     let meta_sql = format!(
-        "SELECT {model}, started_at, ended_at, {title}, {source}, {parent}, {end_reason} \
-         FROM sessions WHERE id = ?1",
-        model = if has_model { "model" } else { "NULL" },
-        title = if has_title { "title" } else { "NULL" },
-        source = if has_source { "source" } else { "NULL" },
-        parent = if has_parent { "parent_session_id" } else { "NULL" },
-        end_reason = if has_end_reason { "end_reason" } else { "NULL" },
+        "SELECT {model}, started_at, ended_at, {title}, {source}, {parent}, {end_reason}, {cwd}, \
+         {git_branch}, {last}, {model_config} FROM sessions WHERE id = ?1",
+        model = expr("model"),
+        title = expr("title"),
+        source = expr("source"),
+        parent = expr("parent_session_id"),
+        end_reason = expr("end_reason"),
+        cwd = expr("cwd"),
+        git_branch = expr("git_branch"),
+        last = expr("last_activity_at"),
+        model_config = expr("model_config"),
     );
-    let (model, started, ended, title, source, _parent, end_reason): SessionMetaRow = conn
-        .query_row(&meta_sql, [&r.id], |row| {
+    let (model, started, ended, title, source, parent, end_reason, cwd, git_branch, last_activity, model_config): SessionMetaRow =
+        conn.query_row(&meta_sql, [&r.id], |row| {
             Ok((
                 row.get(0).ok().flatten(),
                 row.get(1).ok().flatten(),
@@ -334,41 +508,63 @@ fn stream_conn(conn: &Connection, r: &SessionRef, sink: &mut dyn MessageSink) ->
                 row.get(4).ok().flatten(),
                 row.get(5).ok().flatten(),
                 row.get(6).ok().flatten(),
+                row.get(7).ok().flatten(),
+                row.get(8).ok().flatten(),
+                row.get(9).ok().flatten(),
+                row.get(10).ok().flatten(),
             ))
         })
-        .unwrap_or((None, None, None, r.title.clone(), None, None, None));
+        .unwrap_or((None, None, None, r.title.clone(), None, None, None, None, None, None, None));
 
     // Format-complete: capture the session columns that have no first-class IR home, so emit can
     // write them back (small metadata only — text/aggregate counters, never message bodies). The tip
     // session's row is the one whose metadata survives (lineage flattening keeps the tip).
-    let extra = read_session_extra(conn, &r.id, source.as_deref(), end_reason.as_deref());
+    let mut extra = read_session_extra(conn, &r.id, source.as_deref(), end_reason.as_deref());
 
-    let s = Session {
-        id: r.id.clone(),
-        harness: Harness::Hermes,
-        cwd: None,
-        title: title.or_else(|| r.title.clone()),
-        created_at: started.and_then(secs_to_dt).or(r.created_at),
-        updated_at: ended.and_then(secs_to_dt).or(r.updated_at),
-        model,
-        git: None,
-        messages: Vec::new(),
-        source_path: Some(r.path.clone()),
-        extra,
-    };
-
-    // Walk the compression/branch lineage root→tip so a compressed-and-continued conversation
-    // reads as a single transcript (mirrors get_messages_as_conversation(include_ancestors=True)).
+    // Walk the compression lineage root→tip so a compressed-and-continued conversation reads as a
+    // single transcript (mirrors `_resume_lineage_ids`); branches/resets/delegates stand alone.
     let lineage = if has_parent {
         session_lineage_root_to_tip(conn, &r.id)
     } else {
         vec![r.id.clone()]
     };
+    // Lineage facts: the `model_config` markers, plus the parent when it was NOT merged in.
+    let mut lin = lineage_markers(model_config.as_deref());
+    if lineage.len() == 1 {
+        if let Some(p) = parent.filter(|p| !p.is_empty()) {
+            lin.insert("parent_session_id".into(), Value::String(p));
+        }
+    }
+    if !lin.is_empty() {
+        extra.insert(LINEAGE_KEY.into(), Value::Object(lin));
+    }
+
+    let s = Session {
+        id: r.id.clone(),
+        harness: Harness::Hermes,
+        cwd: cwd
+            .filter(|c| !c.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| r.cwd.clone()),
+        title: title.or_else(|| r.title.clone()),
+        created_at: started.and_then(secs_to_dt).or(r.created_at),
+        updated_at: latest_of([ended, last_activity, started]).or(r.updated_at),
+        model,
+        git: git_branch.filter(|b| !b.is_empty()).map(|branch| GitInfo {
+            branch: Some(branch),
+            ..Default::default()
+        }),
+        messages: Vec::new(),
+        source_path: Some(r.path.clone()),
+        extra,
+    };
+
     let cols = present_msg_cols(conn);
     let has = |c: &str| cols.contains(c);
 
     // Build the SELECT defensively: required cols always present; optional cols gated by probe.
     let mut select_cols: Vec<&str> = vec![
+        "id",
         "role",
         "content",
         "tool_call_id",
@@ -383,6 +579,21 @@ fn stream_conn(conn: &Connection, r: &SessionRef, sink: &mut dyn MessageSink) ->
     }
     let select_list = select_cols.join(", ");
 
+    // Row visibility (schema v12+): Hermes's display projection is `(active = 1 OR compacted = 1)`
+    // — live rows plus the history a compaction summarized away — which drops rewound rows and the
+    // superseded originals of carried tails. `complete` reads every row instead and tags the flags.
+    let has_flags = has("active") && has("compacted");
+    let visibility = if has_flags && !opts.complete {
+        " AND (active = 1 OR compacted = 1)"
+    } else {
+        ""
+    };
+    // Display-generation dedup (`_dedupe_display_generations`): a compaction copies the protected
+    // tail into each generation — same role/content/timestamp/tool fields, different id/flags — so
+    // each logical message is emitted once (its first row; the copies are byte-identical).
+    let dedup_generations = has("compacted") && !opts.complete;
+    let mut seen_generations: HashSet<u64> = HashSet::new();
+
     // Hand the session-level metadata to the sink before the body (header-rendering sinks use it).
     sink.meta(&s);
 
@@ -391,7 +602,9 @@ fn stream_conn(conn: &Connection, r: &SessionRef, sink: &mut dyn MessageSink) ->
     // not the whole transcript, so peak stays O(one message).
     let mut dedup = ReplayDedup::default();
     'lineage: for sid in &lineage {
-        let sql = format!("SELECT {select_list} FROM messages WHERE session_id = ?1 ORDER BY timestamp ASC, id ASC");
+        // `ORDER BY id`, as Hermes itself reads (`_ACTIVE_IDS_SQL`, `_fetch_conversation_rows`):
+        // timestamps are not monotonic and would split a tool call from its result.
+        let sql = format!("SELECT {select_list} FROM messages WHERE session_id = ?1{visibility} ORDER BY id ASC");
         let mut stmt = conn.prepare(&sql)?;
         // Map column name -> index so we can read by name regardless of which optionals exist.
         let idx = |name: &str| select_cols.iter().position(|c| *c == name);
@@ -404,6 +617,7 @@ fn stream_conn(conn: &Connection, r: &SessionRef, sink: &mut dyn MessageSink) ->
             let get_i64 =
                 |name: &str| -> Option<i64> { idx(name).and_then(|i| row.get::<_, Option<i64>>(i).ok().flatten()) };
             Ok(MsgRow {
+                id: get_i64("id").unwrap_or(0),
                 role: get_str("role").unwrap_or_default(),
                 content: get_str("content"),
                 tool_call_id: get_str("tool_call_id"),
@@ -419,20 +633,53 @@ fn stream_conn(conn: &Connection, r: &SessionRef, sink: &mut dyn MessageSink) ->
                 codex_message_items: get_str("codex_message_items"),
                 platform_message_id: get_str("platform_message_id"),
                 observed: get_i64("observed"),
+                effect_disposition: get_str("effect_disposition"),
+                active: get_i64("active"),
+                compacted: get_i64("compacted"),
+                compressed_summary: matches!(get_i64("_compressed_summary"), Some(n) if n != 0),
+                api_content: get_str("api_content"),
+                display_kind: get_str("display_kind"),
+                display_metadata: get_str("display_metadata"),
             })
         })?;
 
         for row in rows.by_ref() {
             let Ok(row) = row else { continue };
-            if let Some(m) = row.into_message() {
-                // Dedup the replayed first user message at compression boundaries.
-                if dedup.is_duplicate(&m) {
-                    continue;
+            if dedup_generations && !seen_generations.insert(row.generation_key()) {
+                continue;
+            }
+            let row_id = row.id;
+            let Some(mut m) = row.into_message() else { continue };
+            // A compaction summary row: emit the boundary marker first, then the summary linked to
+            // it — the same two-message shape the Claude adapter yields for `compact_boundary` +
+            // `isCompactSummary`, which `crate::compaction` pairs by parent id.
+            if m.extra.get("isCompactSummary").and_then(Value::as_bool) == Some(true) {
+                let boundary_id = format!("compact-{row_id}");
+                let mut boundary = Message::new(Role::System);
+                boundary.id = Some(boundary_id.clone());
+                boundary.timestamp = m.timestamp;
+                boundary.content.push(Block::Text {
+                    text: "[conversation compacted]".to_string().into(),
+                });
+                boundary
+                    .extra
+                    .insert("subtype".into(), Value::String("compact_boundary".into()));
+                if sink.message(boundary) == Flow::Stop {
+                    break 'lineage;
                 }
-                dedup.observe(&m);
+                m.parent_id = Some(boundary_id);
                 if sink.message(m) == Flow::Stop {
                     break 'lineage;
                 }
+                continue;
+            }
+            // Dedup the replayed first user message at compression boundaries (`complete` keeps it).
+            if !opts.complete && dedup.is_duplicate(&m) {
+                continue;
+            }
+            dedup.observe(&m);
+            if sink.message(m) == Flow::Stop {
+                break 'lineage;
             }
         }
     }
@@ -487,12 +734,25 @@ impl ReplayDedup {
     }
 }
 
-/// Walk `parent_session_id` from `session_id` up to the root, return root→tip order.
-/// Mirrors `SessionDB._session_lineage_root_to_tip`. Bounded + cycle-guarded.
+/// Walk `parent_session_id` from `session_id` up through COMPRESSION continuations only, returning
+/// root→tip order — the ids a Hermes display resume materializes (`_resume_lineage_ids` /
+/// `_session_lineage_root_to_tip`, `_COMPRESSION_CHILD_SQL`). A `/branch` copy (`_branched_from`)
+/// owns a copied transcript and stands alone; reset (`_reset_from`) and delegate (`_delegate_from`)
+/// children are separate conversations that only record their lineage; a parent that ended for any
+/// reason other than compression is not a continuation either. Bounded + cycle-guarded.
 fn session_lineage_root_to_tip(conn: &Connection, session_id: &str) -> Vec<String> {
     if session_id.is_empty() {
         return vec![session_id.to_string()];
     }
+    let has_end_reason = session_has_col(conn, "end_reason");
+    let has_model_config = session_has_col(conn, "model_config");
+    let str_col = |col: &str, id: &str| -> Option<String> {
+        conn.query_row(&format!("SELECT {col} FROM sessions WHERE id = ?1"), [id], |row| {
+            row.get::<_, Option<String>>(0)
+        })
+        .ok()
+        .flatten()
+    };
     let mut chain: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     let mut current = session_id.to_string();
@@ -502,18 +762,23 @@ fn session_lineage_root_to_tip(conn: &Connection, session_id: &str) -> Vec<Strin
         }
         seen.insert(current.clone());
         chain.push(current.clone());
-        let parent: Option<String> = conn
-            .query_row(
-                "SELECT parent_session_id FROM sessions WHERE id = ?1",
-                [&current],
-                |row| row.get::<_, Option<String>>(0),
-            )
-            .ok()
-            .flatten();
-        match parent {
-            Some(p) => current = p,
-            None => break,
+        // An explicit lineage marker on this row ends the walk: it is a branch/reset/delegate child.
+        if has_model_config && !lineage_markers(str_col("model_config", &current).as_deref()).is_empty() {
+            break;
         }
+        let Some(parent) = str_col("parent_session_id", &current).filter(|p| !p.is_empty()) else {
+            break;
+        };
+        // Merge only through a parent that ended in compression (the continuation needs its rows).
+        if has_end_reason
+            && !matches!(
+                str_col("end_reason", &parent).as_deref(),
+                Some("compression") | Some("orphaned_compression")
+            )
+        {
+            break;
+        }
+        current = parent;
     }
     chain.reverse();
     if chain.is_empty() {
@@ -538,6 +803,7 @@ fn single_text(m: &Message) -> Option<String> {
 }
 
 struct MsgRow {
+    id: i64,
     role: String,
     content: Option<String>,
     tool_call_id: Option<String>,
@@ -553,19 +819,85 @@ struct MsgRow {
     codex_message_items: Option<String>,
     platform_message_id: Option<String>,
     observed: Option<i64>,
+    // v11+ columns (NULL / default on older schemas).
+    effect_disposition: Option<String>,
+    active: Option<i64>,
+    compacted: Option<i64>,
+    compressed_summary: bool,
+    api_content: Option<String>,
+    display_kind: Option<String>,
+    display_metadata: Option<String>,
 }
 
 impl MsgRow {
+    /// Hermes's display-generation identity (`_display_dedupe_key`): the fields a compaction clone
+    /// copies byte-exact. Hashed so the dedup set costs one word per row.
+    fn generation_key(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.role.hash(&mut h);
+        self.content.hash(&mut h);
+        self.timestamp.map(f64::to_bits).hash(&mut h);
+        self.tool_call_id.hash(&mut h);
+        self.tool_calls.hash(&mut h);
+        self.tool_name.hash(&mut h);
+        h.finish()
+    }
+
     fn into_message(self) -> Option<Message> {
-        let role = match self.role.as_str() {
+        let mut role = match self.role.as_str() {
             "user" => Role::User,
             "assistant" => Role::Assistant,
             "tool" => Role::Tool,
             "system" => Role::System,
             _ => Role::User,
         };
+        // Harness-injected user rows (a hidden compaction handoff, auto-continue nudges, model-switch
+        // / delegation / process notices) are System turns, not prompts.
+        if role == Role::User
+            && self
+                .display_kind
+                .as_deref()
+                .is_some_and(|k| HARNESS_DISPLAY_KINDS.contains(&k))
+        {
+            role = Role::System;
+        }
+        // A compaction summary is what seeds the next context window: never a human prompt.
+        if self.compressed_summary {
+            role = Role::System;
+        }
         let mut m = Message::new(role);
         m.timestamp = self.timestamp.and_then(secs_to_dt);
+
+        // In-place compaction / rewind flags (non-default values only, so old-schema rows carry
+        // nothing): `compacted` = summarized away but still displayed history; `active = false`
+        // alone = a rewound or superseded row (only reachable under `complete`).
+        if matches!(self.compacted, Some(c) if c != 0) {
+            m.extra.insert("compacted".into(), Value::Bool(true));
+        }
+        if matches!(self.active, Some(0)) {
+            m.extra.insert("active".into(), Value::Bool(false));
+        }
+        if self.compressed_summary {
+            m.extra.insert("isCompactSummary".into(), Value::Bool(true));
+        }
+        if let Some(k) = self.display_kind.as_deref().filter(|s| !s.is_empty()) {
+            m.extra.insert("display_kind".into(), Value::String(k.to_string()));
+        }
+        if let Some(ed) = self.effect_disposition.as_deref().filter(|s| !s.is_empty()) {
+            m.extra
+                .insert("effect_disposition".into(), Value::String(ed.to_string()));
+        }
+        // `api_content`: the verbatim provider view of this (user) row — what was actually sent, when
+        // it differs from the displayed `content` (e.g. injected context). Kept as a sidecar so the
+        // block text stays the user's own words.
+        if let Some(api) = self.api_content.as_deref().filter(|s| !s.is_empty()) {
+            m.extra.insert("api_content".into(), Value::String(api.to_string()));
+        }
+        if let Some(raw) = self.display_metadata.as_deref().filter(|s| !s.is_empty()) {
+            let v = serde_json::from_str::<Value>(raw).unwrap_or_else(|_| Value::String(raw.to_string()));
+            m.extra.insert("display_metadata".into(), v);
+        }
 
         // Per-message token_count → Usage. Hermes records a single combined count per message; we
         // route it to output_tokens for assistant turns and input_tokens otherwise (best-effort).
@@ -837,8 +1169,13 @@ fn secs_to_dt(s: f64) -> Option<DateTime<Utc>> {
 /// reattach the messages. The production path goes through `Adapter::parse` → `stream::collect`.
 #[cfg(test)]
 fn parse_conn(conn: &Connection, r: &SessionRef) -> Result<Session> {
+    parse_conn_with(conn, r, &ParseOptions::full())
+}
+
+#[cfg(test)]
+fn parse_conn_with(conn: &Connection, r: &SessionRef, opts: &ParseOptions) -> Result<Session> {
     let mut sink = crate::stream::CollectSink::default();
-    let mut s = stream_conn(conn, r, &mut sink)?;
+    let mut s = stream_conn(conn, r, opts, &mut sink)?;
     s.messages = sink.messages;
     Ok(s)
 }
@@ -1259,6 +1596,360 @@ mod tests {
         assert_eq!(s.messages[0].text().as_deref(), Some("hi"));
 
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Schema v30 (2026-09, `hermes_state_common.py:239`): the v14 tables plus the in-place
+    /// compaction flags, display sidecars, `system_prompts`, cwd/git columns and listing flags.
+    const SCHEMA_V30: &str = "
+        CREATE TABLE system_prompts (hash TEXT PRIMARY KEY, prompt TEXT NOT NULL);
+        CREATE TABLE sessions (
+            id TEXT PRIMARY KEY,
+            source TEXT NOT NULL,
+            user_id TEXT,
+            display_name TEXT,
+            model TEXT,
+            model_config TEXT,
+            system_prompt TEXT,
+            system_prompt_hash TEXT,
+            parent_session_id TEXT,
+            started_at REAL NOT NULL,
+            ended_at REAL,
+            end_reason TEXT,
+            message_count INTEGER DEFAULT 0,
+            tool_call_count INTEGER DEFAULT 0,
+            input_tokens INTEGER DEFAULT 0,
+            output_tokens INTEGER DEFAULT 0,
+            cache_read_tokens INTEGER DEFAULT 0,
+            cache_write_tokens INTEGER DEFAULT 0,
+            reasoning_tokens INTEGER DEFAULT 0,
+            cwd TEXT,
+            git_branch TEXT,
+            git_repo_root TEXT,
+            title TEXT,
+            title_source TEXT,
+            last_activity_at REAL,
+            profile_name TEXT,
+            archived INTEGER NOT NULL DEFAULT 0,
+            hidden INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT,
+            tool_call_id TEXT,
+            tool_calls TEXT,
+            tool_name TEXT,
+            effect_disposition TEXT,
+            timestamp REAL NOT NULL,
+            token_count INTEGER,
+            finish_reason TEXT,
+            reasoning TEXT,
+            reasoning_content TEXT,
+            reasoning_details TEXT,
+            codex_reasoning_items TEXT,
+            codex_message_items TEXT,
+            platform_message_id TEXT,
+            observed INTEGER DEFAULT 0,
+            _compressed_summary INTEGER NOT NULL DEFAULT 0,
+            active INTEGER NOT NULL DEFAULT 1,
+            compacted INTEGER NOT NULL DEFAULT 0,
+            api_content TEXT,
+            display_kind TEXT,
+            display_metadata TEXT,
+            display_identity BLOB,
+            display_order INTEGER
+        );
+    ";
+
+    /// Insert a v30 message row with explicit flags; returns nothing (ids are AUTOINCREMENT in order).
+    fn insert_v30(conn: &Connection, sid: &str, role: &str, content: &str, ts: f64, active: i64, compacted: i64) {
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, timestamp, active, compacted) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![sid, role, content, ts, active, compacted],
+        )
+        .unwrap();
+    }
+
+    fn texts(s: &Session) -> Vec<String> {
+        s.messages.iter().filter_map(|m| m.text()).collect()
+    }
+
+    #[test]
+    fn orders_by_id_not_timestamp() {
+        // Hermes reads `ORDER BY id`: timestamps are not monotonic and would split a tool call from
+        // its result (hermes_state_messages.py:42).
+        let conn = mk_conn(SCHEMA_V30);
+        insert_session(&conn, "s", None, None, 1000.0, None);
+        insert_v30(&conn, "s", "user", "later stamp, first row", 2000.0, 1, 0);
+        insert_v30(&conn, "s", "assistant", "earlier stamp, second row", 1500.0, 1, 0);
+        let s = parse_conn(&conn, &sref("s")).unwrap();
+        assert_eq!(texts(&s), vec!["later stamp, first row", "earlier stamp, second row"]);
+    }
+
+    #[test]
+    fn in_place_compaction_display_view() {
+        // archive_and_compact: summarized rows → active=0,compacted=1 (still history); the summary is
+        // a fresh active row with _compressed_summary=1; the carried tail is cloned (same content +
+        // timestamp, new id) and superseded originals / rewound rows get active=0,compacted=0.
+        let conn = mk_conn(SCHEMA_V30);
+        insert_session(&conn, "s", None, None, 1000.0, None);
+        insert_v30(&conn, "s", "user", "q1", 1001.0, 0, 1); // id 1: summarized away
+        insert_v30(&conn, "s", "assistant", "a1", 1002.0, 0, 1); // id 2
+        insert_v30(&conn, "s", "user", "q2", 1003.0, 0, 1); // id 3: older generation of the carried tail
+        insert_v30(&conn, "s", "user", "typo", 1003.5, 0, 0); // id 4: rewound — never displayed
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, timestamp, active, compacted, _compressed_summary, display_kind) \
+             VALUES ('s', 'user', '[CONTEXT COMPACTION] earlier turns…', 1004.0, 1, 0, 1, 'hidden')",
+            [],
+        )
+        .unwrap(); // id 5: the summary
+        insert_v30(&conn, "s", "user", "q2", 1003.0, 1, 0); // id 6: live clone of id 3
+        insert_v30(&conn, "s", "assistant", "a2", 1005.0, 1, 0); // id 7
+
+        // Lean: the display projection, generation-deduped, summary as boundary + summary.
+        let s = parse_conn(&conn, &sref("s")).unwrap();
+        assert_eq!(
+            texts(&s),
+            vec![
+                "q1",
+                "a1",
+                "q2",
+                "[conversation compacted]",
+                "[CONTEXT COMPACTION] earlier turns…",
+                "a2"
+            ]
+        );
+        assert!(
+            !texts(&s).contains(&"typo".to_string()),
+            "rewound rows are not displayed"
+        );
+        assert_eq!(s.messages[0].extra.get("compacted"), Some(&Value::Bool(true)));
+        assert_eq!(s.messages[0].role, Role::User, "summarized-away history keeps its role");
+        let boundary = &s.messages[3];
+        assert_eq!(boundary.role, Role::System);
+        assert_eq!(
+            boundary.extra.get("subtype").and_then(Value::as_str),
+            Some("compact_boundary")
+        );
+        let summary = &s.messages[4];
+        assert_eq!(summary.role, Role::System);
+        assert_eq!(summary.extra.get("isCompactSummary"), Some(&Value::Bool(true)));
+        assert_eq!(summary.parent_id, boundary.id, "summary links to its boundary");
+        assert_eq!(
+            summary.extra.get("display_kind").and_then(Value::as_str),
+            Some("hidden")
+        );
+        // the shared detector sees one compaction with its summary
+        let found = crate::compaction::detect_in_session(&s, true);
+        assert_eq!(found.len(), 1);
+        assert!(found[0].summary.as_deref().is_some_and(|t| t.contains("earlier turns")));
+
+        // Complete: every row, flags tagged, no dedup.
+        let c = parse_conn_with(&conn, &sref("s"), &ParseOptions::complete()).unwrap();
+        assert_eq!(c.messages.len(), 8, "7 rows + 1 boundary marker");
+        let typo = c.messages.iter().find(|m| m.text().as_deref() == Some("typo")).unwrap();
+        assert_eq!(typo.extra.get("active"), Some(&Value::Bool(false)));
+        assert!(!typo.extra.contains_key("compacted"));
+        assert_eq!(
+            c.messages.iter().filter(|m| m.text().as_deref() == Some("q2")).count(),
+            2
+        );
+    }
+
+    #[test]
+    fn system_prompt_resolves_via_system_prompts_table() {
+        // v25 hollowed `sessions.system_prompt` out into `system_prompts(hash, prompt)`.
+        let conn = mk_conn(SCHEMA_V30);
+        conn.execute(
+            "INSERT INTO system_prompts (hash, prompt) VALUES ('h1', 'You are Hermes')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions (id, source, started_at, system_prompt, system_prompt_hash) VALUES ('s', 'cli', 1000.0, NULL, 'h1')",
+            [],
+        )
+        .unwrap();
+        insert_v30(&conn, "s", "user", "hi", 1001.0, 1, 0);
+        let s = parse_conn(&conn, &sref("s")).unwrap();
+        assert_eq!(s.extra[SESSION_META_KEY]["system_prompt"], "You are Hermes");
+        // the old direct column still wins on a v14 DB
+        let old = mk_conn(SCHEMA_V14);
+        old.execute(
+            "INSERT INTO sessions (id, source, started_at, system_prompt) VALUES ('s', 'cli', 1000.0, 'legacy prompt')",
+            [],
+        )
+        .unwrap();
+        old.execute(
+            "INSERT INTO messages (session_id, role, content, timestamp) VALUES ('s','user','hi',1001.0)",
+            [],
+        )
+        .unwrap();
+        let s = parse_conn(&old, &sref("s")).unwrap();
+        assert_eq!(s.extra[SESSION_META_KEY]["system_prompt"], "legacy prompt");
+    }
+
+    #[test]
+    fn branches_and_delegates_stand_alone_but_compression_still_merges() {
+        let conn = mk_conn(SCHEMA_V30);
+        // /branch: parent ended 'branched'; the child owns a COPY of the transcript.
+        insert_session(&conn, "p", None, Some("branched"), 1000.0, Some(1500.0));
+        insert_v30(&conn, "p", "user", "shared prompt", 1001.0, 1, 0);
+        conn.execute(
+            "INSERT INTO sessions (id, source, parent_session_id, model_config, started_at) \
+             VALUES ('b', 'cli', 'p', '{\"_branched_from\":\"p\",\"yolo_mode\":false}', 1600.0)",
+            [],
+        )
+        .unwrap();
+        insert_v30(&conn, "b", "user", "shared prompt", 1001.0, 1, 0); // the copied row
+        insert_v30(&conn, "b", "assistant", "branch answer", 1601.0, 1, 0);
+        let b = parse_conn(&conn, &sref("b")).unwrap();
+        assert_eq!(
+            texts(&b),
+            vec!["shared prompt", "branch answer"],
+            "no parent merge, no duplicate"
+        );
+        assert_eq!(b.extra[LINEAGE_KEY]["_branched_from"], "p");
+        assert_eq!(b.extra[LINEAGE_KEY]["parent_session_id"], "p");
+        assert_eq!(b.model.as_deref(), None, "markers never leak into the model name");
+
+        // delegate sub-agent run: separate conversation.
+        conn.execute(
+            "INSERT INTO sessions (id, source, parent_session_id, model_config, started_at) \
+             VALUES ('d', 'cli', 'p', '{\"_delegate_from\":\"p\"}', 1700.0)",
+            [],
+        )
+        .unwrap();
+        insert_v30(&conn, "d", "user", "delegate task", 1701.0, 1, 0);
+        let d = parse_conn(&conn, &sref("d")).unwrap();
+        assert_eq!(texts(&d), vec!["delegate task"]);
+        assert_eq!(d.extra[LINEAGE_KEY]["_delegate_from"], "p");
+
+        // compression continuation: parent ended in compression → merged root→tip.
+        insert_session(&conn, "c0", None, Some("compression"), 2000.0, Some(2500.0));
+        insert_v30(&conn, "c0", "user", "long ago", 2001.0, 1, 0);
+        insert_session(&conn, "c1", Some("c0"), None, 2600.0, None);
+        insert_v30(&conn, "c1", "assistant", "continued", 2601.0, 1, 0);
+        let c1 = parse_conn(&conn, &sref("c1")).unwrap();
+        assert_eq!(texts(&c1), vec!["long ago", "continued"]);
+        assert!(
+            !c1.extra.contains_key(LINEAGE_KEY),
+            "a merged parent is not a lineage fact"
+        );
+    }
+
+    #[test]
+    fn discovery_mirrors_hermes_listing() {
+        let conn = mk_conn(SCHEMA_V30);
+        insert_session(&conn, "root", None, Some("compression"), 1000.0, Some(1500.0));
+        insert_session(&conn, "tip", Some("root"), None, 1600.0, None);
+        conn.execute(
+            "INSERT INTO sessions (id, source, started_at, archived) VALUES ('arch', 'cli', 1700.0, 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions (id, source, started_at, hidden) VALUES ('hid', 'cli', 1800.0, 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions (id, source, started_at, parent_session_id, model_config) \
+             VALUES ('del', 'cli', 1900.0, 'tip', '{\"_delegate_from\":\"tip\"}')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions (id, source, started_at, cwd, last_activity_at, ended_at) \
+             VALUES ('plain', 'cli', 2000.0, '/work/proj', 5000.0, 4000.0)",
+            [],
+        )
+        .unwrap();
+        let refs = discover_conn(&conn, &PathBuf::from(":memory:")).unwrap();
+        let ids: Vec<&str> = refs.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["plain", "tip"],
+            "tip lists (root is its compression ancestor); archived/hidden/delegate do not"
+        );
+        let plain = &refs[0];
+        assert_eq!(plain.cwd.as_deref(), Some(Path::new("/work/proj")));
+        assert_eq!(plain.updated_at, secs_to_dt(5000.0), "last_activity_at beats ended_at");
+        // a v14 DB is listed exactly as before (no listing columns → no filters)
+        let old = mk_conn(SCHEMA_V14);
+        insert_session(&old, "a", None, None, 1000.0, None);
+        assert_eq!(discover_conn(&old, &PathBuf::from(":memory:")).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn session_cwd_git_and_activity_are_first_class() {
+        let conn = mk_conn(SCHEMA_V30);
+        conn.execute(
+            "INSERT INTO sessions (id, source, started_at, ended_at, last_activity_at, cwd, git_branch, git_repo_root, profile_name) \
+             VALUES ('s', 'cli', 1000.0, 2000.0, 3000.0, '/work/proj', 'main', '/work/proj', 'hermes-x')",
+            [],
+        )
+        .unwrap();
+        insert_v30(&conn, "s", "user", "hi", 1001.0, 1, 0);
+        let s = parse_conn(&conn, &sref("s")).unwrap();
+        assert_eq!(s.cwd.as_deref(), Some(Path::new("/work/proj")));
+        assert_eq!(s.git.as_ref().and_then(|g| g.branch.as_deref()), Some("main"));
+        assert_eq!(s.updated_at, secs_to_dt(3000.0));
+        assert_eq!(s.extra[SESSION_META_KEY]["git_repo_root"], "/work/proj");
+        assert_eq!(s.extra[SESSION_META_KEY]["profile_name"], "hermes-x");
+    }
+
+    #[test]
+    fn display_kind_notices_and_sidecars() {
+        let conn = mk_conn(SCHEMA_V30);
+        insert_session(&conn, "s", None, None, 1000.0, None);
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, timestamp, display_kind) \
+             VALUES ('s', 'user', 'Model switched to x', 1001.0, 'model_switch')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, timestamp, display_kind) \
+             VALUES ('s', 'user', 'keep going but faster', 1002.0, 'steer')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, timestamp, api_content, effect_disposition, display_metadata) \
+             VALUES ('s', 'user', 'what the user typed', 1003.0, '[context] what the user typed', 'observed', '{\"k\":1}')",
+            [],
+        )
+        .unwrap();
+        let s = parse_conn(&conn, &sref("s")).unwrap();
+        assert_eq!(s.messages[0].role, Role::System, "harness-injected notice");
+        assert_eq!(
+            s.messages[0].extra.get("display_kind").and_then(Value::as_str),
+            Some("model_switch")
+        );
+        assert_eq!(s.messages[1].role, Role::User, "a human steer stays a user turn");
+        let u = &s.messages[2];
+        assert_eq!(u.role, Role::User);
+        assert_eq!(
+            u.text().as_deref(),
+            Some("what the user typed"),
+            "block text is the user's words"
+        );
+        assert_eq!(
+            u.extra.get("api_content").and_then(Value::as_str),
+            Some("[context] what the user typed")
+        );
+        assert_eq!(
+            u.extra.get("effect_disposition").and_then(Value::as_str),
+            Some("observed")
+        );
+        assert_eq!(u.extra["display_metadata"]["k"], 1);
+        assert_eq!(
+            s.first_user_text().as_deref(),
+            Some("keep going but faster"),
+            "notices never become the title"
+        );
     }
 
     #[test]
