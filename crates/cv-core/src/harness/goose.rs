@@ -32,6 +32,16 @@
 //! `created_at`/`updated_at` are stored as SQLite `TIMESTAMP` text (`YYYY-MM-DD HH:MM:SS`, UTC).
 //! `messages.created_timestamp` is unix **seconds** (Goose tolerates milliseconds on read:
 //! `MILLISECOND_TIMESTAMP_THRESHOLD = 10_000_000_000`, session_manager.rs:30,728 — so do we).
+//!
+//! Ground truth on disk: `tests/fixtures/goose/sessions-v16-1.51.0.db` was written by a goose 1.51.0
+//! built from `2090ad1c` (`GOOSE_PATH_ROOT` isolated home): two `goose session import`s (a Claude
+//! Code transcript, a Codex rollout), one turn against an OpenAI-compatible stub, one against a dead
+//! endpoint, and a recipe whose `retry` check always fails. Facts that only the real writer settled:
+//! every prompt is followed by a `userVisible: false, turnContext: true` user row holding the
+//! `<turn-context>` block; the assistant row carries `inference{provider, requestedModel}` and
+//! `usage{…, cacheReadTokens}`; `usage_ledger` mirrors it; a provider network error is NOT persisted
+//! at all; and the retry-exhaustion message lands as a plain `text` block (not `error`) — so the
+//! `error` arm below covers other producers (`from_provider_error`, ACP), not that path.
 //! Two columns are **never written** at any revision: `sessions.description` (only `name` is set by
 //! `create_session`/updates; Goose itself reads `name` and falls back to `description`,
 //! session_manager.rs:826-833) and `messages.tokens` (every `INSERT INTO messages` lists
@@ -450,7 +460,24 @@ impl DbMsg {
 /// → [`Usage`] (real per-response counts; the `tokens` column is never written), the inference's
 /// resolved (else requested) model → `model`, and the whole object under `extra["goose_metadata"]`
 /// so `userVisible`/`agentVisible`/`isCompaction`/cost/latency survive for consumers that care.
+///
+/// Visibility re-roles the turn the way Goose itself treats it: a row with `userVisible: false`
+/// is text the harness injected for the model — the per-turn `<turn-context>` block
+/// (`turnContext: true`, written on every prompt by 1.51's agent), steering/notification rows —
+/// and Goose never shows it to the user (`session_manager.rs:742` hides `userVisible = 0`). It
+/// becomes a [`Role::System`] turn (`extra.subtype` = `turn_context` or `hidden`), matching how the
+/// Claude adapter surfaces system reminders, so a user-text count or a `cv show` reads as the user
+/// saw it while the model-visible context is still there. Verified on a real 1.51.0 store.
 fn apply_metadata(m: &mut Message, meta: Value) {
+    if meta.get("userVisible") == Some(&Value::Bool(false)) && m.role == Role::User {
+        m.role = Role::System;
+        let subtype = if meta.get("turnContext") == Some(&Value::Bool(true)) {
+            "turn_context"
+        } else {
+            "hidden"
+        };
+        m.extra.insert("subtype".into(), Value::String(subtype.into()));
+    }
     if let Some(u) = meta.get("usage") {
         let get = |k: &str| u.get(k).and_then(Value::as_u64);
         let usage = Usage {
@@ -1061,6 +1088,93 @@ mod tests {
             matches!(&t.content[0], Block::ToolResult { tool_use_id, content, tool_name, is_error, .. }
             if tool_use_id == "call_1" && content == "file1\nfile2" && tool_name.as_deref() == Some("shell") && !is_error)
         );
+    }
+
+    /// The store a real goose 1.51.0 wrote (see the module doc for how). Every assertion here is a
+    /// fact observed on disk, not a fixture we authored.
+    #[test]
+    fn real_1_51_0_store_round_trips() {
+        let path = format!(
+            "{}/tests/fixtures/goose/sessions-v16-1.51.0.db",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let c = open_ro(Path::new(&path)).unwrap();
+        let version: i64 = c
+            .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 16);
+
+        // Discovery: four sessions, titled by `name`, cwd from `working_dir`, real timestamps.
+        let refs = discover_db(&c, Path::new(&path)).unwrap();
+        assert_eq!(refs.len(), 4);
+        let by_id = |id: &str| refs.iter().find(|r| r.id == id).unwrap();
+        assert_eq!(
+            by_id("20260919_6").title.as_deref(),
+            Some("Parser refactor session"),
+            "`goose session import` titles from the Claude transcript's ai-title"
+        );
+        assert_eq!(by_id("20260919_6").cwd.as_deref(), Some(Path::new("/work/proj")));
+        assert_eq!(by_id("20260919_3").title.as_deref(), Some("stubturn"));
+        assert!(by_id("20260919_3")
+            .created_at
+            .is_some_and(|t| t.to_rfc3339().starts_with("2026-09-19T20:16")));
+
+        // A stub-provider turn: prompt, the injected `<turn-context>` row (hidden from the user →
+        // System), the reply with its model and real usage; the session model is provider/model.
+        let s = parse_db(&c, &sref("20260919_3")).unwrap();
+        assert_eq!(s.model.as_deref(), Some("openai/stub-model"));
+        let roles: Vec<Role> = s.messages.iter().map(|m| m.role).collect();
+        assert_eq!(roles, vec![Role::User, Role::System, Role::Assistant]);
+        assert_eq!(s.messages[0].text().as_deref(), Some("say pong"));
+        assert_eq!(s.messages[1].extra["subtype"], "turn_context");
+        assert!(s.messages[1].text().unwrap().starts_with("<turn-context>"));
+        let a = &s.messages[2];
+        assert_eq!(a.model.as_deref(), Some("stub-model"));
+        let u = a.usage.as_ref().unwrap();
+        assert_eq!(
+            (u.input_tokens, u.output_tokens, u.cache_read_tokens),
+            (Some(324), Some(17), Some(100))
+        );
+        assert_eq!(a.extra["goose_metadata"]["inference"]["provider"], "openai");
+
+        // An imported Claude Code transcript (cv's own `rich_blocks.jsonl` fixture, run through
+        // `goose session import`): tool calls and results keep their names, thinking survives.
+        let s = parse_db(&c, &sref("20260919_6")).unwrap();
+        let tool_names: Vec<&str> = s
+            .messages
+            .iter()
+            .flat_map(|m| &m.content)
+            .filter_map(|b| match b {
+                Block::ToolUse { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tool_names, vec!["Edit"], "{tool_names:?}");
+        assert!(s
+            .messages
+            .iter()
+            .any(|m| m.content.iter().any(|b| matches!(b, Block::Thinking { .. }))));
+        let results: Vec<&Block> = s
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .flat_map(|m| &m.content)
+            .collect();
+        assert!(!results.is_empty());
+        assert!(results
+            .iter()
+            .all(|b| matches!(b, Block::ToolResult { tool_name: Some(_), .. })));
+
+        // Retry exhaustion: goose 1.51.0 persists the message as a plain text block.
+        let s = parse_db(&c, &sref("20260919_5")).unwrap();
+        let last = s.messages.last().unwrap();
+        assert_eq!(last.role, Role::Assistant);
+        assert!(
+            matches!(&last.content[0], Block::Text { text } if text.starts_with("Maximum retry attempts (1) exceeded"))
+        );
+        // The dead-endpoint session recorded no assistant row at all.
+        let s = parse_db(&c, &sref("20260919_4")).unwrap();
+        assert!(s.messages.iter().all(|m| m.role != Role::Assistant));
     }
 
     #[test]
