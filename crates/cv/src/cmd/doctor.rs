@@ -224,6 +224,19 @@ fn verdict(rep: &Report) -> String {
     if rep.thinking * 4 >= total && rep.thinking > 0 {
         parts.push("extended thinking is a large share — lower the thinking budget if you don't need it".into());
     }
+    // System reminders (the attachments Claude Code appends per turn) at ≥ 10% are a real, and
+    // steerable, share: background-task notifications, edited-file notices and hook stdout.
+    if rep.attachments * 10 >= total && rep.attachments > 0 {
+        let mut kinds: Vec<(&String, &u64)> = rep.by_attachment.iter().collect();
+        kinds.sort_by_key(|k| std::cmp::Reverse(*k.1));
+        let top: Vec<String> = kinds.iter().take(2).map(|(k, _)| format!("`{k}`")).collect();
+        parts.push(format!(
+            "system reminders are {:.0}% of context ({}) — quiet hook stdout, fewer concurrent \
+             background tasks, or `cv prune` old turns",
+            100.0 * rep.attachments as f64 / total as f64,
+            top.join(" + ")
+        ));
+    }
     if parts.is_empty() {
         if rep.compactions == 0 {
             return "nothing alarming — context use looks balanced and the session hasn't compacted.".into();

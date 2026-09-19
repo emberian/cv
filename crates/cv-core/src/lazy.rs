@@ -21,6 +21,17 @@ use std::fmt;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 
+/// Read at most `max_bytes` from the head of a sidecar text file (a persisted tool output, say) as
+/// lossy UTF-8. `None` if the file can't be opened. Indexers use this to make text the model never
+/// saw inline (only via a stub) searchable, without ever loading a whole multi-MB dump.
+pub fn read_head(path: &Path, max_bytes: usize) -> Option<String> {
+    use std::io::Read as _;
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut buf = Vec::with_capacity(max_bytes.min(1 << 20));
+    f.by_ref().take(max_bytes as u64).read_to_end(&mut buf).ok()?;
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
 /// Content at or below this many bytes is stored inline; larger content becomes a lazy [`Span`].
 /// Small on purpose: most messages are well under it, so typical sessions are untouched and only
 /// genuinely large fields (file dumps, pasted blobs, base64) go lazy.

@@ -216,6 +216,17 @@ pub(crate) fn stream_corpus(mut f: impl FnMut(Doc) -> Result<()>) -> Result<usiz
                     Block::ToolResult { content, .. } => {
                         self.push_text(content);
                         self.body.push('\n');
+                        // A persisted-output stub: the real output lives in a sidecar file the model
+                        // only saw a pointer to — index its head too, within the same budget.
+                        if let Some(p) = b.persisted_output_path() {
+                            let remaining = EMBED_HEAD_BYTES.saturating_sub(self.body.len());
+                            if remaining > 0 {
+                                if let Some(t) = cv_core::lazy::read_head(std::path::Path::new(p), remaining) {
+                                    self.body.push_str(&t);
+                                    self.body.push('\n');
+                                }
+                            }
+                        }
                     }
                     Block::File { path, source, .. } => {
                         if let Some(p) = path.as_deref().or(source.as_deref()) {

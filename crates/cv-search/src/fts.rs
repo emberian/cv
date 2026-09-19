@@ -740,6 +740,17 @@ impl<'w> ChunkSink<'w> {
             Block::ToolResult { content, .. } => {
                 self.append_text(r, content);
                 self.push_chunk("\n");
+                // A persisted-output stub (Claude Code parked the real output in
+                // `<session>/tool-results/<id>.txt`): index the file's head too, so the text the tool
+                // produced is findable even though the transcript holds only the pointer.
+                if let Some(p) = b.persisted_output_path() {
+                    if let Some(t) = cv_core::lazy::read_head(std::path::Path::new(p), PERSISTED_INDEX_CAP) {
+                        for piece in t.as_bytes().chunks(CHUNK_BYTES) {
+                            self.push_chunk(&String::from_utf8_lossy(piece));
+                        }
+                        self.push_chunk("\n");
+                    }
+                }
             }
             Block::File { path, source, .. } => {
                 if let Some(p) = path.as_deref().or(source.as_deref()) {
@@ -751,6 +762,10 @@ impl<'w> ChunkSink<'w> {
         }
     }
 }
+
+/// How much of a persisted tool output (a sidecar file) to index per stub. A multi-MB dump beyond
+/// this is still on disk (`cv show` prints the path); the index just carries its head.
+const PERSISTED_INDEX_CAP: usize = 1024 * 1024;
 
 impl cv_core::MessageSink for ChunkSink<'_> {
     fn meta(&mut self, s: &cv_core::Session) {
@@ -1160,6 +1175,16 @@ fn live_snippet(path: &str, harness: &str, query: &str) -> Option<String> {
                     Block::ToolResult { content, .. } => {
                         self.push_text(content);
                         self.buf.push('\n');
+                        // Persisted output: scan the sidecar file's head for the snippet too.
+                        if let Some(p) = b.persisted_output_path() {
+                            let remaining = SNIPPET_SCAN_CAP.saturating_sub(self.buf.len());
+                            if remaining > 0 {
+                                if let Some(t) = cv_core::lazy::read_head(std::path::Path::new(p), remaining) {
+                                    self.buf.push_str(&t);
+                                    self.buf.push('\n');
+                                }
+                            }
+                        }
                     }
                     Block::File { path, source, .. } => {
                         if let Some(p) = path.as_deref().or(source.as_deref()) {
@@ -1386,6 +1411,53 @@ mod tests {
         // Conjunction-by-default: a term present in neither yields nothing.
         assert!(text_search(&dir, "kubernetes", 10).unwrap().is_empty());
 
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&sdir).ok();
+    }
+
+    #[test]
+    fn persisted_tool_output_files_are_indexed_and_snippeted() {
+        let _home = IsolatedHome::new();
+        let dir = tmpdir();
+        let sdir = tmpdir();
+        // Claude Code parks a too-large tool output in `<session>/tool-results/<id>.txt` and leaves
+        // only a stub (pointer + preview) in the transcript. The marker word exists ONLY in the file.
+        let tr = sdir.join("p1").join("tool-results");
+        std::fs::create_dir_all(&tr).unwrap();
+        let file = tr.join("abc123.txt");
+        std::fs::write(
+            &file,
+            "line one\nthe zanzibar constant appears only on disk\nline three\n",
+        )
+        .unwrap();
+        let stub = format!(
+            "<persisted-output>\nOutput too large (66KB). Full output saved to: {}\n\nPreview (first 2KB):\nline one\n</persisted-output>",
+            file.display()
+        );
+        let p = sdir.join("p1.jsonl");
+        let lines = [
+            serde_json::json!({"type":"user","uuid":"u0","sessionId":"p1","timestamp":"2026-09-19T00:00:00Z",
+                "message":{"role":"user","content":"run the harvester"}}),
+            serde_json::json!({"type":"assistant","uuid":"a0","parentUuid":"u0","sessionId":"p1","timestamp":"2026-09-19T00:00:01Z",
+                "message":{"role":"assistant","model":"m","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"harvest"}}]}}),
+            serde_json::json!({"type":"user","uuid":"u1","parentUuid":"a0","sessionId":"p1","timestamp":"2026-09-19T00:00:02Z",
+                "message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":stub}]}}),
+        ];
+        std::fs::write(&p, lines.iter().map(|l| l.to_string() + "\n").collect::<String>()).unwrap();
+        index_refs(&dir, &[sref("p1", "harvest run", p.display().to_string())], false).unwrap();
+
+        let hits = text_search(&dir, "zanzibar", 10).unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "a word that lives only in the persisted file is findable"
+        );
+        assert_eq!(hits[0].id, "p1");
+        assert!(
+            hits[0].snippet.contains("zanzibar"),
+            "the live snippet scans the file too: {:?}",
+            hits[0].snippet
+        );
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&sdir).ok();
     }

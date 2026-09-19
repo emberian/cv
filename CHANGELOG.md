@@ -48,7 +48,10 @@
   - *Persisted tool outputs.* A `<persisted-output>` stub (the real output went to
     `<session>/tool-results/<id>.txt`) keeps the stub as content — that is what the model
     saw — and records the path and size in the block's `details.persistedOutput`; `cv show`
-    prints the on-disk pointer under the result.
+    prints the on-disk pointer under the result, and `cv index`/`search` index the file's
+    head (up to 1 MiB) and scan it for live snippets, so text the tool produced is findable
+    even though the transcript holds only the pointer. `cv doctor`'s verdict names system
+    reminders when they are ≥ 10% of context.
   - *prune:* a windowed tail keeps the LAST of each session-level singleton record
     (`custom-title`, `ai-title`, `tag`, `agent-name`, `relocated`, `cost-state`,
     `atis-latch`, `continued-in`, legacy `summary`) instead of only `summary`; both id

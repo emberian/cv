@@ -401,6 +401,18 @@ pub enum Block {
     },
 }
 
+impl Block {
+    /// For a tool result whose real output was too large for the transcript and went to a file
+    /// (Claude Code's `<persisted-output>` stub → `<session>/tool-results/<id>.txt`): where that
+    /// file lives. The block's `content` is the stub the model saw; this is the rest.
+    pub fn persisted_output_path(&self) -> Option<&str> {
+        match self {
+            Block::ToolResult { details: Some(d), .. } => d.pointer("/persistedOutput/path")?.as_str(),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Usage {
     #[serde(skip_serializing_if = "Option::is_none")]
