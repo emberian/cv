@@ -24,10 +24,14 @@
 //!
 //! **cwd.** A recording lives at `<runtime>/tmp/<projectIdentifier>/chats/…`, where the identifier is
 //! either the legacy sha256 of the project path or (current) a short id such as `claurdvoyant`. The
-//! path itself is recorded in `<runtime>/projects.json` (`{"projects": {"/abs/path": "short-id"}}`)
-//! and in `<runtime>/history/<short-id>/.project_root` (`config/projectRegistry.ts`,
-//! `storage.ts:267-335`). The record's own `directories[]` wins when present; otherwise the cwd is
-//! recovered from the registry — before that, almost every Gemini session had `cwd: None`.
+//! path itself is recorded in `<runtime>/projects.json` (`{"projects": {"/abs/path": "short-id"}}`,
+//! pretty-printed) and in a bare-path `.project_root` marker the registry writes into EVERY base dir
+//! it manages — `<runtime>/tmp/<short-id>/.project_root` (right next to `chats/`) and
+//! `<runtime>/history/<short-id>/.project_root` (`config/projectRegistry.ts` `baseDirs` +
+//! `PROJECT_ROOT_FILE`, `storage.ts:283-296`). Verified on 0.46.0: a fresh project dir got all three
+//! at once, the short id being the dir's basename (`proj`, `proj-1` on collision). The record's own
+//! `directories[]` wins when present; otherwise the cwd is recovered from the registry — before that,
+//! almost every Gemini session had `cwd: None`.
 //!
 //! The closed Antigravity IDE's `~/.gemini/antigravity/conversations/*.pb` are opaque (compressed /
 //! no on-disk schema, no readable strings) and are *not* parsed.
@@ -143,6 +147,20 @@ fn dedupe_by_id(refs: Vec<SessionRef>) -> Vec<SessionRef> {
 /// (`config/projectRegistry.ts`), and `<runtime>/history/<id>/.project_root` holds the path too
 /// (the ownership marker gemini-cli uses to self-heal a lost registry). Hash-named dirs have no
 /// marker, so they stay `None` — exactly as before. Registry reads are cached per runtime root.
+/// gemini-cli's own rule for user content that is NOT a prompt (`utils/sessionUtils.ts:97-105`
+/// `isIgnoredUserContent`): empty, a slash command, a `?` query, or the injected `<session_context>`
+/// / `<hook_context>` preamble the CLI writes as the first "user" message of every session. Such a
+/// turn is kept in the transcript (it is in the record) but must not become the session title —
+/// verified on 0.46.0, where a fresh session's only user turn was the `<session_context>` block.
+fn is_ignored_user_content(text: &str) -> bool {
+    let t = text.trim_start();
+    t.is_empty()
+        || t.starts_with('/')
+        || t.starts_with('?')
+        || t.starts_with("<session_context>")
+        || t.starts_with("<hook_context>")
+}
+
 fn project_cwd(path: &Path) -> Option<PathBuf> {
     let comps: Vec<&std::ffi::OsStr> = path.components().map(|c| c.as_os_str()).collect();
     let tmp_at = comps.iter().position(|c| *c == "tmp")?;
@@ -168,13 +186,17 @@ fn registry_for(runtime: &Path) -> Registry {
         return hit;
     }
     let mut map: HashMap<String, PathBuf> = HashMap::new();
-    // `history/<id>/.project_root` first, so a (newer) registry entry overrides it below.
-    if let Ok(entries) = fs::read_dir(runtime.join("history")) {
-        for e in entries.flatten() {
-            if let Ok(root) = fs::read_to_string(e.path().join(".project_root")) {
-                let root = root.trim();
-                if !root.is_empty() {
-                    map.insert(e.file_name().to_string_lossy().into_owned(), PathBuf::from(root));
+    // The `.project_root` markers first (`tmp/<id>/` — the dir the chats live in — then
+    // `history/<id>/`), so a (newer) registry entry overrides them below. The marker is the bare
+    // absolute path, no trailing newline (0.46.0), but trim defensively.
+    for base in ["tmp", "history"] {
+        if let Ok(entries) = fs::read_dir(runtime.join(base)) {
+            for e in entries.flatten() {
+                if let Ok(root) = fs::read_to_string(e.path().join(".project_root")) {
+                    let root = root.trim();
+                    if !root.is_empty() {
+                        map.insert(e.file_name().to_string_lossy().into_owned(), PathBuf::from(root));
+                    }
                 }
             }
         }
@@ -666,8 +688,9 @@ fn parse_logs_str(text: &str, source_path: Option<PathBuf>) -> Vec<Session> {
 
         let title = items
             .iter()
-            .find(|e| e.get("type").and_then(Value::as_str) == Some("user"))
-            .and_then(|e| e.get("message").and_then(Value::as_str))
+            .filter(|e| e.get("type").and_then(Value::as_str) == Some("user"))
+            .filter_map(|e| e.get("message").and_then(Value::as_str))
+            .find(|t| !is_ignored_user_content(t))
             .map(|t| crate::ir::truncate(t, 80));
         let times: Vec<DateTime<Utc>> = items
             .iter()
@@ -902,7 +925,10 @@ fn emit_record_message(
             m.timestamp = ts;
             push_content_blocks(&mut m.content, obj.get("content"));
             if title.is_none() {
-                *title = m.text().map(|t| crate::ir::truncate(&t, 80));
+                *title = m
+                    .text()
+                    .filter(|t| !is_ignored_user_content(t))
+                    .map(|t| crate::ir::truncate(&t, 80));
             }
             if !m.content.is_empty() && sink.message(m) == Flow::Stop {
                 return Flow::Stop;
@@ -1140,7 +1166,10 @@ fn parse_checkpoint(text: &str, file_name: &str, source_path: Option<PathBuf>) -
             m.role = Role::Tool;
         }
         if m.role == Role::User && title.is_none() {
-            title = m.text().map(|t| crate::ir::truncate(&t, 80));
+            title = m
+                .text()
+                .filter(|t| !is_ignored_user_content(t))
+                .map(|t| crate::ir::truncate(&t, 80));
         }
         if !m.content.is_empty() {
             messages.push(m);
@@ -1522,6 +1551,71 @@ mod tests {
         for d in [runtime, runtime2, runtime3] {
             let _ = fs::remove_dir_all(&d);
         }
+    }
+
+    #[test]
+    fn registry_files_in_their_real_0_46_shapes_recover_cwd() {
+        // Fixtures mirror what gemini-cli 0.46.0 wrote for a fresh project dir on 2026-09-19:
+        // `projects.json` pretty-printed with a nested `projects` map, and an identical bare-path
+        // `.project_root` (no trailing newline) in BOTH `tmp/<id>/` and `history/<id>/`.
+        let (runtime, file) = runtime_fixture("real-shapes", "gemtest-proj", "session_modern.jsonl");
+        fs::write(runtime.join("projects.json"), fixture("registry/projects.json")).unwrap();
+        fs::write(
+            runtime.join("tmp").join("gemtest-proj").join(".project_root"),
+            fixture("registry/project_root"),
+        )
+        .unwrap();
+        fs::create_dir_all(runtime.join("history").join("gemtest-proj")).unwrap();
+        fs::write(
+            runtime.join("history").join("gemtest-proj").join(".project_root"),
+            fixture("registry/project_root"),
+        )
+        .unwrap();
+        let refs = scan_session_file(&file, Harness::Gemini);
+        assert_eq!(refs[0].cwd.as_deref(), Some(Path::new("/Users/u/scratch/gemtest-proj")));
+
+        // The marker beside the chats is enough on its own (a runtime root with no registry file
+        // and no history dir — e.g. one the CLI is still populating).
+        let (runtime2, file2) = runtime_fixture("tmp-marker-only", "solo", "session_legacy.json");
+        fs::write(
+            runtime2.join("tmp").join("solo").join(".project_root"),
+            "/Users/u/work/solo",
+        )
+        .unwrap();
+        let refs2 = scan_session_file(&file2, Harness::Gemini);
+        assert_eq!(refs2[0].cwd.as_deref(), Some(Path::new("/Users/u/work/solo")));
+        for d in [runtime, runtime2] {
+            let _ = fs::remove_dir_all(&d);
+        }
+    }
+
+    #[test]
+    fn real_0_46_recording_keeps_the_context_preamble_but_never_titles_from_it() {
+        // Written by gemini-cli 0.46.0 on 2026-09-19 (paths neutralized): a metadata line, then ONE
+        // `$set` carrying the whole `messages` array, whose only user turn is the injected
+        // `<session_context>` preamble. gemini-cli ignores such content when rebuilding history
+        // (`isIgnoredUserContent`), so it must not become the title; the turn itself stays.
+        let (runtime, file) = runtime_fixture("real-0-46", "gemtest-proj", "session_0_46_session_context.jsonl");
+        fs::write(runtime.join("projects.json"), fixture("registry/projects.json")).unwrap();
+        fs::write(
+            runtime.join("tmp").join("gemtest-proj").join(".project_root"),
+            fixture("registry/project_root"),
+        )
+        .unwrap();
+        let refs = scan_session_file(&file, Harness::Gemini);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].id, "ad7102ea-0b4f-4822-94f7-f3bbf67f1614");
+        assert_eq!(refs[0].cwd.as_deref(), Some(Path::new("/Users/u/scratch/gemtest-proj")));
+        assert_eq!(refs[0].title, None, "the <session_context> preamble is not a prompt");
+
+        let adapter = Gemini { roots: vec![] };
+        let mut sink = CollectSink::default();
+        let s = adapter.stream(&refs[0], &ParseOptions::full(), &mut sink).unwrap();
+        assert_eq!(s.title, None);
+        assert_eq!(sink.messages.len(), 1, "the preamble turn is still in the transcript");
+        assert_eq!(sink.messages[0].role, Role::User);
+        assert!(sink.messages[0].text().unwrap().starts_with("<session_context>"));
+        let _ = fs::remove_dir_all(&runtime);
     }
 
     #[test]
