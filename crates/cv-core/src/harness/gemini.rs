@@ -16,6 +16,19 @@
 //!    `{sessionId, messageId, type, message, timestamp}` (user prompts reliably; weak on assistant).
 //!    One `logs.json` may interleave several `sessionId`s; each becomes its own IR session.
 //!
+//! **Roots.** gemini-cli's runtime state normally lives under `~/.gemini/`, but under the macOS
+//! Seatbelt sandbox (`SANDBOX=sandbox-exec`) the profile blocks writes there, so
+//! `Storage.getGlobalRuntimeDir()` routes everything to `~/.cache/.gemini/` instead
+//! (`packages/core/src/config/storage.ts:90-107`, `getGlobalTempDir` `:195-197`). Both `tmp` roots
+//! are scanned; a session is keyed by its id, so nothing is listed twice.
+//!
+//! **cwd.** A recording lives at `<runtime>/tmp/<projectIdentifier>/chats/…`, where the identifier is
+//! either the legacy sha256 of the project path or (current) a short id such as `claurdvoyant`. The
+//! path itself is recorded in `<runtime>/projects.json` (`{"projects": {"/abs/path": "short-id"}}`)
+//! and in `<runtime>/history/<short-id>/.project_root` (`config/projectRegistry.ts`,
+//! `storage.ts:267-335`). The record's own `directories[]` wins when present; otherwise the cwd is
+//! recovered from the registry — before that, almost every Gemini session had `cwd: None`.
+//!
 //! The closed Antigravity IDE's `~/.gemini/antigravity/conversations/*.pb` are opaque (compressed /
 //! no on-disk schema, no readable strings) and are *not* parsed.
 //!
@@ -35,15 +48,25 @@ use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 pub struct Gemini {
-    root: Option<PathBuf>,
+    /// Every `tmp` root that exists: `~/.gemini/tmp`, then the sandbox root `~/.cache/.gemini/tmp`.
+    roots: Vec<PathBuf>,
 }
 
 impl Gemini {
     pub fn new() -> Self {
-        let root = dirs::home_dir()
-            .map(|h| h.join(".gemini").join("tmp"))
-            .filter(|p| p.exists());
-        Gemini { root }
+        let roots = dirs::home_dir()
+            .map(|h| {
+                vec![
+                    h.join(".gemini").join("tmp"),
+                    // `SANDBOX=sandbox-exec` runs (macOS Seatbelt) write here instead — storage.ts:90-107.
+                    h.join(".cache").join(".gemini").join("tmp"),
+                ]
+            })
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|p| p.exists())
+            .collect();
+        Gemini { roots }
     }
 }
 
@@ -59,24 +82,26 @@ impl Adapter for Gemini {
     }
 
     fn storage_root(&self) -> Option<PathBuf> {
-        self.root.clone()
+        self.roots.first().cloned()
     }
 
     fn discover(&self) -> Result<Vec<SessionRef>> {
-        let Some(root) = &self.root else {
+        if self.roots.is_empty() {
             return Ok(vec![]);
-        };
-        // Collect candidate file paths first (cheap walk), then read+parse in parallel. A single
-        // `logs.json` can expand into many sessions, so this is a flat-map.
-        let paths: Vec<_> = WalkDir::new(root)
-            .into_iter()
-            .filter_map(|e| e.ok())
+        }
+        // Collect candidate file paths first (cheap walk over every root), then read+parse in
+        // parallel. A single `logs.json` can expand into many sessions, so this is a flat-map.
+        let paths: Vec<_> = self
+            .roots
+            .iter()
+            .flat_map(|root| WalkDir::new(root).into_iter().filter_map(|e| e.ok()))
             .filter(|e| e.file_type().is_file())
             .map(|e| e.into_path())
             .collect();
-        Ok(crate::par_flat_map(paths, |path| {
+        let refs = crate::par_flat_map(paths, |path| {
             crate::discover_cache::cached_scan_many(&path, || scan_session_file(&path, Harness::Gemini))
-        }))
+        });
+        Ok(dedupe_by_id(refs))
     }
 
     fn parse(&self, r: &SessionRef) -> Result<Session> {
@@ -86,6 +111,90 @@ impl Adapter for Gemini {
     fn stream(&self, r: &SessionRef, opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
         stream_for(Harness::Gemini, r, opts, sink)
     }
+}
+
+/// Keep one [`SessionRef`] per session id across roots (a sandboxed and an unsandboxed run of the
+/// same project could, in principle, both hold a copy): the most recently updated wins, and the
+/// input order is otherwise preserved.
+fn dedupe_by_id(refs: Vec<SessionRef>) -> Vec<SessionRef> {
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut out: Vec<SessionRef> = Vec::with_capacity(refs.len());
+    for r in refs {
+        match seen.get(&r.id) {
+            Some(&i) => {
+                if r.updated_at > out[i].updated_at {
+                    out[i] = r;
+                }
+            }
+            None => {
+                seen.insert(r.id.clone(), out.len());
+                out.push(r);
+            }
+        }
+    }
+    out
+}
+
+/// The project cwd a Gemini-format file belongs to, from gemini-cli's project registry.
+///
+/// A recording/checkpoint/log lives at `<runtime>/tmp/<projectIdentifier>/…`. The identifier is a
+/// short id (`claurdvoyant`) or, for pre-registry installs, the sha256 of the project path. The
+/// registry `<runtime>/projects.json` maps `{"/abs/path": "short-id"}`
+/// (`config/projectRegistry.ts`), and `<runtime>/history/<id>/.project_root` holds the path too
+/// (the ownership marker gemini-cli uses to self-heal a lost registry). Hash-named dirs have no
+/// marker, so they stay `None` — exactly as before. Registry reads are cached per runtime root.
+fn project_cwd(path: &Path) -> Option<PathBuf> {
+    let comps: Vec<&std::ffi::OsStr> = path.components().map(|c| c.as_os_str()).collect();
+    let tmp_at = comps.iter().position(|c| *c == "tmp")?;
+    let identifier = comps.get(tmp_at + 1)?.to_str()?;
+    // `<runtime>` is the parent of `tmp`: rebuild it from the leading components.
+    let runtime: PathBuf = comps[..tmp_at].iter().collect();
+    if runtime.as_os_str().is_empty() {
+        return None;
+    }
+    registry_for(&runtime).get(identifier).cloned()
+}
+
+/// `short-id → project path`, one map per runtime root.
+type Registry = std::sync::Arc<std::collections::HashMap<String, PathBuf>>;
+
+/// The [`Registry`] for one runtime root, read once per process.
+fn registry_for(runtime: &Path) -> Registry {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Registry>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(hit) = cache.lock().ok().and_then(|c| c.get(runtime).cloned()) {
+        return hit;
+    }
+    let mut map: HashMap<String, PathBuf> = HashMap::new();
+    // `history/<id>/.project_root` first, so a (newer) registry entry overrides it below.
+    if let Ok(entries) = fs::read_dir(runtime.join("history")) {
+        for e in entries.flatten() {
+            if let Ok(root) = fs::read_to_string(e.path().join(".project_root")) {
+                let root = root.trim();
+                if !root.is_empty() {
+                    map.insert(e.file_name().to_string_lossy().into_owned(), PathBuf::from(root));
+                }
+            }
+        }
+    }
+    if let Ok(text) = fs::read_to_string(runtime.join("projects.json")) {
+        if let Ok(v) = serde_json::from_str::<Value>(&text) {
+            if let Some(projects) = v.get("projects").and_then(Value::as_object) {
+                for (abs_path, id) in projects {
+                    if let Some(id) = id.as_str() {
+                        map.insert(id.to_string(), PathBuf::from(abs_path));
+                    }
+                }
+            }
+        }
+    }
+    let arc = Arc::new(map);
+    if let Ok(mut c) = cache.lock() {
+        c.insert(runtime.to_path_buf(), arc.clone());
+    }
+    arc
 }
 
 /// Discovery scan of one Gemini-format file into 0..n [`SessionRef`]s, tagged as `harness`.
@@ -568,7 +677,7 @@ fn parse_logs_str(text: &str, source_path: Option<PathBuf>) -> Vec<Session> {
         let mut s = Session {
             id: sid,
             harness: Harness::Gemini,
-            cwd: None,
+            cwd: source_path.as_deref().and_then(project_cwd),
             title,
             created_at: times.iter().min().copied(),
             updated_at: times.iter().max().copied(),
@@ -647,14 +756,15 @@ fn record_metadata(rec: &serde_json::Map<String, Value>, source_path: Option<Pat
     let updated_at = rec.get("lastUpdated").and_then(Value::as_str).and_then(parse_ts);
     let title = rec.get("summary").and_then(Value::as_str).map(str::to_string);
 
-    // cwd: gemini stores only an opaque projectHash, but `directories[]` (added via /dir) may carry
-    // real absolute paths; use the first as a best-effort cwd.
+    // cwd: `directories[]` (added via /dir) may carry real absolute paths — use the first; else
+    // recover the project path from gemini-cli's registry via the file's `tmp/<id>/` location.
     let cwd = rec
         .get("directories")
         .and_then(Value::as_array)
         .and_then(|a| a.first())
         .and_then(Value::as_str)
-        .map(PathBuf::from);
+        .map(PathBuf::from)
+        .or_else(|| source_path.as_deref().and_then(project_cwd));
 
     Session {
         id,
@@ -1044,7 +1154,7 @@ fn parse_checkpoint(text: &str, file_name: &str, source_path: Option<PathBuf>) -
     Some(Session {
         id,
         harness: Harness::Gemini,
-        cwd: None,
+        cwd: source_path.as_deref().and_then(project_cwd),
         title,
         created_at: None,
         updated_at: None,
@@ -1267,7 +1377,7 @@ mod tests {
             updated_at: None,
             message_count: 0,
         };
-        let adapter = Gemini { root: None };
+        let adapter = Gemini { roots: vec![] };
 
         // Reference: the pure parser, with source_path set to the on-disk file for an apples-to-
         // apples comparison.
@@ -1324,7 +1434,7 @@ mod tests {
             updated_at: None,
             message_count: 0,
         };
-        let adapter = Gemini { root: None };
+        let adapter = Gemini { roots: vec![] };
         let mut seen = 0usize;
         let mut sink = |_m: Message| {
             seen += 1;
@@ -1333,5 +1443,106 @@ mod tests {
         let _ = adapter.stream(&r, &ParseOptions::full(), &mut sink).unwrap();
         assert_eq!(seen, 1, "Stop after the first message must halt streaming");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A fake gemini-cli runtime root (`<runtime>/tmp/<id>/chats/<recording>` + registry files).
+    fn runtime_fixture(tag: &str, project_id: &str, recording: &str) -> (PathBuf, PathBuf) {
+        let runtime = std::env::temp_dir().join(format!(
+            "cv-gemini-{tag}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        let chats = runtime.join("tmp").join(project_id).join("chats");
+        fs::create_dir_all(&chats).unwrap();
+        let file = chats.join(recording);
+        fs::write(&file, fixture(recording)).unwrap();
+        (runtime, file)
+    }
+
+    #[test]
+    fn discovers_both_runtime_roots_and_dedupes_by_id() {
+        // `~/.gemini/tmp` and the Seatbelt root `~/.cache/.gemini/tmp` are both scanned; the same
+        // session id under both roots is listed once.
+        let (rt_a, _) = runtime_fixture("root-a", "proj", "session_modern.jsonl");
+        let (rt_b, _) = runtime_fixture("root-b", "proj", "session_modern.jsonl");
+        let (rt_c, _) = runtime_fixture("root-c", "proj", "session_legacy.json");
+        let adapter = Gemini {
+            roots: vec![rt_a.join("tmp"), rt_b.join("tmp"), rt_c.join("tmp")],
+        };
+        let refs = adapter.discover().unwrap();
+        let mut ids: Vec<&str> = refs.iter().map(|r| r.id.as_str()).collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec![
+                "11112222-3333-4444-5555-666677778888",
+                "9aeb2942-7c46-47b7-aded-13772d4d4e63"
+            ],
+            "two distinct sessions across three roots; the duplicate collapsed"
+        );
+        assert_eq!(adapter.storage_root(), Some(rt_a.join("tmp")));
+        for d in [rt_a, rt_b, rt_c] {
+            let _ = fs::remove_dir_all(&d);
+        }
+    }
+
+    #[test]
+    fn cwd_comes_from_the_project_registry() {
+        // `projects.json` maps path → short id; `history/<id>/.project_root` is the fallback marker.
+        let (runtime, file) = runtime_fixture("registry", "claurdvoyant", "session_modern.jsonl");
+        fs::write(
+            runtime.join("projects.json"),
+            r#"{"projects": {"/Users/u/pug/claurdvoyant": "claurdvoyant"}}"#,
+        )
+        .unwrap();
+        let (runtime2, file2) = runtime_fixture("marker", "gemtest", "session_legacy.json");
+        fs::create_dir_all(runtime2.join("history").join("gemtest")).unwrap();
+        fs::write(
+            runtime2.join("history").join("gemtest").join(".project_root"),
+            "/Users/u/cvrt8/gemtest\n",
+        )
+        .unwrap();
+        // hash-named dirs (pre-registry) have no mapping → None, as before
+        let (runtime3, file3) = runtime_fixture("hash", &"ab".repeat(32), "session_modern.jsonl");
+
+        let refs = scan_session_file(&file, Harness::Gemini);
+        assert_eq!(refs[0].cwd.as_deref(), Some(Path::new("/Users/u/pug/claurdvoyant")));
+        let refs2 = scan_session_file(&file2, Harness::Gemini);
+        assert_eq!(refs2[0].cwd.as_deref(), Some(Path::new("/Users/u/cvrt8/gemtest")));
+        let refs3 = scan_session_file(&file3, Harness::Gemini);
+        assert_eq!(refs3[0].cwd, None);
+
+        // the streamed session carries it too (the sink's `meta` sees the cwd)
+        let adapter = Gemini { roots: vec![] };
+        let mut sink = CollectSink::default();
+        let s = adapter.stream(&refs[0], &ParseOptions::full(), &mut sink).unwrap();
+        assert_eq!(s.cwd.as_deref(), Some(Path::new("/Users/u/pug/claurdvoyant")));
+        // a record's own `directories[]` still wins (unchanged behaviour): covered by
+        // `parses_legacy_chat_recording` fixtures carrying no registry at all.
+        for d in [runtime, runtime2, runtime3] {
+            let _ = fs::remove_dir_all(&d);
+        }
+    }
+
+    #[test]
+    fn rewrite_siblings_are_not_sessions() {
+        // `rewriteConversationFile` (chatRecordingService.ts:575-640) leaves `<file>.unreadable-<ms>`
+        // and writes through `<file>.tmp-<pid>`; neither is a recording.
+        let (runtime, file) = runtime_fixture("siblings", "proj", "session_modern.jsonl");
+        let text = fs::read_to_string(&file).unwrap();
+        fs::write(file.with_extension("jsonl.unreadable-1700000000000"), &text).unwrap();
+        fs::write(file.with_extension("jsonl.tmp-4242"), &text).unwrap();
+        let adapter = Gemini {
+            roots: vec![runtime.join("tmp")],
+        };
+        let refs = adapter.discover().unwrap();
+        assert_eq!(
+            refs.len(),
+            1,
+            "only the real recording is discovered: {:?}",
+            refs.iter().map(|r| &r.path).collect::<Vec<_>>()
+        );
+        assert!(refs[0].path.ends_with("session_modern.jsonl"));
+        let _ = fs::remove_dir_all(&runtime);
     }
 }

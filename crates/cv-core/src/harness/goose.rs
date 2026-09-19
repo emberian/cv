@@ -12,32 +12,59 @@
 //! on first run, but we read whatever is on disk: we parse the DB *and* any `.jsonl` not shadowed by
 //! a same-id DB row.
 //!
-//! ## Modern schema (from `goose/src/session/session_manager.rs`)
+//! ## Modern schema (from `goose/src/session/session_manager.rs`, schema v16 at goose 1.51)
 //! ```sql
+//! CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TIMESTAMP);  -- MAX(version)
 //! CREATE TABLE sessions (
-//!   id TEXT PRIMARY KEY, name TEXT, description TEXT, working_dir TEXT NOT NULL,
-//!   created_at TIMESTAMP, updated_at TIMESTAMP, total_tokens INTEGER, input_tokens INTEGER,
-//!   output_tokens INTEGER, provider_name TEXT, model_config_json TEXT, session_type TEXT, … );
+//!   id TEXT PRIMARY KEY, name TEXT NOT NULL DEFAULT '', description TEXT NOT NULL DEFAULT '',
+//!   user_set_name BOOLEAN, session_type TEXT NOT NULL DEFAULT 'user', working_dir TEXT NOT NULL,
+//!   created_at TIMESTAMP, updated_at TIMESTAMP, extension_data TEXT, total_tokens INTEGER,
+//!   input_tokens INTEGER, output_tokens INTEGER, cache_read_tokens INTEGER, cache_write_tokens INTEGER,
+//!   accumulated_* INTEGER, accumulated_cost REAL, schedule_id TEXT, recipe_json TEXT,
+//!   user_recipe_values_json TEXT, provider_name TEXT, model_config_json TEXT, goose_mode TEXT,
+//!   archived_at TIMESTAMP, project_id TEXT, parent_session_id TEXT );
 //! CREATE TABLE messages (
 //!   id INTEGER PK, message_id TEXT, session_id TEXT, role TEXT, content_json TEXT NOT NULL,
 //!   created_timestamp INTEGER NOT NULL, timestamp TIMESTAMP, tokens INTEGER, metadata_json TEXT );
+//! CREATE TABLE usage_ledger ( id, session_id, created_timestamp, model, input_tokens, output_tokens,
+//!   total_tokens, cache_read_tokens, cache_write_tokens, cost REAL, cost_source, is_compaction );
 //! ```
 //! `created_at`/`updated_at` are stored as SQLite `TIMESTAMP` text (`YYYY-MM-DD HH:MM:SS`, UTC).
-//! `messages.created_timestamp` is unix **seconds**. Schema columns have accreted over versions, so
-//! we probe `PRAGMA table_info` and only SELECT columns that exist (older DBs lack `name`,
-//! `provider_name`, `model_config_json`, `message_id`, `tokens`, …).
+//! `messages.created_timestamp` is unix **seconds** (Goose tolerates milliseconds on read:
+//! `MILLISECOND_TIMESTAMP_THRESHOLD = 10_000_000_000`, session_manager.rs:30,728 — so do we).
+//! Two columns are **never written** at any revision: `sessions.description` (only `name` is set by
+//! `create_session`/updates; Goose itself reads `name` and falls back to `description`,
+//! session_manager.rs:826-833) and `messages.tokens` (every `INSERT INTO messages` lists
+//! `message_id, session_id, role, content_json, created_timestamp, metadata_json`, :1942). Per-message
+//! usage/model live in `metadata_json` (`MessageMetadata`, goose-provider-types
+//! `conversation/message.rs:828-853`): `{userVisible, agentVisible, inference{provider,
+//! requestedModel, resolvedModel, providerSessionId}, outputTokenLimitReached, steer, turnContext,
+//! usage{inputTokens, outputTokens, totalTokens, cacheReadTokens, cacheWriteTokens, cost, costSource,
+//! elapsedMs, timeToFirstTokenMs, isCompaction}, operations}`. Goose hides rows whose
+//! `userVisible` is false from its UI; we keep them (they were in the model's context) and carry the
+//! flag. Schema columns have accreted over versions, so we probe `PRAGMA table_info` and only SELECT
+//! columns that exist (older DBs lack `name`, `provider_name`, `model_config_json`, `message_id`,
+//! `metadata_json`, …).
 //!
-//! ## content_json (one row's content = a JSON array of `MessageContent`, tagged `type`, camelCase)
+//! ## content_json (one row's content = a JSON array of `MessageContentBlock`, tagged `type`, camelCase;
+//! goose-provider-types `conversation/message.rs:313-329`)
 //! ```jsonc
 //! [{"type":"text","text":"…"},
 //!  {"type":"image","data":"…","mimeType":"…"},
+//!  {"type":"document","data":"<base64>","mimeType":"application/pdf","name":"q3-report.pdf"},
 //!  {"type":"thinking","thinking":"…","signature":"…"},
 //!  {"type":"redactedThinking","data":"…"},
+//!  {"type":"error","kind":"authentication|contextLengthExceeded|creditsExhausted|other","message":"…"},
 //!  {"type":"toolRequest","id":"…",
 //!     "toolCall":{"status":"success","value":{"name":"…","arguments":{…}}}},
 //!  {"type":"toolResponse","id":"…",
 //!     "toolResult":{"status":"success","value":{"content":[{"type":"text","text":"…"}],"isError":false}}}]
 //! ```
+//! `toolResult.value` may also be a **bare content array** (the legacy `SuccessWithContentVec` shape
+//! Goose still accepts, `tool_result_serde.rs:132-146`), and result content blocks may be rmcp 3.x
+//! `text|image|audio|resource|resource_link`. `toolConfirmationRequest`, `actionRequired` and
+//! `systemNotification` are UI/control content and are skipped; `frontendToolRequest` (removed
+//! 2026-08) is still read from old rows.
 //! Goose uses MCP-style tools: a `toolRequest` is the assistant's call (rmcp `CallToolRequestParams`
 //! = `{name, arguments}`); a `toolResponse` is the result (rmcp `CallToolResult` =
 //! `{content:[Content…], isError}`). On error the inner wrapper is `{"status":"error","error":"…"}`.
@@ -107,10 +134,13 @@ fn sessions_dir() -> Option<PathBuf> {
         // Linux XDG default.
         candidates.push(h.join(".local/share/goose/sessions"));
     }
-    // Windows: %APPDATA%\Block\Block\goose\data\sessions (etcetera Windows strategy).
+    // Windows: `%APPDATA%\Block\goose\data\sessions` (etcetera 0.11's Windows strategy yields one
+    // vendor segment); older etcetera doubled it (`Block\Block\goose`). Probe both.
     if let Some(appdata) = std::env::var_os("APPDATA") {
+        let appdata = PathBuf::from(appdata);
+        candidates.push(appdata.join("Block").join("goose").join("data").join("sessions"));
         candidates.push(
-            PathBuf::from(appdata)
+            appdata
                 .join("Block")
                 .join("Block")
                 .join("goose")
@@ -203,15 +233,23 @@ fn columns(conn: &Connection, table: &str) -> std::collections::HashSet<String> 
     set
 }
 
+/// The SQL expression for a session's title, given which columns exist. Goose only ever WRITES
+/// `name` (`create_session`, the name updater — nothing touches `description`) and reads `name`
+/// first, falling back to `description` (session_manager.rs:826-833). Preferring `description`
+/// used to yield `None` for every modern session.
+fn title_expr(has: impl Fn(&str) -> bool) -> &'static str {
+    match (has("name"), has("description")) {
+        (true, true) => "COALESCE(NULLIF(name, ''), NULLIF(description, ''))",
+        (true, false) => "NULLIF(name, '')",
+        (false, true) => "NULLIF(description, '')",
+        _ => "NULL",
+    }
+}
+
 fn discover_db(conn: &Connection, db: &Path) -> Result<Vec<SessionRef>> {
     let cols = columns(conn, "sessions");
     let has = |c: &str| cols.contains(c);
-    // Prefer `description` (the human title), fall back to `name`.
-    let title_expr = match (has("description"), has("name")) {
-        (true, _) => "description",
-        (false, true) => "name",
-        _ => "NULL",
-    };
+    let title_expr = title_expr(has);
     let working_dir = if has("working_dir") { "working_dir" } else { "NULL" };
     let created = if has("created_at") { "created_at" } else { "NULL" };
     let updated = if has("updated_at") { "updated_at" } else { "NULL" };
@@ -259,13 +297,9 @@ fn discover_db(conn: &Connection, db: &Path) -> Result<Vec<SessionRef>> {
 fn stream_db(conn: &Connection, r: &SessionRef, sink: &mut dyn MessageSink) -> Result<Session> {
     let cols = columns(conn, "sessions");
     let has = |c: &str| cols.contains(c);
-    let title_expr = match (has("description"), has("name")) {
-        (true, _) => "description",
-        (false, true) => "name",
-        _ => "NULL",
-    };
+    let title_expr = title_expr(has);
     let sel = format!(
-        "SELECT {title}, {wd}, {created}, {updated}, {provider}, {model_cfg} \
+        "SELECT {title}, {wd}, {created}, {updated}, {provider}, {model_cfg}, {stype}, {parent} \
          FROM sessions WHERE id = ?1",
         title = title_expr,
         wd = if has("working_dir") { "working_dir" } else { "NULL" },
@@ -274,6 +308,12 @@ fn stream_db(conn: &Connection, r: &SessionRef, sink: &mut dyn MessageSink) -> R
         provider = if has("provider_name") { "provider_name" } else { "NULL" },
         model_cfg = if has("model_config_json") {
             "model_config_json"
+        } else {
+            "NULL"
+        },
+        stype = if has("session_type") { "session_type" } else { "NULL" },
+        parent = if has("parent_session_id") {
+            "parent_session_id"
         } else {
             "NULL"
         },
@@ -286,8 +326,10 @@ fn stream_db(conn: &Connection, r: &SessionRef, sink: &mut dyn MessageSink) -> R
         Option<String>,
         Option<String>,
         Option<String>,
+        Option<String>,
+        Option<String>,
     );
-    let (title, wd, created, updated, provider, model_cfg): MetaRow = conn
+    let (title, wd, created, updated, provider, model_cfg, session_type, parent_id): MetaRow = conn
         .query_row(&sel, [&r.id], |row| {
             Ok((
                 row.get(0).ok().flatten(),
@@ -296,11 +338,22 @@ fn stream_db(conn: &Connection, r: &SessionRef, sink: &mut dyn MessageSink) -> R
                 row.get(3).ok().flatten(),
                 row.get(4).ok().flatten(),
                 row.get(5).ok().flatten(),
+                row.get(6).ok().flatten(),
+                row.get(7).ok().flatten(),
             ))
         })
-        .unwrap_or((None, None, None, None, None, None));
+        .unwrap_or((None, None, None, None, None, None, None, None));
 
     let model = reconstruct_model(provider.as_deref(), model_cfg.as_deref());
+    // Session-level facts with no first-class IR home: the kind (`user`/`sub_agent`/`hidden`/…, v13+)
+    // and the spawning session for sub-agents (`parent_session_id`, v15+).
+    let mut extra = serde_json::Map::new();
+    if let Some(t) = session_type.filter(|t| !t.is_empty()) {
+        extra.insert("session_type".into(), Value::String(t));
+    }
+    if let Some(pid) = parent_id.filter(|p| !p.is_empty()) {
+        extra.insert("parent_session_id".into(), Value::String(pid));
+    }
 
     let s = Session {
         id: r.id.clone(),
@@ -316,7 +369,7 @@ fn stream_db(conn: &Connection, r: &SessionRef, sink: &mut dyn MessageSink) -> R
         git: None,
         messages: Vec::new(),
         source_path: Some(r.path.clone()),
-        extra: serde_json::Map::new(),
+        extra,
     };
     // All session metadata is known up front, so hand it to the sink before the body.
     sink.meta(&s);
@@ -325,8 +378,13 @@ fn stream_db(conn: &Connection, r: &SessionRef, sink: &mut dyn MessageSink) -> R
     let has_msg = |c: &str| mcols.contains(c);
     let msg_id = if has_msg("message_id") { "message_id" } else { "NULL" };
     let tokens = if has_msg("tokens") { "tokens" } else { "NULL" };
+    let metadata = if has_msg("metadata_json") {
+        "metadata_json"
+    } else {
+        "NULL"
+    };
     let sql = format!(
-        "SELECT role, content_json, created_timestamp, {msg_id}, {tokens} \
+        "SELECT role, content_json, created_timestamp, {msg_id}, {tokens}, {metadata} \
          FROM messages WHERE session_id = ?1 ORDER BY created_timestamp, id"
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -339,6 +397,7 @@ fn stream_db(conn: &Connection, r: &SessionRef, sink: &mut dyn MessageSink) -> R
             created: row.get::<_, Option<i64>>(2).ok().flatten(),
             id: row.get::<_, Option<String>>(3).ok().flatten(),
             tokens: row.get::<_, Option<i64>>(4).ok().flatten(),
+            metadata: row.get::<_, Option<String>>(5).ok().flatten(),
         })
     })?;
 
@@ -361,19 +420,61 @@ struct DbMsg {
     created: Option<i64>,
     id: Option<String>,
     tokens: Option<i64>,
+    /// `messages.metadata_json` — the only place Goose records per-message usage and model.
+    metadata: Option<String>,
 }
 
 impl DbMsg {
     fn into_message(self, tool_names: &mut HashMap<String, String>) -> Option<Message> {
         let content: Value = serde_json::from_str(&self.content_json).unwrap_or(Value::Null);
         let blocks = content_to_blocks(&content, tool_names);
-        build_message(
+        let mut m = build_message(
             &self.role,
             self.id,
             self.created.and_then(secs_to_dt),
             self.tokens,
             blocks,
-        )
+        )?;
+        if let Some(meta) = self
+            .metadata
+            .as_deref()
+            .and_then(|j| serde_json::from_str::<Value>(j).ok())
+        {
+            apply_metadata(&mut m, meta);
+        }
+        Some(m)
+    }
+}
+
+/// Fold a row's `metadata_json` (`MessageMetadata`, message.rs:828-853) into the message: `usage.*`
+/// → [`Usage`] (real per-response counts; the `tokens` column is never written), the inference's
+/// resolved (else requested) model → `model`, and the whole object under `extra["goose_metadata"]`
+/// so `userVisible`/`agentVisible`/`isCompaction`/cost/latency survive for consumers that care.
+fn apply_metadata(m: &mut Message, meta: Value) {
+    if let Some(u) = meta.get("usage") {
+        let get = |k: &str| u.get(k).and_then(Value::as_u64);
+        let usage = Usage {
+            input_tokens: get("inputTokens"),
+            output_tokens: get("outputTokens"),
+            cache_read_tokens: get("cacheReadTokens"),
+            cache_creation_tokens: get("cacheWriteTokens"),
+        };
+        if usage.input_tokens.is_some() || usage.output_tokens.is_some() {
+            m.usage = Some(usage);
+        }
+    }
+    if let Some(inf) = meta.get("inference") {
+        let model = inf
+            .get("resolvedModel")
+            .or_else(|| inf.get("requestedModel"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty());
+        if let Some(model) = model {
+            m.model = Some(model.to_string());
+        }
+    }
+    if meta.is_object() {
+        m.extra.insert("goose_metadata".into(), meta);
     }
 }
 
@@ -564,6 +665,27 @@ fn item_to_block(item: &Value, tool_names: &mut HashMap<String, String>) -> Opti
             encrypted: item.get("data").and_then(Value::as_str).map(str::to_string),
             redacted: true,
         }),
+        // `DocumentContent {data, mimeType, name?}` (message.rs:291-296, goose 1.4x): an attached
+        // file (PDF, …) — like Claude's `document` block, a File carrying the name + mime, never the
+        // base64 bytes.
+        "document" => Some(Block::File {
+            mime: item.get("mimeType").and_then(Value::as_str).map(str::to_string),
+            path: item.get("name").and_then(Value::as_str).map(str::to_string),
+            source: item
+                .get("data")
+                .and_then(Value::as_str)
+                .map(|_| "base64:inline".to_string()),
+        }),
+        // `ErrorContent {kind, message}` (message.rs:284-287; written by `Message::with_error` when a
+        // provider call gives up — retry exhaustion, context overflow, auth, credits). Shown to the
+        // user in Goose; keep it visible here as text, self-describing with its kind.
+        "error" => {
+            let kind = item.get("kind").and_then(Value::as_str).unwrap_or("other");
+            let message = item.get("message").and_then(Value::as_str).unwrap_or("");
+            Some(Block::Text {
+                text: format!("[error: {kind}] {message}").into(),
+            })
+        }
         "toolRequest" | "frontendToolRequest" => {
             let id = item.get("id").and_then(Value::as_str).unwrap_or("").to_string();
             let call = item.get("toolCall")?;
@@ -602,8 +724,11 @@ fn item_to_block(item: &Value, tool_names: &mut HashMap<String, String>) -> Opti
                         .and_then(|v| v.get("isError"))
                         .and_then(Value::as_bool)
                         .unwrap_or(false);
+                    // `value` is an rmcp `CallToolResult {content, isError}` — or, in the legacy
+                    // shape Goose still accepts (`SuccessWithContentVec`, tool_result_serde.rs:
+                    // 132-146), the bare content array itself.
                     let text = value
-                        .and_then(|v| v.get("content"))
+                        .and_then(|v| if v.is_array() { Some(v) } else { v.get("content") })
                         .map(flatten_result_content)
                         .unwrap_or_default();
                     (text, is_error)
@@ -624,7 +749,9 @@ fn item_to_block(item: &Value, tool_names: &mut HashMap<String, String>) -> Opti
     }
 }
 
-/// Flatten an rmcp `CallToolResult.content` array (`[{type:"text",text}|{type:"image",…}]`) to text.
+/// Flatten an rmcp `CallToolResult.content` array to text. rmcp 3.x content blocks are
+/// `text | image | audio | resource | resource_link` (snake_case): embedded resources contribute
+/// their text (or a `[blob: <mime>]` marker), links their uri.
 fn flatten_result_content(content: &Value) -> String {
     let Some(items) = content.as_array() else {
         return content.as_str().unwrap_or_default().to_string();
@@ -640,6 +767,24 @@ fn flatten_result_content(content: &Value) -> String {
             Some("image") => {
                 let mime = it.get("mimeType").and_then(Value::as_str).unwrap_or("image");
                 parts.push(format!("[image: {mime}]"));
+            }
+            Some("audio") => {
+                let mime = it.get("mimeType").and_then(Value::as_str).unwrap_or("audio");
+                parts.push(format!("[audio: {mime}]"));
+            }
+            Some("resource") => {
+                let res = it.get("resource").unwrap_or(it);
+                match res.get("text").and_then(Value::as_str) {
+                    Some(t) => parts.push(t.to_string()),
+                    None => {
+                        let mime = res.get("mimeType").and_then(Value::as_str).unwrap_or("binary");
+                        parts.push(format!("[blob: {mime}]"));
+                    }
+                }
+            }
+            Some("resource_link") => {
+                let uri = it.get("uri").and_then(Value::as_str).unwrap_or("?");
+                parts.push(format!("[resource: {uri}]"));
             }
             _ => {}
         }
@@ -692,10 +837,14 @@ fn build_message(
 // Timestamp helpers
 // ---------------------------------------------------------------------------
 
+/// Unix seconds → datetime. A value above Goose's `MILLISECOND_TIMESTAMP_THRESHOLD`
+/// (`10_000_000_000`, session_manager.rs:30 — i.e. past year 2286 as seconds) is milliseconds,
+/// exactly as Goose's own reader treats it (:728-733).
 fn secs_to_dt(s: i64) -> Option<DateTime<Utc>> {
     if s <= 0 {
         return None;
     }
+    let s = if s > 10_000_000_000 { s / 1000 } else { s };
     Utc.timestamp_opt(s, 0).single()
 }
 
@@ -753,29 +902,65 @@ fn parse_legacy(name: &str, path: &Path) -> Result<Session> {
 mod tests {
     use super::*;
 
+    /// Goose schema v16 (session_manager.rs, goose 1.51.0) — the columns as created today.
     const SCHEMA: &str = "
+        CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);
+        INSERT INTO schema_version (version) VALUES (16);
         CREATE TABLE sessions (
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL DEFAULT '',
             description TEXT NOT NULL DEFAULT '',
+            user_set_name BOOLEAN DEFAULT FALSE,
+            session_type TEXT NOT NULL DEFAULT 'user',
             working_dir TEXT NOT NULL,
-            created_at TIMESTAMP,
-            updated_at TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            extension_data TEXT DEFAULT '{}',
             total_tokens INTEGER,
+            input_tokens INTEGER,
+            output_tokens INTEGER,
+            cache_read_tokens INTEGER,
+            cache_write_tokens INTEGER,
+            accumulated_total_tokens INTEGER,
+            accumulated_input_tokens INTEGER,
+            accumulated_output_tokens INTEGER,
+            accumulated_cache_read_tokens INTEGER,
+            accumulated_cache_write_tokens INTEGER,
+            accumulated_cost REAL,
+            schedule_id TEXT,
+            recipe_json TEXT,
+            user_recipe_values_json TEXT,
             provider_name TEXT,
             model_config_json TEXT,
-            session_type TEXT NOT NULL DEFAULT 'user'
+            goose_mode TEXT NOT NULL DEFAULT 'auto',
+            archived_at TIMESTAMP,
+            project_id TEXT,
+            parent_session_id TEXT
         );
         CREATE TABLE messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             message_id TEXT,
-            session_id TEXT NOT NULL,
+            session_id TEXT NOT NULL REFERENCES sessions(id),
             role TEXT NOT NULL,
             content_json TEXT NOT NULL,
             created_timestamp INTEGER NOT NULL,
-            timestamp TIMESTAMP,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             tokens INTEGER,
             metadata_json TEXT
+        );
+        CREATE TABLE usage_ledger (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+            created_timestamp INTEGER NOT NULL,
+            model TEXT,
+            input_tokens INTEGER,
+            output_tokens INTEGER,
+            total_tokens INTEGER,
+            cache_read_tokens INTEGER,
+            cache_write_tokens INTEGER,
+            cost REAL,
+            cost_source TEXT,
+            is_compaction INTEGER DEFAULT 0
         );
     ";
 
@@ -875,6 +1060,118 @@ mod tests {
         assert!(
             matches!(&t.content[0], Block::ToolResult { tool_use_id, content, tool_name, is_error, .. }
             if tool_use_id == "call_1" && content == "file1\nfile2" && tool_name.as_deref() == Some("shell") && !is_error)
+        );
+    }
+
+    #[test]
+    fn title_prefers_the_written_name_column() {
+        // Goose only ever writes `name`; `description` is a never-written default '' (v16 DDL).
+        let c = mk(SCHEMA);
+        c.execute("INSERT INTO sessions (id, name, working_dir, updated_at) VALUES ('n','Fix flaky test','/p','2026-09-01 00:00:00')", []).unwrap();
+        c.execute("INSERT INTO sessions (id, description, working_dir, updated_at) VALUES ('d','Only description','/p','2026-08-01 00:00:00')", []).unwrap();
+        c.execute(
+            "INSERT INTO sessions (id, working_dir, updated_at) VALUES ('e','/p','2026-07-01 00:00:00')",
+            [],
+        )
+        .unwrap();
+        let refs = discover_db(&c, Path::new("sessions.db")).unwrap();
+        let by_id = |id: &str| refs.iter().find(|r| r.id == id).unwrap().title.clone();
+        assert_eq!(by_id("n").as_deref(), Some("Fix flaky test"));
+        assert_eq!(
+            by_id("d").as_deref(),
+            Some("Only description"),
+            "description still a fallback"
+        );
+        assert_eq!(by_id("e"), None, "empty strings are not titles");
+        assert_eq!(
+            parse_db(&c, &sref("n")).unwrap().title.as_deref(),
+            Some("Fix flaky test")
+        );
+    }
+
+    #[test]
+    fn metadata_json_yields_usage_model_and_flags() {
+        let c = mk(SCHEMA);
+        c.execute(
+            "INSERT INTO sessions (id, name, working_dir, session_type, parent_session_id) VALUES ('s1','t','/x','sub_agent','root-1')",
+            [],
+        )
+        .unwrap();
+        let meta = r#"{"userVisible":true,"agentVisible":true,"inference":{"provider":"anthropic","requestedModel":"claude-sonnet-4-5","resolvedModel":"claude-sonnet-4-5-20250929"},"usage":{"inputTokens":1200,"outputTokens":85,"totalTokens":1285,"cacheReadTokens":900,"cacheWriteTokens":0,"cost":0.0041,"costSource":"provider_reported","elapsedMs":2310,"timeToFirstTokenMs":410}}"#;
+        c.execute(
+            "INSERT INTO messages (message_id, session_id, role, content_json, created_timestamp, metadata_json) VALUES ('m1','s1','assistant','[{\"type\":\"text\",\"text\":\"hi\"}]',1704110400,?1)",
+            [meta],
+        )
+        .unwrap();
+        let hidden = r#"{"userVisible":false,"agentVisible":true,"usage":{"inputTokens":10,"outputTokens":2,"isCompaction":true}}"#;
+        c.execute(
+            "INSERT INTO messages (message_id, session_id, role, content_json, created_timestamp, metadata_json) VALUES ('m2','s1','assistant','[{\"type\":\"text\",\"text\":\"summary\"}]',1704110401,?1)",
+            [hidden],
+        )
+        .unwrap();
+        let s = parse_db(&c, &sref("s1")).unwrap();
+        assert_eq!(s.extra["session_type"], "sub_agent");
+        assert_eq!(s.extra["parent_session_id"], "root-1");
+        let m = &s.messages[0];
+        let u = m.usage.as_ref().expect("usage from metadata_json");
+        assert_eq!((u.input_tokens, u.output_tokens), (Some(1200), Some(85)));
+        assert_eq!((u.cache_read_tokens, u.cache_creation_tokens), (Some(900), Some(0)));
+        assert_eq!(
+            m.model.as_deref(),
+            Some("claude-sonnet-4-5-20250929"),
+            "resolved model wins"
+        );
+        assert_eq!(m.extra["goose_metadata"]["usage"]["cost"], 0.0041);
+        let h = &s.messages[1];
+        assert_eq!(
+            h.extra["goose_metadata"]["userVisible"], false,
+            "hidden rows are kept, flagged"
+        );
+        assert_eq!(h.extra["goose_metadata"]["usage"]["isCompaction"], true);
+        assert!(h.model.is_none(), "no inference → no model");
+    }
+
+    #[test]
+    fn error_and_document_blocks_map() {
+        let c = mk(SCHEMA);
+        c.execute("INSERT INTO sessions (id, working_dir) VALUES ('s1','/x')", [])
+            .unwrap();
+        let content = r#"[{"type":"error","kind":"contextLengthExceeded","message":"Maximum retry attempts (3) exceeded."},{"type":"document","data":"cGRmLWJ5dGVz","mimeType":"application/pdf","name":"q3-report.pdf"}]"#;
+        c.execute(
+            "INSERT INTO messages (session_id, role, content_json, created_timestamp) VALUES ('s1','assistant',?1,1)",
+            [content],
+        )
+        .unwrap();
+        let s = parse_db(&c, &sref("s1")).unwrap();
+        let m = &s.messages[0];
+        assert_eq!(m.content.len(), 2, "neither block is dropped");
+        assert!(
+            matches!(&m.content[0], Block::Text { text } if text == "[error: contextLengthExceeded] Maximum retry attempts (3) exceeded.")
+        );
+        assert!(matches!(&m.content[1], Block::File { mime, path, source }
+                if mime.as_deref() == Some("application/pdf") && path.as_deref() == Some("q3-report.pdf") && source.as_deref() == Some("base64:inline")));
+    }
+
+    #[test]
+    fn bare_array_results_and_rmcp3_content_flatten() {
+        let c = mk(SCHEMA);
+        c.execute("INSERT INTO sessions (id, working_dir) VALUES ('s1','/x')", [])
+            .unwrap();
+        // legacy `SuccessWithContentVec`: `value` is the content array itself, with rmcp 3 blocks
+        let resp = r#"[{"type":"toolResponse","id":"c1","toolResult":{"status":"success","value":[{"type":"text","text":"ok"},{"type":"resource","resource":{"uri":"file:///tmp/a.txt","mimeType":"text/plain","text":"hello"}},{"type":"resource_link","uri":"file:///tmp/b.bin","name":"b"},{"type":"audio","data":"…","mimeType":"audio/wav"}]}}]"#;
+        c.execute(
+            "INSERT INTO messages (session_id, role, content_json, created_timestamp) VALUES ('s1','user',?1,1704110400123)",
+            [resp],
+        )
+        .unwrap();
+        let s = parse_db(&c, &sref("s1")).unwrap();
+        let m = &s.messages[0];
+        assert!(matches!(&m.content[0], Block::ToolResult { content, is_error, .. }
+                if content == "ok\nhello\n[resource: file:///tmp/b.bin]\n[audio: audio/wav]" && !is_error));
+        // millisecond `created_timestamp` normalized like Goose does (threshold 10_000_000_000)
+        assert_eq!(
+            m.timestamp.map(|t| t.to_rfc3339()),
+            Some("2024-01-01T12:00:00+00:00".to_string())
         );
     }
 
