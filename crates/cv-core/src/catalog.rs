@@ -234,7 +234,10 @@ mod imp {
         if let Some(root) = root {
             paths.insert(root.to_path_buf());
         }
-        let file_watch = matches!(h, Harness::Cursor | Harness::Goose | Harness::Hermes | Harness::Zed);
+        let file_watch = matches!(
+            h,
+            Harness::Cursor | Harness::Goose | Harness::Hermes | Harness::Zed | Harness::OpenCode
+        );
         for r in refs {
             if file_watch {
                 paths.insert(r.path.clone());
