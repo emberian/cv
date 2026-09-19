@@ -56,6 +56,7 @@
 //! - `session_nodes(session_key PK, current_session_id, entry_json, label, display_name,
 //!   parent_session_key, fork_source_session_id, archived_at, …)` — `entry_json` is the old
 //!   `sessions.json` entry (`{sessionId, updatedAt, cwd?, label?, spawnedCwd?, spawnedWorkspaceDir?, …}`).
+//!
 //! `sessions.json` is a legacy discovery target only. JSONL files on disk are now: pre-July
 //! transcripts (still read), and archives that are NOT sessions — `<sid>.checkpoint.<uuid>.jsonl`
 //! (compaction checkpoints), `*.trajectory.jsonl`, `<sid>.jsonl.<reset|deleted|bak>.<ts>[.zst]`,
@@ -1282,9 +1283,10 @@ fn select_rows(entries: Vec<Value>, complete: bool) -> Vec<Row> {
             let crosses_reset = latest_reset.is_some()
                 && !te.side
                 && te.parent_id.as_ref().is_none_or(|p| !reset_descendants.contains(p));
-            let logical = if crosses_reset || (!te.side && stale) {
-                leaf.clone()
-            } else if explicit_present && !te.side && te.parent_id == append_parent && leaf != append_parent {
+            let reparent_to_leaf = crosses_reset
+                || (!te.side && stale)
+                || (explicit_present && !te.side && te.parent_id == append_parent && leaf != append_parent);
+            let logical = if reparent_to_leaf {
                 leaf.clone()
             } else {
                 te.parent_id.clone()

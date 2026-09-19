@@ -93,6 +93,15 @@
     `compaction`/`reset`/`branch_summary`/`custom_message` become System notes,
     `session_info.name` the title, `model_change` the model; checkpoint/trajectory/archive
     siblings are excluded from discovery.
+  - *Kimi Code (new harness `kimi-code`).* kimi-cli is deprecated and `~/.kimi` frozen since
+    the 2026-06 migration; its successor writes `~/.kimi-code/sessions/wd_*/session_*/agents/
+    <id>/wire.jsonl` (flat records, `time` in ms, object `args`, camelCase usage, `cwd` in
+    `state.json`) — 34 sessions on this machine were invisible. The new adapter discovers the
+    workspace tree (honouring `session_index.jsonl` tombstones), buffers each LLM step into one
+    Assistant turn plus Tool turns (usage from `step.end`), maps compaction, task-termination and
+    cancel notes, system prompts from `profile.bind`, injected prompts with their `origin`, and
+    persisted `tool-results`/`tasks` outputs as on-disk pointers; sub-agents ride in
+    `Session.extra.agents`. `cv resume` launches `kimi --session session_<id>`.
 
 ## 0.10.0 (2026-07-17)
 

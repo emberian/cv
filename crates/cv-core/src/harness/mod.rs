@@ -28,6 +28,7 @@ pub mod grok;
 #[cfg(feature = "sqlite")]
 pub mod hermes;
 pub mod kimi;
+pub mod kimi_code;
 pub mod lmstudio;
 pub mod openclaw;
 pub mod opencode;
@@ -182,6 +183,7 @@ pub fn all() -> Vec<Box<dyn Adapter>> {
         Box::new(claude_app::ClaudeApp::new()),
         Box::new(chatgpt_app::ChatGptApp::new()),
         Box::new(kimi::Kimi::new()),
+        Box::new(kimi_code::KimiCode::new()),
         Box::new(qwen::Qwen::new()),
         Box::new(lmstudio::LmStudio::new()),
         Box::new(cline::Cline::new()),

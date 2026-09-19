@@ -1191,7 +1191,7 @@ mod tests {
         )
         .unwrap();
         // Part rows: `data` = Part minus id/sessionID/messageID; ordered by id.
-        let mut add = |pid: &str, mid: &str, data: &str| {
+        let add = |pid: &str, mid: &str, data: &str| {
             conn.execute(
                 "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?1, ?2, ?3, 1, 1, ?4)",
                 rusqlite::params![pid, mid, sid, data],

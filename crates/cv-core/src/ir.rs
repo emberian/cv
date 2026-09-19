@@ -54,8 +54,10 @@ harnesses! {
     ClaudeApp => "claude-app",
     /// The ChatGPT desktop app (macOS/Windows).
     ChatGptApp => "chatgpt-app",
-    /// Kimi CLI (MoonshotAI), `~/.kimi`.
+    /// Kimi CLI (MoonshotAI), `~/.kimi` — the legacy store, frozen since the 2026-06 migration.
     Kimi => "kimi",
+    /// Kimi Code (MoonshotAI), kimi-cli's successor: `~/.kimi-code/sessions/**/wire.jsonl`.
+    KimiCode => "kimi-code",
     /// Qwen Code CLI (a gemini-cli fork), `~/.qwen`.
     Qwen => "qwen",
     /// LM Studio desktop app, `~/.lmstudio`.
@@ -90,6 +92,7 @@ impl Harness {
             "claude-app" | "claude-desktop" | "claudeapp" => Harness::ClaudeApp,
             "chatgpt-app" | "chatgpt" | "chatgpt-desktop" | "openai-app" => Harness::ChatGptApp,
             "kimi" | "kimi-cli" => Harness::Kimi,
+            "kimi-code" | "kimicode" | "kimi2" => Harness::KimiCode,
             "qwen" | "qwen-code" => Harness::Qwen,
             "lmstudio" | "lm-studio" => Harness::LmStudio,
             "cline" => Harness::Cline,

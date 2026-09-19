@@ -384,6 +384,7 @@ fn harness_color(h: Harness) -> Color {
         Harness::OpenClaw => Color::Rgb(200, 120, 60),
         Harness::Cursor => Color::Rgb(160, 160, 160),
         Harness::Kimi => Color::Rgb(80, 200, 160),
+        Harness::KimiCode => Color::Rgb(60, 170, 190),
         Harness::Qwen => Color::Rgb(150, 90, 200),
         Harness::LmStudio => Color::Rgb(100, 180, 120),
         Harness::Cline => Color::Rgb(90, 180, 200),

@@ -393,7 +393,7 @@ pub fn harness_family(harness: Harness) -> Option<&'static str> {
         Harness::Gemini => Some("google"),
         Harness::Grok => Some("xai"),
         Harness::Qwen => Some("alibaba"),
-        Harness::Kimi => Some("moonshot"),
+        Harness::Kimi | Harness::KimiCode => Some("moonshot"),
         Harness::Hermes => Some("nous"),
         // Model-agnostic multiplexers: could be running anything.
         Harness::OpenCode
