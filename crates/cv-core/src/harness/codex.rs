@@ -5,15 +5,30 @@
 //! appears both as `event_msg` and as `response_item message`; when `event_msg`s are present we take
 //! NL text from them and skip the `response_item` duplicates.
 //!
-//! Record types (ground truth: codex-rs `protocol::RolloutItem` + `EventMsg`):
-//! - `session_meta` — id, cwd, originator, cli_version, source, model_provider, git.
-//! - `turn_context`  — per-turn model/cwd/approval/sandbox; we track model/cwd drift.
+//! Record types (ground truth: codex-rs `history::RolloutItem` + `protocol::EventMsg`, verified
+//! against Codex `132c2be23`, CLI 0.154):
+//! - `session_meta` — id, cwd, originator, cli_version, source, model_provider, git, plus (since
+//!   0.147) the thread's place in a swarm: `session_id` (root thread), `parent_thread_id`,
+//!   `forked_from_id`, `thread_source`, `agent_nickname`/`agent_path`/`agent_role`, `history_mode`
+//!   and `subagent_history_start_ordinal`. Every line carries an `ordinal` in paginated files.
+//! - `turn_context`  — per-turn model/effort/cwd/approval/sandbox; we track model drift.
 //! - `response_item` — the model-visible items: `message`, `reasoning`, `function_call`,
 //!   `function_call_output`, `custom_tool_call(_output)`, `local_shell_call`, `web_search_call`,
-//!   `tool_search_call`/`tool_search_output`, `image_generation_call`, `compaction`.
-//! - `event_msg`     — UI-side events: `user_message`/`agent_message` (NL text), `token_count`
-//!   (usage + rate limits), `view_image_tool_call`, `web_search_*`, `context_compacted`, etc.
+//!   `tool_search_call`/`tool_search_output`, `image_generation_call`, `compaction`, and the
+//!   inter-agent `agent_message` (paired with a preceding `inter_agent_communication_metadata`).
+//! - `event_msg`     — UI-side events. Legacy history mode (CLI ≤ 0.147) echoes NL text as
+//!   `user_message`/`agent_message`; paginated mode (0.147+) drops those echoes and instead records
+//!   every finished `TurnItem` as `item_completed` (command executions, file changes, MCP calls,
+//!   image views, sub-agent activity, plans, …). Both modes carry `token_count` (usage + rate
+//!   limits), `thread_settings_applied`, `task_started`/`task_complete`, `turn_aborted`,
+//!   `thread_rolled_back`.
+//! - `token_usage_record` — per-response usage keyed by `response_id`/`turn_id` (paginated).
 //! - `compacted`     — a top-level record marking an auto/manual history compaction boundary.
+//!
+//! Fork/subagent rollouts embed the parent's history up to the fork point (ordinals below
+//! `subagent_history_start_ordinal`, stamped with the FORK time); the lean passes skip those
+//! records (the thread's own work is what a listing/title/search should show) and take a message's
+//! real time from `internal_chat_message_metadata_passthrough.create_time` when present.
 //!
 //! Multimodal/structured bits that the IR can't model natively (rate limits, web-search queries,
 //! shell command vectors, compaction boundaries) are stashed in `Message.extra` so conversions stay
@@ -78,7 +93,11 @@ impl Adapter for Codex {
                 if !name.starts_with("rollout-") {
                     continue;
                 }
-                if !name.ends_with(".jsonl") && !name.ends_with(".json") {
+                // `.jsonl.zst`: Codex compresses rollouts colder than 7 days in place
+                // (rollout/src/compression.rs); `.tmp` are its staging files. The zstd decoder rides
+                // the `sqlite` feature (ruzstd), so compressed rollouts are only listed when we can
+                // read them.
+                if !name.ends_with(".jsonl") && !name.ends_with(".json") && !is_zst_rollout(name) {
                     continue;
                 }
                 paths.push(path.to_path_buf());
@@ -98,13 +117,12 @@ impl Adapter for Codex {
     fn parse(&self, r: &SessionRef) -> Result<Session> {
         // Concrete full parse (used directly for full-fidelity ops, and by `stream`'s legacy-JSON
         // branch). `stream` is the memory-light path for the bulk consumers.
-        let text = fs::read_to_string(&r.path).with_context(|| format!("reading {}", r.path.display()))?;
-        let is_jsonl = r.path.extension().and_then(|e| e.to_str()) == Some("jsonl");
-        Ok(parse_str(&r.id, &text, is_jsonl, Some(r.path.clone())))
+        let text = read_rollout_to_string(&r.path)?;
+        Ok(parse_str(&r.id, &text, is_jsonl_path(&r.path), Some(r.path.clone())))
     }
 
     fn stream(&self, r: &SessionRef, opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
-        let is_jsonl = r.path.extension().and_then(|e| e.to_str()) == Some("jsonl");
+        let is_jsonl = is_jsonl_path(&r.path);
         if !is_jsonl {
             // 2025 legacy layout is a single JSON document — inherently whole-file. Reuse the full
             // parse and replay (these sessions are rare and small).
@@ -122,14 +140,12 @@ impl Adapter for Codex {
         // come from `event_msg`s or `response_item`s?), so we make a cheap first pass to detect it,
         // then a second streaming pass that emits one record's messages at a time. Both passes are
         // O(largest line); the previous `parse_str` collected the entire file into a `Vec<Value>`.
-        let has_events = {
-            let f = fs::File::open(&r.path).with_context(|| format!("opening {}", r.path.display()))?;
-            detect_has_events(BufReader::new(f))
-        };
+        let has_events = detect_has_events(open_rollout(&r.path)?);
         // Span path (partial-access / chunked index): mmap the file and emit a lazy `Span` for a giant
         // `function_call_output` string output instead of reading/materializing the 100s-of-MB line.
+        // Never for a compressed rollout — a span can't point into zstd frames.
         #[cfg(feature = "mmap")]
-        if opts.spans {
+        if opts.spans && !is_zst_path(&r.path) {
             if let Ok(file) = fs::File::open(&r.path) {
                 if let Ok(map) = unsafe { memmap2::Mmap::map(&file) } {
                     return Ok(stream_jsonl_spans(
@@ -143,15 +159,83 @@ impl Adapter for Codex {
                 }
             }
         }
-        let f = fs::File::open(&r.path).with_context(|| format!("opening {}", r.path.display()))?;
         Ok(stream_jsonl(
             &r.id,
-            BufReader::new(f),
+            open_rollout(&r.path)?,
             Some(r.path.clone()),
             has_events,
             opts,
             sink,
         ))
+    }
+}
+
+/// A `rollout-*.jsonl.zst`: Codex's in-place compression of cold rollouts (readable only with the
+/// `sqlite` feature, which brings the pure-Rust ruzstd decoder).
+fn is_zst_rollout(name: &str) -> bool {
+    cfg!(feature = "sqlite") && name.ends_with(".jsonl.zst")
+}
+
+fn is_zst_path(path: &Path) -> bool {
+    path.to_str().is_some_and(|p| p.ends_with(".jsonl.zst"))
+}
+
+/// Modern JSONL rollout (plain or zstd-compressed), as opposed to the 2025 single-JSON layout.
+fn is_jsonl_path(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()) == Some("jsonl") || is_zst_path(path)
+}
+
+/// Open a rollout for line-oriented reading, transparently decoding a `.jsonl.zst`.
+fn open_rollout(path: &Path) -> Result<Box<dyn BufRead>> {
+    let f = fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    #[cfg(feature = "sqlite")]
+    if is_zst_path(path) {
+        let dec = ruzstd::decoding::StreamingDecoder::new(BufReader::new(f))
+            .map_err(|e| anyhow::anyhow!("zstd header of {}: {e}", path.display()))?;
+        return Ok(Box::new(BufReader::new(dec)));
+    }
+    Ok(Box::new(BufReader::new(f)))
+}
+
+/// Whole-file read of a rollout, transparently decoding a `.jsonl.zst`.
+fn read_rollout_to_string(path: &Path) -> Result<String> {
+    use std::io::Read as _;
+    let mut text = String::new();
+    open_rollout(path)?
+        .read_to_string(&mut text)
+        .with_context(|| format!("reading {}", path.display()))?;
+    Ok(text)
+}
+
+/// Per-parse state shared by the full and streaming paths (both call [`dispatch_line`] per
+/// record), so their outputs stay identical.
+#[derive(Default)]
+struct CodexCtx {
+    /// Format-complete parse: keep inherited-prefix records (tagged `inherited`) instead of
+    /// skipping them.
+    complete: bool,
+    /// `session_meta.subagent_history_start_ordinal`: records with a smaller top-level `ordinal`
+    /// are the parent thread's history embedded in this fork/subagent rollout.
+    inherit_before: Option<u64>,
+    /// This thread's own `agent_path` (from `session_meta`), to attribute `agent_message` authorship.
+    agent_path: Option<String>,
+    /// `inter_agent_communication_metadata.trigger_turn` seen, waiting for the `agent_message`
+    /// record it immediately precedes.
+    pending_trigger_turn: Option<bool>,
+    /// The canonical (first) `session_meta` has been applied — a fork embeds the parent's as a
+    /// second line, whose thread-level fields must not overwrite the child's.
+    meta_seen: bool,
+    /// Usage from the last `token_usage_record`, until its `token_count` twin (same numbers, a few
+    /// records later) has been seen — so the twin never double-counts as a second carrier.
+    pending_record_usage: Option<Usage>,
+}
+
+impl CodexCtx {
+    fn for_opts(opts: &ParseOptions) -> Self {
+        CodexCtx {
+            complete: opts.complete,
+            ..Default::default()
+        }
     }
 }
 
@@ -188,18 +272,20 @@ pub fn parse_str(id: &str, text: &str, is_jsonl: bool, source_path: Option<PathB
         // the assistant message it trails. Using a separate `out` (not `&mut s.messages`) avoids
         // borrowing `s` twice in `dispatch_line`.
         let mut out: Vec<Message> = Vec::new();
+        let mut ctx = CodexCtx::default();
         let skipped = super::for_each_json_line_str(text, |v| {
-            dispatch_line(&mut s, &mut out, &v, has_events);
+            dispatch_line(&mut s, &mut out, &v, has_events, &mut ctx);
             Flow::Continue
         });
         super::note_skipped_lines(&mut s, skipped);
         s.messages = out;
     } else if let Ok(root) = serde_json::from_str::<Value>(text) {
-        apply_meta(&mut s, root.get("session"));
+        let mut ctx = CodexCtx::default();
+        apply_meta(&mut s, &mut ctx, root.get("session"));
         let items = root.get("items").and_then(Value::as_array).or_else(|| root.as_array());
         if let Some(items) = items {
             for it in items {
-                handle_item(Some(it), false, None, &mut s.messages);
+                handle_item(Some(it), false, None, &mut s.messages, &mut ctx);
             }
         }
     }
@@ -223,14 +309,27 @@ fn is_nl_event(v: &Value) -> bool {
 /// Fold one record into `s`'s metadata and push any resulting messages into `scratch`. Shared by the
 /// full [`parse_str`] and the streaming [`stream_jsonl`] so both produce identical messages.
 ///
-/// The one cross-record behavior — `token_count` events attach usage to the assistant message they
-/// trail — works on both paths because it only ever touches the *last* entry of `scratch` (see
-/// [`apply_token_count`]), which the streaming loops hold back until the next message arrives.
-fn dispatch_line(s: &mut Session, scratch: &mut Vec<Message>, v: &Value, has_events: bool) {
+/// The cross-record behaviors — `token_count`/`token_usage_record` attach usage to the assistant
+/// message they trail — work on both paths because they only ever touch the *last* entry of
+/// `scratch` (see [`apply_token_count`]), which the streaming loops hold back until the next
+/// message arrives. Everything else that spans records (the `inter_agent_communication_metadata`
+/// → `agent_message` pairing, the inherited-prefix cutoff, the thread's `agent_path`) lives in
+/// [`CodexCtx`], which both paths carry.
+fn dispatch_line(s: &mut Session, scratch: &mut Vec<Message>, v: &Value, has_events: bool, ctx: &mut CodexCtx) {
     if let Some(ts) = top_ts(v) {
         s.created_at.get_or_insert(ts);
         s.updated_at = Some(ts);
     }
+    // Inherited prefix (fork/subagent rollouts embed the parent's history before
+    // `subagent_history_start_ordinal`): those records still shape the thread's metadata — the
+    // child inherits the parent's model/cwd — but they are the parent's turns, not this thread's,
+    // so the lean passes emit no messages for them; `complete` keeps them, tagged.
+    let inherited = matches!(
+        (v.get("ordinal").and_then(Value::as_u64), ctx.inherit_before),
+        (Some(o), Some(cut)) if o < cut
+    );
+    let before = scratch.len();
+    let ts = top_ts(v);
     match v.get("type").and_then(Value::as_str) {
         None => {
             // bare {id,timestamp} header
@@ -240,12 +339,26 @@ fn dispatch_line(s: &mut Session, scratch: &mut Vec<Message>, v: &Value, has_eve
                 }
             }
         }
-        Some("session_meta") => apply_meta(s, v.get("payload")),
-        Some("turn_context") => apply_turn_context(s, scratch, v.get("payload"), top_ts(v)),
-        Some("event_msg") => handle_event(v.get("payload"), has_events, top_ts(v), scratch),
-        Some("response_item") => handle_item(v.get("payload"), has_events, top_ts(v), scratch),
-        Some("compacted") => handle_compacted(v.get("payload"), top_ts(v), scratch),
+        Some("session_meta") => apply_meta(s, ctx, v.get("payload")),
+        Some("turn_context") => apply_turn_context(s, scratch, v.get("payload"), ts),
+        Some("event_msg") => handle_event(s, ctx, v.get("payload"), has_events, ts, scratch),
+        Some("response_item") => handle_item(v.get("payload"), has_events, ts, scratch, ctx),
+        Some("compacted") => handle_compacted(v.get("payload"), ts, scratch),
+        Some("token_usage_record") => apply_token_usage_record(v.get("payload"), ts, scratch, ctx),
+        // Precedes the `agent_message` it describes (verified on 0.154 rollouts: M at n, A at n+1).
+        Some("inter_agent_communication_metadata") => {
+            ctx.pending_trigger_turn = v.pointer("/payload/trigger_turn").and_then(Value::as_bool);
+        }
         _ => {}
+    }
+    if inherited {
+        if ctx.complete {
+            for m in &mut scratch[before..] {
+                m.extra.insert("inherited".into(), Value::Bool(true));
+            }
+        } else {
+            scratch.truncate(before);
+        }
     }
 }
 
@@ -319,9 +432,13 @@ pub(crate) fn detect_has_events<R: BufRead>(reader: R) -> bool {
 /// the last message, and the last message is exactly what's held. The hold is at most one message,
 /// flushed by the next [`flush_all_but_held`] call or by the caller at EOF.
 fn flush_all_but_held(scratch: &mut Vec<Message>, sink: &mut dyn MessageSink) -> Flow {
-    let hold = scratch
-        .last()
-        .is_some_and(|m| m.role == Role::Assistant && m.usage.is_none());
+    // Also hold an assistant message whose usage came from a `token_usage_record`: its
+    // `token_count` twin (rate limits, context window) follows a few records later and merges into
+    // it — see [`apply_token_count`].
+    let hold = scratch.last().is_some_and(|m| {
+        m.role == Role::Assistant
+            && (m.usage.is_none() || m.extra.get("usage_source").and_then(Value::as_str) == Some(USAGE_FROM_RECORD))
+    });
     let upto = scratch.len() - hold as usize;
     for m in scratch.drain(..upto) {
         if sink.message(m) == Flow::Stop {
@@ -339,7 +456,7 @@ pub fn stream_jsonl<R: BufRead>(
     reader: R,
     source_path: Option<PathBuf>,
     has_events: bool,
-    _opts: &ParseOptions,
+    opts: &ParseOptions,
     sink: &mut dyn MessageSink,
 ) -> Session {
     let mut s = Session {
@@ -356,10 +473,11 @@ pub fn stream_jsonl<R: BufRead>(
         extra: serde_json::Map::new(),
     };
     let mut scratch: Vec<Message> = Vec::new();
+    let mut ctx = CodexCtx::for_opts(opts);
     let mut meta_sent = false;
     let mut stopped = false;
     let skipped = super::for_each_json_line(reader, |v| {
-        dispatch_line(&mut s, &mut scratch, &v, has_events);
+        dispatch_line(&mut s, &mut scratch, &v, has_events, &mut ctx);
         // Hand the session metadata to the sink as soon as the model is known (session_meta /
         // turn_context land in the first records, before any message), so header-rendering sinks
         // have it ahead of the body.
@@ -483,6 +601,8 @@ fn stream_spans_core(
         return s;
     }
     let mut scratch: Vec<Message> = Vec::new();
+    // The span path is the lazy (never format-complete) path, so inherited prefixes are skipped.
+    let mut ctx = CodexCtx::default();
     let mut meta_sent = false;
     let mut skipped = 0u64;
     let mut off = start_off;
@@ -506,7 +626,7 @@ fn stream_spans_core(
         if let Some(msg) = giant_fco_span(slice, base_off, &mut s) {
             scratch.push(msg);
         } else if let Ok(v) = serde_json::from_slice::<Value>(slice) {
-            dispatch_line(&mut s, &mut scratch, &v, has_events);
+            dispatch_line(&mut s, &mut scratch, &v, has_events, &mut ctx);
         } else {
             skipped += 1; // corrupt line — tolerated, but counted (see note_skipped_lines)
             continue;
@@ -581,7 +701,16 @@ fn giant_fco_span(slice: &[u8], base_off: u64, s: &mut Session) -> Option<Messag
     }
     // Only a plain *string* output spans (object/array output is transformed by coerce_output → fall
     // back to the materializing path; those giant cases are rare).
-    let span = json_string_span(pay.output?, slice, base_off)?;
+    let mut span = json_string_span(pay.output?, slice, base_off)?;
+    // cv's own emitter writes a failed result as the string "[error] <content>" (Codex never
+    // persists an error bit) — same convention as the materializing path: strip it, flag it. The
+    // prefix has no escapes, so the raw span can simply be advanced past it.
+    let lo = (span.offset - base_off) as usize;
+    let is_error = slice[lo..lo + (span.len as usize).min(slice.len() - lo)].starts_with(ERROR_PREFIX.as_bytes());
+    if is_error {
+        span.offset += ERROR_PREFIX.len() as u64;
+        span.len -= ERROR_PREFIX.len() as u64;
+    }
     let ts = rec.timestamp.and_then(parse_ts);
     if let Some(ts) = ts {
         s.created_at.get_or_insert(ts);
@@ -592,20 +721,54 @@ fn giant_fco_span(slice: &[u8], base_off: u64, s: &mut Session) -> Option<Messag
     m.content.push(Block::ToolResult {
         tool_use_id: pay.call_id.unwrap_or_default(),
         content: Text::Span(span),
-        is_error: false, // a string output is never an error (output_is_error only fires on objects)
+        is_error,
         tool_name: None,
-        status: Some("completed".into()),
+        status: Some(if is_error { "error" } else { "completed" }.into()),
         details: None,
     });
     Some(m)
 }
 
-fn apply_meta(s: &mut Session, payload: Option<&Value>) {
+/// `session_meta` fields with no first-class IR home, stashed verbatim (wire names) into
+/// `Session.extra` from the canonical (first) meta record: where the thread sits in a swarm
+/// (`session_id` = root thread, `parent_thread_id`, `forked_from_id`, `thread_source`,
+/// `agent_*`), how it was made (`source` — a string or, for subagents, an object), and how its
+/// file is laid out (`history_mode`, `subagent_history_start_ordinal`, `history_base`).
+const META_EXTRA_KEYS: &[&str] = &[
+    "session_id",
+    "parent_thread_id",
+    "forked_from_id",
+    "thread_source",
+    "agent_nickname",
+    "agent_path",
+    "agent_role",
+    "source",
+    "model_provider",
+    "history_mode",
+    "subagent_history_start_ordinal",
+    "history_base",
+    "cli_version",
+    "originator",
+];
+
+fn apply_meta(s: &mut Session, ctx: &mut CodexCtx, payload: Option<&Value>) {
     let Some(p) = payload else { return };
     if let Some(id) = p.get("id").and_then(Value::as_str) {
         if s.id.is_empty() {
             s.id = id.to_string();
         }
+    }
+    // Thread-level facts come from the FIRST meta only: a fork/subagent rollout embeds the parent's
+    // `session_meta` as its second line (recorder.rs:1108-1112 treats the first as canonical).
+    if !ctx.meta_seen {
+        ctx.meta_seen = true;
+        for key in META_EXTRA_KEYS {
+            if let Some(val) = p.get(*key).filter(|v| !v.is_null()) {
+                s.extra.insert((*key).to_string(), val.clone());
+            }
+        }
+        ctx.inherit_before = p.get("subagent_history_start_ordinal").and_then(Value::as_u64);
+        ctx.agent_path = p.get("agent_path").and_then(Value::as_str).map(str::to_string);
     }
     if s.cwd.is_none() {
         s.cwd = p.get("cwd").and_then(Value::as_str).map(PathBuf::from);
@@ -632,23 +795,50 @@ fn apply_turn_context(s: &mut Session, out: &mut Vec<Message>, payload: Option<&
     if s.cwd.is_none() {
         s.cwd = p.get("cwd").and_then(Value::as_str).map(PathBuf::from);
     }
-    let model = p.get("model").and_then(Value::as_str);
+    // 0.147+ also carries the collaboration-mode settings; `model` there mirrors the top-level one.
+    let settings = p.pointer("/collaboration_mode/settings");
+    let model = p
+        .get("model")
+        .and_then(Value::as_str)
+        .or_else(|| settings.and_then(|c| c.get("model")).and_then(Value::as_str));
+    let effort = p
+        .get("effort")
+        .and_then(Value::as_str)
+        .or_else(|| settings.and_then(|c| c.get("reasoning_effort")).and_then(Value::as_str));
+    if let Some(e) = effort {
+        s.extra.insert("reasoning_effort".into(), Value::String(e.to_string()));
+    }
+    let mut extra = Map::new();
+    for key in ["turn_id", "effort", "cwd"] {
+        if let Some(val) = p.get(key).filter(|v| !v.is_null()) {
+            extra.insert(key.to_string(), val.clone());
+        }
+    }
+    note_model_change(s, out, model, ts, "turn_context", extra);
+}
+
+/// Seed or update the session-level model; when it *changes* mid-session (`/model`, escalation, a
+/// `thread_settings_applied` event) record the switch as a system note so the drift survives into
+/// the IR. `extra` rides on the note (which record noticed it, the turn, the effort, the cwd).
+fn note_model_change(
+    s: &mut Session,
+    out: &mut Vec<Message>,
+    model: Option<&str>,
+    ts: Option<DateTime<Utc>>,
+    source: &str,
+    mut extra: Map<String, Value>,
+) {
     match (&s.model, model) {
         (None, Some(m)) => s.model = Some(m.to_string()),
         (Some(prev), Some(m)) if prev != m => {
-            // Model switched mid-session (e.g. `/model`, escalation). Record the change as a system
-            // note and update the session-level model to the latest effective value.
             let mut msg = Message::new(Role::System);
             msg.timestamp = ts;
             msg.content.push(Block::Text {
                 text: format!("[model changed: {prev} → {m}]").into(),
             });
-            msg.extra
-                .insert("codex_event".into(), Value::String("turn_context".into()));
+            msg.extra.insert("codex_event".into(), Value::String(source.into()));
             msg.extra.insert("model".into(), Value::String(m.to_string()));
-            if let Some(cwd) = p.get("cwd").and_then(Value::as_str) {
-                msg.extra.insert("cwd".into(), Value::String(cwd.into()));
-            }
+            msg.extra.append(&mut extra);
             out.push(msg);
             s.model = Some(m.to_string());
         }
@@ -658,11 +848,22 @@ fn apply_turn_context(s: &mut Session, out: &mut Vec<Message>, payload: Option<&
 
 /// Handle an `event_msg` record. These are the UI-side mirror of the model exchange. We emit
 /// natural-language `user_message`/`agent_message` text (only when `has_events`, since otherwise the
-/// `response_item message`s carry it), surface `view_image_tool_call` as an image attachment, and
-/// attach `token_count` usage/rate-limit info to the assistant message it trails. Other events
-/// (exec_command_*, web_search_*, task_started/complete, …) are intentionally not turned into
-/// messages: their structured equivalents arrive as `response_item`s.
-fn handle_event(payload: Option<&Value>, has_events: bool, ts: Option<DateTime<Utc>>, out: &mut Vec<Message>) {
+/// `response_item message`s carry it), surface `view_image_tool_call` as an image attachment
+/// (legacy files; paginated ones record it as an `item_completed` `ImageView`), attach
+/// `token_count` usage/rate-limit info to the assistant message it trails, turn paginated-mode
+/// `item_completed` items into structured system notes, follow `thread_settings_applied` model
+/// changes, and note `turn_aborted`/`thread_rolled_back`. Streaming deltas, approvals and
+/// `exec_command_*`/`web_search_*` events are never persisted (rollout/src/policy.rs), and
+/// `task_started`/`task_complete` carry nothing the items don't — except the last agent message,
+/// which is stashed session-level as a preview.
+fn handle_event(
+    s: &mut Session,
+    ctx: &mut CodexCtx,
+    payload: Option<&Value>,
+    has_events: bool,
+    ts: Option<DateTime<Utc>>,
+    out: &mut Vec<Message>,
+) {
     let Some(p) = payload else { return };
     match p.get("type").and_then(Value::as_str) {
         Some("user_message") if has_events => {
@@ -704,16 +905,278 @@ fn handle_event(payload: Option<&Value>, has_events: bool, ts: Option<DateTime<U
             // Usage totals + rate limits. Attach to the assistant message this event trails so the
             // numbers ride along with the turn they belong to; otherwise drop a bare carrier
             // message so the rate-limit snapshot isn't lost.
-            apply_token_count(p, ts, out);
+            apply_token_count(p, ts, out, ctx);
+        }
+        Some("item_completed") => handle_item_completed(p, ts, out, ctx),
+        Some("thread_settings_applied") => {
+            // The reliable "settings changed" signal (protocol.rs:2194-2233): model, provider,
+            // effort, personality, cwd, approval/permission profile. The next `turn_context` will
+            // agree, so the model-change note fires here at most once.
+            let Some(t) = p.get("thread_settings").and_then(Value::as_object) else {
+                return;
+            };
+            let model = t.get("model").and_then(Value::as_str);
+            let mut kept = Map::new();
+            for key in [
+                "model",
+                "model_provider_id",
+                "reasoning_effort",
+                "reasoning_summary",
+                "personality",
+                "cwd",
+                "approval_policy",
+                "service_tier",
+            ] {
+                if let Some(val) = t.get(key).filter(|v| !v.is_null()) {
+                    kept.insert(key.to_string(), val.clone());
+                }
+            }
+            if let Some(e) = kept.get("reasoning_effort").cloned() {
+                s.extra.insert("reasoning_effort".into(), e);
+            }
+            s.extra.insert("thread_settings".into(), Value::Object(kept));
+            note_model_change(s, out, model, ts, "thread_settings_applied", Map::new());
+        }
+        Some("task_complete") => {
+            if let Some(last) = p.get("last_agent_message").and_then(Value::as_str) {
+                if !last.trim().is_empty() {
+                    s.extra
+                        .insert("last_agent_message".into(), Value::String(last.to_string()));
+                }
+            }
+        }
+        Some("turn_aborted") => {
+            let reason = p.get("reason").and_then(Value::as_str).unwrap_or("unknown");
+            let mut m = Message::new(Role::System);
+            m.timestamp = ts;
+            m.content.push(Block::Text {
+                text: format!("[turn aborted: {reason}]").into(),
+            });
+            m.extra
+                .insert("codex_event".into(), Value::String("turn_aborted".into()));
+            for key in ["turn_id", "reason", "duration_ms"] {
+                if let Some(val) = p.get(key).filter(|v| !v.is_null()) {
+                    m.extra.insert(key.to_string(), val.clone());
+                }
+            }
+            out.push(m);
+        }
+        Some("thread_rolled_back") => {
+            // `/undo`-style rollback: the last N turns left the model's context (protocol.rs:3685).
+            let n = p.get("num_turns").and_then(Value::as_u64).unwrap_or(0);
+            let mut m = Message::new(Role::System);
+            m.timestamp = ts;
+            m.content.push(Block::Text {
+                text: format!("[rolled back {n} turn{}]", if n == 1 { "" } else { "s" }).into(),
+            });
+            m.extra
+                .insert("codex_event".into(), Value::String("thread_rolled_back".into()));
+            m.extra.insert("num_turns".into(), Value::from(n));
+            out.push(m);
         }
         _ => {}
     }
 }
 
+/// Paginated history mode records every finished `TurnItem` as an `item_completed` event
+/// (codex-rs/protocol/src/items.rs). The model-visible twins (`UserMessage`/`AgentMessage`/
+/// `Reasoning`/`FunctionCallOutput`/`ContextCompaction`) already arrive as `response_item`s, so
+/// those are skipped; the rest are UI-side facts with no `response_item` counterpart — command
+/// executions with exit codes, file changes as diffs, MCP calls with errors, viewed/generated
+/// images, sub-agent lifecycle, collaboration calls, plans, web searches — and become
+/// [`Role::System`] notes: a one-line summary as text (so `cv show` reads), the structured item in
+/// `extra.item`.
+///
+/// Why notes and not `ToolResult`s: on real 0.154 rollouts the `CommandExecution` items PRECEDE the
+/// `custom_tool_call_output` they belong to, several map to one output (a unified-exec session runs
+/// many commands), and their `exec-…` ids share nothing with the `call_…` id — so there is no safe
+/// join, and a `ToolResult` with an unmatched `tool_use_id` would round-trip into an orphan
+/// tool result (which Claude Code rejects on resume). System notes are dropped by every emitter.
+/// The model saw none of this (its context is the `response_item`s), so the notes also add no
+/// tokens to doctor's attribution — and `ImageView`/image-gen items carry the path as text only, the
+/// image itself is already a `Block::Image` on the tool output the model received.
+fn handle_item_completed(p: &Value, ts: Option<DateTime<Utc>>, out: &mut Vec<Message>, _ctx: &mut CodexCtx) {
+    let Some(item) = p.get("item") else { return };
+    let ity = item.get("type").and_then(Value::as_str).unwrap_or("");
+    let str_of = |k: &str| item.get(k).and_then(Value::as_str).unwrap_or("");
+    let text = match ity {
+        "CommandExecution" => {
+            let cmd = item
+                .get("command")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" "))
+                .unwrap_or_default();
+            let status = str_of("status");
+            let exit = item.get("exit_code").and_then(Value::as_i64);
+            let mut t = format!("$ {}", truncate(&cmd, 160));
+            if !status.is_empty() {
+                t.push_str(&format!(" → {status}"));
+            }
+            if let Some(code) = exit {
+                t.push_str(&format!(" (exit {code})"));
+            }
+            t
+        }
+        "FileChange" => {
+            let paths: Vec<&str> = item
+                .get("changes")
+                .and_then(Value::as_object)
+                .map(|c| c.keys().map(String::as_str).collect())
+                .unwrap_or_default();
+            let status = str_of("status");
+            format!(
+                "[file change{}] {}",
+                if status.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {status}")
+                },
+                truncate(&paths.join(", "), 200)
+            )
+        }
+        "McpToolCall" => {
+            let err = item.get("error").filter(|e| !e.is_null()).map(|e| e.to_string());
+            format!(
+                "[mcp {}.{}] {}{}",
+                str_of("server"),
+                str_of("tool"),
+                str_of("status"),
+                err.map(|e| format!(": {}", truncate(&e, 120))).unwrap_or_default()
+            )
+        }
+        "ImageView" => format!("[viewed image: {}]", str_of("path")),
+        "ImageGeneration" => format!("[generated image: {}]", str_of("saved_path")),
+        "Extension" => match str_of("kind") {
+            "image_gen.generation" => format!("[generated image: {}]", str_of("saved_path")),
+            "web.search" => {
+                let queries = item
+                    .pointer("/action/queries")
+                    .and_then(Value::as_array)
+                    .map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" · "))
+                    .filter(|q| !q.is_empty())
+                    .unwrap_or_else(|| str_of("query").to_string());
+                format!("[web search] {}", truncate(&queries, 200))
+            }
+            _ => return, // clock.sleep and friends: nothing to say
+        },
+        "SubAgentActivity" => format!("[sub-agent {} {}]", str_of("agent_path"), str_of("kind")),
+        "CollabAgentToolCall" => {
+            let receivers = item
+                .get("receiver_thread_ids")
+                .and_then(Value::as_array)
+                .map(|a| a.len())
+                .unwrap_or(0);
+            format!(
+                "[collab {}] {}{}",
+                str_of("tool"),
+                str_of("status"),
+                if receivers > 0 {
+                    format!(" → {receivers} agent(s)")
+                } else {
+                    String::new()
+                }
+            )
+        }
+        "Plan" => str_of("text").to_string(),
+        // Twins of `response_item`s already emitted (or, for `FunctionCallOutput`, the output's
+        // own record) — nothing new to say.
+        _ => return,
+    };
+    if text.trim().is_empty() {
+        return;
+    }
+    let mut m = Message::new(Role::System);
+    m.timestamp = p
+        .get("completed_at_ms")
+        .and_then(Value::as_i64)
+        .and_then(DateTime::from_timestamp_millis)
+        .or(ts);
+    m.content.push(Block::Text { text: text.into() });
+    m.extra.insert(
+        "codex_event".into(),
+        Value::String(if ity == "Plan" {
+            "plan".into()
+        } else {
+            "item_completed".into()
+        }),
+    );
+    m.extra.insert("item_type".into(), Value::String(ity.into()));
+    for key in ["turn_id", "started_at_ms", "completed_at_ms"] {
+        if let Some(val) = p.get(key).filter(|v| !v.is_null()) {
+            m.extra.insert(key.to_string(), val.clone());
+        }
+    }
+    m.extra.insert("item".into(), item.clone());
+    out.push(m);
+}
+
+/// Field-wise equality of two usage blocks (the IR type derives no `PartialEq`).
+fn usage_eq(a: &Usage, b: &Usage) -> bool {
+    a.input_tokens == b.input_tokens
+        && a.output_tokens == b.output_tokens
+        && a.cache_read_tokens == b.cache_read_tokens
+        && a.cache_creation_tokens == b.cache_creation_tokens
+}
+
+/// Marker in `extra.usage_source` for usage that came from a `token_usage_record` (authoritative:
+/// keyed by `response_id`/`turn_id`), so the `token_count` twin merges instead of duplicating.
+const USAGE_FROM_RECORD: &str = "token_usage_record";
+
+/// Paginated rollouts record usage per model response as a top-level `token_usage_record`
+/// (protocol.rs:2258): `usage` for this response, plus running `turn_token_usage` /
+/// `thread_token_usage`, keyed by `response_id`/`turn_id`. It precedes the `token_count` event for
+/// the same response and is the authoritative figure — attach it to the trailing assistant message
+/// (same trailing-only rule as [`apply_token_count`]), or carry it if nothing trails.
+fn apply_token_usage_record(
+    payload: Option<&Value>,
+    ts: Option<DateTime<Utc>>,
+    out: &mut Vec<Message>,
+    ctx: &mut CodexCtx,
+) {
+    let Some(p) = payload else { return };
+    let Some(usage) = p.get("usage").and_then(parse_usage) else {
+        return;
+    };
+    ctx.pending_record_usage = Some(usage.clone());
+    let attach = out
+        .last()
+        .is_some_and(|m| m.role == Role::Assistant && m.usage.is_none());
+    if !attach {
+        let mut nm = Message::new(Role::Assistant);
+        nm.timestamp = ts;
+        nm.extra
+            .insert("codex_event".into(), Value::String(USAGE_FROM_RECORD.into()));
+        out.push(nm);
+    }
+    let m = out.last_mut().unwrap();
+    m.usage = Some(usage);
+    m.extra
+        .insert("usage_source".into(), Value::String(USAGE_FROM_RECORD.into()));
+    for key in ["response_id", "turn_id"] {
+        if let Some(val) = p.get(key).filter(|v| !v.is_null()) {
+            m.extra.insert(key.to_string(), val.clone());
+        }
+    }
+    if let Some(thread) = p.get("thread_token_usage").filter(|v| !v.is_null()) {
+        m.extra.insert("thread_token_usage".into(), thread.clone());
+    }
+}
+
 /// Pull `last_token_usage` into IR [`Usage`] and stash rate-limit / context-window info in `extra`.
-fn apply_token_count(p: &Value, ts: Option<DateTime<Utc>>, out: &mut Vec<Message>) {
+fn apply_token_count(p: &Value, ts: Option<DateTime<Utc>>, out: &mut Vec<Message>, ctx: &mut CodexCtx) {
     let info = p.get("info");
-    let usage = info.and_then(|i| i.get("last_token_usage")).and_then(parse_usage);
+    let mut usage = info.and_then(|i| i.get("last_token_usage")).and_then(parse_usage);
+    // The twin of a `token_usage_record` already applied (same numbers; on real 0.154 files the
+    // call's `item_completed` notes and its output sit between the two, so the record's message no
+    // longer trails): its usage is a duplicate — keep only the rate-limit/context-window snapshot.
+    let twin_of_record = match (&usage, &ctx.pending_record_usage) {
+        (Some(u), Some(r)) => usage_eq(u, r),
+        _ => false,
+    };
+    if twin_of_record {
+        ctx.pending_record_usage = None;
+        usage = None;
+    }
     let rate_limits = p.get("rate_limits").filter(|v| !v.is_null()).cloned();
     let ctx_window = info
         .and_then(|i| i.get("model_context_window"))
@@ -728,9 +1191,18 @@ fn apply_token_count(p: &Value, ts: Option<DateTime<Utc>>, out: &mut Vec<Message
     // after a user message), so attaching it further back would mislabel an older turn. It also
     // keeps the streaming paths exact: they hold back only the trailing assistant message (see
     // [`flush_all_but_held`]), and with this rule that's the only message ever targeted.
-    let attach = out
-        .last()
-        .is_some_and(|m| m.role == Role::Assistant && m.usage.is_none());
+    // A `token_usage_record` already gave the trailing assistant message its (authoritative) usage:
+    // this is its `token_count` twin — merge the rate-limit/context-window snapshot, keep the usage.
+    let from_record = out.last().is_some_and(|m| {
+        m.role == Role::Assistant && m.extra.get("usage_source").and_then(Value::as_str) == Some(USAGE_FROM_RECORD)
+    });
+    if twin_of_record && !from_record && rate_limits.is_none() && ctx_window.is_none() {
+        return; // the twin carried nothing beyond the usage already attached elsewhere
+    }
+    let attach = from_record
+        || out
+            .last()
+            .is_some_and(|m| m.role == Role::Assistant && m.usage.is_none());
     if !attach {
         let mut nm = Message::new(Role::Assistant);
         nm.timestamp = ts;
@@ -740,7 +1212,9 @@ fn apply_token_count(p: &Value, ts: Option<DateTime<Utc>>, out: &mut Vec<Message
     }
     let m = out.last_mut().unwrap();
     if let Some(u) = usage {
-        m.usage = Some(u);
+        if !from_record {
+            m.usage = Some(u);
+        }
     }
     if let Some(rl) = rate_limits {
         m.extra.insert("rate_limits".into(), rl);
@@ -750,15 +1224,16 @@ fn apply_token_count(p: &Value, ts: Option<DateTime<Utc>>, out: &mut Vec<Message
     }
 }
 
-/// Codex token-usage block → IR [`Usage`]. `cached_input_tokens` maps to cache-read; Codex has no
-/// separate cache-creation counter.
+/// Codex token-usage block → IR [`Usage`]. `cached_input_tokens` maps to cache-read;
+/// `cache_write_input_tokens` (added in 0.147, `#[serde(default)]`, protocol.rs:2235) to
+/// cache-creation — absent on older files.
 fn parse_usage(v: &Value) -> Option<Usage> {
     let u64f = |k: &str| v.get(k).and_then(Value::as_u64);
     let u = Usage {
         input_tokens: u64f("input_tokens"),
         output_tokens: u64f("output_tokens"),
         cache_read_tokens: u64f("cached_input_tokens"),
-        cache_creation_tokens: None,
+        cache_creation_tokens: u64f("cache_write_input_tokens"),
     };
     if u.input_tokens.is_none() && u.output_tokens.is_none() && u.cache_read_tokens.is_none() {
         return None;
@@ -787,11 +1262,42 @@ fn handle_compacted(payload: Option<&Value>, ts: Option<DateTime<Utc>>, out: &mu
     out.push(m);
 }
 
+/// cv's emitter writes a failed tool result as the string `"[error] <content>"`: Codex's
+/// `FunctionCallOutputPayload` persists only a string or a content-item array — never an error
+/// bit (models.rs:2252-2275) — so this prefix is the one form that both decodes in Codex and
+/// round-trips `is_error` through cv. Recognized on parse and stripped from the content.
+const ERROR_PREFIX: &str = "[error] ";
+
+/// The real creation time of a `response_item`, when Codex recorded one:
+/// `internal_chat_message_metadata_passthrough.create_time` (epoch seconds, float; models.rs:959).
+/// A fork/subagent rollout stamps its inherited prefix with the FORK time as the envelope
+/// `timestamp`, so this is the only honest per-item clock there.
+fn passthrough_ts(p: &Value) -> Option<DateTime<Utc>> {
+    let ct = p.pointer("/internal_chat_message_metadata_passthrough/create_time")?;
+    let secs = ct.as_f64()?;
+    if !secs.is_finite() || secs <= 0.0 {
+        return None;
+    }
+    DateTime::from_timestamp(secs.trunc() as i64, ((secs.fract()) * 1e9) as u32)
+}
+
 /// Handle a `response_item` payload or a legacy `items[]` entry.
-fn handle_item(payload: Option<&Value>, has_events: bool, ts: Option<DateTime<Utc>>, out: &mut Vec<Message>) {
+fn handle_item(
+    payload: Option<&Value>,
+    has_events: bool,
+    ts: Option<DateTime<Utc>>,
+    out: &mut Vec<Message>,
+    ctx: &mut CodexCtx,
+) {
     let Some(p) = payload else { return };
     let ty = p.get("type").and_then(Value::as_str).unwrap_or("");
     let str_field = |k: &str| p.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+    let ts = passthrough_ts(p).or(ts);
+    let turn_id = p
+        .pointer("/internal_chat_message_metadata_passthrough/turn_id")
+        .filter(|v| !v.is_null())
+        .cloned();
+    let before = out.len();
 
     match ty {
         "message" => {
@@ -841,6 +1347,43 @@ fn handle_item(payload: Option<&Value>, has_events: bool, ts: Option<DateTime<Ut
                 out.push(m);
             }
         }
+        // Inter-agent (swarm) message: `{id, author, recipient, content:[input_text |
+        // encrypted_content]}` (models.rs:1036), produced by `InterAgentCommunication`
+        // (protocol.rs:880-915) and preceded by a top-level `inter_agent_communication_metadata`
+        // line carrying `trigger_turn`. From this thread's point of view a message it authored is
+        // assistant output; one addressed to it is (user-role) input. The payload body is usually an
+        // `encrypted_content` item — only the header text is readable.
+        "agent_message" => {
+            let author = str_field("author");
+            let me = ctx.agent_path.as_deref().unwrap_or("/root");
+            let role = if author == me { Role::Assistant } else { Role::User };
+            let mut m = Message::new(role);
+            m.timestamp = ts;
+            let items = p.get("content").and_then(Value::as_array);
+            let encrypted = items.is_some_and(|a| {
+                a.iter()
+                    .any(|it| it.get("type").and_then(Value::as_str) == Some("encrypted_content"))
+            });
+            for it in items.into_iter().flatten() {
+                if it.get("type").and_then(Value::as_str) == Some("input_text") {
+                    if let Some(t) = it.get("text").and_then(Value::as_str).filter(|t| !t.is_empty()) {
+                        m.content.push(Block::Text { text: t.into() });
+                    }
+                }
+            }
+            m.extra
+                .insert("codex_event".into(), Value::String("agent_message".into()));
+            m.extra.insert("author".into(), Value::String(author));
+            m.extra
+                .insert("recipient".into(), Value::String(str_field("recipient")));
+            if encrypted {
+                m.extra.insert("encrypted".into(), Value::Bool(true));
+            }
+            if let Some(trigger) = ctx.pending_trigger_turn.take() {
+                m.extra.insert("trigger_turn".into(), Value::Bool(trigger));
+            }
+            out.push(m);
+        }
         "function_call" | "custom_tool_call" | "local_shell_call" => {
             let call_id = p
                 .get("call_id")
@@ -885,6 +1428,11 @@ fn handle_item(payload: Option<&Value>, has_events: bool, ts: Option<DateTime<Ut
             if let Some(status) = p.get("status").and_then(Value::as_str) {
                 m.extra.insert("status".into(), Value::String(status.into()));
             }
+            // `namespace` (0.147+, e.g. `collaboration` for `send_message`/`spawn`/`wait`) rides in
+            // extra; `name` stays the bare tool name so per-tool stats keep grouping.
+            if let Some(ns) = p.get("namespace").and_then(Value::as_str) {
+                m.extra.insert("namespace".into(), Value::String(ns.into()));
+            }
             m.content.push(Block::ToolUse {
                 id: call_id,
                 name,
@@ -894,15 +1442,28 @@ fn handle_item(payload: Option<&Value>, has_events: bool, ts: Option<DateTime<Ut
         }
         "function_call_output" | "custom_tool_call_output" => {
             let call_id = str_field("call_id");
-            let (content, images) = coerce_output(p.get("output"));
-            let is_error = output_is_error(p.get("output"));
+            let (mut content, images) = coerce_output(p.get("output"));
+            // Error-ness: cv's own `[error] ` string convention (see [`ERROR_PREFIX`]), or the
+            // legacy object form `{success:false}` / `{metadata:{exit_code≠0}}` some older
+            // recorders wrote. Real Codex 0.147+ files carry neither — a failed command's exit code
+            // lives only in the `item_completed CommandExecution` note.
+            let prefixed = matches!(p.get("output"), Some(Value::String(_))) && content.starts_with(ERROR_PREFIX);
+            if prefixed {
+                content.drain(..ERROR_PREFIX.len());
+            }
+            let is_error = prefixed || output_is_error(p.get("output"));
             let mut m = Message::new(Role::Tool);
             m.timestamp = ts;
+            // 0.147+ outputs name their tool (`name`, `namespace`; models.rs:1113-1131).
+            let tool_name = p.get("name").and_then(Value::as_str).map(str::to_string);
+            if let Some(ns) = p.get("namespace").and_then(Value::as_str) {
+                m.extra.insert("namespace".into(), Value::String(ns.into()));
+            }
             m.content.push(Block::ToolResult {
                 tool_use_id: call_id,
                 content: content.into(),
                 is_error,
-                tool_name: None,
+                tool_name,
                 status: Some(if is_error { "error" } else { "completed" }.into()),
                 details: None,
             });
@@ -995,6 +1556,12 @@ fn handle_item(payload: Option<&Value>, has_events: bool, ts: Option<DateTime<Ut
             out.push(m);
         }
         _ => {}
+    }
+    // The turn this item belongs to (from the passthrough), on every message it produced.
+    if let Some(tid) = turn_id {
+        for m in &mut out[before..] {
+            m.extra.insert("turn_id".into(), tid.clone());
+        }
     }
 }
 
@@ -1147,15 +1714,31 @@ struct CodexScan {
     created_at: Option<DateTime<Utc>>,
     updated_at: Option<DateTime<Utc>>,
     message_count: usize,
+    /// `subagent_history_start_ordinal` of the first `session_meta`: records below it are the
+    /// parent's embedded history, not this thread's (they'd title every subagent with the parent's
+    /// first prompt and count its turns).
+    inherit_before: Option<u64>,
+    /// This thread's `agent_path`, to tell a task handed TO it (title-worthy) from its own sends.
+    agent_path: Option<String>,
+    meta_seen: bool,
 }
 
 impl CodexScan {
     fn consider_title(&mut self, t: &str) {
         let trimmed = t.trim();
-        // Skip Codex's injected preambles — they aren't the user's first words.
-        let is_injected = trimmed.starts_with("<environment_context")
-            || trimmed.starts_with("<user_instructions")
-            || trimmed.starts_with("# Codex CLI");
+        // Skip Codex's injected preambles — they aren't the user's first words. (0.147+ adds the
+        // goal context, the plugin catalog, the AGENTS.md dump and the @-mention file bundle.)
+        let is_injected = [
+            "<environment_context",
+            "<user_instructions",
+            "<codex_internal_context",
+            "<recommended_plugins",
+            "# Codex CLI",
+            "# AGENTS.md instructions",
+            "# Files mentioned by the user",
+        ]
+        .iter()
+        .any(|p| trimmed.starts_with(p));
         if self.title.is_none() && !trimmed.is_empty() && !is_injected {
             self.title = Some(crate::ir::truncate(trimmed, 80));
         }
@@ -1166,6 +1749,14 @@ impl CodexScan {
         if let Some(ts) = top_ts(v) {
             self.created_at.get_or_insert(ts);
             self.updated_at = Some(ts);
+        }
+        // Inherited prefix of a fork/subagent rollout: not this thread's turns (see `dispatch_line`).
+        if matches!(
+            (v.get("ordinal").and_then(Value::as_u64), self.inherit_before),
+            (Some(o), Some(cut)) if o < cut
+        ) && v.get("type").and_then(Value::as_str) != Some("session_meta")
+        {
+            return;
         }
         match v.get("type").and_then(Value::as_str) {
             None => {
@@ -1185,6 +1776,16 @@ impl CodexScan {
                 if self.cwd.is_none() {
                     self.cwd = p.and_then(|p| p.get("cwd")).and_then(Value::as_str).map(PathBuf::from);
                 }
+                if !self.meta_seen {
+                    self.meta_seen = true;
+                    self.inherit_before = p
+                        .and_then(|p| p.get("subagent_history_start_ordinal"))
+                        .and_then(Value::as_u64);
+                    self.agent_path = p
+                        .and_then(|p| p.get("agent_path"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                }
             }
             Some("event_msg") => {
                 let pt = v.pointer("/payload/type").and_then(Value::as_str);
@@ -1201,6 +1802,26 @@ impl CodexScan {
                 self.message_count += 1;
                 if v.pointer("/payload/role").and_then(Value::as_str) == Some("user") {
                     self.consider_title(&coerce_content(v.pointer("/payload/content")));
+                }
+            }
+            // A task handed to this thread by another agent is its prompt — the only one a
+            // subagent thread usually gets (its `user`-role messages are the developer preamble).
+            Some("response_item") if v.pointer("/payload/type").and_then(Value::as_str) == Some("agent_message") => {
+                self.message_count += 1;
+                let author = v.pointer("/payload/author").and_then(Value::as_str);
+                if author != self.agent_path.as_deref() {
+                    let text = v
+                        .pointer("/payload/content")
+                        .and_then(Value::as_array)
+                        .map(|a| {
+                            a.iter()
+                                .filter(|it| it.get("type").and_then(Value::as_str) == Some("input_text"))
+                                .filter_map(|it| it.get("text").and_then(Value::as_str))
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        })
+                        .unwrap_or_default();
+                    self.consider_title(&text);
                 }
             }
             _ => {}
@@ -1263,10 +1884,17 @@ fn scan(path: &Path) -> Result<SessionRef> {
     const SAMPLE: usize = 1 << 20; // 1 MiB head, 1 MiB tail
 
     let size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-    let is_jsonl = path.extension().and_then(|e| e.to_str()) == Some("jsonl");
+    let is_jsonl = is_jsonl_path(path);
     let mut s = CodexScan::default();
 
-    if is_jsonl {
+    if is_zst_path(path) {
+        // Compressed (cold, > 7 days) rollout: no seeking, so stream the whole decode — these are
+        // exactly the files whose bytes we never mmap.
+        super::for_each_json_line(open_rollout(path)?, |v| {
+            s.feed(&v);
+            Flow::Continue
+        });
+    } else if is_jsonl {
         if size <= FULL_SCAN_CAP {
             let text = fs::read_to_string(path)?;
             super::for_each_json_line_str(&text, |v| {
@@ -1303,7 +1931,13 @@ fn scan(path: &Path) -> Result<SessionRef> {
     }
 
     if s.id.is_empty() {
-        s.id = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
+        // `rollout-<ts>-<uuid>.jsonl[.zst]`: strip both suffixes.
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        s.id = name
+            .trim_end_matches(".zst")
+            .trim_end_matches(".jsonl")
+            .trim_end_matches(".json")
+            .to_string();
     }
 
     Ok(SessionRef {
@@ -1870,6 +2504,489 @@ mod tests {
         }
         eprintln!("tool_uses={tool_uses} tool_results={tool_results} images={images} thinking={thinking}");
         assert!(tool_uses > 0, "expected some tool calls in the corpus");
+    }
+
+    /// Parse a `.jsonl` transcript under explicit options via the streaming path (the only entry
+    /// that takes `ParseOptions`), collecting messages like `parse_jsonl` does.
+    fn stream_jsonl_with(lines: &[&str], opts: &ParseOptions) -> Session {
+        let text = lines.join("\n");
+        let has_events = detect_has_events(std::io::Cursor::new(text.as_bytes()));
+        let mut sink = crate::stream::CollectSink::default();
+        let mut s = stream_jsonl(
+            "fallback-id",
+            std::io::Cursor::new(text.as_bytes()),
+            None,
+            has_events,
+            opts,
+            &mut sink,
+        );
+        s.messages = sink.messages;
+        s
+    }
+
+    /// The 0.154 subagent-rollout head: the child's meta (with swarm fields and an inherited-prefix
+    /// cutoff), the parent's meta embedded as line 1, then the parent's history up to the cutoff.
+    const SUBAGENT_META: &str = r#"{"timestamp":"2026-09-19T18:12:43.771Z","ordinal":0,"type":"session_meta","payload":{"id":"child-1","session_id":"root-1","forked_from_id":"parent-1","parent_thread_id":"parent-1","timestamp":"2026-09-19T18:12:43.771Z","cwd":"/Users/ember/dev/minidregg","originator":"codex-tui","cli_version":"0.154.0","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent-1","depth":1,"agent_path":"/root/cycle_client","agent_nickname":"Newton","agent_role":null}}},"thread_source":"subagent","agent_nickname":"Newton","agent_path":"/root/cycle_client","agent_role":null,"model_provider":"openai","history_mode":"paginated","subagent_history_start_ordinal":4}}"#;
+    const PARENT_META: &str = r#"{"timestamp":"2026-09-19T18:12:43.780Z","ordinal":1,"type":"session_meta","payload":{"id":"parent-1","timestamp":"2026-09-19T17:00:00.000Z","cwd":"/Users/ember/dev/parent","originator":"codex-tui","cli_version":"0.154.0","agent_path":"/root","history_mode":"paginated"}}"#;
+
+    #[test]
+    fn session_meta_swarm_fields_land_in_extra_and_first_meta_wins() {
+        let s = parse_jsonl(&[SUBAGENT_META, PARENT_META]);
+        assert_eq!(s.id, "child-1", "the first session_meta is canonical");
+        assert_eq!(s.cwd.as_deref(), Some(Path::new("/Users/ember/dev/minidregg")));
+        assert_eq!(s.extra["session_id"], "root-1");
+        assert_eq!(s.extra["parent_thread_id"], "parent-1");
+        assert_eq!(s.extra["forked_from_id"], "parent-1");
+        assert_eq!(s.extra["thread_source"], "subagent");
+        assert_eq!(s.extra["agent_nickname"], "Newton");
+        assert_eq!(
+            s.extra["agent_path"], "/root/cycle_client",
+            "the parent's /root did not overwrite it"
+        );
+        assert_eq!(
+            s.extra["source"]["subagent"]["thread_spawn"]["depth"], 1,
+            "object-valued source kept raw"
+        );
+        assert_eq!(s.extra["model_provider"], "openai");
+        assert_eq!(s.extra["history_mode"], "paginated");
+        assert_eq!(s.extra["subagent_history_start_ordinal"], 4);
+        assert_eq!(s.extra["cli_version"], "0.154.0");
+        assert!(!s.extra.contains_key("agent_role"), "null fields are not stashed");
+    }
+
+    #[test]
+    fn inherited_prefix_is_skipped_lean_and_tagged_complete() {
+        // Ordinals 0-3 are the parent's embedded history (cutoff 4): its turn_context still seeds
+        // the child's model, but its messages are not the child's turns.
+        let lines = [
+            SUBAGENT_META,
+            PARENT_META,
+            r#"{"timestamp":"2026-09-19T18:12:43.790Z","ordinal":2,"type":"turn_context","payload":{"turn_id":"t0","cwd":"/Users/ember/dev/parent","model":"gpt-6-astra","effort":"xhigh","approval_policy":"never","sandbox_policy":{"type":"danger-full-access"},"summary":"auto"}}"#,
+            r#"{"timestamp":"2026-09-19T18:12:43.795Z","ordinal":3,"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"parent's original prompt"}],"internal_chat_message_metadata_passthrough":{"turn_id":"t0","create_time":1789840968.10353}}}"#,
+            r#"{"timestamp":"2026-09-19T18:12:44.000Z","ordinal":4,"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"child's own reply"}],"internal_chat_message_metadata_passthrough":{"turn_id":"t1","create_time":1789845000.5}}}"#,
+        ];
+        let lean = parse_jsonl(&lines);
+        assert_eq!(
+            lean.model.as_deref(),
+            Some("gpt-6-astra"),
+            "inherited turn_context still seeds the model"
+        );
+        assert_eq!(lean.extra["reasoning_effort"], "xhigh");
+        let texts: Vec<_> = lean.messages.iter().filter_map(|m| m.text()).collect();
+        assert_eq!(
+            texts,
+            vec!["child's own reply"],
+            "the parent's prompt is not the child's turn"
+        );
+        // create_time (epoch seconds, float) beats the envelope timestamp; turn_id rides along.
+        let m = &lean.messages[0];
+        assert_eq!(m.timestamp.map(|t| t.timestamp()), Some(1789845000));
+        assert_eq!(m.extra["turn_id"], "t1");
+
+        let complete = stream_jsonl_with(&lines, &ParseOptions::complete());
+        let texts: Vec<_> = complete.messages.iter().filter_map(|m| m.text()).collect();
+        assert_eq!(texts, vec!["parent's original prompt", "child's own reply"]);
+        assert_eq!(complete.messages[0].extra["inherited"], true);
+        assert_eq!(
+            complete.messages[0].timestamp.map(|t| t.timestamp()),
+            Some(1789840968),
+            "the fork-time envelope stamp is not used"
+        );
+        assert!(!complete.messages[1].extra.contains_key("inherited"));
+
+        // parse == stream for the lean pass too
+        let streamed = stream_jsonl_with(&lines, &ParseOptions::full());
+        assert_eq!(
+            serde_json::to_value(&lean).unwrap(),
+            serde_json::to_value(&streamed).unwrap()
+        );
+    }
+
+    #[test]
+    fn agent_message_pairs_with_preceding_metadata_and_attributes_by_author() {
+        let lines = [
+            SUBAGENT_META,
+            r#"{"timestamp":"2026-09-19T18:12:45.000Z","ordinal":4,"type":"inter_agent_communication_metadata","payload":{"trigger_turn":true}}"#,
+            r#"{"timestamp":"2026-09-19T18:12:45.001Z","ordinal":5,"type":"response_item","payload":{"type":"agent_message","id":"amsg_1","author":"/root","recipient":"/root/cycle_client","content":[{"type":"input_text","text":"Message Type: NEW_TASK\nTask name: /root/cycle_client\nSender: /root\nPayload:\n"},{"type":"encrypted_content","encrypted_content":"gAAAA"}]}}"#,
+            r#"{"timestamp":"2026-09-19T18:12:46.000Z","ordinal":6,"type":"response_item","payload":{"type":"function_call","id":"fc_1","name":"send_message","namespace":"collaboration","arguments":"{\"to\":\"/root\"}","call_id":"call_1"}}"#,
+            r#"{"timestamp":"2026-09-19T18:12:46.100Z","ordinal":7,"type":"response_item","payload":{"type":"function_call_output","call_id":"call_1","name":"send_message","namespace":"collaboration","output":""}}"#,
+            r#"{"timestamp":"2026-09-19T18:12:47.000Z","ordinal":8,"type":"inter_agent_communication_metadata","payload":{"trigger_turn":false}}"#,
+            r#"{"timestamp":"2026-09-19T18:12:47.001Z","ordinal":9,"type":"response_item","payload":{"type":"agent_message","id":"amsg_2","author":"/root/cycle_client","recipient":"/root","content":[{"type":"input_text","text":"Message Type: MESSAGE\nPayload:\n"}]}}"#,
+        ];
+        let s = parse_jsonl(&lines);
+        let inbound = &s.messages[0];
+        assert_eq!(inbound.role, Role::User, "addressed to this thread ⇒ input");
+        assert!(inbound.text().unwrap().starts_with("Message Type: NEW_TASK"));
+        assert_eq!(inbound.extra["codex_event"], "agent_message");
+        assert_eq!(inbound.extra["author"], "/root");
+        assert_eq!(inbound.extra["recipient"], "/root/cycle_client");
+        assert_eq!(inbound.extra["encrypted"], true);
+        assert_eq!(
+            inbound.extra["trigger_turn"], true,
+            "the metadata line that preceded it"
+        );
+        // namespace kept on the call and its output; name stays bare
+        let call = &s.messages[1];
+        assert!(matches!(&call.content[0], Block::ToolUse { name, .. } if name == "send_message"));
+        assert_eq!(call.extra["namespace"], "collaboration");
+        let out = &s.messages[2];
+        assert!(
+            matches!(&out.content[0], Block::ToolResult { tool_name, .. } if tool_name.as_deref() == Some("send_message"))
+        );
+        assert_eq!(out.extra["namespace"], "collaboration");
+        let outbound = &s.messages[3];
+        assert_eq!(outbound.role, Role::Assistant, "authored by this thread ⇒ output");
+        assert_eq!(outbound.extra["trigger_turn"], false);
+        assert!(!outbound.extra.contains_key("encrypted"));
+        // identical on the streaming path (the pairing lives in parser state, not the sink)
+        let streamed = stream_jsonl_with(&lines, &ParseOptions::full());
+        assert_eq!(
+            serde_json::to_value(&s).unwrap(),
+            serde_json::to_value(&streamed).unwrap()
+        );
+    }
+
+    #[test]
+    fn item_completed_items_become_system_notes_except_twins() {
+        let lines = [
+            r#"{"timestamp":"2026-09-19T18:13:04.000Z","ordinal":0,"type":"event_msg","payload":{"type":"item_completed","thread_id":"child-1","turn_id":"t1","item":{"type":"CommandExecution","id":"exec-1","command":["/bin/zsh","-lc","cargo test"],"cwd":"file:///Users/ember/dev/x","status":"failed","exit_code":101,"duration":{"secs":3,"nanos":0},"stdout":"error: test failed","source":"unified_exec_startup"},"started_at_ms":1789841584000,"completed_at_ms":1789841587000}}"#,
+            r#"{"timestamp":"2026-09-19T18:13:05.000Z","ordinal":1,"type":"event_msg","payload":{"type":"item_completed","thread_id":"child-1","turn_id":"t1","item":{"type":"FileChange","id":"exec-2","changes":{"/Users/ember/dev/x/src/lib.rs":{"type":"update","unified_diff":"@@ -1 +1 @@\n-a\n+b\n"}},"status":"completed"},"completed_at_ms":1789841588000}}"#,
+            r#"{"timestamp":"2026-09-19T18:13:06.000Z","ordinal":2,"type":"event_msg","payload":{"type":"item_completed","thread_id":"child-1","turn_id":"t1","item":{"type":"SubAgentActivity","id":"call_9","kind":"started","agent_thread_id":"grand-1","agent_path":"/root/cycle_client/helper"},"completed_at_ms":1789841589000}}"#,
+            r#"{"timestamp":"2026-09-19T18:13:07.000Z","ordinal":3,"type":"event_msg","payload":{"type":"item_completed","thread_id":"child-1","turn_id":"t1","item":{"type":"ImageView","id":"exec-3","path":"file:///Users/ember/shot.png"},"completed_at_ms":1789841590000}}"#,
+            r#"{"timestamp":"2026-09-19T18:13:08.000Z","ordinal":4,"type":"event_msg","payload":{"type":"item_completed","thread_id":"child-1","turn_id":"t1","item":{"type":"McpToolCall","id":"exec-4","server":"node_repl","tool":"js","arguments":{"code":"1+1"},"status":"failed","error":{"message":"boom"}},"completed_at_ms":1789841591000}}"#,
+            r#"{"timestamp":"2026-09-19T18:13:09.000Z","ordinal":5,"type":"event_msg","payload":{"type":"item_completed","thread_id":"child-1","turn_id":"t1","item":{"type":"Extension","kind":"web.search","id":"exec-5","query":"q","action":{"type":"search","query":null,"queries":["rust zstd crate","ruzstd docs"]}},"completed_at_ms":1789841592000}}"#,
+            r#"{"timestamp":"2026-09-19T18:13:10.000Z","ordinal":6,"type":"event_msg","payload":{"type":"item_completed","thread_id":"child-1","turn_id":"t1","item":{"type":"Plan","id":"plan-1","text":"1. read\n2. fix"},"completed_at_ms":1789841593000}}"#,
+            r#"{"timestamp":"2026-09-19T18:13:11.000Z","ordinal":7,"type":"event_msg","payload":{"type":"item_completed","thread_id":"child-1","turn_id":"t1","item":{"type":"Reasoning","id":"rs_1","summary_text":[],"raw_content":[]},"completed_at_ms":1789841594000}}"#,
+            r#"{"timestamp":"2026-09-19T18:13:12.000Z","ordinal":8,"type":"event_msg","payload":{"type":"item_completed","thread_id":"child-1","turn_id":"t1","item":{"type":"AgentMessage","id":"msg_1","content":[{"type":"Text","text":"twin of the response_item"}]},"completed_at_ms":1789841595000}}"#,
+            r#"{"timestamp":"2026-09-19T18:13:13.000Z","ordinal":9,"type":"event_msg","payload":{"type":"item_completed","thread_id":"child-1","turn_id":"t1","item":{"type":"Extension","kind":"clock.sleep","id":"exec-6"},"completed_at_ms":1789841596000}}"#,
+        ];
+        let s = parse_jsonl(&lines);
+        let texts: Vec<String> = s.messages.iter().filter_map(|m| m.text()).collect();
+        assert_eq!(
+            texts,
+            vec![
+                "$ /bin/zsh -lc cargo test → failed (exit 101)",
+                "[file change completed] /Users/ember/dev/x/src/lib.rs",
+                "[sub-agent /root/cycle_client/helper started]",
+                "[viewed image: file:///Users/ember/shot.png]",
+                "[mcp node_repl.js] failed: {\"message\":\"boom\"}",
+                "[web search] rust zstd crate · ruzstd docs",
+                "1. read\n2. fix",
+            ],
+            "Reasoning/AgentMessage twins and clock.sleep emit nothing"
+        );
+        assert!(s.messages.iter().all(|m| m.role == Role::System));
+        assert!(
+            s.messages
+                .iter()
+                .all(|m| !m.content.iter().any(|b| matches!(b, Block::Image { .. }))),
+            "the viewed image is not duplicated as an Image block (the tool output already carries it)"
+        );
+        let exec = &s.messages[0];
+        assert_eq!(exec.extra["codex_event"], "item_completed");
+        assert_eq!(exec.extra["item_type"], "CommandExecution");
+        assert_eq!(exec.extra["item"]["exit_code"], 101);
+        assert_eq!(exec.extra["item"]["stdout"], "error: test failed");
+        assert_eq!(exec.extra["turn_id"], "t1");
+        assert_eq!(exec.extra["started_at_ms"], 1789841584000u64);
+        assert_eq!(
+            exec.timestamp.map(|t| t.timestamp_millis()),
+            Some(1789841587000),
+            "completed_at_ms is the note's time"
+        );
+        assert_eq!(s.messages[6].extra["codex_event"], "plan");
+    }
+
+    #[test]
+    fn token_usage_record_is_authoritative_and_its_token_count_merges() {
+        let lines = [
+            r#"{"timestamp":"2026-09-19T18:12:44.000Z","ordinal":0,"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}}"#,
+            r#"{"timestamp":"2026-09-19T18:12:44.100Z","ordinal":1,"type":"token_usage_record","payload":{"thread_id":"child-1","turn_id":"t1","session_id":"root-1","root_turn_id":"t1","response_id":"resp_1","usage":{"input_tokens":35507,"cached_input_tokens":34432,"cache_write_input_tokens":512,"output_tokens":55,"reasoning_output_tokens":0,"total_tokens":35562},"turn_token_usage":{"input_tokens":35507},"thread_token_usage":{"input_tokens":70000}}}"#,
+            r#"{"timestamp":"2026-09-19T18:12:44.200Z","ordinal":2,"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":35507,"cached_input_tokens":34432,"cache_write_input_tokens":512,"output_tokens":55,"reasoning_output_tokens":0,"total_tokens":35562},"model_context_window":258400},"rate_limits":{"primary":{"used_percent":7.0}}}}"#,
+            r#"{"timestamp":"2026-09-19T18:12:50.000Z","ordinal":3,"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"next"}]}}"#,
+        ];
+        let s = parse_jsonl(&lines);
+        assert_eq!(
+            s.messages.len(),
+            2,
+            "no carrier: the token_count merged into the record-sourced usage"
+        );
+        let m = &s.messages[0];
+        let u = m.usage.as_ref().expect("usage from the record");
+        assert_eq!(
+            (
+                u.input_tokens,
+                u.cache_read_tokens,
+                u.cache_creation_tokens,
+                u.output_tokens
+            ),
+            (Some(35507), Some(34432), Some(512), Some(55))
+        );
+        assert_eq!(m.extra["usage_source"], "token_usage_record");
+        assert_eq!(m.extra["response_id"], "resp_1");
+        assert_eq!(m.extra["turn_id"], "t1");
+        assert_eq!(m.extra["thread_token_usage"]["input_tokens"], 70000);
+        assert!(m.extra.contains_key("rate_limits"), "token_count's snapshot merged in");
+        assert_eq!(m.extra["model_context_window"], 258400);
+        // and the streaming path (which holds the message across the two records) agrees
+        let streamed = stream_jsonl_with(&lines, &ParseOptions::full());
+        assert_eq!(
+            serde_json::to_value(&s).unwrap(),
+            serde_json::to_value(&streamed).unwrap()
+        );
+    }
+
+    #[test]
+    fn thread_settings_applied_aborts_and_rollbacks_are_noted() {
+        let lines = [
+            r#"{"timestamp":"2026-09-19T18:12:43.000Z","ordinal":0,"type":"turn_context","payload":{"turn_id":"t0","cwd":"/w","model":"gpt-6-astra","effort":"high","approval_policy":"never","sandbox_policy":{"type":"danger-full-access"},"summary":"auto"}}"#,
+            r#"{"timestamp":"2026-09-19T18:12:44.000Z","ordinal":1,"type":"event_msg","payload":{"type":"thread_settings_applied","thread_id":"child-1","thread_settings":{"model":"gpt-6-vega","model_provider_id":"openai","reasoning_effort":"xhigh","personality":"pragmatic","cwd":"/w","approval_policy":"never","service_tier":"default"}}}"#,
+            r#"{"timestamp":"2026-09-19T18:12:45.000Z","ordinal":2,"type":"turn_context","payload":{"turn_id":"t1","cwd":"/w","model":"gpt-6-vega","effort":"xhigh","approval_policy":"never","sandbox_policy":{"type":"danger-full-access"},"summary":"auto"}}"#,
+            r#"{"timestamp":"2026-09-19T18:12:46.000Z","ordinal":3,"type":"event_msg","payload":{"type":"task_complete","turn_id":"t1","last_agent_message":"all done here"}}"#,
+            r#"{"timestamp":"2026-09-19T18:12:47.000Z","ordinal":4,"type":"event_msg","payload":{"type":"turn_aborted","turn_id":"t2","reason":"interrupted","started_at":1788236085,"completed_at":1788246782,"duration_ms":10696120}}"#,
+            r#"{"timestamp":"2026-09-19T18:12:48.000Z","ordinal":5,"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":2}}"#,
+        ];
+        let s = parse_jsonl(&lines);
+        assert_eq!(s.model.as_deref(), Some("gpt-6-vega"));
+        assert_eq!(s.extra["reasoning_effort"], "xhigh");
+        assert_eq!(s.extra["thread_settings"]["model_provider_id"], "openai");
+        assert_eq!(s.extra["thread_settings"]["personality"], "pragmatic");
+        assert_eq!(s.extra["last_agent_message"], "all done here");
+        let texts: Vec<String> = s.messages.iter().filter_map(|m| m.text()).collect();
+        assert_eq!(
+            texts,
+            vec![
+                "[model changed: gpt-6-astra → gpt-6-vega]",
+                "[turn aborted: interrupted]",
+                "[rolled back 2 turns]"
+            ],
+            "the settings event notes the switch once; the agreeing turn_context adds nothing"
+        );
+        assert_eq!(s.messages[0].extra["codex_event"], "thread_settings_applied");
+        assert_eq!(s.messages[1].extra["duration_ms"], 10696120u64);
+        assert_eq!(s.messages[2].extra["num_turns"], 2);
+    }
+
+    #[test]
+    fn error_prefix_marks_tool_failure_and_is_stripped() {
+        let s = parse_jsonl(&[
+            r#"{"timestamp":"2026-01-01T00:00:00Z","type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"{}","call_id":"c1"}}"#,
+            r#"{"timestamp":"2026-01-01T00:00:01Z","type":"response_item","payload":{"type":"function_call_output","call_id":"c1","output":"[error] command not found: frobnicate"}}"#,
+            r#"{"timestamp":"2026-01-01T00:00:02Z","type":"response_item","payload":{"type":"function_call_output","call_id":"c2","output":"[error] is only a marker at the very start"}}"#,
+            r#"{"timestamp":"2026-01-01T00:00:03Z","type":"response_item","payload":{"type":"function_call_output","call_id":"c3","output":[{"type":"input_text","text":"[error] inside an array is plain text"}]}}"#,
+        ]);
+        let results: Vec<(&str, bool, Option<&str>)> = s
+            .messages
+            .iter()
+            .flat_map(|m| &m.content)
+            .filter_map(|b| match b {
+                Block::ToolResult {
+                    content,
+                    is_error,
+                    status,
+                    ..
+                } => Some((&**content, *is_error, status.as_deref())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            results,
+            vec![
+                ("command not found: frobnicate", true, Some("error")),
+                ("is only a marker at the very start", true, Some("error")),
+                ("[error] inside an array is plain text", false, Some("completed")),
+            ]
+        );
+    }
+
+    #[cfg(feature = "mmap")]
+    #[test]
+    fn error_prefix_survives_the_giant_span_path() {
+        use std::io::Write;
+        let body = format!("[error] {}", "boom line\n".repeat(600)); // > INLINE_MAX
+        let line = serde_json::json!({"timestamp":"2026-01-01T00:00:01Z","type":"response_item",
+            "payload":{"type":"function_call_output","call_id":"c1","output":body}})
+        .to_string();
+        let dir = std::env::temp_dir().join(format!("cv-codex-err-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rollout-2026-01-01T00-00-00-err.jsonl");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(line.as_bytes())
+            .unwrap();
+        let data = std::fs::read(&path).unwrap();
+        let mut sink = crate::stream::CollectSink::default();
+        let s = stream_jsonl_spans("x", &data, Some(path.clone()), false, false, &mut sink);
+        let m = &sink.messages[0];
+        let Block::ToolResult { content, is_error, .. } = &m.content[0] else {
+            panic!()
+        };
+        assert!(is_error);
+        let resolved = content.resolve(&s.resolver()).into_owned();
+        assert!(
+            resolved.starts_with("boom line\n"),
+            "prefix stripped from the span: {:?}",
+            &resolved[..20]
+        );
+        assert!(!resolved.contains("[error]"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn zstd_compressed_rollouts_are_discovered_scanned_and_parsed() {
+        let lines = [
+            r#"{"timestamp":"2026-08-01T10:00:00Z","ordinal":0,"type":"session_meta","payload":{"id":"cold-1","timestamp":"2026-08-01T10:00:00Z","cwd":"/cold","originator":"codex-tui","cli_version":"0.154.0","history_mode":"paginated"}}"#,
+            r#"{"timestamp":"2026-08-01T10:00:01Z","ordinal":1,"type":"turn_context","payload":{"turn_id":"t0","cwd":"/cold","model":"gpt-6-astra","approval_policy":"never","sandbox_policy":{"type":"danger-full-access"},"summary":"auto"}}"#,
+            r#"{"timestamp":"2026-08-01T10:00:02Z","ordinal":2,"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"cold storage question"}]}}"#,
+            r#"{"timestamp":"2026-08-01T10:00:03Z","ordinal":3,"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"cold storage answer"}]}}"#,
+        ];
+        let raw = lines.join("\n") + "\n";
+        let zst = ruzstd::encoding::compress_to_vec(raw.as_bytes(), ruzstd::encoding::CompressionLevel::Fastest);
+        let root = std::env::temp_dir().join(format!("cv-codex-zst-{}", uuid::Uuid::new_v4()));
+        let day = root.join("sessions").join("2026").join("08").join("01");
+        std::fs::create_dir_all(&day).unwrap();
+        let path = day.join("rollout-2026-08-01T10-00-00-cold-1.jsonl.zst");
+        std::fs::write(&path, &zst).unwrap();
+        std::fs::write(day.join("rollout-2026-08-01T10-00-00-cold-1.jsonl.tmp"), b"{}").unwrap();
+
+        let cx = Codex {
+            roots: vec![root.join("sessions")],
+        };
+        let refs = cx.discover().unwrap();
+        assert_eq!(refs.len(), 1, "the .zst is listed, the .tmp staging file is not");
+        let r = &refs[0];
+        assert_eq!(r.id, "cold-1");
+        assert_eq!(r.title.as_deref(), Some("cold storage question"));
+        assert_eq!(r.message_count, 2);
+
+        let s = cx.parse(r).unwrap();
+        assert_eq!(s.model.as_deref(), Some("gpt-6-astra"));
+        assert_eq!(
+            s.messages.iter().filter_map(|m| m.text()).collect::<Vec<_>>(),
+            vec!["cold storage question", "cold storage answer"]
+        );
+        // streaming (lazy spans requested, but a compressed file never spans) matches
+        let mut sink = crate::stream::CollectSink::default();
+        let mut st = cx.stream(r, &ParseOptions::lazy(), &mut sink).unwrap();
+        st.messages = sink.messages;
+        assert_eq!(serde_json::to_value(&s).unwrap(), serde_json::to_value(&st).unwrap());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn scan_titles_a_subagent_by_its_own_task_not_the_parents_prompt() {
+        let lines = [
+            SUBAGENT_META,
+            PARENT_META,
+            r#"{"timestamp":"2026-09-19T18:12:43.795Z","ordinal":3,"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"parent's original prompt"}]}}"#,
+            r#"{"timestamp":"2026-09-19T18:12:45.000Z","ordinal":4,"type":"inter_agent_communication_metadata","payload":{"trigger_turn":true}}"#,
+            r#"{"timestamp":"2026-09-19T18:12:45.001Z","ordinal":5,"type":"response_item","payload":{"type":"agent_message","id":"amsg_1","author":"/root","recipient":"/root/cycle_client","content":[{"type":"input_text","text":"Message Type: NEW_TASK\nTask name: build the client"}]}}"#,
+            r#"{"timestamp":"2026-09-19T18:12:46.000Z","ordinal":6,"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"on it"}]}}"#,
+        ];
+        let dir = std::env::temp_dir().join(format!("cv-codex-scan-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rollout-2026-09-19T14-12-43-child-1.jsonl");
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+        let r = scan(&path).unwrap();
+        assert_eq!(r.id, "child-1");
+        assert_eq!(r.cwd.as_deref(), Some(Path::new("/Users/ember/dev/minidregg")));
+        // (`truncate` folds the newline, as it does for every listing title)
+        assert_eq!(
+            r.title.as_deref(),
+            Some("Message Type: NEW_TASK Task name: build the client")
+        );
+        assert_eq!(r.message_count, 2, "the inherited parent prompt is not counted");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Developer smoke against the newest real paginated rollout and the newest subagent rollout
+    /// on this machine (run with `--ignored`): parse == stream, and the 0.147+ records actually
+    /// surface (item notes, usage from records, swarm messages, no inherited-prefix leakage).
+    #[test]
+    #[ignore = "requires local ~/.codex corpus"]
+    fn real_newest_paginated_and_subagent_rollouts_smoke() {
+        let root = dirs::home_dir()
+            .unwrap()
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("09");
+        let mut files: Vec<PathBuf> = WalkDir::new(&root)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path().to_path_buf())
+            .filter(|p| p.to_str().is_some_and(|s| s.ends_with(".jsonl")))
+            .collect();
+        files.sort_by_key(|p| std::cmp::Reverse(fs::metadata(p).and_then(|m| m.modified()).ok()));
+        let newest = files.first().cloned().expect("a September rollout");
+        let subagent = files
+            .iter()
+            .find(|p| {
+                fs::read_to_string(p).is_ok_and(|t| {
+                    t.lines()
+                        .next()
+                        .is_some_and(|l| l.contains("subagent_history_start_ordinal"))
+                })
+            })
+            .cloned()
+            .expect("a subagent rollout");
+        // Snapshot each file first: the newest rollout is usually a LIVE session still being
+        // appended to, and parse-vs-stream must see identical bytes.
+        let snap = std::env::temp_dir().join(format!("cv-codex-smoke-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&snap).unwrap();
+        for src in [newest, subagent] {
+            let path = snap.join(src.file_name().unwrap());
+            fs::copy(&src, &path).unwrap();
+            let cx = Codex::new();
+            let r = scan(&path).unwrap();
+            let parsed = cx.parse(&r).unwrap();
+            let mut sink = crate::stream::CollectSink::default();
+            let mut streamed = cx.stream(&r, &ParseOptions::full(), &mut sink).unwrap();
+            streamed.messages = sink.messages;
+            assert_eq!(
+                serde_json::to_value(&parsed).unwrap(),
+                serde_json::to_value(&streamed).unwrap(),
+                "{}",
+                path.display()
+            );
+            let notes = parsed
+                .messages
+                .iter()
+                .filter(|m| m.extra.get("codex_event").and_then(Value::as_str) == Some("item_completed"))
+                .count();
+            let agent_msgs = parsed
+                .messages
+                .iter()
+                .filter(|m| m.extra.get("codex_event").and_then(Value::as_str) == Some("agent_message"))
+                .count();
+            let with_usage = parsed.messages.iter().filter(|m| m.usage.is_some()).count();
+            let from_record = parsed
+                .messages
+                .iter()
+                .filter(|m| m.extra.get("usage_source").is_some())
+                .count();
+            let carriers = parsed
+                .messages
+                .iter()
+                .filter(|m| m.content.is_empty() && m.usage.is_some())
+                .count();
+            let inherit = parsed.extra.get("subagent_history_start_ordinal").cloned();
+            eprintln!(
+                "{}: id={} title={:?} msgs={} scan_count={} item_notes={} agent_msgs={} usage={} (from record {}) usage_carriers={} model={:?} agent_path={:?} inherit_before={:?}",
+                path.file_name().unwrap().to_string_lossy(), parsed.id, r.title, parsed.messages.len(), r.message_count, notes, agent_msgs, with_usage, from_record, carriers, parsed.model, parsed.extra.get("agent_path"), inherit
+            );
+            assert!(from_record > 0, "paginated files carry token_usage_records");
+            // A response whose only item was a tool call is followed by the call's OUTPUT before
+            // its usage record, so the trailing-only rule has nothing to attach to and carries the
+            // usage bare (as `token_count` always did on these files) — never more than one per
+            // record, and never a lost record.
+            assert!(carriers <= from_record, "at most one bare carrier per usage record");
+            if inherit.is_some() {
+                assert!(parsed.messages.iter().all(|m| !m.extra.contains_key("inherited")));
+            }
+        }
+        fs::remove_dir_all(&snap).ok();
     }
 
     #[test]

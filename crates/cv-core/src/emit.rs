@@ -752,18 +752,30 @@ fn claude_tool_result_blocks(content: &[Block]) -> Vec<Value> {
 
 fn emit_codex(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<EmitResult> {
     let new_id = opts.new_id.clone().unwrap_or_else(|| Uuid::now_v7().to_string());
-    let cwd = effective_cwd(session, opts);
+    // `session_meta.cwd` (and `turn_context.cwd`) are REQUIRED by Codex's decoder (`SessionMeta.cwd:
+    // PathBuf`, no default): a meta line without one is undecodable, the thread id can't be read,
+    // and resume fails with "failed to parse thread ID from rollout file". A session with no known
+    // cwd (some harnesses never record one) lands in the home dir rather than nowhere.
+    let cwd = effective_cwd(session, opts)
+        .or_else(dirs::home_dir)
+        .unwrap_or_else(|| PathBuf::from("/"));
+    let cwd_str = cwd.to_string_lossy().into_owned();
 
     let now = session.created_at.unwrap_or_else(Utc::now);
-    // Path: out_dir/YYYY/MM/DD/rollout-<iso8601 colons→dashes>-<uuid>.jsonl
+    // Path: out_dir/YYYY/MM/DD/rollout-<YYYY-MM-DDTHH-MM-SS>-<uuid>.jsonl — in LOCAL time and with no
+    // zone suffix, exactly as `RolloutFileName::render` writes it (`OffsetDateTime::now_local()`):
+    // Codex's `RolloutFileName::parse` requires a 19-char timestamp with byte 19 == `-` before the
+    // uuid, so a `…T11-04-49Z-<uuid>` name (what we used to write) is invisible to every
+    // filename-based lookup (thread-id resolution, migration, `builder_from_items`) and the thread
+    // only resumed while its sqlite row happened to exist.
+    let local = now.with_timezone(&chrono::Local);
     let date_dir = out_dir
-        .join(now.format("%Y").to_string())
-        .join(now.format("%m").to_string())
-        .join(now.format("%d").to_string());
+        .join(local.format("%Y").to_string())
+        .join(local.format("%m").to_string())
+        .join(local.format("%d").to_string());
     fs::create_dir_all(&date_dir).with_context(|| format!("creating {}", date_dir.display()))?;
-    let iso = now.to_rfc3339_opts(SecondsFormat::Secs, true);
-    let iso_dashed = iso.replace(':', "-");
-    let file_path = date_dir.join(format!("rollout-{iso_dashed}-{new_id}.jsonl"));
+    let stamp = local.format("%Y-%m-%dT%H-%M-%S").to_string();
+    let file_path = date_dir.join(format!("rollout-{stamp}-{new_id}.jsonl"));
 
     let ts_str = now.to_rfc3339_opts(SecondsFormat::Millis, true);
 
@@ -772,13 +784,24 @@ fn emit_codex(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<E
     // session_meta first line.
     let mut meta = Map::new();
     meta.insert("id".into(), json!(new_id));
+    // `session_id` is the root-thread id (Codex backfills it from `id` on read; explicit is clearer).
+    meta.insert("session_id".into(), json!(new_id));
     meta.insert("timestamp".into(), json!(ts_str));
-    if let Some(c) = &cwd {
-        meta.insert("cwd".into(), json!(c.to_string_lossy()));
-    }
+    meta.insert("cwd".into(), json!(cwd_str));
     meta.insert("source".into(), json!("cli"));
+    meta.insert("thread_source".into(), json!("user"));
+    // We write the pre-paginated layout (`response_item` message + `event_msg` user/agent twins);
+    // say so — Codex ≥ 0.147 keys its persistence policy and ordinal handling off `history_mode`,
+    // defaulting to `legacy` when absent, and the legacy→paginated migration canonicalizes it.
+    meta.insert("history_mode".into(), json!("legacy"));
     meta.insert("originator".into(), json!("clustervision"));
     meta.insert("cli_version".into(), json!(env!("CARGO_PKG_VERSION")));
+    // Codex persists this field into `state_5.sqlite.threads.model_provider` when it first
+    // discovers the rollout. Omitting it creates an empty provider entry which the TUI then
+    // cannot resume (`Model provider `` not found`), even though `turn_context.model` is valid.
+    // The Codex target uses its standard OpenAI provider; the model id remains independently
+    // carried by `turn_context` below.
+    meta.insert("model_provider".into(), json!("openai"));
     if let Some(g) = &session.git {
         meta.insert("git".into(), codex_git(g));
     }
@@ -792,16 +815,22 @@ fn emit_codex(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<E
     // that's the ONLY place Codex's own parser (and ours, `apply_turn_context`) reads a model id
     // from. (`session_meta.model_provider` is the *provider* name, not a model id; stuffing the
     // model there was silently dropped on re-parse.)
+    // `TurnContextItem` requires `cwd`, `approval_policy`, `sandbox_policy`, `model` and `summary`
+    // (no serde defaults); a `{cwd, model}` record fails `decode_rollout_line` and is silently
+    // skipped on resume, so the model never actually came back. `on-request` + `workspace-write`
+    // are Codex's own defaults (both decode with no further fields).
     if let Some(model) = &session.model {
-        let mut tc = Map::new();
-        if let Some(c) = &cwd {
-            tc.insert("cwd".into(), json!(c.to_string_lossy()));
-        }
-        tc.insert("model".into(), json!(model));
         lines.push(json!({
             "type": "turn_context",
             "timestamp": ts_str,
-            "payload": Value::Object(tc),
+            "payload": {
+                "turn_id": Uuid::now_v7().to_string(),
+                "cwd": cwd_str,
+                "approval_policy": "on-request",
+                "sandbox_policy": { "type": "workspace-write" },
+                "model": model,
+                "summary": "auto",
+            },
         }));
     }
 
@@ -863,17 +892,23 @@ fn emit_codex(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<E
                         Block::Thinking { text, encrypted, .. } => {
                             let mut p = Map::new();
                             p.insert("type".into(), json!("reasoning"));
-                            // The IR's Thinking text is the raw chain-of-thought (the parser
-                            // prefers `content` over `summary`); preserve it as raw `content` so
-                            // re-parsing recovers it verbatim. A distinct summary, if the source
-                            // adapter stashed one in `extra.reasoning_summary`, rides in `summary`.
-                            p.insert("content".into(), json!([{ "type": "reasoning_text", "text": text }]));
+                            // `reasoning.content` is an output-only/raw-reasoning surface for the
+                            // current Codex Responses wire. Replaying even one `reasoning_text`
+                            // entry makes the next request fail with `array_above_max_length`
+                            // (the input schema accepts zero raw content entries). Preserve the
+                            // useful text through the replayable summary and the opaque state
+                            // through `encrypted_content`, matching native Codex rollouts.
                             let summary = msg
                                 .extra
                                 .get("reasoning_summary")
                                 .and_then(Value::as_str)
                                 .unwrap_or(text);
-                            p.insert("summary".into(), json!([{ "type": "summary_text", "text": summary }]));
+                            let summary_items = if summary.is_empty() {
+                                Vec::new()
+                            } else {
+                                vec![json!({ "type": "summary_text", "text": summary })]
+                            };
+                            p.insert("summary".into(), Value::Array(summary_items));
                             if let Some(enc) = encrypted {
                                 p.insert("encrypted_content".into(), json!(enc));
                             }
@@ -914,11 +949,14 @@ fn emit_codex(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<E
                         ..
                     } = b
                     {
-                        // A plain-string `output` always re-parses as success (`output_is_error`
-                        // only fires on objects), so a failed result must use Codex's object form
-                        // `{content, success:false}` or the error is silently laundered.
+                        // `FunctionCallOutputPayload` deserializes ONLY a string or a content-item
+                        // array (and never serializes a `success` flag) — Codex itself has no
+                        // persisted error bit. The object form `{content, success:false}` we used
+                        // to write is undecodable: the line was dropped on resume, orphaning its
+                        // `function_call`. Keep the error visible in the text instead; cv's own
+                        // Codex parser recognizes the `[error] ` prefix and restores `is_error`.
                         let output = if *is_error {
-                            json!({ "content": content, "success": false })
+                            json!(format!("[error] {content}"))
                         } else {
                             json!(content)
                         };
@@ -2537,6 +2575,32 @@ mod tests {
     }
 
     #[test]
+    fn codex_error_outputs_are_decodable_strings() {
+        // `function_call_output.output` is a string or a content-item array — never an object.
+        // The old `{content, success:false}` form was undecodable and dropped on resume.
+        let mut s = sample_session(Harness::Codex);
+        for m in &mut s.messages {
+            for b in &mut m.content {
+                if let Block::ToolResult { is_error, .. } = b {
+                    *is_error = true;
+                }
+            }
+        }
+        let out = temp_dir();
+        let res = emit(&s, Harness::Codex, &out, &EmitOptions::default()).unwrap();
+        let outputs: Vec<Value> = fs::read_to_string(&res.path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|item| item["payload"]["type"] == "function_call_output")
+            .collect();
+        assert_eq!(outputs.len(), 1);
+        let output = &outputs[0]["payload"]["output"];
+        assert!(output.is_string(), "got {output}");
+        assert!(output.as_str().unwrap().starts_with("[error] "));
+    }
+
+    #[test]
     fn codex_round_trip() {
         let s = sample_session(Harness::Codex);
         let out = temp_dir();
@@ -2557,6 +2621,64 @@ mod tests {
 
         assert_eq!(parsed.id, res.new_id);
         assert_eq!(parsed.cwd, Some(PathBuf::from("/Users/test/project")));
+        let first_line = fs::read_to_string(&res.path)
+            .unwrap()
+            .lines()
+            .next()
+            .map(str::to_owned)
+            .unwrap();
+        let session_meta: Value = serde_json::from_str(&first_line).unwrap();
+        assert_eq!(
+            session_meta["payload"]["model_provider"], "openai",
+            "emitted Codex sessions must be resumable before their model turn-context is read"
+        );
+        // Codex's decoder rules (rollout_file_name.rs / protocol.rs / models.rs at 132c2be23):
+        // file name `rollout-<YYYY-MM-DDTHH-MM-SS>-<uuid>.jsonl`, local time, no zone suffix.
+        let name = res.path.file_name().unwrap().to_string_lossy().into_owned();
+        let stamp = name.strip_prefix("rollout-").unwrap();
+        assert_eq!(stamp.as_bytes()[19], b'-', "byte 19 must be `-`: {name}");
+        assert!(
+            stamp[..19].chars().all(|c| c.is_ascii_digit() || c == '-' || c == 'T'),
+            "{name}"
+        );
+        assert!(stamp[20..].starts_with(&res.new_id), "{name}");
+        // session_meta: `cwd` is required; history_mode says which layout we wrote.
+        assert_eq!(session_meta["payload"]["cwd"], "/Users/test/project");
+        assert_eq!(session_meta["payload"]["history_mode"], "legacy");
+        assert_eq!(session_meta["payload"]["session_id"], res.new_id);
+        // turn_context: every required field present, else the line is skipped and the model lost.
+        let tc = fs::read_to_string(&res.path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .find(|item| item["type"] == "turn_context")
+            .expect("turn_context emitted");
+        for key in [
+            "turn_id",
+            "cwd",
+            "approval_policy",
+            "sandbox_policy",
+            "model",
+            "summary",
+        ] {
+            assert!(
+                tc["payload"].get(key).is_some(),
+                "turn_context.{key} is required by Codex"
+            );
+        }
+        assert_eq!(tc["payload"]["sandbox_policy"]["type"], "workspace-write");
+        assert_eq!(tc["payload"]["approval_policy"], "on-request");
+        let emitted_reasoning = fs::read_to_string(&res.path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .find(|item| item["type"] == "response_item" && item["payload"]["type"] == "reasoning")
+            .unwrap();
+        assert!(
+            emitted_reasoning["payload"].get("content").is_none(),
+            "raw reasoning content is not accepted when a Codex rollout is replayed"
+        );
+        assert_eq!(emitted_reasoning["payload"]["summary"].as_array().unwrap().len(), 1);
         // The model must survive: it's carried by a `turn_context` record (the only place the
         // codex parser reads a model id from; `session_meta.model_provider` is not a model).
         assert_eq!(parsed.model.as_deref(), Some("test-model"));
@@ -2586,8 +2708,10 @@ mod tests {
 
     #[test]
     fn codex_round_trip_preserves_tool_failure() {
-        // A plain-string `output` re-parses as success; a failed result must be emitted in the
-        // object form ({content, success:false}) so `output_is_error` recovers it.
+        // Codex persists no error bit on `function_call_output` (string or content-item array only),
+        // so a failed result is emitted as the string "[error] <content>" and cv's Codex parser
+        // restores `is_error` from that prefix — the object form ({content, success:false}) we
+        // used to write is undecodable by Codex and was dropped on resume.
         let mut s = sample_session(Harness::Codex);
         let mut failed = Message::new(Role::Tool);
         failed.content.push(Block::ToolResult {

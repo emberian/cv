@@ -61,6 +61,31 @@
     signature-only blocks are ~700 bytes on disk but hundreds of tokens on the wire
     (Claude Code's own `thinking_drop` freed ~105k for 236 of them).
 
+- **Harness catch-up, from source (2026-09-19).** Every harness we have a checkout for
+  (`~/pug/*`) was fast-forwarded and its persistence code diffed against what the adapter
+  targeted; three of six had moved their live store out from under cv without any error.
+  `docs/FORMATS.md` is re-verified throughout.
+  - *Codex (0.154).* The parser handles the paginated history mode (`item_completed`
+    items as System notes with the full item in `extra`, since the `event_msg`
+    user/agent twins are gone), the inter-agent `agent_message` channel, `token_usage_record`
+    as the authoritative per-response usage (`cache_write_input_tokens` mapped), fork/
+    subagent rollouts (the embedded parent prefix is skipped in lean passes and tagged under
+    `complete`; `create_time` fixes fork-stamped timestamps), the grown `session_meta`
+    (swarm fields into `Session.extra`), `thread_settings_applied`/effort model tracking,
+    `turn_aborted`/`thread_rolled_back` notes, tool `namespace`, and `.jsonl.zst` rollouts.
+    The emitter now writes rollouts Codex can resume: local-time file names, a complete
+    `turn_context`, string-form error outputs (`[error] ` prefix, restored on parse), a
+    guaranteed `cwd`, `history_mode: legacy`, `model_provider`, summary-only reasoning.
+  - *OpenCode.* Reads the canonical `opencode.db` (the JSON tree importer was deleted
+    2026-06-02); JSON is a fallback deduped by id; session facts, tool attachments and
+    `state.{title,metadata,time}` are preserved; the db is file-watched for freshness.
+  - *Hermes (schema 30).* In-place compaction visibility (`active`/`compacted`), `ORDER BY
+    id`, compaction summaries as boundary pairs, `system_prompts` table, lineage markers,
+    listing parity, `cwd`/`git_branch` first-class; old-schema dbs unchanged.
+  - *Goose (schema 16).* Titles from `name`; `metadata_json` usage/model; `document` and
+    `error` blocks; bare-array and rmcp-3 tool results; millisecond timestamps.
+  - *Gemini/Qwen.* Second (sandbox) storage root; cwd from `projects.json`/`.project_root`.
+
 ## 0.10.0 (2026-07-17)
 
 - **`cv ls --json` closes the consumer gaps (#15).** Every row now carries
