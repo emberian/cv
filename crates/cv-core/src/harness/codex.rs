@@ -52,14 +52,14 @@ pub struct Codex {
 
 impl Codex {
     pub fn new() -> Self {
-        let home = dirs::home_dir();
-        let roots = home
-            .map(|h| {
-                vec![
-                    h.join(".codex").join("sessions"),
-                    h.join(".codex").join("archived_sessions"),
-                ]
-            })
+        // Codex resolves its home as `$CODEX_HOME`, else `~/.codex` (codex-rs/utils/home-dir/src/lib.rs
+        // `find_codex_home`); honour the same override so a test home (or a relocated store) is read.
+        let codex_home = std::env::var_os("CODEX_HOME")
+            .map(PathBuf::from)
+            .filter(|p| !p.as_os_str().is_empty())
+            .or_else(|| dirs::home_dir().map(|h| h.join(".codex")));
+        let roots = codex_home
+            .map(|c| vec![c.join("sessions"), c.join("archived_sessions")])
             .unwrap_or_default()
             .into_iter()
             .filter(|p| p.exists())
