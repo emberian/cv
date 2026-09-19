@@ -304,6 +304,127 @@ fn revive_rewrites_stale_usage_below_loaded_content() {
 }
 
 #[test]
+fn usage_total_reads_the_last_request_iteration_like_claude_code() {
+    // Claude Code ≥ 2.1.277 sizes context from `usage.iterations` (the last non-advisor/compaction
+    // request) — the top-level counters are only a fallback. cv must see the same number.
+    let u = |v: Value| usage_total(v.as_object().unwrap());
+    let top =
+        |t: u64| serde_json::json!({"input_tokens":t,"cache_read_input_tokens":0,"cache_creation_input_tokens":0});
+    // iterations present: the last request iteration wins over a top-level that says otherwise,
+    // and a trailing advisor iteration is skipped
+    let mut v = top(500_866);
+    v["iterations"] = serde_json::json!([
+        {"type":"message","input_tokens":2,"output_tokens":78,
+         "cache_read_input_tokens":975_473,"cache_creation_input_tokens":1_031},
+        {"type":"advisor_message","input_tokens":1,"output_tokens":1,
+         "cache_read_input_tokens":9_999_999,"cache_creation_input_tokens":0},
+    ]);
+    assert_eq!(u(v), 976_506);
+    // no iterations → top-level
+    assert_eq!(u(top(123)), 123);
+    // top-level zero → zero, whatever iterations say (Claude Code short-circuits there)
+    let mut z = top(0);
+    z["iterations"] = serde_json::json!([{"type":"message","input_tokens":5,"output_tokens":1,
+        "cache_read_input_tokens":0,"cache_creation_input_tokens":0}]);
+    assert_eq!(u(z), 0);
+    // a zero-context or malformed last iteration → top-level fallback
+    let mut m = top(321);
+    m["iterations"] = serde_json::json!([{"type":"message","input_tokens":0,"output_tokens":1,
+        "cache_read_input_tokens":0,"cache_creation_input_tokens":0}]);
+    assert_eq!(u(m), 321);
+    let mut m2 = top(321);
+    m2["iterations"] = serde_json::json!([{"type":"message","input_tokens":7}]);
+    assert_eq!(u(m2), 321);
+}
+
+#[test]
+fn revive_pins_usage_iterations_too() {
+    // The regression behind "a pruned session never resumes" on Claude Code 2.1.277+: revive pinned
+    // the top-level usage but left `iterations[*]` at the stale wall figure — and that is what the
+    // gate reads now, so it refused the (small) session client-side with a synthesized "Prompt is
+    // too long" before sending anything.
+    let dir = tmpdir();
+    let sid = "44444444-4444-4444-8444-444444444444";
+    let line = |uuid: &str, role: &str, content: serde_json::Value, usage: Option<serde_json::Value>| {
+        let mut m = serde_json::json!({"role":role,"content":content});
+        if let Some(u) = usage {
+            m["usage"] = u;
+        }
+        serde_json::json!({"type":role,"sessionId":sid,"uuid":uuid,"timestamp":"2026-09-19T00:00:00Z","message":m})
+    };
+    // Top level already small (as a pre-fix revive would have left it); the stale wall lives in the
+    // request iteration; an advisor iteration rides along and must be left alone.
+    let stale = serde_json::json!({"input_tokens":50_000,"output_tokens":10,
+    "cache_read_input_tokens":0,"cache_creation_input_tokens":0,
+    "cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":0},
+    "iterations":[
+        {"type":"message","input_tokens":2,"output_tokens":10,
+         "cache_read_input_tokens":975_000,"cache_creation_input_tokens":296,
+         "cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":296}},
+        {"type":"advisor_message","input_tokens":1,"output_tokens":1,
+         "cache_read_input_tokens":777,"cache_creation_input_tokens":0}
+    ]});
+    let lines = [
+        line("u0", "user", serde_json::json!("old turn"), None),
+        serde_json::json!({"type":"system","subtype":"compact_boundary","sessionId":sid,"uuid":"b0",
+            "timestamp":"2026-09-19T00:00:01Z"}),
+        line("u1", "user", serde_json::json!("hi again"), None),
+        line(
+            "a1",
+            "assistant",
+            serde_json::json!([{"type":"text","text":"small reply"}]),
+            Some(stale),
+        ),
+    ];
+    let path = dir.join(format!("{sid}.jsonl"));
+    std::fs::write(&path, lines.iter().map(|l| l.to_string() + "\n").collect::<String>()).unwrap();
+
+    let opts = PruneOptions {
+        revive: true,
+        keep_last: 100,
+        ..Default::default()
+    };
+    let r = prune_session(&path, &opts).unwrap();
+    assert_eq!(r.usage_rewritten, 1);
+    assert_eq!(
+        r.revive_old_tokens,
+        Some(975_298),
+        "the stale figure is read from the request iteration, not the (already small) top level"
+    );
+    let honest = r.revive_tokens.expect("honest figure written");
+    assert!(
+        honest < 1000,
+        "tiny post-boundary content → tiny honest figure (got {honest})"
+    );
+
+    let out = std::fs::read_to_string(&r.new_path).unwrap();
+    let a1 = out.lines().find(|l| l.contains("\"uuid\":\"a1\"")).unwrap();
+    let v: serde_json::Value = serde_json::from_str(a1).unwrap();
+    assert_eq!(
+        v["_cv_orig_ctx"], 975_298,
+        "the real (iteration) figure is stashed for a later --window"
+    );
+    let u = v.pointer("/message/usage").unwrap();
+    assert_eq!(u["input_tokens"].as_u64().unwrap(), honest);
+    assert_eq!(u["cache_read_input_tokens"], 0);
+    let req = &u["iterations"][0];
+    assert_eq!(
+        req["input_tokens"].as_u64().unwrap(),
+        honest,
+        "request iteration pinned"
+    );
+    assert_eq!(req["cache_read_input_tokens"], 0);
+    assert_eq!(req["cache_creation_input_tokens"], 0);
+    assert_eq!(req["cache_creation"]["ephemeral_5m_input_tokens"], 0);
+    assert_eq!(req["output_tokens"], 10, "output counts are real and untouched");
+    let adv = &u["iterations"][1];
+    assert_eq!(adv["cache_read_input_tokens"], 777, "advisor iteration left alone");
+    // and what Claude Code will read back is the pinned figure
+    assert_eq!(usage_total(u.as_object().unwrap()), honest);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn revive_honors_recorded_delta_evidence_over_low_byte_estimate() {
     let dir = tmpdir();
     let sid = "44444444-4444-4444-8444-444444444444";

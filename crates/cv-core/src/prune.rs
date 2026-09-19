@@ -66,11 +66,12 @@ pub struct PruneOptions {
     /// thousands of files. Turn on if you want cv's forest features to work on the pruned session.
     pub copy_resources: bool,
     /// After pruning, rewrite the trailing `message.usage` records to an **honest** post-prune token
-    /// count. Claude Code's resume gate reads the last turn's recorded `usage` (input + cache) as the
-    /// session's current size *before it re-sends anything* — so an already-maxed session refuses to
-    /// resume even when the (now pruned) content would fit. This recomputes the real size of the loaded
-    /// window and corrects the stale number, so the gate lets you back in. Off by default — it edits
-    /// recorded metadata, not just content. The source is still never touched (new id only).
+    /// count. Claude Code's resume gate reads the last turn's recorded `usage` (input + cache — from
+    /// its `iterations` array when present, since 2.1.277) as the session's current size *before it
+    /// re-sends anything* — so an already-maxed session refuses to resume even when the (now pruned)
+    /// content would fit. This recomputes the real size of the loaded window and corrects the stale
+    /// number (top level and iterations alike), so the gate lets you back in. Off by default — it
+    /// edits recorded metadata, not just content. The source is still never touched (new id only).
     pub revive: bool,
     /// Sliding window: keep only the NEWEST conversational turns whose content sums to **≤ this many
     /// tokens**, dropping older turns entirely (lossy — but the source session is never touched, so it
@@ -587,6 +588,11 @@ pub fn prune_session(src_path: &Path, opts: &PruneOptions) -> Result<PruneResult
 /// session's current context size — and it does so *before* re-sending anything to the API. After a
 /// prune the real content is small, but that recorded number is still the pre-prune total, so the gate
 /// refuses to resume a session that would actually fit (the "979.7k / context limit reached" wall).
+/// Concretely (2.1.278): it takes the last non-synthetic assistant record's usage — preferring the
+/// last request entry of `usage.iterations` over the top-level counters — adds a byte estimate of
+/// everything recorded after it, and if that is ≥ context window − max-output reserve (≤ 20k) −
+/// 3k it yields a synthesized `Prompt is too long` (no `errorDetails`, no request) instead of
+/// calling the API. So the pin has to land in `iterations` too — see [`pin_usage`].
 ///
 /// We recompute the honest size of the **loaded window** — everything after the last compaction
 /// boundary, which is what Claude actually re-sends on resume — and rewrite every usage record in that
@@ -658,13 +664,7 @@ fn revive_usage(
             v["_cv_orig_ctx"] = Value::from(total);
         }
         if let Some(u) = v.pointer_mut("/message/usage").and_then(Value::as_object_mut) {
-            u.insert("input_tokens".into(), Value::from(honest));
-            u.insert("cache_read_input_tokens".into(), Value::from(0u64));
-            u.insert("cache_creation_input_tokens".into(), Value::from(0u64));
-            if let Some(cc) = u.get_mut("cache_creation").and_then(Value::as_object_mut) {
-                cc.insert("ephemeral_1h_input_tokens".into(), Value::from(0u64));
-                cc.insert("ephemeral_5m_input_tokens".into(), Value::from(0u64));
-            }
+            pin_usage(u, honest);
         }
         out_lines[i] = v.to_string();
         rewritten += 1;
@@ -739,12 +739,91 @@ fn honest_window_tokens(parsed: &[Option<Value>], out_lines: &[String], window: 
     sum + span_est(span_start, parsed.len())
 }
 
-/// Sum the context-bearing token counts of a Claude `usage` object (input + both cache buckets).
-fn usage_total(usage: &serde_json::Map<String, Value>) -> u64 {
-    ["input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"]
+/// The three context-bearing counters of a Claude `usage` object (input + both cache buckets).
+const USAGE_CTX_KEYS: [&str; 3] = ["input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"];
+
+fn ctx_sum(m: &serde_json::Map<String, Value>) -> u64 {
+    USAGE_CTX_KEYS
         .iter()
-        .map(|k| usage.get(*k).and_then(Value::as_u64).unwrap_or(0))
+        .map(|k| m.get(*k).and_then(Value::as_u64).unwrap_or(0))
         .sum()
+}
+
+/// The context-token count of a Claude `usage` object — read the way Claude Code reads it.
+///
+/// Since 2.1.277 Claude Code sizes the loaded context from a record's `usage.iterations` when that
+/// array is present: it takes the LAST iteration that is not an auxiliary request (`advisor_message`
+/// / `compaction`), and if that one is a well-formed request iteration (`message` /
+/// `fallback_message`, all four counts present, non-zero context) reads input + both cache buckets
+/// from IT — the top-level counters are only the fallback (and the whole thing short-circuits to the
+/// top-level when the top-level total is zero). `--window` sizing, the honest-figure arithmetic and
+/// `--revive`'s stale-record detection all go through here so cv reasons about the same number the
+/// resume gate will see.
+fn usage_total(usage: &serde_json::Map<String, Value>) -> u64 {
+    let top = ctx_sum(usage);
+    if top == 0 {
+        return 0;
+    }
+    usage
+        .get("iterations")
+        .and_then(Value::as_array)
+        .and_then(|iters| iters.iter().rev().find(|it| !is_aux_iteration(it)))
+        .and_then(Value::as_object)
+        .filter(|it| is_request_iteration(it))
+        .map(ctx_sum)
+        .unwrap_or(top)
+}
+
+/// `advisor_message` / `compaction` iterations are side requests Claude Code skips when reading
+/// context size.
+fn is_aux_iteration(it: &Value) -> bool {
+    matches!(
+        it.get("type").and_then(Value::as_str),
+        Some("advisor_message" | "compaction")
+    )
+}
+
+/// A request iteration Claude Code will read the context size from: `message` / `fallback_message`
+/// with all four counts present as non-negative numbers and a non-zero context total.
+fn is_request_iteration(it: &serde_json::Map<String, Value>) -> bool {
+    matches!(
+        it.get("type").and_then(Value::as_str),
+        Some("message" | "fallback_message")
+    ) && [
+        "input_tokens",
+        "output_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+    ]
+    .iter()
+    .all(|k| it.get(*k).and_then(Value::as_u64).is_some())
+        && ctx_sum(it) > 0
+}
+
+/// Pin a `usage` record to `honest` context tokens everywhere Claude Code might read it: the
+/// top-level counters AND every non-auxiliary entry of `iterations`. Pinning only the top level
+/// used to be enough; since Claude Code 2.1.277 prefers the last request iteration, a stale
+/// iteration silently defeats the pin — the gate reads the old wall figure and refuses the session
+/// client-side (a synthesized "Prompt is too long", no API call). Cache counters are zeroed (a fresh
+/// resume has no live cache anyway); output counts are real and left alone.
+fn pin_usage(u: &mut serde_json::Map<String, Value>, honest: u64) {
+    fn pin(m: &mut serde_json::Map<String, Value>, honest: u64) {
+        m.insert("input_tokens".into(), Value::from(honest));
+        m.insert("cache_read_input_tokens".into(), Value::from(0u64));
+        m.insert("cache_creation_input_tokens".into(), Value::from(0u64));
+        if let Some(cc) = m.get_mut("cache_creation").and_then(Value::as_object_mut) {
+            cc.insert("ephemeral_1h_input_tokens".into(), Value::from(0u64));
+            cc.insert("ephemeral_5m_input_tokens".into(), Value::from(0u64));
+        }
+    }
+    pin(u, honest);
+    if let Some(iters) = u.get_mut("iterations").and_then(Value::as_array_mut) {
+        for it in iters.iter_mut().filter(|it| !is_aux_iteration(it)) {
+            if let Some(m) = it.as_object_mut() {
+                pin(m, honest);
+            }
+        }
+    }
 }
 
 /// Snip the eligible payloads on one (old) user line, in place. `line_key` (the line's uuid or a

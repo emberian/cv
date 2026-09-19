@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+- **`cv prune --revive` works again on Claude Code ≥ 2.1.277 — the pin now lands in
+  `usage.iterations` too.** Claude Code's resume gate sizes the loaded context from
+  the last real assistant record's `usage`, and since 2.1.277 it prefers the last
+  request entry of that record's `iterations` array (skipping `advisor_message` /
+  `compaction` iterations) over the top-level counters. Revive pinned only the top
+  level, so the stale wall figure survived inside `iterations`; the gate read it,
+  and — with the total at or above *context window − max-output reserve (≤ 20k) −
+  3k* — refused the (now small) session client-side with a synthesized `Prompt is
+  too long` (no `errorDetails`, no request ever sent), on every resume attempt,
+  whatever `--window` was. Now `usage_total` reads a record exactly as Claude Code
+  does (the last non-auxiliary iteration when well-formed and non-zero, else the
+  top level), so `--window` sizing, the honest figure, stale-record detection and
+  the `_cv_orig_ctx` stash all agree with the gate, and revive pins every
+  non-auxiliary iteration alongside the top level (output counts untouched, caches
+  zeroed). Regression test: `revive_pins_usage_iterations_too`.
+
 ## 0.10.0 (2026-07-17)
 
 - **`cv ls --json` closes the consumer gaps (#15).** Every row now carries
