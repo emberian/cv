@@ -120,6 +120,7 @@ fn print_report(rep: &Report, label: &str, n_targets: usize) {
         ("tool-call args", rep.tool_call_args),
         ("images", rep.images),
         ("system msgs", rep.system_text),
+        ("system reminders", rep.attachments),
     ];
     rows.sort_by_key(|r| std::cmp::Reverse(r.1));
     for (name, v) in rows {
@@ -163,6 +164,18 @@ fn print_report(rep: &Report, label: &str, n_targets: usize) {
                 share,
                 fmt_tok(builtin)
             );
+        }
+    }
+
+    // System reminders by kind — the per-turn context Claude Code itself appends (hook output,
+    // edited-file notices, queued task notifications, CLAUDE.md `instructions`, …). Before these
+    // were itemized they were misread as part of the fixed overhead.
+    if rep.attachments > 0 {
+        let mut kinds: Vec<(&String, &u64)> = rep.by_attachment.iter().collect();
+        kinds.sort_by_key(|k| std::cmp::Reverse(*k.1));
+        println!("\nSystem reminders (attachments) by kind:");
+        for (kind, v) in kinds.iter().take(6) {
+            println!("  {:<28} {:>7}", kind, fmt_tok(**v));
         }
     }
 

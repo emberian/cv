@@ -801,10 +801,10 @@ pub(crate) fn show_header(h: &HeaderInfo) -> String {
 /// One rendered `cv show` message block (the String form of the old `print_message`).
 pub(crate) fn show_message(m: &Message) -> String {
     let tag = match m.role {
-        Role::System => "system",
-        Role::User => "user",
-        Role::Assistant => "assistant",
-        Role::Tool => "tool",
+        Role::System => system_tag(m),
+        Role::User => "user".to_string(),
+        Role::Assistant => "assistant".to_string(),
+        Role::Tool => "tool".to_string(),
     };
     let mut s = format!("── {tag} ──\n");
     for b in &m.content {
@@ -817,11 +817,21 @@ pub(crate) fn show_message(m: &Message) -> String {
             Block::ToolUse { name, input, .. } => {
                 s.push_str(&format!("[tool_use {name}] {}\n", truncate(&input.to_string(), 200)))
             }
-            Block::ToolResult { content, is_error, .. } => s.push_str(&format!(
-                "[tool_result{}] {}\n",
-                if *is_error { " error" } else { "" },
-                truncate(content, 200)
-            )),
+            Block::ToolResult {
+                content,
+                is_error,
+                details,
+                ..
+            } => {
+                s.push_str(&format!(
+                    "[tool_result{}] {}\n",
+                    if *is_error { " error" } else { "" },
+                    truncate(content, 200)
+                ));
+                if let Some(p) = persisted_path(details.as_ref()) {
+                    s.push_str(&format!("  ↳ full output on disk: {p}\n"));
+                }
+            }
             Block::File { path, source, .. } => s.push_str(&format!(
                 "[file: {}]\n",
                 path.as_deref().or(source.as_deref()).unwrap_or("?")
@@ -831,6 +841,27 @@ pub(crate) fn show_message(m: &Message) -> String {
     }
     s.push('\n');
     s
+}
+
+/// Label for a System turn: the attachment kind (a Claude Code system reminder — `hook_success`,
+/// `edited_text_file`, …) or the record subtype (`api_error`, `compact_boundary`, …) when the
+/// adapter recorded one, so a reader can tell a hook's output from a compaction marker.
+fn system_tag(m: &Message) -> String {
+    let kind = m
+        .extra
+        .get("attachmentType")
+        .or_else(|| m.extra.get("subtype"))
+        .and_then(|v| v.as_str());
+    match kind {
+        Some(k) => format!("system · {k}"),
+        None => "system".to_string(),
+    }
+}
+
+/// Where a persisted (too-large) tool output lives on disk, when the adapter recorded it — the
+/// transcript holds only the stub the model saw.
+fn persisted_path(details: Option<&serde_json::Value>) -> Option<&str> {
+    details?.pointer("/persistedOutput/path")?.as_str()
 }
 
 /// Header for `cv export md`.

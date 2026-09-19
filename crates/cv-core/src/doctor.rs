@@ -3,10 +3,11 @@
 //! Powers both `cv doctor` (CLI rendering) and the `doctor` MCP tool. Walks a session's typed
 //! blocks and tallies context tokens by source — tool results (ranked per tool, MCP vs builtin),
 //! thinking (plaintext PLUS the signature/encrypted blob, both re-sent to the API), assistant/user
-//! text, images — plus compaction frequency/triggers and a usage-derived size of the fixed
-//! system+tools overhead. That fixed block (base prompt, CLAUDE.md/rules, skills, MCP tool schemas)
-//! can't be itemized: the transcript records the conversation, not the system block, so it's only
-//! *sized* from token usage, not broken down.
+//! text, images, the system reminders Claude Code appends per turn (hook output, edited-file
+//! notices, queued task notifications, CLAUDE.md, … — itemized by attachment kind) — plus
+//! compaction frequency/triggers and a usage-derived size of the fixed system+tools overhead. That
+//! fixed block (base prompt, skills, MCP tool schemas) can't be itemized: the transcript records
+//! the conversation, not the system block, so it's only *sized* from token usage, not broken down.
 
 use crate::compaction;
 use crate::ir::{Block, Role, Session};
@@ -44,6 +45,10 @@ pub struct Report {
     pub tool_results: u64,
     pub images: u64,
     pub system_text: u64,
+    /// System reminders Claude Code appended to the prompt (model-visible `attachment` records).
+    pub attachments: u64,
+    /// The same, by attachment kind (`hook_success`, `edited_text_file`, `queued_command`, …).
+    pub by_attachment: BTreeMap<String, u64>,
     pub by_tool: BTreeMap<String, ToolStat>,
     // compaction
     pub compactions: u64,
@@ -91,7 +96,15 @@ impl Report {
                         let t = toks(text.len());
                         match m.role {
                             Role::Assistant => self.assistant_text += t,
-                            Role::System => self.system_text += t,
+                            // A system reminder Claude Code appended to the prompt: real per-turn
+                            // context, itemized by kind (it used to hide inside "fixed overhead").
+                            Role::System => match m.extra.get("attachmentType").and_then(Value::as_str) {
+                                Some(kind) => {
+                                    self.attachments += t;
+                                    *self.by_attachment.entry(kind.to_string()).or_default() += t;
+                                }
+                                None => self.system_text += t,
+                            },
                             _ => self.user_text += t,
                         }
                     }
@@ -164,6 +177,7 @@ impl Report {
             + self.tool_results
             + self.images
             + self.system_text
+            + self.attachments
     }
 
     /// Tool-result tokens attributable to MCP tools (name `mcp__*`).
@@ -200,7 +214,9 @@ impl Report {
                 "tool_call_args": self.tool_call_args,
                 "images": self.images,
                 "system_msgs": self.system_text,
+                "system_reminders": self.attachments,
             },
+            "by_attachment": self.by_attachment,
             "tool_results_mcp": mcp,
             "tool_results_builtin": self.tool_results.saturating_sub(mcp),
             "by_tool": tools,

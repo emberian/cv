@@ -25,10 +25,15 @@
 //! context window: they ride along as content (kept, dropped, or snipped by position) but are never
 //! counted as conversational turns, never contribute usage to `--window` sizing or `--revive`
 //! arithmetic, and are never chosen as the re-root of a windowed tail.
+//!
+//! Claude Code's synthetic assistant notices (`model: "<synthetic>"` — "Prompt is too long" and
+//! friends) are not turns either: they ride along as records but never count toward `--keep-last`,
+//! `--range` indices or `--window` sizing. Model-visible `attachment` records (those with
+//! `rendered[]`) DO count toward byte estimates — that text is in the prompt.
 
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// Marker prefix stamped where a payload used to be; carries enough to retrieve the original.
@@ -56,8 +61,10 @@ pub struct PruneOptions {
     pub drop: bool,
     /// Also flatten assistant **thinking** blocks (extended reasoning). On a long session the
     /// chain-of-thought often dominates the loaded context, and on resume you rarely need the
-    /// verbatim old reasoning — the conclusions are in the assistant's text. Lossless (stashed in the
-    /// sidecar like any other payload). Off by default — it changes more than tool output.
+    /// verbatim old reasoning — the conclusions are in the assistant's text. Snips every old block
+    /// regardless of `min_size` (a signature-only block is ~700 bytes on disk but hundreds of tokens
+    /// on the wire). Lossless (stashed in the sidecar like any other payload). Off by default — it
+    /// changes more than tool output.
     pub thinking: bool,
     /// Explicit new session id; otherwise a fresh UUIDv4.
     pub new_id: Option<String>,
@@ -177,10 +184,49 @@ fn is_sidechain(v: &Value) -> bool {
     v.get("isSidechain").and_then(Value::as_bool).unwrap_or(false)
 }
 
-/// A main-thread conversational turn (sidechain user/assistant lines don't count).
-fn is_main_turn(v: &Value) -> bool {
-    matches!(v.get("type").and_then(Value::as_str), Some("user" | "assistant")) && !is_sidechain(v)
+/// Classify a line as a main-thread conversational turn: `Some(is_user)` for a real user/assistant
+/// turn, `None` for everything else — bookkeeping records, sidechain (sub-agent) lines, and Claude
+/// Code's synthetic assistant notices (see [`is_synthetic_assistant`]), which are never sent to the
+/// API and must not shift turn indices or eat `--keep-last` budget.
+fn turn_kind(v: &Value) -> Option<bool> {
+    if is_sidechain(v) {
+        return None;
+    }
+    match v.get("type").and_then(Value::as_str) {
+        Some("user") => Some(true),
+        Some("assistant") if !is_synthetic_assistant(v) => Some(false),
+        _ => None,
+    }
 }
+
+/// A main-thread conversational turn (sidechain lines and synthetic notices don't count).
+fn is_main_turn(v: &Value) -> bool {
+    turn_kind(v).is_some()
+}
+
+/// Claude Code's client-side assistant notices — an `isApiErrorMessage` ("Prompt is too long", …)
+/// or any `message.model == "<synthetic>"` row ("No response requested."). Not model output.
+fn is_synthetic_assistant(v: &Value) -> bool {
+    v.get("isApiErrorMessage").and_then(Value::as_bool).unwrap_or(false)
+        || v.pointer("/message/model").and_then(Value::as_str) == Some("<synthetic>")
+}
+
+/// Session-level records written once (or rarely) that a windowed tail must not lose — the label
+/// and identity facts Claude Code's picker and loader read: the legacy `summary`, both titles, the
+/// tag, agent name, a fork's relocation, the running cost, the ATIS latch and a continuation
+/// pointer. The LAST occurrence of each survives wherever it sits; per-prompt records (`mode`,
+/// `last-prompt`, …) recur constantly and need no help.
+const SINGLETON_RECORDS: &[&str] = &[
+    "summary",
+    "ai-title",
+    "custom-title",
+    "tag",
+    "agent-name",
+    "relocated",
+    "cost-state",
+    "atis-latch",
+    "continued-in",
+];
 
 /// Size a `--window` tail by Claude's OWN recorded token counts — no estimator. Returns
 /// `(turn to keep from, real content-token size of that tail, overshoot)`, or `None` if the session
@@ -208,7 +254,7 @@ fn usage_window_cutoff(parsed: &[Option<Value>], budget: u64) -> Option<(usize, 
             continue;
         }
         match v.get("type").and_then(Value::as_str) {
-            Some("user") | Some("assistant") => {
+            _ if turn_kind(v).is_some() => {
                 // Prefer `_cv_orig_ctx` (the real count a prior revive stashed) over the live usage,
                 // which revive may have overwritten with a pinned figure.
                 let tot = v
@@ -291,15 +337,7 @@ fn select_kept_turns(
         return (0, total_turns, None, false);
     };
 
-    let is_user: Vec<bool> = parsed
-        .iter()
-        .flatten()
-        .filter(|v| !is_sidechain(v))
-        .filter_map(|v| match v.get("type").and_then(Value::as_str) {
-            Some(t @ ("user" | "assistant")) => Some(t == "user"),
-            _ => None,
-        })
-        .collect();
+    let is_user: Vec<bool> = parsed.iter().flatten().filter_map(turn_kind).collect();
     let snap = |mut start: usize| {
         // Snap back to a user turn so the tail opens on a prompt, not a bare assistant reply.
         while start > 0 && !is_user.get(start).copied().unwrap_or(true) {
@@ -315,17 +353,17 @@ fn select_kept_turns(
 
     // Fallback (no usage records): byte estimate of message.content, newest-backward, keeping the
     // largest tail whose estimate is ≤ budget (same contract as the usage path).
-    let per_turn: Vec<u64> = parsed
-        .iter()
-        .flatten()
-        .filter(|v| is_main_turn(v))
-        .map(|v| {
-            v.get("message")
-                .and_then(|m| m.get("content"))
-                .map(est_tokens)
-                .unwrap_or(0)
-        })
-        .collect();
+    // Model-visible attachments (system reminders) ride with the turn they precede.
+    let mut per_turn: Vec<u64> = Vec::new();
+    let mut pending = 0u64;
+    for v in parsed.iter().flatten().filter(|v| !is_sidechain(v)) {
+        if is_main_turn(v) {
+            per_turn.push(line_est_tokens(v) + pending);
+            pending = 0;
+        } else {
+            pending += line_est_tokens(v);
+        }
+    }
     let mut acc = 0u64;
     let mut start = per_turn.len();
     let mut overshoot = false;
@@ -386,6 +424,20 @@ pub fn prune_session(src_path: &Path, opts: &PruneOptions) -> Result<PruneResult
     // first survivor is re-rooted after the loop. Defaults to the whole session (no-op).
     let (keep_start, keep_end, window_real, overshoot) = select_kept_turns(&parsed, opts, total_turns);
     let windowing = keep_start > 0 || keep_end < total_turns;
+    // Session-level singleton records the kept tail must not lose (see [`SINGLETON_RECORDS`]): the
+    // line index of the LAST occurrence of each type, kept wherever the window falls.
+    let mut keep_singletons: HashSet<usize> = HashSet::new();
+    if windowing {
+        let mut last: HashMap<&str, usize> = HashMap::new();
+        for (i, v) in parsed.iter().enumerate() {
+            if let Some(t) = v.as_ref().and_then(|v| v.get("type")).and_then(Value::as_str) {
+                if SINGLETON_RECORDS.contains(&t) {
+                    last.insert(t, i);
+                }
+            }
+        }
+        keep_singletons.extend(last.into_values());
+    }
     let mut dropped_turns = 0usize;
     let mut warnings: Vec<String> = Vec::new();
     if overshoot {
@@ -410,16 +462,19 @@ pub fn prune_session(src_path: &Path, opts: &PruneOptions) -> Result<PruneResult
             continue;
         };
 
-        // Stamp the new session id on every line that carries one.
-        let had_session_id = v.get("sessionId").is_some();
-        if had_session_id {
-            v["sessionId"] = Value::String(new_id.clone());
+        // Stamp the new session id on every line that carries one — Claude Code writes both
+        // spellings (`sessionId` on every record, `session_id` on most since ~2.1.25x).
+        let mut had_session_id = false;
+        for key in ["sessionId", "session_id"] {
+            if v.get(key).is_some() {
+                v[key] = Value::String(new_id.clone());
+                had_session_id = true;
+            }
         }
 
         let ty = v.get("type").and_then(Value::as_str).unwrap_or("");
-        let sidechain = is_sidechain(&v);
         let is_turn_line = ty == "user" || ty == "assistant";
-        let is_turn = is_turn_line && !sidechain;
+        let is_turn = turn_kind(&v).is_some();
         let this_turn = turn;
         if is_turn {
             turn += 1;
@@ -427,15 +482,18 @@ pub fn prune_session(src_path: &Path, opts: &PruneOptions) -> Result<PruneResult
         let is_old = is_turn_line && this_turn < keep_from;
 
         // `--window`/`--range`: drop turns outside the kept range. Non-turn records (system lines,
-        // file-history snapshots, sidechain lines) travel with the turn they precede — EXCEPT:
-        //  * `summary` (title) records are always kept so the new session keeps its label (their
-        //    `leafUuid` may dangle after a head drop; Claude Code tolerates that);
+        // attachments, file-history snapshots, sidechain lines, synthetic notices) travel with the
+        // turn they precede — EXCEPT:
+        //  * the last occurrence of each session-level singleton (titles, tag, agent name, cost,
+        //    … — [`SINGLETON_RECORDS`]) is always kept so the new session keeps its label and
+        //    identity (a `summary`'s `leafUuid` may dangle after a head drop; Claude Code tolerates
+        //    that);
         //  * records trailing the FINAL kept turn are kept when the range runs to the end of the
         //    session (they belong to the kept tail, not to any dropped turn).
         if windowing {
             let drop_line = if is_turn {
                 this_turn < keep_start || this_turn >= keep_end
-            } else if ty == "summary" {
+            } else if keep_singletons.contains(&idx) {
                 false
             } else {
                 this_turn < keep_start || (keep_end < total_turns && this_turn >= keep_end)
@@ -698,8 +756,7 @@ fn honest_window_tokens(parsed: &[Option<Value>], out_lines: &[String], window: 
             .iter()
             .flatten()
             .filter(|v| !is_sidechain(v))
-            .filter_map(|v| v.get("message").and_then(|m| m.get("content")))
-            .map(est_tokens)
+            .map(line_est_tokens)
             .sum()
     };
     let mut sum = 0u64;
@@ -964,14 +1021,13 @@ fn prune_assistant_thinking(
         if block.get("type").and_then(Value::as_str) != Some("thinking") {
             continue;
         }
-        // Gate on the WHOLE block size, not the thinking text: Claude usually omits the reasoning
-        // text in the transcript but keeps a ~600-byte cryptographic `signature` — that signature
-        // (×thousands of turns) is what actually bloats the resumed context, so that's what we lift
-        // out. Commit by cloning the block out (lossless), releasing the borrow before overwriting.
+        // Every old thinking block goes, whatever its size — `--min-size` is a payload gate and does
+        // not apply here. Claude usually omits the reasoning text in the transcript but keeps a
+        // ~600-byte cryptographic `signature`, and on the wire that signature-only block still costs
+        // hundreds of tokens (Claude Code's own `thinking_drop` freed ~105k for 236 such blocks), so
+        // a byte gate would skip exactly the blocks that matter. Commit by cloning the block out
+        // (lossless), releasing the borrow before overwriting.
         let size = value_byte_size(block);
-        if size <= opts.min_size {
-            continue;
-        }
         let line_count = block
             .get("thinking")
             .and_then(Value::as_str)
@@ -1250,6 +1306,28 @@ fn str_tokens(s: &str) -> u64 {
 }
 
 /// Estimate the context-token cost of a content value (text + image tiles).
+/// Byte-estimated tokens one line contributes to the loaded prompt: `message.content` for a turn,
+/// `rendered[].content` for a model-visible attachment (Claude Code appends exactly that text to
+/// the prompt; an attachment with nothing rendered costs nothing), zero for bookkeeping. Sidechain
+/// filtering is the caller's job.
+fn line_est_tokens(v: &Value) -> u64 {
+    match v.get("type").and_then(Value::as_str) {
+        Some("user" | "assistant") => v.pointer("/message/content").map(est_tokens).unwrap_or(0),
+        Some("attachment") => v
+            .get("rendered")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|i| i.get("content").and_then(Value::as_str))
+                    .map(str_tokens)
+                    .sum()
+            })
+            .unwrap_or(0),
+        _ => 0,
+    }
+}
+
 fn est_tokens(content: &Value) -> u64 {
     match content {
         Value::String(s) => str_tokens(s),

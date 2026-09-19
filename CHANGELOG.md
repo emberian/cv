@@ -18,6 +18,46 @@
   non-auxiliary iteration alongside the top level (output counts untouched, caches
   zeroed). Regression test: `revive_pins_usage_iterations_too`.
 
+- **Claude Code fidelity catch-up (2.1.23x → 2.1.278).** The transcript format moved
+  under cv; this brings the adapter, prune and doctor back in line with what the
+  files actually hold:
+  - *System reminders are content, not UI state.* The `<system-reminder>` text Claude
+    Code appends to the prompt — hook output, edited-file notices, queued task
+    notifications, CLAUDE.md `instructions`, skill/agent listings, … — has lived in
+    separate `attachment` records (with `rendered[].content`) since ~2.1.23x, and cv
+    dropped them. Rendered attachments now parse as System turns carrying exactly that
+    text (`extra.attachmentType` names the kind; the full object under `full`/`complete`;
+    large text spans lazily), so `cv show`, `search`, `dataset` and `doctor` see what the
+    model saw. `cv doctor` itemizes them as **system reminders** by kind instead of
+    misreading them as fixed system-prompt overhead (~90k of a 327k "overhead" in one
+    live session). Unrendered attachments stay bookkeeping.
+  - *Synthetic notices are not turns.* Claude Code's client-side `assistant` rows with
+    `model: "<synthetic>"` ("Prompt is too long", "No response requested.", …) are never
+    sent to the API. The lean passes now surface them as System notices
+    (`extra.subtype` = `api_error`/`synthetic`, with `error`/`errorDetails`), they no
+    longer count toward `cv ls` message counts, `--keep-last`, `--range` indices or
+    `--window` sizing, and they never name the session model. `complete` keeps their
+    original shape for round-trips.
+  - *Titles and bookkeeping records.* `custom-title` (`/rename`) now outranks `ai-title`
+    in `cv ls` and `Session.title`; `agent-name`, `tag`, `relocated`, `continued-in`
+    (session lineage) and `pr-link` land in `Session.extra`; every other non-conversational
+    record (`cost-state`, `atis-latch`, `frame-link`, `content-replacement`, artifact
+    watches, and anything future without a `message`) round-trips as a carrier under
+    `complete` instead of being silently dropped. `summary` records — which Claude Code no
+    longer writes — are still read.
+  - *Persisted tool outputs.* A `<persisted-output>` stub (the real output went to
+    `<session>/tool-results/<id>.txt`) keeps the stub as content — that is what the model
+    saw — and records the path and size in the block's `details.persistedOutput`; `cv show`
+    prints the on-disk pointer under the result.
+  - *prune:* a windowed tail keeps the LAST of each session-level singleton record
+    (`custom-title`, `ai-title`, `tag`, `agent-name`, `relocated`, `cost-state`,
+    `atis-latch`, `continued-in`, legacy `summary`) instead of only `summary`; both id
+    spellings (`sessionId` and `session_id`) are restamped; byte estimates (the honest
+    figure and the no-usage fallback) count rendered attachments as prompt text; and
+    `--thinking` snips every old thinking block regardless of `--min-size` — Fable-era
+    signature-only blocks are ~700 bytes on disk but hundreds of tokens on the wire
+    (Claude Code's own `thinking_drop` freed ~105k for 236 of them).
+
 ## 0.10.0 (2026-07-17)
 
 - **`cv ls --json` closes the consumer gaps (#15).** Every row now carries

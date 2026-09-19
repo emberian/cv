@@ -425,6 +425,161 @@ fn revive_pins_usage_iterations_too() {
 }
 
 #[test]
+fn synthetic_notices_are_not_turns() {
+    // Claude Code's client-side "Prompt is too long" rows are `assistant` records with
+    // `model: "<synthetic>"`. They ride along as records but never count as turns.
+    let dir = tmpdir();
+    let sid = "55555555-5555-4555-8555-555555555555";
+    let mk = |ty: &str, uuid: &str, content: Value| {
+        serde_json::json!({"type":ty,"sessionId":sid,"uuid":uuid,"timestamp":"2026-09-19T00:00:00Z",
+            "message":{"role":ty,"content":content}})
+    };
+    let mut synth = mk(
+        "assistant",
+        "e1",
+        serde_json::json!([{"type":"text","text":"Prompt is too long"}]),
+    );
+    synth["message"]["model"] = "<synthetic>".into();
+    synth["isApiErrorMessage"] = true.into();
+    let lines = [
+        mk("user", "u0", "first".into()),
+        synth.clone(),
+        mk("assistant", "a1", serde_json::json!([{"type":"text","text":"reply"}])),
+        mk("user", "u1", "second".into()),
+        synth,
+    ];
+    let path = dir.join(format!("{sid}.jsonl"));
+    std::fs::write(&path, lines.iter().map(|l| l.to_string() + "\n").collect::<String>()).unwrap();
+    // turns are u0, a1, u1 — the notices don't count; `--range 1-` keeps a1 + u1 (and the notices,
+    // which travel with the turns they precede)
+    let opts = PruneOptions {
+        keep_range: Some((1, None)),
+        ..Default::default()
+    };
+    let r = prune_session(&path, &opts).unwrap();
+    assert_eq!(r.dropped_turns, 1);
+    let out = std::fs::read_to_string(&r.new_path).unwrap();
+    assert!(!out.contains("\"uuid\":\"u0\""));
+    assert!(out.contains("\"uuid\":\"a1\"") && out.contains("\"uuid\":\"u1\""));
+    assert_eq!(
+        out.matches("Prompt is too long").count(),
+        2,
+        "notices are kept as records, just not counted"
+    );
+    let turns = out
+        .lines()
+        .filter(|l| serde_json::from_str::<Value>(l).is_ok_and(|v| turn_kind(&v).is_some()))
+        .count();
+    assert_eq!(turns, 2);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn window_keeps_last_singleton_records_and_restamps_both_id_spellings() {
+    let dir = tmpdir();
+    let sid = "66666666-6666-4666-8666-666666666666";
+    let turn = |ty: &str, uuid: &str, text: &str| {
+        serde_json::json!({"type":ty,"sessionId":sid,"session_id":sid,"uuid":uuid,"timestamp":"2026-09-19T00:00:00Z",
+            "message":{"role":ty,"content":text}})
+    };
+    let lines = [
+        serde_json::json!({"type":"custom-title","customTitle":"My rename","sessionId":sid}),
+        serde_json::json!({"type":"agent-name","agentName":"Fixing prune","sessionId":sid}),
+        serde_json::json!({"type":"ai-title","aiTitle":"old auto title","sessionId":sid}),
+        turn("user", "u0", "first"),
+        turn("assistant", "a0", "r0"),
+        serde_json::json!({"type":"ai-title","aiTitle":"newer auto title","sessionId":sid}),
+        turn("user", "u1", "second"),
+        turn("assistant", "a1", "r1"),
+    ];
+    let path = dir.join(format!("{sid}.jsonl"));
+    std::fs::write(&path, lines.iter().map(|l| l.to_string() + "\n").collect::<String>()).unwrap();
+    let opts = PruneOptions {
+        keep_range: Some((2, None)),
+        ..Default::default()
+    };
+    let r = prune_session(&path, &opts).unwrap();
+    assert_eq!(r.dropped_turns, 2);
+    let out = std::fs::read_to_string(&r.new_path).unwrap();
+    assert!(!out.contains("\"uuid\":\"u0\""));
+    assert_eq!(
+        out.matches("\"type\":\"custom-title\"").count(),
+        1,
+        "the /rename title survives a head drop"
+    );
+    assert_eq!(out.matches("\"type\":\"agent-name\"").count(), 1);
+    assert_eq!(
+        out.matches("\"type\":\"ai-title\"").count(),
+        1,
+        "only the LAST ai-title is kept"
+    );
+    assert!(out.contains("newer auto title") && !out.contains("old auto title"));
+    // both id spellings restamped — the source id is gone entirely
+    assert!(!out.contains(sid));
+    assert_eq!(out.matches(&format!("\"session_id\":\"{}\"", r.new_id)).count(), 2);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn thinking_flatten_snips_signature_only_blocks() {
+    // Fable-era transcripts keep `thinking: ""` + a ~600-byte signature per turn. On the wire those
+    // blocks still cost hundreds of tokens each, so `--thinking` must not skip them for being small.
+    let dir = tmpdir();
+    let sid = "77777777-7777-4777-8777-777777777777";
+    let sig = "C".repeat(600);
+    let mk = |uuid: &str, ty: &str, content: Value| {
+        serde_json::json!({"type":ty,"sessionId":sid,"uuid":uuid,"timestamp":"2026-09-19T00:00:00Z",
+            "message":{"role":ty,"content":content}})
+    };
+    let think = |reply: &str| serde_json::json!([{"type":"thinking","thinking":"","signature":sig},{"type":"text","text":reply}]);
+    let lines = [
+        mk("u0", "user", "hi".into()),
+        mk("a0", "assistant", think("old reply")),
+        mk("u1", "user", "again".into()),
+        mk("a1", "assistant", think("recent reply")),
+    ];
+    let path = dir.join(format!("{sid}.jsonl"));
+    std::fs::write(&path, lines.iter().map(|l| l.to_string() + "\n").collect::<String>()).unwrap();
+    let opts = PruneOptions {
+        thinking: true,
+        keep_last: 2,
+        ..Default::default()
+    };
+    let r = prune_session(&path, &opts).unwrap();
+    assert_eq!(
+        r.pruned_count, 1,
+        "the OLD signature-only block is snipped; the recent one (keep-last) stays"
+    );
+    let out = std::fs::read_to_string(&r.new_path).unwrap();
+    let a0 = out.lines().find(|l| l.contains("\"uuid\":\"a0\"")).unwrap();
+    assert!(a0.contains("[PRUNED id=") && !a0.contains(&sig));
+    let a1 = out.lines().find(|l| l.contains("\"uuid\":\"a1\"")).unwrap();
+    assert!(a1.contains(&sig));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn rendered_attachments_count_toward_byte_estimates() {
+    // A model-visible attachment (`rendered[]`) is prompt text; the honest figure must include it.
+    let big = "x".repeat(35_000);
+    let lines = [
+        serde_json::json!({"type":"user","uuid":"u0","message":{"role":"user","content":"hi"}}),
+        serde_json::json!({"type":"attachment","uuid":"t0","attachment":{"type":"instructions"},"rendered":[{"content":big}]}),
+        serde_json::json!({"type":"attachment","uuid":"t1","attachment":{"type":"hook_success"}}),
+        serde_json::json!({"type":"assistant","uuid":"a0","message":{"role":"assistant","content":[{"type":"text","text":"ok"}],
+            "usage":{"input_tokens":100,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}),
+    ];
+    let parsed = pv(&lines);
+    let out: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+    let honest = honest_window_tokens(&parsed, &out, 0, true);
+    assert!(
+        honest >= 10_000,
+        "35k bytes of rendered reminder ≈ 10k tokens must be counted (got {honest})"
+    );
+    assert_eq!(line_est_tokens(&lines[2]), 0, "an unrendered attachment costs nothing");
+}
+
+#[test]
 fn revive_honors_recorded_delta_evidence_over_low_byte_estimate() {
     let dir = tmpdir();
     let sid = "44444444-4444-4444-8444-444444444444";

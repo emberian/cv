@@ -258,52 +258,94 @@ fn ingest_value(
 
     // session-level metadata records
     match ty {
+        // Titles, by precedence: an explicit `/rename` (`custom-title`) outranks the model-generated
+        // `ai-title`, which outranks the legacy `summary` (Claude Code stopped writing `summary`
+        // records around 2.1.25x; `ai-title` is rewritten on every prompt).
         "ai-title" => {
             if let Some(t) = v.get("aiTitle").and_then(Value::as_str) {
-                session.title = Some(t.to_string());
+                if !session.extra.contains_key("customTitle") {
+                    session.title = Some(t.to_string());
+                }
             }
-            // In `complete` mode, also carry the record itself so it round-trips.
-            return if opts.complete {
-                sink.message(carrier_record(v))
-            } else {
-                Flow::Continue
-            };
+            return carry_or_skip(v, opts, sink);
         }
-        // `summary`/`last-prompt` carry a title-ish/leaf pointer but no message body.
-        // `summary` lines have a `summary` string we can fall back to for the title.
+        "custom-title" => {
+            if let Some(t) = v.get("customTitle").and_then(Value::as_str) {
+                session.title = Some(t.to_string());
+                session.extra.insert("customTitle".into(), Value::String(t.to_string()));
+            }
+            return carry_or_skip(v, opts, sink);
+        }
         "summary" => {
             if session.title.is_none() {
                 if let Some(t) = v.get("summary").and_then(Value::as_str) {
                     session.title = Some(t.to_string());
                 }
             }
-            return if opts.complete {
-                sink.message(carrier_record(v))
-            } else {
-                Flow::Continue
+            return carry_or_skip(v, opts, sink);
+        }
+        // Session-level facts with a first-class home in `Session::extra` (camelCase, as recorded):
+        // the derived agent name, a `/tag`, a fork's relocated cwd, the linked PR(s), and the
+        // pointer Claude Code leaves when a conversation moved on to another session id.
+        "agent-name" | "tag" | "relocated" | "continued-in" | "pr-link" => {
+            match ty {
+                "agent-name" => copy_str_field(v, "agentName", &mut session.extra),
+                "tag" => copy_str_field(v, "tag", &mut session.extra),
+                "relocated" => copy_str_field(v, "relocatedCwd", &mut session.extra),
+                "continued-in" => copy_str_field(v, "continuedInSessionId", &mut session.extra),
+                _ => {
+                    if let Some(url) = v.get("prUrl").and_then(Value::as_str) {
+                        if let Some(list) = session
+                            .extra
+                            .entry("prLinks")
+                            .or_insert_with(|| Value::Array(Vec::new()))
+                            .as_array_mut()
+                        {
+                            list.push(Value::String(url.to_string()));
+                        }
+                    }
+                }
+            }
+            return carry_or_skip(v, opts, sink);
+        }
+        // Model-visible attachments. Since ~2.1.23x the system reminders Claude Code appends to the
+        // prompt — hook output, edited-file notices, queued task notifications, CLAUDE.md
+        // `instructions`, skill/agent listings, … — are separate `attachment` records whose
+        // `rendered[].content` is byte-for-byte what the model saw (they used to be inline
+        // `<system-reminder>` text in user content). Surface those as System turns; an attachment
+        // with nothing rendered (a hook that printed nothing) is bookkeeping only.
+        "attachment" => {
+            return match parse_attachment_message(v, opts, span) {
+                Some(m) => sink.message(m),
+                None => carry_or_skip(v, opts, sink),
             };
         }
-        // Pure bookkeeping / live-process records with no conversational payload.
-        // `progress`, `started`, `result` are sub-agent hook/streaming telemetry;
-        // `queue-operation` is the input queue; `mode`/`permission-mode`/`attachment`/
-        // `last-prompt` are UI state. The lean passes drop them; `complete` carries them verbatim as
-        // round-trippable carrier messages (unknown types still fall through and are ignored).
+        // Pure bookkeeping / live-process records with no conversational payload: the input queue,
+        // UI/permission state, the leaf pointer, sub-agent hook/streaming telemetry, running cost,
+        // the ATIS latch, artifact watches, request-side content replacements. The lean passes drop
+        // them; `complete` carries them verbatim as round-trippable carrier messages.
         "mode"
         | "permission-mode"
         | "last-prompt"
-        | "attachment"
         | "progress"
         | "started"
         | "result"
         | "queue-operation"
         | "x-quota"
-        | "file-history-snapshot" => {
-            return if opts.complete {
-                sink.message(carrier_record(v))
-            } else {
-                Flow::Continue
-            };
+        | "file-history-snapshot"
+        | "cost-state"
+        | "atis-latch"
+        | "frame-link"
+        | "content-replacement"
+        | "artifact-comment-monitor"
+        | "artifact-autoreact-ledger" => {
+            return carry_or_skip(v, opts, sink);
         }
+        "user" | "assistant" | "system" | "" => {}
+        // Any other record without a `message` body is a bookkeeping record we haven't met yet
+        // (Claude Code adds a few per release). Never conversational — carry it in `complete` mode
+        // so round-trips stay lossless, skip it otherwise.
+        _ if v.get("message").is_none() => return carry_or_skip(v, opts, sink),
         _ => {}
     }
 
@@ -336,7 +378,8 @@ fn ingest_value(
                 msg.extra.insert(crate::offsets::OFFSET_KEY.into(), ctx.base_off.into());
             }
         }
-        if session.model.is_none() {
+        // A synthetic notice (`model: "<synthetic>"`, kept only under `complete`) never names the model.
+        if session.model.is_none() && msg.model.as_deref() != Some(SYNTHETIC_MODEL) {
             session.model = msg.model.clone();
         }
         return sink.message(msg);
@@ -360,6 +403,127 @@ fn carrier_record(v: &Value) -> Message {
 
 /// `extra` key under which a [`carrier_record`] stashes the verbatim original meta record.
 pub const CARRIER_KEY: &str = "_record";
+
+/// `message.model` of Claude Code's own client-side assistant notices (API errors such as
+/// "Prompt is too long", "No response requested.", …): never model output, never sent to the API.
+pub const SYNTHETIC_MODEL: &str = "<synthetic>";
+
+/// Carry `v` verbatim under `complete`, skip it otherwise — the shared tail of every
+/// non-conversational record arm in [`ingest_value`].
+fn carry_or_skip(v: &Value, opts: &ParseOptions, sink: &mut dyn MessageSink) -> Flow {
+    if opts.complete {
+        sink.message(carrier_record(v))
+    } else {
+        Flow::Continue
+    }
+}
+
+/// Copy string field `key` of `v` into `extra` under the same (camelCase) key, if present.
+fn copy_str_field(v: &Value, key: &str, extra: &mut Map<String, Value>) {
+    if let Some(s) = v.get(key).and_then(Value::as_str) {
+        extra.insert(key.to_string(), Value::String(s.to_string()));
+    }
+}
+
+/// Is this `assistant` record one of Claude Code's synthetic notices (an `isApiErrorMessage`, or any
+/// `model: "<synthetic>"` row such as "No response requested.")? Claude Code itself filters these out
+/// of the API messages; they are not turns.
+fn is_synthetic_assistant(v: &Value, msg: &Value) -> bool {
+    v.get("isApiErrorMessage").and_then(Value::as_bool).unwrap_or(false)
+        || msg.get("model").and_then(Value::as_str) == Some(SYNTHETIC_MODEL)
+}
+
+/// A model-visible `attachment` record (one with a non-empty `rendered[]`) as a [`Role::System`]
+/// message: one text block per rendered item, exactly the text appended to the prompt. `None` when
+/// nothing was rendered. Under `complete` the message is also a carrier of the verbatim record, so
+/// the emitter replays it byte-for-byte while lean consumers still see its text. The attachment
+/// kind always rides in `extra["attachmentType"]` (it is what the text *is*); the full `attachment`
+/// object only under [`ParseOptions::extra`].
+fn parse_attachment_message(v: &Value, opts: &ParseOptions, span: Option<&SpanCtx>) -> Option<Message> {
+    let rendered = v.get("rendered").and_then(Value::as_array).filter(|r| !r.is_empty())?;
+    let att = v.get("attachment").and_then(Value::as_object)?;
+    let att_type = att.get("type").and_then(Value::as_str).unwrap_or("attachment");
+    let raw_items = span.and_then(|ctx| rendered_content_raw(ctx.slice));
+    let mut blocks = Vec::with_capacity(rendered.len());
+    for (i, item) in rendered.iter().enumerate() {
+        let Some(text) = item.get("content").and_then(Value::as_str) else {
+            continue;
+        };
+        let raw = raw_items.as_ref().and_then(|r| r.get(i).copied().flatten());
+        let t = match (span, raw) {
+            (Some(ctx), Some(raw)) if text.len() > INLINE_MAX => raw_string_span(raw, ctx)
+                .inspect(|sp| debug_assert_span(sp, ctx, text))
+                .map(Text::Span)
+                .unwrap_or_else(|| Text::Inline(text.to_string())),
+            _ => Text::Inline(text.to_string()),
+        };
+        blocks.push(Block::Text { text: t });
+    }
+    if blocks.is_empty() {
+        return None;
+    }
+    let mut m = if opts.complete {
+        carrier_record(v)
+    } else {
+        Message::new(Role::System)
+    };
+    m.id = v.get("uuid").and_then(Value::as_str).map(String::from);
+    m.parent_id = v.get("parentUuid").and_then(Value::as_str).map(String::from);
+    m.timestamp = v.get("timestamp").and_then(Value::as_str).and_then(parse_ts);
+    m.content = blocks;
+    m.extra.insert("subtype".into(), Value::String("attachment".into()));
+    m.extra
+        .insert("attachmentType".into(), Value::String(att_type.to_string()));
+    if opts.extra {
+        m.extra.insert("attachment".into(), Value::Object(att.clone()));
+        for key in ["renderedInHumanTurn", "agentId"] {
+            if let Some(val) = v.get(key) {
+                m.extra.insert(key.to_string(), val.clone());
+            }
+        }
+        if v.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+            m.extra.insert("isSidechain".into(), Value::Bool(true));
+        }
+    }
+    Some(m)
+}
+
+/// Raw JSON of each `rendered[i].content` (aligned 1:1 with the parsed array), borrowing `slice`.
+fn rendered_content_raw(slice: &[u8]) -> Option<Vec<Option<&RawValue>>> {
+    #[derive(serde::Deserialize)]
+    struct R<'a> {
+        #[serde(borrow, default)]
+        rendered: Option<Vec<Ri<'a>>>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Ri<'a> {
+        #[serde(borrow, default)]
+        content: Option<&'a RawValue>,
+    }
+    let r = serde_json::from_slice::<R>(slice).ok()?.rendered?;
+    Some(r.into_iter().map(|i| i.content).collect())
+}
+
+/// Recognize Claude Code's persisted-output stub — the note left in a `tool_result` when the real
+/// output was too large and went to `<session>/tool-results/<id>.txt` (the model saw only this stub
+/// plus a preview). Returns `(path, size hint)`.
+fn persisted_output(text: &str) -> Option<(String, Option<String>)> {
+    let t = text.trim_start();
+    if !t.starts_with("<persisted-output>") {
+        return None;
+    }
+    let after = &t[t.find("Full output saved to:")? + "Full output saved to:".len()..];
+    let path = after.lines().next()?.trim();
+    if path.is_empty() {
+        return None;
+    }
+    let size = t
+        .find("Output too large (")
+        .map(|i| &t[i + "Output too large (".len()..])
+        .and_then(|rest| rest.split(')').next())
+        .map(str::to_string);
+    Some((path.to_string(), size))
+}
 
 /// Sub-agent transcripts spawned by `parent_path`'s session (Claude Code's Task tool). They live at
 /// `<projects>/<encoded>/<sid>/subagents/<agent>.jsonl` — a sibling `subagents/` dir next to the
@@ -598,13 +762,21 @@ fn scan(path: &std::path::Path) -> Result<SessionRef> {
 
     let mut cwd = None;
     let mut title = None;
+    let mut custom_title = false;
     let mut created_at: Option<DateTime<Utc>> = None;
     let mut updated_at: Option<DateTime<Utc>> = None;
     let mut message_count = 0usize;
 
     super::for_each_json_line(reader, |v| {
         let ty = v.get("type").and_then(Value::as_str).unwrap_or("");
-        if ty == "ai-title" {
+        // Same precedence as `ingest_value`: `/rename` beats the model's title.
+        if ty == "custom-title" {
+            if let Some(t) = v.get("customTitle").and_then(Value::as_str) {
+                title = Some(t.to_string());
+                custom_title = true;
+            }
+        }
+        if ty == "ai-title" && !custom_title {
             if let Some(t) = v.get("aiTitle").and_then(Value::as_str) {
                 title = Some(t.to_string());
             }
@@ -619,7 +791,9 @@ fn scan(path: &std::path::Path) -> Result<SessionRef> {
             created_at = Some(created_at.map_or(ts, |c: DateTime<Utc>| c.min(ts)));
             updated_at = Some(updated_at.map_or(ts, |u: DateTime<Utc>| u.max(ts)));
         }
-        if matches!(ty, "user" | "assistant") {
+        // Synthetic notices ("Prompt is too long", …) are not turns — see `is_synthetic_assistant`.
+        let synthetic = ty == "assistant" && is_synthetic_assistant(&v, v.get("message").unwrap_or(&Value::Null));
+        if matches!(ty, "user" | "assistant") && !synthetic {
             message_count += 1;
         }
         Flow::Continue
@@ -693,7 +867,36 @@ fn parse_message(ty: &str, v: &Value, opts: &ParseOptions, span: Option<&SpanCtx
             role
         };
 
+    // Claude Code's synthetic assistant notices (client-side API errors like "Prompt is too long",
+    // "No response requested.", …) are not model output and are never sent to the API. The lean
+    // passes surface them as System notices so turn counts, `--keep-last` windows and renders stay
+    // honest; `complete` keeps the record's own shape (`assistant` + its fields) for round-trip.
+    let synthetic = ty == "assistant" && is_synthetic_assistant(v, msg);
+    let (role, model) = if synthetic && !opts.complete {
+        (Role::System, None)
+    } else {
+        (role, model)
+    };
+
     let mut extra = Map::new();
+    if synthetic && !opts.complete {
+        let api_error = v.get("isApiErrorMessage").and_then(Value::as_bool).unwrap_or(false);
+        extra.insert(
+            "subtype".into(),
+            Value::String(if api_error { "api_error" } else { "synthetic" }.into()),
+        );
+        for key in [
+            "isApiErrorMessage",
+            "error",
+            "errorDetails",
+            "apiErrorStatus",
+            "requestId",
+        ] {
+            if let Some(val) = v.get(key).filter(|val| !val.is_null()) {
+                extra.insert(key.to_string(), val.clone());
+            }
+        }
+    }
     if opts.extra {
         collect_extra(v, msg, &mut extra);
     }
@@ -999,6 +1202,15 @@ fn collect_extra_complete(v: &Value, msg: &Value, extra: &mut Map<String, Value>
     }
 }
 
+/// The inline text of a just-built tool-result `content`, or (for a lazy span — always a large real
+/// payload, never the small persisted-output stub) the raw `content` string of `item`.
+fn coerced_ref<'a>(content: &'a Text, item: &'a Value) -> &'a str {
+    content
+        .inline_str()
+        .or_else(|| item.get("content").and_then(Value::as_str))
+        .unwrap_or("")
+}
+
 fn parse_block(item: &Value, span_field: Option<(&RawValue, &SpanCtx)>) -> Option<Block> {
     match item.get("type").and_then(Value::as_str)? {
         "text" => Some(Block::Text {
@@ -1042,6 +1254,10 @@ fn parse_block(item: &Value, span_field: Option<(&RawValue, &SpanCtx)>) -> Optio
                 }
                 _ => Text::Inline(coerced),
             };
+            // A persisted-output stub keeps the stub as `content` (that IS what the model saw) and
+            // records where the full output lives, so renders can point at it and indexers can read it.
+            let details = persisted_output(coerced_ref(&content, item))
+                .map(|(path, size)| serde_json::json!({ "persistedOutput": { "path": path, "size": size } }));
             Some(Block::ToolResult {
                 tool_use_id: item
                     .get("tool_use_id")
@@ -1052,7 +1268,7 @@ fn parse_block(item: &Value, span_field: Option<(&RawValue, &SpanCtx)>) -> Optio
                 is_error: item.get("is_error").and_then(Value::as_bool).unwrap_or(false),
                 tool_name: None,
                 status: None,
-                details: None,
+                details,
             })
         }
         "image" => {
@@ -1294,6 +1510,184 @@ mod tests {
         assert_eq!(session.title.as_deref(), Some("My Session"));
         // carriers are empty-content System turns, so message_count (user+assistant) is unaffected
         assert!(carriers.iter().all(|m| m.content.is_empty() && m.role == Role::System));
+    }
+
+    #[test]
+    fn rendered_attachments_surface_as_system_reminders() {
+        // Since ~2.1.23x the system reminders Claude Code appends to the prompt are `attachment`
+        // records; `rendered[].content` is exactly what the model saw. Unrendered ones (a hook that
+        // printed nothing) are bookkeeping only.
+        let text = [
+            r#"{"type":"user","sessionId":"s1","uuid":"u0","timestamp":"2026-09-19T00:00:00Z","message":{"role":"user","content":"hi"}}"#,
+            r#"{"type":"attachment","sessionId":"s1","uuid":"t1","parentUuid":"u0","timestamp":"2026-09-19T00:00:01Z","attachment":{"type":"hook_success","hookName":"UserPromptSubmit","stdout":"{}\n"}}"#,
+            r#"{"type":"attachment","sessionId":"s1","uuid":"t2","parentUuid":"t1","timestamp":"2026-09-19T00:00:02Z","attachment":{"type":"edited_text_file","filename":"/x.md","snippet":"1\tfoo"},"rendered":[{"content":"<system-reminder>\nNote: /x.md was modified.\n</system-reminder>"}],"renderedInHumanTurn":true}"#,
+            r#"{"type":"assistant","sessionId":"s1","uuid":"a1","parentUuid":"t2","timestamp":"2026-09-19T00:00:03Z","message":{"role":"assistant","model":"claude-fable-5-1","content":[{"type":"text","text":"ok"}]}}"#,
+        ]
+        .join("\n");
+        let mut sink = CollectSink::default();
+        stream_str("s1", &text, None, &ParseOptions::bulk(), &mut sink);
+        assert_eq!(
+            sink.messages.len(),
+            3,
+            "user + rendered attachment + assistant; the silent hook is dropped"
+        );
+        let att = &sink.messages[1];
+        assert_eq!(att.role, Role::System);
+        assert_eq!(
+            att.extra.get("attachmentType").and_then(Value::as_str),
+            Some("edited_text_file")
+        );
+        assert_eq!(att.id.as_deref(), Some("t2"));
+        assert_eq!(att.parent_id.as_deref(), Some("t1"));
+        assert!(att.text().unwrap().contains("/x.md was modified"));
+        assert!(!att.extra.contains_key("attachment"), "bulk keeps extra lean");
+
+        // full: the attachment object rides along
+        let mut sink = CollectSink::default();
+        stream_str("s1", &text, None, &ParseOptions::full(), &mut sink);
+        assert_eq!(sink.messages[1].extra["attachment"]["filename"], "/x.md");
+        assert_eq!(sink.messages[1].extra["renderedInHumanTurn"], true);
+
+        // complete: both attachments carried verbatim; the rendered one still carries its text
+        let mut sink = CollectSink::default();
+        stream_str("s1", &text, None, &ParseOptions::complete(), &mut sink);
+        assert_eq!(sink.messages.len(), 4);
+        let carried: Vec<_> = sink
+            .messages
+            .iter()
+            .filter(|m| m.extra.contains_key(CARRIER_KEY))
+            .collect();
+        assert_eq!(carried.len(), 2);
+        assert_eq!(carried[0].extra[CARRIER_KEY]["attachment"]["type"], "hook_success");
+        assert!(carried[0].content.is_empty());
+        assert_eq!(carried[1].extra[CARRIER_KEY]["attachment"]["type"], "edited_text_file");
+        assert!(!carried[1].content.is_empty(), "rendered carrier keeps its text");
+    }
+
+    #[test]
+    fn synthetic_assistant_notices_are_system_not_turns() {
+        // Claude Code's client-side notices ("Prompt is too long", "No response requested.") are
+        // `assistant` records with `model: "<synthetic>"`: not model output, never sent to the API.
+        let text = [
+            r#"{"type":"user","sessionId":"s1","uuid":"u0","timestamp":"2026-09-19T00:00:00Z","message":{"role":"user","content":"hi"}}"#,
+            r#"{"type":"assistant","sessionId":"s1","uuid":"e1","parentUuid":"u0","timestamp":"2026-09-19T00:00:01Z","message":{"role":"assistant","model":"<synthetic>","content":[{"type":"text","text":"Prompt is too long"}],"usage":{"input_tokens":0,"output_tokens":0}},"isApiErrorMessage":true,"error":"invalid_request"}"#,
+            r#"{"type":"assistant","sessionId":"s1","uuid":"n1","parentUuid":"e1","timestamp":"2026-09-19T00:00:02Z","message":{"role":"assistant","model":"<synthetic>","content":[{"type":"text","text":"No response requested."}]},"isApiErrorMessage":false}"#,
+            r#"{"type":"assistant","sessionId":"s1","uuid":"a1","parentUuid":"n1","timestamp":"2026-09-19T00:00:03Z","message":{"role":"assistant","model":"claude-fable-5-1","content":[{"type":"text","text":"ok"}]}}"#,
+        ]
+        .join("\n");
+        let mut sink = CollectSink::default();
+        let session = stream_str("s1", &text, None, &ParseOptions::full(), &mut sink);
+        let e1 = &sink.messages[1];
+        assert_eq!(e1.role, Role::System);
+        assert_eq!(e1.extra.get("subtype").and_then(Value::as_str), Some("api_error"));
+        assert_eq!(e1.extra.get("error").and_then(Value::as_str), Some("invalid_request"));
+        assert_eq!(e1.model, None);
+        assert_eq!(e1.text().as_deref(), Some("Prompt is too long"));
+        assert_eq!(
+            sink.messages[2].extra.get("subtype").and_then(Value::as_str),
+            Some("synthetic")
+        );
+        assert_eq!(
+            session.model.as_deref(),
+            Some("claude-fable-5-1"),
+            "a notice never names the session model"
+        );
+
+        // complete: the record keeps its own shape for round-trip
+        let mut sink = CollectSink::default();
+        stream_str("s1", &text, None, &ParseOptions::complete(), &mut sink);
+        assert_eq!(sink.messages[1].role, Role::Assistant);
+        assert!(!sink.messages[1].extra.contains_key("subtype"));
+        assert_eq!(sink.messages[1].model.as_deref(), Some("<synthetic>"));
+
+        // scan(): message_count skips both notices
+        let dir = std::env::temp_dir().join(format!("cv-claude-scan-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("s1.jsonl");
+        std::fs::write(&p, format!("{text}\n")).unwrap();
+        assert_eq!(scan(&p).unwrap().message_count, 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn custom_title_outranks_ai_title_and_bookkeeping_records_carry() {
+        let text = [
+            r#"{"type":"ai-title","aiTitle":"Auto title","sessionId":"s1"}"#,
+            r#"{"type":"custom-title","customTitle":"My rename","sessionId":"s1"}"#,
+            r#"{"type":"ai-title","aiTitle":"Auto title v2","sessionId":"s1"}"#,
+            r#"{"type":"agent-name","agentName":"Debug docker","sessionId":"s1"}"#,
+            r#"{"type":"continued-in","timestamp":"2026-09-03T12:45:08.257Z","sessionId":"s1","continuedInSessionId":"s2"}"#,
+            r#"{"type":"cost-state","sessionId":"s1","totalCostUSD":1.5}"#,
+            r#"{"type":"pr-link","sessionId":"s1","prNumber":1,"prUrl":"https://github.com/o/r/pull/1","timestamp":"2026-09-02T04:04:30.481Z"}"#,
+            r#"{"type":"some-future-record","sessionId":"s1","payload":true}"#,
+            r#"{"type":"user","sessionId":"s1","uuid":"u0","timestamp":"2026-09-19T00:00:00Z","message":{"role":"user","content":"hi"}}"#,
+        ]
+        .join("\n");
+        let mut sink = CollectSink::default();
+        let session = stream_str("s1", &text, None, &ParseOptions::full(), &mut sink);
+        assert_eq!(
+            session.title.as_deref(),
+            Some("My rename"),
+            "/rename beats a later ai-title"
+        );
+        assert_eq!(session.extra["agentName"], "Debug docker");
+        assert_eq!(session.extra["continuedInSessionId"], "s2");
+        assert_eq!(session.extra["prLinks"][0], "https://github.com/o/r/pull/1");
+        assert_eq!(sink.messages.len(), 1, "bookkeeping records are not turns");
+
+        let mut sink = CollectSink::default();
+        stream_str("s1", &text, None, &ParseOptions::complete(), &mut sink);
+        assert_eq!(
+            sink.messages.len(),
+            9,
+            "complete mode carries every record, known or not"
+        );
+        assert!(sink.messages.iter().any(|m| m
+            .extra
+            .get(CARRIER_KEY)
+            .and_then(|r| r.get("type"))
+            .and_then(Value::as_str)
+            == Some("some-future-record")));
+
+        // scan() agrees on the title
+        let dir = std::env::temp_dir().join(format!("cv-claude-scan-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("s1.jsonl");
+        std::fs::write(&p, format!("{text}\n")).unwrap();
+        assert_eq!(scan(&p).unwrap().title.as_deref(), Some("My rename"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn persisted_output_stubs_are_annotated() {
+        // A too-large tool output goes to `<session>/tool-results/<id>.txt`; the transcript (and the
+        // model) get only this stub. The stub stays the content; the path rides in `details`.
+        let stub = "<persisted-output>\nOutput too large (66KB). Full output saved to: /tmp/proj/sess/tool-results/bgz.txt\n\nPreview (first 2KB):\nhello\n</persisted-output>";
+        let line = serde_json::json!({"type":"user","sessionId":"s1","uuid":"u1","timestamp":"2026-09-19T00:00:00Z",
+            "message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":stub}]}})
+        .to_string();
+        let mut sink = CollectSink::default();
+        stream_str("s1", &line, None, &ParseOptions::bulk(), &mut sink);
+        let Block::ToolResult { content, details, .. } = &sink.messages[0].content[0] else {
+            panic!("expected a tool result");
+        };
+        assert!(
+            content.contains("Preview"),
+            "the stub — what the model saw — stays the content"
+        );
+        let d = details.as_ref().expect("persisted output recorded");
+        assert_eq!(d["persistedOutput"]["path"], "/tmp/proj/sess/tool-results/bgz.txt");
+        assert_eq!(d["persistedOutput"]["size"], "66KB");
+        // an ordinary result carries no details
+        let plain = serde_json::json!({"type":"user","sessionId":"s1","uuid":"u2","timestamp":"2026-09-19T00:00:00Z",
+            "message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t2","content":"ok"}]}})
+        .to_string();
+        let mut sink = CollectSink::default();
+        stream_str("s1", &plain, None, &ParseOptions::bulk(), &mut sink);
+        let Block::ToolResult { details, .. } = &sink.messages[0].content[0] else {
+            panic!()
+        };
+        assert!(details.is_none());
     }
 
     #[test]
