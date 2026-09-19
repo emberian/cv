@@ -225,12 +225,32 @@ Re-verified 2026-09-19 at `132c2be23` (CLI 0.154).
 
 ## OpenCode — `~/.local/share/opencode/` (NOT `~/.opencode`, which is plugins/cache)
 
-- **Storage:** `~/.local/share/opencode/storage/session/<...>.json` (session records) and
-  `storage/message/<sessionID>/<messageID>.json` (one file per message). Also `~/.local/state/opencode/`
-  and `prompt-history.jsonl`.
-- **Message record:** `{id: msg_*, sessionID: ses_*, role, summary{title,body,diffs[]}, ...}` plus model info.
+Re-verified 2026-09-19 at `fee476bb` (1.18.31). Ground truth: `packages/core/src/session/sql.ts` (tables),
+`packages/schema/src/v1/session.ts` (Info/Part shapes), `packages/core/src/database/database.ts` (db path).
+
+- **The canonical store is SQLite:** `opencode.db` in the data dir (`$XDG_DATA_HOME`-aware; `$OPENCODE_DB` may
+  point elsewhere — `:memory:`, absolute, or relative to the data dir; non-default channels use
+  `opencode-<channel>.db`), WAL mode. Tables `session(id, project_id, parent_id, directory, path, title, version,
+  agent, model{id, providerID, variant}, cost, tokens_input/output/reasoning/cache_read/cache_write,
+  summary_additions/deletions/files, share_url, revert, time_created, time_updated, time_archived, metadata?
+  (json; added 2026-05-30 — probe `PRAGMA table_info`))`, `message(id, session_id, time_created, data)`,
+  `part(id, message_id, data)`, `todo`, `session_share`. `data` is the Info/Part JSON MINUS `id`/`sessionID`/
+  `messageID` — re-hydrate as `{...data, id, sessionID, messageID}`. Message `data`: `{role, time{created,
+  completed}, parentID, modelID, providerID, mode, agent, path{cwd, root}, cost, tokens{input, output, reasoning,
+  cache{read, write}}, finish, error?}` with `error.name ∈ {ProviderAuthError, UnknownError,
+  MessageOutputLengthError, MessageAbortedError, StructuredOutputError, ContextOverflowError, ContentFilterError,
+  APIError}`. Part union unchanged (`text reasoning tool file agent subtask patch snapshot step-start step-finish
+  retry compaction`); tool `state` is `pending | running | completed{input, output, title, metadata, time,
+  attachments?: FilePart[]} | error`.
+- **The JSON tree is dead:** `storage/{session,message,part}/**.json` was only the input of a one-shot importer,
+  deleted 2026-06-02 (`ca2acc4f`); anything left on disk is a pre-2026-01 leftover. Read it only as a fallback
+  when no db exists. Also `~/.local/state/opencode/` and `prompt-history.jsonl`. `opencode export [sid]` writes
+  `{info, messages:[{info, parts}]}` (an importable interchange form).
 
 ## Gemini / Antigravity — `~/.gemini/`
+
+Re-verified 2026-09-19 at `cfbcaa8` (0.46.0): **the record format is unchanged** (`chatRecordingTypes.ts` and
+`logger.ts` have no diff since 2026-05).
 
 - **Antigravity transcripts:** `~/.gemini/antigravity/conversations/<uuid>.pb` — **protobuf, opaque**
   (no .proto on disk). Best-effort only.
@@ -243,23 +263,68 @@ Re-verified 2026-09-19 at `132c2be23` (CLI 0.154).
 - Also handled now: the gemini-cli JSON **chat recordings** (`~/.gemini/tmp/<projectHash>/chats/session-*.json`
   legacy object + modern append-only `.jsonl` with `$set`/`$rewindTo`) and `checkpoint-*.json` — far richer
   than logs.json (real assistant turns, thoughts, tool calls). Qwen Code reuses this format under `~/.qwen/`.
+- **Second storage root:** under macOS Seatbelt (`SANDBOX=sandbox-exec`) the runtime dir is `~/.cache/.gemini`,
+  so recordings land in `~/.cache/.gemini/tmp/<project>/chats/…` (and `history/`) — scan both roots, dedupe by
+  `sessionId`. `chats/` may hold `<file>.unreadable-<epochms>` and `<file>.tmp-<pid>` siblings (a corrupt
+  recording, a rewrite in progress) — skip them. Empty, non-resumable recordings are deleted by the CLI.
+- **cwd:** `tmp/<projectIdentifier>` is a short id; the real path lives in `~/.gemini/projects.json`
+  (`{"projects": {"/abs/path": "<id>"}}`) or `~/.gemini/history/<id>/.project_root`; `directories[]` inside a
+  recording is often absent.
 
-## Hermes (Nous) — `~/.hermes/state.db` (SQLite, schema v14; `$HERMES_HOME` overrides)
+## Hermes (Nous) — `~/.hermes/state.db` (SQLite, `SCHEMA_VERSION` 30 as of 2026-09-19; `$HERMES_HOME` overrides; per-profile `profiles/<name>/state.db`)
 
-- `sessions` + `messages` tables (OpenAI-shaped rows). cwd is NOT persisted (runtime-only).
-- Multimodal content uses a `\x00json:` sentinel prefix. Reasoning spans several columns
-  (`reasoning`, `reasoning_content`, `reasoning_details`, `codex_reasoning_items`, `codex_message_items`).
-- **Schema drift:** Hermes ALTERs columns in live (no version gate) — older DBs lack newer columns, so probe
-  `PRAGMA table_info` and select only what exists. Compression chains link sessions via `parent_session_id`
-  (parent `end_reason='compression'`); walk root→tip and dedup the replayed boundary user message.
+- `sessions` + `messages` tables (OpenAI-shaped rows; roles `user|assistant|tool|system`). Multimodal content
+  uses a `\x00json:` sentinel prefix. Reasoning spans several columns (`reasoning`, `reasoning_content`,
+  `reasoning_details`, `codex_reasoning_items`, `codex_message_items`).
+- **Schema drift:** columns are added with `ALTER TABLE ADD COLUMN` against `SCHEMA_SQL`, so probe
+  `PRAGMA table_info` and select only what exists. v16 → v30 added to `messages`: `active`, `compacted`,
+  `_compressed_summary`, `effect_disposition`, `api_content`, `display_kind` (`hidden | steer | auto_continue |
+  model_switch | async_delegation_complete | process_complete | internal_notification`), `display_metadata`,
+  `display_identity`, `display_order`; to `sessions`: `cwd`, `git_branch`, `git_repo_root`, `session_key`,
+  `display_name`, `origin_json` (foreign imports: `imported_from{tool: claude-code|codex-cli, path,
+  foreign_session_id}`), `system_prompt_hash`, `title_source`, `last_activity_at`, `profile_name`,
+  `transport_profile`, `pinned`, `hidden`, `tool_names`, …
+- **Row visibility is load-bearing:** compaction happens IN PLACE under one session id — old rows get
+  `active=0, compacted=1`, the summary row has `_compressed_summary=1` (`display_kind='hidden'`), the carried
+  tail is cloned to fresh ids and the originals get `active=0, compacted=0` (rewound rows likewise). Hermes
+  shows `active = 1 OR compacted = 1` and sends `active = 1`; read with that filter or every carried message
+  appears twice. **Order by `id`**, not `timestamp` (timestamps are not monotonic; tool-call adjacency breaks).
+- **System prompt** moved (v25) to `system_prompts(hash, prompt)`; `sessions.system_prompt` is NULL —
+  `COALESCE(sp.prompt, s.system_prompt)` via `LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash`.
+- **Lineage:** compression chains link via `parent_session_id` (parent `end_reason='compression'`); branch /
+  reset / delegate children are marked in `model_config` JSON (`_branched_from`, `_reset_from`,
+  `_delegate_from`) — an explicit branch is its own conversation and delegate children are sub-agent runs;
+  Hermes's own listing hides `archived=1 OR hidden=1`, compression continuations and delegate children.
 
-## OpenClaw — `~/.openclaw/agents/<agentId>/sessions/`
+## OpenClaw — `$OPENCLAW_STATE_DIR` or `~/.openclaw/agents/<agentId>/`
 
-- `sessions.json` index + `<sid>.jsonl` (and `<sid>-topic-<id>.jsonl`) transcripts; a `{type:session,version:N}`
-  header (v1/v2 linear → v3 parent-linked, migrated in place) then `{type:message,...}` lines.
-- Roles user/assistant/toolResult + custom (bashExecution, branchSummary, compactionSummary, custom).
-  Blocks: text(+textSignature), thinking(+thinkingSignature,redacted), toolCall, image. Secrets redacted at
-  write time (no fixed sentinel). ACP-bridged sessions are text-only echoes (`model:"acp-runtime"`).
+Re-verified 2026-09-19 at `0e9181234a`. Ground truth: `src/state/openclaw-agent-schema.sql`,
+`src/config/sessions/*`, `src/agents/sessions/session-manager-types.ts`.
+
+- **The live store is SQLite (since 2026-07-11, `0a8e3604ba`):** `agent/openclaw-agent.sqlite` (also
+  `openclaw-agent.<agentId>.sqlite` / `.<n>.sqlite` for shared stores; `PRAGMA user_version` = 21), all tables
+  `STRICT`: `transcript_events(session_id, seq, event_json, created_at)` — `event_json` is exactly the object
+  that used to be a JSONL line (header + entries), ordered by `seq`; `session_windows(session_id, session_key,
+  previous_session_id, reason: initial|reset|rollover|fork|rewind|switch|recovery|compaction, created_at,
+  updated_at, status, model_provider, model, parent_session_key, spawned_by, display_name, …)`;
+  `session_nodes(session_key, current_session_id, entry_json (the old sessions.json entry), label,
+  display_name, parent_session_key, fork_source_session_id, pinned_at, archived_at, last_activity_at, …)`;
+  archives `session_transcript_archives` (zstd blobs, reason deleted|reset), `session_transcript_cold_archives`,
+  `trajectory_runtime_events`.
+- **JSONL on disk is legacy or archive only:** pre-July `sessions/<sid>.jsonl` (+ `<sid>-topic-<id>.jsonl`,
+  `sessions.json` index), cold-tier `<sha256>.jsonl.zst`, reset/delete archives `<sid>.jsonl.<reason>.<ts>[.zst]`,
+  compaction checkpoints `<sid>.checkpoint.<uuid>.jsonl`, `*.trajectory.jsonl`, `*.migrated*`, `*.bak` — only the
+  first kind is a session.
+- **Transcript entries:** header `{type:"session", version:4 (min readable 3), id, timestamp, cwd,
+  parentSession?}`, then canonical entries `message | thinking_level_change | model_change{provider, modelId} |
+  compaction{summary, firstKeptEntryId, tokensBefore, details?} | reset{reason: new|reset|idle|daily|cron-stale,
+  firstKeptEntryId?} | branch_summary | custom | custom_message{customType, content, display} | label{targetId,
+  label} | session_info{name}`, plus branch controls `{type:"leaf", id, parentId, targetId, appendParentId?,
+  appendMode?:"side"}` (any entry may carry `appendMode:"side"`): readers must follow the visible path, not file
+  order. Roles user/assistant/toolResult + custom (bashExecution, branchSummary, compactionSummary, custom);
+  blocks text(+textSignature), thinking(+thinkingSignature, redacted), toolCall(+async), image. Assistant
+  messages add `responseId`, `turnId`, `endTurn`, `errorCode/errorType`, `usage.contextUsage`; secrets are always
+  redacted at write time. ACP-bridged sessions are text-only echoes (`model:"acp-runtime"`).
 
 ## Cursor IDE — `~/Library/Application Support/Cursor/User/` (mac; `%APPDATA%/Cursor/User` Win; `$XDG_CONFIG_HOME/Cursor/User` Linux)
 
@@ -281,15 +346,28 @@ Re-verified 2026-09-19 at `132c2be23` (CLI 0.154).
   history is local as one **encrypted** file per conversation (`conversations-v3-<acct>/<uuid>.data`); the key is
   app-held (not in a readable Keychain item). We detect the install + count convos but cannot decrypt.
 
-## Kimi CLI (MoonshotAI) — `$KIMI_SHARE_DIR` or `~/.kimi`
+## Kimi — `~/.kimi-code` (Kimi Code, current) and `~/.kimi` (kimi-cli, frozen)
 
-- Sessions at `sessions/<md5(cwd)>/<uuid>/context.jsonl` (modern dir form) or `sessions/<md5(cwd)>/<uuid>.jsonl`
-  (legacy flat). Project-dir name is `md5(cwd_utf8).hexdigest()` (or `<kaos>_<md5>` for non-local KAOS); cwd is
-  recovered from `~/.kimi/kimi.json` `work_dirs[]`. `context.jsonl` roles `_system_prompt`/`user`/`assistant`/
-  `tool` (+ skippable `_checkpoint`/`_usage`); content is a bare string or a list of `type`-tagged Parts
-  (`text`/`think`/`image_url`/…); tool calls carry a JSON-string `arguments`. A `wire.jsonl` sidecar
-  (`protocol_version` 1.x) enriches tool results + token usage. `state.json` → title; `context_N.jsonl` are
-  compaction segments. Read-only.
+- **kimi-cli (`$KIMI_SHARE_DIR` or `~/.kimi`) is deprecated and frozen** — its format is unchanged since 2026-05
+  (wire `protocol_version` 1.1–1.10) but nothing new is written once `~/.kimi/.migrated-to-kimi-code` exists.
+  Sessions at `sessions/<md5(cwd)>/<uuid>/context.jsonl` (or legacy flat `<uuid>.jsonl`); cwd from
+  `~/.kimi/kimi.json` `work_dirs[]`; roles `_system_prompt`/`user`/`assistant`/`tool` (+ `_checkpoint`/`_usage`);
+  Parts `text`/`think`/`image_url`; tool calls carry a JSON-string `arguments`; `wire.jsonl` (`{timestamp,
+  message:{type, payload}}`) enriches tool results + `StatusUpdate.token_usage{input_other, …}`;
+  `context_N.jsonl` are compaction segments.
+- **Kimi Code (`$KIMI_CODE_HOME` or `~/.kimi-code`)** — a different format: `session_index.jsonl`
+  (`{sessionId, sessionDir, workDir}` + `{sessionId, deleted:true}` tombstones); workspace dirs
+  `sessions/wd_<slug>_<sha256(cwd)[:12]>/session_<uuid>/` with `state.json` v2 `{id, version:2, cwd, archived,
+  agents{main, agent-N{type:"sub", parentAgentId}}, title, titleKind, isCustomTitle, lastPrompt, createdAt,
+  updatedAt (ms), lastTurnReason}` (**cwd is stored**). The transcript is `agents/<id>/wire.jsonl`: header
+  `{type:"metadata", protocol_version:"1.4"|"1.5", created_at:<ms>}` then FLAT records `{type, …, time:<ms>}`:
+  `context.append_message` (user), `context.append_loop_event` with `event.type` ∈ `step.begin` /
+  `content.part{part:{type: text|think}}` / `tool.call{toolCallId, name, args:<object>}` /
+  `tool.result{toolCallId, result:{output, isError?, note?, truncated?}}` / `step.end{finishReason,
+  usage{inputOther, output, inputCacheRead, inputCacheCreation}, messageId}` (group by `event.stepUuid`),
+  `usage.record`, `llm.request`, `turn.prompt|ended|steer|cancel`, `profile.bind`,
+  `context.apply_compaction{summary, compactedCount}`. Sidecars `agents/<id>/tool-results/<Tool>-<callId>-
+  <uuid>.txt` (outputs > 50 000 chars), `media/`, `logs/`.
 
 ## Qwen Code — `~/.qwen/`
 
@@ -326,12 +404,31 @@ Re-verified 2026-09-19 at `132c2be23` (CLI 0.154).
 
 ## Goose (Block) — modern SQLite + legacy `.jsonl`
 
+Re-verified 2026-09-19 at `2090ad1c` (1.51.0). Ground truth: `crates/goose/src/session/session_manager.rs`
+(schema + writers), `crates/goose-provider-types/src/conversation/message.rs` (content blocks).
+
 - Data dir: Linux `~/.local/share/goose/sessions/`; macOS `~/Library/Application Support/Block.block.goose/sessions/`;
-  Windows `%APPDATA%\Block\Block\goose\data\sessions\` (`$GOOSE_PATH_ROOT`/`$XDG_DATA_HOME` override). Modern:
-  `sessions.db` (`sessions(working_dir→cwd, description→title, provider_name+model_config_json→model, …)` +
-  `messages(role[user|assistant], content_json, …)`; open READ-ONLY, PRAGMA-probe columns). `content_json` = array of
-  MCP-style `MessageContent` (`text`/`thinking`/`toolRequest`/`toolResponse`/…); tool results ride on `user` msgs →
-  reclassified to Tool. Legacy: per-session `<name>.jsonl` (header line + one message per line).
+  Windows `%APPDATA%\Block\goose\data\sessions\` (one `Block`; `$GOOSE_PATH_ROOT` (absolute only) /
+  `$XDG_DATA_HOME` override). Modern: `sessions.db`, schema version in a `schema_version` table (`SELECT
+  MAX(version)`; 16 today): `sessions(id, name (the title — `description` is never written), working_dir→cwd,
+  created_at/updated_at 'YYYY-MM-DD HH:MM:SS', provider_name + model_config_json → model, session_type,
+  parent_session_id (v15), cache_read/write_tokens + accumulated_* (v14), …)`, `messages(message_id, session_id,
+  role[user|assistant], content_json, created_timestamp secs, tokens (never written), metadata_json)`,
+  `usage_ledger(session_id, created_timestamp, model, input/output/total_tokens, cache_read/write_tokens, cost,
+  cost_source, is_compaction)` (v15). Open READ-ONLY, PRAGMA-probe columns.
+- `content_json` = array of `MessageContentBlock` (`type` camelCase): `text`, `image`, `document{data, mimeType,
+  name?}` (2026-09), `toolRequest`, `toolResponse` (`toolResult` = `{status:"success", value}` |
+  `{status:"error", error}`; `value` is an rmcp `CallToolResult{content[], structuredContent?, _meta?}` with
+  snake_case blocks `text|image|audio|resource|resource_link`, or — legacy — a bare content array),
+  `toolConfirmationRequest`, `actionRequired`, `thinking`, `redactedThinking`, `systemNotification`,
+  `error{kind: authentication|contextLengthExceeded|creditsExhausted|other, message}` (2026-08);
+  `frontendToolRequest` was removed 2026-08 (old rows may carry it). Tool results ride on `user` msgs → Tool turn.
+- `metadata_json` (written on every insert): `{userVisible, agentVisible, inference{provider, requestedModel,
+  resolvedModel, providerSessionId}, outputTokenLimitReached, steer, turnContext, usage{inputTokens,
+  outputTokens, totalTokens, cacheReadTokens, cacheWriteTokens, cost, costSource, elapsedMs,
+  timeToFirstTokenMs, isCompaction}, operations}` — the only per-message usage; Goose hides rows with
+  `userVisible = 0`. `created_timestamp` is seconds (values > 10_000_000_000 are milliseconds). Legacy:
+  per-session `<name>.jsonl` (header line + one message per line), unchanged.
 
 ## Zed — `<data_dir>/threads/threads.db` (SQLite + zstd blobs)
 
