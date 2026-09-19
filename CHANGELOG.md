@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- **`cv workflow <session> <run> --revive` salvages a dead run.** A `Workflow` run that dies
+  mid-flight (session limit, kill, crash) loses every in-progress lane at once, and the
+  orchestrator's state file keeps only a ~400-char preview of each prompt, so re-running the
+  script restarts every lane from zero. `--revive` mines each lane's own transcript
+  (`<session>/subagents/workflows/<run>/agent-<id>.jsonl`) for the FULL original prompt plus the
+  work it already landed — files written or edited, distinct commands run, its last substantive
+  note — and prints a ready-to-paste standalone `Agent` prompt per unfinished lane
+  (`--revive-all` includes finished ones), so lanes come back resumed rather than restarted and
+  without the workflow runtime.
+
 - **`cv prune --revive` works again on Claude Code ≥ 2.1.277 — the pin now lands in
   `usage.iterations` too.** Claude Code's resume gate sizes the loaded context from
   the last real assistant record's `usage`, and since 2.1.277 it prefers the last

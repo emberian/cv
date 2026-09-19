@@ -88,8 +88,8 @@ struct Cli {
 enum Cmd {
     /// List discovered sessions across all harnesses.
     Ls {
-        /// Only this harness (claude, codex, grok, opencode, gemini, cursor, kimi, qwen,
-        /// cline, roo, continue, lmstudio, hermes, goose, zed, openclaw, …).
+        /// Only this harness (claude, codex, grok, opencode, gemini, cursor, kimi, kimi-code,
+        /// qwen, cline, roo, continue, lmstudio, hermes, goose, zed, openclaw, …).
         #[arg(long)]
         harness: Option<String>,
         /// Only sessions whose cwd contains this substring.
@@ -513,6 +513,15 @@ enum Cmd {
         /// render the full run when it reaches a terminal status.
         #[arg(long, short = 'f')]
         follow: bool,
+        /// Salvage a dead or interrupted run: emit a ready-to-paste standalone `Agent` prompt per
+        /// lane — the FULL original task plus the work that lane already landed (files written,
+        /// commands run, its own last note) — so lanes come back resumed rather than restarted.
+        #[arg(long)]
+        revive: bool,
+        /// With `--revive`, include lanes that completed successfully too (default: only the ones
+        /// that did not finish).
+        #[arg(long)]
+        revive_all: bool,
     },
     /// Cross-agent tool analytics: per-agent histograms, which-agent-used-what, aggregate usage,
     /// and a tool-call timeline — across the orchestrator and its whole sub-agent forest.
@@ -856,7 +865,9 @@ fn main() -> Result<()> {
             script,
             results,
             follow,
-        } => workflow::cmd_workflow(&id, run_id, harness, json, script, results, follow),
+            revive,
+            revive_all,
+        } => workflow::cmd_workflow(&id, run_id, harness, json, script, results, follow, revive, revive_all),
         Cmd::Tools {
             id,
             harness,

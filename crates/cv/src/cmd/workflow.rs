@@ -15,6 +15,7 @@ use cv_core::tools::{ForestTools, ToolHistogram};
 /// accept **names**: `run` matches a workflow name (exact, else unique prefix) as well as a run id,
 /// and when `<session>` matches no session id it's resolved as a workflow name across the whole
 /// catalog — session titles are auto-generated and rarely mention the workflow you remember.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn cmd_workflow(
     id: &str,
     run_id: Option<String>,
@@ -23,13 +24,15 @@ pub(crate) fn cmd_workflow(
     script: bool,
     results: bool,
     follow: bool,
+    revive: bool,
+    revive_all: bool,
 ) -> Result<()> {
     let want = crate::util::parse_harness(&harness)?;
     // find_cheap: don't pay a full fleet re-discovery before trying the id as a workflow name —
     // the name path escalates to a full `find` itself once every cheaper reading has missed.
     let Some((r, _adapter)) = cv_core::find_cheap(id, want)? else {
         // Not a session id → maybe it's a workflow name ("the stark-kill session" problem).
-        return workflow_by_name_fleetwide(id, want, json, script, results);
+        return workflow_by_name_fleetwide(id, want, json, script, results, revive, revive_all);
     };
 
     // No run id → list the session's workflows (a directory of runs).
@@ -56,7 +59,7 @@ pub(crate) fn cmd_workflow(
         )
     })?;
     wf.attach_journal(&r.path);
-    emit_workflow(&wf, json, script, results)
+    emit_workflow(&wf, json, script, results, revive, revive_all, Some(r.path.as_path()))
 }
 
 /// `--follow`: poll the run's state file (the harness flushes it as agents progress) and stream
@@ -108,7 +111,7 @@ fn follow_workflow(r: &cv_core::SessionRef, key: &str, json: bool, script: bool,
             println!("\n── run reached {} ──\n", wf.status.as_deref().unwrap_or("?"));
             let mut wf = wf;
             wf.attach_journal(&r.path);
-            return emit_workflow(&wf, json, script, results);
+            return emit_workflow(&wf, json, script, results, false, false, Some(r.path.as_path()));
         }
         std::thread::sleep(std::time::Duration::from_secs(2));
     }
@@ -116,7 +119,18 @@ fn follow_workflow(r: &cv_core::SessionRef, key: &str, json: bool, script: bool,
 
 /// Shared single-run output: `--json` gets the full structure (journal results included);
 /// otherwise the rendered view, with `--results` appending each agent's full journaled return.
-fn emit_workflow(wf: &cv_core::Workflow, json: bool, script: bool, results: bool) -> Result<()> {
+fn emit_workflow(
+    wf: &cv_core::Workflow,
+    json: bool,
+    script: bool,
+    results: bool,
+    revive: bool,
+    revive_all: bool,
+    session_path: Option<&std::path::Path>,
+) -> Result<()> {
+    if revive {
+        return render_revive(wf, revive_all, session_path);
+    }
     if json {
         println!("{}", serde_json::to_string_pretty(wf)?);
         return Ok(());
@@ -171,6 +185,8 @@ fn workflow_by_name_fleetwide(
     json: bool,
     script: bool,
     results: bool,
+    revive: bool,
+    revive_all: bool,
 ) -> Result<()> {
     let hits = cv_core::find_workflows_by_name(name);
     if hits.is_empty() {
@@ -211,7 +227,7 @@ fn workflow_by_name_fleetwide(
                 r.title.as_deref().unwrap_or("untitled")
             );
         }
-        return emit_workflow(&wf, json, script, results);
+        return emit_workflow(&wf, json, script, results, revive, revive_all, Some(r.path.as_path()));
     }
     println!("# {} workflow run(s) matching {name:?}:\n", hits.len());
     for (r, w) in &hits {
@@ -821,6 +837,249 @@ fn fmt_duration(ms: u64) -> String {
     }
 }
 
+// ===================== cv workflow --revive =====================
+
+/// One lane's salvageable state: the task it was given, and what it managed to do first.
+struct Revivable {
+    label: String,
+    agent_id: Option<String>,
+    phase: u64,
+    state: String,
+    error: Option<String>,
+    tokens: u64,
+    tool_calls: u64,
+    /// The FULL prompt the orchestrator handed the lane (not the ~400-char preview).
+    prompt: Option<String>,
+    /// Files the lane wrote or edited before it died — the concrete work worth not redoing.
+    files: Vec<String>,
+    /// Distinct shell commands it ran, deduped and capped.
+    commands: Vec<String>,
+    /// The lane's last substantive note to itself, which usually says where it had got to.
+    last_note: Option<String>,
+}
+
+/// `--revive`: turn a dead or interrupted workflow run into per-lane resume prompts.
+///
+/// A `Workflow` run that dies mid-flight (an API session limit, a kill, a crash) loses every
+/// in-progress lane at once, and the orchestrator's state file keeps only a ~400-char preview of
+/// each prompt — so the obvious recovery, re-running the script, restarts every lane from zero and
+/// throws away whatever they had already done. That is the expensive failure: our own runs have
+/// lost multi-million-token waves this way.
+///
+/// The lanes' transcripts survive on disk regardless. This mines each one for the full original
+/// prompt plus the work it actually landed (files written, commands run, its own last note) and
+/// emits a ready-to-paste prompt for a standalone `Agent` — so lanes come back individually,
+/// resumed rather than restarted, without needing the workflow runtime at all.
+fn render_revive(w: &cv_core::Workflow, all: bool, session_path: Option<&std::path::Path>) -> Result<()> {
+    let agents: Vec<&cv_core::WorkflowAgent> = w
+        .phases
+        .iter()
+        .flat_map(|p| &p.agents)
+        .chain(&w.orphan_agents)
+        .filter(|a| all || a.state.as_deref() != Some("done"))
+        .collect();
+
+    if agents.is_empty() {
+        println!(
+            "no revivable lanes in {} (every agent completed; `--revive --all` to include them)",
+            w.run_id
+        );
+        return Ok(());
+    }
+
+    println!("# revive {} — {} lane(s)", w.run_id, agents.len());
+    if let Some(e) = &w.error {
+        println!("run died: {}", truncate(e, 160));
+    }
+    println!(
+        "\nEach block below is a standalone Agent prompt. The lane's own transcript supplied the\n\
+         full task; the work log is mined from its tool calls so the revived lane does not redo it.\n"
+    );
+
+    for a in agents {
+        let rev = mine_lane(a, &w.run_id, session_path);
+        print_revive_block(&rev);
+    }
+    Ok(())
+}
+
+/// Pull one lane's full prompt and work log out of its own transcript.
+///
+/// Resolved by PATH, not by id lookup: a workflow lane's transcript always lives at
+/// `<session>/subagents/workflows/<run_id>/agent-<id>.jsonl`, and we already know all three parts.
+/// Going through the fleet-wide id resolver instead silently returns nothing for these — which is
+/// how the first cut of this command ended up emitting truncated previews and empty work logs.
+fn mine_lane(a: &cv_core::WorkflowAgent, run_id: &str, session_path: Option<&std::path::Path>) -> Revivable {
+    let mut rev = Revivable {
+        label: a.label.clone().unwrap_or_else(|| format!("agent#{}", a.index)),
+        agent_id: a.agent_id.clone(),
+        phase: a.phase_index,
+        state: a.state.clone().unwrap_or_else(|| "unknown".into()),
+        error: a.error.clone(),
+        tokens: a.tokens.unwrap_or(0),
+        tool_calls: a.tool_calls.unwrap_or(0),
+        // Fall back to the ~400-char preview only if the transcript is genuinely unreadable.
+        prompt: a.prompt_preview.clone(),
+        files: Vec::new(),
+        commands: Vec::new(),
+        last_note: None,
+    };
+
+    let (Some(id), Some(sp)) = (a.agent_id.as_deref(), session_path) else {
+        return rev;
+    };
+    let Some(stem) = sp.file_stem().and_then(|s| s.to_str()) else {
+        return rev;
+    };
+    let dir = sp.with_file_name(stem).join("subagents").join("workflows").join(run_id);
+    let bare = id.strip_prefix("agent-").unwrap_or(id);
+    let path = dir.join(format!("agent-{bare}.jsonl"));
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return rev;
+    };
+    mine_transcript(&text, &mut rev);
+    rev
+}
+
+/// The transcript-mining half of [`mine_lane`], split from path resolution so it can be tested
+/// on JSONL text alone: the FULL first user prompt, the files the lane wrote or edited, its distinct
+/// Bash commands (first line, capped), and its last substantive note.
+fn mine_transcript(text: &str, rev: &mut Revivable) {
+    let mut seen_files = std::collections::BTreeSet::new();
+    let mut seen_cmds = std::collections::BTreeSet::new();
+    let mut got_prompt = false;
+
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let role = v.pointer("/message/role").and_then(|r| r.as_str()).unwrap_or("");
+        let content = match v.pointer("/message/content") {
+            Some(c) => c,
+            None => continue,
+        };
+
+        // The lane's task is the first user message — the FULL text the orchestrator handed it.
+        if role == "user" && !got_prompt {
+            let full = match content {
+                serde_json::Value::String(s) => Some(s.clone()),
+                serde_json::Value::Array(bs) => bs
+                    .iter()
+                    .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                    .next()
+                    .map(str::to_string),
+                _ => None,
+            };
+            if let Some(f) = full.filter(|f| !f.trim().is_empty()) {
+                rev.prompt = Some(f);
+                got_prompt = true;
+            }
+        }
+
+        let serde_json::Value::Array(blocks) = content else {
+            continue;
+        };
+        for b in blocks {
+            match b.get("type").and_then(|t| t.as_str()) {
+                Some("tool_use") => {
+                    let name = b.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                    let input = b.get("input");
+                    match name {
+                        "Write" | "Edit" | "NotebookEdit" => {
+                            if let Some(f) = input.and_then(|i| i.get("file_path")).and_then(|f| f.as_str()) {
+                                if seen_files.insert(f.to_string()) {
+                                    rev.files.push(f.to_string());
+                                }
+                            }
+                        }
+                        "Bash" => {
+                            if let Some(c) = input.and_then(|i| i.get("command")).and_then(|c| c.as_str()) {
+                                let head: String = c.split('\n').next().unwrap_or(c).chars().take(70).collect();
+                                if seen_cmds.insert(head.clone()) {
+                                    rev.commands.push(head);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Some("text") if role == "assistant" => {
+                    if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
+                        if t.trim().len() > 80 {
+                            rev.last_note = Some(t.to_string());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn print_revive_block(rev: &Revivable) {
+    println!("\n{}", "=".repeat(78));
+    println!("## lane: {}", rev.label);
+    print!(
+        "state={} phase={} tokens={} tools={}",
+        rev.state,
+        rev.phase,
+        fmt_int(rev.tokens),
+        fmt_int(rev.tool_calls)
+    );
+    if let Some(id) = &rev.agent_id {
+        print!(" agent={}", short_id(id));
+    }
+    println!();
+    if let Some(e) = &rev.error {
+        println!("died: {}", truncate(e, 200));
+    }
+    if rev.prompt.is_none() {
+        println!("\n(no prompt recoverable — neither transcript nor preview; re-issue by hand)");
+        return;
+    }
+
+    // The work log only earns its place when the lane actually did something.
+    let did_work = !rev.files.is_empty() || !rev.commands.is_empty();
+    println!("\n--- 8< --- paste the block below as an Agent prompt --- 8< ---\n");
+    println!("{}", rev.prompt.as_deref().unwrap_or_default());
+
+    if did_work {
+        println!(
+            "\n\n--- RESUMING AN INTERRUPTED RUN ---\n\
+             A previous run of this exact lane was cut short ({}) after {} tool calls. Its work is\n\
+             still on disk. Do NOT start over — verify what is listed below, then continue from there.",
+            rev.error
+                .as_deref()
+                .map(|e| truncate(e, 90))
+                .unwrap_or_else(|| rev.state.clone()),
+            fmt_int(rev.tool_calls),
+        );
+        if !rev.files.is_empty() {
+            println!("\nFiles it already wrote or edited ({}):", rev.files.len());
+            for f in rev.files.iter().take(40) {
+                println!("  {}", f);
+            }
+            if rev.files.len() > 40 {
+                println!("  … and {} more", rev.files.len() - 40);
+            }
+        }
+        if !rev.commands.is_empty() {
+            println!("\nCommands it ran ({} distinct, first 15):", rev.commands.len());
+            for c in rev.commands.iter().take(15) {
+                println!("  $ {}", c);
+            }
+        }
+        if let Some(note) = &rev.last_note {
+            println!(
+                "\nIts own last note, which usually says where it had got to:\n{}",
+                truncate(note, 900)
+            );
+        }
+        println!("\n--- END RESUME CONTEXT ---");
+    }
+    println!("\n--- >8 --- end prompt --- >8 ---");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -840,5 +1099,46 @@ mod tests {
     fn kindcell_blanks_zero() {
         assert_eq!(kindcell(0), "");
         assert_eq!(kindcell(3), "3");
+    }
+
+    #[test]
+    fn revive_mines_prompt_files_commands_and_last_note() {
+        let lines = [
+            r#"{"type":"user","message":{"role":"user","content":"Full lane task: implement the widget end to end."}}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Starting; I will scaffold first and then wire the tests, keeping the public surface unchanged for now."},{"type":"tool_use","name":"Write","input":{"file_path":"/repo/src/widget.rs","content":"..."}}]}}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Bash","input":{"command":"cargo test -p widget\necho done"}},{"type":"tool_use","name":"Edit","input":{"file_path":"/repo/src/widget.rs"}},{"type":"tool_use","name":"Bash","input":{"command":"cargo test -p widget"}}]}}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Scaffold and tests landed in widget.rs; the remaining piece is the CLI flag, which I had not started when interrupted."}]}}"#,
+        ]
+        .join("\n");
+        let mut rev = Revivable {
+            label: "widget".into(),
+            agent_id: Some("agent-1".into()),
+            phase: 0,
+            state: "error".into(),
+            error: Some("session limit".into()),
+            tokens: 0,
+            tool_calls: 4,
+            prompt: Some("Full lane task: impl…".into()), // the ~400-char preview, to be replaced
+            files: vec![],
+            commands: vec![],
+            last_note: None,
+        };
+        mine_transcript(&lines, &mut rev);
+        assert_eq!(
+            rev.prompt.as_deref(),
+            Some("Full lane task: implement the widget end to end."),
+            "the FULL first user prompt replaces the preview"
+        );
+        assert_eq!(
+            rev.files,
+            vec!["/repo/src/widget.rs"],
+            "Write + Edit of one file dedupe"
+        );
+        assert_eq!(rev.commands, vec!["cargo test -p widget"], "first line only, deduped");
+        assert!(rev
+            .last_note
+            .as_deref()
+            .is_some_and(|n| n.starts_with("Scaffold and tests landed")));
     }
 }
