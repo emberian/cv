@@ -17,7 +17,16 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=CV_BUILD_SHA");
     if let Some(dir) = git(&["rev-parse", "--absolute-git-dir"]) {
+        // `HEAD` alone is not enough: on a branch it holds `ref: refs/heads/<name>` and does not
+        // change when you commit — only the ref file does. Watching just `HEAD` left the embedded
+        // sha (and its `-dirty` suffix) stale for every commit made on the same branch, which is
+        // exactly the case `cv --version` exists to make checkable. Watch the resolved ref too,
+        // plus `packed-refs` for when the ref has been packed away and has no loose file.
         println!("cargo:rerun-if-changed={dir}/HEAD");
+        println!("cargo:rerun-if-changed={dir}/packed-refs");
+        if let Some(r) = git(&["symbolic-ref", "--quiet", "HEAD"]) {
+            println!("cargo:rerun-if-changed={dir}/{r}");
+        }
     }
     let sha = std::env::var("CV_BUILD_SHA")
         .ok()
