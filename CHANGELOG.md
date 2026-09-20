@@ -157,40 +157,40 @@ harness reads one back through the registered export sources, tolerant of the 0.
 that differs is `source_path`, which honestly names the document the reader actually opened. The
 browser's whole camelCase translation layer is gone with it.
 
-### Names and numbers that disagreed with themselves
+### One name per thing, enforced
+
+The release's thesis applied to itself. cv answers the same questions through several doors —
+`cv <cmd> --json`, the daemon's HTTP API, the MCP tools, the desktop app — and a consumer should
+never have to ask which door a row came through before reading it. Asking each door the same
+questions, and sweeping every type that carries both a serde spelling and a canonical accessor,
+turned up six places where it mattered:
 
 - **A harness had two spellings.** `Harness` derived `rename_all = "lowercase"`, which spells the
   *variant*, so `KimiCode` serialized as `"kimicode"` while `as_str()`, `cv --harness` and
-  `cv ls --json` all said `"kimi-code"`. A consumer filtering on the name got nothing back from
+  `cv ls --json` all said `"kimi-code"`. Filtering on the name returned nothing from
   `cv show --json`. Serde goes through the canonical name now, for all five hyphenated harnesses.
-- **An instant had three spellings.** The same timestamp came back `…Z` from `/api/sessions`,
-  `…+00:00` from `/api/search` and `cv ls --json`. Every door uses `to_rfc3339()` now.
+- **An instant had three spellings**: `…Z` from `/api/sessions`, `…+00:00` from `/api/search` and
+  from the CLI. Every door uses `to_rfc3339()`.
+- **Sub-agent provenance was dropped twice.** `/api/touched` and `/api/session/…/events` both
+  omitted the `agent_id`/`parent_id`/`workflow` trio they had always carried, so a caller could not
+  tell a top-level run from one lane of a workflow.
+- **Compactions were the odd list out.** That route was the only one wrapped in an object rather
+  than served bare, and renamed two fields on the way: the CLI's `boundary_msg_idx` was `index`,
+  its `pre_compaction_span` was `pre_span`. The daemon serializes the same struct the CLI does now,
+  and adds `headline` rather than renaming anything.
+- **Session rows were missing two keys** (`path`, `size_bytes`) from the daemon, so its rows were
+  not the row §3 describes.
 - **Codex session sizes were badly wrong in `cv ls`.** A rollout over 8 MB is sampled rather than
-  read, and the estimate extrapolated from the head — which is where a rollout keeps its largest and
-  least representative records. On a real 10.9 MB session it reported 74 against a true 198.
-  Extrapolating from every sampled byte instead gives 189. Across three real rollouts the error fell
-  from 63%, 58% and 25% to 4.5%, 19% and 1.6%.
+  read, and the estimate extrapolated from the head — exactly where a rollout keeps its largest and
+  least representative records. A real 10.9 MB session reported 74 messages against a true 198.
+  Extrapolating from every sampled byte gives 189; across three rollouts the error fell from 63%,
+  58% and 25% to 4.5%, 19% and 1.6%.
 
-### Door parity, now enforced
-
-cv answers the same questions through several doors: `cv <cmd> --json`, the daemon's HTTP API, the
-MCP tools, the desktop app. A consumer should never have to ask which door a row came through
-before reading it. Scanning every shared noun found three more places where it did matter, on top
-of the ones already fixed above:
-
-- `/api/session/<h>/<id>/events` dropped the `agent_id`/`parent_id`/`workflow` trio, so a caller
-  could not tell a top-level run from one lane of a workflow — the same gap `/api/touched` had.
-- `/api/session/<h>/<id>/compactions` was the only list in the API wrapped in an object rather than
-  served bare, and it renamed two fields on the way out: the CLI's `boundary_msg_idx` was `index`
-  and its `pre_compaction_span` was `pre_span`. Same facts, different names, depending on the door.
-
-`crates/cvd/tests/parity.rs` is the thing that notices next time. It asks the CLI and the daemon
-the same questions and compares key sets, allowing a door to ADD a field but never to rename or
-drop one. It also pins the timestamp spelling and the rule that a list is a bare array. Verified
-the way a guard should be: by renaming a field and watching it fail.
-
-A sweep of every enum that carries both a serde spelling and a canonical accessor — the shape of
-the `kimi-code`/`kimicode` bug — found no remaining case where a type spells itself two ways.
+`crates/cvd/tests/parity.rs` is what notices next time: it asks both doors the same questions and
+compares key sets, allowing a door to ADD a field but never to rename or drop one, and pins the
+timestamp spelling and the rule that a list is a bare array. It was verified the way a guard should
+be — rename a field, watch it fail, put it back, watch it pass. The enum sweep found no remaining
+type that spells itself two ways.
 
 ### Also in this release
 
