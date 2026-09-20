@@ -26,7 +26,7 @@ set -uo pipefail
 
 PUG="${PUG:-$HOME/pug}"
 CV_REPO="${CV_REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
-FORMATS="$CV_REPO/formats"
+FORMATS="$CV_REPO/crates/cv-core/formats"
 PULL=0
 
 # harness(manifest stem) : checkout dir under $PUG : paths inside the checkout that hold the

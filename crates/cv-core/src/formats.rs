@@ -61,7 +61,7 @@ use std::path::{Path, PathBuf};
 macro_rules! manifests {
     ($($name:literal),+ $(,)?) => {
         pub const MANIFEST_SOURCES: &[(&str, &str)] = &[
-            $( ($name, include_str!(concat!("../../../formats/", $name, ".toml"))) ),+
+            $( ($name, include_str!(concat!("../formats/", $name, ".toml"))) ),+
         ];
     };
 }
