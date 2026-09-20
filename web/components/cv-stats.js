@@ -1,14 +1,22 @@
-// <cv-stats> — a small, tasteful stats dashboard over the loaded session pool.
+// <cv-stats> — the stats dashboard, in two clearly separated halves.
 //
 // API: stats.sessions = Session[]   (setter)
 //
-// Totals, per-harness counts, message counts, top cwds, date range, token
-// sums. Charts are hand-rolled CSS bars + a tiny inline SVG activity sparkline.
-// No chart library.
+// The split is the point. Some numbers are true of the whole archive (how many sessions, how
+// many messages, which harnesses, which directories); others can only be true of the transcripts
+// this page has actually downloaded (tokens, cost, message kinds, block types). Mixing them in
+// one grid produced a "Messages: 1,684" tile beside a "Sessions: 6,873" tile, which is two
+// different questions answered as if they were one.
+//
+// So: the CORPUS half comes from `/api/stats` when a daemon is there (and from the stub pool
+// when it isn't, which is still archive-wide because the pool is every session's metadata); the
+// OPENED half is headed with exactly how many transcripts it covers. Charts are hand-rolled CSS
+// bars + a tiny inline SVG activity histogram. No chart library.
 import {
   esc, fmtTime, sortTime, shortPath, sumTokens, msgCount, HARNESS_LABELS,
   messageKindLabel, ORIGIN_LABELS, fmtCost,
 } from "./util.js";
+import { getCorpusStats } from "./hydrate.js";
 
 // Semantic, not decorative: conversation reads in the transcript's own rail colors, machinery in
 // muted, and the things you would want to notice (errors, compaction) in the warning palette.
@@ -36,12 +44,27 @@ class CvStats extends HTMLElement {
   constructor() {
     super();
     this._sessions = [];
+    this._corpus = null;     // `/api/stats` answered
+    this._asked = false;
   }
 
-  set sessions(arr) { this._sessions = Array.isArray(arr) ? arr : []; this.render(); }
+  set sessions(arr) { this._sessions = Array.isArray(arr) ? arr : []; this.render(); this._askCorpus(); }
   get sessions() { return this._sessions; }
 
-  connectedCallback() { this.render(); }
+  connectedCallback() { this.render(); this._askCorpus(); }
+
+  /** Ask the daemon for the numbers no browser-side tally can reach — chiefly the real message
+   *  total, which is 3.9 million here and would need every transcript downloaded to compute.
+   *  Once; a null answer (static demo, older cvd) just leaves the pool's own figures in place.
+   *
+   *  `/api/stats` also takes `q=`, the session-filter expression of `cv stats --query`. That is a
+   *  different language from the search box's free text, so nothing forwards one as the other. */
+  async _askCorpus() {
+    if (this._asked || !this._sessions.length) return;
+    this._asked = true;
+    const corpus = await getCorpusStats();
+    if (corpus) { this._corpus = corpus; this.render(); }
+  }
 
   _compute() {
     const sessions = this._sessions;
@@ -101,72 +124,141 @@ class CvStats extends HTMLElement {
     };
   }
 
+  /** What the whole archive is, preferring the daemon's answer over anything tallied here. */
+  _archive(c) {
+    const k = this._corpus;
+    if (!k) {
+      return {
+        source: `tallied from the ${c.sessions.toLocaleString()} session${c.sessions === 1 ? "" : "s"} loaded in this page`,
+        sessions: c.sessions,
+        messages: c.messages,
+        perHarness: c.perHarness,
+        cwds: c.cwds,
+        projects: c.projects,
+        range: c.range,
+      };
+    }
+    const perHarness = new Map(Object.entries(k.by_harness || {})
+      .map(([h, n]) => [String(h).toLowerCase(), n])
+      .sort((a, b) => b[1] - a[1]));
+    const at = (t) => (t ? new Date(t).getTime() : 0);
+    return {
+      source: "every session on this machine · cv stats",
+      sessions: k.sessions,
+      messages: k.messages,
+      perHarness,
+      cwds: (k.top_cwds || []).slice(0, 6).map((r) => [r.cwd, r.sessions]),
+      projects: null,             // /api/stats reports the top directories, not a distinct count
+      range: k.earliest_created ? [at(k.earliest_created), at(k.latest_updated)] : c.range,
+    };
+  }
+
   render() {
     if (!this._sessions.length) {
       this.innerHTML = `<div class="view-empty muted"><p>No sessions loaded.</p></div>`;
       return;
     }
     const c = this._compute();
+    const a = this._archive(c);
 
-    const cards = [
-      ["Sessions", c.sessions.toLocaleString()],
-      ["Messages", c.messages.toLocaleString()],
-      ["Projects", c.projects.toLocaleString()],
-      ["Harnesses", c.perHarness.size],
+    const tiles = (rows) => rows.map(([k, v, title]) =>
+      `<div class="stat-card"${title ? ` title="${esc(title)}"` : ""}>
+         <div class="stat-num">${esc(String(v))}</div>
+         <div class="stat-label muted">${esc(k)}</div>
+       </div>`).join("");
+
+    const archiveTiles = tiles([
+      ["Sessions", a.sessions.toLocaleString()],
+      ["Messages", a.messages.toLocaleString()],
+      ["Harnesses", a.perHarness.size],
+      ...(a.projects != null ? [["Directories", a.projects.toLocaleString()]] : []),
+    ]);
+
+    // The second half is about downloaded transcripts and says so in its own heading, so its
+    // tiles never have to caveat themselves one by one.
+    const openTiles = tiles([
+      ["Messages read", c.hydrated ? this._readCount(c).toLocaleString() : "—"],
       ["Input tokens", c.tokIn ? c.tokIn.toLocaleString() : "—"],
       ["Output tokens", c.tokOut ? c.tokOut.toLocaleString() : "—"],
-      // Only the harnesses that record a cost contribute one, so the tile stays a dash for a
+      ...(c.tokCache ? [["Cache reads", c.tokCache.toLocaleString()]] : []),
+      ...(c.tokReason ? [["Reasoning tokens", c.tokReason.toLocaleString()]] : []),
+      // Only the harnesses that record a cost contribute one, so the tile stays absent for a
       // Claude-and-Codex corpus rather than claiming a spend of zero.
       ...(c.cost != null ? [["Reported cost", fmtCost(c.cost)]] : []),
-      ...(c.tokReason ? [["Reasoning tokens", c.tokReason.toLocaleString()]] : []),
-    ].map(([k, v]) => `<div class="stat-card"><div class="stat-num">${esc(String(v))}</div><div class="stat-label muted">${esc(k)}</div></div>`).join("");
+    ]);
 
-    // Honest disclosure: message-level charts only reflect sessions whose transcript is loaded.
-    const unhydrated = c.sessions - c.hydrated;
-    const note = unhydrated > 0
-      ? `<div class="stat-note muted">Role, block &amp; token breakdowns reflect the ${c.hydrated.toLocaleString()} opened session${c.hydrated === 1 ? "" : "s"} — open more to enrich them. (${unhydrated.toLocaleString()} not yet loaded.)</div>`
-      : "";
+    const span = a.range
+      ? `${esc(fmtTime(new Date(a.range[0]).toISOString()))} → ${esc(fmtTime(new Date(a.range[1]).toISOString()))}`
+      : "no timestamps";
 
-    const needsHydration = (map, label) =>
+    const unopened = a.sessions - c.hydrated;
+    const openedHead = c.hydrated
+      ? `${c.hydrated.toLocaleString()} of ${a.sessions.toLocaleString()} transcript${a.sessions === 1 ? "" : "s"} downloaded — these panels describe only those`
+      : `nothing downloaded yet — open a session and these fill in`;
+
+    const bars = (map, label) =>
       map.size ? this._barsHtml(map, ...label) : `<p class="muted">${c.hydrated ? "none" : "open a session to populate"}</p>`;
 
     this.innerHTML = `
-      <div class="view-head"><h2>📊 Stats</h2>
-        <span class="muted">${c.range ? `${esc(fmtTime(new Date(c.range[0]).toISOString()))} → ${esc(fmtTime(new Date(c.range[1]).toISOString()))}` : "no timestamps"}</span>
-      </div>
-      <div class="stat-grid">${cards}</div>
-      ${note}
-      <div class="stat-cols">
+      <div class="view-head"><h2>📊 Stats</h2><span class="muted">${span}</span></div>
+
+      <section class="stat-section">
+        <div class="stat-section-head">
+          <h3>The archive</h3>
+          <span class="stat-source muted">${esc(a.source)}</span>
+        </div>
+        <div class="stat-grid">${archiveTiles}</div>
+        <div class="stat-cols">
+          <section class="stat-block">
+            <h3>Sessions per harness</h3>
+            ${this._barsHtml(a.perHarness, (k) => HARNESS_LABELS[k] || k, (k) => `var(--h-${k}, var(--accent))`)}
+          </section>
+          <section class="stat-block">
+            <h3>Top working directories</h3>
+            ${a.cwds.length ? `<ul class="cwd-list">${a.cwds.map(([p, n]) => `<li><span class="cwd-path" title="${esc(p)}">${esc(shortPath(p, 3))}</span><span class="cwd-count muted">${n.toLocaleString()}</span></li>`).join("")}</ul>` : '<p class="muted">none recorded</p>'}
+          </section>
+        </div>
         <section class="stat-block">
-          <h3>Sessions per harness</h3>
-          ${this._barsHtml(c.perHarness, (k) => HARNESS_LABELS[k] || k, (k) => `var(--h-${k}, var(--accent))`)}
+          <h3>Activity over time</h3>
+          ${this._sparkHtml(c.times)}
+          <p class="stat-source muted">one bar per period, over the ${c.times.length.toLocaleString()} dated session${c.times.length === 1 ? "" : "s"} in this list</p>
         </section>
-        <section class="stat-block">
-          <h3>Messages by kind</h3>
-          ${needsHydration(c.perKind, [(k) => messageKindLabel(k), (k) => KIND_COLOR[k] || "var(--accent)"])}
-        </section>
-        <section class="stat-block">
-          <h3>Where they came from</h3>
-          ${needsHydration(c.perOrigin, [(k) => ORIGIN_LABELS[k] || k, (k) => ORIGIN_COLOR[k] || "var(--fg-muted)"])}
-        </section>
-        <section class="stat-block">
-          <h3>Block types</h3>
-          ${needsHydration(c.blockKinds, [(k) => k, () => "var(--h-codex)"])}
-        </section>
-        <section class="stat-block">
-          <h3>Messages by role</h3>
-          ${needsHydration(c.perRole, [(k) => k, () => "var(--fg-muted)"])}
-        </section>
-        <section class="stat-block">
-          <h3>Top working directories</h3>
-          ${c.cwds.length ? `<ul class="cwd-list">${c.cwds.map(([p, n]) => `<li><span class="cwd-path" title="${esc(p)}">${esc(shortPath(p, 3))}</span><span class="cwd-count muted">${n}</span></li>`).join("")}</ul>` : '<p class="muted">none recorded</p>'}
-        </section>
-      </div>
-      <section class="stat-block">
-        <h3>Activity over time</h3>
-        ${this._sparkHtml(c.times)}
+      </section>
+
+      <section class="stat-section">
+        <div class="stat-section-head">
+          <h3>Opened transcripts</h3>
+          <span class="stat-source muted">${esc(openedHead)}</span>
+        </div>
+        <div class="stat-grid">${openTiles}</div>
+        <div class="stat-cols">
+          <section class="stat-block">
+            <h3>Messages by kind</h3>
+            ${bars(c.perKind, [(k) => messageKindLabel(k), (k) => KIND_COLOR[k] || "var(--accent)"])}
+          </section>
+          <section class="stat-block">
+            <h3>Where they came from</h3>
+            ${bars(c.perOrigin, [(k) => ORIGIN_LABELS[k] || k, (k) => ORIGIN_COLOR[k] || "var(--fg-muted)"])}
+          </section>
+          <section class="stat-block">
+            <h3>Block types</h3>
+            ${bars(c.blockKinds, [(k) => k, () => "var(--h-codex)"])}
+          </section>
+          <section class="stat-block">
+            <h3>Messages by role</h3>
+            ${bars(c.perRole, [(k) => k, () => "var(--fg-muted)"])}
+          </section>
+        </div>
+        ${unopened > 0 ? `<p class="stat-note muted">${unopened.toLocaleString()} session${unopened === 1 ? "" : "s"} in the archive have not been opened here, so none of their messages, tokens or cost are counted above.</p>` : ""}
       </section>
     `;
+  }
+
+  /** Messages actually downloaded — the denominator the second half is really about. */
+  _readCount(c) {
+    let n = 0;
+    for (const s of this._sessions) n += s.messages?.length || 0;
+    return n;
   }
 
   _barsHtml(map, labelFn, colorFn) {
@@ -177,7 +269,7 @@ class CvStats extends HTMLElement {
       <div class="bar-row">
         <span class="bar-label">${esc(labelFn(k))}</span>
         <span class="bar-track"><span class="bar-fill" style="width:${(v / max * 100).toFixed(1)}%; background:${colorFn(k)}"></span></span>
-        <span class="bar-val muted">${v}</span>
+        <span class="bar-val muted">${v.toLocaleString()}</span>
       </div>`).join("")}</div>`;
   }
 

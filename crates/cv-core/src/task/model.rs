@@ -395,7 +395,9 @@ pub fn harness_family(harness: Harness) -> Option<&'static str> {
         Harness::Qwen => Some("alibaba"),
         Harness::Kimi | Harness::KimiCode => Some("moonshot"),
         Harness::Hermes => Some("nous"),
-        // Model-agnostic multiplexers: could be running anything.
+        // Model-agnostic multiplexers: could be running anything. `OpenSession` joins them
+        // because a document names the harness it came from — by the time a session is one, the
+        // family is whatever that harness was, and the wrapper itself says nothing.
         Harness::OpenCode
         | Harness::OpenClaw
         | Harness::Cursor
@@ -404,7 +406,8 @@ pub fn harness_family(harness: Harness) -> Option<&'static str> {
         | Harness::Roo
         | Harness::Continue
         | Harness::Goose
-        | Harness::Zed => None,
+        | Harness::Zed
+        | Harness::OpenSession => None,
     }
 }
 

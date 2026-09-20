@@ -3,25 +3,18 @@
 //! These read [`cv_core::sessions`] (the probed catalog — milliseconds warm, transparently a full
 //! discovery when cold/stale); `cv ls --fresh` forces [`cv_core::discover_all`]'s full scan.
 
-use crate::util::{dim_cwd, home_rel, parse_harness, session_row, short_id};
+use crate::util::{dim_cwd, parse_harness, session_row, short_id};
 use anyhow::Result;
 use cv_core::ir::{truncate, SessionRef};
 use cv_core::sanitize::sanitize_line;
 
-/// Apply a parsed query to a ref list in place: prune with the catalog-cheap prefilter, then — if
-/// the query has any parse/index/events term — parse each survivor and keep only full matches. Used
-/// by `ls`/`timeline`/`stats` so they all speak the same `-q`.
+/// Apply a parsed query to a ref list in place. The two-phase filter itself is
+/// [`cv_core::query::filter_refs`] — shared with `cvd`'s `/api/stats?q=`, so `ls`/`timeline`/
+/// `stats` and the daemon all speak exactly the same `-q`; the CLI only supplies the `text:`
+/// resolution, which needs the tantivy index cv-core cannot depend on.
 fn apply_query(refs: &mut Vec<SessionRef>, query: &Option<cv_core::SessionQuery>) {
     let Some(q) = query else { return };
-    refs.retain(|r| q.prefilter(r));
-    if q.needs_parse() || q.needs_index() || q.needs_events() || q.needs_forest() {
-        let text_sets = crate::cmd::query::TextSets::resolve(q);
-        refs.retain(|r| {
-            cv_core::harness::for_harness(r.harness)
-                .and_then(|a| cv_core::stream::collect_with(a.as_ref(), r, &cv_core::ParseOptions::lazy()).ok())
-                .is_some_and(|s| crate::cmd::query::matches_full(q, r, &s, &text_sets))
-        });
-    }
+    crate::cmd::query::filter_refs(refs, q, &crate::cmd::query::text_sets(q));
 }
 
 /// Session rows for `--json` listings: the SAME refs the table would print (the `exists()` guard —
@@ -228,54 +221,17 @@ pub(crate) fn cmd_timeline(
 // ---------- stats ----------
 
 pub(crate) fn cmd_stats(query: Option<String>, json: bool) -> Result<()> {
-    use std::collections::HashMap;
     let query = crate::cmd::query::build(query)?;
     let mut refs = cv_core::sessions();
     apply_query(&mut refs, &query);
-    let total = refs.len();
-
-    let mut per_harness: HashMap<&'static str, usize> = HashMap::new();
-    let mut per_cwd: HashMap<String, usize> = HashMap::new();
-    let mut total_messages: usize = 0;
-    let mut min_created: Option<chrono::DateTime<chrono::Utc>> = None;
-    let mut max_updated: Option<chrono::DateTime<chrono::Utc>> = None;
-
-    for r in &refs {
-        *per_harness.entry(r.harness.as_str()).or_default() += 1;
-        total_messages += r.message_count;
-        let cwd = r.cwd.as_deref().map(home_rel).unwrap_or_else(|| "(no cwd)".into());
-        *per_cwd.entry(cwd).or_default() += 1;
-        if let Some(c) = r.created_at {
-            min_created = Some(min_created.map_or(c, |m| m.min(c)));
-        }
-        if let Some(u) = r.updated_at {
-            max_updated = Some(max_updated.map_or(u, |m| m.max(u)));
-        }
-    }
-    let mut hv: Vec<_> = per_harness.into_iter().collect();
-    hv.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
-    let mut cv: Vec<_> = per_cwd.into_iter().collect();
-    cv.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    // The aggregation and the `--json` payload both live in `cv_core::stats`, so `cv stats --json`
+    // and `cvd`'s `/api/stats` are the same six numbers computed once — the dashboard used to
+    // accumulate its own from whichever sessions the user had happened to open.
+    let s = cv_core::stats::CorpusStats::compute(&refs);
+    let total = s.sessions;
 
     if json {
-        let by_harness: serde_json::Map<String, serde_json::Value> =
-            hv.iter().map(|(h, n)| (h.to_string(), serde_json::json!(n))).collect();
-        let top_cwds: Vec<serde_json::Value> = cv
-            .iter()
-            .take(10)
-            .map(|(c, n)| serde_json::json!({ "cwd": c, "sessions": n }))
-            .collect();
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "sessions": total,
-                "messages": total_messages,
-                "by_harness": by_harness,
-                "top_cwds": top_cwds,
-                "earliest_created": min_created.map(|d| d.to_rfc3339()),
-                "latest_updated": max_updated.map(|d| d.to_rfc3339()),
-            }))?
-        );
+        println!("{}", serde_json::to_string_pretty(&s.to_json())?);
         return Ok(());
     }
 
@@ -290,28 +246,28 @@ pub(crate) fn cmd_stats(query: Option<String>, json: bool) -> Result<()> {
     }
 
     println!("✦ clustervision fleet stats\n");
-    println!("{total} session(s) · {total_messages} message(s)\n");
+    println!("{total} session(s) · {} message(s)\n", s.messages);
 
     println!("by harness:");
-    for (h, n) in hv {
+    for (h, n) in &s.by_harness {
         println!("  {h:12} {n:>5}");
     }
 
     println!("\ntop cwds:");
-    for (c, n) in cv.into_iter().take(10) {
-        println!("  {n:>5}  {}", truncate(&c, 70));
+    for (c, n) in s.top_cwds.iter().take(cv_core::stats::TOP_CWDS) {
+        println!("  {n:>5}  {}", truncate(c, 70));
     }
 
     println!("\ndate range:");
     println!(
         "  earliest created: {}",
-        min_created
+        s.earliest_created
             .map(|d| crate::util::fmt_local(d, "%Y-%m-%d %H:%M"))
             .unwrap_or_else(|| "?".into())
     );
     println!(
         "  latest updated:   {}",
-        max_updated
+        s.latest_updated
             .map(|d| crate::util::fmt_local(d, "%Y-%m-%d %H:%M"))
             .unwrap_or_else(|| "?".into())
     );

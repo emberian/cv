@@ -288,3 +288,78 @@ export async function getSubagent(parentHarness, parentId, agentId) {
   full._stub = false;
   return full;
 }
+
+// ---------------------------------------------------------------------------
+// Corpus-wide reads. These two ask the daemon a question the browser cannot answer for itself:
+// the pool the UI holds is session *stubs*, so it can match a title but never a message body,
+// and it can count sessions but never messages it has not downloaded. Both return `null` when
+// the endpoint isn't there (the static demo, an older cvd) — every caller keeps a local answer
+// for that case and says which one it is showing.
+// ---------------------------------------------------------------------------
+
+/** `GET /api/search?q=&limit=&harness=&cwd=&semantic=1` — full-text (or embedding) search over
+ *  every session's content, returning the rows `cv search --json` emits: the §3 session row plus
+ *  `score`, `snippet`, and the sub-agent provenance `agent_id` / `parent_id` / `workflow`.
+ *
+ *  `null` means "this deployment cannot search" (404 / unreachable / no cvd), which is a
+ *  different answer from `[]` ("searched, found nothing") — the caller falls back to filtering
+ *  the loaded stubs and says so in the placeholder. */
+export async function searchSessions(q, opts = {}) {
+  const query = String(q ?? "").trim();
+  if (!query) return [];
+  const params = new URLSearchParams({ q: query });
+  if (opts.limit) params.set("limit", String(opts.limit));
+  if (opts.harness) params.set("harness", opts.harness);
+  if (opts.cwd) params.set("cwd", opts.cwd);
+  if (opts.semantic) params.set("semantic", "1");
+  try {
+    const resp = await fetch(`${CVD_BASE}/api/search?${params}`, {
+      headers: { Accept: "application/json" },
+      signal: opts.signal,
+    });
+    if (!resp.ok) return null;
+    const raw = await resp.json();
+    return Array.isArray(raw) ? raw : null;
+  } catch (e) {
+    if (e?.name === "AbortError") throw e; // a superseded keystroke, not a missing endpoint
+    return null;
+  }
+}
+
+/** One cheap probe for whether this deployment can search at all, so the search box can promise
+ *  the right thing from the first keystroke instead of discovering it on the first miss.
+ *  Resolves "server" or "local"; never throws, never blocks longer than `ms`. */
+export async function probeSearch(ms = 3500) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), ms);
+  try {
+    const resp = await fetch(`${CVD_BASE}/api/search?q=cv&limit=1`, {
+      headers: { Accept: "application/json" },
+      signal: ctrl.signal,
+    });
+    return resp.ok ? "server" : "local";
+  } catch {
+    return "local";
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** `GET /api/stats?q=` — corpus-wide analytics, exactly what `cv stats --json` emits:
+ *  `{ sessions, messages, by_harness, top_cwds, earliest_created, latest_updated }`.
+ *
+ *  `q` is the *session-filter* expression `cv stats --query` takes (see `cv schema`) — a
+ *  different language from the search box's free text, so the UI does not forward one as the
+ *  other. `null` when the endpoint is absent; the caller then computes what the pool can support
+ *  and labels it as such. */
+export async function getCorpusStats(q) {
+  try {
+    const qs = q ? `?q=${enc(q)}` : "";
+    const resp = await fetch(`${CVD_BASE}/api/stats${qs}`, { headers: { Accept: "application/json" } });
+    if (!resp.ok) return null;
+    const raw = await resp.json();
+    return raw && typeof raw === "object" && typeof raw.sessions === "number" ? raw : null;
+  } catch {
+    return null;
+  }
+}

@@ -32,6 +32,9 @@ pub mod kimi_code;
 pub mod lmstudio;
 pub mod openclaw;
 pub mod opencode;
+/// cv's own **OpenSession** interchange documents (`docs/OPENSESSION.md`) — the format
+/// `cv export --format json` writes — read back into the IR.
+pub mod opensession;
 pub mod qwen;
 pub mod roo;
 #[cfg(feature = "sqlite")]
@@ -210,6 +213,7 @@ pub fn all() -> Vec<Box<dyn Adapter>> {
         Box::new(continuedev::Continue::new()),
         Box::new(export::ChatGptExport::new()),
         Box::new(export::ClaudeExport::new()),
+        Box::new(opensession::OpenSession::new()),
     ];
     #[cfg(feature = "sqlite")]
     {

@@ -16,10 +16,30 @@ use std::path::PathBuf;
 macro_rules! harnesses {
     ($( $(#[$meta:meta])* $name:ident => $str:literal ),+ $(,)?) => {
         /// Which agent harness a session came from.
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-        #[serde(rename_all = "lowercase")]
+        ///
+        /// Serde goes through [`Harness::as_str`] and [`Harness::parse`], NOT a derived
+        /// `rename_all`: the derive spells a variant name in lowercase, so `KimiCode` serialized as
+        /// `"kimicode"` while `as_str` (and `cv --harness`, and `cv ls --json`) said `"kimi-code"`.
+        /// The same field therefore had two spellings depending on which door you asked — exactly
+        /// the ambiguity `docs/INTERFACE-V2.md` §3 exists to remove — and the five hyphenated
+        /// harnesses were the ones that suffered.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
         pub enum Harness {
             $( $(#[$meta])* $name, )+
+        }
+
+        impl serde::Serialize for Harness {
+            fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                s.serialize_str(self.as_str())
+            }
+        }
+
+        impl<'de> serde::Deserialize<'de> for Harness {
+            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                let s = String::deserialize(d)?;
+                Harness::parse(&s)
+                    .ok_or_else(|| serde::de::Error::custom(format!("unknown harness {s:?}")))
+            }
         }
 
         impl Harness {
@@ -76,6 +96,11 @@ harnesses! {
     ChatGptExport => "chatgpt-export",
     /// Claude.ai account **data export** (`conversations.json`, linear `chat_messages[]`).
     ClaudeExport => "claude-export",
+    /// cv's own **OpenSession** interchange documents (`docs/OPENSESSION.md`) — what
+    /// `cv export --format json` writes, read back in. A document names the harness it came
+    /// from, so a parsed session keeps that harness; this variant is what *discovery* tags a
+    /// `.opensession.json` file with, and what a document with no (or an unknown) `harness` gets.
+    OpenSession => "opensession",
 }
 
 impl Harness {
@@ -102,6 +127,7 @@ impl Harness {
             "zed" | "zed-editor" => Harness::Zed,
             "chatgpt-export" | "openai-export" | "chatgpt-data" | "openai-data" => Harness::ChatGptExport,
             "claude-export" | "claude-ai" | "claudeai" | "claude-data" => Harness::ClaudeExport,
+            "opensession" | "open-session" | "open_session" => Harness::OpenSession,
             _ => return None,
         })
     }
@@ -816,6 +842,36 @@ pub fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One spelling of a harness name on every door. Serde used to derive `rename_all =
+    /// "lowercase"`, which spells the VARIANT — so `KimiCode` serialized as `"kimicode"` while
+    /// `as_str()`, `cv --harness` and `cv ls --json` all said `"kimi-code"`, and a consumer
+    /// filtering on the name got nothing back from `cv show --json`. Five hyphenated harnesses
+    /// were affected.
+    #[test]
+    fn harness_serializes_as_its_canonical_name() {
+        for h in Harness::ALL {
+            let json = serde_json::to_string(&h).expect("serialize");
+            assert_eq!(
+                json,
+                format!("{:?}", h.as_str()),
+                "{h:?} must serialize as its canonical name, not its variant"
+            );
+            let back: Harness = serde_json::from_str(&json).expect("round trip");
+            assert_eq!(back, h);
+        }
+        // The spelling the rest of the CLI uses is accepted on the way back in.
+        let h: Harness = serde_json::from_str("\"kimi-code\"").unwrap();
+        assert_eq!(h, Harness::KimiCode);
+        assert!(
+            serde_json::from_str::<Harness>("\"kimicode\"").is_ok(),
+            "aliases still parse"
+        );
+        assert!(
+            serde_json::from_str::<Harness>("\"marsrover\"").is_err(),
+            "unknown is an error"
+        );
+    }
 
     /// `Harness::ALL` and `as_str` are macro-generated from one list; `parse` is hand-written
     /// (it carries aliases). This ties them together: every harness's canonical name must parse

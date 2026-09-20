@@ -268,20 +268,9 @@ pub(crate) fn continue_hint(next: usize) -> String {
 // ---------- the session row ----------
 
 /// The one JSON shape for a session in a list (`ls`, `search`, `timeline`): snake_case, always
-/// these keys. `size_bytes` is the transcript's on-disk length when the caller has it.
-pub(crate) fn session_row(r: &SessionRef, size_bytes: Option<u64>) -> serde_json::Value {
-    serde_json::json!({
-        "id": r.id,
-        "harness": r.harness.as_str(),
-        "path": r.path.to_string_lossy(),
-        "cwd": r.cwd.as_ref().map(|p| p.to_string_lossy()),
-        "title": r.title,
-        "created_at": r.created_at.map(|t| t.to_rfc3339()),
-        "updated_at": r.updated_at.map(|t| t.to_rfc3339()),
-        "message_count": r.message_count,
-        "size_bytes": size_bytes,
-    })
-}
+/// these keys. It lives in cv-core because the CLI is not the only door onto it — `cvd`'s
+/// `/api/search` emits the same row, and §3 only holds if there is one implementation.
+pub(crate) use cv_core::rows::session_row;
 
 // ---------- display ----------
 

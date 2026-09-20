@@ -449,7 +449,7 @@ pub(crate) fn cmd_dataset(
     // Pre-resolve any `text:` predicates against the full-text index (one search per needle).
     let text_sets = query
         .as_ref()
-        .map(crate::cmd::query::TextSets::resolve)
+        .map(crate::cmd::query::text_sets)
         .unwrap_or_else(crate::cmd::query::TextSets::empty);
     let mut writer: Box<dyn Write> = match &out {
         Some(p) => Box::new(std::io::BufWriter::new(fs::File::create(p)?)),

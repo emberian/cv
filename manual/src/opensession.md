@@ -12,34 +12,43 @@ The full spec lives at **[docs/OPENSESSION.md](https://github.com/emberian/cv/bl
 
 ```jsonc
 {
-  "openSession": "0.2",
+  "open_session": "0.3",
   "id": "…",
   "harness": "claude",            // origin hint, not identity
   "title": "…",
   "cwd": "/Users/you/project",    // metadata, NOT identity (see below)
-  "model": "claude-opus-4-…",
+  "model": "claude-opus-4-…",     // session default; a message names one only when it differs
+  "system_prompt": "…",           // what the harness actually sent, when it stores it
+  "lineage": { "forked_from": "…", "parent": "…", "continued_in": "…" },
   "messages": [
     {
-      "role": "user",            // user · assistant · system · tool
+      "role": "user",            // WHO spoke: user · assistant · system · tool
+      "kind": "prompt",          // WHAT the turn is: prompt · reply · tool_result ·
+                                 //   injected_context · notice · compaction_boundary · error · …
+      "origin": "human",         // WHERE it came from: human · model · harness · hook ·
+                                 //   scheduler · subagent · import
       "timestamp": "2026-…Z",
       "content": [               // an ordered list of typed blocks
-        { "kind": "text", "text": "…" },
-        { "kind": "thinking", "text": "…", "signature": "…", "redacted": false },
-        { "kind": "toolUse", "id": "…", "name": "run_shell", "input": { … } },
-        { "kind": "toolResult", "toolUseId": "…", "content": "…", "isError": false },
-        { "kind": "file", "mime": "…", "path": "…" },
-        { "kind": "image", "mediaType": "image/png", "dataRef": "…" }
-      ]
+        { "type": "text", "text": "…" },
+        { "type": "thinking", "text": "…", "signature": "…", "redacted": false },
+        { "type": "tool_use", "id": "…", "name": "run_shell", "input": { }, "namespace": "…" },
+        { "type": "tool_result", "tool_use_id": "…", "content": "…", "is_error": false },
+        { "type": "file", "mime": "…", "path": "…" },
+        { "type": "image", "media_type": "image/png", "data_ref": "…" }
+      ],
+      "extra": { "claude": { } } // namespaced passthrough: one bag per harness
     }
   ]
 }
 ```
 
-> **Spelling note.** The OpenSession document above is camelCase, as published. cv's *own*
-> machine output is not: since 0.11.0 every `cv --json` payload and every MCP payload is
-> **snake_case** (`tool_use_id`, `media_type`, `message_count`), a message carries `kind` and
-> `origin`, and a block is tagged `type` rather than `kind`. If you are consuming `cv`, follow
-> [`cv schema --json`](cli.md#cv-schema), not this page.
+> **0.3 is the IR.** Until 0.11.0 this page showed a camelCase document with `kind`-tagged blocks
+> while cv's own output was snake_case with `type`-tagged ones, and the spec claimed the IR was its
+> reference implementation anyway — so the two described different formats while asserting they
+> were one. 0.3 resolves it in the direction that leaves one vocabulary: the spec adopts the IR.
+> `cv export --format json` emits a valid OpenSession 0.3 document, and what
+> [`cv schema --json`](cli.md#cv-schema) publishes is the same shape. A reader can still accept the
+> 0.2 spellings, and cv's does.
 
 ## The one heresy: *cwd is metadata, not identity*
 

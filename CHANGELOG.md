@@ -138,6 +138,39 @@ in CI looked at them. They are fixed, and CI looks at them now.
   name and was rejected with "Expected a JavaScript-or-Wasm module script" — which reads like a
   server misconfiguration rather than the truth. Routes still fall back; assets do not.
 
+### OpenSession 0.3 — the spec cv can actually speak
+
+cv publishes [`docs/OPENSESSION.md`](docs/OPENSESSION.md), a proposed interchange format for agent
+sessions, and told you "clustervision's in-memory IR is the reference implementation, and
+`cv export --format json` emits it". That was false on every axis: the document specified camelCase
+with blocks tagged `kind: "toolResult"` while the export emitted snake_case with
+`type: "tool_result"` and no version marker at all — and **no Rust code could read or write the
+format**. The only implementation was a dozen lines of translation in the browser.
+
+0.3 resolves it in the direction that leaves one vocabulary: the spec adopts the IR. It gains the
+concepts IR v2 added — message `kind` and `origin`, session `system_prompt` and `lineage`, tool
+`namespace`, reasoning tokens and cost — and promotes system prompts and cost out of the old
+"deliberately not in scope" list, since every harness that records them records the same thing.
+`cv export --format json` now emits a valid `open_session: "0.3"` document, and a new `opensession`
+harness reads one back through the registered export sources, tolerant of the 0.2 spellings. A real
+900-message session round-trips with an identical message, kind and block census; the one field
+that differs is `source_path`, which honestly names the document the reader actually opened. The
+browser's whole camelCase translation layer is gone with it.
+
+### Names and numbers that disagreed with themselves
+
+- **A harness had two spellings.** `Harness` derived `rename_all = "lowercase"`, which spells the
+  *variant*, so `KimiCode` serialized as `"kimicode"` while `as_str()`, `cv --harness` and
+  `cv ls --json` all said `"kimi-code"`. A consumer filtering on the name got nothing back from
+  `cv show --json`. Serde goes through the canonical name now, for all five hyphenated harnesses.
+- **An instant had three spellings.** The same timestamp came back `…Z` from `/api/sessions`,
+  `…+00:00` from `/api/search` and `cv ls --json`. Every door uses `to_rfc3339()` now.
+- **Codex session sizes were badly wrong in `cv ls`.** A rollout over 8 MB is sampled rather than
+  read, and the estimate extrapolated from the head — which is where a rollout keeps its largest and
+  least representative records. On a real 10.9 MB session it reported 74 against a true 198.
+  Extrapolating from every sampled byte instead gives 189. Across three real rollouts the error fell
+  from 63%, 58% and 25% to 4.5%, 19% and 1.6%.
+
 ### Also in this release
 
 - **`cv workflow <session> <run> --revive` salvages a dead run.** A `Workflow` run that dies

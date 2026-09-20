@@ -95,7 +95,7 @@ pub(crate) fn cmd_show(
     }
 
     if json {
-        return print_session_json(adapter.as_ref(), &r, range, window.max_bytes);
+        return print_session_json(adapter.as_ref(), &r, range, window.max_bytes, false);
     }
     // The pipe guard applies only to a selector-less, budget-less render (an explicit window or
     // budget is the caller saying what they want).
@@ -105,11 +105,18 @@ pub(crate) fn cmd_show(
 
 /// `show --json` / `export --format json`: the whole IR (incl. `extra`), windowed, and — under
 /// `--max-bytes` — cut at the budget with the continuation hint on **stderr** (stdout stays JSON).
+///
+/// `as_document` wraps the same bytes as an **OpenSession** document (`docs/OPENSESSION.md`):
+/// the IR's own serialization with `"open_session": "0.3"` as the first key. That marker belongs
+/// to a *document*, not to a `Session` — `cv show --json`, the MCP payloads and cvd all serialize
+/// the raw IR and their key sets are pinned — so it is added here, at the one boundary where cv
+/// hands a session to somebody else, and nowhere else.
 fn print_session_json(
     adapter: &dyn Adapter,
     r: &SessionRef,
     range: Option<(usize, Option<usize>)>,
     max_bytes: Option<usize>,
+    as_document: bool,
 ) -> Result<()> {
     let mut session = adapter.parse(r)?;
     let start = range.map(|(s, _)| s).unwrap_or(0);
@@ -133,7 +140,14 @@ fn print_session_json(
             session.messages.truncate(keep);
         }
     }
-    println!("{}", serde_json::to_string_pretty(&session)?);
+    if as_document {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&cv_core::harness::opensession::document(&session))?
+        );
+    } else {
+        println!("{}", serde_json::to_string_pretty(&session)?);
+    }
     Ok(())
 }
 
@@ -385,7 +399,7 @@ fn show_one_subagent(
     let range = window.bounds(|| count_messages(adapter, &sub.session))?;
 
     if json {
-        return print_session_json(adapter, &sub.session, range, window.max_bytes);
+        return print_session_json(adapter, &sub.session, range, window.max_bytes, false);
     }
 
     // A small provenance banner so the reader knows which agent (and outcome) this is.
@@ -435,7 +449,8 @@ pub(crate) fn cmd_export(id: &str, format: &str, harness: Option<String>, window
             }
             out.flush()?;
         }
-        "json" => print_session_json(adapter.as_ref(), &r, range, window.max_bytes)?,
+        // `--format json` IS OpenSession 0.3: the IR, plus the version marker.
+        "json" => print_session_json(adapter.as_ref(), &r, range, window.max_bytes, true)?,
         // HTML is one self-contained document: windowed, but never cut mid-page.
         "html" => {
             if window.max_bytes.is_some() {

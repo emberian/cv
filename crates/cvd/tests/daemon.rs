@@ -467,6 +467,16 @@ fn serve_endpoints() {
     );
     assert!(arr[0]["path"].as_str().is_some_and(|p| p.ends_with(".jsonl")), "{v}");
     assert!(arr[0]["size_bytes"].as_u64().is_some_and(|n| n > 0), "{v}");
+    // One spelling of an instant on every door. serde's chrono default writes UTC as `…Z` while
+    // `cv ls --json` and `/api/search` write `…+00:00`, so the same timestamp came back three
+    // ways and a consumer comparing strings across doors found differences that were not there.
+    for k in ["created_at", "updated_at"] {
+        let t = arr[0][k].as_str().unwrap_or_default();
+        assert!(
+            t.ends_with("+00:00"),
+            "{k} must be rfc3339 like the CLI's, got {t:?}: {v}"
+        );
+    }
 
     // limit
     let (status, v) = get_json(port, "/api/sessions?limit=1");
@@ -1164,6 +1174,209 @@ fn serve_refuses_bare_public_bind() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("refusing"), "{stderr}");
     assert!(stderr.contains("--insecure-expose"), "{stderr}");
+}
+
+// ───────────────────────── search & stats ─────────────────────────
+
+/// The value of one response header, lowercased-name match, from a raw response.
+fn header_of(raw: &str, name: &str) -> Option<String> {
+    raw.lines()
+        .take_while(|l| !l.trim().is_empty())
+        .find(|l| {
+            l.to_ascii_lowercase()
+                .starts_with(&format!("{}:", name.to_ascii_lowercase()))
+        })
+        .map(|l| l[l.find(':').unwrap() + 1..].trim().to_string())
+}
+
+/// The JSON body of a raw response.
+fn raw_json(raw: &str) -> Value {
+    let body = raw.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
+    serde_json::from_str(body).unwrap_or_else(|e| panic!("non-JSON body {body:?}: {e}"))
+}
+
+/// The §3 search row: a session row plus what the search contributed. `cv search --json` emits
+/// exactly these keys in exactly this order, so `/api/search` must too — a consumer that cannot
+/// tell the CLI's rows from the daemon's is the whole point of the contract.
+const SEARCH_ROW_KEYS: [&str; 14] = [
+    "id",
+    "harness",
+    "path",
+    "cwd",
+    "title",
+    "created_at",
+    "updated_at",
+    "message_count",
+    "size_bytes",
+    "score",
+    "snippet",
+    "agent_id",
+    "parent_id",
+    "workflow",
+];
+
+/// `/api/search` over a world with NO full-text index — i.e. the degraded path, which is the one
+/// a hermetic test can drive (building a tantivy index needs a real corpus under the *test
+/// process*'s `$HOME`, which these tests deliberately don't have; the indexed path is verified
+/// against the real 6,873-session archive by hand). It must still answer, in the same row shape,
+/// and SAY it degraded.
+#[test]
+fn serve_search() {
+    let w = World::new("search");
+    let (port, _reaper) = spawn_serve(&w);
+
+    // A word only `alphasess` says. One row, and the row is the §3 search row.
+    let raw = raw_get(port, "/api/search?q=zebrafish");
+    assert_eq!(raw_status(&raw), 200, "{raw}");
+    let v = raw_json(&raw);
+    let arr = v.as_array().expect("array");
+    assert_eq!(arr.len(), 1, "{v}");
+    assert_eq!(arr[0]["id"], "alphasess", "{v}");
+    let keys: Vec<&str> = arr[0].as_object().unwrap().keys().map(String::as_str).collect();
+    assert_eq!(keys, SEARCH_ROW_KEYS, "search row must match §3 exactly: {v}");
+    // The session-row half is real (it came from a ref, not the index) and the search half is
+    // filled the way a scoreless scan fills it.
+    assert!(arr[0]["path"].as_str().is_some_and(|p| p.ends_with(".jsonl")), "{v}");
+    assert!(arr[0]["size_bytes"].as_u64().is_some_and(|n| n > 0), "{v}");
+    assert!(arr[0]["score"].is_null(), "a live scan ranks nothing: {v}");
+    assert!(
+        arr[0]["snippet"].as_str().is_some_and(|s| s.contains("zebrafish")),
+        "{v}"
+    );
+    assert!(arr[0]["agent_id"].is_null() && arr[0]["workflow"].is_null(), "{v}");
+
+    // …and it says which door answered, so the UI can tell the user the result is partial.
+    assert_eq!(header_of(&raw, "X-Cv-Search-Source").as_deref(), Some("live"), "{raw}");
+    let note = header_of(&raw, "X-Cv-Search-Note").unwrap_or_default();
+    assert!(note.contains("no index"), "the degrade must be stated: {raw}");
+
+    // An empty or missing query is a caller mistake, not "every session".
+    for path in ["/api/search", "/api/search?q=", "/api/search?limit=5"] {
+        let (status, v) = get_json(port, path);
+        assert_eq!(status, 400, "{path}: {v}");
+        assert!(v["error"].as_str().unwrap().contains("q parameter"), "{v}");
+    }
+
+    // harness: a filter, and a typo is a clear 400 (same as /api/sessions).
+    let (status, v) = get_json(port, "/api/search?q=zebrafish&harness=claude");
+    assert_eq!(status, 200);
+    assert_eq!(v.as_array().unwrap().len(), 1, "{v}");
+    let (status, v) = get_json(port, "/api/search?q=zebrafish&harness=codex");
+    assert_eq!(status, 200);
+    assert!(v.as_array().unwrap().is_empty(), "{v}");
+    let (status, v) = get_json(port, "/api/search?q=zebrafish&harness=warpdrive");
+    assert_eq!(status, 400);
+    assert!(v["error"].as_str().unwrap().contains("unknown harness"), "{v}");
+
+    // cwd: a substring of the row's cwd, matching /api/sessions?cwd=.
+    let (_, v) = get_json(port, "/api/search?q=zebrafish&cwd=%2Fwork%2Fproj");
+    assert_eq!(v.as_array().unwrap().len(), 1, "{v}");
+    let (_, v) = get_json(port, "/api/search?q=zebrafish&cwd=nowhere");
+    assert!(v.as_array().unwrap().is_empty(), "{v}");
+
+    // A needle both fixtures contain ("plea(se)" / "(se)venteen"), so `limit` bites — and the
+    // truncation is stated rather than silently looking like the whole answer.
+    let (_, v) = get_json(port, "/api/search?q=se");
+    assert_eq!(v.as_array().unwrap().len(), 2, "{v}");
+    let raw = raw_get(port, "/api/search?q=se&limit=1");
+    assert_eq!(raw_json(&raw).as_array().unwrap().len(), 1);
+    assert!(
+        header_of(&raw, "X-Cv-Search-Note")
+            .unwrap_or_default()
+            .contains("stopped at 1 hits"),
+        "{raw}"
+    );
+
+    // A miss is an empty array, never an error.
+    let (status, v) = get_json(port, "/api/search?q=pangolin");
+    assert_eq!(status, 200);
+    assert!(v.as_array().unwrap().is_empty(), "{v}");
+
+    // The degrade signal is readable cross-origin — a header a dev-server dashboard can't read is
+    // not a channel.
+    let raw = raw_request(
+        port,
+        "GET",
+        "/api/search?q=zebrafish",
+        &[("Origin", "http://localhost:5173")],
+    );
+    let exposed = header_of(&raw, "Access-Control-Expose-Headers").unwrap_or_default();
+    assert!(
+        exposed.contains("X-Cv-Search-Source") && exposed.contains("X-Cv-Search-Note"),
+        "{raw}"
+    );
+}
+
+/// `/api/stats` — the corpus-wide numbers `cv stats --json` computes, over the whole archive
+/// rather than over whatever the dashboard happened to have open.
+#[test]
+fn serve_stats() {
+    let w = World::new("stats");
+    w.write_gamma();
+    let (port, _reaper) = spawn_serve(&w);
+
+    let (status, v) = get_json(port, "/api/stats");
+    assert_eq!(status, 200, "{v}");
+    let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+    assert_eq!(
+        keys,
+        [
+            "sessions",
+            "messages",
+            "by_harness",
+            "top_cwds",
+            "earliest_created",
+            "latest_updated"
+        ],
+        "stats payload must match `cv stats --json` exactly: {v}"
+    );
+    assert_eq!(v["sessions"], 3, "{v}");
+    assert_eq!(v["by_harness"]["claude"], 3, "{v}");
+
+    // The totals are the fleet's, not one session's: cross-check against /api/sessions' own rows.
+    let (_, sessions) = get_json(port, "/api/sessions");
+    let rows = sessions.as_array().unwrap();
+    let total: u64 = rows.iter().map(|r| r["message_count"].as_u64().unwrap_or(0)).sum();
+    assert_eq!(v["messages"].as_u64(), Some(total), "{v}");
+
+    // top_cwds: home-relative cwd + a session count, ranked.
+    let top = v["top_cwds"].as_array().unwrap();
+    assert_eq!(top[0]["cwd"], "/work/proj", "{v}");
+    assert_eq!(top[0]["sessions"], 3, "{v}");
+    // RFC 3339 spans, oldest creation to newest activity.
+    assert!(
+        v["earliest_created"]
+            .as_str()
+            .is_some_and(|s| s.starts_with("2026-01-01")),
+        "{v}"
+    );
+    assert!(
+        v["latest_updated"]
+            .as_str()
+            .is_some_and(|s| s.starts_with("2026-04-01")),
+        "{v}"
+    );
+
+    // `q` is cv's query calculus, exactly as `cv stats -q` takes it.
+    let (_, v) = get_json(port, "/api/stats?q=harness%3Aclaude");
+    assert_eq!(v["sessions"], 3, "{v}");
+    let (_, v) = get_json(port, "/api/stats?q=harness%3Acodex");
+    assert_eq!(v["sessions"], 0, "{v}");
+    assert_eq!(v["messages"], 0, "{v}");
+    assert!(v["by_harness"].as_object().unwrap().is_empty(), "{v}");
+    assert!(
+        v["earliest_created"].is_null(),
+        "an empty match is nulls, not an error: {v}"
+    );
+    // A term that needs the parsed transcript, not just the catalog row.
+    let (_, v) = get_json(port, "/api/stats?q=tool%3Aedit");
+    assert_eq!(v["sessions"], 1, "only gammasess edits a file: {v}");
+
+    // A malformed query is a 400 quoting the core's own message, pointed at `cv schema`.
+    let (status, v) = get_json(port, "/api/stats?q=msgs%3E");
+    assert_eq!(status, 400, "{v}");
+    let msg = v["error"].as_str().unwrap();
+    assert!(msg.contains("msgs") && msg.contains("cv schema"), "{v}");
 }
 
 /// Raw GET returning the full response text (headers + body) — for content-type / CORS assertions.

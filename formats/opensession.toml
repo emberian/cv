@@ -1,0 +1,71 @@
+# formats/opensession.toml — the vocabulary cv's `opensession` adapter is checked against (docs/INTERFACE-V2.md §7).
+# status: handled = per-item arm in the adapter; generic = interpreted by a blanket rule; carried = verbatim
+# under ParseOptions::complete only; ignored = known and deliberately skipped.
+#
+# OpenSession is cv's OWN format, so "upstream" is docs/OPENSESSION.md and the vocabulary is the IR's:
+# 0.3 is the IR key for key. Most of it is therefore `generic` — message kinds, origins and roles go
+# through the IR's own `Deserialize`, which is the point (a second hand-written copy of the vocabulary
+# here is exactly the drift that made 0.3 necessary). What IS per-item: the block types, whose required
+# fields differ, the role words, and every 0.2 spelling the reader still accepts.
+
+harness = "opensession"
+source_files = ["harness/opensession.rs"]
+ignore_literals = []
+store = [
+  "registered *.opensession.json documents (cv config --add-export)",
+  "any registered *.json whose head carries an `open_session` key",
+]
+
+[upstream]
+repo = "docs/OPENSESSION.md (this repo)"
+commit = "0.3"
+date = "2026-09-20"
+
+[types]
+# ── the document envelope ──
+"field.open_session" = { status = "handled", note = "0.3 version key; written first by `cv export --format json`" }
+"field.openSession" = { status = "handled", note = "0.2 spelling, accepted on the way in" }
+
+# ── content blocks (`type` in 0.3, `kind` in 0.2) ──
+"block.text" = { status = "handled", note = "" }
+"block.thinking" = { status = "handled", note = "text + signature/encrypted/redacted" }
+"block.tool_use" = { status = "handled", note = "id/name/input default rather than fail the block" }
+"block.tool_result" = { status = "handled", note = "array or {text} content is flattened" }
+"block.image" = { status = "handled", note = "" }
+"block.file" = { status = "handled", note = "0.2 `mediaType` maps to `mime`" }
+"block.toolUse" = { status = "generic", note = "0.2 tag; snake-normalized to tool_use before dispatch" }
+"block.toolResult" = { status = "generic", note = "0.2 tag; snake-normalized to tool_result" }
+
+# ── roles ──
+"role.user" = { status = "handled", note = "" }
+"role.human" = { status = "handled", note = "several stores' spelling of `user`" }
+"role.assistant" = { status = "handled", note = "" }
+"role.tool" = { status = "handled", note = "" }
+"role.system" = { status = "generic", note = "anything else, including a missing role" }
+
+# ── message kinds and origins ──
+"kind.*" = { status = "generic", note = "validated against ir::MessageKind's own Deserialize; unknown ⇒ role default + extra.cv.unknown_kind" }
+"origin.*" = { status = "generic", note = "validated against ir::Origin's own Deserialize; unknown ⇒ role default + extra.cv.unknown_origin" }
+
+# ── 0.2 camelCase spellings the reader still accepts (principle 10) ──
+"alias.parentId" = { status = "handled", note = "→ parent_id" }
+"alias.messageKind" = { status = "handled", note = "→ kind (0.2 spent `kind` on blocks)" }
+"alias.message_kind" = { status = "handled", note = "→ kind" }
+"alias.createdAt" = { status = "handled", note = "→ created_at" }
+"alias.updatedAt" = { status = "handled", note = "→ updated_at" }
+"alias.systemPrompt" = { status = "handled", note = "→ system_prompt" }
+"alias.toolUseId" = { status = "handled", note = "→ tool_use_id" }
+"alias.isError" = { status = "handled", note = "→ is_error" }
+"alias.toolName" = { status = "handled", note = "→ tool_name" }
+"alias.mediaType" = { status = "handled", note = "→ media_type (mime on a file block)" }
+"alias.dataRef" = { status = "handled", note = "→ data_ref" }
+"alias.forkedFrom" = { status = "handled", note = "lineage → forked_from" }
+"alias.spawnedByToolUse" = { status = "handled", note = "lineage → spawned_by_tool_use" }
+"alias.continuedIn" = { status = "handled", note = "lineage → continued_in" }
+"alias.agentPath" = { status = "handled", note = "lineage → agent_path" }
+"alias.inputTokens" = { status = "handled", note = "usage → input_tokens" }
+"alias.outputTokens" = { status = "handled", note = "usage → output_tokens" }
+"alias.cacheReadTokens" = { status = "handled", note = "usage → cache_read_tokens" }
+"alias.cacheCreationTokens" = { status = "handled", note = "usage → cache_creation_tokens" }
+"alias.reasoningTokens" = { status = "handled", note = "usage → reasoning_tokens" }
+"alias.costUsd" = { status = "handled", note = "usage → cost_usd" }

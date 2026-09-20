@@ -1,6 +1,9 @@
 /* clustervision — lite, hand-written styles. No framework. Light + dark. */
 
 :root {
+  /* Height of the app chrome above the two-pane layout; cv-app lowers it when the dropzone
+     folds to one line, so the panes take the space back instead of leaving a gap. */
+  --chrome-h: 280px;
   --bg: #fbfbfd;
   --bg-elev: #ffffff;
   --bg-sunk: #f1f1f5;
@@ -175,6 +178,48 @@ cv-app {
 .dz-status.warn { color: var(--warn); }
 .dz-status.error { color: var(--error); }
 
+/* ---------- Dropzone, collapsed ----------
+   When a daemon is answering, the archive is already here and the dropzone is not the way in —
+   it is an occasional extra. So it folds to one quiet line that still takes a drop, and the
+   invitation to expand sits at the end of it rather than across the top of every view. */
+.dropzone.compact {
+  border-style: solid;
+  border-color: var(--border);
+  background: transparent;
+  padding: 0 6px;
+  margin: 0 4px 10px;
+  cursor: default;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 30px;
+}
+.dropzone.compact:hover { border-color: var(--border-strong); }
+.dropzone.compact.drag { border-style: dashed; border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, var(--bg-elev)); }
+.dropzone.compact .dz-inner { display: none; }
+.dropzone.compact .dz-sources { margin-left: 0; }
+.dropzone.compact .dz-status { margin-top: 0; min-height: 0; flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+.dz-expand {
+  flex: none;
+  margin-left: auto;
+  background: none;
+  border: none;
+  color: var(--fg-muted);
+  font-size: 12px;
+  padding: 4px 6px;
+  border-radius: 6px;
+}
+.dz-expand:hover { color: var(--accent); background: var(--bg-sunk); }
+.dropzone:not(.compact) .dz-expand { margin-left: 0; }
+.dz-collapse {
+  position: absolute; top: 6px; right: 8px;
+  background: none; border: none; color: var(--fg-muted); font-size: 13px;
+  padding: 2px 6px; border-radius: 6px;
+}
+.dz-collapse:hover { color: var(--fg); background: var(--bg-sunk); }
+.dropzone { position: relative; }
+.dropzone.compact .dz-collapse { display: none; }
+
 /* ---------- Two-pane layout ---------- */
 
 .layout {
@@ -250,31 +295,73 @@ cv-app {
   padding: 4px 6px;
 }
 
-.list-count { font-size: 12px; margin: 4px 2px 8px; }
+.list-count { font-size: 12px; margin: 9px 2px 0; font-variant-numeric: tabular-nums; }
+.list-count b { font-weight: 650; color: var(--fg); }
+.list-count mark { background: none; color: var(--fg); font-weight: 600; }
 
-.session-rows { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+/* ---------- Session list rows: a windowed list ----------
+   Only the rows near the viewport are in the DOM. The <ul> is stretched to the full height the
+   whole result set WOULD occupy and each live row is placed at its own offset, so the scrollbar
+   still means what it means — the thumb's size and position are "you are here in 6,873 sessions",
+   not "you are here in the thirty rows that happen to exist".
+
+   That trade needs one uniform stride, which is also how a list of repeated things should look:
+   same edges, same baselines, one row to the next. `--cv-row-stride` is the single source of
+   truth — the CSS sizes the box from it and the windowing math reads it back. */
+.session-rows {
+  list-style: none; margin: 0; padding: 0;
+  position: relative;
+  display: block;
+  --cv-row-stride: 68px;   /* row box + the 6px that used to be a flex gap */
+}
+.session-rows.has-snippets { --cv-row-stride: 108px; }
 .session-row {
+  position: absolute;
+  left: 0; right: 0;
+  height: calc(var(--cv-row-stride) - 6px);
+  overflow: hidden;
   border: 1px solid var(--border);
   border-radius: 9px;
-  padding: 9px 11px;
+  padding: 8px 11px;
   cursor: pointer;
   transition: border-color 0.12s, background 0.12s;
   outline: none;
-  /* Skip layout/paint for off-screen rows so a 2000+ session list stays smooth. */
-  content-visibility: auto;
-  contain-intrinsic-size: auto 58px;
 }
+/* Keyboard scrolling must clear the sticky controls sitting over the top of the scroll box. */
+.session-row { scroll-margin-top: calc(var(--cv-sticky-h, 90px) + 8px); scroll-margin-bottom: 8px; }
 .session-row:hover { border-color: var(--border-strong); background: var(--bg-sunk); }
-.session-row:focus-visible { border-color: var(--accent); }
+.session-row:focus-visible { border-color: var(--accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 35%, transparent); }
 .session-row.selected {
   border-color: var(--accent);
   background: color-mix(in srgb, var(--accent) 10%, var(--bg-elev));
 }
 .row-top { display: flex; align-items: center; gap: 8px; }
 .row-title { font-weight: 550; font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.row-meta { display: flex; flex-wrap: wrap; gap: 4px 10px; font-size: 12px; margin-top: 5px; }
-.row-cwd { font-family: var(--mono); font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; }
+/* One line, always: a wrapped meta row would break the uniform stride the window is placed on. */
+.row-meta { display: flex; flex-wrap: nowrap; gap: 4px 10px; font-size: 12px; margin-top: 3px; overflow: hidden; }
+.row-cwd { font-family: var(--mono); font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 0 1 auto; min-width: 0; }
+.row-when, .row-count { flex: none; font-variant-numeric: tabular-nums; }
+/* The matched text the daemon returned — why this row is a hit at all. */
+.row-snippet {
+  margin-top: 5px;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--fg-muted);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.row-snippet mark {
+  background: color-mix(in srgb, var(--accent) 24%, transparent);
+  color: var(--fg);
+  border-radius: 3px;
+  padding: 0 1px;
+}
+.row-score { flex: none; font-family: var(--mono); font-size: 11px; color: var(--fg-muted); margin-left: auto; font-variant-numeric: tabular-nums; }
+.row-agent { flex: none; font-size: 11px; border: 1px solid var(--border-strong); border-radius: 999px; padding: 0 6px; color: var(--fg-muted); }
 .empty { padding: 16px 4px; font-size: 13px; }
+.list-count.list-busy { opacity: 0.7; font-style: italic; }
 
 /* ---------- Harness badge ---------- */
 
@@ -706,7 +793,9 @@ pre code { background: none; padding: 0; }
 .app-footer { padding: 14px 4px 22px; font-size: 12px; text-align: center; }
 
 /* ---------- Source chips (dropzone) ---------- */
-.dz-sources { display: flex; flex-wrap: wrap; gap: 6px; margin-left: auto; }
+.dz-sources { display: flex; flex-wrap: wrap; gap: 6px; }
+.dropzone:not(.compact) .dz-sources:not(:empty) { margin-top: 10px; }
+.dropzone.compact .dz-sources { flex: none; }
 .src-chip {
   font-size: 11.5px; font-family: var(--mono);
   background: var(--bg-sunk); border: 1px solid var(--border);
@@ -998,7 +1087,10 @@ cv-session-picker { position: relative; display: inline-flex; min-width: 0; }
 
 /* ---------- Stats ---------- */
 .stat-grid {
-  display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+  /* Capped tracks, not `1fr`: a three-tile row used to stretch each tile to 460px of empty
+     ground around a four-digit number. Tiles keep their size and the row keeps its slack. */
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 240px));
+  justify-content: start;
   gap: 10px; margin: 0 4px 20px;
 }
 .stat-card {
@@ -1015,7 +1107,24 @@ cv-session-picker { position: relative; display: inline-flex; min-width: 0; }
 .stat-num { font-size: 26px; font-weight: 700; letter-spacing: -0.02em; }
 .stat-card:hover .stat-num { color: var(--accent); }
 .stat-label { font-size: 11px; margin-top: 2px; text-transform: uppercase; letter-spacing: 0.05em; }
-.stat-note { margin: -8px 6px 18px; font-size: 12px; }
+.stat-note { margin: 4px 6px 0; font-size: 12px; }
+.stat-num { font-variant-numeric: tabular-nums; }
+.cwd-count { font-variant-numeric: tabular-nums; }
+
+/* Two halves, one page: what the whole archive is, and what the transcripts on this page are.
+   A rule and a label separate them — not another box, which would just read as more cards. */
+.stat-section { margin-bottom: 26px; }
+.stat-section-head {
+  display: flex; align-items: baseline; gap: 4px 12px; flex-wrap: wrap;
+  margin: 0 4px 12px; padding-bottom: 7px;
+  border-bottom: 1px solid var(--border);
+}
+.stat-section-head h3 {
+  margin: 0; font-size: 12px; font-weight: 700; letter-spacing: 0.07em;
+  text-transform: uppercase; color: var(--fg);
+}
+.stat-source { font-size: 12px; }
+.stat-block p.stat-source { margin: 10px 0 0; }
 .stat-cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 14px; margin: 0 4px 18px; }
 .stat-block {
   background: var(--bg-elev); border: 1px solid var(--border);
@@ -1024,7 +1133,7 @@ cv-session-picker { position: relative; display: inline-flex; min-width: 0; }
 .stat-cols .stat-block { margin: 0; }
 .stat-block h3 { margin: 0 0 12px; font-size: 13px; font-weight: 650; color: var(--fg-muted); text-transform: uppercase; letter-spacing: 0.04em; }
 .bars { display: flex; flex-direction: column; gap: 8px; }
-.bar-row { display: grid; grid-template-columns: 100px 1fr 40px; align-items: center; gap: 8px; }
+.bar-row { display: grid; grid-template-columns: 100px 1fr 50px; align-items: center; gap: 8px; }
 .bar-label { font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .bar-track { height: 12px; background: var(--bg-sunk); border-radius: 6px; overflow: hidden; }
 .bar-fill {
@@ -1392,6 +1501,7 @@ cv-session-picker { position: relative; display: inline-flex; min-width: 0; }
 }
 
 @media (max-width: 820px) {
+  .stat-grid { grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); }
   .layout { grid-template-columns: 1fr; }
   cv-app { padding: 0 10px; }
   /* On narrow screens, when a transcript is shown, hide the list to focus. */
@@ -1403,14 +1513,26 @@ cv-session-picker { position: relative; display: inline-flex; min-width: 0; }
   .cmp-heads, .cmp-row { grid-template-columns: 1fr; }
   .cmp-gutter { display: none; }
   .cmp-row .cmp-cell:first-child { border-bottom: 1px dashed var(--border); }
-  .dz-sources { margin-left: 0; width: 100%; }
   .fleet-grid { grid-template-columns: 1fr; }
   .fleet-base { width: 100%; }
 }
 
 @media (min-width: 821px) {
-  .layout { height: calc(100vh - 280px); min-height: 420px; }
-  .loom-grid { height: calc(100vh - 300px); min-height: 460px; }
+  /* The panes are a fixed height so each scrolls on its own; `--chrome-h` is everything above
+     them (header + dropzone + tabs), which shrinks when the dropzone folds — see cv-app.
+     `grid-template-rows` is what makes that height bind: an implicit `auto` row sizes to its
+     content and spills, so with 6,873 sessions the list pane grew to 467,000px and it was the
+     DOCUMENT that scrolled — header, tabs and footer sliding away with it. */
+  .layout {
+    /* `flex: none` is the other half of it: as a flex item of `.view-host`, `.layout`'s
+       `flex: 1` (basis 0%, grow 1) took precedence over `height`, and since nothing up the
+       chain has a definite height, "grow" meant "grow to the content". */
+    flex: none;
+    height: calc(100vh - var(--chrome-h, 280px));
+    min-height: 420px;
+    grid-template-rows: minmax(0, 1fr);
+  }
+  .loom-grid { height: calc(100vh - calc(var(--chrome-h, 280px) + 20px)); min-height: 460px; }
 }
 
 /* Respect users who prefer reduced motion: keep the static glows, drop the animation/transition. */

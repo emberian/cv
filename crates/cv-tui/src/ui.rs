@@ -394,6 +394,7 @@ fn harness_color(h: Harness) -> Color {
         Harness::Zed => Color::Rgb(7, 81, 207),              // zed accent blue
         Harness::ChatGptExport => Color::Rgb(116, 170, 156), // chatgpt teal (export)
         Harness::ClaudeExport => Color::Rgb(217, 119, 87),   // claude orange (export)
+        Harness::OpenSession => Color::Rgb(109, 73, 214),    // --h-opensession, the web UI's violet
     }
 }
 

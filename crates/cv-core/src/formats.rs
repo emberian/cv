@@ -87,6 +87,7 @@ manifests!(
     "zed",
     "chatgpt-export",
     "claude-export",
+    "opensession",
 );
 
 /// How an adapter treats one vocabulary item.

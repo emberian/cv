@@ -1,8 +1,8 @@
 //! `cv search` / `cv index` — full-text and semantic search.
 
-use crate::util::{dirs_home, parse_harness, session_row, short_id};
+use crate::util::{dirs_home, parse_harness, short_id};
 use anyhow::{Context, Result};
-use cv_core::ir::{truncate, Harness, SessionRef};
+use cv_core::ir::{truncate, Harness};
 use cv_core::sanitize::sanitize_line;
 use std::path::PathBuf;
 
@@ -144,71 +144,23 @@ fn render_search_hits(
     Ok(())
 }
 
-fn rfc3339(secs: Option<i64>) -> Option<String> {
-    secs.and_then(|t| chrono::DateTime::from_timestamp(t, 0))
-        .map(|d| d.to_rfc3339())
-}
-
-/// One `--json` object for an index/semantic hit: the session row (from the catalog, so `path`,
-/// `message_count` and `size_bytes` are the same values `ls --json` gives; null for a sub-agent
-/// lane, which the catalog doesn't list) with the hit's own title/cwd/dates laid over it, plus
-/// `score`, `snippet`, and the sub-agent provenance trio — always present, null for a top-level hit.
+/// One `--json` object for an index/semantic hit — [`cv_core::rows::SearchRow`] does the shaping,
+/// so `cv search --json` and `cvd`'s `/api/search` emit the identical row for the identical hit.
 fn hit_json(h: &cv_search::Hit) -> serde_json::Value {
-    let harness = Harness::parse(&h.harness);
-    let cataloged = cv_core::catalog::lookup(&h.id, harness)
-        .into_iter()
-        .find(|r| r.id == h.id);
-    let mut row = match &cataloged {
-        Some(r) => session_row(r, std::fs::metadata(&r.path).ok().map(|m| m.len())),
-        None => serde_json::json!({
-            "id": h.id,
-            "harness": h.harness,
-            "path": serde_json::Value::Null,
-            "cwd": serde_json::Value::Null,
-            "title": serde_json::Value::Null,
-            "created_at": serde_json::Value::Null,
-            "updated_at": serde_json::Value::Null,
-            "message_count": serde_json::Value::Null,
-            "size_bytes": serde_json::Value::Null,
-        }),
-    };
-    let obj = row.as_object_mut().expect("json object");
-    // The index is what matched: its title/cwd/dates win when it has them.
-    if let Some(c) = &h.cwd {
-        obj.insert("cwd".into(), serde_json::json!(c));
+    cv_core::rows::SearchRow {
+        id: &h.id,
+        harness: &h.harness,
+        cwd: h.cwd.as_deref(),
+        title: h.title.as_deref(),
+        created_at: h.created_at,
+        updated_at: h.updated_at,
+        score: Some(h.score),
+        snippet: &h.snippet,
+        agent_id: h.agent_id.as_deref(),
+        parent_id: h.parent_id.as_deref(),
+        workflow: h.workflow.as_deref(),
     }
-    if let Some(t) = &h.title {
-        obj.insert("title".into(), serde_json::json!(t));
-    }
-    if let Some(t) = rfc3339(h.created_at) {
-        obj.insert("created_at".into(), serde_json::json!(t));
-    }
-    if let Some(t) = rfc3339(h.updated_at) {
-        obj.insert("updated_at".into(), serde_json::json!(t));
-    }
-    obj.insert("score".into(), serde_json::json!(h.score));
-    obj.insert("snippet".into(), serde_json::json!(h.snippet));
-    // Sub-agent provenance (an index built with `cv index --subagents` folds lane transcripts
-    // in): the lane's own agent id (`cv show <agent_id>` resolves it), the top-level session
-    // that spawned it, and the workflow run it belonged to.
-    obj.insert("agent_id".into(), serde_json::json!(h.agent_id));
-    obj.insert("parent_id".into(), serde_json::json!(h.parent_id));
-    obj.insert("workflow".into(), serde_json::json!(h.workflow));
-    row
-}
-
-/// The live-scan twin of [`hit_json`]: the ref is in hand, so the row is exact; a live scan has
-/// no score and never walks sub-agents (provenance is null).
-fn live_hit_json(r: &SessionRef, title: &str, snippet: &str) -> serde_json::Value {
-    let mut row = session_row(r, std::fs::metadata(&r.path).ok().map(|m| m.len()));
-    let obj = row.as_object_mut().expect("json object");
-    obj.insert("title".into(), serde_json::json!(title));
-    obj.insert("score".into(), serde_json::Value::Null);
-    obj.insert("snippet".into(), serde_json::json!(snippet));
-    obj.insert("agent_id".into(), serde_json::Value::Null);
-    obj.insert("parent_id".into(), serde_json::Value::Null);
-    obj.insert("workflow".into(), serde_json::Value::Null);
-    row
+    .to_json()
 }
 
 /// Whole days the FTS index lags the newest session file on disk, when ≥ 1. Cheap enough for the
@@ -226,68 +178,39 @@ fn index_days_behind() -> Option<u64> {
 }
 
 fn cmd_search_live(query: &str, want: Option<Harness>, limit: usize, json: bool) -> Result<()> {
-    use cv_core::ParseOptions;
-    let needle = query.to_lowercase();
-    let mut hits = 0;
-    // --json: accumulate the SAME hits the table would print (same order, same snippet), emitted
-    // as one array at the end. No live-scan score exists, so `score` is an explicit null; ids are
-    // full (the table truncates to 8 chars).
-    let mut rows: Vec<serde_json::Value> = Vec::new();
-
-    // Streams each session into pack's head-capped `CapSink` under a lazy parse: peak per session
-    // is O(LIVE_HAY_BYTES), never O(session) — this is exactly the first-run (no index yet) path,
-    // where the old bulk parse materialized every message plus a lowercased copy of the whole
-    // transcript (multi-GB RSS on a big corpus). Trade-off: a match beyond the capped head is
-    // missed here; finding those is the index's job (`cv index`).
-    for adapter in cv_core::harness::all() {
-        if want.is_some_and(|h| adapter.harness() != h) || adapter.storage_root().is_none() {
-            continue;
-        }
-        for r in adapter.discover()? {
-            let mut sink = super::pack::CapSink::new(&r.path);
-            let meta = match adapter.stream(&r, &ParseOptions::lazy(), &mut sink) {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            // Lowercase only the bounded head (the match check), windowing the snippet from the
-            // original-case haystack.
-            let low = sink.hay.to_lowercase();
-            if let Some(pos) = low.find(&needle) {
-                hits += 1;
-                let label = cv_core::label_from(meta.title.as_deref(), sink.first_user.as_deref());
-                let snip = snippet(&sink.hay, pos.min(sink.hay.len()), needle.len());
-                if json {
-                    rows.push(live_hit_json(&r, &label, &snip));
-                } else {
-                    println!(
-                        "{:8}  {:8}  {:10}  {}",
-                        r.harness.as_str(),
-                        short_id(&r.id),
-                        r.updated_at
-                            .map(|d| crate::util::fmt_local(d, "%Y-%m-%d"))
-                            .unwrap_or_else(|| "----------".into()),
-                        sanitize_line(&label),
-                    );
-                    println!("          … {}", sanitize_line(&snip));
-                }
-                if hits >= limit {
-                    if json {
-                        println!("{}", serde_json::to_string_pretty(&rows)?);
-                        eprintln!("(stopped at {limit} hits; use --limit)");
-                    } else {
-                        println!("\n(stopped at {limit} hits; use --limit)");
-                    }
-                    return Ok(());
-                }
-            }
-        }
-    }
+    // The scan itself is [`cv_core::scan::live_search`] (head-capped per session, so peak memory is
+    // O(cap) not O(session)) — the same call `cvd`'s `/api/search` degrades to when the index is
+    // missing, so the no-index answer is identical through both doors.
+    let found = cv_core::scan::live_search(query, want, limit)?;
     if json {
         // Pure JSON on stdout even for a miss: an empty array, no prose.
+        let rows: Vec<serde_json::Value> = found
+            .hits
+            .iter()
+            .map(|h| cv_core::rows::live_search_row(&h.session, &h.title, &h.snippet))
+            .collect();
         println!("{}", serde_json::to_string_pretty(&rows)?);
+        if found.truncated {
+            eprintln!("(stopped at {limit} hits; use --limit)");
+        }
         return Ok(());
     }
-    if hits == 0 {
+    for h in &found.hits {
+        println!(
+            "{:8}  {:8}  {:10}  {}",
+            h.session.harness.as_str(),
+            short_id(&h.session.id),
+            h.session
+                .updated_at
+                .map(|d| crate::util::fmt_local(d, "%Y-%m-%d"))
+                .unwrap_or_else(|| "----------".into()),
+            sanitize_line(&h.title),
+        );
+        println!("          … {}", sanitize_line(&h.snippet));
+    }
+    if found.truncated {
+        println!("\n(stopped at {limit} hits; use --limit)");
+    } else if found.hits.is_empty() {
         println!("no matches for {query:?}");
     }
     Ok(())
@@ -319,24 +242,4 @@ pub(crate) fn cmd_index(semantic: bool, rebuild: bool, subagents: bool) -> Resul
     }
     println!("events: extracted on the same pass → try `cv events <id>` / `cv touched <path>`");
     Ok(())
-}
-
-fn snippet(hay: &str, pos: usize, len: usize) -> String {
-    let start = pos.saturating_sub(40);
-    let end = (pos + len + 40).min(hay.len());
-    let s = &hay[floor_char(hay, start)..ceil_char(hay, end)];
-    truncate(&s.replace('\n', " "), 120)
-}
-
-fn floor_char(s: &str, mut i: usize) -> usize {
-    while i > 0 && !s.is_char_boundary(i) {
-        i -= 1;
-    }
-    i
-}
-fn ceil_char(s: &str, mut i: usize) -> usize {
-    while i < s.len() && !s.is_char_boundary(i) {
-        i += 1;
-    }
-    i
 }

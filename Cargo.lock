@@ -573,6 +573,7 @@ dependencies = [
  "chrono",
  "clap",
  "clustervision-core",
+ "cv-search",
  "dirs 5.0.1",
  "serde",
  "serde_json",

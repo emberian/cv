@@ -6,7 +6,7 @@
 
 ### Your AI coding sessions are gold. Stop letting them rot in scattered folders.
 
-**Find, search, port, prune, and even *resurrect* every AI coding-agent session you've ever run — across 20 harnesses, through one unified format.**
+**Find, search, port, prune, and even *resurrect* every AI coding-agent session you've ever run — across 22 harnesses, through one unified format.**
 
 `claude` · `codex` · `grok` · `opencode` · `gemini` · `hermes` · `openclaw` · `cursor` · …
 
@@ -62,7 +62,7 @@ cv scry
 - 🧠 **An MCP server** so a *running* agent can read **other** agents' sessions — "what happened in this project before?", "what's my sibling agent doing right now?", "have I solved this before?" — mid-task, without leaving its harness.
 - 🌐 **A zero-install web viewer**: drag a zip of any harness folder into your browser and explore it. Nothing uploaded, all WASM.
 
-## 🪐 20 harnesses, one IR
+## 🪐 22 harnesses, one IR
 
 | | Harness | Parse | Port *to* | | | Harness | Parse | Port *to* |
 |---|---|:--:|:--:|---|---|---|:--:|:--:|
@@ -171,7 +171,7 @@ parse(any harness) → 🔮 unified IR → search · port · prune · loom · pa
 
 Built in a wild few sessions, much of it by a swarm of agents working disjoint files. ✨ Honest about the edges:
 
-- **20 harnesses parse**; 13 also **emit** (N-way conversion). The rest — Cursor, Goose, Zed, the Claude/ChatGPT desktop apps, and the ChatGPT/Claude.ai **account data exports** (`chatgpt-export`/`claude-export` — register their location with `cv config --add-export <path>`) — are parse-only for now.
+- **22 harnesses parse**; 13 also **emit** (N-way conversion). The rest — Cursor, Goose, Zed, the Claude/ChatGPT desktop apps, and the ChatGPT/Claude.ai **account data exports** (`chatgpt-export`/`claude-export` — register their location with `cv config --add-export <path>`) — are parse-only for now.
 - **Robustness:** 2000+ real sessions parse with **0 panics**; parsers are fuzz-tested against hostile input.
 - The full-text index trades disk for speed; Gemini's protobuf `.pb` is opaque; a few sidecar tool-call streams aren't merged yet.
 - Historical format variants are an explicit goal — see [`ADDING_HARNESS.md`](ADDING_HARNESS.md), and **please send your own harness logs** (we can only test what we can see).

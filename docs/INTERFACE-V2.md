@@ -77,7 +77,8 @@ candidates as `harness:full-id` lines and exits 2.
 - Every `--json` output and every MCP payload uses **snake_case** keys. `ls --json` changes:
   `messageCount → message_count`, `createdAt → created_at`, `updatedAt → updated_at`,
   `sizeBytes → size_bytes`, `displayTitle → display_title`. `search --json` and `workflow --json`
-  likewise. Timestamps are RFC 3339 strings.
+  likewise. Timestamps are `DateTime::to_rfc3339()` — UTC spelled `+00:00`, never `Z` — on every
+  door, so the same instant compares equal whether it came from the CLI, the daemon or MCP.
 - A **session row** (from `ls`, `search`, `project_sessions`, …) always has the same keys:
   `id, harness, path, cwd, title, created_at, updated_at, message_count, size_bytes` (+ `display_title`,
   `git` under `--enrich`).

@@ -68,6 +68,7 @@ import { blockToText, messagesToChat } from "./openrouter.js";
 import { SAMPLE_SESSIONS } from "./sample.js";
 import "./components/cv-transcript.js";
 import "./components/cv-stats.js";
+import "./components/cv-session-list.js";
 import "./components/cv-compare.js";
 import "./components/cv-forest.js";
 import "./components/cv-loom.js";
@@ -83,6 +84,17 @@ const check = (name, fn) => {
   let why = null;
   try {
     const r = fn();
+    if (typeof r === "string" && r) why = r;
+  } catch (e) {
+    why = (e && e.message) || String(e);
+  }
+  results.push({ group, name, why });
+};
+/** Same contract as `check`, for an invariant that has to await a fetch-shaped thing. */
+const acheck = async (name, fn) => {
+  let why = null;
+  try {
+    const r = await fn();
     if (typeof r === "string" && r) why = r;
   } catch (e) {
     why = (e && e.message) || String(e);
@@ -220,12 +232,17 @@ check("toMarkdown renders every block type and names the kinds", () => {
   if (md.includes("[undefined block]")) throw new Error("a block fell through to the unknown branch");
 });
 
-check("OpenSession export flips `type` back to `kind` and round-trips", () => {
+check("OpenSession 0.3 export IS the IR, and round-trips", () => {
   const doc = toOpenSession(claude);
-  const kinds = doc.messages.flatMap((m) => m.content).map((b) => b.kind);
-  has(kinds.join(","), "toolUse", "toolUse");
-  has(kinds.join(","), "toolResult", "toolResult");
-  eq(doc.messages[6].messageKind, "compaction_boundary", "message kind exported");
+  eq(doc.open_session, "0.3", "version marker");
+  // 0.3 dropped 0.2's camelCase translation: a block keeps its `type`, and a MESSAGE keeps `kind`
+  // (0.2 spent that word on blocks and had to invent `messageKind` for the turn).
+  const types = doc.messages.flatMap((m) => m.content).map((b) => b.type);
+  has(types.join(","), "tool_use", "tool_use");
+  has(types.join(","), "tool_result", "tool_result");
+  eq(doc.messages[6].kind, "compaction_boundary", "message kind exported under `kind`");
+  const tr = doc.messages.flatMap((m) => m.content).find((b) => b.type === "tool_result");
+  eq(typeof tr?.tool_use_id, "string", "snake_case block fields (tool_use_id, not toolUseId)");
   const back = normalizeSession(doc);
   eq(back.messages[6].kind, "compaction_boundary", "kind round-tripped");
   eq(back.messages[3].content[0].type, "tool_result", "block type round-tripped");
@@ -393,6 +410,7 @@ check("cv-stats buckets blocks by type and messages by kind/origin", () => {
   const el = document.createElement("cv-stats");
   document.body.appendChild(el);
   el.style.display = "none";
+  el._asked = true;        // this page must not need a daemon
   el.sessions = sessions;
   const txt = el.textContent;
   has(txt, "tool_use", "tool_use bucket");
@@ -445,6 +463,282 @@ check("cv-loom previews a message from its blocks", () => {
   has(el._previewText(codex.messages[3]), "Classic", "a thinking turn previews as its reasoning");
   has(el._previewText(codex.messages[4]), "max_attempts", "a tool-result turn previews as its output");
   has(el._previewText(codex.messages[7]), "Applied patch", "no block type falls through to an empty preview");
+});
+
+// ===========================================================================
+suite("Session list — a window over the corpus, not the corpus");
+
+/** A list mounted in its own bounded scroll box, off to the side of the page. */
+function makeList(rows) {
+  const box = document.createElement("div");
+  box.style.cssText = "position:fixed;left:-10000px;top:0;width:340px;height:300px;overflow:auto";
+  const el = document.createElement("cv-session-list");
+  box.appendChild(el);
+  document.body.appendChild(box);
+  el.sessions = rows;
+  return el;
+}
+/** N metadata-only stubs, shaped exactly like cvd's `/api/sessions` rows. */
+function stubs(n) {
+  return normalizeSessions(Array.from({ length: n }, (_, i) => ({
+    id: `s-${String(i).padStart(4, "0")}`,
+    harness: i % 3 === 0 ? "codex" : "claude",
+    title: `Session number ${i}`,
+    cwd: `/Users/x/dev/proj${i % 7}`,
+    created_at: new Date(1750000000000 + i * 60000).toISOString(),
+    updated_at: new Date(1750000000000 + i * 60000).toISOString(),
+    message_count: 10 + i,
+  }))).map((s) => ((s._stub = true), s));
+}
+const stride = () => {
+  const probe = document.querySelector("cv-session-list .session-rows");
+  return parseFloat(getComputedStyle(probe).getPropertyValue("--cv-row-stride"));
+};
+
+check("2,000 sessions put a window in the DOM, not 2,000 rows", () => {
+  const el = makeList(stubs(2000));
+  const n = el.querySelectorAll(".session-row").length;
+  if (n < 1) throw new Error("no rows rendered at all");
+  if (n > 60) throw new Error(`${n} rows realized for a 300px viewport — the list is not windowed`);
+  eq(el._rows.length, 2000, "the result set still holds every session");
+});
+
+check("the scrollbar still measures the whole result set", () => {
+  const el = makeList(stubs(2000));
+  const ul = el.querySelector(".session-rows");
+  const px = stride();
+  eq(ul.style.height, `${2000 * px - 6}px`, "ul height");
+  // ...and every realized row sits on that same stride, so the geometry is not a lie.
+  for (const li of ul.querySelectorAll(".session-row")) {
+    const i = Number(li.getAttribute("aria-posinset")) - 1;
+    eq(li.style.top, `${i * px}px`, `row ${i} offset`);
+  }
+});
+
+check("j / k walk the result set, past the end of the rendered window", () => {
+  const el = makeList(stubs(500));
+  const realized = el.querySelectorAll(".session-row").length;
+  let moved = 0;
+  for (let i = 0; i < realized + 12; i++) if (el.moveSelection(1)) moved++;
+  if (moved < realized + 10) throw new Error(`selection stalled after ${moved} moves (${realized} rows were realized)`);
+  const at = el._rows.findIndex((r) => r.id === el.selectedId);
+  eq(at, moved - 1, "cursor index");
+  truthy(el.querySelector(".session-row.selected"), "the selected row is realized wherever it is");
+  el.moveSelection(-1);
+  eq(el._rows.findIndex((r) => r.id === el.selectedId), moved - 2, "k steps back");
+});
+
+check("the selected row survives filtering", () => {
+  const el = makeList(stubs(500));
+  el.moveSelection(1); el.moveSelection(1); el.moveSelection(1);
+  const id = el.selectedId;
+  truthy(id, "something is selected");
+  el._query = el._rows.find((r) => r.id === id).title;   // a query the selected row still matches
+  el._refresh();
+  eq(el.selectedId, id, "selection id");
+  truthy(el._rows.some((r) => r.id === id), "still in the result set");
+  truthy(el.querySelector(`.session-row[data-id="${id}"].selected`), "still marked in the DOM");
+});
+
+// ===========================================================================
+suite("Session list — the search box promises what the deployment can do");
+
+check("with no daemon it says it filters, because that is all it can do", () => {
+  const el = makeList(stubs(6873));
+  const ph = el.querySelector(".search").placeholder;
+  has(ph, "6,873", "the real count");
+  has(ph, "title", "what it actually matches");
+  if (/message/i.test(ph)) throw new Error(`a stub-only filter must not promise message text: ${ph}`);
+  eq(el.searchMode, "local", "mode");
+});
+
+check("a loaded pool may honestly say it reaches message text", () => {
+  const el = makeList(sessions);              // the fixtures carry full transcripts
+  has(el.querySelector(".search").placeholder, "messages", "hydrated pools do search messages");
+});
+
+check("with a daemon it promises message text, and offers best-match + meaning", () => {
+  const el = makeList(stubs(120));
+  el.searchProvider = async () => [];
+  el.searchMode = "server";
+  has(el.querySelector(".search").placeholder, "message text", "placeholder");
+  const opts = [...el.querySelectorAll(".sort option")].map((o) => o.value);
+  eq(opts[0], "relevance", "best match is offered first");
+  truthy(el.querySelector(".chip[data-semantic]"), "the semantic toggle appears only here");
+});
+
+check("server mode needs a provider — the label can never outrun the capability", () => {
+  const el = makeList(stubs(10));
+  el.searchMode = "server";                   // no provider set
+  eq(el.searchMode, "local", "mode stays local");
+});
+
+await acheck("a daemon hit shows its snippet, marked, and escaped", async () => {
+  const el = makeList(stubs(50));
+  el.searchProvider = async (q) => [
+    { id: "hit-1", harness: "codex", title: "A hit", cwd: "/tmp/x", path: "/tmp/x.jsonl",
+      created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-02T00:00:00Z",
+      message_count: 12, size_bytes: 9, score: 9.5,
+      snippet: "<img src=x onerror=alert(1)> a prune commutation line", agent_id: null, parent_id: null, workflow: null },
+    { id: "hit-2", harness: "claude", title: "Another", cwd: null, path: null,
+      created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z",
+      message_count: null, size_bytes: null, score: 3.2, snippet: "prune again",
+      agent_id: "ag-1", parent_id: "p-1", workflow: "wf_1" },
+  ];
+  el.searchMode = "server";
+  el._query = "prune";
+  el._refresh();
+  await el.whenSettled();
+  eq(el._rows.length, 2, "hits");
+  const snips = el.querySelectorAll(".row-snippet");
+  eq(snips.length, 2, "a snippet per row");
+  truthy(!el.querySelector(".row-snippet img"), "the snippet is escaped, not executed");
+  has(snips[0].innerHTML, "&lt;img", "escaped markup");
+  has(snips[0].innerHTML, "<mark>prune</mark>", "the query is marked inside the snippet");
+  has(el.querySelector(".list-count").textContent, "match", "the count says matches, not \"of\"");
+  truthy(el.querySelector(".session-rows").classList.contains("has-snippets"), "snippet rows get their own stride");
+  truthy(el.querySelector(".row-agent"), "a sub-agent hit is labelled as one");
+});
+
+await acheck("a search hit carries score, snippet and provenance, and can be hydrated", async () => {
+  const el = makeList(stubs(50));
+  el.searchProvider = async () => [
+    { id: "unknown-9", harness: "claude", title: "Not in the pool", cwd: null, path: null,
+      created_at: null, updated_at: null, message_count: null, size_bytes: null,
+      score: 1.25, snippet: "s", agent_id: "ag-9", parent_id: "p-9", workflow: "wf_9" },
+  ];
+  el.searchMode = "server";
+  el._query = "x";
+  el._refresh();
+  await el.whenSettled();
+  const row = el._rows[0];
+  eq(row.id, "unknown-9", "id");
+  eq(row.score, 1.25, "score");
+  eq(row.agent_id, "ag-9", "agent_id");
+  eq(row.workflow, "wf_9", "workflow");
+  truthy(row._stub, "a hit outside the pool is a stub the app can hydrate");
+});
+
+await acheck("when the endpoint 404s the list falls back to filtering, and relabels", async () => {
+  const el = makeList(stubs(300));
+  el.searchProvider = async () => null;       // exactly what hydrate.js returns on a 404
+  el.searchMode = "server";
+  eq(el.searchMode, "server", "server until proven otherwise");
+  el._query = "Session number 7";
+  el._refresh();
+  await el.whenSettled();
+  eq(el.searchMode, "local", "fell back");
+  truthy(el._rows.length > 0 && el._rows.length < 300, "the local filter answered instead");
+  const ph = el.querySelector(".search").placeholder;
+  if (/message text/.test(ph)) throw new Error(`the placeholder kept promising search: ${ph}`);
+});
+
+await acheck("re-sorting hits in hand does not re-issue the search", async () => {
+  let calls = 0;
+  const el = makeList(stubs(20));
+  el.searchProvider = async () => {
+    calls++;
+    return [
+      { id: "a", harness: "codex", title: "Older", created_at: "2025-01-01T00:00:00Z", updated_at: "2025-01-01T00:00:00Z", message_count: 1, score: 9 },
+      { id: "b", harness: "codex", title: "Newer", created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z", message_count: 2, score: 1 },
+    ];
+  };
+  el.searchMode = "server";
+  el._query = "q";
+  el._refresh();
+  await el.whenSettled();
+  eq(calls, 1, "one request");
+  eq(el._rows[0].id, "a", "best match first");
+  el._sort = "recent";
+  el._sortTouched = true;
+  el._resort();
+  eq(calls, 1, "still one request");
+  eq(el._rows[0].id, "b", "reordered in place");
+});
+
+// ===========================================================================
+suite("Stats — a corpus number and a one-session number never share a panel");
+
+check("without a daemon the archive panel says where its numbers came from", () => {
+  const el = document.createElement("cv-stats");
+  document.body.appendChild(el);
+  el.style.display = "none";
+  el._asked = true;
+  el.sessions = sessions;
+  const heads = [...el.querySelectorAll(".stat-section-head")];
+  eq(heads.length, 2, "two sections");
+  has(heads[0].textContent, "archive", "the archive half");
+  has(heads[0].textContent, "loaded in this page", "…and that it is only the page's own tally");
+  has(heads[1].textContent, "Opened transcripts", "the opened half");
+});
+
+check("the opened half names exactly how many transcripts it covers", () => {
+  const el = document.createElement("cv-stats");
+  document.body.appendChild(el);
+  el.style.display = "none";
+  el._asked = true;
+  el._corpus = { sessions: 6873, messages: 3977480, by_harness: { codex: 3310, claude: 781 },
+                 top_cwds: [{ cwd: "~/dev/cv", sessions: 40 }],
+                 earliest_created: "2025-02-14T05:11:47Z", latest_updated: "2026-09-20T17:14:10Z" };
+  el.sessions = sessions;
+  const heads = [...el.querySelectorAll(".stat-section-head")];
+  has(heads[1].textContent, `${sessions.length} of 6,873`, "opened over corpus");
+  has(heads[1].textContent, "these panels describe only those", "the fence is stated");
+  // The token tiles live in the OPENED half and the corpus tiles in the archive half — never mixed.
+  const secs = [...el.querySelectorAll(".stat-section")];
+  const archive = secs[0].textContent, opened = secs[1].textContent;
+  has(archive, "3,977,480", "the daemon's message total");
+  has(archive, "6,873", "the daemon's session total");
+  if (/Input tokens/.test(archive)) throw new Error("a per-transcript token tile leaked into the archive panel");
+  if (/3,977,480/.test(opened)) throw new Error("the corpus message total leaked into the opened panel");
+  has(opened, "Input tokens", "tokens are disclosed as per-transcript");
+});
+
+check("the archive panel prefers the daemon's own breakdown", () => {
+  const el = document.createElement("cv-stats");
+  document.body.appendChild(el);
+  el.style.display = "none";
+  el._asked = true;
+  el._corpus = { sessions: 6873, messages: 3977480, by_harness: { codex: 3310, grok: 1258 },
+                 top_cwds: [{ cwd: "~/dev/breadstuffs", sessions: 1013 }],
+                 earliest_created: "2025-02-14T05:11:47Z", latest_updated: "2026-09-20T17:14:10Z" };
+  el.sessions = sessions;
+  const archive = el.querySelector(".stat-section").textContent;
+  has(archive, "cv stats", "it says which command answered");
+  has(archive, "3,310", "a per-harness count from by_harness");
+  has(archive, "breadstuffs", "a directory from top_cwds");
+  has(archive, "1,013", "…with its session count");
+});
+
+// ===========================================================================
+suite("Chrome — the dropzone costs a line, not a banner");
+
+check("the folded dropzone is one line high", () => {
+  const dz = document.createElement("div");
+  dz.className = "dropzone compact";
+  dz.style.cssText = "position:fixed;left:-10000px;top:0;width:900px";
+  dz.innerHTML = `<div class="dz-inner"><span class="dz-glyph">x</span>
+    <div class="dz-text"><strong>Drop files</strong><span class="muted">a long paragraph of invitation</span></div></div>
+    <div class="dz-sources"><span class="src-chip">local (cvd) <b>6873</b></span></div>
+    <div class="dz-status muted">ready</div><button class="dz-expand">+ add</button>`;
+  document.body.appendChild(dz);
+  const h = dz.getBoundingClientRect().height;
+  if (h > 44) throw new Error(`the folded dropzone is ${Math.round(h)}px — it is supposed to be one line`);
+  const inner = getComputedStyle(dz.querySelector(".dz-inner")).display;
+  eq(inner, "none", "the invitation is folded away");
+  // The source chip is the one thing that must survive the fold: it is how you know what loaded.
+  truthy(dz.querySelector(".dz-sources").getBoundingClientRect().width > 0, "the source chip stays visible");
+});
+
+check("an unfolded dropzone is still the prominent invitation", () => {
+  const dz = document.createElement("div");
+  dz.className = "dropzone";
+  dz.style.cssText = "position:fixed;left:-10000px;top:0;width:900px";
+  dz.innerHTML = `<div class="dz-inner"><span class="dz-glyph">📦</span>
+    <div class="dz-text"><strong>Drop .zip or .json files here</strong><span class="muted">multiple at once</span></div></div>
+    <div class="dz-status muted"></div>`;
+  document.body.appendChild(dz);
+  if (dz.getBoundingClientRect().height < 60) throw new Error("the demo dropzone lost its prominence");
 });
 
 // ===========================================================================

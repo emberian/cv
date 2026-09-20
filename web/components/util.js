@@ -409,7 +409,7 @@ export function normalizeSessions(data) {
   if (data && typeof data === "object") {
     // A single OpenSession doc, or a wrapper { sessions: [...] }.
     if (Array.isArray(data.sessions)) return data.sessions.map(normalizeSession).filter(Boolean);
-    if (data.openSession || data.messages || data.harness) {
+    if (data.open_session || data.openSession || data.messages || data.harness) {
       const one = normalizeSession(data);
       return one ? [one] : [];
     }
@@ -430,47 +430,42 @@ export function randomId() {
 
 /** Convert an internal session (or composed list of messages) to an OpenSession doc. */
 export function toOpenSession(session) {
-  // NOTE the tag flip: internally a block is tagged `type` (IR v2); OpenSession tags it `kind`
-  // and camelCases the field names. This function is the only place that translation happens.
-  const blockOut = (b) => {
-    switch (b.type) {
-      case "text": return { kind: "text", text: b.text ?? "" };
-      case "thinking": return clean({ kind: "thinking", text: b.text ?? "", signature: b.signature, encrypted: b.encrypted, redacted: b.redacted });
-      case "tool_use": return clean({ kind: "toolUse", id: b.id, name: b.name, input: b.input, namespace: b.namespace });
-      case "tool_result": return clean({ kind: "toolResult", toolUseId: b.tool_use_id, content: b.content, isError: !!b.is_error, toolName: b.tool_name, status: b.status, details: b.details });
-      case "file": return clean({ kind: "file", mime: b.mime, path: b.path, source: b.source });
-      case "image": return clean({ kind: "image", mediaType: b.media_type, dataRef: b.data_ref });
-      default: { const { type, ...rest } = b; return { kind: type, ...rest }; }
-    }
-  };
-  const usageOut = (u) => u && clean({
-    inputTokens: u.input_tokens, outputTokens: u.output_tokens,
-    cacheReadTokens: u.cache_read_tokens, cacheCreationTokens: u.cache_creation_tokens,
-    reasoningTokens: u.reasoning_tokens, costUsd: u.cost_usd,
-  });
-  // `messageKind`/`origin` are additive optional fields: OpenSession consumers ignore what they
-  // don't know, and dropping them would export a compaction boundary as an anonymous system turn.
-  // They ride under those names so they can never be read as a block `kind`.
+  // OpenSession 0.3 IS the IR (docs/OPENSESSION.md): same keys, same snake_case, blocks tagged
+  // `type`. So this is a near-identity plus the version marker — the whole camelCase translation
+  // layer 0.2 needed is gone, and with it the `messageKind` alias that only existed because 0.2
+  // spent the word `kind` on blocks and had nothing left for messages.
+  const blockOut = (b) => clean({ ...b });
   const msgOut = (m) => clean({
-    id: m.id, parentId: m.parent_id, role: m.role,
-    messageKind: m.kind, origin: m.origin,
+    id: m.id,
+    parent_id: m.parent_id,
+    role: m.role,
+    kind: m.kind,
+    origin: m.origin,
     timestamp: m.timestamp,
-    model: m.model, usage: usageOut(m.usage),
-    content: (m.content || []).map(blockOut), extra: m.extra,
+    model: m.model,
+    usage: m.usage && clean({ ...m.usage }),
+    content: (m.content || []).map(blockOut),
+    extra: m.extra,
   });
   return clean({
-    openSession: "0.2",
-    harness: session.harness || "openSession",
+    open_session: OPEN_SESSION_VERSION,
+    harness: session.harness || "opensession",
     id: session.id || randomId(),
-    cwd: session.cwd, title: session.title, model: session.model,
-    createdAt: session.created_at, updatedAt: session.updated_at,
+    cwd: session.cwd,
+    title: session.title,
+    model: session.model,
+    created_at: session.created_at,
+    updated_at: session.updated_at,
     git: session.git,
-    systemPrompt: session.system_prompt,
+    system_prompt: session.system_prompt,
     lineage: session.lineage,
     messages: (session.messages || []).map(msgOut),
     extra: session.extra,
   });
 }
+
+/** The OpenSession version this writes. Readers still accept 0.2 (see `normalizeSession`). */
+export const OPEN_SESSION_VERSION = "0.3";
 
 /** Drop undefined/null/empty-object fields for tidy JSON. */
 function clean(obj) {

@@ -23,7 +23,9 @@ import "./cv-fleet.js";
 import "./cv-opensession.js";
 import { esc, normalizeSession, normalizeSessions, randomId } from "./util.js";
 import { isTauri, listen, invoke, canInvokeNative } from "../tauri.js";
-import { getMessages, getSessionHead, PAGE, CVD_BASE } from "./hydrate.js";
+import {
+  getMessages, getSessionHead, searchSessions, probeSearch, PAGE, CVD_BASE,
+} from "./hydrate.js";
 
 // A running `cvd serve` (always the case inside the desktop app) exposes the machine's real local
 // sessions. The main viewer prefers these over the bundled sample; `CVD_BASE` (from hydrate.js)
@@ -50,6 +52,8 @@ class CvApp extends HTMLElement {
     this._wasmState = "loading";
     this._view = "sessions";
     this._isSample = true;     // true until the user loads their own data
+    this._daemon = false;      // a cvd answered: the archive is already here
+    this._searchMode = "local";
   }
 
   connectedCallback() {
@@ -78,7 +82,15 @@ class CvApp extends HTMLElement {
     // Now settle the wasm status (for the ingest/status UI), independently of session loading.
     this._wasmState = await main.wasmReady();
     this._updateStatus();
-    if (loadedLocal) return;
+    if (loadedLocal) {
+      // Ask once whether this daemon can search message text, so the search box promises the
+      // right thing from the first keystroke rather than discovering it on the first miss.
+      probeSearch().then((mode) => {
+        this._searchMode = mode;
+        if (this._list) this._list.searchMode = mode;
+      });
+      return;
+    }
 
     try {
       const sample = await main.loadSample();
@@ -118,10 +130,14 @@ class CvApp extends HTMLElement {
       this._sessions = sessions;
       this._sources = [{ name: "local (cvd)", count: sessions.length }];
       this._isSample = false;
+      this._daemon = true;
+      // The archive is already here, so the dropzone stops being the way in and folds to one
+      // line. It still takes a drop; it just stops charging every view 110px for the offer.
+      this._setDropzoneOpen(this._storedDropzoneOpen(), { silent: true });
       this._renderSources?.();
       this._refreshViews();
       this._setStatus(
-        `Showing ${sessions.length} local session${sessions.length === 1 ? "" : "s"} from cvd — select one to load its transcript.`,
+        `${sessions.length.toLocaleString()} sessions from this machine — pick one to read it.`,
         "ok"
       );
       return true;
@@ -224,9 +240,15 @@ class CvApp extends HTMLElement {
     }
   }
 
-  /** Show a session in the transcript, hydrating from cvd first if it's only a stub. */
+  /** Show a session in the transcript, hydrating from cvd first if it's only a stub.
+   *
+   *  Holding `j` asks for a new session every few milliseconds, and the fetches come back in
+   *  whatever order they finish — so each one checks that it is still the session the user is
+   *  on before it paints anything. Without that, a slow early transcript lands on top of the
+   *  row the cursor has already moved to, and the selection jumps backwards. */
   async _showSession(session) {
     if (!session) return;
+    const token = (this._showToken = (this._showToken || 0) + 1);
     let full = session;
     if (this._needsHydration(session)) {
       this._transcript.session = session; // render header immediately
@@ -234,10 +256,12 @@ class CvApp extends HTMLElement {
       try {
         full = await this._hydrate(session);
       } catch (e) {
+        if (token !== this._showToken) return;
         console.error("[clustervision] hydrate failed:", e);
         this._setStatus(`Couldn't load that transcript from cvd (${e?.message ?? e}).`, "error");
         return;
       }
+      if (token !== this._showToken) return;   // the cursor has moved on
       this._setStatus("", "ok");
     }
     this._transcript.session = full;
@@ -288,15 +312,17 @@ class CvApp extends HTMLElement {
 
       <div class="dropzone" tabindex="0" role="button" aria-label="Upload or drop .zip / .json session files">
         <input type="file" class="file-input" accept=".zip,.json,application/zip,application/json" multiple hidden />
+        <button type="button" class="dz-collapse" aria-label="Collapse the file drop area" title="Collapse">✕</button>
         <div class="dz-inner">
           <span class="dz-glyph" aria-hidden="true">📦</span>
           <div class="dz-text">
             <strong>Drop <code>.zip</code> or <code>.json</code> files here</strong>
             <span class="muted">multiple at once — harness <code>.zip</code>s and OpenSession <code>.json</code> files both load right here. Everything merges into one pool.</span>
           </div>
-          <div class="dz-sources" aria-live="polite"></div>
         </div>
+        <div class="dz-sources" aria-live="polite"></div>
         <div class="dz-status muted" aria-live="polite"></div>
+        <button type="button" class="dz-expand" aria-expanded="true">choose files…</button>
       </div>
 
       <nav class="view-tabs" role="tablist" aria-label="Views">
@@ -332,6 +358,46 @@ class CvApp extends HTMLElement {
     this.querySelector(".help-btn")?.addEventListener("click", () => this._toggleHelp());
     this._renderView();
     this._renderSources();
+    this._syncChromeHeight();
+    window.addEventListener("resize", () => this._syncChromeHeight());
+  }
+
+  // ---- dropzone: prominent on the demo, one line next to a daemon ---------
+
+  /** The panes below are sized as `100vh - chrome`. Measure the chrome instead of guessing it,
+   *  so folding the dropzone gives the list and transcript the space back. */
+  _syncChromeHeight() {
+    if (!this._host) return;
+    const top = Math.round(this._host.getBoundingClientRect().top + (window.scrollY || 0));
+    const footer = this.querySelector(".app-footer")?.offsetHeight || 0;
+    const px = `${top + footer + 12}px`;
+    if (px !== this._chromeH) { this._chromeH = px; this.style.setProperty("--chrome-h", px); }
+  }
+
+  /** Whether the user last left the fold open. Per-viewer convenience only, so a blocked or
+   *  empty store just means "closed". */
+  _storedDropzoneOpen() {
+    try { return localStorage.getItem("cv-dropzone") === "open"; } catch { return false; }
+  }
+
+  /** Fold the dropzone to a single line (or unfold it). Only ever called once a daemon has
+   *  answered — on the static demo the dropzone IS the way in and stays prominent. */
+  _setDropzoneOpen(open, opts = {}) {
+    if (!this._dropzone) return;
+    this._dzOpen = !!open;
+    this._dropzone.classList.toggle("compact", !open);
+    this._dropzone.setAttribute("role", open ? "button" : "group");
+    this._dropzone.tabIndex = open ? 0 : -1;
+    const expand = this.querySelector(".dz-expand");
+    if (expand) {
+      expand.setAttribute("aria-expanded", String(!!open));
+      expand.textContent = open ? "done" : "+ add .zip / .json";
+    }
+    if (!opts.silent) {
+      try { localStorage.setItem("cv-dropzone", open ? "open" : "closed"); } catch { /* fine */ }
+    }
+    this._updateStatus();
+    this._syncChromeHeight();
   }
 
   // ---- view switching ----------------------------------------------------
@@ -382,6 +448,9 @@ class CvApp extends HTMLElement {
       this._transcript = layout.querySelector("cv-transcript");
 
       this._list.addEventListener("select", (e) => {
+        // `select` is also a native event: a text <input> fires one whenever its selection
+        // changes, and it bubbles right through here. Only the list's own carries a session.
+        if (!e.detail?.session) return;
         this._showSession(e.detail.session);
         layout.classList.add("show-transcript");
         layout.querySelector(".pane-transcript")?.scrollTo?.(0, 0);
@@ -396,6 +465,13 @@ class CvApp extends HTMLElement {
   // Push the current pool into whichever view is mounted.
   _refreshViews() {
     if (this._list) {
+      if (!this._list._wiredSearch) {
+        this._list._wiredSearch = true;
+        // The list asks the daemon; `searchSessions` returns null when there is no daemon to ask,
+        // which is the list's cue to go back to filtering the stubs it already holds.
+        this._list.searchProvider = (q, o) => searchSessions(q, o);
+        this._list.searchMode = this._searchMode;
+      }
       this._list.sessions = this._sessions;
       if (!this._list.selectedId && this._sessions[0]) {
         // Don't auto-hydrate the first stub on load — it'd fire a fetch for a transcript the user
@@ -563,23 +639,58 @@ class CvApp extends HTMLElement {
 
   _wireDropzone() {
     const dz = this._dropzone;
-    const open = () => this._fileInput.click();
-    dz.addEventListener("click", (e) => { if (e.target.tagName !== "INPUT") open(); });
-    dz.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(); } });
+    const pick = () => this._fileInput.click();
+
+    this.querySelector(".dz-expand").addEventListener("click", (e) => {
+      e.stopPropagation();
+      // On the demo this button is the file picker; next to a daemon it is the fold.
+      if (!this._daemon) { pick(); return; }
+      this._setDropzoneOpen(!this._dzOpen);
+    });
+    this.querySelector(".dz-collapse").addEventListener("click", (e) => {
+      e.stopPropagation();
+      this._setDropzoneOpen(false);
+    });
+
+    dz.addEventListener("click", (e) => {
+      if (e.target.closest("button") || e.target.tagName === "INPUT") return;
+      if (dz.classList.contains("compact")) return;   // a one-line bar is not a 30px click target
+      pick();
+    });
+    dz.addEventListener("keydown", (e) => {
+      if (dz.classList.contains("compact")) return;
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); pick(); }
+    });
     this._fileInput.addEventListener("change", () => {
       const files = [...(this._fileInput.files || [])];
       if (files.length) this._handleFiles(files);
       this._fileInput.value = "";
     });
 
-    ["dragenter", "dragover"].forEach((ev) =>
-      dz.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.add("drag"); }));
-    ["dragleave", "drop"].forEach((ev) =>
-      dz.addEventListener(ev, (e) => { e.preventDefault(); if (ev === "dragleave" && dz.contains(e.relatedTarget)) return; dz.classList.remove("drag"); }));
-    dz.addEventListener("drop", (e) => {
-      const files = [...(e.dataTransfer?.files || [])];
-      if (files.length) this._handleFiles(files);
+    // Drag targets: the zone itself, and — once it is folded away — the whole app, so a dropped
+    // .zip still lands somewhere instead of the browser navigating to it.
+    const over = (e) => {
+      if (!e.dataTransfer?.types?.includes?.("Files")) return;
+      e.preventDefault();
+      dz.classList.add("drag");
+    };
+    ["dragenter", "dragover"].forEach((ev) => {
+      dz.addEventListener(ev, over);
+      this.addEventListener(ev, over);
     });
+    const leave = (e) => {
+      if (e.type === "dragleave" && dz.contains(e.relatedTarget)) return;
+      dz.classList.remove("drag");
+    };
+    ["dragleave", "drop"].forEach((ev) => { dz.addEventListener(ev, leave); this.addEventListener(ev, leave); });
+    const drop = (e) => {
+      const files = [...(e.dataTransfer?.files || [])];
+      if (!files.length) return;
+      e.preventDefault();
+      this._handleFiles(files);
+    };
+    dz.addEventListener("drop", drop);
+    this.addEventListener("drop", drop);
   }
 
   async _handleFiles(files) {
@@ -653,13 +764,19 @@ class CvApp extends HTMLElement {
     this._status.className = "dz-status muted" + (kind ? " " + kind : "");
   }
 
+  /** The wasm bundle only matters for `.zip` ingest. Next to a daemon the archive is already
+   *  loaded, so a missing bundle is not news — "Demo mode" over 6,873 of the user's own sessions
+   *  was simply false. Say it where it actually stops someone: the demo deploy, where dropping a
+   *  file is the only way in, and the fold when a user opens it to drop one. */
   _updateStatus() {
-    if (this._wasmState === "missing") {
-      this._setStatus(
-        "Demo mode: .zip ingest isn't available in this build. You can still drop OpenSession .json files and explore the sample.",
-        "warn"
-      );
-    }
+    if (this._wasmState !== "missing") return;
+    if (this._daemon && !this._dzOpen) return;
+    this._setStatus(
+      this._daemon
+        ? "This build can't unpack .zip archives — OpenSession .json files still load."
+        : "Demo mode: .zip ingest isn't available in this build. You can still drop OpenSession .json files and explore the sample.",
+      "warn",
+    );
   }
 }
 

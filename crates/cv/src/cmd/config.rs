@@ -47,7 +47,8 @@ pub(crate) fn cmd_config(add_export: Option<PathBuf>, rm_export: Option<PathBuf>
     }
     if cfg.exports.is_empty() {
         println!("\nno export sources registered. register one with:\n  cv config --add-export ~/Downloads");
-        println!("(then `cv ls --harness chatgpt-export` / `claude-export` will find your account exports)");
+        println!("(then `cv ls --harness chatgpt-export` / `claude-export` will find your account exports,");
+        println!(" and `--harness opensession` any `*.opensession.json` you have been handed)");
     } else {
         println!("\nexport sources ({}):", cfg.exports.len());
         for e in &cfg.exports {

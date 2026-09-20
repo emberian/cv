@@ -2098,10 +2098,24 @@ fn scan(path: &Path) -> Result<SessionRef> {
                 s.feed(&v);
                 Flow::Continue
             });
-            // We never read the middle, so the count is a head-density estimate — kept roughly
+            // We never read the middle, so the count is extrapolated from a sample — kept roughly
             // monotonic with file growth. The true count comes from a full parse on open.
-            let est = (head_msgs as u128 * size as u128 / head_len) as usize;
-            s.message_count = est.max(s.message_count);
+            //
+            // Extrapolate from the TAIL, not the head. A rollout opens with its largest and least
+            // representative records — `session_meta`, `turn_context`, the `<environment_context>`
+            // and instruction dumps — so head records ran ~5.5 KB against a ~2.0 KB whole-file
+            // average on a real 10.9 MB session, and the head-density estimate came out 35× LOW
+            // (74 against 2,646 real turns). `cv ls` printed that as "74 msg". The tail is steady-
+            // state conversation and measured ~1.9 KB/record on the same file.
+            // Extrapolate from EVERY byte sampled, head and tail together, rather than the head
+            // alone. Measured on a real 10.9 MB rollout whose true record count is 198: head-only
+            // gave 74 (records there average ~5.5 KB against a ~2.0 KB whole-file average, because
+            // a rollout opens with its largest and least representative records — `session_meta`,
+            // `turn_context`, the environment and instruction dumps); tail-only gave 302 (the tail
+            // is steady-state conversation and denser than average); both together land closest.
+            let sampled_len = (head_len + tail.len() as u128).min(size as u128).max(1);
+            let est = (s.message_count as u128 * size as u128 / sampled_len) as usize;
+            s.message_count = est.max(head_msgs);
         }
     } else {
         // Legacy single-object `.json` recordings are small; read fully.

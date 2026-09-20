@@ -55,11 +55,16 @@ A tab bar (`<cv-app>`) switches between views, all reading from the merged pool:
 - **🔍 Compare** (`<cv-compare>`) — pick two sessions side-by-side; messages are
   aligned and divergence is highlighted (shared prefix dims, the split is marked).
   Great for inspecting loom branches.
-- **📊 Stats** (`<cv-stats>`) — totals, per-harness / per-message-kind /
-  per-origin / per-block-type / per-role bars, top working directories, token
-  sums (including reasoning tokens and provider-reported cost where a harness
-  records them), date range, and an activity histogram. Hand-rolled CSS bars +
-  inline SVG — no chart library.
+- **📊 Stats** (`<cv-stats>`) — two clearly separated halves, because two
+  different questions were being answered as if they were one. **The archive**
+  (session and message totals, per-harness bars, top working directories, date
+  range, activity histogram) comes from `/api/stats` — exactly what
+  `cv stats --json` emits — and falls back to tallying the loaded pool, saying
+  which it did. **Opened transcripts** (tokens, reasoning tokens, provider cost,
+  message kinds, origins, block types, roles) is headed with how many transcripts
+  it actually covers, e.g. "3 of 6,873 downloaded". A corpus number and a
+  one-session number never share a panel. Hand-rolled CSS bars + inline SVG — no
+  chart library.
 - **🌳 Structure** (`<cv-forest>`) — the session-structure explorer for one root
   session: the sub-agent **forest** (direct + workflow agents), **workflow phase
   lanes**, **tool** histograms + a phase×tool **heatmap**, and the **compaction**
@@ -185,10 +190,20 @@ All are plain native custom elements (no framework, no build step), in `componen
 
 - **`<cv-app>`** — shell: header, theme toggle, **multi-file** dropzone (with
   per-source counts), view tabs, and the active view. Merges all sources into one
-  de-duplicated pool.
-- **`<cv-session-list>`** — sortable, filterable list. Free-text search across
-  titles, cwd, model, and **all message content**; harness filter chips; sort by
-  recency / oldest / title / message count.
+  de-duplicated pool. When a `cvd` is answering, the dropzone **folds to one
+  line** — the archive is already here, so the invitation stops charging every
+  view ~110px; the fold keeps the source chip, still takes a drop (anywhere in
+  the app), reopens from `+ add .zip / .json`, and remembers which way you left
+  it. On the static demo it stays prominent, because there it *is* the way in.
+- **`<cv-session-list>`** — sortable, filterable list, rendered as a **window**:
+  only the rows near the viewport exist in the DOM, while the `<ul>` is stretched
+  to the height the whole result set would occupy, so the scrollbar still measures
+  the corpus (6,873 sessions went from 54,255 nodes on landing to ~200). `j`/`k`
+  walk the *result set*, not the rendered rows. It searches two ways and says
+  which in the placeholder: with a daemon, `/api/search` over **every message in
+  the archive** (with the daemon's snippet in the row, best-match ordering, and a
+  `≈ meaning` toggle for `semantic=1`); without one, it filters the metadata stubs
+  it downloaded, which can only match titles and paths.
 - **`<cv-transcript>`** — renders one `Session`, keyed on the message **kind**
   rather than the role, so a typed prompt, harness-injected context, a slash-command
   notice and an API error no longer all read as one grey "System" turn:
@@ -308,8 +323,12 @@ than dropped.
 `selftest.html` runs the components against `sample.js` and asserts
 these invariants — every message renders exactly one node, every block type is
 recognised, `extra` is read through the harness namespace, the OpenSession export
-round-trips. No build step, no dependencies; it does need a static server, because
-browsers refuse ES modules over `file://`:
+round-trips; the session list renders a window whose geometry matches the whole
+result set and whose keyboard cursor walks it; the search box's placeholder never
+promises more than the deployment can do, and a 404 from `/api/search` falls back
+to the local filter; the stats view never mixes a corpus number with a
+one-session number. No build step, no dependencies; it does need a static server,
+because browsers refuse ES modules over `file://`:
 
     cvd serve --web ./web      # then open /selftest.html
     # or, from web/:

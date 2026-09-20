@@ -605,12 +605,24 @@ fn export_formats() {
     assert!(out.contains("zebrafish migration"), "{out}");
     assert!(out.contains("**🔧 Edit**"), "{out}");
 
-    // JSON: the full IR round-trips through serde.
+    // JSON: the full IR round-trips through serde — and `export` is a DOCUMENT boundary, so what
+    // it writes is an OpenSession 0.3 document: the IR led by the version marker.
     let (out, _) = w.cv_ok(&["export", "alphasess", "--format", "json"]);
     let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+    assert_eq!(v["open_session"], "0.3", "{out}");
+    assert!(
+        out.trim_start().starts_with("{\n  \"open_session\""),
+        "the marker leads the document:\n{out}"
+    );
     assert_eq!(v["id"], "alphasess", "{out}");
     assert_eq!(v["harness"], "claude", "{out}");
     assert_eq!(v["messages"].as_array().unwrap().len(), 3, "{out}");
+
+    // `show --json` is the RAW IR: the marker belongs to a document, never to a Session.
+    let (out, _) = w.cv_ok(&["show", "alphasess", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+    assert!(v.get("open_session").is_none(), "{out}");
+    assert_eq!(v["id"], "alphasess", "{out}");
 
     // HTML: self-contained document with the transcript in it.
     let (out, _) = w.cv_ok(&["export", "alphasess", "--format", "html"]);

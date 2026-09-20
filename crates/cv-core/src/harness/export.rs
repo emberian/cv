@@ -101,7 +101,7 @@ impl Adapter for ClaudeExport {
 /// `:`-separated ad-hoc list). **Opt-in**: with nothing registered and the env unset, export discovery
 /// is a no-op, so the default `cv ls`/`discover_all` never pays to scan (account exports are huge —
 /// enumerating thousands of conversations across multi-MB files takes seconds).
-fn export_dirs() -> Vec<PathBuf> {
+pub(crate) fn export_dirs() -> Vec<PathBuf> {
     let mut dirs = crate::config::load().exports;
     if let Ok(spec) = std::env::var("CV_EXPORTS") {
         dirs.extend(spec.split(':').filter(|s| !s.is_empty()).map(PathBuf::from));
@@ -112,13 +112,20 @@ fn export_dirs() -> Vec<PathBuf> {
     dirs
 }
 
-/// Every `conversations*.json` under the export dirs (depth ≤ 2; a dir entry is scanned, a file entry
-/// is taken directly).
+/// Every `conversations*.json` under the export dirs.
 fn export_files() -> Vec<PathBuf> {
+    files_under(export_dirs(), is_conversations_file)
+}
+
+/// Every file under `roots` matching `pred` (depth ≤ 2; a dir entry is scanned, a file entry is
+/// taken directly), sorted and deduped. Shared with [`opensession`](super::opensession), which
+/// discovers `.opensession.json` documents through the same registered sources — they have no
+/// fixed home either.
+pub(crate) fn files_under(roots: Vec<PathBuf>, pred: fn(&Path) -> bool) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    for root in export_dirs() {
+    for root in roots {
         if root.is_file() {
-            if is_conversations_file(&root) {
+            if pred(&root) {
                 out.push(root);
             }
             continue;
@@ -126,12 +133,12 @@ fn export_files() -> Vec<PathBuf> {
         // root dir + one level of subdirs (an extracted export is usually a subfolder)
         for depth1 in std::fs::read_dir(&root).into_iter().flatten().flatten() {
             let p = depth1.path();
-            if p.is_file() && is_conversations_file(&p) {
+            if p.is_file() && pred(&p) {
                 out.push(p);
             } else if p.is_dir() {
                 for depth2 in std::fs::read_dir(&p).into_iter().flatten().flatten() {
                     let q = depth2.path();
-                    if q.is_file() && is_conversations_file(&q) {
+                    if q.is_file() && pred(&q) {
                         out.push(q);
                     }
                 }
