@@ -33,6 +33,71 @@ pub struct EmitOptions {
     /// inherently cannot represent — never fail; they are reported under `⚠ lost`. The CLI wires
     /// this to `port --strict`. Only [`emit_verified`] consults it (plain [`emit`] never verifies).
     pub strict: bool,
+    /// What to do with [`Block::Thinking`] on the way out. See [`ThinkingMode`].
+    pub thinking: ThinkingMode,
+}
+
+/// What [`emit`] does with the model's reasoning.
+///
+/// Measured on one real 900-message session: of 204 thinking blocks only 27 carried text and 177
+/// were **signature-only** — an opaque provider-signed blob with no plaintext at all. So "carry the
+/// reasoning as text" is impossible for the majority of them; the only question a mode can answer
+/// is whether the *turn* survives. An assistant turn whose sole content is such a block is
+/// unrepresentable in a store that cannot hold the signature, and vanishes (the fidelity report
+/// names it `unrepresentable_turns`), taking the conversation's user/assistant alternation with it.
+///
+/// Spelled `native` / `text` / `drop` on the wire ([`ThinkingMode::parse`], [`std::str::FromStr`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ThinkingMode {
+    /// Structured thinking where the target holds it, dropped where it does not, reported as an
+    /// expected loss. The default, and what every port did before this mode existed.
+    #[default]
+    Native,
+    /// Never lose the turn. Where the target cannot hold thinking structurally, a block with text
+    /// becomes a [`Block::Text`]; a signature-only / encrypted / redacted blob becomes a short
+    /// placeholder naming what it was and how big it was, so the turn (and the alternation around
+    /// it) survives. The lost *signature* is still reported — this mode keeps the conversation, it
+    /// does not make a lossy port look clean.
+    Text,
+    /// Never emit thinking at all, even where the target could hold it: for sharing a session
+    /// without your reasoning. Every thinking loss is then an expected one (you asked for it).
+    Drop,
+}
+
+impl ThinkingMode {
+    /// Every mode, in CLI/`possible_values` order.
+    pub const ALL: [ThinkingMode; 3] = [ThinkingMode::Native, ThinkingMode::Text, ThinkingMode::Drop];
+
+    /// The wire spelling (`--thinking <mode>`, JSON, `possible_values`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ThinkingMode::Native => "native",
+            ThinkingMode::Text => "text",
+            ThinkingMode::Drop => "drop",
+        }
+    }
+
+    /// Parse a wire spelling, case-insensitively. `None` for anything else.
+    pub fn parse(s: &str) -> Option<Self> {
+        let s = s.trim().to_ascii_lowercase();
+        ThinkingMode::ALL.into_iter().find(|m| m.as_str() == s)
+    }
+}
+
+impl std::str::FromStr for ThinkingMode {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        ThinkingMode::parse(s).ok_or_else(|| {
+            let all = ThinkingMode::ALL.map(|m| m.as_str()).join(", ");
+            anyhow::anyhow!("unknown thinking mode {s:?} (expected one of: {all})")
+        })
+    }
+}
+
+impl std::fmt::Display for ThinkingMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// An emitter: writes one IR session into one harness's native on-disk format.
@@ -79,12 +144,138 @@ pub fn emit(session: &Session, target: Harness, out_dir: &Path, opts: &EmitOptio
     // as its `{source,off,len}` struct, shipping garbage into the target file. A lazily-parsed
     // session must be resolved before it hits an emitter; do it here (on a clone, since `emit`
     // takes `&Session`) so no caller can forget.
+    //
+    // [`ThinkingMode`] is applied in the same place and on the same clone, for the same reason: it
+    // is one rewrite of the IR that every emitter must see, and doing it here means no emitter has
+    // to know the mode exists. It runs AFTER materialization (it reads `Thinking.text`).
+    let mut owned: Option<Session> = None;
     if has_unresolved_spans(session) {
-        let mut owned = session.clone();
-        owned.materialize();
-        return f(&owned, out_dir, opts);
+        let mut s = session.clone();
+        s.materialize();
+        owned = Some(s);
     }
-    f(session, out_dir, opts)
+    if opts.thinking != ThinkingMode::Native {
+        let mut s = owned.take().unwrap_or_else(|| session.clone());
+        apply_thinking_mode(&mut s, target, opts.thinking);
+        owned = Some(s);
+    }
+    f(owned.as_ref().unwrap_or(session), out_dir, opts)
+}
+
+/// Rewrite every [`Block::Thinking`] in `session` as [`EmitOptions::thinking`] asks, for `target`.
+/// A no-op under [`ThinkingMode::Native`] (the emitters' own drop-what-I-cannot-write behaviour is
+/// already that mode). [`thinking_fate`] is the single decision function, shared with
+/// [`block_survives`] so the verifier's idea of what survives cannot drift from what is written.
+fn apply_thinking_mode(session: &mut Session, target: Harness, mode: ThinkingMode) {
+    if mode == ThinkingMode::Native {
+        return;
+    }
+    for msg in &mut session.messages {
+        if !msg.content.iter().any(|b| matches!(b, Block::Thinking { .. })) {
+            continue;
+        }
+        let mut out = Vec::with_capacity(msg.content.len());
+        for b in std::mem::take(&mut msg.content) {
+            let fate = match &b {
+                Block::Thinking {
+                    text,
+                    signature,
+                    encrypted,
+                    redacted,
+                } => thinking_fate(
+                    target,
+                    mode,
+                    text,
+                    signature.as_deref(),
+                    encrypted.as_deref(),
+                    *redacted,
+                ),
+                _ => {
+                    out.push(b);
+                    continue;
+                }
+            };
+            match fate {
+                ThinkingFate::Keep => out.push(b),
+                ThinkingFate::Drop => {}
+                ThinkingFate::AsText | ThinkingFate::Placeholder => {
+                    let Block::Thinking {
+                        text,
+                        signature,
+                        encrypted,
+                        redacted,
+                    } = b
+                    else {
+                        unreachable!("fate computed from a Thinking block")
+                    };
+                    let text = if fate == ThinkingFate::AsText {
+                        text
+                    } else {
+                        thinking_placeholder(signature.as_deref(), encrypted.as_deref(), redacted).into()
+                    };
+                    out.push(Block::Text { text });
+                }
+            }
+        }
+        msg.content = out;
+    }
+}
+
+/// What becomes of one thinking block under a [`ThinkingMode`] for one target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThinkingFate {
+    /// Written as a thinking block — the target holds at least one of its payloads.
+    Keep,
+    /// Written as a [`Block::Text`] carrying the reasoning text verbatim.
+    AsText,
+    /// Written as a [`Block::Text`] carrying a placeholder: there is no plaintext to carry.
+    Placeholder,
+    /// Not written at all.
+    Drop,
+}
+
+/// The one decision: what `mode` does with this thinking block when writing to `target`.
+fn thinking_fate(
+    target: Harness,
+    mode: ThinkingMode,
+    text: &str,
+    signature: Option<&str>,
+    encrypted: Option<&str>,
+    redacted: bool,
+) -> ThinkingFate {
+    let has_text = !text.trim().is_empty();
+    // Whether the target can hold this block AS a thinking block: any one payload is enough.
+    let structural = (has_text && target_holds(target, "thinking_text"))
+        || (signature.is_some() && target_holds(target, "thinking_signature"))
+        || (encrypted.is_some() && target_holds(target, "thinking_encrypted"));
+    match mode {
+        ThinkingMode::Drop => ThinkingFate::Drop,
+        ThinkingMode::Native if structural => ThinkingFate::Keep,
+        ThinkingMode::Native => ThinkingFate::Drop,
+        ThinkingMode::Text if structural => ThinkingFate::Keep,
+        ThinkingMode::Text if has_text => ThinkingFate::AsText,
+        // Signature-only / encrypted / redacted: no plaintext exists, so the turn survives as a
+        // named stand-in. An entirely empty thinking block has nothing honest to say, so it goes.
+        ThinkingMode::Text if signature.is_some() || encrypted.is_some() || redacted => ThinkingFate::Placeholder,
+        ThinkingMode::Text => ThinkingFate::Drop,
+    }
+}
+
+/// The stand-in text [`ThinkingMode::Text`] writes for a block with no plaintext: what it was and
+/// how big it was, in one short line. Never pretends to be the reasoning itself.
+fn thinking_placeholder(signature: Option<&str>, encrypted: Option<&str>, redacted: bool) -> String {
+    if let Some(e) = encrypted {
+        format!("[thinking: encrypted reasoning blob, {} bytes, not portable]", e.len())
+    } else if let Some(s) = signature {
+        format!(
+            "[thinking: signature-only reasoning, {}-byte provider signature, not portable]",
+            s.len()
+        )
+    } else if redacted {
+        "[thinking: redacted by the provider]".to_string()
+    } else {
+        "[thinking: not portable]".to_string()
+    }
 }
 
 /// Whether any message content field is still a lazy [`Span`](crate::lazy::Span) (see [`emit`]).
@@ -151,7 +342,7 @@ pub fn emit_report(
         ParseOptions::full()
     };
     let report = match reparse_emitted(target, &result, &reparse_opts) {
-        Ok(reparsed) => diff_fidelity(target, session, &reparsed),
+        Ok(reparsed) => diff_fidelity(target, opts.thinking, session, &reparsed),
         Err(e) => FidelityReport {
             deltas: vec![Delta {
                 field: "round_trip".into(),
@@ -374,8 +565,13 @@ struct Features {
     results_is_error: usize,
     usage: usize,
     cost: usize,
+    // Timestamps and ids are counted separately for TOOL turns, because a store that keeps a tool
+    // result inside its originating call's record gives that turn no record of its own to carry
+    // them on — see the `id:tool_turn` arm of [`target_holds`].
     timestamps: usize,
+    timestamps_tool: usize,
     ids: usize,
+    ids_tool: usize,
     model_eff: usize,
 }
 
@@ -385,19 +581,25 @@ fn is_carrier(m: &Message) -> bool {
 }
 
 /// Whether `target`’s format can hold this block at all (the block-level half of
-/// [`target_holds`]). A thinking block survives if ANY of its three payloads does.
-fn block_survives(target: Harness, b: &Block) -> bool {
+/// [`target_holds`]), under the requested [`ThinkingMode`]. A thinking block survives if
+/// [`thinking_fate`] writes anything for it — structurally, as text, or as a placeholder.
+fn block_survives(target: Harness, thinking: ThinkingMode, b: &Block) -> bool {
     match b {
         Block::Text { .. } => true,
         Block::Thinking {
             text,
             signature,
             encrypted,
-            ..
+            redacted,
         } => {
-            (!text.trim().is_empty() && target_holds(target, "thinking_text"))
-                || (signature.is_some() && target_holds(target, "thinking_signature"))
-                || (encrypted.is_some() && target_holds(target, "thinking_encrypted"))
+            thinking_fate(
+                target,
+                thinking,
+                text,
+                signature.as_deref(),
+                encrypted.as_deref(),
+                *redacted,
+            ) != ThinkingFate::Drop
         }
         Block::ToolUse { .. } => target_holds(target, "tool_use"),
         Block::ToolResult { .. } => target_holds(target, "tool_result"),
@@ -416,11 +618,14 @@ fn block_survives(target: Harness, b: &Block) -> bool {
 /// `unrepresentable_turns` delta — their disappearance is a consequence of a block-level loss the
 /// table already calls expected, and counting them as lost turns made `--strict` fail on every real
 /// Claude session (drowning the losses a target genuinely could have avoided).
-fn unrepresentable(target: Harness, m: &Message) -> bool {
-    !m.content.is_empty() && !m.content.iter().any(|b| block_survives(target, b))
+///
+/// [`ThinkingMode::Text`] is the answer to this: under it a signature-only block is written as a
+/// placeholder, so the turn is representable after all and nothing here fires.
+fn unrepresentable(target: Harness, thinking: ThinkingMode, m: &Message) -> bool {
+    !m.content.is_empty() && !m.content.iter().any(|b| block_survives(target, thinking, b))
 }
 
-fn features(target: Harness, session: &Session) -> Features {
+fn features(target: Harness, thinking: ThinkingMode, session: &Session) -> Features {
     let mut f = Features::default();
     for m in &session.messages {
         // Two kinds of message are not *turns* for this comparison and are skipped whole — counting
@@ -429,16 +634,36 @@ fn features(target: Harness, session: &Session) -> Features {
         //  * a format-complete **carrier** (empty-content System message holding a verbatim meta
         //    record) is bookkeeping the emitter replays byte-for-byte;
         //  * a turn the target cannot represent AT ALL ([`unrepresentable`]).
-        if is_carrier(m) || unrepresentable(target, m) {
+        if is_carrier(m) || unrepresentable(target, thinking, m) {
             continue;
         }
-        *f.role_counts.entry(role_str(m.role)).or_default() += 1;
-        *f.kind_counts.entry(m.kind.as_str()).or_default() += 1;
+        // A store whose own reader re-tags a turn on the way back in is not LOSING it, and the
+        // verifier must not cry loss over a transformation the format defines. Model the known one
+        // here so both sides agree; anything else still shows up.
+        let (role, kind) = if reroles_client_commands(target) && is_client_command(m) {
+            ("system", MessageKind::InjectedContext.as_str())
+        } else {
+            (role_str(m.role), m.kind.as_str())
+        };
+        *f.role_counts.entry(role).or_default() += 1;
+        *f.kind_counts.entry(kind).or_default() += 1;
+        // A Tool turn's timestamp/id are counted apart from every other turn's: two of our targets
+        // have no record to hang them on, and blanket-excusing ids or timestamps would have hidden
+        // a real loss on a normal turn.
+        let tool_turn = m.role == Role::Tool;
         if m.timestamp.is_some() {
-            f.timestamps += 1;
+            if tool_turn {
+                f.timestamps_tool += 1;
+            } else {
+                f.timestamps += 1;
+            }
         }
         if m.id.is_some() {
-            f.ids += 1;
+            if tool_turn {
+                f.ids_tool += 1;
+            } else {
+                f.ids += 1;
+            }
         }
         // Usage is a property of a MODEL turn, and that is the only place a store keeps it (Codex
         // attaches `token_count` to the assistant message it trails; OpenCode to the assistant
@@ -529,7 +754,21 @@ fn target_holds(t: Harness, field: &str) -> bool {
         "file" => matches!(t, Claude | OpenCode | Gemini),
         "tool_use" | "tool_result" => !matches!(t, LmStudio),
         "tool_name" => matches!(t, OpenClaw | Hermes | Codex | Gemini | OpenCode),
-        "is_error" => !matches!(t, LmStudio),
+        // Hermes has no slot for a tool result's error flag. Its `messages` table (schema v30,
+        // `hermes_state_common.py` `SCHEMA_SQL`) is
+        //   id, session_id, role, content, tool_call_id, tool_calls, tool_name,
+        //   effect_disposition, timestamp, token_count, finish_reason, reasoning*,
+        //   codex_*_items, platform_message_id, observed, _compressed_summary, active,
+        //   compacted, api_content, display_kind, display_metadata, display_identity,
+        //   display_order
+        // — no error/status column. The near misses are not it: `effect_disposition` is the
+        // *side-effect* classification (`"none"` when a call was blocked, `"unknown"` on timeout;
+        // `agent/tool_executor.py`, consumed by `agent/replay_cleanup.py`), and `finish_reason` is
+        // the assistant turn's stop reason. Hermes's own writer proves it: `append_message` /
+        // `make_tool_result_message` (`agent/tool_dispatch_helpers.py`) take no error argument —
+        // a failure reaches the store only as the text of `content`. So the read side has nothing
+        // to read: `hermes.rs` builds every tool row's block with `is_error: false`.
+        "is_error" => !matches!(t, LmStudio | Hermes),
         "details" => matches!(t, Claude | OpenCode),
         "usage" => !matches!(t, Grok | Cline | Roo | Continue),
         "cost" => matches!(t, OpenCode),
@@ -537,10 +776,27 @@ fn target_holds(t: Harness, field: &str) -> bool {
         "timestamp" => !matches!(t, LmStudio | Grok),
         // Per-message ids: kept by the stores that thread by a stable id.
         "id" => matches!(t, Claude | OpenCode | OpenClaw | Gemini | Kimi | Cline | Roo),
+        // A TOOL turn's own id/timestamp, which is a narrower question than the turn above. Where
+        // the store keeps a tool result INSIDE its originating call's record ([`folds_tool_result`])
+        // the tool turn has no record of its own, so there is nowhere for an id or a timestamp to
+        // live — the reader rebuilds the turn out of the call. (Gemini's reader does recover a
+        // timestamp from the enclosing record, so in practice only the id is ever reported there;
+        // the classification is about what the STORE can hold.) Everywhere else the ordinary
+        // `id`/`timestamp` answer stands, so a real id loss on a tool turn stays unexpected.
+        "id:tool_turn" => !folds_tool_result(t) && target_holds(t, "id"),
+        "timestamp:tool_turn" => !folds_tool_result(t) && target_holds(t, "timestamp"),
         "model" => true,
         "title" => !matches!(t, Codex),
         "cwd" => !matches!(t, LmStudio),
         "session_model" => true,
+        // A session model the target must *replace* to stay runnable there. Grok resumes a session
+        // against `summary.json`'s `current_model_id`, so a foreign id (`claude-fable-5-1`,
+        // `gpt-5.5`) would make it replay the history against a backend that cannot serve it;
+        // [`grok_model_id`] pins those to `grok-build` on purpose. The substitution is the correct
+        // behaviour, so the verifier reports it, but never as a loss the emitter could have
+        // avoided. A Grok model (or a Grok→Grok rehome) is carried verbatim and is still checked
+        // under plain `session_model`, so a genuine model loss there is still unexpected.
+        "session_model_foreign" => false,
         "system_prompt" => matches!(t, Claude | Codex | Hermes | Kimi),
         // Lineage reconstruction on a standalone emit needs a target the pointer resolves in; treat
         // any lineage change as expected (a fresh single-session port has nothing to point at).
@@ -549,33 +805,94 @@ fn target_holds(t: Harness, field: &str) -> bool {
     }
 }
 
+/// Whether `target`'s store keeps a tool result **inside its originating call's record** rather
+/// than in a record of its own — OpenCode folds it into the assistant message's `tool` part
+/// (`state.output`/`state.error`, `harness/opencode.rs` `tool_blocks`), Gemini into the same
+/// `toolCalls[]` entry as the call (`toolCalls[].result`, `harness/gemini.rs`). Both readers
+/// synthesize the IR's Tool turn as they parse the call, so it never had a row/object of its own.
+/// Every other target writes a standalone record for the result (Claude a `user` line with a
+/// `tool_result` block, Codex a `function_call_output` item, OpenClaw a `toolResult` message,
+/// Hermes a `tool` row, Grok a `tool_result` line) and therefore keeps its id and timestamp.
+///
+/// Derived by reading the emitters: these are exactly the two that `continue`/skip on
+/// [`Role::Tool`] instead of writing a record.
+/// Targets whose reader applies gemini-cli's `isIgnoredUserContent` rule
+/// (`utils/sessionUtils.ts`): a user turn beginning `/` or `?` is a command typed AT the client,
+/// never a prompt sent to the model, so reading one back yields a System / `injected_context` turn
+/// rather than the `prompt` that went in. The turn and its text survive intact — only the tagging
+/// changes — so this is a known transformation to model, not a loss to report. Qwen shares Gemini's
+/// parser and therefore its rule.
+fn reroles_client_commands(t: Harness) -> bool {
+    matches!(t, Harness::Gemini | Harness::Qwen)
+}
+
+/// A human-typed client command (`/compact`, `?help`) rather than a prompt for the model.
+fn is_client_command(m: &Message) -> bool {
+    m.kind == MessageKind::Prompt
+        && m.text()
+            .map(|t| {
+                let t = t.trim_start();
+                t.starts_with('/') || t.starts_with('?')
+            })
+            .unwrap_or(false)
+}
+
+fn folds_tool_result(t: Harness) -> bool {
+    matches!(t, Harness::OpenCode | Harness::Gemini)
+}
+
+/// [`target_holds`] under the requested [`ThinkingMode`]: `drop` is the user saying "lose the
+/// reasoning", so a thinking loss there is expected no matter what the target could have held.
+/// (`text` needs no override — the text lands in a [`Block::Text`] and the structured payloads are
+/// still classified by the target's own capability, which is what makes the report stay honest.)
+fn holds(target: Harness, thinking: ThinkingMode, field: &str) -> bool {
+    if thinking == ThinkingMode::Drop && field.starts_with("thinking_") {
+        return false;
+    }
+    target_holds(target, field)
+}
+
+/// The model id [`emit_grok`] records in `summary.json` as `current_model_id` — the session's own
+/// when Grok can serve it, else [`GROK_FALLBACK_MODEL`]. Shared with the verifier so "did the
+/// emitter pin a foreign model?" is asked of the same code that does the pinning.
+fn grok_model_id(session: &Session) -> &str {
+    session
+        .model
+        .as_deref()
+        .filter(|m| session.harness == Harness::Grok || m.to_ascii_lowercase().contains("grok"))
+        .unwrap_or(GROK_FALLBACK_MODEL)
+}
+
+/// What `summary.json` records when the source model is not one Grok can run.
+const GROK_FALLBACK_MODEL: &str = "grok-build";
+
 /// The v2 diff: compare the source IR against what the target's own adapter read back, field by
 /// field, classifying each surviving delta. Only *losses* (count decreases, dropped/altered session
 /// fields) are reported — the re-parse legitimately adds records (compaction notes, synthesized
 /// ids/timestamps), and an addition is never a fidelity loss.
-fn diff_fidelity(target: Harness, input: &Session, reparsed: &Session) -> FidelityReport {
-    let before = features(target, input);
-    let after = features(target, reparsed);
+fn diff_fidelity(target: Harness, thinking: ThinkingMode, input: &Session, reparsed: &Session) -> FidelityReport {
+    let before = features(target, thinking, input);
+    let after = features(target, thinking, reparsed);
     // Turns the target cannot represent at all: reported once, as their own expected loss, instead
     // of as a phantom deficit spread over role/kind/timestamp/id counts.
     let dropped = input
         .messages
         .iter()
-        .filter(|m| !is_carrier(m) && unrepresentable(target, m))
+        .filter(|m| !is_carrier(m) && unrepresentable(target, thinking, m))
         .count();
     let mut deltas = Vec::new();
 
     // A count loss (after < before) for `field`, classified via the target's capability table.
-    fn count_delta(deltas: &mut Vec<Delta>, target: Harness, field: &str, label: &str, b: usize, a: usize) {
+    let count_delta = |deltas: &mut Vec<Delta>, field: &str, label: &str, b: usize, a: usize| {
         if a < b {
             deltas.push(Delta {
                 field: label.to_string(),
                 before: b.to_string(),
                 after: a.to_string(),
-                expected: !target_holds(target, field),
+                expected: !holds(target, thinking, field),
             });
         }
-    }
+    };
     // A dropped-or-changed session-level option field.
     fn opt_delta(
         deltas: &mut Vec<Delta>,
@@ -655,10 +972,9 @@ fn diff_fidelity(target: Harness, input: &Session, reparsed: &Session) -> Fideli
         });
     }
 
-    count_delta(&mut deltas, target, "text", "block:text", before.text, after.text);
+    count_delta(&mut deltas, "text", "block:text", before.text, after.text);
     count_delta(
         &mut deltas,
-        target,
         "tool_use",
         "block:tool_use",
         before.tool_use,
@@ -666,17 +982,15 @@ fn diff_fidelity(target: Harness, input: &Session, reparsed: &Session) -> Fideli
     );
     count_delta(
         &mut deltas,
-        target,
         "tool_result",
         "block:tool_result",
         before.tool_result,
         after.tool_result,
     );
-    count_delta(&mut deltas, target, "image", "block:image", before.image, after.image);
-    count_delta(&mut deltas, target, "file", "block:file", before.file, after.file);
+    count_delta(&mut deltas, "image", "block:image", before.image, after.image);
+    count_delta(&mut deltas, "file", "block:file", before.file, after.file);
     count_delta(
         &mut deltas,
-        target,
         "thinking_text",
         "thinking(text)",
         before.thinking_text,
@@ -684,7 +998,6 @@ fn diff_fidelity(target: Harness, input: &Session, reparsed: &Session) -> Fideli
     );
     count_delta(
         &mut deltas,
-        target,
         "thinking_signature",
         "thinking(signature)",
         before.thinking_sig,
@@ -692,7 +1005,6 @@ fn diff_fidelity(target: Harness, input: &Session, reparsed: &Session) -> Fideli
     );
     count_delta(
         &mut deltas,
-        target,
         "thinking_encrypted",
         "thinking(encrypted)",
         before.thinking_enc,
@@ -700,7 +1012,6 @@ fn diff_fidelity(target: Harness, input: &Session, reparsed: &Session) -> Fideli
     );
     count_delta(
         &mut deltas,
-        target,
         "tool_name",
         "tool_name on result",
         before.results_with_name,
@@ -708,7 +1019,6 @@ fn diff_fidelity(target: Harness, input: &Session, reparsed: &Session) -> Fideli
     );
     count_delta(
         &mut deltas,
-        target,
         "is_error",
         "tool result is_error",
         before.results_is_error,
@@ -716,26 +1026,37 @@ fn diff_fidelity(target: Harness, input: &Session, reparsed: &Session) -> Fideli
     );
     count_delta(
         &mut deltas,
-        target,
         "details",
         "tool result details",
         before.results_with_details,
         after.results_with_details,
     );
-    count_delta(&mut deltas, target, "usage", "usage", before.usage, after.usage);
-    count_delta(&mut deltas, target, "cost", "usage cost", before.cost, after.cost);
+    count_delta(&mut deltas, "usage", "usage", before.usage, after.usage);
+    count_delta(&mut deltas, "cost", "usage cost", before.cost, after.cost);
     count_delta(
         &mut deltas,
-        target,
         "timestamp",
         "timestamps",
         before.timestamps,
         after.timestamps,
     );
-    count_delta(&mut deltas, target, "id", "message ids", before.ids, after.ids);
     count_delta(
         &mut deltas,
-        target,
+        "timestamp:tool_turn",
+        "timestamps (tool turns)",
+        before.timestamps_tool,
+        after.timestamps_tool,
+    );
+    count_delta(&mut deltas, "id", "message ids", before.ids, after.ids);
+    count_delta(
+        &mut deltas,
+        "id:tool_turn",
+        "message ids (tool turns)",
+        before.ids_tool,
+        after.ids_tool,
+    );
+    count_delta(
+        &mut deltas,
         "model",
         "per-message model",
         before.model_eff,
@@ -759,11 +1080,23 @@ fn diff_fidelity(target: Harness, input: &Session, reparsed: &Session) -> Fideli
         input.cwd.as_ref().map(|p| p.to_string_lossy().into_owned()),
         reparsed.cwd.as_ref().map(|p| p.to_string_lossy().into_owned()),
     );
+    // The session model. A target that deliberately *pins* its own model rather than carrying a
+    // foreign one (Grok — see `session_model_foreign` in [`target_holds`]) is classified under that
+    // key, so the substitution is reported but not counted against the emitter.
+    let model_pinned = target == Harness::Grok && input.model.as_deref().is_some_and(|m| grok_model_id(input) != m);
     opt_delta(
         &mut deltas,
         target,
-        "session_model",
-        "session model",
+        if model_pinned {
+            "session_model_foreign"
+        } else {
+            "session_model"
+        },
+        if model_pinned {
+            "session model (foreign)"
+        } else {
+            "session model"
+        },
         input.model.clone(),
         reparsed.model.clone(),
     );
@@ -1051,12 +1384,15 @@ fn emit_claude(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<
                     message.insert("model".into(), json!(model));
                 }
                 // Reconstruct the API `usage` block from the first-classed [`Usage`] (the parser
-                // pulls it out of `message.usage`), so a complete round-trip keeps the token counts.
-                // Same-harness only, so cross-harness convert output is unchanged.
-                if session.harness == Harness::Claude {
-                    if let Some(usage) = claude_usage(msg.usage.as_ref()) {
-                        message.insert("usage".into(), usage);
-                    }
+                // pulls it out of `message.usage`), so the token counts survive. This is NOT
+                // same-harness-only: `message.usage` is Claude's own slot for exactly these four
+                // numbers, and every harness that records usage records the same ones, so a Codex
+                // or OpenCode session ported here keeps them too (it used to read back
+                // `usage: 2032 → 0`). A Claude→Claude replay is byte-identical either way —
+                // `usage` is first-classed out of the record (`CLAUDE_FIRSTCLASS_MSG`), so this is
+                // the only thing that writes it and the key order is unchanged.
+                if let Some(usage) = claude_usage(msg.usage.as_ref()) {
+                    message.insert("usage".into(), usage);
                 }
                 message.insert("content".into(), Value::Array(blocks));
                 line.insert("message".into(), Value::Object(message));
@@ -1357,6 +1693,8 @@ fn claude_tool_result_blocks(content: &[Block]) -> Vec<Value> {
 
 fn emit_codex(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<EmitResult> {
     let new_id = opts.new_id.clone().unwrap_or_else(|| Uuid::now_v7().to_string());
+    // Which tool calls exist at all, so a result whose call was pruned away can be paired below.
+    let called = called_tool_ids(session);
     // `session_meta.cwd` (and `turn_context.cwd`) are REQUIRED by Codex's decoder (`SessionMeta.cwd:
     // PathBuf`, no default): a meta line without one is undecodable, the thread id can't be read,
     // and resume fails with "failed to parse thread ID from rollout file". A session with no known
@@ -1579,7 +1917,7 @@ fn emit_codex(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<E
                 // ported session read back `usage: 393 → 0`. Only when the turn actually wrote
                 // records Codex reads back: trailing nothing (or only an empty `reasoning` item,
                 // which its reader drops) the event would synthesize a bare usage-only turn.
-                if lines.len() > first_record && !unrepresentable(Harness::Codex, msg) {
+                if lines.len() > first_record && !unrepresentable(Harness::Codex, opts.thinking, msg) {
                     if let Some(info) = codex_token_usage(msg.usage.as_ref()) {
                         lines.push(codex_event_msg(
                             &ts,
@@ -1594,6 +1932,7 @@ fn emit_codex(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<E
                         tool_use_id,
                         content,
                         is_error,
+                        tool_name,
                         ..
                     } = b
                     {
@@ -1608,6 +1947,22 @@ fn emit_codex(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<E
                         } else {
                             json!(content)
                         };
+                        // Codex pairs an output with the call above it and logs "Orphan function
+                        // call output for call id" for one it cannot pair — which a pruned session
+                        // produces, since its first turn can be a result whose call was snipped.
+                        // Emit a call shell first so the pair is well-formed and the output's text
+                        // still reaches the model, rather than dropping the turn.
+                        if is_orphan_result(b, &called) {
+                            lines.push(codex_response_item(
+                                &ts,
+                                json!({
+                                    "type": "function_call",
+                                    "call_id": tool_use_id,
+                                    "name": tool_name.clone().unwrap_or_else(|| "unknown".into()),
+                                    "arguments": "{}",
+                                }),
+                            ));
+                        }
                         lines.push(codex_response_item(
                             &ts,
                             json!({
@@ -1737,12 +2092,9 @@ fn emit_grok(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Em
     // cross-harness port only when it *is* a Grok model; otherwise default to `grok-build`. A
     // foreign model id (e.g. `gpt-5.5`) would make Grok replay the history against an incompatible
     // backend, so it is dropped there — but a same-harness rehome must round-trip the model exactly.
-    let model_id = session
-        .model
-        .as_deref()
-        .filter(|m| session.harness == Harness::Grok || m.to_ascii_lowercase().contains("grok"))
-        .unwrap_or("grok-build");
-    summary.insert("current_model_id".into(), json!(model_id));
+    // The verifier asks [`grok_model_id`] the same question, and classifies a pinned foreign model
+    // as an expected substitution rather than an avoidable loss.
+    summary.insert("current_model_id".into(), json!(grok_model_id(session)));
     if let Some(g) = &session.git {
         if let Some(b) = &g.branch {
             summary.insert("head_branch".into(), json!(b));
@@ -2033,15 +2385,19 @@ fn emit_opencode_db(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Re
         }
     }
 
+    let called = called_tool_ids(session);
+
     let base = created;
     let mut seq: u64 = 0;
     for msg in &session.messages {
-        // Tool turns are folded into the assistant's tool parts; no standalone message.
-        if msg.role == Role::Tool {
+        // Tool turns are folded into the assistant's tool parts; no standalone message. The
+        // exception is a turn carrying an ORPHAN result ([`called_tool_ids`]): nothing folds it, so
+        // it rides in a message of its own or it is lost outright.
+        if msg.role == Role::Tool && !msg.content.iter().any(|b| is_orphan_result(b, &called)) {
             continue;
         }
         let role = match msg.role {
-            Role::Assistant => "assistant",
+            Role::Assistant | Role::Tool => "assistant",
             Role::System => "system",
             _ => "user",
         };
@@ -2102,61 +2458,7 @@ fn emit_opencode_db(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Re
                     write_part(Value::Object(p))?;
                 }
                 Block::ToolUse { id, name, input, .. } => {
-                    let mut state = Map::new();
-                    state.insert("input".into(), input.clone());
-                    if let Some(Block::ToolResult {
-                        content,
-                        is_error,
-                        details,
-                        ..
-                    }) = tool_results.get(id).copied()
-                    {
-                        if *is_error {
-                            state.insert("status".into(), json!("error"));
-                            state.insert("error".into(), json!(content));
-                        } else {
-                            state.insert("status".into(), json!("completed"));
-                            state.insert("output".into(), json!(content));
-                        }
-                        // `details` was read from `state.{title,metadata,time}`; fold it back so an
-                        // OpenCode→OpenCode round-trip reproduces the result's structured details.
-                        // A FOREIGN details (Claude's `toolUseResult`, Kimi's note/truncation) has
-                        // none of those three keys, and dropping it read back as
-                        // `tool result details: 194 → 0`. Its keys ride in `metadata`, OpenCode's own
-                        // free-form slot for a tool's structured extras — which is exactly where the
-                        // adapter reads them back from.
-                        if let Some(d) = details {
-                            let mut meta = d
-                                .get("metadata")
-                                .and_then(Value::as_object)
-                                .cloned()
-                                .unwrap_or_default();
-                            match d {
-                                Value::Object(d) => {
-                                    for (k, v) in d {
-                                        match k.as_str() {
-                                            "title" | "time" => {
-                                                state.insert(k.clone(), v.clone());
-                                            }
-                                            "metadata" if v.is_object() => {}
-                                            _ => {
-                                                meta.insert(k.clone(), v.clone());
-                                            }
-                                        }
-                                    }
-                                }
-                                // A scalar sidecar (no key to hang it on) still belongs in metadata.
-                                other => {
-                                    meta.insert("details".into(), other.clone());
-                                }
-                            }
-                            if !meta.is_empty() {
-                                state.insert("metadata".into(), Value::Object(meta));
-                            }
-                        }
-                    } else {
-                        state.insert("status".into(), json!("completed"));
-                    }
+                    let state = opencode_tool_state(Some(input), tool_results.get(id).copied());
                     write_part(json!({
                         "type": "tool",
                         "callID": id,
@@ -2186,6 +2488,19 @@ fn emit_opencode_db(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Re
                     }
                     write_part(Value::Object(p))?;
                 }
+                // An ORPHAN result gets a `tool` part of its own — the output, with no `input`,
+                // because the call it answers is not in this session. A result that HAS its call
+                // here was already folded onto that call's part above, so it is skipped.
+                Block::ToolResult {
+                    tool_use_id, tool_name, ..
+                } if !called.contains(tool_use_id.as_str()) => {
+                    write_part(json!({
+                        "type": "tool",
+                        "callID": tool_use_id,
+                        "tool": tool_name.clone().unwrap_or_default(),
+                        "state": Value::Object(opencode_tool_state(None, Some(b))),
+                    }))?;
+                }
                 Block::ToolResult { .. } => {}
             }
         }
@@ -2197,6 +2512,92 @@ fn emit_opencode_db(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Re
         new_id: new_id.clone(),
         resume_hint: Some(format!("opencode --session {new_id}")),
     })
+}
+
+/// The `state` object of an OpenCode `tool` part: the call's `input`, plus — when the session
+/// paired one with it — the result's status, output-or-error and structured `details`.
+///
+/// `input` is `None` for an **orphan** result (see [`emit_opencode_db`]): the call itself is not in
+/// this session, so there are no arguments to record, only what came back.
+fn opencode_tool_state(input: Option<&Value>, result: Option<&Block>) -> Map<String, Value> {
+    let mut state = Map::new();
+    if let Some(input) = input {
+        state.insert("input".into(), input.clone());
+    }
+    let Some(Block::ToolResult {
+        content,
+        is_error,
+        details,
+        ..
+    }) = result
+    else {
+        state.insert("status".into(), json!("completed"));
+        return state;
+    };
+    if *is_error {
+        state.insert("status".into(), json!("error"));
+        state.insert("error".into(), json!(content));
+    } else {
+        state.insert("status".into(), json!("completed"));
+        state.insert("output".into(), json!(content));
+    }
+    // `details` was read from `state.{title,metadata,time}`; fold it back so an OpenCode→OpenCode
+    // round-trip reproduces the result's structured details. A FOREIGN details (Claude's
+    // `toolUseResult`, Kimi's note/truncation) has none of those three keys, and dropping it read
+    // back as `tool result details: 194 → 0`. Its keys ride in `metadata`, OpenCode's own free-form
+    // slot for a tool's structured extras — which is exactly where the adapter reads them back from.
+    if let Some(d) = details {
+        let mut meta = d
+            .get("metadata")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        match d {
+            Value::Object(d) => {
+                for (k, v) in d {
+                    match k.as_str() {
+                        "title" | "time" => {
+                            state.insert(k.clone(), v.clone());
+                        }
+                        "metadata" if v.is_object() => {}
+                        _ => {
+                            meta.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+            }
+            // A scalar sidecar (no key to hang it on) still belongs in metadata.
+            other => {
+                meta.insert("details".into(), other.clone());
+            }
+        }
+        if !meta.is_empty() {
+            state.insert("metadata".into(), Value::Object(meta));
+        }
+    }
+    state
+}
+
+/// Every `tool_use` id this session actually calls. A result whose `tool_use_id` is NOT in here is
+/// an **orphan**: its call lives outside the transcript, which is the ordinary shape of a resumed or
+/// `prune`d session that opens mid-call (a real 1639-message Claude session starts with exactly one
+/// such result, its call pruned away). Emitters that store a result *inside* its call's record
+/// (OpenCode, Gemini) would otherwise have nothing to fold it onto and would drop it silently.
+fn called_tool_ids(session: &Session) -> std::collections::HashSet<&str> {
+    session
+        .messages
+        .iter()
+        .flat_map(|m| &m.content)
+        .filter_map(|b| match b {
+            Block::ToolUse { id, .. } => Some(id.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A [`Block::ToolResult`] with no call in this session — see [`called_tool_ids`].
+fn is_orphan_result(b: &Block, called: &std::collections::HashSet<&str>) -> bool {
+    matches!(b, Block::ToolResult { tool_use_id, .. } if !called.contains(tool_use_id.as_str()))
 }
 
 /// A short, stable, filesystem-safe hash of a string (FNV-1a, hex). Used for project-dir names.
@@ -2552,6 +2953,8 @@ fn emit_gemini(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<
         }
     }
 
+    let called = called_tool_ids(session);
+
     let mut messages: Vec<Value> = Vec::new();
     for msg in &session.messages {
         let ts = msg.timestamp.map(|t| t.to_rfc3339_opts(SecondsFormat::Millis, true));
@@ -2635,8 +3038,50 @@ fn emit_gemini(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<
                 }
                 messages.push(Value::Object(m));
             }
-            // Tool turns are folded into the assistant's toolCalls[].result above.
-            Role::Tool => {}
+            // Tool turns are folded into the assistant's toolCalls[].result above — except an
+            // ORPHAN result ([`called_tool_ids`]), which has no call here to fold onto. It gets a
+            // `gemini` record of its own holding the call shell (no `args`) and the response, so
+            // the output survives instead of vanishing.
+            Role::Tool => {
+                let calls: Vec<Value> = msg
+                    .content
+                    .iter()
+                    .filter_map(|b| match b {
+                        Block::ToolResult {
+                            tool_use_id,
+                            content,
+                            is_error,
+                            tool_name,
+                            ..
+                        } if !called.contains(tool_use_id.as_str()) => {
+                            let name = tool_name.clone().unwrap_or_else(|| "tool".into());
+                            Some(json!({
+                                "id": tool_use_id,
+                                "name": name,
+                                "status": if *is_error { "error" } else { "success" },
+                                "result": [{
+                                    "functionResponse": {
+                                        "id": tool_use_id,
+                                        "name": name,
+                                        "response": { "output": content.to_string() },
+                                    }
+                                }],
+                            }))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                if !calls.is_empty() {
+                    let mut m = Map::new();
+                    m.insert("id".into(), json!(Uuid::new_v4().to_string()));
+                    m.insert("type".into(), json!("gemini"));
+                    if let Some(t) = &ts {
+                        m.insert("timestamp".into(), json!(t));
+                    }
+                    m.insert("toolCalls".into(), Value::Array(calls));
+                    messages.push(Value::Object(m));
+                }
+            }
         }
     }
 
@@ -4882,6 +5327,233 @@ mod tests {
         );
     }
 
+    /// The capability table for a TOOL turn's own id/timestamp. OpenCode and Gemini store a tool
+    /// result inside its originating call's record, so the turn has no record to carry them; every
+    /// other target writes the result as its own record and keeps them. The narrow key is the whole
+    /// point: `id`/`timestamp` on a NORMAL turn must keep answering for themselves.
+    #[test]
+    fn tool_turn_id_is_expected_only_where_the_store_folds_the_result() {
+        for t in [Harness::OpenCode, Harness::Gemini] {
+            assert!(folds_tool_result(t), "{t} folds a result into its call's record");
+            assert!(
+                !target_holds(t, "id:tool_turn"),
+                "{t}: a tool turn has no id of its own"
+            );
+            assert!(
+                !target_holds(t, "timestamp:tool_turn"),
+                "{t}: a tool turn has no timestamp of its own"
+            );
+            // …and that must NOT have excused the ordinary fields.
+            assert!(target_holds(t, "id"), "{t} still holds a normal turn's id");
+            assert!(
+                target_holds(t, "timestamp"),
+                "{t} still holds a normal turn's timestamp"
+            );
+        }
+        // A target that gives the result its own record answers exactly as it does for any turn.
+        for t in [Harness::Claude, Harness::OpenClaw, Harness::Kimi] {
+            assert!(!folds_tool_result(t));
+            assert!(target_holds(t, "id:tool_turn"), "{t} keeps a tool turn's id");
+            assert!(
+                target_holds(t, "timestamp:tool_turn"),
+                "{t} keeps a tool turn's timestamp"
+            );
+        }
+        // Codex has no per-message id at all, so a tool turn's is expected there for the older
+        // reason — the narrow key never *adds* a capability.
+        assert!(!target_holds(Harness::Codex, "id"));
+        assert!(!target_holds(Harness::Codex, "id:tool_turn"));
+        assert!(target_holds(Harness::Codex, "timestamp:tool_turn"));
+    }
+
+    /// Both directions of the new classification, through the real diff: a folding target losing
+    /// every TOOL turn's id/timestamp is an expected loss and passes `--strict`; the same target
+    /// losing a NORMAL turn's id is still unexpected and still fails it.
+    #[test]
+    fn a_folded_tool_turns_lost_id_is_expected_a_normal_turns_is_not() {
+        let mut src = sample_session(Harness::Claude);
+        for (i, m) in src.messages.iter_mut().enumerate() {
+            m.id = Some(format!("m{i}"));
+            m.timestamp = Some(Utc::now());
+        }
+
+        // What a folding store reads back: every turn keeps its id and timestamp except the tool
+        // turn, which the reader rebuilt out of the call and has nowhere to read them from.
+        let mut folded = src.clone();
+        for m in &mut folded.messages {
+            if m.role == Role::Tool {
+                m.id = None;
+                m.timestamp = None;
+            }
+        }
+        let report = diff_fidelity(Harness::OpenCode, ThinkingMode::Native, &src, &folded);
+        let d = report
+            .deltas
+            .iter()
+            .find(|d| d.field == "message ids (tool turns)")
+            .expect("the tool turn's lost id is reported");
+        assert_eq!((d.before.as_str(), d.after.as_str()), ("1", "0"));
+        assert!(d.expected, "OpenCode cannot give a tool turn an id");
+        assert!(
+            report.deltas.iter().any(|d| d.field == "timestamps (tool turns)"),
+            "and its timestamp too: {:?}",
+            report.deltas
+        );
+        assert!(!report.has_unexpected(), "so --strict passes: {:?}", report.deltas);
+
+        // The same target losing an ASSISTANT turn's id is a loss it could have avoided.
+        let mut normal = src.clone();
+        for m in &mut normal.messages {
+            if m.role == Role::Assistant {
+                m.id = None;
+            }
+        }
+        let report = diff_fidelity(Harness::OpenCode, ThinkingMode::Native, &src, &normal);
+        let d = report
+            .deltas
+            .iter()
+            .find(|d| d.field == "message ids")
+            .expect("a normal turn's lost id is reported");
+        assert!(!d.expected, "a normal turn's id loss stays unexpected");
+        assert!(report.has_unexpected(), "and --strict still fails on it");
+    }
+
+    /// A session that opens mid-call — a resumed or `prune`d transcript whose first tool result has
+    /// no `tool_use` anywhere in it — keeps that result when ported into a store that folds results
+    /// into their call's record. Both emitters used to index results by call id and silently drop
+    /// the ones that matched nothing, which cost a real 1639-message port one tool result, its
+    /// `details` and its whole Tool turn.
+    fn session_with_an_orphan_result(harness: Harness) -> Session {
+        let mut s = sample_session(harness);
+        let mut orphan = Message::new(Role::Tool);
+        orphan.timestamp = Some(Utc::now());
+        orphan.content.push(Block::ToolResult {
+            tool_use_id: "call_from_before_the_prune".into(),
+            content: "the output of a call this transcript does not contain".into(),
+            is_error: false,
+            tool_name: Some("run_shell".into()),
+            status: None,
+            details: Some(serde_json::json!({ "title": "ls" })),
+        });
+        s.messages.insert(0, orphan);
+        s
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn opencode_keeps_a_tool_result_whose_call_is_not_in_the_session() {
+        let s = session_with_an_orphan_result(Harness::OpenCode);
+        let storage = temp_dir().join(".local/share/opencode/storage");
+        fs::create_dir_all(&storage).unwrap();
+        let res = emit(&s, Harness::OpenCode, &storage, &EmitOptions::default()).unwrap();
+        let oc = OpenCode::with_db(res.path.clone());
+        let parsed = oc
+            .discover()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == res.new_id)
+            .map(|r| oc.parse(&r).unwrap())
+            .expect("discoverable");
+
+        let orphan = parsed
+            .messages
+            .iter()
+            .flat_map(|m| &m.content)
+            .find_map(|b| match b {
+                Block::ToolResult {
+                    tool_use_id, content, ..
+                } if tool_use_id == "call_from_before_the_prune" => Some(content.to_string()),
+                _ => None,
+            })
+            .expect("the orphan result survives the port");
+        assert!(orphan.contains("does not contain"));
+        assert_eq!(
+            parsed.messages.iter().filter(|m| m.role == Role::Tool).count(),
+            2,
+            "both tool turns are there — the paired one and the orphan"
+        );
+
+        let (_r, report) = emit_report(&s, Harness::OpenCode, &temp_dir(), &EmitOptions::default()).unwrap();
+        assert!(
+            !report.has_unexpected(),
+            "opencode orphan round-trip: {:?}",
+            report.deltas
+        );
+    }
+
+    /// Codex pairs a `function_call_output` with the `function_call` above it and logs "Orphan
+    /// function call output for call id" for one it cannot pair — which every ported pruned session
+    /// produced, because a pruned transcript can open on a result whose call was snipped away.
+    /// Emitting a call shell first keeps the pair well-formed AND the output's text in the thread.
+    #[test]
+    fn codex_pairs_an_orphan_tool_output_with_a_call_shell() {
+        let s = session_with_an_orphan_result(Harness::Codex);
+        let dir = temp_dir();
+        let res = emit(&s, Harness::Codex, &dir, &EmitOptions::default()).unwrap();
+        let text = fs::read_to_string(&res.path).unwrap();
+        let items: Vec<Value> = text.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
+
+        let ids = |ty: &str| -> Vec<String> {
+            items
+                .iter()
+                .filter(|i| i["payload"]["type"] == ty)
+                .filter_map(|i| i["payload"]["call_id"].as_str().map(str::to_string))
+                .collect()
+        };
+        let calls = ids("function_call");
+        let outs = ids("function_call_output");
+        for o in &outs {
+            assert!(calls.contains(o), "every output is paired; {o} is orphaned:\n{text}");
+        }
+        assert!(
+            calls.contains(&"call_from_before_the_prune".to_string()),
+            "the orphan got a call shell:\n{text}"
+        );
+        // And the shell sits BEFORE its output, which is what Codex's pairing relies on.
+        let pos = |ty: &str| {
+            items
+                .iter()
+                .position(|i| i["payload"]["type"] == ty && i["payload"]["call_id"] == "call_from_before_the_prune")
+        };
+        assert!(pos("function_call") < pos("function_call_output"), "{text}");
+    }
+
+    #[test]
+    fn gemini_keeps_a_tool_result_whose_call_is_not_in_the_session() {
+        let s = session_with_an_orphan_result(Harness::Gemini);
+        let dir = temp_dir();
+        let res = emit(&s, Harness::Gemini, &dir, &EmitOptions::default()).unwrap();
+        let r = SessionRef {
+            id: res.new_id.clone(),
+            harness: Harness::Gemini,
+            path: res.path.clone(),
+            cwd: None,
+            title: None,
+            created_at: None,
+            updated_at: None,
+            message_count: 0,
+        };
+        let parsed = Gemini::new().parse(&r).unwrap();
+
+        let orphan = parsed
+            .messages
+            .iter()
+            .flat_map(|m| &m.content)
+            .find_map(|b| match b {
+                Block::ToolResult {
+                    tool_use_id, content, ..
+                } if tool_use_id == "call_from_before_the_prune" => Some(content.to_string()),
+                _ => None,
+            })
+            .expect("the orphan result survives the port");
+        assert!(orphan.contains("does not contain"));
+        assert_eq!(
+            parsed.messages.iter().filter(|m| m.role == Role::Tool).count(),
+            2,
+            "both tool turns are there — the paired one and the orphan"
+        );
+    }
+
     /// The `⚠ lost` rendering never dumps a whole value: a real session's system prompt is
     /// thousands of lines, and printing it buried every other delta in scrollback. The struct keeps
     /// the full value for `--json`.
@@ -5026,35 +5698,35 @@ mod tests {
         );
     }
 
-    /// `--strict` fails on an *unexpected* loss — one the target format could have carried. Tool
-    /// result `details` used to be that loss for Claude (parse kept the sidecar in
-    /// `extra["claude"]`, so a re-parse read back no block-level details); it now round-trips, so
-    /// the subject here is per-message `usage`: Claude's records carry a `message.usage` block
-    /// (`target_holds(Claude, "usage")`), but `emit_claude` only reconstructs one for a
-    /// same-harness replay, so a foreign source's token counts are genuinely dropped. If that gap
-    /// is ever closed, point this test at another real one rather than weakening the check.
+    /// `--strict` fails on an *unexpected* loss — one the target format could have carried. The
+    /// subject has had to move twice, because each previous one got fixed: tool-result `details`
+    /// (now round-trips) and then per-message `usage` (now written for every source harness, see
+    /// [`claude_carries_usage_from_a_foreign_source`]). It is now the **text of a foreign System
+    /// turn**: Claude's transcript has no standalone system record, so `emit_claude` drops the turn
+    /// — but its text is not inherently unportable there (a foreign `InjectedContext` turn is
+    /// carried into an `attachment` record a few lines away), so `target_holds(Claude, "text")` is
+    /// rightly true and the loss is rightly unexpected. If that gap is ever closed, point this test
+    /// at another real one rather than weakening the check.
     #[test]
     fn strict_fails_on_unexpected_loss() {
-        let mut s = sample_session(Harness::OpenCode); // foreign source → Claude cross-harness path
-        for m in &mut s.messages {
-            if m.role == Role::Assistant {
-                m.usage = Some(crate::ir::Usage {
-                    input_tokens: Some(12),
-                    output_tokens: Some(34),
-                    ..Default::default()
-                });
-            }
-        }
-        // Sanity: the report flags an unexpected `usage` loss.
+        let s = sample_session(Harness::OpenCode); // foreign source → Claude cross-harness path
+        assert!(
+            s.messages.iter().any(|m| m.role == Role::System && m.text().is_some()),
+            "the sample carries a System turn with text"
+        );
+        // Sanity: the report flags an unexpected loss of that text.
         let (_r, report) = emit_report(&s, Harness::Claude, &temp_dir(), &EmitOptions::default()).unwrap();
         assert!(
-            report.deltas.iter().any(|d| d.field.contains("usage") && !d.expected),
-            "expected an unexpected usage loss, got {:?}",
+            report
+                .deltas
+                .iter()
+                .any(|d| d.field == "block:text" && !d.expected && d.before == "3" && d.after == "2"),
+            "expected an unexpected text loss, got {:?}",
             report.deltas
         );
         // Non-strict: succeeds, lists the loss.
         let (_res, warnings) = emit_verified(&s, Harness::Claude, &temp_dir(), &EmitOptions::default()).unwrap();
-        assert!(warnings.iter().any(|w| w.contains("usage")));
+        assert!(warnings.iter().any(|w| w.contains("block:text")));
         // Strict: errors.
         let err = emit_verified(
             &s,
@@ -5067,5 +5739,281 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("strict"), "got: {err:#}");
+    }
+
+    /// Per-turn token usage survives a port into Claude **from another harness**. Claude keeps the
+    /// counts at `message.usage` and `target_holds(Claude, "usage")` says so, but `emit_claude`
+    /// rebuilt that block only when replaying a Claude session from its own fact bag — so a real
+    /// Codex session ported here read back `usage: 2032 → 0`, an unexpected loss on every port.
+    #[test]
+    fn claude_carries_usage_from_a_foreign_source() {
+        for src in [Harness::Codex, Harness::OpenCode] {
+            let mut s = sample_session(src);
+            for m in &mut s.messages {
+                if m.role == Role::Assistant {
+                    m.usage = Some(crate::ir::Usage {
+                        input_tokens: Some(12),
+                        output_tokens: Some(34),
+                        cache_read_tokens: Some(5),
+                        cache_creation_tokens: Some(6),
+                        reasoning_tokens: Some(7),
+                        cost_usd: Some(0.5),
+                    });
+                }
+            }
+            let (res, report) = emit_report(&s, Harness::Claude, &temp_dir(), &EmitOptions::default()).unwrap();
+            assert!(
+                !report.deltas.iter().any(|d| d.field == "usage"),
+                "usage must survive {src} → Claude, got {:?}",
+                report.deltas
+            );
+            // …and it is really Claude's own `message.usage` shape, read back by Claude's parser.
+            let re = reparse_emitted(Harness::Claude, &res, &ParseOptions::full()).unwrap();
+            let u = re
+                .messages
+                .iter()
+                .filter(|m| m.role == Role::Assistant)
+                .find_map(|m| m.usage.as_ref())
+                .unwrap_or_else(|| panic!("usage on the re-parsed Claude session ({src})"));
+            assert_eq!(
+                (
+                    u.input_tokens,
+                    u.output_tokens,
+                    u.cache_read_tokens,
+                    u.cache_creation_tokens
+                ),
+                (Some(12), Some(34), Some(5), Some(6))
+            );
+            // The raw record carries the Anthropic spelling of the cache fields.
+            let raw = fs::read_to_string(&res.path).unwrap();
+            assert!(
+                raw.contains("\"cache_read_input_tokens\":5") && raw.contains("\"cache_creation_input_tokens\":6"),
+                "Anthropic key spellings in the emitted record"
+            );
+        }
+    }
+
+    /// Hermes cannot carry a tool result's error flag, so the loss is expected, not a `--strict`
+    /// failure. Evidence (schema v30, `hermes_state_common.py` SCHEMA_SQL): the `messages` table
+    /// has no error/status column — `effect_disposition` is the side-effect classification and
+    /// `finish_reason` is the assistant stop reason — and Hermes's own writers (`append_message`,
+    /// `make_tool_result_message`) take no error argument, so a failure reaches the store only as
+    /// the text of `content`. Its reader therefore builds every tool block with `is_error: false`.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn hermes_tool_result_is_error_is_an_expected_loss() {
+        let mut s = sample_session(Harness::Claude);
+        for m in &mut s.messages {
+            for b in &mut m.content {
+                if let Block::ToolResult { is_error, .. } = b {
+                    *is_error = true;
+                }
+            }
+        }
+        let (_res, report) = emit_report(&s, Harness::Hermes, &temp_dir(), &EmitOptions::default()).unwrap();
+        let d = report
+            .deltas
+            .iter()
+            .find(|d| d.field == "tool result is_error")
+            .expect("the flag is reported as lost");
+        assert!(d.expected, "Hermes has no column for it: {d:?}");
+        // …so `--strict` does not fail on it.
+        emit_verified(
+            &s,
+            Harness::Hermes,
+            &temp_dir(),
+            &EmitOptions {
+                strict: true,
+                ..Default::default()
+            },
+        )
+        .expect("an expected loss never fails --strict");
+        // A target that *does* have a slot still has to fill it.
+        let (_res, report) = emit_report(&s, Harness::Grok, &temp_dir(), &EmitOptions::default()).unwrap();
+        assert!(
+            !report.deltas.iter().any(|d| d.field == "tool result is_error"),
+            "Grok carries it in updates.jsonl, got {:?}",
+            report.deltas
+        );
+    }
+
+    /// Grok *pins* the model it will resume with: `summary.json`'s `current_model_id` is what the
+    /// backend is asked for, so a foreign id would replay the history against a model that cannot
+    /// serve it. Substituting `grok-build` is the correct behaviour, and the verifier says so —
+    /// reported, but as an expected substitution, never a `--strict` failure. A model Grok can run
+    /// is still carried verbatim, and losing THAT would still be unexpected.
+    #[test]
+    fn grok_pins_a_foreign_session_model() {
+        let mut s = sample_session(Harness::Claude);
+        s.model = Some("claude-fable-5-1".into());
+        let (res, report) = emit_report(&s, Harness::Grok, &temp_dir(), &EmitOptions::default()).unwrap();
+        let d = report
+            .deltas
+            .iter()
+            .find(|d| d.field.starts_with("session model"))
+            .expect("the substitution is reported");
+        assert_eq!(d.field, "session model (foreign)");
+        assert_eq!(
+            (d.before.as_str(), d.after.as_str()),
+            ("claude-fable-5-1", "grok-build")
+        );
+        assert!(d.expected, "a pinned model is not an avoidable loss: {d:?}");
+        let summary: Value = serde_json::from_str(&fs::read_to_string(res.path.join("summary.json")).unwrap()).unwrap();
+        assert_eq!(summary["current_model_id"], json!("grok-build"));
+
+        // A Grok model is carried verbatim, and is checked under the plain `session_model` key.
+        let mut g = sample_session(Harness::Grok);
+        g.model = Some("grok-code-fast-1".into());
+        for m in &mut g.messages {
+            m.model = g.model.clone();
+        }
+        let (res, report) = emit_report(&g, Harness::Grok, &temp_dir(), &EmitOptions::default()).unwrap();
+        assert!(
+            !report.deltas.iter().any(|d| d.field.starts_with("session model")),
+            "a Grok model round-trips, got {:?}",
+            report.deltas
+        );
+        let summary: Value = serde_json::from_str(&fs::read_to_string(res.path.join("summary.json")).unwrap()).unwrap();
+        assert_eq!(summary["current_model_id"], json!("grok-code-fast-1"));
+    }
+
+    /// The wire spellings the CLI parses (`--thinking <mode>`), and the default.
+    #[test]
+    fn thinking_mode_parses_from_a_string() {
+        assert_eq!(ThinkingMode::default(), ThinkingMode::Native);
+        assert_eq!(EmitOptions::default().thinking, ThinkingMode::Native);
+        for m in ThinkingMode::ALL {
+            assert_eq!(ThinkingMode::parse(m.as_str()), Some(m));
+            assert_eq!(m.as_str().parse::<ThinkingMode>().unwrap(), m);
+            assert_eq!(m.to_string(), m.as_str());
+        }
+        assert_eq!(ThinkingMode::parse("  TEXT "), Some(ThinkingMode::Text));
+        assert_eq!(ThinkingMode::parse("summarize"), None);
+        let err = "summarize".parse::<ThinkingMode>().unwrap_err().to_string();
+        assert!(err.contains("native, text, drop"), "the error lists the modes: {err}");
+        assert_eq!(
+            ThinkingMode::ALL.map(|m| m.as_str()),
+            ["native", "text", "drop"],
+            "the CLI's possible_values order"
+        );
+    }
+
+    /// A signature-only thinking block against a target that cannot hold signatures (Codex holds
+    /// reasoning *text*, never an Anthropic signature), through all three [`ThinkingMode`]s.
+    /// Measured on a real session: 177 of 204 thinking blocks are signature-only, so this is the
+    /// common case, not the corner.
+    #[test]
+    fn thinking_modes_against_a_target_without_signatures() {
+        // An assistant turn whose ONLY content is a signature-only block, plus one that also has
+        // text (so we can see the text survive independently).
+        let sig_only = |sig: &str| Block::Thinking {
+            text: "".into(),
+            signature: Some(sig.to_string()),
+            encrypted: None,
+            redacted: false,
+        };
+        let mut base = sample_session(Harness::Claude);
+        let mut think = Message::new(Role::Assistant);
+        think.timestamp = Some(Utc::now());
+        think.id = Some("think-1".into());
+        think.content.push(sig_only("SIG-0123456789"));
+        base.messages.insert(3, think);
+        // The turn that already has text also carries a signature (lost either way).
+        for m in &mut base.messages {
+            if m.id.as_deref() == Some("think-1") {
+                continue;
+            }
+            if let Some(Block::Thinking { signature, .. }) = m.content.first_mut() {
+                *signature = Some("SIG-abcdef".into());
+            }
+        }
+        let opts = |t: ThinkingMode| EmitOptions {
+            thinking: t,
+            ..Default::default()
+        };
+        let reparse = |res: &EmitResult| reparse_emitted(Harness::Codex, res, &ParseOptions::full()).unwrap();
+        let thinking_blocks = |s: &Session| -> usize {
+            s.messages
+                .iter()
+                .flat_map(|m| &m.content)
+                .filter(|b| matches!(b, Block::Thinking { .. }))
+                .count()
+        };
+
+        // --- native: today's behaviour. The signature-only turn is unrepresentable and vanishes.
+        let (res, report) = emit_report(&base, Harness::Codex, &temp_dir(), &opts(ThinkingMode::Native)).unwrap();
+        assert!(report.deltas.iter().all(|d| d.expected), "{:?}", report.deltas);
+        assert!(
+            report.deltas.iter().any(|d| d.field == "unrepresentable_turns"),
+            "the sig-only turn is dropped, got {:?}",
+            report.deltas
+        );
+        let re = reparse(&res);
+        assert!(
+            !re.messages
+                .iter()
+                .any(|m| m.id.as_deref() == Some("think-1") || m.text().is_some_and(|t| t.contains("signature-only"))),
+            "native never invents a placeholder"
+        );
+
+        // --- text: the turn survives, and the lost signature is still reported.
+        let (res, report) = emit_report(&base, Harness::Codex, &temp_dir(), &opts(ThinkingMode::Text)).unwrap();
+        assert!(
+            !report.deltas.iter().any(|d| d.field == "unrepresentable_turns"),
+            "no turn is lost under --thinking text, got {:?}",
+            report.deltas
+        );
+        let sig = report
+            .deltas
+            .iter()
+            .find(|d| d.field == "thinking(signature)")
+            .expect("the signature loss is STILL reported — this mode saves the turn, not the blob");
+        assert!(sig.expected, "Codex cannot hold an Anthropic signature: {sig:?}");
+        assert!(report.deltas.iter().all(|d| d.expected), "{:?}", report.deltas);
+        let re = reparse(&res);
+        let placeholder = re
+            .messages
+            .iter()
+            .filter_map(|m| m.text())
+            .find(|t| t.contains("signature-only"))
+            .expect("the sig-only turn came through as a named placeholder");
+        assert!(
+            placeholder.contains("14-byte") && placeholder.contains("thinking"),
+            "the placeholder names what it was and how big: {placeholder}"
+        );
+        // The turn with real reasoning text keeps it as reasoning (Codex holds thinking text).
+        assert_eq!(thinking_blocks(&re), 1, "text-bearing thinking stays structural");
+        assert!(
+            re.messages
+                .iter()
+                .any(|m| m.text().is_some_and(|t| t.contains("I should run ls"))
+                    || m.content
+                        .iter()
+                        .any(|b| matches!(b, Block::Thinking { text, .. } if text.contains("I should run ls")))),
+            "the reasoning text survives"
+        );
+
+        // --- drop: no thinking at all, even into a target that could hold every payload.
+        for target in [Harness::Codex, Harness::Claude] {
+            let (res, report) = emit_report(&base, target, &temp_dir(), &opts(ThinkingMode::Drop)).unwrap();
+            let re = reparse_emitted(target, &res, &ParseOptions::full()).unwrap();
+            assert_eq!(thinking_blocks(&re), 0, "--thinking drop emits none into {target}");
+            assert!(
+                !re.messages
+                    .iter()
+                    .any(|m| m.text().is_some_and(|t| t.contains("I should run ls"))),
+                "the reasoning text is gone from {target} too"
+            );
+            assert!(
+                report.deltas.iter().all(|d| d.expected),
+                "a requested drop is an expected loss into {target}, got {:?}",
+                report.deltas
+            );
+            assert!(
+                report.deltas.iter().any(|d| d.field.starts_with("thinking(")),
+                "…and it is still REPORTED into {target}, got {:?}",
+                report.deltas
+            );
+        }
     }
 }

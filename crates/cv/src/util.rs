@@ -344,6 +344,20 @@ pub(crate) fn dirs_home() -> Option<std::path::PathBuf> {
     std::env::var_os("HOME").map(std::path::PathBuf::from)
 }
 
+/// `--thinking <native|text|drop>`: what an emit does with the model's reasoning on the way out.
+/// Shared by every command that writes a session into a harness (`port`, `splice`, `loom`,
+/// `pack --format session`), because a flag means the same thing everywhere it appears.
+pub(crate) fn parse_thinking(s: &str) -> Result<cv_core::emit::ThinkingMode> {
+    cv_core::emit::ThinkingMode::parse(s).ok_or_else(|| {
+        let all = cv_core::emit::ThinkingMode::ALL
+            .iter()
+            .map(|m| m.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        anyhow::anyhow!("unknown --thinking mode {s:?} (expected one of: {all})")
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

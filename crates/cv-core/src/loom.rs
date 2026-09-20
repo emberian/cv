@@ -76,8 +76,14 @@ pub fn splice(spans: &[Span<'_>], new_id: Option<String>, harness: Harness) -> S
         prev_id = Some(fresh);
     }
 
+    // Provenance is cv's own fact about a session cv synthesized, not something read out of a
+    // harness store, so it lives in the `cv` namespace — `Session::extra` has no flat keys
+    // (docs/INTERFACE-V2.md §4).
     let mut extra = serde_json::Map::new();
-    extra.insert("loom".into(), serde_json::Value::Array(provenance));
+    extra.insert(
+        crate::ir::CV_NAMESPACE.into(),
+        serde_json::json!({ "loom": serde_json::Value::Array(provenance) }),
+    );
 
     Session {
         id,
@@ -250,7 +256,15 @@ mod tests {
         );
 
         assert_eq!(spliced.id, "fixed-id");
-        let loom = spliced.extra.get("loom").expect("loom provenance present");
+        // A synthesized session obeys the same `extra` rule as a parsed one: no flat keys, every
+        // top-level key a namespace object. `loom` used to sit flat here, which quietly made the
+        // contract's "a session's extra has no flat keys at all" false for our own output.
+        crate::harness::assert_no_flat_keys(&spliced);
+        let loom = spliced
+            .cv_extra()
+            .expect("cv namespace present")
+            .get("loom")
+            .expect("loom provenance");
         let arr = loom.as_array().expect("loom is an array");
         assert_eq!(arr.len(), 2);
         assert_eq!(arr[0]["source_id"], "A");
@@ -274,7 +288,8 @@ mod tests {
         assert_linear_chain(&g);
         assert_eq!(g.harness, Harness::Claude); // defaults to base's.
 
-        let loom = g.extra["loom"].as_array().unwrap();
+        crate::harness::assert_no_flat_keys(&g);
+        let loom = g.cv_extra().unwrap()["loom"].as_array().unwrap();
         assert_eq!(loom[0]["source_id"], "BASE");
         assert_eq!(loom[1]["source_id"], "SRC");
     }

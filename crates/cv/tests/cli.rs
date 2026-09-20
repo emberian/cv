@@ -559,6 +559,36 @@ fn show_range_windowing() {
     assert_eq!(v["messages"].as_array().unwrap().len(), 0, "{out}");
 }
 
+/// `--thinking <native|text|drop>` means the same thing on every command that emits a session, and
+/// nothing else answers to that word. The modes differ in whether a turn whose only content is
+/// provider-signed reasoning survives a target that cannot hold the signature.
+#[test]
+fn thinking_mode_is_one_word_on_every_emitting_command() {
+    let w = World::new("think");
+    standard_corpus(&w);
+
+    // Present, with the same three values, wherever a session is written out.
+    for cmd in ["port", "splice", "loom", "pack"] {
+        let (ok, _, out, err) = w.cv(&[cmd, "--help"]);
+        assert!(ok, "cv {cmd} --help failed:\n{err}");
+        for mode in ["native", "text", "drop"] {
+            assert!(
+                out.contains(mode),
+                "cv {cmd} --help must offer --thinking {mode}:\n{out}"
+            );
+        }
+    }
+
+    // An unknown mode is rejected by name, listing what is valid.
+    let (_, _, _, err) = w.cv(&["port", "alphasess", "--thinking", "sideways"]);
+    assert!(err.contains("sideways"), "the bad value is quoted back:\n{err}");
+
+    // And the word is NOT overloaded: prune's old boolean spelling is gone.
+    let (_, code, _, err) = w.cv(&["prune", "alphasess", "--thinking"]);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("--drop-thinking"), "{err}");
+}
+
 // ───────────────────────────── export ─────────────────────────────
 
 #[test]
@@ -869,6 +899,9 @@ fn error_paths_exit_nonzero_with_stderr() {
         // `--to`/`--to-dir` say where; the flags now say what.
         (&["port", "alphasess", "--to", "codex"], "use `--harness <harness>`"),
         (&["port", "alphasess", "--to-dir", "/tmp/nope"], "use `--cwd <dir>`"),
+        // `prune --thinking` was a boolean "snip reasoning too"; `--thinking <mode>` now names what
+        // an EMIT does with reasoning, and one word may not mean two things.
+        (&["prune", "alphasess", "--thinking"], "use `--drop-thinking`"),
     ];
     for (args, pointer) in removed {
         let (ok, code, out, err) = w.cv(args);

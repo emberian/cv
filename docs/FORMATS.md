@@ -1,12 +1,63 @@
 # Harness session formats (reverse-engineered)
 
 This is the ground-truth catalog of how each harness stores sessions on disk, reverse-engineered from a
-real machine (2026-05-29; Claude Code and Codex re-verified 2026-09-19 against Claude Code 2.1.278 and
-Codex 0.154 / `132c2be23`). It drives the adapters in `cv-core`. Keep it accurate; it is the spec.
+real machine (2026-05-29; re-verified 2026-09-19 against upstream checkouts under `~/pug` for Codex
+`132c2be23` (0.154), OpenCode `fee476bb` (1.18.31), gemini-cli `cfbcaa8`, Goose `2090ad1c`
+(1.51.0), OpenClaw `0e9181234a`, Hermes `6d8a8bebf7` (schema v30), kimi-cli `86f1364`, and against the
+shipped bundles for Claude Code 2.1.278 and Kimi Code 0.39.1). It drives the adapters in `cv-core`.
+Keep it accurate; it is the spec.
 
 The unifying insight: **all harnesses encode the working directory (cwd) into where/how they store a
 session.** That cwd-coupling is exactly why sessions are "dir-jailed" and hard to find. clustervision
 decouples them via a unified IR.
+
+## This document and `formats/*.toml` — which one to edit
+
+Since 0.11.0 there are **two** sources of truth and they do not overlap. Each adapter has a
+machine-readable manifest at `formats/<harness>.toml` holding `[upstream] repo/commit/date`, the
+`store = [...]` paths, and a `[types]` table naming every persisted record/part/column with cv's
+status for it (`handled` = its own match arm, `generic` = covered by a blanket rule, `carried` =
+verbatim only under `ParseOptions::complete`, `ignored` = known and deliberately skipped).
+
+- **The manifest is authoritative for the machine-checkable vocabulary**: which record types exist,
+  what cv does with each, and which upstream commit that was pinned against. It is enforced in both
+  directions — `cv formats check` (and `crates/cv-core/tests/formats_manifest.rs`) fails when a
+  `handled` type is no longer in the adapter, or when the adapter matches a literal the manifest
+  does not name.
+- **This prose is authoritative for everything a table cannot hold**: where the store lives and how
+  it is discovered, how records thread into a conversation, what a field *means*, which fields are
+  load-bearing, and the traps.
+
+So: a new record type, or a change in how cv treats one, is a **manifest** edit (plus the adapter).
+A change in how the format *works* is an edit **here**. When the two disagree the manifest wins on
+vocabulary and this document wins on meaning — and one of them is then wrong and should be fixed.
+
+The per-harness type lists below are therefore **illustrative, not exhaustive**, and are not the
+checked list. For the current picture run `cv formats check` (drift against the pinned manifests)
+and `cv formats census [--harness h] [--recent N]` (what recent real sessions on this machine
+actually contain: message kinds, block types, and record vocabulary the adapter did not interpret,
+with anything the manifest does not name marked `NEW`). `tools/harness-drift.sh` refreshes the
+`~/pug` checkouts and greps their persistence enums against the manifests.
+
+## IR names this document uses (cv 0.11.0)
+
+The contract is `docs/INTERFACE-V2.md` §4; this is only the vocabulary needed to read the notes
+below. A `Message` has a `role` (who speaks), a `kind` (`prompt`, `reply`, `tool_result`,
+`injected_context`, `system_prompt`, `notice`, `compaction_boundary`, `compaction_summary`,
+`model_change`, `error`, `subagent_spawn`, `subagent_return`, `branch`, `carrier`) and an `origin`
+(`human`, `model`, `harness`, `hook`, `scheduler`, `subagent`, `import`, `unknown`). A `Block` is
+tagged by `type` (`text`, `thinking`, `tool_use`, `tool_result`, `image`, `file`); `tool_use` carries
+an optional `namespace`, `tool_result` an optional `details` object. Session-level facts that used to
+live in `extra` are now first-class: `Session::system_prompt` and `Session::lineage`
+(`forked_from`, `parent`, `spawned_by_tool_use`, `continued_in`, `continues`, `agent_path`).
+`Usage` carries `reasoning_tokens` and `cost_usd` alongside the four token counters.
+
+**Harness-specific facts are nested under the harness's own key** — `extra["claude"]["attachment_type"]`,
+`extra["zed"]["thread_version"]` — never flat. The one non-harness namespace is `extra["cv"]`, which
+holds cv's own parse diagnostics (`extra["cv"]["skipped_lines"]`, written by `harness::note_skipped_lines`
+when a transcript had unreadable lines; `Harness::parse("cv")` is `None`, so the two cannot collide).
+Exactly two flat message-level keys survive, both cv's own streaming bookkeeping: `_record` (the
+verbatim carrier record under `ParseOptions::complete`) and `cv_byte_offset`.
 
 ---
 
@@ -21,7 +72,8 @@ decouples them via a unified IR.
   `atis-latch`, `last-prompt` (`{leafUuid, lastPrompt, explicit?, rewound?}` — the loader's leaf pointer),
   `queue-operation` (`{operation: enqueue|dequeue|remove|popAll, reason?, content}`), `cost-state`
   (cumulative `totalCostUSD`/durations/`modelUsage` per model), `continued-in` (`{continuedInSessionId}` —
-  the conversation moved to another session id), `relocated` (`{relocatedCwd}`, forks), `pr-link`
+  the conversation moved to another session id, and cv's **`Session::lineage.continued_in`**),
+  `relocated` (`{relocatedCwd}`, forks), `pr-link`
   (`{prNumber, prUrl, prRepository}`), `frame-link`, `content-replacement` (`{replacements}` applied at
   load — forks/microcompact), `artifact-comment-monitor`, `artifact-autoreact-ledger`,
   `file-history-snapshot`. **`summary` records are no longer written** (gone since ~2.1.25x; still read).
@@ -29,6 +81,9 @@ decouples them via a unified IR.
   `entrypoint`, `userType`, `version`, `gitBranch`; user turns add `promptId`, `origin{kind:human|…}`,
   `promptSource`, `turnOrigin`, `permissionMode`; assistant turns add `requestId`, `effort`,
   `apiBlockIndex` (one line per streamed content block, sharing `message.id`).
+  `formats/claude.toml` `[types]` is the checked list and says which of these cv interprets and which
+  it merely carries under `ParseOptions::complete`; `cv formats census --harness claude` shows what a
+  real store holds today.
 - **Attachments ARE prompt content (since ~2.1.23x).** The `<system-reminder>` text Claude Code appends to
   the prompt no longer lives inline in user content; each is an `attachment` record `{attachment:{type,…},
   rendered?: [{content: "<system-reminder>…</system-reminder>"}], renderedInHumanTurn?}` — `rendered[]`
@@ -43,22 +98,33 @@ decouples them via a unified IR.
   `auto_mode`, `goal_status`, `task_status`, `file` (an `@`-mentioned file), `compact_file_reference`,
   `thinking_drop` (`{blockHashes[], newlyDropped{blockCount,turnCount,reason}, thinkingBlocksSent}` —
   Claude Code dropped those thinking blocks from the REQUEST; the transcript keeps them and the loader
-  re-applies the drop by hash). cv parses rendered attachments as System turns (`extra.attachmentType`).
+  re-applies the drop by hash). The full, current kind list is `formats/claude.toml` (`attachment.*`).
+  cv parses a rendered attachment as a `Role::System` message with `kind: injected_context`;
+  `origin` is `hook` for the `hook_*` kinds and `harness` otherwise, and the attachment's own kind rides in
+  `extra["claude"]["attachment_type"]`. `prompt_snapshot` is the exception: its
+  `attachment.systemPrompt[]` sections are joined into **`Session::system_prompt`** (the latest
+  snapshot wins — a resume re-snapshots), and it is a session fact, never a message.
 - **Synthetic assistant notices:** `assistant` lines with `message.model == "<synthetic>"` are Claude
   Code's own client-side rows, never sent to the API: `isApiErrorMessage:true` + `error`
   (`invalid_request`/`rate_limit`/…) for "Prompt is too long" (with `errorDetails` ONLY when it came from
   the API — the client-side context gate emits it with none), and `isApiErrorMessage:false` for "No
-  response requested." (resume preamble). Not turns.
+  response requested." (resume preamble). Not model turns: cv re-roles them `Role::System` with
+  `kind: error` (when `isApiErrorMessage`) or `kind: notice`, `origin: harness`, and keeps
+  `isApiErrorMessage`/`error`/`errorDetails`/`apiErrorStatus`/`requestId` in `extra["claude"]`. Under
+  `ParseOptions::complete` the record keeps its wire `assistant` shape so it round-trips.
 - **`usage.iterations[]`** (Fable-era): per-request entries `{type: message|fallback_message|
   advisor_message|compaction, input_tokens, output_tokens, cache_read_input_tokens,
   cache_creation_input_tokens}`. **Claude Code ≥ 2.1.277 reads the context size from the LAST
   non-advisor/compaction iteration** (falling back to the top-level counters), and its turn gate refuses
   client-side with a synthesized "Prompt is too long" when that + a byte estimate of everything after the
-  record ≥ context window − min(max_output, 20k) − 3k. `cv prune --revive` pins both.
+  record ≥ context window − min(max_output, 20k) − 3k. `cv prune` pins both — revive is **on by
+  default** since 0.11.0; `--no-revive` preserves the original `usage` records byte-for-byte.
 - **Persisted tool outputs:** a too-large `tool_result` is replaced by the stub
   `<persisted-output>\nOutput too large (NNKB). Full output saved to: <session>/tool-results/<id>.txt\n\n
   Preview (first 2KB):\n…</persisted-output>` — the model saw only the stub; cv keeps it as content and
-  records the path in `details.persistedOutput`.
+  records the path in `Block::ToolResult::details` as `persistedOutput: {path, size}`. Kimi Code
+  spills the same way under the same `details.persistedOutput.path` key, so `cv cat <session>
+  <tool_use_id>` (0.11.0's replacement for `prune --retrieve`) fetches the full body for either.
 - **Threading:** every `user`/`assistant`/`attachment` line has `uuid` + `parentUuid` (null at root) →
   a linked list / DAG. `last-prompt.leafUuid` points at the tail.
 - **Message line fields:** `message.role`, `message.content` (string for simple user msgs; array of blocks
@@ -67,7 +133,12 @@ decouples them via a unified IR.
   (assistant), `usage` (tokens), `requestId`, `message.{id,stop_reason}`.
 - **Tool results:** carried on a `user` line as `content[].type=="tool_result"` (`tool_use_id`, `content`,
   `is_error`) plus a richer `toolUseResult` sidecar object (`structuredPatch`/`oldTodos`/`newTodos`/
-  `stdout`/`stderr`/file contents…). A user line whose content is *only* tool_results is a Tool turn.
+  `stdout`/`stderr`/file contents…). The sidecar is a shared concept, so it rides on the block as
+  **`Block::ToolResult::details`**, not in the harness bag, and only under `ParseOptions::extra` (it
+  routinely dwarfs the visible transcript). cv's derived `persistedOutput` pointer is merged into the
+  same object and stripped back out on emit; when the sidecar is not an object (Claude writes a bare
+  error string for ~28% of them) the two are parked side by side under `details.toolUseResult`. A user
+  line whose content is *only* tool_results becomes a `Role::Tool` message with `kind: tool_result`.
 - **`system` records** (`subtype`): `compact_boundary` (with `compactMetadata`), `local_command` (slash
   commands — `content` wraps `<command-name>/foo</command-name>` + `<command-args>` for the invocation,
   or `<local-command-stdout>…</local-command-stdout>` for the output), `away_summary`, `api_error`
@@ -81,17 +152,26 @@ decouples them via a unified IR.
   plus bodyless `turn_duration` (`{durationMs, messageCount, pendingBackgroundAgentCount}`) /
   `agents_killed`. Hook output for PreToolUse/PostToolUse/UserPromptSubmit/SessionStart is NOT a system
   record — it is an `attachment{type:hook_success}` (rendered when the hook printed something).
-- **Compaction** (`compact_boundary`): `compactMetadata = {trigger: manual|auto, preTokens, durationMs,
-  preservedSegment:{headUuid,anchorUuid,tailUuid}, preservedMessages:{…}}`. The boundary is immediately
+  The subtype is what fixes the IR `kind`/`origin`: `compact_boundary` → `compaction_boundary`,
+  `api_error`/`model_refusal_fallback` → `kind: error`, `stop_hook_summary` → `notice`/`origin: hook`,
+  `scheduled_task_fire` → `notice`/`origin: scheduler`, everything else → `notice`/`origin: harness`.
+  Adding a subtype is a `formats/claude.toml` edit (`system.*`) as well as an adapter one.
+- **Compaction** (`compact_boundary` → `kind: compaction_boundary`): `compactMetadata = {trigger:
+  manual|auto, preTokens, durationMs, preservedSegment:{headUuid,anchorUuid,tailUuid},
+  preservedMessages:{…}}`. The boundary is immediately
   followed by a `user` message `isCompactSummary:true` whose `parentUuid == boundary.uuid` and whose body
-  is the **generated summary that seeds the next context window** (the lost pre-compaction context). A
+  is the **generated summary that seeds the next context window** (the lost pre-compaction context) —
+  `kind: compaction_summary`, `origin: harness`. Shared code (`compaction.rs`, `doctor.rs`) keys off
+  those two kinds, not off the Claude subtype, so every harness's compaction is found the same way. A
   session compacts repeatedly (the reference transcript: 11×).
 - **Subagents (two tiers):**
   - *Directly-spawned* (`Agent`/`Task` tool): `<sessionId>/subagents/agent-<agentId>.jsonl` +
     `agent-<agentId>.meta.json` = `{agentType, description, toolUseId}`. **`toolUseId` links the child
     back to the exact `Agent`/`Task` tool_use in the parent transcript.** The child's records carry
     `isSidechain:true` + `agentId`; its *return value* is the last assistant text turn (surfaced in the
-    parent's tool_result).
+    parent's tool_result). In the IR the child session gets `lineage.parent` = the parent session id
+    (read off the `<sessionId>/subagents/` path) and `lineage.spawned_by_tool_use` = that `toolUseId`;
+    `agentType`/`description` stay in `extra["claude"]` as `agent_type`/`agent_description`.
   - *Workflow* (`Workflow` tool): TWO sidecar locations per run.
     - `<sessionId>/subagents/workflows/<wf_runId>/agent-<agentId>.jsonl` (+ meta
       `{agentType:"workflow-subagent"}`) **plus `journal.jsonl`** = the orchestrator's structured log:
@@ -158,6 +238,15 @@ Re-verified 2026-09-19 at `132c2be23` (CLI 0.154).
   `subagent_history_start_ordinal`, with a second `session_meta` = the parent's on line 1) stamped with
   the FORK time; the real per-item time is `payload.internal_chat_message_metadata_passthrough
   .create_time` (epoch seconds). The FIRST `session_meta` is canonical.
+  In the IR the swarm pointers are first-class **`Session::lineage`** — `parent_thread_id` →
+  `lineage.parent`, `forked_from_id` → `lineage.forked_from`, `agent_path` → `lineage.agent_path` —
+  and `base_instructions.text` → **`Session::system_prompt`**. The rest (`session_id`,
+  `thread_source`, `agent_nickname`, `agent_role`, `source`, `model_provider`, `history_mode`,
+  `subagent_history_start_ordinal`, `history_base`, `cli_version`, `originator`) stays in the
+  session's `extra["codex"]` bag, never flat. Per-message Codex facts are nested the same way —
+  `crate::offsets`' seek path reads `extra["codex"]["codex_event"] == "turn_context"` through
+  `harness_extra(Harness::Codex)` to flag a model-change replay hazard, and reading that key flat
+  is what once silently disabled the check and let a model-changing session look seekable.
 - **`turn_context` payload:** REQUIRED `cwd`, `approval_policy` (`untrusted|on-request|never`),
   `sandbox_policy` (`{type: danger-full-access|read-only|workspace-write|external-sandbox, …}`),
   `model`, `summary` (`auto|concise|detailed|none`); optional `turn_id`, `root_turn_id`, `effort`,
@@ -169,24 +258,35 @@ Re-verified 2026-09-19 at `132c2be23` (CLI 0.154).
   content:[{type:input_text,text}|{type:encrypted_content,…}]}`, always paired with a following top-level
   `inter_agent_communication_metadata {trigger_turn}` line), `reasoning` (`{id: rs_…, summary:[…],
   encrypted_content}` — `content` omitted whenever it holds `reasoning_text`), `function_call`
-  (`{id: fc_…, call_id, name, namespace?, arguments (JSON string), encrypted_function_args?}`),
+  (`{id: fc_…, call_id, name, namespace?, arguments (JSON string), encrypted_function_args?}` —
+  `namespace` is the IR's `Block::ToolUse::namespace`, e.g. `collaboration` for the swarm tools),
   `function_call_output` (`{call_id, name?, namespace?, output}` where **`output` is a string or a
-  content-item array — never an object; no persisted error bit**), `custom_tool_call(_output)` (`input`
+  content-item array — never an object; no persisted error bit**, so an output's error-ness survives
+  a round-trip only through cv's own `"[error] "` string prefix, which `emit_codex` writes and the
+  adapter reads back — and only when it is a bare string, never inside a content array),
+  `custom_tool_call(_output)` (`input`
   is a freeform string), `local_shell_call`, `web_search_call` (`action: search|open_page|find_in_page`),
   `tool_search_call/_output`, `image_generation_call`, `compaction`/`context_compaction`,
-  `configuration_update`.
+  `configuration_update`. `formats/codex.toml` `[types]` carries the full, checked list of
+  `response_item.*` / `event_msg.*` / `item.*` names with cv's status for each (it names several the
+  prose below does not, and marks the legacy `event_msg` twins `ignored`).
 - **Other top-level types:** `compacted` (`{message (now usually ""), replacement_history[], window_number,
   window_id, first/previous_window_id, compaction_response_id, latest_token_usage_record,
   retained_context}`), `token_usage_record` (per response: `{thread_id, turn_id, session_id,
   root_turn_id, response_id, usage, turn_token_usage, thread_token_usage}`; `TokenUsage = {input_tokens,
-  cached_input_tokens, cache_write_input_tokens, output_tokens, reasoning_output_tokens, total_tokens}`),
+  cached_input_tokens, cache_write_input_tokens, output_tokens, reasoning_output_tokens, total_tokens}`
+  → `Usage`, with `cached_input_tokens` → `cache_read_tokens`, `cache_write_input_tokens` (0.147+,
+  absent on older files) → `cache_creation_tokens` and `reasoning_output_tokens` →
+  `Usage::reasoning_tokens`. **Codex stores no cost**, so `Usage::cost_usd` is always null here),
   `inter_agent_communication_metadata`, `world_state` (embeds AGENTS.md text), `security_risk_score`,
   `retained_context`, `realtime_item`.
 - **`event_msg.payload.type` (both modes):** `token_count {info{last_token_usage, total_token_usage},
   rate_limits}`, `task_started {turn_id, model_context_window}`, `task_complete {turn_id,
   last_agent_message, duration_ms}`, `thread_settings_applied {thread_settings{model, model_provider_id,
-  reasoning_effort, personality, approval_policy, cwd}}` (the reliable model-change signal),
-  `turn_aborted {turn_id, reason}`, `thread_goal_updated`, `thread_rolled_back {num_turns}`,
+  reasoning_effort, personality, approval_policy, cwd}}` (the reliable model-change signal → one
+  `kind: model_change` note per switch),
+  `turn_aborted {turn_id, reason}`, `thread_goal_updated`, `thread_rolled_back {num_turns}` (→
+  `kind: branch`: what follows does not continue what precedes),
   `item_completed` (paginated: all items; legacy: only FunctionCallOutput/Plan/Sleep/completed
   SubAgentActivity). `view_image_tool_call` is never persisted (images arrive as `item_completed
   ImageView{path:"file:///…"}`).
@@ -195,7 +295,8 @@ Re-verified 2026-09-19 at `132c2be23` (CLI 0.154).
   parsed_cmd, source, status, stdout?, stderr?, aggregated_output?, exit_code?, duration}`,
   `FileChange{changes{path:{type:add|update|delete, content|unified_diff}}, status}`, `ImageView{path}`,
   `ImageGeneration{saved_path}`, `SubAgentActivity{kind: started|interacted|interrupted|completed,
-  agent_thread_id, agent_path}`, `CollabAgentToolCall{tool, status, sender_thread_id,
+  agent_thread_id, agent_path}` (`started` → IR `kind: subagent_spawn`, `completed` →
+  `subagent_return`, anything else → `notice`), `CollabAgentToolCall{tool, status, sender_thread_id,
   receiver_thread_ids, prompt?, model?}`, `McpToolCall{server, tool, arguments, status, result?, error?}`,
   `WebSearch{query, action, results?}`, `ContextCompaction`, `Plan{text}`, `FunctionCallOutput`,
   `Extension{kind}`.
@@ -216,9 +317,12 @@ Re-verified 2026-09-19 at `132c2be23` (CLI 0.154).
 - **cwd encoding:** percent-encoding of the absolute cwd (`%2F` = `/`). Reversible.
 - **session id:** UUIDv7. **chat_history.jsonl line:** `{type: system|user|assistant, content}` where
   user `content` is `[{type:text,text}]`, assistant `content` is a string and carries
-  `reasoning{text,encrypted,id}`, `model_id`, `model_fingerprint`.
+  `reasoning{text,encrypted,id}`, `model_id`, `model_fingerprint`. A `system` line is
+  `kind: system_prompt`.
 - **summary.json:** `{info{id,cwd}, created_at, updated_at, num_messages, current_model_id, git_root_dir,
-  git_remotes[], head_commit, head_branch, agent_name, ...}`.
+  git_remotes[], head_commit, head_branch, agent_name, ...}`, plus the sub-agent/lineage facts.
+- **`system_prompt.txt`** is byte-identical to the leading `system` transcript record; cv reads it as
+  **`Session::system_prompt`** (a session fact, never a message).
 - **Indexes (sqlite):** `~/.grok/sessions/session_search.sqlite` (FTS5: `session_docs` + `session_docs_fts`
   over title+content), `~/.grok/worktrees.db` (`worktrees(id,path,session_id,...)`), and per-cwd
   `prompt_history.jsonl` (`{timestamp,session_id,prompt,is_bash}`).
@@ -241,7 +345,11 @@ Re-verified 2026-09-19 at `fee476bb` (1.18.31). Ground truth: `packages/core/src
   MessageOutputLengthError, MessageAbortedError, StructuredOutputError, ContextOverflowError, ContentFilterError,
   APIError}`. Part union unchanged (`text reasoning tool file agent subtask patch snapshot step-start step-finish
   retry compaction`); tool `state` is `pending | running | completed{input, output, title, metadata, time,
-  attachments?: FilePart[]} | error`.
+  attachments?: FilePart[]} | error`. The message's `tokens{input, output, reasoning, cache{read, write}}`
+  and `cost` fill `Usage` whole, including **`reasoning_tokens`** (dropped when 0) and **`cost_usd`** —
+  OpenCode is one of the three harnesses that persist a provider cost (with Goose and OpenClaw). A
+  `system`-role message is `kind: system_prompt` and the first one also becomes
+  `Session::system_prompt`. `formats/opencode.toml` `[types]` is the checked part/table/error vocabulary.
 - **The JSON tree is dead:** `storage/{session,message,part}/**.json` was only the input of a one-shot importer,
   deleted 2026-06-02 (`ca2acc4f`); anything left on disk is a pre-2026-01 leftover. Read it only as a fallback
   when no db exists. Also `~/.local/state/opencode/` and `prompt-history.jsonl`. `opencode export [sid]` writes
@@ -249,8 +357,11 @@ Re-verified 2026-09-19 at `fee476bb` (1.18.31). Ground truth: `packages/core/src
 
 ## Gemini / Antigravity — `~/.gemini/`
 
-Re-verified 2026-09-19 at `cfbcaa8` (0.46.0): **the record format is unchanged** (`chatRecordingTypes.ts` and
-`logger.ts` have no diff since 2026-05).
+Re-verified 2026-09-19 at `cfbcaa8` (the checkout's `package.json` reports
+`0.62.0-nightly.20260918`; the newest tag there is `v0.49.0-preview.0`): **the record format is
+unchanged** — `packages/core/src/services/chatRecordingTypes.ts` and `packages/core/src/core/logger.ts`
+were last touched 2026-05-29, which is also the first commit in that checkout's history, so "unchanged"
+here means "unchanged across everything we have", not "unchanged since the file was written".
 
 - **Antigravity transcripts:** `~/.gemini/antigravity/conversations/<uuid>.pb` — **protobuf, opaque**
   (no .proto on disk). Best-effort only.
@@ -269,9 +380,20 @@ Re-verified 2026-09-19 at `cfbcaa8` (0.46.0): **the record format is unchanged**
   recording, a rewrite in progress) — skip them. Empty, non-resumable recordings are deleted by the CLI.
 - **cwd:** `tmp/<projectIdentifier>` is a short id; the real path lives in `~/.gemini/projects.json`
   (`{"projects": {"/abs/path": "<id>"}}`) or `~/.gemini/history/<id>/.project_root`; `directories[]` inside a
-  recording is often absent.
+  recording is often absent. The runtime root is found by walking a session path
+  (`<runtime>/tmp/<id>/chats/<file>`) **right to left** for the component named `tmp` — the innermost
+  one is the runtime's own. Left to right breaks on every box whose runtime root itself sits under a
+  `tmp` directory (`/tmp` is `std::env::temp_dir()` on Linux), and every cwd comes back `None`.
+- **Record vocabulary:** `formats/gemini.toml` `[types]` is the checked list — the record kinds
+  (`user`, `gemini`/`model`/`assistant`, `info`, `error`, `warning`, `system`, `rewind`), the
+  append-only controls (`$set`, `$rewindTo`) and the parts (`text`, `thought`, `functionCall`,
+  `functionResponse`, `inlineData`, `fileData`). Qwen delegates to this parser, so
+  `formats/qwen.toml` is a path delta only.
 
 ## Hermes (Nous) — `~/.hermes/state.db` (SQLite, `SCHEMA_VERSION` 30 as of 2026-09-19; `$HERMES_HOME` overrides; per-profile `profiles/<name>/state.db`)
+
+Re-verified 2026-09-19 at `6d8a8bebf7` (`~/pug/hermes-agent`). The checked column/`display_kind`/role
+vocabulary is `formats/hermes.toml`.
 
 - `sessions` + `messages` tables (OpenAI-shaped rows; roles `user|assistant|tool|system`). Multimodal content
   uses a `\x00json:` sentinel prefix. Reasoning spans several columns (`reasoning`, `reasoning_content`,
@@ -291,15 +413,24 @@ Re-verified 2026-09-19 at `cfbcaa8` (0.46.0): **the record format is unchanged**
   appears twice. **Order by `id`**, not `timestamp` (timestamps are not monotonic; tool-call adjacency breaks).
 - **System prompt** moved (v25) to `system_prompts(hash, prompt)`; `sessions.system_prompt` is NULL —
   `COALESCE(sp.prompt, s.system_prompt)` via `LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash`.
+  That is **`Session::system_prompt`**; a `system` row in `messages` is `kind: system_prompt`.
 - **Lineage:** compression chains link via `parent_session_id` (parent `end_reason='compression'`); branch /
   reset / delegate children are marked in `model_config` JSON (`_branched_from`, `_reset_from`,
   `_delegate_from`) — an explicit branch is its own conversation and delegate children are sub-agent runs;
   Hermes's own listing hides `archived=1 OR hidden=1`, compression continuations and delegate children.
+  In the IR: `_branched_from` → `lineage.forked_from`, `_delegate_from` → `lineage.parent`, a
+  compression rotation → `lineage.continues` / `lineage.continued_in`. `_reset_from` (a `/new` with
+  nothing carried over) has no IR field and stays in `extra["hermes"]`, as does an unmarked
+  `parent_session_id` whose rows were not merged.
+- **Imports:** `sessions.origin_json.imported_from{tool: claude-code|codex-cli, …}` marks a foreign
+  transcript Hermes ingested; every message of such a session carries `origin: import`.
 
 ## OpenClaw — `$OPENCLAW_STATE_DIR` or `~/.openclaw/agents/<agentId>/`
 
 Re-verified 2026-09-19 at `0e9181234a`. Ground truth: `src/state/openclaw-agent-schema.sql`,
-`src/config/sessions/*`, `src/agents/sessions/session-manager-types.ts`.
+`src/state/openclaw-agent-db-contract.ts` (`OPENCLAW_AGENT_SCHEMA_VERSION = 21` — the schema version
+is *there*, not in the `.sql`), `src/config/sessions/*`,
+`src/agents/sessions/session-manager-types.ts`.
 
 - **The live store is SQLite (since 2026-07-11, `0a8e3604ba`):** `agent/openclaw-agent.sqlite` (also
   `openclaw-agent.<agentId>.sqlite` / `.<n>.sqlite` for shared stores; `PRAGMA user_version` = 21), all tables
@@ -325,6 +456,15 @@ Re-verified 2026-09-19 at `0e9181234a`. Ground truth: `src/state/openclaw-agent-
   blocks text(+textSignature), thinking(+thinkingSignature, redacted), toolCall(+async), image. Assistant
   messages add `responseId`, `turnId`, `endTurn`, `errorCode/errorType`, `usage.contextUsage`; secrets are always
   redacted at write time. ACP-bridged sessions are text-only echoes (`model:"acp-runtime"`).
+- **IR mapping:** the entry type fixes the `kind` — `compaction` → `compaction_boundary` (its `summary`
+  becomes a following `compaction_summary`), `reset` → `branch`, `model_change`/`thinking_level_change`
+  → `model_change`, `branch_summary`/`custom_message` → `notice`; by role, `system` →
+  `system_prompt` (and the first one fills `Session::system_prompt`), `bashExecution` →
+  `injected_context`, `compactionSummary` → `compaction_summary`, an assistant message with
+  `errorCode`/`errorType` → `kind: error`. A fork's `header.parentSession` is
+  `Session::lineage.forked_from`. `usage{input, output, cacheRead, cacheWrite, cost{total}}` fills
+  `Usage` including **`cost_usd`**; OpenClaw reports no reasoning-token count.
+  `formats/openclaw.toml` `[types]` is the checked entry/role/block vocabulary.
 
 ## Cursor IDE — `~/Library/Application Support/Cursor/User/` (mac; `%APPDATA%/Cursor/User` Win; `$XDG_CONFIG_HOME/Cursor/User` Linux)
 
@@ -367,7 +507,17 @@ Re-verified 2026-09-19 at `0e9181234a`. Ground truth: `src/state/openclaw-agent-
   usage{inputOther, output, inputCacheRead, inputCacheCreation}, messageId}` (group by `event.stepUuid`),
   `usage.record`, `llm.request`, `turn.prompt|ended|steer|cancel`, `profile.bind`,
   `context.apply_compaction{summary, compactedCount}`. Sidecars `agents/<id>/tool-results/<Tool>-<callId>-
-  <uuid>.txt` (outputs > 50 000 chars), `media/`, `logs/`.
+  <uuid>.txt` (outputs > 50 000 chars, pointed at by `details.persistedOutput.path`), `media/`, `logs/`.
+  That record list is **not exhaustive** and it moves fast — `formats/kimi-code.toml` names the
+  checked set (including the `permission.*`, `tools.*`, `token_counting.*`, `swarm_mode.*`,
+  `plan_mode.*`, `plugin.session_start`, `prompt.accepted`, `staleGuard.recorded` families that a
+  real store is full of but which cv only carries), and `cv formats census --harness kimi-code`
+  shows what is actually on this machine.
+- **Kimi Code IR mapping:** `profile.bind` is the system prompt (`kind: system_prompt`, and
+  `Session::system_prompt`); `context.apply_compaction` is a `compaction_boundary` +
+  `compaction_summary` pair; each sub-agent dir under `agents/` parses as its own `Session` with
+  `lineage.parent` = the session uuid and `lineage.agent_path` = `agent-N` (`parentAgentId`/`labels`
+  stay in `extra["kimi-code"]`).
 
 ## Qwen Code — `~/.qwen/`
 
@@ -429,6 +579,14 @@ Re-verified 2026-09-19 at `2090ad1c` (1.51.0). Ground truth: `crates/goose/src/s
   timeToFirstTokenMs, isCompaction}, operations}` — the only per-message usage; Goose hides rows with
   `userVisible = 0`. `created_timestamp` is seconds (values > 10_000_000_000 are milliseconds). Legacy:
   per-session `<name>.jsonl` (header line + one message per line), unchanged.
+- **IR mapping:** `usage` → `Usage`, with `cost` → **`Usage::cost_usd`** (Goose reports no
+  reasoning-token count). `userVisible = 0` is not a drop: the row becomes a `Role::System` turn —
+  `kind: compaction_summary` when `usage.isCompaction` (cv synthesizes the paired
+  `compaction_boundary` in front of it), else `kind: injected_context` — so turn counts and
+  `cv show` stay honest. A row holding an `error` block is `kind: error`; a row holding only control
+  blocks (`systemNotification`, `actionRequired`, `toolConfirmationRequest`) is `kind: notice`.
+  `sessions.parent_session_id` (v15) → **`Session::lineage.parent`**. The checked block/action/column
+  vocabulary, including the `session_type` values, is `formats/goose.toml`.
 
 ## Zed — `<data_dir>/threads/threads.db` (SQLite + zstd blobs)
 
@@ -441,8 +599,10 @@ Re-verified 2026-09-19 at `2090ad1c` (1.51.0). Ground truth: `crates/goose/src/s
   `parent_id, worktree_branch, folder_paths, folder_paths_order, created_at)`. Timestamps are RFC3339
   with offset. `folder_paths` = workspace folders, **lexicographically sorted and `\n`-joined**;
   `folder_paths_order` = `,`-joined indices restoring the user's original order (first ordered path =
-  primary worktree). `parent_id` links a **subagent** thread to its parent (we surface it as
-  `extra.parent_thread_id`; the hierarchy itself is flattened — each thread is its own session).
+  primary worktree). `parent_id` links a **subagent** thread to its parent, and we surface it as
+  first-class **`Session::lineage.parent`** — the `parent_id` column wins over the 0.3.0 blob's
+  `subagent_context.parent_thread_id` when both name one, and the blob's `depth` rides alongside as
+  `extra["zed"]["subagent_depth"]`. The hierarchy itself is flattened: each thread is its own session.
 - **Blob:** `data_type` `"zstd"` → one zstd frame (level 3, written by `zstd::encode_all`) of JSON;
   `"json"` → raw JSON (the code supports it; never observed). No message table — counting messages
   requires decoding the blob.
@@ -467,13 +627,19 @@ Re-verified 2026-09-19 at `2090ad1c` (1.51.0). Ground truth: `crates/goose/src/s
     {"Image":{source,size}}]}}`, `{"Agent":{content:[{"Text":…}|{"Thinking":{text,signature}}|
     {"RedactedThinking":"…"}|{"ToolUse":{id,name,input,raw_input,…}}], tool_results:{<id>:
     {tool_use_id,tool_name,is_error,content,output}}, reasoning_details}}`, bare `"Resume"`, or
-    `{"Compaction":{"Summary":"…"}}`. Tool-result `content` is `{"Text":…}`/`{"Image":…}`/plain string.
+    `{"Compaction":{"Summary":"…"}}` (→ `kind: compaction_summary`; bare `"Resume"` carries no
+    content and is dropped). Tool-result `content` is `{"Text":…}`/`{"Image":…}`/plain string.
+- **Kind edges:** a legacy `system`-role message is the system prompt (`kind: system_prompt`; Zed's
+  is normally app-level and absent), and a user message with `is_hidden: true` is Zed's auto-injected
+  "continue where you left off" turn → `kind: injected_context`, `origin: harness`.
 - **cwd:** `initial_project_snapshot.worktree_snapshots[0].worktree_path` (fallback: `folder_paths`
   column). The same snapshot's `git_state{remote_url, head_sha, current_branch, diff}` → `GitInfo`.
 - **No per-message timestamps anywhere** — only thread-level created/updated.
 - **Lossy notes:** extra worktrees of a multi-root workspace, `request_token_usage`, mention bodies
   (URI kept as a File block), and `creases` semantics aren't modeled; legacy `context` and 0.3.0
-  `reasoning_details` ride in `extra`. We decode blobs with pure-Rust `ruzstd` (no C cross-compile cost).
+  `reasoning_details` ride in `extra["zed"]` (per-message), alongside session-level
+  `thread_version`/`profile`/`completion_mode`/`detailed_summary`/`cumulative_token_usage`/`imported`.
+  We decode blobs with pure-Rust `ruzstd` (no C cross-compile cost).
 
 ## Account data exports — registered in `config.toml` (opt-in)
 
@@ -511,5 +677,6 @@ are sniffed by content (a file's first conversation): `mapping` ⇒ ChatGPT, `ch
 - `agent-transcript-parser` (Python) — Claude↔Codex conversion, "lossless on round-trip". Only those two.
 - `trail-cli`, Contextify, Automagik, `claude_codex_bridge` — Python, 2–3 harnesses, mostly read/HTML.
 
-Gap clustervision fills: one **Rust** IR across **all of them** (10 harnesses) with **index + search + port +
-convert + live-follow + an MCP server + a coordination board**.
+Gap clustervision fills: one **Rust** IR across **all of them** (21 harnesses — `Harness::COUNT`, one
+manifest each under `formats/`) with **index + search + port + live-follow + an MCP server + a
+coordination board**.

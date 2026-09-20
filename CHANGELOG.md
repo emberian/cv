@@ -11,8 +11,10 @@ This release renames, regroups and restructures on purpose, with **no aliases fo
 - **Commands.** `convert` is folded into `port` (`port <id> --harness <h> [--cwd <dir>] [--out <dir>]`);
   `query` is `schema`; `recall` and `distill` are gone (`pack` is the one "build context from the
   corpus" verb); `prune --retrieve` is `cat <session> <tool_use_id>`; `prune --range` is
-  `prune --keep A..B`. Every command is visible in `cv --help`, grouped Read / Reshape / Export /
-  Fleet & live / System; `cv recipes` is the agent quickstart.
+  `prune --keep A..B`; `prune --thinking` is `prune --drop-thinking`, because `--thinking` now
+  names what an *emit* does with reasoning and one word may not mean two things. Every command is
+  visible in `cv --help`, grouped Read / Reshape / Export / Fleet & live / System; `cv recipes` is
+  the agent quickstart.
 - **Windows.** `--first N`, `--last N`, `--range A..B` (0-based, end-exclusive; `A..`, `..B`),
   `--around N [--context K]`, `--max-bytes N` — the same five on `show`, `export` and the MCP `show`.
   The old `--range -N` (which meant the FIRST N) is gone.
@@ -25,7 +27,10 @@ This release renames, regroups and restructures on purpose, with **no aliases fo
   subagent · import); `Session` gains `system_prompt` and `lineage` (forked_from, parent,
   spawned_by_tool_use, continued_in, continues, agent_path); `Block::ToolUse` gains `namespace`;
   `Usage` gains `reasoning_tokens` and `cost_usd`. Harness-specific facts live under
-  `extra["<harness>"]` (one bag per harness) — never as flat keys.
+  `extra["<harness>"]` (one bag per harness) — never as flat keys. Facts cv produces itself rather
+  than reading from a store (parse diagnostics, and the provenance stamped on a session that `loom`
+  or `splice` synthesized) live under `extra["cv"]`, so a session's `extra` has no flat keys at
+  all.
 - **MCP.** Tools are generated from the CLI (`cv schema --commands --json`): same names, flags and
   output as the commands; `show` defaults to the last 50 messages / 200 KB over MCP.
   `read_session`, `search_sessions`, `list_sessions`, `project_sessions`, `recall`,
@@ -48,9 +53,25 @@ This release renames, regroups and restructures on purpose, with **no aliases fo
   NOT interpret, so a harness changing its format shows up on real data the day it lands. `check`
   compares every adapter's match arms against a pinned manifest in `formats/<harness>.toml`, which
   names the upstream commit it was verified against. `tools/harness-drift.sh` re-checks the
-  manifests against the upstream checkouts.
+  manifests against the upstream checkouts, and `tools/harness-fixtures/` regenerates each
+  real-writer fixture. All of it is now run rather than merely shipped, which is how we learned
+  that the Codex smoke check had been proving nothing (it exited before the model call) and that
+  `OPENAI_BASE_URL` does not redirect Codex 0.155.1, so the "dead endpoint" it relied on was
+  letting a real request leave the machine. Containment is a provider override now, the drift
+  script is read-only by default, and every generator writes where you tell it instead of over the
+  committed fixture.
 - **`cv port --strict`** fails the port when the fidelity check finds a loss the target format
   could have carried. Losses the format inherently cannot hold are still only reported.
+- **`--thinking <native|text|drop>`**, on every command that writes a session out (`port`,
+  `splice`, `loom`, `pack --format session`). Thinking blocks come in two shapes: a few carry
+  plaintext, most carry only an opaque provider signature with no text at all (on one real session,
+  177 of 204). Nothing but the store that produced it can hold that blob, so the only question a
+  mode can answer is whether the *turn* survives. `native`, the default, keeps structured reasoning
+  where the target holds it and drops it elsewhere, which can quietly cost a third of the assistant
+  turns. `text` never loses a turn: reasoning with text becomes text, a signed blob becomes a short
+  placeholder, and the lost signature is still reported so a lossy port does not start looking
+  clean. `drop` omits reasoning entirely, for handing someone a session without your chain of
+  thought.
 
 ### Fidelity: conversions now carry what they always should have
 
@@ -60,7 +81,21 @@ them silently lost every usage record, every per-message model, signature-bearin
 tool name on every result, and every structured result payload; `claude → hermes` also lost the
 working directory and `claude → codex` the title. All of that is now carried where the target
 format can hold it, and the verifier diffs every field it could have carried, classifying each
-loss as expected for that format or unexpected. The OpenCode emitter writes OpenCode's SQLite
+loss as expected for that format or unexpected. On a real 900-message session `--strict` now passes
+into **all seven** emit targets. Every remaining "inherent" verdict is backed by evidence rather
+than assumed: Hermes's schema-30 store has no column for a tool result's error flag and its own
+writers take no error argument; Grok records the model it will resume against, so a foreign model
+id there is a deliberate rewrite; OpenCode and Gemini fold a tool result into its originating
+call's record, so a tool turn never had an id of its own to carry, and Gemini's reader applies
+gemini-cli's own rule that a `/`-leading turn is a command typed at the client rather than a
+prompt, which re-tags the turn without losing it.
+
+Getting there turned up real bugs that no test had caught, because nothing had compared a
+conversion field by field on a real session before: an assistant turn whose only content was
+provider-signed reasoning vanished, taking a third of the assistant turns with it; a tool result
+whose call had been pruned away was dropped by three emitters and made Codex log an orphan on every
+resume; a Gemini tool call that completed with empty output lost its whole turn; and usage never
+crossed into Claude from another harness at all. The OpenCode emitter writes OpenCode's SQLite
 store, which is what OpenCode 1.18 actually reads; it had been writing the superseded JSON tree.
 
 ### Also in this release

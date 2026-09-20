@@ -3,6 +3,12 @@
 *Draft — ember + claude, 2026-05-31. Follows PRs #1 (hermes profiles), #2 (stream ingest),
 #3 (cv dataset).*
 
+> **Historical.** This is the design as argued in May 2026; the CLI it uses (`cv show --range
+> 100-120`) predates the 0.11.0 window grammar, and one rule here — the "IR diet", which nulled a
+> message model that merely repeated the session default — was **withdrawn** for seekable harnesses
+> because it made a record's parse depend on how much of the file preceded it. The current contract
+> is [`INTERFACE-V2.md`](INTERFACE-V2.md).
+
 ## The one structural fact
 
 `Adapter::parse(&self, r) -> Result<Session>` materializes the **entire** transcript into one

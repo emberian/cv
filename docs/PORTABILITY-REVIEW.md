@@ -1,5 +1,9 @@
 # Port-a-sesh correctness review — live round-trip (2026-05-31)
 
+> **Historical.** The method still stands; the commands do not. `cv convert <id> --to <h>` became
+> `cv port <id> --harness <h>` in 0.11.0, and the fidelity check it describes has been replaced by
+> the per-field verifier behind `cv port --strict`. See [`INTERFACE-V2.md`](INTERFACE-V2.md).
+
 Goal: verify that `cv convert` produces sessions that the **target harness's own binary**
 can `--resume` and that **Basically Work** (the prior conversation is in the model's
 context). Method: plant an unguessable passphrase ("VELVET-OTTER-7731") + a number (8842)

@@ -67,7 +67,7 @@ as a tree — see [sub-agent trees in the app](app.md).
   model — alongside `agent` mention parts.
 - **Zed** stores a subagent thread as its own row in `threads.db` with a `parent_id` column (and, in
   the 0.3.0 blob, a `subagent_context{parent_thread_id, depth}`); we keep the link in
-  `Session.extra.parent_thread_id`.
+  `Session::lineage.parent` (with `depth` in `extra["zed"]`).
 
 ## The SQLite quartet
 

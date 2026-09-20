@@ -968,7 +968,11 @@ fn emit_record_message(
                     let content = tool_result_text(c.get("result"))
                         .or_else(|| c.get("resultDisplay").and_then(Value::as_str).map(str::to_string))
                         .unwrap_or_default();
-                    if !content.is_empty() {
+                    // A tool that completed with EMPTY output still ran and still answered — the
+                    // turn is real. Requiring non-empty text dropped it, and with it the whole Tool
+                    // turn, so a `ToolSearch` that found nothing vanished from a round trip. A call
+                    // with no `status` yet has not completed and still contributes no result.
+                    if !content.is_empty() || status.is_some() {
                         tool_results.push(Block::ToolResult {
                             tool_use_id: call_id,
                             content: content.into(),

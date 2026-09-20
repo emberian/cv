@@ -180,7 +180,24 @@ impl Lineage {
     }
 }
 
+/// The namespace inside `extra` for facts cv itself produces rather than reads from a harness:
+/// parse diagnostics like `skipped_lines`, and the provenance cv stamps on a session it synthesized
+/// (`loom`, `splice`). It is spelled `"cv"`, which `Harness::parse` never yields, so it can never
+/// collide with a harness bag. See `docs/INTERFACE-V2.md` §4.
+pub const CV_NAMESPACE: &str = "cv";
+
 impl Session {
+    /// cv's own fact bag — `extra["cv"]` as an object, created on demand. For things cv produced
+    /// itself; anything read out of a harness store belongs in that harness's bag instead.
+    pub fn cv_extra_mut(&mut self) -> &mut serde_json::Map<String, serde_json::Value> {
+        bag_mut(&mut self.extra, CV_NAMESPACE)
+    }
+
+    /// cv's own fact bag, if anything was recorded in it.
+    pub fn cv_extra(&self) -> Option<&serde_json::Map<String, serde_json::Value>> {
+        self.extra.get(CV_NAMESPACE).and_then(serde_json::Value::as_object)
+    }
+
     /// The harness-specific fact bag for `h` — `extra[h.as_str()]` as an object, created on demand.
     /// Adapters write here, never at the top level of `extra`.
     pub fn harness_extra_mut(&mut self, h: Harness) -> &mut serde_json::Map<String, serde_json::Value> {
@@ -496,8 +513,17 @@ fn harness_bag_mut(
     extra: &mut serde_json::Map<String, serde_json::Value>,
     h: Harness,
 ) -> &mut serde_json::Map<String, serde_json::Value> {
+    bag_mut(extra, h.as_str())
+}
+
+/// `extra[name]` as a mutable object, created on demand. A non-object value already under that key
+/// can only be a bug, so it is replaced.
+fn bag_mut<'a>(
+    extra: &'a mut serde_json::Map<String, serde_json::Value>,
+    name: &str,
+) -> &'a mut serde_json::Map<String, serde_json::Value> {
     let slot = extra
-        .entry(h.as_str())
+        .entry(name)
         .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
     if !slot.is_object() {
         *slot = serde_json::Value::Object(serde_json::Map::new());

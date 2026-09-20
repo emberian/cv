@@ -34,6 +34,7 @@ pub(crate) fn cmd_port(
     out: Option<PathBuf>,
     no_context: bool,
     strict: bool,
+    thinking: cv_core::emit::ThinkingMode,
 ) -> Result<()> {
     // The source harness rides on the id (`codex:019e…`); `--harness` is the TARGET.
     let (r, adapter) = resolve(id, None)?;
@@ -51,6 +52,7 @@ pub(crate) fn cmd_port(
             new_cwd: cwd,
             new_id: None,
             strict,
+            thinking,
         },
     )?;
 

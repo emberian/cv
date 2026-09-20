@@ -117,24 +117,17 @@ fn each_json_line_inner(line: &str, skipped: &mut u64, f: &mut impl FnMut(Value)
 /// and [`crate::offsets::OFFSET_KEY`] (`cv_byte_offset`, written per message on the lazy-offset hot
 /// path, where a nested map per message would be pure allocation). `Session::extra` has **no** flat
 /// exception: every top-level key there is a namespace object — a harness name or `"cv"`.
-pub(crate) const CV_NAMESPACE: &str = "cv";
-
+///
+/// The namespace itself is [`crate::ir::CV_NAMESPACE`], reached with `Session::cv_extra_mut`.
+///
 /// Record `skipped` unreadable transcript lines under `extra["cv"]["skipped_lines"]` (only when
 /// non-zero, so clean sessions stay byte-identical). The count is a *lower bound* when a pass
 /// stopped early. It is a parse diagnostic shared by every adapter, so it lives in cv's own
-/// namespace ([`CV_NAMESPACE`]) rather than in any harness bag.
+/// namespace ([`crate::ir::CV_NAMESPACE`]) rather than in any harness bag.
 pub(crate) fn note_skipped_lines(s: &mut Session, skipped: u64) {
     if skipped > 0 {
-        let slot = s
-            .extra
-            .entry(CV_NAMESPACE)
-            .or_insert_with(|| Value::Object(serde_json::Map::new()));
-        if !slot.is_object() {
-            *slot = Value::Object(serde_json::Map::new());
-        }
-        if let Some(bag) = slot.as_object_mut() {
-            bag.insert("skipped_lines".into(), Value::Number(skipped.into()));
-        }
+        s.cv_extra_mut()
+            .insert("skipped_lines".into(), Value::Number(skipped.into()));
     }
 }
 
@@ -238,13 +231,13 @@ pub fn for_harness(h: Harness) -> Option<Box<dyn Adapter>> {
 ///
 /// Every top-level key in `Session::extra` and in each `Message::extra` must be a **namespace whose
 /// value is an object** — a canonical harness name (`Harness::as_str`, so an alias like `cc` fails)
-/// or [`CV_NAMESPACE`]. Exactly two flat keys are allowed, both message-level and both cv's own
+/// or [`crate::ir::CV_NAMESPACE`]. Exactly two flat keys are allowed, both message-level and both cv's own
 /// streaming bookkeeping rather than harness facts: [`claude::CARRIER_KEY`] (`_record`, the verbatim
 /// source record under [`ParseOptions::complete`]) and [`crate::offsets::OFFSET_KEY`]
 /// (`cv_byte_offset`). `Session::extra` has no flat exception at all.
 #[cfg(test)]
 pub(crate) fn assert_no_flat_keys(s: &Session) {
-    let namespace = |k: &str| Harness::parse(k).is_some_and(|h| h.as_str() == k) || k == CV_NAMESPACE;
+    let namespace = |k: &str| Harness::parse(k).is_some_and(|h| h.as_str() == k) || k == crate::ir::CV_NAMESPACE;
     for (k, v) in &s.extra {
         assert!(namespace(k), "flat session extra key {k:?} on a {} session", s.harness);
         assert!(v.is_object(), "namespace {k:?} must hold an object, got {v}");
@@ -333,7 +326,7 @@ mod tests {
         // (`CV_NAMESPACE`; `docs/INTERFACE-V2.md` §4).
         let noted = |s: &Session| {
             s.extra
-                .get(CV_NAMESPACE)
+                .get(crate::ir::CV_NAMESPACE)
                 .and_then(|v| v.get("skipped_lines"))
                 .and_then(Value::as_u64)
         };
@@ -346,15 +339,15 @@ mod tests {
     }
 
     /// Every top-level key a session's `extra` may carry is a NAMESPACE object — a harness name or
-    /// [`CV_NAMESPACE`]. `Session::extra` has no flat exception at all (the two documented flat
+    /// [`crate::ir::CV_NAMESPACE`]. `Session::extra` has no flat exception at all (the two documented flat
     /// keys, `_record` and `cv_byte_offset`, are message-level). Asserted here because
     /// `note_skipped_lines` is the one writer every adapter shares.
     #[test]
     fn cv_namespace_never_collides_with_a_harness_name() {
         assert!(
-            Harness::parse(CV_NAMESPACE).is_none(),
+            Harness::parse(crate::ir::CV_NAMESPACE).is_none(),
             "`cv` must never be parseable as a harness, or its bag would shadow one"
         );
-        assert!(!Harness::ALL.iter().any(|h| h.as_str() == CV_NAMESPACE));
+        assert!(!Harness::ALL.iter().any(|h| h.as_str() == crate::ir::CV_NAMESPACE));
     }
 }

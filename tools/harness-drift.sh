@@ -5,19 +5,20 @@
 # from under cv (OpenClaw → sqlite, OpenCode → opencode.db, Kimi → ~/.kimi-code) with no error from
 # any adapter. This makes it a command. For each harness with a checkout under $PUG:
 #
-#   1. record HEAD, `git pull --ff-only`, and show HEAD before/after plus the commit the manifest
-#      claims it was verified against (`[upstream] commit`);
+#   1. record HEAD and show it next to the commit the manifest claims it was verified against
+#      (`[upstream] commit`);
 #   2. grep every type the manifest names out of the checkout — a type that is GONE upstream means
 #      the manifest (and probably the adapter) is carrying dead weight;
 #   3. harvest the vocabulary around the types that ARE there and print what the manifest does not
 #      name — that is the new stuff.
 #
-# Read-only apart from the fast-forward: it never writes inside the cv repo, never checks out,
-# resets, fetches a branch or stashes anything in a harness checkout, and skips a missing one.
+# READ-ONLY BY DEFAULT. It never writes inside the cv repo, and it does not touch a checkout at all
+# unless you pass --pull: other work shares those trees, and a fast-forward under a lane that is
+# mid-bisect or mid-edit is not a thing a reporting tool should do on its own.
 #
-#   tools/harness-drift.sh                 # every harness
+#   tools/harness-drift.sh                 # every harness, checkouts exactly as they are
 #   tools/harness-drift.sh goose hermes    # just these
-#   tools/harness-drift.sh --no-pull       # use the checkouts exactly as they are
+#   tools/harness-drift.sh --pull          # `git pull --ff-only` each checkout first
 #
 # Env: PUG (default ~/pug), CV_REPO (default: the repo this script lives in).
 
@@ -26,7 +27,7 @@ set -uo pipefail
 PUG="${PUG:-$HOME/pug}"
 CV_REPO="${CV_REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 FORMATS="$CV_REPO/formats"
-PULL=1
+PULL=0
 
 # harness(manifest stem) : checkout dir under $PUG : paths inside the checkout that hold the
 # persistence vocabulary (a prefix match; empty = the whole tree).
@@ -47,11 +48,27 @@ CHECKOUTS=(
 WANT=()
 for a in "$@"; do
   case "$a" in
-    --no-pull) PULL=0 ;;
-    -h|--help) sed -n '2,24p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    --pull) PULL=1 ;;
+    --no-pull) PULL=0 ;;   # the default; still accepted so old invocations keep working
+    -h|--help) sed -n '2,23p' "${BASH_SOURCE[0]}"; exit 0 ;;
     -*) echo "unknown flag: $a" >&2; exit 2 ;;
     *) WANT+=("$a") ;;
   esac
+done
+
+command -v git >/dev/null || { echo "no git on PATH" >&2; exit 1; }
+[ -d "$FORMATS" ] || { echo "no manifests at $FORMATS (set CV_REPO)" >&2; exit 1; }
+[ -d "$PUG" ] || { echo "no checkout root at $PUG (set PUG) — nothing to compare against" >&2; exit 1; }
+
+# A name nobody knows used to produce an empty report and exit 0, which reads exactly like "no
+# drift". Say what the known names are instead.
+KNOWN=$(printf '%s\n' "${CHECKOUTS[@]}" | cut -d: -f1)
+for w in ${WANT[@]+"${WANT[@]}"}; do
+  printf '%s\n' "$KNOWN" | grep -qx "$w" || {
+    echo "unknown harness: $w" >&2
+    echo "known: $(printf '%s ' $KNOWN)" >&2
+    exit 2
+  }
 done
 
 # Vocabulary noise: words that are type-shaped but mean nothing on their own. Kept tiny and
@@ -91,11 +108,17 @@ for row in "${CHECKOUTS[@]}"; do
   when=$(git -C "$co" log -1 --format=%cs 2>/dev/null)
   claimed=$(manifest_upstream "$manifest")
   echo "   checkout $co"
-  echo "   HEAD     $before → $after ($when)   manifest [upstream] commit = ${claimed:-unset}"
-  case "$claimed" in
-    "$after"*|"") ;;
-    *) echo "   ⚠ manifest is pinned to $claimed; re-verify the adapter and bump [upstream]" ;;
-  esac
+  if [ "$PULL" = 1 ] && [ "$before" != "$after" ]; then
+    echo "   HEAD     $before → $after ($when)   manifest [upstream] commit = ${claimed:-unset}"
+  else
+    echo "   HEAD     $after ($when)   manifest [upstream] commit = ${claimed:-unset}"
+  fi
+  # `commit = "..."` may carry a note ("86f1364 (store frozen since 2026-06)"), and the two short
+  # hashes need not be the same length, so compare the leading hex token as a prefix either way.
+  pinned=${claimed%% *}
+  if [ -n "$pinned" ] && [ "${after#"$pinned"}" = "$after" ] && [ "${pinned#"$after"}" = "$pinned" ]; then
+    echo "   ⚠ manifest is pinned to $claimed; re-verify the adapter and bump [upstream]"
+  fi
 
   # Where to look. A named subpath that no longer exists is itself a drift signal.
   roots=()
@@ -110,6 +133,8 @@ for row in "${CHECKOUTS[@]}"; do
   # across the whole checkout before it is called GONE — upstream moves files constantly, and a
   # false "GONE" is worse than a slow one.
   present=$(mktemp); gone=$(mktemp); files=$(mktemp)
+  # shellcheck disable=SC2064  # expand now: the trap must name THIS iteration's files
+  trap "rm -f '$present' '$gone' '$files'" EXIT
   while IFS= read -r ty; do
     [ -z "$ty" ] && continue
     hits=$(grep -rlF --binary-files=without-match --exclude-dir=.git --exclude-dir=node_modules \

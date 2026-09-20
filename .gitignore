@@ -11,3 +11,7 @@ app/src-tauri/gen/
 /manual/book/
 /web/manual/
 .claude/worktrees/
+
+# Python bytecode from the fixture generators under tools/
+__pycache__/
+*.pyc

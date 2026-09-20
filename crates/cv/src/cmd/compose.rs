@@ -233,6 +233,7 @@ pub(crate) fn cmd_splice(
     cwd: Option<PathBuf>,
     generate: bool,
     gen_model: Option<String>,
+    thinking: cv_core::emit::ThinkingMode,
 ) -> Result<()> {
     let parsed: Vec<SpliceSpec> = specs.iter().map(|s| parse_splice_spec(s)).collect::<Result<_>>()?;
 
@@ -264,7 +265,17 @@ pub(crate) fn cmd_splice(
     };
 
     let spliced = cv_core::loom::splice(&spans, None, to_h);
-    finish_composed(spliced, to_h, harness.is_some(), out, export, cwd, generate, gen_model)
+    finish_composed(
+        spliced,
+        to_h,
+        harness.is_some(),
+        out,
+        export,
+        cwd,
+        generate,
+        gen_model,
+        thinking,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -279,6 +290,7 @@ pub(crate) fn cmd_loom(
     cwd: Option<PathBuf>,
     generate: bool,
     gen_model: Option<String>,
+    thinking: cv_core::emit::ThinkingMode,
 ) -> Result<()> {
     let (rb, ab) = resolve(base, None)?;
     let (rg, ag) = resolve(graft, None)?;
@@ -294,7 +306,17 @@ pub(crate) fn cmd_loom(
     // Re-stamp the harness if --harness overrode it (graft used base.harness).
     let mut grafted = grafted;
     grafted.harness = to_h;
-    finish_composed(grafted, to_h, harness.is_some(), out, export, cwd, generate, gen_model)
+    finish_composed(
+        grafted,
+        to_h,
+        harness.is_some(),
+        out,
+        export,
+        cwd,
+        generate,
+        gen_model,
+        thinking,
+    )
 }
 
 /// Shared tail for splice/loom: emit to a harness when `--harness`/`--out` is in play, otherwise
@@ -309,6 +331,7 @@ fn finish_composed(
     cwd: Option<PathBuf>,
     generate: bool,
     gen_model: Option<String>,
+    thinking: cv_core::emit::ThinkingMode,
 ) -> Result<()> {
     // The generative half of looming: grow the composed branch with an LLM-generated continuation.
     if generate {
@@ -348,6 +371,7 @@ fn finish_composed(
                 new_cwd: cwd,
                 new_id: None,
                 strict: false,
+                thinking,
             },
         );
     }
@@ -359,7 +383,7 @@ fn finish_composed(
         session.harness.as_str(),
         session.messages.len()
     );
-    if let Some(prov) = session.extra.get("loom") {
+    if let Some(prov) = session.cv_extra().and_then(|b| b.get("loom")) {
         if let Some(arr) = prov.as_array() {
             for p in arr {
                 println!(

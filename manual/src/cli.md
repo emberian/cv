@@ -64,6 +64,27 @@ An **ambiguous** prefix is never resolved by guessing: cv lists the candidates a
 | `--limit <n>` | how many rows/records | `ls` `search` `timeline` `dataset` `pack` `board read` |
 | `--fresh` | bypass the catalog and re-discover | `ls` |
 | `--all` | include what is hidden by default | `task list` `task verify` |
+| `--thinking <mode>` | what an emit does with the model's reasoning: `native` (default), `text`, `drop` | `port` `splice` `loom` `pack` |
+| `--strict` | fail if a loss the target format *could* have carried happens | `port` |
+
+**`--thinking` and why the default drops some reasoning.** Thinking blocks come in two shapes. A few
+carry plaintext. Most carry only a provider **signature** — an opaque, vendor-bound blob with no
+text at all (on one real 900-message session, 177 of 204). No format but the one that produced it
+can hold that blob, so "carry the reasoning across" is not on the table for the majority. The only
+question is whether the *turn* survives, and the mode answers it:
+
+- `native` (default) — structured reasoning where the target holds it, dropped where it does not.
+  An assistant turn whose only content was a signature blob disappears, reported as
+  `unrepresentable_turns`.
+- `text` — never lose the turn. Reasoning with text becomes a text block; a signed blob becomes a
+  short placeholder naming what it was. The conversation's alternation survives intact. The lost
+  signature is still reported, so a lossy port does not start looking clean.
+- `drop` — omit reasoning entirely, even where the target could hold it, for handing someone a
+  session without your chain of thought.
+
+Note that `cv prune --drop-thinking` is a different thing: it flattens old reasoning to shrink a
+session you intend to resume. It was spelled `--thinking` before 0.11.0, and was renamed precisely
+so that one word does not mean two things.
 
 **JSON is snake_case, everywhere.** Every `--json` output and every MCP payload uses snake_case keys, and timestamps are RFC 3339 strings. There is **one** session-row shape, and `ls`, `search`, `timeline` and the MCP tools all emit it:
 
@@ -470,7 +491,7 @@ cv prune 3b829648 --keep-last 40 --min-size 4096   # spare more recent context; 
 cv prune 3b829648 --dry-run                        # report the savings without writing
 cv prune 3b829648 --to my-tidy-session             # choose the new id
 cv prune 3b829648 --drop                           # hard-drop payloads (no sidecar, irreversible)
-cv prune 3b829648 --thinking                       # the resurrection: flatten old reasoning + revive
+cv prune 3b829648 --drop-thinking                 # the resurrection: flatten old reasoning + revive
 cv prune 3b829648 --window 120000                  # keep the newest turns fitting a real-token budget
 cv prune 3b829648 --keep 0..400                    # …or keep an explicit turn-index window
 cv prune 3b829648 --json                           # + the report as one JSON object on stdout
@@ -482,13 +503,13 @@ cv cat <new-id> toolu_abc123                       # fetch a stashed original ba
 - `--min-size <bytes>` — only snip a tool payload larger than this (default `2048`).
 - `--keep-last <N>` — keep the last N conversational turns' payloads verbatim (default `25`).
 - `--to <id>` — the new session id (default: a fresh UUID).
-- `--thinking` — also flatten the **oldest** assistant reasoning (thinking blocks); recent thinking (within `--keep-last`) stays verbatim. On a long Claude session the chain-of-thought *signatures* dominate the loaded context (Claude keeps a ~600-byte signature per thinking turn even when the reasoning text is omitted), so this is the biggest lever for shrinking what a resume loads. Lossless. Real example: it took a 976k-token session from ~98% to ~36% of a 1M window.
+- `--drop-thinking` — also flatten the **oldest** assistant reasoning (thinking blocks); recent thinking (within `--keep-last`) stays verbatim. On a long Claude session the chain-of-thought *signatures* dominate the loaded context (Claude keeps a ~600-byte signature per thinking turn even when the reasoning text is omitted), so this is the biggest lever for shrinking what a resume loads. Lossless. Real example: it took a 976k-token session from ~98% to ~36% of a 1M window.
 - `--drop` — discard payloads entirely instead of stashing them (smallest output, irreversible; the source is never touched regardless).
 - `--window <tokens>` — a sliding window: keep only the newest turns totalling ≤ this many **real** tokens, dropping older turns. Sized from Claude's own recorded `usage` counts rather than a tokenizer estimate, so the budget lands true; the resumed session loads roughly this budget plus ~30k of system overhead. Lossy in the new session — the source keeps the full history.
 - `--keep <A..B>` — the same thing by *index*: keep only this turn-index window (0-based, end-exclusive; `A..` through the last), dropping everything outside it. This is the flag that used to be spelled `--range`; it was renamed because it selects what to **keep**, while `--range` is the read-window flag everywhere else.
 - `--copy-resources` — also copy the session's `subagents/`/`workflows/` dir under the new id (off by default; can be hundreds of MB). `claude --resume` doesn't need it — only cv's forest features on the pruned session do.
 - `--no-revive` — opt *out* of the resume-gate fix. By default prune **resurrects an already-maxed session**: Claude Code's resume gate reads the last turn's recorded `usage` (input + cache tokens) as the session's current size, and checks it *before* re-sending anything, so a session sitting at the wall refuses to resume even after pruning has made the real content fit. Revive recomputes the honest size of the loaded window (everything after the last compaction boundary — what Claude actually re-sends) and rewrites the stale `usage` records to that figure. A no-op when the recorded size is already honest. `--no-revive` preserves the original records byte-for-byte.
-- `--declassify` — also snip conversational *prose* (user prompts + assistant text blocks) dense in caller-supplied terms, into the sidecar with a `[PRUNED …]` marker (lossless). A message is snipped iff it holds ≥ 2 distinct terms, matched case-insensitively as substrings. Unlike the tool/`--thinking` passes this ignores `--keep-last` — recent prose is snipped too, because the use case (a scorer reading the *whole* loaded context) doesn't care about recency. cv ships **no built-in term list**: supply terms with `--declassify-tokens t1,t2,…` and/or `--declassify-tokens-file <path>` (one per line, `#` comments and blanks ignored), else `--declassify` warns and snips nothing.
+- `--declassify` — also snip conversational *prose* (user prompts + assistant text blocks) dense in caller-supplied terms, into the sidecar with a `[PRUNED …]` marker (lossless). A message is snipped iff it holds ≥ 2 distinct terms, matched case-insensitively as substrings. Unlike the tool/`--drop-thinking` passes this ignores `--keep-last` — recent prose is snipped too, because the use case (a scorer reading the *whole* loaded context) doesn't care about recency. cv ships **no built-in term list**: supply terms with `--declassify-tokens t1,t2,…` and/or `--declassify-tokens-file <path>` (one per line, `#` comments and blanks ignored), else `--declassify` warns and snips nothing.
 - `--dry-run` — compute and report without writing.
 - `--json` — also emit the report as **one JSON object on stdout** (the human report stays on stderr, so stdout is pure JSON): `source_id`/`new_id` (FULL ids), `harness`, `before_bytes`/`after_bytes`, `snipped_payloads`, `image_blocks`, `tokens_freed`, `dropped_turns`/`window_real_tokens`, `revived`, `warnings`, `new_path`/`sidecar_path`/`copied_resources`, `dry_run`, `note`. Dry-run honest: nothing was written, so the paths — and `new_id`, unless `--to` pinned it — are explicit nulls with a `note` saying so.
 

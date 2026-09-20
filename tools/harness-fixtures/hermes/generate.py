@@ -1,14 +1,73 @@
-"""Populate an isolated Hermes state.db through Hermes's OWN store API (no raw SQL), then dump Hermes's
-own views for comparison with cv. Run from ~/pug/hermes-agent with HERMES_HOME set."""
-import json, os, sys, time
-sys.path.insert(0, os.getcwd())
-import hermes_state
-from hermes_state_ids import new_session_id
-from agent.context_compressor import SUMMARY_PREFIX, _SUMMARY_END_MARKER
-from hermes_cli.foreign_sessions import import_foreign_session
+"""Populate an isolated Hermes state.db through Hermes's OWN store API (no raw SQL), then dump
+Hermes's own views for comparison with cv, and VACUUM the result into a fixture file.
 
-OUT = os.environ["GEN_OUT"]
+    HERMES_HOME=$(mktemp -d) OUT=/tmp/state-v30.db \
+      python3 tools/harness-fixtures/hermes/generate.py
+
+Env:
+  HERMES_HOME         (required)  throwaway Hermes home. REFUSED if unset, $HOME or ~/.hermes:
+                                  Hermes falls back to ~/.hermes with only a warning
+                                  (hermes_constants.get_hermes_home), so an unset var would write
+                                  ten sessions into your real state.
+  OUT                 (default: none)  where to VACUUM the finished state.db. Unset = leave it in
+                                  $HERMES_HOME and print the path.
+  GEN_OUT             (default: <OUT dir>/hermes-views.json, else $HERMES_HOME/hermes-views.json)
+  FOREIGN_CLAUDE_PATH (default: crates/cv-core/tests/fixtures/claude/rich_blocks.jsonl)
+  HERMES_SRC          (default ~/pug/hermes-agent)  the checkout to import Hermes from.
+"""
+import json, os, sqlite3, sys, time
+from pathlib import Path
+
+
+def die(msg):
+    sys.exit(f"generate.py: {msg}")
+
+
+# ── prerequisites, all up front ───────────────────────────────────────────────────────────────
+# Every one of these used to fail late or not at all: FOREIGN_CLAUDE_PATH raised KeyError after all
+# ten sessions were already built, and HERMES_HOME was never checked at all.
+home = Path.home()
+hermes_home = os.environ.get("HERMES_HOME", "").strip()
+if not hermes_home:
+    die("HERMES_HOME is unset. Hermes would fall back to ~/.hermes and write into your real state.\n"
+        "  Set it to a throwaway dir:  HERMES_HOME=$(mktemp -d)")
+hermes_home_path = Path(os.path.expanduser(os.path.expandvars(hermes_home))).resolve()
+if hermes_home_path in (home, (home / ".hermes").resolve()):
+    die(f"refusing to write into {hermes_home_path} — HERMES_HOME must be a throwaway dir")
+os.environ["HERMES_HOME"] = str(hermes_home_path)
+
+src = Path(os.environ.get("HERMES_SRC") or home / "pug" / "hermes-agent").expanduser()
+if not (src / "hermes_state.py").is_file():
+    die(f"no Hermes checkout at {src} (set HERMES_SRC)")
+sys.path.insert(0, str(src))
+
+CV_REPO = Path(__file__).resolve().parents[3]
+FOREIGN = Path(os.environ.get("FOREIGN_CLAUDE_PATH")
+               or CV_REPO / "crates/cv-core/tests/fixtures/claude/rich_blocks.jsonl").expanduser()
+if not FOREIGN.is_file():
+    die(f"no Claude transcript to import at {FOREIGN} (set FOREIGN_CLAUDE_PATH)")
+
+FIXTURE = os.environ.get("OUT")
+if FIXTURE:
+    FIXTURE = Path(FIXTURE).expanduser().resolve()
+    FIXTURE.parent.mkdir(parents=True, exist_ok=True)
+    if FIXTURE.exists():
+        die(f"{FIXTURE} already exists — VACUUM INTO will not overwrite it. Remove it first.")
+OUT = os.environ.get("GEN_OUT") or str(
+    (FIXTURE.parent if FIXTURE else hermes_home_path) / "hermes-views.json")
+
+try:
+    import hermes_state
+    from hermes_state_ids import new_session_id
+    from agent.context_compressor import SUMMARY_PREFIX, _SUMMARY_END_MARKER
+    from hermes_cli.foreign_sessions import import_foreign_session
+except ImportError as e:
+    die(f"cannot import Hermes from {src}: {e}\n"
+        f"  Install its Python environment, or run this with that env's interpreter.")
+
 db = hermes_state.SessionDB()
+if not str(Path(db.db_path).resolve()).startswith(str(hermes_home_path)):
+    die(f"Hermes opened {db.db_path}, which is outside {hermes_home_path} — refusing to continue")
 print("db:", db.db_path)
 MODEL = "anthropic/claude-sonnet-4.5"
 SYS_PROMPT = "You are Hermes, a helpful coding agent. Working dir: /tmp/proj."
@@ -115,7 +174,7 @@ db.append_message(Y, "assistant", "hidden reply", timestamp=T0 + 501)
 db.set_session_hidden(Y, True)
 
 # ── F: a foreign import of a real (small) Claude Code transcript ──────────────────────────────
-F = import_foreign_session("claude", os.environ["FOREIGN_CLAUDE_PATH"], db); ids["F_foreign_claude"] = F
+F = import_foreign_session("claude", str(FOREIGN), db); ids["F_foreign_claude"] = F
 
 db.flush_token_counts() if hasattr(db, "flush_token_counts") else None
 
@@ -136,3 +195,19 @@ with open(OUT, "w") as f:
     json.dump(views, f, indent=1, default=str)
 db.close()
 print(json.dumps(ids, indent=1))
+print("views:", OUT)
+
+# VACUUM INTO, so the fixture is one file with no -wal/-shm siblings. A plain copy would lose
+# whatever is still in the WAL.
+if FIXTURE:
+    con = sqlite3.connect(db.db_path)
+    con.execute("VACUUM INTO ?", (str(FIXTURE),))
+    con.close()
+    n_s, n_m = sqlite3.connect(FIXTURE).execute(
+        "SELECT (SELECT COUNT(*) FROM sessions), (SELECT COUNT(*) FROM messages)").fetchone()
+    print(f"wrote {FIXTURE} ({n_s} sessions, {n_m} messages)")
+    print("NOTE: Hermes derives session ids from the wall clock, so every regeneration changes")
+    print("      them. The `const A/R/B/S/D/C1/C2/X/Y/F` block in")
+    print("      crates/cv-core/src/harness/hermes.rs must be updated to the ids printed above.")
+else:
+    print(f"state.db left in {hermes_home_path}; set OUT=<path> to VACUUM it into a fixture")

@@ -180,9 +180,13 @@ fn select_tool_commands(all: Vec<CommandSpec>) -> Vec<CommandSpec> {
 fn locate_cv() -> Result<(PathBuf, String)> {
     let exe_name = if cfg!(windows) { "cv.exe" } else { "cv" };
     let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Some(explicit) = std::env::var_os("CV_BIN").filter(|v| !v.is_empty()) {
-        candidates.push(PathBuf::from(explicit));
-    }
+    let explicit = match std::env::var_os("CV_BIN").filter(|v| !v.is_empty()) {
+        Some(v) => {
+            candidates.push(PathBuf::from(v));
+            true
+        }
+        None => false,
+    };
     if let Ok(me) = std::env::current_exe() {
         if let Some(dir) = me.parent() {
             candidates.push(dir.join(exe_name));
@@ -191,10 +195,22 @@ fn locate_cv() -> Result<(PathBuf, String)> {
     candidates.push(PathBuf::from(exe_name)); // PATH lookup
 
     let mut errors = Vec::new();
-    for cand in candidates {
-        match schema_dump(&cand) {
-            Ok(dump) => return Ok((cand, dump)),
-            Err(e) => errors.push(format!("{}: {e:#}", cand.display())),
+    for (i, cand) in candidates.iter().enumerate() {
+        match schema_dump(cand) {
+            Ok(dump) => return Ok((cand.clone(), dump)),
+            Err(e) => {
+                // An explicit `$CV_BIN` that does not work is a mistake worth hearing about: falling
+                // through to a sibling or `PATH` silently would hand back a DIFFERENT binary than
+                // the one that was asked for, which is exactly the kind of surprise that costs an
+                // afternoon when you set it to test one build.
+                if i == 0 && explicit {
+                    eprintln!(
+                        "cv-mcp: $CV_BIN is set but unusable ({}: {e:#}); falling back",
+                        cand.display()
+                    );
+                }
+                errors.push(format!("{}: {e:#}", cand.display()));
+            }
         }
     }
     Err(anyhow!("no usable `cv` binary ({})", errors.join("; ")))

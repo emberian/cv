@@ -197,7 +197,8 @@ pub struct Usage {
     pub cache_creation_tokens: Option<u64>,
     /// Reasoning/thinking tokens when the provider reports them separately.
     pub reasoning_tokens: Option<u64>,
-    /// Provider-reported cost, when the harness stores it (Goose, OpenCode, Codex).
+    /// Provider-reported cost, when the harness stores it (Goose, OpenCode, OpenClaw — Codex
+    /// records none).
     pub cost_usd: Option<f64>,
 }
 
@@ -221,9 +222,12 @@ Rules:
 - **`extra` is nested by harness, always.** `m.harness_extra_mut(Harness::Claude)` returns the
   `extra["claude"]` object. The keys inside keep the harness's own spelling (`attachment_type`,
   `history_mode`, `display_kind`), snake_case where cv invents a name. A namespace key is either a
-  canonical harness name or `cv` (`harness::CV_NAMESPACE`), which holds cv's own cross-harness
-  parse diagnostics such as `skipped_lines`; `Harness::parse("cv")` is `None`, so the two can never
-  collide. Exactly two flat keys survive, both message-level and both cv's own streaming
+  canonical harness name or `cv` (`ir::CV_NAMESPACE`, reached with `Session::cv_extra_mut`), which
+  holds facts cv itself produced rather than read from a store: parse diagnostics such as
+  `skipped_lines`, and the provenance cv stamps on a session it synthesized, such as `loom`.
+  `Harness::parse("cv")` is `None`, so the two can never collide. **This rule binds cv's own
+  session producers too, not only adapters** — `loom` wrote a flat `extra["loom"]` for a release
+  and made this very sentence false; its tests now call `assert_no_flat_keys` like an adapter's. Exactly two flat keys survive, both message-level and both cv's own streaming
   bookkeeping, never harness facts: `_record` (the verbatim carrier under `ParseOptions::complete`)
   and `cv_byte_offset` (`crate::offsets::OFFSET_KEY`, on the per-message hot path). A session's
   `extra` has no flat keys at all. `harness::assert_no_flat_keys(&Session)` states this rule once
@@ -241,7 +245,9 @@ Rules:
 - **Shared core modules key off `kind`, not harness keys.** `compaction.rs` detects
   `MessageKind::CompactionBoundary`/`CompactionSummary`; `doctor.rs` buckets
   `MessageKind::InjectedContext` as system reminders (kind name from `extra["claude"]["attachment_type"]`
-  when present); `events.rs`/`tools.rs` read Claude's `toolUseResult` from `extra["claude"]`;
+  when present); Claude's `toolUseResult` is a SHARED concept and lives on the block as
+  `Block::ToolResult::details` (a `complete`-mode copy stays in `extra["claude"]` only for
+  byte-exact same-harness replay);
   `render.rs`/`html.rs` and `cv show` label a System turn by its `kind` (plus the attachment kind).
 - **`Session::model`** is the session default, and `Message::model` names the model that turn ran
   under. REARCH's "IR diet" would null a message model that merely repeats the session default;

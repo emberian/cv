@@ -980,6 +980,7 @@ mod tests {
             message_count: 0,
         };
         let s = Continue { sessions: None }.parse(&r).unwrap();
+        crate::harness::assert_no_flat_keys(&s);
         assert_eq!(s.cwd.as_deref(), Some(Path::new("/Users/me/proj")));
         assert!(s.messages.iter().any(|m| m.role == Role::User));
         assert!(s.messages.iter().any(|m| m.role == Role::Assistant));

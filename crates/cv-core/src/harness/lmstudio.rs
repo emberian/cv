@@ -856,6 +856,8 @@ mod tests {
         assert_eq!(r.message_count, 2);
 
         let s = LmStudio { root: None }.parse(&r).unwrap();
+
+        crate::harness::assert_no_flat_keys(&s);
         assert!(s.cwd.is_none(), "lmstudio chats have no cwd");
         assert_eq!(s.model.as_deref(), Some("openai/gpt-oss-120b"));
         assert_eq!(s.messages.len(), 2);

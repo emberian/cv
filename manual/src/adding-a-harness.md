@@ -42,8 +42,12 @@ msg.harness_extra_mut(Harness::Yours).insert("thread_state".into(), json!(state)
 msg.extra.insert("thread_state".into(), json!(state));
 ```
 
-The one top-level key that is *not* a harness name is `_record`, the verbatim source record carried
-under `ParseOptions::complete`.
+Two top-level keys are not harness names, both on a message and both cv's own streaming
+bookkeeping: `_record`, the verbatim source record carried under `ParseOptions::complete`, and
+`cv_byte_offset`, stamped on the lazy-offset path. Facts cv produces itself rather than reading
+from your store — a parse diagnostic, provenance for a session cv synthesized — go under
+`extra["cv"]` via `Session::cv_extra_mut`. A session's `extra` has no flat keys at all, and
+`harness::assert_no_flat_keys` in your tests will hold you to it.
 
 **3. Shared concepts get their first-class home, not a bag entry.** Before you reach for `extra`,
 check whether the IR already has the field: the system prompt is `Session::system_prompt`; fork,

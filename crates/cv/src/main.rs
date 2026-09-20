@@ -429,7 +429,13 @@ enum Cmd {
         /// Also flatten the OLDEST assistant reasoning (thinking blocks) — recent thinking (within
         /// --keep-last) stays verbatim. On a long session the chain-of-thought dominates the loaded
         /// context; flattening the old reasoning is the biggest lever for shrinking it. Lossless.
-        #[arg(long)]
+        ///
+        /// Renamed from `--thinking` in 0.11.0: that spelling now names the emit-side
+        /// `--thinking <native|text|drop>`, and one word may not mean two things.
+        #[arg(long = "drop-thinking")]
+        drop_thinking: bool,
+        // Renamed in 0.11.0 — hidden so the old spelling errors with a pointer (exit 2).
+        #[arg(long, hide = true)]
         thinking: bool,
         /// Also copy the session's subagents/workflows dir under the new id (off by default; can be
         /// hundreds of MB for big sessions). Resume doesn't need it — only cv's forest features do.
@@ -497,6 +503,11 @@ enum Cmd {
         /// Write under this directory instead of the target's real storage root.
         #[arg(long)]
         out: Option<PathBuf>,
+        /// What to do with the model's reasoning on the way out: `native` keeps it where the target
+        /// format holds it and drops it elsewhere, `text` keeps the turn by demoting thinking to
+        /// text (a placeholder for provider-signed blobs, which have no text), `drop` omits it.
+        #[arg(long, default_value = "native", value_parser = ["native", "text", "drop"])]
+        thinking: String,
         /// Print the composed session instead of emitting it: md or json.
         #[arg(long)]
         export: Option<String>,
@@ -530,6 +541,11 @@ enum Cmd {
         harness: Option<String>,
         #[arg(long)]
         out: Option<PathBuf>,
+        /// What to do with the model's reasoning on the way out: `native` keeps it where the target
+        /// format holds it and drops it elsewhere, `text` keeps the turn by demoting thinking to
+        /// text (a placeholder for provider-signed blobs, which have no text), `drop` omits it.
+        #[arg(long, default_value = "native", value_parser = ["native", "text", "drop"])]
+        thinking: String,
         /// Print the grafted session instead of emitting it: md or json.
         #[arg(long)]
         export: Option<String>,
@@ -566,6 +582,11 @@ enum Cmd {
         /// format inherently cannot hold are still only reported under `⚠ lost`.
         #[arg(long)]
         strict: bool,
+        /// What to do with the model's reasoning on the way out: `native` keeps it where the target
+        /// format holds it and drops it elsewhere, `text` keeps the turn by demoting thinking to
+        /// text (a placeholder for provider-signed blobs, which have no text), `drop` omits it.
+        #[arg(long, default_value = "native", value_parser = ["native", "text", "drop"])]
+        thinking: String,
         // Renamed in 0.11.0 — hidden so the old spellings error with a pointer (exit 2).
         #[arg(long, hide = true)]
         to: Option<String>,
@@ -659,6 +680,11 @@ enum Cmd {
         limit: usize,
         #[arg(long)]
         out: Option<PathBuf>,
+        /// What to do with the model's reasoning on the way out: `native` keeps it where the target
+        /// format holds it and drops it elsewhere, `text` keeps the turn by demoting thinking to
+        /// text (a placeholder for provider-signed blobs, which have no text), `drop` omits it.
+        #[arg(long, default_value = "native", value_parser = ["native", "text", "drop"])]
+        thinking: String,
         #[arg(long, hide = true)]
         to: Option<String>,
     },
@@ -881,6 +907,7 @@ fn run() -> Result<()> {
             out,
             no_context,
             strict,
+            thinking,
             to,
             to_dir,
             from,
@@ -897,7 +924,7 @@ fn run() -> Result<()> {
                      `cv port <harness>:<id>`",
                 );
             }
-            port::cmd_port(&id, harness, cwd, out, no_context, strict)
+            port::cmd_port(&id, harness, cwd, out, no_context, strict, util::parse_thinking(&thinking)?)
         }
         Cmd::Scry {
             harness,
@@ -935,12 +962,13 @@ fn run() -> Result<()> {
             harness,
             limit,
             out,
+            thinking,
             to,
         } => {
             if to.is_some() {
                 return usage("`cv pack --to <harness>` was renamed in 0.11.0 — use `--harness <harness>`");
             }
-            pack::cmd_pack(&task, &format, harness, limit, out)
+            pack::cmd_pack(&task, &format, harness, limit, out, util::parse_thinking(&thinking)?)
         }
         Cmd::Stats { query, json } => browse::cmd_stats(query, json),
         Cmd::Prune {
@@ -950,6 +978,7 @@ fn run() -> Result<()> {
             keep_last,
             to,
             drop,
+            drop_thinking,
             thinking,
             copy_resources,
             no_revive,
@@ -982,6 +1011,12 @@ fn run() -> Result<()> {
                      --declassify-tokens-file) — nothing will be snipped. cv ships no built-in list."
                 );
             }
+            if thinking {
+                return usage(
+                    "`cv prune --thinking` was renamed in 0.11.0 — use `--drop-thinking` (plain \
+                     `--thinking <native|text|drop>` now means what an EMIT does with reasoning)",
+                );
+            }
             compose::cmd_prune(
                 &id,
                 harness,
@@ -989,7 +1024,7 @@ fn run() -> Result<()> {
                 keep_last,
                 to,
                 drop,
-                thinking,
+                drop_thinking,
                 copy_resources,
                 !no_revive,
                 window,
@@ -1057,12 +1092,13 @@ fn run() -> Result<()> {
             cwd,
             generate,
             gen_model,
+            thinking,
             to,
         } => {
             if to.is_some() {
                 return usage("`cv splice --to <harness>` was renamed in 0.11.0 — use `--harness <harness>`");
             }
-            compose::cmd_splice(&specs, harness, out, export, cwd, generate, gen_model)
+            compose::cmd_splice(&specs, harness, out, export, cwd, generate, gen_model, util::parse_thinking(&thinking)?)
         }
         Cmd::Redact {
             id,
@@ -1081,12 +1117,16 @@ fn run() -> Result<()> {
             cwd,
             generate,
             gen_model,
+            thinking,
             to,
         } => {
             if to.is_some() {
                 return usage("`cv loom --to <harness>` was renamed in 0.11.0 — use `--harness <harness>`");
             }
-            compose::cmd_loom(&base, at, &graft, from, harness, out, export, cwd, generate, gen_model)
+            compose::cmd_loom(
+                &base, at, &graft, from, harness, out, export, cwd, generate, gen_model,
+                util::parse_thinking(&thinking)?,
+            )
         }
         // Removed commands: one line each, pointing at the replacement; exit 2.
         Cmd::Convert { .. } => usage(

@@ -52,7 +52,7 @@ One selector at a time. Piped `cv show` with no selector over 200 KB prints the 
        compactions, auto_compactions, peak_context, …}
 
  7. Prune and resume a maxed-out session
-    cv prune <id> --thinking --json              # snips old payloads + thinking; revives the resume gate
+    cv prune <id> --drop-thinking --json         # snips old payloads + thinking; revives the resume gate
     → {source_id, new_id, harness, before_bytes, after_bytes, snipped_payloads, image_blocks,
        tokens_freed, dropped_turns, window_real_tokens, revived, warnings, new_path, sidecar_path,
        copied_resources, dry_run, note}
@@ -62,6 +62,9 @@ One selector at a time. Piped `cv show` with no selector over 200 KB prints the 
     cv port <id> --harness codex                 # same cwd, runs in Codex
     cv port <id> --cwd ~/new/home                # same harness, new home (carries CLAUDE.md/AGENTS.md)
     cv port <id> --harness codex --out /tmp/dry  # dry run: write under --out, not the real store
+    cv port <id> --harness codex --strict        # fail if a loss the target COULD have carried happens
+    cv port <id> --harness codex --thinking text # keep every turn: reasoning the target can't hold
+                                                 # becomes text (a placeholder for signed blobs)
     → prints `✦ wrote <path> (<new_id>)` and the resume incantation; `⚠ lossy:` lines name what
       the target format cannot carry
 

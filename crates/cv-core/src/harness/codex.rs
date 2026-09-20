@@ -2583,7 +2583,7 @@ mod tests {
     fn corrupt_lines_are_counted_identically_on_both_paths() {
         // A live/damaged rollout: one corrupt line amid good records. Both paths must (a) keep the
         // good records, (b) surface the same `extra["cv"]["skipped_lines"]` count (cv's own parse
-        // diagnostic, not a harness fact — see `harness::CV_NAMESPACE`), and (c) stay
+        // diagnostic, not a harness fact — see `ir::CV_NAMESPACE`), and (c) stay
         // byte-identical to each other. Clean files get NO `cv` bag (see the other tests'
         // sessions, which assert exact JSON equality without it).
         let lines = [

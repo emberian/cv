@@ -46,6 +46,7 @@ pub(crate) fn cmd_pack(
     harness: Option<String>,
     limit: usize,
     out: Option<PathBuf>,
+    thinking: cv_core::emit::ThinkingMode,
 ) -> Result<()> {
     if !matches!(format, "md" | "prompt" | "session") {
         bail!("unknown format {format:?} (use md, prompt, or session)");
@@ -96,7 +97,7 @@ pub(crate) fn cmd_pack(
     match format {
         "md" => write_text(&md_bundle(task, &sources, &rollup), out, "context pack"),
         "prompt" => write_text(&prompt_bundle(task, &sources, &rollup), out, "context prompt"),
-        _ => emit_pack_session(task, &sources, &rollup, to_h.expect("validated above"), out),
+        _ => emit_pack_session(task, &sources, &rollup, to_h.expect("validated above"), out, thinking),
     }
 }
 
@@ -824,6 +825,7 @@ fn emit_pack_session(
     rollup: &[(String, usize, i64, i64)],
     to_h: Harness,
     out: Option<PathBuf>,
+    thinking: cv_core::emit::ThinkingMode,
 ) -> Result<()> {
     let bundle = md_bundle(task, sources, rollup);
     let now = Utc::now();
@@ -870,7 +872,15 @@ fn emit_pack_session(
         system_prompt: None,
         lineage: cv_core::ir::Lineage::default(),
     };
-    crate::cmd::port::emit_session(&session, to_h, out, EmitOptions::default())
+    crate::cmd::port::emit_session(
+        &session,
+        to_h,
+        out,
+        EmitOptions {
+            thinking,
+            ..Default::default()
+        },
+    )
 }
 
 /// Write a text bundle to `--out` (with a stderr note) or stdout.

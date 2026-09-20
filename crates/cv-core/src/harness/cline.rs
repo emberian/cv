@@ -1171,6 +1171,7 @@ mod tests {
             message_count: 0,
         };
         let parsed = cline.parse(&r).expect("re-parse");
+        crate::harness::assert_no_flat_keys(&parsed);
 
         // Roles survive: user, assistant, tool.
         assert_eq!(parsed.messages.len(), 3);

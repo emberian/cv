@@ -1179,6 +1179,8 @@ mod tests {
         assert_eq!(sub.created_at.map(|t| t.timestamp_millis()), Some(1787509646010));
 
         let s = a.parse(sub).unwrap();
+
+        crate::harness::assert_no_flat_keys(&s);
         assert_eq!(s.lineage.parent.as_deref(), Some(SID));
         assert_eq!(s.lineage.agent_path.as_deref(), Some("agent-0"));
         assert_eq!(s.system_prompt.as_deref(), Some("You are an explorer."));

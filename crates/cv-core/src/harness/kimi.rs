@@ -1562,6 +1562,7 @@ mod tests {
             root: None,
         };
         let s = adapter.parse(&r).unwrap();
+        crate::harness::assert_no_flat_keys(&s);
         assert_eq!(s.system_prompt.as_deref(), Some("You are Kimi."));
         let kinds: Vec<MessageKind> = s.messages.iter().map(|m| m.kind).collect();
         assert_eq!(
