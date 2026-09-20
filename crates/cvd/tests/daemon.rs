@@ -414,6 +414,29 @@ fn serve_endpoints() {
     assert_eq!(arr.len(), 2, "{v}");
     assert_eq!(arr[0]["id"], "betasess", "newest-first: {v}");
 
+    // THE session row (docs/INTERFACE-V2.md §3): the same keys `cv ls --json` and the desktop
+    // app's `local_sessions` emit, so a consumer never has to ask which door the row came
+    // through. `path` and `size_bytes` were missing here for a release.
+    let mut keys: Vec<&str> = arr[0].as_object().unwrap().keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "created_at",
+            "cwd",
+            "harness",
+            "id",
+            "message_count",
+            "path",
+            "size_bytes",
+            "title",
+            "updated_at"
+        ],
+        "session row must match §3 exactly: {v}"
+    );
+    assert!(arr[0]["path"].as_str().is_some_and(|p| p.ends_with(".jsonl")), "{v}");
+    assert!(arr[0]["size_bytes"].as_u64().is_some_and(|n| n > 0), "{v}");
+
     // limit
     let (status, v) = get_json(port, "/api/sessions?limit=1");
     assert_eq!(status, 200);
@@ -615,6 +638,15 @@ fn serve_messages_events_touched() {
     assert_eq!(rows.len(), 1, "{v}");
     assert_eq!(rows[0]["session_id"], "gammasess", "{v}");
     assert_eq!(rows[0]["edits"], 1, "{v}");
+    // Same keys as `cv touched --json`, provenance included: without `agent_id`/`parent_id`/
+    // `workflow` a caller cannot tell a top-level run from one lane of a workflow, and the trio
+    // was dropped here even though `events::Touched` has always carried it.
+    for k in ["agent_id", "parent_id", "workflow"] {
+        assert!(
+            rows[0].as_object().unwrap().contains_key(k),
+            "touched row must carry {k} like the CLI's: {v}"
+        );
+    }
     let (status, v) = get_json(port, "/api/touched?path=src%2Fpelican.rs&edits_only=true");
     assert_eq!(status, 200);
     assert_eq!(v.as_array().unwrap().len(), 1, "{v}");

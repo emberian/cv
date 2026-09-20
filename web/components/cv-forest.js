@@ -22,7 +22,7 @@
 import "./cv-harness-badge.js";
 import "./cv-transcript.js";
 import {
-  esc, fmtTime, sessionLabel, shortPath, truncate, msgCount, sumTokens,
+  esc, fmtTime, sessionLabel, shortPath, truncate, msgCount, sumTokens, harnessExtra,
 } from "./util.js";
 import {
   getSubagentTree, getSubagent, getMessages, getWorkflowScript, getCompactions,
@@ -359,7 +359,7 @@ class CvForest extends HTMLElement {
     const counts = new Map();
     for (const m of (session?.messages || [])) {
       for (const b of (m.content || [])) {
-        if (b.kind === "tool_use" && b.name) counts.set(b.name, (counts.get(b.name) || 0) + 1);
+        if (b.type === "tool_use" && b.name) counts.set(b.name, (counts.get(b.name) || 0) + 1);
       }
     }
     return [...counts.entries()].sort((a, b) => b[1] - a[1]);
@@ -383,17 +383,26 @@ class CvForest extends HTMLElement {
         _complete: true,
       }));
     }
-    // Fallback: scan the loaded window (only present if cvd sent `extra`; usually empty).
+    // Fallback: scan the loaded window. IR v2 makes this a first-class question — a boundary is
+    // `kind: "compaction_boundary"` on every harness — so the old Claude-shaped sniff
+    // (`extra.subtype === "compact_boundary"` plus a text match) is gone. The harness metadata
+    // that decorates it is nested under the harness key now (`extra.claude.compactMetadata`),
+    // never flat.
     const out = [];
     const msgs = this._root?.messages || [];
+    const hx = (m) => harnessExtra(m, this._root?.harness) || {};
     msgs.forEach((m, i) => {
-      const sub = m.extra?.subtype;
-      const cm = m.extra?.compactMetadata;
-      const isCompact = sub === "compact_boundary" ||
-        (m.role === "system" && (m.content || []).some((b) => /conversation compacted/i.test(b.text || "")));
-      if (isCompact) out.push({
-        index: i, summaryIndex: null, trigger: cm?.trigger, preTokens: cm?.preTokens,
-        durationMs: cm?.durationMs, summary: null, preSpan: null, _complete: false,
+      if (m.kind !== "compaction_boundary") return;
+      const e = hx(m);
+      const cm = e.compactMetadata || e.compact_metadata || {};
+      out.push({
+        index: i,
+        // The summary that seeds the next window is its own message right after the boundary.
+        summaryIndex: msgs[i + 1]?.kind === "compaction_summary" ? i + 1 : null,
+        trigger: cm.trigger || e.codex_event || null,
+        preTokens: cm.preTokens ?? cm.pre_tokens ?? null,
+        durationMs: cm.durationMs ?? cm.duration_ms ?? null,
+        summary: null, preSpan: null, _complete: false,
       });
     });
     return out;
@@ -555,7 +564,7 @@ class CvForest extends HTMLElement {
     msgs.forEach((m, i) => {
       const c = Math.min(COLS - 1, Math.floor((i / windowN) * COLS));
       buckets[c]++;
-      if ((m.content || []).some((b) => b.kind === "tool_use")) toolBuckets[c]++;
+      if ((m.content || []).some((b) => b.type === "tool_use")) toolBuckets[c]++;
     });
     const max = Math.max(1, ...buckets);
     const windowFrac = windowN / total; // how much of the full strip the window covers
@@ -872,7 +881,7 @@ class CvForest extends HTMLElement {
     msgs.forEach((m, i) => {
       const p = Math.min(PHASES - 1, Math.floor((i / n) * PHASES));
       for (const b of (m.content || [])) {
-        if (b.kind === "tool_use" && b.name && grid[p][b.name] != null) grid[p][b.name]++;
+        if (b.type === "tool_use" && b.name && grid[p][b.name] != null) grid[p][b.name]++;
       }
     });
     let cellMax = 1;
@@ -975,7 +984,7 @@ class CvForest extends HTMLElement {
             const idx = (dir === "pre" ? Math.max(0, around - 4) : around) + k;
             const role = (m.role || "?");
             const text = (m.content || [])
-              .map((b) => b.kind === "text" ? b.text : b.kind === "tool_use" ? `⚙ ${b.name}` : "")
+              .map((b) => b.type === "text" ? b.text : b.type === "tool_use" ? `⚙ ${b.name}` : "")
               .filter(Boolean).join(" ").replace(/\s+/g, " ");
             return `<div style="font-size:12px;padding:5px 0;border-top:1px solid var(--border)">
               <span class="muted">#${idx} ${esc(role)}</span> ${esc(truncate(text, 160))}</div>`;

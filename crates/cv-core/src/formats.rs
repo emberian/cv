@@ -391,8 +391,16 @@ pub fn check_all(src_root: &Path) -> Vec<Finding> {
         match m {
             Ok(m) => {
                 let (sources, mut missing) = read_sources(&m, src_root);
+                let readable = !sources.is_empty();
                 out.append(&mut missing);
-                out.append(&mut check(&m, &sources));
+                // With NONE of a harness's sources readable there is nothing to compare against,
+                // and running the check anyway reported every `handled` type as "missing in
+                // source" — hundreds of findings that read like real drift but only mean "I could
+                // not open the file". That is exactly what a RELEASED binary does: it has no
+                // checkout, and `src_root` defaults to the one it was built in. Say why once.
+                if readable {
+                    out.append(&mut check(&m, &sources));
+                }
             }
             Err(e) => out.push(Finding {
                 harness: h.as_str().to_string(),
@@ -403,6 +411,31 @@ pub fn check_all(src_root: &Path) -> Vec<Finding> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod check_all_tests {
+    use super::*;
+
+    /// With a source root that does not exist, every manifest reports its unreadable files and
+    /// NOTHING else. Running the vocabulary comparison against zero sources used to report every
+    /// `handled` type as missing — hundreds of findings that read like real drift but only meant
+    /// the file could not be opened, which is precisely what a released binary (built elsewhere,
+    /// shipped without a checkout) produced.
+    #[test]
+    fn an_unreadable_source_root_reports_the_files_not_every_type() {
+        let findings = check_all(Path::new("/nonexistent/cv/crates/cv-core/src"));
+        assert!(!findings.is_empty(), "the missing root is still reported");
+        assert!(
+            findings.iter().all(|f| f.kind == FindingKind::SourceFileMissing),
+            "only file-missing findings, got: {:?}",
+            findings
+                .iter()
+                .filter(|f| f.kind != FindingKind::SourceFileMissing)
+                .take(3)
+                .collect::<Vec<_>>()
+        );
+    }
 }
 
 // ───────────────────────────── census: real data vs manifest ─────────────────────────────

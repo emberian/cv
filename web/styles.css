@@ -333,13 +333,182 @@ cv-app {
 .turn-system { border-left-color: var(--fg-muted); }
 .turn-tool { border-left-color: var(--warn); }
 
+/* The rail is keyed to the message KIND, not the role — IR v2 distinguishes a typed prompt from
+   harness-injected context from a notice from an error, all of which used to arrive as one grey
+   "System" turn. Kind wins over role, so these rules follow the role ones above. */
+.turn-kind-prompt { border-left-color: var(--accent); }
+.turn-kind-reply { border-left-color: var(--h-codex); }
+.turn-kind-tool_result { border-left-color: var(--warn); }
+.turn-kind-error { border-left-color: var(--error); }
+.turn-kind-compaction_summary { border-left-color: var(--warn); border-left-style: dashed; }
+.turn-kind-injected_context,
+.turn-kind-notice,
+.turn-kind-carrier { border-left-color: color-mix(in srgb, var(--fg-muted) 40%, transparent); }
+.turn-kind-system_prompt { border-left-color: var(--h-hermes); }
+.turn-unknown-kind { border-left-color: var(--h-opencode); border-left-style: dotted; }
+
 .turn-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-bottom: 6px; }
+.turn-glyph { font-size: 11px; color: var(--fg-muted); width: 1.2em; text-align: center; flex: none; }
 .turn-role { font-weight: 650; font-size: 13px; text-transform: uppercase; letter-spacing: 0.04em; }
 .turn-user .turn-role { color: var(--accent); }
 .turn-assistant .turn-role { color: var(--h-codex); }
 .turn-tool .turn-role { color: var(--warn); }
+.turn-kind-prompt .turn-role { color: var(--accent); }
+.turn-kind-prompt .turn-glyph { color: var(--accent); }
+.turn-kind-reply .turn-role { color: var(--h-codex); }
+.turn-kind-tool_result .turn-role { color: var(--warn); }
+.turn-kind-error .turn-role, .turn-kind-error .turn-glyph { color: var(--error); }
+.turn-kind-error .turn-body { color: var(--error); }
+.turn-kind-system_prompt .turn-role { color: var(--h-hermes); }
+.turn-kind-compaction_summary .turn-role { color: var(--warn); }
+/* Machinery reads quieter than conversation, at the same size — dimmed, not shrunk. */
+.turn-kind-injected_context .turn-role,
+.turn-kind-notice .turn-role,
+.turn-kind-carrier .turn-role { color: var(--fg-muted); font-weight: 600; }
+
+.turn-unknown-tag {
+  font-size: 10px; font-family: var(--mono); text-transform: uppercase; letter-spacing: 0.05em;
+  color: var(--h-opencode); border: 1px solid color-mix(in srgb, var(--h-opencode) 45%, var(--border));
+  border-radius: 4px; padding: 0 5px;
+}
+
+/* Origin chip — only shown when the origin is NOT the obvious one for the kind. */
+.turn-origin {
+  font-size: 10.5px; font-family: var(--mono); letter-spacing: 0.03em;
+  color: var(--fg-muted); background: var(--bg-sunk);
+  border: 1px solid var(--border); border-radius: 999px; padding: 0 7px;
+}
+.turn-origin[data-origin="human"] { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 40%, var(--border)); }
+.turn-origin[data-origin="hook"],
+.turn-origin[data-origin="scheduler"] { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, var(--border)); }
+.turn-origin[data-origin="subagent"] { color: var(--h-hermes); border-color: color-mix(in srgb, var(--h-hermes) 40%, var(--border)); }
+
 .turn-model { font-size: 11.5px; color: var(--fg-muted); font-family: var(--mono); }
 .turn-when, .turn-usage { font-size: 11.5px; }
+.turn-usage { font-variant-numeric: tabular-nums; }
+.turn-cost {
+  font-size: 11px; font-family: var(--mono); font-variant-numeric: tabular-nums;
+  color: var(--ok); margin-left: -4px;
+}
+
+/* ---- Quiet turns: injected context, notices, system prompts, carriers ----
+   One line until you ask. On a Claude session these are ~40% of all turns, and painting them
+   like prompts is what made a transcript unreadable. */
+.turn-quiet { position: relative; }
+.turn-quiet > details > summary { cursor: pointer; list-style: none; margin-bottom: 0; }
+.turn-quiet > details > summary::-webkit-details-marker { display: none; }
+.turn-quiet > details > summary::before { content: "▸"; color: var(--fg-muted); font-size: 10px; }
+.turn-quiet > details[open] > summary::before { content: "▾"; }
+.turn-quiet > details[open] > summary { margin-bottom: 6px; }
+.turn-quiet .turn-peek {
+  font-size: 12px; font-family: var(--mono); color: var(--fg-muted);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  flex: 1 1 200px; min-width: 0;
+}
+.turn-quiet > details[open] .turn-peek { display: none; }
+
+/* ---- Structural markers: a rule across the column, not a turn ----
+   A compaction, a model change, a branch, a sub-agent handoff: these are punctuation between
+   turns. Giving them a turn card said they were something someone said. */
+.turn-rule {
+  display: flex; align-items: center; gap: 10px;
+  font-size: 12px; font-family: var(--mono);
+  color: var(--fg-muted);
+  margin: 4px 0 4px -17px;   /* pull left past the turns' 3px rail + 14px padding */
+  padding: 5px 0;
+  border-top: 1px dashed var(--border-strong);
+  border-bottom: 1px dashed var(--border-strong);
+}
+.turn-rule .tr-glyph { flex: none; font-size: 13px; }
+.turn-rule .tr-label { font-weight: 650; text-transform: uppercase; letter-spacing: 0.05em; font-size: 11px; }
+.turn-rule .tr-detail { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.turn-rule .tr-when { flex: none; font-size: 11px; }
+.turn-rule-compaction_boundary {
+  color: var(--warn);
+  border-color: color-mix(in srgb, var(--warn) 55%, transparent);
+  background: linear-gradient(to bottom, transparent, color-mix(in srgb, var(--warn) 7%, transparent), transparent);
+}
+.turn-rule-model_change { color: var(--h-gemini); border-color: color-mix(in srgb, var(--h-gemini) 45%, transparent); }
+.turn-rule-branch,
+.turn-rule-subagent_spawn,
+.turn-rule-subagent_return { color: var(--h-hermes); border-color: color-mix(in srgb, var(--h-hermes) 45%, transparent); }
+
+/* ---- Filter strip ---- */
+.turn-filters {
+  display: flex; align-items: center; gap: 7px; flex-wrap: wrap;
+  padding: 9px 20px; border-bottom: 1px solid var(--border);
+}
+.tf-lead { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; }
+.tf-chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  background: var(--bg-elev); border: 1px solid var(--border); border-radius: 999px;
+  color: var(--fg); font-size: 12px; padding: 2px 10px 2px 8px;
+}
+.tf-chip .tf-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); flex: none; }
+.tf-chip .tf-n { font-family: var(--mono); font-size: 11px; color: var(--fg-muted); font-variant-numeric: tabular-nums; }
+.tf-chip:hover { border-color: var(--border-strong); }
+.tf-chip.off { color: var(--fg-muted); background: transparent; text-decoration: line-through; }
+.tf-chip.off .tf-dot { background: var(--border-strong); }
+
+.turns.hide-injected .turn-kind-injected_context { display: none; }
+.turns.hide-thinking .block.thinking { display: none; }
+.turns.hide-tools .block.tool-use,
+.turns.hide-tools .block.tool-result,
+.turns.hide-tools details.tool-use,
+.turns.hide-tools details.tool-result { display: none; }
+
+/* ---- Lineage + system prompt in the transcript header ---- */
+.th-lineage { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.ln-chip {
+  display: inline-flex; align-items: baseline; gap: 6px;
+  background: var(--bg-sunk); border: 1px solid var(--border); border-radius: 999px;
+  padding: 2px 10px; font-size: 11.5px; color: var(--fg-muted);
+}
+.ln-chip code { font-size: 11px; color: var(--fg); }
+.ln-chip .ln-k { text-transform: uppercase; font-size: 9.5px; letter-spacing: 0.06em; }
+button.ln-chip.is-nav { cursor: pointer; }
+button.ln-chip.is-nav:hover { border-color: var(--accent); color: var(--accent); }
+button.ln-chip.is-nav:hover code { color: var(--accent); }
+
+.th-sysprompt { margin-top: 10px; }
+.th-sysprompt > summary {
+  cursor: pointer; list-style: none; font-size: 12px; font-family: var(--mono);
+  color: var(--fg-muted); display: flex; align-items: center; gap: 8px;
+  border: 1px solid var(--border); border-radius: 8px; padding: 5px 10px;
+  background: var(--bg-sunk);
+}
+.th-sysprompt > summary::-webkit-details-marker { display: none; }
+.th-sysprompt > summary::before { content: "▸"; font-size: 10px; }
+.th-sysprompt[open] > summary::before { content: "▾"; }
+.th-sysprompt .sp-glyph { color: var(--h-hermes); font-weight: 700; }
+.th-sysprompt .copy-btn { margin-left: auto; }
+.sp-body {
+  margin: 8px 0 0; max-height: 420px; overflow: auto;
+  background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px;
+  padding: 12px 14px; font-size: 12.5px; line-height: 1.55; white-space: pre-wrap;
+}
+
+/* ---- Structured tool-result details ---- */
+.td-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.td-chip {
+  font-size: 11px; font-family: var(--mono); color: var(--fg-muted);
+  background: var(--bg-sunk); border: 1px solid var(--border); border-radius: 6px;
+  padding: 1px 7px;
+}
+.td-chip b { color: var(--fg); font-weight: 600; font-variant-numeric: tabular-nums; }
+.td-chip.bad { color: var(--error); border-color: color-mix(in srgb, var(--error) 40%, var(--border)); }
+.td-chip.bad b { color: var(--error); }
+
+.tool-ns {
+  font-size: 10.5px; font-family: var(--mono); color: var(--h-hermes);
+  border: 1px solid color-mix(in srgb, var(--h-hermes) 40%, var(--border));
+  border-radius: 4px; padding: 0 5px;
+}
+
+.ub-tag {
+  font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em;
+  color: var(--h-opencode); font-family: var(--mono);
+}
 
 .turn-body { display: flex; flex-direction: column; gap: 10px; }
 .block { font-size: 14.5px; }

@@ -62,3 +62,64 @@ jobs:
         run: cargo check -p clustervision-core --no-default-features --target wasm32-unknown-unknown
       - name: Build cv-web to wasm
         run: wasm-pack build --target web --out-dir /tmp/pkg crates/cv-web -- --no-default-features
+
+  desktop:
+    name: desktop app (app/src-tauri)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app/src-tauri
+      - name: Tauri v2 system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev patchelf \
+            libayatana-appindicator3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev
+      # `app/src-tauri` declares its OWN [workspace], so the repo's `--workspace` build never sees
+      # it. That is why it sat un-compilable from the 0.10 crate rename until 0.11.0: it asked for
+      # a package named `cv-core` that had become `clustervision-core`, and nothing noticed for a
+      # whole release. This job is the thing that notices.
+      - name: Check
+        working-directory: app/src-tauri
+        run: cargo check --all-targets
+      - name: Test
+        working-directory: app/src-tauri
+        run: cargo test
+
+  web:
+    name: web UI (web/)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # `web/` has no build step and no framework, so nothing was ever checking that it parses —
+      # or that it still matches the IR. Syntax is the floor; `web/selftest.html` carries the
+      # rendering invariants for a human to run.
+      - name: Syntax-check every module
+        run: |
+          set -euo pipefail
+          found=0
+          for f in web/*.js web/components/*.js; do
+            [ -e "$f" ] || continue
+            found=$((found + 1))
+            node --check "$f"
+          done
+          if [ "$found" -eq 0 ]; then
+            echo "::error::no web modules found — did the layout move?"
+            exit 1
+          fi
+          echo "checked $found module(s)"
+      # A content block is tagged `type` (§4); an EVENT still has a `kind`. This catches the
+      # specific regression that broke every transcript screen in 0.11.0.
+      - name: No block is read by the pre-0.11.0 tag
+        run: |
+          set -uo pipefail
+          if grep -rnE '\.kind *=== *"(text|thinking|tool_use|tool_result|image|file)"' web/; then
+            echo "::error::a content block is tagged 'type', not 'kind' — see docs/INTERFACE-V2.md §4"
+            exit 1
+          fi
+          echo "no stale block-tag reads"

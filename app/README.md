@@ -28,7 +28,12 @@ app/
 cargo workspace**, so it is *excluded* from the main clustervision workspace at the repo
 root. Building or CI-testing the main crates never compiles the app (which pulls in the
 heavy WebKit/Tauri stack), and vice-versa. The app still depends on the real crates by
-relative path: `cv-core`, `cv-llm`, `cv-search` at `../../crates/...`.
+relative path: `cv-core`, `cv-llm`, `cv-search` at `../../crates/...`. Note that `cv-core`'s
+**package** name is `clustervision-core` (renamed for crates.io in 0.10), so the manifest says
+`cv-core = { path = "../../crates/cv-core", package = "clustervision-core" }` — the same form
+`crates/cv/Cargo.toml` uses. Asking for a bare `cv-core` fails resolution instantly, and because
+this workspace is excluded from the root one, that went unnoticed for a whole release. CI's
+`desktop` job now compiles and tests it on every push.
 
 ### Frontend
 No build step. `frontendDist` in `tauri.conf.json` points at the existing static web app
@@ -46,6 +51,44 @@ Rust means LLM API keys live in the desktop *process* env, never in JS:
 | `generate`      | `{ sessionJson: string, model?: string }`     | next assistant turn (`string`)  | `cv_llm::generate`     |
 | `ingest_zip`    | `{ path: string }`                            | `Session[]` as a JSON string    | `cv_core::ingest::ingest_files` |
 | `provider_info` | `{}`                                          | `{ provider, available }`       | `cv_llm::available_provider` |
+
+### Reading the machine's sessions — the `local_*` commands
+
+The desktop app answers session reads **natively**, out of `cv_core`, instead of fetching
+`http://localhost:7777` (the webview's cross-origin fetch to localhost is unreliable). Every
+shape below is the one `cvd serve` returns for the same thing (`crates/cvd/src/serve.rs`), so a
+session is indistinguishable between the daemon's HTTP API and this app — verified against both
+`cv <cmd> --json` and a live `cvd` across all 12 harnesses present on a real machine.
+
+| Command                 | Args                                                                   | Returns |
+|-------------------------|------------------------------------------------------------------------|---------|
+| `local_sessions`        | `{ limit?: number, harness?: string, cwd?: string }`                    | `SessionRow[]` |
+| `local_session`         | `{ harness, id }`                                                       | the IR `Session` (identical to `cv show --json`) |
+| `local_session_head`    | `{ harness, id }`                                                       | `SessionRow` + `model, git, system_prompt, lineage, extra, total` |
+| `local_messages`        | `{ harness, id, start?, end?, extra?: boolean }`                        | `{ harness, id, start, end, has_more, total_known, total, message_count, session, messages }` |
+| `local_events`          | `{ harness, id, kind?: string }`                                        | `{ msg_idx, ts, kind, tool, target, detail }[]` |
+| `local_compactions`     | `{ harness, id }`                                                       | `{ harness, id, compactions: { index, summary_index, trigger, pre_tokens, duration_ms, summary, headline, pre_span }[] }` |
+| `local_touched`         | `{ path, editsOnly?: boolean }`                                         | `{ harness, session_id, title, edits, reads, last_ts }[]` |
+| `local_subagents`       | `{ harness, id }`                                                       | `SessionRow[]` + `agent_id, agent_type, description, tool_use_id, workflow, result_status, result_summary` |
+| `local_subagent`        | `{ harness, parent, agent }`                                            | the sub-agent's IR `Session` |
+| `local_workflow_script` | `{ harness, id, workflow }`                                             | `{ workflow, name, source }` |
+
+Each returns a **JSON string** (`JSON.parse` it), or rejects with a readable message.
+
+A **`SessionRow`** is `INTERFACE-V2.md` §3's session row, exactly as `cv ls --json` prints it:
+`{ id, harness, path, cwd, title, created_at, updated_at, message_count, size_bytes }` —
+timestamps RFC 3339, `null` when unknown.
+
+Two IR-v2 notes for the UI:
+
+- **`local_messages`' `extra: true`** keeps each message's harness `extra` bag *and* the
+  structured `Block::ToolResult.details` sidecar (both gated on `ParseOptions::extra`, because the
+  sidecar routinely dwarfs the transcript). Bulk paging leaves it off; a structure/detail view
+  turns it on.
+- **`local_session_head`** is the cheap way to get the session-level fields 0.11 added —
+  `system_prompt` and `lineage` (`forked_from`, `parent`, `spawned_by_tool_use`, `continued_in`,
+  `continues`, `agent_path`) — plus `git`, `model` and the exact message `total`, in one pass that
+  keeps no messages. It is the only way to get them for Claude, whose stream emits no `meta()`.
 
 `distill`/`generate` need a provider in the environment — see [LLM providers](#llm-providers).
 `redact` and `ingest_zip` are pure and offline (no key needed). All take/return the **same

@@ -45,8 +45,8 @@ export function setModel(m) {
 // ---- IR → OpenRouter chat conversion --------------------------------------
 
 /** Flatten one IR content block to plain text for the chat API. */
-function blockToText(b) {
-  switch (b?.kind) {
+export function blockToText(b) {
+  switch (b?.type) {
     case "text":
       return b.text || "";
     case "thinking":
@@ -58,7 +58,7 @@ function blockToText(b) {
     case "tool_use": {
       let input = "";
       try { input = b.input == null ? "" : JSON.stringify(b.input); } catch { input = String(b.input); }
-      return `[tool_use ${b.name || "?"}${input ? " " + input : ""}]`;
+      return `[tool_use ${b.namespace ? b.namespace + ":" : ""}${b.name || "?"}${input ? " " + input : ""}]`;
     }
     case "tool_result": {
       const body = String(b.content ?? "");

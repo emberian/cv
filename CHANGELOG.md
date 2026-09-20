@@ -98,6 +98,37 @@ resume; a Gemini tool call that completed with empty output lost its whole turn;
 crossed into Claude from another harness at all. The OpenCode emitter writes OpenCode's SQLite
 store, which is what OpenCode 1.18 actually reads; it had been writing the superseded JSON tree.
 
+### The release pipeline, the desktop app and the web UI
+
+Three things had been quietly broken for a release or more, all of them invisible because nothing
+in CI looked at them. They are fixed, and CI looks at them now.
+
+- **Tagging produced nothing.** `dist-workspace.toml` said `publish-jobs = ["cargo"]`, which
+  cargo-dist rejects while parsing the file — it has no built-in crates.io job, only `homebrew`,
+  `npm` and custom `./name` jobs. The `plan` step therefore died before a single artifact was
+  built, so every tag since just after v0.9.22 shipped neither binaries nor a crates.io upload, and
+  the failure read like a TOML error rather than a missing feature. There is now a real
+  `./publish-crates` job that publishes the six library crates in dependency order and tolerates a
+  re-run. Verified by running `dist plan` and a full local `dist build` for the host target, which
+  produce the seven-target manifest and a working packaged binary.
+- **The desktop app had not compiled since the 0.10 crate rename.** It declares its own
+  `[workspace]`, so `cargo check --workspace` never saw it, and it asked for a package named
+  `cv-core` after that package became `clustervision-core`. Behind that one-line break sat five
+  semantic bugs: its session rows were not the §3 shape, `local_messages` ignored the `extra`
+  argument the UI had always passed (so tool-result `details` could never reach the desktop), the
+  sub-agent listing missed the entire workflow tier, and two commands the UI has invoked since
+  0.9.12 did not exist and silently returned null. A new `local_session_head` exposes a session's
+  `system_prompt` and `lineage`, which is otherwise unreachable for Claude.
+- **The web UI read the pre-0.11.0 block tag,** so every transcript, diff and forest screen was
+  broken. It reads `type` now, and uses the new vocabulary rather than painting every
+  non-assistant turn the same: a prompt, harness-injected context, a notice, an error and a
+  compaction boundary are visually distinct, an unknown kind renders honestly instead of
+  vanishing, and lineage is navigable. `web/selftest.html` carries 37 rendering invariants, run in
+  a real browser, so the next IR change fails loudly.
+- **The daemon's rows now match everyone else's.** `/api/sessions` was missing `path` and
+  `size_bytes`, and `/api/touched` dropped the `agent_id`/`parent_id`/`workflow` trio it had always
+  carried, so a consumer could tell which door a row came through. Both are pinned by tests.
+
 ### Also in this release
 
 - **`cv workflow <session> <run> --revive` salvages a dead run.** A `Workflow` run that dies

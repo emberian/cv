@@ -45,7 +45,7 @@ export function searchableText(session) {
   if (session.model) parts.push(session.model);
   for (const m of session.messages || []) {
     for (const b of m.content || []) {
-      switch (b.kind) {
+      switch (b.type) {
         case "text":
         case "thinking":
           if (b.text) parts.push(b.text);
@@ -69,12 +69,22 @@ export function searchableText(session) {
   return parts.join("\n").toLowerCase();
 }
 
-/** First non-empty user text — used as a preview/fallback title. */
+/** First non-empty *human prompt* text — used as a preview/fallback title.
+ *  IR v2 distinguishes a typed prompt from the other things that ride a `user` turn (a
+ *  compaction summary is `role: user` too, and using one as a title produced 4 kB "titles"),
+ *  so prefer `kind === "prompt"` and only fall back to the role when a source predates kinds. */
 export function firstUserText(session) {
-  for (const m of session.messages || []) {
+  const msgs = session.messages || [];
+  for (const m of msgs) {
+    if (m.kind !== "prompt") continue;
+    for (const b of m.content || []) {
+      if (b.type === "text" && b.text && b.text.trim()) return b.text.trim();
+    }
+  }
+  for (const m of msgs) {
     if (m.role !== "user") continue;
     for (const b of m.content || []) {
-      if (b.kind === "text" && b.text && b.text.trim()) return b.text.trim();
+      if (b.type === "text" && b.text && b.text.trim()) return b.text.trim();
     }
   }
   return null;
@@ -82,7 +92,7 @@ export function firstUserText(session) {
 
 /** Human label for a session listing. */
 export function sessionLabel(session) {
-  const raw = session.title || firstUserText(session) || "(untitled)";
+  const raw = session.display_title || session.title || firstUserText(session) || "(untitled)";
   return truncate(raw.replace(/\s+/g, " ").trim(), 80);
 }
 
@@ -120,6 +130,56 @@ export const ROLE_LABELS = {
   tool: "Tool",
 };
 
+/** IR v2 `Message::kind` — WHAT a message is. The label is what the transcript prints on the turn;
+ *  the glyph is the one-character tell that lets you skim a 1,000-turn session. */
+export const MESSAGE_KINDS = {
+  prompt:              { label: "Prompt",            glyph: "▸" },
+  reply:               { label: "Reply",             glyph: "✦" },
+  tool_result:         { label: "Tool result",       glyph: "↳" },
+  injected_context:    { label: "Injected context",  glyph: "⟨⟩" },
+  system_prompt:       { label: "System prompt",     glyph: "§" },
+  notice:              { label: "Notice",            glyph: "ⓘ" },
+  compaction_boundary: { label: "Compaction",        glyph: "✂" },
+  compaction_summary:  { label: "Compaction summary", glyph: "≡" },
+  model_change:        { label: "Model change",      glyph: "⇄" },
+  error:               { label: "Error",             glyph: "✖" },
+  subagent_spawn:      { label: "Sub-agent spawned", glyph: "⑂" },
+  subagent_return:     { label: "Sub-agent returned", glyph: "⑃" },
+  branch:              { label: "Branch",            glyph: "⑂" },
+  carrier:             { label: "Carrier record",    glyph: "▪" },
+};
+
+/** IR v2 `Message::origin` — WHERE a message came from. */
+export const ORIGIN_LABELS = {
+  human: "you", model: "model", harness: "harness", hook: "hook",
+  scheduler: "scheduler", subagent: "sub-agent", import: "imported", unknown: "unknown",
+};
+
+/** The kinds that are structural punctuation rather than conversation: they get a rule across the
+ *  transcript instead of a turn card. */
+export const STRUCTURAL_KINDS = new Set([
+  "compaction_boundary", "model_change", "branch", "subagent_spawn", "subagent_return",
+]);
+
+/** Label for a message kind, honest about kinds this build has never heard of. */
+export function messageKindLabel(kind) {
+  if (!kind) return "";
+  return MESSAGE_KINDS[kind]?.label || String(kind).replace(/_/g, " ");
+}
+export function messageKindGlyph(kind) {
+  return MESSAGE_KINDS[kind]?.glyph || "•";
+}
+
+/** IR v2 `Session::lineage` — the pointers that make a session navigable. */
+export const LINEAGE_LABELS = {
+  forked_from: "forked from",
+  parent: "parent session",
+  continued_in: "continued in",
+  continues: "continues",
+  spawned_by_tool_use: "spawned by tool call",
+  agent_path: "agent",
+};
+
 export const HARNESS_LABELS = {
   claude: "Claude",
   codex: "Codex",
@@ -132,11 +192,22 @@ export const HARNESS_LABELS = {
 };
 
 // ---------------------------------------------------------------------------
-// Normalization — accept both the internal IR (snake_case: tool_use,
-// tool_result, created_at, data_ref, …) AND the OpenSession interchange shape
-// (camelCase: toolUse, toolResult, createdAt, dataRef, parentId, …). The wasm
-// ingest emits the former; a dropped OpenSession .json emits the latter. We
-// converge everything onto the internal IR shape the components already speak.
+// Normalization — one chokepoint. Every session in the pool passes through here,
+// whichever door it came in by: cvd's HTTP API, the desktop's native commands,
+// the wasm ingest, or a dropped .json. It converges three vocabularies onto one:
+//
+//   • **IR v2** (cv 0.11+, snake_case): a BLOCK is tagged `type`; a MESSAGE has its
+//     own `kind` (prompt · reply · tool_result · injected_context · system_prompt ·
+//     notice · compaction_boundary · compaction_summary · model_change · error ·
+//     subagent_spawn · subagent_return · branch · carrier) and an `origin`
+//     (human · model · harness · hook · scheduler · subagent · import); a session
+//     carries `system_prompt` and `lineage`. This is what the components speak.
+//   • **pre-0.11 cv IR**, where a block was tagged `kind` and messages had none.
+//   • **OpenSession** interchange (camelCase: `toolUse`, `toolResult`, `createdAt`,
+//     `dataRef`, `parentId`, …), which still tags blocks with `kind` by spec.
+//
+// So: read `type` first and `kind` second for a BLOCK, and never read a block's
+// `kind` outside this file — `m.kind` and `b.type` mean different things now.
 // ---------------------------------------------------------------------------
 
 function pick(obj, ...keys) {
@@ -144,7 +215,16 @@ function pick(obj, ...keys) {
   return undefined;
 }
 
-/** Normalize one usage object (camel or snake) to snake_case-ish keys. */
+/** `toolUse` / `InjectedContext` / `TOOL_RESULT` → `tool_use` / `injected_context` / `tool_result`. */
+function snakeTag(v) {
+  if (v == null) return undefined;
+  return String(v)
+    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+    .replace(/[\s-]+/g, "_")
+    .toLowerCase();
+}
+
+/** Normalize one usage object (camel or snake) to the IR v2 snake_case keys. */
 function normUsage(u) {
   if (!u || typeof u !== "object") return undefined;
   const out = {};
@@ -153,6 +233,8 @@ function normUsage(u) {
     output_tokens: ["output_tokens", "outputTokens"],
     cache_read_tokens: ["cache_read_tokens", "cacheReadTokens"],
     cache_creation_tokens: ["cache_creation_tokens", "cacheCreationTokens"],
+    reasoning_tokens: ["reasoning_tokens", "reasoningTokens"],
+    cost_usd: ["cost_usd", "costUsd"],
   };
   const consumed = new Set();
   for (const [dest, srcs] of Object.entries(map)) {
@@ -168,20 +250,18 @@ function normUsage(u) {
   return Object.keys(out).length ? out : undefined;
 }
 
-/** Normalize one content block. Maps OpenSession kinds to internal kinds. */
+/** Normalize one content block onto IR v2's `type` tag. */
 function normBlock(b) {
-  if (!b || typeof b !== "object") return { kind: "text", text: String(b ?? "") };
-  let kind = b.kind;
-  // OpenSession camelCase kinds -> internal snake_case kinds.
-  if (kind === "toolUse") kind = "tool_use";
-  else if (kind === "toolResult") kind = "tool_result";
+  if (!b || typeof b !== "object") return { type: "text", text: String(b ?? "") };
+  // IR v2 tags a block with `type`; OpenSession and pre-0.11 cv tagged it `kind`.
+  const type = snakeTag(b.type ?? b.kind);
 
-  switch (kind) {
+  switch (type) {
     case "text":
-      return { kind: "text", text: b.text ?? "" };
+      return { type: "text", text: b.text ?? "" };
     case "thinking":
       return {
-        kind: "thinking",
+        type: "thinking",
         text: b.text ?? "",
         signature: b.signature,
         encrypted: b.encrypted,
@@ -189,14 +269,15 @@ function normBlock(b) {
       };
     case "tool_use":
       return {
-        kind: "tool_use",
+        type: "tool_use",
         id: pick(b, "id", "toolUseId", "tool_use_id"),
         name: b.name,
         input: b.input,
+        namespace: b.namespace,
       };
     case "tool_result":
       return {
-        kind: "tool_result",
+        type: "tool_result",
         tool_use_id: pick(b, "tool_use_id", "toolUseId"),
         content: b.content,
         is_error: pick(b, "is_error", "isError") ?? false,
@@ -206,42 +287,89 @@ function normBlock(b) {
       };
     case "file":
       return {
-        kind: "file",
+        type: "file",
         mime: pick(b, "mime", "mediaType", "media_type"),
         path: b.path,
         source: b.source,
       };
     case "image":
       return {
-        kind: "image",
+        type: "image",
         media_type: pick(b, "media_type", "mediaType"),
         data_ref: pick(b, "data_ref", "dataRef"),
       };
     default:
-      return { ...b, kind: kind ?? "unknown" };
+      // A block type this build has never heard of. Keep every field so the renderer can show
+      // the raw record instead of dropping the turn on the floor.
+      return { ...b, type: type ?? "unknown" };
   }
 }
 
-/** Normalize one message. */
+/** Only for a source that predates `Message::kind` (pre-0.11 cv, OpenSession). The contract
+ *  spells these defaults out: User→Prompt, Assistant→Reply, Tool→ToolResult, System→Notice. */
+const KIND_BY_ROLE = { user: "prompt", assistant: "reply", tool: "tool_result", system: "notice" };
+const ORIGIN_BY_KIND = { prompt: "human", reply: "model", tool_result: "harness" };
+
+/** Normalize one message: role, IR v2 `kind` + `origin`, usage, blocks. */
 function normMessage(m) {
-  if (!m || typeof m !== "object") return { role: "user", content: [] };
+  if (!m || typeof m !== "object") return { role: "user", kind: "prompt", origin: "human", content: [] };
   const content = Array.isArray(m.content) ? m.content.map(normBlock)
-    : m.content != null ? [normBlock({ kind: "text", text: String(m.content) })]
+    : m.content != null ? [normBlock({ type: "text", text: String(m.content) })]
     : [];
+  const role = (m.role || "user").toLowerCase();
+  // `messageKind` is what `toOpenSession` writes, so an exported doc round-trips.
+  const kind = snakeTag(pick(m, "kind", "messageKind", "message_kind")) || KIND_BY_ROLE[role] || "notice";
+  const origin = snakeTag(m.origin) || ORIGIN_BY_KIND[kind] || "harness";
   return {
     id: m.id,
     parent_id: pick(m, "parent_id", "parentId"),
-    role: (m.role || "user").toLowerCase(),
+    role,
+    kind,
+    origin,
     timestamp: m.timestamp,
     model: m.model,
     usage: normUsage(m.usage),
     content,
+    // `extra` is nested by harness in IR v2 (`extra.claude.attachment_type`); pass it through
+    // verbatim and let readers reach in via `harnessExtra(m, harness)`.
     extra: m.extra,
   };
 }
 
+/** Normalize `Session::lineage`. Returns undefined when the session has no pointers at all, so
+ *  `if (s.lineage)` stays a useful question. */
+function normLineage(l) {
+  if (!l || typeof l !== "object") return undefined;
+  const out = {};
+  const map = {
+    forked_from: ["forked_from", "forkedFrom"],
+    parent: ["parent", "parent_id", "parentId"],
+    spawned_by_tool_use: ["spawned_by_tool_use", "spawnedByToolUse"],
+    continued_in: ["continued_in", "continuedIn"],
+    continues: ["continues"],
+    agent_path: ["agent_path", "agentPath"],
+  };
+  for (const [dest, srcs] of Object.entries(map)) {
+    const v = pick(l, ...srcs);
+    if (v != null && v !== "") out[dest] = v;
+  }
+  return Object.keys(out).length ? out : undefined;
+}
+
+/** A message's harness-specific bag. IR v2 nests `extra` under the harness name — never flat —
+ *  with exactly two flat exceptions (`_record`, `cv_byte_offset`) that are cv's own bookkeeping. */
+export function harnessExtra(m, harness) {
+  const e = m?.extra;
+  if (!e || typeof e !== "object") return null;
+  const h = (harness || "").toLowerCase();
+  const own = h && e[h];
+  if (own && typeof own === "object") return own;
+  // `cv` is the one non-harness namespace the contract allows.
+  return null;
+}
+
 /**
- * Normalize a single session object from either shape into the internal IR.
+ * Normalize a single session object from any shape into IR v2 as the components read it.
  * Idempotent: re-normalizing an already-normalized session is a no-op-ish.
  */
 export function normalizeSession(s) {
@@ -251,13 +379,20 @@ export function normalizeSession(s) {
     id: s.id ?? randomId(),
     harness,
     cwd: s.cwd,
+    path: s.path,
     title: s.title,
+    display_title: pick(s, "display_title", "displayTitle"),
     created_at: pick(s, "created_at", "createdAt"),
     updated_at: pick(s, "updated_at", "updatedAt"),
     model: s.model,
     git: s.git,
+    // IR v2: the system prompt the harness sent, when the store keeps it. NOT a message.
+    system_prompt: pick(s, "system_prompt", "systemPrompt"),
+    // IR v2: where this session came from and where it went.
+    lineage: normLineage(s.lineage),
     extra: s.extra,
     source_path: pick(s, "source_path", "sourcePath"),
+    size_bytes: pick(s, "size_bytes", "sizeBytes"),
     // Metadata-only "stub" sessions (e.g. from cvd's /api/sessions) carry a count but no messages
     // yet; keep it so the list can show the real length before the transcript is hydrated.
     message_count: pick(s, "message_count", "messageCount"),
@@ -295,33 +430,43 @@ export function randomId() {
 
 /** Convert an internal session (or composed list of messages) to an OpenSession doc. */
 export function toOpenSession(session) {
+  // NOTE the tag flip: internally a block is tagged `type` (IR v2); OpenSession tags it `kind`
+  // and camelCases the field names. This function is the only place that translation happens.
   const blockOut = (b) => {
-    switch (b.kind) {
+    switch (b.type) {
       case "text": return { kind: "text", text: b.text ?? "" };
       case "thinking": return clean({ kind: "thinking", text: b.text ?? "", signature: b.signature, encrypted: b.encrypted, redacted: b.redacted });
-      case "tool_use": return clean({ kind: "toolUse", id: b.id, name: b.name, input: b.input });
+      case "tool_use": return clean({ kind: "toolUse", id: b.id, name: b.name, input: b.input, namespace: b.namespace });
       case "tool_result": return clean({ kind: "toolResult", toolUseId: b.tool_use_id, content: b.content, isError: !!b.is_error, toolName: b.tool_name, status: b.status, details: b.details });
       case "file": return clean({ kind: "file", mime: b.mime, path: b.path, source: b.source });
       case "image": return clean({ kind: "image", mediaType: b.media_type, dataRef: b.data_ref });
-      default: return { ...b };
+      default: { const { type, ...rest } = b; return { kind: type, ...rest }; }
     }
   };
   const usageOut = (u) => u && clean({
     inputTokens: u.input_tokens, outputTokens: u.output_tokens,
     cacheReadTokens: u.cache_read_tokens, cacheCreationTokens: u.cache_creation_tokens,
+    reasoningTokens: u.reasoning_tokens, costUsd: u.cost_usd,
   });
+  // `messageKind`/`origin` are additive optional fields: OpenSession consumers ignore what they
+  // don't know, and dropping them would export a compaction boundary as an anonymous system turn.
+  // They ride under those names so they can never be read as a block `kind`.
   const msgOut = (m) => clean({
-    id: m.id, parentId: m.parent_id, role: m.role, timestamp: m.timestamp,
+    id: m.id, parentId: m.parent_id, role: m.role,
+    messageKind: m.kind, origin: m.origin,
+    timestamp: m.timestamp,
     model: m.model, usage: usageOut(m.usage),
     content: (m.content || []).map(blockOut), extra: m.extra,
   });
   return clean({
-    openSession: "0.1",
+    openSession: "0.2",
     harness: session.harness || "openSession",
     id: session.id || randomId(),
     cwd: session.cwd, title: session.title, model: session.model,
     createdAt: session.created_at, updatedAt: session.updated_at,
     git: session.git,
+    systemPrompt: session.system_prompt,
+    lineage: session.lineage,
     messages: (session.messages || []).map(msgOut),
     extra: session.extra,
   });
@@ -351,15 +496,32 @@ export function toMarkdown(session) {
   if (session.created_at) meta.push(`**created:** ${session.created_at}`);
   if (session.updated_at) meta.push(`**updated:** ${session.updated_at}`);
   if (session.id) meta.push(`**id:** \`${session.id}\``);
+  for (const [k, label] of Object.entries(LINEAGE_LABELS)) {
+    const v = session.lineage?.[k];
+    if (v) meta.push(`**${label}:** \`${v}\``);
+  }
   if (meta.length) { lines.push(meta.join("  \n")); lines.push(""); }
+
+  if (session.system_prompt) {
+    lines.push("<details><summary>system prompt</summary>");
+    lines.push("");
+    lines.push("```");
+    lines.push(session.system_prompt);
+    lines.push("```");
+    lines.push("");
+    lines.push("</details>");
+    lines.push("");
+  }
 
   for (const m of session.messages || []) {
     const role = (m.role || "?").toUpperCase();
+    const kind = m.kind && m.kind !== KIND_BY_ROLE[m.role] ? ` · ${messageKindLabel(m.kind)}` : "";
+    const origin = m.origin && m.origin !== "model" && m.origin !== "human" ? ` · via ${m.origin}` : "";
     const when = m.timestamp ? ` · ${fmtTime(m.timestamp)}` : "";
-    lines.push(`## ${role}${when}`);
+    lines.push(`## ${role}${kind}${origin}${when}`);
     lines.push("");
     for (const b of m.content || []) {
-      switch (b.kind) {
+      switch (b.type) {
         case "text":
           lines.push(b.text || ""); lines.push(""); break;
         case "thinking":
@@ -367,7 +529,7 @@ export function toMarkdown(session) {
           lines.push((b.text || (b.encrypted ? "[encrypted reasoning]" : b.redacted ? "[redacted]" : "")).split("\n").map((l) => "> " + l).join("\n"));
           lines.push(""); break;
         case "tool_use":
-          lines.push(`**🔧 tool_use → \`${b.name || "?"}\`**`);
+          lines.push(`**🔧 tool_use → \`${b.namespace ? b.namespace + ":" : ""}${b.name || "?"}\`**`);
           lines.push("```json"); lines.push(pretty(b.input)); lines.push("```"); lines.push(""); break;
         case "tool_result":
           lines.push(`**↳ tool_result${b.is_error ? " (error)" : ""}${b.status ? " · " + b.status : ""}**`);
@@ -377,7 +539,7 @@ export function toMarkdown(session) {
         case "image":
           lines.push(`**🖼 image:** ${b.media_type || ""} ${b.data_ref || ""}`.trim()); lines.push(""); break;
         default:
-          lines.push(`*[${b.kind} block]*`); lines.push(""); break;
+          lines.push(`*[${b.type || "unknown"} block]*`); lines.push(""); break;
       }
     }
   }
@@ -408,13 +570,32 @@ export function slug(s, max = 48) {
 
 /** Total token usage across a session's messages. */
 export function sumTokens(session) {
-  let input = 0, output = 0, cacheRead = 0;
+  let input = 0, output = 0, cacheRead = 0, reasoning = 0, cost = 0, costSeen = false;
   for (const m of session.messages || []) {
     const u = m.usage;
     if (!u) continue;
     input += u.input_tokens || 0;
     output += u.output_tokens || 0;
     cacheRead += u.cache_read_tokens || 0;
+    reasoning += u.reasoning_tokens || 0;
+    if (u.cost_usd != null) { cost += u.cost_usd; costSeen = true; }
   }
-  return { input, output, cacheRead, total: input + output };
+  return { input, output, cacheRead, reasoning, cost: costSeen ? cost : null, total: input + output };
+}
+
+/** Format a USD cost the way a transcript wants it: never round a fraction of a cent to "$0.00". */
+export function fmtCost(usd) {
+  if (usd == null || !Number.isFinite(usd)) return "";
+  if (usd === 0) return "$0";
+  if (usd < 0.01) return `$${usd.toFixed(4)}`;
+  if (usd < 1) return `$${usd.toFixed(3)}`;
+  return `$${usd.toFixed(2)}`;
+}
+
+/** Compact token count: 1234 → 1.2k. */
+export function fmtTokens(n) {
+  if (n == null) return "";
+  if (n >= 1e6) return (n / 1e6).toFixed(n >= 1e7 ? 0 : 1) + "M";
+  if (n >= 1e3) return (n / 1e3).toFixed(n >= 1e4 ? 0 : 1) + "k";
+  return String(n);
 }

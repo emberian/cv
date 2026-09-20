@@ -145,12 +145,14 @@ class CvApp extends HTMLElement {
     const win = await getMessages(stub, 0, PAGE);
     if (win) {
       const meta = win.session || {};
+      // The stream's parsed metadata (when delivered) beats the discovery-time stub's. Spread the
+      // whole meta rather than three named fields: cvd decides what a session-level fact is, and a
+      // fact it starts sending (`system_prompt`, `lineage`) should reach the UI without a change
+      // here. Nulls in the meta must not clobber the stub, so drop them first.
+      const live = Object.fromEntries(Object.entries(meta).filter(([, v]) => v != null));
       const full = normalizeSession({
         ...stub,
-        // The stream's parsed metadata (when delivered) beats the discovery-time stub's.
-        title: meta.title ?? stub.title,
-        model: meta.model ?? stub.model,
-        cwd: meta.cwd ?? stub.cwd,
+        ...live,
         messages: win.messages,
       });
       full._stub = false;
@@ -377,6 +379,7 @@ class CvApp extends HTMLElement {
         layout.querySelector(".pane-transcript")?.scrollTo?.(0, 0);
       });
       this._transcript.addEventListener("load-more", () => this._loadMoreMessages());
+      this._transcript.addEventListener("open-session-id", (e) => this._openById(e.detail));
       layout.querySelector(".back-btn").addEventListener("click", () => layout.classList.remove("show-transcript"));
     }
     return this._sessionsLayout;
@@ -411,6 +414,29 @@ class CvApp extends HTMLElement {
         el._wired = true;
         el.addEventListener("open", (e) => this._openInSessions(e.detail.session));
       }
+    }
+  }
+
+  /** A lineage chip was clicked: open the session it points at. The pool holds stubs for every
+   *  local session, so an id usually resolves there (ids are full, but a harness may record a
+   *  prefix, so accept one). Failing that, ask cvd for it directly — a forked-from or
+   *  continued-in id can name a session the current filter never listed. */
+  async _openById({ id, harness }) {
+    if (!id) return;
+    const hit = this._sessions.find((s) => s.id === id)
+      || this._sessions.find((s) => s.id?.startsWith(id) || id.startsWith(s.id));
+    if (hit) { this._openInSessions(hit); return; }
+    this._setStatus(`Looking up ${id}…`);
+    try {
+      const stub = normalizeSession({ id, harness, _stub: true });
+      stub._stub = true;
+      const full = await this._hydrate(stub);
+      this._sessions = this._mergePool(this._sessions, [full]);
+      this._refreshViews();
+      this._openInSessions(full);
+      this._setStatus("", "ok");
+    } catch {
+      this._setStatus(`No session ${id} in this archive — it may live on another machine.`, "warn");
     }
   }
 

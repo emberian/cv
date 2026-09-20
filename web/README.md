@@ -40,9 +40,10 @@ Shortcuts never fire while you're typing in an input, and respect focus.
   disabled in that mode, but OpenSession `.json` drops still work.
 
 Everything dropped is **normalized** to one internal shape (`components/util.js`),
-so the internal IR (snake_case: `tool_use`, `created_at`, `data_ref`, …) and the
-OpenSession interchange shape (camelCase: `toolUse`, `createdAt`, `dataRef`,
-`parentId`, …) both load and render identically.
+so the internal IR (snake_case, blocks tagged `type`: `tool_use`, `created_at`,
+`data_ref`, …) and the OpenSession interchange shape (camelCase, blocks tagged
+`kind`: `toolUse`, `createdAt`, `dataRef`, `parentId`, …) both load and render
+identically. See [Session schema](#session-schema).
 
 ## Views
 
@@ -54,9 +55,11 @@ A tab bar (`<cv-app>`) switches between views, all reading from the merged pool:
 - **🔍 Compare** (`<cv-compare>`) — pick two sessions side-by-side; messages are
   aligned and divergence is highlighted (shared prefix dims, the split is marked).
   Great for inspecting loom branches.
-- **📊 Stats** (`<cv-stats>`) — totals, per-harness / per-role / per-block-kind
-  bars, top working directories, token sums, date range, and an activity
-  histogram. Hand-rolled CSS bars + inline SVG — no chart library.
+- **📊 Stats** (`<cv-stats>`) — totals, per-harness / per-message-kind /
+  per-origin / per-block-type / per-role bars, top working directories, token
+  sums (including reasoning tokens and provider-reported cost where a harness
+  records them), date range, and an activity histogram. Hand-rolled CSS bars +
+  inline SVG — no chart library.
 - **🌳 Structure** (`<cv-forest>`) — the session-structure explorer for one root
   session: the sub-agent **forest** (direct + workflow agents), **workflow phase
   lanes**, **tool** histograms + a phase×tool **heatmap**, and the **compaction**
@@ -186,14 +189,27 @@ All are plain native custom elements (no framework, no build step), in `componen
 - **`<cv-session-list>`** — sortable, filterable list. Free-text search across
   titles, cwd, model, and **all message content**; harness filter chips; sort by
   recency / oldest / title / message count.
-- **`<cv-transcript>`** — renders one `Session`: role-labeled turns; **Markdown
-  prose** (headings, lists, blockquotes, emphasis, links, inline + fenced code
-  with a light highlighter — see `markdown.js`, XSS-safe by escaping before
-  injecting); **collapsible thinking** (with encrypted/redacted/signature
-  handling); `tool_use` (highlighted JSON, auto-collapsed when large);
-  `tool_result` (error styling, `status`, `tool_name`, collapsible `details`);
-  **`file`** blocks; images; and a graceful fallback for unknown block kinds.
-  Shows per-message **token usage** and a session-total. **Very long transcripts
+- **`<cv-transcript>`** — renders one `Session`, keyed on the message **kind**
+  rather than the role, so a typed prompt, harness-injected context, a slash-command
+  notice and an API error no longer all read as one grey "System" turn:
+  - a **structural** kind (compaction boundary, model change, branch, sub-agent
+    spawn/return) draws a **rule across the column** carrying what happened —
+    trigger, token counts, the new model — read from the harness bag;
+  - a **quiet** kind (injected context, system prompt, notice, carrier) folds to
+    one line with a peek that names it (Claude's `attachment_type` when present);
+  - everything else is a full turn, with an **origin chip** when the origin is not
+    the obvious one (a prompt from the *scheduler*, a result from a *sub-agent*).
+  Plus: a **filter strip** that hides injected context / thinking / tool calls with
+  CSS alone (no re-render); the session's **`system_prompt`** in a fold and its
+  **`lineage`** as navigable chips; **Markdown prose** (headings, lists,
+  blockquotes, emphasis, links, inline + fenced code with a light highlighter —
+  see `markdown.js`, XSS-safe by escaping before injecting); **collapsible
+  thinking** (with encrypted/redacted/signature handling); `tool_use` (highlighted
+  JSON, auto-collapsed when large, with its `namespace`); `tool_result` (error
+  styling, `status`, `tool_name`, and structured `details` as fact chips);
+  **`file`** blocks; images; and a loud fallback for unknown block types and
+  unknown message kinds. Shows per-message **token usage** — including reasoning
+  tokens and provider cost where recorded — and a session-total. **Very long transcripts
   are virtualized** — only a sliding window of messages is in the DOM, so a
   12k-message session renders in ~30 ms instead of freezing the tab. Has
   per-session **Markdown / OpenSession-JSON export** buttons, and an optional
@@ -239,35 +255,67 @@ In a browser none of this exists: `isTauri()` is `false`, `canInvokeNative()` is
 
 ## Session schema
 
-The internal IR (serde of `cv-core`). Each `Session`:
+The internal IR (serde of `cv-core`, **IR v2** as of cv 0.11). Each `Session`:
 
 ```
-{ id, harness, cwd?, title?, created_at?, updated_at?, model?,
-  git?{branch?,commit?,remote?}, extra?,
-  messages: [ { id?, parent_id?, role, timestamp?, model?, usage?, content: [Block], extra? } ],
-  source_path? }
+{ id, harness, cwd?, path?, title?, display_title?, created_at?, updated_at?, model?,
+  git?{branch?,commit?,remote?}, system_prompt?, lineage?, extra?, size_bytes?,
+  messages: [ Message ], source_path? }
+
+Message = { id?, parent_id?, role, kind, origin, timestamp?, model?, usage?,
+            content: [Block], extra? }
+
+lineage = { forked_from?, parent?, spawned_by_tool_use?, continued_in?, continues?, agent_path? }
+usage   = { input_tokens?, output_tokens?, cache_read_tokens?, cache_creation_tokens?,
+            reasoning_tokens?, cost_usd? }
 ```
 
-`harness` is one of `claude | codex | grok | opencode | gemini | hermes | openclaw |
-opensession`. `role` is `system | user | assistant | tool`. Each `Block` is tagged
-by `kind`:
+`role` (WHO speaks) is `system | user | assistant | tool`.
 
-- `{ kind: "text", text }`
-- `{ kind: "thinking", text, signature?, encrypted?, redacted? }`
-- `{ kind: "tool_use", id, name, input }`
-- `{ kind: "tool_result", tool_use_id, content, is_error, tool_name?, status?, details? }`
-- `{ kind: "file", mime?, path?, source? }`
-- `{ kind: "image", media_type?, data_ref? }`
+`kind` (WHAT the message is) is `prompt | reply | tool_result | injected_context |
+system_prompt | notice | compaction_boundary | compaction_summary | model_change |
+error | subagent_spawn | subagent_return | branch | carrier`.
 
-Dropped OpenSession `.json` uses the camelCase equivalents (`toolUse`,
-`toolResult`, `createdAt`, `parentId`, `dataRef`, `inputTokens`, …); the loader
-normalizes them automatically. Unknown block kinds are rendered gracefully.
+`origin` (WHERE it came from) is `human | model | harness | hook | scheduler |
+subagent | import | unknown`.
+
+**A block is tagged `type`; a message is tagged `kind`.** They are different
+questions and the UI must never confuse them — `m.kind` is the message kind,
+`b.type` is the block type, and an *event* (from `/api/…/events`) has its own
+`kind` (`file_edit | file_read | command | tool | error`) that is neither.
+
+- `{ type: "text", text }`
+- `{ type: "thinking", text, signature?, encrypted?, redacted? }`
+- `{ type: "tool_use", id, name, input, namespace? }`
+- `{ type: "tool_result", tool_use_id, content, is_error, tool_name?, status?, details? }`
+- `{ type: "file", mime?, path?, source? }`
+- `{ type: "image", media_type?, data_ref? }`
+
+`extra` is **nested by harness** — `m.extra.claude.attachment_type`, never a flat
+`m.extra.attachment_type`. Reach it with `harnessExtra(m, harness)` from
+`components/util.js`.
+
+Dropped OpenSession `.json` still uses the interchange spelling — blocks tagged
+`kind`, camelCase fields (`toolUse`, `toolResult`, `createdAt`, `parentId`,
+`dataRef`, `inputTokens`, …) — and pre-0.11 cv output tagged blocks `kind` too.
+`normalizeSession` in `components/util.js` is the single place that folds all
+three onto the shape above; no component should read a block's `kind`. Unknown
+block types and unknown message kinds are rendered with their raw record rather
+than dropped.
+
+### Self-test
+
+`selftest.html` (open it directly, or visit `/selftest.html` under
+`cvd serve --web ./web`) runs the components against `sample.js` and asserts
+these invariants — every message renders exactly one node, every block type is
+recognised, `extra` is read through the harness namespace, the OpenSession export
+round-trips. No build step, no dependencies. Run it after any IR change.
 
 ## Export & the loom
 
 - From any transcript header: **⬇ .md** and **⬇ .json** (OpenSession).
 - From the loom: the composed lane downloads as
-  `{ openSession: "0.1", harness: "openSession", id, title, messages: [...] }`.
+  `{ openSession: "0.2", harness: "openSession", id, title, messages: [...] }`.
 
 All exports are client-side `Blob` downloads — nothing leaves the page.
 

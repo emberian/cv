@@ -79,6 +79,15 @@ fn check(src: Option<PathBuf>, json_out: bool) -> Result<()> {
             root.display()
         );
     } else {
+        // A binary installed from a release has no cv checkout beside it, and `--src` defaults to
+        // the directory it was BUILT in — so the honest answer there is "point me at a checkout",
+        // not a wall of per-harness findings. Say that first, before the list.
+        if !root.is_dir() {
+            eprintln!("✦ {} is not a directory.", root.display());
+            eprintln!("  `formats check` reads the adapter sources, so it needs a cv checkout:");
+            eprintln!("  pass `--src <repo>/crates/cv-core/src`.");
+            eprintln!("  (`formats census` needs no source — it reads your real sessions.)");
+        }
         for f in &findings {
             println!(
                 "{:<15} {:<26} {:<34} {}",

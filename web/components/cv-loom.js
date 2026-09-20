@@ -111,7 +111,7 @@ class CvLoom extends HTMLElement {
   _composed() {
     const b = this._branch();
     return {
-      openSession: "0.1",
+      openSession: "0.2",
       harness: "opensession",
       id: b.composedId,
       title: this._title + (this._branches.length > 1 ? ` — ${b.name}` : ""),
@@ -416,7 +416,7 @@ class CvLoom extends HTMLElement {
       id: randomId(),
       role: "assistant",
       model: getModel(),
-      content: [{ kind: "text", text: "" }],
+      content: [{ type: "text", text: "" }],
       timestamp: new Date().toISOString(),
     };
     const entry = { uid: randomId(), message: placeholder, from: "⚡ generated", harness: "opensession" };
@@ -427,7 +427,7 @@ class CvLoom extends HTMLElement {
     const setText = (full) => {
       const m = this._lane.find((e) => e.uid === entry.uid)?.message;
       if (m) {
-        m.content = [{ kind: "text", text: full }];
+        m.content = [{ type: "text", text: full }];
         // Update only the preview + this lane row's text, cheaply.
         this._renderPreview();
         const row = this.querySelector(`.lane-item[data-uid="${CSS.escape(entry.uid)}"] .lane-preview`);
@@ -514,12 +514,12 @@ class CvLoom extends HTMLElement {
 
   _previewText(m) {
     for (const b of m.content || []) {
-      if (b.kind === "text" && b.text?.trim()) return b.text.trim().replace(/\s+/g, " ").slice(0, 120);
+      if (b.type === "text" && b.text?.trim()) return b.text.trim().replace(/\s+/g, " ").slice(0, 120);
     }
     for (const b of m.content || []) {
-      if (b.kind === "tool_use") return `⚙ ${b.name || "tool"}`;
-      if (b.kind === "tool_result") return `↳ ${String(b.content || "").slice(0, 100)}`;
-      if (b.kind === "thinking") return `💭 ${(b.text || "[opaque]").slice(0, 100)}`;
+      if (b.type === "tool_use") return `⚙ ${b.name || "tool"}`;
+      if (b.type === "tool_result") return `↳ ${String(b.content || "").slice(0, 100)}`;
+      if (b.type === "thinking") return `💭 ${(b.text || "[opaque]").slice(0, 100)}`;
     }
     return "";
   }

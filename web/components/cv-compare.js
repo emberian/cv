@@ -122,10 +122,10 @@ class CvCompare extends HTMLElement {
     const hit = this._sigCache.get(m);
     if (hit !== undefined) return hit;
     const text = (m.content || []).map((b) => {
-      if (b.kind === "text" || b.kind === "thinking") return b.text || "";
-      if (b.kind === "tool_use") return `⚙${b.name}:${JSON.stringify(b.input)}`;
-      if (b.kind === "tool_result") return `↳${b.content || ""}`;
-      return b.kind;
+      if (b.type === "text" || b.type === "thinking") return b.text || "";
+      if (b.type === "tool_use") return `⚙${b.name}:${JSON.stringify(b.input)}`;
+      if (b.type === "tool_result") return `↳${b.content || ""}`;
+      return b.type;
     }).join("\n");
     const sig = `${m.role} ${text}`;
     this._sigCache.set(m, sig);
@@ -281,11 +281,11 @@ class CvCompare extends HTMLElement {
     const label = ROLE_LABELS[role] || role;
     const when = fmtTime(m.timestamp);
     const body = (m.content || []).map((blk) => {
-      if (blk.kind === "text") return `<div class="cmp-text">${esc(blk.text || "")}</div>`;
-      if (blk.kind === "thinking") return `<div class="cmp-think muted">💭 ${esc((blk.text || "[opaque]").slice(0, 280))}</div>`;
-      if (blk.kind === "tool_use") return `<div class="cmp-tool">⚙ <b>${esc(blk.name || "?")}</b></div>`;
-      if (blk.kind === "tool_result") return `<div class="cmp-tool">↳ <span class="muted">${esc(String(blk.content || "").slice(0, 200))}</span></div>`;
-      return `<div class="muted">[${esc(blk.kind)}]</div>`;
+      if (blk.type === "text") return `<div class="cmp-text">${esc(blk.text || "")}</div>`;
+      if (blk.type === "thinking") return `<div class="cmp-think muted">💭 ${esc((blk.text || "[opaque]").slice(0, 280))}</div>`;
+      if (blk.type === "tool_use") return `<div class="cmp-tool">⚙ <b>${esc(blk.name || "?")}</b></div>`;
+      if (blk.type === "tool_result") return `<div class="cmp-tool">↳ <span class="muted">${esc(String(blk.content || "").slice(0, 200))}</span></div>`;
+      return `<div class="muted">[${esc(blk.type || "unknown")}]</div>`;
     }).join("");
     return `<div class="cmp-msg cmp-role-${esc(role)}"><div class="cmp-msg-head"><span class="turn-role">${esc(label)}</span>${when ? `<span class="muted">${esc(when)}</span>` : ""}</div>${body}</div>`;
   }

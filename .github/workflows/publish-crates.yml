@@ -1,0 +1,66 @@
+# Publish the library crates to crates.io as part of a release.
+#
+# Why this file exists: `dist-workspace.toml` used to say `publish-jobs = ["cargo"]`, which
+# cargo-dist 0.31 rejects outright ("cargo is not a recognized job value") — it has no built-in
+# crates.io job, only `homebrew`, `npm`, and custom `./name` jobs like this one. The bad value made
+# the release `plan` step fail before anything was built, so EVERY tag since it was added produced
+# no binaries and no crates.io upload. dist calls this job by name from the generated release.yml.
+#
+# Needs a `CARGO_REGISTRY_TOKEN` repository secret with publish rights on all six crates.
+name: Publish to crates.io
+
+on:
+  workflow_call:
+    inputs:
+      # dist passes its whole plan; we only need it to exist for the call to typecheck, but it is
+      # handy in the log when a release goes sideways.
+      plan:
+        required: true
+        type: string
+
+jobs:
+  publish-crates:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+
+      - name: Publish in dependency order
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          PLAN: ${{ inputs.plan }}
+        run: |
+          set -uo pipefail
+          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
+            echo "::error::CARGO_REGISTRY_TOKEN is not set; cannot publish to crates.io"
+            exit 1
+          fi
+
+          # Dependency order: a crate cannot be published before the ones it depends on are live.
+          # `cv-sim`, `cv-tui` and `cv-web` are `publish = false` and deliberately absent.
+          CRATES="clustervision-core cv-search cv-llm cvd cv-mcp clustervision"
+
+          for c in $CRATES; do
+            echo "::group::publish $c"
+            # A re-run of a release (or a partially-successful first run) must not fail the job for
+            # versions that already landed — crates.io is append-only, so "already uploaded" is the
+            # success state, not an error.
+            out="$(cargo publish -p "$c" --locked 2>&1)" && status=0 || status=$?
+            echo "$out"
+            if [ "$status" -ne 0 ]; then
+              if echo "$out" | grep -qiE 'already (been )?uploaded|crate version .* is already'; then
+                echo "$c is already on crates.io at this version — continuing"
+              else
+                echo "::error::publishing $c failed"
+                echo "::endgroup::"
+                exit "$status"
+              fi
+            fi
+            echo "::endgroup::"
+          done
+
+          echo "all crates published"

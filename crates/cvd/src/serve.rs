@@ -420,14 +420,20 @@ fn sessions(query: &str) -> (u16, Value) {
     let out: Vec<Value> = refs
         .iter()
         .map(|r| {
+            // The ONE session-row shape (docs/INTERFACE-V2.md §3) — the same keys `cv ls --json`
+            // and the desktop app's `local_sessions` emit. `path` and `size_bytes` were missing
+            // here, so a consumer could not tell the daemon's rows from the CLI's without special
+            // casing, which is exactly what §3 exists to prevent.
             json!({
                 "id": r.id,
                 "harness": r.harness.as_str(),
+                "path": r.path.to_string_lossy(),
                 "cwd": r.cwd.as_ref().map(|c| c.to_string_lossy()),
                 "title": r.title,
-                "updated_at": r.updated_at,
                 "created_at": r.created_at,
+                "updated_at": r.updated_at,
                 "message_count": r.message_count,
+                "size_bytes": std::fs::metadata(&r.path).map(|m| m.len()).unwrap_or(0),
             })
         })
         .collect();
@@ -713,6 +719,9 @@ fn touched(query: &str) -> (u16, Value) {
     let out: Vec<Value> = cv_core::events::sessions_touching(&path, edits_only)
         .iter()
         .map(|t| {
+            // Same keys as `cv touched --json`, including the sub-agent provenance trio the
+            // struct has always carried: without it a caller cannot tell whether the session that
+            // touched a file was a top-level run or one lane of a workflow.
             json!({
                 "harness": t.harness,
                 "session_id": t.session_id,
@@ -720,6 +729,9 @@ fn touched(query: &str) -> (u16, Value) {
                 "edits": t.edits,
                 "reads": t.reads,
                 "last_ts": t.last_ts,
+                "agent_id": t.agent_id,
+                "parent_id": t.parent_id,
+                "workflow": t.workflow,
             })
         })
         .collect();

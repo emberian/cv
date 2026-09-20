@@ -9,7 +9,15 @@ cargo-dist-version = "0.31.0"
 ci = "github"
 # Publish to crates.io as part of the release (in addition to the GitHub release artifacts).
 # Without this, crates.io lagged the tag: v0.9.22 shipped binaries while crates.io sat at 0.9.21.
-publish-jobs = ["cargo"]
+#
+# This MUST be the custom job `./publish-crates` (`.github/workflows/publish-crates.yml`), not the
+# plausible-looking `"cargo"`. cargo-dist 0.31 has no built-in crates.io job — it accepts only
+# `homebrew`, `npm`, and `./name` — and rejects anything else while PARSING this file, so the
+# `plan` step dies before a single artifact is built. That is what happened: the value was
+# `"cargo"` from just after v0.9.22 until 0.11.0, every tag in between produced nothing, and the
+# failure looked like a TOML error rather than a missing feature. `dist plan` locally is the
+# cheapest way to catch a repeat.
+publish-jobs = ["./publish-crates"]
 # The installers to generate for each app
 installers = ["shell", "powershell"]
 # Target platforms to build apps for (Rust target-triple syntax)

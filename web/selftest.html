@@ -1,0 +1,479 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>clustervision — rendering self-test</title>
+  <link rel="stylesheet" href="./styles.css" />
+  <style>
+    /* This page is a test report, not part of the app; its own chrome lives here. */
+    body { padding: 0 16px 48px; }
+    .st-wrap { max-width: 1100px; margin: 0 auto; }
+    .st-head { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; padding: 22px 0 10px; }
+    .st-head h1 { margin: 0; font-size: 21px; letter-spacing: -0.01em; }
+    .st-head p { margin: 0; font-size: 13px; color: var(--fg-muted); flex: 1 1 320px; }
+    .st-score {
+      font-family: var(--mono); font-size: 14px; font-weight: 650;
+      border-radius: 999px; padding: 4px 14px; border: 1px solid var(--border);
+      background: var(--bg-sunk);
+    }
+    .st-score.pass { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, var(--border)); }
+    .st-score.fail { color: var(--error); border-color: color-mix(in srgb, var(--error) 45%, var(--border)); }
+
+    .st-group { margin-top: 22px; }
+    .st-group > h2 {
+      margin: 0 0 8px; font-size: 12px; font-weight: 650; color: var(--fg-muted);
+      text-transform: uppercase; letter-spacing: 0.06em;
+    }
+    .st-list { display: flex; flex-direction: column; gap: 1px; background: var(--border); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
+    .st-row { display: grid; grid-template-columns: 22px 1fr auto; gap: 10px; align-items: baseline; padding: 7px 12px; background: var(--bg-elev); font-size: 13.5px; }
+    .st-row .st-mark { font-family: var(--mono); font-weight: 700; }
+    .st-row.ok .st-mark { color: var(--ok); }
+    .st-row.bad { background: var(--error-bg); }
+    .st-row.bad .st-mark { color: var(--error); }
+    .st-why { grid-column: 2 / -1; font-family: var(--mono); font-size: 12px; color: var(--error); white-space: pre-wrap; overflow-wrap: anywhere; }
+    .st-note { font-size: 11.5px; color: var(--fg-muted); font-family: var(--mono); }
+
+    .st-stage { margin-top: 28px; border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; background: var(--bg-elev); }
+    .st-stage > h2 { margin: 0; padding: 10px 14px; font-size: 12px; font-weight: 650; color: var(--fg-muted); text-transform: uppercase; letter-spacing: 0.06em; border-bottom: 1px solid var(--border); }
+    .st-stage cv-transcript { display: block; max-height: 70vh; overflow: auto; }
+    @media (max-width: 640px) { .st-row { grid-template-columns: 20px 1fr; } .st-row .st-note { grid-column: 2; } }
+  </style>
+</head>
+<body>
+<div class="st-wrap">
+  <header class="st-head">
+    <h1>Rendering self-test</h1>
+    <p>Runs the components in <code>web/components</code> against <code>web/sample.js</code> and checks
+       the invariants an IR change breaks first. Open this file after touching the IR, or serve it with
+       <code>cvd serve --web ./web</code> and visit <code>/selftest.html</code>.</p>
+    <span class="st-score" id="score">running…</span>
+  </header>
+  <div id="report"></div>
+
+  <section class="st-stage">
+    <h2>Live render — the claude sample (every message kind, including two the UI has never heard of)</h2>
+    <cv-transcript id="stage"></cv-transcript>
+  </section>
+</div>
+
+<script type="module">
+import {
+  normalizeSession, normalizeSessions, searchableText, sessionLabel, sumTokens,
+  toOpenSession, toMarkdown, harnessExtra, MESSAGE_KINDS, fmtCost,
+} from "./components/util.js";
+import { blockToText, messagesToChat } from "./openrouter.js";
+import { SAMPLE_SESSIONS } from "./sample.js";
+import "./components/cv-transcript.js";
+import "./components/cv-stats.js";
+import "./components/cv-compare.js";
+import "./components/cv-forest.js";
+import "./components/cv-loom.js";
+
+// ---------------------------------------------------------------------------
+// Tiny harness. No dependencies, no build step: a check is a name and a body
+// that throws (or returns a string) to fail.
+// ---------------------------------------------------------------------------
+const results = [];
+let group = "";
+const suite = (name) => { group = name; };
+const check = (name, fn) => {
+  let why = null;
+  try {
+    const r = fn();
+    if (typeof r === "string" && r) why = r;
+  } catch (e) {
+    why = (e && e.message) || String(e);
+  }
+  results.push({ group, name, why });
+};
+const eq = (got, want, what) => {
+  if (got !== want) throw new Error(`${what}: expected ${JSON.stringify(want)}, got ${JSON.stringify(got)}`);
+};
+const has = (hay, needle, what) => {
+  if (!String(hay).includes(needle)) throw new Error(`${what}: ${JSON.stringify(needle)} missing from ${JSON.stringify(String(hay).slice(0, 200))}`);
+};
+const truthy = (v, what) => { if (!v) throw new Error(`${what}: expected truthy, got ${JSON.stringify(v)}`); };
+
+// Render one session into a detached <cv-transcript> and hand back its root.
+function renderTranscript(session) {
+  const el = document.createElement("cv-transcript");
+  document.body.appendChild(el);      // custom elements need to be connected to upgrade
+  el.style.display = "none";
+  // The sample sessions are fixtures, not rows in anyone's archive, so don't ask a daemon about
+  // their sub-agents and events — this page must run from `file://` with nothing else running.
+  el._mountSubagents = async () => {};
+  el._mountEvents = async () => {};
+  el.session = session;
+  return el;
+}
+
+const sessions = normalizeSessions(SAMPLE_SESSIONS);
+const claude = sessions.find((s) => s.id === "c0ffee-claude-001");
+const codex = sessions.find((s) => s.id === "feed-codex-7");
+const open = sessions.find((s) => s.id === "open-demo-42");
+
+// ===========================================================================
+suite("Normalizer — the IR v2 vocabulary");
+
+check("a block is tagged `type`, never `kind`", () => {
+  for (const s of sessions) for (const m of s.messages) for (const b of m.content) {
+    truthy(b.type, `block in ${s.id} has no type`);
+    if ("kind" in b) throw new Error(`block in ${s.id} still carries a \`kind\` key: ${JSON.stringify(b).slice(0, 120)}`);
+  }
+});
+
+check("IR v2 `type` survives normalization", () => {
+  eq(claude.messages[0].content[0].type, "text", "prompt block");
+  eq(claude.messages[3].content[0].type, "tool_result", "tool_result block");
+  eq(codex.messages[6].content[1].type, "tool_use", "tool_use block");
+});
+
+check("OpenSession camelCase block kinds fold onto `type`", () => {
+  const blocks = open.messages.flatMap((m) => m.content).map((b) => b.type);
+  has(blocks.join(","), "tool_use", "toolUse → tool_use");
+  has(blocks.join(","), "tool_result", "toolResult → tool_result");
+  eq(open.messages[2].content[0].tool_use_id, "c1", "toolUseId → tool_use_id");
+  eq(open.messages[2].content[0].is_error, false, "isError → is_error");
+});
+
+check("message `kind` and `origin` are carried, not invented", () => {
+  eq(claude.messages[0].kind, "prompt", "m0 kind");
+  eq(claude.messages[0].origin, "human", "m0 origin");
+  eq(claude.messages[1].kind, "injected_context", "m1 kind");
+  eq(claude.messages[6].kind, "compaction_boundary", "compaction kind");
+  eq(claude.messages[7].kind, "compaction_summary", "summary kind");
+  eq(claude.messages[9].origin, "scheduler", "scheduler-origin prompt");
+});
+
+check("a source without kinds gets the contract's role defaults", () => {
+  eq(open.messages[0].kind, "prompt", "user →");
+  eq(open.messages[1].kind, "reply", "assistant →");
+  eq(open.messages[2].kind, "tool_result", "tool →");
+  eq(open.messages[0].origin, "human", "prompt origin");
+});
+
+check("an unknown message kind is preserved verbatim, not coerced", () => {
+  eq(claude.messages[10].kind, "telepathy", "unknown kind");
+  eq(claude.messages[10].content[0].type, "hologram", "unknown block type");
+  truthy(!MESSAGE_KINDS.telepathy, "the fixture's unknown kind must stay unknown to the UI");
+});
+
+check("session keys are snake_case; `system_prompt` and `lineage` arrive", () => {
+  truthy(claude.created_at, "created_at");
+  truthy(claude.updated_at, "updated_at");
+  truthy(claude.system_prompt, "system_prompt");
+  eq(claude.lineage.continued_in, "c0ffee-claude-002", "lineage.continued_in");
+  eq(codex.lineage.forked_from, "feed-codex-6", "lineage.forked_from");
+  eq(codex.lineage.agent_path, "reviewer", "lineage.agent_path");
+  eq(open.created_at, "2026-05-29T10:00:00Z", "createdAt → created_at");
+});
+
+check("usage carries reasoning tokens and cost, in both spellings", () => {
+  eq(codex.messages[3].usage.reasoning_tokens, 1408, "reasoning_tokens");
+  eq(codex.messages[3].usage.cost_usd, 0.0214, "cost_usd");
+  eq(open.messages[1].usage.reasoning_tokens, 64, "reasoningTokens → reasoning_tokens");
+  eq(open.messages[1].usage.cost_usd, 0.0071, "costUsd → cost_usd");
+  const tot = sumTokens(codex);
+  eq(Math.round(tot.cost * 1e4), 545, "summed cost (¢×100)");
+  eq(tot.reasoning, 2308, "summed reasoning tokens");
+});
+
+check("`extra` is read through the harness namespace, never flat", () => {
+  const boundary = claude.messages[6];
+  truthy(!boundary.extra.subtype, "the flat key must not exist on IR v2 data");
+  eq(harnessExtra(boundary, "claude").compactMetadata.trigger, "manual", "extra.claude.compactMetadata");
+  eq(harnessExtra(codex.messages[8], "codex").codex_event, "compacted", "extra.codex.codex_event");
+  eq(harnessExtra(boundary, "codex"), null, "wrong harness must not resolve");
+});
+
+check("a tool call's namespace survives", () => {
+  eq(codex.messages[6].content[1].namespace, "collaboration", "tool_use.namespace");
+});
+
+// ===========================================================================
+suite("Derived text — the helpers that silently returned nothing");
+
+check("searchableText reaches into blocks", () => {
+  const t = searchableText(codex);
+  has(t, "apply_patch", "tool_use name");
+  has(t, "max_attempts", "tool_result content");
+});
+
+check("sessionLabel prefers a human prompt over a compaction summary", () => {
+  const untitled = normalizeSession({ ...SAMPLE_SESSIONS[0], title: null, display_title: null });
+  const label = sessionLabel(untitled);
+  has(label, "Can you read the IR", "label should be the typed prompt");
+  if (label.includes("continued from a previous conversation")) {
+    throw new Error("a compaction summary was used as the title");
+  }
+});
+
+check("toMarkdown renders every block type and names the kinds", () => {
+  const md = toMarkdown(claude);
+  has(md, "tool_use", "tool_use");
+  has(md, "Grep", "tool name");
+  has(md, "Compaction summary", "message kind in the heading");
+  has(md, "system prompt", "session system prompt");
+  if (md.includes("[undefined block]")) throw new Error("a block fell through to the unknown branch");
+});
+
+check("OpenSession export flips `type` back to `kind` and round-trips", () => {
+  const doc = toOpenSession(claude);
+  const kinds = doc.messages.flatMap((m) => m.content).map((b) => b.kind);
+  has(kinds.join(","), "toolUse", "toolUse");
+  has(kinds.join(","), "toolResult", "toolResult");
+  eq(doc.messages[6].messageKind, "compaction_boundary", "message kind exported");
+  const back = normalizeSession(doc);
+  eq(back.messages[6].kind, "compaction_boundary", "kind round-tripped");
+  eq(back.messages[3].content[0].type, "tool_result", "block type round-tripped");
+  eq(back.system_prompt, claude.system_prompt, "system prompt round-tripped");
+  eq(back.lineage.continued_in, "c0ffee-claude-002", "lineage round-tripped");
+});
+
+check("openrouter flattens blocks instead of dropping them", () => {
+  const chat = messagesToChat(codex.messages);
+  const all = chat.map((c) => c.content).join("\n");
+  has(all, "[tool_use collaboration:apply_patch", "namespaced tool call");
+  has(all, "[tool_result", "tool result");
+  has(blockToText(claude.messages[1].content[0]), "system-reminder", "text block");
+});
+
+// ===========================================================================
+suite("Transcript — nothing vanishes");
+
+const stage = renderTranscript(claude);
+
+check("every message produces exactly one node — no silent drops", () => {
+  const nodes = stage.querySelectorAll(".turns > .turn, .turns > .turn-rule");
+  eq(nodes.length, claude.messages.length, "rendered nodes vs messages");
+});
+
+check("a structural kind renders as a rule, not a turn", () => {
+  const rule = stage.querySelector(".turn-rule-compaction_boundary");
+  truthy(rule, "compaction boundary rule");
+  has(rule.textContent, "Compaction", "label");
+  has(rule.textContent, "manual", "trigger, read from extra.claude.compactMetadata");
+  has(rule.textContent, "987k → 7.0k tokens", "pre/post token counts");
+});
+
+check("a quiet kind folds shut with a peek that says what is inside", () => {
+  const quiet = stage.querySelector(".turn-kind-injected_context.turn-quiet");
+  truthy(quiet, "injected context is a quiet turn");
+  truthy(!quiet.querySelector("details").open, "it starts folded");
+  has(quiet.querySelector(".turn-peek").textContent, "system reminder", "peek uses the harness attachment name");
+});
+
+check("a prompt, a notice and an error are told apart", () => {
+  for (const k of ["prompt", "notice", "error", "compaction_summary"]) {
+    truthy(stage.querySelector(`.turn-kind-${k}`), `a .turn-kind-${k} turn`);
+  }
+  const prompt = stage.querySelector(".turn-kind-prompt .turn-role");
+  eq(prompt.textContent.trim(), "Prompt", "prompt label");
+  eq(stage.querySelector(".turn-kind-error .turn-role").textContent.trim(), "Error", "error label");
+});
+
+check("an unexpected origin is called out; an obvious one is not", () => {
+  const sched = stage.querySelector('.turn-kind-prompt .turn-origin[data-origin="scheduler"]');
+  truthy(sched, "a scheduler-origin prompt shows its origin");
+  const reply = stage.querySelector(".turn-kind-reply");
+  truthy(!reply.querySelector(".turn-origin"), "a model-origin reply must not be labelled");
+});
+
+check("an unknown message kind renders honestly instead of vanishing", () => {
+  const unk = stage.querySelector(".turn-unknown-kind");
+  truthy(unk, "a turn for the unknown kind");
+  has(unk.textContent, "telepathy", "the raw kind is printed");
+  has(unk.textContent, "unknown kind", "and flagged as unrecognised");
+});
+
+check("an unknown block type renders its record instead of an empty turn", () => {
+  const ub = stage.querySelector(".unknown-block");
+  truthy(ub, "an .unknown-block");
+  has(ub.textContent, "hologram", "the raw type is printed");
+  has(ub.textContent, "frames", "the raw record is available");
+  truthy(!stage.querySelector(".turn-unknown-kind .block-empty"), "it must not render as (empty)");
+});
+
+check("the session's system prompt and lineage are reachable", () => {
+  truthy(stage.querySelector(".th-sysprompt"), "system prompt fold");
+  has(stage.querySelector(".th-sysprompt").textContent, "software engineering tasks", "its text");
+  const chip = stage.querySelector('[data-open-session="c0ffee-claude-002"]');
+  truthy(chip, "a navigable `continued in` chip");
+  has(chip.textContent, "continued in", "its label");
+});
+
+check("the filter strip counts what is actually in the window", () => {
+  const chips = [...stage.querySelectorAll(".tf-chip")].map((c) => c.textContent.replace(/\s+/g, " ").trim());
+  has(chips.join(" | "), "injected context 1", "injected-context count");
+  has(chips.join(" | "), "thinking 1", "thinking count");
+});
+
+const codexStage = renderTranscript(codex);
+
+check("reasoning tokens and provider cost show on the turn that spent them", () => {
+  const usage = codexStage.querySelector(".turn-kind-reply .turn-usage");
+  has(usage.textContent, "1.4k reasoning", "reasoning tokens");
+  has(codexStage.querySelector(".turn-cost").textContent, "$0.02", "cost");
+  has(codexStage.querySelector(".th-meta").textContent, "$0.05", "session cost total");
+});
+
+check("structured tool-result details surface as facts, not raw JSON only", () => {
+  const chips = [...codexStage.querySelectorAll(".td-chip")].map((c) => c.textContent.replace(/\s+/g, " ").trim());
+  has(chips.join(" | "), "duration ms 34", "duration chip");
+  truthy(codexStage.querySelector(".td-chip.bad"), "a non-zero exit code reads as bad");
+});
+
+check("a model change is a rule that names the new model", () => {
+  const r = codexStage.querySelector(".turn-rule-model_change");
+  truthy(r, "model-change rule");
+  has(r.textContent, "gpt-5-codex-high", "the new model");
+});
+
+check("a tool namespace is shown on the call", () => {
+  has(codexStage.querySelector(".tool-ns").textContent, "collaboration", "namespace chip");
+});
+
+check("a subagent-origin tool result is attributed", () => {
+  has(codexStage.textContent, "sub-agent", "origin chip for an inter-agent result");
+});
+
+check("a structural message with a real body becomes a turn, not a clipped rule", () => {
+  const body = "X".repeat(900);
+  const sess = normalizeSession({
+    id: "marker-guard", harness: "codex",
+    messages: [
+      { role: "system", kind: "subagent_return", origin: "subagent",
+        content: [{ type: "text", text: body }] },
+      { role: "system", kind: "subagent_return", origin: "subagent",
+        content: [{ type: "text", text: "[sub-agent /root/x completed]" }] },
+    ],
+  });
+  const el = renderTranscript(sess);
+  eq(el.querySelectorAll(".turns > .turn").length, 1, "the long one is a full turn");
+  eq(el.querySelectorAll(".turns > .turn-rule").length, 1, "the short one stays a rule");
+  has(el.querySelector(".turn").textContent, body.slice(0, 50), "the long body is rendered in full");
+});
+
+check("a message with no content still renders a turn that says so", () => {
+  const sess = normalizeSession({
+    id: "empty-guard", harness: "claude",
+    messages: [{ role: "assistant", kind: "reply", origin: "model", content: [] }],
+  });
+  const el = renderTranscript(sess);
+  eq(el.querySelectorAll(".turns > .turn").length, 1, "one turn");
+  has(el.querySelector(".turn").textContent, "(empty)", "it says it is empty");
+});
+
+const openStage = renderTranscript(open);
+check("an OpenSession document renders with no unknown blocks", () => {
+  eq(openStage.querySelectorAll(".unknown-block").length, 0, "unknown blocks");
+  truthy(openStage.querySelector(".block.tool-use, details.tool-use"), "a tool_use block");
+  has(openStage.textContent, "cargo test --workspace", "tool input");
+  has(openStage.textContent, "128 passed", "tool result content");
+});
+
+// ===========================================================================
+suite("Other views read blocks through `type`");
+
+check("cv-stats buckets blocks by type and messages by kind/origin", () => {
+  const el = document.createElement("cv-stats");
+  document.body.appendChild(el);
+  el.style.display = "none";
+  el.sessions = sessions;
+  const txt = el.textContent;
+  has(txt, "tool_use", "tool_use bucket");
+  has(txt, "thinking", "thinking bucket");
+  has(txt, "Messages by kind", "kind breakdown");
+  has(txt, "Compaction summary", "a kind label");
+  has(txt, "Where they came from", "origin breakdown");
+  has(txt, "scheduler", "an origin label");
+  has(txt, "Reported cost", "cost tile, since the fixture has cost_usd");
+  has(txt, "Reasoning tokens", "reasoning-token tile");
+  if (/\bundefined\b/.test(txt)) throw new Error("a bucket labelled undefined — a stale key is being read");
+});
+
+check("cv-forest's tool histogram sees tool calls", () => {
+  const el = document.createElement("cv-forest");
+  document.body.appendChild(el);
+  el.style.display = "none";
+  const hist = el._toolHistogram(codex);
+  const names = hist.map(([n]) => n);
+  has(names.join(","), "apply_patch", "apply_patch");
+  has(names.join(","), "shell", "shell");
+});
+
+check("cv-forest finds a compaction boundary by kind when the endpoint is absent", () => {
+  const el = document.createElement("cv-forest");
+  document.body.appendChild(el);
+  el.style.display = "none";
+  el._compactions = null;
+  el._root = claude;
+  const cs = el._resolveCompactions();
+  eq(cs.length, 1, "boundaries found");
+  eq(cs[0].trigger, "manual", "trigger from extra.claude.compactMetadata");
+  eq(cs[0].summaryIndex, 7, "the paired summary message");
+});
+
+check("cv-compare's message signature is built from block text", () => {
+  const el = document.createElement("cv-compare");
+  document.body.appendChild(el);
+  el.style.display = "none";
+  const sig = el._sig(codex.messages[6]);
+  has(sig, "apply_patch", "tool name in the signature");
+  has(sig, "Found it.", "text in the signature");
+});
+
+check("cv-loom previews a message from its blocks", () => {
+  const el = document.createElement("cv-loom");
+  document.body.appendChild(el);
+  el.style.display = "none";
+  has(el._previewText(codex.messages[1]), "retry loop", "a text turn previews as its text");
+  has(el._previewText(codex.messages[3]), "Classic", "a thinking turn previews as its reasoning");
+  has(el._previewText(codex.messages[4]), "max_attempts", "a tool-result turn previews as its output");
+  has(el._previewText(codex.messages[7]), "Applied patch", "no block type falls through to an empty preview");
+});
+
+// ===========================================================================
+// Report
+// ===========================================================================
+const failed = results.filter((r) => r.why);
+const report = document.getElementById("report");
+const groups = [...new Set(results.map((r) => r.group))];
+report.innerHTML = groups.map((g) => {
+  const rows = results.filter((r) => r.group === g).map((r) => `
+    <div class="st-row ${r.why ? "bad" : "ok"}">
+      <span class="st-mark">${r.why ? "✖" : "✓"}</span>
+      <span>${escapeHtml(r.name)}</span>
+      <span class="st-note">${r.why ? "fail" : "pass"}</span>
+      ${r.why ? `<span class="st-why">${escapeHtml(r.why)}</span>` : ""}
+    </div>`).join("");
+  return `<section class="st-group"><h2>${escapeHtml(g)}</h2><div class="st-list">${rows}</div></section>`;
+}).join("");
+
+const score = document.getElementById("score");
+score.textContent = failed.length
+  ? `${failed.length} of ${results.length} failing`
+  : `${results.length} checks passing`;
+score.className = "st-score " + (failed.length ? "fail" : "pass");
+document.title = `${failed.length ? "✖" : "✓"} selftest — ${results.length - failed.length}/${results.length}`;
+
+// The visible stage, so a failure can be eyeballed next to the report.
+const visible = document.getElementById("stage");
+visible.session = claude;
+
+// A headless driver (or a human in the console) reads this.
+globalThis.__CV_SELFTEST__ = {
+  total: results.length,
+  failed: failed.length,
+  failures: failed.map((f) => `${f.group} › ${f.name}: ${f.why}`),
+};
+
+function escapeHtml(s) {
+  return String(s ?? "").replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  })[c]);
+}
+</script>
+</body>
+</html>

@@ -5,7 +5,32 @@
 // Totals, per-harness counts, message counts, top cwds, date range, token
 // sums. Charts are hand-rolled CSS bars + a tiny inline SVG activity sparkline.
 // No chart library.
-import { esc, fmtTime, sortTime, shortPath, sumTokens, msgCount, HARNESS_LABELS } from "./util.js";
+import {
+  esc, fmtTime, sortTime, shortPath, sumTokens, msgCount, HARNESS_LABELS,
+  messageKindLabel, ORIGIN_LABELS, fmtCost,
+} from "./util.js";
+
+// Semantic, not decorative: conversation reads in the transcript's own rail colors, machinery in
+// muted, and the things you would want to notice (errors, compaction) in the warning palette.
+const KIND_COLOR = {
+  prompt: "var(--accent)",
+  reply: "var(--h-codex)",
+  tool_result: "var(--warn)",
+  error: "var(--error)",
+  compaction_boundary: "var(--warn)",
+  compaction_summary: "var(--warn)",
+  system_prompt: "var(--h-hermes)",
+  subagent_spawn: "var(--h-hermes)",
+  subagent_return: "var(--h-hermes)",
+  model_change: "var(--h-gemini)",
+};
+const ORIGIN_COLOR = {
+  human: "var(--accent)",
+  model: "var(--h-codex)",
+  hook: "var(--warn)",
+  scheduler: "var(--warn)",
+  subagent: "var(--h-hermes)",
+};
 
 class CvStats extends HTMLElement {
   constructor() {
@@ -23,9 +48,14 @@ class CvStats extends HTMLElement {
     // `messages` uses msgCount so it counts metadata-only stubs (which carry message_count) too.
     // Role/block breakdowns and token sums need the actual message tree, so they're tallied only over
     // *hydrated* sessions and disclosed as such — never silently zero.
-    let messages = 0, hydrated = 0, tokIn = 0, tokOut = 0, tokCache = 0;
+    let messages = 0, hydrated = 0, tokIn = 0, tokOut = 0, tokCache = 0, tokReason = 0;
+    let cost = 0, costSeen = false;
     const perHarness = new Map();
     const perRole = new Map();
+    // IR v2: what a message IS and where it came FROM. Far more telling than the four roles —
+    // on a real Claude session `system` alone covers injected context, notices and API errors.
+    const perKind = new Map();
+    const perOrigin = new Map();
     const cwds = new Map();
     const projects = new Map();
     const times = [];
@@ -45,12 +75,15 @@ class CvStats extends HTMLElement {
       if (msgs.length) {
         hydrated++;
         const tk = sumTokens(s);
-        tokIn += tk.input; tokOut += tk.output; tokCache += tk.cacheRead;
+        tokIn += tk.input; tokOut += tk.output; tokCache += tk.cacheRead; tokReason += tk.reasoning;
+        if (tk.cost != null) { cost += tk.cost; costSeen = true; }
         for (const m of msgs) {
           const r = (m.role || "?").toLowerCase();
           perRole.set(r, (perRole.get(r) || 0) + 1);
+          if (m.kind) perKind.set(m.kind, (perKind.get(m.kind) || 0) + 1);
+          if (m.origin) perOrigin.set(m.origin, (perOrigin.get(m.origin) || 0) + 1);
           for (const b of m.content || []) {
-            const k = b?.kind || "?";
+            const k = b?.type || "?";
             blockKinds.set(k, (blockKinds.get(k) || 0) + 1);
           }
         }
@@ -59,8 +92,9 @@ class CvStats extends HTMLElement {
 
     times.sort((a, b) => a - b);
     return {
-      sessions: sessions.length, messages, hydrated, tokIn, tokOut, tokCache,
-      perHarness, perRole, blockKinds, projects: projects.size,
+      sessions: sessions.length, messages, hydrated, tokIn, tokOut, tokCache, tokReason,
+      cost: costSeen ? cost : null,
+      perHarness, perRole, perKind, perOrigin, blockKinds, projects: projects.size,
       cwds: [...cwds.entries()].sort((a, b) => b[1] - a[1]).slice(0, 6),
       range: times.length ? [times[0], times[times.length - 1]] : null,
       times,
@@ -81,6 +115,10 @@ class CvStats extends HTMLElement {
       ["Harnesses", c.perHarness.size],
       ["Input tokens", c.tokIn ? c.tokIn.toLocaleString() : "—"],
       ["Output tokens", c.tokOut ? c.tokOut.toLocaleString() : "—"],
+      // Only the harnesses that record a cost contribute one, so the tile stays a dash for a
+      // Claude-and-Codex corpus rather than claiming a spend of zero.
+      ...(c.cost != null ? [["Reported cost", fmtCost(c.cost)]] : []),
+      ...(c.tokReason ? [["Reasoning tokens", c.tokReason.toLocaleString()]] : []),
     ].map(([k, v]) => `<div class="stat-card"><div class="stat-num">${esc(String(v))}</div><div class="stat-label muted">${esc(k)}</div></div>`).join("");
 
     // Honest disclosure: message-level charts only reflect sessions whose transcript is loaded.
@@ -104,12 +142,20 @@ class CvStats extends HTMLElement {
           ${this._barsHtml(c.perHarness, (k) => HARNESS_LABELS[k] || k, (k) => `var(--h-${k}, var(--accent))`)}
         </section>
         <section class="stat-block">
-          <h3>Messages by role</h3>
-          ${needsHydration(c.perRole, [(k) => k, () => "var(--accent)"])}
+          <h3>Messages by kind</h3>
+          ${needsHydration(c.perKind, [(k) => messageKindLabel(k), (k) => KIND_COLOR[k] || "var(--accent)"])}
         </section>
         <section class="stat-block">
-          <h3>Block kinds</h3>
+          <h3>Where they came from</h3>
+          ${needsHydration(c.perOrigin, [(k) => ORIGIN_LABELS[k] || k, (k) => ORIGIN_COLOR[k] || "var(--fg-muted)"])}
+        </section>
+        <section class="stat-block">
+          <h3>Block types</h3>
           ${needsHydration(c.blockKinds, [(k) => k, () => "var(--h-codex)"])}
+        </section>
+        <section class="stat-block">
+          <h3>Messages by role</h3>
+          ${needsHydration(c.perRole, [(k) => k, () => "var(--fg-muted)"])}
         </section>
         <section class="stat-block">
           <h3>Top working directories</h3>
