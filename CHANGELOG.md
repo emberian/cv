@@ -171,6 +171,27 @@ browser's whole camelCase translation layer is gone with it.
   Extrapolating from every sampled byte instead gives 189. Across three real rollouts the error fell
   from 63%, 58% and 25% to 4.5%, 19% and 1.6%.
 
+### Door parity, now enforced
+
+cv answers the same questions through several doors: `cv <cmd> --json`, the daemon's HTTP API, the
+MCP tools, the desktop app. A consumer should never have to ask which door a row came through
+before reading it. Scanning every shared noun found three more places where it did matter, on top
+of the ones already fixed above:
+
+- `/api/session/<h>/<id>/events` dropped the `agent_id`/`parent_id`/`workflow` trio, so a caller
+  could not tell a top-level run from one lane of a workflow — the same gap `/api/touched` had.
+- `/api/session/<h>/<id>/compactions` was the only list in the API wrapped in an object rather than
+  served bare, and it renamed two fields on the way out: the CLI's `boundary_msg_idx` was `index`
+  and its `pre_compaction_span` was `pre_span`. Same facts, different names, depending on the door.
+
+`crates/cvd/tests/parity.rs` is the thing that notices next time. It asks the CLI and the daemon
+the same questions and compares key sets, allowing a door to ADD a field but never to rename or
+drop one. It also pins the timestamp spelling and the rule that a list is a bare array. Verified
+the way a guard should be: by renaming a field and watching it fail.
+
+A sweep of every enum that carries both a serde spelling and a canonical accessor — the shape of
+the `kimi-code`/`kimicode` bug — found no remaining case where a type spells itself two ways.
+
 ### Also in this release
 
 - **`cv workflow <session> <run> --revive` salvages a dead run.** A `Workflow` run that dies

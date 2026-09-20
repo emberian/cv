@@ -372,14 +372,18 @@ class CvForest extends HTMLElement {
   _resolveCompactions() {
     if (Array.isArray(this._compactions)) {
       return this._compactions.map((c) => ({
-        index: c.index,
-        summaryIndex: c.summary_index,
+        index: c.boundary_msg_idx ?? c.index,
+        summaryIndex: c.summary_msg_idx ?? c.summary_index,
         trigger: c.trigger,
         preTokens: c.pre_tokens,
         durationMs: c.duration_ms,
         summary: c.summary,
         headline: c.headline,
-        preSpan: Array.isArray(c.pre_span) ? c.pre_span : null,
+        preSpan: Array.isArray(c.pre_compaction_span)
+          ? c.pre_compaction_span
+          : Array.isArray(c.pre_span)
+            ? c.pre_span
+            : null,
         _complete: true,
       }));
     }

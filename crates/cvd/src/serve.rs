@@ -980,6 +980,13 @@ fn session_events(harness: &str, id: &str, query: &str) -> (u16, Value) {
                         "tool": e.tool,
                         "target": e.target,
                         "detail": e.detail,
+                        // Same keys as `cv events --json`. The sub-agent provenance trio was
+                        // dropped here, so a caller could not tell whether the session that ran a
+                        // command was a top-level run or one lane of a workflow — the same gap
+                        // `/api/touched` had.
+                        "agent_id": e.agent_id,
+                        "parent_id": e.parent_id,
+                        "workflow": e.workflow,
                     })
                 })
                 .collect();
@@ -1021,24 +1028,25 @@ fn compactions(harness: &str, id: &str) -> (u16, Value) {
         .iter()
         .enumerate()
         .map(|(n, c)| {
-            let span = cv_core::compaction::pre_compaction_span(&boundaries, n);
-            json!({
-                "index": c.boundary_msg_idx,
-                "summary_index": c.summary_msg_idx,
-                "trigger": c.trigger,
-                "pre_tokens": c.pre_tokens,
-                "duration_ms": c.duration_ms,
-                "summary": c.summary,
-                "headline": c.headline(n + 1),
-                "pre_span": span.map(|(s, e)| json!([s, e])),
-            })
+            // Serialize the SAME struct `cv compaction --json` serializes, plus the same derived
+            // span under the same name, rather than hand-building a parallel vocabulary: this
+            // endpoint used to call the boundary `index` and the span `pre_span` while the CLI
+            // called them `boundary_msg_idx` and `pre_compaction_span`, so the same fact had two
+            // names depending on the door. `headline` is an addition, not a rename.
+            let mut v = serde_json::to_value(c).unwrap_or(Value::Null);
+            if let Some(obj) = v.as_object_mut() {
+                if let Some((s, e)) = cv_core::compaction::pre_compaction_span(&boundaries, n) {
+                    obj.insert("pre_compaction_span".into(), json!([s, e]));
+                }
+                obj.insert("headline".into(), json!(c.headline(n + 1)));
+            }
+            v
         })
         .collect();
-    ok(json!({
-        "harness": r.harness.as_str(),
-        "id": r.id,
-        "compactions": out,
-    }))
+    // A bare array, like every other list this API serves (`events`, `touched`, `search`,
+    // `sessions`). The `{harness, id, compactions}` wrapper restated two things the caller had
+    // just put in the URL and made this the one list shaped differently from its siblings.
+    ok(json!(out))
 }
 
 /// `GET /api/touched?path=&edits_only=` — sessions whose tool events touched a file (exact or

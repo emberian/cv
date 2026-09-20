@@ -148,6 +148,9 @@ export async function getCompactions(session) {
       raw = await resp.json();
     }
     if (Array.isArray(raw)) return raw;
+    // A bare array, like every other list the API serves. Older daemons wrapped it in
+    // `{harness, id, compactions}`; accept both so an older cvd still lights up the panel.
+    if (Array.isArray(raw)) return raw;
     return raw && Array.isArray(raw.compactions) ? raw.compactions : null;
   } catch {
     return null;

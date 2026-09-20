@@ -808,24 +808,27 @@ fn serve_compactions() {
     // with its summary, and reports the pre-compaction span — all in `/messages` index order.
     let (status, v) = get_json(port, "/api/session/claude/compactsess/compactions");
     assert_eq!(status, 200, "{v}");
-    let arr = v["compactions"].as_array().expect("compactions array");
+    // A bare array with the SAME field names `cv compaction --json` emits — this endpoint used to
+    // wrap it in `{harness, id, compactions}` and rename the boundary to `index` and the span to
+    // `pre_span`, so the same fact had two names depending on the door you asked.
+    let arr = v.as_array().expect("compactions array");
     assert_eq!(arr.len(), 1, "{v}");
     let c = &arr[0];
-    assert_eq!(c["index"], 2, "boundary is the 3rd message (idx 2): {v}");
+    assert_eq!(c["boundary_msg_idx"], 2, "boundary is the 3rd message (idx 2): {v}");
     assert_eq!(c["trigger"], "manual", "{v}");
     assert_eq!(c["pre_tokens"], 900000, "{v}");
     assert_eq!(c["duration_ms"], 120000, "{v}");
     // The summary that seeded the next window is paired and kept.
-    assert_eq!(c["summary_index"], 3, "summary is the 4th message: {v}");
+    assert_eq!(c["summary_msg_idx"], 3, "summary is the 4th message: {v}");
     assert!(c["summary"].as_str().unwrap().contains("the user asked for X"), "{v}");
     // The pre-compaction span is [0, boundary) — what was compacted away.
-    assert_eq!(c["pre_span"], json!([0, 2]), "{v}");
+    assert_eq!(c["pre_compaction_span"], json!([0, 2]), "{v}");
     assert!(c["headline"].as_str().unwrap().contains("compaction #1"), "{v}");
 
     // A session with no compaction → empty list, not an error.
     let (status, v) = get_json(port, "/api/session/claude/alphasess/compactions");
     assert_eq!(status, 200, "{v}");
-    assert!(v["compactions"].as_array().unwrap().is_empty(), "{v}");
+    assert!(v.as_array().unwrap().is_empty(), "{v}");
     let (status, _) = get_json(port, "/api/session/claude/zzz-nope/compactions");
     assert_eq!(status, 404);
 
