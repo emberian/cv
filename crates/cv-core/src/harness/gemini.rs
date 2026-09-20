@@ -196,7 +196,11 @@ fn parent_session_from_path(path: Option<&Path>) -> Option<String> {
 
 fn project_cwd(path: &Path) -> Option<PathBuf> {
     let comps: Vec<&std::ffi::OsStr> = path.components().map(|c| c.as_os_str()).collect();
-    let tmp_at = comps.iter().position(|c| *c == "tmp")?;
+    // The INNERMOST `tmp`, not the first: the layout is `<runtime>/tmp/<id>/chats/<file>`, and a
+    // runtime root can itself sit under a directory called `tmp` — `/tmp/...` on Linux, or a
+    // Seatbelt/CI root. Scanning left-to-right picked that outer one, made `<runtime>` the
+    // filesystem root and silently lost every cwd.
+    let tmp_at = comps.iter().rposition(|c| *c == "tmp")?;
     let identifier = comps.get(tmp_at + 1)?.to_str()?;
     // `<runtime>` is the parent of `tmp`: rebuild it from the leading components.
     let runtime: PathBuf = comps[..tmp_at].iter().collect();
@@ -1754,6 +1758,32 @@ mod tests {
         for d in [rt_a, rt_b, rt_c] {
             let _ = fs::remove_dir_all(&d);
         }
+    }
+
+    /// A runtime root that itself lives under a directory named `tmp` — `/tmp/...` on Linux, a
+    /// Seatbelt root, a CI temp dir — must still resolve. Reading the components left-to-right
+    /// matched that outer `tmp`, so `<runtime>` became `/` and every cwd came back `None`.
+    #[test]
+    fn runtime_root_under_a_tmp_directory_still_resolves_cwd() {
+        let outer = std::env::temp_dir().join(format!("cv-gemini-outer-{}", uuid::Uuid::now_v7()));
+        let runtime = outer.join("tmp").join("gemini-runtime");
+        let chats = runtime.join("tmp").join("proj-id").join("chats");
+        fs::create_dir_all(&chats).unwrap();
+        let file = chats.join("session_modern.jsonl");
+        fs::write(&file, fixture("session_modern.jsonl")).unwrap();
+        fs::write(
+            runtime.join("projects.json"),
+            r#"{"projects": {"/Users/u/work/proj": "proj-id"}}"#,
+        )
+        .unwrap();
+
+        let refs = scan_session_file(&file, Harness::Gemini);
+        assert_eq!(
+            refs[0].cwd.as_deref(),
+            Some(Path::new("/Users/u/work/proj")),
+            "the innermost `tmp` is the runtime's own"
+        );
+        let _ = fs::remove_dir_all(&outer);
     }
 
     #[test]
