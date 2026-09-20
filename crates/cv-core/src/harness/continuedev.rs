@@ -179,6 +179,14 @@ impl Adapter for Continue {
                 continue;
             };
             if let Some(m) = history_item_to_message(&v, &mut s.model) {
+                // A `system` history item is the system prompt — the session-level fact.
+                if s.system_prompt.is_none() && m.kind == MessageKind::SystemPrompt {
+                    if let Some(t) = m.text() {
+                        if !t.trim().is_empty() {
+                            s.system_prompt = Some(t);
+                        }
+                    }
+                }
                 if sink.message(m) == Flow::Stop {
                     break;
                 }
@@ -575,6 +583,10 @@ fn history_item_to_message(item: &Value, model: &mut Option<String>) -> Option<M
     };
 
     let mut m = Message::new(role);
+    // A `system` role history item carries the system prompt.
+    if role == Role::System {
+        m.kind = MessageKind::SystemPrompt;
+    }
 
     // Opportunistically capture the model from promptLogs (assistant turns).
     if model.is_none() {
@@ -873,6 +885,34 @@ mod tests {
     }
 
     #[test]
+    fn kind_and_origin_across_roles() {
+        let mut model = None;
+        let mk = |line: &str, model: &mut Option<String>| {
+            history_item_to_message(&serde_json::from_str::<Value>(line).unwrap(), model).unwrap()
+        };
+        let u = mk(r#"{"message":{"role":"user","content":"hi"}}"#, &mut model);
+        assert_eq!((u.kind, u.origin), (MessageKind::Prompt, Origin::Human));
+        let a = mk(r#"{"message":{"role":"assistant","content":"yo"}}"#, &mut model);
+        assert_eq!((a.kind, a.origin), (MessageKind::Reply, Origin::Model));
+        let t = mk(
+            r#"{"message":{"role":"tool","content":"out","toolCallId":"c1"}}"#,
+            &mut model,
+        );
+        assert_eq!((t.kind, t.origin), (MessageKind::ToolResult, Origin::Harness));
+        let sys = mk(r#"{"message":{"role":"system","content":"you are terse"}}"#, &mut model);
+        assert_eq!(
+            (sys.role, sys.kind, sys.origin),
+            (Role::System, MessageKind::SystemPrompt, Origin::Harness)
+        );
+        // No flat extra keys were introduced.
+        for m in [&u, &a, &t, &sys] {
+            for k in m.extra.keys() {
+                assert!(k == "continue" || k == "_record", "unexpected extra key {k}");
+            }
+        }
+    }
+
+    #[test]
     fn tool_result_message() {
         let mut model = None;
         let v: Value =
@@ -1009,6 +1049,7 @@ mod tests {
         let opts = crate::emit::EmitOptions {
             new_id: Some("emit-test-id".into()),
             new_cwd: None,
+            ..Default::default()
         };
         let res = emit(&session, &dir, &opts).unwrap();
         assert_eq!(res.new_id, "emit-test-id");

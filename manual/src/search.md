@@ -29,14 +29,16 @@ cv index --semantic   # also build semantic embeddings
 ✦ building full-text index…
 indexed 412 session(s) → /Users/you/.clustervision/tantivy
 ✦ embedding sessions (downloads a small model on first use)…
-embedded 412 session(s) → /Users/you/.clustervision/embeddings.json
+embedded 412 session(s) → /Users/you/.clustervision/embeddings.bin
 ```
 
-`cv index` discovers and parses every session from every supported harness, then
-rebuilds the full-text index from scratch (a reindex clears prior contents — it's
-a full rebuild, not an incremental update, which keeps it simple and always
-correct). Add `--semantic` to *also* compute embeddings; that step downloads a
-small embedding model (~30 MB) the first time it runs, then caches it.
+`cv index` discovers every session from every supported harness and indexes the
+ones that changed — it is **incremental** by default, re-reading only new or
+modified sessions and reaping vanished ones, so routine refreshes are cheap. Pass
+`--rebuild` to clear and rebuild from scratch. Add `--semantic` to *also* compute
+embeddings; that step downloads a small embedding model (~30 MB) the first time
+it runs, then caches it. `--subagents` folds the sub-agent/workflow forest in too
+(off by default — it can add hundreds of MB).
 
 The equivalent low-level commands on the standalone binary are:
 
@@ -61,7 +63,7 @@ Both indexes live under `$CLUSTERVISION_HOME` (default `~/.clustervision`):
 | Index            | Path                                  |
 | ---------------- | ------------------------------------- |
 | Full-text        | `~/.clustervision/tantivy/`            |
-| Semantic vectors | `~/.clustervision/embeddings.json`     |
+| Semantic vectors | `~/.clustervision/embeddings.bin`      |
 
 Set `CLUSTERVISION_HOME` to relocate them.
 
@@ -124,7 +126,6 @@ Two front doors, both backed by the embeddings store:
 
 ```sh
 cv search "formalizing proofs" --semantic   # semantic mode of the normal search
-cv recall "formalizing proofs"              # recall: ranked spans + excerpts
 cv-search semantic "formalizing proofs" -k 5
 ```
 
@@ -132,55 +133,26 @@ cv-search semantic "formalizing proofs" -k 5
 cosine similarity, and prints the same row format as full-text search. It needs
 embeddings to exist — run `cv index --semantic` first.
 
-### `cv recall` — relevant spans, not just metadata
+> **No silent degradation.** `cv search --semantic` does **not** quietly fall
+> back to keyword ranking when the embeddings store is missing: it errors and
+> tells you to run `cv index --semantic`. A result set that says "semantic" is
+> always actually semantic.
 
-`cv recall` is the meaning-search built for *re-finding context*. It returns the
-most relevant past **message spans** for a query, not just a list of session
-titles:
+### From a session row to the material you wanted
+
+`cv search` answers *which* sessions are relevant. When what you actually want is
+the **material** — the relevant past spans, compiled into something you can hand
+a fresh agent — that's [`cv pack`](pack.md), which runs the same fused full-text
++ semantic ranking and then excerpts each hit:
 
 ```sh
-cv recall "how did we handle retry backoff" -k 5
-cv recall "auth token refresh" -k 3 --harness codex
+cv pack "how did we handle retry backoff"        # a CLAUDE.md-style context bundle
+cv pack "auth token refresh" --limit 3
 ```
 
-```text
-claude    a1f3c2d9   0.812  Wiring up the HTTP client  ·  ~/proj/api
-      assistant: I added exponential backoff with jitter capped at 30s …
-      user: can we make the cap configurable?
-      assistant: yes — pulled it into RetryConfig.max_delay …
-```
-
-Under the hood, recall ranks sessions semantically, then for each hit produces a
-compact excerpt. It prefers the stored preview; if none is available it loads the
-session, finds the single message that best matches your query, and renders a
-small window (the matching message plus its neighbors) — so you get the actual
-*conversation around the relevant moment*, with role labels, rather than a bare
-metadata row.
-
-`-k` controls how many results to return (default **5**; note it's `-k`, not
-`--limit`). `--harness` filters to one harness — recall over-fetches when a
-harness filter is set so it can still fill `k` results.
-
-For the MCP version of this same capability — recall surfaced to an agent as a
-tool it can call mid-conversation — see [MCP recall](mcp.md).
-
-### Graceful degradation: semantic → keyword
-
-`cv recall` does the right thing if you never ran `cv index --semantic`. When the
-embeddings store is missing, semantic search fails cleanly and recall **falls
-back to keyword mode** automatically, printing a hint:
-
-```text
-(semantic search unavailable: …; falling back to keyword mode — run
- `cv index --semantic` for semantic recall)
-```
-
-You still get spans and excerpts — just ranked by keyword match instead of
-meaning. Build the semantic index to unlock true meaning-based recall.
-
-> Note: `cv search --semantic` is stricter — it does **not** silently degrade. If
-> there are no embeddings it errors and tells you to run `cv index --semantic`.
-> Only `cv recall` falls back to keyword.
+`pack` is where the old `cv recall` and `cv distill` went in 0.11.0: one verb for
+"build context from the corpus." It degrades honestly too — no index means a live
+scan with a stderr note, and no embeddings means full-text-only ranking.
 
 ## How semantic embeddings work
 
@@ -209,13 +181,13 @@ cv index --semantic
 | `cv index --semantic`            | Also build semantic embeddings                      | —                    |
 | `cv search <query>`              | Full-text search (BM25)                             | `--limit` (20)       |
 | `cv search <query> --semantic`   | Semantic search (no keyword fallback)               | `--limit` (20)       |
-| `cv recall <query>`              | Semantic recall → spans/excerpts (keyword fallback) | `-k` (5)             |
+| `cv pack <task>`                 | Fused ranking → relevant spans, as a context bundle | `--limit` (8)        |
 | `cv-search text <query>`         | Full-text search (standalone binary)                | `--limit` (10)       |
 | `cv-search semantic <query>`     | Semantic search (standalone binary)                 | `-k` (10)            |
 | `cv-search index` / `embed`      | Build full-text / embeddings (standalone)           | —                    |
 
 See also: [the CLI](cli.md) for the full command surface, and
-[MCP recall](mcp.md) for exposing semantic recall to agents.
+[MCP](mcp.md) for exposing search to a running agent.
 
 [tantivy]: https://github.com/quickwit-oss/tantivy
 [model2vec]: https://github.com/MinishLab/model2vec

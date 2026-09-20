@@ -9,7 +9,7 @@ hand straight to a fresh agent. 🎒
 cv pack "tantivy chunked indexing"                      # CLAUDE.md-style bundle → stdout
 cv pack "tantivy chunked indexing" --out CONTEXT.md     # …or to a file
 cv pack "fix the parser" --format prompt                # shaped as a system prompt
-cv pack "fix the parser" --format session --to claude   # a synthetic resumable session
+cv pack "fix the parser" --format session --harness claude  # a synthetic resumable session
 cv pack "migrate the daemon" --limit 3                  # draw from at most 3 past sessions
 ```
 
@@ -31,13 +31,13 @@ cv pack "migrate the daemon" --limit 3                  # draw from at most 3 pa
 3. **Emit** in the requested `--format`:
    - `md` (default) — a CLAUDE.md-style bundle: the task, one section per
      source (title, harness, date, cwd → digest, key excerpt, files touched,
-     commands run, a `cv show --range` pointer back into the transcript), and
+     commands run, a `cv show --range A..B` pointer back into the transcript), and
      a closing **"Files that keep appearing"** rollup ranked across sources.
    - `prompt` — the same content shaped as a second-person system prompt
      ("Prior context from earlier sessions: …").
-   - `session` — a synthetic, resumable session in `--to <harness>`: a user
+   - `session` — a synthetic, resumable session in `--harness <h>`: a user
      turn framing the task with the bundle, an assistant acknowledgment, then
-     emitted through the same machinery as [`cv convert`](conversion.md) — it
+     emitted through the same machinery as [`cv port --harness`](conversion.md) — it
      prints the written path and the harness's resume incantation.
 
 ## Optional LLM distillation
@@ -45,7 +45,7 @@ cv pack "migrate the daemon" --limit 3                  # draw from at most 3 pa
 Set `CV_PACK_LLM=1` (or `CV_PACK_LLM=<model-id>`) to additionally route each
 recalled span through the configured LLM provider (`OPENROUTER_API_KEY`,
 `ANTHROPIC_API_KEY`, or `LMSTUDIO_API_BASE=local` for free local inference —
-the same plumbing as `cv distill`) for an abstractive per-span digest on top of
+the plumbing that used to be `cv distill`, folded into `pack` in 0.11.0) for an abstractive per-span digest on top of
 the extractive one. Unset, `cv pack` is fully offline.
 
 ## Flags
@@ -53,6 +53,6 @@ the extractive one. Unset, `cv pack` is fully offline.
 | flag | meaning |
 |---|---|
 | `--format md\|prompt\|session` | output shape (default `md`) |
-| `--to <harness>` | target harness, required for (and exclusive to) `--format session` |
+| `--harness <h>` | target harness, for (and only for) `--format session` |
 | `--limit N` | max past sessions to draw from (default 8) |
 | `--out <path>` | write the bundle to a file instead of stdout |

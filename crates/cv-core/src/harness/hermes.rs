@@ -43,11 +43,23 @@
 //! (`_DISPLAY_ACTIVE_CLAUSE`; "timestamps are not monotonic and would break tool-call adjacency"),
 //! generation-deduped by `(role, content, timestamp, tool_call_id, tool_calls, tool_name)`. The lean
 //! passes mirror that exactly; `complete` reads every row and tags `active`/`compacted` instead. A
-//! summary row becomes a `compact_boundary` System marker + an `isCompactSummary` System message, the
-//! same shape the Claude adapter produces, so `cv compaction`/doctor see Hermes compactions too.
-//! Display sidecars (`api_content` = the verbatim provider view of a user row, `display_kind`,
-//! `display_metadata`, `effect_disposition`) ride in `extra`; harness-injected `display_kind` notices
-//! (`auto_continue`, `model_switch`, `internal_notification`, …) are System turns, not prompts.
+//! summary row becomes a [`MessageKind::CompactionBoundary`] System marker + a
+//! [`MessageKind::CompactionSummary`] System message linked to it by `parent_id` — the pair
+//! `crate::compaction` detects for every harness.
+//!
+//! Kinds (`docs/INTERFACE-V2.md` §4): a `system` row is the [`MessageKind::SystemPrompt`] (the
+//! resolved prompt is also `Session::system_prompt`); harness-stamped `display_kind` rows are System
+//! turns typed by what they are — `model_switch` → [`MessageKind::ModelChange`],
+//! `async_delegation_complete` → [`MessageKind::SubagentReturn`] (origin [`Origin::Subagent`]),
+//! `hidden` / `process_complete` / `internal_notification` / `auto_continue` →
+//! [`MessageKind::Notice`] — while a `steer` (a human's mid-turn message) stays a
+//! [`MessageKind::Prompt`]. A foreign import (`origin_json.imported_from`) gives every message
+//! [`Origin::Import`]. Lineage is first-class (`Session::lineage`: `_branched_from` → `forked_from`,
+//! `_delegate_from` → `parent`, a compression rotation → `continues` / `continued_in`); everything
+//! Hermes-specific rides in `extra["hermes"]` — the display sidecars (`api_content` = the verbatim
+//! provider view of a user row, `display_kind`, `display_metadata`, `effect_disposition`), the
+//! compaction flags, the raw reasoning columns, and the session row under
+//! `extra["hermes"]["session"]`.
 
 use super::Adapter;
 use crate::ir::*;
@@ -62,21 +74,18 @@ use std::path::PathBuf;
 
 const MULTIMODAL_SENTINEL: &str = "\u{0}json:";
 
-/// `Message.extra` keys under which the parser stashes the raw `reasoning` / `reasoning_content`
-/// source columns verbatim (the folded `Thinking.text` projection is lossy — it merges and dedups
-/// across columns — so the originals are kept here for a lossless emit round-trip). Public so
-/// `emit_hermes` can read them back.
-pub const RAW_REASONING_KEY: &str = "hermes_reasoning";
-pub const RAW_REASONING_CONTENT_KEY: &str = "hermes_reasoning_content";
+/// Keys inside a message's `extra["hermes"]` bag under which the parser stashes the raw `reasoning`
+/// / `reasoning_content` source columns verbatim (the folded `Thinking.text` projection is lossy —
+/// it merges and dedups across columns — so the originals are kept here for a lossless emit
+/// round-trip). Named after the columns. Public so `emit_hermes` can read them back.
+pub const RAW_REASONING_KEY: &str = "reasoning";
+pub const RAW_REASONING_CONTENT_KEY: &str = "reasoning_content";
 
-/// `Session.extra` key under which the parser stashes the per-session columns that have no
-/// first-class IR home (`source`, `user_id`, `model_config`, `system_prompt`, `end_reason`, the
-/// aggregate token counters, …) so `emit_hermes` can write them back. A single namespaced object so
-/// it never collides with other session-level extra keys. `parent_session_id` is intentionally NOT
-/// stored: parse FLATTENS a parent→child lineage into one transcript, so the surviving IR session is
-/// the tip with no parent of its own; round-tripping the chain structure is out of scope (see
-/// caveats).
-pub const SESSION_META_KEY: &str = "hermes_session";
+/// Key inside the session's `extra["hermes"]` bag holding the per-session columns that have no
+/// first-class IR home (`source`, `user_id`, `model_config`, `end_reason`, the aggregate token
+/// counters, the listing flags, …) so `emit_hermes` can write them back. The system prompt is NOT
+/// here (it is `Session::system_prompt`), nor is lineage (`Session::lineage`).
+pub const SESSION_META_KEY: &str = "session";
 
 /// Optional `messages` columns that older schemas may lack. We probe for each before SELECTing.
 const OPTIONAL_MSG_COLS: &[&str] = &[
@@ -100,24 +109,26 @@ const OPTIONAL_MSG_COLS: &[&str] = &[
     "display_metadata",
 ];
 
-/// `display_kind` values Hermes stamps on rows IT injected (not typed by the human): a hidden
-/// compaction handoff, auto-continue nudges, model-switch / delegation / process notices. They read
-/// as System turns so titles, first-prompt previews and turn counts stay honest; `steer` (a human
-/// mid-turn steer) keeps its user role.
-const HARNESS_DISPLAY_KINDS: &[&str] = &[
-    "hidden",
-    "auto_continue",
-    "model_switch",
-    "async_delegation_complete",
-    "process_complete",
-    "internal_notification",
-];
+/// What a `display_kind` Hermes stamped on a row IT injected (not typed by the human) makes the
+/// turn: a hidden compaction handoff / diagnostic, auto-continue nudges and process notices are
+/// notices; a model switch is a [`MessageKind::ModelChange`]; a delegation delivery is the
+/// sub-agent's return. All read as System turns so titles, first-prompt previews and turn counts
+/// stay honest. `None` for `steer` (a human mid-turn message: a prompt) and for kinds Hermes has
+/// not documented (`personality_switch`, …), which keep their row role and carry the kind in
+/// `extra["hermes"]["display_kind"]` only.
+fn harness_display_kind(display_kind: &str) -> Option<(MessageKind, Origin)> {
+    match display_kind {
+        "model_switch" => Some((MessageKind::ModelChange, Origin::Harness)),
+        "async_delegation_complete" => Some((MessageKind::SubagentReturn, Origin::Subagent)),
+        "hidden" | "auto_continue" | "process_complete" | "internal_notification" => {
+            Some((MessageKind::Notice, Origin::Harness))
+        }
+        _ => None,
+    }
+}
 
-/// `Session.extra` key holding this session's lineage facts: the `model_config` markers
-/// (`_branched_from` / `_reset_from` / `_delegate_from`, `hermes_state_common.py:151-216`) and its
-/// `parent_session_id` when the parent was NOT merged into this transcript (branch/reset/delegate
-/// children, or a parent that did not end in compression).
-pub const LINEAGE_KEY: &str = "hermes_lineage";
+/// The `model_config` lineage markers (`_branched_from` / `_reset_from` / `_delegate_from`,
+/// `hermes_state_common.py:151-216`).
 const LINEAGE_MARKERS: &[&str] = &["_branched_from", "_reset_from", "_delegate_from"];
 
 /// The `model_config` JSON lineage markers present on a session row, if any.
@@ -381,9 +392,7 @@ fn discover_conn(conn: &Connection, path: &Path) -> Result<Vec<SessionRef>> {
 /// `title` NULL). Given a root→tip `chain` (see [`session_lineage_root_to_tip`]), the nearest titled
 /// ancestor, root first; `None` for a chain of one.
 fn inherited_title(conn: &Connection, chain: &[String]) -> Option<String> {
-    let Some((_, ancestors)) = chain.split_last() else {
-        return None;
-    };
+    let (_, ancestors) = chain.split_last()?;
     ancestors.iter().find_map(|id| {
         conn.query_row("SELECT title FROM sessions WHERE id = ?1", [id], |row| {
             row.get::<_, Option<String>>(0)
@@ -394,15 +403,15 @@ fn inherited_title(conn: &Connection, chain: &[String]) -> Option<String> {
     })
 }
 
-/// Per-session columns with no first-class IR home. Captured into `Session.extra[SESSION_META_KEY]`
-/// on parse and written back by `emit_hermes`, so the round-trip loses no session-row data. Text
-/// columns map to JSON strings; the aggregate counters to JSON numbers (see [`SESSION_META_INT_COLS`]).
-/// `source` / `end_reason` are read by the metadata SELECT already and passed in (so we don't re-probe
-/// them); everything here is probed independently to stay graceful on older schemas.
+/// Per-session columns with no first-class IR home. Captured into
+/// `Session.extra["hermes"][SESSION_META_KEY]` on parse and written back by `emit_hermes`, so the
+/// round-trip loses no session-row data. Text columns map to JSON strings; the aggregate counters to
+/// JSON numbers (see [`SESSION_META_INT_COLS`]). `source` / `end_reason` are read by the metadata
+/// SELECT already and passed in (so we don't re-probe them); everything here is probed independently
+/// to stay graceful on older schemas. `system_prompt` is not here: it is `Session::system_prompt`.
 const SESSION_META_TEXT_COLS: &[&str] = &[
     "user_id",
     "model_config",
-    "system_prompt",
     // v11+: where the transcript came from and how it is labelled/routed.
     "display_name",
     "origin_json",
@@ -424,14 +433,19 @@ const SESSION_META_INT_COLS: &[&str] = &[
     "reasoning_tokens",
 ];
 
-/// Collect the dropped per-session columns into a namespaced extra object (empty if none present).
-/// `source` / `end_reason` come pre-read from the metadata SELECT; the rest are probed here.
-fn read_session_extra(
-    conn: &Connection,
-    id: &str,
-    source: Option<&str>,
-    end_reason: Option<&str>,
-) -> serde_json::Map<String, Value> {
+/// Session-level facts read from the `sessions` row beyond the first-class columns: the contents of
+/// the session's `extra["hermes"]` bag (the dropped columns under [`SESSION_META_KEY`], the
+/// importer's `imported_from`), the resolved system prompt, and whether the transcript is a foreign
+/// import (which makes every message's origin [`Origin::Import`]).
+struct SessionFacts {
+    bag: serde_json::Map<String, Value>,
+    system_prompt: Option<String>,
+    imported: bool,
+}
+
+/// Read the [`SessionFacts`] for `id`. `source` / `end_reason` come pre-read from the metadata
+/// SELECT; the rest are probed here.
+fn read_session_facts(conn: &Connection, id: &str, source: Option<&str>, end_reason: Option<&str>) -> SessionFacts {
     let mut meta = serde_json::Map::new();
     if let Some(s) = source.filter(|s| !s.is_empty()) {
         meta.insert("source".into(), Value::String(s.to_string()));
@@ -470,43 +484,80 @@ fn read_session_extra(
             meta.insert((*col).into(), Value::Number(v.into()));
         }
     }
-    // Schema v25 hollowed `sessions.system_prompt` out into `system_prompts(hash, prompt)` keyed by
-    // `system_prompt_hash` (`hermes_state_schema.py:180-199`); Hermes reads
-    // `COALESCE(sp.prompt, s.system_prompt)`. Same key as before, so emit round-trips it unchanged.
-    if !meta.contains_key("system_prompt")
-        && session_has_col(conn, "system_prompt_hash")
-        && table_exists(conn, "system_prompts")
-    {
-        let v: Option<String> = conn
-            .query_row(
-                "SELECT sp.prompt FROM sessions s JOIN system_prompts sp ON sp.hash = s.system_prompt_hash \
-                 WHERE s.id = ?1",
-                [id],
-                |row| row.get::<_, Option<String>>(0),
-            )
+    // The system prompt: schema v25 hollowed `sessions.system_prompt` out into
+    // `system_prompts(hash, prompt)` keyed by `system_prompt_hash` (`hermes_state_schema.py:180-199`);
+    // Hermes reads `COALESCE(sp.prompt, s.system_prompt)`, so the table wins and the legacy column is
+    // the fallback for a store an older Hermes wrote.
+    let str_col = |sql: &str| -> Option<String> {
+        conn.query_row(sql, [id], |row| row.get::<_, Option<String>>(0))
             .ok()
-            .flatten();
-        if let Some(v) = v.filter(|s| !s.is_empty()) {
-            meta.insert("system_prompt".into(), Value::String(v));
-        }
+            .flatten()
+            .filter(|s| !s.is_empty())
+    };
+    let mut system_prompt = None;
+    if session_has_col(conn, "system_prompt_hash") && table_exists(conn, "system_prompts") {
+        system_prompt = str_col(
+            "SELECT sp.prompt FROM sessions s JOIN system_prompts sp ON sp.hash = s.system_prompt_hash \
+             WHERE s.id = ?1",
+        );
     }
-    let mut out = serde_json::Map::new();
+    if system_prompt.is_none() && session_has_col(conn, "system_prompt") {
+        system_prompt = str_col("SELECT system_prompt FROM sessions WHERE id = ?1");
+    }
+    let mut bag = serde_json::Map::new();
     // A foreign import (`hermes sessions import --from claude|codex`, `hermes_cli/foreign_sessions.py`)
     // records its provenance in `origin_json.imported_from{tool, path, foreign_session_id}` — the
-    // very transcript cv also parses natively. Surface it top-level so consumers can dedupe.
-    if let Some(imported) = meta
+    // very transcript cv also parses natively. Surface it in the bag so consumers can dedupe; the
+    // messages themselves carry `Origin::Import`.
+    let imported_from = meta
         .get("origin_json")
         .and_then(Value::as_str)
         .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
         .and_then(|origin| origin.get("imported_from").cloned())
-        .filter(Value::is_object)
-    {
-        out.insert("imported_from".into(), imported);
+        .filter(Value::is_object);
+    let imported = imported_from.is_some();
+    if let Some(imported_from) = imported_from {
+        bag.insert("imported_from".into(), imported_from);
     }
     if !meta.is_empty() {
-        out.insert(SESSION_META_KEY.into(), Value::Object(meta));
+        bag.insert(SESSION_META_KEY.into(), Value::Object(meta));
     }
-    out
+    SessionFacts {
+        bag,
+        system_prompt,
+        imported,
+    }
+}
+
+/// The compression continuation of `id`, if any: the child whose `parent_session_id` is `id` and
+/// that carries no branch / reset / delegate marker (`_COMPRESSION_CHILD_SQL`). Only meaningful for
+/// a session that ended in compression; `None` when the store does not say.
+fn compression_child(conn: &Connection, id: &str) -> Option<String> {
+    if !session_has_col(conn, "parent_session_id") {
+        return None;
+    }
+    let model_config = if session_has_col(conn, "model_config") {
+        "model_config"
+    } else {
+        "NULL"
+    };
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT id, {model_config} FROM sessions WHERE parent_session_id = ?1 ORDER BY started_at ASC"
+        ))
+        .ok()?;
+    let rows = stmt
+        .query_map([id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1).ok().flatten()))
+        })
+        .ok()?;
+    // Not a tail expression: `rows` borrows `stmt`, which must drop before the return.
+    #[allow(clippy::let_and_return)]
+    let found = rows
+        .flatten()
+        .find(|(_, mc)| lineage_markers(mc.as_deref()).is_empty())
+        .map(|(child, _)| child);
+    found
 }
 
 fn stream_conn(conn: &Connection, r: &SessionRef, opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
@@ -553,24 +604,53 @@ fn stream_conn(conn: &Connection, r: &SessionRef, opts: &ParseOptions, sink: &mu
     // Format-complete: capture the session columns that have no first-class IR home, so emit can
     // write them back (small metadata only — text/aggregate counters, never message bodies). The tip
     // session's row is the one whose metadata survives (lineage flattening keeps the tip).
-    let mut extra = read_session_extra(conn, &r.id, source.as_deref(), end_reason.as_deref());
+    let SessionFacts {
+        bag: mut hermes_bag,
+        system_prompt,
+        imported,
+    } = read_session_facts(conn, &r.id, source.as_deref(), end_reason.as_deref());
+    // A foreign import: every message of the session came through the importer.
+    let session_origin = imported.then_some(Origin::Import);
 
     // Walk the compression lineage root→tip so a compressed-and-continued conversation reads as a
     // single transcript (mirrors `_resume_lineage_ids`); branches/resets/delegates stand alone.
-    let lineage = if has_parent {
+    let chain = if has_parent {
         session_lineage_root_to_tip(conn, &r.id)
     } else {
         vec![r.id.clone()]
     };
-    // Lineage facts: the `model_config` markers, plus the parent when it was NOT merged in.
-    let mut lin = lineage_markers(model_config.as_deref());
-    if lineage.len() == 1 {
+    // Lineage, first-class: a `/branch` copy points at what it was branched from, a delegate run at
+    // the session that spawned it, a compression rotation at the session it continues (whose rows
+    // are merged into this transcript) and — for a session that ended in compression — at the
+    // session that continued it. `_reset_from` (a fresh conversation after `/new`; nothing carried
+    // over) has no IR field and stays a Hermes fact, as does an unmarked parent that was not merged.
+    let markers = lineage_markers(model_config.as_deref());
+    let marker = |k: &str| markers.get(k).and_then(Value::as_str).map(str::to_string);
+    let mut lineage = Lineage {
+        forked_from: marker("_branched_from"),
+        parent: marker("_delegate_from"),
+        ..Default::default()
+    };
+    if chain.len() > 1 {
+        lineage.continues = chain.get(chain.len() - 2).cloned();
+    }
+    if matches!(
+        end_reason.as_deref(),
+        Some("compression") | Some("orphaned_compression")
+    ) {
+        lineage.continued_in = compression_child(conn, &r.id);
+    }
+    if let Some(reset) = marker("_reset_from") {
+        hermes_bag.insert("_reset_from".into(), Value::String(reset));
+    }
+    if chain.len() == 1 && markers.is_empty() {
         if let Some(p) = parent.filter(|p| !p.is_empty()) {
-            lin.insert("parent_session_id".into(), Value::String(p));
+            hermes_bag.insert("parent_session_id".into(), Value::String(p));
         }
     }
-    if !lin.is_empty() {
-        extra.insert(LINEAGE_KEY.into(), Value::Object(lin));
+    let mut extra = serde_json::Map::new();
+    if !hermes_bag.is_empty() {
+        extra.insert(Harness::Hermes.as_str().into(), Value::Object(hermes_bag));
     }
 
     let s = Session {
@@ -583,7 +663,7 @@ fn stream_conn(conn: &Connection, r: &SessionRef, opts: &ParseOptions, sink: &mu
         title: title
             .filter(|t| !t.is_empty())
             .or_else(|| r.title.clone())
-            .or_else(|| inherited_title(conn, &lineage)),
+            .or_else(|| inherited_title(conn, &chain)),
         created_at: started.and_then(secs_to_dt).or(r.created_at),
         updated_at: latest_of([ended, last_activity, started]).or(r.updated_at),
         model,
@@ -594,8 +674,8 @@ fn stream_conn(conn: &Connection, r: &SessionRef, opts: &ParseOptions, sink: &mu
         messages: Vec::new(),
         source_path: Some(r.path.clone()),
         extra,
-        system_prompt: None,
-        lineage: crate::ir::Lineage::default(),
+        system_prompt,
+        lineage,
     };
 
     let cols = present_msg_cols(conn);
@@ -640,7 +720,7 @@ fn stream_conn(conn: &Connection, r: &SessionRef, opts: &ParseOptions, sink: &mu
     // look-back (the trailing run of user single-texts since the last substantive assistant turn),
     // not the whole transcript, so peak stays O(one message).
     let mut dedup = ReplayDedup::default();
-    'lineage: for sid in &lineage {
+    'lineage: for sid in &chain {
         // `ORDER BY id`, as Hermes itself reads (`_ACTIVE_IDS_SQL`, `_fetch_conversation_rows`):
         // timestamps are not monotonic and would split a tool call from its result.
         let sql = format!("SELECT {select_list} FROM messages WHERE session_id = ?1{visibility} ORDER BY id ASC");
@@ -688,21 +768,20 @@ fn stream_conn(conn: &Connection, r: &SessionRef, opts: &ParseOptions, sink: &mu
                 continue;
             }
             let row_id = row.id;
-            let Some(mut m) = row.into_message() else { continue };
+            let Some(mut m) = row.into_message(session_origin) else {
+                continue;
+            };
             // A compaction summary row: emit the boundary marker first, then the summary linked to
-            // it — the same two-message shape the Claude adapter yields for `compact_boundary` +
-            // `isCompactSummary`, which `crate::compaction` pairs by parent id.
-            if m.extra.get("isCompactSummary").and_then(Value::as_bool) == Some(true) {
+            // it by `parent_id` — the `CompactionBoundary` + `CompactionSummary` pair
+            // `crate::compaction` detects for every harness.
+            if m.kind == MessageKind::CompactionSummary {
                 let boundary_id = format!("compact-{row_id}");
-                let mut boundary = Message::new(Role::System);
+                let mut boundary = Message::of_kind(Role::System, MessageKind::CompactionBoundary, m.origin);
                 boundary.id = Some(boundary_id.clone());
                 boundary.timestamp = m.timestamp;
                 boundary.content.push(Block::Text {
                     text: "[conversation compacted]".to_string().into(),
                 });
-                boundary
-                    .extra
-                    .insert("subtype".into(), Value::String("compact_boundary".into()));
                 if sink.message(boundary) == Flow::Stop {
                     break 'lineage;
                 }
@@ -883,59 +962,63 @@ impl MsgRow {
         h.finish()
     }
 
-    fn into_message(self) -> Option<Message> {
-        let mut role = match self.role.as_str() {
-            "user" => Role::User,
-            "assistant" => Role::Assistant,
-            "tool" => Role::Tool,
-            "system" => Role::System,
-            _ => Role::User,
+    /// The IR message for this row. `session_origin` overrides every message's origin when the
+    /// session as a whole came from somewhere else (a foreign import).
+    fn into_message(self, session_origin: Option<Origin>) -> Option<Message> {
+        let (mut role, mut kind, mut origin) = match self.role.as_str() {
+            "assistant" => (Role::Assistant, MessageKind::Reply, Origin::Model),
+            "tool" => (Role::Tool, MessageKind::ToolResult, Origin::Harness),
+            // The system prompt, stored as a row (older Hermes; `Session::system_prompt` today).
+            "system" => (Role::System, MessageKind::SystemPrompt, Origin::Harness),
+            // `user`, and anything unknown.
+            _ => (Role::User, MessageKind::Prompt, Origin::Human),
         };
-        // Harness-injected user rows (a hidden compaction handoff, auto-continue nudges, model-switch
-        // / delegation / process notices) are System turns, not prompts.
-        if role == Role::User
-            && self
-                .display_kind
-                .as_deref()
-                .is_some_and(|k| HARNESS_DISPLAY_KINDS.contains(&k))
-        {
+        // Harness-injected rows (a hidden compaction handoff, auto-continue nudges, model-switch /
+        // delegation / process notices) are System turns typed by what they are, never prompts.
+        if let Some((k, o)) = self.display_kind.as_deref().and_then(harness_display_kind) {
             role = Role::System;
+            kind = k;
+            origin = o;
         }
         // A compaction summary is what seeds the next context window: never a human prompt.
         if self.compressed_summary {
             role = Role::System;
+            kind = MessageKind::CompactionSummary;
+            origin = Origin::Harness;
         }
-        let mut m = Message::new(role);
+        if let Some(o) = session_origin {
+            origin = o;
+        }
+        let mut m = Message::of_kind(role, kind, origin);
         m.timestamp = self.timestamp.and_then(secs_to_dt);
+
+        // Everything Hermes-specific goes in the `extra["hermes"]` bag, built here and attached once.
+        let mut bag = serde_json::Map::new();
 
         // In-place compaction / rewind flags (non-default values only, so old-schema rows carry
         // nothing): `compacted` = summarized away but still displayed history; `active = false`
         // alone = a rewound or superseded row (only reachable under `complete`).
         if matches!(self.compacted, Some(c) if c != 0) {
-            m.extra.insert("compacted".into(), Value::Bool(true));
+            bag.insert("compacted".into(), Value::Bool(true));
         }
         if matches!(self.active, Some(0)) {
-            m.extra.insert("active".into(), Value::Bool(false));
-        }
-        if self.compressed_summary {
-            m.extra.insert("isCompactSummary".into(), Value::Bool(true));
+            bag.insert("active".into(), Value::Bool(false));
         }
         if let Some(k) = self.display_kind.as_deref().filter(|s| !s.is_empty()) {
-            m.extra.insert("display_kind".into(), Value::String(k.to_string()));
+            bag.insert("display_kind".into(), Value::String(k.to_string()));
         }
         if let Some(ed) = self.effect_disposition.as_deref().filter(|s| !s.is_empty()) {
-            m.extra
-                .insert("effect_disposition".into(), Value::String(ed.to_string()));
+            bag.insert("effect_disposition".into(), Value::String(ed.to_string()));
         }
         // `api_content`: the verbatim provider view of this (user) row — what was actually sent, when
         // it differs from the displayed `content` (e.g. injected context). Kept as a sidecar so the
         // block text stays the user's own words.
         if let Some(api) = self.api_content.as_deref().filter(|s| !s.is_empty()) {
-            m.extra.insert("api_content".into(), Value::String(api.to_string()));
+            bag.insert("api_content".into(), Value::String(api.to_string()));
         }
         if let Some(raw) = self.display_metadata.as_deref().filter(|s| !s.is_empty()) {
             let v = serde_json::from_str::<Value>(raw).unwrap_or_else(|_| Value::String(raw.to_string()));
-            m.extra.insert("display_metadata".into(), v);
+            bag.insert("display_metadata".into(), v);
         }
 
         // Per-message token_count → Usage. Hermes records a single combined count per message; we
@@ -953,13 +1036,13 @@ impl MsgRow {
         }
 
         if let Some(fr) = self.finish_reason.filter(|s| !s.is_empty()) {
-            m.extra.insert("finish_reason".into(), Value::String(fr));
+            bag.insert("finish_reason".into(), Value::String(fr));
         }
         if let Some(pmid) = self.platform_message_id.filter(|s| !s.is_empty()) {
-            m.extra.insert("platform_message_id".into(), Value::String(pmid));
+            bag.insert("platform_message_id".into(), Value::String(pmid));
         }
         if matches!(self.observed, Some(o) if o != 0) {
-            m.extra.insert("observed".into(), Value::Bool(true));
+            bag.insert("observed".into(), Value::Bool(true));
         }
 
         // Format-complete capture: keep the raw reasoning source columns verbatim so a parse→emit
@@ -970,11 +1053,10 @@ impl MsgRow {
         // (summaries / encrypted handles), never large tool payloads. `reasoning_details` /
         // `codex_*` are already stashed (as parsed JSON) further down.
         if let Some(r) = self.reasoning.as_deref().filter(|s| !s.is_empty()) {
-            m.extra.insert(RAW_REASONING_KEY.into(), Value::String(r.to_string()));
+            bag.insert(RAW_REASONING_KEY.into(), Value::String(r.to_string()));
         }
         if let Some(r) = self.reasoning_content.as_deref().filter(|s| !s.is_empty()) {
-            m.extra
-                .insert(RAW_REASONING_CONTENT_KEY.into(), Value::String(r.to_string()));
+            bag.insert(RAW_REASONING_CONTENT_KEY.into(), Value::String(r.to_string()));
         }
 
         // Reasoning: combine summary text from `reasoning`, `reasoning_content`, and the text
@@ -1008,18 +1090,18 @@ impl MsgRow {
             encrypted = encrypted.or(enc);
             // Preserve the full structured blob for lossless round-tripping.
             if let Ok(v) = serde_json::from_str::<Value>(raw) {
-                m.extra.insert("reasoning_details".into(), v);
+                bag.insert("reasoning_details".into(), v);
             }
         }
         if let Some(raw) = self.codex_reasoning_items.as_deref() {
             encrypted = encrypted.or_else(|| extract_codex_encrypted(raw));
             if let Ok(v) = serde_json::from_str::<Value>(raw) {
-                m.extra.insert("codex_reasoning_items".into(), v);
+                bag.insert("codex_reasoning_items".into(), v);
             }
         }
         if let Some(raw) = self.codex_message_items.as_deref() {
             if let Ok(v) = serde_json::from_str::<Value>(raw) {
-                m.extra.insert("codex_message_items".into(), v);
+                bag.insert("codex_message_items".into(), v);
             }
         }
         if !reasoning_text.is_empty() || encrypted.is_some() {
@@ -1030,22 +1112,21 @@ impl MsgRow {
                 redacted: false,
             });
         }
+        if !bag.is_empty() {
+            *m.harness_extra_mut(Harness::Hermes) = bag;
+        }
 
-        // tool result rows carry the output in `content`
+        // Tool result rows carry the output in `content`; the tool's name is the block's.
         if role == Role::Tool {
             m.content.push(Block::ToolResult {
                 tool_use_id: self.tool_call_id.unwrap_or_default(),
                 content: self.content.unwrap_or_default().into(),
                 is_error: false,
-                tool_name: self.tool_name.clone(),
+                tool_name: self.tool_name,
                 status: None,
                 details: None,
             });
-            // attach tool name for context if present
-            if let Some(name) = self.tool_name {
-                m.extra.insert("tool_name".into(), Value::String(name));
-            }
-            return (!m.content.is_empty()).then_some(m);
+            return Some(m);
         }
 
         // text / multimodal content
@@ -1302,6 +1383,38 @@ mod tests {
         conn
     }
 
+    /// A message's `extra["hermes"]` bag (the only place a Hermes message fact may live).
+    fn bag(m: &Message) -> &serde_json::Map<String, Value> {
+        m.harness_extra(Harness::Hermes).expect("extra[\"hermes\"]")
+    }
+
+    /// The session-row facts, `extra["hermes"]["session"]`.
+    fn smeta(s: &Session) -> &Value {
+        &s.harness_extra(Harness::Hermes).expect("extra[\"hermes\"]")[SESSION_META_KEY]
+    }
+
+    /// Every `extra` key, on the session and on each message, is `hermes` (or the carrier's
+    /// `_record`): no flat harness keys anywhere.
+    /// The shared IR-v2 nesting invariant ([`crate::harness::assert_no_flat_keys`]), tightened for
+    /// Hermes: the only namespace a Hermes session may carry is `hermes` (plus cv's own `cv` bag
+    /// and the `_record` carrier), so a fact leaking into some other harness's bag also fails.
+    fn assert_nested_extra(s: &Session) {
+        crate::harness::assert_no_flat_keys(s);
+        let allowed = |k: &str| {
+            k == Harness::Hermes.as_str()
+                || k == crate::harness::CV_NAMESPACE
+                || k == crate::harness::claude::CARRIER_KEY
+        };
+        for k in s.extra.keys() {
+            assert!(allowed(k), "flat session extra key {k:?}");
+        }
+        for (i, m) in s.messages.iter().enumerate() {
+            for k in m.extra.keys() {
+                assert!(allowed(k), "flat extra key {k:?} on message {i}");
+            }
+        }
+    }
+
     fn sref(id: &str) -> SessionRef {
         SessionRef {
             id: id.into(),
@@ -1350,13 +1463,53 @@ mod tests {
         let s = parse_conn(&conn, &sref("s1")).unwrap();
         assert_eq!(s.messages.len(), 2);
         assert_eq!(s.messages[0].role, Role::User);
+        assert_eq!(
+            (s.messages[0].kind, s.messages[0].origin),
+            (MessageKind::Prompt, Origin::Human)
+        );
         assert_eq!(s.messages[0].text().as_deref(), Some("Hello"));
         assert_eq!(s.messages[1].role, Role::Assistant);
+        assert_eq!(
+            (s.messages[1].kind, s.messages[1].origin),
+            (MessageKind::Reply, Origin::Model)
+        );
         assert_eq!(s.messages[1].text().as_deref(), Some("Hi there!"));
         // token_count → Usage.output_tokens for assistant.
         assert_eq!(s.messages[1].usage.as_ref().unwrap().output_tokens, Some(42));
-        assert_eq!(s.messages[1].extra.get("finish_reason").unwrap(), "stop");
+        assert_eq!(bag(&s.messages[1])["finish_reason"], "stop");
         assert_eq!(s.model.as_deref(), Some("nous/hermes-4"));
+        assert!(s.messages[0].extra.is_empty(), "a plain prompt carries no Hermes facts");
+        assert_nested_extra(&s);
+    }
+
+    #[test]
+    fn system_row_is_the_system_prompt() {
+        // Older Hermes stored the system prompt as a `system` row; it is `SystemPrompt`, not a notice,
+        // and the session-level copy comes from the column.
+        let conn = mk_conn(SCHEMA_V14);
+        conn.execute(
+            "INSERT INTO sessions (id, source, started_at, system_prompt) VALUES ('s', 'cli', 1000.0, 'You are Hermes')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, timestamp) VALUES ('s','system','You are Hermes',1000.5)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, timestamp) VALUES ('s','user','hi',1001.0)",
+            [],
+        )
+        .unwrap();
+        let s = parse_conn(&conn, &sref("s")).unwrap();
+        assert_eq!(s.system_prompt.as_deref(), Some("You are Hermes"));
+        assert_eq!(s.messages[0].role, Role::System);
+        assert_eq!(
+            (s.messages[0].kind, s.messages[0].origin),
+            (MessageKind::SystemPrompt, Origin::Harness)
+        );
+        assert_eq!(s.messages[1].kind, MessageKind::Prompt);
     }
 
     #[test]
@@ -1430,8 +1583,16 @@ mod tests {
             assert_eq!(input.get("q").and_then(Value::as_str), Some("x"));
         }
         let tr = &s.messages[1].content[0];
-        assert!(matches!(tr, Block::ToolResult { tool_use_id, .. } if tool_use_id == "c1"));
-        assert_eq!(s.messages[1].extra.get("tool_name").unwrap(), "web_search");
+        assert!(
+            matches!(tr, Block::ToolResult { tool_use_id, tool_name, .. } if tool_use_id == "c1" && tool_name.as_deref() == Some("web_search")),
+            "the tool name lives on the block, not in extra"
+        );
+        assert_eq!(s.messages[1].role, Role::Tool);
+        assert_eq!(
+            (s.messages[1].kind, s.messages[1].origin),
+            (MessageKind::ToolResult, Origin::Harness)
+        );
+        assert!(s.messages[1].extra.is_empty());
     }
 
     #[test]
@@ -1457,8 +1618,12 @@ mod tests {
         assert!(think.0.contains("native scratchpad"));
         assert!(think.0.contains("summarised"));
         assert_eq!(think.1.as_deref(), Some("ENC123"));
-        // structured blob preserved in extra
-        assert!(s.messages[0].extra.contains_key("reasoning_details"));
+        // structured blob and the raw source columns preserved in the Hermes bag
+        let b = bag(&s.messages[0]);
+        assert!(b.contains_key("reasoning_details"));
+        assert_eq!(b[RAW_REASONING_KEY], "short summary");
+        assert_eq!(b[RAW_REASONING_CONTENT_KEY], "native scratchpad");
+        assert_nested_extra(&s);
     }
 
     #[test]
@@ -1501,8 +1666,8 @@ mod tests {
             _ => None,
         });
         assert_eq!(enc.as_deref(), Some("BLOB"));
-        assert!(s.messages[0].extra.contains_key("codex_reasoning_items"));
-        assert!(s.messages[0].extra.contains_key("codex_message_items"));
+        assert!(bag(&s.messages[0]).contains_key("codex_reasoning_items"));
+        assert!(bag(&s.messages[0]).contains_key("codex_message_items"));
     }
 
     #[test]
@@ -1516,8 +1681,8 @@ mod tests {
         )
         .unwrap();
         let s = parse_conn(&conn, &sref("s1")).unwrap();
-        assert_eq!(s.messages[0].extra.get("platform_message_id").unwrap(), "abc-123");
-        assert_eq!(s.messages[0].extra.get("observed").unwrap(), &Value::Bool(true));
+        assert_eq!(bag(&s.messages[0])["platform_message_id"], "abc-123");
+        assert_eq!(bag(&s.messages[0])["observed"], Value::Bool(true));
     }
 
     #[test]
@@ -1644,6 +1809,12 @@ mod tests {
 
     /// Schema v30 (2026-09, `hermes_state_common.py:239`): the v14 tables plus the in-place
     /// compaction flags, display sidecars, `system_prompts`, cwd/git columns and listing flags.
+    ///
+    /// A *subset* of the real schema 30 — column ORDER and types match
+    /// `tests/fixtures/hermes/state-v30.db` (`sqlite3 … '.schema sessions'`), but the gateway,
+    /// billing, handoff and compression-cooldown columns the adapter never reads are omitted.
+    /// Every column this adapter SELECTs or a test INSERTs must be here; add it in its real
+    /// position when one is missing.
     const SCHEMA_V30: &str = "
         CREATE TABLE system_prompts (hash TEXT PRIMARY KEY, prompt TEXT NOT NULL);
         CREATE TABLE sessions (
@@ -1651,6 +1822,10 @@ mod tests {
             source TEXT NOT NULL,
             user_id TEXT,
             display_name TEXT,
+            -- Provenance of an imported session (`hermes sessions import` writes
+            -- `origin_json.imported_from`); real schema 30 puts it right here, after
+            -- `display_name` — verified against tests/fixtures/hermes/state-v30.db.
+            origin_json TEXT,
             model TEXT,
             model_config TEXT,
             system_prompt TEXT,
@@ -1768,33 +1943,37 @@ mod tests {
             !texts(&s).contains(&"typo".to_string()),
             "rewound rows are not displayed"
         );
-        assert_eq!(s.messages[0].extra.get("compacted"), Some(&Value::Bool(true)));
+        assert_eq!(bag(&s.messages[0])["compacted"], Value::Bool(true));
         assert_eq!(s.messages[0].role, Role::User, "summarized-away history keeps its role");
+        assert_eq!(s.messages[0].kind, MessageKind::Prompt);
         let boundary = &s.messages[3];
         assert_eq!(boundary.role, Role::System);
         assert_eq!(
-            boundary.extra.get("subtype").and_then(Value::as_str),
-            Some("compact_boundary")
+            (boundary.kind, boundary.origin),
+            (MessageKind::CompactionBoundary, Origin::Harness)
         );
+        assert!(boundary.extra.is_empty(), "the boundary is its kind; no flat subtype");
         let summary = &s.messages[4];
         assert_eq!(summary.role, Role::System);
-        assert_eq!(summary.extra.get("isCompactSummary"), Some(&Value::Bool(true)));
-        assert_eq!(summary.parent_id, boundary.id, "summary links to its boundary");
         assert_eq!(
-            summary.extra.get("display_kind").and_then(Value::as_str),
-            Some("hidden")
+            (summary.kind, summary.origin),
+            (MessageKind::CompactionSummary, Origin::Harness)
         );
+        assert_eq!(summary.parent_id, boundary.id, "summary links to its boundary");
+        assert_eq!(bag(summary)["display_kind"], "hidden");
+        assert!(!bag(summary).contains_key("isCompactSummary"), "the kind carries it");
         // the shared detector sees one compaction with its summary
         let found = crate::compaction::detect_in_session(&s, true);
         assert_eq!(found.len(), 1);
         assert!(found[0].summary.as_deref().is_some_and(|t| t.contains("earlier turns")));
+        assert_nested_extra(&s);
 
         // Complete: every row, flags tagged, no dedup.
         let c = parse_conn_with(&conn, &sref("s"), &ParseOptions::complete()).unwrap();
         assert_eq!(c.messages.len(), 8, "7 rows + 1 boundary marker");
         let typo = c.messages.iter().find(|m| m.text().as_deref() == Some("typo")).unwrap();
-        assert_eq!(typo.extra.get("active"), Some(&Value::Bool(false)));
-        assert!(!typo.extra.contains_key("compacted"));
+        assert_eq!(bag(typo)["active"], Value::Bool(false));
+        assert!(!bag(typo).contains_key("compacted"));
         assert_eq!(
             c.messages.iter().filter(|m| m.text().as_deref() == Some("q2")).count(),
             2
@@ -1817,7 +1996,11 @@ mod tests {
         .unwrap();
         insert_v30(&conn, "s", "user", "hi", 1001.0, 1, 0);
         let s = parse_conn(&conn, &sref("s")).unwrap();
-        assert_eq!(s.extra[SESSION_META_KEY]["system_prompt"], "You are Hermes");
+        assert_eq!(s.system_prompt.as_deref(), Some("You are Hermes"));
+        assert!(
+            !smeta(&s).as_object().unwrap().contains_key("system_prompt"),
+            "the system prompt is first-class, not a session fact"
+        );
         // the old direct column still wins on a v14 DB
         let old = mk_conn(SCHEMA_V14);
         old.execute(
@@ -1831,7 +2014,7 @@ mod tests {
         )
         .unwrap();
         let s = parse_conn(&old, &sref("s")).unwrap();
-        assert_eq!(s.extra[SESSION_META_KEY]["system_prompt"], "legacy prompt");
+        assert_eq!(s.system_prompt.as_deref(), Some("legacy prompt"));
     }
 
     #[test]
@@ -1854,11 +2037,22 @@ mod tests {
             vec!["shared prompt", "branch answer"],
             "no parent merge, no duplicate"
         );
-        assert_eq!(b.extra[LINEAGE_KEY]["_branched_from"], "p");
-        assert_eq!(b.extra[LINEAGE_KEY]["parent_session_id"], "p");
+        assert_eq!(
+            b.lineage,
+            Lineage {
+                forked_from: Some("p".into()),
+                ..Default::default()
+            }
+        );
+        assert!(
+            !b.harness_extra(Harness::Hermes)
+                .unwrap()
+                .contains_key("parent_session_id"),
+            "a marked parent is already in the lineage"
+        );
         assert_eq!(b.model.as_deref(), None, "markers never leak into the model name");
 
-        // delegate sub-agent run: separate conversation.
+        // delegate sub-agent run: separate conversation whose parent spawned it.
         conn.execute(
             "INSERT INTO sessions (id, source, parent_session_id, model_config, started_at) \
              VALUES ('d', 'cli', 'p', '{\"_delegate_from\":\"p\"}', 1700.0)",
@@ -1868,18 +2062,44 @@ mod tests {
         insert_v30(&conn, "d", "user", "delegate task", 1701.0, 1, 0);
         let d = parse_conn(&conn, &sref("d")).unwrap();
         assert_eq!(texts(&d), vec!["delegate task"]);
-        assert_eq!(d.extra[LINEAGE_KEY]["_delegate_from"], "p");
+        assert_eq!(
+            d.lineage,
+            Lineage {
+                parent: Some("p".into()),
+                ..Default::default()
+            }
+        );
 
-        // compression continuation: parent ended in compression → merged root→tip.
+        // reset child: a fresh conversation; the marker is a Hermes fact only.
+        conn.execute(
+            "INSERT INTO sessions (id, source, parent_session_id, model_config, started_at) \
+             VALUES ('r', 'cli', 'p', '{\"_reset_from\":\"p\"}', 1800.0)",
+            [],
+        )
+        .unwrap();
+        insert_v30(&conn, "r", "user", "fresh", 1801.0, 1, 0);
+        let r = parse_conn(&conn, &sref("r")).unwrap();
+        assert!(r.lineage.is_empty(), "{:?}", r.lineage);
+        assert_eq!(r.harness_extra(Harness::Hermes).unwrap()["_reset_from"], "p");
+
+        // compression continuation: parent ended in compression → merged root→tip, and the store's
+        // pointers survive both ways.
         insert_session(&conn, "c0", None, Some("compression"), 2000.0, Some(2500.0));
         insert_v30(&conn, "c0", "user", "long ago", 2001.0, 1, 0);
         insert_session(&conn, "c1", Some("c0"), None, 2600.0, None);
         insert_v30(&conn, "c1", "assistant", "continued", 2601.0, 1, 0);
         let c1 = parse_conn(&conn, &sref("c1")).unwrap();
         assert_eq!(texts(&c1), vec!["long ago", "continued"]);
+        assert_eq!(c1.lineage.continues.as_deref(), Some("c0"));
+        assert_eq!(c1.lineage.continued_in, None);
+        let c0 = parse_conn(&conn, &sref("c0")).unwrap();
+        assert_eq!(c0.lineage.continued_in.as_deref(), Some("c1"));
+        assert_eq!(c0.lineage.continues, None);
         assert!(
-            !c1.extra.contains_key(LINEAGE_KEY),
-            "a merged parent is not a lineage fact"
+            !c1.harness_extra(Harness::Hermes)
+                .unwrap()
+                .contains_key("parent_session_id"),
+            "a compression parent is in the lineage, not the bag"
         );
     }
 
@@ -1948,8 +2168,9 @@ mod tests {
         assert_eq!(s.cwd.as_deref(), Some(Path::new("/work/proj")));
         assert_eq!(s.git.as_ref().and_then(|g| g.branch.as_deref()), Some("main"));
         assert_eq!(s.updated_at, secs_to_dt(3000.0));
-        assert_eq!(s.extra[SESSION_META_KEY]["git_repo_root"], "/work/proj");
-        assert_eq!(s.extra[SESSION_META_KEY]["profile_name"], "hermes-x");
+        assert_eq!(smeta(&s)["git_repo_root"], "/work/proj");
+        assert_eq!(smeta(&s)["profile_name"], "hermes-x");
+        assert_nested_extra(&s);
     }
 
     #[test]
@@ -1974,13 +2195,29 @@ mod tests {
             [],
         )
         .unwrap();
+        for (kind, text) in [
+            ("hidden", "[diagnostic] provider latency 900ms"),
+            ("auto_continue", "continue"),
+            ("process_complete", "job 7 finished"),
+            ("internal_notification", "context 80% full"),
+            ("async_delegation_complete", "delegate 7f3c finished"),
+            ("personality_switch", "now terse"),
+        ] {
+            conn.execute(
+                "INSERT INTO messages (session_id, role, content, timestamp, display_kind) VALUES ('s', 'user', ?1, 1004.0, ?2)",
+                [text, kind],
+            )
+            .unwrap();
+        }
         let s = parse_conn(&conn, &sref("s")).unwrap();
-        assert_eq!(s.messages[0].role, Role::System, "harness-injected notice");
-        assert_eq!(
-            s.messages[0].extra.get("display_kind").and_then(Value::as_str),
-            Some("model_switch")
-        );
-        assert_eq!(s.messages[1].role, Role::User, "a human steer stays a user turn");
+        let m = &s.messages[0];
+        assert_eq!(m.role, Role::System, "harness-injected notice");
+        assert_eq!((m.kind, m.origin), (MessageKind::ModelChange, Origin::Harness));
+        assert_eq!(bag(m)["display_kind"], "model_switch");
+        let steer = &s.messages[1];
+        assert_eq!(steer.role, Role::User, "a human steer stays a user turn");
+        assert_eq!((steer.kind, steer.origin), (MessageKind::Prompt, Origin::Human));
+        assert_eq!(bag(steer)["display_kind"], "steer");
         let u = &s.messages[2];
         assert_eq!(u.role, Role::User);
         assert_eq!(
@@ -1988,20 +2225,62 @@ mod tests {
             Some("what the user typed"),
             "block text is the user's words"
         );
+        assert_eq!(bag(u)["api_content"], "[context] what the user typed");
+        assert_eq!(bag(u)["effect_disposition"], "observed");
+        assert_eq!(bag(u)["display_metadata"]["k"], 1);
+        // every documented harness display_kind, by kind
+        let kinds: Vec<(Role, MessageKind, Origin)> =
+            s.messages[3..].iter().map(|m| (m.role, m.kind, m.origin)).collect();
         assert_eq!(
-            u.extra.get("api_content").and_then(Value::as_str),
-            Some("[context] what the user typed")
+            kinds,
+            vec![
+                (Role::System, MessageKind::Notice, Origin::Harness),
+                (Role::System, MessageKind::Notice, Origin::Harness),
+                (Role::System, MessageKind::Notice, Origin::Harness),
+                (Role::System, MessageKind::Notice, Origin::Harness),
+                (Role::System, MessageKind::SubagentReturn, Origin::Subagent),
+                // undocumented: keeps its row role, carries the kind in the bag only
+                (Role::User, MessageKind::Prompt, Origin::Human),
+            ]
         );
-        assert_eq!(
-            u.extra.get("effect_disposition").and_then(Value::as_str),
-            Some("observed")
-        );
-        assert_eq!(u.extra["display_metadata"]["k"], 1);
+        assert_eq!(bag(&s.messages[8])["display_kind"], "personality_switch");
         assert_eq!(
             s.first_user_text().as_deref(),
             Some("keep going but faster"),
             "notices never become the title"
         );
+        assert_nested_extra(&s);
+    }
+
+    #[test]
+    fn imported_session_messages_carry_import_origin() {
+        // `hermes sessions import` records `origin_json.imported_from`; every message of such a
+        // session came through the importer, whatever its role.
+        let conn = mk_conn(SCHEMA_V30);
+        conn.execute(
+            "INSERT INTO sessions (id, source, started_at, origin_json) VALUES ('f', 'codex-cli', 1000.0, \
+             '{\"imported_from\": {\"tool\": \"codex-cli\", \"path\": \"/r.jsonl\", \"foreign_session_id\": \"x1\"}}')",
+            [],
+        )
+        .unwrap();
+        insert_v30(&conn, "f", "user", "hello", 1001.0, 1, 0);
+        insert_v30(&conn, "f", "assistant", "hi", 1002.0, 1, 0);
+        let f = parse_conn(&conn, &sref("f")).unwrap();
+        assert_eq!(f.messages.len(), 2);
+        assert!(
+            f.messages.iter().all(|m| m.origin == Origin::Import),
+            "{:?}",
+            f.messages
+        );
+        assert_eq!(f.messages[0].kind, MessageKind::Prompt);
+        assert_eq!(f.messages[1].kind, MessageKind::Reply);
+        let hb = f.harness_extra(Harness::Hermes).unwrap();
+        assert_eq!(hb["imported_from"]["tool"], "codex-cli");
+        assert_eq!(hb["imported_from"]["foreign_session_id"], "x1");
+        assert_eq!(hb[SESSION_META_KEY]["source"], "codex-cli");
+        assert!(!f.extra.contains_key("imported_from"), "nested, never flat");
+        assert_nested_extra(&f);
+        assert_nested_extra(&f);
     }
 
     #[test]
@@ -2096,9 +2375,6 @@ mod tests {
         assert_eq!(txt(0), "fix the flaky test in tests/sched.py");
         assert_eq!(txt(1), "Let me look at the test.");
         assert_eq!(a.messages[2].role, Role::Tool);
-        assert_eq!(a.messages[4].role, Role::System);
-        assert_eq!(a.messages[4].extra["subtype"], "compact_boundary");
-        assert_eq!(a.messages[5].extra["isCompactSummary"], true);
         assert!(txt(5).starts_with("[CONTEXT COMPACTION"), "{}", txt(5));
         assert_eq!(
             t.iter().filter(|x| x.as_str() == "ok do it").count(),
@@ -2107,29 +2383,68 @@ mod tests {
         );
         assert_eq!(txt(6), "ok do it");
         assert_eq!(txt(8), "now run the suite");
-        assert_eq!(a.messages[10].role, Role::User, "a steer stays a user turn");
-        assert_eq!(a.messages[10].extra["display_kind"], "steer");
-        assert_eq!(a.messages[11].role, Role::System, "a hidden diagnostic is a notice");
-        assert_eq!(a.messages[12].role, Role::System);
-        assert_eq!(a.messages[12].extra["display_kind"], "async_delegation_complete");
+        // Every turn typed: prompt / reply / tool result / the compaction pair / steer / notices /
+        // the delegation return.
+        let kinds: Vec<(Role, MessageKind, Origin)> = a.messages.iter().map(|m| (m.role, m.kind, m.origin)).collect();
+        use MessageKind as K;
+        use Origin as O;
+        use Role as R_;
+        assert_eq!(
+            kinds,
+            vec![
+                (R_::User, K::Prompt, O::Human),
+                (R_::Assistant, K::Reply, O::Model),
+                (R_::Tool, K::ToolResult, O::Harness),
+                (R_::Assistant, K::Reply, O::Model),
+                (R_::System, K::CompactionBoundary, O::Harness),
+                (R_::System, K::CompactionSummary, O::Harness),
+                (R_::User, K::Prompt, O::Human),
+                (R_::Assistant, K::Reply, O::Model),
+                (R_::User, K::Prompt, O::Human),
+                (R_::Assistant, K::Reply, O::Model),
+                (R_::User, K::Prompt, O::Human),     // steer
+                (R_::System, K::Notice, O::Harness), // hidden diagnostic
+                (R_::System, K::SubagentReturn, O::Subagent),
+            ]
+        );
+        assert_eq!(
+            a.messages[5].parent_id, a.messages[4].id,
+            "summary links to its boundary"
+        );
+        assert_eq!(bag(&a.messages[5])["display_kind"], "hidden");
+        assert_eq!(
+            bag(&a.messages[0])["compacted"],
+            true,
+            "summarized-away history is flagged"
+        );
+        assert_eq!(bag(&a.messages[10])["display_kind"], "steer");
+        assert_eq!(bag(&a.messages[12])["display_kind"], "async_delegation_complete");
         assert_eq!(a.model.as_deref(), Some("anthropic/claude-sonnet-4.5"));
+        assert!(
+            a.messages.iter().all(|m| m.model.is_none()),
+            "no per-message model to record"
+        );
         assert_eq!(a.cwd, Some(PathBuf::from("/tmp/proj")));
-        let sp = a.extra[SESSION_META_KEY]["system_prompt"].as_str().unwrap();
+        let sp = a.system_prompt.as_deref().unwrap();
         assert!(
             sp.ends_with("Context was compacted once."),
             "system prompt resolved via system_prompts: {sp}"
         );
+        assert!(a.lineage.is_empty(), "{:?}", a.lineage);
+        assert_nested_extra(&a);
         // complete: the superseded originals of the carried tail are present, tagged as rewind rows.
         let ac = parse_conn_with(&conn, &sref(A), &ParseOptions::complete()).unwrap();
         assert!(ac.messages.len() > a.messages.len());
         // (Flags are recorded as non-default values only: a superseded original carries
         // `active: false` and no `compacted` key — the same shape as a rewound row.)
-        assert!(ac
-            .messages
-            .iter()
-            .any(|m| m.extra.get("active") == Some(&Value::Bool(false)) && !m.extra.contains_key("compacted")));
+        assert!(ac.messages.iter().any(|m| {
+            m.harness_extra(Harness::Hermes)
+                .is_some_and(|b| b.get("active") == Some(&Value::Bool(false)) && !b.contains_key("compacted"))
+        }));
+        assert_nested_extra(&ac);
 
-        // C2: the rotation chain reads root→tip, titled by the root, the carried tail once.
+        // C2: the rotation chain reads root→tip, titled by the root, the carried tail once; the
+        // store's pointers survive both ways.
         let c2 = parse_conn(&conn, &sref(C2)).unwrap();
         assert_eq!(c2.title.as_deref(), Some("Long migration"));
         let t = texts(&c2);
@@ -2137,6 +2452,25 @@ mod tests {
         assert_eq!(t.iter().filter(|x| x.as_str() == "migrated t3").count(), 1);
         assert!(t.iter().any(|x| x.starts_with("[CONTEXT COMPACTION")));
         assert_eq!(t.last().map(String::as_str), Some("migrated t4"));
+        assert_eq!(
+            c2.lineage,
+            Lineage {
+                continues: Some(C1.into()),
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            parse_conn(&conn, &sref(C1)).unwrap().lineage,
+            Lineage {
+                continued_in: Some(C2.into()),
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            c2.system_prompt.as_deref(),
+            Some("You are Hermes, a helpful coding agent. Working dir: /tmp/proj.")
+        );
+        assert_nested_extra(&c2);
 
         // Lineage: branch / reset / delegate children stand alone with their markers.
         let b = parse_conn(&conn, &sref(B)).unwrap();
@@ -2145,25 +2479,31 @@ mod tests {
             4,
             "a branch owns its copied transcript; never merged with R"
         );
-        assert_eq!(b.extra[LINEAGE_KEY]["_branched_from"], R);
+        assert_eq!(b.lineage.forked_from.as_deref(), Some(R));
+        assert_eq!(b.lineage.parent, None);
         let s = parse_conn(&conn, &sref(S)).unwrap();
-        assert_eq!(s.extra[LINEAGE_KEY]["_reset_from"], R);
+        assert!(s.lineage.is_empty(), "a reset has no IR lineage field: {:?}", s.lineage);
+        assert_eq!(s.harness_extra(Harness::Hermes).unwrap()["_reset_from"], R);
         assert_eq!(s.messages.len(), 2);
         let d = parse_conn(&conn, &sref(D)).unwrap();
-        assert_eq!(d.extra[LINEAGE_KEY]["_delegate_from"], R);
+        assert_eq!(d.lineage.parent.as_deref(), Some(R));
+        assert_eq!(d.lineage.forked_from, None);
 
         // Flags and provenance.
-        assert_eq!(
-            parse_conn(&conn, &sref(X)).unwrap().extra[SESSION_META_KEY]["archived"],
-            1
-        );
-        assert_eq!(
-            parse_conn(&conn, &sref(Y)).unwrap().extra[SESSION_META_KEY]["hidden"],
-            1
-        );
+        assert_eq!(smeta(&parse_conn(&conn, &sref(X)).unwrap())["archived"], 1);
+        assert_eq!(smeta(&parse_conn(&conn, &sref(Y)).unwrap())["hidden"], 1);
         let f = parse_conn(&conn, &sref(F)).unwrap();
-        assert_eq!(f.extra["imported_from"]["tool"], "claude-code");
-        assert_eq!(f.extra[SESSION_META_KEY]["source"], "claude-code");
+        let fb = f.harness_extra(Harness::Hermes).unwrap();
+        assert_eq!(fb["imported_from"]["tool"], "claude-code");
+        assert_eq!(smeta(&f)["source"], "claude-code");
         assert_eq!(texts(&f)[0], "Reply with exactly: ONE");
+        assert_eq!(f.messages.len(), 4);
+        assert!(
+            f.messages.iter().all(|m| m.origin == Origin::Import),
+            "every message of an import came through the importer"
+        );
+        assert_eq!(f.messages[0].kind, MessageKind::Prompt);
+        assert_eq!(f.messages[1].kind, MessageKind::Reply);
+        assert_nested_extra(&f);
     }
 }

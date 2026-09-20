@@ -1,17 +1,17 @@
-//! `cv search` / `cv recall` / `cv index` — full-text and semantic search.
+//! `cv search` / `cv index` — full-text and semantic search.
 
-use crate::util::{dirs_home, home_rel, parse_harness, short_id};
+use crate::util::{dirs_home, parse_harness, session_row, short_id};
 use anyhow::{Context, Result};
-use cv_core::ir::{truncate, Harness};
+use cv_core::ir::{truncate, Harness, SessionRef};
 use cv_core::sanitize::sanitize_line;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 pub(crate) fn cmd_search(
     query: &str,
     harness: Option<String>,
     limit: usize,
     semantic: bool,
-    json: bool, // emit the hits as one JSON array (camelCase fields, full ids) instead of the table
+    json: bool, // emit the hits as one JSON array (session rows + score/snippet/provenance) instead of the table
 ) -> Result<()> {
     let want = parse_harness(&harness)?;
 
@@ -77,10 +77,9 @@ fn render_search_hits(
         .take(limit)
         .collect();
     if json {
-        // Machine-readable hits: camelCase fields, the FULL session id (the table shows an
-        // 8-char prefix), the untruncated snippet, and the index's relevance score (BM25 for
-        // FTS, cosine similarity for --semantic). Timestamps are ISO-8601 UTC, null when the
-        // index carries none (e.g. semantic hits from a pre-dates embedding store).
+        // Machine-readable hits: a session row (the same shape `ls --json` emits, filled from the
+        // catalog) plus the untruncated snippet and the index's relevance score (BM25 for FTS,
+        // cosine similarity for --semantic). Timestamps are RFC 3339, null when unknown.
         let vals: Vec<serde_json::Value> = rows.iter().map(|h| hit_json(h)).collect();
         println!("{}", serde_json::to_string_pretty(&vals)?);
         return Ok(());
@@ -118,7 +117,7 @@ fn render_search_hits(
             .unwrap_or_else(|| "----------".into());
         // A folded-in sub-agent hit (`cv index --subagents`): its own id is `agent-<hex>`, so a
         // bare `short_id` would render the shared `agent-` prefix, useless for drill-in. Show the
-        // bare agentId (what `cv show <id>` resolves) and tag the row with its parent + workflow so
+        // bare agent id (what `cv show <id>` resolves) and tag the row with its parent + workflow so
         // the reader sees it's a lane, not a top-level session.
         let (id_disp, provenance) = match h.agent_id.as_deref() {
             Some(aid) => {
@@ -145,26 +144,71 @@ fn render_search_hits(
     Ok(())
 }
 
-/// One `--json` object for an index/semantic hit: what the table row shows, machine-readably —
-/// plus the full id, cwd, and score the table drops or truncates.
+fn rfc3339(secs: Option<i64>) -> Option<String> {
+    secs.and_then(|t| chrono::DateTime::from_timestamp(t, 0))
+        .map(|d| d.to_rfc3339())
+}
+
+/// One `--json` object for an index/semantic hit: the session row (from the catalog, so `path`,
+/// `message_count` and `size_bytes` are the same values `ls --json` gives; null for a sub-agent
+/// lane, which the catalog doesn't list) with the hit's own title/cwd/dates laid over it, plus
+/// `score`, `snippet`, and the sub-agent provenance trio — always present, null for a top-level hit.
 fn hit_json(h: &cv_search::Hit) -> serde_json::Value {
-    serde_json::json!({
-        "harness": h.harness,
-        "id": h.id,
-        "cwd": h.cwd,
-        "title": h.title,
-        "score": h.score,
-        "snippet": h.snippet,
-        "createdAt": h.created_at.and_then(|t| chrono::DateTime::from_timestamp(t, 0)).map(|d| d.to_rfc3339()),
-        "updatedAt": h.updated_at.and_then(|t| chrono::DateTime::from_timestamp(t, 0)).map(|d| d.to_rfc3339()),
-        // Sub-agent provenance (an index built with `cv index --subagents` folds lane transcripts
-        // in): the lane's own agent id (`cv show <agentId>` resolves it), the top-level session
-        // that spawned it, and the workflow run it belonged to. All null for a top-level hit —
-        // the keys are always present so consumers can branch on them without probing.
-        "agentId": h.agent_id,
-        "parentId": h.parent_id,
-        "workflow": h.workflow,
-    })
+    let harness = Harness::parse(&h.harness);
+    let cataloged = cv_core::catalog::lookup(&h.id, harness)
+        .into_iter()
+        .find(|r| r.id == h.id);
+    let mut row = match &cataloged {
+        Some(r) => session_row(r, std::fs::metadata(&r.path).ok().map(|m| m.len())),
+        None => serde_json::json!({
+            "id": h.id,
+            "harness": h.harness,
+            "path": serde_json::Value::Null,
+            "cwd": serde_json::Value::Null,
+            "title": serde_json::Value::Null,
+            "created_at": serde_json::Value::Null,
+            "updated_at": serde_json::Value::Null,
+            "message_count": serde_json::Value::Null,
+            "size_bytes": serde_json::Value::Null,
+        }),
+    };
+    let obj = row.as_object_mut().expect("json object");
+    // The index is what matched: its title/cwd/dates win when it has them.
+    if let Some(c) = &h.cwd {
+        obj.insert("cwd".into(), serde_json::json!(c));
+    }
+    if let Some(t) = &h.title {
+        obj.insert("title".into(), serde_json::json!(t));
+    }
+    if let Some(t) = rfc3339(h.created_at) {
+        obj.insert("created_at".into(), serde_json::json!(t));
+    }
+    if let Some(t) = rfc3339(h.updated_at) {
+        obj.insert("updated_at".into(), serde_json::json!(t));
+    }
+    obj.insert("score".into(), serde_json::json!(h.score));
+    obj.insert("snippet".into(), serde_json::json!(h.snippet));
+    // Sub-agent provenance (an index built with `cv index --subagents` folds lane transcripts
+    // in): the lane's own agent id (`cv show <agent_id>` resolves it), the top-level session
+    // that spawned it, and the workflow run it belonged to.
+    obj.insert("agent_id".into(), serde_json::json!(h.agent_id));
+    obj.insert("parent_id".into(), serde_json::json!(h.parent_id));
+    obj.insert("workflow".into(), serde_json::json!(h.workflow));
+    row
+}
+
+/// The live-scan twin of [`hit_json`]: the ref is in hand, so the row is exact; a live scan has
+/// no score and never walks sub-agents (provenance is null).
+fn live_hit_json(r: &SessionRef, title: &str, snippet: &str) -> serde_json::Value {
+    let mut row = session_row(r, std::fs::metadata(&r.path).ok().map(|m| m.len()));
+    let obj = row.as_object_mut().expect("json object");
+    obj.insert("title".into(), serde_json::json!(title));
+    obj.insert("score".into(), serde_json::Value::Null);
+    obj.insert("snippet".into(), serde_json::json!(snippet));
+    obj.insert("agent_id".into(), serde_json::Value::Null);
+    obj.insert("parent_id".into(), serde_json::Value::Null);
+    obj.insert("workflow".into(), serde_json::Value::Null);
+    row
 }
 
 /// Whole days the FTS index lags the newest session file on disk, when ≥ 1. Cheap enough for the
@@ -213,21 +257,7 @@ fn cmd_search_live(query: &str, want: Option<Harness>, limit: usize, json: bool)
                 let label = cv_core::label_from(meta.title.as_deref(), sink.first_user.as_deref());
                 let snip = snippet(&sink.hay, pos.min(sink.hay.len()), needle.len());
                 if json {
-                    rows.push(serde_json::json!({
-                        "harness": r.harness.as_str(),
-                        "id": r.id,
-                        "cwd": r.cwd.as_ref().map(|p| p.to_string_lossy()),
-                        "title": label,
-                        "score": serde_json::Value::Null,
-                        "snippet": snip,
-                        "createdAt": r.created_at.map(|t| t.to_rfc3339()),
-                        "updatedAt": r.updated_at.map(|t| t.to_rfc3339()),
-                        // A live scan only walks top-level sessions, so provenance is always
-                        // null here — the keys ride along for shape parity with indexed hits.
-                        "agentId": serde_json::Value::Null,
-                        "parentId": serde_json::Value::Null,
-                        "workflow": serde_json::Value::Null,
-                    }));
+                    rows.push(live_hit_json(&r, &label, &snip));
                 } else {
                     println!(
                         "{:8}  {:8}  {:10}  {}",
@@ -261,104 +291,6 @@ fn cmd_search_live(query: &str, want: Option<Harness>, limit: usize, json: bool)
         println!("no matches for {query:?}");
     }
     Ok(())
-}
-
-pub(crate) fn cmd_recall(query: &str, k: usize, harness: Option<String>) -> Result<()> {
-    let want = parse_harness(&harness)?;
-    let k = k.max(1);
-    // Over-fetch when filtering by harness so we can still fill `k`.
-    let fetch = if want.is_some() { (k * 4).max(20) } else { k };
-
-    let (mut hits, mode) = match cv_search::semantic_search(None, query, fetch) {
-        Ok(h) => (h, "semantic"),
-        Err(e) => {
-            eprintln!(
-                "(semantic search unavailable: {e:#}; falling back to keyword mode — run \
-                 `cv index --semantic` for semantic recall)"
-            );
-            (cv_search::text_search(None, query, fetch)?, "keyword")
-        }
-    };
-
-    if let Some(h) = want {
-        let w = h.as_str();
-        hits.retain(|hit| hit.harness == w);
-    }
-    hits.truncate(k);
-
-    if hits.is_empty() {
-        println!("no recall matches for {query:?} ({mode})");
-        return Ok(());
-    }
-
-    for hit in &hits {
-        let cwd = hit
-            .cwd
-            .as_deref()
-            .map(|c| home_rel(Path::new(c)))
-            .unwrap_or_else(|| "(no cwd)".into());
-        println!(
-            "{:8}  {:8}  {:>6.3}  {}  ·  {}",
-            hit.harness,
-            short_id(&hit.id),
-            hit.score,
-            truncate(&sanitize_line(hit.title.as_deref().unwrap_or_default()), 50),
-            truncate(&sanitize_line(&cwd), 40),
-        );
-        let excerpt = recall_excerpt(hit, query);
-        for line in excerpt.lines() {
-            println!("      {}", sanitize_line(line));
-        }
-    }
-    Ok(())
-}
-
-/// Best excerpt for a recall hit: prefer the stored snippet; otherwise load the session and render
-/// a compact ~3-message window around the best textual match of `query`.
-fn recall_excerpt(hit: &cv_search::Hit, query: &str) -> String {
-    if !hit.snippet.trim().is_empty() {
-        return truncate(&hit.snippet, 200);
-    }
-    let h = Harness::parse(&hit.harness);
-    let Some((sref, adapter)) = cv_core::find(&hit.id, h).ok().flatten() else {
-        return String::new();
-    };
-    let Ok(session) = adapter.parse(&sref) else {
-        return String::new();
-    };
-    if session.messages.is_empty() {
-        return String::new();
-    }
-    // Pick the message best matching the query (most query words present), with a small window.
-    let needle = query.to_lowercase();
-    let words: Vec<&str> = needle.split_whitespace().filter(|w| w.len() > 2).collect();
-    let mut best = 0usize;
-    let mut best_score = -1i64;
-    for (i, m) in session.messages.iter().enumerate() {
-        let t = m.text().unwrap_or_default().to_lowercase();
-        if t.trim().is_empty() {
-            continue;
-        }
-        let score = words.iter().filter(|w| t.contains(**w)).count() as i64 + if t.contains(&needle) { 5 } else { 0 };
-        if score > best_score {
-            best_score = score;
-            best = i;
-        }
-    }
-    let lo = best.saturating_sub(1);
-    let hi = (best + 2).min(session.messages.len());
-    let mut out = String::new();
-    for m in &session.messages[lo..hi] {
-        if let Some(t) = m.text() {
-            if !t.trim().is_empty() {
-                out.push_str(cv_core::render::role_label(m.role));
-                out.push_str(": ");
-                out.push_str(&truncate(&t, 100));
-                out.push('\n');
-            }
-        }
-    }
-    out.trim_end().to_string()
 }
 
 pub(crate) fn cmd_index(semantic: bool, rebuild: bool, subagents: bool) -> Result<()> {

@@ -10,7 +10,7 @@ authors.workspace = true
 
 # Fence position: cv-sim may depend on cv-core; nothing depends on cv-sim.
 [dependencies]
-cv-core = { path = "../cv-core", version = "0.10", package = "clustervision-core" }
+cv-core = { path = "../cv-core", version = "0.11", package = "clustervision-core" }
 chrono.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

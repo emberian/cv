@@ -1,0 +1,33 @@
+# formats/zed.toml — the vocabulary cv's `zed` adapter is checked against (docs/INTERFACE-V2.md §7).
+# status: handled = per-item arm in the adapter; generic = interpreted by a blanket rule; carried = verbatim
+# under ParseOptions::complete only; ignored = known and deliberately skipped. Regenerate: tools/gen-manifests (or edit by hand).
+
+harness = "zed"
+source_files = ["harness/zed.rs"]
+ignore_literals = ["json", "zstd", "Zed", "threads.db", "threads"]
+store = [
+  "<data_dir>/threads/threads.db (zstd blobs)",
+]
+
+[upstream]
+repo = "https://github.com/zed-industries/zed (not checked out)"
+commit = "unknown"
+date = "2026-05-29"
+
+[types]
+"role.user" = { status = "handled", note = "" }
+"role.assistant" = { status = "handled", note = "" }
+"role.system" = { status = "handled", note = "" }
+"segment.text" = { status = "handled", note = "" }
+"segment.thinking" = { status = "handled", note = "" }
+"segment.RedactedThinking" = { status = "handled", note = "" }
+"v3.User" = { status = "handled", note = "" }
+"v3.Agent" = { status = "handled", note = "" }
+"v3.Text" = { status = "handled", note = "" }
+"v3.Thinking" = { status = "handled", note = "" }
+"v3.ToolUse" = { status = "handled", note = "" }
+"v3.Image" = { status = "handled", note = "" }
+"v3.Mention" = { status = "handled", note = "→ File (uri)" }
+"v3.Compaction" = { status = "handled", note = "Summary" }
+"v3.Summary" = { status = "handled", note = "" }
+"v3.Resume" = { status = "generic", note = "bare marker" }

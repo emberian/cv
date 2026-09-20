@@ -2,12 +2,16 @@
 //! run the MCP handshake, list tools, and call them against a temp-home fixture corpus.
 //!
 //! Hermetic: a fake `$HOME` carries the claude fixtures and `$CLUSTERVISION_HOME` the index/board
-//! state; both are passed only to the child process's environment.
+//! state; both are passed only to the child process's environment. `$CV_BIN` points at a **stub
+//! `cv`** written into the same temp tree, so the CLI-generated half of the toolset is exercised
+//! end-to-end (schema dump → tool registration → argv → exit code) without depending on a built
+//! `clustervision` binary being present. What the real commands *do* is the CLI crate's business;
+//! what this crate owes is the translation.
 
 use serde_json::{json, Value};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
@@ -60,11 +64,14 @@ impl Server {
             fs::write(proj.join(format!("{name}.jsonl")), body).unwrap();
         }
 
+        let cv_bin = write_stub_cv(&base);
+
         let mut child = Command::new(env!("CARGO_BIN_EXE_cv-mcp"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .env("HOME", &home)
+            .env("CV_BIN", &cv_bin)
             .env("CLUSTERVISION_HOME", &cv_home)
             .env_remove("CV_ENDPOINT") // hermetic: ambient identity must not leak into the tests
             .env("XDG_CACHE_HOME", home.join(".cache"))
@@ -134,6 +141,66 @@ impl Server {
     }
 }
 
+/// The command tree the stub `cv` reports: a faithful (abridged) copy of the real
+/// `cv schema --commands --json` shape, including `show`'s window flags, a help-less `--harness`,
+/// a command with no `--json` form (`cat`), two positionals in order, and a `Fleet & live` entry
+/// that must NOT become a tool.
+const STUB_COMMANDS: &str = r#"[
+  {"name":"ls","group":"Read","about":"List discovered sessions across all harnesses","args":[
+    {"name":"harness","kind":"option","value_type":"string","help":"Only this harness","required":false},
+    {"name":"cwd","kind":"option","value_type":"string","help":"Only sessions whose cwd contains this substring","required":false},
+    {"name":"limit","kind":"option","value_type":"integer","help":"Max rows to show","required":false,"default":"40"},
+    {"name":"sort_by","kind":"option","value_type":"string","help":"Sort key","required":false,"possible_values":["updated","created","messages"],"default":"updated"},
+    {"name":"json","kind":"flag","value_type":"boolean","help":"Emit the rows as JSON","required":false}]},
+  {"name":"show","group":"Read","about":"Print a single session","args":[
+    {"name":"id","kind":"positional","value_type":"string","help":"Session id","required":true},
+    {"name":"harness","kind":"option","value_type":"string","help":"","required":false},
+    {"name":"json","kind":"flag","value_type":"boolean","help":"Emit the raw unified IR as JSON","required":false},
+    {"name":"first","kind":"option","value_type":"integer","help":"The first N messages","required":false},
+    {"name":"last","kind":"option","value_type":"integer","help":"The last N messages","required":false},
+    {"name":"range","kind":"option","value_type":"string","help":"Messages A..B","required":false},
+    {"name":"around","kind":"option","value_type":"integer","help":"Message N with context either side","required":false},
+    {"name":"context","kind":"option","value_type":"integer","help":"How many either side","required":false,"default":"5"},
+    {"name":"max_bytes","kind":"option","value_type":"integer","help":"Stop after N bytes","required":false},
+    {"name":"subagents","kind":"flag","value_type":"boolean","help":"List the sub-agent forest","required":false}]},
+  {"name":"cat","group":"Read","about":"Print one tool call's full output","args":[
+    {"name":"session","kind":"positional","value_type":"string","help":"The pruned session id","required":true},
+    {"name":"tool_use_id","kind":"positional","value_type":"string","help":"The tool_use id","required":true},
+    {"name":"input","kind":"flag","value_type":"boolean","help":"Print the call's arguments instead","required":false}]},
+  {"name":"search","group":"Read","about":"Search across session transcripts","args":[
+    {"name":"query","kind":"positional","value_type":"string","help":"Text to search for","required":true},
+    {"name":"limit","kind":"option","value_type":"integer","help":"Max results","required":false,"default":"20"},
+    {"name":"json","kind":"flag","value_type":"boolean","help":"Emit rows as JSON","required":false}]},
+  {"name":"task","group":"Fleet & live","about":"Durable fleet tasks","args":[]},
+  {"name":"task open","group":"Fleet & live","about":"Open a task","args":[
+    {"name":"title","kind":"positional","value_type":"string","help":"Title","required":true}]}
+]"#;
+
+/// Write a stub `cv` that answers the schema dump from a file, echoes its argv for every other
+/// call, and fails loudly on a session id of `nosuch` (the non-zero-exit path).
+fn write_stub_cv(base: &Path) -> PathBuf {
+    let bin_dir = base.join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    fs::write(bin_dir.join("commands.json"), STUB_COMMANDS).unwrap();
+    let cv = bin_dir.join("cv");
+    fs::write(
+        &cv,
+        "#!/bin/sh\n\
+         if [ \"$1\" = schema ]; then cat \"$(dirname \"$0\")/commands.json\"; exit 0; fi\n\
+         case \"$*\" in *nosuch*) echo 'cv: no session found for id \"nosuch\"' >&2; exit 2;; esac\n\
+         printf 'ARGV'\n\
+         for a in \"$@\"; do printf ' %s' \"$a\"; done\n\
+         echo\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&cv, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    cv
+}
+
 impl Drop for Server {
     fn drop(&mut self) {
         let _ = self.child.kill();
@@ -190,78 +257,115 @@ fn handshake_and_tool_schemas() {
             }
         }
     }
-    for expected in [
+    // Generated from the stub CLI's Read group…
+    for expected in ["ls", "show", "cat", "search"] {
+        assert!(
+            names.contains(expected),
+            "missing CLI-generated tool {expected}: {names:?}"
+        );
+    }
+    // …alongside the hand-written MCP-only tools, which have no CLI equivalent.
+    for expected in ["observe_stream", "await_omen", "board_post", "board_claim", "task_open"] {
+        assert!(names.contains(expected), "missing MCP-only tool {expected}");
+    }
+    // `Fleet & live` commands are NOT generated — their MCP tools are the hand-written ones.
+    assert!(!names.contains("task"), "`task` is a dispatcher, not a tool: {names:?}");
+    let task_open = tools.iter().find(|t| t["name"] == "task_open").unwrap();
+    assert!(
+        task_open["description"].as_str().unwrap().contains("dispatch object"),
+        "task_open must be the hand-written tool, not a generated `cv task open`: {task_open}"
+    );
+    // The 0.11.0 removals stay removed: their replacements are show/search/ls/pack/prune/cat.
+    for gone in [
         "list_sessions",
         "search_sessions",
         "read_session",
         "project_sessions",
         "recall",
-        "observe_stream",
+        "prune_session",
+        "prune_retrieve",
     ] {
-        assert!(names.contains(expected), "missing core tool {expected}");
+        assert!(
+            !names.contains(gone),
+            "{gone} was removed in 0.11.0 but is still advertised"
+        );
     }
+
+    // `show` advertises its MCP window defaults, and `--json` is never the caller's to set.
+    let show = tools.iter().find(|t| t["name"] == "show").unwrap();
+    let desc = show["description"].as_str().unwrap();
+    assert!(desc.contains("LAST 50") && desc.contains("200000"), "{desc}");
+    let props = &show["inputSchema"]["properties"];
+    assert!(props.get("json").is_none(), "json must not be a property: {props}");
+    assert_eq!(props["last"]["type"], "integer", "{props}");
+    assert_eq!(show["inputSchema"]["required"], json!(["id"]), "{show}");
+}
+
+/// The generated tools are real subprocess calls: the argv cv-mcp builds is what `cv` receives,
+/// and a non-zero exit comes back as an MCP tool error carrying the child's stderr.
+#[test]
+fn generated_tools_shell_out_to_cv() {
+    let mut s = Server::spawn("generated");
+    s.request(1, "initialize", json!({}));
+
+    // No window selector → the MCP defaults, and `--json` because `show` has the flag.
+    let (text, is_err) = s.call_tool(2, "show", json!({"id": "alphasess"}));
+    assert!(!is_err, "{text}");
+    assert_eq!(
+        text.trim(),
+        "ARGV show alphasess --last 50 --max-bytes 200000 --json",
+        "{text}"
+    );
+
+    // An explicit selector wins; a clap id becomes its kebab-case long flag.
+    let (text, _) = s.call_tool(3, "show", json!({"id": "alphasess", "around": 12, "context": 2}));
+    assert_eq!(
+        text.trim(),
+        "ARGV show alphasess --around 12 --context 2 --json",
+        "{text}"
+    );
+    let (text, _) = s.call_tool(4, "show", json!({"id": "alphasess", "max_bytes": 4096}));
+    assert_eq!(text.trim(), "ARGV show alphasess --max-bytes 4096 --json", "{text}");
+
+    // A boolean flag is present only when true; positionals lead in declaration order; `cat` has
+    // no JSON form, so no `--json` is appended.
+    let (text, _) = s.call_tool(
+        5,
+        "cat",
+        json!({"tool_use_id": "toolu_42", "session": "alphasess", "input": true}),
+    );
+    assert_eq!(text.trim(), "ARGV cat alphasess toolu_42 --input", "{text}");
+    let (text, _) = s.call_tool(6, "cat", json!({"session": "alphasess", "tool_use_id": "toolu_42"}));
+    assert_eq!(text.trim(), "ARGV cat alphasess toolu_42", "{text}");
+
+    // A non-zero exit becomes an isError tool result carrying stderr.
+    let (text, is_err) = s.call_tool(7, "show", json!({"id": "nosuch"}));
+    assert!(is_err, "a failing `cv` must be a tool error: {text}");
+    assert!(
+        text.contains("no session found"),
+        "stderr must reach the caller: {text}"
+    );
+
+    // A missing required positional and an unknown argument are the caller's protocol mistakes.
+    let resp = s.request(8, "tools/call", json!({"name": "cat", "arguments": {"session": "a"}}));
+    assert_eq!(resp["error"]["code"], -32602, "{resp}");
+    assert!(
+        resp["error"]["message"].as_str().unwrap().contains("tool_use_id"),
+        "{resp}"
+    );
+    let resp = s.request(
+        9,
+        "tools/call",
+        json!({"name": "show", "arguments": {"id": "a", "limit": 5}}),
+    );
+    assert_eq!(resp["error"]["code"], -32602, "{resp}");
+    assert!(resp["error"]["message"].as_str().unwrap().contains("limit"), "{resp}");
 }
 
 #[test]
 fn tool_calls_against_fixture_corpus() {
     let mut s = Server::spawn("tools");
     s.request(1, "initialize", json!({}));
-
-    // list_sessions: both fixtures, newest (alpha, updated 2026-01-02… wait beta is 03-01) first.
-    let (text, is_err) = s.call_tool(2, "list_sessions", json!({}));
-    assert!(!is_err, "{text}");
-    let v: Value = serde_json::from_str(&text).expect("list_sessions returns JSON");
-    let arr = v.as_array().expect("array");
-    assert_eq!(arr.len(), 2, "{text}");
-    assert_eq!(arr[0]["id"], "betasess", "newest-first: {text}");
-    assert_eq!(arr[1]["id"], "alphasess", "{text}");
-    assert_eq!(arr[1]["title"], "alpha adventures", "{text}");
-    assert_eq!(arr[0]["harness"], "claude", "{text}");
-    assert!(arr[0]["message_count"].as_u64().unwrap() >= 2, "{text}");
-
-    // limit + harness filtering.
-    let (text, _) = s.call_tool(3, "list_sessions", json!({"limit": 1}));
-    let v: Value = serde_json::from_str(&text).unwrap();
-    assert_eq!(v.as_array().unwrap().len(), 1, "{text}");
-    let (text, is_err) = s.call_tool(4, "list_sessions", json!({"harness": "warpdrive"}));
-    assert!(is_err, "unknown harness must be a tool error: {text}");
-    assert!(text.contains("unknown harness"), "{text}");
-
-    // search_sessions: finds the planted text with a snippet.
-    let (text, is_err) = s.call_tool(5, "search_sessions", json!({"query": "zebrafish"}));
-    assert!(!is_err, "{text}");
-    let v: Value = serde_json::from_str(&text).unwrap();
-    let hits = v.as_array().unwrap();
-    assert_eq!(hits.len(), 1, "{text}");
-    assert_eq!(hits[0]["id"], "alphasess", "{text}");
-    assert!(hits[0]["snippet"].as_str().unwrap().contains("zebrafish"), "{text}");
-    // Missing required arg: tool error, not a crash.
-    let (text, is_err) = s.call_tool(6, "search_sessions", json!({}));
-    assert!(is_err, "{text}");
-    assert!(text.contains("query"), "{text}");
-
-    // read_session: markdown by default (prefix match allowed), JSON on request.
-    let (text, is_err) = s.call_tool(7, "read_session", json!({"id": "alpha"}));
-    assert!(!is_err, "{text}");
-    assert!(text.contains("zebrafish migration"), "{text}");
-    let (text, _) = s.call_tool(8, "read_session", json!({"id": "betasess", "format": "json"}));
-    let v: Value = serde_json::from_str(&text).expect("json format parses");
-    assert_eq!(v["id"], "betasess", "{text}");
-    assert_eq!(v["messages"].as_array().unwrap().len(), 2, "{text}");
-    let (text, is_err) = s.call_tool(9, "read_session", json!({"id": "nonexistent"}));
-    assert!(is_err, "{text}");
-    assert!(text.contains("no session found"), "{text}");
-    let (text, is_err) = s.call_tool(10, "read_session", json!({"id": "alpha", "format": "yaml"}));
-    assert!(is_err, "{text}");
-    assert!(text.contains("unknown format"), "{text}");
-
-    // project_sessions: exact cwd, ancestor, trailing component — but not a path-prefix fragment.
-    for (q, want) in [("/work/proj", 2), ("/work", 2), ("proj", 2), ("/wo", 0)] {
-        let (text, is_err) = s.call_tool(11, "project_sessions", json!({"cwd": q}));
-        assert!(!is_err, "{text}");
-        let v: Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(v.as_array().unwrap().len(), want, "cwd={q}: {text}");
-    }
 
     // board round-trip: post → read.
     let (text, is_err) = s.call_tool(12, "board_post", json!({"channel": "testchan", "body": "hello fleet"}));
@@ -304,64 +408,6 @@ fn tool_calls_against_fixture_corpus() {
     assert!(!is_err, "{text}");
     let v: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(v["released"], false, "{text}");
-
-    // recall with no index built: an honest tool error naming both failed paths.
-    let (text, is_err) = s.call_tool(18, "recall", json!({"query": "zebrafish"}));
-    assert!(is_err, "recall without an index should error: {text}");
-    assert!(text.contains("recall failed"), "{text}");
-}
-
-/// `read_session` resolves workflow sub-agent ids (`agent-…`) through cv_core::find's sub-agent
-/// fallback — no MCP-side special-casing. Full id, unique prefix, and the ambiguous-prefix error.
-#[test]
-fn read_session_resolves_workflow_subagent_ids() {
-    let mut s = Server::spawn("agentid");
-
-    // A workflow sub-agent transcript in the standard sidecar layout:
-    // <projects>/<encoded>/<sid>/subagents/workflows/<runId>/agent-<id>.jsonl
-    let proj = s.base.join("home/.claude/projects/-work-proj");
-    let run_dir = proj.join("alphasess/subagents/workflows/wf_run1");
-    fs::create_dir_all(&run_dir).unwrap();
-    let lines = [
-        json!({"type": "user", "uuid": "w1", "timestamp": "2026-01-01T11:00:00Z",
-               "cwd": "/work/proj",
-               "message": {"role": "user", "content": "count the wombats"}}),
-        json!({"type": "assistant", "uuid": "w2", "timestamp": "2026-01-01T11:05:00Z",
-               "message": {"role": "assistant", "content": [
-                   {"type": "text", "text": "WOMBAT_COUNT is forty-two"}]}}),
-    ];
-    let body: String = lines.iter().map(|l| format!("{l}\n")).collect();
-    fs::write(run_dir.join("agent-zeta97cafe.jsonl"), body).unwrap();
-
-    s.request(1, "initialize", json!({}));
-
-    // The full agent id reads the sub-agent's transcript.
-    let (text, is_err) = s.call_tool(2, "read_session", json!({"id": "agent-zeta97cafe"}));
-    assert!(!is_err, "{text}");
-    assert!(text.contains("WOMBAT_COUNT is forty-two"), "{text}");
-
-    // A unique prefix resolves too; JSON format carries the full agent id.
-    let (text, is_err) = s.call_tool(3, "read_session", json!({"id": "agent-zeta9", "format": "json"}));
-    assert!(!is_err, "{text}");
-    let v: Value = serde_json::from_str(&text).expect("json format parses");
-    assert_eq!(v["id"], "agent-zeta97cafe", "{text}");
-
-    // A second parent session carrying a matching agent makes the prefix ambiguous: a tool error
-    // naming the candidate parents, never a silent "first one wins".
-    let direct = proj.join("betasess/subagents");
-    fs::create_dir_all(&direct).unwrap();
-    fs::write(direct.join("agent-zeta97beef.jsonl"), "").unwrap();
-    let (text, is_err) = s.call_tool(4, "read_session", json!({"id": "agent-zeta97"}));
-    assert!(is_err, "ambiguous agent prefix must be an error: {text}");
-    assert!(
-        text.contains("alphasess") && text.contains("betasess"),
-        "the error must name both parents: {text}"
-    );
-
-    // A non-existent agent id still reports a clean miss.
-    let (text, is_err) = s.call_tool(5, "read_session", json!({"id": "agent-nope"}));
-    assert!(is_err, "{text}");
-    assert!(text.contains("no session found"), "{text}");
 }
 
 /// The task tools drive the durable store end-to-end over the protocol: open → two claimants
@@ -502,14 +548,14 @@ fn slow_long_poll_does_not_block_other_requests() {
         "name": "board_await",
         "arguments": {"channel": "quiet", "regex": "NEVER_MATCHES", "timeout_secs": 6, "interval_secs": 1}}}));
     s.send(&json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
-        "name": "list_sessions", "arguments": {}}}));
+        "name": "board_read", "arguments": {"channel": "quiet"}}}));
 
     let first = s.recv();
     let elapsed = start.elapsed();
     assert_eq!(first["id"], json!(3), "the fast request must answer first: {first}");
     assert!(
         elapsed < Duration::from_secs(4),
-        "list_sessions took {elapsed:?} — blocked behind the 6s long-poll?"
+        "board_read took {elapsed:?} — blocked behind the 6s long-poll?"
     );
     assert_eq!(first["result"]["isError"], false, "{first}");
 
@@ -532,7 +578,7 @@ fn malformed_numeric_args_are_invalid_params() {
         let resp = s.request(
             id,
             "tools/call",
-            json!({"name": "list_sessions", "arguments": {"limit": bad}}),
+            json!({"name": "board_read", "arguments": {"channel": "c", "limit": bad}}),
         );
         assert_eq!(resp["error"]["code"], -32602, "limit={bad}: {resp}");
         assert!(
@@ -542,11 +588,13 @@ fn malformed_numeric_args_are_invalid_params() {
         assert!(resp["result"].is_null(), "an error response carries no result: {resp}");
     }
 
-    // Integral float: accepted, behaves like the integer.
-    let (text, is_err) = s.call_tool(5, "list_sessions", json!({"limit": 1.0}));
+    // Integral float: accepted, behaves like the integer — on the hand-written guard…
+    let (text, is_err) = s.call_tool(5, "board_read", json!({"channel": "c", "limit": 1.0}));
     assert!(!is_err, "{text}");
-    let v: Value = serde_json::from_str(&text).unwrap();
-    assert_eq!(v.as_array().unwrap().len(), 1, "{text}");
+    // …and on the generated path, which renders it for clap without the `.0`.
+    let (text, is_err) = s.call_tool(9, "show", json!({"id": "a", "last": 20.0}));
+    assert!(!is_err, "{text}");
+    assert_eq!(text.trim(), "ARGV show a --last 20 --json", "{text}");
 
     // Other tools route through the same guard (spot-check a long-poll's timeout).
     let resp = s.request(

@@ -1,0 +1,18 @@
+# formats/chatgpt-app.toml — the vocabulary cv's `chatgpt-app` adapter is checked against (docs/INTERFACE-V2.md §7).
+# status: handled = per-item arm in the adapter; generic = interpreted by a blanket rule; carried = verbatim
+# under ParseOptions::complete only; ignored = known and deliberately skipped. Regenerate: tools/gen-manifests (or edit by hand).
+
+harness = "chatgpt-app"
+source_files = ["harness/chatgpt_app.rs"]
+ignore_literals = ["Library", "com.openai.chat"]
+store = [
+  "~/Library/Application Support/com.openai.chat/conversations-v3-<acct>/<uuid>.data (encrypted; detected only)",
+]
+
+[upstream]
+repo = "closed source"
+commit = "unknown"
+date = "2026-05-29"
+
+[types]
+"file.conversations-v3" = { status = "ignored", note = "encrypted; counted, not decoded" }

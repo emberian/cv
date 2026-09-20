@@ -220,8 +220,14 @@ Rules:
   System→Notice. Adapters MUST set the precise kind.
 - **`extra` is nested by harness, always.** `m.harness_extra_mut(Harness::Claude)` returns the
   `extra["claude"]` object. The keys inside keep the harness's own spelling (`attachment_type`,
-  `history_mode`, `display_kind`), snake_case where cv invents a name. The only top-level key
-  besides harness names is `_record`.
+  `history_mode`, `display_kind`), snake_case where cv invents a name. A namespace key is either a
+  canonical harness name or `cv` (`harness::CV_NAMESPACE`), which holds cv's own cross-harness
+  parse diagnostics such as `skipped_lines`; `Harness::parse("cv")` is `None`, so the two can never
+  collide. Exactly two flat keys survive, both message-level and both cv's own streaming
+  bookkeeping, never harness facts: `_record` (the verbatim carrier under `ParseOptions::complete`)
+  and `cv_byte_offset` (`crate::offsets::OFFSET_KEY`, on the per-message hot path). A session's
+  `extra` has no flat keys at all. `harness::assert_no_flat_keys(&Session)` states this rule once
+  and every adapter's tests call it.
 - **Shared concepts leave `extra`.** Compaction → `kind`; system prompt → `Session::system_prompt`;
   parent/fork/continued → `Session::lineage`; tool details → `Block::ToolResult::details`;
   error → `kind: Error` + `extra[h]["error"]`; injected context origin → `origin`.
@@ -237,8 +243,19 @@ Rules:
   `MessageKind::InjectedContext` as system reminders (kind name from `extra["claude"]["attachment_type"]`
   when present); `events.rs`/`tools.rs` read Claude's `toolUseResult` from `extra["claude"]`;
   `render.rs`/`html.rs` and `cv show` label a System turn by its `kind` (plus the attachment kind).
-- **`Session::model`** is the session default; `Message::model` is set only when it differs
-  (REARCH "IR diet").
+- **`Session::model`** is the session default, and `Message::model` names the model that turn ran
+  under. REARCH's "IR diet" would null a message model that merely repeats the session default;
+  **that rule is withdrawn for any seekable harness** (2026-09-19). `crate::offsets::stream_range`
+  serves `cv show --range` by parsing from a recorded mid-file byte offset, so a record's parse
+  must not depend on how much of the file preceded it. Nulling a duplicate makes it depend on
+  exactly that, and it also leaves a windowed read with no way to learn the model at all when the
+  adapter emits no `meta()`, which is the case for Claude. An adapter may still omit a model its
+  store never recorded; it may not omit one the store did record. Redundant strings are the
+  cheaper price than position-dependent parsing.
+- **`events.rs`/`tools.rs` and `crate::offsets`** reach harness facts through
+  `harness_extra(Harness::X)`, never a flat key. The seek path's codex model-change hazard check
+  is the cautionary tale: it read a flat `codex_event` after the adapter had nested it, so it
+  silently stopped firing and a model-changing session looked seekable.
 
 ## 5. Fidelity verifier v2 (`emit_verified`)
 

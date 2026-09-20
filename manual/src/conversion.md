@@ -50,30 +50,39 @@ These are the harnesses `emit()` can currently write — the authoritative list 
 
 > The other seven parseable harnesses — **Cursor**, **Goose**, **Zed**, the **Claude
 > desktop app**, the **ChatGPT desktop app**, and the **ChatGPT/Claude.ai account data
-> exports** — are parse-only. You can read, search, and convert *away* from them, but
-> they aren't conversion targets yet (their on-disk stores are harder to write back
+> exports** — are parse-only. You can read, search, and port *away* from them, but
+> they aren't port targets yet (their on-disk stores are harder to write back
 > safely). Asking to emit to one gives a clear "not supported yet" error rather than
 > corrupting anything.
 
-## `cv convert` — change harness format
+## `cv port` — one verb for both
 
-`cv convert` parses a session, then emits it into another harness's native format:
+Converting a session's format and rehoming it to a new directory were always the same
+act: **produce a copy of this session that runs elsewhere.** Since 0.11.0 they are one
+command. (`cv convert` is gone; it errors with a pointer to this.)
 
 ```sh
-# Convert a Codex session into Claude Code's format.
-cv convert <id> --to claude
+# Convert a Codex session into Claude Code's format (same working directory).
+cv port <id> --harness claude
 
-# Source harness is auto-detected from the id; pass --from to disambiguate.
-cv convert <id> --from codex --to opencode
+# The source harness rides on the id when a bare prefix would be ambiguous.
+cv port codex:019e75e0 --harness opencode
 
 # Dry run: write under a scratch dir instead of the target's real storage root.
-cv convert <id> --to gemini --out /tmp/try-gemini
+cv port <id> --harness gemini --out /tmp/try-gemini
 
-# Rehome to a new working directory while converting.
-cv convert <id> --to claude --cwd ~/work/other-project
+# Rehome a session to a new working directory (same harness).
+cv port <id> --cwd ~/work/new-checkout
+
+# Rehome *and* change harness in one step.
+cv port <id> --harness claude --cwd ~/work/new-checkout
 ```
 
-By default `convert` writes into the target harness's real storage root (so the converted
+`--harness` names the target harness; omitted, it defaults to the source's, which makes
+a pure rehome. `--cwd` names the new working directory. Neither is spelled `--to`
+any more: a flag says what its value *is*, not where it goes.
+
+By default `port` writes into the target harness's real storage root (so the ported
 session shows up when you launch that harness), and prints a resume hint:
 
 ```text
@@ -82,32 +91,22 @@ session shows up when you launch that harness), and prints a resume hint:
 ```
 
 If the target harness doesn't appear to be installed, `cv` asks you to pass `--out <dir>`
-rather than guessing where its store lives.
-
-## `cv port` — rehome a session
-
-`cv port` is conversion's sibling for *moving* a session. It defaults to the **same**
-harness (a pure rehome) but takes `--to` to combine rehoming with a format change:
-
-```sh
-# Rehome a session to a new working directory (same harness).
-cv port <id> --to-dir ~/work/new-checkout
-
-# Rehome *and* convert to another harness in one step.
-cv port <id> --to claude --to-dir ~/work/new-checkout
-```
+rather than guessing where its store lives. The source session is **never** touched.
 
 Rehoming rewrites the working directory baked into the target format (Claude's encoded
 project-dir name, Grok's percent-encoded path, Cline/Roo's `<environment_details>` cwd
 line, …) so the ported session resolves to the new location.
 
 **Same-harness fidelity.** When the source and target harness are the same (a pure rehome,
-or an A→A convert), the session is parsed **format-complete** (`ParseOptions::complete()`):
+or an A→A port), the session is parsed **format-complete** (`ParseOptions::complete()`):
 every record — including the non-conversational meta lines the lean passes skip (Claude's
 `mode`/`queue-operation`/`ai-title`/compact-boundary records, exhaustive per-record
 `extra` fields) — is carried through the IR and replayed verbatim into the output, with only
-the session-identity fields (`sessionId`, `cwd`) rewritten to the new home. Cross-harness
-conversion uses the ordinary full-fidelity parse, since one harness's raw records can't be
+the session-identity fields (`sessionId`, `cwd`) rewritten to the new home. Records the
+adapter doesn't interpret ride along as [`carrier`](architecture.md#the-unified-ir) messages,
+and the replay fields live in the harness's own bag (`extra["claude"]`, …) plus the verbatim
+record at `_record` — so an emitter only ever reads back its *own* harness's keys. Cross-harness
+porting uses the ordinary full-fidelity parse, since one harness's raw records can't be
 replayed into another's format.
 
 **It also brings the project's memory along.** Unless you pass `--no-context`, `port`
@@ -131,17 +130,28 @@ clustervision tells you when that happens instead of pretending otherwise.
 
 ### Verified emits
 
-Every `cv convert` and `cv port` runs `emit_verified()`, which does the honest thing: after
-writing the output, it **re-parses that output with the target's own adapter** and diffs it
-against the source IR. Any content that didn't make it back is printed as a human-readable
-warning (`diff_lossy()`), e.g. `⚠ lossy: dropped 3 tool calls` or `⚠ lossy: 2 reasoning
-blocks preserved as encrypted/summary only`. This is purely a read-back check — it never
-changes what `emit()` wrote.
+Every `cv port` runs `emit_verified()`, which does the honest thing: after writing the
+output, it **re-parses that output with the target's own adapter** and diffs it against the
+source IR, message by message. This is purely a read-back check — it never changes what
+`emit()` wrote.
 
-It compares counts of the things most likely to be lost: tool calls, tool results, images,
-reasoning (thinking) text, and standalone system turns. An empty warning list means a clean
-round-trip (modulo fields the format simply can't hold, which aren't flagged because they're
-inherent to the format).
+What it compares, per message: the `role` sequence, the [`kind`](architecture.md#the-unified-ir)
+sequence, block-`type` counts, thinking (distinguishing text, signature-only and encrypted),
+tool names on results, `is_error`, whether `details` survived, and whether `usage`, `model`,
+timestamps and ids survived. Plus, per session: title, cwd, model, `system_prompt` and
+`lineage`.
+
+Every difference becomes a **delta**, and every delta is classified against a per-emitter
+table of what that format genuinely cannot carry:
+
+- **expected** — the target format has no place for this (vendor-bound thinking signatures,
+  per-message ids in a format that doesn't store them). Reported under `⚠ lost`, never fatal.
+- **unexpected** — the target *could* have held it and didn't. Reported the same way, and
+  `cv port --strict` exits non-zero on any of them.
+
+An empty delta list means a fully clean round-trip. The point of the split is that "lossy"
+stays *visible* without crying wolf: a format limitation and a bug look different in the
+output, and `--strict` fails on exactly one of them.
 
 ### Known faithful-but-lossy cases
 
@@ -161,23 +171,24 @@ emitter does the most faithful thing the destination format allows:
 When any of these reduce the content on the way out, `emit_verified` surfaces it as a
 warning — so "lossy" is always *visible*, never silent.
 
-## The IR block kinds
+## The IR block types
 
-A `Session` is metadata (`id`, `cwd`, `title`, `model`, `git`, timestamps, …) plus a list
-of `Message`s. Each `Message` has a `Role` (`System` / `User` / `Assistant` / `Tool` —
-tool results are kept as a distinct role so conversions can re-encode them correctly) and a
-`content: Vec<Block>`. The block kinds (see `Block` in `ir.rs`):
+A `Session` is metadata (`id`, `cwd`, `title`, `model`, `git`, `system_prompt`, `lineage`,
+timestamps, …) plus a list of `Message`s. Each `Message` says **who** speaks (`role`),
+**what** the turn is (`kind`) and **where** it came from (`origin`), and carries a
+`content: Vec<Block>`. Blocks are tagged by `type` (see `Block` in `ir.rs`):
 
-| block | carries | notes |
+| `type` | carries | notes |
 |---|---|---|
-| `Text` | `text` | plain assistant/user prose |
-| `Thinking` | `text`, `signature?`, `encrypted?`, `redacted` | extended reasoning / chain-of-thought; `encrypted` holds an opaque provider blob |
-| `ToolUse` | `id`, `name`, `input` (JSON) | a tool/function invocation by the assistant |
-| `ToolResult` | `tool_use_id`, `content`, `is_error`, `tool_name?`, `status?`, `details?` | the result fed back for a call |
-| `File` | `mime?`, `path?`, `source?` | a first-class file/dir/resource attachment |
-| `Image` | `media_type?`, `data_ref?` | image bytes are **not** inlined into the IR — only a path/opaque reference is kept |
+| `text` | `text` | plain assistant/user prose |
+| `thinking` | `text`, `signature?`, `encrypted?`, `redacted` | extended reasoning; `signature` is Anthropic-bound, `encrypted` an opaque OpenAI-bound blob |
+| `tool_use` | `id`, `name`, `input` (JSON), `namespace?` | a tool/function invocation by the assistant |
+| `tool_result` | `tool_use_id`, `content`, `is_error`, `tool_name?`, `status?`, `details?` | the result fed back for a call |
+| `file` | `mime?`, `path?`, `source?` | a first-class file/dir/resource attachment |
+| `image` | `media_type?`, `data_ref?` | image bytes are **not** inlined into the IR — only a path/opaque reference is kept |
 
-Because each harness parser produces these same blocks, and each emitter knows how to write
-(or gracefully flatten) each one, conversion is just translation between two dialects of the
-same underlying conversation. For the full shape of a parsed session, see
-[OpenSession](opensession.md).
+Emitters read `kind` and block `type`, never another harness's private keys — which is what
+makes any-to-any porting a translation rather than a pile of special cases. The full
+vocabulary (every `kind`, every `origin`, `lineage`, and the `extra["<harness>"]` rule) is
+defined once in [Architecture](architecture.md#the-unified-ir). For the interchange shape of
+a parsed session, see [OpenSession](opensession.md).

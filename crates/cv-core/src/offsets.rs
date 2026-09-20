@@ -178,7 +178,13 @@ impl MessageSink for OffsetSink {
                 self.first_model = Some((idx, md.clone()));
             }
         }
-        if m.extra.get("codex_event").and_then(Value::as_str) == Some("turn_context") {
+        // Harness facts are nested (`extra["codex"]`), never flat — reading the flat key here
+        // silently disabled hazard detection and let a model-changing codex session look seekable.
+        if m.harness_extra(crate::ir::Harness::Codex)
+            .and_then(|b| b.get("codex_event"))
+            .and_then(Value::as_str)
+            == Some("turn_context")
+        {
             self.hazard = true;
         }
         Flow::Continue
@@ -214,6 +220,8 @@ fn meta_session(r: &SessionRef, row: &db::SeekRow, start: usize) -> Session {
     } else {
         s.title = r.title.clone();
         s.cwd = r.cwd.clone();
+        // Strictly before `start`: a model named by a message INSIDE the window arrives with that
+        // message, so only the skipped prefix's model has to be replayed here.
         s.model = match (row.first_model_idx, &row.first_model) {
             (Some(i), Some(m)) if i < start => Some(m.clone()),
             _ => None,
@@ -718,7 +726,7 @@ mod tests {
     fn sink_flags_codex_model_change_hazard() {
         let mut sink = OffsetSink::new();
         let mut note = stamped(40, None);
-        note.extra
+        note.harness_extra_mut(crate::ir::Harness::Codex)
             .insert("codex_event".into(), serde_json::json!("turn_context"));
         sink.message(stamped(0, None));
         sink.message(note);

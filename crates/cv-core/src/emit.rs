@@ -11,7 +11,8 @@
 //! point; `cv-core::lib` re-exports it and the `cv` CLI calls it.
 
 use crate::harness::EmitResult;
-use crate::ir::{Block, GitInfo, Harness, Role, Session, SessionRef};
+use crate::ir::{Block, GitInfo, Harness, Message, MessageKind, Role, Session, SessionRef};
+use crate::stream::ParseOptions;
 use anyhow::{Context, Result};
 use chrono::{DateTime, SecondsFormat, Utc};
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
@@ -27,6 +28,11 @@ pub struct EmitOptions {
     pub new_cwd: Option<PathBuf>,
     /// Force a specific new session id (otherwise a fresh one is generated).
     pub new_id: Option<String>,
+    /// Fail the emit if the fidelity verifier finds any **unexpected** loss (a field the target
+    /// format *can* hold that didn't survive the round-trip). Expected losses — fields the format
+    /// inherently cannot represent — never fail; they are reported under `⚠ lost`. The CLI wires
+    /// this to `port --strict`. Only [`emit_verified`] consults it (plain [`emit`] never verifies).
+    pub strict: bool,
 }
 
 /// An emitter: writes one IR session into one harness's native on-disk format.
@@ -98,24 +104,73 @@ fn has_unresolved_spans(session: &Session) -> bool {
 /// porting a session knows what (if anything) didn't survive.
 ///
 /// This never changes what `emit` writes — it's a read-back verification pass on top of it.
+///
+/// With [`EmitOptions::strict`] a single **unexpected** delta (a field the target could hold but
+/// lost) fails the emit; expected losses never do. The returned `Vec<String>` is the human `⚠ lost`
+/// rendering (both expected and unexpected losses, so the user sees the full picture). Callers that
+/// want the structured deltas call [`emit_report`].
 pub fn emit_verified(
     session: &Session,
     target: Harness,
     out_dir: &Path,
     opts: &EmitOptions,
 ) -> Result<(EmitResult, Vec<String>)> {
+    let (result, report) = emit_report(session, target, out_dir, opts)?;
+    if opts.strict {
+        let unexpected: Vec<&Delta> = report.deltas.iter().filter(|d| !d.expected).collect();
+        if !unexpected.is_empty() {
+            let joined = unexpected.iter().map(|d| d.describe()).collect::<Vec<_>>().join("; ");
+            anyhow::bail!(
+                "--strict: {} unexpected fidelity loss(es) porting to {target}: {joined}",
+                unexpected.len()
+            );
+        }
+    }
+    Ok((result, report.lost_lines()))
+}
+
+/// Like [`emit_verified`] but returns the structured [`FidelityReport`] instead of rendered strings,
+/// and never fails on a delta (the caller decides what `strict` means). This is the field-by-field
+/// diff between the source IR and what the target's own adapter reads back — the v2 verifier.
+pub fn emit_report(
+    session: &Session,
+    target: Harness,
+    out_dir: &Path,
+    opts: &EmitOptions,
+) -> Result<(EmitResult, FidelityReport)> {
     let result = emit(session, target, out_dir, opts)?;
-    let warnings = match reparse_emitted(target, &result) {
-        Ok(reparsed) => diff_lossy(session, &reparsed),
-        Err(e) => vec![format!("could not verify round-trip ({e:#})")],
+    // Re-parse at the fidelity the SOURCE was parsed at. `cv port` parses a same-harness rehome
+    // format-complete (`port::parse_for_emit`), and re-parsing that plainly compared a complete
+    // session against a lean one: impossible deltas such as `per-message model: 2106 → 836` on an
+    // 836-message session, because the source's carriers (and the complete-mode roles of synthetic
+    // notices) had no counterpart. Carriers are the tell — only a complete parse produces them —
+    // and their presence is exactly what has to match on both sides.
+    let reparse_opts = if session.messages.iter().any(is_carrier) {
+        ParseOptions::complete()
+    } else {
+        ParseOptions::full()
     };
-    Ok((result, warnings))
+    let report = match reparse_emitted(target, &result, &reparse_opts) {
+        Ok(reparsed) => diff_fidelity(target, session, &reparsed),
+        Err(e) => FidelityReport {
+            deltas: vec![Delta {
+                field: "round_trip".into(),
+                before: "parseable".into(),
+                after: format!("re-parse failed ({e:#})"),
+                expected: false,
+            }],
+        },
+    };
+    Ok((result, report))
 }
 
 /// Re-parse a just-emitted session back into the IR using `target`'s adapter, so we can diff it
 /// against the source. Mirrors how each adapter's `parse` keys off a [`SessionRef`].
-fn reparse_emitted(target: Harness, result: &EmitResult) -> Result<Session> {
+fn reparse_emitted(target: Harness, result: &EmitResult, opts: &ParseOptions) -> Result<Session> {
     use crate::harness::Adapter;
+    // Adapters that stream honour `opts` (complete ⇒ carriers + exhaustive `extra`); the rest fall
+    // through `Adapter::stream`’s default bridge to `parse`, which ignores it.
+    let collect = |a: &dyn Adapter, r: &SessionRef| crate::stream::collect_with(a, r, opts);
     let sref = |id: String, path: PathBuf| SessionRef {
         id,
         harness: target,
@@ -129,48 +184,79 @@ fn reparse_emitted(target: Harness, result: &EmitResult) -> Result<Session> {
     match target {
         Harness::Claude => {
             let id = result.new_id.clone();
-            crate::harness::claude::Claude::new().parse(&sref(id, result.path.clone()))
+            collect(&crate::harness::claude::Claude::new(), &sref(id, result.path.clone()))
         }
-        Harness::Codex => crate::harness::codex::Codex::new().parse(&sref(String::new(), result.path.clone())),
-        Harness::Grok => crate::harness::grok::Grok::new().parse(&sref(result.new_id.clone(), result.path.clone())),
-        Harness::OpenClaw => {
-            crate::harness::openclaw::OpenClaw::new().parse(&sref(result.new_id.clone(), result.path.clone()))
+        Harness::Codex => collect(
+            &crate::harness::codex::Codex::new(),
+            &sref(String::new(), result.path.clone()),
+        ),
+        Harness::Grok => {
+            // Grok's `parse` takes the title from the `SessionRef` (that is where discovery puts
+            // the `summary.json` `session_summary`/`generated_title`); re-parsing from a bare ref
+            // would lose it, so read the summary title into the ref exactly as discovery does.
+            let title = fs::read_to_string(result.path.join("summary.json"))
+                .ok()
+                .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+                .and_then(|v| {
+                    v.get("session_summary")
+                        .or_else(|| v.get("generated_title"))
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                });
+            let mut r = sref(result.new_id.clone(), result.path.clone());
+            r.title = title;
+            collect(&crate::harness::grok::Grok::new(), &r)
         }
-        Harness::Gemini => {
-            crate::harness::gemini::Gemini::new().parse(&sref(result.new_id.clone(), result.path.clone()))
-        }
+        Harness::OpenClaw => collect(
+            &crate::harness::openclaw::OpenClaw::new(),
+            &sref(result.new_id.clone(), result.path.clone()),
+        ),
+        Harness::Gemini => collect(
+            &crate::harness::gemini::Gemini::new(),
+            &sref(result.new_id.clone(), result.path.clone()),
+        ),
         Harness::OpenCode => reparse_opencode(result),
         #[cfg(feature = "sqlite")]
         Harness::Hermes => reparse_hermes(result),
         // The emitters whose output is parseable directly from the EmitResult path.
-        Harness::Kimi => crate::harness::kimi::Kimi::new().parse(&sref(result.new_id.clone(), result.path.clone())),
-        Harness::LmStudio => {
-            crate::harness::lmstudio::LmStudio::new().parse(&sref(result.new_id.clone(), result.path.clone()))
-        }
-        Harness::Cline => crate::harness::cline::Cline::new().parse(&sref(result.new_id.clone(), result.path.clone())),
-        Harness::Roo => crate::harness::roo::Roo::new().parse(&sref(result.new_id.clone(), result.path.clone())),
-        Harness::Continue => {
-            crate::harness::continuedev::Continue::new().parse(&sref(result.new_id.clone(), result.path.clone()))
-        }
+        Harness::Kimi => collect(
+            &crate::harness::kimi::Kimi::new(),
+            &sref(result.new_id.clone(), result.path.clone()),
+        ),
+        Harness::LmStudio => collect(
+            &crate::harness::lmstudio::LmStudio::new(),
+            &sref(result.new_id.clone(), result.path.clone()),
+        ),
+        Harness::Cline => collect(
+            &crate::harness::cline::Cline::new(),
+            &sref(result.new_id.clone(), result.path.clone()),
+        ),
+        Harness::Roo => collect(
+            &crate::harness::roo::Roo::new(),
+            &sref(result.new_id.clone(), result.path.clone()),
+        ),
+        Harness::Continue => collect(
+            &crate::harness::continuedev::Continue::new(),
+            &sref(result.new_id.clone(), result.path.clone()),
+        ),
         // Qwen reuses Gemini's emitter (same record shape) but its own parser.
-        Harness::Qwen => crate::harness::qwen::Qwen::new().parse(&sref(result.new_id.clone(), result.path.clone())),
+        Harness::Qwen => collect(
+            &crate::harness::qwen::Qwen::new(),
+            &sref(result.new_id.clone(), result.path.clone()),
+        ),
         other => anyhow::bail!("re-parse for {other} not supported"),
     }
 }
 
-/// OpenCode resolves message/part dirs relative to a storage root (normally
-/// `$HOME/.local/share/opencode/storage`); the emit target dir IS that root, so re-parse with an
-/// adapter rooted there explicitly. (No `HOME` mutation: `set_var` is process-global and races any
-/// concurrent `getenv` — e.g. rayon discovery threads.)
+/// OpenCode's live store is `opencode.db` (SQLite); the emitter writes the session there and
+/// `result.path` IS that db file, so re-parse by pointing an adapter straight at it (no `HOME`
+/// mutation: `set_var` is process-global and races any concurrent `getenv` — e.g. rayon discovery
+/// threads). This fixes the old "could not locate storage root" failure of the dead JSON-tree path.
+#[cfg(feature = "sqlite")]
 fn reparse_opencode(result: &EmitResult) -> Result<Session> {
     use crate::harness::Adapter;
-    // result.path is .../storage/session/<projectID>/<id>.json — walk up to the storage root.
-    let storage = result
-        .path
-        .ancestors()
-        .find(|p| p.file_name().map(|n| n == "storage").unwrap_or(false))
-        .context("locating opencode storage root for re-parse")?;
-    let oc = crate::harness::opencode::OpenCode::with_root(storage.to_path_buf());
+    let oc = crate::harness::opencode::OpenCode::with_db(result.path.clone());
     oc.discover()
         .ok()
         .and_then(|refs| {
@@ -179,6 +265,11 @@ fn reparse_opencode(result: &EmitResult) -> Result<Session> {
                 .and_then(|r| oc.parse(&r).ok())
         })
         .context("re-discovering emitted opencode session")
+}
+
+#[cfg(not(feature = "sqlite"))]
+fn reparse_opencode(_result: &EmitResult) -> Result<Session> {
+    anyhow::bail!("opencode re-parse requires the `sqlite` feature")
 }
 
 /// Hermes re-parses straight from the emitted `state.db` (no `HERMES_HOME` mutation — see
@@ -197,100 +288,507 @@ fn reparse_hermes(result: &EmitResult) -> Result<Session> {
         .context("re-discovering emitted hermes session")
 }
 
-/// Count notable content features of a session, for before/after lossiness comparison.
-struct ContentStats {
-    tool_uses: usize,
-    tool_results: usize,
-    images: usize,
-    /// Thinking blocks carrying real summary/raw text (not just an encrypted blob).
-    thinking_with_text: usize,
-    /// Thinking blocks carrying only an encrypted blob (text empty).
-    thinking_encrypted_only: usize,
-    system_turns: usize,
+// ------------------------------------------------------------------------------------------------
+// Fidelity verifier v2
+// ------------------------------------------------------------------------------------------------
+
+/// One field that changed across the emit→re-parse round-trip. `before`/`after` are human strings
+/// (counts, option values). `expected` is true when the target format inherently cannot carry the
+/// field (a known, non-fatal loss); false when it could have and didn't (an `--strict` failure).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Delta {
+    pub field: String,
+    pub before: String,
+    pub after: String,
+    pub expected: bool,
 }
 
-fn content_stats(session: &Session) -> ContentStats {
-    let mut s = ContentStats {
-        tool_uses: 0,
-        tool_results: 0,
-        images: 0,
-        thinking_with_text: 0,
-        thinking_encrypted_only: 0,
-        system_turns: 0,
-    };
+impl Delta {
+    /// A one-line `<field>: <before> → <after>` description (used in `--strict` errors and the
+    /// `⚠ lost` lines). Values are [`brief`]ed: a real session's system prompt is thousands of
+    /// lines, and dumping it into the terminal buried every other delta. The struct keeps the full
+    /// values for `--json` consumers.
+    pub fn describe(&self) -> String {
+        format!("{}: {} → {}", self.field, brief(&self.before), brief(&self.after))
+    }
+}
+
+/// A value shortened for one-line display: its first non-blank line, capped, plus the full
+/// character count when anything was cut. Short single-line values pass through untouched.
+fn brief(s: &str) -> String {
+    const MAX: usize = 72;
+    let first = s.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+    let head: String = first.chars().take(MAX).collect();
+    if head.len() < s.len() {
+        format!("{head}… ({} chars)", s.chars().count())
+    } else {
+        head
+    }
+}
+
+/// The structured result of the v2 fidelity check: every field that did not survive the round-trip,
+/// each classified expected/unexpected. An empty `deltas` is a fully clean round-trip.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct FidelityReport {
+    pub deltas: Vec<Delta>,
+}
+
+impl FidelityReport {
+    /// Any loss the target could have avoided — what `port --strict` fails on.
+    pub fn has_unexpected(&self) -> bool {
+        self.deltas.iter().any(|d| !d.expected)
+    }
+
+    /// Render every delta as a human `⚠ lost` line (expected ones tagged so the reader knows the
+    /// format simply cannot hold them). Both kinds are shown: the point is a complete picture.
+    pub fn lost_lines(&self) -> Vec<String> {
+        self.deltas
+            .iter()
+            .map(|d| {
+                if d.expected {
+                    format!("{} (expected: this format cannot carry it)", d.describe())
+                } else {
+                    d.describe()
+                }
+            })
+            .collect()
+    }
+}
+
+/// Per-message + per-session features extracted for a before/after comparison.
+#[derive(Default)]
+struct Features {
+    role_counts: std::collections::BTreeMap<&'static str, usize>,
+    kind_counts: std::collections::BTreeMap<&'static str, usize>,
+    // Block-type counts (thinking is broken out into its three sub-features below).
+    text: usize,
+    tool_use: usize,
+    tool_result: usize,
+    image: usize,
+    file: usize,
+    thinking_text: usize,
+    thinking_sig: usize,
+    thinking_enc: usize,
+    results_with_name: usize,
+    results_with_details: usize,
+    results_is_error: usize,
+    usage: usize,
+    cost: usize,
+    timestamps: usize,
+    ids: usize,
+    model_eff: usize,
+}
+
+/// A verbatim meta record carried under `ParseOptions::complete` — never a conversational turn.
+fn is_carrier(m: &Message) -> bool {
+    m.kind == MessageKind::Carrier || m.extra.contains_key(crate::harness::claude::CARRIER_KEY)
+}
+
+/// Whether `target`’s format can hold this block at all (the block-level half of
+/// [`target_holds`]). A thinking block survives if ANY of its three payloads does.
+fn block_survives(target: Harness, b: &Block) -> bool {
+    match b {
+        Block::Text { .. } => true,
+        Block::Thinking {
+            text,
+            signature,
+            encrypted,
+            ..
+        } => {
+            (!text.trim().is_empty() && target_holds(target, "thinking_text"))
+                || (signature.is_some() && target_holds(target, "thinking_signature"))
+                || (encrypted.is_some() && target_holds(target, "thinking_encrypted"))
+        }
+        Block::ToolUse { .. } => target_holds(target, "tool_use"),
+        Block::ToolResult { .. } => target_holds(target, "tool_result"),
+        Block::Image { .. } => target_holds(target, "image"),
+        Block::File { .. } => target_holds(target, "file"),
+    }
+}
+
+/// A turn with nothing left to write once the target has dropped the blocks it cannot hold: every
+/// block is unrepresentable there, so the emitted record is empty and the target’s own reader drops
+/// it. The real case is Claude’s **signature-only thinking** — bound reasoning with no plaintext
+/// and no portable blob (109 of 380 assistant turns in one 836-message session): ported to
+/// Codex/OpenCode it leaves an empty turn those stores never read back.
+///
+/// Such turns are excluded from BOTH sides of the diff and reported once, as an expected
+/// `unrepresentable_turns` delta — their disappearance is a consequence of a block-level loss the
+/// table already calls expected, and counting them as lost turns made `--strict` fail on every real
+/// Claude session (drowning the losses a target genuinely could have avoided).
+fn unrepresentable(target: Harness, m: &Message) -> bool {
+    !m.content.is_empty() && !m.content.iter().any(|b| block_survives(target, b))
+}
+
+fn features(target: Harness, session: &Session) -> Features {
+    let mut f = Features::default();
     for m in &session.messages {
-        // Only content-bearing system turns count: a format-complete *carrier* (an empty-content
-        // System message holding a verbatim meta record) is replayed byte-for-byte by the emitter
-        // but re-parses (under the lean full() pass) into either nothing or a rendered system turn
-        // — counting carriers would flag that as loss when nothing was lost.
-        if m.role == Role::System && !m.content.is_empty() {
-            s.system_turns += 1;
+        // Two kinds of message are not *turns* for this comparison and are skipped whole — counting
+        // their timestamps/ids/model would have reported losses that no emitter could have avoided:
+        //
+        //  * a format-complete **carrier** (empty-content System message holding a verbatim meta
+        //    record) is bookkeeping the emitter replays byte-for-byte;
+        //  * a turn the target cannot represent AT ALL ([`unrepresentable`]).
+        if is_carrier(m) || unrepresentable(target, m) {
+            continue;
+        }
+        *f.role_counts.entry(role_str(m.role)).or_default() += 1;
+        *f.kind_counts.entry(m.kind.as_str()).or_default() += 1;
+        if m.timestamp.is_some() {
+            f.timestamps += 1;
+        }
+        if m.id.is_some() {
+            f.ids += 1;
+        }
+        // Usage is a property of a MODEL turn, and that is the only place a store keeps it (Codex
+        // attaches `token_count` to the assistant message it trails; OpenCode to the assistant
+        // part). Claude also writes a `usage` block on its synthetic client-side error notices,
+        // which parse as System turns — counting those made every real port report 13 lost usages
+        // that no target has a slot for.
+        if m.usage.is_some() && m.role == Role::Assistant {
+            f.usage += 1;
+        }
+        if m.usage.as_ref().and_then(|u| u.cost_usd).is_some() && m.role == Role::Assistant {
+            f.cost += 1;
+        }
+        // Effective model: a turn's own model, else the session default (the "model only when it
+        // differs" IR rule means comparing raw `Message::model` would flag non-losses).
+        if m.model.is_some() || session.model.is_some() {
+            f.model_eff += 1;
         }
         for b in &m.content {
             match b {
-                Block::ToolUse { .. } => s.tool_uses += 1,
-                Block::ToolResult { .. } => s.tool_results += 1,
-                Block::Image { .. } => s.images += 1,
-                Block::Thinking { text, .. } => {
-                    if text.trim().is_empty() {
-                        s.thinking_encrypted_only += 1;
-                    } else {
-                        s.thinking_with_text += 1;
+                Block::Text { .. } => f.text += 1,
+                Block::ToolUse { .. } => f.tool_use += 1,
+                Block::Image { .. } => f.image += 1,
+                Block::File { .. } => f.file += 1,
+                Block::ToolResult {
+                    tool_name,
+                    is_error,
+                    details,
+                    ..
+                } => {
+                    f.tool_result += 1;
+                    if tool_name.as_deref().is_some_and(|n| !n.is_empty()) {
+                        f.results_with_name += 1;
+                    }
+                    if *is_error {
+                        f.results_is_error += 1;
+                    }
+                    if details.is_some() {
+                        f.results_with_details += 1;
                     }
                 }
-                _ => {}
+                Block::Thinking {
+                    text,
+                    signature,
+                    encrypted,
+                    ..
+                } => {
+                    if !text.trim().is_empty() {
+                        f.thinking_text += 1;
+                    }
+                    if signature.is_some() {
+                        f.thinking_sig += 1;
+                    }
+                    if encrypted.is_some() {
+                        f.thinking_enc += 1;
+                    }
+                }
             }
         }
     }
-    s
+    f
 }
 
-/// Human-readable lossy-conversion warnings: what the source IR had that didn't survive the
-/// emit→re-parse round-trip. An empty Vec means a clean round-trip (modulo fields the target can't
-/// represent, which we don't flag because they're inherent to the format).
-fn diff_lossy(input: &Session, reparsed: &Session) -> Vec<String> {
-    let before = content_stats(input);
-    let after = content_stats(reparsed);
-    let mut warnings = Vec::new();
+fn role_str(r: Role) -> &'static str {
+    match r {
+        Role::System => "system",
+        Role::User => "user",
+        Role::Assistant => "assistant",
+        Role::Tool => "tool",
+    }
+}
 
-    if after.tool_uses < before.tool_uses {
-        let n = before.tool_uses - after.tool_uses;
-        warnings.push(format!("dropped {n} tool call{}", if n == 1 { "" } else { "s" }));
+/// Whether `target`'s native format can carry `field`. Everything it cannot is reported as an
+/// **expected** loss (never fatal under `--strict`); everything it can but didn't is **unexpected**.
+/// Grounded in each adapter's read side (`docs/FORMATS.md`, the `harness/*.rs` parsers):
+/// Anthropic signature-only thinking survives only into Anthropic-shaped stores; OpenAI encrypted
+/// reasoning only into OpenAI-shaped ones; per-message ids not into Codex/Hermes; a standalone tool
+/// name on a *result* only where the format has a slot for it; structured `details` only into
+/// Claude's `toolUseResult` / OpenCode's tool `state`; cost only into OpenCode.
+fn target_holds(t: Harness, field: &str) -> bool {
+    use Harness::*;
+    match field {
+        // Text is universal; every conversational store keeps it.
+        "text" => true,
+        "thinking_text" => !matches!(t, LmStudio | Continue),
+        "thinking_signature" => matches!(t, Claude | OpenCode | OpenClaw),
+        "thinking_encrypted" => matches!(t, Codex | Grok | Hermes),
+        "image" => !matches!(t, Grok | LmStudio),
+        "file" => matches!(t, Claude | OpenCode | Gemini),
+        "tool_use" | "tool_result" => !matches!(t, LmStudio),
+        "tool_name" => matches!(t, OpenClaw | Hermes | Codex | Gemini | OpenCode),
+        "is_error" => !matches!(t, LmStudio),
+        "details" => matches!(t, Claude | OpenCode),
+        "usage" => !matches!(t, Grok | Cline | Roo | Continue),
+        "cost" => matches!(t, OpenCode),
+        // Grok's `chat_history.jsonl` turns carry no per-message timestamp; LM Studio none either.
+        "timestamp" => !matches!(t, LmStudio | Grok),
+        // Per-message ids: kept by the stores that thread by a stable id.
+        "id" => matches!(t, Claude | OpenCode | OpenClaw | Gemini | Kimi | Cline | Roo),
+        "model" => true,
+        "title" => !matches!(t, Codex),
+        "cwd" => !matches!(t, LmStudio),
+        "session_model" => true,
+        "system_prompt" => matches!(t, Claude | Codex | Hermes | Kimi),
+        // Lineage reconstruction on a standalone emit needs a target the pointer resolves in; treat
+        // any lineage change as expected (a fresh single-session port has nothing to point at).
+        "lineage" => false,
+        _ => true,
     }
-    if after.tool_results < before.tool_results {
-        let n = before.tool_results - after.tool_results;
-        warnings.push(format!("dropped {n} tool result{}", if n == 1 { "" } else { "s" }));
-    }
-    if after.images < before.images {
-        let n = before.images - after.images;
-        warnings.push(format!(
-            "{n} image{} dropped or reduced to a placeholder",
-            if n == 1 { "" } else { "s" }
-        ));
-    }
-    // Reasoning text that didn't come back, or came back only as an encrypted/summary blob.
-    if after.thinking_with_text < before.thinking_with_text {
-        let lost = before.thinking_with_text - after.thinking_with_text;
-        if after.thinking_encrypted_only > before.thinking_encrypted_only {
-            warnings.push(format!(
-                "{lost} reasoning block{} preserved as encrypted/summary only (raw text not stored)",
-                if lost == 1 { "" } else { "s" }
-            ));
-        } else {
-            warnings.push(format!(
-                "dropped {lost} reasoning block{}",
-                if lost == 1 { "" } else { "s" }
-            ));
+}
+
+/// The v2 diff: compare the source IR against what the target's own adapter read back, field by
+/// field, classifying each surviving delta. Only *losses* (count decreases, dropped/altered session
+/// fields) are reported — the re-parse legitimately adds records (compaction notes, synthesized
+/// ids/timestamps), and an addition is never a fidelity loss.
+fn diff_fidelity(target: Harness, input: &Session, reparsed: &Session) -> FidelityReport {
+    let before = features(target, input);
+    let after = features(target, reparsed);
+    // Turns the target cannot represent at all: reported once, as their own expected loss, instead
+    // of as a phantom deficit spread over role/kind/timestamp/id counts.
+    let dropped = input
+        .messages
+        .iter()
+        .filter(|m| !is_carrier(m) && unrepresentable(target, m))
+        .count();
+    let mut deltas = Vec::new();
+
+    // A count loss (after < before) for `field`, classified via the target's capability table.
+    fn count_delta(deltas: &mut Vec<Delta>, target: Harness, field: &str, label: &str, b: usize, a: usize) {
+        if a < b {
+            deltas.push(Delta {
+                field: label.to_string(),
+                before: b.to_string(),
+                after: a.to_string(),
+                expected: !target_holds(target, field),
+            });
         }
     }
-    if after.system_turns < before.system_turns {
-        let n = before.system_turns - after.system_turns;
-        warnings.push(format!(
-            "dropped {n} system turn{} (target has no standalone system message)",
-            if n == 1 { "" } else { "s" }
-        ));
+    // A dropped-or-changed session-level option field.
+    fn opt_delta(
+        deltas: &mut Vec<Delta>,
+        target: Harness,
+        field: &str,
+        label: &str,
+        b: Option<String>,
+        a: Option<String>,
+    ) {
+        if b.is_some() && a != b {
+            deltas.push(Delta {
+                field: label.to_string(),
+                before: b.unwrap_or_default(),
+                after: a.unwrap_or_else(|| "(none)".into()),
+                expected: !target_holds(target, field),
+            });
+        }
     }
-    warnings
+
+    if dropped > 0 {
+        deltas.push(Delta {
+            field: "unrepresentable_turns".into(),
+            before: dropped.to_string(),
+            after: "0".into(),
+            expected: true,
+        });
+    }
+    // Role / kind census. A lost *conversational* turn (user/assistant/tool) is always unexpected;
+    // a lost system turn is format-dependent (Claude has no standalone system turn), so expected.
+    for (role, &b) in &before.role_counts {
+        let a = after.role_counts.get(role).copied().unwrap_or(0);
+        if a < b {
+            deltas.push(Delta {
+                field: format!("role:{role}"),
+                before: b.to_string(),
+                after: a.to_string(),
+                expected: *role == "system",
+            });
+        }
+    }
+    // Kinds: the three conversational kinds are tracked precisely (a dropped one is unexpected). The
+    // meta/system kinds (notice, injected_context, compaction_*, error, model_change, …) are one
+    // bucket: a target routinely *re-tags* a meta turn (a Notice becomes a Codex `developer`
+    // message → InjectedContext) without losing it, and only a net *drop* of meta turns is a loss —
+    // always an expected, format-dependent one.
+    let is_conversational = |k: &str| matches!(k, "prompt" | "reply" | "tool_result");
+    for kind in ["prompt", "reply", "tool_result"] {
+        let b = before.kind_counts.get(kind).copied().unwrap_or(0);
+        let a = after.kind_counts.get(kind).copied().unwrap_or(0);
+        if a < b {
+            deltas.push(Delta {
+                field: format!("kind:{kind}"),
+                before: b.to_string(),
+                after: a.to_string(),
+                expected: false,
+            });
+        }
+    }
+    let meta_before: usize = before
+        .kind_counts
+        .iter()
+        .filter(|(k, _)| !is_conversational(k))
+        .map(|(_, n)| *n)
+        .sum();
+    let meta_after: usize = after
+        .kind_counts
+        .iter()
+        .filter(|(k, _)| !is_conversational(k))
+        .map(|(_, n)| *n)
+        .sum();
+    if meta_after < meta_before {
+        deltas.push(Delta {
+            field: "kind:meta".into(),
+            before: meta_before.to_string(),
+            after: meta_after.to_string(),
+            expected: true,
+        });
+    }
+
+    count_delta(&mut deltas, target, "text", "block:text", before.text, after.text);
+    count_delta(
+        &mut deltas,
+        target,
+        "tool_use",
+        "block:tool_use",
+        before.tool_use,
+        after.tool_use,
+    );
+    count_delta(
+        &mut deltas,
+        target,
+        "tool_result",
+        "block:tool_result",
+        before.tool_result,
+        after.tool_result,
+    );
+    count_delta(&mut deltas, target, "image", "block:image", before.image, after.image);
+    count_delta(&mut deltas, target, "file", "block:file", before.file, after.file);
+    count_delta(
+        &mut deltas,
+        target,
+        "thinking_text",
+        "thinking(text)",
+        before.thinking_text,
+        after.thinking_text,
+    );
+    count_delta(
+        &mut deltas,
+        target,
+        "thinking_signature",
+        "thinking(signature)",
+        before.thinking_sig,
+        after.thinking_sig,
+    );
+    count_delta(
+        &mut deltas,
+        target,
+        "thinking_encrypted",
+        "thinking(encrypted)",
+        before.thinking_enc,
+        after.thinking_enc,
+    );
+    count_delta(
+        &mut deltas,
+        target,
+        "tool_name",
+        "tool_name on result",
+        before.results_with_name,
+        after.results_with_name,
+    );
+    count_delta(
+        &mut deltas,
+        target,
+        "is_error",
+        "tool result is_error",
+        before.results_is_error,
+        after.results_is_error,
+    );
+    count_delta(
+        &mut deltas,
+        target,
+        "details",
+        "tool result details",
+        before.results_with_details,
+        after.results_with_details,
+    );
+    count_delta(&mut deltas, target, "usage", "usage", before.usage, after.usage);
+    count_delta(&mut deltas, target, "cost", "usage cost", before.cost, after.cost);
+    count_delta(
+        &mut deltas,
+        target,
+        "timestamp",
+        "timestamps",
+        before.timestamps,
+        after.timestamps,
+    );
+    count_delta(&mut deltas, target, "id", "message ids", before.ids, after.ids);
+    count_delta(
+        &mut deltas,
+        target,
+        "model",
+        "per-message model",
+        before.model_eff,
+        after.model_eff,
+    );
+
+    // Session-level fields: report a drop OR a change in value (not just absence).
+    opt_delta(
+        &mut deltas,
+        target,
+        "title",
+        "session title",
+        input.title.clone(),
+        reparsed.title.clone(),
+    );
+    opt_delta(
+        &mut deltas,
+        target,
+        "cwd",
+        "session cwd",
+        input.cwd.as_ref().map(|p| p.to_string_lossy().into_owned()),
+        reparsed.cwd.as_ref().map(|p| p.to_string_lossy().into_owned()),
+    );
+    opt_delta(
+        &mut deltas,
+        target,
+        "session_model",
+        "session model",
+        input.model.clone(),
+        reparsed.model.clone(),
+    );
+    opt_delta(
+        &mut deltas,
+        target,
+        "system_prompt",
+        "system prompt",
+        input.system_prompt.clone(),
+        reparsed.system_prompt.clone(),
+    );
+    if !input.lineage.is_empty() && input.lineage != reparsed.lineage {
+        deltas.push(Delta {
+            field: "lineage".into(),
+            before: "present".into(),
+            after: if reparsed.lineage.is_empty() {
+                "(none)".into()
+            } else {
+                "changed".into()
+            },
+            expected: !target_holds(target, "lineage"),
+        });
+    }
+
+    FidelityReport { deltas }
 }
 
 /// Which targets [`emit`] can currently write — derived from [`emitter_for`] (the one registry),
@@ -394,6 +892,22 @@ fn emit_claude(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<
         }
     }
 
+    // Session-level system prompt → a `prompt_snapshot` attachment (Claude's own slot for it), so a
+    // cross-harness port keeps the instructions the model ran under. A Claude→Claude session already
+    // carries this (its own `prompt_snapshot` attachment rides through as a carrier), so emit it only
+    // for a foreign source to avoid a duplicate.
+    if session.harness != Harness::Claude {
+        if let Some(sp) = session.system_prompt.as_deref().filter(|s| !s.trim().is_empty()) {
+            lines.push(json!({
+                "type": "attachment",
+                "sessionId": new_id,
+                "cwd": cwd_str,
+                "timestamp": ts0,
+                "attachment": { "type": "prompt_snapshot", "systemPrompt": [sp] },
+            }));
+        }
+    }
+
     // Thread the conversation by uuid / parentUuid.
     let mut parent: Option<String> = None;
     // Non-carrier System turns can't be replayed (see below) and are dropped — record each dropped
@@ -429,6 +943,52 @@ fn emit_claude(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<
                 }
             }
             lines.push(record);
+            continue;
+        }
+        // Cross-harness kind-aware records: a compaction pair, or injected context, carried into
+        // Claude's own record shapes (a Claude→Claude session replays these verbatim as carriers
+        // above, so this runs only when the source is another harness). Each threads normally so a
+        // child's parentUuid resolves. See `docs/INTERFACE-V2.md` §4.
+        if session.harness != Harness::Claude
+            && matches!(
+                msg.kind,
+                MessageKind::CompactionBoundary | MessageKind::CompactionSummary | MessageKind::InjectedContext
+            )
+        {
+            let uuid = msg.id.clone().unwrap_or_else(|| Uuid::new_v4().to_string());
+            let parent_uuid = match msg.parent_id.clone() {
+                Some(pid) => resolve_parent(&dropped, pid),
+                None => parent.clone(),
+            };
+            let ts = msg
+                .timestamp
+                .map(|t| t.to_rfc3339_opts(SecondsFormat::Millis, true))
+                .unwrap_or_else(|| ts0.clone());
+            let text = msg.text().unwrap_or_default();
+            let rec = match msg.kind {
+                MessageKind::CompactionBoundary => json!({
+                    "type": "system", "subtype": "compact_boundary", "level": "info",
+                    "uuid": uuid, "parentUuid": parent_uuid, "sessionId": new_id, "cwd": cwd_str,
+                    "timestamp": ts, "content": text,
+                    "compactMetadata": { "trigger": "manual", "preTokens": 0 },
+                }),
+                MessageKind::CompactionSummary => json!({
+                    "type": "user", "isCompactSummary": true,
+                    "uuid": uuid, "parentUuid": parent_uuid, "sessionId": new_id, "cwd": cwd_str,
+                    "timestamp": ts, "message": { "role": "user", "content": text },
+                }),
+                // InjectedContext → an `attachment` whose `rendered[].content` is the injected text
+                // (exactly what Claude's parser reads back as InjectedContext).
+                _ => json!({
+                    "type": "attachment",
+                    "uuid": uuid, "parentUuid": parent_uuid, "sessionId": new_id, "cwd": cwd_str,
+                    "timestamp": ts,
+                    "attachment": { "type": "injected_context" },
+                    "rendered": [{ "content": text }],
+                }),
+            };
+            lines.push(rec);
+            parent = Some(uuid);
             continue;
         }
         // Claude transcripts have no standalone system turn; skip to avoid polluting user text. (A
@@ -513,15 +1073,29 @@ fn emit_claude(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<
             Role::System => unreachable!("system turns are carried/skipped above"),
         }
 
-        // Format-complete / same-harness port: fold every captured `extra` field back onto the
+        // A tool result's structured `details` → Claude's `toolUseResult` sidecar: the slot Claude
+        // itself writes it in and reads it back from. INTERFACE-V2 §4 puts that sidecar on the block,
+        // so `details` is the source of truth for EVERY source harness — a Claude→Claude replay and
+        // a cross-harness port alike (foreign details survive rather than vanishing). The
+        // complete-mode bag copy applied below is only the fallback, for a message whose block-level
+        // details were rewritten or dropped between parse and emit.
+        if let Some(tur) = claude_tool_use_result(&msg.content) {
+            line.insert(crate::harness::claude::TOOL_USE_RESULT_KEY.into(), tur);
+        }
+
+        // Format-complete / same-harness port: fold every captured replay field back onto the
         // record — top-level keys directly, `message.<k>` keys inside the `message` object — so the
-        // emitted line carries the same key set + values as the source. (`toolUseResult`,
-        // `requestId`, `version`, `userType`, `message.id`, `message.stop_reason`, … all ride here.)
-        // Internal sidecar keys (lazy offset stamp, the carrier key) are never emitted. Only for a
-        // Claude→Claude session: a foreign source's `extra` holds *that* harness's fields, which
-        // aren't valid Claude record keys, so cross-harness convert keeps its prior lean output.
+        // emitted line carries the same key set + values as the source. (`requestId`, `version`,
+        // `userType`, `message.id`, `message.stop_reason`, … all ride here; `toolUseResult` came
+        // from the block's `details` above and is not overwritten by the bag's copy of it.)
+        // These live in the Claude fact bag (`extra["claude"]`, IR-v2 nesting), so read from there;
+        // internal sidecar keys (lazy offset stamp, the carrier key) are never emitted. Only for a
+        // Claude→Claude session: a foreign source's bag holds *that* harness's fields, which aren't
+        // valid Claude record keys, so cross-harness convert keeps its prior lean output.
         if session.harness == Harness::Claude {
-            apply_claude_extra(&mut line, &msg.extra);
+            if let Some(bag) = msg.harness_extra(Harness::Claude) {
+                apply_claude_extra(&mut line, bag);
+            }
         }
 
         lines.push(Value::Object(line));
@@ -572,6 +1146,11 @@ fn apply_claude_extra(line: &mut Map<String, Value>, extra: &Map<String, Value>)
     use crate::harness::claude::MESSAGE_EXTRA_PREFIX;
     for (k, val) in extra {
         if is_internal_extra_key(k) || k == "sessionId" || k == "cwd" {
+            continue;
+        }
+        // `toolUseResult` was already rebuilt from the block's `details` (the IR's home for it);
+        // the bag's verbatim complete-mode copy is only the fallback, so it must not clobber it.
+        if k == crate::harness::claude::TOOL_USE_RESULT_KEY && line.contains_key(k) {
             continue;
         }
         if let Some(sub) = k.strip_prefix(MESSAGE_EXTRA_PREFIX) {
@@ -725,6 +1304,32 @@ fn claude_user_blocks(content: &[Block]) -> Vec<Value> {
     out
 }
 
+/// A record's `toolUseResult` sidecar, rebuilt from the message's tool-result `details`
+/// (INTERFACE-V2 §4: a tool result's structured extras live on the block, so `details` is where
+/// both a Claude replay and a cross-harness port read them from).
+///
+/// Two adjustments reverse what `claude::attach_tool_use_result` did on the way in: a sidecar that
+/// was not an object is parked under `details["toolUseResult"]` and
+/// comes back out verbatim, and cv's derived `persistedOutput` pointer is stripped (it is
+/// re-derived from the transcript stub on every parse and was never a Claude wire field — replaying
+/// it would invent a key the source record never had). `None` when the block carried nothing but
+/// that pointer.
+fn claude_tool_use_result(content: &[Block]) -> Option<Value> {
+    let details = content.iter().find_map(|b| match b {
+        Block::ToolResult { details: Some(d), .. } => Some(d),
+        _ => None,
+    })?;
+    let Value::Object(map) = details else {
+        return Some(details.clone());
+    };
+    if let Some(parked) = map.get(crate::harness::claude::TOOL_USE_RESULT_KEY) {
+        return Some(parked.clone());
+    }
+    let mut out = map.clone();
+    out.remove(crate::harness::claude::PERSISTED_OUTPUT_KEY);
+    (!out.is_empty()).then(|| Value::Object(out))
+}
+
 fn claude_tool_result_blocks(content: &[Block]) -> Vec<Value> {
     let mut out = Vec::new();
     for b in content {
@@ -802,6 +1407,11 @@ fn emit_codex(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<E
     // The Codex target uses its standard OpenAI provider; the model id remains independently
     // carried by `turn_context` below.
     meta.insert("model_provider".into(), json!("openai"));
+    // Session-level system prompt → Codex's own `base_instructions {text}` slot (the parser reads it
+    // back into `Session::system_prompt`), so a ported session keeps the instructions it ran under.
+    if let Some(sp) = session.system_prompt.as_deref().filter(|s| !s.trim().is_empty()) {
+        meta.insert("base_instructions".into(), json!({ "text": sp }));
+    }
     if let Some(g) = &session.git {
         meta.insert("git".into(), codex_git(g));
     }
@@ -840,6 +1450,27 @@ fn emit_codex(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<E
             .map(|t| t.to_rfc3339_opts(SecondsFormat::Millis, true))
             .unwrap_or_else(|| ts_str.clone());
 
+        // A compaction pair → Codex's own top-level `compacted` record (the parser reads it back as
+        // a CompactionBoundary, plus a CompactionSummary when `message` is non-empty). The boundary
+        // carries no text; the summary carries the seed text — both become `compacted` records so the
+        // boundary survives even without a summary.
+        if matches!(
+            msg.kind,
+            MessageKind::CompactionBoundary | MessageKind::CompactionSummary
+        ) {
+            let text = if msg.kind == MessageKind::CompactionSummary {
+                msg.text().unwrap_or_default()
+            } else {
+                String::new()
+            };
+            lines.push(json!({
+                "type": "compacted",
+                "timestamp": ts,
+                "payload": { "message": text },
+            }));
+            continue;
+        }
+
         match msg.role {
             Role::System => {
                 let text = msg.text().unwrap_or_default();
@@ -869,6 +1500,7 @@ fn emit_codex(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<E
                 lines.push(codex_event_msg(&ts, json!({ "type": "user_message", "message": text })));
             }
             Role::Assistant => {
+                let first_record = lines.len();
                 // Split assistant content into NL text (event_msg) and structured items.
                 for b in &msg.content {
                     match b {
@@ -898,9 +1530,11 @@ fn emit_codex(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<E
                             // (the input schema accepts zero raw content entries). Preserve the
                             // useful text through the replayable summary and the opaque state
                             // through `encrypted_content`, matching native Codex rollouts.
+                            // The distinct user-visible summary a Codex source recorded, when it
+                            // had one (IR v2: harness facts live in the harness bag, never flat).
                             let summary = msg
-                                .extra
-                                .get("reasoning_summary")
+                                .harness_extra(Harness::Codex)
+                                .and_then(|b| b.get("reasoning_summary"))
                                 .and_then(Value::as_str)
                                 .unwrap_or(text);
                             let summary_items = if summary.is_empty() {
@@ -937,6 +1571,20 @@ fn emit_codex(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<E
                             ));
                         }
                         Block::ToolResult { .. } | Block::Image { .. } => {}
+                    }
+                }
+                // Per-turn token usage → Codex's own `token_count` event, the ONLY record its parser
+                // (and ours, `codex::apply_token_count`) reads usage from: it attaches
+                // `info.last_token_usage` to the assistant message the event trails. Without it a
+                // ported session read back `usage: 393 → 0`. Only when the turn actually wrote
+                // records Codex reads back: trailing nothing (or only an empty `reasoning` item,
+                // which its reader drops) the event would synthesize a bare usage-only turn.
+                if lines.len() > first_record && !unrepresentable(Harness::Codex, msg) {
+                    if let Some(info) = codex_token_usage(msg.usage.as_ref()) {
+                        lines.push(codex_event_msg(
+                            &ts,
+                            json!({ "type": "token_count", "info": { "last_token_usage": info } }),
+                        ));
                     }
                 }
             }
@@ -981,6 +1629,36 @@ fn emit_codex(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<E
         new_id: new_id.clone(),
         resume_hint: Some(format!("codex resume {new_id}")),
     })
+}
+
+/// IR [`Usage`](crate::ir::Usage) → Codex's `last_token_usage` block, reversing
+/// [`codex::parse_usage`]'s renames (`cache_read_tokens` → `cached_input_tokens`,
+/// `cache_creation_tokens` → `cache_write_input_tokens`, `reasoning_tokens` →
+/// `reasoning_output_tokens`). Only the fields actually present are written, so a Codex source
+/// round-trips with the same key set. `None` when there is nothing Codex's parser would read back
+/// (it requires at least one of input / output / cached-input).
+fn codex_token_usage(usage: Option<&crate::ir::Usage>) -> Option<Value> {
+    let u = usage?;
+    let mut m = Map::new();
+    for (key, val) in [
+        ("input_tokens", u.input_tokens),
+        ("cached_input_tokens", u.cache_read_tokens),
+        ("cache_write_input_tokens", u.cache_creation_tokens),
+        ("output_tokens", u.output_tokens),
+        ("reasoning_output_tokens", u.reasoning_tokens),
+    ] {
+        if let Some(v) = val {
+            m.insert(key.into(), json!(v));
+        }
+    }
+    if u.input_tokens.is_none() && u.output_tokens.is_none() && u.cache_read_tokens.is_none() {
+        return None;
+    }
+    // Codex's own totals are input + output (cached input is a *subset* of `input_tokens`, not an
+    // addend — 35507 + 55 = 35562 in a real 0.155 record whose cached count was 34432).
+    let total: u64 = u.input_tokens.unwrap_or(0) + u.output_tokens.unwrap_or(0);
+    m.insert("total_tokens".into(), json!(total));
+    Some(Value::Object(m))
 }
 
 fn codex_event_msg(ts: &str, payload: Value) -> Value {
@@ -1055,13 +1733,14 @@ fn emit_grok(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Em
             json!(format!("{}/.grok", Path::new(&home).to_string_lossy())),
         );
     }
-    // Carry the source model only if it's actually a Grok model; otherwise default to
-    // `grok-build`. A foreign model id (e.g. `gpt-5.5`) would make Grok try to replay the
-    // history against an incompatible backend.
+    // Carry the source model verbatim for a Grok→Grok port (it is already a Grok model), and for a
+    // cross-harness port only when it *is* a Grok model; otherwise default to `grok-build`. A
+    // foreign model id (e.g. `gpt-5.5`) would make Grok replay the history against an incompatible
+    // backend, so it is dropped there — but a same-harness rehome must round-trip the model exactly.
     let model_id = session
         .model
         .as_deref()
-        .filter(|m| m.to_ascii_lowercase().contains("grok"))
+        .filter(|m| session.harness == Harness::Grok || m.to_ascii_lowercase().contains("grok"))
         .unwrap_or("grok-build");
     summary.insert("current_model_id".into(), json!(model_id));
     if let Some(g) = &session.git {
@@ -1209,7 +1888,7 @@ fn grok_concat_text(msg: &crate::ir::Message) -> String {
 }
 
 // ------------------------------------------------------------------------------------------------
-// OpenCode (parts generation)
+// OpenCode (SQLite `opencode.db`)
 // ------------------------------------------------------------------------------------------------
 
 /// Epoch-millis for an optional timestamp, falling back to `now`.
@@ -1217,34 +1896,45 @@ fn epoch_ms(t: Option<DateTime<Utc>>) -> i64 {
     t.unwrap_or_else(Utc::now).timestamp_millis()
 }
 
-/// Emit into OpenCode's newer "parts" storage generation:
-///   out_dir/session/<projectID>/ses_<id>.json
-///   out_dir/message/<sid>/msg_<mid>.json
-///   out_dir/part/<mid>/prt_<pid>.json
-///
-/// The OpenCode reader (see `harness/opencode.rs`) keys parts by *messageID*, orders messages by
-/// `time.created` and parts by filename, and splits tool parts into a trailing Tool-role IR
-/// message. We honour all of that. Tool results are folded back onto the originating assistant
-/// message's `tool` part (matched by `tool_use_id`), since OpenCode has no standalone tool turn.
-fn emit_opencode(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<EmitResult> {
-    // OpenCode migrated to a SQLite store (`opencode.db`, sibling of this `storage/` dir). Once that
-    // DB exists the binary no longer reads the file-based `storage/{session,message,part}/*.json`
-    // layout we write here — the JSON→DB import is one-shot, gated on the DB's absence — so a session
-    // emitted into `storage/` is invisible to resume (`opencode run --session <id>` → "Session not
-    // found", verified live). Refuse rather than silently produce an unresumable session. Emitting
-    // INTO opencode.db is tracked as a follow-up. If the DB is absent (fresh install), the legacy JSON
-    // is still imported on next launch, so we proceed normally.
-    if out_dir
-        .parent()
-        .map(|p| p.join("opencode.db"))
-        .is_some_and(|db| db.exists())
-    {
-        anyhow::bail!(
-            "opencode has migrated to SQLite (opencode.db); it no longer reads the file-based \
-             storage/ layout, so a session converted here cannot be resumed. Emitting into \
-             opencode.db isn't implemented yet — see docs/PORTABILITY-REVIEW.md."
-        );
+/// Where the `opencode.db` should live for a given `--out`/storage-root `out_dir`: the db file
+/// itself if pointed at one, the data-dir sibling of a `storage/` root (the real install layout —
+/// `~/.local/share/opencode/opencode.db` next to `storage/`), else `<out_dir>/opencode.db`.
+fn opencode_db_path(out_dir: &Path) -> PathBuf {
+    if out_dir.is_file() || out_dir.extension().is_some_and(|e| e == "db") {
+        out_dir.to_path_buf()
+    } else if out_dir.file_name().is_some_and(|n| n == "storage") {
+        out_dir
+            .parent()
+            .map(|p| p.join("opencode.db"))
+            .unwrap_or_else(|| out_dir.join("opencode.db"))
+    } else {
+        out_dir.join("opencode.db")
     }
+}
+
+/// Emit into OpenCode's canonical SQLite store `opencode.db` (`session`/`message`/`part` tables;
+/// schema per `~/pug/opencode/packages/core/src/session/sql.ts`). The dead JSON tree under
+/// `storage/` is no longer read by OpenCode 1.18, so a session emitted there was unresumable — we
+/// write the db instead. Each `data` column holds the Info/Part JSON *minus* `id`/`sessionID`/
+/// `messageID` (the reader re-hydrates them). Tables are created when the db is absent; a `--out`
+/// dir gets a fresh db. Tool results are folded onto the originating assistant's `tool` part
+/// (`state.output`/`state.error`), since OpenCode has no standalone tool turn.
+fn emit_opencode(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<EmitResult> {
+    #[cfg(not(feature = "sqlite"))]
+    {
+        let _ = (session, out_dir, opts);
+        anyhow::bail!("emit to opencode requires the `sqlite` feature (opencode.db is SQLite)");
+    }
+    #[cfg(feature = "sqlite")]
+    {
+        emit_opencode_db(session, out_dir, opts)
+    }
+}
+
+#[cfg(feature = "sqlite")]
+fn emit_opencode_db(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<EmitResult> {
+    use rusqlite::{params, Connection};
+
     let new_id = opts
         .new_id
         .clone()
@@ -1254,39 +1944,84 @@ fn emit_opencode(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Resul
         .as_ref()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_default();
-
-    // OpenCode shards sessions under a per-project directory. We don't reproduce its exact project
-    // hashing; a deterministic dir keyed off the cwd is enough for the reader (it WalkDirs).
     let project_id = if cwd_str.is_empty() {
-        "global".to_string()
+        "prj_global".to_string()
     } else {
         format!("prj_{}", short_hash(&cwd_str))
     };
 
-    let session_dir = out_dir.join("session").join(&project_id);
-    let msg_dir = out_dir.join("message").join(&new_id);
-    fs::create_dir_all(&session_dir).with_context(|| format!("creating {}", session_dir.display()))?;
-    fs::create_dir_all(&msg_dir).with_context(|| format!("creating {}", msg_dir.display()))?;
+    let db_path = opencode_db_path(out_dir);
+    if let Some(parent) = db_path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let conn = Connection::open(&db_path).with_context(|| format!("opening {}", db_path.display()))?;
+    // FK enforcement stays off (rusqlite's default) so a fresh db needs no `project` row and an
+    // append into a real store isn't rejected for the synthetic project_id. Create the reader's
+    // schema when absent (`IF NOT EXISTS` no-ops against a real store; our INSERTs name only columns
+    // both schemas share, so any extra real columns keep their defaults).
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS session (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            slug TEXT NOT NULL,
+            directory TEXT NOT NULL,
+            title TEXT NOT NULL,
+            version TEXT NOT NULL,
+            model TEXT,
+            cost REAL NOT NULL DEFAULT 0,
+            tokens_input INTEGER NOT NULL DEFAULT 0,
+            tokens_output INTEGER NOT NULL DEFAULT 0,
+            tokens_reasoning INTEGER NOT NULL DEFAULT 0,
+            tokens_cache_read INTEGER NOT NULL DEFAULT 0,
+            tokens_cache_write INTEGER NOT NULL DEFAULT 0,
+            time_created INTEGER NOT NULL,
+            time_updated INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS message (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            time_created INTEGER NOT NULL,
+            time_updated INTEGER NOT NULL,
+            data TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS part (
+            id TEXT PRIMARY KEY,
+            message_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            time_created INTEGER NOT NULL,
+            time_updated INTEGER NOT NULL,
+            data TEXT NOT NULL
+         );",
+    )
+    .context("creating opencode schema")?;
 
     let created = epoch_ms(session.created_at.or(session.updated_at));
     let updated = epoch_ms(session.updated_at.or(session.created_at));
 
-    // ── session metadata file ──
-    let mut meta = Map::new();
-    meta.insert("id".into(), json!(new_id));
-    if !cwd_str.is_empty() {
-        meta.insert("directory".into(), json!(cwd_str));
-    }
-    if let Some(t) = &session.title {
-        meta.insert("title".into(), json!(t));
-    }
-    meta.insert("time".into(), json!({ "created": created, "updated": updated }));
-    let ses_path = session_dir.join(format!("{new_id}.json"));
-    fs::write(&ses_path, serde_json::to_string_pretty(&meta)?)
-        .with_context(|| format!("writing {}", ses_path.display()))?;
+    // Session row. `model` is `{id, providerID}` (the reader reads `model.id`); `title` is NOT NULL.
+    let model_json = session
+        .model
+        .as_deref()
+        .map(|m| json!({ "id": m, "providerID": "clustervision" }).to_string());
+    conn.execute(
+        "INSERT OR REPLACE INTO session \
+         (id, project_id, slug, directory, title, version, model, time_created, time_updated) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            new_id,
+            project_id,
+            short_hash(&new_id),
+            cwd_str,
+            session.title.clone().unwrap_or_default(),
+            env!("CARGO_PKG_VERSION"),
+            model_json,
+            created,
+            updated,
+        ],
+    )
+    .context("inserting opencode session")?;
 
-    // Pre-index tool results (from Role::Tool turns) by tool_use_id so we can attach them to the
-    // matching `tool` part on the assistant message that produced the call.
+    // Pre-index tool results by tool_use_id so each folds onto its assistant's `tool` part.
     let mut tool_results: std::collections::HashMap<String, &Block> = std::collections::HashMap::new();
     for msg in &session.messages {
         if msg.role == Role::Tool {
@@ -1298,9 +2033,10 @@ fn emit_opencode(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Resul
         }
     }
 
+    let base = created;
     let mut seq: u64 = 0;
     for msg in &session.messages {
-        // Tool turns are folded into the assistant's tool parts; don't emit standalone messages.
+        // Tool turns are folded into the assistant's tool parts; no standalone message.
         if msg.role == Role::Tool {
             continue;
         }
@@ -1309,39 +2045,53 @@ fn emit_opencode(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Resul
             Role::System => "system",
             _ => "user",
         };
-        let mid = format!("msg_{}", Uuid::now_v7().simple());
-        let mts = epoch_ms(msg.timestamp.or(session.created_at));
+        // Monotonic id + time so the reader's `ORDER BY time_created, id` == emission order.
+        let mid = format!("msg_{seq:08}_{}", Uuid::now_v7().simple());
+        let mts = msg.timestamp.map(|t| t.timestamp_millis()).unwrap_or(base + seq as i64);
 
-        let mut mrec = Map::new();
-        mrec.insert("id".into(), json!(mid));
-        mrec.insert("sessionID".into(), json!(new_id));
-        mrec.insert("role".into(), json!(role));
-        mrec.insert("time".into(), json!({ "created": mts }));
+        let mut mdata = Map::new();
+        mdata.insert("role".into(), json!(role));
+        mdata.insert("time".into(), json!({ "created": mts }));
         if let Some(model) = msg.model.as_ref().or(session.model.as_ref()) {
-            mrec.insert("modelID".into(), json!(model));
+            mdata.insert("modelID".into(), json!(model));
         }
-        let mrec_path = msg_dir.join(format!("{mid}.json"));
-        fs::write(&mrec_path, serde_json::to_string_pretty(&Value::Object(mrec))?)
-            .with_context(|| format!("writing {}", mrec_path.display()))?;
-
-        let part_dir = out_dir.join("part").join(&mid);
-        fs::create_dir_all(&part_dir).with_context(|| format!("creating {}", part_dir.display()))?;
+        // Usage → `tokens` + `cost` (the reader's `parse_usage` reads both off the message record).
+        if let Some(u) = &msg.usage {
+            let mut tokens = Map::new();
+            tokens.insert("input".into(), json!(u.input_tokens.unwrap_or(0)));
+            tokens.insert("output".into(), json!(u.output_tokens.unwrap_or(0)));
+            tokens.insert("reasoning".into(), json!(u.reasoning_tokens.unwrap_or(0)));
+            tokens.insert(
+                "cache".into(),
+                json!({ "read": u.cache_read_tokens.unwrap_or(0), "write": u.cache_creation_tokens.unwrap_or(0) }),
+            );
+            mdata.insert("tokens".into(), Value::Object(tokens));
+            if let Some(c) = u.cost_usd {
+                mdata.insert("cost".into(), json!(c));
+            }
+        }
+        conn.execute(
+            "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![mid, new_id, mts, mts, Value::Object(mdata).to_string()],
+        )
+        .context("inserting opencode message")?;
 
         let mut pidx: u64 = 0;
         let mut write_part = |part: Value| -> Result<()> {
-            // Zero-padded prefix keeps the reader's filename sort == emission order.
             let pid = format!("prt_{seq:08}_{pidx:04}_{}", Uuid::now_v7().simple());
-            let p = part_dir.join(format!("{pid}.json"));
-            fs::write(&p, serde_json::to_string_pretty(&part)?).with_context(|| format!("writing {}", p.display()))?;
+            conn.execute(
+                "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![pid, mid, new_id, mts, mts, part.to_string()],
+            )
+            .context("inserting opencode part")?;
             pidx += 1;
             Ok(())
         };
 
         for b in &msg.content {
             match b {
-                Block::Text { text } => {
-                    write_part(json!({ "type": "text", "text": text }))?;
-                }
+                Block::Text { text } => write_part(json!({ "type": "text", "text": text }))?,
                 Block::Thinking { text, signature, .. } => {
                     let mut p = Map::new();
                     p.insert("type".into(), json!("reasoning"));
@@ -1354,14 +2104,55 @@ fn emit_opencode(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Resul
                 Block::ToolUse { id, name, input, .. } => {
                     let mut state = Map::new();
                     state.insert("input".into(), input.clone());
-                    // Attach the paired result, if we have one.
-                    if let Some(Block::ToolResult { content, is_error, .. }) = tool_results.get(id).copied() {
+                    if let Some(Block::ToolResult {
+                        content,
+                        is_error,
+                        details,
+                        ..
+                    }) = tool_results.get(id).copied()
+                    {
                         if *is_error {
                             state.insert("status".into(), json!("error"));
                             state.insert("error".into(), json!(content));
                         } else {
                             state.insert("status".into(), json!("completed"));
                             state.insert("output".into(), json!(content));
+                        }
+                        // `details` was read from `state.{title,metadata,time}`; fold it back so an
+                        // OpenCode→OpenCode round-trip reproduces the result's structured details.
+                        // A FOREIGN details (Claude's `toolUseResult`, Kimi's note/truncation) has
+                        // none of those three keys, and dropping it read back as
+                        // `tool result details: 194 → 0`. Its keys ride in `metadata`, OpenCode's own
+                        // free-form slot for a tool's structured extras — which is exactly where the
+                        // adapter reads them back from.
+                        if let Some(d) = details {
+                            let mut meta = d
+                                .get("metadata")
+                                .and_then(Value::as_object)
+                                .cloned()
+                                .unwrap_or_default();
+                            match d {
+                                Value::Object(d) => {
+                                    for (k, v) in d {
+                                        match k.as_str() {
+                                            "title" | "time" => {
+                                                state.insert(k.clone(), v.clone());
+                                            }
+                                            "metadata" if v.is_object() => {}
+                                            _ => {
+                                                meta.insert(k.clone(), v.clone());
+                                            }
+                                        }
+                                    }
+                                }
+                                // A scalar sidecar (no key to hang it on) still belongs in metadata.
+                                other => {
+                                    meta.insert("details".into(), other.clone());
+                                }
+                            }
+                            if !meta.is_empty() {
+                                state.insert("metadata".into(), Value::Object(meta));
+                            }
                         }
                     } else {
                         state.insert("status".into(), json!("completed"));
@@ -1401,11 +2192,10 @@ fn emit_opencode(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Resul
         seq += 1;
     }
 
-    let resume = format!("opencode (session {new_id})");
     Ok(EmitResult {
-        path: ses_path,
-        new_id,
-        resume_hint: Some(resume),
+        path: db_path,
+        new_id: new_id.clone(),
+        resume_hint: Some(format!("opencode --session {new_id}")),
     })
 }
 
@@ -1464,6 +2254,19 @@ fn emit_openclaw(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Resul
     }
     lines.push(Value::Object(header));
 
+    // A `session_info` entry carries the session title (OpenClaw's `name`), which the reader reads
+    // back as `Session::title` — the `sessions.json`/`session_nodes` index label alone is only a
+    // discovery hint, not seen by a direct `parse`. Emit it so the title round-trips.
+    if let Some(title) = session.title.as_deref().filter(|t| !t.trim().is_empty()) {
+        lines.push(json!({
+            "type": "session_info",
+            "id": openclaw_short_id(),
+            "parentId": Value::Null,
+            "timestamp": created_iso,
+            "name": title,
+        }));
+    }
+
     // Message lines, parent-linked (v3).
     let mut parent: Option<String> = None;
     for msg in &session.messages {
@@ -1471,6 +2274,40 @@ fn emit_openclaw(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Resul
         let ts = msg.timestamp.unwrap_or(created);
         let ts_iso = ts.to_rfc3339_opts(SecondsFormat::Millis, true);
         let ts_ms = ts.timestamp_millis();
+
+        // Kind-aware control entries → OpenClaw's own top-level records (the reader parses them as
+        // System notes / lineage markers), so a cross-harness compaction, rewind, or model switch is
+        // carried rather than flattened into a plain system turn. They still thread by parentId.
+        let control: Option<Value> = match msg.kind {
+            MessageKind::CompactionBoundary | MessageKind::CompactionSummary => Some(json!({
+                "type": "compaction",
+                "id": entry_id,
+                "parentId": parent,
+                "timestamp": ts_iso,
+                "summary": msg.text().unwrap_or_default(),
+            })),
+            MessageKind::Branch => Some(json!({
+                "type": "reset",
+                "id": entry_id,
+                "parentId": parent,
+                "timestamp": ts_iso,
+                "reason": "reset",
+            })),
+            MessageKind::ModelChange => Some(json!({
+                "type": "model_change",
+                "id": entry_id,
+                "parentId": parent,
+                "timestamp": ts_iso,
+                "provider": Value::Null,
+                "modelId": msg.model.clone().or_else(|| session.model.clone()),
+            })),
+            _ => None,
+        };
+        if let Some(entry) = control {
+            lines.push(entry);
+            parent = Some(entry_id);
+            continue;
+        }
 
         let inner = match msg.role {
             Role::User => json!({
@@ -1490,6 +2327,12 @@ fn emit_openclaw(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Resul
                 m.insert("timestamp".into(), json!(ts_ms));
                 if let Some(model) = msg.model.as_ref().or(session.model.as_ref()) {
                     m.insert("model".into(), json!(model));
+                }
+                // Assistant-level token usage → OpenClaw's own `message.usage` block, which its
+                // reader (`openclaw::parse_usage`) reads straight back into [`Usage`]. Without it a
+                // ported session read back `usage: 462 → 0`.
+                if let Some(u) = openclaw_usage(msg.usage.as_ref()) {
+                    m.insert("usage".into(), u);
                 }
                 Value::Object(m)
             }
@@ -1557,6 +2400,36 @@ fn emit_openclaw(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Resul
 }
 
 /// 8-hex-char id slice, matching OpenClaw's entry-id convention.
+/// IR [`Usage`](crate::ir::Usage) → OpenClaw's `usage{input, output, cacheRead, cacheWrite,
+/// totalTokens, cost{total}}`, reversing [`openclaw::parse_usage`]'s names. Only the fields present
+/// are written, so an OpenClaw source round-trips with the same key set; `None` when the turn
+/// carried no counts and no cost (nothing its reader would accept).
+fn openclaw_usage(usage: Option<&crate::ir::Usage>) -> Option<Value> {
+    let u = usage?;
+    let mut m = Map::new();
+    for (key, val) in [
+        ("input", u.input_tokens),
+        ("output", u.output_tokens),
+        ("cacheRead", u.cache_read_tokens),
+        ("cacheWrite", u.cache_creation_tokens),
+    ] {
+        if let Some(v) = val {
+            m.insert(key.into(), json!(v));
+        }
+    }
+    if let Some(c) = u.cost_usd {
+        m.insert("cost".into(), json!({ "total": c }));
+    }
+    if m.is_empty() {
+        return None;
+    }
+    m.insert(
+        "totalTokens".into(),
+        json!(u.input_tokens.unwrap_or(0) + u.output_tokens.unwrap_or(0)),
+    );
+    Some(Value::Object(m))
+}
+
 fn openclaw_short_id() -> String {
     Uuid::new_v4().simple().to_string()[..8].to_string()
 }
@@ -1703,6 +2576,23 @@ fn emit_gemini(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<
                 }
                 if let Some(model) = msg.model.as_ref().or(session.model.as_ref()) {
                     m.insert("model".into(), json!(model));
+                }
+                // Per-message usage → Gemini's `tokens{input, output, cached}` (the parser reads it
+                // back into `Usage`), so token counts survive a port into Gemini.
+                if let Some(u) = &msg.usage {
+                    let mut tokens = Map::new();
+                    if let Some(x) = u.input_tokens {
+                        tokens.insert("input".into(), json!(x));
+                    }
+                    if let Some(x) = u.output_tokens {
+                        tokens.insert("output".into(), json!(x));
+                    }
+                    if let Some(x) = u.cache_read_tokens {
+                        tokens.insert("cached".into(), json!(x));
+                    }
+                    if !tokens.is_empty() {
+                        m.insert("tokens".into(), Value::Object(tokens));
+                    }
                 }
                 // Thoughts (thinking) ride in `thoughts[]`, the rest in `content`.
                 let mut thoughts = Vec::new();
@@ -1929,7 +2819,9 @@ fn emit_hermes(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<
             cache_read_tokens INTEGER DEFAULT 0,
             cache_write_tokens INTEGER DEFAULT 0,
             reasoning_tokens INTEGER DEFAULT 0,
-            title TEXT
+            title TEXT,
+            cwd TEXT,
+            git_branch TEXT
          );
          CREATE TABLE IF NOT EXISTS messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2014,26 +2906,35 @@ fn emit_hermes(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<
         .or(session.created_at)
         .map(|t| t.timestamp_millis() as f64 / 1000.0);
 
-    // Format-complete: pull the captured per-session columns back out of `Session.extra` (written
-    // by the Hermes parser under `SESSION_META_KEY`) so the round-trip reproduces every session-row
-    // value. Anything absent falls back to a sensible default (e.g. `source = "clustervision"`).
+    // Format-complete: pull the captured per-session columns back out of the Hermes fact bag
+    // (`extra["hermes"][SESSION_META_KEY]`, IR-v2 nesting) so the round-trip reproduces every
+    // session-row value. Anything absent falls back to a sensible default (`source = "clustervision"`).
     use crate::harness::hermes::{RAW_REASONING_CONTENT_KEY, RAW_REASONING_KEY, SESSION_META_KEY};
-    let smeta = session.extra.get(SESSION_META_KEY).and_then(Value::as_object);
+    let smeta = session
+        .harness_extra(Harness::Hermes)
+        .and_then(|b| b.get(SESSION_META_KEY))
+        .and_then(Value::as_object);
     let smeta_str =
         |k: &str| -> Option<String> { smeta.and_then(|m| m.get(k)).and_then(Value::as_str).map(str::to_string) };
     let smeta_int = |k: &str| -> i64 { smeta.and_then(|m| m.get(k)).and_then(Value::as_i64).unwrap_or(0) };
     let source = smeta_str("source").unwrap_or_else(|| "clustervision".to_string());
     let user_id = smeta_str("user_id");
     let model_config = smeta_str("model_config");
-    let system_prompt = smeta_str("system_prompt");
+    // System prompt: the captured Hermes column (same-harness replay) else the first-class
+    // `Session::system_prompt` (a cross-harness port carries it here into Hermes's own slot).
+    let system_prompt = smeta_str("system_prompt").or_else(|| session.system_prompt.clone());
     let end_reason = smeta_str("end_reason");
+    // First-class cwd/git → Hermes's own `cwd`/`git_branch` columns (v-recent schema), so a ported
+    // session keeps its working dir (the reader probes these columns).
+    let cwd = effective_cwd(session, opts).map(|p| p.to_string_lossy().into_owned());
+    let git_branch = branch_of(session);
 
     conn.execute(
         "INSERT OR REPLACE INTO sessions \
          (id, source, user_id, model, model_config, system_prompt, started_at, ended_at, \
           end_reason, message_count, tool_call_count, input_tokens, output_tokens, \
-          cache_read_tokens, cache_write_tokens, reasoning_tokens, title) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+          cache_read_tokens, cache_write_tokens, reasoning_tokens, title, cwd, git_branch) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
         params![
             new_id,
             source,
@@ -2052,6 +2953,8 @@ fn emit_hermes(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<
             smeta_int("cache_write_tokens"),
             smeta_int("reasoning_tokens"),
             session.title,
+            cwd,
+            git_branch,
         ],
     )
     .context("inserting hermes session")?;
@@ -2074,13 +2977,15 @@ fn emit_hermes(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<
         };
 
         // Reasoning columns. For a lossless round-trip we prefer the verbatim source columns the
-        // parser stashed in `extra` (`hermes_reasoning` / `hermes_reasoning_content` /
-        // `reasoning_details` / `codex_*`) over reconstructing from the folded `Thinking.text`
-        // projection — that projection merges + dedups across columns and so can't recover the
-        // originals. We only synthesize from Thinking blocks when no verbatim column was captured
-        // (i.e. a session built in-memory or ported from another harness).
-        let extra_str = |k: &str| -> Option<String> { msg.extra.get(k).and_then(Value::as_str).map(str::to_string) };
-        let extra_json = |k: &str| -> Option<String> { msg.extra.get(k).map(|v| v.to_string()) };
+        // parser stashed in the Hermes fact bag (`extra["hermes"]`, IR-v2 nesting: `reasoning` /
+        // `reasoning_content` / `reasoning_details` / `codex_*`) over reconstructing from the folded
+        // `Thinking.text` projection — that projection merges + dedups across columns and so can't
+        // recover the originals. We synthesize from Thinking blocks only when no verbatim column was
+        // captured (a session built in-memory or ported from another harness).
+        let hbag = msg.harness_extra(Harness::Hermes);
+        let extra_str =
+            |k: &str| -> Option<String> { hbag.and_then(|b| b.get(k)).and_then(Value::as_str).map(str::to_string) };
+        let extra_json = |k: &str| -> Option<String> { hbag.and_then(|b| b.get(k)).map(|v| v.to_string()) };
 
         let mut reasoning = extra_str(RAW_REASONING_KEY);
         let reasoning_content = extra_str(RAW_REASONING_CONTENT_KEY);
@@ -2118,7 +3023,7 @@ fn emit_hermes(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<
 
         let finish_reason = extra_str("finish_reason");
         let platform_message_id = extra_str("platform_message_id");
-        let observed: i64 = if msg.extra.get("observed") == Some(&Value::Bool(true)) {
+        let observed: i64 = if hbag.and_then(|b| b.get("observed")) == Some(&Value::Bool(true)) {
             1
         } else {
             0
@@ -2429,6 +3334,7 @@ mod tests {
             &EmitOptions {
                 new_cwd: Some(link.clone()),
                 new_id: None,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -2889,6 +3795,7 @@ mod tests {
         let opts = EmitOptions {
             new_cwd: Some(PathBuf::from("/tmp/rehomed")),
             new_id: Some("forced-id".into()),
+            ..Default::default()
         };
         let res = emit(&s, Harness::Claude, &out, &opts).unwrap();
         assert_eq!(res.new_id, "forced-id");
@@ -2896,23 +3803,27 @@ mod tests {
         assert!(res.path.ends_with("forced-id.jsonl"));
     }
 
+    #[cfg(feature = "sqlite")]
     #[test]
     fn opencode_round_trip() {
-        // OpenCode's parse() resolves message/part dirs relative to a storage root; point an
-        // adapter at the emitted storage dir explicitly (no HOME mutation).
+        // The emitter writes `opencode.db`; re-parse by pointing an adapter straight at that db
+        // file (no HOME mutation). `out_dir` is a `storage/` root, so the db lands beside it.
         let storage = temp_dir().join(".local/share/opencode/storage");
         fs::create_dir_all(&storage).unwrap();
 
         let s = sample_session(Harness::OpenCode);
         let res = emit(&s, Harness::OpenCode, &storage, &EmitOptions::default()).unwrap();
         assert!(res.path.exists());
+        assert_eq!(res.path.file_name().unwrap(), "opencode.db");
 
-        let oc = OpenCode::with_root(storage);
+        let oc = OpenCode::with_db(res.path.clone());
         let refs = oc.discover().unwrap();
         let parsed = refs.iter().find(|r| r.id == res.new_id).map(|r| oc.parse(r).unwrap());
 
         let parsed = parsed.expect("emitted opencode session should be discoverable");
         assert_eq!(parsed.cwd, Some(PathBuf::from("/Users/test/project")));
+        assert_eq!(parsed.title.as_deref(), Some("a test session"));
+        assert_eq!(parsed.model.as_deref(), Some("test-model"));
         assert_eq!(texts(&parsed, Role::User), vec!["list the files please"]);
         assert_eq!(texts(&parsed, Role::Assistant), vec!["Sure, listing now."]);
         assert_eq!(tool_names(&parsed), vec!["run_shell"]);
@@ -3476,6 +4387,7 @@ mod tests {
         let opts = EmitOptions {
             new_id: Some(sid.to_string()),
             new_cwd: Some(PathBuf::from("/work/proj")),
+            ..Default::default()
         };
         let res = emit(&session, Harness::Claude, &out, &opts).unwrap();
 
@@ -3544,5 +4456,616 @@ mod tests {
         }
 
         fs::remove_dir_all(&out).ok();
+    }
+
+    // --------------------------------------------------------------------------------------------
+    // Verifier v2 + newly-carried-field round trips
+    // --------------------------------------------------------------------------------------------
+
+    /// The strict gate and rendering: an expected-only report is never fatal and still lists its
+    /// losses; any unexpected delta trips `has_unexpected` and reads back cleanly.
+    #[test]
+    fn fidelity_report_gate_and_rendering() {
+        let expected_only = FidelityReport {
+            deltas: vec![Delta {
+                field: "block:image".into(),
+                before: "1".into(),
+                after: "0".into(),
+                expected: true,
+            }],
+        };
+        assert!(!expected_only.has_unexpected(), "expected losses never fail strict");
+        assert_eq!(expected_only.lost_lines().len(), 1);
+        assert!(expected_only.lost_lines()[0].contains("expected"));
+
+        let unexpected = FidelityReport {
+            deltas: vec![Delta {
+                field: "usage".into(),
+                before: "1".into(),
+                after: "0".into(),
+                expected: false,
+            }],
+        };
+        assert!(unexpected.has_unexpected());
+        assert!(!unexpected.lost_lines()[0].contains("expected"));
+    }
+
+    /// OpenCode (SQLite) carries per-message usage (incl. `cost_usd`) and a tool result's structured
+    /// `details` (`state.{title,metadata}`) — all previously dropped on the file-tree path.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn opencode_carries_usage_cost_and_details() {
+        let mut s = sample_session(Harness::OpenCode);
+        // Give the assistant real usage + cost.
+        for m in &mut s.messages {
+            if m.role == Role::Assistant {
+                m.usage = Some(Usage {
+                    input_tokens: Some(100),
+                    output_tokens: Some(20),
+                    cache_read_tokens: Some(10),
+                    cache_creation_tokens: Some(2),
+                    reasoning_tokens: Some(5),
+                    cost_usd: Some(0.0123),
+                });
+            }
+            // Give the tool result structured details.
+            for b in &mut m.content {
+                if let Block::ToolResult { details, .. } = b {
+                    *details = Some(serde_json::json!({ "title": "ls", "metadata": { "exit": 0 } }));
+                }
+            }
+        }
+
+        let storage = temp_dir().join(".local/share/opencode/storage");
+        fs::create_dir_all(&storage).unwrap();
+        let res = emit(&s, Harness::OpenCode, &storage, &EmitOptions::default()).unwrap();
+        let oc = OpenCode::with_db(res.path.clone());
+        let parsed = oc
+            .discover()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == res.new_id)
+            .map(|r| oc.parse(&r).unwrap())
+            .expect("discoverable");
+
+        let usage = parsed
+            .messages
+            .iter()
+            .find(|m| m.role == Role::Assistant)
+            .and_then(|m| m.usage.clone())
+            .expect("assistant usage survives");
+        assert_eq!(usage.input_tokens, Some(100));
+        assert_eq!(usage.output_tokens, Some(20));
+        assert_eq!(usage.cost_usd, Some(0.0123));
+
+        let details = parsed.messages.iter().flat_map(|m| &m.content).find_map(|b| match b {
+            Block::ToolResult { details, .. } => details.clone(),
+            _ => None,
+        });
+        assert_eq!(
+            details.as_ref().and_then(|d| d.get("title")).and_then(|v| v.as_str()),
+            Some("ls"),
+            "tool result details survive on the block"
+        );
+
+        // The verifier sees no unexpected loss for this OpenCode round-trip.
+        let (_r, report) = emit_report(&s, Harness::OpenCode, &temp_dir(), &EmitOptions::default()).unwrap();
+        assert!(!report.has_unexpected(), "opencode round-trip: {:?}", report.deltas);
+    }
+
+    /// Codex carries the session system prompt (`base_instructions`) and a compaction pair
+    /// (`compacted` records → boundary + summary).
+    #[test]
+    fn codex_carries_system_prompt_and_compaction() {
+        let mut s = sample_session(Harness::Codex);
+        s.system_prompt = Some("You are a careful engineer.".into());
+        let mut boundary = Message::of_kind(Role::System, MessageKind::CompactionBoundary, Origin::Harness);
+        boundary.content.push(Block::Text { text: "".into() });
+        let mut summary = Message::of_kind(Role::System, MessageKind::CompactionSummary, Origin::Harness);
+        summary.content.push(Block::Text {
+            text: "earlier: set up the project".into(),
+        });
+        s.messages.push(boundary);
+        s.messages.push(summary);
+
+        let out = temp_dir();
+        let res = emit(&s, Harness::Codex, &out, &EmitOptions::default()).unwrap();
+        let r = SessionRef {
+            id: String::new(),
+            harness: Harness::Codex,
+            path: res.path.clone(),
+            cwd: None,
+            title: None,
+            created_at: None,
+            updated_at: None,
+            message_count: 0,
+        };
+        let parsed = Codex::new().parse(&r).unwrap();
+        assert_eq!(parsed.system_prompt.as_deref(), Some("You are a careful engineer."));
+        assert!(
+            parsed
+                .messages
+                .iter()
+                .any(|m| m.kind == MessageKind::CompactionBoundary),
+            "compaction boundary survives into Codex"
+        );
+        assert!(
+            parsed.messages.iter().any(|m| m.kind == MessageKind::CompactionSummary
+                && m.text().as_deref() == Some("earlier: set up the project")),
+            "compaction summary text survives"
+        );
+    }
+
+    /// A cross-harness port INTO Claude carries a compaction pair, injected context, and the session
+    /// system prompt into Claude's own record shapes (compact_boundary + isCompactSummary,
+    /// attachment/rendered, prompt_snapshot).
+    #[test]
+    fn claude_cross_harness_carries_compaction_injected_and_system_prompt() {
+        // Source harness is Codex → the Claude emitter's cross-harness path runs.
+        let mut s = sample_session(Harness::Codex);
+        s.system_prompt = Some("Follow the house style.".into());
+        let mut injected = Message::of_kind(Role::System, MessageKind::InjectedContext, Origin::Harness);
+        injected.content.push(Block::Text {
+            text: "<environment_context>cwd=/x</environment_context>".into(),
+        });
+        let mut boundary = Message::of_kind(Role::System, MessageKind::CompactionBoundary, Origin::Harness);
+        boundary.content.push(Block::Text {
+            text: "[history compacted]".into(),
+        });
+        let mut summary = Message::of_kind(Role::User, MessageKind::CompactionSummary, Origin::Harness);
+        summary.content.push(Block::Text {
+            text: "summary seed".into(),
+        });
+        s.messages.push(injected);
+        s.messages.push(boundary);
+        s.messages.push(summary);
+
+        let out = temp_dir();
+        let res = emit(&s, Harness::Claude, &out, &EmitOptions::default()).unwrap();
+        let r = SessionRef {
+            id: res.new_id.clone(),
+            harness: Harness::Claude,
+            path: res.path.clone(),
+            cwd: None,
+            title: None,
+            created_at: None,
+            updated_at: None,
+            message_count: 0,
+        };
+        let parsed = Claude::new().parse(&r).unwrap();
+        assert_eq!(parsed.system_prompt.as_deref(), Some("Follow the house style."));
+        assert!(
+            parsed
+                .messages
+                .iter()
+                .any(|m| m.kind == MessageKind::CompactionBoundary),
+            "compact_boundary survives into Claude"
+        );
+        assert!(
+            parsed
+                .messages
+                .iter()
+                .any(|m| m.kind == MessageKind::CompactionSummary && m.text().as_deref() == Some("summary seed")),
+            "isCompactSummary survives into Claude"
+        );
+        assert!(
+            parsed.messages.iter().any(|m| m.kind == MessageKind::InjectedContext),
+            "injected context survives as a Claude attachment"
+        );
+    }
+
+    /// Hermes carries `Session::cwd` into its own `cwd` column.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn hermes_carries_cwd() {
+        use crate::harness::hermes::Hermes;
+        let s = sample_session(Harness::Hermes);
+        let out = temp_dir();
+        let res = emit(&s, Harness::Hermes, &out, &EmitOptions::default()).unwrap();
+        let h = Hermes::with_db(res.path.clone());
+        let parsed = h
+            .discover()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == res.new_id)
+            .map(|r| h.parse(&r).unwrap())
+            .expect("discoverable");
+        assert_eq!(parsed.cwd, Some(PathBuf::from("/Users/test/project")));
+    }
+
+    /// OpenClaw carries the title (`session_info`) and a model-change marker.
+    #[test]
+    fn openclaw_carries_title_and_model_change() {
+        let mut s = sample_session(Harness::OpenClaw);
+        let mut mc = Message::of_kind(Role::System, MessageKind::ModelChange, Origin::Harness);
+        mc.model = Some("claude-opus-4".into());
+        mc.content.push(Block::Text {
+            text: "[model changed]".into(),
+        });
+        s.messages.push(mc);
+
+        let out = temp_dir();
+        let res = emit(&s, Harness::OpenClaw, &out, &EmitOptions::default()).unwrap();
+        let r = SessionRef {
+            id: res.new_id.clone(),
+            harness: Harness::OpenClaw,
+            path: res.path.clone(),
+            cwd: None,
+            title: None,
+            created_at: None,
+            updated_at: None,
+            message_count: 0,
+        };
+        let parsed = OpenClaw::new().parse(&r).unwrap();
+        assert_eq!(
+            parsed.title.as_deref(),
+            Some("a test session"),
+            "title round-trips via session_info"
+        );
+        // The model change is written as OpenClaw's own `model_change` entry (the reader folds it
+        // into `Session::model`/notes rather than a standalone turn, so assert the emitted record).
+        let emitted: Vec<Value> = fs::read_to_string(&res.path)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert!(
+            emitted
+                .iter()
+                .any(|v| v.get("type").and_then(Value::as_str) == Some("model_change")
+                    && v.get("modelId").and_then(Value::as_str) == Some("claude-opus-4")),
+            "model_change entry written to the OpenClaw transcript"
+        );
+    }
+
+    /// `--strict` never fails on an *expected* loss: an image ported into Grok (plain-text chat) is
+    /// reported but not fatal.
+    #[test]
+    fn strict_passes_on_expected_loss() {
+        let img = image_session();
+        let out = temp_dir();
+        let (_res, warnings) = emit_verified(
+            &img,
+            Harness::Grok,
+            &out,
+            &EmitOptions {
+                strict: true,
+                ..Default::default()
+            },
+        )
+        .expect("expected loss (image → Grok) must not fail --strict");
+        assert!(warnings.iter().any(|w| w.contains("image")));
+    }
+
+    /// Per-turn token usage survives a port into Codex. Codex keeps usage in a `token_count`
+    /// event that trails the assistant turn it reports on (`codex::apply_token_count`), and the
+    /// emitter wrote none at all, so every real port read back `usage: 393 → 0`.
+    #[test]
+    fn codex_carries_per_turn_usage() {
+        let mut s = sample_session(Harness::Claude);
+        for m in &mut s.messages {
+            if m.role == Role::Assistant {
+                m.usage = Some(crate::ir::Usage {
+                    input_tokens: Some(12),
+                    output_tokens: Some(34),
+                    cache_read_tokens: Some(5),
+                    ..Default::default()
+                });
+            }
+        }
+        let (res, report) = emit_report(&s, Harness::Codex, &temp_dir(), &EmitOptions::default()).unwrap();
+        assert!(
+            !report.deltas.iter().any(|d| d.field == "usage"),
+            "usage must survive into Codex, got {:?}",
+            report.deltas
+        );
+        let re = reparse_emitted(Harness::Codex, &res, &ParseOptions::full()).unwrap();
+        let u = re
+            .messages
+            .iter()
+            .find_map(|m| m.usage.as_ref())
+            .expect("usage on the re-parsed Codex session");
+        assert_eq!(
+            (u.input_tokens, u.output_tokens, u.cache_read_tokens),
+            (Some(12), Some(34), Some(5))
+        );
+    }
+
+    /// Assistant token usage survives a port into OpenClaw, whose message format has its own
+    /// `usage` block (the emitter wrote none, so every port read back `usage: 462 → 0`).
+    #[test]
+    fn openclaw_carries_assistant_usage() {
+        let mut s = sample_session(Harness::Claude);
+        for m in &mut s.messages {
+            if m.role == Role::Assistant {
+                m.usage = Some(crate::ir::Usage {
+                    input_tokens: Some(9),
+                    output_tokens: Some(8),
+                    cache_read_tokens: Some(7),
+                    ..Default::default()
+                });
+            }
+        }
+        let (res, report) = emit_report(&s, Harness::OpenClaw, &temp_dir(), &EmitOptions::default()).unwrap();
+        assert!(
+            !report.deltas.iter().any(|d| d.field == "usage"),
+            "usage must survive into OpenClaw, got {:?}",
+            report.deltas
+        );
+        let re = reparse_emitted(Harness::OpenClaw, &res, &ParseOptions::full()).unwrap();
+        let u = re
+            .messages
+            .iter()
+            .find_map(|m| m.usage.as_ref())
+            .expect("usage on the re-parsed OpenClaw session");
+        assert_eq!(
+            (u.input_tokens, u.output_tokens, u.cache_read_tokens),
+            (Some(9), Some(8), Some(7))
+        );
+    }
+
+    /// A FOREIGN tool-result `details` survives a port into OpenCode. OpenCode reads `details` from
+    /// `state.{title,metadata,time}`; the emitter folded back only those three keys, so a Claude
+    /// `toolUseResult` (no such key) read back as `tool result details: 194 → 0`. Foreign keys now
+    /// ride in `metadata`, OpenCode's own free-form slot.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn opencode_carries_foreign_tool_details() {
+        let mut s = sample_session(Harness::Claude);
+        for b in s.messages.iter_mut().flat_map(|m| &mut m.content) {
+            if let Block::ToolResult { details, .. } = b {
+                *details = Some(serde_json::json!({ "filePath": "/w/a.rs", "structuredPatch": [1] }));
+            }
+        }
+        let (res, report) = emit_report(&s, Harness::OpenCode, &temp_dir(), &EmitOptions::default()).unwrap();
+        assert!(
+            !report.deltas.iter().any(|d| d.field == "details"),
+            "details must survive into OpenCode, got {:?}",
+            report.deltas
+        );
+        let re = reparse_emitted(Harness::OpenCode, &res, &ParseOptions::full()).unwrap();
+        let d = re
+            .messages
+            .iter()
+            .flat_map(|m| &m.content)
+            .find_map(|b| match b {
+                Block::ToolResult { details, .. } => details.clone(),
+                _ => None,
+            })
+            .expect("details on the re-parsed OpenCode tool result");
+        assert_eq!(d["metadata"]["filePath"], "/w/a.rs");
+    }
+
+    /// A turn whose every block is unrepresentable in the target (Claude's signature-only thinking
+    /// — bound reasoning with no plaintext and no portable blob) cannot come back: the emitted
+    /// record is empty and the target's reader drops it. That is an EXPECTED loss, reported once
+    /// as `unrepresentable_turns`, not a phantom deficit spread over role/kind/timestamp/id counts
+    /// (which failed `--strict` on every real Claude session: 133 of 458 assistant turns).
+    #[test]
+    fn turns_with_only_unrepresentable_content_are_an_expected_loss() {
+        let mut s = sample_session(Harness::Claude);
+        let mut think = Message::new(Role::Assistant);
+        think.timestamp = Some(Utc::now());
+        think.id = Some("think-1".into());
+        think.usage = Some(crate::ir::Usage {
+            input_tokens: Some(7),
+            ..Default::default()
+        });
+        think.content.push(Block::Thinking {
+            text: "".into(),
+            signature: Some("SIGONLY".into()),
+            encrypted: None,
+            redacted: false,
+        });
+        s.messages.insert(3, think);
+
+        let (_res, report) = emit_report(&s, Harness::Codex, &temp_dir(), &EmitOptions::default()).unwrap();
+        assert!(
+            report.deltas.iter().all(|d| d.expected),
+            "no unexpected loss from a turn the target cannot represent, got {:?}",
+            report.deltas
+        );
+        let d = report
+            .deltas
+            .iter()
+            .find(|d| d.field == "unrepresentable_turns")
+            .expect("the dropped turn is reported");
+        assert_eq!((d.before.as_str(), d.after.as_str()), ("1", "0"));
+
+        // Into Claude itself the same turn is perfectly representable, so nothing is reported.
+        let (_res, report) = emit_report(&s, Harness::Claude, &temp_dir(), &EmitOptions::default()).unwrap();
+        assert!(
+            !report.deltas.iter().any(|d| d.field == "unrepresentable_turns"),
+            "Claude holds signature-only thinking, got {:?}",
+            report.deltas
+        );
+    }
+
+    /// The `⚠ lost` rendering never dumps a whole value: a real session's system prompt is
+    /// thousands of lines, and printing it buried every other delta in scrollback. The struct keeps
+    /// the full value for `--json`.
+    #[test]
+    fn delta_describe_briefs_long_values() {
+        let d = Delta {
+            field: "system prompt".into(),
+            before: format!("\n\nYou are an interactive agent{}\nand more\n", "…".repeat(4000)),
+            after: "(none)".into(),
+            expected: true,
+        };
+        let line = d.describe();
+        assert!(
+            line.chars().count() < 120 && !line.contains('\n'),
+            "describe must stay one short line: {}",
+            line.chars().count()
+        );
+        assert!(
+            line.contains("You are an interactive agent"),
+            "keeps the first real line: {line}"
+        );
+        assert!(line.contains("chars)"), "says how much was cut: {line}");
+        assert!(line.ends_with("→ (none)"), "short values pass through: {line}");
+        assert!(d.before.len() > 1000, "the delta itself keeps the full value");
+    }
+
+    /// Same-harness verification compares like with like. `cv port` parses a rehome
+    /// format-complete, so re-parsing the output plainly diffed a complete session against a lean
+    /// one and invented deltas (`per-message model: 2106 → 836` against 836 messages).
+    #[test]
+    fn same_harness_verification_reparses_in_the_source_mode() {
+        use crate::harness::claude::stream_str;
+        use crate::stream::CollectSink;
+
+        let sid = "22222222-2222-4222-8222-222222222222";
+        let text = [
+            json!({"type":"user","uuid":"u0","parentUuid":null,"sessionId":sid,"cwd":"/w","version":"2.1.0",
+                   "timestamp":"2026-09-19T00:00:00.000Z","message":{"role":"user","content":"hi"}}),
+            json!({"type":"mode","sessionId":sid,"mode":"plan","timestamp":"2026-09-19T00:00:01.000Z"}),
+            json!({"type":"assistant","uuid":"a1","parentUuid":"u0","sessionId":sid,"cwd":"/w","version":"2.1.0",
+                   "timestamp":"2026-09-19T00:00:02.000Z",
+                   "message":{"id":"msg_1","role":"assistant","model":"claude-opus-4","stop_reason":"end_turn",
+                              "usage":{"input_tokens":3,"output_tokens":4},
+                              "content":[{"type":"text","text":"hello"}]}}),
+        ]
+        .map(|v| v.to_string())
+        .join("\n");
+
+        let mut sink = CollectSink::default();
+        let mut s = stream_str(sid, &text, None, &ParseOptions::complete(), &mut sink);
+        s.messages = sink.messages;
+        assert!(s.messages.iter().any(is_carrier), "the `mode` record is carried");
+
+        let (_res, report) = emit_report(
+            &s,
+            Harness::Claude,
+            &temp_dir(),
+            &EmitOptions {
+                new_id: Some(sid.into()),
+                new_cwd: Some(PathBuf::from("/w")),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            report.deltas.is_empty(),
+            "a complete-mode Claude rehome is lossless, got {:?}",
+            report.deltas
+        );
+    }
+
+    /// The INTERFACE-V2 §4 fidelity gain: a tool result's structured `details` is a SHARED concept,
+    /// so it survives a cross-harness port INTO Claude — written as the `toolUseResult` sidecar and
+    /// read back onto the block by Claude's own parser. This is the loss the verifier used to
+    /// report as unexpected for Claude (the adapter kept the sidecar in `extra["claude"]`, so a
+    /// re-parse saw no block-level details at all).
+    #[test]
+    fn claude_cross_harness_carries_tool_result_details() {
+        let mut s = sample_session(Harness::OpenCode);
+        for m in &mut s.messages {
+            for b in &mut m.content {
+                if let Block::ToolResult { details, .. } = b {
+                    *details = Some(serde_json::json!({ "title": "ls", "metadata": { "exit": 0 } }));
+                }
+            }
+        }
+        let (res, report) = emit_report(&s, Harness::Claude, &temp_dir(), &EmitOptions::default()).unwrap();
+        assert!(
+            !report.deltas.iter().any(|d| d.field == "details"),
+            "details must survive a port into Claude, got {:?}",
+            report.deltas
+        );
+        let parsed = crate::harness::claude::parse_str(&res.new_id, &fs::read_to_string(&res.path).unwrap(), None);
+        let details = parsed
+            .messages
+            .iter()
+            .flat_map(|m| &m.content)
+            .find_map(|b| match b {
+                Block::ToolResult { details, .. } => details.clone(),
+                _ => None,
+            })
+            .expect("details on the re-parsed Claude tool result");
+        assert_eq!(details["title"], "ls");
+        assert_eq!(details["metadata"]["exit"], 0);
+    }
+
+    /// Same-harness replay reads `toolUseResult` back out of the block's `details` and reproduces
+    /// the source record's value exactly — including the two shapes the parser has to reconcile
+    /// with cv's derived `persistedOutput` pointer: an object sidecar (pointer merged in) and a
+    /// bare string one (pointer parked beside it). Neither may leak that cv-only key into the
+    /// emitted record.
+    #[test]
+    fn claude_replay_rebuilds_tool_use_result_from_details() {
+        let stub = "<persisted-output>\nOutput too large (66KB). Full output saved to: /tmp/s/tool-results/b.txt\n\nPreview (first 2KB):\nhi\n</persisted-output>";
+        let obj_tur = json!({ "stdout": "hi", "persistedOutputPath": "/tmp/s/tool-results/b.txt" });
+        let str_tur = json!("Error: Exit code 64");
+        let text = [
+            json!({"type":"user","sessionId":"s1","uuid":"u1","timestamp":"2026-09-19T00:00:00Z",
+                   "toolUseResult": obj_tur,
+                   "message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":stub}]}}),
+            json!({"type":"user","sessionId":"s1","uuid":"u2","parentUuid":"u1","timestamp":"2026-09-19T00:00:01Z",
+                   "toolUseResult": str_tur,
+                   "message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t2","content":stub,"is_error":true}]}}),
+        ]
+        .map(|v| v.to_string())
+        .join("\n");
+
+        let s = crate::harness::claude::parse_str("s1", &text, None);
+        let (res, _report) = emit_report(&s, Harness::Claude, &temp_dir(), &EmitOptions::default()).unwrap();
+        let emitted: Vec<Value> = fs::read_to_string(&res.path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let sidecars: Vec<&Value> = emitted.iter().filter_map(|v| v.get("toolUseResult")).collect();
+        assert_eq!(sidecars, vec![&obj_tur, &str_tur], "both sidecars replay verbatim");
+        assert!(
+            !emitted
+                .iter()
+                .any(|v| v["toolUseResult"].get("persistedOutput").is_some()),
+            "cv's derived pointer is never written into a Claude record"
+        );
+    }
+
+    /// `--strict` fails on an *unexpected* loss — one the target format could have carried. Tool
+    /// result `details` used to be that loss for Claude (parse kept the sidecar in
+    /// `extra["claude"]`, so a re-parse read back no block-level details); it now round-trips, so
+    /// the subject here is per-message `usage`: Claude's records carry a `message.usage` block
+    /// (`target_holds(Claude, "usage")`), but `emit_claude` only reconstructs one for a
+    /// same-harness replay, so a foreign source's token counts are genuinely dropped. If that gap
+    /// is ever closed, point this test at another real one rather than weakening the check.
+    #[test]
+    fn strict_fails_on_unexpected_loss() {
+        let mut s = sample_session(Harness::OpenCode); // foreign source → Claude cross-harness path
+        for m in &mut s.messages {
+            if m.role == Role::Assistant {
+                m.usage = Some(crate::ir::Usage {
+                    input_tokens: Some(12),
+                    output_tokens: Some(34),
+                    ..Default::default()
+                });
+            }
+        }
+        // Sanity: the report flags an unexpected `usage` loss.
+        let (_r, report) = emit_report(&s, Harness::Claude, &temp_dir(), &EmitOptions::default()).unwrap();
+        assert!(
+            report.deltas.iter().any(|d| d.field.contains("usage") && !d.expected),
+            "expected an unexpected usage loss, got {:?}",
+            report.deltas
+        );
+        // Non-strict: succeeds, lists the loss.
+        let (_res, warnings) = emit_verified(&s, Harness::Claude, &temp_dir(), &EmitOptions::default()).unwrap();
+        assert!(warnings.iter().any(|w| w.contains("usage")));
+        // Strict: errors.
+        let err = emit_verified(
+            &s,
+            Harness::Claude,
+            &temp_dir(),
+            &EmitOptions {
+                strict: true,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("strict"), "got: {err:#}");
     }
 }

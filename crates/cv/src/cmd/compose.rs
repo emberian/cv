@@ -1,7 +1,7 @@
-//! `cv splice` / `cv loom` / `cv distill` / `cv dataset` — composing and distilling sessions.
+//! `cv prune` / `cv splice` / `cv loom` / `cv dataset` — reshaping sessions into new ones.
 
-use crate::cmd::convert::emit_session;
-use crate::util::{parse_harness, short_id};
+use crate::cmd::port::emit_session;
+use crate::util::{parse_harness, parse_range, resolve, short_id};
 use anyhow::{bail, Context, Result};
 use cv_core::ir::{Block, Harness, Message, Role, Session};
 use cv_core::EmitOptions;
@@ -10,13 +10,12 @@ use std::path::PathBuf;
 
 // ---------- prune ----------
 
-/// `cv prune <id>` — compact a Claude session into a new resumable one (see [`cv_core::prune`]); or
-/// `cv prune <id> --retrieve <tool_use_id>` to fetch a stashed original back out of the sidecar.
+/// `cv prune <id>` — compact a Claude session into a new resumable one (see [`cv_core::prune`]).
+/// Stashed originals come back with `cv cat <new-id> <tool_use_id>`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn cmd_prune(
     id: &str,
     harness: Option<String>,
-    retrieve: Option<String>,
     min_size: usize,
     keep_last: usize,
     to: Option<String>,
@@ -32,28 +31,7 @@ pub(crate) fn cmd_prune(
     json: bool, // also emit the report as one JSON object on stdout (the human report stays on stderr)
 ) -> Result<()> {
     let want = parse_harness(&harness)?;
-    let (r, _adapter) = cv_core::find(id, want)?.with_context(|| format!("no session matching {id:?}"))?;
-    let dir = r.path.parent().unwrap_or(std::path::Path::new("."));
-    let stem = r.path.file_stem().and_then(|s| s.to_str()).unwrap_or(id);
-
-    // Retrieval mode: read a stashed original from <id>.flat.jsonl and print it.
-    if let Some(tool_use_id) = retrieve {
-        let sidecar = dir.join(format!("{stem}.flat.jsonl"));
-        if !sidecar.exists() {
-            bail!(
-                "no prune sidecar at {} — is {} a pruned session?",
-                sidecar.display(),
-                short_id(&r.id)
-            );
-        }
-        let value = cv_core::prune::retrieve(&sidecar, &tool_use_id)?;
-        // Print raw text verbatim; pretty-print structured payloads.
-        match value.as_str() {
-            Some(s) => println!("{s}"),
-            None => println!("{}", serde_json::to_string_pretty(&value)?),
-        }
-        return Ok(());
-    }
+    let (r, _adapter) = resolve(id, want)?;
 
     if r.harness != Harness::Claude {
         bail!(
@@ -81,10 +59,10 @@ pub(crate) fn cmd_prune(
     let res = cv_core::prune::prune_session(&r.path, &opts)?;
 
     if json {
-        // Machine-readable prune report: ONE camelCase JSON object on stdout — the human report
+        // Machine-readable prune report: ONE snake_case JSON object on stdout — the human report
         // below stays on stderr (compose-family convention: status → stderr, data → stdout), so
         // stdout carries only the JSON and pipes cleanly. Dry-run honesty: nothing was written,
-        // so newPath/sidecarPath/copiedResources are null, and newId is null too unless --to
+        // so new_path/sidecar_path/copied_resources are null, and new_id is null too unless --to
         // pinned it — the core mints a throwaway UUID a real run would NOT reuse (see `note`).
         let report_id = (!res.dry_run || pinned_id).then(|| res.new_id.clone());
         let note = match (res.dry_run, pinned_id) {
@@ -98,35 +76,35 @@ pub(crate) fn cmd_prune(
         // stale → honest rewrite detail (what the human report prints as "revived: …k → …k").
         let revived = match (res.revive_tokens, res.revive_old_tokens) {
             (Some(honest), Some(stale)) => serde_json::json!({
-                "recordedTokensBefore": stale,
-                "recordedTokensAfter": honest,
-                "usageRecordsRewritten": res.usage_rewritten,
+                "recorded_tokens_before": stale,
+                "recorded_tokens_after": honest,
+                "usage_records_rewritten": res.usage_rewritten,
             }),
             _ => serde_json::Value::Bool(false),
         };
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
-                "sourceId": res.source_id,
-                "newId": report_id,
+                "source_id": res.source_id,
+                "new_id": report_id,
                 "harness": r.harness.as_str(),
-                "beforeBytes": res.original_size,
-                "afterBytes": res.new_size,
-                "snippedPayloads": res.pruned_count,
-                "imageBlocks": res.image_blocks,
-                "tokensFreed": res.est_context_tokens_saved,
-                "droppedTurns": res.dropped_turns,
-                "windowRealTokens": res.window_real_tokens,
+                "before_bytes": res.original_size,
+                "after_bytes": res.new_size,
+                "snipped_payloads": res.pruned_count,
+                "image_blocks": res.image_blocks,
+                "tokens_freed": res.est_context_tokens_saved,
+                "dropped_turns": res.dropped_turns,
+                "window_real_tokens": res.window_real_tokens,
                 "revived": revived,
                 "warnings": res.warnings,
-                "newPath": (!res.dry_run).then(|| res.new_path.display().to_string()),
-                "sidecarPath": (!res.dry_run)
+                "new_path": (!res.dry_run).then(|| res.new_path.display().to_string()),
+                "sidecar_path": (!res.dry_run)
                     .then(|| res.sidecar_path.as_ref().map(|p| p.display().to_string()))
                     .flatten(),
-                "copiedResources": (!res.dry_run)
+                "copied_resources": (!res.dry_run)
                     .then(|| res.copied_resources.as_ref().map(|p| p.display().to_string()))
                     .flatten(),
-                "dryRun": res.dry_run,
+                "dry_run": res.dry_run,
                 "note": note,
             }))?
         );
@@ -179,7 +157,7 @@ pub(crate) fn cmd_prune(
         eprintln!("  new session: {}", res.new_path.display());
         if let Some(sc) = &res.sidecar_path {
             eprintln!(
-                "  sidecar:     {} (retrieve: cv prune {} --retrieve <tool_use_id>)",
+                "  sidecar:     {} (fetch an original: cv cat {} <tool_use_id>)",
                 sc.display(),
                 short_id(&res.new_id)
             );
@@ -217,44 +195,39 @@ struct SpliceSpec {
     end: Option<usize>,
 }
 
-/// Parse `<id>:<start>-<end>` | `<id>:<start>-` | `<id>` into a [`SpliceSpec`].
+/// Parse `<id>:A..B` | `<id>:A..` | `<id>:..B` | `<id>` into a [`SpliceSpec`] — the same `A..B`
+/// window grammar as `show --range` (0-based, end-exclusive). `<id>` may carry a `harness:` prefix
+/// (`codex:019e…:0..12`), so the range is split off the END.
 fn parse_splice_spec(spec: &str) -> Result<SpliceSpec> {
-    match spec.split_once(':') {
-        None => Ok(SpliceSpec {
-            id: spec.to_string(),
-            start: 0,
-            end: None,
-        }),
-        Some((id, range)) => {
-            let (s, e) = range
-                .split_once('-')
-                .with_context(|| format!("bad spec {spec:?}: range must be <start>-<end> or <start>-"))?;
-            let start: usize = s
-                .trim()
-                .parse()
-                .with_context(|| format!("bad spec {spec:?}: start must be a number"))?;
-            let end = if e.trim().is_empty() {
-                None
-            } else {
-                Some(
-                    e.trim()
-                        .parse()
-                        .with_context(|| format!("bad spec {spec:?}: end must be a number"))?,
-                )
-            };
+    match spec.rsplit_once(':') {
+        Some((id, range)) if range.contains("..") => {
+            let (start, end) = parse_range(range).with_context(|| format!("bad spec {spec:?}"))?;
             Ok(SpliceSpec {
                 id: id.to_string(),
                 start,
                 end,
             })
         }
+        Some((_, range))
+            if !range.is_empty() && range.contains('-') && range.chars().all(|c| c.is_ascii_digit() || c == '-') =>
+        {
+            bail!(
+                "bad spec {spec:?}: the `<id>:A-B` grammar is gone — use `<id>:A..B` (0-based, end-exclusive), \
+                 `<id>:A..`, or `<id>:..B`"
+            )
+        }
+        _ => Ok(SpliceSpec {
+            id: spec.to_string(),
+            start: 0,
+            end: None,
+        }),
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn cmd_splice(
     specs: &[String],
-    to: Option<String>,
+    harness: Option<String>,
     out: Option<PathBuf>,
     export: Option<String>,
     cwd: Option<PathBuf>,
@@ -267,7 +240,7 @@ pub(crate) fn cmd_splice(
     // borrow them. We pair each parsed session with the (start, end) it'll select.
     let mut owned: Vec<(Session, usize, Option<usize>)> = Vec::with_capacity(parsed.len());
     for sp in &parsed {
-        let (r, adapter) = cv_core::find(&sp.id, None)?.with_context(|| format!("no session matching {:?}", sp.id))?;
+        let (r, adapter) = resolve(&sp.id, None)?;
         let session = adapter.parse(&r)?;
         owned.push((session, sp.start, sp.end));
     }
@@ -281,8 +254,8 @@ pub(crate) fn cmd_splice(
         })
         .collect();
 
-    // Target harness: --to, else the first spec's source harness.
-    let to_h = match &to {
+    // Target harness: --harness, else the first spec's source harness.
+    let to_h = match &harness {
         Some(s) => Harness::parse(s).with_context(|| format!("unknown target harness: {s}"))?,
         None => owned
             .first()
@@ -291,7 +264,7 @@ pub(crate) fn cmd_splice(
     };
 
     let spliced = cv_core::loom::splice(&spans, None, to_h);
-    finish_composed(spliced, to_h, to.is_some(), out, export, cwd, generate, gen_model)
+    finish_composed(spliced, to_h, harness.is_some(), out, export, cwd, generate, gen_model)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -300,32 +273,32 @@ pub(crate) fn cmd_loom(
     at: usize,
     graft: &str,
     from: usize,
-    to: Option<String>,
+    harness: Option<String>,
     out: Option<PathBuf>,
     export: Option<String>,
     cwd: Option<PathBuf>,
     generate: bool,
     gen_model: Option<String>,
 ) -> Result<()> {
-    let (rb, ab) = cv_core::find(base, None)?.with_context(|| format!("no session matching {base:?}"))?;
-    let (rg, ag) = cv_core::find(graft, None)?.with_context(|| format!("no session matching {graft:?}"))?;
+    let (rb, ab) = resolve(base, None)?;
+    let (rg, ag) = resolve(graft, None)?;
     let base_s = ab.parse(&rb)?;
     let graft_s = ag.parse(&rg)?;
 
     let grafted = cv_core::loom::graft(&base_s, at, &graft_s, from, None);
-    // Default target harness is the base's (graft() already used it); honor --to if given.
-    let to_h = match &to {
+    // Default target harness is the base's (graft() already used it); honor --harness if given.
+    let to_h = match &harness {
         Some(s) => Harness::parse(s).with_context(|| format!("unknown target harness: {s}"))?,
         None => base_s.harness,
     };
-    // Re-stamp the harness if --to overrode it (graft used base.harness).
+    // Re-stamp the harness if --harness overrode it (graft used base.harness).
     let mut grafted = grafted;
     grafted.harness = to_h;
-    finish_composed(grafted, to_h, to.is_some(), out, export, cwd, generate, gen_model)
+    finish_composed(grafted, to_h, harness.is_some(), out, export, cwd, generate, gen_model)
 }
 
-/// Shared tail for splice/loom: emit to a harness when `--to`/`--out` is in play, otherwise print a
-/// summary and (with `--export md|json`) the composed session to stdout.
+/// Shared tail for splice/loom: emit to a harness when `--harness`/`--out` is in play, otherwise
+/// print a summary and (with `--export md|json`) the composed session to stdout.
 #[allow(clippy::too_many_arguments)]
 fn finish_composed(
     mut session: Session,
@@ -362,7 +335,7 @@ fn finish_composed(
         );
     }
 
-    // Emit path: an explicit --to or an --out directory means "materialize this for a harness".
+    // Emit path: an explicit --harness or an --out directory means "materialize this for a harness".
     if explicit_to || out.is_some() {
         if let Some(dir) = &cwd {
             session.cwd = Some(dir.clone());
@@ -374,6 +347,7 @@ fn finish_composed(
             EmitOptions {
                 new_cwd: cwd,
                 new_id: None,
+                strict: false,
             },
         );
     }
@@ -403,7 +377,7 @@ fn finish_composed(
     }
     match export.as_deref() {
         None => {
-            println!("\n(use --export md|json to print it, or --to <harness> [--out <dir>] to emit it)");
+            println!("\n(use --export md|json to print it, or --harness <harness> [--out <dir>] to emit it)");
         }
         Some("json") => println!("{}", serde_json::to_string_pretty(&session)?),
         Some("md") | Some("markdown") => print!("{}", cv_core::render::to_markdown(&session)),
@@ -412,66 +386,7 @@ fn finish_composed(
     Ok(())
 }
 
-// ---------- distill ----------
-
-pub(crate) fn cmd_distill(
-    id: &str,
-    harness: Option<String>,
-    model: Option<String>,
-    project: bool,
-    out: Option<PathBuf>,
-    append: bool,
-) -> Result<()> {
-    let want = parse_harness(&harness)?;
-    let (r, adapter) = cv_core::find(id, want)?.with_context(|| format!("no session matching {id:?}"))?;
-    let session = adapter.parse(&r)?;
-
-    match cv_llm::available_provider() {
-        None => {
-            eprintln!(
-                "no LLM provider configured. Set one of:\n  \
-                 OPENROUTER_API_KEY=…   (OpenRouter; preferred)\n  \
-                 ANTHROPIC_API_KEY=…    (Anthropic)\n  \
-                 LMSTUDIO_API_BASE=local  (a free local LM Studio server at localhost:1234)"
-            );
-            std::process::exit(1);
-        }
-        Some(p) => eprintln!("✦ distilling via {p}…"),
-    }
-
-    let opts = cv_llm::DistillOptions { model, project };
-    let digest = cv_llm::distill(&session, &opts).context("distillation failed")?;
-
-    match out {
-        None => print!("{digest}"),
-        Some(path) => {
-            if append {
-                use std::io::Write;
-                let date = session
-                    .updated_at
-                    .or(session.created_at)
-                    .map(|d| crate::util::fmt_local(d, "%Y-%m-%d"))
-                    .unwrap_or_else(|| "----------".into());
-                let header = format!("\n\n## {} ({})\n", session.label(), date);
-                let mut f = fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&path)
-                    .with_context(|| format!("opening {} for append", path.display()))?;
-                f.write_all(header.as_bytes())?;
-                f.write_all(digest.as_bytes())?;
-                if !digest.ends_with('\n') {
-                    f.write_all(b"\n")?;
-                }
-                eprintln!("✦ appended distillation → {}", path.display());
-            } else {
-                fs::write(&path, &digest).with_context(|| format!("writing {}", path.display()))?;
-                eprintln!("✦ wrote distillation → {}", path.display());
-            }
-        }
-    }
-    Ok(())
-}
+// ---------- dataset ----------
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn cmd_dataset(

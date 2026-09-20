@@ -104,11 +104,37 @@ fn each_json_line_inner(line: &str, skipped: &mut u64, f: &mut impl FnMut(Value)
     f(v)
 }
 
-/// Record `skipped` unreadable transcript lines in a session's `extra` (only when non-zero, so
-/// clean sessions stay byte-identical). The count is a *lower bound* when a pass stopped early.
+/// The namespace in `Session::extra` / `Message::extra` for cv's OWN bookkeeping — facts about the
+/// *parse*, not about the harness. It sits beside the per-harness bags
+/// ([`Session::harness_extra_mut`](crate::ir::Session::harness_extra_mut)) and can never collide
+/// with one: `Harness::parse("cv")` is `None`.
+///
+/// Why a namespace and not a flat key (`docs/INTERFACE-V2.md` §4): the flat-key exception list is a
+/// list that GROWS — every new cross-harness diagnostic would have to be added to it and to every
+/// consumer that walks `extra` (see [`emit::is_internal_extra_key`](crate::emit)). A namespace does
+/// not. So §4's exceptions stay exactly what they are today, both on `Message` only:
+/// [`claude::CARRIER_KEY`] (`_record`, the verbatim source record under `ParseOptions::complete`)
+/// and [`crate::offsets::OFFSET_KEY`] (`cv_byte_offset`, written per message on the lazy-offset hot
+/// path, where a nested map per message would be pure allocation). `Session::extra` has **no** flat
+/// exception: every top-level key there is a namespace object — a harness name or `"cv"`.
+pub(crate) const CV_NAMESPACE: &str = "cv";
+
+/// Record `skipped` unreadable transcript lines under `extra["cv"]["skipped_lines"]` (only when
+/// non-zero, so clean sessions stay byte-identical). The count is a *lower bound* when a pass
+/// stopped early. It is a parse diagnostic shared by every adapter, so it lives in cv's own
+/// namespace ([`CV_NAMESPACE`]) rather than in any harness bag.
 pub(crate) fn note_skipped_lines(s: &mut Session, skipped: u64) {
     if skipped > 0 {
-        s.extra.insert("skipped_lines".into(), Value::Number(skipped.into()));
+        let slot = s
+            .extra
+            .entry(CV_NAMESPACE)
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        if !slot.is_object() {
+            *slot = Value::Object(serde_json::Map::new());
+        }
+        if let Some(bag) = slot.as_object_mut() {
+            bag.insert("skipped_lines".into(), Value::Number(skipped.into()));
+        }
     }
 }
 
@@ -207,6 +233,38 @@ pub fn for_harness(h: Harness) -> Option<Box<dyn Adapter>> {
     all().into_iter().find(|a| a.harness() == h)
 }
 
+/// Assert the IR-v2 nesting invariant on a parsed session (`docs/INTERFACE-V2.md` §4), so every
+/// adapter's tests state the rule the same way instead of each spelling out its own key list.
+///
+/// Every top-level key in `Session::extra` and in each `Message::extra` must be a **namespace whose
+/// value is an object** — a canonical harness name (`Harness::as_str`, so an alias like `cc` fails)
+/// or [`CV_NAMESPACE`]. Exactly two flat keys are allowed, both message-level and both cv's own
+/// streaming bookkeeping rather than harness facts: [`claude::CARRIER_KEY`] (`_record`, the verbatim
+/// source record under [`ParseOptions::complete`]) and [`crate::offsets::OFFSET_KEY`]
+/// (`cv_byte_offset`). `Session::extra` has no flat exception at all.
+#[cfg(test)]
+pub(crate) fn assert_no_flat_keys(s: &Session) {
+    let namespace = |k: &str| Harness::parse(k).is_some_and(|h| h.as_str() == k) || k == CV_NAMESPACE;
+    for (k, v) in &s.extra {
+        assert!(namespace(k), "flat session extra key {k:?} on a {} session", s.harness);
+        assert!(v.is_object(), "namespace {k:?} must hold an object, got {v}");
+    }
+    for m in &s.messages {
+        for (k, v) in &m.extra {
+            if k == claude::CARRIER_KEY || k == crate::offsets::OFFSET_KEY {
+                continue; // the two documented flat exceptions
+            }
+            assert!(
+                namespace(k),
+                "flat message extra key {k:?} on {:?} (a {} session)",
+                m.id,
+                s.harness
+            );
+            assert!(v.is_object(), "namespace {k:?} must hold an object, got {v}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -271,6 +329,32 @@ mod tests {
         note_skipped_lines(&mut s, 0);
         assert!(s.extra.is_empty());
         note_skipped_lines(&mut s, 3);
-        assert_eq!(s.extra.get("skipped_lines").and_then(Value::as_u64), Some(3));
+        // cv's own parse diagnostic lives in cv's namespace, never flat on the session
+        // (`CV_NAMESPACE`; `docs/INTERFACE-V2.md` §4).
+        let noted = |s: &Session| {
+            s.extra
+                .get(CV_NAMESPACE)
+                .and_then(|v| v.get("skipped_lines"))
+                .and_then(Value::as_u64)
+        };
+        assert_eq!(noted(&s), Some(3));
+        assert!(!s.extra.contains_key("skipped_lines"), "never a flat session key");
+        // Re-noting replaces rather than nesting again, and adds no second top-level key.
+        note_skipped_lines(&mut s, 5);
+        assert_eq!(noted(&s), Some(5));
+        assert_eq!(s.extra.keys().collect::<Vec<_>>(), ["cv"]);
+    }
+
+    /// Every top-level key a session's `extra` may carry is a NAMESPACE object — a harness name or
+    /// [`CV_NAMESPACE`]. `Session::extra` has no flat exception at all (the two documented flat
+    /// keys, `_record` and `cv_byte_offset`, are message-level). Asserted here because
+    /// `note_skipped_lines` is the one writer every adapter shares.
+    #[test]
+    fn cv_namespace_never_collides_with_a_harness_name() {
+        assert!(
+            Harness::parse(CV_NAMESPACE).is_none(),
+            "`cv` must never be parseable as a harness, or its bag would shadow one"
+        );
+        assert!(!Harness::ALL.iter().any(|h| h.as_str() == CV_NAMESPACE));
     }
 }

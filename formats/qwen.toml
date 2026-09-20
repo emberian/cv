@@ -1,0 +1,19 @@
+# formats/qwen.toml — the vocabulary cv's `qwen` adapter is checked against (docs/INTERFACE-V2.md §7).
+# status: handled = per-item arm in the adapter; generic = interpreted by a blanket rule; carried = verbatim
+# under ParseOptions::complete only; ignored = known and deliberately skipped. Regenerate: tools/gen-manifests (or edit by hand).
+
+harness = "qwen"
+source_files = ["harness/qwen.rs"]
+ignore_literals = ["json", "jsonl", "chats", "checkpoint-", "logs.json", "tmp"]
+store = [
+  "~/.qwen/tmp/<project>/{chats/session-*.json|jsonl, checkpoint-*.json, logs.json}",
+]
+
+[upstream]
+repo = "gemini-cli fork (not checked out)"
+commit = "unknown"
+date = "2026-05-29"
+
+[types]
+"record.user" = { status = "generic", note = "delegates to gemini" }
+"record.gemini" = { status = "generic", note = "delegates to gemini" }

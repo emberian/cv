@@ -272,12 +272,22 @@ fn pack_session_emits_resumable_claude_session_that_round_trips() {
     let w = World::new("session");
     pack_corpus(&w);
 
-    // --format session requires --to.
+    // --format session requires --harness, and the error spells the fix out.
     let (_, err) = w.cv_fails(&["pack", "wombat caching layer", "--format", "session"]);
-    assert!(err.contains("--format session needs --to"), "{err}");
+    assert!(
+        err.contains("--format session needs --harness <harness>") && err.contains("--harness claude"),
+        "{err}"
+    );
 
-    // Emit into the (temp-HOME) claude storage root, like `cv convert` does.
-    let (out, _) = w.cv_ok(&["pack", "wombat caching layer", "--format", "session", "--to", "claude"]);
+    // Emit into the (temp-HOME) claude storage root, like `cv port` does.
+    let (out, _) = w.cv_ok(&[
+        "pack",
+        "wombat caching layer",
+        "--format",
+        "session",
+        "--harness",
+        "claude",
+    ]);
     assert!(out.contains("✦ wrote "), "{out}");
     assert!(out.contains("claude --resume"), "resume hint expected:\n{out}");
 
@@ -334,9 +344,19 @@ fn pack_rejects_bad_arguments() {
     let (_, err) = w.cv_fails(&["pack", "x", "--format", "docx"]);
     assert!(err.contains("unknown format"), "{err}");
 
-    let (_, err) = w.cv_fails(&["pack", "x", "--to", "claude"]);
-    assert!(err.contains("--to only applies to --format session"), "{err}");
+    // --harness is the target-harness flag, and only --format session has a target.
+    let (_, err) = w.cv_fails(&["pack", "x", "--harness", "claude"]);
+    assert!(err.contains("--harness only applies to --format session"), "{err}");
 
-    let (_, err) = w.cv_fails(&["pack", "x", "--format", "session", "--to", "marsrover"]);
+    let (_, err) = w.cv_fails(&["pack", "x", "--format", "session", "--harness", "marsrover"]);
     assert!(err.contains("unknown target harness"), "{err}");
+
+    // The 0.10 `--to` spelling is gone, with a pointer at --harness (exit 2: a caller mistake).
+    let (ok, code, out, err) = w.cv(&["pack", "x", "--to", "claude"]);
+    assert!(!ok, "`pack --to` must not still work:\n{out}");
+    assert_eq!(code, 2, "{err}");
+    assert!(
+        err.contains("renamed in 0.11.0") && err.contains("--harness <harness>"),
+        "{err}"
+    );
 }

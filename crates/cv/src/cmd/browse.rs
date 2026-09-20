@@ -3,7 +3,7 @@
 //! These read [`cv_core::sessions`] (the probed catalog — milliseconds warm, transparently a full
 //! discovery when cold/stale); `cv ls --fresh` forces [`cv_core::discover_all`]'s full scan.
 
-use crate::util::{dim_cwd, home_rel, parse_harness, short_id};
+use crate::util::{dim_cwd, home_rel, parse_harness, session_row, short_id};
 use anyhow::Result;
 use cv_core::ir::{truncate, SessionRef};
 use cv_core::sanitize::sanitize_line;
@@ -24,6 +24,16 @@ fn apply_query(refs: &mut Vec<SessionRef>, query: &Option<cv_core::SessionQuery>
     }
 }
 
+/// Session rows for `--json` listings: the SAME refs the table would print (the `exists()` guard —
+/// a row whose file vanished since the probe is dropped — comes free from the `stat` that yields
+/// `size_bytes`), capped at `limit`.
+fn json_rows<'a>(refs: impl Iterator<Item = &'a SessionRef>, limit: usize) -> Vec<(&'a SessionRef, serde_json::Value)> {
+    refs.filter_map(|r| std::fs::metadata(&r.path).ok().map(|m| (r, m.len())))
+        .take(limit)
+        .map(|(r, size)| (r, session_row(r, Some(size))))
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn cmd_ls(
     harness: Option<String>,
@@ -32,8 +42,8 @@ pub(crate) fn cmd_ls(
     limit: usize,
     sort_by: &str,
     fresh: bool,  // force a full re-discovery instead of trusting the probed catalog
-    json: bool,   // emit the rows as one JSON array (OpenSession-aligned fields) instead of the table
-    enrich: bool, // --json only: add transcript-derived git + displayTitle (one parse per emitted row)
+    json: bool,   // emit the rows as one JSON array of session rows instead of the table
+    enrich: bool, // --json only: add transcript-derived git + display_title (one parse per emitted row)
 ) -> Result<()> {
     let want = parse_harness(&harness)?;
     let query = crate::cmd::query::build(query)?;
@@ -64,33 +74,15 @@ pub(crate) fn cmd_ls(
     if json {
         // Machine-readable listing: the SAME rows the table below would print (same filters, sort,
         // exists() guard, and limit), as one JSON array on stdout — no header/footer, so it pipes
-        // cleanly. Field names are camelCase, aligned with docs/OPENSESSION.md where it names the
-        // concept (harness/id/cwd/title/createdAt/updatedAt).
+        // cleanly. Transcript-derived text (title) stays raw here — sanitizing is the terminal
+        // seam's job (G5); JSON is the machine contract.
         //
-        // `sizeBytes` is always emitted: it comes free from the metadata() call that already serves
-        // as the exists() guard (a row whose file has vanished since the probe is skipped, its Err
-        // standing in for the old `path.exists()` == false). Transcript-derived text (title) stays
-        // raw here — sanitizing is the terminal seam's job (G5); JSON is the machine contract.
-        //
-        // `--enrich` (git + displayTitle) is opt-in because it costs one transcript parse per
+        // `--enrich` (git + display_title) is opt-in because it costs one transcript parse per
         // emitted row — O(limit), not O(fleet), but not the catalog-cheap default `ls --json`
         // promises. See the perf note in the flag's help.
-        let rows: Vec<serde_json::Value> = refs
-            .iter()
-            .filter_map(|r| std::fs::metadata(&r.path).ok().map(|m| (r, m.len())))
-            .take(limit)
-            .map(|(r, size)| {
-                let mut obj = serde_json::json!({
-                    "harness": r.harness.as_str(),
-                    "id": r.id,
-                    "cwd": r.cwd.as_ref().map(|p| p.to_string_lossy()),
-                    "title": r.title,
-                    "messageCount": r.message_count,
-                    "createdAt": r.created_at.map(|t| t.to_rfc3339()),
-                    "updatedAt": r.updated_at.map(|t| t.to_rfc3339()),
-                    "path": r.path.to_string_lossy(),
-                    "sizeBytes": size,
-                });
+        let rows: Vec<serde_json::Value> = json_rows(refs.iter(), limit)
+            .into_iter()
+            .map(|(r, mut obj)| {
                 if enrich {
                     // Same transcript source `cv show --json` reads. A lazy parse leaves giant
                     // content on disk (memory-safe on the multi-MB "single-exchange giants" sesh
@@ -107,10 +99,10 @@ pub(crate) fn cmd_ls(
                                 map.insert("git".into(), g);
                             }
                         }
-                        // `displayTitle`: `title` with a first-real-user-text fallback. Explicit
+                        // `display_title`: `title` with a first-real-user-text fallback. Explicit
                         // null (not absent) when a session has neither, so consumers can tell "no
                         // title anywhere" from "not enriched" (the key is absent without --enrich).
-                        map.insert("displayTitle".into(), serde_json::json!(session.synth_title()));
+                        map.insert("display_title".into(), serde_json::json!(session.synth_title()));
                     }
                 }
                 obj
@@ -155,6 +147,7 @@ pub(crate) fn cmd_timeline(
     cwd: Option<String>,
     query: Option<String>,
     limit: usize,
+    json: bool, // the shown window as one JSON array of session rows, oldest first
 ) -> Result<()> {
     let want = parse_harness(&harness)?;
     let query = crate::cmd::query::build(query)?;
@@ -179,6 +172,11 @@ pub(crate) fn cmd_timeline(
     } else {
         &refs[..]
     };
+    if json {
+        let rows: Vec<serde_json::Value> = json_rows(shown.iter(), limit).into_iter().map(|(_, v)| v).collect();
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+        return Ok(());
+    }
     if total > limit {
         println!("… {} older (use --limit)\n", total - limit);
     }
@@ -229,21 +227,12 @@ pub(crate) fn cmd_timeline(
 
 // ---------- stats ----------
 
-pub(crate) fn cmd_stats(query: Option<String>) -> Result<()> {
+pub(crate) fn cmd_stats(query: Option<String>, json: bool) -> Result<()> {
     use std::collections::HashMap;
     let query = crate::cmd::query::build(query)?;
     let mut refs = cv_core::sessions();
     apply_query(&mut refs, &query);
     let total = refs.len();
-    if total == 0 {
-        let scope = if query.is_some() {
-            " match the query"
-        } else {
-            " discovered"
-        };
-        println!("no sessions{scope}.");
-        return Ok(());
-    }
 
     let mut per_harness: HashMap<&'static str, usize> = HashMap::new();
     let mut per_cwd: HashMap<String, usize> = HashMap::new();
@@ -263,20 +252,52 @@ pub(crate) fn cmd_stats(query: Option<String>) -> Result<()> {
             max_updated = Some(max_updated.map_or(u, |m| m.max(u)));
         }
     }
+    let mut hv: Vec<_> = per_harness.into_iter().collect();
+    hv.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    let mut cv: Vec<_> = per_cwd.into_iter().collect();
+    cv.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+
+    if json {
+        let by_harness: serde_json::Map<String, serde_json::Value> =
+            hv.iter().map(|(h, n)| (h.to_string(), serde_json::json!(n))).collect();
+        let top_cwds: Vec<serde_json::Value> = cv
+            .iter()
+            .take(10)
+            .map(|(c, n)| serde_json::json!({ "cwd": c, "sessions": n }))
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "sessions": total,
+                "messages": total_messages,
+                "by_harness": by_harness,
+                "top_cwds": top_cwds,
+                "earliest_created": min_created.map(|d| d.to_rfc3339()),
+                "latest_updated": max_updated.map(|d| d.to_rfc3339()),
+            }))?
+        );
+        return Ok(());
+    }
+
+    if total == 0 {
+        let scope = if query.is_some() {
+            " match the query"
+        } else {
+            " discovered"
+        };
+        println!("no sessions{scope}.");
+        return Ok(());
+    }
 
     println!("✦ clustervision fleet stats\n");
     println!("{total} session(s) · {total_messages} message(s)\n");
 
     println!("by harness:");
-    let mut hv: Vec<_> = per_harness.into_iter().collect();
-    hv.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
     for (h, n) in hv {
         println!("  {h:12} {n:>5}");
     }
 
     println!("\ntop cwds:");
-    let mut cv: Vec<_> = per_cwd.into_iter().collect();
-    cv.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     for (c, n) in cv.into_iter().take(10) {
         println!("  {n:>5}  {}", truncate(&c, 70));
     }

@@ -10,13 +10,25 @@
 //! the conversation, not the system block, so it's only *sized* from token usage, not broken down.
 
 use crate::compaction;
-use crate::ir::{Block, Role, Session};
+use crate::ir::{Block, Message, MessageKind, Role, Session};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
 
 /// Claude tokenizer ≈ 3.3–3.7 bytes/token.
 const BYTES_PER_TOKEN: f64 = 3.5;
+
+/// The bucket name for an injected-context turn: the harness's own attachment kind when it recorded
+/// one (`extra[h]["attachment_type"]`, e.g. Claude's `hook_success`), else the IR kind name.
+fn injected_kind(m: &Message) -> String {
+    m.extra
+        .values()
+        .filter_map(Value::as_object)
+        .find_map(|bag| bag.get("attachment_type"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| m.kind.as_str().to_string())
+}
 /// One image tile ≈ this many tokens (image bytes are never inlined into the IR).
 const IMAGE_TOKENS: u64 = 1500;
 
@@ -94,17 +106,24 @@ impl Report {
                 match b {
                     Block::Text { text } => {
                         let t = toks(text.len());
-                        match m.role {
-                            Role::Assistant => self.assistant_text += t,
-                            // A system reminder Claude Code appended to the prompt: real per-turn
-                            // context, itemized by kind (it used to hide inside "fixed overhead").
-                            Role::System => match m.extra.get("attachmentType").and_then(Value::as_str) {
-                                Some(kind) => {
-                                    self.attachments += t;
-                                    *self.by_attachment.entry(kind.to_string()).or_default() += t;
-                                }
-                                None => self.system_text += t,
-                            },
+                        match (m.role, m.kind) {
+                            // Harness-side notices, errors, markers and carriers are never sent to
+                            // the model: they cost no context.
+                            (_, MessageKind::Notice)
+                            | (_, MessageKind::Error)
+                            | (_, MessageKind::Carrier)
+                            | (_, MessageKind::CompactionBoundary)
+                            | (_, MessageKind::Branch)
+                            | (_, MessageKind::ModelChange) => {}
+                            // Context the harness injected into the prompt (system reminders, hook
+                            // output, turn context): real per-turn context, itemized by kind — it
+                            // used to hide inside "fixed overhead".
+                            (_, MessageKind::InjectedContext) => {
+                                self.attachments += t;
+                                *self.by_attachment.entry(injected_kind(m)).or_default() += t;
+                            }
+                            (Role::Assistant, _) => self.assistant_text += t,
+                            (Role::System, _) => self.system_text += t,
                             _ => self.user_text += t,
                         }
                     }

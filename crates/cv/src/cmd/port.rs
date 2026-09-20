@@ -1,17 +1,22 @@
-//! `cv convert` / `cv port` / `cv resume` — moving sessions between harnesses and homes.
+//! `cv port` / `cv resume` — producing a copy of a session that runs elsewhere (another harness,
+//! another working directory, or both), and launching one in its native harness.
+//!
+//! `port` is the one verb for "make this session runnable somewhere else": 0.10's `convert` (same
+//! place, different harness) and `port` (different place) were the same act, so `--harness` picks
+//! the target harness (default: the source's) and `--cwd` the new home. The source is never touched.
 
-use crate::util::{home_rel, parse_harness};
+use crate::util::{home_rel, parse_harness, resolve};
 use anyhow::{bail, Context, Result};
 use cv_core::ir::{Harness, Session, SessionRef};
 use cv_core::{Adapter, EmitOptions, ParseOptions};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Parse a session at the fidelity the conversion needs. Same-harness (a `cv port` rehome or an
-/// A→A convert) parses **format-complete** so the carrier/replay machinery preserves every record
-/// (meta lines, compact boundaries, exhaustive `extra`) — the emitter replays them verbatim.
-/// Cross-harness sticks to the plain full-fidelity parse: carriers hold *source*-native records
-/// that no other emitter can replay (they'd just surface as empty turns).
+/// Parse a session at the fidelity the port needs. Same-harness (a pure rehome) parses
+/// **format-complete** so the carrier/replay machinery preserves every record (meta lines, compact
+/// boundaries, exhaustive `extra`) — the emitter replays them verbatim. Cross-harness sticks to the
+/// plain full-fidelity parse: carriers hold *source*-native records that no other emitter can
+/// replay (they'd just surface as empty turns).
 fn parse_for_emit(adapter: &dyn Adapter, r: &SessionRef, to_h: Harness) -> Result<Session> {
     if r.harness == to_h {
         let mut s = cv_core::stream::collect_with(adapter, r, &ParseOptions::complete())?;
@@ -22,17 +27,22 @@ fn parse_for_emit(adapter: &dyn Adapter, r: &SessionRef, to_h: Harness) -> Resul
     }
 }
 
-pub(crate) fn cmd_convert(
+pub(crate) fn cmd_port(
     id: &str,
-    to: &str,
-    from: Option<String>,
-    out: Option<PathBuf>,
+    harness: Option<String>,
     cwd: Option<PathBuf>,
+    out: Option<PathBuf>,
+    no_context: bool,
+    strict: bool,
 ) -> Result<()> {
-    let from_h = parse_harness(&from)?;
-    let to_h = Harness::parse(to).with_context(|| format!("unknown target harness: {to}"))?;
-    let (r, adapter) = cv_core::find(id, from_h)?.with_context(|| format!("no session matching {id:?}"))?;
+    // The source harness rides on the id (`codex:019e…`); `--harness` is the TARGET.
+    let (r, adapter) = resolve(id, None)?;
+    let to_h = match &harness {
+        Some(s) => Harness::parse(s).with_context(|| format!("unknown target harness: {s}"))?,
+        None => r.harness, // a pure rehome
+    };
     let session = parse_for_emit(adapter.as_ref(), &r, to_h)?;
+    let new_cwd = cwd.clone();
     emit_session(
         &session,
         to_h,
@@ -40,34 +50,7 @@ pub(crate) fn cmd_convert(
         EmitOptions {
             new_cwd: cwd,
             new_id: None,
-        },
-    )
-}
-
-pub(crate) fn cmd_port(
-    id: &str,
-    to: Option<String>,
-    from: Option<String>,
-    to_dir: Option<PathBuf>,
-    out: Option<PathBuf>,
-    no_context: bool,
-) -> Result<()> {
-    let from_h = parse_harness(&from)?;
-    let (r, adapter) = cv_core::find(id, from_h)?.with_context(|| format!("no session matching {id:?}"))?;
-    // Default to the same harness — a pure rehome.
-    let to_h = match to {
-        Some(s) => Harness::parse(&s).with_context(|| format!("unknown target harness: {s}"))?,
-        None => r.harness,
-    };
-    let session = parse_for_emit(adapter.as_ref(), &r, to_h)?;
-    let new_cwd = to_dir.clone();
-    emit_session(
-        &session,
-        to_h,
-        out,
-        EmitOptions {
-            new_cwd: to_dir,
-            new_id: None,
+            strict,
         },
     )?;
 
@@ -153,7 +136,7 @@ pub(crate) fn emit_session(session: &Session, to_h: Harness, out: Option<PathBuf
 
 pub(crate) fn cmd_resume(id: &str, harness: Option<String>, launch: bool) -> Result<()> {
     let want = parse_harness(&harness)?;
-    let (r, _adapter) = cv_core::find(id, want)?.with_context(|| format!("no session matching {id:?}"))?;
+    let (r, _adapter) = resolve(id, want)?;
     let cwd = r.cwd.clone();
     let (program, args) = resume_command(r.harness, &r.id);
 

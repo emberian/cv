@@ -19,9 +19,9 @@ path = "src/main.rs"
 # default; a CLI whose output is made for pipes must die quietly like every other
 # unix tool. Unix-only (no-op dep elsewhere).
 libc = "0.2"
-cv-core = { path = "../cv-core", version = "0.10", package = "clustervision-core" }
-cv-search = { path = "../cv-search", version = "0.10" }
-cv-llm = { path = "../cv-llm", version = "0.10" }
+cv-core = { path = "../cv-core", version = "0.11", package = "clustervision-core" }
+cv-search = { path = "../cv-search", version = "0.11" }
+cv-llm = { path = "../cv-llm", version = "0.11" }
 clap.workspace = true
 anyhow.workspace = true
 serde_json.workspace = true

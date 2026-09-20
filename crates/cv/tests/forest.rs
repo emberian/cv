@@ -281,10 +281,14 @@ fn compaction_lists_boundaries_and_summaries() {
 #[test]
 fn show_pre_compaction_windows_the_lost_span() {
     let w = build_world("precompact");
-    // The first boundary is at msg 3 (u0,a0,u1 precede it → span 0-3).
+    // The first boundary is at msg 3 (u0,a0,u1 precede it → span 0..3, end-exclusive).
     let (out, err) = w.cv_ok(&["show", "fsess", "--pre-compaction", "1"]);
     assert!(err.contains("pre-compaction #1 of 2"), "banner:\n{err}");
-    assert!(err.contains("messages 0-3"), "computed span:\n{err}");
+    assert!(
+        err.contains("messages 0..3"),
+        "computed span (the 0.11 `A..B` grammar):\n{err}"
+    );
+    assert!(!err.contains("messages 0-3"), "the old `A-B` span must be gone:\n{err}");
     // The pre-span body holds the first user turn, not the post-compaction "finish up".
     assert!(out.contains("start the work"), "pre-span body:\n{out}");
     assert!(

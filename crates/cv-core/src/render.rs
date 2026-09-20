@@ -18,7 +18,7 @@ pub fn to_markdown(s: &Session) -> String {
     }
     out.push('\n');
     for m in &s.messages {
-        let who = role_label(m.role);
+        let who = turn_label(m);
         out.push_str(&format!("## {who}\n\n"));
         for b in &m.content {
             render_block_md(b, &mut out);
@@ -63,7 +63,7 @@ fn file_label(path: &Option<String>, source: &Option<String>) -> String {
 pub fn to_plain(s: &Session, block_limit: usize) -> String {
     let mut out = String::new();
     for m in &s.messages {
-        out.push_str(&format!("── {} ──\n", role_label(m.role)));
+        out.push_str(&format!("── {} ──\n", turn_label(m)));
         for b in &m.content {
             match b {
                 Block::Text { text } => {
@@ -95,5 +95,26 @@ pub fn role_label(r: Role) -> &'static str {
         Role::User => "user",
         Role::Assistant => "assistant",
         Role::Tool => "tool",
+    }
+}
+
+/// The label a rendered turn gets: the role, refined by its `kind` whenever the kind says more than
+/// the role does (`system · compaction_boundary`, `user · compaction_summary`, `system · error`),
+/// and for injected context by the harness's own attachment kind when it recorded one
+/// (`system · injected_context/hook_success`). A plain prompt or reply is just `user` / `assistant`.
+pub fn turn_label(m: &Message) -> String {
+    let role = role_label(m.role);
+    if m.kind == MessageKind::for_role(m.role) {
+        return role.to_string();
+    }
+    let attachment_kind = m
+        .extra
+        .values()
+        .filter_map(serde_json::Value::as_object)
+        .find_map(|bag| bag.get("attachment_type"))
+        .and_then(serde_json::Value::as_str);
+    match (m.kind, attachment_kind) {
+        (MessageKind::InjectedContext, Some(k)) => format!("{role} · {}/{k}", m.kind.as_str()),
+        _ => format!("{role} · {}", m.kind.as_str()),
     }
 }

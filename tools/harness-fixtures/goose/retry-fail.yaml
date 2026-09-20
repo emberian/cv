@@ -1,0 +1,10 @@
+version: "1.0.0"
+title: "retry fail"
+description: "A recipe whose success check can never pass, so goose records a retry-exhaustion error block."
+prompt: "Say pong."
+retry:
+  max_retries: 1
+  timeout_seconds: 5
+  checks:
+    - type: shell
+      command: "false"

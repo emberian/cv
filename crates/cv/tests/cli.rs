@@ -229,35 +229,35 @@ fn ls_json_emits_the_same_rows_machine_readably() {
     standard_corpus(&w);
 
     // Stdout is exactly one JSON array — no header/footer — with one object per table row,
-    // in table order (updated: alpha first), carrying the OpenSession-aligned camelCase fields.
+    // in table order (updated: alpha first), carrying the one snake_case session-row shape (INTERFACE-V2 §3).
     let (out, _) = w.cv_ok(&["ls", "--json"]);
     let rows: Vec<serde_json::Value> = serde_json::from_str(out.trim()).expect("stdout must be pure JSON");
     assert_eq!(rows.len(), 2, "{out}");
     assert_eq!(rows[0]["id"], "alphasess", "updated order:\n{out}");
     assert_eq!(rows[0]["harness"], "claude");
     assert_eq!(rows[0]["title"], "alpha adventures");
-    assert_eq!(rows[0]["messageCount"], 3);
+    assert_eq!(rows[0]["message_count"], 3);
     assert_eq!(rows[0]["cwd"], "/work/proj");
     assert!(
-        rows[0]["createdAt"].as_str().unwrap().starts_with("2026-01-01"),
+        rows[0]["created_at"].as_str().unwrap().starts_with("2026-01-01"),
         "{out}"
     );
     assert!(
-        rows[0]["updatedAt"].as_str().unwrap().starts_with("2026-06-01"),
+        rows[0]["updated_at"].as_str().unwrap().starts_with("2026-06-01"),
         "{out}"
     );
     assert!(rows[0]["path"].as_str().unwrap().ends_with("alphasess.jsonl"), "{out}");
     // betasess has no title: present as an explicit null, not absent.
     assert!(rows[1]["title"].is_null(), "{out}");
-    // sizeBytes is always emitted (it comes free from the exists() guard's metadata call) and
+    // size_bytes is always emitted (it comes free from the exists() guard's metadata call) and
     // matches the file's real length; the enrichment fields stay absent without --enrich.
     let real_size = std::fs::metadata(rows[0]["path"].as_str().unwrap()).unwrap().len();
-    assert_eq!(rows[0]["sizeBytes"].as_u64().unwrap(), real_size, "{out}");
-    assert!(rows[0]["sizeBytes"].as_u64().unwrap() > 0, "{out}");
+    assert_eq!(rows[0]["size_bytes"].as_u64().unwrap(), real_size, "{out}");
+    assert!(rows[0]["size_bytes"].as_u64().unwrap() > 0, "{out}");
     assert!(rows[0].get("git").is_none(), "no --enrich ⇒ no git:\n{out}");
     assert!(
-        rows[0].get("displayTitle").is_none(),
-        "no --enrich ⇒ no displayTitle:\n{out}"
+        rows[0].get("display_title").is_none(),
+        "no --enrich ⇒ no display_title:\n{out}"
     );
 
     // --limit bounds the array just like the table, with no "… N more" footer polluting stdout.
@@ -274,7 +274,7 @@ fn ls_json_emits_the_same_rows_machine_readably() {
 #[test]
 fn ls_json_enrich_adds_git_branch_and_synthesized_title() {
     let w = World::new("lsjsonenrich");
-    // A session with a recorded git branch and NO explicit title — so displayTitle must be
+    // A session with a recorded git branch and NO explicit title — so display_title must be
     // synthesized from the first real user turn, and a leading <system-reminder> block is peeled.
     w.write_session(
         "enrichsess",
@@ -296,14 +296,14 @@ fn ls_json_enrich_adds_git_branch_and_synthesized_title() {
     let (out, _) = w.cv_ok(&["ls", "--json", "--enrich"]);
     let rows: Vec<serde_json::Value> = serde_json::from_str(out.trim()).expect("pure JSON");
     assert_eq!(rows.len(), 1, "{out}");
-    // The raw catalog title stays null; displayTitle carries the synthesized fallback with the
+    // The raw catalog title stays null; display_title carries the synthesized fallback with the
     // system-reminder noise stripped.
     assert!(rows[0]["title"].is_null(), "{out}");
-    assert_eq!(rows[0]["displayTitle"], "teach me about capybaras please", "{out}");
+    assert_eq!(rows[0]["display_title"], "teach me about capybaras please", "{out}");
     // git object matches `cv show --json`'s shape (branch present).
     assert_eq!(rows[0]["git"]["branch"], "feature/enrich", "{out}");
-    // sizeBytes still present alongside the enrichment.
-    assert!(rows[0]["sizeBytes"].as_u64().unwrap() > 0, "{out}");
+    // size_bytes still present alongside the enrichment.
+    assert!(rows[0]["size_bytes"].as_u64().unwrap() > 0, "{out}");
 }
 
 // ───────────────────────────── search ─────────────────────────────
@@ -368,13 +368,13 @@ fn search_json_emits_machine_readable_hits() {
     assert!(rows[0]["score"].is_null(), "{out}");
     // Sub-agent provenance keys are always present — null for a top-level hit — so consumers
     // can branch on them without probing for the keys.
-    for key in ["agentId", "parentId", "workflow"] {
+    for key in ["agent_id", "parent_id", "workflow"] {
         let obj = rows[0].as_object().unwrap();
         assert!(obj.contains_key(key), "provenance key {key} must be present:\n{out}");
         assert!(obj[key].is_null(), "top-level hit must have null {key}:\n{out}");
     }
     assert!(
-        rows[0]["updatedAt"].as_str().unwrap().starts_with("2026-06-01"),
+        rows[0]["updated_at"].as_str().unwrap().starts_with("2026-06-01"),
         "{out}"
     );
 
@@ -401,14 +401,14 @@ fn search_json_emits_machine_readable_hits() {
     assert!(rows[0]["score"].as_f64().unwrap() > 0.0, "{out}");
     // Provenance keys ride on indexed hits too (null: the fixture has no sub-agent lanes).
     let obj = rows[0].as_object().unwrap();
-    for key in ["agentId", "parentId", "workflow"] {
+    for key in ["agent_id", "parent_id", "workflow"] {
         assert!(
             obj.contains_key(key) && obj[key].is_null(),
             "{key} present+null:\n{out}"
         );
     }
     assert!(
-        rows[0]["updatedAt"].as_str().unwrap().starts_with("2026-06-01"),
+        rows[0]["updated_at"].as_str().unwrap().starts_with("2026-06-01"),
         "{out}"
     );
 
@@ -421,8 +421,11 @@ fn search_json_emits_machine_readable_hits() {
     assert!(rows.is_empty(), "{out}");
 }
 
-// ───────────────────────────── show --range ─────────────────────────────
+// ───────────────────────────── show windows ─────────────────────────────
 
+/// The 0.11 window grammar, on the one command every consumer reaches for: `--range A..B` is
+/// 0-based and end-exclusive, `--first/--last/--around` are the named selectors, only one of the
+/// four may be given, and every 0.10 spelling errors with a pointer at what replaced it.
 #[test]
 fn show_range_windowing() {
     let w = World::new("show");
@@ -432,44 +435,126 @@ fn show_range_windowing() {
     let (out, _) = w.cv_ok(&["show", "alphasess"]);
     assert!(out.contains("# alpha adventures"), "{out}");
     assert!(out.contains("zebrafish migration"), "{out}");
-    assert!(out.contains("[tool_use Edit]"), "{out}");
+    assert!(out.contains("[tool_use Edit t1]"), "{out}");
     assert!(out.contains("edited ok"), "{out}");
 
-    // Single message (idx 1 = the assistant turn).
-    let (out, _) = w.cv_ok(&["show", "alphasess", "--range", "1"]);
-    assert!(out.contains("[tool_use Edit]"), "{out}");
+    // `A..B` is end-exclusive: 1..2 is exactly msg 1 (the assistant turn).
+    let (out, _) = w.cv_ok(&["show", "alphasess", "--range", "1..2"]);
+    assert!(out.contains("[tool_use Edit t1]"), "{out}");
     assert!(!out.contains("zebrafish"), "window must exclude msg 0:\n{out}");
     assert!(!out.contains("edited ok"), "window must exclude msg 2:\n{out}");
 
-    // Open-ended tail.
-    let (out, _) = w.cv_ok(&["show", "alphasess", "--range", "2-"]);
+    // Open-ended tail `A..`.
+    let (out, _) = w.cv_ok(&["show", "alphasess", "--range", "2.."]);
     assert!(out.contains("edited ok"), "{out}");
     assert!(!out.contains("zebrafish"), "{out}");
 
-    // Head window `-1` = just the first message.
-    let (out, _) = w.cv_ok(&["show", "alphasess", "--range", "-1"]);
+    // Open-ended head `..B` — end-exclusive, so `..1` is just msg 0.
+    let (out, _) = w.cv_ok(&["show", "alphasess", "--range", "..1"]);
     assert!(out.contains("zebrafish"), "{out}");
-    assert!(!out.contains("[tool_use Edit]"), "{out}");
+    assert!(!out.contains("[tool_use Edit t1]"), "{out}");
+
+    // `--first N` is the replacement for the old `-N` head window.
+    let (out, _) = w.cv_ok(&["show", "alphasess", "--first", "1"]);
+    assert!(out.contains("zebrafish"), "{out}");
+    assert!(!out.contains("[tool_use Edit t1]"), "{out}");
+    let (out, _) = w.cv_ok(&["show", "alphasess", "--first", "2"]);
+    assert!(out.contains("zebrafish") && out.contains("[tool_use Edit t1]"), "{out}");
+    assert!(!out.contains("edited ok"), "{out}");
+
+    // `--last N` counts from the end (3 messages ⇒ --last 1 is msg 2).
+    let (out, _) = w.cv_ok(&["show", "alphasess", "--last", "1"]);
+    assert!(out.contains("edited ok"), "{out}");
+    assert!(!out.contains("zebrafish"), "{out}");
+    // More than exist ⇒ the whole session, not an error.
+    let (out, _) = w.cv_ok(&["show", "alphasess", "--last", "99"]);
+    assert!(out.contains("zebrafish") && out.contains("edited ok"), "{out}");
+
+    // `--around N` with an explicit --context: 0 is the single message the old bare `N` meant.
+    let (out, _) = w.cv_ok(&["show", "alphasess", "--around", "1", "--context", "0"]);
+    assert!(out.contains("[tool_use Edit t1]"), "{out}");
+    assert!(!out.contains("zebrafish"), "{out}");
+    assert!(!out.contains("edited ok"), "{out}");
+    // …and context pulls in the neighbours either side.
+    let (out, _) = w.cv_ok(&["show", "alphasess", "--around", "1", "--context", "1"]);
+    assert!(out.contains("zebrafish") && out.contains("edited ok"), "{out}");
+    // --context without --around is a usage error (it has no centre to hang off).
+    let (_, err) = w.cv_fails(&["show", "alphasess", "--context", "2"]);
+    assert!(err.contains("--around"), "{err}");
+
+    // `--max-bytes` truncates the render and prints the copy-pasteable continuation line.
+    let (out, _) = w.cv_ok(&["show", "alphasess", "--max-bytes", "1"]);
+    assert!(
+        out.contains("continue with --range"),
+        "continuation line expected:\n{out}"
+    );
+    assert!(!out.contains("edited ok"), "budget must cut the render short:\n{out}");
 
     // Range entirely past the end: still exits 0, renders the header and no messages.
-    let (out, _) = w.cv_ok(&["show", "alphasess", "--range", "10-20"]);
+    let (out, _) = w.cv_ok(&["show", "alphasess", "--range", "10..20"]);
     assert!(out.contains("# alpha adventures"), "{out}");
     assert!(!out.contains("──"), "no message blocks expected:\n{out}");
 
     // Inverted range is rejected.
-    let (_, err) = w.cv_fails(&["show", "alphasess", "--range", "9-3"]);
+    let (_, err) = w.cv_fails(&["show", "alphasess", "--range", "9..3"]);
     assert!(err.contains("end (3) is before start (9)"), "{err}");
 
     // Garbage range is rejected.
     let (_, err) = w.cv_fails(&["show", "alphasess", "--range", "abc"]);
     assert!(err.contains("bad range"), "{err}");
 
-    // JSON path honors the same window.
-    let (out, _) = w.cv_ok(&["show", "alphasess", "--json", "--range", "1-2"]);
+    // ── the 0.10 grammar is GONE, and each rejection names its replacement ──
+    let (_, err) = w.cv_fails(&["show", "alphasess", "--range", "1-2"]);
+    assert!(
+        err.contains("A..B") && err.contains("--first N") && err.contains("--last N"),
+        "`A-B` must point at the new grammar:\n{err}"
+    );
+    let (_, err) = w.cv_fails(&["show", "alphasess", "--range", "-1"]);
+    assert!(
+        err.contains("--first N") && err.contains("--last N"),
+        "`-N` must point at the flags:\n{err}"
+    );
+    let (_, err) = w.cv_fails(&["show", "alphasess", "--range", "2-"]);
+    assert!(err.contains("A.."), "`N-` must point at `A..`:\n{err}");
+    let (_, err) = w.cv_fails(&["show", "alphasess", "--range", "1"]);
+    assert!(
+        err.contains("--around 1 --context 0") && err.contains("1..2"),
+        "a bare index must point at both spellings of one message:\n{err}"
+    );
+
+    // ── exactly one selector: clap refuses two at once, naming the conflict ──
+    for pair in [
+        ["--first", "--last"],
+        ["--first", "--range"],
+        ["--last", "--range"],
+        ["--first", "--around"],
+        ["--last", "--around"],
+        ["--range", "--around"],
+    ] {
+        let a = if pair[0] == "--range" { "0..1" } else { "1" };
+        let b = if pair[1] == "--range" { "0..1" } else { "1" };
+        let args = ["show", "alphasess", pair[0], a, pair[1], b];
+        let (ok, code, out, err) = w.cv(&args);
+        assert!(!ok, "two selectors must be refused: cv {args:?}\n{out}");
+        assert_eq!(code, 2, "clap usage errors exit 2\nstderr:\n{err}");
+        assert!(
+            err.contains("cannot be used with"),
+            "conflict must be named: cv {args:?}\n{err}"
+        );
+    }
+
+    // JSON path honors the same windows.
+    let (out, _) = w.cv_ok(&["show", "alphasess", "--json", "--range", "1..2"]);
+    let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+    assert_eq!(v["messages"].as_array().unwrap().len(), 1, "{out}");
+    let (out, _) = w.cv_ok(&["show", "alphasess", "--json", "--first", "2"]);
+    let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+    assert_eq!(v["messages"].as_array().unwrap().len(), 2, "{out}");
+    let (out, _) = w.cv_ok(&["show", "alphasess", "--json", "--last", "1"]);
     let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
     assert_eq!(v["messages"].as_array().unwrap().len(), 1, "{out}");
     // And a past-the-end JSON window is empty, not a panic.
-    let (out, _) = w.cv_ok(&["show", "alphasess", "--json", "--range", "10-20"]);
+    let (out, _) = w.cv_ok(&["show", "alphasess", "--json", "--range", "10..20"]);
     let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
     assert_eq!(v["messages"].as_array().unwrap().len(), 0, "{out}");
 }
@@ -562,15 +647,15 @@ fn prune_json_emits_machine_readable_report() {
         "--json",
     ]);
     let v: serde_json::Value = serde_json::from_str(out.trim()).expect("stdout must be pure JSON");
-    assert_eq!(v["sourceId"], "prunesrc", "{out}");
-    assert_eq!(v["dryRun"], true, "{out}");
-    assert!(v["newId"].is_null(), "unpinned dry-run id must be null:\n{out}");
-    assert!(v["newPath"].is_null(), "{out}");
-    assert!(v["sidecarPath"].is_null(), "{out}");
+    assert_eq!(v["source_id"], "prunesrc", "{out}");
+    assert_eq!(v["dry_run"], true, "{out}");
+    assert!(v["new_id"].is_null(), "unpinned dry-run id must be null:\n{out}");
+    assert!(v["new_path"].is_null(), "{out}");
+    assert!(v["sidecar_path"].is_null(), "{out}");
     assert!(v["note"].as_str().unwrap().contains("dry run"), "{out}");
-    assert_eq!(v["snippedPayloads"], 1, "{out}");
+    assert_eq!(v["snipped_payloads"], 1, "{out}");
     assert!(
-        v["beforeBytes"].as_u64().unwrap() > v["afterBytes"].as_u64().unwrap(),
+        v["before_bytes"].as_u64().unwrap() > v["after_bytes"].as_u64().unwrap(),
         "{out}"
     );
     assert_eq!(fs::read_dir(&dir).unwrap().count(), 1, "dry run must write nothing");
@@ -589,8 +674,8 @@ fn prune_json_emits_machine_readable_report() {
         "--json",
     ]);
     let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
-    assert_eq!(v["newId"], "pinnedsess", "{out}");
-    assert!(v["newPath"].is_null(), "still nothing written:\n{out}");
+    assert_eq!(v["new_id"], "pinnedsess", "{out}");
+    assert!(v["new_path"].is_null(), "still nothing written:\n{out}");
 
     // Real prune: full ids + real paths in the JSON; the files exist; the source is untouched.
     let (out, _) = w.cv_ok(&[
@@ -605,19 +690,19 @@ fn prune_json_emits_machine_readable_report() {
         "--json",
     ]);
     let v: serde_json::Value = serde_json::from_str(out.trim()).expect("stdout must be pure JSON");
-    assert_eq!(v["sourceId"], "prunesrc", "{out}");
-    assert_eq!(v["newId"], "prunedsess", "{out}");
+    assert_eq!(v["source_id"], "prunesrc", "{out}");
+    assert_eq!(v["new_id"], "prunedsess", "{out}");
     assert_eq!(v["harness"], "claude", "{out}");
-    assert_eq!(v["dryRun"], false, "{out}");
+    assert_eq!(v["dry_run"], false, "{out}");
     assert!(v["note"].is_null(), "{out}");
-    assert_eq!(v["snippedPayloads"], 1, "{out}");
-    assert!(v["tokensFreed"].as_u64().unwrap() > 0, "{out}");
-    let new_path = PathBuf::from(v["newPath"].as_str().unwrap());
+    assert_eq!(v["snipped_payloads"], 1, "{out}");
+    assert!(v["tokens_freed"].as_u64().unwrap() > 0, "{out}");
+    let new_path = PathBuf::from(v["new_path"].as_str().unwrap());
     assert!(new_path.ends_with("prunedsess.jsonl"), "{out}");
-    assert!(new_path.exists(), "pruned session must exist at newPath");
-    let sidecar = PathBuf::from(v["sidecarPath"].as_str().unwrap());
+    assert!(new_path.exists(), "pruned session must exist at new_path");
+    let sidecar = PathBuf::from(v["sidecar_path"].as_str().unwrap());
     assert!(sidecar.ends_with("prunedsess.flat.jsonl"), "{out}");
-    assert!(sidecar.exists(), "sidecar must exist at sidecarPath");
+    assert!(sidecar.exists(), "sidecar must exist at sidecar_path");
     assert_eq!(
         fs::read_to_string(dir.join("prunesrc.jsonl")).unwrap(),
         source_before,
@@ -763,15 +848,61 @@ fn error_paths_exit_nonzero_with_stderr() {
     let (_, err) = w.cv_fails(&["show", "alphasess", "--harness", "marsrover"]);
     assert!(err.contains("unknown harness"), "{err}");
 
-    let (_, err) = w.cv_fails(&["convert", "alphasess", "--to", "marsrover"]);
-    assert!(err.contains("unknown target harness"), "{err}");
+    // Every 0.10 name that 0.11.0 removed or renamed: gone, but never silently — each one exits 2
+    // (a caller mistake, not a failure) with a line naming the version and the replacement.
+    let removed: &[(&[&str], &str)] = &[
+        // `convert` folded into `port`.
+        (
+            &["convert", "alphasess", "--to", "marsrover"],
+            "cv port <id> --harness <harness>",
+        ),
+        // `query` only ever printed the field reference; that is `schema`.
+        (&["query"], "cv schema"),
+        // `recall` / `distill` superseded by the one build-context verb.
+        (&["recall", "zebrafish"], "cv pack <task>"),
+        (&["distill", "alphasess"], "cv pack <task>"),
+        // Fetching a tool's output is a Read, not a prune option.
+        (
+            &["prune", "alphasess", "--retrieve", "t1"],
+            "cv cat <session> <tool_use_id>",
+        ),
+        // `--to`/`--to-dir` say where; the flags now say what.
+        (&["port", "alphasess", "--to", "codex"], "use `--harness <harness>`"),
+        (&["port", "alphasess", "--to-dir", "/tmp/nope"], "use `--cwd <dir>`"),
+    ];
+    for (args, pointer) in removed {
+        let (ok, code, out, err) = w.cv(args);
+        assert!(!ok, "cv {args:?} must not still work\nstdout:\n{out}");
+        assert_eq!(code, 2, "cv {args:?} must exit 2 (caller mistake)\nstderr:\n{err}");
+        assert!(!err.contains("panicked"), "cv {args:?} panicked:\n{err}");
+        assert!(err.contains("0.11.0"), "cv {args:?} must say when it went away:\n{err}");
+        assert!(err.contains(pointer), "cv {args:?} must point at {pointer:?}:\n{err}");
+    }
+    // The pointers are real: the replacement parses (it fails on the harness, not the grammar).
+    let (_, err) = w.cv_fails(&["port", "alphasess", "--harness", "marsrover"]);
+    assert!(err.contains("unknown"), "{err}");
 
-    let (_, err) = w.cv_fails(&["splice", "alphasess:zz-3"]);
+    // A splice spec carries the same `A..B` window grammar as `--range`, split off the END of the
+    // id (so a `harness:id` prefix still works): the 0.10 `<id>:A-B` points at its replacement,
+    // and a non-numeric window is a bad spec, not a mystery id.
+    let (_, err) = w.cv_fails(&["splice", "alphasess:1-2"]);
+    assert!(err.contains("bad spec") && err.contains("<id>:A..B"), "{err}");
+    let (_, err) = w.cv_fails(&["splice", "alphasess:zz..3"]);
     assert!(err.contains("bad spec"), "{err}");
 
-    // An empty id matches every session: the ambiguity is named, not silently picked.
-    let (_, err) = w.cv_fails(&["events", ""]);
-    assert!(err.contains("ambiguous session id"), "{err}");
+    // An empty id matches every session: the ambiguity is named, not silently picked, and the
+    // candidates are listed as the `harness:full-id` you can paste straight back in (§2).
+    let (ok, code, out, err) = w.cv(&["events", ""]);
+    assert!(!ok, "an ambiguous id must not be silently resolved:\n{out}");
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("ambiguous id"), "{err}");
+    assert!(err.contains("2 candidates"), "{err}");
+    assert!(
+        err.contains("claude:alphasess") && err.contains("claude:betasess"),
+        "candidates must be listed as harness:full-id:\n{err}"
+    );
+    // …and pasting one back in resolves it.
+    w.cv_ok(&["events", "claude:alphasess"]);
 }
 
 // ───────────────────────────── blame on a non-file ─────────────────────────────

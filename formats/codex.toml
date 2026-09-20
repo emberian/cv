@@ -1,0 +1,96 @@
+# formats/codex.toml — the vocabulary cv's `codex` adapter is checked against (docs/INTERFACE-V2.md §7).
+# status: handled = per-item arm in the adapter; generic = interpreted by a blanket rule; carried = verbatim
+# under ParseOptions::complete only; ignored = known and deliberately skipped. Regenerate: tools/gen-manifests (or edit by hand).
+
+harness = "codex"
+source_files = ["harness/codex.rs"]
+ignore_literals = ["jsonl", "unknown"]
+store = [
+  "~/.codex/sessions/YYYY/MM/DD/rollout-<local ts>-<uuid>.jsonl[.zst]",
+  "~/.codex/archived_sessions/",
+  "~/.codex/state_5.sqlite",
+  "~/.codex/session_index.jsonl",
+]
+
+[upstream]
+repo = "https://github.com/openai/codex (~/pug/codex)"
+commit = "132c2be23"
+date = "2026-09-19"
+
+[types]
+session_meta = { status = "handled", note = "first line; swarm fields → Session.extra/lineage" }
+turn_context = { status = "handled", note = "model/effort/cwd per turn" }
+response_item = { status = "handled", note = "payload-typed" }
+event_msg = { status = "handled", note = "payload-typed" }
+compacted = { status = "handled", note = "compaction record" }
+token_usage_record = { status = "handled", note = "authoritative per-response usage" }
+inter_agent_communication_metadata = { status = "handled", note = "pairs with agent_message" }
+inter_agent_communication = { status = "carried", note = "defined, unobserved" }
+world_state = { status = "carried", note = "embeds AGENTS.md" }
+security_risk_score = { status = "carried", note = "" }
+retained_context = { status = "carried", note = "" }
+realtime_item = { status = "carried", note = "paginated only" }
+"response_item.message" = { status = "handled", note = "user/assistant/developer text" }
+"response_item.agent_message" = { status = "handled", note = "inter-agent swarm channel" }
+"response_item.reasoning" = { status = "handled", note = "summary + encrypted_content" }
+"response_item.function_call" = { status = "handled", note = "" }
+"response_item.function_call_output" = { status = "handled", note = "string or content array; `[error] ` prefix = cv error bit" }
+"response_item.custom_tool_call" = { status = "handled", note = "" }
+"response_item.custom_tool_call_output" = { status = "handled", note = "" }
+"response_item.local_shell_call" = { status = "handled", note = "" }
+"response_item.web_search_call" = { status = "handled", note = "" }
+"response_item.tool_search_call" = { status = "handled", note = "" }
+"response_item.tool_search_output" = { status = "handled", note = "" }
+"response_item.image_generation_call" = { status = "handled", note = "" }
+"response_item.compaction" = { status = "handled", note = "" }
+"response_item.compaction_summary" = { status = "handled", note = "alias" }
+"response_item.context_compaction" = { status = "handled", note = "" }
+"response_item.configuration_update" = { status = "carried", note = "new at HEAD, unobserved" }
+"event_msg.item_completed" = { status = "handled", note = "paginated: every TurnItem → System note" }
+"event_msg.token_count" = { status = "handled", note = "" }
+"event_msg.task_complete" = { status = "handled", note = "last_agent_message" }
+"event_msg.task_started" = { status = "carried", note = "" }
+"event_msg.thread_settings_applied" = { status = "handled", note = "model change signal" }
+"event_msg.turn_aborted" = { status = "handled", note = "notice" }
+"event_msg.thread_rolled_back" = { status = "handled", note = "notice" }
+"event_msg.thread_goal_updated" = { status = "carried", note = "" }
+"event_msg.user_message" = { status = "handled", note = "legacy twin" }
+"event_msg.agent_message" = { status = "handled", note = "legacy twin" }
+"event_msg.view_image_tool_call" = { status = "handled", note = "legacy; never persisted at HEAD" }
+"event_msg.agent_reasoning" = { status = "ignored", note = "legacy twin of response_item reasoning" }
+"event_msg.agent_reasoning_raw_content" = { status = "ignored", note = "legacy twin of response_item reasoning (raw CoT)" }
+"event_msg.image_generation_end" = { status = "ignored", note = "legacy twin of response_item.image_generation_call" }
+"event_msg.error" = { status = "handled", note = "ErrorEvent{message,codex_error_info} → MessageKind::Error (CLI <= 0.1xx)" }
+"event_msg.patch_apply_end" = { status = "ignored", note = "legacy" }
+"event_msg.mcp_tool_call_end" = { status = "ignored", note = "legacy" }
+"event_msg.web_search_end" = { status = "ignored", note = "legacy" }
+"event_msg.context_compacted" = { status = "ignored", note = "legacy twin of compacted" }
+"event_msg.sub_agent_activity" = { status = "ignored", note = "legacy" }
+"event_msg.entered_review_mode" = { status = "ignored", note = "" }
+"event_msg.exited_review_mode" = { status = "ignored", note = "" }
+"item.CommandExecution" = { status = "handled", note = "System note + details" }
+"item.FileChange" = { status = "handled", note = "" }
+"item.McpToolCall" = { status = "handled", note = "" }
+"item.SubAgentActivity" = { status = "handled", note = "swarm graph" }
+"item.CollabAgentToolCall" = { status = "handled", note = "" }
+"item.Plan" = { status = "handled", note = "" }
+"item.ImageView" = { status = "handled", note = "" }
+"item.ImageGeneration" = { status = "handled", note = "" }
+"item.Extension" = { status = "handled", note = "kind-tagged" }
+"item.WebSearch" = { status = "generic", note = "text note" }
+"item.ContextCompaction" = { status = "ignored", note = "twin of compacted" }
+"item.UserMessage" = { status = "ignored", note = "twin" }
+"item.AgentMessage" = { status = "ignored", note = "twin" }
+"item.Reasoning" = { status = "ignored", note = "twin" }
+"item.FunctionCallOutput" = { status = "ignored", note = "twin" }
+"extension.web.search" = { status = "handled", note = "" }
+"extension.image_gen.generation" = { status = "handled", note = "" }
+"content.input_text" = { status = "handled", note = "" }
+"content.output_text" = { status = "generic", note = "content_blocks() reads `.text` off any part type, so no per-type arm" }
+"content.input_image" = { status = "handled", note = "" }
+"content.output_image" = { status = "handled", note = "" }
+"content.encrypted_content" = { status = "handled", note = "" }
+"role.user" = { status = "handled", note = "" }
+"role.assistant" = { status = "handled", note = "" }
+"role.system" = { status = "handled", note = "" }
+"role.developer" = { status = "handled", note = "→ System" }

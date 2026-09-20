@@ -110,7 +110,7 @@ mod tests {
     /// resulting session as [`Harness::Qwen`] — the pure-text mirror of what the adapter's on-disk
     /// paths do, used here to cross-check them.
     fn parse_qwen_str(text: &str, source_path: Option<PathBuf>) -> Vec<Session> {
-        let mut sessions = crate::harness::gemini::parse_all_str(text, source_path);
+        let mut sessions = crate::harness::gemini::parse_all_str_for(Harness::Qwen, text, source_path);
         for s in &mut sessions {
             s.harness = Harness::Qwen;
         }
@@ -141,7 +141,63 @@ mod tests {
         let s = &sessions[0];
         assert_eq!(s.harness, Harness::Qwen);
         assert_eq!(s.id, "9aeb2942-7c46-47b7-aded-13772d4d4e63");
-        assert!(!s.messages.is_empty());
+        // The shared machinery types every turn; Qwen-specific facts say "qwen", never "gemini".
+        let kinds: Vec<(Role, MessageKind, Origin)> = s.messages.iter().map(|m| (m.role, m.kind, m.origin)).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                (Role::User, MessageKind::Prompt, Origin::Human),
+                (Role::Assistant, MessageKind::Reply, Origin::Model),
+                (Role::Tool, MessageKind::ToolResult, Origin::Harness),
+                (Role::Assistant, MessageKind::Reply, Origin::Model),
+                (Role::System, MessageKind::Notice, Origin::Harness),
+            ]
+        );
+        let info = &s.messages[4];
+        assert_eq!(info.harness_extra(Harness::Qwen).unwrap()["record_type"], "info");
+        assert!(info.harness_extra(Harness::Gemini).is_none());
+        for m in &s.messages {
+            for k in m.extra.keys() {
+                assert_eq!(k, "qwen", "flat or misfiled extra key {k:?}");
+            }
+        }
+        assert!(s.messages.iter().all(|m| m.model.is_none()), "one model throughout");
+    }
+
+    #[test]
+    fn injected_context_and_rewinds_as_qwen() {
+        let text = concat!(
+            r#"{"sessionId":"q1","projectHash":"h","startTime":"2026-03-01T00:00:00.000Z","lastUpdated":"2026-03-01T00:00:04.000Z","kind":"main"}"#,
+            "\n",
+            r#"{"id":"u1","timestamp":"2026-03-01T00:00:01.000Z","type":"user","content":"<session_context>\nhi\n</session_context>"}"#,
+            "\n",
+            r#"{"id":"u2","timestamp":"2026-03-01T00:00:02.000Z","type":"user","content":"<hook_context>\nok\n</hook_context>"}"#,
+            "\n",
+            r#"{"id":"u3","timestamp":"2026-03-01T00:00:03.000Z","type":"user","content":"do it"}"#,
+            "\n",
+            r#"{"id":"g1","timestamp":"2026-03-01T00:00:04.000Z","type":"gemini","model":"qwen3-coder","content":"done"}"#,
+            "\n",
+            r#"{"$rewindTo":"g1"}"#,
+            "\n",
+            r#"{"id":"g1","timestamp":"2026-03-01T00:00:05.000Z","type":"gemini","model":"qwen3-coder","content":"done, properly"}"#,
+            "\n",
+        );
+        let s = &parse_qwen_str(text, None)[0];
+        assert_eq!(s.harness, Harness::Qwen);
+        let kinds: Vec<(MessageKind, Origin)> = s.messages.iter().map(|m| (m.kind, m.origin)).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                (MessageKind::InjectedContext, Origin::Harness),
+                (MessageKind::InjectedContext, Origin::Hook),
+                (MessageKind::Prompt, Origin::Human),
+                (MessageKind::Branch, Origin::Harness),
+                (MessageKind::Reply, Origin::Model),
+            ]
+        );
+        assert_eq!(s.messages[3].harness_extra(Harness::Qwen).unwrap()["rewind_to"], "g1");
+        assert_eq!(s.harness_extra(Harness::Qwen).unwrap()["kind"], "main");
+        assert_eq!(s.title.as_deref(), Some("do it"));
     }
 
     #[test]

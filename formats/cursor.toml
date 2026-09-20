@@ -1,0 +1,27 @@
+# formats/cursor.toml — the vocabulary cv's `cursor` adapter is checked against (docs/INTERFACE-V2.md §7).
+# status: handled = per-item arm in the adapter; generic = interpreted by a blanket rule; carried = verbatim
+# under ParseOptions::complete only; ignored = known and deliberately skipped. Regenerate: tools/gen-manifests (or edit by hand).
+
+harness = "cursor"
+source_files = ["harness/cursor.rs"]
+ignore_literals = []
+store = [
+  "~/Library/Application Support/Cursor/User/globalStorage/state.vscdb",
+  "…/workspaceStorage/<hash>/state.vscdb",
+]
+
+[upstream]
+repo = "closed source"
+commit = "unknown"
+date = "2026-05-29"
+
+[types]
+"kv.composerData" = { status = "generic", note = "one thread" }
+"kv.bubbleId" = { status = "generic", note = "one message" }
+"bubble.user" = { status = "handled", note = "type 1" }
+"bubble.ai" = { status = "handled", note = "type 2 (assistant)" }
+"bubble.assistant" = { status = "handled", note = "" }
+"field.thinking" = { status = "generic", note = "" }
+"field.toolFormerData" = { status = "generic", note = "tool call + result" }
+"field.richText" = { status = "generic", note = "Lexical" }
+"field.tokenCount" = { status = "generic", note = "" }

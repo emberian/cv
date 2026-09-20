@@ -9,7 +9,7 @@
 //! warning. The document pieces live in [`cv_core::html`] (`share_begin` / `share_message` /
 //! `share_end`); this module owns the streaming sink and the CLI surface.
 
-use crate::util::{home_rel, parse_harness};
+use crate::util::{home_rel, parse_harness, resolve};
 use anyhow::{Context, Result};
 use cv_core::html::{self, ShareMeta};
 use cv_core::ir::{label_from, Harness, Message, Role, Session};
@@ -20,7 +20,7 @@ use std::path::PathBuf;
 
 pub(crate) fn cmd_share(id: &str, harness: Option<String>, out: Option<PathBuf>, no_redact: bool) -> Result<()> {
     let want = parse_harness(&harness)?;
-    let (r, adapter) = cv_core::find(id, want)?.with_context(|| format!("no session matching {id:?}"))?;
+    let (r, adapter) = resolve(id, want)?;
 
     if no_redact {
         eprintln!("⚠ --no-redact: secrets and PII will NOT be scrubbed — review the file before sharing it");

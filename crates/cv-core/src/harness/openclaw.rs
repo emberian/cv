@@ -75,7 +75,8 @@
 //! `selectSessionTranscriptActiveEntries`), not file order. [`select_rows`] ports that scan; it only
 //! runs when a transcript holds a `leaf` control (OpenClaw's own rule for legacy flat readers,
 //! `selectSessionTranscriptLeafControlledPath`). Entries off the active branch are dropped by the
-//! lean passes and carried, tagged `openclaw_inactive_branch`, under [`ParseOptions::complete`].
+//! lean passes and carried, tagged `extra["openclaw"]["inactive_branch"]`, under
+//! [`ParseOptions::complete`].
 //!
 //! Canonical entry types beyond `message` (`session-manager-types.ts:28-95`): `compaction`
 //! (`summary, firstKeptEntryId, tokensBefore, details?, fromHook?`), `reset` (`reason:
@@ -83,6 +84,28 @@
 //! `custom_message` (`customType, content, display, details?` — in model context), `custom`
 //! (`customType, data?` — extension state, NOT in context), `session_info` (`name` → the title),
 //! `model_change` (`provider, modelId`), `thinking_level_change`, `label` (`targetId, label`).
+//!
+//! ## Kinds (`docs/INTERFACE-V2.md` §4)
+//!
+//! Entries → messages: `message` by role — `user` → `Prompt`/Human, `assistant` → `Reply`/Model
+//! (or `Error`/Harness when it carries `errorMessage` / `stopReason: "error"`, the error under
+//! `extra["openclaw"]["error"]`), `toolResult` → `ToolResult`/Harness, `system` → `SystemPrompt`
+//! (also `Session::system_prompt`), and the custom roles `bashExecution` → `InjectedContext`
+//! (in model context), `branchSummary`/`custom` → `Notice`, `compactionSummary` →
+//! `CompactionBoundary` + `CompactionSummary`; `compaction` → a `CompactionBoundary` turn (the
+//! entry's id and fields) followed by a `CompactionSummary` turn holding `summary`; `reset` →
+//! `Branch`; `model_change` / `thinking_level_change` → `ModelChange` (`Message::model` = the new
+//! model); `branch_summary` / `custom_message` → `Notice`. `session_info` and `label` are session
+//! facts (`Session::title` + `extra["openclaw"]["session_name"]`, `extra["openclaw"]["labels"]`)
+//! and surface only under [`ParseOptions::complete`], as `Notice` turns; `custom`, `leaf`,
+//! `thinking_level_change`-like bookkeeping and unknown types surface only under `complete`, as
+//! `Carrier` turns. Every carried record is the top-level `_record`; every harness fact is in
+//! `extra["openclaw"]` (`record_type` = the entry type, `message_role` = a custom message role,
+//! `session_version` on the first turn, `inactive_branch: true` off the visible path, the
+//! assistant's `api`/`provider`/`response_model`/`response_id`/`stop_reason`/`diagnostics`/
+//! `usage_raw`, and each control entry's own fields snake_cased). The header's `parentSession` is
+//! `Lineage::forked_from`; `usage.cost.total` is `Usage::cost_usd`; `Message::model` is set only
+//! when it differs from `Session::model` (the first non-synthetic one seen).
 
 use super::{parse_ts, ts_from_value, Adapter};
 use crate::ir::*;
@@ -327,7 +350,7 @@ fn stream_rows<I: Iterator<Item = Row>>(
             }
             // v4 fork lineage: the transcript this one was branched from.
             if let Some(parent) = v.get("parentSession").and_then(Value::as_str) {
-                s.extra.insert("openclaw_parent_session".into(), Value::from(parent));
+                s.lineage.forked_from = Some(parent.to_string());
             }
             continue;
         }
@@ -335,81 +358,93 @@ fn stream_rows<I: Iterator<Item = Row>>(
         if !row.active && !opts.complete {
             continue;
         }
-        let msg = match ty {
+        let msgs = match ty {
             "message" => parse_entry(&v),
-            "compaction" | "reset" | "branch_summary" | "custom_message" => parse_control_entry(&v),
+            "compaction" | "reset" | "branch_summary" | "custom_message" | "model_change" | "thinking_level_change" => {
+                parse_control_entry(&v)
+            }
             // Session-level facts with a first-class home; the record itself only rides under
-            // `complete`.
+            // `complete`, as the notice the user saw.
             "session_info" => {
-                if let Some(name) = v.get("name").and_then(Value::as_str).filter(|n| !n.trim().is_empty()) {
+                let name = v.get("name").and_then(Value::as_str).filter(|n| !n.trim().is_empty());
+                if let Some(name) = name {
                     // Discovery already applied OpenClaw's own precedence (store label /
                     // display_name first, then this name — what its session list shows), so a
                     // titled ref keeps its title and `cv ls` and `cv show` agree; the name is
-                    // still first-class in `extra`. A bare JSONL parse has no ref title.
+                    // still first-class in the bag. A bare JSONL parse has no ref title.
                     if s.title.is_none() {
                         s.title = Some(crate::ir::truncate(name, 80));
                     }
-                    s.extra.insert("openclaw_session_name".into(), Value::from(name));
+                    s.harness_extra_mut(Harness::OpenClaw)
+                        .insert("session_name".into(), Value::from(name));
                 }
-                carrier_if_complete(&v, opts)
-            }
-            "model_change" => {
-                if s.model.is_none() {
-                    if let Some(model) = v.get("modelId").and_then(Value::as_str) {
-                        s.model = Some(model.to_string());
-                    }
-                }
-                carrier_if_complete(&v, opts)
+                notice_if_complete(&v, opts, format!("[session named: {}]", name.unwrap_or("")))
             }
             "label" => {
-                if let (Some(target), Some(label)) = (
-                    v.get("targetId").and_then(Value::as_str),
-                    v.get("label").and_then(Value::as_str),
-                ) {
+                let target = v.get("targetId").and_then(Value::as_str);
+                let label = v.get("label").and_then(Value::as_str);
+                if let (Some(target), Some(label)) = (target, label) {
                     let labels = s
-                        .extra
-                        .entry("openclaw_labels")
+                        .harness_extra_mut(Harness::OpenClaw)
+                        .entry("labels")
                         .or_insert_with(|| Value::Object(serde_json::Map::new()));
                     if let Some(map) = labels.as_object_mut() {
                         map.insert(target.to_string(), Value::from(label));
                     }
                 }
-                carrier_if_complete(&v, opts)
+                notice_if_complete(
+                    &v,
+                    opts,
+                    format!("[label {}: {}]", target.unwrap_or(""), label.unwrap_or("")),
+                )
             }
-            // `custom` (extension state, not in context), `thinking_level_change`, `leaf`
-            // navigation controls and anything newer: bookkeeping, carried only under `complete`.
+            // `custom` (extension state, not in context), `leaf` navigation controls and anything
+            // newer: bookkeeping, carried only under `complete`.
             _ => carrier_if_complete(&v, opts),
         };
-        let Some(mut m) = msg else {
-            continue;
-        };
-        if let Some(parent) = &row.parent {
-            m.parent_id = parent.clone();
-        }
-        if !row.active {
-            m.extra.insert("openclaw_inactive_branch".into(), Value::Bool(true));
-        }
-        // The session model is the first real model we see; ignore the synthetic openclaw
-        // transcript-only providers (delivery mirrors / acp-runtime).
-        if s.model.is_none() {
-            if let Some(model) = m.model.as_deref() {
-                if !is_synthetic_openclaw_model(model) {
-                    s.model = Some(model.to_string());
+        for (i, mut m) in msgs.into_iter().enumerate() {
+            // The branch selection's normalized parent applies to the entry's own turn; a second
+            // turn split off the same entry (a compaction summary) already points at the first.
+            if i == 0 {
+                if let Some(parent) = &row.parent {
+                    m.parent_id = parent.clone();
                 }
             }
-        }
-        // Stash the transcript schema version on the first message so a downstream consumer can
-        // tell v1/v2 (linear) from v3/v4 (parent-linked) sessions.
-        if let Some(ver) = header_version.take() {
-            m.extra.insert("openclaw_session_version".into(), Value::from(ver));
-        }
-        // Hand session metadata to the sink before the first message (header consumers).
-        if !meta_sent {
-            sink.meta(&s);
-            meta_sent = true;
-        }
-        if sink.message(m) == Flow::Stop {
-            break;
+            if !row.active {
+                m.harness_extra_mut(Harness::OpenClaw)
+                    .insert("inactive_branch".into(), Value::Bool(true));
+            }
+            // The session model is the first real model we see; ignore the synthetic openclaw
+            // transcript-only providers (delivery mirrors / acp-runtime).
+            if s.model.is_none() {
+                if let Some(model) = m.model.as_deref() {
+                    if !is_synthetic_openclaw_model(model) {
+                        s.model = Some(model.to_string());
+                    }
+                }
+            }
+            // IR diet: a turn names its model only when it differs from the session's. A
+            // `ModelChange` always names the model it switched to.
+            if m.kind != MessageKind::ModelChange && m.model.is_some() && m.model == s.model {
+                m.model = None;
+            }
+            if m.kind == MessageKind::SystemPrompt && s.system_prompt.is_none() {
+                s.system_prompt = m.text();
+            }
+            // Stash the transcript schema version on the first message so a downstream consumer
+            // can tell v1/v2 (linear) from v3/v4 (parent-linked) sessions.
+            if let Some(ver) = header_version.take() {
+                m.harness_extra_mut(Harness::OpenClaw)
+                    .insert("session_version".into(), Value::from(ver));
+            }
+            // Hand session metadata to the sink before the first message (header consumers).
+            if !meta_sent {
+                sink.meta(&s);
+                meta_sent = true;
+            }
+            if sink.message(m) == Flow::Stop {
+                return s;
+            }
         }
     }
     if !meta_sent {
@@ -418,64 +453,117 @@ fn stream_rows<I: Iterator<Item = Row>>(
     s
 }
 
-/// A non-`message` canonical entry that carries context or a boundary the reader should see:
-/// `compaction` (the summary that replaced the compacted span), `reset` (a session boundary),
-/// `branch_summary`, `custom_message` (extension text that IS in model context). System turns with
-/// the entry's fields in `extra` (snake_case) and `openclaw_entry_type` naming the kind.
-fn parse_control_entry(v: &Value) -> Option<Message> {
-    let ty = v.get("type").and_then(Value::as_str)?;
-    let mut m = Message::new(Role::System);
+/// A System turn for a non-`message` entry: id / parent / timestamp from the entry, and — in the
+/// harness bag — `record_type` plus every field the entry carries besides the structural ones and
+/// the `summary`/`content` that become the turn's text, snake_cased.
+fn entry_message(v: &Value, ty: &str, kind: MessageKind, origin: Origin) -> Message {
+    let mut m = Message::of_kind(Role::System, kind, origin);
     m.id = v.get("id").and_then(Value::as_str).map(str::to_string);
     m.parent_id = v.get("parentId").and_then(Value::as_str).map(str::to_string);
     m.timestamp = entry_timestamp(v);
-    m.extra.insert("openclaw_entry_type".into(), Value::from(ty));
+    let bag = m.harness_extra_mut(Harness::OpenClaw);
+    bag.insert("record_type".into(), Value::from(ty));
+    if let Some(obj) = v.as_object() {
+        for (key, val) in obj {
+            if matches!(
+                key.as_str(),
+                "type" | "id" | "parentId" | "timestamp" | "summary" | "content"
+            ) || val.is_null()
+            {
+                continue;
+            }
+            bag.insert(snake(key), val.clone());
+        }
+    }
+    m
+}
+
+/// A non-`message` canonical entry that carries context or a boundary the reader should see, as
+/// the kinds vocabulary has it: `compaction` → a `CompactionBoundary` (the entry's own fields:
+/// `first_kept_entry_id`, `tokens_before`, `from_hook`, `details`) followed by the
+/// `CompactionSummary` that replaced the compacted span; `reset` → `Branch`; `model_change` /
+/// `thinking_level_change` → `ModelChange`; `branch_summary` / `custom_message` (extension text
+/// that IS in model context) → `Notice`. All origin Harness.
+fn parse_control_entry(v: &Value) -> Vec<Message> {
+    let Some(ty) = v.get("type").and_then(Value::as_str) else {
+        return Vec::new();
+    };
+    let kind = match ty {
+        "compaction" => MessageKind::CompactionBoundary,
+        "reset" => MessageKind::Branch,
+        "model_change" | "thinking_level_change" => MessageKind::ModelChange,
+        "branch_summary" | "custom_message" => MessageKind::Notice,
+        _ => return Vec::new(),
+    };
+    let mut m = entry_message(v, ty, kind, Origin::Harness);
+    let str_of = |k: &str| v.get(k).and_then(Value::as_str);
     let text = match ty {
-        "compaction" | "branch_summary" => v.get("summary").and_then(Value::as_str).unwrap_or("").to_string(),
-        "reset" => format!(
-            "[session reset: {}]",
-            v.get("reason").and_then(Value::as_str).unwrap_or("reset")
-        ),
+        "compaction" => "[conversation compacted]".to_string(),
+        "branch_summary" => str_of("summary").unwrap_or("").to_string(),
+        "reset" => format!("[session reset: {}]", str_of("reason").unwrap_or("reset")),
+        "model_change" => {
+            let model = str_of("modelId").unwrap_or("");
+            m.model = (!model.is_empty()).then(|| model.to_string());
+            match str_of("provider") {
+                Some(p) if !p.is_empty() => format!("[model: {p}/{model}]"),
+                _ => format!("[model: {model}]"),
+            }
+        }
+        "thinking_level_change" => match str_of("thinkingLevel") {
+            Some(level) => format!("[thinking level: {level}]"),
+            None => "[thinking level changed]".to_string(),
+        },
         _ => coerce_content_text(v.get("content")),
     };
     if !text.is_empty() {
         m.content.push(Block::Text { text: text.into() });
     }
-    for key in [
-        "firstKeptEntryId",
-        "tokensBefore",
-        "fromHook",
-        "details",
-        "reason",
-        "fromId",
-        "customType",
-        "display",
-        "appendMode",
-    ] {
-        if let Some(val) = v.get(key) {
-            if !val.is_null() {
-                m.extra.insert(snake(key), val.clone());
-            }
+    let mut out = vec![m];
+    if ty == "compaction" {
+        let summary = str_of("summary").unwrap_or("");
+        if !summary.trim().is_empty() {
+            let mut sm = Message::of_kind(Role::System, MessageKind::CompactionSummary, Origin::Harness);
+            sm.parent_id = v.get("id").and_then(Value::as_str).map(str::to_string);
+            sm.timestamp = entry_timestamp(v);
+            sm.content.push(Block::Text {
+                text: summary.to_string().into(),
+            });
+            sm.harness_extra_mut(Harness::OpenClaw)
+                .insert("record_type".into(), Value::from(ty));
+            out.push(sm);
         }
     }
-    Some(m)
+    out
 }
 
-/// Under [`ParseOptions::complete`], a bookkeeping entry (`session_info`, `model_change`, `label`,
-/// `custom`, `thinking_level_change`, `leaf`, …) rides along verbatim as an empty System message
-/// carrying the raw record in `extra["openclaw_entry"]`, so nothing is lost; the lean passes drop it.
-fn carrier_if_complete(v: &Value, opts: &ParseOptions) -> Option<Message> {
+/// Under [`ParseOptions::complete`], a bookkeeping entry (`custom`, `leaf`, …) rides along verbatim
+/// as a `Carrier` turn: the raw record at the top-level `_record`, its type in
+/// `extra["openclaw"]["record_type"]`. The lean passes drop it.
+fn carrier_if_complete(v: &Value, opts: &ParseOptions) -> Vec<Message> {
     if !opts.complete {
-        return None;
+        return Vec::new();
     }
-    let mut m = Message::new(Role::System);
+    let ty = v.get("type").and_then(Value::as_str).unwrap_or("");
+    let mut m = Message::of_kind(Role::System, MessageKind::Carrier, Origin::Harness);
     m.id = v.get("id").and_then(Value::as_str).map(str::to_string);
     m.parent_id = v.get("parentId").and_then(Value::as_str).map(str::to_string);
     m.timestamp = entry_timestamp(v);
-    if let Some(ty) = v.get("type").and_then(Value::as_str) {
-        m.extra.insert("openclaw_entry_type".into(), Value::from(ty));
+    m.harness_extra_mut(Harness::OpenClaw)
+        .insert("record_type".into(), Value::from(ty));
+    m.extra.insert(crate::harness::claude::CARRIER_KEY.into(), v.clone());
+    vec![m]
+}
+
+/// Under [`ParseOptions::complete`], a session-fact entry the user saw as a notice (`session_info`,
+/// `label`) rides along as a `Notice` turn with `text`, the raw record at `_record` and its type in
+/// the bag. Lean passes keep only the fact's first-class home.
+fn notice_if_complete(v: &Value, opts: &ParseOptions, text: String) -> Vec<Message> {
+    let mut out = carrier_if_complete(v, opts);
+    if let Some(m) = out.first_mut() {
+        m.kind = MessageKind::Notice;
+        m.content.push(Block::Text { text: text.into() });
     }
-    m.extra.insert("openclaw_entry".into(), v.clone());
-    Some(m)
+    out
 }
 
 /// Models OpenClaw writes for transcript-only / bridged turns that should not be reported as the
@@ -671,20 +759,29 @@ fn entry_timestamp(v: &Value) -> Option<DateTime<Utc>> {
         .or_else(|| v.pointer("/message/timestamp").and_then(ts_from_value))
 }
 
-fn parse_entry(v: &Value) -> Option<Message> {
-    let msg = v.get("message")?;
-    let role_str = msg.get("role").and_then(Value::as_str)?;
-    let role = match role_str {
-        "user" => Role::User,
-        "assistant" => Role::Assistant,
-        "toolResult" => Role::Tool,
-        "system" => Role::System,
-        // Custom (declaration-merged) message types. Modeled as System turns so they ride along
-        // in the IR with their semantics preserved in `extra`/blocks rather than being dropped.
-        "bashExecution" | "branchSummary" | "compactionSummary" | "custom" => Role::System,
-        _ => return None,
+/// A `message` entry → its turn(s). The `compactionSummary` custom role (the pre-`compaction`-entry
+/// form) yields two: the boundary (the entry's id and token counts) and the summary.
+fn parse_entry(v: &Value) -> Vec<Message> {
+    let Some(msg) = v.get("message") else {
+        return Vec::new();
     };
-    let mut m = Message::new(role);
+    let Some(role_str) = msg.get("role").and_then(Value::as_str) else {
+        return Vec::new();
+    };
+    let (role, kind, origin) = match role_str {
+        "user" => (Role::User, MessageKind::Prompt, Origin::Human),
+        "assistant" => (Role::Assistant, MessageKind::Reply, Origin::Model),
+        "toolResult" => (Role::Tool, MessageKind::ToolResult, Origin::Harness),
+        "system" => (Role::System, MessageKind::SystemPrompt, Origin::Harness),
+        // Custom (declaration-merged) message types, as System turns: a `!cmd` run and its output
+        // are flattened into the model's context; the summaries and extension markers are notices
+        // (the compaction summary gets its boundary below).
+        "bashExecution" => (Role::System, MessageKind::InjectedContext, Origin::Harness),
+        "branchSummary" | "custom" => (Role::System, MessageKind::Notice, Origin::Harness),
+        "compactionSummary" => (Role::System, MessageKind::CompactionSummary, Origin::Harness),
+        _ => return Vec::new(),
+    };
+    let mut m = Message::of_kind(role, kind, origin);
     m.id = v.get("id").and_then(Value::as_str).map(str::to_string);
     m.parent_id = v.get("parentId").and_then(Value::as_str).map(str::to_string);
     m.timestamp = entry_timestamp(v);
@@ -707,11 +804,32 @@ fn parse_entry(v: &Value) -> Option<Message> {
         _ => {}
     }
 
-    (!m.content.is_empty() || !m.extra.is_empty()).then_some(m)
+    if m.content.is_empty() && m.extra.is_empty() {
+        return Vec::new();
+    }
+    if role_str != "compactionSummary" {
+        return vec![m];
+    }
+    // The old single-record form: the record IS the compaction. The boundary keeps the entry's id
+    // (what a later `firstKeptEntryId` / label points at) and counts; the summary hangs off it.
+    let mut boundary = Message::of_kind(Role::System, MessageKind::CompactionBoundary, Origin::Harness);
+    boundary.id = m.id.take();
+    boundary.parent_id = m.parent_id.take();
+    boundary.timestamp = m.timestamp;
+    boundary.extra = std::mem::take(&mut m.extra);
+    boundary.content.push(Block::Text {
+        text: "[conversation compacted]".into(),
+    });
+    m.parent_id = boundary.id.clone();
+    m.harness_extra_mut(Harness::OpenClaw)
+        .insert("message_role".into(), Value::from(role_str));
+    vec![boundary, m]
 }
 
 fn parse_tool_result(m: &mut Message, msg: &Value) {
     let tool_use_id = msg.get("toolCallId").and_then(Value::as_str).unwrap_or("").to_string();
+    // `toolName` and the arbitrary structured `details` payload (diffs, file lists) live on the
+    // block, where every harness puts them.
     m.content.push(Block::ToolResult {
         tool_use_id,
         content: coerce_content_text(msg.get("content")).into(),
@@ -730,15 +848,6 @@ fn parse_tool_result(m: &mut Message, msg: &Value) {
             }
         }
     }
-    if let Some(name) = msg.get("toolName").and_then(Value::as_str) {
-        m.extra.insert("tool_name".into(), Value::from(name));
-    }
-    // `details` is an arbitrary structured payload (e.g. diffs, file lists) — preserve verbatim.
-    if let Some(details) = msg.get("details") {
-        if !details.is_null() {
-            m.extra.insert("tool_details".into(), details.clone());
-        }
-    }
 }
 
 /// Parse a `(TextContent|ThinkingContent|ToolCall|ImageContent)[]` content array.
@@ -752,34 +861,53 @@ fn parse_content_array(m: &mut Message, content: Option<&Value>) {
     }
 }
 
-/// Capture assistant-level metadata (provider/api/model/usage/stop/diagnostics) into `extra`.
+/// Capture assistant-level metadata (provider/api/model/usage/stop/diagnostics) into the harness
+/// bag, and an API failure into the `Error` kind (`extra["openclaw"]["error"]`).
 fn capture_assistant_meta(m: &mut Message, msg: &Value) {
+    let failed = msg
+        .get("errorMessage")
+        .and_then(Value::as_str)
+        .is_some_and(|e| !e.is_empty())
+        || msg.get("stopReason").and_then(Value::as_str) == Some("error");
+    if let Some(usage) = msg.get("usage") {
+        m.usage = parse_usage(usage);
+    }
+    let mut bag = serde_json::Map::new();
     for key in [
         "api",
         "provider",
         "responseModel",
         "responseId",
         "stopReason",
-        "errorMessage",
+        "diagnostics",
     ] {
         if let Some(val) = msg.get(key) {
             if !val.is_null() {
-                m.extra.insert(snake(key), val.clone());
+                bag.insert(snake(key), val.clone());
             }
         }
     }
-    if let Some(diags) = msg.get("diagnostics") {
-        if !diags.is_null() {
-            m.extra.insert("diagnostics".into(), diags.clone());
-        }
-    }
     if let Some(usage) = msg.get("usage") {
-        m.usage = parse_usage(usage);
-        // The full usage object also carries cost breakdowns; keep it verbatim.
-        m.extra.insert("usage_raw".into(), usage.clone());
+        // The full usage object also carries per-bucket cost and `contextUsage`; keep it verbatim.
+        bag.insert("usage_raw".into(), usage.clone());
+    }
+    if failed {
+        let mut err = serde_json::Map::new();
+        for key in ["errorMessage", "errorCode", "errorType"] {
+            if let Some(val) = msg.get(key).filter(|v| !v.is_null()) {
+                err.insert(snake(key), val.clone());
+            }
+        }
+        bag.insert("error".into(), Value::Object(err));
+        m.kind = MessageKind::Error;
+        m.origin = Origin::Harness;
+    }
+    if !bag.is_empty() {
+        m.harness_extra_mut(Harness::OpenClaw).extend(bag);
     }
 }
 
+/// `usage{input, output, cacheRead, cacheWrite, totalTokens, cost{…, total}}` → [`Usage`].
 fn parse_usage(usage: &Value) -> Option<Usage> {
     let get = |k: &str| usage.get(k).and_then(Value::as_u64);
     let u = Usage {
@@ -788,13 +916,33 @@ fn parse_usage(usage: &Value) -> Option<Usage> {
         cache_read_tokens: get("cacheRead"),
         cache_creation_tokens: get("cacheWrite"),
         reasoning_tokens: None,
-        cost_usd: None,
+        cost_usd: usage.pointer("/cost/total").and_then(Value::as_f64),
     };
     let any = u.input_tokens.is_some()
         || u.output_tokens.is_some()
         || u.cache_read_tokens.is_some()
-        || u.cache_creation_tokens.is_some();
+        || u.cache_creation_tokens.is_some()
+        || u.cost_usd.is_some();
     any.then_some(u)
+}
+
+/// The custom message roles keep their role name and fields in the harness bag.
+fn custom_role_bag<'a>(
+    m: &'a mut Message,
+    role: &str,
+    msg: &Value,
+    keys: &[&str],
+) -> &'a mut serde_json::Map<String, Value> {
+    let bag = m.harness_extra_mut(Harness::OpenClaw);
+    bag.insert("message_role".into(), Value::from(role));
+    for key in keys {
+        if let Some(val) = msg.get(*key) {
+            if !val.is_null() {
+                bag.insert(snake(key), val.clone());
+            }
+        }
+    }
+    bag
 }
 
 fn parse_bash_execution(m: &mut Message, msg: &Value) {
@@ -806,21 +954,18 @@ fn parse_bash_execution(m: &mut Message, msg: &Value) {
         text.push_str(output);
     }
     m.content.push(Block::Text { text: text.into() });
-    m.extra
-        .insert("openclaw_message_role".into(), Value::from("bashExecution"));
-    for key in [
-        "exitCode",
-        "cancelled",
-        "truncated",
-        "fullOutputPath",
-        "excludeFromContext",
-    ] {
-        if let Some(val) = msg.get(key) {
-            if !val.is_null() {
-                m.extra.insert(snake(key), val.clone());
-            }
-        }
-    }
+    custom_role_bag(
+        m,
+        "bashExecution",
+        msg,
+        &[
+            "exitCode",
+            "cancelled",
+            "truncated",
+            "fullOutputPath",
+            "excludeFromContext",
+        ],
+    );
 }
 
 fn parse_branch_summary(m: &mut Message, msg: &Value) {
@@ -828,10 +973,9 @@ fn parse_branch_summary(m: &mut Message, msg: &Value) {
     m.content.push(Block::Text {
         text: summary.to_string().into(),
     });
-    m.extra
-        .insert("openclaw_message_role".into(), Value::from("branchSummary"));
+    let bag = custom_role_bag(m, "branchSummary", msg, &[]);
     if let Some(from_id) = msg.get("fromId").and_then(Value::as_str) {
-        m.extra.insert("branch_from_id".into(), Value::from(from_id));
+        bag.insert("branch_from_id".into(), Value::from(from_id));
     }
 }
 
@@ -840,15 +984,12 @@ fn parse_compaction_summary(m: &mut Message, msg: &Value) {
     m.content.push(Block::Text {
         text: summary.to_string().into(),
     });
-    m.extra
-        .insert("openclaw_message_role".into(), Value::from("compactionSummary"));
-    for key in ["tokensBefore", "tokensAfter", "firstKeptEntryId"] {
-        if let Some(val) = msg.get(key) {
-            if !val.is_null() {
-                m.extra.insert(snake(key), val.clone());
-            }
-        }
-    }
+    custom_role_bag(
+        m,
+        "compactionSummary",
+        msg,
+        &["tokensBefore", "tokensAfter", "firstKeptEntryId"],
+    );
 }
 
 fn parse_custom(m: &mut Message, msg: &Value) {
@@ -856,19 +997,12 @@ fn parse_custom(m: &mut Message, msg: &Value) {
     if !text.is_empty() {
         m.content.push(Block::Text { text: text.into() });
     }
-    m.extra.insert("openclaw_message_role".into(), Value::from("custom"));
+    let bag = custom_role_bag(m, "custom", msg, &["display"]);
     if let Some(ct) = msg.get("customType").and_then(Value::as_str) {
-        m.extra.insert("custom_type".into(), Value::from(ct));
+        bag.insert("custom_type".into(), Value::from(ct));
     }
-    if let Some(display) = msg.get("display") {
-        if !display.is_null() {
-            m.extra.insert("display".into(), display.clone());
-        }
-    }
-    if let Some(details) = msg.get("details") {
-        if !details.is_null() {
-            m.extra.insert("custom_details".into(), details.clone());
-        }
+    if let Some(details) = msg.get("details").filter(|d| !d.is_null()) {
+        bag.insert("custom_details".into(), details.clone());
     }
 }
 
@@ -1553,25 +1687,60 @@ mod tests {
         );
 
         // Lean parse: the visible branch only — a2 (the rewound sibling) is gone, the leaf control
-        // emits nothing, session_info sets the title, the compaction is a System note.
+        // emits nothing, session_info sets the title, the compaction is a boundary + summary.
         let s = adapter.parse(r).unwrap();
         assert_eq!(s.title.as_deref(), Some("Named session"));
         assert_eq!(s.model.as_deref(), Some("claude-opus-4"));
-        assert_eq!(s.extra["openclaw_parent_session"], "s-parent");
+        assert_eq!(
+            s.lineage.forked_from.as_deref(),
+            Some("s-parent"),
+            "header parentSession"
+        );
+        assert_eq!(s.extra["openclaw"]["session_name"], "Named session");
+        assert_eq!(
+            s.extra.len(),
+            1,
+            "session facts live only in the harness bag: {:?}",
+            s.extra
+        );
         let ids: Vec<&str> = s.messages.iter().filter_map(|m| m.id.as_deref()).collect();
         assert_eq!(ids, ["u1", "a1", "u2", "c1", "a3"]);
+        let kinds: Vec<MessageKind> = s.messages.iter().map(|m| m.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                MessageKind::Prompt,
+                MessageKind::Reply,
+                MessageKind::Prompt,
+                MessageKind::CompactionBoundary,
+                MessageKind::CompactionSummary,
+                MessageKind::Reply,
+            ]
+        );
         let texts: Vec<String> = s.messages.iter().filter_map(|m| m.text()).collect();
         assert!(!texts.iter().any(|t| t.contains("side branch")));
         let c1 = &s.messages[3];
-        assert_eq!(c1.role, Role::System);
-        assert_eq!(c1.extra["openclaw_entry_type"], "compaction");
-        assert_eq!(c1.extra["tokens_before"], 1234);
-        assert_eq!(c1.extra["first_kept_entry_id"], "u2");
-        assert_eq!(c1.text().as_deref(), Some("summary of earlier"));
+        assert_eq!((c1.role, c1.origin), (Role::System, Origin::Harness));
+        assert_eq!(c1.extra["openclaw"]["record_type"], "compaction");
+        assert_eq!(c1.extra["openclaw"]["tokens_before"], 1234);
+        assert_eq!(c1.extra["openclaw"]["first_kept_entry_id"], "u2");
+        let summary = &s.messages[4];
+        assert_eq!(summary.text().as_deref(), Some("summary of earlier"));
+        assert_eq!(
+            summary.parent_id.as_deref(),
+            Some("c1"),
+            "the summary hangs off its boundary"
+        );
+        assert!(summary.id.is_none());
         // parents on the visible path are kept as written (u2 → a1); the leaf control itself is
         // never a parent of anything on the path.
         assert_eq!(s.messages[2].parent_id.as_deref(), Some("a1"));
         assert_eq!(c1.parent_id.as_deref(), Some("si"));
+        // the session model is on the session, not repeated on every reply (IR diet)
+        assert!(s.messages.iter().all(|m| m.model.is_none()), "{:?}", s.messages);
+        for m in &s.messages {
+            assert!(m.extra.keys().all(|k| k == "openclaw"), "{:?}", m.extra);
+        }
 
         // Complete parse: everything rides along; off-branch rows are tagged.
         let mut sink = crate::stream::CollectSink::default();
@@ -1581,19 +1750,43 @@ mod tests {
         let inactive: Vec<&str> = sink
             .messages
             .iter()
-            .filter(|m| m.extra.get("openclaw_inactive_branch") == Some(&Value::Bool(true)))
+            // The bag only exists for messages that carry OpenClaw facts, so look it up rather
+            // than indexing (indexing panics on the ones that have none).
+            .filter(|m| {
+                m.harness_extra(Harness::OpenClaw)
+                    .and_then(|b| b.get("inactive_branch"))
+                    == Some(&Value::Bool(true))
+            })
             .filter_map(|m| m.id.as_deref())
             .collect();
         assert_eq!(inactive, ["a2", "l1"]);
+        // the rewound reply keeps its kind; the leaf control is a carrier
+        let a2 = sink.messages.iter().find(|m| m.id.as_deref() == Some("a2")).unwrap();
+        assert_eq!(a2.kind, MessageKind::Reply);
+        let l1 = sink.messages.iter().find(|m| m.id.as_deref() == Some("l1")).unwrap();
+        assert_eq!(l1.kind, MessageKind::Carrier);
+        assert_eq!(l1.extra["openclaw"]["record_type"], "leaf");
+        assert_eq!(l1.extra[crate::harness::claude::CARRIER_KEY]["targetId"], "a1");
+        // the session name is a notice under complete, carrying its record
         let si = sink.messages.iter().find(|m| m.id.as_deref() == Some("si")).unwrap();
-        assert_eq!(si.extra["openclaw_entry_type"], "session_info");
-        assert_eq!(si.extra["openclaw_entry"]["name"], "Named session");
-        assert!(si.content.is_empty());
+        assert_eq!(si.kind, MessageKind::Notice);
+        assert_eq!(si.extra["openclaw"]["record_type"], "session_info");
+        assert_eq!(si.extra[crate::harness::claude::CARRIER_KEY]["name"], "Named session");
+        assert_eq!(si.text().as_deref(), Some("[session named: Named session]"));
+        for m in &sink.messages {
+            assert!(
+                m.extra
+                    .keys()
+                    .all(|k| k == "openclaw" || k == crate::harness::claude::CARRIER_KEY),
+                "{:?}",
+                m.extra
+            );
+        }
         fs::remove_dir_all(agents.parent().unwrap()).ok();
     }
 
     /// The store under `tests/fixtures/openclaw/openclaw-agent.sqlite` was written by OpenClaw's OWN
-    /// code (`0e9181234a`, 2026-09-19): `generate-openclaw-agent-sqlite.mts` next to it drives
+    /// code (`0e9181234a`, 2026-09-19): `tools/harness-fixtures/openclaw/generate-openclaw-agent-sqlite.mts` drives
     /// `upsertSessionEntryCore` + `appendTranscriptMessage` + `SessionManager` (`appendSessionInfo`,
     /// `appendModelChange`, `appendLabelChange`, `appendCompaction`, `branch`, `appendLeafControl`
     /// with and without `appendMode: "side"`, `appendResetBoundary`, `createBranchedSession`) and
@@ -1637,12 +1830,21 @@ mod tests {
         assert_eq!(legacy.cwd, Some(PathBuf::from("/Users/ember/ocfid/proj")));
         assert_eq!(legacy.message_count, 5);
 
-        // OpenClaw's visible path for the main window (session_info/model_change/label are
-        // session facts, not turns): 4 turns, compaction, 2 turns, 2 turns, reset, 2 turns.
+        // OpenClaw's visible path for the main window. `session_info` and `label` are session
+        // facts (they land in the session bag above, not as turns); `model_change` IS a turn —
+        // `MessageKind::ModelChange`, the point the model switched (`docs/INTERFACE-V2.md` §4).
+        // So: 4 turns, model change, compaction, 2 turns, 2 turns, reset, 2 turns.
         let s = adapter.parse(main).unwrap();
         assert_eq!(s.title.as_deref(), Some("cv fixture"), "`cv ls` and `cv show` agree");
-        assert_eq!(s.extra["openclaw_session_name"], "cv fixture session");
-        assert_eq!(s.extra["openclaw_labels"]["a2"], "good answer");
+        // OpenClaw session facts ride nested under `extra["openclaw"]`, never flat.
+        let bag = s.harness_extra(Harness::OpenClaw).expect("openclaw session bag");
+        assert_eq!(bag["session_name"], "cv fixture session");
+        assert_eq!(bag["labels"]["a2"], "good answer");
+        assert_eq!(
+            s.extra.keys().collect::<Vec<_>>(),
+            ["openclaw"],
+            "no flat session keys besides the harness bag"
+        );
         assert_eq!(s.model.as_deref(), Some("claude-sonnet-4.6"));
         let ids: Vec<&str> = s.messages.iter().filter_map(|m| m.id.as_deref()).collect();
         assert_eq!(
@@ -1652,6 +1854,7 @@ mod tests {
                 "a1",
                 "t1",
                 "a2",
+                "2ebc2e14-15f4-4a7f-96b3-b53b0c85f19f",
                 "a8809d72-24a8-48f1-af6e-96d73cdaea5e",
                 "4f9b3064-6b25-4ab4-82fc-9267b84f8674",
                 "8aa23aa2-040c-404e-872f-73a4225f184b",
@@ -1673,15 +1876,33 @@ mod tests {
                 "{gone} is off the visible path"
             );
         }
-        let compaction = &s.messages[4];
+        // Every OpenClaw fact is nested under `extra["openclaw"]` — no flat keys survive.
+        let ocbag = |m: &Message| m.harness_extra(Harness::OpenClaw).expect("openclaw bag").clone();
+        let switch = &s.messages[4];
+        assert_eq!(switch.kind, MessageKind::ModelChange);
+        assert_eq!(
+            switch.model.as_deref(),
+            Some("claude-opus-4.6"),
+            "a ModelChange names the model it switched TO, even though the session default is the first one"
+        );
+        assert_eq!(ocbag(switch)["record_type"], "model_change");
+        let compaction = &s.messages[5];
         assert_eq!(compaction.role, Role::System);
-        assert_eq!(compaction.extra["openclaw_entry_type"], "compaction");
-        assert_eq!(compaction.extra["tokens_before"], 4321);
-        assert_eq!(compaction.extra["first_kept_entry_id"], "u1");
-        assert!(compaction.text().unwrap().starts_with("Summary: the user asked"));
-        let reset = &s.messages[9];
-        assert_eq!(reset.extra["openclaw_entry_type"], "reset");
-        assert_eq!(reset.extra["reason"], "reset");
+        assert_eq!(compaction.kind, MessageKind::CompactionBoundary);
+        assert_eq!(ocbag(compaction)["record_type"], "compaction");
+        assert_eq!(ocbag(compaction)["tokens_before"], 4321);
+        assert_eq!(ocbag(compaction)["first_kept_entry_id"], "u1");
+        assert_eq!(compaction.text().as_deref(), Some("[conversation compacted]"));
+        // The summary that seeds the next window is its own turn, hanging off the boundary; it is
+        // the store's synthetic text, so it carries no entry id (hence the id list skips it).
+        let summary = &s.messages[6];
+        assert_eq!(summary.kind, MessageKind::CompactionSummary);
+        assert!(summary.text().unwrap().starts_with("Summary: the user asked"));
+        assert!(summary.id.is_none());
+        let reset = &s.messages[11];
+        assert_eq!(ocbag(reset)["record_type"], "reset");
+        assert_eq!(ocbag(reset)["reason"], "reset");
+        crate::harness::assert_no_flat_keys(&s);
         // the assistant turn carries thinking + the tool call; the tool result names its tool
         assert!(s.messages[1]
             .content
@@ -1699,7 +1920,11 @@ mod tests {
         let inactive: Vec<String> = sink
             .messages
             .iter()
-            .filter(|m| m.extra.get("openclaw_inactive_branch") == Some(&Value::Bool(true)))
+            .filter(|m| {
+                m.harness_extra(Harness::OpenClaw)
+                    .and_then(|b| b.get("inactive_branch"))
+                    == Some(&Value::Bool(true))
+            })
             .filter_map(|m| m.text())
             .collect();
         assert!(inactive.iter().any(|t| t.contains("branch: rename README")));
@@ -1707,7 +1932,12 @@ mod tests {
         assert_eq!(
             sink.messages
                 .iter()
-                .filter(|m| m.extra.get("openclaw_entry_type").and_then(Value::as_str) == Some("leaf"))
+                .filter(|m| {
+                    m.harness_extra(Harness::OpenClaw)
+                        .and_then(|b| b.get("record_type"))
+                        .and_then(Value::as_str)
+                        == Some("leaf")
+                })
                 .count(),
             3,
             "three leaf controls in the store"
@@ -1715,17 +1945,18 @@ mod tests {
 
         // the fork: v4 header with `parentSession`, the inherited prefix, then its own turns
         let f = adapter.parse(fork).unwrap();
-        assert_eq!(f.extra["openclaw_parent_session"], "cvfix-main-0001");
+        // The fork pointer is first-class lineage now, not a bag key.
+        assert_eq!(f.lineage.forked_from.as_deref(), Some("cvfix-main-0001"));
         let ftexts: Vec<String> = f.messages.iter().filter_map(|m| m.text()).collect();
         assert!(ftexts.iter().any(|t| t == "post-reset answer"));
         assert_eq!(ftexts.last().map(String::as_str), Some("fork answer"));
         // `createBranchedSession` copies only the visible path, so the fork has no abandoned
-        // branch: its 12 message rows plus the compaction and reset notes, all on the path.
-        assert_eq!(f.messages.len(), 14);
-        assert!(!f
-            .messages
-            .iter()
-            .any(|m| m.extra.contains_key("openclaw_inactive_branch")));
+        // branch: its 12 message rows plus the model change, the compaction boundary and its
+        // summary, and the reset note — all on the path.
+        assert_eq!(f.messages.len(), 16);
+        assert!(!f.messages.iter().any(|m| m
+            .harness_extra(Harness::OpenClaw)
+            .is_some_and(|b| b.contains_key("inactive_branch"))));
 
         // the legacy v3 transcript, as a migration lands it
         let l = adapter.parse(legacy).unwrap();
@@ -1847,21 +2078,44 @@ mod tests {
         let r = fixture_ref("unused.jsonl");
         let s = parse_text(&text, &r);
         assert_eq!(s.model.as_deref(), Some("claude-sonnet-5"));
-        assert_eq!(s.extra["openclaw_labels"]["u2"], "pinned prompt");
+        assert_eq!(s.extra["openclaw"]["labels"]["u2"], "pinned prompt");
         let ids: Vec<&str> = s.messages.iter().filter_map(|m| m.id.as_deref()).collect();
-        assert_eq!(ids, ["u1", "r1", "u2", "cm"]);
-        let reset = &s.messages[1];
-        assert_eq!(reset.role, Role::System);
+        assert_eq!(
+            ids,
+            ["mc", "u1", "r1", "u2", "cm"],
+            "a model change is a turn the reader sees"
+        );
+        let mc = &s.messages[0];
+        assert_eq!((mc.kind, mc.origin), (MessageKind::ModelChange, Origin::Harness));
+        assert_eq!(
+            mc.model.as_deref(),
+            Some("claude-sonnet-5"),
+            "a ModelChange always names the new model"
+        );
+        assert_eq!(mc.text().as_deref(), Some("[model: anthropic/claude-sonnet-5]"));
+        assert_eq!(mc.extra["openclaw"]["record_type"], "model_change");
+        assert_eq!(mc.extra["openclaw"]["provider"], "anthropic");
+        let reset = &s.messages[2];
+        assert_eq!((reset.role, reset.kind), (Role::System, MessageKind::Branch));
         assert_eq!(reset.text().as_deref(), Some("[session reset: idle]"));
-        assert_eq!(reset.extra["reason"], "idle");
-        assert_eq!(s.messages[3].extra["custom_type"], "ext.note");
-        assert_eq!(s.messages[3].text().as_deref(), Some("an extension note"));
+        assert_eq!(reset.extra["openclaw"]["reason"], "idle");
+        let cm = &s.messages[4];
+        assert_eq!(cm.kind, MessageKind::Notice);
+        assert_eq!(cm.extra["openclaw"]["custom_type"], "ext.note");
+        assert_eq!(cm.extra["openclaw"]["display"], true);
+        assert_eq!(cm.text().as_deref(), Some("an extension note"));
 
         let c = parse_text_with(&text, &r, &ParseOptions::complete());
         let ids: Vec<&str> = c.messages.iter().filter_map(|m| m.id.as_deref()).collect();
         assert_eq!(ids, ["mc", "u1", "r1", "u2", "lb", "cx", "cm"]);
         let cx = c.messages.iter().find(|m| m.id.as_deref() == Some("cx")).unwrap();
-        assert_eq!(cx.extra["openclaw_entry"]["data"]["ttl"], 60);
+        assert_eq!(cx.kind, MessageKind::Carrier);
+        assert_eq!(cx.extra["openclaw"]["record_type"], "custom");
+        assert_eq!(cx.extra[crate::harness::claude::CARRIER_KEY]["data"]["ttl"], 60);
+        let lb = c.messages.iter().find(|m| m.id.as_deref() == Some("lb")).unwrap();
+        assert_eq!(lb.kind, MessageKind::Notice);
+        assert_eq!(lb.text().as_deref(), Some("[label u2: pinned prompt]"));
+        assert_eq!(lb.extra[crate::harness::claude::CARRIER_KEY]["targetId"], "u2");
     }
 
     #[test]
@@ -1921,17 +2175,17 @@ mod tests {
         // but its model is not promoted to the session model)
         assert_eq!(s.messages.len(), 4);
         assert_eq!(s.messages[3].model.as_deref(), Some("delivery-mirror"));
+        assert_eq!(s.messages[1].model, None, "the session's own model is not repeated");
         let user = &s.messages[0];
         assert_eq!(user.role, Role::User);
+        assert_eq!((user.kind, user.origin), (MessageKind::Prompt, Origin::Human));
         assert_eq!(user.text().as_deref(), Some("hello"));
         // version stashed on the first message
-        assert_eq!(
-            user.extra.get("openclaw_session_version").and_then(Value::as_i64),
-            Some(3)
-        );
+        assert_eq!(user.extra["openclaw"]["session_version"], 3);
 
         let asst = &s.messages[1];
         assert_eq!(asst.role, Role::Assistant);
+        assert_eq!((asst.kind, asst.origin), (MessageKind::Reply, Origin::Model));
         // thinking (with signature + redacted), text, toolCall
         let kinds: Vec<&str> = asst
             .content
@@ -1961,17 +2215,21 @@ mod tests {
         } else {
             panic!("expected toolcall block");
         }
-        // usage + raw usage captured
+        // usage (+ cost) first-class, raw usage in the bag
         let u = asst.usage.as_ref().expect("usage");
         assert_eq!(u.input_tokens, Some(100));
         assert_eq!(u.output_tokens, Some(20));
         assert_eq!(u.cache_read_tokens, Some(5));
-        assert!(asst.extra.contains_key("usage_raw"));
-        assert_eq!(asst.extra.get("provider").and_then(Value::as_str), Some("anthropic"));
-        assert_eq!(asst.extra.get("stop_reason").and_then(Value::as_str), Some("toolUse"));
+        assert_eq!(u.cost_usd, Some(0.03));
+        let bag = &asst.extra["openclaw"];
+        assert!(bag.get("usage_raw").is_some());
+        assert_eq!(bag["provider"], "anthropic");
+        assert_eq!(bag["stop_reason"], "toolUse");
+        assert_eq!(asst.extra.len(), 1, "nothing flat: {:?}", asst.extra);
 
         let tr = &s.messages[2];
         assert_eq!(tr.role, Role::Tool);
+        assert_eq!((tr.kind, tr.origin), (MessageKind::ToolResult, Origin::Harness));
         match &tr.content[0] {
             Block::ToolResult {
                 tool_use_id,
@@ -1987,8 +2245,11 @@ mod tests {
             }
             _ => panic!("expected tool result"),
         }
-        assert_eq!(tr.extra.get("tool_name").and_then(Value::as_str), Some("read_file"));
-        assert!(tr.extra.contains_key("tool_details"));
+        // the tool's name and details live on the block, not in extra
+        assert!(tr.extra.is_empty(), "{:?}", tr.extra);
+        if let Block::ToolResult { details, .. } = &tr.content[0] {
+            assert!(details.is_some());
+        }
     }
 
     #[test]
@@ -1997,57 +2258,88 @@ mod tests {
         assert_eq!(s.messages.len(), 2);
         // v1 entries have no parentId
         assert!(s.messages[0].parent_id.is_none());
-        assert_eq!(
-            s.messages[0]
-                .extra
-                .get("openclaw_session_version")
-                .and_then(Value::as_i64),
-            Some(1)
-        );
+        assert_eq!(s.messages[0].extra["openclaw"]["session_version"], 1);
         assert_eq!(s.messages[0].text().as_deref(), Some("legacy first"));
     }
 
     #[test]
     fn parses_custom_message_types() {
         let s = parse_fixture("custom-messages.jsonl");
-        // bashExecution, branchSummary, compactionSummary, custom — all System turns
-        assert_eq!(s.messages.len(), 4);
+        // bashExecution, branchSummary, compactionSummary (→ boundary + summary), custom — all
+        // System turns
+        assert_eq!(s.messages.len(), 5);
+        let kinds: Vec<MessageKind> = s.messages.iter().map(|m| m.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                MessageKind::InjectedContext,
+                MessageKind::Notice,
+                MessageKind::CompactionBoundary,
+                MessageKind::CompactionSummary,
+                MessageKind::Notice,
+            ]
+        );
+        assert!(s
+            .messages
+            .iter()
+            .all(|m| m.role == Role::System && m.origin == Origin::Harness));
 
         let bash = &s.messages[0];
-        assert_eq!(bash.role, Role::System);
-        assert_eq!(
-            bash.extra.get("openclaw_message_role").and_then(Value::as_str),
-            Some("bashExecution")
-        );
+        assert_eq!(bash.extra["openclaw"]["message_role"], "bashExecution");
         assert!(bash.text().unwrap().contains("$ ls -la"));
-        assert_eq!(bash.extra.get("exit_code").and_then(Value::as_i64), Some(0));
+        assert_eq!(bash.extra["openclaw"]["exit_code"], 0);
 
         let branch = &s.messages[1];
-        assert_eq!(
-            branch.extra.get("openclaw_message_role").and_then(Value::as_str),
-            Some("branchSummary")
-        );
-        assert_eq!(
-            branch.extra.get("branch_from_id").and_then(Value::as_str),
-            Some("abc123")
-        );
+        assert_eq!(branch.extra["openclaw"]["message_role"], "branchSummary");
+        assert_eq!(branch.extra["openclaw"]["branch_from_id"], "abc123");
 
-        let compact = &s.messages[2];
-        assert_eq!(
-            compact.extra.get("openclaw_message_role").and_then(Value::as_str),
-            Some("compactionSummary")
-        );
-        assert_eq!(compact.extra.get("tokens_before").and_then(Value::as_i64), Some(5000));
+        // the single-record compaction: the boundary keeps the entry id and counts, the summary
+        // its text, hanging off the boundary
+        let boundary = &s.messages[2];
+        assert_eq!(boundary.id.as_deref(), Some("c3"));
+        assert_eq!(boundary.parent_id.as_deref(), Some("c2"));
+        assert_eq!(boundary.extra["openclaw"]["message_role"], "compactionSummary");
+        assert_eq!(boundary.extra["openclaw"]["tokens_before"], 5000);
+        let summary = &s.messages[3];
+        assert_eq!(summary.text().as_deref(), Some("earlier history compacted"));
+        assert_eq!(summary.parent_id.as_deref(), Some("c3"));
+        assert_eq!(summary.extra["openclaw"]["message_role"], "compactionSummary");
+        let comps = crate::compaction::detect_in_session(&s, true);
+        assert_eq!(comps.len(), 1);
+        assert_eq!(comps[0].summary_msg_idx, Some(3));
 
-        let custom = &s.messages[3];
+        let custom = &s.messages[4];
+        assert_eq!(custom.extra["openclaw"]["message_role"], "custom");
+        assert_eq!(custom.extra["openclaw"]["custom_type"], "openclaw.cache-ttl");
+        assert_eq!(custom.extra["openclaw"]["custom_details"]["ttlMs"], 3600000);
+    }
+
+    #[test]
+    fn assistant_api_failure_is_an_error_turn() {
+        let text = [
+            r#"{"type":"session","version":4,"id":"s-e","timestamp":"2026-09-19T12:00:00.000Z","cwd":"/w"}"#,
+            r#"{"type":"message","id":"u1","parentId":null,"timestamp":"2026-09-19T12:00:01.000Z","message":{"role":"user","content":"go"}}"#,
+            r#"{"type":"message","id":"a1","parentId":"u1","timestamp":"2026-09-19T12:00:02.000Z","message":{"role":"assistant","model":"claude-opus-4","provider":"anthropic","stopReason":"error","errorMessage":"overloaded","errorCode":529,"errorType":"api","content":[]}}"#,
+            r#"{"type":"message","id":"s1","parentId":"a1","timestamp":"2026-09-19T12:00:03.000Z","message":{"role":"system","content":"You are OpenClaw."}}"#,
+        ]
+        .join("\n");
+        let s = parse_text(&text, &fixture_ref("unused.jsonl"));
+        let a1 = &s.messages[1];
         assert_eq!(
-            custom.extra.get("openclaw_message_role").and_then(Value::as_str),
-            Some("custom")
+            (a1.role, a1.kind, a1.origin),
+            (Role::Assistant, MessageKind::Error, Origin::Harness)
         );
-        assert_eq!(
-            custom.extra.get("custom_type").and_then(Value::as_str),
-            Some("openclaw.cache-ttl")
+        assert_eq!(a1.extra["openclaw"]["error"]["error_message"], "overloaded");
+        assert_eq!(a1.extra["openclaw"]["error"]["error_code"], 529);
+        assert_eq!(a1.extra["openclaw"]["stop_reason"], "error");
+        assert!(
+            a1.extra["openclaw"].get("error_message").is_none(),
+            "the error is one object"
         );
+        // a `system` record is the system prompt, session-level too
+        let sys = &s.messages[2];
+        assert_eq!((sys.kind, sys.origin), (MessageKind::SystemPrompt, Origin::Harness));
+        assert_eq!(s.system_prompt.as_deref(), Some("You are OpenClaw."));
     }
 
     #[test]
@@ -2068,7 +2360,7 @@ mod tests {
         let reply = &s.messages[1];
         assert_eq!(reply.role, Role::Assistant);
         assert_eq!(reply.model.as_deref(), Some("acp-runtime"));
-        assert_eq!(reply.extra.get("provider").and_then(Value::as_str), Some("openclaw"));
+        assert_eq!(reply.extra["openclaw"]["provider"], "openclaw");
         assert_eq!(reply.text().as_deref(), Some("done bridging"));
         // bridged turns have no captured tool calls / thinking — confirm the gap
         assert!(reply.content.iter().all(|b| matches!(b, Block::Text { .. })));

@@ -30,9 +30,12 @@
 //! records (the thread's own work is what a listing/title/search should show) and take a message's
 //! real time from `internal_chat_message_metadata_passthrough.create_time` when present.
 //!
-//! Multimodal/structured bits that the IR can't model natively (rate limits, web-search queries,
-//! shell command vectors, compaction boundaries) are stashed in `Message.extra` so conversions stay
-//! as lossless as the IR allows. Images become `Block::Image` with a reference (never inlined bytes).
+//! Every message carries a precise `kind`/`origin` (INTERFACE-V2 §4): a human prompt vs. Codex's
+//! injected preambles, swarm `agent_message`s from `Origin::Subagent`, `item_completed` notes,
+//! compaction boundaries, model/effort changes, rollbacks (`Branch`), persisted errors, and — under
+//! `ParseOptions::complete` — verbatim `Carrier`s for every record with no conversational shape.
+//! Harness-specific facts (rate limits, turn ids, the structured `item`, swarm routing) live in
+//! `extra["codex"]`, the only bag this adapter writes; images become `Block::Image` references.
 
 use super::{parse_ts, Adapter};
 use crate::ir::*;
@@ -45,6 +48,62 @@ use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
+
+/// The one door into this adapter's per-message facts: `extra["codex"]` (INTERFACE-V2 §4).
+fn bag(m: &mut Message) -> &mut Map<String, Value> {
+    m.harness_extra_mut(Harness::Codex)
+}
+
+/// The session-level fact bag, `Session::extra["codex"]`.
+fn sbag(s: &mut Session) -> &mut Map<String, Value> {
+    s.harness_extra_mut(Harness::Codex)
+}
+
+/// Read a fact from a message's `extra["codex"]` bag.
+fn bag_get<'a>(m: &'a Message, key: &str) -> Option<&'a Value> {
+    m.harness_extra(Harness::Codex).and_then(|b| b.get(key))
+}
+
+/// Codex's injected preambles — text the HARNESS put in the user turn, not the user's own words:
+/// the environment/user-instructions envelopes (0.1xx), the internal-context bundle, the plugin
+/// catalog, the AGENTS.md dump and the @-mention file bundle (0.147+). Such a user message is
+/// [`MessageKind::InjectedContext`] from [`Origin::Harness`], and never a title.
+fn is_injected_text(t: &str) -> bool {
+    let trimmed = t.trim_start();
+    [
+        "<environment_context",
+        "<user_instructions",
+        "<codex_internal_context",
+        "<recommended_plugins",
+        "# Codex CLI",
+        "# AGENTS.md instructions",
+        "# Files mentioned by the user",
+    ]
+    .iter()
+    .any(|p| trimmed.starts_with(p))
+}
+
+/// A harness-side note: `Role::System`, `Origin::Harness`, the given kind, one text block.
+fn note(kind: MessageKind, ts: Option<DateTime<Utc>>, text: String) -> Message {
+    let mut m = Message::of_kind(Role::System, kind, Origin::Harness);
+    m.timestamp = ts;
+    m.content.push(Block::Text { text: text.into() });
+    m
+}
+
+/// Under `ParseOptions::complete`, a record with no conversational shape — one no arm knows, or a
+/// lifecycle marker the lean passes drop — becomes a [`MessageKind::Carrier`]: the verbatim line
+/// under the top-level `_record` key and its top-level `type` in `extra["codex"]["record_type"]`
+/// (the `payload.type` stays inside `_record`), so a same-harness round-trip loses nothing and
+/// `cv formats census` can count what the adapter does not model.
+fn carry_record(v: &Value, ts: Option<DateTime<Utc>>, out: &mut Vec<Message>) {
+    let mut m = Message::of_kind(Role::System, MessageKind::Carrier, Origin::Harness);
+    m.timestamp = ts;
+    let ty = v.get("type").and_then(Value::as_str).unwrap_or("");
+    bag(&mut m).insert("record_type".into(), Value::String(ty.to_string()));
+    m.extra.insert(super::claude::CARRIER_KEY.into(), v.clone());
+    out.push(m);
+}
 
 pub struct Codex {
     roots: Vec<PathBuf>,
@@ -343,20 +402,35 @@ fn dispatch_line(s: &mut Session, scratch: &mut Vec<Message>, v: &Value, has_eve
         }
         Some("session_meta") => apply_meta(s, ctx, v.get("payload")),
         Some("turn_context") => apply_turn_context(s, scratch, v.get("payload"), ts),
-        Some("event_msg") => handle_event(s, ctx, v.get("payload"), has_events, ts, scratch),
-        Some("response_item") => handle_item(v.get("payload"), has_events, ts, scratch, ctx),
+        Some("event_msg") => {
+            if !handle_event(s, ctx, v.get("payload"), has_events, ts, scratch) && ctx.complete {
+                carry_record(v, ts, scratch);
+            }
+        }
+        Some("response_item") => {
+            if !handle_item(v.get("payload"), has_events, ts, scratch, ctx) && ctx.complete {
+                carry_record(v, ts, scratch);
+            }
+        }
         Some("compacted") => handle_compacted(v.get("payload"), ts, scratch),
         Some("token_usage_record") => apply_token_usage_record(v.get("payload"), ts, scratch, ctx),
         // Precedes the `agent_message` it describes (verified on 0.154 rollouts: M at n, A at n+1).
         Some("inter_agent_communication_metadata") => {
             ctx.pending_trigger_turn = v.pointer("/payload/trigger_turn").and_then(Value::as_bool);
         }
-        _ => {}
+        // `world_state`, `security_risk_score`, `retained_context`, `realtime_item`, and whatever
+        // a newer Codex adds: bookkeeping with no conversational payload. Lean passes drop them;
+        // `complete` carries them so nothing is lost and the census can count them.
+        Some(_) => {
+            if ctx.complete {
+                carry_record(v, ts, scratch);
+            }
+        }
     }
     if inherited {
         if ctx.complete {
             for m in &mut scratch[before..] {
-                m.extra.insert("inherited".into(), Value::Bool(true));
+                bag(m).insert("inherited".into(), Value::Bool(true));
             }
         } else {
             scratch.truncate(before);
@@ -439,7 +513,7 @@ fn flush_all_but_held(scratch: &mut Vec<Message>, sink: &mut dyn MessageSink) ->
     // it — see [`apply_token_count`].
     let hold = scratch.last().is_some_and(|m| {
         m.role == Role::Assistant
-            && (m.usage.is_none() || m.extra.get("usage_source").and_then(Value::as_str) == Some(USAGE_FROM_RECORD))
+            && (m.usage.is_none() || bag_get(m, "usage_source").and_then(Value::as_str) == Some(USAGE_FROM_RECORD))
     });
     let upto = scratch.len() - hold as usize;
     for m in scratch.drain(..upto) {
@@ -736,17 +810,16 @@ fn giant_fco_span(slice: &[u8], base_off: u64, s: &mut Session) -> Option<Messag
 }
 
 /// `session_meta` fields with no first-class IR home, stashed verbatim (wire names) into
-/// `Session.extra` from the canonical (first) meta record: where the thread sits in a swarm
-/// (`session_id` = root thread, `parent_thread_id`, `forked_from_id`, `thread_source`,
-/// `agent_*`), how it was made (`source` — a string or, for subagents, an object), and how its
-/// file is laid out (`history_mode`, `subagent_history_start_ordinal`, `history_base`).
+/// `Session::extra["codex"]` from the canonical (first) meta record: where the thread sits in a
+/// swarm (`session_id` = root thread, `thread_source`, `agent_nickname`/`agent_role`), how it was
+/// made (`source` — a string or, for subagents, an object), and how its file is laid out
+/// (`history_mode`, `subagent_history_start_ordinal`, `history_base`). The lineage fields
+/// (`parent_thread_id`, `forked_from_id`, `agent_path`) are first-class in [`Session::lineage`];
+/// `base_instructions.text` is [`Session::system_prompt`].
 const META_EXTRA_KEYS: &[&str] = &[
     "session_id",
-    "parent_thread_id",
-    "forked_from_id",
     "thread_source",
     "agent_nickname",
-    "agent_path",
     "agent_role",
     "source",
     "model_provider",
@@ -770,11 +843,21 @@ fn apply_meta(s: &mut Session, ctx: &mut CodexCtx, payload: Option<&Value>) {
         ctx.meta_seen = true;
         for key in META_EXTRA_KEYS {
             if let Some(val) = p.get(*key).filter(|v| !v.is_null()) {
-                s.extra.insert((*key).to_string(), val.clone());
+                sbag(s).insert((*key).to_string(), val.clone());
             }
         }
+        let str_of = |k: &str| p.get(k).and_then(Value::as_str).map(str::to_string);
+        s.lineage.parent = str_of("parent_thread_id");
+        s.lineage.forked_from = str_of("forked_from_id");
+        s.lineage.agent_path = str_of("agent_path");
+        // `base_instructions {text, provenance?}` (0.147+): the system prompt this thread runs on.
+        s.system_prompt = p
+            .pointer("/base_instructions/text")
+            .and_then(Value::as_str)
+            .filter(|t| !t.trim().is_empty())
+            .map(str::to_string);
         ctx.inherit_before = p.get("subagent_history_start_ordinal").and_then(Value::as_u64);
-        ctx.agent_path = p.get("agent_path").and_then(Value::as_str).map(str::to_string);
+        ctx.agent_path = s.lineage.agent_path.clone();
     }
     if s.cwd.is_none() {
         s.cwd = p.get("cwd").and_then(Value::as_str).map(PathBuf::from);
@@ -793,9 +876,9 @@ fn apply_meta(s: &mut Session, ctx: &mut CodexCtx, payload: Option<&Value>) {
     }
 }
 
-/// `turn_context` records persist per-turn config (model, cwd, sandbox/approval). We seed the
-/// session-level `model`/`cwd` from the first one, and emit a lightweight system marker whenever the
-/// effective model changes mid-session so that drift survives into the IR.
+/// `turn_context` records persist per-turn config (model, effort, cwd, sandbox/approval). We seed
+/// the session-level `model`/`cwd`/`reasoning_effort` from the first one, and note every later
+/// model or effort change (see [`note_settings_change`]).
 fn apply_turn_context(s: &mut Session, out: &mut Vec<Message>, payload: Option<&Value>, ts: Option<DateTime<Utc>>) {
     let Some(p) = payload else { return };
     if s.cwd.is_none() {
@@ -811,45 +894,59 @@ fn apply_turn_context(s: &mut Session, out: &mut Vec<Message>, payload: Option<&
         .get("effort")
         .and_then(Value::as_str)
         .or_else(|| settings.and_then(|c| c.get("reasoning_effort")).and_then(Value::as_str));
-    if let Some(e) = effort {
-        s.extra.insert("reasoning_effort".into(), Value::String(e.to_string()));
-    }
     let mut extra = Map::new();
     for key in ["turn_id", "effort", "cwd"] {
         if let Some(val) = p.get(key).filter(|v| !v.is_null()) {
             extra.insert(key.to_string(), val.clone());
         }
     }
-    note_model_change(s, out, model, ts, "turn_context", extra);
+    note_settings_change(s, out, model, effort, ts, "turn_context", extra);
 }
 
-/// Seed or update the session-level model; when it *changes* mid-session (`/model`, escalation, a
-/// `thread_settings_applied` event) record the switch as a system note so the drift survives into
-/// the IR. `extra` rides on the note (which record noticed it, the turn, the effort, the cwd).
-fn note_model_change(
+/// Seed or update the session-level model and reasoning effort (`extra["codex"]["reasoning_effort"]`);
+/// when either *changes* mid-session (`/model`, escalation, a `thread_settings_applied` event) the
+/// switch is one [`MessageKind::ModelChange`] note so the drift survives into the IR.
+/// `Message::model` names the new model when the model is what changed (the one place a message's
+/// model equals the session's: the session's has just become this one); an effort-only change
+/// leaves it unset. `extra` rides on the note in the bag (which record noticed it, the turn, the
+/// effort, the cwd).
+fn note_settings_change(
     s: &mut Session,
     out: &mut Vec<Message>,
     model: Option<&str>,
+    effort: Option<&str>,
     ts: Option<DateTime<Utc>>,
     source: &str,
     mut extra: Map<String, Value>,
 ) {
-    match (&s.model, model) {
-        (None, Some(m)) => s.model = Some(m.to_string()),
-        (Some(prev), Some(m)) if prev != m => {
-            let mut msg = Message::new(Role::System);
-            msg.timestamp = ts;
-            msg.content.push(Block::Text {
-                text: format!("[model changed: {prev} → {m}]").into(),
-            });
-            msg.extra.insert("codex_event".into(), Value::String(source.into()));
-            msg.extra.insert("model".into(), Value::String(m.to_string()));
-            msg.extra.append(&mut extra);
-            out.push(msg);
-            s.model = Some(m.to_string());
+    let mut changes = Vec::new();
+    let mut new_model = None;
+    if let Some(m) = model {
+        if let Some(prev) = s.model.as_deref().filter(|prev| *prev != m) {
+            changes.push(format!("model changed: {prev} → {m}"));
+            new_model = Some(m.to_string());
         }
-        _ => {}
+        s.model = Some(m.to_string());
     }
+    if let Some(e) = effort {
+        let prev = sbag(s)
+            .get("reasoning_effort")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        if let Some(prev) = prev.filter(|prev| prev != e) {
+            changes.push(format!("effort changed: {prev} → {e}"));
+        }
+        sbag(s).insert("reasoning_effort".into(), Value::String(e.to_string()));
+    }
+    if changes.is_empty() {
+        return;
+    }
+    let mut msg = note(MessageKind::ModelChange, ts, format!("[{}]", changes.join("; ")));
+    msg.model = new_model;
+    let b = bag(&mut msg);
+    b.insert("codex_event".into(), Value::String(source.into()));
+    b.append(&mut extra);
+    out.push(msg);
 }
 
 /// Handle an `event_msg` record. These are the UI-side mirror of the model exchange. We emit
@@ -857,11 +954,14 @@ fn note_model_change(
 /// `response_item message`s carry it), surface `view_image_tool_call` as an image attachment
 /// (legacy files; paginated ones record it as an `item_completed` `ImageView`), attach
 /// `token_count` usage/rate-limit info to the assistant message it trails, turn paginated-mode
-/// `item_completed` items into structured system notes, follow `thread_settings_applied` model
-/// changes, and note `turn_aborted`/`thread_rolled_back`. Streaming deltas, approvals and
-/// `exec_command_*`/`web_search_*` events are never persisted (rollout/src/policy.rs), and
-/// `task_started`/`task_complete` carry nothing the items don't — except the last agent message,
-/// which is stashed session-level as a preview.
+/// `item_completed` items into structured system notes, follow `thread_settings_applied` model /
+/// effort changes, and note `turn_aborted` (a notice), `thread_rolled_back` (a branch) and
+/// persisted `error`s. Streaming deltas, approvals and `exec_command_*`/`web_search_*` events are
+/// never persisted (rollout/src/policy.rs), and `task_started`/`task_complete` carry nothing the
+/// items don't — except the last agent message, which is stashed session-level as a preview.
+///
+/// Returns whether the record is represented in the IR (as a message, merged usage or session
+/// metadata); `false` lets [`dispatch_line`] carry it verbatim under `ParseOptions::complete`.
 fn handle_event(
     s: &mut Session,
     ctx: &mut CodexCtx,
@@ -869,16 +969,15 @@ fn handle_event(
     has_events: bool,
     ts: Option<DateTime<Utc>>,
     out: &mut Vec<Message>,
-) {
-    let Some(p) = payload else { return };
+) -> bool {
+    let Some(p) = payload else { return false };
     match p.get("type").and_then(Value::as_str) {
         Some("user_message") if has_events => {
             if let Some(text) = p.get("message").and_then(Value::as_str) {
-                let mut m = Message::new(Role::User);
+                let mut m = user_message(text);
                 m.timestamp = ts;
-                m.content.push(Block::Text { text: text.into() });
                 if let Some(kind) = p.get("kind").and_then(Value::as_str) {
-                    m.extra.insert("kind".into(), Value::String(kind.into()));
+                    bag(&mut m).insert("kind".into(), Value::String(kind.into()));
                 }
                 out.push(m);
             }
@@ -900,11 +999,11 @@ fn handle_event(
                 media_type: None,
                 data_ref: path.map(str::to_string),
             });
+            let b = bag(&mut m);
             if let Some(id) = p.get("call_id").and_then(Value::as_str) {
-                m.extra.insert("call_id".into(), Value::String(id.into()));
+                b.insert("call_id".into(), Value::String(id.into()));
             }
-            m.extra
-                .insert("codex_event".into(), Value::String("view_image_tool_call".into()));
+            b.insert("codex_event".into(), Value::String("view_image_tool_call".into()));
             out.push(m);
         }
         Some("token_count") => {
@@ -919,7 +1018,7 @@ fn handle_event(
             // effort, personality, cwd, approval/permission profile. The next `turn_context` will
             // agree, so the model-change note fires here at most once.
             let Some(t) = p.get("thread_settings").and_then(Value::as_object) else {
-                return;
+                return true;
             };
             let model = t.get("model").and_then(Value::as_str);
             let mut kept = Map::new();
@@ -937,51 +1036,102 @@ fn handle_event(
                     kept.insert(key.to_string(), val.clone());
                 }
             }
-            if let Some(e) = kept.get("reasoning_effort").cloned() {
-                s.extra.insert("reasoning_effort".into(), e);
-            }
-            s.extra.insert("thread_settings".into(), Value::Object(kept));
-            note_model_change(s, out, model, ts, "thread_settings_applied", Map::new());
+            let effort = t.get("reasoning_effort").and_then(Value::as_str);
+            sbag(s).insert("thread_settings".into(), Value::Object(kept));
+            note_settings_change(s, out, model, effort, ts, "thread_settings_applied", Map::new());
         }
         Some("task_complete") => {
+            // The turn's closing marker: its `last_agent_message` is the session preview; the
+            // record itself has no conversational shape (carried under `complete`, see below).
             if let Some(last) = p.get("last_agent_message").and_then(Value::as_str) {
                 if !last.trim().is_empty() {
-                    s.extra
-                        .insert("last_agent_message".into(), Value::String(last.to_string()));
+                    sbag(s).insert("last_agent_message".into(), Value::String(last.to_string()));
                 }
             }
+            return false;
+        }
+        Some("error") => {
+            // A persisted API/usage error the model never answered — `ErrorEvent {message,
+            // codex_error_info}` (protocol.rs:1930). CLI ≤ 0.1xx wrote them (88 in the local
+            // 2026-04 corpus, all `usage_limit_exceeded`); the current policy no longer persists
+            // `EventMsg::Error`, but old rollouts keep theirs.
+            let message = p.get("message").and_then(Value::as_str).unwrap_or("").trim();
+            let text = if message.is_empty() {
+                "[error]".to_string()
+            } else {
+                message.to_string()
+            };
+            let mut m = note(MessageKind::Error, ts, text);
+            let mut error = Map::new();
+            for (k, val) in p.as_object().into_iter().flatten() {
+                if k != "type" && !val.is_null() {
+                    error.insert(k.clone(), val.clone());
+                }
+            }
+            let b = bag(&mut m);
+            b.insert("codex_event".into(), Value::String("error".into()));
+            b.insert("error".into(), Value::Object(error));
+            out.push(m);
         }
         Some("turn_aborted") => {
             let reason = p.get("reason").and_then(Value::as_str).unwrap_or("unknown");
-            let mut m = Message::new(Role::System);
-            m.timestamp = ts;
-            m.content.push(Block::Text {
-                text: format!("[turn aborted: {reason}]").into(),
-            });
-            m.extra
-                .insert("codex_event".into(), Value::String("turn_aborted".into()));
+            let mut m = note(MessageKind::Notice, ts, format!("[turn aborted: {reason}]"));
+            let b = bag(&mut m);
+            b.insert("codex_event".into(), Value::String("turn_aborted".into()));
             for key in ["turn_id", "reason", "duration_ms"] {
                 if let Some(val) = p.get(key).filter(|v| !v.is_null()) {
-                    m.extra.insert(key.to_string(), val.clone());
+                    b.insert(key.to_string(), val.clone());
                 }
             }
             out.push(m);
         }
         Some("thread_rolled_back") => {
-            // `/undo`-style rollback: the last N turns left the model's context (protocol.rs:3685).
+            // `/undo`-style rollback: the last N turns left the model's context (protocol.rs:3685)
+            // — what follows does not continue what precedes: a [`MessageKind::Branch`].
             let n = p.get("num_turns").and_then(Value::as_u64).unwrap_or(0);
-            let mut m = Message::new(Role::System);
-            m.timestamp = ts;
-            m.content.push(Block::Text {
-                text: format!("[rolled back {n} turn{}]", if n == 1 { "" } else { "s" }).into(),
-            });
-            m.extra
-                .insert("codex_event".into(), Value::String("thread_rolled_back".into()));
-            m.extra.insert("num_turns".into(), Value::from(n));
+            let mut m = note(
+                MessageKind::Branch,
+                ts,
+                format!("[rolled back {n} turn{}]", if n == 1 { "" } else { "s" }),
+            );
+            let b = bag(&mut m);
+            b.insert("codex_event".into(), Value::String("thread_rolled_back".into()));
+            b.insert("num_turns".into(), Value::from(n));
             out.push(m);
         }
-        _ => {}
+        // Legacy-mode twins of records already represented — the `response_item`s, the top-level
+        // `compacted`, `item_completed` activity (rollout/src/policy.rs:109-120 persists these only
+        // under `history_mode: legacy`): silent in every pass, not unknown and not lost.
+        Some(
+            "user_message"
+            | "agent_message"
+            | "agent_reasoning"
+            | "agent_reasoning_raw_content"
+            | "patch_apply_end"
+            | "mcp_tool_call_end"
+            | "web_search_end"
+            | "image_generation_end"
+            | "context_compacted"
+            | "sub_agent_activity",
+        ) => {}
+        // Lifecycle markers with no conversational shape and no twin (`task_started`,
+        // `thread_goal_updated`, `entered_review_mode`/`exited_review_mode`) and whatever a newer
+        // Codex adds: nothing to show in a lean pass; `complete` carries them verbatim.
+        _ => return false,
     }
+    true
+}
+
+/// A user turn from text: the human's prompt, unless it is one of Codex's injected preambles
+/// (then it is context the harness put there).
+fn user_message(text: &str) -> Message {
+    let mut m = if is_injected_text(text) {
+        Message::of_kind(Role::User, MessageKind::InjectedContext, Origin::Harness)
+    } else {
+        Message::new(Role::User)
+    };
+    m.content.push(Block::Text { text: text.into() });
+    m
 }
 
 /// Paginated history mode records every finished `TurnItem` as an `item_completed` event
@@ -1091,14 +1241,21 @@ fn handle_item_completed(p: &Value, ts: Option<DateTime<Utc>>, out: &mut Vec<Mes
     if text.trim().is_empty() {
         return;
     }
-    let mut m = Message::new(Role::System);
-    m.timestamp = p
+    // Sub-agent lifecycle is first-class: a `started` activity is the spawn, `completed` the
+    // return; everything else here is a harness notice.
+    let kind = match (ity, str_of("kind")) {
+        ("SubAgentActivity", "started") => MessageKind::SubagentSpawn,
+        ("SubAgentActivity", "completed") => MessageKind::SubagentReturn,
+        _ => MessageKind::Notice,
+    };
+    let when = p
         .get("completed_at_ms")
         .and_then(Value::as_i64)
         .and_then(DateTime::from_timestamp_millis)
         .or(ts);
-    m.content.push(Block::Text { text: text.into() });
-    m.extra.insert(
+    let mut m = note(kind, when, text);
+    let b = bag(&mut m);
+    b.insert(
         "codex_event".into(),
         Value::String(if ity == "Plan" {
             "plan".into()
@@ -1106,13 +1263,20 @@ fn handle_item_completed(p: &Value, ts: Option<DateTime<Utc>>, out: &mut Vec<Mes
             "item_completed".into()
         }),
     );
-    m.extra.insert("item_type".into(), Value::String(ity.into()));
+    b.insert("item_type".into(), Value::String(ity.into()));
     for key in ["turn_id", "started_at_ms", "completed_at_ms"] {
         if let Some(val) = p.get(key).filter(|v| !v.is_null()) {
-            m.extra.insert(key.to_string(), val.clone());
+            b.insert(key.to_string(), val.clone());
         }
     }
-    m.extra.insert("item".into(), item.clone());
+    if ity == "SubAgentActivity" {
+        for key in ["agent_thread_id", "agent_path"] {
+            if let Some(val) = item.get(key).filter(|v| !v.is_null()) {
+                b.insert(key.to_string(), val.clone());
+            }
+        }
+    }
+    b.insert("item".into(), item.clone());
     out.push(m);
 }
 
@@ -1122,6 +1286,7 @@ fn usage_eq(a: &Usage, b: &Usage) -> bool {
         && a.output_tokens == b.output_tokens
         && a.cache_read_tokens == b.cache_read_tokens
         && a.cache_creation_tokens == b.cache_creation_tokens
+        && a.reasoning_tokens == b.reasoning_tokens
 }
 
 /// Marker in `extra.usage_source` for usage that came from a `token_usage_record` (authoritative:
@@ -1150,21 +1315,20 @@ fn apply_token_usage_record(
     if !attach {
         let mut nm = Message::new(Role::Assistant);
         nm.timestamp = ts;
-        nm.extra
-            .insert("codex_event".into(), Value::String(USAGE_FROM_RECORD.into()));
+        bag(&mut nm).insert("codex_event".into(), Value::String(USAGE_FROM_RECORD.into()));
         out.push(nm);
     }
     let m = out.last_mut().unwrap();
     m.usage = Some(usage);
-    m.extra
-        .insert("usage_source".into(), Value::String(USAGE_FROM_RECORD.into()));
+    let b = bag(m);
+    b.insert("usage_source".into(), Value::String(USAGE_FROM_RECORD.into()));
     for key in ["response_id", "turn_id"] {
         if let Some(val) = p.get(key).filter(|v| !v.is_null()) {
-            m.extra.insert(key.to_string(), val.clone());
+            b.insert(key.to_string(), val.clone());
         }
     }
     if let Some(thread) = p.get("thread_token_usage").filter(|v| !v.is_null()) {
-        m.extra.insert("thread_token_usage".into(), thread.clone());
+        b.insert("thread_token_usage".into(), thread.clone());
     }
 }
 
@@ -1200,7 +1364,7 @@ fn apply_token_count(p: &Value, ts: Option<DateTime<Utc>>, out: &mut Vec<Message
     // A `token_usage_record` already gave the trailing assistant message its (authoritative) usage:
     // this is its `token_count` twin — merge the rate-limit/context-window snapshot, keep the usage.
     let from_record = out.last().is_some_and(|m| {
-        m.role == Role::Assistant && m.extra.get("usage_source").and_then(Value::as_str) == Some(USAGE_FROM_RECORD)
+        m.role == Role::Assistant && bag_get(m, "usage_source").and_then(Value::as_str) == Some(USAGE_FROM_RECORD)
     });
     if twin_of_record && !from_record && rate_limits.is_none() && ctx_window.is_none() {
         return; // the twin carried nothing beyond the usage already attached elsewhere
@@ -1212,8 +1376,7 @@ fn apply_token_count(p: &Value, ts: Option<DateTime<Utc>>, out: &mut Vec<Message
     if !attach {
         let mut nm = Message::new(Role::Assistant);
         nm.timestamp = ts;
-        nm.extra
-            .insert("codex_event".into(), Value::String("token_count".into()));
+        bag(&mut nm).insert("codex_event".into(), Value::String("token_count".into()));
         out.push(nm);
     }
     let m = out.last_mut().unwrap();
@@ -1222,17 +1385,19 @@ fn apply_token_count(p: &Value, ts: Option<DateTime<Utc>>, out: &mut Vec<Message
             m.usage = Some(u);
         }
     }
+    let b = bag(m);
     if let Some(rl) = rate_limits {
-        m.extra.insert("rate_limits".into(), rl);
+        b.insert("rate_limits".into(), rl);
     }
     if let Some(cw) = ctx_window {
-        m.extra.insert("model_context_window".into(), cw);
+        b.insert("model_context_window".into(), cw);
     }
 }
 
 /// Codex token-usage block → IR [`Usage`]. `cached_input_tokens` maps to cache-read;
 /// `cache_write_input_tokens` (added in 0.147, `#[serde(default)]`, protocol.rs:2235) to
-/// cache-creation — absent on older files.
+/// cache-creation — absent on older files; `reasoning_output_tokens` to `reasoning_tokens`. Codex
+/// stores no cost.
 fn parse_usage(v: &Value) -> Option<Usage> {
     let u64f = |k: &str| v.get(k).and_then(Value::as_u64);
     let u = Usage {
@@ -1240,7 +1405,7 @@ fn parse_usage(v: &Value) -> Option<Usage> {
         output_tokens: u64f("output_tokens"),
         cache_read_tokens: u64f("cached_input_tokens"),
         cache_creation_tokens: u64f("cache_write_input_tokens"),
-        reasoning_tokens: None,
+        reasoning_tokens: u64f("reasoning_output_tokens"),
         cost_usd: None,
     };
     if u.input_tokens.is_none() && u.output_tokens.is_none() && u.cache_read_tokens.is_none() {
@@ -1249,25 +1414,30 @@ fn parse_usage(v: &Value) -> Option<Usage> {
     Some(u)
 }
 
-/// A top-level `compacted` record marks an auto/manual history-compaction boundary. The `message`
-/// (a human summary) is preserved as a system note; `replacement_history` is summarized in `extra`.
+/// A top-level `compacted` record marks an auto/manual history-compaction boundary
+/// ([`MessageKind::CompactionBoundary`]); when it carries a human `message`, that summary follows as
+/// a [`MessageKind::CompactionSummary`] (usually `""` on 0.147+ files, where the model-visible
+/// replacement lives in `replacement_history`, whose length rides in the bag).
 fn handle_compacted(payload: Option<&Value>, ts: Option<DateTime<Utc>>, out: &mut Vec<Message>) {
     let Some(p) = payload else { return };
-    let summary = p.get("message").and_then(Value::as_str).unwrap_or("");
-    let mut m = Message::new(Role::System);
-    m.timestamp = ts;
-    let text = if summary.trim().is_empty() {
-        "[history compacted]".to_string()
-    } else {
-        format!("[history compacted]\n{summary}")
-    };
-    m.content.push(Block::Text { text: text.into() });
-    m.extra.insert("codex_event".into(), Value::String("compacted".into()));
+    let mut m = note(MessageKind::CompactionBoundary, ts, "[history compacted]".into());
+    let b = bag(&mut m);
+    b.insert("codex_event".into(), Value::String("compacted".into()));
     if let Some(rh) = p.get("replacement_history").and_then(Value::as_array) {
-        m.extra
-            .insert("replacement_history_len".into(), Value::Number(rh.len().into()));
+        b.insert("replacement_history_len".into(), Value::Number(rh.len().into()));
+    }
+    for key in ["window_number", "window_id", "compaction_response_id"] {
+        if let Some(val) = p.get(key).filter(|v| !v.is_null()) {
+            b.insert(key.to_string(), val.clone());
+        }
     }
     out.push(m);
+    let summary = p.get("message").and_then(Value::as_str).unwrap_or("");
+    if !summary.trim().is_empty() {
+        let mut sm = note(MessageKind::CompactionSummary, ts, summary.to_string());
+        bag(&mut sm).insert("codex_event".into(), Value::String("compacted".into()));
+        out.push(sm);
+    }
 }
 
 /// cv's emitter writes a failed tool result as the string `"[error] <content>"`: Codex's
@@ -1296,8 +1466,8 @@ fn handle_item(
     ts: Option<DateTime<Utc>>,
     out: &mut Vec<Message>,
     ctx: &mut CodexCtx,
-) {
-    let Some(p) = payload else { return };
+) -> bool {
+    let Some(p) = payload else { return false };
     let ty = p.get("type").and_then(Value::as_str).unwrap_or("");
     let str_field = |k: &str| p.get(k).and_then(Value::as_str).unwrap_or("").to_string();
     let ts = passthrough_ts(p).or(ts);
@@ -1312,20 +1482,30 @@ fn handle_item(
             let role = p.get("role").and_then(Value::as_str).unwrap_or("user");
             // Natural-language user/assistant text is taken from event_msg when present.
             if has_events && (role == "user" || role == "assistant") {
-                return;
+                return true;
             }
-            let ir_role = match role {
-                "assistant" => Role::Assistant,
-                "developer" | "system" => Role::System,
-                _ => Role::User,
-            };
             // A message can mix text and images; emit one message carrying all blocks in order.
             let blocks = content_blocks(p.get("content"));
             if !blocks.is_empty() {
-                let mut m = Message::new(ir_role);
+                let mut m = match role {
+                    "assistant" => Message::new(Role::Assistant),
+                    // `developer`/`system` messages are instructions the harness injected
+                    // (`<user_instructions>`, AGENTS.md); never the user's own words.
+                    "developer" | "system" => {
+                        Message::of_kind(Role::System, MessageKind::InjectedContext, Origin::Harness)
+                    }
+                    _ => {
+                        let text = join_text(p.get("content"));
+                        if is_injected_text(&text) {
+                            Message::of_kind(Role::User, MessageKind::InjectedContext, Origin::Harness)
+                        } else {
+                            Message::new(Role::User)
+                        }
+                    }
+                };
                 m.timestamp = ts;
                 if let Some(phase) = p.get("phase").and_then(Value::as_str) {
-                    m.extra.insert("phase".into(), Value::String(phase.into()));
+                    bag(&mut m).insert("phase".into(), Value::String(phase.into()));
                 }
                 m.content = blocks;
                 out.push(m);
@@ -1344,7 +1524,7 @@ fn handle_item(
                 m.timestamp = ts;
                 // When we surfaced raw content but a distinct summary also exists, keep the summary.
                 if !summary.is_empty() && text != summary {
-                    m.extra.insert("reasoning_summary".into(), Value::String(summary));
+                    bag(&mut m).insert("reasoning_summary".into(), Value::String(summary));
                 }
                 m.content.push(Block::Thinking {
                     text: text.into(),
@@ -1364,8 +1544,13 @@ fn handle_item(
         "agent_message" => {
             let author = str_field("author");
             let me = ctx.agent_path.as_deref().unwrap_or("/root");
-            let role = if author == me { Role::Assistant } else { Role::User };
-            let mut m = Message::new(role);
+            // Authored here: this thread's reply; addressed to it: a prompt — either way it came
+            // from another agent, not a person.
+            let mut m = if author == me {
+                Message::of_kind(Role::Assistant, MessageKind::Reply, Origin::Subagent)
+            } else {
+                Message::of_kind(Role::User, MessageKind::Prompt, Origin::Subagent)
+            };
             m.timestamp = ts;
             let items = p.get("content").and_then(Value::as_array);
             let encrypted = items.is_some_and(|a| {
@@ -1379,16 +1564,16 @@ fn handle_item(
                     }
                 }
             }
-            m.extra
-                .insert("codex_event".into(), Value::String("agent_message".into()));
-            m.extra.insert("author".into(), Value::String(author));
-            m.extra
-                .insert("recipient".into(), Value::String(str_field("recipient")));
+            let trigger = ctx.pending_trigger_turn.take();
+            let b = bag(&mut m);
+            b.insert("codex_event".into(), Value::String("agent_message".into()));
+            b.insert("author".into(), Value::String(author));
+            b.insert("recipient".into(), Value::String(str_field("recipient")));
             if encrypted {
-                m.extra.insert("encrypted".into(), Value::Bool(true));
+                b.insert("encrypted".into(), Value::Bool(true));
             }
-            if let Some(trigger) = ctx.pending_trigger_turn.take() {
-                m.extra.insert("trigger_turn".into(), Value::Bool(trigger));
+            if let Some(trigger) = trigger {
+                b.insert("trigger_turn".into(), Value::Bool(trigger));
             }
             out.push(m);
         }
@@ -1434,18 +1619,16 @@ fn handle_item(
             let mut m = Message::new(Role::Assistant);
             m.timestamp = ts;
             if let Some(status) = p.get("status").and_then(Value::as_str) {
-                m.extra.insert("status".into(), Value::String(status.into()));
+                bag(&mut m).insert("status".into(), Value::String(status.into()));
             }
-            // `namespace` (0.147+, e.g. `collaboration` for `send_message`/`spawn`/`wait`) rides in
-            // extra; `name` stays the bare tool name so per-tool stats keep grouping.
-            if let Some(ns) = p.get("namespace").and_then(Value::as_str) {
-                m.extra.insert("namespace".into(), Value::String(ns.into()));
-            }
+            // `namespace` (0.147+, e.g. `collaboration` for `send_message`/`spawn`/`wait`) is
+            // first-class on the block; `name` stays the bare tool name so per-tool stats keep
+            // grouping.
             m.content.push(Block::ToolUse {
                 id: call_id,
                 name,
                 input,
-                namespace: None,
+                namespace: p.get("namespace").and_then(Value::as_str).map(str::to_string),
             });
             out.push(m);
         }
@@ -1466,7 +1649,7 @@ fn handle_item(
             // 0.147+ outputs name their tool (`name`, `namespace`; models.rs:1113-1131).
             let tool_name = p.get("name").and_then(Value::as_str).map(str::to_string);
             if let Some(ns) = p.get("namespace").and_then(Value::as_str) {
-                m.extra.insert("namespace".into(), Value::String(ns.into()));
+                bag(&mut m).insert("namespace".into(), Value::String(ns.into()));
             }
             m.content.push(Block::ToolResult {
                 tool_use_id: call_id,
@@ -1526,7 +1709,7 @@ fn handle_item(
             let mut m = Message::new(Role::Assistant);
             m.timestamp = ts;
             if let Some(status) = p.get("status").and_then(Value::as_str) {
-                m.extra.insert("status".into(), Value::String(status.into()));
+                bag(&mut m).insert("status".into(), Value::String(status.into()));
             }
             m.content.push(Block::ToolUse {
                 id: call_id,
@@ -1540,7 +1723,7 @@ fn handle_item(
             let mut m = Message::new(Role::Assistant);
             m.timestamp = ts;
             if let Some(rp) = p.get("revised_prompt").and_then(Value::as_str) {
-                m.extra.insert("revised_prompt".into(), Value::String(rp.into()));
+                bag(&mut m).insert("revised_prompt".into(), Value::String(rp.into()));
             }
             // `result` is base64 image data; record a reference, not the bytes.
             m.content.push(Block::Image {
@@ -1555,25 +1738,23 @@ fn handle_item(
         // Mid-history compaction recorded inline as a response_item (vs. the top-level `compacted`
         // record). Only an opaque encrypted blob survives; note the boundary.
         "compaction" | "compaction_summary" | "context_compaction" => {
-            let mut m = Message::new(Role::System);
-            m.timestamp = ts;
-            m.content.push(Block::Text {
-                text: "[history compacted]".into(),
-            });
-            m.extra.insert("codex_event".into(), Value::String(ty.into()));
+            let mut m = note(MessageKind::CompactionBoundary, ts, "[history compacted]".into());
+            let b = bag(&mut m);
+            b.insert("codex_event".into(), Value::String(ty.into()));
             if p.get("encrypted_content").and_then(Value::as_str).is_some() {
-                m.extra.insert("encrypted".into(), Value::Bool(true));
+                b.insert("encrypted".into(), Value::Bool(true));
             }
             out.push(m);
         }
-        _ => {}
+        _ => return false,
     }
     // The turn this item belongs to (from the passthrough), on every message it produced.
     if let Some(tid) = turn_id {
         for m in &mut out[before..] {
-            m.extra.insert("turn_id".into(), tid.clone());
+            bag(m).insert("turn_id".into(), tid.clone());
         }
     }
+    true
 }
 
 /// Build IR content blocks from a `ContentItem[]` (or a bare string), preserving text + images.
@@ -1737,20 +1918,9 @@ struct CodexScan {
 impl CodexScan {
     fn consider_title(&mut self, t: &str) {
         let trimmed = t.trim();
-        // Skip Codex's injected preambles — they aren't the user's first words. (0.147+ adds the
-        // goal context, the plugin catalog, the AGENTS.md dump and the @-mention file bundle.)
-        let is_injected = [
-            "<environment_context",
-            "<user_instructions",
-            "<codex_internal_context",
-            "<recommended_plugins",
-            "# Codex CLI",
-            "# AGENTS.md instructions",
-            "# Files mentioned by the user",
-        ]
-        .iter()
-        .any(|p| trimmed.starts_with(p));
-        if self.title.is_none() && !trimmed.is_empty() && !is_injected {
+        // Skip Codex's injected preambles — they aren't the user's first words (see
+        // [`is_injected_text`]).
+        if self.title.is_none() && !trimmed.is_empty() && !is_injected_text(trimmed) {
             self.title = Some(crate::ir::truncate(trimmed, 80));
         }
     }
@@ -1968,9 +2138,14 @@ mod tests {
     use super::*;
 
     /// Build a `.jsonl` transcript from individual record lines and parse it.
+    /// Parse JSONL lines into a Session, checking the IR-v2 nesting invariant on the way out:
+    /// every Codex fact must be in `extra["codex"]`, never flat (`crate::harness::assert_no_flat_keys`).
+    /// Doing it here means every test below that builds a session enforces it for free.
     fn parse_jsonl(lines: &[&str]) -> Session {
         let text = lines.join("\n");
-        parse_str("fallback-id", &text, true, None)
+        let s = parse_str("fallback-id", &text, true, None);
+        crate::harness::assert_no_flat_keys(&s);
+        s
     }
 
     fn first_block<'a>(s: &'a Session, pred: impl Fn(&&'a Block) -> bool) -> &'a Block {
@@ -2037,7 +2212,7 @@ mod tests {
             other => panic!("expected thinking, got {other:?}"),
         }
         assert_eq!(
-            m.extra.get("reasoning_summary").and_then(Value::as_str),
+            m.extra["codex"].get("reasoning_summary").and_then(Value::as_str),
             Some("short summary")
         );
     }
@@ -2084,7 +2259,7 @@ mod tests {
             _ => unreachable!(),
         }
         assert_eq!(
-            s.messages[0].extra.get("status").and_then(Value::as_str),
+            s.messages[0].extra["codex"].get("status").and_then(Value::as_str),
             Some("completed")
         );
     }
@@ -2293,8 +2468,8 @@ mod tests {
         assert_eq!(u.input_tokens, Some(100));
         assert_eq!(u.output_tokens, Some(20));
         assert_eq!(u.cache_read_tokens, Some(10));
-        assert!(m.extra.contains_key("rate_limits"));
-        assert!(m.extra.contains_key("model_context_window"));
+        assert!(m.extra["codex"].get("rate_limits").is_some());
+        assert!(m.extra["codex"].get("model_context_window").is_some());
     }
 
     #[test]
@@ -2407,9 +2582,10 @@ mod tests {
     #[test]
     fn corrupt_lines_are_counted_identically_on_both_paths() {
         // A live/damaged rollout: one corrupt line amid good records. Both paths must (a) keep the
-        // good records, (b) surface the same `skipped_lines` count in Session.extra, and (c) stay
-        // byte-identical to each other. Clean files get NO `skipped_lines` key (see the other
-        // tests' sessions, which assert exact JSON equality without it).
+        // good records, (b) surface the same `extra["cv"]["skipped_lines"]` count (cv's own parse
+        // diagnostic, not a harness fact — see `harness::CV_NAMESPACE`), and (c) stay
+        // byte-identical to each other. Clean files get NO `cv` bag (see the other tests'
+        // sessions, which assert exact JSON equality without it).
         let lines = [
             r#"{"timestamp":"2026-01-01T00:00:00Z","type":"event_msg","payload":{"type":"user_message","message":"hi"}}"#,
             r#"{"timestamp":"2026-01-01T00:00:01Z","type":"event_msg","payload":{"type":"agent_mess"#, // truncated mid-write
@@ -2419,9 +2595,17 @@ mod tests {
         let parsed = parse_str("s", &text, true, None);
         assert_eq!(parsed.messages.len(), 2);
         assert_eq!(
-            parsed.extra.get("skipped_lines").and_then(Value::as_u64),
+            parsed
+                .extra
+                .get("cv")
+                .and_then(|v| v.get("skipped_lines"))
+                .and_then(Value::as_u64),
             Some(1),
             "the corrupt line is tolerated but counted"
+        );
+        assert!(
+            !parsed.extra.contains_key("skipped_lines"),
+            "the diagnostic is namespaced, never flat"
         );
 
         let mut sink = crate::stream::CollectSink::default();
@@ -2443,15 +2627,41 @@ mod tests {
     }
 
     #[test]
-    fn compacted_record_becomes_system_note() {
+    fn compacted_record_is_a_boundary_plus_a_summary_when_readable() {
+        // Legacy shape: a human-readable `message` — the boundary, then the summary that seeds the
+        // next window.
         let s = parse_jsonl(&[
             r#"{"timestamp":"2026-01-27T00:52:58Z","type":"compacted","payload":{"message":"summary text","replacement_history":[{"type":"message","role":"user","content":[]}]}}"#,
         ]);
-        let m = &s.messages[0];
-        assert_eq!(m.role, Role::System);
-        assert!(m.text().unwrap().contains("history compacted"));
-        assert!(m.text().unwrap().contains("summary text"));
-        assert_eq!(m.extra.get("replacement_history_len").and_then(Value::as_u64), Some(1));
+        let kinds: Vec<_> = s.messages.iter().map(|m| (m.role, m.kind, m.origin)).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                (Role::System, MessageKind::CompactionBoundary, Origin::Harness),
+                (Role::System, MessageKind::CompactionSummary, Origin::Harness),
+            ]
+        );
+        assert_eq!(s.messages[0].text().as_deref(), Some("[history compacted]"));
+        assert_eq!(s.messages[0].extra["codex"]["replacement_history_len"], 1);
+        assert_eq!(s.messages[0].extra["codex"]["codex_event"], "compacted");
+        assert_eq!(s.messages[1].text().as_deref(), Some("summary text"));
+
+        // 0.147+ shape: `message` is "" and the replacement is an encrypted `compaction` item —
+        // nothing readable seeds the window, so only the boundary is emitted.
+        let s = parse_jsonl(&[
+            r#"{"timestamp":"2026-09-19T18:12:51.000Z","ordinal":17,"type":"compacted","payload":{"message":"","replacement_history":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},{"type":"compaction","encrypted_content":"ENC"}],"window_number":1,"window_id":"w1"}}"#,
+        ]);
+        assert_eq!(s.messages.len(), 1);
+        assert_eq!(s.messages[0].kind, MessageKind::CompactionBoundary);
+        assert_eq!(s.messages[0].extra["codex"]["replacement_history_len"], 2);
+        assert_eq!(s.messages[0].extra["codex"]["window_number"], 1);
+
+        // The inline `response_item compaction` (mid-history) is a boundary too.
+        let s = parse_jsonl(&[
+            r#"{"timestamp":"2026-01-27T00:52:58Z","type":"response_item","payload":{"type":"compaction","encrypted_content":"ENC"}}"#,
+        ]);
+        assert_eq!(s.messages[0].kind, MessageKind::CompactionBoundary);
+        assert_eq!(s.messages[0].extra["codex"]["encrypted"], true);
     }
 
     #[test]
@@ -2462,11 +2672,44 @@ mod tests {
         ]);
         assert_eq!(s.model.as_deref(), Some("gpt-5.3-codex-high"));
         let note = s.messages.iter().find(|m| m.role == Role::System).unwrap();
-        assert!(note.text().unwrap().contains("model changed"));
+        assert_eq!(note.kind, MessageKind::ModelChange);
+        assert_eq!(note.origin, Origin::Harness);
         assert_eq!(
-            note.extra.get("model").and_then(Value::as_str),
-            Some("gpt-5.3-codex-high")
+            note.text().as_deref(),
+            Some("[model changed: gpt-5.3-codex → gpt-5.3-codex-high]")
         );
+        assert_eq!(
+            note.model.as_deref(),
+            Some("gpt-5.3-codex-high"),
+            "the new model is first-class on the note"
+        );
+        assert!(bag_get(note, "model").is_none(), "no bag copy of a first-class field");
+        assert_eq!(note.extra["codex"]["codex_event"], "turn_context");
+    }
+
+    #[test]
+    fn turn_context_effort_change_is_a_model_change_note_without_a_model() {
+        let s = parse_jsonl(&[
+            r#"{"timestamp":"2026-09-19T18:12:43.000Z","type":"turn_context","payload":{"turn_id":"t0","cwd":"/w","model":"gpt-6-astra","effort":"high","approval_policy":"never","sandbox_policy":{"type":"danger-full-access"},"summary":"auto"}}"#,
+            r#"{"timestamp":"2026-09-19T18:12:44.000Z","type":"turn_context","payload":{"turn_id":"t1","cwd":"/w","model":"gpt-6-astra","effort":"xhigh","approval_policy":"never","sandbox_policy":{"type":"danger-full-access"},"summary":"auto"}}"#,
+            r#"{"timestamp":"2026-09-19T18:12:45.000Z","type":"turn_context","payload":{"turn_id":"t2","cwd":"/w","model":"gpt-6-astra","effort":"xhigh","approval_policy":"never","sandbox_policy":{"type":"danger-full-access"},"summary":"auto"}}"#,
+        ]);
+        assert_eq!(s.extra["codex"]["reasoning_effort"], "xhigh");
+        assert_eq!(
+            s.messages.len(),
+            1,
+            "the first record seeds silently; the agreeing third adds nothing"
+        );
+        let note = &s.messages[0];
+        assert_eq!(note.kind, MessageKind::ModelChange);
+        assert_eq!(note.text().as_deref(), Some("[effort changed: high → xhigh]"));
+        assert!(note.model.is_none(), "the model did not change");
+        // Every `turn_context` fact the note carries is nested under `extra["codex"]`, never flat
+        // (`parse_jsonl` also runs the whole-session check).
+        assert_eq!(note.extra["codex"]["effort"], "xhigh");
+        assert_eq!(note.extra["codex"]["turn_id"], "t1");
+        assert_eq!(note.extra["codex"]["cwd"], "/w");
+        assert_eq!(note.extra.keys().collect::<Vec<_>>(), ["codex"]);
     }
 
     #[test]
@@ -2545,24 +2788,28 @@ mod tests {
         let s = parse_jsonl(&[SUBAGENT_META, PARENT_META]);
         assert_eq!(s.id, "child-1", "the first session_meta is canonical");
         assert_eq!(s.cwd.as_deref(), Some(Path::new("/Users/ember/dev/minidregg")));
-        assert_eq!(s.extra["session_id"], "root-1");
-        assert_eq!(s.extra["parent_thread_id"], "parent-1");
-        assert_eq!(s.extra["forked_from_id"], "parent-1");
-        assert_eq!(s.extra["thread_source"], "subagent");
-        assert_eq!(s.extra["agent_nickname"], "Newton");
+        assert_eq!(s.extra["codex"]["session_id"], "root-1");
+        assert_eq!(s.lineage.parent.as_deref(), Some("parent-1"));
+        assert_eq!(s.lineage.forked_from.as_deref(), Some("parent-1"));
+        assert_eq!(s.extra["codex"]["thread_source"], "subagent");
+        assert_eq!(s.extra["codex"]["agent_nickname"], "Newton");
         assert_eq!(
-            s.extra["agent_path"], "/root/cycle_client",
+            s.lineage.agent_path.as_deref(),
+            Some("/root/cycle_client"),
             "the parent's /root did not overwrite it"
         );
         assert_eq!(
-            s.extra["source"]["subagent"]["thread_spawn"]["depth"], 1,
+            s.extra["codex"]["source"]["subagent"]["thread_spawn"]["depth"], 1,
             "object-valued source kept raw"
         );
-        assert_eq!(s.extra["model_provider"], "openai");
-        assert_eq!(s.extra["history_mode"], "paginated");
-        assert_eq!(s.extra["subagent_history_start_ordinal"], 4);
-        assert_eq!(s.extra["cli_version"], "0.154.0");
-        assert!(!s.extra.contains_key("agent_role"), "null fields are not stashed");
+        assert_eq!(s.extra["codex"]["model_provider"], "openai");
+        assert_eq!(s.extra["codex"]["history_mode"], "paginated");
+        assert_eq!(s.extra["codex"]["subagent_history_start_ordinal"], 4);
+        assert_eq!(s.extra["codex"]["cli_version"], "0.154.0");
+        assert!(
+            !s.extra["codex"].as_object().unwrap().contains_key("agent_role"),
+            "null fields are not stashed"
+        );
     }
 
     #[test]
@@ -2582,7 +2829,7 @@ mod tests {
             Some("gpt-6-astra"),
             "inherited turn_context still seeds the model"
         );
-        assert_eq!(lean.extra["reasoning_effort"], "xhigh");
+        assert_eq!(lean.extra["codex"]["reasoning_effort"], "xhigh");
         let texts: Vec<_> = lean.messages.iter().filter_map(|m| m.text()).collect();
         assert_eq!(
             texts,
@@ -2592,18 +2839,18 @@ mod tests {
         // create_time (epoch seconds, float) beats the envelope timestamp; turn_id rides along.
         let m = &lean.messages[0];
         assert_eq!(m.timestamp.map(|t| t.timestamp()), Some(1789845000));
-        assert_eq!(m.extra["turn_id"], "t1");
+        assert_eq!(m.extra["codex"]["turn_id"], "t1");
 
         let complete = stream_jsonl_with(&lines, &ParseOptions::complete());
         let texts: Vec<_> = complete.messages.iter().filter_map(|m| m.text()).collect();
         assert_eq!(texts, vec!["parent's original prompt", "child's own reply"]);
-        assert_eq!(complete.messages[0].extra["inherited"], true);
+        assert_eq!(complete.messages[0].extra["codex"]["inherited"], true);
         assert_eq!(
             complete.messages[0].timestamp.map(|t| t.timestamp()),
             Some(1789840968),
             "the fork-time envelope stamp is not used"
         );
-        assert!(!complete.messages[1].extra.contains_key("inherited"));
+        assert!(bag_get(&complete.messages[1], "inherited").is_none());
 
         // parse == stream for the lean pass too
         let streamed = stream_jsonl_with(&lines, &ParseOptions::full());
@@ -2627,28 +2874,38 @@ mod tests {
         let s = parse_jsonl(&lines);
         let inbound = &s.messages[0];
         assert_eq!(inbound.role, Role::User, "addressed to this thread ⇒ input");
-        assert!(inbound.text().unwrap().starts_with("Message Type: NEW_TASK"));
-        assert_eq!(inbound.extra["codex_event"], "agent_message");
-        assert_eq!(inbound.extra["author"], "/root");
-        assert_eq!(inbound.extra["recipient"], "/root/cycle_client");
-        assert_eq!(inbound.extra["encrypted"], true);
         assert_eq!(
-            inbound.extra["trigger_turn"], true,
+            (inbound.kind, inbound.origin),
+            (MessageKind::Prompt, Origin::Subagent),
+            "a task from another agent is a prompt, but not a human's"
+        );
+        assert!(inbound.text().unwrap().starts_with("Message Type: NEW_TASK"));
+        assert_eq!(inbound.extra["codex"]["codex_event"], "agent_message");
+        assert_eq!(inbound.extra["codex"]["author"], "/root");
+        assert_eq!(inbound.extra["codex"]["recipient"], "/root/cycle_client");
+        assert_eq!(inbound.extra["codex"]["encrypted"], true);
+        assert_eq!(
+            inbound.extra["codex"]["trigger_turn"], true,
             "the metadata line that preceded it"
         );
         // namespace kept on the call and its output; name stays bare
         let call = &s.messages[1];
         assert!(matches!(&call.content[0], Block::ToolUse { name, .. } if name == "send_message"));
-        assert_eq!(call.extra["namespace"], "collaboration");
+        assert!(call
+            .content
+            .iter()
+            .any(|b| matches!(b, Block::ToolUse { namespace: Some(ns), .. } if ns == "collaboration")));
         let out = &s.messages[2];
         assert!(
             matches!(&out.content[0], Block::ToolResult { tool_name, .. } if tool_name.as_deref() == Some("send_message"))
         );
-        assert_eq!(out.extra["namespace"], "collaboration");
+        assert_eq!(out.extra["codex"]["namespace"], "collaboration");
+        assert_eq!((out.kind, out.origin), (MessageKind::ToolResult, Origin::Harness));
         let outbound = &s.messages[3];
         assert_eq!(outbound.role, Role::Assistant, "authored by this thread ⇒ output");
-        assert_eq!(outbound.extra["trigger_turn"], false);
-        assert!(!outbound.extra.contains_key("encrypted"));
+        assert_eq!((outbound.kind, outbound.origin), (MessageKind::Reply, Origin::Subagent));
+        assert_eq!(outbound.extra["codex"]["trigger_turn"], false);
+        assert!(!outbound.extra["codex"].get("encrypted").is_some());
         // identical on the streaming path (the pairing lives in parser state, not the sink)
         let streamed = stream_jsonl_with(&lines, &ParseOptions::full());
         assert_eq!(
@@ -2663,6 +2920,7 @@ mod tests {
             r#"{"timestamp":"2026-09-19T18:13:04.000Z","ordinal":0,"type":"event_msg","payload":{"type":"item_completed","thread_id":"child-1","turn_id":"t1","item":{"type":"CommandExecution","id":"exec-1","command":["/bin/zsh","-lc","cargo test"],"cwd":"file:///Users/ember/dev/x","status":"failed","exit_code":101,"duration":{"secs":3,"nanos":0},"stdout":"error: test failed","source":"unified_exec_startup"},"started_at_ms":1789841584000,"completed_at_ms":1789841587000}}"#,
             r#"{"timestamp":"2026-09-19T18:13:05.000Z","ordinal":1,"type":"event_msg","payload":{"type":"item_completed","thread_id":"child-1","turn_id":"t1","item":{"type":"FileChange","id":"exec-2","changes":{"/Users/ember/dev/x/src/lib.rs":{"type":"update","unified_diff":"@@ -1 +1 @@\n-a\n+b\n"}},"status":"completed"},"completed_at_ms":1789841588000}}"#,
             r#"{"timestamp":"2026-09-19T18:13:06.000Z","ordinal":2,"type":"event_msg","payload":{"type":"item_completed","thread_id":"child-1","turn_id":"t1","item":{"type":"SubAgentActivity","id":"call_9","kind":"started","agent_thread_id":"grand-1","agent_path":"/root/cycle_client/helper"},"completed_at_ms":1789841589000}}"#,
+            r#"{"timestamp":"2026-09-19T18:13:06.500Z","ordinal":3,"type":"event_msg","payload":{"type":"item_completed","thread_id":"child-1","turn_id":"t1","item":{"type":"SubAgentActivity","id":"call_9","kind":"completed","agent_thread_id":"grand-1","agent_path":"/root/cycle_client/helper"},"completed_at_ms":1789841589500}}"#,
             r#"{"timestamp":"2026-09-19T18:13:07.000Z","ordinal":3,"type":"event_msg","payload":{"type":"item_completed","thread_id":"child-1","turn_id":"t1","item":{"type":"ImageView","id":"exec-3","path":"file:///Users/ember/shot.png"},"completed_at_ms":1789841590000}}"#,
             r#"{"timestamp":"2026-09-19T18:13:08.000Z","ordinal":4,"type":"event_msg","payload":{"type":"item_completed","thread_id":"child-1","turn_id":"t1","item":{"type":"McpToolCall","id":"exec-4","server":"node_repl","tool":"js","arguments":{"code":"1+1"},"status":"failed","error":{"message":"boom"}},"completed_at_ms":1789841591000}}"#,
             r#"{"timestamp":"2026-09-19T18:13:09.000Z","ordinal":5,"type":"event_msg","payload":{"type":"item_completed","thread_id":"child-1","turn_id":"t1","item":{"type":"Extension","kind":"web.search","id":"exec-5","query":"q","action":{"type":"search","query":null,"queries":["rust zstd crate","ruzstd docs"]}},"completed_at_ms":1789841592000}}"#,
@@ -2679,6 +2937,7 @@ mod tests {
                 "$ /bin/zsh -lc cargo test → failed (exit 101)",
                 "[file change completed] /Users/ember/dev/x/src/lib.rs",
                 "[sub-agent /root/cycle_client/helper started]",
+                "[sub-agent /root/cycle_client/helper completed]",
                 "[viewed image: file:///Users/ember/shot.png]",
                 "[mcp node_repl.js] failed: {\"message\":\"boom\"}",
                 "[web search] rust zstd crate · ruzstd docs",
@@ -2686,7 +2945,28 @@ mod tests {
             ],
             "Reasoning/AgentMessage twins and clock.sleep emit nothing"
         );
-        assert!(s.messages.iter().all(|m| m.role == Role::System));
+        assert!(s
+            .messages
+            .iter()
+            .all(|m| m.role == Role::System && m.origin == Origin::Harness));
+        // Sub-agent lifecycle is first-class; every other item is a harness notice.
+        let kinds: Vec<_> = s.messages.iter().map(|m| m.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                MessageKind::Notice,
+                MessageKind::Notice,
+                MessageKind::SubagentSpawn,
+                MessageKind::SubagentReturn,
+                MessageKind::Notice,
+                MessageKind::Notice,
+                MessageKind::Notice,
+                MessageKind::Notice,
+            ]
+        );
+        assert_eq!(s.messages[2].extra["codex"]["agent_thread_id"], "grand-1");
+        assert_eq!(s.messages[2].extra["codex"]["agent_path"], "/root/cycle_client/helper");
+        assert_eq!(s.messages[3].extra["codex"]["item"]["kind"], "completed");
         assert!(
             s.messages
                 .iter()
@@ -2694,26 +2974,26 @@ mod tests {
             "the viewed image is not duplicated as an Image block (the tool output already carries it)"
         );
         let exec = &s.messages[0];
-        assert_eq!(exec.extra["codex_event"], "item_completed");
-        assert_eq!(exec.extra["item_type"], "CommandExecution");
-        assert_eq!(exec.extra["item"]["exit_code"], 101);
-        assert_eq!(exec.extra["item"]["stdout"], "error: test failed");
-        assert_eq!(exec.extra["turn_id"], "t1");
-        assert_eq!(exec.extra["started_at_ms"], 1789841584000u64);
+        assert_eq!(exec.extra["codex"]["codex_event"], "item_completed");
+        assert_eq!(exec.extra["codex"]["item_type"], "CommandExecution");
+        assert_eq!(exec.extra["codex"]["item"]["exit_code"], 101);
+        assert_eq!(exec.extra["codex"]["item"]["stdout"], "error: test failed");
+        assert_eq!(exec.extra["codex"]["turn_id"], "t1");
+        assert_eq!(exec.extra["codex"]["started_at_ms"], 1789841584000u64);
         assert_eq!(
             exec.timestamp.map(|t| t.timestamp_millis()),
             Some(1789841587000),
             "completed_at_ms is the note's time"
         );
-        assert_eq!(s.messages[6].extra["codex_event"], "plan");
+        assert_eq!(s.messages[7].extra["codex"]["codex_event"], "plan");
     }
 
     #[test]
     fn token_usage_record_is_authoritative_and_its_token_count_merges() {
         let lines = [
             r#"{"timestamp":"2026-09-19T18:12:44.000Z","ordinal":0,"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}}"#,
-            r#"{"timestamp":"2026-09-19T18:12:44.100Z","ordinal":1,"type":"token_usage_record","payload":{"thread_id":"child-1","turn_id":"t1","session_id":"root-1","root_turn_id":"t1","response_id":"resp_1","usage":{"input_tokens":35507,"cached_input_tokens":34432,"cache_write_input_tokens":512,"output_tokens":55,"reasoning_output_tokens":0,"total_tokens":35562},"turn_token_usage":{"input_tokens":35507},"thread_token_usage":{"input_tokens":70000}}}"#,
-            r#"{"timestamp":"2026-09-19T18:12:44.200Z","ordinal":2,"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":35507,"cached_input_tokens":34432,"cache_write_input_tokens":512,"output_tokens":55,"reasoning_output_tokens":0,"total_tokens":35562},"model_context_window":258400},"rate_limits":{"primary":{"used_percent":7.0}}}}"#,
+            r#"{"timestamp":"2026-09-19T18:12:44.100Z","ordinal":1,"type":"token_usage_record","payload":{"thread_id":"child-1","turn_id":"t1","session_id":"root-1","root_turn_id":"t1","response_id":"resp_1","usage":{"input_tokens":35507,"cached_input_tokens":34432,"cache_write_input_tokens":512,"output_tokens":55,"reasoning_output_tokens":7,"total_tokens":35562},"turn_token_usage":{"input_tokens":35507},"thread_token_usage":{"input_tokens":70000}}}"#,
+            r#"{"timestamp":"2026-09-19T18:12:44.200Z","ordinal":2,"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":35507,"cached_input_tokens":34432,"cache_write_input_tokens":512,"output_tokens":55,"reasoning_output_tokens":7,"total_tokens":35562},"model_context_window":258400},"rate_limits":{"primary":{"used_percent":7.0}}}}"#,
             r#"{"timestamp":"2026-09-19T18:12:50.000Z","ordinal":3,"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"next"}]}}"#,
         ];
         let s = parse_jsonl(&lines);
@@ -2733,12 +3013,21 @@ mod tests {
             ),
             (Some(35507), Some(34432), Some(512), Some(55))
         );
-        assert_eq!(m.extra["usage_source"], "token_usage_record");
-        assert_eq!(m.extra["response_id"], "resp_1");
-        assert_eq!(m.extra["turn_id"], "t1");
-        assert_eq!(m.extra["thread_token_usage"]["input_tokens"], 70000);
-        assert!(m.extra.contains_key("rate_limits"), "token_count's snapshot merged in");
-        assert_eq!(m.extra["model_context_window"], 258400);
+        assert_eq!(
+            u.reasoning_tokens,
+            Some(7),
+            "reasoning_output_tokens → reasoning_tokens"
+        );
+        assert_eq!(u.cost_usd, None, "Codex stores no cost");
+        assert_eq!(m.extra["codex"]["usage_source"], "token_usage_record");
+        assert_eq!(m.extra["codex"]["response_id"], "resp_1");
+        assert_eq!(m.extra["codex"]["turn_id"], "t1");
+        assert_eq!(m.extra["codex"]["thread_token_usage"]["input_tokens"], 70000);
+        assert!(
+            m.extra["codex"].get("rate_limits").is_some(),
+            "token_count's snapshot merged in"
+        );
+        assert_eq!(m.extra["codex"]["model_context_window"], 258400);
         // and the streaming path (which holds the message across the two records) agrees
         let streamed = stream_jsonl_with(&lines, &ParseOptions::full());
         assert_eq!(
@@ -2759,23 +3048,33 @@ mod tests {
         ];
         let s = parse_jsonl(&lines);
         assert_eq!(s.model.as_deref(), Some("gpt-6-vega"));
-        assert_eq!(s.extra["reasoning_effort"], "xhigh");
-        assert_eq!(s.extra["thread_settings"]["model_provider_id"], "openai");
-        assert_eq!(s.extra["thread_settings"]["personality"], "pragmatic");
-        assert_eq!(s.extra["last_agent_message"], "all done here");
+        assert_eq!(s.extra["codex"]["reasoning_effort"], "xhigh");
+        assert_eq!(s.extra["codex"]["thread_settings"]["model_provider_id"], "openai");
+        assert_eq!(s.extra["codex"]["thread_settings"]["personality"], "pragmatic");
+        assert_eq!(s.extra["codex"]["last_agent_message"], "all done here");
         let texts: Vec<String> = s.messages.iter().filter_map(|m| m.text()).collect();
         assert_eq!(
             texts,
             vec![
-                "[model changed: gpt-6-astra → gpt-6-vega]",
+                "[model changed: gpt-6-astra → gpt-6-vega; effort changed: high → xhigh]",
                 "[turn aborted: interrupted]",
                 "[rolled back 2 turns]"
             ],
             "the settings event notes the switch once; the agreeing turn_context adds nothing"
         );
-        assert_eq!(s.messages[0].extra["codex_event"], "thread_settings_applied");
-        assert_eq!(s.messages[1].extra["duration_ms"], 10696120u64);
-        assert_eq!(s.messages[2].extra["num_turns"], 2);
+        let kinds: Vec<_> = s.messages.iter().map(|m| (m.role, m.kind, m.origin)).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                (Role::System, MessageKind::ModelChange, Origin::Harness),
+                (Role::System, MessageKind::Notice, Origin::Harness),
+                (Role::System, MessageKind::Branch, Origin::Harness),
+            ]
+        );
+        assert_eq!(s.messages[0].model.as_deref(), Some("gpt-6-vega"));
+        assert_eq!(s.messages[0].extra["codex"]["codex_event"], "thread_settings_applied");
+        assert_eq!(s.messages[1].extra["codex"]["duration_ms"], 10696120u64);
+        assert_eq!(s.messages[2].extra["codex"]["num_turns"], 2);
     }
 
     #[test]
@@ -2964,28 +3263,31 @@ mod tests {
             let notes = parsed
                 .messages
                 .iter()
-                .filter(|m| m.extra.get("codex_event").and_then(Value::as_str) == Some("item_completed"))
+                .filter(|m| bag_get(m, "codex_event").and_then(Value::as_str) == Some("item_completed"))
                 .count();
             let agent_msgs = parsed
                 .messages
                 .iter()
-                .filter(|m| m.extra.get("codex_event").and_then(Value::as_str) == Some("agent_message"))
+                .filter(|m| bag_get(m, "codex_event").and_then(Value::as_str) == Some("agent_message"))
                 .count();
             let with_usage = parsed.messages.iter().filter(|m| m.usage.is_some()).count();
             let from_record = parsed
                 .messages
                 .iter()
-                .filter(|m| m.extra.get("usage_source").is_some())
+                .filter(|m| bag_get(m, "usage_source").is_some())
                 .count();
             let carriers = parsed
                 .messages
                 .iter()
                 .filter(|m| m.content.is_empty() && m.usage.is_some())
                 .count();
-            let inherit = parsed.extra.get("subagent_history_start_ordinal").cloned();
+            let inherit = parsed
+                .harness_extra(Harness::Codex)
+                .and_then(|b| b.get("subagent_history_start_ordinal"))
+                .cloned();
             eprintln!(
                 "{}: id={} title={:?} msgs={} scan_count={} item_notes={} agent_msgs={} usage={} (from record {}) usage_carriers={} model={:?} agent_path={:?} inherit_before={:?}",
-                path.file_name().unwrap().to_string_lossy(), parsed.id, r.title, parsed.messages.len(), r.message_count, notes, agent_msgs, with_usage, from_record, carriers, parsed.model, parsed.extra.get("agent_path"), inherit
+                path.file_name().unwrap().to_string_lossy(), parsed.id, r.title, parsed.messages.len(), r.message_count, notes, agent_msgs, with_usage, from_record, carriers, parsed.model, parsed.lineage.agent_path, inherit
             );
             assert!(from_record > 0, "paginated files carry token_usage_records");
             // A response whose only item was a tool call is followed by the call's OUTPUT before
@@ -2994,7 +3296,22 @@ mod tests {
             // record, and never a lost record.
             assert!(carriers <= from_record, "at most one bare carrier per usage record");
             if inherit.is_some() {
-                assert!(parsed.messages.iter().all(|m| !m.extra.contains_key("inherited")));
+                assert!(parsed.messages.iter().all(|m| bag_get(m, "inherited").is_none()));
+            }
+            // The v2 shape holds on real files: nothing flat, every kind precise.
+            for m in &parsed.messages {
+                assert!(
+                    m.extra
+                        .keys()
+                        .all(|k| k == "codex" || k == super::super::claude::CARRIER_KEY),
+                    "flat extra key on {}: {:?}",
+                    path.display(),
+                    m.extra.keys().collect::<Vec<_>>()
+                );
+                if m.role == Role::User && m.origin == Origin::Human {
+                    assert_eq!(m.kind, MessageKind::Prompt);
+                    assert!(!is_injected_text(&m.text().unwrap_or_default()));
+                }
             }
         }
         fs::remove_dir_all(&snap).ok();
@@ -3010,5 +3327,335 @@ mod tests {
         assert!(
             matches!(&m.content[1], Block::Image { media_type, .. } if media_type.as_deref() == Some("image/jpeg"))
         );
+    }
+
+    #[test]
+    fn user_prompts_vs_injected_preambles_kind_and_origin() {
+        // Paginated (no NL event twins): the response_items carry the text.
+        let s = parse_jsonl(&[
+            r#"{"timestamp":"2026-09-19T18:12:44.000Z","type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"<app-context>\n# Codex desktop context"}]}}"#,
+            r#"{"timestamp":"2026-09-19T18:12:44.001Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>\n  <cwd>/w</cwd>\n</environment_context>"}]}}"#,
+            r#"{"timestamp":"2026-09-19T18:12:44.002Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<recommended_plugins>\nHere is a list of plugins"}]}}"#,
+            r#"{"timestamp":"2026-09-19T18:12:44.003Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<codex_internal_context source=\"goal\">\nCurrent goal"}]}}"#,
+            r##"{"timestamp":"2026-09-19T18:12:44.004Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for /Users/ember/dev/x\n\nbe kind"}]}}"##,
+            r##"{"timestamp":"2026-09-19T18:12:44.005Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# Files mentioned by the user\n\n## /x/y.rs"}]}}"##,
+            r#"{"timestamp":"2026-09-19T18:12:44.006Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"please fix the build"}]}}"#,
+            r#"{"timestamp":"2026-09-19T18:12:45.000Z","type":"response_item","payload":{"type":"reasoning","summary":[{"type":"summary_text","text":"thinking"}]}}"#,
+            r#"{"timestamp":"2026-09-19T18:12:46.000Z","type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"{}","call_id":"c1"}}"#,
+            r#"{"timestamp":"2026-09-19T18:12:46.100Z","type":"response_item","payload":{"type":"function_call_output","call_id":"c1","output":"ok"}}"#,
+            r#"{"timestamp":"2026-09-19T18:12:46.200Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"c2","output":"patched"}}"#,
+            r#"{"timestamp":"2026-09-19T18:12:47.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"fixed"}],"phase":"final_answer"}}"#,
+        ]);
+        let shape: Vec<_> = s.messages.iter().map(|m| (m.role, m.kind, m.origin)).collect();
+        let injected = (Role::User, MessageKind::InjectedContext, Origin::Harness);
+        assert_eq!(
+            shape,
+            vec![
+                (Role::System, MessageKind::InjectedContext, Origin::Harness), // developer preamble
+                injected,                                                      // <environment_context>
+                injected,                                                      // <recommended_plugins>
+                injected,                                                      // <codex_internal_context …>
+                injected,                                                      // AGENTS.md dump
+                injected,                                                      // files-mentioned bundle
+                (Role::User, MessageKind::Prompt, Origin::Human),
+                (Role::Assistant, MessageKind::Reply, Origin::Model),
+                (Role::Assistant, MessageKind::Reply, Origin::Model),
+                (Role::Tool, MessageKind::ToolResult, Origin::Harness),
+                (Role::Tool, MessageKind::ToolResult, Origin::Harness),
+                (Role::Assistant, MessageKind::Reply, Origin::Model),
+            ]
+        );
+        assert_eq!(s.messages[11].extra["codex"]["phase"], "final_answer");
+        assert!(
+            s.messages.iter().all(|m| m.model.is_none()),
+            "no message repeats the session model"
+        );
+
+        // Legacy mode (NL event twins): the `user_message` event decides the same way.
+        let s = parse_jsonl(&[
+            r#"{"timestamp":"2026-01-01T00:00:00Z","type":"event_msg","payload":{"type":"user_message","message":"<environment_context>\n  <cwd>/w</cwd>\n</environment_context>"}}"#,
+            r#"{"timestamp":"2026-01-01T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"hello","kind":"plain"}}"#,
+            r#"{"timestamp":"2026-01-01T00:00:02Z","type":"event_msg","payload":{"type":"agent_message","message":"hi"}}"#,
+        ]);
+        let shape: Vec<_> = s.messages.iter().map(|m| (m.role, m.kind, m.origin)).collect();
+        assert_eq!(
+            shape,
+            vec![
+                injected,
+                (Role::User, MessageKind::Prompt, Origin::Human),
+                (Role::Assistant, MessageKind::Reply, Origin::Model),
+            ]
+        );
+        assert_eq!(s.messages[1].extra["codex"]["kind"], "plain");
+    }
+
+    #[test]
+    fn persisted_error_event_is_an_error_message() {
+        let s = parse_jsonl(&[
+            r#"{"timestamp":"2026-04-28T03:55:07.952Z","type":"event_msg","payload":{"type":"error","message":"You've hit your usage limit. To get more access now, send a request to your admin or try again at 10:56 AM.","codex_error_info":"usage_limit_exceeded"}}"#,
+        ]);
+        let m = &s.messages[0];
+        assert_eq!(
+            (m.role, m.kind, m.origin),
+            (Role::System, MessageKind::Error, Origin::Harness)
+        );
+        assert!(m.text().unwrap().starts_with("You've hit your usage limit."));
+        assert_eq!(m.extra["codex"]["codex_event"], "error");
+        assert_eq!(m.extra["codex"]["error"]["codex_error_info"], "usage_limit_exceeded");
+        assert!(
+            m.extra["codex"]["error"].get("type").is_none(),
+            "the wire `type` is the kind, not a fact"
+        );
+        assert!(m.extra["codex"]["error"]["message"].is_string());
+    }
+
+    #[test]
+    fn session_meta_lineage_and_system_prompt() {
+        let s = parse_jsonl(&[
+            r#"{"timestamp":"2026-09-19T18:12:43.771Z","ordinal":0,"type":"session_meta","payload":{"id":"child-2","session_id":"root-1","parent_thread_id":"parent-1","forked_from_id":"fork-src-1","cwd":"/w","originator":"codex-tui","cli_version":"0.154.0","source":"cli","thread_source":"subagent","agent_path":"/root/reviewer","agent_nickname":"Ada","model_provider":"openai","history_mode":"paginated","subagent_history_start_ordinal":9,"history_base":{"thread_id":"parent-1","end_ordinal_exclusive":9,"end_byte_offset":4096},"base_instructions":{"text":"You are Codex, a coding agent.","provenance":"built_in"}}}"#,
+        ]);
+        assert_eq!(s.lineage.parent.as_deref(), Some("parent-1"));
+        assert_eq!(s.lineage.forked_from.as_deref(), Some("fork-src-1"));
+        assert_eq!(s.lineage.agent_path.as_deref(), Some("/root/reviewer"));
+        assert_eq!(
+            s.lineage.spawned_by_tool_use, None,
+            "Codex does not record the spawning call"
+        );
+        assert_eq!(s.lineage.continued_in, None);
+        assert_eq!(s.system_prompt.as_deref(), Some("You are Codex, a coding agent."));
+        // The session bag: every listed meta fact, and nothing first-class duplicated into it.
+        let bag = s.harness_extra(Harness::Codex).expect("codex bag");
+        let mut keys: Vec<&str> = bag.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "agent_nickname",
+                "cli_version",
+                "history_base",
+                "history_mode",
+                "model_provider",
+                "originator",
+                "session_id",
+                "source",
+                "subagent_history_start_ordinal",
+                "thread_source",
+            ]
+        );
+        assert_eq!(bag["history_base"]["end_ordinal_exclusive"], 9);
+        assert_eq!(
+            s.extra.keys().collect::<Vec<_>>(),
+            vec!["codex"],
+            "session extra is nested only"
+        );
+
+        // Without those fields: empty lineage, no system prompt (a blank one does not count).
+        let s = parse_jsonl(&[
+            r#"{"timestamp":"2026-09-19T18:12:43.771Z","type":"session_meta","payload":{"id":"solo-1","cwd":"/w","base_instructions":{"text":"   "}}}"#,
+        ]);
+        assert!(s.lineage.is_empty());
+        assert_eq!(s.system_prompt, None);
+    }
+
+    /// One paginated thread touching every arm: the v2 shape must hold everywhere — every message
+    /// fact under `extra["codex"]`, `_record` the only other top-level key (complete mode only),
+    /// precise kinds, `Message::model` unset except on the model-change note, `namespace` on the
+    /// block and not in the bag.
+    const EVERY_ARM: &[&str] = &[
+        r#"{"timestamp":"2026-09-19T18:12:43.771Z","ordinal":0,"type":"session_meta","payload":{"id":"nest-1","timestamp":"2026-09-19T18:12:43.771Z","cwd":"/w","originator":"codex-tui","cli_version":"0.154.0","source":"cli","thread_source":"user","model_provider":"openai","history_mode":"paginated","base_instructions":{"text":"You are Codex."}}}"#,
+        r#"{"timestamp":"2026-09-19T18:12:43.780Z","ordinal":1,"type":"turn_context","payload":{"turn_id":"t0","cwd":"/w","model":"gpt-6-astra","effort":"high","approval_policy":"never","sandbox_policy":{"type":"danger-full-access"},"summary":"auto"}}"#,
+        r#"{"timestamp":"2026-09-19T18:12:43.790Z","ordinal":2,"type":"event_msg","payload":{"type":"task_started","turn_id":"t0","model_context_window":258400}}"#,
+        r#"{"timestamp":"2026-09-19T18:12:44.000Z","ordinal":3,"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>\n  <cwd>/w</cwd>\n</environment_context>"}]}}"#,
+        r#"{"timestamp":"2026-09-19T18:12:44.001Z","ordinal":4,"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"please fix the build"}],"internal_chat_message_metadata_passthrough":{"turn_id":"t0","create_time":1789845000.5}}}"#,
+        r#"{"timestamp":"2026-09-19T18:12:45.000Z","ordinal":5,"type":"response_item","payload":{"type":"reasoning","summary":[{"type":"summary_text","text":"thinking"}],"encrypted_content":"ENC"}}"#,
+        r#"{"timestamp":"2026-09-19T18:12:46.000Z","ordinal":6,"type":"response_item","payload":{"type":"function_call","id":"fc_1","name":"spawn","namespace":"collaboration","arguments":"{\"agent\":\"helper\"}","call_id":"call_1"}}"#,
+        r#"{"timestamp":"2026-09-19T18:12:46.100Z","ordinal":7,"type":"response_item","payload":{"type":"function_call_output","call_id":"call_1","name":"spawn","namespace":"collaboration","output":"spawned"}}"#,
+        r#"{"timestamp":"2026-09-19T18:12:46.200Z","ordinal":8,"type":"event_msg","payload":{"type":"item_completed","thread_id":"nest-1","turn_id":"t0","item":{"type":"SubAgentActivity","id":"call_1","kind":"started","agent_thread_id":"child-9","agent_path":"/root/helper"},"completed_at_ms":1789845006200}}"#,
+        r##"{"timestamp":"2026-09-19T18:12:47.000Z","ordinal":9,"type":"world_state","payload":{"agents_md":"# AGENTS.md"}}"##,
+        r#"{"timestamp":"2026-09-19T18:12:48.000Z","ordinal":10,"type":"inter_agent_communication_metadata","payload":{"trigger_turn":false}}"#,
+        r#"{"timestamp":"2026-09-19T18:12:48.001Z","ordinal":11,"type":"response_item","payload":{"type":"agent_message","id":"amsg_1","author":"/root/helper","recipient":"/root","content":[{"type":"input_text","text":"Message Type: MESSAGE\nPayload: done"}]}}"#,
+        r#"{"timestamp":"2026-09-19T18:12:49.000Z","ordinal":12,"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"fixed"}],"phase":"final_answer"}}"#,
+        r#"{"timestamp":"2026-09-19T18:12:49.100Z","ordinal":13,"type":"token_usage_record","payload":{"thread_id":"nest-1","turn_id":"t0","response_id":"resp_1","usage":{"input_tokens":100,"cached_input_tokens":50,"cache_write_input_tokens":5,"output_tokens":20,"reasoning_output_tokens":7,"total_tokens":120},"thread_token_usage":{"input_tokens":100}}}"#,
+        r#"{"timestamp":"2026-09-19T18:12:49.200Z","ordinal":14,"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"cached_input_tokens":50,"cache_write_input_tokens":5,"output_tokens":20,"reasoning_output_tokens":7,"total_tokens":120},"model_context_window":258400},"rate_limits":{"primary":{"used_percent":7.0}}}}"#,
+        r#"{"timestamp":"2026-09-19T18:12:49.300Z","ordinal":15,"type":"event_msg","payload":{"type":"task_complete","turn_id":"t0","last_agent_message":"fixed"}}"#,
+        r#"{"timestamp":"2026-09-19T18:12:50.000Z","ordinal":16,"type":"event_msg","payload":{"type":"thread_settings_applied","thread_id":"nest-1","thread_settings":{"model":"gpt-6-vega","model_provider_id":"openai","reasoning_effort":"high","cwd":"/w"}}}"#,
+        r#"{"timestamp":"2026-09-19T18:12:51.000Z","ordinal":17,"type":"compacted","payload":{"message":"","replacement_history":[{"type":"compaction","encrypted_content":"ENC"}],"window_number":1}}"#,
+        r#"{"timestamp":"2026-09-19T18:12:52.000Z","ordinal":18,"type":"event_msg","payload":{"type":"turn_aborted","turn_id":"t1","reason":"interrupted"}}"#,
+        r#"{"timestamp":"2026-09-19T18:12:53.000Z","ordinal":19,"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":1}}"#,
+        r#"{"timestamp":"2026-09-19T18:12:54.000Z","ordinal":20,"type":"event_msg","payload":{"type":"error","message":"You've hit your usage limit.","codex_error_info":"usage_limit_exceeded"}}"#,
+    ];
+
+    #[test]
+    fn every_arm_has_a_precise_kind_and_nothing_flat() {
+        let s = parse_jsonl(EVERY_ARM);
+        let shape: Vec<_> = s.messages.iter().map(|m| (m.role, m.kind, m.origin)).collect();
+        assert_eq!(
+            shape,
+            vec![
+                (Role::User, MessageKind::InjectedContext, Origin::Harness),
+                (Role::User, MessageKind::Prompt, Origin::Human),
+                (Role::Assistant, MessageKind::Reply, Origin::Model), // reasoning
+                (Role::Assistant, MessageKind::Reply, Origin::Model), // spawn call
+                (Role::Tool, MessageKind::ToolResult, Origin::Harness),
+                (Role::System, MessageKind::SubagentSpawn, Origin::Harness),
+                (Role::User, MessageKind::Prompt, Origin::Subagent), // helper → /root
+                (Role::Assistant, MessageKind::Reply, Origin::Model), // "fixed" (+usage)
+                (Role::System, MessageKind::ModelChange, Origin::Harness),
+                (Role::System, MessageKind::CompactionBoundary, Origin::Harness),
+                (Role::System, MessageKind::Notice, Origin::Harness), // turn_aborted
+                (Role::System, MessageKind::Branch, Origin::Harness), // thread_rolled_back
+                (Role::System, MessageKind::Error, Origin::Harness),
+            ],
+            "lean: no carriers, every kind precise"
+        );
+        // Nothing flat, anywhere; no `_record` in a lean pass.
+        for m in &s.messages {
+            let keys: Vec<&String> = m.extra.keys().collect();
+            assert!(
+                keys.iter().all(|k| *k == "codex"),
+                "flat key(s) on {:?}: {keys:?}",
+                m.kind
+            );
+        }
+        assert_eq!(s.extra.keys().collect::<Vec<_>>(), vec!["codex"]);
+        assert_eq!(s.system_prompt.as_deref(), Some("You are Codex."));
+        assert_eq!(s.model.as_deref(), Some("gpt-6-vega"));
+        assert_eq!(s.extra["codex"]["reasoning_effort"], "high");
+        assert_eq!(s.extra["codex"]["last_agent_message"], "fixed");
+        assert_eq!(s.extra["codex"]["thread_settings"]["model"], "gpt-6-vega");
+        // `Message::model` only on the model-change note (the session default covers the rest).
+        for m in &s.messages {
+            assert_eq!(
+                m.model.as_deref(),
+                (m.kind == MessageKind::ModelChange).then_some("gpt-6-vega"),
+                "{:?}",
+                m.kind
+            );
+        }
+        // namespace: on the block, not in the call's bag; the output keeps it in the bag (no
+        // block field for it) alongside `tool_name`.
+        let call = &s.messages[3];
+        assert!(matches!(
+            &call.content[0],
+            Block::ToolUse { name, namespace: Some(ns), .. } if name == "spawn" && ns == "collaboration"
+        ));
+        assert!(bag_get(call, "namespace").is_none());
+        assert_eq!(s.messages[4].extra["codex"]["namespace"], "collaboration");
+        // Usage from the record (with the token_count snapshot merged) on the reply it trails.
+        let reply = &s.messages[7];
+        let u = reply.usage.as_ref().expect("usage");
+        assert_eq!(
+            (
+                u.input_tokens,
+                u.cache_read_tokens,
+                u.cache_creation_tokens,
+                u.output_tokens,
+                u.reasoning_tokens
+            ),
+            (Some(100), Some(50), Some(5), Some(20), Some(7))
+        );
+        assert_eq!(reply.extra["codex"]["phase"], "final_answer");
+        assert_eq!(reply.extra["codex"]["usage_source"], "token_usage_record");
+        assert!(reply.extra["codex"].get("rate_limits").is_some());
+        // The exact per-message bag keys, so a new flat-looking key cannot sneak in unnoticed.
+        let keys = |i: usize| -> Vec<String> {
+            let mut k: Vec<String> = s.messages[i].extra["codex"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect();
+            k.sort_unstable();
+            k
+        };
+        assert_eq!(keys(1), vec!["turn_id"]);
+        assert_eq!(
+            keys(5),
+            vec![
+                "agent_path",
+                "agent_thread_id",
+                "codex_event",
+                "completed_at_ms",
+                "item",
+                "item_type",
+                "turn_id"
+            ]
+        );
+        assert_eq!(keys(6), vec!["author", "codex_event", "recipient", "trigger_turn"]);
+        assert_eq!(
+            keys(7),
+            vec![
+                "model_context_window",
+                "phase",
+                "rate_limits",
+                "response_id",
+                "thread_token_usage",
+                "turn_id",
+                "usage_source"
+            ]
+        );
+        assert_eq!(keys(8), vec!["codex_event"]);
+        assert_eq!(keys(9), vec!["codex_event", "replacement_history_len", "window_number"]);
+        assert_eq!(keys(10), vec!["codex_event", "reason", "turn_id"]);
+        assert_eq!(keys(11), vec!["codex_event", "num_turns"]);
+        assert_eq!(keys(12), vec!["codex_event", "error"]);
+        // parse == stream
+        let streamed = stream_jsonl_with(EVERY_ARM, &ParseOptions::full());
+        assert_eq!(
+            serde_json::to_value(&s).unwrap(),
+            serde_json::to_value(&streamed).unwrap()
+        );
+    }
+
+    #[test]
+    fn complete_mode_carries_lifecycle_and_unknown_records_verbatim() {
+        let lean = parse_jsonl(EVERY_ARM);
+        assert!(lean.messages.iter().all(|m| m.kind != MessageKind::Carrier));
+        let complete = stream_jsonl_with(EVERY_ARM, &ParseOptions::complete());
+        let carriers: Vec<(&str, &str)> = complete
+            .messages
+            .iter()
+            .filter(|m| m.kind == MessageKind::Carrier)
+            .map(|m| {
+                let record = &m.extra[super::super::claude::CARRIER_KEY];
+                (
+                    m.extra["codex"]["record_type"].as_str().unwrap(),
+                    record
+                        .pointer("/payload/type")
+                        .and_then(Value::as_str)
+                        .unwrap_or(record["type"].as_str().unwrap()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            carriers,
+            vec![
+                ("event_msg", "task_started"),
+                ("world_state", "world_state"),
+                ("event_msg", "task_complete"),
+            ],
+            "lifecycle markers and unmodelled record types ride verbatim; represented records do not"
+        );
+        assert_eq!(complete.messages.len(), lean.messages.len() + carriers.len());
+        for m in &complete.messages {
+            let allowed = |k: &String| k == "codex" || k == super::super::claude::CARRIER_KEY;
+            assert!(m.extra.keys().all(allowed), "{:?}", m.extra.keys().collect::<Vec<_>>());
+            assert_eq!(
+                m.extra.contains_key(super::super::claude::CARRIER_KEY),
+                m.kind == MessageKind::Carrier,
+                "`_record` marks exactly the carriers"
+            );
+        }
+        let ws = complete
+            .messages
+            .iter()
+            .find(|m| bag_get(m, "record_type").and_then(Value::as_str) == Some("world_state"))
+            .unwrap();
+        assert_eq!((ws.role, ws.origin), (Role::System, Origin::Harness));
+        assert_eq!(
+            ws.extra[super::super::claude::CARRIER_KEY]["payload"]["agents_md"],
+            "# AGENTS.md"
+        );
+        assert!(ws.content.is_empty());
     }
 }

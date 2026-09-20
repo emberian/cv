@@ -1,0 +1,114 @@
+# formats/claude.toml — the vocabulary cv's `claude` adapter is checked against (docs/INTERFACE-V2.md §7).
+# status: handled = per-item arm in the adapter; generic = interpreted by a blanket rule; carried = verbatim
+# under ParseOptions::complete only; ignored = known and deliberately skipped. Regenerate: tools/gen-manifests (or edit by hand).
+
+harness = "claude"
+source_files = ["harness/claude.rs", "harness/claude_workflow.rs"]
+ignore_literals = ["jsonl", "json", "base64", "url"]
+store = [
+  "~/.claude/projects/<encoded-cwd>/<sessionId>.jsonl",
+  "~/.claude/projects/<encoded-cwd>/<sessionId>/subagents/agent-*.jsonl",
+  "~/.claude/projects/<encoded-cwd>/<sessionId>/subagents/workflows/<run>/agent-*.jsonl",
+  "~/.claude/projects/<encoded-cwd>/<sessionId>/workflows/<run>.json",
+  "~/.claude/projects/<encoded-cwd>/<sessionId>/tool-results/<id>.txt",
+  "~/.claude/history.jsonl",
+  "~/.claude/sessions/<pid>.json",
+]
+
+[upstream]
+repo = "Claude Code (Bun binary, ~/.local/share/claude/versions/<v>)"
+commit = "2.1.278"
+date = "2026-09-19"
+
+[types]
+user = { status = "handled", note = "a turn (prompt or tool results)" }
+assistant = { status = "handled", note = "a reply; one line per streamed block" }
+system = { status = "handled", note = "subtyped notice" }
+attachment = { status = "handled", note = "model-visible when `rendered[]` is present → injected context; else bookkeeping" }
+summary = { status = "handled", note = "legacy title record; no longer written since ~2.1.25x" }
+"ai-title" = { status = "handled", note = "model-generated title, rewritten per prompt" }
+"custom-title" = { status = "handled", note = "/rename title; outranks ai-title" }
+tag = { status = "handled", note = "/tag" }
+"agent-name" = { status = "handled", note = "derived session name" }
+mode = { status = "carried", note = "UI mode" }
+"permission-mode" = { status = "carried", note = "permission mode" }
+"atis-latch" = { status = "carried", note = "latch state" }
+"last-prompt" = { status = "carried", note = "loader leaf pointer {leafUuid, lastPrompt, explicit?, rewound?}" }
+"queue-operation" = { status = "carried", note = "input queue" }
+"cost-state" = { status = "carried", note = "cumulative cost / durations / modelUsage" }
+"continued-in" = { status = "handled", note = "→ Session.lineage.continued_in" }
+relocated = { status = "handled", note = "fork's relocated cwd" }
+"pr-link" = { status = "handled", note = "linked PR" }
+"frame-link" = { status = "carried", note = "artifact frame link" }
+"content-replacement" = { status = "carried", note = "load-time replacements (forks / microcompact)" }
+"artifact-comment-monitor" = { status = "carried", note = "artifact watch" }
+"artifact-autoreact-ledger" = { status = "carried", note = "artifact watch" }
+"file-history-snapshot" = { status = "carried", note = "file history" }
+progress = { status = "carried", note = "legacy sub-agent telemetry" }
+started = { status = "carried", note = "legacy sub-agent telemetry" }
+result = { status = "carried", note = "legacy sub-agent telemetry / journal result" }
+"x-quota" = { status = "carried", note = "quota record" }
+"system.compact_boundary" = { status = "handled", note = "compaction boundary + compactMetadata" }
+"system.local_command" = { status = "handled", note = "slash command in/out" }
+"system.away_summary" = { status = "generic", note = "no arm of its own: the `_` arm of system_msg makes every other subtype a Notice/Harness" }
+"system.api_error" = { status = "handled", note = "notice" }
+"system.scheduled_task_fire" = { status = "handled", note = "/loop, cron wakeups" }
+"system.informational" = { status = "generic", note = "same `_` arm as away_summary" }
+"system.model_refusal_fallback" = { status = "handled", note = "refusal re-route" }
+"system.stop_hook_summary" = { status = "handled", note = "Stop hook record" }
+"origin.human" = { status = "handled", note = "`origin.kind` on a user record; anything else is Origin::Harness" }
+"system.turn_duration" = { status = "handled", note = "bodyless timing" }
+"system.agents_killed" = { status = "handled", note = "bodyless" }
+"block.text" = { status = "handled", note = "" }
+"block.thinking" = { status = "handled", note = "signature-only in Fable-era transcripts" }
+"block.redacted_thinking" = { status = "handled", note = "" }
+"block.tool_use" = { status = "handled", note = "" }
+"block.tool_result" = { status = "handled", note = "+ toolUseResult sidecar; persisted-output stubs annotated" }
+"block.image" = { status = "handled", note = "" }
+"block.document" = { status = "handled", note = "→ File" }
+"image_source.base64" = { status = "handled", note = "" }
+"image_source.url" = { status = "handled", note = "" }
+"image_source.file" = { status = "handled", note = "Files-API id" }
+"attachment.hook_success" = { status = "generic", note = "rendered → injected context" }
+"attachment.total_tokens_reminder" = { status = "generic", note = "rendered → injected context" }
+"attachment.batching_reminder_sent" = { status = "generic", note = "rendered → injected context" }
+"attachment.bash_output_audience_note" = { status = "generic", note = "rendered → injected context" }
+"attachment.queued_command" = { status = "generic", note = "rendered → injected context" }
+"attachment.silent_turn_reminder" = { status = "generic", note = "rendered → injected context" }
+"attachment.edited_text_file" = { status = "generic", note = "rendered → injected context" }
+"attachment.task_reminder" = { status = "generic", note = "rendered → injected context" }
+"attachment.deferred_tools_delta" = { status = "generic", note = "rendered → injected context" }
+"attachment.agent_listing_delta" = { status = "generic", note = "rendered → injected context" }
+"attachment.mcp_instructions_delta" = { status = "generic", note = "rendered → injected context" }
+"attachment.skill_listing" = { status = "generic", note = "rendered → injected context" }
+"attachment.command_permissions" = { status = "generic", note = "rendered → injected context" }
+"attachment.environment" = { status = "generic", note = "rendered → injected context" }
+"attachment.date" = { status = "generic", note = "rendered → injected context" }
+"attachment.date_change" = { status = "generic", note = "rendered → injected context" }
+"attachment.model" = { status = "generic", note = "rendered → injected context" }
+"attachment.instructions" = { status = "generic", note = "rendered → injected context" }
+"attachment.session_context" = { status = "generic", note = "rendered → injected context" }
+"attachment.remote_session_change" = { status = "generic", note = "rendered → injected context" }
+"attachment.prompt_snapshot" = { status = "generic", note = "rendered → injected context" }
+"attachment.auto_mode" = { status = "generic", note = "rendered → injected context" }
+"attachment.goal_status" = { status = "generic", note = "rendered → injected context" }
+"attachment.task_status" = { status = "generic", note = "rendered → injected context" }
+"attachment.file" = { status = "generic", note = "rendered → injected context" }
+"attachment.compact_file_reference" = { status = "generic", note = "rendered → injected context" }
+"attachment.thinking_drop" = { status = "generic", note = "rendered → injected context" }
+"attachment.deferred_tools_record" = { status = "generic", note = "rendered → injected context" }
+"attachment.hook_cancelled" = { status = "generic", note = "rendered → injected context" }
+"attachment.hook_system_message" = { status = "generic", note = "rendered → injected context" }
+"attachment.hook_additional_context" = { status = "generic", note = "rendered → injected context" }
+"attachment.invoked_skills" = { status = "generic", note = "rendered → injected context" }
+"attachment.plan_mode_exit" = { status = "generic", note = "rendered → injected context" }
+"attachment.read_truncation_notice" = { status = "generic", note = "rendered → injected context" }
+"workflow.workflow_phase" = { status = "handled", note = "phase header in workflowProgress" }
+"workflow.workflow_agent" = { status = "handled", note = "agent row in workflowProgress" }
+"workflow.Workflow" = { status = "handled", note = "the Workflow tool name" }
+"workflow.started" = { status = "handled", note = "journal line" }
+"workflow.result" = { status = "handled", note = "journal line" }
+# Store layout the adapter walks (see `store` above) — path segments, not record types.
+"path.subagents" = { status = "handled", note = "<sessionId>/subagents/agent-*.jsonl" }
+"path.workflows" = { status = "handled", note = "<sessionId>/subagents/workflows/<run>/" }
+"assistant.synthetic" = { status = "generic", note = "model `<synthetic>` / isApiErrorMessage → System notice or error" }

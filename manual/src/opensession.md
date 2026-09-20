@@ -2,8 +2,9 @@
 
 After reverse-engineering seventeen different transcript formats, one thing was obvious: they're all
 *almost the same thing* underneath. **OpenSession** is the format they should have agreed on — a
-small, honest, harness-neutral interchange format. clustervision's internal IR is its reference
-implementation, and `.opensession.json` is a first-class import/export format in the app and CLI.
+small, honest, harness-neutral interchange format, written down as a proposal for harness authors.
+clustervision's internal [IR](architecture.md#the-unified-ir) is its reference implementation: the
+same spine, the same blocks, the same heresy about `cwd`.
 
 The full spec lives at **[docs/OPENSESSION.md](https://github.com/emberian/cv/blob/main/docs/OPENSESSION.md)**. The essentials:
 
@@ -33,6 +34,12 @@ The full spec lives at **[docs/OPENSESSION.md](https://github.com/emberian/cv/bl
   ]
 }
 ```
+
+> **Spelling note.** The OpenSession document above is camelCase, as published. cv's *own*
+> machine output is not: since 0.11.0 every `cv --json` payload and every MCP payload is
+> **snake_case** (`tool_use_id`, `media_type`, `message_count`), a message carries `kind` and
+> `origin`, and a block is tagged `type` rather than `kind`. If you are consuming `cv`, follow
+> [`cv schema --json`](cli.md#cv-schema), not this page.
 
 ## The one heresy: *cwd is metadata, not identity*
 

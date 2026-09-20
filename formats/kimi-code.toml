@@ -1,0 +1,67 @@
+# formats/kimi-code.toml — the vocabulary cv's `kimi-code` adapter is checked against (docs/INTERFACE-V2.md §7).
+# status: handled = per-item arm in the adapter; generic = interpreted by a blanket rule; carried = verbatim
+# under ParseOptions::complete only; ignored = known and deliberately skipped. Regenerate: tools/gen-manifests (or edit by hand).
+
+harness = "kimi-code"
+source_files = ["harness/kimi_code.rs"]
+ignore_literals = ["wire.jsonl", "session_index.jsonl", "tool-results"]
+store = [
+  "$KIMI_CODE_HOME or ~/.kimi-code/sessions/wd_<slug>_<sha256[:12]>/session_<uuid>/agents/<id>/wire.jsonl",
+  "…/state.json",
+  "~/.kimi-code/session_index.jsonl",
+]
+
+[upstream]
+repo = "Kimi Code bundle (@moonshot-ai/kimi-code 0.39.1, dist/main.mjs)"
+commit = "0.39.1"
+date = "2026-09-19"
+
+[types]
+"record.metadata" = { status = "handled", note = "header {protocol_version, created_at}" }
+"record.profile.bind" = { status = "handled", note = "model + system prompt" }
+"record.config.update" = { status = "handled", note = "" }
+"record.context.append_message" = { status = "handled", note = "user / injected prompt" }
+"record.context.append_loop_event" = { status = "handled", note = "one LLM step" }
+"record.context.apply_compaction" = { status = "handled", note = "→ compaction boundary" }
+"record.task.terminated" = { status = "handled", note = "→ notice" }
+"record.turn.cancel" = { status = "handled", note = "→ notice" }
+"record.turn.prompt" = { status = "ignored", note = "UI twin of append_message" }
+"record.turn.steer" = { status = "ignored", note = "" }
+"record.turn.ended" = { status = "carried", note = "" }
+"record.usage.record" = { status = "carried", note = "per-turn totals" }
+"record.llm.request" = { status = "carried", note = "" }
+"record.llm.tools_snapshot" = { status = "carried", note = "" }
+"record.permission.*" = { status = "carried", note = "" }
+"record.tools.*" = { status = "carried", note = "" }
+"record.token_counting.*" = { status = "carried", note = "" }
+"record.task.started" = { status = "carried", note = "" }
+"record.plan_mode.*" = { status = "carried", note = "" }
+"record.swarm_mode.*" = { status = "carried", note = "" }
+"record.full_compaction.*" = { status = "carried", note = "" }
+# Found by `cv formats census` on 2026-09-19 against 20 real ~/.kimi-code sessions — not in the
+# 0.39.1 bundle read-through, so the census is how we learned about them.
+"record.plugin.session_start" = { status = "carried", note = "plugin lifecycle" }
+"record.prompt.accepted" = { status = "carried", note = "UI twin of turn.prompt" }
+"record.runtime.set_binding" = { status = "carried", note = "" }
+"record.staleGuard.recorded" = { status = "carried", note = "" }
+"record.interruptionReminder.recorded" = { status = "carried", note = "" }
+"event.step.begin" = { status = "handled", note = "" }
+"event.content.part" = { status = "handled", note = "" }
+"event.tool.call" = { status = "handled", note = "args object → ToolUse" }
+"event.tool.result" = { status = "handled", note = "→ Tool turn; output_path → persisted" }
+"event.step.end" = { status = "handled", note = "usage, messageId, finishReason" }
+"part.text" = { status = "generic", note = "" }
+"part.think" = { status = "handled", note = "empty think parts skipped" }
+"part.image_url" = { status = "generic", note = "" }
+"agent.main" = { status = "generic", note = "the session" }
+"agent.sub" = { status = "handled", note = "→ Session.extra agents" }
+"role.assistant" = { status = "handled", note = "message.role" }
+"role.tool" = { status = "handled", note = "message.role" }
+"role.system" = { status = "handled", note = "message.role" }
+"role.user" = { status = "generic", note = "the `_` arm: user and anything unknown" }
+# `message.origin.kind` — who put the text in the user slot.
+"origin.user" = { status = "handled", note = "a typed prompt" }
+"origin.background_task" = { status = "handled", note = "-> InjectedContext/Scheduler" }
+"origin.task" = { status = "handled", note = "-> InjectedContext/Scheduler" }
+"origin.injection" = { status = "generic", note = "injection/system_trigger/unknown -> InjectedContext/Harness" }
+"path.agents" = { status = "handled", note = "session_<uuid>/agents/<id>/wire.jsonl" }

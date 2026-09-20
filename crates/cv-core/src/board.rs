@@ -999,16 +999,17 @@ mod tests {
     #[test]
     fn expired_claim_is_stealable() {
         let dir = tmp_board();
-        // Tiny ttl so it lapses almost immediately.
-        let lease = claim_in_dir(&dir, "ch", "alice", "k", Duration::from_millis(20))
-            .unwrap()
-            .unwrap();
-        // Immediately, bob is blocked.
+        // A short ttl so it lapses during the test, but long enough that the "still held" check
+        // below cannot lose a race with it: under a loaded test runner a 20ms budget expired
+        // before bob's first attempt ran, and the assertion failed spuriously.
+        let ttl = Duration::from_millis(300);
+        let lease = claim_in_dir(&dir, "ch", "alice", "k", ttl).unwrap().unwrap();
+        // While alice's lease is live, bob is blocked.
         assert!(claim_in_dir(&dir, "ch", "bob", "k", Duration::from_secs(60))
             .unwrap()
             .is_none());
         // Wait past the ttl; now bob can steal it.
-        std::thread::sleep(Duration::from_millis(40));
+        std::thread::sleep(ttl + Duration::from_millis(100));
         let stolen = claim_in_dir(&dir, "ch", "bob", "k", Duration::from_secs(60)).unwrap();
         assert!(stolen.is_some());
         assert_eq!(stolen.unwrap().owner, "bob");

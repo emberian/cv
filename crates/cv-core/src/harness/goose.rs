@@ -73,8 +73,23 @@
 //! `toolResult.value` may also be a **bare content array** (the legacy `SuccessWithContentVec` shape
 //! Goose still accepts, `tool_result_serde.rs:132-146`), and result content blocks may be rmcp 3.x
 //! `text|image|audio|resource|resource_link`. `toolConfirmationRequest`, `actionRequired` and
-//! `systemNotification` are UI/control content and are skipped; `frontendToolRequest` (removed
-//! 2026-08) is still read from old rows.
+//! `systemNotification` are UI/control content: rendered as text the way Goose's own `Display`
+//! prints them, kept verbatim in `extra["goose"]["control_blocks"]`, and a message that is nothing
+//! but control content is a [`MessageKind::Notice`]. `frontendToolRequest` (removed 2026-08) is
+//! still read from old rows.
+//!
+//! ## Kinds (`docs/INTERFACE-V2.md` §4)
+//! A `userVisible: false` row is text the harness fed the model and never showed the person — the
+//! per-turn `<turn-context>` block (`turnContext: true`), the agent-only rows compaction leaves
+//! behind — so it is a System turn: [`MessageKind::CompactionSummary`] when its
+//! `usage.isCompaction` says so (`context_mgmt/mod.rs:136-160`: the summary is `agent_only()`),
+//! else [`MessageKind::InjectedContext`]. A row holding an `error` block is a [`MessageKind::Error`]
+//! (`extra["goose"]["error"]` = `{kind, message}`). The origin of a prompt follows the session's
+//! `session_type`: `scheduled` → [`Origin::Scheduler`], `sub_agent` → [`Origin::Subagent`],
+//! `hidden` (Goose's own helper runs) → [`Origin::Harness`], everything else a person. Goose 1.51
+//! stores NO import provenance (`goose session import` forces `session_type = user`,
+//! `import_formats/mod.rs:46`), so [`Origin::Import`] is never derivable from the store today.
+//! `parent_session_id` → `Session::lineage.parent`; `metadata_json.usage.cost` → `Usage::cost_usd`.
 //! Goose uses MCP-style tools: a `toolRequest` is the assistant's call (rmcp `CallToolRequestParams`
 //! = `{name, arguments}`); a `toolResponse` is the result (rmcp `CallToolResult` =
 //! `{content:[Content…], isError}`). On error the inner wrapper is `{"status":"error","error":"…"}`.
@@ -355,15 +370,21 @@ fn stream_db(conn: &Connection, r: &SessionRef, sink: &mut dyn MessageSink) -> R
         .unwrap_or((None, None, None, None, None, None, None, None));
 
     let model = reconstruct_model(provider.as_deref(), model_cfg.as_deref());
-    // Session-level facts with no first-class IR home: the kind (`user`/`sub_agent`/`hidden`/…, v13+)
-    // and the spawning session for sub-agents (`parent_session_id`, v15+).
+    // The session's kind (`user`/`scheduled`/`sub_agent`/`hidden`/…, v13+) is a Goose fact and
+    // decides where its prompts came from; the spawning session of a sub-agent (`parent_session_id`,
+    // v15+) is first-class lineage.
+    let session_type = session_type.filter(|t| !t.is_empty());
+    let prompt_origin = prompt_origin(session_type.as_deref());
     let mut extra = serde_json::Map::new();
-    if let Some(t) = session_type.filter(|t| !t.is_empty()) {
-        extra.insert("session_type".into(), Value::String(t));
+    if let Some(t) = session_type {
+        let mut bag = serde_json::Map::new();
+        bag.insert("session_type".into(), Value::String(t));
+        extra.insert(Harness::Goose.as_str().into(), Value::Object(bag));
     }
-    if let Some(pid) = parent_id.filter(|p| !p.is_empty()) {
-        extra.insert("parent_session_id".into(), Value::String(pid));
-    }
+    let lineage = Lineage {
+        parent: parent_id.filter(|p| !p.is_empty()),
+        ..Default::default()
+    };
 
     let s = Session {
         id: r.id.clone(),
@@ -381,7 +402,7 @@ fn stream_db(conn: &Connection, r: &SessionRef, sink: &mut dyn MessageSink) -> R
         source_path: Some(r.path.clone()),
         extra,
         system_prompt: None,
-        lineage: crate::ir::Lineage::default(),
+        lineage,
     };
     // All session metadata is known up front, so hand it to the sink before the body.
     sink.meta(&s);
@@ -415,15 +436,48 @@ fn stream_db(conn: &Connection, r: &SessionRef, sink: &mut dyn MessageSink) -> R
 
     // Track tool-request names so we can label later tool responses (forward-only state).
     let mut tool_names: HashMap<String, String> = HashMap::new();
-    for row in rows {
+    for (idx, row) in rows.enumerate() {
         let Ok(row) = row else { continue };
-        if let Some(m) = row.into_message(&mut tool_names) {
-            if sink.message(m) == Flow::Stop {
+        let Some(mut m) = row.into_message(&mut tool_names, s.model.as_deref()) else {
+            continue;
+        };
+        if m.kind == MessageKind::Prompt {
+            m.origin = prompt_origin;
+        }
+        // A compaction summary: emit the boundary marker first, then the summary linked to it by
+        // `parent_id` — the `CompactionBoundary` + `CompactionSummary` pair `crate::compaction`
+        // detects for every harness.
+        if m.kind == MessageKind::CompactionSummary {
+            let boundary_id = format!("compact-{}", m.id.as_deref().unwrap_or(&idx.to_string()));
+            let mut boundary = Message::of_kind(Role::System, MessageKind::CompactionBoundary, Origin::Harness);
+            boundary.id = Some(boundary_id.clone());
+            boundary.timestamp = m.timestamp;
+            boundary.content.push(Block::Text {
+                text: "[conversation compacted]".to_string().into(),
+            });
+            if sink.message(boundary) == Flow::Stop {
                 break;
             }
+            m.parent_id = Some(boundary_id);
+        }
+        if sink.message(m) == Flow::Stop {
+            break;
         }
     }
     Ok(s)
+}
+
+/// Where a session's prompts came from, by its `session_type` (`SessionType`,
+/// session_manager.rs:47-56): a scheduler fires a `scheduled` session's recipe prompt, a parent
+/// agent instructs a `sub_agent`, Goose itself composes a `hidden` helper run's prompt
+/// (`tool_call_labels.rs`, `prompt_manager.rs`); `user` / `terminal` / `gateway` / `acp` are a person.
+fn prompt_origin(session_type: Option<&str>) -> Origin {
+    match session_type {
+        Some("scheduled") => Origin::Scheduler,
+        Some("sub_agent") => Origin::Subagent,
+        Some("hidden") => Origin::Harness,
+        _ => Origin::Human,
+    }
 }
 
 struct DbMsg {
@@ -437,48 +491,52 @@ struct DbMsg {
 }
 
 impl DbMsg {
-    fn into_message(self, tool_names: &mut HashMap<String, String>) -> Option<Message> {
+    fn into_message(self, tool_names: &mut HashMap<String, String>, session_model: Option<&str>) -> Option<Message> {
         let content: Value = serde_json::from_str(&self.content_json).unwrap_or(Value::Null);
-        let blocks = content_to_blocks(&content, tool_names);
+        let decoded = decode_content(&content, tool_names);
         let mut m = build_message(
             &self.role,
             self.id,
             self.created.and_then(secs_to_dt),
             self.tokens,
-            blocks,
+            decoded,
         )?;
         if let Some(meta) = self
             .metadata
             .as_deref()
             .and_then(|j| serde_json::from_str::<Value>(j).ok())
         {
-            apply_metadata(&mut m, meta);
+            apply_metadata(&mut m, meta, session_model);
         }
         Some(m)
     }
 }
 
 /// Fold a row's `metadata_json` (`MessageMetadata`, message.rs:828-853) into the message: `usage.*`
-/// → [`Usage`] (real per-response counts; the `tokens` column is never written), the inference's
-/// resolved (else requested) model → `model`, and the whole object under `extra["goose_metadata"]`
-/// so `userVisible`/`agentVisible`/`isCompaction`/cost/latency survive for consumers that care.
+/// → [`Usage`] (real per-response counts and the provider-reported `cost`; the `tokens` column is
+/// never written), the inference's `provider/model` → `model` when it differs from the session's,
+/// and the whole object under `extra["goose"]["metadata"]` so `userVisible` / `agentVisible` /
+/// `isCompaction` / latency survive for consumers that care.
 ///
-/// Visibility re-roles the turn the way Goose itself treats it: a row with `userVisible: false`
-/// is text the harness injected for the model — the per-turn `<turn-context>` block
-/// (`turnContext: true`, written on every prompt by 1.51's agent), steering/notification rows —
+/// Visibility types the turn the way Goose itself treats it: a row with `userVisible: false` is text
+/// the harness fed the model — the per-turn `<turn-context>` block (`turnContext: true`, written on
+/// every prompt by 1.51's agent), the agent-only summary + continuation compaction leaves behind —
 /// and Goose never shows it to the user (`session_manager.rs:742` hides `userVisible = 0`). It
-/// becomes a [`Role::System`] turn (`extra.subtype` = `turn_context` or `hidden`), matching how the
-/// Claude adapter surfaces system reminders, so a user-text count or a `cv show` reads as the user
-/// saw it while the model-visible context is still there. Verified on a real 1.51.0 store.
-fn apply_metadata(m: &mut Message, meta: Value) {
-    if meta.get("userVisible") == Some(&Value::Bool(false)) && m.role == Role::User {
+/// becomes a [`Role::System`] turn of kind [`MessageKind::CompactionSummary`] (when
+/// `usage.isCompaction`) or [`MessageKind::InjectedContext`], so a user-text count or a `cv show`
+/// reads as the user saw it while the model-visible context is still there. Verified on a real
+/// 1.51.0 store.
+fn apply_metadata(m: &mut Message, meta: Value, session_model: Option<&str>) {
+    let hidden = meta.get("userVisible") == Some(&Value::Bool(false));
+    let compaction = meta.pointer("/usage/isCompaction") == Some(&Value::Bool(true));
+    if hidden && matches!(m.role, Role::User | Role::Assistant) {
         m.role = Role::System;
-        let subtype = if meta.get("turnContext") == Some(&Value::Bool(true)) {
-            "turn_context"
-        } else {
-            "hidden"
-        };
-        m.extra.insert("subtype".into(), Value::String(subtype.into()));
+        m.origin = Origin::Harness;
+        if compaction {
+            m.kind = MessageKind::CompactionSummary;
+        } else if matches!(m.kind, MessageKind::Prompt | MessageKind::Reply) {
+            m.kind = MessageKind::InjectedContext;
+        }
     }
     if let Some(u) = meta.get("usage") {
         let get = |k: &str| u.get(k).and_then(Value::as_u64);
@@ -488,24 +546,31 @@ fn apply_metadata(m: &mut Message, meta: Value) {
             cache_read_tokens: get("cacheReadTokens"),
             cache_creation_tokens: get("cacheWriteTokens"),
             reasoning_tokens: None,
-            cost_usd: None,
+            cost_usd: u.get("cost").and_then(Value::as_f64),
         };
-        if usage.input_tokens.is_some() || usage.output_tokens.is_some() {
+        if usage.input_tokens.is_some() || usage.output_tokens.is_some() || usage.cost_usd.is_some() {
             m.usage = Some(usage);
         }
     }
     if let Some(inf) = meta.get("inference") {
+        // The same `provider/model` shape as `Session::model` (`reconstruct_model`), recorded only
+        // when it differs — the resolved snapshot, a switched provider (IR diet).
         let model = inf
             .get("resolvedModel")
             .or_else(|| inf.get("requestedModel"))
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty());
-        if let Some(model) = model {
-            m.model = Some(model.to_string());
+        let provider = inf.get("provider").and_then(Value::as_str).filter(|s| !s.is_empty());
+        let model = model.map(|name| match provider {
+            Some(p) => format!("{p}/{name}"),
+            None => name.to_string(),
+        });
+        if let Some(model) = model.filter(|model| session_model != Some(model.as_str())) {
+            m.model = Some(model);
         }
     }
     if meta.is_object() {
-        m.extra.insert("goose_metadata".into(), meta);
+        m.harness_extra_mut(Harness::Goose).insert("metadata".into(), meta);
     }
 }
 
@@ -625,11 +690,11 @@ fn stream_legacy(name: &str, path: &Path, sink: &mut dyn MessageSink) -> Result<
         let role = v.get("role").and_then(Value::as_str).unwrap_or("user");
         let id = v.get("id").and_then(Value::as_str).map(str::to_string);
         let ts = v.get("created").and_then(Value::as_i64).and_then(secs_to_dt);
-        let blocks = v
+        let decoded = v
             .get("content")
-            .map(|c| content_to_blocks(c, &mut tool_names))
+            .map(|c| decode_content(c, &mut tool_names))
             .unwrap_or_default();
-        if let Some(m) = build_message(role, id, ts, None, blocks) {
+        if let Some(m) = build_message(role, id, ts, None, decoded) {
             if sink.message(m) == Flow::Stop {
                 break;
             }
@@ -642,26 +707,88 @@ fn stream_legacy(name: &str, path: &Path, sink: &mut dyn MessageSink) -> Result<
 // Shared content decoding (modern content_json == legacy `content` array)
 // ---------------------------------------------------------------------------
 
-/// Turn a `Vec<MessageContent>` JSON value into IR blocks, recording tool-request names.
-fn content_to_blocks(content: &Value, tool_names: &mut HashMap<String, String>) -> Vec<Block> {
+/// A message's decoded content: the IR blocks plus the facts that type the message — an `error`
+/// block makes it a [`MessageKind::Error`]; control blocks (`systemNotification`, `actionRequired`,
+/// `toolConfirmationRequest`) make it a [`MessageKind::Notice`] when they are all it holds.
+#[derive(Default)]
+struct Decoded {
+    blocks: Vec<Block>,
+    /// The first `error` block, as `{kind, message}`.
+    error: Option<Value>,
+    /// Every control block, verbatim (each is also rendered into `blocks` as text).
+    control: Vec<Value>,
+    /// Whether any block is conversational content (text, tools, thinking, media) rather than the
+    /// rendering of a control block or an error.
+    substantive: bool,
+}
+
+/// Decode a `Vec<MessageContent>` JSON value, recording tool-request names.
+fn decode_content(content: &Value, tool_names: &mut HashMap<String, String>) -> Decoded {
+    let mut d = Decoded::default();
     let Some(items) = content.as_array() else {
         // A bare string content (defensive; Goose stores arrays) → one Text block.
-        if let Some(t) = content.as_str() {
-            if !t.is_empty() {
-                return vec![Block::Text {
-                    text: t.to_string().into(),
-                }];
+        if let Some(t) = content.as_str().filter(|t| !t.is_empty()) {
+            d.blocks.push(Block::Text {
+                text: t.to_string().into(),
+            });
+            d.substantive = true;
+        }
+        return d;
+    };
+    for item in items {
+        match item.get("type").and_then(Value::as_str) {
+            // `ErrorContent {kind, message}` (message.rs:284-287; written by `Message::with_error`
+            // when a provider call gives up — context overflow, auth, credits). Shown to the user in
+            // Goose; kept visible here as text, self-describing with its kind, and the message is an
+            // Error.
+            Some("error") => {
+                let kind = item.get("kind").and_then(Value::as_str).unwrap_or("other");
+                let message = item.get("message").and_then(Value::as_str).unwrap_or("");
+                d.blocks.push(Block::Text {
+                    text: format!("[error: {kind}] {message}").into(),
+                });
+                if d.error.is_none() {
+                    d.error = Some(serde_json::json!({ "kind": kind, "message": message }));
+                }
+            }
+            Some("systemNotification" | "actionRequired" | "toolConfirmationRequest") => {
+                d.blocks.push(Block::Text {
+                    text: control_block_text(item).into(),
+                });
+                d.control.push(item.clone());
+            }
+            _ => {
+                if let Some(b) = item_to_block(item, tool_names) {
+                    d.blocks.push(b);
+                    d.substantive = true;
+                }
             }
         }
-        return vec![];
-    };
-    let mut out = Vec::new();
-    for item in items {
-        if let Some(b) = item_to_block(item, tool_names) {
-            out.push(b);
+    }
+    d
+}
+
+/// A control block as Goose's own `Display` prints it (message.rs:352-373), so a notice reads the
+/// same in cv as in a Goose log.
+fn control_block_text(item: &Value) -> String {
+    let s = |k: &str| item.get(k).and_then(Value::as_str).unwrap_or("");
+    match item.get("type").and_then(Value::as_str) {
+        Some("systemNotification") => format!("[SystemNotification: {}]", s("msg")),
+        Some("toolConfirmationRequest") => format!("[ToolConfirmationRequest: {}]", s("toolName")),
+        _ => {
+            let data = item.get("data").unwrap_or(item);
+            let d = |k: &str| data.get(k).and_then(Value::as_str).unwrap_or("");
+            match data.get("actionType").and_then(Value::as_str) {
+                Some("toolConfirmation") => format!("[ActionRequired: ToolConfirmation for {}]", d("toolName")),
+                Some("elicitation") => format!("[ActionRequired: Elicitation - {}]", d("message")),
+                Some("elicitationResponse") => format!("[ActionRequired: ElicitationResponse for {}]", d("id")),
+                Some("toolConfirmationResponse") => {
+                    format!("[ActionRequired: ToolConfirmationResponse for {}]", d("id"))
+                }
+                other => format!("[ActionRequired: {}]", other.unwrap_or("?")),
+            }
         }
     }
-    out
 }
 
 fn item_to_block(item: &Value, tool_names: &mut HashMap<String, String>) -> Option<Block> {
@@ -709,16 +836,6 @@ fn item_to_block(item: &Value, tool_names: &mut HashMap<String, String>) -> Opti
                 .and_then(Value::as_str)
                 .map(|_| "base64:inline".to_string()),
         }),
-        // `ErrorContent {kind, message}` (message.rs:284-287; written by `Message::with_error` when a
-        // provider call gives up — retry exhaustion, context overflow, auth, credits). Shown to the
-        // user in Goose; keep it visible here as text, self-describing with its kind.
-        "error" => {
-            let kind = item.get("kind").and_then(Value::as_str).unwrap_or("other");
-            let message = item.get("message").and_then(Value::as_str).unwrap_or("");
-            Some(Block::Text {
-                text: format!("[error: {kind}] {message}").into(),
-            })
-        }
         "toolRequest" | "frontendToolRequest" => {
             let id = item.get("id").and_then(Value::as_str).unwrap_or("").to_string();
             let call = item.get("toolCall")?;
@@ -781,8 +898,7 @@ fn item_to_block(item: &Value, tool_names: &mut HashMap<String, String>) -> Opti
                 details: None,
             })
         }
-        // toolConfirmationRequest / actionRequired / systemNotification: no first-class IR home;
-        // skip (they're ephemeral UI/control content, not transcript-bearing).
+        // `error` and the control blocks are handled by `decode_content`; anything unknown is skipped.
         _ => None,
     }
 }
@@ -830,14 +946,23 @@ fn flatten_result_content(content: &Value) -> String {
     parts.join("\n")
 }
 
-/// Build a [`Message`], re-classifying a pure-tool-response `user` message to [`Role::Tool`].
+/// Build a [`Message`] from decoded content: a pure-tool-response `user` message is a
+/// [`Role::Tool`] turn; an `error` block makes the message a [`MessageKind::Error`]; control
+/// content alone makes it a [`MessageKind::Notice`]. The row's `metadata_json` may refine the kind
+/// afterwards ([`apply_metadata`]).
 fn build_message(
     role: &str,
     id: Option<String>,
     ts: Option<DateTime<Utc>>,
     tokens: Option<i64>,
-    blocks: Vec<Block>,
+    decoded: Decoded,
 ) -> Option<Message> {
+    let Decoded {
+        blocks,
+        error,
+        control,
+        substantive,
+    } = decoded;
     if blocks.is_empty() {
         return None;
     }
@@ -850,10 +975,23 @@ fn build_message(
     };
     // Goose stores tool results on `user` messages; if a message is *only* tool results, surface it
     // as a Tool turn so conversions re-encode it correctly.
-    if ir_role == Role::User && !blocks.is_empty() && blocks.iter().all(|b| matches!(b, Block::ToolResult { .. })) {
+    if ir_role == Role::User && blocks.iter().all(|b| matches!(b, Block::ToolResult { .. })) {
         ir_role = Role::Tool;
     }
     let mut m = Message::new(ir_role);
+    if let Some(error) = error {
+        // An error the model never answered (a provider gave up); the harness recorded it.
+        m.kind = MessageKind::Error;
+        m.origin = Origin::Harness;
+        m.harness_extra_mut(Harness::Goose).insert("error".into(), error);
+    } else if !substantive && !control.is_empty() {
+        m.kind = MessageKind::Notice;
+        m.origin = Origin::Harness;
+    }
+    if !control.is_empty() {
+        m.harness_extra_mut(Harness::Goose)
+            .insert("control_blocks".into(), Value::Array(control));
+    }
     m.id = id;
     m.timestamp = ts;
     if let Some(t) = tokens {
@@ -1027,6 +1165,27 @@ mod tests {
         c
     }
 
+    /// A message's `extra["goose"]` bag (the only place a Goose message fact may live).
+    fn bag(m: &Message) -> &serde_json::Map<String, Value> {
+        m.harness_extra(Harness::Goose).expect("extra[\"goose\"]")
+    }
+
+    /// Every `extra` key, on the session and on each message, is `goose`: no flat keys anywhere.
+    fn assert_nested_extra(s: &Session) {
+        for k in s.extra.keys() {
+            assert_eq!(k, Harness::Goose.as_str(), "flat session extra key {k:?}");
+        }
+        for (i, m) in s.messages.iter().enumerate() {
+            for k in m.extra.keys() {
+                assert_eq!(k, Harness::Goose.as_str(), "flat extra key {k:?} on message {i}");
+            }
+        }
+    }
+
+    fn kinds(s: &Session) -> Vec<(Role, MessageKind, Origin)> {
+        s.messages.iter().map(|m| (m.role, m.kind, m.origin)).collect()
+    }
+
     fn sref(id: &str) -> SessionRef {
         SessionRef {
             id: id.into(),
@@ -1131,26 +1290,45 @@ mod tests {
             .is_some_and(|t| t.to_rfc3339().starts_with("2026-09-19T20:16")));
 
         // A stub-provider turn: prompt, the injected `<turn-context>` row (hidden from the user →
-        // System), the reply with its model and real usage; the session model is provider/model.
+        // System / injected context), the reply with real usage; the session model is
+        // provider/model and the reply's `openai/stub-model` is the same, so it is not repeated.
         let s = parse_db(&c, &sref("20260919_3")).unwrap();
         assert_eq!(s.model.as_deref(), Some("openai/stub-model"));
-        let roles: Vec<Role> = s.messages.iter().map(|m| m.role).collect();
-        assert_eq!(roles, vec![Role::User, Role::System, Role::Assistant]);
+        assert_eq!(
+            kinds(&s),
+            vec![
+                (Role::User, MessageKind::Prompt, Origin::Human),
+                (Role::System, MessageKind::InjectedContext, Origin::Harness),
+                (Role::Assistant, MessageKind::Reply, Origin::Model),
+            ]
+        );
         assert_eq!(s.messages[0].text().as_deref(), Some("say pong"));
-        assert_eq!(s.messages[1].extra["subtype"], "turn_context");
+        assert_eq!(
+            bag(&s.messages[0]).keys().collect::<Vec<_>>(),
+            vec!["metadata"],
+            "a prompt carries only its metadata_json"
+        );
+        assert_eq!(bag(&s.messages[1])["metadata"]["turnContext"], true);
         assert!(s.messages[1].text().unwrap().starts_with("<turn-context>"));
         let a = &s.messages[2];
-        assert_eq!(a.model.as_deref(), Some("stub-model"));
+        assert_eq!(a.model, None, "same as the session model");
         let u = a.usage.as_ref().unwrap();
         assert_eq!(
-            (u.input_tokens, u.output_tokens, u.cache_read_tokens),
-            (Some(324), Some(17), Some(100))
+            (u.input_tokens, u.output_tokens, u.cache_read_tokens, u.cost_usd),
+            (Some(324), Some(17), Some(100), None)
         );
-        assert_eq!(a.extra["goose_metadata"]["inference"]["provider"], "openai");
+        assert_eq!(bag(a)["metadata"]["inference"]["provider"], "openai");
+        assert_eq!(s.harness_extra(Harness::Goose).unwrap()["session_type"], "user");
+        assert!(s.lineage.is_empty());
+        assert_nested_extra(&s);
 
         // An imported Claude Code transcript (cv's own `rich_blocks.jsonl` fixture, run through
-        // `goose session import`): tool calls and results keep their names, thinking survives.
+        // `goose session import`): tool calls and results keep their names, thinking survives. The
+        // store records no provenance (`session_type` is forced to `user`), so its prompts read as
+        // a person's — `Origin::Import` is not derivable from a goose 1.51 store.
         let s = parse_db(&c, &sref("20260919_6")).unwrap();
+        assert_eq!(s.messages[0].origin, Origin::Human);
+        assert!(s.harness_extra(Harness::Goose).unwrap()["session_type"] == "user");
         let tool_names: Vec<&str> = s
             .messages
             .iter()
@@ -1176,13 +1354,16 @@ mod tests {
             .iter()
             .all(|b| matches!(b, Block::ToolResult { tool_name: Some(_), .. })));
 
-        // Retry exhaustion: goose 1.51.0 persists the message as a plain text block.
+        // Retry exhaustion: goose 1.51.0 persists the message as a plain text block — a reply, not
+        // an `error` block, so it is not a `MessageKind::Error`.
         let s = parse_db(&c, &sref("20260919_5")).unwrap();
         let last = s.messages.last().unwrap();
         assert_eq!(last.role, Role::Assistant);
+        assert_eq!(last.kind, MessageKind::Reply);
         assert!(
             matches!(&last.content[0], Block::Text { text } if text.starts_with("Maximum retry attempts (1) exceeded"))
         );
+        assert_nested_extra(&s);
         // The dead-endpoint session recorded no assistant row at all.
         let s = parse_db(&c, &sref("20260919_4")).unwrap();
         assert!(s.messages.iter().all(|m| m.role != Role::Assistant));
@@ -1218,7 +1399,14 @@ mod tests {
     fn metadata_json_yields_usage_model_and_flags() {
         let c = mk(SCHEMA);
         c.execute(
-            "INSERT INTO sessions (id, name, working_dir, session_type, parent_session_id) VALUES ('s1','t','/x','sub_agent','root-1')",
+            "INSERT INTO sessions (id, name, working_dir, session_type, parent_session_id, provider_name, model_config_json) \
+             VALUES ('s1','t','/x','sub_agent','root-1','anthropic','{\"model_name\":\"claude-sonnet-4-5\"}')",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO messages (message_id, session_id, role, content_json, created_timestamp, metadata_json) \
+             VALUES ('m0','s1','user','[{\"type\":\"text\",\"text\":\"subtask\"}]',1704110399,'{\"userVisible\":true,\"agentVisible\":true}')",
             [],
         )
         .unwrap();
@@ -1235,25 +1423,69 @@ mod tests {
         )
         .unwrap();
         let s = parse_db(&c, &sref("s1")).unwrap();
-        assert_eq!(s.extra["session_type"], "sub_agent");
-        assert_eq!(s.extra["parent_session_id"], "root-1");
-        let m = &s.messages[0];
+        assert_eq!(s.harness_extra(Harness::Goose).unwrap()["session_type"], "sub_agent");
+        assert_eq!(
+            s.lineage,
+            Lineage {
+                parent: Some("root-1".into()),
+                ..Default::default()
+            }
+        );
+        assert_eq!(s.model.as_deref(), Some("anthropic/claude-sonnet-4-5"));
+        // prompt / reply / the compaction pair (boundary synthesized before the agent-only summary)
+        assert_eq!(
+            kinds(&s),
+            vec![
+                (Role::User, MessageKind::Prompt, Origin::Subagent),
+                (Role::Assistant, MessageKind::Reply, Origin::Model),
+                (Role::System, MessageKind::CompactionBoundary, Origin::Harness),
+                (Role::System, MessageKind::CompactionSummary, Origin::Harness),
+            ]
+        );
+        let m = &s.messages[1];
         let u = m.usage.as_ref().expect("usage from metadata_json");
         assert_eq!((u.input_tokens, u.output_tokens), (Some(1200), Some(85)));
         assert_eq!((u.cache_read_tokens, u.cache_creation_tokens), (Some(900), Some(0)));
+        assert_eq!(u.cost_usd, Some(0.0041), "provider-reported cost is first-class");
         assert_eq!(
             m.model.as_deref(),
-            Some("claude-sonnet-4-5-20250929"),
-            "resolved model wins"
+            Some("anthropic/claude-sonnet-4-5-20250929"),
+            "the resolved snapshot differs from the session model, so it is recorded"
         );
-        assert_eq!(m.extra["goose_metadata"]["usage"]["cost"], 0.0041);
-        let h = &s.messages[1];
+        assert_eq!(bag(m)["metadata"]["usage"]["costSource"], "provider_reported");
+        let (boundary, h) = (&s.messages[2], &s.messages[3]);
+        assert_eq!(h.parent_id, boundary.id);
         assert_eq!(
-            h.extra["goose_metadata"]["userVisible"], false,
+            bag(h)["metadata"]["userVisible"],
+            false,
             "hidden rows are kept, flagged"
         );
-        assert_eq!(h.extra["goose_metadata"]["usage"]["isCompaction"], true);
+        assert_eq!(bag(h)["metadata"]["usage"]["isCompaction"], true);
         assert!(h.model.is_none(), "no inference → no model");
+        assert_eq!(crate::compaction::detect_in_session(&s, true).len(), 1);
+        assert_nested_extra(&s);
+    }
+
+    #[test]
+    fn prompt_origin_follows_session_type() {
+        let c = mk(SCHEMA);
+        for (id, ty) in [("u", "user"), ("s", "scheduled"), ("h", "hidden"), ("a", "acp")] {
+            c.execute(
+                "INSERT INTO sessions (id, working_dir, session_type) VALUES (?1, '/x', ?2)",
+                [id, ty],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO messages (session_id, role, content_json, created_timestamp) VALUES (?1,'user','[{\"type\":\"text\",\"text\":\"go\"}]',1)",
+                [id],
+            )
+            .unwrap();
+        }
+        let origin = |id: &str| parse_db(&c, &sref(id)).unwrap().messages[0].origin;
+        assert_eq!(origin("u"), Origin::Human);
+        assert_eq!(origin("s"), Origin::Scheduler);
+        assert_eq!(origin("h"), Origin::Harness);
+        assert_eq!(origin("a"), Origin::Human);
     }
 
     #[test]
@@ -1269,12 +1501,79 @@ mod tests {
         .unwrap();
         let s = parse_db(&c, &sref("s1")).unwrap();
         let m = &s.messages[0];
+        assert_eq!(m.role, Role::Assistant);
+        assert_eq!((m.kind, m.origin), (MessageKind::Error, Origin::Harness));
+        assert_eq!(bag(m)["error"]["kind"], "contextLengthExceeded");
+        assert_eq!(bag(m)["error"]["message"], "Maximum retry attempts (3) exceeded.");
         assert_eq!(m.content.len(), 2, "neither block is dropped");
         assert!(
             matches!(&m.content[0], Block::Text { text } if text == "[error: contextLengthExceeded] Maximum retry attempts (3) exceeded.")
         );
         assert!(matches!(&m.content[1], Block::File { mime, path, source }
                 if mime.as_deref() == Some("application/pdf") && path.as_deref() == Some("q3-report.pdf") && source.as_deref() == Some("base64:inline")));
+        assert_nested_extra(&s);
+    }
+
+    #[test]
+    fn control_blocks_are_notices() {
+        let c = mk(SCHEMA);
+        c.execute("INSERT INTO sessions (id, working_dir) VALUES ('s1','/x')", [])
+            .unwrap();
+        let rows = [
+            // a bare notification → a notice, rendered as Goose prints it
+            (
+                "user",
+                r#"[{"type":"systemNotification","notificationType":"progressMessage","msg":"Loading extension developer"}]"#,
+            ),
+            // a bare confirmation request → a notice
+            (
+                "assistant",
+                r#"[{"type":"toolConfirmationRequest","id":"c1","toolName":"developer__shell","arguments":{"command":"rm -rf x"},"prompt":null}]"#,
+            ),
+            // an action-required elicitation → a notice
+            (
+                "user",
+                r#"[{"type":"actionRequired","data":{"actionType":"elicitation","id":"e1","message":"Which branch?","requestedSchema":{}}}]"#,
+            ),
+            // real content alongside a control block keeps its kind
+            (
+                "assistant",
+                r#"[{"type":"text","text":"I need to run a command."},{"type":"actionRequired","data":{"actionType":"toolConfirmation","id":"c2","toolName":"developer__shell","arguments":{},"prompt":null}}]"#,
+            ),
+        ];
+        for (i, (role, content)) in rows.iter().enumerate() {
+            c.execute(
+                "INSERT INTO messages (session_id, role, content_json, created_timestamp) VALUES ('s1', ?1, ?2, ?3)",
+                rusqlite::params![role, content, i as i64 + 1],
+            )
+            .unwrap();
+        }
+        let s = parse_db(&c, &sref("s1")).unwrap();
+        assert_eq!(
+            kinds(&s),
+            vec![
+                (Role::User, MessageKind::Notice, Origin::Harness),
+                (Role::Assistant, MessageKind::Notice, Origin::Harness),
+                (Role::User, MessageKind::Notice, Origin::Harness),
+                (Role::Assistant, MessageKind::Reply, Origin::Model),
+            ]
+        );
+        let texts: Vec<String> = s.messages.iter().filter_map(|m| m.text()).collect();
+        assert_eq!(
+            texts,
+            vec![
+                "[SystemNotification: Loading extension developer]",
+                "[ToolConfirmationRequest: developer__shell]",
+                "[ActionRequired: Elicitation - Which branch?]",
+                "I need to run a command.\n[ActionRequired: ToolConfirmation for developer__shell]",
+            ]
+        );
+        assert_eq!(bag(&s.messages[0])["control_blocks"][0]["type"], "systemNotification");
+        assert_eq!(
+            bag(&s.messages[3])["control_blocks"][0]["data"]["actionType"],
+            "toolConfirmation"
+        );
+        assert_nested_extra(&s);
     }
 
     #[test]
@@ -1375,8 +1674,14 @@ mod tests {
         assert_eq!(s.title.as_deref(), Some("legacy chat"));
         assert_eq!(s.cwd.as_deref().map(|p| p.to_str().unwrap()), Some("/home/u/old"));
         assert_eq!(s.messages.len(), 3);
-        assert_eq!(s.messages[0].role, Role::User);
-        assert_eq!(s.messages[1].role, Role::Assistant);
+        assert_eq!(
+            kinds(&s),
+            vec![
+                (Role::User, MessageKind::Prompt, Origin::Human),
+                (Role::Assistant, MessageKind::Reply, Origin::Model),
+                (Role::Tool, MessageKind::ToolResult, Origin::Harness),
+            ]
+        );
         assert!(matches!(&s.messages[1].content[1], Block::ToolUse { name, .. } if name == "developer__shell"));
         // tool response reclassified + name paired
         assert_eq!(s.messages[2].role, Role::Tool);

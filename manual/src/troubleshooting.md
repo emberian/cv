@@ -19,11 +19,14 @@ run does the real work (a few seconds across thousands of sessions) and later ru
 huge transcript (hundreds of MB) is sampled head+tail during discovery, never fully read. See
 [Architecture](architecture.md).
 
-### `cv convert` warns about lost content
+### `cv port` warns about lost content
 
-Conversion re-parses its own output and reports anything that didn't survive. Some targets are
-*faithfully* lossy — e.g. LM Studio has no tool structures on disk, so tool calls become readable
-text. That's a format limitation, not a bug. See [Cross-harness conversion](conversion.md).
+`cv port` re-parses its own output and diffs it against the source, message by message, then
+reports anything that didn't survive. Each loss is classified: **expected** when the target format
+genuinely cannot hold it (LM Studio has no tool structures on disk, so tool calls become readable
+text), **unexpected** when it could have and didn't. Only the unexpected ones fail `cv port
+--strict`. A `⚠ lost` line about an expected loss is a format limitation, not a bug. See
+[Cross-harness conversion](conversion.md).
 
 ### Sub-agents
 

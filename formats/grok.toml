@@ -1,0 +1,28 @@
+# formats/grok.toml — the vocabulary cv's `grok` adapter is checked against (docs/INTERFACE-V2.md §7).
+# status: handled = per-item arm in the adapter; generic = interpreted by a blanket rule; carried = verbatim
+# under ParseOptions::complete only; ignored = known and deliberately skipped. Regenerate: tools/gen-manifests (or edit by hand).
+
+harness = "grok"
+source_files = ["harness/grok.rs"]
+ignore_literals = []
+store = [
+  "~/.grok/sessions/<percent-encoded-cwd>/<sessionId>/{chat_history.jsonl,updates.jsonl,summary.json,system_prompt.txt}",
+]
+
+[upstream]
+repo = "unknown"
+commit = "unknown"
+date = "2026-05-29"
+
+[types]
+user = { status = "handled", note = "chat_history line" }
+assistant = { status = "handled", note = "" }
+system = { status = "handled", note = "" }
+tool_call = { status = "handled", note = "updates.jsonl" }
+tool_call_update = { status = "handled", note = "updates.jsonl" }
+error = { status = "handled", note = "failed tool status" }
+failed = { status = "handled", note = "tool status" }
+tool_result = { status = "generic", note = "from tool_call_update" }
+reasoning = { status = "generic", note = "assistant reasoning{text,encrypted}" }
+compaction_meta = { status = "handled", note = "`synthetic_reason` on a user line -> CompactionSummary/Harness" }
+subagent = { status = "handled", note = "`session_kind` of a .grok/worktrees/*/subagent-<id>/ session" }

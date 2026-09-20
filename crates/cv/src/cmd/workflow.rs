@@ -27,10 +27,15 @@ pub(crate) fn cmd_workflow(
     revive: bool,
     revive_all: bool,
 ) -> Result<()> {
-    let want = crate::util::parse_harness(&harness)?;
+    let (want, id) = crate::util::split_harness_id(id, crate::util::parse_harness(&harness)?);
     // find_cheap: don't pay a full fleet re-discovery before trying the id as a workflow name —
     // the name path escalates to a full `find` itself once every cheaper reading has missed.
-    let Some((r, _adapter)) = cv_core::find_cheap(id, want)? else {
+    let found = match cv_core::find_cheap(id, want) {
+        Ok(found) => found,
+        // An ambiguous prefix: the candidate lines, exit 2.
+        Err(e) => return crate::util::resolve_found(Err(e), id, want).map(|_| ()),
+    };
+    let Some((r, _adapter)) = found else {
         // Not a session id → maybe it's a workflow name ("the stark-kill session" problem).
         return workflow_by_name_fleetwide(id, want, json, script, results, revive, revive_all);
     };
@@ -194,8 +199,10 @@ fn workflow_by_name_fleetwide(
         if ghosts.is_empty() {
             // Very last reading: a session id living in the discovery probe's blind spots (what
             // the full `find` covers and `find_cheap` deliberately skipped).
-            if let Some((r, _adapter)) = cv_core::find(name, want)? {
-                return list_workflows(&r, json);
+            match cv_core::find(name, want) {
+                Ok(Some((r, _adapter))) => return list_workflows(&r, json),
+                Ok(None) => {}
+                Err(e) => return crate::util::resolve_found(Err(e), name, want).map(|_| ()),
             }
         }
         if !ghosts.is_empty() {
@@ -520,7 +527,7 @@ pub(crate) fn cmd_tools(
     json: bool,
 ) -> Result<()> {
     let want = crate::util::parse_harness(&harness)?;
-    let (r, _adapter) = cv_core::find(id, want)?.with_context(|| format!("no session matching {id:?}"))?;
+    let (r, _adapter) = crate::util::resolve(id, want)?;
 
     if timeline {
         return tools_timeline(&r, agent.as_deref(), json);
@@ -742,7 +749,7 @@ fn kindcell(n: usize) -> String {
 /// `--summaries`, print each summary's full text.
 pub(crate) fn cmd_compaction(id: &str, harness: Option<String>, summaries: bool, json: bool) -> Result<()> {
     let want = crate::util::parse_harness(&harness)?;
-    let (r, _adapter) = cv_core::find(id, want)?.with_context(|| format!("no session matching {id:?}"))?;
+    let (r, _adapter) = crate::util::resolve(id, want)?;
 
     let comps = cv_core::compaction::detect(&r, true)?;
 

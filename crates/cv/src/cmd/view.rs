@@ -1,48 +1,73 @@
 //! `cv show` / `cv export` / `cv tree` / `cv diff` / `cv redact` — reading sessions,
 //! plus the streaming renderer (`stream_session_render`) and its header/message helpers.
 
-use crate::util::{home_rel, parse_harness, parse_msg_range, short_id};
+use crate::util::{
+    clamp, continue_hint, count_messages, home_rel, parse_harness, resolve, resolve_found, short_id, split_harness_id,
+    usage, WindowArgs,
+};
 use anyhow::{bail, Context, Result};
-use cv_core::ir::{truncate, Block, Harness, Message, Role, Session, SessionRef};
+use cv_core::ir::{truncate, Block, Harness, Message, MessageKind, Role, Session, SessionRef};
 use cv_core::Adapter;
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
+
+/// A piped `cv show` with no selector prints at most this much before switching to head + tail:
+/// agents read cv through pipes constantly, and a full transcript in a tool result is the
+/// context-window failure mode this exists to prevent.
+const PIPE_GUARD_BYTES: usize = 200 * 1024;
+/// How many messages each end of the head + tail view shows.
+const PIPE_GUARD_EDGE: usize = 20;
 
 pub(crate) fn cmd_show(
     id: &str,
     harness: Option<String>,
     json: bool,
-    range: Option<String>,
+    window: &WindowArgs,
     subagents: bool,
     agent: Option<String>,
     pre_compaction: Option<usize>,
 ) -> Result<()> {
-    let want = parse_harness(&harness)?;
+    let (want, id) = split_harness_id(id, parse_harness(&harness)?);
+    // Parse the selector before any I/O so a bad `--range` errors immediately.
+    let selector = window.window()?;
+
     // An `agent-…` shaped id goes straight to the sub-agent view: cv_core::find_cheap can now
     // resolve these too (its fleet-wide fallback), but this path keeps the provenance banner and
     // lists candidates on an ambiguous prefix instead of erroring.
-    if id.starts_with("agent-") {
-        let parsed_range = range.as_deref().map(parse_msg_range).transpose()?;
-        if show_agent_fleetwide(id, json, parsed_range)? {
-            return Ok(());
-        }
+    if id.starts_with("agent-") && show_agent_fleetwide(id, json, window)? {
+        return Ok(());
     }
     // find_cheap first: don't pay a full fleet re-discovery before trying the id as a sub-agent
     // id — sub-agents aren't in the main pool, but `cv show <agent-id>` should still just work
     // (harvest reports hand out bare agent ids all the time). Only when the id is neither a
     // cataloged session nor an agent does the full-scan `find` escalation run (a session in the
     // discovery probe's blind spots).
-    let found = match cv_core::find_cheap(id, want)? {
-        Some(hit) => Some(hit),
-        None => {
-            let range = range.as_deref().map(parse_msg_range).transpose()?;
-            if show_agent_fleetwide(id, json, range)? {
+    let found = match cv_core::find_cheap(id, want) {
+        Ok(Some(hit)) => Ok(Some(hit)),
+        Ok(None) => {
+            if show_agent_fleetwide(id, json, window)? {
                 return Ok(());
             }
-            cv_core::find(id, want)?
+            cv_core::find(id, want)
         }
+        Err(e) => Err(e),
     };
-    let (r, adapter) = found.with_context(|| format!("no session (and no sub-agent) matching {id:?}"))?;
-    let mut range = range.as_deref().map(parse_msg_range).transpose()?;
+    let (r, adapter) = match found {
+        Ok(Some(hit)) => hit,
+        Ok(None) => return usage(format!("no session (and no sub-agent) matching {id:?}")),
+        Err(e) => return resolve_found(Err(e), id, want).map(|_| ()),
+    };
+
+    // `--agent <id>`: render one specific sub-agent's transcript (resolved through this parent,
+    // since sub-agents aren't in the main pool). `--subagents`: list the whole forest with results.
+    if let Some(agent_id) = &agent {
+        return show_one_subagent(&r, adapter.as_ref(), agent_id, json, window);
+    }
+    if subagents {
+        return show_subagents(&r, json);
+    }
+
+    let mut range = window.bounds(|| count_messages(adapter.as_ref(), &r))?;
 
     // `--pre-compaction <N>`: resolve the Nth (1-based) compaction's pre-span into a window. This
     // reads the context the continued agent lost — the whole point is to retrieve it by message
@@ -50,7 +75,7 @@ pub(crate) fn cmd_show(
     if let Some(n) = pre_compaction {
         let comps = cv_core::compaction::detect(&r, false)?;
         if comps.is_empty() {
-            anyhow::bail!("{} never compacted — nothing pre-compaction to show", short_id(&r.id));
+            bail!("{} never compacted — nothing pre-compaction to show", short_id(&r.id));
         }
         let idx = n.saturating_sub(1);
         let (start, end) = cv_core::compaction::pre_compaction_span(&comps, idx).with_context(|| {
@@ -62,37 +87,139 @@ pub(crate) fn cmd_show(
             )
         })?;
         eprintln!(
-            "✦ pre-compaction #{n} of {}: messages {start}-{end} (the span before boundary @msg {})",
+            "✦ pre-compaction #{n} of {}: messages {start}..{end} (the span before boundary @msg {})",
             comps.len(),
             comps[idx].boundary_msg_idx,
         );
         range = Some((start, Some(end)));
     }
 
-    // `--agent <id>`: render one specific sub-agent's transcript (resolved through this parent,
-    // since sub-agents aren't in the main pool). `--subagents`: list the whole forest with results.
-    if let Some(agent_id) = &agent {
-        return show_one_subagent(&r, adapter.as_ref(), agent_id, json, range);
-    }
-    if subagents {
-        return show_subagents(&r, json);
-    }
-
-    // JSON wants the whole IR (incl. `extra`), so it materializes; the rendered transcript streams.
     if json {
-        let mut session = adapter.parse(&r)?;
-        if let Some((start, end)) = range {
-            let end = end.unwrap_or(session.messages.len()).min(session.messages.len());
-            let start = start.min(end);
-            session.messages = session.messages.drain(start..end).collect();
+        return print_session_json(adapter.as_ref(), &r, range, window.max_bytes);
+    }
+    // The pipe guard applies only to a selector-less, budget-less render (an explicit window or
+    // budget is the caller saying what they want).
+    let guard = selector.is_none() && pre_compaction.is_none() && window.max_bytes.is_none();
+    render_text(adapter.as_ref(), &r, range, window.max_bytes, guard)
+}
+
+/// `show --json` / `export --format json`: the whole IR (incl. `extra`), windowed, and — under
+/// `--max-bytes` — cut at the budget with the continuation hint on **stderr** (stdout stays JSON).
+fn print_session_json(
+    adapter: &dyn Adapter,
+    r: &SessionRef,
+    range: Option<(usize, Option<usize>)>,
+    max_bytes: Option<usize>,
+) -> Result<()> {
+    let mut session = adapter.parse(r)?;
+    let start = range.map(|(s, _)| s).unwrap_or(0);
+    if let Some(rg) = range {
+        let (s, e) = clamp(rg, session.messages.len());
+        session.messages = session.messages.drain(s..e).collect();
+    }
+    if let Some(budget) = max_bytes {
+        let mut bytes = 0usize;
+        let mut keep = 0usize;
+        for (i, m) in session.messages.iter().enumerate() {
+            let n = serde_json::to_vec(m)?.len();
+            if keep > 0 && bytes + n > budget {
+                break;
+            }
+            bytes += n;
+            keep = i + 1;
         }
-        println!("{}", serde_json::to_string_pretty(&session)?);
+        if keep < session.messages.len() {
+            eprintln!("{}", continue_hint(start + keep));
+            session.messages.truncate(keep);
+        }
+    }
+    println!("{}", serde_json::to_string_pretty(&session)?);
+    Ok(())
+}
+
+/// The rendered-transcript path of `cv show`, with the pipe guard: a selector-less render to a
+/// non-terminal stdout that would exceed [`PIPE_GUARD_BYTES`] becomes the first and last
+/// [`PIPE_GUARD_EDGE`] messages with a hint line between them.
+fn render_text(
+    adapter: &dyn Adapter,
+    r: &SessionRef,
+    range: Option<(usize, Option<usize>)>,
+    max_bytes: Option<usize>,
+    guard: bool,
+) -> Result<()> {
+    let stdout = std::io::stdout();
+    if guard && !stdout.is_terminal() {
+        // Render into memory under the guard's budget; if it all fits, that IS the output.
+        let mut buf = Vec::new();
+        let probe = stream_session_render(
+            adapter,
+            r,
+            &mut buf,
+            show_header,
+            show_message,
+            RenderOpts {
+                range: None,
+                max_bytes: Some(PIPE_GUARD_BYTES),
+            },
+        )?;
+        let mut out = std::io::BufWriter::new(stdout.lock());
+        if probe.next.is_none() {
+            out.write_all(&buf)?;
+            out.flush()?;
+            return Ok(());
+        }
+        let total = count_messages(adapter, r)?;
+        if total <= 2 * PIPE_GUARD_EDGE {
+            // Too few messages to elide any — the size is in the messages themselves.
+            stream_session_render(adapter, r, &mut out, show_header, show_message, RenderOpts::default())?;
+            out.flush()?;
+            return Ok(());
+        }
+        stream_session_render(
+            adapter,
+            r,
+            &mut out,
+            show_header,
+            show_message,
+            RenderOpts {
+                range: Some((0, Some(PIPE_GUARD_EDGE))),
+                max_bytes: None,
+            },
+        )?;
+        writeln!(
+            out,
+            "… {} messages omitted ({total} total; the full render exceeds {} KB on a pipe) — read them with \
+             --first N, --last N, --range A..B, or --around N; --max-bytes N caps output\n",
+            total - 2 * PIPE_GUARD_EDGE,
+            PIPE_GUARD_BYTES / 1024,
+        )?;
+        stream_session_render(
+            adapter,
+            r,
+            &mut out,
+            |_| String::new(),
+            show_message,
+            RenderOpts {
+                range: Some((total - PIPE_GUARD_EDGE, None)),
+                max_bytes: None,
+            },
+        )?;
+        out.flush()?;
         return Ok(());
     }
 
-    let mut out = std::io::BufWriter::new(std::io::stdout().lock());
-    stream_session_render(adapter.as_ref(), &r, &mut out, show_header, show_message, range)?;
-    use std::io::Write;
+    let mut out = std::io::BufWriter::new(stdout.lock());
+    let outcome = stream_session_render(
+        adapter,
+        r,
+        &mut out,
+        show_header,
+        show_message,
+        RenderOpts { range, max_bytes },
+    )?;
+    if let Some(next) = outcome.next {
+        writeln!(out, "{}", continue_hint(next))?;
+    }
     out.flush()?;
     Ok(())
 }
@@ -101,7 +228,7 @@ pub(crate) fn cmd_show(
 /// scan across the fleet) and render it through the one parent — or list the candidates when the
 /// prefix is ambiguous. Returns `false` when nothing agent-shaped matched (the caller has one
 /// more reading of the id to try).
-fn show_agent_fleetwide(agent_id: &str, json: bool, range: Option<(usize, Option<usize>)>) -> Result<bool> {
+fn show_agent_fleetwide(agent_id: &str, json: bool, window: &WindowArgs) -> Result<bool> {
     let parents = cv_core::find_subagent_parents(agent_id);
     match parents.as_slice() {
         [] => Ok(false),
@@ -113,19 +240,29 @@ fn show_agent_fleetwide(agent_id: &str, json: bool, range: Option<(usize, Option
                 short_id(&parent.id),
                 parent.title.as_deref().unwrap_or("untitled"),
             );
-            show_one_subagent(parent, adapter.as_ref(), agent_id, json, range)?;
+            show_one_subagent(parent, adapter.as_ref(), agent_id, json, window)?;
             Ok(true)
         }
         many => {
-            println!("# {} session(s) have a sub-agent matching {agent_id:?}:\n", many.len());
-            for p in many {
-                println!(
-                    "cv show {} --agent {agent_id}   # {}",
-                    short_id(&p.id),
-                    p.title.as_deref().unwrap_or("untitled"),
-                );
-            }
-            Ok(true)
+            // Ambiguous: every candidate as a pasteable `harness:id` line, exit 2.
+            let mut lines: Vec<String> = many
+                .iter()
+                .map(|p| {
+                    format!(
+                        "{}:{}   # cv show {} --agent {agent_id} ({})",
+                        p.harness.as_str(),
+                        p.id,
+                        short_id(&p.id),
+                        p.title.as_deref().unwrap_or("untitled")
+                    )
+                })
+                .collect();
+            lines.sort();
+            usage(format!(
+                "ambiguous sub-agent id {agent_id:?} — {} sessions spawned a match:\n{}",
+                many.len(),
+                lines.join("\n")
+            ))
         }
     }
 }
@@ -144,7 +281,7 @@ fn show_subagents(r: &SessionRef, json: bool) -> Result<()> {
             .map(|s| {
                 let mut v = serde_json::to_value(s).unwrap_or(serde_json::Value::Null);
                 if let Some(obj) = v.as_object_mut() {
-                    // Surface the bare agentId (the journal/transcript key) so consumers don't have
+                    // Surface the bare agent id (the journal/transcript key) so consumers don't have
                     // to know the `agent-` stripping convention.
                     obj.insert("agent_id".into(), serde_json::Value::String(s.agent_id().to_string()));
                     // Direct agents have no journaled summary — attach their final return value.
@@ -201,13 +338,14 @@ fn show_subagents(r: &SessionRef, json: bool) -> Result<()> {
 }
 
 /// Render one specific sub-agent's transcript (`--agent <id>`), resolved by id-prefix relative to
-/// its parent session. Honors `--json` and `--range` exactly as a top-level `cv show` would.
+/// its parent session. Honors `--json` and the window flags exactly as a top-level `cv show` would
+/// (`--last` counts the sub-agent's own messages).
 fn show_one_subagent(
     parent: &SessionRef,
     adapter: &dyn Adapter,
     agent_id: &str,
     json: bool,
-    range: Option<(usize, Option<usize>)>,
+    window: &WindowArgs,
 ) -> Result<()> {
     let subs = cv_core::subagent_tree_of(parent);
     // Match on the full session id (`agent-…`), the bare agentId, or a prefix of either.
@@ -222,31 +360,32 @@ fn show_one_subagent(
         .collect();
     let sub = match matches.as_slice() {
         [one] => *one,
-        [] => bail!(
-            "no sub-agent matching {agent_id:?} under {} ({} sub-agent(s); try `cv show {} --subagents`)",
-            short_id(&parent.id),
-            subs.len(),
-            short_id(&parent.id),
-        ),
-        many => bail!(
-            "{} sub-agents match {agent_id:?} — disambiguate with a longer id ({})",
-            many.len(),
-            many.iter()
-                .map(|s| short_id(s.agent_id()))
-                .collect::<Vec<_>>()
-                .join(", "),
-        ),
+        [] => {
+            return usage(format!(
+                "no sub-agent matching {agent_id:?} under {} ({} sub-agent(s); try `cv show {} --subagents`)",
+                short_id(&parent.id),
+                subs.len(),
+                short_id(&parent.id),
+            ))
+        }
+        many => {
+            let mut lines: Vec<String> = many
+                .iter()
+                .map(|s| format!("{}:{}", s.session.harness.as_str(), s.session.id))
+                .collect();
+            lines.sort();
+            return usage(format!(
+                "ambiguous sub-agent id {agent_id:?} — {} candidates under {}:\n{}",
+                many.len(),
+                short_id(&parent.id),
+                lines.join("\n")
+            ));
+        }
     };
+    let range = window.bounds(|| count_messages(adapter, &sub.session))?;
 
     if json {
-        let mut session = adapter.parse(&sub.session)?;
-        if let Some((start, end)) = range {
-            let end = end.unwrap_or(session.messages.len()).min(session.messages.len());
-            let start = start.min(end);
-            session.messages = session.messages.drain(start..end).collect();
-        }
-        println!("{}", serde_json::to_string_pretty(&session)?);
-        return Ok(());
+        return print_session_json(adapter, &sub.session, range, window.max_bytes);
     }
 
     // A small provenance banner so the reader knows which agent (and outcome) this is.
@@ -270,31 +409,43 @@ fn show_one_subagent(
         status,
         wf,
     );
-
-    let mut out = std::io::BufWriter::new(std::io::stdout().lock());
-    stream_session_render(adapter, &sub.session, &mut out, show_header, show_message, range)?;
-    use std::io::Write;
-    out.flush()?;
-    Ok(())
+    render_text(adapter, &sub.session, range, window.max_bytes, false)
 }
 
-pub(crate) fn cmd_export(id: &str, format: &str, harness: Option<String>) -> Result<()> {
+pub(crate) fn cmd_export(id: &str, format: &str, harness: Option<String>, window: &WindowArgs) -> Result<()> {
     let want = parse_harness(&harness)?;
-    let (r, adapter) = cv_core::find(id, want)?.with_context(|| format!("no session matching {id:?}"))?;
+    let (r, adapter) = resolve(id, want)?;
+    let range = window.bounds(|| count_messages(adapter.as_ref(), &r))?;
     match format {
         "md" | "markdown" => {
             let mut out = std::io::BufWriter::new(std::io::stdout().lock());
-            stream_session_render(adapter.as_ref(), &r, &mut out, md_header, md_message, None)?;
-            use std::io::Write;
+            let outcome = stream_session_render(
+                adapter.as_ref(),
+                &r,
+                &mut out,
+                md_header,
+                md_message,
+                RenderOpts {
+                    range,
+                    max_bytes: window.max_bytes,
+                },
+            )?;
+            if let Some(next) = outcome.next {
+                writeln!(out, "{}", continue_hint(next))?;
+            }
             out.flush()?;
         }
-        // JSON and HTML need the whole session at once (full IR / a single self-contained document).
-        "json" => {
-            let session = adapter.parse(&r)?;
-            println!("{}", serde_json::to_string_pretty(&session)?);
-        }
+        "json" => print_session_json(adapter.as_ref(), &r, range, window.max_bytes)?,
+        // HTML is one self-contained document: windowed, but never cut mid-page.
         "html" => {
-            let session = adapter.parse(&r)?;
+            if window.max_bytes.is_some() {
+                bail!("--max-bytes does not apply to --format html — pick a window (--first/--last/--range/--around) instead");
+            }
+            let mut session = adapter.parse(&r)?;
+            if let Some(rg) = range {
+                let (s, e) = clamp(rg, session.messages.len());
+                session.messages = session.messages.drain(s..e).collect();
+            }
             print!("{}", cv_core::html::to_html(&session));
         }
         other => bail!("unknown format {other:?} (use md, json, or html)"),
@@ -304,7 +455,7 @@ pub(crate) fn cmd_export(id: &str, format: &str, harness: Option<String>) -> Res
 
 pub(crate) fn cmd_redact(id: &str, harness: Option<String>, format: &str, stats: bool) -> Result<()> {
     let want = parse_harness(&harness)?;
-    let (r, adapter) = cv_core::find(id, want)?.with_context(|| format!("no session matching {id:?}"))?;
+    let (r, adapter) = resolve(id, want)?;
     let session = adapter.parse(&r)?;
 
     let (redacted, st) = cv_core::redact::redact_with(&session, &Default::default());
@@ -334,7 +485,7 @@ pub(crate) fn cmd_redact(id: &str, harness: Option<String>, format: &str, stats:
 
 pub(crate) fn cmd_tree(id: &str, harness: Option<String>) -> Result<()> {
     let want = parse_harness(&harness)?;
-    let (r, adapter) = cv_core::find(id, want)?.with_context(|| format!("no session matching {id:?}"))?;
+    let (r, adapter) = resolve(id, want)?;
     let session = adapter.parse(&r)?;
 
     println!("# {}", session.label());
@@ -454,10 +605,10 @@ fn render_tree_dag(session: &Session) {
     walk(None, 0, session, &children);
 }
 
-/// One-line preview of a message for the tree: role, markers for tool turns / sub-agent spawns,
-/// and a text preview.
+/// One-line preview of a message for the tree: role (with its kind when that says more than the
+/// role), markers for tool turns / sub-agent spawns, and a text preview.
 fn tree_line(m: &Message) -> String {
-    let role = cv_core::render::role_label(m.role);
+    let role = role_tag(m);
     let mut tags = Vec::new();
     let has_tool_use = m.content.iter().any(|b| matches!(b, Block::ToolUse { .. }));
     let has_tool_result = m.content.iter().any(|b| matches!(b, Block::ToolResult { .. }));
@@ -476,9 +627,9 @@ fn tree_line(m: &Message) -> String {
     if has_tool_result {
         tags.push("↩ result".to_string());
     }
-    // Sub-agent spawns recorded in `extra` (harness-specific).
-    if let Some(sub) = sub_agent_from_extra(m) {
-        tags.push(format!("↳ sub-agent ({sub})"));
+    // The adapter said so: a spawn the tool-name heuristic didn't catch.
+    if m.kind == MessageKind::SubagentSpawn && !tags.iter().any(|t| t.starts_with("↳ sub-agent")) {
+        tags.push("↳ sub-agent".to_string());
     }
 
     let preview = m.text().map(|t| truncate(&t, 80)).unwrap_or_else(|| {
@@ -503,19 +654,6 @@ fn tree_line(m: &Message) -> String {
     format!("{role}{tagstr}  {preview}")
 }
 
-/// Look for a sub-agent spawn recorded in `Message::extra` under common harness keys.
-fn sub_agent_from_extra(m: &Message) -> Option<String> {
-    for key in ["subagent", "sub_agent", "subAgent", "spawn", "agent", "child_agent"] {
-        if let Some(v) = m.extra.get(key) {
-            return Some(match v {
-                serde_json::Value::String(s) => s.clone(),
-                other => truncate(&other.to_string(), 40),
-            });
-        }
-    }
-    None
-}
-
 // ---------- diff ----------
 
 /// Compare two sessions message-by-message: a shared prefix (`=`) then a divergence marked
@@ -523,12 +661,9 @@ fn sub_agent_from_extra(m: &Message) -> Option<String> {
 pub(crate) fn cmd_diff(a: &str, b: &str, harness: Option<String>) -> Result<()> {
     let default = parse_harness(&harness)?;
     // Each side may carry its own `harness:id` prefix so the two sessions can live in *different*
-    // harnesses — applying one `--harness` to both made cross-harness diffs impossible. A side with
-    // no recognized prefix falls back to the shared `--harness` (or unconstrained search).
-    let (wa, ida) = split_side_harness(a, default);
-    let (wb, idb) = split_side_harness(b, default);
-    let (ra, aa) = cv_core::find(ida, wa)?.with_context(|| format!("no session matching {a:?}"))?;
-    let (rb, ab) = cv_core::find(idb, wb)?.with_context(|| format!("no session matching {b:?}"))?;
+    // harnesses; a side with no prefix falls back to the shared `--harness` (or unconstrained).
+    let (ra, aa) = resolve(a, default)?;
+    let (rb, ab) = resolve(b, default)?;
     let sa = aa.parse(&ra)?;
     let sb = ab.parse(&rb)?;
 
@@ -572,18 +707,6 @@ pub(crate) fn cmd_diff(a: &str, b: &str, harness: Option<String>) -> Result<()> 
     Ok(())
 }
 
-/// Split an optional `<harness>:<id>` prefix off a diff side. Only treats the part before the first
-/// `:` as a harness when it actually names one; otherwise the whole string is the id and `fallback`
-/// (the shared `--harness`) applies.
-fn split_side_harness(spec: &str, fallback: Option<Harness>) -> (Option<Harness>, &str) {
-    if let Some((head, rest)) = spec.split_once(':') {
-        if let Some(h) = Harness::parse(head) {
-            return (Some(h), rest);
-        }
-    }
-    (fallback, spec)
-}
-
 /// One-line `role: text-preview` for a diff row.
 fn diff_line(m: &Message) -> String {
     let role = cv_core::render::role_label(m.role);
@@ -603,6 +726,23 @@ pub(crate) struct HeaderInfo {
     model: Option<String>,
 }
 
+/// What to render: an optional `[start, end)` message window and an optional byte budget.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct RenderOpts {
+    pub range: Option<(usize, Option<usize>)>,
+    /// Stop before the message that would push the rendered output past this many bytes (the
+    /// first in-window message is always rendered, so progress is always possible).
+    pub max_bytes: Option<usize>,
+}
+
+/// What a render did: how many messages it wrote, and — when the byte budget cut it short — the
+/// index of the first message it did NOT write (the `--range <next>..` continuation point).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RenderOutcome {
+    pub rendered: usize,
+    pub next: Option<usize>,
+}
+
 /// Render a session to `out` by **streaming** — each message is rendered and written as it arrives,
 /// then dropped, so a multi-GB transcript renders at O(largest message) instead of materializing the
 /// whole `Session`. The header needs the label and model, which come from the first user/assistant
@@ -614,8 +754,8 @@ pub(crate) fn stream_session_render<W: std::io::Write>(
     out: &mut W,
     header: impl Fn(&HeaderInfo) -> String,
     render_msg: impl Fn(&Message) -> String,
-    range: Option<(usize, Option<usize>)>,
-) -> Result<()> {
+    opts: RenderOpts,
+) -> Result<RenderOutcome> {
     use cv_core::{Flow, MessageSink, ParseOptions};
     const HOLDBACK: usize = 24;
 
@@ -638,6 +778,11 @@ pub(crate) fn stream_session_render<W: std::io::Write>(
         idx: usize,
         start: usize,
         end: Option<usize>,
+        // Byte budget: rendered bytes so far (header + messages) and where the cut landed.
+        max_bytes: Option<usize>,
+        bytes: usize,
+        rendered: usize,
+        next: Option<usize>,
     }
     impl<W: std::io::Write, H: Fn(&HeaderInfo) -> String, R: Fn(&Message) -> String> Sink<'_, W, H, R> {
         fn write(&mut self, s: &str) {
@@ -657,6 +802,7 @@ pub(crate) fn stream_session_render<W: std::io::Write>(
                 model: self.model.clone(),
             };
             let head = (self.header)(&info);
+            self.bytes += head.len();
             self.write(&head);
             let buffered = std::mem::take(&mut self.buf);
             for s in buffered {
@@ -681,7 +827,7 @@ pub(crate) fn stream_session_render<W: std::io::Write>(
             }
         }
         fn message(&mut self, m: Message) -> Flow {
-            if self.result.is_err() {
+            if self.result.is_err() || self.next.is_some() {
                 return Flow::Stop;
             }
             let idx = self.idx;
@@ -720,6 +866,16 @@ pub(crate) fn stream_session_render<W: std::io::Write>(
             }
             let rendered = (self.render_msg)(&m);
             drop(m);
+            // The byte budget: stop BEFORE the message that would overflow it — unless it is the
+            // first in-window message, which always renders so a window never comes back empty.
+            if let Some(budget) = self.max_bytes {
+                if self.rendered > 0 && self.bytes + rendered.len() > budget {
+                    self.next = Some(idx);
+                    return Flow::Stop;
+                }
+            }
+            self.bytes += rendered.len();
+            self.rendered += 1;
             if self.printed {
                 self.write(&rendered);
             } else {
@@ -737,8 +893,8 @@ pub(crate) fn stream_session_render<W: std::io::Write>(
         }
     }
 
-    let start = range.map(|(s, _)| s).unwrap_or(0);
-    let end = range.and_then(|(_, e)| e);
+    let start = opts.range.map(|(s, _)| s).unwrap_or(0);
+    let end = opts.range.and_then(|(_, e)| e);
     let mut sink = Sink {
         out,
         harness: r.harness,
@@ -756,11 +912,15 @@ pub(crate) fn stream_session_render<W: std::io::Write>(
         idx: 0,
         start,
         end,
+        max_bytes: opts.max_bytes,
+        bytes: 0,
+        rendered: 0,
+        next: None,
     };
     // Windowed: lazy spans, so out-of-window giant fields arrive as 16-byte handles and only
     // in-window messages materialize (the sink already resolves per message). A full show reads
     // every byte regardless — spans would only add resolve overhead there (floor = C).
-    let opts = if range.is_some() {
+    let parse_opts = if opts.range.is_some() {
         ParseOptions::lazy()
     } else {
         ParseOptions::bulk()
@@ -773,17 +933,23 @@ pub(crate) fn stream_session_render<W: std::io::Write>(
     // no/stale offsets — the sink is untouched; fall through to the full stream below.
     if start > 0 {
         sink.idx = start;
-        if cv_core::offsets::stream_range(r, start, end, &opts, &mut sink)? {
+        if cv_core::offsets::stream_range(r, start, end, &parse_opts, &mut sink)? {
             sink.flush_header();
             sink.result?;
-            return Ok(());
+            return Ok(RenderOutcome {
+                rendered: sink.rendered,
+                next: sink.next,
+            });
         }
         sink.idx = 0;
     }
-    adapter.stream(r, &opts, &mut sink)?;
+    adapter.stream(r, &parse_opts, &mut sink)?;
     sink.flush_header(); // short sessions (no assistant turn / < HOLDBACK msgs) flush here
     sink.result?;
-    Ok(())
+    Ok(RenderOutcome {
+        rendered: sink.rendered,
+        next: sink.next,
+    })
 }
 
 /// Header for `cv show` (mirrors the old eager header exactly).
@@ -800,13 +966,7 @@ pub(crate) fn show_header(h: &HeaderInfo) -> String {
 
 /// One rendered `cv show` message block (the String form of the old `print_message`).
 pub(crate) fn show_message(m: &Message) -> String {
-    let tag = match m.role {
-        Role::System => system_tag(m),
-        Role::User => "user".to_string(),
-        Role::Assistant => "assistant".to_string(),
-        Role::Tool => "tool".to_string(),
-    };
-    let mut s = format!("── {tag} ──\n");
+    let mut s = format!("── {} ──\n", role_tag(m));
     for b in &m.content {
         match b {
             Block::Text { text } => {
@@ -814,22 +974,26 @@ pub(crate) fn show_message(m: &Message) -> String {
                 s.push('\n');
             }
             Block::Thinking { text, .. } => s.push_str(&format!("[thinking] {}\n", truncate(text, 200))),
-            Block::ToolUse { name, input, .. } => {
-                s.push_str(&format!("[tool_use {name}] {}\n", truncate(&input.to_string(), 200)))
-            }
+            Block::ToolUse { id, name, input, .. } => s.push_str(&format!(
+                "[tool_use {name} {id}] {}\n",
+                truncate(&input.to_string(), 200)
+            )),
             Block::ToolResult {
+                tool_use_id,
                 content,
                 is_error,
                 details,
                 ..
             } => {
                 s.push_str(&format!(
-                    "[tool_result{}] {}\n",
+                    "[tool_result{} {tool_use_id}] {}\n",
                     if *is_error { " error" } else { "" },
                     truncate(content, 200)
                 ));
                 if let Some(p) = persisted_path(details.as_ref()) {
-                    s.push_str(&format!("  ↳ full output on disk: {p}\n"));
+                    s.push_str(&format!(
+                        "  ↳ full output on disk: {p} (cv cat <session> {tool_use_id})\n"
+                    ));
                 }
             }
             Block::File { path, source, .. } => s.push_str(&format!(
@@ -843,18 +1007,43 @@ pub(crate) fn show_message(m: &Message) -> String {
     s
 }
 
-/// Label for a System turn: the attachment kind (a Claude Code system reminder — `hook_success`,
-/// `edited_text_file`, …) or the record subtype (`api_error`, `compact_boundary`, …) when the
-/// adapter recorded one, so a reader can tell a hook's output from a compaction marker.
-fn system_tag(m: &Message) -> String {
-    let kind = m
-        .extra
-        .get("attachmentType")
-        .or_else(|| m.extra.get("subtype"))
-        .and_then(|v| v.as_str());
-    match kind {
-        Some(k) => format!("system · {k}"),
-        None => "system".to_string(),
+/// The turn label: the role, plus the message `kind` whenever it says more than the role does. A
+/// System turn always carries its kind (`system · injected_context`, `system · error`, …) and,
+/// for Claude attachments, the attachment kind from `extra["claude"]["attachment_type"]`
+/// (`system · injected_context · hook_success`). Other roles add the kind only when it differs
+/// from the role's default (`user · compaction_summary`, `assistant · error`).
+fn role_tag(m: &Message) -> String {
+    match m.role {
+        Role::System => {
+            let attachment = m
+                .harness_extra(Harness::Claude)
+                .and_then(|c| c.get("attachment_type"))
+                .and_then(|v| v.as_str());
+            match attachment {
+                Some(a) => format!("system · {} · {a}", kind_name(m.kind)),
+                None => format!("system · {}", kind_name(m.kind)),
+            }
+        }
+        role => {
+            let base = match role {
+                Role::User => "user",
+                Role::Assistant => "assistant",
+                _ => "tool",
+            };
+            if m.kind == MessageKind::for_role(role) {
+                base.to_string()
+            } else {
+                format!("{base} · {}", kind_name(m.kind))
+            }
+        }
+    }
+}
+
+/// `MessageKind` as serde spells it (`injected_context`, `compaction_boundary`, …).
+fn kind_name(k: MessageKind) -> String {
+    match serde_json::to_value(k) {
+        Ok(serde_json::Value::String(s)) => s,
+        _ => format!("{k:?}").to_ascii_lowercase(),
     }
 }
 
@@ -880,10 +1069,10 @@ fn md_header(h: &HeaderInfo) -> String {
 /// One rendered `cv export md` message section.
 fn md_message(m: &Message) -> String {
     let who = match m.role {
-        Role::System => "System",
-        Role::User => "User",
-        Role::Assistant => "Assistant",
-        Role::Tool => "Tool",
+        Role::System => format!("System · {}", kind_name(m.kind)),
+        Role::User => "User".to_string(),
+        Role::Assistant => "Assistant".to_string(),
+        Role::Tool => "Tool".to_string(),
     };
     let mut out = format!("## {who}\n\n");
     for b in &m.content {
@@ -922,7 +1111,6 @@ fn md_message(m: &Message) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
 
     /// `CLUSTERVISION_HOME` is process-global — these are the only env-touching unit tests in
     /// this binary, serialized against each other.
@@ -947,10 +1135,14 @@ mod tests {
     }
 
     fn render(r: &SessionRef, range: Option<(usize, Option<usize>)>) -> String {
+        render_with(r, RenderOpts { range, max_bytes: None }).0
+    }
+
+    fn render_with(r: &SessionRef, opts: RenderOpts) -> (String, RenderOutcome) {
         let adapter = cv_core::harness::for_harness(r.harness).unwrap();
         let mut out = Vec::new();
-        stream_session_render(adapter.as_ref(), r, &mut out, show_header, show_message, range).unwrap();
-        String::from_utf8(out).unwrap()
+        let outcome = stream_session_render(adapter.as_ref(), r, &mut out, show_header, show_message, opts).unwrap();
+        (String::from_utf8(out).unwrap(), outcome)
     }
 
     /// Whether a windowed render of `r` would take the seek path right now.
@@ -959,15 +1151,9 @@ mod tests {
         cv_core::offsets::stream_range(r, start, Some(start + 1), &cv_core::ParseOptions::lazy(), &mut sink).unwrap()
     }
 
-    /// THE Phase-2 contract: the same window rendered via the seek path (offsets recorded) and
-    /// via the full stream (no offsets) must be **byte-identical** — header (incl. the model the
-    /// skipped prefix provides) and body. And a stale recording falls back, output unchanged.
-    #[test]
-    fn windowed_render_is_byte_identical_via_seek_and_full_stream() {
-        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let home = temp_home("claude");
-        std::env::set_var("CLUSTERVISION_HOME", &home);
-
+    /// A small Claude fixture: title, a user turn, a model-carrying assistant turn, one big user
+    /// turn, then eight short follow-ups (11 messages).
+    fn claude_fixture(home: &std::path::Path) -> SessionRef {
         let path = home.join("s.jsonl");
         let big = "long \"quoted\" content\n".repeat(400);
         let mut f = std::fs::File::create(&path).unwrap();
@@ -1000,16 +1186,28 @@ mod tests {
             .unwrap();
         }
         drop(f);
-        let r = SessionRef {
+        SessionRef {
             id: "render-seek".into(),
             harness: Harness::Claude,
-            path: path.clone(),
+            path,
             cwd: Some("/w".into()),
             title: Some("render seek".into()),
             created_at: None,
             updated_at: None,
             message_count: 11,
-        };
+        }
+    }
+
+    /// THE Phase-2 contract: the same window rendered via the seek path (offsets recorded) and
+    /// via the full stream (no offsets) must be **byte-identical** — header (incl. the model the
+    /// skipped prefix provides) and body. And a stale recording falls back, output unchanged.
+    #[test]
+    fn windowed_render_is_byte_identical_via_seek_and_full_stream() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = temp_home("claude");
+        std::env::set_var("CLUSTERVISION_HOME", &home);
+        let r = claude_fixture(&home);
+        let path = r.path.clone();
         record_offsets(&r);
         assert!(seekable(&r, 3), "recording must enable the seek path");
 
@@ -1041,6 +1239,82 @@ mod tests {
 
         std::env::remove_var("CLUSTERVISION_HOME");
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// `--max-bytes`: the render stops before the message that would overflow the budget and
+    /// reports the continuation index; the first in-window message always renders; a budget
+    /// that fits everything reports no cut.
+    #[test]
+    fn byte_budget_cuts_and_reports_the_next_index() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = temp_home("budget");
+        std::env::set_var("CLUSTERVISION_HOME", temp_home("budget-empty"));
+        let r = claude_fixture(&home);
+
+        // Message 2 is the ~9 KB giant: a 1 KB budget renders messages 0 and 1, then stops.
+        let (out, oc) = render_with(
+            &r,
+            RenderOpts {
+                range: None,
+                max_bytes: Some(1024),
+            },
+        );
+        assert_eq!(oc.rendered, 2, "{out}");
+        assert_eq!(oc.next, Some(2), "{out}");
+        assert!(
+            out.contains("q one") && out.contains("a one") && !out.contains("follow-up"),
+            "{out}"
+        );
+
+        // Starting AT the giant: it renders anyway (progress is always possible), then the cut.
+        let (out, oc) = render_with(
+            &r,
+            RenderOpts {
+                range: Some((2, None)),
+                max_bytes: Some(1024),
+            },
+        );
+        assert_eq!(oc.rendered, 1, "{out}");
+        assert_eq!(oc.next, Some(3), "{out}");
+        assert!(out.contains("long \"quoted\" content"), "{out}");
+
+        // A generous budget: everything, no cut.
+        let (_, oc) = render_with(
+            &r,
+            RenderOpts {
+                range: Some((3, None)),
+                max_bytes: Some(1 << 20),
+            },
+        );
+        assert_eq!(oc.rendered, 8);
+        assert_eq!(oc.next, None);
+
+        std::env::remove_var("CLUSTERVISION_HOME");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// System turns are labelled by `kind` (plus Claude's attachment kind when present); other
+    /// roles add the kind only when it says more than the role.
+    #[test]
+    fn turn_labels_come_from_kind_not_flat_extra_keys() {
+        let mut m = Message::new(Role::System);
+        m.kind = MessageKind::InjectedContext;
+        assert_eq!(role_tag(&m), "system · injected_context");
+        m.harness_extra_mut(Harness::Claude)
+            .insert("attachment_type".into(), serde_json::json!("hook_success"));
+        assert_eq!(role_tag(&m), "system · injected_context · hook_success");
+        // A flat legacy key is ignored: only the nested harness bag counts.
+        let mut legacy = Message::new(Role::System);
+        legacy.kind = MessageKind::Error;
+        legacy.extra.insert("subtype".into(), serde_json::json!("api_error"));
+        assert_eq!(role_tag(&legacy), "system · error");
+        // Defaults stay bare; a non-default kind on a user turn is surfaced.
+        assert_eq!(role_tag(&Message::new(Role::User)), "user");
+        assert_eq!(role_tag(&Message::new(Role::Assistant)), "assistant");
+        let mut summary = Message::new(Role::User);
+        summary.kind = MessageKind::CompactionSummary;
+        assert_eq!(role_tag(&summary), "user · compaction_summary");
+        assert!(show_message(&summary).starts_with("── user · compaction_summary ──\n"));
     }
 
     /// Same contract for codex, whose metadata comes from the recorded `meta()` snapshot (the

@@ -88,10 +88,15 @@ fn meta_row(out: &mut String, key: &str, value: &str) {
 
 fn render_message(m: &Message, out: &mut String) {
     let role = role_class(m.role);
-    out.push_str(&format!("<section class=\"msg msg-{role}\">\n"));
+    // The section carries both the role (styling) and the kind (what the turn is), so a stylesheet
+    // can dim notices or highlight compaction markers without parsing the label.
+    out.push_str(&format!(
+        "<section class=\"msg msg-{role} kind-{}\">\n",
+        m.kind.as_str()
+    ));
 
     out.push_str("<div class=\"msg-head\"><span class=\"role\">");
-    out.push_str(&escape(role));
+    out.push_str(&escape(&crate::render::turn_label(m)));
     out.push_str("</span>");
     if let Some(t) = &m.timestamp {
         out.push_str("<span class=\"ts\">");

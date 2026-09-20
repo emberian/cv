@@ -36,6 +36,24 @@
 //! `url`, `source`), `agent` (an `@agent` mention / sub-agent reference), `subtask` (a spawned
 //! sub-session with its own prompt/agent/model), `patch`, `snapshot`, `step-start`,
 //! `step-finish` (per-step cost/tokens), `retry`, `compaction`.
+//!
+//! ## Kinds (`docs/INTERFACE-V2.md` §4)
+//!
+//! A `user` record is a `Prompt`/Human and an `assistant` record a `Reply`/Model, except: a record
+//! whose parts include `compaction` (the user-side request that starts a compaction — on this
+//! machine always a user record with that one part) is the `CompactionBoundary`; an assistant
+//! record with `summary: true` (`agent: compaction`) is the `CompactionSummary`; an assistant record
+//! carrying `error` is an `Error` (`extra["opencode"]["error"]` + `error_name`), whatever partial
+//! text it kept; a record with an `agent` mention or a `subtask` part is a `SubagentSpawn`; a
+//! `system` record is the `SystemPrompt` (also `Session::system_prompt`). Compaction/error origin
+//! is Harness. Tool results are split into a trailing `ToolResult`/Harness message.
+//! `step-start`/`step-finish`/`retry`/`snapshot`/`patch` parts never surface as messages; they ride
+//! on their record's `extra["opencode"]` bag (`steps`, `retries`, `snapshots`, `patches`), as do
+//! `agent_refs`, `subtasks`, `compactions`, `unknown_parts`, the record's `agent`/`mode`/
+//! `providerID`/`finish`/`variant`/`structured`/`format`/`system`/`tools`/`cwd`, `summary_diffs`
+//! (old generation) and `error`/`error_name`. `cost` and `tokens.reasoning` are first-class
+//! (`Usage::cost_usd`, `Usage::reasoning_tokens`); `session.parent_id` is `Lineage::parent`; the
+//! remaining `session` columns land in `Session::extra["opencode"]`.
 
 use super::Adapter;
 use crate::ir::*;
@@ -257,7 +275,14 @@ impl Adapter for OpenCode {
             source_path: Some(r.path.clone()),
             extra: serde_json::Map::new(),
             system_prompt: None,
-            lineage: crate::ir::Lineage::default(),
+            lineage: Lineage {
+                parent: meta
+                    .get("parentID")
+                    .and_then(Value::as_str)
+                    .filter(|p| !p.is_empty())
+                    .map(str::to_string),
+                ..Lineage::default()
+            },
         };
 
         // Order message files by `time/created` (same ordering as before) while holding only the
@@ -288,10 +313,8 @@ impl Adapter for OpenCode {
             };
             let msg_id = mv.get("id").and_then(Value::as_str).unwrap_or("");
             let parts = self.load_parts(msg_id);
-            for built in build_messages(&mv, &parts) {
-                if s.model.is_none() {
-                    s.model = built.model.clone();
-                }
+            for mut built in build_messages(&mv, &parts) {
+                fold_into_session(&mut s, &mut built);
                 if sink.message(built) == Flow::Stop {
                     return Ok(s);
                 }
@@ -299,6 +322,21 @@ impl Adapter for OpenCode {
         }
 
         Ok(s)
+    }
+}
+
+/// Session facts a message reveals as it streams past: the session model (the first one seen when
+/// the store gave none), the system prompt (a `system` record), and the IR diet — `Message::model`
+/// stays set only when it differs from the session's.
+fn fold_into_session(s: &mut Session, m: &mut Message) {
+    if s.model.is_none() {
+        s.model = m.model.clone();
+    }
+    if m.model.is_some() && m.model == s.model {
+        m.model = None;
+    }
+    if m.kind == MessageKind::SystemPrompt && s.system_prompt.is_none() {
+        s.system_prompt = m.text();
     }
 }
 
@@ -355,8 +393,9 @@ mod db {
     use rusqlite::{Connection, OpenFlags};
     use std::collections::HashMap;
 
-    /// Session columns the IR first-classes (everything else lands in `Session::extra` verbatim).
-    const FIRSTCLASS: &[&str] = &["id", "directory", "title", "time_created", "time_updated"];
+    /// Session columns the IR first-classes (`parent_id` is `Lineage::parent`; everything else lands
+    /// in `Session::extra["opencode"]` verbatim).
+    const FIRSTCLASS: &[&str] = &["id", "directory", "title", "time_created", "time_updated", "parent_id"];
     /// Columns opencode declares `{ mode: "json" }` — stored as JSON text, decoded on read.
     const JSON_COLS: &[&str] = &["model", "metadata", "revert", "permission", "summary_diffs"];
 
@@ -455,20 +494,28 @@ mod db {
                 None => anyhow::bail!("no opencode session {} in {}", r.id, r.path.display()),
             }
         };
-        let mut extra = Map::new();
+        let mut bag = Map::new();
         for (k, v) in &row {
-            // Keep the session's own facts (parent_id, agent, model, cost, tokens_*, summary_*,
-            // share_url, version, project_id, time_archived, metadata, …) verbatim; skip blanks.
+            // Keep the session's own facts (agent, model, cost, tokens_*, summary_*, share_url,
+            // version, project_id, time_archived, metadata, …) verbatim; skip blanks.
             if FIRSTCLASS.contains(&k.as_str()) || v.as_str().is_some_and(str::is_empty) {
                 continue;
             }
-            extra.insert(k.clone(), v.clone());
+            bag.insert(k.clone(), v.clone());
         }
         let mut s = Session {
             id: r.id.clone(),
             harness: Harness::OpenCode,
             system_prompt: None,
-            lineage: crate::ir::Lineage::default(),
+            // A sub-agent session (`@agent` mention, `subtask`) points at the session that spawned it.
+            lineage: Lineage {
+                parent: row
+                    .get("parent_id")
+                    .and_then(Value::as_str)
+                    .filter(|p| !p.is_empty())
+                    .map(str::to_string),
+                ..Lineage::default()
+            },
             cwd: row.get("directory").and_then(Value::as_str).map(PathBuf::from),
             title: row
                 .get("title")
@@ -487,8 +534,11 @@ mod db {
             git: None,
             messages: Vec::new(),
             source_path: Some(r.path.clone()),
-            extra,
+            extra: Map::new(),
         };
+        if !bag.is_empty() {
+            s.harness_extra_mut(Harness::OpenCode).extend(bag);
+        }
         sink.meta(&s);
 
         let mut msgs = conn.prepare("SELECT id, data FROM message WHERE session_id = ?1 ORDER BY time_created, id")?;
@@ -514,10 +564,8 @@ mod db {
                     pv.push(Value::Object(po));
                 }
             }
-            for built in build_messages(&Value::Object(mv), &pv) {
-                if s.model.is_none() {
-                    s.model = built.model.clone();
-                }
+            for mut built in build_messages(&Value::Object(mv), &pv) {
+                fold_into_session(&mut s, &mut built);
                 if sink.message(built) == Flow::Stop {
                     return Ok(s);
                 }
@@ -540,7 +588,10 @@ fn build_messages(mv: &Value, parts: &[Value]) -> Vec<Message> {
     };
 
     let msg_id = mv.get("id").and_then(Value::as_str).unwrap_or("");
-    let mut m = Message::new(role);
+    let mut m = match role {
+        Role::System => Message::of_kind(Role::System, MessageKind::SystemPrompt, Origin::Harness),
+        role => Message::new(role),
+    };
     m.id = (!msg_id.is_empty()).then(|| msg_id.to_string());
     m.parent_id = mv.get("parentID").and_then(Value::as_str).map(str::to_string);
     m.timestamp = mv.pointer("/time/created").and_then(super::ts_from_value);
@@ -550,8 +601,13 @@ fn build_messages(mv: &Value, parts: &[Value]) -> Vec<Message> {
         .and_then(Value::as_str)
         .or_else(|| mv.pointer("/model/modelID").and_then(Value::as_str))
         .map(str::to_string);
-    m.usage = parse_tokens(mv.get("tokens"));
-    collect_message_extra(mv, &mut m.extra);
+    m.usage = parse_usage(mv);
+    // Harness facts, gathered here and nested under `extra["opencode"]` at the end (module doc).
+    let mut bag = Map::new();
+    collect_message_extra(mv, &mut bag);
+    // Kind evidence from the parts: a `compaction` part, an `agent` mention / `subtask` spawn.
+    let mut compaction = false;
+    let mut spawn = false;
 
     let mut tool_results: Vec<Block> = Vec::new();
     for part in parts {
@@ -567,15 +623,18 @@ fn build_messages(mv: &Value, parts: &[Value]) -> Vec<Message> {
             }
             "reasoning" => {
                 if let Some(t) = part.get("text").and_then(Value::as_str) {
-                    if !t.is_empty() {
-                        // Providers stash an opaque signature under
-                        // `metadata.<provider>.signature` (e.g. anthropic). Preserve it so a
-                        // thinking block can round-trip.
-                        let signature = part
-                            .pointer("/metadata/anthropic/signature")
-                            .and_then(Value::as_str)
-                            .or_else(|| find_signature(part.get("metadata")))
-                            .map(str::to_string);
+                    // Providers stash an opaque signature under `metadata.<provider>.signature`
+                    // (e.g. anthropic). Preserve it so a thinking block can round-trip.
+                    let signature = part
+                        .pointer("/metadata/anthropic/signature")
+                        .and_then(Value::as_str)
+                        .or_else(|| find_signature(part.get("metadata")))
+                        .map(str::to_string);
+                    // A signature-only part (empty text, opaque blob) is still the whole of a
+                    // redacted thinking turn: dropping it deleted the turn's only content, and with
+                    // it the message — which cost a ported session 134 assistant turns and their
+                    // usage, timestamps and ids.
+                    if !t.is_empty() || signature.is_some() {
                         m.content.push(Block::Thinking {
                             text: t.to_string().into(),
                             signature,
@@ -594,33 +653,39 @@ fn build_messages(mv: &Value, parts: &[Value]) -> Vec<Message> {
                 m.content.push(file_block(part));
             }
             "agent" => {
-                // An `@agent` mention / sub-agent reference embedded in a user prompt. No IR
-                // block fits; surface its name as text and keep the structured form in extra.
+                // An `@agent` mention / sub-agent reference embedded in a user prompt — opencode
+                // routes the prompt to that agent in a child session. No IR block fits; surface
+                // its name as text and keep the structured form in the bag.
                 if let Some(name) = part.get("name").and_then(Value::as_str) {
                     m.content.push(Block::Text {
                         text: format!("@{name}").into(),
                     });
                 }
-                push_extra_array(&mut m.extra, "agent_refs", part.clone());
+                push_extra_array(&mut bag, "agent_refs", part.clone());
+                spawn = true;
             }
             "subtask" => {
                 // A spawned sub-session (Task tool style). Render its prompt + which agent ran
-                // it; keep the full record (agent/model/command/description) in extra.
+                // it; keep the full record (agent/model/command/description) in the bag.
                 let agent = part.get("agent").and_then(Value::as_str).unwrap_or("agent");
                 let prompt = part.get("prompt").and_then(Value::as_str).unwrap_or("");
                 m.content.push(Block::Text {
                     text: format!("[subtask → {agent}] {prompt}").into(),
                 });
-                push_extra_array(&mut m.extra, "subtasks", part.clone());
+                push_extra_array(&mut bag, "subtasks", part.clone());
+                spawn = true;
             }
-            "patch" => push_extra_array(&mut m.extra, "patches", part.clone()),
-            "snapshot" => push_extra_array(&mut m.extra, "snapshots", part.clone()),
-            "step-start" | "step-finish" => push_extra_array(&mut m.extra, "steps", part.clone()),
-            "retry" => push_extra_array(&mut m.extra, "retries", part.clone()),
-            "compaction" => push_extra_array(&mut m.extra, "compactions", part.clone()),
+            "patch" => push_extra_array(&mut bag, "patches", part.clone()),
+            "snapshot" => push_extra_array(&mut bag, "snapshots", part.clone()),
+            "step-start" | "step-finish" => push_extra_array(&mut bag, "steps", part.clone()),
+            "retry" => push_extra_array(&mut bag, "retries", part.clone()),
+            "compaction" => {
+                push_extra_array(&mut bag, "compactions", part.clone());
+                compaction = true;
+            }
             other if !other.is_empty() => {
                 // Unknown / future part type: never drop it silently — stash verbatim.
-                push_extra_array(&mut m.extra, "unknown_parts", part.clone());
+                push_extra_array(&mut bag, "unknown_parts", part.clone());
             }
             _ => {}
         }
@@ -628,7 +693,7 @@ fn build_messages(mv: &Value, parts: &[Value]) -> Vec<Message> {
 
     // Older inline-summary generation stored no parts — fall back to the AI summary so the turn
     // isn't blank. (`summary` must be an *object* here; a boolean `summary: true` is a newer
-    // compaction marker handled in collect_message_extra.)
+    // compaction marker: the `CompactionSummary` kind below.)
     if m.content.is_empty() {
         let summary = mv
             .pointer("/summary/body")
@@ -643,12 +708,29 @@ fn build_messages(mv: &Value, parts: &[Value]) -> Vec<Message> {
         }
     }
 
+    // What the record IS, most specific first (module doc "Kinds").
+    if compaction {
+        m.kind = MessageKind::CompactionBoundary;
+        m.origin = Origin::Harness;
+    } else if mv.get("summary").and_then(Value::as_bool) == Some(true) {
+        m.kind = MessageKind::CompactionSummary;
+        m.origin = Origin::Harness;
+    } else if mv.get("error").is_some_and(|e| !e.is_null()) {
+        m.kind = MessageKind::Error;
+        m.origin = Origin::Harness;
+    } else if spawn {
+        m.kind = MessageKind::SubagentSpawn;
+    }
+    if !bag.is_empty() {
+        m.harness_extra_mut(Harness::OpenCode).extend(bag);
+    }
+
     let mut out = Vec::new();
-    if !m.content.is_empty() || !m.extra.is_empty() {
+    if !m.content.is_empty() || !m.extra.is_empty() || m.kind != MessageKind::for_role(role) {
         out.push(m);
     }
     if !tool_results.is_empty() {
-        let mut tm = Message::new(Role::Tool);
+        let mut tm = Message::of_kind(Role::Tool, MessageKind::ToolResult, Origin::Harness);
         tm.content = tool_results;
         out.push(tm);
     }
@@ -763,13 +845,14 @@ fn file_block(part: &Value) -> Block {
     }
 }
 
-/// Preserve message-level fields the IR has no home for, verbatim, in `Message.extra`.
-fn collect_message_extra(mv: &Value, extra: &mut Map<String, Value>) {
+/// Preserve message-level fields the IR has no home for, verbatim, in the record's
+/// `extra["opencode"]` bag. (`cost`/`tokens` are [`Usage`]; `summary: true` is the
+/// `CompactionSummary` kind; `error` also sets the `Error` kind.)
+fn collect_message_extra(mv: &Value, bag: &mut Map<String, Value>) {
     for key in [
         "agent",      // which agent ran this turn (Sisyphus, build, compaction, …)
         "mode",       // deprecated alias of agent; kept for old records
         "providerID", // amazon-bedrock, anthropic, …
-        "cost",       // USD cost of the turn
         "finish",     // finish reason: stop | tool-calls | length | …
         "error",      // assistant error object (aborted / overflow / api error)
         "variant",    // model variant
@@ -780,36 +863,25 @@ fn collect_message_extra(mv: &Value, extra: &mut Map<String, Value>) {
     ] {
         if let Some(v) = mv.get(key) {
             if !v.is_null() {
-                extra.insert(key.to_string(), v.clone());
+                bag.insert(key.to_string(), v.clone());
             }
         }
     }
     // `path: {cwd, root}` — per-turn working dir.
     if let Some(cwd) = mv.pointer("/path/cwd").and_then(Value::as_str) {
-        extra.insert("cwd".to_string(), json!(cwd));
+        bag.insert("cwd".to_string(), json!(cwd));
     }
     // The assistant `error` union is tagged by `name` — ProviderAuthError, UnknownError,
     // MessageOutputLengthError, MessageAbortedError, StructuredOutputError, ContextOverflowError,
     // ContentFilterError (2026-06), APIError — with the detail under `data`. Lift the tag so
     // consumers can filter on it without unpicking the object.
     if let Some(name) = mv.pointer("/error/name").and_then(Value::as_str) {
-        extra.insert("error_name".to_string(), json!(name));
-    }
-    // A boolean `summary: true` marks a compaction summary message (newer generation). Don't
-    // confuse it with the older inline `summary` object.
-    if mv.get("summary").and_then(Value::as_bool) == Some(true) {
-        extra.insert("is_compaction_summary".to_string(), json!(true));
+        bag.insert("error_name".to_string(), json!(name));
     }
     // The older inline summary's `diffs[]` are worth keeping even though we render body as text.
     if let Some(diffs) = mv.pointer("/summary/diffs") {
         if diffs.is_array() && !diffs.as_array().map(|a| a.is_empty()).unwrap_or(true) {
-            extra.insert("summary_diffs".to_string(), diffs.clone());
-        }
-    }
-    // tokens.reasoning isn't on Usage; keep it visible.
-    if let Some(r) = mv.pointer("/tokens/reasoning").and_then(Value::as_u64) {
-        if r > 0 {
-            extra.insert("reasoning_tokens".to_string(), json!(r));
+            bag.insert("summary_diffs".to_string(), diffs.clone());
         }
     }
 }
@@ -842,15 +914,22 @@ fn coerce_text(v: &Value) -> String {
     }
 }
 
-fn parse_tokens(v: Option<&Value>) -> Option<Usage> {
-    let v = v?;
+/// `tokens{input, output, reasoning, cache{read, write}}` + `cost` (USD) of an assistant record.
+/// `reasoning` is always written by opencode; it is reported only when non-zero.
+fn parse_usage(mv: &Value) -> Option<Usage> {
+    let t = mv.get("tokens").filter(|t| t.is_object());
+    let cost = mv.get("cost").and_then(Value::as_f64);
+    if t.is_none() && cost.is_none() {
+        return None;
+    }
+    let get = |k: &str| t.and_then(|t| t.pointer(k)).and_then(Value::as_u64);
     Some(Usage {
-        input_tokens: v.get("input").and_then(Value::as_u64),
-        output_tokens: v.get("output").and_then(Value::as_u64),
-        cache_read_tokens: v.pointer("/cache/read").and_then(Value::as_u64),
-        cache_creation_tokens: v.pointer("/cache/write").and_then(Value::as_u64),
-        reasoning_tokens: None,
-        cost_usd: None,
+        input_tokens: get("/input"),
+        output_tokens: get("/output"),
+        cache_read_tokens: get("/cache/read"),
+        cache_creation_tokens: get("/cache/write"),
+        reasoning_tokens: get("/reasoning").filter(|&r| r > 0),
+        cost_usd: cost,
     })
 }
 
@@ -892,16 +971,26 @@ mod tests {
         }
         assert!(matches!(&asst.content[1], Block::Text { text } if text == "Hello"));
         assert!(matches!(&asst.content[2], Block::ToolUse { name, .. } if name == "bash"));
-        // message-level extras
-        assert_eq!(asst.extra.get("agent").and_then(Value::as_str), Some("build"));
-        assert_eq!(asst.extra.get("finish").and_then(Value::as_str), Some("tool-calls"));
-        assert_eq!(asst.extra.get("reasoning_tokens").and_then(Value::as_u64), Some(3));
-        // usage
+        assert_eq!((asst.kind, asst.origin), (MessageKind::Reply, Origin::Model));
+        // message-level facts live in the harness bag only
+        let bag = &asst.extra["opencode"];
+        assert_eq!(bag["agent"], "build");
+        assert_eq!(bag["finish"], "tool-calls");
+        assert_eq!(bag["providerID"], "anthropic");
+        assert!(
+            bag.get("cost").is_none() && bag.get("reasoning_tokens").is_none(),
+            "{bag}"
+        );
+        assert_eq!(asst.extra.len(), 1, "{:?}", asst.extra);
+        // usage, cost and reasoning first-class
         let u = asst.usage.as_ref().unwrap();
         assert_eq!(u.input_tokens, Some(10));
         assert_eq!(u.cache_creation_tokens, Some(2));
+        assert_eq!(u.reasoning_tokens, Some(3));
+        assert_eq!(u.cost_usd, Some(0.01));
         // tool result became its own Tool message
         assert_eq!(out[1].role, Role::Tool);
+        assert_eq!((out[1].kind, out[1].origin), (MessageKind::ToolResult, Origin::Harness));
         match &out[1].content[0] {
             Block::ToolResult {
                 content,
@@ -971,38 +1060,25 @@ mod tests {
         ]);
         let out = build_messages(&mv, &p);
         let m = &out[0];
-        assert_eq!(
-            m.extra.get("patches").and_then(|v| v.as_array()).map(|a| a.len()),
-            Some(1)
-        );
-        assert_eq!(
-            m.extra.get("snapshots").and_then(|v| v.as_array()).map(|a| a.len()),
-            Some(1)
-        );
-        assert_eq!(
-            m.extra.get("steps").and_then(|v| v.as_array()).map(|a| a.len()),
-            Some(2)
-        );
-        assert_eq!(
-            m.extra.get("retries").and_then(|v| v.as_array()).map(|a| a.len()),
-            Some(1)
-        );
-        assert_eq!(
-            m.extra.get("compactions").and_then(|v| v.as_array()).map(|a| a.len()),
-            Some(1)
-        );
-        assert_eq!(
-            m.extra.get("agent_refs").and_then(|v| v.as_array()).map(|a| a.len()),
-            Some(1)
-        );
-        assert_eq!(
-            m.extra.get("subtasks").and_then(|v| v.as_array()).map(|a| a.len()),
-            Some(1)
-        );
+        let bag = &m.extra["opencode"];
+        let len = |k: &str| bag.get(k).and_then(|v| v.as_array()).map(|a| a.len());
+        assert_eq!(len("patches"), Some(1));
+        assert_eq!(len("snapshots"), Some(1));
+        assert_eq!(len("steps"), Some(2), "step-start/finish never surface as messages");
+        assert_eq!(len("retries"), Some(1));
+        assert_eq!(len("compactions"), Some(1));
+        assert_eq!(len("agent_refs"), Some(1));
+        assert_eq!(len("subtasks"), Some(1));
         // unknown part type is never dropped
+        assert_eq!(len("unknown_parts"), Some(1));
+        assert_eq!(m.extra.len(), 1, "nothing flat: {:?}", m.extra);
+        // the compaction part outranks the spawn parts for the kind (it is the rarer, structural one)
+        assert_eq!((m.kind, m.origin), (MessageKind::CompactionBoundary, Origin::Harness));
+        // without it, the agent mention / subtask make the record a spawn
+        let out = build_messages(&mv, &p[..2]);
         assert_eq!(
-            m.extra.get("unknown_parts").and_then(|v| v.as_array()).map(|a| a.len()),
-            Some(1)
+            (out[0].kind, out[0].origin),
+            (MessageKind::SubagentSpawn, Origin::Model)
         );
         // agent + subtask also surface as text
         assert!(m
@@ -1027,26 +1103,83 @@ mod tests {
         let out = build_messages(&mv, &[]);
         assert_eq!(out.len(), 1);
         assert!(matches!(&out[0].content[0], Block::Text { text } if text == "Removed debug comments."));
-        // diffs preserved in extra
-        assert!(out[0].extra.get("summary_diffs").is_some());
+        assert_eq!((out[0].kind, out[0].origin), (MessageKind::Prompt, Origin::Human));
+        // diffs preserved in the bag
+        assert!(out[0].extra["opencode"].get("summary_diffs").is_some());
     }
 
     #[test]
-    fn boolean_summary_is_compaction_marker_not_text() {
-        // Newer generation: summary:true is a compaction flag, not inline content.
+    fn compaction_is_a_user_boundary_then_an_assistant_summary() {
+        // As opencode writes it: the user-side request is one record with a lone `compaction`
+        // part; the summary is an assistant record flagged `summary: true` (agent `compaction`).
+        let req: Value =
+            serde_json::from_str(r#"{"id":"u","role":"user","time":{"created":1},"agent":"Sisyphus"}"#).unwrap();
+        let out = build_messages(&req, &parts(&[r#"{"type":"compaction","auto":true}"#]));
+        assert_eq!(out.len(), 1);
+        let b = &out[0];
+        assert_eq!(
+            (b.role, b.kind, b.origin),
+            (Role::User, MessageKind::CompactionBoundary, Origin::Harness)
+        );
+        assert!(b.content.is_empty(), "the boundary has no text of its own");
+        assert_eq!(b.extra["opencode"]["compactions"][0]["auto"], true);
+
         let mv: Value = serde_json::from_str(
-            r#"{"id":"m","role":"assistant","time":{"created":1},"agent":"compaction","summary":true}"#,
+            r#"{"id":"m","role":"assistant","time":{"created":2},"agent":"compaction","summary":true}"#,
         )
         .unwrap();
         let p = parts(&[r#"{"type":"text","text":"compacted history…"}"#]);
         let out = build_messages(&mv, &p);
         let m = &out[0];
         assert_eq!(
-            m.extra.get("is_compaction_summary").and_then(Value::as_bool),
-            Some(true)
+            (m.role, m.kind, m.origin),
+            (Role::Assistant, MessageKind::CompactionSummary, Origin::Harness)
+        );
+        assert!(
+            m.extra["opencode"].get("is_compaction_summary").is_none(),
+            "the kind says it"
         );
         // the boolean must NOT be rendered as a text body; the real text comes from parts
         assert!(matches!(&m.content[0], Block::Text { text } if text == "compacted history…"));
+    }
+
+    #[test]
+    fn system_record_is_the_system_prompt() {
+        let mv: Value = serde_json::from_str(r#"{"id":"s","role":"system","time":{"created":1}}"#).unwrap();
+        let out = build_messages(&mv, &parts(&[r#"{"type":"text","text":"You are opencode."}"#]));
+        let mut m = out.into_iter().next().unwrap();
+        assert_eq!(
+            (m.role, m.kind, m.origin),
+            (Role::System, MessageKind::SystemPrompt, Origin::Harness)
+        );
+        let mut s = Session {
+            id: "x".into(),
+            harness: Harness::OpenCode,
+            cwd: None,
+            title: None,
+            created_at: None,
+            updated_at: None,
+            model: None,
+            git: None,
+            system_prompt: None,
+            lineage: Lineage::default(),
+            messages: Vec::new(),
+            source_path: None,
+            extra: Map::new(),
+        };
+        fold_into_session(&mut s, &mut m);
+        assert_eq!(s.system_prompt.as_deref(), Some("You are opencode."));
+        // the IR diet: a message model equal to the session's is dropped, a different one kept
+        let mut a: Value =
+            serde_json::from_str(r#"{"id":"a","role":"assistant","time":{"created":2},"modelID":"m1"}"#).unwrap();
+        let mut first = build_messages(&a, &parts(&[r#"{"type":"text","text":"hi"}"#])).remove(0);
+        fold_into_session(&mut s, &mut first);
+        assert_eq!(s.model.as_deref(), Some("m1"));
+        assert_eq!(first.model, None);
+        a["modelID"] = json!("m2");
+        let mut second = build_messages(&a, &parts(&[r#"{"type":"text","text":"hi"}"#])).remove(0);
+        fold_into_session(&mut s, &mut second);
+        assert_eq!(second.model.as_deref(), Some("m2"));
     }
 
     #[test]
@@ -1079,6 +1212,8 @@ mod tests {
         let refs = oc.discover().unwrap();
         assert_eq!(refs.len(), 1, "one session in parts_gen fixture");
         let s = oc.parse(&refs[0]).unwrap();
+        // Every OpenCode part fact is nested under `extra["opencode"]` (`docs/INTERFACE-V2.md` §4).
+        crate::harness::assert_no_flat_keys(&s);
         assert!(s.messages.iter().any(|m| m.role == Role::Assistant));
         assert!(s
             .messages
@@ -1093,6 +1228,7 @@ mod tests {
         let refs2 = oc2.discover().unwrap();
         assert_eq!(refs2.len(), 1, "one session in summary_gen fixture");
         let s2 = oc2.parse(&refs2[0]).unwrap();
+        crate::harness::assert_no_flat_keys(&s2);
         assert!(s2
             .messages
             .iter()
@@ -1134,8 +1270,21 @@ mod tests {
         )
         .unwrap();
         let out = build_messages(&mv, &[]);
-        assert_eq!(out[0].extra["error_name"], "ContentFilterError");
-        assert_eq!(out[0].extra["error"]["data"]["message"], "blocked");
+        let m = &out[0];
+        assert_eq!(
+            (m.role, m.kind, m.origin),
+            (Role::Assistant, MessageKind::Error, Origin::Harness)
+        );
+        assert_eq!(m.extra["opencode"]["error_name"], "ContentFilterError");
+        assert_eq!(m.extra["opencode"]["error"]["data"]["message"], "blocked");
+        // an abort that kept partial text is still an Error, text and all
+        let aborted: Value = serde_json::from_str(
+            r#"{"id":"m","role":"assistant","time":{"created":1},"error":{"name":"MessageAbortedError","data":{}}}"#,
+        )
+        .unwrap();
+        let out = build_messages(&aborted, &parts(&[r#"{"type":"text","text":"I was about to"}"#]));
+        assert_eq!(out[0].kind, MessageKind::Error);
+        assert_eq!(out[0].text().as_deref(), Some("I was about to"));
     }
 
     /// The real `opencode.db` DDL (opencode `fee476bb`, `packages/core/src/session/sql.ts`), minus
@@ -1250,20 +1399,40 @@ mod tests {
             assert!(r.created_at.is_some() && r.updated_at >= r.created_at);
 
             let s = oc.parse(r).unwrap();
+            crate::harness::assert_no_flat_keys(&s);
             assert_eq!(s.model.as_deref(), Some("claude-sonnet-4-5"), "session.model.id wins");
             assert_eq!(s.cwd.as_deref(), Some(std::path::Path::new("/home/dev/proj")));
-            assert_eq!(s.extra["agent"], "Sisyphus");
-            assert_eq!(s.extra["parent_id"], "ses_PARENT");
-            assert_eq!(s.extra["tokens_input"], 42987);
-            assert_eq!(s.extra["model"]["providerID"], "anthropic");
-            assert!(!s.extra.contains_key("slug"), "blank columns stay out of extra");
+            assert_eq!(s.lineage.parent.as_deref(), Some("ses_PARENT"), "parent_id is lineage");
+            let bag = &s.extra["opencode"];
+            assert_eq!(bag["agent"], "Sisyphus");
+            assert!(bag.get("parent_id").is_none(), "first-class facts leave the bag");
+            assert_eq!(bag["tokens_input"], 42987);
+            assert_eq!(bag["model"]["providerID"], "anthropic");
+            assert!(bag.get("slug").is_none(), "blank columns stay out of extra");
             assert_eq!(
-                s.extra.get("metadata").map(|m| m["origin"] == "test"),
+                bag.get("metadata").map(|m| m["origin"] == "test"),
                 with_metadata.then_some(true)
+            );
+            assert_eq!(
+                s.extra.len(),
+                1,
+                "session facts live only in the harness bag: {:?}",
+                s.extra
             );
             // user, assistant, tool — the same mapping the JSON tree gets
             let roles: Vec<Role> = s.messages.iter().map(|m| m.role).collect();
             assert_eq!(roles, vec![Role::User, Role::Assistant, Role::Tool]);
+            let kinds: Vec<MessageKind> = s.messages.iter().map(|m| m.kind).collect();
+            assert_eq!(
+                kinds,
+                vec![MessageKind::Prompt, MessageKind::Reply, MessageKind::ToolResult]
+            );
+            // both records name the session's own model, so neither carries it (IR diet)
+            assert!(s.messages.iter().all(|m| m.model.is_none()), "{:?}", s.messages);
+            assert_eq!(s.messages[1].usage.as_ref().unwrap().cost_usd, Some(0.03));
+            for m in &s.messages {
+                assert!(m.extra.keys().all(|k| k == "opencode"), "{:?}", m.extra);
+            }
             assert_eq!(
                 s.messages[0].id.as_deref(),
                 Some("msg_user01"),
@@ -1306,5 +1475,36 @@ mod tests {
         };
         assert_eq!(oc_json_only.discover().unwrap().len(), 1);
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A `reasoning` part whose text is empty but which carries a provider signature is the WHOLE
+    /// of a redacted thinking turn. Dropping it used to delete the turn's only block, and an
+    /// assistant message with no content is discarded — which silently cost a real ported session
+    /// 134 assistant turns along with their usage, timestamps and ids.
+    #[test]
+    fn signature_only_reasoning_keeps_its_turn() {
+        let mv = serde_json::json!({"id": "msg_1", "role": "assistant", "modelID": "claude-x"});
+        let parts = vec![serde_json::json!({
+            "type": "reasoning",
+            "text": "",
+            "metadata": {"anthropic": {"signature": "SIGBLOB=="}}
+        })];
+        let msgs = build_messages(&mv, &parts);
+        assert_eq!(msgs.len(), 1, "the turn must survive: {msgs:?}");
+        assert!(
+            matches!(
+                msgs[0].content.as_slice(),
+                [Block::Thinking { signature: Some(sig), redacted: false, .. }] if sig == "SIGBLOB=="
+            ),
+            "signature-only thinking preserved: {:?}",
+            msgs[0].content
+        );
+
+        // A reasoning part with neither text nor signature carries nothing and is still dropped.
+        let empty = vec![serde_json::json!({"type": "reasoning", "text": ""})];
+        assert!(
+            build_messages(&mv, &empty).is_empty(),
+            "a contentless part adds no turn"
+        );
     }
 }

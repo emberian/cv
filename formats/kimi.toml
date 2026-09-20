@@ -1,0 +1,42 @@
+# formats/kimi.toml — the vocabulary cv's `kimi` adapter is checked against (docs/INTERFACE-V2.md §7).
+# status: handled = per-item arm in the adapter; generic = interpreted by a blanket rule; carried = verbatim
+# under ParseOptions::complete only; ignored = known and deliberately skipped. Regenerate: tools/gen-manifests (or edit by hand).
+
+harness = "kimi"
+source_files = ["harness/kimi.rs"]
+ignore_literals = ["local", "context.jsonl", "metadata", "text"]
+store = [
+  "$KIMI_SHARE_DIR or ~/.kimi/sessions/<md5(cwd)>/<uuid>/context.jsonl",
+  "…/wire.jsonl",
+  "…/state.json",
+  "~/.kimi/kimi.json",
+]
+
+[upstream]
+repo = "https://github.com/MoonshotAI/kimi-cli (~/pug/kimi-cli)"
+commit = "86f1364 (store frozen since 2026-06)"
+date = "2026-09-19"
+
+[types]
+"role._system_prompt" = { status = "generic", note = "" }
+"role._checkpoint" = { status = "generic", note = "skipped" }
+"role._usage" = { status = "generic", note = "skipped" }
+"role.user" = { status = "handled", note = "" }
+"role.assistant" = { status = "handled", note = "" }
+"role.tool" = { status = "handled", note = "" }
+"part.text" = { status = "handled", note = "" }
+"part.think" = { status = "handled", note = "" }
+"part.image_url" = { status = "handled", note = "" }
+"part.audio_url" = { status = "handled", note = "" }
+"part.video_url" = { status = "handled", note = "" }
+"wire.ContentPart" = { status = "handled", note = "" }
+"wire.StatusUpdate" = { status = "handled", note = "token_usage" }
+"wire.ToolResult" = { status = "handled", note = "" }
+"wire.TurnBegin" = { status = "handled", note = "" }
+"wire.ToolCall" = { status = "handled", note = "" }
+"wire.SubagentEvent" = { status = "ignored", note = "" }
+"wire.ApprovalRequest" = { status = "ignored", note = "" }
+"wire.CompactionBegin" = { status = "ignored", note = "" }
+"wire.CompactionEnd" = { status = "ignored", note = "" }
+"wire.StepRetry" = { status = "ignored", note = "" }
+"wire.Notification" = { status = "ignored", note = "" }

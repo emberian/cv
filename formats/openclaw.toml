@@ -1,0 +1,63 @@
+# formats/openclaw.toml — the vocabulary cv's `openclaw` adapter is checked against (docs/INTERFACE-V2.md §7).
+# status: handled = per-item arm in the adapter; generic = interpreted by a blanket rule; carried = verbatim
+# under ParseOptions::complete only; ignored = known and deliberately skipped. Regenerate: tools/gen-manifests (or edit by hand).
+
+harness = "openclaw"
+source_files = ["harness/openclaw.rs"]
+# Record FIELDS the parser names while copying the rest of an entry into extra[openclaw] —
+# first-class in the IR, so they are not vocabulary.
+ignore_literals = [
+  "sqlite", "openclaw", "elide-home",
+  "type", "id", "parentId", "timestamp", "summary", "content",
+]
+store = [
+  "$OPENCLAW_STATE_DIR/agents/<id>/agent/openclaw-agent*.sqlite",
+  "$OPENCLAW_STATE_DIR/agents/<id>/sessions/*.jsonl (legacy)",
+]
+
+[upstream]
+repo = "https://github.com/openclaw/openclaw (~/pug/openclaw)"
+commit = "0e9181234a"
+date = "2026-09-19"
+
+[types]
+"entry.session" = { status = "handled", note = "header v3/v4 (+parentSession)" }
+"entry.message" = { status = "handled", note = "" }
+"entry.leaf" = { status = "handled", note = "branch control; visible path selected" }
+"entry.compaction" = { status = "handled", note = "→ System note" }
+"entry.reset" = { status = "handled", note = "→ System note" }
+"entry.branch_summary" = { status = "handled", note = "→ System note" }
+"entry.custom_message" = { status = "handled", note = "→ System note" }
+"entry.session_info" = { status = "handled", note = "name → title" }
+"entry.model_change" = { status = "handled", note = "model fallback" }
+"entry.label" = { status = "handled", note = "→ extra" }
+"entry.thinking_level_change" = { status = "carried", note = "" }
+"entry.custom" = { status = "carried", note = "" }
+"role.user" = { status = "generic", note = "" }
+"role.assistant" = { status = "generic", note = "" }
+"role.toolResult" = { status = "generic", note = "" }
+"role.bashExecution" = { status = "generic", note = "" }
+"role.branchSummary" = { status = "generic", note = "" }
+"role.compactionSummary" = { status = "generic", note = "" }
+"role.system" = { status = "handled", note = "-> SystemPrompt/Harness" }
+"block.text" = { status = "generic", note = "" }
+"block.thinking" = { status = "generic", note = "" }
+"block.toolCall" = { status = "generic", note = "" }
+"block.image" = { status = "generic", note = "" }
+"thinking.redacted" = { status = "handled", note = "redacted thinking item -> Block::Thinking{redacted}" }
+# Synthetic `model` values that mark a transcript-only echo rather than a real completion.
+"model.delivery-mirror" = { status = "handled", note = "" }
+"model.gateway-injected" = { status = "handled", note = "" }
+"model.acp-runtime" = { status = "handled", note = "embedded-CLI turn" }
+"stop_reason.error" = { status = "handled", note = "-> MessageKind::Error" }
+"append_mode.side" = { status = "handled", note = "written past the visible leaf; not on the main path" }
+"table.transcript_events" = { status = "handled", note = "event_json = the JSONL line" }
+"table.session_windows" = { status = "handled", note = "" }
+"table.session_nodes" = { status = "handled", note = "entry_json = old sessions.json entry" }
+"table.session_transcript_archives" = { status = "ignored", note = "zstd archives of reset/deleted history" }
+"file.checkpoint" = { status = "ignored", note = "*.checkpoint.<uuid>.jsonl" }
+"file.trajectory" = { status = "ignored", note = "*.trajectory.jsonl" }
+"file.zst" = { status = "ignored", note = "cold-tier archive" }
+"file.sessions.json" = { status = "handled", note = "legacy index of session entries (same shape as session_nodes.entry_json)" }
+"path.agents" = { status = "handled", note = "$OPENCLAW_STATE_DIR/agents/<id>/" }
+"path.sessions" = { status = "handled", note = "agents/<id>/sessions/*.jsonl (legacy)" }

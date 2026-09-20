@@ -6,7 +6,7 @@
 
 ### Your AI coding sessions are gold. Stop letting them rot in scattered folders.
 
-**Find, search, convert, prune, and even *resurrect* every AI coding-agent session you've ever run — across 20 harnesses, through one unified format.**
+**Find, search, port, prune, and even *resurrect* every AI coding-agent session you've ever run — across 20 harnesses, through one unified format.**
 
 `claude` · `codex` · `grok` · `opencode` · `gemini` · `hermes` · `openclaw` · `cursor` · …
 
@@ -42,12 +42,12 @@ cv search "the flux inference refactor"        # full-text, instant
 cv search --semantic "formalizing proofs"      # by meaning — no keyword overlap needed
 
 # 🚀 take a Claude session and continue it in Codex. for real.
-cv convert da9174f4 --to codex
+cv port da9174f4 --harness codex
 #   ✦ wrote ~/.codex/sessions/2026/…/rollout-….jsonl
 #   ↳ codex resume 019e75e0-…
 
 # 🧳 break a session out of its directory jail (brings CLAUDE.md / MEMORY.md along)
-cv port da9174f4 --to-dir ~/new/home
+cv port da9174f4 --cwd ~/new/home
 
 # 🪦 a session hit the context wall and won't reopen? prune the bulk and revive it
 cv prune da9174f4 --thinking --revive
@@ -64,7 +64,7 @@ cv scry
 
 ## 🪐 20 harnesses, one IR
 
-| | Harness | Parse | Convert *to* | | | Harness | Parse | Convert *to* |
+| | Harness | Parse | Port *to* | | | Harness | Parse | Port *to* |
 |---|---|:--:|:--:|---|---|---|:--:|:--:|
 | ✅ | **Claude Code** | ✅ | ✅ | | ✅ | **Cursor** | ✅ | — |
 | ✅ | **Codex CLI** | ✅ | ✅ | | ✅ | **Kimi CLI** | ✅ | ✅ |
@@ -82,12 +82,11 @@ cv scry
 
 ## ✨ More than a viewer
 
-- **🧵 Splice & loom** — compose a new session from spans of others (`cv splice A:0-12 B:6-`), or *fork-and-graft* a branch and **generate** its continuation with an LLM (`cv loom … --generate`). Works via OpenRouter / Anthropic / **LM Studio (free, local, offline)**. Loom agent transcripts like a [Janus loom](https://generative.ink/posts/loom-interface-to-the-multiverse/), across any harness.
-- **🧠 Distill** — `cv distill <id>` turns a session into a durable `MEMORY.md` digest (decisions, gotchas, where things live). Your archive *compounds* instead of rotting.
-- **🔮 Recall** — semantic "have I solved this before?" — as a `cv recall` command *and* an MCP tool that hands a running agent the relevant past span.
+- **🧵 Splice & loom** — compose a new session from spans of others (`cv splice A:0..12 B:6..`), or *fork-and-graft* a branch and **generate** its continuation with an LLM (`cv loom … --generate`). Works via OpenRouter / Anthropic / **LM Studio (free, local, offline)**. Loom agent transcripts like a [Janus loom](https://generative.ink/posts/loom-interface-to-the-multiverse/), across any harness.
+- **🔮 Semantic search** — "have I solved this before?", answered by *meaning* rather than keywords: `cv search --semantic <query>` on the CLI, and the same ranking behind the MCP `search` tool a running agent can call mid-task.
 - **🧬 Provenance** — search answers what was *said*; the **event catalog** answers what was *done*. Every tool call across every session is classified and queryable: `cv touched <file>` lists every session that ever edited a file, and **`cv blame <file>`** ties a file's git history back to the agent conversation that wrote it — "why does this code exist?", answered by the actual reasoning that produced it (with a `cv show --range` jump to the moment of the edit).
 - **🌳 Anatomy of a run** — a deep agent session isn't a flat transcript, it's a *forest*. **`cv workflow <id>`** renders a `Workflow`-tool run as its real shape — the phase tree, the agents under each phase, their journaled outcomes/tokens/tool-calls, and the driving script. **`cv tools <id>`** is cross-agent tool analytics over the whole orchestrator+sub-agent forest (per-agent histograms, *which agent used what*, a wall-clock timeline). **`cv compaction <id>`** finds every context-compaction seam — trigger, pre-compaction size, and the summary that seeded the next window — and `cv show --pre-compaction` reads back the span the continued agent *lost*. (`cv dataset --subagents` pulls the whole forest into a training set.)
-- **✂️ Prune** — `cv prune <id>` is *custom compaction*: instead of abandoning a giant session to the summarizer (which rewrites your history into a lossy paragraph), it snips the bulky **old** tool payloads — large file reads, command logs, screenshots — into a sidecar and leaves a tiny `[PRUNED id=…]` marker, producing a **new, resumable** session (`claude --resume <new-id>`). Your prompts and the exact flow stay verbatim; the most recent turns stay sharp; originals are one `cv prune … --retrieve` away. Add `--thinking` to also lift the oldest reasoning, and `--revive` to **resurrect a session already stuck at the context wall** — Claude Code's resume gate trusts a stale `usage` number recorded in the file, so a maxed session refuses to reopen even once its real content fits; `--revive` rewrites that number to the honest post-prune size and the gate lets you back in. (Algorithm adapted from the validated [flatten-mcp](https://github.com/shayaShav/flatten-mcp).)
+- **✂️ Prune** — `cv prune <id>` is *custom compaction*: instead of abandoning a giant session to the summarizer (which rewrites your history into a lossy paragraph), it snips the bulky **old** tool payloads — large file reads, command logs, screenshots — into a sidecar and leaves a tiny `[PRUNED id=…]` marker, producing a **new, resumable** session (`claude --resume <new-id>`). Your prompts and the exact flow stay verbatim; the most recent turns stay sharp; originals are one `cv cat <new-id> <tool_use_id>` away. Add `--thinking` to also lift the oldest reasoning, and `--revive` to **resurrect a session already stuck at the context wall** — Claude Code's resume gate trusts a stale `usage` number recorded in the file, so a maxed session refuses to reopen even once its real content fits; `--revive` rewrites that number to the honest post-prune size and the gate lets you back in. (Algorithm adapted from the validated [flatten-mcp](https://github.com/shayaShav/flatten-mcp).)
 - **🔒 Redact** — `cv redact <id>` scrubs secrets/PII so a transcript is safe to share.
 - **🎁 Share** — `cv share <id>` → one self-contained, redacted-by-default HTML artifact: dark crystal-ball theme, collapsible thinking/tool folds, opens offline in any browser, uploads nothing (CSP-pinned so it *can't*).
 - **📦 Pack** — `cv pack "<task>"` compiles a context bundle from your whole corpus: relevant past spans + what files those sessions actually touched (event catalog), as a CLAUDE.md digest, a system prompt, or a synthetic *resumable session* in any harness. Never explain your codebase to an agent twice.
@@ -99,7 +98,7 @@ cv scry
   - a **Structure** explorer (`<cv-forest>`) — Overview / Forest / Workflows / Tools / Compaction tabs that turn a run's anatomy into something you can drill through.
 
   The browser build is zero-install — drop a harness zip, nothing uploaded (all WASM).
-- **🔌 Harness integrations** — plug clustervision into the agents' own hooks/MCP/plugins ([`integrations/`](integrations/)): SessionEnd → archive + distill, SessionStart → recall.
+- **🔌 Harness integrations** — plug clustervision into the agents' own hooks/MCP/plugins ([`integrations/`](integrations/)): SessionEnd → archive + post to the board, SessionStart → `cv pack` the prior context back in.
 
 ## 📖 Manual
 
@@ -125,7 +124,7 @@ cargo build --release          # → target/release/{cv, cv-mcp, cvd, cv-tui, cv
 claude mcp add clustervision -- /path/to/target/release/cv-mcp
 ```
 
-Tools incl: `list_sessions` · `search_sessions` · `read_session` · `project_sessions` · **`recall`** (semantic "where was this solved before") · `await_omen` (block until a sibling's message matches a regex) · **`observe_stream`** (its non-blocking sibling — poll a junior agent's live message tail on your own cadence) · `prune_session`/`prune_retrieve` (custom compaction, in-place). …and a few more your agents can discover for themselves. 😉
+The MCP tools are **generated from the CLI** — same names, same flags, same JSON — so they can't drift from what `cv` actually does. Plus the live-coordination primitives that only make sense over MCP: `await_omen` (block until a sibling agent's message matches a regex), `observe_stream` (its non-blocking sibling — poll a junior agent's live message tail on your own cadence), and the board/task tools. The current roster is in the manual's **[MCP chapter](https://emberian.github.io/clustervision/manual/mcp.html)**, or run `cv schema --commands` to see the tree they're generated from.
 
 ## 📋 Dispatch work you can trust (`cv task`)
 
@@ -162,10 +161,10 @@ After staring into seven different transcript formats, we wrote down the one the
 
 ## 🏗️ Under the hood
 
-One IR (`Session → Message → Block{Text|Thinking|ToolUse|ToolResult|File|Image}`), one `Adapter` per harness (`discover` + `parse` + `emit`), plus `loom` / `redact` / `prune` / `watch` / `ingest` modules — and small crates on top: **`cv`** (CLI) · **`cv-mcp`** (MCP) · **`cvd`** (daemon + `serve`) · **`cv-search`** (tantivy + `model2vec`) · **`cv-llm`** (distill/generate) · **`cv-web`** (WASM) · **`app/`** (Tauri desktop).
+One IR (`Session → Message → Block{Text|Thinking|ToolUse|ToolResult|File|Image}`), one `Adapter` per harness (`discover` + `parse` + `emit`), plus `loom` / `redact` / `prune` / `watch` / `ingest` modules — and small crates on top: **`cv`** (CLI) · **`cv-mcp`** (MCP) · **`cvd`** (daemon + `serve`) · **`cv-search`** (tantivy + `model2vec`) · **`cv-llm`** (LLM digests for `pack`, `--generate` for the loom) · **`cv-web`** (WASM) · **`app/`** (Tauri desktop).
 
 ```
-parse(any harness) → 🔮 unified IR → search · convert · port · prune · loom · distill · archive · view
+parse(any harness) → 🔮 unified IR → search · port · prune · loom · pack · archive · view
 ```
 
 ## 🧪 Status

@@ -1,0 +1,39 @@
+# formats/gemini.toml — the vocabulary cv's `gemini` adapter is checked against (docs/INTERFACE-V2.md §7).
+# status: handled = per-item arm in the adapter; generic = interpreted by a blanket rule; carried = verbatim
+# under ParseOptions::complete only; ignored = known and deliberately skipped. Regenerate: tools/gen-manifests (or edit by hand).
+
+harness = "gemini"
+source_files = ["harness/gemini.rs"]
+ignore_literals = ["json", "jsonl"]
+store = [
+  "~/.gemini/tmp/<project>/chats/session-*.json|.jsonl",
+  "~/.cache/.gemini/tmp/<project>/chats/ (sandbox root)",
+  "~/.gemini/tmp/<project>/checkpoint-*.json",
+  "~/.gemini/tmp/<project>/logs.json",
+  "~/.gemini/projects.json",
+  "~/.gemini/history/<id>/.project_root",
+]
+
+[upstream]
+repo = "https://github.com/google-gemini/gemini-cli (~/pug/gemini-cli)"
+commit = "cfbcaa8"
+date = "2026-09-19"
+
+[types]
+"record.user" = { status = "handled", note = "" }
+"record.gemini" = { status = "handled", note = "assistant" }
+"record.model" = { status = "handled", note = "assistant alias" }
+"record.assistant" = { status = "handled", note = "" }
+"record.info" = { status = "handled", note = "→ System" }
+"record.error" = { status = "handled", note = "→ System" }
+"record.warning" = { status = "handled", note = "→ System" }
+"record.system" = { status = "handled", note = "" }
+"record.rewind" = { status = "handled", note = "marker cv synthesizes from control.$rewindTo, then parses as a Branch" }
+"control.$set" = { status = "generic", note = "metadata update" }
+"control.$rewindTo" = { status = "generic", note = "rewind" }
+"part.text" = { status = "generic", note = "" }
+"part.thought" = { status = "generic", note = "thoughts[]" }
+"part.functionCall" = { status = "generic", note = "toolCalls[]" }
+"part.functionResponse" = { status = "generic", note = "" }
+"part.inlineData" = { status = "generic", note = "image" }
+"part.fileData" = { status = "generic", note = "file" }

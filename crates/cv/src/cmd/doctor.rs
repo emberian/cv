@@ -27,7 +27,7 @@ pub(crate) fn cmd_doctor(id: Option<String>, harness: Option<String>, recent: us
 
     // Resolve the target session(s).
     let targets: Vec<SessionRef> = if let Some(id) = &id {
-        let (r, _ad) = cv_core::find(id, want)?.with_context(|| format!("no session matching {id:?}"))?;
+        let (r, _ad) = crate::util::resolve(id, want)?;
         vec![r]
     } else {
         let cwd = std::env::current_dir().ok();

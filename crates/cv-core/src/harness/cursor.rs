@@ -362,9 +362,36 @@ fn stream_global(conn: &Connection, r: &SessionRef, sink: &mut dyn MessageSink) 
         system_prompt: None,
         lineage: crate::ir::Lineage::default(),
     };
-    // Note: the composer's `unifiedMode` (chat/agent/edit) has no home on the IR Session (no
-    // free-form Session.extra). Each bubble's own `unifiedMode` is preserved in Message.extra
-    // instead. See the report for the proposed Session.extra addition.
+    // Sub-agent lineage: a composer spawned as a sub-agent records `subagentInfo`
+    // (`parentComposerId`, the spawning `toolCallId`, the `subagentTypeName` nickname).
+    if let Some(si) = d.get("subagentInfo").filter(|v| !v.is_null()) {
+        if let Some(p) = si
+            .get("parentComposerId")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            session.lineage.parent = Some(p.to_string());
+        }
+        if let Some(tc) = si.get("toolCallId").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+            session.lineage.spawned_by_tool_use = Some(tc.to_string());
+        }
+        if let Some(name) = si
+            .get("subagentTypeName")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            session.lineage.agent_path = Some(name.to_string());
+        }
+    }
+    // `unifiedMode` (chat/agent/edit) has no first-class IR home. The composer's is a *session*
+    // fact — the mode the thread was opened in — so it lands in the session bag; a bubble that
+    // carries its own overrides it for that message only (see `bubble_to_message`), which is how
+    // Cursor records a mode switched mid-thread.
+    if let Some(mode) = d.get("unifiedMode").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+        session
+            .harness_extra_mut(Harness::Cursor)
+            .insert("unified_mode".into(), Value::String(mode.to_string()));
+    }
 
     // Session model: the latest message's model (whole-Vec `rev().find_map` originally). Tracked
     // incrementally here — each emitted message overwrites it when it carries a model — so the last
@@ -490,9 +517,12 @@ fn bubble_to_message(b: &Value) -> Option<Message> {
             });
         }
     }
+    // A bubble's own `unifiedMode` overrides the composer's (which `stream_global` puts on the
+    // session bag) for this message only — a mode switched mid-thread.
     if let Some(mode) = b.get("unifiedMode").and_then(Value::as_str) {
         if !mode.is_empty() {
-            m.extra.insert("unifiedMode".into(), Value::String(mode.to_string()));
+            m.harness_extra_mut(Harness::Cursor)
+                .insert("unified_mode".into(), Value::String(mode.to_string()));
         }
     }
 
@@ -770,6 +800,7 @@ mod tests {
             &conn,
             &format!("bubbleId:{cid}:b2"),
             r#"{"bubbleId":"b2","type":2,"text":"Here is how.","thinking":{"text":"let me think"},
+                "unifiedMode":"chat",
                 "tokenCount":{"inputTokens":10,"outputTokens":5},
                 "toolFormerData":{"name":"run_terminal_cmd","toolCallId":"t1","status":"completed",
                   "rawArgs":"{\"command\":\"cargo test\"}","result":"{\"output\":\"ok\"}"}}"#,
@@ -816,6 +847,63 @@ mod tests {
         // usage mapped
         assert_eq!(a.usage.as_ref().unwrap().input_tokens, Some(10));
         assert_eq!(a.usage.as_ref().unwrap().output_tokens, Some(5));
+
+        // kind/origin: user bubble is a prompt, assistant bubble a reply.
+        assert_eq!(
+            (s.messages[0].kind, s.messages[0].origin),
+            (MessageKind::Prompt, Origin::Human)
+        );
+        assert_eq!((a.kind, a.origin), (MessageKind::Reply, Origin::Model));
+        // `unifiedMode` rides nested under `extra["cursor"]`, never flat. The COMPOSER's mode is a
+        // session fact (the mode the thread was opened in); a bubble's own overrides it per
+        // message — here b2 switched to "chat" while the thread is an "agent" thread, and b1
+        // (which carries no mode of its own) gets no message-level key at all.
+        assert_eq!(
+            s.harness_extra(Harness::Cursor)
+                .and_then(|b| b.get("unified_mode"))
+                .and_then(Value::as_str),
+            Some("agent"),
+            "the composer's mode lands on the session bag"
+        );
+        assert_eq!(
+            a.harness_extra(Harness::Cursor)
+                .and_then(|b| b.get("unified_mode"))
+                .and_then(Value::as_str),
+            Some("chat"),
+            "the bubble's own mode overrides for that message"
+        );
+        assert!(s.messages[0]
+            .harness_extra(Harness::Cursor)
+            .is_none_or(|b| !b.contains_key("unified_mode")));
+        // No flat keys survive anywhere: every top-level key is a namespace (the harness bag, cv's
+        // own `cv` bag, or the `_record` carrier). See `docs/INTERFACE-V2.md` §4.
+        assert!(
+            !a.extra.contains_key("unifiedMode"),
+            "no flat keys besides the harness bag"
+        );
+        crate::harness::assert_no_flat_keys(&s);
+    }
+
+    #[test]
+    fn subagent_info_populates_lineage() {
+        let conn = mk_global();
+        let cid = "comp-sub";
+        put(
+            &conn,
+            &format!("composerData:{cid}"),
+            r#"{"composerId":"comp-sub","_v":3,
+                "subagentInfo":{"parentComposerId":"comp-parent","toolCallId":"tool_7","subagentTypeName":"explore"},
+                "fullConversationHeadersOnly":[{"bubbleId":"b1","type":1}]}"#,
+        );
+        put(
+            &conn,
+            &format!("bubbleId:{cid}:b1"),
+            r#"{"bubbleId":"b1","type":1,"text":"look"}"#,
+        );
+        let s = parse_global(&conn, &sref(cid)).unwrap();
+        assert_eq!(s.lineage.parent.as_deref(), Some("comp-parent"));
+        assert_eq!(s.lineage.spawned_by_tool_use.as_deref(), Some("tool_7"));
+        assert_eq!(s.lineage.agent_path.as_deref(), Some("explore"));
     }
 
     #[test]

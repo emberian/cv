@@ -13,8 +13,57 @@
 //! Reasoning is kept in a `<thinking>` wrapper — it's high-signal for distilling into smaller
 //! models, and a downstream filter can strip it if a given run wants answer-only SFT.
 
-use crate::ir::{Block, Message, Role, Session};
+use crate::ir::{Block, Message, MessageKind, Role, Session};
 use serde_json::{json, Value};
+
+/// The training-role label for a message, or `None` when the turn was never part of what the model
+/// saw or said (a harness notice, an API error, a compaction boundary, a carrier record, …) and so
+/// must not appear in a distillation corpus. Keyed off [`MessageKind`], not the harness: injected
+/// context (system reminders, hook output, environment context) is labelled as user INPUT — that is
+/// where the model saw it on the wire — while the system prompt and a compaction summary are
+/// `system`. `chat` picks the ChatML spelling, otherwise ShareGPT's.
+fn training_role(m: &Message, chat: bool) -> Option<&'static str> {
+    if !m.kind.is_model_visible() {
+        return None;
+    }
+    Some(match m.kind {
+        MessageKind::SystemPrompt | MessageKind::CompactionSummary => "system",
+        MessageKind::InjectedContext | MessageKind::Prompt => {
+            if chat {
+                "user"
+            } else {
+                "human"
+            }
+        }
+        MessageKind::Reply => {
+            if chat {
+                "assistant"
+            } else {
+                "gpt"
+            }
+        }
+        MessageKind::ToolResult => "tool",
+        // is_model_visible() admits nothing else; fall back to the role for safety.
+        _ => match m.role {
+            Role::System => "system",
+            Role::User => {
+                if chat {
+                    "user"
+                } else {
+                    "human"
+                }
+            }
+            Role::Assistant => {
+                if chat {
+                    "assistant"
+                } else {
+                    "gpt"
+                }
+            }
+            Role::Tool => "tool",
+        },
+    })
+}
 
 /// Serialize a session as a ChatML record. Returns `None` if it has no non-empty turns.
 pub fn to_chatml(session: &Session) -> Option<Value> {
@@ -23,16 +72,11 @@ pub fn to_chatml(session: &Session) -> Option<Value> {
         .messages
         .iter()
         .filter_map(|m| {
+            let role = training_role(m, true)?;
             let content = render_blocks(&m.content, &resolver);
             if content.trim().is_empty() {
                 return None;
             }
-            let role = match m.role {
-                Role::System => "system",
-                Role::User => "user",
-                Role::Assistant => "assistant",
-                Role::Tool => "tool",
-            };
             Some(json!({ "role": role, "content": content }))
         })
         .collect();
@@ -49,16 +93,11 @@ pub fn to_sharegpt(session: &Session) -> Option<Value> {
         .messages
         .iter()
         .filter_map(|m| {
+            let from = training_role(m, false)?;
             let value = render_blocks(&m.content, &resolver);
             if value.trim().is_empty() {
                 return None;
             }
-            let from = match m.role {
-                Role::System => "system",
-                Role::User => "human",
-                Role::Assistant => "gpt",
-                Role::Tool => "tool",
-            };
             Some(json!({ "from": from, "value": value }))
         })
         .collect();
@@ -244,23 +283,15 @@ pub fn write_record<W: std::io::Write>(
     fmt: Format,
     redact: Option<&crate::redact::RedactOptions>,
 ) -> std::io::Result<bool> {
-    // Cheap pre-scan: skip the whole record if every turn is empty (no resolve needed).
-    if !session.messages.iter().any(|m| !message_is_empty(m)) {
+    // Cheap pre-scan: skip the whole record if every exportable turn is empty (no resolve needed).
+    let chat = matches!(fmt, Format::Chatml);
+    let exportable = |m: &Message| training_role(m, chat).is_some() && !message_is_empty(m);
+    if !session.messages.iter().any(exportable) {
         return Ok(false);
     }
     let (array_key, role_key, content_key) = match fmt {
         Format::Chatml => ("messages", "role", "content"),
         Format::ShareGpt => ("conversations", "from", "value"),
-    };
-    let role_label = |r: Role| -> &'static str {
-        match (fmt, r) {
-            (Format::Chatml, Role::System) | (Format::ShareGpt, Role::System) => "system",
-            (Format::Chatml, Role::User) => "user",
-            (Format::ShareGpt, Role::User) => "human",
-            (Format::Chatml, Role::Assistant) => "assistant",
-            (Format::ShareGpt, Role::Assistant) => "gpt",
-            (_, Role::Tool) => "tool",
-        }
     };
 
     // serde_json's `Map` is a BTreeMap, so a one-shot `json!({role, content})` serializes its keys
@@ -271,6 +302,9 @@ pub fn write_record<W: std::io::Write>(
     write!(w, "{{\"{array_key}\":[")?;
     let mut first = true;
     for m in &session.messages {
+        let Some(role) = training_role(m, chat) else {
+            continue;
+        };
         if message_is_empty(m) {
             continue;
         }
@@ -278,7 +312,6 @@ pub fn write_record<W: std::io::Write>(
             w.write_all(b",")?;
         }
         first = false;
-        let role = role_label(m.role);
         if role_first {
             write!(w, "{{\"{role_key}\":\"{role}\",\"{content_key}\":\"")?;
         } else {

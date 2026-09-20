@@ -1,0 +1,27 @@
+# formats/roo.toml — the vocabulary cv's `roo` adapter is checked against (docs/INTERFACE-V2.md §7).
+# status: handled = per-item arm in the adapter; generic = interpreted by a blanket rule; carried = verbatim
+# under ParseOptions::complete only; ignored = known and deliberately skipped. Regenerate: tools/gen-manifests (or edit by hand).
+
+harness = "roo"
+source_files = ["harness/roo.rs"]
+ignore_literals = ["base64", "url"]
+store = [
+  "<globalStorage>/rooveterinaryinc.roo-cline|roo-code/tasks/<taskId>/",
+  "~/.roo/tasks/",
+]
+
+[upstream]
+repo = "https://github.com/RooCodeInc/Roo-Code (not checked out)"
+commit = "unknown"
+date = "2026-05-29"
+
+[types]
+"role.user" = { status = "handled", note = "cline parser" }
+"role.assistant" = { status = "handled", note = "" }
+"role.system" = { status = "handled", note = "" }
+"block.text" = { status = "handled", note = "" }
+"block.thinking" = { status = "handled", note = "" }
+"block.redacted_thinking" = { status = "handled", note = "" }
+"block.tool_use" = { status = "handled", note = "" }
+"block.tool_result" = { status = "handled", note = "" }
+"block.image" = { status = "handled", note = "" }

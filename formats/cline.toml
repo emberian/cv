@@ -1,0 +1,30 @@
+# formats/cline.toml — the vocabulary cv's `cline` adapter is checked against (docs/INTERFACE-V2.md §7).
+# status: handled = per-item arm in the adapter; generic = interpreted by a blanket rule; carried = verbatim
+# under ParseOptions::complete only; ignored = known and deliberately skipped. Regenerate: tools/gen-manifests (or edit by hand).
+
+harness = "cline"
+source_files = ["harness/cline.rs"]
+ignore_literals = ["base64", "url"]
+store = [
+  "<globalStorage>/saoudrizwan.claude-dev/tasks/<taskId>/{api_conversation_history.json,ui_messages.json,task_metadata.json}",
+  "~/.cline/tasks/",
+]
+
+[upstream]
+repo = "https://github.com/cline/cline (not checked out)"
+commit = "unknown"
+date = "2026-05-29"
+
+[types]
+"role.user" = { status = "handled", note = "" }
+"role.assistant" = { status = "handled", note = "" }
+"role.system" = { status = "handled", note = "" }
+"block.text" = { status = "handled", note = "" }
+"block.thinking" = { status = "handled", note = "" }
+"block.redacted_thinking" = { status = "handled", note = "" }
+"block.tool_use" = { status = "handled", note = "" }
+"block.tool_result" = { status = "handled", note = "" }
+"block.image" = { status = "handled", note = "" }
+"ui.say" = { status = "handled", note = "ui_messages timestamp enrichment" }
+"ui.ask" = { status = "generic", note = "" }
+"ui.completion_result" = { status = "generic", note = "" }

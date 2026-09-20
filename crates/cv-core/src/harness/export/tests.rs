@@ -101,6 +101,40 @@ fn chatgpt_tool_call_links_to_result() {
 }
 
 #[test]
+fn kind_and_origin_chatgpt_and_claude() {
+    // ChatGPT: user prompt, assistant reply, a recipient!=all tool call (still a reply), tool result.
+    let conv = json!({ "id": "k", "current_node": "res", "mapping": {
+        "u": { "id": "u", "parent": null, "children": ["call"],
+            "message": { "author": { "role": "user" }, "content": { "content_type": "text", "parts": ["hi"] }, "recipient": "all" } },
+        "call": { "id": "call", "parent": "u", "children": ["res"],
+            "message": { "author": { "role": "assistant" }, "recipient": "python", "content": { "content_type": "code", "text": "print(1)" } } },
+        "res": { "id": "res", "parent": "call", "children": [],
+            "message": { "author": { "role": "tool", "name": "python" }, "recipient": "all", "content": { "content_type": "execution_output", "text": "1" } } }
+    }});
+    let msgs = chatgpt_messages(&conv);
+    assert_eq!((msgs[0].kind, msgs[0].origin), (MessageKind::Prompt, Origin::Human));
+    assert_eq!((msgs[1].kind, msgs[1].origin), (MessageKind::Reply, Origin::Model));
+    assert_eq!(
+        (msgs[2].kind, msgs[2].origin),
+        (MessageKind::ToolResult, Origin::Harness)
+    );
+    for m in &msgs {
+        for k in m.extra.keys() {
+            assert!(k == "chatgpt-export" || k == "_record", "unexpected extra key {k}");
+        }
+    }
+
+    // Claude.ai export: human prompt, assistant reply.
+    let cc = json!({ "uuid": "c", "chat_messages": [
+        { "uuid": "m1", "sender": "human", "content": [{ "type": "text", "text": "q" }] },
+        { "uuid": "m2", "sender": "assistant", "content": [{ "type": "text", "text": "a" }] }
+    ]});
+    let cm = claude_messages(&cc);
+    assert_eq!((cm[0].kind, cm[0].origin), (MessageKind::Prompt, Origin::Human));
+    assert_eq!((cm[1].kind, cm[1].origin), (MessageKind::Reply, Origin::Model));
+}
+
+#[test]
 fn claude_export_blocks() {
     let conv = json!({
         "uuid": "u1", "name": "Refactor chat", "created_at": "2026-01-01T00:00:00Z",

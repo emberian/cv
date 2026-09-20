@@ -134,8 +134,13 @@ fn blame_end_to_end() {
         out.contains("other checkout"),
         "suffix-only match should be labeled:\n{out}"
     );
+    // The hint is copy-pasteable into the 0.11 window grammar: `--range A..B`, never `A-B`.
     let (lo, hi) = ((edit_idx - 3).max(0), edit_idx + 3);
-    assert!(out.contains(&format!("--range {lo}-{hi}")), "{out}");
+    assert!(out.contains(&format!("cv show blame-e2 --range {lo}..{hi}")), "{out}");
+    assert!(
+        !out.contains(&format!("--range {lo}-{hi}")),
+        "old `A-B` hint must be gone:\n{out}"
+    );
     assert!(out.contains("1 of 2 commit(s) matched an agent session"), "{out}");
 
     // --- -L: line 2 was never touched by the tweak, so only the first commit owns it ---
@@ -153,7 +158,7 @@ fn blame_end_to_end() {
         "stdout:\n{out}\nstderr:\n{err}"
     );
     assert!(
-        out.contains("[tool_use Edit]"),
+        out.contains("[tool_use Edit t1]"),
         "event msg_idx is misaligned with show --range indexing:\n{out}"
     );
     assert!(out.contains("adding the widget now"), "{out}");

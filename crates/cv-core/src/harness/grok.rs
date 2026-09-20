@@ -22,7 +22,8 @@
 //!   strictly additive enrichment — if it's empty or absent we still get full tool fidelity.
 //! - Sessions with no tool activity (`events.jsonl` empty, short `chat_history`) parse fine.
 //! - `session_kind: "subagent"` (under `.grok/worktrees/.../subagent-<id>/`) vs primary sessions
-//!   (no `session_kind`, an `agent_name` instead) are both handled; the kind is stashed in `extra`.
+//!   are both handled: the raw `session_kind`/`agent_name` ride in `extra["grok"]`, and a subagent's
+//!   `agent_name` nickname also becomes [`Lineage::agent_path`] (Grok records no parent session id).
 
 use super::{parse_ts, Adapter};
 use crate::ir::*;
@@ -124,18 +125,58 @@ impl Adapter for Grok {
         // Sidecar enrichment: tool_call / tool_call_update entries from the ACP update stream.
         let enrich = read_update_enrichment(dir);
 
+        // Subagent / agent-name facts + lineage from summary.json.
+        grok_session_facts(&mut s, &summary);
+
+        // Grok persists the system prompt it sent as `system_prompt.txt` — byte-identical to the
+        // leading `system` transcript record. It is the session-level fact, never a message.
+        if let Ok(sp) = fs::read_to_string(dir.join("system_prompt.txt")) {
+            if !sp.trim().is_empty() {
+                s.system_prompt = Some(sp);
+            }
+        }
+
         // All session metadata comes from summary.json (already set above), so hand it to the sink
         // before the body — header-rendering consumers (cv show) get the title/model/cwd up front.
         sink.meta(&s);
 
+        // IR diet: a message names its model only when it differs from the session default.
+        let session_model = s.model.clone();
         let file = fs::File::open(dir.join("chat_history.jsonl"))
             .with_context(|| format!("reading chat_history in {}", dir.display()))?;
         let skipped = super::for_each_json_line(BufReader::new(file), |v| match chat_message(&v, &enrich) {
-            Some(m) => sink.message(m),
+            Some(mut m) => {
+                if m.model.is_some() && m.model == session_model {
+                    m.model = None;
+                }
+                sink.message(m)
+            }
             None => Flow::Continue,
         });
         super::note_skipped_lines(&mut s, skipped);
         Ok(s)
+    }
+}
+
+/// Subagent lineage + Grok-specific session facts from `summary.json`. Grok stores no parent
+/// session id, so a subagent's `agent_name` nickname becomes [`Lineage::agent_path`]; the raw
+/// `session_kind` / `agent_name` ride in `extra["grok"]`.
+fn grok_session_facts(s: &mut Session, summary: &Value) {
+    let kind = summary.get("session_kind").and_then(Value::as_str);
+    let agent = summary.get("agent_name").and_then(Value::as_str);
+    if kind == Some("subagent") {
+        if let Some(a) = agent {
+            s.lineage.agent_path = Some(a.to_string());
+        }
+    }
+    if kind.is_some() || agent.is_some() {
+        let bag = s.harness_extra_mut(Harness::Grok);
+        if let Some(k) = kind {
+            bag.insert("session_kind".into(), Value::String(k.to_string()));
+        }
+        if let Some(a) = agent {
+            bag.insert("agent_name".into(), Value::String(a.to_string()));
+        }
     }
 }
 
@@ -255,6 +296,17 @@ fn chat_message(v: &Value, enrich: &HashMap<String, ToolEnrich>) -> Option<Messa
         _ => return None,
     };
     let mut m = Message::new(role);
+    // kind/origin from Grok's own turn semantics. `assistant` keeps the role-implied Reply/Model.
+    match ty {
+        // The system prompt (also `system_prompt.txt`, mirrored into `Session::system_prompt`).
+        "system" => m.kind = MessageKind::SystemPrompt,
+        "user" => {
+            let (kind, origin) = user_kind_origin(v);
+            m.kind = kind;
+            m.origin = origin;
+        }
+        _ => {}
+    }
 
     // assistant lines may carry reasoning (summarized text + opaque encrypted blob).
     if let Some(reasoning) = v.get("reasoning") {
@@ -300,10 +352,11 @@ fn chat_message(v: &Value, enrich: &HashMap<String, ToolEnrich>) -> Option<Messa
                     );
                 }
                 if !info.is_empty() {
-                    m.extra
+                    let bag = m.harness_extra_mut(Harness::Grok);
+                    if let Value::Object(obj) = bag
                         .entry("tool_calls")
-                        .or_insert_with(|| Value::Object(serde_json::Map::new()));
-                    if let Some(Value::Object(obj)) = m.extra.get_mut("tool_calls") {
+                        .or_insert_with(|| Value::Object(serde_json::Map::new()))
+                    {
                         obj.insert(id.clone(), Value::Object(info));
                     }
                 }
@@ -317,19 +370,44 @@ fn chat_message(v: &Value, enrich: &HashMap<String, ToolEnrich>) -> Option<Messa
         }
     }
 
-    // Preserve a couple of high-signal scalars for round-tripping.
-    if let Some(fp) = v.get("model_fingerprint").and_then(Value::as_str) {
-        m.extra
-            .insert("model_fingerprint".into(), Value::String(fp.to_string()));
-    }
-    if let Some(sr) = v.get("synthetic_reason").and_then(Value::as_str) {
-        m.extra.insert("synthetic_reason".into(), Value::String(sr.to_string()));
+    // Preserve a couple of high-signal scalars for round-tripping (the injected-context flavor —
+    // `system_reminder` / `project_instructions` / `task_completed` — is already on `kind`/`origin`,
+    // but the exact `synthetic_reason` is kept so the distinction survives).
+    let fingerprint = v.get("model_fingerprint").and_then(Value::as_str).map(str::to_string);
+    let synthetic = v.get("synthetic_reason").and_then(Value::as_str).map(str::to_string);
+    if fingerprint.is_some() || synthetic.is_some() {
+        let bag = m.harness_extra_mut(Harness::Grok);
+        if let Some(fp) = fingerprint {
+            bag.insert("model_fingerprint".into(), Value::String(fp));
+        }
+        if let Some(sr) = synthetic {
+            bag.insert("synthetic_reason".into(), Value::String(sr));
+        }
     }
 
     if m.content.is_empty() {
         return None;
     }
     Some(m)
+}
+
+/// kind/origin for a Grok `user` record from its own semantics. A real typed prompt is
+/// Prompt/Human; the harness injects several kinds of context as their own `user` turns —
+/// `<system-reminder>` skill/rule blocks and background-task notices (flagged by
+/// `synthetic_reason`) and the unflagged `<user_info>` environment block — all InjectedContext /
+/// Harness. A `compaction_meta` turn is the summary that seeds the post-compaction window.
+fn user_kind_origin(v: &Value) -> (MessageKind, Origin) {
+    match v.get("synthetic_reason").and_then(Value::as_str) {
+        Some("compaction_meta") => (MessageKind::CompactionSummary, Origin::Harness),
+        Some(_) => (MessageKind::InjectedContext, Origin::Harness),
+        None => {
+            if coerce_content(v.get("content")).trim_start().starts_with("<user_info>") {
+                (MessageKind::InjectedContext, Origin::Harness)
+            } else {
+                (MessageKind::Prompt, Origin::Human)
+            }
+        }
+    }
 }
 
 /// Tool-call `arguments` is a JSON-encoded *string*. Parse it into structured JSON when possible,
@@ -465,7 +543,11 @@ mod tests {
             }
             other => panic!("expected tool_use, got {other:?}"),
         }
-        assert_eq!(m.extra["model_fingerprint"], "fp_x");
+        assert_eq!(m.kind, MessageKind::Reply);
+        assert_eq!(m.origin, Origin::Model);
+        let bag = m.harness_extra(Harness::Grok).expect("grok bag");
+        assert_eq!(bag["model_fingerprint"], "fp_x");
+        assert!(!m.extra.contains_key("model_fingerprint"), "no flat keys");
         // encrypted reasoning preserved
         match &m.content[0] {
             Block::Thinking { encrypted, text, .. } => {
@@ -482,6 +564,8 @@ mod tests {
         let v: Value = serde_json::from_str(line).unwrap();
         let m = chat_message(&v, &HashMap::new()).expect("tool message");
         assert_eq!(m.role, Role::Tool);
+        assert_eq!(m.kind, MessageKind::ToolResult);
+        assert_eq!(m.origin, Origin::Harness);
         match &m.content[0] {
             Block::ToolResult {
                 tool_use_id,
@@ -528,7 +612,7 @@ mod tests {
         )
         .unwrap();
         let m = chat_message(&call, &enrich).unwrap();
-        let tc = &m.extra["tool_calls"]["call-9"];
+        let tc = &m.harness_extra(Harness::Grok).expect("grok bag")["tool_calls"]["call-9"];
         assert_eq!(tc["title"], "Search foo");
         assert_eq!(tc["kind"], "search");
     }
@@ -550,7 +634,53 @@ mod tests {
         let m = chat_message(&v, &HashMap::new()).unwrap();
         assert_eq!(m.role, Role::User);
         assert_eq!(m.text().as_deref(), Some("hi"));
-        assert_eq!(m.extra["synthetic_reason"], "project_instructions");
+        // A `synthetic_reason` user turn is harness-injected context, not a prompt.
+        assert_eq!(m.kind, MessageKind::InjectedContext);
+        assert_eq!(m.origin, Origin::Harness);
+        assert_eq!(
+            m.harness_extra(Harness::Grok).unwrap()["synthetic_reason"],
+            "project_instructions"
+        );
+        assert!(!m.extra.contains_key("synthetic_reason"), "no flat keys");
+    }
+
+    /// The kind/origin mapping across every Grok record shape, plus the `<user_info>` env block.
+    #[test]
+    fn kind_and_origin_by_record() {
+        let msg = |line: &str| chat_message(&serde_json::from_str::<Value>(line).unwrap(), &HashMap::new());
+
+        // A real typed prompt.
+        let p = msg(r#"{"type":"user","content":[{"type":"text","text":"do the thing"}],"synthetic_reason":null}"#)
+            .unwrap();
+        assert_eq!((p.kind, p.origin), (MessageKind::Prompt, Origin::Human));
+
+        // The `<user_info>` environment block is harness-injected context, though unflagged.
+        // (The newlines inside the block are JSON `\n` escapes: a literal newline inside a JSON
+        // string is a control character and would not parse.)
+        let ui = msg(
+            r#"{"type":"user","content":[{"type":"text","text":"<user_info>\nOS: mac\n</user_info>"}],"synthetic_reason":null}"#,
+        )
+        .unwrap();
+        assert!(ui.text().is_some_and(|t| t.contains("\nOS: mac\n")));
+        assert_eq!((ui.kind, ui.origin), (MessageKind::InjectedContext, Origin::Harness));
+
+        // A compaction summary seeds the next window.
+        let cm = msg(
+            r#"{"type":"user","content":[{"type":"text","text":"summary…"}],"synthetic_reason":"compaction_meta"}"#,
+        )
+        .unwrap();
+        assert_eq!((cm.kind, cm.origin), (MessageKind::CompactionSummary, Origin::Harness));
+
+        // The system record is the system prompt.
+        let sys = msg(r#"{"type":"system","content":"You are Grok."}"#).unwrap();
+        assert_eq!(
+            (sys.role, sys.kind, sys.origin),
+            (Role::System, MessageKind::SystemPrompt, Origin::Harness)
+        );
+
+        // A model reply.
+        let a = msg(r#"{"type":"assistant","content":"hi"}"#).unwrap();
+        assert_eq!((a.kind, a.origin), (MessageKind::Reply, Origin::Model));
     }
 
     #[test]
@@ -567,6 +697,8 @@ mod tests {
         let r = scan(&dir.join("summary.json")).unwrap().unwrap();
         let grok = Grok { root: None };
         let s = grok.parse(&r).unwrap();
+        // Every Grok fact is nested under `extra["grok"]` (`docs/INTERFACE-V2.md` §4).
+        crate::harness::assert_no_flat_keys(&s);
         // roles present: system, user, assistant(with tool_use), tool(result)
         assert!(s.messages.iter().any(|m| m.role == Role::System));
         assert!(s
@@ -593,5 +725,17 @@ mod tests {
         }
         assert!(saw_call2, "expected call-2 tool result");
         assert_eq!(s.title.as_deref(), Some("Add a greeting function"));
+        // The system record → SystemPrompt kind; system_prompt.txt (if present) seeds the session.
+        assert!(s
+            .messages
+            .iter()
+            .any(|m| m.kind == MessageKind::SystemPrompt && m.role == Role::System));
+        // summary.json marks this a subagent session.
+        assert_eq!(
+            s.harness_extra(Harness::Grok)
+                .and_then(|b| b.get("session_kind"))
+                .and_then(Value::as_str),
+            Some("subagent")
+        );
     }
 }

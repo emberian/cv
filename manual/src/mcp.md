@@ -5,150 +5,194 @@ other direction: it hands the same powers to a **running coding agent** so it ca
 *other* agents' sessions — within this project, back through time, and across harnesses
 — and coordinate with siblings live. 🔮
 
-It's a [Model Context Protocol](https://modelcontextprotocol.io) server: a thin stdio
-front-end over the `cv_core` library. Point Claude Code (or Codex, Gemini, …) at it and
-the agent gets a handful of tools.
+It's a [Model Context Protocol](https://modelcontextprotocol.io) server speaking
+line-delimited JSON-RPC 2.0 over stdio. Point Claude Code (or Codex, Gemini, …) at it and
+the agent gets the whole `cv` command surface as tools, plus a handful of MCP-only tools
+for live coordination.
 
 ## Motivating use cases
 
-- **"What happened in this project before?"** — `project_sessions(cwd)` lists every
-  session (any harness) whose recorded working directory is this project, newest first.
-  The agent reads the relevant one with `read_session(id)`.
-- **"Has anyone solved this before?"** — `recall(query)` semantically searches the whole
-  cross-harness corpus and pulls back the most relevant *message spans*, so the agent can
-  fold prior context into a running task. See [search/recall](search.md).
-- **"What's my sibling agent doing right now?"** — `list_sessions` / `search_sessions`
-  surface live sessions; `board_who` shows who's present on a channel.
+- **"What happened in this project before?"** — `ls(cwd='/myproj')` lists every session
+  (any harness) whose recorded working directory is this project, newest first. The agent
+  reads the relevant one with `show(id=…)`.
+- **"Has anyone solved this before?"** — `search(query=…)` finds it by what was literally
+  said; `pack(task=…)` compiles a whole context bundle out of the corpus. See
+  [search](search.md).
+- **"What's my sibling agent doing right now?"** — `ls` surfaces live sessions;
+  `observe_stream` tails their output; `board_who` shows who's present on a channel.
 - **"Block until another session prints X."** — `await_omen(regex=…)` watches live
   message streams and returns when one matches; `board_await` does the same for explicit
   [board](board.md) posts.
+- **"Why does my own context keep filling up?"** — `doctor(id=…)` attributes the pressure
+  by source. Point it at your *own* session id.
 
 ## Registering it
 
-Build the binary, then register it with your host. For Claude Code:
+Build the binaries, then register the server with your host. For Claude Code:
 
 ```sh
-cargo build -p cv-mcp --release
+cargo build -p clustervision -p cv-mcp --release
 claude mcp add clustervision -- /absolute/path/to/cv-mcp
 ```
 
-Any MCP host works — give it the absolute path to the `cv-mcp` binary as the command
-(no arguments needed). Under the hood it speaks **line-delimited JSON-RPC 2.0 over
-stdio**: one JSON message per line on stdin, one per line on stdout. **stdout is the
-protocol channel**, so all diagnostics go to stderr. It implements `initialize`, `ping`,
-`tools/list`, and `tools/call` against protocol version `2025-06-18`.
+Any MCP host works — give it the absolute path to the `cv-mcp` binary as the command (no
+arguments needed). **stdout is the protocol channel**, so all diagnostics go to stderr. It
+implements `initialize`, `ping`, `tools/list` and `tools/call` against protocol version
+`2025-06-18`, and every tool returns its result as a single text content block.
 
-Every tool returns its result as a text content block. The read/search/board tools return
-**pretty-printed JSON** as that text; `read_session` can also return rendered Markdown.
+`cv-mcp` needs the `cv` binary at runtime (see below), so build and install them together.
 
-## Reading sessions
+## The tools are generated from the CLI
 
-These four tools find and read transcripts. Arguments marked **required** must be present.
+There is no hand-maintained list of what cv can do inside `cv-mcp`. At startup the server
+runs, once:
 
-### `list_sessions`
+```sh
+cv schema --commands --json
+```
 
-Recent sessions across all harnesses, newest first.
+which dumps clap's own introspection of the command tree — every visible command and
+subcommand with its group, `about`, and each argument's kind (`flag` / `option` /
+`positional`), value type, possible values, default, help text and required-ness. Each
+command in the **Read**, **Reshape**, **Export** and **System** groups becomes one MCP
+tool:
 
-| Arg | Type | Default | Meaning |
-|-----|------|---------|---------|
-| `harness` | string | — | Restrict to one harness: `claude`, `codex`, `grok`, `opencode`, `gemini`. |
-| `cwd_contains` | string | — | Only sessions whose recorded cwd contains this substring. |
-| `limit` | number | `40` | Max results. |
+- the **tool name is the command name** (`ls`, `show`, `cat`, …; a subcommand joins with
+  an underscore, `formats_census`);
+- the **tool description is clap's `about`**;
+- **every argument becomes a JSON-schema property named after the argument** —
+  positionals included, so `cat` takes `session` and `tool_use_id` as properties — with
+  clap's help as the property description, `possible_values` as an `enum`, and the CLI
+  default as `default`;
+- **required arguments land in the schema's `required` list.**
 
-Returns an array of session refs (`id`, `harness`, `cwd`, `title`, `updated_at`,
-`created_at`, `message_count`). *When to use:* a quick "what's been going on lately"
-glance, or to find a session id to read.
+A call shells out: `cv <command> <args…> --json`, and the child's stdout comes back as the
+tool result. The `--json` is appended only for commands that have the flag (so `cat`,
+`tree`, `export`, `blame`, `resume`, … return text), and `json` is therefore *not* a
+property you set. A **non-zero exit is an MCP tool error** (`isError: true`) carrying the
+child's stderr, so `cv`'s exit-2 "no session matching …" reaches the agent verbatim. A
+malformed or unknown argument never reaches `cv` at all: it comes back as JSON-RPC
+`-32602 Invalid params`.
 
-### `search_sessions`
+Because the schema is the binary's own, **tool names, flags, harness lists and output
+shapes cannot drift from the CLI**. Add a command or a flag to `cv` and it appears over
+MCP with no change here. The page you are reading is the one place that can go stale: if
+it and a live `tools/list` ever disagree, the live reply is the authority.
 
-Full-text search across transcripts — case-insensitive substring over all message
-content. Sessions are parsed on demand.
+### Finding the `cv` binary
 
-| Arg | Type | Default | Meaning |
-|-----|------|---------|---------|
-| `query` | string | **required** | Text to search for. |
-| `harness` | string | — | Restrict to one harness. |
-| `cwd_contains` | string | — | Only sessions whose cwd contains this substring. |
-| `limit` | number | `20` | Max results. |
+In order, first one that actually answers `cv schema --commands --json`:
 
-Returns matching session refs, each with a `snippet` (~280 chars) around the first hit.
-*When to use:* find a past conversation by something that was literally said in it.
+1. **`$CV_BIN`** — an explicit absolute path. Set this when `cv` is somewhere unusual, or
+   to pin a specific build.
+2. **A `cv` next to the running `cv-mcp`** (via `std::env::current_exe`). The two are
+   built and installed together, so the sibling is the matching version.
+3. **`cv` on `$PATH`.**
 
-### `read_session`
+If none answers, the server logs the failure to stderr and **serves only the MCP-only
+tools** — it does not die. `tools/list` is then short, and calling a command tool returns
+an error telling you to set `$CV_BIN`.
 
-The full transcript by id (a unique **prefix** of the id is accepted).
+## Windows: `show` never dumps a whole transcript by default
 
-| Arg | Type | Default | Meaning |
-|-----|------|---------|---------|
-| `id` | string | **required** | Session id, or a unique prefix. |
-| `harness` | string | — | Disambiguate if the id/prefix is ambiguous. |
-| `format` | string | `markdown` | `markdown` (rendered) or `json` (full structured session). |
+The [window flags](cli.md) are the same five words everywhere in cv, and they are
+properties on the `show` tool (and on `export`, which has them too):
 
-*When to use:* once `list`/`search`/`project_sessions`/`recall` hands back an id you want
-to read in full.
+| Property | Meaning |
+|---|---|
+| `first` | the first N messages |
+| `last` | the last N messages |
+| `range` | `"A..B"` — messages A (inclusive) to B (exclusive); `"A.."`, `"..B"` |
+| `around` + `context` | message N with K either side (default 5) |
+| `max_bytes` | stop after N bytes of rendered output, then print a `… continue with --range <next>..` line |
 
-### `project_sessions`
+Over MCP — and **only** over MCP — `show` gets a default window: when the caller passes
+**none** of those five, cv-mcp adds `--last 50 --max-bytes 200000`. A 400-message session
+would otherwise land in the agent's context in one shot, which is exactly the problem
+`doctor` exists to diagnose. Naming any selector (including `max_bytes` alone, or
+`pre_compaction`, which sets its own window) suppresses the defaults entirely — asking for
+the whole thing is allowed, it just has to be asked for. The `ls` / `search` `limit`
+defaults are the CLI's, unchanged.
 
-Sessions whose recorded working directory **equals or contains** the given path, newest
-first. Path matching is component-aware (so `/foo` won't match `/foobar`), and a bare
-project name matches by trailing components.
+## The generated tools
 
-| Arg | Type | Default | Meaning |
-|-----|------|---------|---------|
-| `cwd` | string | **required** | Project path (or name) to match against sessions' cwd. |
-| `limit` | number | `20` | Max results. |
+Exactly the CLI's Read / Reshape / Export / System groups. Arguments are listed in full by
+the live `tools/list`; only the **required** ones are shown here. "JSON" says whether the
+call gets `--json` appended (and so returns machine output rather than rendered text).
 
-*When to use:* the headline tool — "what happened in THIS project before, and what are
-sibling agents doing here?"
+### Read
 
-## Pruning — custom lossless compaction
+| Tool | Required | JSON | What it does |
+|---|---|---|---|
+| `ls` | — | yes | List discovered sessions across all harnesses. `cwd` filters to a project; `query` takes the filter calculus. |
+| `show` | `id` | yes | Print a single session (by `harness:id` or a unique id prefix). Windowed by default — see above. |
+| `cat` | `session`, `tool_use_id` | no | Print one tool call's full output, wherever it lives: inline, in a `prune` sidecar, or in a persisted-output file. `input: true` prints the call's arguments instead. |
+| `search` | `query` | yes | Full-text search across all session content. |
+| `events` | `id` | yes | What a session DID: its extracted events (file edits/reads, commands, errors). |
+| `touched` | `path` | yes | Every session with a file_edit/file_read event on that path. |
+| `tools` | `id` | yes | Cross-agent tool analytics across the orchestrator and its whole sub-agent forest. |
+| `tree` | `id` | no | A session's message threading (DAG if parent ids exist, else a numbered list). |
+| `workflow` | `id` | yes | A `Workflow` run, first-class: phase tree, agents and outcomes, totals, driving script. Without `run_id`, lists the session's runs. |
+| `compaction` | `id` | yes | Every compaction boundary, its trigger, pre-compaction size, and the seeding summary. |
+| `timeline` | — | yes | Unified chronological feed across all harnesses. |
+| `stats` | — | yes | Fleet analytics over all discovered sessions. |
+| `diff` | `a`, `b` | no | Compare two sessions message-by-message (great for loom branches). |
+| `blame` | `file` | no | Which agent session wrote this code, and what was it thinking? |
+| `doctor` | — | yes | Why a context window keeps filling: pressure by source, overhead, compaction frequency. |
 
-### `prune_session`
+### Reshape
 
-Compact a Claude session into a **new, resumable** one by snipping bulky *old* tool payloads into a sidecar (see [`cv prune`](cli.md#cv-prune)). The source is never modified; resume the new id with `claude --resume`.
+Each produces a **new** session id; the source is never touched.
 
-| Argument | Type | Default | Meaning |
-| --- | --- | --- | --- |
-| `id` | string | **required** | Source session id (or unique prefix). |
-| `min_size` | number | `2048` | Only snip a tool payload larger than this many bytes. |
-| `keep_last` | number | `25` | Keep the last N conversational turns' payloads verbatim. |
-| `to` | string | — | New session id (default: a fresh UUID). |
-| `drop` | boolean | `false` | Hard-drop payloads (no sidecar, irreversible). |
-| `dry_run` | boolean | `false` | Report what would happen without writing. |
+| Tool | Required | JSON | What it does |
+|---|---|---|---|
+| `prune` | `id` | yes | Lossless compaction into a new resumable session: bulky old tool payloads go to a sidecar behind a `[PRUNED]` marker. Retrieve one with `cat`. |
+| `splice` | `specs` | no | Compose a new session from spans of existing ones (`<id>:A..B`). |
+| `loom` | `base`, `at`, `graft`, `from` | no | Graft: `base[..N]` then `other[M..]`, as one new branched session. |
+| `port` | `id` | no | A copy that runs elsewhere — another harness (`harness`), another working directory (`cwd`), or both. |
+| `redact` | `id` | no | Scrub secrets/PII and export (safe to share). |
+| `resume` | `id` | no | The resume incantation for a session in its native harness. |
 
-Returns JSON with the new id, paths, counts, byte/token savings, and the `claude --resume` line.
+### Export
 
-### `prune_retrieve`
+| Tool | Required | JSON | What it does |
+|---|---|---|---|
+| `export` | `id` | no | Export a session to markdown, JSON, or self-contained HTML. Takes the window flags. |
+| `dataset` | — | no | The corpus as a fine-tuning dataset (JSONL, one session per line). |
+| `pack` | `task` | no | Compile a context bundle for a new task out of the whole corpus. |
 
-Fetch a stashed original back out of a pruned session's sidecar.
+### System
 
-| Argument | Type | Default | Meaning |
-| --- | --- | --- | --- |
-| `session` | string | **required** | The pruned session id the `[PRUNED id=…]` marker names. |
-| `tool_use_id` | string | **required** | The id from the marker (e.g. `toolu_…` or `…#tur`). |
+| Tool | Required | JSON | What it does |
+|---|---|---|---|
+| `index` | — | no | Build/refresh the full-text index that makes `search` instant. |
+| `config` | — | no | View the user config and manage the export-source index. |
+| `schema` | — | yes | The reference: query calculus, and the machine-readable schema of every shape cv emits. |
+| `formats` | — | yes | The format census and manifest check. |
+| `recipes` | — | no | The agent quickstart: the ten things agents do with cv. |
 
-## Recall — semantic prior-work search
+## What was removed in 0.11.0
 
-### `recall`
+The old hand-written session tools are gone, with no aliases. Each had a CLI command doing
+the same job better; now there is one of each.
 
-"Have I (or another agent) solved/seen this before?" Semantically searches the whole
-cross-harness corpus and returns the most relevant message **spans** — a short excerpt
-of the messages around each best match — not just metadata.
+| Removed tool | Use instead |
+|---|---|
+| `list_sessions` | `ls` |
+| `project_sessions(cwd)` | `ls(cwd=…)` |
+| `search_sessions` | `search` |
+| `read_session` | `show` (windowed by default) |
+| `recall` | `pack` — the one "build context from the corpus" verb. For plain meaning-based hits, `search(semantic=true)`. |
+| `prune_session` | `prune` |
+| `prune_retrieve` | `cat(session, tool_use_id)` |
 
-| Arg | Type | Default | Meaning |
-|-----|------|---------|---------|
-| `query` | string | **required** | What you're trying to do / the problem to find prior work on. |
-| `k` | number | `5` | Max sessions to return. |
-| `harness` | string | — | Restrict results to one harness. |
+The hand-written `doctor` tool was replaced by the generated `cv doctor`, which takes the
+same `id` and returns the same report plus everything the CLI has grown since.
 
-Returns `{ mode, query, results[] }`, where each result has `id`, `harness`, `cwd`,
-`title`, `score`, `why` (why it matched), and `span` (the rendered excerpt). `mode` is
-`"semantic"` when an embedding store is available and `"text"` when it fell back to
-keyword search. For meaning-based results, build the embedding store first with
-`cv index --semantic`; without it, recall **degrades gracefully** to full-text search.
-See [search/recall](search.md) for the search machinery.
+## The MCP-only tools
 
-## Awaiting live activity
+These have **no CLI equivalent** and stay hand-written, because they block, hold a cursor,
+or arbitrate between agents — things a one-shot subprocess cannot do.
 
 ### `await_omen`
 
@@ -169,6 +213,26 @@ On a match returns `{ matched: true, harness, id, cwd, role, matched_text, event
 `{ matched: false, timed_out: true, waited_secs }`. *When to use:* wait on a sibling
 agent's raw transcript — e.g. `await_omen(regex='BUILD (PASSED|FAILED)', cwd_contains='/myproj')`.
 For explicit, structured coordination, prefer the board (below).
+
+### `observe_stream`
+
+The **non-blocking** sibling of `await_omen`: drain the newly-appended messages since an
+opaque cursor and return immediately with a fresh one, so a senior orchestrator can poll a
+junior's live activity on its own cadence. The first call (no cursor) records a baseline
+and returns no backlog.
+
+| Arg | Type | Default | Meaning |
+|-----|------|---------|---------|
+| `cwd_contains` | string | — | Only observe sessions whose cwd contains this substring. |
+| `harness` | string | — | Only observe this harness. |
+| `since_cursor` | string | — | Cursor from a previous call. Omit to baseline from the current tail. |
+| `max_messages` | number | `50` | Max messages this call; the rest are flagged `more_pending`. |
+| `char_cap` | number | `16000` | Cap on total characters returned; the last message is truncated to fit. |
+
+Read-only — it never writes the board.
+
+Requests are dispatched concurrently, so a parked `await_omen` or `board_await` never
+head-of-line-blocks a `show` issued after it.
 
 ## The coordination board
 
@@ -218,7 +282,7 @@ A claimed `key` is typically a file path or task id. Always `board_release` when
 | Tool | Required args | Optional args | Purpose / when to use |
 |------|---------------|---------------|------------------------|
 | `board_heartbeat` | `channel`, `from` | — | Announce you're alive on a channel. Call periodically to stay "active". |
-| `board_who` | `channel` | `within_secs` (`120`) | List agents that heartbeat within the window — active presence. |
+| `board_who` | `channel` | `within_secs` (`60`) | List agents that heartbeat within the window — active presence. |
 
 ## The task substrate over MCP
 
@@ -254,18 +318,20 @@ shapes. Two things to know up front:
 
 \* identity-bearing: defaults to `$CV_ENDPOINT`, errors when neither is set.
 
-This table is transcribed from the server's own `tools/list` reply (the `tool_list()` function
-in `cv-mcp`); if this page and a live `tools/list` ever disagree, the live reply is the
-authority.
+This table is transcribed from the server's own `tools/list` reply (the `task_tool_list()`
+function in `cv-mcp`); if this page and a live `tools/list` ever disagree, the live reply is
+the authority.
 
 ## A typical flow
 
-1. An agent starts work in `/myproj`. It calls `project_sessions(cwd='/myproj')` to see
-   prior history, and `board_who(channel='myproj')` to see which siblings are live.
+1. An agent starts work in `/myproj`. It calls `ls(cwd='/myproj')` to see prior history,
+   and `board_who(channel='myproj')` to see which siblings are live.
 2. It `board_heartbeat`s, then `board_claim(channel='myproj', key='src/auth.rs')` so no
    one else touches that file.
-3. Mid-task it hits a wall and `recall(query='refresh token rotation')`s the corpus for
-   how it was solved before, reading the winner with `read_session(id)`.
+3. Mid-task it hits a wall and calls `pack(task='refresh token rotation')` to compile
+   prior work on it from the whole corpus, then `show(id=…, around=…)` on the winner to
+   read the span in context — or `cat(session, tool_use_id)` to pull one tool output back
+   in full.
 4. It hands off: `board_post(channel='myproj', kind='status', body='auth done, tests green')`
    and `board_release(channel='myproj', key='src/auth.rs')`.
 5. A sibling that ran `board_await(channel='myproj', regex='auth done')` unblocks and

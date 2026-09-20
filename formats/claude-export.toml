@@ -1,0 +1,25 @@
+# formats/claude-export.toml — the vocabulary cv's `claude-export` adapter is checked against (docs/INTERFACE-V2.md §7).
+# status: handled = per-item arm in the adapter; generic = interpreted by a blanket rule; carried = verbatim
+# under ParseOptions::complete only; ignored = known and deliberately skipped. Regenerate: tools/gen-manifests (or edit by hand).
+
+harness = "claude-export"
+source_files = ["harness/export.rs"]
+ignore_literals = ["conversations.json", "all"]
+store = [
+  "registered conversations.json (cv config --add-export)",
+]
+
+[upstream]
+repo = "Claude.ai data export"
+commit = "unknown"
+date = "2026-05-29"
+
+[types]
+"sender.human" = { status = "handled", note = "" }
+"sender.assistant" = { status = "handled", note = "" }
+"sender.user" = { status = "handled", note = "" }
+"sender.tool" = { status = "handled", note = "" }
+"block.text" = { status = "handled", note = "" }
+"block.thinking" = { status = "handled", note = "" }
+"block.tool_use" = { status = "handled", note = "" }
+"block.tool_result" = { status = "handled", note = "" }

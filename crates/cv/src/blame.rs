@@ -418,7 +418,7 @@ fn print_match(e: &EditEvent, m: &SessionMatch) {
         elsewhere,
     );
     let (s, end) = range_hint(e.msg_idx);
-    println!("    ↳ cv show {} --range {s}-{end}", crate::short_id(&e.session_id));
+    println!("    ↳ cv show {} --range {s}..{end}", crate::short_id(&e.session_id));
 }
 
 /// `--show`: render the conversation window around the best match's edit, through the exact
@@ -429,7 +429,7 @@ fn show_best(harness: &str, session_id: &str, msg_idx: i64) -> Result<()> {
         .with_context(|| format!("session {harness}:{session_id} not found (deleted since indexing?)"))?;
     let (start, end) = range_hint(msg_idx);
     println!(
-        "\n── conversation around the edit · {harness} {} · msg {start}-{end} ──\n",
+        "\n── conversation around the edit · {harness} {} · msg {start}..{end} ──\n",
         crate::short_id(session_id)
     );
     let mut out = std::io::BufWriter::new(std::io::stdout().lock());
@@ -439,7 +439,10 @@ fn show_best(harness: &str, session_id: &str, msg_idx: i64) -> Result<()> {
         &mut out,
         crate::show_header,
         crate::show_message,
-        Some((start, Some(end))),
+        crate::RenderOpts {
+            range: Some((start, Some(end))),
+            max_bytes: None,
+        },
     )?;
     use std::io::Write;
     out.flush()?;
@@ -488,7 +491,7 @@ fn blame_event_only(file: &str, abs: &Path) -> Result<()> {
             e.msg_idx,
         );
         let (s, end) = range_hint(e.msg_idx);
-        println!("    ↳ cv show {} --range {s}-{end}", crate::short_id(&e.session_id));
+        println!("    ↳ cv show {} --range {s}..{end}", crate::short_id(&e.session_id));
     }
     Ok(())
 }

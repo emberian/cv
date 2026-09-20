@@ -1,7 +1,7 @@
-//! CLI glue for the query calculus (`cv_core::query`): parse `-q` strings, the `cv query` reference
-//! command, and a [`SessionFacts`] resolver that answers the external predicates (`text:` via the
-//! tantivy index, `tool:`/`touched:`/`has:` from the parsed session's events) so the engine can be
-//! evaluated against a real session.
+//! CLI glue for the query calculus (`cv_core::query`): parse `-q` strings and a [`SessionFacts`]
+//! resolver that answers the external predicates (`text:` via the tantivy index,
+//! `tool:`/`touched:`/`has:` from the parsed session's events) so the engine can be evaluated
+//! against a real session. The reference itself is `cv schema` (`cmd/schema.rs`).
 
 use anyhow::{anyhow, Result};
 use cv_core::events::{self, Event};
@@ -10,23 +10,15 @@ use cv_core::query::{ExtFacts, Facts, FieldId, SessionQuery, Tri};
 use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
 
-/// Parse an optional `-q` string into a query, surfacing parse errors (which already point at
-/// `cv query`).
+/// Parse an optional `-q` string into a query, surfacing parse errors. The core's messages point
+/// at the reference by its 0.10 name; the CLI seam re-points them at `cv schema`.
 pub(crate) fn build(query: Option<String>) -> Result<Option<SessionQuery>> {
     match query {
-        Some(q) => Ok(Some(SessionQuery::parse(&q).map_err(|e| anyhow!(e))?)),
+        Some(q) => Ok(Some(
+            SessionQuery::parse(&q).map_err(|e| anyhow!(e.replace("`cv query`", "`cv schema`")))?,
+        )),
         None => Ok(None),
     }
-}
-
-/// `cv query` — print the full language reference (or the machine schema with `--json`).
-pub(crate) fn cmd_query(json: bool) -> Result<()> {
-    if json {
-        println!("{}", serde_json::to_string_pretty(&cv_core::query::schema_json())?);
-    } else {
-        print!("{}", cv_core::query::reference());
-    }
-    Ok(())
 }
 
 /// Pre-resolved full-text results: each distinct `text:` needle → the set of session ids that match

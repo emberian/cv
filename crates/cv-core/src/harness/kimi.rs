@@ -8,21 +8,37 @@
 //!
 //! Two on-disk shapes (sniffed, never via a version field):
 //! - **Modern (dir form):** `sessions/<hash>/<uuid>/context.jsonl` plus a `wire.jsonl` sidecar
-//!   (timestamps + token usage), optional `state.json` (`custom_title`), and archived pre-compaction
-//!   segments `context_1.jsonl…context_N.jsonl` (we read the live `context.jsonl`, recording the
-//!   count of segments in `session.extra`).
+//!   (timestamps + token usage), optional `state.json` (`custom_title`), and rotated-out segments
+//!   `context_1.jsonl…context_N.jsonl` (we read the live `context.jsonl`, recording the count of
+//!   segments in `extra["kimi"]["compaction_segments"]`).
 //! - **Legacy (flat form):** `sessions/<hash>/<uuid>.jsonl` — the transcript only, no sidecar/dir.
 //!   (kimi-cli migrates these to the dir form on next open; we still read them in place.)
 //!
-//! ## `context.jsonl` records (one JSON object per line)
-//! - `{"role":"_system_prompt","content":str}` → System message.
-//! - `{"role":"_checkpoint","id":N}` → skipped (UI bookmark).
-//! - `{"role":"_usage","token_count":N}` → skipped (running total; real usage comes from wire).
-//! - `{"role":"user","content": str | [Part]}` → User. `content` is a BARE STRING for a single text
-//!   part, else a list of Parts.
-//! - `{"role":"assistant","content":[Part],"tool_calls":[…]}` → Assistant.
-//! - `{"role":"tool","content": str | [Part],"tool_call_id":id}` → Tool (one ToolResult). The first
-//!   text part is often a `<system>summary</system>` line.
+//! ## `context.jsonl` records (one JSON object per line) → kind / origin
+//! Ground truth is kimi-cli's `soul/context.py` (the writer) and `soul/kimisoul.py` (the loop).
+//! - `{"role":"_system_prompt","content":str}` → `SystemPrompt`/Harness, and `Session::system_prompt`
+//!   (`Context.write_system_prompt`, the first record of every segment).
+//! - `{"role":"_checkpoint","id":N}` → a per-step rewind target (`KimiSoul._checkpoint()` runs at the
+//!   top of EVERY step, `kimisoul.py:1036`; `Context.revert_to(id)` truncates back to it). It marks
+//!   nothing the reader needs, so it is a `Carrier` under [`ParseOptions::complete`] and dropped
+//!   otherwise — NOT a `Branch` and NOT a `CompactionBoundary`: the segment rotation
+//!   (`context.jsonl` → `context_N.jsonl`) is done by `revert_to` (rewind) and `clear` (compaction,
+//!   `kimisoul.py:1577`), never by a checkpoint.
+//! - `{"role":"_usage","token_count":N}` → not a message: the request input-token count kimi-cli
+//!   logs after a step (`update_token_count(usage.input)`, `kimisoul.py:1267`). It lands on the
+//!   preceding message as `extra["kimi"]["token_count"]`, and — on a `Reply` the wire sidecar gave
+//!   no usage for — as `usage.input_tokens`.
+//! - `{"role":"user","content": str | [Part]}` → `Prompt`/Human, unless kimi-cli's own markers say
+//!   the harness wrote it: a first text part starting `<system>Previous context has been compacted`
+//!   (`soul/compaction.py::COMPACTION_OUTPUT_PREFIX`) is the `CompactionSummary` that seeds the
+//!   rotated segment — preceded by a synthetic `CompactionBoundary`, since the boundary itself is
+//!   the file rotation; `<notification …>` (`notifications/llm.py`) is `InjectedContext`/Scheduler;
+//!   `<system>…</system>` / `<system-reminder>` (`soul/message.py::system[_reminder]`) is
+//!   `InjectedContext`/Harness. `content` is a BARE STRING for a single text part, else a list.
+//! - `{"role":"assistant","content":[Part],"tool_calls":[…]}` → `Reply`/Model.
+//! - `{"role":"tool","content": str | [Part],"tool_call_id":id}` → `ToolResult`/Harness (one
+//!   ToolResult block, `tool_name` resolved from the call). The first text part is often a
+//!   `<system>summary</system>` line.
 //!
 //! ### Part (`type`-tagged)
 //! - `text{text}` → Text.
@@ -157,7 +173,7 @@ impl Adapter for Kimi {
         crate::stream::collect(self, r)
     }
 
-    fn stream(&self, r: &SessionRef, _opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
+    fn stream(&self, r: &SessionRef, opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
         // r.path is the session dir (modern) or the hash dir (legacy). Locate the transcript.
         let (transcript, wire) = locate_transcript(&r.path, &r.id);
 
@@ -190,9 +206,12 @@ impl Adapter for Kimi {
         // Note archived compaction segments (context_1.jsonl…), if any, for fidelity bookkeeping.
         let seg_count = count_segments(&r.path);
         if seg_count > 0 {
-            s.extra
+            s.harness_extra_mut(Harness::Kimi)
                 .insert("compaction_segments".into(), Value::Number(seg_count.into()));
         }
+        // The system prompt is the first `context.jsonl` record; peek so the session-level copy is
+        // known before the body streams.
+        s.system_prompt = peek_system_prompt(&transcript);
 
         // Session metadata is known up front; hand it to the sink before the body.
         sink.meta(&s);
@@ -208,31 +227,63 @@ impl Adapter for Kimi {
         let mut statuses = enrich.statuses.iter();
         let first_wire_ts = enrich.msg_timestamps.first().copied();
         let mut first_user_seen = false;
-        let skipped = super::for_each_json_line(BufReader::new(file), |v| match context_message(&v, &enrich) {
-            Some(mut m) => {
-                match m.role {
-                    Role::Assistant => {
-                        if let Some(st) = statuses.next() {
-                            if m.usage.is_none() {
-                                m.usage = st.usage.clone();
-                            }
-                            if m.id.is_none() {
-                                m.id = st.message_id.clone();
-                            }
-                        }
-                    }
-                    Role::User if !first_user_seen => {
-                        first_user_seen = true;
-                        if m.timestamp.is_none() {
-                            m.timestamp = first_wire_ts;
-                        }
-                    }
-                    _ => {}
+        // `tool_call_id` → tool name from the assistant's `tool_calls`, so a result names its tool.
+        let mut call_names: HashMap<String, String> = HashMap::new();
+        let complete = opts.complete;
+        // One-message lookahead: a `_usage` record describes the message BEFORE it, so each message
+        // waits here until the next record shows what follows. Peak memory stays O(one message).
+        let mut pending: Option<Message> = None;
+        let mut stopped = false;
+        let skipped = super::for_each_json_line(BufReader::new(file), |v| {
+            if v.get("role").and_then(Value::as_str) == Some("_usage") {
+                if let Some(p) = pending.as_mut() {
+                    fold_usage_record(p, &v);
                 }
-                sink.message(m)
+                return Flow::Continue;
             }
-            None => Flow::Continue,
+            let Some(mut m) = context_message(&v, &enrich, complete, &mut call_names) else {
+                return Flow::Continue;
+            };
+            match m.role {
+                Role::Assistant => {
+                    if let Some(st) = statuses.next() {
+                        if m.usage.is_none() {
+                            m.usage = st.usage.clone();
+                        }
+                        if m.id.is_none() {
+                            m.id = st.message_id.clone();
+                        }
+                    }
+                }
+                Role::User if !first_user_seen => {
+                    first_user_seen = true;
+                    if m.timestamp.is_none() {
+                        m.timestamp = first_wire_ts;
+                    }
+                }
+                _ => {}
+            }
+            if let Some(prev) = pending.take() {
+                if sink.message(prev) == Flow::Stop {
+                    stopped = true;
+                    return Flow::Stop;
+                }
+            }
+            // The compaction summary seeds a rotated segment; the boundary itself is the rotation,
+            // which leaves no record — synthesize it so the compaction detector can pair the two.
+            if m.kind == MessageKind::CompactionSummary && sink.message(compaction_boundary(m.timestamp)) == Flow::Stop
+            {
+                stopped = true;
+                return Flow::Stop;
+            }
+            pending = Some(m);
+            Flow::Continue
         });
+        if !stopped {
+            if let Some(last) = pending.take() {
+                sink.message(last);
+            }
+        }
         super::note_skipped_lines(&mut s, skipped);
 
         Ok(s)
@@ -288,14 +339,28 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &crate::emit::EmitOptions) 
         let ts = msg.timestamp.unwrap_or(base_ts);
         let epoch = dt_to_epoch(ts);
         match msg.role {
-            Role::System => {
-                let text = coerce_message_text(msg);
-                ctx_lines.push(serde_json::json!({
-                    "role": "_system_prompt",
-                    "content": text,
-                }));
-                wire_lines.push(wire_event(epoch, "TurnBegin", serde_json::json!({})));
-            }
+            // Kimi's only System-role record is the system prompt. A verbatim Kimi carrier replays
+            // as-is; other System kinds — notices, and the synthetic `CompactionBoundary` this
+            // adapter itself emits before a compaction summary (the boundary is a file rotation,
+            // not a record) — have no `context.jsonl` form and are left out.
+            Role::System => match msg.kind {
+                MessageKind::SystemPrompt => {
+                    let text = coerce_message_text(msg);
+                    ctx_lines.push(serde_json::json!({
+                        "role": "_system_prompt",
+                        "content": text,
+                    }));
+                    wire_lines.push(wire_event(epoch, "TurnBegin", serde_json::json!({})));
+                }
+                MessageKind::Carrier => {
+                    if let Some(rec) = msg.extra.get(crate::harness::claude::CARRIER_KEY) {
+                        if rec.get("role").is_some() {
+                            ctx_lines.push(rec.clone());
+                        }
+                    }
+                }
+                _ => {}
+            },
             Role::User => {
                 ctx_lines.push(serde_json::json!({
                     "role": "user",
@@ -356,6 +421,15 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &crate::emit::EmitOptions) 
                     }
                 }
             }
+        }
+        // The `_usage` record that followed this message on parse (folded into
+        // `extra["kimi"]["token_count"]`) goes back where it was.
+        if let Some(n) = msg
+            .harness_extra(Harness::Kimi)
+            .and_then(|bag| bag.get("token_count"))
+            .filter(|n| n.is_number())
+        {
+            ctx_lines.push(serde_json::json!({ "role": "_usage", "token_count": n }));
         }
     }
 
@@ -705,24 +779,73 @@ fn count_segments(dir: &Path) -> u64 {
 // context.jsonl → IR
 // ---------------------------------------------------------------------------
 
-/// Convert one `context.jsonl` record into a `Message`, or `None` to skip it.
-fn context_message(v: &Value, enrich: &WireEnrich) -> Option<Message> {
+/// The system prompt from the head of `context.jsonl` (kimi-cli writes it as the first record,
+/// `{"role":"_system_prompt", …}`; `soul/context.py:99`). Bounded to the first few lines.
+fn peek_system_prompt(transcript: &Path) -> Option<String> {
+    let file = fs::File::open(transcript).ok()?;
+    let mut prompt = None;
+    let mut seen = 0usize;
+    super::for_each_json_line(BufReader::new(file), |v| {
+        seen += 1;
+        if v.get("role").and_then(Value::as_str) == Some("_system_prompt") {
+            let text = coerce_content_text(v.get("content"));
+            if !text.is_empty() {
+                prompt = Some(text);
+            }
+            return Flow::Stop;
+        }
+        if seen >= 4 {
+            Flow::Stop
+        } else {
+            Flow::Continue
+        }
+    });
+    prompt
+}
+
+/// Convert one `context.jsonl` record into a `Message`, or `None` to skip it (`_usage` is always
+/// `None` here: [`Kimi::stream`] folds it onto the preceding message with [`fold_usage_record`]).
+///
+/// `_checkpoint` records are kimi-cli's numbered rewind targets (`Context.checkpoint()` /
+/// `revert_to()`, `soul/context.py:123-200`), written at the top of every step
+/// (`kimisoul.py:1036`): no content, and the conversation continues straight through them. Only a
+/// later `revert_to` makes one matter, and that rewrites the file (rotating the old one to
+/// `context_N.jsonl`) — so a checkpoint still present in the live transcript is one that was never
+/// reverted to. Bookkeeping: a `Carrier` under `complete`, dropped otherwise; not a `Branch`, not a
+/// `CompactionBoundary` (see the module doc for where those come from).
+fn context_message(
+    v: &Value,
+    enrich: &WireEnrich,
+    complete: bool,
+    call_names: &mut HashMap<String, String>,
+) -> Option<Message> {
     let role = v.get("role").and_then(Value::as_str)?;
     match role {
-        "_checkpoint" | "_usage" => None,
+        "_usage" => None,
+        "_checkpoint" => {
+            if !complete {
+                return None;
+            }
+            let mut m = Message::of_kind(Role::System, MessageKind::Carrier, Origin::Harness);
+            m.extra.insert(crate::harness::claude::CARRIER_KEY.into(), v.clone());
+            m.harness_extra_mut(Harness::Kimi)
+                .insert("record_type".into(), Value::String(role.to_string()));
+            Some(m)
+        }
         "_system_prompt" => {
             let text = coerce_content_text(v.get("content"));
-            let mut m = Message::new(Role::System);
+            let mut m = Message::of_kind(Role::System, MessageKind::SystemPrompt, Origin::Harness);
             m.content.push(Block::Text { text: text.into() });
             Some(m)
         }
         "user" => {
-            let mut m = Message::new(Role::User);
+            let mut m = Message::of_kind(Role::User, MessageKind::Prompt, Origin::Human);
             push_parts(&mut m, v.get("content"));
+            classify_user(&mut m);
             (!m.content.is_empty()).then_some(m)
         }
         "assistant" => {
-            let mut m = Message::new(Role::Assistant);
+            let mut m = Message::of_kind(Role::Assistant, MessageKind::Reply, Origin::Model);
             push_parts(&mut m, v.get("content"));
             if let Some(calls) = v.get("tool_calls").and_then(Value::as_array) {
                 for c in calls {
@@ -734,6 +857,9 @@ fn context_message(v: &Value, enrich: &WireEnrich) -> Option<Message> {
                         .unwrap_or("")
                         .to_string();
                     let input = parse_arguments(func.and_then(|f| f.get("arguments")));
+                    if !id.is_empty() && !name.is_empty() {
+                        call_names.insert(id.clone(), name.clone());
+                    }
                     m.content.push(Block::ToolUse {
                         id,
                         name,
@@ -753,12 +879,12 @@ fn context_message(v: &Value, enrich: &WireEnrich) -> Option<Message> {
                 None => (coerce_content_text(v.get("content")), false, None),
             };
             let status = Some(if is_error { "error" } else { "completed" }.to_string());
-            let mut m = Message::new(Role::Tool);
+            let mut m = Message::of_kind(Role::Tool, MessageKind::ToolResult, Origin::Harness);
             m.content.push(Block::ToolResult {
+                tool_name: call_names.get(&tool_use_id).cloned(),
                 tool_use_id,
                 content: content.into(),
                 is_error,
-                tool_name: None,
                 status,
                 details,
             });
@@ -766,6 +892,64 @@ fn context_message(v: &Value, enrich: &WireEnrich) -> Option<Message> {
         }
         _ => None,
     }
+}
+
+/// `soul/compaction.py::COMPACTION_OUTPUT_PREFIX`, as `soul/message.py::system()` wraps it: the first
+/// text part of the user message that seeds a rotated segment.
+const COMPACTION_SUMMARY_TAG: &str = "<system>Previous context has been compacted.";
+
+/// Refine a `user` record's kind/origin from kimi-cli's own text markers (module doc). A typed
+/// prompt never starts with these tags; the harness's `system()` / `system_reminder()` helpers and
+/// `build_notification_message` always do.
+fn classify_user(m: &mut Message) {
+    let Some(Block::Text { text }) = m.content.first() else {
+        return;
+    };
+    let head = text.trim_start();
+    let (kind, origin) = if head.starts_with(COMPACTION_SUMMARY_TAG) {
+        (MessageKind::CompactionSummary, Origin::Harness)
+    } else if head.starts_with("<notification") {
+        (MessageKind::InjectedContext, Origin::Scheduler)
+    } else if head.starts_with("<system>") || head.starts_with("<system-reminder>") {
+        (MessageKind::InjectedContext, Origin::Harness)
+    } else {
+        return;
+    };
+    m.kind = kind;
+    m.origin = origin;
+}
+
+/// Fold a `{"role":"_usage","token_count":N}` record onto the message it follows: always as
+/// `extra["kimi"]["token_count"]` (so [`emit`] can put the record back), and as `usage.input_tokens`
+/// on a `Reply` the wire sidecar gave no usage for (`token_count` is the request's input tokens,
+/// `kimisoul.py:1267`).
+fn fold_usage_record(m: &mut Message, v: &Value) {
+    let Some(n) = v.get("token_count").filter(|n| n.is_number()) else {
+        return;
+    };
+    m.harness_extra_mut(Harness::Kimi)
+        .insert("token_count".into(), n.clone());
+    if m.kind == MessageKind::Reply && m.usage.is_none() {
+        m.usage = Some(Usage {
+            input_tokens: n.as_u64(),
+            ..Usage::default()
+        });
+    }
+}
+
+/// The synthetic boundary emitted before a `CompactionSummary`: kimi-cli's compaction rotates the
+/// transcript (`Context.clear`, `kimisoul.py:1577`) and leaves no record of its own, so the
+/// summary is the only trace — and the compaction detector pairs a summary with the boundary
+/// before it.
+fn compaction_boundary(ts: Option<DateTime<Utc>>) -> Message {
+    let mut m = Message::of_kind(Role::System, MessageKind::CompactionBoundary, Origin::Harness);
+    m.timestamp = ts;
+    m.content.push(Block::Text {
+        text: "[conversation compacted]".into(),
+    });
+    m.harness_extra_mut(Harness::Kimi)
+        .insert("synthetic".into(), Value::Bool(true));
+    m
 }
 
 /// Push a record's `content` (bare string or `[Part]`) onto a message as Blocks.
@@ -1159,7 +1343,7 @@ mod tests {
     #[test]
     fn user_bare_string_and_list() {
         let bare: Value = serde_json::from_str(r#"{"role":"user","content":"hello"}"#).unwrap();
-        let m = context_message(&bare, &WireEnrich::default()).unwrap();
+        let m = context_message(&bare, &WireEnrich::default(), false, &mut HashMap::new()).unwrap();
         assert_eq!(m.role, Role::User);
         assert_eq!(m.text().as_deref(), Some("hello"));
 
@@ -1167,7 +1351,7 @@ mod tests {
             r#"{"role":"user","content":[{"type":"text","text":"hi"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AAA","id":null}}]}"#,
         )
         .unwrap();
-        let m = context_message(&list, &WireEnrich::default()).unwrap();
+        let m = context_message(&list, &WireEnrich::default(), false, &mut HashMap::new()).unwrap();
         assert_eq!(m.text().as_deref(), Some("hi"));
         assert!(matches!(
             m.content[1],
@@ -1182,8 +1366,11 @@ mod tests {
     fn assistant_think_and_tool_calls() {
         let line = r#"{"role":"assistant","content":[{"type":"think","think":"reasoning","encrypted":"BLOB"},{"type":"text","text":"Let me look."}],"tool_calls":[{"type":"function","id":"tool_1","function":{"name":"Shell","arguments":"{\"command\":\"cat .gitmodules\"}"}}]}"#;
         let v: Value = serde_json::from_str(line).unwrap();
-        let m = context_message(&v, &WireEnrich::default()).unwrap();
+        let mut call_names = HashMap::new();
+        let m = context_message(&v, &WireEnrich::default(), false, &mut call_names).unwrap();
         assert_eq!(m.role, Role::Assistant);
+        assert_eq!((m.kind, m.origin), (MessageKind::Reply, Origin::Model));
+        assert_eq!(call_names.get("tool_1").map(String::as_str), Some("Shell"));
         match &m.content[0] {
             Block::Thinking {
                 text,
@@ -1214,20 +1401,24 @@ mod tests {
         let line =
             r#"{"role":"tool","content":"<system>Command executed successfully.</system>","tool_call_id":"tool_1"}"#;
         let v: Value = serde_json::from_str(line).unwrap();
-        let m = context_message(&v, &WireEnrich::default()).unwrap();
+        let mut call_names = HashMap::from([("tool_1".to_string(), "Shell".to_string())]);
+        let m = context_message(&v, &WireEnrich::default(), false, &mut call_names).unwrap();
         assert_eq!(m.role, Role::Tool);
+        assert_eq!((m.kind, m.origin), (MessageKind::ToolResult, Origin::Harness));
         match &m.content[0] {
             Block::ToolResult {
                 tool_use_id,
                 content,
                 is_error,
                 status,
+                tool_name,
                 ..
             } => {
                 assert_eq!(tool_use_id, "tool_1");
                 assert!(content.contains("Command executed successfully"));
                 assert!(!is_error);
                 assert_eq!(status.as_deref(), Some("completed"));
+                assert_eq!(tool_name.as_deref(), Some("Shell"), "resolved from the call");
             }
             o => panic!("expected tool_result, got {o:?}"),
         }
@@ -1242,7 +1433,7 @@ mod tests {
                 extras: Some(serde_json::json!({"k":"v"})),
             },
         );
-        let m = context_message(&v, &enrich).unwrap();
+        let m = context_message(&v, &enrich, false, &mut HashMap::new()).unwrap();
         match &m.content[0] {
             Block::ToolResult {
                 content,
@@ -1275,17 +1466,173 @@ mod tests {
 
     #[test]
     fn internal_roles_skipped() {
-        for line in [
-            r#"{"role":"_checkpoint","id":3}"#,
-            r#"{"role":"_usage","token_count":7291}"#,
-        ] {
-            let v: Value = serde_json::from_str(line).unwrap();
-            assert!(context_message(&v, &WireEnrich::default()).is_none());
+        let cp: Value = serde_json::from_str(r#"{"role":"_checkpoint","id":3}"#).unwrap();
+        assert!(context_message(&cp, &WireEnrich::default(), false, &mut HashMap::new()).is_none());
+        // … but under `complete` a checkpoint rides along as a carrier naming its record type
+        let c = context_message(&cp, &WireEnrich::default(), true, &mut HashMap::new()).unwrap();
+        assert_eq!((c.kind, c.origin), (MessageKind::Carrier, Origin::Harness));
+        assert_eq!(c.extra[crate::harness::claude::CARRIER_KEY], cp);
+        assert_eq!(c.extra["kimi"]["record_type"], "_checkpoint");
+        // `_usage` is never a message, even under `complete`: it folds onto the message before it
+        let us: Value = serde_json::from_str(r#"{"role":"_usage","token_count":7291}"#).unwrap();
+        for complete in [false, true] {
+            assert!(context_message(&us, &WireEnrich::default(), complete, &mut HashMap::new()).is_none());
         }
         let sp: Value = serde_json::from_str(r#"{"role":"_system_prompt","content":"You are Kimi."}"#).unwrap();
-        let m = context_message(&sp, &WireEnrich::default()).unwrap();
+        let m = context_message(&sp, &WireEnrich::default(), false, &mut HashMap::new()).unwrap();
         assert_eq!(m.role, Role::System);
+        assert_eq!(m.kind, MessageKind::SystemPrompt);
+        assert_eq!(m.origin, Origin::Harness);
         assert_eq!(m.text().as_deref(), Some("You are Kimi."));
+    }
+
+    #[test]
+    fn user_markers_set_kind_and_origin() {
+        let cases = [
+            (
+                r#"{"role":"user","content":"fix the build"}"#,
+                MessageKind::Prompt,
+                Origin::Human,
+            ),
+            (
+                r#"{"role":"user","content":[{"type":"text","text":"<system>Previous context has been compacted. Here is the compaction output:</system>"},{"type":"text","text":"<current_focus>x</current_focus>"}]}"#,
+                MessageKind::CompactionSummary,
+                Origin::Harness,
+            ),
+            (
+                r#"{"role":"user","content":[{"type":"text","text":"<system-reminder>\nremember\n</system-reminder>"}]}"#,
+                MessageKind::InjectedContext,
+                Origin::Harness,
+            ),
+            (
+                r#"{"role":"user","content":[{"type":"text","text":"<system>CHECKPOINT 3</system>"}]}"#,
+                MessageKind::InjectedContext,
+                Origin::Harness,
+            ),
+            (
+                r#"{"role":"user","content":[{"type":"text","text":"<notification id=\"n1\" category=\"task\" type=\"task.completed\">\nTitle: done\n</notification>"}]}"#,
+                MessageKind::InjectedContext,
+                Origin::Scheduler,
+            ),
+            // a typed prompt that merely mentions a tag mid-text stays a prompt
+            (
+                r#"{"role":"user","content":"why does <system> appear in the log?"}"#,
+                MessageKind::Prompt,
+                Origin::Human,
+            ),
+        ];
+        for (line, kind, origin) in cases {
+            let v: Value = serde_json::from_str(line).unwrap();
+            let m = context_message(&v, &WireEnrich::default(), false, &mut HashMap::new()).unwrap();
+            assert_eq!(m.role, Role::User, "{line}");
+            assert_eq!((m.kind, m.origin), (kind, origin), "{line}");
+        }
+    }
+
+    /// A rotated (post-compaction) legacy segment, as `Context.clear` + `write_system_prompt` +
+    /// `checkpoint` + `append_message(summary)` + `update_token_count` lay it down: the summary user
+    /// record gets a synthetic boundary before it; `_usage` folds onto the message before it (as
+    /// `usage.input_tokens` on a Reply, as `token_count` on anything) and comes back on emit.
+    #[test]
+    fn usage_folds_onto_preceding_message_and_compaction_pairs() {
+        let id = "33333333-3333-3333-3333-333333333333";
+        let lines = [
+            r#"{"role":"_system_prompt","content":"You are Kimi."}"#,
+            r#"{"role":"_checkpoint","id":0}"#,
+            r#"{"role":"user","content":[{"type":"text","text":"<system>Previous context has been compacted. Here is the compaction output:</system>"},{"type":"text","text":"summary body"}]}"#,
+            r#"{"role":"_usage","token_count":900}"#,
+            r#"{"role":"_checkpoint","id":1}"#,
+            r#"{"role":"user","content":"and now?"}"#,
+            r#"{"role":"assistant","content":[{"type":"text","text":"Next."}]}"#,
+            r#"{"role":"_usage","token_count":1234}"#,
+        ];
+        let dir = write_temp(&format!("{id}.jsonl"), &(lines.join("\n") + "\n"));
+        let r = SessionRef {
+            id: id.into(),
+            harness: Harness::Kimi,
+            path: dir.clone(),
+            cwd: None,
+            title: None,
+            created_at: None,
+            updated_at: None,
+            message_count: 0,
+        };
+        let adapter = Kimi {
+            sessions: None,
+            root: None,
+        };
+        let s = adapter.parse(&r).unwrap();
+        assert_eq!(s.system_prompt.as_deref(), Some("You are Kimi."));
+        let kinds: Vec<MessageKind> = s.messages.iter().map(|m| m.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                MessageKind::SystemPrompt,
+                MessageKind::CompactionBoundary,
+                MessageKind::CompactionSummary,
+                MessageKind::Prompt,
+                MessageKind::Reply,
+            ],
+            "{kinds:?}"
+        );
+        assert_eq!(s.messages[1].extra["kimi"]["synthetic"], true);
+        assert_eq!(s.messages[2].extra["kimi"]["token_count"], 900);
+        assert!(s.messages[2].usage.is_none(), "token_count is usage only on a Reply");
+        let reply = &s.messages[4];
+        assert_eq!(reply.extra["kimi"]["token_count"], 1234);
+        assert_eq!(reply.usage.as_ref().and_then(|u| u.input_tokens), Some(1234));
+        // the compaction detector pairs the synthetic boundary with the summary
+        let comps = crate::compaction::detect_in_session(&s, true);
+        assert_eq!(comps.len(), 1);
+        assert_eq!(comps[0].summary_msg_idx, Some(2));
+        assert!(comps[0].summary.as_deref().unwrap_or("").contains("summary body"));
+        // every fact is in the harness bag; nothing flat
+        for m in &s.messages {
+            assert!(
+                m.extra
+                    .keys()
+                    .all(|k| k == "kimi" || k == crate::harness::claude::CARRIER_KEY),
+                "{:?}",
+                m.extra
+            );
+        }
+        // complete: the checkpoints ride as carriers, `_usage` still folds (the emitter re-creates it)
+        let c = crate::stream::collect_with(&adapter, &r, &ParseOptions::complete()).unwrap();
+        let record_types: Vec<&str> = c
+            .messages
+            .iter()
+            .filter(|m| m.kind == MessageKind::Carrier)
+            .filter_map(|m| m.extra["kimi"]["record_type"].as_str())
+            .collect();
+        assert_eq!(record_types, ["_checkpoint", "_checkpoint"]);
+        let out = emit_temp_dir();
+        let res = emit(&c, &out, &crate::emit::EmitOptions::default()).unwrap();
+        let text = fs::read_to_string(res.path.join("context.jsonl")).unwrap();
+        let roles: Vec<String> = text
+            .lines()
+            .map(|l| {
+                serde_json::from_str::<Value>(l).unwrap()["role"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            roles,
+            [
+                "_system_prompt",
+                "_checkpoint",
+                "user",
+                "_usage",
+                "_checkpoint",
+                "user",
+                "assistant",
+                "_usage"
+            ],
+            "the record sequence round-trips (the synthetic boundary has no record form)"
+        );
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&out);
     }
 
     #[test]
@@ -1426,7 +1773,7 @@ mod tests {
     #[test]
     fn emit_round_trips_through_parse() {
         // Build a small session: system + user + assistant(think+text+tool_use) + tool result.
-        let mut sys = Message::new(Role::System);
+        let mut sys = Message::of_kind(Role::System, MessageKind::SystemPrompt, Origin::Harness);
         sys.content.push(Block::Text {
             text: "You are Kimi.".into(),
         });

@@ -464,7 +464,11 @@ fn parse_message(v: &Value, session: &mut Session) -> Option<Message> {
         _ => {}
     }
 
-    // Side effects from the first user turn: pull cwd + a clean title out of the prompt text.
+    // Side effects from the first user turn: pull cwd + a clean title out of the prompt text, and
+    // note the harness-injected `<task>` / `<environment_details>` wrappers (which are embedded in
+    // the human's own text, so the turn stays a Prompt — we just flag that it carried them).
+    let mut wraps_task = false;
+    let mut wraps_env = false;
     if role == Role::User {
         let plain = blocks
             .iter()
@@ -474,6 +478,8 @@ fn parse_message(v: &Value, session: &mut Session) -> Option<Message> {
             })
             .collect::<Vec<_>>()
             .join("\n");
+        wraps_task = plain.contains("<task>");
+        wraps_env = plain.contains("<environment_details>");
         if session.cwd.is_none() {
             session.cwd = extract_cwd(&plain);
         }
@@ -493,7 +499,27 @@ fn parse_message(v: &Value, session: &mut Session) -> Option<Message> {
         };
 
     let mut m = Message::new(role);
+    // A `system` message carries the system prompt (rare in Cline; it stores raw Anthropic turns).
+    if role == Role::System {
+        m.kind = MessageKind::SystemPrompt;
+    }
     m.content = blocks;
+    if role == Role::System && session.system_prompt.is_none() {
+        if let Some(t) = m.text() {
+            if !t.trim().is_empty() {
+                session.system_prompt = Some(t);
+            }
+        }
+    }
+    if role == Role::User && (wraps_task || wraps_env) {
+        let bag = m.harness_extra_mut(session.harness);
+        if wraps_task {
+            bag.insert("wraps_task".into(), Value::Bool(true));
+        }
+        if wraps_env {
+            bag.insert("wraps_environment_details".into(), Value::Bool(true));
+        }
+    }
     Some(m)
 }
 
@@ -1001,9 +1027,21 @@ mod tests {
 
         let user = &s.messages[0];
         assert_eq!(user.role, Role::User);
+        // The first user turn carries <task>/<environment_details>; it stays a Prompt, flagged.
+        assert_eq!((user.kind, user.origin), (MessageKind::Prompt, Origin::Human));
+        let bag = user.harness_extra(Harness::Cline).expect("cline bag");
+        assert_eq!(bag.get("wraps_task"), Some(&serde_json::Value::Bool(true)));
+        assert_eq!(
+            bag.get("wraps_environment_details"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        for k in user.extra.keys() {
+            assert!(k == "cline" || k == "_record", "unexpected top-level extra key {k}");
+        }
 
         let asst = &s.messages[1];
         assert_eq!(asst.role, Role::Assistant);
+        assert_eq!((asst.kind, asst.origin), (MessageKind::Reply, Origin::Model));
         assert!(matches!(&asst.content[0], Block::Thinking { signature: Some(sig), .. } if sig == "SIG=="));
         assert!(matches!(&asst.content[1], Block::Text { .. }));
         assert!(matches!(&asst.content[2], Block::ToolUse { name, .. } if name == "read_file"));
@@ -1011,6 +1049,7 @@ mod tests {
         // tool_result-only user line reclassified as Tool.
         let tool = &s.messages[2];
         assert_eq!(tool.role, Role::Tool);
+        assert_eq!((tool.kind, tool.origin), (MessageKind::ToolResult, Origin::Harness));
         match &tool.content[0] {
             Block::ToolResult {
                 tool_use_id,

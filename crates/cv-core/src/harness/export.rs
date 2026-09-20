@@ -366,6 +366,11 @@ fn chatgpt_messages(conv: &Value) -> Vec<Message> {
             continue;
         }
         let mut m = Message::new(role);
+        // A non-user/assistant/tool author (custom instructions, `user_editable_context`) is a
+        // system turn — the system prompt as far as the export records one.
+        if role == Role::System {
+            m.kind = MessageKind::SystemPrompt;
+        }
         m.id = (!node_id.is_empty()).then(|| node_id.clone());
         m.parent_id = node.get("parent").and_then(Value::as_str).map(str::to_string);
         m.timestamp = msg.get("create_time").and_then(ts_from_value);
@@ -426,6 +431,9 @@ fn claude_messages(conv: &Value) -> Vec<Message> {
                 return None;
             }
             let mut msg = Message::new(role);
+            if role == Role::System {
+                msg.kind = MessageKind::SystemPrompt;
+            }
             msg.id = m.get("uuid").and_then(Value::as_str).map(str::to_string);
             msg.parent_id = m.get("parent_message_uuid").and_then(Value::as_str).map(str::to_string);
             msg.timestamp = m.get("created_at").and_then(ts_from_value);

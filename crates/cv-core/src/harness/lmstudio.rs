@@ -112,7 +112,7 @@ impl Adapter for LmStudio {
     /// pinned) and `messages` as a `Vec<&RawValue>` slicing the mapped/owned bytes. Each turn is then
     /// turned into one small `Value` ([`parse_message`]), emitted to `sink`, and dropped before the
     /// next — so peak memory is O(largest turn) + the mmap (reclaimable) + the slice vec.
-    fn stream(&self, r: &SessionRef, _opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
+    fn stream(&self, r: &SessionRef, opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
         let bytes = read_bytes(&r.path).with_context(|| format!("reading {}", r.path.display()))?;
         let doc: Doc =
             serde_json::from_slice(bytes.as_ref()).with_context(|| format!("parsing {}", r.path.display()))?;
@@ -120,17 +120,9 @@ impl Adapter for LmStudio {
         let created_at = doc.created_at.as_ref().and_then(super::ts_from_value);
         let updated_at = file_mtime(&r.path).or(created_at);
 
-        let mut extra = serde_json::Map::new();
-        // Preserve the per-chat / global system prompt so it isn't silently dropped. These
-        // session-level fields are small, so capturing them as owned `Value`s costs nothing.
-        if let Some(sp) = doc.system_prompt() {
-            if !sp.trim().is_empty() {
-                extra.insert("systemPrompt".into(), Value::String(sp.to_string()));
-            }
-        }
-        if doc.pinned == Some(true) {
-            extra.insert("pinned".into(), Value::Bool(true));
-        }
+        // The per-chat / global system prompt is the session-level fact (never a message).
+        let system_prompt = doc.system_prompt().map(str::to_string).filter(|s| !s.trim().is_empty());
+        let pinned = doc.pinned == Some(true);
 
         let mut s = Session {
             id: r.id.clone(),
@@ -143,23 +135,37 @@ impl Adapter for LmStudio {
             git: None,
             messages: Vec::new(),
             source_path: Some(r.path.clone()),
-            extra,
-            system_prompt: None,
+            extra: serde_json::Map::new(),
+            system_prompt,
             lineage: crate::ir::Lineage::default(),
         };
+        if pinned {
+            s.harness_extra_mut(Harness::LmStudio)
+                .insert("pinned".into(), Value::Bool(true));
+        }
 
         // `model` is backfilled from the first genInfo seen while iterating turns, so hand the
         // metadata to the sink after the loop (the bridge sinks read it from the returned Session).
         let mut session_model: Option<String> = None;
         sink.meta(&s);
-        for raw in doc.messages {
+        'outer: for raw in doc.messages {
             // ONE small Value per turn — parsed, emitted, dropped before the next.
             let Ok(v) = serde_json::from_str::<Value>(raw.get()) else {
                 continue;
             };
+            // The `currentlySelected` version is the conversation.
             if let Some(m) = parse_message(&v, &mut session_model) {
                 if sink.message(m) == Flow::Stop {
                     break;
+                }
+            }
+            // Under `complete`, the regenerated/edited `versions[]` alternates ride along as
+            // `Branch` turns, each tagged with its index in `extra["lmstudio"]["variant"]`.
+            if opts.complete {
+                for m in parse_variants(&v) {
+                    if sink.message(m) == Flow::Stop {
+                        break 'outer;
+                    }
                 }
             }
         }
@@ -302,8 +308,8 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &crate::emit::EmitOptions) 
     root.insert("tokenCount".into(), json!(0));
     root.insert("pinned".into(), json!(false));
 
-    // Preserve any system prompt the source carried in `extra` (parse stashes it there).
-    if let Some(sp) = session.extra.get("systemPrompt").and_then(Value::as_str) {
+    // Preserve any system prompt the source carried (parse puts it on `Session::system_prompt`).
+    if let Some(sp) = &session.system_prompt {
         root.insert("systemPrompt".into(), json!(sp));
     }
 
@@ -597,9 +603,14 @@ fn selected_version(msg: &Value) -> Option<&Value> {
     versions.get(idx)
 }
 
-/// Parse one message turn into an IR [`Message`]. Updates `session_model` with the first model seen.
+/// Parse one message turn's visible (`currentlySelected`) version into an IR [`Message`]. Updates
+/// `session_model` with the first model seen.
 fn parse_message(msg: &Value, session_model: &mut Option<String>) -> Option<Message> {
-    let version = selected_version(msg)?;
+    parse_version(selected_version(msg)?, session_model)
+}
+
+/// Parse one specific `version` object into an IR [`Message`].
+fn parse_version(version: &Value, session_model: &mut Option<String>) -> Option<Message> {
     let role = match version.get("role").and_then(Value::as_str) {
         Some("user") => Role::User,
         Some("assistant") => Role::Assistant,
@@ -607,6 +618,10 @@ fn parse_message(msg: &Value, session_model: &mut Option<String>) -> Option<Mess
         _ => return None,
     };
     let mut m = Message::new(role);
+    // A `system` turn is the system prompt (session-level copy in `Session::system_prompt`).
+    if role == Role::System {
+        m.kind = MessageKind::SystemPrompt;
+    }
 
     match version.get("type").and_then(Value::as_str) {
         // Assistant turns: a list of steps (contentBlock / debugInfoBlock / status).
@@ -629,25 +644,55 @@ fn parse_message(msg: &Value, session_model: &mut Option<String>) -> Option<Mess
     Some(m)
 }
 
+/// Every NON-selected `versions[]` entry of a turn, as `Branch`-kind messages — the regenerations
+/// and edits LM Studio keeps beside the visible one. Only emitted under [`ParseOptions::complete`];
+/// each carries its `versions[]` index in `extra["lmstudio"]["variant"]`. A throwaway model sink is
+/// used so an alternate never redefines the session model.
+fn parse_variants(msg: &Value) -> Vec<Message> {
+    let versions = match msg.get("versions").and_then(Value::as_array) {
+        Some(v) if v.len() > 1 => v,
+        _ => return Vec::new(),
+    };
+    let selected = msg
+        .get("currentlySelected")
+        .and_then(Value::as_u64)
+        .map(|i| i as usize)
+        .filter(|i| *i < versions.len())
+        .unwrap_or(versions.len() - 1);
+    let mut out = Vec::new();
+    let mut throwaway_model = None;
+    for (i, version) in versions.iter().enumerate() {
+        if i == selected {
+            continue;
+        }
+        if let Some(mut m) = parse_version(version, &mut throwaway_model) {
+            m.kind = MessageKind::Branch;
+            m.harness_extra_mut(Harness::LmStudio)
+                .insert("variant".into(), Value::Number(i.into()));
+            out.push(m);
+        }
+    }
+    out
+}
+
 /// Parse one assistant `step`. Only `contentBlock` carries content; others are app-internal.
 fn parse_step(step: &Value, m: &mut Message, session_model: &mut Option<String>) {
     if step.get("type").and_then(Value::as_str) != Some("contentBlock") {
         return; // debugInfoBlock / status — nothing to render.
     }
 
-    // Model + usage live on genInfo.
+    // Model + usage live on genInfo. IR diet: the first model seen becomes the session default, so
+    // it is NOT repeated on the message; a later, differing model would name itself.
     if let Some(gen) = step.get("genInfo") {
-        if session_model.is_none() {
-            if let Some(model) = gen
-                .get("indexedModelIdentifier")
-                .or_else(|| gen.get("identifier"))
-                .and_then(Value::as_str)
-            {
-                let model = model.to_string();
-                if m.model.is_none() {
-                    m.model = Some(model.clone());
-                }
-                *session_model = Some(model);
+        if let Some(model) = gen
+            .get("indexedModelIdentifier")
+            .or_else(|| gen.get("identifier"))
+            .and_then(Value::as_str)
+        {
+            match session_model {
+                None => *session_model = Some(model.to_string()),
+                Some(cur) if cur != model && m.model.is_none() => m.model = Some(model.to_string()),
+                _ => {}
             }
         }
         if m.usage.is_none() {
@@ -829,7 +874,11 @@ mod tests {
             _ => unreachable!(),
         }
         assert_eq!(a.text().as_deref(), Some("Hi! How can I help?"));
-        assert_eq!(a.model.as_deref(), Some("openai/gpt-oss-120b"));
+        // IR diet: the assistant's model equals the session default, so it is not repeated.
+        assert!(a.model.is_none());
+        assert_eq!(s.model.as_deref(), Some("openai/gpt-oss-120b"));
+        assert_eq!((u.kind, u.origin), (MessageKind::Prompt, Origin::Human));
+        assert_eq!((a.kind, a.origin), (MessageKind::Reply, Origin::Model));
         let usage = a.usage.as_ref().expect("usage present");
         assert_eq!(usage.input_tokens, Some(12));
         assert_eq!(usage.output_tokens, Some(34));
@@ -879,6 +928,55 @@ mod tests {
         let mut model = None;
         let m = parse_message(&msg, &mut model).unwrap();
         assert_eq!(m.text().as_deref(), Some("v1"));
+    }
+
+    #[test]
+    fn variant_versions_emitted_as_branches_under_complete() {
+        use crate::stream::{collect_with, ParseOptions};
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("cv-lmstudio-branch-{}-{}", std::process::id(), n));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("c.conversation.json");
+        // One user turn, then an assistant turn with two regenerated versions (index 1 selected).
+        fs::write(
+            &path,
+            r#"{"name":"T","createdAt":1754425094719,"messages":[
+                {"currentlySelected":0,"versions":[{"type":"singleStep","role":"user","content":[{"type":"text","text":"hi"}]}]},
+                {"currentlySelected":1,"versions":[
+                    {"type":"multiStep","role":"assistant","steps":[{"type":"contentBlock","content":[{"type":"text","text":"first try"}]}]},
+                    {"type":"multiStep","role":"assistant","steps":[{"type":"contentBlock","content":[{"type":"text","text":"second try"}]}]}
+                ]}
+            ]}"#,
+        )
+        .unwrap();
+        let r = scan(&path).unwrap().unwrap();
+
+        // Default parse: only the selected version — no branches.
+        let normal = LmStudio { root: None }.parse(&r).unwrap();
+        assert_eq!(normal.messages.len(), 2);
+        assert_eq!(normal.messages[1].text().as_deref(), Some("second try"));
+        assert!(normal.messages.iter().all(|m| m.kind != MessageKind::Branch));
+
+        // Complete parse: the non-selected version rides along as a Branch turn.
+        let full = collect_with(&LmStudio { root: None }, &r, &ParseOptions::complete()).unwrap();
+        let branch = full
+            .messages
+            .iter()
+            .find(|m| m.kind == MessageKind::Branch)
+            .expect("a branch turn");
+        assert_eq!(branch.role, Role::Assistant);
+        assert_eq!(branch.text().as_deref(), Some("first try"));
+        assert_eq!(
+            branch
+                .harness_extra(Harness::LmStudio)
+                .and_then(|b| b.get("variant"))
+                .and_then(Value::as_u64),
+            Some(0)
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -966,7 +1064,11 @@ mod tests {
             "thinking block round-trips via style.type==thinking"
         );
         assert_eq!(a.text().as_deref(), Some("Hi! How can I help?"));
-        assert_eq!(a.model.as_deref(), Some("openai/gpt-oss-120b"));
+        assert!(
+            a.model.is_none(),
+            "model rides on the session, not repeated on the turn"
+        );
+        assert_eq!(parsed.model.as_deref(), Some("openai/gpt-oss-120b"));
         let usage = a.usage.as_ref().expect("usage round-trips");
         assert_eq!(usage.input_tokens, Some(12));
         assert_eq!(usage.output_tokens, Some(34));
@@ -1012,8 +1114,9 @@ mod tests {
             }
             other => panic!("expected Text, got {other:?}"),
         }
-        // Model + usage still parsed from genInfo.
-        assert_eq!(a.model.as_deref(), Some("openai/gpt-oss-120b"));
+        // Model + usage still parsed from genInfo (model on the session, not repeated per message).
+        assert!(a.model.is_none());
+        assert_eq!(s.model.as_deref(), Some("openai/gpt-oss-120b"));
         assert_eq!(a.usage.as_ref().unwrap().output_tokens, Some(68));
     }
 
@@ -1059,8 +1162,8 @@ mod tests {
 
         assert_eq!(sink.seen, vec!["one".to_string()]);
         assert!(s.messages.is_empty(), "stream returns empty messages");
-        // Session-level extras survive without being subject to early-stop.
-        assert_eq!(s.extra.get("systemPrompt").and_then(Value::as_str), Some("be terse"));
+        // The system prompt is a first-class session field, captured before the early stop.
+        assert_eq!(s.system_prompt.as_deref(), Some("be terse"));
 
         let _ = fs::remove_dir_all(&dir);
     }

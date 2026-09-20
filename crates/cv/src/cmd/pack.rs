@@ -40,14 +40,20 @@ const MAX_FILES_PER_SOURCE: usize = 8;
 /// Rows of the cross-source file rollup.
 const MAX_ROLLUP: usize = 12;
 
-pub(crate) fn cmd_pack(task: &str, format: &str, to: Option<String>, limit: usize, out: Option<PathBuf>) -> Result<()> {
+pub(crate) fn cmd_pack(
+    task: &str,
+    format: &str,
+    harness: Option<String>,
+    limit: usize,
+    out: Option<PathBuf>,
+) -> Result<()> {
     if !matches!(format, "md" | "prompt" | "session") {
         bail!("unknown format {format:?} (use md, prompt, or session)");
     }
-    let to_h = match (format, &to) {
+    let to_h = match (format, &harness) {
         ("session", Some(s)) => Some(Harness::parse(s).with_context(|| format!("unknown target harness: {s}"))?),
-        ("session", None) => bail!("--format session needs --to <harness> (e.g. --to claude)"),
-        (_, Some(_)) => bail!("--to only applies to --format session"),
+        ("session", None) => bail!("--format session needs --harness <harness> (e.g. --harness claude)"),
+        (_, Some(_)) => bail!("--harness only applies to --format session"),
         _ => None,
     };
     let limit = limit.max(1);
@@ -864,7 +870,7 @@ fn emit_pack_session(
         system_prompt: None,
         lineage: cv_core::ir::Lineage::default(),
     };
-    crate::cmd::convert::emit_session(&session, to_h, out, EmitOptions::default())
+    crate::cmd::port::emit_session(&session, to_h, out, EmitOptions::default())
 }
 
 /// Write a text bundle to `--out` (with a stderr note) or stdout.

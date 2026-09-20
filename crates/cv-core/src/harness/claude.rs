@@ -6,6 +6,7 @@
 
 use super::{parse_ts, Adapter};
 use crate::ir::*;
+use crate::ir::{Lineage, MessageKind, Origin};
 use crate::lazy::{Span, Text, INLINE_MAX};
 use crate::stream::{CollectSink, Flow, MessageSink, ParseOptions};
 use anyhow::{Context, Result};
@@ -227,9 +228,10 @@ fn ingest_bytes(
     ingest_value(session, &v, opts, sink, ctx.as_ref())
 }
 
-/// An empty Claude [`Session`] shell, ready to accumulate records.
+/// An empty Claude [`Session`] shell, ready to accumulate records. A sub-agent transcript (by its
+/// path) starts with its lineage already filled in — see [`apply_subagent_lineage`].
 fn new_session(id: &str, source_path: Option<PathBuf>) -> Session {
-    Session {
+    let mut s = Session {
         id: id.to_string(),
         harness: Harness::Claude,
         cwd: None,
@@ -242,7 +244,53 @@ fn new_session(id: &str, source_path: Option<PathBuf>) -> Session {
         source_path,
         extra: serde_json::Map::new(),
         system_prompt: None,
-        lineage: crate::ir::Lineage::default(),
+        lineage: Lineage::default(),
+    };
+    if let Some(p) = s.source_path.clone() {
+        apply_subagent_lineage(&mut s, &p);
+    }
+    s
+}
+
+/// A sub-agent transcript lives at `<parent-stem>/subagents/[workflows/<run>/]agent-<id>.jsonl`:
+/// the path alone names the parent session, and the `agent-<id>.meta.json` sidecar names the
+/// `Agent`/`Task` tool call in the parent that spawned it (plus the agent type and description).
+/// Both become first-class [`Lineage`]; the Claude-only facts (agent type, description, workflow
+/// run) go to `extra["claude"]`. A top-level session path leaves everything untouched.
+fn apply_subagent_lineage(s: &mut Session, path: &std::path::Path) {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return;
+    };
+    if !name.starts_with("agent-") || !name.ends_with(".jsonl") {
+        return;
+    }
+    let Some(dir) = path.parent() else {
+        return;
+    };
+    let dir_name = |p: &std::path::Path| p.file_name().and_then(|n| n.to_str()).map(str::to_string);
+    // Peel an optional `workflows/<run>/` tier, then require `subagents/` under the parent's dir.
+    let (subagents, workflow_run) = match dir.parent().and_then(&dir_name).as_deref() {
+        Some("workflows") => (dir.parent().and_then(|p| p.parent()), dir_name(dir)),
+        _ => (Some(dir), None),
+    };
+    let Some(subagents) = subagents.filter(|d| dir_name(d).as_deref() == Some("subagents")) else {
+        return;
+    };
+    let Some(parent_stem) = subagents.parent().and_then(dir_name) else {
+        return;
+    };
+    s.lineage.parent = Some(parent_stem);
+    let (agent_type, description, tool_use_id) = read_meta(&path.with_extension("meta.json"));
+    s.lineage.spawned_by_tool_use = tool_use_id;
+    let bag = s.harness_extra_mut(Harness::Claude);
+    if let Some(t) = agent_type {
+        bag.insert("agent_type".into(), Value::String(t));
+    }
+    if let Some(d) = description {
+        bag.insert("agent_description".into(), Value::String(d));
+    }
+    if let Some(run) = workflow_run {
+        bag.insert("workflow_run".into(), Value::String(run));
     }
 }
 
@@ -265,7 +313,10 @@ fn ingest_value(
         // records around 2.1.25x; `ai-title` is rewritten on every prompt).
         "ai-title" => {
             if let Some(t) = v.get("aiTitle").and_then(Value::as_str) {
-                if !session.extra.contains_key("customTitle") {
+                let renamed = session
+                    .harness_extra(Harness::Claude)
+                    .is_some_and(|b| b.contains_key("custom_title"));
+                if !renamed {
                     session.title = Some(t.to_string());
                 }
             }
@@ -274,7 +325,9 @@ fn ingest_value(
         "custom-title" => {
             if let Some(t) = v.get("customTitle").and_then(Value::as_str) {
                 session.title = Some(t.to_string());
-                session.extra.insert("customTitle".into(), Value::String(t.to_string()));
+                session
+                    .harness_extra_mut(Harness::Claude)
+                    .insert("custom_title".into(), Value::String(t.to_string()));
             }
             return carry_or_skip(v, opts, sink);
         }
@@ -286,24 +339,32 @@ fn ingest_value(
             }
             return carry_or_skip(v, opts, sink);
         }
-        // Session-level facts with a first-class home in `Session::extra` (camelCase, as recorded):
-        // the derived agent name, a `/tag`, a fork's relocated cwd, the linked PR(s), and the
-        // pointer Claude Code leaves when a conversation moved on to another session id.
+        // Session-level facts. The continuation pointer is first-class lineage; the derived agent
+        // name, a `/tag`, a fork's relocated cwd and the linked PR(s) are Claude facts in
+        // `extra["claude"]` (snake_case: these names are cv's).
         "agent-name" | "tag" | "relocated" | "continued-in" | "pr-link" => {
             match ty {
-                "agent-name" => copy_str_field(v, "agentName", &mut session.extra),
-                "tag" => copy_str_field(v, "tag", &mut session.extra),
-                "relocated" => copy_str_field(v, "relocatedCwd", &mut session.extra),
-                "continued-in" => copy_str_field(v, "continuedInSessionId", &mut session.extra),
+                "continued-in" => {
+                    if let Some(id) = v.get("continuedInSessionId").and_then(Value::as_str) {
+                        session.lineage.continued_in = Some(id.to_string());
+                    }
+                }
                 _ => {
-                    if let Some(url) = v.get("prUrl").and_then(Value::as_str) {
-                        if let Some(list) = session
-                            .extra
-                            .entry("prLinks")
-                            .or_insert_with(|| Value::Array(Vec::new()))
-                            .as_array_mut()
-                        {
-                            list.push(Value::String(url.to_string()));
+                    let bag = session.harness_extra_mut(Harness::Claude);
+                    match ty {
+                        "agent-name" => copy_str_field(v, "agentName", "agent_name", bag),
+                        "tag" => copy_str_field(v, "tag", "tag", bag),
+                        "relocated" => copy_str_field(v, "relocatedCwd", "relocated_cwd", bag),
+                        _ => {
+                            if let Some(url) = v.get("prUrl").and_then(Value::as_str) {
+                                if let Some(list) = bag
+                                    .entry("pr_links")
+                                    .or_insert_with(|| Value::Array(Vec::new()))
+                                    .as_array_mut()
+                                {
+                                    list.push(Value::String(url.to_string()));
+                                }
+                            }
                         }
                     }
                 }
@@ -317,6 +378,15 @@ fn ingest_value(
         // `<system-reminder>` text in user content). Surface those as System turns; an attachment
         // with nothing rendered (a hook that printed nothing) is bookkeeping only.
         "attachment" => {
+            // `prompt_snapshot` records the whole system prompt Claude Code sent (an array of
+            // sections) — the session-level fact, never a message. The latest snapshot wins: a
+            // resume re-snapshots, and that is the prompt the rest of the transcript ran under.
+            if let Some(sections) = v.pointer("/attachment/systemPrompt").and_then(Value::as_array) {
+                let joined = sections.iter().filter_map(Value::as_str).collect::<Vec<_>>().join("\n");
+                if !joined.trim().is_empty() {
+                    session.system_prompt = Some(joined);
+                }
+            }
             return match parse_attachment_message(v, opts, span) {
                 Some(m) => sink.message(m),
                 None => carry_or_skip(v, opts, sink),
@@ -384,6 +454,13 @@ fn ingest_value(
         if session.model.is_none() && msg.model.as_deref() != Some(SYNTHETIC_MODEL) {
             session.model = msg.model.clone();
         }
+        // An assistant turn KEEPS the model it names, even when it matches the session default.
+        // REARCH's "IR diet" would null the duplicate, but claude transcripts are seekable: a
+        // record's parse must not depend on how much of the file preceded it, or a replay from a
+        // mid-file offset (`crate::offsets::stream_range`, behind `cv show --range`) stops being
+        // byte-identical to the full stream's suffix. The model is also the only thing that tells
+        // a windowed read, and `task`'s reviewer scan, which model was in play, since this adapter
+        // emits no `meta()`. Redundant strings are the cheaper price.
         return sink.message(msg);
     }
     Flow::Continue
@@ -395,16 +472,30 @@ fn ingest_value(
 /// existing consumers are unaffected — with the full original record stashed under `extra["_record"]`
 /// for the emitter to replay byte-for-byte.
 fn carrier_record(v: &Value) -> Message {
-    let mut m = Message::new(Role::System);
+    let mut m = Message::of_kind(Role::System, MessageKind::Carrier, Origin::Harness);
     m.id = v.get("uuid").and_then(Value::as_str).map(String::from);
     m.parent_id = v.get("parentUuid").and_then(Value::as_str).map(String::from);
     m.timestamp = v.get("timestamp").and_then(Value::as_str).and_then(parse_ts);
+    if let Some(t) = v.get("type").and_then(Value::as_str) {
+        m.harness_extra_mut(Harness::Claude)
+            .insert("record_type".into(), Value::String(t.to_string()));
+    }
     m.extra.insert(CARRIER_KEY.into(), v.clone());
     m
 }
 
 /// `extra` key under which a [`carrier_record`] stashes the verbatim original meta record.
 pub const CARRIER_KEY: &str = "_record";
+
+/// The record field holding a tool result's structured sidecar — and the key the sidecar is parked
+/// under inside [`Block::ToolResult::details`] when it is a bare scalar (see
+/// [`attach_tool_use_result`]). `emit_claude` writes the field back from those `details`.
+pub const TOOL_USE_RESULT_KEY: &str = "toolUseResult";
+
+/// `details` key holding cv's *derived* pointer to a spilled tool output (`persistedOutput.path` /
+/// `.size`). Shared across adapters (Kimi Code sets it too) and re-derived from the transcript stub
+/// on every parse, so it is never replayed into an emitted Claude record.
+pub const PERSISTED_OUTPUT_KEY: &str = "persistedOutput";
 
 /// `message.model` of Claude Code's own client-side assistant notices (API errors such as
 /// "Prompt is too long", "No response requested.", …): never model output, never sent to the API.
@@ -420,10 +511,26 @@ fn carry_or_skip(v: &Value, opts: &ParseOptions, sink: &mut dyn MessageSink) -> 
     }
 }
 
-/// Copy string field `key` of `v` into `extra` under the same (camelCase) key, if present.
-fn copy_str_field(v: &Value, key: &str, extra: &mut Map<String, Value>) {
-    if let Some(s) = v.get(key).and_then(Value::as_str) {
-        extra.insert(key.to_string(), Value::String(s.to_string()));
+/// Copy string field `from` of `v` into `bag` under cv's snake_case name `to`, if present.
+fn copy_str_field(v: &Value, from: &str, to: &str, bag: &mut Map<String, Value>) {
+    if let Some(s) = v.get(from).and_then(Value::as_str) {
+        bag.insert(to.to_string(), Value::String(s.to_string()));
+    }
+}
+
+/// Where a `user` record came from: a typed prompt is human; `isMeta` rows ("Continue from where
+/// you left off.", the local-command caveat) and non-human `origin.kind`s are the harness; a
+/// scheduled/loop wakeup (`scheduledTaskId`) is the scheduler.
+fn user_origin(v: &Value) -> Origin {
+    if v.get("scheduledTaskId").is_some() || v.get("scheduledFireId").is_some() {
+        return Origin::Scheduler;
+    }
+    if v.get("isMeta").and_then(Value::as_bool) == Some(true) {
+        return Origin::Harness;
+    }
+    match v.pointer("/origin/kind").and_then(Value::as_str) {
+        None | Some("human") => Origin::Human,
+        Some(_) => Origin::Harness,
     }
 }
 
@@ -438,8 +545,10 @@ fn is_synthetic_assistant(v: &Value, msg: &Value) -> bool {
 /// A model-visible `attachment` record (one with a non-empty `rendered[]`) as a [`Role::System`]
 /// message: one text block per rendered item, exactly the text appended to the prompt. `None` when
 /// nothing was rendered. Under `complete` the message is also a carrier of the verbatim record, so
-/// the emitter replays it byte-for-byte while lean consumers still see its text. The attachment
-/// kind always rides in `extra["attachmentType"]` (it is what the text *is*); the full `attachment`
+/// the emitter replays it byte-for-byte while lean consumers still see its text. `kind` is
+/// [`MessageKind::InjectedContext`]; `origin` is [`Origin::Hook`] for `hook_*` attachments (a
+/// user-configured hook's stdout) and [`Origin::Harness`] otherwise. The attachment kind always
+/// rides in `extra["claude"]["attachment_type"]` (it is what the text *is*); the full `attachment`
 /// object only under [`ParseOptions::extra`].
 fn parse_attachment_message(v: &Value, opts: &ParseOptions, span: Option<&SpanCtx>) -> Option<Message> {
     let rendered = v.get("rendered").and_then(Value::as_array).filter(|r| !r.is_empty())?;
@@ -469,22 +578,28 @@ fn parse_attachment_message(v: &Value, opts: &ParseOptions, span: Option<&SpanCt
     } else {
         Message::new(Role::System)
     };
+    m.kind = MessageKind::InjectedContext;
+    m.origin = if att_type.starts_with("hook_") {
+        Origin::Hook
+    } else {
+        Origin::Harness
+    };
     m.id = v.get("uuid").and_then(Value::as_str).map(String::from);
     m.parent_id = v.get("parentUuid").and_then(Value::as_str).map(String::from);
     m.timestamp = v.get("timestamp").and_then(Value::as_str).and_then(parse_ts);
     m.content = blocks;
-    m.extra.insert("subtype".into(), Value::String("attachment".into()));
-    m.extra
-        .insert("attachmentType".into(), Value::String(att_type.to_string()));
-    if opts.extra {
-        m.extra.insert("attachment".into(), Value::Object(att.clone()));
+    let with_extra = opts.extra;
+    let bag = m.harness_extra_mut(Harness::Claude);
+    bag.insert("attachment_type".into(), Value::String(att_type.to_string()));
+    if with_extra {
+        bag.insert("attachment".into(), Value::Object(att.clone()));
         for key in ["renderedInHumanTurn", "agentId"] {
             if let Some(val) = v.get(key) {
-                m.extra.insert(key.to_string(), val.clone());
+                bag.insert(key.to_string(), val.clone());
             }
         }
         if v.get("isSidechain").and_then(Value::as_bool) == Some(true) {
-            m.extra.insert("isSidechain".into(), Value::Bool(true));
+            bag.insert("isSidechain".into(), Value::Bool(true));
         }
     }
     Some(m)
@@ -861,6 +976,18 @@ fn parse_message(ty: &str, v: &Value, opts: &ParseOptions, span: Option<&SpanCtx
         _ => {}
     }
 
+    // INTERFACE-V2 §4: `toolUseResult` — the structured sidecar Claude writes *next to* the
+    // `tool_result` block (structuredPatch, oldTodos/newTodos, stdout/stderr, file contents,
+    // persisted-output pointers) — is a SHARED concept, so it rides on the block as
+    // `Block::ToolResult::details`, not in the harness bag. Gated on `opts.extra` because the
+    // sidecar routinely dwarfs the visible transcript and the bulk text passes must not materialize
+    // it (that gate is the whole point of `ParseOptions::extra`).
+    if opts.extra {
+        if let Some(tur) = v.get("toolUseResult").filter(|t| !t.is_null()) {
+            attach_tool_use_result(&mut blocks, tur);
+        }
+    }
+
     // A `user` line carrying only tool results is really a Tool turn.
     let role =
         if role == Role::User && !blocks.is_empty() && blocks.iter().all(|b| matches!(b, Block::ToolResult { .. })) {
@@ -874,19 +1001,39 @@ fn parse_message(ty: &str, v: &Value, opts: &ParseOptions, span: Option<&SpanCtx
     // passes surface them as System notices so turn counts, `--keep-last` windows and renders stay
     // honest; `complete` keeps the record's own shape (`assistant` + its fields) for round-trip.
     let synthetic = ty == "assistant" && is_synthetic_assistant(v, msg);
+    let api_error = synthetic && v.get("isApiErrorMessage").and_then(Value::as_bool).unwrap_or(false);
     let (role, model) = if synthetic && !opts.complete {
         (Role::System, None)
     } else {
         (role, model)
     };
 
-    let mut extra = Map::new();
+    // What the turn IS and where it came from — set here even under `complete` (the record keeps its
+    // wire role for replay; `kind`/`origin` are IR facts consumers may always trust).
+    let compact_summary = v.get("isCompactSummary").and_then(Value::as_bool) == Some(true);
+    let (kind, origin) = if synthetic {
+        (
+            if api_error {
+                MessageKind::Error
+            } else {
+                MessageKind::Notice
+            },
+            Origin::Harness,
+        )
+    } else if compact_summary {
+        (MessageKind::CompactionSummary, Origin::Harness)
+    } else {
+        match role {
+            Role::Tool => (MessageKind::ToolResult, Origin::Harness),
+            Role::Assistant => (MessageKind::Reply, Origin::Model),
+            Role::User => (MessageKind::Prompt, user_origin(v)),
+            Role::System => (MessageKind::Notice, Origin::Harness),
+        }
+    };
+
+    // Everything Claude-specific lands in `extra["claude"]`; the top level stays clean.
+    let mut bag = Map::new();
     if synthetic && !opts.complete {
-        let api_error = v.get("isApiErrorMessage").and_then(Value::as_bool).unwrap_or(false);
-        extra.insert(
-            "subtype".into(),
-            Value::String(if api_error { "api_error" } else { "synthetic" }.into()),
-        );
         for key in [
             "isApiErrorMessage",
             "error",
@@ -895,30 +1042,34 @@ fn parse_message(ty: &str, v: &Value, opts: &ParseOptions, span: Option<&SpanCtx
             "requestId",
         ] {
             if let Some(val) = v.get(key).filter(|val| !val.is_null()) {
-                extra.insert(key.to_string(), val.clone());
+                bag.insert(key.to_string(), val.clone());
             }
         }
     }
     if opts.extra {
-        collect_extra(v, msg, &mut extra);
+        collect_extra(v, msg, &mut bag);
     }
     // Format-complete: capture EVERY remaining top-level + message-level field (beyond the
     // first-classed ones) so `parse → emit` reproduces the record with no dropped keys.
     if opts.complete {
-        collect_extra_complete(v, msg, &mut extra);
+        collect_extra_complete(v, msg, &mut bag);
+    }
+    let mut extra = Map::new();
+    if !bag.is_empty() {
+        extra.insert(Harness::Claude.as_str().into(), Value::Object(bag));
     }
 
     Some(Message {
         id,
         parent_id,
         role,
+        kind,
+        origin,
         timestamp,
         model,
         content: blocks,
         usage,
         extra,
-        kind: crate::ir::MessageKind::for_role(role),
-        origin: crate::ir::Origin::for_role(role),
     })
 }
 
@@ -991,10 +1142,21 @@ fn system_msg(v: &Value, text: Text, subtype: &str, opts: &ParseOptions) -> Opti
     let parent_id = v.get("parentUuid").and_then(Value::as_str).map(str::to_string);
     let timestamp = v.get("timestamp").and_then(Value::as_str).and_then(parse_ts);
 
-    let mut extra = Map::new();
+    // The subtype says what the notice IS: a compaction marker, an error the model never answered
+    // (an API error, a refusal that re-routed to another model), a Stop hook's output, a scheduled
+    // wakeup, or a plain harness notice (slash-command output, away summary, informational).
+    let (kind, origin) = match subtype {
+        "compact_boundary" => (MessageKind::CompactionBoundary, Origin::Harness),
+        "api_error" | "model_refusal_fallback" => (MessageKind::Error, Origin::Harness),
+        "stop_hook_summary" => (MessageKind::Notice, Origin::Hook),
+        "scheduled_task_fire" => (MessageKind::Notice, Origin::Scheduler),
+        _ => (MessageKind::Notice, Origin::Harness),
+    };
+
+    let mut bag = Map::new();
     if opts.extra {
         if !subtype.is_empty() {
-            extra.insert("subtype".into(), Value::String(subtype.to_string()));
+            bag.insert("subtype".into(), Value::String(subtype.to_string()));
         }
         for key in [
             "level",
@@ -1024,22 +1186,26 @@ fn system_msg(v: &Value, text: Text, subtype: &str, opts: &ParseOptions) -> Opti
             "direction",
         ] {
             if let Some(val) = v.get(key) {
-                extra.insert(key.to_string(), val.clone());
+                bag.insert(key.to_string(), val.clone());
             }
         }
+    }
+    let mut extra = Map::new();
+    if !bag.is_empty() {
+        extra.insert(Harness::Claude.as_str().into(), Value::Object(bag));
     }
 
     Some(Message {
         id,
         parent_id,
         role: Role::System,
+        kind,
+        origin,
         timestamp,
         model: None,
         content: vec![Block::Text { text }],
         usage: None,
         extra,
-        kind: crate::ir::MessageKind::for_role(Role::System),
-        origin: crate::ir::Origin::for_role(Role::System),
     })
 }
 
@@ -1124,15 +1290,16 @@ fn tag_inner<'a>(s: &'a str, tag: &str) -> Option<&'a str> {
     Some(&s[start..end])
 }
 
-/// Preserve Claude-specific record/sidecar fields that the IR has no first-class home for, so
-/// conversions and the viewer can still surface them. This is where the rich `toolUseResult`
-/// sidecar (diffs, todos, command stdout/stderr, structured patches) is kept verbatim.
+/// Preserve Claude-specific record fields that the IR has no first-class home for, into the
+/// message's `extra["claude"]` bag, so conversions and the viewer can still surface them. Keys keep
+/// Claude's own spelling; cv-invented names are snake_case.
+///
+/// The rich `toolUseResult` sidecar is deliberately NOT here: it is a shared concept and lives on
+/// the block ([`attach_tool_use_result`] → [`Block::ToolResult::details`]). Under
+/// [`ParseOptions::complete`] a verbatim copy still lands in the bag via [`collect_extra_complete`]
+/// — that copy exists only so byte-exact same-harness replay has a fallback if a block's details
+/// were rewritten or dropped between parse and emit.
 fn collect_extra(v: &Value, msg: &Value, extra: &mut Map<String, Value>) {
-    // The richest dropped field: the structured tool-result sidecar that sits *next to* the plain
-    // `tool_result` text block (structuredPatch, oldTodos/newTodos, stdout/stderr, file contents…).
-    if let Some(tur) = v.get("toolUseResult") {
-        extra.insert("toolUseResult".into(), tur.clone());
-    }
     // Threading / provenance fields beyond uuid/parentUuid.
     for key in [
         "logicalParentUuid",
@@ -1182,10 +1349,12 @@ const CLAUDE_FIRSTCLASS_MSG: &[&str] = &["content", "usage", "role", "model"];
 pub const MESSAGE_EXTRA_PREFIX: &str = "message.";
 
 /// Format-complete capture (only under [`ParseOptions::complete`]): mirror EVERY top-level and
-/// `message.*` field that the IR doesn't already first-class into `extra`, so a `parse → emit`
-/// round-trip reproduces the record's full key set + values. Runs *after* [`collect_extra`], so the
-/// already-captured fields (`toolUseResult`, `requestId`, `message.stop_reason`, …) are simply
-/// re-confirmed (same key, same value) rather than dropped. Large content lives in `content`/`usage`
+/// `message.*` field that the IR doesn't already first-class into the `extra["claude"]` bag, so a
+/// `parse → emit` round-trip reproduces the record's full key set + values. Runs *after* [`collect_extra`], so the
+/// already-captured fields (`requestId`, `message.stop_reason`, …) are simply re-confirmed (same
+/// key, same value) rather than dropped. This is also the *only* producer of the bag's
+/// [`TOOL_USE_RESULT_KEY`] copy — the block's `details` is the sidecar's real home, and this
+/// verbatim copy is the complete-mode replay fallback. Large content lives in `content`/`usage`
 /// and is first-classed, so nothing big is duplicated here.
 fn collect_extra_complete(v: &Value, msg: &Value, extra: &mut Map<String, Value>) {
     if let Some(obj) = v.as_object() {
@@ -1215,6 +1384,35 @@ fn coerced_ref<'a>(content: &'a Text, item: &'a Value) -> &'a str {
         .inline_str()
         .or_else(|| item.get("content").and_then(Value::as_str))
         .unwrap_or("")
+}
+
+/// Fold a record's `toolUseResult` sidecar into its `tool_result` block's
+/// [`Block::ToolResult::details`] — the IR's home for a tool result's structured extras
+/// (INTERFACE-V2 §4). Claude writes one sidecar per record and (in every transcript we have seen)
+/// one `tool_result` block per record, so it attaches to the first result block.
+///
+/// cv's own derived persisted-output pointer may already be sitting in `details`; it is *merged
+/// into* the sidecar object, and `emit_claude` strips it back out, so a same-harness replay
+/// reproduces `toolUseResult` exactly. A sidecar that is not an object (Claude writes a bare error
+/// string for some tools: 28% of the 89k sidecars in a census of real transcripts, 3 of which also
+/// had a spilled output) leaves no room for that pointer, so the two are parked side by side under
+/// [`TOOL_USE_RESULT_KEY`] and the emitter unwraps them.
+fn attach_tool_use_result(blocks: &mut [Block], tur: &Value) {
+    let Some(Block::ToolResult { details, .. }) = blocks.iter_mut().find(|b| matches!(b, Block::ToolResult { .. }))
+    else {
+        return;
+    };
+    *details = Some(match (tur.clone(), details.take()) {
+        (Value::Object(mut sidecar), Some(Value::Object(derived))) => {
+            sidecar.extend(derived);
+            Value::Object(sidecar)
+        }
+        (sidecar, Some(Value::Object(mut derived))) => {
+            derived.insert(TOOL_USE_RESULT_KEY.into(), sidecar);
+            Value::Object(derived)
+        }
+        (sidecar, _) => sidecar,
+    });
 }
 
 fn parse_block(item: &Value, span_field: Option<(&RawValue, &SpanCtx)>) -> Option<Block> {
@@ -1472,6 +1670,26 @@ impl Claude {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::LazyLock;
+
+    static NO_BAG: LazyLock<Map<String, Value>> = LazyLock::new(Map::new);
+
+    /// The message's `extra["claude"]` bag (empty when it recorded nothing).
+    fn cl(m: &Message) -> &Map<String, Value> {
+        m.harness_extra(Harness::Claude).unwrap_or(&NO_BAG)
+    }
+
+    /// The structured `details` of the message's first tool-result block — where the record's
+    /// `toolUseResult` sidecar lives (INTERFACE-V2 §4).
+    fn details(m: &Message) -> &Value {
+        m.content
+            .iter()
+            .find_map(|b| match b {
+                Block::ToolResult { details, .. } => details.as_ref(),
+                _ => None,
+            })
+            .expect("tool result details")
+    }
 
     #[test]
     fn complete_mode_carries_dropped_meta_records() {
@@ -1543,19 +1761,19 @@ mod tests {
         let att = &sink.messages[1];
         assert_eq!(att.role, Role::System);
         assert_eq!(
-            att.extra.get("attachmentType").and_then(Value::as_str),
+            cl(att).get("attachment_type").and_then(Value::as_str),
             Some("edited_text_file")
         );
         assert_eq!(att.id.as_deref(), Some("t2"));
         assert_eq!(att.parent_id.as_deref(), Some("t1"));
         assert!(att.text().unwrap().contains("/x.md was modified"));
-        assert!(!att.extra.contains_key("attachment"), "bulk keeps extra lean");
+        assert!(!cl(att).contains_key("attachment"), "bulk keeps extra lean");
 
         // full: the attachment object rides along
         let mut sink = CollectSink::default();
         stream_str("s1", &text, None, &ParseOptions::full(), &mut sink);
-        assert_eq!(sink.messages[1].extra["attachment"]["filename"], "/x.md");
-        assert_eq!(sink.messages[1].extra["renderedInHumanTurn"], true);
+        assert_eq!(cl(&sink.messages[1])["attachment"]["filename"], "/x.md");
+        assert_eq!(cl(&sink.messages[1])["renderedInHumanTurn"], true);
 
         // complete: both attachments carried verbatim; the rendered one still carries its text
         let mut sink = CollectSink::default();
@@ -1588,13 +1806,15 @@ mod tests {
         let session = stream_str("s1", &text, None, &ParseOptions::full(), &mut sink);
         let e1 = &sink.messages[1];
         assert_eq!(e1.role, Role::System);
-        assert_eq!(e1.extra.get("subtype").and_then(Value::as_str), Some("api_error"));
-        assert_eq!(e1.extra.get("error").and_then(Value::as_str), Some("invalid_request"));
+        assert_eq!(e1.kind, MessageKind::Error);
+        assert_eq!(e1.origin, Origin::Harness);
+        assert_eq!(cl(e1).get("error").and_then(Value::as_str), Some("invalid_request"));
         assert_eq!(e1.model, None);
         assert_eq!(e1.text().as_deref(), Some("Prompt is too long"));
         assert_eq!(
-            sink.messages[2].extra.get("subtype").and_then(Value::as_str),
-            Some("synthetic")
+            sink.messages[2].kind,
+            MessageKind::Notice,
+            "\"No response requested.\" is a notice"
         );
         assert_eq!(
             session.model.as_deref(),
@@ -1606,7 +1826,11 @@ mod tests {
         let mut sink = CollectSink::default();
         stream_str("s1", &text, None, &ParseOptions::complete(), &mut sink);
         assert_eq!(sink.messages[1].role, Role::Assistant);
-        assert!(!sink.messages[1].extra.contains_key("subtype"));
+        assert_eq!(
+            sink.messages[1].kind,
+            MessageKind::Error,
+            "the kind is an IR fact even when the wire role is kept"
+        );
         assert_eq!(sink.messages[1].model.as_deref(), Some("<synthetic>"));
 
         // scan(): message_count skips both notices
@@ -1639,9 +1863,19 @@ mod tests {
             Some("My rename"),
             "/rename beats a later ai-title"
         );
-        assert_eq!(session.extra["agentName"], "Debug docker");
-        assert_eq!(session.extra["continuedInSessionId"], "s2");
-        assert_eq!(session.extra["prLinks"][0], "https://github.com/o/r/pull/1");
+        let bag = session.harness_extra(Harness::Claude).expect("claude session bag");
+        assert_eq!(bag["agent_name"], "Debug docker");
+        assert_eq!(bag["pr_links"][0], "https://github.com/o/r/pull/1");
+        assert_eq!(
+            session.lineage.continued_in.as_deref(),
+            Some("s2"),
+            "a continuation is lineage, not a bag fact"
+        );
+        assert!(
+            session.extra.keys().all(|k| k == "claude"),
+            "session extra is nested by harness: {:?}",
+            session.extra.keys().collect::<Vec<_>>()
+        );
         assert_eq!(sink.messages.len(), 1, "bookkeeping records are not turns");
 
         let mut sink = CollectSink::default();
@@ -1699,6 +1933,170 @@ mod tests {
         assert!(details.is_none());
     }
 
+    /// Every record field the Claude adapter keeps that the IR does not first-class, with the
+    /// spelling Claude itself uses. Nesting them under `extra["claude"]` (IR v2) is what keeps the
+    /// top level of `extra` free for cv's own bookkeeping.
+    const FORMER_FLAT_KEYS: &[&str] = &[
+        "logicalParentUuid",
+        "isSidechain",
+        "isMeta",
+        "isCompactSummary",
+        "isApiErrorMessage",
+        "agentId",
+        "slug",
+        "version",
+        "requestId",
+        "parentToolUseID",
+        "toolUseID",
+        "sourceToolAssistantUUID",
+        "attributionAgent",
+        "attributionMcpServer",
+        "attributionMcpTool",
+        "attributionSkill",
+        "userType",
+        "message.id",
+        "message.stop_reason",
+        "message.stop_sequence",
+        "message.stop_details",
+    ];
+
+    /// Two records covering everything `collect_extra` captures: one carrying every non-first-class
+    /// field, one carrying a `toolUseResult` sidecar.
+    fn kitchen_sink_transcript() -> String {
+        let meta = serde_json::json!({
+            "type": "user", "sessionId": "s1", "uuid": "u1", "parentUuid": null,
+            "timestamp": "2026-09-19T00:00:00Z",
+            "logicalParentUuid": "u0", "isSidechain": true, "isMeta": true,
+            "isCompactSummary": true, "isApiErrorMessage": false,
+            "agentId": "a4a55af", "slug": "magical-wondering-rabbit", "version": "2.1.278",
+            "requestId": "req_123", "parentToolUseID": "toolu_parent", "toolUseID": "toolu_self",
+            "sourceToolAssistantUUID": "u-src", "attributionAgent": "general-purpose",
+            "attributionMcpServer": "scry", "attributionMcpTool": "sql",
+            "attributionSkill": "code-review", "userType": "internal",
+            "message": {"role": "user", "content": "hi", "id": "msg_abc", "stop_reason": "tool_use",
+                        "stop_sequence": "</done>", "stop_details": {"type": "max_tokens"}},
+        });
+        let result = serde_json::json!({
+            "type": "user", "sessionId": "s1", "uuid": "u2", "parentUuid": "u1",
+            "timestamp": "2026-09-19T00:00:01Z",
+            "toolUseResult": {"filePath": "/w/a.rs", "structuredPatch": [{"oldStart": 1}]},
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]},
+        });
+        format!("{meta}\n{result}\n")
+    }
+
+    #[test]
+    fn tool_use_result_is_block_details_and_every_other_fact_is_nested() {
+        let text = kitchen_sink_transcript();
+        let s = parse_str("s1", &text, None);
+
+        // 1. The sidecar is block-level `details` (INTERFACE-V2 §4), not a bag key.
+        let tool = s.messages.iter().find(|m| m.role == Role::Tool).expect("tool turn");
+        assert_eq!(details(tool)["filePath"], "/w/a.rs");
+        assert!(details(tool).get("structuredPatch").is_some());
+        assert!(
+            !cl(tool).contains_key(TOOL_USE_RESULT_KEY),
+            "not duplicated into the bag"
+        );
+
+        // 2. Every remaining Claude fact is in the bag, with Claude's own spelling.
+        let meta = &s.messages[0];
+        for k in FORMER_FLAT_KEYS {
+            assert!(cl(meta).contains_key(*k), "`{k}` must live in extra[\"claude\"]");
+        }
+        assert_eq!(cl(meta)["agentId"], "a4a55af");
+        assert_eq!(cl(meta)["message.stop_reason"], "tool_use");
+        assert_eq!(cl(meta)["message.stop_details"]["type"], "max_tokens");
+        assert_eq!(cl(meta)["userType"], "internal");
+
+        // 3. Nothing but the harness bag at the top level of `extra` — and under the strongest
+        //    options (complete + carriers + offset stamping) only cv's own two bookkeeping keys
+        //    join it.
+        for m in &s.messages {
+            assert!(
+                m.extra.keys().all(|k| k == "claude"),
+                "top-level extra must hold only the harness bag, got {:?}",
+                m.extra.keys().collect::<Vec<_>>()
+            );
+        }
+        let dir = std::env::temp_dir().join(format!("cv-claude-bag-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s1.jsonl");
+        // A bookkeeping record so the carrier key is exercised too.
+        std::fs::write(&path, format!("{{\"type\":\"mode\",\"sessionId\":\"s1\"}}\n{text}")).unwrap();
+        let opts = ParseOptions {
+            extra: true,
+            complete: true,
+            spans: true,
+            offsets: true,
+        };
+        let mut sink = CollectSink::default();
+        stream_reader(
+            "s1",
+            BufReader::new(fs::File::open(&path).unwrap()),
+            Some(path.clone()),
+            &opts,
+            &mut sink,
+        );
+        let allowed = ["claude", CARRIER_KEY, crate::offsets::OFFSET_KEY];
+        let mut saw_carrier = false;
+        let mut saw_offset = false;
+        for m in &sink.messages {
+            for k in m.extra.keys() {
+                assert!(allowed.contains(&k.as_str()), "unexpected top-level extra key `{k}`");
+                saw_carrier |= k == CARRIER_KEY;
+                saw_offset |= k == crate::offsets::OFFSET_KEY;
+            }
+        }
+        assert!(
+            saw_carrier && saw_offset,
+            "the two bookkeeping keys must actually be exercised"
+        );
+
+        // 4. Complete mode keeps a verbatim bag copy *as well* — the byte-exact replay fallback —
+        //    while `details` stays the sidecar's real home.
+        let tool = sink
+            .messages
+            .iter()
+            .find(|m| m.content.iter().any(|b| matches!(b, Block::ToolResult { .. })))
+            .expect("tool turn");
+        assert_eq!(cl(tool)[TOOL_USE_RESULT_KEY]["filePath"], "/w/a.rs");
+        assert_eq!(details(tool)["filePath"], "/w/a.rs");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn persisted_output_pointer_rides_alongside_the_sidecar() {
+        // cv's derived `persistedOutput` pointer and Claude's own sidecar must BOTH survive on the
+        // one `details` slot: merged when the sidecar is an object, parked side by side when it is
+        // a bare string (Claude writes those for tool errors).
+        let stub = "<persisted-output>\nOutput too large (66KB). Full output saved to: /tmp/s/tool-results/b.txt\n\nPreview (first 2KB):\nhi\n</persisted-output>";
+        let obj = serde_json::json!({"type":"user","sessionId":"s1","uuid":"u1","timestamp":"2026-09-19T00:00:00Z",
+            "toolUseResult":{"stdout":"hi","persistedOutputPath":"/tmp/s/tool-results/b.txt"},
+            "message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":stub}]}});
+        let scalar = serde_json::json!({"type":"user","sessionId":"s1","uuid":"u2","timestamp":"2026-09-19T00:00:01Z",
+            "toolUseResult":"Error: Exit code 64",
+            "message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t2","content":stub,"is_error":true}]}});
+        let s = parse_str("s1", &format!("{obj}\n{scalar}\n"), None);
+
+        let d = details(&s.messages[0]);
+        assert_eq!(d["stdout"], "hi", "the sidecar survives");
+        assert_eq!(d[PERSISTED_OUTPUT_KEY]["path"], "/tmp/s/tool-results/b.txt");
+        assert_eq!(d[PERSISTED_OUTPUT_KEY]["size"], "66KB");
+        assert_eq!(
+            s.messages[0].content[0].persisted_output_path(),
+            Some("/tmp/s/tool-results/b.txt")
+        );
+
+        let d = details(&s.messages[1]);
+        assert_eq!(
+            d[TOOL_USE_RESULT_KEY], "Error: Exit code 64",
+            "a scalar sidecar is parked, not dropped"
+        );
+        assert_eq!(d[PERSISTED_OUTPUT_KEY]["path"], "/tmp/s/tool-results/b.txt");
+    }
+
     #[test]
     fn discovery_excludes_prune_flat_sidecar() {
         let root = std::env::temp_dir().join(format!("cv-disc-{}", uuid::Uuid::new_v4()));
@@ -1754,16 +2152,21 @@ mod tests {
         assert!(matches!(kinds[2], Block::Text { .. }));
         assert!(matches!(kinds[3], Block::ToolUse { name, .. } if name == "Edit"));
         // assistant API metadata + requestId captured in extra.
-        assert_eq!(asst.extra.get("message.stop_reason").unwrap(), "tool_use");
-        assert_eq!(asst.extra.get("message.id").unwrap(), "msg_abc");
-        assert_eq!(asst.extra.get("requestId").unwrap(), "req_123");
+        assert_eq!(cl(asst).get("message.stop_reason").unwrap(), "tool_use");
+        assert_eq!(cl(asst).get("message.id").unwrap(), "msg_abc");
+        assert_eq!(cl(asst).get("requestId").unwrap(), "req_123");
 
-        // tool-result user line is reclassified as a Tool turn, and the rich sidecar is preserved.
+        // tool-result user line is reclassified as a Tool turn, and the rich sidecar is preserved
+        // — on the BLOCK, as shared `details`, not in the harness bag.
         let tool = &s.messages[2];
         assert_eq!(tool.role, Role::Tool);
-        let tur = tool.extra.get("toolUseResult").expect("sidecar kept");
+        let tur = details(tool);
         assert!(tur.get("structuredPatch").is_some());
         assert_eq!(tur.get("filePath").unwrap(), "/work/proj/a.rs");
+        assert!(
+            !cl(tool).contains_key(TOOL_USE_RESULT_KEY),
+            "the sidecar is block-level `details`; the bag keeps a copy only under `complete`"
+        );
 
         // image + document.
         let media = &s.messages[3];
@@ -1785,17 +2188,15 @@ mod tests {
         assert!(systems
             .iter()
             .any(|m| m.text().as_deref() == Some("Conversation compacted")
-                && m.extra.get("subtype").unwrap() == "compact_boundary"
-                && m.extra.get("compactMetadata").is_some()));
+                && m.kind == MessageKind::CompactionBoundary
+                && cl(m).get("compactMetadata").is_some()));
+        assert!(systems.iter().any(|m| cl(m).get("subtype").unwrap() == "away_summary"));
         assert!(systems
             .iter()
-            .any(|m| m.extra.get("subtype").unwrap() == "away_summary"));
-        assert!(systems
-            .iter()
-            .any(|m| m.extra.get("subtype").unwrap() == "api_error" && m.extra.get("level").unwrap() == "error"));
+            .any(|m| m.kind == MessageKind::Error && cl(m).get("level").unwrap() == "error"));
         // no bodyless subtypes leaked in.
         assert!(!systems.iter().any(|m| matches!(
-            m.extra.get("subtype").and_then(Value::as_str),
+            cl(m).get("subtype").and_then(Value::as_str),
             Some("turn_duration" | "agents_killed")
         )));
     }
@@ -1825,7 +2226,7 @@ mod tests {
 
         let hook = systems
             .iter()
-            .find(|m| m.extra.get("subtype").and_then(Value::as_str) == Some("stop_hook_summary"))
+            .find(|m| cl(m).get("subtype").and_then(Value::as_str) == Some("stop_hook_summary"))
             .unwrap();
         let body = hook.text().unwrap();
         assert!(body.starts_with("⛓ stop hook"), "hook body: {body:?}");
@@ -1835,17 +2236,17 @@ mod tests {
             "hook context surfaced: {body:?}"
         );
         // Hook metadata preserved in extra.
-        assert_eq!(hook.extra.get("hookCount").unwrap(), 1);
-        assert!(hook.extra.get("hookInfos").is_some());
-        assert_eq!(hook.extra.get("stopReason").unwrap(), "hook");
+        assert_eq!(cl(hook).get("hookCount").unwrap(), 1);
+        assert!(cl(hook).get("hookInfos").is_some());
+        assert_eq!(cl(hook).get("stopReason").unwrap(), "hook");
 
         // Refusal-fallback metadata preserved.
         let refusal = systems
             .iter()
-            .find(|m| m.extra.get("subtype").and_then(Value::as_str) == Some("model_refusal_fallback"))
+            .find(|m| cl(m).get("subtype").and_then(Value::as_str) == Some("model_refusal_fallback"))
             .unwrap();
-        assert_eq!(refusal.extra.get("originalModel").unwrap(), "claude-fable-5[1m]");
-        assert_eq!(refusal.extra.get("fallbackModel").unwrap(), "claude-opus-4-8");
+        assert_eq!(cl(refusal).get("originalModel").unwrap(), "claude-fable-5[1m]");
+        assert_eq!(cl(refusal).get("fallbackModel").unwrap(), "claude-opus-4-8");
     }
 
     #[test]
@@ -1855,23 +2256,22 @@ mod tests {
         assert_eq!(s.messages.len(), 2);
         let first = &s.messages[0];
         // isSidechain / isMeta / agentId / slug preserved for sub-agent reconstruction.
-        assert_eq!(first.extra.get("isSidechain").unwrap(), true);
-        assert_eq!(first.extra.get("isMeta").unwrap(), true);
-        assert_eq!(first.extra.get("agentId").unwrap(), "a4a55af");
-        assert_eq!(first.extra.get("slug").unwrap(), "magical-wondering-rabbit");
+        assert_eq!(cl(first).get("isSidechain").unwrap(), true);
+        assert_eq!(cl(first).get("isMeta").unwrap(), true);
+        assert_eq!(cl(first).get("agentId").unwrap(), "a4a55af");
+        assert_eq!(cl(first).get("slug").unwrap(), "magical-wondering-rabbit");
         // attribution metadata on the assistant turn.
-        assert_eq!(s.messages[1].extra.get("attributionAgent").unwrap(), "general-purpose");
+        assert_eq!(cl(&s.messages[1]).get("attributionAgent").unwrap(), "general-purpose");
     }
 
     #[test]
     fn compact_summary_variant() {
         let s = parse_str("s3", &fixture("compact_summary.jsonl"), None);
         let first = &s.messages[0];
-        assert_eq!(first.extra.get("isCompactSummary").unwrap(), true);
-        // todo sidecar preserved on the tool turn.
+        assert_eq!(cl(first).get("isCompactSummary").unwrap(), true);
+        // todo sidecar preserved on the tool turn, as block-level `details`.
         let tool = s.messages.iter().find(|m| m.role == Role::Tool).unwrap();
-        let tur = tool.extra.get("toolUseResult").unwrap();
-        assert!(tur.get("newTodos").is_some());
+        assert!(details(tool).get("newTodos").is_some());
     }
 
     #[test]
@@ -2190,7 +2590,7 @@ mod tests {
         let full = parse_str("s1", &text, None);
         let tool_full = full.messages.iter().find(|m| m.role == Role::Tool).unwrap();
         assert!(
-            tool_full.extra.get("toolUseResult").is_some(),
+            details(tool_full).get("structuredPatch").is_some(),
             "full parse must keep the sidecar"
         );
 
@@ -2199,6 +2599,12 @@ mod tests {
         bulk.messages = sink.messages;
         for m in &bulk.messages {
             assert!(m.extra.is_empty(), "bulk opts must leave every message's extra empty");
+            assert!(
+                m.content
+                    .iter()
+                    .all(|b| !matches!(b, Block::ToolResult { details: Some(_), .. })),
+                "bulk opts must not materialize the fat sidecar onto the block either"
+            );
         }
         assert_eq!(
             full.searchable_text(),

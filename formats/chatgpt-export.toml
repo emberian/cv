@@ -1,0 +1,33 @@
+# formats/chatgpt-export.toml — the vocabulary cv's `chatgpt-export` adapter is checked against (docs/INTERFACE-V2.md §7).
+# status: handled = per-item arm in the adapter; generic = interpreted by a blanket rule; carried = verbatim
+# under ParseOptions::complete only; ignored = known and deliberately skipped. Regenerate: tools/gen-manifests (or edit by hand).
+
+harness = "chatgpt-export"
+source_files = ["harness/export.rs"]
+# `human` is claude-export vocabulary; harness/export.rs serves both export harnesses.
+ignore_literals = ["conversations.json", "human"]
+store = [
+  "registered conversations.json (cv config --add-export)",
+]
+
+[upstream]
+repo = "ChatGPT data export"
+commit = "unknown"
+date = "2026-05-29"
+
+[types]
+"author.user" = { status = "handled", note = "" }
+"author.assistant" = { status = "handled", note = "" }
+"author.tool" = { status = "handled", note = "" }
+"author.system" = { status = "generic", note = "" }
+"content.text" = { status = "handled", note = "" }
+"content.thinking" = { status = "handled", note = "" }
+"content.tool_use" = { status = "handled", note = "" }
+"content.tool_result" = { status = "handled", note = "" }
+"content.multimodal_text" = { status = "generic", note = "image_asset_pointer → Image" }
+"content.code" = { status = "generic", note = "" }
+"content.execution_output" = { status = "generic", note = "" }
+"content.tether_browsing_display" = { status = "ignored", note = "" }
+"content.user_editable_context" = { status = "ignored", note = "custom instructions" }
+"recipient.all" = { status = "handled", note = "" }
+"recipient.tool" = { status = "generic", note = "recipient ≠ all ⇒ tool call" }

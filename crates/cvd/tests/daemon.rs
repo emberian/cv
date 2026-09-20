@@ -510,12 +510,48 @@ fn serve_messages_events_touched() {
     assert_eq!(v["has_more"], true, "{v}");
     assert_eq!(v["total_known"], false, "{v}");
     assert!(v["total"].is_null(), "{v}");
-    // Message 3 (the second of the window) is the Bash tool_use turn.
+    // Message 3 (the second of the window) is the Bash tool_use turn. A BLOCK is tagged `type`
+    // (the word every harness uses on the wire); the MESSAGE separately carries `kind`/`origin`
+    // naming what the turn is and where it came from (INTERFACE-V2 §4).
     let blocks = msgs[1]["content"].as_array().expect("content blocks");
     assert!(
-        blocks.iter().any(|b| b["kind"] == "tool_use" && b["name"] == "Bash"),
+        blocks.iter().any(|b| b["type"] == "tool_use" && b["name"] == "Bash"),
         "{v}"
     );
+    assert!(
+        blocks.iter().all(|b| b.get("kind").is_none()),
+        "a block is tagged `type`, never `kind`: {v}"
+    );
+    assert_eq!(msgs[1]["role"], "assistant", "{v}");
+    assert_eq!(msgs[1]["kind"], "reply", "{v}");
+    assert_eq!(msgs[1]["origin"], "model", "{v}");
+    // Its window-mate (msg 2) is the failed Edit's tool result fed back to the model.
+    assert_eq!(msgs[0]["role"], "tool", "{v}");
+    assert_eq!(msgs[0]["kind"], "tool_result", "{v}");
+    assert!(
+        msgs[0]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b["type"] == "tool_result" && b["is_error"] == true),
+        "{v}"
+    );
+
+    // The whole session, kind by kind: the human prompt, the model replies, the tool results.
+    let (status, all) = get_json(port, "/api/session/claude/gammasess/messages");
+    assert_eq!(status, 200, "{all}");
+    let kinds: Vec<&str> = all["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["kind"].as_str().expect("every message carries a kind"))
+        .collect();
+    assert_eq!(
+        kinds,
+        ["prompt", "reply", "tool_result", "reply", "tool_result", "reply"],
+        "{all}"
+    );
+    assert_eq!(all["messages"][0]["origin"], "human", "a typed prompt: {all}");
 
     // A tail window: the stream reaches EOF, so the total is exact and nothing more remains.
     let (status, v) = get_json(port, "/api/session/claude/gammasess/messages?start=4");
@@ -657,19 +693,32 @@ fn serve_compactions() {
     assert_eq!(status, 404);
 
     // `extra=1` on the windowed read keeps the boundary's subtype + compactMetadata in-band;
-    // without it the lean read omits them.
+    // without it the lean read omits them. Harness facts NEST under the harness name
+    // (`extra["claude"][…]`, INTERFACE-V2 §4) — never flat — while the shared concept the
+    // boundary IS has moved out of `extra` entirely and onto the message's `kind`.
     let (status, v) = get_json(port, "/api/session/claude/compactsess/messages?extra=1");
     assert_eq!(status, 200, "{v}");
     let m = &v["messages"].as_array().unwrap()[2];
-    assert_eq!(m["extra"]["subtype"], "compact_boundary", "{v}");
-    assert_eq!(m["extra"]["compactMetadata"]["trigger"], "manual", "{v}");
+    assert_eq!(m["kind"], "compaction_boundary", "{v}");
+    assert_eq!(m["extra"]["claude"]["subtype"], "compact_boundary", "{v}");
+    assert_eq!(m["extra"]["claude"]["compactMetadata"]["trigger"], "manual", "{v}");
+    assert_eq!(m["extra"]["claude"]["compactMetadata"]["preTokens"], 900000, "{v}");
+    assert!(
+        m["extra"].get("subtype").is_none() && m["extra"].get("compactMetadata").is_none(),
+        "harness facts must not sit flat at the top of extra: {v}"
+    );
+    // The summary that seeds the next window is its own kind, also independent of `extra`.
+    let summary = &v["messages"].as_array().unwrap()[3];
+    assert_eq!(summary["kind"], "compaction_summary", "{v}");
 
     let (status, v) = get_json(port, "/api/session/claude/compactsess/messages");
     assert_eq!(status, 200);
     let m = &v["messages"].as_array().unwrap()[2];
-    // Lean read: no `extra` populated (the map is absent or empty for the boundary).
+    // Lean read: no `extra` populated (the map is absent or empty for the boundary) — but `kind`
+    // is first-class, so the boundary is still identifiable without opting into the harness bag.
     let extra_empty = m["extra"].is_null() || m["extra"].as_object().map(|o| o.is_empty()).unwrap_or(true);
     assert!(extra_empty, "lean read should omit extra: {m}");
+    assert_eq!(m["kind"], "compaction_boundary", "{m}");
 }
 
 /// `serve --web <dir>` hosts the dashboard from `/` while keeping the JSON API at `/api/*`, with

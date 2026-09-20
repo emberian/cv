@@ -1,6 +1,69 @@
 # Changelog
 
-## Unreleased
+## 0.11.0 (unreleased) — the clean break
+
+This release renames, regroups and restructures on purpose, with **no aliases for old names**
+(an old command or flag errors with a pointer to the new one). The contract is
+`docs/INTERFACE-V2.md`. Principle: one name, one meaning, no grammar to memorize.
+
+### Breaking changes
+
+- **Commands.** `convert` is folded into `port` (`port <id> --harness <h> [--cwd <dir>] [--out <dir>]`);
+  `query` is `schema`; `recall` and `distill` are gone (`pack` is the one "build context from the
+  corpus" verb); `prune --retrieve` is `cat <session> <tool_use_id>`; `prune --range` is
+  `prune --keep A..B`. Every command is visible in `cv --help`, grouped Read / Reshape / Export /
+  Fleet & live / System; `cv recipes` is the agent quickstart.
+- **Windows.** `--first N`, `--last N`, `--range A..B` (0-based, end-exclusive; `A..`, `..B`),
+  `--around N [--context K]`, `--max-bytes N` — the same five on `show`, `export` and the MCP `show`.
+  The old `--range -N` (which meant the FIRST N) is gone.
+- **JSON is snake_case everywhere.** `ls --json`: `message_count`, `created_at`, `updated_at`,
+  `size_bytes`, `display_title`; `search`/`timeline`/`workflow --json` likewise; every session row
+  has the same keys. Blocks in `show --json` are tagged `type` (was `kind`); a message has a `kind`.
+- **The IR.** `Message` gains `kind` (prompt · reply · tool_result · injected_context · system_prompt
+  · notice · compaction_boundary · compaction_summary · model_change · error · subagent_spawn ·
+  subagent_return · branch · carrier) and `origin` (human · model · harness · hook · scheduler ·
+  subagent · import); `Session` gains `system_prompt` and `lineage` (forked_from, parent,
+  spawned_by_tool_use, continued_in, continues, agent_path); `Block::ToolUse` gains `namespace`;
+  `Usage` gains `reasoning_tokens` and `cost_usd`. Harness-specific facts live under
+  `extra["<harness>"]` (one bag per harness) — never as flat keys.
+- **MCP.** Tools are generated from the CLI (`cv schema --commands --json`): same names, flags and
+  output as the commands; `show` defaults to the last 50 messages / 200 KB over MCP.
+  `read_session`, `search_sessions`, `list_sessions`, `project_sessions`, `recall`,
+  `prune_session`, `prune_retrieve` are gone (`show`, `search`, `ls`, `ls --cwd`, `pack`, `prune`,
+  `cat`).
+- **Downstream consumers** of `cv ls --json` / `cv show --json` must switch to the snake_case keys
+  and the `type` block tag. Ours (`sesh`) is updated separately, after this release.
+
+### New
+
+- **`cv cat <session> <tool_use_id>`** prints one tool call's full output wherever it lives:
+  inline in the transcript, in a `prune` sidecar, or in a persisted-output file. `--input` prints
+  the call's arguments instead. This replaces `prune --retrieve`, which could only reach sidecars.
+- **`cv recipes`** is the agent quickstart: the ten things an agent does with cv, each as one
+  command line plus the JSON keys it returns. `cv --help` points at it.
+- **`cv schema --commands --json`** dumps the whole command tree, every command and flag with its
+  help text. The MCP server builds its tool list from it, so the two cannot drift.
+- **`cv formats census` and `cv formats check`** audit cv against the harnesses. `census` parses
+  recent real sessions in format-complete mode and reports the record vocabulary each adapter did
+  NOT interpret, so a harness changing its format shows up on real data the day it lands. `check`
+  compares every adapter's match arms against a pinned manifest in `formats/<harness>.toml`, which
+  names the upstream commit it was verified against. `tools/harness-drift.sh` re-checks the
+  manifests against the upstream checkouts.
+- **`cv port --strict`** fails the port when the fidelity check finds a loss the target format
+  could have carried. Losses the format inherently cannot hold are still only reported.
+
+### Fidelity: conversions now carry what they always should have
+
+The round-trip verifier used to compare six counts, so it reported "clean" on paths that were
+dropping most of the session. A per-field diff of every conversion path found that nearly all of
+them silently lost every usage record, every per-message model, signature-bearing thinking, the
+tool name on every result, and every structured result payload; `claude → hermes` also lost the
+working directory and `claude → codex` the title. All of that is now carried where the target
+format can hold it, and the verifier diffs every field it could have carried, classifying each
+loss as expected for that format or unexpected. The OpenCode emitter writes OpenCode's SQLite
+store, which is what OpenCode 1.18 actually reads; it had been writing the superseded JSON tree.
+
+### Also in this release
 
 - **`cv workflow <session> <run> --revive` salvages a dead run.** A `Workflow` run that dies
   mid-flight (session limit, kill, crash) loses every in-progress lane at once, and the

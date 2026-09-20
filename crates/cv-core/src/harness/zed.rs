@@ -46,10 +46,11 @@
 //! ## Fidelity caveats
 //! * Multi-root workspaces: we take the first worktree as `cwd` (extra worktrees are only in the
 //!   project snapshot, which we don't replicate into the IR).
-//! * Legacy `context` (the rendered attached-files preamble) is preserved in `Message.extra`;
+//! * Legacy `context` (the rendered attached-files preamble) is preserved in `extra["zed"]`;
 //!   modern `Mention` content (an attached file's body) is reduced to its URI as a [`Block::File`].
 //! * `request_token_usage` (per-request usage) has no per-message home — only the thread-level
-//!   `cumulative_token_usage` is kept (in `Session.extra`).
+//!   `cumulative_token_usage` is kept (in `extra["zed"]`). A subagent's `parent_thread_id` is
+//!   first-class [`Lineage::parent`]; the `Compaction` summary becomes a `CompactionSummary` turn.
 
 use super::Adapter;
 use crate::ir::*;
@@ -250,12 +251,15 @@ fn stream_thread(conn: &Connection, r: &SessionRef, sink: &mut dyn MessageSink) 
 
     let thread = decode_blob(data_type.as_deref(), &data);
 
-    let mut extra = serde_json::Map::new();
+    let mut zed = serde_json::Map::new();
     let mut model = None;
     let mut git = None;
     let mut blob_title = None;
     let mut blob_updated = None;
     let mut cwd = None;
+    // The parent thread of a subagent: from the 0.3.0 blob's `subagent_context`, overridden by the
+    // `parent_id` column when both name one. First-class [`Lineage`], not an extra key.
+    let mut parent_thread_id: Option<String> = None;
     if let Some(t) = &thread {
         // `title` (0.3.0) / `summary` (legacy) — same meaning, renamed across generations.
         blob_title = t
@@ -268,18 +272,17 @@ fn stream_thread(conn: &Connection, r: &SessionRef, sink: &mut dyn MessageSink) 
         cwd = snapshot_cwd(t);
         git = snapshot_git(t);
         model = t.get("model").and_then(model_string);
-        thread_extras(t, &mut extra);
+        thread_extras(t, &mut zed, &mut parent_thread_id);
     } else if !data.is_empty() {
         // The row exists but its blob wouldn't decode — surface that instead of erroring, so one
         // corrupt thread never breaks listings or bulk exports.
-        extra.insert("undecodable_blob".into(), Value::Bool(true));
+        zed.insert("undecodable_blob".into(), Value::Bool(true));
     }
     if let Some(p) = parent.filter(|p| !p.is_empty()) {
-        // Subagent linkage (also present inside the 0.3.0 blob; the column wins when both exist).
-        extra.insert("parent_thread_id".into(), Value::String(p));
+        parent_thread_id = Some(p);
     }
 
-    let s = Session {
+    let mut s = Session {
         id: r.id.clone(),
         harness: Harness::Zed,
         cwd: cwd
@@ -296,10 +299,19 @@ fn stream_thread(conn: &Connection, r: &SessionRef, sink: &mut dyn MessageSink) 
         git,
         messages: Vec::new(),
         source_path: Some(r.path.clone()),
-        extra,
+        extra: serde_json::Map::new(),
         system_prompt: None,
-        lineage: crate::ir::Lineage::default(),
+        lineage: Lineage {
+            parent: parent_thread_id,
+            ..Lineage::default()
+        },
     };
+    if !zed.is_empty() {
+        let bag = s.harness_extra_mut(Harness::Zed);
+        for (k, v) in zed {
+            bag.insert(k, v);
+        }
+    }
     // All session metadata is known up front; hand it to the sink before the body.
     sink.meta(&s);
 
@@ -392,9 +404,11 @@ fn first_folder_path(folders: Option<&str>, order: Option<&str>) -> Option<PathB
     (!first.is_empty()).then(|| PathBuf::from(first))
 }
 
-/// Session-level extras shared by both generations: profile, completion mode, detailed summary,
-/// cumulative token usage, subagent context, imported flag, and the raw format version.
-fn thread_extras(t: &Value, extra: &mut serde_json::Map<String, Value>) {
+/// Session-level facts shared by both generations, written into `extra["zed"]`: profile,
+/// completion mode, detailed summary, cumulative token usage, subagent depth, imported flag, and
+/// the raw format version. A subagent's `parent_thread_id` is first-class lineage, so it is
+/// returned via `parent` rather than stashed in the bag.
+fn thread_extras(t: &Value, extra: &mut serde_json::Map<String, Value>, parent: &mut Option<String>) {
     if let Some(v) = t.get("version").and_then(Value::as_str) {
         extra.insert("thread_version".into(), Value::String(v.to_string()));
     }
@@ -419,8 +433,12 @@ fn thread_extras(t: &Value, extra: &mut serde_json::Map<String, Value>) {
     }
     // 0.3.0 subagent threads: {parent_thread_id, depth}.
     if let Some(sub) = t.get("subagent_context").filter(|v| !v.is_null()) {
-        if let Some(p) = sub.get("parent_thread_id").and_then(Value::as_str) {
-            extra.insert("parent_thread_id".into(), Value::String(p.to_string()));
+        if let Some(p) = sub
+            .get("parent_thread_id")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            *parent = Some(p.to_string());
         }
         if let Some(d) = sub.get("depth").and_then(Value::as_u64) {
             extra.insert("subagent_depth".into(), Value::Number(d.into()));
@@ -468,6 +486,10 @@ fn legacy_message(m: &Value, tool_names: &mut HashMap<String, String>, f: &mut d
         _ => Role::User,
     };
     let mut msg = Message::new(role);
+    // A legacy `system` role carries the system prompt (rare; Zed's is normally app-level).
+    if role == Role::System {
+        msg.kind = MessageKind::SystemPrompt;
+    }
     msg.id = m.get("id").and_then(Value::as_i64).map(|i| i.to_string());
 
     // segments[] (0.1.0+) or a plain `text` field (the oldest, versionless shape).
@@ -508,14 +530,24 @@ fn legacy_message(m: &Value, tool_names: &mut HashMap<String, String>, f: &mut d
                 text: ctx.to_string().into(),
             });
         } else {
-            msg.extra.insert("context".into(), Value::String(ctx.to_string()));
+            // Embedded attached-files preamble on an otherwise-real turn: the turn stays a Prompt;
+            // the preamble is noted in `extra["zed"]`.
+            msg.harness_extra_mut(Harness::Zed)
+                .insert("context".into(), Value::String(ctx.to_string()));
         }
     }
     if m.get("is_hidden").and_then(Value::as_bool) == Some(true) {
-        msg.extra.insert("is_hidden".into(), Value::Bool(true));
+        msg.harness_extra_mut(Harness::Zed)
+            .insert("is_hidden".into(), Value::Bool(true));
+        // Hidden user turns are Zed's auto-injected "Continue where you left off" continuations.
+        if role == Role::User {
+            msg.kind = MessageKind::InjectedContext;
+            msg.origin = Origin::Harness;
+        }
     }
     if let Some(creases) = m.get("creases").and_then(Value::as_array).filter(|c| !c.is_empty()) {
-        msg.extra.insert("creases".into(), Value::Array(creases.clone()));
+        msg.harness_extra_mut(Harness::Zed)
+            .insert("creases".into(), Value::Array(creases.clone()));
     }
 
     if !msg.content.is_empty() && f(msg) == Flow::Stop {
@@ -634,7 +666,8 @@ fn modern_message(m: &Value, f: &mut dyn FnMut(Message) -> Flow) -> Flow {
             }
         }
         if let Some(rd) = agent.get("reasoning_details").filter(|v| !v.is_null()) {
-            msg.extra.insert("reasoning_details".into(), rd.clone());
+            msg.harness_extra_mut(Harness::Zed)
+                .insert("reasoning_details".into(), rd.clone());
         }
         // tool_results is an id-keyed map ({"<tool_use_id>": {…}}), ordered by insertion.
         let blocks: Vec<Block> = agent
@@ -661,11 +694,10 @@ fn modern_message(m: &Value, f: &mut dyn FnMut(Message) -> Flow) -> Flow {
             .and_then(Value::as_str)
             .filter(|s| !s.trim().is_empty())
         {
-            let mut msg = Message::new(Role::System);
+            let mut msg = Message::of_kind(Role::System, MessageKind::CompactionSummary, Origin::Harness);
             msg.content.push(Block::Text {
                 text: text.to_string().into(),
             });
-            msg.extra.insert("compaction".into(), Value::Bool(true));
             return f(msg);
         }
     }
@@ -960,6 +992,8 @@ mod tests {
         let c = mk(SCHEMA);
         insert(&c, "t1", "Fix the flaky test", "zstd", &zstd_blob(&legacy_thread()));
         let s = parse_thread(&c, &sref("t1")).unwrap();
+        // Every Zed thread fact is nested under `extra["zed"]` (`docs/INTERFACE-V2.md` §4).
+        crate::harness::assert_no_flat_keys(&s);
 
         assert_eq!(s.title.as_deref(), Some("Fix the flaky test"));
         assert_eq!(s.cwd.as_deref(), Some(Path::new("/Users/u/proj")));
@@ -970,22 +1004,49 @@ mod tests {
         assert_eq!(git.remote.as_deref(), Some("git@github.com:u/proj"));
         // Blob updated_at preferred; created_at from the column.
         assert!(s.created_at.is_some() && s.updated_at.is_some());
-        assert_eq!(s.extra.get("profile").and_then(Value::as_str), Some("write"));
-        assert_eq!(s.extra.get("completion_mode").and_then(Value::as_str), Some("burn"));
-        assert_eq!(s.extra.get("thread_version").and_then(Value::as_str), Some("0.2.0"));
+        let bag = s.harness_extra(Harness::Zed).expect("zed bag");
+        assert_eq!(bag.get("profile").and_then(Value::as_str), Some("write"));
+        assert_eq!(bag.get("completion_mode").and_then(Value::as_str), Some("burn"));
+        assert_eq!(bag.get("thread_version").and_then(Value::as_str), Some("0.2.0"));
         assert_eq!(
-            s.extra.get("detailed_summary").and_then(Value::as_str),
+            bag.get("detailed_summary").and_then(Value::as_str),
             Some("We fixed a race.")
         );
-        assert!(s.extra.contains_key("cumulative_token_usage"));
+        assert!(bag.contains_key("cumulative_token_usage"));
+        // Nested only: no flat facts leaked to the top level.
+        for k in s.extra.keys() {
+            assert!(
+                k == "zed" || k == "_record",
+                "unexpected top-level session extra key {k}"
+            );
+        }
 
         // user, assistant(+tool call), Tool, assistant.
         assert_eq!(s.messages.len(), 4);
         assert_eq!(s.messages[0].role, Role::User);
+        assert_eq!(
+            (s.messages[0].kind, s.messages[0].origin),
+            (MessageKind::Prompt, Origin::Human)
+        );
         assert_eq!(s.messages[0].text().as_deref(), Some("why is test_foo flaky?"));
         assert_eq!(
-            s.messages[0].extra.get("context").and_then(Value::as_str),
+            s.messages[0]
+                .harness_extra(Harness::Zed)
+                .and_then(|b| b.get("context"))
+                .and_then(Value::as_str),
             Some("<context>attached file foo.rs</context>")
+        );
+        assert!(
+            !s.messages[0].extra.contains_key("context"),
+            "context nests under the zed bag"
+        );
+        assert_eq!(
+            (s.messages[1].kind, s.messages[1].origin),
+            (MessageKind::Reply, Origin::Model)
+        );
+        assert_eq!(
+            (s.messages[2].kind, s.messages[2].origin),
+            (MessageKind::ToolResult, Origin::Harness)
         );
         let a = &s.messages[1];
         assert_eq!(a.role, Role::Assistant);
@@ -1011,17 +1072,22 @@ mod tests {
         let c = mk(SCHEMA);
         insert(&c, "t2", "", "zstd", &zstd_blob(&modern_thread()));
         let s = parse_thread(&c, &sref("t2")).unwrap();
+        crate::harness::assert_no_flat_keys(&s);
 
         assert_eq!(s.title.as_deref(), Some("Refactor the parser"));
         assert_eq!(s.model.as_deref(), Some("openai/gpt-5-mini"));
         assert_eq!(s.git.as_ref().unwrap().branch.as_deref(), Some("dev"));
+        assert_eq!(s.lineage.parent.as_deref(), Some("parent-1"));
         assert_eq!(
-            s.extra.get("parent_thread_id").and_then(Value::as_str),
-            Some("parent-1")
+            s.harness_extra(Harness::Zed)
+                .and_then(|b| b.get("subagent_depth"))
+                .and_then(Value::as_u64),
+            Some(1)
         );
-        assert_eq!(s.extra.get("subagent_depth").and_then(Value::as_u64), Some(1));
         // All-zero usage is not stashed.
-        assert!(!s.extra.contains_key("cumulative_token_usage"));
+        assert!(s
+            .harness_extra(Harness::Zed)
+            .is_none_or(|b| !b.contains_key("cumulative_token_usage")));
 
         // user, assistant, Tool ("Resume" skipped).
         assert_eq!(s.messages.len(), 3);
@@ -1092,7 +1158,10 @@ mod tests {
         assert_eq!(s.messages.len(), 2);
         assert_eq!(s.messages[0].text().as_deref(), Some("hello from the past"));
         assert_eq!(s.messages[1].text().as_deref(), Some("still parses"));
-        assert!(s.extra.get("thread_version").is_none());
+        assert!(s
+            .harness_extra(Harness::Zed)
+            .and_then(|b| b.get("thread_version"))
+            .is_none());
     }
 
     #[test]
@@ -1120,7 +1189,10 @@ mod tests {
         // parse returns the row's metadata + a flag, never an error.
         let s = parse_thread(&c, &sref("bad")).unwrap();
         assert!(s.messages.is_empty());
-        assert_eq!(s.extra.get("undecodable_blob"), Some(&Value::Bool(true)));
+        assert_eq!(
+            s.harness_extra(Harness::Zed).and_then(|b| b.get("undecodable_blob")),
+            Some(&Value::Bool(true))
+        );
         assert_eq!(s.title.as_deref(), Some("corrupt one"));
     }
 
@@ -1169,9 +1241,60 @@ mod tests {
         )
         .unwrap();
         let s = parse_thread(&c, &sref("child")).unwrap();
+        assert_eq!(s.lineage.parent.as_deref(), Some("parent-thread"));
+    }
+
+    /// The modern `Compaction` variant becomes a `CompactionSummary` turn (no flat marker).
+    #[test]
+    fn modern_compaction_becomes_compaction_summary() {
+        let thread = serde_json::json!({
+            "version": "0.3.0",
+            "title": "compacted",
+            "updated_at": "2026-06-10T00:00:00Z",
+            "messages": [
+                {"User": {"id": "u", "content": [{"Text": "hi"}]}},
+                {"Compaction": {"Summary": "we did a lot of things earlier"}}
+            ]
+        });
+        let c = mk(SCHEMA);
+        insert(&c, "t", "compacted", "zstd", &zstd_blob(&thread));
+        let s = parse_thread(&c, &sref("t")).unwrap();
+        let comp = s
+            .messages
+            .iter()
+            .find(|m| m.kind == MessageKind::CompactionSummary)
+            .expect("compaction summary");
+        assert_eq!(comp.role, Role::System);
+        assert_eq!(comp.origin, Origin::Harness);
+        assert!(comp.text().unwrap().contains("earlier"));
+        assert!(
+            !comp.extra.contains_key("compaction"),
+            "kind carries it, not a flat key"
+        );
+    }
+
+    /// A hidden legacy user turn ("Continue where you left off") is harness-injected context.
+    #[test]
+    fn hidden_user_turn_is_injected_context() {
+        let thread = serde_json::json!({
+            "version": "0.2.0",
+            "summary": "resumed",
+            "updated_at": "2026-06-10T00:00:00Z",
+            "messages": [
+                {"id": 0, "role": "user", "is_hidden": true,
+                 "segments": [{"type": "text", "text": "Continue where you left off"}]},
+                {"id": 1, "role": "assistant", "segments": [{"type": "text", "text": "ok"}]}
+            ]
+        });
+        let c = mk(SCHEMA);
+        insert(&c, "t", "resumed", "zstd", &zstd_blob(&thread));
+        let s = parse_thread(&c, &sref("t")).unwrap();
+        let u = &s.messages[0];
+        assert_eq!(u.role, Role::User);
+        assert_eq!((u.kind, u.origin), (MessageKind::InjectedContext, Origin::Harness));
         assert_eq!(
-            s.extra.get("parent_thread_id").and_then(Value::as_str),
-            Some("parent-thread")
+            u.harness_extra(Harness::Zed).and_then(|b| b.get("is_hidden")),
+            Some(&Value::Bool(true))
         );
     }
 
@@ -1253,6 +1376,7 @@ mod tests {
         eprintln!("zed: {} thread(s) in {}", refs.len(), root.display());
         for r in &refs {
             let s = zed.parse(r).unwrap();
+            crate::harness::assert_no_flat_keys(&s);
             eprintln!(
                 "  {} [{}] {:?} cwd={:?} msgs={} (count={})",
                 &r.id[..8.min(r.id.len())],

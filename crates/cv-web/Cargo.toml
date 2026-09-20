@@ -15,7 +15,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 # no-default-features drops rusqlite so cv-core compiles to wasm32.
-cv-core = { path = "../cv-core", version = "0.10", package = "clustervision-core", default-features = false }
+cv-core = { path = "../cv-core", version = "0.11", package = "clustervision-core", default-features = false }
 wasm-bindgen = "0.2"
 serde_json.workspace = true
 # In-memory zip reader. default-features=false drops native codecs (bzip2/zstd/aes) that don't build

@@ -18,7 +18,7 @@
 //! [`CompactionSink`]; it keeps only small per-boundary rows + (optionally) the summary text, never
 //! the transcript. The summary itself is bounded (a few KB) so it's resolved eagerly.
 
-use crate::ir::{Block, Message, Role, Session, SessionRef};
+use crate::ir::{Block, Message, MessageKind, Session, SessionRef};
 use crate::stream::{Flow, MessageSink};
 use serde_json::Value;
 
@@ -94,14 +94,24 @@ impl CompactionSink {
     }
 }
 
+/// A harness-specific fact by key, searching every harness bag in `extra` (a compaction sink sees
+/// messages from any harness and does not know which wrote them).
+fn bag_value<'a>(m: &'a Message, key: &str) -> Option<&'a Value> {
+    m.extra
+        .values()
+        .filter_map(Value::as_object)
+        .find_map(|bag| bag.get(key))
+}
+
 impl MessageSink for CompactionSink {
     fn message(&mut self, m: Message) -> Flow {
         let idx = self.msg_idx;
         self.msg_idx += 1;
 
-        // A compaction boundary: a System message whose `subtype` is `compact_boundary`.
-        if m.role == Role::System && m.extra.get("subtype").and_then(Value::as_str) == Some("compact_boundary") {
-            let meta = m.extra.get("compactMetadata");
+        // A compaction boundary is a `kind`, whatever the harness. Its metadata (trigger, tokens
+        // before, duration) is harness-specific and lives in that harness's `extra` bag.
+        if m.kind == MessageKind::CompactionBoundary {
+            let meta = bag_value(&m, "compactMetadata").or_else(|| bag_value(&m, "compact_metadata"));
             let comp = Compaction {
                 boundary_msg_idx: idx,
                 boundary_uuid: m.id.clone(),
@@ -121,10 +131,10 @@ impl MessageSink for CompactionSink {
             return Flow::Continue;
         }
 
-        // The paired summary: an `isCompactSummary` message whose `parentUuid` is a pending
-        // boundary's uuid. (Falls back to "the most recent unpaired boundary" if parentUuid is
-        // absent — older transcripts linked only by adjacency.)
-        let is_summary = m.extra.get("isCompactSummary").and_then(Value::as_bool) == Some(true);
+        // The paired summary: a `CompactionSummary` whose `parent_id` is a pending boundary's uuid.
+        // (Falls back to "the most recent unpaired boundary" if the parent link is absent — older
+        // transcripts linked only by adjacency.)
+        let is_summary = m.kind == MessageKind::CompactionSummary;
         if is_summary {
             let slot = m.parent_id.as_deref().and_then(|p| self.pending.remove(p)).or_else(|| {
                 // No/unknown parent link: attach to the latest boundary still awaiting a summary.
@@ -170,8 +180,9 @@ pub fn detect(r: &SessionRef, keep_summaries: bool) -> anyhow::Result<Vec<Compac
         crate::harness::for_harness(r.harness).ok_or_else(|| anyhow::anyhow!("no adapter for {}", r.harness))?;
     let mut sink = CompactionSink::new(keep_summaries);
     sink.resolver = Some(crate::lazy::Resolver::new(Some(r.path.clone())));
-    // `lazy_extra`: the `subtype`/`compactMetadata`/`isCompactSummary` keys this detector keys on
-    // live in `extra` — plain `lazy()` omits them. Giant message bodies still stay lazy on disk.
+    // `lazy_extra`: the boundary/summary `kind`s are always present, but the boundary's
+    // `compactMetadata` (trigger, preTokens, duration) lives in `extra` — plain `lazy()` omits it.
+    // Giant message bodies still stay lazy on disk.
     adapter.stream(r, &crate::stream::ParseOptions::lazy_extra(), &mut sink)?;
     Ok(sink.into_boundaries())
 }
@@ -206,30 +217,27 @@ pub fn detect_in_session(session: &Session, keep_summaries: bool) -> Vec<Compact
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::Harness;
+    use crate::ir::{Harness, Origin, Role};
 
-    /// Build a system compact_boundary message with the given uuid + metadata.
+    /// Build a compaction-boundary message (Claude shape) with the given uuid + metadata.
     fn boundary(uuid: &str, trigger: &str, pre: u64) -> Message {
-        let mut m = Message::new(Role::System);
+        let mut m = Message::of_kind(Role::System, MessageKind::CompactionBoundary, Origin::Harness);
         m.id = Some(uuid.to_string());
         m.content = vec![Block::Text {
             text: "Conversation compacted".into(),
         }];
-        m.extra
-            .insert("subtype".into(), Value::String("compact_boundary".into()));
-        m.extra.insert(
+        m.harness_extra_mut(Harness::Claude).insert(
             "compactMetadata".into(),
             serde_json::json!({"trigger": trigger, "preTokens": pre, "durationMs": 1234}),
         );
         m
     }
 
-    /// Build an isCompactSummary user message whose parentUuid links to `parent`.
+    /// Build a compaction-summary message whose parent links to `parent`.
     fn summary(parent: &str, body: &str) -> Message {
-        let mut m = Message::new(Role::User);
+        let mut m = Message::of_kind(Role::User, MessageKind::CompactionSummary, Origin::Harness);
         m.parent_id = Some(parent.to_string());
         m.content = vec![Block::Text { text: body.into() }];
-        m.extra.insert("isCompactSummary".into(), Value::Bool(true));
         m
     }
 

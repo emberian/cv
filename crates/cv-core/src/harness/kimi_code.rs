@@ -24,13 +24,14 @@
 //!   output.log` (background commands), `media/`, `blobs/`.
 //!
 //! ## `wire.jsonl` records (`{"type": …, …, "time": <ms>}`, header `{"type":"metadata",
-//! "protocol_version", "created_at"}`)
+//! "protocol_version", "created_at"}`) → kind / origin
 //! - `profile.bind{modelAlias, profileName, thinkingEffort, systemPrompt}` / `config.update{…}` →
-//!   the model, plus a System turn holding the system prompt (deduplicated: a re-bind with the same
-//!   prompt is bookkeeping).
-//! - `context.append_message{message:{role:"user", content:[Part], origin:{kind}}}` → User. `origin.kind`
-//!   is `user` for a typed prompt and `injection` / `system_trigger` / `background_task` / `task` for
-//!   text the harness itself fed the model (steers, task notifications); it rides in `extra.origin`.
+//!   the model, plus a `SystemPrompt`/Harness turn holding the system prompt (deduplicated: a re-bind
+//!   with the same prompt is bookkeeping) — also `Session::system_prompt`.
+//! - `context.append_message{message:{role:"user", content:[Part], origin:{kind}}}` → `origin.kind`
+//!   `user` is a typed `Prompt`/Human; `injection` / `system_trigger` are `InjectedContext`/Harness
+//!   (steers, reminders); `background_task` / `task` are `InjectedContext`/Scheduler (task
+//!   notifications). The raw kind rides in `extra["kimi-code"]["origin_kind"]`.
 //!   (`turn.prompt` / `turn.steer` duplicate this text at the UI layer and are not turns.)
 //! - `context.append_loop_event{event}` — one LLM step, in this order: `step.begin{uuid, turnId,
 //!   step}`, `content.part{stepUuid, part:{type:"think"|"text"}}`…, `tool.call{toolCallId, name,
@@ -41,14 +42,23 @@
 //!   step): one Assistant turn (thinking + text + tool_use blocks, `usage` from `step.end`) followed
 //!   by one Tool turn per result. A `think` part with empty text and no encrypted blob (kosong ≥
 //!   0.55 writes those) is skipped.
-//! - `context.apply_compaction{summary, compactedCount}` → a System turn (`subtype:
-//!   "compact_boundary"`) whose text is the summary that seeds the next window.
+//!   Each step is one `Reply`/Model turn followed by `ToolResult`/Harness turns.
+//! - `context.apply_compaction{summary, compactedCount}` → a `CompactionBoundary` turn
+//!   (`extra["kimi-code"]["compactedCount"]`) followed by a `CompactionSummary` turn whose text is
+//!   the summary that seeds the next window (both origin Harness).
 //! - `task.terminated{info{taskId, description, status, exitCode, command}, outputTail}` → a
-//!   System note (background command finished); `turn.cancel` → a System note.
+//!   `Notice`/Harness (background command finished); `turn.cancel` → a `Notice`/Human.
 //! - Everything else (`usage.record`, `llm.request`, `llm.tools_snapshot`, `turn.*`,
 //!   `permission.*`, `tools.*`, `token_counting.*`, `task.started`, `plan_mode.*`,
 //!   `swarm_mode.*`, `full_compaction.*`, …) is bookkeeping: dropped by the lean passes, carried
-//!   verbatim under [`ParseOptions::complete`] like the Claude adapter's carriers.
+//!   verbatim under [`ParseOptions::complete`] as `Carrier` turns (`_record` = the record,
+//!   `extra["kimi-code"]["record_type"]` = its `type`) like the Claude adapter's carriers.
+//!
+//! Every harness fact lives in `extra["kimi-code"]` (message: `event`, `origin_kind`,
+//! `finishReason`, `compactedCount`, `record_type`, and under `ParseOptions::extra` the step
+//! telemetry `stepUuid`/`turnId`/`step`/`traceId`/`llm*`; session: `native_id`, `archived`,
+//! `lastTurnReason`, `titleKind`, `isCustomTitle`, `lastPrompt`, `agents`, `protocol_version`, and
+//! on a sub-agent `agent_id`/`parentAgentId`/`labels`).
 //!
 //! ### Parts
 //! `text{text}` → Text; `think{think, encrypted?}` → Thinking; `image_url{imageUrl:{url}}` (camelCase
@@ -57,13 +67,16 @@
 //!
 //! ## Ids
 //! The cv session id is the bare uuid (`session_` stripped) so `cv show <prefix>` works like every
-//! other harness; the native id (`state.json.id`) is kept in `Session.extra["sessionId"]`. Resume:
-//! `kimi --session <id>` (`-S`).
+//! other harness; the native id (`state.json.id`) is kept in `extra["kimi-code"]["native_id"]`.
+//! Resume: `kimi --session <id>` (`-S`).
 //!
 //! ## Sub-agents
-//! cv's sub-agent forest is Claude-only for now, so the session is the `main` agent's transcript and
-//! the other agents are listed in `Session.extra["agents"]` (`{"agent-N": {type, parentAgentId,
-//! labels}}`); the parent's `Agent` tool result names the child (`agent_id: agent-N`).
+//! Like the Claude adapter, [`Adapter::discover`] lists only top-level sessions (the `main` agent's
+//! transcript); the other agents are summarized in `extra["kimi-code"]["agents"]` (`{"agent-N":
+//! {type, parentAgentId, labels}}`) and the parent's `Agent` tool result names the child (`agent_id:
+//! agent-N`). [`subagent_refs`] produces a [`SessionRef`] per sub-agent (id `<uuid>/agent-N`, path
+//! `…/agents/agent-N`); parsing one yields its own [`Session`] with `lineage.parent` = the session
+//! uuid and `lineage.agent_path` = `agent-N`.
 
 use super::Adapter;
 use crate::harness::claude::CARRIER_KEY;
@@ -172,8 +185,11 @@ impl Adapter for KimiCode {
     }
 
     fn stream(&self, r: &SessionRef, opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
-        let state = read_state(&r.path);
-        let wire = main_wire(&r.path);
+        // The ref points at the session dir (the `main` agent) or, from [`subagent_refs`], at one
+        // sub-agent's dir (`…/agents/agent-N`); the state file is the session's either way.
+        let (session_dir, agent_id) = split_agent_path(&r.path);
+        let state = read_state(session_dir);
+        let wire = agent_wire(session_dir, agent_id);
 
         let mut s = Session {
             id: r.id.clone(),
@@ -195,31 +211,55 @@ impl Adapter for KimiCode {
             source_path: Some(r.path.clone()),
             extra: Map::new(),
         };
-        if let Some(native) = state.get("id").and_then(Value::as_str) {
-            s.extra.insert("sessionId".into(), Value::String(native.to_string()));
-        }
-        for key in ["archived", "lastTurnReason", "titleKind", "isCustomTitle", "lastPrompt"] {
-            if let Some(v) = state.get(key).filter(|v| !v.is_null()) {
-                s.extra.insert(key.to_string(), v.clone());
+        // The system prompt is bound by the head of the wire (`profile.bind`); peek so the
+        // session-level copy is known before the body streams (INTERFACE-V2 §4).
+        s.system_prompt = peek_system_prompt(&wire);
+        if agent_id == "main" {
+            // Session facts live in the harness bag, `extra["kimi-code"]`, never at the top level.
+            let bag = s.harness_extra_mut(Harness::KimiCode);
+            if let Some(native) = state.get("id").and_then(Value::as_str) {
+                // The id as Kimi Code writes it (`session_<uuid>`); cv keys the session by the bare uuid.
+                bag.insert("native_id".into(), Value::String(native.to_string()));
             }
-        }
-        // Sub-agents (`Agent` tool): everything in `state.json.agents` but `main`.
-        if let Some(agents) = state.get("agents").and_then(Value::as_object) {
-            let subs: Map<String, Value> = agents
-                .iter()
-                .filter(|(k, _)| k.as_str() != "main")
-                .map(|(k, v)| {
-                    let mut a = Map::new();
-                    for key in ["type", "parentAgentId", "labels"] {
-                        if let Some(x) = v.get(key) {
-                            a.insert(key.to_string(), x.clone());
+            for key in ["archived", "lastTurnReason", "titleKind", "isCustomTitle", "lastPrompt"] {
+                if let Some(v) = state.get(key).filter(|v| !v.is_null()) {
+                    bag.insert(key.to_string(), v.clone());
+                }
+            }
+            // Sub-agents (`Agent` tool): everything in `state.json.agents` but `main`.
+            if let Some(agents) = state.get("agents").and_then(Value::as_object) {
+                let subs: Map<String, Value> = agents
+                    .iter()
+                    .filter(|(k, _)| k.as_str() != "main")
+                    .map(|(k, v)| {
+                        let mut a = Map::new();
+                        for key in ["type", "parentAgentId", "labels"] {
+                            if let Some(x) = v.get(key) {
+                                a.insert(key.to_string(), x.clone());
+                            }
                         }
+                        (k.clone(), Value::Object(a))
+                    })
+                    .collect();
+                if !subs.is_empty() {
+                    bag.insert("agents".into(), Value::Object(subs));
+                }
+            }
+        } else {
+            // A sub-agent's own session: the parent is the session it lives in (its uuid), the
+            // nickname is the agent dir. `parentAgentId` says which agent spawned it (`main`, or
+            // another sub-agent for nested spawns); the `Agent` tool call that did so is not
+            // recorded on the child's side, so `spawned_by_tool_use` stays unknown.
+            s.lineage.parent = Some(session_uuid(session_dir).to_string());
+            s.lineage.agent_path = Some(agent_id.to_string());
+            let bag = s.harness_extra_mut(Harness::KimiCode);
+            bag.insert("agent_id".into(), Value::String(agent_id.to_string()));
+            if let Some(a) = state.pointer(&format!("/agents/{agent_id}")) {
+                for key in ["parentAgentId", "labels"] {
+                    if let Some(x) = a.get(key).filter(|x| !x.is_null()) {
+                        bag.insert(key.to_string(), x.clone());
                     }
-                    (k.clone(), Value::Object(a))
-                })
-                .collect();
-            if !subs.is_empty() {
-                s.extra.insert("agents".into(), Value::Object(subs));
+                }
             }
         }
 
@@ -241,7 +281,8 @@ impl Adapter for KimiCode {
             ctx.flush_step(sink);
         }
         if let Some(pv) = ctx.protocol_version.take() {
-            s.extra.insert("protocol_version".into(), Value::String(pv));
+            s.harness_extra_mut(Harness::KimiCode)
+                .insert("protocol_version".into(), Value::String(pv));
         }
         super::note_skipped_lines(&mut s, skipped);
         Ok(s)
@@ -250,7 +291,68 @@ impl Adapter for KimiCode {
 
 /// The session's own transcript: the `main` agent's wire log.
 fn main_wire(session_dir: &Path) -> PathBuf {
-    session_dir.join("agents").join("main").join("wire.jsonl")
+    agent_wire(session_dir, "main")
+}
+
+/// One agent's wire log under a session dir.
+fn agent_wire(session_dir: &Path, agent_id: &str) -> PathBuf {
+    session_dir.join("agents").join(agent_id).join("wire.jsonl")
+}
+
+/// A [`SessionRef::path`] is the session dir (`session_<uuid>`) or, for a sub-agent ref, one agent's
+/// dir under it (`session_<uuid>/agents/agent-N`): `(session dir, agent id)`.
+fn split_agent_path(path: &Path) -> (&Path, &str) {
+    let is_agents_dir = |p: &Path| p.file_name().and_then(|n| n.to_str()) == Some("agents");
+    match (path.parent(), path.file_name().and_then(|n| n.to_str())) {
+        (Some(agents), Some(agent)) if is_agents_dir(agents) && agent.starts_with("agent-") => {
+            (agents.parent().unwrap_or(path), agent)
+        }
+        _ => (path, "main"),
+    }
+}
+
+/// The bare uuid a session dir is keyed by (`session_` stripped).
+fn session_uuid(session_dir: &Path) -> &str {
+    let name = session_dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    name.strip_prefix("session_").unwrap_or(name)
+}
+
+/// One [`SessionRef`] per sub-agent transcript of `main` (a top-level ref from
+/// [`Adapter::discover`]): `agents/agent-N/wire.jsonl`, in agent order. Ids are `<uuid>/agent-N`;
+/// parsing one gives a session whose `lineage.parent` is the uuid and `lineage.agent_path` the
+/// agent id. Sub-agents are not listed by `discover` (like the Claude adapter's `subagents/`).
+pub fn subagent_refs(main: &SessionRef) -> Vec<SessionRef> {
+    let Ok(rd) = fs::read_dir(main.path.join("agents")) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(u64, SessionRef)> = rd
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let n: u64 = name.strip_prefix("agent-")?.parse().ok()?;
+            let dir = e.path();
+            let wire = dir.join("wire.jsonl");
+            if !wire.exists() {
+                return None;
+            }
+            let w = scan_wire(&wire);
+            Some((
+                n,
+                SessionRef {
+                    id: format!("{}/{name}", main.id),
+                    harness: Harness::KimiCode,
+                    path: dir,
+                    cwd: main.cwd.clone(),
+                    title: w.title,
+                    created_at: w.first_ts.or_else(|| file_mtime(&wire)),
+                    updated_at: w.last_ts.or_else(|| file_mtime(&wire)),
+                    message_count: w.message_count,
+                },
+            ))
+        })
+        .collect();
+    out.sort_by_key(|(n, _)| *n);
+    out.into_iter().map(|(_, r)| r).collect()
 }
 
 fn read_state(session_dir: &Path) -> Value {
@@ -322,56 +424,23 @@ fn scan(session_dir: &Path, id: &str, fallback_cwd: Option<PathBuf>) -> Option<S
         .and_then(Value::as_str)
         .map(PathBuf::from)
         .or(fallback_cwd);
-    let mut title = state
+    let w = scan_wire(&wire);
+    let title = state
         .get("title")
         .and_then(Value::as_str)
         .filter(|t| !t.trim().is_empty())
-        .map(str::to_string);
-
-    let mut message_count = 0usize;
-    let mut first_ts: Option<DateTime<Utc>> = None;
-    let mut last_ts: Option<DateTime<Utc>> = None;
-    if let Ok(file) = fs::File::open(&wire) {
-        super::for_each_json_line(BufReader::new(file), |v| {
-            if let Some(ts) = v.get("time").and_then(super::ts_from_value) {
-                first_ts = Some(first_ts.map_or(ts, |f| f.min(ts)));
-                last_ts = Some(last_ts.map_or(ts, |l| l.max(ts)));
-            }
-            match v.get("type").and_then(Value::as_str) {
-                // SessionRef contract: user + assistant turns. A user record is one turn; an
-                // assistant turn is one LLM step (`step.end`).
-                Some("context.append_message") => {
-                    if v.pointer("/message/role").and_then(Value::as_str) == Some("user") {
-                        message_count += 1;
-                        // Title fallback: the first prompt the USER typed (not an injected notice).
-                        if title.is_none() && origin_kind(v.get("message")) == "user" {
-                            let t = parts_text(v.pointer("/message/content"));
-                            if !t.trim().is_empty() {
-                                title = Some(crate::ir::truncate(&t, 80));
-                            }
-                        }
-                    }
-                }
-                Some("context.append_loop_event")
-                    if v.pointer("/event/type").and_then(Value::as_str) == Some("step.end") =>
-                {
-                    message_count += 1;
-                }
-                _ => {}
-            }
-            Flow::Continue
-        });
-    }
+        .map(str::to_string)
+        .or(w.title);
 
     let created = state
         .get("createdAt")
         .and_then(super::ts_from_value)
-        .or(first_ts)
+        .or(w.first_ts)
         .or_else(|| file_mtime(&wire));
     let updated = state
         .get("updatedAt")
         .and_then(super::ts_from_value)
-        .or(last_ts)
+        .or(w.last_ts)
         .or_else(|| file_mtime(&wire));
 
     Some(SessionRef {
@@ -382,8 +451,55 @@ fn scan(session_dir: &Path, id: &str, fallback_cwd: Option<PathBuf>) -> Option<S
         title,
         created_at: created,
         updated_at: updated,
-        message_count,
+        message_count: w.message_count,
     })
+}
+
+/// What one pass over a wire log yields for a listing.
+#[derive(Default)]
+struct WireScan {
+    /// user + assistant turns (the [`SessionRef::message_count`] contract).
+    message_count: usize,
+    /// The first prompt the USER typed (not an injected notice), truncated.
+    title: Option<String>,
+    first_ts: Option<DateTime<Utc>>,
+    last_ts: Option<DateTime<Utc>>,
+}
+
+/// One pass over a wire log: turn count, title fallback and time bounds. A user record is one turn;
+/// an assistant turn is one LLM step (`step.end`).
+fn scan_wire(wire: &Path) -> WireScan {
+    let mut w = WireScan::default();
+    let Ok(file) = fs::File::open(wire) else {
+        return w;
+    };
+    super::for_each_json_line(BufReader::new(file), |v| {
+        if let Some(ts) = v.get("time").and_then(super::ts_from_value) {
+            w.first_ts = Some(w.first_ts.map_or(ts, |f| f.min(ts)));
+            w.last_ts = Some(w.last_ts.map_or(ts, |l| l.max(ts)));
+        }
+        match v.get("type").and_then(Value::as_str) {
+            Some("context.append_message") => {
+                if v.pointer("/message/role").and_then(Value::as_str) == Some("user") {
+                    w.message_count += 1;
+                    if w.title.is_none() && origin_kind(v.get("message")) == "user" {
+                        let t = parts_text(v.pointer("/message/content"));
+                        if !t.trim().is_empty() {
+                            w.title = Some(crate::ir::truncate(&t, 80));
+                        }
+                    }
+                }
+            }
+            Some("context.append_loop_event")
+                if v.pointer("/event/type").and_then(Value::as_str) == Some("step.end") =>
+            {
+                w.message_count += 1;
+            }
+            _ => {}
+        }
+        Flow::Continue
+    });
+    w
 }
 
 fn file_mtime(path: &Path) -> Option<DateTime<Utc>> {
@@ -420,6 +536,33 @@ fn peek_model(wire: &Path) -> Option<String> {
 
 /// `message.origin.kind` (`user` / `injection` / `system_trigger` / `background_task` / `task`),
 /// `"user"` when absent (older records).
+/// The system prompt from the head of the wire: the first `profile.bind` / `config.update` that
+/// carries a non-empty `systemPrompt` (the same records [`Ctx::system_prompt`] turns into a
+/// `SystemPrompt` message). Bounded like [`peek_model`].
+fn peek_system_prompt(wire: &Path) -> Option<String> {
+    let file = fs::File::open(wire).ok()?;
+    let mut prompt = None;
+    let mut seen = 0usize;
+    super::for_each_json_line(BufReader::new(file), |v| {
+        seen += 1;
+        if matches!(
+            v.get("type").and_then(Value::as_str),
+            Some("profile.bind" | "config.update")
+        ) {
+            if let Some(p) = v.get("systemPrompt").and_then(Value::as_str).filter(|p| !p.is_empty()) {
+                prompt = Some(p.to_string());
+                return Flow::Stop;
+            }
+        }
+        if seen >= 16 {
+            Flow::Stop
+        } else {
+            Flow::Continue
+        }
+    });
+    prompt
+}
+
 fn origin_kind(message: Option<&Value>) -> &str {
     message
         .and_then(|m| m.pointer("/origin/kind"))
@@ -465,19 +608,35 @@ impl Ctx<'_> {
                 if f == Flow::Stop {
                     return self.stop();
                 }
-                let summary = v.get("summary").and_then(Value::as_str).unwrap_or("");
-                let text = if summary.trim().is_empty() {
-                    "[conversation compacted]".to_string()
-                } else {
-                    summary.to_string()
-                };
-                let mut m = system_note(text, ts, "compact_boundary");
-                let mut meta = Map::new();
+                // Two turns, as the kinds vocabulary has it: the boundary (where the harness cut
+                // the context), then the summary that seeds the next window, when there is one.
+                let mut boundary = note(
+                    "[conversation compacted]".into(),
+                    ts,
+                    MessageKind::CompactionBoundary,
+                    Origin::Harness,
+                    ty,
+                );
                 if let Some(n) = v.get("compactedCount") {
-                    meta.insert("compactedCount".into(), n.clone());
+                    boundary
+                        .harness_extra_mut(Harness::KimiCode)
+                        .insert("compactedCount".into(), n.clone());
                 }
-                m.extra.insert("compactMetadata".into(), Value::Object(meta));
-                sink.message(m)
+                if sink.message(boundary) == Flow::Stop {
+                    return self.stop();
+                }
+                let summary = v.get("summary").and_then(Value::as_str).unwrap_or("");
+                if summary.trim().is_empty() {
+                    Flow::Continue
+                } else {
+                    sink.message(note(
+                        summary.to_string(),
+                        ts,
+                        MessageKind::CompactionSummary,
+                        Origin::Harness,
+                        ty,
+                    ))
+                }
             }
             "task.terminated" => {
                 let info = v.get("info").cloned().unwrap_or(Value::Null);
@@ -491,15 +650,18 @@ impl Ctx<'_> {
                     .and_then(Value::as_i64)
                     .map(|c| format!(", exit {c}"))
                     .unwrap_or_default();
-                let mut m = system_note(
+                let mut m = note(
                     format!("⏱ background task {status}: {desc}{exit}"),
                     ts,
-                    "task_terminated",
+                    MessageKind::Notice,
+                    Origin::Harness,
+                    ty,
                 );
                 if self.opts.extra {
-                    m.extra.insert("task".into(), info);
+                    let bag = m.harness_extra_mut(Harness::KimiCode);
+                    bag.insert("task".into(), info);
                     if let Some(tail) = v.get("outputTail") {
-                        m.extra.insert("outputTail".into(), tail.clone());
+                        bag.insert("outputTail".into(), tail.clone());
                     }
                 }
                 sink.message(m)
@@ -509,7 +671,14 @@ impl Ctx<'_> {
                 if f == Flow::Stop {
                     return self.stop();
                 }
-                sink.message(system_note("[turn cancelled]".into(), ts, "turn_cancel"))
+                // The person cancelled the turn: a notice, of human origin.
+                sink.message(note(
+                    "[turn cancelled]".into(),
+                    ts,
+                    MessageKind::Notice,
+                    Origin::Human,
+                    ty,
+                ))
             }
             _ => self.carry(v, ts, sink),
         };
@@ -530,9 +699,13 @@ impl Ctx<'_> {
         if !self.opts.complete {
             return Flow::Continue;
         }
-        let mut m = Message::new(Role::System);
+        let mut m = Message::of_kind(Role::System, MessageKind::Carrier, Origin::Harness);
         m.timestamp = ts;
         m.extra.insert(CARRIER_KEY.into(), v.clone());
+        if let Some(ty) = v.get("type").and_then(Value::as_str) {
+            m.harness_extra_mut(Harness::KimiCode)
+                .insert("record_type".into(), Value::String(ty.to_string()));
+        }
         sink.message(m)
     }
 
@@ -549,23 +722,20 @@ impl Ctx<'_> {
         if !self.seen_prompts.insert(hash) {
             return self.carry(v, ts, sink);
         }
-        let mut m = if self.opts.complete {
-            let mut c = Message::new(Role::System);
-            c.extra.insert(CARRIER_KEY.into(), v.clone());
-            c
-        } else {
-            Message::new(Role::System)
-        };
+        let mut m = Message::of_kind(Role::System, MessageKind::SystemPrompt, Origin::Harness);
+        if self.opts.complete {
+            m.extra.insert(CARRIER_KEY.into(), v.clone());
+        }
         m.timestamp = ts;
         m.content.push(Block::Text {
             text: Text::from(prompt),
         });
-        m.extra.insert("subtype".into(), Value::String("system_prompt".into()));
-        m.extra.insert("kimi_event".into(), Value::String(ty.to_string()));
+        let bag = m.harness_extra_mut(Harness::KimiCode);
+        bag.insert("event".into(), Value::String(ty.to_string()));
         if self.opts.extra {
             for key in ["modelAlias", "profileName", "thinkingEffort"] {
                 if let Some(x) = v.get(key) {
-                    m.extra.insert(key.to_string(), x.clone());
+                    bag.insert(key.to_string(), x.clone());
                 }
             }
         }
@@ -584,12 +754,24 @@ impl Ctx<'_> {
             Some("system") => Role::System,
             _ => Role::User,
         };
-        let mut m = Message::new(role);
+        // `origin.kind` says who put the text there: `user` is a typed prompt; `injection` /
+        // `system_trigger` are harness steers; `background_task` / `task` are automation notices.
+        let origin_kind = origin_kind(message);
+        let (kind, origin) = match role {
+            Role::User => match origin_kind {
+                "user" => (MessageKind::Prompt, Origin::Human),
+                "background_task" | "task" => (MessageKind::InjectedContext, Origin::Scheduler),
+                _ => (MessageKind::InjectedContext, Origin::Harness),
+            },
+            Role::Assistant => (MessageKind::Reply, Origin::Model),
+            Role::Tool => (MessageKind::ToolResult, Origin::Harness),
+            Role::System => (MessageKind::InjectedContext, Origin::Harness),
+        };
+        let mut m = Message::of_kind(role, kind, origin);
         m.timestamp = ts;
         push_parts(&mut m, message.and_then(|m| m.get("content")));
-        // Always: distinguishes a typed prompt from harness-injected text (steers, task notices).
-        m.extra
-            .insert("origin".into(), Value::String(origin_kind(message).to_string()));
+        m.harness_extra_mut(Harness::KimiCode)
+            .insert("origin_kind".into(), Value::String(origin_kind.to_string()));
         if self.opts.complete {
             m.extra.insert(CARRIER_KEY.into(), v.clone());
         }
@@ -666,8 +848,9 @@ impl Ctx<'_> {
                     if let Some(mid) = e.get("messageId").and_then(Value::as_str) {
                         step.msg.id = Some(mid.to_string());
                     }
+                    let bag = step.msg.harness_extra_mut(Harness::KimiCode);
                     if let Some(fr) = e.get("finishReason") {
-                        step.msg.extra.insert("finishReason".into(), fr.clone());
+                        bag.insert("finishReason".into(), fr.clone());
                     }
                     if self.opts.extra {
                         for key in [
@@ -677,7 +860,7 @@ impl Ctx<'_> {
                             "rawFinishReason",
                         ] {
                             if let Some(x) = e.get(key) {
-                                step.msg.extra.insert(key.to_string(), x.clone());
+                                bag.insert(key.to_string(), x.clone());
                             }
                         }
                     }
@@ -689,14 +872,15 @@ impl Ctx<'_> {
     }
 
     fn open_step(&mut self, uuid: String, e: &Value, ts: Option<DateTime<Utc>>) {
-        let mut msg = Message::new(Role::Assistant);
+        let mut msg = Message::of_kind(Role::Assistant, MessageKind::Reply, Origin::Model);
         msg.id = Some(uuid.clone());
         msg.timestamp = ts;
         if self.opts.extra {
-            msg.extra.insert("stepUuid".into(), Value::String(uuid.clone()));
+            let bag = msg.harness_extra_mut(Harness::KimiCode);
+            bag.insert("stepUuid".into(), Value::String(uuid.clone()));
             for key in ["turnId", "step"] {
                 if let Some(x) = e.get(key) {
-                    msg.extra.insert(key.to_string(), x.clone());
+                    bag.insert(key.to_string(), x.clone());
                 }
             }
         }
@@ -760,7 +944,7 @@ impl Ctx<'_> {
         if let Some(path) = output_path(&content) {
             details.insert("persistedOutput".into(), serde_json::json!({ "path": path }));
         }
-        let mut m = Message::new(Role::Tool);
+        let mut m = Message::of_kind(Role::Tool, MessageKind::ToolResult, Origin::Harness);
         m.timestamp = ts;
         m.content.push(Block::ToolResult {
             tool_use_id: id.clone(),
@@ -772,7 +956,8 @@ impl Ctx<'_> {
         });
         if self.opts.extra {
             if let Some(t) = e.get("traceId") {
-                m.extra.insert("traceId".into(), t.clone());
+                m.harness_extra_mut(Harness::KimiCode)
+                    .insert("traceId".into(), t.clone());
             }
         }
         if self.opts.complete {
@@ -782,11 +967,14 @@ impl Ctx<'_> {
     }
 }
 
-fn system_note(text: String, ts: Option<DateTime<Utc>>, subtype: &str) -> Message {
-    let mut m = Message::new(Role::System);
+/// A harness-side System turn of the given kind and origin, with the wire record type that
+/// produced it in `extra["kimi-code"]["event"]`.
+fn note(text: String, ts: Option<DateTime<Utc>>, kind: MessageKind, origin: Origin, event: &str) -> Message {
+    let mut m = Message::of_kind(Role::System, kind, origin);
     m.timestamp = ts;
     m.content.push(Block::Text { text: Text::from(text) });
-    m.extra.insert("subtype".into(), Value::String(subtype.to_string()));
+    m.harness_extra_mut(Harness::KimiCode)
+        .insert("event".into(), Value::String(event.to_string()));
     m
 }
 
@@ -957,12 +1145,64 @@ mod tests {
             r#"{"type":"task.terminated","info":{"taskId":"bash-1","description":"long build","status":"completed","exitCode":0},"outputTail":"ok","time":1787509646900}"#,
         ];
         fs::write(main.join("wire.jsonl"), lines.join("\n") + "\n").unwrap();
+        // The sub-agent's own wire (as Kimi Code writes one: `config.update` binds cwd/model, a
+        // second one binds the profile's system prompt, then the delegated prompt and its step).
+        let sub_lines = [
+            lines[0],
+            r#"{"type":"config.update","cwd":"/Users/u/proj","modelAlias":"kimi-code/k3","thinkingEffort":"high","time":1787509646010}"#,
+            r#"{"type":"config.update","profileName":"explore","systemPrompt":"You are an explorer.","time":1787509646011}"#,
+            r#"{"type":"context.append_message","message":{"role":"user","content":[{"type":"text","text":"Extract IPA verifier math"}],"origin":{"kind":"user"}},"time":1787509646020}"#,
+            r#"{"type":"context.append_loop_event","event":{"type":"step.begin","uuid":"x1","turnId":"0","step":1},"time":1787509646030}"#,
+            r#"{"type":"context.append_loop_event","event":{"type":"content.part","uuid":"px","turnId":"0","step":1,"stepUuid":"x1","part":{"type":"text","text":"It is a Pedersen commitment."}},"time":1787509646031}"#,
+            r#"{"type":"context.append_loop_event","event":{"type":"step.end","uuid":"x1","turnId":"0","step":1,"usage":{"inputOther":10,"output":6,"inputCacheRead":0,"inputCacheCreation":0},"finishReason":"end_turn","messageId":"chatcmpl-x"},"time":1787509646040}"#,
+        ];
         fs::write(
             sdir.join("agents").join("agent-0").join("wire.jsonl"),
-            lines[0].to_string() + "\n",
+            sub_lines.join("\n") + "\n",
         )
         .unwrap();
         root
+    }
+
+    #[test]
+    fn sub_agent_wire_parses_as_its_own_session_with_lineage() {
+        let root = fixture_root();
+        let a = KimiCode::for_root(root.clone());
+        let main = a.discover().unwrap().remove(0);
+        let subs = subagent_refs(&main);
+        assert_eq!(subs.len(), 1, "{subs:?}");
+        let sub = &subs[0];
+        assert_eq!(sub.id, format!("{SID}/agent-0"));
+        assert_eq!(sub.path, main.path.join("agents").join("agent-0"));
+        assert_eq!(sub.title.as_deref(), Some("Extract IPA verifier math"));
+        assert_eq!(sub.message_count, 2, "the prompt + one step");
+        assert_eq!(sub.created_at.map(|t| t.timestamp_millis()), Some(1787509646010));
+
+        let s = a.parse(sub).unwrap();
+        assert_eq!(s.lineage.parent.as_deref(), Some(SID));
+        assert_eq!(s.lineage.agent_path.as_deref(), Some("agent-0"));
+        assert_eq!(s.system_prompt.as_deref(), Some("You are an explorer."));
+        assert_eq!(s.model.as_deref(), Some("kimi-code/k3"));
+        assert_eq!(s.cwd.as_deref(), Some(Path::new("/Users/u/proj")));
+        let bag = &s.extra["kimi-code"];
+        assert_eq!(bag["agent_id"], "agent-0");
+        assert_eq!(bag["parentAgentId"], "main");
+        assert!(
+            bag.get("agents").is_none(),
+            "the agents map belongs to the main session"
+        );
+        assert!(bag.get("native_id").is_none());
+        let kinds: Vec<MessageKind> = s.messages.iter().map(|m| m.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![MessageKind::SystemPrompt, MessageKind::Prompt, MessageKind::Reply],
+            "{kinds:?}"
+        );
+        assert_eq!(s.messages[0].extra["kimi-code"]["event"], "config.update");
+        // the main session knows nothing of the child's lineage
+        let m = a.parse(&main).unwrap();
+        assert!(m.lineage.is_empty());
+        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -989,9 +1229,17 @@ mod tests {
         let s = a.parse(&r).unwrap();
         assert_eq!(s.harness, Harness::KimiCode);
         assert_eq!(s.model.as_deref(), Some("kimi-code/k3"));
-        assert_eq!(s.extra["sessionId"], format!("session_{SID}"));
-        assert_eq!(s.extra["agents"]["agent-0"]["parentAgentId"], "main");
-        assert_eq!(s.extra["protocol_version"], "1.5");
+        let bag = &s.extra["kimi-code"];
+        assert_eq!(bag["native_id"], format!("session_{SID}"));
+        assert_eq!(bag["agents"]["agent-0"]["parentAgentId"], "main");
+        assert_eq!(bag["protocol_version"], "1.5");
+        assert_eq!(
+            s.extra.len(),
+            1,
+            "session facts live only in the harness bag: {:?}",
+            s.extra
+        );
+        assert_eq!(s.system_prompt.as_deref(), Some("You are Kimi Code CLI."));
 
         let roles: Vec<Role> = s.messages.iter().map(|m| m.role).collect();
         assert_eq!(
@@ -1004,17 +1252,40 @@ mod tests {
                 Role::Tool,      // Bash result
                 Role::Assistant, // step 2: text
                 Role::User,      // injected background-task notice
-                Role::System,    // compaction
+                Role::System,    // compaction boundary
+                Role::System,    // compaction summary
                 Role::System,    // task terminated
             ],
             "{roles:?}"
         );
+        let kinds: Vec<MessageKind> = s.messages.iter().map(|m| m.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                MessageKind::SystemPrompt,
+                MessageKind::Prompt,
+                MessageKind::Reply,
+                MessageKind::ToolResult,
+                MessageKind::ToolResult,
+                MessageKind::Reply,
+                MessageKind::InjectedContext,
+                MessageKind::CompactionBoundary,
+                MessageKind::CompactionSummary,
+                MessageKind::Notice,
+            ],
+            "{kinds:?}"
+        );
         // system prompt
         assert_eq!(s.messages[0].text().as_deref(), Some("You are Kimi Code CLI."));
-        assert_eq!(s.messages[0].extra["subtype"], "system_prompt");
-        // prompt origin vs injection origin
-        assert_eq!(s.messages[1].extra["origin"], "user");
-        assert_eq!(s.messages[6].extra["origin"], "background_task");
+        assert_eq!(s.messages[0].origin, Origin::Harness);
+        assert_eq!(s.messages[0].extra["kimi-code"]["event"], "profile.bind");
+        // a typed prompt vs a harness-injected notice: kind + origin first-class, raw kind in the bag
+        assert_eq!(s.messages[1].origin, Origin::Human);
+        assert_eq!(s.messages[1].extra["kimi-code"]["origin_kind"], "user");
+        assert_eq!(s.messages[6].origin, Origin::Scheduler);
+        assert_eq!(s.messages[6].extra["kimi-code"]["origin_kind"], "background_task");
+        assert_eq!(s.messages[2].origin, Origin::Model);
+        assert_eq!(s.messages[3].origin, Origin::Harness);
         // step 1: the empty think part is dropped; the real one + both calls are there, in order
         let step1 = &s.messages[2];
         assert_eq!(step1.id.as_deref(), Some("chatcmpl-1"), "messageId from step.end");
@@ -1036,7 +1307,12 @@ mod tests {
             ),
             (Some(2452), Some(39), Some(17920), Some(0))
         );
-        assert_eq!(step1.extra["finishReason"], "tool_calls");
+        assert_eq!(step1.extra["kimi-code"]["finishReason"], "tool_calls");
+        assert!(
+            step1.extra.keys().all(|k| k == "kimi-code"),
+            "message facts live only in the harness bag: {:?}",
+            step1.extra
+        );
         // tool results: name resolved from the call, is_error, note/truncated/persisted path in details
         let Block::ToolResult {
             tool_use_id,
@@ -1070,13 +1346,19 @@ mod tests {
         );
         // step 2
         assert_eq!(s.messages[5].text().as_deref(), Some("Fixed it."));
-        // compaction marker is what the compaction detector keys on
-        assert_eq!(s.messages[7].extra["subtype"], "compact_boundary");
-        assert!(s.messages[7].text().unwrap().contains("Current Focus"));
-        assert_eq!(s.messages[7].extra["compactMetadata"]["compactedCount"], 4);
-        assert!(s.messages[8].text().unwrap().contains("long build"));
-        // lean mode carries no bookkeeping
-        assert!(s.messages.iter().all(|m| !m.extra.contains_key(CARRIER_KEY)));
+        // compaction: the boundary (what the compaction detector keys on) then the summary
+        assert_eq!(s.messages[7].text().as_deref(), Some("[conversation compacted]"));
+        assert_eq!(s.messages[7].extra["kimi-code"]["compactedCount"], 4);
+        assert_eq!(s.messages[7].extra["kimi-code"]["event"], "context.apply_compaction");
+        assert!(s.messages[8].text().unwrap().contains("Current Focus"));
+        assert!(s.messages[9].text().unwrap().contains("long build"));
+        assert_eq!(s.messages[9].extra["kimi-code"]["event"], "task.terminated");
+        // lean mode carries no bookkeeping, and nothing lives outside the harness bag
+        for m in &s.messages {
+            assert!(!m.extra.contains_key(CARRIER_KEY));
+            assert!(m.extra.keys().all(|k| k == "kimi-code"), "{:?}", m.extra);
+        }
+        assert!(s.lineage.is_empty(), "a top-level session has no lineage");
         fs::remove_dir_all(&root).ok();
     }
 
@@ -1100,18 +1382,25 @@ mod tests {
         ] {
             assert!(carried.contains(&t), "{t} should be carried: {carried:?}");
         }
+        // carriers are `Carrier`-kind turns naming their record type
+        assert!(s
+            .messages
+            .iter()
+            .filter(|m| m.kind == MessageKind::Carrier)
+            .all(|m| m.extra.contains_key(CARRIER_KEY) && m.extra["kimi-code"]["record_type"].is_string()));
         // the system-prompt turn is both content and a carrier of the bind record
         let bind = s
             .messages
             .iter()
-            .find(|m| m.extra.get("subtype").and_then(Value::as_str) == Some("system_prompt"))
+            .find(|m| m.kind == MessageKind::SystemPrompt)
             .expect("system prompt turn");
         assert!(bind.extra.contains_key(CARRIER_KEY) && !bind.content.is_empty());
-        // Every record is accounted for: 9 content turns (the step events fold into their assistant
-        // turn rather than being carried one by one) + 5 bookkeeping carriers.
+        // Every record is accounted for: 10 content turns (the step events fold into their assistant
+        // turn rather than being carried one by one; the compaction is boundary + summary) + 5
+        // bookkeeping carriers.
         assert_eq!(
             s.messages.len(),
-            14,
+            15,
             "{:?}",
             s.messages.iter().map(|m| m.role).collect::<Vec<_>>()
         );

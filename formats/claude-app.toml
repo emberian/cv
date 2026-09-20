@@ -1,0 +1,18 @@
+# formats/claude-app.toml — the vocabulary cv's `claude-app` adapter is checked against (docs/INTERFACE-V2.md §7).
+# status: handled = per-item arm in the adapter; generic = interpreted by a blanket rule; carried = verbatim
+# under ParseOptions::complete only; ignored = known and deliberately skipped. Regenerate: tools/gen-manifests (or edit by hand).
+
+harness = "claude-app"
+source_files = ["harness/claude_app.rs"]
+ignore_literals = ["Claude", "Library"]
+store = [
+  "~/Library/Application Support/Claude/ (detected only; transcripts are server-side)",
+]
+
+[upstream]
+repo = "closed source"
+commit = "unknown"
+date = "2026-05-29"
+
+[types]
+"stub.claude-code-sessions" = { status = "generic", note = "metadata stubs → Claude Code transcripts" }

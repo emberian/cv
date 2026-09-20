@@ -1067,7 +1067,7 @@ fn prune_assistant_thinking(
 /// `--declassify`: snip a message's TEXT when its security-token density is high, so the resumed
 /// session does not carry classifier-tripping PROSE into a fresh seat's context. Handles both message
 /// shapes: a user turn's bare-string `content`, and an assistant turn's array of `text` blocks. The
-/// original text is stashed in the sidecar verbatim (lossless, `--retrieve`-able, under `<line_key>#declass`)
+/// original text is stashed in the sidecar verbatim (lossless, readable with `cv cat`, under `<line_key>#declass`)
 /// and replaced with a `[PRUNED …]` marker. A block is snipped iff it contains at least
 /// `declassify_min_hits` DISTINCT `declassify_tokens` (case-insensitive substring match).
 #[allow(clippy::too_many_arguments)]
@@ -1409,7 +1409,7 @@ fn build_marker(
     let tail = if dropped {
         "dropped (no sidecar)".to_string()
     } else {
-        format!("retrieve: cv prune {session} --retrieve {id}")
+        format!("retrieve: cv cat {session} {id}")
     };
     format!("{MARKER_PREFIX}{id} tool={name}{args} | {label} {size}B/{lines}L | session={session} | {tail}]")
 }

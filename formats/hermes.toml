@@ -1,0 +1,67 @@
+# formats/hermes.toml — the vocabulary cv's `hermes` adapter is checked against (docs/INTERFACE-V2.md §7).
+# status: handled = per-item arm in the adapter; generic = interpreted by a blanket rule; carried = verbatim
+# under ParseOptions::complete only; ignored = known and deliberately skipped. Regenerate: tools/gen-manifests (or edit by hand).
+
+harness = "hermes"
+source_files = ["harness/hermes.rs"]
+ignore_literals = []
+store = [
+  "$HERMES_HOME/state.db (default ~/.hermes)",
+  "$HERMES_HOME/profiles/<name>/state.db",
+]
+
+[upstream]
+repo = "https://github.com/NousResearch/hermes-agent (~/pug/hermes-agent)"
+commit = "6d8a8bebf7"
+date = "2026-09-19"
+
+[types]
+"role.user" = { status = "generic", note = "the `_` arm of into_message: user and anything unknown" }
+"role.assistant" = { status = "handled", note = "" }
+"role.system" = { status = "handled", note = "" }
+"role.tool" = { status = "handled", note = "" }
+"end_reason.compression" = { status = "handled", note = "lineage merge" }
+"end_reason.orphaned_compression" = { status = "handled", note = "lineage merge" }
+"display_kind.hidden" = { status = "handled", note = "" }
+"display_kind.steer" = { status = "generic", note = "no harness_display_kind arm: stays a user Prompt, kind kept in extra[hermes]" }
+"display_kind.auto_continue" = { status = "handled", note = "" }
+"display_kind.model_switch" = { status = "handled", note = "" }
+"display_kind.async_delegation_complete" = { status = "handled", note = "" }
+"display_kind.process_complete" = { status = "handled", note = "" }
+"display_kind.internal_notification" = { status = "handled", note = "" }
+"column.active" = { status = "handled", note = "visibility" }
+"column.compacted" = { status = "handled", note = "visibility" }
+"column._compressed_summary" = { status = "handled", note = "compaction summary row" }
+"column.api_content" = { status = "handled", note = "" }
+"column.display_metadata" = { status = "handled", note = "" }
+"column.effect_disposition" = { status = "handled", note = "" }
+"column.display_order" = { status = "ignored", note = "index internal" }
+"column.display_identity" = { status = "ignored", note = "index internal" }
+"table.system_prompts" = { status = "handled", note = "system prompt by hash" }
+"column.system_prompt_hash" = { status = "handled", note = "" }
+"column.cwd" = { status = "handled", note = "" }
+"column.git_branch" = { status = "handled", note = "" }
+"column.git_repo_root" = { status = "handled", note = "" }
+"column.last_activity_at" = { status = "handled", note = "" }
+"column.archived" = { status = "handled", note = "listed, flag in extra" }
+"column.hidden" = { status = "handled", note = "listed, flag in extra" }
+"column.pinned" = { status = "handled", note = "" }
+"column.origin_json" = { status = "handled", note = "imported_from" }
+"column.model_config" = { status = "handled", note = "_branched_from/_reset_from/_delegate_from" }
+"column.title_source" = { status = "handled", note = "" }
+"column.profile_name" = { status = "handled", note = "" }
+"column.transport_profile" = { status = "handled", note = "" }
+"column.display_name" = { status = "handled", note = "" }
+"column.tool_names" = { status = "ignored", note = "" }
+'content.\x00json:' = { status = "generic", note = "multimodal sentinel" }
+"part.input_text" = { status = "handled", note = "" }
+"part.output_text" = { status = "handled", note = "" }
+"part.input_image" = { status = "handled", note = "" }
+"part.image_url" = { status = "handled", note = "" }
+"reasoning.reasoning.summary" = { status = "handled", note = "codex reasoning items" }
+"reasoning.reasoning.encrypted_content" = { status = "handled", note = "" }
+"reasoning.thinking" = { status = "handled", note = "OpenRouter-style reasoning_details item" }
+"part.text" = { status = "handled", note = "" }
+"column.reasoning" = { status = "handled", note = "" }
+"column.reasoning_content" = { status = "handled", note = "" }
+"column.reasoning_details" = { status = "handled", note = "" }
