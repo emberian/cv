@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.11.1 — packaging fix
+
+`clustervision-core` 0.11.0 could not be published to crates.io. `formats.rs` embeds the 22 format
+manifests with `include_str!`, reaching from `crates/cv-core/src/` up to a `formats/` directory at
+the workspace root — and `cargo package` only puts files from *inside* the crate into the tarball,
+so the packaged crate had no manifests and would not compile. The manifests are cv-core's data, and
+`cv formats census` needs them on a machine with no checkout, so they now live in
+`crates/cv-core/formats/`.
+
+Nothing about the binaries changes; v0.11.0's release assets are unaffected. This version exists so
+that the tag, the release binaries and the published crate are all the same source.
+
+Worth recording: nothing caught this for a whole release, and the only reason CI did not discover
+it halfway through a six-crate publish is that `CARGO_REGISTRY_TOKEN` was never set. `cargo package
+-p <crate>` belongs in the pre-tag checklist, since it is the only thing that builds a crate from
+the tarball it would actually ship rather than from the working tree.
+
 ## 0.11.0 — the clean break
 
 This release renames, regroups and restructures on purpose, with **no aliases for old names**

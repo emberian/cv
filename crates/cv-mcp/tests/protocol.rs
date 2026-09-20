@@ -108,11 +108,15 @@ impl Server {
         self.send_raw(&v.to_string());
     }
 
-    /// Next response line as JSON (10s timeout → test failure, not a hang).
+    /// Next response line as JSON. The timeout exists to turn a WEDGE into a failure, not to gate
+    /// on speed: 10s was tight enough that `observe_stream_bounded_read_only_tail` failed at
+    /// exactly 10.018s under a loaded full-suite run while passing in 2.5s on its own, and a
+    /// generated tool now shells out to the `cv` binary, which is not free. A minute still fails a
+    /// genuine hang promptly and stops reporting the machine's load as a bug.
     fn recv(&mut self) -> Value {
         let line = self
             .lines
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(Duration::from_secs(60))
             .expect("timed out waiting for a cv-mcp response");
         serde_json::from_str(&line).unwrap_or_else(|e| panic!("non-JSON response {line:?}: {e}"))
     }
