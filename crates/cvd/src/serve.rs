@@ -224,6 +224,8 @@ fn route(segments: &[String], query: &str) -> (u16, Value) {
 
         ["api", "session", harness, id] => session(harness, id),
 
+        ["api", "session", harness, id, "head"] => session_head(harness, id),
+
         ["api", "session", harness, id, "messages"] => messages(harness, id, query),
 
         ["api", "session", harness, id, "events"] => session_events(harness, id, query),
@@ -459,6 +461,60 @@ fn session(harness: &str, id: &str) -> (u16, Value) {
     }
 }
 
+/// `GET /api/session/<harness>/<id>/head` — everything a session knows about ITSELF, and no
+/// messages: the §3 row plus `model`, `git`, `system_prompt`, `lineage` and the exact message
+/// `total`.
+///
+/// Why this exists rather than folding into the windowed read: a window stops streaming once it
+/// is full, so a session-level fact recorded LATER in the transcript — Claude writes its
+/// `prompt_snapshot` well after the opening turns — is simply not reached, and asking the window
+/// to keep scanning would make every transcript open pay for the whole file. One cheap pass that
+/// keeps no messages answers it instead. The desktop app's `local_session_head` is the same thing
+/// through the other door, so a reader cannot tell them apart.
+fn session_head(harness: &str, id: &str) -> (u16, Value) {
+    let h = match Harness::parse(harness) {
+        Some(h) => h,
+        None => return err(400, &format!("unknown harness {harness:?}")),
+    };
+    let (r, adapter) = match cv_core::find(id, Some(h)) {
+        Ok(Some(found)) => found,
+        Ok(None) => return err(404, "session not found"),
+        Err(e) => return err(500, &e.to_string()),
+    };
+    let mut total = 0usize;
+    let mut counter = |_m: cv_core::Message| {
+        total += 1;
+        cv_core::stream::Flow::Continue
+    };
+    let shell = match adapter.stream(&r, &cv_core::stream::ParseOptions::lazy(), &mut counter) {
+        Ok(shell) => shell,
+        Err(e) => return err(500, &format!("stream failed: {e:#}")),
+    };
+    let mut row = session_meta_json(&shell);
+    if let Some(obj) = row.as_object_mut() {
+        obj.insert("id".into(), json!(r.id));
+        obj.insert("harness".into(), json!(r.harness.as_str()));
+        obj.insert("path".into(), json!(r.path.to_string_lossy()));
+        obj.insert("created_at".into(), json!(r.created_at));
+        obj.insert("updated_at".into(), json!(r.updated_at));
+        obj.insert("message_count".into(), json!(r.message_count));
+        obj.insert(
+            "size_bytes".into(),
+            json!(std::fs::metadata(&r.path).map(|m| m.len()).unwrap_or(0)),
+        );
+        obj.insert("total".into(), json!(total));
+        obj.insert("extra".into(), json!(shell.extra));
+        // `cwd` from the parsed shell can be None where the ref knows it; prefer whichever has it.
+        if obj.get("cwd").is_none_or(Value::is_null) {
+            obj.insert("cwd".into(), json!(r.cwd.as_ref().map(|c| c.to_string_lossy())));
+        }
+        if obj.get("title").is_none_or(Value::is_null) {
+            obj.insert("title".into(), json!(r.title));
+        }
+    }
+    ok(row)
+}
+
 /// Collects the message window `[start, end)` as serialized IR, never holding more than the
 /// window: out-of-window messages pass by as unmaterialized lazy handles, and the stream stops
 /// at `end` (after noting whether a message exists there — the `has_more` probe).
@@ -478,14 +534,27 @@ struct WindowSink {
     fail: Option<String>,
 }
 
+/// The `session` object a windowed read returns. Whatever a session knows about itself has to
+/// arrive here or it never reaches a reader: the windowed path is the one every transcript open
+/// uses, and `system_prompt` and `lineage` were absent from it entirely.
+fn session_meta_json(s: &Session) -> Value {
+    json!({
+        "title": s.title,
+        "model": s.model,
+        "cwd": s.cwd.as_ref().map(|c| c.to_string_lossy()),
+        "system_prompt": s.system_prompt,
+        "lineage": s.lineage,
+        "git": s.git,
+    })
+}
+
 impl MessageSink for WindowSink {
     fn meta(&mut self, s: &Session) {
         if self.meta.is_none() {
-            self.meta = Some(json!({
-                "title": s.title,
-                "model": s.model,
-                "cwd": s.cwd.as_ref().map(|c| c.to_string_lossy()),
-            }));
+            // The windowed read is the path EVERY transcript open uses, so whatever a session
+            // knows about itself has to arrive here or it never reaches a reader at all:
+            // `system_prompt` and `lineage` were absent, which made them unreachable in the UI.
+            self.meta = Some(session_meta_json(s));
         }
     }
 
@@ -592,8 +661,14 @@ fn messages(harness: &str, id: &str, query: &str) -> (u16, Value) {
     };
     if !seeked {
         sink.idx = 0; // full stream counts from the top (skipping pre-window messages cheaply)
-        if let Err(e) = adapter.stream(&r, &opts, &mut sink) {
-            return err(500, &format!("stream failed: {e:#}"));
+        match adapter.stream(&r, &opts, &mut sink) {
+            // Some adapters never call `meta()` — Claude is one — so the sink stays empty and the
+            // response used to say `session: null` for the single most-read harness. `stream`
+            // RETURNS the session shell it assembled, which knows the title, model, cwd,
+            // system prompt and lineage; use it when nothing was pushed.
+            Ok(shell) if sink.meta.is_none() => sink.meta = Some(session_meta_json(&shell)),
+            Ok(_) => {}
+            Err(e) => return err(500, &format!("stream failed: {e:#}")),
         }
     }
     if let Some(f) = sink.fail {
@@ -976,10 +1051,20 @@ fn static_file(root: &Path, segments: &[String]) -> Response<std::io::Cursor<Vec
         p
     };
 
-    // Canonicalize and confine to the root (defeats symlink escapes too). On a miss, serve the SPA
-    // index so deep links resolve client-side.
+    // A deep link is a ROUTE and falls back to the SPA index; a missing ASSET is a 404. Falling
+    // back for an asset hands the browser `index.html` under the asset's name, and for a module
+    // script that surfaces as "Expected a JavaScript-or-Wasm module script but the server
+    // responded with a MIME type of text/html" — which reads like a server misconfiguration
+    // rather than the truth, that the file is not there. (`/pkg/cv_web.js`, the optional wasm
+    // bundle, is not built unless you run wasm-pack.)
+    let is_asset = resolved
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| !e.eq_ignore_ascii_case("html"));
+
     let serve_path = match resolved.canonicalize() {
         Ok(c) if c.starts_with(root) && c.is_file() => c,
+        _ if is_asset => return text_response(404, "text/plain; charset=utf-8", b"not found".to_vec()),
         _ => match index.canonicalize() {
             Ok(c) if c.starts_with(root) && c.is_file() => c,
             _ => return text_response(404, "text/plain; charset=utf-8", b"not found".to_vec()),

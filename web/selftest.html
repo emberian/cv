@@ -45,8 +45,10 @@
   <header class="st-head">
     <h1>Rendering self-test</h1>
     <p>Runs the components in <code>web/components</code> against <code>web/sample.js</code> and checks
-       the invariants an IR change breaks first. Open this file after touching the IR, or serve it with
-       <code>cvd serve --web ./web</code> and visit <code>/selftest.html</code>.</p>
+       the invariants an IR change breaks first. Run it after touching the IR. It needs a static
+       server, because browsers refuse ES modules over <code>file://</code> —
+       <code>cvd serve --web ./web</code> then <code>/selftest.html</code>, or
+       <code>python3 -m http.server</code> in <code>web/</code>.</p>
     <span class="st-score" id="score">running…</span>
   </header>
   <div id="report"></div>
@@ -261,7 +263,9 @@ check("a quiet kind folds shut with a peek that says what is inside", () => {
   const quiet = stage.querySelector(".turn-kind-injected_context.turn-quiet");
   truthy(quiet, "injected context is a quiet turn");
   truthy(!quiet.querySelector("details").open, "it starts folded");
-  has(quiet.querySelector(".turn-peek").textContent, "system reminder", "peek uses the harness attachment name");
+  const peek = quiet.querySelector(".turn-peek").textContent;
+  has(peek, "system reminder", "the peek carries the harness's name for the record");
+  has(peek, "prefer reading the contract", "and what it actually says");
 });
 
 check("a prompt, a notice and an error are told apart", () => {
@@ -355,14 +359,23 @@ check("a structural message with a real body becomes a turn, not a clipped rule"
   has(el.querySelector(".turn").textContent, body.slice(0, 50), "the long body is rendered in full");
 });
 
-check("a message with no content still renders a turn that says so", () => {
+check("a content-less record renders one honest line, named by the harness", () => {
   const sess = normalizeSession({
-    id: "empty-guard", harness: "claude",
-    messages: [{ role: "assistant", kind: "reply", origin: "model", content: [] }],
+    id: "empty-guard", harness: "codex",
+    messages: [
+      { role: "assistant", kind: "reply", origin: "model", content: [],
+        extra: { codex: { codex_event: "token_count" } },
+        usage: { input_tokens: 123456, output_tokens: 0 } },
+      { role: "assistant", kind: "reply", origin: "model", content: [] },
+    ],
   });
   const el = renderTranscript(sess);
-  eq(el.querySelectorAll(".turns > .turn").length, 1, "one turn");
-  has(el.querySelector(".turn").textContent, "(empty)", "it says it is empty");
+  eq(el.querySelectorAll(".turns > .turn.turn-empty").length, 2, "both render as records");
+  has(el.querySelector(".turn-empty").textContent, "token count", "named from extra.codex.codex_event");
+  has(el.querySelector(".turn-empty").textContent, "Reply", "the adapter's kind is NOT reinterpreted");
+  has(el.querySelectorAll(".turn-empty")[1].textContent, "no content", "an unnamed one still says what it is");
+  const chips = [...el.querySelectorAll(".tf-chip")].map((c) => c.textContent.replace(/\s+/g, " ").trim());
+  has(chips.join(" | "), "empty records 2", "they are countable and hideable");
 });
 
 const openStage = renderTranscript(open);

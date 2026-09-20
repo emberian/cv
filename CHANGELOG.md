@@ -128,6 +128,15 @@ in CI looked at them. They are fixed, and CI looks at them now.
 - **The daemon's rows now match everyone else's.** `/api/sessions` was missing `path` and
   `size_bytes`, and `/api/touched` dropped the `agent_id`/`parent_id`/`workflow` trio it had always
   carried, so a consumer could tell which door a row came through. Both are pinned by tests.
+- **`GET /api/session/<harness>/<id>/head`** answers what a session knows about *itself* — the
+  session row plus `model`, `git`, `system_prompt`, `lineage` and the exact message `total` — with
+  no messages. A windowed read structurally cannot: it stops once its window is full, and Claude
+  writes its system prompt well after the opening turns, so opening a transcript at the top could
+  never learn it. The desktop app's `local_session_head` is the same thing through the other door.
+- **A missing static asset is a 404 again.** The dashboard server answered any missing path with
+  the single-page index, so a module the browser could not find came back as HTML under a `.js`
+  name and was rejected with "Expected a JavaScript-or-Wasm module script" — which reads like a
+  server misconfiguration rather than the truth. Routes still fall back; assets do not.
 
 ### Also in this release
 

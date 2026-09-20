@@ -77,6 +77,34 @@ export async function getMessages(stub, start, end, opts = {}) {
   }
 }
 
+/** Everything a session knows about ITSELF, with no messages: the session row plus `model`,
+ *  `git`, `system_prompt`, `lineage` and the exact message `total`.
+ *
+ *  Why this is a separate call and not part of `getMessages`: a windowed read stops streaming
+ *  once its window is full, so a session-level fact recorded LATER in the transcript is never
+ *  reached — Claude writes its system prompt well after the opening turns, so opening a
+ *  transcript at the top could never learn it. One cheap pass that keeps no messages answers it.
+ *
+ *  `null` on an older cvd or app that has no head endpoint; callers just show less. */
+export async function getSessionHead(stub) {
+  if (!stub || !stub.harness || !stub.id) return null;
+  try {
+    let raw;
+    if (canInvokeNative()) {
+      raw = JSON.parse(await invoke("local_session_head", { harness: stub.harness, id: stub.id }));
+    } else {
+      const resp = await fetch(`${CVD_BASE}/api/session/${enc(stub.harness)}/${enc(stub.id)}/head`, {
+        headers: { Accept: "application/json" },
+      });
+      if (!resp.ok) return null;
+      raw = await resp.json();
+    }
+    return raw && typeof raw === "object" ? raw : null;
+  } catch {
+    return null;
+  }
+}
+
 /** The session's extracted tool events (file edits/reads, commands, errors), in transcript
  *  order, optionally filtered by kind. Empty on any error or an older cvd — the events panel
  *  simply doesn't appear. */

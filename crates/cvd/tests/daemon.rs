@@ -278,6 +278,37 @@ fn http(port: u16, method: &str, path: &str) -> (u16, String) {
     (status, body)
 }
 
+/// Like [`http`] but also hands back the `Content-Type`, for the static-asset rules where the
+/// header IS the behaviour under test.
+fn get_raw(port: u16, path: &str) -> (u16, String, String) {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to cvd serve");
+    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).expect("read response");
+    let text = String::from_utf8_lossy(&raw);
+    let status: u16 = text
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("bad status line in: {text}"));
+    let ct = text
+        .lines()
+        .take_while(|l| !l.trim().is_empty())
+        .find(|l| l.to_ascii_lowercase().starts_with("content-type:"))
+        .map(|l| l[l.find(':').unwrap() + 1..].trim().to_string())
+        .unwrap_or_default();
+    let body = text
+        .split_once("\r\n\r\n")
+        .map(|(_, b)| b.to_string())
+        .unwrap_or_default();
+    (status, ct, body)
+}
+
 fn get_json(port: u16, path: &str) -> (u16, Value) {
     let (status, body) = http(port, "GET", path);
     let v = serde_json::from_str(&body).unwrap_or_else(|e| panic!("GET {path}: non-JSON body {body:?}: {e}"));
@@ -693,6 +724,70 @@ fn serve_workflow_script() {
 
 /// The `/compactions` scan: every boundary with its metadata, plus `extra=1` on `/messages`
 /// surfacing the boundary's `compactMetadata` in-band.
+/// `/head` answers what a session knows about ITSELF, which a windowed read structurally cannot:
+/// the window stops once it is full, so a session-level fact recorded later in the transcript is
+/// never reached. It also pins the §3 row keys, so this door and `cv ls --json` agree.
+#[test]
+fn serve_session_head() {
+    let w = World::new("head");
+    w.write_fixtures();
+    let (port, _reaper) = spawn_serve(&w);
+
+    let (status, v) = get_json(port, "/api/session/claude/alphasess/head");
+    assert_eq!(status, 200, "{v}");
+    for k in [
+        "id",
+        "harness",
+        "path",
+        "cwd",
+        "title",
+        "created_at",
+        "updated_at",
+        "message_count",
+        "size_bytes",
+        "model",
+        "git",
+        "system_prompt",
+        "lineage",
+        "total",
+    ] {
+        assert!(v.as_object().unwrap().contains_key(k), "head must carry {k}: {v}");
+    }
+    assert_eq!(v["id"], "alphasess", "{v}");
+    // `total` is the exact streamed message count — the index space `/messages` windows — and is
+    // not the discovery-time `message_count`, which counts records on disk.
+    assert!(v["total"].as_u64().is_some(), "{v}");
+
+    let (status, _) = get_json(port, "/api/session/claude/zzz-nope/head");
+    assert_eq!(status, 404);
+}
+
+/// A deep link is a ROUTE and falls back to the SPA index; a missing ASSET is a 404. Serving
+/// `index.html` under an asset's name made the browser reject it with "Expected a
+/// JavaScript-or-Wasm module script but the server responded with a MIME type of text/html",
+/// which reads like a server misconfiguration rather than a missing file.
+#[test]
+fn serve_static_missing_asset_is_404_not_the_index() {
+    let w = World::new("static");
+    w.write_fixtures();
+    let webroot = w.write_web_root();
+    let (port, _reaper) = spawn_serve_with(&w, &["--web", webroot.to_str().unwrap()]);
+
+    let (status, ct, _) = get_raw(port, "/pkg/cv_web.js");
+    assert_eq!(status, 404, "a missing module is a 404, not the index");
+    assert!(!ct.contains("html"), "and not served as html: {ct}");
+
+    let (status, ct, _) = get_raw(port, "/components/cv-forest.js");
+    assert_eq!(status, 200);
+    assert!(ct.contains("javascript"), "{ct}");
+
+    // A route (no file extension) still resolves to the SPA index so deep links work.
+    let (status, ct, body) = get_raw(port, "/session/claude/alphasess");
+    assert_eq!(status, 200);
+    assert!(ct.contains("html"), "{ct}");
+    assert!(body.contains("<!doctype html>"), "{body}");
+}
+
 #[test]
 fn serve_compactions() {
     let w = World::new("compact");

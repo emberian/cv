@@ -406,6 +406,18 @@ cv-app {
   flex: 1 1 200px; min-width: 0;
 }
 .turn-quiet > details[open] .turn-peek { display: none; }
+/* The harness's own name for the record, ahead of what it says. */
+.turn-rec {
+  font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em;
+  border: 1px solid var(--border); border-radius: 4px; padding: 0 5px; margin-right: 7px;
+  color: var(--fg-muted); background: var(--bg-sunk); white-space: nowrap;
+}
+
+/* A message with no content is a record the harness kept, not a turn. One dim line. */
+.turn-empty { border-left-color: color-mix(in srgb, var(--fg-muted) 25%, transparent); }
+.turn-empty .turn-head { margin-bottom: 0; }
+.turn-empty .turn-role { color: var(--fg-muted); font-weight: 600; }
+.turn-empty .turn-glyph { opacity: 0.5; }
 
 /* ---- Structural markers: a rule across the column, not a turn ----
    A compaction, a model change, a branch, a sub-agent handoff: these are punctuation between
@@ -451,6 +463,7 @@ cv-app {
 .tf-chip.off .tf-dot { background: var(--border-strong); }
 
 .turns.hide-injected .turn-kind-injected_context { display: none; }
+.turns.hide-records .turn-empty { display: none; }
 .turns.hide-thinking .block.thinking { display: none; }
 .turns.hide-tools .block.tool-use,
 .turns.hide-tools .block.tool-result,

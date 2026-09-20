@@ -305,11 +305,17 @@ than dropped.
 
 ### Self-test
 
-`selftest.html` (open it directly, or visit `/selftest.html` under
-`cvd serve --web ./web`) runs the components against `sample.js` and asserts
+`selftest.html` runs the components against `sample.js` and asserts
 these invariants — every message renders exactly one node, every block type is
 recognised, `extra` is read through the harness namespace, the OpenSession export
-round-trips. No build step, no dependencies. Run it after any IR change.
+round-trips. No build step, no dependencies; it does need a static server, because
+browsers refuse ES modules over `file://`:
+
+    cvd serve --web ./web      # then open /selftest.html
+    # or, from web/:
+    python3 -m http.server     # then open /selftest.html
+
+Run it after any IR change.
 
 ## Export & the loom
 

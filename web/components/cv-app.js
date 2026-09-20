@@ -23,7 +23,7 @@ import "./cv-fleet.js";
 import "./cv-opensession.js";
 import { esc, normalizeSession, normalizeSessions, randomId } from "./util.js";
 import { isTauri, listen, invoke, canInvokeNative } from "../tauri.js";
-import { getMessages, PAGE, CVD_BASE } from "./hydrate.js";
+import { getMessages, getSessionHead, PAGE, CVD_BASE } from "./hydrate.js";
 
 // A running `cvd serve` (always the case inside the desktop app) exposes the machine's real local
 // sessions. The main viewer prefers these over the bundled sample; `CVD_BASE` (from hydrate.js)
@@ -142,9 +142,16 @@ class CvApp extends HTMLElement {
    *  "load more" pages in the rest (`_loadMoreMessages`). Falls back to the classic whole-session
    *  fetch when the windowed path isn't available (older cvd). Returns the hydrated session. */
   async _hydrate(stub) {
-    const win = await getMessages(stub, 0, PAGE);
+    // Both at once: the first window, and the session-level facts a window can never learn. A
+    // windowed read stops when its window is full, so anything the transcript records LATER —
+    // Claude writes its system prompt well after the opening turns — is simply not reached.
+    const [win, head] = await Promise.all([getMessages(stub, 0, PAGE), getSessionHead(stub)]);
     if (win) {
-      const meta = win.session || {};
+      // Drop nulls from EACH source before merging, not after: a windowed read reports
+      // `system_prompt: null` (it stops before the record that carries it), and merging that null
+      // over the head's real value destroyed it — the filter below then removed the key entirely.
+      const present = (o) => Object.fromEntries(Object.entries(o || {}).filter(([, v]) => v != null));
+      const meta = { ...present(head), ...present(win.session) };
       // The stream's parsed metadata (when delivered) beats the discovery-time stub's. Spread the
       // whole meta rather than three named fields: cvd decides what a session-level fact is, and a
       // fact it starts sending (`system_prompt`, `lineage`) should reach the UI without a change
@@ -157,6 +164,7 @@ class CvApp extends HTMLElement {
       });
       full._stub = false;
       if (win.total_known) full.message_count = win.total;
+      else if (head && Number.isFinite(head.total)) full.message_count = head.total;
       if (win.has_more) full._paged = { next: win.end };
       const i = this._sessions.findIndex((x) => x.id === stub.id && x.harness === stub.harness);
       if (i >= 0) this._sessions[i] = full;

@@ -29,6 +29,7 @@ const HIDE_LS = "cv-transcript-hide";
  *  takes the same color the thing has in the transcript, so the strip reads as a legend. */
 const FILTERS = [
   ["injected", "injected context", "var(--fg-muted)"],
+  ["records", "empty records", "var(--border-strong)"],
   ["thinking", "thinking", "var(--accent)"],
   ["tools", "tool calls", "var(--warn)"],
 ];
@@ -437,9 +438,10 @@ class CvTranscript extends HTMLElement {
   /** How many of each filterable thing the loaded window holds — a filter for something that is
    *  not there is a lie about the session, so an absent count hides the chip. */
   _kindCounts() {
-    const out = { injected: 0, thinking: 0, tools: 0 };
+    const out = { injected: 0, records: 0, thinking: 0, tools: 0 };
     for (const m of this._session?.messages || []) {
       if (m.kind === "injected_context") out.injected++;
+      if (!(m.content || []).length) out.records++;
       for (const b of m.content || []) {
         if (b.type === "thinking") out.thinking++;
         else if (b.type === "tool_use" || b.type === "tool_result") out.tools++;
@@ -579,12 +581,24 @@ class CvTranscript extends HTMLElement {
         ${when ? `<span class="turn-when muted">${esc(when)}</span>` : ""}
         ${usage}`;
 
+    if (!(m.content || []).length) {
+      // No content at all. This is a record the harness kept, not something anyone said — 20% of a
+      // real Codex session is contentless `reply` rows carrying nothing but `token_count`
+      // bookkeeping. Say what it is on one line; do not reclassify it, the adapter owns the kind.
+      const named = this._recordName(m);
+      return `
+      <article class="${cls} turn-empty" data-kind="${esc(kind)}">
+        <div class="turn-head">${head}
+          <span class="turn-peek muted">${esc(named || "no content")}</span>${pick}</div>
+      </article>`;
+    }
+
     if (CvTranscript.QUIET_KINDS.has(kind)) {
       // One line until you want it. On a Claude session this is ~40% of all turns.
       return `
       <article class="${cls} turn-quiet" data-kind="${esc(kind)}">
         <details>
-          <summary class="turn-head">${head}<span class="turn-peek muted">${esc(this._peek(m))}</span>${pick}</summary>
+          <summary class="turn-head">${head}<span class="turn-peek muted">${this._peekHtml(m)}</span>${pick}</summary>
           <div class="turn-body">${blocks}</div>
         </details>
       </article>`;
@@ -630,20 +644,34 @@ class CvTranscript extends HTMLElement {
       </div>`;
   }
 
-  /** A one-line peek at a folded turn, so the fold still says what is inside it. For Claude's
-   *  injected context the harness names the attachment; that name beats the first 80 characters
-   *  of `<system-reminder>` boilerplate every time. */
-  _peek(m) {
+  /** What the harness itself called this record, when it recorded a name for it —
+   *  Claude's `attachment_type`, Codex's `codex_event`, a carrier's `record_type`. Reached
+   *  through the harness namespace, never a flat key. */
+  _recordName(m) {
     const e = harnessExtra(m, this._session?.harness) || {};
-    const named = e.attachment_type || e.attachmentType || e.record_type || e.display_kind;
-    if (named) return String(named).replace(/_/g, " ");
+    const named = e.attachment_type || e.attachmentType || e.record_type || e.display_kind || e.codex_event;
+    return named ? String(named).replace(/_/g, " ") : "";
+  }
+
+  /** A one-line peek at a folded turn, so the fold still says what is inside it: the harness's own
+   *  name for the record (Claude `attachment_type`, Codex `codex_event`) as a tag, then the first
+   *  line of what it actually says. Either alone is worse — the name alone loses a Codex notice's
+   *  text, the text alone loses that a Claude reminder is a `total_tokens_reminder`. */
+  _peekHtml(m) {
+    const named = this._recordName(m);
+    let text = "";
     for (const b of m.content || []) {
       if (b.type === "text" && b.text?.trim()) {
-        return truncateLine(b.text.replace(/<\/?system-reminder>/g, "").trim(), 110);
+        text = b.text.replace(/<\/?system-reminder>/g, "").trim();
+        break;
       }
-      if (b.type === "tool_result") return truncateLine(String(b.content ?? ""), 110);
+      if (b.type === "tool_result") { text = String(b.content ?? ""); break; }
     }
-    return "";
+    // The name is usually the same words the text opens with; don't print it twice.
+    const dupe = named && text && truncateLine(text, 60).toLowerCase().includes(named.toLowerCase());
+    const tag = named && !dupe ? `<span class="turn-rec">${esc(named)}</span>` : "";
+    const body = text ? esc(truncateLine(text, 110)) : (named && !tag ? esc(named) : "");
+    return `${tag}${body}`;
   }
 
   /** The origin chip, shown only when the origin is NOT the obvious one for the kind — a reply is
