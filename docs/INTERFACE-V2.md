@@ -321,6 +321,47 @@ shapes cannot drift. Mechanism (no shared crate; the clap tree lives in the `cv`
 - **Manual** (`manual/src/*.md`), `README.md`, `docs/FORMATS.md`, `CHANGELOG.md` (0.11.0 section
   headed "clean break").
 
+## 8b. Where this is going (the attractor)
+
+*Named 2026-09-20, in a parsimony pass over everything 0.11.0 added. Not a plan; a direction, so a
+future session mid-work makes a different choice knowing it.*
+
+cv keeps discovering the same idea and giving it a new name each time: **two representations of the
+same thing disagree, and something must judge whether that is expected.** It is now implemented
+seven times, in four different shapes and three shapeless ones:
+
+| the pair | the mechanism | the shape it reports in |
+|---|---|---|
+| manifest ↔ adapter source | `cv formats check` | `formats::Finding { harness, kind, item, detail }` |
+| manifest ↔ real on-disk data | `cv formats census` | its own `RecordStat` |
+| source IR ↔ emitted output | `emit_verified` | `emit::Delta { field, before, after, expected }` |
+| CLI JSON ↔ daemon JSON | `cvd tests/parity.rs` | ad-hoc `missing`/`extra` vectors |
+| render ↔ IR | `web/selftest.html` | `{ group, name, why }` |
+| `extra` bags ↔ the namespacing rule | `assert_no_flat_keys` | a panic |
+| manifest ↔ upstream checkout | `tools/harness-drift.sh` | printed lines |
+
+Each checks a genuinely different pair, so none of them is redundant — this is not a call to delete
+one. The cost is that **adding a surface means writing an eighth bespoke checker**, and that the
+seven cannot be read, filtered or rendered together even though they answer the same question.
+
+**The end-state:** one `Divergence { what, a, b, expected, where }` and one renderer, so
+`--strict`, `formats check`, the parity test and the dashboard all speak the same words, and adding
+a surface means *declaring a pair* rather than writing a checker. `Finding` and `Delta` are already
+that type with two different spellings; unifying them is the down-payment and the rest can adopt it
+incrementally.
+
+Two further steps toward it, both real debt found in the same pass:
+
+- **This document has no mechanical check, and was factually wrong twice on the day it was
+  written** (it claimed `events.rs` reads `toolUseResult` from the harness bag after that moved to
+  the block, and listed Codex among the harnesses recording a cost, which it does not). Either §3's
+  key lists get asserted against `cv schema --json`, or the prose shrinks to only what cannot be
+  checked. A contract nothing verifies decays into folklore.
+- **359 of the 545 manifest type entries are `handled`**, which is exactly what the checker already
+  derives by reading the adapter's match arms. The manifests should carry what the source cannot
+  say — the `[upstream]` pin, and the `generic`/`carried`/`ignored` judgments — and let `handled`
+  be inferred. That is roughly 60% of `formats/`'s hand-maintained surface.
+
 ## 9. Work packages and file ownership
 
 | WP | owner | files | depends on |
