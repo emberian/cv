@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.11.0 (unreleased) — the clean break
+## 0.11.0 — the clean break
 
 This release renames, regroups and restructures on purpose, with **no aliases for old names**
 (an old command or flag errors with a pointer to the new one). The contract is

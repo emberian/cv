@@ -6,7 +6,11 @@
 # the release `plan` step fail before anything was built, so EVERY tag since it was added produced
 # no binaries and no crates.io upload. dist calls this job by name from the generated release.yml.
 #
-# Needs a `CARGO_REGISTRY_TOKEN` repository secret with publish rights on all six crates.
+# Needs a `CARGO_REGISTRY_TOKEN` repository secret with publish rights on all six crates. It was
+# NOT set for v0.11.0: the binaries published fine (84 assets, seven targets) and this job stopped
+# with the message below, so crates.io sat at the previous version. Set it with
+# `gh secret set CARGO_REGISTRY_TOKEN`, then either re-run this job on the release workflow or
+# publish by hand in the order below.
 name: Publish to crates.io
 
 on:
