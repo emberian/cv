@@ -376,6 +376,7 @@ cv lanes 0c315aee                 # launch order, one row + one detail line per 
 cv lanes 0c315aee --running       # no stop recorded: still at it (shows the last tool call)
 cv lanes 0c315aee --done          # finished for real
 cv lanes 0c315aee --stranded      # the strand class, each with `→ resume: SendMessage to <agentId>`
+cv lanes 0c315aee --tasks         # each lane joined to the tasks its endpoint holds, with the last note
 cv lanes 0c315aee --json          # [{agent_id, model, tokens: {total, …}, status, status_source, last_text, stranded, …}]
 ```
 
@@ -390,6 +391,22 @@ a1e1ce3d  running    opus-4-1       10-01 00:11  2h01m    2.1M    88  K-SPK: ker
 **Status** comes from the most authoritative source available, and the JSON says which (`status_source`): a `Workflow` run's journal (`done` / `partial` / …), else the parent transcript's last `<task-notification>` for the agent (`completed` / `failed` / `killed` / `stopped` — read from the `queue-operation` records the harness writes the moment a child stops, so it does not depend on the notification ever reaching the conversation), else the child's own `SubagentStop` hook (`stopped`), else `running`.
 
 **Stranded** is the class that parked four lanes in one day: the harness reports the lane *completed*, and its final text says it is waiting — `Waiting on notifications`, `I'll continue when the monitor fires`, `waiting for the … verdict`. Nothing will wake it. `--stranded` lists exactly those, with the resume hint; a stranded lane never counts as done (`--done` and the header's `completed` exclude it). The phrase set is `cv_core::lanes::STRAND_PATTERNS`; only the last two sentences of the text are consulted, so a report that mentions waiting and then concludes is not stranded.
+
+**`--tasks`** joins the lane table to the task store. A lane's endpoint is the first
+`CV_ENDPOINT=<kind>:<name>` its own tool calls exported (exact — `endpoint_source: transcript`, and
+reported in `--json` even without `--tasks`); failing that, its description's leading token
+(`FIX-KICK: a kick ends…` → `lane:fix-kick`) matched case-insensitively against the store's
+assignees (`description`, a guess by name, labelled `(by description)`). Under each lane: the
+endpoint and up to five tasks it holds — short id, state, title, the last note's first line. The
+serve page's Lanes pane shows the newest one in a `task` column (the last note on hover, all of
+them in the expanded row).
+
+```text
+a06df2ba  running    opus-5-5       10-01 20:26   3h34m   68.9M   223  FIX-KICK: a kick ends authority in the room
+          ↪ Bash · ssh persvati 'for i in $(seq 1 58); do grep -qE "^STEP J17 (PASS|FAIL)" /home/e…
+          ⚑ lane:fix-kick: 4 task(s)
+            01a0f9e2-5fde [claimed] AUDIT: sealing a room cell ends kick, invite and re-law whi…
+```
 
 ### `cv deferrals`
 

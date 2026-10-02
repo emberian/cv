@@ -31,6 +31,7 @@
   .bar h1 input { font: inherit; font-weight: 600; width: 9ch; background: transparent; color: var(--fg);
     border: 0; border-bottom: 1px dashed var(--line); padding: 0 2px; }
   .counter { color: var(--muted); font-size: 12.5px; }
+  td.muted { color: var(--muted); }
   .tabs { display: flex; gap: 4px; margin-top: 6px; flex-wrap: wrap; align-items: center; }
   .tabs button { font: inherit; font-size: 13px; padding: 4px 10px; border-radius: 999px;
     border: 1px solid var(--line); background: var(--card); color: var(--fg); cursor: pointer; }
@@ -400,6 +401,15 @@
   }
 
   // ---------- lanes ----------
+  // The lane's task (its endpoint's newest), with the last note as the hover text.
+  function laneTaskCell(l) {
+    const ts = l.tasks || [];
+    if (!ts.length) return el('td', { class: 'muted', text: l.endpoint ? '—' : '', title: l.endpoint || 'no CV_ENDPOINT seen' });
+    const t = ts[0];
+    return el('td', { title: (l.endpoint || '') + ' · ' + t.title + (t.last_note ? '\nlast note: ' + t.last_note : '') + (ts.length > 1 ? '\n+' + (ts.length - 1) + ' more' : '') },
+      [el('code', { text: t.id.slice(0, 13) }), ' ' + t.state + (ts.length > 1 ? ' +' + (ts.length - 1) : '')]);
+  }
+
   function renderLanes(main, lanes) {
     const top = el('div', { class: 'chips' }, [
       el('span', { class: 'counter', text: 'session ' }),
@@ -410,7 +420,7 @@
     if (!S.lanesSession) { main.appendChild(el('div', { class: 'empty', text: 'name the orchestrator session (its id prefix) to see its lanes' })); return; }
     if (!S.lanes) { main.appendChild(el('div', { class: 'empty', text: 'loading lanes…' })); return; }
     if (S.lanes.error) { main.appendChild(el('div', { class: 'err', text: S.lanes.error })); return; }
-    const tbl = el('table', { class: 'lanes' }, [el('thead', {}, [el('tr', {}, ['', 'lane', 'description', 'model', 'start', 'dur', 'last', 'tokens', 'calls', 'where'].map((h) => el('th', { text: h })))])]);
+    const tbl = el('table', { class: 'lanes' }, [el('thead', {}, [el('tr', {}, ['', 'lane', 'description', 'task', 'model', 'start', 'dur', 'last', 'tokens', 'calls', 'where'].map((h) => el('th', { text: h })))])]);
     const tb = el('tbody');
     const now = Date.now();
     lanes.forEach((l, k) => {
@@ -423,6 +433,7 @@
         el('td', { class: 'nowrap', title: l.status + (l.stranded ? ' · STRANDED' : '') + (quiet ? ' · quiet ' + Math.round(quietMin) + 'm' : '') }, [el('span', { class: 'dot ' + cls }), quiet ? 'quiet ' + Math.round(quietMin / 60 * 10) / 10 + 'h' : l.stranded ? 'stranded' : l.status]),
         el('td', { class: 'nowrap' }, [el('code', { text: l.agent_id.slice(0, 8), title: 'copy ' + l.agent_id, onclick: (ev) => { ev.stopPropagation(); copy(l.agent_id, 'agent id'); } })]),
         el('td', { text: l.description || l.agent_type || '' }),
+        laneTaskCell(l),
         el('td', { class: 'nowrap', text: (l.model || '').replace('claude-', '').replace(/-\d{8}$/, '') }),
         el('td', { class: 'nowrap', text: l.started_at ? fmtTs(l.started_at) : '' }),
         el('td', { class: 'num', text: dur(l.duration_ms) }),
@@ -433,7 +444,9 @@
       ]);
       tb.appendChild(tr);
       if (S.expanded['l:' + l.agent_id]) {
-        tb.appendChild(el('tr', {}, [el('td', { colspan: '10' }, [el('div', { class: 'expand', text: (l.last_text || '(no text yet)') + (l.last_tool ? '\n\n↪ ' + l.last_tool : '') })])]));
+        const tasks = (l.tasks || []).map((t) => t.id.slice(0, 13) + ' [' + t.state + '] ' + t.title + (t.last_note ? '\n    last note: ' + t.last_note : '')).join('\n');
+        const head = l.endpoint ? l.endpoint + (l.endpoint_source === 'description' ? ' (by description)' : '') + (tasks ? '\n' + tasks : ' — holds no tasks') + '\n\n' : '';
+        tb.appendChild(el('tr', {}, [el('td', { colspan: '11' }, [el('div', { class: 'expand', text: head + (l.last_text || '(no text yet)') + (l.last_tool ? '\n\n↪ ' + l.last_tool : '') })])]));
       }
     });
     tbl.appendChild(tb);

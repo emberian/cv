@@ -382,6 +382,10 @@ enum Cmd {
         /// Only lanes active in this window: started or last turned within `2h`, `30m`, `1d`, …
         #[arg(long, value_name = "DUR")]
         since: Option<String>,
+        /// Join each lane to the task store: the tasks its endpoint (`CV_ENDPOINT=lane:…` from its
+        /// own tool calls, else its description's leading token) holds, with the last note.
+        #[arg(long)]
+        tasks: bool,
         /// Emit the lanes as one JSON array (snake_case; `cv schema` has the shape).
         #[arg(long)]
         json: bool,
@@ -1310,6 +1314,7 @@ fn run() -> Result<()> {
             done,
             stranded,
             since,
+            tasks,
             json,
         } => {
             let filter = if running {
@@ -1321,7 +1326,7 @@ fn run() -> Result<()> {
             } else {
                 orchestrate::LaneFilter::All
             };
-            orchestrate::cmd_lanes(&id, harness, filter, since, json)
+            orchestrate::cmd_lanes(&id, harness, filter, since, tasks, json)
         }
         Cmd::Deferrals {
             id,

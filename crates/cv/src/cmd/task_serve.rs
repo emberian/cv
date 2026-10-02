@@ -22,8 +22,9 @@
 //! - `POST /api/task/<id>/reopen`         a closed task comes back as a NEW task (the record stays)
 //! - `GET /api/events?since=&kind=&by=&not_by=&assignee=&task=`  JSON lines — the same query as
 //!   `cv task events`, so a poller and the page see one feed.
-//! - `GET /api/lanes?session=<id>`        the sub-agent forest of a session (`cv lanes`), running
-//!   first — the orchestrator's live lane table beside the inbox.
+//! - `GET /api/lanes?session=<id>`        the sub-agent forest of a session (`cv lanes --tasks`),
+//!   running first, each lane with the `tasks` its endpoint holds — the orchestrator's live lane
+//!   table beside the inbox.
 //! - `GET /api/backlog?repo=&state=&tag=&all=1` every open task (`cv task list` with no window);
 //!   `all=1` includes terminal ones.
 //!
@@ -343,6 +344,10 @@ fn api_lanes(q: &Query) -> (u16, Value) {
         Err(e) => return (404, json!({"error": e.to_string()})),
     };
     let mut lanes = cv_core::lanes::lanes_of(&r);
+    // Each lane joined to the tasks its endpoint holds (the page shows the task + last note).
+    if let Ok(outcome) = task::replay() {
+        cv_core::lanes::attach_tasks(&mut lanes, &outcome.model);
+    }
     lanes.sort_by(|a, b| {
         b.is_running()
             .cmp(&a.is_running())

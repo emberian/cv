@@ -108,6 +108,98 @@ pub struct Lane {
     pub last_tool: Option<String>,
     /// Parked on a promise nothing will keep: stopped, and its last text says it is waiting.
     pub stranded: bool,
+    /// The task-store endpoint this lane acts as (`lane:<name>`): the first `CV_ENDPOINT=…` its
+    /// own tool calls exported, else (after [`attach_tasks`]) a `lane:<slug>` assignee matching
+    /// the description's leading token.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    /// Where `endpoint` came from: `transcript` (exact) or `description` (a guess by name).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint_source: Option<EndpointSource>,
+    /// The tasks the endpoint holds (assignee), newest activity first — present only when joined
+    /// ([`attach_tasks`]; `cv lanes --tasks`, the serve page's Lanes pane).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tasks: Option<Vec<LaneTask>>,
+}
+
+/// How a lane's task-store endpoint was found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EndpointSource {
+    /// The lane's own tool call exported `CV_ENDPOINT=…` (first occurrence) — exact.
+    Transcript,
+    /// No export seen; the description's leading token matched a `lane:<slug>` assignee.
+    Description,
+}
+
+/// One task a lane's endpoint holds, as the lane table shows it.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct LaneTask {
+    pub id: String,
+    pub title: String,
+    pub state: String,
+    /// The first line of the task's last note, when it has one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_note: Option<String>,
+    pub last_ts: DateTime<Utc>,
+}
+
+/// The first `CV_ENDPOINT=<value>` in a tool call's input (`export CV_ENDPOINT=lane:x; …`,
+/// `CV_ENDPOINT="lane:x" cv task …`).
+pub fn endpoint_in(text: &str) -> Option<String> {
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(r#"CV_ENDPOINT=["']?([A-Za-z0-9_.@/-]+:[A-Za-z0-9_.@/:-]+)"#).expect("endpoint regex"));
+    re.captures(text).map(|c| c[1].to_string())
+}
+
+/// The description's leading token as a lane slug: `FIX-KICK: a kick ends authority…` →
+/// `fix-kick`. `None` for a description with no plausible token.
+pub fn description_slug(description: &str) -> Option<String> {
+    let token: String = description
+        .trim()
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '-' || *c == '_' || *c == '.')
+        .collect();
+    (token.len() >= 2).then(|| token.to_lowercase())
+}
+
+/// Join each lane to the task store: resolve its endpoint (the transcript's export, else a
+/// `lane:<slug>` assignee matching the description's leading token, case-insensitively) and list
+/// the tasks that endpoint holds, newest activity first.
+pub fn attach_tasks(lanes: &mut [Lane], model: &crate::task::TaskReadModel) {
+    let assignees: std::collections::BTreeSet<&str> =
+        model.tasks.values().filter_map(|t| t.assignee.as_deref()).collect();
+    for lane in lanes.iter_mut() {
+        if lane.endpoint.is_none() {
+            if let Some(slug) = lane.description.as_deref().and_then(description_slug) {
+                let want = format!("lane:{slug}");
+                if let Some(hit) = assignees.iter().find(|a| a.to_lowercase() == want) {
+                    lane.endpoint = Some(hit.to_string());
+                    lane.endpoint_source = Some(EndpointSource::Description);
+                }
+            }
+        }
+        let Some(endpoint) = lane.endpoint.as_deref() else {
+            lane.tasks = Some(Vec::new());
+            continue;
+        };
+        let mut rows: Vec<LaneTask> = model
+            .tasks
+            .values()
+            .filter(|t| t.assignee.as_deref().is_some_and(|a| crate::task::same_actor(a, endpoint)))
+            .map(|t| LaneTask {
+                id: t.task_id.clone(),
+                title: t.title.clone(),
+                state: crate::task::effective_display(t),
+                last_note: t.notes.last().map(|n| {
+                    n.text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("").to_string()
+                }),
+                last_ts: t.last_ts,
+            })
+            .collect();
+        rows.sort_by(|a, b| b.last_ts.cmp(&a.last_ts));
+        lane.tasks = Some(rows);
+    }
 }
 
 impl Lane {
@@ -219,6 +311,8 @@ struct Pass {
     /// The transcript's last conversational turn is an assistant text with no tool call: the
     /// shape of a final report (a running lane ends in a tool call or a tool result).
     ends_in_report: bool,
+    /// The first `CV_ENDPOINT=…` a tool call of this lane exported.
+    endpoint: Option<String>,
 }
 
 fn pass(r: &SessionRef) -> Option<Pass> {
@@ -265,6 +359,12 @@ fn pass(r: &SessionRef) -> Option<Pass> {
                     if let Block::ToolUse { name, input, .. } = b {
                         p.tool_calls += 1;
                         p.last_tool = Some(tool_summary(name, input));
+                        if p.endpoint.is_none() {
+                            p.endpoint = match input.get("command").and_then(Value::as_str) {
+                                Some(cmd) => endpoint_in(cmd),
+                                None => endpoint_in(&input.to_string()),
+                            };
+                        }
                     }
                 }
             }
@@ -358,6 +458,9 @@ fn lane_of(sub: SubagentInfo, notices: &HashMap<String, TaskNotice>) -> Option<L
         last_text,
         last_tool: p.last_tool,
         stranded,
+        endpoint_source: p.endpoint.as_ref().map(|_| EndpointSource::Transcript),
+        endpoint: p.endpoint,
+        tasks: None,
     })
 }
 
@@ -401,6 +504,27 @@ mod tests {
         long.push_str(&"The lane then did a great deal of work. ".repeat(40));
         long.push_str("Done; branch pushed.");
         assert!(!text_is_waiting(&long));
+    }
+
+    #[test]
+    fn endpoint_and_slug_are_read_from_the_shapes_lanes_write() {
+        assert_eq!(
+            endpoint_in("export CV_ENDPOINT=lane:cv-edits; cv task list --repo /x").as_deref(),
+            Some("lane:cv-edits")
+        );
+        assert_eq!(
+            endpoint_in(r#"CV_ENDPOINT="lane:fix-kick" cv task claim 01a0"#).as_deref(),
+            Some("lane:fix-kick")
+        );
+        assert_eq!(endpoint_in("cv task inbox ember"), None);
+        // A format string or a shell variable is not an endpoint: keep looking.
+        assert_eq!(
+            endpoint_in("export CV_ENDPOINT={owner}; CV_ENDPOINT=$X; CV_ENDPOINT=lane:real").as_deref(),
+            Some("lane:real")
+        );
+        assert_eq!(description_slug("FIX-KICK: a kick ends authority").as_deref(), Some("fix-kick"));
+        assert_eq!(description_slug("CV-EDITS").as_deref(), Some("cv-edits"));
+        assert_eq!(description_slug(": nothing"), None);
     }
 
     #[test]

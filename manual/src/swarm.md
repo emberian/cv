@@ -103,9 +103,12 @@ Ranked by how often the gap bit:
    upgraded to a `decide` with a required default.~~ **Landed:** `open --tags decision` and `tag <id>
    decision` on an unposed task refuse, naming `cv task decide … --default …`; old tag-only decisions
    still show (not migrated).
-4. **Lanes joined to tasks.** `cv lanes --tasks`: the lane table knows the agent and its description;
+4. ~~**Lanes joined to tasks.** `cv lanes --tasks`: the lane table knows the agent and its description;
    the store knows which `lane:<name>` endpoint claimed which task. Join them, and the page's Lanes
-   pane shows each lane's task and last note.
+   pane shows each lane's task and last note.~~ **Landed:** the endpoint is read from the lane's own
+   `CV_ENDPOINT=` export (else its description's leading token); `--tasks` lists what it holds with
+   the last note; `/api/lanes` carries `tasks` and the page has a task column. On this session, 113
+   of 295 lanes join (the rest predate the `lane:` convention).
 5. **A pinned STATUS note.** `cv task status ID --file F` replaces a task's current-state note (shown at
    the top of `show`), so a relay's hand-off is a field, not the newest of a hundred notes.
 6. **Failure cause from the transcript.** A lane that died of an API rate limit, a context-length

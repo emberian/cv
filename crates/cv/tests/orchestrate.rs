@@ -194,7 +194,7 @@ fn build_world(tag: &str) -> World {
                 "x1",
                 "2026-10-01T10:00:20Z",
                 "Bash",
-                serde_json::json!({"command": "cargo build"}),
+                serde_json::json!({"command": "export CV_ENDPOINT=lane:lane-a; cargo build"}),
             ),
             tool_result("x2", "2026-10-01T10:01:00Z", "toolu_x1", "ok"),
             assistant(
@@ -470,4 +470,50 @@ fn deferrals_find_the_phrases_and_open_tasks_gates_on_unmatched() {
         rows[0]["context"].as_str().unwrap().chars().count() <= 100 + "queued".len() + 2,
         "{json}"
     );
+}
+
+/// `cv lanes --tasks` joins each lane to the task store: lane A by the `CV_ENDPOINT` its own tool
+/// call exported (exact), lane B by its description's leading token (`LANE-B:` → `lane:lane-b`),
+/// lane C holds nothing. Each task shows its short id, state, title and last note's first line;
+/// `--json` carries `endpoint`, `endpoint_source` and `tasks`.
+#[test]
+fn lanes_tasks_join_by_exported_endpoint_then_description() {
+    let w = build_world("lanes-tasks");
+    let open = |title: &str, who: &str| -> String {
+        let (out, _) = w.cv_ok(&["task", "open", title, "--assignee", who]);
+        out.lines().last().unwrap().trim().to_string()
+    };
+    let a = open("A: the first lane's task", "lane:lane-a");
+    w.cv_ok(&["task", "note", &a, "halfway: the parser is done\nsecond line", "--from", "lane:lane-a"]);
+    open("B: the stranded lane's task", "lane:lane-b");
+    open("someone else's", "lane:zzz");
+
+    let (out, _) = w.cv_ok(&["lanes", SID, "--tasks"]);
+    assert!(out.contains("⚑ lane:lane-a: 1 task(s)"), "{out}");
+    assert!(out.contains("[open] A: the first lane's task · halfway: the parser is done"), "{out}");
+    assert!(!out.contains("second line"), "only the last note's first line:\n{out}");
+    assert!(out.contains("⚑ lane:lane-b (by description): 1 task(s)"), "{out}");
+    assert!(!out.contains("someone else's"), "{out}");
+    assert!(out.contains("⚑ no endpoint"), "lane C exported nothing and matches nothing:\n{out}");
+    let (plain, _) = w.cv_ok(&["lanes", SID]);
+    assert!(!plain.contains('⚑'), "no join without --tasks:\n{plain}");
+
+    let (json, _) = w.cv_ok(&["lanes", SID, "--tasks", "--json"]);
+    let rows: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
+    let by_id = |id: &str| rows.iter().find(|r| r["agent_id"] == id).unwrap().clone();
+    let la = by_id("aaa1");
+    assert_eq!(la["endpoint"], "lane:lane-a");
+    assert_eq!(la["endpoint_source"], "transcript");
+    assert_eq!(la["tasks"][0]["id"], a.as_str());
+    assert_eq!(la["tasks"][0]["last_note"], "halfway: the parser is done");
+    let lb = by_id("bbb2");
+    assert_eq!(lb["endpoint_source"], "description");
+    assert_eq!(lb["tasks"].as_array().unwrap().len(), 1);
+    assert_eq!(by_id("ccc3")["tasks"], serde_json::json!([]));
+    // Without --tasks the transcript endpoint is still reported; no tasks key.
+    let (json, _) = w.cv_ok(&["lanes", SID, "--json"]);
+    let rows: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
+    let la = rows.iter().find(|r| r["agent_id"] == "aaa1").unwrap();
+    assert_eq!(la["endpoint"], "lane:lane-a");
+    assert!(la.get("tasks").is_none(), "{la}");
 }

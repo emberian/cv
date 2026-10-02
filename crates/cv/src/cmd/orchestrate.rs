@@ -212,11 +212,48 @@ fn lane_passes(l: &Lane, f: LaneFilter) -> bool {
     }
 }
 
+/// The `--tasks` lines under a lane: its endpoint, then each task it holds (short id, state,
+/// title, the last note's first line), at most five.
+fn print_lane_tasks(l: &Lane, tasks: &[cv_core::lanes::LaneTask]) {
+    const SHOWN: usize = 5;
+    let Some(endpoint) = l.endpoint.as_deref() else {
+        println!("          ⚑ no endpoint (no CV_ENDPOINT export in its tool calls, no lane:<name> matches its description)");
+        return;
+    };
+    let guessed = if l.endpoint_source == Some(cv_core::lanes::EndpointSource::Description) {
+        " (by description)"
+    } else {
+        ""
+    };
+    if tasks.is_empty() {
+        println!("          ⚑ {}{guessed}: holds no tasks", sanitize_line(endpoint));
+        return;
+    }
+    println!("          ⚑ {}{guessed}: {} task(s)", sanitize_line(endpoint), tasks.len());
+    for t in tasks.iter().take(SHOWN) {
+        let note = t
+            .last_note
+            .as_deref()
+            .map(|n| format!(" · {}", truncate(&sanitize_line(n), 70)))
+            .unwrap_or_default();
+        println!(
+            "            {} [{}] {}{note}",
+            t.id.get(..13).unwrap_or(&t.id),
+            t.state,
+            truncate(&sanitize_line(&t.title), 60)
+        );
+    }
+    if tasks.len() > SHOWN {
+        println!("            (+{} more — `cv task list --assignee {}`)", tasks.len() - SHOWN, sanitize_line(endpoint));
+    }
+}
+
 pub(crate) fn cmd_lanes(
     id: &str,
     harness: Option<String>,
     filter: LaneFilter,
     since: Option<String>,
+    with_tasks: bool,
     json: bool,
 ) -> Result<()> {
     let want = parse_harness(&harness)?;
@@ -229,10 +266,17 @@ pub(crate) fn cmd_lanes(
         }
         None => None,
     };
-    let all: Vec<Lane> = cv_core::lanes::lanes_of(&r)
+    let mut all: Vec<Lane> = cv_core::lanes::lanes_of(&r)
         .into_iter()
         .filter(|l| since.is_none_or(|t| l.active_since(t)))
         .collect();
+    if with_tasks {
+        let outcome = cv_core::task::replay()?;
+        for w in &outcome.warnings {
+            eprintln!("⚠ {}", sanitize_line(w));
+        }
+        cv_core::lanes::attach_tasks(&mut all, &outcome.model);
+    }
     let lanes: Vec<&Lane> = all.iter().filter(|l| lane_passes(l, filter)).collect();
 
     if json {
@@ -320,6 +364,9 @@ pub(crate) fn cmd_lanes(
         }
         if l.stranded {
             println!("          → resume: SendMessage to {}", l.agent_id);
+        }
+        if let Some(tasks) = &l.tasks {
+            print_lane_tasks(l, tasks);
         }
     }
     if stranded > 0 && filter != LaneFilter::Stranded {
