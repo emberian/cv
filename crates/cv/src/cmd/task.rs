@@ -940,7 +940,11 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                         "  STATUS ({}, {}{}):",
                         sanitize_line(&st.by),
                         fmt_local(st.ts, "%Y-%m-%d %H:%M"),
-                        if st.revisions > 1 { format!(", revision {}", st.revisions) } else { String::new() }
+                        if st.revisions > 1 {
+                            format!(", revision {}", st.revisions)
+                        } else {
+                            String::new()
+                        }
                     );
                     for line in st.text.lines() {
                         println!("    {}", sanitize_line(line));
@@ -1133,7 +1137,11 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                         "  notes:    {} of {} (newest last){}",
                         shown.len(),
                         t.notes.len(),
-                        if brief { " — one line each; drop --brief for the full text" } else { "" }
+                        if brief {
+                            " — one line each; drop --brief for the full text"
+                        } else {
+                            ""
+                        }
                     );
                 }
                 for note in shown {
@@ -1576,13 +1584,20 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
             for w in report.replay_warnings.iter().chain(&report.warnings) {
                 eprintln!("⚠ {}", sanitize_line(w));
             }
-            if let TaskEventKind::Resolved { choice, provisional, .. } = &report.event.kind {
+            if let TaskEventKind::Resolved {
+                choice, provisional, ..
+            } = &report.event.kind
+            {
                 println!(
                     "✦ resolved {} → {} (by {}){}",
                     prefix(&id, 13),
                     sanitize_line(choice),
                     sanitize_line(&from),
-                    if *provisional { " — provisional: the decider can --confirm or veto" } else { "" }
+                    if *provisional {
+                        " — provisional: the decider can --confirm or veto"
+                    } else {
+                        ""
+                    }
                 );
             }
             Ok(())
@@ -1599,7 +1614,10 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                     prefix(&id, plen),
                     t.notes.len(),
                     if plan.mid_text > 0 {
-                        format!("; {} mention DECIDE mid-text — split takes notes that START with DECIDE", plan.mid_text)
+                        format!(
+                            "; {} mention DECIDE mid-text — split takes notes that START with DECIDE",
+                            plan.mid_text
+                        )
                     } else {
                         String::new()
                     }
@@ -1649,7 +1667,11 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
             }
             println!();
             for (_, child) in &created {
-                println!("✦ decision {} posed for {}", prefix(child, 13), sanitize_line(t.assignee.as_deref().unwrap_or("-")));
+                println!(
+                    "✦ decision {} posed for {}",
+                    prefix(child, 13),
+                    sanitize_line(t.assignee.as_deref().unwrap_or("-"))
+                );
             }
             println!(
                 "{} decision(s) created, each blocking {} · `cv task inbox {}` lists them first",

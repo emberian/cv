@@ -45,11 +45,11 @@ pub mod views;
 
 #[cfg(not(target_family = "wasm"))]
 pub use check::CheckSpec;
+pub use decide::{is_decide_note, options_of, parse_deadline, parse_decide_note, DecideNote, AS_PROPOSED};
 pub use model::{
     harness_family, model_family, DoneCheck, DoneCheckKind, IndependenceCheck, MergeFailure, ReviewReceipts, Revision,
     RevisionState, TaskEvent, TaskEventKind, TaskState, VERIFIER_BY,
 };
-pub use decide::{is_decide_note, options_of, parse_deadline, parse_decide_note, DecideNote, AS_PROPOSED};
 pub use project::{
     age_short, awaiting_review, blocks, branch_carriers, debt, effective_display, in_scope, inbox, involves,
     is_blocked, list, parse_duration, parse_since, propose_collision_warnings, resolve_id, same_actor,
@@ -58,8 +58,8 @@ pub use project::{
 };
 pub use provenance::{freshness_from_heartbeat, Freshness, Provenance};
 pub use reduce::{
-    Decision, EffectiveState, Note, PassEvidence, PinnedStatus, ReduceError, RefuteEvidence, RerouteEvidence, Resolution,
-    RevisionProjection, TaskIssue, TaskProjection, TaskReadModel, TaskReducer,
+    Decision, EffectiveState, Note, PassEvidence, PinnedStatus, ReduceError, RefuteEvidence, RerouteEvidence,
+    Resolution, RevisionProjection, TaskIssue, TaskProjection, TaskReadModel, TaskReducer,
 };
 #[cfg(not(target_family = "wasm"))]
 pub use stats::{EndpointRow, FamilyRow, FleetStats, ReviewerRow};

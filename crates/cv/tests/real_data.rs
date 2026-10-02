@@ -95,7 +95,11 @@ const EMBER_TASK: &str = "01a0f54c-d1dd";
 fn require_real_store() {
     let home = std::env::var_os("HOME").map(PathBuf::from).expect("HOME");
     let log = home.join(".clustervision/tasks/events.jsonl");
-    assert!(log.exists(), "the real task store is not on this machine: {}", log.display());
+    assert!(
+        log.exists(),
+        "the real task store is not on this machine: {}",
+        log.display()
+    );
 }
 
 /// After `cv task split 01a0f54c-d1dd` ran (the acceptance step), ember's inbox leads with the
@@ -127,7 +131,10 @@ fn real_inbox_ember_lists_the_split_decisions() {
     let (code, out) = cv(&["task", "inbox", "ember", "--md"]);
     assert_eq!(code, 0);
     assert!(out.starts_with("# Inbox for ember — "), "{}", &out[..60.min(out.len())]);
-    assert!(out.contains("## Decisions owed (") && out.contains("- **default:** "), "{out}");
+    assert!(
+        out.contains("## Decisions owed (") && out.contains("- **default:** "),
+        "{out}"
+    );
     let (code, out) = cv(&["task", "inbox", "ember"]);
     assert_eq!(code, 0);
     assert!(out.starts_with("decisions owed ("), "{out}");

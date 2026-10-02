@@ -119,7 +119,11 @@ impl World {
         use std::io::Write;
         let dir = self.cv_home.join("tasks");
         fs::create_dir_all(&dir).unwrap();
-        let mut f = fs::OpenOptions::new().create(true).append(true).open(dir.join("events.jsonl")).unwrap();
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("events.jsonl"))
+            .unwrap();
         for l in lines {
             writeln!(f, "{l}").unwrap();
         }
@@ -1983,12 +1987,19 @@ fn normalize(s: &str) -> String {
 fn task_decide_resolve_round_trip() {
     let w = World::new("decide");
     let (out, _) = w.cv_ok(&[
-        "task", "decide", "K-PORTAL: who births the guest cell",
-        "--for", "ember",
-        "--default", "the concierge births it",
-        "--option", "the receiver allocates it",
-        "--by", "3d",
-        "--body", "default = the concierge; alternative = the receiver (then F pays).",
+        "task",
+        "decide",
+        "K-PORTAL: who births the guest cell",
+        "--for",
+        "ember",
+        "--default",
+        "the concierge births it",
+        "--option",
+        "the receiver allocates it",
+        "--by",
+        "3d",
+        "--body",
+        "default = the concierge; alternative = the receiver (then F pays).",
     ]);
     let d = opened_task_id(&out);
     assert!(out.contains("posed for ember"), "{out}");
@@ -1997,8 +2008,14 @@ fn task_decide_resolve_round_trip() {
     assert!(out.contains("]  decision"), "kind on the header line:\n{out}");
     assert!(out.contains("default:  the concierge births it"), "{out}");
     assert!(out.contains("option:   the receiver allocates it"), "{out}");
-    assert!(out.contains("(in 2d)") || out.contains("(in 3d)"), "deadline phrase:\n{out}");
-    assert!(out.contains("resolve:  cv task resolve") && out.contains("--from ember"), "{out}");
+    assert!(
+        out.contains("(in 2d)") || out.contains("(in 3d)"),
+        "deadline phrase:\n{out}"
+    );
+    assert!(
+        out.contains("resolve:  cv task resolve") && out.contains("--from ember"),
+        "{out}"
+    );
     assert!(out.contains("tags:     decision"), "{out}");
     let (json, _) = w.cv_ok(&["task", "show", &d, "--json"]);
     let t: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -2009,21 +2026,46 @@ fn task_decide_resolve_round_trip() {
     // inbox: the decision group, with its default and alternative on one line.
     let (out, _) = w.cv_ok(&["task", "inbox", "ember"]);
     assert!(out.starts_with("decisions owed (1):"), "{out}");
-    assert!(out.contains("⇒ default: the concierge births it · alt: the receiver allocates it · by "), "{out}");
-    assert!(out.contains("resolve: cv task resolve <id> --accept-default --from ember"), "{out}");
+    assert!(
+        out.contains("⇒ default: the concierge births it · alt: the receiver allocates it · by "),
+        "{out}"
+    );
+    assert!(
+        out.contains("resolve: cv task resolve <id> --accept-default --from ember"),
+        "{out}"
+    );
     let (json, _) = w.cv_ok(&["task", "inbox", "ember", "--json"]);
-    assert!(json.contains("\"decision_owed\"") && json.contains("\"default\": \"the concierge births it\""), "{json}");
+    assert!(
+        json.contains("\"decision_owed\"") && json.contains("\"default\": \"the concierge births it\""),
+        "{json}"
+    );
 
     // Wrong verb, wrong option, no identity.
     let (_, err) = w.cv_fails(&["task", "done", &d]);
     assert!(err.contains("answer it with resolve"), "{err}");
     let (_, err) = w.cv_fails(&["task", "resolve", &d, "--choice", "burn it", "--from", "ember"]);
-    assert!(err.contains("not one of the posed options") && err.contains("--choice \"the receiver allocates it\""), "{err}");
-    let (_, err) = w.cv_fails(&["task", "resolve", &d, "--choice", "THE RECEIVER allocates it", "--from", "ember"]);
-    assert!(err.contains("did you mean --choice \"the receiver allocates it\""), "{err}");
+    assert!(
+        err.contains("not one of the posed options") && err.contains("--choice \"the receiver allocates it\""),
+        "{err}"
+    );
+    let (_, err) = w.cv_fails(&[
+        "task",
+        "resolve",
+        &d,
+        "--choice",
+        "THE RECEIVER allocates it",
+        "--from",
+        "ember",
+    ]);
+    assert!(
+        err.contains("did you mean --choice \"the receiver allocates it\""),
+        "{err}"
+    );
     let (_, err) = w.cv_fails(&["task", "resolve", &d, "--accept-default"]);
     assert!(
-        err.contains("records WHO decided") && err.contains("--accept-default --from ember") && err.contains("export CV_ENDPOINT=ember"),
+        err.contains("records WHO decided")
+            && err.contains("--accept-default --from ember")
+            && err.contains("export CV_ENDPOINT=ember"),
         "the cure names the owner:\n{err}"
     );
     let (_, err) = w.cv_fails(&["task", "resolve", &d]);
@@ -2031,10 +2073,16 @@ fn task_decide_resolve_round_trip() {
 
     // Resolve: by the owner, accepting the default.
     let (out, _) = w.cv_ok(&["task", "resolve", &d, "--accept-default", "--from", "ember"]);
-    assert!(out.contains("resolved") && out.contains("→ the concierge births it (by ember)"), "{out}");
+    assert!(
+        out.contains("resolved") && out.contains("→ the concierge births it (by ember)"),
+        "{out}"
+    );
     let (out, _) = w.cv_ok(&["task", "show", &d]);
     assert!(out.contains("[resolved]"), "{out}");
-    assert!(out.contains("resolved: the concierge births it — by ember,") && out.contains("(the default)"), "{out}");
+    assert!(
+        out.contains("resolved: the concierge births it — by ember,") && out.contains("(the default)"),
+        "{out}"
+    );
     let (json, _) = w.cv_ok(&["task", "show", &d, "--json"]);
     let t: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert_eq!(t["state"], "resolved");
@@ -2051,9 +2099,23 @@ fn task_decide_resolve_round_trip() {
     assert!(err.contains("resolved") && err.contains("cannot apply"), "{err}");
 
     // A non-default choice with a note from stdin; CV_ENDPOINT as the resolver.
-    let (out, _) = w.cv_ok(&["task", "decide", "Q2", "--for", "ember", "--default", "a", "--option", "b"]);
+    let (out, _) = w.cv_ok(&[
+        "task",
+        "decide",
+        "Q2",
+        "--for",
+        "ember",
+        "--default",
+        "a",
+        "--option",
+        "b",
+    ]);
     let d2 = opened_task_id(&out);
-    let (ok, _, _, err) = w.cv_full(&["task", "resolve", &d2, "--choice", "b", "--note", "-"], &[("CV_ENDPOINT", "ember")], Some("because b\n"));
+    let (ok, _, _, err) = w.cv_full(
+        &["task", "resolve", &d2, "--choice", "b", "--note", "-"],
+        &[("CV_ENDPOINT", "ember")],
+        Some("because b\n"),
+    );
     assert!(ok, "{err}");
     let (json, _) = w.cv_ok(&["task", "show", &d2, "--json"]);
     let t: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -2076,23 +2138,55 @@ fn task_inbox_orders_decisions_first_and_renders_markdown() {
     let (out, _) = w.cv_ok(&["task", "open", "the claimed one", "--body", "claimed body"]);
     let c = opened_task_id(&out);
     assert!(w.cv_env(&["task", "claim", &c], &[("CV_ENDPOINT", "ember")]).0);
-    let (out, _) = w.cv_ok(&["task", "open", "write the docs", "--assignee", "ember", "--body", "First line of the action.\n\nSecond paragraph."]);
-    let a = opened_task_id(&out);
-    w.cv_ok(&["task", "note", &a, "a note with two lines\nsecond line hidden in md", "--from", "orchestrator:x"]);
     let (out, _) = w.cv_ok(&[
-        "task", "decide", "P6: WHO MAY REFILL a purse", "--for", "ember",
-        "--default", "keep open", "--option", "per-refill consent",
-        "--body", "today anyone may fund any purse.", "--from", "orchestrator:x",
+        "task",
+        "open",
+        "write the docs",
+        "--assignee",
+        "ember",
+        "--body",
+        "First line of the action.\n\nSecond paragraph.",
+    ]);
+    let a = opened_task_id(&out);
+    w.cv_ok(&[
+        "task",
+        "note",
+        &a,
+        "a note with two lines\nsecond line hidden in md",
+        "--from",
+        "orchestrator:x",
+    ]);
+    let (out, _) = w.cv_ok(&[
+        "task",
+        "decide",
+        "P6: WHO MAY REFILL a purse",
+        "--for",
+        "ember",
+        "--default",
+        "keep open",
+        "--option",
+        "per-refill consent",
+        "--body",
+        "today anyone may fund any purse.",
+        "--from",
+        "orchestrator:x",
     ]);
     let d = opened_task_id(&out);
-    w.plant_legacy_tag_decision("01a0f000-0000-7000-8000-00000000000b", "legacy decision by tag", "ember");
+    w.plant_legacy_tag_decision(
+        "01a0f000-0000-7000-8000-00000000000b",
+        "legacy decision by tag",
+        "ember",
+    );
 
     let (out, _) = w.cv_ok(&["task", "inbox", "ember"]);
     let dec = out.find("decisions owed (2):").expect(&out);
     let assigned = out.find("assigned actions (1):").expect(&out);
     let claimed = out.find("claimed work (1):").expect(&out);
     assert!(dec < assigned && assigned < claimed, "group order:\n{out}");
-    assert!(out.find("P6: WHO MAY REFILL").unwrap() < out.find("legacy decision by tag").unwrap(), "{out}");
+    assert!(
+        out.find("P6: WHO MAY REFILL").unwrap() < out.find("legacy decision by tag").unwrap(),
+        "{out}"
+    );
 
     let (md, _) = w.cv_ok(&["task", "inbox", "ember", "--md"]);
     let got = normalize(&md);
@@ -2151,7 +2245,15 @@ claimed body
 #[test]
 fn task_split_turns_decide_notes_into_decisions() {
     let w = World::new("split");
-    let (out, _) = w.cv_ok(&["task", "open", "EMBER: everything only ember can do", "--assignee", "ember", "--repo", w.base.to_str().unwrap()]);
+    let (out, _) = w.cv_ok(&[
+        "task",
+        "open",
+        "EMBER: everything only ember can do",
+        "--assignee",
+        "ember",
+        "--repo",
+        w.base.to_str().unwrap(),
+    ]);
     let parent = opened_task_id(&out);
     let notes = [
         "DECIDE: move the build base from /tank (slow) to NVMe? Default if silent: keep /tank.",
@@ -2164,24 +2266,45 @@ fn task_split_turns_decide_notes_into_decisions() {
         w.cv_ok(&["task", "note", &parent, n, "--from", "orchestrator:x"]);
     }
     let (out, _) = w.cv_ok(&["task", "split", &parent, "--dry-run"]);
-    assert!(out.contains("# 3 DECIDE note(s)") && out.contains("(dry run: nothing written)"), "{out}");
+    assert!(
+        out.contains("# 3 DECIDE note(s)") && out.contains("(dry run: nothing written)"),
+        "{out}"
+    );
     assert!(out.contains("1 other note(s) mention DECIDE mid-text"), "{out}");
     let (list, _) = w.cv_ok(&["task", "list"]);
-    assert_eq!(list.lines().filter(|l| l.starts_with(|c: char| c.is_ascii_hexdigit())).count(), 1, "dry run wrote nothing:\n{list}");
+    assert_eq!(
+        list.lines()
+            .filter(|l| l.starts_with(|c: char| c.is_ascii_hexdigit()))
+            .count(),
+        1,
+        "dry run wrote nothing:\n{list}"
+    );
 
     let (out, _) = w.cv_ok(&["task", "split", &parent, "--from", "orchestrator:x"]);
     assert!(out.contains("3 decision(s) created, each blocking"), "{out}");
-    assert!(out.contains("move the build base from /tank to NVMe?"), "title from the question, parens stripped:\n{out}");
+    assert!(
+        out.contains("move the build base from /tank to NVMe?"),
+        "title from the question, parens stripped:\n{out}"
+    );
     assert!(out.contains("default: keep /tank"), "{out}");
     assert!(out.contains("K-PORTAL: who births a guest cell"), "{out}");
-    assert!(out.contains("option:  the receiver allocates it (then F pays)"), "{out}");
-    assert!(out.contains("DEOS.md §5: quotes: REFERENCED by default") && out.contains("default: as proposed"), "{out}");
+    assert!(
+        out.contains("option:  the receiver allocates it (then F pays)"),
+        "{out}"
+    );
+    assert!(
+        out.contains("DEOS.md §5: quotes: REFERENCED by default") && out.contains("default: as proposed"),
+        "{out}"
+    );
 
     // The inbox: three decisions first, then the parent as an assigned action.
     let (out, _) = w.cv_ok(&["task", "inbox", "ember"]);
     assert!(out.starts_with("decisions owed (3):"), "{out}");
     assert!(out.contains("assigned actions (1):"), "{out}");
-    assert!(out.contains("⇒ default: the concierge births it · alt: the receiver allocates it (then F pays)"), "{out}");
+    assert!(
+        out.contains("⇒ default: the concierge births it · alt: the receiver allocates it (then F pays)"),
+        "{out}"
+    );
 
     // Relations and provenance: the parent is blocked by each decision; each decision carries
     // the note it came from as its source; `show` on the parent points each note at its child.
@@ -2209,7 +2332,14 @@ fn task_split_turns_decide_notes_into_decisions() {
 
     // Resolving one decision unblocks nothing yet (two remain); resolving all three unblocks.
     for d in &ds {
-        w.cv_ok(&["task", "resolve", d["task_id"].as_str().unwrap(), "--accept-default", "--from", "ember"]);
+        w.cv_ok(&[
+            "task",
+            "resolve",
+            d["task_id"].as_str().unwrap(),
+            "--accept-default",
+            "--from",
+            "ember",
+        ]);
     }
     let (out, _) = w.cv_ok(&["task", "show", &parent]);
     assert!(!out.contains("⊘ BLOCKED"), "{out}");
@@ -2228,7 +2358,15 @@ fn task_note_reads_stdin_and_open_absolutizes_issue() {
     let w = World::new("stdin-paths");
     fs::write(w.base.join("PLAN.md"), "# plan\n").unwrap();
     let (ok, _, out, err) = w.cv_stdin(
-        &["task", "open", "with a heredoc body", "--body", "-", "--issue", "PLAN.md"],
+        &[
+            "task",
+            "open",
+            "with a heredoc body",
+            "--body",
+            "-",
+            "--issue",
+            "PLAN.md",
+        ],
         "a `code span` body\nwith two lines\n",
     );
     assert!(ok, "{err}");
@@ -2237,8 +2375,14 @@ fn task_note_reads_stdin_and_open_absolutizes_issue() {
     let t: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert_eq!(t["body"], "a `code span` body\nwith two lines\n");
     let issue = t["issue"].as_str().unwrap();
-    assert!(std::path::Path::new(issue).is_absolute() && issue.ends_with("PLAN.md"), "{issue}");
-    assert_eq!(std::path::Path::new(issue).canonicalize().unwrap(), w.base.join("PLAN.md").canonicalize().unwrap());
+    assert!(
+        std::path::Path::new(issue).is_absolute() && issue.ends_with("PLAN.md"),
+        "{issue}"
+    );
+    assert_eq!(
+        std::path::Path::new(issue).canonicalize().unwrap(),
+        w.base.join("PLAN.md").canonicalize().unwrap()
+    );
 
     let (ok, _, _, err) = w.cv_stdin(&["task", "note", &a, "-"], "note from stdin\n");
     assert!(ok, "{err}");
@@ -2248,17 +2392,30 @@ fn task_note_reads_stdin_and_open_absolutizes_issue() {
     let (out, _) = w.cv_ok(&["task", "open", "handle", "--issue", "#42"]);
     let b = opened_task_id(&out);
     let (json, _) = w.cv_ok(&["task", "show", &b, "--json"]);
-    assert_eq!(serde_json::from_str::<serde_json::Value>(&json).unwrap()["issue"], "#42");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&json).unwrap()["issue"],
+        "#42"
+    );
     let (out, _) = w.cv_ok(&["task", "open", "url", "--issue", "https://x.y/issues/4"]);
     let c = opened_task_id(&out);
     let (json, _) = w.cv_ok(&["task", "show", &c, "--json"]);
-    assert_eq!(serde_json::from_str::<serde_json::Value>(&json).unwrap()["issue"], "https://x.y/issues/4");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&json).unwrap()["issue"],
+        "https://x.y/issues/4"
+    );
     // A relative path that does not exist yet is still rooted at the cwd.
     let (out, _) = w.cv_ok(&["task", "open", "future doc", "--issue", "docs/later.md"]);
     let d = opened_task_id(&out);
     let (json, _) = w.cv_ok(&["task", "show", &d, "--json"]);
-    let issue = serde_json::from_str::<serde_json::Value>(&json).unwrap()["issue"].as_str().unwrap().to_string();
-    assert!(issue.starts_with(w.base.to_str().unwrap()) || issue.starts_with(&w.base.canonicalize().unwrap().display().to_string()), "{issue}");
+    let issue = serde_json::from_str::<serde_json::Value>(&json).unwrap()["issue"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        issue.starts_with(w.base.to_str().unwrap())
+            || issue.starts_with(&w.base.canonicalize().unwrap().display().to_string()),
+        "{issue}"
+    );
 }
 
 fn seeded_old_and_new(w: &World) -> (String, String) {
@@ -2309,9 +2466,16 @@ fn task_list_and_inbox_scope_to_recent_and_all_shows_old() {
     let (old, new) = seeded_old_and_new(&w);
     let (out, _) = w.cv_ok(&["task", "list"]);
     assert!(out.contains("NEW: today") && !out.contains("OLD: from"), "{out}");
-    assert!(out.trim_end().ends_with("(1 older task(s) hidden — `--all`, or `--since 90d`)"), "{out}");
+    assert!(
+        out.trim_end()
+            .ends_with("(1 older task(s) hidden — `--all`, or `--since 90d`)"),
+        "{out}"
+    );
     let (out, _) = w.cv_ok(&["task", "list", "--all"]);
-    assert!(out.contains("OLD: from") && out.contains("NEW: today") && !out.contains("hidden"), "{out}");
+    assert!(
+        out.contains("OLD: from") && out.contains("NEW: today") && !out.contains("hidden"),
+        "{out}"
+    );
     let (out, _) = w.cv_ok(&["task", "list", "--since", "2025-12-01"]);
     assert!(out.contains("OLD: from") && !out.contains("hidden"), "{out}");
     let (out, _) = w.cv_ok(&["task", "list", "--since", "1d"]);
@@ -2320,7 +2484,10 @@ fn task_list_and_inbox_scope_to_recent_and_all_shows_old() {
     let (ok, _, out, _) = w.cv_env(&["task", "list"], &[("CV_ENDPOINT", "orchestrator:old")]);
     assert!(ok && out.contains("OLD: from") && !out.contains("hidden"), "{out}");
     let (ok, _, out, _) = w.cv_env(&["task", "list"], &[("CV_ENDPOINT", "web:ember")]);
-    assert!(ok && out.contains("OLD: from"), "web:<who> ≡ <who>, the assignee:\n{out}");
+    assert!(
+        ok && out.contains("OLD: from"),
+        "web:<who> ≡ <who>, the assignee:\n{out}"
+    );
 
     // Same window for the inbox.
     let (out, _) = w.cv_ok(&["task", "inbox", "ember"]);
@@ -2339,17 +2506,44 @@ fn task_list_and_inbox_scope_to_recent_and_all_shows_old() {
 #[test]
 fn task_inbox_unread_and_events_since() {
     let w = World::new("unread-events");
-    let (out, _) = w.cv_ok(&["task", "open", "A: touched by the orchestrator last", "--assignee", "ember", "--from", "orchestrator:x"]);
+    let (out, _) = w.cv_ok(&[
+        "task",
+        "open",
+        "A: touched by the orchestrator last",
+        "--assignee",
+        "ember",
+        "--from",
+        "orchestrator:x",
+    ]);
     let a = opened_task_id(&out);
-    let (out, _) = w.cv_ok(&["task", "open", "B: ember spoke last", "--assignee", "ember", "--from", "orchestrator:x"]);
+    let (out, _) = w.cv_ok(&[
+        "task",
+        "open",
+        "B: ember spoke last",
+        "--assignee",
+        "ember",
+        "--from",
+        "orchestrator:x",
+    ]);
     let b = opened_task_id(&out);
     w.cv_ok(&["task", "note", &b, "on it", "--from", "ember"]);
-    let (out, _) = w.cv_ok(&["task", "open", "C: web ember spoke last", "--assignee", "ember", "--from", "orchestrator:x"]);
+    let (out, _) = w.cv_ok(&[
+        "task",
+        "open",
+        "C: web ember spoke last",
+        "--assignee",
+        "ember",
+        "--from",
+        "orchestrator:x",
+    ]);
     let c = opened_task_id(&out);
     w.cv_ok(&["task", "note", &c, "via the page", "--from", "web:ember"]);
 
     let (out, _) = w.cv_ok(&["task", "inbox", "ember", "--unread"]);
-    assert!(out.contains("A: touched") && !out.contains("B: ember") && !out.contains("C: web"), "{out}");
+    assert!(
+        out.contains("A: touched") && !out.contains("B: ember") && !out.contains("C: web"),
+        "{out}"
+    );
     let (json, _) = w.cv_ok(&["task", "inbox", "ember", "--unread", "--json"]);
     assert!(json.contains(&a) && !json.contains(&b), "{json}");
 
@@ -2371,17 +2565,27 @@ fn task_inbox_unread_and_events_since() {
     let (out, _) = w.cv_ok(&["task", "events", "--since", "1h", "--kind", "note"]);
     assert_eq!(out.lines().count(), 2, "{out}");
     let (out, _) = w.cv_ok(&["task", "events", "--by", "ember"]);
-    assert_eq!(out.lines().count(), 2, "web:ember is ember acting through the page:\n{out}");
+    assert_eq!(
+        out.lines().count(),
+        2,
+        "web:ember is ember acting through the page:\n{out}"
+    );
     let (out, _) = w.cv_ok(&["task", "events", "--not-by", "orchestrator:x", "--text"]);
     assert_eq!(out.lines().count(), 2, "{out}");
-    assert!(out.contains("noted") && out.contains("on it") && out.contains("via the page"), "{out}");
+    assert!(
+        out.contains("noted") && out.contains("on it") && out.contains("via the page"),
+        "{out}"
+    );
     let (out, _) = w.cv_ok(&["task", "events", "--task", &b]);
     assert_eq!(out.lines().count(), 2, "{out}");
     let (_, err) = w.cv_fails(&["task", "events", "--since", "whenever"]);
     assert!(err.contains("cannot read"), "{err}");
 
     // watch: what ember did on their tasks, minus the caller's own events.
-    let (ok, _, out, _) = w.cv_env(&["task", "watch", "--assignee", "ember", "--since", "1d"], &[("CV_ENDPOINT", "orchestrator:x")]);
+    let (ok, _, out, _) = w.cv_env(
+        &["task", "watch", "--assignee", "ember", "--since", "1d"],
+        &[("CV_ENDPOINT", "orchestrator:x")],
+    );
     assert!(ok);
     let rows: Vec<serde_json::Value> = out.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
     assert_eq!(rows.len(), 2, "{out}");
@@ -2442,25 +2646,56 @@ fn serve(w: &World, who: &str) -> (std::process::Child, String) {
 #[test]
 fn task_serve_records_the_same_events_as_the_cli() {
     let w = World::new("serve");
-    let (out, _) = w.cv_ok(&["task", "decide", "PAY §7: tariff", "--for", "ember", "--default", "1 credit/unit", "--option", "free tier", "--from", "orchestrator:x"]);
+    let (out, _) = w.cv_ok(&[
+        "task",
+        "decide",
+        "PAY §7: tariff",
+        "--for",
+        "ember",
+        "--default",
+        "1 credit/unit",
+        "--option",
+        "free tier",
+        "--from",
+        "orchestrator:x",
+    ]);
     let d = opened_task_id(&out);
-    let (out, _) = w.cv_ok(&["task", "open", "push dregg-infra", "--assignee", "ember", "--from", "orchestrator:x"]);
+    let (out, _) = w.cv_ok(&[
+        "task",
+        "open",
+        "push dregg-infra",
+        "--assignee",
+        "ember",
+        "--from",
+        "orchestrator:x",
+    ]);
     let a = opened_task_id(&out);
     let (mut child, addr) = serve(&w, "ember");
     let result = std::panic::catch_unwind(|| {
         // The page itself is served inline; it names its own origin story.
         let (status, html) = http(&addr, "GET", "/", None);
         assert_eq!(status, 200);
-        assert!(html.contains("<title>cv inbox</title>") && html.contains("/api/inbox"), "{}", &html[..200.min(html.len())]);
-        assert!(!html.contains("<script src=") && !html.contains("<link rel=\"stylesheet\""), "no external resources");
+        assert!(
+            html.contains("<title>cv inbox</title>") && html.contains("/api/inbox"),
+            "{}",
+            &html[..200.min(html.len())]
+        );
+        assert!(
+            !html.contains("<script src=") && !html.contains("<link rel=\"stylesheet\""),
+            "no external resources"
+        );
         // A DNS-named Host is refused (rebinding); an IP literal is fine (the LAN case).
         let (status, _) = {
             use std::io::{Read, Write};
             let mut s = std::net::TcpStream::connect(&addr).unwrap();
-            s.write_all(b"GET /api/inbox HTTP/1.1\r\nHost: evil.example\r\nConnection: close\r\n\r\n").unwrap();
+            s.write_all(b"GET /api/inbox HTTP/1.1\r\nHost: evil.example\r\nConnection: close\r\n\r\n")
+                .unwrap();
             let mut raw = String::new();
             s.read_to_string(&mut raw).unwrap();
-            (raw.split_whitespace().nth(1).unwrap_or("0").parse::<u16>().unwrap_or(0), raw)
+            (
+                raw.split_whitespace().nth(1).unwrap_or("0").parse::<u16>().unwrap_or(0),
+                raw,
+            )
         };
         assert_eq!(status, 403);
 
@@ -2481,17 +2716,42 @@ fn task_serve_records_the_same_events_as_the_cli() {
         assert!(body.contains("\"who\":\"ember\""), "{body}");
 
         // Act: a note, then "needs discussion", then resolve with an option, then done.
-        let (status, body) = http(&addr, "POST", &format!("/api/task/{d}/note"), Some(r#"{"text":"reading PAY first"}"#));
+        let (status, body) = http(
+            &addr,
+            "POST",
+            &format!("/api/task/{d}/note"),
+            Some(r#"{"text":"reading PAY first"}"#),
+        );
         assert_eq!(status, 200, "{body}");
         assert!(body.contains("\"by\":\"web:ember\""), "{body}");
-        let (status, body) = http(&addr, "POST", &format!("/api/task/{d}/discuss"), Some(r#"{"text":"what is a unit?"}"#));
+        let (status, body) = http(
+            &addr,
+            "POST",
+            &format!("/api/task/{d}/discuss"),
+            Some(r#"{"text":"what is a unit?"}"#),
+        );
         assert_eq!(status, 200, "{body}");
-        let (status, body) = http(&addr, "POST", &format!("/api/task/{d}/resolve"), Some(r#"{"choice":"free tier","note":"for October"}"#));
+        let (status, body) = http(
+            &addr,
+            "POST",
+            &format!("/api/task/{d}/resolve"),
+            Some(r#"{"choice":"free tier","note":"for October"}"#),
+        );
         assert_eq!(status, 200, "{body}");
         assert!(body.contains("\"task_state\":\"resolved\""), "{body}");
-        let (status, body) = http(&addr, "POST", &format!("/api/task/{d}/resolve"), Some(r#"{"accept_default":true}"#));
+        let (status, body) = http(
+            &addr,
+            "POST",
+            &format!("/api/task/{d}/resolve"),
+            Some(r#"{"accept_default":true}"#),
+        );
         assert_eq!(status, 400, "a second resolution is refused: {body}");
-        let (status, body) = http(&addr, "POST", &format!("/api/task/{a}/done"), Some(r#"{"observed":"pushed"}"#));
+        let (status, body) = http(
+            &addr,
+            "POST",
+            &format!("/api/task/{a}/done"),
+            Some(r#"{"observed":"pushed"}"#),
+        );
         assert_eq!(status, 200, "{body}");
         let (status, body) = http(&addr, "POST", &format!("/api/task/{a}/done"), Some("{}"));
         assert_eq!(status, 400, "{body}");
@@ -2514,7 +2774,10 @@ fn task_serve_records_the_same_events_as_the_cli() {
         let items = page["items"].as_array().unwrap();
         assert_eq!(items.len(), 1, "{body}");
         assert_eq!(items[0]["title"], "push dregg-infra");
-        assert!(items[0]["tags"].as_array().unwrap().iter().any(|t| t == "reopened"), "{body}");
+        assert!(
+            items[0]["tags"].as_array().unwrap().iter().any(|t| t == "reopened"),
+            "{body}"
+        );
 
         // One task, with its history; the event feed is the same query as `cv task events`.
         let (status, body) = http(&addr, "GET", &format!("/api/task/{d}?events=1"), None);
@@ -2537,12 +2800,18 @@ fn task_serve_records_the_same_events_as_the_cli() {
     // The CLI sees exactly what the page recorded, with the web author.
     let (out, _) = w.cv_ok(&["task", "show", &d, "--brief"]);
     assert!(out.contains("[resolved]"), "{out}");
-    assert!(out.contains("resolved: free tier — by web:ember,") && out.contains("· for October"), "{out}");
+    assert!(
+        out.contains("resolved: free tier — by web:ember,") && out.contains("· for October"),
+        "{out}"
+    );
     assert!(out.contains("web:ember") && out.contains("reading PAY first"), "{out}");
     assert!(out.contains("NEEDS DISCUSSION: what is a unit?"), "{out}");
     assert!(out.contains("tags:     decision, discuss"), "{out}");
     let (out, _) = w.cv_ok(&["task", "show", &a, "--brief"]);
-    assert!(out.contains("[done]") && out.contains("self-reported") && out.contains("(pushed)"), "{out}");
+    assert!(
+        out.contains("[done]") && out.contains("self-reported") && out.contains("(pushed)"),
+        "{out}"
+    );
     let (json, _) = w.cv_ok(&["task", "show", &a, "--events"]);
     assert!(json.contains("\"by\": \"web:ember\""), "{json}");
     let (out, _) = w.cv_ok(&["task", "events", "--since", "1h", "--kind", "resolved,done"]);
@@ -2809,14 +3078,21 @@ fn task_notes_after_close_and_close_with_a_note() {
     fs::write(&evidence, "journey J4: expected 7 / got 7\n").unwrap();
     let ev = evidence.to_str().unwrap();
     let (out, _) = w.cv_ok(&["task", "done", &a, "--note-file", ev, "--from", "lane:x"]);
-    assert!(out.contains("✦ noted") && out.contains("✦ done"), "both events reported:\n{out}");
+    assert!(
+        out.contains("✦ noted") && out.contains("✦ done"),
+        "both events reported:\n{out}"
+    );
     let (json, _) = w.cv_ok(&["task", "show", &a, "--events"]);
     let kinds: Vec<&str> = json
         .lines()
         .filter_map(|l| l.trim().strip_prefix("\"event\": \""))
         .map(|k| k.trim_end_matches(['"', ',']))
         .collect();
-    assert_eq!(kinds, ["opened", "noted", "done"], "the note precedes the close:\n{json}");
+    assert_eq!(
+        kinds,
+        ["opened", "noted", "done"],
+        "the note precedes the close:\n{json}"
+    );
 
     // A late note: accepted, marked, state unchanged.
     let (out, _) = w.cv_ok(&["task", "note", &a, "the report is at /tmp/r.md", "--from", "lane:x"]);
@@ -2824,7 +3100,10 @@ fn task_notes_after_close_and_close_with_a_note() {
     let (out, _) = w.cv_ok(&["task", "show", &a]);
     assert!(out.contains("[done]"), "{out}");
     assert!(out.contains("journey J4: expected 7 / got 7"), "{out}");
-    assert!(!out.contains("journey J4: expected 7 / got 7\n  (after close)"), "{out}");
+    assert!(
+        !out.contains("journey J4: expected 7 / got 7\n  (after close)"),
+        "{out}"
+    );
     assert!(out.contains("(after close): the report is at /tmp/r.md"), "{out}");
     let (json, _) = w.cv_ok(&["task", "show", &a, "--json"]);
     let t: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -2837,15 +3116,33 @@ fn task_notes_after_close_and_close_with_a_note() {
     // abandon --note: one unit; a refused close writes no note either.
     let (out, _) = w.cv_ok(&["task", "open", "the wrong approach"]);
     let b = opened_task_id(&out);
-    w.cv_ok(&["task", "abandon", &b, "--reason", "superseded by design", "--note", "why: see the audit"]);
+    w.cv_ok(&[
+        "task",
+        "abandon",
+        &b,
+        "--reason",
+        "superseded by design",
+        "--note",
+        "why: see the audit",
+    ]);
     let (out, _) = w.cv_ok(&["task", "show", &b]);
-    assert!(out.contains("[abandoned]") && out.contains("why: see the audit"), "{out}");
-    assert!(!out.contains("(after close)"), "the abandon note preceded the close:\n{out}");
+    assert!(
+        out.contains("[abandoned]") && out.contains("why: see the audit"),
+        "{out}"
+    );
+    assert!(
+        !out.contains("(after close)"),
+        "the abandon note preceded the close:\n{out}"
+    );
     let (_, err) = w.cv_fails(&["task", "done", &b, "--note", "too late to finish"]);
     assert!(err.contains("event rejected"), "{err}");
     let (json, _) = w.cv_ok(&["task", "show", &b, "--json"]);
     let t: serde_json::Value = serde_json::from_str(&json).unwrap();
-    assert_eq!(t["notes"].as_array().unwrap().len(), 1, "the refused batch left nothing:\n{json}");
+    assert_eq!(
+        t["notes"].as_array().unwrap().len(),
+        1,
+        "the refused batch left nothing:\n{json}"
+    );
 }
 
 /// Provisional resolutions: the orchestrator poses and resolves on the default at once
@@ -2856,14 +3153,33 @@ fn task_notes_after_close_and_close_with_a_note() {
 fn task_provisional_resolution_veto_and_confirm() {
     let w = World::new("provisional");
     let (out, _) = w.cv_ok(&[
-        "task", "decide", "build base: /tank or NVMe", "--for", "ember", "--default", "keep /tank",
-        "--option", "move to NVMe", "--provisional", "--from", "orchestrator:o",
+        "task",
+        "decide",
+        "build base: /tank or NVMe",
+        "--for",
+        "ember",
+        "--default",
+        "keep /tank",
+        "--option",
+        "move to NVMe",
+        "--provisional",
+        "--from",
+        "orchestrator:o",
     ]);
     let d = opened_task_id(&out);
-    assert!(out.contains("resolved") && out.contains("provisionally on the default"), "{out}");
+    assert!(
+        out.contains("resolved") && out.contains("provisionally on the default"),
+        "{out}"
+    );
     let (out, _) = w.cv_ok(&["task", "inbox", "ember"]);
-    assert!(out.starts_with("made for you (veto?) (1):"), "not owed, its own group:\n{out}");
-    assert!(out.contains("⇒ made: keep /tank — by orchestrator:o · veto to: move to NVMe"), "{out}");
+    assert!(
+        out.starts_with("made for you (veto?) (1):"),
+        "not owed, its own group:\n{out}"
+    );
+    assert!(
+        out.contains("⇒ made: keep /tank — by orchestrator:o · veto to: move to NVMe"),
+        "{out}"
+    );
     assert!(out.contains("cv task resolve <id> --confirm --from ember"), "{out}");
     let (json, _) = w.cv_ok(&["task", "inbox", "ember", "--json"]);
     assert!(json.contains("\"provisional\""), "{json}");
@@ -2872,11 +3188,40 @@ fn task_provisional_resolution_veto_and_confirm() {
     assert!(out.contains("veto?:    cv task resolve"), "{out}");
 
     // The poser cannot pick a non-default provisionally; a third party cannot override.
-    let (out, _) = w.cv_ok(&["task", "decide", "Q2", "--for", "ember", "--default", "a", "--option", "b", "--from", "orchestrator:o"]);
+    let (out, _) = w.cv_ok(&[
+        "task",
+        "decide",
+        "Q2",
+        "--for",
+        "ember",
+        "--default",
+        "a",
+        "--option",
+        "b",
+        "--from",
+        "orchestrator:o",
+    ]);
     let d2 = opened_task_id(&out);
-    let (_, err) = w.cv_fails(&["task", "resolve", &d2, "--choice", "b", "--provisional", "--from", "orchestrator:o"]);
+    let (_, err) = w.cv_fails(&[
+        "task",
+        "resolve",
+        &d2,
+        "--choice",
+        "b",
+        "--provisional",
+        "--from",
+        "orchestrator:o",
+    ]);
     assert!(err.contains("stands on the default"), "{err}");
-    let (_, err) = w.cv_fails(&["task", "resolve", &d, "--choice", "move to NVMe", "--from", "lane:someone"]);
+    let (_, err) = w.cv_fails(&[
+        "task",
+        "resolve",
+        &d,
+        "--choice",
+        "move to NVMe",
+        "--from",
+        "lane:someone",
+    ]);
     assert!(err.contains("only the decision's assignee (ember)"), "{err}");
     let (_, err) = w.cv_fails(&["task", "resolve", &d2, "--confirm", "--from", "ember"]);
     assert!(err.contains("no provisional resolution to confirm"), "{err}");
@@ -2886,21 +3231,38 @@ fn task_provisional_resolution_veto_and_confirm() {
     assert!(out.contains("→ move to NVMe (by ember)"), "{out}");
     let (out, _) = w.cv_ok(&["task", "show", &d]);
     assert!(out.contains("provisionally: keep /tank — by orchestrator:o"), "{out}");
-    assert!(out.contains("resolved: move to NVMe — by ember") && !out.contains("PROVISIONAL"), "{out}");
+    assert!(
+        out.contains("resolved: move to NVMe — by ember") && !out.contains("PROVISIONAL"),
+        "{out}"
+    );
     let (json, _) = w.cv_ok(&["task", "show", &d, "--json"]);
     let t: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert_eq!(t["decision"]["resolution"]["choice"], "move to NVMe");
     assert!(t["decision"]["resolution"].get("provisional").is_none(), "{json}");
     assert_eq!(t["decision"]["superseded_provisional"]["provisional"], true, "{json}");
     let (out, _) = w.cv_ok(&["task", "inbox", "ember"]);
-    assert!(out.contains("(inbox empty for ember)") || !out.contains("made for you"), "{out}");
+    assert!(
+        out.contains("(inbox empty for ember)") || !out.contains("made for you"),
+        "{out}"
+    );
     // A second answer is refused as it always was.
     let (_, err) = w.cv_fails(&["task", "resolve", &d, "--accept-default", "--from", "ember"]);
     assert!(err.contains("cannot apply resolved"), "{err}");
 
     // Confirm through the page.
     let (out, _) = w.cv_ok(&[
-        "task", "decide", "Q3", "--for", "ember", "--default", "x", "--option", "y", "--provisional", "--from", "orchestrator:o",
+        "task",
+        "decide",
+        "Q3",
+        "--for",
+        "ember",
+        "--default",
+        "x",
+        "--option",
+        "y",
+        "--provisional",
+        "--from",
+        "orchestrator:o",
     ]);
     let d3 = opened_task_id(&out);
     let (mut child, addr) = serve(&w, "ember");
@@ -2910,10 +3272,20 @@ fn task_provisional_resolution_veto_and_confirm() {
         let page: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(page["counts"]["provisional"], 1, "{body}");
         assert_eq!(page["counts"]["decisions"], 1, "Q2 is still owed; Q3 is not: {body}");
-        let made: Vec<&serde_json::Value> = page["items"].as_array().unwrap().iter().filter(|i| i["reason"] == "provisional").collect();
+        let made: Vec<&serde_json::Value> = page["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|i| i["reason"] == "provisional")
+            .collect();
         assert_eq!(made.len(), 1, "{body}");
         assert_eq!(made[0]["title"], "Q3");
-        let (status, body) = http(&addr, "POST", &format!("/api/task/{d3}/resolve"), Some(r#"{"confirm":true}"#));
+        let (status, body) = http(
+            &addr,
+            "POST",
+            &format!("/api/task/{d3}/resolve"),
+            Some(r#"{"confirm":true}"#),
+        );
         assert_eq!(status, 200, "{body}");
     });
     let _ = child.kill();
@@ -2935,16 +3307,33 @@ fn task_provisional_resolution_veto_and_confirm() {
 #[test]
 fn task_decision_tag_without_options_is_refused() {
     let w = World::new("decision-tag");
-    let (_, err) = w.cv_fails(&["task", "open", "pick a rate", "--assignee", "ember", "--tags", "deploy,decision"]);
-    assert!(err.contains("a decision is posed, not tagged") && err.contains("cv task decide \"pick a rate\""), "{err}");
+    let (_, err) = w.cv_fails(&[
+        "task",
+        "open",
+        "pick a rate",
+        "--assignee",
+        "ember",
+        "--tags",
+        "deploy,decision",
+    ]);
+    assert!(
+        err.contains("a decision is posed, not tagged") && err.contains("cv task decide \"pick a rate\""),
+        "{err}"
+    );
     assert!(err.contains("--default") && err.contains("is required"), "{err}");
     let (out, _) = w.cv_ok(&["task", "list", "--all"]);
-    assert!(out.contains("(no matching tasks)"), "a refused open leaves nothing behind:\n{out}");
+    assert!(
+        out.contains("(no matching tasks)"),
+        "a refused open leaves nothing behind:\n{out}"
+    );
 
     let (out, _) = w.cv_ok(&["task", "open", "plain work", "--assignee", "ember"]);
     let a = opened_task_id(&out);
     let (_, err) = w.cv_fails(&["task", "tag", &a, "decision"]);
-    assert!(err.contains("a decision is posed, not tagged") && err.contains("--blocks"), "{err}");
+    assert!(
+        err.contains("a decision is posed, not tagged") && err.contains("--blocks"),
+        "{err}"
+    );
     let (out, _) = w.cv_ok(&["task", "show", &a, "--json"]);
     assert!(!out.contains("\"decision\""), "{out}");
 
@@ -2954,7 +3343,10 @@ fn task_decision_tag_without_options_is_refused() {
 
     w.plant_legacy_tag_decision("01a0f000-0000-7000-8000-00000000000c", "legacy tag-only", "ember");
     let (out, _) = w.cv_ok(&["task", "inbox", "ember"]);
-    assert!(out.starts_with("decisions owed (2):") && out.contains("legacy tag-only"), "{out}");
+    assert!(
+        out.starts_with("decisions owed (2):") && out.contains("legacy tag-only"),
+        "{out}"
+    );
 }
 
 /// The pinned STATUS: `cv task status ID --file F` replaces it (the events keep every one);
@@ -2963,16 +3355,38 @@ fn task_decision_tag_without_options_is_refused() {
 #[test]
 fn task_status_is_pinned_replaced_and_shown_first() {
     let w = World::new("status");
-    let (out, _) = w.cv_ok(&["task", "open", "INTEGRATOR: own final", "--assignee", "lane:integrator-1", "--from", "orchestrator:o"]);
+    let (out, _) = w.cv_ok(&[
+        "task",
+        "open",
+        "INTEGRATOR: own final",
+        "--assignee",
+        "lane:integrator-1",
+        "--from",
+        "orchestrator:o",
+    ]);
     let t = opened_task_id(&out);
     w.cv_ok(&["task", "note", &t, "merged braid-host", "--from", "lane:integrator-1"]);
     let f = w.base.join("status.md");
     fs::write(&f, "tip 4ad19d9a\nmerged: braid-host\nnext: braid-proof\n").unwrap();
     let (_, err) = w.cv_fails(&["task", "status", &t, "--file", f.to_str().unwrap()]);
-    assert!(err.contains("set CV_ENDPOINT or pass --from"), "identity-bearing:\n{err}");
-    w.cv_ok(&["task", "status", &t, "--file", f.to_str().unwrap(), "--from", "lane:integrator-1"]);
+    assert!(
+        err.contains("set CV_ENDPOINT or pass --from"),
+        "identity-bearing:\n{err}"
+    );
+    w.cv_ok(&[
+        "task",
+        "status",
+        &t,
+        "--file",
+        f.to_str().unwrap(),
+        "--from",
+        "lane:integrator-1",
+    ]);
     let (_, err) = w.cv_fails(&["task", "status", &t, "hijack", "--from", "lane:stranger"]);
-    assert!(err.contains("only its assignee (lane:integrator-1) or its opener (orchestrator:o)"), "{err}");
+    assert!(
+        err.contains("only its assignee (lane:integrator-1) or its opener (orchestrator:o)"),
+        "{err}"
+    );
     // The opener replaces it (a relay generation's hand-off), from stdin.
     let (ok, _, _, err) = w.cv_full(
         &["task", "status", &t, "-", "--from", "orchestrator:o"],
@@ -2984,13 +3398,25 @@ fn task_status_is_pinned_replaced_and_shown_first() {
     let (out, _) = w.cv_ok(&["task", "show", &t]);
     let status_at = out.find("  STATUS (orchestrator:o,").expect(&out);
     assert!(status_at < out.find("  title:").unwrap(), "STATUS leads:\n{out}");
-    assert!(out.contains("revision 2") && out.contains("    next: braid-rooms"), "{out}");
+    assert!(
+        out.contains("revision 2") && out.contains("    next: braid-rooms"),
+        "{out}"
+    );
     assert!(!out.contains("next: braid-proof"), "replaced, not appended:\n{out}");
     let (out, _) = w.cv_ok(&["task", "show", &t, "--brief"]);
-    assert!(out.contains("STATUS") && out.contains("title:    INTEGRATOR: own final"), "{out}");
-    assert!(!out.contains("merged braid-host\n") && !out.contains("note"), "only title + STATUS:\n{out}");
+    assert!(
+        out.contains("STATUS") && out.contains("title:    INTEGRATOR: own final"),
+        "{out}"
+    );
+    assert!(
+        !out.contains("merged braid-host\n") && !out.contains("note"),
+        "only title + STATUS:\n{out}"
+    );
     let (out, _) = w.cv_ok(&["task", "show", &t, "--status"]);
-    assert_eq!(out, "tip 8411b1bf\nmerged: braid-host, braid-proof\nnext: braid-rooms\n");
+    assert_eq!(
+        out,
+        "tip 8411b1bf\nmerged: braid-host, braid-proof\nnext: braid-rooms\n"
+    );
     let (json, _) = w.cv_ok(&["task", "show", &t, "--json"]);
     let v: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert_eq!(v["status"]["by"], "orchestrator:o");
@@ -3002,7 +3428,10 @@ fn task_status_is_pinned_replaced_and_shown_first() {
     let (out, _) = w.cv_ok(&["task", "open", "plain"]);
     let p = opened_task_id(&out);
     let (_, err) = w.cv_fails(&["task", "show", &p, "--status"]);
-    assert!(err.contains("no STATUS pinned") && err.contains("cv task status"), "{err}");
+    assert!(
+        err.contains("no STATUS pinned") && err.contains("cv task status"),
+        "{err}"
+    );
     w.cv_ok(&["task", "done", &t, "--from", "lane:integrator-1"]);
     let (_, err) = w.cv_fails(&["task", "status", &t, "late", "--from", "lane:integrator-1"]);
     assert!(err.contains("cannot apply status_set"), "{err}");

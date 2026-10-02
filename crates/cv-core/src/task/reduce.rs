@@ -663,9 +663,8 @@ impl TaskReducer {
 
             TaskEventKind::StatusSet { text } => {
                 require_base(task, kind, &[TaskState::Open, TaskState::Claimed])?;
-                let holder = |who: &Option<String>| {
-                    who.as_deref().is_some_and(|w| super::project::same_actor(&event.by, w))
-                };
+                let holder =
+                    |who: &Option<String>| who.as_deref().is_some_and(|w| super::project::same_actor(&event.by, w));
                 if !holder(&task.assignee) && !holder(&Some(task.opened_by.clone())) {
                     return Err(ReduceError::StatusNotHolder {
                         task_id: task.task_id.clone(),
@@ -1018,7 +1017,10 @@ fn validate_event_shape(event: &TaskEvent) -> Result<(), ReduceError> {
             if !options.iter().any(|o| o == default_choice) {
                 return Err(ReduceError::InvalidField {
                     field: "options",
-                    value: format!("{} (the default {default_choice:?} must be one of them)", options.join(" | ")),
+                    value: format!(
+                        "{} (the default {default_choice:?} must be one of them)",
+                        options.join(" | ")
+                    ),
                 });
             }
             let mut seen = std::collections::HashSet::new();
@@ -1716,7 +1718,10 @@ mod tests {
         assert!(t.state.is_terminal());
         assert_eq!(t.effective_state().as_str(), "resolved");
         let r = t.decision.as_ref().unwrap().resolution.as_ref().unwrap();
-        assert_eq!((r.choice.as_str(), r.by.as_str(), r.accepted_default), ("delete", OTHER, false));
+        assert_eq!(
+            (r.choice.as_str(), r.by.as_str(), r.accepted_default),
+            ("delete", OTHER, false)
+        );
         assert_eq!(r.event_id, ev.id);
         assert_eq!(r.note.as_deref(), Some("the twin goes"));
 
@@ -1749,10 +1754,7 @@ mod tests {
                 provisional: false,
             },
         );
-        assert!(matches!(
-            log.reduce().unwrap_err(),
-            ReduceError::MissingDecision { .. }
-        ));
+        assert!(matches!(log.reduce().unwrap_err(), ReduceError::MissingDecision { .. }));
         log.events.pop();
         log.push(&task, AUTHOR, posed(&["a", "b"], "c"));
         assert!(matches!(
@@ -1801,13 +1803,12 @@ mod tests {
                     check: None,
                 }],
             ),
-            (
-                "abandoned",
-                vec![TaskEventKind::Abandoned { reason: "r".into() }],
-            ),
+            ("abandoned", vec![TaskEventKind::Abandoned { reason: "r".into() }]),
             (
                 "superseded",
-                vec![TaskEventKind::Superseded { by_task: "other".into() }],
+                vec![TaskEventKind::Superseded {
+                    by_task: "other".into(),
+                }],
             ),
             (
                 "resolved",
@@ -1924,7 +1925,10 @@ mod tests {
         // A provisional choice other than the default is refused.
         let (mut log, task) = setup();
         log.push(&task, AUTHOR, resolved("delete", true));
-        assert!(matches!(log.reduce().unwrap_err(), ReduceError::ProvisionalNotDefault { .. }));
+        assert!(matches!(
+            log.reduce().unwrap_err(),
+            ReduceError::ProvisionalNotDefault { .. }
+        ));
         log.events.pop();
 
         // The poser resolves provisionally on the default: resolved, awaiting veto.
@@ -1959,13 +1963,22 @@ mod tests {
         let d = t.decision.as_ref().unwrap();
         assert!(!d.awaiting_veto());
         let r = d.resolution.as_ref().unwrap();
-        assert_eq!((r.choice.as_str(), r.provisional, r.event_id.as_str()), ("delete", false, veto.id.as_str()));
+        assert_eq!(
+            (r.choice.as_str(), r.provisional, r.event_id.as_str()),
+            ("delete", false, veto.id.as_str())
+        );
         let p = d.superseded_provisional.as_ref().unwrap();
-        assert_eq!((p.choice.as_str(), p.by.as_str(), p.provisional), ("keep", AUTHOR, true));
+        assert_eq!(
+            (p.choice.as_str(), p.by.as_str(), p.provisional),
+            ("keep", AUTHOR, true)
+        );
 
         // A second non-provisional resolve is refused as it always was.
         log.push(&task, DECIDER, resolved("keep", false));
-        assert!(matches!(log.reduce().unwrap_err(), ReduceError::InvalidTransition { .. }));
+        assert!(matches!(
+            log.reduce().unwrap_err(),
+            ReduceError::InvalidTransition { .. }
+        ));
         log.events.pop();
 
         // Confirming is the same event with the provisional choice.
@@ -1982,7 +1995,10 @@ mod tests {
         let (mut log, task) = setup();
         log.push(&task, DECIDER, resolved("keep", false));
         log.push(&task, DECIDER, resolved("delete", false));
-        assert!(matches!(log.reduce().unwrap_err(), ReduceError::InvalidTransition { .. }));
+        assert!(matches!(
+            log.reduce().unwrap_err(),
+            ReduceError::InvalidTransition { .. }
+        ));
     }
 
     /// A pinned STATUS replaces the previous one (history stays in the events), may be set by the
@@ -1997,8 +2013,15 @@ mod tests {
         log.push(&task, OTHER, status("gen 2: tip bbb; next: merge C"));
         let m = log.reduce().unwrap();
         let s = m.tasks[&task].status.as_ref().unwrap();
-        assert_eq!((s.text.as_str(), s.by.as_str(), s.revisions), ("gen 2: tip bbb; next: merge C", OTHER, 2));
-        assert_eq!(m.tasks[&task].effective_state().as_str(), "claimed", "a status never moves state");
+        assert_eq!(
+            (s.text.as_str(), s.by.as_str(), s.revisions),
+            ("gen 2: tip bbb; next: merge C", OTHER, 2)
+        );
+        assert_eq!(
+            m.tasks[&task].effective_state().as_str(),
+            "claimed",
+            "a status never moves state"
+        );
         // The opener still may; a third party may not.
         log.push(&task, AUTHOR, status("gen 3"));
         log.reduce().unwrap();
@@ -2015,8 +2038,14 @@ mod tests {
             },
         );
         log.push(&task, OTHER, status("after the end"));
-        assert!(matches!(log.reduce().unwrap_err(), ReduceError::InvalidTransition { .. }));
+        assert!(matches!(
+            log.reduce().unwrap_err(),
+            ReduceError::InvalidTransition { .. }
+        ));
         log.events.pop();
-        assert_eq!(log.reduce().unwrap().tasks[&task].status.as_ref().unwrap().text, "gen 3");
+        assert_eq!(
+            log.reduce().unwrap().tasks[&task].status.as_ref().unwrap().text,
+            "gen 3"
+        );
     }
 }

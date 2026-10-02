@@ -498,7 +498,11 @@ mod tests {
         let released = new_event(Some(&task), "agent:a", TaskEventKind::Released {});
         let err = store.append_agent_events(vec![note("lost?"), released]).unwrap_err();
         assert!(err.to_string().contains("event rejected"), "{err}");
-        assert_eq!(store.replay().unwrap().events.len(), 1, "nothing of the refused batch landed");
+        assert_eq!(
+            store.replay().unwrap().events.len(),
+            1,
+            "nothing of the refused batch landed"
+        );
 
         let done = new_event(
             Some(&task),

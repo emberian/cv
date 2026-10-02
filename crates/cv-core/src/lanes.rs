@@ -161,7 +161,9 @@ pub struct LaneTask {
 /// `CV_ENDPOINT="lane:x" cv task …`).
 pub fn endpoint_in(text: &str) -> Option<String> {
     static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    let re = RE.get_or_init(|| Regex::new(r#"CV_ENDPOINT=["']?([A-Za-z0-9_.@/-]+:[A-Za-z0-9_.@/:-]+)"#).expect("endpoint regex"));
+    let re = RE.get_or_init(|| {
+        Regex::new(r#"CV_ENDPOINT=["']?([A-Za-z0-9_.@/-]+:[A-Za-z0-9_.@/:-]+)"#).expect("endpoint regex")
+    });
     re.captures(text).map(|c| c[1].to_string())
 }
 
@@ -199,18 +201,27 @@ pub fn attach_tasks(lanes: &mut [Lane], model: &crate::task::TaskReadModel) {
         let mut rows: Vec<LaneTask> = model
             .tasks
             .values()
-            .filter(|t| t.assignee.as_deref().is_some_and(|a| crate::task::same_actor(a, endpoint)))
+            .filter(|t| {
+                t.assignee
+                    .as_deref()
+                    .is_some_and(|a| crate::task::same_actor(a, endpoint))
+            })
             .map(|t| LaneTask {
                 id: t.task_id.clone(),
                 title: t.title.clone(),
                 state: crate::task::effective_display(t),
                 last_note: t.notes.last().map(|n| {
-                    n.text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("").to_string()
+                    n.text
+                        .lines()
+                        .map(str::trim)
+                        .find(|l| !l.is_empty())
+                        .unwrap_or("")
+                        .to_string()
                 }),
                 last_ts: t.last_ts,
             })
             .collect();
-        rows.sort_by(|a, b| b.last_ts.cmp(&a.last_ts));
+        rows.sort_by_key(|t| std::cmp::Reverse(t.last_ts));
         lane.tasks = Some(rows);
     }
 }
@@ -301,13 +312,21 @@ pub fn classify_api_error(e: &ApiErrorNotice) -> Option<&'static str> {
     let error = e.error.as_deref().unwrap_or("");
     if error == "rate_limit"
         || e.status == Some(429)
-        || ["session limit", "usage limit", "rate limit", "rate_limit"].iter().any(|p| text.contains(p))
+        || ["session limit", "usage limit", "rate limit", "rate_limit"]
+            .iter()
+            .any(|p| text.contains(p))
     {
         return Some("rate-limited");
     }
-    if ["prompt is too long", "context length", "context window", "maximum context", "too many tokens"]
-        .iter()
-        .any(|p| text.contains(p))
+    if [
+        "prompt is too long",
+        "context length",
+        "context window",
+        "maximum context",
+        "too many tokens",
+    ]
+    .iter()
+    .any(|p| text.contains(p))
     {
         return Some("context");
     }
@@ -484,7 +503,10 @@ fn lane_of(sub: SubagentInfo, notices: &HashMap<String, TaskNotice>) -> Option<L
     let parked = matches!(status.as_str(), "completed" | "stopped" | "returned");
     let stranded = parked && last_text.as_deref().is_some_and(text_is_waiting);
     let cause = failure_cause(&status, &end);
-    let notice = end.api_error.as_ref().filter(|_| matches!(cause, Some("rate-limited" | "context")));
+    let notice = end
+        .api_error
+        .as_ref()
+        .filter(|_| matches!(cause, Some("rate-limited" | "context")));
     Some(Lane {
         agent_id,
         session_id: sub.session.id.clone(),
@@ -572,7 +594,10 @@ mod tests {
             endpoint_in("export CV_ENDPOINT={owner}; CV_ENDPOINT=$X; CV_ENDPOINT=lane:real").as_deref(),
             Some("lane:real")
         );
-        assert_eq!(description_slug("FIX-KICK: a kick ends authority").as_deref(), Some("fix-kick"));
+        assert_eq!(
+            description_slug("FIX-KICK: a kick ends authority").as_deref(),
+            Some("fix-kick")
+        );
         assert_eq!(description_slug("CV-EDITS").as_deref(), Some("cv-edits"));
         assert_eq!(description_slug(": nothing"), None);
     }
@@ -602,7 +627,11 @@ mod tests {
         assert_eq!(failure_cause("failed", &end(Some(rate.clone()))), Some("rate-limited"));
         assert_eq!(failure_cause("killed", &end(Some(ctx.clone()))), Some("context"));
         assert_eq!(failure_cause("completed", &end(Some(rate))), None, "not dead: no cause");
-        assert_eq!(failure_cause("failed", &end(None)), None, "nothing says why: plain failed");
+        assert_eq!(
+            failure_cause("failed", &end(None)),
+            None,
+            "nothing says why: plain failed"
+        );
         let other = ApiErrorNotice {
             text: "API Error: 500 internal".into(),
             ..ApiErrorNotice::default()

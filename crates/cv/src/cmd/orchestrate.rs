@@ -217,7 +217,9 @@ fn lane_passes(l: &Lane, f: LaneFilter) -> bool {
 fn print_lane_tasks(l: &Lane, tasks: &[cv_core::lanes::LaneTask]) {
     const SHOWN: usize = 5;
     let Some(endpoint) = l.endpoint.as_deref() else {
-        println!("          ⚑ no endpoint (no CV_ENDPOINT export in its tool calls, no lane:<name> matches its description)");
+        println!(
+            "          ⚑ no endpoint (no CV_ENDPOINT export in its tool calls, no lane:<name> matches its description)"
+        );
         return;
     };
     let guessed = if l.endpoint_source == Some(cv_core::lanes::EndpointSource::Description) {
@@ -229,7 +231,11 @@ fn print_lane_tasks(l: &Lane, tasks: &[cv_core::lanes::LaneTask]) {
         println!("          ⚑ {}{guessed}: holds no tasks", sanitize_line(endpoint));
         return;
     }
-    println!("          ⚑ {}{guessed}: {} task(s)", sanitize_line(endpoint), tasks.len());
+    println!(
+        "          ⚑ {}{guessed}: {} task(s)",
+        sanitize_line(endpoint),
+        tasks.len()
+    );
     for t in tasks.iter().take(SHOWN) {
         let note = t
             .last_note
@@ -244,7 +250,11 @@ fn print_lane_tasks(l: &Lane, tasks: &[cv_core::lanes::LaneTask]) {
         );
     }
     if tasks.len() > SHOWN {
-        println!("            (+{} more — `cv task list --assignee {}`)", tasks.len() - SHOWN, sanitize_line(endpoint));
+        println!(
+            "            (+{} more — `cv task list --assignee {}`)",
+            tasks.len() - SHOWN,
+            sanitize_line(endpoint)
+        );
     }
 }
 
@@ -321,7 +331,11 @@ pub(crate) fn cmd_lanes(
     } else {
         format!(
             " ({})",
-            causes.iter().map(|(c, n)| format!("{n} {c}")).collect::<Vec<_>>().join(" · ")
+            causes
+                .iter()
+                .map(|(c, n)| format!("{n} {c}"))
+                .collect::<Vec<_>>()
+                .join(" · ")
         )
     };
     println!(
@@ -342,7 +356,12 @@ pub(crate) fn cmd_lanes(
             truncate(&l.status, 10)
         }
     };
-    let sw = lanes.iter().map(|l| status_of(l).chars().count()).max().unwrap_or(0).max(10);
+    let sw = lanes
+        .iter()
+        .map(|l| status_of(l).chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(10);
     println!(
         "AGENT     {:<sw$} MODEL          STARTED         DUR  TOKENS CALLS  DESCRIPTION",
         "STATUS"
@@ -378,7 +397,12 @@ pub(crate) fn cmd_lanes(
                 .last_turn_at
                 .map(|t| chrono::Utc::now().signed_duration_since(t))
                 .filter(|d| d.num_minutes() >= 60)
-                .map(|d| format!(" · ⚠ quiet {}", cv_core::task::age_short(chrono::Utc::now() - d, chrono::Utc::now())))
+                .map(|d| {
+                    format!(
+                        " · ⚠ quiet {}",
+                        cv_core::task::age_short(chrono::Utc::now() - d, chrono::Utc::now())
+                    )
+                })
                 .unwrap_or_default();
             l.last_tool.as_deref().map(|t| format!("↪ {t}{quiet}"))
         } else {
@@ -393,7 +417,10 @@ pub(crate) fn cmd_lanes(
         match l.failure_cause.as_deref() {
             Some("rate-limited") => println!(
                 "          ✗ {}{} → resume with one message after the reset: SendMessage to {}",
-                truncate(&sanitize_line(l.failure_detail.as_deref().unwrap_or("rate-limited")), 80),
+                truncate(
+                    &sanitize_line(l.failure_detail.as_deref().unwrap_or("rate-limited")),
+                    80
+                ),
                 l.resets_at
                     .map(|t| format!(" (resets {})", fmt_local(t, "%m-%d %H:%M")))
                     .unwrap_or_default(),

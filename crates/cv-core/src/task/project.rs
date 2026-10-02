@@ -150,7 +150,12 @@ pub fn parse_since(s: &str, now: DateTime<Utc>) -> Result<DateTime<Utc>, String>
         return Ok(t.with_timezone(&Utc));
     }
     use chrono::{Local, NaiveDate, NaiveDateTime, TimeZone};
-    for fmt in ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M"] {
+    for fmt in [
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M",
+        "%Y-%m-%d %H:%M",
+    ] {
         if let Ok(ndt) = NaiveDateTime::parse_from_str(s, fmt) {
             if let Some(t) = Local.from_local_datetime(&ndt).single() {
                 return Ok(t.with_timezone(&Utc));

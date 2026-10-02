@@ -484,17 +484,30 @@ fn lanes_tasks_join_by_exported_endpoint_then_description() {
         out.lines().last().unwrap().trim().to_string()
     };
     let a = open("A: the first lane's task", "lane:lane-a");
-    w.cv_ok(&["task", "note", &a, "halfway: the parser is done\nsecond line", "--from", "lane:lane-a"]);
+    w.cv_ok(&[
+        "task",
+        "note",
+        &a,
+        "halfway: the parser is done\nsecond line",
+        "--from",
+        "lane:lane-a",
+    ]);
     open("B: the stranded lane's task", "lane:lane-b");
     open("someone else's", "lane:zzz");
 
     let (out, _) = w.cv_ok(&["lanes", SID, "--tasks"]);
     assert!(out.contains("⚑ lane:lane-a: 1 task(s)"), "{out}");
-    assert!(out.contains("[open] A: the first lane's task · halfway: the parser is done"), "{out}");
+    assert!(
+        out.contains("[open] A: the first lane's task · halfway: the parser is done"),
+        "{out}"
+    );
     assert!(!out.contains("second line"), "only the last note's first line:\n{out}");
     assert!(out.contains("⚑ lane:lane-b (by description): 1 task(s)"), "{out}");
     assert!(!out.contains("someone else's"), "{out}");
-    assert!(out.contains("⚑ no endpoint"), "lane C exported nothing and matches nothing:\n{out}");
+    assert!(
+        out.contains("⚑ no endpoint"),
+        "lane C exported nothing and matches nothing:\n{out}"
+    );
     let (plain, _) = w.cv_ok(&["lanes", SID]);
     assert!(!plain.contains('⚑'), "no join without --tasks:\n{plain}");
 
@@ -520,7 +533,14 @@ fn lanes_tasks_join_by_exported_endpoint_then_description() {
 
 /// A Claude Code API-error notice, in the record shape session 0c315aee's kills left (content
 /// redacted to the notice text; `quotaLimits` carried only on the rate limit).
-fn api_error(uuid: &str, ts: &str, text: &str, error: &str, status: Option<u64>, resets_at: Option<i64>) -> serde_json::Value {
+fn api_error(
+    uuid: &str,
+    ts: &str,
+    text: &str,
+    error: &str,
+    status: Option<u64>,
+    resets_at: Option<i64>,
+) -> serde_json::Value {
     let mut v = serde_json::json!({
         "type": "assistant", "uuid": uuid, "sessionId": "s", "timestamp": ts, "isSidechain": true,
         "message": {"id": format!("e-{uuid}"), "model": "<synthetic>", "role": "assistant", "type": "message",
@@ -558,7 +578,12 @@ fn lanes_failure_cause_from_the_transcript() {
     let run = |id: &str, desc: &str, tail: Vec<serde_json::Value>| {
         let mut lines = vec![
             user(&format!("{id}0"), "2026-10-01T19:00:10Z", "You are a lane."),
-            assistant_tool(&format!("{id}1"), "2026-10-01T19:00:20Z", "Bash", serde_json::json!({"command": "cargo build"})),
+            assistant_tool(
+                &format!("{id}1"),
+                "2026-10-01T19:00:20Z",
+                "Bash",
+                serde_json::json!({"command": "cargo build"}),
+            ),
             tool_result(&format!("{id}2"), "2026-10-01T19:01:00Z", &format!("toolu_{id}1"), "ok"),
         ];
         lines.extend(tail);
@@ -567,18 +592,39 @@ fn lanes_failure_cause_from_the_transcript() {
     run(
         "eee5",
         "LANE-E: killed by the session limit",
-        vec![api_error("e3", "2026-10-01T20:10:20Z", "You've hit your session limit · resets 9pm (America/New_York)", "rate_limit", Some(429), Some(1_790_902_800))],
+        vec![api_error(
+            "e3",
+            "2026-10-01T20:10:20Z",
+            "You've hit your session limit · resets 9pm (America/New_York)",
+            "rate_limit",
+            Some(429),
+            Some(1_790_902_800),
+        )],
     );
     run(
         "fff6",
         "LANE-F: the standing integrator",
-        vec![api_error("f3", "2026-10-01T19:30:04Z", "Prompt is too long", "invalid_request", None, None)],
+        vec![api_error(
+            "f3",
+            "2026-10-01T19:30:04Z",
+            "Prompt is too long",
+            "invalid_request",
+            None,
+            None,
+        )],
     );
     run(
         "ggg7",
         "LANE-G: resumed after the limit",
         vec![
-            api_error("g3", "2026-10-01T20:10:21Z", "You've hit your session limit · resets 9pm (America/New_York)", "rate_limit", Some(429), Some(1_790_902_800)),
+            api_error(
+                "g3",
+                "2026-10-01T20:10:21Z",
+                "You've hit your session limit · resets 9pm (America/New_York)",
+                "rate_limit",
+                Some(429),
+                Some(1_790_902_800),
+            ),
             user("g4", "2026-10-01T21:10:00Z", "The coordinator sent a message: resume."),
             assistant("g5", "2026-10-01T21:29:00Z", "Resumed and finished; report written."),
         ],
@@ -587,13 +633,25 @@ fn lanes_failure_cause_from_the_transcript() {
 
     let (out, _) = w.cv_ok(&["lanes", SID]);
     assert!(out.contains("eee5      failed:rate-limited"), "{out}");
-    assert!(out.contains("✗ You've hit your session limit · resets 9pm (America/New_York) (resets "), "{out}");
-    assert!(out.contains("resume with one message after the reset: SendMessage to eee5"), "{out}");
+    assert!(
+        out.contains("✗ You've hit your session limit · resets 9pm (America/New_York) (resets "),
+        "{out}"
+    );
+    assert!(
+        out.contains("resume with one message after the reset: SendMessage to eee5"),
+        "{out}"
+    );
     assert!(out.contains("fff6      failed:context"), "{out}");
     assert!(out.contains("✗ Prompt is too long → it cannot be resumed"), "{out}");
-    assert!(out.contains("ggg7      completed"), "a resumed lane is not dead:\n{out}");
+    assert!(
+        out.contains("ggg7      completed"),
+        "a resumed lane is not dead:\n{out}"
+    );
     assert!(out.contains("hhh8      failed "), "no notice: plain failed:\n{out}");
-    assert!(out.contains("4 sub-agents: 0 running · 1 completed · 3 other (1 context · 1 rate-limited)"), "{out}");
+    assert!(
+        out.contains("4 sub-agents: 0 running · 1 completed · 3 other (1 context · 1 rate-limited)"),
+        "{out}"
+    );
 
     let (json, _) = w.cv_ok(&["lanes", SID, "--json"]);
     let rows: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();

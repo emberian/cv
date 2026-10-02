@@ -89,10 +89,7 @@ pub(crate) fn run(bind: &str, default_who: Option<String>, open: bool) -> Result
         }
     }
     let server = Arc::new(server);
-    let ctx = Arc::new(Ctx {
-        bind_host,
-        default_who,
-    });
+    let ctx = Arc::new(Ctx { bind_host, default_who });
     let mut workers = Vec::new();
     for _ in 0..2 {
         let server = Arc::clone(&server);
@@ -207,12 +204,7 @@ fn handle(mut request: Request, ctx: &Ctx) {
     let mut body = Value::Null;
     if method == Method::Post {
         let mut buf = String::new();
-        if request
-            .as_reader()
-            .take(1 << 20)
-            .read_to_string(&mut buf)
-            .is_err()
-        {
+        if request.as_reader().take(1 << 20).read_to_string(&mut buf).is_err() {
             let _ = request.respond(json_response(400, &json!({"error": "unreadable body"})));
             return;
         }
@@ -229,7 +221,9 @@ fn handle(mut request: Request, ctx: &Ctx) {
 
     let parts: Vec<&str> = segments.iter().map(String::as_str).collect();
     let response = match (method, parts.as_slice()) {
-        (Method::Get, []) | (Method::Get, ["index.html"]) => text_response(200, "text/html; charset=utf-8", PAGE.to_string()),
+        (Method::Get, []) | (Method::Get, ["index.html"]) => {
+            text_response(200, "text/html; charset=utf-8", PAGE.to_string())
+        }
         (Method::Get, ["api", "inbox"]) => {
             let (status, v) = api_inbox(ctx, &q);
             json_response(status, &v)
@@ -259,7 +253,10 @@ fn handle(mut request: Request, ctx: &Ctx) {
                 .or_else(|| ctx.default_who.clone());
             let (status, v) = match who {
                 Some(who) => api_act(id, verb, &who, &body),
-                None => (400, json!({"error": "who? pass `who` in the body or start with --assignee"})),
+                None => (
+                    400,
+                    json!({"error": "who? pass `who` in the body or start with --assignee"}),
+                ),
             };
             json_response(status, &v)
         }
@@ -384,7 +381,7 @@ fn api_backlog(q: &Query) -> (u16, Value) {
             Ok(t) => t,
             Err(e) => return (400, json!({"error": e})),
         };
-        tasks.sort_by(|a, b| b.last_ts.cmp(&a.last_ts));
+        tasks.sort_by_key(|t| std::cmp::Reverse(t.last_ts));
         let now = Utc::now();
         let rows: Vec<Value> = tasks
             .iter()
@@ -414,7 +411,10 @@ fn api_backlog(q: &Query) -> (u16, Value) {
             .collect();
         repos.sort();
         repos.dedup();
-        (200, json!({"count": rows.len(), "repos": repos, "tasks": rows, "warnings": outcome.warnings}))
+        (
+            200,
+            json!({"count": rows.len(), "repos": repos, "tasks": rows, "warnings": outcome.warnings}),
+        )
     })
 }
 
@@ -422,7 +422,11 @@ fn api_events(q: &Query) -> Result<String> {
     let outcome = task::replay()?;
     let now = Utc::now();
     let task_id = match q.get("task") {
-        Some(p) => Some(task::resolve_id(&outcome.model, &p).map_err(|e| anyhow::anyhow!(e))?.to_string()),
+        Some(p) => Some(
+            task::resolve_id(&outcome.model, &p)
+                .map_err(|e| anyhow::anyhow!(e))?
+                .to_string(),
+        ),
         None => None,
     };
     let f = EventFilter {
@@ -460,7 +464,12 @@ fn act(id: &str, verb: &str, who: &str, body: &Value) -> Result<Value> {
     let t = &outcome.model.tasks[&id];
     let by = format!("web:{}", who.trim());
     let store = TaskStore::default_store();
-    let text = |k: &str| body.get(k).and_then(Value::as_str).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let text = |k: &str| {
+        body.get(k)
+            .and_then(Value::as_str)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
     let appended = match verb {
         "resolve" => {
             let accept = body.get("accept_default").and_then(Value::as_bool).unwrap_or(false);
@@ -652,7 +661,10 @@ mod tests {
         assert!(host_allowed(Some("localhost:7777"), "127.0.0.1"));
         assert!(host_allowed(Some("192.168.1.20:7777"), "0.0.0.0"), "a phone on the LAN");
         assert!(host_allowed(Some("[::1]:7777"), "127.0.0.1"));
-        assert!(!host_allowed(Some("evil.example:7777"), "0.0.0.0"), "DNS rebinding vector");
+        assert!(
+            !host_allowed(Some("evil.example:7777"), "0.0.0.0"),
+            "DNS rebinding vector"
+        );
         assert!(!host_allowed(None, "127.0.0.1"));
     }
 

@@ -155,17 +155,18 @@ fn clauses_after(text: &str, markers: &[&str]) -> Vec<String> {
     hits.sort();
     // A longer marker that starts where a shorter one does wins (`default if silent:` over
     // `default:` cannot collide, but `recommend:`/`recommendation:` share a prefix).
-    hits.dedup_by(|b, a| b.0 == a.0 && { a.1 = a.1.max(b.1); true });
+    hits.dedup_by(|b, a| {
+        b.0 == a.0 && {
+            a.1 = a.1.max(b.1);
+            true
+        }
+    });
     hits.into_iter()
         .map(|(_, end)| {
             let tail = &text[end..];
             let tail = tail.trim_start();
             let stop = clause_end(tail);
-            tail[..stop]
-                .trim()
-                .trim_end_matches(['.', ';', ','])
-                .trim()
-                .to_string()
+            tail[..stop].trim().trim_end_matches(['.', ';', ',']).trim().to_string()
         })
         .filter(|c| !c.is_empty())
         .collect()
@@ -260,7 +261,11 @@ pub fn strip_parentheticals(s: &str) -> String {
         }
         prev_space = sp;
     }
-    tidy.replace(" ?", "?").replace(" .", ".").replace(" ,", ",").trim().to_string()
+    tidy.replace(" ?", "?")
+        .replace(" .", ".")
+        .replace(" ,", ",")
+        .trim()
+        .to_string()
 }
 
 /// The first clause of a question: up to the first sentence end, `; `, ` — ` or ` -- `.
@@ -302,7 +307,12 @@ pub fn parse_deadline(s: &str, now: DateTime<Utc>) -> Result<DateTime<Utc>, Stri
         return Ok(t.with_timezone(&Utc));
     }
     use chrono::{Local, NaiveDate, NaiveDateTime, TimeZone};
-    for fmt in ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M"] {
+    for fmt in [
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M",
+        "%Y-%m-%d %H:%M",
+    ] {
         if let Ok(ndt) = NaiveDateTime::parse_from_str(s, fmt) {
             if let Some(t) = Local.from_local_datetime(&ndt).single() {
                 return Ok(t.with_timezone(&Utc));
@@ -389,9 +399,17 @@ mod tests {
             n.default_choice,
             "constants; a door that needs time reads clock/now from the kernel's clock cell instead"
         );
-        assert!(n.title.starts_with("N11: a door's poke sample fixes eny/our/now = 0 so a claim"), "{}", n.title);
+        assert!(
+            n.title
+                .starts_with("N11: a door's poke sample fixes eny/our/now = 0 so a claim"),
+            "{}",
+            n.title
+        );
         assert!(n.title.chars().count() <= 95, "{}", n.title);
-        assert!(n.alternatives.is_empty(), "`the alternative (now = …)` is prose, not a marker");
+        assert!(
+            n.alternatives.is_empty(),
+            "`the alternative (now = …)` is prose, not a marker"
+        );
     }
 
     #[test]
@@ -403,12 +421,20 @@ mod tests {
             "do NOT wire a second history; delete the event-log family as a twin unless K-DOC-EVENTS (DEOS Oct 26+, O(doc) history) is wanted · keep; hiding the metadata too is one predicate"
         );
         let n = parse_decide_note(DEOS).unwrap();
-        assert_eq!(n.label.as_deref(), Some("DEOS.md §5"), "boilerplate and the doc remark are not the label");
+        assert_eq!(
+            n.label.as_deref(),
+            Some("DEOS.md §5"),
+            "boilerplate and the doc remark are not the label"
+        );
         assert_eq!(n.default_choice, "", "`REFERENCED by default,` is prose, not a marker");
         let (d, opts) = options_of(&n);
         assert_eq!(d, AS_PROPOSED);
         assert_eq!(opts, vec![AS_PROPOSED]);
-        assert!(n.title.starts_with("DEOS.md §5: quotes: REFERENCED by default"), "{}", n.title);
+        assert!(
+            n.title.starts_with("DEOS.md §5: quotes: REFERENCED by default"),
+            "{}",
+            n.title
+        );
     }
 
     #[test]
@@ -433,7 +459,10 @@ mod tests {
             "2026-10-05T10:00:00Z".parse::<DateTime<Utc>>().unwrap()
         );
         let d = parse_deadline("2026-10-03", now).unwrap();
-        assert!(d > "2026-10-02T12:00:00Z".parse::<DateTime<Utc>>().unwrap(), "end of local day");
+        assert!(
+            d > "2026-10-02T12:00:00Z".parse::<DateTime<Utc>>().unwrap(),
+            "end of local day"
+        );
         assert!(parse_deadline("whenever", now).is_err());
     }
 }

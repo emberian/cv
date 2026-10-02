@@ -175,7 +175,9 @@ pub(crate) fn resolve(
         Answer::AcceptDefault => d.default_choice.clone(),
         Answer::Confirm => match d.resolution.as_ref().filter(|r| r.provisional) {
             Some(r) => r.choice.clone(),
-            None => bail!("task {short} has no provisional resolution to confirm — answer it with --choice or --accept-default"),
+            None => bail!(
+                "task {short} has no provisional resolution to confirm — answer it with --choice or --accept-default"
+            ),
         },
     };
     if provisional && choice != d.default_choice {
@@ -190,9 +192,7 @@ pub(crate) fn resolve(
         let near: Vec<&str> = d
             .options
             .iter()
-            .filter(|o| {
-                o.eq_ignore_ascii_case(&choice) || o.to_lowercase().starts_with(&choice.to_lowercase())
-            })
+            .filter(|o| o.eq_ignore_ascii_case(&choice) || o.to_lowercase().starts_with(&choice.to_lowercase()))
             .map(String::as_str)
             .collect();
         if let [one] = near.as_slice() {
@@ -480,8 +480,15 @@ pub(crate) fn event_detail(ev: &TaskEvent) -> String {
         TaskEventKind::StatusSet { text } => format!("STATUS: {}", first_line(text, 150)),
         TaskEventKind::Opened { title, .. } => truncate(&sanitize_line(title), 120),
         TaskEventKind::Claimed { assignee } => format!("by {}", sanitize_line(assignee)),
-        TaskEventKind::Done { observed, .. } => observed.as_deref().map(|o| truncate(&sanitize_line(o), 120)).unwrap_or_default(),
-        TaskEventKind::Tagged { tags } => tags.iter().map(|t| format!("#{}", sanitize_line(t))).collect::<Vec<_>>().join(" "),
+        TaskEventKind::Done { observed, .. } => observed
+            .as_deref()
+            .map(|o| truncate(&sanitize_line(o), 120))
+            .unwrap_or_default(),
+        TaskEventKind::Tagged { tags } => tags
+            .iter()
+            .map(|t| format!("#{}", sanitize_line(t)))
+            .collect::<Vec<_>>()
+            .join(" "),
         _ => String::new(),
     }
 }
@@ -810,7 +817,10 @@ pub(crate) fn inbox_page(
 /// what others wait on you for.
 pub(crate) const INBOX_GROUPS: &[(InboxReason, &str)] = &[
     (InboxReason::DecisionOwed, "decisions owed"),
-    (InboxReason::Discussing, "in discussion (parked, still yours to resolve)"),
+    (
+        InboxReason::Discussing,
+        "in discussion (parked, still yours to resolve)",
+    ),
     (InboxReason::Provisional, "made for you (veto?)"),
     (InboxReason::AssignedOpen, "assigned actions"),
     (InboxReason::ClaimedByYou, "claimed work"),
@@ -851,10 +861,19 @@ pub(crate) fn render_inbox_text(page: &InboxPage) -> String {
                     if !d.alternatives.is_empty() {
                         line.push_str(&format!(
                             " · veto to: {}",
-                            d.alternatives.iter().map(|a| sanitize_line(a)).collect::<Vec<_>>().join(" / ")
+                            d.alternatives
+                                .iter()
+                                .map(|a| sanitize_line(a))
+                                .collect::<Vec<_>>()
+                                .join(" / ")
                         ));
                     }
-                    out.push_str(&format!("{:width$}{}\n", "", truncate(&line, 200), width = i.short.len() + 3));
+                    out.push_str(&format!(
+                        "{:width$}{}\n",
+                        "",
+                        truncate(&line, 200),
+                        width = i.short.len() + 3
+                    ));
                     continue;
                 }
                 let mut line = format!("⇒ default: {}", sanitize_line(&d.default_choice));
@@ -871,7 +890,12 @@ pub(crate) fn render_inbox_text(page: &InboxPage) -> String {
                 if let Some(p) = &d.deadline_phrase {
                     line.push_str(&format!(" · {p}"));
                 }
-                out.push_str(&format!("{:width$}{}\n", "", truncate(&line, 200), width = i.short.len() + 3));
+                out.push_str(&format!(
+                    "{:width$}{}\n",
+                    "",
+                    truncate(&line, 200),
+                    width = i.short.len() + 3
+                ));
             }
         }
     }
