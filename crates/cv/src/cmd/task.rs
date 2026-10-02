@@ -347,18 +347,31 @@ pub(crate) enum TaskCmd {
         /// This decision blocks another task (writes a `blocked_by` on THAT task). Repeatable.
         #[arg(long = "blocks", value_name = "ID")]
         blocks: Vec<String>,
+        /// Resolve it on its default NOW, on the decider's behalf (by you, the poser), with a veto
+        /// window: work proceeds, and their inbox shows it under "made for you (veto?)" until they
+        /// `--confirm` or choose otherwise.
+        #[arg(long)]
+        provisional: bool,
         /// Acting endpoint recorded in `by`. Default: $CV_ENDPOINT.
         #[arg(long)]
         from: Option<String>,
     },
     /// Answer a decision: `--accept-default`, or `--choice "<option>"` (one of the posed options).
-    /// Records WHO resolved it: pass `--from <you>` or set `CV_ENDPOINT` once.
+    /// Records WHO resolved it: pass `--from <you>` or set `CV_ENDPOINT` once. On a decision made
+    /// for you provisionally, `--confirm` keeps its choice and `--choice` vetoes it.
     Resolve {
         id: String,
         #[arg(long, value_name = "OPTION", group = "answer", required = true)]
         choice: Option<String>,
         #[arg(long = "accept-default", group = "answer")]
         accept_default: bool,
+        /// Confirm a provisional resolution (the decider answers with the choice made for them).
+        #[arg(long, group = "answer")]
+        confirm: bool,
+        /// Resolve on the default on the decider's behalf, with a veto window (the poser's verb;
+        /// only `--accept-default` is admissible).
+        #[arg(long, conflicts_with = "confirm")]
+        provisional: bool,
         /// Why (`-` = stdin). Recorded IN the resolution event, so it lands with it.
         #[arg(long, conflicts_with = "note_file")]
         note: Option<String>,
@@ -970,18 +983,36 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                     for a in d.alternatives() {
                         println!("    option:   {}", sanitize_line(a));
                     }
+                    if let Some(p) = &d.superseded_provisional {
+                        println!(
+                            "    provisionally: {} — by {}, {} (then answered by the decider, below)",
+                            sanitize_line(&p.choice),
+                            sanitize_line(&p.by),
+                            fmt_local(p.ts, "%Y-%m-%d %H:%M"),
+                        );
+                    }
                     match &d.resolution {
-                        Some(r) => println!(
-                            "    resolved: {} — by {}, {}{}{}",
-                            sanitize_line(&r.choice),
-                            sanitize_line(&r.by),
-                            fmt_local(r.ts, "%Y-%m-%d %H:%M"),
-                            if r.accepted_default { " (the default)" } else { "" },
-                            r.note
-                                .as_deref()
-                                .map(|n| format!(" · {}", sanitize_line(n)))
-                                .unwrap_or_default()
-                        ),
+                        Some(r) => {
+                            println!(
+                                "    resolved: {} — by {}, {}{}{}{}",
+                                sanitize_line(&r.choice),
+                                sanitize_line(&r.by),
+                                fmt_local(r.ts, "%Y-%m-%d %H:%M"),
+                                if r.accepted_default { " (the default)" } else { "" },
+                                if r.provisional { " PROVISIONAL" } else { "" },
+                                r.note
+                                    .as_deref()
+                                    .map(|n| format!(" · {}", sanitize_line(n)))
+                                    .unwrap_or_default()
+                            );
+                            if r.provisional {
+                                println!(
+                                    "    veto?:    cv task resolve {} --confirm --from {owner} · or --choice \"<option>\"",
+                                    prefix(&t.task_id, plen),
+                                    owner = sanitize_line(t.assignee.as_deref().unwrap_or("<you>"))
+                                );
+                            }
+                        }
                         None if !t.state.is_terminal() => println!(
                             "    resolve:  cv task resolve {} --accept-default --from {}",
                             prefix(&t.task_id, plen),
@@ -1357,6 +1388,7 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
             channel,
             tags,
             blocks,
+            provisional,
             from,
         } => {
             let repo = match repo {
@@ -1398,7 +1430,8 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                 blocks,
             };
             let store = TaskStore::default_store();
-            let (events, warnings) = task_ops::pose(&store, &from_or_cv(from), spec)?;
+            let from = from_or_cv(from);
+            let (events, warnings) = task_ops::pose(&store, &from, spec)?;
             for w in &warnings {
                 eprintln!("⚠ {}", sanitize_line(w));
             }
@@ -1408,6 +1441,28 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                 _ => String::new(),
             };
             println!("✦ decision {} posed for {}", prefix(&id, 13), sanitize_line(&for_who));
+            if provisional {
+                let outcome = replay_loud()?;
+                let report = task_ops::resolve(
+                    &store,
+                    &outcome.model,
+                    &from,
+                    None,
+                    &id,
+                    task_ops::Answer::AcceptDefault,
+                    None,
+                    true,
+                )?;
+                for w in report.replay_warnings.iter().chain(&report.warnings) {
+                    eprintln!("⚠ {}", sanitize_line(w));
+                }
+                println!(
+                    "✦ resolved {} provisionally on the default (by {}) — {} can --confirm or veto",
+                    prefix(&id, 13),
+                    sanitize_line(&from),
+                    sanitize_line(&for_who)
+                );
+            }
             println!("{id}");
             Ok(())
         }
@@ -1415,6 +1470,8 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
             id,
             choice,
             accept_default,
+            confirm,
+            provisional,
             note,
             note_file,
             from,
@@ -1435,22 +1492,24 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                     short = prefix(&id, 13),
                     answer = match &choice {
                         Some(c) => format!("--choice {c:?}"),
+                        None if confirm => "--confirm".into(),
                         None => "--accept-default".into(),
                     }
                 ),
             };
             let store = TaskStore::default_store();
-            let answer = task_ops::Answer::from_flags(choice, accept_default)?;
-            let report = task_ops::resolve(&store, &outcome.model, &from, token, &id, answer, note)?;
+            let answer = task_ops::Answer::from_flags(choice, accept_default, confirm)?;
+            let report = task_ops::resolve(&store, &outcome.model, &from, token, &id, answer, note, provisional)?;
             for w in report.replay_warnings.iter().chain(&report.warnings) {
                 eprintln!("⚠ {}", sanitize_line(w));
             }
-            if let TaskEventKind::Resolved { choice, .. } = &report.event.kind {
+            if let TaskEventKind::Resolved { choice, provisional, .. } = &report.event.kind {
                 println!(
-                    "✦ resolved {} → {} (by {})",
+                    "✦ resolved {} → {} (by {}){}",
                     prefix(&id, 13),
                     sanitize_line(choice),
-                    sanitize_line(&from)
+                    sanitize_line(&from),
+                    if *provisional { " — provisional: the decider can --confirm or veto" } else { "" }
                 );
             }
             Ok(())

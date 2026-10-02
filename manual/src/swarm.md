@@ -93,9 +93,12 @@ Ranked by how often the gap bit:
    one event. Four lanes and the orchestrator lost or re-homed notes on this.~~ **Landed:** a note on
    a terminal task appends with `post_close: true` ("(after close)" on every surface) and never moves
    the state; `done` / `abandon` take `--note` / `--note-file` and append note + close as one unit.
-2. **Provisional resolutions.** `cv task decide … --provisional` resolves a decision on its default *by
+2. ~~**Provisional resolutions.** `cv task decide … --provisional` resolves a decision on its default *by
    the orchestrator* with a veto window; the inbox shows it under "made for you — veto?" and the
-   decider's `resolve` overrides. Today this is prose on a note.
+   decider's `resolve` overrides. Today this is prose on a note.~~ **Landed:** `decide --provisional` /
+   `resolve --accept-default --provisional`; inbox group "made for you (veto?)" (not owed); the
+   decider's `resolve --confirm | --choice` replaces it — the one state-bearing event a terminal task
+   accepts, and only from the decision's assignee.
 3. **One way to pose a decision.** A task tagged `decision` with no options should be refused or
    upgraded to a `decide` with a required default.
 4. **Lanes joined to tasks.** `cv lanes --tasks`: the lane table knows the agent and its description;

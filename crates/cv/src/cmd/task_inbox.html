@@ -224,9 +224,9 @@
   function counters() {
     const p = S.page; if (!p) return;
     const c = p.counts;
-    $('#counter').textContent = c.decisions + ' owed' + (c.discussing ? ' · ' + c.discussing + ' in discussion' : '') + ' · ' + c.assigned + ' assigned · ' + c.claimed + ' claimed · ' + c.reviews + ' reviews · ' + c.unread + ' unread' +
+    $('#counter').textContent = c.decisions + ' owed' + (c.discussing ? ' · ' + c.discussing + ' in discussion' : '') + (c.provisional ? ' · ' + c.provisional + ' made for you' : '') + ' · ' + c.assigned + ' assigned · ' + c.claimed + ' claimed · ' + c.reviews + ' reviews · ' + c.unread + ' unread' +
       (p.hidden ? ' · ' + p.hidden + ' older hidden' : '') + ' · ' + fmtHm(new Date().toISOString());
-    $('#n-decisions').textContent = (c.decisions || c.discussing) ? ' ' + c.decisions + (c.discussing ? '+' + c.discussing : '') : '';
+    $('#n-decisions').textContent = (c.decisions || c.discussing || c.provisional) ? ' ' + c.decisions + ((c.discussing + c.provisional) ? '+' + (c.discussing + c.provisional) : '') : '';
     $('#n-actions').textContent = (c.assigned + c.claimed + c.reviews + c.unlanded) ? ' ' + (c.assigned + c.claimed + c.reviews + c.unlanded) : '';
     $('#n-closed').textContent = c.closed ? ' ' + c.closed : '';
     if (S.lanes) $('#n-lanes').textContent = ' ' + S.lanes.counts.running + '/' + S.lanes.counts.total;
@@ -237,8 +237,8 @@
   // ---------- items for keyboard ----------
   function visibleItems() {
     const p = S.page; if (!p) return [];
-    if (S.pane === 'decisions') return p.items.filter((i) => (i.reason === 'decision_owed' || i.reason === 'discussing') && matches(i.title + ' ' + i.body + ' ' + (i.tags || []).join(' ')));
-    if (S.pane === 'actions') return p.items.filter((i) => i.reason !== 'decision_owed' && i.reason !== 'discussing' && matches(i.title + ' ' + i.body));
+    if (S.pane === 'decisions') return p.items.filter((i) => isDecisionReason(i.reason) && matches(i.title + ' ' + i.body + ' ' + (i.tags || []).join(' ')));
+    if (S.pane === 'actions') return p.items.filter((i) => !isDecisionReason(i.reason) && matches(i.title + ' ' + i.body));
     if (S.pane === 'closed') return p.closed.filter((i) => matches(i.title + ' ' + i.body));
     if (S.pane === 'backlog') return (S.backlog ? S.backlog.tasks : []).filter((t) => matches(t.title + ' ' + t.body + ' ' + (t.tags || []).join(' ') + ' ' + (t.assignee || '')));
     if (S.pane === 'lanes') return (S.lanes ? S.lanes.lanes : []).filter((l) => matches((l.description || '') + ' ' + l.agent_id + ' ' + (l.last_tool || '')));
@@ -262,11 +262,13 @@
           its.forEach((i) => { main.appendChild(card(i, false, items.indexOf(i))); k++; });
         });
       } else if (S.pane === 'decisions') {
-        const owed = items.filter((i) => i.reason === 'decision_owed'), parked = items.filter((i) => i.reason === 'discussing');
+        const owed = items.filter((i) => i.reason === 'decision_owed'), parked = items.filter((i) => i.reason === 'discussing'), made = items.filter((i) => i.reason === 'provisional');
         if (owed.length) main.appendChild(el('h2', { text: 'owed (' + owed.length + ')' }));
         owed.forEach((i) => main.appendChild(card(i, false, items.indexOf(i))));
         if (parked.length) main.appendChild(el('h2', { text: 'in discussion (' + parked.length + ') — parked, the ball is with whoever posed it; resolve when ready' }));
         parked.forEach((i) => main.appendChild(card(i, false, items.indexOf(i))));
+        if (made.length) main.appendChild(el('h2', { text: 'made for you (veto?) (' + made.length + ') — resolved on the default so work could proceed; confirm, or pick another option to veto' }));
+        made.forEach((i) => main.appendChild(card(i, false, items.indexOf(i))));
       } else {
         items.forEach((i, k) => main.appendChild(card(i, closed, k)));
       }
@@ -316,11 +318,23 @@
     return el('div', { class: 'card' + (i.unread && !closed ? ' unread' : '') + (k === S.sel ? ' sel' : ''), onclick: () => { S.sel = k; S.keyboard = false; document.querySelectorAll('.card.sel').forEach((c) => c.classList.remove('sel')); }, 'data-k': k }, kids);
   }
 
+  function isDecisionReason(r) { return r === 'decision_owed' || r === 'discussing' || r === 'provisional'; }
+
   function decisionBlock(i, closed) {
     const d = i.decision;
+    if (d.resolution && d.resolution.provisional && !closed) {
+      // Made for you: confirm keeps it; each alternative is a veto (a new resolution that replaces it).
+      const r = d.resolution;
+      const buttons = [el('button', { class: 'btn primary', onclick: () => act(i, 'resolve', { confirm: true }) }, [el('kbd', { text: 'a' }), 'confirm'])];
+      d.alternatives.forEach((o, n) => buttons.push(el('button', { class: 'btn', title: 'veto: ' + o, onclick: () => act(i, 'resolve', { choice: o }) }, [el('kbd', { text: String(n + 1) }), o])));
+      return el('div', { class: 'decision' }, [
+        el('p', { class: 'default' }, [el('b', { text: 'made for you: ' }), r.choice + ' — ' + r.by + ', ' + fmtTs(r.ts) + (r.note ? ' · ' + r.note : '')]),
+        el('div', { class: 'choices' }, buttons)]);
+    }
     if (d.resolution) {
       const r = d.resolution;
-      return el('div', { class: 'decision' }, [el('p', { class: 'default resolved', text: '✓ ' + r.choice + (r.accepted_default ? ' (the default)' : '') + ' — ' + r.by + ', ' + fmtTs(r.ts) + (r.note ? ' · ' + r.note : '') })]);
+      const was = d.superseded_provisional ? ' (provisionally ' + d.superseded_provisional.choice + ' by ' + d.superseded_provisional.by + ')' : '';
+      return el('div', { class: 'decision' }, [el('p', { class: 'default resolved', text: '✓ ' + r.choice + (r.accepted_default ? ' (the default)' : '') + (r.provisional ? ' — provisional' : '') + ' — ' + r.by + ', ' + fmtTs(r.ts) + (r.note ? ' · ' + r.note : '') + was })]);
     }
     const buttons = [el('button', { class: 'btn primary', onclick: () => act(i, 'resolve', { accept_default: true }) }, [el('kbd', { text: 'a' }), 'accept the default'])];
     d.alternatives.forEach((o, n) => buttons.push(el('button', { class: 'btn', title: o, onclick: () => act(i, 'resolve', { choice: o }) }, [el('kbd', { text: String(n + 1) }), o])));
@@ -525,12 +539,13 @@
       case 'a':
         if (!inboxPane || !cur) break;
         if (cur.decision && !cur.decision.resolution) act(cur, 'resolve', { accept_default: true });
+        else if (cur.decision && cur.reason === 'provisional') act(cur, 'resolve', { confirm: true });
         else if (!cur.decision && (cur.reason === 'decision_owed' || cur.reason === 'discussing')) { const b = document.querySelector('.card.sel .decision .btn.primary'); if (b) b.click(); }
         break;
       case 'd': if (inboxPane && cur && cur.reason !== 'discussing' && !(cur.decision && cur.decision.resolution)) discuss(cur); break;
       case 'n': if (cur) { const ta = document.getElementById('note-' + cur.id); if (ta) { ta.focus(); ev.preventDefault(); } else if (S.pane === 'backlog') { S.expanded['b:' + cur.id] = true; render(); } } break;
       default:
-        if (/^[1-9]$/.test(ev.key) && inboxPane && cur && cur.decision && !cur.decision.resolution) {
+        if (/^[1-9]$/.test(ev.key) && inboxPane && cur && cur.decision && (!cur.decision.resolution || cur.reason === 'provisional')) {
           const o = cur.decision.alternatives[parseInt(ev.key, 10) - 1]; if (o) act(cur, 'resolve', { choice: o });
         }
     }

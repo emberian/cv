@@ -114,20 +114,25 @@ pub(crate) fn pose(store: &TaskStore, from: &str, spec: DecisionSpec) -> Result<
 pub(crate) enum Answer {
     Choice(String),
     AcceptDefault,
+    /// Confirm a provisional resolution: the decider answers with the choice made for them.
+    Confirm,
 }
 
 impl Answer {
-    pub fn from_flags(choice: Option<String>, accept_default: bool) -> Result<Answer> {
-        match (choice, accept_default) {
-            (Some(c), _) => Ok(Answer::Choice(c.trim().to_string())),
-            (None, true) => Ok(Answer::AcceptDefault),
-            (None, false) => bail!("pass --choice \"<option>\" or --accept-default"),
+    pub fn from_flags(choice: Option<String>, accept_default: bool, confirm: bool) -> Result<Answer> {
+        match (choice, accept_default, confirm) {
+            (Some(c), _, _) => Ok(Answer::Choice(c.trim().to_string())),
+            (None, true, _) => Ok(Answer::AcceptDefault),
+            (None, false, true) => Ok(Answer::Confirm),
+            (None, false, false) => bail!("pass --choice \"<option>\", --accept-default, or --confirm"),
         }
     }
 }
 
 /// Resolve a decision (full task id) with `answer`. `from` is the resolver and is recorded;
-/// `token` is the TOFU credential for it.
+/// `token` is the TOFU credential for it. `provisional`: resolve it on its default on the
+/// decider's behalf, with a veto window (the reducer refuses a provisional non-default choice).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve(
     store: &TaskStore,
     model: &TaskReadModel,
@@ -136,18 +141,27 @@ pub(crate) fn resolve(
     id: &str,
     answer: Answer,
     note: Option<String>,
+    provisional: bool,
 ) -> Result<task::AppendOutcome> {
     let t = model.tasks.get(id).with_context(|| format!("no task {id}"))?;
+    let short = &id[..13.min(id.len())];
     let Some(d) = t.decision.as_ref() else {
-        bail!(
-            "task {} is not a decision (nothing was posed) — finish it with `cv task done`",
-            &id[..13.min(id.len())]
-        );
+        bail!("task {short} is not a decision (nothing was posed) — finish it with `cv task done`");
     };
     let choice = match answer {
         Answer::Choice(c) => c,
         Answer::AcceptDefault => d.default_choice.clone(),
+        Answer::Confirm => match d.resolution.as_ref().filter(|r| r.provisional) {
+            Some(r) => r.choice.clone(),
+            None => bail!("task {short} has no provisional resolution to confirm — answer it with --choice or --accept-default"),
+        },
     };
+    if provisional && choice != d.default_choice {
+        bail!(
+            "a provisional resolution stands on the default ({:?}); only the decider chooses otherwise",
+            d.default_choice
+        );
+    }
     if !d.options.iter().any(|o| o == &choice) {
         // Be helpful before the reducer refuses: a case-insensitive / prefix match is almost
         // always the intended option; name it instead of guessing.
@@ -176,7 +190,11 @@ pub(crate) fn resolve(
         &store.clone().with_token(task::token(token)),
         Some(id),
         from,
-        TaskEventKind::Resolved { choice, note },
+        TaskEventKind::Resolved {
+            choice,
+            note,
+            provisional,
+        },
         Vec::new(),
     )
 }
@@ -424,10 +442,17 @@ pub(crate) fn event_json(ev: &TaskEvent, model: &TaskReadModel) -> serde_json::V
 pub(crate) fn event_detail(ev: &TaskEvent) -> String {
     match &ev.kind {
         TaskEventKind::Noted { text, .. } => truncate(&sanitize_line(text), 160),
-        TaskEventKind::Resolved { choice, note } => match note {
-            Some(n) => format!("→ {} ({})", sanitize_line(choice), truncate(&sanitize_line(n), 80)),
-            None => format!("→ {}", sanitize_line(choice)),
-        },
+        TaskEventKind::Resolved {
+            choice,
+            note,
+            provisional,
+        } => {
+            let p = if *provisional { " (provisional — veto?)" } else { "" };
+            match note {
+                Some(n) => format!("→ {}{p} ({})", sanitize_line(choice), truncate(&sanitize_line(n), 80)),
+                None => format!("→ {}{p}", sanitize_line(choice)),
+            }
+        }
         TaskEventKind::Posed { default_choice, .. } => format!("default: {}", sanitize_line(default_choice)),
         TaskEventKind::Opened { title, .. } => truncate(&sanitize_line(title), 120),
         TaskEventKind::Claimed { assignee } => format!("by {}", sanitize_line(assignee)),
@@ -446,10 +471,17 @@ pub(crate) fn event_text(ev: &TaskEvent, model: &TaskReadModel, plen: usize) -> 
         .unwrap_or_default();
     let detail = match &ev.kind {
         TaskEventKind::Noted { text, .. } => truncate(&sanitize_line(text), 100),
-        TaskEventKind::Resolved { choice, note } => match note {
-            Some(n) => format!("→ {} ({})", sanitize_line(choice), truncate(&sanitize_line(n), 60)),
-            None => format!("→ {}", sanitize_line(choice)),
-        },
+        TaskEventKind::Resolved {
+            choice,
+            note,
+            provisional,
+        } => {
+            let p = if *provisional { " (provisional)" } else { "" };
+            match note {
+                Some(n) => format!("→ {}{p} ({})", sanitize_line(choice), truncate(&sanitize_line(n), 60)),
+                None => format!("→ {}{p}", sanitize_line(choice)),
+            }
+        }
         TaskEventKind::Done { observed, .. } => observed
             .as_deref()
             .map(|o| sanitize_line(o).to_string())
@@ -529,6 +561,9 @@ pub(crate) struct DecisionView {
     pub source: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolution: Option<ResolutionView>,
+    /// The provisional resolution a decider confirmed or vetoed (kept, never rewritten).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub superseded_provisional: Option<ResolutionView>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -539,6 +574,21 @@ pub(crate) struct ResolutionView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
     pub accepted_default: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub provisional: bool,
+}
+
+impl ResolutionView {
+    fn of(r: &task::Resolution) -> ResolutionView {
+        ResolutionView {
+            choice: r.choice.clone(),
+            by: r.by.clone(),
+            ts: r.ts,
+            note: r.note.clone(),
+            accepted_default: r.accepted_default,
+            provisional: r.provisional,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -573,6 +623,8 @@ pub(crate) struct InboxCounts {
     pub decisions: usize,
     /// Decisions parked for discussion (open, not owed).
     pub discussing: usize,
+    /// Decisions made for `who` provisionally, awaiting a confirm or veto (resolved, not owed).
+    pub provisional: usize,
     pub assigned: usize,
     pub claimed: usize,
     pub reviews: usize,
@@ -643,13 +695,8 @@ fn item_of(ctx: &PageCtx<'_>, t: &TaskProjection, reason: Option<InboxReason>, s
             posed_by: d.posed_by.clone(),
             posed_at: d.posed_at,
             source: d.source.clone(),
-            resolution: d.resolution.as_ref().map(|r| ResolutionView {
-                choice: r.choice.clone(),
-                by: r.by.clone(),
-                ts: r.ts,
-                note: r.note.clone(),
-                accepted_default: r.accepted_default,
-            }),
+            resolution: d.resolution.as_ref().map(ResolutionView::of),
+            superseded_provisional: d.superseded_provisional.as_ref().map(ResolutionView::of),
         }),
         notes: t
             .notes
@@ -701,6 +748,8 @@ pub(crate) fn inbox_page(
         .tasks
         .values()
         .filter(|t| t.state.is_terminal() && t.assignee.as_deref() == Some(who))
+        // A provisional resolution awaiting a veto is an open item, not a closed one.
+        .filter(|t| !t.decision.as_ref().is_some_and(|d| d.awaiting_veto()))
         .filter(|t| task::in_scope(t, since, caller))
         .map(|t| item_of(&ctx, t, None, t.last_ts))
         .collect();
@@ -709,6 +758,7 @@ pub(crate) fn inbox_page(
     let counts = InboxCounts {
         decisions: count(InboxReason::DecisionOwed),
         discussing: count(InboxReason::Discussing),
+        provisional: count(InboxReason::Provisional),
         assigned: count(InboxReason::AssignedOpen),
         claimed: count(InboxReason::ClaimedByYou),
         reviews: count(InboxReason::AwaitingYourReview),
@@ -732,6 +782,7 @@ pub(crate) fn inbox_page(
 pub(crate) const INBOX_GROUPS: &[(InboxReason, &str)] = &[
     (InboxReason::DecisionOwed, "decisions owed"),
     (InboxReason::Discussing, "in discussion (parked, still yours to resolve)"),
+    (InboxReason::Provisional, "made for you (veto?)"),
     (InboxReason::AssignedOpen, "assigned actions"),
     (InboxReason::ClaimedByYou, "claimed work"),
     (InboxReason::AwaitingYourReview, "reviews"),
@@ -766,6 +817,17 @@ pub(crate) fn render_inbox_text(page: &InboxPage) -> String {
                 sanitize_line(&i.title)
             ));
             if let Some(d) = &i.decision {
+                if let Some(r) = d.resolution.as_ref().filter(|r| r.provisional) {
+                    let mut line = format!("⇒ made: {} — by {}", sanitize_line(&r.choice), sanitize_line(&r.by));
+                    if !d.alternatives.is_empty() {
+                        line.push_str(&format!(
+                            " · veto to: {}",
+                            d.alternatives.iter().map(|a| sanitize_line(a)).collect::<Vec<_>>().join(" / ")
+                        ));
+                    }
+                    out.push_str(&format!("{:width$}{}\n", "", truncate(&line, 200), width = i.short.len() + 3));
+                    continue;
+                }
                 let mut line = format!("⇒ default: {}", sanitize_line(&d.default_choice));
                 if !d.alternatives.is_empty() {
                     line.push_str(&format!(
@@ -796,6 +858,12 @@ pub(crate) fn render_inbox_text(page: &InboxPage) -> String {
             who = sanitize_line(&page.who)
         ));
     }
+    if page.counts.provisional > 0 {
+        out.push_str(&format!(
+            "made for you: cv task resolve <id> --confirm --from {who} · or veto with --choice \"<option>\"\n",
+            who = sanitize_line(&page.who)
+        ));
+    }
     out
 }
 
@@ -813,6 +881,9 @@ pub(crate) fn render_inbox_md(page: &InboxPage) -> String {
         "{} decision(s) owed · {} assigned action(s) · {} claimed · {} review(s) · {} unlanded · {} unread",
         c.decisions, c.assigned, c.claimed, c.reviews, c.unlanded, c.unread
     ));
+    if c.provisional > 0 {
+        out.push_str(&format!(" · {} made for you (veto?)", c.provisional));
+    }
     if page.hidden > 0 {
         out.push_str(&format!(" · {} older hidden (`--all`)", page.hidden));
     }
@@ -858,10 +929,18 @@ pub(crate) fn render_inbox_md(page: &InboxPage) -> String {
                 for a in &d.alternatives {
                     out.push_str(&format!("- alternative: {}\n", md_inline(a)));
                 }
-                out.push_str(&format!(
-                    "- resolve: `cv task resolve {} --accept-default --from {who}`\n",
-                    i.short
-                ));
+                match d.resolution.as_ref().filter(|r| r.provisional) {
+                    Some(r) => out.push_str(&format!(
+                        "- **made for you:** {} — by {} · confirm: `cv task resolve {} --confirm --from {who}` · or veto with `--choice`\n",
+                        md_inline(&r.choice),
+                        md_inline(&r.by),
+                        i.short
+                    )),
+                    None => out.push_str(&format!(
+                        "- resolve: `cv task resolve {} --accept-default --from {who}`\n",
+                        i.short
+                    )),
+                }
                 out.push('\n');
             }
             if !i.body.trim().is_empty() {

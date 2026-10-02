@@ -12,7 +12,8 @@
 //! - `GET /`                              the page
 //! - `GET /api/inbox?who=`                the inbox page (`task_ops::inbox_page`, `all=1` lifts the window)
 //! - `GET /api/task/<id>`                 one item (`events=1` adds the raw history)
-//! - `POST /api/task/<id>/resolve`        `{choice}` | `{accept_default: true}`, `{note}` optional
+//! - `POST /api/task/<id>/resolve`        `{choice}` | `{accept_default: true}` | `{confirm: true}` (a
+//!   provisional resolution), `{note}` optional
 //! - `POST /api/task/<id>/done`           `{observed}` optional
 //! - `POST /api/task/<id>/note`           `{text}`
 //! - `POST /api/task/<id>/discuss`        `{text}` optional → a `NEEDS DISCUSSION:` note + the `discuss` tag
@@ -458,8 +459,9 @@ fn act(id: &str, verb: &str, who: &str, body: &Value) -> Result<Value> {
     let appended = match verb {
         "resolve" => {
             let accept = body.get("accept_default").and_then(Value::as_bool).unwrap_or(false);
-            let answer = task_ops::Answer::from_flags(text("choice"), accept)?;
-            let out = task_ops::resolve(&store, &outcome.model, &by, None, &id, answer, text("note"))?;
+            let confirm = body.get("confirm").and_then(Value::as_bool).unwrap_or(false);
+            let answer = task_ops::Answer::from_flags(text("choice"), accept, confirm)?;
+            let out = task_ops::resolve(&store, &outcome.model, &by, None, &id, answer, text("note"), false)?;
             vec![out.event]
         }
         "done" => {

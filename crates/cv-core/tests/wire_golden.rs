@@ -476,6 +476,7 @@ fn regenerate(log_path: &std::path::Path, snap_path: &std::path::Path) {
         TaskEventKind::Resolved {
             choice: "the receiver allocates it".into(),
             note: Some("F can afford the arrivals".into()),
+            provisional: false,
         },
     );
 

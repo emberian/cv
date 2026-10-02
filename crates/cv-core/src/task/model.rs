@@ -117,10 +117,18 @@ pub enum TaskEventKind {
     /// Answer a posed decision. `choice` must be one of the posed options (the default included).
     /// Terminal (`TaskState::Resolved`). Identity-bearing: WHO resolved is the fact that matters,
     /// so the resolver is recorded from an explicit identity, never a shared sink.
+    ///
+    /// `provisional`: the poser (an orchestrator) resolved it ON ITS DEFAULT on the decider's
+    /// behalf, with a veto window — the task is resolved and work proceeds, and the decider's
+    /// inbox lists it under "made for you (veto?)" until they answer. The ONE state-bearing event a
+    /// terminal task accepts is a non-provisional `resolved` by the decision's assignee over a
+    /// provisional resolution (a confirmation or a veto). Omitted from the wire when false.
     Resolved {
         choice: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         note: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        provisional: bool,
     },
 
     // ── land facet (revision-scoped) ────────────────────────────────────────
@@ -564,6 +572,7 @@ mod tests {
             TaskEventKind::Resolved {
                 choice: "delete".into(),
                 note: Some("why".into()),
+                provisional: false,
             },
             TaskEventKind::RevisionProposed { revision: revision() },
             TaskEventKind::ReviewRerouted {
@@ -664,6 +673,7 @@ mod tests {
                 TaskEventKind::Resolved {
                     choice: "a".into(),
                     note: None,
+                    provisional: false,
                 },
                 "resolved",
             ),
@@ -731,6 +741,7 @@ mod tests {
             TaskEventKind::Resolved {
                 choice: String::new(),
                 note: None,
+                provisional: false,
             },
             TaskEventKind::RevisionProposed { revision: revision() },
             TaskEventKind::ReviewRerouted {
@@ -770,6 +781,7 @@ mod tests {
             TaskEventKind::Resolved {
                 choice: String::new(),
                 note: None,
+                provisional: false,
             },
             TaskEventKind::RevisionProposed { revision: revision() },
             TaskEventKind::ReviewPassed {

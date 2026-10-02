@@ -259,6 +259,10 @@ pub enum InboxReason {
     /// A decision you parked with [`DISCUSS_TAG`]: open, still yours to resolve, but the next
     /// move is the poser's answer to your note — it is not counted as owed.
     Discussing,
+    /// A decision made FOR you: the poser resolved it provisionally on its default, work went
+    /// ahead, and your confirmation or veto is wanted. Resolved, so not counted as owed; listed
+    /// right after the decisions you owe.
+    Provisional,
     /// Open task assigned to you, not yet claimed.
     AssignedOpen,
     /// You claimed it; it is yours to finish.
@@ -284,6 +288,22 @@ pub fn inbox<'m>(model: &'m TaskReadModel, endpoint: &str) -> Vec<InboxEntry<'m>
     let mut entries = Vec::new();
     for task in model.tasks.values() {
         if task.state.is_terminal() {
+            // The one terminal row an inbox carries: a provisional resolution awaiting its
+            // decider's veto. It ages from the provisional resolve.
+            if let Some(r) = task
+                .decision
+                .as_ref()
+                .filter(|d| d.awaiting_veto())
+                .and_then(|d| d.resolution.as_ref())
+            {
+                if task.assignee.as_deref().is_some_and(|a| same_actor(a, endpoint)) {
+                    entries.push(InboxEntry {
+                        task,
+                        reason: InboxReason::Provisional,
+                        since: r.ts,
+                    });
+                }
+            }
             continue;
         }
         let reason_since = if let Some(rev) = task.current_revision() {

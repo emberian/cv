@@ -75,6 +75,27 @@ eight hex digits, every list renders ids at the shortest length that keeps them 
 below eight) — a batch of 23 tasks opened by one orchestrator used to print as 23 copies of
 `01a0f52e`, none of which `show` would accept.
 
+### Decisions, and provisional resolutions
+
+A **decision** is a task with a posed question: `cv task decide "<title>" --for <who> --default
+<option> [--option <alt>]… [--by <when>]` appends `opened` + `tagged decision` + `posed`, and the
+decider answers with `cv task resolve <id> --accept-default | --choice "<option>"` — identity-
+bearing, terminal (`resolved`). `done` is refused on a decision; a second `posed` is refused.
+
+**Provisional resolutions** are how an orchestrator proceeds on a default without leaving the
+decision to rot as owed: `cv task decide … --provisional` (or `cv task resolve <id>
+--accept-default --provisional` on an existing one) resolves it **on its default, by the poser**,
+with a veto window. The task is `resolved` (work proceeds), `resolution.provisional` is `true`,
+and the decider's inbox lists it in its own group, **made for you (veto?)** — not counted as owed.
+The decider answers with `cv task resolve <id> --confirm` (keep it) or `--choice "<other>"` (veto),
+from the page's "confirm" or alternative buttons too. That answer is **the one state-bearing event
+a terminal task accepts**, and the rule is narrow: a *non-provisional* `resolved`, *by the
+decision's assignee* (`web:<who>` counts as `<who>`), *over a provisional resolution*. It
+replaces the resolution; the provisional one is kept as `decision.superseded_provisional` (the
+last non-provisional resolution wins). A third party's override, a provisional choice other than
+the default, and a second non-provisional resolve are all refused
+(`reduce.rs::provisional_resolution_is_overridden_only_by_the_decider`).
+
 ### Bodies, tags and relations
 
 - **`--body-file <path>`** (`-` for stdin) reads the body from a file; `note --file` does the same
@@ -240,13 +261,15 @@ Error: unknown state "redy" (expected one of open|claimed|done|abandoned|superse
 
 **`cv task inbox [who]`** — "what needs me", **grouped by reason and stalest first within a
 group** (age is the escalation mechanism; there is no other). Bare `cv task inbox` means *my*
-inbox via `$CV_ENDPOINT`. The groups print in this order — `decisions owed`, `claimed`,
-`reviews`, `unlanded`, `assigned, unclaimed` — because a decision nobody sees is the slowest
-blocker a fleet has. Five reasons, each with an honest aging anchor:
+inbox via `$CV_ENDPOINT`. The groups print in this order — `decisions owed`, `in discussion`,
+`made for you (veto?)`, `assigned actions`, `claimed work`, `reviews`, `unlanded` — because a
+decision nobody sees is the slowest blocker a fleet has. Each reason has an honest aging anchor:
 
 | Reason | You appear because | Ages since |
 | --- | --- | --- |
-| `DecisionOwed` | a live task tagged `decision` is assigned to you | the last event |
+| `DecisionOwed` | a live decision (posed, or tagged `decision`) is assigned to you | the **pose** (the last event for a tag-only one) |
+| `Discussing` | you parked a decision for discussion — open, not owed | the last event |
+| `Provisional` | a decision assigned to you was resolved *for* you, provisionally — resolved, not owed | the **provisional resolve** |
 | `AssignedOpen` | an open task is assigned to you, unclaimed | the last event |
 | `ClaimedByYou` | you claimed it; it's yours to finish | the last event |
 | `AwaitingYourReview` | a revision awaits your verdict | the **propose** |

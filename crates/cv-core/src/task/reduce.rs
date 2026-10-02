@@ -91,6 +91,18 @@ pub enum ReduceError {
     },
     #[error("task {task_id} is a decision: answer it with resolve (--choice or --accept-default), not done")]
     DecisionNeedsResolve { task_id: String },
+    #[error("task {task_id}: a provisional resolution stands on the default ({default:?}), not {choice:?} — only the decider chooses otherwise")]
+    ProvisionalNotDefault {
+        task_id: String,
+        default: String,
+        choice: String,
+    },
+    #[error("task {task_id}: only the decision's assignee ({assignee}) can confirm or veto its provisional resolution, not {by}")]
+    ProvisionalOverrideNotDecider {
+        task_id: String,
+        assignee: String,
+        by: String,
+    },
 }
 
 /// A recorded anomaly that did not change state (the task/revision stays actionable).
@@ -232,9 +244,19 @@ pub struct Decision {
     pub posed_by: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolution: Option<Resolution>,
+    /// A provisional resolution the decider has since confirmed or vetoed: kept, never rewritten
+    /// (`resolution` is then the decider's — the last non-provisional resolution wins).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_provisional: Option<Resolution>,
 }
 
 impl Decision {
+    /// Resolved provisionally and not yet confirmed or vetoed by the decider: the decider's
+    /// "made for you (veto?)" inbox group.
+    pub fn awaiting_veto(&self) -> bool {
+        self.resolution.as_ref().is_some_and(|r| r.provisional)
+    }
+
     /// The options other than the default, in posed order.
     pub fn alternatives(&self) -> impl Iterator<Item = &str> {
         self.options
@@ -256,6 +278,10 @@ pub struct Resolution {
     pub note: Option<String>,
     /// `choice == default` at resolve time: the resolver accepted the proposed default.
     pub accepted_default: bool,
+    /// Made on the decider's behalf by the poser, on the default, with a veto window
+    /// ([`TaskEventKind::Resolved`]'s `provisional`). Omitted from the wire when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub provisional: bool,
 }
 
 /// Read model for one task.
@@ -549,10 +575,32 @@ impl TaskReducer {
                     posed_at: event.ts,
                     posed_by: event.by.clone(),
                     resolution: None,
+                    superseded_provisional: None,
                 });
             }
-            TaskEventKind::Resolved { choice, note } => {
-                require_base(task, kind, &[TaskState::Open, TaskState::Claimed])?;
+            TaskEventKind::Resolved {
+                choice,
+                note,
+                provisional,
+            } => {
+                // The one place a terminal task accepts a state-bearing event, written narrowly: a
+                // NON-provisional resolution, by the decision's assignee, over a resolution that is
+                // provisional. Everything else on a resolved task is refused as before.
+                let over_provisional = task.state == TaskState::Resolved
+                    && !*provisional
+                    && task.decision.as_ref().is_some_and(Decision::awaiting_veto);
+                if over_provisional {
+                    let assignee = task.assignee.clone().unwrap_or_default();
+                    if !super::project::same_actor(&event.by, &assignee) {
+                        return Err(ReduceError::ProvisionalOverrideNotDecider {
+                            task_id: task.task_id.clone(),
+                            assignee,
+                            by: event.by.clone(),
+                        });
+                    }
+                } else {
+                    require_base(task, kind, &[TaskState::Open, TaskState::Claimed])?;
+                }
                 let task_id = task.task_id.clone();
                 let Some(decision) = task.decision.as_mut() else {
                     return Err(ReduceError::MissingDecision {
@@ -560,6 +608,13 @@ impl TaskReducer {
                         event: kind.tag_static(),
                     });
                 };
+                if *provisional && *choice != decision.default_choice {
+                    return Err(ReduceError::ProvisionalNotDefault {
+                        task_id,
+                        default: decision.default_choice.clone(),
+                        choice: choice.clone(),
+                    });
+                }
                 if !decision.options.iter().any(|o| o == choice) {
                     return Err(ReduceError::UnknownChoice {
                         task_id,
@@ -567,14 +622,18 @@ impl TaskReducer {
                         options: decision.options.join(" | "),
                     });
                 }
-                decision.resolution = Some(Resolution {
+                let previous = decision.resolution.replace(Resolution {
                     choice: choice.clone(),
                     by: event.by.clone(),
                     ts: event.ts,
                     event_id: event.id.clone(),
                     note: note.clone(),
                     accepted_default: *choice == decision.default_choice,
+                    provisional: *provisional,
                 });
+                if over_provisional {
+                    decision.superseded_provisional = previous;
+                }
                 task.state = TaskState::Resolved;
             }
 
@@ -1582,6 +1641,7 @@ mod tests {
             TaskEventKind::Resolved {
                 choice: "burn it".into(),
                 note: None,
+                provisional: false,
             },
         );
         assert!(matches!(log.reduce().unwrap_err(), ReduceError::UnknownChoice { .. }));
@@ -1599,6 +1659,7 @@ mod tests {
             TaskEventKind::Resolved {
                 choice: "delete".into(),
                 note: Some("the twin goes".into()),
+                provisional: false,
             },
         );
         let m = log.reduce().unwrap();
@@ -1637,6 +1698,7 @@ mod tests {
             TaskEventKind::Resolved {
                 choice: "yes".into(),
                 note: None,
+                provisional: false,
             },
         );
         assert!(matches!(
@@ -1670,6 +1732,7 @@ mod tests {
             TaskEventKind::Resolved {
                 choice: "a".into(),
                 note: None,
+                provisional: false,
             },
         );
         let m = log.reduce().unwrap();
@@ -1705,6 +1768,7 @@ mod tests {
                     TaskEventKind::Resolved {
                         choice: "b".into(),
                         note: None,
+                        provisional: false,
                     },
                 ],
             ),
@@ -1774,5 +1838,102 @@ mod tests {
         assert!(!back.post_close);
         let late = Note { post_close: true, ..n };
         assert_eq!(serde_json::to_value(&late).unwrap()["post_close"], true);
+    }
+
+    /// Provisional resolutions: the poser resolves on the default (state `resolved`, provisional);
+    /// the decider confirms or vetoes it with a non-provisional resolve, which REPLACES it (the
+    /// provisional one is kept); a third party cannot override; a second non-provisional resolve
+    /// is refused as before; a provisional choice must be the default.
+    #[test]
+    fn provisional_resolution_is_overridden_only_by_the_decider() {
+        const DECIDER: &str = "ember";
+        let resolved = |choice: &str, provisional: bool| TaskEventKind::Resolved {
+            choice: choice.into(),
+            note: None,
+            provisional,
+        };
+        let setup = || {
+            let mut log = Log::new();
+            let id = log.next_id();
+            log.events.push(TaskEvent {
+                id: id.clone(),
+                task_id: id.clone(),
+                ts: "2026-07-16T12:00:00Z".parse().unwrap(),
+                by: AUTHOR.into(),
+                kind: TaskEventKind::Opened {
+                    title: "a decision".into(),
+                    body: String::new(),
+                    repo: None,
+                    issue: None,
+                    channel: "tasks".into(),
+                    assignee: Some(DECIDER.into()),
+                },
+            });
+            log.push(&id, AUTHOR, posed(&["keep", "delete"], "keep"));
+            (log, id)
+        };
+
+        // A provisional choice other than the default is refused.
+        let (mut log, task) = setup();
+        log.push(&task, AUTHOR, resolved("delete", true));
+        assert!(matches!(log.reduce().unwrap_err(), ReduceError::ProvisionalNotDefault { .. }));
+        log.events.pop();
+
+        // The poser resolves provisionally on the default: resolved, awaiting veto.
+        log.push(&task, AUTHOR, resolved("keep", true));
+        let m = log.reduce().unwrap();
+        let t = &m.tasks[&task];
+        assert_eq!(t.state, TaskState::Resolved);
+        let d = t.decision.as_ref().unwrap();
+        assert!(d.awaiting_veto());
+        assert!(d.resolution.as_ref().unwrap().provisional);
+        assert_eq!(d.resolution.as_ref().unwrap().by, AUTHOR);
+
+        // A third party cannot override; nor can the poser re-resolve, provisionally or not.
+        for (by, prov) in [(OTHER, false), (AUTHOR, false), (AUTHOR, true), (DECIDER, true)] {
+            log.push(&task, by, resolved("delete", prov));
+            assert!(log.reduce().is_err(), "{by} provisional={prov} must be refused");
+            log.events.pop();
+        }
+        log.push(&task, OTHER, resolved("delete", false));
+        assert!(matches!(
+            log.reduce().unwrap_err(),
+            ReduceError::ProvisionalOverrideNotDecider { .. }
+        ));
+        log.events.pop();
+
+        // The decider vetoes (through the web inbox: `web:ember` is ember): the veto replaces the
+        // provisional resolution, which is kept.
+        let veto = log.push(&task, "web:ember", resolved("delete", false));
+        let m = log.reduce().unwrap();
+        let t = &m.tasks[&task];
+        assert_eq!(t.state, TaskState::Resolved);
+        let d = t.decision.as_ref().unwrap();
+        assert!(!d.awaiting_veto());
+        let r = d.resolution.as_ref().unwrap();
+        assert_eq!((r.choice.as_str(), r.provisional, r.event_id.as_str()), ("delete", false, veto.id.as_str()));
+        let p = d.superseded_provisional.as_ref().unwrap();
+        assert_eq!((p.choice.as_str(), p.by.as_str(), p.provisional), ("keep", AUTHOR, true));
+
+        // A second non-provisional resolve is refused as it always was.
+        log.push(&task, DECIDER, resolved("keep", false));
+        assert!(matches!(log.reduce().unwrap_err(), ReduceError::InvalidTransition { .. }));
+        log.events.pop();
+
+        // Confirming is the same event with the provisional choice.
+        let (mut log, task) = setup();
+        log.push(&task, AUTHOR, resolved("keep", true));
+        log.push(&task, DECIDER, resolved("keep", false));
+        let m = log.reduce().unwrap();
+        let d = m.tasks[&task].decision.as_ref().unwrap();
+        assert!(!d.awaiting_veto());
+        assert!(d.resolution.as_ref().unwrap().accepted_default);
+        assert!(d.superseded_provisional.is_some());
+
+        // An ordinary (non-provisional) resolution is final: the decider cannot re-resolve it.
+        let (mut log, task) = setup();
+        log.push(&task, DECIDER, resolved("keep", false));
+        log.push(&task, DECIDER, resolved("delete", false));
+        assert!(matches!(log.reduce().unwrap_err(), ReduceError::InvalidTransition { .. }));
     }
 }

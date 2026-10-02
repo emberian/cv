@@ -2823,3 +2823,83 @@ fn task_notes_after_close_and_close_with_a_note() {
     let t: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert_eq!(t["notes"].as_array().unwrap().len(), 1, "the refused batch left nothing:\n{json}");
 }
+
+/// Provisional resolutions: the orchestrator poses and resolves on the default at once
+/// (`decide --provisional`); the decider's inbox lists it under "made for you (veto?)", not as
+/// owed; a third party cannot override it; the decider vetoes with `--choice` (or confirms, here
+/// through the page's `{confirm: true}`), and `show` keeps both resolutions.
+#[test]
+fn task_provisional_resolution_veto_and_confirm() {
+    let w = World::new("provisional");
+    let (out, _) = w.cv_ok(&[
+        "task", "decide", "build base: /tank or NVMe", "--for", "ember", "--default", "keep /tank",
+        "--option", "move to NVMe", "--provisional", "--from", "orchestrator:o",
+    ]);
+    let d = opened_task_id(&out);
+    assert!(out.contains("resolved") && out.contains("provisionally on the default"), "{out}");
+    let (out, _) = w.cv_ok(&["task", "inbox", "ember"]);
+    assert!(out.starts_with("made for you (veto?) (1):"), "not owed, its own group:\n{out}");
+    assert!(out.contains("⇒ made: keep /tank — by orchestrator:o · veto to: move to NVMe"), "{out}");
+    assert!(out.contains("cv task resolve <id> --confirm --from ember"), "{out}");
+    let (json, _) = w.cv_ok(&["task", "inbox", "ember", "--json"]);
+    assert!(json.contains("\"provisional\""), "{json}");
+    let (out, _) = w.cv_ok(&["task", "show", &d]);
+    assert!(out.contains("[resolved]") && out.contains("PROVISIONAL"), "{out}");
+    assert!(out.contains("veto?:    cv task resolve"), "{out}");
+
+    // The poser cannot pick a non-default provisionally; a third party cannot override.
+    let (out, _) = w.cv_ok(&["task", "decide", "Q2", "--for", "ember", "--default", "a", "--option", "b", "--from", "orchestrator:o"]);
+    let d2 = opened_task_id(&out);
+    let (_, err) = w.cv_fails(&["task", "resolve", &d2, "--choice", "b", "--provisional", "--from", "orchestrator:o"]);
+    assert!(err.contains("stands on the default"), "{err}");
+    let (_, err) = w.cv_fails(&["task", "resolve", &d, "--choice", "move to NVMe", "--from", "lane:someone"]);
+    assert!(err.contains("only the decision's assignee (ember)"), "{err}");
+    let (_, err) = w.cv_fails(&["task", "resolve", &d2, "--confirm", "--from", "ember"]);
+    assert!(err.contains("no provisional resolution to confirm"), "{err}");
+
+    // The decider vetoes: a new resolution replaces the provisional one, which is kept.
+    let (out, _) = w.cv_ok(&["task", "resolve", &d, "--choice", "move to NVMe", "--from", "ember"]);
+    assert!(out.contains("→ move to NVMe (by ember)"), "{out}");
+    let (out, _) = w.cv_ok(&["task", "show", &d]);
+    assert!(out.contains("provisionally: keep /tank — by orchestrator:o"), "{out}");
+    assert!(out.contains("resolved: move to NVMe — by ember") && !out.contains("PROVISIONAL"), "{out}");
+    let (json, _) = w.cv_ok(&["task", "show", &d, "--json"]);
+    let t: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(t["decision"]["resolution"]["choice"], "move to NVMe");
+    assert!(t["decision"]["resolution"].get("provisional").is_none(), "{json}");
+    assert_eq!(t["decision"]["superseded_provisional"]["provisional"], true, "{json}");
+    let (out, _) = w.cv_ok(&["task", "inbox", "ember"]);
+    assert!(out.contains("(inbox empty for ember)") || !out.contains("made for you"), "{out}");
+    // A second answer is refused as it always was.
+    let (_, err) = w.cv_fails(&["task", "resolve", &d, "--accept-default", "--from", "ember"]);
+    assert!(err.contains("cannot apply resolved"), "{err}");
+
+    // Confirm through the page.
+    let (out, _) = w.cv_ok(&[
+        "task", "decide", "Q3", "--for", "ember", "--default", "x", "--option", "y", "--provisional", "--from", "orchestrator:o",
+    ]);
+    let d3 = opened_task_id(&out);
+    let (mut child, addr) = serve(&w, "ember");
+    let result = std::panic::catch_unwind(|| {
+        let (status, body) = http(&addr, "GET", "/api/inbox?who=ember", None);
+        assert_eq!(status, 200, "{body}");
+        let page: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(page["counts"]["provisional"], 1, "{body}");
+        assert_eq!(page["counts"]["decisions"], 1, "Q2 is still owed; Q3 is not: {body}");
+        let made: Vec<&serde_json::Value> = page["items"].as_array().unwrap().iter().filter(|i| i["reason"] == "provisional").collect();
+        assert_eq!(made.len(), 1, "{body}");
+        assert_eq!(made[0]["title"], "Q3");
+        let (status, body) = http(&addr, "POST", &format!("/api/task/{d3}/resolve"), Some(r#"{"confirm":true}"#));
+        assert_eq!(status, 200, "{body}");
+    });
+    let _ = child.kill();
+    let _ = child.wait();
+    if let Err(e) = result {
+        std::panic::resume_unwind(e);
+    }
+    let (json, _) = w.cv_ok(&["task", "show", &d3, "--json"]);
+    let t: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(t["decision"]["resolution"]["by"], "web:ember");
+    assert_eq!(t["decision"]["resolution"]["choice"], "x");
+    assert_eq!(t["decision"]["superseded_provisional"]["by"], "orchestrator:o");
+}
