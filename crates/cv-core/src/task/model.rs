@@ -131,6 +131,14 @@ pub enum TaskEventKind {
         provisional: bool,
     },
 
+    /// Pin the task's current STATUS: the relay hand-off field (a generation's tip, what is
+    /// merged, what runs, what is next). REPLACES the pinned status in the projection — the
+    /// history stays in the events. Allowed on a live task, by its assignee or its opener;
+    /// refused on a terminal one (a status is state-bearing, unlike a note). Identity-bearing.
+    StatusSet {
+        text: String,
+    },
+
     // ── land facet (revision-scoped) ────────────────────────────────────────
     /// Attach a reviewed code revision. Proposing again supersedes the prior revision — that is
     /// the only cure for a refute (a REFUTE on a revision is terminal for that revision).
@@ -197,7 +205,7 @@ impl TaskEventKind {
     }
 
     /// Kinds whose `by` endpoint carries semantics (keys inbox, reviewer, and land bookkeeping),
-    /// matching the identity-BEARING verbs claim/release/resolve/propose/pass/refute (see
+    /// matching the identity-BEARING verbs claim/release/resolve/status/propose/pass/refute (see
     /// [`crate::task::require_actor`]). The store's TOFU token gate ([`crate::task::identity`])
     /// applies only to these: a bound endpoint must present its token to stamp one of them, and a
     /// first-use token binds on one of them. Bookkeeping kinds (open/note/done/abandon/supersede/
@@ -209,6 +217,7 @@ impl TaskEventKind {
             TaskEventKind::Claimed { .. }
                 | TaskEventKind::Released {}
                 | TaskEventKind::Resolved { .. }
+                | TaskEventKind::StatusSet { .. }
                 | TaskEventKind::RevisionProposed { .. }
                 | TaskEventKind::ReviewPassed { .. }
                 | TaskEventKind::ReviewRefuted { .. }
@@ -229,6 +238,7 @@ impl TaskEventKind {
             TaskEventKind::BlockedBy { .. } => "blocked_by",
             TaskEventKind::Posed { .. } => "posed",
             TaskEventKind::Resolved { .. } => "resolved",
+            TaskEventKind::StatusSet { .. } => "status_set",
             TaskEventKind::RevisionProposed { .. } => "revision_proposed",
             TaskEventKind::ReviewRerouted { .. } => "review_rerouted",
             TaskEventKind::ReviewPassed { .. } => "review_passed",
@@ -602,6 +612,14 @@ mod tests {
                     turns: Some(2),
                 }),
             },
+            TaskEventKind::Resolved {
+                choice: "keep".into(),
+                note: None,
+                provisional: true,
+            },
+            TaskEventKind::StatusSet {
+                text: "tip abc123; next: merge B".into(),
+            },
             TaskEventKind::SourceUnavailable { detail: "gone".into() },
             TaskEventKind::MergeFailed {
                 reason: MergeFailure::GitFailed { detail: "boom".into() },
@@ -669,6 +687,7 @@ mod tests {
         // Tag helper stays in sync with serde.
         for (kind, tag) in [
             (TaskEventKind::Released {}, "released"),
+            (TaskEventKind::StatusSet { text: "s".into() }, "status_set"),
             (
                 TaskEventKind::Resolved {
                     choice: "a".into(),
@@ -743,6 +762,7 @@ mod tests {
                 note: None,
                 provisional: false,
             },
+            TaskEventKind::StatusSet { text: String::new() },
             TaskEventKind::RevisionProposed { revision: revision() },
             TaskEventKind::ReviewRerouted {
                 from: String::new(),
@@ -768,9 +788,9 @@ mod tests {
         }
     }
 
-    /// The identity-bearing partition (the TOFU token gate's scope) is exactly the six verbs whose
-    /// endpoint keys inbox/reviewer/land/decision semantics — claim/release/resolve/propose/pass/
-    /// refute.
+    /// The identity-bearing partition (the TOFU token gate's scope) is exactly the seven verbs
+    /// whose endpoint keys inbox/reviewer/land/decision/status semantics — claim/release/resolve/
+    /// status/propose/pass/refute.
     #[test]
     fn identity_bearing_partition_is_exact() {
         let identity_bearing = [
@@ -783,6 +803,7 @@ mod tests {
                 note: None,
                 provisional: false,
             },
+            TaskEventKind::StatusSet { text: String::new() },
             TaskEventKind::RevisionProposed { revision: revision() },
             TaskEventKind::ReviewPassed {
                 reviewer: String::new(),

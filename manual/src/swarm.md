@@ -109,8 +109,11 @@ Ranked by how often the gap bit:
    `CV_ENDPOINT=` export (else its description's leading token); `--tasks` lists what it holds with
    the last note; `/api/lanes` carries `tasks` and the page has a task column. On this session, 113
    of 295 lanes join (the rest predate the `lane:` convention).
-5. **A pinned STATUS note.** `cv task status ID --file F` replaces a task's current-state note (shown at
-   the top of `show`), so a relay's hand-off is a field, not the newest of a hundred notes.
+5. ~~**A pinned STATUS note.** `cv task status ID --file F` replaces a task's current-state note (shown at
+   the top of `show`), so a relay's hand-off is a field, not the newest of a hundred notes.~~
+   **Landed:** `status_set` replaces `TaskProjection.status` (history in the events), by the assignee
+   or the opener, refused when terminal; `show` leads with it, `--brief` is title + STATUS, `--status`
+   is the text alone.
 6. **Failure cause from the transcript.** A lane that died of an API rate limit, a context-length
    error, or a stop should show as `rate-limited` / `context` / `stopped`, not all as `failed`: the
    remedy differs (resume vs relaunch).

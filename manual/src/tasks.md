@@ -66,6 +66,15 @@ open ──claim──► claimed ──done──► done
   *kill* a task, but you can never silently complete one that has unlanded reviewed code. On a
   non-code task `done` is **self-reported unless a completion check is attached** to verify it —
   `--observed` alone is free text (law 1 covers landing, not completion; see the note above).
+- **`status`** — `cv task status <id> --file F` (or `-` for stdin, or the text inline) pins the
+  task's **STATUS**: one `status_set` event that *replaces* the pinned status in the projection
+  (every earlier one stays in the events; `revisions` counts them). It is the relay hand-off
+  field — a generation's tip, what is merged, what runs (pids and paths), what is next — so a
+  successor reads one field, not the newest of a hundred notes. `show` prints it first, under
+  `STATUS`; `show --brief` on a task with a STATUS prints only the title and the STATUS; `show
+  --status` prints just the text (exit 1 when none is pinned). Unlike a note it is
+  state-bearing: allowed on an open or claimed task, **by its assignee or its opener** (an
+  identity-bearing verb), and refused on a terminal task.
 - **`abandon` / `supersede`** — the terminals. Abandon is always available on a non-terminal
   task, live revision or not.
 

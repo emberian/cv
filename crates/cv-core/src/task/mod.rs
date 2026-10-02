@@ -58,7 +58,7 @@ pub use project::{
 };
 pub use provenance::{freshness_from_heartbeat, Freshness, Provenance};
 pub use reduce::{
-    Decision, EffectiveState, Note, PassEvidence, ReduceError, RefuteEvidence, RerouteEvidence, Resolution,
+    Decision, EffectiveState, Note, PassEvidence, PinnedStatus, ReduceError, RefuteEvidence, RerouteEvidence, Resolution,
     RevisionProjection, TaskIssue, TaskProjection, TaskReadModel, TaskReducer,
 };
 #[cfg(not(target_family = "wasm"))]

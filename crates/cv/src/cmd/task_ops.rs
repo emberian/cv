@@ -407,6 +407,7 @@ pub(crate) fn kind_tag(s: &str) -> String {
         "tag" => "tagged",
         "block" | "blocked" => "blocked_by",
         "pose" | "decision" => "posed",
+        "status" | "status-set" => "status_set",
         "propose" | "proposed" | "revision" => "revision_proposed",
         "pass" | "passed" => "review_passed",
         "refute" | "refuted" => "review_refuted",
@@ -476,6 +477,7 @@ pub(crate) fn event_detail(ev: &TaskEvent) -> String {
             }
         }
         TaskEventKind::Posed { default_choice, .. } => format!("default: {}", sanitize_line(default_choice)),
+        TaskEventKind::StatusSet { text } => format!("STATUS: {}", first_line(text, 150)),
         TaskEventKind::Opened { title, .. } => truncate(&sanitize_line(title), 120),
         TaskEventKind::Claimed { assignee } => format!("by {}", sanitize_line(assignee)),
         TaskEventKind::Done { observed, .. } => observed.as_deref().map(|o| truncate(&sanitize_line(o), 120)).unwrap_or_default(),
@@ -512,6 +514,7 @@ pub(crate) fn event_text(ev: &TaskEvent, model: &TaskReadModel, plen: usize) -> 
         TaskEventKind::Claimed { assignee } => sanitize_line(assignee).to_string(),
         TaskEventKind::Tagged { tags } => format!("#{}", tags.join(" #")),
         TaskEventKind::Posed { default_choice, .. } => format!("default: {}", sanitize_line(default_choice)),
+        TaskEventKind::StatusSet { text } => format!("STATUS: {}", first_line(text, 100)),
         _ => String::new(),
     };
     format!(
@@ -564,6 +567,9 @@ pub(crate) struct InboxItem {
     pub unread: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decision: Option<DecisionView>,
+    /// The pinned STATUS text, when one is pinned.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
     pub notes: Vec<NoteView>,
 }
 
@@ -720,6 +726,7 @@ fn item_of(ctx: &PageCtx<'_>, t: &TaskProjection, reason: Option<InboxReason>, s
             resolution: d.resolution.as_ref().map(ResolutionView::of),
             superseded_provisional: d.superseded_provisional.as_ref().map(ResolutionView::of),
         }),
+        status: t.status.as_ref().map(|s| s.text.clone()),
         notes: t
             .notes
             .iter()

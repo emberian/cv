@@ -35,6 +35,7 @@ const ALL_EVENT_TAGS: &[&str] = &[
     "blocked_by",
     "posed",
     "resolved",
+    "status_set",
     "revision_proposed",
     "review_rerouted",
     "review_passed",
@@ -476,6 +477,86 @@ fn regenerate(log_path: &std::path::Path, snap_path: &std::path::Path) {
         TaskEventKind::Resolved {
             choice: "the receiver allocates it".into(),
             note: Some("F can afford the arrivals".into()),
+            provisional: false,
+        },
+    );
+
+    // Task E: a relay decision — a pinned STATUS (replaced once), a PROVISIONAL resolution on the
+    // default by the poser, a post-close note, then the decider's veto over the provisional one
+    // (pins `status_set`, `resolved.provisional`, `note.post_close`, `superseded_provisional`).
+    let e = push(
+        &mut events,
+        "",
+        "orchestrator:demo",
+        27,
+        TaskEventKind::Opened {
+            title: "build base: /tank or NVMe".into(),
+            body: String::new(),
+            repo: None,
+            issue: None,
+            channel: "tasks".into(),
+            assignee: Some("ember".into()),
+        },
+    );
+    push(
+        &mut events,
+        &e,
+        "orchestrator:demo",
+        28,
+        TaskEventKind::Posed {
+            options: vec!["keep /tank".into(), "move to NVMe".into()],
+            default_choice: "keep /tank".into(),
+            deadline: None,
+            source: None,
+        },
+    );
+    push(
+        &mut events,
+        &e,
+        "orchestrator:demo",
+        29,
+        TaskEventKind::StatusSet {
+            text: "gen 1: measuring".into(),
+        },
+    );
+    push(
+        &mut events,
+        &e,
+        "orchestrator:demo",
+        30,
+        TaskEventKind::StatusSet {
+            text: "gen 2: /tank is fast enough; proceeding on it".into(),
+        },
+    );
+    push(
+        &mut events,
+        &e,
+        "orchestrator:demo",
+        31,
+        TaskEventKind::Resolved {
+            choice: "keep /tank".into(),
+            note: Some("my decision, veto-able".into()),
+            provisional: true,
+        },
+    );
+    push(
+        &mut events,
+        &e,
+        "orchestrator:demo",
+        32,
+        TaskEventKind::Noted {
+            text: "the measurement is in the report".into(),
+            session_ref: None,
+        },
+    );
+    push(
+        &mut events,
+        &e,
+        "web:ember",
+        33,
+        TaskEventKind::Resolved {
+            choice: "move to NVMe".into(),
+            note: None,
             provisional: false,
         },
     );

@@ -810,7 +810,8 @@ It gets its own chapter: **[`cv pack` — the context compiler](pack.md)**.
 The fleet's durable dispatch objects: open/claim/note/done plus reviewed code **revisions** whose landing is *observed from git by cv* (`cv task verify`), never asserted by an agent. The verbs:
 
 ```text
-open · list · show · claim · release · note · tag · block · done · abandon · supersede
+open · list · show · claim · release · note · status · tag · block · done · abandon · supersede
+decide · resolve · split · events · watch · serve
 propose · reroute · pass · refute · verify · inbox · debt · stats · sweep
 ```
 

@@ -225,6 +225,67 @@
           "accepted_default": false
         }
       }
+    },
+    "00000000-0000-7000-8000-000000000028": {
+      "task_id": "00000000-0000-7000-8000-000000000028",
+      "title": "build base: /tank or NVMe",
+      "body": "",
+      "repo": null,
+      "issue": null,
+      "channel": "tasks",
+      "state": "resolved",
+      "assignee": "ember",
+      "opened_by": "orchestrator:demo",
+      "opened_at": "2026-07-16T12:27:00Z",
+      "last_event_id": "00000000-0000-7000-8000-000000000034",
+      "last_ts": "2026-07-16T12:33:00Z",
+      "revisions": [],
+      "notes": [
+        {
+          "event_id": "00000000-0000-7000-8000-000000000033",
+          "by": "orchestrator:demo",
+          "ts": "2026-07-16T12:32:00Z",
+          "text": "the measurement is in the report",
+          "session_ref": null,
+          "post_close": true
+        }
+      ],
+      "superseded_by": null,
+      "abandoned_reason": null,
+      "done_observed": null,
+      "done_check": null,
+      "decision": {
+        "options": [
+          "keep /tank",
+          "move to NVMe"
+        ],
+        "default": "keep /tank",
+        "posed_at": "2026-07-16T12:28:00Z",
+        "posed_by": "orchestrator:demo",
+        "resolution": {
+          "choice": "move to NVMe",
+          "by": "web:ember",
+          "ts": "2026-07-16T12:33:00Z",
+          "event_id": "00000000-0000-7000-8000-000000000034",
+          "accepted_default": false
+        },
+        "superseded_provisional": {
+          "choice": "keep /tank",
+          "by": "orchestrator:demo",
+          "ts": "2026-07-16T12:31:00Z",
+          "event_id": "00000000-0000-7000-8000-000000000032",
+          "note": "my decision, veto-able",
+          "accepted_default": true,
+          "provisional": true
+        }
+      },
+      "status": {
+        "text": "gen 2: /tank is fast enough; proceeding on it",
+        "by": "orchestrator:demo",
+        "ts": "2026-07-16T12:30:00Z",
+        "event_id": "00000000-0000-7000-8000-000000000031",
+        "revisions": 2
+      }
     }
   }
 }

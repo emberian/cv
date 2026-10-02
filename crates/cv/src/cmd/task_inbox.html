@@ -292,6 +292,7 @@
     if (i.blocked) meta.push(el('span', { class: 'tag blocked', text: 'blocked' }));
     (i.tags || []).forEach((t) => { if (t !== 'decision') meta.push(el('span', { class: 'tag', text: '#' + t })); });
     const kids = [el('p', { class: 'title', text: i.title }), el('div', { class: 'meta' }, meta)];
+    if (i.status) kids.push(el('div', { class: 'body status', text: 'STATUS: ' + i.status }));
     if (i.body && i.body.trim()) {
       const long = i.body.length > 360 && !S.expanded[i.id];
       kids.push(el('div', { class: 'body' + (long ? ' clipped' : ''), text: i.body }));

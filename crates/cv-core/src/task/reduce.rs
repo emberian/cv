@@ -97,6 +97,13 @@ pub enum ReduceError {
         default: String,
         choice: String,
     },
+    #[error("task {task_id}: only its assignee ({assignee}) or its opener ({opener}) can pin its STATUS, not {by}")]
+    StatusNotHolder {
+        task_id: String,
+        assignee: String,
+        opener: String,
+        by: String,
+    },
     #[error("task {task_id}: only the decision's assignee ({assignee}) can confirm or veto its provisional resolution, not {by}")]
     ProvisionalOverrideNotDecider {
         task_id: String,
@@ -284,6 +291,18 @@ pub struct Resolution {
     pub provisional: bool,
 }
 
+/// A task's pinned STATUS (the latest `status_set`): the current state in one place, so a relay's
+/// hand-off is a field, not the newest of a hundred notes.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PinnedStatus {
+    pub text: String,
+    pub by: String,
+    pub ts: DateTime<Utc>,
+    pub event_id: String,
+    /// How many times a status was pinned on this task (this one included).
+    pub revisions: u32,
+}
+
 /// Read model for one task.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TaskProjection {
@@ -321,6 +340,10 @@ pub struct TaskProjection {
     /// every pre-decision projection serializes exactly as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision: Option<Decision>,
+    /// The pinned STATUS, once a `status_set` applied (the latest replaces the earlier ones).
+    /// Omitted from the wire when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<PinnedStatus>,
 }
 
 impl TaskProjection {
@@ -372,6 +395,7 @@ impl TaskProjection {
             tags: Vec::new(),
             blocked_by: Vec::new(),
             decision: None,
+            status: None,
         }
     }
 
@@ -635,6 +659,29 @@ impl TaskReducer {
                     decision.superseded_provisional = previous;
                 }
                 task.state = TaskState::Resolved;
+            }
+
+            TaskEventKind::StatusSet { text } => {
+                require_base(task, kind, &[TaskState::Open, TaskState::Claimed])?;
+                let holder = |who: &Option<String>| {
+                    who.as_deref().is_some_and(|w| super::project::same_actor(&event.by, w))
+                };
+                if !holder(&task.assignee) && !holder(&Some(task.opened_by.clone())) {
+                    return Err(ReduceError::StatusNotHolder {
+                        task_id: task.task_id.clone(),
+                        assignee: task.assignee.clone().unwrap_or_else(|| "-".into()),
+                        opener: task.opened_by.clone(),
+                        by: event.by.clone(),
+                    });
+                }
+                let revisions = task.status.as_ref().map_or(0, |s| s.revisions) + 1;
+                task.status = Some(PinnedStatus {
+                    text: text.clone(),
+                    by: event.by.clone(),
+                    ts: event.ts,
+                    event_id: event.id.clone(),
+                    revisions,
+                });
             }
 
             // ── land facet ────────────────────────────────────────────────
@@ -984,6 +1031,7 @@ fn validate_event_shape(event: &TaskEvent) -> Result<(), ReduceError> {
             Ok(())
         }
         TaskEventKind::Resolved { choice, .. } => require_nonempty("choice", choice),
+        TaskEventKind::StatusSet { text } => require_nonempty("text", text),
         TaskEventKind::RevisionProposed { revision } => validate_revision(revision),
         TaskEventKind::ReviewRerouted { from, to } => {
             require_nonempty("from", from)?;
@@ -1935,5 +1983,40 @@ mod tests {
         log.push(&task, DECIDER, resolved("keep", false));
         log.push(&task, DECIDER, resolved("delete", false));
         assert!(matches!(log.reduce().unwrap_err(), ReduceError::InvalidTransition { .. }));
+    }
+
+    /// A pinned STATUS replaces the previous one (history stays in the events), may be set by the
+    /// assignee or the opener only, and is refused on a terminal task.
+    #[test]
+    fn status_replaces_is_held_by_assignee_or_opener_and_refused_when_terminal() {
+        let mut log = Log::new();
+        let task = log.open(AUTHOR);
+        let status = |t: &str| TaskEventKind::StatusSet { text: t.into() };
+        log.push(&task, AUTHOR, status("gen 1: tip aaa"));
+        log.push(&task, OTHER, TaskEventKind::Claimed { assignee: OTHER.into() });
+        log.push(&task, OTHER, status("gen 2: tip bbb; next: merge C"));
+        let m = log.reduce().unwrap();
+        let s = m.tasks[&task].status.as_ref().unwrap();
+        assert_eq!((s.text.as_str(), s.by.as_str(), s.revisions), ("gen 2: tip bbb; next: merge C", OTHER, 2));
+        assert_eq!(m.tasks[&task].effective_state().as_str(), "claimed", "a status never moves state");
+        // The opener still may; a third party may not.
+        log.push(&task, AUTHOR, status("gen 3"));
+        log.reduce().unwrap();
+        log.push(&task, "agent:stranger", status("hijack"));
+        assert!(matches!(log.reduce().unwrap_err(), ReduceError::StatusNotHolder { .. }));
+        log.events.pop();
+        // Terminal: refused (state-bearing), unlike a note.
+        log.push(
+            &task,
+            OTHER,
+            TaskEventKind::Done {
+                observed: None,
+                check: None,
+            },
+        );
+        log.push(&task, OTHER, status("after the end"));
+        assert!(matches!(log.reduce().unwrap_err(), ReduceError::InvalidTransition { .. }));
+        log.events.pop();
+        assert_eq!(log.reduce().unwrap().tasks[&task].status.as_ref().unwrap().text, "gen 3");
     }
 }

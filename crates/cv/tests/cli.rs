@@ -2956,3 +2956,54 @@ fn task_decision_tag_without_options_is_refused() {
     let (out, _) = w.cv_ok(&["task", "inbox", "ember"]);
     assert!(out.starts_with("decisions owed (2):") && out.contains("legacy tag-only"), "{out}");
 }
+
+/// The pinned STATUS: `cv task status ID --file F` replaces it (the events keep every one);
+/// `show` prints it first, `show --brief` prints only the title and the STATUS, `show --status`
+/// prints just the text; a stranger cannot pin one; a terminal task refuses it.
+#[test]
+fn task_status_is_pinned_replaced_and_shown_first() {
+    let w = World::new("status");
+    let (out, _) = w.cv_ok(&["task", "open", "INTEGRATOR: own final", "--assignee", "lane:integrator-1", "--from", "orchestrator:o"]);
+    let t = opened_task_id(&out);
+    w.cv_ok(&["task", "note", &t, "merged braid-host", "--from", "lane:integrator-1"]);
+    let f = w.base.join("status.md");
+    fs::write(&f, "tip 4ad19d9a\nmerged: braid-host\nnext: braid-proof\n").unwrap();
+    let (_, err) = w.cv_fails(&["task", "status", &t, "--file", f.to_str().unwrap()]);
+    assert!(err.contains("set CV_ENDPOINT or pass --from"), "identity-bearing:\n{err}");
+    w.cv_ok(&["task", "status", &t, "--file", f.to_str().unwrap(), "--from", "lane:integrator-1"]);
+    let (_, err) = w.cv_fails(&["task", "status", &t, "hijack", "--from", "lane:stranger"]);
+    assert!(err.contains("only its assignee (lane:integrator-1) or its opener (orchestrator:o)"), "{err}");
+    // The opener replaces it (a relay generation's hand-off), from stdin.
+    let (ok, _, _, err) = w.cv_full(
+        &["task", "status", &t, "-", "--from", "orchestrator:o"],
+        &[],
+        Some("tip 8411b1bf\nmerged: braid-host, braid-proof\nnext: braid-rooms\n"),
+    );
+    assert!(ok, "{err}");
+
+    let (out, _) = w.cv_ok(&["task", "show", &t]);
+    let status_at = out.find("  STATUS (orchestrator:o,").expect(&out);
+    assert!(status_at < out.find("  title:").unwrap(), "STATUS leads:\n{out}");
+    assert!(out.contains("revision 2") && out.contains("    next: braid-rooms"), "{out}");
+    assert!(!out.contains("next: braid-proof"), "replaced, not appended:\n{out}");
+    let (out, _) = w.cv_ok(&["task", "show", &t, "--brief"]);
+    assert!(out.contains("STATUS") && out.contains("title:    INTEGRATOR: own final"), "{out}");
+    assert!(!out.contains("merged braid-host\n") && !out.contains("note"), "only title + STATUS:\n{out}");
+    let (out, _) = w.cv_ok(&["task", "show", &t, "--status"]);
+    assert_eq!(out, "tip 8411b1bf\nmerged: braid-host, braid-proof\nnext: braid-rooms\n");
+    let (json, _) = w.cv_ok(&["task", "show", &t, "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(v["status"]["by"], "orchestrator:o");
+    assert_eq!(v["status"]["revisions"], 2);
+    let (out, _) = w.cv_ok(&["task", "events", "--task", &t, "--kind", "status"]);
+    assert_eq!(out.lines().count(), 2, "history kept in the events:\n{out}");
+
+    // No status: --status exits nonzero naming the verb; a terminal task refuses one.
+    let (out, _) = w.cv_ok(&["task", "open", "plain"]);
+    let p = opened_task_id(&out);
+    let (_, err) = w.cv_fails(&["task", "show", &p, "--status"]);
+    assert!(err.contains("no STATUS pinned") && err.contains("cv task status"), "{err}");
+    w.cv_ok(&["task", "done", &t, "--from", "lane:integrator-1"]);
+    let (_, err) = w.cv_fails(&["task", "status", &t, "late", "--from", "lane:integrator-1"]);
+    assert!(err.contains("cannot apply status_set"), "{err}");
+}

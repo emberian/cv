@@ -194,9 +194,13 @@ pub(crate) enum TaskCmd {
         #[arg(long)]
         events: bool,
         /// One line per note (author, time, first 150 chars) and the body's first line — a
-        /// 26-note task on one screen.
+        /// 26-note task on one screen. On a task with a pinned STATUS: only the title and the
+        /// STATUS (the relay hand-off view).
         #[arg(long)]
         brief: bool,
+        /// Print only the pinned STATUS text (exit 1 when none is pinned).
+        #[arg(long, conflicts_with_all = ["json", "brief", "events"])]
+        status: bool,
         /// Only the last N notes.
         #[arg(long = "notes-last", value_name = "N")]
         notes_last: Option<usize>,
@@ -270,6 +274,24 @@ pub(crate) enum TaskCmd {
         /// Acting endpoint recorded in `by`. Default: $CV_ENDPOINT.
         #[arg(long)]
         from: Option<String>,
+    },
+    /// Pin the task's current STATUS (replaces the previous one; history stays in the events):
+    /// the relay hand-off — tip, what is merged, what runs, what is next. `show` prints it first.
+    /// By the task's assignee or opener; refused on a terminal task.
+    Status {
+        id: String,
+        /// The status text (`-` = stdin). Omit it and pass `--file`.
+        #[arg(required_unless_present = "file", conflicts_with = "file")]
+        text: Option<String>,
+        /// Read the status from a file (`-` for stdin).
+        #[arg(long, value_name = "PATH")]
+        file: Option<PathBuf>,
+        /// Acting endpoint recorded in `by` (must be the assignee or the opener). Default: $CV_ENDPOINT.
+        #[arg(long)]
+        from: Option<String>,
+        /// TOFU per-endpoint token authenticating the `--from` claim. Default: $CV_TOKEN.
+        #[arg(long)]
+        token: Option<String>,
     },
     /// Kill a task.
     Abandon {
@@ -882,12 +904,26 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
             json,
             events,
             brief,
+            status,
             notes_last,
             notes_grep,
         } => {
             let outcome = replay_loud()?;
             let id = resolve(&outcome.model, &id)?.to_string();
             let t = &outcome.model.tasks[&id];
+            if status {
+                let Some(st) = &t.status else {
+                    bail!(
+                        "no STATUS pinned on {} — `cv task status {} --file F` pins one",
+                        prefix(&id, 13),
+                        prefix(&id, 13)
+                    );
+                };
+                for line in st.text.lines() {
+                    println!("{}", sanitize_line(line));
+                }
+                return Ok(());
+            }
             let grep = match &notes_grep {
                 Some(p) => Some(regex::RegexBuilder::new(p).case_insensitive(true).build()?),
                 None => None,
@@ -898,6 +934,22 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                 // Every free-text field below came from the durable log — sanitize at render
                 // (G5): titles, notes, endpoints, and branch names are all untrusted.
                 println!("task {}  [{}]  {}", t.task_id, task::effective_display(t), t.kind());
+                if let Some(st) = &t.status {
+                    // The pinned STATUS leads: it is what a successor reads first.
+                    println!(
+                        "  STATUS ({}, {}{}):",
+                        sanitize_line(&st.by),
+                        fmt_local(st.ts, "%Y-%m-%d %H:%M"),
+                        if st.revisions > 1 { format!(", revision {}", st.revisions) } else { String::new() }
+                    );
+                    for line in st.text.lines() {
+                        println!("    {}", sanitize_line(line));
+                    }
+                    if brief {
+                        println!("  title:    {}", sanitize_line(&t.title));
+                        return Ok(());
+                    }
+                }
                 // Provenance for the terminal facts: a self-reported completion is labeled as
                 // such (never silently equal to a verified land), and landing carries the
                 // verifier's freshness read.
@@ -1183,6 +1235,24 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                 None => (observed, None),
             };
             close_with_note(&id, &from_or_cv(from), note, TaskEventKind::Done { observed, check })
+        }
+        TaskCmd::Status {
+            id,
+            text,
+            file,
+            from,
+            token,
+        } => {
+            let from = require_from(from)?;
+            let outcome = replay_loud()?;
+            let id = resolve(&outcome.model, &id)?.to_string();
+            let text = match (text, file) {
+                (Some(t), _) => text_or_stdin(t)?,
+                (None, Some(f)) => read_text_arg(&f)?,
+                (None, None) => unreachable!("clap requires text or --file"),
+            };
+            let text = text.trim_end().to_string();
+            append_and_report(Some(&id), &from, TaskEventKind::StatusSet { text }, token)
         }
         TaskCmd::Abandon {
             id,
@@ -2000,6 +2070,7 @@ mod tests {
             tags: Vec::new(),
             blocked_by: Vec::new(),
             decision: None,
+            status: None,
         }
     }
 
