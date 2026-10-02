@@ -52,9 +52,17 @@ open ──claim──► claimed ──done──► done
 - **`claim` / `release`** — claiming is a durable, race-free **first-writer-wins**: the store
   validates each append against a replay of the log *under the lock*, so when N agents race,
   exactly one claim lands and the rest get a rejection, not a duplicate.
-- **`note`** — progress notes; never change state.
+- **`note`** — progress notes; never change state. **A note is accepted on a terminal task too**:
+  terminal is about *state*, not the record. A note appended after `done` / `resolved` /
+  `abandoned` / `superseded` is marked `post_close: true` and every surface says so — `show`,
+  the inbox Markdown and the web page render it "(after close)" — and the task's effective state
+  does not move (pinned by `reduce.rs::post_close_note_appends_and_never_changes_effective_state`).
+  Four lanes and the orchestrator lost or re-homed evidence before this, because they wrote
+  `done` first and the note second. Tags stay refused on a terminal task: they change views.
 - **`done`** — completes a task, optionally pointing at observable evidence
-  (`--observed <url-or-path>`). **Refused while a code revision is live** — you can always
+  (`--observed <url-or-path>`). `--note TEXT` / `--note-file F` (and the same on `abandon`)
+  appends the note and the terminal event as **one unit** — validated together under the lock
+  and written with one `write`, the note first: both land or neither does. **Refused while a code revision is live** — you can always
   *kill* a task, but you can never silently complete one that has unlanded reviewed code. On a
   non-code task `done` is **self-reported unless a completion check is attached** to verify it —
   `--observed` alone is free text (law 1 covers landing, not completion; see the note above).

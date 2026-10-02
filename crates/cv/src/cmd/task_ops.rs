@@ -546,6 +546,9 @@ pub(crate) struct NoteView {
     pub by: String,
     pub ts: DateTime<Utc>,
     pub text: String,
+    /// Appended after the task closed (the page renders "(after close)").
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub post_close: bool,
     /// The decision this note was split into, when it was.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub split_into: Option<String>,
@@ -655,6 +658,7 @@ fn item_of(ctx: &PageCtx<'_>, t: &TaskProjection, reason: Option<InboxReason>, s
                 by: n.by.clone(),
                 ts: n.ts,
                 text: n.text.clone(),
+                post_close: n.post_close,
                 split_into: children.get(&n.event_id).cloned(),
             })
             .collect(),
@@ -870,9 +874,10 @@ pub(crate) fn render_inbox_md(page: &InboxPage) -> String {
                 out.push_str(&format!("notes ({}):\n\n", i.notes.len()));
                 for note in &i.notes {
                     let mut line = format!(
-                        "- _{}, {}:_ {}",
+                        "- _{}, {}{}:_ {}",
                         md_inline(&note.by),
                         fmt_local(note.ts, "%m-%d %H:%M"),
+                        if note.post_close { " (after close)" } else { "" },
                         md_inline(&first_line(&note.text, 200))
                     );
                     if let Some(child) = &note.split_into {

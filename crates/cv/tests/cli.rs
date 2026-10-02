@@ -2772,3 +2772,54 @@ fn adopt_reaches_extra_claude_roots_and_never_targets_the_dead_session() {
     let (out, _) = w.cv_ok(&["adopt", "--list", dead]);
     assert!(out.contains(aid), "a seat session lists by id too: {out}");
 }
+
+/// Terminal is about STATE, not the record: a note on a done task appends (marked "(after
+/// close)") and leaves the state alone; `done --note-file` / `abandon --note` land the note and
+/// the terminal event as one unit, the note first; tags stay refused on a closed task.
+#[test]
+fn task_notes_after_close_and_close_with_a_note() {
+    let w = World::new("post-close");
+    let (out, _) = w.cv_ok(&["task", "open", "ship the thing"]);
+    let a = opened_task_id(&out);
+    let evidence = w.base.join("evidence.md");
+    fs::write(&evidence, "journey J4: expected 7 / got 7\n").unwrap();
+    let ev = evidence.to_str().unwrap();
+    let (out, _) = w.cv_ok(&["task", "done", &a, "--note-file", ev, "--from", "lane:x"]);
+    assert!(out.contains("✦ noted") && out.contains("✦ done"), "both events reported:\n{out}");
+    let (json, _) = w.cv_ok(&["task", "show", &a, "--events"]);
+    let kinds: Vec<&str> = json
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("\"event\": \""))
+        .map(|k| k.trim_end_matches(['"', ',']))
+        .collect();
+    assert_eq!(kinds, ["opened", "noted", "done"], "the note precedes the close:\n{json}");
+
+    // A late note: accepted, marked, state unchanged.
+    let (out, _) = w.cv_ok(&["task", "note", &a, "the report is at /tmp/r.md", "--from", "lane:x"]);
+    assert!(out.contains("✦ noted") && out.contains("→ done"), "{out}");
+    let (out, _) = w.cv_ok(&["task", "show", &a]);
+    assert!(out.contains("[done]"), "{out}");
+    assert!(out.contains("journey J4: expected 7 / got 7"), "{out}");
+    assert!(!out.contains("journey J4: expected 7 / got 7\n  (after close)"), "{out}");
+    assert!(out.contains("(after close): the report is at /tmp/r.md"), "{out}");
+    let (json, _) = w.cv_ok(&["task", "show", &a, "--json"]);
+    let t: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(t["state"], "done");
+    assert!(t["notes"][0].get("post_close").is_none(), "{json}");
+    assert_eq!(t["notes"][1]["post_close"], true, "{json}");
+    let (_, err) = w.cv_fails(&["task", "tag", &a, "late"]);
+    assert!(err.contains("cannot apply tagged"), "{err}");
+
+    // abandon --note: one unit; a refused close writes no note either.
+    let (out, _) = w.cv_ok(&["task", "open", "the wrong approach"]);
+    let b = opened_task_id(&out);
+    w.cv_ok(&["task", "abandon", &b, "--reason", "superseded by design", "--note", "why: see the audit"]);
+    let (out, _) = w.cv_ok(&["task", "show", &b]);
+    assert!(out.contains("[abandoned]") && out.contains("why: see the audit"), "{out}");
+    assert!(!out.contains("(after close)"), "the abandon note preceded the close:\n{out}");
+    let (_, err) = w.cv_fails(&["task", "done", &b, "--note", "too late to finish"]);
+    assert!(err.contains("event rejected"), "{err}");
+    let (json, _) = w.cv_ok(&["task", "show", &b, "--json"]);
+    let t: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(t["notes"].as_array().unwrap().len(), 1, "the refused batch left nothing:\n{json}");
+}

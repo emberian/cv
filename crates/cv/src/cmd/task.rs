@@ -260,6 +260,13 @@ pub(crate) enum TaskCmd {
         /// GET this http:// url; a 2xx = pass. (https is not built in — use --check-cmd 'curl -fsS …'.)
         #[arg(long = "check-http", group = "check")]
         check_http: Option<String>,
+        /// A closing note (`-` = stdin), appended with the `done` as ONE unit: the note, then the
+        /// done — both land or neither does.
+        #[arg(long, conflicts_with = "note_file")]
+        note: Option<String>,
+        /// The closing note from a file (`-` for stdin).
+        #[arg(long = "note-file", value_name = "PATH")]
+        note_file: Option<PathBuf>,
         /// Acting endpoint recorded in `by`. Default: $CV_ENDPOINT.
         #[arg(long)]
         from: Option<String>,
@@ -269,6 +276,12 @@ pub(crate) enum TaskCmd {
         id: String,
         #[arg(long, default_value = "no reason given")]
         reason: String,
+        /// A closing note (`-` = stdin), appended with the abandon as ONE unit.
+        #[arg(long, conflicts_with = "note_file")]
+        note: Option<String>,
+        /// The closing note from a file (`-` for stdin).
+        #[arg(long = "note-file", value_name = "PATH")]
+        note_file: Option<PathBuf>,
         /// Acting endpoint recorded in `by`. Default: $CV_ENDPOINT.
         #[arg(long)]
         from: Option<String>,
@@ -346,9 +359,12 @@ pub(crate) enum TaskCmd {
         choice: Option<String>,
         #[arg(long = "accept-default", group = "answer")]
         accept_default: bool,
-        /// Why (`-` = stdin).
-        #[arg(long)]
+        /// Why (`-` = stdin). Recorded IN the resolution event, so it lands with it.
+        #[arg(long, conflicts_with = "note_file")]
         note: Option<String>,
+        /// The resolution's note from a file (`-` for stdin).
+        #[arg(long = "note-file", value_name = "PATH")]
+        note_file: Option<PathBuf>,
         /// The resolver, recorded in `by`. Default: $CV_ENDPOINT.
         #[arg(long)]
         from: Option<String>,
@@ -581,6 +597,48 @@ fn append_event(task_id: Option<&str>, from: &str, kind: TaskEventKind, token: O
         println!("{}", report.event.task_id);
     }
     Ok(report.event.task_id)
+}
+
+/// `--note TEXT` (`-` = stdin) or `--note-file PATH`, whichever was given.
+fn note_arg(note: Option<String>, note_file: Option<PathBuf>) -> Result<Option<String>> {
+    let text = match (note, note_file) {
+        (Some(n), _) => text_or_stdin(n)?,
+        (None, Some(f)) => read_text_arg(&f)?,
+        (None, None) => return Ok(None),
+    };
+    Ok(Some(text).filter(|t| !t.trim().is_empty()))
+}
+
+/// Close a task with an optional note first, as ONE unit (the note, then `close`): both land or
+/// neither does, so a lane cannot lose its evidence by ordering.
+fn close_with_note(id: &str, from: &str, note: Option<String>, close: TaskEventKind) -> Result<()> {
+    let Some(text) = note else {
+        return append_and_report(Some(id), from, close, None);
+    };
+    let store = TaskStore::default_store();
+    let report = task::append_batch_and_notify(
+        &store,
+        from,
+        vec![
+            (
+                Some(id.to_string()),
+                TaskEventKind::Noted {
+                    text,
+                    session_ref: None,
+                },
+            ),
+            (Some(id.to_string()), close),
+        ],
+        Vec::new(),
+    )?;
+    for w in report.replay_warnings.iter().chain(&report.warnings) {
+        eprintln!("⚠ {}", sanitize_line(w));
+    }
+    let state = report.effective_state.unwrap_or_else(|| "?".into());
+    for ev in &report.events {
+        println!("✦ {} {} → {}", ev.kind.tag(), prefix(&ev.task_id, 13), state);
+    }
+    Ok(())
 }
 
 fn resolve<'m>(model: &'m cv_core::task::TaskReadModel, prefix: &str) -> Result<&'m str> {
@@ -999,16 +1057,17 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                         .get(&note.event_id)
                         .map(|c| format!("  → split into {}", prefix(c, plen)))
                         .unwrap_or_default();
+                    let late = if note.post_close { " (after close)" } else { "" };
                     if brief {
                         println!(
-                            "    {} {:<24} {}{split}",
+                            "    {} {:<24} {}{late}{split}",
                             fmt_local(note.ts, "%m-%d %H:%M"),
                             truncate(&sanitize_line(&note.by), 24),
                             task_ops::first_line(&note.text, 150)
                         );
                     } else {
                         println!(
-                            "  note ({}, {}): {}{split}",
+                            "  note ({}, {}){late}: {}{split}",
                             sanitize_line(&note.by),
                             fmt_local(note.ts, "%Y-%m-%d %H:%M"),
                             sanitize_line(&note.text)
@@ -1066,8 +1125,11 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
             check_cmd,
             check_file,
             check_http,
+            note,
+            note_file,
             from,
         } => {
+            let note = note_arg(note, note_file)?;
             let outcome = replay_loud()?;
             let id = resolve(&outcome.model, &id)?.to_string();
             let t = &outcome.model.tasks[&id];
@@ -1088,17 +1150,19 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                 }
                 None => (observed, None),
             };
-            append_and_report(
-                Some(&id),
-                &from_or_cv(from),
-                TaskEventKind::Done { observed, check },
-                None,
-            )
+            close_with_note(&id, &from_or_cv(from), note, TaskEventKind::Done { observed, check })
         }
-        TaskCmd::Abandon { id, reason, from } => {
+        TaskCmd::Abandon {
+            id,
+            reason,
+            note,
+            note_file,
+            from,
+        } => {
+            let note = note_arg(note, note_file)?;
             let outcome = replay_loud()?;
             let id = resolve(&outcome.model, &id)?.to_string();
-            append_and_report(Some(&id), &from_or_cv(from), TaskEventKind::Abandoned { reason }, None)
+            close_with_note(&id, &from_or_cv(from), note, TaskEventKind::Abandoned { reason })
         }
         TaskCmd::Supersede { id, by_task, from } => {
             let outcome = replay_loud()?;
@@ -1352,9 +1416,11 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
             choice,
             accept_default,
             note,
+            note_file,
             from,
             token,
         } => {
+            let note = note_arg(note, note_file)?;
             let outcome = replay_loud()?;
             let id = resolve(&outcome.model, &id)?.to_string();
             let t = &outcome.model.tasks[&id];
@@ -1372,10 +1438,6 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                         None => "--accept-default".into(),
                     }
                 ),
-            };
-            let note = match note {
-                Some(n) => Some(text_or_stdin(n)?),
-                None => None,
             };
             let store = TaskStore::default_store();
             let answer = task_ops::Answer::from_flags(choice, accept_default)?;

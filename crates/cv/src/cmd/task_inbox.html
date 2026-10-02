@@ -305,11 +305,12 @@
       const open = S.expanded['n:' + i.id];
       kids.push(el('button', { class: 'more', text: (open ? '▾ ' : '▸ ') + i.notes.length + ' note' + (i.notes.length === 1 ? '' : 's'), onclick: () => { S.expanded['n:' + i.id] = !open; render(); } }));
       if (open) kids.push(el('ul', { class: 'notes' }, i.notes.map((n) => el('li', {}, [
-        el('div', { class: 'who', text: n.by + ' · ' + fmtTs(n.ts) + (n.split_into ? ' · split into ' + n.split_into.slice(0, 13) : '') }),
+        el('div', { class: 'who', text: n.by + ' · ' + fmtTs(n.ts) + (n.post_close ? ' · (after close)' : '') + (n.split_into ? ' · split into ' + n.split_into.slice(0, 13) : '') }),
         el('div', { class: 'text', text: n.text })]))));
     }
-    if (!closed) {
-      const ta = draftArea('note-' + i.id, 'note… (n)', (text) => act(i, 'note', { text }));
+    {
+      // A closed item takes notes too: they append after the close and change nothing else.
+      const ta = draftArea('note-' + i.id, closed ? 'note after close… (n)' : 'note… (n)', (text) => act(i, 'note', { text }));
       kids.push(el('div', { class: 'notebox' }, [ta, el('button', { class: 'btn', text: 'Save', title: '⌘⏎', onclick: () => { if (ta.value.trim()) act(i, 'note', { text: ta.value }); } })]));
     }
     return el('div', { class: 'card' + (i.unread && !closed ? ' unread' : '') + (k === S.sel ? ' sel' : ''), onclick: () => { S.sel = k; S.keyboard = false; document.querySelectorAll('.card.sel').forEach((c) => c.classList.remove('sel')); }, 'data-k': k }, kids);

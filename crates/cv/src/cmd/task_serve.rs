@@ -592,8 +592,8 @@ fn act(id: &str, verb: &str, who: &str, body: &Value) -> Result<Value> {
                     id
                 }
             };
-            // The closed task is terminal, so no note can be appended to it; the new task's
-            // body says where it came from instead.
+            // Each side points at the other: the new task says where it came from, and the closed
+            // one gets a post-close note (it stays closed; a note never changes state).
             let note = task::append_and_notify(
                 &store,
                 Some(&new_id),
@@ -605,6 +605,17 @@ fn act(id: &str, verb: &str, who: &str, body: &Value) -> Result<Value> {
                 Vec::new(),
             )?;
             events.push(note.event);
+            let back = task::append_and_notify(
+                &store,
+                Some(&id),
+                &by,
+                TaskEventKind::Noted {
+                    text: format!("reopened as {}", &new_id[..13]),
+                    session_ref: None,
+                },
+                Vec::new(),
+            )?;
+            events.push(back.event);
             events
         }
         other => bail!("unknown action {other:?}"),

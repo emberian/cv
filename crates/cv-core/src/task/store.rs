@@ -179,6 +179,20 @@ impl TaskStore {
         self.append(event)
     }
 
+    /// Agent-facing append of several events as ONE unit: every event is validated in order
+    /// against the replay under one lock and the lines are written with one `write_all`, so
+    /// either all of them land or none does. `cv task done --note-file F` uses it so a lane
+    /// cannot lose its evidence by ordering (the note, then the terminal event).
+    pub fn append_agent_events(&self, events: Vec<TaskEvent>) -> Result<Vec<TaskEvent>> {
+        if let Some(e) = events.iter().find(|e| e.kind.is_verifier_only()) {
+            bail!(
+                "event kind '{}' is verifier-only: landing state is observed by `cv task verify`, never asserted",
+                e.kind.tag()
+            );
+        }
+        self.append_all(events)
+    }
+
     /// Verifier-only append: same CAS, no kind restriction. Callers other than the git verifier
     /// (and its tests) must not use this.
     pub fn append_verifier_event(&self, event: TaskEvent) -> Result<TaskEvent> {
@@ -192,6 +206,16 @@ impl TaskStore {
     /// the log is incomplete — a stale binary must not write against an incomplete model, so the
     /// append is refused with the problem named instead of being validated against a lie.
     fn append(&self, event: TaskEvent) -> Result<TaskEvent> {
+        let mut out = self.append_all(vec![event])?;
+        Ok(out.pop().expect("one event in, one out"))
+    }
+
+    /// [`Self::append`] for a batch: validate every candidate in order, authenticate every one,
+    /// then bind and write them all in one `write_all`.
+    fn append_all(&self, events: Vec<TaskEvent>) -> Result<Vec<TaskEvent>> {
+        if events.is_empty() {
+            return Ok(events);
+        }
         fs::create_dir_all(&self.dir).with_context(|| format!("creating tasks dir {}", self.dir.display()))?;
         let _lock = FileLock::acquire(self.lock_path())?;
 
@@ -216,21 +240,30 @@ impl TaskStore {
                 )
             })?;
         }
-        reducer
-            .apply(&event)
-            .map_err(|e| anyhow::anyhow!("event rejected: {e}"))?;
+        for event in &events {
+            reducer
+                .apply(event)
+                .map_err(|e| anyhow::anyhow!("event rejected: {e}"))?;
+        }
 
-        // Identity gate (TOFU): after the event is validated but before it is written, authenticate
-        // the `by` claim against the endpoint bindings. Runs under the same lock as the append and
-        // binding write, so load-decide-bind-append is atomic. Non-identity events proceed
-        // untouched; a bound endpoint without the matching token is rejected here.
-        let decision = super::identity::authorize(
-            &self.dir,
-            &event.by,
-            event.kind.is_identity_bearing(),
-            self.token.as_deref(),
-        )?;
-        if let super::identity::Decision::Bind { endpoint, hash } = &decision {
+        // Identity gate (TOFU): after the events are validated but before any is written,
+        // authenticate each `by` claim against the endpoint bindings. Runs under the same lock as
+        // the append and binding write, so load-decide-bind-append is atomic. Non-identity events
+        // proceed untouched; a bound endpoint without the matching token is rejected here, before
+        // anything is bound or written.
+        let mut binds = Vec::new();
+        for event in &events {
+            let decision = super::identity::authorize(
+                &self.dir,
+                &event.by,
+                event.kind.is_identity_bearing(),
+                self.token.as_deref(),
+            )?;
+            if let super::identity::Decision::Bind { endpoint, hash } = decision {
+                binds.push((endpoint, hash));
+            }
+        }
+        for (endpoint, hash) in &binds {
             super::identity::commit(&self.dir, endpoint, hash)?;
         }
 
@@ -242,8 +275,10 @@ impl TaskStore {
             line.push_str(HEADER_LINE);
             line.push('\n');
         }
-        line.push_str(&serde_json::to_string(&event).context("serializing task event")?);
-        line.push('\n');
+        for event in &events {
+            line.push_str(&serde_json::to_string(event).context("serializing task event")?);
+            line.push('\n');
+        }
         let mut f = OpenOptions::new()
             .create(true)
             .append(true)
@@ -253,7 +288,7 @@ impl TaskStore {
             .with_context(|| format!("appending to task log {}", self.events_path().display()))?;
         f.flush()
             .with_context(|| format!("flushing task log {}", self.events_path().display()))?;
-        Ok(event)
+        Ok(events)
     }
 
     /// Read raw events as `(1-based line number, event)` pairs. Interior unparseable lines are
@@ -441,6 +476,45 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("event rejected"), "{err}");
         assert_eq!(store.replay().unwrap().events.len(), before);
+    }
+
+    /// A batch lands whole or not at all: a note then a `done` both land; a note then a refused
+    /// event writes neither (the note is not left behind as a half-applied unit).
+    #[test]
+    fn batch_append_is_all_or_nothing() {
+        let dir = tmp_tasks();
+        let store = TaskStore::at(&dir);
+        let task = open_task(&store);
+        let note = |t: &str| {
+            new_event(
+                Some(&task),
+                "agent:a",
+                TaskEventKind::Noted {
+                    text: t.into(),
+                    session_ref: None,
+                },
+            )
+        };
+        let released = new_event(Some(&task), "agent:a", TaskEventKind::Released {});
+        let err = store.append_agent_events(vec![note("lost?"), released]).unwrap_err();
+        assert!(err.to_string().contains("event rejected"), "{err}");
+        assert_eq!(store.replay().unwrap().events.len(), 1, "nothing of the refused batch landed");
+
+        let done = new_event(
+            Some(&task),
+            "agent:a",
+            TaskEventKind::Done {
+                observed: None,
+                check: None,
+            },
+        );
+        let out = store.append_agent_events(vec![note("the evidence"), done]).unwrap();
+        assert_eq!(out.len(), 2);
+        let outcome = store.replay().unwrap();
+        let t = &outcome.model.tasks[&task];
+        assert_eq!(t.state, TaskState::Done);
+        assert_eq!(t.notes.len(), 1);
+        assert!(!t.notes[0].post_close, "the note preceded the close");
     }
 
     #[test]

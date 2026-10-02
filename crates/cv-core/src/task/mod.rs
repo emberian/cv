@@ -569,6 +569,51 @@ pub fn append_and_notify(
     })
 }
 
+/// [`append_and_notify`] for several events by one actor, appended as ONE unit
+/// ([`TaskStore::append_agent_events`]): all land or none does. Each event is notified on its
+/// task's board channel. The outcome's `event` is the LAST event and `effective_state` is its
+/// task's state after the batch; `events` holds all of them in append order.
+pub fn append_batch_and_notify(
+    store: &TaskStore,
+    from: &str,
+    kinds: Vec<(Option<String>, TaskEventKind)>,
+    mut warnings: Vec<String>,
+) -> anyhow::Result<BatchOutcome> {
+    let candidates: Vec<TaskEvent> = kinds
+        .into_iter()
+        .map(|(task_id, kind)| new_event(task_id.as_deref(), from, kind))
+        .collect();
+    let events = store.append_agent_events(candidates)?;
+    let outcome = store.replay()?;
+    for event in &events {
+        let proj = outcome.model.tasks.get(&event.task_id);
+        let channel = proj.map(|t| t.channel.clone()).unwrap_or_else(|| "tasks".into());
+        if let Err(e) = notify_board(event, &channel, proj.map(|t| t.title.as_str())) {
+            warnings.push(format!("board notification failed (task state is durable): {e}"));
+        }
+    }
+    let effective_state = events
+        .last()
+        .and_then(|e| outcome.model.tasks.get(&e.task_id))
+        .map(effective_display);
+    Ok(BatchOutcome {
+        events,
+        effective_state,
+        warnings,
+        replay_warnings: outcome.warnings,
+    })
+}
+
+/// What one batch append produced (see [`append_batch_and_notify`]).
+#[derive(Debug)]
+pub struct BatchOutcome {
+    pub events: Vec<TaskEvent>,
+    /// The last event's task, after the batch.
+    pub effective_state: Option<String>,
+    pub warnings: Vec<String>,
+    pub replay_warnings: Vec<String>,
+}
+
 use std::path::PathBuf;
 
 /// Root dir for the task log: `$CLUSTERVISION_HOME/tasks` (or `~/.clustervision/tasks`).

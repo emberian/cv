@@ -16,7 +16,8 @@
 //! 4. Typed `EndpointId` → plain `String`, matching the board's `from` convention.
 //!
 //! On top of the ported facet sits a base lifecycle for tasks that never involve code review:
-//! `Open → Claimed → Done`, terminals `Abandoned`/`Superseded`, `Noted` for progress. The two
+//! `Open → Claimed → Done`, terminals `Abandoned`/`Superseded`, `Noted` for progress (accepted on
+//! a terminal task too, marked `post_close`: terminal is about state, not the record). The two
 //! layers meet in exactly two rules: a revision may only be proposed on a non-terminal task, and
 //! `Done` is refused while a revision is live (you can always kill a task, never silently
 //! complete one that has unlanded reviewed code).
@@ -127,6 +128,11 @@ pub struct Note {
     pub ts: DateTime<Utc>,
     pub text: String,
     pub session_ref: Option<String>,
+    /// Appended after the task reached a terminal state. Terminal is about STATE, not the record:
+    /// a lane that marks `done` and then writes its evidence keeps the evidence, and the note
+    /// changes nothing else. Omitted from the wire when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub post_close: bool,
 }
 
 /// Read model for one revision of a task.
@@ -461,13 +467,16 @@ impl TaskReducer {
                 task.state = TaskState::Open;
             }
             TaskEventKind::Noted { text, session_ref } => {
-                require_base(task, kind, &[TaskState::Open, TaskState::Claimed])?;
+                // The one event a terminal task accepts unconditionally: a note never changes
+                // state, so refusing it only lost evidence (four lanes wrote `done` before their
+                // note and lost the note). It is marked `post_close` so every surface can say so.
                 task.notes.push(Note {
                     event_id: event.id.clone(),
                     by: event.by.clone(),
                     ts: event.ts,
                     text: text.clone(),
                     session_ref: session_ref.clone(),
+                    post_close: task.state.is_terminal(),
                 });
             }
             TaskEventKind::Done { observed, check } => {
@@ -1602,13 +1611,12 @@ mod tests {
         assert_eq!(r.event_id, ev.id);
         assert_eq!(r.note.as_deref(), Some("the twin goes"));
 
-        // Nothing applies after a resolution (terminal), including a note.
+        // Nothing state-bearing applies after a resolution (terminal) — a tag included.
         log.push(
             &task,
             AUTHOR,
-            TaskEventKind::Noted {
-                text: "late".into(),
-                session_ref: None,
+            TaskEventKind::Tagged {
+                tags: vec!["late".into()],
             },
         );
         assert!(matches!(
@@ -1668,5 +1676,103 @@ mod tests {
         let r = m.tasks[&task].decision.as_ref().unwrap().resolution.as_ref().unwrap();
         assert!(r.accepted_default);
         assert_eq!(r.choice, "a");
+    }
+
+    /// A note on a terminal task appends (marked `post_close`) and never changes the task's state —
+    /// for every terminal state. Tags stay refused: they change views, not the record.
+    #[test]
+    fn post_close_note_appends_and_never_changes_effective_state() {
+        let terminals: Vec<(&str, Vec<TaskEventKind>)> = vec![
+            (
+                "done",
+                vec![TaskEventKind::Done {
+                    observed: None,
+                    check: None,
+                }],
+            ),
+            (
+                "abandoned",
+                vec![TaskEventKind::Abandoned { reason: "r".into() }],
+            ),
+            (
+                "superseded",
+                vec![TaskEventKind::Superseded { by_task: "other".into() }],
+            ),
+            (
+                "resolved",
+                vec![
+                    posed(&["a", "b"], "a"),
+                    TaskEventKind::Resolved {
+                        choice: "b".into(),
+                        note: None,
+                    },
+                ],
+            ),
+        ];
+        for (name, close) in terminals {
+            let mut log = Log::new();
+            let task = log.open(AUTHOR);
+            log.push(
+                &task,
+                AUTHOR,
+                TaskEventKind::Noted {
+                    text: "before".into(),
+                    session_ref: None,
+                },
+            );
+            for k in close {
+                log.push(&task, AUTHOR, k);
+            }
+            let before = log.reduce().unwrap().tasks[&task].clone();
+            assert_eq!(before.effective_state().as_str(), name);
+            log.push(
+                &task,
+                OTHER,
+                TaskEventKind::Noted {
+                    text: "the evidence, after the close".into(),
+                    session_ref: None,
+                },
+            );
+            let after = log.reduce().unwrap().tasks[&task].clone();
+            assert_eq!(after.effective_state(), before.effective_state(), "{name}: state moved");
+            assert_eq!(after.state, before.state, "{name}");
+            assert_eq!(after.decision, before.decision, "{name}: the resolution is untouched");
+            assert_eq!(after.notes.len(), 2, "{name}");
+            assert!(!after.notes[0].post_close, "{name}: a live note is not post-close");
+            assert!(after.notes[1].post_close, "{name}: the late note is marked");
+            assert_eq!(after.notes[1].by, OTHER);
+            // Tags are still refused on a terminal task.
+            log.push(
+                &task,
+                AUTHOR,
+                TaskEventKind::Tagged {
+                    tags: vec!["late".into()],
+                },
+            );
+            assert!(
+                matches!(log.reduce().unwrap_err(), ReduceError::InvalidTransition { .. }),
+                "{name}: tags stay refused"
+            );
+        }
+    }
+
+    /// `post_close` is wire-additive: a live note serializes exactly as before the field existed,
+    /// and a note recorded before it existed deserializes as live.
+    #[test]
+    fn post_close_is_wire_additive() {
+        let n = Note {
+            event_id: "e".into(),
+            by: "b".into(),
+            ts: "2026-07-16T12:00:00Z".parse().unwrap(),
+            text: "t".into(),
+            session_ref: None,
+            post_close: false,
+        };
+        let v = serde_json::to_value(&n).unwrap();
+        assert!(v.get("post_close").is_none(), "{v}");
+        let back: Note = serde_json::from_value(v).unwrap();
+        assert!(!back.post_close);
+        let late = Note { post_close: true, ..n };
+        assert_eq!(serde_json::to_value(&late).unwrap()["post_close"], true);
     }
 }

@@ -88,9 +88,11 @@ that already existed under another title.
 
 Ranked by how often the gap bit:
 
-1. **Notes on terminal tasks.** Terminal is about *state*, not about the record: `cv task note` on a
+1. ~~**Notes on terminal tasks.** Terminal is about *state*, not about the record: `cv task note` on a
    done or resolved task should append (marked post-close), and `cv task done --note FILE` should be
-   one event. Four lanes and the orchestrator lost or re-homed notes on this.
+   one event. Four lanes and the orchestrator lost or re-homed notes on this.~~ **Landed:** a note on
+   a terminal task appends with `post_close: true` ("(after close)" on every surface) and never moves
+   the state; `done` / `abandon` take `--note` / `--note-file` and append note + close as one unit.
 2. **Provisional resolutions.** `cv task decide … --provisional` resolves a decision on its default *by
    the orchestrator* with a veto window; the inbox shows it under "made for you — veto?" and the
    decider's `resolve` overrides. Today this is prose on a note.
