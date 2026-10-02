@@ -102,6 +102,36 @@
     `CLUSTERVISION_CLAUDE_ROOTS`, so a test run inside an agent that has its own config dir stays
     hermetic.
 
+### The swarm's edits
+
+Six of the eight edits `manual/src/swarm.md` asks for, from a forty-hour swarm session.
+
+- **Notes on terminal tasks.** A `noted` on a done/resolved/abandoned/superseded task appends with
+  `post_close: true` ("(after close)" on `show`, the inbox and the page) and never changes state;
+  tags stay refused. `cv task done|abandon --note TEXT|--note-file F` append the note and the
+  terminal event as one unit (`TaskStore::append_agent_events`: all or none).
+- **Provisional resolutions.** `cv task decide … --provisional` / `resolve --accept-default
+  --provisional`: resolved on the default by the poser; the decider's inbox shows it under "made for
+  you (veto?)" (`InboxReason::Provisional`, not owed); `resolve --confirm | --choice` by the
+  decision's assignee replaces it (kept as `decision.superseded_provisional`) — the one state-bearing
+  event a terminal task accepts. The page has confirm/veto buttons.
+- **One way to pose a decision.** `open --tags decision` / `tag <id> decision` on an unposed task
+  refuse, naming `cv task decide … --default …`. Old tag-only decisions still show.
+- **`cv lanes --tasks`.** Each lane's endpoint (its own first `CV_ENDPOINT=<kind>:<name>` export,
+  else its description's leading token) joined to the tasks it holds, with the last note;
+  `/api/lanes` and the page's Lanes pane carry them.
+- **A pinned STATUS.** New event `status_set` (identity-bearing; assignee or opener; refused when
+  terminal) replaces `TaskProjection.status`; `show` leads with it, `--brief` is title + STATUS,
+  `--status` is the text.
+- **Why a lane died.** `failed:rate-limited` (with `resets_at`) / `failed:context` / `stopped`, from
+  the transcript's last uncleared API-error notice; the header counts the causes.
+- ⚠ **Wire.** New tag `status_set`; `resolved.provisional`; `note.post_close`. An older cv refuses
+  to replay a `status_set` line, a post-close note, or a provisional override, and then refuses
+  every append (fail-closed on a degraded log): install this cv on every writer before using them.
+  The golden log gained specimen task E (additive; every earlier line byte-identical).
+- Not yet: `show` defaults (last three notes; `--all`) and dedupe-on-open — tasks
+  `01a0fab1-9b64` and `01a0fab1-9b7a` hold the next steps.
+
 ## 0.13.0 — decisions are a kind; a human can drain the inbox
 
 Written from the first day a human was on the other end of `cv task`: an orchestrator had filed
