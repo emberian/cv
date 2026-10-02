@@ -390,6 +390,16 @@ a1e1ce3d  running    opus-4-1       10-01 00:11  2h01m    2.1M    88  K-SPK: ker
 
 **Status** comes from the most authoritative source available, and the JSON says which (`status_source`): a `Workflow` run's journal (`done` / `partial` / …), else the parent transcript's last `<task-notification>` for the agent (`completed` / `failed` / `killed` / `stopped` — read from the `queue-operation` records the harness writes the moment a child stops, so it does not depend on the notification ever reaching the conversation), else the child's own `SubagentStop` hook (`stopped`), else `running`.
 
+**Why a lane died.** A `failed` or `killed` lane carries a `failure_cause` read from its
+transcript's last API-error notice that no real turn followed (a resume clears it): an API 429 /
+"session limit" / "usage limit" is **`rate-limited`** — with `resets_at` from the record's
+`quotaLimits.resetsAt` and the notice's own text, and the remedy *resume with one message after
+the reset*; "Prompt is too long" / a context-length error is **`context`** — it cannot be resumed,
+relaunch from its clone with a STATUS hand-off; no notice but a `SubagentStop` after the last turn
+is **`stopped`**; anything else stays plain `failed`. The STATUS column reads `failed:rate-limited`,
+the header counts the causes (`4 other (2 context)`), and the page's status dot carries the cause,
+the notice and the reset in its title.
+
 **Stranded** is the class that parked four lanes in one day: the harness reports the lane *completed*, and its final text says it is waiting — `Waiting on notifications`, `I'll continue when the monitor fires`, `waiting for the … verdict`. Nothing will wake it. `--stranded` lists exactly those, with the resume hint; a stranded lane never counts as done (`--done` and the header's `completed` exclude it). The phrase set is `cv_core::lanes::STRAND_PATTERNS`; only the last two sentences of the text are consulted, so a report that mentions waiting and then concludes is not stranded.
 
 **`--tasks`** joins the lane table to the task store. A lane's endpoint is the first

@@ -114,9 +114,13 @@ Ranked by how often the gap bit:
    **Landed:** `status_set` replaces `TaskProjection.status` (history in the events), by the assignee
    or the opener, refused when terminal; `show` leads with it, `--brief` is title + STATUS, `--status`
    is the text alone.
-6. **Failure cause from the transcript.** A lane that died of an API rate limit, a context-length
+6. ~~**Failure cause from the transcript.** A lane that died of an API rate limit, a context-length
    error, or a stop should show as `rate-limited` / `context` / `stopped`, not all as `failed`: the
-   remedy differs (resume vs relaunch).
+   remedy differs (resume vs relaunch).~~ **Landed:** `Lane.failure_cause` (+ `resets_at`,
+   `failure_detail`) from the last uncleared `isApiErrorMessage` notice; `failed:rate-limited` in the
+   table with the resume hint, `failed:context` with the relaunch hint. On this session the two
+   `failed` lanes (S3 R4, the STANDING INTEGRATOR) read `failed:context`; the eleven session-limit
+   kills of 10-01/02 were all resumed, so their notices are history and they read `completed`.
 7. **`show` defaults.** `cv task show` prints the body and the last three notes with a count; `--all`
    dumps. The dump is what killed the integrator.
 8. **Dedupe on open.** `cv task open` warns when an open task's title is near the new one.

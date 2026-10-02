@@ -431,7 +431,7 @@
       const cls = l.stranded ? 'stranded' : quiet ? 'quiet' : running ? 'running' : (l.status === 'failed' || l.status === 'killed') ? 'failed' : 'done';
       const where = l.last_tool || l.last_text || '';
       const tr = el('tr', { class: 'row' + (k === S.sel ? ' sel' : ''), onclick: () => { S.expanded['l:' + l.agent_id] = !S.expanded['l:' + l.agent_id]; S.sel = k; render(); } }, [
-        el('td', { class: 'nowrap', title: l.status + (l.stranded ? ' · STRANDED' : '') + (quiet ? ' · quiet ' + Math.round(quietMin) + 'm' : '') }, [el('span', { class: 'dot ' + cls }), quiet ? 'quiet ' + Math.round(quietMin / 60 * 10) / 10 + 'h' : l.stranded ? 'stranded' : l.status]),
+        el('td', { class: 'nowrap', title: l.status + (l.failure_cause ? ':' + l.failure_cause : '') + (l.failure_detail ? ' — ' + l.failure_detail : '') + (l.resets_at ? ' · resets ' + fmtTs(l.resets_at) : '') + (l.stranded ? ' · STRANDED' : '') + (quiet ? ' · quiet ' + Math.round(quietMin) + 'm' : '') }, [el('span', { class: 'dot ' + cls }), quiet ? 'quiet ' + Math.round(quietMin / 60 * 10) / 10 + 'h' : l.stranded ? 'stranded' : l.status + (l.failure_cause ? ':' + l.failure_cause : '')]),
         el('td', { class: 'nowrap' }, [el('code', { text: l.agent_id.slice(0, 8), title: 'copy ' + l.agent_id, onclick: (ev) => { ev.stopPropagation(); copy(l.agent_id, 'agent id'); } })]),
         el('td', { text: l.description || l.agent_type || '' }),
         laneTaskCell(l),

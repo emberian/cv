@@ -1045,6 +1045,27 @@ pub struct SubagentEnd {
     pub last_turn_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stopped_at: Option<DateTime<Utc>>,
+    /// The last API-error notice (`isApiErrorMessage`) with no real turn after it — what killed
+    /// the agent, if anything did. A resume clears it (the next real record is a new turn).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_error: Option<ApiErrorNotice>,
+}
+
+/// One of Claude Code's synthetic API-error notices, as the transcript records it: the notice
+/// text (`You've hit your session limit · resets 9pm (America/New_York)`, `Prompt is too long`),
+/// the `error` class (`rate_limit`, `invalid_request`), the HTTP status when present, and the
+/// quota's reset instant (`quotaLimits.resetsAt`, epoch seconds) for a rate limit.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+pub struct ApiErrorNotice {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ts: Option<DateTime<Utc>>,
+    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resets_at: Option<DateTime<Utc>>,
 }
 
 impl SubagentEnd {
@@ -1065,9 +1086,37 @@ pub fn subagent_end(path: &std::path::Path) -> SubagentEnd {
     super::for_each_json_line(BufReader::new(file), |v| {
         let ts = v.get("timestamp").and_then(Value::as_str).and_then(parse_ts);
         match v.get("type").and_then(Value::as_str) {
-            Some("user") | Some("assistant") => {
+            Some(kind @ ("user" | "assistant")) => {
                 if let Some(ts) = ts {
                     end.last_turn_at = Some(end.last_turn_at.map_or(ts, |t: DateTime<Utc>| t.max(ts)));
+                }
+                let msg = v.get("message").cloned().unwrap_or(Value::Null);
+                if v.get("isApiErrorMessage").and_then(Value::as_bool).unwrap_or(false) {
+                    let text = msg
+                        .get("content")
+                        .and_then(Value::as_array)
+                        .map(|blocks| {
+                            blocks
+                                .iter()
+                                .filter_map(|b| b.get("text").and_then(Value::as_str))
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        })
+                        .or_else(|| msg.get("content").and_then(Value::as_str).map(str::to_string))
+                        .unwrap_or_default();
+                    end.api_error = Some(ApiErrorNotice {
+                        ts,
+                        text,
+                        error: v.get("error").and_then(Value::as_str).map(str::to_string),
+                        status: v.get("apiErrorStatus").and_then(Value::as_u64),
+                        resets_at: v
+                            .pointer("/quotaLimits/resetsAt")
+                            .and_then(Value::as_i64)
+                            .and_then(|s| DateTime::from_timestamp(s, 0)),
+                    });
+                } else if kind == "user" || !is_synthetic_assistant(&v, &msg) {
+                    // A real turn after the notice: the agent was resumed; the error is history.
+                    end.api_error = None;
                 }
             }
             Some("attachment")

@@ -517,3 +517,92 @@ fn lanes_tasks_join_by_exported_endpoint_then_description() {
     assert_eq!(la["endpoint"], "lane:lane-a");
     assert!(la.get("tasks").is_none(), "{la}");
 }
+
+/// A Claude Code API-error notice, in the record shape session 0c315aee's kills left (content
+/// redacted to the notice text; `quotaLimits` carried only on the rate limit).
+fn api_error(uuid: &str, ts: &str, text: &str, error: &str, status: Option<u64>, resets_at: Option<i64>) -> serde_json::Value {
+    let mut v = serde_json::json!({
+        "type": "assistant", "uuid": uuid, "sessionId": "s", "timestamp": ts, "isSidechain": true,
+        "message": {"id": format!("e-{uuid}"), "model": "<synthetic>", "role": "assistant", "type": "message",
+            "stop_reason": "stop_sequence", "content": [{"type": "text", "text": text}],
+            "usage": {"input_tokens": 0, "output_tokens": 0, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}},
+        "error": error, "isApiErrorMessage": true
+    });
+    if let Some(s) = status {
+        v["apiErrorStatus"] = s.into();
+    }
+    if let Some(r) = resets_at {
+        v["quotaLimits"] = serde_json::json!({"status": "rejected", "resetsAt": r, "rateLimitType": "five_hour"});
+    }
+    v
+}
+
+/// `cv lanes` names why a lane died: the session-limit 429 is `failed:rate-limited` with its
+/// reset, `Prompt is too long` is `failed:context`, a lane resumed after a limit is no longer
+/// failed, and a failure with no notice stays plain `failed`. The summary counts the causes.
+#[test]
+fn lanes_failure_cause_from_the_transcript() {
+    let w = World::new("lanes-cause");
+    w.write_session(
+        SID,
+        &[
+            user("u0", "2026-10-01T19:00:00Z", "go"),
+            notification("2026-10-01T20:10:30Z", "eee5", "failed"),
+            notification("2026-10-01T19:30:30Z", "fff6", "failed"),
+            notification("2026-10-01T20:10:31Z", "ggg7", "failed"),
+            notification("2026-10-01T21:30:00Z", "ggg7", "completed"),
+            notification("2026-10-01T20:00:00Z", "hhh8", "failed"),
+            assistant("a0", "2026-10-01T22:00:00Z", "ok"),
+        ],
+    );
+    let run = |id: &str, desc: &str, tail: Vec<serde_json::Value>| {
+        let mut lines = vec![
+            user(&format!("{id}0"), "2026-10-01T19:00:10Z", "You are a lane."),
+            assistant_tool(&format!("{id}1"), "2026-10-01T19:00:20Z", "Bash", serde_json::json!({"command": "cargo build"})),
+            tool_result(&format!("{id}2"), "2026-10-01T19:01:00Z", &format!("toolu_{id}1"), "ok"),
+        ];
+        lines.extend(tail);
+        w.write_agent(SID, id, desc, &lines);
+    };
+    run(
+        "eee5",
+        "LANE-E: killed by the session limit",
+        vec![api_error("e3", "2026-10-01T20:10:20Z", "You've hit your session limit · resets 9pm (America/New_York)", "rate_limit", Some(429), Some(1_790_902_800))],
+    );
+    run(
+        "fff6",
+        "LANE-F: the standing integrator",
+        vec![api_error("f3", "2026-10-01T19:30:04Z", "Prompt is too long", "invalid_request", None, None)],
+    );
+    run(
+        "ggg7",
+        "LANE-G: resumed after the limit",
+        vec![
+            api_error("g3", "2026-10-01T20:10:21Z", "You've hit your session limit · resets 9pm (America/New_York)", "rate_limit", Some(429), Some(1_790_902_800)),
+            user("g4", "2026-10-01T21:10:00Z", "The coordinator sent a message: resume."),
+            assistant("g5", "2026-10-01T21:29:00Z", "Resumed and finished; report written."),
+        ],
+    );
+    run("hhh8", "LANE-H: died quietly", vec![]);
+
+    let (out, _) = w.cv_ok(&["lanes", SID]);
+    assert!(out.contains("eee5      failed:rate-limited"), "{out}");
+    assert!(out.contains("✗ You've hit your session limit · resets 9pm (America/New_York) (resets "), "{out}");
+    assert!(out.contains("resume with one message after the reset: SendMessage to eee5"), "{out}");
+    assert!(out.contains("fff6      failed:context"), "{out}");
+    assert!(out.contains("✗ Prompt is too long → it cannot be resumed"), "{out}");
+    assert!(out.contains("ggg7      completed"), "a resumed lane is not dead:\n{out}");
+    assert!(out.contains("hhh8      failed "), "no notice: plain failed:\n{out}");
+    assert!(out.contains("4 sub-agents: 0 running · 1 completed · 3 other (1 context · 1 rate-limited)"), "{out}");
+
+    let (json, _) = w.cv_ok(&["lanes", SID, "--json"]);
+    let rows: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
+    let by_id = |id: &str| rows.iter().find(|r| r["agent_id"] == id).unwrap().clone();
+    let e = by_id("eee5");
+    assert_eq!(e["status"], "failed");
+    assert_eq!(e["failure_cause"], "rate-limited");
+    assert_eq!(e["resets_at"], "2026-10-02T01:00:00Z");
+    assert_eq!(by_id("fff6")["failure_cause"], "context");
+    assert!(by_id("ggg7").get("failure_cause").is_none());
+    assert!(by_id("hhh8").get("failure_cause").is_none());
+}

@@ -308,8 +308,24 @@ pub(crate) fn cmd_lanes(
     } else {
         String::new()
     };
+    // What killed the "other" lanes, when their transcripts say (the remedy differs: a
+    // rate-limited lane resumes after the reset; a context death relaunches from its clone).
+    let mut causes: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for l in &all {
+        if let Some(c) = l.failure_cause.as_deref() {
+            *causes.entry(c).or_default() += 1;
+        }
+    }
+    let why = if causes.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " ({})",
+            causes.iter().map(|(c, n)| format!("{n} {c}")).collect::<Vec<_>>().join(" · ")
+        )
+    };
     println!(
-        "# lanes of {} — {} sub-agents: {running} running · {done} completed{lost} · {other} other · {stranded} STRANDED{scope}\n",
+        "# lanes of {} — {} sub-agents: {running} running · {done} completed{lost} · {other} other{why} · {stranded} STRANDED{scope}\n",
         short_id(&r.id),
         all.len(),
     );
@@ -317,17 +333,26 @@ pub(crate) fn cmd_lanes(
         println!("(none match)");
         return Ok(());
     }
-    println!("AGENT     STATUS     MODEL          STARTED         DUR  TOKENS CALLS  DESCRIPTION");
+    let status_of = |l: &Lane| -> String {
+        if l.stranded {
+            "STRANDED".to_string()
+        } else if let Some(c) = &l.failure_cause {
+            format!("{}:{c}", l.status)
+        } else {
+            truncate(&l.status, 10)
+        }
+    };
+    let sw = lanes.iter().map(|l| status_of(l).chars().count()).max().unwrap_or(0).max(10);
+    println!(
+        "AGENT     {:<sw$} MODEL          STARTED         DUR  TOKENS CALLS  DESCRIPTION",
+        "STATUS"
+    );
     for l in &lanes {
         let started = l
             .started_at
             .map(|t| fmt_local(t, "%m-%d %H:%M"))
             .unwrap_or_else(|| "-".into());
-        let status = if l.stranded {
-            "STRANDED".to_string()
-        } else {
-            truncate(&l.status, 10)
-        };
+        let status = status_of(l);
         let desc = l
             .description
             .as_deref()
@@ -335,7 +360,7 @@ pub(crate) fn cmd_lanes(
             .unwrap_or_default();
         let wf = l.workflow.as_deref().map(|w| format!(" ⟐{w}")).unwrap_or_default();
         println!(
-            "{:<9} {:<10} {:<14} {:<11} {:>7} {:>7} {:>5}  {}{}",
+            "{:<9} {:<sw$} {:<14} {:<11} {:>7} {:>7} {:>5}  {}{}",
             short_id(&l.agent_id),
             status,
             short_model(l.model.as_deref()),
@@ -364,6 +389,21 @@ pub(crate) fn cmd_lanes(
         }
         if l.stranded {
             println!("          → resume: SendMessage to {}", l.agent_id);
+        }
+        match l.failure_cause.as_deref() {
+            Some("rate-limited") => println!(
+                "          ✗ {}{} → resume with one message after the reset: SendMessage to {}",
+                truncate(&sanitize_line(l.failure_detail.as_deref().unwrap_or("rate-limited")), 80),
+                l.resets_at
+                    .map(|t| format!(" (resets {})", fmt_local(t, "%m-%d %H:%M")))
+                    .unwrap_or_default(),
+                l.agent_id
+            ),
+            Some("context") => println!(
+                "          ✗ {} → it cannot be resumed: relaunch from its clone with a STATUS hand-off",
+                truncate(&sanitize_line(l.failure_detail.as_deref().unwrap_or("context")), 80)
+            ),
+            _ => {}
         }
         if let Some(tasks) = &l.tasks {
             print_lane_tasks(l, tasks);

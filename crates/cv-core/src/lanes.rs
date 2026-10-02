@@ -17,7 +17,7 @@ use regex::Regex;
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::harness::claude::{subagent_end, task_notices, SubagentEnd, TaskNotice};
+use crate::harness::claude::{subagent_end, task_notices, ApiErrorNotice, SubagentEnd, TaskNotice};
 use crate::ir::{Block, Message, MessageKind, Role, SessionRef, Usage};
 use crate::stream::{Flow, ParseOptions};
 use crate::SubagentInfo;
@@ -108,6 +108,19 @@ pub struct Lane {
     pub last_tool: Option<String>,
     /// Parked on a promise nothing will keep: stopped, and its last text says it is waiting.
     pub stranded: bool,
+    /// Why a `failed` / `killed` lane died, read from its transcript's last API-error notice:
+    /// `rate-limited` (an API 429 / session or usage limit — resume after the reset),
+    /// `context` (prompt too long — relaunch from its clone, it cannot be resumed), or `stopped`
+    /// (no error; the harness's own stop hook fired). `None` = undetermined: plain `failed`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_cause: Option<String>,
+    /// For `rate-limited`: when the quota resets (`quotaLimits.resetsAt`), when the record says.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resets_at: Option<DateTime<Utc>>,
+    /// For `rate-limited` / `context`: the notice's own text (`You've hit your session limit ·
+    /// resets 9pm (America/New_York)`, `Prompt is too long`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_detail: Option<String>,
     /// The task-store endpoint this lane acts as (`lane:<name>`): the first `CV_ENDPOINT=…` its
     /// own tool calls exported, else (after [`attach_tasks`]) a `lane:<slug>` assignee matching
     /// the description's leading token.
@@ -267,6 +280,38 @@ pub fn text_is_waiting(text: &str) -> bool {
     });
     let present = past.replace_all(&tail, "");
     strand_regex().is_match(&present)
+}
+
+/// Classify a dead lane's cause from its transcript's last uncleared API-error notice (see
+/// [`Lane::failure_cause`]). Only `failed` / `killed` lanes get a cause; everything else is `None`.
+pub fn failure_cause(status: &str, end: &SubagentEnd) -> Option<&'static str> {
+    if !matches!(status, "failed" | "killed") {
+        return None;
+    }
+    match &end.api_error {
+        Some(e) => classify_api_error(e),
+        None if end.stopped() == Some(true) => Some("stopped"),
+        None => None,
+    }
+}
+
+/// `rate-limited` / `context` from one API-error notice, else `None`.
+pub fn classify_api_error(e: &ApiErrorNotice) -> Option<&'static str> {
+    let text = e.text.to_lowercase();
+    let error = e.error.as_deref().unwrap_or("");
+    if error == "rate_limit"
+        || e.status == Some(429)
+        || ["session limit", "usage limit", "rate limit", "rate_limit"].iter().any(|p| text.contains(p))
+    {
+        return Some("rate-limited");
+    }
+    if ["prompt is too long", "context length", "context window", "maximum context", "too many tokens"]
+        .iter()
+        .any(|p| text.contains(p))
+    {
+        return Some("context");
+    }
+    None
 }
 
 /// One line for a tool call: the tool name plus the argument a reader would look at first.
@@ -438,6 +483,8 @@ fn lane_of(sub: SubagentInfo, notices: &HashMap<String, TaskNotice>) -> Option<L
     let last_text = sub.result_summary.clone().or(p.last_text);
     let parked = matches!(status.as_str(), "completed" | "stopped" | "returned");
     let stranded = parked && last_text.as_deref().is_some_and(text_is_waiting);
+    let cause = failure_cause(&status, &end);
+    let notice = end.api_error.as_ref().filter(|_| matches!(cause, Some("rate-limited" | "context")));
     Some(Lane {
         agent_id,
         session_id: sub.session.id.clone(),
@@ -458,6 +505,9 @@ fn lane_of(sub: SubagentInfo, notices: &HashMap<String, TaskNotice>) -> Option<L
         last_text,
         last_tool: p.last_tool,
         stranded,
+        failure_cause: cause.map(str::to_string),
+        resets_at: notice.and_then(|n| n.resets_at),
+        failure_detail: notice.map(|n| n.text.clone()),
         endpoint_source: p.endpoint.as_ref().map(|_| EndpointSource::Transcript),
         endpoint: p.endpoint,
         tasks: None,
@@ -525,6 +575,51 @@ mod tests {
         assert_eq!(description_slug("FIX-KICK: a kick ends authority").as_deref(), Some("fix-kick"));
         assert_eq!(description_slug("CV-EDITS").as_deref(), Some("cv-edits"));
         assert_eq!(description_slug(": nothing"), None);
+    }
+
+    /// The record shapes of session 0c315aee's 10-01/02 kills (content redacted to the notice):
+    /// the session-limit 429s are `rate-limited` with the quota's reset, the integrator's
+    /// `Prompt is too long` is `context`, a resumed lane's old error is history, and a lane that
+    /// is not dead gets no cause.
+    #[test]
+    fn failure_cause_reads_the_last_uncleared_api_error() {
+        let rate = ApiErrorNotice {
+            ts: None,
+            text: "You've hit your session limit · resets 9pm (America/New_York)".into(),
+            error: Some("rate_limit".into()),
+            status: Some(429),
+            resets_at: DateTime::from_timestamp(1_790_902_800, 0),
+        };
+        let ctx = ApiErrorNotice {
+            text: "Prompt is too long".into(),
+            error: Some("invalid_request".into()),
+            ..ApiErrorNotice::default()
+        };
+        let end = |e: Option<ApiErrorNotice>| SubagentEnd {
+            api_error: e,
+            ..SubagentEnd::default()
+        };
+        assert_eq!(failure_cause("failed", &end(Some(rate.clone()))), Some("rate-limited"));
+        assert_eq!(failure_cause("killed", &end(Some(ctx.clone()))), Some("context"));
+        assert_eq!(failure_cause("completed", &end(Some(rate))), None, "not dead: no cause");
+        assert_eq!(failure_cause("failed", &end(None)), None, "nothing says why: plain failed");
+        let other = ApiErrorNotice {
+            text: "API Error: 500 internal".into(),
+            ..ApiErrorNotice::default()
+        };
+        assert_eq!(failure_cause("failed", &end(Some(other))), None);
+        let stopped = SubagentEnd {
+            stopped_at: DateTime::from_timestamp(10, 0),
+            last_turn_at: DateTime::from_timestamp(5, 0),
+            api_error: None,
+        };
+        assert_eq!(failure_cause("failed", &stopped), Some("stopped"));
+        // The usage-limit phrasing without a status is still a rate limit.
+        let usage = ApiErrorNotice {
+            text: "Claude AI usage limit reached|1759370400".into(),
+            ..ApiErrorNotice::default()
+        };
+        assert_eq!(classify_api_error(&usage), Some("rate-limited"));
     }
 
     #[test]
