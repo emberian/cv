@@ -99,8 +99,10 @@ Ranked by how often the gap bit:
    `resolve --accept-default --provisional`; inbox group "made for you (veto?)" (not owed); the
    decider's `resolve --confirm | --choice` replaces it — the one state-bearing event a terminal task
    accepts, and only from the decision's assignee.
-3. **One way to pose a decision.** A task tagged `decision` with no options should be refused or
-   upgraded to a `decide` with a required default.
+3. ~~**One way to pose a decision.** A task tagged `decision` with no options should be refused or
+   upgraded to a `decide` with a required default.~~ **Landed:** `open --tags decision` and `tag <id>
+   decision` on an unposed task refuse, naming `cv task decide … --default …`; old tag-only decisions
+   still show (not migrated).
 4. **Lanes joined to tasks.** `cv lanes --tasks`: the lane table knows the agent and its description;
    the store knows which `lane:<name>` endpoint claimed which task. Join them, and the page's Lanes
    pane shows each lane's task and last note.

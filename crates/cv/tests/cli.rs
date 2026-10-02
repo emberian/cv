@@ -113,6 +113,31 @@ impl World {
         fs::write(dir.join("events.jsonl"), body).unwrap();
     }
 
+    /// Append raw events to the task log (after whatever the CLI wrote) — how a test plants a
+    /// shape the CLI no longer writes, e.g. a legacy tag-only decision.
+    fn append_task_log(&self, lines: &[serde_json::Value]) {
+        use std::io::Write;
+        let dir = self.cv_home.join("tasks");
+        fs::create_dir_all(&dir).unwrap();
+        let mut f = fs::OpenOptions::new().create(true).append(true).open(dir.join("events.jsonl")).unwrap();
+        for l in lines {
+            writeln!(f, "{l}").unwrap();
+        }
+    }
+
+    /// A legacy decision: opened assigned to `who` and tagged `decision`, with nothing posed — the
+    /// shape `cv task open --tags decision` wrote before it was refused. Stamped a few seconds
+    /// ahead so it sorts after anything the test just opened.
+    fn plant_legacy_tag_decision(&self, id: &str, title: &str, who: &str) {
+        let ts = chrono_at(3);
+        self.append_task_log(&[
+            serde_json::json!({"id": id, "task_id": id, "ts": ts, "by": "cv", "event": "opened",
+                "title": title, "channel": "tasks", "assignee": who}),
+            serde_json::json!({"id": format!("{}f", &id[..id.len() - 1]), "task_id": id, "ts": ts, "by": "cv",
+                "event": "tagged", "tags": ["decision"]}),
+        ]);
+    }
+
     /// Like `cv`, asserting success and returning (stdout, stderr).
     fn cv_ok(&self, args: &[&str]) -> (String, String) {
         let (ok, code, out, err) = self.cv(args);
@@ -1775,9 +1800,9 @@ fn task_open_relations_tags_and_file_bodies() {
     assert!(!ok, "note needs text or --file");
 
     // tag / block verbs after the fact; a self-block is refused; an unknown blocker is refused.
-    w.cv_ok(&["task", "tag", &b, "decision"]);
+    w.cv_ok(&["task", "tag", &b, "deploy"]);
     let (json, _) = w.cv_ok(&["task", "show", &b, "--json"]);
-    assert!(json.contains("\"decision\""), "{json}");
+    assert!(json.contains("\"deploy\""), "{json}");
     let (ok, _, _, err) = w.cv(&["task", "block", &b, "--by", &b]);
     assert!(!ok && err.contains("cannot block itself"), "{err}");
     let (ok, _, _, err) = w.cv(&["task", "open", "typo", "--blocked-by", "ffffffff"]);
@@ -1794,16 +1819,9 @@ fn task_open_relations_tags_and_file_bodies() {
 #[test]
 fn task_inbox_groups_decisions_first() {
     let w = World::new("task-inbox");
-    let (out, _) = w.cv_ok(&[
-        "task",
-        "open",
-        "pick the enrollment rate",
-        "--assignee",
-        "ember",
-        "--tags",
-        "decision",
-    ]);
-    let d = opened_task_id(&out);
+    // A tag-only decision is a shape older stores hold; the CLI no longer writes it.
+    let d = "01a0f000-0000-7000-8000-00000000000a".to_string();
+    w.plant_legacy_tag_decision(&d, "pick the enrollment rate", "ember");
     w.cv_ok(&["task", "open", "write the docs", "--assignee", "ember"]);
     let (out, _) = w.cv_ok(&["task", "open", "the claimed one"]);
     let c = opened_task_id(&out);
@@ -2067,7 +2085,7 @@ fn task_inbox_orders_decisions_first_and_renders_markdown() {
         "--body", "today anyone may fund any purse.", "--from", "orchestrator:x",
     ]);
     let d = opened_task_id(&out);
-    w.cv_ok(&["task", "open", "legacy decision by tag", "--assignee", "ember", "--tags", "decision"]);
+    w.plant_legacy_tag_decision("01a0f000-0000-7000-8000-00000000000b", "legacy decision by tag", "ember");
 
     let (out, _) = w.cv_ok(&["task", "inbox", "ember"]);
     let dec = out.find("decisions owed (2):").expect(&out);
@@ -2257,10 +2275,16 @@ fn seeded_old_and_new(w: &World) -> (String, String) {
 
 /// An RFC 3339 "now" for seeded events (the test crate has no chrono: derive it from cv itself).
 fn chrono_now() -> String {
+    chrono_at(0)
+}
+
+/// [`chrono_now`] shifted by `offset` seconds.
+fn chrono_at(offset: u64) -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
-        .as_secs();
+        .as_secs()
+        + offset;
     // days since epoch → civil date (Howard Hinnant's algorithm), UTC, minute precision is plenty
     let days = secs / 86_400;
     let (h, m, s) = ((secs % 86_400) / 3600, (secs % 3600) / 60, secs % 60);
@@ -2902,4 +2926,33 @@ fn task_provisional_resolution_veto_and_confirm() {
     assert_eq!(t["decision"]["resolution"]["by"], "web:ember");
     assert_eq!(t["decision"]["resolution"]["choice"], "x");
     assert_eq!(t["decision"]["superseded_provisional"]["by"], "orchestrator:o");
+}
+
+/// One way to pose a decision: `open --tags decision` and `tag <id> decision` on a task with
+/// nothing posed are refused, naming `cv task decide` and its required `--default`; a posed
+/// decision may be tagged; a legacy tag-only decision in an older store still shows (and the page
+/// still offers "my last note is the answer").
+#[test]
+fn task_decision_tag_without_options_is_refused() {
+    let w = World::new("decision-tag");
+    let (_, err) = w.cv_fails(&["task", "open", "pick a rate", "--assignee", "ember", "--tags", "deploy,decision"]);
+    assert!(err.contains("a decision is posed, not tagged") && err.contains("cv task decide \"pick a rate\""), "{err}");
+    assert!(err.contains("--default") && err.contains("is required"), "{err}");
+    let (out, _) = w.cv_ok(&["task", "list", "--all"]);
+    assert!(out.contains("(no matching tasks)"), "a refused open leaves nothing behind:\n{out}");
+
+    let (out, _) = w.cv_ok(&["task", "open", "plain work", "--assignee", "ember"]);
+    let a = opened_task_id(&out);
+    let (_, err) = w.cv_fails(&["task", "tag", &a, "decision"]);
+    assert!(err.contains("a decision is posed, not tagged") && err.contains("--blocks"), "{err}");
+    let (out, _) = w.cv_ok(&["task", "show", &a, "--json"]);
+    assert!(!out.contains("\"decision\""), "{out}");
+
+    let (out, _) = w.cv_ok(&["task", "decide", "a real one", "--for", "ember", "--default", "x"]);
+    let d = opened_task_id(&out);
+    w.cv_ok(&["task", "tag", &d, "decision,urgent"]);
+
+    w.plant_legacy_tag_decision("01a0f000-0000-7000-8000-00000000000c", "legacy tag-only", "ember");
+    let (out, _) = w.cv_ok(&["task", "inbox", "ember"]);
+    assert!(out.starts_with("decisions owed (2):") && out.contains("legacy tag-only"), "{out}");
 }

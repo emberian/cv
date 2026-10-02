@@ -136,8 +136,8 @@ pub(crate) enum TaskCmd {
         channel: String,
         #[arg(long)]
         assignee: Option<String>,
-        /// Comma-separated tags (`decision,deploy`); `list --tag` filters on them and a `decision`
-        /// tag on an assigned task puts it in the assignee's inbox under "decisions owed".
+        /// Comma-separated tags (`deploy,lean`); `list --tag` filters on them. `decision` is refused
+        /// here: a decision is POSED with `cv task decide … --default …`, so it has options.
         #[arg(long, value_name = "A,B")]
         tags: Option<String>,
         /// This task waits on another (id or unique prefix). Repeatable. Blocked-ness is computed
@@ -760,6 +760,7 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                 None => text_or_stdin(body)?,
             };
             let tags = tags.as_deref().map(parse_tags).unwrap_or_default();
+            task_ops::refuse_bare_decision_tag(&tags, &title, None)?;
             // Relations name other tasks: resolve every prefix BEFORE the open, so a typo refuses
             // the whole command instead of leaving a task opened with half its relations.
             let (blocked_by, blocks) = {
@@ -1211,8 +1212,10 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
             let id = resolve(&outcome.model, &id)?.to_string();
             let tags = parse_tags(&tags);
             if tags.is_empty() {
-                bail!("no tags given (comma-separated, e.g. `decision,deploy`)");
+                bail!("no tags given (comma-separated, e.g. `deploy,lean`)");
             }
+            let t = &outcome.model.tasks[&id];
+            task_ops::refuse_bare_decision_tag(&tags, &t.title, Some(t))?;
             append_and_report(Some(&id), &from_or_cv(from), TaskEventKind::Tagged { tags }, None)
         }
         TaskCmd::Block { id, by_task, from } => {

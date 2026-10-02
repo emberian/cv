@@ -109,6 +109,28 @@ pub(crate) fn pose(store: &TaskStore, from: &str, spec: DecisionSpec) -> Result<
     Ok((events, warnings))
 }
 
+/// One way to pose a decision. A bare `decision` tag on a task with nothing posed made an inbox
+/// card with no options and no buttons (two such cards, 10-01): refuse it, naming the verb that
+/// poses one and its required `--default`. `existing` is the task being tagged (`None` = opening).
+/// A task that already carries a posed decision may be tagged anything.
+pub(crate) fn refuse_bare_decision_tag(tags: &[String], title: &str, existing: Option<&TaskProjection>) -> Result<()> {
+    if !tags.iter().any(|t| t == task::DECISION_TAG) || existing.is_some_and(TaskProjection::is_decision) {
+        return Ok(());
+    }
+    let mut msg = format!(
+        "a decision is posed, not tagged — a `decision` tag with no options gives the decider nothing to choose. Pose it:\n  \
+         cv task decide {title:?} --for <who> --default \"<the option that stands if nobody speaks>\" [--option \"<alternative>\"]…\n\
+         (`--default` is required; add `--provisional` to proceed on it now with a veto window)"
+    );
+    if let Some(t) = existing {
+        msg.push_str(&format!(
+            "\nto make this task wait on the answer: add `--blocks {}` to the decide",
+            &t.task_id[..13.min(t.task_id.len())]
+        ));
+    }
+    bail!(msg)
+}
+
 /// What a resolution says: the literal choice, or the posed default.
 #[derive(Clone, Debug)]
 pub(crate) enum Answer {

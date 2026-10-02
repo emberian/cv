@@ -82,6 +82,13 @@ A **decision** is a task with a posed question: `cv task decide "<title>" --for 
 decider answers with `cv task resolve <id> --accept-default | --choice "<option>"` — identity-
 bearing, terminal (`resolved`). `done` is refused on a decision; a second `posed` is refused.
 
+**There is one way to pose a decision.** `cv task open … --tags decision` and `cv task tag <id>
+decision` on a task with nothing posed are **refused**, with the message naming `cv task decide`
+and its required `--default`: a tag-only decision gave the decider an inbox card with no options
+and no buttons (two of them, 10-01). Stores that already hold tag-only decisions keep showing them
+under "decisions owed" — the page offers "my last note is the answer — close it" — and nothing is
+migrated.
+
 **Provisional resolutions** are how an orchestrator proceeds on a default without leaving the
 decision to rot as owed: `cv task decide … --provisional` (or `cv task resolve <id>
 --accept-default --provisional` on an existing one) resolves it **on its default, by the poser**,
@@ -101,8 +108,8 @@ the default, and a second non-provisional resolve are all refused
 - **`--body-file <path>`** (`-` for stdin) reads the body from a file; `note --file` does the same
   for notes. A brief is a document, not a 500-character shell string.
 - **`--tags a,b`** labels a task; `list --tag <t>` filters on a label, and `cv task tag <id> a,b`
-  adds labels later (additive, never removes). One label is load-bearing: a task tagged
-  **`decision`** and assigned to someone is a decision they owe, and the inbox lists it first.
+  adds labels later (additive, never removes). One label is reserved: **`decision`** is written by
+  `cv task decide` and refused on a task with nothing posed (see *Decisions* above).
 - **`--blocked-by <id>`** records that this task waits on another; **`--blocks <id>`** records the
   same relation on the *other* task (`cv task block <id> --by <blocker>` after the fact). Both are
   resolved before the open is written, so a typo refuses the command rather than opening a task
