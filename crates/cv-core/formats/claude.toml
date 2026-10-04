@@ -70,6 +70,8 @@ result = { status = "carried", note = "legacy sub-agent telemetry / journal resu
 "image_source.url" = { status = "handled", note = "" }
 "image_source.file" = { status = "handled", note = "Files-API id" }
 "attachment.hook_success" = { status = "generic", note = "rendered → injected context" }
+# `attachment.hookEvent` — the one hook event the adapter reads by name (subagent_end: when a child stopped).
+"hook_event.SubagentStop" = { status = "handled", note = "subagent_end → stopped_at" }
 "attachment.total_tokens_reminder" = { status = "generic", note = "rendered → injected context" }
 "attachment.batching_reminder_sent" = { status = "generic", note = "rendered → injected context" }
 "attachment.bash_output_audience_note" = { status = "generic", note = "rendered → injected context" }
