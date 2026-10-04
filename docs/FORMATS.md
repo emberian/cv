@@ -641,6 +641,75 @@ Re-verified 2026-09-19 at `2090ad1c` (1.51.0). Ground truth: `crates/goose/src/s
   `thread_version`/`profile`/`completion_mode`/`detailed_summary`/`cumulative_token_usage`/`imported`.
   We decode blobs with pure-Rust `ruzstd` (no C cross-compile cost).
 
+## Devin CLI — `~/.local/share/devin/cli/sessions.db` (SQLite, refinery schema 17 as of cli 3000.11.3)
+
+Closed-source (github.com/CognitionAI/devin-cli is a release manifest only); reverse-engineered
+from a live DB 2026-10-04. The path is literally `~/.local/share/devin/cli/` even on macOS
+(`$XDG_DATA_HOME/devin/cli` honoured); `transcripts/` sits beside it observed **empty** (purpose
+unknown), alongside `app_state.json`, `session_locks/<id>.lock`, `logs/`, `plugins/` (not read).
+WAL-mode and the CLI is typically running — we open READ-ONLY and never checkpoint.
+
+- **Schema** (`MAX(version)` of `refinery_schema_history` = 17; migrations accrete columns, so we
+  probe `PRAGMA table_info`): `sessions(id two-word slug, working_directory→cwd, backend_type
+  ('windsurf'), model (CAN BE ''), agent_mode ('bypass'|'normal'|'plan'|…), created_at,
+  last_activity_at unix seconds, title, main_chain_id, cogs_json, workspace_dirs JSON, hidden,
+  metadata)`, `message_nodes(row_id, session_id, node_id, parent_node_id NULL=root,
+  chat_message JSON, created_at secs, metadata JSON-or-'null' — UNIQUE(session_id, node_id))`,
+  plus ignored `prompt_history`, `rendered_commits`, `app_state`, `tool_call_state` (ACP
+  ToolCall/Update JSON — duplicates the assistant message), and `subagent_heads
+  (session_id, agent_id, chain_node_id, updated_at — PK (session_id, agent_id), one current
+  head per agent)`.
+- **The forest:** every context rebuild (compaction, re-prefixing) writes a NEW chain of nodes
+  copying earlier messages (same `message_id`), with node `metadata.extensions
+  ["compact/prior_node_ids"]` naming the superseded copies. The transcript is the path from
+  `sessions.main_chain_id` up `parent_node_id` to a root, reversed; off-chain nodes aren't emitted
+  (`extra["devin"]["node_count"]`/`chain_len` show the loss). `main_chain_id` NULL → head = max
+  `node_id`, flagged `main_chain_fallback`. Node `metadata`: `{summarized_from,
+  num_tokens_preceding, is_system_prefix, extensions}`; `is_system_prefix` marks the system-prompt
+  run.
+- **chat_message**: `{message_id, role: system|user|assistant|tool, content: string}` + nested
+  `metadata`. Assistant: `tool_calls[{id:"exec_N_…#…", name, arguments, index, kind:"function"}]`,
+  `thinking{thinking, signature:"sealed.v1…", signature_type}`, `metadata{num_tokens, request_id,
+  metrics{input/output/cache_read/cache_creation_tokens, ttft/total_time/tpot_ms, tokens_per_sec},
+  finish_reason, extensions["chisel/tool_call_content"]={<id>:{title,status,kind,rawInput,…}},
+  generation_model, created_at RFC3339, telemetry}`. Tool: `tool_call_id` + extensions
+  `chisel/tool_call_timing`, `chisel/tool_result_meta{success,kind}`, `chisel/terminal_output`
+  (exec: `{text,cwd,exit{terminal_id,exit_code}}`; `text` duplicates `content`, dropped),
+  `chisel/undo`. User: `metadata.is_user_input` marks typed prompts. Non-prefix system rows are
+  `<system_info>` (with `affogato/cog-context`) and `<rules type="always-on">` blocks.
+- **Sub-agent chains:** each `subagent_heads` row names a chain head in the *same* forest — a
+  whole second conversation (verified: a sidekick's own `is_system_prefix` prompt, then its
+  handoff prompt and turns) the main-chain walk never emits. Each becomes a child
+  `SessionRef` id `<session_id>/<agent_id>` (`atom-telephone/sidekick`), listed right after the
+  parent, with cwd/created_at inherited, `title` = `"[<agent_id>] <parent title>"`, `updated_at`
+  from the head row, `lineage.parent`/`agent_path` set, and `extra["devin"]["agent_id"]` +
+  `chain_head`. A `chain_node_id` that names no live node is skipped and counted under the
+  parent's `extra["devin"]["dangling_subagent_heads"]`.
+- **Compaction:** a compaction writes two consecutive chain nodes sharing `summarized_from` = the
+  old window's head — an `assistant` node holding the summary markdown and a `system` wrapper
+  ("You are continuing work…") carrying `devin-rs/summary` (`source`), `compact/edited_files`,
+  `compact/todo_list`, and `subagent/handoff_history` (a verbatim handoff copy — not carried). The
+  wrapper's content embeds `Full conversation history saved at <path>.` →
+  `summaries/<agent_id>/history_<hex>.md` beside `sessions.db` (~300 KB of pre-compaction
+  markdown; referenced, not read). A synthetic `CompactionBoundary` is emitted before each pair
+  (`extra["devin"]["compaction"]` = `{summarized_from, pre_chain_head, source, history_path,
+  edited_files, todo_list}` + `compactMetadata` trigger/preTokens), so `cv compaction` works.
+- **IR mapping:** prefix system → `system_prompt` kind (also joined into `Session::system_prompt`);
+  other system and non-input user rows → `injected_context`; `summarized_from` non-null →
+  `compaction_summary` regardless of role; a tool row's `chisel/tool_failure` → `is_error` +
+  `details.failure_reason`; `chisel/user_question_answers` (dialog answers, "User answered your
+  questions:") → `extra`, which `cv prompts` picks up; `subagent/profile_name|model|agent_id|
+  chain_node_id` on the parent's completion rows → `extra["devin"]["subagent"]` (the tool row's
+  `tool_call_id` is the child's `spawned_by_tool_use`); assistant
+  metrics → `Usage`, `generation_model` → `model` (and the session's
+  model when `sessions.model` is `''`); tool rows pair `tool_name` from the earlier call and carry
+  `{cwd, exit_code, terminal_id, duration_ms, kind}` in `ToolResult.details`. A `user` row with
+  `extensions["subagent/handoff"]` → `Prompt`/`Origin::Subagent`, and
+  `chisel/fusion_lead_model_uid` → `extra["devin"]["lead_model"]`. Sub-agent system rows'
+  `agent-ext/rules-loaded` → `extra["devin"]["rules_loaded"]` (whole object) and
+  `agent-ext/skills-loaded` → `skills_loaded` reduced to `{name, path}`. `hidden = 1` sessions
+  stay discoverable.
+
 ## Account data exports — registered in `config.toml` (opt-in)
 
 The archives you download via "Export data". One file (`conversations.json`, often split

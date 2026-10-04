@@ -227,6 +227,16 @@ pub use harness::claude::SubagentInfo;
 pub fn subagent_tree_of(r: &SessionRef) -> Vec<SubagentInfo> {
     match r.harness {
         Harness::Claude => harness::claude::subagent_tree(&r.path),
+        Harness::Devin => {
+            #[cfg(feature = "sqlite")]
+            {
+                harness::devin::subagent_tree(&r.path, &r.id)
+            }
+            #[cfg(not(feature = "sqlite"))]
+            {
+                Vec::new()
+            }
+        }
         _ => Vec::new(),
     }
 }

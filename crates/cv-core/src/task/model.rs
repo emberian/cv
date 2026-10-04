@@ -453,6 +453,7 @@ pub fn harness_family(harness: Harness) -> Option<&'static str> {
         | Harness::Continue
         | Harness::Goose
         | Harness::Zed
+        | Harness::Devin
         | Harness::OpenSession => None,
     }
 }

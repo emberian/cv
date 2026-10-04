@@ -1,0 +1,98 @@
+# formats/devin.toml — the vocabulary cv's `devin` adapter is checked against (docs/INTERFACE-V2.md §7).
+# status: handled = per-item arm in the adapter; generic = interpreted by a blanket rule; carried = verbatim
+# under ParseOptions::complete only; ignored = known and deliberately skipped. Regenerate: tools/gen-manifests (or edit by hand).
+# Devin CLI is closed source — this vocabulary was reverse-engineered from a live sessions.db.
+
+harness = "devin"
+source_files = ["harness/devin.rs"]
+ignore_literals = ["NULL"]
+store = [
+  "~/.local/share/devin/cli/sessions.db (all platforms observed; $XDG_DATA_HOME/devin/cli honoured)",
+  "~/.local/share/devin/cli/transcripts/ (observed empty — purpose unknown)",
+]
+
+[upstream]
+repo = "closed source; https://github.com/CognitionAI/devin-cli is a release manifest only"
+commit = "cli 3000.11.3"
+date = "2026-10-04"
+
+[types]
+"role.system" = { status = "handled", note = "prefix → SystemPrompt, else InjectedContext" }
+"role.user" = { status = "handled", note = "is_user_input → Prompt, else InjectedContext" }
+"role.assistant" = { status = "handled", note = "" }
+"role.tool" = { status = "handled", note = "" }
+"table.sessions" = { status = "handled", note = "" }
+"table.message_nodes" = { status = "handled", note = "the forest; transcript = main_chain_id walk" }
+"table.refinery_schema_history" = { status = "handled", note = "MAX(version) → schema_version (17)" }
+"table.subagent_heads" = { status = "handled", note = "chain heads → <session>/<agent> child sessions" }
+"table.tool_call_state" = { status = "ignored", note = "ACP ToolCall/Update; duplicates the message" }
+"table.prompt_history" = { status = "ignored", note = "not read" }
+"table.rendered_commits" = { status = "ignored", note = "not read; always empty so far" }
+"table.app_state" = { status = "ignored", note = "not read" }
+"column.working_directory" = { status = "handled", note = "→ Session.cwd" }
+"column.backend_type" = { status = "handled", note = "→ extra (observed 'windsurf')" }
+"column.model" = { status = "handled", note = "may be '' → generation_model fallback" }
+"column.agent_mode" = { status = "handled", note = "→ extra" }
+"column.main_chain_id" = { status = "handled", note = "the chain head; NULL → max node_id" }
+"column.cogs_json" = { status = "handled", note = "→ extra, parsed" }
+"column.workspace_dirs" = { status = "handled", note = "JSON array → extra" }
+"column.hidden" = { status = "handled", note = "still discovered; flag in extra" }
+"column.metadata" = { status = "handled", note = "sessions + message_nodes both" }
+"column.title" = { status = "handled", note = "" }
+"column.shell_last_seen_index" = { status = "ignored", note = "UI state" }
+"column.created_at" = { status = "handled", note = "unix seconds" }
+"column.last_activity_at" = { status = "handled", note = "unix seconds → updated_at" }
+"column.node_id" = { status = "handled", note = "forest key" }
+"column.parent_node_id" = { status = "handled", note = "NULL = root" }
+"column.chat_message" = { status = "handled", note = "JSON per node" }
+# chat_message fields
+"field.message_id" = { status = "handled", note = "→ Message.id" }
+"field.content" = { status = "handled", note = "always a plain string" }
+"field.tool_calls" = { status = "handled", note = "assistant; {id, name, arguments, index, kind:function}" }
+"field.thinking" = { status = "handled", note = "{thinking, signature: sealed.v1…, signature_type}" }
+"field.tool_call_id" = { status = "handled", note = "tool row ↔ tool_calls[].id" }
+"field.generation_model" = { status = "handled", note = "metadata.generation_model → model" }
+"field.finish_reason" = { status = "handled", note = "tool_calls|stop|… → extra" }
+"finish_reason.stop" = { status = "ignored", note = "a finish_reason value (turn ended)" }
+"field.request_id" = { status = "handled", note = "→ extra" }
+"field.num_tokens" = { status = "handled", note = "→ extra" }
+"field.is_user_input" = { status = "handled", note = "true = a typed prompt" }
+"field.is_system_prefix" = { status = "handled", note = "node metadata; marks the system prompt" }
+"field.num_tokens_preceding" = { status = "handled", note = "node metadata → extra" }
+"field.summarized_from" = { status = "handled", note = "node metadata → CompactionSummary (observed live)" }
+"field.telemetry" = { status = "handled", note = "→ extra" }
+"field.metrics" = { status = "handled", note = "→ Usage (input/output/cache_read/cache_creation)" }
+"field.response_dimensions" = { status = "ignored", note = "UI stats" }
+"field.started_generation_at" = { status = "ignored", note = "created_at is kept" }
+"field.signature_type" = { status = "ignored", note = "always 'sealed' so far" }
+"field.index" = { status = "ignored", note = "tool_calls order is the array order" }
+"field.kind" = { status = "ignored", note = "always 'function'" }
+# metrics fields not lifted into Usage
+"field.ttft_ms" = { status = "ignored", note = "latency, not token accounting" }
+"field.total_time_ms" = { status = "ignored", note = "" }
+"field.tpot_ms" = { status = "ignored", note = "" }
+"field.tokens_per_sec" = { status = "ignored", note = "" }
+# extension keys (metadata.extensions / node metadata.extensions)
+"extension.compact/prior_node_ids" = { status = "handled", note = "superseded copies → prior_node_ids" }
+"extension.affogato/cog-context" = { status = "handled", note = "→ cog_context" }
+"extension.chisel/tool_call_content" = { status = "handled", note = "reduced to {title,kind,status}" }
+"extension.chisel/tool_call_timing" = { status = "handled", note = "duration_ms → result details" }
+"extension.chisel/tool_result_meta" = { status = "handled", note = "success/kind → status+details" }
+"extension.chisel/terminal_output" = { status = "handled", note = "cwd/exit → details; text duplicates content" }
+"extension.chisel/undo" = { status = "ignored", note = "exec reversibility hints" }
+"extension.chisel/client-message-id" = { status = "ignored", note = "client dedup id" }
+"extension.subagent/handoff" = { status = "handled", note = "user row → Prompt/Subagent" }
+"extension.chisel/fusion_lead_model_uid" = { status = "handled", note = "the lead's model → lead_model" }
+"extension.agent-ext/rules-loaded" = { status = "handled", note = "whole object → rules_loaded" }
+"extension.agent-ext/skills-loaded" = { status = "handled", note = "reduced to {name,path} → skills_loaded" }
+"extension.subagent/handoff_history" = { status = "ignored", note = "compaction sidecar; duplicates the lead's handoff texts verbatim" }
+"extension.compact/todo_list" = { status = "handled", note = "compaction sidecar → boundary extra" }
+"extension.compact/edited_files" = { status = "handled", note = "paths → boundary extra edited_files" }
+"extension.devin-rs/summary" = { status = "handled", note = "source → compaction trigger" }
+"extension.chisel/tool_failure" = { status = "handled", note = "reason → is_error + details.failure_reason" }
+"extension.chisel/user_question_answers" = { status = "handled", note = "verbatim → extra; cv prompts reads it" }
+"extension.subagent/profile_name" = { status = "handled", note = "→ extra.subagent (completion rows)" }
+"extension.subagent/model" = { status = "handled", note = "→ extra.subagent" }
+"extension.subagent/agent_id" = { status = "handled", note = "→ extra.subagent; child's spawned_by_tool_use" }
+"extension.subagent/chain_node_id" = { status = "handled", note = "→ extra.subagent" }
+"extension.barista/prompt_cache_footer" = { status = "ignored", note = "prompt-cache hint; no informational content" }

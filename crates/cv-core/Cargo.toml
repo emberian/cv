@@ -54,7 +54,7 @@ default = ["sqlite", "parallel", "mmap"]
 # Off for wasm32 (no mmap); the resolver falls back to a positioned ranged read, behavior identical.
 mmap = ["dep:memmap2"]
 # `sqlite` pulls in rusqlite (native C SQLite) for the SQLite-backed adapters (Hermes, Cursor,
-# Goose, Zed) and the FTS index, plus ruzstd (pure Rust) for Zed's zstd-compressed thread blobs.
+# Goose, Zed, Devin) and the FTS index, plus ruzstd (pure Rust) for Zed's zstd-compressed thread blobs.
 # Disable it (e.g. `--no-default-features`) to compile cv-core for wasm32.
 sqlite = ["dep:rusqlite", "dep:ruzstd"]
 # `parallel` fans discovery across adapters/files with rayon. Off for wasm32 (no threads); the code

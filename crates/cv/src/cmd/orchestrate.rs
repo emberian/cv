@@ -18,10 +18,15 @@ use crate::util::{fmt_local, parse_harness, resolve, short_id};
 
 // ===================== cv prompts =====================
 
-/// The two markers Claude Code puts at the head of an `AskUserQuestion` tool result. The answers
-/// a person gives through that dialog never appear as a prompt — they are tool output — and an
-/// orchestrator re-reading what it was told needs them in the same stream.
-const ANSWER_MARKERS: &[&str] = &["The user answered", "Your questions have been answered"];
+/// The markers a question-dialog tool result starts with — Claude Code's two `AskUserQuestion`
+/// phrasings, and Devin CLI's `User answered your questions:`. The answers a person gives through
+/// that dialog never appear as a prompt — they are tool output — and an orchestrator re-reading
+/// what it was told needs them in the same stream.
+const ANSWER_MARKERS: &[&str] = &[
+    "The user answered",
+    "Your questions have been answered",
+    "User answered your questions",
+];
 
 #[derive(Debug, Clone, Serialize)]
 struct PromptRow {

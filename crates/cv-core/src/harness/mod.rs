@@ -20,6 +20,8 @@ pub mod codex;
 pub mod continuedev;
 #[cfg(feature = "sqlite")]
 pub mod cursor;
+#[cfg(feature = "sqlite")]
+pub mod devin;
 pub mod export;
 pub mod gemini;
 #[cfg(feature = "sqlite")]
@@ -221,6 +223,7 @@ pub fn all() -> Vec<Box<dyn Adapter>> {
         adapters.push(Box::new(cursor::Cursor::new()));
         adapters.push(Box::new(goose::Goose::new()));
         adapters.push(Box::new(zed::Zed::new()));
+        adapters.push(Box::new(devin::Devin::new()));
     }
     adapters
 }

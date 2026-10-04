@@ -319,7 +319,13 @@ fn status_of(
 
 fn lane_of(sub: SubagentInfo, notices: &HashMap<String, TaskNotice>) -> Option<Lane> {
     let p = pass(&sub.session)?;
-    let end = subagent_end(&sub.session.path);
+    // `subagent_end` reads Claude's jsonl sidecars; other harnesses' child sessions live inside
+    // their own stores (a `.db` path here), where a jsonl scan is meaningless.
+    let end = if sub.session.harness == crate::ir::Harness::Claude {
+        subagent_end(&sub.session.path)
+    } else {
+        SubagentEnd::default()
+    };
     let agent_id = sub.agent_id().to_string();
     let (status, status_source) = status_of(&sub, &end, notices.get(&agent_id), p.ends_in_report, Utc::now());
     let started_at = sub.session.created_at;

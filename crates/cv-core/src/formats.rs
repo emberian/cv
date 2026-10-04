@@ -85,6 +85,7 @@ manifests!(
     "continue",
     "goose",
     "zed",
+    "devin",
     "chatgpt-export",
     "claude-export",
     "opensession",

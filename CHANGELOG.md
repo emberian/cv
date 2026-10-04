@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+
+- **Devin CLI (Cognition) parses** — `~/.local/share/devin/cli/sessions.db` (refinery schema 17, cli
+  3000.11.3), read-only and PRAGMA-probed like the other SQLite stores. `message_nodes` is a
+  *forest* — every context rebuild rewrites the transcript as a fresh chain of copies — so the
+  parse is the `main_chain_id`→root walk (NULL falls back to the max `node_id`, flagged
+  `extra["devin"]["main_chain_fallback"]`), and superseded branches are dropped with
+  `node_count`/`chain_len` kept in `extra["devin"]`. `is_system_prefix` nodes become
+  `Session::system_prompt`; thinking blocks (with `sealed.v1` signatures), parallel tool calls,
+  per-call metrics → `Usage`, and `generation_model` (which also rescues the session model when
+  `sessions.model` is `''`) all survive. `cv resume` prints `devin --resume <id>`.
+  `subagent_heads` rows are **child sessions** — `<session_id>/<agent_id>`
+  (`atom-telephone/sidekick`) walking the same forest from `chain_node_id`, with
+  `lineage.parent`/`agent_path`, `[<agent_id>]` titles, the lead's handoff prompt as
+  `Prompt`/`Subagent` (`lead_model` from `chisel/fusion_lead_model_uid`), and `rules_loaded`/
+  `skills_loaded` extras; dangling heads are skipped and counted
+  (`dangling_subagent_heads`). `cv lanes`/`cv tools`/`cv show` all see them.
+  Compaction pairs (`summarized_from` = old head, an assistant summary + a system wrapper
+  pointing at `summaries/<agent>/history_*.md`) synthesize a `CompactionBoundary` carrying
+  `source`/`history_path`/`edited_files`/`todo_list`, so `cv compaction` detects Devin
+  compactions; `chisel/tool_failure` marks failed tool results,
+  `chisel/user_question_answers` surfaces in `cv prompts`, and the parent's
+  `subagent/*` completion rows fill `extra["devin"]["subagent"]` +
+  `lineage.spawned_by_tool_use`.
+
 ## 0.13.0 — decisions are a kind; a human can drain the inbox
 
 Written from the first day a human was on the other end of `cv task`: an orchestrator had filed

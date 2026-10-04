@@ -182,6 +182,7 @@ fn resume_command(h: Harness, id: &str) -> (String, Vec<String>) {
         // session by the bare uuid so prefixes work like every other harness.
         Harness::KimiCode => ("kimi".into(), vec!["--session".into(), format!("session_{id}")]),
         Harness::Qwen => ("qwen".into(), vec!["--resume".into(), id.into()]),
+        Harness::Devin => ("devin".into(), vec!["--resume".into(), id.into()]),
         // Desktop/IDE apps (and any future harness) have no documented CLI resume.
         _ => (
             format!("# no CLI resume for {h}; open the app and find the session"),

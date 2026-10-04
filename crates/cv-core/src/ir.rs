@@ -92,6 +92,8 @@ harnesses! {
     Goose => "goose",
     /// Zed editor's agent panel (`threads.db` SQLite, zstd-compressed JSON thread blobs).
     Zed => "zed",
+    /// Devin CLI (Cognition), `~/.local/share/devin/cli/sessions.db` (SQLite message forest).
+    Devin => "devin",
     /// ChatGPT account **data export** (`conversations.json`, a `mapping` DAG per conversation).
     ChatGptExport => "chatgpt-export",
     /// Claude.ai account **data export** (`conversations.json`, linear `chat_messages[]`).
@@ -125,6 +127,7 @@ impl Harness {
             "continue" | "continuedev" => Harness::Continue,
             "goose" => Harness::Goose,
             "zed" | "zed-editor" => Harness::Zed,
+            "devin" | "devin-cli" => Harness::Devin,
             "chatgpt-export" | "openai-export" | "chatgpt-data" | "openai-data" => Harness::ChatGptExport,
             "claude-export" | "claude-ai" | "claudeai" | "claude-data" => Harness::ClaudeExport,
             "opensession" | "open-session" | "open_session" => Harness::OpenSession,

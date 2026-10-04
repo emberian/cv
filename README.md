@@ -6,7 +6,7 @@
 
 ### Your AI coding sessions are gold. Stop letting them rot in scattered folders.
 
-**Find, search, port, prune, and even *resurrect* every AI coding-agent session you've ever run — across 22 harnesses, through one unified format.**
+**Find, search, port, prune, and even *resurrect* every AI coding-agent session you've ever run — across 23 harnesses, through one unified format.**
 
 `claude` · `codex` · `grok` · `opencode` · `gemini` · `hermes` · `openclaw` · `cursor` · …
 
@@ -62,7 +62,7 @@ cv scry
 - 🧠 **An MCP server** so a *running* agent can read **other** agents' sessions — "what happened in this project before?", "what's my sibling agent doing right now?", "have I solved this before?" — mid-task, without leaving its harness.
 - 🌐 **A zero-install web viewer**: drag a zip of any harness folder into your browser and explore it. Nothing uploaded, all WASM.
 
-## 🪐 22 harnesses, one IR
+## 🪐 23 harnesses, one IR
 
 | | Harness | Parse | Port *to* | | | Harness | Parse | Port *to* |
 |---|---|:--:|:--:|---|---|---|:--:|:--:|
@@ -74,7 +74,7 @@ cv scry
 | ✅ | **Hermes** (Nous) | ✅ | ✅ | | ✅ | **Roo Code** | ✅ | ✅ |
 | ✅ | **OpenClaw** | ✅ | ✅ | | ✅ | **Continue** | ✅ | ✅ |
 | 🔒 | **Claude / ChatGPT apps** | detected¹ | — | | ✅ | **Goose** (Block) | ✅ | — |
-| ✅ | **Zed** (agent panel) | ✅ | — | | | | | |
+| ✅ | **Zed** (agent panel) | ✅ | — | | ✅ | **Devin CLI** (Cognition) | ✅ | — |
 
 <sub>¹ The Claude app keeps transcripts server-side; the ChatGPT app keeps them locally but encrypted at rest. We detect the install and document exactly why neither is readable — see [`docs/FORMATS.md`](docs/FORMATS.md).</sub>
 
@@ -211,7 +211,7 @@ parse(any harness) → 🔮 unified IR → search · port · prune · loom · pa
 
 Built in a wild few sessions, much of it by a swarm of agents working disjoint files. ✨ Honest about the edges:
 
-- **22 harnesses parse**; 13 also **emit** (N-way conversion). The rest — Cursor, Goose, Zed, the Claude/ChatGPT desktop apps, and the ChatGPT/Claude.ai **account data exports** (`chatgpt-export`/`claude-export` — register their location with `cv config --add-export <path>`) — are parse-only for now.
+- **23 harnesses parse**; 13 also **emit** (N-way conversion). The rest — Cursor, Goose, Zed, Devin CLI, the Claude/ChatGPT desktop apps, and the ChatGPT/Claude.ai **account data exports** (`chatgpt-export`/`claude-export` — register their location with `cv config --add-export <path>`) — are parse-only for now.
 - **Robustness:** 2000+ real sessions parse with **0 panics**; parsers are fuzz-tested against hostile input.
 - The full-text index trades disk for speed; Gemini's protobuf `.pb` is opaque; a few sidecar tool-call streams aren't merged yet.
 - Historical format variants are an explicit goal — see [`ADDING_HARNESS.md`](ADDING_HARNESS.md), and **please send your own harness logs** (we can only test what we can see).

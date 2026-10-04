@@ -369,6 +369,7 @@ fn harness_color(name: &str) -> &'static str {
         "roo" => "#e0533d",
         "continue" => "#444",
         "goose" => "#7a5c3e",
+        "devin" => "#3b6ee8",
         _ => "#555",
     }
 }

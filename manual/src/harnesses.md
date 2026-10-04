@@ -1,6 +1,6 @@
 # Harnesses & where they store sessions
 
-clustervision currently understands **20 harnesses** 🔮 (incl. the ChatGPT & Claude.ai account data
+clustervision currently understands **23 harnesses** 🔮 (incl. the ChatGPT & Claude.ai account data
 exports — `chatgpt-export`/`claude-export`, register via `cv config --add-export`). Every one of them couples a session to a
 working directory — they encode the `cwd` into the path, the filename, a hash, or a DB column — which
 is exactly why your sessions feel "dir-jailed" and impossible to find later. clustervision reads them
@@ -37,6 +37,7 @@ All paths are the real ones the adapters look at. `~` is your home dir; `<AppSup
 | **Cursor IDE** | `<AppSupport>/Cursor/User/globalStorage/state.vscdb` (**SQLite**) | ✓ | — | Closed-source, opened read-only. Global DB holds `composerData:`/`bubbleId:` rows; per-workspace DB links composers → cwd. Schema churns (`_v` 1..=10+). |
 | **Goose (Block)** | `<AppSupport>/Block.block.goose/sessions/sessions.db` (**SQLite**) | ✓ | — | `$GOOSE_PATH_ROOT`/`$XDG_DATA_HOME` override. Modern `sessions.db` + **legacy** per-session `<name>.jsonl`. MCP-style tool content; read-only, PRAGMA-probed. |
 | **Zed (agent panel)** | `<data_dir>/Zed/threads/threads.db` (**SQLite**) | ✓ | — | One DB, one row per thread; `data` BLOB = **zstd-compressed JSON** (pure-Rust decode). Three blob generations (versionless / agent1 0.1–0.2 / agent2 0.3 tagged-enum). cwd + git from the project snapshot; **subagents** linked by `parent_id`. |
+| **Devin CLI** (Cognition) | `~/.local/share/devin/cli/sessions.db` (**SQLite**) | ✓ | — | Closed-source, opened read-only (the CLI keeps writing while we read). `message_nodes` is a **forest** of re-prefixed copies — the transcript is the `main_chain_id`→root walk. Thinking + parallel tool calls + `sealed` signatures preserved. |
 | **Claude app** | `<AppSupport>/Claude/` | ✓\* | — | **Detected, not readable.** Transcripts are **server-side** (claude.ai); local store holds only auth/UI state. `claude-code-sessions/*.json` are stubs pointing at `~/.claude/projects/` (handled by Claude Code). |
 | **ChatGPT app** | `<AppSupport>/com.openai.chat/conversations-v3-<acct>/<uuid>.data` | ✓\* | — | **Detected, not readable.** History *is* local but **encrypted at rest** with an app-held key (not in a readable Keychain). We count conversations but can't decrypt. |
 | **ChatGPT export** | a `conversations.json` you register with `cv config --add-export <path>` | ✓ | — | The "Export data" archive. One file = many conversations; each is a `mapping` DAG (we walk root→`current_node`). Opt-in (no fixed home); deduped by id. |
@@ -48,9 +49,9 @@ All paths are the real ones the adapters look at. `~` is your home dir; `<AppSup
 **13 harnesses are emit-capable** (conversion targets): Claude Code, Codex, Grok, OpenCode, OpenClaw,
 Gemini, Hermes, Kimi, LM Studio, Cline, Roo, Continue, Qwen.
 
-**7 are parse-only**: Cursor, Goose, and Zed (closed-source / read-only stores we deliberately don't
-write back to), the two desktop apps below, and the two account-data **exports** (`chatgpt-export` /
-`claude-export`, registered via `cv config --add-export`).
+**8 are parse-only**: Cursor, Goose, Zed, and Devin CLI (closed-source / read-only stores we
+deliberately don't write back to), the two desktop apps below, and the two account-data **exports**
+(`chatgpt-export` / `claude-export`, registered via `cv config --add-export`).
 
 ## Sub-agents
 
