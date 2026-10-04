@@ -340,6 +340,7 @@ dependencies = [
  "serde_json",
  "tiny_http",
  "urlencoding",
+ "uuid",
 ]
 
 [[package]]

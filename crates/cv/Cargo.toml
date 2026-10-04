@@ -28,6 +28,7 @@ serde.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
 regex.workspace = true
+uuid.workspace = true
 # `cv task serve`: the same tiny synchronous HTTP server cvd uses (no async stack for a page one
 # person reads), plus the query-string decoder it pairs with.
 tiny_http = { version = "0.12", default-features = false }

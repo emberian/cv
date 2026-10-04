@@ -178,6 +178,22 @@ struct SidecarEntry {
     kind: String, // "text" | "image" | "mixed"
 }
 
+/// One sidecar line in the `<stem>.flat.jsonl` format [`retrieve`] (and `cv cat`) reads: the stash
+/// format is shared with `cv distill`, which elides whole tool outputs the same way prune snips them.
+pub fn sidecar_line(id: &str, name: &str, input: &Value, content: &str) -> String {
+    let e = SidecarEntry {
+        id: id.to_string(),
+        slot: "content".into(),
+        name: name.to_string(),
+        input: input.clone(),
+        content: Value::String(content.to_string()),
+        size: content.len(),
+        line_count: content.lines().count(),
+        kind: "text".into(),
+    };
+    serde_json::to_string(&e).unwrap_or_default()
+}
+
 /// Sub-agent (Task tool) lines carry `isSidechain: true`; their usage belongs to the sub-agent's
 /// own context window, not the main thread's.
 pub(crate) fn is_sidechain(v: &Value) -> bool {

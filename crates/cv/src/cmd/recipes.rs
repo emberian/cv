@@ -97,6 +97,15 @@ One selector at a time. Piped `cv show` with no selector over 200 KB prints the 
     cv deferrals <id> --since <msg> --json
     → [{index, timestamp, phrase, context, matched?: {task_id, title, state, shared}}]
 
+14. Hand a lane's context on without its transcript (distill)
+    cv distill <agent-id> --pack lane.md         # brief + messages + own words + facts + ledger + last 12 calls
+    cv distill <agent-id> --agent-of <root-id>   # a new sub-agent of <root>: SendMessage to the printed id resumes it
+    cv distill <agent-id> --session              # a new session: claude -p --resume <new-id> \"<next quest>\"
+    cv distill <agent-id> --with <other-agent>   # inject another lane's findings into this pack
+    cv fork <id> --at N --agent-of <root-id>     # branch a lane's verbatim context at message N
+    → stderr: context before → after; --json: {stats: {recorded_context_tokens, distilled_est_tokens, …},
+      emitted: {session_id, agent_id, path, sidecar_path, resume}}; elided outputs: cv cat <new> <tool_use_id>
+
 More: `cv schema` (the -q query calculus), `cv schema --commands --json` (every command + flag),
 `cv <command> --help`.
 ";
@@ -111,18 +120,10 @@ mod tests {
     #[test]
     fn ten_recipes_and_no_old_names() {
         let r = super::RECIPES;
-        for n in 1..=13 {
+        for n in 1..=14 {
             assert!(r.contains(&format!("{n:>2}. ")), "recipe {n} missing");
         }
-        for old in [
-            "cv convert",
-            "cv query",
-            "cv recall",
-            "cv distill",
-            "--retrieve",
-            "--to-dir",
-            "--to ",
-        ] {
+        for old in ["cv convert", "cv query", "cv recall", "--retrieve", "--to-dir", "--to "] {
             assert!(!r.contains(old), "recipes mention the removed {old:?}");
         }
     }

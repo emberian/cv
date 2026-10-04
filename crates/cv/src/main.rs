@@ -88,7 +88,7 @@ pub(crate) const GROUPS: &[(&str, &[&str])] = &[
     ),
     (
         "Reshape",
-        &["prune", "rewind", "splice", "loom", "port", "redact", "resume"],
+        &["prune", "rewind", "distill", "fork", "splice", "loom", "port", "redact", "resume"],
     ),
     ("Export", &["export", "dataset", "pack"]),
     ("Fleet & live", &["task", "board", "scry", "share"]),
@@ -602,6 +602,80 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Distill a long session (typically a sub-agent lane) into a compact context: the brief and
+    /// every message to the agent verbatim, its own words (text, messages sent, notes written)
+    /// verbatim, an index of commits/branches/hosts/paths/verdicts/errors, a one-line-per-call
+    /// ledger, and its last N tool calls as real turns. Deterministic (no model calls). Elided
+    /// outputs go to a sidecar `cv cat` reads. Prints the markdown pack by default; `--session`
+    /// emits a resumable session (`claude -p --resume <id>`); `--agent-of <root>` emits a new
+    /// sub-agent of that root, which the root resumes with SendMessage to the printed agent id.
+    Distill {
+        /// Session id, agent id (`agent-…`), `harness:id`, or a path to a transcript file.
+        id: String,
+        #[arg(long)]
+        harness: Option<String>,
+        /// Keep the last N tool calls (and the turns around them) verbatim.
+        #[arg(long, default_value_t = 12)]
+        keep_last: usize,
+        /// Byte cap for one tool result inside the verbatim tail (head+tail kept, rest elided).
+        #[arg(long, default_value_t = 6000)]
+        tail_result_max: usize,
+        /// Byte cap for one note the agent wrote, a sub-agent return, or a spawned prompt.
+        #[arg(long, default_value_t = 6000)]
+        note_max: usize,
+        /// Keep the agent's thinking blocks inside the verbatim tail (dropped by default).
+        #[arg(long)]
+        keep_tail_thinking: bool,
+        /// Omit the one-line-per-tool-call ledger.
+        #[arg(long)]
+        no_ledger: bool,
+        /// Distill the session as it stood at message N (exclusive): a distilled fork.
+        #[arg(long, value_name = "N")]
+        upto: Option<usize>,
+        /// Inject another session's findings (its own words and facts) into this pack. Repeatable.
+        #[arg(long = "with", value_name = "SESSION")]
+        with: Vec<String>,
+        /// Write the markdown pack to this file (instead of stdout).
+        #[arg(long, value_name = "FILE")]
+        pack: Option<PathBuf>,
+        /// Emit a resumable main-thread session (new id) under the Claude store or --out.
+        #[arg(long, conflicts_with = "agent_of")]
+        session: bool,
+        /// Emit a new sub-agent transcript owned by this ROOT session (id or transcript path).
+        #[arg(long, value_name = "ROOT")]
+        agent_of: Option<String>,
+        /// With --session: rehome the new session to this working directory.
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        /// With --session: write under this directory instead of the Claude store.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Report as JSON on stdout (stats + what was written).
+        #[arg(long)]
+        json: bool,
+    },
+    /// Fork a session's context at message N: emit the verbatim prefix as a new resumable session
+    /// (`--session`) or as a new sub-agent of a root (`--agent-of`), to branch a lane and run
+    /// variants from one point. Calls whose results fall after the cut are dropped.
+    Fork {
+        /// Session id, agent id, `harness:id`, or a transcript path.
+        id: String,
+        #[arg(long)]
+        harness: Option<String>,
+        /// Keep messages [0, N).
+        #[arg(long, value_name = "N")]
+        at: usize,
+        #[arg(long, conflicts_with = "agent_of")]
+        session: bool,
+        #[arg(long, value_name = "ROOT")]
+        agent_of: Option<String>,
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        #[arg(long)]
+        out: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Compose a new session from spans of existing ones (`<id>:A..B`).
     Splice {
         /// One or more specs: `<id>:A..B`, `<id>:A..` (through the last), `<id>:..B`, or `<id>`
@@ -908,11 +982,6 @@ enum Cmd {
     },
     #[command(hide = true)]
     Recall {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
-        rest: Vec<String>,
-    },
-    #[command(hide = true)]
-    Distill {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         rest: Vec<String>,
     },
@@ -1246,6 +1315,47 @@ fn run() -> Result<()> {
             json,
         } => browse::cmd_timeline(harness, cwd, query, limit, json),
         Cmd::Diff { a, b, harness } => view::cmd_diff(&a, &b, harness),
+        Cmd::Distill {
+            id,
+            harness,
+            keep_last,
+            tail_result_max,
+            note_max,
+            keep_tail_thinking,
+            no_ledger,
+            upto,
+            with,
+            pack,
+            session,
+            agent_of,
+            cwd,
+            out,
+            json,
+        } => {
+            let opts = cv_core::distill::DistillOptions {
+                keep_last,
+                tail_result_max,
+                note_max,
+                keep_tail_thinking,
+                ledger: !no_ledger,
+                retrieve_ref: None,
+            };
+            let target = cmd::distill::target(session, agent_of, cwd, out)?;
+            cmd::distill::cmd_distill(&id, harness, opts, upto, &with, pack, target, json)
+        }
+        Cmd::Fork {
+            id,
+            harness,
+            at,
+            session,
+            agent_of,
+            cwd,
+            out,
+            json,
+        } => {
+            let target = cmd::distill::target(session, agent_of, cwd, out)?;
+            cmd::distill::cmd_fork(&id, harness, at, target, json)
+        }
         Cmd::Splice {
             specs,
             harness,
@@ -1299,9 +1409,6 @@ fn run() -> Result<()> {
         Cmd::Recall { .. } => usage(
             "`cv recall` was removed in 0.11.0 — use `cv search <query>` to find content, or `cv pack <task>` to build context",
         ),
-        Cmd::Distill { .. } => {
-            usage("`cv distill` was removed in 0.11.0 — use `cv pack <task>` (the one build-context-from-the-corpus verb)")
-        }
     }
 }
 
@@ -1383,7 +1490,7 @@ mod tests {
             }
         }
         // Old names are hidden stubs, never visible commands.
-        for old in ["convert", "query", "recall", "distill"] {
+        for old in ["convert", "query", "recall"] {
             assert!(!visible.contains(&old), "{old} must be hidden");
             assert!(
                 cmd.get_subcommands().any(|s| s.get_name() == old),
@@ -1408,7 +1515,7 @@ mod tests {
         }
         assert!(help.trim_end().ends_with(RECIPES_FOOTER), "footer:\n{help}");
         assert!(
-            !help.contains("convert") && !help.contains("distill"),
+            !help.contains("    convert ") && !help.contains("    recall "),
             "stubs leak:\n{help}"
         );
         // The flat clap list is gone — commands appear under their group only.

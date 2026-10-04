@@ -2481,3 +2481,136 @@ fn task_serve_records_the_same_events_as_the_cli() {
     let (out, _) = w.cv_ok(&["task", "events", "--since", "1h", "--kind", "resolved,done"]);
     assert_eq!(out.lines().count(), 2, "the CLI feed and /api/events agree:\n{out}");
 }
+// ───────────────────────────── distill ─────────────────────────────
+
+/// Walk `parentUuid` back from the newest threaded record, the way Claude Code loads a session on
+/// resume; returns how many records the walk reaches and the root it stops at.
+fn chain_walk(path: &std::path::Path) -> (usize, usize, serde_json::Value) {
+    let lines: Vec<serde_json::Value> = fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let threaded: Vec<&serde_json::Value> = lines.iter().filter(|v| v.get("uuid").is_some()).collect();
+    let by: std::collections::HashMap<&str, &serde_json::Value> =
+        threaded.iter().map(|v| (v["uuid"].as_str().unwrap(), *v)).collect();
+    let mut cur = *threaded.last().unwrap();
+    let mut n = 1;
+    while let Some(p) = cur["parentUuid"].as_str() {
+        match by.get(p) {
+            Some(v) => {
+                cur = v;
+                n += 1;
+            }
+            None => break,
+        }
+    }
+    (n, threaded.len(), cur.clone())
+}
+
+#[test]
+fn distill_emits_a_whole_resumable_session_and_a_sub_agent() {
+    let w = World::new("distill");
+    let big = "y".repeat(9000);
+    w.write_session(
+        "rootsess",
+        &[serde_json::json!({
+            "type": "user", "uuid": "r1", "sessionId": "rootsess", "timestamp": "2026-01-01T09:00:00Z",
+            "cwd": "/work/proj", "message": {"role": "user", "content": "run the lanes"}
+        })],
+    );
+    let sub = w.home.join(".claude/projects/-work-proj/rootsess/subagents");
+    fs::create_dir_all(&sub).unwrap();
+    let agent = sub.join("agent-a0123456789abcdef.jsonl");
+    let line = |v: serde_json::Value| {
+        let mut v = v;
+        v["isSidechain"] = true.into();
+        v["agentId"] = "a0123456789abcdef".into();
+        v["sessionId"] = "rootsess".into();
+        v["cwd"] = "/work/proj".into();
+        format!("{v}\n")
+    };
+    let body = [
+        line(serde_json::json!({"type": "user", "uuid": "u0", "parentUuid": null, "timestamp": "2026-01-01T10:00:00Z",
+            "message": {"role": "user", "content": "You are lane TEST. Build it on box1 and commit on lane/test."}})),
+        line(serde_json::json!({"type": "assistant", "uuid": "a1", "parentUuid": "u0", "timestamp": "2026-01-01T10:01:00Z",
+            "message": {"role": "assistant", "model": "claude-test-1", "content": [
+                {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "ssh ember@box1 'cat big.log'", "description": "Read the big log"}}]}})),
+        line(serde_json::json!({"type": "user", "uuid": "u1", "parentUuid": "a1", "timestamp": "2026-01-01T10:02:00Z",
+            "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": big, "is_error": false}]}})),
+        // A hook record the IR does not carry — the next turn's parent. A reshaped session that
+        // kept this link would resume from the break and silently lose everything before it.
+        line(serde_json::json!({"type": "attachment", "uuid": "h1", "parentUuid": "u1", "timestamp": "2026-01-01T10:02:30Z",
+            "attachment": {"type": "hook_success", "hookName": "PostToolUse", "content": ""}})),
+        line(serde_json::json!({"type": "assistant", "uuid": "a2", "parentUuid": "h1", "timestamp": "2026-01-01T10:03:00Z",
+            "message": {"role": "assistant", "model": "claude-test-1", "content": [
+                {"type": "text", "text": "Chose a rebase: the queue wants linear ranges."},
+                {"type": "tool_use", "id": "t2", "name": "Bash", "input": {"command": "cd /srv/x && git commit -F msg", "description": "Commit"}}]}})),
+        line(serde_json::json!({"type": "user", "uuid": "u2", "parentUuid": "a2", "timestamp": "2026-01-01T10:04:00Z",
+            "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t2", "content": "[lane/test 1234abcd] kernel: one", "is_error": false}]}})),
+        line(serde_json::json!({"type": "assistant", "uuid": "a3", "parentUuid": "u2", "timestamp": "2026-01-01T10:05:00Z",
+            "message": {"role": "assistant", "model": "claude-test-1", "content": [{"type": "text", "text": "Committed."}],
+                "usage": {"input_tokens": 5, "cache_read_input_tokens": 900000, "output_tokens": 10}}})),
+    ]
+    .concat();
+    fs::write(&agent, &body).unwrap();
+    let agent_s = agent.to_str().unwrap();
+
+    // The pack: brief, own words, commit, host, and the big output elided.
+    let (out, err) = w.cv_ok(&["distill", agent_s, "--keep-last", "1"]);
+    assert!(out.contains("You are lane TEST."), "{out}");
+    assert!(out.contains("Chose a rebase"), "{out}");
+    assert!(out.contains("`lane/test` `1234abcd`"), "{out}");
+    assert!(out.contains("`ember@box1`"), "{out}");
+    assert!(!out.contains(&"y".repeat(200)), "the big output must be elided");
+    assert!(err.contains("distilled"), "{err}");
+
+    // A resumable session: every record reachable from the newest, rooted at the pack prompt.
+    let (out, _) = w.cv_ok(&["distill", agent_s, "--keep-last", "1", "--session", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(out.trim()).expect("stdout must be pure JSON");
+    let path = PathBuf::from(v["emitted"]["path"].as_str().unwrap());
+    let new_id = v["emitted"]["session_id"].as_str().unwrap().to_string();
+    let (reached, threaded, root) = chain_walk(&path);
+    assert_eq!(reached, threaded, "a dangling parent truncates the resumed context");
+    assert!(
+        root["message"]["content"].as_str().unwrap().contains("[cv distill]"),
+        "{root}"
+    );
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(!text.contains("\"isSidechain\":true"), "a main-thread session");
+    assert!(
+        !text.contains("900000"),
+        "the source's near-limit usage must not reach the resume gate"
+    );
+    // The elided output comes back through the sidecar.
+    let (cat, _) = w.cv_ok(&["cat", &new_id, "t1"]);
+    assert!(cat.contains(&"y".repeat(9000)), "cv cat must return the elided payload");
+
+    // A sub-agent of the root: sidechain records under the root's id, in the root's subagents/.
+    let (out, _) = w.cv_ok(&[
+        "distill",
+        agent_s,
+        "--keep-last",
+        "1",
+        "--agent-of",
+        "rootsess",
+        "--json",
+    ]);
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    let aid = v["emitted"]["agent_id"].as_str().unwrap();
+    let apath = sub.join(format!("agent-{aid}.jsonl"));
+    assert!(apath.exists() && sub.join(format!("agent-{aid}.meta.json")).exists());
+    let (reached, threaded, _) = chain_walk(&apath);
+    assert_eq!(reached, threaded);
+    for l in fs::read_to_string(&apath).unwrap().lines() {
+        let r: serde_json::Value = serde_json::from_str(l).unwrap();
+        assert_eq!(r["isSidechain"], true, "{l}");
+        assert_eq!(r["agentId"], aid, "{l}");
+        assert_eq!(r["sessionId"], "rootsess", "{l}");
+    }
+    assert_eq!(
+        fs::read_to_string(&agent).unwrap(),
+        body,
+        "distill must never modify the source"
+    );
+}

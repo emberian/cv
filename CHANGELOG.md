@@ -22,6 +22,30 @@
   their byte offset under `lazy_offsets`, so any session with one (current Claude Code writes
   them constantly) recorded no seek row and `cv show --range` fell back to a full stream.
 - `cv_core::digest::Sha256` — the vendored SHA-256, now incremental.
+- **`cv distill` — a transcript as a reshapeable lane context** (`docs/design/DISTILL.md`). It
+  compresses a long session, typically a sub-agent lane at 500K–900K tokens, into a pack. The pack
+  holds verbatim: the brief, every message to the agent, everything the agent said, sent or wrote
+  down, and the documents its instructions named that it read. It also holds an index of commits,
+  branch tips, repository heads, hosts, paths, build verdicts and tool errors, a one-line ledger
+  per tool call, and the last N tool calls as real turns. It is deterministic, with no model calls.
+  Elided outputs go to a prune-format sidecar that `cv cat <new> <tool_use_id>` reads. Three
+  emissions: the markdown pack (stdout or `--pack`); `--session`, a new resumable session
+  (`claude -p --resume <id>`); and `--agent-of <root>`, a new sub-agent transcript in the root's
+  `subagents/`, which the root resumes with `SendMessage` to the printed id. That last route was
+  measured to work for a transcript the root never spawned, even one planted mid-run. `--upto N`
+  distills the session as of message N; `--with <other>` injects another lane's findings.
+  Measured on three real lanes, the distilled context loads 5.4–6.7× fewer tokens than the source
+  and answers 28 of 30 probe questions, against 29.5 for the full transcript.
+- **`cv fork <id> --at N (--session | --agent-of <root>)`** branches a session's verbatim context at
+  message N, to run variants from one point.
+- **The name `distill` returns with a new meaning.** The 0.11 stub that pointed `cv distill` at
+  `cv pack` is gone. `pack` still builds context from the corpus; `distill` reshapes one session.
+- **Reshaped sessions thread linearly.** Claude Code resumes by walking `parentUuid` back from the
+  newest record and silently stops at the first missing link. A lane's turns often point at hook
+  attachments the IR does not carry, so a session emitted with source parents resumed with only
+  its last record or two. `distill` and `fork` clear parents and let the emitter chain records in
+  order. (`port`/`splice`/`loom` keep source parents and may share this; not yet checked.)
+
 - **Devin CLI (Cognition) parses** — `~/.local/share/devin/cli/sessions.db` (refinery schema 17, cli
   3000.11.3), read-only and PRAGMA-probed like the other SQLite stores. `message_nodes` is a
   *forest* — every context rebuild rewrites the transcript as a fresh chain of copies — so the

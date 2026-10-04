@@ -13,6 +13,7 @@ pub mod config;
 pub mod dataset;
 pub mod digest;
 pub mod discover_cache;
+pub mod distill;
 pub mod doctor;
 pub mod emit;
 pub mod events;
