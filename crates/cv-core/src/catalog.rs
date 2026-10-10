@@ -24,8 +24,6 @@
 //! Behind the `sqlite` feature (default-on); no-op fallbacks keep the scan path working without it.
 
 use crate::ir::{Harness, SessionRef};
-#[cfg(not(feature = "sqlite"))]
-use std::path::Path;
 #[cfg(feature = "sqlite")]
 use std::path::{Path, PathBuf};
 
@@ -223,17 +221,14 @@ mod imp {
         let _ = tx.commit();
     }
 
-    /// Compute the watch set for one harness from a finished discovery: the harness root, every
-    /// ancestor directory between each session file and the root (so a new project/day directory
+    /// Compute the watch set for one harness from a finished discovery: the harness roots, every
+    /// ancestor directory between each session file and its root (so a new project/day directory
     /// anywhere in the tree bumps a watched mtime), and — for the SQLite-backed harnesses — each
     /// session's backing file itself (their "session file" is a database that grows in place, which
     /// directory mtimes never reflect). Paths that can't be stat'd are skipped: if they reappear,
     /// their parent's mtime changes. Recently-modified paths record `0` (see [`WATCH_FUDGE`]).
-    pub(crate) fn watches_for(h: Harness, root: Option<&Path>, refs: &[SessionRef]) -> Vec<(PathBuf, i64)> {
-        let mut paths: BTreeSet<PathBuf> = BTreeSet::new();
-        if let Some(root) = root {
-            paths.insert(root.to_path_buf());
-        }
+    pub(crate) fn watches_for(h: Harness, roots: &[PathBuf], refs: &[SessionRef]) -> Vec<(PathBuf, i64)> {
+        let mut paths: BTreeSet<PathBuf> = roots.iter().cloned().collect();
         let file_watch = matches!(
             h,
             Harness::Cursor
@@ -247,6 +242,7 @@ mod imp {
             if file_watch {
                 paths.insert(r.path.clone());
             }
+            let root = roots.iter().map(PathBuf::as_path).find(|rt| r.path.starts_with(rt));
             let mut d = r.path.parent();
             while let Some(dir) = d {
                 paths.insert(dir.to_path_buf());
@@ -281,7 +277,10 @@ mod imp {
     ///    an in-place append changes `(mtime, size)` there (active sessions are precisely the
     ///    recently-updated ones);
     /// 3. each registered adapter's `storage_root()` presence vs. whether we hold watch rows for
-    ///    it — a harness installed (or wholly removed) since the last sync is stale.
+    ///    it — a harness installed (or wholly removed) since the last sync is stale — and each of
+    ///    its existing `storage_roots()` vs. a watch row for that path: a root that appeared since
+    ///    the last sync (a new agent seat under a `*` Claude root, a line added to the roots file,
+    ///    or another cv process that syncs with different roots) is stale too.
     ///
     /// `None` means the catalog is unusable (sqlite error) and the caller must fall back to a full
     /// discovery. An empty Vec means "fresh, read away".
@@ -305,6 +304,7 @@ mod imp {
 
         // 1. watched dirs + db files.
         let mut watched_harnesses: HashSet<Harness> = HashSet::new();
+        let mut watched_paths: HashSet<(Harness, String)> = HashSet::new();
         {
             let mut stmt = conn.prepare("SELECT harness, path, mtime_ns FROM watched").ok()?;
             let rows = stmt
@@ -315,6 +315,7 @@ mod imp {
             for (h, path, recorded) in rows.flatten() {
                 let Some(h) = Harness::parse(&h) else { continue };
                 watched_harnesses.insert(h);
+                watched_paths.insert((h, path.clone()));
                 if stale.contains(&h) {
                     continue; // already condemned; skip the stat
                 }
@@ -360,10 +361,19 @@ mod imp {
             }
         }
 
-        // 3. harnesses that appeared (root now exists, no watch rows) or vanished outright.
+        // 3. harnesses that appeared (root now exists, no watch rows) or vanished outright, and
+        //    existing roots with no watch row of their own (appeared since the last sync).
         for a in crate::harness::all() {
             let h = a.harness();
-            if a.storage_root().is_some() != watched_harnesses.contains(&h) {
+            if stale.contains(&h) {
+                continue;
+            }
+            let unwatched_root = || {
+                a.storage_roots()
+                    .iter()
+                    .any(|r| r.exists() && !watched_paths.contains(&(h, r.to_string_lossy().into_owned())))
+            };
+            if a.storage_root().is_some() != watched_harnesses.contains(&h) || unwatched_root() {
                 mark(&mut stale, h);
             }
         }
@@ -446,7 +456,11 @@ pub fn lookup(_id: &str, _harness: Option<Harness>) -> Vec<SessionRef> {
 #[cfg(not(feature = "sqlite"))]
 pub(crate) fn replace_harness(_h: Harness, _refs: &[SessionRef], _watches: &[(std::path::PathBuf, i64)]) {}
 #[cfg(not(feature = "sqlite"))]
-pub(crate) fn watches_for(_h: Harness, _root: Option<&Path>, _refs: &[SessionRef]) -> Vec<(std::path::PathBuf, i64)> {
+pub(crate) fn watches_for(
+    _h: Harness,
+    _roots: &[std::path::PathBuf],
+    _refs: &[SessionRef],
+) -> Vec<(std::path::PathBuf, i64)> {
     Vec::new()
 }
 #[cfg(not(feature = "sqlite"))]

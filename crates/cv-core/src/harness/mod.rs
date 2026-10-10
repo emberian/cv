@@ -157,6 +157,14 @@ pub trait Adapter: Send + Sync {
     /// The on-disk root this adapter reads from (already resolved against $HOME), if it exists.
     fn storage_root(&self) -> Option<PathBuf>;
 
+    /// Every root this adapter reads sessions from, [`storage_root`](Adapter::storage_root) first.
+    /// The catalog's freshness probe watches each one, and re-discovers the harness when a root
+    /// exists that it holds no watch for (one that appeared since the last sync). The default is
+    /// the single storage root; an adapter that reads several (Claude's extra roots) overrides it.
+    fn storage_roots(&self) -> Vec<PathBuf> {
+        self.storage_root().into_iter().collect()
+    }
+
     /// Cheaply enumerate sessions without fully parsing them.
     fn discover(&self) -> Result<Vec<SessionRef>>;
 

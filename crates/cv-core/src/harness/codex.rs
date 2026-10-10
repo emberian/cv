@@ -3007,7 +3007,7 @@ mod tests {
         assert_eq!(outbound.role, Role::Assistant, "authored by this thread ⇒ output");
         assert_eq!((outbound.kind, outbound.origin), (MessageKind::Reply, Origin::Subagent));
         assert_eq!(outbound.extra["codex"]["trigger_turn"], false);
-        assert!(!outbound.extra["codex"].get("encrypted").is_some());
+        assert!(outbound.extra["codex"].get("encrypted").is_none());
         // identical on the streaming path (the pairing lives in parser state, not the sink)
         let streamed = stream_jsonl_with(&lines, &ParseOptions::full());
         assert_eq!(

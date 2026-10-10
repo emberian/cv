@@ -176,6 +176,7 @@ Each row shows the session's `created → last-active` span in **local time** (s
 `cv ls` reads the **probed catalog**, not a full fleet scan: warm, it answers in milliseconds. The catalog's freshness rests on a staleness probe plus a time backstop (`CLUSTERVISION_MAX_STALE_SECS`, default **900s**):
 
 - **A brand-new session is always seen.** Creating a session writes a new file, which bumps its directory's mtime; the probe re-stats the watched directories and re-discovers that harness before reading. Worst-case lag for a *just-created* session is one probe cycle, not the backstop window.
+- **A new storage root is seen too.** When a root appears that the catalog does not watch yet (a new agent under a `*` entry in `claude-roots`, or a line added to that file — see [Harnesses](harnesses.md#claude-code-sessions-outside-claude)), the probe re-discovers that harness.
 - **The bounded blind spot is an in-place append** to an *existing, older* session (one outside the 50 most-recently-updated files the probe re-stats): its `updated_at`/`message_count` can lag until the backstop forces a full re-discovery — at most `CLUSTERVISION_MAX_STALE_SECS`.
 - **`--fresh` forces a full re-discovery** instead of trusting the probe — the escape hatch when you cannot accept even the bounded append lag. `CLUSTERVISION_MAX_STALE_SECS=0` has the same effect for every read.
 

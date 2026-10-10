@@ -75,7 +75,10 @@ impl World {
             .env("XDG_CACHE_HOME", self.home.join(".cache"))
             .env("XDG_CONFIG_HOME", self.home.join(".config"))
             .env("XDG_DATA_HOME", self.home.join(".local/share"))
-            .env_remove("CV_ENDPOINT");
+            .env_remove("CV_ENDPOINT")
+            // Hermetic: an agent seat's own Claude config dir must not add its sessions here.
+            .env_remove("CLAUDE_CONFIG_DIR")
+            .env_remove("CLUSTERVISION_CLAUDE_ROOTS");
         for (k, v) in extra {
             cmd.env(k, v);
         }
@@ -1297,6 +1300,46 @@ fn id_prefix_resolution() {
 
     let (out, _) = w.cv_ok(&["show", "beta", "--harness", "claude"]);
     assert!(out.contains("quokkas"), "{out}");
+}
+
+// ───────────────────────────── extra claude roots ─────────────────────────────
+
+/// Claude Code sessions outside `~/.claude` (a second `CLAUDE_CONFIG_DIR`, e.g. one per agent
+/// seat) are listed, searched and read when named by `$CLUSTERVISION_HOME/claude-roots` (with a
+/// `*` seat wildcard) or `$CLUSTERVISION_CLAUDE_ROOTS`; the default root keeps working beside them.
+#[test]
+fn extra_claude_roots_are_listed_and_read() {
+    let w = World::new("roots");
+    standard_corpus(&w);
+    let seat_proj = w.home.join("seats/bonsai/claude/projects/-work-proj");
+    fs::create_dir_all(&seat_proj).unwrap();
+    let seat_line = user_line("s1", "2026-07-01T10:00:00Z", "the seat asks about narwhals");
+    fs::write(seat_proj.join("seatsess.jsonl"), format!("{seat_line}\n")).unwrap();
+    let env_proj = w.base.join("elsewhere/projects/-work-proj");
+    fs::create_dir_all(&env_proj).unwrap();
+    let env_line = user_line("e1", "2026-07-02T10:00:00Z", "the env root asks about axolotls");
+    fs::write(env_proj.join("envsess.jsonl"), format!("{env_line}\n")).unwrap();
+
+    // Not configured yet: the seat session is invisible, exactly as before.
+    w.cv_fails(&["show", "seatsess"]);
+
+    fs::write(w.cv_home.join("claude-roots"), "# agent seats\n~/seats/*/claude\n").unwrap();
+    let (out, _) = w.cv_ok(&["show", "seatsess"]);
+    assert!(out.contains("narwhals"), "{out}");
+    let (out, _) = w.cv_ok(&["show", "alphasess"]);
+    assert!(out.contains("zebrafish"), "the default root still works:\n{out}");
+    let (out, _) = w.cv_ok(&["ls"]);
+    assert!(out.contains("3 session(s)"), "{out}");
+    let (out, _) = w.cv_ok(&["search", "narwhals"]);
+    assert!(out.contains("seatsess"), "{out}");
+
+    let roots = w.base.join("elsewhere");
+    let (ok, _, out, err) = w.cv_env(
+        &["show", "envsess"],
+        &[("CLUSTERVISION_CLAUDE_ROOTS", roots.to_str().unwrap())],
+    );
+    assert!(ok, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(out.contains("axolotls"), "{out}");
 }
 
 // ───────────────────────────── task substrate: identity + sanitizing ─────────────────────────────

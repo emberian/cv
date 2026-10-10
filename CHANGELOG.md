@@ -68,6 +68,25 @@
   `chisel/user_question_answers` surfaces in `cv prompts`, and the parent's
   `subagent/*` completion rows fill `extra["devin"]["subagent"]` +
   `lineage.spawned_by_tool_use`.
+- **Claude Code sessions outside `~/.claude` are read.** Claude Code writes to
+  `$CLAUDE_CONFIG_DIR/projects` when that variable is set, and tools that run many agents give each
+  agent its own config dir, so cv could not list, search or read those sessions. The Claude adapter
+  now reads a list of roots: `$CLAUDE_CONFIG_DIR/projects`, `~/.claude/projects`, each entry of
+  `$CLUSTERVISION_CLAUDE_ROOTS`, and each line of `$CLUSTERVISION_HOME/claude-roots` (blank lines
+  and `#` comments skipped). An entry can be a config dir or a `projects/` dir, can start with `~`,
+  and can hold `*` segments (`~/.agents/*/claude`, `~/.agents/*/instances/*/claude`) that are
+  expanded on every scan, so an agent added later is found. Missing roots are skipped, a directory named twice is read once, and a
+  config dir with no `projects/` yet is skipped rather than read as one. `storage_root()` is the
+  first root that exists. `Adapter` gains `storage_roots()` (default: the one storage root); the
+  catalog watches every root and re-discovers the harness when a root appears that it does not
+  watch yet.
+  - *One session id in two roots.* A transcript copied into a second config dir and continued there
+    is two files with one id. Both are listed; `find` (so `cv show` and the MCP `read_session`)
+    returns the most recently updated copy instead of an arbitrary one, and a prefix of that id is
+    no longer reported as ambiguous.
+  - The test harnesses that fake `$HOME` now also clear `CLAUDE_CONFIG_DIR` and
+    `CLUSTERVISION_CLAUDE_ROOTS`, so a test run inside an agent that has its own config dir stays
+    hermetic.
 
 ## 0.13.0 — decisions are a kind; a human can drain the inbox
 

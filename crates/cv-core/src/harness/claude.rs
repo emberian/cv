@@ -1,4 +1,6 @@
-//! Claude Code adapter — `~/.claude/projects/<encoded-cwd>/<sessionId>.jsonl`.
+//! Claude Code adapter — `~/.claude/projects/<encoded-cwd>/<sessionId>.jsonl`, plus the same
+//! layout under any extra roots (`$CLAUDE_CONFIG_DIR`, `$CLUSTERVISION_CLAUDE_ROOTS`, the
+//! `claude-roots` file; see [`Claude::new`]).
 //!
 //! See `docs/FORMATS.md`. Key points: one session per `.jsonl` file; each line is a typed record;
 //! `cwd` is read from inside the transcript (the dir-name encoding is lossy), and the conversation is
@@ -13,9 +15,10 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde_json::value::RawValue;
 use serde_json::{Map, Value};
+use std::collections::HashSet;
 use std::fs;
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 /// Context for turning large content fields into lazy [`Span`]s during streaming: the raw bytes of
@@ -28,16 +31,127 @@ struct SpanCtx<'a> {
 }
 
 pub struct Claude {
-    root: Option<PathBuf>,
+    /// Root entries in priority order, before `*` expansion and the existence check. They are
+    /// resolved by [`Claude::roots`] on every call, so a root that appears later (a new agent seat
+    /// under a `*` entry) is read without rebuilding the adapter.
+    entries: Vec<PathBuf>,
 }
 
+/// Files Claude Code keeps at the top of a config dir. A directory that holds one of them but no
+/// `projects/` is a config dir with no sessions yet, not a projects dir: reading it as one would
+/// list its other `.jsonl` files (e.g. `transcripts/*.jsonl`) as sessions.
+const CONFIG_MARKERS: [&str; 5] = [
+    "settings.json",
+    ".claude.json",
+    ".credentials.json",
+    "history.jsonl",
+    "CLAUDE.md",
+];
+
 impl Claude {
+    /// Collect the root entries, in priority order:
+    /// 1. `$CLAUDE_CONFIG_DIR/projects` — Claude Code's own variable for moving its config dir, so
+    ///    this is where the Claude Code of this environment reads and writes (and it is the
+    ///    [`storage_root`](Adapter::storage_root), the default conversion target, when it exists);
+    /// 2. `~/.claude/projects` — Claude Code's default;
+    /// 3. each entry of `$CLUSTERVISION_CLAUDE_ROOTS` (a path list, split like `$PATH`);
+    /// 4. each non-blank line of `$CLUSTERVISION_HOME/claude-roots` (default
+    ///    `~/.clustervision/claude-roots`) that does not start with `#` — the machine-wide list,
+    ///    which every cv process (CLI, MCP servers, daemon) reads alike.
+    ///
+    /// An entry from 3 or 4 may name a Claude config dir (one that holds `projects/`) or a projects
+    /// dir itself, may start with `~`, and may hold path segments that are exactly `*`; each stands
+    /// for every entry of the directory before it (`~/.agents/*/claude`, `~/.agents/*/instances/*/claude`).
     pub fn new() -> Self {
-        let root = dirs::home_dir().map(|h| h.join(".claude").join("projects"));
-        Claude {
-            root: root.filter(|p| p.exists()),
+        let home = dirs::home_dir();
+        let mut entries: Vec<PathBuf> = Vec::new();
+        entries.extend(
+            std::env::var_os("CLAUDE_CONFIG_DIR")
+                .filter(|v| !v.is_empty())
+                .map(|d| PathBuf::from(d).join("projects")),
+        );
+        entries.extend(home.as_ref().map(|h| h.join(".claude").join("projects")));
+        if let Some(list) = std::env::var_os("CLUSTERVISION_CLAUDE_ROOTS") {
+            entries.extend(std::env::split_paths(&list).filter(|p| !p.as_os_str().is_empty()));
         }
+        let cv_home = std::env::var_os("CLUSTERVISION_HOME")
+            .map(PathBuf::from)
+            .or_else(|| home.as_ref().map(|h| h.join(".clustervision")));
+        if let Some(text) = cv_home.and_then(|d| fs::read_to_string(d.join("claude-roots")).ok()) {
+            entries.extend(
+                text.lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                    .map(PathBuf::from),
+            );
+        }
+        let entries = entries
+            .into_iter()
+            .map(|e| match (e.strip_prefix("~"), &home) {
+                (Ok(rest), Some(h)) => h.join(rest),
+                _ => e,
+            })
+            .collect();
+        Claude { entries }
     }
+
+    /// The projects dirs this adapter reads, in priority order: each entry with its `*` expanded
+    /// and a config dir mapped to its `projects/`; missing dirs dropped; and one directory reached
+    /// several ways (a symlink, or a config dir and its `projects/` both listed) kept once, under
+    /// the first spelling seen.
+    fn roots(&self) -> Vec<PathBuf> {
+        let mut seen = HashSet::new();
+        self.entries
+            .iter()
+            .flat_map(|e| expand_star(e))
+            .filter_map(projects_dir)
+            .filter(|p| fs::canonicalize(p).is_ok_and(|c| seen.insert(c)))
+            .collect()
+    }
+}
+
+/// `entry` with each path segment that is exactly `*` replaced by each entry of the directory
+/// before it (names starting with `.` skipped, like a shell glob), sorted so the root order is
+/// stable. An entry with no `*` is returned as is; a `*` under a missing directory matches nothing.
+fn expand_star(entry: &Path) -> Vec<PathBuf> {
+    let mut head = PathBuf::new();
+    let mut rest = entry.components();
+    while let Some(c) = rest.next() {
+        if c.as_os_str() != "*" {
+            head.push(c);
+            continue;
+        }
+        let tail = rest.as_path();
+        let Ok(dir) = fs::read_dir(&head) else {
+            return Vec::new();
+        };
+        let mut out: Vec<PathBuf> = dir
+            .flatten()
+            .filter(|d| !d.file_name().to_string_lossy().starts_with('.'))
+            .map(|d| {
+                if tail.as_os_str().is_empty() {
+                    d.path()
+                } else {
+                    d.path().join(tail)
+                }
+            })
+            .collect();
+        out.sort();
+        // A later `*` in the tail (`agents/*/instances/*/claude`) expands the same way.
+        return out.iter().flat_map(|p| expand_star(p)).collect();
+    }
+    vec![entry.to_path_buf()]
+}
+
+/// The projects dir `entry` names: its `projects/` when it has one (a Claude config dir), else the
+/// entry itself — unless that is missing, or is a config dir with no sessions yet
+/// ([`CONFIG_MARKERS`]).
+fn projects_dir(entry: PathBuf) -> Option<PathBuf> {
+    let projects = entry.join("projects");
+    if projects.is_dir() {
+        return Some(projects);
+    }
+    (entry.is_dir() && !CONFIG_MARKERS.iter().any(|m| entry.join(m).exists())).then_some(entry)
 }
 
 impl Default for Claude {
@@ -52,20 +166,23 @@ impl Adapter for Claude {
     }
 
     fn storage_root(&self) -> Option<PathBuf> {
-        self.root.clone()
+        self.roots().into_iter().next()
+    }
+
+    fn storage_roots(&self) -> Vec<PathBuf> {
+        self.roots()
     }
 
     fn discover(&self) -> Result<Vec<SessionRef>> {
-        let Some(root) = &self.root else {
-            return Ok(vec![]);
-        };
-        // Session files sit at projects/<encoded>/<sid>.jsonl (depth 2). Subagent transcripts live
-        // deeper (…/<sid>/subagents/…), which max_depth(2) naturally excludes. Collect paths (cheap),
-        // then scan (read + parse) them in parallel.
-        let paths: Vec<_> = WalkDir::new(root)
-            .min_depth(2)
-            .max_depth(2)
-            .into_iter()
+        // Session files sit at projects/<encoded>/<sid>.jsonl (depth 2) in every root. Subagent
+        // transcripts live deeper (…/<sid>/subagents/…), which max_depth(2) naturally excludes.
+        // Collect paths (cheap), then scan (read + parse) them in parallel. The same session id in
+        // two roots (a transcript copied into another config dir to resume there) is listed twice,
+        // once per file; `crate::find` resolves such an id to the most recently updated copy.
+        let paths: Vec<_> = self
+            .roots()
+            .iter()
+            .flat_map(|root| WalkDir::new(root).min_depth(2).max_depth(2))
             .filter_map(|e| e.ok())
             .map(|e| e.into_path())
             .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonl"))
@@ -1814,7 +1931,7 @@ fn parse_usage(v: &Value) -> Usage {
 impl Claude {
     /// Test-only: point the adapter at an explicit projects root.
     fn for_root(root: std::path::PathBuf) -> Self {
-        Claude { root: Some(root) }
+        Claude { entries: vec![root] }
     }
 }
 

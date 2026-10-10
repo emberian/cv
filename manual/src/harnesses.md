@@ -21,7 +21,7 @@ All paths are the real ones the adapters look at. `~` is your home dir; `<AppSup
 
 | Harness | On-disk location | Parse | Emit | Notes |
 |---|---|:--:|:--:|---|
-| **Claude Code** | `~/.claude/projects/<encoded-cwd>/<sid>.jsonl` | ✓ | ✓ | One JSONL per session; threaded via `uuid`/`parentUuid`. **Sub-agents** under `<sid>/subagents/agent-*.jsonl`. Dir-name encoding is lossy — `cwd` is read from inside. |
+| **Claude Code** | `~/.claude/projects/<encoded-cwd>/<sid>.jsonl` | ✓ | ✓ | One JSONL per session; threaded via `uuid`/`parentUuid`. **Sub-agents** under `<sid>/subagents/agent-*.jsonl`. Dir-name encoding is lossy — `cwd` is read from inside. Also reads `$CLAUDE_CONFIG_DIR` and extra roots — see [below](#claude-code-sessions-outside-claude). |
 | **Codex CLI** | `~/.codex/sessions/YYYY/MM/DD/rollout-<ISO>-<ULID>.jsonl` | ✓ | ✓ | Also `~/.codex/archived_sessions/`. **SQLite index** `state_5.sqlite`. 2025 **legacy** variant = single `{session,items[]}` JSON. |
 | **Grok CLI** | `~/.grok/sessions/<percent-encoded-cwd>/<sid>/` | ✓ | ✓ | A *directory* per session (`chat_history.jsonl` + sidecars). **Sub-agents** flagged by `session_kind:"subagent"`. cwd is reversible (`%2F`). |
 | **OpenCode** | `~/.local/share/opencode/storage/` | ✓ | ✓ | `session/**/ses_*.json` + `message/<sid>/*.json` + `part/<msgid>/*.json`. **Subtask** parts spawn sub-sessions. Two storage generations (inline-summary vs parts). |
@@ -52,6 +52,45 @@ Gemini, Hermes, Kimi, LM Studio, Cline, Roo, Continue, Qwen.
 **8 are parse-only**: Cursor, Goose, Zed, and Devin CLI (closed-source / read-only stores we
 deliberately don't write back to), the two desktop apps below, and the two account-data **exports**
 (`chatgpt-export` / `claude-export`, registered via `cv config --add-export`).
+
+## Claude Code sessions outside `~/.claude`
+
+Claude Code keeps its sessions in `~/.claude/projects/` unless `CLAUDE_CONFIG_DIR` moves its config
+dir. Tools that run many Claude Code agents often give each agent its own config dir, so one machine
+can hold sessions in many places. clustervision reads all of them, in this order:
+
+1. `$CLAUDE_CONFIG_DIR/projects`, when `CLAUDE_CONFIG_DIR` is set. This is where the Claude Code of
+   the current environment writes, so it is also where `cv port --harness claude` writes when you
+   do not give `--out`.
+2. `~/.claude/projects`.
+3. Each entry of `CLUSTERVISION_CLAUDE_ROOTS`, a list separated like `PATH` (`:` on Unix, `;` on
+   Windows).
+4. Each line of `$CLUSTERVISION_HOME/claude-roots` (by default `~/.clustervision/claude-roots`).
+   Blank lines and lines that start with `#` are ignored.
+
+An entry can name a Claude config dir (a directory that contains `projects/`) or a `projects/`
+directory itself, and it can start with `~`. A path segment that is exactly `*` matches each entry
+of the directory before it, and an entry can have more than one. For example, these lines in
+`~/.clustervision/claude-roots` read every agent that has its own config dir under `~/.agents/`,
+and every instance of an agent that runs several:
+
+```text
+~/.agents/*/claude
+~/.agents/*/instances/*/claude
+```
+
+cv expands each `*` every time it looks for sessions, so it finds an agent that you add later
+without a restart. Entries that do not exist are ignored. A directory that you name more than once
+(for example, through a symlink) is read once. A config dir that does not contain `projects/` yet has
+no sessions, and cv skips it until `projects/` appears.
+
+Prefer the file to the environment variable. All cv processes on the machine (the CLI, each MCP
+server, the daemon) share one catalog and read the same file, so they agree about which sessions
+exist. An environment variable applies only to the processes that have it.
+
+If two roots hold the same session id (for example, a transcript that was copied to a second config
+dir and continued there), `cv ls` shows both files, and `cv show <id>` opens the copy that was
+updated most recently.
 
 ## Sub-agents
 

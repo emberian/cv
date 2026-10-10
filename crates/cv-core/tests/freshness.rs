@@ -45,6 +45,8 @@ impl World {
         std::env::set_var("XDG_DATA_HOME", home.join(".local/share"));
         std::env::remove_var("CLUSTERVISION_MAX_STALE_SECS");
         std::env::remove_var("CURSOR_USER_DIR");
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        std::env::remove_var("CLUSTERVISION_CLAUDE_ROOTS");
         World {
             base,
             home,

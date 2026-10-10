@@ -66,16 +66,17 @@ pub fn discover_all() -> Vec<SessionRef> {
     // Per-adapter outcome: refs on success, `None` on error (the catalog keeps that harness's
     // previous rows rather than wiping them over a transient failure). Rootless adapters are a
     // successful empty scan — their catalog rows (root deleted since last sync) must clear.
-    fn run(a: &dyn Adapter) -> (Harness, Option<std::path::PathBuf>, Option<Vec<SessionRef>>) {
+    fn run(a: &dyn Adapter) -> (Harness, Vec<std::path::PathBuf>, Option<Vec<SessionRef>>) {
         let h = a.harness();
-        let Some(root) = a.storage_root() else {
-            return (h, None, Some(Vec::new()));
-        };
+        let roots = a.storage_roots();
+        if roots.is_empty() {
+            return (h, roots, Some(Vec::new()));
+        }
         match a.discover() {
-            Ok(refs) => (h, Some(root), Some(refs)),
+            Ok(refs) => (h, roots, Some(refs)),
             Err(e) => {
                 eprintln!("cv: discover failed for {h}: {e:#}");
-                (h, Some(root), None)
+                (h, roots, None)
             }
         }
     }
@@ -94,9 +95,9 @@ pub fn discover_all() -> Vec<SessionRef> {
     // Refresh the catalog per harness so `sessions`/`find` can answer without re-scanning the
     // fleet, recording the watch set the freshness probe stats.
     let mut out = Vec::new();
-    for (h, root, refs) in results {
+    for (h, roots, refs) in results {
         let Some(refs) = refs else { continue };
-        catalog::replace_harness(h, &refs, &catalog::watches_for(h, root.as_deref(), &refs));
+        catalog::replace_harness(h, &refs, &catalog::watches_for(h, &roots, &refs));
         out.extend(refs);
     }
     catalog::stamp_full_sync();
@@ -155,14 +156,15 @@ fn sessions_impl() -> (Vec<SessionRef>, bool) {
 /// On a discover error the previous rows are kept (matching [`discover_all`]'s tolerance).
 fn refresh_harness(h: Harness) {
     let Some(a) = harness::for_harness(h) else { return };
-    let Some(root) = a.storage_root() else {
+    let roots = a.storage_roots();
+    if roots.is_empty() {
         // Root gone (harness uninstalled / dir deleted): its sessions vanish from the catalog.
         catalog::replace_harness(h, &[], &[]);
         return;
-    };
+    }
     match a.discover() {
         Ok(refs) => {
-            catalog::replace_harness(h, &refs, &catalog::watches_for(h, Some(&root), &refs));
+            catalog::replace_harness(h, &refs, &catalog::watches_for(h, &roots, &refs));
         }
         Err(e) => eprintln!("cv: discover failed for {h}: {e:#}"),
     }
@@ -362,6 +364,8 @@ pub fn workflow_of(r: &SessionRef, run_id: &str) -> Option<Workflow> {
 /// An exact id match always wins and returns immediately. Otherwise the id is treated as a prefix:
 /// a single prefix hit is returned, but *multiple* distinct prefix hits are an error rather than a
 /// silent "first one wins" — callers should disambiguate (e.g. by passing a longer id or a harness).
+/// When several files carry the same id (one session under two storage roots), the most recently
+/// updated one is returned.
 pub fn find(id: &str, harness: Option<Harness>) -> Result<Option<(SessionRef, Box<dyn Adapter>)>> {
     match find_inner(id, harness)? {
         (Some(hit), _) => Ok(Some(hit)),
@@ -448,22 +452,13 @@ type FoundSession = (SessionRef, Box<dyn Adapter>);
 fn find_inner(id: &str, harness: Option<Harness>) -> Result<(Option<FoundSession>, bool)> {
     // Fast path: the persisted catalog resolves the id without touching the fleet. We trust a row
     // only if its file still exists (a stale row — session deleted/moved — falls through to scan).
-    let cataloged = catalog::lookup(id, harness);
-    if !cataloged.is_empty() {
-        if let Some(r) = cataloged.iter().find(|r| r.id == id && r.path.exists()) {
-            if let Some(a) = harness::for_harness(r.harness) {
-                return Ok((Some((r.clone(), a)), false));
-            }
-        }
-        let live: Vec<&SessionRef> = cataloged.iter().filter(|r| r.path.exists()).collect();
-        match live.len() {
-            1 => {
-                if let Some(a) = harness::for_harness(live[0].harness) {
-                    return Ok((Some((live[0].clone(), a)), false));
-                }
-            }
-            n if n > 1 => return Err(ambiguous(id, live.into_iter())),
-            _ => {} // all stale → fall through to a fresh scan
+    let live: Vec<SessionRef> = catalog::lookup(id, harness)
+        .into_iter()
+        .filter(|r| r.path.exists())
+        .collect();
+    if let Some(r) = pick(live, id)? {
+        if let Some(a) = harness::for_harness(r.harness) {
+            return Ok((Some((r, a)), false));
         }
     }
 
@@ -480,34 +475,31 @@ fn resolve_id(
     id: &str,
     harness: Option<Harness>,
 ) -> Result<Option<(SessionRef, Box<dyn Adapter>)>> {
-    let mut prefix_hits: Vec<SessionRef> = Vec::new();
-    for r in refs {
-        if let Some(h) = harness {
-            if r.harness != h {
-                continue;
-            }
-        }
-        if !r.id.starts_with(id) {
-            continue;
-        }
+    let hits: Vec<SessionRef> = refs
+        .into_iter()
+        .filter(|r| harness.is_none_or(|h| r.harness == h) && r.id.starts_with(id))
         // Mirror the fast path: never return a session whose file has vanished (deleted between
         // the scan and now, or a stale probe-path catalog row). Stat only the id matches — cheap.
-        if !r.path.exists() {
-            continue;
-        }
-        if r.id == id {
-            let a = harness::for_harness(r.harness);
-            return Ok(a.map(|a| (r, a)));
-        }
-        prefix_hits.push(r);
+        .filter(|r| r.path.exists())
+        .collect();
+    Ok(pick(hits, id)?.and_then(|r| harness::for_harness(r.harness).map(|a| (r, a))))
+}
+
+/// Choose among the live sessions matching `id` — `find`'s matching contract, shared by the
+/// catalog and scan paths. An exact id beats a prefix. Several files can carry one session id (a
+/// Claude transcript copied into a second config dir and continued there, both under read roots):
+/// they resolve to the most recently updated copy rather than an arbitrary one. Prefix hits naming
+/// more than one distinct session are an error rather than a silent "first one wins".
+fn pick(mut hits: Vec<SessionRef>, id: &str) -> Result<Option<SessionRef>> {
+    hits.sort_by_key(|r| (r.id != id, std::cmp::Reverse(r.updated_at.or(r.created_at))));
+    if hits.first().is_some_and(|r| r.id == id) {
+        return Ok(hits.into_iter().next());
     }
-    match prefix_hits.len() {
-        0 => Ok(None),
-        1 => {
-            let r = prefix_hits.pop().unwrap();
-            Ok(harness::for_harness(r.harness).map(|a| (r, a)))
-        }
-        _ => Err(ambiguous(id, prefix_hits.iter())),
+    let mut seen = std::collections::HashSet::new();
+    hits.retain(|r| seen.insert((r.harness, r.id.clone())));
+    match hits.len() {
+        0 | 1 => Ok(hits.pop()),
+        _ => Err(ambiguous(id, hits.iter())),
     }
 }
 

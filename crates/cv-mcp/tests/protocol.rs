@@ -73,6 +73,9 @@ impl Server {
             .env("HOME", &home)
             .env("CV_BIN", &cv_bin)
             .env("CLUSTERVISION_HOME", &cv_home)
+            // Hermetic: an agent seat's own Claude config dir must not add its sessions here.
+            .env_remove("CLAUDE_CONFIG_DIR")
+            .env_remove("CLUSTERVISION_CLAUDE_ROOTS")
             .env_remove("CV_ENDPOINT") // hermetic: ambient identity must not leak into the tests
             .env("XDG_CACHE_HOME", home.join(".cache"))
             .env("XDG_CONFIG_HOME", home.join(".config"))

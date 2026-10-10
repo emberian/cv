@@ -41,6 +41,9 @@ impl World {
             .current_dir(&self.base)
             .env("HOME", &self.home)
             .env("CLUSTERVISION_HOME", &self.cv_home)
+            // Hermetic: an agent seat's own Claude config dir must not add its sessions here.
+            .env_remove("CLAUDE_CONFIG_DIR")
+            .env_remove("CLUSTERVISION_CLAUDE_ROOTS")
             .env("XDG_CACHE_HOME", self.home.join(".cache"))
             .env("XDG_CONFIG_HOME", self.home.join(".config"))
             .env("XDG_DATA_HOME", self.home.join(".local/share"))

@@ -636,6 +636,8 @@ fn saw_change_rejects_bare_sha_echo() {
     std::env::set_var("XDG_CONFIG_HOME", home.join(".config"));
     std::env::set_var("XDG_DATA_HOME", home.join(".local/share"));
     std::env::remove_var("CURSOR_USER_DIR");
+    std::env::remove_var("CLAUDE_CONFIG_DIR");
+    std::env::remove_var("CLUSTERVISION_CLAUDE_ROOTS");
 
     let review_sha = "a".repeat(40);
     let t = task_with_revision("/repo/proj", "task/demo", &review_sha);
@@ -673,6 +675,8 @@ fn saw_change_accepts_genuine_file_read() {
     std::env::set_var("XDG_CONFIG_HOME", home.join(".config"));
     std::env::set_var("XDG_DATA_HOME", home.join(".local/share"));
     std::env::remove_var("CURSOR_USER_DIR");
+    std::env::remove_var("CLAUDE_CONFIG_DIR");
+    std::env::remove_var("CLUSTERVISION_CLAUDE_ROOTS");
 
     let review_sha = "a".repeat(40);
     let t = task_with_revision("/repo/proj", "task/demo", &review_sha);
@@ -706,6 +710,8 @@ fn receipts_remain_a_heuristic_by_design() {
     std::env::set_var("XDG_CONFIG_HOME", home.join(".config"));
     std::env::set_var("XDG_DATA_HOME", home.join(".local/share"));
     std::env::remove_var("CURSOR_USER_DIR");
+    std::env::remove_var("CLAUDE_CONFIG_DIR");
+    std::env::remove_var("CLUSTERVISION_CLAUDE_ROOTS");
 
     let review_sha = "a".repeat(40);
     let t = task_with_revision("/repo/proj", "task/demo", &review_sha);

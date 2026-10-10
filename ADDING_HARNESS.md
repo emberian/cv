@@ -16,6 +16,7 @@ Every harness implements one trait ([`crates/cv-core/src/harness/mod.rs`](crates
 pub trait Adapter {
     fn harness(&self) -> Harness;
     fn storage_root(&self) -> Option<PathBuf>;   // where its sessions live ($HOME-relative); None = not installed
+    fn storage_roots(&self) -> Vec<PathBuf>;     // optional: every root, if it reads several (default: storage_root)
     fn discover(&self) -> Result<Vec<SessionRef>>; // cheap: list sessions w/ id, cwd, title, times, count
     fn parse(&self, r: &SessionRef) -> Result<Session>; // full: produce the IR
 }
