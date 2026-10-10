@@ -4,10 +4,17 @@ use serde_json::json;
 const SID: &str = "11111111-1111-4111-8111-111111111111";
 const SHA: &str = "63cef473b771e07a2b5060e50373a41a27d54c0e";
 
+/// A temp `projects/`-style dir named the way Claude files sessions launched from `/work/proj`.
 fn tmpdir() -> PathBuf {
-    let d = std::env::temp_dir().join(format!("cv-rewind-test-{}", uuid::Uuid::new_v4()));
+    let d = std::env::temp_dir()
+        .join(format!("cv-rewind-test-{}", uuid::Uuid::new_v4()))
+        .join("-work-proj");
     std::fs::create_dir_all(&d).unwrap();
     d
+}
+
+fn cleanup(dir: &Path) {
+    std::fs::remove_dir_all(dir.parent().unwrap()).ok();
 }
 
 fn write_jsonl(path: &Path, lines: &[Value]) {
@@ -183,7 +190,7 @@ fn cut_at_message_index_starts_at_the_last_boundary_before_it() {
     // Out of range is a clear error, not a silent clamp.
     let err = rewind_session(&sref(&src, SID), &opts(CutAt::Message(999), &dir.join("x"))).unwrap_err();
     assert!(err.to_string().contains("message(s)"), "{err}");
-    std::fs::remove_dir_all(&dir).ok();
+    cleanup(&dir);
 }
 
 #[test]
@@ -219,7 +226,7 @@ fn cut_at_commit_sha_lands_on_the_tool_result_that_made_it() {
     let msg = err.to_string();
     assert!(msg.contains("abcdef1234") && msg.contains("git commit"), "{msg}");
     assert!(!none.exists());
-    std::fs::remove_dir_all(&dir).ok();
+    cleanup(&dir);
 }
 
 #[test]
@@ -246,7 +253,7 @@ fn from_compaction_takes_the_preserved_segment_and_full_takes_everything() {
     .unwrap();
     assert_eq!((full.start_line, full.start_mode, full.boundary_msg_idx), (1, "full", None));
     assert_eq!(full.lines_written, 16);
-    std::fs::remove_dir_all(&dir).ok();
+    cleanup(&dir);
 }
 
 #[test]
@@ -261,7 +268,7 @@ fn a_cut_between_parallel_results_runs_on_until_the_calls_close() {
     let got = read_lines(&res.new_path);
     assert_eq!(uuids(&got).last(), Some(&"t2r"));
     assert!(res.warnings.is_empty(), "{:?}", res.warnings);
-    std::fs::remove_dir_all(&dir).ok();
+    cleanup(&dir);
 }
 
 #[test]
@@ -308,7 +315,7 @@ fn provenance_sidecar_records_source_cut_and_start_and_the_source_is_untouched()
     // An existing target is refused, never overwritten.
     let err = rewind_session(&sref(&src, SID), &opts(CutAt::End, &out)).unwrap_err();
     assert!(err.to_string().contains("already exists"), "{err}");
-    std::fs::remove_dir_all(&dir).ok();
+    cleanup(&dir);
 }
 
 #[test]
@@ -321,6 +328,7 @@ fn subagent_transcript_becomes_a_standalone_resumable_session() {
         let mut v = rec(ty, uuid, parent, message);
         v["isSidechain"] = json!(true);
         v["agentId"] = json!("abc123");
+        v["cwd"] = json!("/work/proj/wt"); // the sub-agent works in a worktree…
         v
     };
     write_jsonl(
@@ -353,6 +361,10 @@ fn subagent_transcript_becomes_a_standalone_resumable_session() {
     assert!(got.iter().all(|v| v["sessionId"] == "22222222-2222-4222-8222-222222222222"));
     // The whole transcript is one root chain the loader can walk to a null parent.
     assert_eq!(chain(&got), ["x3", "x2", "x1", "x0"]);
+    // …but resumes from the parent's launch dir, the one Claude files `-work-proj` under.
+    assert_eq!(res.cwd.as_deref(), Some("/work/proj"));
+    assert_eq!(res.cut_cwd.as_deref(), Some("/work/proj/wt"));
+    assert!(res.warnings.is_empty(), "{:?}", res.warnings);
     // And it reads back as an ordinary (non-sub-agent) session.
     let s = crate::harness::claude::parse_reader("n", BufReader::new(std::fs::File::open(&res.new_path).unwrap()), None);
     assert_eq!(s.messages.len(), 4);
@@ -368,7 +380,7 @@ fn subagent_transcript_becomes_a_standalone_resumable_session() {
     )
     .unwrap();
     assert_eq!(short.cut_line, 3);
-    std::fs::remove_dir_all(&dir).ok();
+    cleanup(&dir);
 }
 
 #[test]
@@ -382,7 +394,7 @@ fn commit_evidence_scans_only_sessions_that_mention_the_sha() {
     assert!(ev[0].byte_offset.is_none(), "plain lazy() streams carry no offsets");
     assert!(commit_evidence(&r, &["fedcba9876".into()]).unwrap().is_empty());
     assert!(commit_evidence(&r, &["not-a-sha".into()]).unwrap().is_empty());
-    std::fs::remove_dir_all(&dir).ok();
+    cleanup(&dir);
 }
 
 #[test]
@@ -396,7 +408,7 @@ fn file_mentions_finds_needles_across_chunk_boundaries() {
     body.extend_from_slice(b"9876543");
     std::fs::write(&p, &body).unwrap();
     assert_eq!(file_mentions(&p, &["abcdef1", "9876543", "1111111"]).unwrap(), [true, true, false]);
-    std::fs::remove_dir_all(&dir).ok();
+    cleanup(&dir);
 }
 
 #[test]

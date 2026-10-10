@@ -1167,7 +1167,7 @@ fn realpath_for_claude(cwd: &Path) -> PathBuf {
 }
 
 /// Encode a cwd into Claude's project-dir name: leading `-`, then every `/` and `.` becomes `-`.
-fn claude_encode_cwd(cwd: &Path) -> String {
+pub(crate) fn claude_encode_cwd(cwd: &Path) -> String {
     let s = cwd.to_string_lossy();
     // Strip a single leading '/' so the mandatory leading '-' isn't doubled.
     let s = s.strip_prefix('/').unwrap_or(&s);

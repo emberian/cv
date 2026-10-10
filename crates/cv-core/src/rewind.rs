@@ -373,8 +373,13 @@ pub struct RewindResult {
     pub omitted_lines: usize,
     pub omitted_bytes: u64,
     pub evidence: Option<CommitEvidence>,
-    /// The cwd the agent was in at the cut (from the last record carrying one).
+    /// Where to launch `claude --resume` from: the recorded cwd whose Claude project-dir encoding
+    /// is the dir the session belongs in (Claude looks a session up by the launch dir), else
+    /// `cut_cwd`.
     pub cwd: Option<String>,
+    /// The cwd the agent was working in at the cut (the last record carrying one) — often a
+    /// worktree it had `cd`'d into, which is not where it resumes from.
+    pub cut_cwd: Option<String>,
     pub warnings: Vec<String>,
     pub dry_run: bool,
 }
@@ -566,7 +571,7 @@ pub fn rewind_session(r: &SessionRef, opts: &RewindOptions) -> Result<RewindResu
     let mut open: HashSet<String> = HashSet::new();
     let mut closed = 0usize;
     let mut source_session_id: Option<String> = None;
-    let mut cwd: Option<String> = None;
+    let mut cwds: Vec<String> = Vec::new();
     #[derive(PartialEq)]
     enum Phase {
         Before,
@@ -622,7 +627,10 @@ pub fn rewind_session(r: &SessionRef, opts: &RewindOptions) -> Result<RewindResu
                 }
                 track_tool_calls(&v, &mut open, if phase == Phase::Closing { Some(&mut closed) } else { None });
                 if let Some(c) = v.get("cwd").and_then(Value::as_str) {
-                    cwd = Some(c.to_string());
+                    if cwds.last().map(String::as_str) != Some(c) {
+                        cwds.retain(|x| x != c);
+                        cwds.push(c.to_string());
+                    }
                 }
                 if modified {
                     let mut s = v.to_string().into_bytes();
@@ -660,7 +668,26 @@ pub fn rewind_session(r: &SessionRef, opts: &RewindOptions) -> Result<RewindResu
     }
     let source_sha256 = hasher.finish_hex();
 
+    // The launch dir: among the cwds the window recorded (plus the owning session's first one — a
+    // sub-agent's records may all sit in a worktree), the one Claude would file this session under.
+    let home = project_dir(&r.path);
+    let home_name = home.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string();
+    let owner = source_session_id
+        .as_deref()
+        .and_then(|sid| first_cwd(&home.join(format!("{sid}.jsonl"))));
+    let cut_cwd = cwds.last().cloned();
+    let launch = cwds
+        .iter()
+        .rev()
+        .cloned()
+        .chain(owner)
+        .find(|c| crate::emit::claude_encode_cwd(Path::new(c)) == home_name);
     let mut warnings = Vec::new();
+    if launch.is_none() && cut_cwd.is_some() {
+        warnings.push(format!(
+            "no recorded cwd maps to {home_name}; `claude --resume` from the cut's cwd may not find the session"
+        ));
+    }
     if !open.is_empty() {
         warnings.push(format!(
             "{} tool call(s) issued before the cut have no result in the rewind (the next turn began first)",
@@ -695,7 +722,8 @@ pub fn rewind_session(r: &SessionRef, opts: &RewindOptions) -> Result<RewindResu
         omitted_lines,
         omitted_bytes,
         evidence,
-        cwd,
+        cwd: launch.or_else(|| cut_cwd.clone()),
+        cut_cwd,
         warnings,
         dry_run: opts.dry_run,
     };
@@ -763,6 +791,15 @@ fn provenance(res: &RewindResult, opts: &RewindOptions) -> Value {
         },
         "derived_at": chrono::Utc::now().to_rfc3339(),
         "cv_version": opts.generator,
+    })
+}
+
+/// The first `cwd` a transcript records (within its first few hundred lines), if any.
+fn first_cwd(path: &Path) -> Option<String> {
+    let f = std::fs::File::open(path).ok()?;
+    BufReader::new(f).lines().take(500).map_while(Result::ok).find_map(|l| {
+        let v: Value = serde_json::from_str(&l).ok()?;
+        v.get("cwd").and_then(Value::as_str).map(String::from)
     })
 }
 

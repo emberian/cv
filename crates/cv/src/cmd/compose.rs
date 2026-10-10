@@ -336,6 +336,12 @@ pub(crate) fn cmd_rewind(
     for w in &res.warnings {
         eprintln!("  ⚠ {w}");
     }
+    if res.cut_cwd.is_some() && res.cut_cwd != res.cwd {
+        eprintln!(
+            "  at the cut the agent was working in {}",
+            res.cut_cwd.as_deref().unwrap_or_default()
+        );
+    }
     if !res.dry_run {
         eprintln!("  new session: {}", res.new_path.display());
         eprintln!("  provenance:  {}", res.provenance_path.display());
