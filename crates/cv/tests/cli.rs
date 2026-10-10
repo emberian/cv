@@ -1143,9 +1143,9 @@ fn error_paths_exit_nonzero_with_stderr() {
         ),
         // `query` only ever printed the field reference; that is `schema`.
         (&["query"], "cv schema"),
-        // `recall` / `distill` superseded by the one build-context verb.
+        // `recall` superseded by the one build-context verb. (`distill` was a 0.11 stub that pointed
+        // here too; the name now means `cv distill`, the transcript reshaper.)
         (&["recall", "zebrafish"], "cv pack <task>"),
-        (&["distill", "alphasess"], "cv pack <task>"),
         // Fetching a tool's output is a Read, not a prune option.
         (
             &["prune", "alphasess", "--retrieve", "t1"],
