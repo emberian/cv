@@ -36,7 +36,7 @@ The principle behind all of it: **one name, one meaning, no grammar to memorize.
 | Group | What they have in common | Commands |
 | --- | --- | --- |
 | **[Read](#read)** | read-only over existing sessions | [`ls`](#cv-ls) [`show`](#cv-show) [`cat`](#cv-cat) [`search`](#cv-search) [`events`](#cv-events) [`touched`](#cv-touched) [`tools`](#cv-tools) [`tree`](#cv-tree) [`workflow`](#cv-workflow) [`compaction`](#cv-compaction) [`prompts`](#cv-prompts) [`lanes`](#cv-lanes) [`deferrals`](#cv-deferrals) [`timeline`](#cv-timeline) [`stats`](#cv-stats) [`diff`](#cv-diff) [`blame`](#cv-blame) [`doctor`](#cv-doctor) |
-| **[Reshape](#reshape)** | produce a **new** session id from existing ones; the source is never touched | [`prune`](#cv-prune) [`splice`](#cv-splice) [`loom`](#cv-loom) [`port`](#cv-port) [`redact`](#cv-redact) [`resume`](#cv-resume) |
+| **[Reshape](#reshape)** | produce a **new** session id from existing ones; the source is never touched | [`prune`](#cv-prune) [`rewind`](#cv-rewind) [`splice`](#cv-splice) [`loom`](#cv-loom) [`port`](#cv-port) [`redact`](#cv-redact) [`resume`](#cv-resume) |
 | **[Export](#export)** | produce something that is *not* a session | [`export`](#cv-export) [`dataset`](#cv-dataset) [`pack`](#cv-pack) |
 | **[Fleet & live](#fleet--live)** | multi-agent coordination and live views | [`task`](#cv-task) [`board`](#cv-board) [`scry`](#cv-scry) [`share`](#cv-share) |
 | **[System](#system)** | cv's own state and reference | [`index`](#cv-index) [`config`](#cv-config) [`schema`](#cv-schema) [`formats`](#cv-formats) [`recipes`](#cv-recipes) |
@@ -57,10 +57,10 @@ An **ambiguous** prefix is never resolved by guessing: cv lists the candidates a
 
 | flag | meaning | on |
 | --- | --- | --- |
-| `--harness <h>` | filter to, or target, one harness — never spelled `--to` | `ls` `show` `cat` `search` `events` `tools` `tree` `workflow` `compaction` `timeline` `diff` `doctor` `prune` `splice` `loom` `port` `redact` `resume` `export` `dataset` `pack` `scry` `share` |
+| `--harness <h>` | filter to, or target, one harness — never spelled `--to` | `ls` `show` `cat` `search` `events` `tools` `tree` `workflow` `compaction` `timeline` `diff` `doctor` `prune` `rewind` `splice` `loom` `port` `redact` `resume` `export` `dataset` `pack` `scry` `share` |
 | `--cwd <dir>` | a working directory: a filter when reading, the new home when reshaping | `ls` `timeline` `splice` `loom` `port` `scry` |
-| `--out <dir\|file>` | write somewhere other than the real store | `splice` `loom` `port` `dataset` `pack` `share` |
-| `--json` | machine output | `ls` `show` `search` `events` `touched` `tools` `workflow` `compaction` `timeline` `stats` `doctor` `prune` `schema` `task list/show/inbox/debt/stats` `board read/unanswered` |
+| `--out <dir\|file>` | write somewhere other than the real store | `rewind` `splice` `loom` `port` `dataset` `pack` `share` |
+| `--json` | machine output | `ls` `show` `search` `events` `touched` `tools` `workflow` `compaction` `timeline` `stats` `doctor` `prune` `rewind` `schema` `task list/show/inbox/debt/stats` `board read/unanswered` |
 | `--limit <n>` | how many rows/records | `ls` `search` `timeline` `dataset` `pack` `board read` |
 | `--fresh` | bypass the catalog and re-discover | `ls` |
 | `--all` | include what is hidden by default | `task list` `task verify` |
@@ -510,6 +510,17 @@ cv blame src/ir.rs --show                 # print the conversation around the be
 
 Each matched commit prints the session, the message index of the nearest edit, and a copy-pasteable `cv show <id> --range A..B` centered on it. Time-correlation is honest about its limits: rebases and squashes shift commit times away from the edits that produced them, so matches are ranked, not asserted. Run [`cv index`](#cv-index) first to ingest events.
 
+Some matches are not heuristic. When a candidate session ran the commit itself through a tool — a `git commit` (or `merge`, `cherry-pick`, `revert`) whose output names the sha, or a `git push` that does — blame reads that straight out of the transcript and ranks it above every timed match, labeled `exact: commit created here` (or `exact: commit pushed here`). That line also carries a [`cv rewind`](#cv-rewind) hint, which resumes that agent as it was at the moment of the commit:
+
+```text
+◆ 63cef47 2026-10-09  gate plan: an undeclared linked worktree names its repository's project …
+  claude   fc3b7de4  2026-10-09  "Meta-claude project lead manager"  commit at msg 179078 (exact: commit created here)
+    ↳ cv rewind fc3b7de4 --at 63cef47
+    ↳ cv show fc3b7de4 --range 179075..179081
+```
+
+The candidates are the sessions with an edit on the file (plus, for sub-agents cataloged by `cv index --subagents`, the session that spawned them) whose transcript was written to after the commit; a session that committed without ever editing the file through a tool is not scanned. The scan reads the transcripts themselves, so it doesn't need a fresh index — only the candidate list comes from the catalog. A rebased or cherry-picked commit has a sha no session ever printed, and a commit made with silenced output (`-q` and no `rev-parse`) leaves no proof.
+
 ### `cv doctor`
 
 Why does this session's context keep filling up? `cv doctor` attributes context pressure by source, sizes the fixed system+tools overhead from recorded token usage, and pairs it with compaction frequency.
@@ -545,7 +556,7 @@ The fixed overhead is *sized*, not itemized, and the report says so: the transcr
 
 ## Reshape
 
-Six commands that produce a **new** session id from existing ones. The source session is never modified — not by `prune`, not by `port`, not by anything. (`resume` is the odd one out: it launches an existing session rather than making a new one, but it belongs with the "get me back into this" verbs.)
+Seven commands that produce a **new** session id from existing ones. The source session is never modified — not by `prune`, not by `port`, not by anything. (`resume` is the odd one out: it launches an existing session rather than making a new one, but it belongs with the "get me back into this" verbs.)
 
 ### `cv prune`
 
@@ -583,6 +594,31 @@ cv cat <new-id> toolu_abc123                       # fetch a stashed original ba
 
 Claude Code only for now (it operates on the raw JSONL to stay byte-faithful).
 
+### `cv rewind`
+
+Reconstruct an agent **as it was at a past moment** — a message, or the commit it landed — as a new, resumable Claude Code session. The use case is review by the author: when one agent changes code another session wrote, resume the writer *as of the moment it committed that code* and ask it to review the change. `claude --resume` alone can't do that — it loads the session's current tail, after every later compaction — and most writers are sub-agents, whose transcripts can't be resumed at all.
+
+```sh
+cv rewind fc3b7de4 --at 63cef47              # through the tool result that shows that commit being made
+cv rewind fc3b7de4 --at 179078               # through message 179078 (as `cv show --range` counts)
+cv rewind fc3b7de4 --at 63cef47 --full       # from the first record, not the last compaction
+cv rewind agent-a7f5742c50c0b9654            # a sub-agent, extracted as a standalone session
+cv rewind fc3b7de4 --agent a7f57 --at 9f00ba5
+cv rewind fc3b7de4 --at 63cef47 --dry-run --json
+
+claude --resume <new-id> --fork-session -p "Another agent changed the code you just landed. Review its diff: …"
+```
+
+- `--at <MSG_IDX|SHA>` — the cut, inclusive. A message index, or a commit sha (7+ hex digits; an all-digit value is an index): the cut is the tool result whose `git commit`/`git push` output names that sha, and `cv rewind` fails with an explanation if no tool result does. Omit it for the last message. If the cut leaves parallel tool calls open, the copy runs on to their results (they happened at the same moment; the API rejects a call with no result) and stops at the next turn.
+- `--from-compaction` (default) / `--full` — where the new session starts. By default at the last compaction boundary before the cut — exactly the context the agent had, since a resume loads from the last boundary anyway — moved back to the boundary's preserved segment when partial compaction kept recent messages verbatim. On a month-long session that is the difference between one window (8k lines) and 900 MB. `--full` starts at the first record.
+- `--agent <id>` — rewind a sub-agent of `<id>` (resolved like `cv show --agent`). A sub-agent can also be named directly (`agent-<id>`) or by its transcript path. Its records carry the parent's session id and `isSidechain: true`; the rewind gives them their own id, `isSidechain: false`, drops `agentId`, and writes the session to the parent's project dir — a standalone top-level session.
+- `--out <dir>` — write somewhere other than the source's project dir. `claude --resume` only finds a session in the project dir of the directory it's launched from, so cv says where to copy it.
+- `--to <id>` — the new session id (default: a fresh UUID). `--dry-run` — report the window without writing. `--json` — the result as one JSON object on stdout (`source_*`, `new_id`/`new_path`/`provenance_path`, `cut_msg_idx`/`cut_line`, `start_msg_idx`/`start_line`/`boundary_msg_idx`/`preserved_head`, `end_line`, `closed_tool_calls`, `lines_written`, `omitted_lines`, `evidence`, `cwd`/`cut_cwd`, `resume`, `warnings`); dry-run honest like `prune --json`.
+
+The derived session is the source's raw records `[start, cut]` with every `sessionId` rewritten and `parentUuid` chains untouched, so everything Claude-specific survives. Next to it goes `<new-id>.rewind.json`, the provenance: source id, path, bytes and sha256 (of the prefix read — a live transcript keeps growing), the cut and start (message index, byte offset, line), the commit evidence, how many lines of the source come after the cut, when, and which cv. The resume line `cd`s to the directory Claude files the session under (the launch dir), which is not always where the agent was working at the cut — cv prints both.
+
+Claude Code only (it copies raw records). The source is never modified.
+
 ### `cv splice`
 
 Stitch a new session together from spans of existing ones. Each spec is `<id>:A..B`, `<id>:A..` (through the last), `<id>:..B`, or just `<id>` (the whole session). Indices are 0-based and end-exclusive, and `<id>` may be `harness:id`.
@@ -603,6 +639,8 @@ cv splice da9174f4:0..20 4f2a0c11:50.. --generate
   ↳ claude da9174f4[0..20]
   ↳ claude 4f2a0c11[50..91]
 ```
+
+A span may come from a sub-agent (`agent-<id>`): it joins the new session's main thread, shedding the sidechain markers that would make Claude skip it.
 
 Without `--harness` or `--out`, splice composes in memory and prints a summary; add `--export md|json` to dump the result. With `--harness`/`--out` it materializes the session for a harness.
 
