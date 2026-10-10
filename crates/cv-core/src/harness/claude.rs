@@ -409,7 +409,10 @@ fn ingest_value(
                 }
             }
             return match parse_attachment_message(v, opts, span) {
-                Some(m) => sink.message(m),
+                Some(mut m) => {
+                    stamp_offset(&mut m, opts, span);
+                    sink.message(m)
+                }
                 None => carry_or_skip(v, opts, sink),
             };
         }
@@ -463,14 +466,7 @@ fn ingest_value(
     }
 
     if let Some(mut msg) = parse_message(ty, v, opts, span) {
-        // Offset-recording pass: stamp the record's byte offset so `cv index` can persist a seek
-        // point for this message (see [`crate::offsets`]). Requires the on-disk span path (`span`
-        // carries the offset); ordinary lazy/bulk/full streams never set `opts.offsets`.
-        if opts.offsets {
-            if let Some(ctx) = span {
-                msg.extra.insert(crate::offsets::OFFSET_KEY.into(), ctx.base_off.into());
-            }
-        }
+        stamp_offset(&mut msg, opts, span);
         // A synthetic notice (`model: "<synthetic>"`, kept only under `complete`) never names the model.
         if session.model.is_none() && msg.model.as_deref() != Some(SYNTHETIC_MODEL) {
             session.model = msg.model.clone();
@@ -485,6 +481,19 @@ fn ingest_value(
         return sink.message(msg);
     }
     Flow::Continue
+}
+
+/// Offset-recording pass: stamp the record's byte offset so `cv index` can persist a seek point for
+/// this message (see [`crate::offsets`]) and `cv rewind` can map a message to its record. Requires
+/// the on-disk span path (`span` carries the offset); ordinary lazy/bulk/full streams never set
+/// `opts.offsets`. EVERY message-producing record must call this — one unstamped message (a
+/// rendered attachment, before this was shared) makes the whole session unseekable.
+fn stamp_offset(msg: &mut Message, opts: &ParseOptions, span: Option<&SpanCtx>) {
+    if opts.offsets {
+        if let Some(ctx) = span {
+            msg.extra.insert(crate::offsets::OFFSET_KEY.into(), ctx.base_off.into());
+        }
+    }
 }
 
 /// A non-conversational meta record (mode/attachment/queue-operation/hook telemetry/ai-title/…)
@@ -2735,6 +2744,9 @@ mod tests {
                 {"type":"tool_result","tool_use_id":"t1","content":big,"is_error":false}]}}),
             serde_json::json!({"type":"system","subtype":"away_summary","uuid":"s3",
                 "content":"came back"}),
+            // A model-visible attachment (hook output) is a message too — and must be stamped.
+            serde_json::json!({"type":"attachment","uuid":"h3","attachment":{"type":"hook_success"},
+                "rendered":[{"content":"hook said hi"}]}),
             serde_json::json!({"type":"user","uuid":"u4","message":{"role":"user","content":"second question"}}),
             serde_json::json!({"type":"assistant","uuid":"a5","message":{"role":"assistant",
                 "model":"claude-test-1","content":[{"type":"text","text":"answer two"}]}}),
@@ -2758,7 +2770,7 @@ mod tests {
             &mut full,
         );
         let full = full.messages;
-        assert_eq!(full.len(), 6); // user, assistant, tool, system, user, assistant
+        assert_eq!(full.len(), 7); // user, assistant, tool, system, attachment, user, assistant
         let offs: Vec<u64> = full
             .iter()
             .map(|m| {

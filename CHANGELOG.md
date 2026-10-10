@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- **`cv rewind`** — an agent as of a past moment, resumable. `cv rewind <id> --at <MSG_IDX|SHA>`
+  copies the source's raw records from the last compaction before the cut (moved back to the
+  boundary's preserved segment; `--full` from the top) through the cut into a new session id,
+  `parentUuid` chains intact, plus a `<new-id>.rewind.json` provenance sidecar (source bytes +
+  sha256, cut, start, omitted tail, cv version). A sha resolves to the tool result whose `git
+  commit`/`git push` output names it; open parallel calls at the cut run on to their results.
+  Sub-agent transcripts (`agent-<id>`, `--agent`, or a path) come out as standalone top-level
+  sessions in the parent's project dir. The resume line uses the launch dir Claude files the
+  session under. Streams: a 0.9 GB session rewinds in ~13 s at ~37 MB RSS.
+- **`cv blame` exact evidence** — a candidate session whose own tool output shows the commit
+  being made (or pushed) ranks above every time-window match as `exact: commit created here`,
+  with a `cv rewind <id> --at <sha>` hint. Read from the transcripts (byte prefilter, then the
+  stream), so it needs no fresh index; sub-agent edit rows now bring their parent session along
+  as a candidate.
+- **`cv splice` of a sub-agent span** joins the new main thread: the `isSidechain`/`agentId`
+  markers that made Claude skip the emitted records are dropped.
+- **Seekable real Claude transcripts** — rendered-attachment messages were never stamped with
+  their byte offset under `lazy_offsets`, so any session with one (current Claude Code writes
+  them constantly) recorded no seek row and `cv show --range` fell back to a full stream.
+- `cv_core::digest::Sha256` — the vendored SHA-256, now incremental.
 - **Devin CLI (Cognition) parses** — `~/.local/share/devin/cli/sessions.db` (refinery schema 17, cli
   3000.11.3), read-only and PRAGMA-probed like the other SQLite stores. `message_nodes` is a
   *forest* — every context rebuild rewrites the transcript as a fresh chain of copies — so the

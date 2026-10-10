@@ -16,17 +16,34 @@
 //! by its repo-relative suffix (`target` ends with `/<rel>`), because a session may have edited
 //! the same file in a worktree or an older clone at a different path.
 //!
+//! ## Exact evidence
+//!
+//! Time is a heuristic; a session that *ran the commit* through a tool left proof. Every candidate
+//! session — each one with an edit on the file, plus the parent of each sub-agent among them (the
+//! orchestrator often commits what its agents wrote) — whose transcript was still being written
+//! when the commit landed is scanned for a `git commit`/`merge`/`cherry-pick`/`revert` (or `git
+//! push`) tool result naming the commit's sha ([`cv_core::rewind::commit_evidence`]). A match
+//! outranks every timed one, is labeled `exact: commit created here` (or `… pushed here`), and
+//! carries the `cv rewind <id> --at <sha>` hint that resumes that agent as it was at that moment.
+//! The scan reads the transcripts themselves (a byte prefilter skips the ones that never mention
+//! the sha), so it doesn't depend on the index being fresh — only the candidate list does.
+//!
 //! ## Honest limits
 //!
 //! * Time correlation breaks under rebases, squash-merges, and cherry-picks: the rewritten
 //!   commit's committer time can land hours or days after the edit, outside the window. The
-//!   session still shows in `cv touched`; it just won't be pinned to the rewritten commit.
+//!   session still shows in `cv touched`; it just won't be pinned to the rewritten commit. Exact
+//!   evidence breaks the same way — the rewritten sha was never printed by any session.
 //! * Clock skew between the machine that recorded the session and the one that committed shifts
 //!   deltas; the 6-hour pre-window absorbs most of it, but this is a heuristic, not proof.
 //! * `git log --follow` tracks renames only as well as git's similarity detection does, and
 //!   events recorded against a file's *old* name don't suffix-match its new one.
 //! * Several sessions often overlap one commit (a swarm in one working tree). We print the best
 //!   few, closest-first — provenance candidates, not a verdict.
+//! * Exact evidence needs the committing session among the candidates: one that committed without
+//!   ever editing the file through a tool (and isn't the parent of a sub-agent that did — sub-agent
+//!   edits are cataloged only by `cv index --subagents`) isn't scanned. A commit made outside any
+//!   tool call (by a human, a hook) or with silenced output (`-q`, no `rev-parse`) leaves no proof.
 //!
 //! `msg_idx` in the catalog counts messages in adapter stream order — the same counting `cv show
 //! --range` does (both index every message the adapter streams, regardless of parse options), so
@@ -41,6 +58,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use cv_core::events::{self, EditEvent};
 use cv_core::ir::{truncate, Harness};
+use cv_core::rewind::{CommitEvidence, CommitEvidenceSink, EvidenceKind};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -62,6 +80,8 @@ const RANGE_CONTEXT: i64 = 3;
 /// One commit that touched the file, as far as blame cares.
 #[derive(Debug, Clone)]
 struct CommitInfo {
+    /// The full sha (what exact evidence is matched against).
+    sha: String,
     short: String,
     /// Committer time, unix seconds (what the correlation window keys on).
     time: i64,
@@ -117,11 +137,12 @@ fn file_commits(root: &Path, rel: &str) -> Result<Vec<CommitInfo>> {
     let mut commits = Vec::new();
     for line in out.lines() {
         let mut f = line.split('\u{1f}');
-        let (Some(_sha), Some(ct), Some(short), summary) = (f.next(), f.next(), f.next(), f.next()) else {
+        let (Some(sha), Some(ct), Some(short), summary) = (f.next(), f.next(), f.next(), f.next()) else {
             continue;
         };
         let Ok(time) = ct.parse::<i64>() else { continue };
         commits.push(CommitInfo {
+            sha: sha.to_string(),
             short: short.to_string(),
             time,
             summary: summary.unwrap_or("").to_string(),
@@ -175,6 +196,7 @@ fn line_commits(root: &Path, rel: &str, lo: u32, hi: u32) -> Result<Vec<CommitIn
                 short: sha.chars().take(7).collect(),
                 time: m.committer_time.or(m.author_time).unwrap_or(0),
                 summary: m.summary.unwrap_or_default(),
+                sha,
             }
         })
         .collect();
@@ -288,6 +310,60 @@ fn cwd_in_repo(cwd: Option<&str>, root: &Path) -> bool {
     cwd.map(Path::new).is_some_and(|c| c.starts_with(root))
 }
 
+/// One session whose own tool output shows a commit being made (or pushed) — the exact tier.
+#[derive(Debug, Clone)]
+pub(crate) struct ExactMatch {
+    pub harness: String,
+    pub session_id: String,
+    pub title: Option<String>,
+    pub evidence: CommitEvidence,
+}
+
+/// One line under a commit, in print order.
+#[derive(Debug)]
+pub(crate) enum Ranked<'a> {
+    Exact(&'a ExactMatch),
+    Timed(SessionMatch),
+}
+
+/// THE ranking under one commit: exact evidence for its sha first (created before pushed, then
+/// earliest), then the [`correlate`] matches of sessions not already proven, in their own order.
+/// One line per session.
+pub(crate) fn rank_commit<'a>(
+    sha: &str,
+    exact: &'a [ExactMatch],
+    timed: Vec<SessionMatch>,
+    edits: &[EditEvent],
+) -> Vec<Ranked<'a>> {
+    let mut proven: Vec<&ExactMatch> = exact
+        .iter()
+        .filter(|x| cv_core::rewind::output_names_sha(&x.evidence.sha, &sha.to_ascii_lowercase()))
+        .collect();
+    proven.sort_by_key(|x| {
+        (
+            x.evidence.kind != EvidenceKind::Created,
+            x.evidence.ts,
+            x.evidence.msg_idx,
+        )
+    });
+    let mut seen: Vec<(&str, &str)> = Vec::new();
+    let mut out: Vec<Ranked<'a>> = Vec::new();
+    for x in proven {
+        let key = (x.harness.as_str(), x.session_id.as_str());
+        if !seen.contains(&key) {
+            seen.push(key);
+            out.push(Ranked::Exact(x));
+        }
+    }
+    for m in timed {
+        let e = &edits[m.event];
+        if !seen.contains(&(e.harness.as_str(), e.session_id.as_str())) {
+            out.push(Ranked::Timed(m));
+        }
+    }
+    out
+}
+
 /// The repo-relative suffix rule [`cv_core::events::edits_touching_file`]'s SQL implements, as a
 /// pure function so the rule itself is unit-testable: a recorded target names this file when it
 /// equals the current absolute path, equals the bare relative path, or ends with `/<rel>` (the
@@ -359,24 +435,34 @@ pub fn cmd_blame(file: &str, lines: Option<&str>, show: bool) -> Result<()> {
         }
     }
 
+    // The exact tier: candidate sessions whose own tool output shows one of these commits made.
+    let exact = exact_matches(&commits, &edits);
+
     // Newest first: each commit, with its best-matched sessions.
     let mut matched_commits = 0usize;
     let mut best_overall: Option<(String, String, i64)> = None; // (harness, session_id, msg_idx)
     for c in &commits {
         println!("◆ {} {}  {}", c.short, date(c.time), c.summary);
-        let matches = correlate(c.time, &edits, &root);
-        if matches.is_empty() {
+        let ranked = rank_commit(&c.sha, &exact, correlate(c.time, &edits, &root), &edits);
+        if ranked.is_empty() {
             println!("  (no agent session found)");
             continue;
         }
         matched_commits += 1;
-        for m in matches.iter().take(MATCHES_PER_COMMIT) {
-            let e = &edits[m.event];
-            print_match(e, m);
+        for r in ranked.iter().take(MATCHES_PER_COMMIT) {
+            let best = match r {
+                Ranked::Exact(x) => {
+                    print_exact(x, c);
+                    (x.harness.clone(), x.session_id.clone(), x.evidence.msg_idx as i64)
+                }
+                Ranked::Timed(m) => {
+                    let e = &edits[m.event];
+                    print_match(e, m);
+                    (e.harness.clone(), e.session_id.clone(), e.msg_idx)
+                }
+            };
             // Best overall = the top match of the newest commit that matched anything.
-            if best_overall.is_none() {
-                best_overall = Some((e.harness.clone(), e.session_id.clone(), e.msg_idx));
-            }
+            best_overall.get_or_insert(best);
         }
     }
 
@@ -419,6 +505,101 @@ fn print_match(e: &EditEvent, m: &SessionMatch) {
     );
     let (s, end) = range_hint(e.msg_idx);
     println!("    ↳ cv show {} --range {s}..{end}", crate::short_id(&e.session_id));
+}
+
+/// An exact-evidence line: the session, where the commit output landed, the label — and the
+/// `cv rewind` hint that resumes that agent as of that moment, plus the usual `cv show` window.
+fn print_exact(x: &ExactMatch, c: &CommitInfo) {
+    let date = x.evidence.ts.map(date).unwrap_or_else(|| "----------".into());
+    let title = x
+        .title
+        .as_deref()
+        .map(|t| format!("\"{}\"  ", truncate(t, 48)))
+        .unwrap_or_default();
+    println!(
+        "  {:8} {}  {}  {}commit at msg {} ({})",
+        x.harness,
+        crate::short_id(&x.session_id),
+        date,
+        title,
+        x.evidence.msg_idx,
+        x.evidence.kind.label(),
+    );
+    let id = hint_id(&x.session_id);
+    println!("    ↳ cv rewind {id} --at {}", c.short);
+    let (s, end) = range_hint(x.evidence.msg_idx as i64);
+    println!("    ↳ cv show {id} --range {s}..{end}");
+}
+
+/// The id a copy-pasteable hint uses: the short prefix, except for a sub-agent (`agent-…`), whose
+/// 8-char prefix would almost never be unique.
+fn hint_id(id: &str) -> String {
+    if id.starts_with("agent-") {
+        id.to_string()
+    } else {
+        crate::short_id(id)
+    }
+}
+
+/// The sessions the exact tier scans, deduplicated in first-seen order: every session with an edit
+/// on the file, and the parent of each sub-agent among them (a sub-agent's parent is a Claude
+/// session — the orchestrator that often commits what its agents wrote).
+pub(crate) fn candidate_ids(edits: &[EditEvent]) -> Vec<(String, String)> {
+    let mut ids: Vec<(String, String)> = Vec::new();
+    for e in edits {
+        for (h, id) in std::iter::once((e.harness.as_str(), e.session_id.as_str()))
+            .chain(e.parent_id.as_deref().map(|p| ("claude", p)))
+        {
+            if !ids.iter().any(|(a, b)| a == h && b == id) {
+                ids.push((h.to_string(), id.to_string()));
+            }
+        }
+    }
+    ids
+}
+
+/// The exact tier for `commits` (see the module docs): candidates are the sessions with an edit on
+/// the file plus the parents of sub-agents among them, kept only if their transcript was written
+/// to after the earliest commit landed; each is scanned for tool output naming a commit's sha.
+fn exact_matches(commits: &[CommitInfo], edits: &[EditEvent]) -> Vec<ExactMatch> {
+    let Some(earliest) = commits.iter().map(|c| c.time).min() else {
+        return Vec::new();
+    };
+    let ids = candidate_ids(edits);
+    let mut titles: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for e in edits {
+        if let Some(t) = &e.title {
+            titles.entry(e.session_id.clone()).or_insert_with(|| t.clone());
+        }
+    }
+    let written_since = |p: &Path| {
+        std::fs::metadata(p)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .is_some_and(|d| d.as_secs() as i64 + WINDOW_AFTER_SECS >= earliest)
+    };
+    let refs: Vec<cv_core::ir::SessionRef> = ids
+        .iter()
+        .filter_map(|(h, id)| cv_core::find_cheap(id, Harness::parse(h)).ok().flatten())
+        .map(|(r, _)| r)
+        .filter(|r| written_since(&r.path))
+        .collect();
+    let shas: Vec<String> = commits.iter().map(|c| c.sha.clone()).collect();
+    let mut out = Vec::new();
+    for (r, found) in cv_core::rewind::commit_evidence_many(refs, &shas) {
+        for sha in &shas {
+            if let Some(ev) = CommitEvidenceSink::best(&found, &sha.to_ascii_lowercase()) {
+                out.push(ExactMatch {
+                    harness: r.harness.as_str().to_string(),
+                    title: titles.get(&r.id).cloned().or_else(|| r.title.clone()),
+                    session_id: r.id.clone(),
+                    evidence: ev,
+                });
+            }
+        }
+    }
+    out
 }
 
 /// `--show`: render the conversation window around the best match's edit, through the exact
@@ -577,6 +758,7 @@ mod tests {
             cwd: cwd.map(Into::into),
             created_at: span.map(|(c, _)| c),
             updated_at: span.map(|(_, u)| u),
+            parent_id: None,
         }
     }
 
@@ -658,6 +840,79 @@ mod tests {
         let m = correlate(T, &edits, &root());
         assert_eq!(m.len(), 1);
         assert_eq!(edits[m[0].event].msg_idx, 42);
+    }
+
+    fn exact(sid: &str, sha: &str, kind: EvidenceKind, msg_idx: usize) -> ExactMatch {
+        ExactMatch {
+            harness: "claude".into(),
+            session_id: sid.into(),
+            title: None,
+            evidence: CommitEvidence {
+                sha: sha.into(),
+                kind,
+                msg_idx,
+                ts: Some(T),
+                tool_use_id: "toolu_x".into(),
+                command: "git commit -m x".into(),
+                byte_offset: None,
+            },
+        }
+    }
+
+    #[test]
+    fn exact_evidence_ranks_above_every_timed_match() {
+        const SHA: &str = "63cef473b771e07a2b5060e50373a41a27d54c0e";
+        let edits = vec![
+            ev("near", 9, Some(T - 60), Some("/repo"), None),
+            ev("keeper", 3, Some(T - 5 * 3600), Some("/repo"), None),
+            ev("pusher", 4, Some(T - 120), Some("/repo"), None),
+        ];
+        let exact = vec![
+            exact("pusher", SHA, EvidenceKind::Pushed, 40),
+            exact("keeper", SHA, EvidenceKind::Created, 12),
+            exact(
+                "other-commit",
+                "0123456789abcdef0123456789abcdef01234567",
+                EvidenceKind::Created,
+                1,
+            ),
+        ];
+        let ranked = rank_commit(SHA, &exact, correlate(T, &edits, &root()), &edits);
+        let order: Vec<(&str, &str)> = ranked
+            .iter()
+            .map(|r| match r {
+                Ranked::Exact(x) => (x.session_id.as_str(), "exact"),
+                Ranked::Timed(m) => (edits[m.event].session_id.as_str(), "timed"),
+            })
+            .collect();
+        // Created beats pushed beats the 1-minute timed match; the keeper's own 5h-old timed
+        // match is folded into its exact line, and another commit's evidence never shows.
+        assert_eq!(order, [("keeper", "exact"), ("pusher", "exact"), ("near", "timed")]);
+        // No evidence for a commit → exactly the timed ranking, untouched.
+        let plain = rank_commit(
+            "ffffffffffffffffffffffffffffffffffffffff",
+            &exact,
+            correlate(T, &edits, &root()),
+            &edits,
+        );
+        assert_eq!(plain.len(), 3);
+        assert!(plain.iter().all(|r| matches!(r, Ranked::Timed(_))));
+    }
+
+    #[test]
+    fn candidates_include_each_subagents_parent_once() {
+        let mut sub = ev("agent-a7f5", 2, Some(T), None, None);
+        sub.parent_id = Some("orchestrator".into());
+        let mut sub2 = ev("agent-b8e6", 5, Some(T), None, None);
+        sub2.parent_id = Some("orchestrator".into());
+        let edits = vec![
+            ev("solo", 1, Some(T), None, None),
+            sub,
+            ev("solo", 9, Some(T), None, None),
+            sub2,
+        ];
+        let ids: Vec<String> = candidate_ids(&edits).into_iter().map(|(_, id)| id).collect();
+        assert_eq!(ids, ["solo", "agent-a7f5", "orchestrator", "agent-b8e6"]);
     }
 
     #[test]

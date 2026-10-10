@@ -180,7 +180,7 @@ struct SidecarEntry {
 
 /// Sub-agent (Task tool) lines carry `isSidechain: true`; their usage belongs to the sub-agent's
 /// own context window, not the main thread's.
-fn is_sidechain(v: &Value) -> bool {
+pub(crate) fn is_sidechain(v: &Value) -> bool {
     v.get("isSidechain").and_then(Value::as_bool).unwrap_or(false)
 }
 
@@ -188,7 +188,7 @@ fn is_sidechain(v: &Value) -> bool {
 /// turn, `None` for everything else — bookkeeping records, sidechain (sub-agent) lines, and Claude
 /// Code's synthetic assistant notices (see [`is_synthetic_assistant`]), which are never sent to the
 /// API and must not shift turn indices or eat `--keep-last` budget.
-fn turn_kind(v: &Value) -> Option<bool> {
+pub(crate) fn turn_kind(v: &Value) -> Option<bool> {
     if is_sidechain(v) {
         return None;
     }
@@ -462,15 +462,7 @@ pub fn prune_session(src_path: &Path, opts: &PruneOptions) -> Result<PruneResult
             continue;
         };
 
-        // Stamp the new session id on every line that carries one — Claude Code writes both
-        // spellings (`sessionId` on every record, `session_id` on most since ~2.1.25x).
-        let mut had_session_id = false;
-        for key in ["sessionId", "session_id"] {
-            if v.get(key).is_some() {
-                v[key] = Value::String(new_id.clone());
-                had_session_id = true;
-            }
-        }
+        let had_session_id = stamp_session_id(&mut v, &new_id);
 
         let ty = v.get("type").and_then(Value::as_str).unwrap_or("");
         let is_turn_line = ty == "user" || ty == "assistant";
@@ -1214,8 +1206,23 @@ pub fn retrieve(sidecar_path: &Path, id: &str) -> Result<Value> {
 
 // ── helpers ───────────────────────────────────────────────────────────────
 
-fn new_uuid() -> String {
+pub(crate) fn new_uuid() -> String {
     uuid::Uuid::new_v4().to_string()
+}
+
+/// Stamp `new_id` on a record that carries a session id — Claude Code writes both spellings
+/// (`sessionId` on every record, `session_id` on most since ~2.1.25x). Returns whether the record
+/// had one (and so must be re-serialized). Shared with [`crate::rewind`], which derives sessions
+/// from the same raw records.
+pub(crate) fn stamp_session_id(v: &mut Value, new_id: &str) -> bool {
+    let mut had = false;
+    for key in ["sessionId", "session_id"] {
+        if v.get(key).is_some() {
+            v[key] = Value::String(new_id.to_string());
+            had = true;
+        }
+    }
+    had
 }
 
 fn build_tool_name_map(parsed: &[Option<Value>]) -> HashMap<String, (String, Value)> {

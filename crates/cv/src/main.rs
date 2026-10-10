@@ -86,7 +86,10 @@ pub(crate) const GROUPS: &[(&str, &[&str])] = &[
             "doctor",
         ],
     ),
-    ("Reshape", &["prune", "splice", "loom", "port", "redact", "resume"]),
+    (
+        "Reshape",
+        &["prune", "rewind", "splice", "loom", "port", "redact", "resume"],
+    ),
     ("Export", &["export", "dataset", "pack"]),
     ("Fleet & live", &["task", "board", "scry", "share"]),
     ("System", &["index", "config", "schema", "formats", "recipes"]),
@@ -441,15 +444,18 @@ enum Cmd {
     /// Code provenance: which agent session wrote this code, and what was it thinking?
     ///
     /// Correlates the file's git history with the event catalog's file_edit events — an agent
-    /// edit shortly before a commit is strong evidence that session authored it. Each matched
-    /// commit gets its best sessions plus a `cv show --range` hint into the conversation around
-    /// the edit. Run `cv index` first to ingest events.
+    /// edit shortly before a commit is strong evidence that session authored it. A session whose
+    /// own tool output shows the commit being made ranks above all of those as `exact: commit
+    /// created here`, with a `cv rewind <id> --at <sha>` hint to resume that agent as of the commit.
+    /// Each matched commit gets its best sessions plus a `cv show --range` hint into the
+    /// conversation around the edit. Run `cv index` first to ingest events.
     Blame {
         file: String,
         /// Only these lines: `<line>` or `<line>,<endline>` (via `git blame -L`).
         #[arg(short = 'L', value_name = "LINE[,ENDLINE]")]
         lines: Option<String>,
-        /// Also print the conversation window around the single best-matched edit.
+        /// Also print the conversation window around the single best match (the commit itself
+        /// for an exact match, else the matched edit).
         #[arg(long)]
         show: bool,
     },
@@ -555,6 +561,46 @@ enum Cmd {
         retrieve: Option<String>,
         #[arg(long, hide = true, value_name = "RANGE")]
         range: Option<String>,
+    },
+    /// Rewind a Claude session to a past moment: a NEW resumable session holding the source's
+    /// records up to a message or the tool result that made a commit — the agent as it was when it
+    /// landed that code, ready for `claude --resume <new-id> --fork-session`. Starts at the last
+    /// compaction before the cut (the context the agent actually had); a sub-agent transcript comes
+    /// out as a standalone top-level session. Writes `<new-id>.rewind.json` provenance alongside.
+    Rewind {
+        /// Source session: an id (prefix, `harness:id`), a sub-agent's `agent-<id>`, or a transcript path.
+        id: String,
+        #[arg(long)]
+        harness: Option<String>,
+        /// The cut, inclusive: a message index (as `cv show --range` counts) or a commit sha (7+ hex
+        /// digits) — resolved to the `git commit`/`git push` tool result whose output names it, or an
+        /// error if none does. An all-digit value is an index. Omit for the last message.
+        #[arg(long, value_name = "MSG_IDX|SHA")]
+        at: Option<String>,
+        /// Rewind this sub-agent of <id> instead (its `agent-…` id, bare agentId, or a prefix), as
+        /// `cv show --agent` resolves it.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Write under this directory instead of the source's project dir (where `claude --resume`
+        /// looks; a sub-agent's is its parent's).
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// New session id (default: a fresh UUID).
+        #[arg(long)]
+        to: Option<String>,
+        /// Start at the last compaction boundary before the cut (the default): what a resume loads.
+        #[arg(long, conflicts_with = "full")]
+        from_compaction: bool,
+        /// Start at the source's first record instead (the whole history up to the cut).
+        #[arg(long)]
+        full: bool,
+        /// Report the window that would be written without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Also emit the result as ONE JSON object on stdout (snake_case, FULL ids, the `resume`
+        /// lines); the human report stays on stderr. Dry-run honest like `prune --json`.
+        #[arg(long)]
+        json: bool,
     },
     /// Compose a new session from spans of existing ones (`<id>:A..B`).
     Splice {
@@ -1100,6 +1146,18 @@ fn run() -> Result<()> {
                 json,
             )
         }
+        Cmd::Rewind {
+            id,
+            harness,
+            at,
+            agent,
+            out,
+            to,
+            from_compaction: _,
+            full,
+            dry_run,
+            json,
+        } => compose::cmd_rewind(&id, harness, agent, at.as_deref(), out, to, full, dry_run, json, BUILD_VERSION),
         Cmd::Config { add_export, rm_export } => config::cmd_config(add_export, rm_export),
         Cmd::Schema { json, commands } => schema::cmd_schema(&build_cli(), json, commands),
         Cmd::Formats { action } => formats::cmd_formats(action),

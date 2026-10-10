@@ -797,6 +797,214 @@ fn prune_json_emits_machine_readable_report() {
     assert!(err.contains("pruned"), "{err}");
 }
 
+// ───────────────────────────── rewind ─────────────────────────────
+
+/// A keeper session (two compactions) that committed `63cef47…` mid-way, plus one sub-agent that
+/// committed `9f00ba5…` — the shapes `cv rewind` exists for.
+fn keeper_corpus(w: &World) -> PathBuf {
+    let sid = "aaaaaaaa-0000-4000-8000-000000000001";
+    let line = |ty: &str, uuid: &str, parent: Option<&str>, message: serde_json::Value| {
+        serde_json::json!({"type": ty, "sessionId": sid, "uuid": uuid, "parentUuid": parent,
+            "isSidechain": false, "cwd": "/work/proj", "timestamp": "2026-06-01T10:00:00Z", "message": message})
+    };
+    let boundary = |uuid: &str| {
+        serde_json::json!({"type": "system", "subtype": "compact_boundary", "sessionId": sid, "uuid": uuid,
+            "parentUuid": null, "isSidechain": false, "compactMetadata": {"trigger": "auto"}})
+    };
+    let path = w.write_session(
+        sid,
+        &[
+            line("user", "u0", None, serde_json::json!({"role": "user", "content": "fix the gate"})),
+            boundary("b1"),
+            line("assistant", "a1", Some("b1"), serde_json::json!({"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_c", "name": "Bash",
+                 "input": {"command": "git commit -am 'gate: name the project'"}}]})),
+            line("user", "r1", Some("a1"), serde_json::json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_c", "content": "[main 63cef47] gate: name the project"}]})),
+            line("assistant", "a2", Some("r1"), serde_json::json!({"role": "assistant", "content": [
+                {"type": "text", "text": "landed"}]})),
+            boundary("b2"),
+            line("user", "u3", Some("b2"), serde_json::json!({"role": "user", "content": "now something else"})),
+        ],
+    );
+    let agent = w
+        .home
+        .join(".claude/projects/-work-proj")
+        .join(sid)
+        .join("subagents/agent-a7f5742c50c0b9654.jsonl");
+    fs::create_dir_all(agent.parent().unwrap()).unwrap();
+    let side = |uuid: &str, parent: Option<&str>, ty: &str, message: serde_json::Value| {
+        serde_json::json!({"type": ty, "sessionId": sid, "uuid": uuid, "parentUuid": parent,
+            "isSidechain": true, "agentId": "a7f5742c50c0b9654", "cwd": "/work/proj",
+            "timestamp": "2026-06-01T11:00:00Z", "message": message})
+    };
+    let lines = [
+        side(
+            "s0",
+            None,
+            "user",
+            serde_json::json!({"role": "user", "content": "review lane"}),
+        ),
+        side(
+            "s1",
+            Some("s0"),
+            "assistant",
+            serde_json::json!({"role": "assistant", "content": [
+            {"type": "tool_use", "id": "toolu_s", "name": "Bash",
+             "input": {"command": "git commit -qam fix && git rev-parse HEAD"}}]}),
+        ),
+        side(
+            "s2",
+            Some("s1"),
+            "user",
+            serde_json::json!({"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_s", "content": "9f00ba5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e"}]}),
+        ),
+        side(
+            "s3",
+            Some("s2"),
+            "assistant",
+            serde_json::json!({"role": "assistant", "content": [
+            {"type": "text", "text": "done"}]}),
+        ),
+    ];
+    let body: String = lines.iter().map(|l| format!("{l}\n")).collect();
+    fs::write(&agent, body).unwrap();
+    path
+}
+
+fn jsonl(path: &std::path::Path) -> Vec<serde_json::Value> {
+    fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+#[test]
+fn rewind_derives_the_agent_as_of_a_commit() {
+    let w = World::new("rewind");
+    let src = keeper_corpus(&w);
+    let before = fs::read(&src).unwrap();
+    let out = w.base.join("rw");
+    let out_s = out.to_str().unwrap();
+
+    // By commit sha: the cut is the tool result that printed it; the window opens at b1.
+    let (stdout, err) = w.cv_ok(&[
+        "rewind",
+        "aaaaaaaa",
+        "--at",
+        "63cef473b771e07a",
+        "--out",
+        out_s,
+        "--json",
+    ]);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("stdout must be pure JSON");
+    assert_eq!(v["source_id"], "aaaaaaaa-0000-4000-8000-000000000001", "{stdout}");
+    assert_eq!(
+        (v["start_line"].as_u64(), v["cut_line"].as_u64()),
+        (Some(2), Some(4)),
+        "{stdout}"
+    );
+    assert_eq!(v["evidence"]["kind"], "created", "{stdout}");
+    assert_eq!(v["omitted_lines"], 3, "{stdout}");
+    let new_id = v["new_id"].as_str().unwrap().to_string();
+    let new_path = PathBuf::from(v["new_path"].as_str().unwrap());
+    assert_eq!(new_path, out.join(format!("{new_id}.jsonl")));
+    let got = jsonl(&new_path);
+    assert_eq!(got.len(), 3);
+    assert!(got.iter().all(|r| r["sessionId"] == new_id.as_str()), "{got:?}");
+    assert!(PathBuf::from(v["provenance_path"].as_str().unwrap()).exists());
+    // The resume incantation is `cv resume`'s rendering for the NEW id, in the cut's cwd.
+    assert_eq!(
+        v["resume"],
+        serde_json::json!(["cd /work/proj", format!("claude --resume {new_id}")])
+    );
+    assert!(err.contains("exact: commit created here"), "{err}");
+    assert!(
+        err.contains("copy it there first"),
+        "an --out elsewhere must say where claude looks:\n{err}"
+    );
+    assert_eq!(fs::read(&src).unwrap(), before, "rewind must never modify the source");
+
+    // By message index, written to the project dir by default (where `claude --resume` looks).
+    let (stdout, _) = w.cv_ok(&["rewind", "aaaaaaaa", "--at", "1", "--to", "rw-by-idx", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(v["cut_msg_idx"], 1, "{stdout}");
+    assert!(w.home.join(".claude/projects/-work-proj/rw-by-idx.jsonl").exists());
+    assert!(w
+        .home
+        .join(".claude/projects/-work-proj/rw-by-idx.rewind.json")
+        .exists());
+
+    // Dry run: nothing written, honest nulls.
+    let (stdout, _) = w.cv_ok(&["rewind", "aaaaaaaa", "--full", "--dry-run", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(
+        (v["dry_run"].as_bool(), v["start_line"].as_u64()),
+        (Some(true), Some(1)),
+        "{stdout}"
+    );
+    assert!(v["new_id"].is_null() && v["new_path"].is_null(), "{stdout}");
+
+    // A sha no tool result shows: exit 1 with the reason. A bad --at: exit 2.
+    let (_, err) = w.cv_fails(&["rewind", "aaaaaaaa", "--at", "deadbeef1"]);
+    assert!(err.contains("deadbeef1") && err.contains("git commit"), "{err}");
+    let (ok, code, _, err) = w.cv(&["rewind", "aaaaaaaa", "--at", "nope"]);
+    assert!(!ok && code == 2, "{err}");
+    let (ok, code, _, err) = w.cv(&["rewind", "aaaaaaaa", "--at", "99"]);
+    assert!(!ok && code == 1 && err.contains("message(s)"), "{err}");
+}
+
+#[test]
+fn rewind_extracts_a_subagent_as_a_standalone_session() {
+    let w = World::new("rewindsub");
+    keeper_corpus(&w);
+    let proj = w.home.join(".claude/projects/-work-proj");
+
+    // `agent-<id>` resolves fleet-wide (as `cv show agent-…` does); the sub-agent's own commit is
+    // exact evidence; the session lands in the PARENT's project dir.
+    let (stdout, err) = w.cv_ok(&[
+        "rewind",
+        "agent-a7f5742c",
+        "--at",
+        "9f00ba5",
+        "--to",
+        "kept-sub",
+        "--json",
+    ]);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| panic!("{e}: {stdout}\n{err}"));
+    assert_eq!(v["subagent"], true, "{stdout}");
+    assert_eq!(
+        v["source_session_id"], "aaaaaaaa-0000-4000-8000-000000000001",
+        "{stdout}"
+    );
+    assert_eq!(v["cut_line"], 3, "{stdout}");
+    let got = jsonl(&proj.join("kept-sub.jsonl"));
+    assert_eq!(got.len(), 3);
+    assert!(got
+        .iter()
+        .all(|r| r["isSidechain"] == false && r.get("agentId").is_none() && r["sessionId"] == "kept-sub"));
+    assert!(got[0]["parentUuid"].is_null(), "the root chain starts at a null parent");
+    assert!(err.contains("sub-agent of aaaaaaaa"), "{err}");
+
+    // `<parent> --agent <id>` and a plain transcript path reach the same transcript.
+    let (stdout, _) = w.cv_ok(&["rewind", "aaaaaaaa", "--agent", "a7f57", "--dry-run", "--json"]);
+    assert!(stdout.contains("\"subagent\": true"), "{stdout}");
+    let path = proj.join("aaaaaaaa-0000-4000-8000-000000000001/subagents/agent-a7f5742c50c0b9654.jsonl");
+    let (stdout, _) = w.cv_ok(&["rewind", path.to_str().unwrap(), "--dry-run", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(
+        (v["subagent"].as_bool(), v["lines_written"].as_u64()),
+        (Some(true), Some(4)),
+        "{stdout}"
+    );
+
+    // The derived session is an ordinary top-level session to the rest of cv.
+    let (out, _) = w.cv_ok(&["show", "kept-sub"]);
+    assert!(out.contains("review lane"), "{out}");
+}
+
 // ───────────────────────────── dataset ─────────────────────────────
 
 #[test]

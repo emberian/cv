@@ -29,6 +29,12 @@ fn git(repo: &Path, args: &[&str], date: Option<i64>) {
     );
 }
 
+/// Index of `needle`'s first occurrence, with a labeled panic when missing.
+fn pos(hay: &str, needle: &str) -> usize {
+    hay.find(needle)
+        .unwrap_or_else(|| panic!("expected {needle:?} in:\n{hay}"))
+}
+
 /// Run the built `cv` binary with the temp catalog home; returns (stdout, stderr).
 fn cv(home: &Path, dir: &Path, args: &[&str]) -> (String, String) {
     let out = Command::new(env!("CARGO_BIN_EXE_cv"))
@@ -98,7 +104,61 @@ fn blame_end_to_end() {
     let body: String = lines.iter().map(|l| format!("{l}\n")).collect();
     fs::write(&jsonl, body).unwrap();
 
+    // --- a second session that edited the file hours earlier and then RAN the first commit ---
+    // (its tool result prints the sha: exact evidence that must outrank the closer timed match).
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["rev-parse", "HEAD~1"])
+        .output()
+        .unwrap();
+    let sha1 = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let short1 = &sha1[..7];
+    let exact_jsonl = home.join("sessions/exact-e2e.jsonl");
+    let lines = [
+        serde_json::json!({
+            "type": "assistant", "uuid": "x1", "sessionId": "exact-e2e",
+            "timestamp": "2026-06-01T07:00:00Z",
+            "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "e1", "name": "Edit",
+                 "input": {"file_path": "/elsewhere/src/widget.rs", "old_string": "x", "new_string": "y"}}
+            ]}
+        }),
+        serde_json::json!({
+            "type": "user", "uuid": "x2", "sessionId": "exact-e2e", "timestamp": "2026-06-01T07:00:01Z",
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "e1", "content": "ok", "is_error": false}
+            ]}
+        }),
+        serde_json::json!({
+            "type": "assistant", "uuid": "x3", "sessionId": "exact-e2e", "timestamp": "2026-06-01T12:08:00Z",
+            "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "c1", "name": "Bash",
+                 "input": {"command": "git commit -qm 'feat: add widget' && git log -1 --oneline"}}
+            ]}
+        }),
+        serde_json::json!({
+            "type": "user", "uuid": "x4", "sessionId": "exact-e2e", "timestamp": "2026-06-01T12:08:01Z",
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "c1", "content": format!("{short1} feat: add widget"), "is_error": false}
+            ]}
+        }),
+    ];
+    let body: String = lines.iter().map(|l| format!("{l}\n")).collect();
+    fs::write(&exact_jsonl, body).unwrap();
+
     std::env::set_var("CLUSTERVISION_HOME", &home);
+    let rx = cv_core::ir::SessionRef {
+        id: "exact-e2e".into(),
+        harness: cv_core::ir::Harness::Claude,
+        path: exact_jsonl.clone(),
+        cwd: Some("/elsewhere".into()),
+        title: None,
+        created_at: None,
+        updated_at: None,
+        message_count: 4,
+    };
+    cv_core::events::ingest_ref(&rx).expect("ingest exact fixture session");
     let r = cv_core::ir::SessionRef {
         id: "blame-e2e".into(),
         harness: cv_core::ir::Harness::Claude,
@@ -110,7 +170,7 @@ fn blame_end_to_end() {
         message_count: 3,
     };
     cv_core::events::ingest_ref(&r).expect("ingest fixture session");
-    cv_core::catalog::sync(std::slice::from_ref(&r));
+    cv_core::catalog::sync(&[r.clone(), rx]);
     // The edit's msg_idx as the catalog recorded it — asserted against, never assumed.
     let edit_idx = cv_core::events::events_for("claude", "blame-e2e", Some("file_edit"))
         .first()
@@ -142,6 +202,16 @@ fn blame_end_to_end() {
         "old `A-B` hint must be gone:\n{out}"
     );
     assert!(out.contains("1 of 2 commit(s) matched an agent session"), "{out}");
+    // The session that ran the commit is proven, and outranks the closer timed match.
+    let exact_at = pos(&out, "exact: commit created here");
+    assert!(out[..exact_at].contains("exact-e2"), "{out}");
+    assert!(
+        exact_at < pos(&out, "8m before commit"),
+        "exact must rank first:\n{out}"
+    );
+    assert!(out.contains(&format!("cv rewind exact-e2 --at {short1}")), "{out}");
+    // Its 5h-old edit is folded into the exact line, never listed again as a timed match.
+    assert_eq!(out.matches("exact-e2").count(), 3, "one match line + two hints:\n{out}");
 
     // --- -L: line 2 was never touched by the tweak, so only the first commit owns it ---
     let (out, err) = cv(&home, &repo, &["blame", "src/widget.rs", "-L", "2"]);
@@ -151,17 +221,17 @@ fn blame_end_to_end() {
     assert!(out.contains("8m before commit"), "{out}");
 
     // --- --show: the range hint indexing must line up with `cv show --range` ---
-    // The rendered window around msg `edit_idx` must contain the Edit tool_use itself.
+    // The best match is now the exact one: its window must contain the commit call itself.
     let (out, err) = cv(&home, &repo, &["blame", "src/widget.rs", "--show"]);
     assert!(
         out.contains("conversation around the edit"),
         "stdout:\n{out}\nstderr:\n{err}"
     );
     assert!(
-        out.contains("[tool_use Edit t1]"),
-        "event msg_idx is misaligned with show --range indexing:\n{out}"
+        out.contains("[tool_use Bash c1]"),
+        "evidence msg_idx is misaligned with show --range indexing:\n{out}"
     );
-    assert!(out.contains("adding the widget now"), "{out}");
+    assert!(out.contains(&format!("{short1} feat: add widget")), "{out}");
 
     // --- not a git repo: degrades to pure event-catalog mode with the same hints ---
     let (out, err) = cv(&home, &base, &["blame", "src/widget.rs"]);

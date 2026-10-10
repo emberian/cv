@@ -18,7 +18,7 @@ Grouped help (`cv --help` shows every command under these headings; nothing is h
 | group | commands | what they have in common |
 |---|---|---|
 | **Read** | `ls` `show` `cat` `search` `events` `touched` `tools` `tree` `workflow` `compaction` `prompts` `lanes` `deferrals` `timeline` `stats` `diff` `blame` `doctor` | read-only over existing sessions |
-| **Reshape** | `prune` `splice` `loom` `port` `redact` `resume` | produce a NEW session id from existing ones (the source is never touched); `resume` launches one |
+| **Reshape** | `prune` `rewind` `splice` `loom` `port` `redact` `resume` | produce a NEW session id from existing ones (the source is never touched); `resume` launches one |
 | **Export** | `export` `dataset` `pack` | produce something that is not a session |
 | **Fleet & live** | `task` `board` `scry` `share` | multi-agent coordination and live views |
 | **System** | `index` `config` `schema` `formats` `recipes` | cv's own state and reference |

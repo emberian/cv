@@ -68,12 +68,23 @@ pub fn splice(spans: &[Span<'_>], new_id: Option<String>, harness: Harness) -> S
     // Re-thread into a clean linear chain: each message gets a fresh id, parent_id points at the
     // previous message's new id, the first is None. This makes threading coherent regardless of the
     // sources' original ids (which may collide or reference messages that weren't spliced in).
+    // The chain is the new session's MAIN thread, so a span taken from a sub-agent transcript sheds
+    // its sidechain markers: a Claude record emitted with `isSidechain: true` / `agentId` is skipped
+    // by the main-thread loader, and the spliced session would resume empty.
     let mut prev_id: Option<String> = None;
     for msg in &mut messages {
         let fresh = uuid::Uuid::now_v7().to_string();
         msg.parent_id = prev_id.take();
         msg.id = Some(fresh.clone());
         prev_id = Some(fresh);
+        if let Some(bag) = msg
+            .extra
+            .get_mut(Harness::Claude.as_str())
+            .and_then(|b| b.as_object_mut())
+        {
+            bag.shift_remove("isSidechain");
+            bag.shift_remove("agentId");
+        }
     }
 
     // Provenance is cv's own fact about a session cv synthesized, not something read out of a
@@ -292,6 +303,34 @@ mod tests {
         let loom = g.cv_extra().unwrap()["loom"].as_array().unwrap();
         assert_eq!(loom[0]["source_id"], "BASE");
         assert_eq!(loom[1]["source_id"], "SRC");
+    }
+
+    #[test]
+    fn spliced_subagent_spans_lose_their_sidechain_markers() {
+        let mut sub = session("agent-x", Harness::Claude, 2);
+        for m in &mut sub.messages {
+            let bag = m.harness_extra_mut(Harness::Claude);
+            bag.insert("isSidechain".into(), serde_json::Value::Bool(true));
+            bag.insert("agentId".into(), "x".into());
+            bag.insert("slug".into(), "kept".into());
+        }
+        let out = splice(
+            &[Span {
+                source: &sub,
+                start: 0,
+                end: None,
+            }],
+            None,
+            Harness::Claude,
+        );
+        for m in &out.messages {
+            let bag = m.extra["claude"].as_object().unwrap();
+            assert!(
+                !bag.contains_key("isSidechain") && !bag.contains_key("agentId"),
+                "{bag:?}"
+            );
+            assert_eq!(bag["slug"], "kept", "only the sidechain markers go");
+        }
     }
 
     #[test]

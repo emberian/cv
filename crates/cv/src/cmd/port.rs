@@ -159,11 +159,22 @@ pub(crate) fn cmd_resume(id: &str, harness: Option<String>, launch: bool) -> Res
     }
 
     // Print the incantation.
-    if let Some(dir) = &cwd {
-        println!("cd {}", shell_quote(&dir.display().to_string()));
+    for line in resume_lines(r.harness, &r.id, cwd.as_deref()) {
+        println!("{line}");
     }
-    println!("{} {}", program, args.join(" "));
     Ok(())
+}
+
+/// The resume incantation `cv resume` prints, as lines: `cd <cwd>` (when known), then the
+/// harness's own resume command. Shared with `cv rewind`, which prints it for the session it made.
+pub(crate) fn resume_lines(h: Harness, id: &str, cwd: Option<&Path>) -> Vec<String> {
+    let (program, args) = resume_command(h, id);
+    let mut out = Vec::new();
+    if let Some(dir) = cwd {
+        out.push(format!("cd {}", shell_quote(&dir.display().to_string())));
+    }
+    out.push(format!("{} {}", program, args.join(" ")));
+    out
 }
 
 /// Best-known resume incantation per harness: the program + its args (the cwd is handled

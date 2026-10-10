@@ -234,8 +234,9 @@ fn instructions() -> String {
          `last`, `range`, `around`+`context` or `max_bytes` to move the window) and `cat` one tool \
          call's full output by its tool_use_id. `pack` builds task-relevant context out of the whole \
          corpus; `doctor` explains why a session's context window keeps filling; `workflow`, `tree` \
-         and `show --subagents` open up sub-agent forests. `prune`, `splice`, `loom`, `port` and \
-         `redact` produce NEW sessions from existing ones without touching the source. \
+         and `show --subagents` open up sub-agent forests. `prune`, `rewind`, `splice`, `loom`, \
+         `port` and `redact` produce NEW sessions from existing ones without touching the source \
+         (`rewind` = an agent as of a past message or commit, resumable). \
          To coordinate with sibling agents live, use `await_omen`/`observe_stream` (watch another \
          agent's output) and the `board_*` / `task_*` tools. \
          Harnesses cv reads: {}.",

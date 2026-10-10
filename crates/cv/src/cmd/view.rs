@@ -351,16 +351,9 @@ fn show_subagents(r: &SessionRef, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// Render one specific sub-agent's transcript (`--agent <id>`), resolved by id-prefix relative to
-/// its parent session. Honors `--json` and the window flags exactly as a top-level `cv show` would
-/// (`--last` counts the sub-agent's own messages).
-fn show_one_subagent(
-    parent: &SessionRef,
-    adapter: &dyn Adapter,
-    agent_id: &str,
-    json: bool,
-    window: &WindowArgs,
-) -> Result<()> {
+/// One sub-agent of `parent` by its `agent-…` id, bare agentId, or a unique prefix of either — the
+/// resolution `cv show --agent` and `cv rewind --agent` share. No match / several → exit 2.
+pub(crate) fn resolve_subagent(parent: &SessionRef, agent_id: &str) -> Result<cv_core::SubagentInfo> {
     let subs = cv_core::subagent_tree_of(parent);
     // Match on the full session id (`agent-…`), the bare agentId, or a prefix of either.
     let matches: Vec<&cv_core::SubagentInfo> = subs
@@ -372,30 +365,41 @@ fn show_one_subagent(
                 || s.agent_id().starts_with(agent_id)
         })
         .collect();
-    let sub = match matches.as_slice() {
-        [one] => *one,
-        [] => {
-            return usage(format!(
-                "no sub-agent matching {agent_id:?} under {} ({} sub-agent(s); try `cv show {} --subagents`)",
-                short_id(&parent.id),
-                subs.len(),
-                short_id(&parent.id),
-            ))
-        }
+    match matches.as_slice() {
+        [one] => Ok((*one).clone()),
+        [] => usage(format!(
+            "no sub-agent matching {agent_id:?} under {} ({} sub-agent(s); try `cv show {} --subagents`)",
+            short_id(&parent.id),
+            subs.len(),
+            short_id(&parent.id),
+        )),
         many => {
             let mut lines: Vec<String> = many
                 .iter()
                 .map(|s| format!("{}:{}", s.session.harness.as_str(), s.session.id))
                 .collect();
             lines.sort();
-            return usage(format!(
+            usage(format!(
                 "ambiguous sub-agent id {agent_id:?} — {} candidates under {}:\n{}",
                 many.len(),
                 short_id(&parent.id),
                 lines.join("\n")
-            ));
+            ))
         }
-    };
+    }
+}
+
+/// Render one specific sub-agent's transcript (`--agent <id>`), resolved by id-prefix relative to
+/// its parent session. Honors `--json` and the window flags exactly as a top-level `cv show` would
+/// (`--last` counts the sub-agent's own messages).
+fn show_one_subagent(
+    parent: &SessionRef,
+    adapter: &dyn Adapter,
+    agent_id: &str,
+    json: bool,
+    window: &WindowArgs,
+) -> Result<()> {
+    let sub = resolve_subagent(parent, agent_id)?;
     let range = window.bounds(|| count_messages(adapter, &sub.session))?;
 
     if json {

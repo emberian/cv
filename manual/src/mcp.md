@@ -140,7 +140,7 @@ call gets `--json` appended (and so returns machine output rather than rendered 
 | `timeline` | — | yes | Unified chronological feed across all harnesses. |
 | `stats` | — | yes | Fleet analytics over all discovered sessions. |
 | `diff` | `a`, `b` | no | Compare two sessions message-by-message (great for loom branches). |
-| `blame` | `file` | no | Which agent session wrote this code, and what was it thinking? |
+| `blame` | `file` | no | Which agent session wrote this code, and what was it thinking? A session whose own tool output made the commit ranks first, `exact`. |
 | `doctor` | — | yes | Why a context window keeps filling: pressure by source, overhead, compaction frequency. |
 
 ### Reshape
@@ -150,6 +150,7 @@ Each produces a **new** session id; the source is never touched.
 | Tool | Required | JSON | What it does |
 |---|---|---|---|
 | `prune` | `id` | yes | Lossless compaction into a new resumable session: bulky old tool payloads go to a sidecar behind a `[PRUNED]` marker. Retrieve one with `cat`. |
+| `rewind` | `id` | yes | The agent as of a past message or commit (`at`: message index or sha), as a new resumable Claude session with a provenance sidecar; sub-agents come out standalone. |
 | `splice` | `specs` | no | Compose a new session from spans of existing ones (`<id>:A..B`). |
 | `loom` | `base`, `at`, `graft`, `from` | no | Graft: `base[..N]` then `other[M..]`, as one new branched session. |
 | `port` | `id` | no | A copy that runs elsewhere — another harness (`harness`), another working directory (`cwd`), or both. |
