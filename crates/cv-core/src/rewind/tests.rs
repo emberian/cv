@@ -69,7 +69,7 @@ fn session(dir: &Path) -> PathBuf {
             json!({"role": "assistant", "content": [{"type": "tool_use", "id": "t2", "name": "Read", "input": {"file_path": "/b"}}]})),
         rec("user", "t1r", Some("t2u"), result("t1", "contents of a")),
         json!({"type": "attachment", "sessionId": SID, "uuid": "h1", "parentUuid": "t1r", "isSidechain": false,
-               "attachment": {"type": "hook_success", "content": "ok"}}),
+               "attachment": {"type": "hook_success", "content": "ok"}, "rendered": [{"content": "hook ok"}]}),
         rec("user", "t2r", Some("h1"), result("t2", "contents of b")),
         rec("assistant", "a5", Some("t2r"), text("assistant", "done")),
         rec("user", "u9", Some("a5"), json!({"role": "user", "content": "next thing"})),
