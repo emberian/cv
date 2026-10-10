@@ -106,7 +106,12 @@ fn blame_end_to_end() {
 
     // --- a second session that edited the file hours earlier and then RAN the first commit ---
     // (its tool result prints the sha: exact evidence that must outrank the closer timed match).
-    let out = Command::new("git").arg("-C").arg(&repo).args(["rev-parse", "HEAD~1"]).output().unwrap();
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["rev-parse", "HEAD~1"])
+        .output()
+        .unwrap();
     let sha1 = String::from_utf8_lossy(&out.stdout).trim().to_string();
     let short1 = &sha1[..7];
     let exact_jsonl = home.join("sessions/exact-e2e.jsonl");
@@ -200,7 +205,10 @@ fn blame_end_to_end() {
     // The session that ran the commit is proven, and outranks the closer timed match.
     let exact_at = pos(&out, "exact: commit created here");
     assert!(out[..exact_at].contains("exact-e2"), "{out}");
-    assert!(exact_at < pos(&out, "8m before commit"), "exact must rank first:\n{out}");
+    assert!(
+        exact_at < pos(&out, "8m before commit"),
+        "exact must rank first:\n{out}"
+    );
     assert!(out.contains(&format!("cv rewind exact-e2 --at {short1}")), "{out}");
     // Its 5h-old edit is folded into the exact line, never listed again as a timed match.
     assert_eq!(out.matches("exact-e2").count(), 3, "one match line + two hints:\n{out}");

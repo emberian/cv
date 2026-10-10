@@ -339,7 +339,13 @@ pub(crate) fn rank_commit<'a>(
         .iter()
         .filter(|x| cv_core::rewind::output_names_sha(&x.evidence.sha, &sha.to_ascii_lowercase()))
         .collect();
-    proven.sort_by_key(|x| (x.evidence.kind != EvidenceKind::Created, x.evidence.ts, x.evidence.msg_idx));
+    proven.sort_by_key(|x| {
+        (
+            x.evidence.kind != EvidenceKind::Created,
+            x.evidence.ts,
+            x.evidence.msg_idx,
+        )
+    });
     let mut seen: Vec<(&str, &str)> = Vec::new();
     let mut out: Vec<Ranked<'a>> = Vec::new();
     for x in proven {
@@ -864,7 +870,12 @@ mod tests {
         let exact = vec![
             exact("pusher", SHA, EvidenceKind::Pushed, 40),
             exact("keeper", SHA, EvidenceKind::Created, 12),
-            exact("other-commit", "0123456789abcdef0123456789abcdef01234567", EvidenceKind::Created, 1),
+            exact(
+                "other-commit",
+                "0123456789abcdef0123456789abcdef01234567",
+                EvidenceKind::Created,
+                1,
+            ),
         ];
         let ranked = rank_commit(SHA, &exact, correlate(T, &edits, &root()), &edits);
         let order: Vec<(&str, &str)> = ranked
@@ -878,7 +889,12 @@ mod tests {
         // match is folded into its exact line, and another commit's evidence never shows.
         assert_eq!(order, [("keeper", "exact"), ("pusher", "exact"), ("near", "timed")]);
         // No evidence for a commit → exactly the timed ranking, untouched.
-        let plain = rank_commit("ffffffffffffffffffffffffffffffffffffffff", &exact, correlate(T, &edits, &root()), &edits);
+        let plain = rank_commit(
+            "ffffffffffffffffffffffffffffffffffffffff",
+            &exact,
+            correlate(T, &edits, &root()),
+            &edits,
+        );
         assert_eq!(plain.len(), 3);
         assert!(plain.iter().all(|r| matches!(r, Ranked::Timed(_))));
     }
@@ -889,7 +905,12 @@ mod tests {
         sub.parent_id = Some("orchestrator".into());
         let mut sub2 = ev("agent-b8e6", 5, Some(T), None, None);
         sub2.parent_id = Some("orchestrator".into());
-        let edits = vec![ev("solo", 1, Some(T), None, None), sub, ev("solo", 9, Some(T), None, None), sub2];
+        let edits = vec![
+            ev("solo", 1, Some(T), None, None),
+            sub,
+            ev("solo", 9, Some(T), None, None),
+            sub2,
+        ];
         let ids: Vec<String> = candidate_ids(&edits).into_iter().map(|(_, id)| id).collect();
         assert_eq!(ids, ["solo", "agent-a7f5", "orchestrator", "agent-b8e6"]);
     }

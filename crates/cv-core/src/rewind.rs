@@ -250,7 +250,12 @@ pub fn commit_evidence(r: &SessionRef, shas: &[String]) -> Result<Vec<CommitEvid
     if textual && r.path.is_file() {
         let heads: Vec<&str> = want.iter().map(|s| &s[..MIN_SHA_LEN]).collect();
         let present = file_mentions(&r.path, &heads)?;
-        want = want.into_iter().zip(present).filter(|(_, p)| *p).map(|(s, _)| s).collect();
+        want = want
+            .into_iter()
+            .zip(present)
+            .filter(|(_, p)| *p)
+            .map(|(s, _)| s)
+            .collect();
     }
     if want.is_empty() {
         return Ok(Vec::new());
@@ -437,14 +442,21 @@ pub fn project_dir(path: &Path) -> PathBuf {
 
 /// Whether `r` is a sub-agent transcript (`agent-<id>.jsonl`, by id or file name).
 pub fn is_subagent(r: &SessionRef) -> bool {
-    r.id.starts_with("agent-") || r.path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("agent-"))
+    r.id.starts_with("agent-")
+        || r.path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("agent-"))
 }
 
 /// Derive the rewound session (see the module docs). Claude Code sessions only: the derivation
 /// copies raw records, and only Claude's records are resumable by id.
 pub fn rewind_session(r: &SessionRef, opts: &RewindOptions) -> Result<RewindResult> {
     if r.harness != Harness::Claude {
-        bail!("cv rewind currently supports Claude Code sessions only (got {})", r.harness);
+        bail!(
+            "cv rewind currently supports Claude Code sessions only (got {})",
+            r.harness
+        );
     }
     let size = std::fs::metadata(&r.path)
         .with_context(|| format!("reading {}", r.path.display()))?
@@ -453,9 +465,9 @@ pub fn rewind_session(r: &SessionRef, opts: &RewindOptions) -> Result<RewindResu
 
     // Pass 1 — stream the prefix through the adapter: offsets, boundaries, evidence.
     let want_sha = match &opts.at {
-        CutAt::Commit(s) => Some(
-            normalize_sha(s).with_context(|| format!("{s:?} is not a commit sha (7–64 hex digits)"))?,
-        ),
+        CutAt::Commit(s) => {
+            Some(normalize_sha(s).with_context(|| format!("{s:?} is not a commit sha (7–64 hex digits)"))?)
+        }
         _ => None,
     };
     let mut scan = ScanSink {
@@ -506,7 +518,11 @@ pub fn rewind_session(r: &SessionRef, opts: &RewindOptions) -> Result<RewindResu
     let cut_idx = match (&opts.at, &evidence) {
         (CutAt::Message(n), _) => {
             if *n >= total {
-                bail!("--at {n}: {} has {total} message(s) (0-based; the last is {})", r.id, total - 1);
+                bail!(
+                    "--at {n}: {} has {total} message(s) (0-based; the last is {})",
+                    r.id,
+                    total - 1
+                );
             }
             *n
         }
@@ -625,7 +641,15 @@ pub fn rewind_session(r: &SessionRef, opts: &RewindOptions) -> Result<RewindResu
                     omitted_bytes += n as u64;
                     continue;
                 }
-                track_tool_calls(&v, &mut open, if phase == Phase::Closing { Some(&mut closed) } else { None });
+                track_tool_calls(
+                    &v,
+                    &mut open,
+                    if phase == Phase::Closing {
+                        Some(&mut closed)
+                    } else {
+                        None
+                    },
+                );
                 if let Some(c) = v.get("cwd").and_then(Value::as_str) {
                     if cwds.last().map(String::as_str) != Some(c) {
                         cwds.retain(|x| x != c);
@@ -664,14 +688,21 @@ pub fn rewind_session(r: &SessionRef, opts: &RewindOptions) -> Result<RewindResu
             drop(w);
             let _ = std::fs::remove_file(&partial);
         }
-        bail!("message {cut_idx}'s record (byte {cut_off}) is not a line start in {}", r.path.display());
+        bail!(
+            "message {cut_idx}'s record (byte {cut_off}) is not a line start in {}",
+            r.path.display()
+        );
     }
     let source_sha256 = hasher.finish_hex();
 
     // The launch dir: among the cwds the window recorded (plus the owning session's first one — a
     // sub-agent's records may all sit in a worktree), the one Claude would file this session under.
     let home = project_dir(&r.path);
-    let home_name = home.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string();
+    let home_name = home
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default()
+        .to_string();
     let owner = source_session_id
         .as_deref()
         .and_then(|sid| first_cwd(&home.join(format!("{sid}.jsonl"))));
@@ -731,8 +762,7 @@ pub fn rewind_session(r: &SessionRef, opts: &RewindOptions) -> Result<RewindResu
     if let Some(mut w) = writer.take() {
         w.flush()?;
         drop(w);
-        std::fs::rename(&partial, &res.new_path)
-            .with_context(|| format!("writing {}", res.new_path.display()))?;
+        std::fs::rename(&partial, &res.new_path).with_context(|| format!("writing {}", res.new_path.display()))?;
         let body = serde_json::to_string_pretty(&provenance(&res, opts))? + "\n";
         std::fs::write(&res.provenance_path, body)
             .with_context(|| format!("writing {}", res.provenance_path.display()))?;
@@ -848,7 +878,10 @@ fn closes_open_call(v: &Value) -> bool {
         Some(true) => v
             .pointer("/message/content")
             .and_then(Value::as_array)
-            .is_some_and(|bs| bs.iter().any(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))),
+            .is_some_and(|bs| {
+                bs.iter()
+                    .any(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
+            }),
     }
 }
 

@@ -77,7 +77,11 @@ pub fn splice(spans: &[Span<'_>], new_id: Option<String>, harness: Harness) -> S
         msg.parent_id = prev_id.take();
         msg.id = Some(fresh.clone());
         prev_id = Some(fresh);
-        if let Some(bag) = msg.extra.get_mut(Harness::Claude.as_str()).and_then(|b| b.as_object_mut()) {
+        if let Some(bag) = msg
+            .extra
+            .get_mut(Harness::Claude.as_str())
+            .and_then(|b| b.as_object_mut())
+        {
             bag.shift_remove("isSidechain");
             bag.shift_remove("agentId");
         }
@@ -321,7 +325,10 @@ mod tests {
         );
         for m in &out.messages {
             let bag = m.extra["claude"].as_object().unwrap();
-            assert!(!bag.contains_key("isSidechain") && !bag.contains_key("agentId"), "{bag:?}");
+            assert!(
+                !bag.contains_key("isSidechain") && !bag.contains_key("agentId"),
+                "{bag:?}"
+            );
             assert_eq!(bag["slug"], "kept", "only the sidechain markers go");
         }
     }

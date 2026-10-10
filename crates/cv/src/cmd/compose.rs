@@ -296,8 +296,16 @@ pub(crate) fn cmd_rewind(
         println!("{}", serde_json::to_string_pretty(&v)?);
     }
 
-    let tag = if res.dry_run { " (dry run — nothing written)" } else { "" };
-    eprintln!("✦ rewound {} → {}{tag}", short_id(&res.source_id), short_id(&res.new_id));
+    let tag = if res.dry_run {
+        " (dry run — nothing written)"
+    } else {
+        ""
+    };
+    eprintln!(
+        "✦ rewound {} → {}{tag}",
+        short_id(&res.source_id),
+        short_id(&res.new_id)
+    );
     let of = match (&res.subagent, &res.source_session_id) {
         (true, Some(p)) => format!(" · sub-agent of {} → emitted as a top-level session", short_id(p)),
         _ => String::new(),
@@ -319,9 +327,15 @@ pub(crate) fn cmd_rewind(
         (_, Some(b), true) => format!("the compaction at msg {b}, from its preserved segment"),
         (_, Some(b), false) => format!("the compaction at msg {b}"),
     };
-    eprintln!("  start:   msg {} · line {} · {from}", res.start_msg_idx, res.start_line);
+    eprintln!(
+        "  start:   msg {} · line {} · {from}",
+        res.start_msg_idx, res.start_line
+    );
     let closed = if res.closed_tool_calls > 0 {
-        format!(" (+{} tool result(s) past the cut, closing its open calls)", res.closed_tool_calls)
+        format!(
+            " (+{} tool result(s) past the cut, closing its open calls)",
+            res.closed_tool_calls
+        )
     } else {
         String::new()
     };

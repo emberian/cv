@@ -52,17 +52,37 @@ fn text(role: &str, t: &str) -> Value {
 /// ```
 fn session(dir: &Path) -> PathBuf {
     let lines = vec![
-        rec("user", "u0", None, json!({"role": "user", "content": "land the gate fix"})),
+        rec(
+            "user",
+            "u0",
+            None,
+            json!({"role": "user", "content": "land the gate fix"}),
+        ),
         rec("assistant", "d0", Some("u0"), bash("toolu_d", "cat notes.txt")),
         // Mentions the sha, but `cat` is no commit — must never count as evidence.
-        rec("user", "d1", Some("d0"), result("toolu_d", &format!("todo: review {SHA}"))),
+        rec(
+            "user",
+            "d1",
+            Some("d0"),
+            result("toolu_d", &format!("todo: review {SHA}")),
+        ),
         json!({"type": "system", "subtype": "compact_boundary", "sessionId": SID, "uuid": "b1",
                "parentUuid": null, "logicalParentUuid": "d1", "isSidechain": false,
                "compactMetadata": {"trigger": "auto", "preTokens": 900000}}),
         json!({"type": "user", "sessionId": SID, "uuid": "s1", "parentUuid": "b1", "isSidechain": false,
                "isCompactSummary": true, "message": {"role": "user", "content": "Summary: landing the gate fix"}}),
-        rec("assistant", "a1", Some("s1"), bash("toolu_c", "cd /work/proj && git add -A && git commit -m 'gate fix'")),
-        rec("user", "r1", Some("a1"), result("toolu_c", "[main 63cef47] gate fix\n 1 file changed")),
+        rec(
+            "assistant",
+            "a1",
+            Some("s1"),
+            bash("toolu_c", "cd /work/proj && git add -A && git commit -m 'gate fix'"),
+        ),
+        rec(
+            "user",
+            "r1",
+            Some("a1"),
+            result("toolu_c", "[main 63cef47] gate fix\n 1 file changed"),
+        ),
         rec("assistant", "a2", Some("r1"), text("assistant", "landed 63cef47")),
         json!({"type": "system", "subtype": "compact_boundary", "sessionId": SID, "uuid": "b2",
                "parentUuid": null, "logicalParentUuid": "a2", "isSidechain": false,
@@ -70,16 +90,29 @@ fn session(dir: &Path) -> PathBuf {
                    "preservedSegment": {"headUuid": "a2", "anchorUuid": "s2", "tailUuid": "a2"}}}),
         json!({"type": "user", "sessionId": SID, "uuid": "s2", "parentUuid": "b2", "isSidechain": false,
                "isCompactSummary": true, "message": {"role": "user", "content": "Summary: gate fix landed"}}),
-        rec("assistant", "t1u", Some("s2"),
-            json!({"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "Read", "input": {"file_path": "/a"}}]})),
-        rec("assistant", "t2u", Some("t1u"),
-            json!({"role": "assistant", "content": [{"type": "tool_use", "id": "t2", "name": "Read", "input": {"file_path": "/b"}}]})),
+        rec(
+            "assistant",
+            "t1u",
+            Some("s2"),
+            json!({"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "Read", "input": {"file_path": "/a"}}]}),
+        ),
+        rec(
+            "assistant",
+            "t2u",
+            Some("t1u"),
+            json!({"role": "assistant", "content": [{"type": "tool_use", "id": "t2", "name": "Read", "input": {"file_path": "/b"}}]}),
+        ),
         rec("user", "t1r", Some("t2u"), result("t1", "contents of a")),
         json!({"type": "attachment", "sessionId": SID, "uuid": "h1", "parentUuid": "t1r", "isSidechain": false,
                "attachment": {"type": "hook_success", "content": "ok"}, "rendered": [{"content": "hook ok"}]}),
         rec("user", "t2r", Some("h1"), result("t2", "contents of b")),
         rec("assistant", "a5", Some("t2r"), text("assistant", "done")),
-        rec("user", "u9", Some("a5"), json!({"role": "user", "content": "next thing"})),
+        rec(
+            "user",
+            "u9",
+            Some("a5"),
+            json!({"role": "user", "content": "next thing"}),
+        ),
     ];
     let path = dir.join(format!("{SID}.jsonl"));
     write_jsonl(&path, &lines);
@@ -132,7 +165,10 @@ fn read_lines(path: &Path) -> Vec<Value> {
 }
 
 fn uuids(lines: &[Value]) -> Vec<&str> {
-    lines.iter().filter_map(|v| v.get("uuid").and_then(Value::as_str)).collect()
+    lines
+        .iter()
+        .filter_map(|v| v.get("uuid").and_then(Value::as_str))
+        .collect()
 }
 
 /// Walk `parentUuid` back from the last record: the chain Claude Code loads on resume. Returns the
@@ -170,7 +206,9 @@ fn cut_at_message_index_starts_at_the_last_boundary_before_it() {
     assert_eq!(uuids(&got), ["b1", "s1", "a1", "r1", "a2"]);
     assert_eq!(res.lines_written, 5);
     // Every record carries the new id; parent links are exactly the source's.
-    assert!(got.iter().all(|v| v["sessionId"] == "22222222-2222-4222-8222-222222222222"));
+    assert!(got
+        .iter()
+        .all(|v| v["sessionId"] == "22222222-2222-4222-8222-222222222222"));
     assert_eq!(chain(&got), ["a2", "r1", "a1", "s1", "b1"]);
     // The future is omitted, and said so.
     assert_eq!(res.omitted_lines, 9);
@@ -251,7 +289,10 @@ fn from_compaction_takes_the_preserved_segment_and_full_takes_everything() {
         },
     )
     .unwrap();
-    assert_eq!((full.start_line, full.start_mode, full.boundary_msg_idx), (1, "full", None));
+    assert_eq!(
+        (full.start_line, full.start_mode, full.boundary_msg_idx),
+        (1, "full", None)
+    );
     assert_eq!(full.lines_written, 16);
     cleanup(&dir);
 }
@@ -260,7 +301,11 @@ fn from_compaction_takes_the_preserved_segment_and_full_takes_everything() {
 fn a_cut_between_parallel_results_runs_on_until_the_calls_close() {
     let dir = tmpdir();
     let src = session(&dir);
-    let res = rewind_session(&sref(&src, SID), &opts(CutAt::Message(idx_of(&src, "t1r")), &dir.join("o"))).unwrap();
+    let res = rewind_session(
+        &sref(&src, SID),
+        &opts(CutAt::Message(idx_of(&src, "t1r")), &dir.join("o")),
+    )
+    .unwrap();
     // t2 was issued before the cut; its result (line 15, after a hook record) comes along, the
     // next assistant turn does not.
     assert_eq!((res.cut_line, res.end_line), (13, 15));
@@ -280,7 +325,10 @@ fn provenance_sidecar_records_source_cut_and_start_and_the_source_is_untouched()
     let res = rewind_session(&sref(&src, SID), &opts(CutAt::Commit(SHA[..12].into()), &out)).unwrap();
     assert_eq!(std::fs::read(&src).unwrap(), before, "the source must never change");
 
-    assert_eq!(res.provenance_path, out.join("22222222-2222-4222-8222-222222222222.rewind.json"));
+    assert_eq!(
+        res.provenance_path,
+        out.join("22222222-2222-4222-8222-222222222222.rewind.json")
+    );
     let p: Value = serde_json::from_str(&std::fs::read_to_string(&res.provenance_path).unwrap()).unwrap();
     assert_eq!(p["format"], "cv-rewind");
     assert_eq!(p["source"]["id"], SID);
@@ -322,7 +370,10 @@ fn provenance_sidecar_records_source_cut_and_start_and_the_source_is_untouched()
 fn subagent_transcript_becomes_a_standalone_resumable_session() {
     let dir = tmpdir();
     let parent = dir.join(format!("{SID}.jsonl"));
-    write_jsonl(&parent, &[rec("user", "p0", None, json!({"role": "user", "content": "spawn"}))]);
+    write_jsonl(
+        &parent,
+        &[rec("user", "p0", None, json!({"role": "user", "content": "spawn"}))],
+    );
     let agent = dir.join(SID).join("subagents").join("agent-abc123.jsonl");
     let side = |ty: &str, uuid: &str, parent: Option<&str>, message: Value| {
         let mut v = rec(ty, uuid, parent, message);
@@ -335,7 +386,12 @@ fn subagent_transcript_becomes_a_standalone_resumable_session() {
         &agent,
         &[
             side("user", "x0", None, json!({"role": "user", "content": "fix the gate"})),
-            side("assistant", "x1", Some("x0"), bash("toolu_x", "git commit -qam fix && git rev-parse HEAD")),
+            side(
+                "assistant",
+                "x1",
+                Some("x0"),
+                bash("toolu_x", "git commit -qam fix && git rev-parse HEAD"),
+            ),
             side("user", "x2", Some("x1"), result("toolu_x", SHA)),
             side("assistant", "x3", Some("x2"), text("assistant", "committed")),
         ],
@@ -357,8 +413,12 @@ fn subagent_transcript_becomes_a_standalone_resumable_session() {
     assert_eq!(res.new_path.parent().unwrap(), dir);
     assert_eq!(res.source_session_id.as_deref(), Some(SID));
     let got = read_lines(&res.new_path);
-    assert!(got.iter().all(|v| v["isSidechain"] == false && v.get("agentId").is_none()));
-    assert!(got.iter().all(|v| v["sessionId"] == "22222222-2222-4222-8222-222222222222"));
+    assert!(got
+        .iter()
+        .all(|v| v["isSidechain"] == false && v.get("agentId").is_none()));
+    assert!(got
+        .iter()
+        .all(|v| v["sessionId"] == "22222222-2222-4222-8222-222222222222"));
     // The whole transcript is one root chain the loader can walk to a null parent.
     assert_eq!(chain(&got), ["x3", "x2", "x1", "x0"]);
     // …but resumes from the parent's launch dir, the one Claude files `-work-proj` under.
@@ -366,7 +426,8 @@ fn subagent_transcript_becomes_a_standalone_resumable_session() {
     assert_eq!(res.cut_cwd.as_deref(), Some("/work/proj/wt"));
     assert!(res.warnings.is_empty(), "{:?}", res.warnings);
     // And it reads back as an ordinary (non-sub-agent) session.
-    let s = crate::harness::claude::parse_reader("n", BufReader::new(std::fs::File::open(&res.new_path).unwrap()), None);
+    let s =
+        crate::harness::claude::parse_reader("n", BufReader::new(std::fs::File::open(&res.new_path).unwrap()), None);
     assert_eq!(s.messages.len(), 4);
     assert_eq!(std::fs::read(&agent).unwrap(), before);
 
@@ -407,7 +468,10 @@ fn file_mentions_finds_needles_across_chunk_boundaries() {
     body.extend_from_slice(&vec![b'y'; 1000]);
     body.extend_from_slice(b"9876543");
     std::fs::write(&p, &body).unwrap();
-    assert_eq!(file_mentions(&p, &["abcdef1", "9876543", "1111111"]).unwrap(), [true, true, false]);
+    assert_eq!(
+        file_mentions(&p, &["abcdef1", "9876543", "1111111"]).unwrap(),
+        [true, true, false]
+    );
     cleanup(&dir);
 }
 
@@ -431,7 +495,10 @@ fn sha_tokens_match_whole_hex_runs_prefix_compatibly() {
 fn git_verbs_classify_created_and_pushed() {
     use EvidenceKind::*;
     assert_eq!(git_evidence_kind("git commit -m x"), Some(Created));
-    assert_eq!(git_evidence_kind("cd /r && git -C /r -c user.name=a commit -qm 'x'"), Some(Created));
+    assert_eq!(
+        git_evidence_kind("cd /r && git -C /r -c user.name=a commit -qm 'x'"),
+        Some(Created)
+    );
     assert_eq!(git_evidence_kind("git --no-pager merge feature"), Some(Created));
     assert_eq!(git_evidence_kind("git cherry-pick abc1234"), Some(Created));
     assert_eq!(git_evidence_kind("git push -u origin HEAD"), Some(Pushed));
