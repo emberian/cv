@@ -1,7 +1,7 @@
-//! `cv prune` / `cv splice` / `cv loom` / `cv dataset` — reshaping sessions into new ones.
+//! `cv prune` / `cv rewind` / `cv splice` / `cv loom` / `cv dataset` — reshaping sessions into new ones.
 
 use crate::cmd::port::emit_session;
-use crate::util::{parse_harness, parse_range, resolve, short_id};
+use crate::util::{parse_harness, parse_range, resolve, short_id, usage};
 use anyhow::{bail, Context, Result};
 use cv_core::ir::{Block, Harness, Message, Role, Session};
 use cv_core::EmitOptions;
@@ -184,6 +184,170 @@ fn human_bytes(n: u64) -> String {
     } else {
         format!("{f:.1} {}", U[i])
     }
+}
+
+// ---------- rewind ----------
+
+/// The `--at` grammar: an all-digit value is a message index (the `cv show --range` counting), any
+/// other 7–64 hex digits a commit sha, nothing at all the last message. (A sha whose digits happen to
+/// be all decimal reads as an index — pass more of it; a full sha never is.)
+pub(crate) fn parse_cut(at: Option<&str>) -> Result<cv_core::rewind::CutAt> {
+    use cv_core::rewind::{normalize_sha, CutAt};
+    let Some(at) = at.map(str::trim) else {
+        return Ok(CutAt::End);
+    };
+    if !at.is_empty() && at.bytes().all(|b| b.is_ascii_digit()) {
+        return match at.parse() {
+            Ok(n) => Ok(CutAt::Message(n)),
+            Err(_) => usage(format!("--at {at:?}: message index out of range")),
+        };
+    }
+    match normalize_sha(at) {
+        Some(sha) => Ok(CutAt::Commit(sha)),
+        None => usage(format!(
+            "--at {at:?}: expected a message index (as `cv show --range` counts) or a commit sha (7–64 hex digits)"
+        )),
+    }
+}
+
+/// `cv rewind <id>` — derive the agent as of a past message or commit (see [`cv_core::rewind`]).
+/// `<id>` is any session id, an `agent-…` sub-agent id, or a transcript path; `--agent` picks a
+/// sub-agent under `<id>` the way `cv show --agent` does.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn cmd_rewind(
+    id: &str,
+    harness: Option<String>,
+    agent: Option<String>,
+    at: Option<&str>,
+    out: Option<PathBuf>,
+    to: Option<String>,
+    full: bool,
+    dry_run: bool,
+    json: bool,
+    generator: &str,
+) -> Result<()> {
+    let cut = parse_cut(at)?;
+    let path = std::path::Path::new(id);
+    let r = if path.is_file() {
+        // A transcript path (a sub-agent file straight from `subagents/`, or a copy elsewhere).
+        cv_core::ir::SessionRef {
+            id: path.file_stem().and_then(|s| s.to_str()).unwrap_or(id).to_string(),
+            harness: Harness::Claude,
+            path: path.to_path_buf(),
+            cwd: None,
+            title: None,
+            created_at: None,
+            updated_at: None,
+            message_count: 0,
+        }
+    } else {
+        resolve(id, parse_harness(&harness)?)?.0
+    };
+    let r = match &agent {
+        Some(a) => crate::cmd::view::resolve_subagent(&r, a)?.session,
+        None => r,
+    };
+    if r.harness != Harness::Claude {
+        return usage(format!(
+            "cv rewind currently supports Claude Code sessions only (got {}) — `cv splice {}:..N` composes a \
+             prefix of any harness",
+            r.harness,
+            short_id(&r.id)
+        ));
+    }
+
+    let pinned = to.is_some();
+    let res = cv_core::rewind::rewind_session(
+        &r,
+        &cv_core::rewind::RewindOptions {
+            at: cut,
+            full,
+            out_dir: out,
+            new_id: to,
+            dry_run,
+            generator: generator.to_string(),
+        },
+    )?;
+    let cwd = res.cwd.as_deref().map(std::path::Path::new);
+    let resume = crate::cmd::port::resume_lines(Harness::Claude, &res.new_id, cwd);
+    // Claude Code finds a session by its project dir; a rewind written anywhere else must be moved
+    // there first. (`--out` defaults to it, so this only fires for an explicit elsewhere.)
+    let home = cv_core::rewind::project_dir(&r.path);
+    let relocate = res.new_path.parent().is_some_and(|d| d != home);
+
+    if json {
+        // Compose-family convention: ONE JSON object on stdout, the human report on stderr.
+        // Dry-run honest, like `prune --json`: nothing written ⇒ null paths, and a null new_id
+        // unless --to pinned it.
+        let mut v = serde_json::to_value(&res)?;
+        v["harness"] = "claude".into();
+        v["resume"] = serde_json::json!(resume);
+        v["note"] = serde_json::Value::Null;
+        if res.dry_run {
+            for k in ["new_path", "provenance_path"] {
+                v[k] = serde_json::Value::Null;
+            }
+            if !pinned {
+                v["new_id"] = serde_json::Value::Null;
+                v["resume"] = serde_json::Value::Null;
+            }
+            v["note"] = "dry run — nothing written".into();
+        }
+        println!("{}", serde_json::to_string_pretty(&v)?);
+    }
+
+    let tag = if res.dry_run { " (dry run — nothing written)" } else { "" };
+    eprintln!("✦ rewound {} → {}{tag}", short_id(&res.source_id), short_id(&res.new_id));
+    let of = match (&res.subagent, &res.source_session_id) {
+        (true, Some(p)) => format!(" · sub-agent of {} → emitted as a top-level session", short_id(p)),
+        _ => String::new(),
+    };
+    eprintln!(
+        "  source:  {} ({}, sha256 {}…){of}",
+        res.source_path.display(),
+        human_bytes(res.source_bytes),
+        &res.source_sha256[..12],
+    );
+    let why = match &res.evidence {
+        Some(e) => format!(" · {} — `{}`", e.kind.label(), cv_core::ir::truncate(&e.command, 80)),
+        None => String::new(),
+    };
+    eprintln!("  cut:     msg {} · line {}{why}", res.cut_msg_idx, res.cut_line);
+    let from = match (res.start_mode, res.boundary_msg_idx, res.preserved_head) {
+        ("full", ..) => "the first record (--full)".to_string(),
+        (_, None, _) => "the first record (no compaction before the cut)".to_string(),
+        (_, Some(b), true) => format!("the compaction at msg {b}, from its preserved segment"),
+        (_, Some(b), false) => format!("the compaction at msg {b}"),
+    };
+    eprintln!("  start:   msg {} · line {} · {from}", res.start_msg_idx, res.start_line);
+    let closed = if res.closed_tool_calls > 0 {
+        format!(" (+{} tool result(s) past the cut, closing its open calls)", res.closed_tool_calls)
+    } else {
+        String::new()
+    };
+    eprintln!(
+        "  copied:  lines {}..={} — {} line(s), {}{closed} · omitted the {} line(s) after it",
+        res.start_line,
+        res.end_line,
+        res.lines_written,
+        human_bytes(res.bytes_written),
+        res.omitted_lines,
+    );
+    for w in &res.warnings {
+        eprintln!("  ⚠ {w}");
+    }
+    if !res.dry_run {
+        eprintln!("  new session: {}", res.new_path.display());
+        eprintln!("  provenance:  {}", res.provenance_path.display());
+        if relocate {
+            eprintln!("  ⚠ claude resumes from {} — copy it there first", home.display());
+        }
+        eprintln!("  resume with (add --fork-session to keep the rewind reusable):");
+        for line in &resume {
+            eprintln!("    {line}");
+        }
+    }
+    Ok(())
 }
 
 // ---------- splice / loom ----------

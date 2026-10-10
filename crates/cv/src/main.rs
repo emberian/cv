@@ -86,7 +86,7 @@ pub(crate) const GROUPS: &[(&str, &[&str])] = &[
             "doctor",
         ],
     ),
-    ("Reshape", &["prune", "splice", "loom", "port", "redact", "resume"]),
+    ("Reshape", &["prune", "rewind", "splice", "loom", "port", "redact", "resume"]),
     ("Export", &["export", "dataset", "pack"]),
     ("Fleet & live", &["task", "board", "scry", "share"]),
     ("System", &["index", "config", "schema", "formats", "recipes"]),
@@ -555,6 +555,46 @@ enum Cmd {
         retrieve: Option<String>,
         #[arg(long, hide = true, value_name = "RANGE")]
         range: Option<String>,
+    },
+    /// Rewind a Claude session to a past moment: a NEW resumable session holding the source's
+    /// records up to a message or the tool result that made a commit — the agent as it was when it
+    /// landed that code, ready for `claude --resume <new-id> --fork-session`. Starts at the last
+    /// compaction before the cut (the context the agent actually had); a sub-agent transcript comes
+    /// out as a standalone top-level session. Writes `<new-id>.rewind.json` provenance alongside.
+    Rewind {
+        /// Source session: an id (prefix, `harness:id`), a sub-agent's `agent-<id>`, or a transcript path.
+        id: String,
+        #[arg(long)]
+        harness: Option<String>,
+        /// The cut, inclusive: a message index (as `cv show --range` counts) or a commit sha (7+ hex
+        /// digits) — resolved to the `git commit`/`git push` tool result whose output names it, or an
+        /// error if none does. An all-digit value is an index. Omit for the last message.
+        #[arg(long, value_name = "MSG_IDX|SHA")]
+        at: Option<String>,
+        /// Rewind this sub-agent of <id> instead (its `agent-…` id, bare agentId, or a prefix), as
+        /// `cv show --agent` resolves it.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Write under this directory instead of the source's project dir (where `claude --resume`
+        /// looks; a sub-agent's is its parent's).
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// New session id (default: a fresh UUID).
+        #[arg(long)]
+        to: Option<String>,
+        /// Start at the last compaction boundary before the cut (the default): what a resume loads.
+        #[arg(long, conflicts_with = "full")]
+        from_compaction: bool,
+        /// Start at the source's first record instead (the whole history up to the cut).
+        #[arg(long)]
+        full: bool,
+        /// Report the window that would be written without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Also emit the result as ONE JSON object on stdout (snake_case, FULL ids, the `resume`
+        /// lines); the human report stays on stderr. Dry-run honest like `prune --json`.
+        #[arg(long)]
+        json: bool,
     },
     /// Compose a new session from spans of existing ones (`<id>:A..B`).
     Splice {
@@ -1100,6 +1140,18 @@ fn run() -> Result<()> {
                 json,
             )
         }
+        Cmd::Rewind {
+            id,
+            harness,
+            at,
+            agent,
+            out,
+            to,
+            from_compaction: _,
+            full,
+            dry_run,
+            json,
+        } => compose::cmd_rewind(&id, harness, agent, at.as_deref(), out, to, full, dry_run, json, BUILD_VERSION),
         Cmd::Config { add_export, rm_export } => config::cmd_config(add_export, rm_export),
         Cmd::Schema { json, commands } => schema::cmd_schema(&build_cli(), json, commands),
         Cmd::Formats { action } => formats::cmd_formats(action),
