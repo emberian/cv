@@ -27,7 +27,8 @@
   the live session's `subagents/` with the top-level `sessionId` restamped on every line, by byte
   offset, so no other byte changes. A `sessionId` quoted inside a tool output is left alone. It
   copies the `.meta.json` verbatim and prints the `SendMessage` call that resumes each agent. `--into`
-  defaults to the project's newest session and is printed first. It refuses an existing target
+  defaults to the project's newest session other than the agent's own and is printed first; agents
+  and sessions are looked up across every Claude root cv reads, not only `~/.claude`. It refuses an existing target
   file unless `--force`, checking every agent before it writes any. `--list <session>` lists a
   session's agents. `--orphans` lists unfinished agents of recent non-live sessions: `running`
   (no completion recorded), `stopped` (an exiting session sends one `stopped` notice naming every

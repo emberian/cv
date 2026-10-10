@@ -13,15 +13,29 @@ use cv_core::ir::Harness;
 use serde_json::json;
 use std::path::PathBuf;
 
+/// Where this environment's Claude Code writes (`$CLAUDE_CONFIG_DIR/projects` or
+/// `~/.claude/projects`): the project dir for a cwd is derived here.
 fn store() -> Result<PathBuf> {
     cv_core::harness::for_harness(Harness::Claude)
         .and_then(|a| a.storage_root())
         .context("Claude Code's store (~/.claude/projects) was not found")
 }
 
+/// Every Claude root cv reads (the store plus `CLUSTERVISION_CLAUDE_ROOTS` / `claude-roots`
+/// entries): sessions and agents are looked up across all of them.
+fn roots() -> Result<Vec<PathBuf>> {
+    let roots = cv_core::harness::for_harness(Harness::Claude)
+        .map(|a| a.storage_roots())
+        .unwrap_or_default();
+    if roots.is_empty() {
+        anyhow::bail!("Claude Code's store (~/.claude/projects) was not found");
+    }
+    Ok(roots)
+}
+
 /// A session spec → its file, with a miss or an ambiguity as a usage error (exit 2).
-fn session(root: &std::path::Path, spec: &str) -> Result<SessionFile> {
-    adopt::find_session(root, spec).or_else(|e| usage(e.to_string()))
+fn session(roots: &[PathBuf], spec: &str) -> Result<SessionFile> {
+    adopt::find_session(roots, spec).or_else(|e| usage(e.to_string()))
 }
 
 fn when(t: Option<std::time::SystemTime>) -> String {
@@ -55,18 +69,18 @@ pub(crate) struct AdoptArgs {
 }
 
 pub(crate) fn cmd_adopt(a: AdoptArgs) -> Result<()> {
-    let root = store()?;
+    let roots = roots()?;
     if let Some(spec) = &a.list {
-        return list(&root, spec, a.json);
+        return list(&roots, spec, a.json);
     }
     if a.orphans {
-        return orphans(&root, a.into.as_deref(), a.recent, a.json);
+        return orphans(&roots, a.into.as_deref(), a.recent, a.json);
     }
-    run(&root, &a)
+    run(&roots, &a)
 }
 
-fn list(root: &std::path::Path, spec: &str, json_out: bool) -> Result<()> {
-    let s = session(root, spec)?;
+fn list(roots: &[PathBuf], spec: &str, json_out: bool) -> Result<()> {
+    let s = session(roots, spec)?;
     let agents = adopt::session_agents(&s);
     let lanes = adopt::lanes_of_session(&s);
     let status = |id: &str| {
@@ -128,15 +142,15 @@ fn list(root: &std::path::Path, spec: &str, json_out: bool) -> Result<()> {
     Ok(())
 }
 
-fn orphans(root: &std::path::Path, into: Option<&str>, recent: usize, json_out: bool) -> Result<()> {
+fn orphans(roots: &[PathBuf], into: Option<&str>, recent: usize, json_out: bool) -> Result<()> {
     let (project, live) = match into {
         Some(spec) => {
-            let s = session(root, spec)?;
+            let s = session(roots, spec)?;
             (s.project_dir.clone(), s.session_id)
         }
         None => {
             let cwd = std::env::current_dir()?;
-            let project = adopt::project_dir_for_cwd(root, &cwd);
+            let project = adopt::project_dir_for_cwd(&store()?, &cwd);
             let Some(live) = adopt::newest_session(&project, &[]) else {
                 return usage(format!(
                     "no Claude sessions for {} ({}) — run from a project dir or pass --into <live-session>",
@@ -189,32 +203,39 @@ fn orphans(root: &std::path::Path, into: Option<&str>, recent: usize, json_out: 
     Ok(())
 }
 
-fn run(root: &std::path::Path, a: &AdoptArgs) -> Result<()> {
-    let from = a.from.as_deref().map(|f| session(root, f)).transpose()?;
-    let into_given = a.into.as_deref().map(|i| session(root, i)).transpose()?;
+fn run(roots: &[PathBuf], a: &AdoptArgs) -> Result<()> {
+    let from = a.from.as_deref().map(|f| session(roots, f)).transpose()?;
+    let into_given = a.into.as_deref().map(|i| session(roots, i)).transpose()?;
 
     // Every copy of each named agent (newest first).
     let mut found: Vec<Vec<AgentFile>> = Vec::new();
     for spec in &a.agents {
-        let hits = adopt::find_agent(root, spec, from.as_ref()).or_else(|e| usage(e.to_string()))?;
+        let hits = adopt::find_agent(roots, spec, from.as_ref()).or_else(|e| usage(e.to_string()))?;
         if hits.is_empty() {
             return usage(match &from {
                 Some(f) => format!("no sub-agent {spec:?} in {}/subagents/", f.session_id),
                 None => format!(
                     "no sub-agent {spec:?} in any session's subagents/ under {}",
-                    home_rel(root)
+                    roots.iter().map(|r| home_rel(r)).collect::<Vec<_>>().join(", ")
                 ),
             });
         }
         found.push(hits);
     }
 
-    // The live session: named, or the newest in the (first) agent's project.
+    // The live session: named, or the newest in the (first) agent's project other than the one
+    // that holds the agent — a session that just crashed is often the newest file, and it is the
+    // one we are rescuing FROM. The project is matched by slug across every root.
     let into = match into_given {
         Some(s) => s,
         None => {
             let first = &found[0][0];
-            let s = adopt::newest_session(&first.project_dir, &[]).context("the agent's project has no sessions")?;
+            let slug = first
+                .project_dir
+                .file_name()
+                .context("the agent's project dir has no name")?;
+            let s = adopt::newest_session_across(roots, slug, &[first.session_id.as_str()])
+                .context("the agent's project has no other session to adopt into (pass --into)")?;
             eprintln!(
                 "✦ into {} — the newest session in {} (last write {}); pass --into to choose another",
                 s.session_id,
@@ -279,7 +300,7 @@ fn run(root: &std::path::Path, a: &AdoptArgs) -> Result<()> {
                     .join(", ")
             );
         }
-        if into.project_dir != g.project_dir {
+        if into.project_dir.file_name() != g.project_dir.file_name() {
             eprintln!(
                 "  ⚠ crossing projects: the agent's cwd stays {} as recorded in its transcript",
                 home_rel(&g.project_dir)

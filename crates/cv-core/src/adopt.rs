@@ -108,11 +108,24 @@ fn session_files_in(project_dir: &Path) -> Vec<SessionFile> {
         .collect()
 }
 
-fn project_dirs(root: &Path) -> Vec<PathBuf> {
-    let Ok(rd) = std::fs::read_dir(root) else {
-        return vec![];
-    };
-    rd.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect()
+/// Every `projects/<slug>` dir under every root. The roots are the Claude adapter's
+/// `storage_roots()` (already de-duplicated by canonical path), so a seat's config dir is searched
+/// like `~/.claude`.
+fn project_dirs(roots: &[PathBuf]) -> Vec<PathBuf> {
+    roots
+        .iter()
+        .filter_map(|root| std::fs::read_dir(root).ok())
+        .flat_map(|rd| rd.flatten().map(|e| e.path()))
+        .filter(|p| p.is_dir())
+        .collect()
+}
+
+fn roots_display(roots: &[PathBuf]) -> String {
+    roots
+        .iter()
+        .map(|r| r.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The project dir Claude Code uses for a working directory (symlinks resolved, as Claude does).
@@ -121,12 +134,12 @@ pub fn project_dir_for_cwd(root: &Path, cwd: &Path) -> PathBuf {
     root.join(crate::emit::claude_encode_cwd(&real))
 }
 
-/// A session by full id or unique prefix, anywhere under `root`.
-pub fn find_session(root: &Path, spec: &str) -> Result<SessionFile> {
+/// A session by full id or unique prefix, anywhere under `roots`.
+pub fn find_session(roots: &[PathBuf], spec: &str) -> Result<SessionFile> {
     if spec.starts_with("agent-") {
         bail!("{spec} is a sub-agent id; this wants a session id");
     }
-    let mut hits: Vec<SessionFile> = project_dirs(root)
+    let mut hits: Vec<SessionFile> = project_dirs(roots)
         .iter()
         .flat_map(|d| session_files_in(d))
         .filter(|s| s.session_id.starts_with(spec))
@@ -135,7 +148,7 @@ pub fn find_session(root: &Path, spec: &str) -> Result<SessionFile> {
         return Ok(hits.swap_remove(i));
     }
     match hits.len() {
-        0 => bail!("no Claude session matching {spec:?} under {}", root.display()),
+        0 => bail!("no Claude session matching {spec:?} under {}", roots_display(roots)),
         1 => Ok(hits.pop().unwrap()),
         n => {
             let mut ids: Vec<String> = hits.iter().map(|s| s.session_id.clone()).collect();
@@ -150,6 +163,19 @@ pub fn newest_session(project_dir: &Path, exclude: &[&str]) -> Option<SessionFil
     session_files_in(project_dir)
         .into_iter()
         .filter(|s| !exclude.contains(&s.session_id.as_str()))
+        .max_by_key(|s| s.modified)
+}
+
+/// The most recently written session for one project slug (`-work-proj`) across every root,
+/// skipping `exclude`: the same working directory is one project in each Claude config dir.
+pub fn newest_session_across(
+    roots: &[PathBuf],
+    project_slug: &std::ffi::OsStr,
+    exclude: &[&str],
+) -> Option<SessionFile> {
+    roots
+        .iter()
+        .filter_map(|root| newest_session(&root.join(project_slug), exclude))
         .max_by_key(|s| s.modified)
 }
 
@@ -203,14 +229,14 @@ pub fn session_agents(session: &SessionFile) -> Vec<AgentFile> {
 }
 
 /// Every copy of an agent (full id or unique prefix; `agent-` optional) in any session's
-/// `subagents/` under `root`, or only in `from` when given. Newest copy first. Copies of ONE agent
+/// `subagents/` under `roots`, or only in `from` when given. Newest copy first. Copies of ONE agent
 /// in several sessions (an earlier adoption) are expected; a prefix matching two different agent
 /// ids is an error.
-pub fn find_agent(root: &Path, spec: &str, from: Option<&SessionFile>) -> Result<Vec<AgentFile>> {
+pub fn find_agent(roots: &[PathBuf], spec: &str, from: Option<&SessionFile>) -> Result<Vec<AgentFile>> {
     let want = spec.strip_prefix("agent-").unwrap_or(spec);
     let sessions: Vec<SessionFile> = match from {
         Some(s) => vec![s.clone()],
-        None => project_dirs(root).iter().flat_map(|d| session_files_in(d)).collect(),
+        None => project_dirs(roots).iter().flat_map(|d| session_files_in(d)).collect(),
     };
     let mut hits: Vec<AgentFile> = Vec::new();
     for s in &sessions {
@@ -488,9 +514,9 @@ mod tests {
     #[test]
     fn adopt_restamps_only_the_session_id_and_copies_the_meta() {
         let root = fixture("rewrite");
-        let into = find_session(&root, "2222").unwrap();
+        let into = find_session(std::slice::from_ref(&root), "2222").unwrap();
         assert_eq!(into.session_id, LIVE);
-        let hits = find_agent(&root, &format!("agent-{}", &AGENT[..6]), None).unwrap();
+        let hits = find_agent(std::slice::from_ref(&root), &format!("agent-{}", &AGENT[..6]), None).unwrap();
         assert_eq!(hits.len(), 1);
         let src_text = std::fs::read_to_string(&hits[0].path).unwrap();
         let p = plan(hits[0].clone(), vec![], &into);
@@ -525,12 +551,12 @@ mod tests {
     #[test]
     fn adopt_refuses_to_overwrite_without_force() {
         let root = fixture("refuse");
-        let into = find_session(&root, LIVE).unwrap();
-        let agent = find_agent(&root, AGENT, None).unwrap().remove(0);
+        let into = find_session(std::slice::from_ref(&root), LIVE).unwrap();
+        let agent = find_agent(std::slice::from_ref(&root), AGENT, None).unwrap().remove(0);
         execute(&plan(agent.clone(), vec![], &into), true, false).unwrap();
 
         // The agent now lives in both sessions; the search sees both copies, newest first.
-        let copies = find_agent(&root, AGENT, None).unwrap();
+        let copies = find_agent(std::slice::from_ref(&root), AGENT, None).unwrap();
         assert_eq!(copies.len(), 2);
 
         // A sentinel in the adopted copy shows whether a refused run wrote anything.
@@ -546,7 +572,7 @@ mod tests {
         assert!(std::fs::read_to_string(&p.dest).unwrap().contains(LIVE));
 
         // Adopting into the session that already owns the agent is refused.
-        let dead = find_session(&root, DEAD).unwrap();
+        let dead = find_session(std::slice::from_ref(&root), DEAD).unwrap();
         assert!(execute(&plan(agent, vec![], &dead), true, true).is_err());
         std::fs::remove_dir_all(&root).ok();
     }
@@ -555,7 +581,7 @@ mod tests {
     fn newest_session_and_listing() {
         let root = fixture("list");
         let proj = root.join("-tmp-proj");
-        let dead = find_session(&root, DEAD).unwrap();
+        let dead = find_session(std::slice::from_ref(&root), DEAD).unwrap();
         let agents = session_agents(&dead);
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].description.as_deref(), Some("fixture lane"));
@@ -563,7 +589,7 @@ mod tests {
         let newest = newest_session(&proj, &[]).unwrap().session_id;
         assert!(newest == DEAD || newest == LIVE);
         assert_ne!(newest_session(&proj, &[newest.as_str()]).unwrap().session_id, newest);
-        assert!(find_session(&root, &format!("agent-{AGENT}")).is_err());
+        assert!(find_session(std::slice::from_ref(&root), &format!("agent-{AGENT}")).is_err());
         std::fs::remove_dir_all(&root).ok();
     }
 

@@ -686,7 +686,8 @@ enum Cmd {
         #[arg(required_unless_present_any = ["list", "orphans"], conflicts_with_all = ["list", "orphans"])]
         agents: Vec<String>,
         /// The live session that adopts them (default: the newest session in the agent's
-        /// project, printed before acting). With --orphans: the live session to exclude.
+        /// project other than the one holding it, printed before acting). With --orphans: the
+        /// live session to exclude.
         #[arg(long, value_name = "SESSION")]
         into: Option<String>,
         /// The dead session that holds them (default: search every session's `subagents/`;

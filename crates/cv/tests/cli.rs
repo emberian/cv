@@ -2732,3 +2732,43 @@ fn adopt_moves_a_stranded_lane_into_the_live_session() {
     let (out, _) = w.cv_ok(&["cat", &format!("agent-{aid}"), "t1"]);
     assert!(out.contains("deadsess"), "{out}");
 }
+
+/// The dead session lives in an agent seat's config dir (named by `claude-roots`), and is the most
+/// recently written file of the project; the live session is under `~/.claude`. Adopt finds the
+/// agent across roots, and the default target is the newest session OTHER than the one being
+/// rescued from, in whichever root holds it.
+#[test]
+fn adopt_reaches_extra_claude_roots_and_never_targets_the_dead_session() {
+    let w = World::new("adopt-roots");
+    let (dead, live, aid) = ("deadsess", "livesess", "afedcba9876543210");
+    let root_line = |sid: &str| {
+        serde_json::json!({"type": "user", "uuid": format!("{sid}-1"), "sessionId": sid,
+            "timestamp": "2026-01-01T09:00:00Z", "cwd": "/work/proj",
+            "message": {"role": "user", "content": "run the lanes"}})
+    };
+    w.write_session(live, &[root_line(live)]);
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let seat_proj = w.home.join("seats/bonsai/claude/projects/-work-proj");
+    let sub = seat_proj.join(dead).join("subagents");
+    fs::create_dir_all(&sub).unwrap();
+    fs::write(seat_proj.join(format!("{dead}.jsonl")), format!("{}\n", root_line(dead))).unwrap();
+    let mut l = serde_json::json!({"type": "user", "uuid": "u0", "parentUuid": null, "timestamp": "2026-01-01T10:00:00Z",
+        "cwd": "/work/proj", "message": {"role": "user", "content": "You are lane SEAT."}});
+    l["isSidechain"] = true.into();
+    l["agentId"] = aid.into();
+    l["sessionId"] = dead.into();
+    fs::write(sub.join(format!("agent-{aid}.jsonl")), format!("{l}\n")).unwrap();
+
+    // The seat root is not configured yet: the agent is invisible.
+    let (ok, _, _, err) = w.cv(&["adopt", aid, "--dry-run"]);
+    assert!(!ok && err.contains("no sub-agent"), "{err}");
+
+    fs::write(w.cv_home.join("claude-roots"), "~/seats/*/claude\n").unwrap();
+    let (_, err) = w.cv_ok(&["adopt", aid, "--dry-run"]);
+    assert!(err.contains("into livesess"), "the dead session is newer but is never the target: {err}");
+    w.cv_ok(&["adopt", aid]);
+    let copied = w.home.join(".claude/projects/-work-proj/livesess/subagents").join(format!("agent-{aid}.jsonl"));
+    assert!(fs::read_to_string(copied).unwrap().contains("\"sessionId\":\"livesess\""));
+    let (out, _) = w.cv_ok(&["adopt", "--list", dead]);
+    assert!(out.contains(aid), "a seat session lists by id too: {out}");
+}
