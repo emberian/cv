@@ -441,15 +441,18 @@ enum Cmd {
     /// Code provenance: which agent session wrote this code, and what was it thinking?
     ///
     /// Correlates the file's git history with the event catalog's file_edit events — an agent
-    /// edit shortly before a commit is strong evidence that session authored it. Each matched
-    /// commit gets its best sessions plus a `cv show --range` hint into the conversation around
-    /// the edit. Run `cv index` first to ingest events.
+    /// edit shortly before a commit is strong evidence that session authored it. A session whose
+    /// own tool output shows the commit being made ranks above all of those as `exact: commit
+    /// created here`, with a `cv rewind <id> --at <sha>` hint to resume that agent as of the commit.
+    /// Each matched commit gets its best sessions plus a `cv show --range` hint into the
+    /// conversation around the edit. Run `cv index` first to ingest events.
     Blame {
         file: String,
         /// Only these lines: `<line>` or `<line>,<endline>` (via `git blame -L`).
         #[arg(short = 'L', value_name = "LINE[,ENDLINE]")]
         lines: Option<String>,
-        /// Also print the conversation window around the single best-matched edit.
+        /// Also print the conversation window around the single best match (the commit itself
+        /// for an exact match, else the matched edit).
         #[arg(long)]
         show: bool,
     },

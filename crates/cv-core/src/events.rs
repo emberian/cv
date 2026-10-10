@@ -399,6 +399,9 @@ pub struct EditEvent {
     /// Session created/updated unix seconds — the weak-match window when `ts` is `None`.
     pub created_at: Option<i64>,
     pub updated_at: Option<i64>,
+    /// For a sub-agent transcript folded in by `cv index --subagents`: the session that spawned it
+    /// (often the one that committed what the sub-agent edited).
+    pub parent_id: Option<String>,
 }
 
 #[cfg(feature = "sqlite")]
@@ -911,7 +914,7 @@ mod db {
         // back to event_targets only resolves the matched rows' target strings by rowid.
         let Ok(mut stmt) = conn.prepare(
             "SELECT es.harness, es.session_id, e.msg_idx, e.ts, t.target,
-                    MAX(s.title), MAX(s.cwd), MAX(s.created_at), MAX(s.updated_at)
+                    MAX(s.title), MAX(s.cwd), MAX(s.created_at), MAX(s.updated_at), MAX(es.parent_id)
              FROM events e
              JOIN event_targets t ON t.id = e.target_id
              JOIN event_sessions es ON es.id = e.session
@@ -935,6 +938,7 @@ mod db {
                 cwd: row.get(6)?,
                 created_at: row.get(7)?,
                 updated_at: row.get(8)?,
+                parent_id: row.get(9)?,
             })
         });
         match rows {

@@ -261,6 +261,16 @@ pub fn commit_evidence(r: &SessionRef, shas: &[String]) -> Result<Vec<CommitEvid
     Ok(sink.found)
 }
 
+/// [`commit_evidence`] over many sessions at once (in parallel where the build allows), keeping
+/// only the sessions with evidence. Per-session failures (an unreadable transcript) are skipped:
+/// exact evidence is a bonus tier, never a reason to fail the caller.
+pub fn commit_evidence_many(refs: Vec<SessionRef>, shas: &[String]) -> Vec<(SessionRef, Vec<CommitEvidence>)> {
+    crate::par_filter_map(refs, |r| {
+        let found = commit_evidence(&r, shas).ok()?;
+        (!found.is_empty()).then_some((r, found))
+    })
+}
+
 /// Which of `needles` (ASCII, case-insensitive) occur anywhere in the file, by one chunked read —
 /// the file is never held whole. Chunks overlap by the longest needle so a match can't straddle.
 fn file_mentions(path: &Path, needles: &[&str]) -> Result<Vec<bool>> {
