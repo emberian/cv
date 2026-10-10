@@ -6,6 +6,7 @@
 //! Every harness has an [`Adapter`](harness::Adapter) that *discovers* sessions on disk and *parses*
 //! them into the common [`Session`] IR. Cross-harness porting is then `parse(A) -> IR -> emit(B)`.
 
+pub mod adopt;
 pub mod board;
 pub mod catalog;
 pub mod compaction;
@@ -410,6 +411,9 @@ fn find_subagent_session(id: &str, harness: Option<Harness>) -> Result<Option<Fo
     let parent = match parents.as_slice() {
         [] => return Ok(None),
         [one] => one,
+        // Copies of ONE agent under several sessions (`cv adopt` moved it into a live session):
+        // the newest parent's copy is the one that continues, so it wins.
+        many if one_agent_across(many, id) => &many[0],
         many => {
             let mut names: Vec<String> = many
                 .iter()
@@ -442,6 +446,19 @@ fn find_subagent_session(id: &str, harness: Option<Harness>) -> Result<Option<Fo
         }
         _ => Err(ambiguous(id, hits.iter())),
     }
+}
+
+/// Whether every sub-agent matching `id` (`agent-` optional) under `parents` is the same agent:
+/// copies of one agent in several sessions, as `cv adopt` leaves them.
+pub fn one_agent_across(parents: &[SessionRef], id: &str) -> bool {
+    let want = format!("agent-{}", id.strip_prefix("agent-").unwrap_or(id));
+    let ids: std::collections::BTreeSet<String> = parents
+        .iter()
+        .flat_map(subagent_tree_of)
+        .map(|s| s.session.id)
+        .filter(|s| s.starts_with(&want))
+        .collect();
+    ids.len() == 1
 }
 
 /// A resolved session: its catalog ref plus the harness adapter that reads it.

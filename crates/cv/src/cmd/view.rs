@@ -244,6 +244,16 @@ fn render_text(
 /// more reading of the id to try).
 fn show_agent_fleetwide(agent_id: &str, json: bool, window: &WindowArgs) -> Result<bool> {
     let parents = cv_core::find_subagent_parents(agent_id);
+    // Copies of one agent across sessions (`cv adopt`) read through the newest parent's copy.
+    let parents = if parents.len() > 1 && cv_core::one_agent_across(&parents, agent_id) {
+        eprintln!(
+            "✦ {} sessions hold a copy of this agent (adopted); reading the newest — `cv show <session> --agent {agent_id}` for another",
+            parents.len()
+        );
+        parents[..1].to_vec()
+    } else {
+        parents
+    };
     match parents.as_slice() {
         [] => Ok(false),
         [parent] => {

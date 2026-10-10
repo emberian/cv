@@ -171,7 +171,7 @@ pub(crate) fn cmd_prune(
 }
 
 /// Group-separate + unit a byte count (`5242880` → `5.0 MB`).
-fn human_bytes(n: u64) -> String {
+pub(crate) fn human_bytes(n: u64) -> String {
     const U: [&str; 4] = ["B", "KB", "MB", "GB"];
     let mut f = n as f64;
     let mut i = 0;

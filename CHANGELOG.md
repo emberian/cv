@@ -22,6 +22,19 @@
   their byte offset under `lazy_offsets`, so any session with one (current Claude Code writes
   them constantly) recorded no seek row and `cv show --range` fell back to a full stream.
 - `cv_core::digest::Sha256` — the vendored SHA-256, now incremental.
+- **`cv adopt` rescues sub-agents stranded by a dead Claude Code session.** `cv adopt <agent-id>…
+  [--into <live>] [--from <dead>] [--dry-run] [--force]` copies `subagents/agent-<id>.jsonl` into
+  the live session's `subagents/` with the top-level `sessionId` restamped on every line, by byte
+  offset, so no other byte changes. A `sessionId` quoted inside a tool output is left alone. It
+  copies the `.meta.json` verbatim and prints the `SendMessage` call that resumes each agent. `--into`
+  defaults to the project's newest session and is printed first. It refuses an existing target
+  file unless `--force`, checking every agent before it writes any. `--list <session>` lists a
+  session's agents. `--orphans` lists unfinished agents of recent non-live sessions: `running`
+  (no completion recorded), `stopped` (an exiting session sends one `stopped` notice naming every
+  lane it abandons), `killed`, `failed`, or stranded. Persisted outputs and prune sidecars stay
+  with the dead session, and the command says so.
+- **Copies of one agent no longer make its id ambiguous.** After an adoption, `cv show`/`cv cat
+  agent-<id>` read the newest session's copy instead of erroring that two sessions hold it.
 - **`cv distill` — a transcript as a reshapeable lane context** (`docs/design/DISTILL.md`). It
   compresses a long session, typically a sub-agent lane at 500K–900K tokens, into a pack. The pack
   holds verbatim: the brief, every message to the agent, everything the agent said, sent or wrote

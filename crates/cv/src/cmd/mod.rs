@@ -1,5 +1,6 @@
 //! One module per command family — see `main.rs` for the clap definitions and dispatch.
 
+pub(crate) mod adopt;
 pub(crate) mod browse;
 pub(crate) mod cat;
 pub(crate) mod compose;

@@ -2657,3 +2657,78 @@ fn distill_emits_a_whole_resumable_session_and_a_sub_agent() {
         "distill must never modify the source"
     );
 }
+
+// ───────────────────────────── adopt ─────────────────────────────
+
+#[test]
+fn adopt_moves_a_stranded_lane_into_the_live_session() {
+    let w = World::new("adopt");
+    let (dead, live, aid) = ("deadsess", "livesess", "a0123456789abcdef");
+    let root_line = |sid: &str| {
+        serde_json::json!({"type": "user", "uuid": format!("{sid}-1"), "sessionId": sid,
+            "timestamp": "2026-01-01T09:00:00Z", "cwd": "/work/proj",
+            "message": {"role": "user", "content": "run the lanes"}})
+    };
+    w.write_session(dead, &[root_line(dead)]);
+    let sub = w.home.join(".claude/projects/-work-proj/deadsess/subagents");
+    fs::create_dir_all(&sub).unwrap();
+    let line = |v: serde_json::Value| {
+        let mut v = v;
+        v["isSidechain"] = true.into();
+        v["agentId"] = aid.into();
+        v["sessionId"] = dead.into();
+        v["cwd"] = "/work/proj".into();
+        format!("{v}\n")
+    };
+    let body = [
+        line(serde_json::json!({"type": "user", "uuid": "u0", "parentUuid": null, "timestamp": "2026-01-01T10:00:00Z",
+            "message": {"role": "user", "content": "You are lane TEST."}})),
+        line(serde_json::json!({"type": "assistant", "uuid": "a1", "parentUuid": "u0", "timestamp": "2026-01-01T10:01:00Z",
+            "message": {"role": "assistant", "model": "claude-test-1", "content": [
+                {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "grep sessionId x.jsonl"}}]}})),
+        // The tool output quotes a transcript line: its sessionId is content and must survive.
+        line(serde_json::json!({"type": "user", "uuid": "u1", "parentUuid": "a1", "timestamp": "2026-01-01T10:02:00Z",
+            "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1",
+                "content": "{\"sessionId\":\"deadsess\"}", "is_error": false}]}})),
+    ]
+    .concat();
+    let agent = sub.join(format!("agent-{aid}.jsonl"));
+    fs::write(&agent, &body).unwrap();
+    let meta = r#"{"agentType":"general-purpose","description":"Lane TEST","model":"opus"}"#;
+    fs::write(sub.join(format!("agent-{aid}.meta.json")), meta).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    w.write_session(live, &[root_line(live)]); // the newest session: the default --into
+
+    let (out, _) = w.cv_ok(&["adopt", "--list", dead]);
+    assert!(out.contains(aid) && out.contains("Lane TEST") && out.contains("yes"), "{out}");
+
+    let live_sub = w.home.join(".claude/projects/-work-proj/livesess/subagents");
+    let (_, err) = w.cv_ok(&["adopt", &aid[..8], "--dry-run"]);
+    assert!(err.contains("into livesess"), "the default target is announced: {err}");
+    assert!(err.contains("restamped on 3 of 3 lines"), "{err}");
+    assert!(err.contains(&format!("\"to\": \"{aid}\"")), "the SendMessage incantation: {err}");
+    assert!(err.contains("cv cat deadsess"), "the sidecar reminder: {err}");
+    assert!(!live_sub.exists(), "a dry run writes nothing");
+
+    w.cv_ok(&["adopt", aid]);
+    let copied = fs::read_to_string(live_sub.join(format!("agent-{aid}.jsonl"))).unwrap();
+    assert_eq!(copied, body.replace("\"sessionId\":\"deadsess\"", "\"sessionId\":\"livesess\"").replace(
+        "{\\\"sessionId\\\":\\\"livesess\\\"}",
+        "{\\\"sessionId\\\":\\\"deadsess\\\"}"
+    ));
+    assert!(copied.contains("{\\\"sessionId\\\":\\\"deadsess\\\"}"), "content untouched");
+    assert_eq!(fs::read_to_string(live_sub.join(format!("agent-{aid}.meta.json"))).unwrap(), meta);
+    assert_eq!(fs::read_to_string(&agent).unwrap(), body, "the source is never modified");
+
+    // A second adoption refuses (nothing written) until --force.
+    fs::write(live_sub.join(format!("agent-{aid}.jsonl")), "sentinel\n").unwrap();
+    let (ok, _, _, err) = w.cv(&["adopt", aid, "--from", dead, "--into", live]);
+    assert!(!ok && err.contains("refusing to overwrite"), "{err}");
+    assert_eq!(fs::read_to_string(live_sub.join(format!("agent-{aid}.jsonl"))).unwrap(), "sentinel\n");
+    w.cv_ok(&["adopt", aid, "--from", dead, "--into", live, "--force"]);
+    assert!(fs::read_to_string(live_sub.join(format!("agent-{aid}.jsonl"))).unwrap().contains("livesess"));
+
+    // The agent now has two copies; reading it by id takes the newest instead of erroring.
+    let (out, _) = w.cv_ok(&["cat", &format!("agent-{aid}"), "t1"]);
+    assert!(out.contains("deadsess"), "{out}");
+}

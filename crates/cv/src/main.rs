@@ -88,7 +88,7 @@ pub(crate) const GROUPS: &[(&str, &[&str])] = &[
     ),
     (
         "Reshape",
-        &["prune", "rewind", "distill", "fork", "splice", "loom", "port", "redact", "resume"],
+        &["prune", "rewind", "distill", "fork", "adopt", "splice", "loom", "port", "redact", "resume"],
     ),
     ("Export", &["export", "dataset", "pack"]),
     ("Fleet & live", &["task", "board", "scry", "share"]),
@@ -673,6 +673,42 @@ enum Cmd {
         cwd: Option<PathBuf>,
         #[arg(long)]
         out: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Rescue sub-agents stranded by a dead Claude Code session into a live one, so the live
+    /// session can `SendMessage` them and they resume with their whole transcript: copies
+    /// `subagents/agent-<id>.jsonl` (with `sessionId` restamped on every line, nothing else
+    /// changed) and its `.meta.json` into the live session's `subagents/`. `--list <session>`
+    /// lists a session's agents; `--orphans` lists unfinished agents of recent dead sessions.
+    Adopt {
+        /// Agent ids (`a5d8…` or `agent-a5d8…`, unique prefix ok).
+        #[arg(required_unless_present_any = ["list", "orphans"], conflicts_with_all = ["list", "orphans"])]
+        agents: Vec<String>,
+        /// The live session that adopts them (default: the newest session in the agent's
+        /// project, printed before acting). With --orphans: the live session to exclude.
+        #[arg(long, value_name = "SESSION")]
+        into: Option<String>,
+        /// The dead session that holds them (default: search every session's `subagents/`;
+        /// when several hold a copy, the newest copy is taken).
+        #[arg(long, value_name = "SESSION")]
+        from: Option<String>,
+        /// Print what would be copied; write nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Replace an agent file already present in the live session.
+        #[arg(long)]
+        force: bool,
+        /// List a session's sub-agents: status, model, size, description, whether a meta exists.
+        #[arg(long, value_name = "SESSION", conflicts_with_all = ["orphans", "from", "dry_run", "force"])]
+        list: Option<String>,
+        /// List unfinished sub-agents (running / stopped / killed / failed / stranded) of the
+        /// project's recent sessions other than the live one (the cwd's project, or --into's).
+        #[arg(long, conflicts_with_all = ["from", "dry_run", "force"])]
+        orphans: bool,
+        /// With --orphans: how many recent sessions to scan.
+        #[arg(long, default_value_t = 10, requires = "orphans")]
+        recent: usize,
         #[arg(long)]
         json: bool,
     },
@@ -1356,6 +1392,27 @@ fn run() -> Result<()> {
             let target = cmd::distill::target(session, agent_of, cwd, out)?;
             cmd::distill::cmd_fork(&id, harness, at, target, json)
         }
+        Cmd::Adopt {
+            agents,
+            into,
+            from,
+            dry_run,
+            force,
+            list,
+            orphans,
+            recent,
+            json,
+        } => cmd::adopt::cmd_adopt(cmd::adopt::AdoptArgs {
+            agents,
+            into,
+            from,
+            dry_run,
+            force,
+            list,
+            orphans,
+            recent,
+            json,
+        }),
         Cmd::Splice {
             specs,
             harness,
