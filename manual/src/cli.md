@@ -513,10 +513,10 @@ Each matched commit prints the session, the message index of the nearest edit, a
 Some matches are not heuristic. When a candidate session ran the commit itself through a tool — a `git commit` (or `merge`, `cherry-pick`, `revert`) whose output names the sha, or a `git push` that does — blame reads that straight out of the transcript and ranks it above every timed match, labeled `exact: commit created here` (or `exact: commit pushed here`). That line also carries a [`cv rewind`](#cv-rewind) hint, which resumes that agent as it was at the moment of the commit:
 
 ```text
-◆ 63cef47 2026-10-09  gate plan: an undeclared linked worktree names its repository's project …
-  claude   fc3b7de4  2026-10-09  "Meta-claude project lead manager"  commit at msg 179078 (exact: commit created here)
-    ↳ cv rewind fc3b7de4 --at 63cef47
-    ↳ cv show fc3b7de4 --range 179075..179081
+◆ d41c0de 2026-10-09  gate plan: an undeclared linked worktree names its repository's project …
+  claude   7b2e19a4  2026-10-09  "Refactor the request router"  commit at msg 1240 (exact: commit created here)
+    ↳ cv rewind 7b2e19a4 --at d41c0de
+    ↳ cv show 7b2e19a4 --range 1237..1243
 ```
 
 The candidates are the sessions with an edit on the file (plus, for sub-agents cataloged by `cv index --subagents`, the session that spawned them) whose transcript was written to after the commit; a session that committed without ever editing the file through a tool is not scanned. The scan reads the transcripts themselves, so it doesn't need a fresh index — only the candidate list comes from the catalog. A rebased or cherry-picked commit has a sha no session ever printed, and a commit made with silenced output (`-q` and no `rev-parse`) leaves no proof.
@@ -599,12 +599,12 @@ Claude Code only for now (it operates on the raw JSONL to stay byte-faithful).
 Reconstruct an agent **as it was at a past moment** — a message, or the commit it landed — as a new, resumable Claude Code session. The use case is review by the author: when one agent changes code another session wrote, resume the writer *as of the moment it committed that code* and ask it to review the change. `claude --resume` alone can't do that — it loads the session's current tail, after every later compaction — and most writers are sub-agents, whose transcripts can't be resumed at all.
 
 ```sh
-cv rewind fc3b7de4 --at 63cef47              # through the tool result that shows that commit being made
-cv rewind fc3b7de4 --at 179078               # through message 179078 (as `cv show --range` counts)
-cv rewind fc3b7de4 --at 63cef47 --full       # from the first record, not the last compaction
-cv rewind agent-a7f5742c50c0b9654            # a sub-agent, extracted as a standalone session
-cv rewind fc3b7de4 --agent a7f57 --at 9f00ba5
-cv rewind fc3b7de4 --at 63cef47 --dry-run --json
+cv rewind 7b2e19a4 --at d41c0de              # through the tool result that shows that commit being made
+cv rewind 7b2e19a4 --at 1240               # through message 1240 (as `cv show --range` counts)
+cv rewind 7b2e19a4 --at d41c0de --full       # from the first record, not the last compaction
+cv rewind agent-b81e242c50c0b9654            # a sub-agent, extracted as a standalone session
+cv rewind 7b2e19a4 --agent b81e2 --at c0ffee1
+cv rewind 7b2e19a4 --at d41c0de --dry-run --json
 
 claude --resume <new-id> --fork-session -p "Another agent changed the code you just landed. Review its diff: …"
 ```
