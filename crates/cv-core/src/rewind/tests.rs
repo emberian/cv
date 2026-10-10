@@ -384,7 +384,7 @@ fn subagent_transcript_becomes_a_standalone_resumable_session() {
 }
 
 #[test]
-fn commit_evidence_scans_only_sessions_that_mention_the_sha() {
+fn commit_evidence_reports_only_git_proof_of_the_queried_shas() {
     let dir = tmpdir();
     let src = session(&dir);
     let r = sref(&src, SID);

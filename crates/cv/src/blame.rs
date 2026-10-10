@@ -535,15 +535,11 @@ fn hint_id(id: &str) -> String {
     }
 }
 
-/// The exact tier for `commits` (see the module docs): candidates are the sessions with an edit on
-/// the file plus the parents of sub-agents among them, kept only if their transcript was written
-/// to after the earliest commit landed; each is scanned for tool output naming a commit's sha.
-fn exact_matches(commits: &[CommitInfo], edits: &[EditEvent]) -> Vec<ExactMatch> {
-    let Some(earliest) = commits.iter().map(|c| c.time).min() else {
-        return Vec::new();
-    };
+/// The sessions the exact tier scans, deduplicated in first-seen order: every session with an edit
+/// on the file, and the parent of each sub-agent among them (a sub-agent's parent is a Claude
+/// session — the orchestrator that often commits what its agents wrote).
+pub(crate) fn candidate_ids(edits: &[EditEvent]) -> Vec<(String, String)> {
     let mut ids: Vec<(String, String)> = Vec::new();
-    let mut titles: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for e in edits {
         for (h, id) in std::iter::once((e.harness.as_str(), e.session_id.as_str()))
             .chain(e.parent_id.as_deref().map(|p| ("claude", p)))
@@ -552,6 +548,20 @@ fn exact_matches(commits: &[CommitInfo], edits: &[EditEvent]) -> Vec<ExactMatch>
                 ids.push((h.to_string(), id.to_string()));
             }
         }
+    }
+    ids
+}
+
+/// The exact tier for `commits` (see the module docs): candidates are the sessions with an edit on
+/// the file plus the parents of sub-agents among them, kept only if their transcript was written
+/// to after the earliest commit landed; each is scanned for tool output naming a commit's sha.
+fn exact_matches(commits: &[CommitInfo], edits: &[EditEvent]) -> Vec<ExactMatch> {
+    let Some(earliest) = commits.iter().map(|c| c.time).min() else {
+        return Vec::new();
+    };
+    let ids = candidate_ids(edits);
+    let mut titles: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for e in edits {
         if let Some(t) = &e.title {
             titles.entry(e.session_id.clone()).or_insert_with(|| t.clone());
         }
@@ -871,6 +881,17 @@ mod tests {
         let plain = rank_commit("ffffffffffffffffffffffffffffffffffffffff", &exact, correlate(T, &edits, &root()), &edits);
         assert_eq!(plain.len(), 3);
         assert!(plain.iter().all(|r| matches!(r, Ranked::Timed(_))));
+    }
+
+    #[test]
+    fn candidates_include_each_subagents_parent_once() {
+        let mut sub = ev("agent-a7f5", 2, Some(T), None, None);
+        sub.parent_id = Some("orchestrator".into());
+        let mut sub2 = ev("agent-b8e6", 5, Some(T), None, None);
+        sub2.parent_id = Some("orchestrator".into());
+        let edits = vec![ev("solo", 1, Some(T), None, None), sub, ev("solo", 9, Some(T), None, None), sub2];
+        let ids: Vec<String> = candidate_ids(&edits).into_iter().map(|(_, id)| id).collect();
+        assert_eq!(ids, ["solo", "agent-a7f5", "orchestrator", "agent-b8e6"]);
     }
 
     #[test]
