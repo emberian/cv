@@ -31,6 +31,7 @@ pub mod prune;
 pub mod query;
 pub mod redact;
 pub mod render;
+pub mod rewind;
 pub mod rows;
 pub mod sanitize;
 pub mod scan;

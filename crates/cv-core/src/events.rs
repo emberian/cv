@@ -219,7 +219,7 @@ fn file_key(input: &Value) -> Option<&str> {
 
 /// The command string of a shell-ish tool input: a plain string, an argv array joined with
 /// spaces, or codex local_shell's nested `action.command`.
-fn command_of(input: &Value) -> Option<String> {
+pub(crate) fn command_of(input: &Value) -> Option<String> {
     let v = input
         .get("command")
         .or_else(|| input.get("cmd"))
