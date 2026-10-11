@@ -125,10 +125,22 @@ Six of the eight edits `manual/src/swarm.md` asks for, from a forty-hour swarm s
   `--status` is the text.
 - **Why a lane died.** `failed:rate-limited` (with `resets_at`) / `failed:context` / `stopped`, from
   the transcript's last uncleared API-error notice; the header counts the causes.
-- ⚠ **Wire.** New tag `status_set`; `resolved.provisional`; `note.post_close`. An older cv refuses
-  to replay a `status_set` line, a post-close note, or a provisional override, and then refuses
-  every append (fail-closed on a degraded log): install this cv on every writer before using them.
-  The golden log gained specimen task E (additive; every earlier line byte-identical).
+- ⚠ **Wire.** One new event tag, `status_set`; one new optional event field, `resolved.provisional`
+  (omitted when false); and one reducer-rule change, a `noted` line may now follow a terminal event
+  (`post_close` is a projection field, not on the wire). What an **older cv** does with a log this
+  cv wrote, exactly:
+  - a `status_set` line does not parse — a read warning, the line skipped, and **every append
+    refused** (fail-closed on a degraded log);
+  - a `noted` after a terminal event parses but its reducer refuses it — quarantined on read, every
+    append refused;
+  - a `resolved` with `provisional: true` parses and is **silently accepted as a firm resolution**:
+    no warning, the task shows as decided on the default, its inbox never shows the "veto?" row,
+    and the older cv **keeps appending** — until the decider's override `resolved` lands, which its
+    reducer refuses (terminal) and from then on it fails closed.
+  Install this cv on every writer before using `--provisional` or `status`; a mixed fleet misreads
+  provisional decisions as final until the override. This cv reads older logs unchanged (every
+  addition defaults); the golden log gained specimen task E (additive; every earlier line
+  byte-identical).
 - Not yet: `show` defaults (last three notes; `--all`) and dedupe-on-open — tasks
   `01a0fab1-9b64` and `01a0fab1-9b7a` hold the next steps.
 
