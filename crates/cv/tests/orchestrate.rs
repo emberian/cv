@@ -664,3 +664,87 @@ fn lanes_failure_cause_from_the_transcript() {
     assert!(by_id("ggg7").get("failure_cause").is_none());
     assert!(by_id("hhh8").get("failure_cause").is_none());
 }
+
+/// A lane's endpoint comes from its OWN shell exports only. A lane that briefs a child (an `Agent`
+/// prompt carrying `export CV_ENDPOINT=lane:child`) or writes that brief to a file is not the
+/// child — scanning the whole tool input used to join it to the child's tasks. Its own later Bash
+/// export wins; a lane with only the brief has no endpoint from the transcript.
+#[test]
+fn lanes_endpoint_comes_from_the_lanes_own_shell_exports_only() {
+    let w = World::new("lanes-endpoint");
+    w.write_session(
+        SID,
+        &[
+            user("u0", "2026-10-01T10:00:00Z", "go"),
+            notification("2026-10-01T10:30:00Z", "ppp1", "completed"),
+            notification("2026-10-01T10:30:01Z", "qqq2", "completed"),
+            assistant("a0", "2026-10-01T10:31:00Z", "ok"),
+        ],
+    );
+    let brief = "You are lane CHILD. First: export CV_ENDPOINT=lane:child; cv task claim 01a0";
+    w.write_agent(
+        SID,
+        "ppp1",
+        "PARENT: briefs a child, then works",
+        &[
+            user("p0", "2026-10-01T10:00:10Z", "You are the parent lane."),
+            assistant_tool(
+                "p1",
+                "2026-10-01T10:00:20Z",
+                "Agent",
+                serde_json::json!({"description": "child lane", "prompt": brief}),
+            ),
+            tool_result("p2", "2026-10-01T10:01:00Z", "toolu_p1", "spawned"),
+            assistant_tool(
+                "p3",
+                "2026-10-01T10:02:00Z",
+                "Write",
+                serde_json::json!({"file_path": "/tmp/brief.md", "content": brief}),
+            ),
+            tool_result("p4", "2026-10-01T10:02:10Z", "toolu_p3", "ok"),
+            assistant_tool(
+                "p5",
+                "2026-10-01T10:03:00Z",
+                "Bash",
+                serde_json::json!({"command": "export CV_ENDPOINT=lane:parent; cv task claim 01a1"}),
+            ),
+            tool_result("p6", "2026-10-01T10:03:10Z", "toolu_p5", "ok"),
+            assistant("p7", "2026-10-01T10:29:00Z", "Done."),
+        ],
+    );
+    w.write_agent(
+        SID,
+        "qqq2",
+        "ONLYBRIEF: spawns and stops",
+        &[
+            user("q0", "2026-10-01T10:00:10Z", "You spawn one child."),
+            assistant_tool(
+                "q1",
+                "2026-10-01T10:00:20Z",
+                "Agent",
+                serde_json::json!({"description": "child lane", "prompt": brief}),
+            ),
+            tool_result("q2", "2026-10-01T10:01:00Z", "toolu_q1", "spawned"),
+            assistant("q3", "2026-10-01T10:29:00Z", "Spawned; done."),
+        ],
+    );
+    let open = |title: &str, who: &str| {
+        w.cv_ok(&["task", "open", title, "--assignee", who]);
+    };
+    open("the child's task", "lane:child");
+    open("the parent's task", "lane:parent");
+
+    let (json, _) = w.cv_ok(&["lanes", SID, "--tasks", "--json"]);
+    let rows: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
+    let by_id = |id: &str| rows.iter().find(|r| r["agent_id"] == id).unwrap().clone();
+    let parent = by_id("ppp1");
+    assert_eq!(parent["endpoint"], "lane:parent", "{parent}");
+    assert_eq!(parent["endpoint_source"], "transcript");
+    assert_eq!(parent["tasks"].as_array().unwrap().len(), 1, "{parent}");
+    assert_eq!(parent["tasks"][0]["title"], "the parent's task");
+    let only = by_id("qqq2");
+    assert!(only.get("endpoint").is_none(), "a brief is not an export: {only}");
+    assert_eq!(only["tasks"], serde_json::json!([]));
+    let (out, _) = w.cv_ok(&["lanes", SID, "--tasks"]);
+    assert!(!out.contains("lane:child"), "no lane is the child:\n{out}");
+}

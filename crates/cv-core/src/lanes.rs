@@ -122,8 +122,8 @@ pub struct Lane {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_detail: Option<String>,
     /// The task-store endpoint this lane acts as (`lane:<name>`): the first `CV_ENDPOINT=…` its
-    /// own tool calls exported, else (after [`attach_tasks`]) a `lane:<slug>` assignee matching
-    /// the description's leading token.
+    /// own shell commands (a tool input's `command`) exported, else (after [`attach_tasks`]) a
+    /// `lane:<slug>` assignee matching the description's leading token.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
     /// Where `endpoint` came from: `transcript` (exact) or `description` (a guess by name).
@@ -139,7 +139,7 @@ pub struct Lane {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EndpointSource {
-    /// The lane's own tool call exported `CV_ENDPOINT=…` (first occurrence) — exact.
+    /// The lane's own shell command exported `CV_ENDPOINT=…` (first occurrence) — exact.
     Transcript,
     /// No export seen; the description's leading token matched a `lane:<slug>` assignee.
     Description,
@@ -157,12 +157,13 @@ pub struct LaneTask {
     pub last_ts: DateTime<Utc>,
 }
 
-/// The first `CV_ENDPOINT=<value>` in a tool call's input (`export CV_ENDPOINT=lane:x; …`,
-/// `CV_ENDPOINT="lane:x" cv task …`).
+/// The first `CV_ENDPOINT=<kind>:<name>` a shell command sets (`export CV_ENDPOINT=lane:x; …`,
+/// `CV_ENDPOINT="lane:x" cv task …`). `<name>` never starts with `/`, so a URL
+/// (`CV_ENDPOINT=https://…`) is not an endpoint.
 pub fn endpoint_in(text: &str) -> Option<String> {
     static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     let re = RE.get_or_init(|| {
-        Regex::new(r#"CV_ENDPOINT=["']?([A-Za-z0-9_.@/-]+:[A-Za-z0-9_.@/:-]+)"#).expect("endpoint regex")
+        Regex::new(r#"CV_ENDPOINT=["']?([A-Za-z0-9_.@-]+:[A-Za-z0-9_.@-][A-Za-z0-9_.@/:-]*)"#).expect("endpoint regex")
     });
     re.captures(text).map(|c| c[1].to_string())
 }
@@ -375,7 +376,7 @@ struct Pass {
     /// The transcript's last conversational turn is an assistant text with no tool call: the
     /// shape of a final report (a running lane ends in a tool call or a tool result).
     ends_in_report: bool,
-    /// The first `CV_ENDPOINT=…` a tool call of this lane exported.
+    /// The first `CV_ENDPOINT=…` a shell command of this lane exported.
     endpoint: Option<String>,
 }
 
@@ -423,11 +424,13 @@ fn pass(r: &SessionRef) -> Option<Pass> {
                     if let Block::ToolUse { name, input, .. } = b {
                         p.tool_calls += 1;
                         p.last_tool = Some(tool_summary(name, input));
+                        // Only the lane's OWN shell commands name its endpoint. An `Agent` prompt
+                        // or a `Write`n brief that carries `export CV_ENDPOINT=lane:child` is the
+                        // CHILD's export; scanning the whole input joined the parent to it.
                         if p.endpoint.is_none() {
-                            p.endpoint = match input.get("command").and_then(Value::as_str) {
-                                Some(cmd) => endpoint_in(cmd),
-                                None => endpoint_in(&input.to_string()),
-                            };
+                            if let Some(cmd) = input.get("command").and_then(Value::as_str) {
+                                p.endpoint = endpoint_in(cmd);
+                            }
                         }
                     }
                 }
@@ -589,6 +592,12 @@ mod tests {
             Some("lane:fix-kick")
         );
         assert_eq!(endpoint_in("cv task inbox ember"), None);
+        // A URL is not an endpoint: a `<kind>:` is never followed by `//`.
+        assert_eq!(endpoint_in("CV_ENDPOINT=https://example.com/x cv task list"), None);
+        assert_eq!(
+            endpoint_in("CV_ENDPOINT=lane:a; curl https://example.com").as_deref(),
+            Some("lane:a")
+        );
         // A format string or a shell variable is not an endpoint: keep looking.
         assert_eq!(
             endpoint_in("export CV_ENDPOINT={owner}; CV_ENDPOINT=$X; CV_ENDPOINT=lane:real").as_deref(),

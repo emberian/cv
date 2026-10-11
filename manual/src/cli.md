@@ -403,8 +403,9 @@ the notice and the reset in its title.
 **Stranded** is the class that parked four lanes in one day: the harness reports the lane *completed*, and its final text says it is waiting — `Waiting on notifications`, `I'll continue when the monitor fires`, `waiting for the … verdict`. Nothing will wake it. `--stranded` lists exactly those, with the resume hint; a stranded lane never counts as done (`--done` and the header's `completed` exclude it). The phrase set is `cv_core::lanes::STRAND_PATTERNS`; only the last two sentences of the text are consulted, so a report that mentions waiting and then concludes is not stranded.
 
 **`--tasks`** joins the lane table to the task store. A lane's endpoint is the first
-`CV_ENDPOINT=<kind>:<name>` its own tool calls exported (exact — `endpoint_source: transcript`, and
-reported in `--json` even without `--tasks`); failing that, its description's leading token
+`CV_ENDPOINT=<kind>:<name>` its own shell commands exported (exact — `endpoint_source: transcript`,
+and reported in `--json` even without `--tasks`; a child's export quoted in an `Agent` prompt or a
+written brief is the child's, not this lane's); failing that, its description's leading token
 (`FIX-KICK: a kick ends…` → `lane:fix-kick`) matched case-insensitively against the store's
 assignees (`description`, a guess by name, labelled `(by description)`). Under each lane: the
 endpoint and up to five tasks it holds — short id, state, title, the last note's first line. The

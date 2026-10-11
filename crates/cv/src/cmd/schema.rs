@@ -127,7 +127,7 @@ pub(crate) fn data_schema_json() -> Value {
             "status_source": ["journal", "task_notification", "subagent_stop", "transcript"],
             "stranded": "status completed/stopped AND the last text's final sentences say it is waiting",
             "failure_cause": "failed/killed lanes only, from the transcript's last uncleared API-error notice: rate-limited · context · stopped (absent = undetermined)",
-            "endpoint": "the CV_ENDPOINT the lane's own tool calls exported first (lane:<name>), else with --tasks a lane:<slug> assignee matching the description's leading token",
+            "endpoint": "the CV_ENDPOINT the lane's own shell commands exported first (lane:<name>; an Agent prompt or a written brief does not count), else with --tasks a lane:<slug> assignee matching the description's leading token",
             "endpoint_source": ["transcript", "description"],
             "tasks": "with --tasks: [{id, title, state, last_note?, last_ts}] the endpoint holds (assignee), newest first",
         },
