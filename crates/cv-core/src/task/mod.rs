@@ -583,6 +583,17 @@ pub fn append_batch_and_notify(
         .into_iter()
         .map(|(task_id, kind)| new_event(task_id.as_deref(), from, kind))
         .collect();
+    append_events_and_notify(store, candidates, warnings)
+}
+
+/// [`append_batch_and_notify`] for events the caller already built with [`new_event`] — for a
+/// batch whose later events name the task the FIRST one opens (`cv task decide`: the `opened`
+/// id must be known before the `tagged`/`posed`/`resolved` that follow it are built).
+pub fn append_events_and_notify(
+    store: &TaskStore,
+    candidates: Vec<TaskEvent>,
+    mut warnings: Vec<String>,
+) -> anyhow::Result<BatchOutcome> {
     let events = store.append_agent_events(candidates)?;
     let outcome = store.replay()?;
     for event in &events {

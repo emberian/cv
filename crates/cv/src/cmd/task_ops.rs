@@ -37,6 +37,9 @@ pub(crate) struct DecisionSpec {
     pub source: Option<String>,
     /// Tasks (full ids) this decision blocks.
     pub blocks: Vec<String>,
+    /// Resolve it on its default at once, by the poser, with a veto window: a `resolved`
+    /// (`provisional: true`) lands in the same unit as the pose.
+    pub provisional: bool,
 }
 
 /// The option list a spec poses: the default first, then the alternatives, deduplicated.
@@ -52,7 +55,12 @@ pub(crate) fn option_list(default_choice: &str, options: &[String]) -> Vec<Strin
 }
 
 /// Pose a decision: three events (`opened`, `tagged decision`, `posed`) plus one `blocked_by` per
-/// task it blocks. Returns the events in append order and the advisory warnings.
+/// task it blocks, plus the provisional `resolved` when `spec.provisional` — appended as ONE unit
+/// (`TaskStore::append_agent_events`), so a decision is never left half-posed: a `resolved` is
+/// identity-bearing, and a token-bound poser without its token used to land the pose and then be
+/// refused the resolve, leaving an owed decision it meant to make provisionally. `store` carries
+/// the poser's token (`TaskStore::with_token`). Returns the events in append order and the
+/// advisory warnings.
 pub(crate) fn pose(store: &TaskStore, from: &str, spec: DecisionSpec) -> Result<(Vec<TaskEvent>, Vec<String>)> {
     if spec.default_choice.trim().is_empty() {
         bail!("a decision needs a --default (the option that stands if nobody speaks)");
@@ -72,18 +80,10 @@ pub(crate) fn pose(store: &TaskStore, from: &str, spec: DecisionSpec) -> Result<
     } else {
         spec.channel.clone()
     };
-    let mut events = Vec::new();
-    let mut warnings = Vec::new();
-    let mut push = |task_id: Option<&str>, kind: TaskEventKind| -> Result<String> {
-        let out = task::append_and_notify(store, task_id, from, kind, Vec::new())?;
-        warnings.extend(out.replay_warnings);
-        warnings.extend(out.warnings);
-        let id = out.event.task_id.clone();
-        events.push(out.event);
-        Ok(id)
-    };
-    let id = push(
+    let default_choice = spec.default_choice.trim().to_string();
+    let opened = task::new_event(
         None,
+        from,
         TaskEventKind::Opened {
             title: spec.title.clone(),
             body: spec.body.clone(),
@@ -92,21 +92,44 @@ pub(crate) fn pose(store: &TaskStore, from: &str, spec: DecisionSpec) -> Result<
             channel,
             assignee: Some(spec.for_who.trim().to_string()),
         },
-    )?;
-    push(Some(&id), TaskEventKind::Tagged { tags })?;
-    push(
-        Some(&id),
-        TaskEventKind::Posed {
-            options,
-            default_choice: spec.default_choice.trim().to_string(),
-            deadline: spec.deadline,
-            source: spec.source.clone(),
-        },
-    )?;
+    );
+    let id = opened.task_id.clone();
+    let mut candidates = vec![
+        opened,
+        task::new_event(Some(&id), from, TaskEventKind::Tagged { tags }),
+        task::new_event(
+            Some(&id),
+            from,
+            TaskEventKind::Posed {
+                options,
+                default_choice: default_choice.clone(),
+                deadline: spec.deadline,
+                source: spec.source.clone(),
+            },
+        ),
+    ];
     for other in &spec.blocks {
-        push(Some(other), TaskEventKind::BlockedBy { task: id.clone() })?;
+        candidates.push(task::new_event(
+            Some(other),
+            from,
+            TaskEventKind::BlockedBy { task: id.clone() },
+        ));
     }
-    Ok((events, warnings))
+    if spec.provisional {
+        candidates.push(task::new_event(
+            Some(&id),
+            from,
+            TaskEventKind::Resolved {
+                choice: default_choice,
+                note: None,
+                provisional: true,
+            },
+        ));
+    }
+    let out = task::append_events_and_notify(store, candidates, Vec::new())?;
+    let mut warnings = out.replay_warnings;
+    warnings.extend(out.warnings);
+    Ok((out.events, warnings))
 }
 
 /// One way to pose a decision. A bare `decision` tag on a task with nothing posed made an inbox
@@ -319,6 +342,7 @@ pub(crate) fn run_split(
             tags: vec!["split".into()],
             source: Some(item.note_event_id.clone()),
             blocks: vec![plan.parent.clone()],
+            provisional: false,
         };
         let (events, w) = pose(store, from, spec)?;
         warnings.extend(w);

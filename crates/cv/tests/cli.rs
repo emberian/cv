@@ -2993,33 +2993,58 @@ fn adopt_moves_a_stranded_lane_into_the_live_session() {
     w.write_session(live, &[root_line(live)]); // the newest session: the default --into
 
     let (out, _) = w.cv_ok(&["adopt", "--list", dead]);
-    assert!(out.contains(aid) && out.contains("Lane TEST") && out.contains("yes"), "{out}");
+    assert!(
+        out.contains(aid) && out.contains("Lane TEST") && out.contains("yes"),
+        "{out}"
+    );
 
     let live_sub = w.home.join(".claude/projects/-work-proj/livesess/subagents");
     let (_, err) = w.cv_ok(&["adopt", &aid[..8], "--dry-run"]);
     assert!(err.contains("into livesess"), "the default target is announced: {err}");
     assert!(err.contains("restamped on 3 of 3 lines"), "{err}");
-    assert!(err.contains(&format!("\"to\": \"{aid}\"")), "the SendMessage incantation: {err}");
+    assert!(
+        err.contains(&format!("\"to\": \"{aid}\"")),
+        "the SendMessage incantation: {err}"
+    );
     assert!(err.contains("cv cat deadsess"), "the sidecar reminder: {err}");
     assert!(!live_sub.exists(), "a dry run writes nothing");
 
     w.cv_ok(&["adopt", aid]);
     let copied = fs::read_to_string(live_sub.join(format!("agent-{aid}.jsonl"))).unwrap();
-    assert_eq!(copied, body.replace("\"sessionId\":\"deadsess\"", "\"sessionId\":\"livesess\"").replace(
-        "{\\\"sessionId\\\":\\\"livesess\\\"}",
-        "{\\\"sessionId\\\":\\\"deadsess\\\"}"
-    ));
-    assert!(copied.contains("{\\\"sessionId\\\":\\\"deadsess\\\"}"), "content untouched");
-    assert_eq!(fs::read_to_string(live_sub.join(format!("agent-{aid}.meta.json"))).unwrap(), meta);
-    assert_eq!(fs::read_to_string(&agent).unwrap(), body, "the source is never modified");
+    assert_eq!(
+        copied,
+        body.replace("\"sessionId\":\"deadsess\"", "\"sessionId\":\"livesess\"")
+            .replace(
+                "{\\\"sessionId\\\":\\\"livesess\\\"}",
+                "{\\\"sessionId\\\":\\\"deadsess\\\"}"
+            )
+    );
+    assert!(
+        copied.contains("{\\\"sessionId\\\":\\\"deadsess\\\"}"),
+        "content untouched"
+    );
+    assert_eq!(
+        fs::read_to_string(live_sub.join(format!("agent-{aid}.meta.json"))).unwrap(),
+        meta
+    );
+    assert_eq!(
+        fs::read_to_string(&agent).unwrap(),
+        body,
+        "the source is never modified"
+    );
 
     // A second adoption refuses (nothing written) until --force.
     fs::write(live_sub.join(format!("agent-{aid}.jsonl")), "sentinel\n").unwrap();
     let (ok, _, _, err) = w.cv(&["adopt", aid, "--from", dead, "--into", live]);
     assert!(!ok && err.contains("refusing to overwrite"), "{err}");
-    assert_eq!(fs::read_to_string(live_sub.join(format!("agent-{aid}.jsonl"))).unwrap(), "sentinel\n");
+    assert_eq!(
+        fs::read_to_string(live_sub.join(format!("agent-{aid}.jsonl"))).unwrap(),
+        "sentinel\n"
+    );
     w.cv_ok(&["adopt", aid, "--from", dead, "--into", live, "--force"]);
-    assert!(fs::read_to_string(live_sub.join(format!("agent-{aid}.jsonl"))).unwrap().contains("livesess"));
+    assert!(fs::read_to_string(live_sub.join(format!("agent-{aid}.jsonl")))
+        .unwrap()
+        .contains("livesess"));
 
     // The agent now has two copies; reading it by id takes the newest instead of erroring.
     let (out, _) = w.cv_ok(&["cat", &format!("agent-{aid}"), "t1"]);
@@ -3044,7 +3069,11 @@ fn adopt_reaches_extra_claude_roots_and_never_targets_the_dead_session() {
     let seat_proj = w.home.join("seats/bonsai/claude/projects/-work-proj");
     let sub = seat_proj.join(dead).join("subagents");
     fs::create_dir_all(&sub).unwrap();
-    fs::write(seat_proj.join(format!("{dead}.jsonl")), format!("{}\n", root_line(dead))).unwrap();
+    fs::write(
+        seat_proj.join(format!("{dead}.jsonl")),
+        format!("{}\n", root_line(dead)),
+    )
+    .unwrap();
     let mut l = serde_json::json!({"type": "user", "uuid": "u0", "parentUuid": null, "timestamp": "2026-01-01T10:00:00Z",
         "cwd": "/work/proj", "message": {"role": "user", "content": "You are lane SEAT."}});
     l["isSidechain"] = true.into();
@@ -3058,10 +3087,18 @@ fn adopt_reaches_extra_claude_roots_and_never_targets_the_dead_session() {
 
     fs::write(w.cv_home.join("claude-roots"), "~/seats/*/claude\n").unwrap();
     let (_, err) = w.cv_ok(&["adopt", aid, "--dry-run"]);
-    assert!(err.contains("into livesess"), "the dead session is newer but is never the target: {err}");
+    assert!(
+        err.contains("into livesess"),
+        "the dead session is newer but is never the target: {err}"
+    );
     w.cv_ok(&["adopt", aid]);
-    let copied = w.home.join(".claude/projects/-work-proj/livesess/subagents").join(format!("agent-{aid}.jsonl"));
-    assert!(fs::read_to_string(copied).unwrap().contains("\"sessionId\":\"livesess\""));
+    let copied = w
+        .home
+        .join(".claude/projects/-work-proj/livesess/subagents")
+        .join(format!("agent-{aid}.jsonl"));
+    assert!(fs::read_to_string(copied)
+        .unwrap()
+        .contains("\"sessionId\":\"livesess\""));
     let (out, _) = w.cv_ok(&["adopt", "--list", dead]);
     assert!(out.contains(aid), "a seat session lists by id too: {out}");
 }
@@ -3435,4 +3472,60 @@ fn task_status_is_pinned_replaced_and_shown_first() {
     w.cv_ok(&["task", "done", &t, "--from", "lane:integrator-1"]);
     let (_, err) = w.cv_fails(&["task", "status", &t, "late", "--from", "lane:integrator-1"]);
     assert!(err.contains("cannot apply status_set"), "{err}");
+}
+
+/// `decide --provisional` is ONE unit. A poser bound to a TOFU token must present it: without the
+/// token the whole pose is refused and the store holds no trace of the decision — never a
+/// posed-but-unresolved decision left owed (the pose used to land token-free, then only the
+/// identity-bearing `resolved` was refused); with the token, opened/tagged/posed/resolved land
+/// together.
+#[test]
+fn task_decide_provisional_is_one_unit_for_a_token_bound_poser() {
+    let w = World::new("decide-bound");
+    let (out, _) = w.cv_ok(&["task", "open", "warm-up"]);
+    let a = opened_task_id(&out);
+    // A claim is identity-bearing: first use with a token binds orchestrator:o to it.
+    w.cv_ok(&["task", "claim", &a, "--from", "orchestrator:o", "--token", "s3cret"]);
+    let decide = [
+        "task",
+        "decide",
+        "build base: /tank or NVMe",
+        "--for",
+        "ember",
+        "--default",
+        "keep /tank",
+        "--option",
+        "move to NVMe",
+        "--provisional",
+        "--from",
+        "orchestrator:o",
+    ];
+    let (out, err) = w.cv_fails(&decide);
+    assert!(err.contains("token-bound"), "{err}");
+    assert!(!out.contains("posed for"), "nothing is announced as posed:\n{out}");
+    let (out, _) = w.cv_ok(&["task", "list", "--all"]);
+    assert!(
+        !out.contains("build base"),
+        "the refused unit left no task behind:\n{out}"
+    );
+    let (out, _) = w.cv_ok(&["task", "inbox", "ember"]);
+    assert!(!out.contains("build base"), "nothing is owed:\n{out}");
+
+    let mut with_token = decide.to_vec();
+    with_token.extend(["--token", "s3cret"]);
+    let (out, _) = w.cv_ok(&with_token);
+    let d = opened_task_id(&out);
+    assert!(
+        out.contains("posed for ember") && out.contains("provisionally on the default"),
+        "{out}"
+    );
+    let (json, _) = w.cv_ok(&["task", "show", &d, "--events"]);
+    let kinds: Vec<&str> = json
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("\"event\": \""))
+        .map(|k| k.trim_end_matches(['"', ',']))
+        .collect();
+    assert_eq!(kinds, ["opened", "tagged", "posed", "resolved"], "{json}");
+    let (out, _) = w.cv_ok(&["task", "inbox", "ember"]);
+    assert!(out.starts_with("made for you (veto?) (1):"), "{out}");
 }

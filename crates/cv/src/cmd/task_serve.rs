@@ -572,6 +572,7 @@ fn act(id: &str, verb: &str, who: &str, body: &Value) -> Result<Value> {
                             tags: vec!["reopened".into()],
                             source: d.source.clone(),
                             blocks: Vec::new(),
+                            provisional: false,
                         },
                     )?;
                     let id = evs[0].task_id.clone();

@@ -371,12 +371,16 @@ pub(crate) enum TaskCmd {
         blocks: Vec<String>,
         /// Resolve it on its default NOW, on the decider's behalf (by you, the poser), with a veto
         /// window: work proceeds, and their inbox shows it under "made for you (veto?)" until they
-        /// `--confirm` or choose otherwise.
+        /// `--confirm` or choose otherwise. Lands in the same unit as the pose: both or neither.
         #[arg(long)]
         provisional: bool,
         /// Acting endpoint recorded in `by`. Default: $CV_ENDPOINT.
         #[arg(long)]
         from: Option<String>,
+        /// TOFU per-endpoint token authenticating the `--from` claim (a provisional `resolved` is
+        /// identity-bearing). Default: $CV_TOKEN.
+        #[arg(long)]
+        token: Option<String>,
     },
     /// Answer a decision: `--accept-default`, or `--choice "<option>"` (one of the posed options).
     /// Records WHO resolved it: pass `--from <you>` or set `CV_ENDPOINT` once. On a decision made
@@ -1471,6 +1475,7 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
             blocks,
             provisional,
             from,
+            token,
         } => {
             let repo = match repo {
                 Some(r) => Some(
@@ -1509,8 +1514,11 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                 tags: tags.as_deref().map(parse_tags).unwrap_or_default(),
                 source: None,
                 blocks,
+                provisional,
             };
-            let store = TaskStore::default_store();
+            // One unit: the pose and (with --provisional) its resolution land together or not at
+            // all, under the poser's token — never a posed-but-unresolved decision left owed.
+            let store = TaskStore::default_store().with_token(task::token(token));
             let from = from_or_cv(from);
             let (events, warnings) = task_ops::pose(&store, &from, spec)?;
             for w in &warnings {
@@ -1522,21 +1530,10 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                 _ => String::new(),
             };
             println!("✦ decision {} posed for {}", prefix(&id, 13), sanitize_line(&for_who));
-            if provisional {
-                let outcome = replay_loud()?;
-                let report = task_ops::resolve(
-                    &store,
-                    &outcome.model,
-                    &from,
-                    None,
-                    &id,
-                    task_ops::Answer::AcceptDefault,
-                    None,
-                    true,
-                )?;
-                for w in report.replay_warnings.iter().chain(&report.warnings) {
-                    eprintln!("⚠ {}", sanitize_line(w));
-                }
+            if events
+                .iter()
+                .any(|e| matches!(&e.kind, TaskEventKind::Resolved { provisional: true, .. }))
+            {
                 println!(
                     "✦ resolved {} provisionally on the default (by {}) — {} can --confirm or veto",
                     prefix(&id, 13),
