@@ -143,6 +143,7 @@ fn opts(at: CutAt, out: &Path) -> RewindOptions {
         dry_run: false,
         generator: "cv-test".into(),
         thinking: Some(crate::emit::ThinkingMode::Native),
+        skills_policy: SkillsPolicy::Keep,
     }
 }
 

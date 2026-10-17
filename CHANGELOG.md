@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- `cv prune`, `rewind` and `port` take `--skills-policy keep|drop-all|drop-stale`: the new session restores no skills, or none whose SKILL.md changed or vanished.
+
 - Reading a large transcript maps 8 MiB windows and each span alone, never the whole file: `cv doctor` on 1.3 GB peaks at 22 MB RSS, not 2.6 GB.
 
 - `cv index` exits 0 when only some sessions are unreadable: it retries a changed source once, warns with the count; `--json` lists them, `--strict` fails.

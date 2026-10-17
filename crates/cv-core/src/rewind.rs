@@ -62,6 +62,7 @@
 //! or whose output was silenced (`-q` with no rev-parse) leaves no evidence; a rebase/cherry-pick
 //! mints a new sha the session never printed.
 
+use crate::harness::claude::skills::{self, SkillsPolicy, SkillsReport};
 use crate::ir::{Block, Harness, Message, MessageKind, SessionRef};
 use crate::lazy::Resolver;
 use crate::offsets::OFFSET_KEY;
@@ -405,6 +406,8 @@ pub struct RewindOptions {
     /// Portable replay removes signed thinking and repairs tool IDs; native keeps archival bytes.
     /// `None`: [`crate::emit::ThinkingMode::replay_default`] over the models the window records.
     pub thinking: Option<crate::emit::ThinkingMode>,
+    /// Which skills the rewound session restores ([`crate::harness::claude::skills`]).
+    pub skills_policy: SkillsPolicy,
     /// Recorded in the provenance sidecar as `cv_version`.
     pub generator: String,
 }
@@ -459,6 +462,8 @@ pub struct RewindResult {
     pub warnings: Vec<String>,
     /// The thinking policy applied (`native` or `portable`), chosen or defaulted.
     pub thinking: &'static str,
+    /// What `skills_policy` dropped from the restored skills.
+    pub skills: SkillsReport,
     pub dry_run: bool,
 }
 
@@ -772,6 +777,8 @@ fn rewind_session_after_scan(
         Done,
     }
     let mut phase = Phase::Before;
+    // Portable replay and a skills policy rewrite the copy before it is written.
+    let staged = thinking == crate::emit::ThinkingMode::Portable || opts.skills_policy != SkillsPolicy::Keep;
     loop {
         buf.clear();
         let n = reader.read_until(b'\n', &mut buf)?;
@@ -835,7 +842,7 @@ fn rewind_session_after_scan(
                 s
             }
         };
-        if thinking == crate::emit::ThinkingMode::Portable {
+        if staged {
             replay_stage.write_all(&out_line)?;
         } else if let Some(w) = writer.as_mut() {
             w.write_all(&out_line)?;
@@ -892,19 +899,27 @@ fn rewind_session_after_scan(
         ));
     }
 
-    if thinking == crate::emit::ThinkingMode::Portable {
-        let source = replay_stage.finish()?;
-        let (stage, changes) = crate::harness::claude::replay::normalize(source, thinking)?;
-        bytes_written = stage.len();
-        lines_written -= changes.records;
-        if changes.ids + changes.thinking + changes.dropped != 0 {
-            warnings.push(format!(
-                "portable replay: remapped {} tool ID(s), demoted {} thinking block(s) to text, removed {} without plaintext ({} record(s) left empty)",
-                changes.ids, changes.thinking, changes.dropped, changes.records
-            ));
+    let mut skills = SkillsReport {
+        policy: opts.skills_policy.as_str(),
+        ..SkillsReport::default()
+    };
+    if staged {
+        let mut source = replay_stage.finish()?;
+        if thinking == crate::emit::ThinkingMode::Portable {
+            let (stage, changes) = crate::harness::claude::replay::normalize(source, thinking)?;
+            lines_written -= changes.records;
+            if changes.ids + changes.thinking + changes.dropped != 0 {
+                warnings.push(format!(
+                    "portable replay: remapped {} tool ID(s), demoted {} thinking block(s) to text, removed {} without plaintext ({} record(s) left empty)",
+                    changes.ids, changes.thinking, changes.dropped, changes.records
+                ));
+            }
+            source = stage.finish()?;
         }
+        (source, skills) = skills::apply(source, opts.skills_policy, skills::config_dir_of(&r.path).as_deref())?;
+        bytes_written = source.len()?;
         if let Some(w) = writer.as_mut() {
-            stage.finish()?.copy_to(w)?;
+            source.copy_to(w)?;
         }
     }
 
@@ -939,6 +954,7 @@ fn rewind_session_after_scan(
         cut_cwd,
         warnings,
         thinking: thinking.as_str(),
+        skills,
         dry_run: opts.dry_run,
     };
 
@@ -977,6 +993,7 @@ fn provenance(res: &RewindResult, opts: &RewindOptions) -> Value {
         },
         "new_id": res.new_id,
         "thinking": res.thinking,
+        "skills": res.skills,
         "cut": {
             "by": cut_by,
             "msg_idx": res.cut_msg_idx,

@@ -13,6 +13,7 @@
 
 use crate::util::{home_rel, parse_harness, resolve, usage};
 use anyhow::{bail, Context, Result};
+use cv_core::harness::claude::skills::SkillsPolicy;
 use cv_core::ir::{Harness, Session, SessionRef};
 use cv_core::{Adapter, EmitOptions};
 use std::fs;
@@ -27,6 +28,7 @@ fn parse_for_emit(adapter: &dyn Adapter, r: &SessionRef, to_h: Harness) -> Resul
     cv_core::emit::parse_for_emit(adapter, r, to_h)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn cmd_port(
     id: &str,
     harness: Option<String>,
@@ -35,6 +37,7 @@ pub(crate) fn cmd_port(
     no_context: bool,
     strict: bool,
     thinking: Option<cv_core::emit::ThinkingMode>,
+    skills_policy: SkillsPolicy,
 ) -> Result<()> {
     // The source harness rides on the id (`codex:019e…`); `--harness` is the TARGET.
     let (r, adapter) = resolve(id, None)?;
@@ -42,6 +45,12 @@ pub(crate) fn cmd_port(
         Some(s) => Harness::parse(s).with_context(|| format!("unknown target harness: {s}"))?,
         None => r.harness, // a pure rehome
     };
+    if skills_policy != SkillsPolicy::Keep && to_h != Harness::Claude {
+        return usage(format!(
+            "--skills-policy {}: only a Claude target restores invoked skills (target: {to_h})",
+            skills_policy.as_str()
+        ));
+    }
     let session = parse_for_emit(adapter.as_ref(), &r, to_h)?;
     let thinking = thinking.unwrap_or_else(|| {
         cv_core::emit::ThinkingMode::replay_default(
@@ -53,7 +62,7 @@ pub(crate) fn cmd_port(
         )
     });
     let new_cwd = cwd.clone();
-    emit_session(
+    let written = emit_session(
         &session,
         to_h,
         out,
@@ -64,6 +73,15 @@ pub(crate) fn cmd_port(
             ..Default::default()
         },
     )?;
+    if skills_policy != SkillsPolicy::Keep {
+        use cv_core::harness::claude::skills::{config_dir_of, rewrite_file};
+        // The destination's config dir, else (under --out) the source's.
+        let config = config_dir_of(&written).or_else(|| config_dir_of(&r.path));
+        let report = rewrite_file(&written, skills_policy, config.as_deref())?;
+        let mut h = String::new();
+        crate::cmd::compose::skills_line(&mut h, &report);
+        print!("{h}");
+    }
 
     // Carry the project's context files to the new home, so the ported session keeps its memory.
     if !no_context {
@@ -131,7 +149,13 @@ fn copy_context_if_absent(from: &Path, to: &Path) -> std::io::Result<Option<u64>
     }
 }
 
-pub(crate) fn emit_session(session: &Session, to_h: Harness, out: Option<PathBuf>, opts: EmitOptions) -> Result<()> {
+/// Emit `session` for `to_h` and report it. -> the written session file.
+pub(crate) fn emit_session(
+    session: &Session,
+    to_h: Harness,
+    out: Option<PathBuf>,
+    opts: EmitOptions,
+) -> Result<PathBuf> {
     if !cv_core::emit::supported_targets().contains(&to_h) {
         // A caller mistake, not a failure (exit 2): the source parsed, the target cannot be written.
         return usage(format!(
@@ -160,7 +184,7 @@ pub(crate) fn emit_session(session: &Session, to_h: Harness, out: Option<PathBuf
     for w in &warnings {
         eprintln!("  ⚠ lossy: {w}");
     }
-    Ok(())
+    Ok(res.path)
 }
 
 // ---------- resume ----------

@@ -51,7 +51,7 @@ fn blocks(source: &RangeSource, row: Range, mut visit: impl FnMut(Range) -> Resu
     Ok(())
 }
 /// Bounded framing for both memory and private spills; never retain an entire JSONL line.
-fn rows(source: &ByteSource, mut visit: impl FnMut(Range) -> Result<()>) -> Result<()> {
+pub(super) fn rows(source: &ByteSource, mut visit: impl FnMut(Range) -> Result<()>) -> Result<()> {
     let mut reader = BufReader::with_capacity(64 * 1024, source.reader()?);
     let (mut start, mut at) = (0u64, 0u64);
     loop {
@@ -81,7 +81,7 @@ fn rows(source: &ByteSource, mut visit: impl FnMut(Range) -> Result<()>) -> Resu
     }
     Ok(())
 }
-fn copy(source: &RangeSource, range: Range, output: &mut ByteStage) -> Result<()> {
+pub(super) fn copy(source: &RangeSource, range: Range, output: &mut ByteStage) -> Result<()> {
     std::io::copy(&mut source.cursor(range)?, output)?;
     Ok(())
 }

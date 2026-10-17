@@ -31,6 +31,7 @@
 //! `--range` indices or `--window` sizing. Model-visible `attachment` records (those with
 //! `rendered[]`) DO count toward byte estimates — that text is in the prompt.
 
+use crate::harness::claude::skills::{self, SkillsPolicy, SkillsReport};
 use crate::harness::store::{
     bytes::{ByteSource, ByteStage},
     jsonl::ranges::{self, Range},
@@ -109,6 +110,9 @@ pub struct PruneOptions {
     pub declassify_tokens: Vec<String>,
     /// Snip a message iff it holds at least this many DISTINCT `declassify_tokens` (default 2).
     pub declassify_min_hits: usize,
+    /// Which skills the new session restores at its next compaction or resume (see
+    /// [`crate::harness::claude::skills`]). `Keep` (the default) copies the records as they are.
+    pub skills_policy: SkillsPolicy,
     /// Compute and report without writing anything.
     pub dry_run: bool,
     /// Replace an existing `<new-id>.jsonl` (and its sidecar) by atomic rename. Without it, an
@@ -131,6 +135,7 @@ impl Default for PruneOptions {
             declassify: false,
             declassify_tokens: Vec::new(), // token-agnostic: caller supplies the terms (no baked-in list)
             declassify_min_hits: 2,
+            skills_policy: SkillsPolicy::Keep,
             dry_run: false,
             force: false,
         }
@@ -179,6 +184,8 @@ pub struct PruneResult {
     /// Data-safety warnings (e.g. a `--window` tail that exceeds its budget because a single turn is
     /// bigger than the whole budget). Also echoed to stderr.
     pub warnings: Vec<String>,
+    /// What `skills_policy` dropped from the new session's restored skills.
+    pub skills: SkillsReport,
     pub dry_run: bool,
 }
 
@@ -946,6 +953,7 @@ pub fn prune_session(src_path: &Path, opts: &PruneOptions) -> Result<PruneResult
     } else {
         output
     };
+    let (output, skills) = skills::apply(output, opts.skills_policy, skills::config_dir_of(src_path).as_deref())?;
     let new_size = output.len()?;
     let sidecar = sidecar_stage.into_inner().map_err(|e| e.into_error())?.finish()?;
 
@@ -1017,6 +1025,7 @@ pub fn prune_session(src_path: &Path, opts: &PruneOptions) -> Result<PruneResult
         revive_tokens,
         revive_old_tokens,
         warnings,
+        skills,
         dry_run: opts.dry_run,
     })
 }

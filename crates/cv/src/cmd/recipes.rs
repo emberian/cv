@@ -57,7 +57,7 @@ One selector at a time. Piped `cv show` with no selector over 200 KB prints the 
     cv prune <id> --drop-thinking --json         # snips old payloads + thinking; revives the resume gate
     → {source_id, new_id, harness, before_bytes, after_bytes, snipped_payloads, image_blocks,
        tokens_freed, dropped_turns, window_real_tokens, revived, warnings, new_path, sidecar_path,
-       copied_resources, dry_run, note}
+       copied_resources, skills, dry_run, note}
     cv resume <new_id>                           # prints `claude --resume <new_id>` (add --launch to run it)
 
  8. Port a session to another harness or directory

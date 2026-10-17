@@ -565,6 +565,11 @@ enum Cmd {
         /// version-controllable home for your term list — e.g. tuned from a classifier-trip corpus.
         #[arg(long, value_name = "PATH")]
         declassify_tokens_file: Option<PathBuf>,
+        /// Which restored skills the new session keeps. Claude Code restores every skill a session
+        /// ever invoked, with its text as of then, at each compaction and resume: keep copies that
+        /// record, drop-all empties it, drop-stale drops skills whose SKILL.md changed or is gone.
+        #[arg(long, value_parser = ["keep", "drop-all", "drop-stale"], default_value = "keep")]
+        skills_policy: String,
         /// Report what would be pruned without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -612,6 +617,11 @@ enum Cmd {
         /// Default: native when every model the window records is `claude-*`, else portable.
         #[arg(long, value_parser = ["native", "portable"])]
         thinking: Option<String>,
+        /// Which restored skills the new session keeps. Claude Code restores every skill a session
+        /// ever invoked, with its text as of then, at each compaction and resume: keep copies that
+        /// record, drop-all empties it, drop-stale drops skills whose SKILL.md changed or is gone.
+        #[arg(long, value_parser = ["keep", "drop-all", "drop-stale"], default_value = "keep")]
+        skills_policy: String,
         /// Report the window that would be written without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -791,6 +801,11 @@ enum Cmd {
         /// Default: native when every recorded model is `claude-*`, else portable.
         #[arg(long, value_parser = ["native", "text", "drop", "portable"])]
         thinking: Option<String>,
+        /// Which restored skills a Claude target keeps. Claude Code restores every skill a session
+        /// ever invoked, with its text as of then, at each compaction and resume: keep copies that
+        /// record, drop-all empties it, drop-stale drops skills whose SKILL.md changed or is gone.
+        #[arg(long, value_parser = ["keep", "drop-all", "drop-stale"], default_value = "keep")]
+        skills_policy: String,
     },
     /// Print (or with --launch, run) the resume incantation for a session in its native harness.
     Resume {
@@ -1271,7 +1286,17 @@ fn run() -> Result<()> {
             no_context,
             strict,
             thinking,
-        } => port::cmd_port(&id, harness, cwd, out, no_context, strict, thinking.as_deref().map(util::parse_thinking).transpose()?),
+            skills_policy,
+        } => port::cmd_port(
+            &id,
+            harness,
+            cwd,
+            out,
+            no_context,
+            strict,
+            thinking.as_deref().map(util::parse_thinking).transpose()?,
+            skills_policy.parse()?,
+        ),
         Cmd::Scry {
             harness,
             cwd,
@@ -1331,6 +1356,7 @@ fn run() -> Result<()> {
             declassify,
             declassify_tokens,
             declassify_tokens_file,
+            skills_policy,
             dry_run,
             json,
         } => {
@@ -1357,6 +1383,7 @@ fn run() -> Result<()> {
                 keep_range,
                 declassify,
                 tokens,
+                skills_policy.parse()?,
                 dry_run,
                 json,
             )
@@ -1370,10 +1397,24 @@ fn run() -> Result<()> {
             to,
             from_compaction: _,
             thinking,
+            skills_policy,
             full,
             dry_run,
             json,
-        } => compose::cmd_rewind(&id, harness, agent, at.as_deref(), out, to, full, thinking.as_deref().map(str::parse).transpose()?, dry_run, json, BUILD_VERSION),
+        } => compose::cmd_rewind(
+            &id,
+            harness,
+            agent,
+            at.as_deref(),
+            out,
+            to,
+            full,
+            thinking.as_deref().map(str::parse).transpose()?,
+            skills_policy.parse()?,
+            dry_run,
+            json,
+            BUILD_VERSION,
+        ),
         Cmd::Config { add_export, rm_export } => config::cmd_config(add_export, rm_export),
         Cmd::Schema { json, commands } => schema::cmd_schema(&build_cli(), json, commands),
         Cmd::Formats {

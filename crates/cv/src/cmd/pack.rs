@@ -918,6 +918,7 @@ fn emit_pack_session(
             ..Default::default()
         },
     )
+    .map(drop)
 }
 
 /// Write a text bundle to `--out` (with a stderr note) or stdout.

@@ -3,6 +3,7 @@
 use crate::cmd::port::emit_session;
 use crate::util::{dry_run_nulls, parse_harness, parse_range, report, short_id, usage};
 use anyhow::{bail, Context, Result};
+use cv_core::harness::claude::skills::SkillsPolicy;
 use cv_core::ir::{human_bytes, Block, Harness, Message, Role, Session};
 use cv_core::EmitOptions;
 use std::fmt::Write as _;
@@ -29,6 +30,7 @@ pub(crate) fn cmd_prune(
     keep_range: Option<(usize, Option<usize>)>,
     declassify: bool,
     declassify_tokens: Vec<String>,
+    skills_policy: SkillsPolicy,
     dry_run: bool,
     json: bool, // also emit the report as one JSON object on stdout (the human report stays on stderr)
 ) -> Result<()> {
@@ -55,6 +57,7 @@ pub(crate) fn cmd_prune(
         keep_range,
         declassify,
         declassify_tokens, // caller-supplied (external); cv ships no built-in list. min_hits from Default (2).
+        skills_policy,
         dry_run,
         force,
         ..Default::default()
@@ -133,6 +136,7 @@ pub(crate) fn cmd_prune(
             }
         }
     }
+    skills_line(&mut h, &res.skills);
     for w in &res.warnings {
         let _ = writeln!(h, "  ⚠ {w}");
     }
@@ -152,6 +156,17 @@ pub(crate) fn cmd_prune(
         let _ = writeln!(h, "  resume with: claude --resume {}", res.new_id);
     }
     report(json, &h, &v)
+}
+
+/// The report line for a skills policy that dropped something (`keep` prints nothing).
+pub(crate) fn skills_line(h: &mut String, s: &cv_core::harness::claude::skills::SkillsReport) {
+    if s.policy != "keep" {
+        let _ = writeln!(
+            h,
+            "  skills ({}): dropped {} restored skill(s), {} chars, kept {} · {} record(s) rewritten",
+            s.policy, s.dropped, s.dropped_chars, s.kept, s.records
+        );
+    }
 }
 
 // ---------- rewind ----------
@@ -191,6 +206,7 @@ pub(crate) fn cmd_rewind(
     to: Option<String>,
     full: bool,
     thinking: Option<cv_core::emit::ThinkingMode>,
+    skills_policy: SkillsPolicy,
     dry_run: bool,
     json: bool,
     generator: &str,
@@ -220,6 +236,7 @@ pub(crate) fn cmd_rewind(
             out_dir: out,
             new_id: to,
             dry_run,
+            skills_policy,
             generator: generator.to_string(),
         },
     )?;
@@ -292,6 +309,7 @@ pub(crate) fn cmd_rewind(
         res.omitted_lines,
     );
     let _ = writeln!(h, "  thinking: {}", res.thinking);
+    skills_line(&mut h, &res.skills);
     for w in &res.warnings {
         let _ = writeln!(h, "  ⚠ {w}");
     }
@@ -485,7 +503,8 @@ fn finish_composed(
                 thinking,
                 ..Default::default()
             },
-        );
+        )
+        .map(drop);
     }
 
     // Complete checked demands before publishing either the report or the exported document.

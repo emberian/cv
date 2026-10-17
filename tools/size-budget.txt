@@ -1,12 +1,12 @@
 # Product lines per crate and per module, and test lines per crate (tools/check-size.py).
 # Raise a number only as a reviewed decision; the gate ratchets each one down as code shrinks.
-cv 19241
-cv-core 79547
+cv 19325
+cv-core 79813
 cv-search 4847
 cv-testkit 450
 cv-web 15
 cv:tests 15358
-cv-core:tests 64378
+cv-core:tests 64578
 cv-search:tests 7410
 cv-testkit:tests 39
 cv-web:tests 0
@@ -25,7 +25,7 @@ cv-core:env 235
 cv-core:events 1704
 cv-core:formats 617
 cv-core:handoff 132
-cv-core:harness/claude 4067
+cv-core:harness/claude 4307
 cv-core:harness/claude_workflow 937
 cv-core:harness/cline 1328
 cv-core:harness/cline_sdk 680
@@ -63,14 +63,14 @@ cv-core:lockfile 32
 cv-core:loom 163
 cv-core:offsets 39
 cv-core:projection 463
-cv-core:prune 3469
+cv-core:prune 3478
 cv-core:publish 416
 cv-core:query 1998
 cv-core:redact 701
 cv-core:render 204
 cv-core:restamp 256
 cv-core:resume 270
-cv-core:rewind 1028
+cv-core:rewind 1045
 cv-core:rows 193
 cv-core:sanitize 77
 cv-core:scan 229
@@ -96,7 +96,7 @@ cv:cmd/archive 716
 cv:cmd/browse 422
 cv:cmd/cat 175
 cv:cmd/compaction 62
-cv:cmd/compose 728
+cv:cmd/compose 746
 cv:cmd/config 59
 cv:cmd/distill 366
 cv:cmd/doctor 269
@@ -108,8 +108,8 @@ cv:cmd/mcp 990
 cv:cmd/mcp_tools 532
 cv:cmd/mod 32
 cv:cmd/orchestrate 994
-cv:cmd/pack 882
-cv:cmd/port 234
+cv:cmd/pack 883
+cv:cmd/port 258
 cv:cmd/query 47
 cv:cmd/recipes 98
 cv:cmd/schema 266
@@ -125,5 +125,5 @@ cv:cmd/view 1660
 cv:cmd/workflow 727
 cv:http 572
 cv:llm 528
-cv:main 1605
+cv:main 1646
 cv:util 374
