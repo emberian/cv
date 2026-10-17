@@ -81,6 +81,11 @@ impl Wait {
         }
     }
 
+    /// Whether the `--for` deadline has passed (never, without one).
+    pub(crate) fn expired(&self) -> bool {
+        matches!(self, Wait::Until(Some((deadline, _))) if *deadline <= std::time::Instant::now())
+    }
+
     /// Sleep one `interval`, cut short by the deadline; false once there is nothing left to wait for.
     pub(crate) fn pause(&self, interval: std::time::Duration) -> bool {
         let left = match self {

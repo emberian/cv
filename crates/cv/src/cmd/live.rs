@@ -29,7 +29,15 @@ pub(crate) fn cmd_scry(
         }
         return Ok(());
     }
-    let mut watcher = Watcher::new(filter, existing);
+    // The baseline read of a large fleet can outlive a short `--for`: it stops at the deadline.
+    let mut watcher = Watcher::with_discovery_until(filter, existing, cv_core::discover_all, || wait.expired());
+    if !existing && wait.expired() {
+        eprintln!(
+            "cv scry: --for elapsed during the baseline read, {} sessions in",
+            watcher.following()
+        );
+        return Ok(());
+    }
     if !matches!(wait, Wait::Once) {
         eprintln!("cv scry: following {} sessions", watcher.following());
     }

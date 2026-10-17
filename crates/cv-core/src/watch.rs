@@ -284,13 +284,24 @@ impl Watcher {
 
     /// [`Watcher::new`] over another session source (see [`Watcher::discover`]).
     pub fn with_discovery(filter: Filter, emit_existing: bool, discover: fn() -> Vec<SessionRef>) -> Self {
+        Self::with_discovery_until(filter, emit_existing, discover, || false)
+    }
+
+    /// [`Watcher::with_discovery`] whose baseline read stops once `expired` says so, for a
+    /// follower bounded by a deadline; [`Watcher::following`] tells how far it got.
+    pub fn with_discovery_until(
+        filter: Filter,
+        emit_existing: bool,
+        discover: fn() -> Vec<SessionRef>,
+        mut expired: impl FnMut() -> bool,
+    ) -> Self {
         let mut w = Watcher {
             filter,
             seen: BTreeMap::new(),
             discover,
         };
         if !emit_existing {
-            w.prime();
+            w.prime(&mut expired);
         }
         w
     }
@@ -391,8 +402,11 @@ impl Watcher {
     }
 
     /// Record current state without emitting anything.
-    fn prime(&mut self) {
+    fn prime(&mut self, expired: &mut impl FnMut() -> bool) {
         for r in self.discover() {
+            if expired() {
+                return;
+            }
             // The cheap discover `message_count` is NOT the parsed IR length for several harnesses
             // (codex/hermes/claude add reasoning/tool/system turns), so seeding from it makes the
             // first `Updated` poll re-emit messages that predate the watcher. Record the true
