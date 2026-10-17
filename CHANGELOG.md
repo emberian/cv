@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **Breaking:** `cv scry` with stdout piped prints the sessions it would follow once and exits 0; `--follow` keeps following, `--for 30s|5m|2h` bounds it.
+- Every waiting command announces what it waits for on stderr within a second, before its first discovery; daemons print their ready line first.
+- `cv workflow --follow` gains `--for <duration>`: stop after that long and render the run as it stands.
+- `cv hook` with a terminal on stdin exits 2 with usage; `cv mcp` and `cv task … -` say what they are reading.
+- MCP tools generated from the CLI omit `--follow` (no Ctrl-C in a tool call); `for` stays.
+- `tests/announce.rs` runs every command on a pipe: exit within 5 s, or be a daemon that announced within 1 s.
 - Inbox table headers no longer cover the first task row, restoring clicks to expand Backlog task details.
 - `cv index` publishes search freshness baselines per session: one row's failure is reported and reread alone, no longer losing the sweep's.
 - One freshness record per consumer and session, verified on load (counts, events, search, usage); watches record file identities. Each rereads once after upgrading.

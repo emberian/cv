@@ -126,6 +126,19 @@ hidden by default: finished lanes, archived sessions, terminal tasks).
 **Session selectors:** accept a unique id prefix or `harness:id`. An ambiguous prefix lists the
 candidates as `harness:full-id` lines and exits 2.
 
+**Blocking is opt-in and announced.** No command waits silently. When stdout is not a terminal, a
+command that would wait (`scry`, `workflow --follow`) prints its current state once, exits 0, and
+says on stderr how to follow: `--follow` keeps following, `--for <duration>` (`30s`, `5m`, `2h`)
+bounds it and implies it; unbounded following needs `--follow` spelled out. Following announces
+what it waits for within a second, before the first discovery, and ends with Ctrl-C or `--for`;
+on a terminal the interactive default stays and announces the same way. The daemons (`serve`,
+`watch`, `mcp`) keep running and print their ready line (address, home, what they do) to stderr
+within a second. A reader of protocol input on stdin says so when stdin is a terminal: `hook` exits
+2 with usage, `mcp` and `task … -` announce what they are reading. An MCP tool never blocks beyond
+its documented cursor or timeout (`observe_stream` returns at once, `await_omen` has
+`timeout_secs`; generated tools drop `--follow` and keep `for`). `crates/cv/tests/announce.rs` runs
+every command of the clap tree on a pipe under this contract.
+
 ## 3. JSON — snake_case, one shape per noun
 
 - cv-defined JSON fields use **snake_case**. Opaque `principal`, harness extras, tool arguments
@@ -194,8 +207,9 @@ under `⚠ lost`.
 
 Tools are **generated from the CLI**: `cv mcp` reads its own clap `Command` at startup and
 registers one tool per Read/Reshape/Export/System command and subcommand and per `cv task`
-subcommand (bare parents and the stdin-only `hook` are excluded), named after the command with a
-subcommand joined by `_`. Each argument is a JSON-schema property with the clap help as its
+subcommand (bare parents and the stdin-only `hook` are excluded, as is every `--follow` flag: a
+tool call has no Ctrl-C, so following is offered bounded, through `for`), named after the command
+with a subcommand joined by `_`. Each argument is a JSON-schema property with the clap help as its
 description; positionals map to properties named after the argument; repeatable arguments accept a
 scalar or an array; `long` carries the actual flag spelling. A call runs the same executable as
 `cv <cmd> <args> --json` (or without `--json` for commands that have no JSON form) and returns

@@ -394,6 +394,7 @@ cv workflow stark-kill-emit-swarm           # no session id? the name resolves f
 cv workflow 3b829648 wf_ab915970 --script   # print the driving JS instead
 cv workflow 3b829648 wf_ab915970 --results  # each agent's FULL journaled return value
 cv workflow 3b829648 wf_ab915970 --follow   # stream a LIVE run's agent transitions (-f)
+cv workflow 3b829648 wf_ab915970 --for 10m  # follow for ten minutes, then render the run as it stands
 cv workflow 3b829648 wf_ab915970 --revive   # a resume prompt per unfinished lane
 cv workflow 3b829648 wf_ab915970 --json     # the structured Workflow IR
 ```
@@ -404,7 +405,7 @@ Agents that didn't finish (`error`/`progress`) show where they last were — `�
 
 The default agent lines carry ~400-char result *previews* (that's all the state file keeps); `--results` (and `--json`) read the run's `journal.jsonl` and print each agent's **complete** journaled return — the full lane harvest.
 
-`--follow` (`-f`) tails a live run: the harness flushes the state file as agents progress, so cv polls it and prints one line per agent state transition (`18:37:15  ✓ gate1:verify → done (63,198 tok)`), then emits the full render when the run reaches a terminal status. If the run hasn't registered yet it waits.
+`--follow` (`-f`) tails a live run: the harness flushes the state file as agents progress, so cv polls it and prints one line per agent state transition (`18:37:15  ✓ gate1:verify → done (63,198 tok)`), then emits the full render when the run reaches a terminal status. If the run hasn't registered yet it waits. It announces what it is following on stderr within a second; `--for <duration>` (`30s`, `5m`, `2h`; implies `--follow`) stops after that long and renders the run as it stands, so a script never waits on a run that will not end.
 
 `--revive` salvages a dead or interrupted run: it emits a ready-to-paste standalone `Agent` prompt per lane — the FULL original task plus the work that lane already landed (files written, commands run, its own last note) — so lanes come back *resumed* rather than restarted. `--revive-all` includes the lanes that succeeded too.
 
@@ -909,15 +910,25 @@ cv scry
 cv scry --harness claude --cwd clustervision
 cv scry --existing            # also emit sessions already present at startup
 cv scry --interval 1
+cv scry --for 5m              # follow for five minutes, then exit 0
+cv scry | tee feed.txt        # a pipe gets the current state once …
+cv scry --follow | tee feed.txt   # … unless told to follow
 ```
 
 ```text
-✦ scrying for agent activity… (Ctrl-C to stop)
+cv scry: following live agent activity; stop with Ctrl-C or --for <duration>
+cv scry: following 212 sessions
 ✷ new  claude   da9174f4  ~/pug/clustervision  (3 msg)
       user walk the type checker and find where flux is ignored
    +  claude   da9174f4  ~/pug/clustervision  (1 msg)
       assistant found it — the walker drops flux constraints here …
 ```
+
+Blocking is opt-in and announced: on a terminal `scry` follows until Ctrl-C and says so within a
+second, before it reads a single session. With stdout piped (an agent, a script) it prints the
+sessions it would follow once — one `   ·` line each, oldest-touched first — and exits 0, with one
+stderr line saying that `--follow` keeps following and `--for 30s`/`5m`/`2h` bounds it (`--for`
+alone follows for that long). `--existing` on a pipe prints the backlog of messages instead.
 
 This is the CLI face of [`cv watch`](serving.md), which mirrors the same activity into a live feed for your whole fleet (and powers the MCP `await_omen` block-until-match primitive).
 

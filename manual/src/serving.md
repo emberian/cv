@@ -74,7 +74,8 @@ cv watch --cwd clustervision       # only sessions whose cwd contains this subst
 
 `cv watch` is the resident counterpart to `sync` (`cv scry` is the same live feed printed, without the archive). On its first poll it archives whatever already
 exists (so it's self-sufficient — no need to `sync` first), then it follows live activity and
-re-archives each session as it changes. It runs until you kill it.
+re-archives each session as it changes. It runs until you kill it, and like every daemon prints
+its ready line (the line below) to stderr within a second, before its first poll.
 
 Every time it archives a changed session it logs the delta to stderr:
 
@@ -100,8 +101,9 @@ read API [the app](viewing-and-sharing.md)'s dashboard polls (and the desktop ap
 [task inbox](tasks.md) page with the routes its buttons use, and with `--web` hosts the dashboard. It binds
 `127.0.0.1:7777` by default and runs until killed.
 
-`--port 0` binds an **ephemeral port**, and the startup banner always carries the *real* bound
-port — so a script or test harness can parse the address instead of racing to guess a free one:
+`--port 0` binds an **ephemeral port**, and the startup banner — printed to stderr within a second
+of starting, before any request is served — always carries the *real* bound port, so a script or
+test harness can parse the address instead of racing to guess a free one:
 
 ```text
 cv serve on http://127.0.0.1:54573 — inbox at /, API at /api/* (no --web)

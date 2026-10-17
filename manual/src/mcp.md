@@ -259,7 +259,8 @@ rather than writing a guess.
 
 Each `cv hook <name>` reads the hook's JSON on stdin and prints one line of hook JSON, or nothing.
 Every hook exits 0, so a hook can never block the harness: bad input or an unreadable store goes
-to stderr. Each one reads the catalog, the event index or one transcript's tail. None of them
+to stderr. Run by hand with a terminal on stdin, it does not wait for JSON that will never come:
+it prints usage and exits 2. Each one reads the catalog, the event index or one transcript's tail. None of them
 ever scans the fleet, and each finishes in 10–30 ms on a real store (one compaction case is
 slower; measurements below).
 
