@@ -20,6 +20,9 @@ use crate::util::{fmt_local, usage};
 /// were 500-char shell strings before this existed; a brief is a document.
 fn read_text_arg(path: &Path) -> Result<String> {
     if path == Path::new("-") {
+        if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+            eprintln!("cv task: reading the text from the terminal; end it with Ctrl-D");
+        }
         let mut buf = String::new();
         std::io::stdin()
             .read_to_string(&mut buf)

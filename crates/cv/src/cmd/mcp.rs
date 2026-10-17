@@ -239,7 +239,13 @@ pub(crate) fn cmd_mcp(tree: clap::Command) -> anyhow::Result<()> {
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
     }
-    eprintln!("cv mcp: clustervision MCP server starting (stdio JSON-RPC)");
+    let on_terminal = if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        "; stdin is a terminal: one JSON-RPC request per line, Ctrl-D stops it (a host registers it with \
+         `claude mcp add clustervision -- /abs/path/to/cv mcp`)"
+    } else {
+        ""
+    };
+    eprintln!("cv mcp: clustervision MCP server starting (stdio JSON-RPC){on_terminal}");
     let generated = match CliTools::from_owned_tree(tree) {
         Ok(c) => {
             eprintln!("cv mcp: generated {} tools from the CLI", c.commands().len());

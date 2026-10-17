@@ -2,7 +2,7 @@
 //! phase with their outcomes, the run totals, the driving script, and `--revive` (per-lane resume
 //! prompts mined from the transcripts of a run that died).
 
-use crate::util::{fmt_duration, fmt_int, short_id};
+use crate::util::{fmt_duration, fmt_int, short_id, Wait};
 use anyhow::{bail, Context, Result};
 use cv_core::ir::truncate;
 
@@ -21,6 +21,7 @@ pub(crate) fn cmd_workflow(
     script: bool,
     results: bool,
     follow: bool,
+    for_: Option<String>,
     revive: bool,
     revive_all: bool,
 ) -> Result<()> {
@@ -42,8 +43,15 @@ pub(crate) fn cmd_workflow(
         return list_workflows(&r, json);
     };
 
-    if follow {
-        return follow_workflow(&r, &run_id, json, script, results);
+    if follow || for_.is_some() {
+        return follow_workflow(
+            &r,
+            &run_id,
+            json,
+            script,
+            results,
+            Wait::resolve(true, for_.as_deref())?,
+        );
     }
 
     let mut wf = cv_core::workflow_of(&r, &run_id).with_context(|| {
@@ -66,29 +74,27 @@ pub(crate) fn cmd_workflow(
 
 /// `--follow`: poll the run's state file (the harness flushes it as agents progress) and stream
 /// agent state TRANSITIONS as feed lines — `12:03:41  ✓ verify:merkle → done (312,004 tok)` —
-/// then, when the run reaches a terminal status, emit the full render (honoring
+/// then, when the run reaches a terminal status or `--for` elapses, emit the full render (honoring
 /// `--json`/`--script`/`--results`). Waits for the state file if the run hasn't registered yet.
-fn follow_workflow(r: &cv_core::SessionRef, key: &str, json: bool, script: bool, results: bool) -> Result<()> {
+fn follow_workflow(
+    r: &cv_core::SessionRef,
+    key: &str,
+    json: bool,
+    script: bool,
+    results: bool,
+    wait: Wait,
+) -> Result<()> {
     use std::collections::HashMap;
     let mut seen: HashMap<u64, String> = HashMap::new(); // agent index → last printed state
-    let mut announced = false;
+    wait.announce("workflow", &format!("run {key:?}"));
     loop {
         let Some(wf) = cv_core::workflow_of(r, key) else {
-            if !announced {
-                eprintln!("… waiting for run {key:?} to register (Ctrl-C to stop)");
-                announced = true;
+            if !wait.pause(std::time::Duration::from_secs(2)) {
+                eprintln!("cv workflow: run {key:?} never registered");
+                return Ok(());
             }
-            std::thread::sleep(std::time::Duration::from_secs(2));
             continue;
         };
-        if !announced {
-            eprintln!(
-                "✦ following {} ({}) — Ctrl-C to stop",
-                wf.name.as_deref().unwrap_or("(unnamed)"),
-                wf.run_id,
-            );
-            announced = true;
-        }
         let now = crate::util::fmt_local(chrono::Utc::now(), "%H:%M:%S");
         for a in wf.phases.iter().flat_map(|p| &p.agents).chain(&wf.orphan_agents) {
             let state = a.state.clone().unwrap_or_default();
@@ -109,13 +115,18 @@ fn follow_workflow(r: &cv_core::SessionRef, key: &str, json: bool, script: bool,
             );
         }
         let live = matches!(wf.status.as_deref(), None | Some("running") | Some("started"));
-        if !live {
-            println!("\n── run reached {} ──\n", wf.status.as_deref().unwrap_or("?"));
-            let mut wf = wf;
-            wf.attach_journal(&r.path);
-            return emit_workflow(&wf, json, script, results, false, false, Some(r.path.as_path()));
+        if live && wait.pause(std::time::Duration::from_secs(2)) {
+            continue;
         }
-        std::thread::sleep(std::time::Duration::from_secs(2));
+        let status = wf.status.as_deref().unwrap_or("?");
+        if live {
+            println!("\n── --for elapsed, run still {status} ──\n");
+        } else {
+            println!("\n── run reached {status} ──\n");
+        }
+        let mut wf = wf;
+        wf.attach_journal(&r.path);
+        return emit_workflow(&wf, json, script, results, false, false, Some(r.path.as_path()));
     }
 }
 

@@ -367,6 +367,9 @@ enum Cmd {
         /// render the full run when it reaches a terminal status.
         #[arg(long, short = 'f')]
         follow: bool,
+        /// Follow for this long (30s, 5m, 2h), then render the run as it stands; implies --follow.
+        #[arg(id = "for", long = "for", value_name = "DURATION")]
+        for_: Option<String>,
         /// Salvage a dead or interrupted run: emit a ready-to-paste standalone `Agent` prompt per
         /// lane — the FULL original task plus the work that lane already landed (files written,
         /// commands run, its own last note) — so lanes come back resumed rather than restarted.
@@ -905,6 +908,12 @@ enum Cmd {
         /// Also emit the sessions that already exist at startup (default: only new activity).
         #[arg(long)]
         existing: bool,
+        /// Keep following when stdout is not a terminal (a pipe gets the current state once without it).
+        #[arg(long, short = 'f')]
+        follow: bool,
+        /// Follow for this long (30s, 5m, 2h), then exit 0; implies --follow.
+        #[arg(id = "for", long = "for", value_name = "DURATION")]
+        for_: Option<String>,
     },
     /// Follow live activity and archive every session as it changes, forever (archives what
     /// already exists on the first poll). `cv scry` is the same feed without the archive.
@@ -1178,7 +1187,12 @@ fn run() -> Result<()> {
     // survive idle server time. Ordinary commands share one cache across their session reads.
     let _reads = (!matches!(
         &cli.cmd,
-        Cmd::Serve { .. } | Cmd::Mcp | Cmd::Watch { .. } | Cmd::Scry { .. } | Cmd::Workflow { follow: true, .. }
+        Cmd::Serve { .. }
+            | Cmd::Mcp
+            | Cmd::Watch { .. }
+            | Cmd::Scry { .. }
+            | Cmd::Workflow { follow: true, .. }
+            | Cmd::Workflow { for_: Some(_), .. }
     ))
     .then(cv_core::source::read_scope);
     match cli.cmd {
@@ -1277,7 +1291,9 @@ fn run() -> Result<()> {
             cwd,
             interval,
             existing,
-        } => live::cmd_scry(harness, cwd, interval, existing),
+            follow,
+            for_,
+        } => live::cmd_scry(harness, cwd, interval, existing, follow, for_),
         Cmd::Index {
             semantic,
             rebuild,
@@ -1394,9 +1410,10 @@ fn run() -> Result<()> {
             script,
             results,
             follow,
+            for_,
             revive,
             revive_all,
-        } => workflow::cmd_workflow(&id, run_id, harness, json, script, results, follow, revive, revive_all),
+        } => workflow::cmd_workflow(&id, run_id, harness, json, script, results, follow, for_, revive, revive_all),
         Cmd::Tools {
             id,
             harness,

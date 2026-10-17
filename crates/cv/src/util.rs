@@ -43,6 +43,70 @@ pub(crate) fn write_user_file(path: &Path, bytes: &[u8], force: bool) -> Result<
     cv_core::publish::publish_reader(path, "out", bytes, claim)
 }
 
+// ---------- waiting ----------
+
+/// Whether a command that could wait does (docs/INTERFACE-V2.md §2, "blocking is opt-in and
+/// announced"): `--follow` or `--for` asks for it, a terminal on stdout permits it, and a pipe
+/// without either gets the current state once. The announcement goes out before the first
+/// discovery, so it lands within a second on a cold fleet too.
+pub(crate) enum Wait {
+    /// Print the current state once and exit 0.
+    Once,
+    /// Keep polling until the `--for` deadline (with the length asked for), or forever.
+    Until(Option<(std::time::Instant, std::time::Duration)>),
+}
+
+impl Wait {
+    pub(crate) fn resolve(follow: bool, for_: Option<&str>) -> Result<Wait> {
+        let bound = for_.map(parse_for).transpose()?;
+        if follow || bound.is_some() || std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+            Ok(Wait::Until(bound.map(|d| (std::time::Instant::now() + d, d))))
+        } else {
+            Ok(Wait::Once)
+        }
+    }
+
+    /// The one stderr line: what `cv <cmd>` is waiting for, or how to make it wait.
+    pub(crate) fn announce(&self, cmd: &str, what: &str) {
+        match self {
+            Wait::Once => eprintln!(
+                "cv {cmd}: stdout is not a terminal, so this is the current state once; \
+                 --follow keeps following {what}, --for <duration> bounds it"
+            ),
+            Wait::Until(None) => eprintln!("cv {cmd}: following {what}; stop with Ctrl-C or --for <duration>"),
+            Wait::Until(Some((_, length))) => eprintln!(
+                "cv {cmd}: following {what} for {}; Ctrl-C stops early",
+                fmt_duration(length.as_millis() as u64)
+            ),
+        }
+    }
+
+    /// Sleep one `interval`, cut short by the deadline; false once there is nothing left to wait for.
+    pub(crate) fn pause(&self, interval: std::time::Duration) -> bool {
+        let left = match self {
+            Wait::Once => return false,
+            Wait::Until(None) => interval,
+            Wait::Until(Some((deadline, _))) => {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                if left.is_zero() {
+                    return false;
+                }
+                interval.min(left)
+            }
+        };
+        std::thread::sleep(left);
+        true
+    }
+}
+
+/// `--for 30s` / `5m` / `2h` (the task deadline grammar) as a duration; anything else is exit 2.
+fn parse_for(s: &str) -> Result<std::time::Duration> {
+    match cv_core::task::project::parse_duration(s).and_then(|d| d.to_std().ok()) {
+        Some(d) => Ok(d),
+        None => usage(format!("--for wants a duration such as 30s, 5m or 2h, not {s:?}")),
+    }
+}
+
 // ---------- harness / id resolution ----------
 
 pub(crate) fn parse_harness(s: &Option<String>) -> Result<Option<Harness>> {

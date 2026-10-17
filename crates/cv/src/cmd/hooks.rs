@@ -591,8 +591,16 @@ struct Input {
 }
 
 /// `cv hook <name>`: read stdin, run the body, print its one-line JSON (or nothing). A body that
-/// fails prints its error on stderr and still exits 0 — a hook must never block the harness.
+/// fails prints its error on stderr and still exits 0 — a hook must never block the harness. A
+/// terminal on stdin means no harness is calling: usage, exit 2, instead of waiting for JSON.
 pub(crate) fn cmd_hook(name: HookName) -> Result<()> {
+    if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        return crate::util::usage(format!(
+            "cv hook {} reads Claude Code's hook JSON on stdin, and stdin is a terminal; \
+             `cv hooks install claude` writes the settings entries that pipe it",
+            name.as_str()
+        ));
+    }
     let mut raw = String::new();
     let _ = std::io::stdin().read_to_string(&mut raw);
     let input: Input = match serde_json::from_str(&raw) {

@@ -9,7 +9,6 @@ use crate::harness;
 use crate::ir::{Harness, Message, SessionRef};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::time::Duration;
 
 mod read;
 pub use read::{read as read_tail, read_session, read_session_into, ReadPass, ReadState};
@@ -382,6 +381,11 @@ impl Watcher {
         format!("{}:{}", r.harness.as_str(), r.id)
     }
 
+    /// How many sessions hold a position (the count a follower announces once primed).
+    pub fn following(&self) -> usize {
+        self.seen.len()
+    }
+
     fn trigger_of(r: &SessionRef) -> (usize, Option<i64>) {
         (r.message_count, r.updated_at.map(|t| t.timestamp_millis()))
     }
@@ -408,8 +412,9 @@ impl Watcher {
 
     /// The sessions to follow, oldest-touched first, so a bounded poll yields a chronological
     /// slice. Followers use full discovery independently of catalog synchronization. The
-    /// identity-aware per-file scan cache avoids reparsing unchanged transcripts.
-    fn discover(&self) -> Vec<SessionRef> {
+    /// identity-aware per-file scan cache avoids reparsing unchanged transcripts. Public as the
+    /// one-shot form of a follower: its current state is this list.
+    pub fn discover(&self) -> Vec<SessionRef> {
         let mut refs: Vec<SessionRef> = (self.discover)()
             .into_iter()
             .filter(|r| self.filter.matches(r))
@@ -739,16 +744,6 @@ impl Watcher {
             accepted += 1;
         }
         accepted
-    }
-
-    /// Poll forever, invoking `on_event` for each event. Blocks the calling thread.
-    pub fn run<F: FnMut(SessionEvent)>(&mut self, interval: Duration, mut on_event: F) -> ! {
-        loop {
-            for ev in self.poll() {
-                on_event(ev);
-            }
-            std::thread::sleep(interval);
-        }
     }
 }
 

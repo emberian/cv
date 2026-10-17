@@ -316,7 +316,8 @@ fn run_command_cancelled(
 /// Keep the commands in the four tool groups and the `task` subcommands, dropping bare dispatcher
 /// parents (a command that has subcommands and no arguments of its own — calling it could only
 /// ever print clap's usage) and `hook`, which reads Claude Code's hook JSON on stdin that an MCP
-/// call cannot supply (it did nothing; `cv hooks install claude` wires it).
+/// call cannot supply (it did nothing; `cv hooks install claude` wires it). A `--follow` flag is
+/// dropped too: a tool call has no Ctrl-C, so following is offered only bounded, through `for`.
 fn select_tool_commands(all: Vec<CommandSpec>) -> Vec<CommandSpec> {
     let names: Vec<String> = all.iter().map(|c| c.name.clone()).collect();
     all.into_iter()
@@ -324,6 +325,10 @@ fn select_tool_commands(all: Vec<CommandSpec>) -> Vec<CommandSpec> {
         .filter(|c| {
             let has_children = names.iter().any(|n| n.starts_with(&format!("{} ", c.name)));
             !(has_children && c.args.is_empty())
+        })
+        .map(|mut c| {
+            c.args.retain(|a| !(a.name == "follow" && a.kind == ArgKind::Flag));
+            c
         })
         .collect()
 }

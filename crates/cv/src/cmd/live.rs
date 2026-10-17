@@ -1,39 +1,69 @@
 //! `cv scry` — live activity across harnesses (`tail -f` for sessions).
 
-use crate::util::{home_rel, parse_harness, short_id};
+use crate::util::{home_rel, parse_harness, short_id, Wait};
 use anyhow::Result;
-use cv_core::ir::truncate;
-use cv_core::watch::{Filter, Watcher};
+use cv_core::ir::{truncate, SessionRef};
+use cv_core::watch::{EventKind, Filter, SessionEvent, Watcher};
 use std::time::Duration;
 
-pub(crate) fn cmd_scry(harness: Option<String>, cwd: Option<String>, interval: f64, existing: bool) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn cmd_scry(
+    harness: Option<String>,
+    cwd: Option<String>,
+    interval: f64,
+    existing: bool,
+    follow: bool,
+    for_: Option<String>,
+) -> Result<()> {
     let interval = poll_interval(interval)?;
     let filter = Filter {
         harness: parse_harness(&harness)?,
         cwd_contains: cwd,
     };
-    let mut watcher = Watcher::new(filter, existing);
-    eprintln!("✦ scrying for agent activity… (Ctrl-C to stop)");
-    watcher.run(interval, |ev| {
-        let r = &ev.reference;
-        let tag = match ev.kind {
-            cv_core::watch::EventKind::New => "✷ new",
-            cv_core::watch::EventKind::Updated => "   +",
-        };
-        let where_ = r.cwd.as_deref().map(home_rel).unwrap_or_else(|| "?".into());
-        println!(
-            "{tag}  {:8} {:8}  {}  ({} msg)",
-            r.harness.as_str(),
-            short_id(&r.id),
-            where_,
-            ev.new_messages.len()
-        );
-        for m in &ev.new_messages {
-            if let Some(t) = m.text() {
-                println!("      {} {}", cv_core::render::role_label(m.role), truncate(&t, 100));
-            }
+    let wait = Wait::resolve(follow, for_.as_deref())?;
+    wait.announce("scry", "live agent activity");
+    if matches!(wait, Wait::Once) && !existing {
+        // The current state: the sessions a follower would baseline, in the order it polls them.
+        for r in Watcher::new(filter, true).discover() {
+            println!("{}", header("   ·", &r, r.message_count));
         }
-    });
+        return Ok(());
+    }
+    let mut watcher = Watcher::new(filter, existing);
+    if !matches!(wait, Wait::Once) {
+        eprintln!("cv scry: following {} sessions", watcher.following());
+    }
+    loop {
+        for ev in watcher.poll() {
+            print_event(&ev);
+        }
+        if !wait.pause(interval) {
+            return Ok(());
+        }
+    }
+}
+
+fn header(tag: &str, r: &SessionRef, messages: usize) -> String {
+    let where_ = r.cwd.as_deref().map(home_rel).unwrap_or_else(|| "?".into());
+    format!(
+        "{tag}  {:8} {:8}  {}  ({messages} msg)",
+        r.harness.as_str(),
+        short_id(&r.id),
+        where_
+    )
+}
+
+fn print_event(ev: &SessionEvent) {
+    let tag = match ev.kind {
+        EventKind::New => "✷ new",
+        EventKind::Updated => "   +",
+    };
+    println!("{}", header(tag, &ev.reference, ev.new_messages.len()));
+    for m in &ev.new_messages {
+        if let Some(t) = m.text() {
+            println!("      {} {}", cv_core::render::role_label(m.role), truncate(&t, 100));
+        }
+    }
 }
 
 fn poll_interval(seconds: f64) -> Result<Duration> {
