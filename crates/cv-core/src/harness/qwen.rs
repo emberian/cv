@@ -16,11 +16,12 @@
 //!
 //! Missing dirs degrade gracefully to empty results.
 
+use super::store::jsonl;
 use super::{parse_ts, Adapter};
 use crate::ir::*;
 use crate::source::{Dependencies, Probe};
 use crate::stream::{Checkpoint, Flow, MessageSink, ParseOptions, ADAPTER_LAYER};
-use anyhow::{Context, Result};
+use anyhow::Result;
 use record::Demand;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -133,25 +134,15 @@ impl Adapter for Qwen {
     fn stream(&self, r: &SessionRef, opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
         crate::stream::checked(sink, |sink| {
             if is_session_jsonl(&r.path) {
-                let source = crate::json::JsonSource::capture(&r.path)?;
+                let input = jsonl::Read::open(&r.path)?;
                 let demand = if opts.spans {
-                    Demand::Spans(&source)
+                    Demand::Spans(input.source())
                 } else {
                     Demand::Owned
                 };
                 let s = session_shell(&r.path, sink);
-                return replay(
-                    &r.path,
-                    &source,
-                    s,
-                    ReplayState::default(),
-                    0,
-                    None,
-                    demand,
-                    sink,
-                    &mut || Ok(()),
-                )
-                .map(Option::unwrap);
+                return replay(&input, s, ReplayState::default(), 0, None, demand, sink, &mut || Ok(()))
+                    .map(Option::unwrap);
             }
             // The gemini-cli shape: the streaming machinery (mmap + RawValue for legacy whole-file
             // JSON, line streaming for JSONL recordings) is shared and re-tags the session as Qwen.
@@ -179,24 +170,14 @@ impl Adapter for Qwen {
             let Some(state) = from.get::<ReplayCheckpoint>(ADAPTER_LAYER) else {
                 return Ok(None);
             };
-            let source = crate::json::JsonSource::capture(&r.path)?;
+            let input = jsonl::Read::open(&r.path)?;
             let demand = if opts.spans {
-                Demand::Spans(&source)
+                Demand::Spans(input.source())
             } else {
                 Demand::Owned
             };
             let (s, replay_state) = (state.session, state.replay);
-            replay(
-                &r.path,
-                &source,
-                s,
-                replay_state,
-                from.offset,
-                None,
-                demand,
-                sink,
-                &mut || Ok(()),
-            )
+            replay(&input, s, replay_state, from.offset, None, demand, sink, &mut || Ok(()))
         })
     }
 
@@ -475,36 +456,28 @@ fn subagent_parent(path: &Path) -> Option<String> {
 }
 
 fn scan_session_jsonl(path: &Path) -> Option<SessionRef> {
-    let mut messages = 0usize;
-    let mut turns = 0usize;
-    let mut sink = |m: Message| {
-        messages += 1;
-        turns += usize::from(matches!(m.role, Role::User | Role::Assistant));
-        Flow::Continue
-    };
-    let source = crate::json::JsonSource::capture(path).ok()?;
-    let shell = session_shell(path, &mut sink);
-    let s = replay(
-        path,
-        &source,
-        shell,
-        ReplayState::default(),
-        0,
-        None,
-        Demand::Discovery,
-        &mut sink,
-        &mut || Ok(()),
-    )
-    .ok()??;
-    if messages == 0 && s.created_at.is_none() {
+    let input = jsonl::Read::open(path).ok()?;
+    let mut sink = |_: Message| Flow::Continue;
+    let mut s = session_shell(path, &mut sink);
+    let mut state = ReplayState::default();
+    let mut present = false;
+    input
+        .lines(0, |line| {
+            if let Some(view) = line.view {
+                present |= record::scan(view, &mut s, &mut state, !present)?;
+            }
+            Ok(Flow::Continue)
+        })
+        .ok()?;
+    if !present && s.created_at.is_none() {
         return None;
     }
-    let mut r = SessionRef::new(s.id.clone(), Harness::Qwen, path.to_path_buf());
-    r.cwd = s.cwd.clone();
-    r.title = s.title.clone();
+    let mut r = SessionRef::new(s.id, Harness::Qwen, path.to_path_buf());
+    r.cwd = s.cwd;
+    r.title = state.title.or(state.first_prompt);
     r.created_at = s.created_at;
     r.updated_at = s.updated_at;
-    r.message_count = turns;
+    r.message_count = 0;
     Some(r)
 }
 
@@ -567,11 +540,10 @@ pub(crate) fn count_prefix_checked(r: &SessionRef, len: u64, check: &mut dyn FnM
         count += 1;
         Flow::Continue
     };
-    let source = crate::json::JsonSource::capture(&r.path)?;
+    let input = jsonl::Read::open(&r.path)?;
     let shell = session_shell(&r.path, &mut sink);
     replay(
-        &r.path,
-        &source,
+        &input,
         shell,
         ReplayState::default(),
         0,
@@ -591,8 +563,7 @@ pub(crate) fn count_prefix_checked(r: &SessionRef, len: u64, check: &mut dyn FnM
 /// `at` lies beyond the file.
 #[allow(clippy::too_many_arguments)] // The replay state, its window and the demand.
 fn replay(
-    path: &Path,
-    source: &crate::json::JsonSource,
+    input: &jsonl::Read,
     mut s: Session,
     mut st: ReplayState,
     at: u64,
@@ -601,14 +572,13 @@ fn replay(
     sink: &mut dyn MessageSink,
     check: &mut dyn FnMut() -> Result<()>,
 ) -> Result<Option<Session>> {
-    let file = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    source.check_metadata(file.metadata()?)?;
+    let source = input.source();
     if at > source.len() {
         return Ok(None);
     }
     let to = to.map_or(source.len(), |to| to.min(source.len()));
     let mut stopped = false;
-    super::store::jsonl::for_each_line(source, &file, at, to, |line| {
+    input.snapshot(at, to, |line| {
         check()?;
         match line.view {
             Some(view) => {
@@ -618,7 +588,15 @@ fn replay(
             }
             None => st.skipped += u64::from(!line.blank),
         }
-        if !stopped && line.complete && sink.wants_checkpoint(line.end) {
+        input.check_backing()?;
+        let checkpoint = if !stopped && line.complete {
+            let wanted = sink.wants_checkpoint(line.end);
+            input.check_backing()?;
+            wanted
+        } else {
+            false
+        };
+        if checkpoint {
             let mut cp = Checkpoint::new(line.end);
             cp.put(
                 ADAPTER_LAYER,
@@ -628,11 +606,10 @@ fn replay(
                 },
             );
             sink.checkpoint(&mut cp);
+            input.check_backing()?;
         }
         Ok(Flow::Continue)
     })?;
-    source.check_metadata(file.metadata()?)?;
-    source.check()?;
     s.model = st.session_model.take();
     s.title = st.title.take().or(st.first_prompt.take());
     super::note_skipped_lines(&mut s, st.skipped);
@@ -817,23 +794,184 @@ mod tests {
         assert!(serde_json::to_value(&resumed.messages).is_err());
     }
 
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn deferred_counts_refill_and_late_metadata_invalidate_the_same_source() -> Result<()> {
+        let world = crate::test_world("qwen-count-publication");
+        let home = world.home.join(".qwen");
+        let path = home.join("projects/p/chats/count.jsonl");
+        fs::create_dir_all(path.parent().unwrap())?;
+        let raw = "{\"type\":\"user\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"message\":{\"parts\":[{\"text\":\"question\"}]}}\n{\"type\":\"assistant\",\"message\":{\"parts\":[{\"text\":\"answer\"}]}}\n";
+        fs::write(&path, raw)?;
+        let adapter = Qwen::with_home(&home);
+        let context = crate::discover_cache::read::Context::current();
+        let _scope = context.enter();
+        let reference = crate::sessions_for(Some(Harness::Qwen)).remove(0);
+        assert_eq!(reference.message_count, 0);
+        let mut sink = crate::stream::CollectSink::default();
+        crate::stream::stream_counted(
+            &adapter,
+            &reference,
+            &ParseOptions::facts(),
+            &mut sink,
+            crate::stream::Pass::RECORD,
+        )?;
+        assert_eq!(crate::sessions_for(Some(Harness::Qwen))[0].message_count, 2);
+        let late = serde_json::json!({"type":"system","subtype":"custom_title","timestamp":"2026-01-03T00:00:00Z","systemPayload":{"title":"late native title","unused":"x".repeat(100_000)}});
+        fs::write(
+            &path,
+            format!("{raw}{late}\n{{\"timestamp\":\"2025-12-31T00:00:00Z\"}}\n"),
+        )?;
+        let changed = crate::sessions_for(Some(Harness::Qwen)).remove(0);
+        assert_eq!(changed.message_count, 0);
+        assert_eq!(changed.title.as_deref(), Some("late native title"));
+        assert_eq!(changed.created_at, parse_ts("2025-12-31T00:00:00Z"));
+        assert_eq!(changed.updated_at, parse_ts("2026-01-03T00:00:00Z"));
+        crate::stream::stream_counted(
+            &adapter,
+            &changed,
+            &ParseOptions::facts(),
+            &mut sink,
+            crate::stream::Pass::RECORD,
+        )?;
+        assert_eq!(crate::sessions_for(Some(Harness::Qwen))[0].message_count, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn visible_presence_preserves_empty_and_timestamp_only_inclusion() -> Result<()> {
+        let world = crate::test_world("qwen-presence");
+        let path = world.base.join("projects/p/chats/presence.jsonl");
+        fs::create_dir_all(path.parent().unwrap())?;
+        let cases = [
+            (serde_json::json!({"type":"system","subtype":"session_model"}), true),
+            (serde_json::json!({"type":"system","subtype":"chat_compression"}), true),
+            (serde_json::json!({"type":"system","subtype":"rewind"}), true),
+            (
+                serde_json::json!({"type":"system","subtype":"custom_title","systemPayload":{"title":"named only"}}),
+                false,
+            ),
+            (
+                serde_json::json!({"type":"user","message":{"parts":[{"text":""}]}}),
+                false,
+            ),
+            (
+                serde_json::json!({"type":"user","message":{"parts":[{"text":"   "}]}}),
+                true,
+            ),
+            (
+                serde_json::json!({"type":"user","message":{"parts":[{"text":"<qwen:user-prompt-submit-context>context"}]}}),
+                true,
+            ),
+            (
+                serde_json::json!({"type":"assistant","message":{"parts":[{"functionCall":{"name":"noop","args":{"x":1}}}]}}),
+                true,
+            ),
+            (
+                serde_json::json!({"type":"tool_result","message":{"parts":[{"functionResponse":{"response":{"output":""}}}]}}),
+                true,
+            ),
+            (serde_json::json!({"type":"unknown"}), false),
+            (
+                serde_json::json!({"type":"unknown","timestamp":"2026-01-01T00:00:00Z"}),
+                true,
+            ),
+        ];
+        for (row, included) in cases {
+            fs::write(&path, format!("{row}\n"))?;
+            let found = scan_session_jsonl(&path);
+            assert_eq!(found.is_some(), included, "{row}");
+            if let Some(reference) = found {
+                assert_eq!(reference.message_count, 0);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn continued_metadata_after_stop_checks_source_before_mapped_reuse() -> Result<()> {
+        let world = crate::test_world("qwen-stop-source");
+        let path = world.base.join("projects/p/chats/source.jsonl");
+        fs::create_dir_all(path.parent().unwrap())?;
+        let raw = "{\"type\":\"user\",\"sessionId\":\"first\",\"timestamp\":\"2026-01-02T00:00:00Z\",\"message\":{\"parts\":[{\"text\":\"first prompt\"}]}}\n{\"type\":\"ignored\",\"sessionId\":\"last\",\"timestamp\":\"2026-01-01T00:00:00Z\"}\n{\"type\":\"ignored\",\"timestamp\":\"2026-01-03T00:00:00Z\"}\n".to_owned() + &"{}\n".repeat(2000);
+        let reference = SessionRef::new("source", Harness::Qwen, &path);
+        let adapter = Qwen::with_home(&world.base);
+        fs::write(&path, &raw)?;
+        let mut calls = 0;
+        let stopped = adapter.stream(&reference, &ParseOptions::full(), &mut |_: Message| {
+            calls += 1;
+            Flow::Stop
+        })?;
+        assert_eq!(calls, 1);
+        assert_eq!(stopped.id, "last", "unchanged Stop still folds later metadata");
+        assert_eq!(stopped.created_at, parse_ts("2026-01-01T00:00:00Z"));
+        assert_eq!(stopped.updated_at, parse_ts("2026-01-03T00:00:00Z"));
+        for flow in [Flow::Stop, Flow::Continue] {
+            fs::write(&path, &raw)?;
+            let mut calls = 0;
+            let result = adapter.stream(&reference, &ParseOptions::full(), &mut |_: Message| {
+                calls += 1;
+                fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_len(0)
+                    .unwrap();
+                flow
+            });
+            assert!(result.is_err());
+            assert_eq!(calls, 1);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn compression_callback_cannot_invalidate_fields_needed_for_summary() -> Result<()> {
+        let world = crate::test_world("qwen-compression-source");
+        let path = world.base.join("projects/p/chats/source.jsonl");
+        fs::create_dir_all(path.parent().unwrap())?;
+        let row = serde_json::json!({"type":"system","subtype":"chat_compression","timestamp":"2026-01-01T00:00:00Z","systemPayload":{"compressedHistory":[{"parts":[{"text":"summary"}]}]},"ignored":"x".repeat(16384)});
+        fs::write(&path, format!("{row}\n"))?;
+        let reference = SessionRef::new("source", Harness::Qwen, &path);
+        let adapter = Qwen::with_home(&world.base);
+        let mut stable = 0;
+        adapter.stream(&reference, &ParseOptions::full(), &mut |_: Message| {
+            stable += 1;
+            Flow::Continue
+        })?;
+        assert_eq!(stable, 2, "boundary and summary come from the same record");
+        let mut calls = 0;
+        let result = adapter.stream(&reference, &ParseOptions::full(), &mut |_: Message| {
+            calls += 1;
+            if calls == 1 {
+                fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_len(0)
+                    .unwrap();
+            }
+            Flow::Continue
+        });
+        assert!(result.is_err());
+        assert!(calls > 0);
+        Ok(())
+    }
+
     #[test]
     fn discovery_demand_matches_the_whole_replay_with_giant_system_payloads() -> Result<()> {
         let world = crate::test_world("qwen-discovery-selected");
         let body = "body λ\n".repeat(512 * 1024);
         let oracle = |path: &Path| -> Result<Option<SessionRef>> {
             let mut messages = 0;
-            let mut turns = 0;
-            let mut sink = |m: Message| {
+            let mut sink = |_: Message| {
                 messages += 1;
-                turns += usize::from(matches!(m.role, Role::User | Role::Assistant));
                 Flow::Continue
             };
-            let source = crate::json::JsonSource::capture(path)?;
+            let input = jsonl::Read::open(path)?;
             let shell = session_shell(path, &mut sink);
             let session = replay(
-                path,
-                &source,
+                &input,
                 shell,
                 ReplayState::default(),
                 0,
@@ -851,7 +989,7 @@ mod tests {
             reference.title = session.title;
             reference.created_at = session.created_at;
             reference.updated_at = session.updated_at;
-            reference.message_count = turns;
+            reference.message_count = 0;
             Ok(Some(reference))
         };
         let rows = [

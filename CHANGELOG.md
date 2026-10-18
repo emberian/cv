@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Qwen listings defer exact counts while preserving late titles, timestamp extrema, and empty-session inclusion.
+- Qwen reads detect callback source changes before continuing metadata scans, including compression summaries.
+
 - Listings reuse source-certified exact turn counts after complete reads, preserving them across harmless metadata refreshes and invalidating changed sources.
 - Kimi Code listings use complete native state metadata directly and defer exact counts; incomplete metadata retains transcript-derived titles and timestamps.
 - Kimi Code reads detect callback source changes before continuing a new step or completing an unfinished one.

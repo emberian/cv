@@ -42,6 +42,117 @@ const TOP: &[&str] = &[
     "message",
 ];
 
+#[derive(Clone, Copy)]
+enum Kind {
+    Prompt,
+    UserContext,
+    Assistant,
+    ToolResult,
+    Compression,
+    Notice,
+    Rewind,
+    Model,
+    Title,
+    Parent,
+    Error,
+    Ignore,
+}
+
+/// Parsed fields and classification shared by metadata and message demands.
+struct Record<'v> {
+    fields: Fields<'v>,
+    ty: String,
+    subtype: Option<String>,
+    kind: Kind,
+}
+impl<'v> Record<'v> {
+    fn of(fields: Fields<'v>) -> Result<Self> {
+        let ty = fields.string("type")?.unwrap_or_default();
+        let subtype = fields.string("subtype")?;
+        let provenance = fields.string("provenance")?;
+        let kind = match (ty.as_str(), subtype.as_deref()) {
+            ("user", None | Some("mid_turn_user_message"))
+                if provenance.as_deref().is_none_or(|p| p == "real_user") =>
+            {
+                Kind::Prompt
+            }
+            ("user", _) => Kind::UserContext,
+            ("assistant", _) => Kind::Assistant,
+            ("tool_result", _) => Kind::ToolResult,
+            ("system", Some("chat_compression")) => Kind::Compression,
+            (
+                "system",
+                Some("goal_state" | "slash_command" | "at_command" | "notification" | "background_task_completed"),
+            ) => Kind::Notice,
+            ("system", Some("rewind")) => Kind::Rewind,
+            ("system", Some("session_model")) => Kind::Model,
+            ("system", Some("custom_title")) => Kind::Title,
+            ("system", Some("parent_session")) => Kind::Parent,
+            ("system", Some("turn_result")) => Kind::Error,
+            _ => Kind::Ignore,
+        };
+        Ok(Self {
+            fields,
+            ty,
+            subtype,
+            kind,
+        })
+    }
+
+    fn control(&self, s: &mut Session, st: &mut ReplayState) -> Result<bool> {
+        let payload = self.fields.get("systemPayload");
+        match self.kind {
+            Kind::Title => {
+                if let Some(t) = payload_str(payload, &["title", "customTitle"])? {
+                    st.title = Some(t);
+                }
+            }
+            Kind::Parent => {
+                if let Some(p) = payload_str(payload, &["parentSessionId", "sessionId"])? {
+                    s.lineage.forked_from = Some(p);
+                }
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+}
+
+/// Listing projection: inspect bodies only until presence and first prompt are established.
+pub(super) fn scan(view: JsonView<'_>, s: &mut Session, st: &mut ReplayState, need_presence: bool) -> Result<bool> {
+    let Some(fields) = fields(view, s)? else {
+        return Ok(false);
+    };
+    let record = Record::of(fields)?;
+    if record.control(s, st)? {
+        return Ok(false);
+    }
+    let r = &record.fields;
+    Ok(match record.kind {
+        Kind::Prompt if need_presence || (st.title.is_none() && st.first_prompt.is_none()) => {
+            let (body, hooks) = split_prompt(content_blocks(r.get("message"), Demand::Discovery)?)?;
+            remember_prompt(st, &body);
+            !body.is_empty() || !hooks.is_empty()
+        }
+        Kind::UserContext | Kind::Assistant | Kind::ToolResult if need_presence => {
+            !content_blocks(r.get("message"), Demand::Discovery)?.is_empty()
+        }
+        Kind::Compression | Kind::Rewind | Kind::Model => true,
+        Kind::Notice | Kind::Error if need_presence => {
+            !system_blocks(r.get("systemPayload"), record.subtype.as_deref(), Demand::Discovery)?.is_empty()
+        }
+        _ => false,
+    })
+}
+
+fn fields<'v>(view: JsonView<'v>, s: &mut Session) -> Result<Option<Fields<'v>>> {
+    let fields = Fields::parse(view, TOP)?;
+    if let Some(fields) = &fields {
+        session_facts(s, fields)?;
+    }
+    Ok(fields)
+}
+
 /// One record: fold its session facts, then (unless the sink already stopped) hand its messages
 /// to `sink`. Returns false once the sink has stopped.
 pub(super) fn ingest(
@@ -52,14 +163,13 @@ pub(super) fn ingest(
     stopped: bool,
     sink: &mut dyn MessageSink,
 ) -> Result<Flow> {
-    let Some(r) = Fields::parse(view, TOP)? else {
+    let Some(fields) = fields(view, s)? else {
         return Ok(Flow::Continue);
     };
-    session_facts(s, &r)?;
     if stopped {
         return Ok(Flow::Continue);
     }
-    emit(&r, s, st, demand, sink)
+    emit(&Record::of(fields)?, s, st, demand, sink)
 }
 
 fn string(view: Option<JsonView<'_>>, key: &str) -> Result<Option<String>> {
@@ -125,15 +235,18 @@ fn session_facts(s: &mut Session, r: &Fields<'_>) -> Result<()> {
 
 /// Translate one `ChatRecord` into 0..2 IR messages.
 fn emit(
-    r: &Fields<'_>,
+    record: &Record<'_>,
     s: &mut Session,
     st: &mut ReplayState,
     demand: Demand<'_>,
     sink: &mut dyn MessageSink,
 ) -> Result<Flow> {
-    let ty = r.string("type")?.unwrap_or_default();
-    let subtype = r.string("subtype")?;
-    let provenance = r.string("provenance")?;
+    if record.control(s, st)? {
+        return Ok(Flow::Continue);
+    }
+    let r = &record.fields;
+    let ty = &record.ty;
+    let subtype = &record.subtype;
     let payload = r.get("systemPayload");
     let blocks = || -> Result<Vec<Block>> {
         if ty == "system" {
@@ -142,8 +255,8 @@ fn emit(
             content_blocks(r.get("message"), demand)
         }
     };
-    let m = match (ty.as_str(), subtype.as_deref()) {
-        ("user", None | Some("mid_turn_user_message")) if provenance.as_deref().is_none_or(|p| p == "real_user") => {
+    let m = match record.kind {
+        Kind::Prompt => {
             // A sub-agent transcript's prompt was written by the parent agent, not a person.
             let origin = if r.get("isSidechain").map(|v| v.as_bool()).transpose()?.flatten() == Some(true) {
                 Origin::Subagent
@@ -151,28 +264,9 @@ fn emit(
                 Origin::Human
             };
             let mut m = Message::of_kind(Role::User, MessageKind::Prompt, origin);
-            let mut hooked = Vec::new();
-            for block in blocks()? {
-                match &block {
-                    Block::Text { text }
-                        if text_head(text, &Resolver::new(None), 80, true)?
-                            .0
-                            .starts_with(HOOK_CONTEXT_TAG) =>
-                    {
-                        hooked.push(block)
-                    }
-                    _ => m.content.push(block),
-                }
-            }
-            if st.first_prompt.is_none() {
-                st.first_prompt = text_summary(
-                    m.content
-                        .iter()
-                        .filter_map(|b| if let Block::Text { text } = b { Some(text) } else { None }),
-                    &Resolver::new(None),
-                    false,
-                );
-            }
+            let (body, hooked) = split_prompt(blocks()?)?;
+            m.content = body;
+            remember_prompt(st, &m.content);
             if !hooked.is_empty() {
                 // A UserPromptSubmit hook's `additionalContext`: its own Hook turn, after the prompt.
                 let mut hook = Message::of_kind(Role::System, MessageKind::InjectedContext, Origin::Hook);
@@ -185,7 +279,8 @@ fn emit(
             }
             m
         }
-        ("user", sub) => {
+        Kind::UserContext => {
+            let sub = subtype.as_deref();
             // Model-facing input the harness (or a scheduler, or another agent) wrote: notifications,
             // cron fires, goal runtime turns, agent mentions/messages.
             let origin = match sub {
@@ -197,7 +292,7 @@ fn emit(
             m.content = blocks()?;
             m
         }
-        ("assistant", _) => {
+        Kind::Assistant => {
             let mut m = Message::of_kind(Role::Assistant, MessageKind::Reply, Origin::Model);
             m.content = blocks()?;
             if let Some(model) = r.string("model")? {
@@ -226,7 +321,7 @@ fn emit(
             }
             m
         }
-        ("tool_result", _) => {
+        Kind::ToolResult => {
             let mut m = Message::of_kind(Role::Tool, MessageKind::ToolResult, Origin::Harness);
             m.content = blocks()?;
             let status = string(r.get("toolCallResult"), "status")?;
@@ -254,7 +349,7 @@ fn emit(
             }
             m
         }
-        ("system", Some("chat_compression")) => {
+        Kind::Compression => {
             // `{info: {originalTokenCount, newTokenCount, triggerReason, ...}, compressedHistory:
             // Content[]}`: the boundary, then the summary turn that seeds the new window.
             let mut m = Message::of_kind(Role::System, MessageKind::CompactionBoundary, Origin::Harness);
@@ -275,6 +370,7 @@ fn emit(
                 }
             }
             let summary = blocks()?;
+            let summary_ts = timestamp(r)?;
             if finish(m, r, subtype.as_deref(), sink)? == Flow::Stop {
                 return Ok(Flow::Stop);
             }
@@ -283,42 +379,27 @@ fn emit(
             }
             let mut sm = Message::of_kind(Role::System, MessageKind::CompactionSummary, Origin::Harness);
             sm.content = summary;
-            sm.timestamp = timestamp(r)?;
+            sm.timestamp = summary_ts;
             return Ok(sink.message(sm));
         }
-        (
-            "system",
-            Some("goal_state" | "slash_command" | "at_command" | "notification" | "background_task_completed"),
-        ) => {
+        Kind::Notice => {
             let mut m = Message::of_kind(Role::System, MessageKind::Notice, Origin::Harness);
             m.content = blocks()?;
             m
         }
-        ("system", Some("rewind")) => {
+        Kind::Rewind => {
             let mut m = Message::of_kind(Role::System, MessageKind::Branch, Origin::Harness);
             m.content.push(Block::Text {
                 text: "[rewound]".to_string().into(),
             });
             m
         }
-        ("system", Some("session_model")) => {
+        Kind::Model => {
             let mut m = Message::of_kind(Role::System, MessageKind::ModelChange, Origin::Harness);
             m.model = payload_str(payload, &["model", "modelId"])?;
             m
         }
-        ("system", Some("custom_title")) => {
-            if let Some(t) = payload_str(payload, &["title", "customTitle"])? {
-                st.title = Some(t);
-            }
-            return Ok(Flow::Continue);
-        }
-        ("system", Some("parent_session")) => {
-            if let Some(p) = payload_str(payload, &["parentSessionId", "sessionId"])? {
-                s.lineage.forked_from = Some(p);
-            }
-            return Ok(Flow::Continue);
-        }
-        ("system", Some("turn_result")) => {
+        Kind::Error => {
             let mut m = Message::of_kind(Role::System, MessageKind::Error, Origin::Harness);
             m.content = blocks()?;
             m
@@ -328,6 +409,31 @@ fn emit(
         _ => return Ok(Flow::Continue),
     };
     finish(m, r, subtype.as_deref(), sink)
+}
+
+fn split_prompt(blocks: Vec<Block>) -> Result<(Vec<Block>, Vec<Block>)> {
+    let mut body = Vec::new();
+    let mut hooks = Vec::new();
+    for block in blocks {
+        if matches!(&block, Block::Text { text } if text_head(text, &Resolver::new(None), 80, true)?.0.starts_with(HOOK_CONTEXT_TAG))
+        {
+            hooks.push(block);
+        } else {
+            body.push(block);
+        }
+    }
+    Ok((body, hooks))
+}
+fn remember_prompt(st: &mut ReplayState, blocks: &[Block]) {
+    if st.first_prompt.is_none() {
+        st.first_prompt = text_summary(
+            blocks
+                .iter()
+                .filter_map(|b| if let Block::Text { text } = b { Some(text) } else { None }),
+            &Resolver::new(None),
+            false,
+        );
+    }
 }
 
 /// Stamp a message with its record's identity and hand it to the sink (an empty one is dropped).
