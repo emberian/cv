@@ -35,6 +35,7 @@ use std::process::{Command, Stdio};
 pub const CLEARED_ENV: &[&str] = &[
     "CV_ENDPOINT",
     "CV_FROZEN",
+    "CV_LIVE_BYTES",
     "CLAUDE_CONFIG_DIR",
     "CLUSTERVISION_CLAUDE_ROOTS",
     "CLUSTERVISION_MAX_STALE_SECS",

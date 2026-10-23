@@ -24,13 +24,15 @@ pub(crate) fn build(query: Option<String>) -> Result<Option<SessionQuery>> {
 }
 
 /// Resolve every matching ID per distinct `text:` needle: the index plus the live read of what it
-/// has not seen (all of it, none under `--frozen`), as `cv search` answers. A session left
+/// has not seen (all of it unless `$CV_LIVE_BYTES` or the config bounds it, none under `--frozen`),
+/// as `cv search` answers. A session left
 /// unread (unreadable, or `--frozen`) keeps what the index last saw of it (a note on stderr says
 /// how many). Without an index the live read must cover every session, or there is no answer: a
 /// usage error (exit 2) pointing at `cv index`, never a partial membership (which `NOT text:`
 /// would turn into "everything unread").
 pub(crate) fn text_sets(query: &SessionQuery) -> Result<TextSets> {
-    text_sets_within(query, cv_search::LiveRead::of(None))
+    let live = cv_search::LiveRead::of(None).or_else(|e| usage(format!("{e:#}")))?;
+    text_sets_within(query, live)
 }
 
 fn text_sets_within(query: &SessionQuery, live: cv_search::LiveRead) -> Result<TextSets> {
@@ -82,7 +84,7 @@ mod tests {
         let sets = text_sets(&query).unwrap();
         assert!(sets.contains("needle", "lone"), "{}", path.display());
         // A live read that cannot cover them all has no answer.
-        let absent = text_sets_within(&query, cv_search::LiveRead::Within(0)).unwrap_err();
+        let absent = text_sets_within(&query, cv_search::LiveRead::Within(0, cv_search::Budget::Flag)).unwrap_err();
         assert!(absent.downcast_ref::<crate::util::UsageError>().is_some(), "{absent:#}");
         assert!(format!("{absent:#}").contains("cv index"), "{absent:#}");
         std::fs::create_dir_all(cv_search::default_tantivy_dir()).unwrap();

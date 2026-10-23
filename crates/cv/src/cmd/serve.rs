@@ -601,6 +601,7 @@ fn search(params: &Query, searcher: &cv_search::Searcher) -> Reply {
         }
         Err(e) if scan => return bad(500, &format!("live scan failed: {e:#}")),
         Err(e) if cv_search::is_invalid_text_query(&e) => return bad(400, &format!("invalid search query: {e:#}")),
+        Err(e) if e.is::<cv_search::BadLiveBytes>() => return bad(500, &format!("{e:#}")),
         // The index is authoritative: a missing or unusable index is an error naming the cause and
         // the fix, never a silent scan of every transcript.
         Err(e) => {

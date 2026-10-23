@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Search's live-read budget defaults from `$CV_LIVE_BYTES` (bytes or `all`), then config `[search] live_bytes`; `--live-bytes` overrides; the footer names the source.
+
 ## 0.18.0 — 2026-10-23 — the release an agent can trust
 ClusterVision 0.18.0 is the release an agent can trust. Every listing, count and search answer
 is either exact or says what it skipped: counts are prompts and replies on every harness, a

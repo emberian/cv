@@ -172,7 +172,8 @@ impl Searcher {
     /// Errors are the path's own (an unusable index, an invalid query, a missing model); the
     /// caller adds the door's pointer. Filters apply before ranking. A full-text search answers
     /// from the index plus a live read of what it has not seen: all of it by default, at most
-    /// `live_bytes` of source when given, nothing under `--frozen` ([`LiveRead::of`]).
+    /// `live_bytes` of source when given (else `$CV_LIVE_BYTES`, else the config's
+    /// `[search] live_bytes`), nothing under `--frozen` ([`LiveRead::of`]).
     pub fn search(
         &self,
         query: &str,
@@ -233,7 +234,7 @@ impl Searcher {
             Source::Index => {
                 let _sources = cv_core::source::read_scope();
                 let refs = cv_core::sessions_for(harness);
-                let live = LiveRead::of(live_bytes);
+                let live = LiveRead::of(live_bytes)?;
                 let fts::Searched {
                     hits,
                     total,
@@ -391,7 +392,7 @@ pub fn embed_sessions(path: impl Into<Option<PathBuf>>, refs: &[cv_core::Session
     semantic::embed_sessions(&path.into().unwrap_or_else(default_embeddings_path), refs)
 }
 
-pub use fts::{Indexed, LiveRead, Suffix, Unreadable};
+pub use fts::{BadLiveBytes, Budget, Indexed, LiveRead, Suffix, Unreadable, LIVE_BYTES_VAR};
 /// Explicit lazy semantic state for a long-lived service. One-shot search remains stateless.
 #[cfg(feature = "semantic")]
 pub use semantic::{embedded_chars, SemanticSearch};

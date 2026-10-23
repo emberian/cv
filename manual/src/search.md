@@ -87,8 +87,10 @@ Bare terms search the title, the exchange and cwd, and all must match. tantivy s
 rewritten or new since `cv index` is read live, newest first, and ranked by the same BM25 with
 shared corpus statistics. A grown session is read from the index's resume mark (taken every
 4 MiB of text); others are read whole. By default every such session is read; `--live-bytes N`
-bounds the read to N bytes of source, and a session past it keeps what the index last saw. The
-footer reports both:
+bounds the read to N bytes of source, and a session past it keeps what the index last saw.
+Without the flag, `$CV_LIVE_BYTES` (bytes, or `all`) and then `[search] live_bytes` in
+[`config.toml`](cli.md#cv-config) set the budget, so every caller on a host (the MCP server
+included) shares one bound. The footer reports what was read, the budget and where it was set:
 
 ```text
 (live: read 3 session(s) the index has not seen live (2.1 MiB, 2 from where the index stopped))

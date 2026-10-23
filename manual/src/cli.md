@@ -305,7 +305,8 @@ claude    da9174f4  2026-05-28  the flux inference refactor
 ```
 
 The index (BM25) plus a live read of everything it has not seen (`--live-bytes N` bounds it,
-newest first, and the footer says what was left out; none under `--frozen`). An unopenable index
+else `$CV_LIVE_BYTES` or the config's `[search] live_bytes`, newest first, and the footer says
+what was left out; none under `--frozen`). An unopenable index
 fails naming [`cv index`](#cv-index); `--scan` is a slow live scan of every session that names what it could
 not read. It matches the exchange; `--kind context` matches injected context, `--kind all` both.
 `--semantic` needs `cv index --semantic` and errors without it. `--limit` (default 20) bounds the
@@ -908,7 +909,8 @@ cv config --rm-export ~/Downloads      # unregister
 ```
 
 Plain TOML (`exports = [...]`); `$CV_EXPORTS` (`:`-separated) adds more per run. A bad config warns
-once. `$CLAURDVOYANT_*` variables exit 2 naming their `CLUSTERVISION_` replacements.
+once. `[search] live_bytes = N` bounds the live read of every search that names no budget
+(`--live-bytes`, then `$CV_LIVE_BYTES`, override it; `CV_LIVE_BYTES=all` lifts it). `$CLAURDVOYANT_*` variables exit 2 naming their `CLUSTERVISION_` replacements.
 
 ### `cv schema`
 

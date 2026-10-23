@@ -530,6 +530,29 @@ fn search_discloses_index_staleness() {
     // …and --frozen answers from the index alone and says so.
     let (out, _) = w.cv_ok(&["--frozen", "search", "tail"]);
     assert!(out.contains("no matches") && out.contains("--frozen"), "{out}");
+    // A host sets its default budget in the config ([search] live_bytes); the footer names it…
+    let config = w.home.join(".config/clustervision/config.toml");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(&config, "[search]\nlive_bytes = 10\n").unwrap();
+    let (out, _) = w.cv_ok(&["search", "zebrafish"]);
+    assert!(out.contains("over the config search.live_bytes budget"), "{out}");
+    // …$CV_LIVE_BYTES overrides it (`all` lifts it), and --live-bytes overrides both…
+    let (ok, _, out, err) = w.cv_env(&["search", "zebrafish"], &[("CV_LIVE_BYTES", "20")]);
+    assert!(ok && out.contains("over the CV_LIVE_BYTES budget"), "{out}{err}");
+    let (ok, _, out, err) = w.cv_env(&["search", "tail"], &[("CV_LIVE_BYTES", "all")]);
+    assert!(
+        ok && out.contains("read 1 session(s)") && !out.contains("budget"),
+        "{out}{err}"
+    );
+    let (ok, _, out, err) = w.cv_env(
+        &["search", "tail", "--live-bytes", "1048576"],
+        &[("CV_LIVE_BYTES", "10")],
+    );
+    assert!(ok && out.contains("of the 1.0 MiB --live-bytes budget"), "{out}{err}");
+    // …and a malformed variable is a usage error, not a silent fallback.
+    let (ok, code, _, err) = w.cv_env(&["search", "tail"], &[("CV_LIVE_BYTES", "50MB")]);
+    assert!(!ok && code == 2 && err.contains("CV_LIVE_BYTES=\"50MB\""), "{err}");
+    std::fs::remove_file(&config).unwrap();
 
     // A fresh pass quiets it again.
     w.cv_ok(&["index"]);

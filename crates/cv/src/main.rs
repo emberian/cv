@@ -272,6 +272,8 @@ enum Cmd {
         /// (grown, rewritten, new since `cv index`), from where the index stopped: all of them by
         /// default; with this, at most BYTES of source, newest sessions first, and the footer
         /// names what the budget left out. 0 (or global --frozen) answers from the index alone.
+        /// Without it, `$CV_LIVE_BYTES` (bytes, or `all`) and then the config's
+        /// `[search] live_bytes` set the budget.
         #[arg(long, value_name = "BYTES", conflicts_with_all = ["semantic", "scan"])]
         live_bytes: Option<u64>,
         /// Emit `{"hits": [...], "total": M}` instead of the table — the same hits in the same

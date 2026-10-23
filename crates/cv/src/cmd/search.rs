@@ -49,7 +49,9 @@ pub(crate) fn cmd_search(
         Err(e) => {
             return match source {
                 Source::Semantic => Err(e.context("semantic search failed (run `cv index --semantic` first?)")),
-                Source::Index if cv_search::is_invalid_text_query(&e) => crate::util::usage(format!("{e:#}")),
+                Source::Index if cv_search::is_invalid_text_query(&e) || e.is::<cv_search::BadLiveBytes>() => {
+                    crate::util::usage(format!("{e:#}"))
+                }
                 Source::Index => Err(e.context(
                     "full-text search needs a usable index (or pass --scan for a slow live scan of every session)",
                 )),

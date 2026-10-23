@@ -74,8 +74,9 @@ cost-only bound that never changes a result, listed here with its fallback.
 Flags, complete by default (the output states a bound the caller set):
 - `cv search --limit` 20 (also `limit`): bounds the hits shown, never the count; the footer says
   `N of M matches` and `--json` carries `total` (`X-Cv-Search-Total` over HTTP).
-- `--live-bytes` / `live_bytes` (search): unset reads every stale session; set, the footer names
-  the budget and what it left out (`fts/live.rs` `LiveRead`).
+- `--live-bytes` / `live_bytes` (search), else `$CV_LIVE_BYTES`, else config `[search] live_bytes`:
+  unset reads every stale session; set, the footer names the budget, its source and what it left
+  out (`fts/live.rs` `LiveRead`).
 - `show` windows and `--max-bytes`; MCP `show` adds none; `observe_stream` `max_messages`
   (`more_pending`) and `char_cap` (`char_cap`, `truncated` in the output).
 

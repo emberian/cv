@@ -19,8 +19,10 @@
 //! counted in its statistics. A session's score is its best chunk on either side, so merging the
 //! two top-`limit` lists is exact.
 //!
-//! **Budget.** By default every stale session is read ([`LiveRead::All`]). `--live-bytes` bounds
-//! the read ([`LiveRead::Within`]), charged in source bytes: a file-backed session costs what lies
+//! **Budget.** By default every stale session is read ([`LiveRead::All`]). A budget bounds the
+//! read ([`LiveRead::Within`]): `--live-bytes` (`live_bytes=`), else `$CV_LIVE_BYTES` (`all` for
+//! none), else `[search] live_bytes` in the config, and the footer names which. It is charged in
+//! source bytes: a file-backed session costs what lies
 //! past its mark (its length when read whole), known before reading, and is skipped when it does
 //! not fit what remains. A session in a shared store (a SQLite database holding many sessions)
 //! has no per-session byte length, so it is charged the text it indexes as it goes and is
@@ -35,22 +37,75 @@ pub enum LiveRead {
     /// Every stale session: the complete answer, and the default.
     #[default]
     All,
-    /// At most this many bytes of source, newest sessions first (`--live-bytes`); the footer
-    /// names what it left out.
-    Within(u64),
+    /// At most this many bytes of source, newest sessions first; the footer names the budget,
+    /// where it was set, and what it left out.
+    Within(u64, Budget),
     /// Nothing (`--frozen`): the index alone answers.
     Frozen,
 }
 
-impl LiveRead {
-    /// The read a search makes: none under `--frozen`, else within `live_bytes` when given,
-    /// else all of it.
-    pub fn of(live_bytes: Option<u64>) -> Self {
-        if cv_core::env::frozen() {
-            Self::Frozen
-        } else {
-            live_bytes.map_or(Self::All, Self::Within)
+/// Where a live-read budget was set, as the footer names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Budget {
+    /// `--live-bytes` (CLI, MCP) or `live_bytes=` (HTTP).
+    Flag,
+    /// `$CV_LIVE_BYTES`.
+    Env,
+    /// `[search] live_bytes` in the config file.
+    Config,
+}
+
+impl Budget {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Flag => "--live-bytes",
+            Self::Env => "CV_LIVE_BYTES",
+            Self::Config => "config search.live_bytes",
         }
+    }
+}
+
+/// The variable that sets the live-read budget when the caller names none: bytes, or `all`.
+pub const LIVE_BYTES_VAR: &str = "CV_LIVE_BYTES";
+
+/// `$CV_LIVE_BYTES` is set to neither a byte count nor `all`: the caller's mistake, not the index's.
+#[derive(Debug)]
+pub struct BadLiveBytes(String);
+
+impl std::fmt::Display for BadLiveBytes {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(out, "{LIVE_BYTES_VAR}={:?}: expected a byte count or `all`", self.0)
+    }
+}
+
+impl std::error::Error for BadLiveBytes {}
+
+impl LiveRead {
+    /// The read a search makes: none under `--frozen`; else within `live_bytes` when given; else
+    /// as `$CV_LIVE_BYTES` says (bytes, or `all`); else within `[search] live_bytes` from the
+    /// config; else all of it. A `$CV_LIVE_BYTES` that is neither is a [`BadLiveBytes`] error.
+    pub fn of(live_bytes: Option<u64>) -> Result<Self> {
+        if cv_core::env::frozen() {
+            return Ok(Self::Frozen);
+        }
+        if let Some(n) = live_bytes {
+            return Ok(Self::Within(n, Budget::Flag));
+        }
+        let var = cv_core::env::var_os(LIVE_BYTES_VAR).filter(|v| !v.is_empty());
+        if let Some(raw) = var {
+            let raw = raw.to_string_lossy();
+            return match raw.trim() {
+                "all" => Ok(Self::All),
+                n => n
+                    .parse()
+                    .map(|n| Self::Within(n, Budget::Env))
+                    .map_err(|_| BadLiveBytes(raw.to_string()).into()),
+            };
+        }
+        Ok(cv_core::config::load()
+            .search
+            .live_bytes
+            .map_or(Self::All, |n| Self::Within(n, Budget::Config)))
     }
 }
 
@@ -95,7 +150,7 @@ impl Suffix {
                 String::new()
             };
             let of = match self.live {
-                LiveRead::Within(budget) => format!(" of the {} --live-bytes budget", bytes(budget)),
+                LiveRead::Within(budget, from) => format!(" of the {} {} budget", bytes(budget), from.name()),
                 LiveRead::All | LiveRead::Frozen => String::new(),
             };
             format!(
@@ -120,8 +175,12 @@ impl Suffix {
         }
         let mut why = Vec::new();
         if self.cut > 0 {
+            let from = match self.live {
+                LiveRead::Within(_, from) => from.name(),
+                LiveRead::All | LiveRead::Frozen => "live-read",
+            };
             why.push(format!(
-                "{} over the --live-bytes budget ({})",
+                "{} over the {from} budget ({})",
                 self.cut,
                 bytes(self.cut_bytes)
             ));
@@ -222,7 +281,7 @@ pub(super) fn read(
     let budget = match live {
         LiveRead::Frozen => return Ok((None, suffix)),
         LiveRead::All => u64::MAX,
-        LiveRead::Within(budget) => budget,
+        LiveRead::Within(budget, _) => budget,
     };
     // Newest first: what changed last is what a search most likely means.
     pending.sort_by_key(|p| std::cmp::Reverse((p.job.mtime, p.job.r.updated_at)));

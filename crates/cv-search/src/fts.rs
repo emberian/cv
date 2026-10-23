@@ -44,7 +44,7 @@ mod observe;
 use observe::{body_hash, SweepWork};
 mod live;
 mod sweep;
-pub use live::{LiveRead, Suffix};
+pub use live::{BadLiveBytes, Budget, LiveRead, Suffix, LIVE_BYTES_VAR};
 use sweep::*;
 
 use crate::ingest::{Admission, AdmittedDocument, Writer};
@@ -8558,7 +8558,7 @@ mod tests {
         assert!(line.contains("1 session(s)") && !line.contains("budget"), "{line}");
         assert_eq!(suffix.unread_line(), None);
         // A --live-bytes read names its budget.
-        let (_, suffix) = suffix_search(&dir, "zanzibar", LiveRead::Within(1 << 20), &refs);
+        let (_, suffix) = suffix_search(&dir, "zanzibar", LiveRead::Within(1 << 20, Budget::Flag), &refs);
         let line = suffix.read_line().unwrap();
         assert!(line.contains("of the 1.0 MiB --live-bytes budget"), "{line}");
         // The prefix the index holds still answers for the same session: one hit, not two.
@@ -8596,7 +8596,7 @@ mod tests {
             std::fs::metadata(&big).unwrap().len(),
         );
         // No marks (index_refs takes none): both are read whole. The budget fits only the small.
-        let (hits, suffix) = suffix_search(&dir, "quokka", LiveRead::Within(small_len + 1), &refs);
+        let (hits, suffix) = suffix_search(&dir, "quokka", LiveRead::Within(small_len + 1, Budget::Flag), &refs);
         assert_eq!(hits.iter().map(|h| h.0.as_str()).collect::<Vec<_>>(), ["small"]);
         assert_eq!((suffix.stale, suffix.read, suffix.cut), (2, 1, 1));
         assert_eq!((suffix.bytes, suffix.cut_bytes), (small_len, big_len));
@@ -8606,12 +8606,72 @@ mod tests {
             "{note}"
         );
         // The cut session keeps what the index last saw of it.
-        let (hits, _) = suffix_search(&dir, "seed", LiveRead::Within(small_len + 1), &refs);
+        let (hits, _) = suffix_search(&dir, "seed", LiveRead::Within(small_len + 1, Budget::Flag), &refs);
         assert_eq!(hits.len(), 2, "{hits:?}");
         // A zero budget reads nothing live but still says what it left out.
-        let (hits, suffix) = suffix_search(&dir, "quokka", LiveRead::Within(0), &refs);
+        let (hits, suffix) = suffix_search(&dir, "quokka", LiveRead::Within(0, Budget::Flag), &refs);
         assert!(hits.is_empty());
         assert_eq!((suffix.read, suffix.cut), (0, 2));
+    }
+
+    /// The budget a search reads within: the caller's, else `$CV_LIVE_BYTES` (`all` for none),
+    /// else the config's `[search] live_bytes`, else none; `--frozen` reads nothing whatever is set.
+    #[test]
+    fn the_live_budget_is_the_flag_then_the_env_then_the_config() {
+        let home = IsolatedHome::new();
+        let config_home = tmpdir();
+        home._scope.set("XDG_CONFIG_HOME", &*config_home);
+        home._scope.remove(LIVE_BYTES_VAR);
+        home._scope.remove("CV_FROZEN");
+        // Nothing set: every stale session.
+        assert_eq!(LiveRead::of(None).unwrap(), LiveRead::All);
+        assert_eq!(LiveRead::of(Some(0)).unwrap(), LiveRead::Within(0, Budget::Flag));
+        let path = cv_core::config::config_path().unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "[search]\nlive_bytes = 52428800\n").unwrap();
+        assert_eq!(
+            LiveRead::of(None).unwrap(),
+            LiveRead::Within(52_428_800, Budget::Config)
+        );
+        home._scope.set(LIVE_BYTES_VAR, "1024");
+        assert_eq!(LiveRead::of(None).unwrap(), LiveRead::Within(1024, Budget::Env));
+        assert_eq!(LiveRead::of(Some(7)).unwrap(), LiveRead::Within(7, Budget::Flag));
+        // `all` lifts a configured bound; empty is unset.
+        home._scope.set(LIVE_BYTES_VAR, "all");
+        assert_eq!(LiveRead::of(None).unwrap(), LiveRead::All);
+        home._scope.set(LIVE_BYTES_VAR, "");
+        assert_eq!(
+            LiveRead::of(None).unwrap(),
+            LiveRead::Within(52_428_800, Budget::Config)
+        );
+        home._scope.set(LIVE_BYTES_VAR, "50MB");
+        let bad = LiveRead::of(None).unwrap_err();
+        assert!(
+            bad.is::<BadLiveBytes>() && format!("{bad}").contains("CV_LIVE_BYTES=\"50MB\""),
+            "{bad}"
+        );
+        // The flag still wins over a malformed variable.
+        assert_eq!(LiveRead::of(Some(7)).unwrap(), LiveRead::Within(7, Budget::Flag));
+        home._scope.set("CV_FROZEN", "1");
+        assert_eq!(LiveRead::of(Some(7)).unwrap(), LiveRead::Frozen);
+        // The footer names where a budget was set.
+        let suffix = Suffix {
+            live: LiveRead::Within(1 << 20, Budget::Config),
+            stale: 2,
+            read: 1,
+            bytes: 10,
+            cut: 1,
+            cut_bytes: 1 << 21,
+            ..Default::default()
+        };
+        assert!(suffix
+            .read_line()
+            .unwrap()
+            .contains("of the 1.0 MiB config search.live_bytes budget"));
+        assert!(suffix
+            .unread_line()
+            .unwrap()
+            .contains("1 over the config search.live_bytes budget (2.0 MiB)"));
     }
 
     /// One scorer: a session read live ranks exactly as it would had `cv index` read it.

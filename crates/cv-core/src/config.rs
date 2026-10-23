@@ -6,6 +6,9 @@
 //! harnesses, so rather than scan a hardcoded path, you register the ones you care about — as many as
 //! you like — and the [`export`](crate::harness::export) adapters read them from here. (`$CV_EXPORTS`,
 //! a `:`-separated list, is still honored as an ad-hoc union on top — handy for one-off runs.)
+//!
+//! It also holds `[search] live_bytes`: the live-read budget a full-text search uses when the
+//! caller names none (below `--live-bytes`/`live_bytes=` and `$CV_LIVE_BYTES`).
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -17,6 +20,24 @@ pub struct Config {
     /// Dirs or `conversations.json` files holding account data exports to discover. Scanned ≤2 deep.
     #[serde(default)]
     pub exports: Vec<PathBuf>,
+    /// `[search]`: defaults for full-text search.
+    #[serde(default, skip_serializing_if = "Search::is_unset")]
+    pub search: Search,
+}
+
+/// The `[search]` table.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Search {
+    /// Bytes of unindexed source a search reads live when neither `--live-bytes` (`live_bytes=`)
+    /// nor `$CV_LIVE_BYTES` names a budget. Unset: every session the index has not seen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_bytes: Option<u64>,
+}
+
+impl Search {
+    fn is_unset(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// `$XDG_CONFIG_HOME/clustervision` (or `~/.config/clustervision`). `None` only if there's no home.
@@ -121,6 +142,7 @@ mod tests {
         std::os::unix::fs::symlink(&dotfile, &path).unwrap();
         let cfg = Config {
             exports: vec![PathBuf::from("/linked")],
+            ..Default::default()
         };
         save(&cfg).unwrap();
         assert!(std::fs::symlink_metadata(&path).unwrap().file_type().is_symlink());
@@ -132,12 +154,29 @@ mod tests {
     fn round_trips_exports() {
         let cfg = Config {
             exports: vec![PathBuf::from("/a/exports"), PathBuf::from("/b/conversations.json")],
+            ..Default::default()
         };
         let text = toml::to_string_pretty(&cfg).unwrap();
+        // An unset [search] table is not written into a config that never had one.
+        assert!(!text.contains("search"), "{text}");
         let back: Config = toml::from_str(&text).unwrap();
         assert_eq!(back.exports, cfg.exports);
         // empty/missing tolerated
         let empty: Config = toml::from_str("").unwrap();
         assert!(empty.exports.is_empty());
+        assert_eq!(empty.search.live_bytes, None);
+    }
+
+    #[test]
+    fn reads_and_keeps_the_search_live_bytes_default() {
+        let _world = crate::test_world("config-search-live-bytes");
+        let path = save(&Config::default()).unwrap();
+        std::fs::write(&path, "[search]\nlive_bytes = 52428800\n").unwrap();
+        assert_eq!(load().search.live_bytes, Some(52_428_800));
+        // Registering an export keeps it.
+        let mut cfg = load_for_update().unwrap();
+        cfg.exports.push("/new".into());
+        save(&cfg).unwrap();
+        assert_eq!(load().search.live_bytes, Some(52_428_800));
     }
 }
