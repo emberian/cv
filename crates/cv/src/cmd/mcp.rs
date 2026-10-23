@@ -1397,7 +1397,14 @@ mod projection_tests {
             assert_eq!(rereads, 0, "a session with a reader state is not read from its start");
             cursor = quiet["cursor"].as_str().unwrap().to_string();
         }
-        assert_eq!(READERS.len(), 12, "one reader state per observed session");
+        assert_eq!(
+            ids.iter()
+                .filter(|id| READERS.contains(&format!("claude:{id}")))
+                .count(),
+            12,
+            "one reader state per observed session (READERS is process-wide: \
+             a total count races with other tests' sessions)"
+        );
         // Carried to a process that never issued it, the cursor reads each changed session
         // from its start once, and says so.
         for id in &ids {

@@ -361,6 +361,16 @@ impl Readers {
             .len()
     }
 
+    /// Whether `key` holds a reader state. A `Readers` serves every observer
+    /// in its process, so a test asserting on `len` races with unrelated
+    /// sessions: the per-key question is the isolation-proof one.
+    pub fn contains(&self, key: &str) -> bool {
+        self.states
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(key)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }

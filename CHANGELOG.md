@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- `cv rewind`, `cv prune` and `cv port` accept `--skills-policy` as an alias of `--skills`, and `drop-all` spells `drop`.
+
 ## 0.18.0 — 2026-10-23 — the release an agent can trust
 ClusterVision 0.18.0 is the release an agent can trust. Every listing, count and search answer
 is either exact or says what it skipped: counts are prompts and replies on every harness, a
