@@ -1105,9 +1105,9 @@ fn analyze(session: &Session, opts: &DistillOptions, demand: Demand) -> anyhow::
     if !earlier.is_empty() {
         let _ = writeln!(
             h,
-            "{EARLIER_HEAD} — this lane was distilled before: what was said to it and by it then \
-             (verbatim, oldest first) and the commits it made. Each generation's ledger and \
-             other facts stay in its source (`cv show <source> --range A..B`).\n\n{}\n",
+            "{EARLIER_HEAD} — this lane was distilled before. Per generation, oldest first: its \
+             brief's first paragraph, its commits and the state it pointed at. Its timeline, ledger \
+             and other facts stay in its source (`cv show <source> --range A..B`).\n\n{}\n",
             earlier.trim()
         );
     }
@@ -1204,73 +1204,139 @@ fn strip_reminder(s: &str) -> String {
     s.trim().to_string()
 }
 
-// The pack's section headings, shared by the renderer and by `unwrap_pack`, which reads them back.
+// The pack's section headings. The renderer writes them numbered; `unwrap_pack` finds them by
+// title, so packs from every numbering (0.18.0's `## 1. Brief`, this one's) read back.
 const PREAMBLE_HEAD: &str = "[cv distill] You are resuming";
 const BRIEF_HEAD: &str = "## 1. Brief (verbatim) [";
 const EARLIER_HEAD: &str = "## 1b. Earlier generations";
 const TIMELINE_HEAD: &str = "## 2. Timeline — everything said to this agent";
 const FACTS_HEAD: &str = "## 3. Facts (mined from tool inputs and outputs)";
 const LEDGER_HEAD: &str = "## 4. Ledger — every tool call before the tail";
+const HANDOFF_HEAD: &str = "## 0. Hand-off — ";
+
+/// The title of a `## N. <title>` heading constant: what `heading` searches for.
+fn title(head: &str) -> &str {
+    head.split_once(". ").map_or(head, |(_, title)| title)
+}
+
+/// The start of the line holding the `## N. <title>` (or `## Nb. <title>`) heading at or after
+/// `from`: the first such line, or with `last` the last one.
+fn heading(t: &str, head: &str, from: usize, last: bool) -> Option<usize> {
+    let title = title(head);
+    let mut found = None;
+    let mut pos = from;
+    while let Some(k) = t[pos..].find(title) {
+        let at = pos + k;
+        let line = t[..at].rfind('\n').map_or(0, |n| n + 1);
+        let prefix = &t[line..at];
+        let numbered = prefix.len() <= 8 && prefix.starts_with("## ") && prefix.ends_with(". ");
+        if numbered && line >= from {
+            if !last {
+                return Some(line);
+            }
+            found = Some(line);
+        }
+        pos = at + title.len();
+    }
+    found
+}
+
+/// The text up to its first blank line, capped: a brief's first paragraph.
+fn first_paragraph(s: &str) -> String {
+    let s = s.trim();
+    let end = s.find("\n\n").unwrap_or(s.len());
+    truncate(s[..end].trim(), 1200)
+}
+
+/// The body of the first entry in a rendered timeline that was said *to* the lane.
+fn first_incoming(timeline: &str) -> Option<&str> {
+    timeline.split("\n### [").skip(1).find_map(|entry| {
+        let (head, body) = entry.split_once('\n')?;
+        let incoming = head.contains("· message delivered while working")
+            || head.contains("· message to this agent")
+            || head.ends_with("· user");
+        incoming.then(|| body.trim())
+    })
+}
 
 /// A brief that is a resumed distilled lane's opening prompt (the preamble, then the
 /// predecessor's pack), split into the original brief and the earlier generations to carry:
 /// `(brief, generations)`. Re-wrapping the whole pack as "the brief, verbatim" nested every
-/// generation's ledger and facts inside the next: on session 698fc87d the fourth infra pack was
-/// 85% nested predecessors (442 of 521 KB) and compressed 1.6×. Each generation keeps its timeline
-/// (what was said to and by the lane), its commit list and its branch tips; its ledger, paths,
-/// verdicts and errors are dropped (its source holds them). Packs written before the
-/// `## 1b` section existed nest in their briefs, and unwrap recursively.
+/// generation inside the next: on session 698fc87d the fourth infra pack was 85% nested
+/// predecessors (442 of 521 KB) and compressed 1.6×.
+///
+/// An old generation is owed little (ember's ruling, 2026-10-27): its entry is its brief's first
+/// paragraph (for a resumed generation, the first message sent to it), its commits, and the state
+/// it pointed at: branch tips, repository heads, branches, PID files and state-file paths. Its
+/// timeline, ledger and other facts stay in its source, which the entry names. Packs written
+/// before the `Earlier generations` section existed nest in their briefs and unwrap recursively.
 fn unwrap_pack(text: &str) -> Option<(String, String)> {
     let t = text.trim_start();
     if !t.starts_with(PREAMBLE_HEAD) {
         return None;
     }
-    let b = t.find(BRIEF_HEAD)?;
+    let b = heading(t, BRIEF_HEAD, 0, false)?;
     let source = t[..b]
         .find("Source: `")
         .and_then(|k| t[k + 9..b].split('`').next())
         .unwrap_or("an earlier distill");
     let body = b + t[b..].find('\n')?;
-    let tl = t.rfind(TIMELINE_HEAD).filter(|tl| *tl >= body)?;
-    let facts = t.rfind(FACTS_HEAD).filter(|f| *f > tl)?;
-    let end = t.rfind(LEDGER_HEAD).filter(|l| *l > facts).unwrap_or(t.len());
-    let (mut brief, mut earlier) = match t[body..tl].find(EARLIER_HEAD) {
+    let tl = heading(t, TIMELINE_HEAD, body, true)?;
+    let facts = heading(t, FACTS_HEAD, tl + 1, true)?;
+    let end = heading(t, LEDGER_HEAD, facts + 1, true).unwrap_or(t.len());
+    let (mut brief, mut earlier) = match heading(&t[..tl], EARLIER_HEAD, body, false) {
         Some(k) => {
-            let carried = &t[body + k..tl];
-            let carried = carried.split_once('\n').map_or("", |(_, rest)| rest);
-            (t[body..body + k].trim().to_string(), carried.trim().to_string())
+            let carried = t[k..tl].split_once('\n').map_or("", |(_, rest)| rest);
+            (t[body..k].trim().to_string(), carried.trim().to_string())
         }
         None => (t[body..tl].trim().to_string(), String::new()),
     };
+    let mut resumed = !earlier.is_empty();
     if let Some((inner, generations)) = unwrap_pack(&brief) {
         brief = inner;
         earlier = format!("{generations}\n\n{earlier}").trim().to_string();
+        resumed = true;
     }
-    let timeline = t[tl..facts].split_once('\n').map_or("", |(_, rest)| rest).trim();
-    let timeline = timeline
-        .trim_start_matches("_(nothing before the verbatim tail)_")
-        .trim();
-    let timeline = shorten_carried_commit_notes(timeline);
-    // The commit list (a header line and its indented items) and the branch-tip line.
-    let mut kept = String::new();
-    let mut in_commits = false;
+    let _ = write!(earlier, "\n\n### ═══ generation distilled from `{source}` ═══\n\n");
+    if !resumed {
+        let _ = writeln!(earlier, "**Its brief**: the brief above.\n");
+    } else if let Some(own) = first_incoming(&t[tl..facts]).map(first_paragraph) {
+        let _ = writeln!(
+            earlier,
+            "**Its brief** (first paragraph of the first message to it): {own}\n"
+        );
+    }
+    // The commit list and the repository-head list (each a header line and its indented items),
+    // the tip and branch lines, and the state-file paths among the referenced paths.
+    let mut in_list = false;
     for line in t[facts..end].lines() {
-        if line.starts_with("- **Commits made**") || line.starts_with("- **Branch tips last seen**") {
-            in_commits = line.starts_with("- **Commits made**");
-            kept.push_str(line);
-            kept.push('\n');
-        } else if in_commits && line.starts_with("  - ") {
-            kept.push_str(line);
-            kept.push('\n');
+        let list_head = line.starts_with("- **Commits made**") || line.starts_with("- **Repository heads last seen**");
+        if list_head || line.starts_with("- **Branch tips last seen**") || line.starts_with("- **Branches**") {
+            in_list = list_head;
+            let _ = writeln!(earlier, "{line}");
+        } else if in_list && line.starts_with("  - ") {
+            let _ = writeln!(earlier, "{line}");
         } else {
-            in_commits = false;
+            in_list = false;
+            if let Some(paths) = line.strip_prefix("- **Paths most referenced**: ") {
+                let state: Vec<&str> = paths
+                    .split(" · ")
+                    .filter(|p| p.to_ascii_lowercase().contains("state"))
+                    .collect();
+                if !state.is_empty() {
+                    let _ = writeln!(earlier, "- **State files named**: {}", state.join(" · "));
+                }
+            }
         }
     }
-    let _ = write!(
-        earlier,
-        "\n\n### ═══ generation distilled from `{source}` ═══\n\n{timeline}\n\n{}",
-        kept.trim_end()
-    );
+    if let Some(handoff) = heading(&t[..b], HANDOFF_HEAD, 0, false) {
+        for line in t[handoff..b]
+            .lines()
+            .filter(|l| l.starts_with("- **PID files it named**"))
+        {
+            let _ = writeln!(earlier, "{line}");
+        }
+    }
     Some((brief, earlier.trim().to_string()))
 }
 
@@ -1306,28 +1372,6 @@ fn shorten_commit_note(e: &mut Entry, input: &Value, commit_files: &HashSet<Stri
         }
         _ => {}
     }
-}
-
-/// The same cut for a carried generation's timeline, written before commit messages were cut:
-/// an `agent wrote` entry whose body carries a commit trailer.
-fn shorten_carried_commit_notes(timeline: &str) -> String {
-    let mut out = String::with_capacity(timeline.len());
-    for (n, entry) in timeline.split("\n### [").enumerate() {
-        if n > 0 {
-            out.push_str("\n### [");
-        }
-        let (heading, body) = entry.split_once('\n').unwrap_or((entry, ""));
-        let note = heading.contains("· agent wrote ") && !heading.contains("(commit message");
-        if note && body.len() > COMMIT_NOTE_MAX && is_commit_note("", body, &HashSet::new()) {
-            out.push_str(heading.trim_end_matches(" (shell)"));
-            out.push_str(" (commit message)\n\n");
-            out.push_str(&head_tail(body.trim(), COMMIT_NOTE_MAX, COMMIT_NOTE_POINTER));
-            out.push('\n');
-        } else {
-            out.push_str(entry);
-        }
-    }
-    out
 }
 
 /// The agent's own words carried by a tool call: messages it sent, notes it wrote, agents it spawned.
@@ -2787,48 +2831,53 @@ facts text",
             assert_eq!(body.matches(brief).count(), 1, "the original brief, once: {h}");
             assert!(!h.contains(PREAMBLE_HEAD), "no pack nested in the brief: {h}");
             assert!(
-                h.contains("Chose rebase over merge"),
-                "the first generation's words carry"
+                !h.contains("Chose rebase over merge"),
+                "an old generation's words stay in its source"
             );
-            assert!(h.contains("`lane/x` `4795b657` kernel: wave one"), "and its commits");
+            assert!(h.contains("`lane/x` `4795b657` kernel: wave one"), "its commits carry");
+            assert!(h.contains("**Its brief**: the brief above."));
             assert!(!h.contains("Poll the build ×20"), "its ledger stays in its source");
             assert!(d.pack().contains("Second generation decision."));
         }
-        assert_eq!(
-            second
-                .head_md
+        let generations = |d: &Distilled| {
+            d.head_md
                 .matches("generation distilled from `claude:agent-test`")
-                .count(),
-            1
-        );
-        assert_eq!(
-            third
-                .head_md
-                .matches("generation distilled from `claude:agent-test`")
-                .count(),
-            2
-        );
+                .count()
+        };
+        assert_eq!((generations(&second), generations(&third)), (1, 2));
         assert!(third.pack().contains("Third generation decision."));
-        // One more generation costs its own timeline, not a copy of every pack before it.
-        assert!(third.head_md.len() < second.head_md.len() + first.head_md.len() / 2);
+        // One more generation costs a few lines, not a copy of every pack before it.
+        assert!(third.head_md.len() < second.head_md.len() + first.head_md.len() / 4);
 
-        // A pack written before the `## 1b` section existed nested its predecessor in its brief.
+        // A pack written before the `Earlier generations` section existed nested its predecessor
+        // in its brief; its own brief is the first message sent to it.
         let old = format!(
             "{PREAMBLE_HEAD} the agent…\n\n# Distilled context — X\n\nSource: `claude:old-gen`\n\n\
-             {BRIEF_HEAD}0]\n\n{}\n\n{TIMELINE_HEAD}, and …\n\n### [3] 10-27 09:00 · agent said\n\n\
+             {BRIEF_HEAD}0]\n\n{}\n\n{TIMELINE_HEAD}, and …\n\n### [2] 10-27 08:59 · message delivered \
+             while working\n\nNext: ship it.\n\nThe rules again.\n\n### [3] 10-27 09:00 · agent said\n\n\
              Old words.\n\n{FACTS_HEAD}\n\n- **Commits made**: none seen\n- **Paths most referenced**: \
-             `/x/y/z.rs` ×3\n\n{LEDGER_HEAD}, one line each\n\n- [1] List → a\n",
+             `/x/docs/LANE-STATE.md` ×2 · `/x/y/z.rs` ×3\n\n{LEDGER_HEAD}, one line each\n\n- [1] List → a\n",
             gen2.messages[0].text().unwrap()
         );
-        let (inner, generations) = unwrap_pack(&old).unwrap();
+        let (inner, carried) = unwrap_pack(&old).unwrap();
         assert_eq!(inner, brief);
-        let (rebase, old_words) = (
-            generations.find("Chose rebase").unwrap(),
-            generations.find("Old words.").unwrap(),
+        let first_gen = carried.find("generation distilled from `claude:agent-test`").unwrap();
+        let old_gen = carried.find("generation distilled from `claude:old-gen`").unwrap();
+        assert!(first_gen < old_gen, "oldest first: {carried}");
+        assert!(carried.contains("(first paragraph of the first message to it): Next: ship it.\n"));
+        assert!(
+            carried.ends_with("- **State files named**: `/x/docs/LANE-STATE.md` ×2"),
+            "{carried}"
         );
-        assert!(rebase < old_words, "oldest first: {generations}");
-        assert!(generations.contains("generation distilled from `claude:old-gen`"));
-        assert!(!generations.contains("Paths most referenced") && !generations.contains("[1] List → a"));
+        for gone in [
+            "Old words.",
+            "The rules again.",
+            "/x/y/z.rs",
+            "[1] List → a",
+            "Chose rebase",
+        ] {
+            assert!(!carried.contains(gone), "{gone}: {carried}");
+        }
         assert!(unwrap_pack(brief).is_none());
     }
 
@@ -2907,16 +2956,6 @@ facts text",
             "a note that is not a commit message stays whole"
         );
         assert_eq!(d.stats.commits, 2);
-
-        // A carried generation's notes, written before the cut, are cut on the way through.
-        let carried = format!(
-            "### [1] 10-27 09:00 · agent said\n\nWords.\n\n### [2] 10-27 09:01 · agent wrote /s/c1.txt\n\n\
-             subject\n\n{reasons}\nCo-Authored-By: A <a@b>\n\n### [3] 10-27 09:02 · agent wrote /s/N.md\n\n{reasons}"
-        );
-        let cut = shorten_carried_commit_notes(&carried);
-        assert!(cut.contains("agent wrote /s/c1.txt (commit message)") && cut.contains("Words."));
-        assert_eq!(cut.matches(COMMIT_NOTE_POINTER).count(), 1);
-        assert!(cut.ends_with(&reasons), "the plain note is untouched");
     }
 
     #[test]
