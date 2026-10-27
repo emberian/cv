@@ -686,14 +686,21 @@ fn validate_analysis_sources(session: &Session) -> anyhow::Result<()> {
 
 fn analysis_label(session: &Session, resolver: &crate::Resolver) -> anyhow::Result<String> {
     // Every adapter is asked: a bag is keyed by the harness that wrote it, not by `session.harness`.
-    if let Some(description) = crate::Harness::ALL
+    let label = match crate::Harness::ALL
         .iter()
         .filter_map(|h| crate::harness::rootless(*h))
         .find_map(|adapter| adapter.agent_description(session))
     {
-        return Ok(description.to_owned());
+        Some(description) => description.to_owned(),
+        None => crate::ir::label_from(session.title_with(resolver)?.as_deref(), None),
+    };
+    // A distilled lane is labelled `distilled: <label>`; distilling it again keeps one prefix,
+    // not `distilled: distilled: …`.
+    let mut rest = label.as_str();
+    while let Some(inner) = rest.strip_prefix("distilled: ") {
+        rest = inner;
     }
-    Ok(crate::ir::label_from(session.title_with(resolver)?.as_deref(), None))
+    Ok(rest.to_string())
 }
 
 fn analyze(session: &Session, opts: &DistillOptions, demand: Demand) -> anyhow::Result<PreparedDistillation> {
@@ -718,6 +725,9 @@ fn analyze(session: &Session, opts: &DistillOptions, demand: Demand) -> anyhow::
             continue;
         }
         let t = MessageText::new(m, &resolver).text()?.unwrap_or_default();
+        // A resumed distilled lane's opening prompt is its predecessor's pack: only the original
+        // brief inside it names documents as instructions.
+        let t = unwrap_pack(&t).map_or(t, |(brief, _)| brief);
         for c in re(Re::Path).captures_iter(&t) {
             referenced.insert(c[1].trim_end_matches(['.', ',', ';', ':', ')', '`', '\'']).to_string());
         }
@@ -762,6 +772,8 @@ fn analyze(session: &Session, opts: &DistillOptions, demand: Demand) -> anyhow::
 
     // ── pass: brief, timeline, facts, ledger ──
     let mut brief: Option<(usize, String)> = None;
+    // Earlier generations carried by a brief that is itself a distilled pack (see `unwrap_pack`).
+    let mut earlier = String::new();
     let mut timeline: Vec<Entry> = Vec::new();
     let mut facts = Facts::default();
     let mut ledger: Vec<(usize, usize, String, String)> = Vec::new(); // first idx, last idx, label, outcome
@@ -779,7 +791,13 @@ fn analyze(session: &Session, opts: &DistillOptions, demand: Demand) -> anyhow::
                     continue;
                 }
                 if brief.is_none() {
-                    brief = Some((i, text));
+                    brief = Some(match unwrap_pack(&text) {
+                        Some((original, generations)) => {
+                            earlier = generations;
+                            (i, original)
+                        }
+                        None => (i, text),
+                    });
                 } else if !in_tail {
                     let who = if m.origin == Origin::Human {
                         "user"
@@ -1019,11 +1037,20 @@ fn analyze(session: &Session, opts: &DistillOptions, demand: Demand) -> anyhow::
         session.id,
     );
     if let Some((i, text)) = &brief {
-        let _ = writeln!(h, "## 1. Brief (verbatim) [{i}]\n\n{}\n", text.trim());
+        let _ = writeln!(h, "{BRIEF_HEAD}{i}]\n\n{}\n", text.trim());
+    }
+    if !earlier.is_empty() {
+        let _ = writeln!(
+            h,
+            "{EARLIER_HEAD} — this lane was distilled before: what was said to it and by it then \
+             (verbatim, oldest first) and the commits it made. Each generation's ledger and \
+             other facts stay in its source (`cv show <source> --range A..B`).\n\n{}\n",
+            earlier.trim()
+        );
     }
     let _ = writeln!(
         h,
-        "## 2. Timeline — everything said to this agent, and everything it said or wrote itself (verbatim)\n"
+        "{TIMELINE_HEAD}, and everything it said or wrote itself (verbatim)\n"
     );
     if timeline.is_empty() {
         let _ = writeln!(h, "_(nothing before the verbatim tail)_\n");
@@ -1031,12 +1058,12 @@ fn analyze(session: &Session, opts: &DistillOptions, demand: Demand) -> anyhow::
     for e in &timeline {
         let _ = writeln!(h, "### [{}] {} · {}\n\n{}\n", e.idx, e.when, e.heading, e.body.trim());
     }
-    let _ = writeln!(h, "## 3. Facts (mined from tool inputs and outputs)\n");
+    let _ = writeln!(h, "{FACTS_HEAD}\n");
     render_facts(&mut h, &facts);
     if opts.ledger && !ledger.is_empty() {
         let _ = writeln!(
             h,
-            "## 4. Ledger — every tool call before the tail, one line each (`[index] label → outcome`; ×N = repeated)\n"
+            "{LEDGER_HEAD}, one line each (`[index] label → outcome`; ×N = repeated)\n"
         );
         for ((a, b, label, outcome), n) in ledger.iter().zip(&ledger_runs) {
             let idx = if a == b {
@@ -1111,6 +1138,75 @@ fn strip_reminder(s: &str) -> String {
         .unwrap_or(s);
     let s = s.strip_suffix("</system-reminder>").unwrap_or(s);
     s.trim().to_string()
+}
+
+// The pack's section headings, shared by the renderer and by `unwrap_pack`, which reads them back.
+const PREAMBLE_HEAD: &str = "[cv distill] You are resuming";
+const BRIEF_HEAD: &str = "## 1. Brief (verbatim) [";
+const EARLIER_HEAD: &str = "## 1b. Earlier generations";
+const TIMELINE_HEAD: &str = "## 2. Timeline — everything said to this agent";
+const FACTS_HEAD: &str = "## 3. Facts (mined from tool inputs and outputs)";
+const LEDGER_HEAD: &str = "## 4. Ledger — every tool call before the tail";
+
+/// A brief that is a resumed distilled lane's opening prompt (the preamble, then the
+/// predecessor's pack), split into the original brief and the earlier generations to carry:
+/// `(brief, generations)`. Re-wrapping the whole pack as "the brief, verbatim" nested every
+/// generation's ledger and facts inside the next: on session 698fc87d the fourth infra pack was
+/// 85% nested predecessors (442 of 521 KB) and compressed 1.6×. Each generation keeps its timeline
+/// (what was said to and by the lane), its commit list and its branch tips; its ledger, paths,
+/// verdicts and errors are dropped (its source holds them). Packs written before the
+/// `## 1b` section existed nest in their briefs, and unwrap recursively.
+fn unwrap_pack(text: &str) -> Option<(String, String)> {
+    let t = text.trim_start();
+    if !t.starts_with(PREAMBLE_HEAD) {
+        return None;
+    }
+    let b = t.find(BRIEF_HEAD)?;
+    let source = t[..b]
+        .find("Source: `")
+        .and_then(|k| t[k + 9..b].split('`').next())
+        .unwrap_or("an earlier distill");
+    let body = b + t[b..].find('\n')?;
+    let tl = t.rfind(TIMELINE_HEAD).filter(|tl| *tl >= body)?;
+    let facts = t.rfind(FACTS_HEAD).filter(|f| *f > tl)?;
+    let end = t.rfind(LEDGER_HEAD).filter(|l| *l > facts).unwrap_or(t.len());
+    let (mut brief, mut earlier) = match t[body..tl].find(EARLIER_HEAD) {
+        Some(k) => {
+            let carried = &t[body + k..tl];
+            let carried = carried.split_once('\n').map_or("", |(_, rest)| rest);
+            (t[body..body + k].trim().to_string(), carried.trim().to_string())
+        }
+        None => (t[body..tl].trim().to_string(), String::new()),
+    };
+    if let Some((inner, generations)) = unwrap_pack(&brief) {
+        brief = inner;
+        earlier = format!("{generations}\n\n{earlier}").trim().to_string();
+    }
+    let timeline = t[tl..facts].split_once('\n').map_or("", |(_, rest)| rest).trim();
+    let timeline = timeline
+        .trim_start_matches("_(nothing before the verbatim tail)_")
+        .trim();
+    // The commit list (a header line and its indented items) and the branch-tip line.
+    let mut kept = String::new();
+    let mut in_commits = false;
+    for line in t[facts..end].lines() {
+        if line.starts_with("- **Commits made**") || line.starts_with("- **Branch tips last seen**") {
+            in_commits = line.starts_with("- **Commits made**");
+            kept.push_str(line);
+            kept.push('\n');
+        } else if in_commits && line.starts_with("  - ") {
+            kept.push_str(line);
+            kept.push('\n');
+        } else {
+            in_commits = false;
+        }
+    }
+    let _ = write!(
+        earlier,
+        "\n\n### ═══ generation distilled from `{source}` ═══\n\n{timeline}\n\n{}",
+        kept.trim_end()
+    );
+    Some((brief, earlier.trim().to_string()))
 }
 
 /// The agent's own words carried by a tool call: messages it sent, notes it wrote, agents it spawned.
@@ -2444,6 +2540,86 @@ facts text",
         .unwrap();
         assert_eq!(d.stats.commits, 2, "the quiet commit and the bracketed one");
         assert!(d.head_md.contains("[2] `/r/demo` `40fdb60` mini ship"), "{}", d.head_md);
+    }
+
+    /// Distill `source`, resume it, and let the resumed lane say and run one more thing.
+    fn next_generation(source: &Session, words: &str, k: usize) -> (Distilled, Session) {
+        let opts = DistillOptions {
+            keep_last: 2,
+            ..Default::default()
+        };
+        let (d, mut resumed) = prepare_distill(source, &opts).unwrap().into_resumable_session(source);
+        let id = format!("g{k}");
+        resumed
+            .messages
+            .push(msg(Role::Assistant, MessageKind::Reply, vec![text(words)]));
+        resumed
+            .messages
+            .push(msg(Role::Assistant, MessageKind::Reply, vec![call(&id, "ls", "List")]));
+        resumed.messages.push(msg(
+            Role::Tool,
+            MessageKind::ToolResult,
+            vec![result(&id, "a\nb", false)],
+        ));
+        (d, resumed)
+    }
+
+    #[test]
+    fn distilling_a_distilled_lane_carries_generations_instead_of_nesting_packs() {
+        let brief = "You are lane X. Build the thing on box1.";
+        let (first, gen2) = next_generation(&lane(), "Second generation decision.", 2);
+        assert!(first.head_md.contains("Poll the build ×20"));
+        let (second, gen3) = next_generation(&gen2, "Third generation decision.", 3);
+        let (third, _) = next_generation(&gen3, "Fourth generation decision.", 4);
+        for d in [&second, &third] {
+            let h = &d.head_md;
+            let body = &h[h.find(BRIEF_HEAD).unwrap()..];
+            assert_eq!(body.matches(brief).count(), 1, "the original brief, once: {h}");
+            assert!(!h.contains(PREAMBLE_HEAD), "no pack nested in the brief: {h}");
+            assert!(
+                h.contains("Chose rebase over merge"),
+                "the first generation's words carry"
+            );
+            assert!(h.contains("`lane/x` `4795b657` kernel: wave one"), "and its commits");
+            assert!(!h.contains("Poll the build ×20"), "its ledger stays in its source");
+            assert!(d.pack().contains("Second generation decision."));
+        }
+        assert_eq!(
+            second
+                .head_md
+                .matches("generation distilled from `claude:agent-test`")
+                .count(),
+            1
+        );
+        assert_eq!(
+            third
+                .head_md
+                .matches("generation distilled from `claude:agent-test`")
+                .count(),
+            2
+        );
+        assert!(third.pack().contains("Third generation decision."));
+        // One more generation costs its own timeline, not a copy of every pack before it.
+        assert!(third.head_md.len() < second.head_md.len() + first.head_md.len() / 2);
+
+        // A pack written before the `## 1b` section existed nested its predecessor in its brief.
+        let old = format!(
+            "{PREAMBLE_HEAD} the agent…\n\n# Distilled context — X\n\nSource: `claude:old-gen`\n\n\
+             {BRIEF_HEAD}0]\n\n{}\n\n{TIMELINE_HEAD}, and …\n\n### [3] 10-27 09:00 · agent said\n\n\
+             Old words.\n\n{FACTS_HEAD}\n\n- **Commits made**: none seen\n- **Paths most referenced**: \
+             `/x/y/z.rs` ×3\n\n{LEDGER_HEAD}, one line each\n\n- [1] List → a\n",
+            gen2.messages[0].text().unwrap()
+        );
+        let (inner, generations) = unwrap_pack(&old).unwrap();
+        assert_eq!(inner, brief);
+        let (rebase, old_words) = (
+            generations.find("Chose rebase").unwrap(),
+            generations.find("Old words.").unwrap(),
+        );
+        assert!(rebase < old_words, "oldest first: {generations}");
+        assert!(generations.contains("generation distilled from `claude:old-gen`"));
+        assert!(!generations.contains("Paths most referenced") && !generations.contains("[1] List → a"));
+        assert!(unwrap_pack(brief).is_none());
     }
 
     #[test]
