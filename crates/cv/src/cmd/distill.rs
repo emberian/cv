@@ -255,11 +255,31 @@ fn agent_meta(source_path: &Path, description: &str, model: Option<&str>) -> Val
 /// read-back (anything the IR carried that the file does not comes back as a warning) and the
 /// resumability rules ([`cv_core::harness::claude::verify_claude_resumable`], an error — it means a bug in cv).
 fn emit_resumable(ir: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<cv_core::EmitResult> {
-    let (res, warnings) = cv_core::emit::emit_verified(ir, cv_core::harness::derived_host(), out_dir, opts)?;
-    for w in &warnings {
+    let (res, report) = cv_core::emit::emit_report(ir, cv_core::harness::derived_host(), out_dir, opts)?;
+    for w in lossy_lines(&report, opts.sidechain_of.is_some()) {
         eprintln!("  ⚠ lossy: {w}");
     }
     Ok(res)
+}
+
+/// The read-back deltas that are a real loss. The emitted IR is this command's own construction,
+/// and two of its fields are named elsewhere: its lineage (`forked_from` the source) by the pack's
+/// `Source:` line, and a sub-agent's title (`distilled: <label>`) by its meta description, the
+/// label a harness shows (the emitter writes no title record for a sidechain). Reporting those as
+/// `⚠ lossy` on every distill taught readers to ignore the line.
+fn lossy_lines(report: &cv_core::emit::FidelityReport, sidechain: bool) -> Vec<String> {
+    report
+        .deltas
+        .iter()
+        .filter(|d| d.what != "lineage" && !(sidechain && d.what == "session title"))
+        .map(|d| {
+            if d.expected {
+                format!("{} (expected: target format policy)", d.describe())
+            } else {
+                d.describe()
+            }
+        })
+        .collect()
 }
 
 /// A root session's transcript, from a path or an id.
@@ -384,6 +404,30 @@ pub(crate) fn cmd_distill(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn distill_lossy_lines_skip_what_the_pack_and_meta_carry() {
+        let delta = |what: &str, expected: bool| cv_core::emit::Divergence {
+            what: what.into(),
+            a: "distilled: lane".into(),
+            b: "(none)".into(),
+            expected,
+            at: String::new(),
+        };
+        let report = cv_core::emit::FidelityReport {
+            deltas: vec![
+                delta("lineage", true),
+                delta("session title", false),
+                delta("per-message model", false),
+            ],
+        };
+        assert_eq!(
+            lossy_lines(&report, true),
+            vec!["per-message model: distilled: lane → (none)"]
+        );
+        // A main-thread session has no meta: a lost title is a loss there.
+        assert_eq!(lossy_lines(&report, false).len(), 2);
+    }
     /// Run alone in a fresh process with synthetic inputs. Includes loading, analysis, requested
     /// resume/sidecar emission and reporting; fixture construction and report inspection are outside.
     #[cfg(feature = "probe-heap")]
