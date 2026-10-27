@@ -236,6 +236,23 @@ struct Facts {
     tips: Vec<(usize, String, String)>,   // idx, branch, sha — latest observation wins
     heads: Vec<(usize, String, String)>,  // idx, "host:dir [ref]", "sha subject" — from `git log` output
     errors: Vec<(usize, String, String)>, // idx, label, first error line
+    /// PID files the lane named (in a command or its own prose): path → last mention.
+    pid_files: Vec<(usize, String)>,
+    /// Directories it `cd`'d into, newest last.
+    dirs: Vec<(usize, String)>,
+}
+
+impl Facts {
+    /// Remember the newest mention of `value` in `list` (one row per distinct value).
+    fn note_latest(list: &mut Vec<(usize, String)>, i: usize, value: &str) {
+        list.retain(|(_, v)| v != value);
+        list.push((i, value.to_string()));
+    }
+    fn note_pid_files(&mut self, i: usize, text: &str) {
+        for c in re(Re::PidFile).captures_iter(text) {
+            Self::note_latest(&mut self.pid_files, i, &c[1]);
+        }
+    }
 }
 
 fn bump(counts: &mut Counts, key: &str) {
@@ -266,9 +283,10 @@ enum Re {
     HeredocTarget,
     GitCommit,
     CommitFile,
+    PidFile,
 }
 
-static RES: [OnceLock<Regex>; 16] = [const { OnceLock::new() }; 16];
+static RES: [OnceLock<Regex>; 17] = [const { OnceLock::new() }; 17];
 
 fn re(which: Re) -> &'static Regex {
     let (cell, pat) = match which {
@@ -309,6 +327,8 @@ fn re(which: Re) -> &'static Regex {
         ),
         // `git commit`, through any `-c key=value` / `-C dir` options; group 1 is a `-C` dir.
         Re::GitCommit => (&RES[14], r"\bgit(?:\s+-c\s+\S+|\s+-C\s+(\S+))*\s+commit\b"),
+        // A PID file path: `/abs/…/name.pid`, `~/…`, or `$VAR/…` (how lanes name their own).
+        Re::PidFile => (&RES[16], r"((?:~|\$\{?\w+\}?)?/[\w.@/${}-]*\.pid)\b"),
         // The message file of `git commit … -F <file>` (also `-qF`, `--file=`).
         Re::CommitFile => (
             &RES[15],
@@ -804,6 +824,8 @@ fn analyze(session: &Session, opts: &DistillOptions, demand: Demand) -> anyhow::
     let mut ledger_runs: Vec<usize> = Vec::new(); // repeat count per ledger row
     let mut elided: Vec<Elided> = Vec::new();
     let mut elided_outputs = 0usize;
+    // The lane's last text block anywhere (tail included): its own hand-off.
+    let mut last_words: Option<(usize, String)> = None;
 
     for (i, m) in msgs.iter().enumerate() {
         let in_tail = i >= tail_start;
@@ -894,6 +916,12 @@ fn analyze(session: &Session, opts: &DistillOptions, demand: Demand) -> anyhow::
                             let input = ToolInput::new(name, input, !in_tail, false)?;
                             let input = &input.fields;
                             scan_input_facts(name, input, &mut facts);
+                            if let Some(c) = command_of(input) {
+                                facts.note_pid_files(i, c);
+                                if let Some(d) = re(Re::Cd).captures_iter(c).last() {
+                                    Facts::note_latest(&mut facts.dirs, i, &d[1]);
+                                }
+                            }
                             if !in_tail {
                                 if let Some(mut e) = own_words_from_tool(i, m, name, input, opts) {
                                     shorten_commit_note(&mut e, input, &commit_files);
@@ -992,11 +1020,16 @@ fn analyze(session: &Session, opts: &DistillOptions, demand: Demand) -> anyhow::
         if m.role == Role::Assistant {
             for (index, b) in m.content.iter().enumerate() {
                 if let Block::Text { .. } = b {
-                    for c in re(Re::Path).captures_iter(reader.block(index)?) {
+                    let prose = reader.block(index)?;
+                    for c in re(Re::Path).captures_iter(prose) {
                         let p = c[1].trim_end_matches(['.', ',', ';', ':', ')', '`']);
                         if plausible_path(p) {
                             bump(&mut facts.paths, p);
                         }
+                    }
+                    facts.note_pid_files(i, prose);
+                    if !prose.trim().is_empty() {
+                        last_words = Some((i, prose.trim().to_string()));
                     }
                 }
             }
@@ -1061,6 +1094,7 @@ fn analyze(session: &Session, opts: &DistillOptions, demand: Demand) -> anyhow::
         tool_calls,
         session.id,
     );
+    render_handoff(&mut h, last_words.as_ref(), &facts, msgs);
     if let Some((i, text)) = &brief {
         let _ = writeln!(h, "{BRIEF_HEAD}{i}]\n\n{}\n", text.trim());
     }
@@ -1451,6 +1485,67 @@ fn scan_result_facts(
     } else {
         fl
     }
+}
+
+/// `## 0. Hand-off`: the lane's last message and the live state it left, first, where a resumed
+/// lane and its coordinator look. On session 698fc87d both sat at the end of a 100–500 KB pack:
+/// the root re-typed tips, paths and next steps into every resume message (~2 KB each, all of
+/// them already in the pack), and successors spent 180 of their first 40-call windows (48k tokens)
+/// re-probing git, PIDs and job logs. The newest heads, tips, PID files and directories are the
+/// places to verify; they are what the lane last saw, not what is true now.
+fn render_handoff(h: &mut String, last_words: Option<&(usize, String)>, f: &Facts, msgs: &[Message]) {
+    let newest = |list: &[(usize, String, String)], n: usize| -> Vec<String> {
+        let mut seen = HashSet::new();
+        let mut rows: Vec<String> = Vec::new();
+        for (i, key, value) in list.iter().rev() {
+            if seen.insert(key) && rows.len() < n {
+                rows.push(format!("`{key}` → `{value}` [{i}]"));
+            }
+        }
+        rows
+    };
+    let heads = newest(&f.heads, 5);
+    let tips = newest(&f.tips, 5);
+    let recent = |list: &[(usize, String)], n: usize| -> String {
+        let skip = list.len().saturating_sub(n);
+        list.iter()
+            .skip(skip)
+            .map(|(i, v)| format!("`{v}` [{i}]"))
+            .collect::<Vec<_>>()
+            .join(" · ")
+    };
+    if last_words.is_none() && heads.is_empty() && tips.is_empty() && f.pid_files.is_empty() {
+        return;
+    }
+    let _ = writeln!(
+        h,
+        "## 0. Hand-off — the lane's last message and the state it last saw (verify before acting)\n"
+    );
+    if let Some((i, words)) = last_words {
+        let at = msgs.get(*i).map(when).unwrap_or_default();
+        let _ = writeln!(h, "**Its last message** [{i}] {at}:\n\n{words}\n");
+    }
+    if !heads.is_empty() {
+        let _ = writeln!(h, "- **Newest repository heads**: {}", heads.join(" · "));
+    }
+    if !tips.is_empty() {
+        let _ = writeln!(h, "- **Newest branch tips**: {}", tips.join(" · "));
+    }
+    if !f.pid_files.is_empty() {
+        let _ = writeln!(
+            h,
+            "- **PID files it named** (newest last): {}",
+            recent(&f.pid_files, 12)
+        );
+    }
+    if !f.dirs.is_empty() {
+        let _ = writeln!(
+            h,
+            "- **Directories it worked in** (newest last): {}",
+            recent(&f.dirs, 4)
+        );
+    }
+    h.push('\n');
 }
 
 fn render_facts(h: &mut String, f: &Facts) {
@@ -2789,6 +2884,63 @@ facts text",
         assert!(cut.contains("agent wrote /s/c1.txt (commit message)") && cut.contains("Words."));
         assert_eq!(cut.matches(COMMIT_NOTE_POINTER).count(), 1);
         assert!(cut.ends_with(&reasons), "the plain note is untouched");
+    }
+
+    #[test]
+    fn handoff_opens_the_pack_with_the_last_message_and_live_state() {
+        let mut s = lane();
+        let n = s.messages.len();
+        s.messages.insert(
+            n - 1,
+            msg(
+                Role::Assistant,
+                MessageKind::Reply,
+                vec![call(
+                    "j1",
+                    "cd /w/lane && nohup ./run.sh & echo $! > $S/run.pid; git log --oneline -1",
+                    "Start",
+                )],
+            ),
+        );
+        s.messages.insert(
+            n,
+            msg(
+                Role::Tool,
+                MessageKind::ToolResult,
+                vec![result("j1", "started\n9f3257a0 lane: tip", false)],
+            ),
+        );
+        s.messages.push(msg(
+            Role::Assistant,
+            MessageKind::Reply,
+            vec![text(
+                "Handing off: the box is idle; the watcher's PID is in /build/lanes/w.pid.",
+            )],
+        ));
+        let d = distill_pack(
+            &s,
+            &DistillOptions {
+                keep_last: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let h = &d.head_md;
+        let handoff = h.find("## 0. Hand-off").expect("a hand-off section");
+        assert!(handoff < h.find(BRIEF_HEAD).unwrap(), "the hand-off comes first");
+        assert!(h.contains("**Its last message**") && h.contains("Handing off: the box is idle"));
+        assert!(h.contains("`/w/lane` → `9f3257a0 lane: tip`"), "{h}");
+        assert!(h.contains("`$S/run.pid`") && h.contains("`/build/lanes/w.pid`"), "{h}");
+        assert!(
+            h.contains("**Directories it worked in** (newest last): `/srv/lanes/x/src`") || h.contains("`/w/lane`")
+        );
+        // A lane with nothing to hand off (no words, no state) gets no empty section.
+        let mut bare = Session::new("agent-bare", Harness::Claude);
+        bare.messages = vec![msg(Role::User, MessageKind::Prompt, vec![text("Go.")])];
+        assert!(!distill_pack(&bare, &DistillOptions::default())
+            .unwrap()
+            .head_md
+            .contains("Hand-off"));
     }
 
     #[test]
