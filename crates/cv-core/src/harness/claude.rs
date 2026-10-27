@@ -839,11 +839,12 @@ fn agents_in_dir(
     {
         for e in super::side_entries(dir)? {
             let p = e.path();
-            // Only `agent-*.jsonl`; skip `journal.jsonl` and the `.meta.json` sidecars.
+            // Only `agent-*.jsonl`; skip `journal.jsonl`, the `.meta.json` sidecars and the
+            // `.flat.jsonl` payload sidecar `cv distill`/`cv prune` write beside a transcript.
             let is_agent = p.extension().and_then(|x| x.to_str()) == Some("jsonl")
                 && p.file_name()
                     .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.starts_with("agent-"));
+                    .is_some_and(|n| n.starts_with("agent-") && !n.ends_with(".flat.jsonl"));
             if is_agent
                 && p.file_stem()
                     .and_then(|id| id.to_str())
@@ -2332,6 +2333,13 @@ mod tests {
             r#"{"agentType":"general-purpose","description":"do task one","toolUseId":"toolu_77"}"#,
         )
         .unwrap();
+        // A distilled agent's payload sidecar sits beside it: not an agent, so `--agent a111` is
+        // not ambiguous with it.
+        std::fs::write(
+            subs.join("agent-a111.flat.jsonl"),
+            r#"{"id":"toolu_1","slot":"content","name":"Read","content":"big","size":3,"line_count":1,"kind":"text"}"#,
+        )
+        .unwrap();
 
         // Tier 2: a workflow dir with two agents and a journal.
         let wf = subs.join("workflows").join("wf_abc-123");
@@ -2363,7 +2371,7 @@ mod tests {
 
         FOREST_READS.lock().unwrap().0 = Some(root.clone());
         let tree = subagent_tree(&parent).unwrap();
-        assert_eq!(tree.len(), 3, "two tiers: 1 direct + 2 workflow");
+        assert_eq!(tree.len(), 3, "two tiers: 1 direct + 2 workflow, no `.flat` sidecar");
         // A Rich forest over unchanged transcripts scans none of them again; a change rescans
         // exactly the changed one.
         let scans = |before: usize| -> Vec<PathBuf> {

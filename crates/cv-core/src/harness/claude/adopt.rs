@@ -152,7 +152,7 @@ fn agents_in(session: &SessionFile, want: &str) -> Vec<AgentFile> {
         .filter(|p| {
             p.file_name()
                 .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with(&prefix) && n.ends_with(".jsonl"))
+                .is_some_and(|n| n.starts_with(&prefix) && n.ends_with(".jsonl") && !n.ends_with(".flat.jsonl"))
         })
         .filter_map(|p| agent_file(session, p))
         .collect()
