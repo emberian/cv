@@ -2819,8 +2819,16 @@ fn distill_emits_a_whole_resumable_session_and_a_sub_agent() {
         !text.contains("900000"),
         "the source's near-limit usage must not reach the resume gate"
     );
-    // The elided output comes back through the sidecar.
-    let (cat, _) = w.cv_ok(&["cat", &new_id, "t1"]);
+    // The elided output comes back through the sidecar, by the id its ledger line names.
+    let pack = root["message"]["content"].as_str().unwrap();
+    let row = pack
+        .lines()
+        .find(|l| l.starts_with("- [") && l.contains("Read the big log"))
+        .unwrap_or_else(|| panic!("a ledger row for t1: {pack}"));
+    let id = row.rsplit('`').nth(1).unwrap();
+    assert!(row.ends_with("8.8 KB"), "{row}");
+    assert!(pack.contains("<tool_use_id>`; the ledger names them"), "{pack}");
+    let (cat, _) = w.cv_ok(&["cat", &new_id, id]);
     assert!(cat.contains(&"y".repeat(9000)), "cv cat must return the elided payload");
 
     // A sub-agent of the root: sidechain records under the root's id, in the root's subagents/.

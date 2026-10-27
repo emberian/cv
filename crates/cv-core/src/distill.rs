@@ -820,7 +820,8 @@ fn analyze(session: &Session, opts: &DistillOptions, demand: Demand) -> anyhow::
     let mut earlier = String::new();
     let mut timeline: Vec<Entry> = Vec::new();
     let mut facts = Facts::default();
-    let mut ledger: Vec<(usize, usize, String, String)> = Vec::new(); // first idx, last idx, label, outcome
+    // first idx, last idx, label, outcome, the last call's tool_use id and output bytes
+    let mut ledger: Vec<(usize, usize, String, String, String, usize)> = Vec::new();
     let mut ledger_runs: Vec<usize> = Vec::new(); // repeat count per ledger row
     let mut elided: Vec<Elided> = Vec::new();
     let mut elided_outputs = 0usize;
@@ -1002,10 +1003,12 @@ fn analyze(session: &Session, opts: &DistillOptions, demand: Demand) -> anyhow::
                             Some(last) if last.2 == label => {
                                 last.1 = use_idx;
                                 last.3 = outcome;
+                                last.4 = tool_use_id.clone();
+                                last.5 = out.len();
                                 *ledger_runs.last_mut().unwrap() += 1;
                             }
                             _ => {
-                                ledger.push((use_idx, use_idx, label, outcome));
+                                ledger.push((use_idx, use_idx, label, outcome, tool_use_id.clone(), out.len()));
                                 ledger_runs.push(1);
                             }
                         }
@@ -1094,7 +1097,8 @@ fn analyze(session: &Session, opts: &DistillOptions, demand: Demand) -> anyhow::
         tool_calls,
         session.id,
     );
-    render_handoff(&mut h, last_words.as_ref(), &facts, msgs);
+    let elided_hint = (opts.ledger && elided_outputs > 0).then_some((retrieve_ref.as_str(), elided_outputs));
+    render_handoff(&mut h, last_words.as_ref(), &facts, msgs, elided_hint);
     if let Some((i, text)) = &brief {
         let _ = writeln!(h, "{BRIEF_HEAD}{i}]\n\n{}\n", text.trim());
     }
@@ -1122,16 +1126,17 @@ fn analyze(session: &Session, opts: &DistillOptions, demand: Demand) -> anyhow::
     if opts.ledger && !ledger.is_empty() {
         let _ = writeln!(
             h,
-            "{LEDGER_HEAD}, one line each (`[index] label → outcome`; ×N = repeated)\n"
+            "{LEDGER_HEAD}, one line each (`[index] label → outcome · tool_use_id size`; ×N = repeated, \
+             the id is the last one's; `cv cat {retrieve_ref} <tool_use_id>` prints an output whole)\n"
         );
-        for ((a, b, label, outcome), n) in ledger.iter().zip(&ledger_runs) {
+        for ((a, b, label, outcome, id, bytes), n) in ledger.iter().zip(&ledger_runs) {
             let idx = if a == b {
                 format!("[{a}]")
             } else {
                 format!("[{a}–{b}]")
             };
             let rep = if *n > 1 { format!(" ×{n}") } else { String::new() };
-            let _ = writeln!(h, "- {idx} {label}{rep} → {outcome}");
+            let _ = writeln!(h, "- {idx} {label}{rep} → {outcome} · `{id}` {}", size(*bytes));
         }
         h.push('\n');
     }
@@ -1493,7 +1498,22 @@ fn scan_result_facts(
 /// them already in the pack), and successors spent 180 of their first 40-call windows (48k tokens)
 /// re-probing git, PIDs and job logs. The newest heads, tips, PID files and directories are the
 /// places to verify; they are what the lane last saw, not what is true now.
-fn render_handoff(h: &mut String, last_words: Option<&(usize, String)>, f: &Facts, msgs: &[Message]) {
+/// A byte count for the ledger: `812 B`, `14.2 KB`, `3.1 MB`.
+fn size(bytes: usize) -> String {
+    match bytes {
+        b if b < 1024 => format!("{b} B"),
+        b if b < 1024 * 1024 => format!("{:.1} KB", b as f64 / 1024.0),
+        b => format!("{:.1} MB", b as f64 / (1024.0 * 1024.0)),
+    }
+}
+
+fn render_handoff(
+    h: &mut String,
+    last_words: Option<&(usize, String)>,
+    f: &Facts,
+    msgs: &[Message],
+    elided: Option<(&str, usize)>,
+) {
     let newest = |list: &[(usize, String, String)], n: usize| -> Vec<String> {
         let mut seen = HashSet::new();
         let mut rows: Vec<String> = Vec::new();
@@ -1514,7 +1534,7 @@ fn render_handoff(h: &mut String, last_words: Option<&(usize, String)>, f: &Fact
             .collect::<Vec<_>>()
             .join(" · ")
     };
-    if last_words.is_none() && heads.is_empty() && tips.is_empty() && f.pid_files.is_empty() {
+    if last_words.is_none() && heads.is_empty() && tips.is_empty() && f.pid_files.is_empty() && elided.is_none() {
         return;
     }
     let _ = writeln!(
@@ -1543,6 +1563,14 @@ fn render_handoff(h: &mut String, last_words: Option<&(usize, String)>, f: &Fact
             h,
             "- **Directories it worked in** (newest last): {}",
             recent(&f.dirs, 4)
+        );
+    }
+    // On session 698fc87d no successor ran `cv cat` once: nothing in the pack named an id.
+    if let Some((reference, n)) = elided {
+        let _ = writeln!(
+            h,
+            "- **Elided outputs** ({n}): `cv cat {reference} <tool_use_id>`; the ledger names them, with \
+             sizes. Fetch a build log or a row table there instead of re-running the command."
         );
     }
     h.push('\n');
@@ -2594,6 +2622,11 @@ facts text",
         assert!(p.contains("`lane/x` `4795b657` kernel: wave one"));
         assert!(p.contains("unknown identifier `bar`"));
         assert!(p.contains("Poll the build ×20"), "{p}");
+        // Each ledger row names the (last) call's id and output size, and the hand-off says how
+        // to fetch it.
+        assert!(p.contains("Poll the build ×20 → x (+499 lines) · `t19` 1000 B"), "{p}");
+        assert!(p.contains("- **Elided outputs** (2"), "{p}");
+        assert!(p.contains("`cv cat agent-test <tool_use_id>`; the ledger names them"));
         assert!(p.contains("`ember@box1` ×20"));
         // The 20 polls' outputs are elided, not inlined.
         assert!(!p.contains(&"x\n".repeat(50)));
