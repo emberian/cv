@@ -265,9 +265,10 @@ enum Re {
     Oneline,
     HeredocTarget,
     GitCommit,
+    CommitFile,
 }
 
-static RES: [OnceLock<Regex>; 15] = [const { OnceLock::new() }; 15];
+static RES: [OnceLock<Regex>; 16] = [const { OnceLock::new() }; 16];
 
 fn re(which: Re) -> &'static Regex {
     let (cell, pat) = match which {
@@ -308,6 +309,11 @@ fn re(which: Re) -> &'static Regex {
         ),
         // `git commit`, through any `-c key=value` / `-C dir` options; group 1 is a `-C` dir.
         Re::GitCommit => (&RES[14], r"\bgit(?:\s+-c\s+\S+|\s+-C\s+(\S+))*\s+commit\b"),
+        // The message file of `git commit … -F <file>` (also `-qF`, `--file=`).
+        Re::CommitFile => (
+            &RES[15],
+            r#"\bcommit\b[^|;&\n]*?\s(?:-[a-zA-Z]*F\s*|--file[=\s])['"]?([^\s'";&|]+)"#,
+        ),
     };
     cell.get_or_init(|| Regex::new(pat).expect("static regex"))
 }
@@ -770,6 +776,24 @@ fn analyze(session: &Session, opts: &DistillOptions, demand: Demand) -> anyhow::
         }
     }
 
+    // Files the lane passed to `git commit -F`: a note it wrote there is a commit message.
+    let mut commit_files: HashSet<String> = HashSet::new();
+    for m in msgs[..tail_start].iter().filter(|_| demand != Demand::Findings) {
+        for b in &m.content {
+            if let Block::ToolUse { name, input, .. } = b {
+                if name != "Write" {
+                    let input = ToolInput::new(name, input, false, false)?;
+                    for c in command_of(&input.fields)
+                        .into_iter()
+                        .flat_map(|c| re(Re::CommitFile).captures_iter(c))
+                    {
+                        commit_files.insert(basename(&c[1]).to_string());
+                    }
+                }
+            }
+        }
+    }
+
     // ── pass: brief, timeline, facts, ledger ──
     let mut brief: Option<(usize, String)> = None;
     // Earlier generations carried by a brief that is itself a distilled pack (see `unwrap_pack`).
@@ -871,7 +895,8 @@ fn analyze(session: &Session, opts: &DistillOptions, demand: Demand) -> anyhow::
                             let input = &input.fields;
                             scan_input_facts(name, input, &mut facts);
                             if !in_tail {
-                                if let Some(e) = own_words_from_tool(i, m, name, input, opts) {
+                                if let Some(mut e) = own_words_from_tool(i, m, name, input, opts) {
+                                    shorten_commit_note(&mut e, input, &commit_files);
                                     timeline.push(e);
                                 }
                             }
@@ -1186,6 +1211,7 @@ fn unwrap_pack(text: &str) -> Option<(String, String)> {
     let timeline = timeline
         .trim_start_matches("_(nothing before the verbatim tail)_")
         .trim();
+    let timeline = shorten_carried_commit_notes(timeline);
     // The commit list (a header line and its indented items) and the branch-tip line.
     let mut kept = String::new();
     let mut in_commits = false;
@@ -1207,6 +1233,62 @@ fn unwrap_pack(text: &str) -> Option<(String, String)> {
         kept.trim_end()
     );
     Some((brief, earlier.trim().to_string()))
+}
+
+/// A commit message is kept to this many bytes in the timeline: the commit holds the whole of it.
+const COMMIT_NOTE_MAX: usize = 700;
+const COMMIT_NOTE_POINTER: &str = "a commit message: the commit holds all of it (`git log`)";
+
+fn basename(p: &str) -> &str {
+    p.trim_end_matches('/').rsplit('/').next().unwrap_or(p)
+}
+
+/// A note that is a commit message: written to a file the lane passed to `git commit -F`, or
+/// carrying a commit trailer. On session 698fc87d these were 101 KB of the first infra pack's
+/// 227 KB timeline (36 messages) and 365 KB across its 14 packs; each restates a commit the facts
+/// list already names, and the repository keeps it whole.
+fn is_commit_note(path: &str, content: &str, commit_files: &HashSet<String>) -> bool {
+    commit_files.contains(basename(path)) || content.contains("Co-Authored-By:") || content.contains("Signed-off-by:")
+}
+
+fn shorten_commit_note(e: &mut Entry, input: &Value, commit_files: &HashSet<String>) {
+    let Some(rest) = e.heading.strip_prefix("agent wrote ") else {
+        return;
+    };
+    let path = rest.trim_end_matches(" (shell)").to_string();
+    match (input.get("content").and_then(Value::as_str), command_of(input)) {
+        (Some(content), _) if is_commit_note(&path, content, commit_files) => {
+            e.heading = format!("agent wrote {path} (commit message)");
+            e.body = head_tail(content, COMMIT_NOTE_MAX, COMMIT_NOTE_POINTER);
+        }
+        (None, Some(cmd)) if is_commit_note(&path, cmd, commit_files) => {
+            e.heading = format!("agent wrote {path} (commit message, shell)");
+            e.body = format!("```\n{}\n```", head_tail(cmd, COMMIT_NOTE_MAX, COMMIT_NOTE_POINTER));
+        }
+        _ => {}
+    }
+}
+
+/// The same cut for a carried generation's timeline, written before commit messages were cut:
+/// an `agent wrote` entry whose body carries a commit trailer.
+fn shorten_carried_commit_notes(timeline: &str) -> String {
+    let mut out = String::with_capacity(timeline.len());
+    for (n, entry) in timeline.split("\n### [").enumerate() {
+        if n > 0 {
+            out.push_str("\n### [");
+        }
+        let (heading, body) = entry.split_once('\n').unwrap_or((entry, ""));
+        let note = heading.contains("· agent wrote ") && !heading.contains("(commit message");
+        if note && body.len() > COMMIT_NOTE_MAX && is_commit_note("", body, &HashSet::new()) {
+            out.push_str(heading.trim_end_matches(" (shell)"));
+            out.push_str(" (commit message)\n\n");
+            out.push_str(&head_tail(body.trim(), COMMIT_NOTE_MAX, COMMIT_NOTE_POINTER));
+            out.push('\n');
+        } else {
+            out.push_str(entry);
+        }
+    }
+    out
 }
 
 /// The agent's own words carried by a tool call: messages it sent, notes it wrote, agents it spawned.
@@ -2620,6 +2702,93 @@ facts text",
         assert!(generations.contains("generation distilled from `claude:old-gen`"));
         assert!(!generations.contains("Paths most referenced") && !generations.contains("[1] List → a"));
         assert!(unwrap_pack(brief).is_none());
+    }
+
+    #[test]
+    fn commit_message_notes_are_cut_to_their_head_and_other_notes_stay_whole() {
+        let reasons = "Because the queue wants linear ranges. ".repeat(60);
+        let write = |id: &str, path: &str, content: &str| Block::ToolUse {
+            id: id.into(),
+            name: "Write".into(),
+            input: json!({"file_path": path, "content": content}).into(),
+            namespace: None,
+        };
+        let shell_msg = format!(
+            "cat > /s/msg/e1.txt <<'EOF'\nedge: the shell subject\n\n{reasons}\n\nCo-Authored-By: A <a@b>\nEOF\n\
+             git commit -q -F /s/msg/e1.txt && git log --oneline -1"
+        );
+        let notes = format!("Hand-off: {}", "the box is idle. ".repeat(100));
+        let mut s = Session::new("agent-notes", Harness::Claude);
+        s.messages = vec![
+            msg(Role::User, MessageKind::Prompt, vec![text("Ship it.")]),
+            msg(
+                Role::Assistant,
+                MessageKind::Reply,
+                vec![call("h1", &shell_msg, "Commit")],
+            ),
+            msg(
+                Role::Tool,
+                MessageKind::ToolResult,
+                vec![result("h1", "aaa1111 edge: the shell subject", false)],
+            ),
+            msg(
+                Role::Assistant,
+                MessageKind::Reply,
+                vec![write(
+                    "w1",
+                    "/s/msg/e2.txt",
+                    &format!("edge: the written subject\n\n{reasons}"),
+                )],
+            ),
+            msg(Role::Tool, MessageKind::ToolResult, vec![result("w1", "ok", false)]),
+            msg(
+                Role::Assistant,
+                MessageKind::Reply,
+                vec![call("c2", "git commit -qF $M/e2.txt && git log --oneline -1", "Commit")],
+            ),
+            msg(
+                Role::Tool,
+                MessageKind::ToolResult,
+                vec![result("c2", "bbb2222 edge: the written subject", false)],
+            ),
+            msg(
+                Role::Assistant,
+                MessageKind::Reply,
+                vec![write("w2", "/s/NOTES.md", &notes)],
+            ),
+            msg(Role::Tool, MessageKind::ToolResult, vec![result("w2", "ok", false)]),
+            msg(Role::Assistant, MessageKind::Reply, vec![call("z", "ls", "List")]),
+            msg(Role::Tool, MessageKind::ToolResult, vec![result("z", "a", false)]),
+        ];
+        let d = distill_pack(
+            &s,
+            &DistillOptions {
+                keep_last: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let h = &d.head_md;
+        assert!(h.contains("agent wrote /s/msg/e1.txt (commit message, shell)"), "{h}");
+        assert!(h.contains("agent wrote /s/msg/e2.txt (commit message)"), "{h}");
+        assert!(h.contains("edge: the shell subject") && h.contains("edge: the written subject"));
+        assert_eq!(h.matches(COMMIT_NOTE_POINTER).count(), 2);
+        assert!(!h.contains(&reasons), "the commit holds the whole message");
+        assert!(
+            h.contains(notes.trim()),
+            "a note that is not a commit message stays whole"
+        );
+        assert_eq!(d.stats.commits, 2);
+
+        // A carried generation's notes, written before the cut, are cut on the way through.
+        let carried = format!(
+            "### [1] 10-27 09:00 · agent said\n\nWords.\n\n### [2] 10-27 09:01 · agent wrote /s/c1.txt\n\n\
+             subject\n\n{reasons}\nCo-Authored-By: A <a@b>\n\n### [3] 10-27 09:02 · agent wrote /s/N.md\n\n{reasons}"
+        );
+        let cut = shorten_carried_commit_notes(&carried);
+        assert!(cut.contains("agent wrote /s/c1.txt (commit message)") && cut.contains("Words."));
+        assert_eq!(cut.matches(COMMIT_NOTE_POINTER).count(), 1);
+        assert!(cut.ends_with(&reasons), "the plain note is untouched");
     }
 
     #[test]
