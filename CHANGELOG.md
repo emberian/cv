@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+Open questions for review (not decided on this branch):
+- A state file larger than 24 KB is cut head and tail; the infra lane's 83 KB CHECKLIST.md whole would cost ~36k tokens (5.8× → ~4.4×). Carry whole, or keep the cut?
+- Coordinator messages are recognised in distill by their "The coordinator sent a message while you were working:" line; should the Claude adapter give them a proper session kind instead?
+
 - `cv distill` of a distilled lane keeps the original brief; each earlier generation is its brief's first paragraph, commits and state, not a nested pack.
 - `cv distill` packs add `## 1. Grounding`: the lane's last state file whole, its listed open items and recorded decisions, verbatim with message indices.
 - `cv distill` keeps a coordinator's message recorded as a meta turn ("The coordinator sent a message…") in the timeline and the verbatim tail.
