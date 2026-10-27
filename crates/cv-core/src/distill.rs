@@ -286,9 +286,10 @@ enum Re {
     PidFile,
     OpenItem,
     Decision,
+    InPlace,
 }
 
-static RES: [OnceLock<Regex>; 19] = [const { OnceLock::new() }; 19];
+static RES: [OnceLock<Regex>; 20] = [const { OnceLock::new() }; 20];
 
 fn re(which: Re) -> &'static Regex {
     let (cell, pat) = match which {
@@ -336,6 +337,8 @@ fn re(which: Re) -> &'static Regex {
             &RES[17],
             r"(?i)\bowed\b|\bbatch for\b|\bstill red\b|\bnot done\b|\bwaiting on\b",
         ),
+        // A command that rewrites a file in place.
+        Re::InPlace => (&RES[19], r"\bsed\s+-i|\bperl\s+-[a-z]*i|write_text\(|\.write\("),
         // A line recording a decision.
         Re::Decision => (&RES[18], r"(?i)\bdecided\b|\bruling\b|\bdefault\b"),
         // The message file of `git commit … -F <file>` (also `-qF`, `--file=`).
@@ -1645,7 +1648,7 @@ fn render_handoff(
 #[derive(Default)]
 struct Grounding {
     /// idx, path, how it was written, its content (`None` for an in-place edit).
-    state: Option<(usize, String, &'static str, Option<String>)>,
+    state: Option<(usize, String, String, Option<String>)>,
     open: Vec<(usize, String)>,
     decisions: Vec<(usize, String)>,
 }
@@ -1663,6 +1666,35 @@ fn is_state_path(p: &str) -> bool {
         .iter()
         .any(|d| p.starts_with(d) || p.contains(&format!("/{d}")));
     placed && (name.contains("STATE") || name.contains("state"))
+}
+
+/// Files a message to the lane calls its state file ("your brief and state file is `…`"): the
+/// infra lane's is `edge/demo/CHECKLIST.md`, which no name rule finds.
+fn named_state_files(msgs: &[Message], resolver: &crate::Resolver) -> anyhow::Result<Vec<String>> {
+    let mut named: Vec<String> = Vec::new();
+    for m in msgs {
+        let incoming = (m.role == Role::User && m.kind == MessageKind::Prompt)
+            || (m.kind == MessageKind::InjectedContext
+                && matches!(crate::harness::attachment_kind(m), Some("queued_command")));
+        if !incoming {
+            continue;
+        }
+        let text = MessageText::new(m, resolver).text()?.unwrap_or_default();
+        let text = unwrap_pack(&text).map_or(text, |(brief, _)| brief);
+        for line in text.lines().filter(|l| l.to_ascii_lowercase().contains("state file")) {
+            for c in re(Re::Path).captures_iter(line) {
+                let p = c[1].trim_end_matches(['.', ',', ';', ':', ')', '`', '\'']).to_string();
+                if !named.contains(&p) {
+                    named.push(p);
+                }
+            }
+        }
+    }
+    Ok(named)
+}
+
+fn is_state(path: &str, named: &[String]) -> bool {
+    is_state_path(path) || named.iter().any(|n| basename(n) == basename(path))
 }
 
 /// The body of the heredoc that writes `target` in `cmd`, up to its delimiter line.
@@ -1683,6 +1715,7 @@ fn ground(
     let open_re = re(Re::OpenItem);
     let decided_re = re(Re::Decision);
     let window = tail_cut(msgs, GROUNDING_WINDOW, uses);
+    let named = named_state_files(msgs, resolver)?;
     let mut g = Grounding::default();
     let mut open: Vec<(usize, String)> = Vec::new();
     let mut decisions: Vec<(usize, String)> = Vec::new();
@@ -1702,19 +1735,26 @@ fn ground(
                     if i >= window {
                         let path = s("file_path");
                         match name.as_str() {
-                            "Write" if is_state_path(path) => {
-                                g.state = Some((i, path.to_string(), "Write", Some(s("content").to_string())))
+                            "Write" if is_state(path, &named) => {
+                                g.state = Some((i, path.to_string(), "Write".into(), Some(s("content").to_string())))
                             }
-                            "Edit" | "MultiEdit" if is_state_path(path) => {
-                                g.state = Some((i, path.to_string(), "Edit", None))
+                            "Edit" | "MultiEdit" if is_state(path, &named) => {
+                                g.state = Some((i, path.to_string(), "Edit".into(), None))
                             }
                             _ => {
                                 if let Some(cmd) = command_of(&input) {
                                     for c in re(Re::HeredocTarget).captures_iter(cmd) {
-                                        if is_state_path(&c[1]) {
+                                        if is_state(&c[1], &named) {
                                             let body = heredoc_body(cmd, &c[1]);
-                                            g.state = Some((i, c[1].to_string(), "shell", body));
+                                            g.state = Some((i, c[1].to_string(), "shell".into(), body));
                                         }
+                                    }
+                                    // A named state file rewritten in place by a script (`sed -i`,
+                                    // `python3 -`, `perl -i`): the transcript holds no content.
+                                    let rewrites = re(Re::InPlace).is_match(cmd);
+                                    let hit = named.iter().find(|p| rewrites && cmd.contains(basename(p)));
+                                    if let Some(path) = hit.filter(|_| g.state.as_ref().is_none_or(|st| st.0 != i)) {
+                                        g.state = Some((i, path.clone(), "a script, in place".into(), None));
                                     }
                                 }
                             }
@@ -1740,6 +1780,17 @@ fn ground(
     for list in [&mut open, &mut decisions] {
         let skip = list.len().saturating_sub(GROUNDING_LINES);
         list.drain(..skip);
+    }
+    // Written in place: the file itself is the content, read now (read-only) when it is there.
+    if let Some((_, path, how, content @ None)) = g.state.as_mut() {
+        let local = match path.strip_prefix("~/") {
+            Some(rest) => std::env::var_os("HOME").map(|home| std::path::Path::new(&home).join(rest)),
+            None => Some(std::path::PathBuf::from(path.as_str())).filter(|p| p.is_absolute()),
+        };
+        if let Some(text) = local.and_then(|p| std::fs::read_to_string(p).ok()) {
+            *content = Some(text);
+            how.push_str("; content read from disk when distilled");
+        }
     }
     g.open = open;
     g.decisions = decisions;
@@ -3291,6 +3342,39 @@ facts text",
             "{}",
             next.head_md
         );
+    }
+
+    #[test]
+    fn grounding_finds_a_state_file_named_in_a_message_and_rewritten_in_place() {
+        let dir = std::env::temp_dir().join(format!("cv-ground-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let checklist = dir.join("CHECKLIST.md");
+        std::fs::write(&checklist, "# Run sheet\n\nstep 5: init, expects 2 purses").unwrap();
+        let path = checklist.to_str().unwrap();
+        let brief = format!("You are the infra lane.\nYour brief and state file is `{path}`: read it whole first.");
+        let rewrite = format!("python3 -I - <<'PY'\nimport pathlib\np=pathlib.Path('{path}')\np.write_text(p.read_text().replace('1 purse','2 purses'))\nPY");
+        let read = format!("sed -n 1,5p {path} 2>&1");
+        let mut s = Session::new("agent-checklist", Harness::Claude);
+        s.messages = vec![msg(Role::User, MessageKind::Prompt, vec![text(&brief)])];
+        for (id, cmd) in [("r1", rewrite.as_str()), ("r2", read.as_str()), ("z", "ls")] {
+            s.messages
+                .push(msg(Role::Assistant, MessageKind::Reply, vec![call(id, cmd, "Step")]));
+            s.messages
+                .push(msg(Role::Tool, MessageKind::ToolResult, vec![result(id, "ok", false)]));
+        }
+        let d = distill_pack(
+            &s,
+            &DistillOptions {
+                keep_last: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let expected = format!(
+            "**State file** `{path}` [1] (written by a script, in place; content read from disk when distilled):\n\n~~~~\n# Run sheet\n\nstep 5: init, expects 2 purses\n~~~~"
+        );
+        assert!(d.head_md.contains(&expected), "{}", d.head_md);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
