@@ -642,9 +642,11 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Distill a long session (typically a sub-agent lane) into a compact context: the brief and
-    /// every message to the agent verbatim, its own words (text, messages sent, notes written)
-    /// verbatim, an index of commits/branches/hosts/paths/verdicts/errors, a one-line-per-call
+    /// Distill a long session (typically a sub-agent lane) into a compact context: a hand-off (its
+    /// last message, the heads, tips and PID files it last saw), the brief and every message to
+    /// the agent verbatim, its own words (text, messages sent, notes written; commit messages cut
+    /// to 700 bytes) verbatim, earlier generations' timelines and commits when it was distilled
+    /// before, an index of commits/branches/hosts/paths/verdicts/errors, a one-line-per-call
     /// ledger, and its last N tool calls as real turns. Deterministic (no model calls). Elided
     /// outputs go to a sidecar `cv cat` reads. Prints the markdown pack by default; `--session`
     /// emits a resumable session (`claude -p --resume <id>`); `--agent-of <root>` emits a new

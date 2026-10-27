@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- `cv distill` of a distilled lane keeps the original brief and carries earlier generations' timelines and commits, instead of nesting whole packs.
+- `cv distill` packs open with `## 0. Hand-off`: the lane's last message, newest heads and tips, PID files and directories it named.
+- `cv distill` counts commits made with `git commit -q` followed by `git log --oneline`, and reads a repository head past a compound command's output.
+- `cv distill` keeps 700 bytes of a commit-message note (a `git commit -F` file or trailer-signed text); the commit holds the rest.
+- `cv distill` no longer warns `lossy: lineage` or, for `--agent-of`, `lossy: session title`; the pack and agent meta carry both.
+- `cv show --agent <id>` accepts a distilled lane's exact id: the `.flat.jsonl` payload sidecar is not listed as an agent.
+
 ## 0.18.0 — 2026-10-23 — the release an agent can trust
 ClusterVision 0.18.0 is the release an agent can trust. Every listing, count and search answer
 is either exact or says what it skipped: counts are prompts and replies on every harness, a
