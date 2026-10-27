@@ -226,7 +226,7 @@ type Counts = HashMap<String, Mentions>;
 
 #[derive(Default)]
 struct Facts {
-    commits: Vec<(usize, String, String, String)>, // idx, branch, sha, subject
+    commits: Vec<(usize, String, String, String)>, // idx, branch (a quiet commit: its repo), sha, subject
     /// The shas in `commits`: a capture is checked against a set, not a scan of every commit so far.
     commit_shas: HashSet<String>,
     branches: Counts, // name, mentions and first-seen order
@@ -264,9 +264,10 @@ enum Re {
     Cd,
     Oneline,
     HeredocTarget,
+    GitCommit,
 }
 
-static RES: [OnceLock<Regex>; 14] = [const { OnceLock::new() }; 14];
+static RES: [OnceLock<Regex>; 15] = [const { OnceLock::new() }; 15];
 
 fn re(which: Re) -> &'static Regex {
     let (cell, pat) = match which {
@@ -305,6 +306,8 @@ fn re(which: Re) -> &'static Regex {
             &RES[13],
             r#"(?:cat|tee(?:\s+-a)?)\s*>{0,2}\s*['"]?([^\s'"<>|;&]+)['"]?\s*<<-?\s*['"]?\w+"#,
         ),
+        // `git commit`, through any `-c key=value` / `-C dir` options; group 1 is a `-C` dir.
+        Re::GitCommit => (&RES[14], r"\bgit(?:\s+-c\s+\S+|\s+-C\s+(\S+))*\s+commit\b"),
     };
     cell.get_or_init(|| Regex::new(pat).expect("static regex"))
 }
@@ -332,9 +335,60 @@ fn git_log_head(cmd: &str, out: &str) -> Option<(String, String)> {
     if let Some(r) = c.get(3) {
         key = format!("{key} [{}]", r.as_str());
     }
-    let line = out.lines().map(str::trim).find(|l| !l.is_empty())?;
-    let m = re(Re::Oneline).captures(line)?;
-    Some((key, format!("{} {}", &m[1], truncate(m[2].trim(), 90))))
+    // A compound command prints other output first (a build's last line, a test verdict): the
+    // head is the first `git log --oneline`-shaped line, wherever it sits.
+    let (sha, subject) = oneline_lines(out).next()?;
+    Some((key, format!("{sha} {}", truncate(subject, 90))))
+}
+
+/// The `<sha> <subject>` lines of `out`, in order. A line that is not the output's first must
+/// carry a hex letter in its sha, so a count (`wc -l`'s `1234567 total`) is not read as a commit.
+fn oneline_lines(out: &str) -> impl Iterator<Item = (&str, &str)> {
+    out.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .enumerate()
+        .filter_map(|(n, line)| {
+            let m = re(Re::Oneline).captures(line)?;
+            let (sha, subject) = (m.get(1)?.as_str(), m.get(2)?.as_str().trim());
+            (n == 0 || sha.bytes().any(|b| b.is_ascii_alphabetic())).then_some((sha, subject))
+        })
+}
+
+/// Commits made quietly: `git commit -q` prints no `[branch sha] subject` line, so a lane that
+/// commits that way (as minidregg's lanes must) and then prints `git log --oneline -1` shows its
+/// commits only as oneline output. When a command runs k `git commit`s followed by a `git log`,
+/// the first k oneline lines it printed are those commits: `(repo, sha, subject)`, the repo being
+/// the commit's `-C` dir or the last `cd` before it.
+fn quiet_commits<'a>(cmd: &str, out: &'a str) -> Vec<(String, &'a str, &'a str)> {
+    let commits: Vec<_> = re(Re::GitCommit)
+        .captures_iter(cmd)
+        .filter(|c| {
+            !cmd[c.get(0).map_or(0, |m| m.end())..]
+                .trim_start()
+                .starts_with("--dry-run")
+        })
+        .collect();
+    let Some(last) = commits.last().and_then(|c| c.get(0)) else {
+        return Vec::new();
+    };
+    if !re(Re::GitLog).is_match(&cmd[last.end()..]) {
+        return Vec::new();
+    }
+    let repos: Vec<String> = commits
+        .iter()
+        .map(|c| {
+            let at = c.get(0).map_or(0, |m| m.start());
+            c.get(1)
+                .map(|d| d.as_str().to_string())
+                .or_else(|| re(Re::Cd).captures_iter(&cmd[..at]).last().map(|d| d[1].to_string()))
+                .unwrap_or_else(|| ".".into())
+        })
+        .collect();
+    oneline_lines(out)
+        .zip(repos)
+        .map(|((sha, subject), repo)| (repo, sha, subject))
+        .collect()
 }
 
 /// Prose files an agent writes to record state: notes, statuses, briefs, commit messages.
@@ -1157,6 +1211,14 @@ fn scan_result_facts(
             commit_outcome.get_or_insert_with(|| format!("⊕ [{b} {sha}] {}", truncate(subj.trim(), 90)));
             f.tips.push((i, b.clone(), sha.clone()));
             f.commits.push((i, b, sha, subj));
+        }
+    }
+    if commit_outcome.is_none() && !is_error {
+        for (repo, sha, subject) in command_of(input).map(|c| quiet_commits(c, out)).unwrap_or_default() {
+            if f.commit_shas.insert(sha.to_string()) {
+                commit_outcome.get_or_insert_with(|| format!("⊕ [{repo} {sha}] {}", truncate(subject, 90)));
+                f.commits.push((i, repo, sha.to_string(), subject.to_string()));
+            }
         }
     }
     for c in re(Re::OnBranch).captures_iter(out) {
@@ -2316,6 +2378,72 @@ facts text",
         let (k, _) = git_log_head("git -C /r log --oneline -1 origin/main", "1234567 m").unwrap();
         assert_eq!(k, "/r [origin/main]");
         assert!(git_log_head("for d in a b; do git -C $d log -1; git -C x log -1; done", "1234567 m").is_none());
+    }
+
+    #[test]
+    fn quiet_commits_and_compound_git_log_heads_are_facts() {
+        // `git commit -q` then `git log --oneline -1`: the oneline is the commit, keyed by repo.
+        let one =
+            "cd /r/demo && git add x && git -c commit.gpgsign=false commit -q -F $M/a.txt && git log --oneline -1";
+        assert_eq!(
+            quiet_commits(one, "40fdb60 mini ship: a genesis may name the observer\n"),
+            vec![(
+                "/r/demo".to_string(),
+                "40fdb60",
+                "mini ship: a genesis may name the observer"
+            )]
+        );
+        let two = "git -C /r/a commit -q -F m1 && git -C /r/a log --oneline -1 && git -C /r/b commit -qF m2 && git -C /r/b log --oneline -1";
+        let got = quiet_commits(two, "Auto-merging x\naaa1111 one\n 1 file changed\nbbb2222 two");
+        assert_eq!(
+            got,
+            vec![("/r/a".into(), "aaa1111", "one"), ("/r/b".into(), "bbb2222", "two")]
+        );
+        // No `git log` after the commit, a dry run, or no commit at all: nothing is claimed.
+        assert!(quiet_commits("git commit -q -F m", "aaa1111 x").is_empty());
+        assert!(quiet_commits("git commit --dry-run && git log --oneline -1", "aaa1111 x").is_empty());
+        assert!(quiet_commits("git log --oneline -1", "aaa1111 x").is_empty());
+
+        // A compound command's head is its oneline line wherever it sits; a count is not one.
+        let (_, line) = git_log_head(
+            "cd /w && swarm-build cargo build 2>&1 | tail -1 && wc -l f && git log --oneline -1",
+            "Finished release\n1234567 total\n3c90b001 parity dry run",
+        )
+        .unwrap();
+        assert_eq!(line, "3c90b001 parity dry run");
+
+        // Through the whole distill: the commit is listed and counted.
+        let mut lane = lane();
+        lane.messages.insert(
+            1,
+            msg(
+                Role::Assistant,
+                MessageKind::Reply,
+                vec![call("q1", one, "Commit quietly")],
+            ),
+        );
+        lane.messages.insert(
+            2,
+            msg(
+                Role::Tool,
+                MessageKind::ToolResult,
+                vec![result(
+                    "q1",
+                    "40fdb60 mini ship: a genesis may name the observer",
+                    false,
+                )],
+            ),
+        );
+        let d = distill_pack(
+            &lane,
+            &DistillOptions {
+                keep_last: 2,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(d.stats.commits, 2, "the quiet commit and the bracketed one");
+        assert!(d.head_md.contains("[2] `/r/demo` `40fdb60` mini ship"), "{}", d.head_md);
     }
 
     #[test]
