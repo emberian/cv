@@ -284,9 +284,11 @@ enum Re {
     GitCommit,
     CommitFile,
     PidFile,
+    OpenItem,
+    Decision,
 }
 
-static RES: [OnceLock<Regex>; 17] = [const { OnceLock::new() }; 17];
+static RES: [OnceLock<Regex>; 19] = [const { OnceLock::new() }; 19];
 
 fn re(which: Re) -> &'static Regex {
     let (cell, pat) = match which {
@@ -329,6 +331,13 @@ fn re(which: Re) -> &'static Regex {
         Re::GitCommit => (&RES[14], r"\bgit(?:\s+-c\s+\S+|\s+-C\s+(\S+))*\s+commit\b"),
         // A PID file path: `/abs/…/name.pid`, `~/…`, or `$VAR/…` (how lanes name their own).
         Re::PidFile => (&RES[16], r"((?:~|\$\{?\w+\}?)?/[\w.@/${}-]*\.pid)\b"),
+        // A line naming something still open, in the words lanes use for it.
+        Re::OpenItem => (
+            &RES[17],
+            r"(?i)\bowed\b|\bbatch for\b|\bstill red\b|\bnot done\b|\bwaiting on\b",
+        ),
+        // A line recording a decision.
+        Re::Decision => (&RES[18], r"(?i)\bdecided\b|\bruling\b|\bdefault\b"),
         // The message file of `git commit … -F <file>` (also `-qF`, `--file=`).
         Re::CommitFile => (
             &RES[15],
@@ -1099,6 +1108,7 @@ fn analyze(session: &Session, opts: &DistillOptions, demand: Demand) -> anyhow::
     );
     let elided_hint = (opts.ledger && elided_outputs > 0).then_some((retrieve_ref.as_str(), elided_outputs));
     render_handoff(&mut h, last_words.as_ref(), &facts, msgs, elided_hint);
+    render_grounding(&mut h, &ground(msgs, &uses, &resolver)?);
     if let Some((i, text)) = &brief {
         let _ = writeln!(h, "{BRIEF_HEAD}{i}]\n\n{}\n", text.trim());
     }
@@ -1207,12 +1217,13 @@ fn strip_reminder(s: &str) -> String {
 // The pack's section headings. The renderer writes them numbered; `unwrap_pack` finds them by
 // title, so packs from every numbering (0.18.0's `## 1. Brief`, this one's) read back.
 const PREAMBLE_HEAD: &str = "[cv distill] You are resuming";
-const BRIEF_HEAD: &str = "## 1. Brief (verbatim) [";
-const EARLIER_HEAD: &str = "## 1b. Earlier generations";
-const TIMELINE_HEAD: &str = "## 2. Timeline — everything said to this agent";
-const FACTS_HEAD: &str = "## 3. Facts (mined from tool inputs and outputs)";
-const LEDGER_HEAD: &str = "## 4. Ledger — every tool call before the tail";
 const HANDOFF_HEAD: &str = "## 0. Hand-off — ";
+const GROUNDING_HEAD: &str = "## 1. Grounding — ";
+const BRIEF_HEAD: &str = "## 2. Brief (verbatim) [";
+const EARLIER_HEAD: &str = "## 2b. Earlier generations";
+const TIMELINE_HEAD: &str = "## 3. Timeline — everything said to this agent";
+const FACTS_HEAD: &str = "## 4. Facts (mined from tool inputs and outputs)";
+const LEDGER_HEAD: &str = "## 5. Ledger — every tool call before the tail";
 
 /// The title of a `## N. <title>` heading constant: what `heading` searches for.
 fn title(head: &str) -> &str {
@@ -1327,6 +1338,12 @@ fn unwrap_pack(text: &str) -> Option<(String, String)> {
                     let _ = writeln!(earlier, "- **State files named**: {}", state.join(" · "));
                 }
             }
+        }
+    }
+    if let Some(grounding) = heading(&t[..b], GROUNDING_HEAD, 0, false) {
+        for line in t[grounding..b].lines().filter(|l| l.starts_with("**State file** `")) {
+            let path = line.split('`').nth(1).unwrap_or("");
+            let _ = writeln!(earlier, "- **State file it last wrote**: `{path}`");
         }
     }
     if let Some(handoff) = heading(&t[..b], HANDOFF_HEAD, 0, false) {
@@ -1583,7 +1600,7 @@ fn render_handoff(
     }
     let _ = writeln!(
         h,
-        "## 0. Hand-off — the lane's last message and the state it last saw (verify before acting)\n"
+        "{HANDOFF_HEAD}the lane's last message and the state it last saw (verify before acting)\n"
     );
     if let Some((i, words)) = last_words {
         let at = msgs.get(*i).map(when).unwrap_or_default();
@@ -1618,6 +1635,159 @@ fn render_handoff(
         );
     }
     h.push('\n');
+}
+
+/// `## 1. Grounding`: what the lane itself wrote down about where it stands, so a successor grounds
+/// on its own record instead of re-deriving it (ember's ruling, 2026-10-27). Deterministic, from the
+/// lane's own words (its text and the messages it sent), each line verbatim with its message
+/// index: the last state file it wrote, the open items it listed in its last
+/// [`GROUNDING_WINDOW`] calls, and the decisions it recorded anywhere.
+#[derive(Default)]
+struct Grounding {
+    /// idx, path, how it was written, its content (`None` for an in-place edit).
+    state: Option<(usize, String, &'static str, Option<String>)>,
+    open: Vec<(usize, String)>,
+    decisions: Vec<(usize, String)>,
+}
+
+const GROUNDING_WINDOW: usize = 60;
+const GROUNDING_LINES: usize = 25;
+const GROUNDING_LINE_MAX: usize = 600;
+/// A state file is carried whole up to this many bytes (head and tail beyond, the rest on disk).
+const STATE_FILE_MAX: usize = 24 * 1024;
+
+/// A file under `docs/` or a scratch directory whose name says it is a state file.
+fn is_state_path(p: &str) -> bool {
+    let name = basename(p);
+    let placed = ["docs/", "scratch"]
+        .iter()
+        .any(|d| p.starts_with(d) || p.contains(&format!("/{d}")));
+    placed && (name.contains("STATE") || name.contains("state"))
+}
+
+/// The body of the heredoc that writes `target` in `cmd`, up to its delimiter line.
+fn heredoc_body(cmd: &str, target: &str) -> Option<String> {
+    let rest = &cmd[cmd.find(target)?..];
+    let after = rest[rest.find("<<")? + 2..].trim_start_matches('-').trim_start();
+    let delim = after.split_whitespace().next()?.trim_matches(['\'', '"']);
+    let body = &after[after.find('\n')? + 1..];
+    let lines: Vec<&str> = body.lines().take_while(|l| l.trim() != delim).collect();
+    Some(lines.join("\n"))
+}
+
+fn ground(
+    msgs: &[Message],
+    uses: &HashMap<&str, crate::ir::ToolCall<'_>>,
+    resolver: &crate::Resolver,
+) -> anyhow::Result<Grounding> {
+    let open_re = re(Re::OpenItem);
+    let decided_re = re(Re::Decision);
+    let window = tail_cut(msgs, GROUNDING_WINDOW, uses);
+    let mut g = Grounding::default();
+    let mut open: Vec<(usize, String)> = Vec::new();
+    let mut decisions: Vec<(usize, String)> = Vec::new();
+    let note = |list: &mut Vec<(usize, String)>, i: usize, line: &str| {
+        let line = truncate(line, GROUNDING_LINE_MAX);
+        list.retain(|(_, l)| *l != line);
+        list.push((i, line));
+    };
+    for (i, m) in msgs.iter().enumerate().filter(|(_, m)| m.role == Role::Assistant) {
+        let mut reader = MessageText::new(m, resolver);
+        for (index, block) in m.content.iter().enumerate() {
+            let words: String = match block {
+                Block::Text { .. } => reader.block(index)?.to_string(),
+                Block::ToolUse { name, input, .. } => {
+                    let input = input.resolve()?;
+                    let s = |k: &str| input.get(k).and_then(Value::as_str).unwrap_or("");
+                    if i >= window {
+                        let path = s("file_path");
+                        match name.as_str() {
+                            "Write" if is_state_path(path) => {
+                                g.state = Some((i, path.to_string(), "Write", Some(s("content").to_string())))
+                            }
+                            "Edit" | "MultiEdit" if is_state_path(path) => {
+                                g.state = Some((i, path.to_string(), "Edit", None))
+                            }
+                            _ => {
+                                if let Some(cmd) = command_of(&input) {
+                                    for c in re(Re::HeredocTarget).captures_iter(cmd) {
+                                        if is_state_path(&c[1]) {
+                                            let body = heredoc_body(cmd, &c[1]);
+                                            g.state = Some((i, c[1].to_string(), "shell", body));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if name != "SendMessage" {
+                        continue;
+                    }
+                    s("message").to_string()
+                }
+                _ => continue,
+            };
+            for line in words.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                if i >= window && open_re.is_match(line) {
+                    note(&mut open, i, line);
+                }
+                if decided_re.is_match(line) {
+                    note(&mut decisions, i, line);
+                }
+            }
+        }
+    }
+    for list in [&mut open, &mut decisions] {
+        let skip = list.len().saturating_sub(GROUNDING_LINES);
+        list.drain(..skip);
+    }
+    g.open = open;
+    g.decisions = decisions;
+    Ok(g)
+}
+
+fn render_grounding(h: &mut String, g: &Grounding) {
+    if g.state.is_none() && g.open.is_empty() && g.decisions.is_empty() {
+        return;
+    }
+    let _ = writeln!(
+        h,
+        "{GROUNDING_HEAD}the lane's own record of where it stands (its verbatim lines, [message index])\n"
+    );
+    if let Some((i, path, how, content)) = &g.state {
+        match content {
+            Some(content) => {
+                let content = head_tail(content, STATE_FILE_MAX, &format!("the whole file is {path}"));
+                let _ = writeln!(
+                    h,
+                    "**State file** `{path}` [{i}] (written by {how}):\n\n~~~~\n{}\n~~~~\n",
+                    content.trim_end()
+                );
+            }
+            None => {
+                let _ = writeln!(h, "**State file** `{path}` [{i}] (edited in place; read it on disk)\n");
+            }
+        }
+    }
+    let list = |h: &mut String, title: &str, rows: &[(usize, String)]| {
+        if !rows.is_empty() {
+            let _ = writeln!(h, "**{title}**:\n");
+            for (i, line) in rows {
+                let _ = writeln!(h, "- [{i}] {line}");
+            }
+            h.push('\n');
+        }
+    };
+    list(
+        h,
+        &format!("Open items it listed (its last {GROUNDING_WINDOW} calls, newest {GROUNDING_LINES})"),
+        &g.open,
+    );
+    list(
+        h,
+        &format!("Decisions it recorded (newest {GROUNDING_LINES})"),
+        &g.decisions,
+    );
 }
 
 fn render_facts(h: &mut String, f: &Facts) {
@@ -1872,7 +2042,7 @@ fn render_prepared_tail(tail: &[Message], tail_start: usize, opts: &DistillOptio
     }
     let _ = writeln!(
         s,
-        "## 5. The last {} tool calls, verbatim (from message [{tail_start}] on)\n",
+        "## 6. The last {} tool calls, verbatim (from message [{tail_start}] on)\n",
         opts.keep_last
     );
     for m in tail {
@@ -3013,6 +3183,114 @@ facts text",
             .unwrap()
             .head_md
             .contains("Hand-off"));
+    }
+
+    #[test]
+    fn grounding_carries_the_last_state_file_open_items_and_decisions_verbatim() {
+        let write = |id: &str, path: &str, content: &str| Block::ToolUse {
+            id: id.into(),
+            name: "Write".into(),
+            input: json!({"file_path": path, "content": content}).into(),
+            namespace: None,
+        };
+        let send = |id: &str, message: &str| Block::ToolUse {
+            id: id.into(),
+            name: "SendMessage".into(),
+            input: json!({"to": "main", "message": message}).into(),
+            namespace: None,
+        };
+        let turn = |blocks: Vec<Block>| msg(Role::Assistant, MessageKind::Reply, blocks);
+        let ok = |id: &str| msg(Role::Tool, MessageKind::ToolResult, vec![result(id, "ok", false)]);
+        let mut s = Session::new("agent-ground", Harness::Claude);
+        s.messages = vec![
+            msg(Role::User, MessageKind::Prompt, vec![text("Ship it.")]),
+            turn(vec![text(
+                "Owed: an item from long ago, since closed.\nDecided: rebase over merge.",
+            )]),
+        ];
+        // 61 polls push the old open item out of the last-60-calls window; decisions are kept.
+        for k in 0..61 {
+            let id = format!("p{k}");
+            s.messages.push(turn(vec![call(&id, "ls", "Poll")]));
+            s.messages.push(ok(&id));
+        }
+        s.messages.extend([
+            turn(vec![write("w1", "/w/docs/LANE-STATE.md", "# old state")]),
+            ok("w1"),
+            turn(vec![
+                text("Still red: jtour step 4.\nNothing else to say."),
+                write(
+                    "w2",
+                    "/w/docs/LANE-STATE.md",
+                    "# Lane state\n\nstep 4 red; next: fix the row",
+                ),
+            ]),
+            ok("w2"),
+            turn(vec![send(
+                "m1",
+                "Batch for the parent: the sudoers line.\nThe ruling stands: default caps 4030.",
+            )]),
+            ok("m1"),
+            turn(vec![call("z", "ls", "List")]),
+            ok("z"),
+        ]);
+        let d = distill_pack(
+            &s,
+            &DistillOptions {
+                keep_last: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let h = &d.head_md;
+        let (handoff, grounding, brief) = (
+            h.find(HANDOFF_HEAD).unwrap(),
+            h.find(GROUNDING_HEAD).unwrap(),
+            h.find(BRIEF_HEAD).unwrap(),
+        );
+        assert!(handoff < grounding && grounding < brief, "{h}");
+        let g = &h[grounding..brief];
+        assert!(g.contains("**State file** `/w/docs/LANE-STATE.md` [126] (written by Write):\n\n~~~~\n# Lane state\n\nstep 4 red; next: fix the row\n~~~~"), "{g}");
+        assert!(!g.contains("# old state"), "the last write wins");
+        assert!(
+            g.contains("- [126] Still red: jtour step 4.\n")
+                && g.contains("- [128] Batch for the parent: the sudoers line.\n"),
+            "{g}"
+        );
+        assert!(
+            !g.contains("an item from long ago"),
+            "open items come from the last 60 calls: {g}"
+        );
+        assert!(
+            g.contains("- [1] Decided: rebase over merge.\n")
+                && g.contains("- [128] The ruling stands: default caps 4030.\n"),
+            "{g}"
+        );
+        assert!(!g.contains("Nothing else to say"));
+
+        // A heredoc into a scratch state file carries its body; the next generation keeps its path.
+        let shell = "cat > /s/scratchpad/lane/state.md <<'EOF'\nwaiting on cut 9\nEOF\necho done";
+        s.messages
+            .insert(s.messages.len() - 2, turn(vec![call("h1", shell, "State")]));
+        s.messages.insert(s.messages.len() - 2, ok("h1"));
+        let (d, mut resumed) = prepare_distill(
+            &s,
+            &DistillOptions {
+                keep_last: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .into_resumable_session(&s);
+        assert!(d.head_md.contains("**State file** `/s/scratchpad/lane/state.md` [130] (written by shell):\n\n~~~~\nwaiting on cut 9\n~~~~"), "{}", d.head_md);
+        resumed.messages.push(turn(vec![text("Resumed.")]));
+        let next = distill_pack(&resumed, &DistillOptions::default()).unwrap();
+        assert!(
+            next.head_md
+                .contains("- **State file it last wrote**: `/s/scratchpad/lane/state.md`"),
+            "{}",
+            next.head_md
+        );
     }
 
     #[test]
