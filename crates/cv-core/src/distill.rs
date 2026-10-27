@@ -756,13 +756,9 @@ fn analyze(session: &Session, opts: &DistillOptions, demand: Demand) -> anyhow::
     // when the agent reads one, its latest read is kept (capped) in the timeline.
     let mut referenced: std::collections::HashSet<String> = std::collections::HashSet::new();
     for m in msgs.iter().filter(|_| demand != Demand::Findings) {
-        let incoming = (m.role == Role::User && m.kind == MessageKind::Prompt)
-            || (m.kind == MessageKind::InjectedContext
-                && matches!(crate::harness::attachment_kind(m), Some("queued_command")));
-        if !incoming {
+        let Some(t) = incoming_text(m, &resolver)? else {
             continue;
-        }
-        let t = MessageText::new(m, &resolver).text()?.unwrap_or_default();
+        };
         // A resumed distilled lane's opening prompt is its predecessor's pack: only the original
         // brief inside it names documents as instructions.
         let t = unwrap_pack(&t).map_or(t, |(brief, _)| brief);
@@ -837,6 +833,7 @@ fn analyze(session: &Session, opts: &DistillOptions, demand: Demand) -> anyhow::
     let mut ledger_runs: Vec<usize> = Vec::new(); // repeat count per ledger row
     let mut elided: Vec<Elided> = Vec::new();
     let mut elided_outputs = 0usize;
+    let mut delivered_bodies: HashSet<String> = HashSet::new();
     // The lane's last text block anywhere (tail included): its own hand-off.
     let mut last_words: Option<(usize, String)> = None;
 
@@ -900,14 +897,17 @@ fn analyze(session: &Session, opts: &DistillOptions, demand: Demand) -> anyhow::
                 });
             }
             (_, MessageKind::InjectedContext) if !in_tail && demand != Demand::Findings => {
-                // A message delivered mid-run (peer agent, coordinator, queued user input).
-                if matches!(crate::harness::attachment_kind(m), Some("queued_command")) {
-                    timeline.push(Entry {
-                        idx: i,
-                        when: when(m),
-                        heading: "message delivered while working".into(),
-                        body: strip_reminder(&reader.text()?.unwrap_or_default()),
-                    });
+                // A message delivered mid-run (peer agent, coordinator, queued user input). One
+                // message can arrive both as a queued command and as a coordinator turn.
+                if let Some(body) = delivered(m, &resolver)? {
+                    if delivered_bodies.insert(body.clone()) {
+                        timeline.push(Entry {
+                            idx: i,
+                            when: when(m),
+                            heading: "message delivered while working".into(),
+                            body,
+                        });
+                    }
                 }
             }
             (Role::Assistant, _) => {
@@ -1204,6 +1204,42 @@ fn analyze(session: &Session, opts: &DistillOptions, demand: Demand) -> anyhow::
         tail,
         keep_last: opts.keep_last,
     })
+}
+
+/// How Claude Code records a coordinator's message to a running sub-agent: a meta user turn
+/// (`isMeta`, `origin.kind = "coordinator"`) whose text opens with this line. The IR reads it as
+/// injected context, like a hook's output.
+const COORDINATOR_HEAD: &str = "The coordinator sent a message while you were working:";
+
+/// The body of a message delivered to the lane mid-run: a queued command (out of its reminder)
+/// or a coordinator turn (after its opening line). On session 698fc87d the coordinator turns
+/// were dropped: the infra lane a221a2ea8cf1d4104 received 11, its timeline kept the 3 that also
+/// arrived as queued commands, and the root's resume message (its quest and state file) was not
+/// among them.
+fn delivered(m: &Message, resolver: &crate::Resolver) -> anyhow::Result<Option<String>> {
+    if m.kind != MessageKind::InjectedContext {
+        return Ok(None);
+    }
+    let queued = matches!(crate::harness::attachment_kind(m), Some("queued_command"));
+    if !queued && m.role != Role::User {
+        return Ok(None);
+    }
+    let text = MessageText::new(m, resolver).text()?.unwrap_or_default();
+    if queued {
+        return Ok(Some(strip_reminder(&text)));
+    }
+    Ok(text
+        .trim_start()
+        .strip_prefix(COORDINATOR_HEAD)
+        .map(|body| body.trim().to_string()))
+}
+
+/// Everything said to the lane: its prompts and the messages delivered to it.
+fn incoming_text(m: &Message, resolver: &crate::Resolver) -> anyhow::Result<Option<String>> {
+    if m.role == Role::User && m.kind == MessageKind::Prompt {
+        return MessageText::new(m, resolver).text();
+    }
+    delivered(m, resolver)
 }
 
 /// A peer message arrives wrapped in a `<system-reminder>`; keep what is inside.
@@ -1673,13 +1709,9 @@ fn is_state_path(p: &str) -> bool {
 fn named_state_files(msgs: &[Message], resolver: &crate::Resolver) -> anyhow::Result<Vec<String>> {
     let mut named: Vec<String> = Vec::new();
     for m in msgs {
-        let incoming = (m.role == Role::User && m.kind == MessageKind::Prompt)
-            || (m.kind == MessageKind::InjectedContext
-                && matches!(crate::harness::attachment_kind(m), Some("queued_command")));
-        if !incoming {
+        let Some(text) = incoming_text(m, resolver)? else {
             continue;
-        }
-        let text = MessageText::new(m, resolver).text()?.unwrap_or_default();
+        };
         let text = unwrap_pack(&text).map_or(text, |(brief, _)| brief);
         for line in text.lines().filter(|l| l.to_ascii_lowercase().contains("state file")) {
             for c in re(Re::Path).captures_iter(line) {
@@ -2052,21 +2084,15 @@ fn resumable_tail(
                 owned.materialize(resolver)?;
                 out.push(owned);
             }
-            (_, MessageKind::InjectedContext)
-                if matches!(crate::harness::attachment_kind(m), Some("queued_command")) =>
-            {
-                let mut u = Message::of_kind(Role::User, MessageKind::Prompt, Origin::Subagent);
-                u.id = m.id.clone();
-                u.parent_id = m.parent_id.clone();
-                u.timestamp = m.timestamp;
-                u.content.push(Block::Text {
-                    text: {
-                        let mut owned = m.clone();
-                        owned.materialize(resolver)?;
-                        strip_reminder(&owned.text().unwrap_or_default()).into()
-                    },
-                });
-                out.push(u);
+            (_, MessageKind::InjectedContext) => {
+                if let Some(body) = delivered(m, resolver)? {
+                    let mut u = Message::of_kind(Role::User, MessageKind::Prompt, Origin::Subagent);
+                    u.id = m.id.clone();
+                    u.parent_id = m.parent_id.clone();
+                    u.timestamp = m.timestamp;
+                    u.content.push(Block::Text { text: body.into() });
+                    out.push(u);
+                }
             }
             _ => {}
         }
