@@ -1692,6 +1692,15 @@ struct Grounding {
 const GROUNDING_WINDOW: usize = 60;
 const GROUNDING_LINES: usize = 25;
 const GROUNDING_LINE_MAX: usize = 600;
+/// List lines kept under an open-item heading.
+const GROUNDING_LIST_MAX: usize = 10;
+
+/// `- x`, `* x`, `1. x`, `2) x`.
+fn is_list_item(line: &str) -> bool {
+    let digits = line.trim_start_matches(|c: char| c.is_ascii_digit());
+    let numbered = digits.len() < line.len() && (digits.starts_with(". ") || digits.starts_with(") "));
+    line.starts_with("- ") || line.starts_with("* ") || numbered
+}
 /// A state file is carried whole up to this many bytes (head and tail beyond, the rest on disk).
 const STATE_FILE_MAX: usize = 24 * 1024;
 
@@ -1799,9 +1808,21 @@ fn ground(
                 }
                 _ => continue,
             };
-            for line in words.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            let lines: Vec<&str> = words.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+            for (n, line) in lines.iter().enumerate() {
                 if i >= window && open_re.is_match(line) {
                     note(&mut open, i, line);
+                    // A heading such as "**Batch for you:**" names nothing itself: its items are
+                    // the list lines under it.
+                    if line.trim_end_matches('*').ends_with(':') {
+                        for item in lines[n + 1..]
+                            .iter()
+                            .take_while(|l| is_list_item(l))
+                            .take(GROUNDING_LIST_MAX)
+                        {
+                            note(&mut open, i, item);
+                        }
+                    }
                 }
                 if decided_re.is_match(line) {
                     note(&mut decisions, i, line);
@@ -3308,6 +3329,10 @@ facts text",
                 "Batch for the parent: the sudoers line.\nThe ruling stands: default caps 4030.",
             )]),
             ok("m1"),
+            turn(vec![text(
+                "**Batch for you:**\n1. The client lane: fix enroll plan.\n2. A genesis with tasks 7901.\nThat is all.",
+            )]),
+            ok("m1b"),
             turn(vec![call("z", "ls", "List")]),
             ok("z"),
         ]);
@@ -3344,6 +3369,11 @@ facts text",
             "{g}"
         );
         assert!(!g.contains("Nothing else to say"));
+        assert!(
+            g.contains("- [130] **Batch for you:**\n- [130] 1. The client lane: fix enroll plan.\n- [130] 2. A genesis with tasks 7901.\n")
+                && !g.contains("That is all."),
+            "a heading's list items come with it: {g}"
+        );
 
         // A heredoc into a scratch state file carries its body; the next generation keeps its path.
         let shell = "cat > /s/scratchpad/lane/state.md <<'EOF'\nwaiting on cut 9\nEOF\necho done";
@@ -3359,7 +3389,7 @@ facts text",
         )
         .unwrap()
         .into_resumable_session(&s);
-        assert!(d.head_md.contains("**State file** `/s/scratchpad/lane/state.md` [130] (written by shell):\n\n~~~~\nwaiting on cut 9\n~~~~"), "{}", d.head_md);
+        assert!(d.head_md.contains("**State file** `/s/scratchpad/lane/state.md` [132] (written by shell):\n\n~~~~\nwaiting on cut 9\n~~~~"), "{}", d.head_md);
         resumed.messages.push(turn(vec![text("Resumed.")]));
         let next = distill_pack(&resumed, &DistillOptions::default()).unwrap();
         assert!(
