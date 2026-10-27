@@ -4,6 +4,7 @@
 
 - `cv distill` of a distilled lane keeps the original brief; each earlier generation is its brief's first paragraph, commits and state, not a nested pack.
 - `cv distill` packs add `## 1. Grounding`: the lane's last state file whole, its listed open items and recorded decisions, verbatim with message indices.
+- `cv distill` keeps a coordinator's message recorded as a meta turn ("The coordinator sent a message…") in the timeline and the verbatim tail.
 - `cv distill` ledger rows name each elided output's tool_use id and size; the hand-off says `cv cat <ref> <id>` fetches it.
 - `cv distill` packs open with `## 0. Hand-off`: the lane's last message, newest heads and tips, PID files and directories it named.
 - `cv distill` counts commits made with `git commit -q` followed by `git log --oneline`, and reads a repository head past a compound command's output.
