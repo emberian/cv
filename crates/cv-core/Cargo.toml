@@ -80,6 +80,8 @@ zstd = ["dep:ruzstd", "dep:zstd"]
 parallel = ["dep:rayon"]
 # Diagnostic example only: count requested Rust allocations separately from clean timing runs.
 probe-heap = []
+# Integration-test observations at the resume reader; absent from normal builds.
+probe-resume = ["sqlite"]
 
 # The golden corpus reads every harness's store, SQLite and zstd ones included.
 [[test]]

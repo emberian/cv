@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Index and live-search planning read resume heads only for selected sessions, avoiding fleet-wide checkpoint I/O on unchanged or writer-busy refreshes.
+
 ## 0.18.0 — 2026-10-23 — the release an agent can trust
 ClusterVision 0.18.0 is the release an agent can trust. Every listing, count and search answer
 is either exact or says what it skipped: counts are prompts and replies on every harness, a

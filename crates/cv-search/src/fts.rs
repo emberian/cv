@@ -1033,7 +1033,6 @@ struct PlanState {
     metadata: HashMap<String, DiscoveryMetadata>,
     event_sync: cv_core::events::SyncTable,
     affordances: cv_core::catalog::AffordanceTable,
-    marks: cv_core::resume::MarkTable,
     consumer: String,
     dependencies: cv_core::source::Table<InIndex>,
     probe: cv_core::source::Probe,
@@ -1055,7 +1054,6 @@ impl PlanState {
             // One query each for the event skip-table and the affordance counts `has:<kind>` reads.
             event_sync: cv_core::events::SyncTable::load(),
             affordances: cv_core::catalog::AffordanceTable::load(),
-            marks: cv_core::resume::MarkTable::load(),
             dependencies: cv_core::source::Table::load(&consumer),
             consumer,
             probe: cv_core::source::Probe::default(),
@@ -1070,7 +1068,6 @@ impl PlanState {
             metadata,
             event_sync,
             affordances,
-            marks,
             dependencies,
             probe,
             ..
@@ -1104,7 +1101,7 @@ impl PlanState {
                 .is_some_and(|&(_, old_size)| old_size > 0 && size > old_size)
                 && (!events || event_sync.can_resume(r, prov)),
             prov: prov.clone(),
-            mark: marks.get(r).cloned(),
+            mark: None,
             source,
             dependencies_fresh,
             decoded: None,
@@ -1212,6 +1209,9 @@ fn job_out(
     adapter: &dyn cv_core::Adapter,
 ) -> Out {
     let version = cv_core::resume::version(adapter, RESUME_TAG);
+    // Workers run only after writer admission and the publication recheck. Even a whole-pass
+    // job needs its prior head so failure cleanup can invalidate an obsolete checkpoint.
+    job.mark = marks.head(&job.r);
     let from = resumable_from(&job, &version, marks);
     // A resume the adapter declines touched nothing: read the session whole instead.
     let resumed = match &from {
@@ -7947,7 +7947,11 @@ mod tests {
         let before = observe(&dir, &refs, &["zqwarm".into()]);
         let (index, _) = open_or_create(&dir).unwrap();
         let _writer_lock = open_writer(&index, 15_000_000).unwrap();
+        let reads = cv_core::resume::probe::Probe::new();
         let swept = sweep(&dir, refs.clone(), false, false).unwrap();
+        let demanded = reads.take();
+        assert_eq!(demanded.scans, 0);
+        assert!(demanded.heads.is_empty() && demanded.states.is_empty(), "{demanded:?}");
         assert_eq!(
             (
                 swept.changed,
@@ -7959,6 +7963,42 @@ mod tests {
         );
         assert_eq!(swept.observed.work, SweepWork::default());
         assert_eq!(observe(&dir, &refs, &["zqwarm".into()]), before);
+    }
+
+    #[test]
+    fn resume_heads_wait_for_writer_and_only_selected_append_is_read() {
+        let home = IsolatedHome::new();
+        let dir = home.home.join("index");
+        let refs: Vec<_> = ["grow", "still", "also-still"]
+            .into_iter()
+            .map(|id| sref(id, id, write_claude(&home.home, id, "zqseed initial text")))
+            .collect();
+        sweep(&dir, refs.clone(), false, false).unwrap();
+        append_claude(refs[0].path.to_str().unwrap(), "grow", 3, "zqappended");
+        let reads = cv_core::resume::probe::Probe::new();
+        let (index, _) = open_or_create(&dir).unwrap();
+        let writer_lock = open_writer(&index, 15_000_000).unwrap();
+        let err = sweep(&dir, refs.clone(), false, false).err().expect("writer is held");
+        assert!(format!("{err:?}").contains("LockBusy"), "{err:?}");
+        let demanded = reads.take();
+        assert_eq!(demanded.scans, 0);
+        assert!(demanded.heads.is_empty() && demanded.states.is_empty(), "{demanded:?}");
+        drop(writer_lock);
+
+        let swept = sweep(&dir, refs.clone(), false, false).unwrap();
+        assert_eq!((swept.changed, swept.resumed, swept.errors), (1, 1, 0));
+        let demanded = reads.take();
+        assert_eq!(demanded.scans, 0);
+        assert_eq!(
+            demanded.heads.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            ["grow"]
+        );
+        assert_eq!(
+            demanded.states.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            ["grow"]
+        );
+        let words = vec!["zqseed".into(), "zqappended".into()];
+        assert_eq!(observe(&dir, &refs, &words), whole_sweep(&refs, &words));
     }
 
     #[test]
@@ -8539,16 +8579,33 @@ mod tests {
             .cloned()
             .expect("a mark");
 
+        let reads = cv_core::resume::probe::Probe::new();
+        // Live search does not need the persistent writer, even when a session is stale.
+        let (index, _) = open_or_create(&dir).unwrap();
+        let writer_lock = open_writer(&index, 15_000_000).unwrap();
         // Fresh: nothing is read live and the footer is quiet.
         let (_, suffix) = suffix_search(&dir, "alpha", LiveRead::All, &refs);
         assert_eq!((suffix.stale, suffix.read), (0, 0));
         assert_eq!((suffix.read_line(), suffix.unread_line()), (None, None));
+        let demanded = reads.take();
+        assert_eq!(demanded.scans, 0);
+        assert!(demanded.heads.is_empty() && demanded.states.is_empty(), "{demanded:?}");
 
         append_claude(&p, "grow", 3, "zanzibar");
         let len = std::fs::metadata(&p).unwrap().len();
         let (hits, suffix) = suffix_search(&dir, "zanzibar", LiveRead::All, &refs);
         assert_eq!(hits.iter().map(|h| h.0.as_str()).collect::<Vec<_>>(), ["grow"]);
         assert_eq!((suffix.stale, suffix.read, suffix.resumed, suffix.cut), (1, 1, 1, 0));
+        let demanded = reads.take();
+        assert_eq!(demanded.scans, 0);
+        assert_eq!(
+            demanded.heads.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            ["grow"]
+        );
+        assert_eq!(
+            demanded.states.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            ["grow"]
+        );
         assert_eq!(
             suffix.bytes,
             len - mark.offset(),
@@ -8575,6 +8632,7 @@ mod tests {
             "{note}"
         );
         // Nothing was written: the sweep still finds the session stale and resumes it.
+        drop(writer_lock);
         let swept = sweep(&dir, refs.clone(), false, false).unwrap();
         assert_eq!((swept.changed, swept.resumed), (1, 1));
         let (_, suffix) = suffix_search(&dir, "zanzibar", LiveRead::All, &refs);

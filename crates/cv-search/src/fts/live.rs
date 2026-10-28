@@ -320,7 +320,6 @@ fn plan(
         Some(consumer) if indexed.is_some() => cv_core::source::Table::<InIndex>::load(&consumer),
         _ => Default::default(),
     };
-    let marks = cv_core::resume::MarkTable::load();
     let reader = cv_core::resume::Reader::default();
     let mut probe = cv_core::source::Probe::default();
     let newest_indexed = existing
@@ -354,7 +353,7 @@ fn plan(
             source,
             dependencies_fresh: fresh.dependencies_fresh,
             prov: prov.clone(),
-            mark: marks.get(r).cloned(),
+            mark: reader.head(r),
             decoded: None,
         };
         let from = resumable_from(&job, &cv_core::resume::version(adapter.as_ref(), RESUME_TAG), &reader);

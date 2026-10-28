@@ -105,14 +105,16 @@ mod imp {
         )
     }
 
-    /// Every mark's head, loaded with one query for a sweep (the states, which can be tens of KB
-    /// each, are read only for the sessions that resume: [`state`]).
+    /// Every mark's head. Index and live planners use [`Reader::head`] instead: SQLite may
+    /// traverse a row's large state to reach its trailing identity, even without selecting state.
     pub struct MarkTable {
         rows: HashMap<(String, String, String), MarkHead>,
     }
 
     impl MarkTable {
         pub fn load() -> MarkTable {
+            #[cfg(feature = "probe-resume")]
+            probe::note(|reads| reads.scans += 1);
             let load = || -> Option<HashMap<(String, String, String), MarkHead>> {
                 let conn = open()?;
                 let mut stmt = conn
@@ -151,9 +153,29 @@ mod imp {
         }
     }
     impl Reader {
+        /// Demand only this session's head, after the caller has selected it for work.
+        pub fn head(&self, r: &SessionRef) -> Option<MarkHead> {
+            #[cfg(feature = "probe-resume")]
+            probe::note(|reads| reads.heads.push(r.clone()));
+            self.0.with_connection(|conn| head_in(conn, r)).flatten()
+        }
+
         pub fn state(&self, r: &SessionRef, head: &MarkHead) -> Option<Checkpoint> {
+            #[cfg(feature = "probe-resume")]
+            probe::note(|reads| reads.states.push(r.clone()));
             self.0.with_connection(|conn| state_in(conn, r, head)).flatten()
         }
+    }
+
+    fn head_in(conn: &Connection, r: &SessionRef) -> Option<MarkHead> {
+        let (h, i, p) = key(r);
+        conn.query_row(
+            "SELECT offset, hash, version, identity FROM resume_marks WHERE harness=?1 AND id=?2 AND path=?3",
+            params![h, i, p],
+            |row| Ok(row_head(row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .ok()
+        .flatten()
     }
 
     fn state_in(conn: &Connection, r: &SessionRef, head: &MarkHead) -> Option<Checkpoint> {
@@ -247,9 +269,112 @@ pub fn state(_r: &SessionRef, _head: &MarkHead) -> Option<Checkpoint> {
 #[cfg(not(feature = "sqlite"))]
 pub fn update(_marks: &[MarkUpdate]) {}
 
+/// Opt-in integration-test observations, scoped to an isolated catalog home and its workers.
+#[cfg(feature = "probe-resume")]
+pub mod probe {
+    use super::*;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    #[derive(Default, Debug)]
+    pub struct Reads {
+        pub scans: usize,
+        pub heads: Vec<SessionRef>,
+        pub states: Vec<SessionRef>,
+    }
+    type Counters = Arc<Mutex<Reads>>;
+    fn active() -> &'static Mutex<HashMap<PathBuf, Counters>> {
+        static ACTIVE: OnceLock<Mutex<HashMap<PathBuf, Counters>>> = OnceLock::new();
+        ACTIVE.get_or_init(Default::default)
+    }
+    pub struct Probe(PathBuf, Counters);
+    impl Probe {
+        pub fn new() -> Self {
+            let home = crate::env::Env::current().cv_home().expect("isolated catalog home");
+            let reads = Arc::new(Mutex::new(Reads::default()));
+            assert!(active().lock().unwrap().insert(home.clone(), reads.clone()).is_none());
+            Self(home, reads)
+        }
+        pub fn take(&self) -> Reads {
+            std::mem::take(&mut *self.1.lock().unwrap())
+        }
+    }
+    impl Default for Probe {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            active().lock().unwrap().remove(&self.0);
+        }
+    }
+    pub(super) fn note(f: impl FnOnce(&mut Reads)) {
+        let Some(home) = crate::env::Env::current().cv_home() else {
+            return;
+        };
+        let reads = active().lock().unwrap().get(&home).cloned();
+        if let Some(reads) = reads {
+            f(&mut reads.lock().unwrap());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(feature = "sqlite")]
+    fn demanded_head_uses_the_exact_key_and_rejects_invalid_identity() {
+        let world = cv_testkit::World::in_process("resume-head", crate::env::Env::enter_isolated);
+        let path = world.base.join("session.jsonl");
+        std::fs::write(&path, b"line\n").unwrap();
+        let r = SessionRef::new("selected", crate::Harness::Claude, path.clone());
+        let cp = Checkpoint::new(5);
+        let head = MarkHead::of(&path, &cp, "v1").unwrap();
+        update(&[MarkUpdate {
+            session: r.clone(),
+            mark: Some((head.clone(), cp.clone())),
+        }]);
+        let reader = Reader::default();
+        assert_eq!(reader.head(&r), Some(head.clone()));
+        assert_eq!(MarkTable::load().get(&r), Some(&head));
+        assert!(reader.state(&r, &head).is_some());
+        for other in [
+            SessionRef {
+                id: "other".into(),
+                ..r.clone()
+            },
+            SessionRef {
+                harness: crate::Harness::Codex,
+                ..r.clone()
+            },
+            SessionRef {
+                path: world.base.join("other.jsonl"),
+                ..r.clone()
+            },
+        ] {
+            assert!(reader.head(&other).is_none(), "{other:?}");
+        }
+        let conn = crate::catalog::open_db().unwrap();
+        // A head query neither decodes checkpoint state nor rejects a usable head because the
+        // state is broken; state admission remains a separate, guarded read.
+        conn.execute("UPDATE resume_marks SET state='not a checkpoint'", [])
+            .unwrap();
+        assert_eq!(reader.head(&r), Some(head.clone()));
+        assert!(reader.state(&r, &head).is_none());
+        for identity in [None, Some("broken"), Some("[1]")] {
+            conn.execute("UPDATE resume_marks SET identity=?1", [identity]).unwrap();
+            assert!(reader.head(&r).is_none(), "{identity:?}");
+        }
+        update(&[MarkUpdate {
+            session: r.clone(),
+            mark: None,
+        }]);
+        assert!(reader.head(&r).is_none());
+    }
 
     /// Sampling an open transcript must not move its reader or any cloned handle.
     #[test]
@@ -351,6 +476,9 @@ mod tests {
 pub struct Reader;
 #[cfg(not(feature = "sqlite"))]
 impl Reader {
+    pub fn head(&self, _: &SessionRef) -> Option<MarkHead> {
+        None
+    }
     pub fn state(&self, _: &SessionRef, _: &MarkHead) -> Option<Checkpoint> {
         None
     }

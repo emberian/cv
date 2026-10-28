@@ -35,6 +35,7 @@ semantic = ["dep:model2vec-rs", "dep:hf-hub"]
 probe-heap = []
 
 [dev-dependencies]
+cv-core = { path = "../cv-core", version = "0.18.0", package = "clustervision-core", features = ["probe-resume"] }
 dirs.workspace = true
 cv-testkit = { path = "../cv-testkit" }
 rusqlite.workspace = true
