@@ -6,7 +6,9 @@
 //! through the same chunking the index writes ([`index_session`]) into a private in-memory
 //! index on disk, from the session's resume mark when it grew (its unread suffix) and whole otherwise:
 //! `cv index` takes marks at chunk boundaries (every 4 MiB of indexed text, or 32 MiB of source)
-//! and where each read ended, so only what was appended since is read.
+//! and where each read ended, so only what was appended since is read. A session is judged under
+//! the path the index read it by when the search's discovery spells the same file another way
+//! ([`as_indexed`]): which spelling a process discovers depends on its environment, not the file.
 //! The private index lives in a temporary directory removed with it, so its heap is the writer's
 //! arena whatever the read covers. Nothing else is written: no index, catalog, mark or count;
 //! `--frozen` reads nothing live.
@@ -336,6 +338,7 @@ fn plan(
         let Some(adapter) = cv_core::harness::for_harness(r.harness) else {
             continue;
         };
+        let r = &*as_indexed(r, &metadata);
         let source = probe.snapshot(r);
         let fresh = Freshness::of(&existing, &metadata, &dependencies, &mut probe, r, &prov, &source);
         newest_on_disk = newest_on_disk.max(fresh.mtime);
@@ -368,6 +371,43 @@ fn plan(
     }
     suffix.behind_ns = newest_on_disk.saturating_sub(newest_indexed);
     Ok(pending)
+}
+
+/// `r` under the path the index read it by, when that path is another spelling of the same file.
+///
+/// Discovery spells a session's path from the caller's environment: `$CLAUDE_CONFIG_DIR/projects`
+/// is a symlink to `~/.claude/projects` on a host that gives each agent its own config dir, and
+/// a `$CODEX_HOME` can hold hard links to `~/.codex/sessions`. A search run under one spelling
+/// (an agent's `cv mcp`) beside an index written under another (a timer's `cv index`) would judge
+/// every such session stale, since its docs, source record and mark are keyed by the indexed
+/// path, and reread each one whole on every query. The same file (device and inode) is the same
+/// session: it is judged, and when grown resumed, as the index keys it. A different file under
+/// another path (a copy, a move) is not, and is read as it is.
+fn as_indexed<'r>(
+    r: &'r cv_core::SessionRef,
+    metadata: &HashMap<String, DiscoveryMetadata>,
+) -> std::borrow::Cow<'r, cv_core::SessionRef> {
+    use std::borrow::Cow;
+    let Some(indexed) = metadata.get(&r.id).map(|m| &m.session) else {
+        return Cow::Borrowed(r);
+    };
+    if indexed.path == r.path || indexed.harness != r.harness || !same_file(&indexed.path, &r.path) {
+        return Cow::Borrowed(r);
+    }
+    Cow::Owned(cv_core::SessionRef {
+        path: indexed.path.clone(),
+        ..r.clone()
+    })
+}
+
+/// Whether two paths name one file: its device and inode (on Unix; elsewhere, one canonical path).
+fn same_file(a: &Path, b: &Path) -> bool {
+    if cfg!(unix) {
+        let id = |p| cv_core::source::FileId::at(p).map(|id| (id.dev, id.ino));
+        id(a).is_some_and(|a| Some(a) == id(b))
+    } else {
+        std::fs::canonicalize(a).is_ok_and(|a| std::fs::canonicalize(b).is_ok_and(|b| a == b))
+    }
 }
 
 /// Read one pending session into the live index: from its mark when the adapter takes it, else

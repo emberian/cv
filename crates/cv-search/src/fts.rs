@@ -8581,6 +8581,70 @@ mod tests {
         assert_eq!(suffix.stale, 0);
     }
 
+    /// A search discovers a session under the spelling of its own environment: an agent's
+    /// `$CLAUDE_CONFIG_DIR/projects` symlinked to `~/.claude/projects`, a `$CODEX_HOME` of hard
+    /// links. Another spelling of the file the index read is that session: unchanged, it costs no
+    /// live read; grown, only its suffix. A copy under another path is another file, read whole.
+    #[cfg(unix)]
+    #[test]
+    fn another_spelling_of_an_indexed_file_reads_only_its_suffix() {
+        let _home = IsolatedHome::new();
+        let (dir, sdir, links) = (tmpdir(), tmpdir(), tmpdir());
+        let msgs: Vec<_> = (0..40)
+            .map(|i| ("user", format!("seed alpha {i} {}", "padding text ".repeat(12))))
+            .collect();
+        let msgs: Vec<_> = msgs.iter().map(|(r, t)| (*r, t.as_str())).collect();
+        let p = write_claude_msgs(&sdir, "grow", &msgs);
+        // Linked before indexing: a new hard link moves the inode's ctime, which the index's
+        // source record holds.
+        let symlinked = links.join("config");
+        std::os::unix::fs::symlink(&*sdir, &symlinked).unwrap();
+        let hard = links.join("hard.jsonl");
+        std::fs::hard_link(&p, &hard).unwrap();
+        let indexed = sref("grow", "one", p.clone());
+        sweep(&dir, vec![indexed.clone()], false, false).unwrap();
+        let mark = cv_core::resume::MarkTable::load()
+            .get(&indexed)
+            .cloned()
+            .expect("a mark");
+        let spellings = [
+            sref("grow", "one", symlinked.join("grow.jsonl").display().to_string()),
+            sref("grow", "one", hard.display().to_string()),
+        ];
+
+        for spelled in &spellings {
+            let (_, suffix) = suffix_search(&dir, "alpha", LiveRead::All, std::slice::from_ref(spelled));
+            assert_eq!(
+                (suffix.stale, suffix.read, suffix.bytes),
+                (0, 0, 0),
+                "an unchanged session is read live under no spelling: {spelled:?}"
+            );
+        }
+
+        append_claude(&p, "grow", 3, "zanzibar");
+        let len = std::fs::metadata(&p).unwrap().len();
+        for spelled in &spellings {
+            let (hits, suffix) = suffix_search(&dir, "zanzibar", LiveRead::All, std::slice::from_ref(spelled));
+            assert_eq!(hits.iter().map(|h| h.0.as_str()).collect::<Vec<_>>(), ["grow"]);
+            assert_eq!((suffix.stale, suffix.read, suffix.resumed), (1, 1, 1), "{spelled:?}");
+            assert_eq!(
+                suffix.bytes,
+                len - mark.offset(),
+                "a grown session costs its suffix under any spelling: {spelled:?}"
+            );
+        }
+
+        let copy = links.join("copy.jsonl");
+        std::fs::copy(&p, &copy).unwrap();
+        let copied = sref("grow", "one", copy.display().to_string());
+        let (_, suffix) = suffix_search(&dir, "zanzibar", LiveRead::All, std::slice::from_ref(&copied));
+        assert_eq!(
+            (suffix.stale, suffix.read, suffix.resumed, suffix.bytes),
+            (1, 1, 0, len),
+            "a copy is another file and is read whole"
+        );
+    }
+
     #[test]
     fn the_budget_cuts_a_delta_too_large_and_the_footer_names_it() {
         let _home = IsolatedHome::new();
