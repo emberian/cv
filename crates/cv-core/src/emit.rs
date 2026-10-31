@@ -587,15 +587,35 @@ pub(crate) fn validate_native_source(session: &Session, target: Harness, thinkin
     Ok(())
 }
 
+/// A prepared read of a live append-only transcript that grew while it was read: the session
+/// as it stood at message `messages`, byte offset `read`; the file is `now` bytes long since.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct Grown {
+    pub messages: usize,
+    pub read: u64,
+    pub now: u64,
+}
+
+impl std::fmt::Display for Grown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "as of message {} / byte offset {}; the source has grown since ({} bytes now)",
+            self.messages, self.read, self.now
+        )
+    }
+}
+
 /// Prepare a full-fidelity message window, retaining the source guards used by native emission.
 /// The stream continues through EOF for final metadata and the original message count. Indices
-/// match ordinary full parsing, rather than format-complete carrier parsing.
+/// match ordinary full parsing, rather than format-complete carrier parsing. A live source that
+/// grew meanwhile yields the prefix read, and [`Grown`] says where it stopped.
 pub fn prepare_selected(
     adapter: &dyn crate::harness::Adapter,
     reference: &SessionRef,
     start: usize,
     end: Option<usize>,
-) -> Result<(Session, usize)> {
+) -> Result<(Session, usize, Option<Grown>)> {
     let mut options = Demand::RICH;
     options.spans = true;
     prepare::selected(adapter, reference, &options, start, end)
@@ -610,20 +630,23 @@ pub fn parse_for_emit(
     reference: &SessionRef,
     target: Harness,
 ) -> Result<Session> {
+    Ok(prepare_for_emit(adapter, reference, target)?.0)
+}
+
+/// [`parse_for_emit`], with where a checked read of a live source stopped ([`Grown`]).
+pub fn prepare_for_emit(
+    adapter: &dyn crate::harness::Adapter,
+    reference: &SessionRef,
+    target: Harness,
+) -> Result<(Session, Option<Grown>)> {
     let mut options = ParsedAt::for_port(reference.harness, target).demand();
-    let checked = emitter_for(target).is_ok();
-    if checked {
+    if emitter_for(target).is_ok() {
         options.spans = true;
+        return prepare::parse(adapter, reference, &options);
     }
-    let mut session = if checked {
-        prepare::parse(adapter, reference, &options)?
-    } else {
-        crate::stream::collect_with(adapter, reference, &options)?
-    };
-    if !checked {
-        session.materialize()?;
-    }
-    Ok(session)
+    let mut session = crate::stream::collect_with(adapter, reference, &options)?;
+    session.materialize()?;
+    Ok((session, None))
 }
 
 #[cfg(test)]

@@ -520,7 +520,10 @@ pub(crate) fn cmd_splice(args: SpliceArgs<'_>) -> Result<()> {
     for sp in &parsed {
         let (reference, adapter) = crate::cmd::distill::resolve_source(&sp.id, None)?;
         first_path.get_or_insert_with(|| reference.path.clone());
-        let (session, total) = cv_core::emit::prepare_selected(adapter.as_ref(), &reference, sp.start, sp.end)?;
+        let (session, total, grown) = cv_core::emit::prepare_selected(adapter.as_ref(), &reference, sp.start, sp.end)?;
+        if let Some(grown) = grown {
+            eprintln!("  ↳ {}: read {grown}", short_id(&reference.id));
+        }
         composition.push(session, total, sp.start, sp.end);
     }
     let to_h = match &harness {

@@ -458,7 +458,9 @@ fn prune_session_after_stage(
     let source = crate::json::JsonSource::capture(src_path)?;
     let file = std::fs::File::open(src_path)?;
     source.check_metadata(file.metadata()?)?;
-    let original_size = file.metadata()?.len();
+    // The captured length, not the file's: a live transcript appended to since is pruned as it
+    // stood at capture, and its growth is reported below.
+    let original_size = source.len();
     let mut lines = Vec::new();
     let mut parsed = Vec::new();
     let mut tool_names = HashMap::new();
@@ -876,6 +878,12 @@ fn prune_session_after_stage(
         }
     }
 
+    let now = file.metadata()?.len();
+    if now > original_size {
+        warnings.push(format!(
+            "read as of byte offset {original_size}; the source has grown since ({now} bytes now)"
+        ));
+    }
     Ok(PruneResult {
         source_id,
         parent_session_id,

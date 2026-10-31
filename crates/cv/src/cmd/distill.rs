@@ -18,6 +18,7 @@
 use crate::util::{parse_harness, report, resolve, short_id, usage};
 use anyhow::{bail, Context, Result};
 use cv_core::distill::{distill_pack, findings, prepare_distill, DistillOptions, Distilled, PreparedDistillation};
+use cv_core::emit::Grown;
 use cv_core::harness::claude::sidecar;
 use cv_core::ir::{Harness, Session, SessionRef};
 use cv_core::{EmitOptions, SidechainOf};
@@ -92,24 +93,28 @@ fn load(spec: &str, harness: Option<Harness>) -> Result<(Session, PathBuf)> {
     Ok((s, path))
 }
 
+/// A distill source: the session read, its transcript's path, and where a read of a live
+/// transcript stopped.
+type Loaded = (Session, PathBuf, Option<Grown>);
+
 /// Checked full-fidelity bodies with EOF metadata, owned only when a distill product demands them.
-fn load_distill(spec: &str, harness: Option<Harness>) -> Result<(Session, PathBuf)> {
+fn load_distill(spec: &str, harness: Option<Harness>) -> Result<Loaded> {
     let (reference, adapter) = resolve_source(spec, harness)?;
-    let (mut session, _) = cv_core::emit::prepare_selected(adapter.as_ref(), &reference, 0, None)?;
+    let (mut session, _, grown) = cv_core::emit::prepare_selected(adapter.as_ref(), &reference, 0, None)?;
     enrich_path_meta(&mut session, Path::new(spec));
-    Ok((session, reference.path))
+    Ok((session, reference.path, grown))
 }
 
 /// Selected prefix with full EOF metadata and original-count validation. Other load callers
 /// retain their existing full-session contract.
-fn load_upto(spec: &str, harness: Option<Harness>, upto: usize) -> Result<(Session, PathBuf)> {
+fn load_upto(spec: &str, harness: Option<Harness>, upto: usize) -> Result<Loaded> {
     let (reference, adapter) = resolve_source(spec, harness)?;
-    let (mut session, total) = cv_core::emit::prepare_selected(adapter.as_ref(), &reference, 0, Some(upto))?;
+    let (mut session, total, grown) = cv_core::emit::prepare_selected(adapter.as_ref(), &reference, 0, Some(upto))?;
     if upto == 0 || upto > total {
         return usage(format!("--upto {upto}: the session has {total} messages"));
     }
     enrich_path_meta(&mut session, Path::new(spec));
-    Ok((session, reference.path))
+    Ok((session, reference.path, grown))
 }
 
 /// Findings retain checked bodies for the shared analyzer rather than owning discarded history.
@@ -335,7 +340,7 @@ pub(crate) fn cmd_distill(
     if let Some(path) = &pack {
         crate::util::user_file_claim(path, force)?;
     }
-    let (s, src_path) = match upto {
+    let (s, src_path, grown) = match upto {
         Some(n) => load_upto(spec, want, n)?,
         None => load_distill(spec, want)?,
     };
@@ -352,6 +357,9 @@ pub(crate) fn cmd_distill(
         Products::Pack(d) => d,
         Products::Resume(prepared) => &mut prepared.distilled,
     };
+    if let Some(grown) = &grown {
+        d.note_grown(grown);
+    }
     for other in with {
         let o = load_findings(other)?;
         d.append_findings(&findings(&o, &opts)?);
@@ -366,15 +374,18 @@ pub(crate) fn cmd_distill(
         }
     };
     let mut h = report_text(&d, &emitted);
+    if let Some(grown) = &grown {
+        let _ = writeln!(h, "  ↳ read {grown}");
+    }
     if let Some(p) = &pack {
         crate::util::write_user_file(p, d.pack().as_bytes(), force)?;
         let _ = writeln!(h, "  ↳ pack {}", p.display());
     }
-    report(
-        json_out,
-        &h,
-        &json!({"stats": d.stats, "emitted": emitted, "pack_path": pack}),
-    )?;
+    let mut out = json!({"stats": d.stats, "emitted": emitted, "pack_path": pack});
+    if let Some(grown) = grown {
+        out["grown"] = json!(grown);
+    }
+    report(json_out, &h, &out)?;
     if !json_out && pack.is_none() && matches!(target, Target::PackOnly) {
         print!("{}", d.pack());
     }
@@ -445,7 +456,7 @@ mod tests {
         relative.push(path.strip_prefix("/")?);
         for spec in [relative.to_str().unwrap(), path.to_str().unwrap()] {
             let (expected, old_path) = load(spec, None)?;
-            let (actual, new_path) = load_distill(spec, None)?;
+            let (actual, new_path, _) = load_distill(spec, None)?;
             assert_eq!(old_path, Path::new(spec));
             assert_eq!(new_path, old_path);
             assert_eq!(serde_json::to_value(&actual)?, serde_json::to_value(&expected)?);
@@ -562,7 +573,7 @@ mod tests {
             for n in [1, full.messages.len()] {
                 let mut expected = full.clone();
                 expected.messages.truncate(n);
-                let (actual, _) = load_upto(spec, Some(harness), n)?;
+                let (actual, _, _) = load_upto(spec, Some(harness), n)?;
                 assert_eq!(
                     serde_json::to_value(actual)?,
                     serde_json::to_value(expected)?,
@@ -599,7 +610,7 @@ mod tests {
         for n in [1, 3, 9] {
             let mut expected = full.clone();
             expected.messages.truncate(n);
-            let (actual, actual_path) = load_upto(spec, None, n)?;
+            let (actual, actual_path, _) = load_upto(spec, None, n)?;
             assert_eq!(actual_path, original_path);
             assert_eq!(serde_json::to_value(&actual)?, serde_json::to_value(&expected)?);
             let opts = DistillOptions::default();

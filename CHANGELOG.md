@@ -2,6 +2,7 @@
 
 ## Unreleased
 - `cv prune --plan <plan.json>` replaces size/age snipping with a per-result plan (keep, précis, excerpt) and drops attachment kinds; originals stay retrievable with `cv cat`.
+- Reshaping a live, growing transcript publishes the prefix read, noting "as of message N / byte offset O"; a rewritten prefix still refuses.
 
 ## 0.18.0 — 2026-10-23 — the release an agent can trust
 ClusterVision 0.18.0 is the release an agent can trust. Every listing, count and search answer

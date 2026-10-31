@@ -19,7 +19,7 @@ use cv_core::EmitOptions;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use cv_core::emit::parse_for_emit;
+use cv_core::emit::prepare_for_emit;
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn cmd_port(
@@ -44,7 +44,7 @@ pub(crate) fn cmd_port(
             skills_policy.as_str()
         ));
     }
-    let session = parse_for_emit(adapter.as_ref(), &r, to_h)?;
+    let (session, grown) = prepare_for_emit(adapter.as_ref(), &r, to_h)?;
     let thinking = thinking.unwrap_or_else(|| {
         cv_core::emit::ThinkingMode::replay_default(
             session
@@ -67,6 +67,9 @@ pub(crate) fn cmd_port(
             ..Default::default()
         },
     )?;
+    if let Some(grown) = grown {
+        println!("  ↳ read {grown}");
+    }
 
     if skills_policy != SkillsPolicy::Keep {
         use cv_core::harness::claude::skills::{config_dir_of, rewrite_file};

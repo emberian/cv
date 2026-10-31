@@ -1126,27 +1126,38 @@ pub fn unchanged_from(r: &SessionRef, primary: &Path, baseline: &Baseline) -> bo
 /// [`unchanged_from`] on the publishing transaction's one probe: its rows' shared files are
 /// stat'ed once, after every pass it publishes.
 pub(crate) fn unchanged_with(r: &SessionRef, primary: &Path, baseline: &Baseline, probe: &mut Probe) -> bool {
-    if baseline.primary.is_none() || probe.entry(primary).and_then(|entry| entry.state) != baseline.primary {
-        return false;
+    admitted_with(r, primary, baseline, false, probe).is_some()
+}
+
+/// [`unchanged_from`] for a pass over an append-only primary's prefix: the primary may also have
+/// grown (the same file, no shorter), its read bytes held by the append-only entry `baseline`'s
+/// reads keep for it ([`ReadSet::record_append_only`]); every other input as captured. The
+/// primary's length now, when admitted.
+pub fn grown_from(r: &SessionRef, primary: &Path, baseline: &Baseline) -> Option<u64> {
+    admitted_with(r, primary, baseline, true, &mut Probe::default())
+}
+
+fn admitted_with(r: &SessionRef, primary: &Path, baseline: &Baseline, grows: bool, probe: &mut Probe) -> Option<u64> {
+    let then = baseline.primary?;
+    let now = probe.entry(primary).and_then(|entry| entry.state)?;
+    let grown = now != then;
+    if grown && !(grows && (now.dev, now.ino) == (then.dev, then.ino) && now.len >= then.len) {
+        return None;
     }
-    let Some(stamp) = baseline.stamp.as_ref() else {
-        return false;
-    };
-    let Some(now) = probe.dependency_entries(r, primary) else {
-        return false;
-    };
+    let stamp = baseline.stamp.as_ref()?;
+    let current = probe.dependency_entries(r, primary)?;
     // Directory enumeration is complete. Only metadata probes are needed for dynamic reads;
     // release path lists before parsing the captured inventory's owned paths.
     probe.directories.clear();
-    let (Some(entries), Some(reads)) = (stamp.entries(), stamp.reads()) else {
-        return false;
-    };
-    let same = entries == now;
+    let (entries, reads) = (stamp.entries()?, stamp.reads()?);
+    let same = entries == current;
     drop(entries);
-    drop(now);
-    same && reads
-        .as_ref()
-        .is_none_or(|reads| reads.iter().all(|entry| entry.holds(probe)))
+    drop(current);
+    // A grown primary is admitted only where the read set samples it as append-only.
+    let reads = reads.unwrap_or_default();
+    let sampled = !grown
+        || absolute(primary).is_some_and(|path| reads.iter().any(|entry| entry.path == path && entry.grows.is_some()));
+    (same && sampled && reads.iter().all(|entry| entry.holds(probe))).then_some(now.len)
 }
 
 pub type Update = (SessionRef, Baseline);
