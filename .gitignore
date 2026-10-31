@@ -18,3 +18,4 @@ __pycache__/
 # sqlite sidecars a reader leaves next to a corpus store; the store itself is the record
 crates/cv-core/tests/corpus/**/*-wal
 crates/cv-core/tests/corpus/**/*-shm
+.agy/
