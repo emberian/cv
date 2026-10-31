@@ -947,6 +947,82 @@ fn prune_drop_thinking_omits_blocks_and_keeps_them_retrievable() {
     assert!(cat.contains("weighing the options"), "{cat}");
 }
 
+/// `--plan`: a précis and an excerpt come back whole through `cv cat`; a plan that does not fit
+/// the session, or does not parse, exits 2 and writes nothing.
+#[test]
+fn prune_plan_precis_and_excerpt_round_trip_through_cat() {
+    let w = World::new("pruneplan");
+    let record = |uuid: &str, parent: Option<&str>, role: &str, content: serde_json::Value| {
+        serde_json::json!({"type": role, "uuid": uuid, "parentUuid": parent, "sessionId": "plansrc",
+            "timestamp": "2026-01-01T10:00:00Z", "cwd": "/work/proj",
+            "message": {"role": role, "model": "claude-opus-5", "content": content}})
+    };
+    let call =
+        |id: &str| serde_json::json!([{"type": "tool_use", "id": id, "name": "Bash", "input": {"command": "make"}}]);
+    let result =
+        |id: &str, text: &str| serde_json::json!([{"type": "tool_result", "tool_use_id": id, "content": text}]);
+    let log: String = (0..300).map(|i| format!("step {i} compiled\n")).collect();
+    let source = w.write_session(
+        "plansrc",
+        &[
+            record("u1", None, "user", serde_json::json!("build it")),
+            record("a1", Some("u1"), "assistant", call("t1")),
+            record("u2", Some("a1"), "user", result("t1", &log)),
+            record("a2", Some("u2"), "assistant", call("t2")),
+            record("u3", Some("a2"), "user", result("t2", &log)),
+        ],
+    );
+    let plan = w.base.join("plan.json");
+    fs::write(
+        &plan,
+        serde_json::json!({"results": {
+            "t1": {"action": "precis", "precis": "300 steps compiled"},
+            "t2": {"action": "excerpt", "precis": "the build", "keep": ["step 299 compiled", "step 7 compiled"]}}})
+        .to_string(),
+    )
+    .unwrap();
+    let plan_s = plan.to_str().unwrap();
+    let (out, _) = w.cv_ok(&["prune", "plansrc", "--plan", plan_s, "--json"]);
+    let report: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(report["plan"]["precis"], 1, "{report}");
+    assert_eq!(report["plan"]["excerpt"], 1, "{report}");
+    let new_id = report["new_id"].as_str().unwrap();
+    let text = fs::read_to_string(source.with_file_name(format!("{new_id}.jsonl"))).unwrap();
+    assert!(text.contains("\\n300 steps compiled\""), "{text}");
+    assert!(
+        text.contains("\\nthe build\\n[…]\\nstep 7 compiled\\n[…]\\nstep 299 compiled\""),
+        "{text}"
+    );
+    for id in ["t1", "t2"] {
+        let (cat, _) = w.cv_ok(&["cat", new_id, id]);
+        assert_eq!(cat.trim_end(), log.trim_end(), "cv cat {id} returns the original");
+    }
+
+    let bad = w.base.join("bad.json");
+    fs::write(
+        &bad,
+        serde_json::json!({"results": {"t2": {"action": "excerpt", "keep": ["step 301 compiled"]}, "t9": {"action": "keep"}}})
+            .to_string(),
+    )
+    .unwrap();
+    let before = fs::read_dir(source.parent().unwrap()).unwrap().count();
+    let (ok, code, _, err) = w.cv(&["prune", "plansrc", "--plan", bad.to_str().unwrap()]);
+    assert!(!ok && code == 2, "{err}");
+    assert!(
+        err.contains("t2: kept passage is not in the payload: \"step 301 compiled\""),
+        "{err}"
+    );
+    assert!(err.contains("t9: no tool_result with this id"), "{err}");
+    assert_eq!(
+        fs::read_dir(source.parent().unwrap()).unwrap().count(),
+        before,
+        "nothing written"
+    );
+    fs::write(&bad, r#"{"results": {"t1": {"action": "summarize"}}}"#).unwrap();
+    let (ok, code, _, err) = w.cv(&["prune", "plansrc", "--plan", bad.to_str().unwrap()]);
+    assert!(!ok && code == 2 && err.contains("--plan"), "{err}");
+}
+
 #[test]
 fn prune_json_emits_machine_readable_report() {
     let w = World::new("prunejson");

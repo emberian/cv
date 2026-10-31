@@ -582,6 +582,14 @@ enum Cmd {
         /// Restored Claude skills: keep all, drop all, or drop entries whose files changed or disappeared.
         #[arg(long = "skills", value_parser = ["keep", "drop", "drop-stale"], default_value = "keep")]
         skills: String,
+        /// Decide tool results by a plan file instead of --min-size/--keep-last: `{"results":
+        /// {"<tool_use_id>": {"action": "keep" | "precis" | "excerpt", "precis": "…", "keep":
+        /// ["literal passage", …]}}, "attachments": {"drop_kinds": ["hook_success", …]}}`. Only
+        /// planned results change; a précis or excerpt follows the usual marker and `cv cat` returns
+        /// the original. Dropped attachments are stashed by record uuid. A plan naming unknown ids,
+        /// or passages not in their payload, is refused (exit 2) before anything is written.
+        #[arg(long, value_name = "PATH", conflicts_with = "min_size")]
+        plan: Option<PathBuf>,
         /// Report what would be pruned without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -1440,13 +1448,14 @@ fn run() -> Result<()> {
             declassify_tokens,
             declassify_tokens_file,
             skills,
+            plan,
             dry_run,
             json,
         } => {
             reshape::cmd_prune(reshape::PruneArgs {
                 id: &id, harness, min_size, keep_last, to, force, drop, thinking: drop_thinking,
                 copy_resources, revive: !no_revive, window, keep, declassify,
-                declassify_tokens, declassify_tokens_file, skills_policy: skills.parse()?, dry_run, json,
+                declassify_tokens, declassify_tokens_file, skills_policy: skills.parse()?, plan, dry_run, json,
             })
         }
         Cmd::Rewind {

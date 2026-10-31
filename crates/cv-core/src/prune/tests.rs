@@ -54,7 +54,7 @@ fn fixture_decisions(lines: &[Value]) -> Vec<Option<Decision>> {
     .map(|row| {
         let (range, _) = row.unwrap();
         let read = source.read(ReadInput::Range(range.offset, range.len), Validation::Value, |v| {
-            decide(v, range, &options, &mut tools)
+            decide(v, range, &options, &mut tools, &mut PlanCheck::default())
         });
         Some(read.unwrap())
     })
@@ -1840,7 +1840,14 @@ fn linked_tool_input_projection_matches_frozen_owned_lookup() -> Result<()> {
     };
     let mut tools = HashMap::new();
     source.read(ReadInput::Range(0, range.len), Validation::Value, |view| {
-        decide(view, range, &PruneOptions::default(), &mut tools).map(|_| ())
+        decide(
+            view,
+            range,
+            &PruneOptions::default(),
+            &mut tools,
+            &mut PlanCheck::default(),
+        )
+        .map(|_| ())
     })?;
     assert_eq!(
         source_tool_metadata(&source, Some("duplicate"), &tools)?,

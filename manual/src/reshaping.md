@@ -21,6 +21,14 @@ path): same transcript, bulky old tool payloads lifted into a sidecar, written a
 session under a new id. It never plants the result under a live parent; `cv adopt` moves child
 transcripts between parents.
 
+`cv prune --plan <plan.json>` takes the choice of payloads from a judge (a rewound copy of the
+session, say) instead of `--min-size`/`--keep-last`. Each listed `tool_use_id` is `keep`, `precis`
+(the marker, then the précis) or `excerpt` (the précis, then literal passages of the payload in
+their order, between `[…]` lines); unlisted results stay verbatim, and `cv cat <new-id> <id>`
+returns every original. `attachments.drop_kinds` removes attachment records of those types,
+stashed by record uuid, their children relinked. An unknown id or a passage that is not in its
+payload refuses the whole plan (exit 2) before anything is written.
+
 ## How Claude Code stores a sub-agent
 
 ```

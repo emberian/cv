@@ -59,8 +59,18 @@ pub(crate) struct PruneArgs<'a> {
     pub declassify_tokens: Option<String>,
     pub declassify_tokens_file: Option<PathBuf>,
     pub skills_policy: SkillsPolicy,
+    pub plan: Option<PathBuf>,
     pub dry_run: bool,
     pub json: bool,
+}
+
+/// Read a `--plan` file; an unreadable or malformed plan is a usage error (exit 2).
+fn read_plan(path: &std::path::Path) -> Result<cv_core::prune::Plan> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) => return usage(format!("--plan {}: {e}", path.display())),
+    };
+    cv_core::prune::Plan::parse(&text).or_else(|e| usage(format!("--plan {}: {e}", path.display())))
 }
 
 pub(crate) fn cmd_prune(args: PruneArgs<'_>) -> Result<()> {
@@ -81,9 +91,11 @@ pub(crate) fn cmd_prune(args: PruneArgs<'_>) -> Result<()> {
         declassify_tokens,
         declassify_tokens_file,
         skills_policy,
+        plan,
         dry_run,
         json,
     } = args;
+    let plan = plan.as_deref().map(read_plan).transpose()?;
     let keep_range = keep.as_deref().map(parse_range).transpose()?;
     let declassify_tokens = resolve_declassify_tokens(declassify_tokens, declassify_tokens_file)?;
     if declassify && declassify_tokens.is_empty() {
@@ -116,11 +128,17 @@ pub(crate) fn cmd_prune(args: PruneArgs<'_>) -> Result<()> {
         declassify,
         declassify_tokens, // caller-supplied (external); cv ships no built-in list. min_hits from Default (2).
         skills_policy,
+        plan,
         dry_run,
         force,
         ..Default::default()
     };
-    let res = cv_core::prune::prune_session(r.harness, &r.path, &opts)?;
+    let res = cv_core::prune::prune_session(r.harness, &r.path, &opts).map_err(|e| match e
+        .downcast_ref::<cv_core::prune::PlanRefused>()
+    {
+        Some(refused) => crate::util::UsageError(refused.to_string()).into(),
+        None => e,
+    })?;
 
     let mut v = serde_json::to_value(&res)?;
     v["harness"] = r.harness.as_str().into();
@@ -193,6 +211,17 @@ pub(crate) fn cmd_prune(args: PruneArgs<'_>) -> Result<()> {
                 let _ = writeln!(h, "  revive: no recorded usage required an estimated-window rewrite");
             }
         }
+    }
+    if let Some(p) = &res.plan {
+        let _ = writeln!(
+            h,
+            "  plan: {} kept · {} précis · {} excerpt(s) · {} attachment(s) dropped · {} payload bytes removed",
+            p.keep,
+            p.precis,
+            p.excerpt,
+            p.attachments_dropped,
+            human_bytes(p.bytes_saved),
+        );
     }
     skills_line(&mut h, &res.skills);
     for w in &res.warnings {

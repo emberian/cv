@@ -108,6 +108,10 @@ pub struct PruneOptions {
     /// Which skills the new session restores at its next compaction or resume (see
     /// [`crate::harness::claude::skills`]). `Keep` (the default) copies the records as they are.
     pub skills_policy: SkillsPolicy,
+    /// `--plan`: the caller's judgment of each tool result and which attachment kinds to drop
+    /// ([`Plan`]). Replaces the `min_size`/`keep_last` payload snipping: only planned results
+    /// change. `--drop-thinking`, `--declassify`, windows and revive compose as without it.
+    pub plan: Option<Plan>,
     /// Compute and report without writing anything.
     pub dry_run: bool,
     /// Replace an existing `<new-id>.jsonl` (and its sidecar) by atomic rename. Without it, an
@@ -131,6 +135,7 @@ impl Default for PruneOptions {
             declassify_tokens: Vec::new(), // token-agnostic: caller supplies the terms (no baked-in list)
             declassify_min_hits: 2,
             skills_policy: SkillsPolicy::Keep,
+            plan: None,
             dry_run: false,
             force: false,
         }
@@ -182,6 +187,9 @@ pub struct PruneResult {
     /// What `skills_policy` dropped from the new session's restored skills.
     #[serde(skip_serializing_if = "SkillsReport::is_keep")]
     pub skills: SkillsReport,
+    /// `--plan`: what the plan changed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan: Option<PlanReport>,
     pub dry_run: bool,
 }
 
@@ -235,6 +243,12 @@ struct Decision {
     /// A tool payload (`toolUseResult` or a `tool_result` body) larger than `--min-size`.
     payload: bool,
     thinking: bool,
+    /// `--plan`: a tool result here gets a planned précis or excerpt.
+    planned: bool,
+    /// `--plan`: tool results here the plan keeps verbatim.
+    plan_keep: usize,
+    /// `--plan`: this attachment's kind is dropped (the kind).
+    drop_attachment: Option<String>,
 }
 
 impl Decision {
@@ -448,6 +462,7 @@ fn prune_session_after_stage(
     let mut lines = Vec::new();
     let mut parsed = Vec::new();
     let mut tool_names = HashMap::new();
+    let mut plan_check = PlanCheck::default();
     // Retain only decision facts; payload trees live for one record. Preserve the old global
     // trim_end contract (including whitespace-only trailing records) without copying the file.
     let mut line_no = 0usize;
@@ -463,7 +478,7 @@ fn prune_session_after_stage(
         // An empty line is blank like any JSON-whitespace row (a JSON range cannot be empty).
         let read = (range.len != 0).then(|| {
             source.read(ReadInput::Range(range.offset, range.len), Validation::Value, |view| {
-                decide(view, range, opts, &mut tool_names)
+                decide(view, range, opts, &mut tool_names, &mut plan_check)
             })
         });
         let facts = match read.transpose() {
@@ -516,6 +531,11 @@ fn prune_session_after_stage(
         bail!("{} holds no records; nothing to prune", src_path.display());
     }
     source.check()?;
+    // A plan that does not fit the session is refused before anything is staged.
+    let plan_warnings = match &opts.plan {
+        Some(plan) => plan_check.finish(plan)?,
+        None => Vec::new(),
+    };
 
     let source_id = parsed
         .iter()
@@ -584,7 +604,7 @@ fn prune_session_after_stage(
         keep_singletons.extend(last.into_values());
     }
     let mut dropped_turns = 0usize;
-    let mut warnings: Vec<String> = Vec::new();
+    let mut warnings: Vec<String> = plan_warnings;
     if overshoot {
         warnings.push(format!(
             "--window {}: the newest coherent tail EXCEEDS the requested budget — kept its required \
@@ -607,6 +627,9 @@ fn prune_session_after_stage(
     let mut image_blocks = 0usize;
     let mut est_tokens_saved = 0u64;
     let mut turn = 0usize;
+    let mut plan_report = opts.plan.as_ref().map(|_| PlanReport::default());
+    // `--plan` attachment drops: removed after staging with their children relinked.
+    let mut dropped_records: HashSet<String> = HashSet::new();
 
     for (idx, (facts, range)) in parsed.into_iter().zip(lines.iter()).enumerate() {
         let Some(facts) = facts else {
@@ -676,10 +699,41 @@ fn prune_session_after_stage(
 
         let needs_root = (subagent || (windowing && keep_start > 0)) && !rooted && facts.is_main_turn();
         rooted |= needs_root;
-        let may_prune = is_turn_line
-            && (opts.declassify
-                || (is_old && user && facts.payload)
-                || (is_old && assistant && opts.thinking && facts.thinking));
+        if let (Some(report), Some(kind)) = (plan_report.as_mut(), facts.drop_attachment.take()) {
+            // Stashed whole by uuid and staged as is; the removal pass takes it out and relinks.
+            let uuid = facts.facts.uuid.clone().unwrap_or_default();
+            if !opts.drop {
+                let record = SourcePayload {
+                    original: source.validated_range(range.offset, range.len)?,
+                    entry: SidecarEntry {
+                        id: uuid.clone(),
+                        slot: "record".into(),
+                        name: kind,
+                        input: Value::Null,
+                        content: Value::Null,
+                        size: usize::try_from(range.len)?,
+                        line_count: 1,
+                        kind: "text".into(),
+                    },
+                };
+                write_source_payload(&record, &mut sidecar_stage)?;
+                sidecar_count += 1;
+            }
+            dropped_records.insert(uuid);
+            report.attachments_dropped += 1;
+            report.bytes_saved += range.len + 1;
+            facts.est = Est::default();
+        }
+        // Under `--plan`, the plan alone picks results: every user line's, whatever its age.
+        let results = match &opts.plan {
+            Some(_) => user && facts.planned,
+            None => is_old && user && facts.payload,
+        };
+        if let Some(report) = plan_report.as_mut() {
+            report.keep += facts.plan_keep;
+        }
+        let may_prune =
+            is_turn_line && (opts.declassify || results || (is_old && assistant && opts.thinking && facts.thinking));
         let plan = if may_prune {
             source_turn_prune(
                 &source,
@@ -688,7 +742,7 @@ fn prune_session_after_stage(
                 &new_id,
                 idx,
                 &tool_names,
-                is_old && user,
+                if opts.plan.is_some() { results } else { is_old && user },
                 is_old && assistant && opts.thinking,
             )?
         } else {
@@ -709,6 +763,11 @@ fn prune_session_after_stage(
             pruned_count += plan.payloads.len();
             est_tokens_saved += plan.saved;
             image_blocks += plan.images;
+            if let Some(report) = plan_report.as_mut() {
+                report.precis += plan.planned.precis;
+                report.excerpt += plan.planned.excerpt;
+                report.bytes_saved += plan.planned.bytes_saved;
+            }
             if !opts.drop {
                 for payload in &plan.payloads {
                     write_source_payload(payload, &mut sidecar_stage)?;
@@ -732,8 +791,10 @@ fn prune_session_after_stage(
             &mut scan,
         )?;
         if opts.revive {
+            // A dropped attachment carries no marker, but its recorded span no longer holds it.
+            let found = scan.found || facts.facts.uuid.as_ref().is_some_and(|u| dropped_records.contains(u));
             output_facts.push(Some(facts));
-            output_pruned.push(scan.found);
+            output_pruned.push(found);
         }
     }
 
@@ -753,9 +814,12 @@ fn prune_session_after_stage(
     } else {
         (output, 0, None, None)
     };
-    // `--drop-thinking` empties thinking-only records; they go, their children relinked.
-    let output = if opts.thinking {
-        crate::harness::claude::replay::drop_empty_records(output)?.0.finish()?
+    // `--drop-thinking` empties thinking-only records and `--plan` drops attachments; they go,
+    // their children relinked.
+    let output = if opts.thinking || !dropped_records.is_empty() {
+        crate::harness::claude::replay::drop_records(output, opts.thinking, &dropped_records)?
+            .0
+            .finish()?
     } else {
         output
     };
@@ -831,6 +895,7 @@ fn prune_session_after_stage(
         revive_old_tokens,
         warnings,
         skills,
+        plan: plan_report,
         dry_run: opts.dry_run,
     })
 }
@@ -848,12 +913,14 @@ fn stage(destination: &Path, bytes: &ByteSource, mode: u32) -> Result<crate::pub
 
 /// One record's [`Decision`]: the codec's facts, the payload/thinking flags against `opts`, the
 /// estimate when `--window`/`--revive` will weigh it, and each assistant `tool_use` block's
-/// name and position into `tools` (results carry only the id).
+/// name and position into `tools` (results carry only the id). Under `--plan`, the record's
+/// results and attachment kind are checked against the plan in `check`.
 fn decide(
     view: crate::json::JsonView<'_>,
     range: Range,
     opts: &PruneOptions,
     tools: &mut HashMap<String, (String, Range, usize)>,
+    check: &mut PlanCheck,
 ) -> Result<Decision> {
     use crate::harness::store::document::Fields;
     let (facts, body) = Facts::parse(view)?;
@@ -863,6 +930,48 @@ fn decide(
         payload |= large(*result)?;
     }
     let thinking = facts.blocks.iter().any(|b| b.ty.as_deref() == Some("thinking"));
+    let (mut planned, mut plan_keep, mut drop_attachment) = (false, 0, None);
+    if let Some(plan) = &opts.plan {
+        if facts.ty == "user" {
+            for block in body
+                .content
+                .map(|c| c.array())
+                .transpose()?
+                .flatten()
+                .into_iter()
+                .flatten()
+            {
+                let Some(block) = Fields::parse(block?, &["type", "tool_use_id", "content"])? else {
+                    continue;
+                };
+                if block.string("type")?.as_deref() != Some("tool_result") {
+                    continue;
+                }
+                if let Some(id) = block.string("tool_use_id")? {
+                    let (replace, keep) = check.result(plan, &id, block.get("content"))?;
+                    planned |= replace;
+                    plan_keep += usize::from(keep);
+                }
+            }
+        } else if facts.ty == "attachment" && !plan.attachments.drop_kinds.is_empty() {
+            let kind = match view.get("attachment")? {
+                Some(attachment) => Fields::parse(attachment, &["type"])?
+                    .map(|a| a.string("type"))
+                    .transpose()?
+                    .flatten(),
+                None => None,
+            };
+            if let Some(kind) = kind.filter(|k| plan.attachments.drop_kinds.contains(k)) {
+                if facts.uuid.is_some() {
+                    drop_attachment = Some(kind);
+                } else {
+                    check
+                        .warnings
+                        .push(format!("a {kind} attachment has no uuid to stash it by; kept"));
+                }
+            }
+        }
+    }
     if facts.ty == "assistant" {
         for (index, block) in facts.blocks.iter().enumerate() {
             if let (Some("tool_use"), Some(id)) = (block.ty.as_deref(), &block.id) {
@@ -899,6 +1008,9 @@ fn decide(
         est,
         payload,
         thinking,
+        planned,
+        plan_keep,
+        drop_attachment,
     })
 }
 
@@ -1053,6 +1165,8 @@ struct SourcePrune {
     saved: u64,
     estimate: Est,
     images: usize,
+    /// `--plan`: the précis and excerpts among `payloads`, and the payload bytes they removed.
+    planned: PlanReport,
 }
 
 /// Compatibility test entry for the source user pass; turn composition uses the same planner.
@@ -1105,6 +1219,8 @@ fn source_turn_prune(
         let mut mirror_tuid = None;
         let mut omitted = HashSet::new();
         let mut kept_blocks = Vec::new();
+        let mut planned_report = PlanReport::default();
+        let mut planned_any = false;
         for (index, original_block) in blocks.into_iter().flatten().enumerate() {
             let original_block = original_block?;
             if opts.revive {
@@ -1182,6 +1298,18 @@ fn source_turn_prune(
                 mirror_base = Some(id.clone());
                 mirror_tuid = tuid.clone();
             }
+            // Under `--plan` only a planned précis or excerpt is replaced, whatever its size.
+            let planned = match &opts.plan {
+                Some(plan) => match plan.get(tuid.as_deref()) {
+                    Some(p @ (plan::Planned::Precis { .. } | plan::Planned::Excerpt { .. }))
+                        if matches!(plan::effect(&id, block.get("content"))?, plan::Effect::Replace) =>
+                    {
+                        Some(p)
+                    }
+                    _ => continue,
+                },
+                None => None,
+            };
             let Some(content) = block.get("content") else { continue };
             if content.is_null()? {
                 continue;
@@ -1195,10 +1323,11 @@ fn source_turn_prune(
                 Some(stats) => stats.bytes,
                 None => value_byte_size_source(content)?,
             };
-            if size <= opts.min_size
-                || stats
-                    .as_ref()
-                    .is_some_and(|stats| stats.prefix.starts_with(MARKER_PREFIX))
+            if planned.is_none()
+                && (size <= opts.min_size
+                    || stats
+                        .as_ref()
+                        .is_some_and(|stats| stats.prefix.starts_with(MARKER_PREFIX)))
             {
                 continue;
             }
@@ -1216,6 +1345,26 @@ fn source_turn_prune(
             }
             let (name, input) = source_tool_metadata(source, tuid.as_deref(), tools)?;
             let marker = build_marker(&id, &name, &input, &kind, size, line_count, new_id, opts.drop);
+            let marker = match planned {
+                Some(planned) => {
+                    let text = match planned {
+                        plan::Planned::Excerpt { .. } => match plan::payload_text(content)? {
+                            Ok(text) => Some(text),
+                            Err(kind) => bail!("{id}: an excerpt needs a text payload; this one is {kind}"),
+                        },
+                        _ => None,
+                    };
+                    let replaced = plan::replacement(&marker, planned, text.as_deref());
+                    match planned {
+                        plan::Planned::Excerpt { .. } => planned_report.excerpt += 1,
+                        _ => planned_report.precis += 1,
+                    }
+                    planned_report.bytes_saved += (size as u64).saturating_sub(replaced.len() as u64);
+                    planned_any = true;
+                    replaced
+                }
+                None => marker,
+            };
             saved += original_tokens.saturating_sub(str_tokens(&marker));
             images += img;
             let original = content.to_json()?;
@@ -1275,7 +1424,13 @@ fn source_turn_prune(
                     Some(stats) => stats.bytes,
                     None => value_byte_size_source(mirror)?,
                 };
-                if size > opts.min_size
+                // A planned result's mirror goes with it, whatever its size: the record must not
+                // carry the full text twice. Unplanned mirrors stay under `--plan`.
+                let eligible = match &opts.plan {
+                    Some(_) => planned_any,
+                    None => size > opts.min_size,
+                };
+                if eligible
                     && !stats
                         .as_ref()
                         .is_some_and(|stats| stats.prefix.starts_with(MARKER_PREFIX))
@@ -1286,6 +1441,9 @@ fn source_turn_prune(
                     let (name, input) = source_tool_metadata(source, mirror_tuid.as_deref(), tools)?;
                     let marker = build_marker(&id, &name, &input, kind, size, line_count, new_id, opts.drop);
                     let original = mirror.to_json()?;
+                    if planned_any {
+                        planned_report.bytes_saved += (size as u64).saturating_sub(marker.len() as u64);
+                    }
                     replacements.push((original.clone(), Value::String(marker)));
                     payloads.push(SourcePayload {
                         original,
@@ -1353,6 +1511,7 @@ fn source_turn_prune(
             saved,
             estimate,
             images,
+            planned: planned_report,
         }))
     })?;
     Ok(planned)
@@ -1957,6 +2116,9 @@ fn pin_usage(u: &mut serde_json::Map<String, Value>, honest: u64) {
 
 mod declassify;
 use declassify::source_declassify_stats;
+mod plan;
+use plan::PlanCheck;
+pub use plan::{Plan, PlanAttachments, PlanRefused, PlanReport, Planned};
 /// Snip the eligible payloads on one (old) user line, in place. `line_key` (the line's uuid or a
 /// file-position fallback) keys sidecar ids for blocks that carry no `tool_use_id` of their own.
 mod retrieve;
@@ -2115,3 +2277,7 @@ pub(crate) mod tests;
 #[cfg(test)]
 #[path = "prune/sidecar_tests.rs"]
 mod sidecar_tests;
+
+#[cfg(test)]
+#[path = "prune/plan_tests.rs"]
+mod plan_tests;
