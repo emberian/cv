@@ -191,6 +191,7 @@ go to stderr); with a terminal on stdin it exits 2 with usage. None scans the fl
 | `SessionStart` · `startup\|resume` | `cv hook start` | `additionalContext`: up to six of this directory's earlier sessions (id, age, messages, title, the last commit sha its transcript's tail shows) and the count of decisions owed |
 | `SubagentStart`, `SubagentStop` (`async`) | `cv hook lane` | nothing; appends `{ts, event, session_id, agent_id, agent_type, transcript_path, agent_transcript_path, cwd, last_text}` to `$CLUSTERVISION_HOME/lanes.jsonl` |
 | `UserPromptSubmit` | `cv hook decisions` | `additionalContext` only when `cv task inbox` has decisions owed to `$CV_ENDPOINT` (else `cv`): the count and the commands that answer them |
+| `PreToolUse` · every tool (opt-in: `cv hooks install --retired`) | `cv hook retired` | `permissionDecision: "deny"` when the calling sub-agent (`agent_id`) is retired in `$CLUSTERVISION_HOME/retired.jsonl` (written by `cv distill --agent-of`, listed and reversed by `cv retire`), telling it its successor and to end its turn; the same for a `SendMessage` whose `to` is retired, naming the successor to send to; nothing (allow) otherwise |
 | `PreToolUse` · `Edit\|Write` | `cv hook edit` | `permissionDecision: "ask"` with the session id and minutes since, when another session edited this exact path and its transcript changed in the last 30 minutes; nothing (allow) otherwise |
 
 - Hooks answer inside the harness's turn, so each reads at most 8 MiB of transcript (streaming

@@ -20,6 +20,7 @@ pub(crate) mod port;
 pub(crate) mod query;
 pub(crate) mod recipes;
 pub(crate) mod reshape;
+pub(crate) mod retire;
 pub(crate) mod schema;
 pub(crate) mod search;
 pub(crate) mod serve;

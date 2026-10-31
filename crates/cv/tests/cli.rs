@@ -2926,6 +2926,51 @@ fn distill_emits_a_whole_resumable_session_and_a_sub_agent() {
         body,
         "distill must never modify the source"
     );
+    // The replaced sub-agent is retired, its successor named; `--keep-source` and `--undo` leave
+    // or make it unretired.
+    assert_eq!(v["retired"]["agent_id"], "a0123456789abcdef", "{v}");
+    assert_eq!(v["retired"]["successor"], aid, "{v}");
+    let (list, _) = w.cv_ok(&["retire", "--json"]);
+    let rows: serde_json::Value = serde_json::from_str(list.trim()).unwrap();
+    assert_eq!(rows.as_array().unwrap().len(), 1, "{rows}");
+    assert_eq!(rows[0]["successor"], aid, "{rows}");
+    // The guard refuses the retired agent's own call and a SendMessage to it; a live agent's call passes.
+    let hook = |payload: serde_json::Value| w.cv_stdin(&["hook", "retired"], &payload.to_string()).2;
+    let tp = w.home.join(".claude/projects/-work-proj/rootsess.jsonl");
+    let tp = tp.to_str().unwrap();
+    let own = hook(
+        serde_json::json!({"session_id": "rootsess", "transcript_path": tp, "hook_event_name": "PreToolUse",
+        "agent_id": "a0123456789abcdef", "tool_name": "Bash", "tool_input": {"command": "git commit"}}),
+    );
+    let own: serde_json::Value = serde_json::from_str(own.trim()).expect("a deny");
+    assert_eq!(own["hookSpecificOutput"]["permissionDecision"], "deny", "{own}");
+    let why = own["hookSpecificOutput"]["permissionDecisionReason"].as_str().unwrap();
+    assert!(why.contains(aid) && why.contains("end your turn"), "{why}");
+    let send = hook(
+        serde_json::json!({"session_id": "rootsess", "transcript_path": tp, "hook_event_name": "PreToolUse",
+        "tool_name": "SendMessage", "tool_input": {"to": "a0123456789abcdef", "message": "go"}}),
+    );
+    let send: serde_json::Value = serde_json::from_str(send.trim()).expect("a deny");
+    assert_eq!(send["hookSpecificOutput"]["permissionDecision"], "deny", "{send}");
+    assert!(
+        send["hookSpecificOutput"]["permissionDecisionReason"]
+            .as_str()
+            .unwrap()
+            .contains(aid),
+        "{send}"
+    );
+    let live = hook(
+        serde_json::json!({"session_id": "rootsess", "transcript_path": tp, "hook_event_name": "PreToolUse",
+        "agent_id": aid, "tool_name": "SendMessage", "tool_input": {"to": "main", "message": "hi"}}),
+    );
+    assert!(live.trim().is_empty(), "the successor is not refused: {live}");
+    let (out, _) = w.cv_ok(&["retire", "--undo", "a0123456789abcdef"]);
+    assert!(out.contains("no longer retired"), "{out}");
+    let again = hook(
+        serde_json::json!({"session_id": "rootsess", "transcript_path": tp, "hook_event_name": "PreToolUse",
+        "agent_id": "a0123456789abcdef", "tool_name": "Bash", "tool_input": {"command": "ls"}}),
+    );
+    assert!(again.trim().is_empty(), "undone: {again}");
 
     // `--model` rewrites the new agent's meta `model`; it needs `--agent-of` (exit 2 without).
     let (out, _) = w.cv_ok(&[
@@ -2935,6 +2980,7 @@ fn distill_emits_a_whole_resumable_session_and_a_sub_agent() {
         "rootsess",
         "--model",
         "inherit",
+        "--keep-source",
         "--json",
     ]);
     let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
@@ -2944,6 +2990,7 @@ fn distill_emits_a_whole_resumable_session_and_a_sub_agent() {
     ));
     let meta: serde_json::Value = serde_json::from_str(&fs::read_to_string(meta).unwrap()).unwrap();
     assert_eq!(meta["model"], "inherit", "{meta}");
+    assert!(v["retired"].is_null(), "--keep-source retires nothing: {v}");
     let (ok, code, _, _) = w.cv(&["distill", agent_s, "--session", "--model", "opus"]);
     assert!(!ok && code == 2);
 

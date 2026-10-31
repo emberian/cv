@@ -77,7 +77,9 @@ pub(crate) const GROUPS: &[(&str, &[&str])] = &[
     ),
     (
         "Reshape",
-        &["prune", "rewind", "distill", "adopt", "splice", "port", "resume"],
+        &[
+            "prune", "rewind", "distill", "adopt", "retire", "splice", "port", "resume",
+        ],
     ),
     ("Export", &["export", "dataset", "pack"]),
     (
@@ -700,6 +702,11 @@ enum Cmd {
         /// a meta without `model` means). Default: the source's meta value.
         #[arg(long, value_name = "ID", requires = "agent_of")]
         model: Option<String>,
+        /// With --agent-of: leave a sub-agent source unretired. By default the source is recorded
+        /// as retired with the new agent as its successor, which `cv hook retired` enforces
+        /// (`cv retire --undo <source>` reverses it). A distilled fork (`--upto`) never retires.
+        #[arg(long, requires = "agent_of")]
+        keep_source: bool,
         /// With --session: rehome the new session to this working directory.
         #[arg(long)]
         cwd: Option<PathBuf>,
@@ -744,6 +751,22 @@ enum Cmd {
         list: Option<String>,
         #[arg(long, hide = true)]
         orphans: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// The retired-agent ledger: `cv distill --agent-of` records the sub-agent it replaced, with
+    /// its successor. With no agent, lists who is retired; `<agent> [--successor <id>]` retires
+    /// one by hand; `--undo <agent>` reverses. `cv hooks install --retired` installs the
+    /// PreToolUse guard that refuses a retired agent's tool calls and messages to it.
+    Retire {
+        /// The agent id (`a5d8…` or `agent-a5d8…`). Omit it to list.
+        agent: Option<String>,
+        /// The agent that continues its work (named in the guard's refusal).
+        #[arg(long, value_name = "ID", requires = "agent", conflicts_with = "undo")]
+        successor: Option<String>,
+        /// Reverse a retirement.
+        #[arg(long, requires = "agent")]
+        undo: bool,
         #[arg(long)]
         json: bool,
     },
@@ -1253,6 +1276,7 @@ fn run() -> Result<()> {
             Cmd::Config { add_export, rm_export } => add_export.is_some() || rm_export.is_some(),
             Cmd::Pack { format, .. } => format == "session",
             Cmd::Resume { launch, .. } => *launch,
+            Cmd::Retire { agent, .. } => agent.is_some(),
             _ => false,
         };
         if writes {
@@ -1491,6 +1515,7 @@ fn run() -> Result<()> {
         Cmd::Recipes => recipes::cmd_recipes(),
         Cmd::Hooks { action } => hooks::cmd_hooks(action),
         Cmd::Hook { name, harness } => hooks::cmd_hook(name, harness),
+        Cmd::Retire { agent, successor, undo, json } => cmd::retire::cmd_retire(agent, successor, undo, json),
         Cmd::Resume { id, harness, launch } => port::cmd_resume(&id, harness, launch),
         Cmd::Workflow {
             id,
@@ -1635,6 +1660,7 @@ fn run() -> Result<()> {
             session,
             agent_of,
             model,
+            keep_source,
             cwd,
             out,
             json,
@@ -1648,7 +1674,8 @@ fn run() -> Result<()> {
                 retrieve_ref: None,
             };
             let target = cmd::distill::target(session, agent_of, model, cwd, out)?;
-            cmd::distill::cmd_distill(&id, harness, opts, upto, &with, pack, force, target, json)
+            let retire = !keep_source && upto.is_none();
+            cmd::distill::cmd_distill(&id, harness, opts, upto, &with, pack, force, target, retire, json)
         }
         Cmd::Adopt {
             agents,

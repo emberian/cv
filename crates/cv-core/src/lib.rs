@@ -50,6 +50,7 @@ pub mod redact;
 pub mod render;
 pub mod restamp;
 pub mod resume;
+pub mod retired;
 pub mod rewind;
 pub mod rows;
 pub mod sanitize;

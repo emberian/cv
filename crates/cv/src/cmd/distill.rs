@@ -329,6 +329,7 @@ pub(crate) fn cmd_distill(
     pack: Option<PathBuf>,
     force: bool,
     target: Target,
+    retire_source: bool,
     json_out: bool,
 ) -> Result<()> {
     let want = parse_harness(&harness)?;
@@ -366,6 +367,20 @@ pub(crate) fn cmd_distill(
         }
     };
     let mut h = report_text(&d, &emitted);
+    // A sub-agent replaced by a new sub-agent of the root is retired: its transcript stays
+    // resumable, and a SendMessage to the old id would wake a second copy of the lane.
+    let retired = match (&target, emitted.agent_id.as_deref(), s.id.strip_prefix("agent-")) {
+        (Target::AgentOf { .. }, Some(successor), Some(source)) if retire_source => {
+            let row = cv_core::retired::retire(source, Some(successor), emitted.session_id.as_deref())
+                .context("recording the source as retired")?;
+            let _ = writeln!(
+                h,
+                "  ↳ retired {source} → {successor}: `cv hook retired` refuses its tool calls and messages to it (`cv retire --undo {source}` reverses)"
+            );
+            Some(row)
+        }
+        _ => None,
+    };
     if let Some(p) = &pack {
         crate::util::write_user_file(p, d.pack().as_bytes(), force)?;
         let _ = writeln!(h, "  ↳ pack {}", p.display());
@@ -373,7 +388,7 @@ pub(crate) fn cmd_distill(
     report(
         json_out,
         &h,
-        &json!({"stats": d.stats, "emitted": emitted, "pack_path": pack}),
+        &json!({"stats": d.stats, "emitted": emitted, "pack_path": pack, "retired": retired}),
     )?;
     if !json_out && pack.is_none() && matches!(target, Target::PackOnly) {
         print!("{}", d.pack());
@@ -420,7 +435,7 @@ mod tests {
         let json_out = std::env::var("CV_DISTILL_PROBE_REPORT").as_deref() != Ok("human");
         let pack = (mode != "stdout").then(|| destination.join("pack.md"));
         let baseline = cv_testkit::heap::begin();
-        let result = cmd_distill(&source, None, opts, upto, &with, pack, false, target, json_out);
+        let result = cmd_distill(&source, None, opts, upto, &with, pack, false, target, false, json_out);
         let heap = cv_testkit::heap::end(baseline);
         eprintln!("CV_DISTILL_HEAP {}", serde_json::to_string(&heap)?);
         result

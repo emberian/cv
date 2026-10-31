@@ -57,13 +57,21 @@ pub(crate) enum HooksCmd {
         /// `user` writes the harness home; `project` writes `.claude/settings.json` or `.codex/hooks.json`.
         #[arg(long, value_enum, default_value_t = Scope::User)]
         scope: Scope,
+        /// Install only the retired-agent guard (`cv hook retired`, PreToolUse on every tool,
+        /// Claude Code only): it refuses each tool call of an agent `cv distill --agent-of`
+        /// replaced, and each `SendMessage` addressed to one, naming the successor.
+        #[arg(long)]
+        retired: bool,
     },
     /// Delete exactly the entries `install` wrote (and the copied skill), nothing else.
+    /// `--retired` deletes only the retired-agent guard.
     Remove {
         #[arg(default_value = "claude")]
         harness: String,
         #[arg(long, value_enum, default_value_t = Scope::User)]
         scope: Scope,
+        #[arg(long)]
+        retired: bool,
     },
     /// Print what `install` would change: each entry present / missing, the skill, the settings path.
     Show {
@@ -96,6 +104,9 @@ pub(crate) enum HookName {
     Decisions,
     /// `PreToolUse` matcher `Edit|Write`: `ask` when another live session edited the file.
     Edit,
+    /// `PreToolUse`, every tool (opt-in, `cv hooks install --retired`): `deny` a retired agent's
+    /// own calls and a `SendMessage` to one, naming its successor.
+    Retired,
 }
 
 impl HookName {
@@ -106,6 +117,7 @@ impl HookName {
             HookName::Lane => "lane",
             HookName::Decisions => "decisions",
             HookName::Edit => "edit",
+            HookName::Retired => "retired",
         }
     }
     fn parse(s: &str) -> Option<HookName> {
@@ -115,6 +127,7 @@ impl HookName {
             HookName::Lane,
             HookName::Decisions,
             HookName::Edit,
+            HookName::Retired,
         ]
         .into_iter()
         .find(|n| n.as_str() == s)
@@ -168,6 +181,14 @@ const SPECS: &[Spec] = &[
         asynchronous: false,
     },
 ];
+
+/// The retired-agent guard: not in [`SPECS`] (a hook on every tool call is opt-in), Claude only.
+const RETIRED: Spec = Spec {
+    event: "PreToolUse",
+    matcher: None,
+    name: HookName::Retired,
+    asynchronous: false,
+};
 
 // Older released Codex builds do not expose the newer Claude-compatible matcher aliases.
 const CODEX_EDIT: Spec = Spec {
@@ -516,6 +537,11 @@ fn handler_for(harness: Harness, exe: &str, spec: &Spec) -> Value {
 
 /// Strip every handler of ours from `settings.hooks`, dropping groups and events left empty.
 fn strip_ours(settings: &mut Value) {
+    strip_where(settings, |_| true);
+}
+
+/// Strip our handlers whose hook `selected` picks, dropping groups and events left empty.
+fn strip_where(settings: &mut Value, selected: impl Fn(HookName) -> bool) {
     let Some(hooks) = settings.get_mut("hooks").and_then(Value::as_object_mut) else {
         return;
     };
@@ -523,7 +549,7 @@ fn strip_ours(settings: &mut Value) {
         if let Some(groups) = hooks.get_mut(ev).and_then(Value::as_array_mut) {
             for g in groups.iter_mut() {
                 if let Some(hs) = g.get_mut("hooks").and_then(Value::as_array_mut) {
-                    hs.retain(|h| ours(h).is_none());
+                    hs.retain(|h| !ours(h).is_some_and(&selected));
                 }
             }
             groups.retain(|g| {
@@ -543,7 +569,8 @@ fn strip_ours(settings: &mut Value) {
 
 /// `settings` with our six entries present (one group per spec, appended under its event).
 fn with_ours(harness: Harness, mut settings: Value, exe: &str) -> Value {
-    strip_ours(&mut settings);
+    // The opt-in retired-agent guard is not one of the six; a reinstall keeps it.
+    strip_where(&mut settings, |n| n != HookName::Retired);
     let obj = settings.as_object_mut().expect("settings is an object");
     let hooks = obj.entry("hooks").or_insert_with(|| json!({}));
     if !hooks.is_object() {
@@ -562,6 +589,29 @@ fn with_ours(harness: Harness, mut settings: Value, exe: &str) -> Value {
         }
         groups.as_array_mut().expect("array").push(Value::Object(group));
     }
+    settings
+}
+
+/// `settings` with the retired-agent guard present once, and nothing else of ours touched.
+fn with_retired(harness: Harness, mut settings: Value, exe: &str) -> Value {
+    strip_where(&mut settings, |n| n == HookName::Retired);
+    let obj = settings.as_object_mut().expect("settings is an object");
+    let hooks = obj.entry("hooks").or_insert_with(|| json!({}));
+    if !hooks.is_object() {
+        *hooks = json!({});
+    }
+    let groups = hooks
+        .as_object_mut()
+        .expect("object")
+        .entry(RETIRED.event)
+        .or_insert_with(|| json!([]));
+    if !groups.is_array() {
+        *groups = json!([]);
+    }
+    groups
+        .as_array_mut()
+        .expect("array")
+        .push(json!({"hooks": [handler_for(harness, exe, &RETIRED)]}));
     settings
 }
 
@@ -605,7 +655,62 @@ fn this_exe() -> Result<String> {
 
 pub(crate) fn cmd_hooks(cmd: HooksCmd) -> Result<()> {
     match cmd {
-        HooksCmd::Install { harness, scope } => {
+        HooksCmd::Install {
+            harness,
+            scope,
+            retired: true,
+        } => {
+            let harness = hook_harness(&harness)?;
+            if harness != Harness::Claude {
+                bail!("the retired-agent guard reads Claude Code's sub-agent `agent_id`; {harness} has no such field");
+            }
+            let (settings_path, _) = paths(harness, scope)?;
+            let before = read_settings(&settings_path)?;
+            let after = with_retired(harness, before.clone(), &this_exe()?);
+            if after == before {
+                println!(
+                    "cv hooks: the retired-agent guard is already in {}; nothing written",
+                    home_rel(&settings_path)
+                );
+            } else {
+                write_settings(&settings_path, &after)?;
+                println!(
+                    "cv hooks: installed the retired-agent guard (PreToolUse, every tool) → {}",
+                    home_rel(&settings_path)
+                );
+                println!("  (`cv retire --list` shows who it refuses; `cv hooks remove --retired` deletes it)");
+            }
+            Ok(())
+        }
+        HooksCmd::Remove {
+            harness,
+            scope,
+            retired: true,
+        } => {
+            let harness = hook_harness(&harness)?;
+            let (settings_path, _) = paths(harness, scope)?;
+            let before = read_settings(&settings_path)?;
+            let mut after = before.clone();
+            strip_where(&mut after, |n| n == HookName::Retired);
+            if after == before {
+                println!(
+                    "cv hooks: no retired-agent guard in {}; nothing written",
+                    home_rel(&settings_path)
+                );
+            } else {
+                write_settings(&settings_path, &after)?;
+                println!(
+                    "cv hooks: removed the retired-agent guard from {}",
+                    home_rel(&settings_path)
+                );
+            }
+            Ok(())
+        }
+        HooksCmd::Install {
+            harness,
+            scope,
+            retired: false,
+        } => {
             let harness = hook_harness(&harness)?;
             let (settings_path, skill_path) = paths(harness, scope)?;
             let exe = this_exe()?;
@@ -641,7 +746,11 @@ pub(crate) fn cmd_hooks(cmd: HooksCmd) -> Result<()> {
             }
             Ok(())
         }
-        HooksCmd::Remove { harness, scope } => {
+        HooksCmd::Remove {
+            harness,
+            scope,
+            retired: false,
+        } => {
             let harness = hook_harness(&harness)?;
             let (settings_path, skill_path) = paths(harness, scope)?;
             let before = read_settings(&settings_path)?;
@@ -985,6 +1094,7 @@ pub(crate) fn cmd_hook(name: HookName, harness: Option<String>) -> Result<()> {
             HookName::Lane => hook_lane(&event),
             HookName::Decisions => hook_decisions(&event),
             HookName::Edit => hook_edit(&event),
+            HookName::Retired => hook_retired(&event, &payload),
         },
         Err(e) => Err(e),
     };
@@ -1264,6 +1374,57 @@ fn hook_lane(ev: &Event) -> Result<Option<Value>> {
     Ok(None)
 }
 
+/// `PreToolUse` (every tool, opt-in): refuse the call when the agent making it is retired, or when
+/// it is a `SendMessage` to a retired agent. Both answers name the successor. The caller is the
+/// payload's `agent_id` (Claude Code sets it on tool hooks that fire inside a sub-agent; the root
+/// has none, so only the `SendMessage` rule applies to it). Nothing printed = allow.
+fn hook_retired(ev: &Event, payload: &Value) -> Result<Option<Value>> {
+    if ev.event.as_deref() != Some("PreToolUse") {
+        return Ok(None);
+    }
+    let retired = cv_core::retired::current();
+    if retired.is_empty() {
+        return Ok(None);
+    }
+    let reason = if let Some(r) = ev
+        .agent
+        .as_ref()
+        .and_then(|a| retired.get(cv_core::retired::bare(&a.id)))
+    {
+        let next = match &r.successor {
+            Some(s) => format!("Your successor {s} continues your work; leave it to that agent."),
+            None => "Another agent continues your work.".to_string(),
+        };
+        format!(
+            "cv: you are agent {id}, retired at {at} (`cv distill` replaced you). {next} Make no further tool calls: \
+             end your turn now with one line saying you stood down. (The user or the root can reverse this with `cv retire --undo {id}`.)",
+            id = r.agent_id,
+            at = r.ts.format("%Y-%m-%d %H:%M UTC"),
+        )
+    } else if payload.get("tool_name").and_then(Value::as_str) == Some("SendMessage") {
+        let to = payload
+            .get("tool_input")
+            .and_then(|t| t.get("to"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let Some(r) = retired.get(cv_core::retired::bare(to)) else {
+            return Ok(None);
+        };
+        let next = match &r.successor {
+            Some(s) => format!("its successor is {s}. Send this message to {s} instead, and use that id from now on"),
+            None => "it has no named successor; ask the root which agent holds its work".to_string(),
+        };
+        format!("cv: {to} is retired (`cv distill` replaced it); {next}. A message to {to} would wake a second copy of the same lane.")
+    } else {
+        return Ok(None);
+    };
+    Ok(Some(json!({"hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "deny",
+        "permissionDecisionReason": reason,
+    }})))
+}
+
 /// `UserPromptSubmit`: one line when decisions are owed, else nothing at all.
 fn hook_decisions(_ev: &Event) -> Result<Option<Value>> {
     let Some((who, n)) = owed_decisions(HookName::Decisions) else {
@@ -1417,6 +1578,44 @@ mod tests {
     }
 
     #[test]
+    fn retired_guard_installs_alone_survives_a_reinstall_and_removes_alone() {
+        let theirs = json!({"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "guard.sh"}]}]}});
+        let once = with_retired(Harness::Claude, theirs.clone(), "/opt/cv");
+        assert_eq!(
+            with_retired(Harness::Claude, once.clone(), "/opt/cv"),
+            once,
+            "idempotent"
+        );
+        let group = &once["hooks"]["PreToolUse"][1];
+        assert!(group.get("matcher").is_none(), "every tool: {group}");
+        assert_eq!(ours(&group["hooks"][0]), Some(HookName::Retired));
+        assert!(
+            present(Harness::Claude, &once).is_empty(),
+            "the guard alone, none of the six"
+        );
+        // The six install beside it and keep it; removing the guard alone leaves the six.
+        let all = with_ours(Harness::Claude, once.clone(), "/opt/cv");
+        assert_eq!(present(Harness::Claude, &all).len(), SPECS.len());
+        let guards = |v: &Value| {
+            v["hooks"]["PreToolUse"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|g| g["hooks"].as_array().unwrap().iter())
+                .filter(|h| ours(h) == Some(HookName::Retired))
+                .count()
+        };
+        assert_eq!(guards(&all), 1);
+        let mut no_guard = all.clone();
+        strip_where(&mut no_guard, |n| n == HookName::Retired);
+        assert_eq!(guards(&no_guard), 0);
+        assert_eq!(present(Harness::Claude, &no_guard).len(), SPECS.len());
+        let mut back = once;
+        strip_ours(&mut back);
+        assert_eq!(back, theirs, "remove deletes the guard too, and nothing of theirs");
+    }
+
+    #[test]
     fn hook_install_keeps_existing_readers_on_the_previous_files() {
         use std::io::Read;
         let _world = crate::test_world("hooks-atomic");
@@ -1429,6 +1628,7 @@ mod tests {
         cmd_hooks(HooksCmd::Install {
             harness: "claude".into(),
             scope: Scope::User,
+            retired: false,
         })
         .unwrap();
         let mut held = String::new();
