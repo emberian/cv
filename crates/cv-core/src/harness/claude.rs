@@ -839,11 +839,14 @@ fn agents_in_dir(
     {
         for e in super::side_entries(dir)? {
             let p = e.path();
-            // Only `agent-*.jsonl`; skip `journal.jsonl` and the `.meta.json` sidecars.
+            // Only `agent-*.jsonl`; skip `journal.jsonl`, the `.meta.json` sidecars and the
+            // `agent-<id>.flat.jsonl` stash `cv distill`/`cv prune` write beside a transcript. Read
+            // as an agent, the stash became a phantom `<id>.flat` lane with no stop, so `cv lanes`
+            // listed it `running` under the real agent's 8-character id.
             let is_agent = p.extension().and_then(|x| x.to_str()) == Some("jsonl")
                 && p.file_name()
                     .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.starts_with("agent-"));
+                    .is_some_and(|n| n.starts_with("agent-") && !n.ends_with(".flat.jsonl"));
             if is_agent
                 && p.file_stem()
                     .and_then(|id| id.to_str())
@@ -2330,6 +2333,12 @@ mod tests {
         std::fs::write(
             subs.join("agent-a111.meta.json"),
             r#"{"agentType":"general-purpose","description":"do task one","toolUseId":"toolu_77"}"#,
+        )
+        .unwrap();
+        // The elided-payload stash `cv distill` writes beside the agent it creates: not an agent.
+        std::fs::write(
+            subs.join("agent-a111.flat.jsonl"),
+            "{\"id\":\"toolu_1\",\"slot\":\"content\",\"name\":\"Bash\",\"content\":\"big\"}\n",
         )
         .unwrap();
 
