@@ -3166,6 +3166,66 @@ fn adopt_moves_a_stranded_lane_into_the_live_session() {
     assert!(out.contains("deadsess"), "{out}");
 }
 
+/// A lane that died on one model's usage limit is resumed in place on another: the agent is
+/// already in the live session, so `--model` rewrites its meta there and copies nothing.
+#[test]
+fn adopt_model_retargets_an_agent_already_in_the_session() {
+    let w = World::new("adopt-retarget");
+    let (live, aid) = ("livesess", "a9876543210fedcba");
+    w.write_session(
+        live,
+        &[serde_json::json!({"type": "user", "uuid": "r1", "sessionId": live,
+            "timestamp": "2026-01-01T09:00:00Z", "cwd": "/work/proj",
+            "message": {"role": "user", "content": "run the lanes"}})],
+    );
+    let sub = w.home.join(".claude/projects/-work-proj/livesess/subagents");
+    fs::create_dir_all(&sub).unwrap();
+    let mut l = serde_json::json!({"type": "user", "uuid": "u0", "parentUuid": null,
+        "timestamp": "2026-01-01T10:00:00Z", "cwd": "/work/proj",
+        "message": {"role": "user", "content": "You are lane LIMIT."}});
+    l["isSidechain"] = true.into();
+    l["agentId"] = aid.into();
+    l["sessionId"] = live.into();
+    let body = format!("{l}\n");
+    let agent = sub.join(format!("agent-{aid}.jsonl"));
+    fs::write(&agent, &body).unwrap();
+    let meta_path = sub.join(format!("agent-{aid}.meta.json"));
+    let meta = r#"{"agentType":"general-purpose","description":"Lane LIMIT","model":"claude-old-1","pickedEffortModel":"claude-old-1"}"#;
+    fs::write(&meta_path, meta).unwrap();
+
+    // Without --model there is nothing to adopt, and the refusal names the retarget.
+    let (ok, code, _, err) = w.cv(&["adopt", aid, "--into", live, "--from", live]);
+    assert!(!ok && code == 2 && err.contains("nothing to adopt"), "{err}");
+    assert!(err.contains("--model"), "the refusal points at the retarget: {err}");
+    assert_eq!(fs::read_to_string(&meta_path).unwrap(), meta);
+
+    // A dry run says what it would do and writes nothing.
+    let (out, err) = w.cv_ok(&[
+        "adopt", aid, "--into", live, "--model", "claude-new-2", "--dry-run", "--json",
+    ]);
+    assert!(
+        err.contains("would retarget") && err.contains("claude-old-1 → claude-new-2"),
+        "{err}"
+    );
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["retargeted"][0]["written"], false, "{out}");
+    assert_eq!(fs::read_to_string(&meta_path).unwrap(), meta);
+
+    // The real run: `model` rewritten, `pickedEffortModel` dropped, the rest kept, the transcript
+    // untouched, and nothing else in subagents/.
+    let (_, err) = w.cv_ok(&[
+        "adopt", aid, "--into", live, "--from", live, "--model", "claude-new-2", "--force",
+    ]);
+    assert!(err.contains(&format!("retargeted {aid} in place")), "{err}");
+    let m: serde_json::Value = serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
+    assert_eq!(
+        m,
+        serde_json::json!({"agentType":"general-purpose","description":"Lane LIMIT","model":"claude-new-2"})
+    );
+    assert_eq!(fs::read_to_string(&agent).unwrap(), body);
+    assert_eq!(fs::read_dir(&sub).unwrap().count(), 2);
+}
+
 /// The dead session lives in an agent seat's config dir (named by `claude-roots`), and is the most
 /// recently written file of the project; the live session is under `~/.claude`. Adopt finds the
 /// agent across roots, and the default target is the newest session OTHER than the one being

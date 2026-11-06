@@ -53,9 +53,12 @@ pub(crate) struct AdoptArgs {
 }
 
 /// Set `model` in a sub-agent's meta sidecar, creating the sidecar when the source had none.
+/// `pickedEffortModel` (the model Claude Code picked at launch) is dropped: beside the new `model`
+/// it would name a second, stale one.
 fn set_meta_model(path: &std::path::Path, model: &str) -> Result<()> {
     let mut meta = sidecar::agent_meta(path);
     meta.insert("model".into(), json!(model));
+    meta.remove("pickedEffortModel");
     let meta = serde_json::Value::Object(meta);
     // The meta adopt itself just published (or none): replaced whole.
     cv_core::publish::publish_reader(
@@ -115,14 +118,22 @@ fn run(roots: &[PathBuf], a: &AdoptArgs) -> Result<()> {
         }
     };
 
+    // An agent already in the live session and nowhere else has nothing to copy; with `--model`
+    // it is retargeted in place (its meta rewritten, the transcript untouched).
     let mut plans: Vec<Plan> = Vec::new();
+    let mut retargets: Vec<AgentFile> = Vec::new();
     for (spec, hits) in a.agents.iter().zip(found) {
-        let (here, elsewhere): (Vec<AgentFile>, Vec<AgentFile>) =
+        let (mut here, elsewhere): (Vec<AgentFile>, Vec<AgentFile>) =
             hits.into_iter().partition(|h| h.session_id == into.session_id);
         let mut elsewhere = elsewhere.into_iter();
         let Some(chosen) = elsewhere.next() else {
+            if a.model.is_some() && !here.is_empty() {
+                retargets.push(here.swap_remove(0));
+                continue;
+            }
             return usage(format!(
-                "{spec} is already in {} and nowhere else{} — nothing to adopt",
+                "{spec} is already in {} and nowhere else{} — nothing to adopt \
+                 (`--model <ID>` retargets its model in place)",
                 into.session_id,
                 if here.is_empty() {
                     ""
@@ -138,12 +149,10 @@ fn run(roots: &[PathBuf], a: &AdoptArgs) -> Result<()> {
     // Repeated prefixes/full ids can resolve to the same agent. Reject the entire request before
     // the first copy rather than discovering the collision after one adoption has been published.
     let mut destinations = std::collections::HashSet::new();
-    for plan in &plans {
-        if !destinations.insert(&plan.dest) {
-            return usage(format!(
-                "agent {} was selected more than once — nothing was written",
-                plan.agent.agent_id
-            ));
+    let picked = plans.iter().map(|p| (&p.dest, &p.agent.agent_id));
+    for (dest, id) in picked.chain(retargets.iter().map(|g| (&g.path, &g.agent_id))) {
+        if !destinations.insert(dest) {
+            return usage(format!("agent {id} was selected more than once — nothing was written"));
         }
     }
 
@@ -241,6 +250,32 @@ fn run(roots: &[PathBuf], a: &AdoptArgs) -> Result<()> {
         );
         done.push(json!({"plan": p, "result": r, "written": !a.dry_run}));
     }
+    let mut retargeted = Vec::new();
+    for g in &retargets {
+        let model = a.model.as_deref().expect("a retarget is planned only with --model");
+        let meta = g
+            .meta_path
+            .clone()
+            .unwrap_or_else(|| g.path.with_extension("meta.json"));
+        if !a.dry_run {
+            set_meta_model(&meta, model)?;
+        }
+        let _ = writeln!(
+            h,
+            "✦ {} {} in place: model {} → {model}  ({})",
+            if a.dry_run { "would retarget" } else { "retargeted" },
+            g.agent_id,
+            g.model.as_deref().unwrap_or("(unset)"),
+            home_rel(&meta)
+        );
+        retargeted.push(json!({
+            "agent_id": g.agent_id,
+            "meta": meta,
+            "old_model": g.model,
+            "model": model,
+            "written": !a.dry_run,
+        }));
+    }
     let source_sessions: std::collections::BTreeSet<&str> = plans.iter().map(|p| p.agent.session_id.as_str()).collect();
     for source in &source_sessions {
         let _ = writeln!(
@@ -256,7 +291,7 @@ fn run(roots: &[PathBuf], a: &AdoptArgs) -> Result<()> {
     report(
         a.json,
         &h,
-        &json!({"into": into.session_id, "dry_run": a.dry_run, "agents": done}),
+        &json!({"into": into.session_id, "dry_run": a.dry_run, "agents": done, "retargeted": retargeted}),
     )
 }
 

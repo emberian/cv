@@ -722,7 +722,8 @@ enum Cmd {
     /// `subagents/agent-<id>.jsonl` (with `sessionId` restamped on every line, nothing else
     /// changed) and its `.meta.json` into the live session's `subagents/`. Find the agents with
     /// `cv lanes <session>` (one session) or `cv lanes --recent N --unfinished` (the project's
-    /// recent sessions).
+    /// recent sessions). An agent already in the live session is retargeted in place with
+    /// `--model` (a lane that hit one model's usage limit resumes on another).
     Adopt {
         /// Agent ids (`a5d8…` or `agent-a5d8…`, unique prefix ok).
         #[arg(required_unless_present_any = ["list", "orphans"])]
@@ -743,7 +744,9 @@ enum Cmd {
         force: bool,
         /// The model the adopted sub-agent runs on when resumed, written to its `agent-<id>.meta.json`
         /// (`opus`, `sonnet`, a full model id, or `inherit`: the root's current model, which is
-        /// also what a meta without `model` means). Default: the copied meta's own value.
+        /// also what a meta without `model` means). Default: the copied meta's own value. The
+        /// meta's `pickedEffortModel` is dropped. For an agent already in `--into` and nowhere
+        /// else, nothing is copied: its meta is rewritten in place (`--into S --model ID`).
         #[arg(long, value_name = "ID")]
         model: Option<String>,
         // Removed in 0.15.0 — hidden so the old spellings error with a pointer (exit 2).

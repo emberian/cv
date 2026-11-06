@@ -29,7 +29,8 @@ The pre-compaction records are still in your transcript; only your context lost 
   timeline and last N tool calls verbatim, the rest indexed (`cv cat <new> <tool_use_id>`).
 - `cv splice <id>:..N --session` (or `--agent-of <root>`) — the lane exactly as it stood at message N, to run variants.
 - `cv adopt <agent-id> --into <live-root>` — a dead root's lane moved under a live one so it can
-  `SendMessage` it; `cv lanes --recent N --unfinished` is the rescue list.
+  `SendMessage` it; `cv lanes --recent N --unfinished` is the rescue list. A lane that hit a
+  model's usage limit: `cv adopt <agent-id> --into <its-root> --model <ID>` retargets it in place.
 - `cv show <agent-id>` / `cv show <session> --subagents` — read a lane, or the whole forest.
 
 ## Before editing a file someone else is on

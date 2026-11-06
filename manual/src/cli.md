@@ -690,10 +690,14 @@ cv adopt a5d8 b81e                      # into the project's newest session othe
 cv adopt a5d8 --into 7b2e19a4 --from c1e4d723
 cv adopt a5d8 --dry-run --json
 cv adopt a5d8 --model sonnet            # resume it on another model
+cv adopt a5d8 --into 7b2e19a4 --model claude-opus-5-5   # already in 7b2e19a4: retarget in place
 ```
 
 Defaults: `--into` the project's newest other session; `--from` everywhere, newest copy wins.
-`--model inherit` (or no `model`) runs on the live root's model.
+`--model inherit` (or no `model`) runs on the live root's model. `--model` drops the meta's
+`pickedEffortModel`. An agent already in `--into` and nowhere else has nothing to copy: with
+`--model` its `agent-<id>.meta.json` is rewritten in place (the transcript untouched), which is how a
+lane that died on one model's usage limit resumes on another; without it, adopt refuses.
 
 ### `cv splice`
 
