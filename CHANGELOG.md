@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- `cv hook receipt` (opt-in, `cv hooks install --receipts`): every Claude Code tool call is appended, hash-chained and fsynced, before it runs; `CV_RECEIPT_STRICT=1` refuses unlogged calls.
 - `cv distill --agent-of` retires a sub-agent source: `$CLUSTERVISION_HOME/retired.jsonl` records it with its successor (`--keep-source` opts out; a `--upto` fork never retires). `cv retire` lists, adds and `--undo`es rows. The opt-in guard `cv hooks install --retired` (PreToolUse on every tool, Claude Code) denies each tool call a retired agent makes and each `SendMessage` to one, naming the successor, so a lane still holding the old id cannot wake a second copy.
 - `cv lanes` no longer lists the `agent-<id>.flat.jsonl` stash beside a distilled agent as a phantom `running` lane.
 - `cv prune --plan <plan.json>` replaces size/age snipping with a per-result plan (keep, précis, excerpt) and drops attachment kinds; originals stay retrievable with `cv cat`.

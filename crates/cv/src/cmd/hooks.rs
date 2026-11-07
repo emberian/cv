@@ -62,6 +62,11 @@ pub(crate) enum HooksCmd {
         /// replaced, and each `SendMessage` addressed to one, naming the successor.
         #[arg(long)]
         retired: bool,
+        /// Install only the receipt log (`cv hook receipt`, PreToolUse and PostToolUse on every
+        /// tool, Claude Code only): each call's input digest is appended to a hash-chained log
+        /// and fsynced before the call runs; `CV_RECEIPT_STRICT=1` refuses a call it cannot log.
+        #[arg(long, conflicts_with = "retired")]
+        receipts: bool,
     },
     /// Delete exactly the entries `install` wrote (and the copied skill), nothing else.
     /// `--retired` deletes only the retired-agent guard.
@@ -72,6 +77,9 @@ pub(crate) enum HooksCmd {
         scope: Scope,
         #[arg(long)]
         retired: bool,
+        /// Delete only the receipt log's entries.
+        #[arg(long, conflicts_with = "retired")]
+        receipts: bool,
     },
     /// Print what `install` would change: each entry present / missing, the skill, the settings path.
     Show {
@@ -107,6 +115,10 @@ pub(crate) enum HookName {
     /// `PreToolUse`, every tool (opt-in, `cv hooks install --retired`): `deny` a retired agent's
     /// own calls and a `SendMessage` to one, naming its successor.
     Retired,
+    /// `PreToolUse` and `PostToolUse`, every tool (opt-in, `cv hooks install --receipts`): append
+    /// the call to the session's hash-chained receipt log and fsync it BEFORE the tool runs
+    /// (commit-before-forward), then its result's digest after.
+    Receipt,
 }
 
 impl HookName {
@@ -118,6 +130,7 @@ impl HookName {
             HookName::Decisions => "decisions",
             HookName::Edit => "edit",
             HookName::Retired => "retired",
+            HookName::Receipt => "receipt",
         }
     }
     fn parse(s: &str) -> Option<HookName> {
@@ -128,6 +141,7 @@ impl HookName {
             HookName::Decisions,
             HookName::Edit,
             HookName::Retired,
+            HookName::Receipt,
         ]
         .into_iter()
         .find(|n| n.as_str() == s)
@@ -189,6 +203,22 @@ const RETIRED: Spec = Spec {
     name: HookName::Retired,
     asynchronous: false,
 };
+
+/// The receipt log: not in [`SPECS`] (a hook on every tool call is opt-in), Claude only.
+const RECEIPTS: [Spec; 2] = [
+    Spec {
+        event: "PreToolUse",
+        matcher: None,
+        name: HookName::Receipt,
+        asynchronous: false,
+    },
+    Spec {
+        event: "PostToolUse",
+        matcher: None,
+        name: HookName::Receipt,
+        asynchronous: false,
+    },
+];
 
 // Older released Codex builds do not expose the newer Claude-compatible matcher aliases.
 const CODEX_EDIT: Spec = Spec {
@@ -545,7 +575,12 @@ fn strip_where(settings: &mut Value, selected: impl Fn(HookName) -> bool) {
     let Some(hooks) = settings.get_mut("hooks").and_then(Value::as_object_mut) else {
         return;
     };
-    for ev in SPECS.iter().map(|s| s.event).collect::<std::collections::BTreeSet<_>>() {
+    for ev in SPECS
+        .iter()
+        .chain(RECEIPTS.iter())
+        .map(|s| s.event)
+        .collect::<std::collections::BTreeSet<_>>()
+    {
         if let Some(groups) = hooks.get_mut(ev).and_then(Value::as_array_mut) {
             for g in groups.iter_mut() {
                 if let Some(hs) = g.get_mut("hooks").and_then(Value::as_array_mut) {
@@ -569,8 +604,8 @@ fn strip_where(settings: &mut Value, selected: impl Fn(HookName) -> bool) {
 
 /// `settings` with our six entries present (one group per spec, appended under its event).
 fn with_ours(harness: Harness, mut settings: Value, exe: &str) -> Value {
-    // The opt-in retired-agent guard is not one of the six; a reinstall keeps it.
-    strip_where(&mut settings, |n| n != HookName::Retired);
+    // The opt-in retired-agent guard and receipt log are not of the six; a reinstall keeps them.
+    strip_where(&mut settings, |n| n != HookName::Retired && n != HookName::Receipt);
     let obj = settings.as_object_mut().expect("settings is an object");
     let hooks = obj.entry("hooks").or_insert_with(|| json!({}));
     if !hooks.is_object() {
@@ -612,6 +647,28 @@ fn with_retired(harness: Harness, mut settings: Value, exe: &str) -> Value {
         .as_array_mut()
         .expect("array")
         .push(json!({"hooks": [handler_for(harness, exe, &RETIRED)]}));
+    settings
+}
+
+/// `settings` with the receipt log's two entries present once, and nothing else of ours touched.
+fn with_receipts(harness: Harness, mut settings: Value, exe: &str) -> Value {
+    strip_where(&mut settings, |n| n == HookName::Receipt);
+    let obj = settings.as_object_mut().expect("settings is an object");
+    let hooks = obj.entry("hooks").or_insert_with(|| json!({}));
+    if !hooks.is_object() {
+        *hooks = json!({});
+    }
+    let hooks = hooks.as_object_mut().expect("object");
+    for spec in &RECEIPTS {
+        let groups = hooks.entry(spec.event).or_insert_with(|| json!([]));
+        if !groups.is_array() {
+            *groups = json!([]);
+        }
+        groups
+            .as_array_mut()
+            .expect("array")
+            .push(json!({"hooks": [handler_for(harness, exe, spec)]}));
+    }
     settings
 }
 
@@ -658,7 +715,61 @@ pub(crate) fn cmd_hooks(cmd: HooksCmd) -> Result<()> {
         HooksCmd::Install {
             harness,
             scope,
+            receipts: true,
+            ..
+        } => {
+            let harness = hook_harness(&harness)?;
+            if harness != Harness::Claude {
+                bail!("the receipt log reads Claude Code's `tool_use_id`; {harness} is not wired");
+            }
+            let (settings_path, _) = paths(harness, scope)?;
+            let before = read_settings(&settings_path)?;
+            let after = with_receipts(harness, before.clone(), &this_exe()?);
+            if after == before {
+                println!(
+                    "cv hooks: the receipt log is already in {}; nothing written",
+                    home_rel(&settings_path)
+                );
+            } else {
+                write_settings(&settings_path, &after)?;
+                println!(
+                    "cv hooks: installed the receipt log (PreToolUse + PostToolUse, every tool) → {}",
+                    home_rel(&settings_path)
+                );
+                println!("  (lines land in <cv home>/receipts/<session>.jsonl; `cv hooks remove --receipts` deletes the entries)");
+            }
+            Ok(())
+        }
+        HooksCmd::Remove {
+            harness,
+            scope,
+            receipts: true,
+            ..
+        } => {
+            let harness = hook_harness(&harness)?;
+            let (settings_path, _) = paths(harness, scope)?;
+            let before = read_settings(&settings_path)?;
+            let mut after = before.clone();
+            strip_where(&mut after, |n| n == HookName::Receipt);
+            if after == before {
+                println!(
+                    "cv hooks: no receipt log entries in {}; nothing written",
+                    home_rel(&settings_path)
+                );
+            } else {
+                write_settings(&settings_path, &after)?;
+                println!(
+                    "cv hooks: removed the receipt log entries from {}",
+                    home_rel(&settings_path)
+                );
+            }
+            Ok(())
+        }
+        HooksCmd::Install {
+            harness,
+            scope,
             retired: true,
+            receipts: false,
         } => {
             let harness = hook_harness(&harness)?;
             if harness != Harness::Claude {
@@ -686,6 +797,7 @@ pub(crate) fn cmd_hooks(cmd: HooksCmd) -> Result<()> {
             harness,
             scope,
             retired: true,
+            receipts: false,
         } => {
             let harness = hook_harness(&harness)?;
             let (settings_path, _) = paths(harness, scope)?;
@@ -710,6 +822,7 @@ pub(crate) fn cmd_hooks(cmd: HooksCmd) -> Result<()> {
             harness,
             scope,
             retired: false,
+            receipts: false,
         } => {
             let harness = hook_harness(&harness)?;
             let (settings_path, skill_path) = paths(harness, scope)?;
@@ -750,6 +863,7 @@ pub(crate) fn cmd_hooks(cmd: HooksCmd) -> Result<()> {
             harness,
             scope,
             retired: false,
+            receipts: false,
         } => {
             let harness = hook_harness(&harness)?;
             let (settings_path, skill_path) = paths(harness, scope)?;
@@ -1095,6 +1209,7 @@ pub(crate) fn cmd_hook(name: HookName, harness: Option<String>) -> Result<()> {
             HookName::Decisions => hook_decisions(&event),
             HookName::Edit => hook_edit(&event),
             HookName::Retired => hook_retired(&event, &payload),
+            HookName::Receipt => hook_receipt(&event, &payload),
         },
         Err(e) => Err(e),
     };
@@ -1425,6 +1540,124 @@ fn hook_retired(ev: &Event, payload: &Value) -> Result<Option<Value>> {
     }})))
 }
 
+/// Canonical JSON for digests: object keys sorted at every depth, no whitespace.
+fn canonical_json(v: &Value) -> String {
+    match v {
+        Value::Object(m) => {
+            let mut keys: Vec<&String> = m.keys().collect();
+            keys.sort();
+            let body: Vec<String> = keys
+                .into_iter()
+                .map(|k| format!("{}:{}", Value::String(k.clone()), canonical_json(&m[k])))
+                .collect();
+            format!("{{{}}}", body.join(","))
+        }
+        Value::Array(a) => format!("[{}]", a.iter().map(canonical_json).collect::<Vec<_>>().join(",")),
+        other => other.to_string(),
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut d = cv_core::digest::Sha256::new();
+    d.update(bytes);
+    d.finish_hex()
+}
+
+/// The domain of a receipt line's chain hash.
+const RECEIPT_DOMAIN: &str = "cv-receipt-v1";
+
+/// One receipt line's chain hash: `sha256(domain \n prev \n canonical(line without h))`.
+pub(crate) fn receipt_line_hash(prev: &str, body: &Value) -> String {
+    sha256_hex(format!("{RECEIPT_DOMAIN}\n{prev}\n{}", canonical_json(body)).as_bytes())
+}
+
+/// The `h` of the last line of a receipt log (`""` for an empty log), read from its tail.
+fn last_receipt_hash(f: &mut std::fs::File) -> Result<String> {
+    use std::io::{Seek, SeekFrom};
+    let len = f.seek(SeekFrom::End(0))?;
+    let start = len.saturating_sub(64 * 1024);
+    f.seek(SeekFrom::Start(start))?;
+    let mut tail = String::new();
+    f.read_to_string(&mut tail)?;
+    let Some(last) = tail.lines().rev().find(|l| !l.trim().is_empty()) else {
+        return Ok(String::new());
+    };
+    let v: Value = serde_json::from_str(last).context("the receipt log's last line is not JSON")?;
+    v.get("h")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .context("the receipt log's last line has no `h`")
+}
+
+/// Append one line to `<cv home>/receipts/<session>.jsonl` under an exclusive lock, chained to
+/// the previous line, and fsync before returning.
+fn append_receipt(session: &str, mut body: Map<String, Value>) -> Result<String> {
+    use std::io::Write;
+    let dir = cv_core::env::Env::current()
+        .cv_home()
+        .context("no cv home")?
+        .join("receipts");
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let path = dir.join(format!("{session}.jsonl"));
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    f.lock().context("locking the receipt log")?;
+    let prev = last_receipt_hash(&mut f)?;
+    body.insert("prev".into(), json!(prev));
+    let h = receipt_line_hash(&prev, &Value::Object(body.clone()));
+    body.insert("h".into(), json!(h));
+    writeln!(f, "{}", Value::Object(body))?;
+    f.sync_data().context("fsync of the receipt log")?;
+    Ok(h)
+}
+
+/// `PreToolUse` / `PostToolUse` on every tool: the receipt log. `pre` lines commit the call's
+/// input digest and are durable before the harness forwards the call; `post` lines commit the
+/// result's. With `CV_RECEIPT_STRICT=1` a `pre` line that cannot be written DENIES the call (the
+/// chokepoint); without it the call proceeds and the missing line is what a verifier counts.
+fn hook_receipt(ev: &Event, payload: &Value) -> Result<Option<Value>> {
+    let kind = match ev.event.as_deref() {
+        Some("PreToolUse") => "pre",
+        Some("PostToolUse") => "post",
+        _ => return Ok(None),
+    };
+    let field = |k: &str| payload.get(k).cloned().unwrap_or(Value::Null);
+    let mut body = Map::new();
+    body.insert("v".into(), json!(1));
+    body.insert("kind".into(), json!(kind));
+    body.insert("session".into(), json!(ev.session.id));
+    body.insert("agent".into(), json!(ev.agent.as_ref().map(|a| a.id.clone())));
+    body.insert("tool_use_id".into(), field("tool_use_id"));
+    body.insert("tool".into(), field("tool_name"));
+    body.insert("ts".into(), json!(chrono::Utc::now().to_rfc3339()));
+    if kind == "pre" {
+        body.insert(
+            "input_sha256".into(),
+            json!(sha256_hex(canonical_json(&field("tool_input")).as_bytes())),
+        );
+    } else {
+        body.insert(
+            "response_sha256".into(),
+            json!(sha256_hex(canonical_json(&field("tool_response")).as_bytes())),
+        );
+    }
+    match append_receipt(&ev.session.id, body) {
+        Ok(_) => Ok(None),
+        Err(e) if kind == "pre" && std::env::var("CV_RECEIPT_STRICT").as_deref() == Ok("1") => {
+            Ok(Some(json!({"hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": format!("cv receipt: the call could not be committed before it ran ({e:#}); CV_RECEIPT_STRICT=1 refuses unreceipted calls"),
+            }})))
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// `UserPromptSubmit`: one line when decisions are owed, else nothing at all.
 fn hook_decisions(_ev: &Event) -> Result<Option<Value>> {
     let Some((who, n)) = owed_decisions(HookName::Decisions) else {
@@ -1616,6 +1849,64 @@ mod tests {
     }
 
     #[test]
+    fn receipt_log_installs_on_both_events_and_survives_a_reinstall() {
+        let theirs =
+            json!({"hooks": {"PostToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "x.sh"}]}]}});
+        let once = with_receipts(Harness::Claude, theirs.clone(), "/opt/cv");
+        assert_eq!(
+            with_receipts(Harness::Claude, once.clone(), "/opt/cv"),
+            once,
+            "idempotent"
+        );
+        let count = |v: &Value, ev: &str| {
+            v["hooks"][ev]
+                .as_array()
+                .map(|gs| {
+                    gs.iter()
+                        .flat_map(|g| g["hooks"].as_array().unwrap().iter())
+                        .filter(|h| ours(h) == Some(HookName::Receipt))
+                        .count()
+                })
+                .unwrap_or(0)
+        };
+        assert_eq!((count(&once, "PreToolUse"), count(&once, "PostToolUse")), (1, 1));
+        let all = with_ours(Harness::Claude, once.clone(), "/opt/cv");
+        assert_eq!(
+            (count(&all, "PreToolUse"), count(&all, "PostToolUse")),
+            (1, 1),
+            "the six keep it"
+        );
+        let mut back = once;
+        strip_where(&mut back, |n| n == HookName::Receipt);
+        assert_eq!(back, theirs, "remove --receipts deletes only its two entries");
+    }
+
+    #[test]
+    fn receipt_lines_chain_and_any_edit_moves_the_hash() {
+        let a = json!({"v": 1, "kind": "pre", "tool_use_id": "t1", "input_sha256": "00", "prev": ""});
+        let ha = receipt_line_hash("", &a);
+        let b = json!({"v": 1, "kind": "pre", "tool_use_id": "t2", "input_sha256": "01", "prev": ha});
+        let hb = receipt_line_hash(&ha, &b);
+        assert_ne!(ha, hb);
+        let mut a2 = a.clone();
+        a2["input_sha256"] = json!("02");
+        assert_ne!(
+            receipt_line_hash("", &a2),
+            ha,
+            "an edited input digest moves the line hash"
+        );
+        assert_ne!(
+            receipt_line_hash("x", &a),
+            ha,
+            "a different predecessor moves the line hash"
+        );
+        // Key order does not: the hash is over canonical JSON.
+        let reordered: Value =
+            serde_json::from_str(r#"{"prev":"","input_sha256":"00","tool_use_id":"t1","kind":"pre","v":1}"#).unwrap();
+        assert_eq!(receipt_line_hash("", &reordered), ha);
+    }
+
+    #[test]
     fn hook_install_keeps_existing_readers_on_the_previous_files() {
         use std::io::Read;
         let _world = crate::test_world("hooks-atomic");
@@ -1629,6 +1920,7 @@ mod tests {
             harness: "claude".into(),
             scope: Scope::User,
             retired: false,
+            receipts: false,
         })
         .unwrap();
         let mut held = String::new();
