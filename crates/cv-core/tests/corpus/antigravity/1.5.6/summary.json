@@ -1,0 +1,191 @@
+{
+  "sessions": [
+    {
+      "id": "11111111-2222-4333-8444-555555555555",
+      "path": ".gemini/antigravity-cli/brain/11111111-2222-4333-8444-555555555555/.system_generated/logs/transcript_full.jsonl",
+      "messages": 16,
+      "sequence": [
+        "user/prompt",
+        "assistant/subagent_spawn",
+        "tool/tool_result",
+        "tool/tool_result",
+        "tool/tool_result",
+        "tool/tool_result",
+        "tool/tool_result",
+        "tool/tool_result",
+        "tool/tool_result",
+        "user/subagent_return",
+        "system/compaction_boundary",
+        "system/compaction_summary",
+        "system/error",
+        "assistant/reply",
+        "tool/tool_result",
+        "assistant/reply"
+      ],
+      "blocks": {
+        "image": 1,
+        "text": 7,
+        "thinking": 2,
+        "tool_result": 8,
+        "tool_use": 8
+      },
+      "tools": [
+        "invoke_subagent",
+        "read_file",
+        "edit_file",
+        "run_command",
+        "run_command",
+        "schedule",
+        "ask_question",
+        "edit_file"
+      ],
+      "usage_messages": 4,
+      "model_messages": 3,
+      "compaction_boundaries": [
+        10
+      ],
+      "subagent_spawns": 1,
+      "subagent_returns": 1,
+      "affordances": {
+        "approval/deny": 1,
+        "background_job/start": 1,
+        "question/ask": 1,
+        "schedule/create": 1,
+        "subagent_return/return": 1,
+        "subagent_spawn/spawn": 1
+      },
+      "tool_histogram": {
+        "tools": {
+          "ask_question": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "edit_file": {
+            "calls": 2,
+            "edits": 2,
+            "reads": 0,
+            "commands": 0,
+            "errors": 1
+          },
+          "invoke_subagent": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "read_file": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 1,
+            "commands": 0,
+            "errors": 0
+          },
+          "run_command": {
+            "calls": 2,
+            "edits": 0,
+            "reads": 0,
+            "commands": 2,
+            "errors": 0
+          },
+          "schedule": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 8,
+        "total_errors": 1
+      },
+      "lineage": {},
+      "model": "gemini-4-argon",
+      "skipped_lines": 0
+    },
+    {
+      "id": "22222222-3333-4444-8555-666666666666",
+      "path": ".gemini/antigravity-cli/brain/22222222-3333-4444-8555-666666666666/.system_generated/logs/transcript_full.jsonl",
+      "messages": 5,
+      "sequence": [
+        "user/prompt",
+        "assistant/reply",
+        "tool/tool_result",
+        "tool/tool_result",
+        "assistant/reply"
+      ],
+      "blocks": {
+        "text": 2,
+        "thinking": 1,
+        "tool_result": 2,
+        "tool_use": 2
+      },
+      "tools": [
+        "read_file",
+        "send_message"
+      ],
+      "usage_messages": 2,
+      "model_messages": 2,
+      "compaction_boundaries": [],
+      "subagent_spawns": 0,
+      "subagent_returns": 0,
+      "affordances": {},
+      "tool_histogram": {
+        "tools": {
+          "read_file": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 1,
+            "commands": 0,
+            "errors": 0
+          },
+          "send_message": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 2,
+        "total_errors": 0
+      },
+      "lineage": {
+        "parent": "11111111-2222-4333-8444-555555555555",
+        "agent_path": "research"
+      },
+      "model": "gemini-4-argon",
+      "skipped_lines": 0
+    },
+    {
+      "id": "33333333-4444-4555-8666-777777777777",
+      "path": ".gemini/antigravity-ide/brain/33333333-4444-4555-8666-777777777777/.system_generated/logs/overview.txt",
+      "messages": 2,
+      "sequence": [
+        "user/prompt",
+        "assistant/reply"
+      ],
+      "blocks": {
+        "text": 2
+      },
+      "tools": [],
+      "usage_messages": 1,
+      "model_messages": 0,
+      "compaction_boundaries": [],
+      "subagent_spawns": 0,
+      "subagent_returns": 0,
+      "affordances": {},
+      "tool_histogram": {
+        "tools": {},
+        "total_calls": 0,
+        "total_errors": 0
+      },
+      "lineage": {},
+      "model": null,
+      "skipped_lines": 0
+    }
+  ]
+}

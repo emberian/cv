@@ -484,7 +484,7 @@ Info/Part shapes), `packages/schema/src/session-message.ts` (2.x message union),
   when no db exists. Also `~/.local/state/opencode/` and `prompt-history.jsonl`. `opencode export [sid]` writes
   `{info, messages:[{info, parts}]}` (an importable interchange form).
 
-## Gemini / Antigravity — `~/.gemini/`
+## Gemini CLI — `~/.gemini/tmp/<projectHash>/chats/`
 
 Re-verified 2026-09-19 at `cfbcaa8` (the checkout's `package.json` reports
 `0.62.0-nightly.20260918`; the newest tag there is `v0.49.0-preview.0`): **the record format is
@@ -492,14 +492,10 @@ unchanged** — `packages/core/src/services/chatRecordingTypes.ts` and `packages
 were last touched 2026-05-29, which is also the first commit in that checkout's history, so "unchanged"
 here means "unchanged across everything we have", not "unchanged since the file was written".
 
-- **Antigravity transcripts:** `~/.gemini/antigravity/conversations/<uuid>.pb` — **protobuf, opaque**
-  (no .proto on disk). Best-effort only.
 - **Readable fallback:** `~/.gemini/tmp/<hash>/logs.json` — array of `{sessionId, messageId, type, message,
   timestamp}` (user messages reliably; assistant inconsistently).
-- **Sidecars:** `~/.gemini/antigravity/brain/<conv-id>/.system_generated/logs/overview.txt` (summary),
-  `knowledge/`, `context_state/`, `implicit/`.
 - Note: open-source `gemini-cli` (cloned at `~/pug/gemini-cli`) uses JSON checkpoints, a *different* format
-  from the closed Antigravity IDE — consult its `packages/cli/src/utils/sessions.ts` for that variant.
+  from Google Antigravity (`antigravity`, below) — consult its `packages/cli/src/utils/sessions.ts` for that variant.
 - Also handled now: the gemini-cli JSON **chat recordings** (`~/.gemini/tmp/<projectHash>/chats/session-*.json`
   legacy object + modern append-only `.jsonl` with `$set`/`$rewindTo`) and `checkpoint-*.json` — far richer
   than logs.json (real assistant turns, thoughts, tool calls). Qwen Code reuses this format under `~/.qwen/`.
@@ -537,6 +533,45 @@ here means "unchanged across everything we have", not "unchanged since the file 
     `checkpoint-<tag>.json` whose first user Content merges the preamble and the prompt (0.63.0);
   - `tmp/<project>/<sessionId>/plans/*.md` (plan mode), `.../tracker/*.json` (task tracker) and
     `tmp/background-processes/background-<pid>.log` are written beside the recordings; cv reads none.
+
+## Google Antigravity — `~/.gemini/{antigravity-cli,antigravity,antigravity-ide}/` (`$JETSKI_APP_DATA_DIR` overrides)
+
+Verified 2026-11-11 against Antigravity CLI 1.5.6 (`agy`, corpus `crates/cv-core/tests/corpus/antigravity/1.5.6/`)
+and the Jetski / Cortex store shared by Antigravity CLI (`~/.gemini/antigravity-cli/`), Antigravity 2.0
+(`~/.gemini/antigravity/`), and Antigravity IDE (`~/.gemini/antigravity-ide/`). Checked step/source/status
+vocabulary: `formats/antigravity.toml`.
+
+- **Transcript discovery & deduplication:** one directory per conversation UUID under `<appDataDir>/brain/<uuid>/`.
+  Logs sit in `brain/<uuid>/.system_generated/logs/`: `transcript_full.jsonl` (rank 3, un-truncated) >
+  `transcript.jsonl` (rank 2, fields over cap carry `truncated_fields[]`) > `overview.txt` (rank 1, legacy IDE
+  NDJSON fallback). `logs/chunks/` holds partial streaming chunks and is skipped. `conversations/<uuid>.pb` and
+  `implicit/*.pb` are AEAD-encrypted protobuf trajectories gated on OS Keychain secrets; cv never opens them or
+  touches Keychain.
+- **Cortex JSONL step records:** `{step_index, source, type, status, created_at, content?, thinking?, tool_calls?,
+  input_tokens?, cache_read_tokens?, output_tokens?, error?, media?, truncated_fields?}`. `step_index` is
+  monotonically increasing per file with gaps where internal Cortex steps (`EPHEMERAL_MESSAGE`, `MQUERY`,
+  `FINISH`) are omitted from JSONL logs.
+  - `USER_INPUT` (`USER_EXPLICIT`) → `user`/`prompt`/`human`; `<USER_REQUEST>` wrapper preserved in message body,
+    peeled only when synthesizing a fallback title; `media[{mime_type, uri, inline_data?}]` → `Block::Image`.
+  - `PLANNER_RESPONSE` (`MODEL`) → `assistant`/`reply`/`model` (`thinking` → `Block::Thinking`, `content` →
+    `Block::Text`, `tool_calls[{name, args}]` → `Block::ToolUse` with derived id `cv:antigravity:<step>.<k>`,
+    `Usage{input_tokens, cache_read_tokens, output_tokens}`).
+  - `GENERIC` (`SYSTEM`) → `tool`/`tool_result`/`harness` paired FIFO against the preceding `PLANNER_RESPONSE`'s
+    `tool_calls[]` (reset when a turn is cancelled short); `status ∈ {ERROR, INVALID}` sets `is_error = true`,
+    `file:///…/.system_generated/steps/<n>/output.txt` populates `details.persistedOutput.path`, and an
+    `invoke_subagent` result JSON `{"conversationId": "<child>"}` links the child session.
+  - `SYSTEM_MESSAGE` (`SYSTEM`) → parsed via `[Message] … sender=<id> … content=…`: child `step_index == 0`
+    from a parent UUID is `user`/`prompt`/`subagent` (setting `lineage.parent`); parent receipt from a known
+    child UUID is `user`/`subagent_return`/`subagent`; `<uuid>/task-*` and timer wakeups are `scheduler`/
+    `harness` notices.
+  - `CHECKPOINT` (`SYSTEM`) → `compaction_boundary` followed by `compaction_summary` when `content` is non-empty.
+  - `ERROR_MESSAGE` → `system`/`error`/`harness`.
+- **Read-only sidecars:** `annotations/<uuid>.pbtxt` (`title`), `brain/<uuid>/.system_generated/subagents/<child>.json`
+  (`{conversationId, spawnStepIndex, state, subagentDescriptor{typeName, role}, workspaceUris[]}`), and SQLite
+  sidecars opened strictly read-only via `store::sqlite`: `conversation_summaries.db` (`conversation_summaries`
+  title/preview, `workspace_uris`, `parent_conversation_id`, `agent_name`, `source`, `project_id`) and
+  `conversations/<uuid>.db` (`gen_metadata` protobuf `1.19` model slug + packed field `2` step indices;
+  `trajectory_metadata_blob` protobuf `1.1` workspace URI, `1.2` git root, `1.4` git branch, `2.1` created epoch).
 
 ## Hermes (Nous) — `~/.hermes/state.db` (SQLite, `SCHEMA_VERSION` 31 as of 0.21.6; `$HERMES_HOME` overrides; per-profile `profiles/<name>/state.db`)
 

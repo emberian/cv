@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- First-class `antigravity` harness (`agy`, `antigravity-cli`, `antigravity-ide`): reads Cortex JSONL step logs, sub-agent trees, and read-only SQLite sidecars under `~/.gemini/antigravity*`.
 - `cv hook receipt` (opt-in, `cv hooks install --receipts`): every Claude Code tool call is appended, hash-chained and fsynced, before it runs; `CV_RECEIPT_STRICT=1` refuses unlogged calls.
 - `cv distill --agent-of` retires a sub-agent source: `$CLUSTERVISION_HOME/retired.jsonl` records it with its successor (`--keep-source` opts out; a `--upto` fork never retires). `cv retire` lists, adds and `--undo`es rows. The opt-in guard `cv hooks install --retired` (PreToolUse on every tool, Claude Code) denies each tool call a retired agent makes and each `SendMessage` to one, naming the successor, so a lane still holding the old id cannot wake a second copy.
 - `cv lanes` and `cv show --agent` skip the `agent-<id>.flat.jsonl` payload sidecar beside a distilled agent.

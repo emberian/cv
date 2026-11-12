@@ -1,6 +1,6 @@
 # Harnesses & where they store sessions
 
-cv reads **21 harnesses**, including the ChatGPT and Claude.ai account exports (`chatgpt-export`,
+cv reads **22 harnesses**, including the ChatGPT and Claude.ai account exports (`chatgpt-export`,
 `claude-export`; register with `cv config --add-export`). Each ties a session to its working
 directory; cv's one IR unties it.
 
@@ -19,7 +19,8 @@ Below: where each keeps sessions, whether cv **parses** it, and whether it can *
 | **Grok CLI** | `~/.grok/sessions/<percent-encoded-cwd>/<sid>/` | ✓ | ✓ | A directory per session (`chat_history.jsonl` + sidecars); sub-agents carry `session_kind:"subagent"`. |
 | **OpenCode** | `~/.local/share/opencode/storage/` | ✓ | ✓ | `session/**/ses_*.json`, `message/<sid>/*.json`, `part/<msgid>/*.json`; `subtask` parts spawn sub-sessions. Two storage generations. |
 | **OpenClaw** | `~/.openclaw/agents/<agentId>/sessions/<sid>.jsonl` | ✓ | ✓ | `sessions.json` index + JSONL; header `version` v1/v2 linear, v3 parent-linked (migrated in place). ACP-bridged sessions are text-only. |
-| **Gemini / Antigravity** | `~/.gemini/tmp/<projectHash>/chats/session-*.json\|jsonl` | ✓ | ✓ | Chat recordings, `checkpoint-*.json`, `logs.json` fallback; sub-agents at `chats/<parentId>/<id>.jsonl`. Antigravity `*.pb` is not parsed. |
+| **Gemini CLI** | `~/.gemini/tmp/<projectHash>/chats/session-*.json\|jsonl` | ✓ | ✓ | Chat recordings, `checkpoint-*.json`, `logs.json` fallback; sub-agents at `chats/<parentId>/<id>.jsonl`. |
+| **Antigravity (Google)** | `~/.gemini/{antigravity-cli,antigravity,antigravity-ide}/brain/<uuid>/` | ✓ | — | `$JETSKI_APP_DATA_DIR` overrides; Cortex JSONL step logs (`transcript_full.jsonl` > `transcript.jsonl` > `overview.txt`), sub-agent descriptors, and read-only SQLite sidecars (`conversation_summaries.db`, `conversations/<uuid>.db`). Encrypted `*.pb` is skipped. |
 | **Hermes (Nous)** | `~/.hermes/state.db` (SQLite) | ✓ | ✓ | `$HERMES_HOME` overrides. No cwd stored. Compression chains linked by `parent_session_id`. |
 | **Kimi CLI** | `~/.kimi/sessions/<md5(cwd)>/<uuid>/context.jsonl` | ✓ | — | Frozen since 2026-06 (kimi-cli migrates it to `~/.kimi-code`). `$KIMI_SHARE_DIR` overrides; cwd from `kimi.json` `work_dirs[]`; legacy `<hash>/<uuid>.jsonl`; `wire.jsonl` enriches. |
 | **Kimi Code** | `~/.kimi-code/sessions/wd_<slug>_<sha256(cwd)[:12]>/session_<uuid>/` | ✓ | — | `$KIMI_CODE_HOME` overrides. `state.json` holds cwd, title, agent map; `agents/<agentId>/wire.jsonl` per agent; large outputs in `tool-results/`. |
@@ -37,7 +38,7 @@ Below: where each keeps sessions, whether cv **parses** it, and whether it can *
 | **Claude.ai export** | a registered `conversations.json` | ✓ | — | Linear `chat_messages[]` (text, thinking, tool_use, tool_result); deduped by id. |
 
 Emit targets (12): Claude Code, Codex, Grok, OpenCode, OpenClaw, Gemini, Hermes, LM Studio, Cline,
-Roo, Continue, Qwen (`supported_targets()` in `emit.rs`). The other nine are parse-only.
+Roo, Continue, Qwen (`supported_targets()` in `emit.rs`). The other ten are parse-only.
 
 Claude Code 2.1.304 is the verified writer: its request-ledger records, fork sub-agents, retries and
 `--max-turns` are in the committed corpus. Unknown records are carried by complete reads, never
@@ -84,6 +85,8 @@ cv attaches child agents to their parent as a tree ([viewing](viewing-and-sharin
   marked `model_config._delegate_from`.
 - **Grok**: `session_kind: "subagent"` (primaries carry `agent_name`), kept in message `extra`.
 - **Gemini**: `chats/<parentId>/<id>.jsonl`; **Qwen**: `subagents/<parentId>/agent-<id>.jsonl`.
+- **Antigravity**: `brain/<parent>/.system_generated/subagents/<child>.json` descriptors and
+  `invoke_subagent` results link `brain/<child>/` sessions (`lineage.parent`, `spawned_by_tool_use`).
 - **OpenCode**: `subtask` parts (own prompt, agent and model), beside `agent` mention parts.
 - **Zed**: its own `threads.db` row with `parent_id` (0.3.0 blobs add
   `subagent_context{parent_thread_id, depth}`), kept as `Session::lineage.parent`, `depth` in
@@ -92,8 +95,8 @@ cv attaches child agents to their parent as a tree ([viewing](viewing-and-sharin
 ## The SQLite stores
 
 Hermes (`state.db`), Cursor (`state.vscdb`), Goose (`sessions.db`), Zed (`threads.db`) and Devin
-(`sessions.db`) keep everything in SQLite; OpenCode 2.x and newer OpenClaw stores use it beside
-files. All open read-only (a WAL database through a private snapshot, so cv never writes a
+(`sessions.db`) keep everything in SQLite; OpenCode 2.x, newer OpenClaw stores and Antigravity
+(`conversation_summaries.db`, `conversations/<uuid>.db`) use it beside files. All open read-only (a WAL database through a private snapshot, so cv never writes a
 `-wal`/`-shm`), and each adapter probes `PRAGMA table_info` and selects only existing columns, so an
 older schema degrades instead of failing. Codex and Grok SQLite files are only indexes.
 

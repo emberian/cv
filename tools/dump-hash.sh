@@ -67,8 +67,8 @@ PACK_TASK="fix the parser and add a test"
 for v in CV_ENDPOINT CLAUDE_CONFIG_DIR CLUSTERVISION_CLAUDE_ROOTS CLUSTERVISION_MAX_STALE_SECS \
          CURSOR_USER_DIR CURSOR_CONFIG_DIR CODEX_HOME HERMES_HOME KIMI_SHARE_DIR KIMI_CODE_HOME \
          CONTINUE_GLOBAL_DIR GOOSE_PATH_ROOT OPENCLAW_STATE_DIR OPENCODE_DB CLINE_SESSION_DATA_DIR \
-         CLINE_DATA_DIR CLINE_DIR CV_EXPORTS CLAURDVOYANT_MAX_STALE_SECS CV_PACK_LLM CV_SERVE_TOKEN \
-         CVD_TOKEN; do unset "$v"; done
+         CLINE_DATA_DIR CLINE_DIR JETSKI_APP_DATA_DIR CV_EXPORTS CLAURDVOYANT_MAX_STALE_SECS \
+         CV_PACK_LLM CV_SERVE_TOKEN CVD_TOKEN; do unset "$v"; done
 export NO_COLOR=1 TERM=dumb
 
 wanted() { # --only filters by root name
@@ -119,6 +119,7 @@ stage_corpus() { # <harness> <version> <home>
 # in a staged home (the layout its detection finds).
 probe_root() { # <home> <harness> <id> <path>
   case "$2" in
+    antigravity) echo "$1/.gemini" ;;
     claude) echo "$1/.claude" ;;            codex) echo "$1/.codex" ;;
     gemini) echo "$1/.gemini" ;;            qwen) echo "$1/.qwen" ;;
     grok) echo "$1/.grok" ;;                kimi) echo "$1/.kimi" ;;

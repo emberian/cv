@@ -14,6 +14,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use cv_core::harness::antigravity::Antigravity;
 use cv_core::harness::claude::Claude;
 use cv_core::harness::cline::Cline;
 use cv_core::harness::codex::Codex;
@@ -127,6 +128,10 @@ fn hermes(version_dir: &Path) -> Box<dyn Adapter> {
     Box::new(Hermes::with_home(&version_dir.join(".hermes")))
 }
 
+fn antigravity(version_dir: &Path) -> Box<dyn Adapter> {
+    Box::new(Antigravity::with_home(&version_dir.join(".gemini")))
+}
+
 /// Harnesses that cannot be driven headless (desktop apps): their version dirs hold a schema
 /// snapshot of the store ember's installed version left on disk (`SNAPSHOT.toml` plus the
 /// `*.schema.txt` / `*.shape.txt` that `tools/harness-corpus/schema_snapshot.py` wrote), never
@@ -213,6 +218,11 @@ const HARNESSES: &[CorpusHarness] = &[
         name: "hermes",
         adapter: hermes,
         children: Some(|r| cv_core::harness::hermes::subagent_refs(r).unwrap()),
+    },
+    CorpusHarness {
+        name: "antigravity",
+        adapter: antigravity,
+        children: None,
     },
 ];
 
@@ -630,6 +640,17 @@ fn claude_corpus_workflow_runs_read_as_recorded() {
 /// one, so a harness that records a plan, a schedule or a spawn cannot quietly drop out of
 /// `cv show --kind`.
 const PERSISTED: &[(&str, &[&str])] = &[
+    (
+        "antigravity/",
+        &[
+            "schedule/create",
+            "background_job/start",
+            "subagent_spawn",
+            "subagent_return",
+            "question",
+            "approval/deny",
+        ],
+    ),
     (
         "claude/",
         &[

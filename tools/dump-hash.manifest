@@ -5,6 +5,7 @@
 #   home <abs dir>               an external fake HOME of real sessions — NEVER committed. Build it
 #                                with `cp -c` of ~30 sessions into <dir>/.claude/projects/<proj>/ and
 #                                <dir>/.codex/sessions/YYYY/MM/DD/, or pass it as `--home <dir>`.
+corpus antigravity/1.5.6
 corpus claude/2.1.296
 corpus claude/2.1.304
 corpus cline/3.0.70

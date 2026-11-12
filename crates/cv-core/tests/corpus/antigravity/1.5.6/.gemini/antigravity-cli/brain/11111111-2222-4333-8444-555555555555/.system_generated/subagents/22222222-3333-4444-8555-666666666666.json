@@ -1,0 +1,12 @@
+{
+  "conversationId": "22222222-3333-4444-8555-666666666666",
+  "spawnStepIndex": 1,
+  "state": "COMPLETED",
+  "subagentDescriptor": {
+    "typeName": "research",
+    "role": "Docs Reviewer"
+  },
+  "workspaceUris": [
+    "file:///workspace/demo"
+  ]
+}
