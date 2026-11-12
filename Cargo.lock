@@ -444,8 +444,10 @@ name = "cv-web"
 version = "0.18.0"
 dependencies = [
  "clustervision-core",
+ "serde",
  "serde_json",
  "wasm-bindgen",
+ "zip",
 ]
 
 [[package]]

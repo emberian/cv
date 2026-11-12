@@ -536,10 +536,21 @@ class CvSessionList extends HTMLElement {
       </li>`;
   }
 
-  /** Escape the daemon's snippet, then mark the query's own words inside it. */
+  /** Escape the daemon's snippet, then mark the query's positive words inside it (never `-neg` or `NOT neg`). */
   _markup(text) {
     const source = String(text);
-    const terms = this._query.trim().split(/\s+/).filter((t) => t.length > 1).slice(0, 6);
+    const rawTokens = this._query.trim().match(/(?:[^\s"]+|"[^"]*")+/g) || [];
+    const terms = [];
+    let negateNext = false;
+    for (const raw of rawTokens) {
+      if (/^(?:AND|OR)$/i.test(raw)) continue;
+      if (/^NOT$/i.test(raw)) { negateNext = true; continue; }
+      if (negateNext || raw.startsWith("-")) { negateNext = false; continue; }
+      const unquoted = raw.replace(/^["(]+|[")]+$/g, "");
+      const value = unquoted.includes(":") ? unquoted.slice(unquoted.indexOf(":") + 1).replace(/^"|"$/g, "") : unquoted;
+      if (value.length > 1) terms.push(value);
+      if (terms.length >= 6) break;
+    }
     if (!terms.length) return esc(source);
     const re = new RegExp(`(${terms.map((t) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})`, "gi");
     return source.split(re).map((part, index) => index % 2 ? `<mark>${esc(part)}</mark>` : esc(part)).join("");

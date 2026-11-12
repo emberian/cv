@@ -62,9 +62,15 @@
 <script type="module">
 import {
   normalizeSession, normalizeSessions, searchableText, sessionLabel, sumTokens,
-  toOpenSession, toMarkdown, harnessExtra, MESSAGE_KINDS, fmtCost, sessionKey,
+  toOpenSession, toMarkdown, harnessExtra, MESSAGE_KINDS, HARNESS_LABELS, sanitizeHarness,
+  fmtCost, sessionKey,
 } from "./components/util.js";
-import { blockToText, messagesToChat, generate, getKey, setKey } from "./openrouter.js";
+import {
+  getAuthToken, setAuthToken, authHeaders, registerWasmStore,
+  hydrateSession, getMessages, getSessionHead, searchSessions, probeSearch, getCorpusStats,
+} from "./components/hydrate.js";
+import { canInvokeNative, listen } from "./tauri.js";
+import { blockToText, messagesToChat, generate, getKey, setKey, MODEL_PRESETS, DEFAULT_MODEL } from "./openrouter.js";
 import { SAMPLE_SESSIONS } from "./sample.js";
 import "./components/cv-transcript.js";
 import "./components/cv-stats.js";
@@ -1394,6 +1400,214 @@ await acheck("workflow agent drill rejects an old response after selecting anoth
 check("local OpenSession downloads retain the IR source metadata", () => {
   const session = normalizeSession({ id: "local", harness: "claude", source_path: "/fixture/session.jsonl", messages: [] });
   eq(normalizeSession(toOpenSession(session)).source_path, session.source_path, "local export preserves source metadata like native OpenSession export");
+});
+
+// ===========================================================================
+suite("Security, 22-harness parity, native IPC, auth & WasmStore");
+
+check("all 22 harnesses have labels and CSS custom properties; untrusted harness slugs are sanitized", () => {
+  const expected = [
+    "claude", "codex", "grok", "opencode", "gemini", "antigravity", "hermes", "openclaw",
+    "cursor", "kimi", "kimi-code", "qwen", "lmstudio", "cline", "roo", "continue",
+    "goose", "zed", "devin", "chatgpt-export", "claude-export", "opensession",
+  ];
+  eq(Object.keys(HARNESS_LABELS).length, 22, "22 harness labels");
+  const rootStyle = getComputedStyle(document.documentElement);
+  for (const slug of expected) {
+    truthy(HARNESS_LABELS[slug], `HARNESS_LABELS[${slug}]`);
+    truthy(rootStyle.getPropertyValue(`--h-${slug}`).trim(), `--h-${slug} CSS variable`);
+  }
+  const evil = normalizeSession({ id: "xss", harness: 'claude);"><img src=x onerror=alert(1)>', messages: [] });
+  eq(evil.harness, "opensession", "hostile harness slug falls back to opensession");
+  eq(sanitizeHarness("Kimi-Code"), "kimi-code", "valid slug normalized to lowercase");
+
+  const stats = document.createElement("cv-stats");
+  document.body.appendChild(stats);
+  stats.style.display = "none";
+  stats._asked = true;
+  stats._corpus = {
+    sessions: 2,
+    messages: 4,
+    by_harness: { 'foo"><img src=x onerror=alert(1)>': 2 },
+    top_cwds: [],
+  };
+  stats.sessions = [evil];
+  truthy(!stats.querySelector("img"), "hostile by_harness key cannot inject DOM nodes");
+  const badFill = stats._barsHtml(new Map([["k", 1]]), (k) => k, () => 'red" onclick="alert(1)');
+  const tmp = document.createElement("div");
+  tmp.innerHTML = badFill;
+  truthy(!tmp.querySelector("[onclick]"), "hostile colorFn cannot break out of style attribute");
+  stats.remove();
+});
+
+check("openrouter keeps API keys out of localStorage and exposes current model presets", () => {
+  const prev = getKey();
+  try {
+    localStorage.setItem("cv-openrouter-key", "legacy-secret");
+    setKey("");
+    localStorage.setItem("cv-openrouter-key", "legacy-secret-2");
+    eq(getKey(), "legacy-secret-2", "legacy localStorage key migrated on read");
+    eq(localStorage.getItem("cv-openrouter-key"), null, "legacy localStorage key purged");
+    setKey("session-only-secret");
+    eq(getKey(), "session-only-secret", "session key readable");
+    eq(localStorage.getItem("cv-openrouter-key"), null, "new key never written to localStorage");
+    eq(sessionStorage.getItem("cv-openrouter-key"), "session-only-secret", "stored in sessionStorage");
+    truthy(MODEL_PRESETS.includes(DEFAULT_MODEL), "default model is in presets");
+    truthy(!MODEL_PRESETS.some((m) => /3\.5|gpt-4o/.test(m)), "stale 2024 presets removed");
+  } finally {
+    setKey(prev);
+  }
+});
+
+check("cv-splice ✕ remove button splices the active lane without ReferenceError", () => {
+  const splice = document.createElement("cv-splice");
+  document.body.appendChild(splice);
+  splice.style.display = "none";
+  splice.sessions = [claude];
+  const b = splice._branch();
+  b.lane.push(
+    { uid: "u1", message: { role: "user", kind: "prompt", content: [{ type: "text", text: "keep me" }] }, from: "s1", harness: "claude" },
+    { uid: "u2", message: { role: "assistant", kind: "reply", content: [{ type: "text", text: "drop me" }] }, from: "s1", harness: "claude" },
+  );
+  splice.render();
+  const rm = splice.querySelector('[data-rm="u2"]');
+  truthy(rm, "remove button rendered");
+  rm.click();
+  eq(splice._lane.length, 1, "item removed from active lane");
+  eq(splice._lane[0].uid, "u1", "remaining item intact");
+  splice.remove();
+});
+
+check("cv-session-list _markup excludes -negated and NOT terms from <mark>", () => {
+  const list = makeList(stubs(2));
+  list._query = 'alpha -beta NOT gamma "NOT" cwd:delta -cwd:omega';
+  const html = list._markup("alpha beta gamma delta omega");
+  has(html, "<mark>alpha</mark>", "positive term highlighted");
+  has(html, "<mark>delta</mark>", "positive field value highlighted");
+  truthy(!html.includes("<mark>beta</mark>"), "-negated term must not be marked");
+  truthy(!html.includes("<mark>gamma</mark>"), "NOT term must not be marked");
+  truthy(!html.includes("<mark>omega</mark>"), "-field:value must not be marked");
+  list.parentElement.remove();
+});
+
+await acheck("bearer token auth propagates to headers, export links, and 401 unlock bar", async () => {
+  const prevTok = getAuthToken();
+  const originalFetch = globalThis.fetch;
+  const originalClick = HTMLAnchorElement.prototype.click;
+  try {
+    setAuthToken("s3cr3t");
+    eq(authHeaders({ Accept: "application/json" }).Authorization, "Bearer s3cr3t", "Bearer header");
+    const s = normalizeSession({ id: "exp-1", harness: "claude", messages: [] });
+    s._remote = true;
+    const tr = renderTranscript(s);
+    const hrefs = [];
+    HTMLAnchorElement.prototype.click = function () { hrefs.push(this.href); };
+    tr.querySelector("[data-export-md]").click();
+    has(hrefs[0], "token=s3cr3t", "remote export appends encoded token");
+    tr.remove();
+
+    setAuthToken("");
+    const app = document.createElement("cv-app");
+    app._init = async () => {};
+    document.body.appendChild(app);
+    app.style.display = "none";
+    eq(app.querySelector(".auth-bar").hidden, true, "auth bar hidden initially");
+    globalThis.fetch = async () => new Response("unauthorized", { status: 401 });
+    const loaded = await app._tryLoadLocal();
+    eq(loaded, false, "401 returns false cleanly");
+    eq(app.querySelector(".auth-bar").hidden, false, "401 reveals auth unlock bar");
+    app.remove();
+  } finally {
+    HTMLAnchorElement.prototype.click = originalClick;
+    globalThis.fetch = originalFetch;
+    setAuthToken(prevTok);
+  }
+});
+
+await acheck("withGlobalTauri:false routes search, stats and events through __TAURI_INTERNALS__", async () => {
+  const prevInternals = window.__TAURI_INTERNALS__;
+  const prevTauri = window.__TAURI__;
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  let registeredCb = null;
+  try {
+    delete window.__TAURI__;
+    window.__TAURI_INTERNALS__ = {
+      transformCallback: (fn) => { registeredCb = fn; return 77; },
+      unregisterCallback: () => { registeredCb = null; },
+      invoke: async (cmd, args) => {
+        calls.push([cmd, args]);
+        if (cmd === "plugin:event|listen") return 99;
+        if (cmd === "plugin:event|unlisten") return null;
+        if (cmd === "api" && args.path === "/api/search") {
+          return JSON.stringify([{ id: "native-hit", harness: "codex", score: 4.2, snippet: "hit" }]);
+        }
+        if (cmd === "api" && args.path === "/api/stats") {
+          return JSON.stringify({ sessions: 12, messages: 340, by_harness: { codex: 12 }, top_cwds: [] });
+        }
+        throw new Error(`unexpected invoke ${cmd}`);
+      },
+    };
+    globalThis.fetch = async () => { throw new Error("HTTP fetch must not run when canInvokeNative() is true"); };
+    truthy(canInvokeNative(), "canInvokeNative via __TAURI_INTERNALS__");
+    eq(await probeSearch(), "server", "probeSearch uses native invoke");
+    const hits = await searchSessions("rust", { limit: 5, harness: "codex" });
+    eq(hits.length, 1, "native search hit returned");
+    eq(hits[0].id, "native-hit", "native search id");
+    const st = await getCorpusStats("harness:codex");
+    eq(st.sessions, 12, "native stats returned");
+
+    const payloads = [];
+    const unlisten = await listen("cv://open-sessions", (p) => payloads.push(p));
+    registeredCb({ payload: [{ id: "opened" }] });
+    eq(payloads.length, 1, "event delivered via internals callback");
+    unlisten();
+    truthy(calls.some(([c]) => c === "plugin:event|unlisten"), "unlisten invoked internals plugin");
+  } finally {
+    if (prevInternals === undefined) delete window.__TAURI_INTERNALS__;
+    else window.__TAURI_INTERNALS__ = prevInternals;
+    if (prevTauri === undefined) delete window.__TAURI__;
+    else window.__TAURI__ = prevTauri;
+    globalThis.fetch = originalFetch;
+  }
+});
+
+await acheck("WasmStore hydrates and pages _wasm stubs in-memory without touching HTTP", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => { throw new Error("WasmStore session must not hit HTTP"); };
+  const fakeStore = {
+    session: (h, id) => JSON.stringify({
+      id, harness: h, title: "Full WASM", system_prompt: "wasm sys",
+      messages: [
+        { role: "user", kind: "prompt", content: [{ type: "text", text: "m0" }] },
+        { role: "assistant", kind: "reply", content: [{ type: "text", text: "m1" }] },
+      ],
+    }),
+    session_head: (h, id) => JSON.stringify({ id, harness: h, title: "Full WASM", system_prompt: "wasm sys", total: 2 }),
+    messages: (h, id, start, end) => JSON.stringify({
+      messages: [{ role: "user", kind: "prompt", content: [{ type: "text", text: `m${start}` }] }],
+      start, end: start + 1, has_more: start + 1 < 2, total_known: true, total: 2, message_count: 2,
+      session: { id, harness: h, title: "Full WASM" },
+    }),
+  };
+  registerWasmStore(fakeStore);
+  try {
+    const stub = normalizeSession({ id: "w1", harness: "claude", title: "Stub", message_count: 2 });
+    stub._stub = true;
+    stub._wasm = true;
+    const win = await getMessages(stub, 0, 1);
+    eq(win.messages.length, 1, "windowed WASM read");
+    eq(win.total, 2, "windowed WASM total");
+    const head = await getSessionHead(stub);
+    eq(head.system_prompt, "wasm sys", "WASM head read");
+    const full = await hydrateSession(stub);
+    eq(full.messages.length, 2, "full WASM hydration");
+    eq(full._wasm, true, "preserves _wasm marker");
+    eq(!!full._remote, false, "never marked _remote");
+  } finally {
+    registerWasmStore(null);
+    globalThis.fetch = originalFetch;
+  }
 });
 
 // ===========================================================================

@@ -2084,3 +2084,185 @@ fn malformed_local_host_authorities_are_rejected() {
         assert_eq!(raw_status(&response), 200, "{authority}: {response}");
     }
 }
+
+#[test]
+fn serve_exposed_headers_and_lan_same_origin_post_with_token() {
+    use cv_core::task::{new_event, TaskEventKind, TaskStore};
+
+    let w = world("lan-same-origin");
+    let store = TaskStore::at(w.cv_home.join("tasks"));
+    let opened = store
+        .append_agent_event(new_event(
+            None,
+            "human",
+            TaskEventKind::Opened {
+                title: "lan task".into(),
+                body: String::new(),
+                repo: None,
+                issue: None,
+                channel: None,
+                assignee: Some("alice".into()),
+            },
+        ))
+        .expect("seed open");
+    let id = opened.task_id;
+
+    let (port, _server) = spawn_serve_cfg(
+        &w,
+        &["--host", "0.0.0.0", "--token", "lan-secret", "--who", "alice"],
+        &[],
+    );
+
+    // X-Cv-Search-Total must be exposed for cross-origin dashboards.
+    let raw = raw_request(
+        port,
+        "GET",
+        "/api/search?scan=1&q=zebrafish",
+        &[
+            ("Origin", "http://localhost:5173"),
+            ("Authorization", "Bearer lan-secret"),
+        ],
+    );
+    assert_eq!(raw_status(&raw), 200, "{raw}");
+    let exposed = header_of(&raw, "Access-Control-Expose-Headers").unwrap_or_default();
+    assert!(exposed.contains("X-Cv-Search-Total"), "{raw}");
+
+    let post_lan = |path: &str, host: &str, origin: &str, auth: Option<&str>, body: &str| -> String {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let auth_hdr = auth.map(|a| format!("Authorization: {a}\r\n")).unwrap_or_default();
+        write!(
+            stream,
+            "POST {path} HTTP/1.1\r\nHost: {host}\r\nOrigin: {origin}\r\n{auth_hdr}\
+             Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        let mut out = String::new();
+        stream.read_to_string(&mut out).unwrap();
+        out
+    };
+
+    let lan_host = format!("192.168.1.50:{port}");
+    let lan_origin = format!("http://192.168.1.50:{port}");
+    let claim_path = format!("/api/task/{id}/claim");
+    let ok_resp = post_lan(
+        &claim_path,
+        &lan_host,
+        &lan_origin,
+        Some("Bearer lan-secret"),
+        r#"{"who":"alice"}"#,
+    );
+    assert_eq!(raw_status(&ok_resp), 200, "same-origin LAN POST failed:\n{ok_resp}");
+    assert_eq!(
+        header_of(&ok_resp, "Access-Control-Allow-Origin").as_deref(),
+        Some(lan_origin.as_str()),
+        "{ok_resp}"
+    );
+
+    // Cross-origin Origin on 0.0.0.0 is still rejected 403 even with valid token.
+    let note_path = format!("/api/task/{id}/note");
+    let evil_resp = post_lan(
+        &note_path,
+        &lan_host,
+        "https://evil.example",
+        Some("Bearer lan-secret"),
+        r#"{"who":"alice","text":"spoof"}"#,
+    );
+    assert_eq!(raw_status(&evil_resp), 403, "{evil_resp}");
+
+    // Query-string ?token= must never authenticate POST writes.
+    let query_tok_post = post_lan(
+        &format!("{note_path}?token=lan-secret"),
+        &lan_host,
+        &lan_origin,
+        None,
+        r#"{"who":"alice","text":"query-token-csrf"}"#,
+    );
+    assert_eq!(raw_status(&query_tok_post), 401, "{query_tok_post}");
+}
+
+#[test]
+fn serve_sse_stream_auth_and_live_cursor_wakeup() {
+    use cv_core::task::{new_event, TaskEventKind, TaskStore};
+
+    let w = world("sse-stream");
+    let store = TaskStore::at(w.cv_home.join("tasks"));
+    let opened = store
+        .append_agent_event(new_event(
+            None,
+            "human",
+            TaskEventKind::Opened {
+                title: "streamed task".into(),
+                body: String::new(),
+                repo: None,
+                issue: None,
+                channel: None,
+                assignee: Some("alice".into()),
+            },
+        ))
+        .expect("seed open");
+    let id = opened.task_id;
+
+    let (port, _server) = spawn_serve_cfg(&w, &["--token", "stream-secret", "--who", "alice"], &[]);
+
+    let unauth = raw_request(port, "GET", "/api/stream", &[]);
+    assert_eq!(raw_status(&unauth), 401, "{unauth}");
+
+    let init = raw_request(port, "GET", "/api/stream?token=stream-secret", &[]);
+    assert_eq!(raw_status(&init), 200, "{init}");
+    assert!(
+        header_of(&init, "Content-Type")
+            .unwrap_or_default()
+            .starts_with("text/event-stream"),
+        "{init}"
+    );
+    let init_cursor: u64 = init
+        .lines()
+        .find_map(|line| line.strip_prefix("id: "))
+        .and_then(|s| s.trim().parse().ok())
+        .expect("initial SSE cursor id");
+    assert!(init_cursor >= 1, "{init}");
+
+    let follower = std::thread::spawn(move || {
+        raw_request(
+            port,
+            "GET",
+            &format!("/api/stream?after={init_cursor}&follow=1&max_events=1&wait_ms=4000"),
+            &[
+                ("Authorization", "Bearer stream-secret"),
+                ("Accept", "text/event-stream"),
+            ],
+        )
+    });
+
+    std::thread::sleep(Duration::from_millis(80));
+    let mut post_stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    post_stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let payload = r#"{"who":"alice","text":"wake follower"}"#;
+    write!(
+        post_stream,
+        "POST /api/task/{id}/note HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\
+         Authorization: Bearer stream-secret\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+        payload.len()
+    )
+    .unwrap();
+    let mut post_resp = String::new();
+    post_stream.read_to_string(&mut post_resp).unwrap();
+    assert_eq!(raw_status(&post_resp), 200, "{post_resp}");
+
+    let streamed = follower.join().expect("follower thread");
+    assert_eq!(raw_status(&streamed), 200, "{streamed}");
+    let next_cursor: u64 = streamed
+        .lines()
+        .find_map(|line| line.strip_prefix("id: "))
+        .and_then(|s| s.trim().parse().ok())
+        .expect("woken SSE cursor id");
+    assert!(next_cursor > init_cursor, "cursor must advance: {streamed}");
+    assert!(streamed.contains("\"tasks\""), "{streamed}");
+    assert!(
+        streamed.ends_with("0\r\n\r\n"),
+        "chunked stream must close cleanly: {streamed}"
+    );
+}

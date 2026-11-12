@@ -19,6 +19,65 @@ export const CVD_BASE = (() => {
   return "http://localhost:7777";
 })();
 
+const TOKEN_SS = "cv.token";
+let memAuthToken = "";
+let wasmStoreRef = null;
+
+function bootstrapUrlToken() {
+  if (typeof location === "undefined") return;
+  try {
+    const sp = new URLSearchParams(location.search || "");
+    const hp = new URLSearchParams((location.hash || "").replace(/^#/, ""));
+    const tok = hp.get("token") || sp.get("token");
+    if (tok) {
+      setAuthToken(tok);
+      sp.delete("token");
+      hp.delete("token");
+      if (typeof history !== "undefined" && typeof history.replaceState === "function") {
+        const qs = sp.toString();
+        const hs = hp.toString();
+        history.replaceState(null, "", `${location.pathname}${qs ? `?${qs}` : ""}${hs ? `#${hs}` : ""}`);
+      }
+    }
+  } catch { /* ignore */ }
+}
+
+export function getAuthToken() {
+  if (memAuthToken) return memAuthToken;
+  try {
+    const s = sessionStorage.getItem(TOKEN_SS) || "";
+    if (s) memAuthToken = s;
+    return s;
+  } catch {
+    return "";
+  }
+}
+
+export function setAuthToken(tok) {
+  memAuthToken = (tok || "").trim();
+  try {
+    if (memAuthToken) sessionStorage.setItem(TOKEN_SS, memAuthToken);
+    else sessionStorage.removeItem(TOKEN_SS);
+  } catch { /* sessionStorage may be unavailable */ }
+}
+
+export function authHeaders(extra = {}) {
+  const tok = getAuthToken();
+  return tok ? { ...extra, Authorization: `Bearer ${tok}` } : { ...extra };
+}
+
+export function notifyAuthRequired() {
+  if (typeof window !== "undefined") {
+    window.dispatchEvent(new CustomEvent("cv:auth-required"));
+  }
+}
+
+export function registerWasmStore(store) {
+  wasmStoreRef = store || null;
+}
+
+bootstrapUrlToken();
+
 /** Whether a session still needs its messages loaded. */
 export function isStub(s) {
   return !!(s && s._stub && !(s.messages && s.messages.length));
@@ -44,8 +103,15 @@ export async function apiGet(path, params = {}) {
   for (const [k, v] of Object.entries(params)) if (v != null && v !== false) q.set(k, String(v === true ? 1 : v));
   const query = q.toString();
   if (canInvokeNative()) return JSON.parse(await invoke("api", { path, query }));
-  const resp = await fetch(`${CVD_BASE}${path}${query ? `?${query}` : ""}`, { headers: { Accept: "application/json" } });
-  if (!resp.ok) throw new Error(`cv serve ${resp.status}`);
+  const resp = await fetch(`${CVD_BASE}${path}${query ? `?${query}` : ""}`, {
+    headers: authHeaders({ Accept: "application/json" }),
+  });
+  if (resp.status === 401) notifyAuthRequired();
+  if (!resp.ok) {
+    const err = new Error(`cv serve ${resp.status}`);
+    err.status = resp.status;
+    throw err;
+  }
   return resp.json();
 }
 
@@ -55,6 +121,12 @@ export function needsFullSession(session) { return isStub(session) || !!session?
 /** Resolve a stub/page prefix to a complete session. Complete local sessions pass through. */
 export async function hydrateSession(stub) {
   if (!needsFullSession(stub)) return stub;
+  if (stub._wasm && wasmStoreRef?.session) {
+    const full = normalizeSession(JSON.parse(wasmStoreRef.session(stub.harness, stub.id)));
+    full._stub = false;
+    full._wasm = true;
+    return full;
+  }
   const full = normalizeSession(await apiGet(sessionPath(stub.harness, stub.id)));
   full._stub = false;
   full._remote = true;
@@ -73,6 +145,14 @@ export const PAGE = 200;
  *  transcript paging stays lean. */
 export async function getMessages(stub, start, end, opts = {}) {
   if (!stub || !stub.harness || !stub.id) return null;
+  if (stub._wasm && wasmStoreRef?.messages) {
+    try {
+      const raw = JSON.parse(wasmStoreRef.messages(stub.harness, stub.id, start, end));
+      return raw && Array.isArray(raw.messages) ? raw : null;
+    } catch {
+      return null;
+    }
+  }
   try {
     const raw = await apiGet(sessionPath(stub.harness, stub.id, "/messages"), { start, end, extra: !!opts.extra });
     return raw && Array.isArray(raw.messages) ? raw : null;
@@ -90,6 +170,14 @@ export async function getMessages(stub, start, end, opts = {}) {
  *  keeps no messages answers it. `null` when unavailable; callers just show less. */
 export async function getSessionHead(stub) {
   if (!stub || !stub.harness || !stub.id) return null;
+  if (stub._wasm && wasmStoreRef?.session_head) {
+    try {
+      const raw = JSON.parse(wasmStoreRef.session_head(stub.harness, stub.id));
+      return raw && typeof raw === "object" ? raw : null;
+    } catch {
+      return null;
+    }
+  }
   try {
     const raw = await apiGet(sessionPath(stub.harness, stub.id, "/head"));
     return raw && typeof raw === "object" ? raw : null;
@@ -219,6 +307,23 @@ export async function getSubagent(parentHarness, parentId, agentId) {
 export async function searchSessions(q, opts = {}) {
   const query = String(q ?? "").trim();
   if (!query) return [];
+  if (canInvokeNative()) {
+    if (opts.signal?.aborted) throw new DOMException("Aborted", "AbortError");
+    try {
+      const raw = await apiGet("/api/search", {
+        q: query,
+        limit: opts.limit,
+        harness: opts.harness,
+        cwd: opts.cwd,
+        semantic: opts.semantic ? 1 : undefined,
+      });
+      if (opts.signal?.aborted) throw new DOMException("Aborted", "AbortError");
+      return Array.isArray(raw) ? raw : null;
+    } catch (e) {
+      if (e?.name === "AbortError") throw e;
+      return null;
+    }
+  }
   const params = new URLSearchParams({ q: query });
   if (opts.limit) params.set("limit", String(opts.limit));
   if (opts.harness) params.set("harness", opts.harness);
@@ -226,9 +331,10 @@ export async function searchSessions(q, opts = {}) {
   if (opts.semantic) params.set("semantic", "1");
   try {
     const resp = await fetch(`${CVD_BASE}/api/search?${params}`, {
-      headers: { Accept: "application/json" },
+      headers: authHeaders({ Accept: "application/json" }),
       signal: opts.signal,
     });
+    if (resp.status === 401) notifyAuthRequired();
     if (!resp.ok) return null;
     const raw = await resp.json();
     return Array.isArray(raw) ? raw : null;
@@ -242,13 +348,22 @@ export async function searchSessions(q, opts = {}) {
  *  the right thing from the first keystroke instead of discovering it on the first miss.
  *  Resolves "server" or "local"; never throws, never blocks longer than `ms`. */
 export async function probeSearch(ms = 3500) {
+  if (canInvokeNative()) {
+    try {
+      const raw = await apiGet("/api/search", { q: "cv", limit: 1 });
+      return Array.isArray(raw) ? "server" : "local";
+    } catch {
+      return "local";
+    }
+  }
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), ms);
   try {
     const resp = await fetch(`${CVD_BASE}/api/search?q=cv&limit=1`, {
-      headers: { Accept: "application/json" },
+      headers: authHeaders({ Accept: "application/json" }),
       signal: ctrl.signal,
     });
+    if (resp.status === 401) notifyAuthRequired();
     return resp.ok ? "server" : "local";
   } catch {
     return "local";
@@ -266,10 +381,7 @@ export async function probeSearch(ms = 3500) {
  *  and labels it as such. */
 export async function getCorpusStats(q) {
   try {
-    const qs = q ? `?q=${enc(q)}` : "";
-    const resp = await fetch(`${CVD_BASE}/api/stats${qs}`, { headers: { Accept: "application/json" } });
-    if (!resp.ok) return null;
-    const raw = await resp.json();
+    const raw = await apiGet("/api/stats", q ? { q } : {});
     return raw && typeof raw === "object" && typeof raw.sessions === "number" ? raw : null;
   } catch {
     return null;

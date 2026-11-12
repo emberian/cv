@@ -1,37 +1,66 @@
 // openrouter.js — a tiny, dependency-free client for OpenRouter's
 // chat/completions endpoint, plus IR↔chat conversion helpers used by the splice composer.
 //
-// The API key lives ONLY in localStorage and is sent ONLY to
-// https://openrouter.ai/api/v1/chat/completions (Bearer auth). Nothing else
-// ever sees it. There is no build step and no server — this runs in the page.
+// The API key lives ONLY in memory + sessionStorage (never persisted in localStorage)
+// and is sent ONLY to https://openrouter.ai/api/v1/chat/completions (Bearer auth).
+// Nothing else ever sees it.
 
 const ENDPOINT = "https://openrouter.ai/api/v1/chat/completions";
-const KEY_LS = "cv-openrouter-key";
+const KEY_SS = "cv-openrouter-key";
+const LEGACY_KEYS_LS = ["cv-openrouter-key", "clustervision.openrouter_key"];
 const MODEL_LS = "cv-openrouter-model";
 
-/** A few sensible presets; the model field is also free-text. */
+let memKey = "";
+
+/** Sensible current presets; the model field is also free-text. */
 export const MODEL_PRESETS = [
-  "anthropic/claude-3.5-sonnet",
-  "anthropic/claude-3.5-haiku",
-  "openai/gpt-4o-mini",
-  "openai/gpt-4o",
-  "google/gemini-flash-1.5",
-  "meta-llama/llama-3.1-70b-instruct",
+  "anthropic/claude-sonnet-4.5",
+  "anthropic/claude-haiku-4.5",
+  "openai/gpt-5-mini",
+  "openai/gpt-5",
+  "google/gemini-2.5-flash",
   "deepseek/deepseek-chat",
 ];
 
-export const DEFAULT_MODEL = "anthropic/claude-3.5-sonnet";
+export const DEFAULT_MODEL = "anthropic/claude-sonnet-4.5";
 
-// ---- credential / preference storage (localStorage only) ------------------
+// ---- credential / preference storage (memory + sessionStorage for key) -----
+
+function purgeLegacyLocalStorageKey() {
+  let migrated = "";
+  try {
+    for (const k of LEGACY_KEYS_LS) {
+      const old = localStorage.getItem(k);
+      if (old && !migrated) migrated = old;
+      if (old != null) localStorage.removeItem(k);
+    }
+  } catch { /* storage may be unavailable */ }
+  return migrated;
+}
 
 export function getKey() {
-  try { return localStorage.getItem(KEY_LS) || ""; } catch { return ""; }
+  const legacy = purgeLegacyLocalStorageKey();
+  if (memKey) return memKey;
+  try {
+    const ss = sessionStorage.getItem(KEY_SS) || "";
+    if (ss) { memKey = ss; return ss; }
+    if (legacy) {
+      memKey = legacy;
+      sessionStorage.setItem(KEY_SS, legacy);
+      return legacy;
+    }
+  } catch {
+    if (legacy) { memKey = legacy; return legacy; }
+  }
+  return "";
 }
 export function setKey(k) {
+  purgeLegacyLocalStorageKey();
+  memKey = k ? String(k) : "";
   try {
-    if (k) localStorage.setItem(KEY_LS, k);
-    else localStorage.removeItem(KEY_LS);
-  } catch { /* storage may be unavailable */ }
+    if (memKey) sessionStorage.setItem(KEY_SS, memKey);
+    else sessionStorage.removeItem(KEY_SS);
+  } catch { /* sessionStorage may be unavailable; memKey still holds it for this page */ }
 }
 export function hasKey() { return !!getKey(); }
 

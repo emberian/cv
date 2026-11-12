@@ -35,6 +35,7 @@ serde_json = "1"
 # NOTE: `cv-core`'s package name is `clustervision-core` (renamed for crates.io); the local alias
 # stays `cv_core` via `package = `, exactly as `crates/cv/Cargo.toml` does it.
 cv-core = { path = "../../crates/cv-core", package = "clustervision-core", features = ["zip-ingest"] }
+cv-search = { path = "../../crates/cv-search", default-features = false }
 
 [dev-dependencies]
 # Test fixture archives; extraction itself is shared with the browser via cv-core.

@@ -22,7 +22,8 @@ import "./cv-fleet.js";
 import { esc, normalizeSession, normalizeSessions, randomId, sessionKey } from "./util.js";
 import { isTauri, listen, canInvokeNative } from "../tauri.js";
 import {
-  apiGet, getMessages, getSessionHead, searchSessions, probeSearch, PAGE, CVD_BASE,
+  apiGet, hydrateSession, getMessages, getSessionHead, searchSessions, probeSearch,
+  authHeaders, getAuthToken, setAuthToken, registerWasmStore, PAGE, CVD_BASE,
 } from "./hydrate.js";
 
 // The read API (the native `api` command in the desktop app, a local `cv serve` in a browser)
@@ -52,10 +53,14 @@ class CvApp extends HTMLElement {
     this._isSample = true;     // true until the user loads their own data
     this._daemon = false;      // a server answered: the archive is already here
     this._searchMode = "local";
+    this._authNeeded = false;
+    this._authBarOpen = false;
+    this._onAuthRequired = () => this._promptAuth();
   }
 
   connectedCallback() {
     this.render();
+    window.addEventListener("cv:auth-required", this._onAuthRequired);
     this._init();
     this._wireKeyboard();
     this._wireTauri();
@@ -63,12 +68,14 @@ class CvApp extends HTMLElement {
 
   disconnectedCallback() {
     if (this._onKeydown) document.removeEventListener("keydown", this._onKeydown);
+    window.removeEventListener("cv:auth-required", this._onAuthRequired);
     this._unlistenTauri?.();
   }
 
   async _init() {
     const main = await import("../main.js");
     this._ingestZip = main.ingestZip;
+    this._ingestZipStateful = main.ingestZipStateful;
     this._loadSample = main.loadSample;
 
     // Load sessions FIRST, before the wasm gate — wasm is only needed for .zip ingest, and a stalled
@@ -79,6 +86,9 @@ class CvApp extends HTMLElement {
 
     // Now settle the wasm status (for the ingest/status UI), independently of session loading.
     this._wasmState = await main.wasmReady();
+    if (typeof main.getWasmStore === "function") {
+      registerWasmStore(await main.getWasmStore());
+    }
     this._updateStatus();
     if (loadedLocal) {
       // Ask once whether this daemon can search message text, so the search box promises the
@@ -172,7 +182,8 @@ class CvApp extends HTMLElement {
       const windowMeta = present(win.session);
       const full = normalizeSession({ ...stub, ...windowMeta, messages: win.messages });
       full._stub = false;
-      full._remote = true;
+      full._wasm = !!stub._wasm;
+      full._remote = !stub._wasm;
       full._totalKnown = !!win.total_known;
       if (win.total_known) full.message_count = win.total;
       if (win.has_more) full._paged = { next: win.end };
@@ -199,10 +210,7 @@ class CvApp extends HTMLElement {
     }
 
     // Whole-session path (older server, or anything the windowed endpoint couldn't serve).
-    const raw = await apiGet(`/api/session/${encodeURIComponent(stub.harness)}/${encodeURIComponent(stub.id)}`);
-    const full = normalizeSession(raw);
-    full._stub = false;
-    full._remote = true;
+    const full = await hydrateSession(stub);
     const i = this._sessions.indexOf(stub);
     if (i >= 0) this._sessions[i] = full; // cache so we don't refetch
     return full;
@@ -247,13 +255,44 @@ class CvApp extends HTMLElement {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), ms);
     try {
-      const resp = await fetch(url, { headers: { Accept: "application/json" }, signal: ctrl.signal });
+      const resp = await fetch(url, {
+        headers: authHeaders({ Accept: "application/json" }),
+        signal: ctrl.signal,
+      });
+      if (resp.status === 401) {
+        this._promptAuth();
+        return null;
+      }
       return resp.ok ? await resp.json() : null;
     } catch {
       return null;
     } finally {
       clearTimeout(timer);
     }
+  }
+
+  _promptAuth() {
+    this._authNeeded = true;
+    this._authBarOpen = true;
+    this._renderAuthBar();
+  }
+
+  _renderAuthBar() {
+    const bar = this.querySelector(".auth-bar");
+    if (!bar) return;
+    const open = !!(this._authBarOpen || this._authNeeded);
+    bar.hidden = !open;
+    const note = bar.querySelector(".auth-note");
+    if (note) {
+      note.textContent = this._authNeeded
+        ? "cv serve requires a bearer token (401 Unauthorized):"
+        : "Bearer token for cv serve --token (sessionStorage only):";
+    }
+    const input = bar.querySelector(".auth-token-input");
+    if (input && open && document.activeElement !== input) {
+      input.value = getAuthToken();
+    }
+    this._syncChromeHeight();
   }
 
   /** Show a session in the transcript, hydrating from the read API first if it's only a stub.
@@ -319,12 +358,21 @@ class CvApp extends HTMLElement {
           </div>
         </div>
         <div class="header-actions">
+          <button type="button" class="icon-btn token-btn" title="Bearer token for cv serve --token" aria-label="Bearer token">🔑</button>
           <button type="button" class="icon-btn help-btn" title="Keyboard shortcuts (?)" aria-label="Keyboard shortcuts">?</button>
           <button type="button" class="icon-btn theme-toggle" title="Toggle theme — dark / light / auto (t)" aria-label="Toggle theme">◐</button>
           <a class="repo-link" href="https://emberian.github.io/clustervision/manual/" target="_blank" rel="noopener" title="User manual">manual</a>
           <a class="repo-link" href="https://github.com/emberian/cv" target="_blank" rel="noopener" title="Project repository">source</a>
         </div>
       </header>
+
+      <form class="auth-bar" hidden>
+        <span class="auth-note">Bearer token for cv serve --token:</span>
+        <input type="password" class="auth-token-input" placeholder="paste bearer token…" aria-label="Bearer token" autocomplete="off" />
+        <button type="submit" class="mini-btn">Unlock</button>
+        <button type="button" class="mini-btn" data-auth-clear>Clear</button>
+        <button type="button" class="mini-btn" data-auth-close aria-label="Dismiss">✕</button>
+      </form>
 
       <div class="dropzone" tabindex="0" role="button" aria-label="Upload or drop .zip / .json session files">
         <input type="file" class="file-input" accept=".zip,.json,application/zip,application/json" multiple hidden />
@@ -368,6 +416,7 @@ class CvApp extends HTMLElement {
 
     this._wireDropzone();
     this._wireTheme();
+    this._wireAuthBar();
     this.querySelector(".help-btn")?.addEventListener("click", () => this._toggleHelp());
     this._renderView();
     this._renderSources();
@@ -556,6 +605,44 @@ class CvApp extends HTMLElement {
       `<span class="src-chip" title="${esc(s.name)}">${esc(s.name)} <b>${s.count}</b></span>`).join("");
   }
 
+  _wireAuthBar() {
+    const bar = this.querySelector(".auth-bar");
+    const input = bar?.querySelector(".auth-token-input");
+    this.querySelector(".token-btn")?.addEventListener("click", () => {
+      this._authBarOpen = !this._authBarOpen;
+      if (!this._authBarOpen) this._authNeeded = false;
+      this._renderAuthBar();
+      if (this._authBarOpen) input?.focus();
+    });
+    bar?.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      setAuthToken(input?.value || "");
+      this._authNeeded = false;
+      this._authBarOpen = false;
+      this._renderAuthBar();
+      const loaded = await this._tryLoadLocal();
+      if (loaded) {
+        probeSearch().then((mode) => {
+          this._searchMode = mode;
+          if (this._list) this._list.searchMode = mode;
+        });
+      }
+    });
+    bar?.querySelector("[data-auth-clear]")?.addEventListener("click", () => {
+      setAuthToken("");
+      if (input) input.value = "";
+      this._authNeeded = false;
+      this._authBarOpen = false;
+      this._renderAuthBar();
+    });
+    bar?.querySelector("[data-auth-close]")?.addEventListener("click", () => {
+      this._authNeeded = false;
+      this._authBarOpen = false;
+      this._renderAuthBar();
+    });
+    this._renderAuthBar();
+  }
+
   _wireTheme() {
     const root = document.documentElement;
     const stored = localStorage.getItem("cv-theme");
@@ -711,11 +798,13 @@ class CvApp extends HTMLElement {
   }
 
   async _handleFiles(files) {
-    let added = 0, failed = 0;
+    let added = 0, failed = 0, skippedTotal = 0;
     for (const file of files) {
       this._setStatus(`Reading ${file.name}…`);
+      this._lastSkipped = [];
       try {
         const got = await this._ingestOne(file);
+        skippedTotal += (this._lastSkipped?.length || 0);
         if (got.length) {
           // A failed/empty import must not discard the existing demo pool.
           if (this._isSample) { this._sessions = []; this._sources = []; this._isSample = false; }
@@ -723,7 +812,8 @@ class CvApp extends HTMLElement {
           this._sources.push({ name: file.name, count: got.length });
           added += got.length;
         } else {
-          this._setStatus(`No sessions found in ${file.name}.`, "warn");
+          const skipNote = this._lastSkipped?.length ? ` (${this._lastSkipped.length} skipped)` : "";
+          this._setStatus(`No sessions found in ${file.name}${skipNote}.`, "warn");
         }
       } catch (err) {
         console.error(err);
@@ -735,11 +825,16 @@ class CvApp extends HTMLElement {
     this._renderSources();
     this._refreshViews();
     if (this._list && this._sessions[0] && !this._list.selectedId) {
-      this._transcript.session = this._sessions[0];
-      this._list.selectedSession = this._sessions[0];
+      if (this._needsHydration(this._sessions[0])) {
+        this._showSession(this._sessions[0]);
+      } else {
+        this._transcript.session = this._sessions[0];
+        this._list.selectedSession = this._sessions[0];
+      }
     }
     if (added) {
-      this._setStatus(`Pool now has ${this._sessions.length} session${this._sessions.length === 1 ? "" : "s"} from ${this._sources.length} source${this._sources.length === 1 ? "" : "s"}.`, failed ? "warn" : "ok");
+      const skipNote = skippedTotal ? ` (${skippedTotal} skipped)` : "";
+      this._setStatus(`Pool now has ${this._sessions.length} session${this._sessions.length === 1 ? "" : "s"} from ${this._sources.length} source${this._sources.length === 1 ? "" : "s"}${skipNote}.`, failed || skippedTotal ? "warn" : "ok");
     }
   }
 
@@ -752,6 +847,15 @@ class CvApp extends HTMLElement {
     }
     if (/\.zip$/i.test(name) || file.type === "application/zip") {
       const buf = new Uint8Array(await file.arrayBuffer());
+      if (typeof this._ingestZipStateful === "function") {
+        const res = await this._ingestZipStateful(buf);
+        this._lastSkipped = res.skipped || [];
+        const sessions = normalizeSessions(res.sessions);
+        if (res.stateful) {
+          for (const s of sessions) { s._stub = true; s._wasm = true; }
+        }
+        return sessions;
+      }
       const raw = await this._ingestZip(buf);
       return normalizeSessions(raw);
     }

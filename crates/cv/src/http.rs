@@ -426,9 +426,28 @@ impl Request<'_> {
             return;
         }
         self.responded = true;
+        if response.is_sse() {
+            self.keep_alive = false;
+        }
         let head_only = self.head.method == "HEAD";
+        let stream = &self.src.get_ref().stream;
+        let peer_closed = || -> bool {
+            let mut one = [0u8; 1];
+            if stream.set_nonblocking(true).is_err() {
+                return false;
+            }
+            let closed = matches!(stream.peek(&mut one), Ok(0));
+            let _ = stream.set_nonblocking(false);
+            closed
+        };
         if response
-            .write_to(&self.src.get_ref().stream, self.keep_alive, head_only)
+            .write_to_with(
+                stream,
+                self.keep_alive,
+                head_only,
+                self.head.version_11,
+                Some(&peer_closed),
+            )
             .is_err()
         {
             self.broken = true;
@@ -515,12 +534,87 @@ fn line_io(e: LineError) -> io::Error {
     }
 }
 
-/// A response: status, headers, and a body of known length (bytes in memory, or a reader).
+type SseBodyFn<'a> = Box<dyn FnOnce(&mut SseWriter<'_>) -> io::Result<()> + 'a>;
+
+enum ResponseBody<'a> {
+    Sized { body: Box<dyn Read + 'a>, len: u64 },
+    Sse(SseBodyFn<'a>),
+}
+
+/// Framed writer for `text/event-stream` responses (chunked on HTTP/1.1, EOF-delimited on HTTP/1.0).
+pub(crate) struct SseWriter<'w> {
+    out: &'w mut dyn Write,
+    chunked: bool,
+    peer_closed: Option<&'w dyn Fn() -> bool>,
+    scratch: Vec<u8>,
+}
+
+impl<'w> SseWriter<'w> {
+    /// True once the client has closed its write half, allowing idle streams to exit promptly.
+    pub(crate) fn peer_closed(&self) -> bool {
+        self.peer_closed.is_some_and(|check| check())
+    }
+
+    /// Emit one SSE event (`id:`, `event:`, one `data:` line per `\n`, blank line) and flush.
+    pub(crate) fn event(&mut self, id: Option<&str>, event: Option<&str>, data: &str) -> io::Result<()> {
+        self.scratch.clear();
+        if let Some(id) = id {
+            self.scratch.extend_from_slice(b"id: ");
+            push_sse_field(&mut self.scratch, id);
+            self.scratch.push(b'\n');
+        }
+        if let Some(event) = event {
+            self.scratch.extend_from_slice(b"event: ");
+            push_sse_field(&mut self.scratch, event);
+            self.scratch.push(b'\n');
+        }
+        for line in data.split('\n') {
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            self.scratch.extend_from_slice(b"data: ");
+            self.scratch.extend_from_slice(line.as_bytes());
+            self.scratch.push(b'\n');
+        }
+        self.scratch.push(b'\n');
+        self.flush_frame()
+    }
+
+    /// Emit an SSE comment (`: ...\n\n`) heartbeat and flush.
+    pub(crate) fn comment(&mut self, text: &str) -> io::Result<()> {
+        self.scratch.clear();
+        self.scratch.extend_from_slice(b": ");
+        push_sse_field(&mut self.scratch, text);
+        self.scratch.extend_from_slice(b"\n\n");
+        self.flush_frame()
+    }
+
+    fn flush_frame(&mut self) -> io::Result<()> {
+        if self.scratch.is_empty() {
+            return Ok(());
+        }
+        if self.chunked {
+            write!(self.out, "{:x}\r\n", self.scratch.len())?;
+            self.out.write_all(&self.scratch)?;
+            self.out.write_all(b"\r\n")?;
+        } else {
+            self.out.write_all(&self.scratch)?;
+        }
+        self.out.flush()
+    }
+}
+
+fn push_sse_field(out: &mut Vec<u8>, s: &str) {
+    for b in s.bytes() {
+        if b != b'\r' && b != b'\n' && b != 0 {
+            out.push(b);
+        }
+    }
+}
+
+/// A response: status, headers, and a body of known length or a server-sent event stream.
 pub(crate) struct Response<'a> {
     status: u16,
     headers: Vec<(String, String)>,
-    body: Box<dyn Read + 'a>,
-    len: u64,
+    body: ResponseBody<'a>,
 }
 
 impl<'a> Response<'a> {
@@ -529,8 +623,10 @@ impl<'a> Response<'a> {
         Response {
             status,
             headers: Vec::new(),
-            body: Box::new(io::Cursor::new(body)),
-            len,
+            body: ResponseBody::Sized {
+                body: Box::new(io::Cursor::new(body)),
+                len,
+            },
         }
     }
 
@@ -543,9 +639,25 @@ impl<'a> Response<'a> {
         Response {
             status,
             headers: Vec::new(),
-            body,
-            len,
+            body: ResponseBody::Sized { body, len },
         }
+    }
+
+    /// A `text/event-stream` response streamed as HTTP/1.1 chunks with write-stall deadlines.
+    pub(crate) fn sse(stream_fn: impl FnOnce(&mut SseWriter<'_>) -> io::Result<()> + 'a) -> Self {
+        let mut resp = Response {
+            status: 200,
+            headers: Vec::new(),
+            body: ResponseBody::Sse(Box::new(stream_fn)),
+        };
+        resp.add_header("Content-Type", "text/event-stream; charset=utf-8");
+        resp.add_header("Cache-Control", "no-cache");
+        resp.add_header("X-Accel-Buffering", "no");
+        resp
+    }
+
+    pub(crate) fn is_sse(&self) -> bool {
+        matches!(self.body, ResponseBody::Sse(_))
     }
 
     /// Add a header. One that could not be sent intact (not a token name, or a value outside
@@ -556,7 +668,18 @@ impl<'a> Response<'a> {
         }
     }
 
-    pub(crate) fn write_to(mut self, out: impl Write, keep_alive: bool, head_only: bool) -> io::Result<()> {
+    pub(crate) fn write_to(self, out: impl Write, keep_alive: bool, head_only: bool) -> io::Result<()> {
+        self.write_to_with(out, keep_alive, head_only, true, None)
+    }
+
+    pub(crate) fn write_to_with(
+        self,
+        out: impl Write,
+        keep_alive: bool,
+        head_only: bool,
+        version_11: bool,
+        peer_closed: Option<&dyn Fn() -> bool>,
+    ) -> io::Result<()> {
         let mut out = BufWriter::new(out);
         let date = chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S GMT");
         write!(
@@ -569,34 +692,58 @@ impl<'a> Response<'a> {
             write!(out, "{name}: {value}\r\n")?;
         }
         let bodiless = self.status == 204 || self.status == 304 || self.status < 200;
-        if !bodiless {
-            write!(out, "Content-Length: {}\r\n", self.len)?;
-        }
-        if !keep_alive {
-            out.write_all(b"Connection: close\r\n")?;
-        }
-        out.write_all(b"\r\n")?;
-        if !bodiless && !head_only {
-            let sent = io::copy(&mut (&mut self.body).take(self.len), &mut out)?;
-            if sent != self.len {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "response body ended early",
-                ));
+        match self.body {
+            ResponseBody::Sized { mut body, len } => {
+                if !bodiless {
+                    write!(out, "Content-Length: {len}\r\n")?;
+                }
+                if !keep_alive {
+                    out.write_all(b"Connection: close\r\n")?;
+                }
+                out.write_all(b"\r\n")?;
+                if !bodiless && !head_only {
+                    let sent = io::copy(&mut (&mut body).take(len), &mut out)?;
+                    if sent != len {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "response body ended early",
+                        ));
+                    }
+                    // A body longer than its declared length lies as much as a short one; its tail must
+                    // not vanish behind a response that looks complete. Every body is a staged file or a
+                    // buffer, so this is one read that answers EOF when the length is right.
+                    let mut surplus = [0u8; 1];
+                    if body.read(&mut surplus)? != 0 {
+                        out.flush()?;
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "response body exceeds its Content-Length",
+                        ));
+                    }
+                }
+                out.flush()
             }
-            // A body longer than its declared length lies as much as a short one; its tail must
-            // not vanish behind a response that looks complete. Every body is a staged file or a
-            // buffer, so this is one read that answers EOF when the length is right.
-            let mut surplus = [0u8; 1];
-            if self.body.read(&mut surplus)? != 0 {
+            ResponseBody::Sse(stream_fn) => {
+                if version_11 && !bodiless {
+                    out.write_all(b"Transfer-Encoding: chunked\r\n")?;
+                }
+                out.write_all(b"Connection: close\r\n\r\n")?;
                 out.flush()?;
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "response body exceeds its Content-Length",
-                ));
+                if !bodiless && !head_only {
+                    let mut writer = SseWriter {
+                        out: &mut out,
+                        chunked: version_11,
+                        peer_closed,
+                        scratch: Vec::with_capacity(256),
+                    };
+                    stream_fn(&mut writer)?;
+                    if version_11 {
+                        out.write_all(b"0\r\n\r\n")?;
+                    }
+                }
+                out.flush()
             }
         }
-        out.flush()
     }
 }
 
@@ -806,5 +953,38 @@ mod tests {
         response.write_to(&mut out, true, false).unwrap();
         let out = String::from_utf8(out).unwrap();
         assert!(out.contains("X-Ok: fine\tvalue\r\n") && !out.contains("Injected") && !out.contains("Bad Name"));
+    }
+
+    #[test]
+    fn sse_frames_events_as_http11_chunks_and_http10_eof() {
+        let mut out = Vec::new();
+        Response::sse(|sse| {
+            sse.comment("keepalive")?;
+            sse.event(Some("7\r\nbad"), Some("change\n"), "{\"cursor\":7}\nsecond")
+        })
+        .write_to_with(&mut out, true, false, true, None)
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("Content-Type: text/event-stream; charset=utf-8\r\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n"),
+            "{text}"
+        );
+        assert!(text.contains("\r\n: keepalive\n\n\r\n"), "{text}");
+        assert!(
+            text.contains("id: 7bad\nevent: change\ndata: {\"cursor\":7}\ndata: second\n\n\r\n0\r\n\r\n"),
+            "{text}"
+        );
+
+        let mut out10 = Vec::new();
+        Response::sse(|sse| sse.event(Some("1"), None, "ok"))
+            .write_to_with(&mut out10, false, false, false, None)
+            .unwrap();
+        let text10 = String::from_utf8(out10).unwrap();
+        assert!(!text10.contains("Transfer-Encoding"), "{text10}");
+        assert!(text10.ends_with("\r\n\r\nid: 1\ndata: ok\n\n"), "{text10}");
     }
 }

@@ -212,7 +212,7 @@ class CvStats extends HTMLElement {
         <div class="stat-cols">
           <section class="stat-block">
             <h3>Sessions per harness</h3>
-            ${this._barsHtml(a.perHarness, (k) => HARNESS_LABELS[k] || k, (k) => `var(--h-${k}, var(--accent))`)}
+            ${this._barsHtml(a.perHarness, (k) => HARNESS_LABELS[k] || k, (k) => `var(--h-${/^[a-z0-9_-]+$/.test(String(k)) ? k : "opensession"}, var(--accent))`)}
           </section>
           <section class="stat-block">
             <h3>Top working directories</h3>
@@ -269,7 +269,7 @@ class CvStats extends HTMLElement {
     return `<div class="bars">${entries.map(([k, v]) => `
       <div class="bar-row">
         <span class="bar-label">${esc(labelFn(k))}</span>
-        <span class="bar-track"><span class="bar-fill" style="width:${(v / max * 100).toFixed(1)}%; background:${colorFn(k)}"></span></span>
+        <span class="bar-track"><span class="bar-fill" style="width:${(v / max * 100).toFixed(1)}%; background:${esc(colorFn(k))}"></span></span>
         <span class="bar-val muted">${v.toLocaleString()}</span>
       </div>`).join("")}</div>`;
   }

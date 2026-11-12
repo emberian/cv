@@ -20,6 +20,7 @@
 // when a section is unchanged.
 import "./cv-harness-badge.js";
 import { msgCount, esc, fmtTime, sessionLabel, shortPath } from "./util.js";
+import { authHeaders, getAuthToken, setAuthToken } from "./hydrate.js";
 
 const BASE_LS = "cv-fleet-base";
 const DEFAULT_BASE = "http://localhost:7777";
@@ -55,7 +56,12 @@ const FLEET_STYLES = `
     backdrop-filter: blur(6px);
     border-radius: 10px;
   }
-  cv-fleet .fleet-base:focus {
+  cv-fleet .fleet-token {
+    width: 120px; font: inherit; font-family: var(--mono); font-size: 12.5px;
+    padding: 5px 9px; border-radius: 7px; border: 1px solid var(--border);
+    background: var(--bg); color: var(--fg);
+  }
+  cv-fleet .fleet-base:focus, cv-fleet .fleet-token:focus {
     outline: none; border-color: var(--accent);
     box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 25%, transparent);
   }
@@ -142,7 +148,8 @@ class CvFleet extends HTMLElement {
 
   async _fetchJson(path, signal) {
     const url = this._base.replace(/\/+$/, "") + path;
-    const resp = await fetch(url, { signal, headers: { Accept: "application/json" } });
+    const resp = await fetch(url, { signal, headers: authHeaders({ Accept: "application/json" }) });
+    if (resp.status === 401) throw new Error(`${path} → HTTP 401 (enter bearer token in toolbar)`);
     if (!resp.ok) throw new Error(`${path} → HTTP ${resp.status}`);
     return resp.json();
   }
@@ -229,6 +236,10 @@ class CvFleet extends HTMLElement {
           <span class="muted">base URL</span>
           <input class="fleet-base" type="text" placeholder="${DEFAULT_BASE}" aria-label="cv serve base URL" />
         </label>
+        <label class="fleet-field">
+          <span class="muted">token</span>
+          <input class="fleet-token" type="password" placeholder="optional" aria-label="Bearer token" autocomplete="off" />
+        </label>
         <button type="button" class="mini-btn" data-fleet-connect>reconnect</button>
         <button type="button" class="mini-btn" data-fleet-pause aria-pressed="false">⏸ pause</button>
         <button type="button" class="mini-btn" data-fleet-refresh title="Poll now">⟳</button>
@@ -242,6 +253,8 @@ class CvFleet extends HTMLElement {
     // The base-URL <input> value is owned by the user while focused; set it once.
     const baseEl = this.querySelector(".fleet-base");
     if (baseEl) baseEl.value = this._base;
+    const tokEl = this.querySelector(".fleet-token");
+    if (tokEl) tokEl.value = getAuthToken();
     this._wireToolbar();
   }
 
@@ -359,9 +372,14 @@ class CvFleet extends HTMLElement {
     baseEl?.addEventListener("change", () => { this._base = baseEl.value.trim() || DEFAULT_BASE; this._write(BASE_LS, this._base); });
     baseEl?.addEventListener("keydown", (e) => { if (e.key === "Enter") { this._base = baseEl.value.trim() || DEFAULT_BASE; this._write(BASE_LS, this._base); this._start(); } });
 
+    const tokEl = this.querySelector(".fleet-token");
+    tokEl?.addEventListener("change", () => { setAuthToken(tokEl.value); });
+    tokEl?.addEventListener("keydown", (e) => { if (e.key === "Enter") { setAuthToken(tokEl.value); this._start(); } });
+
     this.querySelector("[data-fleet-connect]")?.addEventListener("click", () => {
       this._base = (this.querySelector(".fleet-base")?.value || this._base).trim() || DEFAULT_BASE;
       this._write(BASE_LS, this._base);
+      if (tokEl) setAuthToken(tokEl.value);
       this._paused = false;
       this._start();
     });

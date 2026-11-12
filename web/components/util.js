@@ -197,10 +197,32 @@ export const HARNESS_LABELS = {
   grok: "Grok",
   opencode: "OpenCode",
   gemini: "Gemini",
+  antigravity: "Antigravity",
   hermes: "Hermes",
   openclaw: "OpenClaw",
+  cursor: "Cursor",
+  kimi: "Kimi",
+  "kimi-code": "Kimi Code",
+  qwen: "Qwen",
+  lmstudio: "LM Studio",
+  cline: "Cline",
+  roo: "Roo",
+  continue: "Continue",
+  goose: "Goose",
+  zed: "Zed",
+  devin: "Devin",
+  "chatgpt-export": "ChatGPT Export",
+  "claude-export": "Claude Export",
   opensession: "OpenSession",
 };
+
+const HARNESS_SLUG_RE = /^[a-z0-9_-]+$/;
+
+/** Validate a harness slug so untrusted JSON cannot smuggle HTML/CSS syntax via `s.harness`. */
+export function sanitizeHarness(value) {
+  const h = String(value || "opensession").trim().toLowerCase();
+  return HARNESS_SLUG_RE.test(h) ? h : "opensession";
+}
 
 // ---------------------------------------------------------------------------
 // Normalization — one chokepoint. Every session in the pool passes through here,
@@ -340,7 +362,7 @@ export function normalizeSession(s) {
   refuseOldOpenSession(s);
   return {
     id: s.id ?? randomId(),
-    harness: (s.harness || "opensession").toLowerCase(),
+    harness: sanitizeHarness(s.harness),
     cwd: s.cwd,
     path: s.path,
     title: s.title,

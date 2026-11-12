@@ -218,18 +218,29 @@ pub(crate) fn emit_session_output(
 
 // ---------- resume ----------
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ResumeTarget {
+    Cli { program: &'static str, args: Vec<String> },
+    GuiOnly { hint: String },
+}
+
 pub(crate) fn cmd_resume(id: &str, harness: Option<String>, launch: bool) -> Result<()> {
     let want = parse_harness(&harness)?;
     let (r, _adapter) = resolve(id, want)?;
     let cwd = r.cwd.clone();
-    let (program, args) = resume_command(r.harness, &r.id);
 
     if launch {
+        let (program, args) = match resume_target(r.harness, &r.id) {
+            ResumeTarget::Cli { program, args } => (program, args),
+            ResumeTarget::GuiOnly { hint } => {
+                return crate::util::usage(format!("cannot --launch {}: {hint}", r.harness));
+            }
+        };
         let dir = cwd
             .clone()
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
         eprintln!("✦ launching: (cd {}) {} {}", home_rel(&dir), program, args.join(" "));
-        let status = std::process::Command::new(&program)
+        let status = std::process::Command::new(program)
             .args(&args)
             .current_dir(&dir)
             .status()
@@ -248,55 +259,108 @@ pub(crate) fn cmd_resume(id: &str, harness: Option<String>, launch: bool) -> Res
 }
 
 /// The resume incantation `cv resume` prints, as lines: `cd <cwd>` (when known), then the
-/// harness's own resume command. Shared with `cv rewind`, which prints it for the session it made.
+/// harness's own resume command (or a comment hint when the harness has no CLI resume). Shared
+/// with `cv rewind`, which prints it for the session it made.
 pub(crate) fn resume_lines(h: Harness, id: &str, cwd: Option<&Path>) -> Vec<String> {
-    let (program, args) = resume_command(h, id);
-    let mut out = Vec::new();
-    if let Some(dir) = cwd {
-        out.push(format!("cd {}", shell_quote(&dir.display().to_string())));
+    match resume_target(h, id) {
+        ResumeTarget::Cli { program, args } => {
+            let mut out = Vec::new();
+            if let Some(dir) = cwd {
+                out.push(format!("cd {}", shell_quote(&dir.display().to_string())));
+            }
+            if args.is_empty() {
+                out.push(program.to_string());
+            } else {
+                out.push(format!(
+                    "{program} {}",
+                    args.iter().map(|arg| shell_quote(arg)).collect::<Vec<_>>().join(" ")
+                ));
+            }
+            out
+        }
+        ResumeTarget::GuiOnly { hint } => vec![format!("# {hint}")],
     }
-    out.push(format!(
-        "{} {}",
-        program,
-        args.iter().map(|arg| shell_quote(arg)).collect::<Vec<_>>().join(" ")
-    ));
-    out
 }
 
-/// Best-known resume incantation per harness: the program + its args (the cwd is handled
-/// separately, since most harnesses resume relative to the directory they're launched in). A
-/// per-harness table, so a new harness states its own.
-fn resume_command(h: Harness, id: &str) -> (String, Vec<String>) {
+/// Best-known resume target per harness: either the CLI program + args (cwd is handled separately,
+/// since most harnesses resume relative to the directory they're launched in) or a GUI-only hint
+/// that `cv resume --launch` refuses with exit 2 instead of `execvp`-ing a comment string.
+pub(crate) fn resume_target(h: Harness, id: &str) -> ResumeTarget {
     match h {
-        Harness::Claude => ("claude".into(), vec!["--resume".into(), id.into()]),
-        Harness::Codex => ("codex".into(), vec!["resume".into(), id.into()]),
-        Harness::Grok => ("grok".into(), vec!["--resume".into(), id.into()]),
-        Harness::OpenCode => ("opencode".into(), vec!["--session".into(), id.into()]),
-        Harness::Gemini => ("gemini".into(), vec!["--resume".into(), id.into()]),
-        Harness::Antigravity => ("agy".into(), vec!["--conversation".into(), id.into()]),
-        Harness::Hermes => ("hermes".into(), vec!["resume".into(), id.into()]),
-        Harness::OpenClaw => ("openclaw".into(), vec!["--resume".into(), id.into()]),
-        Harness::Kimi => ("kimi".into(), vec!["--resume".into(), id.into()]),
+        Harness::Claude => ResumeTarget::Cli {
+            program: "claude",
+            args: vec!["--resume".into(), id.into()],
+        },
+        Harness::Codex => ResumeTarget::Cli {
+            program: "codex",
+            args: vec!["resume".into(), id.into()],
+        },
+        Harness::Grok => ResumeTarget::Cli {
+            program: "grok",
+            args: vec!["--resume".into(), id.into()],
+        },
+        Harness::OpenCode => ResumeTarget::Cli {
+            program: "opencode",
+            args: vec!["--session".into(), id.into()],
+        },
+        Harness::Gemini => ResumeTarget::Cli {
+            program: "gemini",
+            args: vec!["--resume".into(), id.into()],
+        },
+        Harness::Antigravity => ResumeTarget::Cli {
+            program: "agy",
+            args: vec!["--conversation".into(), id.into()],
+        },
+        Harness::Hermes => ResumeTarget::Cli {
+            program: "hermes",
+            args: vec!["resume".into(), id.into()],
+        },
+        Harness::OpenClaw => ResumeTarget::Cli {
+            program: "openclaw",
+            args: vec!["--resume".into(), id.into()],
+        },
+        Harness::Cursor => ResumeTarget::Cli {
+            program: "cursor-agent",
+            args: vec!["--resume".into(), id.into()],
+        },
+        Harness::Kimi => ResumeTarget::Cli {
+            program: "kimi",
+            args: vec!["--resume".into(), id.into()],
+        },
         // Kimi Code (`kimi --session <id>` / `-S`): the native id is `session_<uuid>`; cv keys the
         // session by the bare uuid so prefixes work like every other harness.
-        Harness::KimiCode => ("kimi".into(), vec!["--session".into(), format!("session_{id}")]),
-        Harness::Qwen => ("qwen".into(), vec!["--resume".into(), id.into()]),
-        Harness::Devin => ("devin".into(), vec!["--resume".into(), id.into()]),
-        // Desktop/IDE apps, Goose, the account exports and OpenSession documents have no
-        // documented CLI resume.
-        Harness::Cursor
-        | Harness::LmStudio
-        | Harness::Cline
+        Harness::KimiCode => ResumeTarget::Cli {
+            program: "kimi",
+            args: vec!["--session".into(), format!("session_{id}")],
+        },
+        Harness::Qwen => ResumeTarget::Cli {
+            program: "qwen",
+            args: vec!["--resume".into(), id.into()],
+        },
+        Harness::Cline => ResumeTarget::Cli {
+            program: "cline",
+            args: vec!["--resume".into(), id.into()],
+        },
+        Harness::Continue => ResumeTarget::Cli {
+            program: "cn",
+            args: vec!["--resume".into()],
+        },
+        Harness::Goose => ResumeTarget::Cli {
+            program: "goose",
+            args: vec!["session".into(), "--resume".into(), "--session-id".into(), id.into()],
+        },
+        Harness::Devin => ResumeTarget::Cli {
+            program: "devin",
+            args: vec!["--resume".into(), id.into()],
+        },
+        Harness::LmStudio
         | Harness::Roo
-        | Harness::Continue
-        | Harness::Goose
         | Harness::Zed
         | Harness::ChatGptExport
         | Harness::ClaudeExport
-        | Harness::OpenSession => (
-            format!("# no CLI resume for {h}; open the app and find the session"),
-            vec![id.into()],
-        ),
+        | Harness::OpenSession => ResumeTarget::GuiOnly {
+            hint: format!("no CLI resume for {h}; open the app and find session {id}"),
+        },
     }
 }
 
@@ -345,5 +409,59 @@ mod context_tests {
         assert_eq!(copy_context_if_absent(&source, &destination).unwrap(), None);
         assert!(destination.is_symlink());
         assert!(!missing.exists());
+    }
+
+    #[test]
+    fn resume_target_separates_cli_programs_from_gui_hints() {
+        for h in Harness::ALL {
+            match resume_target(h, "sess-42") {
+                ResumeTarget::Cli { program, args } => {
+                    assert!(
+                        !program.is_empty() && !program.starts_with('#') && !program.contains(' '),
+                        "invalid CLI program for {h}: {program:?}"
+                    );
+                    let lines = resume_lines(h, "sess-42", Some(Path::new("/work/app")));
+                    assert_eq!(lines[0], "cd /work/app");
+                    assert!(lines[1].starts_with(program), "{h}: {:?} ({args:?})", lines[1]);
+                }
+                ResumeTarget::GuiOnly { hint } => {
+                    assert!(!hint.starts_with('#') && hint.contains(h.as_str()), "{h}: {hint}");
+                    let lines = resume_lines(h, "sess-42", Some(Path::new("/work/app")));
+                    assert_eq!(lines, vec![format!("# {hint}")]);
+                }
+            }
+        }
+        assert_eq!(
+            resume_target(Harness::parse("goose").unwrap(), "abc"),
+            ResumeTarget::Cli {
+                program: "goose",
+                args: vec!["session".into(), "--resume".into(), "--session-id".into(), "abc".into()],
+            }
+        );
+        assert_eq!(
+            resume_target(Harness::parse("cursor").unwrap(), "abc"),
+            ResumeTarget::Cli {
+                program: "cursor-agent",
+                args: vec!["--resume".into(), "abc".into()],
+            }
+        );
+        assert_eq!(
+            resume_target(Harness::parse("continue").unwrap(), "abc"),
+            ResumeTarget::Cli {
+                program: "cn",
+                args: vec!["--resume".into()],
+            }
+        );
+        assert_eq!(
+            resume_target(Harness::parse("cline").unwrap(), "abc"),
+            ResumeTarget::Cli {
+                program: "cline",
+                args: vec!["--resume".into(), "abc".into()],
+            }
+        );
+        assert!(matches!(
+            resume_target(Harness::parse("opensession").unwrap(), "abc"),
+            ResumeTarget::GuiOnly { .. }
+        ));
     }
 }
