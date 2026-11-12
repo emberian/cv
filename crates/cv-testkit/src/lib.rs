@@ -33,9 +33,17 @@ use std::process::{Command, Stdio};
 /// all harness store/export root overrides, the pack LLM switch (tests exercise the zero-network digest), and the server
 /// tokens (a token in the shell must not gate a test's requests).
 pub const CLEARED_ENV: &[&str] = &[
+    "CLUSTERVISION_CACHE",
     "CV_ENDPOINT",
     "CV_FROZEN",
     "CV_LIVE_BYTES",
+    "CV_SERVE_HUB",
+    "CV_PRODUCER_ID",
+    "CV_RECEIPT_STRICT",
+    "CV_HOOK_HARNESS",
+    "CV_IO_DEVICE_CLASS",
+    "CV_IO_MAX_STREAMS",
+    "CV_BYTE_SOURCE_POLICY",
     "CLAUDE_CONFIG_DIR",
     "CLUSTERVISION_CLAUDE_ROOTS",
     "CLUSTERVISION_MAX_STALE_SECS",

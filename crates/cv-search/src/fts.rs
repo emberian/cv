@@ -4794,6 +4794,7 @@ mod tests {
             let home = tmpdir();
             let scope = (*cv_core::env::Env::current()).clone().enter();
             scope.set("CLUSTERVISION_HOME", &*home);
+            scope.remove("CLUSTERVISION_CACHE");
             IsolatedHome { _scope: scope, home }
         }
     }
@@ -7995,6 +7996,7 @@ mod tests {
         let (dir, home) = (tmpdir(), tmpdir());
         let scope = (*cv_core::env::Env::current()).clone().enter();
         scope.set("CLUSTERVISION_HOME", &*home);
+        scope.remove("CLUSTERVISION_CACHE");
         let swept = sweep(&dir, refs.to_vec(), false, false).unwrap();
         assert_eq!((swept.resumed, swept.errors), (0, 0));
         let seen = observe(&dir, refs, words);
