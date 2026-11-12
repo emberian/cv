@@ -167,7 +167,7 @@ fn api_search(params: &cv_core::api::Query) -> (u16, Value) {
         Ok(bytes) => bytes.map(|b| b as u64),
         Err(error) => return bad(400, &error),
     };
-    let searcher = cv_search::Searcher::default();
+    let searcher = cv_search::Searcher;
     let found = match searcher.search(&q, filter, limit, source, live_bytes) {
         Ok(found) => found,
         Err(e) if scan => return bad(500, &format!("live scan failed: {e:#}")),
