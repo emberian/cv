@@ -1019,50 +1019,8 @@ fn rows_from(conn: &Connection, walk: &Walk) -> Result<std::collections::HashMap
     let msg_cols = super::store::sqlite::columns(conn, "messages");
     let mut messages: HashMap<String, (u64, i64, u64)> = HashMap::new();
     {
-        let mut exprs = vec![
-            "session_id".to_string(),
-            "id".to_string(),
-            "role".to_string(),
-            "tool_call_id".to_string(),
-            "tool_name".to_string(),
-            "timestamp".to_string(),
-        ];
-        for col in [
-            "active",
-            "compacted",
-            "_compressed_summary",
-            "display_kind",
-            "finish_reason",
-            "token_count",
-            "observed",
-            "effect_disposition",
-            "platform_message_id",
-            "message_uid",
-            "tool_call_uid",
-        ] {
-            if msg_cols.contains(col) {
-                exprs.push(col.to_string());
-            }
-        }
-        for col in [
-            "content",
-            "tool_calls",
-            "reasoning",
-            "reasoning_content",
-            "reasoning_details",
-            "codex_reasoning_items",
-            "codex_message_items",
-            "api_content",
-            "display_metadata",
-            "absorbed_message_uids",
-            "tool_call_uids",
-        ] {
-            if msg_cols.contains(col) {
-                exprs.push(format!("typeof({col})"));
-                exprs.push(format!("length({col})"));
-                exprs.push(format!("substr({col}, 1, 128)"));
-            }
-        }
+        let mut exprs = vec!["session_id".to_string()];
+        exprs.extend(message_revision_exprs(&msg_cols));
         let col_count = exprs.len();
         let sql = format!("SELECT {} FROM messages ORDER BY session_id, id", exprs.join(", "));
         let mut stmt = conn.prepare(&sql)?;
@@ -1142,10 +1100,60 @@ fn rows_from(conn: &Connection, walk: &Walk) -> Result<std::collections::HashMap
     Ok(out)
 }
 
+/// Header-only message row expressions (`id` first) for [`rows_from`] and [`session_revision`]:
+/// small scalar/status columns are read whole, while unbounded body/JSON columns use `typeof` +
+/// `octet_length` so SQLite reads record headers without materializing overflow pages.
+fn message_revision_exprs(msg_cols: &HashSet<String>) -> Vec<String> {
+    let mut exprs = vec![
+        "id".to_string(),
+        "role".to_string(),
+        "tool_call_id".to_string(),
+        "tool_name".to_string(),
+        "timestamp".to_string(),
+    ];
+    for col in [
+        "active",
+        "compacted",
+        "_compressed_summary",
+        "display_kind",
+        "finish_reason",
+        "token_count",
+        "observed",
+        "effect_disposition",
+        "platform_message_id",
+        "message_uid",
+        "tool_call_uid",
+    ] {
+        if msg_cols.contains(col) {
+            exprs.push(col.to_string());
+        }
+    }
+    for col in [
+        "content",
+        "tool_calls",
+        "reasoning",
+        "reasoning_content",
+        "reasoning_details",
+        "codex_reasoning_items",
+        "codex_message_items",
+        "api_content",
+        "display_metadata",
+        "absorbed_message_uids",
+        "tool_call_uids",
+    ] {
+        if msg_cols.contains(col) {
+            exprs.push(format!("typeof({col})"));
+            exprs.push(format!("octet_length({col})"));
+        }
+    }
+    exprs
+}
+
 /// Exact single-session revision certificate for [`super::store::sqlite::read_session`]: folds
-/// every column of `id`'s compression-chain `sessions` rows, `system_prompts`, stopping parent
-/// `end_reason`, direct children, `state_meta` entries, and `messages` rows (`WHERE session_id = ?1`),
-/// touching zero rows of unrelated sessions in the same database.
+/// `id`'s compression-chain `sessions` rows, `system_prompts`, stopping parent `end_reason`,
+/// direct children, `state_meta` entries, and `messages` rows (`WHERE session_id = ?1`) using
+/// `octet_length` on body columns so overflow pages are never materialized, touching zero rows
+/// of unrelated sessions in the same database.
 fn session_revision(conn: &Connection, id: &str) -> Result<crate::source::Rows> {
     use super::store::sqlite::fold_value;
     use crate::source::Rows;
@@ -1159,12 +1167,30 @@ fn session_revision(conn: &Connection, id: &str) -> Result<crate::source::Rows> 
         vec![id.to_string()]
     };
 
+    let mut session_cols: Vec<String> = super::store::sqlite::columns(conn, "sessions").into_iter().collect();
+    session_cols.sort();
+    let mut session_exprs = Vec::with_capacity(session_cols.len() + 2);
+    for col in &session_cols {
+        if matches!(col.as_str(), "system_prompt" | "origin_json") {
+            session_exprs.push(format!("typeof(\"{}\")", col.replace('"', "\"\"")));
+            session_exprs.push(format!("octet_length(\"{}\")", col.replace('"', "\"\"")));
+        } else {
+            session_exprs.push(format!("\"{}\"", col.replace('"', "\"\"")));
+        }
+    }
+    let session_sql = format!("SELECT {} FROM sessions WHERE id = ?1", session_exprs.join(", "));
+    let msg_exprs = message_revision_exprs(&super::store::sqlite::columns(conn, "messages"));
+    let msg_sql = format!(
+        "SELECT {} FROM messages WHERE session_id = ?1 ORDER BY id ASC",
+        msg_exprs.join(", ")
+    );
+
     let (mut count, mut high, mut digest) = (0u64, 0i64, Rows::SEED);
     digest = Rows::fold(digest, &(chain.len() as u64).to_le_bytes());
     for (idx, sid) in chain.iter().enumerate() {
         digest = Rows::fold(digest, sid.as_bytes());
-        {
-            let mut stmt = conn.prepare("SELECT * FROM sessions WHERE id = ?1")?;
+        if !session_exprs.is_empty() {
+            let mut stmt = conn.prepare(&session_sql)?;
             let ncols = stmt.column_count();
             let mut rows = stmt.query([sid])?;
             let mut found = 0u64;
@@ -1177,17 +1203,19 @@ fn session_revision(conn: &Connection, id: &str) -> Result<crate::source::Rows> 
             digest = Rows::fold(digest, &found.to_le_bytes());
         }
         if has_prompt_hash {
-            let prompt = conn
+            let prompt_meta = conn
                 .query_row(
-                    "SELECT sp.prompt FROM sessions s JOIN system_prompts sp ON sp.hash = s.system_prompt_hash WHERE s.id = ?1",
+                    "SELECT typeof(sp.prompt), octet_length(sp.prompt) FROM sessions s JOIN system_prompts sp ON sp.hash = s.system_prompt_hash WHERE s.id = ?1",
                     [sid],
-                    |r| r.get::<_, Option<String>>(0),
+                    |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<i64>>(1)?)),
                 )
-                .ok()
-                .flatten();
-            digest = Rows::fold(digest, &[u8::from(prompt.is_some())]);
-            if let Some(p) = prompt {
-                digest = Rows::fold(digest, p.as_bytes());
+                .ok();
+            digest = Rows::fold(digest, &[u8::from(prompt_meta.is_some())]);
+            if let Some((ty, len)) = prompt_meta {
+                if let Some(ty) = ty {
+                    digest = Rows::fold(digest, ty.as_bytes());
+                }
+                digest = Rows::fold(digest, &len.unwrap_or(-1).to_le_bytes());
             }
         }
         if idx == 0 && has_parent && has_end {
@@ -1205,15 +1233,12 @@ fn session_revision(conn: &Connection, id: &str) -> Result<crate::source::Rows> 
             }
         }
         {
-            let mut stmt = conn.prepare("SELECT * FROM messages WHERE session_id = ?1 ORDER BY id ASC")?;
+            let mut stmt = conn.prepare(&msg_sql)?;
             let ncols = stmt.column_count();
-            let id_col = stmt.column_names().position(|c| c == "id");
             let mut rows = stmt.query([sid])?;
             while let Some(row) = rows.next()? {
                 count += 1;
-                if let Some(i) = id_col {
-                    high = high.max(row.get::<_, Option<i64>>(i)?.unwrap_or(0));
-                }
+                high = high.max(row.get::<_, Option<i64>>(0)?.unwrap_or(0));
                 for i in 0..ncols {
                     digest = fold_value(digest, row.get_ref(i)?);
                 }
