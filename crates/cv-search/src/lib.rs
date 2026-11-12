@@ -22,6 +22,7 @@
 use anyhow::Result;
 use std::path::PathBuf;
 
+pub mod columnar_events;
 pub mod fts;
 mod ingest;
 mod session_collector;
@@ -374,6 +375,11 @@ pub fn default_trigram_dir() -> PathBuf {
     cache_dir().join("trigram")
 }
 
+/// Default location of the derived columnar event store.
+pub fn default_columnar_events_dir() -> PathBuf {
+    cache_dir().join("events_columnar")
+}
+
 // ---- Convenience wrappers over the default-located indexes ---------------------------------
 
 /// Discover, parse, and update the full-text index at its default location. Incremental by default
@@ -537,12 +543,19 @@ mod tests {
             let expected_cache = cv_core::env::cache_dir().unwrap().join("clustervision");
             assert_eq!(home_dir(), PathBuf::from("/u/.clustervision"));
             assert_eq!(default_tantivy_dir(), expected_cache.join("tantivy"));
+            assert_eq!(default_trigram_dir(), expected_cache.join("trigram"));
+            assert_eq!(default_columnar_events_dir(), expected_cache.join("events_columnar"));
         }
         {
             let _scope =
                 cv_core::env::Env::from_vars([("HOME", "/u"), ("CLUSTERVISION_HOME", "/scratch/cv-home")]).enter();
             assert_eq!(home_dir(), PathBuf::from("/scratch/cv-home"));
             assert_eq!(default_tantivy_dir(), PathBuf::from("/scratch/cv-home/tantivy"));
+            assert_eq!(default_trigram_dir(), PathBuf::from("/scratch/cv-home/trigram"));
+            assert_eq!(
+                default_columnar_events_dir(),
+                PathBuf::from("/scratch/cv-home/events_columnar")
+            );
         }
         {
             let _scope = cv_core::env::Env::from_vars([
@@ -553,6 +566,11 @@ mod tests {
             .enter();
             assert_eq!(home_dir(), PathBuf::from("/durable/cv-home"));
             assert_eq!(default_tantivy_dir(), PathBuf::from("/fast/cv-cache/tantivy"));
+            assert_eq!(default_trigram_dir(), PathBuf::from("/fast/cv-cache/trigram"));
+            assert_eq!(
+                default_columnar_events_dir(),
+                PathBuf::from("/fast/cv-cache/events_columnar")
+            );
         }
     }
 }

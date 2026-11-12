@@ -121,6 +121,25 @@ impl EventSpool {
         #[cfg(not(feature = "sqlite"))]
         return Ok(Box::new(std::iter::empty()));
     }
+    /// Stream staged event rows through `inspect` while rebuilding an equivalent bounded
+    /// [`EventSpool`] for downstream catalog publication, keeping peak heap bounded via spill.
+    pub fn tee(self, mut inspect: impl FnMut(&Event) -> Result<()>) -> Result<Self> {
+        #[cfg(feature = "sqlite")]
+        {
+            let mut rebuilt = EventSpool::default();
+            for row in self.ordered.rows()? {
+                let event = row?;
+                inspect(&event)?;
+                rebuilt.push(event)?;
+            }
+            Ok(rebuilt)
+        }
+        #[cfg(not(feature = "sqlite"))]
+        {
+            let _ = &mut inspect;
+            Ok(self)
+        }
+    }
 }
 
 /// Event extraction with bounded retention. Checkpoints have the same events layer as EventSink;

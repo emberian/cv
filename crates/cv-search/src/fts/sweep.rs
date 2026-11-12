@@ -247,6 +247,9 @@ pub(super) fn run_fed(
     // Initialize the catalog before the feeder opens it to invalidate old baselines. Racing
     // first opens can fail SQLite's transition to WAL before any jobs are admitted.
     let mut catalog = cv_core::catalog::Writer::open();
+    let mut col_store = (!cv_core::env::frozen())
+        .then(|| crate::columnar_events::ColumnarEventStore::open(crate::default_columnar_events_dir()).ok())
+        .flatten();
 
     std::thread::scope(|scope| -> Result<Ran> {
         let (queue, wake) = (&queue, &wake);
@@ -297,6 +300,9 @@ pub(super) fn run_fed(
         let mut since_commit = 0usize;
         let mut ran = Ran::default();
         let mut failure: Option<anyhow::Error> = None;
+        let mut col_batch = col_store
+            .as_mut()
+            .map(crate::columnar_events::ColumnarEventStore::begin_batch);
         for out in rx {
             match out {
                 Out::Begin { id, delete } => {
@@ -346,12 +352,32 @@ pub(super) fn run_fed(
                         .map_or_else(|| job.source.clone(), |c| job.source.with_reads(&c.dependencies));
                     let events_published = match events {
                         Some((from, events)) => {
-                            let result = match catalog.as_mut() {
-                                Some(catalog) => catalog.record_events(&job.r, from, events, &source, &job.prov),
-                                None => cv_core::events::record_spooled_with_source(
-                                    &job.r, from, events, &source, &job.prov,
-                                ),
+                            let teed = if col_batch.is_some() {
+                                let mut col_copy = cv_core::events::EventSpool::default();
+                                events
+                                    .tee(|ev| col_copy.push(ev.clone()))
+                                    .map(|rebuilt| (rebuilt, Some(col_copy)))
+                            } else {
+                                Ok((events, None))
                             };
+                            let result = teed.and_then(|(events, col_copy)| {
+                                match catalog.as_mut() {
+                                    Some(catalog) => catalog.record_events(&job.r, from, events, &source, &job.prov)?,
+                                    None => cv_core::events::record_spooled_with_source(
+                                        &job.r, from, events, &source, &job.prov,
+                                    )?,
+                                }
+                                if let (Some(batch), Some(col_spool)) = (col_batch.as_mut(), col_copy) {
+                                    if let Ok(rows) = col_spool.into_rows() {
+                                        if from == 0 || batch.can_resume(&job.r, &job.prov) {
+                                            let _ = batch.stage_session(&job.r, from, rows, &source, &job.prov, None);
+                                        } else {
+                                            let _ = batch.invalidate_session(&job.r);
+                                        }
+                                    }
+                                }
+                                Ok(())
+                            });
                             match result {
                                 Ok(()) => true,
                                 Err(err) => {
@@ -422,6 +448,9 @@ pub(super) fn run_fed(
             if since_commit >= COMMIT_EVERY && failure.is_none() {
                 if open.is_empty() {
                     writer.commit().context("interim commit")?;
+                    if let Some(batch) = col_batch.as_mut() {
+                        let _ = batch.checkpoint_commit();
+                    }
                     cv_core::resume::update(&std::mem::take(&mut ran.marks));
                     publish_dependencies(&mut ran, consumer);
                     since_commit = 0;
@@ -433,6 +462,9 @@ pub(super) fn run_fed(
                     queue.lock().unwrap().draining = true;
                 }
             }
+        }
+        if let Some(batch) = col_batch {
+            let _ = batch.commit();
         }
         let fed = fed.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic));
         ran.unreadable.append(&mut queue.lock().unwrap().deferred);
