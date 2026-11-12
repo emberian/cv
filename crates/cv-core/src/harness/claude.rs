@@ -404,7 +404,9 @@ impl Adapter for Claude {
         {
             deps.files.push(r.path.with_extension("meta.json"));
         }
-        deps.directories.push(r.path.with_extension("").join("tool-results"));
+        // Claude Code writes each spilled output once, before the record naming it: a new file
+        // there is a later record's, never a change to what a read of the transcript so far saw.
+        deps.growing.push(r.path.with_extension("").join("tool-results"));
         // Every agent transcript lives under `<session>/subagents/`, a workflow agent a tier deeper
         // in `subagents/workflows/<run>/`; the nearest `workflows` ancestor is that tier, not the
         // session's own `workflows/` state dir.

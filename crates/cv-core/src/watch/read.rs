@@ -35,6 +35,8 @@ pub struct ReadState {
     anchor: Option<Anchor>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     completed: Option<Completed>,
+    #[serde(skip)]
+    appended: Option<source::Prefix>,
 }
 
 /// A [`ReadState`] without its baseline, for a store whose [`source::Record`] carries the
@@ -59,6 +61,7 @@ impl ReadState {
             source,
             anchor,
             completed,
+            appended: _,
         } = self;
         (
             source,
@@ -88,6 +91,7 @@ impl ReadState {
             source,
             anchor,
             completed,
+            appended: None,
         }
     }
 
@@ -100,6 +104,7 @@ impl ReadState {
             source: source::Probe::default().snapshot(r),
             anchor: None,
             completed: None,
+            appended: None,
         }
     }
 
@@ -119,6 +124,20 @@ impl ReadState {
         let mut probe = source::Probe::default();
         let now = probe.snapshot_from(r, &adapter.resume_source(r));
         self.describes(adapter, r, &adapter.resume_source(r)) && self.source.fresh(&now, &mut probe)
+    }
+
+    /// Whether the prefix this pass read still stands when its consumer publishes resume state:
+    /// [`Self::fresh_with`] in general, or append-only growth since capture when this pass
+    /// sampled its prefix (so a transcript appended to mid-pass still records its checkpoint).
+    pub fn holds_with(&self, adapter: &dyn Adapter, r: &SessionRef) -> bool {
+        let primary = adapter.resume_source(r);
+        match self.appended.as_ref() {
+            Some(prefix) => {
+                self.describes(adapter, r, &primary)
+                    && source::grown_from(r, &primary, &self.source, Some(prefix)).is_some()
+            }
+            None => self.fresh_with(adapter, r),
+        }
     }
 
     /// The cheaper pre-read gate, distinct from [`Self::fresh`]: identity holds and the primary
@@ -150,10 +169,10 @@ impl ReadState {
         {
             return None;
         }
-        // A source that did not grow is held to its whole identity, not only the anchor's sample.
-        if current.primary_len() == self.source.primary_len()
-            && !self.source.fresh(current, &mut source::Probe::default())
-        {
+        // A primary that did not grow is held to its whole identity, not only the anchor's
+        // sample; its dependencies are held as above (a file added to a growing directory, as a
+        // harness writes one just before the record naming it, is not a reason to read whole).
+        if current.primary_len() == self.source.primary_len() && current.primary != self.source.primary {
             return None;
         }
         let anchor = self.anchor.as_ref()?;
@@ -189,6 +208,7 @@ pub struct ReadPass {
     before: Option<Anchor>,
     last: Option<Anchor>,
     completed: Option<Completed>,
+    appended: Option<source::Prefix>,
 }
 
 impl ReadPass {
@@ -210,6 +230,7 @@ impl ReadPass {
             source: self.source.clone(),
             anchor,
             completed: self.completed.clone(),
+            appended: self.appended,
         }
     }
 }
@@ -412,13 +433,20 @@ pub(super) fn pass(
     let retained = retained || output.is_some();
     let primary = adapter.resume_source(r);
     let captured = source::Probe::default().snapshot_from(r, &primary);
+    // An append-only log is read up to its captured length; its head and the bytes just before
+    // that length are sampled now, so a pass that a writer appended to while it ran still
+    // describes what it read, and the appended bytes are the next pass's input.
+    let appended = crate::json::is_append_only_log(&primary)
+        .then(|| std::fs::File::open(&primary).ok())
+        .flatten()
+        .and_then(|file| source::Prefix::of(&file, captured.primary_len()));
     let cached = previous
         .filter(|state| !session_output && state.fresh_with(adapter, r))
         .and_then(|state| state.completed.as_ref());
     let stop_after_selection = cached.is_some_and(|complete| skip.saturating_add(keep) < complete.total);
     // The primary's whole identity, for a pass whose dependency inventory was unavailable.
     let mut metadata_guard = source::ReadSet::default();
-    metadata_guard.record(&primary);
+    metadata_guard.record_as(&primary, appended.is_some());
     let from = previous.and_then(|state| state.from(adapter, r, &captured, skip));
     if session_output {
         skip = from.and_then(stream::Checkpoint::messages).unwrap_or(0);
@@ -506,11 +534,16 @@ pub(super) fn pass(
     };
     let before = sink.before.as_ref().and_then(anchor);
     let last = done.last.as_ref().or(sink.last.as_ref()).and_then(anchor);
+    let now = || source::Probe::default().snapshot_from(r, &primary).primary;
     anyhow::ensure!(
-        if source.stamp.is_some() {
-            source::unchanged_from(r, &primary, &source)
-        } else {
-            source::Probe::default().snapshot_from(r, &primary).primary == source.primary
+        match (&appended, source.stamp.is_some()) {
+            (Some(prefix), true) => source::grown_from(r, &primary, &source, Some(prefix)).is_some(),
+            (Some(prefix), false) => source
+                .primary
+                .zip(now())
+                .is_some_and(|(then, now)| then.grew_into(prefix, &now, &primary)),
+            (None, true) => source::unchanged_from(r, &primary, &source),
+            (None, false) => now() == source.primary,
         },
         "session source changed during read: {}",
         r.path.display()
@@ -521,7 +554,7 @@ pub(super) fn pass(
         r.path.display()
     );
     anyhow::ensure!(
-        metadata_guard.fresh(&mut source::Probe::default()),
+        metadata_guard.fresh_or_grown(&mut source::Probe::default()),
         "session identity changed during read: {}",
         r.path.display()
     );
@@ -562,6 +595,7 @@ pub(super) fn pass(
         before,
         last,
         completed,
+        appended,
     })
 }
 
@@ -894,6 +928,176 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&next.messages).unwrap(),
             serde_json::to_value(&expected.messages[4096..]).unwrap()
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A live transcript the harness writes to while it is read: the pass ends at the length it
+    /// captured, the bytes and the spilled output appended meanwhile (including creating
+    /// `tool-results/` on the first spill) are the next pass's input, and that pass reads only
+    /// them.
+    #[test]
+    fn an_append_during_a_read_is_the_next_reads_input() {
+        use std::io::Write as _;
+        let dir = std::env::temp_dir().join(format!("cv-watch-live-append-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let spilled = dir.join("live/tool-results");
+        let path = dir.join("live.jsonl");
+        let line = |i: usize| {
+            format!(
+                "{}\n",
+                serde_json::json!({"type":"user","uuid":format!("u{i}"),"sessionId":"live",
+                "message":{"role":"user","content":format!("{i} {}", "x".repeat(256))}})
+            )
+        };
+        std::fs::write(&path, (0..4096).map(line).collect::<String>()).unwrap();
+        let appended: String = (4096..4100).map(line).collect();
+        let r = SessionRef::new("live", Harness::Claude, &path);
+        let adapter = harness::for_harness(r.harness).unwrap();
+        let mut writer = Some(());
+        let mut output = stream::TryFnSink::new(|_| {
+            if writer.take().is_some() {
+                std::fs::create_dir_all(&spilled).unwrap();
+                std::fs::write(spilled.join("first.txt"), "spilled during the read").unwrap();
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .unwrap()
+                    .write_all(appended.as_bytes())
+                    .unwrap();
+            }
+            Ok(stream::Flow::Continue)
+        });
+        let first = read_session_into(adapter.as_ref(), &r, None, 0, &mut output).expect("growth is not a change");
+        assert_eq!(first.total, 4096, "the pass ends where its capture did");
+        let state = first.accepted(first.total);
+        assert!(
+            !state.fresh_with(adapter.as_ref(), &r),
+            "the appended bytes are still unread"
+        );
+        let next = read_session(adapter.as_ref(), &r, Some(&state), first.total).unwrap();
+        assert!(next.resumed, "no reread from the first byte");
+        assert_eq!(next.suffix_bytes, appended.len() as u64, "only the appended bytes");
+        assert!(next.parsed_messages < 1024, "replayed {}", next.parsed_messages);
+        assert_eq!(next.total, 4100);
+        let expected = adapter.parse(&r).unwrap();
+        assert_eq!(
+            serde_json::to_value(&next.messages[next.messages.len() - 4..]).unwrap(),
+            serde_json::to_value(&expected.messages[4096..]).unwrap()
+        );
+        // A file added beside the session between passes is not a reason to read whole either.
+        let state = next.accepted(next.total);
+        std::fs::write(spilled.join("second.txt"), "spilled before its record").unwrap();
+        let idle = read_session(adapter.as_ref(), &r, Some(&state), next.total).unwrap();
+        assert!(idle.resumed);
+        assert_eq!(idle.suffix_bytes, 0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// What an append-only reader still refuses: the bytes it read changed under it. A shrink, a
+    /// rewrite of the head it read, a spilled output removed from beside the session, and a
+    /// same-length rewrite outside the samples (no growth to admit).
+    #[cfg(unix)]
+    #[test]
+    fn a_truncation_or_rewrite_during_a_read_still_rejects_it() {
+        use std::os::unix::fs::FileExt as _;
+        let dir = std::env::temp_dir().join(format!("cv-watch-live-change-{}", uuid::Uuid::new_v4()));
+        let spilled = dir.join("live/tool-results");
+        std::fs::create_dir_all(&spilled).unwrap();
+        let path = dir.join("live.jsonl");
+        let body: String = (0..2048)
+            .map(|i| {
+                format!(
+                    "{}\n",
+                    serde_json::json!({"type":"user","uuid":format!("u{i}"),"sessionId":"live",
+                    "message":{"role":"user","content":format!("{i} {}", "x".repeat(256))}})
+                )
+            })
+            .collect();
+        let r = SessionRef::new("live", Harness::Claude, &path);
+        let adapter = harness::for_harness(r.harness).unwrap();
+        let changes: [(&str, &dyn Fn()); 4] = [
+            ("truncated", &|| {
+                let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+                file.set_len(body.len() as u64 - 1).unwrap();
+            }),
+            ("head rewritten", &|| {
+                let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+                let at = body.find("xxx").unwrap() as u64;
+                file.write_all_at(b"y", at).unwrap();
+            }),
+            ("spill removed", &|| {
+                std::fs::remove_file(spilled.join("kept.txt")).unwrap();
+            }),
+            ("middle rewritten in place", &|| {
+                let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+                let at = body.len() as u64 / 2;
+                assert!(at > 2 * source::SAMPLE_SPAN && at + 2 * source::SAMPLE_SPAN < body.len() as u64);
+                file.write_all_at(b"y", at).unwrap();
+            }),
+        ];
+        for (name, change) in changes {
+            std::fs::write(&path, &body).unwrap();
+            std::fs::write(spilled.join("kept.txt"), "spilled").unwrap();
+            let mut once = Some(());
+            let mut output = stream::TryFnSink::new(|_| {
+                if once.take().is_some() {
+                    change();
+                }
+                Ok(stream::Flow::Continue)
+            });
+            assert!(
+                read_session_into(adapter.as_ref(), &r, None, 0, &mut output).is_err(),
+                "{name}: accepted"
+            );
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A capture that lands inside a record (the writer mid-line): the pass ends at the captured
+    /// length without that record, the writer finishes it during the pass, and the next pass
+    /// reads it whole, once.
+    #[test]
+    fn a_record_torn_at_the_capture_is_the_next_reads() {
+        use std::io::Write as _;
+        let dir = std::env::temp_dir().join(format!("cv-watch-torn-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("live.jsonl");
+        let line = |i: usize| {
+            format!(
+                "{}\n",
+                serde_json::json!({"type":"user","uuid":format!("u{i}"),"sessionId":"live",
+                "message":{"role":"user","content":format!("{i} {}", "x".repeat(256))}})
+            )
+        };
+        let torn = line(64);
+        let (head, rest) = torn.split_at(torn.len() / 2);
+        std::fs::write(&path, (0..64).map(line).collect::<String>() + head).unwrap();
+        let appended = format!("{rest}{}", line(65));
+        let r = SessionRef::new("live", Harness::Claude, &path);
+        let adapter = harness::for_harness(r.harness).unwrap();
+        let mut writer = Some(());
+        let mut output = stream::TryFnSink::new(|_| {
+            if writer.take().is_some() {
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .unwrap()
+                    .write_all(appended.as_bytes())
+                    .unwrap();
+            }
+            Ok(stream::Flow::Continue)
+        });
+        let first = read_session_into(adapter.as_ref(), &r, None, 0, &mut output).expect("growth is not a change");
+        assert_eq!(first.total, 64, "the torn record is not the first pass's");
+        let state = first.accepted(first.total);
+        let next = read_session(adapter.as_ref(), &r, Some(&state), first.total).unwrap();
+        assert_eq!(next.total, 66);
+        let expected = adapter.parse(&r).unwrap();
+        assert_eq!(expected.messages.len(), 66);
+        assert_eq!(
+            serde_json::to_value(&next.messages[next.messages.len() - 2..]).unwrap(),
+            serde_json::to_value(&expected.messages[64..]).unwrap()
         );
         std::fs::remove_dir_all(dir).unwrap();
     }

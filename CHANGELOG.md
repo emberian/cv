@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- `cv watch` admits live append-only transcript growth and write-once `tool-results/` spills mid-pass instead of restarting from byte 0.
 - `cv rewind` ignores `api-request-blob` and other non-turn records when tracking open tool calls.
 - Breaking: removed `cv mcp`, `scry`, `deferrals`, `splice --generate`, `CV_PACK_LLM`, and retired CLI/HTTP tombstones; `cv pack` uses zero-LLM live-suffix recall.
 - First-class `antigravity` harness (`agy`, `antigravity-cli`, `antigravity-ide`): reads Cortex JSONL step logs, sub-agent trees, and read-only SQLite sidecars under `~/.gemini/antigravity*`.

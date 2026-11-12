@@ -368,7 +368,7 @@ impl Archive {
             let record = cv_core::source::Record::new(baseline, stored);
             temporary.write_all(&record.encode())?;
             let _lock = self.lock_catalog()?;
-            if record.payload.artifact.matches(&self.session_path(r.harness, &r.id)) && read.fresh_with(adapter, r) {
+            if record.payload.artifact.matches(&self.session_path(r.harness, &r.id)) && read.holds_with(adapter, r) {
                 temporary.publish(&dest)?;
             }
         }
@@ -594,10 +594,16 @@ mod tests {
         assert_eq!(a.store_ref(adapter.as_ref(), &r).unwrap().parsed_messages, 8196);
         exact(&a, adapter.as_ref(), &r);
 
-        // Auxiliary creation and replacement identity force whole reads, even at the same count.
+        // A write-once spill added to a growing directory keeps the prefix reusable; rewriting an
+        // existing spill or replacing the primary file at the same count forces a whole read.
         let outputs = r.path.with_extension("").join("tool-results");
         fs::create_dir_all(&outputs).unwrap();
-        fs::write(outputs.join("new.txt"), "sidecar changed").unwrap();
+        fs::write(outputs.join("new.txt"), "sidecar spilled").unwrap();
+        let spilled = a.store_ref(adapter.as_ref(), &r).unwrap();
+        assert!(spilled.resumed);
+        assert!(spilled.parsed_messages < spilled.total);
+        exact(&a, adapter.as_ref(), &r);
+        fs::write(outputs.join("new.txt"), "sidecar rewritten").unwrap();
         assert!(!a.store_ref(adapter.as_ref(), &r).unwrap().resumed);
         exact(&a, adapter.as_ref(), &r);
         let replacement = r.path.with_extension("new");
@@ -731,6 +737,81 @@ mod tests {
         let row = &a.load_catalog().unwrap()[0];
         assert_eq!((row.messages_written, row.session.message_count), (8193, Some(8193)));
         exact(&a, adapter.as_ref(), &r);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn mid_pass_append_publishes_prefix_state_and_next_archive_resumes() {
+        use std::io::Write as _;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct Growing(Box<dyn cv_core::Adapter>, AtomicBool);
+        impl cv_core::Adapter for Growing {
+            fn harness(&self) -> Harness {
+                self.0.harness()
+            }
+            fn roots(&self) -> Vec<PathBuf> {
+                self.0.roots()
+            }
+            fn discover(&self) -> Result<cv_core::Discovered> {
+                self.0.discover()
+            }
+            fn capabilities(&self) -> cv_core::harness::Capabilities {
+                self.0.capabilities()
+            }
+            fn dependencies(
+                &self,
+                r: &SessionRef,
+                probe: &mut cv_core::source::Probe,
+                deps: &mut cv_core::source::Dependencies,
+            ) -> Option<()> {
+                self.0.dependencies(r, probe, deps)
+            }
+            fn transcript(
+                &self,
+                r: &SessionRef,
+                opts: &cv_core::Demand,
+                from: cv_core::stream::Start<'_>,
+                sink: &mut dyn cv_core::MessageSink,
+            ) -> Result<Option<Session>> {
+                self.0.transcript(r, opts, from, sink)
+            }
+            fn stream(
+                &self,
+                r: &SessionRef,
+                opts: &cv_core::Demand,
+                sink: &mut dyn cv_core::MessageSink,
+            ) -> Result<Session> {
+                let session = self.0.stream(r, opts, sink)?;
+                if self.1.swap(false, Ordering::SeqCst) {
+                    let mut file = fs::OpenOptions::new().append(true).open(&r.path).unwrap();
+                    for i in 8192..8196 {
+                        writeln!(
+                            file,
+                            "{}",
+                            serde_json::json!({"type":"user","uuid":format!("u{i}"),"sessionId":"read","message":{"role":"user","content":format!("live {i}")}})
+                        )
+                        .unwrap();
+                    }
+                    let outputs = r.path.with_extension("").join("tool-results");
+                    fs::create_dir_all(&outputs).unwrap();
+                    fs::write(outputs.join("spill.txt"), "live spill").unwrap();
+                }
+                Ok(session)
+            }
+        }
+        let (root, a, r, _) = setup(Harness::Claude);
+        let adapter = Growing(cv_core::harness::for_harness(r.harness).unwrap(), AtomicBool::new(true));
+        let first = a.store_ref(&adapter, &r).unwrap();
+        assert_eq!((first.outcome, first.total), (StoreOutcome::Archived, 8192));
+        assert!(
+            a.stored(&r).is_some(),
+            "mid-pass append still publishes prefix resume state"
+        );
+        let second = a.store_ref(&adapter, &r).unwrap();
+        assert!(second.resumed);
+        assert_eq!(second.total, 8196);
+        assert!(second.parsed_messages < second.total);
+        exact(&a, adapter.0.as_ref(), &r);
         fs::remove_dir_all(root).unwrap();
     }
 }

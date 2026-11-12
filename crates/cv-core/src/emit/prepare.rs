@@ -188,7 +188,7 @@ pub(super) fn selected(
     let now = sink
         .reads
         .fresh(&mut Probe::default())
-        .then(|| crate::source::grown_from(reference, &primary, &guard))
+        .then(|| crate::source::grown_from(reference, &primary, &guard, None))
         .flatten();
     let Some(now) = now else {
         anyhow::bail!("source changed during port preparation")
@@ -725,6 +725,12 @@ mod tests {
 
     fn append(path: &Path) -> Result<()> {
         use std::io::Write;
+        let spilled = path.with_extension("").join("tool-results");
+        fs::create_dir_all(&spilled)?;
+        fs::write(
+            spilled.join(format!("spill-{}.txt", fs::read_dir(&spilled)?.count())),
+            b"spilled tool output",
+        )?;
         let mut file = fs::OpenOptions::new().append(true).open(path)?;
         file.write_all(
             b"{\"type\":\"user\",\"uuid\":\"later\",\"message\":{\"role\":\"user\",\"content\":\"later\"}}\n",
@@ -775,11 +781,23 @@ mod tests {
             file.write_all(&changed)?;
             Ok(())
         }
+        fn rewrite_middle(path: &Path) -> Result<()> {
+            let bytes = fs::read(path)?;
+            let at = bytes.windows(6).position(|w| w == b"middle").expect("fixture text") + 4500;
+            assert!(at > 4096 && at + 4096 < bytes.len());
+            let mut changed = bytes.clone();
+            changed[at..at + 6].copy_from_slice(b"MIDDLE");
+            use std::io::{Seek, Write};
+            let mut file = fs::OpenOptions::new().write(true).open(path)?;
+            file.seek(std::io::SeekFrom::Start(0))?;
+            file.write_all(&changed)?;
+            Ok(())
+        }
         fn rewrite_and_grow(path: &Path) -> Result<()> {
             rewrite(path)?;
             append(path)
         }
-        for change in [rewrite as fn(&Path) -> Result<()>, rewrite_and_grow] {
+        for change in [rewrite as fn(&Path) -> Result<()>, rewrite_middle, rewrite_and_grow] {
             let (_world, reference, _) = live_fixture("selected-prepare-live-rewritten")?;
             let error = super::super::prepare_selected(&Live { change }, &reference, 0, None).unwrap_err();
             assert!(

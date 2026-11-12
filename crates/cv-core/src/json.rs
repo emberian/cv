@@ -153,7 +153,7 @@ impl std::hash::Hash for CapturedSource {
 }
 /// Extensions of line-delimited logs that harnesses append to while a session is live.
 const APPEND_ONLY_EXTENSIONS: &[&str] = &["jsonl", "ndjson"];
-fn is_append_only_log(path: &Path) -> bool {
+pub(crate) fn is_append_only_log(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| APPEND_ONLY_EXTENSIONS.iter().any(|x| e.eq_ignore_ascii_case(x)))
