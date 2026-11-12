@@ -364,13 +364,17 @@ impl FactSink {
         if self.targets_settled() {
             return Ok(());
         }
-        // Contains matches survive a later cwd prefix, but an exact relative-path match
-        // depends on the final cwd. Absolute paths are already final.
+        // Contains matches survive a later cwd prefix unless dot-segments (`..` / `/./`) can
+        // collapse components during `events::absolutize`; exact relative-path matches always
+        // depend on the final cwd. Absolute paths are already final (`events::absolutize` ran).
         let lowered = target.to_lowercase();
         let absolute = std::path::Path::new(&target).is_absolute();
-        for needle in &self.targets {
-            if lowered.contains(needle) {
-                self.facts.targets.insert(needle.clone());
+        let has_dot_segments = !absolute && (target.contains("..") || target.contains("/./"));
+        if !has_dot_segments {
+            for needle in &self.targets {
+                if lowered.contains(needle) {
+                    self.facts.targets.insert(needle.clone());
+                }
             }
         }
         if absolute {
@@ -391,11 +395,7 @@ impl FactSink {
     fn finish(mut self, session: &Session) -> anyhow::Result<ReducedFacts> {
         for row in self.pending_targets.rows()? {
             let p = row?;
-            let path = std::path::Path::new(&p);
-            let resolved = match session.cwd.as_deref() {
-                Some(cwd) => cwd.join(path).to_string_lossy().to_lowercase(),
-                None => p.to_lowercase(),
-            };
+            let resolved = events::absolutize(&p, session.cwd.as_deref()).to_lowercase();
             for needle in &self.targets {
                 if resolved.contains(needle) {
                     self.facts.targets.insert(needle.clone());

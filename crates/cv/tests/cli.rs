@@ -4005,7 +4005,7 @@ fn frozen_writer_commands_exit_two_before_resolving_or_writing() {
         vec!["rewind", "missing", "--at", "0"],
         vec!["adopt", "missing"],
         vec!["port", "missing", "--harness", "claude"],
-        vec!["task", "list"],
+        vec!["task", "open", "x"],
         vec!["archive", "sync"],
         vec!["watch"],
         vec!["config", "--add-export", "/absent"],
@@ -4028,6 +4028,8 @@ fn frozen_writer_commands_exit_two_before_resolving_or_writing() {
     assert!(!ok && code == 2 && err.contains("--frozen"), "{err}");
     w.cv_ok(&["ls", "--frozen", "--json"]);
     w.cv_ok(&["hooks", "show", "--frozen", "--json"]);
+    w.cv_ok(&["task", "list", "--frozen", "--json"]);
+    assert_eq!(before, frozen_store_snapshot(&w.cv_home));
 }
 
 #[test]
@@ -4159,11 +4161,24 @@ fn frozen_catalog_does_not_migrate_or_touch_live_wal() {
 }
 
 #[test]
-fn archive_ls_names_each_skipped_catalog_line() {
-    let w = World::new("archive-corrupt-catalog");
-    fs::write(w.cv_home.join("catalog.jsonl"), "\n{broken\n").unwrap();
-    let (_, error) = w.cv_ok(&["archive", "ls"]);
-    assert!(error.contains("skipping corrupt catalog line 2"), "{error}");
+fn archive_ls_lists_packs_and_diagnoses_corrupt_pack_index() {
+    let w = World::new("archive-corrupt-pack-idx");
+    standard_corpus(&w);
+    w.cv_ok(&["archive", "sync"]);
+    let (out, _) = w.cv_ok(&["archive", "ls"]);
+    assert!(out.contains("session(s) across 1 pack(s)"), "{out}");
+
+    let idx_path = fs::read_dir(w.cv_home.join("packs"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| p.file_name().unwrap().to_string_lossy().ends_with(".pack.idx.json"))
+        .expect("sealed .pack.idx.json exists");
+    fs::write(&idx_path, "\n{broken\n").unwrap();
+
+    let (ok, _, _, error) = w.cv(&["archive", "ls"]);
+    assert!(!ok, "corrupt .pack.idx.json must fail archive ls: {error}");
+    assert!(error.contains("parsing pack manifest JSON"), "{error}");
 }
 
 /// The policy reaches all three reshape doors and must not mistake legacy command files for
@@ -4298,4 +4313,24 @@ fn resume_launch_refuses_gui_only_harnesses_with_exit_two() {
         err.contains("cannot --launch opensession") && !err.contains("failed to launch"),
         "{err}"
     );
+}
+
+#[test]
+fn doctor_store_and_serve_hub_flags_dispatch_cleanly() {
+    let w = World::new("doctor-store-serve-hub");
+    let before = frozen_store_snapshot(&w.cv_home);
+
+    let (out, _) = w.cv_ok(&["--frozen", "doctor", "--store", "--json"]);
+    let report: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert!(report["sqlite_version"].as_str().is_some(), "{out}");
+    assert!(report["state_db"].is_object(), "{out}");
+    assert!(report["catalog_db"].is_object(), "{out}");
+    assert!(report["storage"].is_object(), "{out}");
+    assert_eq!(before, frozen_store_snapshot(&w.cv_home));
+
+    let (human, _) = w.cv_ok(&["doctor", "--store"]);
+    assert!(human.contains("# store & system doctor"), "{human}");
+
+    let (ok, _, _, err) = w.cv(&["serve", "--hub", "--host", "0.0.0.0", "--insecure-expose"]);
+    assert!(!ok && err.contains("NEVER allows unauthenticated"), "{err}");
 }

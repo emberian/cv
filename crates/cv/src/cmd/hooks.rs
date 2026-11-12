@@ -1886,7 +1886,9 @@ fn hook_lane(ev: &Event, payload: &Value) -> Result<Option<Value>> {
                         harness: Some(ev.harness.as_str().to_string()),
                         pid,
                         proc_start_time,
-                        boot_id: active_existing.and_then(|r| r.boot_id),
+                        boot_id: active_existing
+                            .and_then(|r| r.boot_id)
+                            .or_else(cv_core::lanes::current_boot_id),
                         transcript_path: ev.transcript().map(|p| p.to_string_lossy().into_owned()),
                         agent_transcript_path: derived_agent_tp.map(|p| p.to_string_lossy().into_owned()),
                         cwd: resolved_cwd.as_ref().map(|p| p.to_string_lossy().into_owned()),

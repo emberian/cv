@@ -843,11 +843,16 @@ pub fn absolutize_path(p: &str, cwd: Option<&std::path::Path>) -> String {
 }
 
 fn resolve_workdir(path: &str, workdir: Option<&str>) -> String {
-    let cwd = workdir.filter(|d| !d.is_empty()).map(std::path::Path::new);
-    if !std::path::Path::new(path).is_absolute() && cwd.is_none() {
+    if std::path::Path::new(path).is_absolute() {
         return path.to_string();
     }
-    absolutize_path(path, cwd)
+    match workdir {
+        Some(dir) if !dir.is_empty() => {
+            let trimmed = path.trim_start_matches("./");
+            std::path::Path::new(dir).join(trimmed).to_string_lossy().into_owned()
+        }
+        _ => path.to_string(),
+    }
 }
 
 fn bool_flag(view: JsonView<'_>, key: &str) -> Result<bool> {
@@ -3338,7 +3343,7 @@ await Promise.all([
             (
                 "view_image".into(),
                 ToolOp::FileRead {
-                    path: absolutize_path("/tmp/diagram.png", None).into()
+                    path: "/tmp/diagram.png".into()
                 }
             )
         );

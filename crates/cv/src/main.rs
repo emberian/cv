@@ -472,6 +472,9 @@ enum Cmd {
         /// With no <id>: how many recent sessions (for this cwd) to aggregate.
         #[arg(long, default_value_t = 1)]
         recent: usize,
+        /// Diagnose local cv stores (state.db, catalog.db, packs, search segments, disk/device health) without requiring a session.
+        #[arg(long, conflicts_with_all = ["id", "harness"])]
+        store: bool,
         #[arg(long)]
         json: bool,
     },
@@ -985,6 +988,9 @@ enum Cmd {
         /// Open the inbox in the default browser once the server is up.
         #[arg(long)]
         open: bool,
+        /// Enable fleet replication hub receiver & pinned snapshot routes (/api/hub/*).
+        #[arg(long)]
+        hub: bool,
     },
     /// Redact a session and emit a single self-contained HTML artifact anyone can open.
     Share {
@@ -1534,8 +1540,15 @@ fn run() -> Result<()> {
             id,
             harness,
             recent,
+            store,
             json,
-        } => doctor::cmd_doctor(id, harness, recent, json),
+        } => {
+            if store {
+                doctor::cmd_doctor_store(json)
+            } else {
+                doctor::cmd_doctor(id, harness, recent, json)
+            }
+        }
         Cmd::Task { action } => task::cmd_task(action),
         Cmd::Watch {
             interval,
@@ -1559,15 +1572,23 @@ fn run() -> Result<()> {
             insecure_expose,
             who,
             open,
-        } => serve::cmd_serve(serve::ServeOpts {
-            host,
-            port,
-            web,
-            token,
-            insecure_expose,
-            who: who.or_else(cv_core::task::default_endpoint),
-            open,
-        }),
+            hub,
+        } => {
+            let opts = serve::ServeOpts {
+                host,
+                port,
+                web,
+                token,
+                insecure_expose,
+                who: who.or_else(cv_core::task::default_endpoint),
+                open,
+            };
+            if hub {
+                serve::cmd_serve_with_hub(opts, true)
+            } else {
+                serve::cmd_serve(opts)
+            }
+        }
         Cmd::Distill {
             id,
             harness,

@@ -173,24 +173,29 @@ fn hook_lane_records_lane_run_pid_endpoint_and_exit_in_state_store() {
     assert!(ok && out.trim().is_empty(), "err: {err}");
 
     let store = StateStore::at_dir(&w.cv_home);
-    let run = store
-        .get_lane_run("parent-sess-1:lane42")
-        .unwrap()
-        .expect("LaneRun recorded on SubagentStart");
+    let runs = store.list_lane_runs_for_session("parent-sess-1").unwrap();
+    assert_eq!(runs.len(), 1, "SubagentStart coalesces into a single LaneRun: {runs:?}");
+    let run = &runs[0];
+    assert!(
+        run.run_id.starts_with("parent-sess-1:lane42:"),
+        "unexpected run_id: {}",
+        run.run_id
+    );
+    assert_eq!(run.agent_id.as_deref(), Some("lane42"));
     assert!(run.exited_at.is_none());
     assert!(run.pid.is_some(), "parent/payload PID captured: {run:?}");
     assert!(
         run.proc_start_time.is_some(),
         "OS proc_start_time captured alongside PID: {run:?}"
     );
-    let endpoints = store.endpoints_for_run("parent-sess-1:lane42").unwrap();
+    let endpoints = store.endpoints_for_run(&run.run_id).unwrap();
     assert_eq!(endpoints.len(), 1);
     assert_eq!(endpoints[0].endpoint, "lane:worker-42");
     let bound = store
         .latest_run_for_endpoint("lane:worker-42")
         .unwrap()
         .expect("CV_ENDPOINT bound in lane_endpoints");
-    assert_eq!(bound.run_id, "parent-sess-1:lane42");
+    assert_eq!(bound.run_id, run.run_id);
 
     let stop_payload = json!({
         "session_id": "parent-sess-1",
@@ -208,7 +213,13 @@ fn hook_lane_records_lane_run_pid_endpoint_and_exit_in_state_store() {
     );
     assert!(ok && out.trim().is_empty(), "err: {err}");
 
-    let stopped = store.get_lane_run("parent-sess-1:lane42").unwrap().unwrap();
+    let runs_after = store.list_lane_runs_for_session("parent-sess-1").unwrap();
+    assert_eq!(
+        runs_after.len(),
+        1,
+        "SubagentStop coalesces onto the started LaneRun: {runs_after:?}"
+    );
+    let stopped = store.get_lane_run(&run.run_id).unwrap().unwrap();
     assert_eq!(stopped.exit_status.as_deref(), Some("hook_stop"));
     assert_eq!(stopped.last_text.as_deref(), Some("All checks green."));
     assert!(stopped.exited_at.is_some());
