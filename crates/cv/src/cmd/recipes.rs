@@ -94,12 +94,7 @@ One selector at a time. Piped `cv show` with no selector over 200 KB prints the 
     → [{agent_id, description, model, started_at, duration_ms, tokens: {total, …}, tool_calls, status,
         status_source, last_text, last_tool, stranded}]
 
-13. What did I promise to do later, and does a task hold it?
-    cv deferrals <id> --open-tasks               # exit 1 while any deferral is UNMATCHED — gate a closeout on it
-    cv deferrals <id> --at <msg> --json
-    → [{index, timestamp, phrase, context, matched?: {task_id, title, state, shared}}]
-
-14. Hand a lane's context on without its transcript (distill)
+13. Hand a lane's context on without its transcript (distill)
     cv distill <agent-id> --pack lane.md         # brief + messages + own words + facts + ledger + last 12 calls
     cv distill <agent-id> --agent-of <root-id>   # a new sub-agent of <root>: SendMessage to the printed id resumes it
     cv distill <agent-id> --session              # a new session: claude -p --resume <new-id> \"<next quest>\"
@@ -122,13 +117,15 @@ mod tests {
     #[test]
     fn every_recipe_present_and_no_old_names() {
         let r = super::RECIPES;
-        for n in 1..=14 {
+        for n in 1..=13 {
             assert!(r.contains(&format!("{n:>2}. ")), "recipe {n} missing");
         }
         for old in [
             "cv convert",
             "cv query",
             "cv recall",
+            "cv deferrals",
+            "cv scry",
             "--retrieve",
             "--to-dir",
             "--to ",

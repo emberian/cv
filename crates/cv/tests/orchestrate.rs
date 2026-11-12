@@ -1,9 +1,9 @@
-//! End-to-end tests for the orchestrator's instruments: `cv show --kind prompt,answer`, `cv lanes`, `cv deferrals`.
+//! End-to-end tests for the orchestrator's instruments: `cv show --kind prompt,answer` and `cv lanes`.
 //! Each builds a hermetic Claude session under a temp `$HOME` — a parent transcript with human
-//! prompts, slash-command bookkeeping rows, an `AskUserQuestion` answer, a compaction, deferral
-//! phrases in the replies and the `queue-operation` notifications the harness writes when a child
-//! stops — plus a `subagents/` dir with one completed, one stranded and one running lane — and
-//! drives the real binary through `cv_testkit::World` (own `$HOME` + `$CLUSTERVISION_HOME`).
+//! prompts, slash-command bookkeeping rows, an `AskUserQuestion` answer, a compaction and the
+//! `queue-operation` notifications the harness writes when a child stops — plus a `subagents/`
+//! dir with one completed, one stranded and one running lane — and drives the real binary through
+//! `cv_testkit::World` (own `$HOME` + `$CLUSTERVISION_HOME`).
 
 use cv_testkit::claude::{self, compact_summary, notification, subagent_stop, tool_result, tool_use, user};
 use cv_testkit::World;
@@ -52,21 +52,8 @@ fn lane_row<'a>(out: &'a str, id: &str) -> &'a str {
         .unwrap_or_else(|| panic!("no row for {id}:\n{out}"))
 }
 
-/// Per deferral phrase (in order): its message index and the task `--open-tasks` matched it to
-/// (the `matched` object, absent when none shares enough words), with the gate's exit status.
-fn deferral_matches(w: &World) -> (i32, Vec<(u64, Option<serde_json::Value>)>) {
-    let (_, code, json, err) = w.cv(&["deferrals", SID, "--open-tasks", "--json"]);
-    let rows: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap_or_else(|e| panic!("{e}: {json}\n{err}"));
-    let rows = rows
-        .iter()
-        .map(|r| (r["index"].as_u64().expect("index"), r.get("matched").cloned()))
-        .collect();
-    (code, rows)
-}
-
 /// The parent: two human prompts, a `/compact` with its bookkeeping rows, an AskUserQuestion
-/// answer, two replies with deferral phrases (one matching a task, one not), three lane
-/// notifications, and a human prompt after the compaction.
+/// answer, two replies, three lane notifications, and a human prompt after the compaction.
 fn build_world(tag: &str) -> World {
     let w = World::new(tag);
     w.write_session(
@@ -335,92 +322,6 @@ fn lanes_table_status_tokens_and_the_strand_class() {
     assert_eq!(c["status"], "running");
     assert_eq!(c["status_source"], "transcript");
     assert_eq!(c["last_tool"], "Read · /work/proj/src/lib.rs");
-}
-
-#[test]
-fn deferrals_find_the_phrases_and_open_tasks_gates_on_unmatched() {
-    let w = build_world("deferrals");
-    let (out, _) = w.cv_ok(&["deferrals", SID]);
-    assert!(out.contains("found"), "{out}");
-    for phrase in [
-        "\"queued\"",
-        "\"after FINAL\"",
-        "\"when X lands\"",
-        "\"later lane\"",
-        "\"not tonight\"",
-    ] {
-        assert!(out.contains(phrase), "missing {phrase}:\n{out}");
-    }
-    assert!(out.contains("[3] ") && out.contains("[10] "), "message indices:\n{out}");
-    assert!(
-        !out.contains("MATCHED"),
-        "no cross-reference without --open-tasks:\n{out}"
-    );
-
-    // --at skips the earlier reply entirely.
-    let (out, _) = w.cv_ok(&["deferrals", SID, "--at", "10"]);
-    assert!(!out.contains("after FINAL") && out.contains("later lane"), "{out}");
-
-    // The old spelling errors with a pointer: `--since` is a duration, on `lanes`.
-    let (ok, code, _, err) = w.cv(&["deferrals", SID, "--since", "10"]);
-    assert!(!ok && code == 2 && err.contains("--at"), "{code}\n{err}");
-
-    // No tasks yet: everything is UNMATCHED and the exit status says so.
-    let (ok, code, out, _) = w.cv(&["deferrals", SID, "--open-tasks"]);
-    assert!(!ok && code == 1, "unmatched deferrals exit 1: code={code}\n{out}");
-    assert!(out.contains("UNMATCHED"), "{out}");
-    let (code, matches) = deferral_matches(&w);
-    assert_eq!(code, 1);
-    assert!(
-        !matches.is_empty() && matches.iter().all(|(_, m)| m.is_none()),
-        "{matches:?}"
-    );
-
-    // A task sharing three significant words with the first deferral matches it; the second
-    // stays unmatched, so the gate still fails.
-    w.cv_ok(&[
-        "task",
-        "open",
-        "Make ResourceTargetAdmission.externalKind exhaustive after the integrator pass",
-        "--body",
-        "the standing integrator owns this",
-    ]);
-    let (ok, code, out, _) = w.cv(&["deferrals", SID, "--open-tasks"]);
-    assert!(!ok && code == 1, "{out}");
-    assert!(out.contains("(shared: ") && out.contains("UNMATCHED"), "{out}");
-    let (code, matches) = deferral_matches(&w);
-    assert_eq!(code, 1);
-    // Every phrase of the integrator reply (message 3) matches the task; the hermes one (10) not.
-    for (index, matched) in &matches {
-        match index {
-            3 => {
-                let m = matched.as_ref().unwrap_or_else(|| panic!("{matches:?}"));
-                assert!(m["title"].as_str().unwrap().contains("exhaustive"), "{m}");
-                assert!(m["shared"].as_array().unwrap().len() >= 3, "{m}");
-            }
-            10 => assert!(matched.is_none(), "{matches:?}"),
-            _ => panic!("a deferral outside messages 3 and 10: {matches:?}"),
-        }
-    }
-
-    // Cover the second with a task: the gate passes.
-    w.cv_ok(&[
-        "task",
-        "open",
-        "HERMES-TARIFF: hermes tariff reconciliation inconsistency",
-    ]);
-    let (ok, code, out, _) = w.cv(&["deferrals", SID, "--open-tasks"]);
-    assert!(ok, "every deferral has a task → exit 0: code={code}\n{out}");
-    assert!(out.contains("0 UNMATCHED"), "{out}");
-
-    let (json, _) = w.cv_ok(&["deferrals", SID, "--open-tasks", "--json"]);
-    let rows: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
-    assert!(rows.iter().all(|r| r["matched"].is_object()), "{json}");
-    // 50 chars either side of the match, the match itself, and two ellipses.
-    assert!(
-        rows[0]["context"].as_str().unwrap().chars().count() <= 100 + "queued".len() + 2,
-        "{json}"
-    );
 }
 
 /// `cv lanes --tasks` joins each lane to the task store: lane A by the `CV_ENDPOINT` its own tool

@@ -456,40 +456,6 @@ a06df2ba  running    opus-5-5       10-01 20:26   3h34m   68.9M   223  FIX-KICK:
             01a0f9e2-5fde [claimed] AUDIT: sealing a room cell ends kick, invite and re-law whi…
 ```
 
-### `cv deferrals`
-
-A linter for promises: every "later lane", "follow-up", "your call", "when X lands", "out of
-scope", … with index, time and context. `--at <msg>` starts there (`--since` exits 2 with a pointer).
-
-```sh
-cv deferrals 0c315aee                      # every deferral, oldest first
-cv deferrals 0c315aee --at 1591            # only the post-compaction region
-cv deferrals 0c315aee --open-tasks         # cross-reference the task store; exit 1 while any is UNMATCHED
-cv deferrals 0c315aee --open-tasks --json  # [{index, timestamp, phrase, context, matched?: {task_id, title, state, shared}}]
-cv deferrals 0c315aee --phrases-file deferrals.txt   # your project's phrase table instead of the built-in one
-```
-
-Your phrase table (`label = regex`, case-insensitive) goes in `--phrases-file` or
-`~/.config/clustervision/deferrals.txt`; defaults are `deferral.default_phrases` in `cv schema --json`.
-
-```text
-# ~/.config/clustervision/deferrals.txt
-parking lot   = \bparking lot\b
-after launch  = \b(after|post)[ -]launch\b
-```
-
-```text
-[1423] 2026-09-30 20:13  "after FINAL"    …Host umbrella — is queued for the standing integrator right after FINAL-1 lands, since it…
-       MATCHED   01a0f52e-76a0 [open] STANDING INTEGRATOR on final: merge landed branches continuously…  (shared: integrator, landed, umbrella)
-[3707] 2026-09-30 22:31  "integrator item" …ranch into the persvati base, note the collisions for the integrator, record it.
-       UNMATCHED
-
-✗ 30 deferral(s) have no task — `cv task open` each, or say why not
-```
-
-`--open-tasks` matches the task (terminal included) sharing the most significant words, at least
-three (ties: newer); `shared:` shows them. Any UNMATCHED exits 1.
-
 ### `cv stats`
 
 Fleet totals, per harness, busiest directories, date range, and "N not counted yet" (`uncounted`
@@ -825,33 +791,6 @@ Durable dispatch: open/claim/note/done and posed decisions; completion is self-r
 
 Removed in 0.15.0 (exit 2): use `cv task note`, `cv task events --since <id>`, `cv task claim`.
 
-### `cv scry`
-
-`tail -f` for agent activity across every harness. 🔮
-
-```sh
-cv scry
-cv scry --harness claude --cwd clustervision
-cv scry --existing            # also emit sessions already present at startup
-cv scry --interval 1
-cv scry --for 5m              # follow for five minutes, then exit 0
-cv scry | tee feed.txt        # a pipe gets the current state once …
-cv scry --follow | tee feed.txt   # … unless told to follow
-```
-
-```text
-cv scry: following live agent activity; stop with Ctrl-C or --for <duration>
-cv scry: following 212 sessions
-✷ new  claude   da9174f4  ~/pug/clustervision  (3 msg)
-      user walk the type checker and find where flux is ignored
-   +  claude   da9174f4  ~/pug/clustervision  (1 msg)
-      assistant found it — the walker drops flux constraints here …
-```
-
-On a terminal it follows until Ctrl-C, announced within a second. On a pipe it prints the
-sessions once (`   ·` lines; `--existing`: the backlog) and exits 0 unless `--follow` or
-`--for 30s|5m|2h`. A negative `--interval` exits 2. Built on [`cv watch`](serving.md).
-
 ### `cv share`
 
 A redacted, self-contained offline HTML file.
@@ -919,7 +858,7 @@ cv schema --commands         # every command, grouped, with its one-line about
 cv schema --commands --json  # the whole tree with every argument
 ```
 
-`--json` shapes: `session_row`, `session`, `message`, `block`, `prompt_row`, `lane`, `deferral`,
+`--json` shapes: `session_row`, `session`, `message`, `block`, `prompt_row`, `lane`,
 `query`, `subagent_row`, `"task_row"`, and `routes` (every `cv serve` method/path). `--commands --json`
 gives `{ name, group, about, args: [{ name, kind, value_type, possible_values?, default?, help,
 required }] }` per command, from clap.

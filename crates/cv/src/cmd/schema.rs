@@ -108,13 +108,6 @@ pub(crate) fn data_schema_json() -> Value {
             "tasks": "with --tasks: [{id, title, state, last_note?, last_ts}] the endpoint holds (assignee), newest first",
             "parent_id": "with --recent only: the session whose forest the lane belongs to",
         },
-        "deferral": {
-            "description": "one row of `deferrals --json`: a place the assistant put something off",
-            "keys": ["index", "timestamp", "phrase", "context", "matched"],
-            "phrase": "the label of the phrase that fired — the built-in table's labels are listed under `default_phrases`; `--phrases-file` (or `<config>/deferrals.txt`) replaces the table with your own",
-            "default_phrases": crate::cmd::session_reports::default_phrase_labels(),
-            "matched": "with --open-tasks: {task_id, title, state, shared[]} or absent when no task shares ≥3 significant words",
-        },
         "query": query::schema_json(),
         "routes": routes(),
     })
@@ -470,10 +463,8 @@ mod tests {
                     }
                     // A path is a string the command reads as a location; `--cwd` stays one word
                     // in the units, not in the clap type.
-                    // `--at` is a message index on `deferrals` and an index-or-commit-sha on `rewind`:
-                    // the integer is a subset of the string's grammar, and both say "message".
                     let kind = |t: &'static str| {
-                        if t == "path" || (flag == "at" && t == "integer") {
+                        if t == "path" {
                             "string"
                         } else {
                             t

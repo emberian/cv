@@ -27,8 +27,8 @@ use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use cmd::hooks::{HookName, HooksCmd};
 use cmd::task::TaskCmd;
 use cmd::{
-    archive, blame, browse, cat, config, doctor, events, formats, hooks, live, pack, port, recipes, reshape, schema,
-    search, serve, session_reports, share, task, tools, view, workflow,
+    archive, blame, browse, cat, config, doctor, events, formats, hooks, pack, port, recipes, reshape, schema, search,
+    serve, session_reports, share, task, tools, view, workflow,
 };
 use std::path::PathBuf;
 use util::{usage, UsageError, WindowArgs};
@@ -59,18 +59,7 @@ pub(crate) const GROUPS: &[(&str, &[&str])] = &[
     (
         "Read",
         &[
-            "ls",
-            "show",
-            "cat",
-            "search",
-            "events",
-            "touched",
-            "tools",
-            "workflow",
-            "lanes",
-            "deferrals",
-            "stats",
-            "blame",
+            "ls", "show", "cat", "search", "events", "touched", "tools", "workflow", "lanes", "stats", "blame",
             "doctor",
         ],
     ),
@@ -81,7 +70,7 @@ pub(crate) const GROUPS: &[(&str, &[&str])] = &[
         ],
     ),
     ("Export", &["export", "dataset", "pack"]),
-    ("Fleet & live", &["task", "scry", "watch", "archive", "serve", "share"]),
+    ("Fleet & live", &["task", "watch", "archive", "serve", "share"]),
     (
         "System",
         &["index", "config", "schema", "formats", "recipes", "hooks", "hook"],
@@ -427,34 +416,6 @@ enum Cmd {
         #[arg(long)]
         tasks: bool,
         /// Emit the lanes as one JSON array (snake_case; `cv schema` has the shape).
-        #[arg(long)]
-        json: bool,
-    },
-    /// A linter for promises: every place the assistant deferred something ("later lane",
-    /// "follow-up", "not tonight", "queued", "your call", "when X lands", …) with its message
-    /// index and context. The phrase table is `--phrases-file`, else `<config>/deferrals.txt`
-    /// if present, else a built-in default. `--open-tasks` cross-references the task store and
-    /// marks each MATCHED or UNMATCHED; any UNMATCHED exits 1, so a closeout can gate on it.
-    Deferrals {
-        id: String,
-        #[arg(long)]
-        harness: Option<String>,
-        /// Only messages from this message index on (e.g. the post-compaction region).
-        #[arg(long, value_name = "MSG")]
-        at: Option<usize>,
-        // Renamed to `--at` in 0.18.0 (`--since` is a duration on `lanes`) — hidden so the old flag errors with a pointer.
-        #[arg(long = "since", hide = true)]
-        since_removed: Option<String>,
-        /// Cross-reference every task in the store (terminal ones included): a deferral MATCHES a
-        /// task when they share three or more significant words.
-        #[arg(long)]
-        open_tasks: bool,
-        /// The phrase table: one `label = regex` per line (`#` comments; regexes are
-        /// case-insensitive). Default: `~/.config/clustervision/deferrals.txt` if it exists, else
-        /// the built-in list — your project's vocabulary lives in the file, not in cv's source.
-        #[arg(long, value_name = "PATH")]
-        phrases_file: Option<PathBuf>,
-        /// Emit the deferrals as one JSON array (`index, timestamp, phrase, context, matched?`).
         #[arg(long)]
         json: bool,
     },
@@ -953,28 +914,8 @@ enum Cmd {
         #[command(subcommand)]
         action: TaskCmd,
     },
-    /// Follow live agent activity across harnesses (tail -f for sessions).
-    Scry {
-        #[arg(long)]
-        harness: Option<String>,
-        /// Only follow sessions whose cwd contains this substring.
-        #[arg(long)]
-        cwd: Option<String>,
-        /// Poll interval in seconds (0.25 minimum; negative is a usage error).
-        #[arg(long, default_value_t = 2.0)]
-        interval: f64,
-        /// Also emit the sessions that already exist at startup (default: only new activity).
-        #[arg(long)]
-        existing: bool,
-        /// Keep following when stdout is not a terminal (a pipe gets the current state once without it).
-        #[arg(long, short = 'f')]
-        follow: bool,
-        /// Follow for this long (30s, 5m, 2h), then exit 0; implies --follow.
-        #[arg(id = "for", long = "for", value_name = "DURATION")]
-        for_: Option<String>,
-    },
     /// Follow live activity and archive every session as it changes, forever (archives what
-    /// already exists on the first poll). `cv scry` is the same feed without the archive.
+    /// already exists on the first poll).
     Watch {
         /// Poll interval in seconds (0.25 minimum; negative is a usage error).
         #[arg(long, default_value_t = 3.0)]
@@ -1273,7 +1214,6 @@ fn run() -> Result<()> {
         &cli.cmd,
         Cmd::Serve { .. }
             | Cmd::Watch { .. }
-            | Cmd::Scry { .. }
             | Cmd::Workflow { follow: true, .. }
             | Cmd::Workflow { for_: Some(_), .. }
     ))
@@ -1369,14 +1309,6 @@ fn run() -> Result<()> {
             thinking,
             skills,
         } => port::cmd_port(&id, harness, cwd, out, no_context, strict, thinking.as_deref().map(util::parse_thinking).transpose()?, skills.parse()?),
-        Cmd::Scry {
-            harness,
-            cwd,
-            interval,
-            existing,
-            follow,
-            for_,
-        } => live::cmd_scry(live::ScryArgs { harness, cwd, interval, existing, follow, for_ }),
         Cmd::Index {
             semantic,
             rebuild,
@@ -1547,27 +1479,6 @@ fn run() -> Result<()> {
                 (None, None) => unreachable!("clap requires <ID> unless --recent is present"),
             };
             session_reports::cmd_lanes(scope, filter, since, tasks, json)
-        }
-        Cmd::Deferrals {
-            id,
-            harness,
-            at,
-            since_removed,
-            open_tasks,
-            phrases_file,
-            json,
-        } => {
-            if since_removed.is_some() {
-                return usage(
-                    "`cv deferrals --since` was renamed to `--at <MSG>` in 0.18.0 (`--since` is a duration \
-                     on `cv lanes`)",
-                );
-            }
-            // An unmatched deferral is a finding, not a failure: plain exit 1, no error text.
-            if !session_reports::cmd_deferrals(&id, harness, at, open_tasks, phrases_file, json)? {
-                std::process::exit(1);
-            }
-            Ok(())
         }
         Cmd::Doctor {
             id,

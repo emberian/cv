@@ -81,11 +81,6 @@ impl Wait {
         }
     }
 
-    /// Whether the `--for` deadline has passed (never, without one).
-    pub(crate) fn expired(&self) -> bool {
-        matches!(self, Wait::Until(Some((deadline, _))) if *deadline <= std::time::Instant::now())
-    }
-
     /// Sleep one `interval`, cut short by the deadline; false once there is nothing left to wait for.
     pub(crate) fn pause(&self, interval: std::time::Duration) -> bool {
         let left = match self {
@@ -454,7 +449,7 @@ pub(crate) fn dry_run_nulls(v: &mut serde_json::Value, pinned: bool, paths: &[&s
     .into();
 }
 
-/// `--interval <SECONDS>` on `scry` and `watch`: finite and not negative (a usage error, never a
+/// `--interval <SECONDS>` on `watch`: finite and not negative (a usage error, never a
 /// silent clamp); a positive value below the quarter-second floor polls at the floor.
 pub(crate) fn poll_interval(seconds: f64) -> Result<std::time::Duration> {
     if !seconds.is_finite() {

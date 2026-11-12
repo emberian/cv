@@ -11,18 +11,17 @@ The shape of the session: an **orchestrator** (one long-lived harness session) s
 land branches into a base repository and write reports, an **integrator** lane merges them, and a
 human (the **decider**) answers decisions through the inbox. `cv` is the memory the orchestrator does
 not have: the task store is the backlog and the obligations, the lane table is the live state of the
-forest, the deferral linter is the closeout gate, and the inbox is what the human owes.
+forest, and the inbox is what the human owes.
 
 ## The instruments, and what each is for
 
 | instrument | one-line purpose | the rule that came with it |
 |---|---|---|
-| `cv task open/claim/note/done` | every obligation is a task before the reply that mentions it | "a *later* in chat is a dropped obligation" — `cv deferrals <session> --open-tasks` exits 1 on any unmatched one |
+| `cv task open/claim/note/done` | every obligation is a task before the reply that mentions it | "a *later* in chat is a dropped obligation" — open the task before writing the sentence that mentions it |
 | `cv task decide --for <who> --default … --option …` | a decision for the human, with a default the swarm can proceed on | the orchestrator may *act on the default* and say so; the inbox shows it as owed until resolved |
 | `cv task inbox <who>` / `cv serve --open` (the inbox page) | what the human owes, drained in one sitting | pose decisions with defaults *before* the human arrives; poll `cv task events --by <who>` at every check-in |
 | `cv lanes <session> --running` | the forest as a status table: model, start, tokens, calls, last tool, stranded | a row whose token count is frozen for an hour is DEAD even if it says running: stop it, relaunch from its clone |
 | `cv lanes --stranded` | lanes that stopped saying they are waiting for a notification nothing will send | brief lanes to FOREGROUND-wait; resume a stranded lane with one message naming what finished |
-| `cv deferrals <session> --open-tasks` | every promise in the transcript, matched against the store | run it at every closeout; an UNMATCHED line is a task to open now |
 | `cv task show ID --notes-grep PAT` / `--notes-last N` | query a long task without loading it | a 100-note integrator task dumped whole killed a 13-hour lane; **query, never dump** |
 | `cv show <session> --kind prompt,answer` | only what the human said | re-read the brief before any status to the human |
 | `cv show <session> --pre-compaction` | the span a compaction summary lost | after any compaction, read the full turns, not the summary: tactics live in the turns |
@@ -65,7 +64,7 @@ default; proceed on the default where the work does not weaken a check; record e
 orchestrator makes on the human's behalf as such ("my decision, veto-able") on its task. When the
 human drains the inbox, read `cv task events --by <who>` and act on every answer that changes a brief.
 
-**Deferrals go into the store before the reply.** The linter exists because "later" in a chat message is
+**Obligations go into the store before the reply.** "Later" in a chat message is
 where obligations die. One rule saved several: open the task, then write the sentence that mentions it.
 
 **Status is printed by a run, never typed.** Keep one NOW page (one screen: the bar, the frontier from
@@ -75,7 +74,7 @@ is for the successor after a compaction; the NOW page is for the human.
 ## What the instruments caught, and what they did not
 
 Caught: a lane whose journey was pending when it reported (stranded); two lanes wedged on a shell
-call that never returned (frozen token counts); seven unmatched deferrals across the session; an
+call that never returned (frozen token counts); an
 inbox item posed without options (a lane tagged `decision` instead of posing one).
 
 Not caught, and now rules: the page's "needs discussion" left the decision owed, so the human

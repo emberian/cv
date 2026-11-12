@@ -56,7 +56,6 @@ cv search "retry backoff"     # full-text search
 cv show <id> --last 40        # print the last 40 turns (prefix-match on the id is fine)
 cv show <id> --tree           # the message thread as a tree
 cv port <id> --harness codex  # port a session into another harness
-cv scry                       # live-follow every agent on your machine
 ```
 
 Most commands take a **session id prefix** (the first few characters are usually enough), or a

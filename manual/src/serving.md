@@ -58,10 +58,9 @@ cv watch --cwd clustervision       # only sessions whose cwd contains this subst
 ```
 
 `cv watch` archives everything on its first poll (no `sync` needed), then each session as it
-changes. Its ready line reaches stderr within a second. `cv scry` prints the same feed without
-archiving.
+changes. Its ready line reaches stderr within a second.
 
-`--interval` is seconds, fractional allowed (minimum 0.25), as on `cv scry`; negative exits 2.
+`--interval` is seconds, fractional allowed (minimum 0.25); negative exits 2.
 Watch cursors are version 2: a 0.17 cursor starts a fresh baseline. A byte mark on a compressed
 Codex rollout stays unresolved.
 
@@ -254,5 +253,4 @@ cv watch &                     # archive every session as it changes, forever
 cv serve --web ./web           # the dashboard, the inbox and the API on :7777
 ```
 
-Then browse in [the app](viewing-and-sharing.md), tail with `cv scry` ([the CLI](cli.md)), and
-coordinate through [tasks](tasks.md).
+Then browse in [the app](viewing-and-sharing.md) and coordinate through [tasks](tasks.md).

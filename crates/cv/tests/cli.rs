@@ -814,16 +814,14 @@ fn thinking_mode_is_one_word_on_every_emitting_command() {
     assert!(err.contains("--drop-thinking"), "{err}");
 }
 
-/// `--interval` is seconds as a number on both pollers; a negative one is a usage error.
+/// `--interval` is seconds as a number on `watch`; a negative one is a usage error.
 #[test]
 fn interval_is_seconds_and_negative_is_a_usage_error() {
     let w = World::new("interval");
     standard_corpus(&w);
-    for cmd in ["scry", "watch"] {
-        let (_, code, _, err) = w.cv(&[cmd, "--interval=-1"]);
-        assert_eq!(code, 2, "cv {cmd}: {err}");
-        assert!(err.contains("--interval"), "cv {cmd}: {err}");
-    }
+    let (_, code, _, err) = w.cv(&["watch", "--interval=-1"]);
+    assert_eq!(code, 2, "cv watch: {err}");
+    assert!(err.contains("--interval"), "cv watch: {err}");
 }
 
 // ───────────────────────────── export ─────────────────────────────

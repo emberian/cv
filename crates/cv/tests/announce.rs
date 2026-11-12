@@ -2,12 +2,11 @@
 //! every command `cv schema --commands --json` lists, run with stdout piped and stdin from
 //! /dev/null, exits within 5 s — except the two daemons (`serve`, `watch`), which must have said
 //! on stderr within the 3 s test allowance what they are doing (see ANNOUNCE). Then the follow/for flags and the terminal-on-stdin
-//! readers, case by case. An agent ran `cv scry` once with no idea what it did; it printed nothing
-//! and waited forever (2026-10-18). This file is what makes that impossible again.
+//! readers, case by case.
 
 use cv_testkit::{claude, World};
 use serde_json::Value;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader};
 use std::process::{Child, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -27,7 +26,6 @@ const DAEMONS: [&str; 2] = ["serve", "watch"];
 struct Run {
     child: Child,
     stderr: mpsc::Receiver<String>,
-    stdout: Option<std::thread::JoinHandle<String>>,
     started: Instant,
 }
 
@@ -51,18 +49,11 @@ impl Run {
                 }
             }
         });
-        let out = child.stdout.take().unwrap();
-        let stdout = std::thread::spawn(move || {
-            let mut s = String::new();
-            let _ = BufReader::new(out).read_to_string(&mut s);
-            s
+        let mut out = child.stdout.take().unwrap();
+        std::thread::spawn(move || {
+            let _ = std::io::copy(&mut out, &mut std::io::sink());
         });
-        Run {
-            child,
-            stderr,
-            stdout: Some(stdout),
-            started,
-        }
+        Run { child, stderr, started }
     }
 
     /// The first stderr line, when one arrives within `within` of the spawn.
@@ -90,10 +81,6 @@ impl Run {
     /// Every stderr line still queued (the process has exited or been killed).
     fn rest_of_stderr(&self) -> String {
         self.stderr.try_iter().collect::<Vec<_>>().join("\n")
-    }
-
-    fn stdout(&mut self) -> String {
-        self.stdout.take().map(|t| t.join().unwrap()).unwrap_or_default()
     }
 }
 
@@ -179,57 +166,6 @@ fn every_command_on_a_pipe_exits_or_is_a_daemon_that_announced() {
         assert!(status.code().is_some(), "cv {argv:?} died by signal; stderr:\n{stderr}");
         assert!(!stderr.contains("panicked"), "cv {argv:?} panicked:\n{stderr}");
     }
-}
-
-#[test]
-fn scry_on_a_pipe_prints_the_current_state_once_unless_told_to_follow() {
-    let w = world("announce-scry");
-
-    let mut run = Run::spawn(&w, &strings(&["scry"]), Stdio::null());
-    let line = run.announced(ANNOUNCE).expect("scry says why it is not following");
-    assert!(
-        line.contains("current state once") && line.contains("--follow"),
-        "{line}"
-    );
-    let status = run.exited(BUDGET);
-    let stderr = run.rest_of_stderr();
-    assert_eq!(
-        status.map(|s| s.code()),
-        Some(Some(0)),
-        "scry on a pipe exits 0; stderr:\n{stderr}"
-    );
-    let out = run.stdout();
-    assert!(
-        out.contains("alphases") && out.contains("msg"),
-        "the snapshot lists the session:\n{out}"
-    );
-
-    let mut run = Run::spawn(&w, &strings(&["scry", "--for", "1s"]), Stdio::null());
-    let line = run.announced(ANNOUNCE).expect("a bounded follow announces itself");
-    assert!(line.contains("following live agent activity for 1s"), "{line}");
-    let status = run.exited(BUDGET);
-    let stderr = run.rest_of_stderr();
-    assert_eq!(
-        status.map(|s| s.code()),
-        Some(Some(0)),
-        "--for 1s exits 0; stderr:\n{stderr}"
-    );
-    assert!(
-        run.started.elapsed() >= Duration::from_secs(1),
-        "--for 1s returned early"
-    );
-
-    let mut run = Run::spawn(&w, &strings(&["scry", "--follow"]), Stdio::null());
-    let line = run.announced(ANNOUNCE).expect("an unbounded follow announces itself");
-    assert!(line.contains("stop with Ctrl-C or --for"), "{line}");
-    assert!(
-        run.exited(Duration::from_millis(1500)).is_none(),
-        "--follow kept following"
-    );
-
-    let (ok, code, _, err) = w.cv(&["scry", "--for", "soon"]);
-    assert!(!ok && code == 2, "a bad --for is a usage error, got {code}: {err}");
-    assert!(err.contains("--for"), "{err}");
 }
 
 #[test]

@@ -97,10 +97,10 @@ The two tables below are generated from the clap tree, and a unit test
 <!-- begin: cv schema --commands -->
 | group | commands |
 |---|---|
-| **Read** | `ls` `show` `cat` `search` `events` `touched` `tools` `workflow` `lanes` `deferrals` `stats` `blame` `doctor` |
+| **Read** | `ls` `show` `cat` `search` `events` `touched` `tools` `workflow` `lanes` `stats` `blame` `doctor` |
 | **Reshape** | `prune` `rewind` `distill` `adopt` `retire` `splice` `port` `resume` |
 | **Export** | `export` `dataset` `pack` |
-| **Fleet & live** | `task` `scry` `watch` `archive` `serve` `share` |
+| **Fleet & live** | `task` `watch` `archive` `serve` `share` |
 | **System** | `index` `config` `schema` `formats` `recipes` `hooks` `hook` |
 
 | command | subcommands |
@@ -137,16 +137,14 @@ write stores or sessions error with exit 2.
 candidates as `harness:full-id` lines and exits 2.
 
 **Blocking is opt-in and announced.** No command waits silently. When stdout is not a terminal, a
-command that would wait (`scry`, `workflow --follow`) prints its current state once, exits 0, and
+command that would wait (`workflow --follow`) prints its current state once, exits 0, and
 says on stderr how to follow: `--follow` keeps following, `--for <duration>` (`30s`, `5m`, `2h`)
 bounds it and implies it; unbounded following needs `--follow` spelled out. Following announces
 what it waits for within a second, before the first discovery, and ends with Ctrl-C or `--for`;
 on a terminal the interactive default stays and announces the same way. The daemons (`serve`,
-`watch`, `mcp`) keep running and print their ready line (address, home, what they do) to stderr
+`watch`) keep running and print their ready line (address, home, what they do) to stderr
 within a second. A reader of protocol input on stdin says so when stdin is a terminal: `hook` exits
-2 with usage, `mcp` and `task … -` announce what they are reading. An MCP tool never blocks beyond
-its documented cursor or timeout (`observe_stream` returns at once, `await_omen` has
-`timeout_secs`; generated tools drop `--follow` and keep `for`). `crates/cv/tests/announce.rs` runs
+2 with usage, and `task … -` announces what it is reading. `crates/cv/tests/announce.rs` runs
 every command of the clap tree on a pipe under this contract.
 
 ## 3. JSON — snake_case, one shape per noun
@@ -161,7 +159,7 @@ every command of the clap tree on a pipe under this contract.
   (+ `display_title`, `git` under `--enrich`; + `score`, `snippet`, `agent_id`, `parent_id`,
   `workflow` from `search`). `cv schema --json` publishes this list as `session_row`, with
   `subagent_row` (a forest member: the session row + its sidecar facts), `task_row`, `session`,
-  `message`, `block`, `prompt_row`, `lane`, `deferral` and `query`; the manual's architecture
+  `message`, `block`, `prompt_row`, `lane` and `query`; the manual's architecture
   chapter is the prose.
 - A **message** is the IR `Message`. A **block** is the IR `Block`, tagged by `type`.
 
