@@ -1480,3 +1480,74 @@ deny_cwds = ["/work/secret-ops"]
         assert!(!db_lossy.contains(forbidden), "hub state.db leaked {forbidden:?}");
     }
 }
+
+/// 8. The hub verifies what it counts: an event whose declared digest does not commit to its own
+///    `(op_id, envelope, payload_addr)` is refused (`400`) before anything is stored, and a frozen
+///    hub refuses a pack upload before creating `hub/packs/` or staging a temp file.
+#[test]
+fn fleet_hub_rejects_unverified_event_digests_and_frozen_pack_uploads() {
+    let hub_w = World::new("hub-verify");
+    let hub = HubStore::at_home(&hub_w.cv_home);
+
+    let s = make_session("verify-1", "/work/v", "V1", "u", "a", 1);
+    let honest = make_event("prod-v", "ep-1", 1, &s, None);
+
+    // Same event, envelope altered after the digest was computed (or a digest simply made up).
+    let mut tampered = honest.clone();
+    tampered.envelope["title"] = json!("tampered in transit");
+    let err = hub
+        .ingest_batch(&IngestBatchRequest { events: vec![tampered] })
+        .unwrap_err();
+    assert!(
+        matches!(err, cv_core::state::hub::HubError::InvalidArgument(ref m) if m.contains("declares digest")),
+        "{err:?}"
+    );
+    let forged = IngestEventRecord::with_digest(
+        EventId::new("prod-v", "ep-1", 1),
+        honest.op_id.clone(),
+        "0".repeat(64),
+        honest.envelope.clone(),
+        None,
+    );
+    assert!(hub.ingest_batch(&IngestBatchRequest { events: vec![forged] }).is_err());
+    let status = hub.hub_status().unwrap();
+    assert!(
+        status.frontiers.is_empty() && status.quarantine.count == 0,
+        "a refused event must leave no frontier, quarantine, or stored row: {status:?}"
+    );
+
+    // The honest record still lands, and its stored digest is the one the hub computed.
+    let ok = hub
+        .ingest_batch(&IngestBatchRequest {
+            events: vec![honest.clone()],
+        })
+        .unwrap();
+    assert_eq!(ok.accepted_count, 1);
+    assert_eq!(
+        ok.origin_frontier.get(&("prod-v".into(), "ep-1".into())).copied(),
+        Some(1)
+    );
+
+    // A frozen hub refuses a pack upload without creating the mirror directory or a staged file.
+    let frozen_w = World::new("hub-frozen-upload");
+    let frozen_hub = HubStore::at_home(&frozen_w.cv_home);
+    let packs_dir = frozen_w.cv_home.join("hub/packs");
+    assert!(!packs_dir.exists());
+    {
+        let _frozen = Env::from_vars([("CV_FROZEN", "1")]).enter();
+        let err = frozen_hub
+            .upload_pack_bytes("pack-frozen", Some("prod-v"), None, b"{}", b"not a pack")
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                cv_core::state::hub::HubError::State(cv_core::state::StateError::Frozen)
+            ),
+            "{err:?}"
+        );
+    }
+    assert!(
+        !packs_dir.exists() && !frozen_w.cv_home.join("hub").exists(),
+        "--frozen pack upload must not create hub/packs"
+    );
+}

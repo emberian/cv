@@ -179,6 +179,11 @@ impl HubStore {
         idx_bytes: &[u8],
         mut zst_reader: impl Read,
     ) -> Result<UploadPackResponse, HubError> {
+        // Refuse before creating `hub/packs/` or staging the upload: the first `state.db` write
+        // would refuse later, but only after the directory and a temp file already exist.
+        if crate::env::frozen() {
+            return Err(HubError::State(crate::state::StateError::Frozen));
+        }
         publish::validate_output_id(pack_id).map_err(|e| HubError::InvalidArgument(e.to_string()))?;
         let zst_dest = pack_zst_path(&self.packs_dir, pack_id).map_err(|e| HubError::InvalidArgument(e.to_string()))?;
         let idx_dest = pack_idx_path(&self.packs_dir, pack_id).map_err(|e| HubError::InvalidArgument(e.to_string()))?;
@@ -491,6 +496,21 @@ impl HubStore {
             }
             if rec.digest.trim().is_empty() {
                 return Err(HubError::InvalidArgument("event digest must not be empty".into()));
+            }
+            // The frontier counts events that were received *and verified*: a declared digest that
+            // does not commit to the bytes actually delivered is refused before anything is stored,
+            // so `hub_ingested_events.event_digest` is always the commitment of its own row.
+            let computed = compute_event_digest(&rec.op_id, &rec.envelope, rec.payload_addr.as_ref())?;
+            if !rec.digest.trim().eq_ignore_ascii_case(&computed) {
+                return Err(HubError::InvalidArgument(format!(
+                    "event {}/{}/#{} declares digest `{}` but its (op_id, envelope, payload_addr) hash to `{computed}`",
+                    rec.event_id.producer_id, rec.event_id.epoch, rec.event_id.seq, rec.digest
+                )));
+            }
+            if i64::try_from(rec.event_id.seq).is_err() {
+                return Err(HubError::InvalidArgument(
+                    "event_id.seq exceeds the storable sequence range".into(),
+                ));
             }
         }
 
