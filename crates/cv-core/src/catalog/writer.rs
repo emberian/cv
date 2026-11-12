@@ -63,4 +63,23 @@ impl Writer {
             counted.record_with_source(r, source);
         }
     }
+
+    /// Persist refreshed query facts (e.g. `subagent_count` / `subagent_guard`) onto an already
+    /// source-certified count record without re-parsing the session transcript.
+    pub(crate) fn refresh_counted_facts(&mut self, r: &SessionRef, source: &Baseline, counted: super::Counted) {
+        #[cfg(feature = "sqlite")]
+        {
+            if !crate::source::unchanged(r, source) {
+                return;
+            }
+            let turns = counted.turns.map(|t| t as usize);
+            let facts = counted.facts;
+            let counts = counted.counts;
+            super::imp::note_counts_in(&mut self.conn, r, source, turns, facts, || counts);
+        }
+        #[cfg(not(feature = "sqlite"))]
+        {
+            let _ = (r, source, counted);
+        }
+    }
 }

@@ -1217,11 +1217,28 @@ mod imp {
                 }
             }
             Harness::Codex => {
-                if let Some(home) = crate::env::Env::current().cv_home() {
-                    guard.record(&home.join("lanes.jsonl"));
-                    guard.record(&home.join("state.db"));
-                    for sidecar in crate::source::sqlite_sidecars(&home.join("state.db")) {
-                        guard.record(&sidecar);
+                let ledger_path = crate::lanes::ledger_path();
+                guard.record(&ledger_path);
+                let home = crate::env::Env::current()
+                    .cv_home()
+                    .unwrap_or_else(|| PathBuf::from("."));
+                let state_db = home.join("state.db");
+                guard.record(&state_db);
+                for sidecar in crate::source::sqlite_sidecars(&state_db) {
+                    guard.record(&sidecar);
+                }
+                let ledger = crate::lanes::ledger_index();
+                let mut visited = HashSet::from([r.id.clone()]);
+                let mut queue = std::collections::VecDeque::from([r.id.clone()]);
+                while let Some(sid) = queue.pop_front() {
+                    for &at in ledger.rows_of(&sid) {
+                        let row = &ledger.rows[at];
+                        if let Some(child_path) = row.agent_transcript_path.as_deref() {
+                            guard.record(child_path);
+                        }
+                        if !row.agent_id.is_empty() && visited.insert(row.agent_id.clone()) {
+                            queue.push_back(row.agent_id.clone());
+                        }
                     }
                 }
             }
@@ -1232,16 +1249,44 @@ mod imp {
                 }
             }
             Harness::Antigravity => {
-                let sub_dir = r
+                let sys_dir = r
                     .path
                     .ancestors()
-                    .find(|p| p.file_name().is_some_and(|n| n == ".system_generated"))
+                    .find(|p| p.file_name().is_some_and(|n| n == ".system_generated"));
+                let sub_dir = sys_dir
                     .map(|sys| sys.join("subagents"))
                     .unwrap_or_else(|| r.path.join(".system_generated").join("subagents"));
+                let brain_root = sys_dir
+                    .and_then(|sys| sys.parent())
+                    .and_then(|brain| brain.parent())
+                    .or_else(|| r.path.parent());
                 guard.record(&sub_dir);
                 if let Ok(entries) = std::fs::read_dir(&sub_dir) {
                     for entry in entries.flatten() {
-                        guard.record(&entry.path());
+                        let desc_path = entry.path();
+                        guard.record(&desc_path);
+                        if desc_path.extension().and_then(|x| x.to_str()) != Some("json") {
+                            continue;
+                        }
+                        let cid = std::fs::read_to_string(&desc_path)
+                            .ok()
+                            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+                            .and_then(|val| {
+                                val.get("conversationId")
+                                    .and_then(serde_json::Value::as_str)
+                                    .filter(|s| !s.is_empty())
+                                    .map(str::to_owned)
+                            })
+                            .or_else(|| desc_path.file_stem().and_then(|s| s.to_str()).map(str::to_owned));
+                        if let (Some(root), Some(cid)) = (brain_root, cid) {
+                            if !cid.is_empty() && !cid.contains('/') && !cid.contains('\\') && cid != ".." {
+                                let child_logs = root.join(&cid).join(".system_generated").join("logs");
+                                guard.record(&child_logs);
+                                for name in ["transcript_full.jsonl", "transcript.jsonl", "overview.txt"] {
+                                    guard.record(&child_logs.join(name));
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1644,13 +1689,15 @@ mod imp {
             Some(self.records.admit(r, source, probe)?.counts.clone())
         }
 
-        pub(crate) fn counted_with_probe(
+        pub(crate) fn counted_record_with_probe(
             &self,
             r: &SessionRef,
             source: &crate::source::Baseline,
             probe: &mut crate::source::Probe,
-        ) -> Option<Counted> {
-            self.records.admit(r, source, probe).cloned()
+        ) -> Option<(crate::source::Baseline, Counted)> {
+            let record = self.records.get(r)?;
+            let payload = record.admit_for(r, source, probe)?.clone();
+            Some((record.baseline.clone(), payload))
         }
     }
 
@@ -3034,6 +3081,133 @@ mod imp {
                 "indexed query columns must survive catalog order republish"
             );
         }
+
+        #[test]
+        fn codex_and_antigravity_subagent_guards_invalidate_when_pending_child_transcript_appears() {
+            // 1. Codex: `SubagentStart` in `lanes.jsonl` names `child_path` BEFORE `child_path`
+            //    exists on disk. Later creating `child_path` without modifying `lanes.jsonl` or
+            //    `parent.jsonl` MUST invalidate `subagent_guard` and refresh `subagent_count` 0 -> 1!
+            let w_codex = crate::test_world("codex-pending-child-guard");
+            let parent_path = w_codex.base.join("codex-parent.jsonl");
+            std::fs::write(
+                &parent_path,
+                serde_json::json!({"type": "session_meta", "payload": {"id": "codex-parent"}}).to_string() + "\n",
+            )
+            .unwrap();
+            let child_path = w_codex.base.join("codex-child.jsonl");
+            assert!(!child_path.exists());
+
+            crate::lanes::append_lane_event(&crate::lanes::LaneEvent {
+                ts: chrono::Utc::now(),
+                event: crate::lanes::LaneEventKind::Start,
+                session_id: "codex-parent".into(),
+                agent_id: "codex-child".into(),
+                agent_type: Some("worker".into()),
+                transcript_path: Some(parent_path.clone()),
+                agent_transcript_path: Some(child_path.clone()),
+                cwd: None,
+                last_text: None,
+            })
+            .unwrap();
+
+            let codex_ref = SessionRef::new("codex-parent", Harness::Codex, &parent_path);
+            let mut codex_facts = SessionQueryFacts::default();
+            populate_subagent_facts(&codex_ref, &mut codex_facts);
+            assert_eq!(codex_facts.subagent_count, Some(0));
+            assert!(codex_facts.subagent_guard.fresh(&mut crate::source::Probe::default()));
+
+            // Now Codex flushes `child_path` WITHOUT touching `parent_path` or `lanes.jsonl`!
+            std::fs::write(
+                &child_path,
+                serde_json::json!({
+                    "type": "session_meta",
+                    "payload": {"id": "codex-child", "parent_thread_id": "codex-parent"}
+                })
+                .to_string()
+                    + "\n",
+            )
+            .unwrap();
+            assert!(
+                !codex_facts.subagent_guard.fresh(&mut crate::source::Probe::default()),
+                "Codex subagent_guard must invalidate when pending child transcript appears"
+            );
+            populate_subagent_facts(&codex_ref, &mut codex_facts);
+            assert_eq!(codex_facts.subagent_count, Some(1));
+            assert!(codex_facts.subagent_guard.fresh(&mut crate::source::Probe::default()));
+
+            // 2. Antigravity: `<parent_brain>/.system_generated/subagents/<cid>.json` exists BEFORE
+            //    `<app_data_dir>/brain/<cid>/.system_generated/logs/transcript.jsonl` is created.
+            //    Creating the child transcript later without touching parent or `<cid>.json` MUST
+            //    invalidate `subagent_guard` and refresh `subagent_count` 0 -> 1!
+            let w_agy = crate::test_world("agy-pending-child-guard");
+            let app_data = w_agy.base.join("antigravity");
+            let parent_logs = app_data
+                .join("brain")
+                .join("agy-parent")
+                .join(".system_generated")
+                .join("logs");
+            let parent_sub_dir = app_data
+                .join("brain")
+                .join("agy-parent")
+                .join(".system_generated")
+                .join("subagents");
+            std::fs::create_dir_all(&parent_logs).unwrap();
+            std::fs::create_dir_all(&parent_sub_dir).unwrap();
+
+            let agy_parent_log = parent_logs.join("transcript.jsonl");
+            std::fs::write(
+                &agy_parent_log,
+                serde_json::json!({
+                    "step_index": 0,
+                    "source": "USER_EXPLICIT",
+                    "type": "USER_INPUT",
+                    "content": "hello parent"
+                })
+                .to_string()
+                    + "\n",
+            )
+            .unwrap();
+            std::fs::write(
+                parent_sub_dir.join("agy-child.json"),
+                serde_json::json!({"conversationId": "agy-child"}).to_string(),
+            )
+            .unwrap();
+
+            let agy_ref = SessionRef::new("agy-parent", Harness::Antigravity, &agy_parent_log);
+            let mut agy_facts = SessionQueryFacts::default();
+            populate_subagent_facts(&agy_ref, &mut agy_facts);
+            assert_eq!(agy_facts.subagent_count, Some(0));
+            assert!(agy_facts.subagent_guard.fresh(&mut crate::source::Probe::default()));
+
+            // Create child transcript under `<app_data>/brain/agy-child/.system_generated/logs/`
+            // WITHOUT touching `agy_parent_log` or `agy-child.json`!
+            let child_logs = app_data
+                .join("brain")
+                .join("agy-child")
+                .join(".system_generated")
+                .join("logs");
+            std::fs::create_dir_all(&child_logs).unwrap();
+            std::fs::write(
+                child_logs.join("transcript.jsonl"),
+                serde_json::json!({
+                    "step_index": 0,
+                    "source": "USER_EXPLICIT",
+                    "type": "USER_INPUT",
+                    "content": "hello child"
+                })
+                .to_string()
+                    + "\n",
+            )
+            .unwrap();
+
+            assert!(
+                !agy_facts.subagent_guard.fresh(&mut crate::source::Probe::default()),
+                "Antigravity subagent_guard must invalidate when pending child transcript appears"
+            );
+            populate_subagent_facts(&agy_ref, &mut agy_facts);
+            assert_eq!(agy_facts.subagent_count, Some(1));
+            assert!(agy_facts.subagent_guard.fresh(&mut crate::source::Probe::default()));
+        }
     }
 }
 
@@ -3117,12 +3291,12 @@ impl AffordanceTable {
     ) -> Option<crate::affordance::Counts> {
         None
     }
-    pub(crate) fn counted_with_probe(
+    pub(crate) fn counted_record_with_probe(
         &self,
         _r: &SessionRef,
         _source: &crate::source::Baseline,
         _probe: &mut crate::source::Probe,
-    ) -> Option<Counted> {
+    ) -> Option<(crate::source::Baseline, Counted)> {
         None
     }
 }

@@ -549,6 +549,32 @@ fn matches_streamed_with_probe(
     matched.decision
 }
 
+#[cfg(all(test, feature = "sqlite"))]
+fn reduced_paths_map() -> &'static std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, usize>> {
+    use std::sync::{Mutex, OnceLock};
+    static REDUCED_PATHS: OnceLock<Mutex<std::collections::HashMap<std::path::PathBuf, usize>>> = OnceLock::new();
+    REDUCED_PATHS.get_or_init(Default::default)
+}
+
+#[cfg(all(test, feature = "sqlite"))]
+fn note_reduced_path(path: &std::path::Path) {
+    *reduced_paths_map()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(path.to_path_buf())
+        .or_insert(0) += 1;
+}
+
+#[cfg(all(test, feature = "sqlite"))]
+fn reduced_path_count(path: &std::path::Path) -> usize {
+    reduced_paths_map()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(path)
+        .copied()
+        .unwrap_or(0)
+}
+
 /// Reduce independently; publication belongs to the caller's serial stage.
 fn reduce_streamed(
     query: &SessionQuery,
@@ -557,6 +583,8 @@ fn reduce_streamed(
     text_sets: &TextSets,
     probe: &mut crate::source::Probe,
 ) -> anyhow::Result<StreamedMatch> {
+    #[cfg(all(test, feature = "sqlite"))]
+    note_reduced_path(&r.path);
     let mut sink = FactSink::new(query);
     let affordances = query
         .needles(FieldId::Has)
@@ -701,6 +729,9 @@ struct RefQuery<'a> {
     /// warns once): the next demand tries again.
     reader: Option<crate::catalog::Reader>,
     probe: crate::source::Probe,
+    /// Stashed by [`Self::cheap`] when `!self.heavy` and `r`'s transcript count record is already
+    /// fresh, needing only an on-demand sub-agent forest refresh without re-parsing `r.path`.
+    pending_subagent_refresh: Option<(crate::source::Baseline, crate::catalog::Counted)>,
 }
 
 impl<'a> RefQuery<'a> {
@@ -720,10 +751,12 @@ impl<'a> RefQuery<'a> {
             demand_counts,
             reader: None,
             probe: crate::source::Probe::default(),
+            pending_subagent_refresh: None,
         }
     }
 
     fn cheap(&mut self, r: &SessionRef) -> anyhow::Result<Tri> {
+        self.pending_subagent_refresh = None;
         if !self.query.prefilter(r) {
             return Ok(Tri::False);
         }
@@ -744,33 +777,97 @@ impl<'a> RefQuery<'a> {
         if !matches!(without_counts, Tri::Unknown) || !self.query.needs_counted() {
             return Ok(without_counts);
         }
-        let counted = if self.demand_counts {
+        let snapshot = self.probe.snapshot(r);
+        let admitted = if self.demand_counts {
             if self.reader.is_none() {
                 self.reader = crate::catalog::Reader::open();
             }
             self.reader
                 .as_ref()
-                .and_then(|reader| reader.counted_with_probe(r, &self.probe.snapshot(r), &mut self.probe))
+                .and_then(|reader| reader.counted_record_with_probe(r, &snapshot, &mut self.probe))
         } else {
             self.table
                 .get_or_insert_with(crate::catalog::AffordanceTable::load)
-                .counted_with_probe(r, &self.probe.snapshot(r), &mut self.probe)
+                .counted_record_with_probe(r, &snapshot, &mut self.probe)
         };
         let subagents_fresh = self.touches_subagents
-            && counted
+            && admitted
                 .as_ref()
-                .and_then(|c| c.facts.as_ref())
+                .and_then(|(_, c)| c.facts.as_ref())
                 .is_some_and(|f| f.subagent_count.is_some() && f.subagent_guard.fresh(&mut self.probe));
-        self.query.eval(&Facts {
+        let decision = self.query.eval(&Facts {
             r,
             session: None,
             ext: &RefFacts {
                 id: &r.id,
                 text_sets: self.text_sets,
-                counted: counted.as_ref(),
+                counted: admitted.as_ref().map(|(_, c)| c),
                 subagents_fresh,
             },
-        })
+        })?;
+        if matches!(decision, Tri::Unknown) && !self.heavy && self.touches_subagents && !subagents_fresh {
+            if let Some((record_baseline, counted)) = admitted {
+                if counted.facts.is_some() {
+                    self.pending_subagent_refresh = Some((record_baseline, counted));
+                }
+            }
+        }
+        Ok(decision)
+    }
+
+    /// Resolve a `Cost::Counted` query whose session transcript is already counted & fresh in
+    /// `catalog.db`, populating only `subagent_count` + `subagent_guard` with zero transcript
+    /// reads/parses on `r.path`.
+    fn resolve_subagent_only(
+        &mut self,
+        r: &SessionRef,
+        writer: &mut Option<crate::catalog::Writer>,
+    ) -> anyhow::Result<Option<bool>> {
+        let Some((record_baseline, mut counted)) = self.pending_subagent_refresh.take() else {
+            return Ok(None);
+        };
+        let Some(ref mut facts) = counted.facts else {
+            return Ok(None);
+        };
+        crate::catalog::populate_subagent_facts(r, facts);
+        let subagents_fresh = facts.subagent_count.is_some() && facts.subagent_guard.fresh(&mut self.probe);
+        if !subagents_fresh {
+            return Ok(None);
+        }
+        let snapshot = self.probe.snapshot(r);
+        let publish_baseline = if record_baseline.fresh(&snapshot, &mut self.probe) {
+            record_baseline
+        } else if let Some(old_reads) = record_baseline.reads() {
+            let mut refreshed = crate::source::ReadSet::default();
+            for p in old_reads.paths() {
+                refreshed.record(p);
+            }
+            snapshot.with_reads(&refreshed)
+        } else {
+            record_baseline
+        };
+        if writer.is_none() {
+            *writer = crate::catalog::Writer::open();
+        }
+        if let Some(w) = writer.as_mut() {
+            w.refresh_counted_facts(r, &publish_baseline, counted.clone());
+        }
+        Ok(
+            match self.query.eval(&Facts {
+                r,
+                session: None,
+                ext: &RefFacts {
+                    id: &r.id,
+                    text_sets: self.text_sets,
+                    counted: Some(&counted),
+                    subagents_fresh: true,
+                },
+            })? {
+                Tri::True => Some(true),
+                Tri::False => Some(false),
+                Tri::Unknown => None,
+            },
+        )
     }
 
     fn reduce(&mut self, r: &SessionRef) -> anyhow::Result<StreamedMatch> {
@@ -813,16 +910,20 @@ pub fn filter_refs_limited(
             Tri::True => true,
             Tri::False => false,
             Tri::Unknown => {
-                let matched = plan.reduce(r)?;
-                if let Some(counted) = matched.counted {
-                    if writer.is_none() {
-                        writer = crate::catalog::Writer::open();
+                if let Some(settled) = plan.resolve_subagent_only(r, &mut writer)? {
+                    settled
+                } else {
+                    let matched = plan.reduce(r)?;
+                    if let Some(counted) = matched.counted {
+                        if writer.is_none() {
+                            writer = crate::catalog::Writer::open();
+                        }
+                        if let Some(writer) = &mut writer {
+                            writer.record_counted(r, &matched.source, counted);
+                        }
                     }
-                    if let Some(writer) = &mut writer {
-                        writer.record_counted(r, &matched.source, counted);
-                    }
+                    matched.decision?
                 }
-                matched.decision?
             }
         };
         if matches {
@@ -850,11 +951,18 @@ pub fn filter_refs(refs: &mut Vec<SessionRef>, query: &SessionQuery, text_sets: 
     // list until every fallible decision succeeds.
     let mut keep = vec![false; refs.len()];
     let mut pending = Vec::new();
+    let mut writer: Option<crate::catalog::Writer> = None;
     for (index, r) in refs.iter().enumerate() {
         match plan.cheap(r)? {
             Tri::True => keep[index] = true,
             Tri::False => {}
-            Tri::Unknown => pending.push(index),
+            Tri::Unknown => {
+                if let Some(settled) = plan.resolve_subagent_only(r, &mut writer)? {
+                    keep[index] = settled;
+                } else {
+                    pending.push(index);
+                }
+            }
         }
     }
     // Use the existing Rayon helpers, with finite batches rather than another executor or
@@ -863,7 +971,9 @@ pub fn filter_refs(refs: &mut Vec<SessionRef>, query: &SessionQuery, text_sets: 
     // A source exceeding the 2 GiB guard runs alone. Width is bounded by available cores.
     const SOURCE_BYTES: u64 = 2 << 30;
     let width = std::thread::available_parallelism().map_or(1, usize::from);
-    let mut writer = (!pending.is_empty()).then(crate::catalog::Writer::open).flatten();
+    if !pending.is_empty() && writer.is_none() {
+        writer = crate::catalog::Writer::open();
+    }
     let mut next = 0;
     while next < pending.len() {
         let start = next;
@@ -1533,6 +1643,7 @@ mod tests {
         crate::catalog::sync(std::slice::from_ref(&r));
 
         // First query counts transcript facts without walking the sub-agent forest.
+        assert_eq!(reduced_path_count(&r.path), 0);
         let mut initial = vec![r.clone()];
         filter_refs(
             &mut initial,
@@ -1541,6 +1652,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(initial.len(), 1);
+        assert_eq!(
+            reduced_path_count(&r.path),
+            1,
+            "cold model:haiku query parses parent transcript once"
+        );
 
         let indexed = crate::catalog::session_indexed_fields(&r).expect("sessions row indexed");
         assert_eq!(indexed.model.as_deref(), Some("claude-opus-4-6"));
@@ -1551,7 +1667,8 @@ mod tests {
             "non-subagent pass must not walk the sub-agent forest"
         );
 
-        // First sub-agent query populates and guards `subagent_count`.
+        // First sub-agent query (`agents=1`) on an already-counted session MUST populate and
+        // persist `subagent_count` with ZERO transcript parses/reads on `r.path`!
         let mut sub_initial = vec![r.clone()];
         filter_refs(
             &mut sub_initial,
@@ -1560,6 +1677,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(sub_initial.len(), 1);
+        assert_eq!(
+            reduced_path_count(&r.path),
+            1,
+            "agents=1 after model:haiku must NOT re-parse parent transcript"
+        );
         assert_eq!(
             crate::catalog::session_indexed_fields(&r).unwrap().subagent_count,
             Some(1)
@@ -1596,7 +1718,7 @@ mod tests {
 
         // Spawning a second sub-agent without touching the parent transcript invalidates `subagent_guard`:
         // `cheap` returns `Unknown` for `agents` / `has:subagents` (never stale `1`), and `filter_refs`
-        // refreshes the count to `2`!
+        // refreshes the count to `2` with ZERO transcript parses/reads on `r.path`!
         world.write_agent(
             "parent",
             "sub-2",
@@ -1614,8 +1736,29 @@ mod tests {
         filter_refs(&mut refreshed, &q_agents2, &texts).unwrap();
         assert_eq!(refreshed.len(), 1);
         assert_eq!(
+            reduced_path_count(&r.path),
+            1,
+            "agents=2 after spawning sub-2 must NOT re-parse parent transcript"
+        );
+        assert_eq!(
             crate::catalog::session_indexed_fields(&r).unwrap().subagent_count,
             Some(2)
+        );
+
+        // Also verify `filter_refs_limited` refreshes `subagent_count` with zero parent parses!
+        world.write_agent(
+            "parent",
+            "sub-3",
+            &serde_json::json!({"agentType": "Explore"}),
+            &[serde_json::json!({"type": "user", "message": {"role": "user", "content": "hi 3"}})],
+        );
+        let mut limited = vec![r.clone()];
+        filter_refs_limited(&mut limited, &SessionQuery::parse("agents=3").unwrap(), &texts, 1).unwrap();
+        assert_eq!(limited.len(), 1);
+        assert_eq!(reduced_path_count(&r.path), 1);
+        assert_eq!(
+            crate::catalog::session_indexed_fields(&r).unwrap().subagent_count,
+            Some(3)
         );
     }
 }

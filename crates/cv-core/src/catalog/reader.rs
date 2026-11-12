@@ -32,12 +32,12 @@ impl Reader {
         crate::discover_cache::read::Context::current().enter()
     }
 
-    pub(crate) fn counted_with_probe(
+    pub(crate) fn counted_record_with_probe(
         &self,
         r: &SessionRef,
         source: &crate::source::Baseline,
         probe: &mut crate::source::Probe,
-    ) -> Option<super::Counted> {
+    ) -> Option<(crate::source::Baseline, super::Counted)> {
         let _ = (r, source, probe);
         None
     }
@@ -126,20 +126,22 @@ impl Reader {
     /// Demand one count record and its provenance in a single statement snapshot. Separate
     /// candidates may observe different commits; no fleet snapshot or transaction spans body
     /// reads/publication. Missing, stale, malformed or unreadable cache records are cache misses.
-    pub(crate) fn counted_with_probe(
+    pub(crate) fn counted_record_with_probe(
         &self,
         r: &SessionRef,
         source: &crate::source::Baseline,
         probe: &mut crate::source::Probe,
-    ) -> Option<super::Counted> {
+    ) -> Option<(crate::source::Baseline, super::Counted)> {
         #[cfg(test)]
         self.counts_lookups.set(self.counts_lookups.get() + 1);
         let conn = self.conn.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let record = super::imp::count_record_in(&conn, r)?;
         #[cfg(test)]
         self.counts_rows.set(self.counts_rows.get() + 1);
+        drop(conn);
         let record = crate::source::Record::<super::Counted>::decode(&record)?;
-        Some(record.admit_for(r, source, probe)?.clone())
+        let payload = record.admit_for(r, source, probe)?.clone();
+        Some((record.baseline, payload))
     }
 
     #[cfg(test)]
@@ -149,7 +151,7 @@ impl Reader {
         source: &crate::source::Baseline,
         probe: &mut crate::source::Probe,
     ) -> Option<crate::affordance::Counts> {
-        Some(self.counted_with_probe(r, source, probe)?.counts)
+        Some(self.counted_record_with_probe(r, source, probe)?.1.counts)
     }
 
     /// Refill only source-certified exact counts. Cold/malformed candidates are rejected
