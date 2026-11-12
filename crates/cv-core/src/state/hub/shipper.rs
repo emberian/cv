@@ -724,7 +724,7 @@ impl Shipper {
                 .collect()
         };
 
-        let all_local = collect_local_commits(store)?;
+        let all_local = collect_local_commits(store, local_packs_dir)?;
         report.events_examined = all_local.len();
 
         let pending: Vec<SealedCommitEntry> = all_local
@@ -934,7 +934,7 @@ impl Shipper {
         // Map hub `(producer_id, epoch, contiguous_seq)` back to the highest local `local_commit_pos`
         // covered by `seq <= contiguous_seq` so `StateStore::is_pack_evictable` unlocks ONLY when
         // the hub's gap-free contiguous frontier covers the sealed local pack!
-        let all_commits_now = collect_local_commits(store)?;
+        let all_commits_now = collect_local_commits(store, local_packs_dir)?;
         for hub_wm in &ingest_resp.custody_acks {
             if hub_wm.contiguous_seq == 0 {
                 continue;
@@ -961,14 +961,16 @@ impl Shipper {
     }
 }
 
-fn collect_local_commits(store: &StateStore) -> Result<Vec<SealedCommitEntry>, HubError> {
+fn collect_local_commits(store: &StateStore, local_packs_dir: &Path) -> Result<Vec<SealedCommitEntry>, HubError> {
     let mut out = Vec::new();
     for pm in store.list_pack_manifests()? {
         if let Some(value) = pm.index_meta.get("commits_addr") {
             let addr: PayloadAddr = serde_json::from_value(value.clone())?;
-            let dir = Path::new(&pm.pack_path)
-                .parent()
-                .ok_or_else(|| HubError::Pack("pack path has no parent".into()))?;
+            let raw_parent = Path::new(&pm.pack_path).parent();
+            let dir = match raw_parent {
+                Some(p) if !p.as_os_str().is_empty() && p.is_absolute() && p.exists() => p,
+                _ => local_packs_dir,
+            };
             let pack = SealedPack::open(dir, &addr.pack_id).map_err(|e| HubError::Pack(format!("{e:#}")))?;
             let bytes = pack.read_payload(&addr).map_err(|e| HubError::Pack(format!("{e:#}")))?;
             out.extend(serde_json::from_slice::<Vec<SealedCommitEntry>>(&bytes)?);
@@ -1019,7 +1021,7 @@ fn load_commit_session(commit: &SealedCommitEntry, local_packs_dir: &Path) -> Re
 
 fn is_session_upsert_envelope(envelope: &Value) -> bool {
     match envelope.get("kind").and_then(Value::as_str) {
-        Some("session_upsert") => envelope
+        Some("session_upsert" | "session_archive") => envelope
             .get("session_id")
             .or_else(|| envelope.get("id"))
             .and_then(Value::as_str)
@@ -1244,10 +1246,10 @@ fn build_scrubbed_envelope(
     repo_root: Option<&Path>,
     stats: &mut ScrubStats,
 ) -> Value {
-    let kind = raw_envelope
-        .get("kind")
-        .and_then(Value::as_str)
-        .unwrap_or("session_upsert");
+    let kind = match raw_envelope.get("kind").and_then(Value::as_str) {
+        Some("session_archive") | None => "session_upsert",
+        Some(other) => other,
+    };
     let msg_count = raw_envelope
         .get("message_count")
         .and_then(Value::as_u64)
@@ -1289,15 +1291,14 @@ mod astra_tests {
     fn sealed_inbox_keeps_envelopes_in_pack_and_reads_them_back() {
         let world = cv_testkit::World::new("inbox-pack-envelope");
         let store = StateStore::at_dir(&world.cv_home);
+        let packs_dir = world.cv_home.join("packs");
         let body = "retained evidence ".repeat(10000);
         store.append("op", "digest", &json!({"body": body})).unwrap();
-        let before = collect_local_commits(&store).unwrap();
-        let manifest = seal_local_inbox_to_pack(&store, &world.cv_home.join("packs"), None)
-            .unwrap()
-            .unwrap();
+        let before = collect_local_commits(&store, &packs_dir).unwrap();
+        let manifest = seal_local_inbox_to_pack(&store, &packs_dir, None).unwrap().unwrap();
         assert!(serde_json::to_vec(&manifest.index_meta).unwrap().len() < 1024);
         assert_eq!(store.inbox_count().unwrap(), 0);
-        let after = collect_local_commits(&store).unwrap();
+        let after = collect_local_commits(&store, &packs_dir).unwrap();
         assert_eq!(
             serde_json::to_value(before).unwrap(),
             serde_json::to_value(after).unwrap()

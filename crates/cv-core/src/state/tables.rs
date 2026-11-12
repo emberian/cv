@@ -1258,3 +1258,50 @@ fn insert_receipt_in_tx(
         body: full_body,
     })
 }
+
+impl StateStore {
+    /// Return or atomically initialize a persistent, privacy-safe replication `producer_id`
+    /// (`prod-<12hex>`) stored in `producers.metadata_json["ship_producer_id"]` for this store so
+    /// multiple machines shipping with default settings never collide under `"local"`.
+    pub fn ensure_ship_producer_id(&self) -> Result<String, StateError> {
+        let mut conn = self.open_writable()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let prod_key = self.default_producer();
+        let existing_meta: Option<String> = tx
+            .query_row(
+                "SELECT metadata_json FROM producers WHERE producer_id = ?1",
+                [prod_key],
+                |r| r.get(0),
+            )
+            .optional()?;
+
+        let mut meta_obj = existing_meta
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+            .and_then(|v| v.as_object().cloned())
+            .unwrap_or_default();
+
+        if let Some(existing_id) = meta_obj
+            .get("ship_producer_id")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+        {
+            return Ok(existing_id.to_string());
+        }
+
+        let generated = format!("prod-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
+        meta_obj.insert("ship_producer_id".into(), Value::String(generated.clone()));
+        let meta_json = serde_json::to_string(&Value::Object(meta_obj))?;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        tx.execute(
+            "INSERT INTO producers(producer_id, host_label, metadata_json, enrolled_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?4)
+             ON CONFLICT(producer_id) DO UPDATE SET
+                 metadata_json = excluded.metadata_json,
+                 updated_at = excluded.updated_at",
+            rusqlite::params![prod_key, default_host_label(), meta_json, now_ms],
+        )?;
+        tx.commit()?;
+        Ok(generated)
+    }
+}

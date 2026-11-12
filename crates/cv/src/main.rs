@@ -956,6 +956,12 @@ enum Cmd {
         /// Archive home (default: $CLUSTERVISION_HOME or ~/.clustervision).
         #[arg(long, value_name = "DIR")]
         home: Option<PathBuf>,
+        /// Replicate sealed custody packs and events to this hub URL or `[replication.<target>]` profile.
+        #[arg(long, value_name = "TARGET")]
+        to: Option<String>,
+        /// Bearer credential for `--to` hub replication (overrides $CV_SERVE_TOKEN and profile token).
+        #[arg(long, value_name = "TOKEN", requires = "to")]
+        token: Option<String>,
     },
     /// The durable archive: every session snapshotted as IR under one home, for search and
     /// safekeeping across machines (`sync` once, `ls`, `path`; `cv watch` keeps it current).
@@ -1108,7 +1114,14 @@ enum Cmd {
 #[derive(Subcommand)]
 enum ArchiveCmd {
     /// Discover and archive every session once, then exit (idempotent: unchanged ones are skipped).
-    Sync,
+    Sync {
+        /// Replicate sealed custody packs and events to this hub URL or `[replication.<target>]` profile.
+        #[arg(long, value_name = "TARGET")]
+        to: Option<String>,
+        /// Bearer credential for `--to` hub replication (overrides $CV_SERVE_TOKEN and profile token).
+        #[arg(long, value_name = "TOKEN", requires = "to")]
+        token: Option<String>,
+    },
     /// List what's in the archive, newest activity first.
     Ls,
     /// Print the archive location.
@@ -1183,7 +1196,7 @@ fn run() -> Result<()> {
                 ..
             } => *session || agent_of.is_some() || harness.is_some() || out.is_some(),
             Cmd::Hooks { action } => !matches!(action, HooksCmd::Show { .. }),
-            Cmd::Archive { action, .. } => matches!(action, ArchiveCmd::Sync),
+            Cmd::Archive { action, .. } => matches!(action, ArchiveCmd::Sync { .. }),
             Cmd::Config { add_export, rm_export } => add_export.is_some() || rm_export.is_some(),
             Cmd::Pack { format, out, .. } => format == "session" || out.is_some(),
             Cmd::Resume { launch, .. } => *launch,
@@ -1566,11 +1579,13 @@ fn run() -> Result<()> {
             harness,
             cwd,
             home,
-        } => archive::cmd_watch(&archive::Archive::resolve(home)?, interval, harness, cwd),
+            to,
+            token,
+        } => archive::cmd_watch(&archive::Archive::resolve(home)?, interval, harness, cwd, to, token),
         Cmd::Archive { home, action } => {
             let a = archive::Archive::resolve(home)?;
             match action {
-                ArchiveCmd::Sync => archive::cmd_sync(&a),
+                ArchiveCmd::Sync { to, token } => archive::cmd_sync(&a, to, token),
                 ArchiveCmd::Ls => archive::cmd_ls(&a),
                 ArchiveCmd::Path => archive::cmd_path(&a),
             }

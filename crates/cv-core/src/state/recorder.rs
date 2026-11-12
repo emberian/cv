@@ -335,12 +335,31 @@ pub(crate) fn commit_append_in_tx(
     })
 }
 
-pub(crate) fn default_host_label() -> String {
-    crate::env::var("HOSTNAME")
+/// Best-effort OS hostname (`$HOSTNAME` / `$COMPUTERNAME`, `gethostname(2)` on Unix, or `"localhost"`).
+pub fn default_host_label() -> String {
+    if let Some(env_host) = crate::env::var("HOSTNAME")
         .or_else(|_| crate::env::var("COMPUTERNAME"))
         .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "localhost".to_string())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        return env_host;
+    }
+    #[cfg(unix)]
+    {
+        let mut buf = [0u8; 256];
+        let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+        if rc == 0 {
+            let nul = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+            if let Ok(s) = std::str::from_utf8(&buf[..nul]) {
+                let trimmed = s.trim();
+                if !trimmed.is_empty() {
+                    return trimmed.to_string();
+                }
+            }
+        }
+    }
+    "localhost".to_string()
 }
 
 #[cfg(unix)]

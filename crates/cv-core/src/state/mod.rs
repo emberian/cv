@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub use recorder::{AppendRequest, FaultMode, RecorderServer};
+pub use recorder::{default_host_label, AppendRequest, FaultMode, RecorderServer};
 pub use schema::{current_schema_version, STATE_SCHEMA_VERSION};
 pub use tables::{
     CaptureInboxRow, CustodyAck, LaneEndpointBinding, LaneRun, LineageEdge, PackManifest, Producer, ReceiptRecord,

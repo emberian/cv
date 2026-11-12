@@ -370,29 +370,40 @@ impl Archive {
 
         // 2. Append capture envelopes to `StateStore` (`capture_inbox`) with pack-scoped `op_id`s
         //    (preventing retry wedges if an earlier pack failed before publishing) and record each
-        //    archived session's exact `local_commit_pos`.
+        //    archived session's exact `local_commit_pos` + `(epoch, seq)` for `Shipper::sync`.
         let mut committed = Vec::with_capacity(entries.len());
         for (item, entry) in staged.iter().zip(entries.iter()) {
-            let anchor = record_anchor(&producer_id, &item.harness, &item.id);
             let op_id = format!("archive:{pack_id}:{producer_id}:{}:{}", item.harness, item.id);
             let envelope = json!({
                 "kind": "session_archive",
                 "producer_id": producer_id,
                 "harness": item.harness,
                 "session_id": item.id,
+                "title": item.title,
+                "cwd": item.cwd,
+                "created_at": item.created_at.map(|t| t.to_rfc3339()),
+                "updated_at": item.updated_at.map(|t| t.to_rfc3339()),
                 "message_count": item.message_count,
                 "content_blake3": item.blake3_hex,
                 "pack_id": pack_id,
                 "decoded_offset": entry.addr.decoded_offset,
                 "length": entry.addr.length,
             });
-            let req = AppendRequest::new(op_id, item.blake3_hex.clone(), envelope)
+            let payload_ref_json = serde_json::to_string(&entry.addr)?;
+            let req = AppendRequest::new(op_id.clone(), item.blake3_hex.clone(), envelope.clone())
                 .with_producer(producer_id.clone())
-                .with_payload_ref(format!("{rel_pack_path}#{anchor}"));
+                .with_payload_ref(payload_ref_json);
             let receipt = store
                 .append_request(&req)
                 .context("appending archive capture envelope to StateStore")?;
-            committed.push((receipt.local_commit_pos, entry.clone()));
+            committed.push(CommittedArchiveRecord {
+                local_commit_pos: receipt.local_commit_pos,
+                epoch: receipt.event_id.epoch,
+                seq: receipt.event_id.seq,
+                op_id,
+                envelope,
+                entry: entry.clone(),
+            });
         }
 
         // 3. Publish maximal contiguous `local_commit_pos` sub-runs so any concurrent non-archive
@@ -416,6 +427,15 @@ impl Archive {
     }
 }
 
+struct CommittedArchiveRecord {
+    local_commit_pos: i64,
+    epoch: String,
+    seq: u64,
+    op_id: String,
+    envelope: serde_json::Value,
+    entry: ArchivedSessionEntry,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn publish_contiguous_archive_runs(
     store: &StateStore,
@@ -425,33 +445,46 @@ fn publish_contiguous_archive_runs(
     pack_blake3: &str,
     pack_file_manifest: &PackFileManifest,
     published_at_ms: i64,
-    mut committed: Vec<(i64, ArchivedSessionEntry)>,
+    mut committed: Vec<CommittedArchiveRecord>,
 ) -> Result<()> {
     if committed.is_empty() {
         return Ok(());
     }
-    committed.sort_by_key(|(pos, _)| *pos);
-    committed.dedup_by_key(|(pos, _)| *pos);
+    committed.sort_by_key(|c| c.local_commit_pos);
+    committed.dedup_by_key(|c| c.local_commit_pos);
 
-    let mut runs: Vec<Vec<(i64, ArchivedSessionEntry)>> = Vec::new();
-    for (pos, entry) in committed {
+    let mut runs: Vec<Vec<CommittedArchiveRecord>> = Vec::new();
+    for item in committed {
         if let Some(last_run) = runs.last_mut() {
-            if let Some((prev_pos, _)) = last_run.last() {
-                if pos == *prev_pos + 1 {
-                    last_run.push((pos, entry));
+            if let Some(prev) = last_run.last() {
+                if item.local_commit_pos == prev.local_commit_pos + 1 {
+                    last_run.push(item);
                     continue;
                 }
             }
         }
-        runs.push(vec![(pos, entry)]);
+        runs.push(vec![item]);
     }
 
     for (run_idx, run) in runs.into_iter().enumerate() {
-        let min_pos = run.first().expect("non-empty run").0;
-        let max_pos = run.last().expect("non-empty run").0;
+        let min_pos = run.first().expect("non-empty run").local_commit_pos;
+        let max_pos = run.last().expect("non-empty run").local_commit_pos;
         let record_count = run.len() as u64;
         debug_assert_eq!((max_pos - min_pos + 1) as u64, record_count);
-        let run_entries: Vec<ArchivedSessionEntry> = run.into_iter().map(|(_, e)| e).collect();
+        let mut run_entries = Vec::with_capacity(run.len());
+        let mut run_commits = Vec::with_capacity(run.len());
+        for c in run {
+            run_commits.push(json!({
+                "local_commit_pos": c.local_commit_pos,
+                "producer_id": c.entry.producer_id,
+                "epoch": c.epoch,
+                "seq": c.seq,
+                "op_id": c.op_id,
+                "envelope": c.envelope,
+                "payload_addr": c.entry.addr,
+            }));
+            run_entries.push(c.entry);
+        }
         let manifest_pack_id = if run_idx == 0 {
             pack_id.to_string()
         } else {
@@ -471,6 +504,7 @@ fn publish_contiguous_archive_runs(
                 "frame_count": pack_file_manifest.frame_count,
                 "total_decoded_len": pack_file_manifest.total_decoded_len,
                 "sessions": run_entries,
+                "commits": run_commits,
             }),
             published_at: published_at_ms,
         };
@@ -536,7 +570,88 @@ fn discover_filtered(harness: Option<Harness>, cwd_sub: Option<&str>) -> Vec<Ses
         .collect()
 }
 
-pub fn cmd_sync(archive: &Archive) -> Result<()> {
+fn resolve_shipper(
+    archive: &Archive,
+    target: &str,
+    cli_token: Option<&str>,
+) -> Result<(String, cv_core::state::hub::Shipper)> {
+    let target = target.trim();
+    if target.is_empty() {
+        bail!("--to target must not be empty (pass an `http://host:port` hub URL or a `[replication.<name>]` profile)");
+    }
+    let cfg = cv_core::config::load();
+    let (target_name, hub_url, profile) = if target.starts_with("http://") || target.starts_with("https://") {
+        let prof = cv_core::state::hub::resolve_replication_profile(&cfg, target);
+        (target.to_string(), target.to_string(), prof)
+    } else {
+        let Some(prof) = cfg.replication.get(target).cloned() else {
+            bail!(
+                "unknown replication target `{target}`: pass an `http://host:port` URL or configure `[replication.{target}]` with `url = \"http://...\"` in config.toml"
+            );
+        };
+        let Some(url) = prof.url.clone().filter(|u| !u.trim().is_empty()) else {
+            bail!("replication profile `[replication.{target}]` has no `url = \"http://...\"` in config.toml");
+        };
+        (target.to_string(), url, prof)
+    };
+
+    let bearer_token = cli_token
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            cv_core::env::var("CV_SERVE_TOKEN")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        })
+        .or_else(|| profile.token.clone().filter(|s| !s.trim().is_empty()));
+
+    let store = archive.state_store();
+    let producer_id = profile
+        .producer_id
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            cv_core::env::var("CV_PRODUCER_ID")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        })
+        .map(Ok)
+        .unwrap_or_else(|| store.ensure_ship_producer_id())
+        .context("resolving replication producer_id")?;
+
+    let mut ship_cfg = cv_core::state::hub::ShipConfig::new(target_name.clone(), hub_url, producer_id)
+        .with_host_label(cv_core::state::default_host_label())
+        .with_profile(profile);
+    if let Some(tok) = bearer_token {
+        ship_cfg = ship_cfg.with_token(tok);
+    }
+    let shipper = cv_core::state::hub::Shipper::new(ship_cfg).context("initializing hub replication shipper")?;
+    Ok((target_name, shipper))
+}
+
+fn format_ship_report(target_name: &str, report: &cv_core::state::hub::ShipReport) -> String {
+    if report.events_shipped == 0 {
+        return format!("  ↳ replicated to {target_name}: already up to date");
+    }
+    let snap_note = report
+        .hub_snapshot_id
+        .as_deref()
+        .map(|id| format!(" · snapshot {}", truncate_str(id, 20)))
+        .unwrap_or_default();
+    format!(
+        "  ↳ replicated to {target_name}: {} event(s) ({} session(s), {} filtered, {} redacted){snap_note}",
+        report.events_shipped, report.sessions_admitted, report.sessions_filtered_out, report.redactions_applied
+    )
+}
+
+pub fn cmd_sync(archive: &Archive, to: Option<String>, token: Option<String>) -> Result<()> {
+    // Validate `--to` upfront before spending time syncing locally if the target profile is missing.
+    let resolved_shipper = match to.as_deref() {
+        Some(target) => Some(resolve_shipper(archive, target, token.as_deref())?),
+        None => None,
+    };
+
     let refs = discover_filtered(None, None);
     let total = refs.len();
     let summary = archive.sync_refs(&refs)?;
@@ -560,6 +675,14 @@ pub fn cmd_sync(archive: &Archive) -> Result<()> {
         },
         archive.home.display(),
     );
+
+    if let Some((target_name, shipper)) = resolved_shipper {
+        let store = archive.state_store();
+        let report = shipper
+            .sync(&store, &archive.packs_dir())
+            .with_context(|| format!("shipping archive custody to `{target_name}`"))?;
+        println!("{}", format_ship_report(&target_name, &report));
+    }
     Ok(())
 }
 
@@ -568,19 +691,29 @@ pub fn cmd_watch(
     interval_secs: f64,
     harness_filter: Option<String>,
     cwd_filter: Option<String>,
+    to: Option<String>,
+    token: Option<String>,
 ) -> Result<()> {
     let want = parse_harness(&harness_filter)?;
     let poll = poll_interval(interval_secs)?;
+    let resolved_shipper = match to.as_deref() {
+        Some(target) => Some(resolve_shipper(archive, target, token.as_deref())?),
+        None => None,
+    };
 
     // Announce immediately to stderr BEFORE initial discovery/sync (`docs/INTERFACE-V2.md` §2:
     // daemons announce on stderr within 1s so piped callers know what is running).
     eprintln!(
-        "cv watch: watching (interval {}s{}{}) -> {}",
+        "cv watch: watching (interval {}s{}{}{}) -> {}",
         poll.as_secs_f64(),
         want.map(|h| format!(" · harness={h}")).unwrap_or_default(),
         cwd_filter
             .as_deref()
             .map(|c| format!(" · cwd~{c:?}"))
+            .unwrap_or_default(),
+        resolved_shipper
+            .as_ref()
+            .map(|(name, _)| format!(" · to={name}"))
             .unwrap_or_default(),
         archive.home.display(),
     );
@@ -596,6 +729,22 @@ pub fn cmd_watch(
         "  initial sync: {} archived, {} already current",
         init.archived, init.skipped
     );
+
+    let mut ship_retry_pending = false;
+    if let Some((ref target_name, ref shipper)) = resolved_shipper {
+        let store = archive.state_store();
+        match shipper.sync(&store, &archive.packs_dir()) {
+            Ok(report) => {
+                if report.events_shipped > 0 {
+                    eprintln!("{}", format_ship_report(target_name, &report));
+                }
+            }
+            Err(e) => {
+                ship_retry_pending = true;
+                eprintln!("  ! replicate {target_name}: {e:#}");
+            }
+        }
+    }
 
     // Track last-seen `(len, mtime)` per source file so unchanged files aren't even touched
     // between polls unless discovery surfaces new/updated refs.
@@ -623,22 +772,43 @@ pub fn cmd_watch(
             }
             candidates.push(r);
         }
-        if candidates.is_empty() {
-            continue;
+
+        let mut synced_any = false;
+        if !candidates.is_empty() {
+            let batch = archive.sync_refs(&candidates)?;
+            for (who, why) in &batch.failed {
+                eprintln!("  ! {who}: {why}");
+            }
+            for entry in &batch.archived_entries {
+                let now = fmt_local(Utc::now(), "%H:%M:%S");
+                let title = entry.title.as_deref().map(|t| truncate_str(t, 44)).unwrap_or_default();
+                println!(
+                    "  [{now}] {:8} {}  ({:>4} msgs)  {title}",
+                    entry.harness,
+                    short_id(&entry.id),
+                    entry.message_count,
+                );
+            }
+            synced_any = batch.archived > 0;
         }
-        let batch = archive.sync_refs(&candidates)?;
-        for (who, why) in &batch.failed {
-            eprintln!("  ! {who}: {why}");
-        }
-        for entry in &batch.archived_entries {
-            let now = fmt_local(Utc::now(), "%H:%M:%S");
-            let title = entry.title.as_deref().map(|t| truncate_str(t, 44)).unwrap_or_default();
-            println!(
-                "  [{now}] {:8} {}  ({:>4} msgs)  {title}",
-                entry.harness,
-                short_id(&entry.id),
-                entry.message_count,
-            );
+
+        if let Some((ref target_name, ref shipper)) = resolved_shipper {
+            let store = archive.state_store();
+            let has_inbox = store.inbox_count().unwrap_or(0) > 0;
+            if synced_any || ship_retry_pending || has_inbox {
+                match shipper.sync(&store, &archive.packs_dir()) {
+                    Ok(report) => {
+                        ship_retry_pending = false;
+                        if report.events_shipped > 0 {
+                            println!("{}", format_ship_report(target_name, &report));
+                        }
+                    }
+                    Err(e) => {
+                        ship_retry_pending = true;
+                        eprintln!("  ! replicate {target_name}: {e:#}");
+                    }
+                }
+            }
         }
     }
 }
@@ -906,7 +1076,24 @@ mod tests {
             &pack_blake3,
             &pfm,
             now.timestamp_millis(),
-            vec![(r1.local_commit_pos, entry_1), (r2.local_commit_pos, entry_2)],
+            vec![
+                CommittedArchiveRecord {
+                    local_commit_pos: r1.local_commit_pos,
+                    epoch: r1.event_id.epoch,
+                    seq: r1.event_id.seq,
+                    op_id: format!("archive:{pack_id}:{producer}:claude:s-one"),
+                    envelope: json!({"kind": "session_archive", "session_id": "s-one"}),
+                    entry: entry_1,
+                },
+                CommittedArchiveRecord {
+                    local_commit_pos: r2.local_commit_pos,
+                    epoch: r2.event_id.epoch,
+                    seq: r2.event_id.seq,
+                    op_id: format!("archive:{pack_id}:{producer}:claude:s-two"),
+                    envelope: json!({"kind": "session_archive", "session_id": "s-two"}),
+                    entry: entry_2,
+                },
+            ],
         )
         .unwrap();
 

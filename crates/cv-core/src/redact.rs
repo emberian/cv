@@ -299,6 +299,15 @@ fn extract_session_tags(session: &Session) -> Vec<&str> {
 /// Configurable privacy & scrubbing profile (`[privacy]` and `[replication.<name>]` in `config.toml`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScrubProfile {
+    /// Hub endpoint URL (`http://host:port`) when configured under `[replication.<target>]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Bearer credential for `[replication.<target>]` (overridden by `--token` or `$CV_SERVE_TOKEN`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    /// Explicit producer identity enrolled on `[replication.<target>]` (default: `$CV_PRODUCER_ID` or persistent `prod-<12hex>`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub producer_id: Option<String>,
     /// Toggleable credential & secret classes.
     #[serde(default, skip_serializing_if = "RedactClasses::is_default")]
     pub classes: RedactClasses,
@@ -2613,6 +2622,7 @@ mod tests {
                 harnesses: vec!["claude".into()],
                 tags: vec!["shareable".into()],
             },
+            ..ScrubProfile::default()
         };
 
         let mut s = Session::new("prof-1", Harness::Claude);

@@ -1759,3 +1759,155 @@ fn hub_snapshots_cap_unpinned_history_while_preserving_pinned_and_delta_fold_par
     let after_rebuild = hub.rebuild_from_raw().unwrap().unwrap();
     assert_eq!(after_rebuild, before_rebuild);
 }
+
+#[test]
+fn cli_archive_sync_to_hub_ships_scrubbed_packs_and_respects_frozen() {
+    let hub_w = World::new("fleet-hub-cli-archive-hub");
+    let (hub_url, _port, _reaper) = spawn_hub_serve(&hub_w, Some("cli-ship-tok"));
+
+    // Host A: direct `--to <url> --token <token>` with auto-generated persistent `prod-<12hex>`.
+    let host_a = World::new("fleet-hub-cli-host-a");
+    let secret_key = "sk-ant-api03-SUPERSECRETKEY1234567890ABCDEFGH";
+    host_a.write_session(
+        "cli-sess-a",
+        &[
+            json!({
+                "type": "user",
+                "uuid": "u-a1",
+                "sessionId": "cli-sess-a",
+                "timestamp": "2026-06-20T10:00:00Z",
+                "cwd": "/work/proj-a",
+                "message": {"role": "user", "content": format!("deploy with {secret_key}")}
+            }),
+            json!({
+                "type": "assistant",
+                "uuid": "a-a1",
+                "sessionId": "cli-sess-a",
+                "timestamp": "2026-06-20T10:00:05Z",
+                "cwd": "/work/proj-a",
+                "message": {"role": "assistant", "content": "deployed cleanly"}
+            }),
+        ],
+    );
+
+    // `--frozen` MUST refuse `cv archive sync --to ...` (exit 2) without creating `state.db` or
+    // shipping anything to the hub.
+    let frozen_out = host_a
+        .cv_command()
+        .args([
+            "--frozen",
+            "archive",
+            "sync",
+            "--to",
+            &hub_url,
+            "--token",
+            "cli-ship-tok",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(frozen_out.status.code(), Some(2));
+    assert!(!host_a.cv_home.join("state.db").exists());
+
+    // Live `cv archive sync --to <url> --token <tok>` seals local pack + ships scrubbed pack to hub!
+    let sync_a = host_a
+        .cv_command()
+        .args(["archive", "sync", "--to", &hub_url, "--token", "cli-ship-tok"])
+        .output()
+        .unwrap();
+    assert!(
+        sync_a.status.success(),
+        "archive sync --to failed: stdout={}\nstderr={}",
+        String::from_utf8_lossy(&sync_a.stdout),
+        String::from_utf8_lossy(&sync_a.stderr)
+    );
+    let stdout_a = String::from_utf8_lossy(&sync_a.stdout);
+    assert!(stdout_a.contains("1 archived"), "unexpected stdout: {stdout_a}");
+    assert!(stdout_a.contains("replicated to"), "unexpected stdout: {stdout_a}");
+
+    // Second run with no changes is idempotent ("already up to date").
+    let sync_a_again = host_a
+        .cv_command()
+        .args(["archive", "sync", "--to", &hub_url, "--token", "cli-ship-tok"])
+        .output()
+        .unwrap();
+    assert!(sync_a_again.status.success());
+    assert!(String::from_utf8_lossy(&sync_a_again.stdout).contains("already up to date"));
+
+    // Host B: named `[replication.team-hub]` profile in `config.toml` with explicit `producer_id`,
+    // `url`, `token`, and `rewrite_home = true`. Ensuring Host A and Host B do NOT collide!
+    let host_b = World::new("fleet-hub-cli-host-b");
+    let cfg_dir = host_b.home.join(".config/clustervision");
+    fs::create_dir_all(&cfg_dir).unwrap();
+    fs::write(
+        cfg_dir.join("config.toml"),
+        format!(
+            "[replication.team-hub]\nurl = {hub_url:?}\ntoken = \"cli-ship-tok\"\nproducer_id = \"laptop-b\"\nrewrite_home = true\n"
+        ),
+    )
+    .unwrap();
+    let host_b_cwd = host_b.home.join("work/secret-repo");
+    host_b.write_session(
+        "cli-sess-b",
+        &[json!({
+            "type": "user",
+            "uuid": "u-b1",
+            "sessionId": "cli-sess-b",
+            "timestamp": "2026-06-20T11:00:00Z",
+            "cwd": host_b_cwd.to_string_lossy(),
+            "message": {"role": "user", "content": format!("inspect {}", host_b_cwd.display())}
+        })],
+    );
+
+    let sync_b = host_b
+        .cv_command()
+        .args(["archive", "sync", "--to", "team-hub"])
+        .output()
+        .unwrap();
+    assert!(
+        sync_b.status.success(),
+        "named profile sync failed: stdout={}\nstderr={}",
+        String::from_utf8_lossy(&sync_b.stdout),
+        String::from_utf8_lossy(&sync_b.stderr)
+    );
+
+    // Query the hub and verify both hosts' sessions arrived under distinct producers with secrets
+    // and home paths scrubbed!
+    let client = HttpClient::new(&hub_url, Some("cli-ship-tok".into())).unwrap();
+    let (page_raw, _) = client.get("/api/hub/sessions").unwrap();
+    assert_eq!(page_raw.status, 200);
+    let page: HubSessionsPage = page_raw.json().unwrap();
+    assert_eq!(page.sessions.len(), 2);
+
+    let row_a = page
+        .sessions
+        .iter()
+        .find(|r| r.id == "cli-sess-a")
+        .expect("cli-sess-a on hub");
+    assert!(
+        row_a.producer_id.starts_with("prod-"),
+        "expected persistent auto-generated prod-<12hex>, got {}",
+        row_a.producer_id
+    );
+
+    let row_b = page
+        .sessions
+        .iter()
+        .find(|r| r.id == "cli-sess-b")
+        .expect("cli-sess-b on hub");
+    assert_eq!(row_b.producer_id, "laptop-b");
+    assert_eq!(row_b.cwd.as_deref(), Some("$HOME/work/secret-repo"));
+
+    let (hydrated_a_raw, _) = client
+        .get(&format!("/api/hub/session/{}/cli-sess-a", row_a.producer_id))
+        .unwrap();
+    assert_eq!(hydrated_a_raw.status, 200);
+    let hydrated_a_str = String::from_utf8_lossy(&hydrated_a_raw.body);
+    assert!(
+        !hydrated_a_str.contains(secret_key),
+        "raw API key leaked to hub: {hydrated_a_str}"
+    );
+    assert!(
+        hydrated_a_str.contains("[REDACTED:"),
+        "expected redaction marker in hydrated session: {hydrated_a_str}"
+    );
+}

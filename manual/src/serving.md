@@ -38,6 +38,8 @@ stderr and the session reread.
 
 ```sh
 cv archive sync
+cv archive sync --to http://100.64.0.10:7777 --token s3cret
+cv archive sync --to team-hub                  # uses [replication.team-hub] in config.toml
 ```
 
 ```text
@@ -46,7 +48,9 @@ archive: /Users/you/.clustervision
 ```
 
 Reruns are cheap (`skipped` = unchanged). Per-session failures go to stderr without aborting.
-Run it from cron or launchd for backups without a resident process.
+Run it from cron or launchd for backups without a resident process. With `--to <target>`, newly
+committed packs and events are scrubbed through `[replication.<target>]` (falling back to
+`[privacy]`) and replicated to a `cv serve --hub` receiver.
 
 ## `cv watch` — follow live + archive as it happens
 
@@ -55,6 +59,7 @@ cv watch                           # follow everything
 cv watch --interval 5              # poll every 5s (default 3)
 cv watch --harness claude          # only one harness
 cv watch --cwd clustervision       # only sessions whose cwd contains this substring
+cv watch --to team-hub             # archive locally and stream scrubbed packs to a fleet hub
 ```
 
 `cv watch` archives everything on its first poll (no `sync` needed), then each session as it
