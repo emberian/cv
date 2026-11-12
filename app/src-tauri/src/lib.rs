@@ -140,6 +140,10 @@ fn api_search(params: &cv_core::api::Query) -> (u16, Value) {
             .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
     };
     let scan = flag("scan");
+    let exact = flag("exact");
+    if scan && exact {
+        return bad(400, "scan=1 and exact=1 conflict; exact=1 uses the trigram index");
+    }
     let scope = match params.get("kind") {
         None => cv_search::Scope::Exchange,
         Some(kind) => match cv_search::Scope::parse(&kind) {
@@ -165,11 +169,17 @@ fn api_search(params: &cv_core::api::Query) -> (u16, Value) {
         Err(error) => return bad(400, &error),
     };
     let searcher = cv_search::Searcher;
-    let found = match searcher.search(&q, filter, limit, source, live_bytes) {
+    let result = if exact {
+        searcher.search_exact(&q, filter, false, limit, live_bytes)
+    } else {
+        searcher.search(&q, filter, limit, source, live_bytes)
+    };
+    let found = match result {
         Ok(found) => found,
         Err(e) if scan => return bad(500, &format!("live scan failed: {e:#}")),
         Err(e) if cv_search::is_invalid_text_query(&e) => return bad(400, &format!("invalid search query: {e:#}")),
         Err(e) if e.is::<cv_search::BadLiveBytes>() => return bad(500, &format!("{e:#}")),
+        Err(e) if exact => return bad(503, &format!("{e:#}")),
         Err(e) => {
             return bad(
                 503,

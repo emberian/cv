@@ -1,6 +1,11 @@
 # Changelog
 
 ## Unreleased
+- `cv archive sync --to` and `cv watch --to` replicate scrubbed session packs and events to a `cv serve --hub` receiver.
+- `GET /api/search?exact=1` exposes trigram literal-substring search across `cv serve` and the desktop app; `--frozen` refuses cold `search --exact` directory creation.
+- `cv serve` adds per-response `script-src` CSP nonces on `/inbox`, `script-src 'self'` CSP on dashboard pages, and LAN `Host` rebinding protection.
+- Claude, Codex, Gemini, and Antigravity discovery use macOS `getattrlistbulk` directory walks; browser zip upload decodes `.zst` transcripts and multi-file harnesses.
+- Fleet hub ingest folds frontiers incrementally in `O(delta)` with full rebuild parity, caps unpinned snapshots at 256, and sweeps orphan pack tempfiles.
 - Search snippets exclude every term in negated groups from browser highlighting.
 - Oversized columnar target dictionaries fail explicitly instead of wrapping stored byte offsets.
 - JSONL visitors release device admission before callbacks, avoiding cross-device payload-read deadlocks and serialization of consumer work.

@@ -2343,11 +2343,27 @@ fn serve_pages_refuse_framing() {
             "{page}: {raw}"
         );
         assert_eq!(header_of(&raw, "X-Frame-Options").as_deref(), Some("DENY"), "{page}");
-        assert_eq!(
-            header_of(&raw, "Content-Security-Policy").as_deref(),
-            Some("frame-ancestors 'none'"),
-            "{page}"
-        );
+        let csp = header_of(&raw, "Content-Security-Policy").unwrap_or_default();
+        assert!(csp.contains("frame-ancestors 'none'"), "{page}: {csp}");
+        assert!(csp.contains("script-src 'self'"), "{page}: {csp}");
+        assert!(csp.contains("object-src 'none'"), "{page}: {csp}");
+        if page == "/inbox" {
+            let nonce = csp
+                .split("'nonce-")
+                .nth(1)
+                .and_then(|s| s.split('\'').next())
+                .expect("inbox CSP must carry per-response script nonce");
+            assert_eq!(nonce.len(), 32);
+            assert!(
+                raw.contains(&format!("<script nonce=\"{nonce}\">")),
+                "HTML script tag must carry matching nonce: {nonce}"
+            );
+            let raw2 = raw_request(port, "GET", "/inbox", &[]);
+            let csp2 = header_of(&raw2, "Content-Security-Policy").unwrap_or_default();
+            assert_ne!(csp, csp2, "/inbox CSP nonce must rotate per response");
+        } else {
+            assert!(csp.contains("'wasm-unsafe-eval'"), "{page}: {csp}");
+        }
         assert_eq!(
             header_of(&raw, "X-Content-Type-Options").as_deref(),
             Some("nosniff"),
@@ -2366,6 +2382,102 @@ fn serve_pages_refuse_framing() {
             header_of(&raw, "X-Frame-Options").as_deref(),
             Some("DENY"),
             "{page}: {raw}"
+        );
+        let csp = header_of(&raw, "Content-Security-Policy").unwrap_or_default();
+        assert!(csp.contains("'nonce-"), "{page}: {csp}");
+    }
+}
+
+#[test]
+fn serve_api_search_exact_and_non_loopback_host_rebinding_guard() {
+    let w = world("serve-exact-and-lan-rebind");
+    w.write_session(
+        "exact-sess",
+        &[
+            json!({"type":"user","uuid":"u1","sessionId":"exact-sess","timestamp":"2026-06-10T10:00:00Z",
+                   "cwd":"/work/exact","message":{"role":"user","content":"call foo::bar_baz(42) right here"}}),
+            json!({"type":"assistant","uuid":"a1","sessionId":"exact-sess","timestamp":"2026-06-10T10:00:05Z",
+                   "cwd":"/work/exact","message":{"role":"assistant","content":"confirmed foo::bar_baz(42) fixed"}}),
+        ],
+    );
+
+    let idx = w.cv_command().args(["index", "--exact"]).output().unwrap();
+    assert!(idx.status.success(), "cv index --exact failed: {:?}", idx);
+
+    let (port, _server) = spawn_serve_cfg(&w, &["--host", "0.0.0.0", "--token", "lan-tok"], &[]);
+
+    // 1. `GET /api/search?exact=1` matches mid-identifier literal substrings (`oo::bar_ba(4`) that
+    //    word-tokenized full-text `/api/search` does not match.
+    let fts_miss = raw_request(
+        port,
+        "GET",
+        "/api/search?q=oo%3A%3Abar_baz(42)",
+        &[("Authorization", "Bearer lan-tok")],
+    );
+    assert_eq!(raw_status(&fts_miss), 200, "{fts_miss}");
+    let fts_rows: Vec<Value> = serde_json::from_str(fts_miss.split("\r\n\r\n").nth(1).unwrap_or("[]")).unwrap();
+    assert!(
+        fts_rows.is_empty(),
+        "word-tokenized FTS should not match mid-token substring: {fts_rows:?}"
+    );
+
+    let ok_exact = raw_request(
+        port,
+        "GET",
+        "/api/search?exact=1&q=oo%3A%3Abar_baz(42)",
+        &[("Authorization", "Bearer lan-tok")],
+    );
+    assert_eq!(raw_status(&ok_exact), 200, "{ok_exact}");
+    assert_eq!(
+        header_of(&ok_exact, "X-Cv-Search-Source").as_deref(),
+        Some("index"),
+        "{ok_exact}"
+    );
+    let body_str = ok_exact.split("\r\n\r\n").nth(1).unwrap_or("");
+    let rows: Vec<Value> = serde_json::from_str(body_str).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], "exact-sess");
+
+    // `scan=1&exact=1` conflicts (400), matching CLI `--scan` + `--exact`.
+    let conflict = raw_request(
+        port,
+        "GET",
+        "/api/search?scan=1&exact=1&q=foo",
+        &[("Authorization", "Bearer lan-tok")],
+    );
+    assert_eq!(raw_status(&conflict), 400, "{conflict}");
+
+    // 2. Non-loopback bind (`0.0.0.0`) allows LAN IP literals and `.local` / `.ts.net` names,
+    //    while rejecting arbitrary attacker domains (`Host: rebind.attacker.example` -> 403)!
+    for good_host in [
+        format!("192.168.1.77:{port}"),
+        format!("macbook.local:{port}"),
+        format!("devbox.tailnet.ts.net:{port}"),
+    ] {
+        let resp = raw_request(
+            port,
+            "GET",
+            "/api/health",
+            &[("Host", &good_host), ("Authorization", "Bearer lan-tok")],
+        );
+        assert_eq!(
+            raw_status(&resp),
+            200,
+            "legitimate LAN host {good_host} rejected:\n{resp}"
+        );
+    }
+
+    for bad_host in ["rebind.attacker.example", &format!("evil.com:{port}")] {
+        let resp = raw_request(
+            port,
+            "GET",
+            "/api/health",
+            &[("Host", bad_host), ("Authorization", "Bearer lan-tok")],
+        );
+        assert_eq!(
+            raw_status(&resp),
+            403,
+            "DNS-rebind host {bad_host} must be rejected:\n{resp}"
         );
     }
 }

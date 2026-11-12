@@ -247,11 +247,7 @@ fn handle(request: &mut Request<'_>, ctx: &Ctx) {
         let page = matches!(parts.as_slice(), ["inbox"] | ["inbox.html"])
             || (ctx.web_root.is_none() && matches!(parts.as_slice(), [] | ["index.html"]));
         if page {
-            request.respond(text_response(
-                200,
-                "text/html; charset=utf-8",
-                serve_tasks::PAGE.as_bytes().to_vec(),
-            ));
+            request.respond(inbox_response());
             return;
         }
         if let Some(root) = &ctx.web_root {
@@ -541,15 +537,42 @@ pub(crate) fn is_loopback_host(host: &str) -> bool {
             .unwrap_or(false)
 }
 
-/// Whether the `Host` header names this machine. An explicitly non-loopback bind is an opt-in to
-/// remote clients whose Host we can't predict, so the check only bites on loopback binds.
+/// Whether the `Host` header names this machine.
+///
+/// On loopback binds, only loopback names (`127.0.0.1`, `::1`, `localhost`, or `bind_host`) pass.
+/// On non-loopback binds (`0.0.0.0`, `::`, LAN IP), literal IP addresses (immune to DNS rebinding),
+/// local mDNS (`.local`) / Tailscale (`.ts.net`) names, the explicit `bind_host`, and this
+/// machine's OS hostname pass, while arbitrary external domains (`evil.example.com`) are rejected
+/// `403` to prevent LAN DNS-rebinding attacks.
 fn host_allowed(host_header: Option<&str>, bind_host: &str) -> bool {
-    if !is_loopback_host(bind_host) {
+    let Some(name) = host_header.and_then(host_name) else {
+        return false;
+    };
+    if is_local_name(name, bind_host) {
         return true;
     }
-    host_header
-        .and_then(host_name)
-        .is_some_and(|name| is_local_name(name, bind_host))
+    if is_loopback_host(bind_host) {
+        return false;
+    }
+    if name.parse::<std::net::IpAddr>().is_ok() {
+        return true;
+    }
+    let lower = name.to_ascii_lowercase();
+    if lower.ends_with(".local") || lower.ends_with(".ts.net") {
+        return true;
+    }
+    let os_host = cv_core::state::default_host_label();
+    if !os_host.is_empty() && !os_host.eq_ignore_ascii_case("localhost") {
+        if name.eq_ignore_ascii_case(&os_host) {
+            return true;
+        }
+        if let Some(short) = os_host.split('.').next().filter(|s| !s.is_empty()) {
+            if name.eq_ignore_ascii_case(short) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// The specific `Origin` to echo in `Access-Control-Allow-Origin`, if it's on the allow-list:
@@ -698,6 +721,10 @@ fn search(params: &Query, searcher: &cv_search::Searcher) -> Reply {
             .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
     };
     let scan = flag("scan");
+    let exact = flag("exact");
+    if scan && exact {
+        return bad(400, "scan=1 and exact=1 conflict; exact=1 uses the trigram index");
+    }
     let scope = match params.get("kind") {
         None => cv_search::Scope::Exchange,
         Some(kind) => match cv_search::Scope::parse(&kind) {
@@ -720,13 +747,19 @@ fn search(params: &Query, searcher: &cv_search::Searcher) -> Reply {
         Ok(bytes) => bytes.map(|b| b as u64),
         Err(error) => return bad(400, &error),
     };
-    let found = match searcher.search(&q, filter, limit, source, live_bytes) {
+    let result = if exact {
+        searcher.search_exact(&q, filter, false, limit, live_bytes)
+    } else {
+        searcher.search(&q, filter, limit, source, live_bytes)
+    };
+    let found = match result {
         Ok(found) => found,
         Err(e) if scan => return bad(500, &format!("live scan failed: {e:#}")),
         Err(e) if cv_search::is_invalid_text_query(&e) => return bad(400, &format!("invalid search query: {e:#}")),
         Err(e) if e.is::<cv_search::BadLiveBytes>() => return bad(500, &format!("{e:#}")),
         // The index is authoritative: a missing or unusable index is an error naming the cause and
         // the fix, never a silent scan of every transcript.
+        Err(e) if exact => return bad(503, &format!("{e:#}")),
         Err(e) => {
             return bad(
                 503,
@@ -872,13 +905,28 @@ fn content_type_for(path: &Path) -> &'static str {
 /// every Origin check, so a hostile site that could load it in an invisible frame could have the
 /// person click an agent's decision through (clickjacking). `X-Frame-Options` covers browsers
 /// that predate `frame-ancestors`. `nosniff` keeps a served file from being run as another type.
+fn inbox_response() -> Response<'static> {
+    let nonce = uuid::Uuid::new_v4().simple().to_string();
+    let html = serve_tasks::PAGE.replacen("\n<script>\n", &format!("\n<script nonce=\"{nonce}\">\n"), 1);
+    let csp = format!("frame-ancestors 'none'; script-src 'self' 'nonce-{nonce}'; object-src 'none'; base-uri 'self'");
+    let mut resp = Response::bytes(200, html.into_bytes());
+    resp.add_header("Content-Type", "text/html; charset=utf-8");
+    resp.add_header("X-Content-Type-Options", "nosniff");
+    resp.add_header("X-Frame-Options", "DENY");
+    resp.add_header("Content-Security-Policy", &csp);
+    resp
+}
+
 fn text_response(status: u16, content_type: &str, body: Vec<u8>) -> Response<'static> {
     let mut resp = Response::bytes(status, body);
     resp.add_header("Content-Type", content_type);
     resp.add_header("X-Content-Type-Options", "nosniff");
     if content_type.starts_with("text/html") {
         resp.add_header("X-Frame-Options", "DENY");
-        resp.add_header("Content-Security-Policy", "frame-ancestors 'none'");
+        resp.add_header(
+            "Content-Security-Policy",
+            "frame-ancestors 'none'; script-src 'self' 'wasm-unsafe-eval'; object-src 'none'; base-uri 'self'",
+        );
     }
     resp
 }
