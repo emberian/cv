@@ -605,7 +605,25 @@ pub fn redact_message(
                     scrub_value(d, opts, stats);
                 }
             }
-            Block::Image { .. } | Block::File { .. } => {}
+            // A reference is a path or URL (a signed URL carries its credential in the query);
+            // inline `data:` bytes are payload, not text, and stay intact.
+            Block::Image { data_ref, .. } => {
+                if let Some(r) = data_ref.as_mut().filter(|r| !is_inline_data_uri(r)) {
+                    if let Cow::Owned(scrubbed) = scrub_cow(r, opts, stats) {
+                        *r = scrubbed;
+                    }
+                }
+            }
+            Block::File { path, source, .. } => {
+                for r in [path, source].into_iter().flatten() {
+                    if is_inline_data_uri(r) {
+                        continue;
+                    }
+                    if let Cow::Owned(scrubbed) = scrub_cow(r, opts, stats) {
+                        *r = scrubbed;
+                    }
+                }
+            }
         }
     }
     if record_dirty {
@@ -774,7 +792,25 @@ impl CompiledProfile {
                         self.scrub_value(d, repo_root, stats);
                     }
                 }
-                Block::Image { .. } | Block::File { .. } => {}
+                // File and image references are paths and URLs: exactly what `$HOME`/`$REPO`
+                // rewriting and host/IP scrubbing exist for. Inline `data:` bytes stay intact.
+                Block::Image { data_ref, .. } => {
+                    if let Some(r) = data_ref.as_mut().filter(|r| !is_inline_data_uri(r)) {
+                        if let Cow::Owned(scrubbed) = self.scrub_text_cow(r, repo_root, stats) {
+                            *r = scrubbed;
+                        }
+                    }
+                }
+                Block::File { path, source, .. } => {
+                    for r in [path, source].into_iter().flatten() {
+                        if is_inline_data_uri(r) {
+                            continue;
+                        }
+                        if let Cow::Owned(scrubbed) = self.scrub_text_cow(r, repo_root, stats) {
+                            *r = scrubbed;
+                        }
+                    }
+                }
             }
         }
         if record_dirty {
@@ -906,7 +942,7 @@ impl CompiledProfile {
                 let replaced = re
                     .replace_all(&current, |caps: &Captures| {
                         count += 1;
-                        format!("{}$HOME{}", &caps[1], &caps[3])
+                        format!("{}$HOME", &caps[1])
                     })
                     .into_owned();
                 if count > 0 {
@@ -1054,10 +1090,23 @@ fn hash_principal_value(v: &mut Value, salt: Option<&str>) {
     }
 }
 
+/// `data:` URIs carry inline payload bytes (often megabytes of base64), not a path or URL.
+fn is_inline_data_uri(reference: &str) -> bool {
+    reference
+        .get(..5)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("data:"))
+}
+
+/// A user home (`/Users/<u>`, `/home/<u>`, `C:\Users\<u>`) that *starts* a path: at the start of
+/// the text, after `file://`, or after any character that cannot continue a path or name. That
+/// keeps `example.com/home/page` and `/var/home/x` intact while catching a home behind any
+/// delimiter (backtick, `<`, `>`, `{`, `|`, CJK brackets, ...), not just an allow-list of them. The
+/// user name runs to the next separator or delimiter and nothing after it is consumed, so two
+/// homes separated by a single character are both rewritten.
 fn home_path_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r#"(^|[\s"'=:(,\[])(?:/Users/|/home/|[A-Za-z]:\\Users\\)([A-Za-z0-9._-]+)(/|\\|$|[\s"'):,\]])"#)
+        Regex::new(r#"(^|[^A-Za-z0-9._~/\\-]|file://)(?:/Users/|/home/|[A-Za-z]:\\Users\\)[^/\\\s"'`<>|:;,(){}\[\]]+"#)
             .expect("home path regex")
     })
 }
@@ -2566,6 +2615,67 @@ mod tests {
         let mut wrong_harness = s.clone();
         wrong_harness.harness = Harness::Codex;
         assert!(filter_and_scrub_session(&wrong_harness, &profile)?.is_none());
+        Ok(())
+    }
+    #[test]
+    fn privacy_profile_scrubs_file_and_image_blocks_and_home_paths_behind_any_delimiter() -> anyhow::Result<()> {
+        let profile = ScrubProfile {
+            private_ips: true,
+            hostnames: true,
+            rewrite_home: true,
+            ..ScrubProfile::default()
+        };
+        let mut s = Session::new("prof-blocks", Harness::Claude);
+        let mut m = Message::new(Role::User);
+        // Foreign users, so only the structural `/Users/<u>` / `/home/<u>` rule can catch them.
+        m.content.push(Block::Text {
+            text: "see `/Users/carol/notes.md`, <path>/home/bob/out.txt</path>, file:///Users/carol/a.png, \
+                   log>/home/bob/build.log and {/Users/carol/x} | /home/bob/y; ls /home/bob /Users/carol; keep https://example.com/home/page"
+                .into(),
+        });
+        m.content.push(Block::File {
+            mime: Some("text/markdown".into()),
+            path: Some("/Users/carol/work/secret-plan.md".into()),
+            source: Some("http://10.20.30.40/files/secret-plan.md".into()),
+        });
+        m.content.push(Block::Image {
+            media_type: Some("image/png".into()),
+            data_ref: Some("file:///home/bob/Desktop/screenshot.png".into()),
+        });
+        let inline = format!("data:image/png;base64,{}", "QUJD".repeat(64));
+        m.content.push(Block::Image {
+            media_type: Some("image/png".into()),
+            data_ref: Some(inline.clone()),
+        });
+        s.messages.push(m);
+
+        let (scrubbed, _stats) = scrub_session_with_profile(&s, &profile)?;
+        let wire = serde_json::to_string(&scrubbed)?;
+        for leak in ["carol", "bob", "10.20.30.40"] {
+            assert!(
+                !wire.contains(leak),
+                "{leak:?} leaked through the privacy profile: {wire}"
+            );
+        }
+        assert!(wire.contains("https://example.com/home/page"), "{wire}");
+        assert!(wire.contains(&inline), "inline image bytes must stay intact");
+
+        // The secrets-only redactor covers the same fields (a signed URL is a credential carrier).
+        let mut signed = Session::new("signed", Harness::Claude);
+        let mut m = Message::new(Role::User);
+        let key = fixture("sk-ant-", "api03-abcdefghijklmnopqrstuvwxyz0123456789ABCD");
+        m.content.push(Block::File {
+            mime: None,
+            path: Some("report.pdf".into()),
+            source: Some(format!("https://files.example.com/report.pdf?api_key={key}")),
+        });
+        m.content.push(Block::Image {
+            media_type: None,
+            data_ref: Some(format!("https://img.example.com/a.png?token={key}")),
+        });
+        signed.messages.push(m);
+        let wire = serde_json::to_string(&redact(&signed)?)?;
+        assert!(!wire.contains(&key), "{wire}");
         Ok(())
     }
 }
