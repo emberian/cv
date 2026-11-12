@@ -80,13 +80,6 @@ impl RecordIndex {
         Self::default()
     }
 
-    pub(crate) fn rebuild_lookup(&mut self) {
-        self.by_anchor.clear();
-        for (idx, rec) in self.records.iter().enumerate() {
-            self.by_anchor.insert(rec.anchor.clone(), idx);
-        }
-    }
-
     pub fn insert(&mut self, span: RecordSpan) -> Result<()> {
         anyhow::ensure!(
             !self.by_anchor.contains_key(&span.anchor),
@@ -262,7 +255,18 @@ impl PackManifest {
             manifest.version,
             PACK_INDEX_VERSION
         );
-        manifest.record_index.rebuild_lookup();
+        // Deserialization bypasses RecordIndex::insert; reapply its ordering, uniqueness,
+        // and bounds invariants before any consumer trusts offsets or verifies records.
+        let mut checked = RecordIndex::new();
+        for span in std::mem::take(&mut manifest.record_index.records) {
+            let end = span
+                .decoded_offset
+                .checked_add(span.length)
+                .context("record end overflow")?;
+            anyhow::ensure!(end <= manifest.total_decoded_len, "record extends beyond pack");
+            checked.insert(span)?;
+        }
+        manifest.record_index = checked;
         manifest.codec_checkpoints.rebuild_lookup();
         Ok(manifest)
     }
@@ -793,5 +797,34 @@ mod tests {
         let entries: Vec<_> = std::fs::read_dir(&dir)?.collect();
         assert!(entries.is_empty(), "aborted PackBuilder left files: {entries:?}");
         Ok(())
+    }
+    #[test]
+    fn manifest_rejects_overlapping_and_duplicate_record_spans() {
+        let mut manifest = PackManifest {
+            version: PACK_INDEX_VERSION,
+            pack_id: "test".into(),
+            total_decoded_len: 4,
+            frame_count: 1,
+            record_index: RecordIndex::new(),
+            codec_checkpoints: CodecCheckpointIndex::default(),
+        };
+        manifest.record_index.records = vec![
+            RecordSpan {
+                anchor: "a".into(),
+                decoded_offset: 0,
+                length: 3,
+                blake3_digest: [0; 32],
+            },
+            RecordSpan {
+                anchor: "b".into(),
+                decoded_offset: 2,
+                length: 2,
+                blake3_digest: [0; 32],
+            },
+        ];
+        assert!(PackManifest::from_json_slice(&serde_json::to_vec(&manifest).unwrap()).is_err());
+        manifest.record_index.records[0].length = 2;
+        manifest.record_index.records[1].anchor = "a".into();
+        assert!(PackManifest::from_json_slice(&serde_json::to_vec(&manifest).unwrap()).is_err());
     }
 }

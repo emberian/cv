@@ -550,6 +550,11 @@ pub fn seal_local_inbox_to_pack(
         });
     }
 
+    // Envelopes are retained evidence, not SQLite index metadata. One addressed record
+    // preserves all commit entries; SQLite holds only its small verified locator.
+    let commits_addr = builder
+        .append_record("inbox-commits", &serde_json::to_vec(&entries)?)
+        .map_err(|e| HubError::Pack(format!("{e:#}")))?;
     let _sealed_manifest = builder.seal(Claim::New).map_err(|e| HubError::Pack(format!("{e:#}")))?;
     let zst_path = pack_zst_path(local_packs_dir, &pack_id).map_err(|e| HubError::Pack(format!("{e:#}")))?;
     let zst_bytes = std::fs::read(&zst_path)?;
@@ -563,7 +568,7 @@ pub fn seal_local_inbox_to_pack(
         byte_len: zst_bytes.len() as u64,
         digest: pack_digest,
         pack_path: zst_path.to_string_lossy().into_owned(),
-        index_meta: json!({ "commits": entries }),
+        index_meta: json!({ "commits_addr": commits_addr }),
         published_at: Utc::now().timestamp_millis(),
     };
     store.publish_pack_range(&state_manifest)?;
@@ -959,6 +964,15 @@ impl Shipper {
 fn collect_local_commits(store: &StateStore) -> Result<Vec<SealedCommitEntry>, HubError> {
     let mut out = Vec::new();
     for pm in store.list_pack_manifests()? {
+        if let Some(value) = pm.index_meta.get("commits_addr") {
+            let addr: PayloadAddr = serde_json::from_value(value.clone())?;
+            let dir = Path::new(&pm.pack_path)
+                .parent()
+                .ok_or_else(|| HubError::Pack("pack path has no parent".into()))?;
+            let pack = SealedPack::open(dir, &addr.pack_id).map_err(|e| HubError::Pack(format!("{e:#}")))?;
+            let bytes = pack.read_payload(&addr).map_err(|e| HubError::Pack(format!("{e:#}")))?;
+            out.extend(serde_json::from_slice::<Vec<SealedCommitEntry>>(&bytes)?);
+        }
         if let Some(arr) = pm.index_meta.get("commits").and_then(Value::as_array) {
             for val in arr {
                 let entry: SealedCommitEntry = serde_json::from_value(val.clone())?;
@@ -1140,6 +1154,7 @@ fn scrub_json_value_in_place(
             }
         }
         Value::Object(map) => {
+            crate::redact::scrub_object_keys(map, |key| compiled.scrub_text_cow(key, repo_root, stats).into_owned());
             match &profile.principal {
                 PrincipalPolicy::Drop => {
                     if map.remove("principal").is_some() {
@@ -1265,4 +1280,27 @@ fn build_scrubbed_envelope(
     }
 
     out
+}
+
+#[cfg(test)]
+mod astra_tests {
+    use super::*;
+    #[test]
+    fn sealed_inbox_keeps_envelopes_in_pack_and_reads_them_back() {
+        let world = cv_testkit::World::new("inbox-pack-envelope");
+        let store = StateStore::at_dir(&world.cv_home);
+        let body = "retained evidence ".repeat(10000);
+        store.append("op", "digest", &json!({"body": body})).unwrap();
+        let before = collect_local_commits(&store).unwrap();
+        let manifest = seal_local_inbox_to_pack(&store, &world.cv_home.join("packs"), None)
+            .unwrap()
+            .unwrap();
+        assert!(serde_json::to_vec(&manifest.index_meta).unwrap().len() < 1024);
+        assert_eq!(store.inbox_count().unwrap(), 0);
+        let after = collect_local_commits(&store).unwrap();
+        assert_eq!(
+            serde_json::to_value(before).unwrap(),
+            serde_json::to_value(after).unwrap()
+        );
+    }
 }

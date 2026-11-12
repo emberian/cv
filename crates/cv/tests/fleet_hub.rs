@@ -1172,15 +1172,14 @@ fn fleet_hub_rebuild_from_raw_matches_incremental_bit_for_bit() {
             .unwrap();
         assert_eq!(h_raw.status, 200);
         let mut val: Value = h_raw.json().unwrap();
-        // Normalize `hub_generation` (rebuild starts fresh generation 1, while `publication_id` and
-        // every content/frontier/session field MUST match bit-for-bit!).
+        // Compare the hydrated payload independently of its publication metadata.
         if let Some(obj) = val.as_object_mut() {
             obj.remove("hub_generation");
         }
         hydrated_before.insert(key, val);
     }
 
-    // Wipe derived views (`hub_snapshots`, `hub_sessions`, `hub_frontiers`) AND clear `hub_packs`
+    // Wipe mutable projections (`hub_sessions`, `hub_frontiers`) AND clear `hub_packs`
     // rows to force full reconciliation from raw `hub_ingested_events` + `hub_quarantine` + `hub/packs/`!
     let hub_store = HubStore::at_home(&hub_w.cv_home);
     hub_store.wipe_derived_views().unwrap();
@@ -1191,7 +1190,18 @@ fn fleet_hub_rebuild_from_raw_matches_incremental_bit_for_bit() {
 
     let (wiped_sessions_raw, _) = client.get("/api/hub/sessions").unwrap();
     let wiped_sessions: HubSessionsPage = wiped_sessions_raw.json().unwrap();
-    assert_eq!(wiped_sessions.total, 0, "derived sessions must be empty after wipe");
+    assert_eq!(
+        wiped_sessions.total,
+        snap_before.session_revisions.len(),
+        "published snapshots remain readable during a projection rebuild"
+    );
+    let conn = hub_store.state_store().open_readonly().unwrap().unwrap();
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM hub_sessions", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    drop(conn);
 
     // Rebuild strictly from raw `hub_ingested_events` + `hub_quarantine` + `hub/packs/`!
     let rebuilt_snap = hub_store
@@ -1550,4 +1560,85 @@ fn fleet_hub_rejects_unverified_event_digests_and_frozen_pack_uploads() {
         !packs_dir.exists() && !frozen_w.cv_home.join("hub").exists(),
         "--frozen pack upload must not create hub/packs"
     );
+}
+
+#[test]
+fn rebuild_preserves_snapshot_pins_and_generation_high_water_mark() {
+    let world = World::new("hub-rebuild-pins");
+    let hub = HubStore::at_home(&world.cv_home);
+    let session = make_session("pin", "/work/pin", "first", "u", "a", 1);
+    hub.ingest_batch(&IngestBatchRequest {
+        events: vec![make_event("p", "e", 1, &session, None)],
+    })
+    .unwrap();
+    let first = hub.get_snapshot(None).unwrap().unwrap();
+    let changed = make_session("pin", "/work/pin", "second", "u", "a", 2);
+    hub.ingest_batch(&IngestBatchRequest {
+        events: vec![make_event("p", "e", 2, &changed, None)],
+    })
+    .unwrap();
+    let before = hub.get_snapshot(None).unwrap().unwrap();
+    assert!(before.hub_generation > first.hub_generation);
+    hub.wipe_derived_views().unwrap();
+    let rebuilt = hub.rebuild_from_raw().unwrap().unwrap();
+    assert_eq!(rebuilt.hub_generation, before.hub_generation);
+    assert_eq!(rebuilt.publication_id, before.publication_id);
+    assert_eq!(
+        hub.get_snapshot(Some(&first.publication_id))
+            .unwrap()
+            .unwrap()
+            .hub_generation,
+        first.hub_generation
+    );
+}
+
+#[test]
+fn hydration_verifies_selected_record_without_reading_unrelated_frames() {
+    use std::io::{Seek, SeekFrom, Write};
+    let world = World::new("hub-range-hydrate");
+    let hub = HubStore::at_home(&world.cv_home);
+    let dir = world.cv_home.join("source");
+    let session = make_session("range", "/work/range", "Range", "u", "a", 1);
+    let mut builder = PackBuilder::with_frame_size(&dir, "range", 128, 1).unwrap();
+    let addr = builder
+        .append_record("session", &serde_json::to_vec(&session).unwrap())
+        .unwrap();
+    builder.append_record("unrelated", &vec![b'x'; 8192]).unwrap();
+    builder.seal(Claim::New).unwrap();
+    let idx = fs::read(cv_core::packs::pack_idx_path(&dir, "range").unwrap()).unwrap();
+    let zst = fs::read(cv_core::packs::pack_zst_path(&dir, "range").unwrap()).unwrap();
+    hub.upload_pack_bytes("range", Some("p"), None, &idx, &zst).unwrap();
+    hub.ingest_batch(&IngestBatchRequest {
+        events: vec![make_event("p", "e", 1, &session, Some(addr))],
+    })
+    .unwrap();
+    let mirrored = world.cv_home.join("hub/packs");
+    let pack = cv_core::packs::SealedPack::open(&mirrored, "range").unwrap();
+    let last = *pack.frame_index().frames().last().unwrap();
+    drop(pack);
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .open(cv_core::packs::pack_zst_path(&mirrored, "range").unwrap())
+        .unwrap();
+    file.seek(SeekFrom::Start(last.compressed_offset)).unwrap();
+    file.write_all(b"bad!").unwrap();
+    assert!(hub.hydrate_session("p", "range", None).is_ok());
+}
+
+#[test]
+fn pack_replay_commits_to_index_bytes_as_well_as_payload_bytes() {
+    let world = World::new("hub-index-replay");
+    let hub = HubStore::at_home(&world.cv_home);
+    let stage = world.cv_home.join("source");
+    let session = make_session("index", "/work/index", "Index", "u", "a", 1);
+    build_pack_with_sessions(&stage, "index", &[session]);
+    let idx = fs::read(cv_core::packs::pack_idx_path(&stage, "index").unwrap()).unwrap();
+    let zst = fs::read(cv_core::packs::pack_zst_path(&stage, "index").unwrap()).unwrap();
+    hub.upload_pack_bytes("index", Some("p"), None, &idx, &zst).unwrap();
+    let mut changed: Value = serde_json::from_slice(&idx).unwrap();
+    changed["record_index"]["records"][0]["anchor"] = json!("different");
+    let err = hub
+        .upload_pack_bytes("index", Some("p"), None, &serde_json::to_vec(&changed).unwrap(), &zst)
+        .unwrap_err();
+    assert!(matches!(err, cv_core::state::hub::HubError::PackConflict { .. }));
 }

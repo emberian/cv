@@ -24,6 +24,43 @@ pub const MAX_PACK_RECORDS: usize = 100_000;
 /// Defensive per-record uncompressed byte cap (256 MiB) before `SeekableReader::read_range`.
 pub const MAX_PACK_RECORD_BYTES: u64 = 256 * 1024 * 1024;
 
+/// Records are ordered and disjoint after PackManifest validation. Keep one decoded frame
+/// across records so both memory and decompression work are bounded by the pack, not N records.
+fn verify_record_digests<S: crate::harness::store::zst::PositionedRead>(
+    reader: &SeekableReader<S>,
+    manifest: &PackManifest,
+) -> Result<(), HubError> {
+    let mut cached_frame = None;
+    let mut decoded = Vec::new();
+    for span in manifest.record_index.records() {
+        let mut hasher = blake3::Hasher::new();
+        let mut offset = span.decoded_offset;
+        let end = offset + span.length; // checked by PackManifest::from_json_slice
+        while offset < end {
+            let idx = reader
+                .index()
+                .frame_for_offset(offset)
+                .ok_or_else(|| HubError::Pack("record offset has no frame".into()))?;
+            if cached_frame != Some(idx) {
+                decoded = reader.decode_frame(idx)?;
+                cached_frame = Some(idx);
+            }
+            let frame = &reader.index().frames()[idx];
+            let start = (offset - frame.decoded_offset) as usize;
+            let take = (end - offset).min((decoded.len() - start) as u64) as usize;
+            hasher.update(&decoded[start..start + take]);
+            offset += take as u64;
+        }
+        if *hasher.finalize().as_bytes() != span.blake3_digest {
+            return Err(HubError::Pack(format!(
+                "BLAKE3 mismatch on record {:?} inside pack {:?}",
+                span.anchor, manifest.pack_id
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn empty_json_object() -> Value {
     Value::Object(serde_json::Map::new())
 }
@@ -216,6 +253,8 @@ impl HubStore {
             }
         }
 
+        let idx_blake3_digest = blake3::hash(idx_bytes).to_hex().to_string();
+        // Both files are immutable commitments: replay cannot silently change the record index.
         // Check existing durable `hub_packs` entry before touching published paths.
         {
             let conn = self.store.open_writable()?;
@@ -247,6 +286,13 @@ impl HubStore {
                         pack_id: pack_id.to_string(),
                         existing_digest: record.blake3_digest,
                         incoming_digest: actual_zst_digest,
+                    });
+                }
+                if record.idx_blake3_digest != idx_blake3_digest {
+                    return Err(HubError::PackConflict {
+                        pack_id: pack_id.to_string(),
+                        existing_digest: record.idx_blake3_digest,
+                        incoming_digest: idx_blake3_digest,
                     });
                 }
                 if zst_dest.is_file() && idx_dest.is_file() {
@@ -327,23 +373,8 @@ impl HubStore {
                 manifest.frame_count
             )));
         }
-        for span in manifest.record_index.records() {
-            let decoded = reader.read_range(span.decoded_offset, span.length).map_err(|e| {
-                HubError::Pack(format!(
-                    "failed decoding span {:?} in pack `{pack_id}`: {e:#}",
-                    span.anchor
-                ))
-            })?;
-            let actual_rec_digest = *blake3::hash(&decoded).as_bytes();
-            if actual_rec_digest != span.blake3_digest {
-                return Err(HubError::Pack(format!(
-                    "BLAKE3 mismatch on record {:?} inside pack `{pack_id}`",
-                    span.anchor
-                )));
-            }
-        }
+        verify_record_digests(&reader, &manifest)?;
 
-        let idx_blake3_digest = blake3::hash(idx_bytes).to_hex().to_string();
         let manifest_json_str = String::from_utf8(idx_bytes.to_vec())
             .map_err(|e| HubError::Pack(format!("pack manifest is not UTF-8: {e}")))?;
 
@@ -864,4 +895,22 @@ fn current_origin_frontier_in_tx(tx: &rusqlite::Transaction<'_>) -> Result<BTree
         out.insert((p, e), seq);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod astra_tests {
+    use super::*;
+    #[test]
+    fn adjacent_records_decode_each_frame_only_once() {
+        let world = cv_testkit::World::new("hub-frame-verification");
+        let mut builder = crate::packs::PackBuilder::with_frame_size(&world.cv_home, "tiny", 64, 1).unwrap();
+        for i in 0..1000 {
+            builder.append_record(format!("r{i}"), b"x").unwrap();
+        }
+        let manifest = builder.seal(Claim::New).unwrap();
+        let file = std::fs::File::open(pack_zst_path(&world.cv_home, "tiny").unwrap()).unwrap();
+        let reader = SeekableReader::open(file).unwrap();
+        verify_record_digests(&reader, &manifest).unwrap();
+        assert_eq!(reader.frames_decoded(), reader.index().len() as u64);
+    }
 }

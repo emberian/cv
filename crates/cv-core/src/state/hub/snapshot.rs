@@ -1351,25 +1351,9 @@ impl HubStore {
             return Ok((manifest, unavailable));
         };
 
-        // Verify the pack whole-file digest matches what `SnapshotPublicationManifest` pinned.
-        if let Some(expected_pack_digest) = manifest.pack_digests.get(&addr.pack_id) {
-            let zst_path =
-                pack_zst_path(&self.packs_dir, &addr.pack_id).map_err(|e| HubError::Pack(format!("{e:#}")))?;
-            let zst_bytes = std::fs::read(&zst_path).map_err(|e| {
-                HubError::Pack(format!(
-                    "reading mirrored pack {} for hydration: {e}",
-                    zst_path.display()
-                ))
-            })?;
-            let actual_pack_digest = blake3::hash(&zst_bytes).to_hex().to_string();
-            if &actual_pack_digest != expected_pack_digest {
-                return Err(HubError::Pack(format!(
-                    "mirrored pack `{}` digest mismatch against snapshot `{}`: expected {expected_pack_digest}, got {actual_pack_digest}",
-                    addr.pack_id, manifest.publication_id
-                )));
-            }
-        }
-
+        // Whole-pack integrity was verified at custody acceptance. Hydration verifies the
+        // selected record against the digest pinned in this snapshot's PayloadAddr, decoding
+        // only intersecting frames rather than hashing the entire immutable pack on every read.
         let pack = SealedPack::open(&self.packs_dir, &addr.pack_id)
             .map_err(|e| HubError::Pack(format!("opening mirrored pack `{}`: {e:#}", addr.pack_id)))?;
         let payload_bytes = pack
@@ -1386,17 +1370,13 @@ impl HubStore {
         Ok((manifest, hydrated))
     }
 
-    /// Wipe all derived hub views (`hub_frontiers`, `hub_sessions`, `hub_snapshots`) while leaving
-    /// raw authoritative inputs (`hub_ingested_events`, `hub_quarantine`, `hub_packs`, `packs/`)
-    /// untouched — used by rebuild recovery and the `Rebuild Parity Invariant` gate.
+    /// Wipe mutable hub projections (`hub_frontiers`, `hub_sessions`) while preserving raw
+    /// inputs and published snapshot pins. Publications retain the durable generation high-water
+    /// mark; rebuilding a cache must never revoke a client's pinned snapshot.
     pub fn wipe_derived_views(&self) -> Result<(), HubError> {
         let mut conn = self.store.open_writable()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute_batch(
-            "DELETE FROM hub_snapshots;
-             DELETE FROM hub_sessions;
-             DELETE FROM hub_frontiers;",
-        )?;
+        tx.execute_batch("DELETE FROM hub_sessions; DELETE FROM hub_frontiers;")?;
         tx.commit()?;
         Ok(())
     }
@@ -1467,11 +1447,9 @@ impl HubStore {
             }
         }
 
-        tx.execute_batch(
-            "DELETE FROM hub_snapshots;
-             DELETE FROM hub_sessions;
-             DELETE FROM hub_frontiers;",
-        )?;
+        // Published manifests are client pins and the durable generation high-water mark.
+        // Rebuild the mutable projections while retaining those immutable publications.
+        tx.execute_batch("DELETE FROM hub_sessions; DELETE FROM hub_frontiers;")?;
 
         let origins: Vec<(String, String)> = {
             let mut stmt = tx.prepare(
