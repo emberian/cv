@@ -333,6 +333,7 @@ pub(crate) fn cmd_watch(archive: &Archive, interval: f64, harness: Option<String
     // before following live activity (`sync` is the dedicated one-shot, but watch is self-sufficient).
     let mut watcher = Watcher::new(filter, true);
     let interval = crate::util::poll_interval(interval)?;
+    let mut wake = cv_core::watch::wake::Wake::new(interval)?;
 
     eprintln!(
         "cv watch: watching (interval {}s) -> {}",
@@ -378,7 +379,8 @@ pub(crate) fn cmd_watch(archive: &Archive, interval: f64, harness: Option<String
         if let Some(error) = fatal {
             return Err(error);
         }
-        std::thread::sleep(interval);
+        watcher.watch_dirs(&mut wake);
+        wake.wait(Some(interval))?;
     }
 }
 

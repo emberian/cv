@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 mod read;
+pub mod wake;
 pub use read::{read as read_tail, read_session, read_session_into, Held, ReadPass, ReadState};
 
 /// What changed.
@@ -583,6 +584,19 @@ impl Watcher {
     /// How many sessions hold a position (the count a follower announces once primed).
     pub fn following(&self) -> usize {
         self.seen.len()
+    }
+
+    /// Arm `wake` for this watcher's harness roots and every followed session's parent chain.
+    pub fn watch_dirs(&self, wake: &mut wake::Wake) {
+        let roots = wake.watch_roots(self.filter.harness);
+        for state in self.seen.values() {
+            if let Some(read) = &state.read {
+                wake.watch_path(&roots, read.path());
+                if let Some(primary) = read.primary_path() {
+                    wake.watch_path(&roots, primary);
+                }
+            }
+        }
     }
 
     fn trigger_of(r: &SessionRef) -> (Option<usize>, Option<i64>) {

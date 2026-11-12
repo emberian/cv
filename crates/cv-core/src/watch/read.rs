@@ -52,6 +52,14 @@ pub struct Held {
 }
 
 impl ReadState {
+    pub(super) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(super) fn primary_path(&self) -> Option<&Path> {
+        self.primary.as_deref()
+    }
+
     /// The baseline, and everything else.
     pub fn split(self) -> (source::Baseline, Held) {
         let ReadState {
