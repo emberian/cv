@@ -286,6 +286,7 @@ fn host(h: Harness) -> Option<Host> {
         Harness::Grok
         | Harness::OpenCode
         | Harness::Gemini
+        | Harness::Antigravity
         | Harness::Hermes
         | Harness::OpenClaw
         | Harness::Cursor
@@ -1238,6 +1239,7 @@ fn selector(harness: Harness, id: &str) -> String {
         Harness::Grok
         | Harness::OpenCode
         | Harness::Gemini
+        | Harness::Antigravity
         | Harness::Hermes
         | Harness::OpenClaw
         | Harness::Cursor

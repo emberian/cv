@@ -78,6 +78,8 @@ harnesses! {
     Grok => "grok",
     OpenCode => "opencode",
     Gemini => "gemini",
+    /// Google Antigravity (`agy` CLI, Antigravity 2.0, Antigravity IDE), `~/.gemini/antigravity*`.
+    Antigravity => "antigravity",
     Hermes => "hermes",
     OpenClaw => "openclaw",
     /// Cursor IDE (chat/composer history in `state.vscdb`).
@@ -120,7 +122,8 @@ impl Harness {
             "codex" => Harness::Codex,
             "grok" => Harness::Grok,
             "opencode" | "oc" => Harness::OpenCode,
-            "gemini" | "antigravity" => Harness::Gemini,
+            "gemini" => Harness::Gemini,
+            "antigravity" | "agy" | "antigravity-cli" | "antigravity-ide" => Harness::Antigravity,
             "hermes" | "hermes-agent" => Harness::Hermes,
             "openclaw" | "claw" => Harness::OpenClaw,
             "cursor" => Harness::Cursor,
@@ -281,6 +284,7 @@ impl Harness {
             | Harness::Codex
             | Harness::Grok
             | Harness::Gemini
+            | Harness::Antigravity
             | Harness::Hermes
             | Harness::OpenClaw
             | Harness::Cursor
@@ -2185,6 +2189,9 @@ mod tests {
     fn every_harness_canonical_name_parses_back() {
         for h in Harness::ALL {
             assert_eq!(Harness::parse(h.as_str()), Some(h), "parse arm missing for {h:?}");
+        }
+        for alias in ["antigravity", "agy", "antigravity-cli", "antigravity-ide"] {
+            assert_eq!(Harness::parse(alias), Some(Harness::Antigravity));
         }
         assert_eq!(Harness::ALL.len(), Harness::COUNT);
     }

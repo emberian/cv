@@ -103,6 +103,7 @@ fn reparse_with(
         #[cfg(not(feature = "sqlite"))]
         Harness::Hermes => anyhow::bail!("re-parse for {target} not supported"),
         Harness::Cursor
+        | Harness::Antigravity
         | Harness::Goose
         | Harness::Zed
         | Harness::Devin
@@ -521,6 +522,7 @@ pub(crate) fn holds_fields(h: Harness) -> &'static [Field] {
         Harness::Qwen => &[Text, ThinkingText, Image, File, ToolUse, ToolResult, ToolName, IsError, Usage, UsageCacheCreation, Timestamp, TimestampToolTurn, Id, IdToolTurn, Title, Cwd, SessionModel, CompleteReparse],
         Harness::OpenSession => &[Principal],
         Harness::Cursor
+        | Harness::Antigravity
         | Harness::Kimi
         | Harness::KimiCode
         | Harness::Goose
@@ -622,6 +624,7 @@ pub(crate) fn write_rules(h: Harness) -> WriteRules {
         | Harness::Roo
         | Harness::Continue
         | Harness::Cursor
+        | Harness::Antigravity
         | Harness::Goose
         | Harness::Zed
         | Harness::Devin

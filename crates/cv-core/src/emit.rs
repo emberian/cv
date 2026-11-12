@@ -232,6 +232,7 @@ fn emitter_for(target: Harness) -> Result<EmitFn, &'static str> {
         // (`~/.kimi`) is not one either: kimi-cli froze that store in 2026-06 and migrates it to
         // `~/.kimi-code` on open, so a session written there was a port to nowhere.
         Harness::Cursor
+        | Harness::Antigravity
         | Harness::Goose
         | Harness::Zed
         | Harness::Devin

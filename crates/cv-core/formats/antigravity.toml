@@ -1,0 +1,47 @@
+# formats/antigravity.toml — the vocabulary cv's `antigravity` adapter is checked against (docs/INTERFACE-V2.md §7).
+# Lists only what the source cannot say: an item the adapter has a match arm for is `handled` by inference and is
+# not listed. generic = interpreted by a blanket rule; carried = verbatim under ParseOptions::complete only;
+# ignored = known and deliberately skipped; handled = interpreted, but not by a match arm (a SQL identifier, a path).
+# tests/formats_manifest.rs holds it to the adapter source.
+
+harness = "antigravity"
+source_files = ["harness/antigravity.rs"]
+ignore_literals = []
+store = [
+  "$JETSKI_APP_DATA_DIR or ~/.gemini/{antigravity-cli,antigravity,antigravity-ide}/brain/<uuid>/.system_generated/logs/transcript_full.jsonl",
+  "…/brain/<uuid>/.system_generated/logs/transcript.jsonl",
+  "…/brain/<uuid>/.system_generated/logs/overview.txt",
+  "…/brain/<uuid>/.system_generated/subagents/<child-uuid>.json",
+  "…/annotations/<uuid>.pbtxt",
+  "…/conversations/<uuid>.db",
+  "…/conversation_summaries.db",
+]
+
+[upstream]
+repo = "Google Antigravity (agy CLI + Antigravity 2.0 / IDE Cortex trajectory_store; corpus 1.5.6)"
+commit = "1.5.6"
+date = "2026-11-11"
+
+[types]
+# Per-session & summary SQLite sidecars (opened strictly read-only via harness::store::sqlite).
+"table.conversation_summaries" = { status = "handled", note = "summary catalog (title, workspace_uris, parent_conversation_id, agent_name)" }
+"column.conversation_id" = { status = "handled", note = "primary key UUID" }
+"column.title" = { status = "handled", note = "session title" }
+"column.preview" = { status = "handled", note = "fallback title preview" }
+"column.workspace_uris" = { status = "handled", note = "JSON array of file:// workspace URIs -> Session::cwd" }
+"column.parent_conversation_id" = { status = "handled", note = "parent session UUID -> Session::lineage.parent" }
+"column.agent_name" = { status = "handled", note = "subagent role/type -> extra" }
+"column.source" = { status = "handled", note = "trajectory source enum -> extra" }
+"column.project_id" = { status = "handled", note = "project identifier -> extra" }
+"column.last_modified_time" = { status = "handled", note = "catalog updated_at timestamp" }
+"table.gen_metadata" = { status = "handled", note = "per-step protobuf blob carrying model slug (field 1.19) and step indices (field 2)" }
+"table.trajectory_metadata_blob" = { status = "handled", note = "main trajectory protobuf carrying workspace URI (1.1), git root (1.2), git branch (1.4), created_at (2)" }
+
+# Known non-transcript / encrypted sidecars deliberately skipped.
+"store.chunks" = { status = "ignored", note = "logs/chunks/transcript_full/*.jsonl is a chunked byte-identical copy of transcript_full.jsonl" }
+"store.implicit_pb" = { status = "ignored", note = "implicit/<uuid>.pb holds AEAD-encrypted implicit context blobs, not sessions" }
+"store.conversations_pb" = { status = "ignored", note = "conversations/<uuid>.pb holds Keychain AEAD-encrypted ProtoStore blobs; cv never touches Keychain and reads overview.txt + SQLite/pbtxt sidecars instead" }
+"store.history_jsonl" = { status = "ignored", note = "history.jsonl records prompt input history, not transcripts" }
+
+# Unknown future Cortex step types carried verbatim under Demand::COMPLETE.
+"record.*" = { status = "carried", note = "unrecognized Cortex step types become Carrier messages under Demand::COMPLETE" }

@@ -164,6 +164,7 @@ fn harness_color(h: Harness) -> &'static str {
         Harness::Grok => "#1d1d1f",
         Harness::OpenCode => "#5b6ee1",
         Harness::Gemini => "#4285f4",
+        Harness::Antigravity => "#1a73e8",
         Harness::Hermes => "#8e44ad",
         Harness::OpenClaw => "#b8860b",
         Harness::Cursor => "#111111",

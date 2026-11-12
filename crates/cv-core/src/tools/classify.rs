@@ -154,6 +154,7 @@ fn is_codex_exec(harness: Option<Harness>, bare: &str) -> bool {
             | Harness::Grok
             | Harness::OpenCode
             | Harness::Gemini
+            | Harness::Antigravity
             | Harness::Hermes
             | Harness::OpenClaw
             | Harness::Cursor
@@ -181,7 +182,9 @@ fn is_spawn_tool(harness: Option<Harness>, bare: &str) -> bool {
         }
     }
     match harness {
-        Some(Harness::Gemini) => matches!(bare, "delegate_to_agent" | "invoke_subagent" | "invoke_agent"),
+        Some(Harness::Gemini | Harness::Antigravity) => {
+            matches!(bare, "delegate_to_agent" | "invoke_subagent" | "invoke_agent")
+        }
         Some(Harness::Cursor) => matches!(bare, "Task" | "Agent" | "mcp_task"),
         Some(Harness::KimiCode) => matches!(bare, "Agent" | "AgentSwarm"),
         Some(
@@ -621,6 +624,7 @@ fn classify_bg_tool(harness: Option<Harness>, bare: &str, input: JsonView<'_>) -
             | Harness::Grok
             | Harness::OpenCode
             | Harness::Gemini
+            | Harness::Antigravity
             | Harness::Hermes
             | Harness::OpenClaw
             | Harness::Cursor
@@ -823,8 +827,10 @@ pub fn spawn_return_id(h: Harness, name: &str, result_text: &str, is_error: bool
         Harness::Claude if matches!(bare, "Agent" | "Task" | "Workflow") => {
             claude_agent_id(trimmed).or_else(|| json_id_field(trimmed, &["agentId", "agent_id", "task_id"]))
         }
-        Harness::Gemini if matches!(bare, "delegate_to_agent" | "invoke_subagent" | "invoke_agent") => {
-            json_id_field(trimmed, &["conversationId", "conversation_id", "agentId", "agent_id"])
+        Harness::Gemini | Harness::Antigravity
+            if matches!(bare, "delegate_to_agent" | "invoke_subagent" | "invoke_agent") =>
+        {
+            embedded_json_id_field(trimmed, &["conversationId", "conversation_id", "agentId", "agent_id"])
                 .or_else(|| claude_agent_id(trimmed))
         }
         Harness::Claude
@@ -832,6 +838,7 @@ pub fn spawn_return_id(h: Harness, name: &str, result_text: &str, is_error: bool
         | Harness::Grok
         | Harness::OpenCode
         | Harness::Gemini
+        | Harness::Antigravity
         | Harness::Hermes
         | Harness::OpenClaw
         | Harness::Cursor
@@ -859,6 +866,15 @@ pub fn spawn_return_id(h: Harness, name: &str, result_text: &str, is_error: bool
             }
         }
     }
+}
+
+fn embedded_json_id_field(trimmed: &str, keys: &[&str]) -> Option<String> {
+    if let Some(id) = json_id_field(trimmed, keys) {
+        return Some(id);
+    }
+    let start = trimmed.find('{')?;
+    let end = trimmed.rfind('}')?;
+    (end > start).then(|| json_id_field(&trimmed[start..=end], keys)).flatten()
 }
 
 fn json_id_field(trimmed: &str, keys: &[&str]) -> Option<String> {

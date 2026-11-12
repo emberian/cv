@@ -5,7 +5,7 @@
 //! OWNED BY the wasm-ingest work. `cv-core::lib` declares this module.
 
 use crate::harness::store::document::range::{RangeSource, Validation};
-use crate::harness::{claude, codex, gemini};
+use crate::harness::{antigravity, claude, codex, gemini};
 use crate::ir::Session;
 use crate::json::JsonView;
 
@@ -47,6 +47,7 @@ enum Sniff {
     Codex { is_jsonl: bool },
     Claude,
     Gemini,
+    Antigravity,
     Unknown,
 }
 
@@ -133,6 +134,14 @@ fn sniff(name: &str, text: &str) -> Sniff {
     if lower.starts_with("rollout-") {
         return Sniff::Codex { is_jsonl };
     }
+    let in_chunks = name.split(['/', '\\']).any(|seg| seg == "chunks");
+    if !in_chunks {
+        if let Some(first) = first_non_empty_line(text) {
+            if first.starts_with('{') && inspect(first, antigravity::is_step_record_view).unwrap_or(false) {
+                return Sniff::Antigravity;
+            }
+        }
+    }
     if let Some(first) = first_non_empty_line(text) {
         if first.contains("\"session_meta\"") {
             return Sniff::Codex { is_jsonl };
@@ -197,13 +206,34 @@ fn codex_id(name: &str, text: &str) -> String {
     file_stem(name).to_owned()
 }
 
+/// Recover `<uuid>` from `…/brain/<uuid>/…` when present, else fall back to filename stem.
+fn antigravity_id_and_rank(name: &str) -> (String, u8) {
+    let parts: Vec<&str> = name.split(['/', '\\']).filter(|s| !s.is_empty()).collect();
+    let base = parts.last().copied().unwrap_or(name);
+    let rank = match base {
+        "transcript_full.jsonl" => 3,
+        "transcript.jsonl" => 2,
+        "overview.txt" => 1,
+        _ => 0,
+    };
+    if let Some(pos) = parts.iter().position(|&seg| seg == "brain") {
+        if let Some(&uuid) = parts.get(pos + 1) {
+            if !uuid.is_empty() && rank > 0 {
+                return (uuid.to_owned(), rank);
+            }
+        }
+    }
+    (file_stem(name).to_owned(), rank)
+}
+
 /// Ingest a set of in-memory files (e.g. the contents of an uploaded zip) into sessions.
 ///
 /// Each file's bytes are decoded as UTF-8 (lossy) and its harness sniffed by content. Files that
 /// can't be classified are skipped. Works without any filesystem access (wasm-safe).
 pub fn ingest_files(files: Vec<(String, Vec<u8>)>) -> anyhow::Result<Vec<Session>> {
     let mut out = Vec::new();
-    for (name, bytes) in files {
+    let mut agy_candidates: std::collections::BTreeMap<String, (u8, usize, String)> = std::collections::BTreeMap::new();
+    for (idx, (name, bytes)) in files.into_iter().enumerate() {
         let text = String::from_utf8_lossy(&bytes);
         match sniff(&name, &text) {
             Sniff::Codex { is_jsonl } => {
@@ -217,8 +247,25 @@ pub fn ingest_files(files: Vec<(String, Vec<u8>)>) -> anyhow::Result<Vec<Session
             Sniff::Gemini => {
                 out.extend(gemini::parse_all_str(&text, None)?);
             }
+            Sniff::Antigravity => {
+                let (id, rank) = antigravity_id_and_rank(&name);
+                let replace = agy_candidates
+                    .get(&id)
+                    .is_none_or(|(prev_rank, _, _)| rank > *prev_rank);
+                if replace {
+                    agy_candidates.insert(id, (rank, idx, text.into_owned()));
+                }
+            }
             Sniff::Unknown => {}
         }
+    }
+    let mut agy_ordered: Vec<(usize, String, String)> = agy_candidates
+        .into_iter()
+        .map(|(id, (_rank, idx, text))| (idx, id, text))
+        .collect();
+    agy_ordered.sort_by_key(|(idx, _, _)| *idx);
+    for (_, id, text) in agy_ordered {
+        out.push(antigravity::parse_str(&id, &text, None)?);
     }
     Ok(out)
 }
@@ -357,6 +404,7 @@ mod tests {
                 Sniff::Gemini => 2,
                 Sniff::Codex { is_jsonl: false } => 3,
                 Sniff::Codex { is_jsonl: true } => 4,
+                Sniff::Antigravity => 5,
             }
         }
         let body = "large escaped λ\n\"".repeat(5000);
@@ -400,5 +448,32 @@ mod tests {
         let text = format!("{snapshots}\n{CLAUDE_SAMPLE}");
         // 63 meta records do not consume the 8-line window; the 64th line is the first conversational one.
         assert_eq!(label(sniff("history.jsonl", &text)), 1);
+    }
+
+    #[test]
+    fn ingests_antigravity_and_prefers_full_log_over_compact_and_chunks() {
+        let full = r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-11-11T10:00:00Z","content":"full prompt"}
+{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-11T10:00:01Z","content":"full reply"}"#;
+        let compact = r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-11-11T10:00:00Z","content":"trunc","truncated_fields":["content"]}"#;
+        let files = vec![
+            (
+                "brain/11111111-2222-4333-8444-555555555555/.system_generated/logs/transcript.jsonl".into(),
+                compact.as_bytes().to_vec(),
+            ),
+            (
+                "brain/11111111-2222-4333-8444-555555555555/.system_generated/logs/transcript_full.jsonl".into(),
+                full.as_bytes().to_vec(),
+            ),
+            (
+                "brain/11111111-2222-4333-8444-555555555555/.system_generated/logs/chunks/transcript_full/0.jsonl"
+                    .into(),
+                full.as_bytes().to_vec(),
+            ),
+        ];
+        let sessions = ingest_files(files).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].harness, Harness::Antigravity);
+        assert_eq!(sessions[0].id, "11111111-2222-4333-8444-555555555555");
+        assert_eq!(sessions[0].messages.len(), 2);
     }
 }

@@ -10,6 +10,7 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
+pub mod antigravity;
 pub mod claude;
 /// Claude Code `Workflow`-tool runs (phase tree + script), a first-class layer over the
 /// `subagents/workflows/` agent tier that [`claude`] walks.
@@ -810,6 +811,7 @@ const ORDER: [Harness; Harness::COUNT] = [
     Harness::Grok,
     Harness::OpenCode,
     Harness::Gemini,
+    Harness::Antigravity,
     Harness::OpenClaw,
     Harness::Kimi,
     Harness::KimiCode,
@@ -866,6 +868,7 @@ pub fn rootless(h: Harness) -> Option<&'static dyn Adapter> {
         Harness::Grok => &grok::ROOTLESS,
         Harness::OpenCode => &opencode::ROOTLESS,
         Harness::Gemini => &gemini::ROOTLESS,
+        Harness::Antigravity => &antigravity::ROOTLESS,
         Harness::OpenClaw => &openclaw::ROOTLESS,
         Harness::Kimi => &kimi::ROOTLESS,
         Harness::KimiCode => &kimi_code::ROOTLESS,
@@ -910,9 +913,7 @@ pub fn attachment_kind(m: &Message) -> Option<&str> {
 /// The unwrapped sender body of a message delivered mid-run ([`Adapter::delivered_body`]), asked
 /// of each bag's adapter and the session's adapter.
 pub fn delivered_body<'a>(h: Harness, m: &Message, text: &'a str) -> Option<&'a str> {
-    bag_owners(m)
-        .chain(rootless(h))
-        .find_map(|a| a.delivered_body(m, text))
+    bag_owners(m).chain(rootless(h)).find_map(|a| a.delivered_body(m, text))
 }
 
 /// The file edit `m`'s record states outside its tool blocks ([`Adapter::native_edit`]), asked
@@ -930,6 +931,7 @@ pub fn for_harness(h: Harness) -> Option<Box<dyn Adapter>> {
         Harness::Grok => Box::new(grok::Grok::detect()),
         Harness::OpenCode => Box::new(opencode::OpenCode::detect()),
         Harness::Gemini => Box::new(gemini::Gemini::detect()),
+        Harness::Antigravity => Box::new(antigravity::Antigravity::detect()),
         Harness::OpenClaw => Box::new(openclaw::OpenClaw::detect()),
         Harness::Kimi => Box::new(kimi::Kimi::detect()),
         Harness::KimiCode => Box::new(kimi_code::KimiCode::detect()),
@@ -969,6 +971,7 @@ pub fn for_harness_with_root(h: Harness, root: &Path) -> Option<Box<dyn Adapter>
         Harness::Codex => Box::new(codex::Codex::with_home(root)),
         Harness::Grok => Box::new(grok::Grok::with_home(root)),
         Harness::Gemini => Box::new(gemini::Gemini::with_home(root)),
+        Harness::Antigravity => Box::new(antigravity::Antigravity::with_home(root)),
         Harness::OpenClaw => Box::new(openclaw::OpenClaw::with_state_dir(root)),
         Harness::Kimi => Box::new(kimi::Kimi::with_home(root)),
         Harness::KimiCode => Box::new(kimi_code::KimiCode::with_home(root)),

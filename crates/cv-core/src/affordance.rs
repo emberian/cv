@@ -378,6 +378,24 @@ pub fn classify_tool_view(h: Harness, name: &str, input: JsonView<'_>) -> Result
             "write_stdin" => Some((BackgroundJob, "read")),
             _ => None,
         },
+        Harness::Antigravity => match name {
+            "schedule" => Some((Schedule, "create")),
+            "run_command" if flag(input, "IsDaemon")? => Some((BackgroundJob, "start")),
+            "manage_task" => {
+                let verb = match input
+                    .get("Action")?
+                    .map(|v| input::word(v, &["kill", "send_input", "list", "status"]))
+                    .transpose()?
+                    .flatten()
+                {
+                    Some(0) => "stop",
+                    Some(1) => "update",
+                    _ => "read",
+                };
+                Some((BackgroundJob, verb))
+            }
+            _ => None,
+        },
         Harness::Claude
         | Harness::Grok
         | Harness::Gemini
@@ -476,6 +494,7 @@ pub fn spawn_returns(h: Harness, name: &str) -> Option<Returns> {
         Harness::Roo => one("new_task", Returns::ResultInPrompt("new_task")),
         Harness::Devin => one("run_subagent", Returns::Result),
         Harness::Continue => one("Subagent", Returns::Result),
+        Harness::Antigravity => one("invoke_subagent", Returns::Later),
         Harness::Gemini
         | Harness::Cursor
         | Harness::KimiCode
@@ -963,10 +982,15 @@ fn call_summary(kind: Kind, view: JsonView<'_>, items: &[Item]) -> Result<String
     let mut parts = Vec::new();
     for key in [
         "description",
+        "toolSummary",
+        "Role",
         "subject",
         "prompt",
+        "Prompt",
         "command",
+        "CommandLine",
         "cron",
+        "CronExpression",
         "schedule",
         "skill",
         "task_name",

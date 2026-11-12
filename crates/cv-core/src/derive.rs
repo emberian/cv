@@ -129,6 +129,7 @@ pub(crate) fn verify(
         | Harness::OpenCode
         | Harness::OpenClaw
         | Harness::Gemini
+        | Harness::Antigravity
         | Harness::Hermes
         | Harness::LmStudio
         | Harness::Cline

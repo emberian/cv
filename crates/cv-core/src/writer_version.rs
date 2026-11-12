@@ -13,6 +13,7 @@ pub fn verified(h: Harness) -> Option<&'static str> {
         Harness::Grok
         | Harness::OpenCode
         | Harness::Gemini
+        | Harness::Antigravity
         | Harness::Hermes
         | Harness::OpenClaw
         | Harness::Cursor

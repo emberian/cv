@@ -273,6 +273,7 @@ fn resume_command(h: Harness, id: &str) -> (String, Vec<String>) {
         Harness::Grok => ("grok".into(), vec!["--resume".into(), id.into()]),
         Harness::OpenCode => ("opencode".into(), vec!["--session".into(), id.into()]),
         Harness::Gemini => ("gemini".into(), vec!["--resume".into(), id.into()]),
+        Harness::Antigravity => ("agy".into(), vec!["--conversation".into(), id.into()]),
         Harness::Hermes => ("hermes".into(), vec!["resume".into(), id.into()]),
         Harness::OpenClaw => ("openclaw".into(), vec!["--resume".into(), id.into()]),
         Harness::Kimi => ("kimi".into(), vec!["--resume".into(), id.into()]),
