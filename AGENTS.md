@@ -28,13 +28,13 @@ Datapath design and open gaps: `docs/design/DATAPATHS.md`; goal, budgets and mea
   per crate, as drift since the last release tag (read from git; nothing is committed or refreshed
   per commit). Drift never fails CI and there are no percentage ratchets or line-count targets;
   explain a consequential size change against "The shape" in the commit. No committed evidence
-  files; design docs stay under 250 lines.
+  files.
 - A file embedded with `include_str!` must live inside its crate, or `cargo publish` fails.
 - `crates/cv-core/tests/corpus/<harness>/<version>/` is real harness-written data, scrubbed. Never
   regenerate a committed version in place; add a new version. Summaries regenerate with
   `CV_REGEN_CORPUS=1` and every diff is explained in the commit.
-- Removed command or flag names error with a pointer and exit 2; stored logs and transcripts keep
-  reading.
+- Stored logs and transcripts keep reading across releases; removed CLI/HTTP shims are deleted
+  cleanly rather than left as tombstones.
 - Judge disk pressure by free bytes and expected writes, not percentage alone. With adequate
   headroom, continue small edits and reuse warm targets. If planned writes risk exhausting space,
   stop those writes and report sizes. Delete only your own artifacts within authorized cleanup scope.

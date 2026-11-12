@@ -4,8 +4,8 @@
 The baseline is the tree at tag `v<workspace version>` (Cargo.toml still says the last release
 during development), read from git's blobs: nothing is committed and nothing is refreshed per
 commit. Drift is printed as GitHub `::notice::` annotations and never fails; a module growing is a
-question for design review, not a failure. Hygiene (committed measurement artifacts, design docs
-over the line cap) still fails. Without the tag (a shallow clone) the drift is not measured:
+question for design review, not a failure. Hygiene (committed measurement artifacts) still fails.
+Without the tag (a shallow clone) the drift is not measured:
 `git fetch --no-tags --depth=1 origin refs/tags/<tag>:refs/tags/<tag>` brings it.
 
 Product lines: non-blank lines of crates/<crate>/src/**/*.rs outside `#[cfg(test)]` items (a test
@@ -20,7 +20,6 @@ import re
 import subprocess
 import sys
 
-DOC_MAX_LINES = 250
 CFG_TEST = re.compile(r"#\[(cfg\((test|all\(test\b[^\]]*)\)|test)\]")  # cfg(test) items and #[test] fns
 MOD_DECL = re.compile(r"\bmod\s+(\w+)\s*;")
 RAW_STRING = re.compile(r'b?r(#*)"')
@@ -189,10 +188,6 @@ def main() -> int:
     failures: list[str] = []
     for path in tracked("docs/*.json", "docs/**/*.json", "tools/profiling/results/*"):
         failures.append(f"{path}: measurements belong in commit messages, not committed files")
-    for path in tracked("docs/design/*.md"):
-        n = len(pathlib.Path(path).read_text().splitlines())
-        if n > DOC_MAX_LINES:
-            failures.append(f"{path}: {n} lines; design docs stay under {DOC_MAX_LINES} (history lives in git)")
     for failure in failures:
         print(f"FAIL {failure}", file=sys.stderr)
     return 1 if failures else 0

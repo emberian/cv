@@ -15,5 +15,7 @@ The handoff from ember's session to akapug's fleet, made the day 0.18.0 shipped.
    three decisions it would make differently, a one-week vertical slice with falsifiers, and the
    verdict "ship with 7 changes". The handoff adopts those seven.
 
-These are a record, not the 250-line design docs of `docs/design/`; the plan that binds is the
-handoff message ember carries, which supersedes DESIGN.md where REVIEW-ASTRA.md amended it.
+These three documents form the 2026-10-28 architecture record; where `REVIEW-ASTRA.md` amends
+`DESIGN.md` (separated producer/epoch/run identity, single-writer durable ledger, hub ingestion
+offsets, large-payload separation, per-session SQLite revision safety, and verified precompact
+context-generation handoff), `REVIEW-ASTRA.md` governs.
