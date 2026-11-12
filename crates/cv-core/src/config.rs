@@ -12,7 +12,10 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
+
+pub use crate::redact::{PathRewrite, PrincipalPolicy, PrivacyPolicy, RedactClasses, ScrubProfile, SessionFilter};
 
 /// The parsed config (missing/extra fields tolerated; absent file ⇒ defaults).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -23,6 +26,12 @@ pub struct Config {
     /// `[search]`: defaults for full-text search.
     #[serde(default, skip_serializing_if = "Search::is_unset")]
     pub search: Search,
+    /// `[privacy]`: default scrubbing & session-admission profile for sharing/exports.
+    #[serde(default, skip_serializing_if = "ScrubProfile::is_unset")]
+    pub privacy: ScrubProfile,
+    /// `[replication.<name>]`: per-destination scrubbing & filter profiles for fleet/hub sync.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub replication: BTreeMap<String, ScrubProfile>,
 }
 
 /// The `[search]` table.
@@ -178,5 +187,70 @@ mod tests {
         cfg.exports.push("/new".into());
         save(&cfg).unwrap();
         assert_eq!(load().search.live_bytes, Some(52_428_800));
+    }
+
+    #[test]
+    fn round_trips_privacy_and_replication_profiles_without_polluting_default_toml() {
+        let default_toml = toml::to_string_pretty(&Config::default()).unwrap();
+        assert!(!default_toml.contains("privacy"), "{default_toml}");
+        assert!(!default_toml.contains("replication"), "{default_toml}");
+
+        let raw = r#"
+exports = ["/tmp/exports"]
+
+[privacy]
+private_ips = true
+hostnames = true
+ssh_principals = true
+rewrite_home = true
+rewrite_repo = true
+principal = "drop"
+
+[privacy.classes]
+emails = false
+
+[[privacy.path_rewrites]]
+pattern = "/corp/[A-Za-z0-9_-]+"
+replacement = "$CORP"
+
+[privacy.filter]
+allow_cwds = ["/Users/ember/dev/*"]
+deny_cwds = ["/Users/ember/dev/secret"]
+harnesses = ["claude", "codex"]
+tags = ["public"]
+
+[replication.team-hub]
+private_ips = true
+rewrite_home = true
+principal = { mode = "hash", salt = "hub-v1" }
+
+[replication.team-hub.filter]
+harnesses = ["claude"]
+"#;
+        let parsed: Config = toml::from_str(raw).unwrap();
+        assert!(parsed.privacy.private_ips);
+        assert!(parsed.privacy.hostnames);
+        assert!(parsed.privacy.ssh_principals);
+        assert!(parsed.privacy.rewrite_home);
+        assert!(parsed.privacy.rewrite_repo);
+        assert!(!parsed.privacy.classes.emails);
+        assert!(parsed.privacy.classes.api_keys);
+        assert_eq!(parsed.privacy.principal, PrincipalPolicy::Drop);
+        assert_eq!(parsed.privacy.path_rewrites.len(), 1);
+        assert_eq!(parsed.privacy.filter.harnesses, vec!["claude", "codex"]);
+
+        let hub = parsed.replication.get("team-hub").expect("team-hub profile");
+        assert!(hub.private_ips);
+        assert_eq!(
+            hub.principal,
+            PrincipalPolicy::Hash {
+                salt: Some("hub-v1".into())
+            }
+        );
+
+        let serialized = toml::to_string_pretty(&parsed).unwrap();
+        let reparsed: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(reparsed.privacy, parsed.privacy);
+        assert_eq!(reparsed.replication, parsed.replication);
     }
 }

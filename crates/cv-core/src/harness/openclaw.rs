@@ -442,6 +442,67 @@ fn stream_lines(
     Ok(session)
 }
 
+/// Parse an in-memory OpenClaw JSONL transcript (v1–v4, including `leaf` navigation trees),
+/// used by [`crate::ingest`] (wasm-safe).
+pub(crate) fn parse_str(id: &str, text: &str) -> Result<Session> {
+    use super::store::jsonl;
+    use crate::harness::store::document::range::RangeSource;
+    let opts = Demand::RICH;
+    let r = SessionRef::new(id, Harness::OpenClaw, std::path::PathBuf::new());
+    let facts = KeyFacts::default();
+    let mut collect = crate::stream::CollectSink::default();
+    let mut tree = false;
+    jsonl::slice(text.as_bytes(), |line| {
+        if let Some(view) = line.view {
+            if is_leaf_entry(view)? {
+                tree = true;
+                return Ok(Flow::Stop);
+            }
+        }
+        Ok(Flow::Continue)
+    })?;
+    let mut fold = Fold::new(&r, &facts, &opts);
+    {
+        let mut spawns =
+            crate::affordance::AffordanceSink::new(Harness::OpenClaw, &mut collect).unwrapping(Some(DEFERRED_WRAPPER));
+        if tree {
+            let mut descriptors = Vec::new();
+            let mut line_slices: Vec<(usize, usize)> = Vec::new();
+            jsonl::slice(text.as_bytes(), |line| {
+                if let Some(view) = line.view {
+                    descriptors.push(record::navigation(view)?);
+                    line_slices.push((line.at as usize, line.end as usize));
+                }
+                Ok(Flow::Continue)
+            })?;
+            let nav = select_navigation(&descriptors, false);
+            for row in nav {
+                let (start, end) = line_slices[row.index];
+                let slice = &text[start..end];
+                let src = RangeSource::text(None, slice, 0, false);
+                if let Some(val) = src.accept(src.range(), Validation::Value)? {
+                    let rec = record::record(crate::json::JsonView::of(&src, val), &opts)?;
+                    if fold.push(rec, row.active, row.parent, &mut spawns)? == Flow::Stop {
+                        break;
+                    }
+                }
+            }
+        } else {
+            jsonl::slice(text.as_bytes(), |line| {
+                if let Some(view) = line.view {
+                    let _ = fold.push(record::record(view, &opts)?, true, None, &mut spawns)?;
+                }
+                Ok(Flow::Continue)
+            })?;
+        }
+        let mut session = fold.finish(&mut spawns);
+        drop(spawns);
+        session.messages = collect.messages;
+        session.source_path = None;
+        Ok(session)
+    }
+}
+
 /// Folds decoded records into the session in emission order and hands their messages to the sink.
 /// The session's `messages` stay empty.
 struct Fold {

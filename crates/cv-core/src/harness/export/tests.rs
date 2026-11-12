@@ -652,7 +652,7 @@ fn wide_chatgpt_parts_preserve_filtered_join_and_source_guard() -> Result<()> {
     let resolver = crate::lazy::Resolver::new(None);
     let text = source.read(ReadInput::Range(0, source.len()), Validation::Value, |view| {
         let fields = crate::harness::store::document::Fields::parse(view, &["parts"])?;
-        native::chatgpt_text(fields.as_ref(), true, &source, &resolver)
+        native::chatgpt_text(fields.as_ref(), true, Some(&source), &resolver)
     })?;
     assert!(matches!(text, crate::Text::Source(_)));
     assert_eq!(text.try_resolve(&resolver)?.as_ref(), expected);

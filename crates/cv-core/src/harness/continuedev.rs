@@ -530,13 +530,118 @@ fn scan_session(path: &Path) -> Result<Option<Scan>> {
 // small helpers
 // ---------------------------------------------------------------------------
 
-/// Continue's `workspaceDirectory` may be a `file://` URI or a plain path. Normalize to a path.
+/// Parse an in-memory Continue session JSON document (used by [`crate::ingest`], wasm-safe).
+pub(crate) fn parse_str(id: &str, text: &str) -> Result<Session> {
+    use crate::harness::store::document::range::RangeSource;
+    let source = RangeSource::text(None, text, 0, false);
+    let Some(val) = source.accept(source.range(), Validation::Syntax)? else {
+        anyhow::bail!("empty Continue session document");
+    };
+    let root = JsonView::of(&source, val);
+    let Some(doc) = Fields::parse_struct(root, &["sessionId", "title", "workspaceDirectory", "history"])? else {
+        return Err(InvalidStruct("expected Continue session struct").into());
+    };
+    let resolved_id = doc
+        .string("sessionId")?
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| id.to_owned());
+    let title = record::title(doc.get("title"), true)?;
+    let workspace = optional_string(doc.get("workspaceDirectory"))?;
+    let history = match doc.get("history").map(JsonView::accepted_array).transpose()? {
+        Some(None) => return Err(InvalidStruct("expected Continue history array").into()),
+        array => array.flatten(),
+    };
+    let mut s = Session {
+        cwd: workspace.filter(|p| !p.is_empty()).map(|p| workspace_to_path(&p)),
+        title,
+        ..Session::new(resolved_id, Harness::Continue)
+    };
+    let mut collect = crate::stream::CollectSink::default();
+    {
+        let mut spawns = crate::affordance::AffordanceSink::new(Harness::Continue, &mut collect);
+        spawns.meta(&s);
+        let mut answered = std::collections::HashSet::<String>::new();
+        for item in history.into_iter().flatten() {
+            let Some(item) = item? else { continue };
+            let reply_id = record::reply_id(item)?;
+            if reply_id.is_some_and(|id| answered.contains(&id)) {
+                continue;
+            }
+            let (message, results) = record::messages(item, false, &mut s.model)?;
+            if let Some(message) = message {
+                if s.system_prompt.is_none() && message.kind == MessageKind::SystemPrompt {
+                    let mut text_message = message.clone();
+                    text_message.try_materialize_text(&s.resolver())?;
+                    if let Some(t) = text_message.text().filter(|t| !t.trim().is_empty()) {
+                        s.system_prompt = Some(t);
+                    }
+                }
+                if spawns.try_message(message)? == Flow::Stop {
+                    break;
+                }
+            }
+            if let Some(results) = results {
+                for block in &results.content {
+                    if let Block::ToolResult { tool_use_id, .. } = block {
+                        answered.insert(tool_use_id.clone());
+                    }
+                }
+                if spawns.try_message(results)? == Flow::Stop {
+                    break;
+                }
+            }
+        }
+    }
+    s.messages = collect.messages;
+    Ok(s)
+}
+
+/// Continue's `workspaceDirectory` may be a `file://` URI (including `file://localhost/...`,
+/// Windows `file:///C:/...`, and percent-encoded UTF-8 like `%20`) or a plain path. Normalize to a path.
 fn workspace_to_path(s: &str) -> PathBuf {
     if let Some(rest) = s.strip_prefix("file://") {
-        // file:///Users/... -> /Users/... (drop the empty authority's leading slash group).
-        PathBuf::from(rest)
+        let path_part = rest.strip_prefix("localhost").unwrap_or(rest);
+        let decoded = percent_decode_utf8(path_part);
+        PathBuf::from(normalize_windows_drive_slash(&decoded))
     } else {
-        PathBuf::from(s)
+        PathBuf::from(normalize_windows_drive_slash(s))
+    }
+}
+
+fn percent_decode_utf8(s: &str) -> String {
+    if !s.as_bytes().contains(&b'%') {
+        return s.to_string();
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push(((h << 4) | l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(&e.into_bytes()).into_owned())
+}
+
+fn normalize_windows_drive_slash(s: &str) -> &str {
+    let b = s.as_bytes();
+    if b.len() >= 3
+        && b[0] == b'/'
+        && b[1].is_ascii_alphabetic()
+        && b[2] == b':'
+        && (b.len() == 3 || b[3] == b'/' || b[3] == b'\\')
+    {
+        &s[1..]
+    } else {
+        s
     }
 }
 
@@ -1280,5 +1385,22 @@ mod tests {
         assert_eq!(found.skipped[0].path, dir.join("sessions.json"));
         assert!(found.refs.iter().find(|r| r.id == "indexed").unwrap().title.as_deref() == Some("file title"));
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn workspace_to_path_decodes_percent_escapes_and_normalizes_windows_drives() {
+        assert_eq!(
+            workspace_to_path("file:///Users/me/My%20Project%2B1"),
+            PathBuf::from("/Users/me/My Project+1")
+        );
+        assert_eq!(
+            workspace_to_path("file://localhost/home/dev/%E9%9B%AA"),
+            PathBuf::from("/home/dev/雪")
+        );
+        assert_eq!(
+            workspace_to_path("file:///C:/Users/dev/My%20Repo"),
+            PathBuf::from("C:/Users/dev/My Repo")
+        );
+        assert_eq!(workspace_to_path("/d:/work/project"), PathBuf::from("d:/work/project"));
     }
 }

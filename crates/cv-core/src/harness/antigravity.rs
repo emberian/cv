@@ -637,6 +637,7 @@ struct SubagentDescriptor {
 }
 
 fn read_subagent_descriptors(brain_dir: &Path) -> Result<Vec<SubagentDescriptor>> {
+    use std::io::Read as _;
     let sub_dir = brain_dir.join(".system_generated").join("subagents");
     let entries = super::side_entries(&sub_dir)?;
     let mut paths: Vec<PathBuf> = entries
@@ -647,9 +648,23 @@ fn read_subagent_descriptors(brain_dir: &Path) -> Result<Vec<SubagentDescriptor>
     paths.sort();
     let mut out = Vec::new();
     for path in paths {
-        let Ok(text) = fs::read_to_string(&path) else {
+        let Ok(file) = fs::File::open(&path) else {
             continue;
         };
+        let Ok(meta) = file.metadata() else {
+            continue;
+        };
+        if !meta.file_type().is_file() || meta.len() > 1024 * 1024 {
+            continue;
+        }
+        let mut text = String::new();
+        if std::io::Read::take(file, 1024 * 1024 + 1)
+            .read_to_string(&mut text)
+            .is_err()
+            || text.len() > 1024 * 1024
+        {
+            continue;
+        }
         let Ok(val) = serde_json::from_str::<Value>(&text) else {
             continue;
         };
@@ -1090,12 +1105,13 @@ impl jsonl::Codec for StepCodec {
                 let is_error = matches!(status.as_deref(), Some("ERROR" | "INVALID"));
                 let norm_status = status.as_deref().map(normalize_step_status);
 
-                // Inspect only a small bounded prefix of `content` for persisted-output paths and
+                // Inspect a bounded 64 KiB prefix of `content` for persisted-output paths and
                 // `invoke_subagent` child conversationIds so multi-megabyte tool outputs stay in
-                // their zero-copy source spans.
+                // their zero-copy source spans without truncating long preamble headers.
+                const STEP_PEEK_BYTES: usize = 64 * 1024;
                 let head = fields
                     .get("content")
-                    .map(|v| peek_view_prefix(v, 1024))
+                    .map(|v| peek_view_prefix(v, STEP_PEEK_BYTES))
                     .transpose()?
                     .unwrap_or_default();
 
@@ -1150,9 +1166,10 @@ impl jsonl::Codec for StepCodec {
                 Ok(sink.message(m))
             }
             "SYSTEM_MESSAGE" => {
+                const SYS_PEEK_BYTES: usize = 64 * 1024;
                 let head = fields
                     .get("content")
-                    .map(|v| peek_view_prefix(v, 512))
+                    .map(|v| peek_view_prefix(v, SYS_PEEK_BYTES))
                     .transpose()?
                     .unwrap_or_default();
                 let sender = extract_system_message_sender(&head);
@@ -1435,15 +1452,68 @@ fn extract_persisted_output_path(head: &str) -> Option<String> {
     )
 }
 
+fn find_conversation_id_in_value(val: &Value) -> Option<String> {
+    match val {
+        Value::Object(map) => {
+            if let Some(id) = map
+                .get("conversationId")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            {
+                return Some(id.to_owned());
+            }
+            for child in map.values() {
+                if let Some(id) = find_conversation_id_in_value(child) {
+                    return Some(id);
+                }
+            }
+            None
+        }
+        Value::Array(items) => items.iter().find_map(find_conversation_id_in_value),
+        _ => None,
+    }
+}
+
 fn extract_spawned_conversation_id(head: &str) -> Option<String> {
+    let trimmed = head.trim();
+    if let Ok(val) = serde_json::from_str::<Value>(trimmed) {
+        if let Some(id) = find_conversation_id_in_value(&val) {
+            return Some(id);
+        }
+    }
+    // Tool outputs often prefix or suffix JSON objects with human-readable status lines:
+    // stream-parse any top-level JSON object embedded in `head` before falling back to a
+    // JSON-decoded string scan if the object was truncated at the 64 KiB peek boundary.
+    for (idx, ch) in head.char_indices() {
+        if ch == '{' {
+            let mut stream = serde_json::Deserializer::from_str(&head[idx..]).into_iter::<Value>();
+            if let Some(Ok(val)) = stream.next() {
+                if let Some(id) = find_conversation_id_in_value(&val) {
+                    return Some(id);
+                }
+            }
+        }
+    }
+    // Truncated JSON fallback: decode the JSON string value properly with serde_json so escapes
+    // (`\"`, `\\`, `\uXXXX`) are handled and prose mentions without `"conversationId": "..."` fail.
     const KEY: &str = "\"conversationId\"";
-    let idx = head.find(KEY)?;
-    let rest = head[idx + KEY.len()..].trim_start();
-    let rest = rest.strip_prefix(':')?.trim_start();
-    let rest = rest.strip_prefix('"')?;
-    let end = rest.find('"')?;
-    let id = &rest[..end];
-    (!id.is_empty()).then(|| id.to_string())
+    let mut search = head;
+    while let Some(idx) = search.find(KEY) {
+        let after_key = &search[idx + KEY.len()..];
+        if let Some(after_colon) = after_key.trim_start().strip_prefix(':') {
+            let val_start = after_colon.trim_start();
+            if val_start.starts_with('"') {
+                let mut stream = serde_json::Deserializer::from_str(val_start).into_iter::<String>();
+                if let Some(Ok(id)) = stream.next() {
+                    if !id.is_empty() {
+                        return Some(id);
+                    }
+                }
+            }
+        }
+        search = after_key;
+    }
+    None
 }
 
 fn extract_system_message_sender(head: &str) -> Option<String> {
@@ -2392,5 +2462,52 @@ mod tests {
                 assert!(!Path::new(&p).exists(), "created sidecar {}", Path::new(&p).display());
             }
         }
+    }
+
+    #[test]
+    fn step_peek_handles_large_preambles_and_structured_conversation_id_extraction() {
+        // Quoted prose containing `"conversationId": "spoof"` inside another field must not hijack
+        // structured JSON extraction, and payloads past 1 KiB (up to 64 KiB) still resolve!
+        let padding = "x".repeat(4096);
+        let payload = serde_json::json!({
+            "note": format!("prose mentioning {{\"conversationId\":\"spoofed-id\"}} {padding}"),
+            "result": {
+                "conversationId": "real-child-uuid-9999"
+            }
+        })
+        .to_string();
+        assert_eq!(
+            extract_spawned_conversation_id(&payload).as_deref(),
+            Some("real-child-uuid-9999")
+        );
+
+        let parent_id = "11111111-1111-4111-8111-111111111111";
+        let child_id = "22222222-2222-4222-8222-222222222222";
+        let long_header = " ".repeat(2048);
+        let transcript = [
+            serde_json::json!({
+                "step_index": 0,
+                "type": "SYSTEM_MESSAGE",
+                "content": format!("{long_header}<SYSTEM_MESSAGE>\n[Message] sender={parent_id}\nAssigned work\n</SYSTEM_MESSAGE>")
+            })
+            .to_string(),
+            serde_json::json!({
+                "step_index": 1,
+                "type": "TOOL_RESULT",
+                "tool_call_id": "tc_sub",
+                "tool_name": "invoke_subagent",
+                "content": serde_json::json!({
+                    "log": padding,
+                    "echo": "{\"conversationId\":\"wrong\"}",
+                    "spawn": { "conversationId": child_id }
+                }).to_string()
+            })
+            .to_string(),
+        ]
+        .join("\n");
+
+        let parsed = parse_str("33333333-3333-4333-8333-333333333333", &transcript, None).unwrap();
+        assert_eq!(parsed.lineage.parent.as_deref(), Some(parent_id));
+        assert_eq!(parsed.messages[0].origin, Origin::Subagent);
     }
 }

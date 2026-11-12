@@ -91,18 +91,23 @@ impl Adapter for ExportAdapter {
 
 /// Where to look for export archives — the registered sources from the config file
 /// (`cv config --add-export <path>`; see [`crate::config`]), unioned with `$CV_EXPORTS` (a
-/// `:`-separated ad-hoc list). **Opt-in**: with nothing registered and the env unset, export discovery
-/// is a no-op, so the default `cv ls`/`discover_all` never pays to scan (account exports are huge —
-/// enumerating thousands of conversations across multi-MB files takes seconds).
+/// platform path-list via [`std::env::split_paths`]). **Opt-in**: with nothing registered and the
+/// env unset, export discovery is a no-op, so the default `cv ls`/`discover_all` never pays to scan.
 pub(crate) fn export_dirs() -> Vec<PathBuf> {
     let mut dirs = crate::config::load().exports;
-    if let Ok(spec) = crate::env::var("CV_EXPORTS") {
-        dirs.extend(spec.split(':').filter(|s| !s.is_empty()).map(PathBuf::from));
+    if let Some(spec) = crate::env::var_os("CV_EXPORTS") {
+        dirs.extend(std::env::split_paths(&spec).filter(|p| !p.as_os_str().is_empty()));
     }
     dirs.retain(|p| p.exists());
     dirs.sort();
     dirs.dedup();
     dirs
+}
+
+/// Parse an in-memory `conversations.json` export array or single conversation object (used by
+/// [`crate::ingest`], wasm-safe).
+pub(crate) fn parse_all_str(text: &str) -> Result<Vec<Session>> {
+    native::parse_all_str(text)
 }
 
 /// Every file under `roots` matching `pred` (depth ≤ 2; a dir entry is scanned, a file entry is

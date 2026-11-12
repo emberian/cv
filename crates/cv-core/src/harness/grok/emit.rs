@@ -64,11 +64,8 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Emi
     // Agent persona, independent of current_model_id; its spelling happens to match the
     // fallback model but the two fields can vary independently.
     summary.insert("agent_name".into(), json!("grok-build"));
-    if let Some(home) = crate::env::var_os("HOME") {
-        summary.insert(
-            "grok_home".into(),
-            json!(format!("{}/.grok", Path::new(&home).to_string_lossy())),
-        );
+    if let Some(home) = crate::env::home_dir() {
+        summary.insert("grok_home".into(), json!(home.join(".grok").to_string_lossy()));
     }
     // Carry the source model verbatim for a Grok→Grok port (it is already a Grok model), and for a
     // cross-harness port only when it *is* a Grok model; otherwise default to `grok-build`. A
@@ -130,10 +127,44 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Emi
                         if let Some(model) = msg.model.as_ref().or(session.model.as_ref()) {
                             line.field("model_id", model)?;
                         }
-                        if let Some(Block::Thinking { text, encrypted, .. }) = thinking {
+                        if !thinking.is_empty() {
+                            let encrypted = thinking.iter().find_map(|b| match b {
+                                Block::Thinking { encrypted: Some(e), .. } => Some(e.as_str()),
+                                _ => None,
+                            });
                             line.field_with("reasoning", |writer| {
                                 let mut reason = ObjectWriter::new(writer)?;
-                                reason.field_with("text", |w| wire::text(w, text, &resolver))?;
+                                reason.field_with("text", |w| {
+                                    if thinking.len() == 1 {
+                                        let Block::Thinking { text, .. } = thinking[0] else {
+                                            unreachable!()
+                                        };
+                                        wire::text(w, text, &resolver)
+                                    } else {
+                                        crate::harness::store::text::generate_string(w, |builder| {
+                                            let mut present = false;
+                                            for block in &thinking {
+                                                let Block::Thinking { text, .. } = block else {
+                                                    unreachable!()
+                                                };
+                                                if text.is_empty() {
+                                                    continue;
+                                                }
+                                                if present {
+                                                    builder.push("\n\n")?;
+                                                }
+                                                text.try_for_each_chunk(&resolver, 64 * 1024, |chunk| {
+                                                    if !chunk.is_empty() {
+                                                        present = true;
+                                                        builder.push(chunk)?;
+                                                    }
+                                                    Ok(())
+                                                })?;
+                                            }
+                                            Ok(())
+                                        })
+                                    }
+                                })?;
                                 if session.harness == Harness::Grok {
                                     if let Some(encrypted) = encrypted {
                                         reason.field("encrypted", encrypted)?;
@@ -225,22 +256,22 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Emi
     })
 }
 
-/// Project each block once; retained text and the first retained thinking stay borrowed.
+/// Project each block once; retained text and all retained thinking blocks stay borrowed.
 fn projected<'a>(
     message: &'a crate::ir::Message,
     mode: ThinkingMode,
     resolver: &Resolver,
-) -> Result<(Vec<Cow<'a, Text>>, Option<&'a Block>)> {
+) -> Result<(Vec<Cow<'a, Text>>, Vec<&'a Block>)> {
     let mut texts = Vec::new();
-    let mut thinking = None;
+    let mut thinking = Vec::new();
     for block in &message.content {
         let fate = crate::emit::thinking::fate(block, Harness::Grok, mode, resolver)?;
         if let Block::Text { text } = block {
             texts.push(Cow::Borrowed(text));
         } else if let Some(text) = crate::emit::thinking::text_with_fate(block, fate) {
             texts.push(text);
-        } else if thinking.is_none() && fate == ThinkingFate::Keep && matches!(block, Block::Thinking { .. }) {
-            thinking = Some(block);
+        } else if fate == ThinkingFate::Keep && matches!(block, Block::Thinking { .. }) {
+            thinking.push(block);
         }
     }
     Ok((texts, thinking))
@@ -259,3 +290,47 @@ pub(crate) fn grok_model_id(session: &Session) -> &str {
 
 /// What `summary.json` records when the source model is not one Grok can run.
 pub(crate) const GROK_FALLBACK_MODEL: &str = "grok-build";
+
+#[cfg(test)]
+mod multi_thinking_tests {
+    use super::*;
+    use crate::harness::{grok::Grok, Parse};
+    use crate::ir::{Message, SessionRef};
+
+    #[test]
+    fn concatenates_multiple_thinking_blocks_instead_of_dropping_second() -> Result<()> {
+        let world = crate::test_world("grok-multi-thinking");
+        let mut session = Session::new("g1", Harness::Grok);
+        session.model = Some("grok-4".into());
+        let mut asst = Message::new(Role::Assistant);
+        asst.content = vec![
+            Block::Thinking {
+                text: "first step".into(),
+                signature: None,
+                encrypted: Some("enc-1".into()),
+                redacted: false,
+            },
+            Block::Thinking {
+                text: "second step".into(),
+                signature: None,
+                encrypted: None,
+                redacted: false,
+            },
+            Block::Text { text: "final".into() },
+        ];
+        session.messages.push(asst);
+        let res = emit(&session, &world.base, &EmitOptions::default())?;
+        let parsed = Grok::detect().parse(&SessionRef::new(&res.new_id, Harness::Grok, &res.path))?;
+        let thinking = parsed.messages[0]
+            .content
+            .iter()
+            .find_map(|b| match b {
+                Block::Thinking { text, encrypted, .. } => Some((text.to_string(), encrypted.clone())),
+                _ => None,
+            })
+            .expect("thinking survives");
+        assert_eq!(thinking.0, "first step\n\nsecond step");
+        assert_eq!(thinking.1.as_deref(), Some("enc-1"));
+        Ok(())
+    }
+}

@@ -33,15 +33,18 @@ const TOP: &[&str] = &[
 pub(super) struct Demand<'a> {
     pub harness: Harness,
     pub source: Option<&'a JsonSource>,
+    pub keep_image_data: bool,
     pub resolver: &'a Resolver,
 }
 
 impl<'a> Demand<'a> {
-    /// The read's demand over its captured `source`: under spans, large fields stay in it.
+    /// The read's demand over its captured `source`: under spans, large fields stay in it;
+    /// discovery skips decoding inline base64 image payloads.
     pub fn of(harness: Harness, demand: &stream::Demand, source: &'a JsonSource, resolver: &'a Resolver) -> Self {
         Demand {
             harness,
             source: demand.spans.then_some(source),
+            keep_image_data: demand.tier != crate::stream::Tier::Discovery,
             resolver,
         }
     }
@@ -403,7 +406,7 @@ fn part_block(view: JsonView<'_>, d: Demand<'_>, out: &mut Vec<Block>) -> Result
         }
         return Ok(false);
     }
-    let selected = genai::select(view, Dialect::Gemini)?;
+    let selected = genai::select_with_images(view, Dialect::Gemini, d.keep_image_data)?;
     match selected.part {
         Some(Part::Call(fc)) => {
             if let Some(fc) = Fields::parse(fc, &["name", "id", "args"])? {
@@ -775,6 +778,7 @@ mod tests {
         let d = Demand {
             harness: Harness::Gemini,
             source: None,
+            keep_image_data: true,
             resolver: &resolver,
         };
         for body in [
@@ -823,6 +827,7 @@ mod genai_contracts {
                     let d = Demand {
                         harness: Harness::Gemini,
                         source: if demand == 0 { None } else { Some(&source) },
+                        keep_image_data: true,
                         resolver: &resolver,
                     };
                     let mut blocks = Vec::new();
@@ -833,6 +838,10 @@ mod genai_contracts {
             }
             assert_eq!(std::fs::read(&path)?, bytes, "decoder changed source");
         }
-        frozen::assert_frozen(rows, include_str!("../../../tests/fixtures/wire/gemini-parts.jsonl"))
+        frozen::assert_frozen(
+            rows,
+            include_str!("../../../tests/fixtures/wire/gemini-parts.jsonl"),
+            "tests/fixtures/wire/gemini-parts.jsonl",
+        )
     }
 }

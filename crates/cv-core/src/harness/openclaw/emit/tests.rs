@@ -791,3 +791,49 @@ fn an_index_changed_after_the_read_is_refused_and_nothing_is_published() -> Resu
     }
     Ok(())
 }
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn emits_into_modern_openclaw_sqlite_store_and_round_trips() -> Result<()> {
+    use crate::harness::{openclaw::OpenClaw, Adapter, Parse};
+    let world = crate::test_world("openclaw-sqlite-emit");
+    let agents = world.base.join("agents");
+    let agent_dir = agents.join("main/agent");
+    fs::create_dir_all(&agent_dir)?;
+    let db = agent_dir.join("openclaw-agent.sqlite");
+    {
+        let conn = rusqlite::Connection::open(&db)?;
+        conn.execute_batch(include_str!(
+            "../../../../tests/fixtures/openclaw/transcript-tables.sql"
+        ))?;
+    }
+    let mut session = fixture(&world.base)?;
+    session.title = Some("Modern SQLite Window".into());
+    let opts = EmitOptions {
+        new_id: Some("sql-win-1".into()),
+        ..Default::default()
+    };
+    let res = crate::emit::emit(&session, Harness::OpenClaw, &agents, &opts)?;
+    assert_eq!(res.path, db);
+
+    // Refuses overwrite without `force: true`, succeeds with `force: true`.
+    assert!(crate::emit::emit(&session, Harness::OpenClaw, &agents, &opts).is_err());
+    crate::emit::emit(
+        &session,
+        Harness::OpenClaw,
+        &agents,
+        &EmitOptions { force: true, ..opts },
+    )?;
+
+    let oc = OpenClaw::with_state_dir(&world.base);
+    let refs = oc.discover()?;
+    let found = refs.iter().find(|r| r.id == "sql-win-1").expect("discovered window");
+    assert_eq!(found.title.as_deref(), Some("Modern SQLite Window"));
+    let back = oc.parse(found)?;
+    assert_eq!(
+        back.extra["openclaw"]["session_key"].as_str(),
+        Some("agent:main:sql-win-1")
+    );
+    assert!(!back.messages.is_empty());
+    Ok(())
+}

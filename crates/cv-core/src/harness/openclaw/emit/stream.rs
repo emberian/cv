@@ -155,14 +155,28 @@ pub(super) fn emit_after_stage(
     let created = session.created_at.or(session.updated_at).unwrap_or_else(Utc::now);
     let created_iso = created.to_rfc3339_opts(SecondsFormat::Millis, true);
     let mut lines = JsonlStage::new();
+    #[cfg(feature = "sqlite")]
+    let sqlite_target = detect_sqlite_target(out_dir, &agents_root);
+    #[cfg(feature = "sqlite")]
+    let mut sql_events: Vec<String> = Vec::new();
+    let mut push_event = |write: &mut dyn FnMut(&mut dyn Write) -> Result<()>| -> Result<()> {
+        #[cfg(feature = "sqlite")]
+        if sqlite_target.is_some() {
+            let mut buf = Vec::new();
+            write(&mut buf)?;
+            sql_events.push(String::from_utf8(buf)?);
+            return Ok(());
+        }
+        lines.push_with(|w| write(w))
+    };
     let native = super::replay::Native::new(session, &new_id);
-    lines.push_with(|w| {
+    push_event(&mut |w| {
         if native.header(session, w, &new_id, &cwd_str)? {
             return Ok(());
         }
         let mut header = ObjectWriter::new(w)?;
         header.field("type", "session")?;
-        header.field("version", 3)?;
+        header.field("version", 4)?;
         header.field("id", &new_id)?;
         header.field("timestamp", &created_iso)?;
         if let Some(parent) = &session.lineage.forked_from {
@@ -178,7 +192,7 @@ pub(super) fn emit_after_stage(
         .as_deref()
         .filter(|t| !t.trim().is_empty() && !native.has_title_record(session))
     {
-        lines.push_with(|w| {
+        push_event(&mut |w| {
             let mut row = ObjectWriter::new(w)?;
             row.field("type", "session_info")?;
             row.field("id", native.generated_id("title"))?;
@@ -238,7 +252,7 @@ pub(super) fn emit_after_stage(
                 parent.clone()
             };
             let mut replayed = false;
-            lines.push_with(|w| {
+            push_event(&mut |w| {
                 if first_part {
                     if let Some(group) = native.record(&session.messages[index..], w, opts.thinking, &resolver)? {
                         consumed = group;
@@ -305,6 +319,23 @@ pub(super) fn emit_after_stage(
         }
         index += consumed;
     }
+    drop(push_event);
+    let session_key = canonical_session_key(session, &new_id);
+    #[cfg(feature = "sqlite")]
+    if let Some(db_path) = sqlite_target {
+        after_stage()?;
+        return emit_to_sqlite(
+            session,
+            &db_path,
+            opts,
+            &new_id,
+            &session_key,
+            label.as_deref(),
+            &cwd_str,
+            created,
+            &sql_events,
+        );
+    }
     // All source demands complete before opening the transcript or changing its index.
     fs::create_dir_all(&sessions_dir).with_context(|| format!("creating {}", sessions_dir.display()))?;
     let index_path = sessions_dir.join("sessions.json");
@@ -339,7 +370,10 @@ pub(super) fn emit_after_stage(
         "updatedAt".into(),
         json!(epoch_ms(session.updated_at.or(session.created_at))),
     );
-    index.insert(new_id.clone(), Value::Object(entry));
+    if session_key != new_id {
+        index.remove(&new_id);
+    }
+    index.insert(session_key, Value::Object(entry));
     let mut index_stage = crate::harness::store::bytes::ByteStage::new();
     serde_json::to_writer_pretty(&mut index_stage, &index)?;
     // The transcript and its index entry publish as one set, the index last: a crash between
@@ -359,6 +393,189 @@ pub(super) fn emit_after_stage(
     Ok(EmitResult {
         path: file_path,
         new_id: new_id.clone(),
+        resume_hint: Some(format!(
+            "openclaw agent --session-id {new_id} --message \"<your prompt>\" --local"
+        )),
+    })
+}
+
+fn canonical_session_key(session: &Session, new_id: &str) -> String {
+    if let Some(existing) = session
+        .extra
+        .get("openclaw")
+        .and_then(|v| v.get("session_key"))
+        .and_then(Value::as_str)
+        .filter(|k| k.starts_with("agent:"))
+    {
+        if new_id == session.id {
+            return existing.to_string();
+        }
+        if let Some(prefix) = existing.strip_suffix(&session.id) {
+            if prefix.ends_with(':') {
+                return format!("{prefix}{new_id}");
+            }
+        }
+    }
+    format!("agent:main:{new_id}")
+}
+
+#[cfg(feature = "sqlite")]
+fn detect_sqlite_target(out_dir: &Path, agents_root: &Path) -> Option<std::path::PathBuf> {
+    if out_dir.extension().and_then(|e| e.to_str()) == Some("sqlite") {
+        return Some(out_dir.to_path_buf());
+    }
+    for candidate in [
+        agents_root.join("main/agent/openclaw-agent.sqlite"),
+        out_dir.join("agent/openclaw-agent.sqlite"),
+        out_dir.join("openclaw-agent.sqlite"),
+    ] {
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    let agent_dir = agents_root.join("main/agent");
+    if let Ok(entries) = fs::read_dir(&agent_dir) {
+        let mut dbs: Vec<std::path::PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.is_file()
+                    && p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("openclaw-agent") && n.ends_with(".sqlite"))
+            })
+            .collect();
+        dbs.sort();
+        if let Some(first) = dbs.into_iter().next() {
+            return Some(first);
+        }
+    }
+    None
+}
+
+#[cfg(feature = "sqlite")]
+#[allow(clippy::too_many_arguments)]
+fn emit_to_sqlite(
+    session: &Session,
+    db_path: &Path,
+    opts: &EmitOptions,
+    new_id: &str,
+    session_key: &str,
+    label: Option<&str>,
+    cwd_str: &str,
+    created: chrono::DateTime<Utc>,
+    events: &[String],
+) -> Result<EmitResult> {
+    if let Some(parent) = db_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let mut conn = rusqlite::Connection::open(db_path).with_context(|| format!("opening {}", db_path.display()))?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    conn.execute_batch(
+        "PRAGMA foreign_keys = ON;
+         CREATE TABLE IF NOT EXISTS session_nodes (
+           session_key TEXT NOT NULL PRIMARY KEY, current_session_id TEXT NOT NULL,
+           entry_json TEXT NOT NULL, legacy_acp_migration_json TEXT,
+           entry_valid INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL, status TEXT,
+           created_at INTEGER, parent_session_key TEXT, spawned_by TEXT, fork_source_session_key TEXT,
+           fork_source_session_id TEXT, fork_source_entry_id TEXT, label TEXT, display_name TEXT,
+           category TEXT, icon TEXT, pinned_at INTEGER, archived_at INTEGER, last_read_at INTEGER,
+           last_interaction_at INTEGER, last_activity_at INTEGER) STRICT;
+         CREATE TABLE IF NOT EXISTS session_windows (
+           session_id TEXT NOT NULL PRIMARY KEY, session_key TEXT NOT NULL, previous_session_id TEXT,
+           reason TEXT, session_scope TEXT NOT NULL DEFAULT 'conversation', created_at INTEGER NOT NULL,
+           updated_at INTEGER NOT NULL, transcript_updated_at INTEGER DEFAULT NULL,
+           transcript_observed_at INTEGER DEFAULT NULL, started_at INTEGER, ended_at INTEGER, status TEXT,
+           chat_type TEXT, channel TEXT, account_id TEXT, primary_conversation_id TEXT,
+           model_provider TEXT, model TEXT, agent_harness_id TEXT, parent_session_key TEXT,
+           spawned_by TEXT, display_name TEXT,
+           FOREIGN KEY (session_key) REFERENCES session_nodes(session_key) ON DELETE CASCADE) STRICT;
+         CREATE TABLE IF NOT EXISTS transcript_events (
+           session_id TEXT NOT NULL, seq INTEGER NOT NULL, event_json TEXT,
+           created_at INTEGER NOT NULL, PRIMARY KEY (session_id, seq),
+           FOREIGN KEY (session_id) REFERENCES session_windows(session_id) ON DELETE CASCADE) STRICT;",
+    )
+    .with_context(|| format!("initializing OpenClaw SQLite schema in {}", db_path.display()))?;
+
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let exists: bool = tx
+        .query_row("SELECT 1 FROM session_windows WHERE session_id = ?1", [new_id], |_| {
+            Ok(true)
+        })
+        .unwrap_or(false);
+    if exists && !opts.force {
+        return Err(crate::publish::Exists {
+            path: db_path.to_path_buf(),
+            hint: "",
+        }
+        .into());
+    }
+    let created_ms = created.timestamp_millis();
+    let updated_ms = epoch_ms(session.updated_at.or(session.created_at));
+    let spawned_by = session
+        .extra
+        .get("openclaw")
+        .and_then(|v| v.get("spawned_by"))
+        .and_then(Value::as_str);
+    let mut entry_obj = Map::new();
+    entry_obj.insert("sessionId".into(), json!(new_id));
+    if let Some(label) = label {
+        entry_obj.insert("label".into(), json!(label));
+    }
+    if !cwd_str.is_empty() {
+        entry_obj.insert("cwd".into(), json!(cwd_str));
+    }
+    entry_obj.insert("updatedAt".into(), json!(updated_ms));
+    let entry_json = serde_json::to_string(&entry_obj)?;
+
+    if exists {
+        tx.execute("DELETE FROM transcript_events WHERE session_id = ?1", [new_id])?;
+    }
+    tx.execute(
+        "INSERT INTO session_nodes (session_key, current_session_id, entry_json, entry_valid, updated_at, created_at, spawned_by, label, display_name)
+         VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6, ?7, ?7)
+         ON CONFLICT(session_key) DO UPDATE SET
+           current_session_id = excluded.current_session_id,
+           entry_json = excluded.entry_json,
+           entry_valid = 1,
+           updated_at = excluded.updated_at,
+           spawned_by = COALESCE(excluded.spawned_by, session_nodes.spawned_by),
+           label = COALESCE(excluded.label, session_nodes.label),
+           display_name = COALESCE(excluded.display_name, session_nodes.display_name)",
+        rusqlite::params![session_key, new_id, entry_json, updated_ms, created_ms, spawned_by, label],
+    )?;
+    tx.execute(
+        "INSERT INTO session_windows (session_id, session_key, created_at, updated_at, transcript_updated_at, model, spawned_by, display_name)
+         VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?6, ?7)
+         ON CONFLICT(session_id) DO UPDATE SET
+           session_key = excluded.session_key,
+           updated_at = excluded.updated_at,
+           transcript_updated_at = excluded.transcript_updated_at,
+           model = excluded.model,
+           spawned_by = excluded.spawned_by,
+           display_name = excluded.display_name",
+        rusqlite::params![
+            new_id,
+            session_key,
+            created_ms,
+            updated_ms,
+            session.model.as_deref(),
+            spawned_by,
+            label
+        ],
+    )?;
+    {
+        let mut insert_ev = tx.prepare(
+            "INSERT INTO transcript_events (session_id, seq, event_json, created_at) VALUES (?1, ?2, ?3, ?4)",
+        )?;
+        for (seq, ev) in events.iter().enumerate() {
+            insert_ev.execute(rusqlite::params![new_id, seq as i64, ev, created_ms])?;
+        }
+    }
+    tx.commit()?;
+    Ok(EmitResult {
+        path: db_path.to_path_buf(),
+        new_id: new_id.to_string(),
         resume_hint: Some(format!(
             "openclaw agent --session-id {new_id} --message \"<your prompt>\" --local"
         )),

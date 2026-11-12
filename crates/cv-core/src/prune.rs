@@ -1951,8 +1951,27 @@ fn anchored_window_tokens(parsed: &[Option<Decision>], before: &[Option<Est>], w
         .filter_map(main)
         .find_map(|v| v.facts.model.as_deref().filter(|m| *m != "<synthetic>"))
         .unwrap_or("");
-    let scale = crate::ir::tokenizer_scale(model);
     let size = Est::total;
+    let scale = if !model.to_ascii_lowercase().contains("claude-") && responses.len() >= 2 {
+        let (mut est_delta, mut rec_delta) = (0u64, 0u64);
+        for pair in responses.windows(2) {
+            let ((a, ta), (b, tb)) = (pair[0], pair[1]);
+            if tb > ta {
+                let span_est: u64 = lines(a, b).map(|i| size(pre(i))).sum();
+                if span_est > 0 {
+                    est_delta = est_delta.saturating_add(span_est);
+                    rec_delta = rec_delta.saturating_add(tb - ta);
+                }
+            }
+        }
+        if est_delta >= 128 && rec_delta > 0 {
+            (est_delta as f64 / rec_delta as f64).clamp(0.5, 2.5)
+        } else {
+            crate::ir::tokenizer_scale(model)
+        }
+    } else {
+        crate::ir::tokenizer_scale(model)
+    };
     let signature_credit = if SIGNATURES_COUNTED.contains(&model) {
         SIGNATURE_CREDIT
     } else {

@@ -119,7 +119,6 @@ fn load_bounded(path: &Path, selected: Option<&str>, admission_bytes: usize) -> 
         }
         // Every conversation's first accepted range, for a selected read's index.
         let mut offsets: HashMap<String, (u64, u64)> = HashMap::new();
-        let mut shapes = [false; 2];
         let mut entries = Vec::new();
         let mut selected_entry = None;
         let mut payload_charge = key.capacity().saturating_add(source.metadata_bytes());
@@ -129,16 +128,20 @@ fn load_bounded(path: &Path, selected: Option<&str>, admission_bytes: usize) -> 
         SCANS.lock().unwrap().push(key.clone());
         let scanned = source.read(ReadInput::Document, Validation::Syntax, |values| {
             let values = values.accepted_array()?;
+            let mut allow_discovery = true;
             for (position, view) in values.into_iter().flatten().enumerate() {
-                let Some(view) = view? else { continue };
+                let Some(view) = view? else {
+                    if position == 0 {
+                        allow_discovery = false;
+                    }
+                    continue;
+                };
                 let Some(record) = Fields::parse(view, CONVERSATION_FIELDS)? else {
                     continue;
                 };
-                // Account archives are assumed uniform: only record zero selects the export
-                // shape. A missing discriminator there leaves the archive unrecognized.
-                if position == 0 {
-                    shapes = [record.get("mapping").is_some(), record.get("chat_messages").is_some()];
-                }
+                // Sniff each valid element individually so a metadata/stub first element or mixed export
+                // never blinds discovery for subsequent conversations in the archive.
+                let elem_shapes = [record.get("mapping").is_some(), record.get("chat_messages").is_some()];
                 let Some(id) = record
                     .get("conversation_id")
                     .or_else(|| record.get("id"))
@@ -173,9 +176,11 @@ fn load_bounded(path: &Path, selected: Option<&str>, admission_bytes: usize) -> 
                     continue;
                 }
                 let mut refs = [None, None];
-                for kind in [Kind::ChatGpt, Kind::Claude] {
-                    if shapes[slot(kind)] {
-                        refs[slot(kind)] = Some(view_ref(kind, Path::new(""), &record, &id)?);
+                if allow_discovery {
+                    for kind in [Kind::ChatGpt, Kind::Claude] {
+                        if elem_shapes[slot(kind)] {
+                            refs[slot(kind)] = Some(view_ref(kind, Path::new(""), &record, &id)?);
+                        }
                     }
                 }
                 payload_charge = payload_charge.saturating_add(id.capacity());
@@ -540,7 +545,7 @@ pub(super) fn stream(kind: Kind, r: &SessionRef, opts: &Demand, sink: &mut dyn M
                     }
                     continue;
                 }
-                if let Some(message) = build_message(kind, view, true, &source, &resolver, &mut calls)? {
+                if let Some(message) = build_message(kind, view, true, Some(&source), &resolver, &mut calls)? {
                     if message.role == Role::User {
                         session.title = text_summary(
                             message.content.iter().filter_map(|b| match b {
@@ -558,7 +563,7 @@ pub(super) fn stream(kind: Kind, r: &SessionRef, opts: &Demand, sink: &mut dyn M
         sink.meta(&session);
         let mut calls = HashMap::new();
         for view in nodes.iter()? {
-            if let Some(message) = build_message(kind, view?, opts.spans, &source, &resolver, &mut calls)? {
+            if let Some(message) = build_message(kind, view?, opts.spans, Some(&source), &resolver, &mut calls)? {
                 let started = std::time::Instant::now();
                 let flow = sink.try_message(message)?;
                 archive.source.check_after(started)?;
@@ -571,11 +576,108 @@ pub(super) fn stream(kind: Kind, r: &SessionRef, opts: &Demand, sink: &mut dyn M
         Ok(session)
     })
 }
+
+/// Parse all ChatGPT and/or Claude.ai export conversations from an in-memory JSON array or object
+/// (used by [`crate::ingest`], wasm-safe).
+pub(super) fn parse_all_str(text: &str) -> Result<Vec<Session>> {
+    use crate::harness::store::document::range::RangeSource;
+    let source = RangeSource::text(None, text, 0, false);
+    let Some(root_val) = source.accept(source.range(), Validation::Syntax)? else {
+        return Ok(Vec::new());
+    };
+    let root = JsonView::of(&source, root_val);
+    let mut out = Vec::new();
+    let parse_one = |view: JsonView<'_>, out: &mut Vec<Session>| -> Result<()> {
+        let Some(conv) = Fields::parse(view, CONVERSATION_FIELDS)? else {
+            return Ok(());
+        };
+        let kind = if conv.get("mapping").is_some() {
+            Kind::ChatGpt
+        } else if conv.get("chat_messages").is_some() {
+            Kind::Claude
+        } else {
+            return Ok(());
+        };
+        let Some(id) = conv
+            .get("conversation_id")
+            .or_else(|| conv.get("id"))
+            .or_else(|| conv.get("uuid"))
+            .map(|v| -> Result<Option<String>> {
+                if v.is_string()? {
+                    Ok(v.resolve()?.as_str().map(str::to_owned))
+                } else {
+                    Ok(None)
+                }
+            })
+            .transpose()?
+            .flatten()
+            .filter(|s| !s.is_empty())
+        else {
+            return Ok(());
+        };
+        let r = view_ref(kind, Path::new(""), &conv, &id)?;
+        let mut session = Session::new(&id, kind.harness());
+        session.title = r.title;
+        session.created_at = r.created_at;
+        session.updated_at = r.updated_at;
+        session.model = conv.string("default_model_slug")?.filter(|s| !s.is_empty());
+        let nodes = Nodes::new(kind, &conv)?;
+        let resolver = Resolver::new(None);
+        if session.title.is_none() {
+            let mut calls = HashMap::new();
+            for nview in nodes.iter()? {
+                let nview = nview?;
+                if node_role(kind, nview)?.as_deref().map(role_from_str) != Some(Role::User) {
+                    continue;
+                }
+                if kind == Kind::ChatGpt {
+                    if let Some(title) = chatgpt_title(nview, &resolver)? {
+                        session.title = title;
+                        break;
+                    }
+                    continue;
+                }
+                if let Some(message) = build_message(kind, nview, false, None, &resolver, &mut calls)? {
+                    if message.role == Role::User {
+                        session.title = text_summary(
+                            message.content.iter().filter_map(|b| match b {
+                                Block::Text { text } => Some(text),
+                                _ => None,
+                            }),
+                            &resolver,
+                            true,
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+        let mut calls = HashMap::new();
+        for nview in nodes.iter()? {
+            if let Some(message) = build_message(kind, nview?, false, None, &resolver, &mut calls)? {
+                session.messages.push(message);
+            }
+        }
+        out.push(session);
+        Ok(())
+    };
+    if let Some(arr) = root.accepted_array()? {
+        for item in arr {
+            if let Some(view) = item? {
+                parse_one(view, &mut out)?;
+            }
+        }
+    } else {
+        parse_one(root, &mut out)?;
+    }
+    Ok(out)
+}
+
 fn build_message(
     kind: Kind,
     view: JsonView<'_>,
     spans: bool,
-    source: &JsonSource,
+    source: Option<&JsonSource>,
     resolver: &Resolver,
     calls: &mut HashMap<String, String>,
 ) -> Result<Option<Message>> {
@@ -653,7 +755,7 @@ fn claude_message(view: JsonView<'_>, spans: bool) -> Result<Option<Message>> {
 fn chatgpt_message(
     view: JsonView<'_>,
     spans: bool,
-    source: &JsonSource,
+    source: Option<&JsonSource>,
     resolver: &Resolver,
     calls: &mut HashMap<String, String>,
 ) -> Result<Option<Message>> {
@@ -791,12 +893,12 @@ fn chatgpt_title(view: JsonView<'_>, resolver: &Resolver) -> Result<Option<Optio
 pub(super) fn chatgpt_text(
     r: Option<&Fields<'_>>,
     spans: bool,
-    source: &JsonSource,
+    source: Option<&JsonSource>,
     resolver: &Resolver,
 ) -> Result<Text> {
     let Some(r) = r else { return Ok(Text::default()) };
     if let Some(parts) = r.get("parts").map(JsonView::array).transpose()?.flatten() {
-        if spans {
+        if let (true, Some(source)) = (spans, source) {
             let mut selected =
                 parts.filter_map(
                     |part| match part.and_then(|part| Ok(part.is_string()?.then_some(part))) {
@@ -983,5 +1085,41 @@ mod tests {
             "whole archive syntax must pass before callbacks"
         );
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn per_element_sniffing_discovers_conversations_after_stub_zero_and_mixed_shapes() -> Result<()> {
+        let world = crate::test_world("export-per-element-sniff");
+        let path = world.base.join("conversations.json");
+        let archive = serde_json::json!([
+            { "id": "stub-no-discriminator", "title": "metadata header" },
+            { "uuid": "claude-1", "name": "Claude Chat", "chat_messages": [{ "sender": "human", "text": "hello claude" }] },
+            {
+                "id": "gpt-1",
+                "title": "ChatGPT Chat",
+                "current_node": "n1",
+                "mapping": {
+                    "n1": {
+                        "id": "n1",
+                        "parent": null,
+                        "message": {
+                            "id": "n1",
+                            "author": { "role": "user" },
+                            "content": { "parts": ["hello gpt"] }
+                        }
+                    }
+                }
+            }
+        ]);
+        std::fs::write(&path, serde_json::to_vec(&archive)?)?;
+
+        let claude_disc = discover(Kind::Claude, vec![path.clone()]);
+        assert_eq!(claude_disc.refs.len(), 1);
+        assert_eq!(claude_disc.refs[0].id, "claude-1");
+
+        let gpt_disc = discover(Kind::ChatGpt, vec![path]);
+        assert_eq!(gpt_disc.refs.len(), 1);
+        assert_eq!(gpt_disc.refs[0].id, "gpt-1");
+        Ok(())
     }
 }

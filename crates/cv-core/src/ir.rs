@@ -1470,6 +1470,26 @@ pub const BLOCK_TOKENS: u64 = 12;
 /// [`TokenKind::Marker`].
 const MARKER_PREFIX: &str = crate::prune::MARKER_PREFIX;
 
+/// Effective byte weight of UTF-8 text for fallback token estimation: each ASCII byte weighs 1
+/// and each multi-byte Unicode scalar weighs 2 (continuation bytes `10xxxxxx` weigh 0).
+///
+/// Raw UTF-8 byte division overcounts 3-byte CJK / box-drawing characters by 1.5x–3x and 4-byte
+/// emoji by 2x–4x relative to BPE tokenizers. Counting lead bytes as 2 and continuation bytes as 0
+/// keeps 1-byte ASCII and 2-byte Latin/Greek scalars identical to `bytes.len()`, cuts 3-byte and
+/// 4-byte scalar inflation to 2 effective bytes per codepoint, and stays strictly additive across
+/// arbitrary streaming byte-chunk splits.
+pub fn utf8_effective_bytes(bytes: &[u8]) -> usize {
+    let mut total = 0usize;
+    for &b in bytes {
+        if b < 0x80 {
+            total += 1;
+        } else if (b & 0xC0) != 0x80 {
+            total += 2;
+        }
+    }
+    total
+}
+
 /// Byte-estimated tokens for `len` bytes of `kind` (ceiling). The one arithmetic behind every
 /// token estimate cv prints.
 pub fn est_tokens_bytes(len: usize, kind: TokenKind) -> u64 {
@@ -1529,13 +1549,13 @@ impl StrTokens {
                     }
                 }
             } else if let Some(at) = memchr::memmem::find(rest, prefix) {
-                self.plain += at;
+                self.plain += utf8_effective_bytes(&rest[..at]);
                 rest = &rest[at..];
                 self.in_marker = true;
             } else {
                 // A prefix may straddle the next chunk: hold back its longest possible start.
                 let keep = (prefix.len() - 1).min(rest.len());
-                self.plain += rest.len() - keep;
+                self.plain += utf8_effective_bytes(&rest[..rest.len() - keep]);
                 self.carry = rest[rest.len() - keep..].to_vec();
                 return;
             }
@@ -1543,7 +1563,8 @@ impl StrTokens {
     }
 
     pub fn tokens(&self) -> u64 {
-        est_tokens_bytes(self.plain + self.carry.len(), self.kind) + est_tokens_bytes(self.marker, TokenKind::Marker)
+        est_tokens_bytes(self.plain + utf8_effective_bytes(&self.carry), self.kind)
+            + est_tokens_bytes(self.marker, TokenKind::Marker)
     }
 }
 
@@ -1560,24 +1581,136 @@ impl std::io::Write for StrTokens {
 /// How much sparser a model's tokenizer is than the one [`TokenKind`] is calibrated for:
 /// 1.35 for the Claude 4.6-and-earlier tokenizer (claude-opus-4-6, -sonnet-4-6, -opus-4-5,
 /// -haiku-4-5, -sonnet-4-5 measured 3.77 bytes/token on prose where 4.7 and later measured 2.74),
-/// 1 otherwise, including unknown models.
+/// model-family ratios for OpenAI/Codex (`o200k_base`), Gemini, Qwen, Grok, and DeepSeek/Kimi/GLM,
+/// and 1.0 otherwise (including Claude >= 4.7 and unknown models).
 pub fn tokenizer_scale(model: &str) -> f64 {
-    let Some(rest) = model.strip_prefix("claude-") else {
-        return 1.0;
-    };
-    let mut parts = rest.split('-').skip_while(|p| p.parse::<u32>().is_err() || p.len() > 2);
-    let (Some(major), minor) = (parts.next().and_then(|p| p.parse::<u32>().ok()), parts.next()) else {
-        return 1.0;
-    };
-    // A dated id (`claude-opus-4-20250514`) or a missing minor is the .0 release.
-    let minor = minor
-        .filter(|m| m.len() <= 2)
-        .and_then(|m| m.parse::<u32>().ok())
-        .unwrap_or(0);
-    if major < 4 || (major == 4 && minor <= 6) {
-        1.35
+    let base = model.rsplit_once('/').map_or(model, |(_, m)| m);
+    let lower = base.to_ascii_lowercase();
+    if let Some(rest) = lower.strip_prefix("claude-") {
+        let mut parts = rest.split('-').skip_while(|p| p.parse::<u32>().is_err() || p.len() > 2);
+        let (Some(major), minor) = (parts.next().and_then(|p| p.parse::<u32>().ok()), parts.next()) else {
+            return 1.0;
+        };
+        // A dated id (`claude-opus-4-20250514`) or a missing minor is the .0 release.
+        let minor = minor
+            .filter(|m| m.len() <= 2)
+            .and_then(|m| m.parse::<u32>().ok())
+            .unwrap_or(0);
+        return if major < 4 || (major == 4 && minor <= 6) {
+            1.35
+        } else {
+            1.0
+        };
+    }
+    if lower.starts_with("gpt-3.5")
+        || lower == "gpt-4"
+        || lower.starts_with("gpt-4-")
+        || lower.starts_with("gpt-4.")
+        || lower.starts_with("gpt-4o")
+        || lower == "gpt-5"
+        || lower.starts_with("gpt-5-")
+        || lower.starts_with("gpt-5.")
+        || lower.starts_with("chatgpt-4o")
+        || lower == "o1"
+        || lower.starts_with("o1-")
+        || lower == "o3"
+        || lower.starts_with("o3-")
+        || lower == "o4"
+        || lower.starts_with("o4-")
+        || lower.starts_with("codex")
+    {
+        return 1.25;
+    }
+    if lower.starts_with("gemini-") {
+        return 1.30;
+    }
+    if lower.starts_with("qwen")
+        || lower.starts_with("grok-")
+        || lower.starts_with("grok2")
+        || lower.starts_with("grok3")
+        || lower.starts_with("grok4")
+    {
+        return 1.20;
+    }
+    if lower.starts_with("deepseek")
+        || lower.starts_with("kimi")
+        || lower.starts_with("moonshot")
+        || lower.starts_with("glm-")
+        || lower.starts_with("mistral-")
+        || lower.starts_with("codestral")
+        || lower.starts_with("devstral")
+    {
+        return 1.18;
+    }
+    1.0
+}
+
+/// Calibrate [`tokenizer_scale`] empirically for `session` against recorded [`Usage::prompt_tokens`]
+/// deltas across uncompacted turns across any harness that reports usage, falling back to
+/// model-family [`tokenizer_scale`] when fewer than two comparable prompt snapshots exist.
+pub fn calibrated_tokenizer_scale(session: &Session) -> f64 {
+    let fallback_model = session
+        .model
+        .as_deref()
+        .filter(|m| !m.is_empty() && *m != "<synthetic>")
+        .or_else(|| {
+            session
+                .messages
+                .iter()
+                .rev()
+                .find_map(|m| m.model.as_deref().filter(|s| !s.is_empty() && *s != "<synthetic>"))
+        });
+    let fallback = fallback_model.map_or(1.0, tokenizer_scale);
+
+    let mut prev: Option<(usize, u64)> = None;
+    let mut total_est_delta = 0u64;
+    let mut total_rec_delta = 0u64;
+
+    for (idx, msg) in session.messages.iter().enumerate() {
+        if msg.kind == MessageKind::CompactionSummary || msg.kind == MessageKind::CompactionBoundary {
+            prev = None;
+            continue;
+        }
+        if !msg.is_model_visible() || msg.kind == MessageKind::SubagentReturn {
+            continue;
+        }
+        let Some(prompt) = msg.usage.as_ref().map(Usage::prompt_tokens).filter(|&p| p > 0) else {
+            continue;
+        };
+        if let Some((start_idx, start_prompt)) = prev {
+            if prompt > start_prompt {
+                let mut span_est = 0u64;
+                let mut valid = true;
+                for between in &session.messages[start_idx..idx] {
+                    if !between.is_model_visible() || between.kind == MessageKind::SubagentReturn {
+                        continue;
+                    }
+                    for block in &between.content {
+                        match est_tokens(block) {
+                            Ok(t) => span_est = span_est.saturating_add(t),
+                            Err(_) => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !valid {
+                        break;
+                    }
+                }
+                if valid && span_est > 0 {
+                    total_est_delta = total_est_delta.saturating_add(span_est);
+                    total_rec_delta = total_rec_delta.saturating_add(prompt - start_prompt);
+                }
+            }
+        }
+        prev = Some((idx, prompt));
+    }
+
+    if total_est_delta >= 64 && total_rec_delta > 0 {
+        (total_est_delta as f64 / total_rec_delta as f64).clamp(0.5, 2.5)
     } else {
-        1.0
+        fallback
     }
 }
 
@@ -1587,7 +1720,11 @@ pub fn tokenizer_scale(model: &str) -> f64 {
 /// nothing for a file reference. Shared by doctor and distill; provider-reported usage statistics
 /// use [`Usage`] instead.
 pub fn est_tokens(block: &Block) -> anyhow::Result<u64> {
-    est_tokens_with(block, |text| Ok(text.len()))
+    est_tokens_with(block, |text| {
+        Ok(text
+            .inline_str()
+            .map_or_else(|| text.len(), |s| utf8_effective_bytes(s.as_bytes())))
+    })
 }
 
 /// The same estimate as [`est_tokens`] after materializing the block, without retaining its
@@ -1595,7 +1732,14 @@ pub fn est_tokens(block: &Block) -> anyhow::Result<u64> {
 /// fallback. Unavailable sources and out-of-bounds spans return errors instead of zero tokens.
 /// This is useful for byte-counting consumers such as the compaction doctor.
 pub fn est_tokens_resolved(block: &Block, resolver: &crate::lazy::Resolver) -> anyhow::Result<u64> {
-    est_tokens_with(block, |text| text.try_decoded_len(resolver))
+    est_tokens_with(block, |text| {
+        let mut eff = 0usize;
+        text.try_for_each_chunk(resolver, 64 * 1024, |chunk| {
+            eff += utf8_effective_bytes(chunk.as_bytes());
+            Ok(())
+        })?;
+        Ok(eff)
+    })
 }
 
 /// Token estimate when a lazy text/result/thinking block's decoded byte count was already observed.
@@ -2087,6 +2231,91 @@ mod tests {
         ] {
             assert_eq!(tokenizer_scale(new), 1.0, "{new}");
         }
+        assert_eq!(tokenizer_scale("gpt-4o-2024-11-20"), 1.25);
+        assert_eq!(tokenizer_scale("openai/gpt-5.2-codex"), 1.25);
+        assert_eq!(tokenizer_scale("o3-mini"), 1.25);
+        assert_eq!(tokenizer_scale("google/gemini-2.5-pro"), 1.30);
+        assert_eq!(tokenizer_scale("qwen/qwen3-coder"), 1.20);
+        assert_eq!(tokenizer_scale("grok-3"), 1.20);
+        assert_eq!(tokenizer_scale("deepseek-reasoner"), 1.18);
+    }
+
+    #[test]
+    fn utf8_effective_bytes_eliminates_cjk_and_emoji_overcount_and_streams_cleanly() {
+        let ascii = "a".repeat(300);
+        let cjk = "中".repeat(100); // 100 scalars = 300 UTF-8 bytes
+        let emoji = "🦀".repeat(100); // 100 scalars = 400 UTF-8 bytes
+        assert_eq!(utf8_effective_bytes(ascii.as_bytes()), 300);
+        assert_eq!(utf8_effective_bytes(cjk.as_bytes()), 200);
+        assert_eq!(utf8_effective_bytes(emoji.as_bytes()), 200);
+
+        let raw_cjk = est_tokens_bytes(cjk.len(), TokenKind::Text);
+        let est_cjk = est_str_tokens(&cjk, TokenKind::Text);
+        assert!(
+            est_cjk < raw_cjk,
+            "CJK prose must not pay 3 UTF-8 bytes per scalar: {est_cjk} vs {raw_cjk}"
+        );
+        assert_eq!(
+            est_tokens(&Block::Text {
+                text: cjk.clone().into()
+            })
+            .unwrap(),
+            BLOCK_TOKENS + est_cjk
+        );
+
+        // Verify 1-byte streaming invariance even when splitting inside 3-byte CJK and 4-byte emoji.
+        let mixed = format!("prefix 中文🙂 {MARKER_PREFIX}t1 tool=Read | 9B] suffix 日本語🦀");
+        let whole = est_str_tokens(&mixed, TokenKind::Text);
+        for split in 0..=mixed.len() {
+            let mut s = StrTokens::new(TokenKind::Text);
+            s.push(&mixed.as_bytes()[..split]);
+            s.push(&mixed.as_bytes()[split..]);
+            assert_eq!(s.tokens(), whole, "split at byte {split}");
+        }
+    }
+
+    #[test]
+    fn calibrated_tokenizer_scale_uses_recorded_usage_across_harnesses() {
+        let mut session = Session::new("cal-1", Harness::Codex);
+        session.model = Some("custom-model-v1".into());
+
+        let mut u1 = Message::new(Role::User);
+        u1.content.push(Block::Text {
+            text: "initial question".into(),
+        });
+        let mut a1 = Message::new(Role::Assistant);
+        // 500 ASCII bytes => ceil(500 / 2.5) = 200 tokens + 12 BLOCK_TOKENS = 212
+        a1.content.push(Block::Text {
+            text: "x".repeat(500).into(),
+        });
+        a1.usage = Some(Usage {
+            input_tokens: Some(1_000),
+            output_tokens: Some(140),
+            ..Default::default()
+        });
+
+        let mut u2 = Message::new(Role::User);
+        // 500 ASCII bytes => 212 est tokens; total span est between a1..a2 = 424
+        u2.content.push(Block::Text {
+            text: "y".repeat(500).into(),
+        });
+        let mut a2 = Message::new(Role::Assistant);
+        a2.content.push(Block::Text { text: "done".into() });
+        // Prompt grew by 300 recorded tokens (1000 -> 1300) for 424 raw estimated tokens => ~1.4133
+        a2.usage = Some(Usage {
+            input_tokens: Some(300),
+            cache_read_tokens: Some(1_000),
+            output_tokens: Some(10),
+            ..Default::default()
+        });
+
+        session.messages = vec![u1, a1, u2, a2];
+        let scale = calibrated_tokenizer_scale(&session);
+        let expected = 424.0 / 300.0;
+        assert!(
+            (scale - expected).abs() < 1e-6,
+            "expected empirical scale {expected}, got {scale}"
+        );
     }
 
     #[test]

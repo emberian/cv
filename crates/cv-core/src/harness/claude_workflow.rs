@@ -832,6 +832,9 @@ pub struct LaneWork {
 impl LaneWork {
     /// Mine a lane transcript. Rejected records are omitted; a read failure ends this
     /// best-effort recovery scan with what it found, and says so in [`LaneWork::unread`].
+    /// When the lane transcript lacks an opening user prompt (e.g. crashed before writing its
+    /// first record or launched from computed/parallel parent tool inputs), falls back to
+    /// recovering the recorded `Agent`/`Task` prompt from the parent session transcript.
     pub fn mine(path: &Path) -> Self {
         let mut miner = Miner::default();
         if let Err(error) = super::store::jsonl::for_each_record(path, |view| miner.record(view)) {
@@ -839,7 +842,21 @@ impl LaneWork {
                 miner.work.unread = Some(format!("{error:#}"));
             }
         }
+        if miner.work.prompt.is_none() {
+            miner.work.prompt = recover_prompt_from_ancestors(path);
+        }
         miner.work
+    }
+
+    /// Mine a lane transcript and, if its opening prompt is absent, recover the non-literal or
+    /// parallel prompt recorded in `parent_transcript` for `agent_id`.
+    pub fn mine_with_parent(path: &Path, parent_transcript: &Path, agent_id: Option<&str>) -> Self {
+        let mut work = Self::mine(path);
+        if work.prompt.is_none() {
+            let inferred = agent_id.map(str::to_owned).or_else(|| agent_id_from_lane_path(path));
+            work.prompt = recover_prompt_from_parent_transcript(parent_transcript, inferred.as_deref());
+        }
+        work
     }
 
     /// [`Self::mine`] over JSONL bytes.
@@ -1109,14 +1126,412 @@ fn compute_ghosts(launches: Vec<WorkflowLaunch>, states: &[Workflow]) -> Vec<Wor
         .collect()
 }
 
-/// Heuristic `meta.name` from an inline workflow script: interpret the first `name` substring
-/// as a quoted property. An earlier identifier containing `name` can hide or mimic the property.
+/// Extract `meta.name` from an inline workflow script by locating the `export const meta = { … }`
+/// (or `const meta = { … }`) object literal and scanning only its top-level (`depth == 1`)
+/// properties. Identifiers containing `name` (`rename`), sibling objects before or after `meta`,
+/// and nested `{ name: … }` objects inside `meta.phases` cannot shadow or spoof `meta.name`.
 fn meta_name(script: &str) -> Option<String> {
-    let i = script.find("name")?;
-    let rest = script[i + 4..].trim_start().strip_prefix(':')?.trim_start();
-    let quote = rest.chars().next().filter(|q| *q == '\'' || *q == '"')?;
-    let body = &rest[1..];
-    Some(body[..body.find(quote)?].to_string())
+    let block = find_meta_object(script)?;
+    extract_top_level_string_prop(block, "name")
+}
+
+fn is_js_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
+}
+
+/// Advance past a JS comment (`//…` or `/*…*/`) or string/template literal starting at `i`.
+/// Returns `Some(next_index)` if `bytes[i..]` starts one, else `None`.
+fn skip_js_trivia_or_literal(script: &str, i: usize) -> Option<usize> {
+    let bytes = script.as_bytes();
+    let b = *bytes.get(i)?;
+    if b == b'/' {
+        match bytes.get(i + 1) {
+            Some(b'/') => {
+                let end = bytes[i + 2..]
+                    .iter()
+                    .position(|&c| c == b'\n')
+                    .map_or(bytes.len(), |p| i + 2 + p + 1);
+                return Some(end);
+            }
+            Some(b'*') => {
+                let mut j = i + 2;
+                while j + 1 < bytes.len() {
+                    if bytes[j] == b'*' && bytes[j + 1] == b'/' {
+                        return Some(j + 2);
+                    }
+                    j += 1;
+                }
+                return Some(bytes.len());
+            }
+            _ => return None,
+        }
+    }
+    if matches!(b, b'\'' | b'"' | b'`') {
+        let quote = b;
+        let mut j = i + 1;
+        while j < bytes.len() {
+            if bytes[j] == b'\\' {
+                j = (j + 2).min(bytes.len());
+                continue;
+            }
+            if bytes[j] == quote {
+                return Some(j + 1);
+            }
+            j += 1;
+        }
+        return Some(bytes.len());
+    }
+    None
+}
+
+fn skip_js_ws_and_comments(script: &str, mut i: usize) -> usize {
+    let bytes = script.as_bytes();
+    while i < bytes.len() {
+        if bytes[i].is_ascii_whitespace() {
+            i += 1;
+        } else if bytes[i] == b'/' && matches!(bytes.get(i + 1), Some(b'/' | b'*')) {
+            i = skip_js_trivia_or_literal(script, i).unwrap_or(bytes.len());
+        } else {
+            break;
+        }
+    }
+    i
+}
+
+/// Locate `[export] (const|let|var) meta = { … }` and return the balanced `{ … }` slice.
+fn find_meta_object(script: &str) -> Option<&str> {
+    let bytes = script.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(next) = skip_js_trivia_or_literal(script, i) {
+            i = next;
+            continue;
+        }
+        if is_js_ident_byte(bytes[i]) {
+            let start = i;
+            while i < bytes.len() && is_js_ident_byte(bytes[i]) {
+                i += 1;
+            }
+            let word = &script[start..i];
+            if matches!(word, "const" | "let" | "var") {
+                let j = skip_js_ws_and_comments(script, i);
+                if script[j..].starts_with("meta") && !bytes.get(j + 4).is_some_and(|&c| is_js_ident_byte(c)) {
+                    let k = skip_js_ws_and_comments(script, j + 4);
+                    if bytes.get(k) == Some(&b'=') && bytes.get(k + 1) != Some(&b'=') {
+                        let brace = skip_js_ws_and_comments(script, k + 1);
+                        if bytes.get(brace) == Some(&b'{') {
+                            return balanced_braces(script, brace);
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        i += 1;
+    }
+    None
+}
+
+fn balanced_braces(script: &str, open: usize) -> Option<&str> {
+    let bytes = script.as_bytes();
+    if bytes.get(open) != Some(&b'{') {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut i = open;
+    while i < bytes.len() {
+        if let Some(next) = skip_js_trivia_or_literal(script, i) {
+            i = next;
+            continue;
+        }
+        match bytes[i] {
+            b'{' => depth += 1,
+            b'}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(&script[open..=i]);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+fn parse_js_string_literal(s: &str) -> Option<(String, usize)> {
+    let bytes = s.as_bytes();
+    let quote = *bytes.first()?;
+    if !matches!(quote, b'\'' | b'"' | b'`') {
+        return None;
+    }
+    let mut out = String::new();
+    let mut chars = s[1..].char_indices();
+    while let Some((off, ch)) = chars.next() {
+        if ch == '\\' {
+            let (_, esc) = chars.next()?;
+            match esc {
+                'n' => out.push('\n'),
+                'r' => out.push('\r'),
+                't' => out.push('\t'),
+                other => out.push(other),
+            }
+        } else if quote == b'`' && ch == '$' && s[1 + off + 1..].starts_with('{') {
+            // Computed template interpolation is not a static literal name.
+            return None;
+        } else if ch as u8 == quote && ch.is_ascii() {
+            return Some((out, 1 + off + 1));
+        } else {
+            out.push(ch);
+        }
+    }
+    None
+}
+
+fn extract_top_level_string_prop(obj: &str, target_key: &str) -> Option<String> {
+    let bytes = obj.as_bytes();
+    let mut depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut paren_depth = 0usize;
+    let mut at_prop_start = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b'/' && matches!(bytes.get(i + 1), Some(b'/' | b'*')) {
+            i = skip_js_trivia_or_literal(obj, i).unwrap_or(bytes.len());
+            continue;
+        }
+        if depth == 1 && bracket_depth == 0 && paren_depth == 0 && at_prop_start {
+            let key_match = if matches!(bytes[i], b'\'' | b'"') {
+                parse_js_string_literal(&obj[i..]).map(|(k, consumed)| (k == target_key, i + consumed))
+            } else if is_js_ident_byte(bytes[i]) {
+                let start = i;
+                let mut end = i;
+                while end < bytes.len() && is_js_ident_byte(bytes[end]) {
+                    end += 1;
+                }
+                Some((&obj[start..end] == target_key, end))
+            } else {
+                None
+            };
+            if let Some((matched, after_key)) = key_match {
+                let colon = skip_js_ws_and_comments(obj, after_key);
+                if bytes.get(colon) == Some(&b':') {
+                    let val_pos = skip_js_ws_and_comments(obj, colon + 1);
+                    if matched {
+                        return parse_js_string_literal(&obj[val_pos..]).map(|(val, _)| val);
+                    }
+                    at_prop_start = false;
+                    i = val_pos;
+                    continue;
+                }
+            }
+            at_prop_start = false;
+        }
+        if let Some(next) = skip_js_trivia_or_literal(obj, i) {
+            i = next;
+            continue;
+        }
+        match bytes[i] {
+            b'{' => {
+                depth += 1;
+                if depth == 1 {
+                    at_prop_start = true;
+                }
+            }
+            b'}' => {
+                depth = depth.saturating_sub(1);
+            }
+            b'[' => bracket_depth += 1,
+            b']' => bracket_depth = bracket_depth.saturating_sub(1),
+            b'(' => paren_depth += 1,
+            b')' => paren_depth = paren_depth.saturating_sub(1),
+            b',' if depth == 1 && bracket_depth == 0 && paren_depth == 0 => {
+                at_prop_start = true;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+fn agent_id_from_lane_path(path: &Path) -> Option<String> {
+    let stem = path.file_stem()?.to_str()?;
+    Some(stem.strip_prefix("agent-").unwrap_or(stem).to_owned())
+}
+
+fn recover_prompt_from_ancestors(path: &Path) -> Option<String> {
+    let agent_id = agent_id_from_lane_path(path);
+    for ancestor in path.ancestors() {
+        if ancestor.file_name().and_then(|n| n.to_str()) == Some("subagents") {
+            let session_dir = ancestor.parent()?;
+            let parent_transcript = session_dir.with_extension("jsonl");
+            if let Some(prompt) = recover_prompt_from_parent_transcript(&parent_transcript, agent_id.as_deref()) {
+                return Some(prompt);
+            }
+            // If this lane is under `subagents/workflows/<runId>/agent-<id>.jsonl`, also check
+            // `<sessionId>/workflows/<runId>.json` for a recorded promptPreview fallback.
+            if let Some(aid) = agent_id.as_deref() {
+                if let Some(run_dir) = path.parent() {
+                    if run_dir.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()) == Some("workflows") {
+                        if let Some(run_id) = run_dir.file_name().and_then(|n| n.to_str()) {
+                            let state_path = session_dir.join("workflows").join(format!("{run_id}.json"));
+                            if let Some(wf) = parse_state_file(&state_path) {
+                                for agent in wf.phases.iter().flat_map(|p| &p.agents).chain(&wf.orphan_agents) {
+                                    let bare = agent.agent_id.as_deref().map(|s| s.strip_prefix("agent-").unwrap_or(s));
+                                    if bare == Some(aid) {
+                                        if let Some(preview) =
+                                            agent.prompt_preview.as_ref().filter(|s| !s.trim().is_empty())
+                                        {
+                                            return Some(preview.clone());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            break;
+        }
+    }
+    None
+}
+
+/// Scan a parent Claude transcript for `Agent`/`Task` `tool_use` blocks and pair them with their
+/// `tool_result` / `toolUseResult` `agentId` outcomes to recover computed or parallel sub-agent prompts.
+fn recover_prompt_from_parent_transcript(parent_path: &Path, target_agent_id: Option<&str>) -> Option<String> {
+    use super::claude::record::{Demand, Head};
+    use super::store::document::Fields;
+
+    let mut calls: Vec<(String, String)> = Vec::new();
+    let mut by_agent_id: BTreeMap<String, String> = BTreeMap::new();
+    let target_norm = target_agent_id.map(|id| id.strip_prefix("agent-").unwrap_or(id));
+
+    let _ = super::store::jsonl::for_each_record(parent_path, |view| {
+        let Some(head) = Head::parse(view, Demand::Tools)? else {
+            return Ok(());
+        };
+        let sidecar_agent_id = view
+            .get("toolUseResult")?
+            .map(|tur| -> anyhow::Result<Option<String>> {
+                if tur.is_string()? {
+                    Ok(tur.resolve()?.as_str().and_then(extract_agent_id_from_text))
+                } else if let Some(f) = Fields::parse(tur, &["agentId"])? {
+                    Ok(f.string("agentId")?)
+                } else {
+                    Ok(None)
+                }
+            })
+            .transpose()?
+            .flatten();
+
+        let Some(blocks) = head
+            .top
+            .get("message")
+            .map(|m| Fields::parse(m, &["content"]))
+            .transpose()?
+            .flatten()
+            .and_then(|m| m.get("content"))
+            .map(|c| c.array())
+            .transpose()?
+            .flatten()
+        else {
+            return Ok(());
+        };
+        for block in blocks {
+            let Some(b) = Fields::parse(block?, &["type", "id", "name", "input", "tool_use_id", "content"])? else {
+                continue;
+            };
+            match b.string("type")?.as_deref() {
+                Some("tool_use") => {
+                    let name = b.string("name")?.unwrap_or_default();
+                    if matches!(name.as_str(), "Agent" | "Task" | "dispatch_agent") {
+                        let Some(id) = b.string("id")? else { continue };
+                        let prompt = b
+                            .get("input")
+                            .map(|i| Fields::parse(i, &["prompt"]))
+                            .transpose()?
+                            .flatten()
+                            .map(|i| i.string("prompt"))
+                            .transpose()?
+                            .flatten()
+                            .filter(|p| !p.trim().is_empty());
+                        if let Some(prompt) = prompt {
+                            calls.push((id, prompt));
+                        }
+                    }
+                }
+                Some("tool_result") => {
+                    let Some(tuid) = b.string("tool_use_id")? else {
+                        continue;
+                    };
+                    let Some((_, prompt)) = calls.iter().find(|(id, _)| id == &tuid) else {
+                        continue;
+                    };
+                    let mut aid = sidecar_agent_id.clone();
+                    if aid.is_none() {
+                        if let Some(content) = b.get("content") {
+                            let text = if content.is_string()? {
+                                content.resolve()?.as_str().map(str::to_owned)
+                            } else if let Some(parts) = content.array()? {
+                                let mut joined = String::new();
+                                for part in parts {
+                                    if let Some(Some(t)) =
+                                        Fields::parse(part?, &["text"])?.map(|p| p.string("text")).transpose()?
+                                    {
+                                        joined.push_str(&t);
+                                        joined.push('\n');
+                                    }
+                                }
+                                Some(joined)
+                            } else {
+                                None
+                            };
+                            aid = text.as_deref().and_then(extract_agent_id_from_text);
+                        }
+                    }
+                    if let Some(aid) = aid {
+                        let bare = aid.strip_prefix("agent-").unwrap_or(&aid).to_owned();
+                        by_agent_id.insert(bare, prompt.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    });
+
+    if let Some(target) = target_norm {
+        if let Some(prompt) = by_agent_id.remove(target) {
+            return Some(prompt);
+        }
+    }
+    // Single-spawn fallback when the parent crashed before recording the tool_result's agentId.
+    if calls.len() == 1 && by_agent_id.is_empty() {
+        return calls.pop().map(|(_, prompt)| prompt);
+    }
+    None
+}
+
+fn extract_agent_id_from_text(text: &str) -> Option<String> {
+    for marker in ["\"agentId\":\"", "\"agentId\": \"", "agentId: ", "agent_id: "] {
+        if let Some(idx) = text.find(marker) {
+            let rest = &text[idx + marker.len()..];
+            let id: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+                .collect();
+            if !id.is_empty() {
+                return Some(id);
+            }
+        }
+    }
+    None
 }
 
 /// Split a `scriptPath` basename `<name>-wf_<runId>.js` into `(name, wf_<runId>)`. Without the
@@ -1758,5 +2173,104 @@ mod tests {
         assert_eq!(w.status.as_deref(), Some("killed"));
         assert_eq!(w.error.as_deref(), Some("session limit"));
         assert_eq!(w.phases[0].agents[0].state.as_deref(), Some("progress"));
+    }
+
+    #[test]
+    fn meta_name_is_bounded_to_balanced_meta_object() {
+        // Earlier identifier containing `name`, earlier object with `name:`, nested `{ name: ... }`
+        // inside `phases` before `meta.name`, and comments/strings with unbalanced braces.
+        let script = r#"
+            const rename = { name: 'wrong-helper' };
+            // export const meta = { name: 'commented-out' }
+            const tpl = `fake { export const meta = { name: 'in-template' }`;
+            export const meta = {
+                description: "has } brace in string",
+                phases: [{ name: "nested-phase-name", title: "P1" }],
+                "name": "real-workflow-name",
+            };
+            const after = { name: "too-late" };
+        "#;
+        assert_eq!(meta_name(script).as_deref(), Some("real-workflow-name"));
+
+        // If `export const meta` has no top-level `name`, later objects do not leak in.
+        let nameless = r#"
+            export const meta = { description: "only desc", phases: [{ name: "phase-only" }] };
+            const other = { name: "leak" };
+        "#;
+        assert_eq!(meta_name(nameless), None);
+    }
+
+    #[test]
+    fn lane_work_mine_recovers_parallel_computed_prompts_from_parent_transcript() {
+        let world = crate::test_world("claude-workflow-parent-prompt-recovery");
+        let proj = world.base.join("proj");
+        let sub_dir = proj.join("sess-parent").join("subagents");
+        std::fs::create_dir_all(&sub_dir).unwrap();
+        let parent = proj.join("sess-parent.jsonl");
+
+        let parent_lines = [
+            json!({
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "tu_alpha",
+                            "name": "Agent",
+                            "input": { "description": "alpha", "prompt": "Computed prompt for ALPHA shard #1" }
+                        },
+                        {
+                            "type": "tool_use",
+                            "id": "tu_beta",
+                            "name": "Task",
+                            "input": { "description": "beta", "prompt": "Computed prompt for BETA shard #2" }
+                        }
+                    ]
+                }
+            })
+            .to_string(),
+            json!({
+                "type": "user",
+                "toolUseResult": { "agentId": "a111" },
+                "message": {
+                    "role": "user",
+                    "content": [{ "type": "tool_result", "tool_use_id": "tu_alpha", "content": "ok" }]
+                }
+            })
+            .to_string(),
+            json!({
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "tu_beta",
+                        "content": "agentId: b222\ncompleted"
+                    }]
+                }
+            })
+            .to_string(),
+        ];
+        std::fs::write(&parent, parent_lines.join("\n")).unwrap();
+
+        // Subagent transcripts crashed before recording user message (or empty/missing file).
+        let lane_alpha = sub_dir.join("agent-a111.jsonl");
+        let lane_beta = sub_dir.join("agent-b222.jsonl");
+        std::fs::write(
+            &lane_beta,
+            json!({"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"w1","name":"Write","input":{"file_path":"/tmp/out.rs"}}]}}).to_string(),
+        )
+        .unwrap();
+
+        let mined_alpha = LaneWork::mine(&lane_alpha);
+        assert_eq!(
+            mined_alpha.prompt.as_deref(),
+            Some("Computed prompt for ALPHA shard #1")
+        );
+
+        let mined_beta = LaneWork::mine(&lane_beta);
+        assert_eq!(mined_beta.prompt.as_deref(), Some("Computed prompt for BETA shard #2"));
+        assert_eq!(mined_beta.files, vec!["/tmp/out.rs".to_string()]);
     }
 }

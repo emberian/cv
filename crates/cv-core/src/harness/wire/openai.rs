@@ -38,9 +38,9 @@ pub const OPENAI: Quirks = Quirks {
     thinking_signature_mirrors_encrypted: false,
     skip_empty_thinking: false,
 };
-/// Hermes: plain, with long image references cut at 120 chars.
+/// Hermes: plain chat-completions shape, preserving full `image_url.url` / `data:` URIs intact.
 pub const HERMES: Quirks = Quirks {
-    image_ref_truncate: Some(120),
+    image_ref_truncate: None,
     ..OPENAI
 };
 /// Codex rollouts: empty text dropped, `data:` images as the inline marker.
@@ -405,9 +405,11 @@ mod tests {
         assert!(
             matches!(&codex[2], Block::Image { media_type: Some(m), data_ref: Some(r) } if m == "image/png" && r == "base64:inline")
         );
-        let long = json!([{"type": "image_url", "image_url": {"url": format!("https://x/{}", "a".repeat(200))}}]);
+        let url = format!("https://x/{}", "a".repeat(200));
+        let long = json!([{"type": "image_url", "image_url": {"url": url}}]);
         assert!(
-            matches!(&blocks_from(Some(&long), &HERMES)[0], Block::Image { data_ref: Some(r), .. } if r.chars().count() == 120)
+            matches!(&blocks_from(Some(&long), &HERMES)[0], Block::Image { data_ref: Some(r), .. } if r == &url),
+            "Hermes dialect preserves full image_url.url without 119-char truncation"
         );
         assert_eq!(blocks_from(Some(&json!("bare")), &OPENAI).len(), 1);
         assert!(blocks_from(Some(&json!("")), &OPENAI).is_empty());
