@@ -736,4 +736,61 @@ mod tests {
             |session, options, connection| write_database(session, options, "fixed", connection),
         )
     }
+
+    #[test]
+    fn hermes_preserves_long_data_uri_images_without_truncation() -> Result<()> {
+        use crate::harness::{hermes::Hermes, Adapter, Parse};
+        use crate::ir::Message;
+        let world = crate::test_world("hermes-long-data-uri");
+        let long_b64 = "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo=".repeat(12);
+        let data_uri = format!("data:image/png;base64,{long_b64}");
+        assert!(data_uri.len() > 400);
+
+        let mut s = Session::new("src", Harness::Hermes);
+        let mut u = Message::new(Role::User);
+        u.content = vec![
+            Block::Text {
+                text: "check diagram".into(),
+            },
+            Block::Image {
+                media_type: Some("image/png".into()),
+                data_ref: Some(data_uri.clone()),
+            },
+        ];
+        s.messages.push(u);
+
+        let res = emit(
+            &s,
+            &world.base,
+            &EmitOptions {
+                new_id: Some("img-hermes".into()),
+                ..Default::default()
+            },
+        )?;
+        let hermes = Hermes::with_db(res.path);
+        let refs = hermes.discover()?;
+        let parsed_first = hermes.parse(&refs[0])?;
+        assert!(parsed_first.messages[0].content.iter().any(|b| matches!(
+            b,
+            Block::Image { data_ref: Some(r), .. } if *r == data_uri && !r.contains('…')
+        )));
+
+        // Re-emitting a parsed Hermes session must keep the full data URI in SQLite too.
+        let out2 = world.base.join("rehome");
+        let res2 = emit(
+            &parsed_first,
+            &out2,
+            &EmitOptions {
+                new_id: Some("img-hermes-2".into()),
+                ..Default::default()
+            },
+        )?;
+        let hermes2 = Hermes::with_db(res2.path);
+        let parsed_second = hermes2.parse(&hermes2.discover()?[0])?;
+        assert!(parsed_second.messages[0].content.iter().any(|b| matches!(
+            b,
+            Block::Image { data_ref: Some(r), .. } if *r == data_uri
+        )));
+        Ok(())
+    }
 }

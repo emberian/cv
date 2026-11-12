@@ -12,12 +12,18 @@ use std::fs;
 use std::path::Path;
 use uuid::Uuid;
 
-/// Emit a gemini-cli legacy chat recording: `out_dir/<sessionId>.json`, a single whole-file
-/// `ConversationRecord` `{sessionId, projectHash, startTime, lastUpdated, messages[]}`. The reader
-/// (`harness/gemini.rs`) requires the file to live under a `chats/` dir to be picked up by
-/// `discover`, but `parse_all_str` / `parse` will read it directly from any path.
+/// Emit a gemini-cli chat recording: modern append-only `.jsonl` when `out_dir` names a `.jsonl`
+/// file, when the target `chats/` directory already uses `.jsonl` recordings, or when rehoming a
+/// `.jsonl` Gemini recording; otherwise `chats/session-<sessionId>.json`. Both formats round-trip
+/// through `harness/gemini.rs`.
 pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<EmitResult> {
-    stream::emit(session, out_dir, opts)
+    stream::emit(session, out_dir, opts, None)
+}
+
+/// Emit a modern append-only gemini-cli `.jsonl` recording (`chats/session-<sessionId>.jsonl`, or
+/// directly to `out_dir` if `out_dir` ends with `.jsonl`).
+pub fn emit_jsonl(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<EmitResult> {
+    stream::emit(session, out_dir, opts, Some(true))
 }
 
 mod stream;
@@ -387,6 +393,82 @@ mod checked_tests {
             .iter()
             .all(|block| !matches!(block,Block::Text {text} if text.is_lazy())));
         // Same-harness Gemini uses the existing complete/owned compatibility path.
+        Ok(())
+    }
+
+    #[test]
+    fn inline_data_uris_round_trip_and_non_inline_images_degrade_to_valid_text_parts() -> Result<()> {
+        use crate::harness::{gemini::Gemini, qwen::Qwen, Adapter, Parse};
+        let world = crate::test_world("gemini-qwen-image-fidelity");
+        let b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+        let data_uri = format!("data:image/png;base64,{b64}");
+
+        let mut session = Session::new("img-src", Harness::Claude);
+        session.cwd = Some("/synthetic/img-proj".into());
+        let mut user = Message::new(Role::User);
+        user.content = vec![
+            Block::Text { text: "inspect".into() },
+            Block::Image {
+                media_type: Some("image/png".into()),
+                data_ref: Some(data_uri.clone()),
+            },
+            Block::Image {
+                media_type: Some("image/jpeg".into()),
+                data_ref: Some("https://example.invalid/remote.jpg".into()),
+            },
+        ];
+        session.messages.push(user);
+
+        // 1. Gemini append-only `.jsonl` emit + discovery + round-trip
+        let gem_runtime = world.base.join("gemini-runtime");
+        let gem_tmp = gem_runtime.join("tmp");
+        let gem_res = emit_jsonl(
+            &session,
+            &gem_tmp,
+            &EmitOptions {
+                new_id: Some("gem-jsonl-1".into()),
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(gem_res.path.extension().and_then(|e| e.to_str()), Some("jsonl"));
+        let raw_jsonl = fs::read_to_string(&gem_res.path)?;
+        assert!(
+            !raw_jsonl.contains("\"inlineData\":{\"mimeType\":\"image/jpeg\"}"),
+            "must never emit schema-invalid inlineData missing data: {raw_jsonl}"
+        );
+        assert!(raw_jsonl.contains("[image: https://example.invalid/remote.jpg]"));
+        let gem = Gemini::with_home(&gem_runtime);
+        let gem_refs = gem.discover()?;
+        assert_eq!(gem_refs.len(), 1);
+        let gem_back = gem.parse(&gem_refs[0])?;
+        assert!(gem_back.messages[0].content.iter().any(|b| matches!(
+            b,
+            Block::Image { media_type: Some(m), data_ref: Some(r) } if m == "image/png" && *r == data_uri
+        )));
+
+        // 2. Qwen 0.25 `.jsonl` round-trip + Discovery skips base64 allocation
+        let qwen_home = world.base.join("qwen-home");
+        let qwen_res = crate::emit::emit(
+            &session,
+            Harness::Qwen,
+            &qwen_home,
+            &EmitOptions {
+                new_id: Some("qwen-img-1".into()),
+                ..Default::default()
+            },
+        )?;
+        let qwen = Qwen::with_home(&qwen_home);
+        let qwen_ref = SessionRef::new("qwen-img-1", Harness::Qwen, &qwen_res.path);
+        let qwen_disc = crate::stream::collect_with(&qwen, &qwen_ref, &crate::Demand::DISCOVERY)?;
+        assert!(qwen_disc.messages[0].content.iter().any(|b| matches!(
+            b,
+            Block::Image { media_type: Some(m), data_ref: None } if m == "image/png"
+        )));
+        let qwen_rich = qwen.parse(&qwen_ref)?;
+        assert!(qwen_rich.messages[0].content.iter().any(|b| matches!(
+            b,
+            Block::Image { media_type: Some(m), data_ref: Some(r) } if m == "image/png" && *r == data_uri
+        )));
         Ok(())
     }
 }

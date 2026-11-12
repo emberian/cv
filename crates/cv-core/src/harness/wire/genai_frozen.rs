@@ -44,7 +44,17 @@ pub(crate) fn row(mut blocks: Vec<Block>, flag: bool, resolver: &Resolver) -> Re
     let bytes = serde_json::to_vec(&blocks)?;
     Ok(json!({"resolved_sha256":crate::digest::sha256_hex(&bytes),"carriers":carriers,"response":flag}))
 }
-pub(crate) fn assert_frozen(rows: Vec<Value>, expected: &str) -> Result<()> {
+pub(crate) fn assert_frozen(rows: Vec<Value>, expected: &str, fixture_rel: &str) -> Result<()> {
+    if std::env::var_os("CV_REGEN_CORPUS").is_some() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(fixture_rel);
+        let mut text = String::new();
+        for row in &rows {
+            text.push_str(&serde_json::to_string(row)?);
+            text.push('\n');
+        }
+        std::fs::write(path, text)?;
+        return Ok(());
+    }
     let expected: Vec<Value> = expected
         .lines()
         .map(serde_json::from_str)

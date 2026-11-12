@@ -428,7 +428,7 @@ fn content_blocks(message: Option<JsonView<'_>>, demand: Demand<'_>) -> Result<V
     let discovery = matches!(demand, Demand::Discovery);
     for part in parts.into_iter().flatten() {
         let part = part?;
-        match genai::select(part, Dialect::Qwen)?.part {
+        match genai::select_with_images(part, Dialect::Qwen, !discovery)?.part {
             Some(Part::Call(call)) => {
                 let name = string(Some(call), "name")?.unwrap_or_else(|| "tool".into());
                 let id = string(Some(call), "id")?.unwrap_or_else(|| name.clone());
@@ -765,6 +765,10 @@ mod genai_contracts {
             }
             assert_eq!(std::fs::read(&path)?, bytes, "decoder changed source");
         }
-        frozen::assert_frozen(rows, include_str!("../../../tests/fixtures/wire/qwen-parts.jsonl"))
+        frozen::assert_frozen(
+            rows,
+            include_str!("../../../tests/fixtures/wire/qwen-parts.jsonl"),
+            "tests/fixtures/wire/qwen-parts.jsonl",
+        )
     }
 }

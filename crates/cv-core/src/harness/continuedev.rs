@@ -530,13 +530,52 @@ fn scan_session(path: &Path) -> Result<Option<Scan>> {
 // small helpers
 // ---------------------------------------------------------------------------
 
-/// Continue's `workspaceDirectory` may be a `file://` URI or a plain path. Normalize to a path.
+/// Continue's `workspaceDirectory` may be a `file://` URI (including `file://localhost/...`,
+/// Windows `file:///C:/...`, and percent-encoded UTF-8 like `%20`) or a plain path. Normalize to a path.
 fn workspace_to_path(s: &str) -> PathBuf {
     if let Some(rest) = s.strip_prefix("file://") {
-        // file:///Users/... -> /Users/... (drop the empty authority's leading slash group).
-        PathBuf::from(rest)
+        let path_part = rest.strip_prefix("localhost").unwrap_or(rest);
+        let decoded = percent_decode_utf8(path_part);
+        PathBuf::from(normalize_windows_drive_slash(&decoded))
     } else {
-        PathBuf::from(s)
+        PathBuf::from(normalize_windows_drive_slash(s))
+    }
+}
+
+fn percent_decode_utf8(s: &str) -> String {
+    if !s.as_bytes().contains(&b'%') {
+        return s.to_string();
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push(((h << 4) | l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(&e.into_bytes()).into_owned())
+}
+
+fn normalize_windows_drive_slash(s: &str) -> &str {
+    let b = s.as_bytes();
+    if b.len() >= 3
+        && b[0] == b'/'
+        && b[1].is_ascii_alphabetic()
+        && b[2] == b':'
+        && (b.len() == 3 || b[3] == b'/' || b[3] == b'\\')
+    {
+        &s[1..]
+    } else {
+        s
     }
 }
 
@@ -1280,5 +1319,22 @@ mod tests {
         assert_eq!(found.skipped[0].path, dir.join("sessions.json"));
         assert!(found.refs.iter().find(|r| r.id == "indexed").unwrap().title.as_deref() == Some("file title"));
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn workspace_to_path_decodes_percent_escapes_and_normalizes_windows_drives() {
+        assert_eq!(
+            workspace_to_path("file:///Users/me/My%20Project%2B1"),
+            PathBuf::from("/Users/me/My Project+1")
+        );
+        assert_eq!(
+            workspace_to_path("file://localhost/home/dev/%E9%9B%AA"),
+            PathBuf::from("/home/dev/雪")
+        );
+        assert_eq!(
+            workspace_to_path("file:///C:/Users/dev/My%20Repo"),
+            PathBuf::from("C:/Users/dev/My Repo")
+        );
+        assert_eq!(workspace_to_path("/d:/work/project"), PathBuf::from("d:/work/project"));
     }
 }

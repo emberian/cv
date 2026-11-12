@@ -30,7 +30,9 @@ fn realpath_for_claude(cwd: &Path) -> PathBuf {
     fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf())
 }
 
-/// Encode a cwd into Claude's project-dir name: leading `-`, then every `/` and `.` becomes `-`.
+/// Encode a cwd into Claude's project-dir name: leading `-`, then every non-ASCII-alphanumeric
+/// character (`/`, `.`, `_`, spaces, `@`, `+`, `:`, `\\`, …) becomes `-`, matching Claude Code's
+/// `sanitizeProjectName`.
 pub(crate) fn claude_encode_cwd(cwd: &Path) -> String {
     let s = cwd.to_string_lossy();
     // Strip a single leading '/' so the mandatory leading '-' isn't doubled.
@@ -38,10 +40,7 @@ pub(crate) fn claude_encode_cwd(cwd: &Path) -> String {
     let mut out = String::with_capacity(s.len() + 1);
     out.push('-');
     for ch in s.chars() {
-        match ch {
-            '/' | '.' => out.push('-'),
-            c => out.push(c),
-        }
+        out.push(if ch.is_ascii_alphanumeric() { ch } else { '-' });
     }
     out
 }
@@ -218,6 +217,43 @@ mod checked_verifier_tests {
             err.to_string().contains("tool_use t has no tool_result; the source"),
             "{err}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn claude_encode_cwd_sanitizes_all_non_alphanumeric_and_reuses_in_place_parent() -> Result<()> {
+        assert_eq!(
+            claude_encode_cwd(Path::new("/Users/me/my_proj@v2+build 1")),
+            "-Users-me-my-proj-v2-build-1"
+        );
+        assert_eq!(
+            claude_encode_cwd(Path::new("C:\\Users\\dev_1\\repo.ts")),
+            "-C--Users-dev-1-repo-ts"
+        );
+
+        let world = cv_testkit::World::new("claude-inplace-project-dir");
+        let projects = world.base.join("projects");
+        let custom_dir = projects.join("-legacy_custom_dir");
+        fs::create_dir_all(&custom_dir)?;
+        let src_file = custom_dir.join("orig.jsonl");
+        fs::write(&src_file, "{}\n")?;
+
+        let mut session = Session::new("orig", Harness::Claude);
+        session.cwd = Some(PathBuf::from("/Users/me/legacy_custom_dir"));
+        session.source_path = Some(src_file);
+        let mut u = crate::ir::Message::new(Role::User);
+        u.content.push(Block::Text { text: "hi".into() });
+        session.messages.push(u);
+
+        let res = emit(
+            &session,
+            &projects,
+            &EmitOptions {
+                new_id: Some("derived".into()),
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(res.path, custom_dir.join("derived.jsonl"));
         Ok(())
     }
 }

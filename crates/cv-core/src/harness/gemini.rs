@@ -42,7 +42,7 @@
 use crate::json::{ReadInput, Validation};
 mod emit;
 mod record;
-pub use emit::emit;
+pub use emit::{emit, emit_jsonl};
 
 use super::{parse_ts, Adapter};
 use crate::ir::*;
@@ -1073,6 +1073,7 @@ fn parse_chat_recording(
     let d = record::Demand {
         harness,
         source: None,
+        keep_image_data: true,
         resolver: &resolver,
     };
     let mut sink = CollectSink::default();
@@ -1207,6 +1208,7 @@ fn checkpoint(
     let parts_demand = record::Demand {
         harness,
         source: None,
+        keep_image_data: true,
         resolver: &resolver,
     };
     let mut messages = Vec::new();

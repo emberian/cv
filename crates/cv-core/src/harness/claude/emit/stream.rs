@@ -759,7 +759,17 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Emi
             out_dir.join(format!("agent-{agent}.jsonl"))
         }
         None => {
-            let project = out_dir.join(cwd.as_deref().map(claude_encode_cwd).unwrap_or_else(|| "-".into()));
+            let in_place_project = (opts.new_cwd.is_none() && session.harness == Harness::Claude)
+                .then_some(session.source_path.as_deref())
+                .flatten()
+                .and_then(|src| {
+                    src.ancestors()
+                        .skip(1)
+                        .find(|dir| dir.parent() == Some(out_dir))
+                        .map(Path::to_path_buf)
+                });
+            let project = in_place_project
+                .unwrap_or_else(|| out_dir.join(cwd.as_deref().map(claude_encode_cwd).unwrap_or_else(|| "-".into())));
             fs::create_dir_all(&project)?;
             project.join(format!("{new_id}.jsonl"))
         }
