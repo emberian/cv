@@ -189,16 +189,34 @@ def doctors(binary, root, env, baseline=None):
     opencode_shell_doctor(binary, root, env)
 
 
+SHELL_DOCTOR_CONVERSATIONAL = {
+    "total": 13421804, "tool_results": 0, "thinking": 0, "assistant_text": 0,
+    "user_text": 0, "tool_call_args": 0, "images": 0, "system_msgs": 0,
+    "system_reminders": 13421804,
+}
+
 SHELL_DOCTOR_EXPECTED = {
     "sessions": 1, "messages": 1, "compactions": 0, "auto_compactions": 0,
     "pre_tokens": [], "fixed_overhead_est": 0, "peak_context": 0,
-    "conversational": {
-        "total": 13421804, "tool_results": 0, "thinking": 0, "assistant_text": 0,
-        "user_text": 0, "tool_call_args": 0, "images": 0, "system_msgs": 0,
-        "system_reminders": 13421804,
-    },
+    "conversational": SHELL_DOCTOR_CONVERSATIONAL,
     "by_attachment": {"injected_context": 13421804},
     "tool_results_mcp": 0, "tool_results_builtin": 0, "by_tool": [],
+    "active_window": {
+        "from_compaction": False, "compacted_sessions": 0, "messages": 1, "turns": 1,
+        "current_context": None, "peak_context": 0, "first_prompt_tokens": None,
+        "reconstructed_visible_turn_tokens": 0, "system_and_tools_overhead": None,
+        "token_burn_per_turn": 13421804,
+        "conversational": {"compaction_summary": 0, **SHELL_DOCTOR_CONVERSATIONAL},
+        "by_attachment": {"injected_context": 13421804},
+        "tool_results_mcp": 0, "tool_results_builtin": 0, "by_tool": [],
+    },
+    "history": {
+        "messages": 1, "compactions": 0, "auto_compactions": 0,
+        "pre_tokens": [], "fixed_overhead_est": 0, "peak_context": 0,
+        "conversational": SHELL_DOCTOR_CONVERSATIONAL,
+        "by_attachment": {"injected_context": 13421804},
+        "tool_results_mcp": 0, "tool_results_builtin": 0, "by_tool": [],
+    },
 }
 
 
