@@ -622,7 +622,7 @@ pub(crate) fn append_cell(
     rowid: i64,
     arena: &super::bytes::ByteSource,
 ) -> Result<(u64, u64)> {
-    if let Ok(mut blob) = conn.blob_open(rusqlite::DatabaseName::Main, table, column, rowid, true) {
+    if let Ok(mut blob) = conn.blob_open(rusqlite::MAIN_DB, table, column, rowid, true) {
         return arena.append(|writer| {
             let mut buffer = [0u8; super::IO_CHUNK];
             loop {
@@ -747,7 +747,7 @@ impl Cells {
             if row.get_ref(i + 1)?.as_str_or_null()? != Some("blob") {
                 return Ok(None);
             }
-            let blob = conn.blob_open(rusqlite::DatabaseName::Main, table, column, row.get(i)?, true)?;
+            let blob = conn.blob_open(rusqlite::MAIN_DB, table, column, row.get(i)?, true)?;
             if blob.is_empty() {
                 return Ok(None);
             }
@@ -884,7 +884,7 @@ pub(crate) fn with_cell_reader<T>(
     rowid: i64,
     read: impl FnOnce(&mut dyn std::io::Read, usize) -> Result<T>,
 ) -> Result<T> {
-    let mut blob = conn.blob_open(rusqlite::DatabaseName::Main, table, column, rowid, true)?;
+    let mut blob = conn.blob_open(rusqlite::MAIN_DB, table, column, rowid, true)?;
     let len = blob.len();
     read(&mut blob, len)
 }

@@ -35,7 +35,7 @@ impl<'a> Hooks<'a> {
         // both hooks. The exclusively borrowed connection cannot execute on another thread.
         unsafe {
             ffi::sqlite3_commit_hook(connection.handle(), Some(commit), ptr);
-            ffi::sqlite3_trace_v2(connection.handle(), ffi::SQLITE_TRACE_STMT as u32, Some(trace), ptr);
+            ffi::sqlite3_trace_v2(connection.handle(), ffi::SQLITE_TRACE_STMT, Some(trace), ptr);
         }
         Self { connection, counts }
     }

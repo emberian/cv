@@ -17,7 +17,7 @@ pub(super) fn cell(conn: &Connection, cells: &Cells, table: &str, key: &str) -> 
         Ok((_, kind)) if kind == "null" => return Ok(None),
         Ok((rowid, kind)) if kind != "blob" => return cells.row(conn, table, "value", rowid),
         Ok((rowid, _)) => {
-            if let Ok(blob) = conn.blob_open(rusqlite::DatabaseName::Main, table, "value", rowid, true) {
+            if let Ok(blob) = conn.blob_open(rusqlite::MAIN_DB, table, "value", rowid, true) {
                 let mut input = LossyUtf8::new(blob);
                 return cells.append(|out| {
                     io::copy(&mut input, out)?;
@@ -144,7 +144,7 @@ mod tests {
                 .unwrap();
             if rowid {
                 assert!(conn
-                    .blob_open(rusqlite::DatabaseName::Main, "cursorDiskKV", "value", 2, true)
+                    .blob_open(rusqlite::MAIN_DB, "cursorDiskKV", "value", 2, true)
                     .is_ok());
             }
             let cells = Cells::new(&conn, &path, &Default::default(), "cursorDiskKV").unwrap();

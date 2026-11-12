@@ -594,7 +594,7 @@ fn walk_conn(conn: &Connection) -> Result<Walk> {
     use super::store::sqlite::fold_value;
     use crate::source::Rows;
     let mut stmt = conn.prepare("SELECT * FROM sessions")?;
-    let names: Vec<String> = stmt.column_names().into_iter().map(str::to_owned).collect();
+    let names: Vec<String> = stmt.column_names().map(str::to_owned).collect();
     let at = |name: &str| names.iter().position(|n| n == name);
     let id_at = at("id").context("hermes sessions without id")?;
     let (title_at, parent_at, end_at, config_at) = (
@@ -1207,7 +1207,7 @@ fn session_revision(conn: &Connection, id: &str) -> Result<crate::source::Rows> 
         {
             let mut stmt = conn.prepare("SELECT * FROM messages WHERE session_id = ?1 ORDER BY id ASC")?;
             let ncols = stmt.column_count();
-            let id_col = stmt.column_names().iter().position(|&c| c == "id");
+            let id_col = stmt.column_names().position(|c| c == "id");
             let mut rows = stmt.query([sid])?;
             while let Some(row) = rows.next()? {
                 count += 1;

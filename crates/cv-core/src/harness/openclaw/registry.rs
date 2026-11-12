@@ -322,7 +322,7 @@ fn sqlite_rows(path: &Path) -> Result<std::sync::Arc<Rows>> {
             let mut rows = stmt.query([])?;
             while let Some(row) = rows.next()? {
                 let job: Value = serde_json::from_str(row.get_ref(0)?.as_str()?)?;
-                let state = rusqlite::types::Value::from(row.get_ref(1)?);
+                let state: rusqlite::types::Value = row.get(1)?;
                 all.jobs.push((job, state));
             }
         }

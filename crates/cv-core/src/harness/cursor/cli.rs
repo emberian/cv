@@ -341,13 +341,7 @@ fn acp_metadata(path: &Path, sink: &mut dyn MessageSink) -> Option<Value> {
 }
 
 fn blob_input<'a>(conn: &'a Connection, id: &str) -> Result<rusqlite::blob::Blob<'a>> {
-    Ok(conn.blob_open(
-        rusqlite::DatabaseName::Main,
-        "blobs",
-        "data",
-        blob_rowid(conn, id)?,
-        true,
-    )?)
+    Ok(conn.blob_open(rusqlite::MAIN_DB, "blobs", "data", blob_rowid(conn, id)?, true)?)
 }
 fn blob_rowid(conn: &Connection, id: &str) -> Result<i64> {
     conn.query_row("SELECT rowid FROM blobs WHERE id=?1", [id], |row| row.get(0))

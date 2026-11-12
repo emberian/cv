@@ -861,7 +861,7 @@ mod db {
             // `SELECT *` + names, so a column that only exists in newer schemas (`metadata`,
             // 2026-05; `workspace_id`, `path`, …) is read when present and never demanded.
             let mut stmt = conn.prepare(&format!("SELECT * FROM {table} WHERE id = ?1"))?;
-            let cols: Vec<String> = stmt.column_names().iter().map(|c| c.to_string()).collect();
+            let cols: Vec<String> = stmt.column_names().map(|c| c.to_string()).collect();
             let mut rows = stmt.query(rusqlite::params![r.id])?;
             match rows.next()? {
                 Some(row) => row_to_map(&cols, row)?,
