@@ -21,14 +21,29 @@ pub(super) struct DeferredMessage {
 }
 impl DeferredMessage {
     pub(super) fn stage(mut message: Message, registry: &mut SourceRegistry) -> Self {
-        // The query has already inspected the original message. Only training rendering uses
-        // this projection; unconsumed rich sidecars/IDs/usage need not occupy the private spool.
-        message.id = None;
-        message.parent_id = None;
+        // The query has already inspected the original message. Keep `id`/`parent_id` and tool
+        // call linkage (`id`, `tool_use_id`, `tool_name`) for `Format::OpenAiTools` and active-branch
+        // trajectory selection, while dropping unconsumed rich sidecars/usage from the private spool.
+        let is_sidechain = message
+            .extra
+            .get("isSidechain")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+            || message
+                .extra
+                .get("cv")
+                .and_then(|v| v.get("inactive_branch"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
         message.timestamp = None;
         message.model = None;
         message.usage = None;
         message.extra = serde_json::Map::new();
+        if is_sidechain {
+            message
+                .extra
+                .insert("isSidechain".into(), serde_json::Value::Bool(true));
+        }
         message.complete_record = None;
         let mut sources = Vec::new();
         for (index, block) in message.content.iter_mut().enumerate() {
@@ -57,24 +72,13 @@ impl DeferredMessage {
                     *signature = None;
                     *encrypted = None;
                 }
-                Block::ToolUse {
-                    id, input, namespace, ..
-                } => {
-                    *id = String::new();
+                Block::ToolUse { input, namespace, .. } => {
                     *namespace = None;
                     if let Some(source) = registry.detach(input) {
                         sources.push((SourceSlot::Input(index), source));
                     }
                 }
-                Block::ToolResult {
-                    tool_use_id,
-                    tool_name,
-                    status,
-                    details,
-                    ..
-                } => {
-                    *tool_use_id = String::new();
-                    *tool_name = None;
+                Block::ToolResult { status, details, .. } => {
                     *status = None;
                     *details = None;
                 }
@@ -156,6 +160,8 @@ impl Record for DeferredMessage {
     type ReadState = Vec<u8>;
     fn heap_bytes(&self) -> usize {
         self.sources.capacity() * std::mem::size_of::<(SourceSlot, SourceDescriptor)>()
+            + self.message.id.as_ref().map_or(0, String::capacity)
+            + self.message.parent_id.as_ref().map_or(0, String::capacity)
             + self.message.content.capacity() * std::mem::size_of::<Block>()
             + self
                 .message
@@ -163,14 +169,20 @@ impl Record for DeferredMessage {
                 .iter()
                 .map(|block| match block {
                     Block::Text { text } | Block::Thinking { text, .. } => text_heap(text),
-                    Block::ToolUse { name, input, .. } => {
-                        name.capacity()
+                    Block::ToolUse { id, name, input, .. } => {
+                        id.capacity()
+                            + name.capacity()
                             + match input {
                                 Json::Owned(value) => value_heap(value),
                                 Json::Source(_) => unreachable!("source values are detached before staging"),
                             }
                     }
-                    Block::ToolResult { content, .. } => text_heap(content),
+                    Block::ToolResult {
+                        tool_use_id,
+                        content,
+                        tool_name,
+                        ..
+                    } => tool_use_id.capacity() + tool_name.as_ref().map_or(0, String::capacity) + text_heap(content),
                     Block::Image { media_type, .. } => media_type.as_ref().map_or(0, String::capacity),
                     Block::File { path, mime, .. } => {
                         path.as_ref().map_or(0, String::capacity) + mime.as_ref().map_or(0, String::capacity)

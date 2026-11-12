@@ -41,8 +41,10 @@ use crate::ir::{Block, Message, Session};
 #[cfg(test)]
 use crate::json::{ReadInput, Validation};
 use regex::{Captures, Regex};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::borrow::Cow;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 /// Knobs for [`redact_with`]. Defaults scrub everything.
@@ -53,15 +55,25 @@ pub struct RedactOptions {
     pub classes: RedactClasses,
 }
 
+const fn default_true() -> bool {
+    true
+}
+
 /// A toggle per secret class. `Default` enables every class (so `RedactOptions::default()` scrubs
 /// everything, unchanged); use [`RedactClasses::none`]/[`RedactClasses::parse_only`] to scope it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RedactClasses {
+    #[serde(default = "default_true")]
     pub api_keys: bool,
+    #[serde(default = "default_true")]
     pub private_keys: bool,
+    #[serde(default = "default_true")]
     pub jwts: bool,
+    #[serde(default = "default_true")]
     pub emails: bool,
+    #[serde(default = "default_true")]
     pub blobs: bool,
+    #[serde(default = "default_true")]
     pub assignments: bool,
 }
 
@@ -91,6 +103,10 @@ impl RedactClasses {
         }
     }
 
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
     /// Parse a comma-separated class list into an "only these" set, accepting singular/plural and the
     /// placeholder labels: `api_key`, `private_key`, `jwt`, `email`, `blob`/`secret`, `assignment`.
     pub fn parse_only(spec: &str) -> Result<Self, String> {
@@ -112,6 +128,245 @@ impl RedactClasses {
     }
 }
 
+/// Regex path/token rewrite rule (`pattern` -> `replacement`) in a [`ScrubProfile`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PathRewrite {
+    pub pattern: String,
+    pub replacement: String,
+}
+
+/// How `Session::principal` is handled under a [`ScrubProfile`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum PrincipalPolicy {
+    /// Preserve `principal` structure (still scrubbing embedded secret tokens if enabled).
+    #[default]
+    Keep,
+    /// Remove `Session::principal` (`None`).
+    Drop,
+    /// Replace principal string leaves with deterministic `sha256:<hex>` digests (optionally salted).
+    Hash { salt: Option<String> },
+}
+
+impl PrincipalPolicy {
+    pub fn is_keep(&self) -> bool {
+        matches!(self, Self::Keep)
+    }
+}
+
+impl Serialize for PrincipalPolicy {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            PrincipalPolicy::Keep => serializer.serialize_str("keep"),
+            PrincipalPolicy::Drop => serializer.serialize_str("drop"),
+            PrincipalPolicy::Hash { salt: None } => serializer.serialize_str("hash"),
+            PrincipalPolicy::Hash { salt: Some(salt) } => {
+                use serde::ser::SerializeMap;
+                let mut map = serializer.serialize_map(Some(2))?;
+                map.serialize_entry("mode", "hash")?;
+                map.serialize_entry("salt", salt)?;
+                map.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for PrincipalPolicy {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Wire {
+            Bare(String),
+            Tagged {
+                mode: String,
+                #[serde(default)]
+                salt: Option<String>,
+            },
+        }
+        match Wire::deserialize(deserializer)? {
+            Wire::Bare(mode) => match mode.trim().to_ascii_lowercase().as_str() {
+                "keep" => Ok(PrincipalPolicy::Keep),
+                "drop" => Ok(PrincipalPolicy::Drop),
+                "hash" => Ok(PrincipalPolicy::Hash { salt: None }),
+                other => Err(serde::de::Error::custom(format!(
+                    "unknown principal policy {other:?} (expected keep, drop, or hash)"
+                ))),
+            },
+            Wire::Tagged { mode, salt } => match mode.trim().to_ascii_lowercase().as_str() {
+                "keep" => Ok(PrincipalPolicy::Keep),
+                "drop" => Ok(PrincipalPolicy::Drop),
+                "hash" => Ok(PrincipalPolicy::Hash { salt }),
+                other => Err(serde::de::Error::custom(format!(
+                    "unknown principal policy mode {other:?} (expected keep, drop, or hash)"
+                ))),
+            },
+        }
+    }
+}
+
+/// Session admission predicates for `[privacy.filter]` and `[replication.<name>.filter]`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionFilter {
+    /// When non-empty, `session.cwd` must live under (or match) at least one allowed directory.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow_cwds: Vec<PathBuf>,
+    /// Sessions whose `cwd` lives under (or matches) any denied directory are excluded.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny_cwds: Vec<PathBuf>,
+    /// When non-empty, `session.harness.as_str()` must match one of these canonical names.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub harnesses: Vec<String>,
+    /// When non-empty, `session.extra["cv"]["tags"]` (or `"tag"`) must include at least one tag.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+}
+
+impl SessionFilter {
+    pub fn is_empty(&self) -> bool {
+        self.allow_cwds.is_empty() && self.deny_cwds.is_empty() && self.harnesses.is_empty() && self.tags.is_empty()
+    }
+
+    /// Evaluate whether `session` passes this filter without materializing lazy content.
+    pub fn matches(&self, session: &Session) -> bool {
+        if !self.harnesses.is_empty() {
+            let actual = session.harness.as_str();
+            let accepted = self.harnesses.iter().any(|want| {
+                let trimmed = want.trim();
+                trimmed.eq_ignore_ascii_case(actual)
+                    || crate::ir::Harness::parse(trimmed).is_some_and(|h| h.as_str() == actual)
+            });
+            if !accepted {
+                return false;
+            }
+        }
+        if !self.deny_cwds.is_empty() {
+            if let Some(cwd) = session.cwd.as_deref() {
+                if self.deny_cwds.iter().any(|deny| path_matches_prefix_or_glob(cwd, deny)) {
+                    return false;
+                }
+            }
+        }
+        if !self.allow_cwds.is_empty() {
+            let Some(cwd) = session.cwd.as_deref() else {
+                return false;
+            };
+            if !self
+                .allow_cwds
+                .iter()
+                .any(|allow| path_matches_prefix_or_glob(cwd, allow))
+            {
+                return false;
+            }
+        }
+        if !self.tags.is_empty() {
+            let session_tags = extract_session_tags(session);
+            if !self
+                .tags
+                .iter()
+                .any(|want| session_tags.iter().any(|have| have.eq_ignore_ascii_case(want.trim())))
+            {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+fn path_matches_prefix_or_glob(cwd: &Path, pattern: &Path) -> bool {
+    let pat_str = pattern.to_string_lossy();
+    if let Some(prefix) = pat_str.strip_suffix("/*").or_else(|| pat_str.strip_suffix("/**")) {
+        return cwd.starts_with(Path::new(prefix));
+    }
+    cwd.starts_with(pattern)
+}
+
+fn extract_session_tags(session: &Session) -> Vec<&str> {
+    let mut out = Vec::new();
+    if let Some(cv) = session.cv_extra() {
+        if let Some(tag) = cv.get("tag").and_then(Value::as_str) {
+            out.push(tag);
+        }
+        if let Some(tags) = cv.get("tags") {
+            match tags {
+                Value::String(s) => out.extend(s.split(',').map(str::trim).filter(|t| !t.is_empty())),
+                Value::Array(items) => out.extend(items.iter().filter_map(Value::as_str)),
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+/// Configurable privacy & scrubbing profile (`[privacy]` and `[replication.<name>]` in `config.toml`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScrubProfile {
+    /// Toggleable credential & secret classes.
+    #[serde(default, skip_serializing_if = "RedactClasses::is_default")]
+    pub classes: RedactClasses,
+    /// Scrub RFC1918 / RFC6598 (Tailscale CGNAT) / IPv6 ULA private addresses to `[REDACTED:ip]`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub private_ips: bool,
+    /// Scrub internal/mDNS/Tailscale hostnames (`.local`, `.internal`, `.lan`, `.corp`, `.ts.net`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hostnames: bool,
+    /// Scrub `user@host` SSH targets (`ssh user@host`, `scp user@host:path`, `ssh://user@host`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ssh_principals: bool,
+    /// Rewrite `$HOME` and `/Users/<user>` / `/home/<user>` / `C:\Users\<user>` prefixes to `$HOME`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub rewrite_home: bool,
+    /// Rewrite `repo_root` (or `session.cwd`) prefixes to `$REPO` before `$HOME` rewrites.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub rewrite_repo: bool,
+    /// Explicit repository root for `rewrite_repo` when `session.cwd` is absent or narrower.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_root: Option<PathBuf>,
+    /// Custom ordered regex path/text rewrites (`pattern` -> `replacement`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub path_rewrites: Vec<PathRewrite>,
+    /// Policy for `Session::principal` (`keep`, `drop`, or `hash`).
+    #[serde(default, skip_serializing_if = "PrincipalPolicy::is_keep")]
+    pub principal: PrincipalPolicy,
+    /// Session admission filter (`allow_cwds`, `deny_cwds`, `harnesses`, `tags`).
+    #[serde(default, skip_serializing_if = "SessionFilter::is_empty")]
+    pub filter: SessionFilter,
+}
+
+/// Alias for [`ScrubProfile`] used by privacy/share/replication callers.
+pub type PrivacyPolicy = ScrubProfile;
+
+impl ScrubProfile {
+    pub fn is_unset(&self) -> bool {
+        *self == Self::default()
+    }
+
+    pub fn matches_session(&self, session: &Session) -> bool {
+        self.filter.matches(session)
+    }
+
+    /// Compile custom regex rules once for repeated text or multi-session scrubbing.
+    pub fn compile(&self) -> anyhow::Result<CompiledProfile> {
+        let mut custom = Vec::with_capacity(self.path_rewrites.len());
+        for rule in &self.path_rewrites {
+            let re = Regex::new(&rule.pattern)
+                .map_err(|e| anyhow::anyhow!("invalid path_rewrites regex {:?}: {e}", rule.pattern))?;
+            custom.push((re, rule.replacement.clone()));
+        }
+        Ok(CompiledProfile {
+            profile: self.clone(),
+            env_home: crate::env::home_dir().map(|p| p.to_string_lossy().into_owned()),
+            custom,
+        })
+    }
+}
+
+/// Pre-compiled [`ScrubProfile`] ready for high-throughput text & session scrubbing.
+#[derive(Debug, Clone)]
+pub struct CompiledProfile {
+    profile: ScrubProfile,
+    env_home: Option<String>,
+    custom: Vec<(Regex, String)>,
+}
+
 /// Counts of how many spans of each class were redacted across a session.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RedactStats {
@@ -127,6 +382,28 @@ impl RedactStats {
     /// Total number of redactions across all classes.
     pub fn total(&self) -> usize {
         self.api_keys + self.private_keys + self.jwts + self.emails + self.blobs + self.assignments
+    }
+}
+
+/// Extended redaction & rewrite statistics returned by [`scrub_session_with_profile`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScrubStats {
+    pub secrets: RedactStats,
+    pub private_ips: usize,
+    pub hostnames: usize,
+    pub ssh_principals: usize,
+    pub path_rewrites: usize,
+    pub principal_transformed: bool,
+}
+
+impl ScrubStats {
+    pub fn total(&self) -> usize {
+        self.secrets.total()
+            + self.private_ips
+            + self.hostnames
+            + self.ssh_principals
+            + self.path_rewrites
+            + usize::from(self.principal_transformed)
     }
 }
 
@@ -185,6 +462,103 @@ pub fn redact_text(s: &str) -> String {
     scrub(s, &RedactOptions::default(), &mut stats)
 }
 
+/// Zero-allocation pre-scan over a single `&str`: returns `true` iff [`scrub_cow`] would redact at
+/// least one non-placeholder span under `opts`.
+pub fn str_needs_scrub(s: &str, opts: &RedactOptions) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    const MAX_RULES: usize = 16;
+    let all = rules();
+    debug_assert!(all.len() <= MAX_RULES);
+    let mut slots: [Option<(&Rule, Option<Hit>)>; MAX_RULES] = [None; MAX_RULES];
+    let mut count = 0usize;
+    for r in all {
+        if r.kind.enabled(opts) {
+            slots[count] = Some((r, r.next_hit(s, 0)));
+            count += 1;
+        }
+    }
+    let active = &mut slots[..count];
+    let mut cur = 0usize;
+    loop {
+        for (r, h) in active.iter_mut().flatten() {
+            if h.as_ref().is_some_and(|hit| hit.start < cur) {
+                *h = r.next_hit(s, cur);
+            }
+        }
+        let Some(hit) = active
+            .iter()
+            .filter_map(|slot| slot.as_ref().and_then(|(_, h)| *h))
+            .min_by_key(|h| h.start)
+        else {
+            return false;
+        };
+        cur = hit.end.max(hit.start + 1);
+        if hit.kind.label().is_some() {
+            return true;
+        }
+    }
+}
+
+/// Zero-allocation pre-scan over a [`crate::json::JsonView`]: checks string leaves in place without
+/// building a `serde_json::Value` tree. Source identity and bounds are still verified by the view.
+pub fn json_view_needs_scrub(view: crate::json::JsonView<'_>, opts: &RedactOptions) -> anyhow::Result<bool> {
+    json_view_any_str(view, &mut |s| str_needs_scrub(s, opts))
+}
+
+/// Zero-allocation pre-scan over a [`crate::json::Json`] (`Owned` or `Source`) before calling
+/// [`crate::json::Json::make_owned`]. Clean `Json::Source` descriptors stay `Json::Source` with
+/// zero heap cloning while still failing on missing or mutated backing files.
+pub fn json_needs_scrub(json: &crate::json::Json, opts: &RedactOptions) -> anyhow::Result<bool> {
+    json.with_view(|view| json_view_needs_scrub(view, opts))
+}
+
+fn json_view_any_str(view: crate::json::JsonView<'_>, pred: &mut dyn FnMut(&str) -> bool) -> anyhow::Result<bool> {
+    if view.is_string()? {
+        let mut chunks = 0usize;
+        let mut matched = false;
+        let _ = crate::stream::stopped(view.for_each_str_chunk(|chunk| {
+            chunks += 1;
+            if chunks == 1 {
+                matched = pred(chunk);
+                if matched {
+                    return Err(crate::stream::Stop.into());
+                }
+                Ok(())
+            } else {
+                // Multi-chunk (>32 KiB) string leaf: materialize this single string leaf so
+                // patterns spanning chunk boundaries are evaluated identically to owned strings.
+                Err(crate::stream::Stop.into())
+            }
+        }))?;
+        if chunks <= 1 {
+            return Ok(matched);
+        }
+        return Ok(view.string()?.is_some_and(|full| pred(&full)));
+    }
+    if let Some(arr) = view.array()? {
+        for item in arr {
+            if json_view_any_str(item?, pred)? {
+                return Ok(true);
+            }
+        }
+        return Ok(false);
+    }
+    let mut found = false;
+    let _ = crate::stream::stopped(
+        view.for_each_entry(|_key, val| {
+            if json_view_any_str(val, pred)? {
+                found = true;
+                return Err(crate::stream::Stop.into());
+            }
+            Ok(())
+        })
+        .map(|_| ()),
+    )?;
+    Ok(found)
+}
+
 /// Redact secrets from a single message in place. Public so streaming consumers (dataset export) can
 /// scrub one message at a time without materializing the whole session.
 pub fn redact_message(
@@ -193,24 +567,23 @@ pub fn redact_message(
     stats: &mut RedactStats,
     resolver: &crate::Resolver,
 ) -> anyhow::Result<()> {
-    // Resolve fallibly before changing text or statistics. Earlier successful fields may
-    // become owned, but a late failed source must never become a successful scrub.
+    // Resolve fallibly and pre-scan every source-backed JSON payload before changing text or
+    // statistics. Clean `Json::Source` tool inputs and clean `complete_record`s never allocate an
+    // owned `Value` tree; unreadable or mutated sources still fail upfront.
     msg.try_materialize_text(resolver)?;
-    if let Some(record) = &mut msg.complete_record {
-        let record = std::sync::Arc::make_mut(record);
-        record.value.make_owned()?;
-        // Redaction invalidates the original replay witness; the scrubbed owned native record
-        // remains available to codec comparison without retaining secret-bearing descriptors.
-        record.projection.clear();
-    }
-    // Validate every demanded input before changing text or statistics. A failed read leaves
-    // source descriptors intact; earlier successful values may become owned without changing data.
-    for block in &mut msg.content {
+    let record_dirty = match &msg.complete_record {
+        Some(record) => json_needs_scrub(&record.value, opts)?,
+        None => false,
+    };
+    let mut dirty_inputs = Vec::new();
+    for (idx, block) in msg.content.iter().enumerate() {
         if let Block::ToolUse { input, .. } = block {
-            input.make_owned()?;
+            if json_needs_scrub(input, opts)? {
+                dirty_inputs.push(idx);
+            }
         }
     }
-    for block in &mut msg.content {
+    for (idx, block) in msg.content.iter_mut().enumerate() {
         match block {
             Block::Text { text } | Block::Thinking { text, .. } => {
                 // `scrub_cow` borrows when clean, so untouched text (the common case) is not
@@ -220,7 +593,9 @@ pub fn redact_message(
                 }
             }
             Block::ToolUse { input, .. } => {
-                scrub_value(input.make_owned()?, opts, stats);
+                if dirty_inputs.binary_search(&idx).is_ok() {
+                    scrub_value(input.make_owned()?, opts, stats);
+                }
             }
             Block::ToolResult { content, details, .. } => {
                 if let Cow::Owned(scrubbed) = scrub_cow(content, opts, stats) {
@@ -233,8 +608,14 @@ pub fn redact_message(
             Block::Image { .. } | Block::File { .. } => {}
         }
     }
-    if let Some(record) = &mut msg.complete_record {
-        scrub_value(std::sync::Arc::make_mut(record).value.make_owned()?, opts, stats);
+    if record_dirty {
+        if let Some(record) = &mut msg.complete_record {
+            let record = std::sync::Arc::make_mut(record);
+            // Redaction invalidates the original replay witness; the scrubbed owned native record
+            // remains available to codec comparison without retaining secret-bearing descriptors.
+            record.projection.clear();
+            scrub_value(record.value.make_owned()?, opts, stats);
+        }
     }
     // Harness-specific passthrough fields can carry anything the harness logged (env snapshots,
     // request metadata) — scrub their string leaves too.
@@ -242,6 +623,564 @@ pub fn redact_message(
         scrub_value(v, opts, stats);
     }
     Ok(())
+}
+
+/// Apply a [`ScrubProfile`] (filter + secret classes + IP/hostname/SSH scrubbing + `$REPO`/`$HOME`/regex
+/// path rewrites + `principal` policy) to `session`. Returns `Ok(None)` without materializing lazy
+/// payloads when `profile.filter` excludes the session.
+pub fn filter_and_scrub_session(
+    session: &Session,
+    profile: &ScrubProfile,
+) -> anyhow::Result<Option<(Session, ScrubStats)>> {
+    if !profile.matches_session(session) {
+        return Ok(None);
+    }
+    let compiled = profile.compile()?;
+    compiled.scrub_session(session).map(Some)
+}
+
+/// Scrub `session` unconditionally under `profile` (ignoring `profile.filter`).
+pub fn scrub_session_with_profile(session: &Session, profile: &ScrubProfile) -> anyhow::Result<(Session, ScrubStats)> {
+    profile.compile()?.scrub_session(session)
+}
+
+/// Scrub a standalone string under `profile` (using `repo_root` when `rewrite_repo` is set).
+pub fn scrub_text_with_profile(s: &str, profile: &ScrubProfile) -> anyhow::Result<String> {
+    let compiled = profile.compile()?;
+    let mut stats = ScrubStats::default();
+    Ok(compiled
+        .scrub_text_cow(s, profile.repo_root.as_deref(), &mut stats)
+        .into_owned())
+}
+
+impl CompiledProfile {
+    /// Scrub a session with zero-allocation `JsonView` pre-scanning on clean `ToolUse` inputs.
+    pub fn scrub_session(&self, session: &Session) -> anyhow::Result<(Session, ScrubStats)> {
+        let mut out = session.clone();
+        let resolver = session.resolver();
+        let mut stats = ScrubStats::default();
+        let repo_root = self.profile.repo_root.as_deref().or(session.cwd.as_deref());
+
+        if let Some(title) = out.title.as_mut() {
+            if let Cow::Owned(s) = self.scrub_text_cow(title, repo_root, &mut stats) {
+                *title = s;
+            }
+        }
+        if let Some(prompt) = out.system_prompt.as_mut() {
+            if let Cow::Owned(s) = self.scrub_text_cow(prompt, repo_root, &mut stats) {
+                *prompt = s;
+            }
+        }
+        if let Some(remote) = out.git.as_mut().and_then(|g| g.remote.as_mut()) {
+            if let Cow::Owned(s) = self.scrub_text_cow(remote, repo_root, &mut stats) {
+                *remote = s;
+            }
+        }
+        if self.profile.rewrite_repo || self.profile.rewrite_home || !self.custom.is_empty() {
+            if let Some(cwd) = out.cwd.as_mut() {
+                let raw = cwd.to_string_lossy();
+                if let Cow::Owned(rewritten) = self.rewrite_paths_cow(&raw, repo_root, &mut stats) {
+                    *cwd = PathBuf::from(rewritten);
+                }
+            }
+            if let Some(src) = out.source_path.as_mut() {
+                let raw = src.to_string_lossy();
+                if let Cow::Owned(rewritten) = self.rewrite_paths_cow(&raw, repo_root, &mut stats) {
+                    *src = PathBuf::from(rewritten);
+                }
+            }
+        }
+
+        // Apply PrincipalPolicy.
+        match &self.profile.principal {
+            PrincipalPolicy::Keep => {
+                if let Some(principal) = out.principal.as_mut() {
+                    match principal {
+                        crate::ir::Principal::String(s) => {
+                            if let Cow::Owned(clean) = self.scrub_text_cow(s, repo_root, &mut stats) {
+                                *s = clean;
+                            }
+                        }
+                        crate::ir::Principal::Object(map) => {
+                            for (_k, val) in map.iter_mut() {
+                                self.scrub_value(val, repo_root, &mut stats);
+                            }
+                        }
+                    }
+                }
+            }
+            PrincipalPolicy::Drop => {
+                if out.principal.take().is_some() {
+                    stats.principal_transformed = true;
+                }
+            }
+            PrincipalPolicy::Hash { salt } => {
+                if let Some(principal) = out.principal.as_mut() {
+                    hash_principal(principal, salt.as_deref());
+                    stats.principal_transformed = true;
+                }
+            }
+        }
+
+        for (_k, v) in out.extra.iter_mut() {
+            self.scrub_value(v, repo_root, &mut stats);
+        }
+        for msg in &mut out.messages {
+            self.scrub_message(msg, repo_root, &mut stats, &resolver)?;
+        }
+        Ok((out, stats))
+    }
+
+    pub fn scrub_message(
+        &self,
+        msg: &mut Message,
+        repo_root: Option<&Path>,
+        stats: &mut ScrubStats,
+        resolver: &crate::Resolver,
+    ) -> anyhow::Result<()> {
+        msg.try_materialize_text(resolver)?;
+        let record_dirty = match &msg.complete_record {
+            Some(record) => record
+                .value
+                .with_view(|v| json_view_any_str(v, &mut |s| self.text_needs_scrub(s, repo_root)))?,
+            None => false,
+        };
+        let mut dirty_inputs = Vec::new();
+        for (idx, block) in msg.content.iter().enumerate() {
+            if let Block::ToolUse { input, .. } = block {
+                let dirty = input.with_view(|v| json_view_any_str(v, &mut |s| self.text_needs_scrub(s, repo_root)))?;
+                if dirty {
+                    dirty_inputs.push(idx);
+                }
+            }
+        }
+        for (idx, block) in msg.content.iter_mut().enumerate() {
+            match block {
+                Block::Text { text } | Block::Thinking { text, .. } => {
+                    if let Cow::Owned(s) = self.scrub_text_cow(text, repo_root, stats) {
+                        *text = s.into();
+                    }
+                }
+                Block::ToolUse { input, .. } => {
+                    if dirty_inputs.binary_search(&idx).is_ok() {
+                        self.scrub_value(input.make_owned()?, repo_root, stats);
+                    }
+                }
+                Block::ToolResult { content, details, .. } => {
+                    if let Cow::Owned(s) = self.scrub_text_cow(content, repo_root, stats) {
+                        *content = s.into();
+                    }
+                    if let Some(d) = details {
+                        self.scrub_value(d, repo_root, stats);
+                    }
+                }
+                Block::Image { .. } | Block::File { .. } => {}
+            }
+        }
+        if record_dirty {
+            if let Some(record) = &mut msg.complete_record {
+                let record = std::sync::Arc::make_mut(record);
+                record.projection.clear();
+                self.scrub_value(record.value.make_owned()?, repo_root, stats);
+            }
+        }
+        for (_k, v) in msg.extra.iter_mut() {
+            self.scrub_value(v, repo_root, stats);
+        }
+        Ok(())
+    }
+
+    fn scrub_value(&self, v: &mut Value, repo_root: Option<&Path>, stats: &mut ScrubStats) {
+        match v {
+            Value::String(s) => {
+                if let Cow::Owned(scrubbed) = self.scrub_text_cow(s, repo_root, stats) {
+                    *s = scrubbed;
+                }
+            }
+            Value::Array(arr) => {
+                for item in arr {
+                    self.scrub_value(item, repo_root, stats);
+                }
+            }
+            Value::Object(map) => {
+                for (_k, val) in map.iter_mut() {
+                    self.scrub_value(val, repo_root, stats);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub fn text_needs_scrub(&self, s: &str, repo_root: Option<&Path>) -> bool {
+        if s.is_empty() {
+            return false;
+        }
+        let secret_opts = RedactOptions {
+            classes: self.profile.classes,
+        };
+        if str_needs_scrub(s, &secret_opts) {
+            return true;
+        }
+        let mut probe = ScrubStats::default();
+        matches!(
+            self.scrub_network_and_paths_cow(s, repo_root, &mut probe),
+            Cow::Owned(_)
+        )
+    }
+
+    pub fn scrub_text_cow<'a>(&self, s: &'a str, repo_root: Option<&Path>, stats: &mut ScrubStats) -> Cow<'a, str> {
+        let secret_opts = RedactOptions {
+            classes: self.profile.classes,
+        };
+        let step1 = scrub_cow(s, &secret_opts, &mut stats.secrets);
+        match step1 {
+            Cow::Borrowed(clean) => self.scrub_network_and_paths_cow(clean, repo_root, stats),
+            Cow::Owned(mut changed) => {
+                if let Cow::Owned(next) = self.scrub_network_and_paths_cow(&changed, repo_root, stats) {
+                    changed = next;
+                }
+                Cow::Owned(changed)
+            }
+        }
+    }
+
+    fn scrub_network_and_paths_cow<'a>(
+        &self,
+        s: &'a str,
+        repo_root: Option<&Path>,
+        stats: &mut ScrubStats,
+    ) -> Cow<'a, str> {
+        let mut current: Cow<'a, str> = Cow::Borrowed(s);
+        if self.profile.ssh_principals {
+            if let Cow::Owned(next) = scrub_ssh_principals_cow(&current, &mut stats.ssh_principals) {
+                current = Cow::Owned(next);
+            }
+        }
+        if self.profile.private_ips {
+            if let Cow::Owned(next) = scrub_private_ips_cow(&current, &mut stats.private_ips) {
+                current = Cow::Owned(next);
+            }
+        }
+        if self.profile.hostnames {
+            if let Cow::Owned(next) = scrub_internal_hostnames_cow(&current, &mut stats.hostnames) {
+                current = Cow::Owned(next);
+            }
+        }
+        if self.profile.rewrite_repo || self.profile.rewrite_home || !self.custom.is_empty() {
+            if let Cow::Owned(next) = self.rewrite_paths_cow(&current, repo_root, stats) {
+                current = Cow::Owned(next);
+            }
+        }
+        current
+    }
+
+    fn rewrite_paths_cow<'a>(&self, s: &'a str, repo_root: Option<&Path>, stats: &mut ScrubStats) -> Cow<'a, str> {
+        let mut current: Cow<'a, str> = Cow::Borrowed(s);
+
+        // 1. $REPO first (more specific than $HOME when repo sits inside $HOME).
+        if self.profile.rewrite_repo {
+            if let Some(repo) = repo_root {
+                let repo_str = repo.to_string_lossy();
+                let trimmed = repo_str.trim_end_matches(['/', '\\']);
+                if trimmed.len() > 1 && current.contains(trimmed) {
+                    let count = current.matches(trimmed).count();
+                    stats.path_rewrites += count;
+                    current = Cow::Owned(current.replace(trimmed, "$REPO"));
+                }
+            }
+        }
+
+        // 2. $HOME (explicit env home first, then canonical /Users/<u...>, /home/<u...>, C:\Users\<u...>).
+        if self.profile.rewrite_home {
+            if let Some(home) = self.env_home.as_deref() {
+                let trimmed = home.trim_end_matches(['/', '\\']);
+                if trimmed.len() > 1 && current.contains(trimmed) {
+                    let count = current.matches(trimmed).count();
+                    stats.path_rewrites += count;
+                    current = Cow::Owned(current.replace(trimmed, "$HOME"));
+                }
+            }
+            let re = home_path_regex();
+            if re.is_match(&current) {
+                let mut count = 0usize;
+                let replaced = re
+                    .replace_all(&current, |caps: &Captures| {
+                        count += 1;
+                        format!("{}$HOME{}", &caps[1], &caps[3])
+                    })
+                    .into_owned();
+                if count > 0 {
+                    stats.path_rewrites += count;
+                    current = Cow::Owned(replaced);
+                }
+            }
+        }
+
+        // 3. Custom regex rules in declared order.
+        // Environment-style placeholders (`$NAS`, `$WORK`, `$SCRATCH`) stay literal unless they
+        // match a numbered capture (`$1`) or an explicit named capture in `re`.
+        for (re, replacement) in &self.custom {
+            if re.is_match(&current) {
+                let mut count = 0usize;
+                let next = if re.captures_len() <= 1 && !replacement.contains("$$") {
+                    count = re.find_iter(&current).count();
+                    re.replace_all(&current, regex::NoExpand(replacement.as_str()))
+                        .into_owned()
+                } else {
+                    re.replace_all(&current, |caps: &Captures| {
+                        count += 1;
+                        expand_path_replacement(caps, re, replacement)
+                    })
+                    .into_owned()
+                };
+                if next != current.as_ref() {
+                    stats.path_rewrites += count;
+                    current = Cow::Owned(next);
+                }
+            }
+        }
+
+        current
+    }
+}
+
+fn expand_path_replacement(caps: &Captures, re: &Regex, replacement: &str) -> String {
+    let bytes = replacement.as_bytes();
+    let mut out = String::with_capacity(replacement.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'$' {
+            let ch = replacement[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+            continue;
+        }
+        if i + 1 >= bytes.len() {
+            out.push('$');
+            break;
+        }
+        if bytes[i + 1] == b'$' {
+            out.push('$');
+            i += 2;
+            continue;
+        }
+        let (token, end, raw_span) = if bytes[i + 1] == b'{' {
+            if let Some(rel_close) = replacement[i + 2..].find('}') {
+                let close = i + 2 + rel_close;
+                (&replacement[i + 2..close], close + 1, &replacement[i..=close])
+            } else {
+                out.push('$');
+                i += 1;
+                continue;
+            }
+        } else {
+            let mut j = i + 1;
+            while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                j += 1;
+            }
+            if j == i + 1 {
+                out.push('$');
+                i += 1;
+                continue;
+            }
+            (&replacement[i + 1..j], j, &replacement[i..j])
+        };
+
+        if let Ok(idx) = token.parse::<usize>() {
+            if idx < caps.len() {
+                if let Some(m) = caps.get(idx) {
+                    out.push_str(m.as_str());
+                }
+                i = end;
+                continue;
+            }
+        } else if re.capture_names().flatten().any(|n| n == token) {
+            if let Some(m) = caps.name(token) {
+                out.push_str(m.as_str());
+            }
+            i = end;
+            continue;
+        }
+
+        out.push_str(raw_span);
+        i = end;
+    }
+    out
+}
+
+fn hash_principal_str(raw: &str, salt: Option<&str>) -> String {
+    if let Some(rest) = raw.strip_prefix("sha256:") {
+        if rest.len() == 64 && rest.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return raw.to_string();
+        }
+    }
+    let mut material = Vec::with_capacity(salt.map_or(0, str::len) + 1 + raw.len());
+    if let Some(salt) = salt {
+        material.extend_from_slice(salt.as_bytes());
+        material.push(b':');
+    }
+    material.extend_from_slice(raw.as_bytes());
+    format!("sha256:{}", crate::digest::sha256_hex(&material))
+}
+
+fn hash_principal(p: &mut crate::ir::Principal, salt: Option<&str>) {
+    match p {
+        crate::ir::Principal::String(s) => *s = hash_principal_str(s, salt),
+        crate::ir::Principal::Object(map) => {
+            for (_k, val) in map.iter_mut() {
+                hash_principal_value(val, salt);
+            }
+        }
+    }
+}
+
+fn hash_principal_value(v: &mut Value, salt: Option<&str>) {
+    match v {
+        Value::String(s) => *s = hash_principal_str(s, salt),
+        Value::Array(items) => {
+            for item in items {
+                hash_principal_value(item, salt);
+            }
+        }
+        Value::Object(map) => {
+            for (_k, val) in map.iter_mut() {
+                hash_principal_value(val, salt);
+            }
+        }
+        other => {
+            let encoded = other.to_string();
+            *other = Value::String(hash_principal_str(&encoded, salt));
+        }
+    }
+}
+
+fn home_path_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r#"(^|[\s"'=:(,\[])(?:/Users/|/home/|[A-Za-z]:\\Users\\)([A-Za-z0-9._-]+)(/|\\|$|[\s"'):,\]])"#)
+            .expect("home path regex")
+    })
+}
+
+fn scrub_private_ips_cow<'a>(s: &'a str, count: &mut usize) -> Cow<'a, str> {
+    static IPV4_RE: OnceLock<Regex> = OnceLock::new();
+    static IPV6_RE: OnceLock<Regex> = OnceLock::new();
+    let v4 = IPV4_RE.get_or_init(|| Regex::new(r"\b(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\b").expect("ipv4 regex"));
+    let v6 = IPV6_RE.get_or_init(|| {
+        Regex::new(r"(?i)\b(?:fd[0-9a-f]{2}|fc[0-9a-f]{2}|fe80):[0-9a-f:]{2,}\b").expect("ipv6 ula regex")
+    });
+
+    let mut out: Option<String> = None;
+    let mut copied = 0usize;
+    for caps in v4.captures_iter(s) {
+        let m = caps.get(0).unwrap();
+        let (start, end) = (m.start(), m.end());
+        if start > 0 && matches!(s.as_bytes()[start - 1], b'.' | b'v' | b'V') {
+            continue;
+        }
+        if end < s.len() && s.as_bytes()[end] == b'.' && end + 1 < s.len() && s.as_bytes()[end + 1].is_ascii_digit() {
+            continue;
+        }
+        let octets: Option<[u8; 4]> = (|| {
+            Some([
+                caps[1].parse().ok()?,
+                caps[2].parse().ok()?,
+                caps[3].parse().ok()?,
+                caps[4].parse().ok()?,
+            ])
+        })();
+        let Some([a, b, _, _]) = octets else { continue };
+        let is_private = a == 10
+            || (a == 172 && (16..=31).contains(&b))
+            || (a == 192 && b == 168)
+            || (a == 100 && (64..=127).contains(&b));
+        if !is_private {
+            continue;
+        }
+        let buf = out.get_or_insert_with(String::new);
+        buf.push_str(&s[copied..start]);
+        buf.push_str("[REDACTED:ip]");
+        *count += 1;
+        copied = end;
+    }
+    let intermediate: Cow<'a, str> = match out {
+        None => Cow::Borrowed(s),
+        Some(mut buf) => {
+            buf.push_str(&s[copied..]);
+            Cow::Owned(buf)
+        }
+    };
+    if v6.is_match(&intermediate) {
+        let hits = v6.find_iter(&intermediate).count();
+        *count += hits;
+        Cow::Owned(v6.replace_all(&intermediate, "[REDACTED:ip]").into_owned())
+    } else {
+        intermediate
+    }
+}
+
+fn scrub_internal_hostnames_cow<'a>(s: &'a str, count: &mut usize) -> Cow<'a, str> {
+    static HOST_RE: OnceLock<Regex> = OnceLock::new();
+    let re = HOST_RE.get_or_init(|| {
+        Regex::new(
+            r"(?i)\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?:local|internal|lan|corp|home\.arpa|ts\.net|localdomain)\b",
+        )
+        .expect("internal hostname regex")
+    });
+    let mut out: Option<String> = None;
+    let mut copied = 0usize;
+    for m in re.find_iter(s) {
+        if m.start() > 0 && s.as_bytes()[m.start() - 1] == b'@' {
+            continue;
+        }
+        let buf = out.get_or_insert_with(String::new);
+        buf.push_str(&s[copied..m.start()]);
+        buf.push_str("[REDACTED:host]");
+        *count += 1;
+        copied = m.end();
+    }
+    match out {
+        None => Cow::Borrowed(s),
+        Some(mut buf) => {
+            buf.push_str(&s[copied..]);
+            Cow::Owned(buf)
+        }
+    }
+}
+
+fn scrub_ssh_principals_cow<'a>(s: &'a str, count: &mut usize) -> Cow<'a, str> {
+    static SSH_RE: OnceLock<Regex> = OnceLock::new();
+    let re = SSH_RE.get_or_init(|| {
+        Regex::new(
+            r#"(?i)(?:((?:git\+)?ssh://)|(\b(?:ssh|scp|sftp|rsync)\s+(?:-[A-Za-z0-9]+\s+)*))([A-Za-z0-9._-]+@[A-Za-z0-9._-]+)"#,
+        )
+        .expect("ssh target regex")
+    });
+    let mut out: Option<String> = None;
+    let mut copied = 0usize;
+    for caps in re.captures_iter(s) {
+        let target = caps.get(3).unwrap();
+        // Public forge git@github.com / git@gitlab.com is not a personal SSH principal.
+        let lower = target.as_str().to_ascii_lowercase();
+        if matches!(
+            lower.as_str(),
+            "git@github.com" | "git@gitlab.com" | "git@bitbucket.org" | "git@codeberg.org"
+        ) {
+            continue;
+        }
+        let buf = out.get_or_insert_with(String::new);
+        buf.push_str(&s[copied..target.start()]);
+        buf.push_str("[REDACTED:ssh]");
+        *count += 1;
+        copied = target.end();
+    }
+    match out {
+        None => Cow::Borrowed(s),
+        Some(mut buf) => {
+            buf.push_str(&s[copied..]);
+            Cow::Owned(buf)
+        }
+    }
 }
 
 /// Recursively scrub string values inside a JSON value, leaving keys and structure intact.
@@ -283,25 +1222,43 @@ fn scrub(s: &str, opts: &RedactOptions, stats: &mut RedactStats) -> String {
 /// [`scrub`], allocation-aware: returns `Cow::Borrowed(s)` when nothing matched (the overwhelmingly
 /// common case for ordinary transcript text), and copies clean stretches between matches in bulk.
 ///
-/// Each enabled [`Rule`] keeps its earliest guarded hit at or after the cursor; the leftmost hit
-/// wins, and at a tie the earlier rule (the order of [`rules`]) wins. An existing placeholder is a
-/// rule too (the first), consumed verbatim, which is what makes the transform idempotent.
+/// Uses a fixed stack state array (no heap allocation on clean strings). Each enabled [`Rule`] keeps
+/// its earliest guarded hit at or after the cursor; the leftmost hit wins, and at a tie the earlier
+/// rule (the order of [`rules`]) wins. An existing placeholder is a rule too (the first), consumed
+/// verbatim, which is what makes the transform idempotent.
 pub(crate) fn scrub_cow<'a>(s: &'a str, opts: &RedactOptions, stats: &mut RedactStats) -> Cow<'a, str> {
-    let rules: Vec<&Rule> = rules().iter().filter(|r| r.kind.enabled(opts)).collect();
-    let mut next: Vec<Option<Hit>> = rules.iter().map(|r| r.next_hit(s, 0)).collect();
+    if s.is_empty() {
+        return Cow::Borrowed(s);
+    }
+    const MAX_RULES: usize = 16;
+    let all = rules();
+    debug_assert!(all.len() <= MAX_RULES);
+    let mut slots: [Option<(&Rule, Option<Hit>)>; MAX_RULES] = [None; MAX_RULES];
+    let mut count = 0usize;
+    for r in all {
+        if r.kind.enabled(opts) {
+            slots[count] = Some((r, r.next_hit(s, 0)));
+            count += 1;
+        }
+    }
+    let active = &mut slots[..count];
     // The redacted output, allocated lazily on the first match; `copied` is how much of `s` has
     // already been flushed into it.
     let (mut out, mut copied, mut cur) = (None::<String>, 0, 0);
     loop {
-        for (r, h) in rules.iter().zip(next.iter_mut()) {
+        for (r, h) in active.iter_mut().flatten() {
             if h.as_ref().is_some_and(|h| h.start < cur) {
                 *h = r.next_hit(s, cur);
             }
         }
-        let Some(hit) = next.iter().flatten().min_by_key(|h| h.start) else {
+        let Some(hit) = active
+            .iter()
+            .filter_map(|slot| slot.as_ref().and_then(|(_, h)| *h))
+            .min_by_key(|h| h.start)
+        else {
             break;
         };
-        let Hit { start, keep, end, kind } = *hit;
+        let Hit { start, keep, end, kind } = hit;
         cur = end.max(start + 1);
         let Some(label) = kind.label() else { continue }; // a placeholder: leave it in place
         let o = out.get_or_insert_with(String::new);
@@ -1471,5 +2428,144 @@ mod tests {
             ),
             Cow::Borrowed(_)
         ));
+    }
+
+    #[test]
+    fn clean_source_tool_inputs_stay_unmaterialized_after_zero_alloc_prescan() -> anyhow::Result<()> {
+        let world = crate::test_world("redact-zero-alloc-prescan");
+        let clean_path = world.base.join("clean_input.json");
+        let dirty_path = world.base.join("dirty_input.json");
+        let secret = fixture("sk-", "testabcdefghijklmnopqrstuvwxyz");
+        let clean_bytes = serde_json::to_vec(&serde_json::json!({
+            "command": "cargo test -p clustervision-core",
+            "nested": ["alpha", 42, {"flag": true}]
+        }))?;
+        let dirty_bytes = serde_json::to_vec(&serde_json::json!({
+            "command": format!("Authorization: Bearer {secret}")
+        }))?;
+        std::fs::write(&clean_path, &clean_bytes)?;
+        std::fs::write(&dirty_path, &dirty_bytes)?;
+
+        let clean_json = crate::Json::source(&clean_path, 0, clean_bytes.len() as u64)?;
+        let dirty_json = crate::Json::source(&dirty_path, 0, dirty_bytes.len() as u64)?;
+        assert!(!json_needs_scrub(&clean_json, &RedactOptions::default())?);
+        assert!(json_needs_scrub(&dirty_json, &RedactOptions::default())?);
+
+        let mut session = Session::new("prescan", Harness::Claude);
+        let mut msg = Message::new(Role::Assistant);
+        msg.content.push(Block::ToolUse {
+            id: "c1".into(),
+            name: "Bash".into(),
+            input: clean_json,
+            namespace: None,
+        });
+        msg.content.push(Block::ToolUse {
+            id: "c2".into(),
+            name: "Bash".into(),
+            input: dirty_json,
+            namespace: None,
+        });
+        session.messages.push(msg);
+
+        let (scrubbed, stats) = redact_with(&session, &RedactOptions::default())?;
+        assert_eq!(stats.api_keys, 1);
+        // Clean ToolUse MUST remain Json::Source (zero Value tree cloning!).
+        assert!(matches!(
+            &scrubbed.messages[0].content[0],
+            Block::ToolUse {
+                input: crate::Json::Source(_),
+                ..
+            }
+        ));
+        // Dirty ToolUse became Json::Owned and was scrubbed.
+        match &scrubbed.messages[0].content[1] {
+            Block::ToolUse {
+                input: crate::Json::Owned(v),
+                ..
+            } => assert!(!v.to_string().contains(&secret)),
+            other => panic!("expected scrubbed Owned ToolUse, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn configurable_privacy_profile_scrubs_paths_ips_hosts_ssh_principal_and_filters() -> anyhow::Result<()> {
+        let profile = ScrubProfile {
+            classes: RedactClasses {
+                emails: false,
+                ..RedactClasses::default()
+            },
+            private_ips: true,
+            hostnames: true,
+            ssh_principals: true,
+            rewrite_home: true,
+            rewrite_repo: true,
+            repo_root: Some(PathBuf::from("/Users/alice/dev/secret-proj")),
+            path_rewrites: vec![PathRewrite {
+                pattern: r"/mnt/nas/[A-Za-z0-9_-]+".into(),
+                replacement: "$NAS".into(),
+            }],
+            principal: PrincipalPolicy::Hash {
+                salt: Some("fleet-salt".into()),
+            },
+            filter: SessionFilter {
+                allow_cwds: vec![PathBuf::from("/Users/alice/dev/*")],
+                deny_cwds: vec![PathBuf::from("/Users/alice/dev/private-vault")],
+                harnesses: vec!["claude".into()],
+                tags: vec!["shareable".into()],
+            },
+        };
+
+        let mut s = Session::new("prof-1", Harness::Claude);
+        s.cwd = Some(PathBuf::from("/Users/alice/dev/secret-proj"));
+        s.principal = Some(crate::ir::Principal::Object(
+            serde_json::json!({"user": "alice", "machine": "mbp"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        ));
+        s.cv_extra_mut()
+            .insert("tags".into(), serde_json::json!(["shareable", "rust"]));
+        let mut m = Message::new(Role::User);
+        m.content.push(Block::Text {
+            text: "Connect via ssh deploy@bastion-01 to 10.42.0.19 or 100.88.1.5 (keep 127.0.0.1 and v10.2.3.4), check db.internal and node.tailnet.ts.net, read /Users/alice/dev/secret-proj/src/lib.rs, /Users/alice/.zshrc, and /mnt/nas/vol9/data. Keep alice@example.com.".into(),
+        });
+        s.messages.push(m);
+
+        let (scrubbed, stats) = filter_and_scrub_session(&s, &profile)?.expect("matching session should pass filter");
+        let rendered = scrubbed.messages[0].text().expect("text block");
+        assert!(rendered.contains("ssh [REDACTED:ssh]"), "{rendered}");
+        assert!(!rendered.contains("10.42.0.19"), "{rendered}");
+        assert!(!rendered.contains("100.88.1.5"), "{rendered}");
+        assert!(rendered.contains("127.0.0.1"), "loopback must survive: {rendered}");
+        assert!(rendered.contains("v10.2.3.4"), "version tag must survive: {rendered}");
+        assert!(!rendered.contains("db.internal"), "{rendered}");
+        assert!(!rendered.contains("node.tailnet.ts.net"), "{rendered}");
+        assert!(rendered.contains("$REPO/src/lib.rs"), "{rendered}");
+        assert!(rendered.contains("$HOME/.zshrc"), "{rendered}");
+        assert!(rendered.contains("$NAS/data"), "{rendered}");
+        assert!(
+            rendered.contains("alice@example.com"),
+            "emails=false must keep email: {rendered}"
+        );
+        assert_eq!(scrubbed.cwd.as_deref(), Some(Path::new("$REPO")));
+
+        let crate::ir::Principal::Object(pmap) = scrubbed.principal.as_ref().unwrap() else {
+            panic!("expected object principal");
+        };
+        let principal_user = pmap["user"].as_str().unwrap();
+        assert!(principal_user.starts_with("sha256:"), "{principal_user}");
+        assert!(!principal_user.contains("alice"));
+        assert!(stats.total() >= 6);
+
+        // Denied cwd or non-matching harness is filtered out before materializing.
+        let mut denied = s.clone();
+        denied.cwd = Some(PathBuf::from("/Users/alice/dev/private-vault/sub"));
+        assert!(filter_and_scrub_session(&denied, &profile)?.is_none());
+
+        let mut wrong_harness = s.clone();
+        wrong_harness.harness = Harness::Codex;
+        assert!(filter_and_scrub_session(&wrong_harness, &profile)?.is_none());
+        Ok(())
     }
 }

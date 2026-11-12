@@ -180,10 +180,14 @@ fn render_blocks_impl<'a>(
                 }
                 let mut writer = TextWriter(emit);
                 if let Some((opts, stats)) = redact.as_mut() {
-                    // Structural scrubbing explicitly owns only the demanded tool value.
-                    let mut owned = input.resolve()?.into_owned();
-                    crate::redact::scrub_value(&mut owned, opts, stats);
-                    serde_json::to_writer(&mut writer, &owned)?;
+                    if crate::redact::json_needs_scrub(input, opts)? {
+                        // Structural scrubbing explicitly owns only the demanded dirty tool value.
+                        let mut owned = input.resolve()?.into_owned();
+                        crate::redact::scrub_value(&mut owned, opts, stats);
+                        serde_json::to_writer(&mut writer, &owned)?;
+                    } else {
+                        input.write_canonical(&mut writer)?;
+                    }
                 } else {
                     input.write_canonical(&mut writer)?;
                 }
@@ -272,7 +276,7 @@ fn represents_system_prompt(message: &Message, prompt: &str, resolver: &crate::R
 
 const fn record_header(format: Format) -> &'static [u8] {
     match format {
-        Format::Chatml => b"{\"messages\":[",
+        Format::Chatml | Format::OpenAiTools => b"{\"messages\":[",
         Format::ShareGpt => b"{\"conversations\":[",
     }
 }
@@ -282,12 +286,210 @@ const fn record_header(format: Format) -> &'static [u8] {
 const RECORD_HEADER_BUF: usize = 32;
 const _: () = assert!(record_header(Format::Chatml).len() <= RECORD_HEADER_BUF);
 const _: () = assert!(record_header(Format::ShareGpt).len() <= RECORD_HEADER_BUF);
+const _: () = assert!(record_header(Format::OpenAiTools).len() <= RECORD_HEADER_BUF);
 
-/// Which export shape — the only difference is the array/role/content key names and the role labels.
-#[derive(Clone, Copy)]
+/// Which export shape — `Chatml`, `ShareGpt`, or native `OpenAiTools` (`tool_calls` + `tool_call_id`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
     Chatml,
     ShareGpt,
+    /// Structured OpenAI tool-calling schema (`tool_calls` array on assistant messages and
+    /// `role: "tool", tool_call_id` messages for tool outputs) for modern SFT/RL trainers.
+    OpenAiTools,
+}
+
+/// Canonical alias for [`Format`].
+pub type DatasetFormat = Format;
+
+impl Format {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Format::Chatml => "chatml",
+            Format::ShareGpt => "sharegpt",
+            Format::OpenAiTools => "openai-tools",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "chatml" => Some(Format::Chatml),
+            "sharegpt" => Some(Format::ShareGpt),
+            "openai-tools" | "openai_tools" | "openaitools" => Some(Format::OpenAiTools),
+            _ => None,
+        }
+    }
+}
+
+/// Trajectory selection and rendering options for [`write_record_with_options`] and [`stage_record_with_options`].
+#[derive(Debug, Clone)]
+pub struct DatasetOptions {
+    /// Walk `parent_id` backward from the session's newest model-visible leaf (and exclude
+    /// sidechain / inactive-branch turns) so rewound edits and abandoned branches are omitted.
+    pub active_branch_only: bool,
+    /// Reject trajectories that end in an error record, an unanswered `ToolUse`, an unrecovered
+    /// `is_error: true` `ToolResult`, or a non-assistant turn.
+    pub clean_outcome_only: bool,
+    /// Include `Block::Thinking` blocks (`<thinking>` in ChatML/ShareGPT, `reasoning_content` in
+    /// `OpenAiTools`). Defaults to `true`.
+    pub include_thinking: bool,
+}
+
+impl Default for DatasetOptions {
+    fn default() -> Self {
+        Self {
+            active_branch_only: false,
+            clean_outcome_only: false,
+            include_thinking: true,
+        }
+    }
+}
+
+fn is_inactive_or_sidechain(m: &Message) -> bool {
+    m.extra
+        .get("isSidechain")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+        || m.extra
+            .get("cv")
+            .and_then(|v| v.get("inactive_branch"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+}
+
+/// Select the message indices to export under `opts`, or `None` if `clean_outcome_only` rejects
+/// the trajectory.
+pub fn select_trajectory(messages: &[Message], opts: &DatasetOptions) -> Option<Vec<usize>> {
+    let indices = if opts.active_branch_only {
+        select_active_branch_indices(messages)
+    } else {
+        (0..messages.len()).collect()
+    };
+    if opts.clean_outcome_only && !trajectory_has_clean_outcome(messages, &indices) {
+        return None;
+    }
+    Some(indices)
+}
+
+fn select_active_branch_indices(messages: &[Message]) -> Vec<usize> {
+    let mut by_id: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (idx, m) in messages.iter().enumerate() {
+        if is_inactive_or_sidechain(m) {
+            continue;
+        }
+        if let Some(id) = m.id.as_deref().filter(|s| !s.is_empty()) {
+            by_id.entry(id).or_insert(idx);
+        }
+    }
+    let leaf = (0..messages.len()).rev().find(|&i| {
+        let m = &messages[i];
+        !is_inactive_or_sidechain(m)
+            && (m.is_model_visible() || m.kind == MessageKind::Error)
+            && m.id.as_deref().is_some_and(|s| !s.is_empty())
+    });
+    let Some(leaf_idx) = leaf else {
+        return (0..messages.len())
+            .filter(|&i| !is_inactive_or_sidechain(&messages[i]))
+            .collect();
+    };
+    let has_parent_links = messages
+        .iter()
+        .any(|m| !is_inactive_or_sidechain(m) && m.parent_id.as_deref().is_some_and(|p| !p.is_empty()));
+    if !has_parent_links {
+        return (0..messages.len())
+            .filter(|&i| !is_inactive_or_sidechain(&messages[i]))
+            .collect();
+    }
+
+    let mut chain = Vec::new();
+    let mut visited = std::collections::HashSet::new();
+    let mut cur = Some(leaf_idx);
+    while let Some(idx) = cur {
+        if !visited.insert(idx) {
+            break;
+        }
+        chain.push(idx);
+        cur = messages[idx]
+            .parent_id
+            .as_deref()
+            .filter(|p| !p.is_empty())
+            .and_then(|p| by_id.get(p).copied());
+    }
+    chain.reverse();
+    if let Some((0, first)) = messages.iter().enumerate().next() {
+        if first.kind == MessageKind::SystemPrompt
+            && first.id.is_none()
+            && !is_inactive_or_sidechain(first)
+            && chain.first().copied() != Some(0)
+        {
+            chain.insert(0, 0);
+        }
+    }
+    chain
+}
+
+fn trajectory_has_clean_outcome(messages: &[Message], indices: &[usize]) -> bool {
+    let mut pending_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut pending_unnamed = 0usize;
+    let mut unresolved_tool_error = false;
+    let mut last_visible_role: Option<Role> = None;
+    let mut saw_assistant = false;
+
+    for &idx in indices {
+        let m = &messages[idx];
+        if m.kind == MessageKind::Error {
+            return false;
+        }
+        if !m.is_model_visible() || message_is_empty(m) {
+            continue;
+        }
+        last_visible_role = Some(m.role);
+        let mut assistant_has_text = false;
+        let mut assistant_called_tool = false;
+        for b in &m.content {
+            match b {
+                Block::Text { text } => {
+                    if m.role == Role::Assistant
+                        && (text.is_lazy() || text.inline_str().is_some_and(|s| !s.trim().is_empty()))
+                    {
+                        assistant_has_text = true;
+                    }
+                }
+                Block::ToolUse { id, .. } => {
+                    assistant_called_tool = true;
+                    if id.is_empty() {
+                        pending_unnamed += 1;
+                    } else {
+                        pending_ids.insert(id.as_str());
+                    }
+                }
+                Block::ToolResult {
+                    tool_use_id, is_error, ..
+                } => {
+                    if tool_use_id.is_empty() {
+                        pending_unnamed = pending_unnamed.saturating_sub(1);
+                    } else {
+                        pending_ids.remove(tool_use_id.as_str());
+                    }
+                    if *is_error {
+                        unresolved_tool_error = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if m.role == Role::Assistant {
+            saw_assistant = true;
+            if assistant_has_text && !assistant_called_tool {
+                unresolved_tool_error = false;
+            }
+        }
+    }
+
+    saw_assistant
+        && last_visible_role == Some(Role::Assistant)
+        && pending_ids.is_empty()
+        && pending_unnamed == 0
+        && !unresolved_tool_error
 }
 
 /// Write `session` as one JSONL record (no trailing newline) **streaming** — content (incl. giant
@@ -301,26 +503,42 @@ pub fn write_record<W: std::io::Write + ?Sized>(
     fmt: Format,
     redact: Option<&crate::redact::RedactOptions>,
 ) -> std::io::Result<bool> {
-    let mut record = RecordWriter::new(w, fmt, redact);
+    write_record_with_options(session, w, fmt, redact, &DatasetOptions::default())
+}
+
+/// Like [`write_record`], applying [`DatasetOptions`] (active-branch selection, clean-outcome gate,
+/// and optional thinking omission).
+pub fn write_record_with_options<W: std::io::Write + ?Sized>(
+    session: &Session,
+    w: &mut W,
+    fmt: Format,
+    redact: Option<&crate::redact::RedactOptions>,
+    opts: &DatasetOptions,
+) -> std::io::Result<bool> {
+    let Some(selected) = select_trajectory(&session.messages, opts) else {
+        return Ok(false);
+    };
+    let mut record = RecordWriter::new(w, fmt, redact).with_include_thinking(opts.include_thinking);
     let resolver = session.resolver();
     if let Some(prompt) = session
         .system_prompt
         .as_deref()
         .filter(|prompt| !prompt.trim().is_empty())
     {
-        let represented = session
-            .messages
+        let represented = selected
             .iter()
-            .try_fold(false, |represented, message| {
-                Ok::<_, anyhow::Error>(represented || represents_system_prompt(message, prompt, &resolver)?)
+            .try_fold(false, |represented, &idx| {
+                Ok::<_, anyhow::Error>(
+                    represented || represents_system_prompt(&session.messages[idx], prompt, &resolver)?,
+                )
             })
             .map_err(std::io::Error::other)?;
         if !represented {
             record.system_prompt(prompt)?;
         }
     }
-    for message in &session.messages {
-        record.message(message, &resolver)?;
+    for idx in selected {
+        record.message(&session.messages[idx], &resolver)?;
     }
     record.finish()
 }
@@ -332,7 +550,10 @@ pub struct RecordWriter<'a, W: std::io::Write + ?Sized> {
     writer: &'a mut W,
     fmt: Format,
     redact: Option<&'a crate::redact::RedactOptions>,
+    include_thinking: bool,
     started: bool,
+    synthetic_call_seq: usize,
+    pending_synth_ids: std::collections::VecDeque<String>,
 }
 
 impl<'a, W: std::io::Write + ?Sized> RecordWriter<'a, W> {
@@ -341,14 +562,22 @@ impl<'a, W: std::io::Write + ?Sized> RecordWriter<'a, W> {
             writer,
             fmt,
             redact,
+            include_thinking: true,
             started: false,
+            synthetic_call_seq: 0,
+            pending_synth_ids: std::collections::VecDeque::new(),
         }
+    }
+
+    pub fn with_include_thinking(mut self, include_thinking: bool) -> Self {
+        self.include_thinking = include_thinking;
+        self
     }
 
     /// Render one model-visible, nonempty message, preserving the whole-session writer's key
     /// order, separators, redaction and role spelling. Returns whether this message contributed.
     pub fn message(&mut self, message: &Message, resolver: &crate::lazy::Resolver) -> std::io::Result<bool> {
-        let chat = matches!(self.fmt, Format::Chatml);
+        let chat = matches!(self.fmt, Format::Chatml | Format::OpenAiTools);
         let Some(role) = training_role(message, chat) else {
             return Ok(false);
         };
@@ -364,8 +593,8 @@ impl<'a, W: std::io::Write + ?Sized> RecordWriter<'a, W> {
                 Block::Text { text } => Some(text),
                 Block::Thinking {
                     text, redacted: false, ..
-                } => Some(text),
-                Block::Thinking { redacted: true, .. } => continue,
+                } if self.include_thinking => Some(text),
+                Block::Thinking { .. } => continue,
                 _ => None,
             };
             let keep = match text {
@@ -388,6 +617,9 @@ impl<'a, W: std::io::Write + ?Sized> RecordWriter<'a, W> {
         if blocks.is_empty() {
             return Ok(false);
         }
+        if self.fmt == Format::OpenAiTools {
+            return self.write_openai_tools_message(role, &blocks, resolver);
+        }
         let redact = self.redact;
         self.write_message(role, |emit| {
             if let Some(opts) = redact {
@@ -397,6 +629,178 @@ impl<'a, W: std::io::Write + ?Sized> RecordWriter<'a, W> {
                 render_blocks_into(blocks, resolver, emit)
             }
         })
+    }
+
+    fn write_openai_tools_message(
+        &mut self,
+        role: &str,
+        blocks: &[&Block],
+        resolver: &crate::lazy::Resolver,
+    ) -> std::io::Result<bool> {
+        if role == "assistant" {
+            let mut thinking: Vec<&crate::lazy::Text> = Vec::new();
+            let mut content_blocks: Vec<&Block> = Vec::new();
+            let mut calls: Vec<(&str, &str, &crate::json::Json)> = Vec::new();
+            let mut extra_tool_results: Vec<&Block> = Vec::new();
+
+            for &b in blocks {
+                match b {
+                    Block::Thinking {
+                        text, redacted: false, ..
+                    } => thinking.push(text),
+                    Block::ToolUse { id, name, input, .. } => calls.push((id.as_str(), name.as_str(), input)),
+                    Block::ToolResult { .. } => extra_tool_results.push(b),
+                    Block::Text { .. } | Block::Image { .. } | Block::File { .. } => content_blocks.push(b),
+                    Block::Thinking { .. } => {}
+                }
+            }
+            if thinking.is_empty() && content_blocks.is_empty() && calls.is_empty() && extra_tool_results.is_empty() {
+                return Ok(false);
+            }
+            let mut wrote = false;
+            if !thinking.is_empty() || !content_blocks.is_empty() || !calls.is_empty() {
+                self.open_item()?;
+                wrote = true;
+                self.writer.write_all(b"{\"role\":\"assistant\",\"content\":")?;
+                if content_blocks.is_empty() {
+                    self.writer.write_all(b"null")?;
+                } else {
+                    self.writer.write_all(b"\"")?;
+                    let redact = self.redact;
+                    let w = &mut self.writer;
+                    let mut emit = |piece: &str| write_json_escaped(w, piece).map_err(anyhow::Error::from);
+                    if let Some(opts) = redact {
+                        let mut stats = crate::redact::RedactStats::default();
+                        render_blocks_impl(
+                            content_blocks.iter().copied(),
+                            resolver,
+                            Some((opts, &mut stats)),
+                            &mut emit,
+                        )
+                        .map_err(std::io::Error::other)?;
+                    } else {
+                        render_blocks_into(content_blocks.iter().copied(), resolver, &mut emit)
+                            .map_err(std::io::Error::other)?;
+                    }
+                    self.writer.write_all(b"\"")?;
+                }
+
+                if !thinking.is_empty() {
+                    self.writer.write_all(b",\"reasoning_content\":\"")?;
+                    for (idx, t) in thinking.iter().enumerate() {
+                        if idx > 0 {
+                            write_json_escaped(self.writer, "\n\n")?;
+                        }
+                        stream_text_escaped(self.writer, t, resolver, self.redact)?;
+                    }
+                    self.writer.write_all(b"\"")?;
+                }
+
+                if !calls.is_empty() {
+                    self.writer.write_all(b",\"tool_calls\":[")?;
+                    for (idx, (id, name, input)) in calls.iter().enumerate() {
+                        if idx > 0 {
+                            self.writer.write_all(b",")?;
+                        }
+                        let call_id: std::borrow::Cow<'_, str> = if id.is_empty() {
+                            self.synthetic_call_seq += 1;
+                            let gen = format!("call_{}", self.synthetic_call_seq);
+                            self.pending_synth_ids.push_back(gen.clone());
+                            std::borrow::Cow::Owned(gen)
+                        } else {
+                            std::borrow::Cow::Borrowed(*id)
+                        };
+                        self.writer.write_all(b"{\"id\":\"")?;
+                        write_json_escaped(self.writer, &call_id)?;
+                        self.writer
+                            .write_all(b"\",\"type\":\"function\",\"function\":{\"name\":\"")?;
+                        write_json_escaped(self.writer, name)?;
+                        self.writer.write_all(b"\",\"arguments\":\"")?;
+                        stream_json_arguments_escaped(self.writer, input, self.redact)?;
+                        self.writer.write_all(b"\"}}")?;
+                    }
+                    self.writer.write_all(b"]")?;
+                }
+
+                self.writer.write_all(b"}")?;
+            }
+            for tr in extra_tool_results {
+                wrote |= self.write_single_openai_tool_result(tr, resolver)?;
+            }
+            return Ok(wrote);
+        }
+
+        let mut tool_results: Vec<&Block> = Vec::new();
+        let mut rest_blocks: Vec<&Block> = Vec::new();
+        for &b in blocks {
+            if matches!(b, Block::ToolResult { .. }) {
+                tool_results.push(b);
+            } else {
+                rest_blocks.push(b);
+            }
+        }
+
+        let mut wrote = false;
+        for tr in tool_results {
+            wrote |= self.write_single_openai_tool_result(tr, resolver)?;
+        }
+        if !rest_blocks.is_empty() {
+            let text_role = if role == "tool" { "user" } else { role };
+            let redact = self.redact;
+            wrote |= self.write_message(text_role, |emit| {
+                if let Some(opts) = redact {
+                    let mut stats = crate::redact::RedactStats::default();
+                    render_blocks_impl(rest_blocks, resolver, Some((opts, &mut stats)), emit)
+                } else {
+                    render_blocks_into(rest_blocks, resolver, emit)
+                }
+            })?;
+        }
+        Ok(wrote)
+    }
+
+    fn write_single_openai_tool_result(
+        &mut self,
+        block: &Block,
+        resolver: &crate::lazy::Resolver,
+    ) -> std::io::Result<bool> {
+        let Block::ToolResult {
+            tool_use_id,
+            content,
+            tool_name,
+            ..
+        } = block
+        else {
+            return Ok(false);
+        };
+        let call_id: std::borrow::Cow<'_, str> = if tool_use_id.is_empty() {
+            std::borrow::Cow::Owned(self.pending_synth_ids.pop_front().unwrap_or_else(|| "call_0".into()))
+        } else {
+            std::borrow::Cow::Borrowed(tool_use_id.as_str())
+        };
+        self.open_item()?;
+        self.writer.write_all(b"{\"role\":\"tool\",\"tool_call_id\":\"")?;
+        write_json_escaped(self.writer, &call_id)?;
+        self.writer.write_all(b"\"")?;
+        if let Some(name) = tool_name.as_deref().filter(|n| !n.is_empty()) {
+            self.writer.write_all(b",\"name\":\"")?;
+            write_json_escaped(self.writer, name)?;
+            self.writer.write_all(b"\"")?;
+        }
+        self.writer.write_all(b",\"content\":\"")?;
+        stream_text_escaped(self.writer, content, resolver, self.redact)?;
+        self.writer.write_all(b"\"}")?;
+        Ok(true)
+    }
+
+    fn open_item(&mut self) -> std::io::Result<()> {
+        if self.started {
+            self.writer.write_all(b",")?;
+        } else {
+            self.writer.write_all(record_header(self.fmt))?;
+            self.started = true;
+        }
+        Ok(())
     }
 
     fn system_prompt(&mut self, prompt: &str) -> std::io::Result<bool> {
@@ -420,18 +824,13 @@ impl<'a, W: std::io::Write + ?Sized> RecordWriter<'a, W> {
         render: impl FnOnce(&mut dyn FnMut(&str) -> anyhow::Result<()>) -> anyhow::Result<()>,
     ) -> std::io::Result<bool> {
         let (role_key, content_key) = match self.fmt {
-            Format::Chatml => ("role", "content"),
+            Format::Chatml | Format::OpenAiTools => ("role", "content"),
             Format::ShareGpt => ("from", "value"),
         };
         // Keep the established lexicographic outer keys and insertion-ordered tool JSON.
         let role_first = role_key < content_key;
+        self.open_item()?;
         let w = &mut self.writer;
-        if self.started {
-            w.write_all(b",")?;
-        } else {
-            w.write_all(record_header(self.fmt))?;
-        }
-        self.started = true;
         if role_first {
             write!(w, "{{\"{role_key}\":\"{role}\",\"{content_key}\":\"")?;
         } else {
@@ -454,6 +853,106 @@ impl<'a, W: std::io::Write + ?Sized> RecordWriter<'a, W> {
         }
         Ok(self.started)
     }
+}
+
+fn stream_text_escaped<W: std::io::Write + ?Sized>(
+    w: &mut W,
+    text: &crate::lazy::Text,
+    resolver: &crate::lazy::Resolver,
+    redact: Option<&crate::redact::RedactOptions>,
+) -> std::io::Result<()> {
+    if let Some(opts) = redact {
+        let resolved = text.try_resolve(resolver).map_err(std::io::Error::other)?;
+        let mut stats = crate::redact::RedactStats::default();
+        let scrubbed = crate::redact::scrub_cow(&resolved, opts, &mut stats);
+        write_json_escaped(w, &scrubbed)
+    } else if let Some(s) = text.inline_str() {
+        write_json_escaped(w, s)
+    } else {
+        text.try_for_each_chunk(resolver, SPAN_CHUNK, |chunk| {
+            write_json_escaped(w, chunk).map_err(anyhow::Error::from)
+        })
+        .map_err(std::io::Error::other)
+    }
+}
+
+fn stream_json_arguments_escaped<W: std::io::Write + ?Sized>(
+    w: &mut W,
+    input: &crate::json::Json,
+    redact: Option<&crate::redact::RedactOptions>,
+) -> std::io::Result<()> {
+    struct EscapedJsonBytes<'a, W: std::io::Write + ?Sized> {
+        inner: &'a mut W,
+        carry: [u8; 4],
+        carry_len: usize,
+    }
+    impl<W: std::io::Write + ?Sized> std::io::Write for EscapedJsonBytes<'_, W> {
+        fn write(&mut self, mut buf: &[u8]) -> std::io::Result<usize> {
+            let total = buf.len();
+            if self.carry_len > 0 {
+                while self.carry_len < 4 && !buf.is_empty() {
+                    self.carry[self.carry_len] = buf[0];
+                    self.carry_len += 1;
+                    buf = &buf[1..];
+                    if let Ok(s) = std::str::from_utf8(&self.carry[..self.carry_len]) {
+                        write_json_escaped(self.inner, s)?;
+                        self.carry_len = 0;
+                        break;
+                    }
+                }
+                if self.carry_len == 4 {
+                    let s = std::str::from_utf8(&self.carry).map_err(std::io::Error::other)?;
+                    write_json_escaped(self.inner, s)?;
+                    self.carry_len = 0;
+                }
+            }
+            if !buf.is_empty() {
+                match std::str::from_utf8(buf) {
+                    Ok(s) => write_json_escaped(self.inner, s)?,
+                    Err(err) => {
+                        let valid = err.valid_up_to();
+                        if valid > 0 {
+                            let s = std::str::from_utf8(&buf[..valid]).map_err(std::io::Error::other)?;
+                            write_json_escaped(self.inner, s)?;
+                        }
+                        if err.error_len().is_some() {
+                            return Err(std::io::Error::other("invalid UTF-8 in tool JSON"));
+                        }
+                        let tail = &buf[valid..];
+                        self.carry[..tail.len()].copy_from_slice(tail);
+                        self.carry_len = tail.len();
+                    }
+                }
+            }
+            Ok(total)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            if self.carry_len != 0 {
+                return Err(std::io::Error::other("truncated UTF-8 in tool JSON"));
+            }
+            self.inner.flush()
+        }
+    }
+
+    let mut esc = EscapedJsonBytes {
+        inner: w,
+        carry: [0; 4],
+        carry_len: 0,
+    };
+    if let Some(opts) = redact {
+        if crate::redact::json_needs_scrub(input, opts).map_err(std::io::Error::other)? {
+            let mut owned = input.resolve().map_err(std::io::Error::other)?.into_owned();
+            let mut stats = crate::redact::RedactStats::default();
+            crate::redact::scrub_value(&mut owned, opts, &mut stats);
+            serde_json::to_writer(&mut esc, &owned).map_err(std::io::Error::other)?;
+        } else {
+            input.write_canonical(&mut esc).map_err(std::io::Error::other)?;
+        }
+    } else {
+        input.write_canonical(&mut esc).map_err(std::io::Error::other)?;
+    }
+    use std::io::Write as _;
+    esc.flush()
 }
 
 /// An adapter failed before a complete dataset record was available. Corpus callers may report
@@ -513,13 +1012,40 @@ pub fn stage_record(
     query: Option<&crate::SessionQuery>,
     text_sets: &crate::query::TextSets,
 ) -> anyhow::Result<Option<StagedRecord>> {
+    stage_record_with_options(
+        adapter,
+        r,
+        fmt,
+        redact,
+        min_messages,
+        query,
+        text_sets,
+        &DatasetOptions::default(),
+    )
+}
+
+/// Like [`stage_record`], applying [`DatasetOptions`] (active-branch selection, clean-outcome gate,
+/// and optional thinking omission).
+#[allow(clippy::too_many_arguments)]
+pub fn stage_record_with_options(
+    adapter: &dyn crate::harness::Adapter,
+    r: &crate::ir::SessionRef,
+    fmt: Format,
+    redact: Option<&crate::redact::RedactOptions>,
+    min_messages: usize,
+    query: Option<&crate::SessionQuery>,
+    text_sets: &crate::query::TextSets,
+    opts: &DatasetOptions,
+) -> anyhow::Result<Option<StagedRecord>> {
     use std::io::Write;
+    let needs_trajectory_pass = opts.active_branch_only || opts.clean_outcome_only;
     struct Sink<'a> {
         record: RecordWriter<'a, std::io::BufWriter<crate::harness::store::bytes::ByteStage>>,
         deferred: Option<crate::spill::Ordered<deferred::DeferredMessage>>,
         systems: crate::spill::Ordered<deferred::DeferredMessage>,
         min_messages: usize,
-        wait_query: bool,
+        wait_eof: bool,
+        needs_trajectory_pass: bool,
         sources: crate::json::SourceRegistry,
         resolver: crate::lazy::Resolver,
         facts: Option<crate::query::QueryReducer<'a>>,
@@ -545,12 +1071,18 @@ pub fn stage_record(
                     facts.observe(&message)?;
                 }
                 if let Some(deferred) = &mut self.deferred {
-                    if training_role(&message, matches!(self.record.fmt, Format::Chatml)).is_some()
-                        && !message_is_empty(&message)
-                    {
+                    let chat = matches!(self.record.fmt, Format::Chatml | Format::OpenAiTools);
+                    let keep = if self.needs_trajectory_pass {
+                        training_role(&message, chat).is_some()
+                            || message.kind == MessageKind::Error
+                            || message.id.is_some()
+                    } else {
+                        training_role(&message, chat).is_some() && !message_is_empty(&message)
+                    };
+                    if keep {
                         deferred.push(deferred::DeferredMessage::stage(message, &mut self.sources))?;
                     }
-                    if !self.wait_query && self.messages >= self.min_messages {
+                    if !self.wait_eof && self.messages >= self.min_messages {
                         for row in self.deferred.take().expect("deferred messages").rows()? {
                             let message = row?.restore(&self.sources)?;
                             self.render(message)?;
@@ -573,13 +1105,15 @@ pub fn stage_record(
             self.latch.take("dataset")
         }
     }
+    let wait_eof = query.is_some_and(|q| !q.is_empty()) || needs_trajectory_pass;
     let mut bytes = std::io::BufWriter::with_capacity(64 * 1024, crate::harness::store::bytes::ByteStage::new());
     let mut sink = Sink {
-        record: RecordWriter::new(&mut bytes, fmt, redact),
-        deferred: (query.is_some_and(|q| !q.is_empty()) || min_messages > 0).then(Default::default),
+        record: RecordWriter::new(&mut bytes, fmt, redact).with_include_thinking(opts.include_thinking),
+        deferred: (wait_eof || min_messages > 0).then(Default::default),
         systems: Default::default(),
         min_messages,
-        wait_query: query.is_some_and(|q| !q.is_empty()),
+        wait_eof,
+        needs_trajectory_pass,
         sources: Default::default(),
         resolver: crate::lazy::Resolver::new(Some(r.path.clone())),
         facts: query.map(crate::query::QueryReducer::new),
@@ -609,9 +1143,25 @@ pub fn stage_record(
         }
     }
     if let Some(deferred) = sink.deferred.take() {
-        for row in deferred.rows()? {
-            let message = row?.restore(&sink.sources)?;
-            sink.render(message)?;
+        if needs_trajectory_pass {
+            let mut restored = Vec::new();
+            for row in deferred.rows()? {
+                restored.push(row?.restore(&sink.sources)?);
+            }
+            let Some(selected) = select_trajectory(&restored, opts) else {
+                return Ok(None);
+            };
+            if selected.len() < min_messages {
+                return Ok(None);
+            }
+            for idx in selected {
+                sink.render(restored[idx].clone())?;
+            }
+        } else {
+            for row in deferred.rows()? {
+                let message = row?.restore(&sink.sources)?;
+                sink.render(message)?;
+            }
         }
     }
     let prompt = session
@@ -638,7 +1188,7 @@ pub fn stage_record(
     let leading = if let Some(prompt) = prompt.filter(|_| !represented) {
         let mut prefix = std::io::BufWriter::with_capacity(64 * 1024, crate::harness::store::bytes::ByteStage::new());
         {
-            let mut record = RecordWriter::new(&mut prefix, fmt, redact);
+            let mut record = RecordWriter::new(&mut prefix, fmt, redact).with_include_thinking(opts.include_thinking);
             record.system_prompt(prompt)?;
             if !has_body {
                 record.finish()?;
@@ -1357,7 +1907,7 @@ mod tests {
                 assert!(write_record(&fixture.session, &mut expected, format, None)?);
                 let parsed: Value = serde_json::from_slice(&expected)?;
                 let (array, role, content) = match format {
-                    Format::Chatml => ("messages", "role", "content"),
+                    Format::Chatml | Format::OpenAiTools => ("messages", "role", "content"),
                     Format::ShareGpt => ("conversations", "from", "value"),
                 };
                 assert_eq!(parsed[array].as_array().unwrap().len(), turns);
@@ -1450,7 +2000,7 @@ mod tests {
             assert!(!std::str::from_utf8(&actual)?.contains("private@example.com"));
             let value: Value = serde_json::from_slice(&actual)?;
             let (array, content) = match format {
-                Format::Chatml => ("messages", "content"),
+                Format::Chatml | Format::OpenAiTools => ("messages", "content"),
                 Format::ShareGpt => ("conversations", "value"),
             };
             assert_eq!(value[array].as_array().unwrap().len(), 1201);
@@ -1532,11 +2082,226 @@ mod tests {
                 },
             ],
         ));
-        for format in [Format::Chatml, Format::ShareGpt] {
+        for format in [Format::Chatml, Format::ShareGpt, Format::OpenAiTools] {
             let mut output = Vec::new();
             assert!(!write_record(&session, &mut output, format, None)?);
             assert!(output.is_empty());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn openai_tools_format_emits_structured_tool_calls_and_matches_staged_stream() -> anyhow::Result<()> {
+        let world = crate::test_world("dataset-openai-tools");
+        let path = world.base.join("source");
+        std::fs::write(&path, "stable")?;
+        let reference = crate::SessionRef::new("oai-1", Harness::OpenSession, path);
+
+        let mut s = Session::new("oai-1", Harness::OpenSession);
+        s.system_prompt = Some("You are a concise coding agent.".into());
+        s.messages = vec![
+            msg(
+                Role::User,
+                vec![Block::Text {
+                    text: "Run grep and summarize.".into(),
+                }],
+            ),
+            msg(
+                Role::Assistant,
+                vec![
+                    Block::Thinking {
+                        text: "Need to inspect matches first.".into(),
+                        signature: None,
+                        encrypted: None,
+                        redacted: false,
+                    },
+                    Block::ToolUse {
+                        id: "call_grep_1".into(),
+                        name: "Bash".into(),
+                        input: json!({"cmd": "rg -n foo src/", "secret": "sk-abcDEF1234567890ghijkl"}).into(),
+                        namespace: None,
+                    },
+                ],
+            ),
+            msg(
+                Role::Tool,
+                vec![Block::ToolResult {
+                    tool_use_id: "call_grep_1".into(),
+                    content: "src/lib.rs:10:foo".into(),
+                    is_error: false,
+                    tool_name: Some("Bash".into()),
+                    status: None,
+                    details: None,
+                }],
+            ),
+            msg(
+                Role::Assistant,
+                vec![Block::Text {
+                    text: "Found `foo` at `src/lib.rs:10`.".into(),
+                }],
+            ),
+        ];
+
+        assert_eq!(DatasetFormat::parse("openai-tools"), Some(Format::OpenAiTools));
+        assert_eq!(Format::OpenAiTools.as_str(), "openai-tools");
+
+        let redact = crate::redact::RedactOptions::default();
+        let mut raw = Vec::new();
+        assert!(write_record(&s, &mut raw, Format::OpenAiTools, Some(&redact))?);
+        let parsed: Value = serde_json::from_slice(&raw)?;
+        let msgs = parsed["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 5);
+        assert_eq!(
+            msgs[0],
+            json!({"role": "system", "content": "You are a concise coding agent."})
+        );
+        assert_eq!(msgs[1], json!({"role": "user", "content": "Run grep and summarize."}));
+        assert_eq!(msgs[2]["role"], "assistant");
+        assert!(
+            msgs[2]["content"].is_null(),
+            "textless tool call turn must emit content: null"
+        );
+        assert_eq!(msgs[2]["reasoning_content"], "Need to inspect matches first.");
+        let tcs = msgs[2]["tool_calls"].as_array().unwrap();
+        assert_eq!(tcs.len(), 1);
+        assert_eq!(tcs[0]["id"], "call_grep_1");
+        assert_eq!(tcs[0]["type"], "function");
+        assert_eq!(tcs[0]["function"]["name"], "Bash");
+        let args: Value = serde_json::from_str(tcs[0]["function"]["arguments"].as_str().unwrap())?;
+        assert_eq!(args["cmd"], "rg -n foo src/");
+        assert_eq!(args["secret"], "[REDACTED:api_key]");
+
+        assert_eq!(
+            msgs[3],
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_grep_1",
+                "name": "Bash",
+                "content": "src/lib.rs:10:foo"
+            })
+        );
+        assert_eq!(
+            msgs[4],
+            json!({
+                "role": "assistant",
+                "content": "Found `foo` at `src/lib.rs:10`."
+            })
+        );
+
+        // Verify exact byte parity with stage_record (both streaming and deferred query paths).
+        let fixture = SystemMetadataFixture {
+            session: s,
+            initial_prompt: None,
+        };
+        let mut expected = raw;
+        expected.push(b'\n');
+        let query = crate::SessionQuery::parse("model:present").map_err(anyhow::Error::msg)?;
+        let staged = stage_record(
+            &fixture,
+            &reference,
+            Format::OpenAiTools,
+            Some(&redact),
+            2,
+            Some(&query),
+            &Default::default(),
+        )?
+        .unwrap();
+        let mut actual = Vec::new();
+        staged.publish(&mut actual)?;
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn active_branch_and_clean_outcome_options_prune_rewinds_and_reject_broken_trajectories() -> anyhow::Result<()> {
+        let mut u1 = msg(
+            Role::User,
+            vec![Block::Text {
+                text: "v1 question".into(),
+            }],
+        );
+        u1.id = Some("m1".into());
+
+        // Abandoned branch off m1: failed tool call with error result.
+        let mut abandoned_a = msg(
+            Role::Assistant,
+            vec![Block::ToolUse {
+                id: "bad_call".into(),
+                name: "Bash".into(),
+                input: json!({"cmd": "false"}).into(),
+                namespace: None,
+            }],
+        );
+        abandoned_a.id = Some("m2_abandoned".into());
+        abandoned_a.parent_id = Some("m1".into());
+
+        let mut abandoned_tr = msg(
+            Role::Tool,
+            vec![Block::ToolResult {
+                tool_use_id: "bad_call".into(),
+                content: "exit 1".into(),
+                is_error: true,
+                tool_name: None,
+                status: None,
+                details: None,
+            }],
+        );
+        abandoned_tr.id = Some("m3_abandoned".into());
+        abandoned_tr.parent_id = Some("m2_abandoned".into());
+
+        // Active winning branch off m1: clean assistant completion.
+        let mut winning_a = msg(
+            Role::Assistant,
+            vec![Block::Text {
+                text: "clean final answer".into(),
+            }],
+        );
+        winning_a.id = Some("m2_win".into());
+        winning_a.parent_id = Some("m1".into());
+
+        let branched = session(vec![u1.clone(), abandoned_a.clone(), abandoned_tr.clone(), winning_a]);
+        let opts = DatasetOptions {
+            active_branch_only: true,
+            clean_outcome_only: true,
+            include_thinking: false,
+        };
+        let mut out = Vec::new();
+        assert!(write_record_with_options(
+            &branched,
+            &mut out,
+            Format::OpenAiTools,
+            None,
+            &opts
+        )?);
+        let v: Value = serde_json::from_slice(&out)?;
+        assert_eq!(
+            v["messages"],
+            json!([
+                {"role": "user", "content": "v1 question"},
+                {"role": "assistant", "content": "clean final answer"}
+            ])
+        );
+
+        // Session ending in an unrecovered tool error or dangling ToolUse is rejected by clean_outcome_only.
+        let failed = session(vec![u1.clone(), abandoned_a.clone(), abandoned_tr]);
+        let mut rejected = Vec::new();
+        assert!(!write_record_with_options(
+            &failed,
+            &mut rejected,
+            Format::OpenAiTools,
+            None,
+            &opts
+        )?);
+        assert!(rejected.is_empty());
+
+        let dangling = session(vec![u1, abandoned_a]);
+        assert!(!write_record_with_options(
+            &dangling,
+            &mut rejected,
+            Format::OpenAiTools,
+            None,
+            &opts
+        )?);
         Ok(())
     }
 }
