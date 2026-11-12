@@ -343,7 +343,17 @@ pub(crate) use cv_core::rows::session_row;
 // ---------- display ----------
 
 pub(crate) fn short_id(id: &str) -> String {
-    id.chars().take(8).collect()
+    short_id_len(id, 8)
+}
+
+/// Shorten an id while keeping `"agent-"` intact (`"agent-"` + at least `min_bare` chars, so
+/// `"agent-ae84249a…"` becomes `"agent-ae84249a"`, never 2-hex `"agent-ae"`).
+pub(crate) fn short_id_len(id: &str, min_bare: usize) -> String {
+    let take = min_bare.max(8);
+    match id.strip_prefix("agent-") {
+        Some(bare) => format!("agent-{}", bare.chars().take(take).collect::<String>()),
+        None => id.chars().take(take).collect(),
+    }
 }
 
 /// Format a UTC instant in the **local** timezone. Every human-facing time cv prints goes through
@@ -659,5 +669,16 @@ mod interval_tests {
         }
         assert_eq!(poll_interval(0.0).unwrap(), Duration::from_millis(250));
         assert_eq!(poll_interval(1.5).unwrap(), Duration::from_millis(1500));
+    }
+
+    #[test]
+    fn short_id_keeps_eight_bare_chars_past_agent_prefix() {
+        assert_eq!(short_id("agent-ae84249a11223344"), "agent-ae84249a");
+        assert_eq!(short_id("agent-aaa1"), "agent-aaa1");
+        assert_eq!(short_id("019c1234-5678-7abc-8000-000000000001"), "019c1234");
+        assert_eq!(
+            short_id_len("019c1234-5678-7abc-8000-000000000001", 16),
+            "019c1234-5678-7a"
+        );
     }
 }

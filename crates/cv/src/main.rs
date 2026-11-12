@@ -652,7 +652,7 @@ enum Cmd {
         #[arg(long, conflicts_with = "agent_of")]
         session: bool,
         /// Emit a new sub-agent transcript owned by this ROOT session (id or transcript path).
-        #[arg(long, value_name = "ROOT")]
+        #[arg(long, visible_alias = "into", value_name = "ROOT")]
         agent_of: Option<String>,
         /// With --agent-of: the model the new sub-agent runs on, written to its meta (`opus`,
         /// `sonnet`, a full model id, or `inherit`: the root's current model, which is also what
@@ -740,7 +740,12 @@ enum Cmd {
         #[arg(long, conflicts_with_all = ["agent_of", "harness", "export"])]
         session: bool,
         /// Emit a new sub-agent transcript owned by this ROOT session (id or transcript path).
-        #[arg(long, value_name = "ROOT", conflicts_with_all = ["harness", "export", "out", "cwd"])]
+        #[arg(
+            long,
+            visible_alias = "into",
+            value_name = "ROOT",
+            conflicts_with_all = ["harness", "export", "out", "cwd"]
+        )]
         agent_of: Option<String>,
         /// Target harness for the composed session (defaults to the first spec's harness).
         #[arg(long)]
@@ -795,6 +800,9 @@ enum Cmd {
         /// Restored Claude skills: keep all, drop all, or drop entries whose files changed or disappeared.
         #[arg(long = "skills", value_parser = ["keep", "drop", "drop-stale"], default_value = "keep")]
         skills: String,
+        /// Emit the result as JSON on stdout (`path`, `id`, `harness`, `resume_hint`, `warnings`).
+        #[arg(long)]
+        json: bool,
     },
     /// Print (or with --launch, run) the resume incantation for a session in its native harness.
     Resume {
@@ -1247,6 +1255,7 @@ fn run() -> Result<()> {
             strict,
             thinking,
             skills,
+            json,
         } => port::cmd_port(
             &id,
             harness,
@@ -1256,6 +1265,7 @@ fn run() -> Result<()> {
             strict,
             thinking.as_deref().map(util::parse_thinking).transpose()?,
             skills.parse()?,
+            json,
         ),
         Cmd::Index {
             semantic,

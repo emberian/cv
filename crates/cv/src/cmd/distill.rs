@@ -15,7 +15,7 @@
 //! Neither command ever writes to the source session. Elided tool outputs go to a sidecar next to
 //! the new transcript (`<stem>.flat.jsonl`), which `cv cat <new> <tool_use_id>` reads.
 
-use crate::util::{parse_harness, report, resolve, short_id, usage};
+use crate::util::{parse_harness, report, resolve, resolve_found, short_id, split_harness_id, usage};
 use anyhow::{bail, Context, Result};
 use cv_core::distill::{distill_pack, findings, prepare_distill, DistillOptions, Distilled, PreparedDistillation};
 use cv_core::emit::Grown;
@@ -70,14 +70,39 @@ pub(crate) fn resolve_source(
     harness: Option<Harness>,
 ) -> Result<(SessionRef, Box<dyn cv_core::harness::Adapter>)> {
     let p = Path::new(spec);
-    let resolved = if p.is_file() {
+    if p.is_file() {
         let h = harness.unwrap_or_else(cv_core::harness::derived_host);
         let a = cv_core::harness::for_harness(h).with_context(|| format!("no adapter for {h}"))?;
-        (SessionRef::from_path(p, h), a)
-    } else {
-        resolve(spec, harness)?
+        return Ok((SessionRef::from_path(p, h), a));
+    }
+    let (want, id) = split_harness_id(spec, harness);
+    if id.starts_with("agent-") {
+        if let Some((sub, adapter)) = crate::cmd::view::resolve_agent_fleetwide(id, want)? {
+            return Ok((sub.session, adapter));
+        }
+    }
+    let found = match cv_core::find_cheap(id, want) {
+        Ok(Some(hit)) => Ok(Some(hit)),
+        Ok(None) => {
+            if let Some((sub, adapter)) = crate::cmd::view::resolve_agent_fleetwide(id, want)? {
+                return Ok((sub.session, adapter));
+            }
+            if !p.exists() {
+                if let Some((parent_spec, agent_spec)) = id.split_once('/') {
+                    let (parent, adapter) = resolve(parent_spec, want)?;
+                    let sub = crate::cmd::view::resolve_subagent(&parent, agent_spec)?;
+                    return Ok((sub.session, adapter));
+                }
+            }
+            cv_core::find(id, want)
+        }
+        Err(e) => Err(e),
     };
-    Ok(resolved)
+    match found {
+        Ok(Some(hit)) => Ok(hit),
+        Ok(None) => usage(format!("no session (and no sub-agent) matching {id:?}")),
+        Err(e) => resolve_found(Err(e), id, want),
+    }
 }
 
 /// Resolve a session spec: an existing transcript path (read as the derived host's, Claude's,
@@ -85,10 +110,9 @@ pub(crate) fn resolve_source(
 #[cfg(test)]
 fn load(spec: &str, harness: Option<Harness>) -> Result<(Session, PathBuf)> {
     let (r, adapter) = resolve_source(spec, harness)?;
-    let p = Path::new(spec);
     let mut s = adapter.parse(&r)?;
     s.materialize()?;
-    enrich_path_meta(&mut s, p);
+    enrich_path_meta(&mut s, &r.path);
     let path = r.path.clone();
     Ok((s, path))
 }
@@ -101,7 +125,7 @@ type Loaded = (Session, PathBuf, Option<Grown>);
 fn load_distill(spec: &str, harness: Option<Harness>) -> Result<Loaded> {
     let (reference, adapter) = resolve_source(spec, harness)?;
     let (mut session, _, grown) = cv_core::emit::prepare_selected(adapter.as_ref(), &reference, 0, None)?;
-    enrich_path_meta(&mut session, Path::new(spec));
+    enrich_path_meta(&mut session, &reference.path);
     Ok((session, reference.path, grown))
 }
 
@@ -113,7 +137,7 @@ fn load_upto(spec: &str, harness: Option<Harness>, upto: usize) -> Result<Loaded
     if upto == 0 || upto > total {
         return usage(format!("--upto {upto}: the session has {total} messages"));
     }
-    enrich_path_meta(&mut session, Path::new(spec));
+    enrich_path_meta(&mut session, &reference.path);
     Ok((session, reference.path, grown))
 }
 

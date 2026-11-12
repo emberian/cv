@@ -3,7 +3,7 @@
 //! These read [`cv_core::sessions`] (the probed catalog — milliseconds warm, transparently a full
 //! discovery when cold/stale); `cv ls --fresh` forces [`cv_core::discover_all`]'s full scan.
 
-use crate::util::{dim_cwd, parse_harness, session_row, short_id};
+use crate::util::{dim_cwd, parse_harness, session_row, short_id_len};
 use anyhow::{Context, Result};
 use cv_core::ir::{truncate, SessionRef};
 use cv_core::sanitize::sanitize_line;
@@ -324,13 +324,21 @@ pub(crate) fn cmd_ls(args: LsArgs<'_>) -> Result<()> {
     }
     // The exists() check guards the catalog read path's one residual lie — a session deleted since
     // the probe last looked — and is bounded by `limit`, not the fleet (it stats only listed rows).
-    for r in refs.iter().filter(|r| r.path.exists()).take(limit) {
+    let shown: Vec<&SessionRef> = refs.iter().filter(|r| r.path.exists()).take(limit).collect();
+    let plen = cv_core::task::unique_prefix_len(shown.iter().map(|r| r.id.strip_prefix("agent-").unwrap_or(&r.id)), 8);
+    let id_col = shown
+        .iter()
+        .map(|r| short_id_len(&r.id, plen).chars().count())
+        .max()
+        .unwrap_or(8)
+        .max(8);
+    for r in shown {
         // Titles/cwds are transcript-derived (untrusted, replayed forever) — sanitize at the
         // terminal seam (G5), exactly like task/board rows.
         println!(
-            "{:8}  {:8}  {}  {:>4} msg  {}",
+            "{:8}  {:id_col$}  {}  {:>4} msg  {}",
             r.harness.as_str(),
-            short_id(&r.id),
+            short_id_len(&r.id, plen),
             crate::util::fmt_span(r.created_at, r.updated_at),
             r.message_count.map_or("–".to_string(), |n| n.to_string()),
             r.title

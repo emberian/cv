@@ -474,6 +474,11 @@ fn resolve_show_target(
             if let Some((sub, adapter)) = resolve_agent_fleetwide(id, want)? {
                 return Ok((sub.session.clone(), adapter, Some(sub)));
             }
+            if let Some((parent_spec, agent_spec)) = id.split_once('/') {
+                let (parent, adapter) = resolve(parent_spec, want)?;
+                let sub = resolve_subagent(&parent, agent_spec)?;
+                return Ok((sub.session.clone(), adapter, Some(sub)));
+            }
             cv_core::find(id, want)
         }
         Err(e) => Err(e),

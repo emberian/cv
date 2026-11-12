@@ -695,3 +695,70 @@ fn lanes_endpoint_comes_from_the_lanes_own_shell_exports_only() {
     let (out, _) = w.cv_ok(&["lanes", SID, "--tasks"]);
     assert!(!out.contains("lane:child"), "no lane is the child:\n{out}");
 }
+
+#[test]
+fn universal_subagent_addressing_ls_prefix_and_port_json() {
+    let w = build_world("universal-addr");
+    // Same-second UUIDv7 sessions share their first 15 chars: `cv ls` grows the ID prefix.
+    let v7_a = "019c1234-5678-7aaa-8000-000000000001";
+    let v7_b = "019c1234-5678-7bbb-8000-000000000002";
+    w.write_session(v7_a, &[user(v7_a, "va0", "2026-10-02T10:00:00Z", "first v7")]);
+    w.write_session(v7_b, &[user(v7_b, "vb0", "2026-10-02T10:00:01Z", "second v7")]);
+    let (ls_out, _) = w.cv_ok(&["ls"]);
+    assert!(
+        ls_out.contains("019c1234-5678-7a") && ls_out.contains("019c1234-5678-7b"),
+        "same-second UUIDv7 rows disambiguate in cv ls:\n{ls_out}"
+    );
+
+    // Long sub-agent hex id renders `agent-` + 8 hex chars (never `agent-ae`), and bare
+    // `<agent-id>` / `<parent>/<agent>` work across show, distill (--into), splice (--into), rewind.
+    let long_agent = "ae84249a11223344";
+    write_agent(
+        &w,
+        SID,
+        long_agent,
+        "LANE-LONG: sub-agent with 16-hex id",
+        &[
+            user(SID, "la0", "2026-10-01T10:00:10Z", "Investigate short_id."),
+            assistant_tool(
+                "la1",
+                "2026-10-01T10:00:20Z",
+                "Bash",
+                serde_json::json!({"command": "cargo check"}),
+            ),
+            tool_result("la2", "2026-10-01T10:00:30Z", "toolu_la1", "ok"),
+            assistant("la3", "2026-10-01T10:00:40Z", "Done checking."),
+        ],
+    );
+
+    let (show_slash, _) = w.cv_ok(&["show", &format!("{SID}/{long_agent}"), "--json"]);
+    let parsed: serde_json::Value = serde_json::from_str(&show_slash).unwrap();
+    assert_eq!(parsed["id"], format!("agent-{long_agent}"));
+
+    // Bare `<agent-id>` in distill + `--into` alias on `--agent-of`, plus `agent-ae84249a` short_id.
+    let (dist_json, dist_err) = w.cv_ok(&["distill", long_agent, "--into", SID, "--keep-source", "--json"]);
+    assert!(
+        dist_err.contains("agent-ae84249a"),
+        "short_id keeps 8 hex chars past agent-:\n{dist_err}"
+    );
+    let dist_val: serde_json::Value = serde_json::from_str(&dist_json).unwrap();
+    assert!(dist_val["emitted"]["agent_id"].as_str().is_some(), "{dist_json}");
+
+    // Bare `<agent-id>` in splice + `--into` alias on `--agent-of`.
+    let (sp_json, _) = w.cv_ok(&["splice", &format!("{long_agent}:..2"), "--into", SID, "--json"]);
+    let sp_val: serde_json::Value = serde_json::from_str(&sp_json).unwrap();
+    assert!(sp_val["agent_id"].as_str().is_some(), "{sp_json}");
+
+    // Bare `<agent-id>` in rewind.
+    let (rw_json, _) = w.cv_ok(&["rewind", long_agent, "--dry-run", "--json"]);
+    let rw_val: serde_json::Value = serde_json::from_str(&rw_json).unwrap();
+    assert_eq!(rw_val["subagent"], true, "{rw_json}");
+
+    // `cv port --json` emits structured JSON on stdout.
+    let port_out = w.base.join("ported");
+    let (port_json, _) = w.cv_ok(&["port", SID, "--out", port_out.to_str().unwrap(), "--json"]);
+    let port_val: serde_json::Value = serde_json::from_str(&port_json).unwrap();
+    assert_eq!(port_val["harness"], "claude", "{port_json}");
+    assert!(port_val["path"].as_str().is_some(), "{port_json}");
+    assert!(port_val["id"].as_str().is_some(), "{port_json}");
+}

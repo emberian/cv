@@ -31,9 +31,10 @@ pub(crate) fn cmd_port(
     strict: bool,
     thinking: Option<cv_core::emit::ThinkingMode>,
     skills_policy: SkillsPolicy,
+    json: bool,
 ) -> Result<()> {
     // The source harness rides on the id (`codex:019e…`); `--harness` is the TARGET.
-    let (r, adapter) = resolve(id, None)?;
+    let (r, adapter) = crate::cmd::distill::resolve_source(id, None)?;
     let to_h = match &harness {
         Some(s) => Harness::parse(s).with_context(|| format!("unknown target harness: {s}"))?,
         None => r.harness, // a pure rehome
@@ -55,7 +56,7 @@ pub(crate) fn cmd_port(
         )
     });
     let new_cwd = cwd.clone();
-    let written = emit_session(
+    let written = emit_session_output(
         &session,
         to_h,
         out,
@@ -66,9 +67,14 @@ pub(crate) fn cmd_port(
             parsed_at: cv_core::emit::ParsedAt::for_port(r.harness, to_h),
             ..Default::default()
         },
+        json,
     )?;
     if let Some(grown) = grown {
-        println!("  ↳ read {grown}");
+        if json {
+            eprintln!("  ↳ read {grown}");
+        } else {
+            println!("  ↳ read {grown}");
+        }
     }
 
     if skills_policy != SkillsPolicy::Keep {
@@ -77,13 +83,17 @@ pub(crate) fn cmd_port(
         let report = rewrite_file(&written, skills_policy, config.as_deref())?;
         let mut h = String::new();
         crate::cmd::reshape::skills_line(&mut h, &report);
-        print!("{h}");
+        if json {
+            eprint!("{h}");
+        } else {
+            print!("{h}");
+        }
     }
 
     // Carry the project's context files to the new home, so the ported session keeps its memory.
     if !no_context {
         if let (Some(src), Some(dst)) = (session.cwd.as_deref(), new_cwd.as_deref()) {
-            carry_context(src, dst);
+            carry_context(src, dst, json);
         }
     }
     Ok(())
@@ -101,7 +111,7 @@ const CONTEXT_FILES: &[&str] = &[
     ".windsurfrules",
 ];
 
-fn carry_context(src: &Path, dst: &Path) {
+fn carry_context(src: &Path, dst: &Path, json: bool) {
     if src == dst {
         return;
     }
@@ -124,7 +134,11 @@ fn carry_context(src: &Path, dst: &Path) {
         }
     }
     if !copied.is_empty() {
-        println!("  ↳ carried context: {}", copied.join(", "));
+        if json {
+            eprintln!("  ↳ carried context: {}", copied.join(", "));
+        } else {
+            println!("  ↳ carried context: {}", copied.join(", "));
+        }
     }
 }
 
