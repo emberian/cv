@@ -530,6 +530,72 @@ fn scan_session(path: &Path) -> Result<Option<Scan>> {
 // small helpers
 // ---------------------------------------------------------------------------
 
+/// Parse an in-memory Continue session JSON document (used by [`crate::ingest`], wasm-safe).
+pub(crate) fn parse_str(id: &str, text: &str) -> Result<Session> {
+    use crate::harness::store::document::range::RangeSource;
+    let source = RangeSource::text(None, text, 0, false);
+    let Some(val) = source.accept(source.range(), Validation::Syntax)? else {
+        anyhow::bail!("empty Continue session document");
+    };
+    let root = JsonView::of(&source, val);
+    let Some(doc) = Fields::parse_struct(root, &["sessionId", "title", "workspaceDirectory", "history"])? else {
+        return Err(InvalidStruct("expected Continue session struct").into());
+    };
+    let resolved_id = doc
+        .string("sessionId")?
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| id.to_owned());
+    let title = record::title(doc.get("title"), true)?;
+    let workspace = optional_string(doc.get("workspaceDirectory"))?;
+    let history = match doc.get("history").map(JsonView::accepted_array).transpose()? {
+        Some(None) => return Err(InvalidStruct("expected Continue history array").into()),
+        array => array.flatten(),
+    };
+    let mut s = Session {
+        cwd: workspace.filter(|p| !p.is_empty()).map(|p| workspace_to_path(&p)),
+        title,
+        ..Session::new(resolved_id, Harness::Continue)
+    };
+    let mut collect = crate::stream::CollectSink::default();
+    {
+        let mut spawns = crate::affordance::AffordanceSink::new(Harness::Continue, &mut collect);
+        spawns.meta(&s);
+        let mut answered = std::collections::HashSet::<String>::new();
+        for item in history.into_iter().flatten() {
+            let Some(item) = item? else { continue };
+            let reply_id = record::reply_id(item)?;
+            if reply_id.is_some_and(|id| answered.contains(&id)) {
+                continue;
+            }
+            let (message, results) = record::messages(item, false, &mut s.model)?;
+            if let Some(message) = message {
+                if s.system_prompt.is_none() && message.kind == MessageKind::SystemPrompt {
+                    let mut text_message = message.clone();
+                    text_message.try_materialize_text(&s.resolver())?;
+                    if let Some(t) = text_message.text().filter(|t| !t.trim().is_empty()) {
+                        s.system_prompt = Some(t);
+                    }
+                }
+                if spawns.try_message(message)? == Flow::Stop {
+                    break;
+                }
+            }
+            if let Some(results) = results {
+                for block in &results.content {
+                    if let Block::ToolResult { tool_use_id, .. } = block {
+                        answered.insert(tool_use_id.clone());
+                    }
+                }
+                if spawns.try_message(results)? == Flow::Stop {
+                    break;
+                }
+            }
+        }
+    }
+    s.messages = collect.messages;
+    Ok(s)
+}
+
 /// Continue's `workspaceDirectory` may be a `file://` URI (including `file://localhost/...`,
 /// Windows `file:///C:/...`, and percent-encoded UTF-8 like `%20`) or a plain path. Normalize to a path.
 fn workspace_to_path(s: &str) -> PathBuf {

@@ -5,12 +5,27 @@
 //! OWNED BY the wasm-ingest work. `cv-core::lib` declares this module.
 
 use crate::harness::store::document::range::{RangeSource, Validation};
-use crate::harness::{antigravity, claude, codex, gemini};
+use crate::harness::{antigravity, claude, codex, continuedev, export, gemini, openclaw, opensession, qwen};
 use crate::ir::Session;
 use crate::json::JsonView;
+use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "zip-ingest")]
 pub mod archive;
+
+/// Structured diagnostic for a zip/upload entry that produced no session during ingestion.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkippedEntry {
+    pub path: String,
+    pub reason: String,
+}
+
+/// Complete ingestion result: parsed [`Session`]s alongside structured diagnostics for skipped entries.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct IngestReport {
+    pub sessions: Vec<Session>,
+    pub skipped: Vec<SkippedEntry>,
+}
 
 /// Strict borrowed shape inspection: ignored uploaded bodies never become a second Value tree.
 fn inspect<T>(text: &str, f: impl FnOnce(JsonView<'_>) -> T) -> Option<T> {
@@ -48,7 +63,32 @@ enum Sniff {
     Claude,
     Gemini,
     Antigravity,
+    Qwen,
+    OpenClaw,
+    OpenSession,
+    Export,
+    Continue,
     Unknown,
+}
+
+/// Is this JSONL line a Qwen 0.25 `ChatRecord` (`{uuid, parentUuid, sessionId, type, message:{parts}, ...}`)?
+/// Checked BEFORE Gemini and Claude so `type:"user"|"assistant"` + `sessionId`/`parentUuid` never
+/// misclassifies Qwen 0.25 transcripts as Claude or Gemini.
+fn is_qwen_chat_record_view(raw: JsonView<'_>) -> bool {
+    let r = fields(raw);
+    let has_thread = r.get("sessionId").is_some() || r.get("parentUuid").is_some();
+    if !has_thread {
+        return false;
+    }
+    let ty = r.string("type").unwrap_or_default();
+    if !matches!(ty.as_str(), "user" | "assistant" | "system" | "tool_result") {
+        return false;
+    }
+    let msg_has_parts = r.get("message").map(fields).is_some_and(|m| m.get("parts").is_some());
+    msg_has_parts
+        || r.get("usageMetadata").is_some()
+        || r.get("toolCallResult").is_some()
+        || r.get("systemPayload").is_some()
 }
 
 /// The file stem (basename without extension), used as a fallback session id.
@@ -70,6 +110,9 @@ fn sniff(name: &str, text: &str) -> Sniff {
     let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
     let lower = base.to_ascii_lowercase();
     let is_jsonl = lower.ends_with(".jsonl");
+    if lower.ends_with(".opensession.json") {
+        return Sniff::OpenSession;
+    }
     if let Some(first) = first_non_empty_line(text) {
         if first.starts_with('[') {
             if inspect(text, |raw| {
@@ -85,7 +128,28 @@ fn sniff(name: &str, text: &str) -> Sniff {
             {
                 return Sniff::Gemini;
             }
+            if !lower.starts_with("rollout-")
+                && inspect(text, |raw| {
+                    items(raw).take(8).any(|item| {
+                        let item = fields(item);
+                        item.get("mapping").is_some() || item.get("chat_messages").is_some()
+                    })
+                })
+                .unwrap_or(false)
+            {
+                return Sniff::Export;
+            }
         } else if first.starts_with('{') {
+            if !is_jsonl
+                && !lower.starts_with("rollout-")
+                && inspect(text, |raw| {
+                    let record = fields(raw);
+                    record.get("open_session").is_some() || record.get("openSession").is_some()
+                })
+                .unwrap_or(false)
+            {
+                return Sniff::OpenSession;
+            }
             if inspect(text, |raw| {
                 let record = fields(raw);
                 (record.get("messages").is_some()
@@ -99,7 +163,48 @@ fn sniff(name: &str, text: &str) -> Sniff {
             {
                 return Sniff::Gemini;
             }
+            if !is_jsonl && !lower.starts_with("rollout-") && lower != "sessions.json" {
+                if let Some(doc_sniff) = inspect(text, |raw| {
+                    let record = fields(raw);
+                    if record.get("mapping").is_some() || record.get("chat_messages").is_some() {
+                        return Some(Sniff::Export);
+                    }
+                    if let Some(hist) = record.get("history") {
+                        if record.get("workspaceDirectory").is_some()
+                            || items(hist).take(8).any(|item| fields(item).get("message").is_some())
+                        {
+                            return Some(Sniff::Continue);
+                        }
+                    }
+                    None
+                })
+                .flatten()
+                {
+                    return doc_sniff;
+                }
+            }
+            // Disambiguate Qwen 0.25 `ChatRecord` BEFORE Gemini JSONL and Claude JSONL.
+            if !lower.starts_with("rollout-")
+                && text
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .take(8)
+                    .any(|line| inspect(line, is_qwen_chat_record_view).unwrap_or(false))
+            {
+                return Sniff::Qwen;
+            }
             if is_jsonl {
+                if inspect(first, |raw| {
+                    let v = fields(raw);
+                    v.string("type").as_deref() == Some("session")
+                        && v.get("version").is_some()
+                        && v.get("id").is_some()
+                })
+                .unwrap_or(false)
+                {
+                    return Sniff::OpenClaw;
+                }
                 if inspect(first, |raw| {
                     let v = fields(raw);
                     v.get("projectHash").is_some() || v.get("messages").is_some()
@@ -229,11 +334,48 @@ fn antigravity_id_and_rank(name: &str) -> (String, u8) {
 /// Ingest a set of in-memory files (e.g. the contents of an uploaded zip) into sessions.
 ///
 /// Each file's bytes are decoded as UTF-8 (lossy) and its harness sniffed by content. Files that
-/// can't be classified are skipped. Works without any filesystem access (wasm-safe).
+/// can't be classified are skipped; use [`ingest_files_with_report`] for structured skipped-entry
+/// diagnostics. Works without any filesystem access on wasm32, and supports temp-staged SQLite and
+/// companion-file stores on native builds.
 pub fn ingest_files(files: Vec<(String, Vec<u8>)>) -> anyhow::Result<Vec<Session>> {
+    Ok(ingest_files_with_report(files)?.sessions)
+}
+
+/// Extract and ingest a `.zip` archive in one call, returning both parsed sessions and structured
+/// skipped-entry diagnostics.
+#[cfg(feature = "zip-ingest")]
+pub fn ingest_zip(reader: impl std::io::Read + std::io::Seek) -> anyhow::Result<IngestReport> {
+    let files = archive::extract(reader, archive::Limits::default())?;
+    ingest_files_with_report(files)
+}
+
+fn is_sqlite_bytes(name: &str, bytes: &[u8]) -> bool {
+    let lower = name.to_ascii_lowercase();
+    bytes.starts_with(b"SQLite format 3\0")
+        || lower.ends_with(".sqlite")
+        || lower.ends_with(".sqlite3")
+        || lower.ends_with(".db")
+        || lower.ends_with(".vscdb")
+}
+
+fn is_sqlite_sidecar(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.ends_with("-wal") || lower.ends_with("-shm") || lower.ends_with("-journal")
+}
+
+/// Ingest `(relative_path, bytes)` pairs and return both parsed sessions and structured
+/// diagnostics for skipped entries.
+pub fn ingest_files_with_report(files: Vec<(String, Vec<u8>)>) -> anyhow::Result<IngestReport> {
     let mut out = Vec::new();
+    let mut skipped = Vec::new();
     let mut agy_candidates: std::collections::BTreeMap<String, (u8, usize, String)> = std::collections::BTreeMap::new();
+    let mut pending_unknown: Vec<(String, Vec<u8>)> = Vec::new();
+
     for (idx, (name, bytes)) in files.into_iter().enumerate() {
+        if is_sqlite_bytes(&name, &bytes) || is_sqlite_sidecar(&name) {
+            pending_unknown.push((name, bytes));
+            continue;
+        }
         let text = String::from_utf8_lossy(&bytes);
         match sniff(&name, &text) {
             Sniff::Codex { is_jsonl } => {
@@ -256,7 +398,27 @@ pub fn ingest_files(files: Vec<(String, Vec<u8>)>) -> anyhow::Result<Vec<Session
                     agy_candidates.insert(id, (rank, idx, text.into_owned()));
                 }
             }
-            Sniff::Unknown => {}
+            Sniff::Qwen => {
+                let id = file_stem(&name).to_string();
+                out.push(qwen::parse_str(&id, &text)?);
+            }
+            Sniff::OpenClaw => {
+                let id = file_stem(&name).to_string();
+                out.push(openclaw::parse_str(&id, &text)?);
+            }
+            Sniff::OpenSession => {
+                out.push(opensession::from_str(&text)?);
+            }
+            Sniff::Export => {
+                out.extend(export::parse_all_str(&text)?);
+            }
+            Sniff::Continue => {
+                let id = file_stem(&name).to_string();
+                out.push(continuedev::parse_str(&id, &text)?);
+            }
+            Sniff::Unknown => {
+                pending_unknown.push((name, bytes));
+            }
         }
     }
     let mut agy_ordered: Vec<(usize, String, String)> = agy_candidates
@@ -267,7 +429,284 @@ pub fn ingest_files(files: Vec<(String, Vec<u8>)>) -> anyhow::Result<Vec<Session
     for (_, id, text) in agy_ordered {
         out.push(antigravity::parse_str(&id, &text, None)?);
     }
-    Ok(out)
+
+    if !pending_unknown.is_empty() {
+        ingest_pending_entries(pending_unknown, &mut out, &mut skipped)?;
+    }
+
+    Ok(IngestReport { sessions: out, skipped })
+}
+
+#[cfg(target_arch = "wasm32")]
+fn ingest_pending_entries(
+    pending: Vec<(String, Vec<u8>)>,
+    _out: &mut Vec<Session>,
+    skipped: &mut Vec<SkippedEntry>,
+) -> anyhow::Result<()> {
+    for (name, bytes) in pending {
+        if is_sqlite_sidecar(&name) {
+            continue;
+        }
+        let reason = if is_sqlite_bytes(&name, &bytes) {
+            "SQLite store requires native sqlite support".to_string()
+        } else {
+            "unrecognized or non-transcript file".to_string()
+        };
+        skipped.push(SkippedEntry { path: name, reason });
+    }
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn sanitize_relative_path(raw: &str) -> Option<std::path::PathBuf> {
+    use std::path::{Component, Path, PathBuf};
+    let mut clean = PathBuf::new();
+    for comp in Path::new(raw).components() {
+        match comp {
+            Component::Normal(seg) => clean.push(seg),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    (!clean.as_os_str().is_empty()).then_some(clean)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn ingest_pending_entries(
+    pending: Vec<(String, Vec<u8>)>,
+    out: &mut Vec<Session>,
+    skipped: &mut Vec<SkippedEntry>,
+) -> anyhow::Result<()> {
+    use crate::harness::{Adapter as _, Parse as _};
+
+    let has_stageable = pending.iter().any(|(name, bytes)| {
+        let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
+        is_sqlite_bytes(name, bytes)
+            || is_sqlite_sidecar(name)
+            || matches!(
+                base,
+                "summary.json"
+                    | "chat_history.jsonl"
+                    | "ui_messages.json"
+                    | "api_conversation_history.json"
+                    | "wire.jsonl"
+            )
+            || base.ends_with(".conversation.json")
+    });
+
+    if !has_stageable {
+        for (name, _) in pending {
+            skipped.push(SkippedEntry {
+                path: name,
+                reason: "unrecognized or non-transcript file".into(),
+            });
+        }
+        return Ok(());
+    }
+
+    let temp_root = std::env::temp_dir().join(format!("cv-ingest-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&temp_root)?;
+    struct TempGuard(std::path::PathBuf);
+    impl Drop for TempGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _guard = TempGuard(temp_root.clone());
+
+    let mut staged_paths: Vec<(String, std::path::PathBuf, bool)> = Vec::new();
+    for (name, bytes) in pending {
+        let Some(rel) = sanitize_relative_path(&name) else {
+            skipped.push(SkippedEntry {
+                path: name,
+                reason: "unsafe relative path in archive".into(),
+            });
+            continue;
+        };
+        let full = temp_root.join(&rel);
+        if let Some(parent) = full.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&full, &bytes)?;
+        let sqlite_like = is_sqlite_bytes(&name, &bytes);
+        staged_paths.push((name, full, sqlite_like));
+    }
+
+    let mut claimed_files: std::collections::HashSet<std::path::PathBuf> = std::collections::HashSet::new();
+
+    #[cfg(feature = "sqlite")]
+    for (orig_name, full_path, sqlite_like) in &staged_paths {
+        if !*sqlite_like {
+            continue;
+        }
+        if let Ok(conn) = crate::harness::store::sqlite::open_ro(full_path) {
+            enum SqliteFlavor {
+                OpenClaw,
+                Goose,
+                Hermes,
+                OpenCode,
+                Unknown,
+            }
+            let flavor = conn
+                .read(|raw, _| {
+                    let has_table = |t: &str| crate::harness::store::sqlite::table_exists(raw, t);
+                    if has_table("session_windows") && has_table("transcript_events") {
+                        Ok(SqliteFlavor::OpenClaw)
+                    } else if has_table("sessions") && has_table("messages") {
+                        let is_goose = raw
+                            .prepare("PRAGMA table_info(messages)")
+                            .and_then(|mut st| {
+                                let cols: Vec<String> = st
+                                    .query_map([], |row| row.get::<_, String>(1))?
+                                    .filter_map(Result::ok)
+                                    .collect();
+                                Ok(cols.iter().any(|c| c == "content_json"))
+                            })
+                            .unwrap_or(false);
+                        Ok(if is_goose {
+                            SqliteFlavor::Goose
+                        } else {
+                            SqliteFlavor::Hermes
+                        })
+                    } else if has_table("session") && has_table("part") {
+                        Ok(SqliteFlavor::OpenCode)
+                    } else {
+                        Ok(SqliteFlavor::Unknown)
+                    }
+                })
+                .unwrap_or(SqliteFlavor::Unknown);
+            drop(conn);
+
+            let parsed_sqlite: anyhow::Result<Option<Vec<Session>>> = match flavor {
+                SqliteFlavor::OpenClaw => {
+                    // Stage OpenClaw SQLite under `<state>/agents/main/agent/openclaw-agent.sqlite` if renamed.
+                    let oc_state = temp_root.join(format!("_oc_{}", uuid::Uuid::new_v4()));
+                    let oc_db_dir = oc_state.join("agents/main/agent");
+                    std::fs::create_dir_all(&oc_db_dir)?;
+                    let target_db = oc_db_dir.join("openclaw-agent.sqlite");
+                    std::fs::copy(full_path, &target_db)?;
+                    for suffix in ["-wal", "-shm"] {
+                        let src_side = std::path::PathBuf::from(format!("{}{suffix}", full_path.display()));
+                        if src_side.is_file() {
+                            let _ = std::fs::copy(
+                                &src_side,
+                                std::path::PathBuf::from(format!("{}{suffix}", target_db.display())),
+                            );
+                        }
+                    }
+                    let adapter = crate::harness::openclaw::OpenClaw::with_state_dir(&oc_state);
+                    let disc = adapter.discover()?;
+                    let mut sessions = Vec::new();
+                    for r in &disc.refs {
+                        let mut s = adapter.parse(r)?;
+                        s.source_path = None;
+                        sessions.push(s);
+                    }
+                    Ok(Some(sessions))
+                }
+                SqliteFlavor::Goose => {
+                    let g_dir = temp_root.join(format!("_goose_{}", uuid::Uuid::new_v4()));
+                    std::fs::create_dir_all(&g_dir)?;
+                    let target_db = g_dir.join("sessions.db");
+                    std::fs::copy(full_path, &target_db)?;
+                    let adapter = crate::harness::goose::Goose::with_sessions_dir(&g_dir);
+                    let disc = adapter.discover()?;
+                    let mut sessions = Vec::new();
+                    for r in &disc.refs {
+                        let mut s = adapter.parse(r)?;
+                        s.source_path = None;
+                        sessions.push(s);
+                    }
+                    Ok(Some(sessions))
+                }
+                SqliteFlavor::Hermes => {
+                    let adapter = crate::harness::hermes::Hermes::with_db(full_path.clone());
+                    let disc = adapter.discover()?;
+                    let mut sessions = Vec::new();
+                    for r in &disc.refs {
+                        let mut s = adapter.parse(r)?;
+                        s.source_path = None;
+                        sessions.push(s);
+                    }
+                    Ok(Some(sessions))
+                }
+                SqliteFlavor::OpenCode => {
+                    let adapter = crate::harness::opencode::OpenCode::with_db(full_path.clone());
+                    let disc = adapter.discover()?;
+                    let mut sessions = Vec::new();
+                    for r in &disc.refs {
+                        let mut s = adapter.parse(r)?;
+                        s.source_path = None;
+                        sessions.push(s);
+                    }
+                    Ok(Some(sessions))
+                }
+                SqliteFlavor::Unknown => Ok(None),
+            };
+            match parsed_sqlite? {
+                Some(mut sessions) => {
+                    claimed_files.insert(full_path.clone());
+                    out.append(&mut sessions);
+                }
+                None => {
+                    claimed_files.insert(full_path.clone());
+                    skipped.push(SkippedEntry {
+                        path: orig_name.clone(),
+                        reason: "unrecognized SQLite schema".into(),
+                    });
+                }
+            }
+        }
+    }
+
+    #[cfg(not(feature = "sqlite"))]
+    for (orig_name, full_path, sqlite_like) in &staged_paths {
+        if *sqlite_like {
+            claimed_files.insert(full_path.clone());
+            skipped.push(SkippedEntry {
+                path: orig_name.clone(),
+                reason: "SQLite store requires sqlite feature".into(),
+            });
+        }
+    }
+
+    // Check directory-paired adapters (Grok `summary.json` + `chat_history.jsonl`, LmStudio `.conversation.json`).
+    let grok = crate::harness::grok::Grok::with_home(&temp_root);
+    if let Ok(disc) = grok.discover() {
+        for r in &disc.refs {
+            if let Ok(mut s) = grok.parse(r) {
+                claimed_files.insert(r.path.join("summary.json"));
+                claimed_files.insert(r.path.join("chat_history.jsonl"));
+                claimed_files.insert(r.path.join("updates.jsonl"));
+                claimed_files.insert(r.path.join("plan.json"));
+                claimed_files.insert(r.path.join("rewind_points.jsonl"));
+                s.source_path = None;
+                out.push(s);
+            }
+        }
+    }
+
+    let lm = crate::harness::lmstudio::LmStudio::with_root(&temp_root);
+    if let Ok(disc) = lm.discover() {
+        for r in &disc.refs {
+            if let Ok(mut s) = lm.parse(r) {
+                claimed_files.insert(r.path.clone());
+                s.source_path = None;
+                out.push(s);
+            }
+        }
+    }
+
+    for (orig_name, full_path, _) in staged_paths {
+        if is_sqlite_sidecar(&orig_name) || claimed_files.contains(&full_path) {
+            continue;
+        }
+        skipped.push(SkippedEntry {
+            path: orig_name,
+            reason: "unrecognized or non-transcript file".into(),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -405,6 +844,11 @@ mod tests {
                 Sniff::Codex { is_jsonl: false } => 3,
                 Sniff::Codex { is_jsonl: true } => 4,
                 Sniff::Antigravity => 5,
+                Sniff::Qwen => 6,
+                Sniff::OpenClaw => 7,
+                Sniff::OpenSession => 8,
+                Sniff::Export => 9,
+                Sniff::Continue => 10,
             }
         }
         let body = "large escaped λ\n\"".repeat(5000);
@@ -475,5 +919,150 @@ mod tests {
         assert_eq!(sessions[0].harness, Harness::Antigravity);
         assert_eq!(sessions[0].id, "11111111-2222-4333-8444-555555555555");
         assert_eq!(sessions[0].messages.len(), 2);
+    }
+
+    #[test]
+    fn disambiguates_qwen_025_before_claude_and_gemini_and_reports_skipped_entries() {
+        let qwen_025 = [
+            serde_json::json!({
+                "uuid": "q-u1",
+                "parentUuid": null,
+                "sessionId": "qwen-sess-1",
+                "timestamp": "2026-06-01T10:00:00Z",
+                "type": "user",
+                "cwd": "/repo/qwen",
+                "message": { "role": "user", "parts": [{ "text": "hello qwen 0.25" }] }
+            })
+            .to_string(),
+            serde_json::json!({
+                "uuid": "q-u2",
+                "parentUuid": "q-u1",
+                "sessionId": "qwen-sess-1",
+                "timestamp": "2026-06-01T10:00:02Z",
+                "type": "assistant",
+                "model": "qwen3-coder-plus",
+                "message": { "role": "model", "parts": [{ "text": "hi from qwen" }] },
+                "usageMetadata": { "promptTokenCount": 12, "candidatesTokenCount": 5 }
+            })
+            .to_string(),
+        ]
+        .join("\n");
+
+        let openclaw_v4 = [
+            serde_json::json!({
+                "type": "session",
+                "version": 4,
+                "id": "oc-sess-1",
+                "timestamp": "2026-08-01T00:00:00Z",
+                "cwd": "/repo/oc"
+            })
+            .to_string(),
+            serde_json::json!({
+                "type": "message",
+                "id": "m1",
+                "parentId": null,
+                "timestamp": "2026-08-01T00:00:01Z",
+                "message": { "role": "user", "content": [{ "type": "text", "text": "hello openclaw" }] }
+            })
+            .to_string(),
+        ]
+        .join("\n");
+
+        let continue_doc = serde_json::json!({
+            "sessionId": "cont-1",
+            "title": "Continue Test",
+            "workspaceDirectory": "file:///Users/alice/my%20repo",
+            "history": [
+                { "message": { "role": "user", "content": "hi continue" }, "contextItems": [] }
+            ]
+        })
+        .to_string();
+
+        let opensession_doc = {
+            let mut s = Session::new("os-1", Harness::OpenSession);
+            let mut m = crate::ir::Message::new(crate::ir::Role::User);
+            m.content.push(crate::ir::Block::Text {
+                text: "hello opensession".into(),
+            });
+            s.messages.push(m);
+            serde_json::to_string(&crate::harness::opensession::document(&s)).unwrap()
+        };
+
+        let claude_export = serde_json::json!([
+            {
+                "uuid": "cexp-1",
+                "name": "Exported Claude",
+                "chat_messages": [{ "sender": "human", "text": "from export" }]
+            }
+        ])
+        .to_string();
+
+        let report = ingest_files_with_report(vec![
+            ("chats/qwen-sess-1.jsonl".into(), qwen_025.into_bytes()),
+            ("sessions/oc-sess-1.jsonl".into(), openclaw_v4.into_bytes()),
+            ("sessions/cont-1.json".into(), continue_doc.into_bytes()),
+            ("backup.opensession.json".into(), opensession_doc.into_bytes()),
+            ("conversations.json".into(), claude_export.into_bytes()),
+            ("README.txt".into(), b"not a transcript".to_vec()),
+        ])
+        .unwrap();
+
+        assert_eq!(report.sessions.len(), 5);
+        assert!(report
+            .sessions
+            .iter()
+            .any(|s| s.harness == Harness::Qwen && s.id == "qwen-sess-1"));
+        assert!(report
+            .sessions
+            .iter()
+            .any(|s| s.harness == Harness::OpenClaw && s.id == "oc-sess-1"));
+        assert!(report
+            .sessions
+            .iter()
+            .any(|s| s.harness == Harness::Continue && s.id == "cont-1"));
+        assert!(report
+            .sessions
+            .iter()
+            .any(|s| s.harness == Harness::OpenSession && s.id == "os-1"));
+        assert!(report
+            .sessions
+            .iter()
+            .any(|s| s.harness == Harness::ClaudeExport && s.id == "cexp-1"));
+
+        assert_eq!(report.skipped.len(), 1);
+        assert_eq!(report.skipped[0].path, "README.txt");
+    }
+
+    #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
+    #[test]
+    fn ingests_sqlite_stores_via_isolated_temp_staging() {
+        let world = crate::test_world("ingest-sqlite-hermes");
+        let mut s = Session::new("hermes-zip-1", Harness::Hermes);
+        let mut m = crate::ir::Message::new(crate::ir::Role::User);
+        m.content.push(crate::ir::Block::Text {
+            text: "zipped sqlite prompt".into(),
+        });
+        s.messages.push(m);
+        let emitted = crate::harness::hermes::emit(
+            &s,
+            &world.base,
+            &crate::emit::EmitOptions {
+                new_id: Some("hermes-zip-1".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let db_bytes = std::fs::read(&emitted.path).unwrap();
+
+        let report = ingest_files_with_report(vec![
+            ("hermes/state.db".into(), db_bytes),
+            ("hermes/notes.txt".into(), b"ignored note".to_vec()),
+        ])
+        .unwrap();
+        assert_eq!(report.sessions.len(), 1);
+        assert_eq!(report.sessions[0].harness, Harness::Hermes);
+        assert_eq!(report.sessions[0].id, "hermes-zip-1");
+        assert_eq!(report.skipped.len(), 1);
+        assert_eq!(report.skipped[0].path, "hermes/notes.txt");
     }
 }

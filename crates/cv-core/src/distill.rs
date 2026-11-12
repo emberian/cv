@@ -72,6 +72,24 @@ impl Default for DistillOptions {
     }
 }
 
+/// Bounds and gating policy for read-only grounding inspection of live state files edited in place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiveFsPolicy {
+    /// Allow bounded read-only grounding reads of live state files edited in place.
+    pub allow: bool,
+    /// Maximum bytes read from an on-disk state file when `allow` is enabled.
+    pub max_bytes: usize,
+}
+
+impl Default for LiveFsPolicy {
+    fn default() -> Self {
+        Self {
+            allow: true,
+            max_bytes: 64 * 1024,
+        }
+    }
+}
+
 /// A tool output that did not survive verbatim — written to the sidecar so `cv cat` can return it.
 #[derive(Debug, Clone)]
 pub struct Elided {
@@ -119,6 +137,8 @@ pub struct Distilled {
     pub stats: DistillStats,
     label: String,
     retrieve_ref: String,
+    brief_text: Option<String>,
+    earlier_md: String,
 }
 
 impl Distilled {
@@ -199,7 +219,16 @@ enum Demand {
 /// Prepare the pack, statistics, sidecar roster and resumable tail together. CLI resume routes
 /// consume the tail instead of constructing it again after rendering the pack.
 pub fn prepare_distill(session: &Session, opts: &DistillOptions) -> anyhow::Result<PreparedDistillation> {
-    analyze(session, opts, Demand::Full)
+    prepare_distill_with_policy(session, opts, &LiveFsPolicy::default())
+}
+
+/// [`prepare_distill`] with an explicit [`LiveFsPolicy`] controlling live state-file reads.
+pub fn prepare_distill_with_policy(
+    session: &Session,
+    opts: &DistillOptions,
+    live_fs: &LiveFsPolicy,
+) -> anyhow::Result<PreparedDistillation> {
+    analyze_with_policy(session, opts, live_fs, Demand::Full)
 }
 
 /// Serialize elided outputs through the shared bounded JSONL stage, then publish the sidecar
@@ -349,8 +378,11 @@ fn re(which: Re) -> &'static Regex {
         ),
         // A command that rewrites a file in place.
         Re::InPlace => (&RES[19], r"\bsed\s+-i|\bperl\s+-[a-z]*i|write_text\(|\.write\("),
-        // A line recording a decision.
-        Re::Decision => (&RES[18], r"(?i)\bdecided\b|\bruling\b|\bdefault\b"),
+        // A line recording an explicit decision or modal constraint (excluding noisy `\bdefault\b`).
+        Re::Decision => (
+            &RES[18],
+            r"(?i)\bdecided\b|\bruling\b|\bdecision:\s|\bmust\s+not\b|\bshall\s+not\b|\bdo\s+not\s+(?:edit|touch|modify|commit|push|delete|write)\b",
+        ),
         // The message file of `git commit … -F <file>` (also `-qF`, `--file=`).
         Re::CommitFile => (
             &RES[15],
@@ -439,8 +471,49 @@ fn quiet_commits<'a>(cmd: &str, out: &'a str) -> Vec<(String, &'a str, &'a str)>
         .collect()
 }
 
+/// Canonical dotless or build/lock filenames recognized even without a path slash or code extension.
+pub fn bare_filename(token: &str) -> Option<&str> {
+    let trimmed = token
+        .trim_matches(|c: char| {
+            matches!(
+                c,
+                '`' | '\'' | '"' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | ':'
+            )
+        })
+        .trim_end_matches('.');
+    if trimmed.is_empty() {
+        return None;
+    }
+    let name = trimmed.rsplit('/').next().unwrap_or(trimmed);
+    matches!(
+        name,
+        "Makefile"
+            | "GNUmakefile"
+            | "makefile"
+            | "Dockerfile"
+            | "Containerfile"
+            | "Justfile"
+            | "justfile"
+            | "BUILD"
+            | "BUILD.bazel"
+            | "WORKSPACE"
+            | "WORKSPACE.bazel"
+            | "CMakeLists.txt"
+            | "Cargo.lock"
+            | "Vagrantfile"
+            | "Rakefile"
+            | "Gemfile"
+            | "Brewfile"
+            | "Procfile"
+    )
+    .then_some(trimmed)
+}
+
 /// Prose files an agent writes to record state: notes, statuses, briefs, commit messages.
 fn is_note_path(p: &str) -> bool {
+    if bare_filename(p).is_some() {
+        return false;
+    }
     let name = p.rsplit('/').next().unwrap_or(p).to_ascii_lowercase();
     let code_ext = [
         ".lean", ".rs", ".py", ".js", ".ts", ".tsx", ".json", ".toml", ".yaml", ".yml", ".sh", ".c", ".h", ".go",
@@ -872,6 +945,9 @@ fn hosts_in(cmd: &str) -> Vec<String> {
 }
 
 fn plausible_path(p: &str) -> bool {
+    if bare_filename(p).is_some() {
+        return true;
+    }
     p.len() >= 8
         && !p.starts_with("/dev/")
         && !p.starts_with("/proc/")
@@ -1109,6 +1185,15 @@ fn is_sync_spawn_return(harness: Harness, name: &str, out: &str) -> bool {
 }
 
 fn analyze(session: &Session, opts: &DistillOptions, demand: Demand) -> anyhow::Result<PreparedDistillation> {
+    analyze_with_policy(session, opts, &LiveFsPolicy::default(), demand)
+}
+
+fn analyze_with_policy(
+    session: &Session,
+    opts: &DistillOptions,
+    live_fs: &LiveFsPolicy,
+    demand: Demand,
+) -> anyhow::Result<PreparedDistillation> {
     let mut cache = TranscriptCache::new(session);
     cache.validate_upfront()?;
     let msgs = &session.messages;
@@ -1129,9 +1214,14 @@ fn analyze(session: &Session, opts: &DistillOptions, demand: Demand) -> anyhow::
             };
             // A resumed distilled lane's opening prompt is its predecessor's pack: only the original
             // brief inside it names documents as instructions.
-            let t = unwrap_pack(&t).map_or(t, |(brief, _)| brief);
+            let t = unwrap_session_pack(session, mi, &t).map_or(t, |(brief, _)| brief);
             for c in re(Re::Path).captures_iter(&t) {
                 referenced.insert(c[1].trim_end_matches(['.', ',', ';', ':', ')', '`', '\'']).to_string());
+            }
+            for tok in t.split_whitespace() {
+                if let Some(bare) = bare_filename(tok) {
+                    referenced.insert(bare.to_string());
+                }
             }
         }
     }
@@ -1231,7 +1321,7 @@ fn analyze(session: &Session, opts: &DistillOptions, demand: Demand) -> anyhow::
                     continue;
                 }
                 if brief.is_none() {
-                    brief = Some(match unwrap_pack(&text) {
+                    brief = Some(match unwrap_session_pack(session, i, &text) {
                         Some((original, generations)) => {
                             earlier = generations;
                             (i, original)
@@ -1510,6 +1600,8 @@ fn analyze(session: &Session, opts: &DistillOptions, demand: Demand) -> anyhow::
                 stats: DistillStats::default(),
                 label,
                 retrieve_ref,
+                brief_text: None,
+                earlier_md: String::new(),
             },
             tail: Vec::new(),
             keep_last: opts.keep_last,
@@ -1537,7 +1629,10 @@ fn analyze(session: &Session, opts: &DistillOptions, demand: Demand) -> anyhow::
     );
     let elided_hint = (opts.ledger && elided_outputs > 0).then_some((retrieve_ref.as_str(), elided_outputs));
     render_handoff(&mut h, last_words.as_ref(), &facts, msgs, elided_hint);
-    render_grounding(&mut h, &ground(session.harness, msgs, &uses, &mut cache)?);
+    render_grounding(
+        &mut h,
+        &ground(session, msgs, &uses, &mut cache, live_fs, session.updated_at)?,
+    );
     if let Some((i, text)) = &brief {
         let _ = writeln!(h, "{BRIEF_HEAD}{i}]\n\n{}\n", text.trim());
     }
@@ -1624,6 +1719,8 @@ fn analyze(session: &Session, opts: &DistillOptions, demand: Demand) -> anyhow::
             stats,
             label,
             retrieve_ref,
+            brief_text: brief.map(|(_, text)| text),
+            earlier_md: earlier,
         },
         tail,
         keep_last: opts.keep_last,
@@ -1697,6 +1794,25 @@ fn first_incoming(timeline: &str) -> Option<&str> {
 /// it pointed at: branch tips, repository heads, branches, PID files and state-file paths. Its
 /// timeline, ledger and other facts stay in its source, which the entry names. Packs written
 /// before the `Earlier generations` section existed nest in their briefs and unwrap recursively.
+/// Prefer structured `extra["cv"]["distill"]` metadata on a resumed distilled session's opening
+/// prompt so user briefs containing Markdown headings cannot confuse boundary scraping, falling
+/// back to [`unwrap_pack`] when re-distilling legacy or wire-reloaded packs.
+fn unwrap_session_pack(session: &Session, msg_idx: usize, text: &str) -> Option<(String, String)> {
+    let legacy = unwrap_pack(text);
+    if msg_idx == 0 {
+        if let Some(meta) = session.cv_extra().and_then(|cv| cv.get("distill")) {
+            if let Some(structured_brief) = meta.get("brief").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                let generations = legacy
+                    .map(|(_, gens)| gens)
+                    .or_else(|| meta.get("earlier").and_then(Value::as_str).map(str::to_owned))
+                    .unwrap_or_default();
+                return Some((structured_brief.to_owned(), generations));
+            }
+        }
+    }
+    legacy
+}
+
 fn unwrap_pack(text: &str) -> Option<(String, String)> {
     let t = text.trim_start();
     if !t.starts_with(PREAMBLE_HEAD) {
@@ -2066,6 +2182,11 @@ fn scan_input_facts(_name: &str, summary: &ToolInput<'_>, f: &mut Facts) {
                 bump(&mut f.paths, p);
             }
         }
+        for tok in c.split_whitespace() {
+            if let Some(bare) = bare_filename(tok) {
+                bump(&mut f.paths, bare);
+            }
+        }
     }
 }
 
@@ -2293,13 +2414,13 @@ fn is_state_path(p: &str) -> bool {
 
 /// Files a message to the lane calls its state file ("your brief and state file is `…`"): the
 /// infra lane's is `edge/demo/CHECKLIST.md`, which no name rule finds.
-fn named_state_files(harness: Harness, cache: &mut TranscriptCache<'_>) -> anyhow::Result<Vec<String>> {
+fn named_state_files(session: &Session, cache: &mut TranscriptCache<'_>) -> anyhow::Result<Vec<String>> {
     let mut named: Vec<String> = Vec::new();
     for mi in 0..cache.msgs.len() {
-        let Some(text) = cache.incoming_text(harness, mi)? else {
+        let Some(text) = cache.incoming_text(session.harness, mi)? else {
             continue;
         };
-        let text = unwrap_pack(&text).map_or(text, |(brief, _)| brief);
+        let text = unwrap_session_pack(session, mi, &text).map_or(text, |(brief, _)| brief);
         for line in text.lines().filter(|l| l.to_ascii_lowercase().contains("state file")) {
             for c in re(Re::Path).captures_iter(line) {
                 let p = c[1].trim_end_matches(['.', ',', ';', ':', ')', '`', '\'']).to_string();
@@ -2348,16 +2469,19 @@ fn note_shell_state(
 }
 
 fn ground(
-    harness: Harness,
+    session: &Session,
     msgs: &[Message],
     uses: &HashMap<&str, crate::ir::ToolCall<'_>>,
     cache: &mut TranscriptCache<'_>,
+    live_fs: &LiveFsPolicy,
+    session_updated_at: Option<chrono::DateTime<chrono::Utc>>,
 ) -> anyhow::Result<Grounding> {
     use crate::tools::classify::{visit_tool_ops, ClassifyOpts, ToolOp};
+    let harness = session.harness;
     let open_re = re(Re::OpenItem);
     let decided_re = re(Re::Decision);
     let window = tail_cut(msgs, GROUNDING_WINDOW, uses);
-    let named = named_state_files(harness, cache)?;
+    let named = named_state_files(session, cache)?;
     let mut g = Grounding::default();
     let mut open: Vec<(usize, String)> = Vec::new();
     let mut decisions: Vec<(usize, String)> = Vec::new();
@@ -2495,13 +2619,10 @@ fn ground(
         let skip = list.len().saturating_sub(GROUNDING_LINES);
         list.drain(..skip);
     }
-    // Written in place: the file itself is the content, read now (read-only) when it is there.
+    // Written in place: the file itself is the content, read now (read-only, bounded, regular-file
+    // and drift-gated) when allowed and still contemporaneous with the transcript.
     if let Some((_, path, how, content @ None)) = g.state.as_mut() {
-        let local = match path.strip_prefix("~/") {
-            Some(rest) => std::env::var_os("HOME").map(|home| std::path::Path::new(&home).join(rest)),
-            None => Some(std::path::PathBuf::from(path.as_str())).filter(|p| p.is_absolute()),
-        };
-        if let Some(text) = local.and_then(|p| std::fs::read_to_string(p).ok()) {
+        if let Some(text) = read_bounded_live_state_file(path, live_fs, session_updated_at) {
             *content = Some(text);
             how.push_str("; content read from disk when distilled");
         }
@@ -2509,6 +2630,50 @@ fn ground(
     g.open = open;
     g.decisions = decisions;
     Ok(g)
+}
+
+fn read_bounded_live_state_file(
+    path: &str,
+    live_fs: &LiveFsPolicy,
+    session_updated_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> Option<String> {
+    use std::io::Read as _;
+    if !live_fs.allow || live_fs.max_bytes == 0 {
+        return None;
+    }
+    let local = match path.strip_prefix("~/") {
+        Some(rest) => crate::env::home_dir().map(|home| home.join(rest)),
+        None => Some(std::path::PathBuf::from(path)).filter(|p| p.is_absolute()),
+    }?;
+    let sym = std::fs::symlink_metadata(&local).ok()?;
+    if !sym.file_type().is_file() || sym.len() > live_fs.max_bytes as u64 {
+        return None;
+    }
+    let file = std::fs::File::open(&local).ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.file_type().is_file() || meta.len() > live_fs.max_bytes as u64 {
+        return None;
+    }
+    // Prevent leaking current-disk drift into historical transcripts when the state file was
+    // modified long after the session ended.
+    if let (Some(ts), Ok(modified)) = (session_updated_at, meta.modified()) {
+        if ts.timestamp() >= 0 {
+            let ended = std::time::UNIX_EPOCH + std::time::Duration::from_secs(ts.timestamp() as u64);
+            if modified
+                .duration_since(ended)
+                .is_ok_and(|drift| drift > std::time::Duration::from_secs(3600))
+            {
+                return None;
+            }
+        }
+    }
+    let cap = live_fs.max_bytes;
+    let mut buf = Vec::with_capacity((meta.len() as usize).min(cap));
+    file.take((cap as u64).saturating_add(1)).read_to_end(&mut buf).ok()?;
+    if buf.len() > cap {
+        return None;
+    }
+    String::from_utf8(buf).ok()
 }
 
 fn render_grounding(h: &mut String, g: &Grounding) {
@@ -2953,7 +3118,7 @@ fn session_with_tail(session: &Session, d: &Distilled, keep_last: usize, mut tai
     });
     let mut messages = vec![first];
     messages.append(&mut tail);
-    let output = Session {
+    let mut output = Session {
         cwd: session.cwd.clone(),
         title: Some(format!("distilled: {}", d.label)),
         created_at: session.created_at,
@@ -2968,6 +3133,23 @@ fn session_with_tail(session: &Session, d: &Distilled, keep_last: usize, mut tai
         messages,
         ..Session::new(session.id.clone(), session.harness)
     };
+    let mut distill_meta = serde_json::Map::new();
+    distill_meta.insert("version".into(), serde_json::json!(1));
+    distill_meta.insert("source_id".into(), serde_json::json!(session.id));
+    distill_meta.insert("source_harness".into(), serde_json::json!(session.harness.as_str()));
+    distill_meta.insert("label".into(), serde_json::json!(d.label));
+    distill_meta.insert("retrieve_ref".into(), serde_json::json!(d.retrieve_ref));
+    distill_meta.insert("keep_last".into(), serde_json::json!(keep_last));
+    distill_meta.insert("tail_start".into(), serde_json::json!(d.tail_start));
+    if let Some(brief) = &d.brief_text {
+        distill_meta.insert("brief".into(), serde_json::json!(brief));
+    }
+    if !d.earlier_md.is_empty() {
+        distill_meta.insert("earlier".into(), serde_json::json!(d.earlier_md));
+    }
+    output
+        .cv_extra_mut()
+        .insert("distill".into(), Value::Object(distill_meta));
     // The selected tail was already materialized; earlier inputs were never demanded.
     output
 }
@@ -4872,6 +5054,140 @@ facts text",
             ..opts
         };
         assert!(prepare_distill(&source, &opts_with_thinking).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn decision_pattern_excludes_noisy_default_and_keeps_directives() -> anyhow::Result<()> {
+        let mut s = Session::new("dec-noise", Harness::Claude);
+        s.messages = vec![
+            msg(Role::User, MessageKind::Prompt, vec![text("Check `Makefile` and `CMakeLists.txt`")]),
+            msg(
+                Role::Assistant,
+                MessageKind::Reply,
+                vec![
+                    text("We use `..Default::default()` by default in tests.\nWe must not modify committed corpus files.\nDecision: keep live fs reads bounded."),
+                    call("c1", "cat Makefile", "Read Makefile"),
+                ],
+            ),
+            msg(Role::Tool, MessageKind::ToolResult, vec![result("c1", "all:\n\tcargo test\n", false)]),
+        ];
+        let opts = DistillOptions {
+            keep_last: 0,
+            ..Default::default()
+        };
+        let d = distill_pack(&s, &opts)?;
+        assert!(
+            !d.head_md.contains("- [1] We use `..Default::default()`"),
+            "noisy 'default' prose should not be extracted as a decision:\n{}",
+            d.head_md
+        );
+        assert!(d.head_md.contains("- [1] We must not modify committed corpus files."));
+        assert!(d.head_md.contains("- [1] Decision: keep live fs reads bounded."));
+        assert!(d.head_md.contains("`Makefile`"));
+        assert_eq!(bare_filename("`Makefile`"), Some("Makefile"));
+        assert_eq!(bare_filename("Dockerfile,"), Some("Dockerfile"));
+        assert_eq!(bare_filename("Justfile"), Some("Justfile"));
+        assert_eq!(bare_filename("BUILD"), Some("BUILD"));
+        assert_eq!(bare_filename("CMakeLists.txt"), Some("CMakeLists.txt"));
+        assert_eq!(bare_filename("Cargo.lock."), Some("Cargo.lock"));
+        assert!(!is_note_path("Makefile"));
+        assert!(!is_note_path("CMakeLists.txt"));
+        Ok(())
+    }
+
+    #[test]
+    fn live_state_file_reads_are_bounded_gated_and_drift_checked() -> anyhow::Result<()> {
+        let world = crate::test_world("distill-live-fs-gate");
+        let state_path = world.base.join("scratch_state.md");
+        std::fs::write(&state_path, "current live disk drift").unwrap();
+        let path_str = state_path.to_str().unwrap().to_string();
+
+        let mut s = Session::new("hist-drift", Harness::Claude);
+        // Historical session ended in 2024; file on disk was modified in 2026 -> drift gate skips it.
+        s.updated_at = Some(chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")?.with_timezone(&chrono::Utc));
+        s.messages = vec![
+            msg(
+                Role::User,
+                MessageKind::Prompt,
+                vec![text(&format!("Your state file is `{path_str}`."))],
+            ),
+            msg(
+                Role::Assistant,
+                MessageKind::Reply,
+                vec![Block::ToolUse {
+                    id: "e1".into(),
+                    name: "Edit".into(),
+                    input: json!({"file_path": path_str}).into(),
+                    namespace: None,
+                }],
+            ),
+            msg(Role::Tool, MessageKind::ToolResult, vec![result("e1", "ok", false)]),
+        ];
+        let opts = DistillOptions {
+            keep_last: 0,
+            ..Default::default()
+        };
+        let d_hist = distill_pack(&s, &opts)?;
+        assert!(
+            !d_hist.head_md.contains("current live disk drift"),
+            "historical session must not leak current-disk drift"
+        );
+
+        // Contemporaneous session respects LiveFsPolicy::allow=false and max_bytes.
+        s.updated_at = None;
+        let d_disabled = prepare_distill_with_policy(
+            &s,
+            &opts,
+            &LiveFsPolicy {
+                allow: false,
+                ..Default::default()
+            },
+        )?
+        .distilled;
+        assert!(!d_disabled.head_md.contains("current live disk drift"));
+
+        let d_oversize = prepare_distill_with_policy(
+            &s,
+            &opts,
+            &LiveFsPolicy {
+                allow: true,
+                max_bytes: 5,
+            },
+        )?
+        .distilled;
+        assert!(!d_oversize.head_md.contains("current live disk drift"));
+
+        let d_allowed = distill_pack(&s, &opts)?;
+        assert!(d_allowed.head_md.contains("current live disk drift"));
+        Ok(())
+    }
+
+    #[test]
+    fn structured_pack_metadata_roundtrips_adversarial_brief_headings() -> anyhow::Result<()> {
+        let mut s = Session::new("struct-pack", Harness::Claude);
+        let tricky_brief = "Fix parser.\n\n## 3. Timeline — everything said to this agent\n\nKeep literal section.";
+        s.messages = vec![
+            msg(Role::User, MessageKind::Prompt, vec![text(tricky_brief)]),
+            msg(Role::Assistant, MessageKind::Reply, vec![call("c1", "ls", "list")]),
+            msg(Role::Tool, MessageKind::ToolResult, vec![result("c1", "ok", false)]),
+        ];
+        let opts = DistillOptions {
+            keep_last: 0,
+            ..Default::default()
+        };
+        let (_, resumed) = prepare_distill(&s, &opts)?.into_resumable_session(&s);
+        let meta = resumed
+            .cv_extra()
+            .and_then(|c| c.get("distill"))
+            .expect("structured extra['cv']['distill'] metadata");
+        assert_eq!(meta["source_id"], "struct-pack");
+        assert_eq!(meta["brief"], tricky_brief);
+
+        // Re-distilling the resumed session recovers the exact original brief via structured metadata.
+        let (_, gen2) = prepare_distill(&resumed, &opts)?.into_resumable_session(&resumed);
+        let meta2 = gen2.cv_extra().and_then(|c| c.get("distill")).unwrap();
+        assert_eq!(meta2["brief"], tricky_brief);
         Ok(())
     }
 }

@@ -617,6 +617,28 @@ impl jsonl::Codec for Replay<'_> {
     }
 }
 
+/// Parse an in-memory Qwen 0.25 `ChatRecord` JSONL transcript (used by [`crate::ingest`], wasm-safe).
+pub(crate) fn parse_str(id: &str, text: &str) -> Result<Session> {
+    use jsonl::Codec as _;
+    let mut collect = crate::stream::CollectSink::default();
+    let mut codec = Replay {
+        s: Session::new(id, Harness::Qwen),
+        st: ReplayState::default(),
+        demand: Demand::Owned,
+        stopped: false,
+        seen: false,
+    };
+    jsonl::slice(text.as_bytes(), |line| {
+        if let Some(view) = line.view {
+            codec.record(view, 0, &mut collect)?;
+        }
+        Ok(Flow::Continue)
+    })?;
+    let mut session = codec.finish(true, &mut collect)?;
+    session.messages = collect.messages;
+    Ok(session)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
