@@ -54,12 +54,32 @@ export function canInvokeNative() {
  */
 export async function listen(event, handler) {
   const ev = window.__TAURI__?.event;
-  if (!ev?.listen) return () => {};
-  try {
-    const unlisten = await ev.listen(event, (e) => handler(e?.payload));
-    return typeof unlisten === "function" ? unlisten : () => {};
-  } catch (err) {
-    console.warn("[clustervision] Tauri event listen failed:", err);
-    return () => {};
+  if (ev?.listen) {
+    try {
+      const unlisten = await ev.listen(event, (e) => handler(e?.payload));
+      return typeof unlisten === "function" ? unlisten : () => {};
+    } catch (err) {
+      console.warn("[clustervision] Tauri event listen failed:", err);
+      return () => {};
+    }
   }
+  const internals = typeof window !== "undefined" ? window.__TAURI_INTERNALS__ : null;
+  if (internals?.invoke && typeof internals.transformCallback === "function") {
+    try {
+      const callbackId = internals.transformCallback((e) => handler(e?.payload));
+      const eventId = await internals.invoke("plugin:event|listen", {
+        event,
+        target: { kind: "Any" },
+        handler: callbackId,
+      });
+      return () => {
+        internals.unregisterCallback?.(callbackId);
+        Promise.resolve(internals.invoke("plugin:event|unlisten", { event, eventId })).catch(() => {});
+      };
+    } catch (err) {
+      console.warn("[clustervision] Tauri internals event listen failed:", err);
+      return () => {};
+    }
+  }
+  return () => {};
 }

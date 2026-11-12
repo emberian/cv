@@ -13,7 +13,7 @@ import {
 } from "./util.js";
 import { canInvokeNative, invoke } from "../tauri.js";
 import { renderMarkdown, renderCodeBlock } from "../markdown.js";
-import { getSubagents, getSubagent, getEvents, PAGE, CVD_BASE } from "./hydrate.js";
+import { getSubagents, getSubagent, getEvents, hydrateSession, getAuthToken, PAGE, CVD_BASE } from "./hydrate.js";
 
 /** Collapse whitespace and cut to `max` — for one-line peeks and rule details. */
 function truncateLine(s, max) {
@@ -401,12 +401,14 @@ class CvTranscript extends HTMLElement {
     for (const [format, selector] of [["opensession", "[data-export-json]"], ["markdown", "[data-export-md]"]]) {
       this.querySelector(selector)?.addEventListener("click", async (e) => {
         const button = e.currentTarget;
-        if (s._remote || s._stub || s._paged) {
+        if (!s._wasm && (s._remote || s._stub || s._paged)) {
           if (!canInvokeNative()) {
             // Let the browser's download manager consume the attachment. No response Blob,
             // full transcript JSON parsing, or mutation of the paged browsing cache.
+            const tok = getAuthToken();
+            const tokParam = tok ? `&token=${encodeURIComponent(tok)}` : "";
             const link = document.createElement("a");
-            link.href = `${CVD_BASE}/api/session/${encodeURIComponent(s.harness)}/${encodeURIComponent(s.id)}/export?format=${format}`;
+            link.href = `${CVD_BASE}/api/session/${encodeURIComponent(s.harness)}/${encodeURIComponent(s.id)}/export?format=${format}${tokParam}`;
             link.target = "_blank"; link.rel = "noopener";
             document.body.appendChild(link); link.click(); link.remove();
             return;
@@ -419,8 +421,9 @@ class CvTranscript extends HTMLElement {
           finally { button.disabled = false; }
           return;
         }
-        downloadFile(`${slug(sessionLabel(s))}.${format === "markdown" ? "md" : "opensession.json"}`,
-          format === "markdown" ? toMarkdown(s) : JSON.stringify(toOpenSession(s), null, 2),
+        const full = (s._stub || s._paged) ? await hydrateSession(s) : s;
+        downloadFile(`${slug(sessionLabel(full))}.${format === "markdown" ? "md" : "opensession.json"}`,
+          format === "markdown" ? toMarkdown(full) : JSON.stringify(toOpenSession(full), null, 2),
           format === "markdown" ? "text/markdown" : "application/json");
       });
     }

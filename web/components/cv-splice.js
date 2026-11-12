@@ -273,7 +273,7 @@ class CvSplice extends HTMLElement {
             placeholder="provider/model-id" aria-label="Model id" />
         </div>
         <p class="ls-note muted">
-          The key is stored in <code>localStorage</code> on this device only and is sent
+          The key is held in <code>sessionStorage</code> for this tab only (never persisted to disk) and is sent
           <strong>only</strong> to <code>openrouter.ai</code> over HTTPS. ${masked ? `Currently: <code>${esc(masked)}</code>.` : "No key set yet."}
         </p>
       </div>`;
@@ -569,7 +569,7 @@ class CvSplice extends HTMLElement {
     list.querySelectorAll("[data-up]").forEach((b) => b.addEventListener("click", () => this._move(b.dataset.up, -1)));
     list.querySelectorAll("[data-down]").forEach((b) => b.addEventListener("click", () => this._move(b.dataset.down, +1)));
     list.querySelectorAll("[data-rm]").forEach((b) => b.addEventListener("click", () => {
-      const i = this._idx(b.dataset.rm); if (i >= 0) branch.lane.splice(i, 1); this.render();
+      const i = this._idx(b.dataset.rm); if (i >= 0) this._lane.splice(i, 1); this.render();
     }));
     // Branch from here → spawn a SIBLING BRANCH containing the prefix, switch to it.
     list.querySelectorAll("[data-branch-here]").forEach((b) => b.addEventListener("click", () => {
