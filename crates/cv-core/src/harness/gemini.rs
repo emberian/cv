@@ -55,7 +55,6 @@ use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
-use walkdir::WalkDir;
 
 pub struct Gemini {
     /// Every `tmp` root that exists: `~/.gemini/tmp`, then the sandbox root `~/.cache/.gemini/tmp`.
@@ -131,10 +130,7 @@ impl Adapter for Gemini {
         let paths: Vec<_> = self
             .roots
             .iter()
-            .flat_map(WalkDir::new)
-            .filter_map(|e| e.map_err(|e| walk_errors.extend(crate::Skipped::walk(&e))).ok())
-            .filter(|e| e.file_type().is_file())
-            .map(|e| e.into_path())
+            .flat_map(|root| super::walk_dir_bulk(root, 0, usize::MAX, true, &mut walk_errors))
             .collect();
         let mut found: crate::Discovered = crate::par_discovery_flat_map(paths, |path| {
             crate::Skipped::listed_many(

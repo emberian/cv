@@ -249,6 +249,131 @@ pub(crate) fn is_not_found(error: &anyhow::Error) -> bool {
         .any(|e| e.kind() == std::io::ErrorKind::NotFound)
 }
 
+/// Enumerate direct entries of `dir` via [`crate::io_admission::read_dir_bulk`] (`getattrlistbulk`
+/// on macOS, portable `read_dir` + `symlink_metadata` elsewhere), recording non-`NotFound`
+/// directory or per-entry errors into `skipped`.
+pub(crate) fn read_dir_bulk_kept(
+    dir: &std::path::Path,
+    skipped: &mut Vec<Skipped>,
+) -> Vec<crate::io_admission::DirEntryAttr> {
+    match crate::io_admission::read_dir_bulk(dir) {
+        Ok(mut entries) => {
+            entries.sort_by(|a, b| a.name.cmp(&b.name));
+            let mut kept = Vec::with_capacity(entries.len());
+            for entry in entries {
+                if let Some(errno) = entry.entry_error {
+                    let ioe = std::io::Error::from_raw_os_error(errno);
+                    if ioe.kind() != std::io::ErrorKind::NotFound {
+                        skipped.push(Skipped {
+                            path: dir.join(&entry.name),
+                            why: ioe.to_string(),
+                        });
+                    }
+                    continue;
+                }
+                kept.push(entry);
+            }
+            kept
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(err) => {
+            skipped.push(Skipped {
+                path: dir.to_path_buf(),
+                why: err.to_string(),
+            });
+            Vec::new()
+        }
+    }
+}
+
+/// Walk `root` from `min_depth..=max_depth` without following directory symlinks, powered by
+/// [`crate::io_admission::read_dir_bulk`] so macOS discovery fetches directory names + types in
+/// bulk (`getattrlistbulk`) instead of issuing one `lstat` per child entry.
+///
+/// Falls back transparently to [`walkdir::WalkDir`] when [`crate::io_admission::read_dir_bulk`]
+/// returns [`std::io::ErrorKind::Unsupported`] (e.g. `wasm32`), ignores `NotFound`, handles a
+/// regular file passed as `root` when `min_depth == 0`, and records unreadable directories/entries
+/// into `skipped`.
+pub(crate) fn walk_dir_bulk(
+    root: &std::path::Path,
+    min_depth: usize,
+    max_depth: usize,
+    files_only: bool,
+    skipped: &mut Vec<Skipped>,
+) -> Vec<PathBuf> {
+    use crate::io_admission::BulkFileType;
+    if min_depth > max_depth {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    if min_depth == 0 && !files_only && root.is_dir() {
+        out.push(root.to_path_buf());
+    }
+    if max_depth == 0 {
+        if min_depth == 0 && files_only && root.is_file() {
+            out.push(root.to_path_buf());
+        }
+        return out;
+    }
+
+    let mut stack: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
+    while let Some((dir, depth)) = stack.pop() {
+        match crate::io_admission::read_dir_bulk(&dir) {
+            Ok(mut entries) => {
+                entries.sort_by(|a, b| a.name.cmp(&b.name));
+                let child_depth = depth + 1;
+                let mut subdirs = Vec::new();
+                for entry in entries {
+                    let child_path = dir.join(&entry.name);
+                    if let Some(errno) = entry.entry_error {
+                        let ioe = std::io::Error::from_raw_os_error(errno);
+                        if ioe.kind() != std::io::ErrorKind::NotFound {
+                            skipped.push(Skipped {
+                                path: child_path,
+                                why: ioe.to_string(),
+                            });
+                        }
+                        continue;
+                    }
+                    if child_depth >= min_depth && (!files_only || entry.file_type == BulkFileType::File) {
+                        out.push(child_path.clone());
+                    }
+                    if entry.file_type == BulkFileType::Dir && child_depth < max_depth {
+                        subdirs.push((child_path, child_depth));
+                    }
+                }
+                for sub in subdirs.into_iter().rev() {
+                    stack.push(sub);
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) if err.kind() == std::io::ErrorKind::Unsupported => {
+                return walkdir::WalkDir::new(root)
+                    .min_depth(min_depth)
+                    .max_depth(max_depth)
+                    .into_iter()
+                    .filter_map(|e| e.map_err(|e| skipped.extend(Skipped::walk(&e))).ok())
+                    .filter(|e| !files_only || e.file_type().is_file())
+                    .map(|e| e.into_path())
+                    .collect();
+            }
+            Err(err) => {
+                if depth == 0 && root.is_file() {
+                    if min_depth == 0 {
+                        out.push(root.to_path_buf());
+                    }
+                } else {
+                    skipped.push(Skipped {
+                        path: dir,
+                        why: err.to_string(),
+                    });
+                }
+            }
+        }
+    }
+    out
+}
+
 /// What [`Adapter::discover`] found: the sessions it could list and the sources it could not open.
 /// Reads as its `refs` (`Deref` to the `Vec`, `IntoIterator` over them); `skipped` rides beside.
 #[derive(Debug, Default)]
@@ -1235,5 +1360,55 @@ mod tests {
             "`cv` must never be parseable as a harness, or its bag would shadow one"
         );
         assert!(!Harness::ALL.iter().any(|h| h.as_str() == crate::ir::CV_NAMESPACE));
+    }
+
+    #[test]
+    fn walk_dir_bulk_respects_depth_files_only_symlinks_and_unreadable_dirs() {
+        let root = std::env::temp_dir().join(format!("cv-walk-bulk-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(root.join("proj-a/subagents")).unwrap();
+        std::fs::create_dir_all(root.join("proj-b")).unwrap();
+        std::fs::write(root.join("top.jsonl"), "{}\n").unwrap();
+        std::fs::write(root.join("proj-a/s1.jsonl"), "{}\n").unwrap();
+        std::fs::write(root.join("proj-a/subagents/a1.jsonl"), "{}\n").unwrap();
+        std::fs::write(root.join("proj-b/s2.jsonl"), "{}\n").unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&root, root.join("proj-a/loop-link")).unwrap();
+        }
+
+        // Depth 2..=2 matches Claude's `projects/<encoded>/<sid>.jsonl` without descending into `subagents/`
+        // or chasing directory symlinks into infinite loops.
+        let mut skipped = Vec::new();
+        let d2 = walk_dir_bulk(&root, 2, 2, false, &mut skipped);
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert!(d2.contains(&root.join("proj-a/s1.jsonl")));
+        assert!(d2.contains(&root.join("proj-b/s2.jsonl")));
+        assert!(!d2.contains(&root.join("top.jsonl")));
+        assert!(!d2.contains(&root.join("proj-a/subagents/a1.jsonl")));
+
+        // `files_only = true` yields every regular file across all depths and omits directories/symlinks.
+        let all_files = walk_dir_bulk(&root, 0, usize::MAX, true, &mut skipped);
+        assert!(skipped.is_empty());
+        assert_eq!(all_files.len(), 4, "{all_files:?}");
+
+        // Non-existent root is an honest empty (`NotFound` -> zero `Skipped`).
+        let missing = walk_dir_bulk(&root.join("does-not-exist"), 0, usize::MAX, false, &mut skipped);
+        assert!(missing.is_empty());
+        assert!(skipped.is_empty());
+
+        #[cfg(unix)]
+        if unsafe { libc::geteuid() } != 0 {
+            use std::os::unix::fs::PermissionsExt;
+            let locked = root.join("proj-locked");
+            std::fs::create_dir_all(&locked).unwrap();
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let mut perm_skipped = Vec::new();
+            let _ = walk_dir_bulk(&root, 2, 2, false, &mut perm_skipped);
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert_eq!(perm_skipped.len(), 1, "{perm_skipped:?}");
+            assert_eq!(perm_skipped[0].path, locked);
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

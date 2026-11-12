@@ -40,7 +40,6 @@ use serde_json::{Map, Value};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use walkdir::WalkDir;
 
 pub struct Claude {
     /// Root entries in priority order, before `*` expansion and the existence check. They are
@@ -447,9 +446,7 @@ impl Adapter for Claude {
         let paths: Vec<_> = self
             .resolve_roots()
             .iter()
-            .flat_map(|root| WalkDir::new(root).min_depth(2).max_depth(2))
-            .filter_map(|e| e.map_err(|e| walk_errors.extend(crate::Skipped::walk(&e))).ok())
-            .map(|e| e.into_path())
+            .flat_map(|root| super::walk_dir_bulk(root, 2, 2, false, &mut walk_errors))
             .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonl"))
             // `cv prune` writes a `<id>.flat.jsonl` sidecar next to the session it creates; it has the
             // `.jsonl` extension but is NOT a session (it holds stashed tool payloads), so exclude it.

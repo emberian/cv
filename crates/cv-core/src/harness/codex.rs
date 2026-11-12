@@ -57,6 +57,7 @@ use serde_json::{Map, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(test)]
 use walkdir::WalkDir;
 
 /// The one door into this adapter's per-message facts: `extra["codex"]` (INTERFACE-V2 §4).
@@ -234,11 +235,7 @@ impl Adapter for Codex {
         let mut paths = Vec::new();
         let mut walk_errors = Vec::new();
         for root in &self.roots {
-            for entry in WalkDir::new(root)
-                .into_iter()
-                .filter_map(|e| e.map_err(|e| walk_errors.extend(crate::Skipped::walk(&e))).ok())
-            {
-                let path = entry.path();
+            for path in super::walk_dir_bulk(root, 0, usize::MAX, false, &mut walk_errors) {
                 let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
                 if !name.starts_with("rollout-") {
                     continue;
@@ -249,7 +246,7 @@ impl Adapter for Codex {
                 if !name.ends_with(".jsonl") && !name.ends_with(".json") && !is_zst_rollout(name) {
                     continue;
                 }
-                paths.push(path.to_path_buf());
+                paths.push(path);
             }
         }
         // An unreadable dir, and a rollout whose scan fails, are skipped and reported.

@@ -284,74 +284,67 @@ impl Adapter for Antigravity {
 
             let brain_root = root.join("brain");
             if brain_root.is_dir() {
-                if let Some(entries) = out.keep(&brain_root, fs::read_dir(&brain_root).map_err(Into::into)) {
-                    for entry in entries {
-                        let Some(entry) = out.keep(&brain_root, entry.map_err(Into::into)) else {
-                            continue;
-                        };
-                        let name = entry.file_name();
-                        let Some(id) = name.to_str() else {
-                            continue;
-                        };
-                        if id.starts_with('.') {
-                            continue;
-                        }
-                        let brain_dir = entry.path();
-                        if !brain_dir.is_dir() {
-                            continue;
-                        }
-                        let Some((rank, log_path)) = select_brain_log(&brain_dir) else {
-                            continue;
-                        };
-                        let replace = match candidates.get(id) {
-                            None => true,
-                            Some(prev) => rank > prev.rank,
-                        };
-                        if replace {
-                            candidates.insert(
-                                id.to_string(),
-                                Candidate {
-                                    rank,
-                                    transcript: log_path,
-                                    app_data_dir: Some(root.clone()),
-                                },
-                            );
-                        }
+                for entry in super::read_dir_bulk_kept(&brain_root, &mut out.skipped) {
+                    let Some(id) = entry.name.to_str() else {
+                        continue;
+                    };
+                    if id.starts_with('.') {
+                        continue;
+                    }
+                    let brain_dir = brain_root.join(&entry.name);
+                    let is_dir = entry.file_type == crate::io_admission::BulkFileType::Dir
+                        || (entry.file_type == crate::io_admission::BulkFileType::Symlink && brain_dir.is_dir());
+                    if !is_dir {
+                        continue;
+                    }
+                    let Some((rank, log_path)) = select_brain_log(&brain_dir) else {
+                        continue;
+                    };
+                    let replace = match candidates.get(id) {
+                        None => true,
+                        Some(prev) => rank > prev.rank,
+                    };
+                    if replace {
+                        candidates.insert(
+                            id.to_string(),
+                            Candidate {
+                                rank,
+                                transcript: log_path,
+                                app_data_dir: Some(root.clone()),
+                            },
+                        );
                     }
                 }
             }
 
             // Also support flat `*.jsonl` transcripts when `with_home` points directly at a
             // directory of exported Antigravity step logs (excluding `history.jsonl`).
-            if let Some(entries) = out.keep(root, fs::read_dir(root).map_err(Into::into)) {
-                for entry in entries {
-                    let Some(entry) = out.keep(root, entry.map_err(Into::into)) else {
-                        continue;
-                    };
-                    let path = entry.path();
-                    if !path.is_file() {
-                        continue;
-                    }
-                    let Some(fname) = path.file_name().and_then(|n| n.to_str()) else {
-                        continue;
-                    };
-                    if fname == "history.jsonl" || !fname.ends_with(".jsonl") {
-                        continue;
-                    }
-                    let id = fname.trim_end_matches(".jsonl").to_string();
-                    if id.is_empty() || candidates.contains_key(&id) {
-                        continue;
-                    }
-                    if looks_like_antigravity_file(&path) {
-                        candidates.insert(
-                            id,
-                            Candidate {
-                                rank: 0,
-                                transcript: path,
-                                app_data_dir: None,
-                            },
-                        );
-                    }
+            for entry in super::read_dir_bulk_kept(root, &mut out.skipped) {
+                let Some(fname) = entry.name.to_str() else {
+                    continue;
+                };
+                if fname == "history.jsonl" || !fname.ends_with(".jsonl") {
+                    continue;
+                }
+                let path = root.join(&entry.name);
+                let is_file = entry.file_type == crate::io_admission::BulkFileType::File
+                    || (entry.file_type == crate::io_admission::BulkFileType::Symlink && path.is_file());
+                if !is_file {
+                    continue;
+                }
+                let id = fname.trim_end_matches(".jsonl").to_string();
+                if id.is_empty() || candidates.contains_key(&id) {
+                    continue;
+                }
+                if looks_like_antigravity_file(&path) {
+                    candidates.insert(
+                        id,
+                        Candidate {
+                            rank: 0,
+                            transcript: path,
+                            app_data_dir: None,
+                        },
+                    );
                 }
             }
         }

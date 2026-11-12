@@ -606,7 +606,7 @@ mod tests {
     #[test]
     fn discovery_projection_matches_owned_corpus_and_file_transport() {
         let corpus = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus/claude");
-        for entry in WalkDir::new(corpus).into_iter().filter_map(Result::ok) {
+        for entry in walkdir::WalkDir::new(corpus).into_iter().filter_map(Result::ok) {
             let path = entry.path();
             if path.extension().is_some_and(|ext| ext == "jsonl") {
                 check(path, &fs::read(path).unwrap());
