@@ -60,6 +60,9 @@ pub(crate) fn cmd_config(add_export: Option<PathBuf>, rm_export: Option<PathBuf>
             println!("  {}{missing}", e.display());
         }
     }
+    if let Some(n) = cfg.search.live_bytes {
+        println!("\nsearch.live_bytes: {n} (a search reads at most this much unindexed source live)");
+    }
     Ok(())
 }
 

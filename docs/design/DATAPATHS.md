@@ -230,7 +230,7 @@ Audited against `git log v0.17.0..HEAD` on 2026-10-21; a closure below names its
   Shared selections landed for OpenClaw/Hermes/Qwen tasks/Goose/exports (`62f0ccda`, `0a6a3b22`,
   `7475e978`, `20980e64`, `646b8fb6`); native allocations and validation still cost work.
 - **Search freshness, closed.** Index plus a live read of its stale suffix from FTS marks, one
-  BM25, all of it unless `--live-bytes` bounds it (`fts/live.rs`); a SQLite write rereads only moved `source::Rows`.
+  BM25, all of it unless `--live-bytes`/`$CV_LIVE_BYTES`/config bounds it (`fts/live.rs`); a SQLite write rereads only moved `source::Rows`.
 - **Archive inventory.** `archive sync` uses `index_all`'s references; `cv/src/cmd/archive` owns
   its checked artifact projection. An unavailable index falls back to discovery with a diagnostic.
 - **Three message windowings, closed.** JSON, text rendering and pack relevance excerpts share
