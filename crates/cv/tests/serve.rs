@@ -2266,3 +2266,35 @@ fn serve_sse_stream_auth_and_live_cursor_wakeup() {
         "chunked stream must close cleanly: {streamed}"
     );
 }
+
+#[test]
+fn serve_hub_routes_gated_by_hub_mode_and_network_auth() {
+    let w = world("serve-hub-gate");
+
+    // Default `cv serve` (hub mode off): GET `/api/hub/*` is 404 and POST `/api/hub/*` is 405.
+    let (port, reaper) = spawn_serve(&w);
+    let (status, _) = get_json(port, "/api/hub/status");
+    assert_eq!(status, 404);
+    let raw = raw_post(
+        port,
+        "/api/hub/enroll",
+        r#"{"producer_id":"p1"}"#,
+        &[("Content-Type", "application/json")],
+    );
+    assert_eq!(raw_status(&raw), 405, "{raw}");
+    drop(reaper);
+
+    // Hub mode NEVER allows unauthenticated non-loopback binds, even with `--insecure-expose`.
+    let out = w
+        .cv_command()
+        .args(["serve", "--host", "0.0.0.0", "--port", "0", "--insecure-expose"])
+        .env("CV_SERVE_HUB", "1")
+        .output()
+        .expect("run cv serve");
+    assert!(!out.status.success(), "unauthenticated network hub bind must fail");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("NEVER allows unauthenticated"),
+        "unexpected stderr: {stderr}"
+    );
+}

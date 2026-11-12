@@ -5,6 +5,7 @@
 //! migrations ([`schema::STATE_SCHEMA_VERSION`]) that are strictly independent of
 //! [`crate::source::VERSION`].
 
+pub mod hub;
 pub mod recorder;
 pub mod schema;
 pub mod tables;

@@ -37,6 +37,26 @@ pub(crate) struct ServeOpts {
     pub open: bool,
 }
 
+impl ServeOpts {
+    /// Whether Fleet Hub mode (`/api/hub/*`) is enabled via `$CV_SERVE_HUB`.
+    pub(crate) fn hub_enabled(&self) -> bool {
+        cv_core::env::var("CV_SERVE_HUB").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    }
+}
+
+/// Fleet Hub routes answered when `hub` mode is enabled (`--hub` / `CV_SERVE_HUB=1`).
+#[allow(dead_code)]
+pub(crate) const HUB_ROUTES: &[&str] = &[
+    "POST /api/hub/enroll",
+    "POST /api/hub/upload_pack",
+    "PUT /api/hub/packs/{pack_id}",
+    "POST /api/hub/ingest_batch",
+    "GET /api/hub/status",
+    "GET /api/hub/snapshot",
+    "GET /api/hub/sessions",
+    "GET /api/hub/session/{producer}/{id}",
+];
+
 /// What one request handler needs to know beyond the request itself.
 struct Ctx {
     /// The configured bind host, accepted in `Host`/`Origin` checks alongside the loopback names.
@@ -46,21 +66,22 @@ struct Ctx {
     /// on browser `EventSource` / download GETs that cannot attach custom headers).
     token: Option<String>,
     default_who: Option<String>,
+    /// Whether Fleet Hub endpoints (`/api/hub/*`) are enabled on this server instance.
+    hub: bool,
     searcher: cv_search::Searcher,
     stream: StreamHub,
 }
 
-/// Gatekeep the exposure, then serve until the process is killed: a non-loopback bind serves the
-/// whole transcript corpus (secrets included) and the inbox's writes to anyone who can reach the
-/// port, so it demands a bearer token or an explicit `--insecure-expose`, and warns either way.
-pub(crate) fn cmd_serve(opts: ServeOpts) -> Result<()> {
-    let token = opts
-        .token
-        .or_else(|| cv_core::env::var("CV_SERVE_TOKEN").ok())
-        .filter(|t| !t.is_empty());
-    let host = opts.host.as_str();
+fn validate_bind_exposure(host: &str, port: u16, token: Option<&str>, insecure_expose: bool, hub: bool) -> Result<()> {
     if !is_loopback_host(host) {
-        if token.is_none() && !opts.insecure_expose {
+        if hub && token.is_none() {
+            anyhow::bail!(
+                "refusing to bind Fleet Hub mode on non-loopback host {host:?} without auth: \
+                 hub mode accepts replicated fleet writes and NEVER allows unauthenticated network \
+                 access (even with --insecure-expose). Set a bearer token (--token or $CV_SERVE_TOKEN)."
+            );
+        }
+        if token.is_none() && !insecure_expose {
             anyhow::bail!(
                 "refusing to bind non-loopback host {host:?} without auth: the API serves your full \
                  transcript corpus (which can contain secrets) to anyone who can reach the port.\n\
@@ -70,13 +91,30 @@ pub(crate) fn cmd_serve(opts: ServeOpts) -> Result<()> {
         eprintln!("cv serve: WARNING: binding non-loopback host {host:?} — the API is reachable from the network.");
         if token.is_none() {
             eprintln!(
-                "cv serve: WARNING: --insecure-expose without a token: anyone who can reach {host}:{} can read \
-                 every transcript and act in the inbox as web:<who>.",
-                opts.port
+                "cv serve: WARNING: --insecure-expose without a token: anyone who can reach {host}:{port} can read \
+                 every transcript and act in the inbox as web:<who>."
             );
         }
     }
-    run(&opts.host, opts.port, opts.web, token, opts.who, opts.open)
+    Ok(())
+}
+
+/// Gatekeep the exposure, then serve until the process is killed: a non-loopback bind serves the
+/// whole transcript corpus (secrets included) and the inbox's writes to anyone who can reach the
+/// port, so it demands a bearer token or an explicit `--insecure-expose`, and warns either way.
+pub(crate) fn cmd_serve(opts: ServeOpts) -> Result<()> {
+    let hub = opts.hub_enabled();
+    cmd_serve_with_hub(opts, hub)
+}
+
+/// Like [`cmd_serve`], with an explicit Fleet Hub enablement flag (for `--hub` CLI wiring).
+pub(crate) fn cmd_serve_with_hub(opts: ServeOpts, hub: bool) -> Result<()> {
+    let token = opts
+        .token
+        .or_else(|| cv_core::env::var("CV_SERVE_TOKEN").ok())
+        .filter(|t| !t.is_empty());
+    validate_bind_exposure(&opts.host, opts.port, token.as_deref(), opts.insecure_expose, hub)?;
+    run(&opts.host, opts.port, opts.web, token, opts.who, opts.open, hub)
 }
 
 /// Run the HTTP server until the process is killed. Never returns under normal operation.
@@ -87,6 +125,7 @@ fn run(
     token: Option<String>,
     who: Option<String>,
     open: bool,
+    hub: bool,
 ) -> Result<()> {
     let listener = TcpListener::bind((host, port)).map_err(|e| anyhow::anyhow!("failed to bind {host}:{port}: {e}"))?;
     // `--port 0` binds an ephemeral port; the banner below must carry the REAL bound port so
@@ -101,12 +140,13 @@ fn run(
             None
         }
     });
+    let hub_tag = if hub { ", hub at /api/hub/*" } else { "" };
     match &web_root {
         Some(dir) => eprintln!(
-            "cv serve on http://{host}:{port} — dashboard at /, inbox at /inbox, API at /api/* (web root {})",
+            "cv serve on http://{host}:{port} — dashboard at /, inbox at /inbox, API at /api/*{hub_tag} (web root {})",
             dir.display()
         ),
-        None => eprintln!("cv serve on http://{host}:{port} — inbox at /, API at /api/* (no --web)"),
+        None => eprintln!("cv serve on http://{host}:{port} — inbox at /, API at /api/*{hub_tag} (no --web)"),
     }
     let display_host = if is_loopback_host(host) || host == "0.0.0.0" || host == "::" {
         "127.0.0.1"
@@ -125,17 +165,20 @@ fn run(
         }
     }
 
+    let mut limits = crate::http::Limits::default();
+    if hub {
+        limits.request = std::time::Duration::from_secs(120);
+    }
     let ctx = Ctx {
         bind_host: host.to_string(),
         web_root,
         token,
         default_who: who,
+        hub,
         searcher: cv_search::Searcher,
         stream: StreamHub::new(),
     };
-    crate::http::serve(listener, crate::http::Limits::default(), move |request| {
-        handle(request, &ctx)
-    })
+    crate::http::serve(listener, limits, move |request| handle(request, &ctx))
 }
 
 /// Handle one request: any error becomes a JSON error response.
@@ -176,9 +219,19 @@ fn handle(request: &mut Request<'_>, ctx: &Ctx) {
     let parts: Vec<&str> = segments.iter().map(String::as_str).collect();
     let is_api = parts.first() == Some(&"api");
     let post = method == "POST";
+    let put = method == "PUT";
+    let is_task_post = post && matches!(parts.as_slice(), ["api", "task", _, _]);
+    let is_hub_write = ctx.hub
+        && ((post
+            && matches!(
+                parts.as_slice(),
+                ["api", "hub", "enroll" | "upload_pack" | "ingest_batch"]
+            ))
+            || (put && matches!(parts.as_slice(), ["api", "hub", "packs", _])));
 
-    // GET reads anything; POST is only ever an inbox write (`/api/task/<id>/<verb>`).
-    if !(method == "GET" || (post && matches!(parts.as_slice(), ["api", "task", _, _]))) {
+    // GET reads anything; POST is an inbox write (`/api/task/<id>/<verb>`) or (when hub mode is
+    // enabled) a Fleet Hub replication write (`/api/hub/*`, plus `PUT /api/hub/packs/<id>`).
+    if !(method == "GET" || is_task_post || is_hub_write) {
         request.respond(json_response(
             405,
             &json!({"error": "method not allowed"}),
@@ -207,11 +260,20 @@ fn handle(request: &mut Request<'_>, ctx: &Ctx) {
     }
 
     let q = cv_core::api::Query::parse(query);
+    if is_hub_write && !is_loopback_host(&ctx.bind_host) && ctx.token.is_none() {
+        request.respond(json_response(
+            401,
+            &json!({"error": "hub network writes require a bearer token"}),
+            origin.as_deref(),
+            &[],
+        ));
+        return;
+    }
     if let Some(token) = &ctx.token {
         let header_ok = header_value(request, "Authorization")
             .and_then(|v| v.strip_prefix("Bearer ").map(str::to_string))
             .is_some_and(|t| token_matches(&t, token));
-        let query_ok = !post
+        let query_ok = method == "GET"
             && (parts.as_slice() == ["api", "stream"]
                 || matches!(parts.as_slice(), ["api", "session", _, _, "export"]))
             && q.get("token").is_some_and(|t| token_matches(&t, token));
@@ -224,6 +286,36 @@ fn handle(request: &mut Request<'_>, ctx: &Ctx) {
             ));
             return;
         }
+    }
+
+    if is_hub_write {
+        if raw_origin.is_some() && origin.is_none() {
+            request.respond(json_response(
+                403,
+                &json!({"error": "forbidden origin"}),
+                origin.as_deref(),
+                &[],
+            ));
+            return;
+        }
+        let resp = handle_hub_write(request, &parts, origin.as_deref(), ctx);
+        request.respond(resp);
+        return;
+    }
+
+    if matches!(parts.as_slice(), ["api", "hub", ..]) {
+        if !ctx.hub {
+            request.respond(json_response(
+                404,
+                &json!({"error": "not found"}),
+                origin.as_deref(),
+                &[],
+            ));
+            return;
+        }
+        let (status, body, extra) = handle_hub_get(&parts, &q);
+        request.respond(json_response(status, &body, origin.as_deref(), &extra));
+        return;
     }
 
     // A write: JSON only (a cross-site form or `text/plain` fetch is a "simple" request that needs
@@ -300,6 +392,7 @@ fn handle(request: &mut Request<'_>, ctx: &Ctx) {
             let mut resp = text_response(200, "application/x-ndjson; charset=utf-8", lines.into_bytes());
             cors_headers(&mut resp, origin.as_deref());
             resp.add_header("Cache-Control", "no-store");
+            stamp_latest_snapshot(&mut resp, false);
             request.respond(resp);
         }
         None if post => {
@@ -327,6 +420,7 @@ fn handle(request: &mut Request<'_>, ctx: &Ctx) {
                             );
                             response.add_header("Cache-Control", "no-store");
                             cors_headers(&mut response, origin.as_deref());
+                            stamp_latest_snapshot(&mut response, false);
                             request.respond(response);
                         }
                         Err(error) => {
@@ -782,6 +876,20 @@ fn err(status: u16, msg: &str) -> (u16, Value) {
     (status, json!({ "error": msg }))
 }
 
+fn latest_hub_snapshot_id() -> Option<String> {
+    cv_core::state::hub::HubStore::default_hub()
+        .ok()
+        .and_then(|hub| hub.latest_publication_id_fast().ok().flatten())
+}
+
+fn stamp_latest_snapshot(response: &mut Response<'_>, already_stamped: bool) {
+    if !already_stamped {
+        if let Some(pub_id) = latest_hub_snapshot_id() {
+            response.add_header("X-Cv-Snapshot", &header_safe(&pub_id));
+        }
+    }
+}
+
 /// Build a JSON response, CORS-tagged for `origin` when one was allowed, plus any route-specific
 /// headers (see [`EXPOSED_HEADERS`] — a header a cross-origin dashboard cannot read is not a
 /// channel).
@@ -794,11 +902,504 @@ fn json_response(
     let data = serde_json::to_vec(body).unwrap_or_else(|_| b"{\"error\":\"serialize failed\"}".to_vec());
     let mut resp = Response::bytes(status, data);
     cors_headers(&mut resp, origin);
+    let mut has_snapshot_hdr = false;
     for (field, value) in extra {
+        if field.eq_ignore_ascii_case("X-Cv-Snapshot") {
+            has_snapshot_hdr = true;
+        }
         resp.add_header(field, value);
     }
+    stamp_latest_snapshot(&mut resp, has_snapshot_hdr);
     resp.add_header("Content-Type", "application/json");
     resp
+}
+
+// --- Fleet Hub endpoints (`/api/hub/*`) ------------------------------------
+
+const HUB_ENROLL_LIMIT: u64 = 1 << 20;
+const HUB_INGEST_BATCH_LIMIT: u64 = 32 << 20;
+const HUB_PACK_JSON_LIMIT: u64 = 64 << 20;
+const HUB_PACK_IDX_LIMIT: usize = 16 << 20;
+const HUB_PACK_ZST_LIMIT: u64 = 256 << 20;
+
+struct BoundedReader<'a, R> {
+    inner: &'a mut R,
+    limit: u64,
+    read_so_far: u64,
+    exceeded: bool,
+}
+
+impl<R: Read> Read for BoundedReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.read_so_far = self.read_so_far.saturating_add(n as u64);
+        if self.read_so_far > self.limit {
+            self.exceeded = true;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "pack body exceeds 256 MiB limit",
+            ));
+        }
+        Ok(n)
+    }
+}
+
+fn media_type_of(request: &Request<'_>) -> String {
+    header_value(request, "Content-Type")
+        .and_then(|ct| ct.split(';').next().map(|s| s.trim().to_ascii_lowercase()))
+        .unwrap_or_default()
+}
+
+fn read_json_body(
+    request: &mut Request<'_>,
+    limit: u64,
+    limit_label: &str,
+    origin: Option<&str>,
+) -> std::result::Result<Value, Response<'static>> {
+    if media_type_of(request) != "application/json" {
+        return Err(json_response(
+            403,
+            &json!({"error": "a write must be application/json from a local origin"}),
+            origin,
+            &[],
+        ));
+    }
+    let mut buf = String::new();
+    if request.by_ref().take(limit + 1).read_to_string(&mut buf).is_err() {
+        return Err(json_response(400, &json!({"error": "unreadable body"}), origin, &[]));
+    }
+    if buf.len() as u64 > limit {
+        return Err(json_response(
+            413,
+            &json!({"error": format!("body exceeds {limit_label} limit")}),
+            origin,
+            &[],
+        ));
+    }
+    if buf.trim().is_empty() {
+        return Ok(Value::Null);
+    }
+    serde_json::from_str::<Value>(&buf)
+        .map_err(|e| json_response(400, &json!({"error": format!("body is not JSON: {e}")}), origin, &[]))
+}
+
+fn decode_hex(hex: &str) -> std::result::Result<Vec<u8>, String> {
+    let s = hex.trim();
+    if !s.len().is_multiple_of(2) {
+        return Err("hex string must have an even number of digits".into());
+    }
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let chunk = std::str::from_utf8(&bytes[i..i + 2]).map_err(|e| e.to_string())?;
+        let byte = u8::from_str_radix(chunk, 16).map_err(|_| format!("invalid hex byte {chunk:?}"))?;
+        out.push(byte);
+        i += 2;
+    }
+    Ok(out)
+}
+
+fn hub_error_reply(err: cv_core::state::hub::HubError) -> Reply {
+    use cv_core::state::hub::HubError;
+    match err {
+        HubError::InvalidArgument(msg) => (400, json!({"error": msg}), Vec::new()),
+        HubError::NotFound(msg) => (404, json!({"error": msg}), Vec::new()),
+        HubError::MissingPackDependency { pack_id, detail } => (
+            424,
+            json!({
+                "error": format!("missing or unverified pack dependency `{pack_id}`: {detail}"),
+                "pack_id": pack_id,
+                "detail": detail,
+            }),
+            Vec::new(),
+        ),
+        HubError::PackConflict {
+            pack_id,
+            existing_digest,
+            incoming_digest,
+        } => (
+            409,
+            json!({
+                "error": format!("conflicting digest for pack `{pack_id}`"),
+                "pack_id": pack_id,
+                "existing_digest": existing_digest,
+                "incoming_digest": incoming_digest,
+            }),
+            Vec::new(),
+        ),
+        HubError::EventConflict(detail) => {
+            let frontier_map: serde_json::Map<String, Value> = detail
+                .origin_frontier
+                .iter()
+                .map(|((p, e), &seq)| (cv_core::state::hub::encode_pair_key(p, e), json!(seq)))
+                .collect();
+            (
+                409,
+                json!({
+                    "error": detail.to_string(),
+                    "conflict": "digest_mismatch",
+                    "quarantined": true,
+                    "event_id": detail.event_id,
+                    "existing_digest": detail.existing_digest,
+                    "conflicting_digest": detail.conflicting_digest,
+                    "quarantine_count": detail.quarantine_count,
+                    "origin_frontier": frontier_map,
+                }),
+                Vec::new(),
+            )
+        }
+        HubError::Pack(msg) => (400, json!({"error": msg}), Vec::new()),
+        HubError::Io(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::InvalidData
+            ) =>
+        {
+            (
+                400,
+                json!({"error": format!("unreadable request stream: {e}")}),
+                Vec::new(),
+            )
+        }
+        other => (500, json!({"error": other.to_string()}), Vec::new()),
+    }
+}
+
+fn handle_hub_write(request: &mut Request<'_>, parts: &[&str], origin: Option<&str>, ctx: &Ctx) -> Response<'static> {
+    use cv_core::state::hub::{
+        EnrollRequest, EnrollResponse, HubError, HubStore, IngestBatchRequest, PACK_STREAM_CONTENT_TYPE,
+    };
+
+    let hub = match HubStore::default_hub() {
+        Ok(h) => h,
+        Err(e) => {
+            let (status, body, extra) = hub_error_reply(e);
+            return json_response(status, &body, origin, &extra);
+        }
+    };
+
+    match parts {
+        ["api", "hub", "enroll"] => {
+            let val = match read_json_body(request, HUB_ENROLL_LIMIT, "1 MiB", origin) {
+                Ok(v) => v,
+                Err(resp) => return resp,
+            };
+            let req: EnrollRequest = match serde_json::from_value(val) {
+                Ok(r) => r,
+                Err(e) => {
+                    return json_response(
+                        400,
+                        &json!({"error": format!("invalid enroll payload: {e}")}),
+                        origin,
+                        &[],
+                    );
+                }
+            };
+            if req.producer_id.trim().is_empty() {
+                return json_response(400, &json!({"error": "producer_id must not be empty"}), origin, &[]);
+            }
+            match hub.enroll_producer(&req.producer_id, &req.host_label, &req.metadata) {
+                Ok(producer) => {
+                    ctx.stream.bump(&["hub"]);
+                    let out = serde_json::to_value(EnrollResponse { producer })
+                        .unwrap_or_else(|_| json!({"error": "serialize failed"}));
+                    json_response(200, &out, origin, &[("Cache-Control", "no-store".into())])
+                }
+                Err(e) => {
+                    let (status, body, extra) = hub_error_reply(e);
+                    json_response(status, &body, origin, &extra)
+                }
+            }
+        }
+        ["api", "hub", "upload_pack"] | ["api", "hub", "packs", _] => {
+            let url_pack_id = match parts {
+                ["api", "hub", "packs", pid] => Some(*pid),
+                _ => None,
+            };
+            let ct = media_type_of(request);
+            if ct == PACK_STREAM_CONTENT_TYPE || ct == "application/octet-stream" {
+                let hdr_pack_id = header_value(request, "X-Cv-Pack-Id");
+                let pack_id = match (url_pack_id, hdr_pack_id.as_deref()) {
+                    (Some(u), Some(h)) if u != h => {
+                        return json_response(
+                            400,
+                            &json!({"error": format!("URL pack_id {u:?} disagrees with X-Cv-Pack-Id {h:?}")}),
+                            origin,
+                            &[],
+                        );
+                    }
+                    (Some(u), _) => u.to_string(),
+                    (None, Some(h)) if !h.trim().is_empty() => h.trim().to_string(),
+                    (None, _) => {
+                        return json_response(400, &json!({"error": "missing X-Cv-Pack-Id header"}), origin, &[]);
+                    }
+                };
+                let expected_digest = header_value(request, "X-Cv-Pack-Digest");
+                let producer_id = header_value(request, "X-Cv-Producer-Id");
+                let Some(idx_len_raw) = header_value(request, "X-Cv-Pack-Idx-Len") else {
+                    return json_response(400, &json!({"error": "missing X-Cv-Pack-Idx-Len header"}), origin, &[]);
+                };
+                let Ok(idx_len) = idx_len_raw.trim().parse::<usize>() else {
+                    return json_response(400, &json!({"error": "invalid X-Cv-Pack-Idx-Len header"}), origin, &[]);
+                };
+                if idx_len > HUB_PACK_IDX_LIMIT {
+                    return json_response(413, &json!({"error": "pack index exceeds 16 MiB limit"}), origin, &[]);
+                }
+
+                let mut idx_bytes = vec![0u8; idx_len];
+                if request.read_exact(&mut idx_bytes).is_err() {
+                    return json_response(400, &json!({"error": "truncated pack index stream"}), origin, &[]);
+                }
+
+                let mut bounded = BoundedReader {
+                    inner: request,
+                    limit: HUB_PACK_ZST_LIMIT,
+                    read_so_far: 0,
+                    exceeded: false,
+                };
+                let result = hub.upload_pack_stream(
+                    &pack_id,
+                    producer_id.as_deref(),
+                    expected_digest.as_deref(),
+                    &idx_bytes,
+                    &mut bounded,
+                );
+                if bounded.exceeded {
+                    return json_response(413, &json!({"error": "pack body exceeds 256 MiB limit"}), origin, &[]);
+                }
+                match result {
+                    Ok(resp) => {
+                        ctx.stream.bump(&["hub"]);
+                        let out = serde_json::to_value(resp).unwrap_or_else(|_| json!({"error": "serialize failed"}));
+                        json_response(200, &out, origin, &[("Cache-Control", "no-store".into())])
+                    }
+                    Err(e) => {
+                        let (status, body, extra) = hub_error_reply(e);
+                        json_response(status, &body, origin, &extra)
+                    }
+                }
+            } else if ct == "application/json" {
+                let val = match read_json_body(request, HUB_PACK_JSON_LIMIT, "64 MiB", origin) {
+                    Ok(v) => v,
+                    Err(resp) => return resp,
+                };
+                let body_pack_id = val.get("pack_id").and_then(Value::as_str);
+                let pack_id = match (url_pack_id, body_pack_id) {
+                    (Some(u), Some(b)) if u != b => {
+                        return json_response(
+                            400,
+                            &json!({"error": format!("URL pack_id {u:?} disagrees with body pack_id {b:?}")}),
+                            origin,
+                            &[],
+                        );
+                    }
+                    (Some(u), _) => u.to_string(),
+                    (None, Some(b)) if !b.trim().is_empty() => b.trim().to_string(),
+                    (None, _) => {
+                        return json_response(400, &json!({"error": "missing pack_id"}), origin, &[]);
+                    }
+                };
+                let producer_id = val.get("producer_id").and_then(Value::as_str);
+                let expected_digest = val.get("blake3_digest").and_then(Value::as_str);
+                let Some(idx_val) = val.get("idx") else {
+                    return json_response(400, &json!({"error": "missing idx field"}), origin, &[]);
+                };
+                let idx_bytes = match idx_val {
+                    Value::String(s) => s.as_bytes().to_vec(),
+                    other => match serde_json::to_vec(other) {
+                        Ok(b) => b,
+                        Err(e) => return json_response(400, &json!({"error": e.to_string()}), origin, &[]),
+                    },
+                };
+                let Some(hex_str) = val.get("pack_zst_hex").and_then(Value::as_str) else {
+                    return json_response(400, &json!({"error": "missing pack_zst_hex field"}), origin, &[]);
+                };
+                let zst_bytes = match decode_hex(hex_str) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        return json_response(
+                            400,
+                            &json!({"error": format!("invalid pack_zst_hex: {e}")}),
+                            origin,
+                            &[],
+                        )
+                    }
+                };
+                match hub.upload_pack_bytes(&pack_id, producer_id, expected_digest, &idx_bytes, &zst_bytes) {
+                    Ok(resp) => {
+                        ctx.stream.bump(&["hub"]);
+                        let out = serde_json::to_value(resp).unwrap_or_else(|_| json!({"error": "serialize failed"}));
+                        json_response(200, &out, origin, &[("Cache-Control", "no-store".into())])
+                    }
+                    Err(e) => {
+                        let (status, body, extra) = hub_error_reply(e);
+                        json_response(status, &body, origin, &extra)
+                    }
+                }
+            } else {
+                json_response(
+                    403,
+                    &json!({
+                        "error": "pack upload must be application/vnd.cv.pack+octet-stream, application/octet-stream, or application/json"
+                    }),
+                    origin,
+                    &[],
+                )
+            }
+        }
+        ["api", "hub", "ingest_batch"] => {
+            let val = match read_json_body(request, HUB_INGEST_BATCH_LIMIT, "32 MiB", origin) {
+                Ok(v) => v,
+                Err(resp) => return resp,
+            };
+            let batch_req: IngestBatchRequest = if val.is_array() {
+                match serde_json::from_value(val) {
+                    Ok(events) => IngestBatchRequest { events },
+                    Err(e) => {
+                        return json_response(
+                            400,
+                            &json!({"error": format!("invalid ingest_batch events array: {e}")}),
+                            origin,
+                            &[],
+                        );
+                    }
+                }
+            } else {
+                match serde_json::from_value(val) {
+                    Ok(req) => req,
+                    Err(e) => {
+                        return json_response(
+                            400,
+                            &json!({"error": format!("invalid ingest_batch request: {e}")}),
+                            origin,
+                            &[],
+                        );
+                    }
+                }
+            };
+
+            match hub.ingest_batch(&batch_req) {
+                Ok(resp) => {
+                    ctx.stream.bump(&["hub", "sessions"]);
+                    let mut extra = vec![("Cache-Control", "no-store".to_string())];
+                    if let Some(ref snap) = resp.snapshot {
+                        extra.push(("X-Cv-Snapshot", header_safe(&snap.publication_id)));
+                        extra.push(("X-Cv-Hub-Generation", snap.hub_generation.to_string()));
+                    }
+                    let out = serde_json::to_value(resp).unwrap_or_else(|_| json!({"error": "serialize failed"}));
+                    json_response(200, &out, origin, &extra)
+                }
+                Err(e) => {
+                    if matches!(e, HubError::EventConflict(_)) {
+                        ctx.stream.bump(&["hub"]);
+                    }
+                    let (status, body, extra) = hub_error_reply(e);
+                    json_response(status, &body, origin, &extra)
+                }
+            }
+        }
+        _ => json_response(404, &json!({"error": "not found"}), origin, &[]),
+    }
+}
+
+fn handle_hub_get(parts: &[&str], q: &Query) -> Reply {
+    use cv_core::state::hub::HubStore;
+
+    let hub = match HubStore::default_hub() {
+        Ok(h) => h,
+        Err(e) => return hub_error_reply(e),
+    };
+
+    match parts {
+        ["api", "hub", "status"] => match hub.hub_status() {
+            Ok(status_resp) => {
+                let mut extra = vec![("Cache-Control", "no-store".to_string())];
+                if let Some(ref snap) = status_resp.latest_snapshot {
+                    extra.push(("X-Cv-Snapshot", header_safe(&snap.publication_id)));
+                    extra.push(("X-Cv-Hub-Generation", snap.hub_generation.to_string()));
+                }
+                match serde_json::to_value(status_resp) {
+                    Ok(val) => (200, val, extra),
+                    Err(e) => (500, json!({"error": e.to_string()}), Vec::new()),
+                }
+            }
+            Err(e) => hub_error_reply(e),
+        },
+        ["api", "hub", "snapshot"] => {
+            let want = q.get("id").or_else(|| q.get("snapshot"));
+            match hub.snapshot_response(want.as_deref()) {
+                Ok(snap_resp) => {
+                    let extra = vec![
+                        ("Cache-Control", "no-store".to_string()),
+                        ("X-Cv-Snapshot", header_safe(&snap_resp.snapshot.publication_id)),
+                        ("X-Cv-Hub-Generation", snap_resp.snapshot.hub_generation.to_string()),
+                    ];
+                    match serde_json::to_value(snap_resp) {
+                        Ok(val) => (200, val, extra),
+                        Err(e) => (500, json!({"error": e.to_string()}), Vec::new()),
+                    }
+                }
+                Err(e) => hub_error_reply(e),
+            }
+        }
+        ["api", "hub", "sessions"] => {
+            let offset = match q.unsigned("offset") {
+                Ok(v) => v.unwrap_or(0),
+                Err(e) => return (400, json!({"error": e}), Vec::new()),
+            };
+            let limit = match q.unsigned("limit") {
+                Ok(v) => v,
+                Err(e) => return (400, json!({"error": e}), Vec::new()),
+            };
+            let snapshot = q.get("snapshot");
+            let producer = q.get("producer");
+            let harness = q.get("harness");
+            let cwd = q.get("cwd");
+            let query_str = q.get("q");
+
+            match hub.query_sessions(
+                snapshot.as_deref(),
+                producer.as_deref(),
+                harness.as_deref(),
+                cwd.as_deref(),
+                query_str.as_deref(),
+                offset,
+                limit,
+            ) {
+                Ok(page) => {
+                    let mut extra = vec![("Cache-Control", "no-store".to_string())];
+                    if let Some(ref sid) = page.snapshot_id {
+                        extra.push(("X-Cv-Snapshot", header_safe(sid)));
+                        extra.push(("X-Cv-Hub-Generation", page.hub_generation.to_string()));
+                    }
+                    match serde_json::to_value(page) {
+                        Ok(val) => (200, val, extra),
+                        Err(e) => (500, json!({"error": e.to_string()}), Vec::new()),
+                    }
+                }
+                Err(e) => hub_error_reply(e),
+            }
+        }
+        ["api", "hub", "session", producer_id, session_id] => {
+            let snapshot = q.get("snapshot");
+            match hub.hydrate_session(producer_id, session_id, snapshot.as_deref()) {
+                Ok((manifest, hydrated)) => match hydrated.to_json() {
+                    Ok(val) => {
+                        let extra = vec![
+                            ("Cache-Control", "no-store".to_string()),
+                            ("X-Cv-Snapshot", header_safe(&manifest.publication_id)),
+                            ("X-Cv-Hub-Generation", manifest.hub_generation.to_string()),
+                        ];
+                        (200, val, extra)
+                    }
+                    Err(e) => hub_error_reply(e),
+                },
+                Err(e) => hub_error_reply(e),
+            }
+        }
+        _ => (404, json!({"error": "not found"}), Vec::new()),
+    }
 }
 
 struct Download {
@@ -864,6 +1465,7 @@ fn staged_response<'a>(
     let mut response = Response::stream(stage.status, reader, stage.bytes);
     response.add_header("Content-Type", "application/json");
     cors_headers(&mut response, origin);
+    stamp_latest_snapshot(&mut response, false);
     response
 }
 
@@ -877,7 +1479,8 @@ fn no_content(origin: Option<&str>) -> Response<'static> {
 /// Response headers a cross-origin caller is allowed to READ. A browser hides every non-safelisted
 /// response header from `fetch` unless it is named here, so `/api/search`'s "this answer is
 /// degraded" signal and hit count would be invisible to a dashboard on a dev server without it.
-const EXPOSED_HEADERS: &str = "X-Cv-Search-Source, X-Cv-Search-Note, X-Cv-Search-Total, Content-Disposition";
+const EXPOSED_HEADERS: &str =
+    "X-Cv-Search-Source, X-Cv-Search-Note, X-Cv-Search-Total, Content-Disposition, X-Cv-Snapshot, X-Cv-Hub-Generation";
 
 /// CORS headers echoing the one allowed `origin` — an unlisted origin gets none (the browser then
 /// refuses to share the response with it). `Vary: Origin` keeps caches from mixing the two.
@@ -885,7 +1488,7 @@ fn cors_headers(response: &mut Response<'_>, origin: Option<&str>) {
     response.add_header("Vary", "Origin");
     if let Some(o) = origin {
         response.add_header("Access-Control-Allow-Origin", o);
-        response.add_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+        response.add_header("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS");
         response.add_header("Access-Control-Allow-Headers", "Authorization, Content-Type");
         response.add_header("Access-Control-Expose-Headers", EXPOSED_HEADERS);
     }
@@ -926,6 +1529,7 @@ struct DiskStamp {
     tasks_log: FileStamp,
     catalog: (FileStamp, FileStamp),
     watch: (FileStamp, FileStamp),
+    hub_state: (FileStamp, FileStamp),
     sessions_digest: u64,
 }
 
@@ -943,6 +1547,10 @@ impl DiskStamp {
             .as_deref()
             .map(|h| (file_stamp(&h.join("watches.json")), file_stamp(&h.join("watch"))))
             .unwrap_or_default();
+        let hub_state = cv_home
+            .as_deref()
+            .map(|h| (file_stamp(&h.join("state.db")), file_stamp(&h.join("state.db-wal"))))
+            .unwrap_or_default();
         let catalog = cv_core::env::cv_cache()
             .map(|c| (file_stamp(&c.join("catalog.db")), file_stamp(&c.join("catalog.db-wal"))))
             .unwrap_or_default();
@@ -951,6 +1559,7 @@ impl DiskStamp {
             tasks_log,
             catalog,
             watch,
+            hub_state,
             sessions_digest,
         }
     }
@@ -1024,14 +1633,21 @@ impl StreamHub {
     }
 
     fn bump(&self, kinds: &[&'static str]) {
-        let fresh_tasks = cv_core::env::var_os("CLUSTERVISION_HOME")
+        let cv_home = cv_core::env::var_os("CLUSTERVISION_HOME")
             .filter(|v| !v.is_empty())
             .map(PathBuf::from)
-            .or_else(|| cv_core::env::home_dir().map(|h| h.join(".clustervision")))
+            .or_else(|| cv_core::env::home_dir().map(|h| h.join(".clustervision")));
+        let fresh_tasks = cv_home
+            .as_deref()
             .map(|h| file_stamp(&h.join("tasks").join("events.jsonl")))
+            .unwrap_or_default();
+        let fresh_hub = cv_home
+            .as_deref()
+            .map(|h| (file_stamp(&h.join("state.db")), file_stamp(&h.join("state.db-wal"))))
             .unwrap_or_default();
         let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
         guard.stamp.tasks_log = fresh_tasks;
+        guard.stamp.hub_state = fresh_hub;
         guard.cursor += 1;
         guard.last_kinds = kinds.to_vec();
         drop(guard);
@@ -1068,6 +1684,10 @@ impl StreamHub {
         if next.watch != guard.stamp.watch {
             guard.stamp.watch = next.watch;
             kinds.push("watch");
+        }
+        if next.hub_state != guard.stamp.hub_state {
+            guard.stamp.hub_state = next.hub_state;
+            kinds.push("hub");
         }
         if !kinds.is_empty() {
             guard.cursor += 1;
@@ -1190,6 +1810,7 @@ fn serve_stream(request: &mut Request<'_>, q: &Query, origin: Option<&str>, hub:
         Ok(())
     });
     cors_headers(&mut resp, origin);
+    stamp_latest_snapshot(&mut resp, false);
     request.respond(resp);
 }
 
@@ -1257,5 +1878,16 @@ mod search_service_tests {
             assert!(!token_matches(wrong, "opensesame"), "{wrong:?}");
         }
         assert!(!token_matches("x", ""));
+    }
+
+    #[test]
+    fn hub_mode_never_allows_unauthenticated_non_loopback_binds() {
+        // Non-hub mode still allows explicit `--insecure-expose`, while hub mode refuses
+        // unauthenticated non-loopback binds unconditionally.
+        assert!(validate_bind_exposure("0.0.0.0", 7777, None, true, false).is_ok());
+        let err = validate_bind_exposure("0.0.0.0", 7777, None, true, true).unwrap_err();
+        assert!(err.to_string().contains("NEVER allows unauthenticated"), "{err}");
+        assert!(validate_bind_exposure("0.0.0.0", 7777, Some("hub-secret"), false, true).is_ok());
+        assert!(validate_bind_exposure("127.0.0.1", 7777, None, false, true).is_ok());
     }
 }
