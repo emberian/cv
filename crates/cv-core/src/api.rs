@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 mod read;
 mod selection;
 mod window;
-pub use selection::MessageWindow;
+pub use selection::{message_index, parse_around, Around, MessageWindow};
 pub use window::WindowSink;
 
 /// A router's arms spelled once: the `match` that answers and the method/path patterns
@@ -388,8 +388,9 @@ fn session_meta_json(s: &Session) -> Value {
     meta
 }
 
-/// `GET /api/session/{harness}/{id}/messages?start=&end=&extra=` — the window `[start, end)` of the
-/// session's messages as IR JSON, without parsing the rest of a huge transcript.
+/// `GET /api/session/{harness}/{id}/messages?start=&end=&around=&context=&extra=` — the window
+/// `[start, end)` (or `around` index/message-id ± `context`, default 5) of the session's messages
+/// as IR JSON, without parsing the rest of a huge transcript.
 ///
 /// A lazy stream that skips the messages before `start` without materializing them and **stops
 /// at `end`** (the `cv show --range` pattern), so the tail is never read.
@@ -403,14 +404,40 @@ fn message_window(harness: &str, id: &str, query: &str) -> Result<(SessionRef, W
     let params = Query::parse(query);
     // Window bounds must parse cleanly — a typo'd index is a clear 400, not a silent full read.
     let idx_param = |key: &str| params.unsigned(key).map_err(|error| err(400, &error));
-    let start = idx_param("start")?.unwrap_or(0);
-    let end = idx_param("end")?;
+    let raw_start = idx_param("start")?;
+    let raw_end = idx_param("end")?;
+    let context = idx_param("context")?;
+    let around = match params.raw("around") {
+        Some(spec) => Some(parse_around(spec).map_err(|error| err(400, &format!("around: {error}")))?),
+        None => None,
+    };
+    if context.is_some() && around.is_none() {
+        return Err(err(400, "context requires around"));
+    }
+    if around.is_some() && (raw_start.is_some() || raw_end.is_some()) {
+        return Err(err(400, "around cannot be combined with start or end"));
+    }
+    let mut start = raw_start.unwrap_or(0);
+    let mut end = raw_end;
     if end.is_some_and(|e| e < start) {
         return Err(err(400, "end must be >= start"));
     }
     let want_extra = params.flag("extra");
 
     let (r, adapter) = lookup(harness, id)?;
+    if let Some(around) = around {
+        let center = match around {
+            Around::Index(n) => n,
+            Around::Id(msg_id) => match message_index(adapter.as_ref(), &r, &msg_id) {
+                Ok(Some(at)) => at,
+                Ok(None) => return Err(err(400, &format!("no message {msg_id:?} in session {}", r.id))),
+                Err(e) => return Err(err(500, &format!("stream failed: {e:#}"))),
+            },
+        };
+        let ctx = context.unwrap_or(5);
+        start = center.saturating_sub(ctx);
+        end = Some(center.saturating_add(ctx).saturating_add(1));
+    }
 
     let (shell, mut sink) = match read::window(read::shared(), adapter.as_ref(), &r, start, end, want_extra) {
         Ok(value) => value,
@@ -602,6 +629,11 @@ impl Query {
         )
     }
 
+    /// First value for `key` (even if empty), if the key appears at all.
+    pub fn raw(&self, key: &str) -> Option<&str> {
+        self.0.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+    }
+
     /// First non-empty value for `key`, if any.
     pub fn get(&self, key: &str) -> Option<String> {
         self.0
@@ -717,7 +749,7 @@ mod tests {
         world.write_session("staged",&[
             json!({"type":"assistant","sessionId":"staged","uuid":"a","message":{"role":"assistant","content":[{"type":"text","text":body},{"type":"tool_use","id":"c","name":"tool","input":{"z":body,"a":2}}]}}),
             json!({"type":"user","sessionId":"staged","uuid":"b","message":{"role":"user","content":"second"}}),
-            json!({"type":"assistant","sessionId":"staged","uuid":"c","message":{"role":"assistant","content":"third"}}),
+            json!({"type":"assistant","sessionId":"staged","uuid":"1","message":{"role":"assistant","content":"third"}}),
         ]);
         let parts = ["api", "session", "claude", "staged", "messages"];
         for query in [
@@ -728,6 +760,13 @@ mod tests {
             "start=0&end=0",
             "start=9&end=10",
             "extra=1&start=0&end=1",
+            "around=1&context=0",
+            "around=b&context=0",
+            "around=id%3A1&context=0",
+            "around=missing&context=0",
+            "around=&context=0",
+            "context=1",
+            "around=1&start=0",
             "start=oops",
             "start=3&end=1",
         ] {
@@ -739,6 +778,16 @@ mod tests {
             assert_eq!(actual.bytes, bytes.len() as u64);
             assert_eq!(bytes, serde_json::to_vec(&expected).unwrap(), "{query}");
         }
+        // Bare `1` is index 1 (message "b"); `id:1` disambiguates message ID "1" (at index 2).
+        let (_, by_idx) = route_json(&parts, "around=1&context=0");
+        assert_eq!(by_idx["start"], 1);
+        assert_eq!(by_idx["messages"][0]["id"], "b");
+        let (_, by_id) = route_json(&parts, "around=id%3A1&context=0");
+        assert_eq!(by_id["start"], 2);
+        assert_eq!(by_id["messages"][0]["id"], "1");
+        let (status, missing) = route_json(&parts, "around=missing&context=0");
+        assert_eq!(status, 400);
+        assert!(missing["error"].as_str().unwrap().contains("missing"), "{missing}");
     }
 
     #[test]

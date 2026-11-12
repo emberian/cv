@@ -284,6 +284,38 @@ fn show_kind_post_filter_last_max_bytes_subagents_and_question_pairing() {
     let texts: Vec<&str> = rows.iter().map(|r| r["text"].as_str().unwrap()).collect();
     assert_eq!(texts, ["ship it", "second directive"], "{json}");
 
+    // `--around ID` composes with post-filtered `--kind` views: `t1` is at raw message index 3
+    // (projected row 2), and an intervening assistant turn (`ta0` at index 1) anchors surrounding rows.
+    let (json, _) = w.cv_ok(&[
+        "show",
+        tail_sid,
+        "--kind",
+        "prompt,answer",
+        "--around",
+        "t1",
+        "--context",
+        "0",
+        "--json",
+    ]);
+    let rows: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
+    assert_eq!(rows.len(), 1, "{json}");
+    assert_eq!(rows[0]["text"], "second directive");
+
+    let (json, _) = w.cv_ok(&[
+        "show",
+        tail_sid,
+        "--kind",
+        "prompt,answer",
+        "--around",
+        "ta0",
+        "--context",
+        "1",
+        "--json",
+    ]);
+    let rows: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
+    let texts: Vec<&str> = rows.iter().map(|r| r["text"].as_str().unwrap()).collect();
+    assert_eq!(texts, ["first directive", "ship it"], "{json}");
+
     // `--max-bytes` bounds output cleanly and emits a `--range` continuation hint.
     let (json, err) = w.cv_ok(&[
         "show",

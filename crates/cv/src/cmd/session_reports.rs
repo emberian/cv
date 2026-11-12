@@ -161,14 +161,21 @@ pub(crate) fn print_prompts(
 ) -> Result<()> {
     let rows = collect_prompts(r, adapter, win.pre_compaction, prompts, answers)?;
     let overhead = if json { 5 } else { 100 };
-    let (rows, next) = super::view::slice_and_budget(rows, win.selector, win.max_bytes, overhead, |row| {
-        if json {
-            let pretty = serde_json::to_string_pretty(row)?;
-            Ok(pretty.len() + 2 * pretty.lines().count() + 2)
-        } else {
-            Ok(format_prompt_row(row).len())
-        }
-    })?;
+    let (rows, next) = super::view::slice_and_budget(
+        rows,
+        win.selector,
+        win.max_bytes,
+        overhead,
+        |row| Some(row.index),
+        |row| {
+            if json {
+                let pretty = serde_json::to_string_pretty(row)?;
+                Ok(pretty.len() + 2 * pretty.lines().count() + 2)
+            } else {
+                Ok(format_prompt_row(row).len())
+            }
+        },
+    )?;
     if json {
         if let Some(next) = next {
             eprintln!("{}", continue_hint(next));

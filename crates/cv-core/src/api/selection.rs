@@ -115,3 +115,53 @@ impl<T: Clone> MessageWindow<T> {
         *previous = Some((i, value));
     }
 }
+
+/// Where `--around` (or `/messages?around=`) centres: a 0-based message index, or a message's own id.
+///
+/// Bare non-negative integers parse as [`Around::Index`]; `id:<raw>` forces [`Around::Id`] even
+/// when `<raw>` is all digits (for numeric message IDs like Hermes SQLite rowids); any other
+/// non-empty string parses as [`Around::Id`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Around {
+    Index(usize),
+    Id(String),
+}
+
+pub fn parse_around(spec: &str) -> std::result::Result<Around, String> {
+    let spec = spec.trim();
+    if spec.is_empty() {
+        return Err("expected a message number or a message id".into());
+    }
+    if let Some(id) = spec.strip_prefix("id:") {
+        if id.is_empty() {
+            return Err("expected a message id after `id:`".into());
+        }
+        return Ok(Around::Id(id.to_owned()));
+    }
+    Ok(spec
+        .parse::<usize>()
+        .map_or_else(|_| Around::Id(spec.to_owned()), Around::Index))
+}
+
+/// The 0-based index of the message whose `id` is `id`, in the lean stream numbering every window
+/// uses; `None` when the session holds no such message.
+pub fn message_index(adapter: &dyn crate::Adapter, r: &crate::SessionRef, id: &str) -> anyhow::Result<Option<usize>> {
+    struct Find<'a> {
+        id: &'a str,
+        at: usize,
+        found: Option<usize>,
+    }
+    impl crate::stream::MessageSink for Find<'_> {
+        fn message(&mut self, m: crate::Message) -> crate::stream::Flow {
+            if m.id.as_deref() == Some(self.id) {
+                self.found = Some(self.at);
+                return crate::stream::Flow::Stop;
+            }
+            self.at += 1;
+            crate::stream::Flow::Continue
+        }
+    }
+    let mut find = Find { id, at: 0, found: None };
+    adapter.try_stream(r, &crate::Demand::LEAN.with_spans(), &mut find)?;
+    Ok(find.found)
+}

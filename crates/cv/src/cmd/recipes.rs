@@ -13,7 +13,7 @@ candidates as `harness:full-id` lines and exits 2. `--json` is machine output (s
 RFC 3339 timestamps); `cv schema --json` publishes every shape below.
 
 Windows (show, export): --first N · --last N · --range A..B (0-based, end-exclusive; A.. / ..B)
-· --around N [--context K] · --max-bytes N (prints `… continue with --range <next>..`).
+· --around N|ID [--context K] · --max-bytes N (prints `… continue with --range <next>..`).
 One selector at a time; with `--kind`, window flags and `--max-bytes` slice the projected rows.
 
  1. Find my own session by cwd

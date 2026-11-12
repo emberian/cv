@@ -118,7 +118,7 @@ On [`cv show`](#cv-show) and [`cv export`](#cv-export); indices are **0-based, e
 | `--first N` | the first N messages |
 | `--last N` | the last N messages |
 | `--range A..B` | messages A (inclusive) through B (exclusive); `A..` runs to the end, `..B` from the start |
-| `--around N [--context K]` | message N with K messages either side (default `5`) |
+| `--around N|ID [--context K]` | message N or message id `ID` (`id:<raw>` for numeric ids) with K messages either side (default `5`) |
 | `--max-bytes N` | stop after N bytes of rendered output and print a continuation line |
 
 ```sh

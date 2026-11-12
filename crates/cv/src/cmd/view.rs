@@ -3,8 +3,8 @@
 
 use super::frames::Frames;
 use crate::util::{
-    continue_hint, home_rel, parse_harness, resolve, resolve_found, short_id, split_harness_id, usage, StreamWindow,
-    Window, WindowArgs,
+    continue_hint, home_rel, parse_harness, resolve, resolve_found, short_id, split_harness_id, usage, KindSelector,
+    StreamWindow, Window, WindowArgs,
 };
 use anyhow::{bail, Context, Result};
 use cv_core::ir::{truncate, Block, Harness, Message, MessageKind, Session, SessionRef};
@@ -84,13 +84,24 @@ pub(super) fn parse_kinds(spec: &str) -> Result<KindView> {
 /// trim at `max_bytes` AFTER projection. The first in-window row always fits whole.
 pub(crate) fn slice_and_budget<T>(
     rows: Vec<T>,
-    selector: Option<Window>,
+    selector: Option<KindSelector>,
     max_bytes: Option<usize>,
     overhead: usize,
+    row_index: impl Fn(&T) -> Option<usize>,
     measure: impl Fn(&T) -> Result<usize>,
 ) -> Result<(Vec<T>, Option<usize>)> {
     let (start, end) = match selector {
-        Some(w) => w.bounds(|| Ok(rows.len()))?,
+        Some(KindSelector::Rows(w)) => w.bounds(|| Ok(rows.len()))?,
+        Some(KindSelector::AroundMessage { msg_index, context }) => {
+            let tx_len = rows.iter().position(|r| row_index(r).is_none()).unwrap_or(rows.len());
+            let tx = &rows[..tx_len];
+            let first = tx.partition_point(|r| row_index(r).is_some_and(|i| i < msg_index));
+            let after = tx.partition_point(|r| row_index(r).is_some_and(|i| i <= msg_index));
+            (
+                first.saturating_sub(context),
+                Some(after.saturating_add(context).min(tx_len)),
+            )
+        }
         None => (0, None),
     };
     let start = start.min(rows.len());
@@ -145,7 +156,7 @@ fn format_affordance_row(a: &cv_core::affordance::Affordance) -> String {
 #[derive(Clone, Copy)]
 pub(crate) struct KindWindow {
     pub pre_compaction: Option<(usize, Option<usize>)>,
-    pub selector: Option<Window>,
+    pub selector: Option<KindSelector>,
     pub max_bytes: Option<usize>,
 }
 
@@ -167,14 +178,21 @@ fn print_affordances(
             }
     });
     let overhead = if json { 5 } else { 100 };
-    let (rows, next) = slice_and_budget(rows, win.selector, win.max_bytes, overhead, |row| {
-        if json {
-            let pretty = serde_json::to_string_pretty(row)?;
-            Ok(pretty.len() + 2 * pretty.lines().count() + 2)
-        } else {
-            Ok(format_affordance_row(row).len())
-        }
-    })?;
+    let (rows, next) = slice_and_budget(
+        rows,
+        win.selector,
+        win.max_bytes,
+        overhead,
+        |row| row.index,
+        |row| {
+            if json {
+                let pretty = serde_json::to_string_pretty(row)?;
+                Ok(pretty.len() + 2 * pretty.lines().count() + 2)
+            } else {
+                Ok(format_affordance_row(row).len())
+            }
+        },
+    )?;
     if json {
         if let Some(next) = next {
             eprintln!("{}", continue_hint(next));
@@ -208,7 +226,7 @@ pub(crate) fn cmd_show(
         summaries,
     } = view;
     // Parse the selector (and `--kind`) before any I/O so a bad value errors immediately.
-    let selector = window.window()?;
+    let selector = window.selects()?;
     let kind = kind.as_deref().map(parse_kinds).transpose()?;
     if summaries && !matches!(kind, Some(KindView::Compactions)) {
         return usage("`--summaries` goes with `--kind compaction_boundary,compaction_summary`");
@@ -226,7 +244,7 @@ pub(crate) fn cmd_show(
             KindView::Said { prompts, answers } => {
                 let win = KindWindow {
                     pre_compaction: pre_compaction_span(&r, pre_compaction)?,
-                    selector,
+                    selector: window.kind_selector_in(adapter.as_ref(), &r)?,
                     max_bytes: window.max_bytes,
                 };
                 crate::cmd::session_reports::print_prompts(&r, adapter.as_ref(), win, prompts, answers, json)
@@ -234,13 +252,13 @@ pub(crate) fn cmd_show(
             KindView::Affordances(kinds) => {
                 let win = KindWindow {
                     pre_compaction: pre_compaction_span(&r, pre_compaction)?,
-                    selector,
+                    selector: window.kind_selector_in(adapter.as_ref(), &r)?,
                     max_bytes: window.max_bytes,
                 };
                 print_affordances(&r, adapter.as_ref(), &kinds, win, json)
             }
             KindView::Compactions => {
-                if selector.is_some() || window.max_bytes.is_some() || pre_compaction.is_some() {
+                if selector || window.max_bytes.is_some() || pre_compaction.is_some() {
                     return usage("the compaction view covers the whole session; drop the window flags");
                 }
                 crate::cmd::compaction::print_compactions(&r, summaries, json)
@@ -248,13 +266,13 @@ pub(crate) fn cmd_show(
         };
     }
     if tree && !json {
-        if selector.is_some() || window.max_bytes.is_some() {
+        if selector || window.max_bytes.is_some() {
             return usage("`--tree` renders the whole session; drop the window flags (or add `--json` for the IR)");
         }
         return print_tree(&r, adapter.as_ref());
     }
 
-    let range = show_range(&r, window, pre_compaction)?;
+    let range = show_range(&r, adapter.as_ref(), window, pre_compaction)?;
     if json {
         return print_session_json(adapter.as_ref(), &r, range, window.max_bytes, false, None).map(|_| ());
     }
@@ -296,11 +314,16 @@ fn pre_compaction_span(r: &SessionRef, pre_compaction: Option<usize>) -> Result<
 /// the Nth (1-based) compaction boundary, the context the continued agent lost, so it is
 /// retrieved by message range without the caller computing offsets by hand. Left unresolved:
 /// `--last N` is resolved by whichever pass reads the session, not by a counting pass first.
-fn show_range(r: &SessionRef, window: &WindowArgs, pre_compaction: Option<usize>) -> Result<Option<Window>> {
+fn show_range(
+    r: &SessionRef,
+    adapter: &dyn Adapter,
+    window: &WindowArgs,
+    pre_compaction: Option<usize>,
+) -> Result<Option<Window>> {
     if let Some((start, end)) = pre_compaction_span(r, pre_compaction)? {
         return Ok(Some(Window::Range(start, end)));
     }
-    window.window()
+    window.window_in(adapter, r)
 }
 
 /// The CLI's window over `r`: the selector's bounds or the last `n`, cut at the byte budget.
@@ -722,7 +745,7 @@ pub(crate) fn cmd_export(
     use cv_core::redact::{redact_message, redact_text, RedactOptions, RedactStats};
     let want = parse_harness(&harness)?;
     let (r, adapter) = resolve(id, want)?;
-    let range = window.window()?;
+    let range = window.window_in(adapter.as_ref(), &r)?;
     // `--redact`: the same scrubber `cv share` runs (API keys, private keys, JWTs, emails,
     // assignments, high-entropy blobs), applied per block before anything is rendered; the
     // per-class counts go to stderr so stdout stays the document.
@@ -1528,7 +1551,8 @@ mod tests {
         let selected = agent_parents_for_harness(parents, Some(Harness::Codex));
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].id, "codex-parent");
-        let error = show_range(&selected[0], &WindowArgs::default(), Some(0)).unwrap_err();
+        let adapter = cv_core::harness::for_harness(Harness::Codex).unwrap();
+        let error = show_range(&selected[0], adapter.as_ref(), &WindowArgs::default(), Some(0)).unwrap_err();
         assert!(error.downcast_ref::<crate::util::UsageError>().is_some());
     }
 

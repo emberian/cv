@@ -199,9 +199,10 @@ pub(crate) struct WindowArgs {
     /// Messages A (inclusive) to B (exclusive), 0-based: `A..B`; `A..` to the end, `..B` from the start.
     #[arg(long, value_name = "A..B", allow_hyphen_values = true, conflicts_with = "around")]
     pub range: Option<String>,
-    /// Message N with --context K messages either side.
-    #[arg(long, value_name = "N")]
-    pub around: Option<usize>,
+    /// Message N, or the message whose id is ID (the `[m:ID]` a summary cites; use `id:<raw>` for
+    /// numeric message IDs), with --context K messages either side.
+    #[arg(long, value_name = "N|ID", value_parser = cv_core::api::parse_around)]
+    pub around: Option<cv_core::api::Around>,
     /// How many messages either side of --around N (default 5).
     #[arg(long, value_name = "K", default_value_t = 5, requires = "around")]
     pub context: usize,
@@ -220,10 +221,46 @@ pub(crate) enum Window {
     Around { center: usize, context: usize },
 }
 
+/// Post-filter selector over projected `--kind` rows: bare row indices slice `0..rows.len()`,
+/// while `--around ID` anchors at the projected transcript rows around message `msg_index`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KindSelector {
+    Rows(Window),
+    AroundMessage { msg_index: usize, context: usize },
+}
+
 impl WindowArgs {
-    /// The selector these flags spell, if any. clap already rejects two selectors at once; this
-    /// only parses `--range`.
+    /// The selector these flags spell with no session to resolve a message id against
+    /// (`--around ID` is refused). clap already rejects two selectors at once; this only parses
+    /// `--range`.
+    #[cfg(test)]
     pub(crate) fn window(&self) -> Result<Option<Window>> {
+        self.window_with(|id| usage(format!("`--around {id}`: a message id needs the session it is in")))
+    }
+
+    /// The selector over session `r`: `--around ID` becomes the number of the message with that id.
+    pub(crate) fn window_in(&self, adapter: &dyn Adapter, r: &SessionRef) -> Result<Option<Window>> {
+        self.window_with(|id| resolve_message_id(adapter, r, id))
+    }
+
+    /// The post-filter selector over projected `--kind` rows in session `r`.
+    pub(crate) fn kind_selector_in(&self, adapter: &dyn Adapter, r: &SessionRef) -> Result<Option<KindSelector>> {
+        if let Some(cv_core::api::Around::Id(id)) = &self.around {
+            let msg_index = resolve_message_id(adapter, r, id)?;
+            return Ok(Some(KindSelector::AroundMessage {
+                msg_index,
+                context: self.context,
+            }));
+        }
+        Ok(self.window_with(|_| unreachable!())?.map(KindSelector::Rows))
+    }
+
+    /// Whether a selector is given, checked without reading a session (a bad `--range` errors).
+    pub(crate) fn selects(&self) -> Result<bool> {
+        Ok(self.window_with(|_| Ok(0))?.is_some())
+    }
+
+    fn window_with(&self, at: impl FnOnce(&str) -> Result<usize>) -> Result<Option<Window>> {
         if let Some(n) = self.first {
             return Ok(Some(Window::First(n)));
         }
@@ -234,13 +271,24 @@ impl WindowArgs {
             let (a, b) = parse_range(spec)?;
             return Ok(Some(Window::Range(a, b)));
         }
-        if let Some(center) = self.around {
+        if let Some(around) = &self.around {
+            let center = match around {
+                cv_core::api::Around::Index(n) => *n,
+                cv_core::api::Around::Id(id) => at(id)?,
+            };
             return Ok(Some(Window::Around {
                 center,
                 context: self.context,
             }));
         }
         Ok(None)
+    }
+}
+
+fn resolve_message_id(adapter: &dyn Adapter, r: &SessionRef, id: &str) -> Result<usize> {
+    match cv_core::api::message_index(adapter, r, id)? {
+        Some(at) => Ok(at),
+        None => usage(format!("no message {id:?} in session {}", r.id)),
     }
 }
 
@@ -590,11 +638,28 @@ mod tests {
         };
         assert_eq!(first.window().unwrap(), Some(Window::First(3)));
         let around = WindowArgs {
-            around: Some(9),
+            around: Some(cv_core::api::Around::Index(9)),
             context: 2,
             ..Default::default()
         };
         assert_eq!(around.window().unwrap(), Some(Window::Around { center: 9, context: 2 }));
+        assert_eq!(cv_core::api::parse_around(" 9 "), Ok(cv_core::api::Around::Index(9)));
+        assert_eq!(
+            cv_core::api::parse_around("4d1dd21f-7a00"),
+            Ok(cv_core::api::Around::Id("4d1dd21f-7a00".into()))
+        );
+        assert_eq!(
+            cv_core::api::parse_around("id:42"),
+            Ok(cv_core::api::Around::Id("42".into()))
+        );
+        assert!(cv_core::api::parse_around("").is_err());
+        assert!(cv_core::api::parse_around("id:").is_err());
+        let by_id = WindowArgs {
+            around: Some(cv_core::api::Around::Id("u1".into())),
+            ..Default::default()
+        };
+        assert!(by_id.window().is_err(), "an id needs a session to resolve against");
+        assert!(by_id.selects().unwrap());
         let bad = WindowArgs {
             range: Some("1-2".into()),
             ..Default::default()

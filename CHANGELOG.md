@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- `cv show`, `cv export`, and `/api/session/{h}/{id}/messages` accept `--around ID` (`id:<raw>` for numeric IDs) as well as message indices, composing with `--kind`.
 - `cv index` and `cv search` load resume mark heads on demand per selected stale session instead of scanning all `resume_marks` rows upfront.
 - `cv search` recognizes symlinked and hard-linked paths to already-indexed transcripts by `(dev, ino)` instead of rereading them whole.
 - `cv watch` wakes immediately on directory changes via `watch::wake` (`inotify` + `eventfd` on Linux, `Condvar` fallback elsewhere).

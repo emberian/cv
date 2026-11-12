@@ -172,7 +172,7 @@ one pass that keeps no messages.
 
 #### `GET /api/session/{harness}/{id}/messages`
 
-Messages `[start, end)` as IR JSON, like `cv show --range`. A malformed `start` or `end` is a
+Messages `[start, end)` (or `around=N|ID` ± `context=K`, default `5`; `id:<raw>` for numeric message ids) as IR JSON, like `cv show --range` / `--around`. A malformed selector or unknown message id is a
 `400`; `extra=1` keeps each message's `extra` map. Messages before `start` are skipped unread.
 The reply has the actual indices, `total_known` (+ `total` at EOF) and `has_more`.
 
