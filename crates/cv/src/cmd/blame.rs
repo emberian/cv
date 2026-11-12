@@ -1,458 +1,55 @@
-//! `cv blame` — code provenance: which agent session wrote this code, and what was it thinking?
-//!
-//! ## The correlation model
-//!
-//! git knows *which commit* changed a line; the event catalog knows *which session* edited a file
-//! and roughly when. Neither alone answers "what was the agent thinking" — the bridge is time:
-//! agents edit files and the human (or the agent itself) commits shortly after. So for each commit
-//! that touched the file we look for `file_edit` events on it inside a window of
-//! `[commit − 6h, commit + 15min]`, preferring the closest edit *before* the commit time. Sessions
-//! whose recorded cwd is inside the same repo outrank sessions matched only by repo-relative path
-//! suffix (a checkout living elsewhere), and timed matches outrank the fallback for harnesses that
-//! record no message timestamps — for those all we can say is "the session was active when the
-//! commit landed" (its created..updated span contains the commit time), and we label that weak.
-//!
-//! File identity is matched two ways: by the file's absolute path in the *current* checkout, and
-//! by its repo-relative suffix (`target` ends with `/<rel>`), because a session may have edited
-//! the same file in a worktree or an older clone at a different path.
-//!
-//! ## Exact evidence
-//!
-//! Time is a heuristic; a session that *ran the commit* through a tool left proof. Every candidate
-//! session — each one with an edit on the file, plus the parent of each sub-agent among them (the
-//! orchestrator often commits what its agents wrote) — whose transcript was still being written
-//! when the commit landed is scanned for a `git commit`/`merge`/`cherry-pick`/`revert` (or `git
-//! push`) tool result naming the commit's sha ([`cv_core::rewind::commit_evidence`]). A match
-//! outranks every timed one, is labeled `exact: commit created here` (or `… pushed here`), and
-//! carries the `cv rewind <id> --at <sha>` hint that resumes that agent as it was at that moment.
-//! The scan reads the transcripts themselves (a byte prefilter skips the ones that never mention
-//! the sha), so it doesn't depend on the index being fresh — only the candidate list does.
-//!
-//! ## Honest limits
-//!
-//! * Time correlation breaks under rebases, squash-merges, and cherry-picks: the rewritten
-//!   commit's committer time can land hours or days after the edit, outside the window. The
-//!   session still shows in `cv touched`; it just won't be pinned to the rewritten commit. Exact
-//!   evidence breaks the same way — the rewritten sha was never printed by any session.
-//! * Clock skew between the machine that recorded the session and the one that committed shifts
-//!   deltas; the 6-hour pre-window absorbs most of it, but this is a heuristic, not proof.
-//! * `git log --follow` tracks renames only as well as git's similarity detection does, and
-//!   events recorded against a file's *old* name don't suffix-match its new one.
-//! * Several sessions often overlap one commit (a swarm in one working tree). We print the best
-//!   few, closest-first — provenance candidates, not a verdict.
-//! * Exact evidence needs the committing session among the candidates: one that committed without
-//!   ever editing the file through a tool (and isn't the parent of a sub-agent that did — sub-agent
-//!   edits are cataloged only by `cv index --subagents`) isn't scanned. A commit made outside any
-//!   tool call (by a human, a hook) or with silenced output (`-q`, no `rev-parse`) leaves no proof.
-//!
-//! `msg_idx` in the catalog counts messages in adapter stream order — the same counting `cv show
-//! --range` does (both index every message the adapter streams, regardless of parse options), so
-//! the `--range` hints land on the right window.
-//!
-//! Streaming discipline: nothing here parses a whole session. Candidates come from indexed
-//! catalog queries ([`cv_core::events::edits_touching_file`]); `--show` reuses the windowed
-//! `cv show --range` rendering path, which resolves only the messages inside the window and stops
-//! reading at its end.
+//! `cv blame` — CLI presentation over [`cv_core::blame`].
 
-use anyhow::{anyhow, bail, Context, Result};
-use cv_core::events::{self, EditEvent};
+use anyhow::{Context, Result};
+use cv_core::blame::{self, BlameReport, CommitBlame, SessionAttribution, Strength};
 use cv_core::ir::{truncate, Harness};
-use cv_core::rewind::{CommitEvidence, CommitEvidenceSink, EvidenceKind};
-use std::path::{Path, PathBuf};
-use std::process::Command;
 
-/// An edit this long before the commit can still have produced it (absorbs long sessions
-/// and moderate clock skew).
-pub(crate) const WINDOW_BEFORE_SECS: i64 = 6 * 60 * 60;
-/// An edit slightly *after* the commit time still counts (committer-vs-author time, skew,
-/// or an agent that edits and amends).
-pub(crate) const WINDOW_AFTER_SECS: i64 = 15 * 60;
-/// Most-recent commits shown without `-L` (we note how many more exist).
-const MAX_COMMITS: usize = 15;
-/// Best session matches printed per commit.
-const MATCHES_PER_COMMIT: usize = 3;
-/// Messages of context on each side of the matched edit in the `cv show --range` hint.
-const RANGE_CONTEXT: i64 = 3;
-
-// ---------- git plumbing ----------
-
-/// One commit that touched the file, as far as blame cares.
-#[derive(Debug, Clone)]
-struct CommitInfo {
-    /// The full sha (what exact evidence is matched against).
-    sha: String,
-    short: String,
-    /// Committer time, unix seconds (what the correlation window keys on).
-    time: i64,
-    summary: String,
-}
-
-/// Spawn `git -C <dir> <args>`. A missing `git` binary degrades to a clear, actionable error
-/// instead of a raw NotFound.
-fn run_git(dir: &Path, args: &[&str]) -> Result<std::process::Output> {
-    Command::new("git").arg("-C").arg(dir).args(args).output().map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            anyhow!(
-                "`git` not found on PATH — cv blame needs git to correlate commits \
-                 (try `cv touched <path>` for catalog-only matches)"
-            )
-        } else {
-            anyhow!("failed to run git: {e}")
-        }
-    })
-}
-
-/// Like [`run_git`] but a non-zero exit is an error carrying git's stderr.
-fn git_stdout(dir: &Path, args: &[&str]) -> Result<String> {
-    let out = run_git(dir, args)?;
-    if !out.status.success() {
-        bail!(
-            "git {} failed: {}",
-            args.first().unwrap_or(&"?"),
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
+pub fn cmd_blame(file: &str, lines: Option<&str>, show: bool, json: bool) -> Result<()> {
+    let report = blame::blame(file, lines)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
     }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
-/// The repo toplevel containing `abs`, or `None` when it isn't inside a work tree.
-/// Only a *spawn* failure (git missing) is an error.
-fn repo_toplevel(abs: &Path) -> Result<Option<PathBuf>> {
-    let dir = match abs.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p,
-        _ => Path::new("."),
-    };
-    let out = run_git(dir, &["rev-parse", "--show-toplevel"])?;
-    if !out.status.success() {
-        return Ok(None);
+    if !report.in_git_repo {
+        return render_event_only(file, &report);
     }
-    let top = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    Ok((!top.is_empty()).then(|| PathBuf::from(top)))
-}
 
-/// The file's commit history, newest first: `git log --follow` with a `%x1f`-separated format.
-fn file_commits(root: &Path, rel: &str) -> Result<Vec<CommitInfo>> {
-    let out = git_stdout(root, &["log", "--follow", "--format=%H%x1f%ct%x1f%h%x1f%s", "--", rel])?;
-    let mut commits = Vec::new();
-    for line in out.lines() {
-        let mut f = line.split('\u{1f}');
-        let (Some(sha), Some(ct), Some(short), summary) = (f.next(), f.next(), f.next(), f.next()) else {
-            continue;
-        };
-        let Ok(time) = ct.parse::<i64>() else { continue };
-        commits.push(CommitInfo {
-            sha: sha.to_string(),
-            short: short.to_string(),
-            time,
-            summary: summary.unwrap_or("").to_string(),
-        });
-    }
-    Ok(commits)
-}
-
-/// The distinct commits owning lines `lo..=hi`, via `git blame --porcelain`, newest first.
-fn line_commits(root: &Path, rel: &str, lo: u32, hi: u32) -> Result<Vec<CommitInfo>> {
-    let range = format!("{lo},{hi}");
-    let out = git_stdout(root, &["blame", "-L", &range, "--porcelain", "--", rel])?;
-    // Porcelain emits the full header block (author-time/committer-time/summary/…) the first time
-    // each commit appears; later occurrences are just the `<sha> <orig> <final> [<n>]` line.
-    let mut order: Vec<String> = Vec::new();
-    let mut cur: Option<String> = None;
-    use std::collections::HashMap;
-    #[derive(Default)]
-    struct Meta {
-        committer_time: Option<i64>,
-        author_time: Option<i64>,
-        summary: Option<String>,
-    }
-    let mut metas: HashMap<String, Meta> = HashMap::new();
-    for line in out.lines() {
-        if line.starts_with('\t') {
-            continue; // content line
-        }
-        if let Some(sha) = blame_header_sha(line) {
-            if let std::collections::hash_map::Entry::Vacant(entry) = metas.entry(sha.to_string()) {
-                order.push(sha.to_string());
-                entry.insert(Meta::default());
-            }
-            cur = Some(sha.to_string());
-        } else if let Some(c) = &cur {
-            let m = metas.entry(c.clone()).or_default();
-            if let Some(t) = line.strip_prefix("committer-time ") {
-                m.committer_time = t.trim().parse().ok();
-            } else if let Some(t) = line.strip_prefix("author-time ") {
-                m.author_time = t.trim().parse().ok();
-            } else if let Some(s) = line.strip_prefix("summary ") {
-                m.summary = Some(s.to_string());
-            }
-        }
-    }
-    let mut commits: Vec<CommitInfo> = order
-        .into_iter()
-        .map(|sha| {
-            let m = metas.remove(&sha).unwrap_or_default();
-            CommitInfo {
-                short: sha.chars().take(7).collect(),
-                time: m.committer_time.or(m.author_time).unwrap_or(0),
-                summary: m.summary.unwrap_or_default(),
-                sha,
-            }
-        })
-        .collect();
-    commits.sort_by_key(|c| std::cmp::Reverse(c.time));
-    Ok(commits)
-}
-
-/// The sha of a porcelain blame *header* line (`<40-hex> <orig> <final> [<n>]`), else `None`.
-fn blame_header_sha(line: &str) -> Option<&str> {
-    let mut it = line.split(' ');
-    let sha = it.next()?;
-    if sha.len() != 40 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return None;
-    }
-    let (a, b) = (it.next()?, it.next()?);
-    let numeric = |s: &str| !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit());
-    (numeric(a) && numeric(b)).then_some(sha)
-}
-
-// ---------- correlation (pure) ----------
-
-/// How a session got tied to a commit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Strength {
-    /// A timestamped edit landed inside the correlation window. The real signal.
-    Timed,
-    /// No event timestamps; the session's created..updated span merely contains the commit time.
-    SessionSpan,
-}
-
-/// One session matched to one commit: the index (into the candidate slice) of its best edit
-/// event, plus everything ranking needs.
-#[derive(Debug, Clone)]
-pub(crate) struct SessionMatch {
-    /// Index into the `edits` slice handed to [`correlate`].
-    pub event: usize,
-    pub strength: Strength,
-    /// `commit_time − event_ts` (positive = edit before commit). 0 for [`Strength::SessionSpan`].
-    pub delta: i64,
-    /// Whether the session's recorded cwd sits inside the repo being blamed.
-    pub cwd_in_repo: bool,
-}
-
-/// Lower sorts first: timed beats span, in-repo cwd beats elsewhere, an edit *before* the
-/// commit beats one after, then closest wins.
-fn match_rank(m: &SessionMatch) -> (u8, u8, u8, i64) {
-    (
-        match m.strength {
-            Strength::Timed => 0,
-            Strength::SessionSpan => 1,
-        },
-        u8::from(!m.cwd_in_repo),
-        u8::from(m.delta < 0),
-        m.delta.abs(),
-    )
-}
-
-/// THE pure correlation: which sessions plausibly produced the commit at `commit_time`, given the
-/// file's `file_edit` events. One match per session (its best event), sorted best-first.
-///
-/// A timestamped edit must fall in `[commit − WINDOW_BEFORE, commit + WINDOW_AFTER]`; sessions
-/// whose events carry no timestamps fall back to "the session's created..updated span contains
-/// the commit time" (with the same small after-grace, since commits land right as sessions end).
-pub(crate) fn correlate(commit_time: i64, edits: &[EditEvent], repo_root: &Path) -> Vec<SessionMatch> {
-    use std::collections::HashMap;
-    let mut best: HashMap<(&str, &str), SessionMatch> = HashMap::new();
-    for (i, e) in edits.iter().enumerate() {
-        let cand = match e.ts {
-            Some(ts) => {
-                let Some(delta) = commit_time.checked_sub(ts) else {
-                    continue;
-                };
-                if !(-WINDOW_AFTER_SECS..=WINDOW_BEFORE_SECS).contains(&delta) {
-                    continue;
-                }
-                SessionMatch {
-                    event: i,
-                    strength: Strength::Timed,
-                    delta,
-                    cwd_in_repo: cwd_in_repo(e.cwd.as_deref(), repo_root),
-                }
-            }
-            None => {
-                let (Some(c), Some(u)) = (e.created_at, e.updated_at) else {
-                    continue;
-                };
-                if commit_time < c || commit_time > u.saturating_add(WINDOW_AFTER_SECS) {
-                    continue;
-                }
-                SessionMatch {
-                    event: i,
-                    strength: Strength::SessionSpan,
-                    delta: 0,
-                    cwd_in_repo: cwd_in_repo(e.cwd.as_deref(), repo_root),
-                }
-            }
-        };
-        let key = (e.harness.as_str(), e.session_id.as_str());
-        match best.get(&key) {
-            Some(prev) if match_rank(prev) <= match_rank(&cand) => {}
-            _ => {
-                best.insert(key, cand);
-            }
-        }
-    }
-    let mut out: Vec<SessionMatch> = best.into_values().collect();
-    out.sort_by_key(match_rank);
-    out
-}
-
-/// Whether a session cwd (string form, possibly stale) lies inside `root`.
-fn cwd_in_repo(cwd: Option<&str>, root: &Path) -> bool {
-    cwd.map(Path::new).is_some_and(|c| c.starts_with(root))
-}
-
-/// One session whose own tool output shows a commit being made (or pushed) — the exact tier.
-#[derive(Debug, Clone)]
-pub(crate) struct ExactMatch {
-    pub harness: String,
-    pub session_id: String,
-    pub title: Option<String>,
-    pub evidence: CommitEvidence,
-}
-
-/// One line under a commit, in print order.
-#[derive(Debug)]
-pub(crate) enum Ranked<'a> {
-    Exact(&'a ExactMatch),
-    Timed(SessionMatch),
-}
-
-/// THE ranking under one commit: exact evidence for its sha first (created before pushed, then
-/// earliest), then the [`correlate`] matches of sessions not already proven, in their own order.
-/// One line per session.
-pub(crate) fn rank_commit<'a>(
-    sha: &str,
-    exact: &'a [ExactMatch],
-    timed: Vec<SessionMatch>,
-    edits: &[EditEvent],
-) -> Vec<Ranked<'a>> {
-    let sha = sha.to_ascii_lowercase();
-    let mut proven: Vec<&ExactMatch> = exact
-        .iter()
-        .filter(|x| cv_core::rewind::output_names_sha(&x.evidence.sha, &sha))
-        .collect();
-    proven.sort_by_key(|x| {
-        (
-            x.evidence.kind != EvidenceKind::Created,
-            x.evidence.ts,
-            x.evidence.msg_idx,
-        )
-    });
-    let mut seen = std::collections::HashSet::new();
-    let mut out: Vec<Ranked<'a>> = Vec::new();
-    for x in proven {
-        let key = (x.harness.as_str(), x.session_id.as_str());
-        if seen.insert(key) {
-            out.push(Ranked::Exact(x));
-        }
-    }
-    for m in timed {
-        let e = &edits[m.event];
-        if !seen.contains(&(e.harness.as_str(), e.session_id.as_str())) {
-            out.push(Ranked::Timed(m));
-        }
-    }
-    out
-}
-
-/// The `cv show --range` window around an edit at `msg_idx`: `RANGE_CONTEXT` messages of leading
-/// context and two trailing messages, end-exclusive (so `142` → `139..145`).
-pub(crate) fn range_hint(msg_idx: i64) -> (usize, usize) {
-    let start = (msg_idx - RANGE_CONTEXT).max(0) as usize;
-    let end = (msg_idx + RANGE_CONTEXT).max(1) as usize;
-    (start, end)
-}
-
-// ---------- CLI entry ----------
-
-pub fn cmd_blame(file: &str, lines: Option<&str>, show: bool) -> Result<()> {
-    let abs = absolutize_input(file)?;
-    let Some(root) = repo_toplevel(&abs)? else {
-        return blame_event_only(file, &abs);
-    };
-    let rel = abs
-        .strip_prefix(&root)
-        .map(|p| p.to_string_lossy().into_owned())
-        .with_context(|| format!("{} is not inside the repo at {}", abs.display(), root.display()))?;
-
-    // The commits owning this file (or these lines), newest first.
-    let (mut commits, total) = match lines {
-        None => {
-            let all = file_commits(&root, &rel)?;
-            let total = all.len();
-            (all, total)
-        }
-        Some(spec) => {
-            let (lo, hi) = parse_line_spec(spec)?;
-            let cs = line_commits(&root, &rel, lo, hi)?;
-            let total = cs.len();
-            (cs, total)
-        }
-    };
-    commits.truncate(MAX_COMMITS);
-
-    if commits.is_empty() {
-        println!("{}", no_commits(&rel, lines));
+    if report.commits.is_empty() {
+        println!("{}", no_commits(&report.file, lines));
         return Ok(());
     }
 
-    // Candidate edits from the event catalog, matched absolutely and by repo-relative suffix.
-    let edits = events::edits_touching_file(&abs.to_string_lossy(), &rel)?;
-    if edits.is_empty() && !events::catalog_has_events() {
+    if report.cold_catalog {
         eprintln!("(event catalog is empty — run `cv index` first to ingest tool events)");
     }
 
-    println!("{}\n", header(&rel, lines, commits.len(), total));
+    println!(
+        "{}\n",
+        header(&report.file, lines, report.commits.len(), report.total_commits)
+    );
 
-    // The exact tier: candidate sessions whose own tool output shows one of these commits made.
-    let exact = exact_matches(&commits, &edits)?;
-
-    // Newest first: each commit, with its best-matched sessions.
-    let mut matched_commits = 0usize;
-    let mut best_overall: Option<(String, String, i64)> = None; // (harness, session_id, msg_idx)
-    for c in &commits {
+    let mut best_overall: Option<(String, String, i64)> = None;
+    for c in &report.commits {
         let summary = if c.summary.is_empty() {
             "(no message)"
         } else {
             &c.summary
         };
-        println!("◆ {} {}  {summary}", c.short, date(c.time));
-        let ranked = rank_commit(&c.sha, &exact, correlate(c.time, &edits, &root), &edits);
-        if ranked.is_empty() {
+        println!("◆ {} {}  {summary}", c.short_sha, date(c.time));
+        if c.matches.is_empty() {
             println!("  (no agent session found)");
             continue;
         }
-        matched_commits += 1;
-        for r in ranked.iter().take(MATCHES_PER_COMMIT) {
-            let best = match r {
-                Ranked::Exact(x) => {
-                    print_exact(x, c);
-                    (x.harness.clone(), x.session_id.clone(), x.evidence.msg_idx as i64)
-                }
-                Ranked::Timed(m) => {
-                    let e = &edits[m.event];
-                    print_match(e, m);
-                    (e.harness.clone(), e.session_id.clone(), e.msg_idx)
-                }
-            };
-            // Best overall = the top match of the newest commit that matched anything.
-            best_overall.get_or_insert(best);
+        for m in &c.matches {
+            print_attribution(m, c);
+            best_overall.get_or_insert_with(|| (m.harness.clone(), m.session_id.clone(), m.msg_idx));
         }
     }
 
     println!(
-        "\nprovenance: {matched_commits} of {} commit(s) matched an agent session",
-        commits.len()
+        "\nprovenance: {} of {} commit(s) matched an agent session",
+        report.matched_commits,
+        report.commits.len()
     );
 
     if show {
@@ -464,8 +61,32 @@ pub fn cmd_blame(file: &str, lines: Option<&str>, show: bool) -> Result<()> {
     Ok(())
 }
 
-/// The heading over the commit list: how many commits own the file (or the `-L` lines), and, when
-/// [`MAX_COMMITS`] cut the list, of how many.
+fn render_event_only(file: &str, report: &BlameReport) -> Result<()> {
+    println!("(not inside a git repository — event-catalog matches only, no commit correlation)\n");
+    if report.event_only_sessions.is_empty() {
+        if report.cold_catalog {
+            println!("no edit events found — run `cv index` first to ingest tool events");
+        } else {
+            println!("no sessions edited {file:?}");
+        }
+        return Ok(());
+    }
+    println!("{} session(s) edited {file:?}:\n", report.event_only_sessions.len());
+    for e in &report.event_only_sessions {
+        let dt = e.ts.map(date).unwrap_or_else(|| "----------".into());
+        println!(
+            "  {:8} {}  {}  {}  last edit at msg {}",
+            e.harness,
+            crate::util::short_id(&e.session_id),
+            dt,
+            e.title.as_deref().map(|t| truncate(t, 48)).unwrap_or_default(),
+            e.msg_idx,
+        );
+        println!("{}", show_hint(&e.session_id, e.range));
+    }
+    Ok(())
+}
+
 fn header(rel: &str, lines: Option<&str>, shown: usize, total: usize) -> String {
     let more = if total > shown {
         format!(" (of {total}; showing the most recent)")
@@ -478,7 +99,6 @@ fn header(rel: &str, lines: Option<&str>, shown: usize, total: usize) -> String 
     }
 }
 
-/// What to say when no commit owns the file, or the `-L` lines of a file that may well be.
 fn no_commits(rel: &str, lines: Option<&str>) -> String {
     match lines {
         Some(spec) => format!(
@@ -488,63 +108,61 @@ fn no_commits(rel: &str, lines: Option<&str>) -> String {
     }
 }
 
-/// One matched-session line under a commit, plus its copy-pasteable `cv show --range` hint.
-fn print_match(e: &EditEvent, m: &SessionMatch) {
-    let when = match m.strength {
-        Strength::Timed => format!("({})", fmt_delta(m.delta)),
-        Strength::SessionSpan => "(weak: session active at commit time; no event timestamps)".into(),
+fn print_attribution(m: &SessionAttribution, c: &CommitBlame) {
+    let dt = m.ts.map(date).unwrap_or_else(|| "----------".into());
+    let title = m
+        .title
+        .as_deref()
+        .map(|t| format!("\"{}\"  ", truncate(t, 48)))
+        .unwrap_or_default();
+
+    if m.strength.is_exact_sha() {
+        let how = match m.commit_evidence.as_deref() {
+            Some("pushed") => "commit pushed here",
+            _ => "commit created here",
+        };
+        println!(
+            "  {:8} {}  {}  {}commit at msg {} ({} · {how})",
+            m.harness,
+            crate::util::short_id(&m.session_id),
+            dt,
+            title,
+            m.msg_idx,
+            m.label,
+        );
+        println!("    ↳ cv rewind {} --at {}", hint_id(&m.session_id), c.short_sha);
+        println!("{}", show_hint(&m.session_id, m.range));
+        return;
+    }
+
+    let detail = match m.strength {
+        Strength::ContentHunk => match m.delta_secs {
+            Some(d) => format!("({} · {})", m.label, fmt_delta(d)),
+            None => format!("({})", m.label),
+        },
+        Strength::Timed => match m.delta_secs {
+            Some(d) => format!("({} · {})", m.label, fmt_delta(d)),
+            None => format!("({})", m.label),
+        },
+        Strength::SessionSpan => format!("({}; session active at commit time; no event timestamps)", m.label),
+        Strength::CommitShaAndContentHunk | Strength::CommitSha => unreachable!(),
     };
     let elsewhere = if m.cwd_in_repo { "" } else { " · other checkout" };
-    let date = e.ts.or(e.updated_at).map(date).unwrap_or_else(|| "----------".into());
-    let title = e
-        .title
-        .as_deref()
-        .map(|t| format!("\"{}\"  ", truncate(t, 48)))
-        .unwrap_or_default();
     println!(
-        "  {:8} {}  {}  {}edit at msg {} {}{}",
-        e.harness,
-        crate::util::short_id(&e.session_id),
-        date,
+        "  {:8} {}  {}  {}edit at msg {} {detail}{elsewhere}",
+        m.harness,
+        crate::util::short_id(&m.session_id),
+        dt,
         title,
-        e.msg_idx,
-        when,
-        elsewhere,
+        m.msg_idx,
     );
-    println!("{}", show_hint(&e.session_id, e.msg_idx));
+    println!("{}", show_hint(&m.session_id, m.range));
 }
 
-/// An exact-evidence line: the session, where the commit output landed, the label — and the
-/// `cv rewind` hint that resumes that agent as of that moment, plus the usual `cv show` window.
-fn print_exact(x: &ExactMatch, c: &CommitInfo) {
-    let date = x.evidence.ts.map(date).unwrap_or_else(|| "----------".into());
-    let title = x
-        .title
-        .as_deref()
-        .map(|t| format!("\"{}\"  ", truncate(t, 48)))
-        .unwrap_or_default();
-    println!(
-        "  {:8} {}  {}  {}commit at msg {} ({})",
-        x.harness,
-        crate::util::short_id(&x.session_id),
-        date,
-        title,
-        x.evidence.msg_idx,
-        x.evidence.kind.label(),
-    );
-    println!("    ↳ cv rewind {} --at {}", hint_id(&x.session_id), c.short);
-    println!("{}", show_hint(&x.session_id, x.evidence.msg_idx as i64));
-}
-
-/// The copy-pasteable `cv show --range` line under a match: every tier spells the session the
-/// same way ([`hint_id`]).
-fn show_hint(session_id: &str, msg_idx: i64) -> String {
-    let (s, end) = range_hint(msg_idx);
+fn show_hint(session_id: &str, (s, end): (usize, usize)) -> String {
     format!("    ↳ cv show {} --range {s}..{end}", hint_id(session_id))
 }
 
-/// The id a copy-pasteable hint uses: the short prefix, except for a sub-agent (`agent-…`), whose
-/// 8-char prefix would almost never be unique.
 fn hint_id(id: &str) -> String {
     if id.starts_with("agent-") {
         id.to_string()
@@ -553,85 +171,11 @@ fn hint_id(id: &str) -> String {
     }
 }
 
-/// The sessions the exact tier scans, deduplicated in first-seen order: every session with an edit
-/// on the file, and the parent of each sub-agent among them (a sub-agent's parent is a Claude
-/// session — the orchestrator that often commits what its agents wrote).
-pub(crate) fn candidate_ids(edits: &[EditEvent]) -> Vec<(String, String)> {
-    let mut ids: Vec<(String, String)> = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for e in edits {
-        for (h, id) in std::iter::once((e.harness.as_str(), e.session_id.as_str()))
-            .chain(e.parent_id.as_deref().map(|p| ("claude", p)))
-        {
-            if seen.insert((h, id)) {
-                ids.push((h.to_string(), id.to_string()));
-            }
-        }
-    }
-    ids
-}
-
-fn event_titles(edits: &[EditEvent]) -> std::collections::HashMap<(&str, &str), &str> {
-    let mut titles = std::collections::HashMap::new();
-    for event in edits {
-        if let Some(title) = event.title.as_deref() {
-            titles
-                .entry((event.harness.as_str(), event.session_id.as_str()))
-                .or_insert(title);
-        }
-    }
-    titles
-}
-
-/// The exact tier for `commits` (see the module docs): candidates are the sessions with an edit on
-/// the file plus the parents of sub-agents among them, kept only if their transcript was written
-/// to after the earliest commit landed; each is scanned for tool output naming a commit's sha.
-fn exact_matches(commits: &[CommitInfo], edits: &[EditEvent]) -> Result<Vec<ExactMatch>> {
-    let Some(earliest) = commits.iter().map(|c| c.time).min() else {
-        return Ok(Vec::new());
-    };
-    let ids = candidate_ids(edits);
-    let titles = event_titles(edits);
-    let written_since = |p: &Path| {
-        std::fs::metadata(p)
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .is_some_and(|d| d.as_secs() as i64 + WINDOW_AFTER_SECS >= earliest)
-    };
-    let refs: Vec<cv_core::ir::SessionRef> = ids
-        .iter()
-        .filter_map(|(h, id)| cv_core::find_cheap(id, Harness::parse(h)).ok().flatten())
-        .map(|(r, _)| r)
-        .filter(|r| written_since(&r.path))
-        .collect();
-    let shas: Vec<String> = commits.iter().map(|c| c.sha.clone()).collect();
-    let mut out = Vec::new();
-    for (r, found) in cv_core::rewind::commit_evidence_many(refs, &shas)? {
-        for sha in &shas {
-            if let Some(ev) = CommitEvidenceSink::best(&found, &sha.to_ascii_lowercase()) {
-                out.push(ExactMatch {
-                    harness: r.harness.as_str().to_string(),
-                    title: titles
-                        .get(&(r.harness.as_str(), r.id.as_str()))
-                        .map(|t| (*t).to_string())
-                        .or_else(|| r.title.clone()),
-                    session_id: r.id.clone(),
-                    evidence: ev,
-                });
-            }
-        }
-    }
-    Ok(out)
-}
-
-/// `--show`: render the conversation window around the best match's edit, through the exact
-/// same streaming range path as `cv show --range` (only the window's messages are resolved).
 fn show_best(harness: &str, session_id: &str, msg_idx: i64) -> Result<()> {
     let want = Harness::parse(harness);
     let (r, adapter) = cv_core::find(session_id, want)?
         .with_context(|| format!("session {harness}:{session_id} not found (deleted since indexing?)"))?;
-    let (start, end) = range_hint(msg_idx);
+    let (start, end) = blame::range_hint(msg_idx);
     println!(
         "\n── conversation around the edit · {harness} {} · msg {start}..{end} ──\n",
         crate::util::short_id(session_id)
@@ -653,94 +197,10 @@ fn show_best(harness: &str, session_id: &str, msg_idx: i64) -> Result<()> {
     Ok(())
 }
 
-/// No git repo around the file: degrade to pure event-catalog mode — the sessions that edited
-/// it (an enriched `cv touched`), with range hints but no commit correlation.
-fn blame_event_only(file: &str, abs: &Path) -> Result<()> {
-    println!("(not inside a git repository — event-catalog matches only, no commit correlation)\n");
-    let rel = file.trim_start_matches("./");
-    let edits = events::edits_touching_file(&abs.to_string_lossy(), rel)?;
-    if edits.is_empty() {
-        if !events::catalog_has_events() {
-            println!("no edit events found — run `cv index` first to ingest tool events");
-        } else {
-            println!("no sessions edited {file:?}");
-        }
-        return Ok(());
-    }
-    // Latest edit per session, newest session first.
-    let mut latest: Vec<&EditEvent> = Vec::new();
-    let mut positions = std::collections::HashMap::new();
-    for e in &edits {
-        let index = *positions.entry((&e.harness, &e.session_id)).or_insert_with(|| {
-            latest.push(e);
-            latest.len() - 1
-        });
-        if e.ts.unwrap_or(i64::MIN) >= latest[index].ts.unwrap_or(i64::MIN) {
-            latest[index] = e;
-        }
-    }
-    latest.sort_by_key(|e| std::cmp::Reverse(e.ts.or(e.updated_at)));
-    println!("{} session(s) edited {file:?}:\n", latest.len());
-    for e in latest {
-        let date = e.ts.or(e.updated_at).map(date).unwrap_or_else(|| "----------".into());
-        println!(
-            "  {:8} {}  {}  {}  last edit at msg {}",
-            e.harness,
-            crate::util::short_id(&e.session_id),
-            date,
-            e.title.as_deref().map(|t| truncate(t, 48)).unwrap_or_default(),
-            e.msg_idx,
-        );
-        println!("{}", show_hint(&e.session_id, e.msg_idx));
-    }
-    Ok(())
-}
-
-// ---------- small helpers ----------
-
-/// Lexically absolutize the user's path against the cwd, then canonicalize when possible
-/// (resolves `/var` → `/private/var`-style symlinks so strip_prefix against the git toplevel
-/// agrees). A path that no longer exists keeps its lexical form.
-fn absolutize_input(file: &str) -> Result<PathBuf> {
-    let p = Path::new(file);
-    let abs = if p.is_absolute() {
-        p.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .context("cannot resolve current directory")?
-            .join(p)
-    };
-    Ok(abs.canonicalize().unwrap_or(abs))
-}
-
-/// Parse `-L <line>[,<endline>]` into an inclusive 1-based `(lo, hi)`.
-pub(crate) fn parse_line_spec(spec: &str) -> Result<(u32, u32)> {
-    let (a, b) = match spec.split_once(',') {
-        None => (spec, spec),
-        Some((a, b)) => (a, b),
-    };
-    let lo: u32 = a
-        .trim()
-        .parse()
-        .with_context(|| format!("bad -L {spec:?}: expected <line> or <line>,<endline>"))?;
-    let hi: u32 = b
-        .trim()
-        .parse()
-        .with_context(|| format!("bad -L {spec:?}: end line must be a number"))?;
-    if lo == 0 {
-        bail!("bad -L {spec:?}: lines are 1-based");
-    }
-    if hi < lo {
-        bail!("bad -L {spec:?}: end line ({hi}) is before start ({lo})");
-    }
-    Ok((lo, hi))
-}
-
 fn date(ts: i64) -> String {
     crate::util::fmt_local_ts(ts, "%Y-%m-%d").unwrap_or_else(|| "----------".into())
 }
 
-/// Humanize a commit↔edit delta: `8m before commit`, `2h10m before commit`, `30s after commit`.
 pub(crate) fn fmt_delta(delta: i64) -> String {
     let (mag, dir) = if delta >= 0 {
         (delta, "before")
@@ -766,190 +226,6 @@ pub(crate) fn fmt_delta(delta: i64) -> String {
 mod tests {
     use super::*;
 
-    fn ev(sid: &str, msg_idx: i64, ts: Option<i64>, cwd: Option<&str>, span: Option<(i64, i64)>) -> EditEvent {
-        EditEvent {
-            harness: "claude".into(),
-            session_id: sid.into(),
-            msg_idx,
-            ts,
-            target: Some("/repo/src/lib.rs".into()),
-            title: None,
-            cwd: cwd.map(Into::into),
-            created_at: span.map(|(c, _)| c),
-            updated_at: span.map(|(_, u)| u),
-            parent_id: None,
-        }
-    }
-
-    const T: i64 = 1_780_000_000; // an arbitrary commit time
-    fn root() -> PathBuf {
-        PathBuf::from("/repo")
-    }
-
-    #[test]
-    fn blame_identity_qualifies_titles_and_extreme_timestamps_do_not_overflow() {
-        let mut claude = ev("shared-id", 0, Some(i64::MIN), None, None);
-        claude.title = Some("Claude title".into());
-        let mut codex = claude.clone();
-        codex.harness = "codex".into();
-        codex.title = Some("Codex title".into());
-        let edits = vec![claude, codex];
-        let titles = event_titles(&edits);
-        assert_eq!(titles[&("claude", "shared-id")], "Claude title");
-        assert_eq!(titles[&("codex", "shared-id")], "Codex title");
-        assert!(correlate(i64::MAX, &edits, &root()).is_empty());
-        let span = vec![ev("span", 0, None, None, Some((i64::MAX - 10, i64::MAX)))];
-        assert_eq!(correlate(i64::MAX, &span, &root()).len(), 1);
-    }
-
-    #[test]
-    fn correlate_prefers_closest_edit_before_commit() {
-        let edits = vec![
-            ev("far", 3, Some(T - 5 * 3600), Some("/repo"), None),
-            ev("near", 9, Some(T - 8 * 60), Some("/repo"), None),
-            ev("after", 4, Some(T + 5 * 60), Some("/repo"), None),
-        ];
-        let m = correlate(T, &edits, &root());
-        assert_eq!(m.len(), 3);
-        assert_eq!(edits[m[0].event].session_id, "near");
-        assert_eq!(m[0].delta, 8 * 60);
-        // Both "before" matches outrank the (closer!) "after" one.
-        assert_eq!(edits[m[1].event].session_id, "far");
-        assert_eq!(edits[m[2].event].session_id, "after");
-        assert!(m[2].delta < 0);
-    }
-
-    #[test]
-    fn correlate_window_excludes_stale_and_future_edits() {
-        let edits = vec![
-            ev("ancient", 1, Some(T - WINDOW_BEFORE_SECS - 1), Some("/repo"), None),
-            ev("future", 2, Some(T + WINDOW_AFTER_SECS + 1), Some("/repo"), None),
-            ev("edge-lo", 3, Some(T - WINDOW_BEFORE_SECS), Some("/repo"), None),
-            ev("edge-hi", 4, Some(T + WINDOW_AFTER_SECS), Some("/repo"), None),
-        ];
-        let m = correlate(T, &edits, &root());
-        let ids: Vec<&str> = m.iter().map(|x| edits[x.event].session_id.as_str()).collect();
-        assert!(ids.contains(&"edge-lo") && ids.contains(&"edge-hi"));
-        assert!(!ids.contains(&"ancient") && !ids.contains(&"future"));
-    }
-
-    #[test]
-    fn correlate_ranks_in_repo_cwd_above_other_checkouts() {
-        // The other-checkout session is *closer* in time, but the in-repo one still wins.
-        let edits = vec![
-            ev("elsewhere", 1, Some(T - 60), Some("/somewhere/else"), None),
-            ev("in-repo", 2, Some(T - 30 * 60), Some("/repo/crates"), None),
-        ];
-        let m = correlate(T, &edits, &root());
-        assert_eq!(edits[m[0].event].session_id, "in-repo");
-        assert!(m[0].cwd_in_repo && !m[1].cwd_in_repo);
-    }
-
-    #[test]
-    fn correlate_null_ts_falls_back_to_session_span_weakly() {
-        let edits = vec![
-            // No event ts, but the session was open across the commit → weak match.
-            ev("spanning", 7, None, Some("/repo"), Some((T - 3600, T + 600))),
-            // No ts and the session closed long before → no match.
-            ev("closed", 1, None, Some("/repo"), Some((T - 9000, T - 8000))),
-            // No ts and no session dates at all → no match.
-            ev("dateless", 2, None, Some("/repo"), None),
-            // Any timed in-window edit outranks the span match.
-            ev("timed", 3, Some(T - 3000), None, None),
-        ];
-        let m = correlate(T, &edits, &root());
-        assert_eq!(m.len(), 2);
-        assert_eq!(edits[m[0].event].session_id, "timed");
-        assert_eq!(m[0].strength, Strength::Timed);
-        assert_eq!(edits[m[1].event].session_id, "spanning");
-        assert_eq!(m[1].strength, Strength::SessionSpan);
-    }
-
-    #[test]
-    fn correlate_dedupes_to_best_event_per_session() {
-        let edits = vec![
-            ev("s", 10, Some(T - 2 * 3600), Some("/repo"), None),
-            ev("s", 42, Some(T - 5 * 60), Some("/repo"), None),
-            ev("s", 50, Some(T + 60), Some("/repo"), None),
-        ];
-        let m = correlate(T, &edits, &root());
-        assert_eq!(m.len(), 1);
-        assert_eq!(edits[m[0].event].msg_idx, 42);
-    }
-
-    fn exact(sid: &str, sha: &str, kind: EvidenceKind, msg_idx: usize) -> ExactMatch {
-        ExactMatch {
-            harness: "claude".into(),
-            session_id: sid.into(),
-            title: None,
-            evidence: CommitEvidence {
-                sha: sha.into(),
-                kind,
-                msg_idx,
-                ts: Some(T),
-                tool_use_id: "toolu_x".into(),
-                command: "git commit -m x".into(),
-                byte_offset: None,
-            },
-        }
-    }
-
-    #[test]
-    fn exact_evidence_ranks_above_every_timed_match() {
-        const SHA: &str = "63cef473b771e07a2b5060e50373a41a27d54c0e";
-        let edits = vec![
-            ev("near", 9, Some(T - 60), Some("/repo"), None),
-            ev("keeper", 3, Some(T - 5 * 3600), Some("/repo"), None),
-            ev("pusher", 4, Some(T - 120), Some("/repo"), None),
-        ];
-        let exact = vec![
-            exact("pusher", SHA, EvidenceKind::Pushed, 40),
-            exact("keeper", SHA, EvidenceKind::Created, 12),
-            exact(
-                "other-commit",
-                "0123456789abcdef0123456789abcdef01234567",
-                EvidenceKind::Created,
-                1,
-            ),
-        ];
-        let ranked = rank_commit(SHA, &exact, correlate(T, &edits, &root()), &edits);
-        let order: Vec<(&str, &str)> = ranked
-            .iter()
-            .map(|r| match r {
-                Ranked::Exact(x) => (x.session_id.as_str(), "exact"),
-                Ranked::Timed(m) => (edits[m.event].session_id.as_str(), "timed"),
-            })
-            .collect();
-        // Created beats pushed beats the 1-minute timed match; the keeper's own 5h-old timed
-        // match is folded into its exact line, and another commit's evidence never shows.
-        assert_eq!(order, [("keeper", "exact"), ("pusher", "exact"), ("near", "timed")]);
-        // No evidence for a commit → exactly the timed ranking, untouched.
-        let plain = rank_commit(
-            "ffffffffffffffffffffffffffffffffffffffff",
-            &exact,
-            correlate(T, &edits, &root()),
-            &edits,
-        );
-        assert_eq!(plain.len(), 3);
-        assert!(plain.iter().all(|r| matches!(r, Ranked::Timed(_))));
-    }
-
-    #[test]
-    fn candidates_include_each_subagents_parent_once() {
-        let mut sub = ev("agent-a7f5", 2, Some(T), None, None);
-        sub.parent_id = Some("orchestrator".into());
-        let mut sub2 = ev("agent-b8e6", 5, Some(T), None, None);
-        sub2.parent_id = Some("orchestrator".into());
-        let edits = vec![
-            ev("solo", 1, Some(T), None, None),
-            sub,
-            ev("solo", 9, Some(T), None, None),
-            sub2,
-        ];
-        let ids: Vec<String> = candidate_ids(&edits).into_iter().map(|(_, id)| id).collect();
-        assert_eq!(ids, ["solo", "agent-a7f5", "orchestrator", "agent-b8e6"]);
-    }
-
     #[test]
     fn line_blame_reports_truncation_and_its_own_empty_case() {
         assert_eq!(
@@ -970,28 +246,14 @@ mod tests {
 
     #[test]
     fn every_show_hint_spells_a_sub_agent_in_full() {
-        assert_eq!(show_hint("blame-e2e-session", 1), "    ↳ cv show blame-e2 --range 0..4");
         assert_eq!(
-            show_hint("agent-a1b2c3d4e5f6", 142),
+            show_hint("blame-e2e-session", blame::range_hint(1)),
+            "    ↳ cv show blame-e2 --range 0..4"
+        );
+        assert_eq!(
+            show_hint("agent-a1b2c3d4e5f6", blame::range_hint(142)),
             "    ↳ cv show agent-a1b2c3d4e5f6 --range 139..145"
         );
-    }
-
-    #[test]
-    fn range_hint_centers_and_clamps() {
-        assert_eq!(range_hint(142), (139, 145)); // the documented example
-        assert_eq!(range_hint(1), (0, 4));
-        assert_eq!(range_hint(0), (0, 3));
-    }
-
-    #[test]
-    fn line_spec_forms() {
-        assert_eq!(parse_line_spec("12").unwrap(), (12, 12));
-        assert_eq!(parse_line_spec("10,20").unwrap(), (10, 20));
-        assert_eq!(parse_line_spec(" 3 , 4 ").unwrap(), (3, 4));
-        assert!(parse_line_spec("0").is_err());
-        assert!(parse_line_spec("9,3").is_err());
-        assert!(parse_line_spec("x").is_err());
     }
 
     #[test]
@@ -1000,20 +262,5 @@ mod tests {
         assert_eq!(fmt_delta(2 * 3600 + 600), "2h10m before commit");
         assert_eq!(fmt_delta(3 * 3600), "3h before commit");
         assert_eq!(fmt_delta(-30), "30s after commit");
-    }
-
-    #[test]
-    fn blame_porcelain_header_detection() {
-        assert_eq!(
-            blame_header_sha("49790775624d4ac7a52a01b3db762a486d8b236f 5 5 1"),
-            Some("49790775624d4ac7a52a01b3db762a486d8b236f")
-        );
-        assert_eq!(
-            blame_header_sha("49790775624d4ac7a52a01b3db762a486d8b236f 6 6"),
-            Some("49790775624d4ac7a52a01b3db762a486d8b236f")
-        );
-        assert_eq!(blame_header_sha("summary fix: a thing"), None);
-        assert_eq!(blame_header_sha("author-time 1748000000"), None);
-        assert_eq!(blame_header_sha("\t    let x = 1;"), None);
     }
 }

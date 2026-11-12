@@ -358,20 +358,21 @@ fn each_hook_answers_the_docs_payload_for_its_event() {
         &[],
     );
     assert_eq!(out.trim(), "");
-    let ledger = fs::read_to_string(w.cv_home.join("lanes.jsonl")).unwrap();
-    let rows: Vec<serde_json::Value> = ledger.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
-    assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0]["event"], "start");
-    assert_eq!(rows[0]["agent_id"], "aaa1", "agent- prefix stripped");
+    let lane_runs = cv_core::state::StateStore::at_dir(&w.cv_home)
+        .list_lane_runs_for_session("hooksess")
+        .unwrap();
+    assert_eq!(lane_runs.len(), 1);
+    assert_eq!(lane_runs[0].agent_id.as_deref(), Some("aaa1"), "agent- prefix stripped");
     assert!(
-        rows[0]["agent_transcript_path"]
-            .as_str()
+        lane_runs[0]
+            .agent_transcript_path
+            .as_deref()
             .unwrap()
             .ends_with("subagents/agent-aaa1.jsonl"),
         "derived on start"
     );
-    assert_eq!(rows[1]["event"], "stop");
-    assert_eq!(rows[1]["last_text"], "Lane A is done.");
+    assert!(lane_runs[0].exited_at.is_some());
+    assert_eq!(lane_runs[0].last_text.as_deref(), Some("Lane A is done."));
     let after = cv_ok(&w, &["lanes", "hooksess", "--json"]);
     let v: serde_json::Value = serde_json::from_str(&after).unwrap();
     assert_eq!(v[0]["status"], "stopped", "{after}");
@@ -578,18 +579,32 @@ fn codex_real_hook_payloads_compose_with_the_recorded_rollouts() {
         observed[index] = true;
     }
     assert!(observed.into_iter().all(|seen| seen));
-    let ledger: Vec<serde_json::Value> = fs::read_to_string(w.cv_home.join("lanes.jsonl"))
-        .unwrap()
-        .lines()
-        .map(|l| serde_json::from_str(l).unwrap())
-        .collect();
-    let stop = ledger.iter().find(|row| row["event"] == "stop").unwrap();
-    assert_eq!(stop["transcript_path"].as_str(), parent.as_deref());
-    let selector = format!("codex:{}", stop["session_id"].as_str().unwrap());
+    let parent_tp = parent.expect("SubagentStop recorded");
+    let state_store = cv_core::state::StateStore::at_dir(&w.cv_home);
+    let stopped_run = {
+        let conn = rusqlite::Connection::open(state_store.path()).unwrap();
+        let sid: String = conn
+            .query_row(
+                "SELECT session_id FROM lane_runs WHERE exited_at IS NOT NULL LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        state_store
+            .list_lane_runs_for_session(&sid)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.exited_at.is_some())
+            .unwrap()
+    };
+    assert_eq!(stopped_run.transcript_path.as_deref(), Some(parent_tp.as_str()));
+    let selector = format!("codex:{}", stopped_run.session_id);
     let lanes: Vec<serde_json::Value> = serde_json::from_str(&cv_ok(&w, &["lanes", &selector, "--json"])).unwrap();
-    assert!(lanes.iter().any(|lane| lane["agent_id"] == stop["agent_id"]
-        && lane["status"] == "stopped"
-        && lane["status_source"] == "hook_ledger"));
+    assert!(lanes.iter().any(|lane| {
+        lane["agent_id"].as_str() == stopped_run.agent_id.as_deref()
+            && lane["status"] == "stopped"
+            && lane["status_source"] == "hook_ledger"
+    }));
 }
 
 /// Codex's `[hooks.state]` in `config.toml`, as its startup hooks review writes it.

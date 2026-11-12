@@ -11,6 +11,8 @@ pub mod affordance;
 // catalog and the event store, neither of which exists on wasm32.
 #[cfg(feature = "sqlite")]
 pub mod api;
+#[cfg(feature = "sqlite")]
+pub mod blame;
 pub mod catalog;
 pub mod compaction;
 pub mod config;
@@ -77,6 +79,200 @@ pub use lazy::{Resolver, Span, Text, INLINE_MAX};
 pub use query::SessionQuery;
 pub use restamp::{restamp, restamp_line, Restamped};
 pub use stream::{collect, CollectSink, Demand, Flow, MessageSink, TeeSink, Tier, TryFnSink};
+
+/// Compute lowercase 64-char hex BLAKE3 digest of `bytes`.
+pub fn blake3_hex(bytes: &[u8]) -> String {
+    blake3::hash(bytes).to_hex().to_string()
+}
+
+/// Read `pack_manifests` from `<cv_home>/state.db` without creating `-wal`/`-shm` sidecars when
+/// `--frozen` is active (delegating to [`harness::store::sqlite::open_ro`]).
+#[cfg(feature = "sqlite")]
+pub fn list_pack_manifests_frozen_safe(cv_home: &std::path::Path) -> anyhow::Result<Vec<state::PackManifest>> {
+    if !env::frozen() {
+        return Ok(state::StateStore::at_dir(cv_home).list_pack_manifests()?);
+    }
+    let db_path = cv_home.join("state.db");
+    let meta = match std::fs::metadata(&db_path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    if !meta.is_file() || meta.len() == 0 {
+        return Ok(Vec::new());
+    }
+    harness::store::sqlite::read(&db_path, |conn, _| {
+        let has_table: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pack_manifests')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(false);
+        if !has_table {
+            return Ok(Vec::new());
+        }
+        let mut stmt = conn.prepare(
+            "SELECT pack_id, min_commit_pos, max_commit_pos, record_count, byte_len,
+                    digest, pack_path, index_meta_json, published_at
+             FROM pack_manifests
+             ORDER BY min_commit_pos ASC, pack_id ASC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            let meta_str: String = r.get(7)?;
+            Ok(state::PackManifest {
+                pack_id: r.get(0)?,
+                min_commit_pos: r.get(1)?,
+                max_commit_pos: r.get(2)?,
+                record_count: r.get::<_, i64>(3)? as u64,
+                byte_len: r.get::<_, i64>(4)? as u64,
+                digest: r.get(5)?,
+                pack_path: r.get(6)?,
+                index_meta: serde_json::from_str(&meta_str).unwrap_or_else(|_| serde_json::json!({})),
+                published_at: r.get(8)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    })
+}
+
+/// Replay the default task store without creating `state.db-wal`/`state.db-shm` or `tasks/state.json`
+/// when `--frozen` is active.
+#[cfg(feature = "sqlite")]
+pub fn replay_tasks_frozen_safe() -> anyhow::Result<task::ReplayOutcome> {
+    if !env::frozen() {
+        return task::replay();
+    }
+    use std::io::BufRead;
+    let tasks_dir = task::tasks_dir();
+    let events_path = tasks_dir.join("events.jsonl");
+    let mut raw_events: Vec<(usize, task::TaskEvent)> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
+    let mut seen_ids = std::collections::HashSet::new();
+    let mut line_no = 0usize;
+
+    match std::fs::File::open(&events_path) {
+        Ok(file) => {
+            let mut reader = std::io::BufReader::new(file);
+            let mut raw = Vec::new();
+            loop {
+                raw.clear();
+                let n = reader.read_until(b'\n', &mut raw)?;
+                if n == 0 {
+                    break;
+                }
+                line_no += 1;
+                let terminated = raw.ends_with(b"\n");
+                let Ok(text) = std::str::from_utf8(&raw) else {
+                    if !terminated {
+                        break;
+                    }
+                    anyhow::bail!(
+                        "reading task log {}: invalid UTF-8 at line {line_no}",
+                        events_path.display()
+                    );
+                };
+                let line = text.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                match serde_json::from_str::<task::TaskEvent>(line) {
+                    Ok(ev) => {
+                        seen_ids.insert(ev.id.clone());
+                        raw_events.push((line_no, ev));
+                    }
+                    Err(_) => {
+                        if let Ok(hdr) = serde_json::from_str::<serde_json::Value>(line) {
+                            if hdr.get("format").and_then(|v| v.as_str()) == Some("cv-task-log") {
+                                if let Some(v) = hdr.get("v").and_then(|v| v.as_u64()) {
+                                    if v > 1 {
+                                        anyhow::bail!(
+                                            "task log {} declares format v{v} (this cv reads v1) — upgrade before touching it",
+                                            events_path.display()
+                                        );
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
+                        if !terminated
+                            && matches!(serde_json::from_str::<&serde_json::value::RawValue>(line), Err(e) if e.is_eof())
+                        {
+                            break;
+                        }
+                        let snippet: String = line.chars().take(80).collect();
+                        warnings.push(format!(
+                            "task log {}: line {} is not a valid event (log may be corrupted): {}",
+                            events_path.display(),
+                            line_no,
+                            snippet
+                        ));
+                    }
+                }
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+
+    let db_path = tasks_dir
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty() && tasks_dir.file_name().and_then(|n| n.to_str()) == Some("tasks"))
+        .map(|p| p.join("state.db"))
+        .unwrap_or_else(|| tasks_dir.join("state.db"));
+    if std::fs::metadata(&db_path).is_ok_and(|m| m.is_file() && m.len() > 0) {
+        let db_rows: Vec<String> = harness::store::sqlite::read(&db_path, |conn, _| {
+            let has_table: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'task_events')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(false);
+            if !has_table {
+                return Ok(Vec::new());
+            }
+            let mut stmt = conn.prepare("SELECT raw_json FROM task_events ORDER BY seq ASC")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        })?;
+        for raw_json in db_rows {
+            line_no += 1;
+            match serde_json::from_str::<task::TaskEvent>(&raw_json) {
+                Ok(ev) => {
+                    if seen_ids.insert(ev.id.clone()) {
+                        raw_events.push((line_no, ev));
+                    }
+                }
+                Err(e) => warnings.push(format!("state.db task_events row {line_no}: {e}")),
+            }
+        }
+    }
+
+    let mut reducer = task::TaskReducer::new();
+    let mut events = Vec::with_capacity(raw_events.len());
+    let mut quarantined = 0usize;
+    for (ln, ev) in raw_events {
+        match reducer.apply(&ev) {
+            Ok(()) => events.push(ev),
+            Err(e) => {
+                quarantined += 1;
+                warnings.push(format!(
+                    "task log {}: line {} quarantined ({})",
+                    events_path.display(),
+                    ln,
+                    e
+                ));
+            }
+        }
+    }
+    Ok(task::ReplayOutcome {
+        model: reducer.into_model(),
+        events,
+        warnings,
+        quarantined,
+    })
+}
 
 use anyhow::Result;
 

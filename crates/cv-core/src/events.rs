@@ -567,17 +567,11 @@ pub(crate) fn command_of_json(input: &Json) -> Result<Option<String>> {
     input.with_view(crate::tools::classify::command_string)
 }
 
-/// Lexically absolutize `p` against the session cwd. Already-absolute paths pass through; with no
-/// cwd the path is stored as given (still suffix-matchable by `cv touched`).
-fn absolutize(p: &str, cwd: Option<&Path>) -> String {
-    if Path::new(p).is_absolute() {
-        return p.to_string();
-    }
-    let trimmed = p.trim_start_matches("./");
-    match cwd {
-        Some(c) => c.join(trimmed).to_string_lossy().into_owned(),
-        None => trimmed.to_string(),
-    }
+/// Absolutize `p` against the session cwd and canonicalize the deepest existing ancestor so OS
+/// symlink aliases (such as macOS `/var` <-> `/private/var`) match identically across ingest and
+/// hook/query lookups. With no cwd, relative paths are stored as given (still suffix-matchable).
+pub fn absolutize(p: &str, cwd: Option<&Path>) -> String {
+    crate::tools::classify::absolutize_path(p, cwd)
 }
 
 /// Provenance for a sub-agent event source: which parent session, which workflow run (if any), and
@@ -1249,7 +1243,8 @@ mod db {
     /// a store of millions of events. No suffix match, so no scan of `event_targets` — the
     /// `target` UNIQUE index resolves the path and `idx_events_target` the rows. Newest first.
     pub fn sessions_editing(abs: &str) -> Result<Vec<TouchedSession>> {
-        touching(abs, None, true)
+        let abs = absolutize(abs, None);
+        touching(&abs, None, true)
     }
 
     fn touching(abs: &str, suffix: Option<&str>, edits_only: bool) -> Result<Vec<TouchedSession>> {
@@ -1308,6 +1303,7 @@ mod db {
     /// path still surface. The LEFT JOIN is grouped per event row because a session may be
     /// cataloged at more than one path. Empty on a cold catalog; a catalog error is an error.
     pub fn edits_touching_file(abs: &str, rel: &str) -> Result<Vec<EditEvent>> {
+        let abs = absolutize(abs, None);
         let conn = open().context("the event catalog cannot be opened")?;
         let escaped = rel.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
         let suffix = format!("%/{escaped}");
@@ -1326,7 +1322,7 @@ mod db {
              GROUP BY es.harness, es.session_id, e.msg_idx, e.ts, t.target
              ORDER BY e.ts, e.msg_idx",
         )?;
-        let rows = stmt.query_map(params![abs, rel, suffix], |row| {
+        let rows = stmt.query_map(params![&abs, rel, suffix], |row| {
             Ok(EditEvent {
                 harness: row.get(0)?,
                 session_id: row.get(1)?,
@@ -1346,6 +1342,7 @@ mod db {
     /// Same file-matching and ordering semantics as [`edits_touching_file`], additionally
     /// returning the persisted 64-bit normalized hunk & line fingerprints for each edit.
     pub fn edits_with_hunks_touching_file(abs: &str, rel: &str) -> Result<Vec<EditHunkEvent>> {
+        let abs = absolutize(abs, None);
         let conn = open().context("the event catalog cannot be opened")?;
         let escaped = rel.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
         let suffix = format!("%/{escaped}");
@@ -1363,7 +1360,7 @@ mod db {
              GROUP BY e.rowid
              ORDER BY e.ts, e.msg_idx, e.rowid",
         )?;
-        let raw_rows = stmt.query_map(params![abs, rel, suffix], |row| {
+        let raw_rows = stmt.query_map(params![&abs, rel, suffix], |row| {
             let blob: Option<Vec<u8>> = row.get(10)?;
             Ok(EditHunkEvent {
                 edit: EditEvent {
@@ -1934,7 +1931,11 @@ mod tests {
             ("file_edit", Some("/repo/src/ir.rs"))
         );
         assert_eq!(ev[0].msg_idx, 7);
-        assert_eq!((ev[1].kind, ev[1].target.as_deref()), ("file_read", Some("/etc/hosts")));
+        let expected_hosts = absolutize("/etc/hosts", None);
+        assert_eq!(
+            (ev[1].kind, ev[1].target.as_deref()),
+            ("file_read", Some(expected_hosts.as_str()))
+        );
         assert_eq!(
             (ev[2].kind, ev[2].target.as_deref()),
             ("command", Some("cargo test -p cv-core"))

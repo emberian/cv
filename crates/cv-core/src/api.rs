@@ -54,6 +54,8 @@ pub fn route_json(parts: &[&str], query: &str) -> (u16, Value) {
 routes! {
     pub const ROUTES;
     fn read(_post, parts, query: &str) -> (u16, Value) {
+        GET ["api", "blame"] => blame(query),
+
         GET ["api", "health"] => ok(json!({
             "ok": true,
             "harnesses": Harness::ALL.iter().map(|h| h.as_str()).collect::<Vec<_>>(),
@@ -524,6 +526,24 @@ fn touched(query: &str) -> (u16, Value) {
     };
     let out: Vec<Value> = rows.iter().map(crate::rows::touched_row).collect();
     ok(json!(out))
+}
+
+/// `GET /api/blame?file=<path>[&lines=a,b]` — git-to-session code provenance with content-hunk,
+/// commit-SHA, and time-window correlation, matching `cv blame --json`.
+fn blame(query: &str) -> (u16, Value) {
+    let params = Query::parse(query);
+    let Some(file) = params.get("file") else {
+        return err(400, "missing file parameter");
+    };
+    let lines = params.get("lines");
+    match crate::blame::blame(&file, lines.as_deref()) {
+        Ok(report) => match serde_json::to_value(report) {
+            Ok(v) => ok(v),
+            Err(e) => err(500, &format!("blame serialization failed: {e}")),
+        },
+        Err(e) if e.downcast_ref::<crate::blame::BlameInputError>().is_some() => err(400, &e.to_string()),
+        Err(e) => err(500, &format!("blame failed: {e:#}")),
+    }
 }
 
 /// `GET /api/session/{harness}/{id}/subagents` — the sub-agent **forest** a session spawned

@@ -57,14 +57,14 @@ pub(crate) enum HooksCmd {
         /// `user` writes the harness home; `project` writes `.claude/settings.json` or `.codex/hooks.json`.
         #[arg(long, value_enum, default_value_t = Scope::User)]
         scope: Scope,
-        /// Install only the retired-agent guard (`cv hook retired`, PreToolUse on every tool,
-        /// Claude Code only): it refuses each tool call of an agent `cv distill --agent-of`
-        /// replaced, and each `SendMessage` addressed to one, naming the successor.
+        /// Install only the retired-agent guard (`cv hook retired`, PreToolUse on every tool):
+        /// it refuses each tool call of an agent `cv distill --agent-of` replaced, and each
+        /// agent message addressed to one, naming the successor.
         #[arg(long)]
         retired: bool,
         /// Install only the receipt log (`cv hook receipt`, PreToolUse and PostToolUse on every
-        /// tool, Claude Code only): each call's input digest is appended to a hash-chained log
-        /// and fsynced before the call runs; `CV_RECEIPT_STRICT=1` refuses a call it cannot log.
+        /// tool): each call's input digest is appended to a hash-chained log in `state.db`
+        /// before the call runs; `CV_RECEIPT_STRICT=1` refuses a call it cannot log.
         #[arg(long, conflicts_with = "retired")]
         receipts: bool,
     },
@@ -280,8 +280,8 @@ fn host(h: Harness) -> Option<Host> {
             edit: Some(&CODEX_EDIT),
             trust: true,
             policy: false,
-            receipts: false,
-            retired_guard: false,
+            receipts: true,
+            retired_guard: true,
         }),
         Harness::Grok
         | Harness::OpenCode
@@ -384,10 +384,12 @@ struct TrustRow {
 fn codex_event_label(event: &str) -> &'static str {
     match event {
         "PreToolUse" => "pre_tool_use",
+        "PostToolUse" => "post_tool_use",
         "SessionStart" => "session_start",
         "UserPromptSubmit" => "user_prompt_submit",
         "SubagentStart" => "subagent_start",
         "SubagentStop" => "subagent_stop",
+        "Stop" => "stop",
         _ => "unknown",
     }
 }
@@ -681,13 +683,29 @@ fn with_receipts(harness: Harness, mut settings: Value, exe: &str) -> Value {
     settings
 }
 
-/// Which of our entries are present in `settings`, by `(event, matcher, name)`, with the command found.
-fn present(harness: Harness, settings: &Value) -> HashMap<(&'static str, Option<&'static str>, HookName), String> {
+fn opt_in_specs(harness: Harness) -> Vec<(&'static Spec, &'static str)> {
+    let mut out = Vec::new();
+    if host(harness).is_some_and(|h| h.retired_guard) {
+        out.push((&RETIRED, "--retired"));
+    }
+    if host(harness).is_some_and(|h| h.receipts) {
+        for s in &RECEIPTS {
+            out.push((s, "--receipts"));
+        }
+    }
+    out
+}
+
+/// Which of the given `specs` are present in `settings`, by `(event, matcher, name)`, with the command found.
+fn present_specs<'a>(
+    specs_iter: impl Iterator<Item = &'a Spec>,
+    settings: &Value,
+) -> HashMap<(&'static str, Option<&'static str>, HookName), String> {
     let mut found = HashMap::new();
     let Some(hooks) = settings.get("hooks").and_then(Value::as_object) else {
         return found;
     };
-    for spec in specs(harness) {
+    for spec in specs_iter {
         let Some(groups) = hooks.get(spec.event).and_then(Value::as_array) else {
             continue;
         };
@@ -705,6 +723,27 @@ fn present(harness: Harness, settings: &Value) -> HashMap<(&'static str, Option<
         }
     }
     found
+}
+
+/// Which of our standard six entries are present in `settings`, by `(event, matcher, name)`.
+fn present(harness: Harness, settings: &Value) -> HashMap<(&'static str, Option<&'static str>, HookName), String> {
+    present_specs(specs(harness), settings)
+}
+
+/// Count every handler of ours in `settings.hooks` (standard six, opt-in `retired`/`receipt`, and
+/// any `PostToolUse` `edit`/`receipt` entries).
+fn total_ours_entries(settings: &Value) -> usize {
+    let Some(hooks) = settings.get("hooks").and_then(Value::as_object) else {
+        return 0;
+    };
+    hooks
+        .values()
+        .filter_map(Value::as_array)
+        .flatten()
+        .filter_map(|g| g.get("hooks").and_then(Value::as_array))
+        .flatten()
+        .filter(|h| ours(h).is_some())
+        .count()
 }
 
 fn hook_harness(harness: &str) -> Result<Harness> {
@@ -745,7 +784,9 @@ pub(crate) fn cmd_hooks(cmd: HooksCmd) -> Result<()> {
                     "cv hooks: installed the receipt log (PreToolUse + PostToolUse, every tool) → {}",
                     home_rel(&settings_path)
                 );
-                println!("  (lines land in <cv home>/receipts/<session>.jsonl; `cv hooks remove --receipts` deletes the entries)");
+                println!(
+                    "  (chained receipts land in <cv home>/state.db; `cv hooks remove --receipts` deletes the entries)"
+                );
             }
             Ok(())
         }
@@ -877,7 +918,7 @@ pub(crate) fn cmd_hooks(cmd: HooksCmd) -> Result<()> {
             let harness = hook_harness(&harness)?;
             let (settings_path, skill_path) = paths(harness, scope)?;
             let before = read_settings(&settings_path)?;
-            let n = present(harness, &before).len();
+            let n = total_ours_entries(&before);
             let mut after = before.clone();
             strip_ours(&mut after);
             let mut removed = Vec::new();
@@ -909,6 +950,8 @@ pub(crate) fn cmd_hooks(cmd: HooksCmd) -> Result<()> {
             let before = read_settings(&settings_path)?;
             let after = with_ours(harness, before.clone(), &exe);
             let have = present(harness, &before);
+            let opt_specs = opt_in_specs(harness);
+            let have_opt = present_specs(opt_specs.iter().map(|(s, _)| *s), &before);
             let skill_present = std::fs::read_to_string(&skill_path).ok().as_deref() == Some(SKILL);
             // Codex: the trust each present entry has today (the file as it is, not as install would leave it).
             let trust = match needs_trust(harness) {
@@ -920,11 +963,46 @@ pub(crate) fn cmd_hooks(cmd: HooksCmd) -> Result<()> {
                     .iter()
                     .find(|r| r.name == s.name && r.key.contains(&format!(":{}:", codex_event_label(s.event))))
             };
+            let all_hook_names = [
+                (HookName::Compact, false),
+                (HookName::Start, false),
+                (HookName::Lane, false),
+                (HookName::Decisions, false),
+                (HookName::Edit, false),
+                (HookName::Retired, true),
+                (HookName::Receipt, true),
+            ];
+            let hook_summary: Vec<Value> = all_hook_names
+                .iter()
+                .map(|&(hname, is_opt)| {
+                    let want = command_for(harness, &exe, hname);
+                    let relevant: Vec<&Spec> = if is_opt {
+                        opt_specs
+                            .iter()
+                            .filter(|(s, _)| s.name == hname)
+                            .map(|(s, _)| *s)
+                            .collect()
+                    } else {
+                        specs(harness).filter(|s| s.name == hname).collect()
+                    };
+                    let map = if is_opt { &have_opt } else { &have };
+                    let is_installed = !relevant.is_empty()
+                        && relevant
+                            .iter()
+                            .all(|s| map.get(&(s.event, s.matcher, s.name)) == Some(&want));
+                    json!({
+                        "hook": hname.as_str(),
+                        "opt_in": is_opt,
+                        "installed": is_installed,
+                    })
+                })
+                .collect();
             if json {
-                let (mut installed, mut missing) = (Vec::new(), Vec::new());
+                let (mut installed, mut missing, mut opt_in) = (Vec::new(), Vec::new(), Vec::new());
                 for s in specs(harness) {
+                    let want = command_for(harness, &exe, s.name);
                     let mut row = json!({"event": s.event, "matcher": s.matcher, "hook": s.name.as_str(),
-                        "command": command_for(harness, &exe, s.name)});
+                        "command": want});
                     if let Some(t) = trust_of(s) {
                         row["trust"] = json!(t.trust.as_str());
                         row["trust_key"] = json!(t.key);
@@ -935,10 +1013,39 @@ pub(crate) fn cmd_hooks(cmd: HooksCmd) -> Result<()> {
                         _ => missing.push(row),
                     }
                 }
+                for &(s, flag) in &opt_specs {
+                    let want = command_for(harness, &exe, s.name);
+                    let is_inst = have_opt.get(&(s.event, s.matcher, s.name)) == Some(&want);
+                    let mut row = json!({
+                        "event": s.event,
+                        "matcher": s.matcher,
+                        "hook": s.name.as_str(),
+                        "opt_in": true,
+                        "flag": flag,
+                        "installed": is_inst,
+                        "command": want,
+                    });
+                    if let Some(t) = trust_of(s) {
+                        row["trust"] = json!(t.trust.as_str());
+                        row["trust_key"] = json!(t.key);
+                        row["current_hash"] = json!(t.hash);
+                    }
+                    if is_inst {
+                        installed.push(row.clone());
+                    }
+                    opt_in.push(row);
+                }
                 let mut out = json!({
-                    "settings_path": settings_path, "installed": installed, "missing": missing,
-                    "skill_path": skill_path, "skill_present": skill_present,
-                    "before": before, "after": after, "would_change": after != before || !skill_present,
+                    "settings_path": settings_path,
+                    "installed": installed,
+                    "missing": missing,
+                    "opt_in": opt_in,
+                    "hooks": hook_summary,
+                    "skill_path": skill_path,
+                    "skill_present": skill_present,
+                    "before": before,
+                    "after": after,
+                    "would_change": after != before || !skill_present,
                 });
                 if needs_trust(harness) {
                     out["trust"] = json!(trust_summary(&trust, scope));
@@ -960,6 +1067,19 @@ pub(crate) fn cmd_hooks(cmd: HooksCmd) -> Result<()> {
                     .unwrap_or_default();
                 println!("  {mark} {:<17}{matcher:<18} {want}{trust}", s.event);
             }
+            for &(s, flag) in &opt_specs {
+                let want = command_for(harness, &exe, s.name);
+                let (mark, suffix) = match have_opt.get(&(s.event, s.matcher, s.name)) {
+                    Some(cmd) if *cmd == want => ("✓", format!(" (opt-in {flag})")),
+                    Some(_) => ("~", format!(" (opt-in {flag})")),
+                    None => ("-", format!(" (opt-in {flag})")),
+                };
+                let matcher = s.matcher.map(|m| format!(" [{m}]")).unwrap_or_default();
+                let trust = trust_of(s)
+                    .map(|t| format!(" · {}", t.trust.as_str()))
+                    .unwrap_or_default();
+                println!("  {mark} {:<17}{matcher:<18} {want}{suffix}{trust}", s.event);
+            }
             println!(
                 "  {} skill {}",
                 if skill_present { "✓" } else { "+" },
@@ -970,7 +1090,7 @@ pub(crate) fn cmd_hooks(cmd: HooksCmd) -> Result<()> {
                 if after == before && skill_present {
                     format!("installed; `cv hooks install {harness}` would write nothing")
                 } else {
-                    format!("✓ present · + `cv hooks install {harness}` adds · ~ replaces (another cv binary's path)")
+                    format!("✓ present · + `cv hooks install {harness}` adds · ~ replaces · - opt-in not installed")
                 }
             );
             if needs_trust(harness) && !trust.is_empty() {
@@ -1214,7 +1334,7 @@ pub(crate) fn cmd_hook(name: HookName, harness: Option<String>) -> Result<()> {
         Ok(Some(event)) => match name {
             HookName::Compact => hook_compact(&event),
             HookName::Start => hook_start(&event),
-            HookName::Lane => hook_lane(&event),
+            HookName::Lane => hook_lane(&event, &payload),
             HookName::Decisions => hook_decisions(&event),
             HookName::Edit => hook_edit(&event),
             HookName::Retired => hook_retired(&event, &payload),
@@ -1312,9 +1432,10 @@ fn is_binary_or_compressed_store(path: &Path) -> bool {
         || (n >= 2 && magic[..2] == [0x1F, 0x8B])
 }
 
-/// Read the last `bytes` of a plain-text transcript `path`. Binary SQLite databases and compressed
-/// archives return `None` so callers never seek raw mid-file binary/compressed bytes as UTF-8.
-fn tail_text(path: &Path, bytes: u64) -> Option<String> {
+/// Read the last `bytes` of a plain-text transcript `path` as raw bytes without allocating a
+/// `String`. Binary SQLite databases and compressed archives return `None` so callers never seek
+/// raw mid-file binary/compressed bytes.
+fn tail_bytes(path: &Path, bytes: u64) -> Option<Vec<u8>> {
     use std::io::{Seek, SeekFrom};
     if is_binary_or_compressed_store(path) {
         return None;
@@ -1325,7 +1446,7 @@ fn tail_text(path: &Path, bytes: u64) -> Option<String> {
     f.seek(SeekFrom::Start(start)).ok()?;
     let mut buf = Vec::with_capacity((len - start) as usize);
     f.read_to_end(&mut buf).ok()?;
-    Some(String::from_utf8_lossy(&buf).into_owned())
+    Some(buf)
 }
 
 fn not_recorded_yet(id: &str) -> Value {
@@ -1415,9 +1536,11 @@ fn affordance_pointer(id: &str) -> String {
     format!("`cv show {id} --kind plan,schedule,background_job` lists the plan, schedules and background jobs this session holds.")
 }
 
-fn commit_re() -> &'static regex::Regex {
-    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| regex::Regex::new(r#"\[([^\]\s\\"]+)(?: \([^)]*\))? ([0-9a-f]{7,40})\] "#).expect("static regex"))
+fn commit_re() -> &'static regex::bytes::Regex {
+    static RE: std::sync::OnceLock<regex::bytes::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| {
+        regex::bytes::Regex::new(r#"\[([^\]\s\\"]+)(?: \([^)]*\))? ([0-9a-f]{7,40})\] "#).expect("static regex")
+    })
 }
 
 /// What the start pack says of a session's last commit: the short sha of the last
@@ -1426,11 +1549,14 @@ fn commit_re() -> &'static regex::Regex {
 /// it looked.
 fn last_commit(path: &Path, bytes: u64) -> String {
     let re = commit_re();
-    let Some(text) = tail_text(path, bytes) else {
+    let Some(buf) = tail_bytes(path, bytes) else {
         return String::new();
     };
-    match re.captures_iter(&text).last() {
-        Some(c) => format!(" · last commit {}", &c[2][..7.min(c[2].len())]),
+    match re.captures_iter(&buf).last() {
+        Some(c) => {
+            let sha = std::str::from_utf8(&c[2]).unwrap_or("");
+            format!(" · last commit {}", &sha[..7.min(sha.len())])
+        }
         None if std::fs::metadata(path).is_ok_and(|m| m.len() > bytes) => {
             format!(" · no commit in its last {}", cv_core::ir::human_bytes(bytes))
         }
@@ -1438,9 +1564,77 @@ fn last_commit(path: &Path, bytes: u64) -> String {
     }
 }
 
-/// Session-aware commit lookup for `hook_start`: plain-text logs tail raw UTF-8 bytes; binary
-/// SQLite stores and small compressed rollouts stream only that session's tool results within
-/// `bytes` instead of seeking raw binary/compressed bytes at EOF.
+fn is_git_commit_command(cmd: &str) -> bool {
+    let has_git = cmd
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '/'))
+        .any(|tok| tok == "git" || tok.ends_with("/git"));
+    if !has_git {
+        return false;
+    }
+    cmd.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+        .any(|tok| matches!(tok, "commit" | "cherry-pick" | "merge" | "revert" | "rebase" | "am"))
+}
+
+fn scan_messages_rev_for_commit<'a>(
+    msgs: impl Iterator<Item = &'a cv_core::Message>,
+    resolver: &cv_core::Resolver,
+    mut remaining: u64,
+) -> Option<String> {
+    let re = commit_re();
+    for m in msgs {
+        for block in m.content.iter().rev() {
+            let text = match block {
+                cv_core::Block::ToolResult { content, .. } => content,
+                _ => continue,
+            };
+            if remaining == 0 {
+                return None;
+            }
+            let mut block_sha: Option<String> = None;
+            let mut overlap: [u8; 96] = [0; 96];
+            let mut overlap_len: usize = 0;
+            let _ = text.try_for_each_chunk(resolver, 64 * 1024, |chunk| {
+                if remaining == 0 {
+                    return Ok(());
+                }
+                let raw = chunk.as_bytes();
+                let take = raw.len().min(remaining as usize);
+                let slice = &raw[..take];
+                remaining = remaining.saturating_sub(take as u64);
+                if overlap_len == 0 {
+                    if let Some(c) = re.captures_iter(slice).last() {
+                        if let Ok(s) = std::str::from_utf8(&c[2]) {
+                            block_sha = Some(s[..7.min(s.len())].to_string());
+                        }
+                    }
+                } else {
+                    let mut combined = Vec::with_capacity(overlap_len + slice.len());
+                    combined.extend_from_slice(&overlap[..overlap_len]);
+                    combined.extend_from_slice(slice);
+                    if let Some(c) = re.captures_iter(&combined).last() {
+                        if let Ok(s) = std::str::from_utf8(&c[2]) {
+                            block_sha = Some(s[..7.min(s.len())].to_string());
+                        }
+                    }
+                }
+                let keep = slice.len().min(overlap.len());
+                overlap[..keep].copy_from_slice(&slice[slice.len() - keep..]);
+                overlap_len = keep;
+                Ok(())
+            });
+            if block_sha.is_some() {
+                return block_sha;
+            }
+        }
+    }
+    None
+}
+
+/// Session-aware commit lookup for `hook_start`: plain-text logs tail raw bytes directly; binary
+/// SQLite stores and compressed rollouts inspect the tail ring backwards first (newest message
+/// first, so giant intermediate `ToolResult`s never starve a newer commit) and fall back to narrow
+/// `[cmd_idx ..= cmd_idx + 4]` windows around indexed `git commit` events when the last commit sits
+/// >`TAIL_MESSAGES` before EOF.
 fn last_commit_session(r: &SessionRef, bytes: u64) -> String {
     if !is_binary_or_compressed_store(&r.path) {
         return last_commit(&r.path, bytes);
@@ -1451,47 +1645,66 @@ fn last_commit_session(r: &SessionRef, bytes: u64) -> String {
     if is_compressed_store(&r.path) && std::fs::metadata(&r.path).is_ok_and(|m| m.len() > bytes) {
         return String::new();
     }
-    if r.message_count.is_some_and(|n| n > 2_000) {
-        return String::new();
-    }
     let Some(adapter) = cv_core::harness::rootless(r.harness) else {
         return String::new();
     };
-    struct CommitSink {
-        resolver: cv_core::Resolver,
-        remaining: u64,
-        sha: Option<String>,
+    const TAIL_MESSAGES: usize = 256;
+    const COMMIT_RESULT_WINDOW: u64 = 4;
+
+    let mut cmd_indices: Vec<u64> = cv_core::events::events_for(r.harness.as_str(), &r.id, Some("command"))
+        .ok()
+        .map(|evs| {
+            let mut idxs: Vec<u64> = evs
+                .iter()
+                .filter(|e| e.target.as_deref().is_some_and(is_git_commit_command))
+                .map(|e| e.msg_idx.max(0) as u64)
+                .collect();
+            idxs.sort_unstable();
+            idxs.dedup();
+            if idxs.len() > 8 {
+                idxs.drain(..idxs.len() - 8);
+            }
+            idxs
+        })
+        .unwrap_or_default();
+    cmd_indices.shrink_to_fit();
+
+    let tail_start = r.message_count.map(|n| n.saturating_sub(TAIL_MESSAGES) as u64);
+
+    struct CommitWindowSink {
+        cmd_windows: Vec<(u64, u64, Vec<cv_core::Message>)>,
+        tail_start: Option<u64>,
+        tail_ring: std::collections::VecDeque<cv_core::Message>,
+        seen_msgs: u64,
     }
-    impl cv_core::MessageSink for CommitSink {
+    impl cv_core::MessageSink for CommitWindowSink {
         fn message(&mut self, m: cv_core::Message) -> cv_core::Flow {
-            let re = commit_re();
-            for block in &m.content {
-                let text = match block {
-                    cv_core::Block::ToolResult { content, .. } => content,
-                    _ => continue,
-                };
-                if self.remaining == 0 {
-                    return cv_core::Flow::Stop;
-                }
-                let Ok(resolved) = text.try_resolve_prefix(&self.resolver, self.remaining) else {
-                    continue;
-                };
-                self.remaining = self.remaining.saturating_sub(resolved.len() as u64);
-                if let Some(c) = re.captures_iter(&resolved).last() {
-                    self.sha = Some(c[2][..7.min(c[2].len())].to_string());
+            let idx = self.seen_msgs;
+            self.seen_msgs += 1;
+            let in_tail = self.tail_start.is_none_or(|ts| idx >= ts);
+            for (lo, hi, buf) in &mut self.cmd_windows {
+                if idx >= *lo && idx <= *hi {
+                    buf.push(m.clone());
                 }
             }
-            if self.remaining == 0 {
-                cv_core::Flow::Stop
-            } else {
-                cv_core::Flow::Continue
+            if in_tail {
+                if self.tail_ring.len() == TAIL_MESSAGES {
+                    self.tail_ring.pop_front();
+                }
+                self.tail_ring.push_back(m);
             }
+            cv_core::Flow::Continue
         }
     }
-    let mut sink = CommitSink {
-        resolver: cv_core::Resolver::new(Some(r.path.clone())),
-        remaining: bytes,
-        sha: None,
+
+    let mut sink = CommitWindowSink {
+        cmd_windows: cmd_indices
+            .into_iter()
+            .map(|c| (c, c.saturating_add(COMMIT_RESULT_WINDOW), Vec::new()))
+            .collect(),
+        tail_start,
+        tail_ring: std::collections::VecDeque::with_capacity(TAIL_MESSAGES),
+        seen_msgs: 0,
     };
     let _ = cv_core::stream::stream_counted(
         adapter,
@@ -1500,7 +1713,19 @@ fn last_commit_session(r: &SessionRef, bytes: u64) -> String {
         &mut sink,
         cv_core::stream::Pass::default(),
     );
-    sink.sha.map_or_else(String::new, |sha| format!(" · last commit {sha}"))
+
+    let resolver = cv_core::Resolver::new(Some(r.path.clone()));
+    // 1. Newest messages in the tail ring win first (scanning backwards from EOF so intermediate
+    //    megabytes of tool output never starve a recent commit).
+    let sha = scan_messages_rev_for_commit(sink.tail_ring.iter().rev(), &resolver, bytes).or_else(|| {
+        // 2. Fall back to narrow `[cmd_idx ..= cmd_idx + 4]` windows around indexed `git commit`
+        //    commands (newest command window first, each with its own `bytes` budget).
+        sink.cmd_windows
+            .iter()
+            .rev()
+            .find_map(|(_, _, win)| scan_messages_rev_for_commit(win.iter().rev(), &resolver, bytes))
+    });
+    sha.map_or_else(String::new, |sha| format!(" · last commit {sha}"))
 }
 
 fn ago(t: Option<chrono::DateTime<chrono::Utc>>) -> String {
@@ -1531,17 +1756,19 @@ fn owed_decisions(hook: HookName) -> Option<(String, usize)> {
 /// `SessionStart` (`startup|resume`): this directory's last sessions from the catalog as it stands
 /// (ids, ages, titles, last commit shas) and the decisions owed — capped, nothing else.
 fn hook_start(ev: &Event) -> Result<Option<Value>> {
-    let cwd = match &ev.cwd {
-        Some(c) => c.clone(),
-        None => std::env::current_dir()?,
+    let cwd = match ev.normalized_cwd() {
+        Some(c) => c,
+        None => cv_core::tools::classify::normalize_path(&std::env::current_dir()?, None),
     };
-    // One canonicalize for the hook's cwd; the catalog's cwds are compared as recorded (a
-    // per-row canonicalize is thousands of syscalls on a real store, for nothing).
-    let canon = std::fs::canonicalize(&cwd).unwrap_or_else(|_| cwd.clone());
+    let raw_cwd = ev.cwd.as_deref();
     let mut rows: Vec<SessionRef> = cv_core::cataloged_sessions()
         .into_iter()
         .filter(|r| r.id != ev.session.id && !r.id.starts_with("agent-"))
-        .filter(|r| r.cwd.as_deref().is_some_and(|c| c == cwd || c == canon))
+        .filter(|r| {
+            r.cwd.as_deref().is_some_and(|c| {
+                c == cwd || raw_cwd == Some(c) || cv_core::tools::classify::normalize_path(c, None) == cwd
+            })
+        })
         .collect();
     rows.sort_by_key(|r| std::cmp::Reverse(r.updated_at.or(r.created_at)));
     rows.truncate(START_SESSIONS);
@@ -1555,7 +1782,7 @@ fn hook_start(ev: &Event) -> Result<Option<Value>> {
     if !rows.is_empty() {
         lines.push(format!(
             "cv: {} earlier session(s) in this directory (catalog as of the last `cv ls`; newest first). \
-             `cv show <id>` reads one; `cv pack \"<task>\"` pulls the relevant parts of several into context.",
+             `cv show <id>` reads one.",
             rows.len()
         ));
         for r in &rows {
@@ -1585,8 +1812,9 @@ fn hook_start(ev: &Event) -> Result<Option<Value>> {
     Ok(Some(context("SessionStart", lines.join("\n"))))
 }
 
-/// `SubagentStart` / `SubagentStop`: one row in the lane ledger; no output, no model action.
-fn hook_lane(ev: &Event) -> Result<Option<Value>> {
+/// `SubagentStart` / `SubagentStop`: record the lane run in `state.db` (`lane_runs` +
+/// `lane_endpoints`) and append one row to the lane ledger; no output, no model action.
+fn hook_lane(ev: &Event, payload: &Value) -> Result<Option<Value>> {
     let event = match ev.event.as_deref() {
         Some("SubagentStart") => cv_core::lanes::LaneEventKind::Start,
         Some("SubagentStop") => cv_core::lanes::LaneEventKind::Stop,
@@ -1595,30 +1823,160 @@ fn hook_lane(ev: &Event) -> Result<Option<Value>> {
     let Some(agent) = ev.agent.as_ref() else {
         return Ok(None);
     };
+    let now = chrono::Utc::now();
+    let now_ms = now.timestamp_millis();
     let last_text = agent
         .last_message
         .as_deref()
         .and_then(|t| t.lines().find(|l| !l.trim().is_empty()))
         .map(|l| cv_core::ir::truncate(l.trim(), 200));
+    let norm_cwd = ev.normalized_cwd();
+
+    let resolved_cwd = norm_cwd.or_else(|| ev.cwd.clone());
     cv_core::lanes::append_lane_event(&LaneEvent {
-        ts: chrono::Utc::now(),
+        ts: now,
         event,
         session_id: ev.session.id.clone(),
         agent_id: agent.id.clone(),
         agent_type: agent.kind.clone(),
         transcript_path: ev.transcript().map(Path::to_path_buf),
         agent_transcript_path: agent.transcript.clone(),
-        cwd: ev.cwd.clone(),
-        last_text,
+        cwd: resolved_cwd.clone(),
+        last_text: last_text.clone(),
     })
     .context("appending to the lane ledger")?;
+
+    if !cv_core::env::frozen() {
+        if let Ok(store) = cv_core::state::StateStore::default_store() {
+            let bare_id = cv_core::retired::bare(&agent.id).to_string();
+            let pid = payload.get("pid").and_then(Value::as_i64).or_else(|| {
+                #[cfg(unix)]
+                {
+                    let ppid = unsafe { libc::getppid() } as i64;
+                    (ppid > 1).then_some(ppid)
+                }
+                #[cfg(not(unix))]
+                {
+                    None
+                }
+            });
+            let proc_start_time = pid.and_then(cv_core::state::tables::proc_start_time_of);
+            let derived_agent_tp = agent.transcript.clone().or_else(|| {
+                cv_core::harness::rootless(ev.harness).and_then(|a| a.agent_transcript(&ev.session, &bare_id, None))
+            });
+            let existing = store
+                .list_lane_runs_for_session(&ev.session.id)
+                .unwrap_or_default()
+                .into_iter()
+                .rev()
+                .find(|r| r.agent_id.as_deref() == Some(bare_id.as_str()));
+
+            let target_run_id = match event {
+                cv_core::lanes::LaneEventKind::Start => {
+                    let active_existing = existing.filter(|r| r.exited_at.is_none());
+                    let rid = active_existing
+                        .as_ref()
+                        .map(|r| r.run_id.clone())
+                        .unwrap_or_else(|| format!("{}:{bare_id}", ev.session.id));
+                    let _ = store.record_lane_start(&cv_core::state::LaneRun {
+                        run_id: rid.clone(),
+                        session_id: ev.session.id.clone(),
+                        agent_id: Some(bare_id),
+                        agent_type: agent.kind.clone(),
+                        harness: Some(ev.harness.as_str().to_string()),
+                        pid,
+                        proc_start_time,
+                        boot_id: active_existing.and_then(|r| r.boot_id),
+                        transcript_path: ev.transcript().map(|p| p.to_string_lossy().into_owned()),
+                        agent_transcript_path: derived_agent_tp.map(|p| p.to_string_lossy().into_owned()),
+                        cwd: resolved_cwd.as_ref().map(|p| p.to_string_lossy().into_owned()),
+                        started_at: now_ms,
+                        exited_at: None,
+                        exit_status: None,
+                        last_text: None,
+                    });
+                    rid
+                }
+                cv_core::lanes::LaneEventKind::Stop => {
+                    let rid = existing
+                        .as_ref()
+                        .map(|r| r.run_id.clone())
+                        .unwrap_or_else(|| format!("{}:{bare_id}", ev.session.id));
+                    let updated = store
+                        .record_lane_exit(&rid, now_ms, Some("hook_stop"), last_text.as_deref())
+                        .unwrap_or(false);
+                    if !updated {
+                        let _ = store.record_lane_start(&cv_core::state::LaneRun {
+                            run_id: rid.clone(),
+                            session_id: ev.session.id.clone(),
+                            agent_id: Some(bare_id),
+                            agent_type: agent.kind.clone(),
+                            harness: Some(ev.harness.as_str().to_string()),
+                            pid,
+                            proc_start_time,
+                            boot_id: None,
+                            transcript_path: ev.transcript().map(|p| p.to_string_lossy().into_owned()),
+                            agent_transcript_path: derived_agent_tp.map(|p| p.to_string_lossy().into_owned()),
+                            cwd: resolved_cwd.as_ref().map(|p| p.to_string_lossy().into_owned()),
+                            started_at: now_ms,
+                            exited_at: Some(now_ms),
+                            exit_status: Some("stop_only".into()),
+                            last_text,
+                        });
+                    }
+                    rid
+                }
+            };
+            if let Ok(ep) = cv_core::env::var("CV_ENDPOINT") {
+                let ep = ep.trim();
+                if !ep.is_empty() {
+                    let _ = store.bind_lane_endpoint(&target_run_id, ep);
+                }
+            }
+        }
+    }
     Ok(None)
 }
 
+/// Extract cross-harness target agent identifiers addressed by a tool call (via `tools::classify`),
+/// covering Claude `SendMessage` (`to`), Codex `send_input` (`id`) and Code Mode `exec`, OpenCode /
+/// Antigravity `send_message`, `Task`/`Agent` `resume`, and `write_stdin`/`wait_agent`.
+fn retired_targets_in_tool_call(harness: Harness, payload: &Value) -> Vec<String> {
+    use cv_core::tools::classify::{visit_tool_ops, BgAction, ClassifyOpts, ToolOp};
+    let Some(tool_name) = payload.get("tool_name").and_then(Value::as_str) else {
+        return Vec::new();
+    };
+    let Some(tool_input) = payload.get("tool_input") else {
+        return Vec::new();
+    };
+    let mut targets = Vec::new();
+    let _ = visit_tool_ops(
+        Some(harness),
+        tool_name,
+        cv_core::json::JsonView::from(tool_input),
+        ClassifyOpts::FULL,
+        |sem| match sem.op {
+            ToolOp::AgentMessage { recipient: Some(to) } => targets.push(to.into_owned()),
+            ToolOp::Background {
+                job_id: Some(id),
+                action: BgAction::Interact | BgAction::Poll,
+            } => targets.push(id.into_owned()),
+            ToolOp::SubagentSpawn {
+                target_hint: Some(hint),
+                ..
+            } => targets.push(hint.into_owned()),
+            _ => {}
+        },
+    );
+    if let Some(resume) = tool_input.get("resume").and_then(Value::as_str) {
+        targets.push(resume.to_string());
+    }
+    targets
+}
+
 /// `PreToolUse` (every tool, opt-in): refuse the call when the agent making it is retired, or when
-/// it is a `SendMessage` to a retired agent. Both answers name the successor. The caller is the
-/// payload's `agent_id` (Claude Code sets it on tool hooks that fire inside a sub-agent; the root
-/// has none, so only the `SendMessage` rule applies to it). Nothing printed = allow.
+/// it messages / resumes a retired agent across any harness. Both answers name the successor.
+/// Nothing printed = allow.
 fn hook_retired(ev: &Event, payload: &Value) -> Result<Option<Value>> {
     if ev.event.as_deref() != Some("PreToolUse") {
         return Ok(None);
@@ -1631,6 +1989,7 @@ fn hook_retired(ev: &Event, payload: &Value) -> Result<Option<Value>> {
         .agent
         .as_ref()
         .and_then(|a| retired.get(cv_core::retired::bare(&a.id)))
+        .or_else(|| retired.get(cv_core::retired::bare(&ev.session.id)))
     {
         let next = match &r.successor {
             Some(s) => format!("Your successor {s} continues your work; leave it to that agent."),
@@ -1642,15 +2001,10 @@ fn hook_retired(ev: &Event, payload: &Value) -> Result<Option<Value>> {
             id = r.agent_id,
             at = r.ts.format("%Y-%m-%d %H:%M UTC"),
         )
-    } else if payload.get("tool_name").and_then(Value::as_str) == Some("SendMessage") {
-        let to = payload
-            .get("tool_input")
-            .and_then(|t| t.get("to"))
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let Some(r) = retired.get(cv_core::retired::bare(to)) else {
-            return Ok(None);
-        };
+    } else if let Some((to, r)) = retired_targets_in_tool_call(ev.harness, payload)
+        .into_iter()
+        .find_map(|to| retired.get(cv_core::retired::bare(&to)).map(|r| (to, r)))
+    {
         let next = match &r.successor {
             Some(s) => format!("its successor is {s}. Send this message to {s} instead, and use that id from now on"),
             None => "it has no named successor; ask the root which agent holds its work".to_string(),
@@ -1666,85 +2020,45 @@ fn hook_retired(ev: &Event, payload: &Value) -> Result<Option<Value>> {
     }})))
 }
 
-/// Canonical JSON for digests: object keys sorted at every depth, no whitespace.
-fn canonical_json(v: &Value) -> String {
-    match v {
-        Value::Object(m) => {
-            let mut keys: Vec<&String> = m.keys().collect();
-            keys.sort();
-            let body: Vec<String> = keys
-                .into_iter()
-                .map(|k| format!("{}:{}", Value::String(k.clone()), canonical_json(&m[k])))
-                .collect();
-            format!("{{{}}}", body.join(","))
-        }
-        Value::Array(a) => format!("[{}]", a.iter().map(canonical_json).collect::<Vec<_>>().join(",")),
-        other => other.to_string(),
-    }
-}
-
 fn sha256_hex(bytes: &[u8]) -> String {
-    let mut d = cv_core::digest::Sha256::new();
-    d.update(bytes);
-    d.finish_hex()
+    cv_core::digest::sha256_hex(bytes)
 }
 
-/// The domain of a receipt line's chain hash.
-const RECEIPT_DOMAIN: &str = "cv-receipt-v1";
-
-/// One receipt line's chain hash: `sha256(domain \n prev \n canonical(line without h))`.
+/// One receipt line's chain hash (`sha256("cv-receipt-v1\n{prev}\n{canonical(body)}")`).
+#[cfg(test)]
 pub(crate) fn receipt_line_hash(prev: &str, body: &Value) -> String {
-    sha256_hex(format!("{RECEIPT_DOMAIN}\n{prev}\n{}", canonical_json(body)).as_bytes())
+    cv_core::state::tables::compute_receipt_hash(prev, body)
 }
 
-/// The `h` of the last line of a receipt log (`""` for an empty log), read from its tail.
-fn last_receipt_hash(f: &mut std::fs::File) -> Result<String> {
-    use std::io::{Seek, SeekFrom};
-    let len = f.seek(SeekFrom::End(0))?;
-    let start = len.saturating_sub(64 * 1024);
-    f.seek(SeekFrom::Start(start))?;
-    let mut tail = String::new();
-    f.read_to_string(&mut tail)?;
-    let Some(last) = tail.lines().rev().find(|l| !l.trim().is_empty()) else {
-        return Ok(String::new());
-    };
-    let v: Value = serde_json::from_str(last).context("the receipt log's last line is not JSON")?;
-    v.get("h")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .context("the receipt log's last line has no `h`")
+/// Commit a hash-chained tool receipt transactionally into `state.db` (`receipts` + `capture_inbox`).
+fn commit_receipt(ev: &Event, body: Map<String, Value>) -> Result<cv_core::state::ReceiptRecord> {
+    let store = cv_core::state::StateStore::default_store().context("locating state.db for receipt log")?;
+    let rec = store
+        .append_receipt(&ev.session.id, ev.harness.as_str(), body)
+        .context("appending receipt to state.db")?;
+    let op_id = format!("receipt:{}:{}:{}", ev.harness.as_str(), rec.session_id, rec.seq);
+    let envelope = json!({
+        "kind": "tool_receipt",
+        "session_id": rec.session_id,
+        "harness": rec.harness,
+        "seq": rec.seq,
+        "tool_use_id": rec.tool_use_id,
+        "tool_name": rec.tool_name,
+        "receipt_kind": rec.kind,
+        "digest_sha256": rec.digest_sha256,
+        "prev_hash": rec.prev_hash,
+        "receipt_hash": rec.receipt_hash,
+    });
+    store
+        .append(&op_id, &rec.receipt_hash, &envelope)
+        .context("recording receipt in state.db capture_inbox")?;
+    Ok(rec)
 }
 
-/// Append one line to `<cv home>/receipts/<session>.jsonl` under an exclusive lock, chained to
-/// the previous line, and fsync before returning.
-fn append_receipt(session: &str, mut body: Map<String, Value>) -> Result<String> {
-    use std::io::Write;
-    let dir = cv_core::env::Env::current()
-        .cv_home()
-        .context("no cv home")?
-        .join("receipts");
-    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    let path = dir.join(format!("{session}.jsonl"));
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .read(true)
-        .append(true)
-        .open(&path)
-        .with_context(|| format!("opening {}", path.display()))?;
-    f.lock().context("locking the receipt log")?;
-    let prev = last_receipt_hash(&mut f)?;
-    body.insert("prev".into(), json!(prev));
-    let h = receipt_line_hash(&prev, &Value::Object(body.clone()));
-    body.insert("h".into(), json!(h));
-    writeln!(f, "{}", Value::Object(body))?;
-    f.sync_data().context("fsync of the receipt log")?;
-    Ok(h)
-}
-
-/// `PreToolUse` / `PostToolUse` on every tool: the receipt log. `pre` lines commit the call's
-/// input digest and are durable before the harness forwards the call; `post` lines commit the
-/// result's. With `CV_RECEIPT_STRICT=1` a `pre` line that cannot be written DENIES the call (the
-/// chokepoint); without it the call proceeds and the missing line is what a verifier counts.
+/// `PreToolUse` / `PostToolUse` on every tool: the receipt log in `state.db`. `pre` rows commit
+/// the call's input digest durably before the harness forwards the call; `post` rows commit the
+/// result's. With `CV_RECEIPT_STRICT=1` a `pre` row that cannot be committed DENIES the call (the
+/// chokepoint); without it the call proceeds and the missing link is what a verifier counts.
 fn hook_receipt(ev: &Event, payload: &Value) -> Result<Option<Value>> {
     let kind = match ev.event.as_deref() {
         Some("PreToolUse") => "pre",
@@ -1763,15 +2077,19 @@ fn hook_receipt(ev: &Event, payload: &Value) -> Result<Option<Value>> {
     if kind == "pre" {
         body.insert(
             "input_sha256".into(),
-            json!(sha256_hex(canonical_json(&field("tool_input")).as_bytes())),
+            json!(sha256_hex(
+                cv_core::state::tables::canonical_json(&field("tool_input")).as_bytes()
+            )),
         );
     } else {
         body.insert(
             "response_sha256".into(),
-            json!(sha256_hex(canonical_json(&field("tool_response")).as_bytes())),
+            json!(sha256_hex(
+                cv_core::state::tables::canonical_json(&field("tool_response")).as_bytes()
+            )),
         );
     }
-    match append_receipt(&ev.session.id, body) {
+    match commit_receipt(ev, body) {
         Ok(_) => Ok(None),
         Err(e) if kind == "pre" && cv_core::env::var("CV_RECEIPT_STRICT").as_deref() == Ok("1") => {
             Ok(Some(json!({"hookSpecificOutput": {
@@ -1801,28 +2119,20 @@ fn minutes_since_modified(path: &Path) -> Option<i64> {
 }
 
 /// `PreToolUse` (`Edit|Write`, Codex `apply_patch`): the harness's guard decision when another
-/// live writer edited this path. The edit index (`cv touched`) names the sessions, the catalog
-/// names their transcripts, one `stat` each says which are live, and [`cv_core::hooks::Guard`]'s
-/// lineage rule says which are this writer's own. Nothing printed = allow.
+/// live writer edited this path. Both `events::sessions_editing` and `ev.normalized_edits()` share
+/// [`cv_core::tools::classify::normalize_path`], so symlinked ancestors (`/var` ↔ `/private/var`)
+/// resolve identically even when the target file does not exist yet. Nothing printed = allow.
 fn hook_edit(ev: &Event) -> Result<Option<Value>> {
     let Some(guard) = cv_core::hooks::Guard::of(ev) else {
         return Ok(None);
     };
     let mut conflicts = Vec::new();
-    for file in &ev.edits {
-        let abs = if Path::new(file).is_absolute() {
-            PathBuf::from(file)
-        } else {
-            ev.cwd
-                .clone()
-                .or_else(|| std::env::current_dir().ok())
-                .unwrap_or_default()
-                .join(file.trim_start_matches("./"))
-        };
+    for abs_str in ev.normalized_edits() {
+        let abs = PathBuf::from(&abs_str);
         let mut live: Vec<(String, i64)> = Vec::new();
         // The guard answers in milliseconds and never blocks an edit on its own failure: an event
         // catalog that cannot answer degrades once, as an accelerator does.
-        let editing = cv_core::events::sessions_editing(&abs.to_string_lossy()).unwrap_or_else(|e| {
+        let editing = cv_core::events::sessions_editing(&abs_str).unwrap_or_else(|e| {
             cv_core::env::warn_once("the event catalog", format_args!("{e:#}"));
             Vec::new()
         });
@@ -2195,8 +2505,8 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        // Raw `tail_text` / `last_commit` refuses binary SQLite files (even with tiny byte cap).
-        assert!(tail_text(&db_path, 64).is_none());
+        // Raw `tail_bytes` / `last_commit` refuses binary SQLite files (even with tiny byte cap).
+        assert!(tail_bytes(&db_path, 64).is_none());
         assert_eq!(last_commit(&db_path, 64), "");
 
         // Session-aware lookup extracts ONLY that session's commit via the adapter, never leaking
@@ -2210,18 +2520,18 @@ mod tests {
         assert_eq!(last_commit_session(&quiet_ref, 64), "");
 
         // 2. Compressed `.zst` store (zstd magic bytes + fake `[leak deadbeef] ` suffix):
-        // raw `tail_text` / `last_commit` never reads raw bytes from `.zst` or zstd-magic files.
+        // raw `tail_bytes` / `last_commit` never reads raw bytes from `.zst` or zstd-magic files.
         let zst_path = dir.join("rollout.jsonl.zst");
         let mut fake_zst = vec![0x28, 0xB5, 0x2F, 0xFD];
         fake_zst.extend_from_slice(&vec![b'x'; 256]);
         fake_zst.extend_from_slice(b"[leak deadbeef] raw tail must never match\n");
         std::fs::write(&zst_path, &fake_zst).unwrap();
-        assert!(tail_text(&zst_path, HOOK_READ_BYTES).is_none());
+        assert!(tail_bytes(&zst_path, HOOK_READ_BYTES).is_none());
         assert_eq!(last_commit(&zst_path, 64), "");
 
         let magic_only = dir.join("extensionless-compressed");
         std::fs::write(&magic_only, &fake_zst).unwrap();
-        assert!(tail_text(&magic_only, HOOK_READ_BYTES).is_none());
+        assert!(tail_bytes(&magic_only, HOOK_READ_BYTES).is_none());
         assert_eq!(last_commit(&magic_only, 64), "");
 
         std::fs::remove_dir_all(&dir).ok();
@@ -2269,6 +2579,142 @@ mod tests {
                 .unwrap()
                 .contains("CV_RECEIPT_STRICT=1"));
         }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn last_commit_session_finds_indexed_early_commit_over_300_msgs_and_giant_tool_results() {
+        let _world = crate::test_world("hooks-sqlite-indexed-commit-window");
+        let dir = std::env::temp_dir().join(format!("cv-hooks-idx-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("state.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, model TEXT, started_at REAL, ended_at REAL, message_count INTEGER, title TEXT);
+             CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, role TEXT, content TEXT, tool_call_id TEXT, tool_calls TEXT, tool_name TEXT, timestamp REAL);
+             INSERT INTO sessions VALUES ('early-commit-sess', 'm', 100.0, 500.0, 323, 'early');
+             INSERT INTO sessions VALUES ('tail-wins-sess', 'm', 100.0, 500.0, 325, 'tail');",
+        )
+        .unwrap();
+
+        let big_output = "x".repeat(64 * 1024); // 64 KiB * 6 = 384 KiB > HOOK_READ_BYTES (256 KiB)
+        let early_call = r#"[{"id":"tc_early","type":"function","function":{"name":"terminal","arguments":"{\"command\":\"cd /repo && git commit -m 'early fix'\"}"}}]"#;
+        let late_call = r#"[{"id":"tc_late","type":"function","function":{"name":"terminal","arguments":"{\"command\":\"git commit -m 'late fix'\"}"}}]"#;
+
+        // Populate `early-commit-sess`: commit at msg 1..2 (>315 msgs before EOF!), followed by
+        // 384 KiB of non-commit tool results and >300 conversational messages.
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, timestamp) VALUES ('early-commit-sess', 'user', 'start', 100.0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, tool_calls, timestamp) VALUES ('early-commit-sess', 'assistant', '', ?1, 101.0)",
+            [early_call],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, tool_call_id, tool_name, timestamp) VALUES ('early-commit-sess', 'tool', '[main 778899aa] early fix\n 1 file changed', 'tc_early', 'terminal', 102.0)",
+            [],
+        )
+        .unwrap();
+        for i in 0..6 {
+            let tcid = format!("tc_big_{i}");
+            let tc_json = format!(
+                r#"[{{"id":"{tcid}","type":"function","function":{{"name":"terminal","arguments":"{{\"command\":\"cargo test\"}}"}}}}]"#
+            );
+            conn.execute(
+                "INSERT INTO messages (session_id, role, content, tool_calls, timestamp) VALUES ('early-commit-sess', 'assistant', '', ?1, ?2)",
+                rusqlite::params![tc_json, 110.0 + i as f64],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO messages (session_id, role, content, tool_call_id, tool_name, timestamp) VALUES ('early-commit-sess', 'tool', ?1, ?2, 'terminal', ?3)",
+                rusqlite::params![&big_output, tcid, 110.5 + i as f64],
+            )
+            .unwrap();
+        }
+        for i in 0..308 {
+            let role = if i % 2 == 0 { "user" } else { "assistant" };
+            conn.execute(
+                "INSERT INTO messages (session_id, role, content, timestamp) VALUES ('early-commit-sess', ?1, ?2, ?3)",
+                rusqlite::params![role, format!("turn {i}"), 130.0 + i as f64],
+            )
+            .unwrap();
+        }
+
+        // Populate `tail-wins-sess`: early commit (11223344) + 384 KiB of tool results + >300 turns +
+        // unindexed late commit (deadbeef) near EOF!
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, timestamp) VALUES ('tail-wins-sess', 'user', 'start', 100.0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, tool_calls, timestamp) VALUES ('tail-wins-sess', 'assistant', '', ?1, 101.0)",
+            [early_call],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, tool_call_id, tool_name, timestamp) VALUES ('tail-wins-sess', 'tool', '[main 11223344] early commit\n', 'tc_early', 'terminal', 102.0)",
+            [],
+        )
+        .unwrap();
+        for i in 0..308 {
+            let role = if i % 2 == 0 { "user" } else { "assistant" };
+            conn.execute(
+                "INSERT INTO messages (session_id, role, content, timestamp) VALUES ('tail-wins-sess', ?1, ?2, ?3)",
+                rusqlite::params![role, format!("turn {i}"), 130.0 + i as f64],
+            )
+            .unwrap();
+        }
+        for i in 0..6 {
+            let tcid = format!("tc_tail_big_{i}");
+            let tc_json = format!(
+                r#"[{{"id":"{tcid}","type":"function","function":{{"name":"terminal","arguments":"{{\"command\":\"cargo test\"}}"}}}}]"#
+            );
+            conn.execute(
+                "INSERT INTO messages (session_id, role, content, tool_calls, timestamp) VALUES ('tail-wins-sess', 'assistant', '', ?1, ?2)",
+                rusqlite::params![tc_json, 450.0 + i as f64],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO messages (session_id, role, content, tool_call_id, tool_name, timestamp) VALUES ('tail-wins-sess', 'tool', ?1, ?2, 'terminal', ?3)",
+                rusqlite::params![&big_output, tcid, 450.5 + i as f64],
+            )
+            .unwrap();
+        }
+        // Index `tail-wins-sess` BEFORE the final commit is appended so `deadbeef` is unindexed!
+        let mut tail_ref = SessionRef::new("tail-wins-sess", Harness::Hermes, &db_path);
+        tail_ref.message_count = Some(323);
+        cv_core::events::ingest_ref(&tail_ref).unwrap();
+
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, tool_calls, timestamp) VALUES ('tail-wins-sess', 'assistant', '', ?1, 490.0)",
+            [late_call],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, tool_call_id, tool_name, timestamp) VALUES ('tail-wins-sess', 'tool', '[main deadbeef] late fix\n 2 files changed', 'tc_late', 'terminal', 491.0)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut early_ref = SessionRef::new("early-commit-sess", Harness::Hermes, &db_path);
+        early_ref.message_count = Some(323);
+        cv_core::events::ingest_ref(&early_ref).unwrap();
+        assert_eq!(
+            last_commit_session(&early_ref, HOOK_READ_BYTES),
+            " · last commit 778899a"
+        );
+
+        tail_ref.message_count = Some(325);
+        assert_eq!(
+            last_commit_session(&tail_ref, HOOK_READ_BYTES),
+            " · last commit deadbee"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
