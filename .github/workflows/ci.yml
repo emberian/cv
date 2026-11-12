@@ -66,8 +66,8 @@ jobs:
 
       # The released binary, not a rebuild of its tag: the comparator reads both binaries' own
       # contracts (`schema --json` lists the HTTP routes from the routers' tables). Each `--accept`
-      # is one reviewed 0.18 change (manual/src/compatibility.md lists them); they leave with this
-      # baseline.
+      # is one reviewed 0.18/0.19 change (manual/src/compatibility.md lists them); they leave with
+      # this baseline.
       - name: Compatibility against the released 0.17.0 binary
         shell: bash
         run: |
@@ -81,11 +81,15 @@ jobs:
             --accept commands.scry \
             --accept commands.deferrals \
             --accept commands.adopt.args.agents.required \
+            --accept commands.search.args.semantic \
+            --accept commands.index.args.semantic \
             --accept commands.pack.args.context_bytes \
             --accept commands.splice.args.generate \
             --accept commands.splice.args.gen_model \
             --accept commands.rewind.args.from_compaction \
             --accept commands.dataset.args.out \
+            --accept commands.show.args.around.value_type \
+            --accept commands.export.args.around.value_type \
             --accept commands.watch.args.interval.value_type \
             --accept rows.codex.message_count \
             --accept 'routes.GET /api/backlog' \
@@ -177,9 +181,6 @@ jobs:
           CV_SWEEP_INPUT_PROBE="$probe_root/input/sweep.jsonl" CV_SWEEP_INPUT_BYTES=100000000 CV_SWEEP_HASH_BODY=1 CLUSTERVISION_HOME="$probe_root/catalog" cargo test -p cv-search --no-default-features --features probe-heap fts::tests::production_sweep_heap_probe -- --ignored --exact --nocapture
           # The live suffix a search reads beside the index: all four giant sessions, read by default.
           CV_SWEEP_INPUT_PROBE="$probe_root/input/sweep.jsonl" CV_SWEEP_INPUT_BYTES=100000000 CLUSTERVISION_HOME="$probe_root/catalog" cargo test -p cv-search --no-default-features --features probe-heap fts::tests::production_live_suffix_heap_probe -- --ignored --exact --nocapture
-          # Fake vectors isolate actual parsing/projection/save retention without a model download.
-          CV_SWEEP_INPUT_PROBE="$probe_root/input/sweep.jsonl" CV_SWEEP_INPUT_BYTES=100000000 CLUSTERVISION_HOME="$probe_root/catalog" cargo test -p cv-search --features probe-heap semantic::tests::production_semantic_heap_probe -- --ignored --exact --nocapture
-          CLUSTERVISION_HOME="$probe_root/catalog" cargo test -p cv-search --features probe-heap semantic::tests::semantic_store_decode_heap_probe -- --ignored --exact --test-threads=1 --nocapture
 
       - name: Bounded CLI JSON output
         run: cargo test -p clustervision --bin cv --features probe-heap cmd::view::tests::staged_json_selected_payload_heap -- --ignored --exact --test-threads=1 --nocapture
@@ -222,10 +223,9 @@ jobs:
           cargo nextest run --profile ci -p clustervision-core --lib --no-default-features --features sqlite -E 'test(/^(lazy|source|json|watch|stream|harness)::/)'
           cargo nextest run --profile ci -p clustervision-core --test corpus --no-default-features --features sqlite
 
-      # cv-search's `semantic` feature (the embedding stack) is default-on, so the keyword-only
-      # build is one nothing else compiles.
-      - name: Lint cv-search without the semantic feature
-        run: cargo clippy -p cv-search --no-default-features -- -D warnings
+      # Lint cv-search with default features disabled (`probe-heap` off, all targets).
+      - name: Lint cv-search (no default features)
+        run: cargo clippy -p cv-search --no-default-features --all-targets -- -D warnings
 
       # `dist plan` parses dist-workspace.toml and the release matrix without building anything.
       # A bad `publish-jobs` value sat in that file from v0.9.22 until 0.11.0 and every tag in

@@ -16,23 +16,21 @@ The **archive home** is `--home <DIR>` (on `cv archive …` and `cv watch`), els
 
 ```
 ~/.clustervision/
-├── catalog.jsonl                 # cheap metadata, one row per (harness, id)
-└── archive/
-    └── <harness>/<id>.json       # the full parsed session, harness-agnostic IR
+└── packs/
+    ├── <pack-hash>.pack.zst       # content-addressed Zstd-Seekable multi-record pack
+    └── <pack-hash>.pack.idx.json  # verified BLAKE3 record manifest and session metadata
 ```
 
-`catalog.jsonl` is append-only, deduped by `(harness, id)` (newest `archived_at` wins) and
-self-compacting; unchanged bytes are never rewritten. Several machines can share one archive home
-(a synced folder or network share).
+Archive sessions are sealed into content-addressed Zstd-Seekable packs under `packs/`, deduped by
+`(harness, id)` (newest `archived_at` wins); unchanged sessions are never rewritten.
 
 ```sh
 cv archive path   # print the archive location
 cv archive ls     # list archived sessions, newest activity first
 ```
 
-`cv archive ls` counts turns like `cv ls` (`catalog.jsonl` keeps the raw count as
-`messages_written`; 0.17 rows show a dash until resynced). Unreadable resume state is said once on
-stderr and the session reread.
+`cv archive ls` counts turns like `cv ls` and reports unreadable pack manifests on stderr without
+aborting. Unreadable resume state is said once on stderr and the session reread.
 
 ## `cv archive sync` — snapshot everything once
 
@@ -84,6 +82,7 @@ cv serve --who ember --open    # whose inbox the page opens on; open it in a bro
 cv serve --port 8080           # pick a port
 cv serve --token s3cret        # require `Authorization: Bearer s3cret` on /api/* ($CV_SERVE_TOKEN works too)
 cv serve --host 0.0.0.0 --token s3cret   # expose beyond loopback (demands a token or --insecure-expose)
+cv serve --hub --host 0.0.0.0 --token s3cret   # also enable fleet replication hub (/api/hub/*)
 ```
 
 Binds `127.0.0.1:7777` and runs until killed; the desktop app calls the same API in-process.

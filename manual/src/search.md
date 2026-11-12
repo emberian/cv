@@ -1,12 +1,12 @@
-# Search (full-text & semantic)
+# Search (full-text & exact)
 
-Two ways to find a session from any harness: **full-text** (you remember a word) and
-**semantic** (you remember what it was about). 🔮
+Two ways to find a session from any harness: **full-text** (BM25 over terms, phrases and booleans)
+and **exact** (trigram-accelerated literal code substrings).
 
 - **Full-text** is a [tantivy] inverted index: BM25 ranking, fielded filters, phrases, booleans,
   highlighted snippets.
-- **Semantic** embeds every session and your query, and ranks by cosine similarity: it finds a
-  session that shares no words with the query.
+- **Exact** (`--exact`) narrows candidates with a positional 3-gram index (`cv index --exact`) and
+  verifies every literal substring match against revision-checked source text.
 
 Both run through `cv index` and `cv search` ([the CLI](cli.md)); the `cv-search` crate is the
 library behind them.
@@ -19,18 +19,17 @@ pre-pays that read.
 
 ```sh
 cv index              # build/refresh the full-text index
-cv index --semantic   # also build semantic embeddings
+cv index --exact      # also build the trigram accelerator for `cv search --exact`
 ```
 
 ```text
 ✦ building full-text index…
 indexed 412 session(s) → /Users/you/.clustervision/tantivy
-✦ embedding sessions (downloads a small model on first use)…
-embedded 412 session(s) → /Users/you/.clustervision/embeddings.bin
 ```
 
 `cv index` is incremental: it reads only new or changed sessions and reaps vanished ones.
-`--rebuild` starts from scratch. `--semantic` downloads a ~30 MB model on first use.
+`--rebuild` starts from scratch. `--if-changed` skips the pass when a stat-only probe shows no
+session drift.
 `--subagents` also indexes the sub-agent and workflow forest (off by default; it can add
 hundreds of MB).
 
@@ -59,7 +58,7 @@ Under `$CLUSTERVISION_HOME` (default `~/.clustervision`):
 | Index            | Path                                  |
 | ---------------- | ------------------------------------- |
 | Full-text        | `~/.clustervision/tantivy/`            |
-| Semantic vectors | `~/.clustervision/embeddings.bin`      |
+| Trigram exact    | `~/.clustervision/trigram/`            |
 
 ## Full-text search
 
@@ -114,56 +113,40 @@ could not be read.
 in discovery order, without operators or ranking, and says so on stderr. Invalid query syntax is
 an error, never a fallback to scanning. `--kind` cannot be combined with `--scan`.
 
-## Semantic / meaning search
+## Exact substring search (`--exact`)
 
 ```sh
-cv search "formalizing proofs" --semantic
+cv index --exact
+cv search "leep 4" --exact
 ```
 
-A Lean session that never says "formalizing" still ranks first: the query and "proving theorems
-in Lean" are close in meaning. `--semantic` prints the same rows as full-text and needs
-`cv index --semantic` first; without embeddings it errors instead of falling back to keywords.
+`--exact` intersects positional 3-gram postings (`cv index --exact`) and verifies every candidate
+against revision-checked source text, so literal substrings inside identifiers, flags, hashes and
+code lines (`sleep 40`, `getattrlistbulk`, `state.db-wal`) match without tokenizer boundaries.
+Sessions changed since `cv index --exact` are verified live under the same `--live-bytes` budget
+(none under `--frozen`).
 
 ### From a session row to the material you wanted
 
-[`cv pack`](pack.md) (formerly `cv recall`) runs the same fused full-text and semantic ranking and
-excerpts each hit into a bundle for a fresh agent:
+[`cv pack`](pack.md) (formerly `cv recall`) runs BM25 full-text ranking over the index plus the
+unindexed live suffix and excerpts each hit into a bundle for a fresh agent:
 
 ```sh
 cv pack "how did we handle retry backoff"        # a CLAUDE.md-style context bundle
 cv pack "auth token refresh" --limit 3
 ```
 
-Without an index it scans live (noted on stderr); without embeddings it ranks full-text only.
-
-## How semantic embeddings work
-
-[model2vec] static embeddings (`minishlab/potion-base-8M`, ~30 MB, 256 dimensions): token vectors
-are looked up and mean-pooled, with no transformer pass or ONNX runtime. Every session is
-embedded up front; queries do a brute-force in-memory cosine scan.
-
-A session's vector embeds the head of its exchange: never the context, never turns a fork copied.
-The head is what the model reads, 512 tokens cut first to 512 × the vocabulary's median token
-length in characters (3,072 for potion-base-8M); `cv index --semantic` prints it.
-`--kind` is full-text only.
-
-The model downloads from the HuggingFace Hub on first use into `~/.cache/huggingface`. For
-offline use, point `CV_SEARCH_MODEL` at a local copy:
-
-```sh
-export CV_SEARCH_MODEL=/path/to/potion-base-8M
-cv index --semantic
-```
+Without an index it reads the live suffix (noted on stderr).
 
 ## Quick reference
 
 | Command                          | What it does                                        | Limit flag (default) |
 | -------------------------------- | --------------------------------------------------- | -------------------- |
 | `cv index`                       | Build/refresh the full-text index                   | —                    |
-| `cv index --semantic`            | Also build semantic embeddings                      | —                    |
+| `cv index --exact`               | Also build the trigram exact-substring accelerator  | —                    |
+| `cv index --if-changed`          | Skip the pass when a stat probe shows no drift      | —                    |
 | `cv search <query>`              | Full-text search (BM25), index plus unindexed suffix | `--limit` (20), `--live-bytes` (all) |
-| `cv search <query> --semantic`   | Semantic search (no keyword fallback)               | `--limit` (20)       |
-| `cv pack <task>`                 | Fused ranking → relevant spans, as a context bundle | `--limit` (8)        |
+| `cv search <query> --exact`      | Exact literal substring search (trigram + source verify) | `--limit` (20), `--live-bytes` (all) |
+| `cv pack <task>`                 | BM25 recall → relevant spans, as a context bundle   | `--limit` (8)        |
 
 [tantivy]: https://github.com/quickwit-oss/tantivy
-[model2vec]: https://github.com/MinishLab/model2vec

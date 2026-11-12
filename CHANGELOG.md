@@ -1,59 +1,47 @@
 # Changelog
 
 ## Unreleased
-- `cv archive sync --to` and `cv watch --to` replicate scrubbed session packs and events to a `cv serve --hub` receiver.
-- `GET /api/search?exact=1` exposes trigram literal-substring search across `cv serve` and the desktop app; `--frozen` refuses cold `search --exact` directory creation.
-- `cv serve` adds per-response `script-src` CSP nonces on `/inbox`, `script-src 'self'` CSP on dashboard pages, and LAN `Host` rebinding protection.
+
+## 0.19.0 — 2026-11-12 — sealed custody, exact search, and the SQLite state spine
+ClusterVision 0.19.0 unifies mutable coordination state in `state.db` (SQLite WAL), replaces loose
+archive files with content-addressed Zstd-Seekable `packs/`, and adds fleet hub replication
+(`cv archive sync --to`, `cv watch --to`, `cv serve --hub`) backed by `[privacy]` and
+`[replication]` scrub profiles. Search drops the external embedding stack in favor of pure-Rust
+trigram exact-substring search (`--exact`) and derived columnar event segments; Antigravity becomes
+the 22nd supported harness; and `blame`, `doctor`, `lanes`, and `dataset` gain structural
+provenance, store diagnostics, obligation/PID liveness, and OpenAI tool-call trajectory export.
+
+- Breaking: removed `cv mcp`, `scry`, `deferrals`, `--semantic`, `splice --generate`, `CV_PACK_LLM`, and pre-0.18 CLI/HTTP tombstones; `cv pack` uses extractive BM25 recall.
+- Unified `state.db` SQLite WAL spine replaces `tasks/events.jsonl`, `lanes.jsonl`, and `retired.jsonl`, served by an auto-started local batching recorder with serverless fallback.
+- `cv archive` replaces `catalog.jsonl` and loose JSON files with content-addressed Zstd-Seekable `packs/` manifests; sealed task inbox envelopes also live in packs.
+- `cv archive sync --to` and `cv watch --to` replicate scrubbed packs and events to `cv serve --hub` with incremental `O(delta)` frontiers and pinned snapshots.
+- `[privacy]` and `[replication.<target>]` in `config.toml` configure redaction classes, boundary-aware path/key rewrites, principal policies, and session filters across exports, shares, and replication.
+- `cv index --exact` builds a positional trigram accelerator; `cv search --exact` and `GET /api/search?exact=1` verify literal code substrings against source revisions.
+- Derived columnar event segments accelerate fleet `events`, `touched`, and `stats` queries alongside `catalog.db`, failing explicitly on oversized target dictionaries or failed compactions.
+- First-class `antigravity` harness (`agy`, `antigravity-cli`, `antigravity-ide`) reads Cortex JSONL step logs, sub-agent trees, and read-only SQLite sidecars under `~/.gemini/antigravity*`.
 - Claude, Codex, Gemini, and Antigravity discovery use macOS `getattrlistbulk` directory walks; browser zip upload decodes `.zst` transcripts and multi-file harnesses.
-- Fleet hub ingest folds frontiers incrementally in `O(delta)` with full rebuild parity, caps unpinned snapshots at 256, and sweeps orphan pack tempfiles.
-- Search snippets exclude every term in negated groups from browser highlighting.
-- Oversized columnar target dictionaries fail explicitly instead of wrapping stored byte offsets.
-- JSONL visitors release device admission before callbacks, avoiding cross-device payload-read deadlocks and serialization of consumer work.
-- `cv index --exact` builds the trigram accelerator; `cv search --exact` finds literal code substrings with source revision verification.
-- `cv serve` and `cv watch` start the local batching recorder when no other process owns it.
-- Hub rebuild preserves published snapshot pins and generations; hydration decodes only selected payload frames.
-- Sealed inbox envelopes move into packs, leaving small verified locators in SQLite.
-- Pack manifests reject overlapping records; hub verification decodes each frame once and rejects changed indexes on replay.
-- Privacy scrubbing covers JSON object keys without dropping colliding values, and path rewrites respect segment boundaries.
-- Archive import stages private files in owner-only temporary directories.
-- SSE data safely handles lone carriage returns; lane liveness rejects boot mismatches through either public entry point.
-- Failed columnar event compaction preserves its in-memory manifest instead of publishing an emptied segment list.
-- Serverless recorder writes reuse a producer epoch, keeping replication frontiers proportional to producers rather than hook calls.
-- `--frozen` reads of `state.db` no longer create `state.db-wal`/`-shm`; a retained WAL without `-shm` is read from a private folded copy.
-- `[privacy]`/`[replication]` scrubbing and `--redact` now cover file and image block references; `$HOME` rewriting catches homes after any delimiter (backticks, `<`, `file://`).
-- `/api/stream` cursors are `<gen>:<offset>`: a cursor from another server run gets an immediate `reset`, and a follower learns every kind it missed.
-- `cv serve` pages send `X-Frame-Options: DENY`, `frame-ancestors 'none'` and `nosniff`, so the inbox's decision buttons cannot be clickjacked.
-- Fleet hub ingest refuses an event whose declared digest does not match its content (400); a frozen hub refuses pack uploads before staging.
-- Dashboard: removed the leftover "search by meaning" toggle (semantic search left in 0.19); message counts from fleet peers are coerced to numbers.
-- The `state.db` recorder's socket owner reads large and slow request frames on macOS instead of dropping them.
-- `cv index --if-changed` (`fts::pass_needed`) skips the index sweep when a stat-only probe shows no session or sub-agent drift.
-- Search's live-read budget defaults from `$CV_LIVE_BYTES` (`<bytes>` or `all`), then config `[search] live_bytes`; `--live-bytes` overrides, and the footer names the source.
-- `cv show`, `cv export`, and `/api/session/{h}/{id}/messages` accept `--around ID` (`id:<raw>` for numeric IDs) as well as message indices, composing with `--kind`.
-- `cv index` and `cv search` load resume mark heads on demand per selected stale session instead of scanning all `resume_marks` rows upfront.
-- `cv search` recognizes symlinked and hard-linked paths to already-indexed transcripts by `(dev, ino)` instead of rereading them whole.
-- `cv watch` wakes immediately on directory changes via `watch::wake` (`inotify` + `eventfd` on Linux, `Condvar` fallback elsewhere).
-- `cv watch` admits live append-only transcript growth and write-once `tool-results/` spills mid-pass instead of restarting from byte 0.
-- `cv rewind` ignores `api-request-blob` and other non-turn records when tracking open tool calls.
-- Breaking: removed `cv mcp`, `scry`, `deferrals`, `splice --generate`, `CV_PACK_LLM`, and retired CLI/HTTP tombstones; `cv pack` uses zero-LLM live-suffix recall.
-- First-class `antigravity` harness (`agy`, `antigravity-cli`, `antigravity-ide`): reads Cortex JSONL step logs, sub-agent trees, and read-only SQLite sidecars under `~/.gemini/antigravity*`.
-- Codex Code Mode `exec` JS calls now classify into `command`, `file_edit`, spawn, and background events across `events`, `touched`, `lanes`, hooks, and `distill`.
-- `cv distill` tracks tools, commits, state files, and sub-agents across all harnesses in one lazy pass without decoding unread thinking blocks.
-- `cv show --kind` applies `--first`, `--last`, `--range`, and `--max-bytes` after projection, resolves sub-agents, and pairs question tools by `tool_use_id`.
+- `cv blame [--lines A..B] [--json]` attributes code to sessions across rebases, squashes, and edits via hunk fingerprints, commit matches, and git history.
+- `cv doctor` splits active post-compaction context from compacted history and calibrates token scales per model; `cv doctor --store` diagnoses local stores and disk health.
+- `cv lanes` computes `stranded` structurally from `open_obligations`, tracks OS PID/boot liveness via `cv hook lane`, and exposes cross-session `lineage` graphs.
+- `cv dataset` adds `--format openai-tools`, `--active-branch` (omitting rewound turns and sidechains), and `--clean-outcome` trajectory filtering.
+- `cv distill --agent-of` retires sub-agent sources in `state.db` (`--keep-source` opts out); `cv retire` lists, updates, or undoes retirements, enforced by `cv hooks install --retired`.
+- `cv hook receipt` (`cv hooks install --receipts`) appends BLAKE3 hash-chained pre/post tool-call receipts to `state.db`; `CV_RECEIPT_STRICT=1` refuses unlogged calls.
+- `cv prune --plan <plan.json>` replaces size/age snipping with per-result `keep`, `precis`, or `excerpt` plans and drops attachment kinds; `cv cat` retrieves originals.
+- `cv distill` adds `## 0. Hand-off` and `## 1. Grounding`, preserves multi-generation briefs without nested packs, cites elided output sizes, and preserves lineage/titles.
+- `cv distill` lazily classifies tools, commits (including quiet `git commit -q` + `git log`), state files, and sub-agents without decoding unread thinking blocks.
+- Codex Code Mode `exec` JS calls classify into `command`, `file_edit`, spawn, and background events across `events`, `touched`, `lanes`, hooks, and `distill`.
+- `cv show`, `cv export`, and `/api/session/{h}/{id}/messages` accept `--around ID` (`id:<raw>` for numeric IDs), composing post-projection with `--kind`, windows, and `--max-bytes`.
 - Bare sub-agent IDs resolve across `show`, `distill`, `splice`, and `rewind`; `ls` disambiguates UUIDv7 prefixes; `distill`/`splice` alias `--into`; `port` adds `--json`.
-- `cv search` adds `--cwd` and `-q`/`--query` session filters, and quotes bare colons instead of failing Tantivy query parsing.
+- Reshaping a live, growing transcript publishes the prefix read with an `as of message N / byte offset O` note; rewritten prefixes still fail.
+- `cv search` adds `--cwd` and `-q`/`--query` session filters, quotes bare colons, deduplicates hard/symlinked transcripts by `(dev, ino)`, and excludes negated snippet terms.
+- `cv index --if-changed` skips sweeps when a stat-only probe finds no drift; resume marks load on demand per stale session.
+- Search live-read budgets default from `$CV_LIVE_BYTES` (`<bytes>` or `all`), then `[search] live_bytes`; `--live-bytes` overrides, and the footer names the source.
+- `cv watch` wakes immediately via `watch::wake` (`inotify` + `eventfd` on Linux, `Condvar` elsewhere) and admits append-only growth and `tool-results/` spills mid-pass.
 - `cv task list --json` emits compact `TaskRow` summaries (`--detail` for full bodies and notes), with `ls` and `close` subcommand aliases.
-- `cv retire --list` prints retired lanes; `current()` chases transitive successor chains and `retire` updates `PENDING` successors in place.
-- Live WAL SQLite reads use MVCC transactions and per-session revisions; `CLUSTERVISION_CACHE` separates caches; `--frozen` permits `--dry-run` and stdout exports.
-- `cv hook receipt` (opt-in, `cv hooks install --receipts`): every Claude Code tool call is appended, hash-chained and fsynced, before it runs; `CV_RECEIPT_STRICT=1` refuses unlogged calls.
-- `cv distill --agent-of` retires a sub-agent source: `$CLUSTERVISION_HOME/retired.jsonl` records it with its successor (`--keep-source` opts out; a `--upto` fork never retires). `cv retire` lists, adds and `--undo`es rows. The opt-in guard `cv hooks install --retired` (PreToolUse on every tool, Claude Code) denies each tool call a retired agent makes and each `SendMessage` to one, naming the successor, so a lane still holding the old id cannot wake a second copy.
-- `cv lanes` and `cv show --agent` skip the `agent-<id>.flat.jsonl` payload sidecar beside a distilled agent.
-- `cv prune --plan <plan.json>` replaces size/age snipping with a per-result plan (keep, précis, excerpt) and drops attachment kinds; originals stay retrievable with `cv cat`.
-- Reshaping a live, growing transcript publishes the prefix read, noting "as of message N / byte offset O"; a rewritten prefix still refuses.
-- `cv distill` of a distilled lane keeps the original brief; each earlier generation carries its brief's first paragraph, commits and state, not a nested pack.
-- `cv distill` packs add `## 0. Hand-off` (last message, newest heads/tips, PID files, directories) and `## 1. Grounding` (state file whole, open items, decisions).
-- `cv distill` ledger rows name each elided output's `tool_use` id and size; `cv cat <ref> <id>` fetches it.
-- `cv distill` counts quiet `git commit -q` commits paired with `git log --oneline` and caps commit-message notes at 700 bytes.
-- `cv distill` no longer warns `lossy: lineage` or, for `--agent-of`, `lossy: session title`; the pack and agent meta carry both.
+- Live WAL SQLite reads use MVCC transactions and per-session revisions; `CLUSTERVISION_CACHE` separates caches; `--frozen` permits read-only `state.db` folds, `--dry-run`, and stdout exports.
+- `cv serve` hardens pages with per-response CSP nonces, `X-Frame-Options: DENY`, `nosniff`, LAN `Host` rebinding checks, `<gen>:<offset>` SSE cursors, and CR-safe SSE framing.
+- Hub ingest verifies BLAKE3 event and frame digests once, rejects overlapping or mutated pack manifests, caps unpinned snapshots, and refuses frozen staging.
+- JSONL visitors release device admission before callbacks; `cv rewind` ignores `api-request-blob` records; dashboard drops the semantic toggle and coerces peer message counts.
 
 ## 0.18.0 — 2026-10-23 — the release an agent can trust
 ClusterVision 0.18.0 is the release an agent can trust. Every listing, count and search answer

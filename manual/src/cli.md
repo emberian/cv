@@ -288,13 +288,13 @@ no tool result "toolu_nope" in 406247d8 — `cv tools 406247d8 --timeline` lists
 
 ### `cv search`
 
-Full-text search over session content. Indexing, BM25 and embeddings: [Search](search.md).
+Full-text and exact substring search over session content. Indexing, BM25 and trigrams: [Search](search.md).
 
 ```sh
 cv search "flux inference refactor"
 cv search "nom parser" --harness codex --limit 10
-cv search "formalizing proofs" --semantic
-cv search "flux inference" --json
+cv search "leep 4" --exact
+cv search "flux inference" --cwd cv -q "msgs>=20" --json
 ```
 
 ```text
@@ -308,10 +308,11 @@ The index (BM25) plus a live read of everything it has not seen (`--live-bytes N
 else `$CV_LIVE_BYTES` or the config's `[search] live_bytes`, newest first, and the footer says
 what was left out; none under `--frozen`). An unopenable index
 fails naming [`cv index`](#cv-index); `--scan` is a slow live scan of every session that names what it could
-not read. It matches the exchange; `--kind context` matches injected context, `--kind all` both.
-`--semantic` needs `cv index --semantic` and errors without it. `--limit` (default 20) bounds the
-hits shown, never the count: the footer says `N of M matches`, M every session that matched (for
-`--semantic`, every embedded session the filters admit). `--json` prints `{"hits": [...],
+not read; `--exact` matches literal substrings through the trigram accelerator and revision-verified
+source text. It matches the exchange; `--kind context` matches injected context, `--kind all` both;
+`--cwd` and `-q` filter candidate sessions before ranking. `--limit` (default 20) bounds the
+hits shown, never the count: the footer says `N of M matches`, M every session that matched.
+`--json` prints `{"hits": [...],
 "total": M}`, each hit a session row plus `score` (`null` on a live scan), full `snippet`, and
 `agent_id`/`parent_id`/`workflow` (set for hits indexed with `--subagents`).
 
@@ -533,6 +534,7 @@ versus newest verified, plus unknown-version sessions) and skipped sources (`ski
 cv doctor da9174f4
 cv doctor                       # the most recent session for the current directory
 cv doctor --recent 20           # aggregate the last 20 sessions for this cwd
+cv doctor --store               # diagnose local stores (state.db, catalog.db, packs, search segments, disk health)
 cv doctor da9174f4 --json
 ```
 
@@ -754,18 +756,22 @@ cv export da9174f4 --redact > safe.md         # secrets/PII scrubbed first; coun
 
 ### `cv dataset`
 
-Fine-tuning JSONL, one session per line: `chatml` (default, `{"messages":[…]}`) or `sharegpt`
-(`{"conversations":[…]}`), loadable by TRL and HuggingFace `datasets`.
+Fine-tuning JSONL, one session per line: `chatml` (default, `{"messages":[…]}`), `sharegpt`
+(`{"conversations":[…]}`), or `openai-tools` (structured OpenAI `tool_calls` + `tool_call_id`),
+loadable by TRL, Unsloth and HuggingFace `datasets`.
 
 ```sh
 cv dataset --file corpus.jsonl                              # whole corpus, chatml
 cv dataset --format sharegpt --harness claude                # one harness, ShareGPT shape
+cv dataset --format openai-tools --active-branch --clean-outcome --file tools.jsonl
 cv dataset -q "model:fable" --subagents --file fable.jsonl   # a queried slice + its forest
 cv dataset -q "harness:claude" --redact-only private_key     # strip PEM keys, keep the rest
 ```
 
-`--subagents` adds the forests (most model usage; a `model:` query wants it). `--redact-only` takes
-`private_key`, `api_key`, `jwt`, `email`, `blob`, `assignment`. `--out` exits 2, pointing at `--file`.
+`--subagents` adds the forests (most model usage; a `model:` query wants it). `--active-branch`
+omits rewound turns and sidechains; `--clean-outcome` omits trajectories ending in errors or
+unanswered tool calls. `--redact-only` takes `private_key`, `api_key`, `jwt`, `email`, `blob`,
+`assignment`.
 
 ### `cv pack`
 
@@ -813,7 +819,7 @@ Prepays the live read search would do; run it whenever convenient.
 
 ```sh
 cv index                # full-text (tantivy) index (top-level sessions)
-cv index --semantic     # also build embeddings for `cv search --semantic`
+cv index --exact        # also build the trigram accelerator for `cv search --exact`
 cv index --subagents    # also fold the sub-agent / workflow forest into the index + events
 cv index --rebuild      # clear and rebuild from scratch
 cv index --if-changed   # skip the pass when nothing changed since the last index
@@ -822,13 +828,12 @@ cv index --if-changed   # skip the pass when nothing changed since the last inde
 ```text
 ✦ building full-text index…
 indexed 2245 session(s) → ~/.clustervision/tantivy
-✦ embedding sessions (downloads a small model on first use)…
-embedded 2245 session(s) → ~/.clustervision/embeddings.bin
 ```
 
 Incremental; `--if-changed` probes session stamps first and skips the pass on a quiet corpus
-(incompatible with `--rebuild`); `--json` reports `indexed`, `changed`, `removed`, `errors`. `--semantic` downloads a
-~30 MB model once. `--subagents` tags forest hits with parent, run and agent (can add hundreds of
+(incompatible with `--rebuild`); `--json` reports `indexed`, `changed`, `removed`, `errors`.
+`--exact` adds one source pass for literal substring trigrams (`~/.clustervision/trigram`).
+`--subagents` tags forest hits with parent, run and agent (can add hundreds of
 MB). The same pass fills the **event catalog** for [`events`](#cv-events), [`touched`](#cv-touched)
 and [`blame`](#cv-blame).
 
@@ -846,7 +851,10 @@ cv config --rm-export ~/Downloads      # unregister
 
 Plain TOML (`exports = [...]`); `$CV_EXPORTS` (`:`-separated) adds more per run. A bad config warns
 once. `[search] live_bytes = N` bounds the live read of every search that names no budget
-(`--live-bytes`, then `$CV_LIVE_BYTES`, override it; `CV_LIVE_BYTES=all` lifts it). `$CLAURDVOYANT_*` variables exit 2 naming their `CLUSTERVISION_` replacements.
+(`--live-bytes`, then `$CV_LIVE_BYTES`, override it; `CV_LIVE_BYTES=all` lifts it). `[privacy]` sets
+default redaction classes, `$HOME`/path rewrites, principal policies and session-admission filters
+for sharing and exports; `[replication.<target>]` sets per-destination URL, bearer token and scrub
+overrides for `cv archive sync --to <target>` and `cv watch --to <target>`.
 
 ### `cv schema`
 

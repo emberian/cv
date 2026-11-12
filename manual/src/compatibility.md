@@ -26,5 +26,9 @@ Additions pass; removed or changed shapes and defaults fail. Route removal is ca
 the baseline (older ones list no routes).
 
 A reviewed removal is an `--accept <contract path>` on the CI step until the baseline moves.
-`crates/cv/tests/announce.rs` tests pipe and
+0.19 removes `mcp` (`tools`), `scry`, `deferrals`, `search --semantic`, `index --semantic`,
+`splice --generate`/`--gen-model`, `pack --context-bytes`, and pre-0.18 CLI/HTTP tombstones
+(`adopt`'s legacy `--list`/`--orphans` flags, `rewind --from-compaction`, `dataset --out`, and 410
+board/task-shim routes), and widens `show --around` and `export --around` from integer to `N|ID`
+string selectors. `crates/cv/tests/announce.rs` tests pipe and
 terminal behavior; `python3 -I tools/test-compatibility.py` runs the comparator's mutation tests.

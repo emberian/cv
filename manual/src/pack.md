@@ -16,11 +16,9 @@ cv pack "migrate the daemon" --limit 3                  # draw from at most 3 pa
 ## The pipeline
 
 1. **Recall.** The task is run through `cv_search::Searcher` against the full-text
-   index + live unindexed suffix *and* the semantic embedding store (when it
-   exists); the two rankings are fused by reciprocal rank and deduped by session,
-   capped at `--limit` sessions. Honest fallbacks: no index → a live suffix read
-   with a stderr note (`cv index` makes packs instant); no embeddings → full-text
-   only (`cv index --semantic` adds semantic recall).
+   index + live unindexed suffix, ranked by BM25 and deduped by session,
+   capped at `--limit` sessions. Honest fallback: no index → a live suffix read
+   with a stderr note (`cv index` makes packs instant).
 2. **Distill.** Each recalled session contributes a *span*, not its whole
    transcript: a ~3-message excerpt window around the best match (streamed
    under lazy spans — huge sessions are never materialized; each message is

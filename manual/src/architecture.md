@@ -238,14 +238,14 @@ error asking for a longer id or `--harness`.
           ┌──────────┴─────┐   ┌────┴─────┐  ┌─────┴────┐ ┌───┴────┐
           │       cv       │   │cv-search │  │  cv-web  │ │  app/  │
           │  CLI · serve   │──▶│ (tantivy,│  │  (WASM)  │ │(Tauri) │
-          │ watch · archive│   │ model2vec│  │          │ │        │
+          │ watch · archive│   │ trigram) │  │          │ │        │
           └────────────────┘   └──────────┘  └──────────┘ └────────┘
 ```
 
 | Crate | Responsibility |
 |-------|----------------|
-| **`cv`** | The binary: the CLI, `cv serve` (HTTP API, task inbox, dashboard), `cv watch` / `cv archive`, and hooks. |
-| **`cv-search`** | Full-text via [tantivy](https://github.com/quickwit-oss/tantivy) (BM25, snippets); semantic via model2vec. |
+| **`cv`** | The binary: the CLI, `cv serve` (HTTP API, task inbox, dashboard, fleet hub), `cv watch` / `cv archive`, and hooks. |
+| **`cv-search`** | Full-text via [tantivy](https://github.com/quickwit-oss/tantivy) (BM25, snippets), exact trigram acceleration, and derived columnar event segments. |
 | **`cv-web`** | WASM: ingests an uploaded harness `.zip` in-browser, returns sessions as JSON. |
 | **`app/`** | Tauri v2 desktop shell around the web UI, reading `cv_core::api` in-process. |
 

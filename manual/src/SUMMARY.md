@@ -5,7 +5,7 @@
 # Using cv
 
 - [The CLI: `cv`](cli.md)
-- [Search (full-text & semantic)](search.md)
+- [Search (full-text & exact)](search.md)
 - [`cv pack` — the context compiler](pack.md)
 - [Reshaping a lane: `distill`, `splice`, `rewind`, `adopt`](reshaping.md)
 - [Viewing & sharing: the app and `cv share`](viewing-and-sharing.md)

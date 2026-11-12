@@ -6,13 +6,13 @@
 
 ### Your AI coding sessions are gold. Stop letting them rot in scattered folders.
 
-**Find, search, port, prune, and even *resurrect* every AI coding-agent session you've ever run — across 21 harnesses, through one unified format.**
+**Find, search, port, prune, and even *resurrect* every AI coding-agent session you've ever run — across 22 harnesses, through one unified format.**
 
-`claude` · `codex` · `grok` · `opencode` · `gemini` · `hermes` · `openclaw` · `cursor` · …
+`claude` · `codex` · `grok` · `opencode` · `gemini` · `antigravity` · `hermes` · `openclaw` · `cursor` · …
 
-*search by meaning · read behind every compaction · port across harnesses · resurrect a maxed-out session · pack a new task from your whole history*
+*search full-text or exact code · read behind every compaction · port across harnesses · resurrect a maxed-out session · pack a new task from your whole history*
 
-No database server, no import step, no telemetry: clustervision reads your **real local session storage**. `cv index` builds full-text search, `cv index --semantic` search by meaning.
+No database server, no import step, no telemetry: clustervision reads your **real local session storage**. `cv index` builds full-text search, `cv index --exact` adds trigram substring acceleration.
 
 <br>
 
@@ -40,7 +40,7 @@ You spent three hours teaching an agent your codebase: the dead ends, the decisi
 # 🔎 find that session from last week by what it was ABOUT, not where it lived
 cv index                                     # build/refresh the search index first
 cv search "the flux inference refactor"        # full-text, instant
-cv search --semantic "formalizing proofs"      # by meaning — no keyword overlap needed
+cv search --exact "getattrlistbulk"            # literal code substring, trigram-verified
 
 # 🚀 take a Claude session and continue it in Codex. for real.
 cv port da9174f4 --harness codex
@@ -58,16 +58,16 @@ cv prune da9174f4 --drop-thinking
 cv adopt a5d8fd7aa0b73f0e7 --dry-run
 #   ↳ resume, from session 945e6fa2: SendMessage {"to": "a5d8fd7aa0b73f0e7", …}
 
-# 👁️ watch every agent on your machine work, live, in one feed
-cv scry
+# 👁️ archive and follow every agent on your machine live, or replicate to a fleet hub
+cv watch
 ```
 
 …and a couple that didn't exist before:
 
-- 🧠 **An MCP server**: a *running* agent reads **other** agents' sessions mid-task — "what happened here before?", "what is my sibling doing?", "have I solved this before?"
+- 🛰️ **A fleet hub & archive**: `cv watch --to` and `cv archive sync --to` replicate scrubbed Zstd-Seekable session packs and events to `cv serve --hub`.
 - 🌐 **A zero-install web viewer**: drop a zip of any harness folder into your browser. Nothing uploaded, all WASM.
 
-## 🪐 21 harnesses, one IR
+## 🪐 22 harnesses, one IR
 
 | | Harness | Parse | Port *to* | | | Harness | Parse | Port *to* |
 |---|---|:--:|:--:|---|---|---|:--:|:--:|
@@ -88,9 +88,9 @@ cv scry
 
 ## ✨ More than a viewer
 
-- **🧵 Splice & loom** — compose a session from spans of others (`cv splice A:0..12 B:6..`), fork a lane (`cv splice A:..40 --session`), graft branches (`cv splice A:..20 B:35..`), or **generate** a continuation (`--generate`: OpenRouter, Anthropic, or **LM Studio, free and local**). A [Janus loom](https://generative.ink/posts/loom-interface-to-the-multiverse/) for agent transcripts, across harnesses.
-- **🔮 Semantic search** — "have I solved this before?" by *meaning*: `cv search --semantic <query>`, and the same ranking behind the MCP `search` tool.
-- **🧬 Provenance** — the **event catalog** classifies every tool call in every session. `cv touched <file>` lists every session that edited a file; **`cv blame <file>`** ties each commit to the conversation that wrote it, with a `cv show --range` jump to the edit, and an exact match when the session's tool output shows the commit.
+- **🧵 Splice & loom** — compose a session from spans of others (`cv splice A:0..12 B:6..`), fork a lane (`cv splice A:..40 --session`), or graft branches (`cv splice A:..20 B:35..`). A [Janus loom](https://generative.ink/posts/loom-interface-to-the-multiverse/) for agent transcripts, across harnesses.
+- **🔎 Full-text & exact search** — Tantivy BM25 over sessions plus live unindexed suffixes (`cv search <query>`), and positional trigram substring search (`cv search --exact <literal>`) verified against source text.
+- **🧬 Provenance** — the **event catalog** classifies every tool call in every session. `cv touched <file>` lists every session that edited a file; **`cv blame <file>`** ties each commit and hunk to the conversation that wrote it, with a `cv show --range` jump to the edit, and an exact match when the session's tool output shows the commit.
 - **🌳 Anatomy of a run** — **`cv workflow <id>`** renders a `Workflow`-tool run: phase tree, agents per phase, their outcomes, tokens and tool calls, and the driving script. **`cv tools <id>`** gives per-agent tool histograms and a timeline over the whole forest. **`cv show <id> --kind compaction_boundary,compaction_summary`** finds every compaction seam; `cv show --pre-compaction` reads back what the continued agent *lost*. `cv dataset --subagents` exports the forest.
 - **✂️ Prune** — *custom compaction*: `cv prune <id>` moves bulky **old** tool payloads (file reads, logs, screenshots) into a sidecar behind a `[PRUNED id=…]` marker and writes a **new, resumable** session. Prompts stay verbatim, recent turns intact; `cv cat <new-id> <tool_use_id>` restores any payload. `--drop-thinking` lifts the oldest reasoning too. It also **revives a session stuck at the context wall** by rewriting the stale recorded `usage` Claude Code's resume gate trusts (`--no-revive` opts out). (Adapted from [flatten-mcp](https://github.com/shayaShav/flatten-mcp).)
 - **⏪ Rewind** — `cv rewind <id> --at <sha>` rebuilds an agent *as it was when it landed a commit*: from the last compaction before it to the tool result showing the commit, under a new id, so `claude --resume <new-id> --fork-session` wakes up as the author. Works on sub-agents and message indexes; leaves a provenance sidecar. `cv blame` ranks such sessions first (`exact: commit created here`) with the `cv rewind` line to paste.
@@ -101,14 +101,14 @@ cv scry
 - **🖥️ Desktop app + 🌐 web viewer** — the Tauri app reads **all your local sessions natively**, zero setup:
   - a **Projects** lens: every repo and every agent that touched it, over time;
   - an **activity heatmap** timeline;
-  - **Compare**, **Stats**, and a visual **splice composer** (OpenRouter or local LM Studio);
+  - **Compare**, **Stats**, and a visual **splice composer**;
   - **sub-agent trees**, nested inline and labeled with their task prompts;
   - a **Structure** explorer (`<cv-forest>`): Overview, Forest, Workflows, Tools and Compaction tabs.
-- **🔌 Hooks** — `cv hooks install claude` (or `codex`) installs five hooks: compactions become visible and reversible, a new session starts knowing this directory's history, lanes land in a ledger, owed decisions surface, and an edit to a file another live session holds asks first (Codex: denies). See [hooks](manual/src/mcp.md#hooks-cv-inside-a-running-session).
+- **🔌 Hooks** — `cv hooks install claude` (or `codex`) installs five hooks (plus opt-in `--retired` and `--receipts`): compactions become visible and reversible, a new session starts knowing this directory's history, lanes land in `state.db`, owed decisions surface, and an edit to a file another live session holds asks first (Codex: denies). See [hooks](manual/src/hooks.md).
 
 ## 📖 Manual
 
-Every CLI command, the MCP tools, the HTTP API, the app, conversion and the harness table: the **[user manual](https://emberian.github.io/clustervision/manual/)** (mdBook, under `manual/`).
+Every CLI command, the HTTP API, the app, conversion and the harness table: the **[user manual](https://emberian.github.io/clustervision/manual/)** (mdBook, under `manual/`).
 
 ## 🛠️ Install
 
@@ -123,16 +123,8 @@ Or from source:
 ```sh
 cargo build --release          # → target/release/cv
 make install                   # = cargo install --path crates/cv --force --target-dir target  → ~/.cargo/bin/cv
-cv --version                   # cv 0.18.0 (<git sha>[-dirty]): the commit it was built from
+cv --version                   # cv 0.19.0 (<git sha>[-dirty]): the commit it was built from
 ```
-
-## 🧠 Let agents read each other's minds (MCP)
-
-```sh
-claude mcp add clustervision -- /path/to/target/release/cv mcp
-```
-
-The MCP tools are **generated from the CLI**: same names, flags and JSON. Plus `await_omen` (block until a sibling agent's message matches a regex), `observe_stream` (poll a live message tail without blocking) and the task tools. Roster: the **[MCP chapter](https://emberian.github.io/clustervision/manual/mcp.html)** or `cv schema --commands`.
 
 ## 📋 Dispatch work you can trust (`cv task`)
 
@@ -169,14 +161,14 @@ cv task done <id> --observed "tests green in <sid>"    # self-reported, labeled 
 cv task sweep --repo ~/proj                            # what git says is probably done; closes nothing
 ```
 
-The same over MCP (`task_open` … `task_inbox`) and `cv serve` (`/api/tasks`, `/api/tasks/inbox/{who}`,
-`/api/inbox`, `/api/task/<id>/{resolve,done,note,discuss,claim,release}`, `/api/events`). State is an
-append-only event log, `~/.clustervision/tasks/events.jsonl`, that refuses events its reducer would reject.
+The same over `cv serve` (`/api/tasks`, `/api/tasks/inbox/{who}`,
+`/api/inbox`, `/api/task/<id>/{resolve,done,note,discuss,claim,release}`, `/api/events`). State lives in
+`~/.clustervision/state.db` (SQLite WAL), refusing events its reducer would reject.
 
 ## 📡 Archive your whole fleet (`cv watch`)
 
 ```sh
-cv archive sync   # snapshot every session into ~/.clustervision
+cv archive sync   # snapshot every session into ~/.clustervision/packs
 cv watch          # follow live + archive as sessions change → a fleet activity feed
 cv serve --web web  # the dashboard, the task inbox and the read API on :7777
 ```
@@ -187,7 +179,7 @@ cv serve --web web  # the dashboard, the task inbox and the read API on :7777
 
 ## 🏗️ Under the hood
 
-One IR (`Session → Message → Block{Text|Thinking|ToolUse|ToolResult|File|Image}`), one `Adapter` per harness (`roots` + `discover` + `stream`, reading through one record codec per wire format) with an emitter beside the twelve that are port targets, plus `splice` / `redact` / `prune` / `watch` / `ingest` modules — and small crates on top: **`cv`** (the one binary: the CLI, `cv mcp`, `cv serve`, `cv watch`, and the LLM digests for `pack` and `splice --generate`) · **`cv-search`** (tantivy + `model2vec`) · **`cv-web`** (WASM) · **`app/`** (Tauri desktop).
+One IR (`Session → Message → Block{Text|Thinking|ToolUse|ToolResult|File|Image}`), one `Adapter` per harness (`roots` + `discover` + `stream`, reading through one record codec per wire format) with an emitter beside the twelve that are port targets, plus `splice` / `redact` / `prune` / `watch` / `ingest` modules — and small crates on top: **`cv`** (the one binary: the CLI, `cv serve`, `cv watch`, `cv archive`, and hooks) · **`cv-search`** (tantivy + trigram + columnar events) · **`cv-web`** (WASM) · **`app/`** (Tauri desktop).
 
 ```
 parse(any harness) → 🔮 unified IR → search · port · prune · splice · pack · archive · view
@@ -197,7 +189,7 @@ parse(any harness) → 🔮 unified IR → search · port · prune · splice · 
 
 Built largely by swarms of agents. ✨ The edges:
 
-- **21 harnesses parse**; 12 also **emit** (N-way conversion). The rest — Cursor, Goose, Zed, Devin CLI, Kimi CLI (frozen store), Kimi Code, OpenSession, and the ChatGPT/Claude.ai **account data exports** (`chatgpt-export`/`claude-export` — register their location with `cv config --add-export <path>`) — are parse-only for now.
+- **22 harnesses parse**; 12 also **emit** (N-way conversion). The rest — Antigravity, Cursor, Goose, Zed, Devin CLI, Kimi CLI (frozen store), Kimi Code, OpenSession, and the ChatGPT/Claude.ai **account data exports** (`chatgpt-export`/`claude-export` — register their location with `cv config --add-export <path>`) — are parse-only for now.
 - **Robustness:** the maintainer's fleet (about 7,000 sessions, 95 GB) lists and indexes without a panic; a per-version corpus of real harness output is golden-tested; parsers are checked against malformed input (`crates/cv-core/tests/robustness.rs`).
 - The full-text index trades disk for speed; Gemini's protobuf `.pb` is opaque; a few sidecar tool-call streams aren't merged yet.
 - Historical format variants are a goal: see [Adding a harness](manual/src/adding-a-harness.md), and **please send your harness logs**.
