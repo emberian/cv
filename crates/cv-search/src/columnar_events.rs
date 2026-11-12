@@ -288,6 +288,19 @@ fn register_schema(writer: &mut ColumnarWriter) {
     writer.record_column_type("call", ColumnType::Bool, false);
 }
 
+fn target_dictionary_offsets(lengths: impl IntoIterator<Item = usize>) -> Result<Vec<u32>> {
+    let mut offsets = vec![0u32];
+    let mut end = 0u32;
+    for len in lengths {
+        let len = u32::try_from(len).context("columnar target exceeds u32 byte capacity")?;
+        end = end
+            .checked_add(len)
+            .context("columnar target dictionary exceeds u32 byte capacity")?;
+        offsets.push(end);
+    }
+    Ok(offsets)
+}
+
 fn write_clev_segment(dir: &Path, rows: &[StagedRow]) -> Result<(String, Vec<RowGroupStats>)> {
     anyhow::ensure!(!rows.is_empty(), "cannot write empty columnar event segment");
     anyhow::ensure!(
@@ -330,12 +343,10 @@ fn write_clev_segment(dir: &Path, rows: &[StagedRow]) -> Result<(String, Vec<Row
     let forward_fst_view = Map::from_bytes(forward_fst_bytes.clone()).context("opening forward FST")?;
 
     // Target string blob + u32 end-offsets for O(1) `ord -> &str` lookup.
-    let mut target_offsets = Vec::with_capacity(unique_targets.len() + 1);
+    let target_offsets = target_dictionary_offsets(unique_targets.iter().map(String::len))?;
     let mut target_blob = Vec::new();
-    target_offsets.push(0u32);
     for t in &unique_targets {
         target_blob.extend_from_slice(t.as_bytes());
-        target_offsets.push(target_blob.len() as u32);
     }
 
     // 2. Populate `ColumnarWriter`, `RoaringBitmap` postings, and `RowGroupStats`.
@@ -462,7 +473,10 @@ fn write_clev_segment(dir: &Path, rows: &[StagedRow]) -> Result<(String, Vec<Row
     let write_bm = |bm: &RoaringBitmap, out: &mut Vec<u8>| -> Result<(u64, u32)> {
         let off = out.len() as u64;
         bm.serialize_into(&mut *out).context("serializing roaring posting")?;
-        Ok((off, (out.len() as u64 - off) as u32))
+        Ok((
+            off,
+            u32::try_from(out.len() as u64 - off).context("columnar posting exceeds u32 byte capacity")?,
+        ))
     };
 
     for (k, bm) in &by_kind {
@@ -1063,6 +1077,15 @@ impl ColumnarEventStore {
     /// Compact fragmented segments (rewriting live `!superseded` rows when dead ratio > 50%, or
     /// unconditionally when `force = true` and any segment has dead rows or multiple segments exist).
     pub fn compact(&mut self, force: bool) -> Result<bool> {
+        let before = self.manifest.clone();
+        let result = self.compact_inner(force);
+        if result.is_err() {
+            self.manifest = before;
+        }
+        result
+    }
+
+    fn compact_inner(&mut self, force: bool) -> Result<bool> {
         if cv_core::env::frozen() || self.manifest.segments.is_empty() {
             return Ok(false);
         }
@@ -2382,6 +2405,18 @@ mod tests {
     }
 
     #[test]
+    fn columnar_target_dictionary_rejects_wrapped_offsets() {
+        assert_eq!(target_dictionary_offsets([2, 0, 3]).unwrap(), vec![0, 2, 2, 5]);
+        assert_eq!(
+            target_dictionary_offsets([u32::MAX as usize]).unwrap(),
+            vec![0, u32::MAX]
+        );
+        assert!(target_dictionary_offsets([u32::MAX as usize, 1]).is_err());
+        #[cfg(target_pointer_width = "64")]
+        assert!(target_dictionary_offsets([usize::MAX]).is_err());
+    }
+
+    #[test]
     fn columnar_events_reject_forged_segment_bounds_cleanly() {
         let tmp = ScratchDir::new();
         let rows = vec![StagedRow {
@@ -2417,6 +2452,20 @@ mod tests {
         forged2[footer_start + 56..footer_start + 60].copy_from_slice(&crc2.to_le_bytes());
         std::fs::write(&seg_path, &forged2).unwrap();
         assert!(ClevReader::open(&seg_path).is_err());
+
+        // Failed compaction must retain the in-memory manifest too. Otherwise a later successful
+        // checkpoint silently publishes the emptied segment list after encountering corruption.
+        let mut store = ColumnarEventStore::open(tmp.path()).unwrap();
+        let entry = SegmentManifestEntry {
+            file: seg_path.file_name().unwrap().to_str().unwrap().into(),
+            num_rows: 1,
+            superseded_bytes: vec![],
+            row_groups: vec![],
+        };
+        store.manifest.segments = vec![entry.clone(), entry];
+        let before = serde_json::to_value(&store.manifest).unwrap();
+        assert!(store.compact(true).is_err());
+        assert_eq!(serde_json::to_value(&store.manifest).unwrap(), before);
     }
 
     #[test]
