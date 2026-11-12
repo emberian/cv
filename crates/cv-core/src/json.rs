@@ -77,6 +77,42 @@ impl std::error::Error for InvalidJson {}
 /// validated_range afterward; this avoids validating each giant input again at producer handoff.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct JsonSource(Arc<CapturedSource>);
+/// Per-session SQLite freshness guard for shared WAL stores: while the pinned MVCC pass is live,
+/// reads come from one SQLite snapshot; once the pass finishes (and whenever lazy source ranges
+/// resolve later), the session's own revision and schema version are re-verified.
+pub(crate) struct SqliteSessionGuard {
+    in_pass: std::sync::atomic::AtomicBool,
+    valid: Box<dyn Fn() -> bool + Send + Sync>,
+}
+
+impl std::fmt::Debug for SqliteSessionGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SqliteSessionGuard")
+            .field("in_pass", &self.in_pass.load(std::sync::atomic::Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
+}
+
+impl SqliteSessionGuard {
+    pub(crate) fn new(valid: impl Fn() -> bool + Send + Sync + 'static) -> Arc<Self> {
+        Arc::new(Self {
+            in_pass: std::sync::atomic::AtomicBool::new(true),
+            valid: Box::new(valid),
+        })
+    }
+
+    pub(crate) fn end_pass(&self) {
+        self.in_pass.store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn valid(&self) -> bool {
+        if self.in_pass.load(std::sync::atomic::Ordering::Acquire) {
+            return true;
+        }
+        (self.valid)()
+    }
+}
+
 #[derive(Debug)]
 struct CapturedSource {
     path: PathBuf,
@@ -89,11 +125,19 @@ struct CapturedSource {
     /// The last observation admitted against `prefix`: the same one again needs no read.
     admitted: std::sync::Mutex<Option<FileId>>,
     reads: Option<Arc<crate::source::ReadSet>>,
+    sqlite_guard: Option<Arc<SqliteSessionGuard>>,
     decoded: std::sync::Mutex<Option<Arc<crate::harness::store::bytes::ByteSource>>>,
 }
 impl PartialEq for CapturedSource {
     fn eq(&self, other: &Self) -> bool {
-        self.path == other.path && self.identity == other.identity && self.reads == other.reads
+        self.path == other.path
+            && self.identity == other.identity
+            && self.reads == other.reads
+            && match (&self.sqlite_guard, &other.sqlite_guard) {
+                (None, None) => true,
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                _ => false,
+            }
     }
 }
 impl Eq for CapturedSource {}
@@ -102,6 +146,7 @@ impl std::hash::Hash for CapturedSource {
         self.path.hash(state);
         self.identity.hash(state);
         self.reads.hash(state);
+        self.sqlite_guard.as_ref().map(Arc::as_ptr).hash(state);
     }
 }
 /// Extensions of line-delimited logs that harnesses append to while a session is live.
@@ -152,12 +197,25 @@ impl JsonSource {
         Self::capture_with_reads(path, &crate::source::ReadSet::default())
     }
     pub(crate) fn capture_with_reads(path: &Path, reads: &crate::source::ReadSet) -> Result<Self> {
-        let source = Self::capture_guarded(path, Some(Arc::new(reads.clone())))?;
+        let source = Self::capture_guarded(path, Some(Arc::new(reads.clone())), None)?;
         // The capture just stat'ed the path; only the dependencies are older than it.
         source.check_reads()?;
         Ok(source)
     }
-    fn capture_guarded(path: &Path, reads: Option<Arc<crate::source::ReadSet>>) -> Result<Self> {
+    pub(crate) fn capture_with_sqlite_guard(
+        path: &Path,
+        reads: &crate::source::ReadSet,
+        guard: Arc<SqliteSessionGuard>,
+    ) -> Result<Self> {
+        let source = Self::capture_guarded(path, Some(Arc::new(reads.clone())), Some(guard))?;
+        source.check()?;
+        Ok(source)
+    }
+    fn capture_guarded(
+        path: &Path,
+        reads: Option<Arc<crate::source::ReadSet>>,
+        sqlite_guard: Option<Arc<SqliteSessionGuard>>,
+    ) -> Result<Self> {
         // Preserve symlink spelling so later retargeting changes the observed identity.
         let path = std::path::absolute(path).context("locating JSON source")?;
         let (identity, prefix) = if is_append_only_log(&path) {
@@ -178,10 +236,19 @@ impl JsonSource {
             prefix,
             admitted: std::sync::Mutex::new(None),
             reads,
+            sqlite_guard,
             decoded: std::sync::Mutex::new(None),
         })))
     }
     pub(crate) fn check(&self) -> Result<()> {
+        if let Some(guard) = &self.0.sqlite_guard {
+            anyhow::ensure!(
+                guard.valid(),
+                "SQLite source dependencies changed or unavailable: {}",
+                self.0.path.display()
+            );
+            return Ok(());
+        }
         let metadata = std::fs::metadata(&self.0.path)
             .with_context(|| format!("reading JSON source {}", self.0.path.display()))?;
         self.check_metadata(metadata)
@@ -224,7 +291,7 @@ impl JsonSource {
     }
     /// [`Self::capture`] without the dependency check: one stat, for a parse-time stamp.
     pub(crate) fn capture_identity(path: &Path) -> Result<Self> {
-        Self::capture_guarded(path, None)
+        Self::capture_guarded(path, None, None)
     }
     /// `later` is a capture of the same path that still carries every byte of this one: identical,
     /// or for an append-only log admitted as growth ([`FileId::admits`]).

@@ -1,19 +1,22 @@
 //! SQLite plumbing for the database-backed stores (Cursor, Devin, Goose, Hermes, OpenClaw,
-//! OpenCode, Zed). One invariant lives here so no adapter can get it wrong: **cv never writes a
-//! harness's store**, not even its coordination files. Opening `SQLITE_OPEN_READ_ONLY` is not
-//! enough for that: a WAL reader records its read mark in the `-shm` wal-index (and creates
-//! `-wal`/`-shm` when they are missing), which rewrites a file in the harness home. So
-//! [`open_ro`] chooses from the database's sidecars:
+//! OpenCode, Zed). One invariant lives here so no adapter can get it wrong: **cv never modifies a
+//! harness's database or WAL**, and under `--frozen` never touches `-shm` either. [`open_ro`]
+//! chooses from the database's sidecars and mode:
 //! - no WAL frames (`-wal` absent or empty) and no `-journal`: the original with
 //!   `immutable=1`, so SQLite opens no `-wal`/`-shm` and takes no locks;
-//! - otherwise: a private snapshot of the database and its `-wal`/`-journal` (never `-shm`,
-//!   which SQLite rebuilds in the private directory), so committed WAL-only rows stay visible.
+//! - live WAL (`-wal` has frames, `-shm` exists, no `-journal`, not `--frozen`): the live store
+//!   opened `SQLITE_OPEN_READ_ONLY` with a short `busy_timeout` and an immediate `BEGIN DEFERRED`
+//!   read transaction (`PRAGMA schema_version`), so SQLite's WAL MVCC pins a coherent snapshot
+//!   without copying multi-hundred-MB stores when other sessions append to `-wal`;
+//! - `--frozen`, rollback `-journal`, retained WAL without `-shm`, or genuine `SQLITE_BUSY` / lock
+//!   contention on live open: a private [`ColdSnapshot`] of the database and its `-wal`/`-journal`
+//!   (never `-shm`, which SQLite rebuilds in the private directory), with bounded TTL reuse so
+//!   bursts under contention or `--frozen` do not copy the database repeatedly.
 //!
-//! This also protects a rollback-mode source that switches to WAL during an operation: an
-//! ordinary read-only connection could create coordination files before the after-read check.
-//!
-//! Every path's identity is captured before and checked after each read ([`ReadConnection::read`]),
-//! so a harness write during a read is an error, not a torn result.
+//! Single-user adapters bracket operations with [`ReadConnection::read`]; shared multi-writer
+//! stores bracket coherent point-in-time scans with [`ReadConnection::read_snapshot`] and
+//! per-session reads with [`read_session`], which validates that session's own revision and schema
+//! version rather than aborting when another session appends to `-wal`.
 
 use crate::json::{ReadInput, Validation};
 use anyhow::{Context, Result};
@@ -36,17 +39,32 @@ mod selection;
 mod snapshots;
 pub(crate) use selection::Selection;
 
+const LIVE_WAL_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(50);
+const COLD_SNAPSHOT_TTL: std::time::Duration = std::time::Duration::from_millis(250);
+const COLD_COPY_RETRIES: usize = 3;
+
 /// A reader retains both its private backing (when needed) and the original provenance.
-/// Use `read` around an adapter operation, and carry `reads()` into lazy source captures.
+/// Use `read`, `read_snapshot` or `read_session` around an adapter operation, and carry `reads()`
+/// into lazy source captures.
 pub(crate) struct ReadConnection {
     connection: Connection,
     reads: crate::source::ReadSet,
+    reads_exact_at_open: bool,
+    isolated_snapshot: bool,
     _snapshot: Option<std::sync::Arc<ColdSnapshot>>,
     _scope: Option<ReadScope>,
 }
 
+impl Drop for ReadConnection {
+    fn drop(&mut self) {
+        if !self.connection.is_autocommit() {
+            let _ = self.connection.execute_batch("ROLLBACK;");
+        }
+    }
+}
+
 /// Tests read the store the way cv sees it without the bracket; product code has only
-/// [`ReadConnection::read`].
+/// [`ReadConnection::read`], [`ReadConnection::read_snapshot`] and [`read_session`].
 #[cfg(test)]
 impl std::ops::Deref for ReadConnection {
     type Target = Connection;
@@ -61,8 +79,9 @@ impl ReadConnection {
         &self.reads
     }
 
-    /// The one way to the connection: `operation` runs between the before and after checks of
-    /// every captured path, and gets the reader's dependencies to carry into lazy captures.
+    /// The one way to the connection for strict whole-file provenance: `operation` runs between
+    /// the before and after checks of every captured path, and gets the reader's dependencies to
+    /// carry into lazy captures.
     pub(crate) fn read<T>(
         &self,
         operation: impl FnOnce(&Connection, &crate::source::ReadSet) -> Result<T>,
@@ -72,6 +91,20 @@ impl ReadConnection {
         // A mutation takes precedence over a body/SQL failure too.
         check_reads(&self.reads)?;
         result
+    }
+
+    /// Coherent point-in-time read over a shared store (discovery, per-session row certificates,
+    /// derived forest scans): when pinned by WAL MVCC (`BEGIN DEFERRED`) or a private
+    /// [`ColdSnapshot`], concurrent WAL appends by other sessions do not invalidate the snapshot;
+    /// `immutable=1` opens have no MVCC and retain before/after file checks.
+    pub(crate) fn read_snapshot<T>(
+        &self,
+        operation: impl FnOnce(&Connection, &crate::source::ReadSet) -> Result<T>,
+    ) -> Result<T> {
+        if !self.isolated_snapshot {
+            return self.read(operation);
+        }
+        operation(&self.connection, &self.reads)
     }
 }
 
@@ -166,16 +199,42 @@ fn scope_from(active: &std::sync::Mutex<std::sync::Weak<SnapshotCache>>) -> Read
 
 struct ColdSnapshot {
     reads: crate::source::ReadSet,
+    birth: [u8; 32],
+    created_at: std::sync::Mutex<std::time::Instant>,
     directory: std::path::PathBuf,
     directory_identity: snapshots::Identity,
     database: std::path::PathBuf,
     _owner: Option<std::sync::Arc<snapshots::Owner>>,
 }
 
+impl ColdSnapshot {
+    fn reusable(&self, path: &Path, allow_ttl: bool) -> bool {
+        if self.reads.fresh(&mut crate::source::Probe::default()) {
+            return true;
+        }
+        if !allow_ttl || self.birth != crate::source::store_birth(path) {
+            return false;
+        }
+        self.created_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .elapsed()
+            < COLD_SNAPSHOT_TTL
+    }
+}
+
 impl Drop for ColdSnapshot {
     fn drop(&mut self) {
         snapshots::remove_snapshot_directory(&self.directory, self.directory_identity);
     }
+}
+
+fn record_store_reads(path: &Path) -> crate::source::ReadSet {
+    let mut reads = crate::source::ReadSet::default();
+    reads.record(path);
+    reads.record(&sidecar(path, "-wal"));
+    reads.record(&sidecar(path, "-journal"));
+    reads
 }
 
 fn check_reads(reads: &crate::source::ReadSet) -> Result<()> {
@@ -195,10 +254,7 @@ pub(crate) fn cached_discover(
     discover: impl FnOnce() -> Result<Vec<crate::SessionRef>>,
 ) -> Result<Vec<crate::SessionRef>> {
     let path = std::path::absolute(db)?;
-    let mut reads = crate::source::ReadSet::default();
-    reads.record(&path);
-    reads.record(&sidecar(&path, "-wal"));
-    reads.record(&sidecar(&path, "-journal"));
+    let reads = record_store_reads(&path);
     crate::discover_cache::cached_scan_many_with_reads(&path, reads, discover)
 }
 
@@ -221,6 +277,55 @@ pub(crate) fn read<T>(
     operation: impl FnOnce(&Connection, &crate::source::ReadSet) -> Result<T>,
 ) -> Result<T> {
     open_ro(path)?.read(operation)
+}
+
+/// Read one session from a shared multi-writer SQLite store inside a coherent WAL MVCC snapshot
+/// (or [`ColdSnapshot`] fallback), then verify that *this session's* revision and schema version
+/// still match. Writes and checkpoints by unrelated sessions in the same database do not fail the
+/// read or trigger full-database copies.
+pub(crate) fn read_session<T>(
+    path: &Path,
+    certify: impl Fn(&Connection) -> Result<crate::source::Rows> + Send + Sync + 'static,
+    operation: impl FnOnce(
+        &Connection,
+        &crate::source::ReadSet,
+        &std::sync::Arc<crate::json::SqliteSessionGuard>,
+    ) -> Result<T>,
+) -> Result<T> {
+    let abs_path = std::path::absolute(path)?;
+    let reader = open_ro(&abs_path)?;
+    if !reader.isolated_snapshot {
+        check_reads(&reader.reads)?;
+    }
+    let expected_schema: i64 = reader.connection.query_row("PRAGMA schema_version", [], |r| r.get(0))?;
+    let expected_rows = certify(&reader.connection)?;
+    let birth = crate::source::store_birth(&abs_path);
+    let open_reads = reader.reads.clone();
+    let exact_open = reader.reads_exact_at_open;
+    let certify = std::sync::Arc::new(certify);
+    let guard = crate::json::SqliteSessionGuard::new(move || {
+        if exact_open && open_reads.fresh(&mut crate::source::Probe::default()) {
+            return true;
+        }
+        if crate::source::store_birth(&abs_path) != birth {
+            return false;
+        }
+        let Ok(now) = open_ro_fresh(&abs_path) else {
+            return false;
+        };
+        let same_schema = now
+            .connection
+            .query_row("PRAGMA schema_version", [], |r| r.get::<_, i64>(0))
+            .ok()
+            == Some(expected_schema);
+        same_schema && certify(&now.connection).ok() == Some(expected_rows)
+    });
+    let result = operation(&reader.connection, &reader.reads, &guard);
+    guard.end_pass();
+    drop(reader);
+    // A mutation of this session or the store's schema takes precedence over a body/SQL failure.
+    anyhow::ensure!(guard.valid(), "SQLite source dependencies changed or unavailable");
+    result
 }
 
 /// Whether byte-exact indexed facts may replace native ID equality. Any explicit collation
@@ -249,98 +354,246 @@ pub(crate) fn binary_text_columns(conn: &Connection, table: &str, names: &[&str]
     }))
 }
 
-/// Open a harness database without writing anything in its directory (see the module docs).
-/// Snapshots of WAL-mode stores with frames live in a private directory, one per store and store
-/// state for the operation ([`SnapshotCacheState`]). `std::fs::copy` clones
-/// on APFS (0.01 s for a 267 MB store) and copies elsewhere (0.26 s for the same file here).
+/// Open a harness database read-only (see the module docs).
+/// Live WAL stores with `-shm` open directly with `BEGIN DEFERRED` MVCC snapshot isolation;
+/// `--frozen`, rollback journals, retained WALs without `-shm`, and `SQLITE_BUSY` contention fall
+/// back to a private [`ColdSnapshot`] with bounded TTL reuse.
 pub(crate) fn open_ro(path: &Path) -> Result<ReadConnection> {
-    open_ro_with_copy_check(path, |_| Ok(()))
+    open_ro_inner(path, true)
 }
 
-fn open_ro_with_copy_check(path: &Path, copied: impl FnOnce(&Path) -> Result<()>) -> Result<ReadConnection> {
-    use std::sync::Arc;
+fn open_ro_fresh(path: &Path) -> Result<ReadConnection> {
+    open_ro_inner(path, false)
+}
+
+fn open_ro_inner(path: &Path, allow_ttl_reuse: bool) -> Result<ReadConnection> {
     let path = std::path::absolute(path)?;
-    let mut reads = crate::source::ReadSet::default();
-    reads.record(&path);
-    reads.record(&sidecar(&path, "-wal"));
-    reads.record(&sidecar(&path, "-journal"));
+    let reads = record_store_reads(&path);
     let has_frames = std::fs::metadata(sidecar(&path, "-wal")).is_ok_and(|m| m.len() > 0);
     let has_journal = sidecar(&path, "-journal").exists();
     let immutable = !has_frames && !has_journal;
-    let scope = (!immutable).then(reader_scope);
-    let snapshot = if let Some(scope) = scope.as_ref() {
-        let mut cache = scope
+    if immutable {
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_URI;
+        let connection = Connection::open_with_flags(immutable_uri(&path), flags)
+            .with_context(|| format!("opening {}", path.display()))?;
+        check_reads(&reads)?;
+        return Ok(ReadConnection {
+            connection,
+            reads,
+            reads_exact_at_open: true,
+            isolated_snapshot: false,
+            _snapshot: None,
+            _scope: None,
+        });
+    }
+
+    let has_shm = sidecar(&path, "-shm").exists();
+    if !crate::env::frozen() && has_frames && !has_journal && has_shm {
+        if allow_ttl_reuse {
+            if let Some(cached) = try_open_cached_cold_ro(&path, true)? {
+                return Ok(cached);
+            }
+        }
+        match open_live_wal(&path, reads) {
+            Ok(conn) => return Ok(conn),
+            Err(err) if is_lock_or_open_contention(&err) => {
+                return open_cold_ro_inner(&path, allow_ttl_reuse, COLD_COPY_RETRIES, |_| Ok(()));
+            }
+            Err(err) => return Err(err).with_context(|| format!("opening {}", path.display())),
+        }
+    }
+
+    open_cold_ro_inner(&path, allow_ttl_reuse, COLD_COPY_RETRIES, |_| Ok(()))
+}
+
+fn open_live_wal(path: &Path, reads: crate::source::ReadSet) -> rusqlite::Result<ReadConnection> {
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let connection = Connection::open_with_flags(path, flags)?;
+    connection.busy_timeout(LIVE_WAL_BUSY_TIMEOUT)?;
+    connection.execute_batch("PRAGMA query_only = ON; BEGIN DEFERRED;")?;
+    // Reading `schema_version` forces SQLite's `walBeginReadTransaction` immediately so the
+    // connection pins its MVCC read mark (or surfaces `SQLITE_BUSY` here for fallback).
+    let _: i64 = connection.query_row("PRAGMA schema_version", [], |row| row.get(0))?;
+    let reads_exact_at_open = reads.fresh(&mut crate::source::Probe::default());
+    Ok(ReadConnection {
+        connection,
+        reads,
+        reads_exact_at_open,
+        isolated_snapshot: true,
+        _snapshot: None,
+        _scope: None,
+    })
+}
+
+fn is_lock_or_open_contention(err: &rusqlite::Error) -> bool {
+    use rusqlite::ErrorCode;
+    let rusqlite::Error::SqliteFailure(sqlite_err, _) = err else {
+        return false;
+    };
+    matches!(
+        sqlite_err.code,
+        ErrorCode::DatabaseBusy
+            | ErrorCode::DatabaseLocked
+            | ErrorCode::ReadOnly
+            | ErrorCode::CannotOpen
+            | ErrorCode::PermissionDenied
+            | ErrorCode::SystemIoFailure
+    ) || (sqlite_err.extended_code & 0xff) == rusqlite::ffi::SQLITE_PROTOCOL
+}
+
+fn try_open_cached_cold_ro(path: &Path, allow_ttl_reuse: bool) -> Result<Option<ReadConnection>> {
+    use std::sync::Arc;
+    let scope = reader_scope();
+    let snapshot = {
+        let cache = scope
             .cache
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("SQLite snapshot cache poisoned"))?;
-        if let Some(snapshot) = cache
+        cache
             .retained
-            .get(&path)
-            .filter(|s| s.reads.fresh(&mut crate::source::Probe::default()))
-        {
-            Some(Arc::clone(snapshot))
-        } else {
-            // A moved store's old backing goes once no reader holds it.
-            cache.retained.remove(&path);
-            let owner = {
-                let mut slot = scope
-                    .cache
-                    .owner
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("SQLite snapshot owner poisoned"))?;
-                if slot.is_none() {
-                    *slot = Some(scope.cache.namespace.owner()?);
-                }
-                Arc::clone(slot.as_ref().unwrap())
-            };
-            let directory = owner.snapshot_directory()?;
-            let directory_identity = snapshots::snapshot_identity(&directory)?;
-            let snapshot = ColdSnapshot {
-                reads: reads.clone(),
-                database: directory.join("store.db"),
-                directory,
-                directory_identity,
-                _owner: Some(owner),
-            };
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&snapshot.directory, std::fs::Permissions::from_mode(0o700))?;
-            }
-            // std::fs::copy uses clonefile on APFS and bounded OS copying elsewhere. Never copy
-            // SHM: it contains live coordination state; SQLite rebuilds it only in our directory.
-            std::fs::copy(&path, &snapshot.database)?;
-            for suffix in ["-wal", "-journal"] {
-                let original = sidecar(&path, suffix);
-                if original.exists() {
-                    std::fs::copy(original, sidecar(&snapshot.database, suffix))?;
-                }
-            }
-            copied(&snapshot.database)?;
-            check_reads(&reads)?;
-            let snapshot = Arc::new(snapshot);
-            cache.retained.insert(path.clone(), Arc::clone(&snapshot));
-            Some(snapshot)
-        }
-    } else {
-        None
+            .get(path)
+            .filter(|s| s.reusable(path, allow_ttl_reuse))
+            .cloned()
     };
-    let backing = snapshot.as_ref().map_or(path.as_path(), |s| s.database.as_path());
+    let Some(snapshot) = snapshot else {
+        return Ok(None);
+    };
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-    let connection = if immutable {
-        Connection::open_with_flags(immutable_uri(backing), flags | OpenFlags::SQLITE_OPEN_URI)
-    } else {
-        Connection::open_with_flags(backing, flags)
-    }
-    .with_context(|| format!("opening {}", path.display()))?;
-    check_reads(&reads)?;
-    Ok(ReadConnection {
+    let connection = Connection::open_with_flags(&snapshot.database, flags)
+        .with_context(|| format!("opening {}", path.display()))?;
+    let reads_exact_at_open = snapshot.reads.fresh(&mut crate::source::Probe::default());
+    Ok(Some(ReadConnection {
         connection,
-        reads,
-        _snapshot: snapshot,
-        _scope: scope,
-    })
+        reads: snapshot.reads.clone(),
+        reads_exact_at_open,
+        isolated_snapshot: true,
+        _snapshot: Some(Arc::clone(&snapshot)),
+        _scope: Some(scope),
+    }))
+}
+
+#[cfg(test)]
+fn open_cold_ro(path: &Path) -> Result<ReadConnection> {
+    let path = std::path::absolute(path)?;
+    open_cold_ro_inner(&path, true, COLD_COPY_RETRIES, |_| Ok(()))
+}
+
+#[cfg(test)]
+fn open_ro_with_copy_check(path: &Path, copied: impl FnOnce(&Path) -> Result<()>) -> Result<ReadConnection> {
+    let path = std::path::absolute(path)?;
+    let reads = record_store_reads(&path);
+    let has_frames = std::fs::metadata(sidecar(&path, "-wal")).is_ok_and(|m| m.len() > 0);
+    let has_journal = sidecar(&path, "-journal").exists();
+    if !has_frames && !has_journal {
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_URI;
+        let connection = Connection::open_with_flags(immutable_uri(&path), flags)
+            .with_context(|| format!("opening {}", path.display()))?;
+        check_reads(&reads)?;
+        return Ok(ReadConnection {
+            connection,
+            reads,
+            reads_exact_at_open: true,
+            isolated_snapshot: false,
+            _snapshot: None,
+            _scope: None,
+        });
+    }
+    open_cold_ro_inner(&path, true, 1, copied)
+}
+
+fn open_cold_ro_inner(
+    path: &Path,
+    allow_ttl_reuse: bool,
+    max_attempts: usize,
+    copied: impl FnOnce(&Path) -> Result<()>,
+) -> Result<ReadConnection> {
+    use std::sync::Arc;
+    if let Some(cached) = try_open_cached_cold_ro(path, allow_ttl_reuse)? {
+        return Ok(cached);
+    }
+    let scope = reader_scope();
+    let mut copied = Some(copied);
+    let mut last_error = None;
+    for attempt in 0..max_attempts.max(1) {
+        let reads = record_store_reads(path);
+        let birth = crate::source::store_birth(path);
+        let db_before = crate::source::FileId::at(path);
+        let owner = {
+            let mut slot = scope
+                .cache
+                .owner
+                .lock()
+                .map_err(|_| anyhow::anyhow!("SQLite snapshot owner poisoned"))?;
+            if slot.is_none() {
+                *slot = Some(scope.cache.namespace.owner()?);
+            }
+            Arc::clone(slot.as_ref().unwrap())
+        };
+        let directory = owner.snapshot_directory()?;
+        let directory_identity = snapshots::snapshot_identity(&directory)?;
+        let mut snapshot = ColdSnapshot {
+            reads: reads.clone(),
+            birth,
+            created_at: std::sync::Mutex::new(std::time::Instant::now()),
+            database: directory.join("store.db"),
+            directory,
+            directory_identity,
+            _owner: Some(owner),
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&snapshot.directory, std::fs::Permissions::from_mode(0o700))?;
+        }
+        // std::fs::copy uses clonefile on APFS and bounded OS copying elsewhere. Never copy
+        // SHM: it contains live coordination state; SQLite rebuilds it only in our directory.
+        std::fs::copy(path, &snapshot.database)?;
+        for suffix in ["-wal", "-journal"] {
+            let original = sidecar(path, suffix);
+            if original.exists() {
+                std::fs::copy(original, sidecar(&snapshot.database, suffix))?;
+            }
+        }
+        if let Some(hook) = copied.take() {
+            hook(&snapshot.database)?;
+        }
+        let exact = reads.fresh(&mut crate::source::Probe::default());
+        let wal_append_only_on_final_retry = max_attempts > 1
+            && attempt + 1 == max_attempts
+            && db_before.is_some()
+            && crate::source::FileId::at(path) == db_before
+            && crate::source::store_birth(path) == birth
+            && !sidecar(path, "-journal").exists();
+        if !exact && !wal_append_only_on_final_retry {
+            last_error = Some(anyhow::anyhow!("SQLite source dependencies changed or unavailable"));
+            continue;
+        }
+        if !exact {
+            snapshot.reads = record_store_reads(path);
+        }
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let connection = Connection::open_with_flags(&snapshot.database, flags)
+            .with_context(|| format!("opening {}", path.display()))?;
+        let snapshot = Arc::new(snapshot);
+        {
+            let mut cache = scope
+                .cache
+                .state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("SQLite snapshot cache poisoned"))?;
+            cache.retained.insert(path.to_path_buf(), Arc::clone(&snapshot));
+        }
+        return Ok(ReadConnection {
+            connection,
+            reads: snapshot.reads.clone(),
+            reads_exact_at_open: exact,
+            isolated_snapshot: true,
+            _snapshot: Some(snapshot),
+            _scope: Some(scope),
+        });
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("SQLite source dependencies changed or unavailable")))
 }
 
 /// `file:<path>?immutable=1`, with the URI's reserved characters percent-encoded.
@@ -418,6 +671,23 @@ impl Cells {
     /// Cells of `table` in the database at `path`, guarded by the reader's dependencies.
     pub(crate) fn new(conn: &Connection, path: &Path, reads: &crate::source::ReadSet, table: &str) -> Result<Self> {
         let source = crate::json::JsonSource::capture_with_reads(path, reads)?;
+        Ok(Self {
+            arena: source.decoded_backing()?,
+            source,
+            incremental: incremental_utf8_table(conn, table),
+        })
+    }
+
+    /// Cells of `table` for a single session in a shared multi-writer SQLite store, guarded by
+    /// that session's revision and schema guard ([`read_session`]).
+    pub(crate) fn for_session(
+        conn: &Connection,
+        path: &Path,
+        reads: &crate::source::ReadSet,
+        guard: &std::sync::Arc<crate::json::SqliteSessionGuard>,
+        table: &str,
+    ) -> Result<Self> {
+        let source = crate::json::JsonSource::capture_with_sqlite_guard(path, reads, std::sync::Arc::clone(guard))?;
         Ok(Self {
             arena: source.decoded_backing()?,
             source,
@@ -822,6 +1092,8 @@ mod tests {
         std::fs::write(&database, "owned snapshot").unwrap();
         let snapshot = ColdSnapshot {
             reads: crate::source::ReadSet::default(),
+            birth: [0; 32],
+            created_at: std::sync::Mutex::new(std::time::Instant::now()),
             directory_identity: snapshots::snapshot_identity(&directory).unwrap(),
             directory: directory.clone(),
             database,
@@ -873,11 +1145,23 @@ mod tests {
         Ok(())
     }
 
-    /// WAL frames are read through a private snapshot (reused within an operation, removed
-    /// after it) and nothing in the store directory changes, `-shm` bytes included.
+    fn expire_cached_snapshot(path: &Path) {
+        let path = std::path::absolute(path).unwrap();
+        let scope = reader_scope();
+        let cache = scope.cache.state.lock().unwrap();
+        if let Some(snapshot) = cache.retained.get(&path) {
+            *snapshot.created_at.lock().unwrap() =
+                std::time::Instant::now() - COLD_SNAPSHOT_TTL - std::time::Duration::from_secs(1);
+        }
+    }
+
+    /// Cold WAL snapshots (used under `--frozen`, missing `-shm`, or `SQLITE_BUSY`) are private,
+    /// reused within an operation, removed after it, and write nothing in the store directory
+    /// (`-shm` bytes included).
     #[test]
     fn live_wal_snapshot_is_private_reused_and_writes_nothing_in_the_store() {
         let _serial = SNAPSHOT_TEST.lock().unwrap();
+        let _frozen = crate::env::Env::current().as_ref().clone().with_frozen().enter();
         let (directory, database) = fixture();
         let writer = live_store(&database, "CREATE TABLE t(x); INSERT INTO t VALUES(7);");
         let before = super::store_state(&directory);
@@ -919,7 +1203,7 @@ mod tests {
         let _serial = SNAPSHOT_TEST.lock().unwrap();
         let (directory, database) = fixture();
         let _writer = live_store(&database, "CREATE TABLE t(x);");
-        let reader = open_ro(&database).unwrap();
+        let reader = open_cold_ro(&database).unwrap();
         let backing = std::sync::Arc::clone(reader._snapshot.as_ref().unwrap());
         let private = backing.directory.clone();
         drop(reader); // Its cache/scope are gone, but the backing retains its own owner Arc.
@@ -940,9 +1224,9 @@ mod tests {
         let scope = read_scope();
         // Model another libtest thread retaining a scope across this test's cleanup.
         let unrelated = std::thread::spawn(read_scope).join().unwrap();
-        let first = open_ro(&database).unwrap();
+        let first = open_cold_ro(&database).unwrap();
         let first_backing = first._snapshot.as_ref().unwrap().directory.clone();
-        let second = open_ro(&second_database).unwrap();
+        let second = open_cold_ro(&second_database).unwrap();
         let second_backing = second._snapshot.as_ref().unwrap().directory.clone();
         let again = open_ro_with_copy_check(&database, |_| panic!("active A snapshot duplicated")).unwrap();
         assert_eq!(again._snapshot.as_ref().unwrap().directory, first_backing);
@@ -972,9 +1256,15 @@ mod tests {
             })
             .collect();
         let scope = read_scope();
-        let first = open_ro(&database).unwrap()._snapshot.unwrap().directory.clone();
+        let first = open_cold_ro(&database)
+            .unwrap()
+            ._snapshot
+            .as_ref()
+            .unwrap()
+            .directory
+            .clone();
         for (_, other) in &others {
-            drop(open_ro(other).unwrap());
+            drop(open_cold_ro(other).unwrap());
             let again = open_ro_with_copy_check(&database, |_| panic!("an unchanged store was copied again")).unwrap();
             assert_eq!(again._snapshot.as_ref().unwrap().directory, first);
         }
@@ -990,11 +1280,12 @@ mod tests {
         let (directory, database) = fixture();
         let writer = live_store(&database, "CREATE TABLE t(x); INSERT INTO t VALUES(7);");
         let scope = read_scope();
-        let first = open_ro(&database).unwrap();
+        let first = open_cold_ro(&database).unwrap();
         let old_backing = first._snapshot.as_ref().unwrap().directory.clone();
         let old_reads = first.reads().clone();
         drop(first);
         writer.execute("UPDATE t SET x=8", []).unwrap();
+        expire_cached_snapshot(&database);
         let mut copied = false;
         let second = open_ro_with_copy_check(&database, |_| {
             copied = true;
@@ -1012,6 +1303,126 @@ mod tests {
         );
         drop(second);
         drop(scope);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn live_wal_uses_mvcc_deferred_snapshot_without_copying_db() {
+        let _serial = SNAPSHOT_TEST.lock().unwrap();
+        let (directory, database) = fixture();
+        let writer = live_store(
+            &database,
+            "CREATE TABLE t(s TEXT, x INT); INSERT INTO t VALUES('a', 7);",
+        );
+        let non_shm = |dir: &Path| -> Vec<_> {
+            super::store_state(dir)
+                .into_iter()
+                .filter(|entry| !entry.0.to_string_lossy().ends_with("-shm"))
+                .collect()
+        };
+        let before = non_shm(&directory);
+        let reader = open_ro(&database).unwrap();
+        assert!(reader._snapshot.is_none(), "live WAL should use MVCC, not ColdSnapshot");
+        assert!(!reader.is_autocommit(), "BEGIN DEFERRED must pin the WAL read mark");
+        assert_eq!(non_shm(&directory), before, ".db and -wal must be untouched");
+
+        // Concurrent writer appends to another session AND passive-checkpoints while reader holds MVCC.
+        writer
+            .execute_batch("INSERT INTO t VALUES('b', 99); PRAGMA wal_checkpoint(PASSIVE);")
+            .unwrap();
+        let seen: Vec<(String, i64)> = reader
+            .read_snapshot(|conn, _| {
+                let mut stmt = conn.prepare("SELECT s, x FROM t ORDER BY s")?;
+                let rows = stmt
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .unwrap();
+        assert_eq!(seen, vec![("a".to_string(), 7)]);
+        drop(reader);
+
+        // Next reader sees the newly committed row without copying either.
+        let next = open_ro(&database).unwrap();
+        assert!(next._snapshot.is_none());
+        let count: i64 = next
+            .read_snapshot(|conn, _| Ok(conn.query_row("SELECT count(*) FROM t", [], |r| r.get(0))?))
+            .unwrap();
+        assert_eq!(count, 2);
+        drop(next);
+        drop(writer);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn busy_or_frozen_falls_back_to_cold_snapshot_with_bounded_ttl_reuse() {
+        let _serial = SNAPSHOT_TEST.lock().unwrap();
+        let (directory, database) = fixture();
+        // 1. Genuine SQLITE_BUSY via EXCLUSIVE lock holder: falls back to ColdSnapshot and reuses
+        //    the single copy across 10 back-to-back opens within TTL.
+        let locker = Connection::open(&database).unwrap();
+        locker
+            .execute_batch(
+                "PRAGMA journal_mode=WAL; PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE; \
+                 CREATE TABLE t(x); INSERT INTO t VALUES(42); COMMIT; BEGIN EXCLUSIVE; INSERT INTO t VALUES(43);",
+            )
+            .unwrap();
+        let scope = read_scope();
+        let first = open_ro(&database).unwrap();
+        let first_dir = first
+            ._snapshot
+            .as_ref()
+            .expect("SQLITE_BUSY must snapshot")
+            .directory
+            .clone();
+        assert_eq!(
+            first
+                .read_snapshot(|c, _| Ok(c.query_row("SELECT x FROM t", [], |r| r.get::<_, i64>(0))?))
+                .unwrap(),
+            42
+        );
+        drop(first);
+        for _ in 0..10 {
+            let again = open_ro(&database).unwrap();
+            assert_eq!(
+                again._snapshot.as_ref().unwrap().directory,
+                first_dir,
+                "10 back-to-back calls under SQLITE_BUSY must reuse the TTL ColdSnapshot"
+            );
+        }
+        drop(scope);
+        drop(locker);
+        std::fs::remove_dir_all(directory).unwrap();
+
+        // 2. `--frozen` with moving `-wal`: 10 back-to-back calls reuse one snapshot within TTL.
+        let (directory, database) = fixture();
+        let _frozen = crate::env::Env::current().as_ref().clone().with_frozen().enter();
+        let writer = live_store(&database, "CREATE TABLE t(x); INSERT INTO t VALUES(0);");
+        let scope = read_scope();
+        let initial = open_ro(&database).unwrap();
+        let snap_dir = initial._snapshot.as_ref().unwrap().directory.clone();
+        drop(initial);
+        for i in 1..=10 {
+            writer.execute("INSERT INTO t VALUES(?1)", [i]).unwrap();
+            let reader = open_ro(&database).unwrap();
+            assert_eq!(
+                reader._snapshot.as_ref().unwrap().directory,
+                snap_dir,
+                "moving -wal within TTL must not copy the DB 10 times"
+            );
+        }
+        expire_cached_snapshot(&database);
+        let refreshed = open_ro(&database).unwrap();
+        assert_ne!(refreshed._snapshot.as_ref().unwrap().directory, snap_dir);
+        assert_eq!(
+            refreshed
+                .read_snapshot(|c, _| Ok(c.query_row("SELECT count(*) FROM t", [], |r| r.get::<_, i64>(0))?))
+                .unwrap(),
+            11
+        );
+        drop(refreshed);
+        drop(scope);
+        drop(writer);
         std::fs::remove_dir_all(directory).unwrap();
     }
 

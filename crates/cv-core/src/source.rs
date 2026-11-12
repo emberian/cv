@@ -810,7 +810,7 @@ pub struct Dependencies {
 /// bytes (so no SQLite header field tells them apart) and the filesystem reuses the freed inode
 /// (ext4 does; the birth time then differs). Where the filesystem keeps no birth time, device and
 /// inode alone.
-fn store_birth(path: &Path) -> [u8; 32] {
+pub(crate) fn store_birth(path: &Path) -> [u8; 32] {
     let mut out = [0u8; 32];
     let Ok(metadata) = std::fs::metadata(path) else {
         return out;

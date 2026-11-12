@@ -45,22 +45,25 @@ pub(crate) fn derived<T: Payload + Send + Sync + 'static>(
             #[cfg(test)]
             DERIVE_OPENS.with(|n| n.set(n.get() + 1));
             let reader = super::open_ro(&r.path)?;
-            let payload = reader.read(|conn, _| derive(conn, &r.path))?;
+            let payload = reader.read_snapshot(|conn, _| derive(conn, &r.path))?;
             let baseline = now.with_reads(&reader.reads);
+            let publishable = reader.reads.fresh(&mut Probe::default());
             drop(reader);
             // The existing publisher rechecks the certificate under the catalog transaction;
-            // unavailable/frozen catalogs degrade to the in-memory record without source writes.
-            context.with_connection_mut(|conn| {
-                let mut publish = || -> Result<()> {
-                    let tx = conn.transaction()?;
-                    crate::source::publish_in(&tx, T::TAG, &r, &baseline, &payload, &mut Probe::default())?;
-                    tx.commit()?;
-                    Ok(())
-                };
-                if let Err(error) = publish() {
-                    crate::env::warn_once("the SQLite forest catalog", error);
-                }
-            });
+            // unavailable/frozen catalogs or concurrent WAL writes degrade to the in-memory record.
+            if publishable {
+                context.with_connection_mut(|conn| {
+                    let mut publish = || -> Result<()> {
+                        let tx = conn.transaction()?;
+                        crate::source::publish_in(&tx, T::TAG, &r, &baseline, &payload, &mut Probe::default())?;
+                        tx.commit()?;
+                        Ok(())
+                    };
+                    if let Err(error) = publish() {
+                        crate::env::warn_once("the SQLite forest catalog", error);
+                    }
+                });
+            }
             Record::new(baseline, payload)
         }
     };

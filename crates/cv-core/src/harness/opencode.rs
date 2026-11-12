@@ -2093,9 +2093,8 @@ mod tests {
         );
     }
 
-    /// Reading a running OpenCode's store writes nothing there: discovery plus a full stream of
-    /// every session leave each file's inode, size, mtime and bytes (`-shm` included) unchanged,
-    /// both with WAL frames pending and after a checkpoint, and the WAL-only rows are read.
+    /// Reading a running OpenCode's store never modifies its database or WAL, and under `--frozen`
+    /// (or after checkpointing) leaves `-shm` byte-for-byte untouched too, while reading WAL-only rows.
     #[cfg(feature = "sqlite")]
     #[test]
     fn reading_a_live_wal_store_writes_nothing_in_it() {
@@ -2107,11 +2106,19 @@ mod tests {
         let writer = live_store(&db, "SELECT 1");
         seed_session(&writer, "ses_live", true);
         assert!(fs::metadata(dir.join("opencode.db-wal")).unwrap().len() > 0);
-        for checkpointed in [false, true] {
+        let non_shm = |d: &std::path::Path| -> Vec<_> {
+            store_state(d)
+                .into_iter()
+                .filter(|entry| !entry.0.to_string_lossy().ends_with("-shm"))
+                .collect()
+        };
+        for (frozen, checkpointed) in [(true, false), (false, false), (false, true)] {
             if checkpointed {
                 writer.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
             }
-            let before = store_state(&dir);
+            let _guard = frozen.then(|| crate::env::Env::current().as_ref().clone().with_frozen().enter());
+            let before_all = store_state(&dir);
+            let before_data = non_shm(&dir);
             let adapter = OpenCode::with_db(db.clone());
             let refs = adapter.discover().unwrap();
             assert_eq!(refs.len(), 1);
@@ -2123,7 +2130,18 @@ mod tests {
                     .iter()
                     .any(|m| m.text().as_deref() == Some("Reverted.")));
             }
-            assert_eq!(store_state(&dir), before, "checkpointed: {checkpointed}");
+            assert_eq!(
+                non_shm(&dir),
+                before_data,
+                "frozen={frozen}, checkpointed={checkpointed}"
+            );
+            if frozen || checkpointed {
+                assert_eq!(
+                    store_state(&dir),
+                    before_all,
+                    "frozen={frozen}, checkpointed={checkpointed}"
+                );
+            }
         }
         drop(writer);
     }

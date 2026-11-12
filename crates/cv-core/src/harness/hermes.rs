@@ -290,8 +290,9 @@ impl Adapter for Hermes {
         // than failing the whole scan.
         let mut out = crate::Discovered::default();
         for db in &self.dbs {
-            let refs =
-                super::store::sqlite::cached_discover(db, || open_ro(db)?.read(|conn, _| discover_conn(conn, db)));
+            let refs = super::store::sqlite::cached_discover(db, || {
+                open_ro(db)?.read_snapshot(|conn, reads| discover_conn_with_reads(conn, db, Some(reads)))
+            });
             if let Some(refs) = out.keep(db, refs) {
                 out.refs.extend(refs);
             }
@@ -324,9 +325,12 @@ impl Adapter for Hermes {
             let sink: &mut dyn MessageSink = &mut spawns;
             // Route by the ref's own DB path (set at discovery time), NOT a single self.db — this is
             // what lets one Hermes adapter span many profile DBs without id collisions.
-            super::store::sqlite::read(&r.path, |conn, reads| {
-                stream_conn_with_reads(conn, r, opts, sink, reads)
-            })
+            let session_id = r.id.clone();
+            super::store::sqlite::read_session(
+                &r.path,
+                move |conn| session_revision(conn, &session_id),
+                |conn, reads, guard| stream_conn_with_reads(conn, r, opts, sink, reads, Some(guard)),
+            )
         })
     }
 
@@ -335,14 +339,14 @@ impl Adapter for Hermes {
     fn rows(&self, store: &Path) -> Option<std::collections::HashMap<String, crate::source::Rows>> {
         open_ro(store)
             .ok()?
-            .read(|conn, _| rows_from(conn, &*walked(conn, store)?))
+            .read_snapshot(|conn, reads| rows_from(conn, &*walked(conn, store, Some(reads))?))
             .ok()
     }
 
     /// What `/goal`, `/loop` and `/heartbeat` keep in `state_meta` under `<kind>:<session id>`.
     fn store_affordances(&self, r: &SessionRef) -> anyhow::Result<Vec<crate::affordance::Affordance>> {
         let conn = open_ro(&r.path)?;
-        conn.read(|conn, _| {
+        conn.read_snapshot(|conn, _| {
             if !table_exists(conn, "state_meta") {
                 return Ok(Vec::new());
             }
@@ -385,7 +389,15 @@ fn latest_of(stamps: [Option<f64>; 3]) -> Option<DateTime<Utc>> {
 /// user-visible conversations and stay listed. An untitled compression tip takes its root's title,
 /// as Hermes's listing does (`COALESCE(tip.title, s.title)`, `hermes_state_sessions.py:1137`).
 fn discover_conn(conn: &Connection, path: &Path) -> Result<Vec<SessionRef>> {
-    Ok(refs_of(&*walked(conn, path)?, path, false)?
+    discover_conn_with_reads(conn, path, None)
+}
+
+fn discover_conn_with_reads(
+    conn: &Connection,
+    path: &Path,
+    reads: Option<&crate::source::ReadSet>,
+) -> Result<Vec<SessionRef>> {
+    Ok(refs_of(&*walked(conn, path, reads)?, path, false)?
         .into_iter()
         .map(|(_, r)| r)
         .collect())
@@ -404,15 +416,19 @@ pub fn subagent_refs(parent: &SessionRef) -> Result<Vec<SessionRef>> {
         return Ok(forests.of.get(&parent.id).cloned().unwrap_or_default());
     }
     // A session discovery does not list (a delegate run, a compression ancestor) walks its chain.
-    open_ro(&parent.path)?.read(|conn, _| {
-        anyhow::ensure!(
-            crate::source::unchanged(parent, &record.baseline),
-            "SQLite source dependencies changed or unavailable"
-        );
+    open_ro(&parent.path)?.read_snapshot(|conn, reads| {
+        if crate::source::unchanged(parent, &record.baseline) {
+            return Ok(chain_delegates(
+                &*walked(conn, &parent.path, Some(reads))?,
+                &parent.id,
+                &forests.by_parent,
+            ));
+        }
+        let fresh = forests_conn(conn, &parent.path)?;
         Ok(chain_delegates(
-            &*walked(conn, &parent.path)?,
+            &*walked(conn, &parent.path, Some(reads))?,
             &parent.id,
-            &forests.by_parent,
+            &fresh.by_parent,
         ))
     })
 }
@@ -435,7 +451,7 @@ impl crate::source::Payload for Forests {
 /// walk reads the overflow pages too; a forest fold asks for every conversation's delegates, so
 /// one walk per parent made a `--subagents` pass over a 4 GB store read ~4 GB per conversation.
 fn forests_conn(conn: &Connection, path: &Path) -> Result<Forests> {
-    let walk = walked(conn, path)?;
+    let walk = walked(conn, path, None)?;
     let mut by_parent = std::collections::HashMap::<String, Vec<SessionRef>>::new();
     for (from, r) in refs_of(&walk, path, true)? {
         by_parent.entry(from.unwrap_or_default()).or_default().push(r);
@@ -658,8 +674,9 @@ fn walk_conn(conn: &Connection) -> Result<Walk> {
 }
 
 /// The [`Walk`] of the store at `db`, once per store state (its database, WAL and journal
-/// identities) in this process. Memory: the walked rows' small columns, for the stores read.
-fn walked(conn: &Connection, db: &Path) -> Result<std::sync::Arc<Walk>> {
+/// identities) in this process. When `reads` is supplied from a pinned MVCC snapshot whose live
+/// WAL already moved on disk, the memo is bypassed so `conn` never pairs with another state's walk.
+fn walked(conn: &Connection, db: &Path, reads: Option<&crate::source::ReadSet>) -> Result<std::sync::Arc<Walk>> {
     type State = Vec<Option<crate::source::FileId>>;
     type Walks = std::sync::Mutex<std::collections::HashMap<PathBuf, (State, std::sync::Arc<Walk>)>>;
     static WALKS: std::sync::LazyLock<Walks> = std::sync::LazyLock::new(Default::default);
@@ -669,16 +686,19 @@ fn walked(conn: &Connection, db: &Path) -> Result<std::sync::Arc<Walk>> {
         files.iter().map(|f| crate::source::FileId::at(f)).collect()
     };
     let key = std::path::absolute(db)?;
+    let matches_disk = reads.is_none_or(|r| r.fresh(&mut crate::source::Probe::default()));
     let before = state();
     let lock = || WALKS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some((_, walk)) = lock().get(&key).filter(|(at, _)| *at == before) {
-        return Ok(walk.clone());
+    if matches_disk {
+        if let Some((_, walk)) = lock().get(&key).filter(|(at, _)| *at == before) {
+            return Ok(walk.clone());
+        }
     }
     #[cfg(test)]
     WALKED.with(|n| n.set(n.get() + 1));
     let walk = std::sync::Arc::new(walk_conn(conn)?);
-    // Kept only when no write landed while it walked.
-    if state() == before {
+    // Kept only when `conn`'s snapshot matches disk and no write landed while it walked.
+    if matches_disk && reads.is_none_or(|r| r.fresh(&mut crate::source::Probe::default())) && state() == before {
         lock().insert(key, (before, walk.clone()));
     }
     Ok(walk)
@@ -818,6 +838,7 @@ struct SessionFacts {
 fn read_session_facts(
     conn: &Connection,
     (path, reads): (&Path, &crate::source::ReadSet),
+    guard: Option<&std::sync::Arc<crate::json::SqliteSessionGuard>>,
     id: &str,
     source: Option<&str>,
     end_reason: Option<&str>,
@@ -899,7 +920,10 @@ fn read_session_facts(
     // dedupe; the messages themselves carry `Origin::Import` on every demand.
     let mut imported_from = None;
     if select.has("origin_json") {
-        let cells = Cells::new(conn, path, reads, "sessions")?;
+        let cells = match guard {
+            Some(guard) => Cells::for_session(conn, path, reads, guard, "sessions")?,
+            None => Cells::new(conn, path, reads, "sessions")?,
+        };
         let origin = Select::of(conn, "sessions").cell(&cells, "origin_json");
         let at = origin.index("origin_json")?;
         let sql = format!("SELECT {} FROM sessions WHERE id = ?1", origin.list());
@@ -992,29 +1016,70 @@ fn rows_from(conn: &Connection, walk: &Walk) -> Result<std::collections::HashMap
         let digest = children.entry(parent.to_owned()).or_insert(Rows::SEED);
         *digest = Rows::fold(*digest, &child.to_le_bytes());
     }
-    let flags = super::store::sqlite::columns(conn, "messages").contains("active");
-    let mut messages: HashMap<String, (u64, i64, i64)> = HashMap::new();
+    let msg_cols = super::store::sqlite::columns(conn, "messages");
+    let mut messages: HashMap<String, (u64, i64, u64)> = HashMap::new();
     {
-        let sql = if flags {
-            "SELECT session_id, count(*), max(id), total(active) FROM messages GROUP BY session_id"
-        } else {
-            "SELECT session_id, count(*), max(id), 0 FROM messages GROUP BY session_id"
-        };
-        let mut stmt = conn.prepare(sql)?;
+        let mut exprs = vec![
+            "session_id".to_string(),
+            "id".to_string(),
+            "role".to_string(),
+            "tool_call_id".to_string(),
+            "tool_name".to_string(),
+            "timestamp".to_string(),
+        ];
+        for col in [
+            "active",
+            "compacted",
+            "_compressed_summary",
+            "display_kind",
+            "finish_reason",
+            "token_count",
+            "observed",
+            "effect_disposition",
+            "platform_message_id",
+            "message_uid",
+            "tool_call_uid",
+        ] {
+            if msg_cols.contains(col) {
+                exprs.push(col.to_string());
+            }
+        }
+        for col in [
+            "content",
+            "tool_calls",
+            "reasoning",
+            "reasoning_content",
+            "reasoning_details",
+            "codex_reasoning_items",
+            "codex_message_items",
+            "api_content",
+            "display_metadata",
+            "absorbed_message_uids",
+            "tool_call_uids",
+        ] {
+            if msg_cols.contains(col) {
+                exprs.push(format!("typeof({col})"));
+                exprs.push(format!("length({col})"));
+                exprs.push(format!("substr({col}, 1, 128)"));
+            }
+        }
+        let col_count = exprs.len();
+        let sql = format!("SELECT {} FROM messages ORDER BY session_id, id", exprs.join(", "));
+        let mut stmt = conn.prepare(&sql)?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
             let Some(id) = row.get::<_, Option<String>>(0)? else {
                 continue;
             };
-            let active: f64 = row.get(3)?;
-            messages.insert(
-                id,
-                (
-                    row.get::<_, i64>(1)? as u64,
-                    row.get::<_, Option<i64>>(2)?.unwrap_or(0),
-                    active as i64,
-                ),
-            );
+            let entry = messages.entry(id).or_insert((0, 0, Rows::SEED));
+            entry.0 += 1;
+            let row_id = row.get::<_, Option<i64>>(1)?.unwrap_or(0);
+            entry.1 = entry.1.max(row_id);
+            let mut d = entry.2;
+            for i in 1..col_count {
+                d = fold_value(d, row.get_ref(i)?);
+            }
+            entry.2 = d;
         }
     }
     let mut meta_rows: HashMap<String, u64> = HashMap::new();
@@ -1050,10 +1115,10 @@ fn rows_from(conn: &Connection, walk: &Walk) -> Result<std::collections::HashMap
                 break;
             }
             let Some(meta) = sessions.get(current) else { break };
-            let (n, max, active) = messages.get(current).copied().unwrap_or_default();
+            let (n, max, msg_digest) = messages.get(current).copied().unwrap_or((0, 0, Rows::SEED));
             count += n;
             high = high.max(max);
-            for part in [meta.row, n, max as u64, active as u64] {
+            for part in [meta.row, n, max as u64, msg_digest] {
                 digest = Rows::fold(digest, &part.to_le_bytes());
             }
             if meta.marked {
@@ -1075,6 +1140,114 @@ fn rows_from(conn: &Connection, walk: &Walk) -> Result<std::collections::HashMap
         out.insert(id.clone(), Rows { count, high, digest });
     }
     Ok(out)
+}
+
+/// Exact single-session revision certificate for [`super::store::sqlite::read_session`]: folds
+/// every column of `id`'s compression-chain `sessions` rows, `system_prompts`, stopping parent
+/// `end_reason`, direct children, `state_meta` entries, and `messages` rows (`WHERE session_id = ?1`),
+/// touching zero rows of unrelated sessions in the same database.
+fn session_revision(conn: &Connection, id: &str) -> Result<crate::source::Rows> {
+    use super::store::sqlite::fold_value;
+    use crate::source::Rows;
+    let select = Select::of(conn, "sessions");
+    let has_parent = select.has("parent_session_id");
+    let has_end = select.has("end_reason");
+    let has_prompt_hash = select.has("system_prompt_hash") && table_exists(conn, "system_prompts");
+    let chain = if has_parent {
+        session_lineage_root_to_tip(conn, id, &select)
+    } else {
+        vec![id.to_string()]
+    };
+
+    let (mut count, mut high, mut digest) = (0u64, 0i64, Rows::SEED);
+    digest = Rows::fold(digest, &(chain.len() as u64).to_le_bytes());
+    for (idx, sid) in chain.iter().enumerate() {
+        digest = Rows::fold(digest, sid.as_bytes());
+        {
+            let mut stmt = conn.prepare("SELECT * FROM sessions WHERE id = ?1")?;
+            let ncols = stmt.column_count();
+            let mut rows = stmt.query([sid])?;
+            let mut found = 0u64;
+            while let Some(row) = rows.next()? {
+                found += 1;
+                for i in 0..ncols {
+                    digest = fold_value(digest, row.get_ref(i)?);
+                }
+            }
+            digest = Rows::fold(digest, &found.to_le_bytes());
+        }
+        if has_prompt_hash {
+            let prompt = conn
+                .query_row(
+                    "SELECT sp.prompt FROM sessions s JOIN system_prompts sp ON sp.hash = s.system_prompt_hash WHERE s.id = ?1",
+                    [sid],
+                    |r| r.get::<_, Option<String>>(0),
+                )
+                .ok()
+                .flatten();
+            digest = Rows::fold(digest, &[u8::from(prompt.is_some())]);
+            if let Some(p) = prompt {
+                digest = Rows::fold(digest, p.as_bytes());
+            }
+        }
+        if idx == 0 && has_parent && has_end {
+            let parent_end = conn
+                .query_row(
+                    "SELECT p.end_reason FROM sessions c JOIN sessions p ON p.id = c.parent_session_id WHERE c.id = ?1",
+                    [sid],
+                    |r| r.get::<_, Option<String>>(0),
+                )
+                .ok()
+                .flatten();
+            digest = Rows::fold(digest, &[u8::from(parent_end.is_some())]);
+            if let Some(end) = parent_end {
+                digest = Rows::fold(digest, end.as_bytes());
+            }
+        }
+        {
+            let mut stmt = conn.prepare("SELECT * FROM messages WHERE session_id = ?1 ORDER BY id ASC")?;
+            let ncols = stmt.column_count();
+            let id_col = stmt.column_names().iter().position(|&c| c == "id");
+            let mut rows = stmt.query([sid])?;
+            while let Some(row) = rows.next()? {
+                count += 1;
+                if let Some(i) = id_col {
+                    high = high.max(row.get::<_, Option<i64>>(i)?.unwrap_or(0));
+                }
+                for i in 0..ncols {
+                    digest = fold_value(digest, row.get_ref(i)?);
+                }
+            }
+        }
+    }
+    if has_parent {
+        let child_sel = Select::of(conn, "sessions")
+            .always(&["id"])
+            .probed(&["model_config", "started_at"]);
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM sessions WHERE parent_session_id = ?1 ORDER BY id ASC",
+            child_sel.list()
+        ))?;
+        let mut rows = stmt.query([id])?;
+        while let Some(row) = rows.next()? {
+            for i in 0..3 {
+                digest = fold_value(digest, row.get_ref(i)?);
+            }
+        }
+    }
+    if table_exists(conn, "state_meta") {
+        let mut stmt = conn.prepare("SELECT key, value FROM state_meta WHERE key LIKE '%:' || ?1 ORDER BY key ASC")?;
+        let mut rows = stmt.query([id])?;
+        while let Some(row) = rows.next()? {
+            let Some(key) = row.get::<_, Option<String>>(0).ok().flatten() else {
+                continue;
+            };
+            if key.split_once(':').is_some_and(|(_, k)| k == id) {
+                digest = fold_value(fold_value(digest, row.get_ref(0)?), row.get_ref(1)?);
+            }
+        }
+    }
+    Ok(Rows { count, high, digest })
 }
 
 fn compression_child(conn: &Connection, id: &str) -> Result<Option<String>> {
@@ -1104,7 +1277,7 @@ fn stream_conn(
     opts: &stream::Demand,
     sink: &mut dyn MessageSink,
 ) -> Result<Session> {
-    stream_conn_with_reads(conn, r, opts, sink, &crate::source::ReadSet::default())
+    stream_conn_with_reads(conn, r, opts, sink, &crate::source::ReadSet::default(), None)
 }
 
 fn stream_conn_with_reads(
@@ -1113,6 +1286,7 @@ fn stream_conn_with_reads(
     opts: &stream::Demand,
     sink: &mut dyn MessageSink,
     reads: &crate::source::ReadSet,
+    guard: Option<&std::sync::Arc<crate::json::SqliteSessionGuard>>,
 ) -> Result<Session> {
     // session-level metadata (guard optional columns for historical schemas).
     let select = Select::of(conn, "sessions")
@@ -1170,6 +1344,7 @@ fn stream_conn_with_reads(
     } = read_session_facts(
         conn,
         (&r.path, reads),
+        guard,
         &r.id,
         source.as_deref(),
         end_reason.as_deref(),
@@ -1247,7 +1422,10 @@ fn stream_conn_with_reads(
     // row decoder reads through `cells`. Generation identity reads `content` and
     // `_content_rowid` from the content cell's columns (the cell's type and rowid when reads are
     // incremental, the cell itself otherwise).
-    let cells = Cells::new(conn, &r.path, reads, "messages")?;
+    let cells = match guard {
+        Some(guard) => Cells::for_session(conn, &r.path, reads, guard, "messages")?,
+        None => Cells::new(conn, &r.path, reads, "messages")?,
+    };
     let incremental = super::store::sqlite::incremental_utf8_table(conn, "messages");
     let plain: Vec<&str> = OPTIONAL_MSG_COLS
         .iter()
@@ -4382,5 +4560,163 @@ mod tests {
         assert_eq!(f.messages[0].kind, MessageKind::Prompt);
         assert_eq!(f.messages[1].kind, MessageKind::Reply);
         assert_nested_extra(&f);
+    }
+
+    #[test]
+    fn fifty_concurrent_wal_writers_do_not_break_target_session_reads_or_discovery() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc, Barrier,
+        };
+        let world = crate::test_world("hermes-50-writers");
+        let db = world.base.join("state.db");
+        {
+            let seed = Connection::open(&db).unwrap();
+            seed.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
+                .unwrap();
+            seed.execute_batch(&fixture("schema-v30.sql")).unwrap();
+            insert_session(&seed, "target", None, None, 1000.0, None);
+            let large_reply = format!("target-reply-{}", "payload-".repeat(1200));
+            insert_v30(&seed, "target", "user", "pinpoint target prompt", 1001.0, 1, 0);
+            insert_v30(&seed, "target", "assistant", &large_reply, 1002.0, 1, 0);
+            for w in 0..50 {
+                insert_session(&seed, &format!("writer-{w}"), None, None, 2000.0 + w as f64, None);
+            }
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let ready = Arc::new(Barrier::new(51));
+        let mut handles = Vec::with_capacity(50);
+        for w in 0..50 {
+            let db = db.clone();
+            let stop = Arc::clone(&stop);
+            let ready = Arc::clone(&ready);
+            handles.push(std::thread::spawn(move || {
+                let conn = Connection::open(&db).unwrap();
+                conn.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
+                let sid = format!("writer-{w}");
+                ready.wait();
+                let mut turn = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    turn += 1;
+                    let _ = conn.execute(
+                        "INSERT INTO messages(session_id, role, content, timestamp, active, compacted) \
+                         VALUES(?1, 'user', ?2, ?3, 1, 0)",
+                        rusqlite::params![sid, format!("msg-{w}-{turn}"), 3000.0 + turn as f64],
+                    );
+                    if w == 0 && turn.is_multiple_of(10) {
+                        let _ = conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);");
+                    }
+                    std::thread::yield_now();
+                }
+            }));
+        }
+
+        ready.wait();
+        let adapter = Hermes::with_db(db.clone());
+        for _ in 0..15 {
+            let refs = adapter.discover().unwrap().refs;
+            let target = refs
+                .iter()
+                .find(|r| r.id == "target")
+                .expect("target session discovered");
+            let mut session = crate::stream::collect_with(&adapter, target, &stream::Demand::LEAN.with_spans())
+                .expect("reading target session under 50 concurrent WAL writers must succeed");
+            session
+                .materialize()
+                .expect("materializing lazy spans of unchanged target session must succeed");
+            assert_eq!(session.messages.len(), 2);
+            assert_eq!(session.messages[0].text().as_deref(), Some("pinpoint target prompt"));
+            assert!(session.messages[1]
+                .text()
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("target-reply-"));
+            assert!(adapter.rows(&db).is_some());
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        for h in handles {
+            h.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn session_revision_detects_update_only_compaction_and_isolates_per_session() {
+        let world = crate::test_world("hermes-revision-honesty");
+        let db = world.base.join("state.db");
+        let writer = Connection::open(&db).unwrap();
+        writer
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+            .unwrap();
+        writer.execute_batch(&fixture("schema-v30.sql")).unwrap();
+        insert_session(&writer, "target", None, None, 1000.0, None);
+        insert_session(&writer, "other", None, None, 1000.0, None);
+        // Two rows in `target`: row 1 active=1, row 2 active=0 -> total(active) == 1.
+        insert_v30(&writer, "target", "user", "first prompt", 1001.0, 1, 0);
+        insert_v30(&writer, "target", "assistant", "draft reply", 1002.0, 0, 0);
+        insert_v30(&writer, "other", "user", "unrelated", 1003.0, 1, 0);
+
+        let before = rows_conn(&writer).unwrap();
+        // Balanced UPDATE-only compaction swap: count(*), max(id), and total(active) all stay
+        // identical (2 rows, same ids, total(active) == 1), yet visible history changes!
+        writer
+            .execute_batch(
+                "UPDATE messages SET active = 0, compacted = 1 WHERE session_id = 'target' AND role = 'user'; \
+                 UPDATE messages SET active = 1, _compressed_summary = 1 WHERE session_id = 'target' AND role = 'assistant';",
+            )
+            .unwrap();
+        let after = rows_conn(&writer).unwrap();
+        assert_ne!(
+            after["target"], before["target"],
+            "UPDATE-only compaction must move target's certificate even when count(*), max(id) and total(active) match"
+        );
+        assert_eq!(
+            after["other"], before["other"],
+            "unrelated session certificate must stay stable"
+        );
+
+        // Mid-stream write to `other` succeeds, while mid-stream UPDATE on `target` is rejected.
+        let adapter = Hermes::with_db(db.clone());
+        let refs = adapter.discover().unwrap().refs;
+        let target_ref = refs.iter().find(|r| r.id == "target").unwrap();
+
+        struct OtherWriter<'a>(&'a Connection);
+        impl MessageSink for OtherWriter<'_> {
+            fn meta(&mut self, _: &Session) {
+                self.0
+                    .execute(
+                        "INSERT INTO messages(session_id, role, content, timestamp, active, compacted) \
+                         VALUES('other', 'assistant', 'concurrent other write', 2000.0, 1, 0)",
+                        [],
+                    )
+                    .unwrap();
+            }
+            fn message(&mut self, _: Message) -> Flow {
+                Flow::Continue
+            }
+        }
+        adapter
+            .stream(target_ref, &stream::Demand::LEAN, &mut OtherWriter(&writer))
+            .expect("concurrent write to another session must not fail target stream");
+
+        struct TargetMutator<'a>(&'a Connection);
+        impl MessageSink for TargetMutator<'_> {
+            fn meta(&mut self, _: &Session) {
+                self.0
+                    .execute(
+                        "UPDATE messages SET compacted = 0 WHERE session_id = 'target' AND role = 'user'",
+                        [],
+                    )
+                    .unwrap();
+            }
+            fn message(&mut self, _: Message) -> Flow {
+                Flow::Continue
+            }
+        }
+        let err = adapter
+            .stream(target_ref, &stream::Demand::LEAN, &mut TargetMutator(&writer))
+            .unwrap_err();
+        assert!(err.to_string().contains("dependencies changed"), "{err:#}");
     }
 }
