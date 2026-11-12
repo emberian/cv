@@ -115,7 +115,10 @@ export function truncate(s, max) {
 
 /** Message count that works for hydrated sessions and metadata-only stubs (`/api/sessions`). */
 export function msgCount(session) {
-  return session.messages?.length || session.message_count || 0;
+  // Always a non-negative integer: rows come from other machines too (a fleet peer's
+  // `/api/sessions`), and callers interpolate the count into HTML.
+  const n = Number(session.messages?.length || session.message_count || 0);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
 }
 
 /** Harness pill as a plain HTML string — same markup/styling as <cv-harness-badge> but with NO

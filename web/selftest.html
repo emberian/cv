@@ -63,7 +63,7 @@
 import {
   normalizeSession, normalizeSessions, searchableText, sessionLabel, sumTokens,
   toOpenSession, toMarkdown, harnessExtra, MESSAGE_KINDS, HARNESS_LABELS, sanitizeHarness,
-  fmtCost, sessionKey,
+  fmtCost, sessionKey, msgCount,
 } from "./components/util.js";
 import {
   getAuthToken, setAuthToken, authHeaders, registerWasmStore,
@@ -589,6 +589,14 @@ check("with a daemon it promises message text, and offers best-match + meaning",
   const opts = [...el.querySelectorAll(".sort option")].map((o) => o.value);
   eq(opts[0], "relevance", "best match is offered first");
   truthy(el.querySelector(".chip[data-semantic]"), "the semantic toggle appears only here");
+});
+
+check("a message count from another machine is a number before it reaches HTML", () => {
+  eq(msgCount({ message_count: '<img src=x onerror="window.__pwned=1">' }), 0, "markup is not a count");
+  eq(msgCount({ message_count: "12" }), 12, "numeric strings coerce");
+  eq(msgCount({ message_count: -3 }), 0, "never negative");
+  eq(msgCount({ message_count: 4.9 }), 4, "an integer");
+  eq(msgCount({ messages: [1, 2, 3], message_count: 99 }), 3, "loaded messages win");
 });
 
 check("server mode needs a provider — the label can never outrun the capability", () => {
