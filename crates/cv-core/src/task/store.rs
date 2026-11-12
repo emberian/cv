@@ -154,6 +154,18 @@ impl TaskStore {
         self.dir.join("events.lock")
     }
 
+    /// Authoritative `state.db` backing this task store (`$CLUSTERVISION_HOME/state.db` when rooted
+    /// at `<home>/tasks`, or `<dir>/state.db` for standalone directories).
+    #[cfg(feature = "sqlite")]
+    pub fn state_store(&self) -> crate::state::StateStore {
+        if self.dir.file_name().and_then(|n| n.to_str()) == Some("tasks") {
+            if let Some(parent) = self.dir.parent().filter(|p| !p.as_os_str().is_empty()) {
+                return crate::state::StateStore::at(parent.join("state.db"));
+            }
+        }
+        crate::state::StateStore::at(self.dir.join("state.db"))
+    }
+
     /// Replay without holding the lock. Readers may see a completed prefix of a concurrent
     /// batch and ignore an incomplete final record; this is not an atomic snapshot of a batch.
     ///
@@ -188,7 +200,8 @@ impl TaskStore {
     /// are read and reduced. What the prompt hook and every mutation's target lookup ask.
     pub fn fold(&self) -> Result<Folded> {
         let path = self.events_path();
-        let start = Fold::stored(&path);
+        let state = self.state_store_for_fold();
+        let start = Fold::stored(&path, state.as_ref());
         let from = start.as_ref().map(Fold::boundary).unwrap_or_default();
         let (mut reducer, mut garbage, mut refused) = match start {
             Some(fold) => (
@@ -219,7 +232,7 @@ impl TaskStore {
         }
         if let Some(((model, applied), refused, garbage)) = snapshot {
             Fold {
-                version: crate::source::VERSION,
+                version: STATE_FOLD_VERSION,
                 offset: committed.offset,
                 lines: committed.lines,
                 model,
@@ -227,7 +240,7 @@ impl TaskStore {
                 garbage,
                 refused,
             }
-            .store(&path);
+            .store(&path, state.as_ref());
         }
         garbage.extend(new_garbage);
         let quarantined = refused.len();
@@ -276,7 +289,9 @@ impl TaskStore {
 
         // Replay under the lock: the candidate is validated against the exact state it will
         // land after. A clean stored fold stands for the log's prefix; only what follows is read.
-        let start = Fold::stored(&self.events_path()).filter(|fold| fold.garbage.is_empty() && fold.refused.is_empty());
+        let state_ref = self.state_store_for_fold();
+        let start = Fold::stored(&self.events_path(), state_ref.as_ref())
+            .filter(|fold| fold.garbage.is_empty() && fold.refused.is_empty());
         let read = self.read_events_from(start.as_ref().map(Fold::boundary).unwrap_or_default())?;
         let tail = read.tail;
         if let LogTail::Unrecognized { line_no } = tail {
@@ -298,8 +313,8 @@ impl TaskStore {
             Some(fold) => TaskReducer::resume(fold.model, fold.applied),
             None => TaskReducer::new(),
         };
-        for (line_no, ev) in read.events {
-            reducer.apply(&ev).map_err(|e| {
+        for (line_no, ev) in &read.events {
+            reducer.apply(ev).map_err(|e| {
                 anyhow::anyhow!(
                     "refusing to append: task log {} line {line_no} fails replay ({e}) — an \
                      incomplete model must not be written against",
@@ -314,6 +329,38 @@ impl TaskStore {
                 .admit(event)
                 .and_then(|()| reducer.apply(event))
                 .map_err(|e| anyhow::anyhow!("event rejected: {e}"))?;
+        }
+
+        // Persist authoritative rows inside `state.db` (`task_events`) under `BEGIN IMMEDIATE` +
+        // `synchronous=FULL` before updating the companion JSONL stream.
+        #[cfg(feature = "sqlite")]
+        {
+            let state = self.state_store();
+            let mut conn = state
+                .open_writable()
+                .with_context(|| format!("opening authoritative state.db at {}", state.path().display()))?;
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .context("starting state.db task_events transaction")?;
+            for (_, prior) in &read.events {
+                let raw_json = serde_json::to_string(prior).context("serializing prior task event")?;
+                tx.execute(
+                    "INSERT INTO task_events(event_id, task_id, ts, by_actor, raw_json)
+                     VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT(event_id) DO NOTHING",
+                    rusqlite::params![prior.id, prior.task_id, prior.ts.to_rfc3339(), prior.by, raw_json],
+                )?;
+            }
+            for event in &events {
+                let raw_json = serde_json::to_string(event).context("serializing task event")?;
+                tx.execute(
+                    "INSERT INTO task_events(event_id, task_id, ts, by_actor, raw_json)
+                     VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT(event_id) DO NOTHING",
+                    rusqlite::params![event.id, event.task_id, event.ts.to_rfc3339(), event.by, raw_json],
+                )?;
+            }
+            tx.commit().context("committing task_events to state.db")?;
         }
 
         // First append to a fresh log stamps the format header (older, header-less logs stay
@@ -344,12 +391,22 @@ impl TaskStore {
         }
         f.write_all(&line)
             .with_context(|| format!("appending to task log {}", self.events_path().display()))?;
-        f.flush()
-            .with_context(|| format!("flushing task log {}", self.events_path().display()))?;
+        f.sync_data()
+            .with_context(|| format!("syncing task log {}", self.events_path().display()))?;
         Ok(Committed {
             events,
             model: reducer.into_model(),
         })
+    }
+
+    #[cfg(feature = "sqlite")]
+    fn state_store_for_fold(&self) -> Option<crate::state::StateStore> {
+        Some(self.state_store())
+    }
+
+    #[cfg(not(feature = "sqlite"))]
+    fn state_store_for_fold(&self) -> Option<()> {
+        None
     }
 
     /// Read raw events as [`RawRead`]. Interior unparseable lines are collected as warnings,
@@ -368,12 +425,18 @@ impl TaskStore {
         let mut file = match File::open(&path) {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                #[cfg(feature = "sqlite")]
+                if from.offset == 0 {
+                    if let Some(db_read) = self.read_events_from_state_db()? {
+                        return Ok(db_read);
+                    }
+                }
                 return Ok(RawRead {
                     events: Vec::new(),
                     warnings: Vec::new(),
                     tail: LogTail::Terminated,
                     committed: Committed0::default(),
-                })
+                });
             }
             Err(e) => return Err(e).with_context(|| format!("opening task log {}", path.display())),
         };
@@ -503,6 +566,47 @@ impl TaskStore {
             committed,
         })
     }
+
+    #[cfg(feature = "sqlite")]
+    fn read_events_from_state_db(&self) -> Result<Option<RawRead>> {
+        let state = self.state_store();
+        let Some(conn) = state
+            .open_readonly()
+            .with_context(|| format!("opening authoritative state.db at {}", state.path().display()))?
+        else {
+            return Ok(None);
+        };
+        let mut stmt = conn.prepare("SELECT seq, raw_json FROM task_events ORDER BY seq ASC")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        let mut events = Vec::new();
+        let mut warnings = Vec::new();
+        for row in rows {
+            let (seq, raw_json) = row?;
+            #[cfg(test)]
+            PARSED.with(|n| n.set(n.get() + 1));
+            match serde_json::from_str::<TaskEvent>(&raw_json) {
+                Ok(ev) => events.push((seq as usize, ev)),
+                Err(_) => {
+                    let snippet: String = raw_json.chars().take(80).collect();
+                    warnings.push(format!(
+                        "task store {}: row {} is not a valid event: {}",
+                        state.path().display(),
+                        seq,
+                        snippet
+                    ));
+                }
+            }
+        }
+        if events.is_empty() && warnings.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(RawRead {
+            events,
+            warnings,
+            tail: LogTail::Terminated,
+            committed: Committed0::default(),
+        }))
+    }
 }
 
 /// The warning a replay gives for an event the reducer refused.
@@ -528,6 +632,8 @@ pub struct Folded {
 /// as a `task-fold` record keyed by the log's path, and admitted only while the log is the same
 /// file, at least `offset` long, its prefix sampling as it did ([`crate::source::Prefix`]: an
 /// edit outside the samples is not seen, the limit every resume mark has).
+const STATE_FOLD_VERSION: u32 = 1;
+
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Fold {
     version: u32,
@@ -542,12 +648,10 @@ struct Fold {
 #[cfg(feature = "sqlite")]
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Stored {
+    path: String,
     prefix: crate::source::Prefix,
     fold: Fold,
 }
-
-#[cfg(feature = "sqlite")]
-const FOLD_CONSUMER: &str = "task-fold";
 
 impl Fold {
     fn boundary(&self) -> Committed0 {
@@ -560,54 +664,68 @@ impl Fold {
     }
 
     #[cfg(feature = "sqlite")]
-    fn stored(path: &Path) -> Option<Fold> {
-        let conn = crate::catalog::open_db()?;
-        let bytes: Vec<u8> = conn
-            .query_row(
-                "SELECT record FROM source_dependencies WHERE consumer=?1 AND harness='' AND id='' AND path=?2",
-                rusqlite::params![FOLD_CONSUMER, path.to_string_lossy()],
-                |row| row.get(0),
-            )
+    fn stored(path: &Path, state: Option<&crate::state::StateStore>) -> Option<Fold> {
+        let conn = state?.open_readonly().ok()??;
+        let raw: String = conn
+            .query_row("SELECT model_json FROM task_folds WHERE slot = 1", [], |row| row.get(0))
             .ok()?;
-        let Stored { prefix, fold } = serde_json::from_slice(&bytes).ok()?;
-        (fold.version == crate::source::VERSION && prefix.len == fold.offset && prefix.holds(path)).then_some(fold)
+        let Stored {
+            path: stored_path,
+            prefix,
+            fold,
+        } = serde_json::from_str(&raw).ok()?;
+        (fold.version == STATE_FOLD_VERSION
+            && stored_path == path.to_string_lossy()
+            && prefix.len == fold.offset
+            && prefix.holds(path))
+        .then_some(fold)
     }
 
     #[cfg(not(feature = "sqlite"))]
-    fn stored(_path: &Path) -> Option<Fold> {
+    fn stored(_path: &Path, _state: Option<&()>) -> Option<Fold> {
         None
     }
 
-    /// Best effort: a fold that cannot be kept is taken again by the next command.
+    /// Best effort: persisted inside `state.db` (`task_folds`), independent of `catalog.db` and
+    /// `source::VERSION`, and skipped completely under `--frozen`.
     #[cfg(feature = "sqlite")]
-    fn store(self, path: &Path) {
+    fn store(self, path: &Path, state: Option<&crate::state::StateStore>) {
         if crate::env::frozen() {
             return;
         }
+        let Some(state) = state else { return };
         let Some(prefix) = File::open(path)
             .ok()
             .and_then(|file| crate::source::Prefix::of(&file, self.offset))
         else {
             return;
         };
-        let stored = Stored { prefix, fold: self };
-        let Ok(bytes) = serde_json::to_vec(&stored) else { return };
-        // A state that does not come back equal from its own bytes is never kept.
-        let same = serde_json::from_slice::<Stored>(&bytes)
-            .is_ok_and(|back| back.fold.model == stored.fold.model && back.fold.applied == stored.fold.applied);
-        let Some(conn) = crate::catalog::open_db().filter(|_| same) else {
+        let upto_seq = self.applied.len() as i64;
+        let stored = Stored {
+            path: path.to_string_lossy().into_owned(),
+            prefix,
+            fold: self,
+        };
+        let Ok(raw) = serde_json::to_string(&stored) else {
             return;
         };
+        let same = serde_json::from_str::<Stored>(&raw)
+            .is_ok_and(|back| back.fold.model == stored.fold.model && back.fold.applied == stored.fold.applied);
+        if !same {
+            return;
+        }
+        let Ok(conn) = state.open_writable() else { return };
         if let Err(error) = conn.execute(
-            "INSERT OR REPLACE INTO source_dependencies(consumer,harness,id,path,record) VALUES(?1,'','',?2,?3)",
-            rusqlite::params![FOLD_CONSUMER, path.to_string_lossy(), bytes],
+            "INSERT OR REPLACE INTO task_folds(slot, upto_seq, model_json, applied_json, garbage_json, refused_json)
+             VALUES (1, ?1, ?2, '{}', '[]', '[]')",
+            rusqlite::params![upto_seq, raw],
         ) {
-            crate::env::warn_once("the task log's fold", error);
+            crate::env::warn_once("the task store's fold", error);
         }
     }
 
     #[cfg(not(feature = "sqlite"))]
-    fn store(self, _path: &Path) {}
+    fn store(self, _path: &Path, _state: Option<&()>) {}
 }
 
 /// If `line` is a log-format header record, its declared version (`v` missing reads as 0, which
@@ -1128,6 +1246,7 @@ mod tests {
         assert_eq!(replay.model.tasks[&task].state, TaskState::Claimed);
     }
 
+    #[cfg(feature = "sqlite")]
     #[test]
     fn a_fold_reads_only_the_events_after_its_mark_and_equals_a_replay() {
         let _world = crate::test_world("task-fold");
@@ -1378,5 +1497,55 @@ mod tests {
             TaskReducer::reduce(&outcome.events).unwrap(),
             "replay parity"
         );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn state_db_backs_tasks_survives_jsonl_removal_and_honors_frozen() {
+        let base = std::env::temp_dir().join(format!("cv-task-statedb-{}", uuid::Uuid::now_v7()));
+        let tasks_dir = base.join("tasks");
+        let store = TaskStore::at(&tasks_dir);
+        assert_eq!(store.state_store().path(), base.join("state.db"));
+
+        // Under `--frozen` on a fresh missing directory, `replay()` and `fold()` succeed with zero
+        // filesystem writes, while `append_agent_event` fails closed.
+        {
+            let _frozen = crate::env::Env::from_vars([("CV_FROZEN", "1")]).enter();
+            assert!(store.replay().unwrap().events.is_empty());
+            assert!(store.fold().unwrap().model.tasks.is_empty());
+            assert!(!base.exists(), "read-only frozen calls must not create directories");
+            assert!(store
+                .append_agent_event(new_event(None, "agent:a", open_kind()))
+                .is_err());
+        }
+
+        let task_id = open_task(&store);
+        store
+            .append_agent_event(new_event(
+                Some(&task_id),
+                "agent:worker",
+                TaskEventKind::Claimed {
+                    assignee: "agent:worker".into(),
+                },
+            ))
+            .unwrap();
+        assert!(base.join("state.db").exists());
+
+        // Even if `events.jsonl` is absent, authoritative `state.db` (`task_events`) replays cleanly!
+        fs::remove_file(store.events_path()).unwrap();
+        let outcome = store.replay().unwrap();
+        assert_eq!(outcome.events.len(), 2);
+        assert_eq!(outcome.model.tasks[&task_id].state, TaskState::Claimed);
+
+        // Frozen reads over an existing `state.db` also succeed without mutating disk.
+        {
+            let _frozen = crate::env::Env::from_vars([("CV_FROZEN", "1")]).enter();
+            assert_eq!(store.fold().unwrap().model.tasks[&task_id].state, TaskState::Claimed);
+            assert!(store
+                .append_agent_event(new_event(Some(&task_id), "agent:worker", TaskEventKind::Released {}))
+                .is_err());
+        }
+
+        fs::remove_dir_all(&base).ok();
     }
 }

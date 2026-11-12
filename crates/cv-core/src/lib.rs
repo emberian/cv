@@ -58,6 +58,8 @@ pub mod scan;
 pub mod source;
 pub(crate) mod spill;
 pub mod splice;
+#[cfg(feature = "sqlite")]
+pub mod state;
 pub mod stats;
 pub mod stream;
 pub mod task;
