@@ -1,6 +1,13 @@
 # Changelog
 
 ## Unreleased
+- `--frozen` reads of `state.db` no longer create `state.db-wal`/`-shm`; a retained WAL without `-shm` is read from a private folded copy.
+- `[privacy]`/`[replication]` scrubbing and `--redact` now cover file and image block references; `$HOME` rewriting catches homes after any delimiter (backticks, `<`, `file://`).
+- `/api/stream` cursors are `<gen>:<offset>`: a cursor from another server run gets an immediate `reset`, and a follower learns every kind it missed.
+- `cv serve` pages send `X-Frame-Options: DENY`, `frame-ancestors 'none'` and `nosniff`, so the inbox's decision buttons cannot be clickjacked.
+- Fleet hub ingest refuses an event whose declared digest does not match its content (400); a frozen hub refuses pack uploads before staging.
+- Dashboard: removed the leftover "search by meaning" toggle (semantic search left in 0.19); message counts from fleet peers are coerced to numbers.
+- The `state.db` recorder's socket owner reads large and slow request frames on macOS instead of dropping them.
 - `cv index --if-changed` (`fts::pass_needed`) skips the index sweep when a stat-only probe shows no session or sub-agent drift.
 - Search's live-read budget defaults from `$CV_LIVE_BYTES` (`<bytes>` or `all`), then config `[search] live_bytes`; `--live-bytes` overrides, and the footer names the source.
 - `cv show`, `cv export`, and `/api/session/{h}/{id}/messages` accept `--around ID` (`id:<raw>` for numeric IDs) as well as message indices, composing with `--kind`.
