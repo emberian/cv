@@ -446,6 +446,29 @@ mod checked_tests {
             Block::Image { media_type: Some(m), data_ref: Some(r) } if m == "image/png" && *r == data_uri
         )));
 
+        // Rehoming a parsed `.jsonl` Gemini session into a fresh `out_dir` via `emit(...)` preserves `.jsonl`.
+        let rehome_runtime = world.base.join("gemini-rehomed-runtime");
+        let rehome_tmp = rehome_runtime.join("tmp");
+        let rehome_res = super::emit(
+            &gem_back,
+            &rehome_tmp,
+            &EmitOptions {
+                new_id: Some("gem-rehomed-1".into()),
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(
+            rehome_res.path.extension().and_then(|e| e.to_str()),
+            Some("jsonl"),
+            "rehoming a .jsonl Gemini session into a fresh out_dir must keep .jsonl: {}",
+            rehome_res.path.display()
+        );
+        let rehome_gem = Gemini::with_home(&rehome_runtime);
+        let rehome_refs = rehome_gem.discover()?;
+        assert_eq!(rehome_refs.len(), 1);
+        let rehome_back = rehome_gem.parse(&rehome_refs[0])?;
+        assert_eq!(rehome_back.messages.len(), gem_back.messages.len());
+
         // 2. Qwen 0.25 `.jsonl` round-trip + Discovery skips base64 allocation
         let qwen_home = world.base.join("qwen-home");
         let qwen_res = crate::emit::emit(

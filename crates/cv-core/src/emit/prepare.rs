@@ -404,12 +404,31 @@ mod tests {
         ];
         let normalized = |path: &Path| -> Result<Vec<u8>> {
             let mut raw = fs::read(path)?;
-            let value: Value = serde_json::from_slice(&raw)?;
-            for message in value["messages"].as_array().unwrap() {
-                let id = message["id"].as_str().unwrap();
-                anyhow::ensure!(uuid::Uuid::parse_str(id).is_ok(), "expected generated message UUID");
-                let text = String::from_utf8(raw)?;
-                raw = text.replace(id, "GENERATED-MESSAGE-ID").into_bytes();
+            if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+                let mut text = String::from_utf8(raw)?;
+                let ids: Vec<String> = text
+                    .lines()
+                    .skip(1)
+                    .filter(|l| !l.trim().is_empty())
+                    .map(|line| -> Result<String> {
+                        let message: Value = serde_json::from_str(line)?;
+                        let id = message["id"].as_str().unwrap();
+                        anyhow::ensure!(uuid::Uuid::parse_str(id).is_ok(), "expected generated message UUID");
+                        Ok(id.to_string())
+                    })
+                    .collect::<Result<_>>()?;
+                for id in ids {
+                    text = text.replace(&id, "GENERATED-MESSAGE-ID");
+                }
+                raw = text.into_bytes();
+            } else {
+                let value: Value = serde_json::from_slice(&raw)?;
+                for message in value["messages"].as_array().unwrap() {
+                    let id = message["id"].as_str().unwrap();
+                    anyhow::ensure!(uuid::Uuid::parse_str(id).is_ok(), "expected generated message UUID");
+                    let text = String::from_utf8(raw)?;
+                    raw = text.replace(id, "GENERATED-MESSAGE-ID").into_bytes();
+                }
             }
             Ok(raw)
         };

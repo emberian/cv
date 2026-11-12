@@ -296,6 +296,16 @@ fn target_prefers_jsonl(session: &Session, out_dir: &Path, chats: &Path, new_id:
     {
         return true;
     }
+    if session.harness == Harness::Gemini
+        && session
+            .source_path
+            .as_deref()
+            .and_then(|p| p.extension())
+            .and_then(|e| e.to_str())
+            == Some("jsonl")
+    {
+        return true;
+    }
     if chats.join(format!("session-{new_id}.jsonl")).is_file() {
         return true;
     }
