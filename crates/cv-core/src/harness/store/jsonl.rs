@@ -427,10 +427,30 @@ fn lines(
     to: u64,
     mut visit: impl FnMut(Line<'_>) -> anyhow::Result<crate::stream::Flow>,
 ) -> anyhow::Result<()> {
+    if decoded.is_none() {
+        return crate::io_admission::IoAdmission::global().admit_path(source.path(), || {
+            lines_inner(source, file, decoded, from, to, &mut visit)
+        });
+    }
+    lines_inner(source, file, decoded, from, to, &mut visit)
+}
+
+fn lines_inner(
+    source: &crate::json::JsonSource,
+    file: &File,
+    decoded: Decoded<'_>,
+    from: u64,
+    to: u64,
+    mut visit: impl FnMut(Line<'_>) -> anyhow::Result<crate::stream::Flow>,
+) -> anyhow::Result<()> {
     use crate::stream::Flow;
     #[cfg(feature = "mmap")]
-    if let Some(mapped) = mapped_lines(source, file, decoded, from, to, &mut visit) {
-        return mapped;
+    if decoded.is_some()
+        || crate::io_admission::byte_source_policy(source.path()) == crate::io_admission::ByteSourcePolicy::Mapped
+    {
+        if let Some(mapped) = mapped_lines(source, file, decoded, from, to, &mut visit) {
+            return mapped;
+        }
     }
     let mut frames = ranges::records(
         file,
@@ -611,7 +631,6 @@ fn mapped_lines(
 pub(crate) struct Records<'s> {
     source: &'s crate::json::JsonSource,
     file: &'s File,
-    #[cfg(not(feature = "mmap"))]
     context: Option<document::range::RangeSource<'static>>,
     buffer: Vec<u8>,
 }
@@ -621,7 +640,6 @@ impl<'s> Records<'s> {
         Self {
             source,
             file,
-            #[cfg(not(feature = "mmap"))]
             context: None,
             buffer: Vec::new(),
         }
@@ -650,14 +668,15 @@ impl<'s> Records<'s> {
         if len <= MAPPED_RECORD {
             self.buffer.resize(len as usize, 0);
             ranges::read_exact_at(self.file, &mut self.buffer, at)?;
-            let text = std::str::from_utf8(&self.buffer).map_err(|_| crate::json::InvalidJson)?;
+            let text = simdutf8::basic::from_utf8(&self.buffer).map_err(|_| crate::json::InvalidJson)?;
             return self.source.read(ReadInput::Record(at, text, None), validation, f);
         }
-        // Only giant reads remain: a mapped build takes them from one mapping, a positioned
-        // build leaves them in place as a positioned view.
+        // Only giant reads remain: local sealed immutable files map for this read alone when
+        // `mmap` is enabled; mutable external transcripts always read via positioned buffers.
         #[cfg(feature = "mmap")]
+        if crate::io_admission::byte_source_policy(self.source.path()) == crate::io_admission::ByteSourcePolicy::Mapped
         {
-            // SAFETY: a read-only mapping of the checked descriptor, dropped with this read.
+            // SAFETY: a read-only mapping of a local sealed immutable file, dropped with this read.
             let map = unsafe {
                 memmap2::MmapOptions::new()
                     .offset(at)
@@ -666,18 +685,15 @@ impl<'s> Records<'s> {
             };
             #[cfg(test)]
             note_mapped(map.len());
-            let text = std::str::from_utf8(&map).map_err(|_| crate::json::InvalidJson)?;
-            self.source.read(ReadInput::Record(at, text, None), validation, f)
+            let text = simdutf8::basic::from_utf8(&map).map_err(|_| crate::json::InvalidJson)?;
+            return self.source.read(ReadInput::Record(at, text, None), validation, f);
         }
-        #[cfg(not(feature = "mmap"))]
-        {
-            if self.context.is_none() {
-                self.context = Some(document::range::RangeSource::from_captured(self.source.clone())?);
-            }
-            let context = self.context.as_ref().expect("context was just made");
-            self.source
-                .read(ReadInput::Positioned(context, at, len, None), validation, f)
+        if self.context.is_none() {
+            self.context = Some(document::range::RangeSource::from_captured(self.source.clone())?);
         }
+        let context = self.context.as_ref().expect("context was just made");
+        self.source
+            .read(ReadInput::Positioned(context, at, len, None), validation, f)
     }
 }
 
@@ -695,7 +711,7 @@ fn in_memory(
     let trimmed = super::json::trim(&bytes[lead..]);
     let at = start + lead as u64;
     let blank = trimmed.is_empty();
-    if let Some(text) = (!blank).then(|| std::str::from_utf8(trimmed).ok()).flatten() {
+    if let Some(text) = (!blank).then(|| simdutf8::basic::from_utf8(trimmed).ok()).flatten() {
         let mut visited = false;
         let mut view = |view: crate::json::JsonView<'_>| {
             visited = true;

@@ -57,7 +57,7 @@ impl Chunks {
             }
         }
         while !bytes.is_empty() {
-            match std::str::from_utf8(bytes) {
+            match simdutf8::compat::from_utf8(bytes) {
                 Ok(text) => {
                     f(text)?;
                     break;
@@ -65,7 +65,8 @@ impl Chunks {
                 Err(error) => {
                     let valid = error.valid_up_to();
                     if valid > 0 {
-                        f(std::str::from_utf8(&bytes[..valid]).expect("validated prefix"))?;
+                        // SAFETY: `simdutf8::compat::from_utf8` verified `bytes[..valid]` is valid UTF-8.
+                        f(unsafe { std::str::from_utf8_unchecked(&bytes[..valid]) })?;
                     }
                     match error.error_len() {
                         Some(invalid) => {
@@ -163,6 +164,31 @@ mod tests {
                     }
                 }
             }
+        }
+
+        // Exercise >64-byte SIMD lanes in `simdutf8::compat` across multi-byte UTF-8 and invalid sequences.
+        let mut long = "ascii-prefix-0123456789-abcdefghijklmnopqrstuvwxyz-0123456789-λ雪🦀"
+            .as_bytes()
+            .to_vec();
+        long.extend_from_slice(b"\xf0\x9f\xa6\xff\xe2\x82\xac-tail-0123456789-abcdefghijklmnopqrstuvwxyz-end");
+        let expected_long = String::from_utf8_lossy(&long);
+        for split in [0, 1, 63, 64, 65, 68, 69, 70, 74, 75, 76, long.len()] {
+            let mut out = String::new();
+            let mut push = |s: &str| -> Result<(), ()> {
+                out.push_str(s);
+                Ok(())
+            };
+            let mut chunks = Chunks::new(Verdict::Replace);
+            assert!(chunks.feed(&long[..split], &mut push).unwrap());
+            assert!(chunks.feed(&long[split..], &mut push).unwrap());
+            assert!(chunks.finish(&mut push).unwrap());
+            assert_eq!(out, expected_long, "long split {split}");
+
+            let mut reject = Chunks::new(Verdict::Reject);
+            let ok = reject.feed(&long[..split], &mut |_| Ok::<_, ()>(())).unwrap()
+                && reject.feed(&long[split..], &mut |_| Ok::<_, ()>(())).unwrap()
+                && reject.finish(&mut |_| Ok::<_, ()>(())).unwrap();
+            assert!(!ok, "long invalid must reject at split {split}");
         }
     }
 }

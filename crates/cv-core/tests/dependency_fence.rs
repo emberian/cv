@@ -28,6 +28,8 @@ fn manifest_dir() -> PathBuf {
 /// dependency, never by reflex.
 const DEPENDENCY_ALLOWLIST: &[&str] = &[
     "anyhow",
+    // Pure-Rust BLAKE3 digests for sealed multi-record packs; deterministic and C-free on wasm32/i686.
+    "blake3",
     "chrono",
     "dirs",
     "fs4",
@@ -43,6 +45,8 @@ const DEPENDENCY_ALLOWLIST: &[&str] = &[
     "ruzstd",
     "serde",
     "serde_json",
+    // Pure-Rust vectorized UTF-8 validation; portable fallback on non-simd wasm32/i686.
+    "simdutf8",
     "thiserror",
     "toml",
     "uuid",

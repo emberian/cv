@@ -12,27 +12,57 @@
 
 use std::borrow::Cow;
 
+/// Whether `c` is a Unicode Bidirectional Format (`Cf`) Trojan-Source spoofing codepoint:
+/// directional embeddings/overrides/PDF (`U+202A..=U+202E`) and directional isolates (`U+2066..=U+2069`).
+#[inline]
+pub fn is_bidi_control(c: char) -> bool {
+    matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+}
+
+#[inline]
+fn needs_sanitizing(c: char) -> bool {
+    c.is_control() || is_bidi_control(c)
+}
+
 /// Make `s` safe for a one-line terminal row: ESC/C1-initiated sequences (CSI, OSC, DCS, SOS, PM,
 /// APC) are dropped entirely (parameters and all), each `\n`/`\t`/`\r` becomes one space (render
-/// sites are one-line rows), and every other control character (C0, DEL, C1) is removed.
+/// sites are one-line rows), and every other control character (C0, DEL, C1) or Unicode Bidi (`Cf`)
+/// spoofing codepoint (`U+202A..=U+202E`, `U+2066..=U+2069`) is removed.
 /// Returns the input borrowed when it is already clean — the overwhelmingly common case.
 pub fn sanitize_line(s: &str) -> Cow<'_, str> {
-    if !s.chars().any(char::is_control) {
+    if !s.chars().any(needs_sanitizing) {
         return Cow::Borrowed(s);
     }
     let mut out = String::with_capacity(s.len());
+    sanitize_into(s, true, &mut out);
+    Cow::Owned(out)
+}
+
+/// Strip ANSI/ESC/C1 escape sequences, non-structural control characters (C0, DEL, C1, `\r`), and
+/// Unicode Bidi Format (`Cf`) Trojan-Source codepoints (`U+202A..=U+202E`, `U+2066..=U+2069`) from
+/// `s`, appending the sanitized text into `out` while preserving `\n` and `\t`.
+pub fn strip_ansi_into(s: &str, out: &mut String) {
+    if !s.chars().any(needs_sanitizing) {
+        out.push_str(s);
+        return;
+    }
+    out.reserve(s.len());
+    sanitize_into(s, false, out);
+}
+
+fn sanitize_into(s: &str, one_line: bool, out: &mut String) {
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
-            '\n' | '\t' | '\r' => out.push(' '),
+            '\n' | '\t' if !one_line => out.push(c),
+            '\n' | '\t' | '\r' if one_line => out.push(' '),
             '\u{1b}' => skip_escape_sequence(&mut chars),
             '\u{9b}' => skip_csi(&mut chars),
             '\u{90}' | '\u{98}' | '\u{9d}' | '\u{9e}' | '\u{9f}' => skip_control_string(&mut chars),
-            c if c.is_control() => {}
+            c if needs_sanitizing(c) => {}
             c => out.push(c),
         }
     }
-    Cow::Owned(out)
 }
 
 /// Consume the remainder of an ESC-initiated sequence (the ESC itself was already consumed), so
@@ -126,5 +156,42 @@ mod tests {
         assert_eq!(sanitize_line("x\u{1b}]0;never terminated"), "x");
         // Two-char ESC sequence: both chars dropped.
         assert_eq!(sanitize_line("a\u{1b}cb"), "ab");
+    }
+
+    #[test]
+    fn strips_trojan_source_bidi_format_codepoints_in_both_sanitizers() {
+        let bidi_all = [
+            '\u{202A}', // LRE
+            '\u{202B}', // RLE
+            '\u{202C}', // PDF
+            '\u{202D}', // LRO
+            '\u{202E}', // RLO
+            '\u{2066}', // LRI
+            '\u{2067}', // RLI
+            '\u{2068}', // FSI
+            '\u{2069}', // PDI
+        ];
+        // Pure-bidi payload without C0/C1 controls must NOT bypass the Cow::Borrowed fast path.
+        for cp in bidi_all {
+            let poisoned = format!("safe{cp}spoof");
+            let cleaned = sanitize_line(&poisoned);
+            assert!(matches!(cleaned, Cow::Owned(_)), "bidi {cp:?} bypassed borrowed check");
+            assert_eq!(cleaned, "safespoof");
+
+            let mut buf = String::from("prefix:");
+            super::strip_ansi_into(&poisoned, &mut buf);
+            assert_eq!(buf, "prefix:safespoof");
+        }
+
+        // Full Trojan-Source RLO/PDI spoofing vector mixed with ANSI CSI + multiline structural text.
+        let trojan = "if access_level != \"user\u{202E} \u{2066}// Check admin\u{2069} \u{202C}\"\n\t\u{1b}[31mreturn\u{1b}[0m;\r\n";
+        let mut out = String::new();
+        super::strip_ansi_into(trojan, &mut out);
+        assert_eq!(out, "if access_level != \"user // Check admin \"\n\treturn;\n");
+        assert!(!out.chars().any(super::is_bidi_control));
+
+        let line = sanitize_line(trojan);
+        assert_eq!(line, "if access_level != \"user // Check admin \"  return;  ");
+        assert!(!line.chars().any(super::is_bidi_control));
     }
 }
