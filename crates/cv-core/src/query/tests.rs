@@ -205,7 +205,7 @@ fn quoted_phrase_with_spaces() {
 #[test]
 fn model_is_parse_required_three_valued() {
     let query = q("model:fable");
-    assert!(query.needs_parse());
+    assert!(query.needs_counted() && !query.needs_parse());
     // prefilter (no session) must NOT exclude on the unknown leaf
     assert!(query.prefilter(&refx("a", Harness::Claude, None, None, 9)));
     // full match against a session
@@ -229,7 +229,7 @@ fn not_over_parse_required_prefilter_keeps() {
 #[test]
 fn git_field_matches_branch() {
     let query = q("git:lazy-content");
-    assert!(query.needs_parse());
+    assert!(query.needs_counted() && !query.needs_parse());
     let mut s = sess(None, &[]);
     s.git = Some(GitInfo {
         branch: Some("lazy-content-ir".into()),

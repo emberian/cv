@@ -59,6 +59,55 @@ pub(crate) fn capture_primary_reads_from(a: &dyn crate::Adapter, refs: &[Session
     out
 }
 
+/// Queryable session metadata and structural counts captured alongside a completed `stream_counted`
+/// pass so `model:`, `git:`, `compactions`, `agents`, `has:compacted`, and `has:subagents` resolve
+/// from `catalog.db` (`Cost::Counted`) without re-parsing transcripts or walking sub-agent trees.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SessionQueryFacts {
+    /// Representative display/session model stored in `sessions.model`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_model: Option<String>,
+    /// Distinct lowercased model IDs across `session.model` and every streamed `message.model`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_remote: Option<String>,
+    #[serde(default)]
+    pub compactions: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_count: Option<u32>,
+    #[serde(default)]
+    pub subagent_guard: crate::source::ReadSet,
+}
+
+/// Persisted `sessions`-table query columns read back from `catalog.db`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexedSessionFields {
+    pub model: Option<String>,
+    pub git_branch: Option<String>,
+    pub git_remote: Option<String>,
+    pub compactions: Option<u32>,
+    pub subagent_count: Option<u32>,
+}
+
+/// What a complete read counted in one session: its affordances, its turns when the pass also
+/// counted them, and its indexed query facts.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Counted {
+    pub counts: crate::affordance::Counts,
+    pub turns: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub facts: Option<SessionQueryFacts>,
+}
+
+#[cfg(feature = "sqlite")]
+impl crate::source::Payload for Counted {
+    const TAG: &'static str = "counts";
+    const BY_ROWS: bool = true;
+}
+
 /// One watched path as discovery recorded it: its identity, an optional file's stable absence
 /// (fresh until it appears), or unknown (unreadable, or modified too recently: never fresh).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -215,22 +264,159 @@ mod imp {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .inspect_err(note_sql)
             .ok()?;
-        (stored == version && schema == SCHEMA).then_some(conn)
+        (stored == version && schema == SCHEMA && scoped_versions_match(&conn).unwrap_or(false)).then_some(conn)
     }
 
-    /// The catalog's schema, stamped in `PRAGMA user_version`: the one stored-format version
-    /// ([`crate::source::VERSION`]). Every table here is derived from the transcripts, so a
-    /// catalog of any other stamp is dropped whole and rebuilt: there are no migrations. Change
-    /// any table's shape and bump that version (8 is above every stamp an older cv wrote).
-    const SCHEMA: i64 = crate::source::VERSION as i64;
+    /// Physical DDL stamp for `catalog.db` (`PRAGMA user_version`), decoupled from
+    /// [`crate::source::VERSION`]: codec and event version bumps invalidate only affected
+    /// harness/consumer rows via `harness_versions` instead of dropping the whole catalog.
+    const SCHEMA: i64 = 11;
+
+    #[cfg(test)]
+    type ScopedVersionOverride = (std::collections::HashMap<Harness, u32>, Option<u32>);
+
+    #[cfg(test)]
+    thread_local! {
+        static SCOPED_VERSION_OVERRIDE: std::cell::RefCell<Option<ScopedVersionOverride>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Current codec revision for `h`, tracked per harness in `harness_versions.codec_v`.
+    pub fn harness_codec_version(h: Harness) -> u32 {
+        #[cfg(test)]
+        if let Some(v) =
+            SCOPED_VERSION_OVERRIDE.with(|slot| slot.borrow().as_ref().and_then(|(m, _)| m.get(&h).copied()))
+        {
+            return v;
+        }
+        let _ = h;
+        crate::source::VERSION
+    }
+
+    /// Current event-extractor revision, tracked in `harness_versions.events_v`.
+    pub fn events_codec_version() -> u32 {
+        #[cfg(test)]
+        if let Some(v) = SCOPED_VERSION_OVERRIDE.with(|slot| slot.borrow().as_ref().and_then(|(_, ev)| *ev)) {
+            return v;
+        }
+        crate::source::VERSION
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_scoped_versions<R>(
+        codec_overrides: &[(Harness, u32)],
+        events_override: Option<u32>,
+        f: impl FnOnce() -> R,
+    ) -> R {
+        struct Guard(Option<ScopedVersionOverride>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                SCOPED_VERSION_OVERRIDE.with(|slot| *slot.borrow_mut() = self.0.take());
+            }
+        }
+        let map = codec_overrides.iter().copied().collect();
+        let prev = SCOPED_VERSION_OVERRIDE.with(|slot| slot.replace(Some((map, events_override))));
+        let _guard = Guard(prev);
+        f()
+    }
+
+    fn scoped_versions_match(conn: &Connection) -> rusqlite::Result<bool> {
+        let mut stmt = conn.prepare("SELECT harness, codec_v, events_v FROM harness_versions")?;
+        let stored: std::collections::HashMap<String, (i64, i64)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, (row.get(1)?, row.get(2)?))))?
+            .collect::<rusqlite::Result<_>>()?;
+        let want_events = events_codec_version() as i64;
+        Ok(Harness::ALL.iter().all(|h| {
+            let want_codec = harness_codec_version(*h) as i64;
+            stored.get(h.as_str()) == Some(&(want_codec, want_events))
+        }))
+    }
+
+    fn table_exists(conn: &Connection, name: &str) -> rusqlite::Result<bool> {
+        let count: i64 = conn.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
+            [name],
+            |r| r.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    fn escape_like_prefix(dir: &str) -> String {
+        let mut out = String::with_capacity(dir.len() + 4);
+        for ch in dir.chars() {
+            if matches!(ch, '\\' | '%' | '_') {
+                out.push('\\');
+            }
+            out.push(ch);
+        }
+        if !out.ends_with('/') {
+            out.push('/');
+        }
+        out.push('%');
+        out
+    }
+
+    fn invalidate_events_for_harness(tx: &rusqlite::Transaction, h: Harness) -> rusqlite::Result<()> {
+        let name = h.as_str();
+        tx.execute(
+            "DELETE FROM source_dependencies WHERE consumer='events' AND harness=?1",
+            [name],
+        )?;
+        if table_exists(tx, "event_sessions")? {
+            if table_exists(tx, "events")? {
+                tx.execute(
+                    "DELETE FROM events WHERE session IN (SELECT id FROM event_sessions WHERE harness=?1)",
+                    [name],
+                )?;
+            }
+            tx.execute("DELETE FROM event_sessions WHERE harness=?1", [name])?;
+        }
+        Ok(())
+    }
+
+    /// Evict all cached rows belonging to `h` without touching any other harness's tables.
+    fn invalidate_harness_in(tx: &rusqlite::Transaction, h: Harness) -> rusqlite::Result<()> {
+        let name = h.as_str();
+        let mut paths = BTreeSet::new();
+        for sql in [
+            "SELECT path FROM sessions WHERE harness=?1",
+            "SELECT path FROM primary_sources WHERE harness=?1",
+            "SELECT path FROM watched WHERE harness=?1",
+        ] {
+            let mut stmt = tx.prepare(sql)?;
+            for p in stmt.query_map([name], |r| r.get::<_, String>(0))? {
+                paths.insert(p?);
+            }
+        }
+        if let Some(adapter) = crate::harness::for_harness(h) {
+            for root in adapter.roots() {
+                paths.insert(root.to_string_lossy().into_owned());
+            }
+        }
+        for p in &paths {
+            let prefix = escape_like_prefix(p);
+            tx.execute(
+                "DELETE FROM scan_cache WHERE path = ?1 OR path LIKE ?2 ESCAPE '\\'",
+                params![p, prefix],
+            )?;
+        }
+        tx.execute("DELETE FROM sessions WHERE harness=?1", [name])?;
+        tx.execute("DELETE FROM watched WHERE harness=?1", [name])?;
+        tx.execute("DELETE FROM primary_sources WHERE harness=?1", [name])?;
+        tx.execute("DELETE FROM resume_marks WHERE harness=?1", [name])?;
+        tx.execute("DELETE FROM skipped_sources WHERE harness=?1", [name])?;
+        tx.execute("DELETE FROM source_dependencies WHERE harness=?1", [name])?;
+        invalidate_events_for_harness(tx, h)?;
+        Ok(())
+    }
 
     fn open_writable(path: &Path) -> rusqlite::Result<Connection> {
         let mut conn = Connection::open(path)?;
         conn.busy_timeout(Duration::from_secs(5))?;
         let schema: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         let version = crate::discover_cache::INTERPRETATION_VERSION.to_string();
-        // A stamp certifies the complete CREATE phase. Drop, create and stamp commit together.
-        // Current catalogs take the read-only fast path without acquiring a writer lock.
+        // A stamp certifies the complete CREATE phase. Current catalogs whose scoped per-harness
+        // `(codec_v, events_v)` also match take the read-only fast path without a writer lock.
         if schema == SCHEMA {
             let old: Option<String> = conn
                 .query_row(
@@ -239,7 +425,7 @@ mod imp {
                     |row| row.get(0),
                 )
                 .optional()?;
-            if old.as_deref() == Some(&version) {
+            if old.as_deref() == Some(&version) && scoped_versions_match(&conn)? {
                 configure_journal(&conn)?;
                 return Ok(conn);
             }
@@ -247,6 +433,8 @@ mod imp {
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let schema: i64 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         let mut rebuilt = false;
+        let mut scoped_cache_invalidated = false;
+        let want_events = events_codec_version() as i64;
         if schema != SCHEMA {
             let tables = tx
                 .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")?
@@ -257,6 +445,49 @@ mod imp {
                 tx.execute_batch(&format!("DROP TABLE \"{}\";", table.replace('"', "\"\"")))?;
             }
             tx.execute_batch(SCHEMA_SQL)?;
+            for h in Harness::ALL {
+                tx.execute(
+                    "INSERT OR REPLACE INTO harness_versions(harness, codec_v, events_v) VALUES(?1, ?2, ?3)",
+                    params![h.as_str(), harness_codec_version(h) as i64, want_events],
+                )?;
+            }
+        } else {
+            let stored: std::collections::HashMap<String, (i64, i64)> = {
+                let mut stmt = tx.prepare("SELECT harness, codec_v, events_v FROM harness_versions")?;
+                let rows = stmt
+                    .query_map([], |row| Ok((row.get(0)?, (row.get(1)?, row.get(2)?))))?
+                    .collect::<rusqlite::Result<_>>()?;
+                rows
+            };
+            for h in Harness::ALL {
+                let want_codec = harness_codec_version(h) as i64;
+                match stored.get(h.as_str()).copied() {
+                    Some((c, e)) if c == want_codec && e == want_events => {}
+                    Some((c, _)) if c != want_codec => {
+                        invalidate_harness_in(&tx, h)?;
+                        scoped_cache_invalidated = true;
+                        tx.execute(
+                            "INSERT OR REPLACE INTO harness_versions(harness, codec_v, events_v) VALUES(?1, ?2, ?3)",
+                            params![h.as_str(), want_codec, want_events],
+                        )?;
+                    }
+                    Some((_, _)) => {
+                        invalidate_events_for_harness(&tx, h)?;
+                        tx.execute(
+                            "INSERT OR REPLACE INTO harness_versions(harness, codec_v, events_v) VALUES(?1, ?2, ?3)",
+                            params![h.as_str(), want_codec, want_events],
+                        )?;
+                    }
+                    None => {
+                        invalidate_harness_in(&tx, h)?;
+                        scoped_cache_invalidated = true;
+                        tx.execute(
+                            "INSERT OR REPLACE INTO harness_versions(harness, codec_v, events_v) VALUES(?1, ?2, ?3)",
+                            params![h.as_str(), want_codec, want_events],
+                        )?;
+                    }
+                }
+            }
         }
         let old: Option<String> = tx
             .query_row(
@@ -284,7 +515,7 @@ mod imp {
         tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA};"))?;
         tx.commit()?;
         configure_journal(&conn)?;
-        if changed {
+        if changed || scoped_cache_invalidated {
             crate::discover_cache::invalidate_interpretation(path);
         }
         if rebuilt {
@@ -313,21 +544,33 @@ mod imp {
     }
 
     const SCHEMA_SQL: &str = "CREATE TABLE IF NOT EXISTS sessions(
-                 harness       TEXT NOT NULL,
-                 id            TEXT NOT NULL,
-                 path          TEXT NOT NULL,
-                 cwd           TEXT,
-                 title         TEXT,
-                 created_at    INTEGER,
-                 updated_at    INTEGER,
-                 message_count INTEGER,
-                 created_ns    INTEGER,
-                 updated_ns    INTEGER,
+                 harness        TEXT NOT NULL,
+                 id             TEXT NOT NULL,
+                 path           TEXT NOT NULL,
+                 cwd            TEXT,
+                 title          TEXT,
+                 created_at     INTEGER,
+                 updated_at     INTEGER,
+                 message_count  INTEGER,
+                 created_ns     INTEGER,
+                 updated_ns     INTEGER,
                  writer_version TEXT,
+                 model          TEXT,
+                 git_branch     TEXT,
+                 git_remote     TEXT,
+                 compactions    INTEGER,
+                 subagent_count INTEGER,
                  PRIMARY KEY(harness, id, path)
              );
              CREATE INDEX IF NOT EXISTS idx_sessions_id ON sessions(id);
              CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at DESC);
+             CREATE INDEX IF NOT EXISTS idx_sessions_model ON sessions(model);
+             CREATE INDEX IF NOT EXISTS idx_sessions_git_branch ON sessions(git_branch);
+             CREATE TABLE IF NOT EXISTS harness_versions(
+                 harness  TEXT PRIMARY KEY,
+                 codec_v  INTEGER NOT NULL,
+                 events_v INTEGER NOT NULL
+             );
              CREATE TABLE IF NOT EXISTS watched(
                  harness  TEXT NOT NULL,
                  path     TEXT NOT NULL,
@@ -919,28 +1162,164 @@ mod imp {
         Ok(())
     }
 
-    /// What a complete read counted in one session: its affordances, and its turns when the
-    /// pass also counted them. The `counts` consumer's [`crate::source::Record`] payload, and the
-    /// only place counts are stored.
-    #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-    pub(crate) struct Counted {
-        pub counts: crate::affordance::Counts,
-        pub turns: Option<u32>,
+    use crate::source::Payload as _;
+
+    /// Whether `h` never records a sub-agent forest (`Adapter::forest` is always empty).
+    fn has_zero_subagent_forest(h: Harness) -> bool {
+        match h {
+            Harness::Claude
+            | Harness::Codex
+            | Harness::Hermes
+            | Harness::Devin
+            | Harness::Antigravity
+            | Harness::Kimi
+            | Harness::KimiCode => false,
+            Harness::Grok
+            | Harness::OpenCode
+            | Harness::Gemini
+            | Harness::OpenClaw
+            | Harness::Cursor
+            | Harness::Qwen
+            | Harness::LmStudio
+            | Harness::Cline
+            | Harness::Roo
+            | Harness::Continue
+            | Harness::Goose
+            | Harness::Zed
+            | Harness::ChatGptExport
+            | Harness::ClaudeExport
+            | Harness::OpenSession => true,
+        }
     }
 
-    impl crate::source::Payload for Counted {
-        const TAG: &'static str = "counts";
-        const BY_ROWS: bool = true;
+    /// Capture sub-agent count and an exact filesystem guard for `r` on demand (when a query
+    /// touches `agents` or `has:subagents`), without holding a SQLite writer lock.
+    pub(crate) fn populate_subagent_facts(r: &SessionRef, facts: &mut SessionQueryFacts) {
+        let mut guard = crate::source::ReadSet::default();
+        if has_zero_subagent_forest(r.harness) {
+            facts.subagent_count = Some(0);
+            facts.subagent_guard = guard;
+            return;
+        }
+        match r.harness {
+            Harness::Claude => {
+                let stem = r.path.with_extension("");
+                let subagents = stem.join("subagents");
+                let wf_subagents = subagents.join("workflows");
+                let workflows = stem.join("workflows");
+                for p in [&stem, &subagents, &wf_subagents, &workflows] {
+                    guard.record(p);
+                }
+                if let Ok(entries) = std::fs::read_dir(&wf_subagents) {
+                    for entry in entries.flatten() {
+                        guard.record(&entry.path());
+                    }
+                }
+            }
+            Harness::Codex => {
+                if let Some(home) = crate::env::Env::current().cv_home() {
+                    guard.record(&home.join("lanes.jsonl"));
+                    guard.record(&home.join("state.db"));
+                    for sidecar in crate::source::sqlite_sidecars(&home.join("state.db")) {
+                        guard.record(&sidecar);
+                    }
+                }
+            }
+            Harness::Hermes | Harness::Devin => {
+                guard.record(&r.path);
+                for sidecar in crate::source::sqlite_sidecars(&r.path) {
+                    guard.record(&sidecar);
+                }
+            }
+            Harness::Antigravity => {
+                let sub_dir = r
+                    .path
+                    .ancestors()
+                    .find(|p| p.file_name().is_some_and(|n| n == ".system_generated"))
+                    .map(|sys| sys.join("subagents"))
+                    .unwrap_or_else(|| r.path.join(".system_generated").join("subagents"));
+                guard.record(&sub_dir);
+                if let Ok(entries) = std::fs::read_dir(&sub_dir) {
+                    for entry in entries.flatten() {
+                        guard.record(&entry.path());
+                    }
+                }
+            }
+            Harness::Kimi => {
+                guard.record(&r.path);
+                let sub_dir = r.path.join("subagents");
+                guard.record(&sub_dir);
+                if let Ok(entries) = std::fs::read_dir(&sub_dir) {
+                    for entry in entries.flatten() {
+                        guard.record(&entry.path());
+                    }
+                }
+            }
+            Harness::KimiCode => {
+                let sdir = r
+                    .path
+                    .ancestors()
+                    .find(|p| {
+                        p.file_name()
+                            .and_then(|n| n.to_str())
+                            .is_some_and(|n| n.starts_with("session_"))
+                    })
+                    .unwrap_or(&r.path);
+                guard.record(&sdir.join("state.json"));
+                let agents_dir = sdir.join("agents");
+                guard.record(&agents_dir);
+                if let Ok(entries) = std::fs::read_dir(&agents_dir) {
+                    for entry in entries.flatten() {
+                        guard.record(&entry.path());
+                    }
+                }
+            }
+            Harness::Grok
+            | Harness::OpenCode
+            | Harness::Gemini
+            | Harness::OpenClaw
+            | Harness::Cursor
+            | Harness::Qwen
+            | Harness::LmStudio
+            | Harness::Cline
+            | Harness::Roo
+            | Harness::Continue
+            | Harness::Goose
+            | Harness::Zed
+            | Harness::ChatGptExport
+            | Harness::ClaudeExport
+            | Harness::OpenSession => unreachable!("handled above"),
+        }
+        match crate::subagent_tree_filtered_of(r, crate::SubagentDemand::Sessions, None, |_, _| true) {
+            Ok(agents) => {
+                for agent in &agents {
+                    guard.record(&agent.session.path);
+                }
+                if let Ok(count) = u32::try_from(agents.len()) {
+                    if guard.fresh(&mut crate::source::Probe::default()) {
+                        facts.subagent_count = Some(count);
+                        facts.subagent_guard = guard;
+                        return;
+                    }
+                }
+                facts.subagent_count = None;
+                facts.subagent_guard = crate::source::ReadSet::unrecorded();
+            }
+            Err(_) => {
+                facts.subagent_count = None;
+                facts.subagent_guard = crate::source::ReadSet::unrecorded();
+            }
+        }
     }
-    use crate::source::Payload as _;
 
     pub(crate) fn note_counted_with_source(
         r: &SessionRef,
         source: &crate::source::Baseline,
         turns: usize,
+        facts: Option<SessionQueryFacts>,
         counts: impl FnOnce() -> crate::affordance::Counts,
     ) {
-        note_counts_with_source(r, source, Some(turns), counts);
+        note_counts_with_source(r, source, Some(turns), facts, counts);
     }
 
     /// Record counts against the dependencies captured before their complete source pass.
@@ -949,13 +1328,14 @@ mod imp {
         source: &crate::source::Baseline,
         counts: impl FnOnce() -> crate::affordance::Counts,
     ) {
-        note_counts_with_source(r, source, None, counts);
+        note_counts_with_source(r, source, None, None, counts);
     }
 
     fn note_counts_with_source(
         r: &SessionRef,
         source: &crate::source::Baseline,
         turns: Option<usize>,
+        facts: Option<SessionQueryFacts>,
         counts: impl FnOnce() -> crate::affordance::Counts,
     ) {
         if crate::env::frozen() {
@@ -968,7 +1348,7 @@ mod imp {
             return;
         }
         let Some(mut conn) = open() else { return };
-        note_counts_in(&mut conn, r, source, turns, counts);
+        note_counts_in(&mut conn, r, source, turns, facts, counts);
     }
 
     /// The caller verified the captured source before publishing on this existing connection.
@@ -978,6 +1358,7 @@ mod imp {
         r: &SessionRef,
         source: &crate::source::Baseline,
         turns: Option<usize>,
+        mut facts: Option<SessionQueryFacts>,
         counts: impl FnOnce() -> crate::affordance::Counts,
     ) {
         if crate::env::frozen() {
@@ -990,19 +1371,42 @@ mod imp {
         // Validate the old record before taking a writer lock. Recheck it after BEGIN IMMEDIATE:
         // a racing publication cannot lend its provenance to our skip decision.
         let stored = count_record_in(conn, r);
-        let keep = stored
-            .as_deref()
-            .and_then(crate::source::Record::<Counted>::decode)
-            .is_some_and(|old| {
-                turns.is_none_or(|turns| old.payload.turns == Some(turns))
-                    && old.admit_for(r, source, &mut crate::source::Probe::default()).is_some()
-            });
-        if keep && turns.is_none() {
+        let old_decoded = stored.as_deref().and_then(crate::source::Record::<Counted>::decode);
+        if let Some(ref mut new_f) = facts {
+            if new_f.subagent_count.is_none() {
+                if has_zero_subagent_forest(r.harness) {
+                    new_f.subagent_count = Some(0);
+                    new_f.subagent_guard = crate::source::ReadSet::default();
+                } else if let Some(old_f) = old_decoded.as_ref().and_then(|old| old.payload.facts.as_ref()) {
+                    if old_f.subagent_count.is_some()
+                        && old_f.subagent_guard.fresh(&mut crate::source::Probe::default())
+                    {
+                        new_f.subagent_count = old_f.subagent_count;
+                        new_f.subagent_guard = old_f.subagent_guard.clone();
+                    }
+                }
+            }
+        }
+        let keep = old_decoded.as_ref().is_some_and(|old| {
+            turns.is_none_or(|turns| old.payload.turns == Some(turns))
+                && facts
+                    .as_ref()
+                    .is_none_or(|new_f| old.payload.facts.as_ref() == Some(new_f))
+                && old.admit_for(r, source, &mut crate::source::Probe::default()).is_some()
+        });
+        if keep && turns.is_none() && facts.is_none() {
             return;
+        }
+        if facts.is_none() {
+            if let Some(old_f) = old_decoded.and_then(|old| old.payload.facts) {
+                // Preserve enriched facts across affordance-only publications on an unchanged source.
+                facts = Some(old_f);
+            }
         }
         let counted = Counted {
             counts: counts(),
             turns,
+            facts,
         };
         let Ok(tx) = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
@@ -1035,6 +1439,21 @@ mod imp {
                     params![turns as i64, r.harness.as_str(), r.id, path],
                 )?;
             }
+            if let Some(f) = &counted.facts {
+                tx.execute(
+                    "UPDATE sessions SET model=?1, git_branch=?2, git_remote=?3, compactions=?4, subagent_count=?5 WHERE harness=?6 AND id=?7 AND path=?8",
+                    params![
+                        f.primary_model,
+                        f.git_branch,
+                        f.git_remote,
+                        i64::from(f.compactions),
+                        f.subagent_count.map(i64::from),
+                        r.harness.as_str(),
+                        r.id,
+                        path,
+                    ],
+                )?;
+            }
             Ok(())
         };
         if write().is_ok() {
@@ -1042,6 +1461,29 @@ mod imp {
                 note_sql(&error);
             }
         }
+    }
+
+    /// Read persisted indexed query columns (`model`, `git_branch`, `git_remote`, `compactions`,
+    /// `subagent_count`) from `catalog.db`'s `sessions` row for `r`.
+    pub fn session_indexed_fields(r: &SessionRef) -> Option<IndexedSessionFields> {
+        let conn = open()?;
+        conn.query_row(
+            "SELECT model, git_branch, git_remote, compactions, subagent_count FROM sessions WHERE harness=?1 AND id=?2 AND path=?3",
+            params![r.harness.as_str(), r.id, r.path.to_string_lossy()],
+            |row| {
+                Ok(IndexedSessionFields {
+                    model: row.get(0)?,
+                    git_branch: row.get(1)?,
+                    git_remote: row.get(2)?,
+                    compactions: row.get::<_, Option<i64>>(3)?.and_then(|n| u32::try_from(n).ok()),
+                    subagent_count: row.get::<_, Option<i64>>(4)?.and_then(|n| u32::try_from(n).ok()),
+                })
+            },
+        )
+        .optional()
+        .inspect_err(note_sql)
+        .ok()
+        .flatten()
     }
 
     /// `r`'s counts record, its bytes as stored: compared across BEGIN IMMEDIATE, decoded by
@@ -1200,6 +1642,15 @@ mod imp {
             probe: &mut crate::source::Probe,
         ) -> Option<crate::affordance::Counts> {
             Some(self.records.admit(r, source, probe)?.counts.clone())
+        }
+
+        pub(crate) fn counted_with_probe(
+            &self,
+            r: &SessionRef,
+            source: &crate::source::Baseline,
+            probe: &mut crate::source::Probe,
+        ) -> Option<Counted> {
+            self.records.admit(r, source, probe).cloned()
         }
     }
 
@@ -2299,7 +2750,11 @@ mod imp {
                     stamp: None,
                     rows: None,
                 },
-                Counted { counts, turns: Some(3) },
+                Counted {
+                    counts,
+                    turns: Some(3),
+                    facts: None,
+                },
             );
             let bytes = record.encode();
             assert_eq!(Record::<Counted>::decode(&bytes).unwrap().payload, record.payload);
@@ -2325,6 +2780,260 @@ mod imp {
                 assert!(Record::<Counted>::decode(&serde_json::to_vec(&wire).unwrap()).is_none());
             }
         }
+
+        #[test]
+        fn scoped_codec_bump_evicts_only_target_harness_rows() {
+            let w = crate::test_world("catalog-scoped-codec-bump");
+            let claude_path = w.base.join("claude.jsonl");
+            let codex_path = w.base.join("codex.jsonl");
+            std::fs::write(&claude_path, "{}\n").unwrap();
+            std::fs::write(&codex_path, "{}\n").unwrap();
+
+            let mut claude_ref = db_ref(Harness::Claude, claude_path.clone());
+            claude_ref.id = "claude-1".into();
+            let mut codex_ref = db_ref(Harness::Codex, codex_path.clone());
+            codex_ref.id = "codex-1".into();
+
+            let mut claude_reads = PrimaryReads::default();
+            let mut cr = crate::source::ReadSet::default();
+            cr.record(&claude_path);
+            claude_reads.insert(claude_path.clone(), cr);
+
+            let mut codex_reads = PrimaryReads::default();
+            let mut xr = crate::source::ReadSet::default();
+            xr.record(&codex_path);
+            codex_reads.insert(codex_path.clone(), xr);
+
+            publish_all(&[
+                (
+                    Harness::Claude,
+                    std::slice::from_ref(&claude_ref),
+                    vec![(claude_path.clone(), Watched::Is(FileId::at(&claude_path).unwrap()))],
+                    &claude_reads,
+                ),
+                (
+                    Harness::Codex,
+                    std::slice::from_ref(&codex_ref),
+                    vec![(codex_path.clone(), Watched::Is(FileId::at(&codex_path).unwrap()))],
+                    &codex_reads,
+                ),
+            ]);
+            let sync_before = last_full_sync();
+            assert!(sync_before.is_some());
+
+            // Seed scan_cache + counts for both harnesses so we prove cross-table isolation.
+            {
+                let mut conn = open().unwrap();
+                for (h, r, p) in [
+                    (Harness::Claude, &claude_ref, &claude_path),
+                    (Harness::Codex, &codex_ref, &codex_path),
+                ] {
+                    conn.execute(
+                        "INSERT INTO scan_cache(path, mtime_ns, size, refs, interpretation_version) VALUES(?1, 1, 3, '[]', ?2)",
+                        params![p.to_string_lossy(), crate::discover_cache::INTERPRETATION_VERSION],
+                    )
+                    .unwrap();
+                    conn.execute(
+                        "INSERT INTO resume_marks(harness, id, path, offset, hash, version, state) VALUES(?1, ?2, ?3, 0, 0, 'v', '{}')",
+                        params![h.as_str(), r.id, p.to_string_lossy()],
+                    )
+                    .unwrap();
+                    conn.execute(
+                        "INSERT INTO skipped_sources(harness, path, why) VALUES(?1, ?2, 'err')",
+                        params![h.as_str(), p.to_string_lossy()],
+                    )
+                    .unwrap();
+                    let snap = crate::source::Probe::default()
+                        .snapshot(r)
+                        .with_reads(&crate::source::ReadSet::default());
+                    note_counts_in(&mut conn, r, &snap, Some(2), None, crate::affordance::Counts::new);
+                }
+            }
+
+            with_scoped_versions(&[(Harness::Codex, crate::source::VERSION + 1)], None, || {
+                let conn = open().unwrap();
+                let count_for = |table: &str, h: Harness| -> i64 {
+                    conn.query_row(
+                        &format!("SELECT COUNT(*) FROM {table} WHERE harness=?1"),
+                        [h.as_str()],
+                        |r| r.get(0),
+                    )
+                    .unwrap()
+                };
+                for table in [
+                    "sessions",
+                    "watched",
+                    "primary_sources",
+                    "resume_marks",
+                    "skipped_sources",
+                    "source_dependencies",
+                ] {
+                    assert_eq!(count_for(table, Harness::Codex), 0, "Codex {table} must be evicted");
+                    assert_eq!(count_for(table, Harness::Claude), 1, "Claude {table} must survive");
+                }
+                let codex_scan: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM scan_cache WHERE path=?1",
+                        [codex_path.to_string_lossy()],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                let claude_scan: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM scan_cache WHERE path=?1",
+                        [claude_path.to_string_lossy()],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(codex_scan, 0, "Codex scan_cache row must be evicted");
+                assert_eq!(claude_scan, 1, "Claude scan_cache row must survive");
+                assert_eq!(last_full_sync(), sync_before, "last_full_sync must be preserved");
+            });
+        }
+
+        #[test]
+        fn scoped_events_bump_evicts_events_only_preserving_sessions_and_counts() {
+            let w = crate::test_world("catalog-scoped-events-bump");
+            let claude_path = w.base.join("claude.jsonl");
+            std::fs::write(&claude_path, "{}\n").unwrap();
+            let mut claude_ref = db_ref(Harness::Claude, claude_path.clone());
+            claude_ref.id = "claude-ev".into();
+            let mut reads = PrimaryReads::default();
+            let mut cr = crate::source::ReadSet::default();
+            cr.record(&claude_path);
+            reads.insert(claude_path.clone(), cr);
+
+            publish_all(&[(
+                Harness::Claude,
+                std::slice::from_ref(&claude_ref),
+                vec![(claude_path.clone(), Watched::Is(FileId::at(&claude_path).unwrap()))],
+                &reads,
+            )]);
+            {
+                let mut conn = open().unwrap();
+                let snap = crate::source::Probe::default()
+                    .snapshot(&claude_ref)
+                    .with_reads(&crate::source::ReadSet::default());
+                note_counts_in(
+                    &mut conn,
+                    &claude_ref,
+                    &snap,
+                    Some(4),
+                    None,
+                    crate::affordance::Counts::new,
+                );
+                conn.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS event_sessions(id INTEGER PRIMARY KEY, harness TEXT NOT NULL, session_id TEXT NOT NULL);
+                     CREATE TABLE IF NOT EXISTS events(session INTEGER NOT NULL, msg_idx INTEGER NOT NULL, kind TEXT NOT NULL);",
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO event_sessions(id, harness, session_id) VALUES(1, 'claude', 'claude-ev')",
+                    [],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO events(session, msg_idx, kind) VALUES(1, 0, 'compaction')",
+                    [],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO source_dependencies(consumer, harness, id, path, record) VALUES('events', 'claude', 'claude-ev', ?1, X'00')",
+                    [claude_path.to_string_lossy()],
+                )
+                .unwrap();
+            }
+
+            with_scoped_versions(&[], Some(crate::source::VERSION + 1), || {
+                let conn = open().unwrap();
+                let sessions_n: i64 = conn
+                    .query_row("SELECT COUNT(*) FROM sessions WHERE harness='claude'", [], |r| r.get(0))
+                    .unwrap();
+                let counts_n: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM source_dependencies WHERE consumer='counts' AND harness='claude'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                let ev_deps_n: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM source_dependencies WHERE consumer='events'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                let ev_sess_n: i64 = conn
+                    .query_row("SELECT COUNT(*) FROM event_sessions", [], |r| r.get(0))
+                    .unwrap();
+                let ev_rows_n: i64 = conn.query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0)).unwrap();
+                assert_eq!(sessions_n, 1, "sessions must survive events_v bump");
+                assert_eq!(counts_n, 1, "counts records must survive events_v bump");
+                assert_eq!(ev_deps_n, 0, "events dependencies must be evicted");
+                assert_eq!(ev_sess_n, 0, "event_sessions must be evicted");
+                assert_eq!(ev_rows_n, 0, "events rows must be evicted");
+            });
+        }
+
+        #[test]
+        fn session_indexed_fields_persist_and_survive_catalog_republish() {
+            let w = crate::test_world("catalog-indexed-fields");
+            let p1 = w.base.join("s1.jsonl");
+            let p2 = w.base.join("s2.jsonl");
+            std::fs::write(&p1, "{}\n").unwrap();
+            std::fs::write(&p2, "{}\n").unwrap();
+
+            let mut r1 = db_ref(Harness::Gemini, p1.clone());
+            r1.id = "g1".into();
+            let mut r2 = db_ref(Harness::Gemini, p2.clone());
+            r2.id = "g2".into();
+
+            let mut reads = PrimaryReads::default();
+            for p in [&p1, &p2] {
+                let mut rs = crate::source::ReadSet::default();
+                rs.record(p);
+                reads.insert(p.clone(), rs);
+            }
+            publish_all(&[(Harness::Gemini, &[r1.clone(), r2.clone()], Vec::new(), &reads)]);
+
+            let snap = crate::source::Probe::default()
+                .snapshot(&r1)
+                .with_reads(&crate::source::ReadSet::default());
+            let facts = SessionQueryFacts {
+                primary_model: Some("gemini-2.5-pro".into()),
+                models: vec!["gemini-2.5-flash".into(), "gemini-2.5-pro".into()],
+                git_branch: Some("feat/spine".into()),
+                git_remote: Some("git@github.com:org/cv.git".into()),
+                compactions: 3,
+                subagent_count: None,
+                subagent_guard: crate::source::ReadSet::default(),
+            };
+            note_counted_with_source(&r1, &snap, 5, Some(facts), crate::affordance::Counts::new);
+
+            let expected = IndexedSessionFields {
+                model: Some("gemini-2.5-pro".into()),
+                git_branch: Some("feat/spine".into()),
+                git_remote: Some("git@github.com:org/cv.git".into()),
+                compactions: Some(3),
+                subagent_count: Some(0),
+            };
+            assert_eq!(session_indexed_fields(&r1), Some(expected.clone()));
+
+            // Republish with a prepended session to exercise order::publish / gap moves.
+            let p0 = w.base.join("s0.jsonl");
+            std::fs::write(&p0, "{}\n").unwrap();
+            let mut r0 = db_ref(Harness::Gemini, p0.clone());
+            r0.id = "g0".into();
+            let mut rs0 = crate::source::ReadSet::default();
+            rs0.record(&p0);
+            reads.insert(p0, rs0);
+            replace_harness(Harness::Gemini, &[r0, r1.clone(), r2], &[], &reads);
+            assert_eq!(
+                session_indexed_fields(&r1),
+                Some(expected),
+                "indexed query columns must survive catalog order republish"
+            );
+        }
     }
 }
 
@@ -2332,10 +3041,16 @@ mod imp {
 pub(crate) use imp::{all_sessions, db_path, open_at, open_db, watches_for};
 
 #[cfg(feature = "sqlite")]
-pub use imp::{lookup, note_affordances_with_source, skipped_sources, sync, writer_versions, AffordanceTable};
+pub use imp::{
+    events_codec_version, harness_codec_version, lookup, note_affordances_with_source, session_indexed_fields,
+    skipped_sources, sync, writer_versions, AffordanceTable,
+};
 
 #[cfg(feature = "sqlite")]
-pub(crate) use imp::note_counted_with_source;
+pub(crate) use imp::{note_counted_with_source, populate_subagent_facts};
+
+#[cfg(not(feature = "sqlite"))]
+pub(crate) fn populate_subagent_facts(_r: &SessionRef, _facts: &mut SessionQueryFacts) {}
 
 #[cfg(all(feature = "sqlite", test))]
 pub(crate) use imp::replace_harness;
@@ -2349,6 +3064,17 @@ pub(crate) fn last_full_sync() -> Option<i64> {
 #[cfg(not(feature = "sqlite"))]
 pub fn sync(_refs: &[SessionRef]) {}
 #[cfg(not(feature = "sqlite"))]
+pub fn harness_codec_version(_h: Harness) -> u32 {
+    crate::source::VERSION
+}
+#[cfg(not(feature = "sqlite"))]
+pub fn events_codec_version() -> u32 {
+    crate::source::VERSION
+}
+#[cfg(not(feature = "sqlite"))]
+pub fn session_indexed_fields(_r: &SessionRef) -> Option<IndexedSessionFields> {
+    None
+}
 #[cfg(not(feature = "sqlite"))]
 pub fn note_affordances_with_source(
     _r: &SessionRef,
@@ -2361,6 +3087,7 @@ pub(crate) fn note_counted_with_source(
     _r: &SessionRef,
     _source: &crate::source::Baseline,
     _turns: usize,
+    _facts: Option<SessionQueryFacts>,
     _counts: impl FnOnce() -> crate::affordance::Counts,
 ) {
 }
@@ -2388,6 +3115,14 @@ impl AffordanceTable {
         _source: &crate::source::Baseline,
         _probe: &mut crate::source::Probe,
     ) -> Option<crate::affordance::Counts> {
+        None
+    }
+    pub(crate) fn counted_with_probe(
+        &self,
+        _r: &SessionRef,
+        _source: &crate::source::Baseline,
+        _probe: &mut crate::source::Probe,
+    ) -> Option<Counted> {
         None
     }
 }

@@ -827,10 +827,29 @@ pub fn stream_counted(
         .filter(|_| !counting.stopped);
     let counted = (!counting.stopped)
         .then(|| -> Result<Counted> {
+            let mut models = counting.models;
+            if let Some(primary) = session.model.as_deref().filter(|s| !s.is_empty()) {
+                models.insert(primary.to_lowercase());
+            }
+            let primary_model = session
+                .model
+                .clone()
+                .filter(|s| !s.is_empty())
+                .or_else(|| counting.first_model.clone());
+            let facts = crate::catalog::SessionQueryFacts {
+                primary_model,
+                models: models.into_iter().collect(),
+                git_branch: session.git.as_ref().and_then(|g| g.branch.clone()),
+                git_remote: session.git.as_ref().and_then(|g| g.remote.clone()),
+                compactions: counting.compactions,
+                subagent_count: None,
+                subagent_guard: Default::default(),
+            };
             Ok(Counted {
                 turns: counting.turns,
                 dependencies: counting.dependencies,
                 counts: counting.affordances.finish(&session, &adapter.store_affordances(r)?),
+                facts: Some(facts),
             })
         })
         .transpose()?;
@@ -847,13 +866,15 @@ pub fn stream_counted(
     })
 }
 
-/// What a whole-session read counted: its turns and its affordances.
+/// What a whole-session read counted: its turns, its affordances, and its indexed query facts.
 #[derive(Debug, Clone)]
 pub struct Counted {
     pub turns: usize,
     pub counts: crate::affordance::Counts,
     /// Adapter dependencies consulted before the pass computed these counts.
     pub dependencies: crate::source::ReadSet,
+    /// Queryable session metadata and structural counts captured during the pass.
+    pub facts: Option<crate::catalog::SessionQueryFacts>,
 }
 
 impl Counted {
@@ -861,7 +882,9 @@ impl Counted {
     pub fn record_with_source(&self, r: &SessionRef, source: &crate::source::Baseline) {
         let source = source.with_reads(&self.dependencies);
         if crate::source::unchanged(r, &source) {
-            crate::catalog::note_counted_with_source(r, &source, self.turns, || self.counts.clone());
+            crate::catalog::note_counted_with_source(r, &source, self.turns, self.facts.clone(), || {
+                self.counts.clone()
+            });
         }
     }
 }
@@ -879,6 +902,12 @@ struct CounterState {
     turns: usize,
     counts: std::collections::BTreeMap<String, u32>,
     dependencies: crate::source::ReadSet,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    models: std::collections::BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    first_model: Option<String>,
+    #[serde(default)]
+    compactions: u32,
     /// At a read's end mark: the last spaced checkpoint before it, so a pass resumed there keeps
     /// the schedule (and the consumers the doc boundaries) a whole pass has.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -920,6 +949,10 @@ struct Counting<'a> {
     turns: usize,
     affordances: crate::affordance::Counter,
     dependencies: crate::source::ReadSet,
+    models: std::collections::BTreeSet<String>,
+    first_model: Option<String>,
+    last_model: Option<String>,
+    compactions: u32,
     stopped: bool,
     latch: Latch,
     /// Records what a guarded pass read, for its [`StagedReadGuard`].
@@ -947,6 +980,10 @@ impl<'a> Counting<'a> {
             turns: 0,
             affordances: crate::affordance::Counter::new(r),
             dependencies: Default::default(),
+            models: Default::default(),
+            first_model: None,
+            last_model: None,
+            compactions: 0,
             stopped: false,
             latch: Latch::default(),
             guard: None,
@@ -987,6 +1024,10 @@ impl<'a> Counting<'a> {
         self.messages = state.messages;
         self.turns = state.turns;
         self.dependencies = state.dependencies;
+        self.models = state.models;
+        self.first_model = state.first_model;
+        self.last_model = None;
+        self.compactions = state.compactions;
         let counts = state
             .counts
             .iter()
@@ -1052,6 +1093,18 @@ impl MessageSink for Counting<'_> {
         }
         self.messages += 1;
         self.turns += usize::from(m.is_turn());
+        if m.kind == crate::ir::MessageKind::CompactionBoundary {
+            self.compactions = self.compactions.saturating_add(1);
+        }
+        if let Some(model) = m.model.as_deref().filter(|s| !s.is_empty()) {
+            if self.first_model.is_none() {
+                self.first_model = Some(model.to_owned());
+            }
+            if self.last_model.as_deref() != Some(model) {
+                self.last_model = Some(model.to_owned());
+                self.models.insert(model.to_lowercase());
+            }
+        }
         if let Err(error) = self.affordances.note(&m) {
             self.latch.fail(error);
             self.stopped = true;
@@ -1099,6 +1152,9 @@ impl MessageSink for Counting<'_> {
                 turns: self.turns,
                 counts,
                 dependencies: self.dependencies.clone(),
+                models: self.models.clone(),
+                first_model: self.first_model.clone(),
+                compactions: self.compactions,
                 anchor: self.ending.then_some(Anchor {
                     offset: self.last_offset,
                     state_bytes: self.state_bytes,

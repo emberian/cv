@@ -128,6 +128,7 @@ fn counted(r: &SessionRef, turns: usize) {
         turns,
         counts: [(crate::affordance::Kind::Plan, 1)].into_iter().collect(),
         dependencies: ReadSet::default(),
+        facts: None,
     }
     .record_with_source(r, &Probe::default().snapshot(r));
 }
@@ -187,6 +188,7 @@ fn certified_turns_enrich_old_counts_refill_refresh_and_keep_partial_publication
             turns: 8,
             counts: Default::default(),
             dependencies: Default::default(),
+            facts: None,
         },
     );
     assert_eq!(
@@ -385,7 +387,7 @@ fn complete_count_publication_waits_for_writer_and_commits_one_pair() {
     let (finished, result) = mpsc::channel();
     let worker = std::thread::spawn(crate::env::carry(move || {
         started.send(()).unwrap();
-        super::imp::note_counts_in(&mut publishing, &r, &source, Some(9), Default::default);
+        super::imp::note_counts_in(&mut publishing, &r, &source, Some(9), None, Default::default);
         finished.send(()).unwrap();
     }));
     entered.recv_timeout(Duration::from_secs(10)).unwrap();
@@ -417,7 +419,7 @@ fn partial_publication_preserves_a_concurrent_certified_complete_pass() {
     let (ready, started) = mpsc::channel();
     let (resume, released) = mpsc::channel();
     let worker = std::thread::spawn(crate::env::carry(move || {
-        super::imp::note_counts_in(&mut publishing, &partial_ref, &source, None, || {
+        super::imp::note_counts_in(&mut publishing, &partial_ref, &source, None, None, || {
             // The old pair has been read, but there is no writer transaction yet.
             ready.send(()).unwrap();
             released.recv_timeout(Duration::from_secs(10)).unwrap();

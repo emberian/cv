@@ -570,9 +570,18 @@ fn reduce_streamed(
         &mut sink,
         Default::default(),
     )?;
-    let (session, counted) = (read.session, read.counted);
+    let (session, mut counted) = (read.session, read.counted);
     if affordances {
         sink.facts.counts = counted.as_ref().map(|c| c.counts.clone());
+    }
+    let touches_subagents =
+        query.mentions_field(FieldId::Agents) || query.needles(FieldId::Has).iter().any(|f| f == "subagents");
+    if touches_subagents {
+        if let Some(ref mut c) = counted {
+            if let Some(ref mut f) = c.facts {
+                crate::catalog::populate_subagent_facts(r, f);
+            }
+        }
     }
     let decision = (|| {
         let reduced = sink.finish(&session)?;
@@ -593,23 +602,89 @@ fn reduce_streamed(
     })
 }
 
-/// Facts available before parsing: indexed text membership and fresh catalog affordance counts.
+/// Facts available before parsing: indexed text membership and fresh catalog counts + session facts.
 /// Other external predicates stay `Unknown`, preserving the query's three-valued evaluation.
 struct RefFacts<'a> {
     id: &'a str,
     text_sets: &'a TextSets,
-    counts: Option<crate::affordance::Counts>,
+    counted: Option<&'a crate::catalog::Counted>,
+    subagents_fresh: bool,
 }
 
 impl ExtFacts for RefFacts<'_> {
+    fn model(&self, needle: &str, exact: bool) -> anyhow::Result<Tri> {
+        let Some(facts) = self.counted.and_then(|c| c.facts.as_ref()) else {
+            return Ok(Tri::Unknown);
+        };
+        Ok(Tri::of(facts.models.iter().any(|m| {
+            if exact {
+                m == needle
+            } else {
+                m.contains(needle)
+            }
+        })))
+    }
+
+    fn git(&self, needle: &str, exact: bool) -> anyhow::Result<Tri> {
+        let Some(facts) = self.counted.and_then(|c| c.facts.as_ref()) else {
+            return Ok(Tri::Unknown);
+        };
+        if exact {
+            return Ok(Tri::of(
+                [facts.git_branch.as_deref(), facts.git_remote.as_deref()]
+                    .into_iter()
+                    .flatten()
+                    .any(|value| value.to_lowercase() == needle),
+            ));
+        }
+        if facts.git_branch.is_none() && facts.git_remote.is_none() {
+            return Ok(Tri::False);
+        }
+        let hay = format!(
+            "{} {}",
+            facts.git_branch.as_deref().unwrap_or_default(),
+            facts.git_remote.as_deref().unwrap_or_default()
+        )
+        .to_lowercase();
+        Ok(Tri::of(hay.contains(needle)))
+    }
+
     fn text(&self, needle: &str) -> anyhow::Result<Tri> {
         Ok(Tri::of(self.text_sets.contains(needle, self.id)))
     }
 
     fn has(&self, flag: &str) -> anyhow::Result<Tri> {
-        Ok(match (crate::affordance::Kind::parse(flag), &self.counts) {
-            (Some(k), Some(counts)) => Tri::of(counts.get(&k).is_some_and(|n| *n > 0)),
-            _ => Tri::Unknown,
+        match flag {
+            "compacted" => Ok(self
+                .counted
+                .and_then(|c| c.facts.as_ref())
+                .map_or(Tri::Unknown, |f| Tri::of(f.compactions > 0))),
+            "subagents" => Ok(self
+                .counted
+                .and_then(|c| c.facts.as_ref())
+                .filter(|_| self.subagents_fresh)
+                .and_then(|f| f.subagent_count)
+                .map_or(Tri::Unknown, |n| Tri::of(n > 0))),
+            _ => Ok(match (crate::affordance::Kind::parse(flag), self.counted) {
+                (Some(k), Some(counted)) => Tri::of(counted.counts.get(&k).is_some_and(|n| *n > 0)),
+                _ => Tri::Unknown,
+            }),
+        }
+    }
+
+    fn count(&self, field: FieldId) -> anyhow::Result<Option<u64>> {
+        Ok(match field {
+            FieldId::Compactions => self
+                .counted
+                .and_then(|c| c.facts.as_ref())
+                .map(|f| u64::from(f.compactions)),
+            FieldId::Agents => self
+                .counted
+                .and_then(|c| c.facts.as_ref())
+                .filter(|_| self.subagents_fresh)
+                .and_then(|f| f.subagent_count)
+                .map(u64::from),
+            _ => None,
         })
     }
 }
@@ -619,6 +694,7 @@ struct RefQuery<'a> {
     query: &'a SessionQuery,
     text_sets: &'a TextSets,
     heavy: bool,
+    touches_subagents: bool,
     table: Option<crate::catalog::AffordanceTable>,
     demand_counts: bool,
     /// Opened on the first counted demand. A failed open is not remembered (the catalog's door
@@ -633,10 +709,13 @@ impl<'a> RefQuery<'a> {
     }
 
     fn with_counts_mode(query: &'a SessionQuery, text_sets: &'a TextSets, demand_counts: bool) -> Self {
+        let touches_subagents =
+            query.mentions_field(FieldId::Agents) || query.needles(FieldId::Has).iter().any(|f| f == "subagents");
         Self {
             query,
             text_sets,
             heavy: query.needs_parse() || query.needs_index() || query.needs_events() || query.needs_forest(),
+            touches_subagents,
             table: None,
             demand_counts,
             reader: None,
@@ -658,31 +737,38 @@ impl<'a> RefQuery<'a> {
             ext: &RefFacts {
                 id: &r.id,
                 text_sets: self.text_sets,
-                counts: None,
+                counted: None,
+                subagents_fresh: false,
             },
         })?;
         if !matches!(without_counts, Tri::Unknown) || !self.query.needs_counted() {
             return Ok(without_counts);
         }
-        let counts = if self.demand_counts {
+        let counted = if self.demand_counts {
             if self.reader.is_none() {
                 self.reader = crate::catalog::Reader::open();
             }
             self.reader
                 .as_ref()
-                .and_then(|reader| reader.counts_with_probe(r, &self.probe.snapshot(r), &mut self.probe))
+                .and_then(|reader| reader.counted_with_probe(r, &self.probe.snapshot(r), &mut self.probe))
         } else {
             self.table
                 .get_or_insert_with(crate::catalog::AffordanceTable::load)
-                .counts_with_probe(r, &self.probe.snapshot(r), &mut self.probe)
+                .counted_with_probe(r, &self.probe.snapshot(r), &mut self.probe)
         };
+        let subagents_fresh = self.touches_subagents
+            && counted
+                .as_ref()
+                .and_then(|c| c.facts.as_ref())
+                .is_some_and(|f| f.subagent_count.is_some() && f.subagent_guard.fresh(&mut self.probe));
         self.query.eval(&Facts {
             r,
             session: None,
             ext: &RefFacts {
                 id: &r.id,
                 text_sets: self.text_sets,
-                counts,
+                counted: counted.as_ref(),
+                subagents_fresh,
             },
         })
     }
@@ -1070,7 +1156,8 @@ mod tests {
             let ext = RefFacts {
                 id: &r.id,
                 text_sets: &texts,
-                counts: None,
+                counted: None,
+                subagents_fresh: false,
             };
             assert_eq!(
                 query
@@ -1399,5 +1486,136 @@ mod tests {
         .is_err());
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].id, r.id);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn counted_session_fields_evaluate_without_parse_and_revalidate_subagent_forest() {
+        let world = crate::test_world("counted_query_fields");
+        let path = world.write_session(
+            "parent",
+            &[
+                serde_json::json!({
+                    "type": "assistant",
+                    "uuid": "u1",
+                    "gitBranch": "feat/spine",
+                    "message": {
+                        "role": "assistant",
+                        "model": "claude-opus-4-6",
+                        "content": [{"type": "text", "text": "step 1"}]
+                    }
+                }),
+                serde_json::json!({
+                    "type": "system",
+                    "uuid": "b1",
+                    "subtype": "compact_boundary",
+                    "compactMetadata": {"trigger": "auto", "preTokens": 4000}
+                }),
+                serde_json::json!({
+                    "type": "assistant",
+                    "uuid": "u2",
+                    "message": {
+                        "role": "assistant",
+                        "model": "claude-haiku-4-5",
+                        "content": [{"type": "text", "text": "step 2"}]
+                    }
+                }),
+            ],
+        );
+        world.write_agent(
+            "parent",
+            "sub-1",
+            &serde_json::json!({"agentType": "Explore"}),
+            &[serde_json::json!({"type": "user", "message": {"role": "user", "content": "hi"}})],
+        );
+
+        let r = SessionRef::new("parent", crate::Harness::Claude, path);
+        crate::catalog::sync(std::slice::from_ref(&r));
+
+        // First query counts transcript facts without walking the sub-agent forest.
+        let mut initial = vec![r.clone()];
+        filter_refs(
+            &mut initial,
+            &SessionQuery::parse("model:haiku").unwrap(),
+            &TextSets::empty(),
+        )
+        .unwrap();
+        assert_eq!(initial.len(), 1);
+
+        let indexed = crate::catalog::session_indexed_fields(&r).expect("sessions row indexed");
+        assert_eq!(indexed.model.as_deref(), Some("claude-opus-4-6"));
+        assert_eq!(indexed.git_branch.as_deref(), Some("feat/spine"));
+        assert_eq!(indexed.compactions, Some(1));
+        assert_eq!(
+            indexed.subagent_count, None,
+            "non-subagent pass must not walk the sub-agent forest"
+        );
+
+        // First sub-agent query populates and guards `subagent_count`.
+        let mut sub_initial = vec![r.clone()];
+        filter_refs(
+            &mut sub_initial,
+            &SessionQuery::parse("agents=1").unwrap(),
+            &TextSets::empty(),
+        )
+        .unwrap();
+        assert_eq!(sub_initial.len(), 1);
+        assert_eq!(
+            crate::catalog::session_indexed_fields(&r).unwrap().subagent_count,
+            Some(1)
+        );
+
+        // Every counted field now settles definitely in `RefQuery::cheap` (zero transcript parse or forest walk).
+        let texts = TextSets::empty();
+        for (expr, want) in [
+            ("model:opus", Tri::True),
+            ("model:haiku", Tri::True),
+            ("model=claude-haiku-4-5", Tri::True),
+            ("model=haiku", Tri::False),
+            ("model:sonnet", Tri::False),
+            ("git:spine", Tri::True),
+            ("git=feat/spine", Tri::True),
+            ("git=spine", Tri::False),
+            ("compactions=1", Tri::True),
+            ("compactions>=2", Tri::False),
+            ("has:compacted", Tri::True),
+            ("agents=1", Tri::True),
+            ("agents>=2", Tri::False),
+            ("has:subagents", Tri::True),
+        ] {
+            let query = SessionQuery::parse(expr).unwrap();
+            assert!(
+                query.needs_counted() && !query.needs_parse() && !query.needs_forest(),
+                "{expr}"
+            );
+            for demand_counts in [false, true] {
+                let mut plan = RefQuery::with_counts_mode(&query, &texts, demand_counts);
+                assert_eq!(plan.cheap(&r).unwrap(), want, "{expr} (demand_counts={demand_counts})");
+            }
+        }
+
+        // Spawning a second sub-agent without touching the parent transcript invalidates `subagent_guard`:
+        // `cheap` returns `Unknown` for `agents` / `has:subagents` (never stale `1`), and `filter_refs`
+        // refreshes the count to `2`!
+        world.write_agent(
+            "parent",
+            "sub-2",
+            &serde_json::json!({"agentType": "Explore"}),
+            &[serde_json::json!({"type": "user", "message": {"role": "user", "content": "hi 2"}})],
+        );
+        let q_agents2 = SessionQuery::parse("agents=2").unwrap();
+        let mut stale_plan = RefQuery::with_counts_mode(&q_agents2, &texts, true);
+        assert_eq!(
+            stale_plan.cheap(&r).unwrap(),
+            Tri::Unknown,
+            "new sub-agent must invalidate subagent_guard without parent transcript edit"
+        );
+        let mut refreshed = vec![r.clone()];
+        filter_refs(&mut refreshed, &q_agents2, &texts).unwrap();
+        assert_eq!(refreshed.len(), 1);
+        assert_eq!(
+            crate::catalog::session_indexed_fields(&r).unwrap().subagent_count,
+            Some(2)
+        );
     }
 }

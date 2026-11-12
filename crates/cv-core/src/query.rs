@@ -111,12 +111,12 @@ pub const HAS_FLAGS: &[(&str, &str, Cost)] = &[
     (
         "subagents",
         "spawned at least one sub-agent (its forest, as `agents` counts)",
-        Cost::Events,
+        Cost::Counted,
     ),
     ("errors", "has at least one error event", Cost::Events),
     ("tools", "used at least one tool", Cost::Events),
     ("images", "contains an image block", Cost::Events),
-    ("compacted", "context was compacted at least once", Cost::Events),
+    ("compacted", "context was compacted at least once", Cost::Counted),
     ("workflows", "ran at least one Workflow-tool run", Cost::Events),
     (
         "plan",
@@ -159,8 +159,8 @@ pub const HAS_FLAGS: &[(&str, &str, Cost)] = &[
 pub const FIELDS: &[FieldDef] = &[
     FieldDef { id: FieldId::Harness, name: "harness", aliases: &[("h", None)], kind: Kind::HarnessEnum, cost: Cost::Catalog,
         desc: "Which harness produced the session.", example: "harness:claude" },
-    FieldDef { id: FieldId::Model, name: "model", aliases: &[("m", None)], kind: Kind::Str, cost: Cost::Parse,
-        desc: "Any turn's model id (substring). Parse-required — pair with a cheap term to stay fast.", example: "model:fable" },
+    FieldDef { id: FieldId::Model, name: "model", aliases: &[("m", None)], kind: Kind::Str, cost: Cost::Counted,
+        desc: "Any turn's model id (substring; counted in catalog once parsed).", example: "model:fable" },
     FieldDef { id: FieldId::Cwd, name: "cwd", aliases: &[("dir", None)], kind: Kind::Path, cost: Cost::Catalog,
         desc: "Working directory (substring).", example: "cwd:/pug/clustervision" },
     FieldDef { id: FieldId::Title, name: "title", aliases: &[], kind: Kind::Str, cost: Cost::Catalog,
@@ -173,8 +173,8 @@ pub const FIELDS: &[FieldDef] = &[
         desc: "Creation time (date or RFC3339).", example: "created>2026-01-01" },
     FieldDef { id: FieldId::Updated, name: "updated", aliases: &[("before", Some(Op::Lt)), ("after", Some(Op::Ge)), ("until", Some(Op::Lt)), ("since", Some(Op::Ge))], kind: Kind::Date, cost: Cost::Catalog,
         desc: "Last-updated time. (`before:`/`until:` are sugar for `updated<`; `after:`/`since:` for `updated>=`.)", example: "updated:2026-01-01..2026-04-01" },
-    FieldDef { id: FieldId::Git, name: "git", aliases: &[("branch", None)], kind: Kind::Str, cost: Cost::Parse,
-        desc: "Git branch or repo (substring). Parse-required.", example: "git:main" },
+    FieldDef { id: FieldId::Git, name: "git", aliases: &[("branch", None)], kind: Kind::Str, cost: Cost::Counted,
+        desc: "Git branch or repo (substring; counted in catalog once parsed).", example: "git:main" },
     FieldDef { id: FieldId::Text, name: "text", aliases: &[("content", None)], kind: Kind::Str, cost: Cost::Index,
         desc: "Full-text match over session content (tantivy). Needs `cv index`.", example: "text:\"SandboxDenied\"" },
     FieldDef { id: FieldId::Tool, name: "tool", aliases: &[], kind: Kind::Str, cost: Cost::Events,
@@ -182,19 +182,19 @@ pub const FIELDS: &[FieldDef] = &[
     FieldDef { id: FieldId::Touched, name: "touched", aliases: &[("file", None)], kind: Kind::Path, cost: Cost::Events,
         desc: "Read or edited a file at this path (events catalog).", example: "touched:src/ir.rs" },
     FieldDef { id: FieldId::Has, name: "has", aliases: &[], kind: Kind::Flag, cost: Cost::Events,
-        desc: "A capability flag (subagents, errors, tools, images, compacted, workflows; events tier) or an affordance (plan, schedule, background_job, …; counted tier: catalog-fast once `cv index` or any full read has counted the session, a parse otherwise).", example: "has:plan" },
+        desc: "A capability flag (errors, tools, images, workflows; events tier) or a counted fact/affordance (subagents, compacted, plan, schedule, background_job, …; counted tier: catalog-fast once `cv index` or any full read has counted the session, a parse otherwise).", example: "has:plan" },
     FieldDef { id: FieldId::Subtool, name: "subtool", aliases: &[], kind: Kind::Str, cost: Cost::Forest,
         desc: "A tool used by a *sub-agent* (not the orchestrator). Walks the forest.", example: "subtool:Bash" },
     FieldDef { id: FieldId::Agent, name: "agent", aliases: &[("subagent", None)], kind: Kind::Str, cost: Cost::Forest,
         desc: "Spawned a sub-agent of this type (substring): Explore, general-purpose, …", example: "agent:Explore" },
-    FieldDef { id: FieldId::Agents, name: "agents", aliases: &[("subagents", None)], kind: Kind::Num, cost: Cost::Forest,
-        desc: "Sub-agent forest size.", example: "agents>=5" },
+    FieldDef { id: FieldId::Agents, name: "agents", aliases: &[("subagents", None)], kind: Kind::Num, cost: Cost::Counted,
+        desc: "Sub-agent forest size (counted in catalog once parsed).", example: "agents>=5" },
     FieldDef { id: FieldId::Workflow, name: "workflow", aliases: &[("wf", None)], kind: Kind::Str, cost: Cost::Forest,
         desc: "Ran a `Workflow` matching this name/run-id (substring).", example: "workflow:census" },
     FieldDef { id: FieldId::Workflows, name: "workflows", aliases: &[], kind: Kind::Num, cost: Cost::Forest,
         desc: "Number of `Workflow`-tool runs.", example: "workflows>=1" },
-    FieldDef { id: FieldId::Compactions, name: "compactions", aliases: &[("compacts", None)], kind: Kind::Num, cost: Cost::Forest,
-        desc: "Number of context-compaction boundaries.", example: "compactions>=2" },
+    FieldDef { id: FieldId::Compactions, name: "compactions", aliases: &[("compacts", None)], kind: Kind::Num, cost: Cost::Counted,
+        desc: "Number of context-compaction boundaries (counted in catalog once parsed).", example: "compactions>=2" },
 ];
 
 fn field_for(key: &str) -> Option<&'static FieldDef> {
@@ -327,6 +327,10 @@ pub trait ExtFacts {
     /// A model predicate resolved without retaining messages. `Unknown` falls back to the
     /// provided Session's model and turn models, preserving existing resolver implementations.
     fn model(&self, _needle: &str, _exact: bool) -> anyhow::Result<Tri> {
+        Ok(Tri::Unknown)
+    }
+    /// A git branch/remote predicate resolved from catalog facts. `Unknown` falls back to `Session::git`.
+    fn git(&self, _needle: &str, _exact: bool) -> anyhow::Result<Tri> {
         Ok(Tri::Unknown)
     }
     fn text(&self, _needle: &str) -> anyhow::Result<Tri> {
@@ -472,6 +476,18 @@ impl SessionQuery {
         let mut out = Vec::new();
         collect_needles(&self.expr, field, Some(Op::Eq), &mut out);
         out
+    }
+
+    pub(crate) fn mentions_field(&self, field: FieldId) -> bool {
+        fn walk(e: &Expr, field: FieldId) -> bool {
+            match e {
+                Expr::All => false,
+                Expr::Term(t) => t.field == field,
+                Expr::Not(b) => walk(b, field),
+                Expr::And(v) | Expr::Or(v) => v.iter().any(|x| walk(x, field)),
+            }
+        }
+        walk(&self.expr, field)
     }
 
     /// Cheap catalog-only prefilter: evaluate against the ref alone (parse/index/events leaves are
@@ -634,26 +650,30 @@ fn eval_term(t: &Term, f: &Facts) -> anyhow::Result<Tri> {
                 }
             })
         })?,
-        FieldId::Git => match f.session {
-            None => Tri::Unknown,
-            Some(s) if t.op == Op::Eq => Tri::of(s.git.as_ref().is_some_and(|g| {
-                [g.branch.as_deref(), g.remote.as_deref()]
-                    .into_iter()
-                    .flatten()
-                    .any(|value| val_hit(&t.val, Op::Eq, &value.to_lowercase()))
-            })),
-            Some(s) => {
-                let hay = s.git.as_ref().map(|g| {
+        FieldId::Git => or_over(&t.val, |needle| {
+            let resolved = f.ext.git(needle, t.op == Op::Eq)?;
+            if resolved != Tri::Unknown {
+                return Ok(resolved);
+            }
+            Ok(match f.session {
+                None => Tri::Unknown,
+                Some(s) if t.op == Op::Eq => Tri::of(s.git.as_ref().is_some_and(|g| {
+                    [g.branch.as_deref(), g.remote.as_deref()]
+                        .into_iter()
+                        .flatten()
+                        .any(|value| value.to_lowercase() == needle)
+                })),
+                Some(s) => Tri::of(s.git.as_ref().is_some_and(|g| {
                     format!(
                         "{} {}",
-                        g.branch.clone().unwrap_or_default(),
-                        g.remote.clone().unwrap_or_default()
+                        g.branch.as_deref().unwrap_or_default(),
+                        g.remote.as_deref().unwrap_or_default()
                     )
                     .to_lowercase()
-                });
-                str_contains_any(&t.val, hay)
-            }
-        },
+                    .contains(needle)
+                })),
+            })
+        })?,
         // External (index/events).
         FieldId::Text => or_over(&t.val, |n| f.ext.text(n))?,
         FieldId::Tool => or_over(&t.val, |n| {
@@ -729,14 +749,6 @@ fn val_hit(val: &Val, op: Op, h: &str) -> bool {
             _ => strs.iter().any(|n| h.contains(n)),
         },
         _ => false,
-    }
-}
-
-/// Substring-any (the `:` semantic) against an optional lowercased haystack.
-fn str_contains_any(val: &Val, hay: Option<String>) -> Tri {
-    match hay {
-        None => Tri::False,
-        Some(h) => Tri::of(val_hit(val, Op::Contains, &h)),
     }
 }
 

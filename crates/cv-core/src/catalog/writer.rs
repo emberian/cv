@@ -54,7 +54,9 @@ impl Writer {
             if !crate::source::unchanged(r, &source) {
                 return;
             }
-            super::imp::note_counts_in(&mut self.conn, r, &source, Some(counted.turns), || counted.counts);
+            super::imp::note_counts_in(&mut self.conn, r, &source, Some(counted.turns), counted.facts, || {
+                counted.counts
+            });
         }
         #[cfg(not(feature = "sqlite"))]
         {

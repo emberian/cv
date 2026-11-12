@@ -77,9 +77,20 @@ fn update(tx: &rusqlite::Transaction, rowid: i64, r: &SessionRef) -> rusqlite::R
     Ok(())
 }
 
-fn insert(tx: &rusqlite::Transaction, rowid: i64, r: &SessionRef, version: Option<&str>) -> rusqlite::Result<()> {
+#[derive(Default)]
+struct Preserved {
+    version: Option<String>,
+    model: Option<String>,
+    git_branch: Option<String>,
+    git_remote: Option<String>,
+    compactions: Option<i64>,
+    subagent_count: Option<i64>,
+}
+
+fn insert(tx: &rusqlite::Transaction, rowid: i64, r: &SessionRef, kept: Option<&Preserved>) -> rusqlite::Result<()> {
     let mut stmt = tx.prepare_cached(&format!(
-        "INSERT INTO sessions({REF_COLUMNS},writer_version,rowid) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)"
+        "INSERT INTO sessions({REF_COLUMNS},writer_version,model,git_branch,git_remote,compactions,subagent_count,rowid) \
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)"
     ))?;
     stmt.execute(params![
         r.harness.as_str(),
@@ -92,7 +103,12 @@ fn insert(tx: &rusqlite::Transaction, rowid: i64, r: &SessionRef, version: Optio
         r.message_count.map(|n| n as i64),
         r.created_at.and_then(|t| t.timestamp_nanos_opt()),
         r.updated_at.and_then(|t| t.timestamp_nanos_opt()),
-        version,
+        kept.and_then(|p| p.version.as_deref()),
+        kept.and_then(|p| p.model.as_deref()),
+        kept.and_then(|p| p.git_branch.as_deref()),
+        kept.and_then(|p| p.git_remote.as_deref()),
+        kept.and_then(|p| p.compactions),
+        kept.and_then(|p| p.subagent_count),
         rowid,
     ])?;
     wrote();
@@ -102,19 +118,27 @@ fn insert(tx: &rusqlite::Transaction, rowid: i64, r: &SessionRef, version: Optio
 struct Old {
     rowid: i64,
     row: Option<SessionRef>,
-    version: Option<String>,
+    preserved: Preserved,
 }
 
 fn old_rows(tx: &rusqlite::Transaction, h: Harness) -> rusqlite::Result<HashMap<Key, Old>> {
     let mut stmt = tx.prepare(&format!(
-        "SELECT {REF_COLUMNS},rowid,writer_version FROM sessions WHERE harness=?1"
+        "SELECT {REF_COLUMNS},rowid,writer_version,model,git_branch,git_remote,compactions,subagent_count \
+         FROM sessions WHERE harness=?1"
     ))?;
     let rows = stmt.query_map([h.as_str()], |row| {
         // A cell this binary cannot decode is a changed row, rewritten, never a failed publication.
         let old = Old {
             rowid: row.get(10)?,
             row: row_to_ref(row).ok().flatten(),
-            version: row.get(11).ok().flatten(),
+            preserved: Preserved {
+                version: row.get(11).ok().flatten(),
+                model: row.get(12).ok().flatten(),
+                git_branch: row.get(13).ok().flatten(),
+                git_remote: row.get(14).ok().flatten(),
+                compactions: row.get(15).ok().flatten(),
+                subagent_count: row.get(16).ok().flatten(),
+            },
         };
         Ok(((row.get(1)?, row.get(2)?), old))
     })?;
@@ -161,7 +185,7 @@ pub(super) fn publish(tx: &rusqlite::Transaction, h: Harness, refs: &[SessionRef
     for (((k, r), id), kept) in listed.iter().zip(ids).zip(kept) {
         let before = old.get(k);
         if !kept {
-            insert(tx, id as i64, r, before.and_then(|o| o.version.as_deref()))?;
+            insert(tx, id as i64, r, before.map(|o| &o.preserved))?;
         } else if let Some(o) = before.filter(|o| !o.row.as_ref().is_some_and(|row| same_row(row, r))) {
             update(tx, o.rowid, r)?;
         }
