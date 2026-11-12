@@ -386,6 +386,16 @@ impl Adapter for Claude {
         m.extra.get("claude")?.get("attachment_type")?.as_str()
     }
 
+    fn delivered_body<'a>(&self, m: &crate::ir::Message, text: &'a str) -> Option<&'a str> {
+        if m.kind == MessageKind::InjectedContext && self.attachment_kind(m) == Some("queued_command") {
+            return Some(strip_system_reminder(text));
+        }
+        if m.role == Role::User && m.origin == Origin::Subagent {
+            return Some(text.trim_start().strip_prefix(COORDINATOR_HEAD).unwrap_or(text).trim());
+        }
+        None
+    }
+
     fn dependencies(&self, r: &SessionRef, _probe: &mut Probe, deps: &mut Dependencies) -> Option<()> {
         if r.path
             .file_name()
@@ -685,9 +695,25 @@ pub const PERSISTED_OUTPUT_KEY: &str = "persistedOutput";
 /// "Prompt is too long", "No response requested.", …): never model output, never sent to the API.
 pub const SYNTHETIC_MODEL: &str = "<synthetic>";
 
+/// Opening line Claude Code prepends to a coordinator's mid-run turn (`isMeta: true`,
+/// `origin.kind = "coordinator"`).
+const COORDINATOR_HEAD: &str = "The coordinator sent a message while you were working:";
+
+fn strip_system_reminder(s: &str) -> &str {
+    let s = s.trim();
+    let s = s
+        .strip_prefix("<system-reminder")
+        .map(|r| r.split_once('>').map(|x| x.1).unwrap_or(r))
+        .unwrap_or(s);
+    s.strip_suffix("</system-reminder>").unwrap_or(s).trim()
+}
+
 fn user_origin_from(scheduled: bool, is_meta: bool, kind: Option<&str>) -> Origin {
     if scheduled {
         return Origin::Scheduler;
+    }
+    if matches!(kind, Some("coordinator" | "peer" | "agent")) {
+        return Origin::Subagent;
     }
     if is_meta {
         return Origin::Harness;
@@ -705,6 +731,9 @@ fn user_kind_from_head(origin: Origin, head: &str) -> (MessageKind, Origin) {
     }
     if origin != Origin::Harness {
         return (MessageKind::Prompt, origin);
+    }
+    if head.starts_with(COORDINATOR_HEAD) {
+        return (MessageKind::Prompt, Origin::Subagent);
     }
     if head.starts_with("<task-notification>") {
         let summary = tag_inner(head, "summary").unwrap_or("").trim_start();

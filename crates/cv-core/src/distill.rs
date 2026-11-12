@@ -24,7 +24,7 @@
 //! messages, its commit messages and notes. That is a property of the store, not of this module.
 
 use crate::ir::{
-    est_tokens, est_tokens_bytes, tool_index, truncate, Block, Message, MessageKind, Origin, Role, Session,
+    est_tokens, est_tokens_bytes, tool_index, truncate, Block, Harness, Message, MessageKind, Origin, Role, Session,
 };
 use regex::Regex;
 use serde::Serialize;
@@ -765,7 +765,7 @@ fn analyze(session: &Session, opts: &DistillOptions, demand: Demand) -> anyhow::
     // when the agent reads one, its latest read is kept (capped) in the timeline.
     let mut referenced: std::collections::HashSet<String> = std::collections::HashSet::new();
     for m in msgs.iter().filter(|_| demand != Demand::Findings) {
-        let Some(t) = incoming_text(m, &resolver)? else {
+        let Some(t) = incoming_text(session.harness, m, &resolver)? else {
             continue;
         };
         // A resumed distilled lane's opening prompt is its predecessor's pack: only the original
@@ -851,7 +851,9 @@ fn analyze(session: &Session, opts: &DistillOptions, demand: Demand) -> anyhow::
         let mut reader = MessageText::new(m, &resolver);
         match (m.role, m.kind) {
             (Role::User, MessageKind::Prompt) if demand != Demand::Findings => {
-                let text = reader.text()?.unwrap_or_default();
+                let raw = reader.text()?.unwrap_or_default();
+                let unwrapped = crate::harness::delivered_body(session.harness, m, &raw).map(str::to_string);
+                let text = unwrapped.clone().unwrap_or(raw);
                 if text.trim().is_empty() {
                     continue;
                 }
@@ -864,17 +866,28 @@ fn analyze(session: &Session, opts: &DistillOptions, demand: Demand) -> anyhow::
                         None => (i, text),
                     });
                 } else if !in_tail {
-                    let who = if m.origin == Origin::Human {
-                        "user"
+                    if unwrapped.is_some() {
+                        if delivered_bodies.insert(text.clone()) {
+                            timeline.push(Entry {
+                                idx: i,
+                                when: when(m),
+                                heading: "message delivered while working".into(),
+                                body: text,
+                            });
+                        }
                     } else {
-                        "message to this agent"
-                    };
-                    timeline.push(Entry {
-                        idx: i,
-                        when: when(m),
-                        heading: who.into(),
-                        body: text,
-                    });
+                        let who = if m.origin == Origin::Human {
+                            "user"
+                        } else {
+                            "message to this agent"
+                        };
+                        timeline.push(Entry {
+                            idx: i,
+                            when: when(m),
+                            heading: who.into(),
+                            body: text,
+                        });
+                    }
                 }
             }
             (_, MessageKind::CompactionSummary) if !in_tail && demand != Demand::Findings => {
@@ -908,7 +921,7 @@ fn analyze(session: &Session, opts: &DistillOptions, demand: Demand) -> anyhow::
             (_, MessageKind::InjectedContext) if !in_tail && demand != Demand::Findings => {
                 // A message delivered mid-run (peer agent, coordinator, queued user input). One
                 // message can arrive both as a queued command and as a coordinator turn.
-                if let Some(body) = delivered(m, &resolver)? {
+                if let Some(body) = delivered(session.harness, m, &resolver)? {
                     if delivered_bodies.insert(body.clone()) {
                         timeline.push(Entry {
                             idx: i,
@@ -1120,7 +1133,7 @@ fn analyze(session: &Session, opts: &DistillOptions, demand: Demand) -> anyhow::
     );
     let elided_hint = (opts.ledger && elided_outputs > 0).then_some((retrieve_ref.as_str(), elided_outputs));
     render_handoff(&mut h, last_words.as_ref(), &facts, msgs, elided_hint);
-    render_grounding(&mut h, &ground(msgs, &uses, &resolver)?);
+    render_grounding(&mut h, &ground(session.harness, msgs, &uses, &resolver)?);
     if let Some((i, text)) = &brief {
         let _ = writeln!(h, "{BRIEF_HEAD}{i}]\n\n{}\n", text.trim());
     }
@@ -1163,7 +1176,14 @@ fn analyze(session: &Session, opts: &DistillOptions, demand: Demand) -> anyhow::
         h.push('\n');
     }
 
-    let tail = resumable_tail(msgs, tail_start, opts, &retrieve_ref, &session.resolver())?;
+    let tail = resumable_tail(
+        session.harness,
+        msgs,
+        tail_start,
+        opts,
+        &retrieve_ref,
+        &session.resolver(),
+    )?;
     let tail_md = render_prepared_tail(&tail, tail_start, opts)?;
     let tail_tool_calls = tail
         .iter()
@@ -1215,51 +1235,32 @@ fn analyze(session: &Session, opts: &DistillOptions, demand: Demand) -> anyhow::
     })
 }
 
-/// How Claude Code records a coordinator's message to a running sub-agent: a meta user turn
-/// (`isMeta`, `origin.kind = "coordinator"`) whose text opens with this line. The IR reads it as
-/// injected context, like a hook's output.
-const COORDINATOR_HEAD: &str = "The coordinator sent a message while you were working:";
-
-/// The body of a message delivered to the lane mid-run: a queued command (out of its reminder)
-/// or a coordinator turn (after its opening line). On session 698fc87d the coordinator turns
-/// were dropped: the infra lane a221a2ea8cf1d4104 received 11, its timeline kept the 3 that also
-/// arrived as queued commands, and the root's resume message (its quest and state file) was not
-/// among them.
-fn delivered(m: &Message, resolver: &crate::Resolver) -> anyhow::Result<Option<String>> {
+/// The body of a message delivered to the lane mid-run via an injected-context record (e.g. a
+/// queued command wrapped in harness framing), unwrapped by the session's adapter.
+fn delivered(harness: Harness, m: &Message, resolver: &crate::Resolver) -> anyhow::Result<Option<String>> {
     if m.kind != MessageKind::InjectedContext {
         return Ok(None);
     }
-    let queued = matches!(crate::harness::attachment_kind(m), Some("queued_command"));
-    if !queued && m.role != Role::User {
-        return Ok(None);
-    }
     let text = MessageText::new(m, resolver).text()?.unwrap_or_default();
-    if queued {
-        return Ok(Some(strip_reminder(&text)));
-    }
-    Ok(text
-        .trim_start()
-        .strip_prefix(COORDINATOR_HEAD)
-        .map(|body| body.trim().to_string()))
+    Ok(crate::harness::delivered_body(harness, m, &text)
+        .filter(|body| !body.is_empty())
+        .map(str::to_string))
 }
 
-/// Everything said to the lane: its prompts and the messages delivered to it.
-fn incoming_text(m: &Message, resolver: &crate::Resolver) -> anyhow::Result<Option<String>> {
+/// Everything said to the lane: its prompts (unwrapped when delivered by an agent/coordinator)
+/// and any messages delivered mid-run via injected context.
+fn incoming_text(harness: Harness, m: &Message, resolver: &crate::Resolver) -> anyhow::Result<Option<String>> {
     if m.role == Role::User && m.kind == MessageKind::Prompt {
-        return MessageText::new(m, resolver).text();
+        let Some(raw) = MessageText::new(m, resolver).text()? else {
+            return Ok(None);
+        };
+        return Ok(Some(
+            crate::harness::delivered_body(harness, m, &raw)
+                .map(str::to_string)
+                .unwrap_or(raw),
+        ));
     }
-    delivered(m, resolver)
-}
-
-/// A peer message arrives wrapped in a `<system-reminder>`; keep what is inside.
-fn strip_reminder(s: &str) -> String {
-    let s = s.trim();
-    let s = s
-        .strip_prefix("<system-reminder")
-        .map(|r| r.split_once('>').map(|x| x.1).unwrap_or(r))
-        .unwrap_or(s);
-    let s = s.strip_suffix("</system-reminder>").unwrap_or(s);
-    s.trim().to_string()
+    delivered(harness, m, resolver)
 }
 
 // The pack's section headings. The renderer writes them numbered; `unwrap_pack` finds them by
@@ -1710,9 +1711,6 @@ fn is_list_item(line: &str) -> bool {
     let numbered = digits.len() < line.len() && (digits.starts_with(". ") || digits.starts_with(") "));
     line.starts_with("- ") || line.starts_with("* ") || numbered
 }
-/// A state file is carried whole up to this many bytes (head and tail beyond, the rest on disk).
-const STATE_FILE_MAX: usize = 24 * 1024;
-
 /// A file under `docs/` or a scratch directory whose name says it is a state file.
 fn is_state_path(p: &str) -> bool {
     let name = basename(p);
@@ -1724,10 +1722,10 @@ fn is_state_path(p: &str) -> bool {
 
 /// Files a message to the lane calls its state file ("your brief and state file is `…`"): the
 /// infra lane's is `edge/demo/CHECKLIST.md`, which no name rule finds.
-fn named_state_files(msgs: &[Message], resolver: &crate::Resolver) -> anyhow::Result<Vec<String>> {
+fn named_state_files(harness: Harness, msgs: &[Message], resolver: &crate::Resolver) -> anyhow::Result<Vec<String>> {
     let mut named: Vec<String> = Vec::new();
     for m in msgs {
-        let Some(text) = incoming_text(m, resolver)? else {
+        let Some(text) = incoming_text(harness, m, resolver)? else {
             continue;
         };
         let text = unwrap_pack(&text).map_or(text, |(brief, _)| brief);
@@ -1758,6 +1756,7 @@ fn heredoc_body(cmd: &str, target: &str) -> Option<String> {
 }
 
 fn ground(
+    harness: Harness,
     msgs: &[Message],
     uses: &HashMap<&str, crate::ir::ToolCall<'_>>,
     resolver: &crate::Resolver,
@@ -1765,7 +1764,7 @@ fn ground(
     let open_re = re(Re::OpenItem);
     let decided_re = re(Re::Decision);
     let window = tail_cut(msgs, GROUNDING_WINDOW, uses);
-    let named = named_state_files(msgs, resolver)?;
+    let named = named_state_files(harness, msgs, resolver)?;
     let mut g = Grounding::default();
     let mut open: Vec<(usize, String)> = Vec::new();
     let mut decisions: Vec<(usize, String)> = Vec::new();
@@ -1780,40 +1779,57 @@ fn ground(
             let words: String = match block {
                 Block::Text { .. } => reader.block(index)?.to_string(),
                 Block::ToolUse { name, input, .. } => {
-                    let input = input.resolve()?;
-                    let s = |k: &str| input.get(k).and_then(Value::as_str).unwrap_or("");
-                    if i >= window {
-                        let path = s("file_path");
-                        match name.as_str() {
-                            "Write" if is_state(path, &named) => {
-                                g.state = Some((i, path.to_string(), "Write".into(), Some(s("content").to_string())))
+                    if i < window && name != "SendMessage" {
+                        continue;
+                    }
+                    let msg_words: Option<String> = input.with_view(|view| {
+                        let string_field = |key: &str| -> anyhow::Result<Option<String>> {
+                            match view.get(key)? {
+                                Some(v) if v.is_string()? => Ok(v.resolve()?.as_str().map(str::to_owned)),
+                                _ => Ok(None),
                             }
-                            "Edit" | "MultiEdit" if is_state(path, &named) => {
-                                g.state = Some((i, path.to_string(), "Edit".into(), None))
-                            }
-                            _ => {
-                                if let Some(cmd) = command_of(&input) {
-                                    for c in re(Re::HeredocTarget).captures_iter(cmd) {
-                                        if is_state(&c[1], &named) {
-                                            let body = heredoc_body(cmd, &c[1]);
-                                            g.state = Some((i, c[1].to_string(), "shell".into(), body));
+                        };
+                        if i >= window {
+                            let path = string_field("file_path")?.unwrap_or_default();
+                            match name.as_str() {
+                                "Write" if is_state(&path, &named) => {
+                                    let content = string_field("content")?.unwrap_or_default();
+                                    g.state = Some((i, path, "Write".into(), Some(content)));
+                                }
+                                "Edit" | "MultiEdit" if is_state(&path, &named) => {
+                                    g.state = Some((i, path, "Edit".into(), None));
+                                }
+                                "Write" | "Edit" | "MultiEdit" => {}
+                                _ => {
+                                    if let Some(cmd) = string_field("command")? {
+                                        for c in re(Re::HeredocTarget).captures_iter(&cmd) {
+                                            if is_state(&c[1], &named) {
+                                                let body = heredoc_body(&cmd, &c[1]);
+                                                g.state = Some((i, c[1].to_string(), "shell".into(), body));
+                                            }
                                         }
-                                    }
-                                    // A named state file rewritten in place by a script (`sed -i`,
-                                    // `python3 -`, `perl -i`): the transcript holds no content.
-                                    let rewrites = re(Re::InPlace).is_match(cmd);
-                                    let hit = named.iter().find(|p| rewrites && cmd.contains(basename(p)));
-                                    if let Some(path) = hit.filter(|_| g.state.as_ref().is_none_or(|st| st.0 != i)) {
-                                        g.state = Some((i, path.clone(), "a script, in place".into(), None));
+                                        // A named state file rewritten in place by a script (`sed -i`,
+                                        // `python3 -`, `perl -i`): the transcript holds no content.
+                                        let rewrites = re(Re::InPlace).is_match(&cmd);
+                                        let hit = named.iter().find(|p| rewrites && cmd.contains(basename(p)));
+                                        if let Some(path) = hit.filter(|_| g.state.as_ref().is_none_or(|st| st.0 != i))
+                                        {
+                                            g.state = Some((i, path.clone(), "a script, in place".into(), None));
+                                        }
                                     }
                                 }
                             }
                         }
-                    }
-                    if name != "SendMessage" {
+                        if name == "SendMessage" {
+                            string_field("message")
+                        } else {
+                            Ok(None)
+                        }
+                    })?;
+                    let Some(words) = msg_words else {
                         continue;
-                    }
-                    s("message").to_string()
+                    };
+                    words
                 }
                 _ => continue,
             };
@@ -1870,7 +1886,6 @@ fn render_grounding(h: &mut String, g: &Grounding) {
     if let Some((i, path, how, content)) = &g.state {
         match content {
             Some(content) => {
-                let content = head_tail(content, STATE_FILE_MAX, &format!("the whole file is {path}"));
                 let _ = writeln!(
                     h,
                     "**State file** `{path}` [{i}] (written by {how}):\n\n~~~~\n{}\n~~~~\n",
@@ -2062,6 +2077,7 @@ fn clear_resume_usage(message: &mut Message) {
 /// records dropped. A trailing call with no result stays here (the pack shows the lane stopped
 /// mid-call); the Claude emitter drops it from a resumable session (`harness::claude::emit::emit`).
 fn resumable_tail(
+    harness: Harness,
     msgs: &[Message],
     tail_start: usize,
     opts: &DistillOptions,
@@ -2071,6 +2087,7 @@ fn resumable_tail(
     #[cfg(test)]
     note_work(|work| work.tail_preparations += 1);
     let mut out: Vec<Message> = Vec::new();
+    let mut delivered_tail: HashSet<String> = HashSet::new();
     for m in &msgs[tail_start..] {
         if !m.is_model_visible() {
             continue;
@@ -2112,16 +2129,27 @@ fn resumable_tail(
                 let mut owned = m.clone();
                 clear_resume_usage(&mut owned);
                 owned.materialize(resolver)?;
+                if let Some(raw) = owned.text() {
+                    if let Some(body) = crate::harness::delivered_body(harness, &owned, &raw) {
+                        let body = body.to_string();
+                        if !delivered_tail.insert(body.clone()) {
+                            continue;
+                        }
+                        owned.content = vec![Block::Text { text: body.into() }];
+                    }
+                }
                 out.push(owned);
             }
             (_, MessageKind::InjectedContext) => {
-                if let Some(body) = delivered(m, resolver)? {
-                    let mut u = Message::of_kind(Role::User, MessageKind::Prompt, Origin::Subagent);
-                    u.id = m.id.clone();
-                    u.parent_id = m.parent_id.clone();
-                    u.timestamp = m.timestamp;
-                    u.content.push(Block::Text { text: body.into() });
-                    out.push(u);
+                if let Some(body) = delivered(harness, m, resolver)? {
+                    if delivered_tail.insert(body.clone()) {
+                        let mut u = Message::of_kind(Role::User, MessageKind::Prompt, Origin::Subagent);
+                        u.id = m.id.clone();
+                        u.parent_id = m.parent_id.clone();
+                        u.timestamp = m.timestamp;
+                        u.content.push(Block::Text { text: body.into() });
+                        out.push(u);
+                    }
                 }
             }
             _ => {}
@@ -2211,6 +2239,7 @@ pub fn resume_preamble(d: &Distilled, keep_last: usize) -> String {
 /// gap, an unanswered trailing call is dropped (`harness::claude::emit::emit`). This is a selector.
 pub fn resumable_session(session: &Session, d: &Distilled, opts: &DistillOptions) -> anyhow::Result<Session> {
     let tail = resumable_tail(
+        session.harness,
         &session.messages,
         d.tail_start,
         opts,
@@ -3439,6 +3468,21 @@ facts text",
             "**State file** `{path}` [1] (written by a script, in place; content read from disk when distilled):\n\n~~~~\n# Run sheet\n\nstep 5: init, expects 2 purses\n~~~~"
         );
         assert!(d.head_md.contains(&expected), "{}", d.head_md);
+
+        // Large state files (>24 KB) are carried whole without arbitrary head+tail truncation.
+        let large_body = format!("# Big state\n{}MIDDLE_MARKER_SURVIVES\n{}\n# End", "line a\n".repeat(3000), "line b\n".repeat(3000));
+        assert!(large_body.len() > 40 * 1024);
+        std::fs::write(&checklist, &large_body).unwrap();
+        let d_large = distill_pack(
+            &s,
+            &DistillOptions {
+                keep_last: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(d_large.head_md.contains("MIDDLE_MARKER_SURVIVES"));
+        assert!(!d_large.head_md.contains("bytes elided"));
         std::fs::remove_dir_all(&dir).ok();
     }
 

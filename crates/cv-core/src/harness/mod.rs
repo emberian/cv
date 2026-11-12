@@ -674,6 +674,12 @@ pub trait Adapter: Send + Sync {
         None
     }
 
+    /// The unwrapped sender body of a message delivered mid-run (e.g. a coordinator turn or
+    /// queued command wrapped in harness framing). Default: none.
+    fn delivered_body<'a>(&self, _m: &Message, _text: &'a str) -> Option<&'a str> {
+        None
+    }
+
     /// Whether thinking recorded under `model` came from the provider this harness replays
     /// natively (its signatures are valid as they are). [`crate::emit::ThinkingMode::replay_default`]
     /// replays natively only when every recorded model is one some adapter claims. Default: no.
@@ -899,6 +905,14 @@ fn bag_owners(m: &Message) -> impl Iterator<Item = &'static dyn Adapter> + '_ {
 /// each bag's adapter, first answer wins.
 pub fn attachment_kind(m: &Message) -> Option<&str> {
     bag_owners(m).find_map(|a| a.attachment_kind(m))
+}
+
+/// The unwrapped sender body of a message delivered mid-run ([`Adapter::delivered_body`]), asked
+/// of each bag's adapter and the session's adapter.
+pub fn delivered_body<'a>(h: Harness, m: &Message, text: &'a str) -> Option<&'a str> {
+    bag_owners(m)
+        .chain(rootless(h))
+        .find_map(|a| a.delivered_body(m, text))
 }
 
 /// The file edit `m`'s record states outside its tool blocks ([`Adapter::native_edit`]), asked
