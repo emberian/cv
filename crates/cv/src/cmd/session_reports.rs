@@ -4,25 +4,15 @@
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use cv_core::ir::{truncate, Block, Message, MessageKind, Origin, Role, SessionRef};
+use cv_core::ir::{truncate, Block, Message, MessageKind, Origin, SessionRef};
 use cv_core::lanes::Lane;
 use cv_core::sanitize::sanitize_line;
 use cv_core::stream::{Demand, Flow};
 use serde::Serialize;
 
-use crate::util::{fmt_local, home_rel, parse_harness, resolve, short_id};
+use crate::util::{continue_hint, fmt_local, home_rel, parse_harness, resolve, short_id};
 
 // ===================== cv show --kind prompt,answer =====================
-
-/// The markers a question-dialog tool result starts with — Claude Code's two `AskUserQuestion`
-/// phrasings, and Devin CLI's `User answered your questions:`. The answers a person gives through
-/// that dialog never appear as a prompt — they are tool output — and an orchestrator re-reading
-/// what it was told needs them in the same stream.
-const ANSWER_MARKERS: &[&str] = &[
-    "The user answered",
-    "Your questions have been answered",
-    "User answered your questions",
-];
 
 #[derive(Debug, Clone, Serialize)]
 struct PromptRow {
@@ -30,37 +20,59 @@ struct PromptRow {
     index: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     timestamp: Option<DateTime<Utc>>,
-    /// `prompt` (typed by the person) or `answer` (an `AskUserQuestion` result).
+    /// `prompt` (typed by the person) or `answer` (a question-tool result).
     kind: &'static str,
     text: String,
 }
 
-/// Stream `r` once and keep only what the person said: `prompt`/`human` messages and the
-/// `AskUserQuestion` answers, in order, with their message indices. `window` bounds the indices
-/// (`[start, end)`, `None` end = through the last) when a window or pre-compaction span is given.
+fn is_question_tool(h: cv_core::Harness, name: &str, input: &cv_core::Json) -> Result<bool> {
+    if matches!(
+        cv_core::affordance::classify_tool_json(h, name, input)?,
+        Some((cv_core::affordance::Kind::Question, _))
+    ) {
+        return Ok(true);
+    }
+    let bare = name.rsplit(':').next().unwrap_or(name);
+    Ok(bare == "request_user_input")
+}
+
+/// Stream `r` once and keep only what the person said: `prompt`/`human` messages and results of
+/// [`cv_core::affordance::Kind::Question`] tool calls paired by `tool_use_id`, in order, with
+/// their raw session message indices. `span` bounds the raw message indices (`[start, end)`,
+/// `None` end = through the last) when `--pre-compaction` narrows the session before projection.
 fn collect_prompts(
     r: &SessionRef,
     adapter: &dyn cv_core::harness::Adapter,
-    window: Option<(usize, Option<usize>)>,
+    span: Option<(usize, Option<usize>)>,
     prompts: bool,
     answers: bool,
 ) -> Result<Vec<PromptRow>> {
     let mut rows = Vec::new();
+    let mut question_ids = std::collections::HashSet::new();
     let mut idx = 0usize;
     let resolver = cv_core::Resolver::new(Some(r.path.clone()));
     let mut error = None;
     adapter.try_stream(r, &Demand::LEAN.with_spans(), &mut |m: Message| {
         let i = idx;
         idx += 1;
-        if let Some((s, e)) = window {
-            if i < s {
-                return Flow::Continue;
-            }
-            if e.is_some_and(|e| i >= e) {
+        if let Some((_, Some(e))) = span {
+            if i >= e {
                 return Flow::Stop;
             }
         }
         let selected = (|| -> Result<()> {
+            if answers {
+                for block in &m.content {
+                    if let Block::ToolUse { id, name, input, .. } = block {
+                        if !id.is_empty() && is_question_tool(r.harness, name, input)? {
+                            question_ids.insert(id.clone());
+                        }
+                    }
+                }
+            }
+            if span.is_some_and(|(s, _)| i < s) {
+                return Ok(());
+            }
             if prompts && m.kind == MessageKind::Prompt && m.origin == Origin::Human {
                 let mut text = String::new();
                 for block in &m.content {
@@ -82,16 +94,26 @@ fn collect_prompts(
                         text,
                     });
                 }
-            } else if answers && (m.role == Role::Tool || m.kind == MessageKind::ToolResult) {
+            }
+            if answers {
                 for block in &m.content {
-                    if let Block::ToolResult { content, .. } = block {
-                        if is_question_answer(content, &resolver)? {
-                            rows.push(PromptRow {
-                                index: i,
-                                timestamp: m.timestamp,
-                                kind: "answer",
-                                text: content.try_resolve(&resolver)?.into_owned(),
-                            });
+                    if let Block::ToolResult {
+                        tool_use_id,
+                        content,
+                        is_error,
+                        ..
+                    } = block
+                    {
+                        if !*is_error && question_ids.contains(tool_use_id) {
+                            let text = content.try_resolve(&resolver)?.into_owned();
+                            if !text.trim().is_empty() {
+                                rows.push(PromptRow {
+                                    index: i,
+                                    timestamp: m.timestamp,
+                                    kind: "answer",
+                                    text,
+                                });
+                            }
                         }
                     }
                 }
@@ -110,69 +132,61 @@ fn collect_prompts(
     Ok(rows)
 }
 
-fn is_question_answer(content: &cv_core::Text, resolver: &cv_core::Resolver) -> Result<bool> {
-    let mut head = String::new();
-    let mut started = false;
-    let mut answer = false;
-    let result = content.try_for_each_chunk(resolver, 4096, |part| {
-        for c in part.chars() {
-            if !started && c.is_whitespace() {
-                continue;
-            }
-            started = true;
-            head.push(c);
-            if ANSWER_MARKERS.iter().any(|marker| head.starts_with(marker)) {
-                answer = true;
-                return Err(cv_core::stream::Stop.into());
-            }
-            if !ANSWER_MARKERS.iter().any(|marker| marker.starts_with(&head)) {
-                return Err(cv_core::stream::Stop.into());
-            }
-        }
-        Ok(())
-    });
-    if let Err(error) = result {
-        if !error.is::<cv_core::stream::Stop>() {
-            return Err(error);
-        }
+fn format_prompt_row(p: &PromptRow) -> String {
+    let ts = p
+        .timestamp
+        .map(|t| fmt_local(t, "%Y-%m-%d %H:%M"))
+        .unwrap_or_else(|| "----------------".into());
+    let tag = if p.kind == "prompt" { "user" } else { "answer" };
+    let mut out = format!("[{}] {ts}  {tag}\n", p.index);
+    // Prompts are the one thing in a transcript worth reading whole; sanitize per line so a
+    // pasted control sequence can't restyle the terminal, but never truncate.
+    for line in p.text.lines() {
+        out.push_str(&sanitize_line(line));
+        out.push('\n');
     }
-    Ok(answer)
+    out.push('\n');
+    out
 }
 
-/// What the person said in `r`, within `window`: typed prompts and/or `AskUserQuestion` answers,
-/// as text (each printed whole) or as one JSON array of `index, timestamp, kind, text` rows.
+/// What the person said in `r`: typed prompts and/or question-tool answers, sliced by `selector`
+/// and `max_bytes` AFTER projection so `--last N` means the last `N` prompts/answers.
 pub(crate) fn print_prompts(
     r: &SessionRef,
     adapter: &dyn cv_core::harness::Adapter,
-    window: Option<(usize, Option<usize>)>,
+    win: super::view::KindWindow,
     prompts: bool,
     answers: bool,
     json: bool,
 ) -> Result<()> {
-    let rows = collect_prompts(r, adapter, window, prompts, answers)?;
+    let rows = collect_prompts(r, adapter, win.pre_compaction, prompts, answers)?;
+    let overhead = if json { 5 } else { 100 };
+    let (rows, next) = super::view::slice_and_budget(rows, win.selector, win.max_bytes, overhead, |row| {
+        if json {
+            let pretty = serde_json::to_string_pretty(row)?;
+            Ok(pretty.len() + 2 * pretty.lines().count() + 2)
+        } else {
+            Ok(format_prompt_row(row).len())
+        }
+    })?;
     if json {
+        if let Some(next) = next {
+            eprintln!("{}", continue_hint(next));
+        }
         println!("{}", serde_json::to_string_pretty(&rows)?);
         return Ok(());
     }
     let prompts = rows.iter().filter(|p| p.kind == "prompt").count();
     let answers = rows.len() - prompts;
     println!(
-        "# prompts of {} — {prompts} typed, {answers} answered via AskUserQuestion\n",
+        "# prompts of {} — {prompts} typed, {answers} answered\n",
         short_id(&r.id)
     );
     for p in &rows {
-        let ts = p
-            .timestamp
-            .map(|t| fmt_local(t, "%Y-%m-%d %H:%M"))
-            .unwrap_or_else(|| "----------------".into());
-        let tag = if p.kind == "prompt" { "user" } else { "answer" };
-        println!("[{}] {ts}  {tag}", p.index);
-        // Prompts are the one thing in a transcript worth reading whole; sanitize per line so a
-        // pasted control sequence can't restyle the terminal, but never truncate.
-        for line in p.text.lines() {
-            println!("{}", sanitize_line(line));
-        }
-        println!();
+        print!("{}", format_prompt_row(p));
+    }
+    if let Some(next) = next {
+        println!("{}", continue_hint(next));
     }
     Ok(())
 }
@@ -575,40 +589,42 @@ pub(crate) fn cmd_lanes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cv_core::ir::Role;
+
+    struct Fixture(cv_core::Harness, Vec<Message>);
+    impl cv_core::Adapter for Fixture {
+        fn harness(&self) -> cv_core::Harness {
+            self.0
+        }
+        fn roots(&self) -> Vec<std::path::PathBuf> {
+            Vec::new()
+        }
+        fn discover(&self) -> Result<cv_core::Discovered> {
+            Ok(Default::default())
+        }
+        fn stream(
+            &self,
+            r: &SessionRef,
+            opts: &Demand,
+            sink: &mut dyn cv_core::MessageSink,
+        ) -> Result<cv_core::Session> {
+            assert!(opts.spans);
+            for m in &self.1 {
+                if sink.try_message(m.clone())? == Flow::Stop {
+                    break;
+                }
+            }
+            Ok(cv_core::Session::new(&r.id, r.harness))
+        }
+    }
 
     #[test]
     fn prompt_selectors_only_resolve_selected_bodies_and_keep_window_indices() -> Result<()> {
-        struct Fixture(Vec<Message>);
-        impl cv_core::Adapter for Fixture {
-            fn harness(&self) -> cv_core::Harness {
-                cv_core::Harness::Claude
-            }
-            fn roots(&self) -> Vec<std::path::PathBuf> {
-                Vec::new()
-            }
-            fn discover(&self) -> Result<cv_core::Discovered> {
-                Ok(Default::default())
-            }
-            fn stream(
-                &self,
-                r: &SessionRef,
-                opts: &Demand,
-                sink: &mut dyn cv_core::MessageSink,
-            ) -> Result<cv_core::Session> {
-                assert!(opts.spans);
-                for m in &self.0 {
-                    if sink.try_message(m.clone())? == Flow::Stop {
-                        break;
-                    }
-                }
-                Ok(cv_core::Session::new(&r.id, r.harness))
-            }
-        }
         let world = crate::test_world("prompt-selected-demands");
         let prompt_path = world.base.join("prompt.txt");
         let answer_path = world.base.join("answer.txt");
         let prompt = "typed🌙\n".repeat(1000);
-        let answer = format!("{}The user answered with a complete answer", "\u{2003}".repeat(3000));
+        let answer = "{\"Where?\":\"persvati\"}".to_string();
         // A span covers a JSON string's body.
         let (prompt_json, answer_json) = (serde_json::to_string(&prompt)?, serde_json::to_string(&answer)?);
         std::fs::write(&prompt_path, &prompt_json)?;
@@ -621,11 +637,35 @@ mod tests {
                 escaped: true,
             })
         };
+        let mut assistant = Message::new(Role::Assistant);
+        assistant.content.push(Block::Text {
+            text: span(&world.base.join("not-demanded"), 8_000_000),
+        });
+        assistant.content.push(Block::ToolUse {
+            id: "question".into(),
+            name: "AskUserQuestion".into(),
+            input: serde_json::json!({"questions": []}).into(),
+            namespace: None,
+        });
+        assistant.content.push(Block::ToolUse {
+            id: "bash".into(),
+            name: "Bash".into(),
+            input: serde_json::json!({"command": "echo hi"}).into(),
+            namespace: None,
+        });
         let mut user = Message::new(Role::User);
         user.content.push(Block::Text {
             text: span(&prompt_path, prompt_json.len() - 2),
         });
         let mut tool = Message::new(Role::Tool);
+        tool.content.push(Block::ToolResult {
+            tool_use_id: "bash".into(),
+            content: span(&world.base.join("not-demanded-bash"), 4096),
+            is_error: false,
+            tool_name: None,
+            status: None,
+            details: None,
+        });
         tool.content.push(Block::ToolResult {
             tool_use_id: "question".into(),
             content: span(&answer_path, answer_json.len() - 2),
@@ -634,11 +674,7 @@ mod tests {
             status: None,
             details: None,
         });
-        let mut irrelevant = Message::new(Role::Assistant);
-        irrelevant.content.push(Block::Text {
-            text: span(&world.base.join("not-demanded"), 8000000),
-        });
-        let fixture = Fixture(vec![irrelevant, user, tool]);
+        let fixture = Fixture(cv_core::Harness::Claude, vec![assistant, user, tool]);
         let r = SessionRef::new("selection", cv_core::Harness::Claude, world.base.join("source"));
         let both = collect_prompts(&r, &fixture, None, true, true)?;
         assert_eq!(both.len(), 2);
@@ -654,22 +690,65 @@ mod tests {
     }
 
     #[test]
-    fn answer_marker_projection_matches_trim_start_at_partial_and_unicode_boundaries() -> Result<()> {
-        for text in [
-            "",
-            "The user",
-            "The user answered",
-            "Your questions have been answered:\nreply",
-            "\u{2003}\tUser answered your questions:reply",
-            "ordinary output",
-            "The user answeréd",
+    fn question_pairing_matches_tool_use_id_and_ignores_non_question_prose() -> Result<()> {
+        for (harness, tool_name) in [
+            (cv_core::Harness::Claude, "AskUserQuestion"),
+            (cv_core::Harness::Codex, "request_user_input"),
+            (cv_core::Harness::Cline, "ask_question"),
         ] {
-            assert_eq!(
-                is_question_answer(&text.into(), &cv_core::Resolver::new(None))?,
-                ANSWER_MARKERS
-                    .iter()
-                    .any(|marker| text.trim_start().starts_with(marker))
-            );
+            let mut ask = Message::new(Role::Assistant);
+            ask.content.push(Block::ToolUse {
+                id: "q-1".into(),
+                name: tool_name.into(),
+                input: serde_json::json!({}).into(),
+                namespace: None,
+            });
+            ask.content.push(Block::ToolUse {
+                id: "q-err".into(),
+                name: tool_name.into(),
+                input: serde_json::json!({}).into(),
+                namespace: None,
+            });
+            ask.content.push(Block::ToolUse {
+                id: "sh-1".into(),
+                name: "Bash".into(),
+                input: serde_json::json!({"command": "cat log"}).into(),
+                namespace: None,
+            });
+            let mut res = Message::new(Role::Tool);
+            res.content = vec![
+                Block::ToolResult {
+                    tool_use_id: "sh-1".into(),
+                    content: "The user answered: fake prose from shell output".into(),
+                    is_error: false,
+                    tool_name: None,
+                    status: None,
+                    details: None,
+                },
+                Block::ToolResult {
+                    tool_use_id: "q-err".into(),
+                    content: "User declined dialog".into(),
+                    is_error: true,
+                    tool_name: None,
+                    status: None,
+                    details: None,
+                },
+                Block::ToolResult {
+                    tool_use_id: "q-1".into(),
+                    content: "plain structured payload without any English marker".into(),
+                    is_error: false,
+                    tool_name: None,
+                    status: None,
+                    details: None,
+                },
+            ];
+            let fixture = Fixture(harness, vec![ask, res]);
+            let r = SessionRef::new("qpair", harness, std::path::PathBuf::from("source"));
+            let rows = collect_prompts(&r, &fixture, None, true, true)?;
+            assert_eq!(rows.len(), 1, "{harness:?} / {tool_name}");
+            assert_eq!(rows[0].kind, "answer");
+            assert_eq!(rows[0].index, 1);
+            assert_eq!(rows[0].text, "plain structured payload without any English marker");
         }
         Ok(())
     }

@@ -3,8 +3,8 @@
 
 use super::frames::Frames;
 use crate::util::{
-    continue_hint, count_messages, home_rel, parse_harness, resolve, resolve_found, short_id, split_harness_id, usage,
-    StreamWindow, Window, WindowArgs,
+    continue_hint, home_rel, parse_harness, resolve, resolve_found, short_id, split_harness_id, usage, StreamWindow,
+    Window, WindowArgs,
 };
 use anyhow::{bail, Context, Result};
 use cv_core::ir::{truncate, Block, Harness, Message, MessageKind, Session, SessionRef};
@@ -80,55 +80,114 @@ pub(super) fn parse_kinds(spec: &str) -> Result<KindView> {
     }
 }
 
+/// Slice projected `--kind` rows by `selector` (`--first`, `--last`, `--range`, `--around`) and
+/// trim at `max_bytes` AFTER projection. The first in-window row always fits whole.
+pub(crate) fn slice_and_budget<T>(
+    rows: Vec<T>,
+    selector: Option<Window>,
+    max_bytes: Option<usize>,
+    overhead: usize,
+    measure: impl Fn(&T) -> Result<usize>,
+) -> Result<(Vec<T>, Option<usize>)> {
+    let (start, end) = match selector {
+        Some(w) => w.bounds(|| Ok(rows.len()))?,
+        None => (0, None),
+    };
+    let start = start.min(rows.len());
+    let end = end.map_or(rows.len(), |e| e.min(rows.len())).max(start);
+    let mut kept = Vec::new();
+    let mut used = overhead;
+    let mut next = None;
+    for (offset, row) in rows.into_iter().skip(start).take(end - start).enumerate() {
+        let size = if max_bytes.is_some() { measure(&row)? } else { 0 };
+        if !kept.is_empty() && max_bytes.is_some_and(|budget| used.saturating_add(size) > budget) {
+            next = Some(start + offset);
+            break;
+        }
+        used = used.saturating_add(size);
+        kept.push(row);
+    }
+    Ok((kept, next))
+}
+
+fn format_affordance_row(a: &cv_core::affordance::Affordance) -> String {
+    use cv_core::sanitize::sanitize_line;
+    let at = match (a.index, a.source) {
+        (Some(i), _) => format!("[{i}]"),
+        (None, cv_core::affordance::Source::Store) => "store".to_string(),
+        (None, _) => "session".to_string(),
+    };
+    let ts = a
+        .timestamp
+        .map(|t| crate::util::fmt_local(t, "%Y-%m-%d %H:%M"))
+        .unwrap_or_else(|| "----------------".into());
+    let tool = a.tool.as_deref().map(|t| format!("  {t}")).unwrap_or_default();
+    let mut out = format!(
+        "{at} {ts}  {}/{}{}  {}\n",
+        a.kind.as_str(),
+        a.action,
+        sanitize_line(&tool),
+        sanitize_line(&a.summary)
+    );
+    for it in &a.items {
+        let st = it.status.as_deref().unwrap_or("-");
+        out.push_str(&format!(
+            "      [{}] {}\n",
+            sanitize_line(st),
+            sanitize_line(&truncate(&it.content, 160))
+        ));
+    }
+    out
+}
+
+/// Post-filter windowing for `--kind` views (`pre_compaction` bounds raw message indices before
+/// projection; `selector` and `max_bytes` slice projected rows afterward).
+#[derive(Clone, Copy)]
+pub(crate) struct KindWindow {
+    pub pre_compaction: Option<(usize, Option<usize>)>,
+    pub selector: Option<Window>,
+    pub max_bytes: Option<usize>,
+}
+
 /// `show --kind plan,schedule,…`: the affordance rows of one session, transcript rows in message
-/// order then the side store's. A window narrows the transcript rows; store rows always print.
+/// order then the side store's, sliced by `selector` and `max_bytes` after projection.
 fn print_affordances(
     r: &SessionRef,
     adapter: &dyn Adapter,
     kinds: &std::collections::HashSet<cv_core::affordance::Kind>,
-    range: Option<(usize, Option<usize>)>,
+    win: KindWindow,
     json: bool,
 ) -> Result<()> {
-    use cv_core::sanitize::sanitize_line;
     let mut rows = cv_core::affordance::read(adapter, r)?;
     rows.retain(|a| {
         kinds.contains(&a.kind)
-            && match (a.index, range) {
+            && match (a.index, win.pre_compaction) {
                 (Some(i), Some((start, end))) => i >= start && end.is_none_or(|e| i < e),
                 _ => true,
             }
     });
+    let overhead = if json { 5 } else { 100 };
+    let (rows, next) = slice_and_budget(rows, win.selector, win.max_bytes, overhead, |row| {
+        if json {
+            let pretty = serde_json::to_string_pretty(row)?;
+            Ok(pretty.len() + 2 * pretty.lines().count() + 2)
+        } else {
+            Ok(format_affordance_row(row).len())
+        }
+    })?;
     if json {
+        if let Some(next) = next {
+            eprintln!("{}", continue_hint(next));
+        }
         println!("{}", serde_json::to_string_pretty(&rows)?);
         return Ok(());
     }
     println!("# affordances of {} — {} row(s)\n", short_id(&r.id), rows.len());
     for a in &rows {
-        let at = match (a.index, a.source) {
-            (Some(i), _) => format!("[{i}]"),
-            (None, cv_core::affordance::Source::Store) => "store".to_string(),
-            (None, _) => "session".to_string(),
-        };
-        let ts = a
-            .timestamp
-            .map(|t| crate::util::fmt_local(t, "%Y-%m-%d %H:%M"))
-            .unwrap_or_else(|| "----------------".into());
-        let tool = a.tool.as_deref().map(|t| format!("  {t}")).unwrap_or_default();
-        println!(
-            "{at} {ts}  {}/{}{}  {}",
-            a.kind.as_str(),
-            a.action,
-            sanitize_line(&tool),
-            sanitize_line(&a.summary)
-        );
-        for it in &a.items {
-            let st = it.status.as_deref().unwrap_or("-");
-            println!(
-                "      [{}] {}",
-                sanitize_line(st),
-                sanitize_line(&truncate(&it.content, 160))
-            );
-        }
+        print!("{}", format_affordance_row(a));
+    }
+    if let Some(next) = next {
+        println!("{}", continue_hint(next));
     }
     Ok(())
 }
@@ -155,28 +214,30 @@ pub(crate) fn cmd_show(
         return usage("`--summaries` goes with `--kind compaction_boundary,compaction_summary`");
     }
 
-    // The compact views read a cataloged session (never a sub-agent id) over the whole session,
-    // except that what the person said can be narrowed to a window.
+    if subagents {
+        let (r, _adapter) = resolve(id, parse_harness(&harness)?)?;
+        return show_subagents(&r, json);
+    }
+
+    let (r, adapter, sub) = resolve_show_target(id, parse_harness(&harness)?, agent.as_deref())?;
+
     if let Some(kind) = kind {
-        let (r, adapter) = resolve(id, parse_harness(&harness)?)?;
         return match kind {
             KindView::Said { prompts, answers } => {
-                if window.max_bytes.is_some() {
-                    return usage("`--max-bytes` cuts a transcript; `--kind prompt,answer` rows are printed whole");
-                }
-                let range = show_range(&r, window, pre_compaction)?
-                    .map(|w| w.bounds(|| count_messages(adapter.as_ref(), &r)))
-                    .transpose()?;
-                crate::cmd::session_reports::print_prompts(&r, adapter.as_ref(), range, prompts, answers, json)
+                let win = KindWindow {
+                    pre_compaction: pre_compaction_span(&r, pre_compaction)?,
+                    selector,
+                    max_bytes: window.max_bytes,
+                };
+                crate::cmd::session_reports::print_prompts(&r, adapter.as_ref(), win, prompts, answers, json)
             }
             KindView::Affordances(kinds) => {
-                if window.max_bytes.is_some() {
-                    return usage("`--max-bytes` cuts a transcript; the affordance rows are printed whole");
-                }
-                let range = show_range(&r, window, pre_compaction)?
-                    .map(|w| w.bounds(|| count_messages(adapter.as_ref(), &r)))
-                    .transpose()?;
-                print_affordances(&r, adapter.as_ref(), &kinds, range, json)
+                let win = KindWindow {
+                    pre_compaction: pre_compaction_span(&r, pre_compaction)?,
+                    selector,
+                    max_bytes: window.max_bytes,
+                };
+                print_affordances(&r, adapter.as_ref(), &kinds, win, json)
             }
             KindView::Compactions => {
                 if selector.is_some() || window.max_bytes.is_some() || pre_compaction.is_some() {
@@ -190,62 +251,22 @@ pub(crate) fn cmd_show(
         if selector.is_some() || window.max_bytes.is_some() {
             return usage("`--tree` renders the whole session; drop the window flags (or add `--json` for the IR)");
         }
-        let (r, adapter) = resolve(id, parse_harness(&harness)?)?;
         return print_tree(&r, adapter.as_ref());
-    }
-
-    let (want, id) = split_harness_id(id, parse_harness(&harness)?);
-
-    // An `agent-…` shaped id goes straight to the sub-agent view: cv_core::find_cheap can now
-    // resolve these too (its fleet-wide fallback), but this path keeps the provenance banner and
-    // lists candidates on an ambiguous prefix instead of erroring.
-    if id.starts_with("agent-") && show_agent_fleetwide(id, want, json, window)? {
-        return Ok(());
-    }
-    // find_cheap first: don't pay a full fleet re-discovery before trying the id as a sub-agent
-    // id — sub-agents aren't in the main pool, but `cv show <agent-id>` should still just work
-    // (harvest reports hand out bare agent ids all the time). Only when the id is neither a
-    // cataloged session nor an agent does the full-scan `find` escalation run (a session in the
-    // discovery probe's blind spots).
-    let found = match cv_core::find_cheap(id, want) {
-        Ok(Some(hit)) => Ok(Some(hit)),
-        Ok(None) => {
-            if show_agent_fleetwide(id, want, json, window)? {
-                return Ok(());
-            }
-            cv_core::find(id, want)
-        }
-        Err(e) => Err(e),
-    };
-    let (r, adapter) = match found {
-        Ok(Some(hit)) => hit,
-        Ok(None) => return usage(format!("no session (and no sub-agent) matching {id:?}")),
-        Err(e) => return resolve_found(Err(e), id, want).map(|_| ()),
-    };
-
-    // `--agent <id>`: render one specific sub-agent's transcript (resolved through this parent,
-    // since sub-agents aren't in the main pool). `--subagents`: list the whole forest with results.
-    if let Some(agent_id) = &agent {
-        return show_one_subagent(&r, adapter.as_ref(), agent_id, json, window);
-    }
-    if subagents {
-        return show_subagents(&r, json);
     }
 
     let range = show_range(&r, window, pre_compaction)?;
     if json {
         return print_session_json(adapter.as_ref(), &r, range, window.max_bytes, false, None).map(|_| ());
     }
+    if let Some(sub) = &sub {
+        print_subagent_banner(sub);
+    }
     render_text(adapter.as_ref(), &r, range, window.max_bytes)
 }
 
-/// The window `show` reads: the selector's, or — under `--pre-compaction <N>` — the span before
-/// the Nth (1-based) compaction boundary, the context the continued agent lost, so it is
-/// retrieved by message range without the caller computing offsets by hand. Left unresolved:
-/// `--last N` is resolved by whichever pass reads the session, not by a counting pass first.
-fn show_range(r: &SessionRef, window: &WindowArgs, pre_compaction: Option<usize>) -> Result<Option<Window>> {
+fn pre_compaction_span(r: &SessionRef, pre_compaction: Option<usize>) -> Result<Option<(usize, Option<usize>)>> {
     let Some(n) = pre_compaction else {
-        return window.window();
+        return Ok(None);
     };
     if n == 0 {
         return usage("--pre-compaction is 1-based; use 1 for the first boundary");
@@ -268,7 +289,18 @@ fn show_range(r: &SessionRef, window: &WindowArgs, pre_compaction: Option<usize>
         comps.len(),
         comps[idx].boundary_msg_idx,
     );
-    Ok(Some(Window::Range(start, Some(end))))
+    Ok(Some((start, Some(end))))
+}
+
+/// The window `show` reads: the selector's, or — under `--pre-compaction <N>` — the span before
+/// the Nth (1-based) compaction boundary, the context the continued agent lost, so it is
+/// retrieved by message range without the caller computing offsets by hand. Left unresolved:
+/// `--last N` is resolved by whichever pass reads the session, not by a counting pass first.
+fn show_range(r: &SessionRef, window: &WindowArgs, pre_compaction: Option<usize>) -> Result<Option<Window>> {
+    if let Some((start, end)) = pre_compaction_span(r, pre_compaction)? {
+        return Ok(Some(Window::Range(start, end)));
+    }
+    window.window()
 }
 
 /// The CLI's window over `r`: the selector's bounds or the last `n`, cut at the byte budget.
@@ -418,11 +450,69 @@ fn agent_parents_for_harness(parents: Vec<SessionRef>, want: Option<Harness>) ->
         .collect()
 }
 
+/// Resolve `cv show <id> [--agent <sub>]` across top-level sessions and sub-agents alike so
+/// transcript, `--json`, `--kind`, and `--tree` views share one addressing path.
+fn resolve_show_target(
+    id: &str,
+    want: Option<Harness>,
+    agent: Option<&str>,
+) -> Result<(SessionRef, Box<dyn Adapter>, Option<cv_core::AgentRef>)> {
+    if let Some(agent_id) = agent {
+        let (parent, adapter) = resolve(id, want)?;
+        let sub = resolve_subagent(&parent, agent_id)?;
+        return Ok((sub.session.clone(), adapter, Some(sub)));
+    }
+    let (want, id) = split_harness_id(id, want);
+    if id.starts_with("agent-") {
+        if let Some((sub, adapter)) = resolve_agent_fleetwide(id, want)? {
+            return Ok((sub.session.clone(), adapter, Some(sub)));
+        }
+    }
+    let found = match cv_core::find_cheap(id, want) {
+        Ok(Some(hit)) => Ok(Some(hit)),
+        Ok(None) => {
+            if let Some((sub, adapter)) = resolve_agent_fleetwide(id, want)? {
+                return Ok((sub.session.clone(), adapter, Some(sub)));
+            }
+            cv_core::find(id, want)
+        }
+        Err(e) => Err(e),
+    };
+    match found {
+        Ok(Some((r, adapter))) => Ok((r, adapter, None)),
+        Ok(None) => usage(format!("no session (and no sub-agent) matching {id:?}")),
+        Err(e) => resolve_found(Err(e), id, want).map(|(r, a)| (r, a, None)),
+    }
+}
+
+pub(crate) struct FleetwideSubagent {
+    pub parent: SessionRef,
+    pub adapter: Box<dyn Adapter>,
+    pub sub: cv_core::AgentRef,
+}
+
 /// `cv show <agent-id>` with no parent given: find which session(s) spawned the agent (filename
-/// scan across the fleet) and render it through the one parent — or list the candidates when the
-/// prefix is ambiguous. Returns `false` when nothing agent-shaped matched (the caller has one
-/// more reading of the id to try).
-fn show_agent_fleetwide(agent_id: &str, want: Option<Harness>, json: bool, window: &WindowArgs) -> Result<bool> {
+/// scan across the fleet) and resolve it through the one parent — or list the candidates when the
+/// prefix is ambiguous. Returns `Ok(None)` when nothing agent-shaped matched.
+pub(crate) fn resolve_agent_fleetwide(
+    agent_id: &str,
+    want: Option<Harness>,
+) -> Result<Option<(cv_core::AgentRef, Box<dyn Adapter>)>> {
+    let Some(hit) = resolve_agent_parent_fleetwide(agent_id, want)? else {
+        return Ok(None);
+    };
+    eprintln!(
+        "✦ sub-agent of session {} ({})",
+        short_id(&hit.parent.id),
+        hit.parent.title.as_deref().unwrap_or("untitled"),
+    );
+    Ok(Some((hit.sub, hit.adapter)))
+}
+
+pub(crate) fn resolve_agent_parent_fleetwide(
+    agent_id: &str,
+    want: Option<Harness>,
+) -> Result<Option<FleetwideSubagent>> {
     let parents = agent_parents_for_harness(cv_core::find_subagent_parents(agent_id), want);
     // Copies of one agent across sessions (`cv adopt`) read through the newest parent's copy.
     let parents = if parents.len() > 1 && cv_core::one_agent_across(&parents, agent_id)? {
@@ -435,17 +525,16 @@ fn show_agent_fleetwide(agent_id: &str, want: Option<Harness>, json: bool, windo
         parents
     };
     match parents.as_slice() {
-        [] => Ok(false),
+        [] => Ok(None),
         [parent] => {
             let adapter = cv_core::harness::for_harness(parent.harness)
                 .with_context(|| format!("no adapter for {}", parent.harness))?;
-            eprintln!(
-                "✦ sub-agent of session {} ({})",
-                short_id(&parent.id),
-                parent.title.as_deref().unwrap_or("untitled"),
-            );
-            show_one_subagent(parent, adapter.as_ref(), agent_id, json, window)?;
-            Ok(true)
+            let sub = resolve_subagent(parent, agent_id)?;
+            Ok(Some(FleetwideSubagent {
+                parent: parent.clone(),
+                adapter,
+                sub,
+            }))
         }
         many => {
             // Ambiguous: every candidate as a pasteable `harness:id` line, exit 2.
@@ -557,24 +646,8 @@ pub(crate) fn resolve_subagent(parent: &SessionRef, agent_id: &str) -> Result<cv
     }
 }
 
-/// Render one specific sub-agent's transcript (`--agent <id>`), resolved by id-prefix relative to
-/// its parent session. Honors `--json` and the window flags exactly as a top-level `cv show` would
-/// (`--last` counts the sub-agent's own messages).
-fn show_one_subagent(
-    parent: &SessionRef,
-    adapter: &dyn Adapter,
-    agent_id: &str,
-    json: bool,
-    window: &WindowArgs,
-) -> Result<()> {
-    let sub = resolve_subagent(parent, agent_id)?;
-    let range = window.window()?;
-
-    if json {
-        return print_session_json(adapter, &sub.session, range, window.max_bytes, false, None).map(|_| ());
-    }
-
-    // A small provenance banner so the reader knows which agent (and outcome) this is.
+/// Provenance banner printed above a plain text sub-agent transcript.
+fn print_subagent_banner(sub: &cv_core::AgentRef) {
     if let Some(d) = &sub.description {
         println!("# sub-agent: {}", truncate(d, 120));
     }
@@ -595,7 +668,6 @@ fn show_one_subagent(
         status,
         wf,
     );
-    render_text(adapter, &sub.session, range, window.max_bytes)
 }
 
 #[derive(Clone, Copy)]

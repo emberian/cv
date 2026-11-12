@@ -2,8 +2,8 @@
 //! (`--first/--last/--range A..B/--around`), the session-row JSON shape, and small display utilities.
 
 use anyhow::{bail, Context, Result};
-use cv_core::ir::{Harness, Message, SessionRef};
-use cv_core::{Adapter, Demand, Flow, MessageSink};
+use cv_core::ir::{Harness, SessionRef};
+use cv_core::Adapter;
 use std::path::Path;
 
 // ---------- exit codes ----------
@@ -326,21 +326,6 @@ fn next_index(n: &str) -> String {
         .and_then(|n| n.checked_add(1))
         .map(|n| n.to_string())
         .unwrap_or_default()
-}
-
-/// The IR message count of a session, by one streamed pass under lazy options (content stays on
-/// disk). `SessionRef::message_count` counts conversational turns only, so `--last N` can't use it.
-pub(crate) fn count_messages(adapter: &dyn Adapter, r: &SessionRef) -> Result<usize> {
-    struct Count(usize);
-    impl MessageSink for Count {
-        fn message(&mut self, _m: Message) -> Flow {
-            self.0 += 1;
-            Flow::Continue
-        }
-    }
-    let mut c = Count(0);
-    adapter.try_stream(r, &Demand::LEAN.with_spans(), &mut c)?;
-    Ok(c.0)
 }
 
 /// The continuation line printed when `--max-bytes` cut a render short.

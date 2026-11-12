@@ -225,8 +225,12 @@ fn show_kind_prompt_lists_only_the_person_and_the_answers() {
     assert_eq!(kinds_of(&["show", SID, "--kind", "prompt", "--json"]), ["prompt"; 4]);
     assert_eq!(kinds_of(&["show", SID, "--kind", "answer", "--json"]), ["answer"]);
     assert_eq!(
-        kinds_of(&["show", SID, "--kind", "prompt,answer", "--range", "0..3", "--json"]),
+        kinds_of(&["show", SID, "--kind", "prompt,answer", "--range", "0..2", "--json"]),
         ["prompt", "answer"]
+    );
+    assert_eq!(
+        kinds_of(&["show", SID, "--kind", "prompt,answer", "--first", "3", "--json"]),
+        ["prompt", "answer", "prompt"]
     );
     // A kind with no view, two views at once, or `--summaries` off the compaction view: exit 2.
     for args in [
@@ -236,6 +240,78 @@ fn show_kind_prompt_lists_only_the_person_and_the_answers() {
     ] {
         let (ok, code, _, err) = w.cv(args);
         assert!(!ok && code == 2 && err.contains("--kind"), "{args:?}: {err}");
+    }
+}
+
+#[test]
+fn show_kind_post_filter_last_max_bytes_subagents_and_question_pairing() {
+    let w = build_world("kind-post-filter");
+    // Session with 2 prompts, 1 real AskUserQuestion answer, and 30 trailing Bash calls (one of
+    // whose outputs starts with `"The user answered"` — must NOT be mistaken for an answer).
+    let tail_sid = "22222222-3333-4444-5555-666666666666";
+    let mut records = vec![
+        user(tail_sid, "t0", "2026-10-01T10:00:00Z", "first directive"),
+        assistant_tool(
+            "ta0",
+            "2026-10-01T10:00:05Z",
+            "AskUserQuestion",
+            serde_json::json!({"questions": [{"question": "Target?"}]}),
+        ),
+        tool_result("tr0", "2026-10-01T10:00:10Z", "toolu_ta0", "ship it"),
+        user(tail_sid, "t1", "2026-10-01T10:00:20Z", "second directive"),
+    ];
+    for i in 0..25 {
+        let aid = format!("tb{i}");
+        let rid = format!("trb{i}");
+        let out = if i == 0 {
+            "The user answered: fake shell log line"
+        } else {
+            "build step ok"
+        };
+        records.push(assistant_tool(
+            &aid,
+            "2026-10-01T10:01:00Z",
+            "Bash",
+            serde_json::json!({"command": "cargo check"}),
+        ));
+        records.push(tool_result(&rid, "2026-10-01T10:01:01Z", &format!("toolu_{aid}"), out));
+    }
+    w.write_session(tail_sid, &records);
+
+    // `--last 2` slices AFTER `--kind` projection (returns 2 rows, not 0 from the 50 Bash turns).
+    let (json, _) = w.cv_ok(&["show", tail_sid, "--kind", "prompt,answer", "--last", "2", "--json"]);
+    let rows: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
+    let texts: Vec<&str> = rows.iter().map(|r| r["text"].as_str().unwrap()).collect();
+    assert_eq!(texts, ["ship it", "second directive"], "{json}");
+
+    // `--max-bytes` bounds output cleanly and emits a `--range` continuation hint.
+    let (json, err) = w.cv_ok(&[
+        "show",
+        tail_sid,
+        "--kind",
+        "prompt,answer",
+        "--max-bytes",
+        "180",
+        "--json",
+    ]);
+    let page1: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
+    assert_eq!(page1.len(), 1, "{json}");
+    assert!(err.contains("continue with --range 1.."), "{err}");
+
+    let (text_out, _) = w.cv_ok(&["show", tail_sid, "--kind", "prompt,answer", "--max-bytes", "200"]);
+    assert!(text_out.contains("first directive"), "{text_out}");
+    assert!(text_out.contains("continue with --range "), "{text_out}");
+
+    // Bare sub-agent id, `agent-<id>`, and `<parent> --agent <sub>` all work with `--kind`.
+    for args in [
+        &["show", "aaa1", "--kind", "prompt,answer", "--json"][..],
+        &["show", "agent-aaa1", "--kind", "prompt,answer", "--json"],
+        &["show", SID, "--agent", "aaa1", "--kind", "prompt,answer", "--json"],
+    ] {
+        let (json, _) = w.cv_ok(args);
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
+        assert_eq!(rows.len(), 1, "{args:?}: {json}");
+        assert_eq!(rows[0]["text"], "You are lane A.");
     }
 }
 

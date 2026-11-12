@@ -204,16 +204,16 @@ enum Cmd {
         #[arg(long, conflicts_with_all = ["kind", "subagents", "agent", "pre_compaction"])]
         tree: bool,
         /// Only messages of these kinds, comma-separated, as a compact view. `prompt,answer`: what
-        /// the person said — every typed prompt and `AskUserQuestion` answer with its index and
-        /// timestamp, printed whole (`--json`: `index, timestamp, kind, text` rows; a window narrows
-        /// it). `compaction_boundary,compaction_summary`: every compaction seam — trigger,
+        /// the person said — every typed prompt and question-tool answer with its index and
+        /// timestamp, printed whole (`--json`: `index, timestamp, kind, text` rows; window flags
+        /// and `--max-bytes` slice the projected rows). `compaction_boundary,compaction_summary`: every compaction seam — trigger,
         /// pre-compaction size, the summary that seeded the next window (`--json`: one row per
         /// boundary with its `pre_compaction_span`). An affordance — `plan`, `goal`, `schedule`,
         /// `background_job`, `subagent_spawn`, `subagent_return`, `skill`, `hook`, `question`,
         /// `approval`, `checkpoint`, `branch`, `fork`, `model_change`, or `affordances` for all —
         /// lists those rows across harnesses, side stores included (`--json`: `kind, action,
         /// index, timestamp, tool, tool_use_id, summary, items, source` rows).
-        #[arg(long, value_name = "KIND,…", conflicts_with_all = ["subagents", "agent"])]
+        #[arg(long, value_name = "KIND,…", conflicts_with = "subagents")]
         kind: Option<String>,
         /// With the compaction kinds: print each summary in full, not just its head.
         #[arg(long, requires = "kind")]
