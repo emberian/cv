@@ -15,23 +15,24 @@ cv pack "migrate the daemon" --limit 3                  # draw from at most 3 pa
 
 ## The pipeline
 
-1. **Recall.** The task is run against the full-text index *and* the semantic
-   embedding store (when it exists); the two rankings are fused by reciprocal
-   rank and deduped by session, capped at `--limit` sessions. Honest fallbacks:
-   no index → a live scan with a stderr note (`cv index` makes packs instant);
-   no embeddings → full-text only (`cv index --semantic` adds semantic recall).
+1. **Recall.** The task is run through `cv_search::Searcher` against the full-text
+   index + live unindexed suffix *and* the semantic embedding store (when it
+   exists); the two rankings are fused by reciprocal rank and deduped by session,
+   capped at `--limit` sessions. Honest fallbacks: no index → a live suffix read
+   with a stderr note (`cv index` makes packs instant); no embeddings → full-text
+   only (`cv index --semantic` adds semantic recall).
 2. **Distill.** Each recalled session contributes a *span*, not its whole
    transcript: a ~3-message excerpt window around the best match (streamed
    under lazy spans — huge sessions are never materialized; each message is
    shown up to `--excerpt-bytes` (default 1600), a longer one cut there with an
    open code fence closed and `…` appended), plus the event catalog's record of what that
    session actually **did** — which files it edited, which commands it ran.
-   The digest is **extractive by default**: every line comes from a real
-   transcript or the catalog, so nothing is hallucinated, and no network is
-   touched for extractive summarization and no generative model is called (semantic recall can load its cached embedding model).
+   The digest is **purely extractive**: every line comes from a real transcript
+   or the catalog, so nothing is hallucinated, zero network calls are made, and
+   zero generative models are invoked.
 3. **Emit** in the requested `--format`:
    - `md` (default) — a CLAUDE.md-style bundle: the task, one section per
-     source (title, harness, date, cwd → digest, key excerpt, files touched,
+     source (title, harness, date, cwd → key excerpt, files touched,
      commands run, a `cv show --range A..B` pointer back into the transcript), and
      a closing **"Files that keep appearing"** rollup ranked across sources.
    - `prompt` — the same content shaped as a second-person system prompt
@@ -42,24 +43,8 @@ cv pack "migrate the daemon" --limit 3                  # draw from at most 3 pa
      prints the written path and the harness's resume incantation.
 
 A pack is a bounded bundle by design, and its header says so: a `Bounds:` line
-names each bound (excerpt bytes; 6 distinct commands per source, each to 90
-characters; 8 files per source; 12 rollup files) and how many items each cut.
-
-## Optional LLM distillation
-
-Set `CV_PACK_LLM=1` (or `CV_PACK_LLM=<model-id>`) to additionally route each
-recalled span through the configured LLM provider (`OPENROUTER_API_KEY`,
-`ANTHROPIC_API_KEY`, or `LMSTUDIO_API_BASE=local` for free local inference —
-the LLM digest folded into `pack` in 0.11.0) for an abstractive per-span digest on top of
-the extractive one. Unset, `cv pack` is fully offline.
-
-Each digest sends the span's rendered transcript whole when it fits the model, else its head
-and tail around a `[… transcript truncated …]` marker. The limit is the model's context window
-as its provider reports it (Anthropic `max_input_tokens`, OpenRouter `context_length`, LM Studio
-`max_context_length`) less the digest's 4,096 output tokens and the prompt, counted in bytes (a
-token is at least a byte, so it always fits); `--context-bytes N` sets it instead, and a server
-that reports no window needs it. The bundle prints, under each digest, the bytes sent of the
-transcript's bytes and the limit with its source.
+names each bound (excerpt bytes, 8 files per source, 12 rollup files) and how
+many items each cut; distinct commands run are kept whole.
 
 ## Flags
 
@@ -70,4 +55,3 @@ transcript's bytes and the limit with its source.
 | `--limit N` | max past sessions to draw from (default 8) |
 | `--out <path>` | write the bundle to a file instead of stdout |
 | `--excerpt-bytes N` | bytes of one message an excerpt shows (default 1600) |
-| `--context-bytes N` | the `CV_PACK_LLM` digest's transcript limit (default: the model's window) |

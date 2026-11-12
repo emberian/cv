@@ -4,7 +4,7 @@ use crate::cmd::port::emit_session;
 use crate::util::{dry_run_nulls, parse_harness, parse_range, report, short_id, usage};
 use anyhow::{bail, Context, Result};
 use cv_core::harness::claude::skills::SkillsPolicy;
-use cv_core::ir::{human_bytes, Block, Harness, Message, Role, Session};
+use cv_core::ir::{human_bytes, Harness, Session};
 use cv_core::EmitOptions;
 use std::fmt::Write as _;
 use std::fs;
@@ -488,8 +488,6 @@ pub(crate) struct SpliceArgs<'a> {
     pub out: Option<PathBuf>,
     pub export: Option<String>,
     pub cwd: Option<PathBuf>,
-    pub generate: bool,
-    pub gen_model: Option<String>,
     pub thinking: cv_core::emit::ThinkingMode,
     pub resumable: Option<crate::cmd::distill::Target>,
     pub json: bool,
@@ -502,8 +500,6 @@ pub(crate) fn cmd_splice(args: SpliceArgs<'_>) -> Result<()> {
         out,
         export,
         cwd,
-        generate,
-        gen_model,
         thinking,
         resumable,
         json,
@@ -532,11 +528,7 @@ pub(crate) fn cmd_splice(args: SpliceArgs<'_>) -> Result<()> {
             .first_harness()
             .context("splice needs at least one session")?,
     };
-    let mut spliced = composition.finish(None, to_h);
-    // Generation demands owned text. Exports retain checked leaves through staged publication.
-    if generate {
-        spliced.materialize()?;
-    }
+    let spliced = composition.finish(None, to_h);
     if let Some(target) = resumable {
         // `--session` / `--agent-of`: a resumable Claude transcript, the way `distill` writes one.
         // Nothing is elided (every selected message is carried whole), so there is no sidecar.
@@ -566,8 +558,6 @@ pub(crate) fn cmd_splice(args: SpliceArgs<'_>) -> Result<()> {
         out,
         export,
         cwd,
-        generate,
-        gen_model,
         thinking,
     })
 }
@@ -581,8 +571,6 @@ pub(crate) struct ComposedArgs {
     pub out: Option<PathBuf>,
     pub export: Option<String>,
     pub cwd: Option<PathBuf>,
-    pub generate: bool,
-    pub gen_model: Option<String>,
     pub thinking: cv_core::emit::ThinkingMode,
 }
 
@@ -594,34 +582,8 @@ fn finish_composed(args: ComposedArgs) -> Result<()> {
         out,
         export,
         cwd,
-        generate,
-        gen_model,
         thinking,
     } = args;
-    // The generative half of looming: grow the composed branch with an LLM-generated continuation.
-    if generate {
-        match crate::llm::available_provider() {
-            Some(prov) => eprintln!("✦ looming a continuation via {prov}…"),
-            None => bail!(
-                "--generate needs an LLM provider: set OPENROUTER_API_KEY, ANTHROPIC_API_KEY, or \
-                 LMSTUDIO_API_BASE=local (free local LM Studio)"
-            ),
-        }
-        let text = crate::llm::generate(
-            &session,
-            &crate::llm::GenerateOptions {
-                model: gen_model,
-                ..Default::default()
-            },
-        )?;
-        let mut m = Message::new(Role::Assistant);
-        m.content.push(Block::Text { text: text.into() });
-        session.messages.push(m);
-        eprintln!(
-            "  ↳ grew the branch by 1 generated turn ({} msg total)",
-            session.messages.len()
-        );
-    }
 
     // Emit path: an explicit --harness or an --out directory means "materialize this for a harness".
     if explicit_to || out.is_some() {

@@ -47,7 +47,7 @@ The headline, and [`cv splice`](cli.md#cv-splice) in the browser. A three-pane w
 
 Beyond rearranging, the composer can generate: **⚡ generate continuation** sends the current composition to an LLM and appends the model's reply as a new assistant turn (streamed in live). Combined with branching, that grows a transcript into **alternate futures** — a branch tree you can navigate and then drop into [Compare](#-compare--side-by-side-aligned). Export the active branch as OpenSession `.json` or `.md`, entirely client-side.
 
-Generation calls **OpenRouter** directly, in the desktop app and the browser alike. Open **⚙ generation** to paste an API key (stored only in this device's `localStorage`, sent only to `openrouter.ai`) and choose a model. For a free local model, `cv splice --generate` with `LMSTUDIO_API_BASE=local` is the CLI's path.
+Generation calls **OpenRouter** directly, in the desktop app and the browser alike. Open **⚙ generation** to paste an API key (stored only in this device's `localStorage`, sent only to `openrouter.ai`) and choose a model.
 
 ### 📡 Fleet — the live dashboard
 

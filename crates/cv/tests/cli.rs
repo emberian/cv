@@ -3535,9 +3535,9 @@ fn rewind_validates_explicit_harness_for_direct_paths_before_writing() {
 }
 
 #[test]
-fn splice_rejects_invalid_exports_before_source_reads_or_generation() {
+fn splice_rejects_invalid_exports_before_source_reads() {
     let w = World::new("splice-export-validation");
-    let (ok, _, stdout, error) = w.cv(&["splice", "nonexistent-source", "--export", "yaml", "--generate"]);
+    let (ok, _, stdout, error) = w.cv(&["splice", "nonexistent-source", "--export", "yaml"]);
     assert!(!ok, "{error}");
     assert!(error.contains("unknown export format \"yaml\""), "{error}");
     assert!(

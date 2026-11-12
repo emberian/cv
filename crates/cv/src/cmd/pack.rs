@@ -1,25 +1,20 @@
 //! `cv pack` — compile a context bundle for a new task from the session corpus.
 //!
-//! Pipeline: **recall** (full-text + semantic, fused by reciprocal rank, deduped by session) →
-//! **distill** (an extractive digest per recalled span: the best-matching message window plus the
-//! session's file-edit/command events from the catalog — no LLM, no network) → **emit** (`md` |
-//! `prompt` | `session`).
+//! Pipeline: **recall** (full-text + live suffix via [`cv_search::Searcher`], plus semantic when
+//! embeddings exist, fused by reciprocal rank and deduped by session) → **distill** (an extractive
+//! digest per recalled span: the best-matching message window plus the session's file-edit/command
+//! events from the catalog — no LLM, no network) → **emit** (`md` | `prompt` | `session`).
 //!
-//! The digest is extractive by design: titles, dates, cwds, excerpts, and event-catalog facts are
-//! all things the corpus already states, so the bundle never hallucinates. Set `CV_PACK_LLM=1`
-//! (or `CV_PACK_LLM=<model-id>`) to additionally route each span through `llm::digest` for an
-//! abstractive digest; without it, `cv pack` does zero network and loads zero models.
-//!
-//! Streaming discipline: recall works off the index (or a live scan), excerpts are
-//! pulled with a windowed streaming sink under [`Demand::with_spans`], and events come from
-//! catalog queries — whole sessions are never materialized.
+//! Streaming discipline: recall works off the index + live suffix, excerpts are pulled with a
+//! windowed streaming sink under [`Demand::with_spans`], and events come from catalog queries —
+//! whole sessions are never materialized.
 
 use crate::util::{home_rel, short_id};
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use cv_core::ir::{Block, Harness, Message, Role, Session};
 use cv_core::lazy::Resolver;
-use cv_core::scan::{ceil_char, floor_char, Matcher, ScanSink};
+use cv_core::scan::floor_char;
 use cv_core::stream::{Demand, Flow, MessageSink};
 use cv_core::EmitOptions;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -29,10 +24,7 @@ use std::path::{Path, PathBuf};
 /// `--excerpt-bytes` default: the bytes of one message an excerpt shows. A pack is a bounded
 /// bundle by design; its header states every bound below and what each one cut.
 pub(crate) const EXCERPT_BYTES: usize = 1600;
-/// How many distinct commands / files to keep per source section (curation over completeness),
-/// and the characters a command shows (its head: a whole pipeline is not memory).
-const MAX_COMMANDS: usize = 6;
-const COMMAND_CHARS: usize = 90;
+/// How many distinct files to keep per source section (curation over completeness).
 const MAX_FILES_PER_SOURCE: usize = 8;
 /// Rows of the cross-source file rollup.
 const MAX_ROLLUP: usize = 12;
@@ -46,8 +38,6 @@ pub(crate) struct PackArgs<'a> {
     pub force: bool,
     pub thinking: cv_core::emit::ThinkingMode,
     pub json: bool,
-    /// `--context-bytes`: the `CV_PACK_LLM` digest's transcript limit (default: the model's window).
-    pub context_bytes: Option<usize>,
     /// `--excerpt-bytes`: the bytes of one message an excerpt shows.
     pub excerpt_bytes: usize,
 }
@@ -62,7 +52,6 @@ pub(crate) fn cmd_pack(args: PackArgs<'_>) -> Result<()> {
         force,
         thinking,
         json,
-        context_bytes,
         excerpt_bytes,
     } = args;
     if let (Some(path), "md" | "prompt") = (&out, format) {
@@ -90,33 +79,10 @@ pub(crate) fn cmd_pack(args: PackArgs<'_>) -> Result<()> {
         return Ok(());
     }
 
-    // Optional abstractive pass. The clap surface for pack is frozen, so the switch is an env var:
-    // CV_PACK_LLM=1 (provider default model) or CV_PACK_LLM=<model-id>.
-    let llm_model = llm_from_env();
-    if llm_model.is_none() && context_bytes.is_some() {
-        return crate::util::usage("--context-bytes bounds the CV_PACK_LLM digest; set CV_PACK_LLM to use it");
-    }
-    if llm_model.is_some() {
-        match crate::llm::available_provider() {
-            Some(p) => eprintln!("✦ CV_PACK_LLM set — distilling each span via {p}…"),
-            None => bail!(
-                "CV_PACK_LLM is set but no LLM provider is configured: set OPENROUTER_API_KEY, \
-                 ANTHROPIC_API_KEY, or LMSTUDIO_API_BASE=local (or unset CV_PACK_LLM for the \
-                 zero-network extractive digest)"
-            ),
-        }
-    }
-
     // 2. DISTILL — one structured digest per recalled span.
     let mut sources: Vec<PackSource> = Vec::with_capacity(hits.len());
     for hit in hits {
-        match build_source(
-            &hit,
-            task,
-            llm_model.as_ref().map(|model| model.as_deref()),
-            context_bytes,
-            excerpt_bytes,
-        ) {
+        match build_source(&hit, task, excerpt_bytes) {
             Ok(s) => sources.push(s),
             Err(e) => eprintln!("cv pack: skipping {} ({}): {e:#}", short_id(&hit.id), hit.harness),
         }
@@ -161,25 +127,12 @@ pub(crate) fn cmd_pack(args: PackArgs<'_>) -> Result<()> {
     }
 }
 
-/// `CV_PACK_LLM` unset/empty/`0` → no LLM. `1`/`true` → provider default model. Anything else is
-/// taken as the model id.
-fn llm_from_env() -> Option<Option<String>> {
-    let v = cv_core::env::var("CV_PACK_LLM").ok()?;
-    let v = v.trim();
-    match v {
-        "" | "0" | "false" => None,
-        "1" | "true" => Some(None),
-        model => Some(Some(model.to_string())),
-    }
-}
-
 // ------------------------------------------------------------------------------------------------
 // 1. RECALL
 // ------------------------------------------------------------------------------------------------
 
-/// Find the `limit` most relevant sessions: full-text (tantivy) and semantic (embeddings) when
-/// their stores exist, fused by reciprocal rank and deduped by session. Honest fallbacks: no
-/// index → live scan with a stderr note; no embeddings → full-text only.
+/// Find the `limit` most relevant sessions: full-text + live suffix (`cv_search::Searcher`) and
+/// semantic (embeddings) when their store exists, fused by reciprocal rank and deduped by session.
 /// Fusion weights: lexical hits on the task's own terms are higher-precision than static-embedding
 /// cosine, so the full-text list counts double; semantic stays the recall-broadening channel
 /// (a session ranked in BOTH lists still gets both contributions).
@@ -188,33 +141,38 @@ const SEM_WEIGHT: f32 = 1.0;
 
 fn recall(task: &str, limit: usize) -> Result<Vec<cv_search::Hit>> {
     let fetch = limit.saturating_mul(4).max(20);
+    let searcher = cv_search::Searcher::default();
     let mut ranked: Vec<(f32, Vec<cv_search::Hit>)> = Vec::new();
 
-    if cv_search::default_tantivy_dir().exists() {
-        // Recall consumes ranks and session IDs; it parses only the selected sources below.
-        match cv_search::text_search_indexed(None, task, fetch) {
-            Ok(hits) if !hits.is_empty() => ranked.push((FTS_WEIGHT, hits)),
-            Ok(_) => {
-                // The index parser is conjunctive (all terms must match) — right for search,
-                // too strict for a task phrase. Retry as an OR of the task's words.
-                if let Some(q) = or_query(task) {
-                    match cv_search::text_search_indexed(None, &q, fetch) {
-                        Ok(hits) if !hits.is_empty() => ranked.push((FTS_WEIGHT, hits)),
-                        Ok(_) => {}
-                        Err(e) => eprintln!("(full-text recall failed: {e:#})"),
+    match fts_recall_in(&searcher, &cv_search::default_tantivy_dir(), task, fetch) {
+        Ok(found) => {
+            for note in &found.notes {
+                match note {
+                    cv_search::Note::Live(s) if s.starts_with("no index yet") => {
+                        eprintln!("(live: {s}; run `cv index` for instant packs)");
                     }
+                    cv_search::Note::Live(s) => eprintln!("(live: {s})"),
+                    cv_search::Note::Stale(s) | cv_search::Note::Unscanned(s) => eprintln!("(note: {s})"),
+                    cv_search::Note::SnippetsUnavailable(_) | cv_search::Note::NoSubagents => {}
                 }
             }
-            Err(e) => eprintln!("(full-text index unavailable: {e:#})"),
+            if !found.hits.is_empty() {
+                ranked.push((FTS_WEIGHT, found.hits));
+            }
         }
-    } else {
-        eprintln!("(no index yet — recalling via a live scan; run `cv index` for instant packs)");
-        ranked.push((FTS_WEIGHT, live_scan(task, fetch)?));
+        Err(e) => eprintln!("(full-text recall unavailable: {e:#})"),
     }
 
     if cv_search::default_embeddings_path().exists() {
-        match cv_search::semantic_search(None, task, fetch) {
-            Ok(hits) => ranked.push((SEM_WEIGHT, hits)),
+        match searcher.search(
+            task,
+            cv_search::SearchFilter::default(),
+            fetch,
+            cv_search::Source::Semantic,
+            None,
+        ) {
+            Ok(found) if !found.hits.is_empty() => ranked.push((SEM_WEIGHT, found.hits)),
+            Ok(_) => {}
             Err(e) => eprintln!("(semantic recall unavailable: {e:#}; full-text only)"),
         }
     } else {
@@ -224,27 +182,72 @@ fn recall(task: &str, limit: usize) -> Result<Vec<cv_search::Hit>> {
     Ok(fuse(ranked, limit))
 }
 
+/// Run full-text + live-suffix recall for a task description. Task prose routinely carries bare
+/// colons (`~/dev/foo: bar`, `error[E0433]:`), brackets, or boolean keywords (`NOT`, `TO`) that
+/// Tantivy's `QueryParser` treats as field/range syntax; when `QueryParser` rejects the raw task,
+/// fall back to its sanitized literal terms, and when conjunctive matching finds nothing, relax
+/// multi-word tasks to `OR`.
+fn fts_recall_in(searcher: &cv_search::Searcher, dir: &Path, task: &str, fetch: usize) -> Result<cv_search::Found> {
+    let filter = cv_search::SearchFilter::default();
+    let initial = match searcher.search_in(dir, task, filter, fetch, cv_search::Source::Index, None) {
+        Ok(found) => found,
+        Err(e) if cv_search::is_invalid_text_query(&e) => {
+            let lit = literal_query(task);
+            if lit.is_empty() {
+                return Ok(cv_search::Found {
+                    hits: Vec::new(),
+                    source: cv_search::Source::Index,
+                    notes: Vec::new(),
+                    total: 0,
+                });
+            }
+            searcher.search_in(dir, &lit, filter, fetch, cv_search::Source::Index, None)?
+        }
+        Err(e) => return Err(e),
+    };
+    if !initial.hits.is_empty() {
+        return Ok(initial);
+    }
+    if let Some(q) = or_query(task) {
+        if let Ok(relaxed) = searcher.search_in(dir, &q, filter, fetch, cv_search::Source::Index, None) {
+            if !relaxed.hits.is_empty() {
+                return Ok(relaxed);
+            }
+        }
+    }
+    Ok(initial)
+}
+
+/// Strip Tantivy query syntax (`:`, `[...]`, `(...)`, leading `-`, quotes, and uppercase boolean
+/// keywords like `AND`/`OR`/`NOT`/`TO`/`IN`) down to lowercase literal tokens.
+fn literal_query(task: &str) -> String {
+    let mut cleaned = String::with_capacity(task.len());
+    for c in task.chars() {
+        if c.is_alphanumeric() || c == '_' {
+            for lc in c.to_lowercase() {
+                cleaned.push(lc);
+            }
+        } else {
+            cleaned.push(' ');
+        }
+    }
+    cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// English filler that would make an OR query match everything.
 const STOPWORDS: &[&str] = &[
     "the", "and", "for", "with", "that", "this", "from", "into", "our", "your", "how", "what", "when", "where", "why",
     "are", "was", "were", "has", "have", "had", "not", "but", "all",
 ];
 
-/// The task's distinct searchable words joined with OR — the relaxed second-try query.
-/// `None` when relaxing can't help (zero or one usable word).
+/// The task's distinct searchable words (lowercased so Tantivy never reads `NOT`/`TO`/`AND` as
+/// operators) joined with `OR` — the relaxed second-try query. `None` when relaxing can't help.
 fn or_query(task: &str) -> Option<String> {
     let mut seen = HashSet::new();
-    let words: Vec<String> = task
+    let words: Vec<String> = literal_query(task)
         .split_whitespace()
-        .map(|w| {
-            w.chars()
-                .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
-                .collect::<String>()
-        })
-        .filter(|w| {
-            let low = w.to_lowercase();
-            w.len() > 2 && !STOPWORDS.contains(&low.as_str()) && seen.insert(low)
-        })
+        .filter(|w| w.len() > 2 && !STOPWORDS.contains(w) && seen.insert((*w).to_string()))
+        .map(str::to_string)
         .collect();
     (words.len() > 1).then(|| words.join(" OR "))
 }
@@ -318,82 +321,8 @@ fn fuse(ranked: Vec<(f32, Vec<cv_search::Hit>)>, limit: usize) -> Vec<cv_search:
     picked
 }
 
-/// No-index fallback: discover and stream every session, scoring its whole searchable exchange
-/// against the task's words. Peak memory is the matcher's window, never O(session).
-fn live_scan(task: &str, fetch: usize) -> Result<Vec<cv_search::Hit>> {
-    let adapters = cv_core::harness::all();
-    live_scan_adapters(task, fetch, adapters.iter().map(|adapter| adapter.as_ref()))
-}
-
 fn lexical_score<'a>(text: &str, needle: &str, words: impl Iterator<Item = &'a str>) -> i64 {
     words.filter(|word| text.contains(word)).count() as i64 + if text.contains(needle) { 5 } else { 0 }
-}
-
-fn live_scan_adapters<'a>(
-    task: &str,
-    fetch: usize,
-    adapters: impl IntoIterator<Item = &'a dyn cv_core::Adapter>,
-) -> Result<Vec<cv_search::Hit>> {
-    let needle = task.to_lowercase();
-    let words: Vec<&str> = needle.split_whitespace().filter(|w| w.len() > 2).collect();
-
-    if fetch == 0 {
-        return Ok(Vec::new());
-    }
-    let mut scored = BTreeMap::new();
-    let mut ordinal = 0usize;
-    for adapter in adapters {
-        if adapter.roots().is_empty() {
-            continue;
-        }
-        for r in adapter.discover()? {
-            // The words place the excerpt; the whole task scores on top.
-            let needles = words.iter().map(|w| w.to_string()).chain([needle.clone()]).collect();
-            let mut sink = ScanSink::new(&r.path, Matcher::new(needles, words.len()));
-            let meta = adapter
-                .try_stream(&r, &Demand::LEAN.with_spans(), &mut sink)
-                .with_context(|| format!("scanning {}:{} for pack", r.harness, r.id))?;
-            let excerpt = sink.matcher.finish();
-            let score = (0..words.len()).filter(|&i| sink.matcher.found(i)).count() as i64
-                + if sink.matcher.found(words.len()) { 5 } else { 0 };
-            if score == 0 {
-                continue;
-            }
-            let rank = (std::cmp::Reverse(score), ordinal);
-            ordinal += 1;
-            // Equal scores retain discovery order, as in the original stable sort.
-            if scored.len() == fetch && scored.last_key_value().is_some_and(|(worst, _)| rank >= *worst) {
-                continue;
-            }
-            // The excerpt holds the earliest word's match (else the text's start), in source bytes.
-            let (text, pos) = (excerpt.text.as_str(), excerpt.at);
-            let lo = floor_char(text, pos.saturating_sub(40));
-            let hi = ceil_char(text, (pos + 120).min(text.len()));
-            let snippet = text[lo..hi].replace('\n', " ").trim().to_string();
-            let title = cv_core::label_from(meta.title.as_deref(), sink.first_prompt.as_deref());
-            scored.insert(
-                rank,
-                cv_search::Hit {
-                    id: r.id.clone(),
-                    harness: r.harness.as_str().to_string(),
-                    cwd: r.cwd.as_ref().map(|p| p.display().to_string()),
-                    title: Some(title),
-                    score: score as f32,
-                    snippet,
-                    created_at: r.created_at.map(|t| t.timestamp()),
-                    updated_at: r.updated_at.map(|t| t.timestamp()),
-                    parent_id: None,
-                    agent_id: None,
-                    workflow: None,
-                    session: None,
-                },
-            );
-            if scored.len() > fetch {
-                scored.pop_last();
-            }
-        }
-    }
-    Ok(scored.into_values().collect())
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -416,22 +345,11 @@ struct PackSource {
     edits: BTreeMap<String, i64>,
     /// `path → read count`, from `file_read` events.
     reads: BTreeMap<String, i64>,
-    /// Distinct commands run, in first-seen order (capped).
+    /// Distinct commands run, in first-seen order (whole, no arbitrary command count/char cap).
     commands: Vec<String>,
-    /// Distinct commands past [`MAX_COMMANDS`], and kept ones shortened to [`COMMAND_CHARS`].
-    commands_dropped: usize,
-    commands_shortened: usize,
-    /// Abstractive digest when `CV_PACK_LLM` routed this span through `llm::digest`.
-    llm_digest: Option<crate::llm::Digest>,
 }
 
-fn build_source(
-    hit: &cv_search::Hit,
-    task: &str,
-    llm_model: Option<Option<&str>>,
-    context_bytes: Option<usize>,
-    excerpt_bytes: usize,
-) -> Result<PackSource> {
+fn build_source(hit: &cv_search::Hit, task: &str, excerpt_bytes: usize) -> Result<PackSource> {
     let want = Harness::parse(&hit.harness);
     let (r, adapter) =
         cv_core::find(&hit.id, want)?.with_context(|| format!("session {} no longer on disk", short_id(&hit.id)))?;
@@ -439,48 +357,7 @@ fn build_source(
     // Stale events ride the excerpt pass; event failure remains best effort.
     let (excerpt, excerpt_range) = best_window_and_ingest(adapter.as_ref(), &r, task, excerpt_bytes)?;
     let rows = cv_core::events::events_for(r.harness.as_str(), &r.id, None)?;
-    let EventFacts {
-        edits,
-        reads,
-        commands,
-        commands_dropped,
-        commands_shortened,
-    } = event_facts(&rows);
-
-    // Optional abstractive pass over just this span (never the whole session).
-    let llm_digest = llm_model.and_then(|model| {
-        let mut mini = Session {
-            cwd: hit.cwd.as_ref().map(PathBuf::from),
-            title: hit.title.clone(),
-            ..Session::new(hit.id.clone(), r.harness)
-        };
-        for (role, text, _) in &excerpt {
-            let mut m = Message::new(*role);
-            m.content.push(Block::Text {
-                text: text.clone().into(),
-            });
-            mini.messages.push(m);
-        }
-        let opts = crate::llm::DigestOptions {
-            model: model.map(str::to_owned),
-            project: false,
-            context_bytes,
-        };
-        match crate::llm::digest(&mini, &opts) {
-            Ok(mut d) => {
-                eprintln!("cv pack: digest of {}: {}", short_id(&hit.id), digest_input(&d));
-                d.text = d.text.trim().to_string();
-                Some(d)
-            }
-            Err(e) => {
-                eprintln!(
-                    "cv pack: LLM digest failed for {} ({e:#}); keeping the extractive digest",
-                    short_id(&hit.id)
-                );
-                None
-            }
-        }
-    });
+    let EventFacts { edits, reads, commands } = event_facts(&rows);
 
     Ok(PackSource {
         hit: hit.clone(),
@@ -489,9 +366,6 @@ fn build_source(
         edits,
         reads,
         commands,
-        commands_dropped,
-        commands_shortened,
-        llm_digest,
     })
 }
 
@@ -500,16 +374,13 @@ struct EventFacts {
     edits: BTreeMap<String, i64>,
     reads: BTreeMap<String, i64>,
     commands: Vec<String>,
-    commands_dropped: usize,
-    commands_shortened: usize,
 }
+
 fn event_facts(rows: &[cv_core::events::EventRow]) -> EventFacts {
     let mut edits: BTreeMap<String, i64> = BTreeMap::new();
     let mut reads: BTreeMap<String, i64> = BTreeMap::new();
     let mut commands: Vec<String> = Vec::new();
-    let mut dropped: HashSet<&str> = HashSet::new();
     let mut seen: HashSet<&str> = HashSet::new();
-    let mut commands_shortened = 0;
     for e in rows {
         match e.kind.as_str() {
             "file_edit" => {
@@ -524,19 +395,8 @@ fn event_facts(rows: &[cv_core::events::EventRow]) -> EventFacts {
             }
             "command" => {
                 if let Some(c) = &e.target {
-                    if !seen.insert(c.as_str()) {
-                        continue;
-                    }
-                    // A whole shell pipeline isn't memory; its head is.
-                    let head = cv_core::ir::truncate(c, COMMAND_CHARS);
-                    if commands.contains(&head) {
-                        continue;
-                    }
-                    if commands.len() < MAX_COMMANDS {
-                        commands_shortened += usize::from(head != *c);
-                        commands.push(head);
-                    } else {
-                        dropped.insert(c.as_str());
+                    if seen.insert(c.as_str()) {
+                        commands.push(c.replace('\n', " "));
                     }
                 }
             }
@@ -544,19 +404,11 @@ fn event_facts(rows: &[cv_core::events::EventRow]) -> EventFacts {
         }
     }
 
-    EventFacts {
-        edits,
-        reads,
-        commands,
-        commands_dropped: dropped.len(),
-        commands_shortened,
-    }
+    EventFacts { edits, reads, commands }
 }
 
 /// Stream the session once (lazy spans, head-capped per message) and return a compact window of
 /// `(role, trimmed text)` around the message that best matches `task`, plus its `[lo, hi)` range.
-/// Same scoring as `cv recall`'s excerpt — word hits + a whole-phrase bonus — but without ever
-/// materializing the session.
 fn best_window_and_ingest(
     adapter: &dyn cv_core::Adapter,
     r: &cv_core::SessionRef,
@@ -754,21 +606,17 @@ struct Bounds {
     rollup_dropped: usize,
 }
 
-/// The header line naming every bound of a pack and what each cut, e.g. `Bounds: excerpt
-/// messages to 1600 bytes (--excerpt-bytes; 2 cut, marked …), …`.
+/// The header line naming every bound of a pack and what each cut, e.g. `Bounds: each excerpt
+/// message to 1600 bytes (--excerpt-bytes; 2 cut, marked …), …`.
 fn bounds_line(sources: &[PackSource], bounds: &Bounds) -> String {
     let excerpts_cut: usize = sources
         .iter()
         .map(|s| s.excerpt.iter().filter(|(_, _, cut)| *cut).count())
         .sum();
-    let commands_dropped: usize = sources.iter().map(|s| s.commands_dropped).sum();
-    let commands_shortened: usize = sources.iter().map(|s| s.commands_shortened).sum();
     let files_dropped: usize = sources.iter().map(files_dropped).sum();
     format!(
         "Bounds: each excerpt message to {} bytes (`--excerpt-bytes`; {excerpts_cut} cut, marked …); \
-         {MAX_COMMANDS} distinct commands per source ({commands_dropped} left out), each to \
-         {COMMAND_CHARS} characters ({commands_shortened} shortened); {MAX_FILES_PER_SOURCE} files per \
-         source ({files_dropped} left out); {MAX_ROLLUP} rollup files ({} left out).",
+         {MAX_FILES_PER_SOURCE} files per source ({files_dropped} left out); {MAX_ROLLUP} rollup files ({} left out).",
         bounds.excerpt_bytes, bounds.rollup_dropped
     )
 }
@@ -819,14 +667,6 @@ fn files_line(s: &PackSource) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join(", "))
 }
 
-/// What a digest was made from: `sent of whole transcript bytes; limit N bytes, from <source>`.
-fn digest_input(d: &crate::llm::Digest) -> String {
-    format!(
-        "{} of {} transcript bytes sent; limit {}",
-        d.sent, d.transcript, d.limit
-    )
-}
-
 /// The `md` format: a CLAUDE.md-style bundle you can paste into project memory.
 fn md_bundle(task: &str, sources: &[PackSource], rollup: &[(String, usize, i64, i64)], bounds: &Bounds) -> String {
     let mut out = String::new();
@@ -849,10 +689,6 @@ fn md_bundle(task: &str, sources: &[PackSource], rollup: &[(String, usize, i64, 
             hit_date(&s.hit),
             hit_cwd(&s.hit)
         );
-        if let Some(d) = &s.llm_digest {
-            let _ = writeln!(out, "{}\n", d.text);
-            let _ = writeln!(out, "_Digest input: {}._\n", digest_input(d));
-        }
         if !s.excerpt.is_empty() {
             let _ = writeln!(out, "Key excerpt:\n");
             for (role, text, _) in &s.excerpt {
@@ -911,11 +747,6 @@ fn prompt_bundle(task: &str, sources: &[PackSource], rollup: &[(String, usize, i
             hit_date(&s.hit),
             hit_cwd(&s.hit)
         );
-        if let Some(d) = &s.llm_digest {
-            for line in d.text.lines() {
-                let _ = writeln!(out, "   {line}");
-            }
-        }
         for (role, text, _) in &s.excerpt {
             let _ = writeln!(out, "   {} said:", cv_core::render::role_label(*role));
             for line in text.lines() {
@@ -1341,121 +1172,46 @@ mod tests {
         Ok(())
     }
 
-    struct RecallFixture(Vec<(String, String)>);
-    impl cv_core::Adapter for RecallFixture {
-        fn harness(&self) -> Harness {
-            Harness::OpenSession
-        }
-        fn roots(&self) -> Vec<PathBuf> {
-            vec![PathBuf::from("recall-fixture")]
-        }
-        fn discover(&self) -> Result<cv_core::Discovered> {
-            Ok(self
-                .0
-                .iter()
-                .map(|(id, _)| {
-                    let mut reference = cv_core::SessionRef::from_path(Path::new(id), self.harness());
-                    reference.id = id.clone();
-                    reference
-                })
-                .collect())
-        }
-        fn stream(&self, r: &cv_core::SessionRef, _: &Demand, sink: &mut dyn MessageSink) -> Result<Session> {
-            let (_, text) = self.0.iter().find(|(id, _)| id == &r.id).unwrap();
-            let mut message = Message::new(Role::User);
-            message.content.push(Block::Text {
-                text: text.clone().into(),
-            });
-            sink.message(message);
-            Ok(Session::new(&r.id, r.harness))
-        }
-    }
-
     #[test]
-    fn pack_live_recall_matches_full_stable_ranking_for_every_limit() -> Result<()> {
-        let fixture = RecallFixture(
-            (0..128)
-                .map(|i| {
-                    (
-                        format!("session-{i}"),
-                        match i % 4 {
-                            0 => "alpha beta".into(),
-                            1 => "alpha".into(),
-                            2 => "beta alpha".into(),
-                            _ => "irrelevant".into(),
-                        },
-                    )
-                })
-                .collect(),
+    fn literal_and_or_queries_sanitize_colons_brackets_and_boolean_keywords() {
+        assert_eq!(
+            literal_query("fix bug in ~/dev/foo: bar [E0433] --flag NOT TO AND"),
+            "fix bug in dev foo bar e0433 flag not to and"
         );
-        // Independent oracle: retain every match and apply the original stable full sort.
-        let mut expected: Vec<_> = fixture
-            .0
-            .iter()
-            .filter_map(|(id, text)| {
-                let score = match text.as_str() {
-                    "alpha beta" => 7,
-                    "alpha" => 1,
-                    "beta alpha" => 2,
-                    _ => return None,
-                };
-                Some((score, id.as_str()))
-            })
-            .collect();
-        expected.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
-        for limit in [0, 1, 2, 7, 32, 96, 128] {
-            let actual = live_scan_adapters("alpha beta", limit, [&fixture as &dyn cv_core::Adapter])?;
-            assert_eq!(
-                actual.iter().map(|hit| hit.id.as_str()).collect::<Vec<_>>(),
-                expected.iter().take(limit).map(|(_, id)| *id).collect::<Vec<_>>()
-            );
-            assert_eq!(
-                actual.iter().map(|hit| hit.score as i64).collect::<Vec<_>>(),
-                expected.iter().take(limit).map(|(score, _)| *score).collect::<Vec<_>>()
-            );
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn pack_live_recall_unicode_snippet_uses_original_source_offsets() -> Result<()> {
-        let source = format!("{}target {}", "İ".repeat(200), "end ".repeat(100));
-        let fixture = RecallFixture(vec![("unicode".into(), source.clone())]);
-        let actual = live_scan_adapters("target", 1, [&fixture as &dyn cv_core::Adapter])?;
-        let pos = source.find("target").unwrap();
-        assert_eq!(actual[0].snippet, source[pos - 40..pos + 120].trim());
-        assert!(actual[0].snippet.contains("target"));
-        for source in ["plain text", "İΣ ΟΣ target", "Ⱥİ target", "λİ target"] {
-            let folded = source.to_lowercase();
-            for (offset, _) in source.char_indices() {
-                let prefix = &source[..offset];
-                assert_eq!(
-                    cv_core::scan::lowercase_source_range(
-                        source,
-                        prefix.to_lowercase().len()..prefix.to_lowercase().len()
-                    )
-                    .start,
-                    offset
-                );
-            }
-            assert_eq!(
-                cv_core::scan::lowercase_source_range(source, folded.len()..folded.len()).start,
-                source.len()
-            );
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn or_query_relaxes_multiword_tasks_only() {
+        assert_eq!(literal_query("::: [] ()"), "");
         assert_eq!(
             or_query("tantivy chunked indexing").as_deref(),
             Some("tantivy OR chunked OR indexing")
         );
         assert_eq!(or_query("tantivy"), None);
         assert_eq!(or_query("a of in"), None); // short words dropped
-                                               // Punctuation stripped, dupes (case-insensitive) collapsed.
-        assert_eq!(or_query("Fix fix, the (parser)!").as_deref(), Some("Fix OR parser"));
+                                               // Punctuation stripped, lowercased, dupes collapsed.
+        assert_eq!(or_query("Fix fix, the (parser)!").as_deref(), Some("fix OR parser"));
+    }
+
+    #[test]
+    fn event_facts_keeps_all_distinct_commands_whole_without_magic_caps() {
+        let rows: Vec<cv_core::events::EventRow> = (0..10)
+            .map(|i| cv_core::events::EventRow {
+                harness: "claude".into(),
+                session_id: "s".into(),
+                msg_idx: i,
+                ts: None,
+                kind: "command".into(),
+                tool: Some("Bash".into()),
+                target: Some(format!(
+                    "cargo test --package clustervision-suite-{i} -- --nocapture {}",
+                    "x".repeat(120)
+                )),
+                detail: None,
+                agent_id: None,
+                parent_id: None,
+                workflow: None,
+            })
+            .collect();
+        let facts = event_facts(&rows);
+        assert_eq!(facts.commands.len(), 10, "all 10 distinct commands kept");
+        assert!(facts.commands.iter().all(|c| c.len() > 150), "no 90-char truncation");
     }
 
     #[test]
@@ -1583,9 +1339,6 @@ mod tests {
             edits: BTreeMap::new(),
             reads: BTreeMap::new(),
             commands: Vec::new(),
-            commands_dropped: 0,
-            commands_shortened: 0,
-            llm_digest: None,
         };
         let bounds = Bounds {
             excerpt_bytes: EXCERPT_BYTES,

@@ -90,10 +90,10 @@ fn pack_md_no_index_fallback_and_content() {
     let w = World::new("md");
     pack_corpus(&w);
 
-    // No index yet: the live-scan fallback is announced, and recall still finds the right session.
+    // No index yet: the live-suffix read is announced, and recall still finds the right session.
     let (out, err) = w.cv_ok(&["pack", "wombat caching layer"]);
-    assert!(err.contains("no index yet"), "want live-scan note, stderr:\n{err}");
-    assert!(err.contains("live scan"), "{err}");
+    assert!(err.contains("no index yet"), "want live-suffix note, stderr:\n{err}");
+    assert!(err.contains("the index has not seen live"), "{err}");
     assert!(
         err.contains("no embeddings store"),
         "honest FTS-only note expected:\n{err}"
@@ -142,7 +142,10 @@ fn pack_header_states_its_bounds_and_what_they_cut() {
     );
     assert!(out.contains("…"), "{out}");
     let (ok, code, _, err) = w.cv(&["pack", "wombat", "--context-bytes", "100"]);
-    assert!(!ok && code == 2 && err.contains("CV_PACK_LLM"), "{code} {err}");
+    assert!(
+        !ok && code == 2 && err.contains("unexpected argument '--context-bytes'"),
+        "{code} {err}"
+    );
 }
 
 #[test]
@@ -186,6 +189,35 @@ fn pack_uses_index_when_present_and_respects_limit() {
     assert!(result["content"].is_null());
     let written = fs::read_to_string(&dest).unwrap();
     assert!(written.contains("# Context pack"), "{written}");
+
+    // 0.18 live-suffix fresh recall + bare-colon query syntax resilience: a session written AFTER
+    // `cv index` is still recalled, and bare `:` / `[...]` in task text never crash QueryParser.
+    w.write_session(
+        "freshsess",
+        &[
+            serde_json::json!({"type": "ai-title", "aiTitle": "fresh unindexed fix"}),
+            user_line(
+                "freshsess",
+                "f1",
+                "2026-05-01T10:00:00Z",
+                "fix bug in ~/dev/foo: platypus",
+            ),
+            assistant_line(
+                "f2",
+                "2026-05-01T10:01:00Z",
+                serde_json::json!([{"type": "text", "text": "resolved the platypus colon issue"}]),
+            ),
+        ],
+    );
+    let (out, err) = w.cv_ok(&["pack", "fix bug in ~/dev/foo: platypus [E0433]"]);
+    assert!(
+        err.contains("the index has not seen live"),
+        "live suffix should read freshsess:\n{err}"
+    );
+    assert!(
+        out.contains("## fresh unindexed fix"),
+        "fresh unindexed session must be recalled:\n{out}"
+    );
 }
 
 #[test]

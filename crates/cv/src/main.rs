@@ -14,7 +14,6 @@ static ALLOCATOR: cv_testkit::heap::Allocator = cv_testkit::heap::Allocator;
 
 mod cmd;
 mod http;
-mod llm;
 mod util;
 
 /// A hermetic world whose environment this thread's library calls read (see `cv_core::env`).
@@ -785,10 +784,10 @@ enum Cmd {
         #[arg(required = true)]
         specs: Vec<String>,
         /// Emit a resumable main-thread Claude session (new id) under the Claude store or --out.
-        #[arg(long, conflicts_with_all = ["agent_of", "harness", "export", "generate"])]
+        #[arg(long, conflicts_with_all = ["agent_of", "harness", "export"])]
         session: bool,
         /// Emit a new sub-agent transcript owned by this ROOT session (id or transcript path).
-        #[arg(long, value_name = "ROOT", conflicts_with_all = ["harness", "export", "generate", "out", "cwd"])]
+        #[arg(long, value_name = "ROOT", conflicts_with_all = ["harness", "export", "out", "cwd"])]
         agent_of: Option<String>,
         /// Target harness for the composed session (defaults to the first spec's harness).
         #[arg(long)]
@@ -812,13 +811,6 @@ enum Cmd {
         /// Rehome the composed session to this working directory.
         #[arg(long)]
         cwd: Option<PathBuf>,
-        /// Generate a continuation of the composed session via an LLM and append it (the loom's
-        /// generative step). Uses OPENROUTER/ANTHROPIC keys or LMSTUDIO_API_BASE for free local gen.
-        #[arg(long)]
-        generate: bool,
-        /// Model for --generate (provider-specific; defaults to the provider's default).
-        #[arg(long = "gen-model")]
-        gen_model: Option<String>,
     },
     /// Produce a copy of a session that runs elsewhere: in another harness (`--harness`), from
     /// another working directory (`--cwd`, carrying CLAUDE.md/AGENTS.md/… along), or both. The
@@ -949,11 +941,6 @@ enum Cmd {
         /// Return the bundle or written artifact as a JSON result.
         #[arg(long)]
         json: bool,
-        /// Bytes of each span's transcript the `CV_PACK_LLM` digest may send. Default: the model's
-        /// context window as its provider reports it, less the digest's output and prompt (a token
-        /// is at least a byte). The bundle states each digest's input and limit.
-        #[arg(long, value_name = "N")]
-        context_bytes: Option<usize>,
         /// Bytes of one message an excerpt shows; a longer one is cut there, an open code fence
         /// closed, and marked `…`. The bundle's header states this and every other bound, and
         /// what each cut.
@@ -1427,7 +1414,6 @@ fn run() -> Result<()> {
             force,
             thinking,
             json,
-            context_bytes,
             excerpt_bytes,
         } => pack::cmd_pack(pack::PackArgs {
             task: &task,
@@ -1438,7 +1424,6 @@ fn run() -> Result<()> {
             force,
             thinking: util::parse_thinking(&thinking)?,
             json,
-            context_bytes,
             excerpt_bytes,
         }),
         Cmd::Stats { query, json, tokens } => browse::cmd_stats(query, json, tokens),
@@ -1704,8 +1689,6 @@ fn run() -> Result<()> {
             json,
             export,
             cwd,
-            generate,
-            gen_model,
             thinking,
         } => {
             // `--session` / `--agent-of` take the distill destinations (`--out`/`--cwd` ride along
@@ -1715,7 +1698,16 @@ fn run() -> Result<()> {
             } else {
                 None
             };
-            reshape::cmd_splice(reshape::SpliceArgs { specs: &specs, harness, out, export, cwd, generate, gen_model, thinking: util::parse_thinking(&thinking)?, resumable, json })
+            reshape::cmd_splice(reshape::SpliceArgs {
+                specs: &specs,
+                harness,
+                out,
+                export,
+                cwd,
+                thinking: util::parse_thinking(&thinking)?,
+                resumable,
+                json,
+            })
         }
         // Removed commands: one line each, pointing at the replacement; exit 2.
         Cmd::Timeline { .. } => usage(

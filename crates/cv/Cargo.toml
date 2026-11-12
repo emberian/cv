@@ -30,9 +30,6 @@ regex.workspace = true
 uuid.workspace = true
 # `cmd/hooks.rs`: Codex's `[hooks.state]` trust store (TOML) and its identity hash.
 toml.workspace = true
-# `llm.rs`: two blocking POSTs (OpenRouter / Anthropic / a local OpenAI-compatible server). `ureq`
-# is already in the tree through cv-search's embedding stack, so this adds no HTTP stack of its own.
-ureq = { version = "2", features = ["json"] }
 # `cv serve`'s banner encodes its query string; the server itself (`src/http.rs`) is std-only.
 urlencoding = "2"
 

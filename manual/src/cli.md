@@ -709,9 +709,6 @@ cv splice da9174f4:0..20 4f2a0c11:50.. --export md
 
 # materialize it into a real Codex session
 cv splice da9174f4:0..20 4f2a0c11:50.. --harness codex
-
-# stitch, then let an LLM continue the thread
-cv splice da9174f4:0..20 4f2a0c11:50.. --generate
 ```
 
 ```text
@@ -723,9 +720,6 @@ cv splice da9174f4:0..20 4f2a0c11:50.. --generate
 Sub-agent spans join the main thread. Without `--harness`/`--out` it only composes
 (`--export md|json` dumps). `--session` and `--agent-of` work as in [`distill`](#cv-distill). A call
 whose result falls outside the spans is dropped ([the dangling-parent trap](reshaping.md#the-dangling-parent-trap)).
-
-`--generate` appends one assistant turn (an empty one is refused) from `OPENROUTER_API_KEY`,
-`ANTHROPIC_API_KEY` or `LMSTUDIO_API_BASE=local`.
 
 ### `cv port`
 

@@ -16,9 +16,8 @@ clustervision fixes all three. It parses [every harness it knows](harnesses.md) 
 - 🧠 **Let running agents coordinate** via hooks and a task substrate: durable dispatch objects and the decisions posed on them, every completion labeled as the agent's own word.
 - 📦 **Pack** your whole history into context for the task you're about to start, so you never explain your codebase to an agent twice.
 
-It's open source (MIT/Apache-2.0). Reading, indexing and browser uploads stay local.
-`splice --generate` and `pack` with `CV_PACK_LLM` send selected context to the configured LLM provider; choose LM Studio
-for local generation. Semantic indexing downloads its model on first use.
+It's open source (MIT/Apache-2.0). Reading, indexing, packing and browser uploads stay local.
+Semantic indexing downloads its embedding model on first use.
 
 ## How to read this manual
 
