@@ -124,11 +124,20 @@ impl StateStore {
             if let Some(lock_file) = self.try_acquire_owner_lock()? {
                 #[cfg(unix)]
                 {
-                    // Holding `owner.lock` proves no `RecorderServer` owns this store; any left-over
-                    // socket file is stale from an abrupt owner death and safe to clean up.
                     let sock = self.socket_path();
                     if sock.exists() {
-                        let _ = std::fs::remove_file(&sock);
+                        // Recheck socket availability under `owner.lock` before declaring the
+                        // socket stale and falling back to direct `BEGIN IMMEDIATE`.
+                        match try_ipc_append(&sock, req) {
+                            IpcAttempt::Done(res) => {
+                                let _ = FileExt::unlock(&lock_file);
+                                drop(lock_file);
+                                return res;
+                            }
+                            IpcAttempt::TransportFailed => {
+                                let _ = std::fs::remove_file(&sock);
+                            }
+                        }
                     }
                 }
                 let result = self.serverless_commit(req);
@@ -452,17 +461,28 @@ impl RecorderServer {
                                 let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
                                 let mut line = String::new();
                                 if let Ok(dup) = stream.try_clone() {
-                                    let mut reader = BufReader::new(dup);
+                                    use std::io::Read as _;
+                                    const MAX_IPC_FRAME_BYTES: u64 = 16 * 1024 * 1024;
+                                    let mut reader = BufReader::new(dup.take(MAX_IPC_FRAME_BYTES + 1));
                                     if reader.read_line(&mut line).is_ok() && !line.trim().is_empty() {
-                                        match serde_json::from_str::<AppendRequest>(line.trim()) {
-                                            Ok(req) => {
-                                                let _ = tx_conn.send(BatchWork { req, stream });
-                                            }
-                                            Err(err) => {
-                                                let _ = write_wire_response(
-                                                    &mut stream,
-                                                    &WireResponse::InvalidArgument(err.to_string()),
-                                                );
+                                        if line.len() as u64 > MAX_IPC_FRAME_BYTES {
+                                            let _ = write_wire_response(
+                                                &mut stream,
+                                                &WireResponse::InvalidArgument(
+                                                    "IPC request exceeds 16 MiB frame limit".into(),
+                                                ),
+                                            );
+                                        } else {
+                                            match serde_json::from_str::<AppendRequest>(line.trim()) {
+                                                Ok(req) => {
+                                                    let _ = tx_conn.send(BatchWork { req, stream });
+                                                }
+                                                Err(err) => {
+                                                    let _ = write_wire_response(
+                                                        &mut stream,
+                                                        &WireResponse::InvalidArgument(err.to_string()),
+                                                    );
+                                                }
                                             }
                                         }
                                     }
