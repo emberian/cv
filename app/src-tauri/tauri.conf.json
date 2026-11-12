@@ -7,7 +7,7 @@
     "frontendDist": "../../web"
   },
   "app": {
-    "withGlobalTauri": true,
+    "withGlobalTauri": false,
     "windows": [
       {
         "title": "clustervision",
@@ -20,7 +20,7 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost https://ipc.localhost https://openrouter.ai http://localhost:* http://127.0.0.1:*; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
     }
   },
   "bundle": {
@@ -31,6 +31,6 @@
     ],
     "category": "DeveloperTool",
     "shortDescription": "Cross-harness AI session viewer.",
-    "longDescription": "clustervision wraps the static web session viewer (timeline, compare, stats, splice composer, fleet dashboard), reads sessions through the in-process read API, and launches a local `cv serve` on startup."
+    "longDescription": "clustervision wraps the web session dashboard (sessions, projects, timeline, compare, stats, structure, splice composer, fleet), reading and searching all 22 supported agent harnesses directly through the in-process Rust API."
   }
 }

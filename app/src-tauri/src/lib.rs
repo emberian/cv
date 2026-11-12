@@ -1,41 +1,26 @@
 //! clustervision desktop app — the Tauri v2 runtime.
 //!
-//! This crate is a window around the *existing* static web UI (`<repo>/web/`, wired via
-//! `frontendDist` in `tauri.conf.json`). It adds the things the browser-only app can't do:
+//! This crate is a window around the static web UI (`<repo>/web/`, wired via `frontendDist` in
+//! `tauri.conf.json`). Every data path runs in-process without spawning external CLI or HTTP
+//! server processes:
 //!
-//!   1. **One native command, `api(path, query)`**, which calls `cv_core::api::route_json` —
-//!      the same function `cv serve` answers `/api/*` with — in-process. No HTTP (the webview's
-//!      cross-origin fetch to `http://localhost` is unreliable) and no second implementation: a
-//!      session cannot look different depending on which door it came through.
-//!   2. **Launches `cv serve --port 7777` on startup** so the bundled fleet dashboard (which
-//!      fetches `http://localhost:7777`) works unchanged. The child is killed on exit.
-//!   3. A **native application menu** (File / Edit / View / Help) — including **File → Open zip…**
-//!      which runs a native file dialog, ingests the zip in Rust (no WASM module), and emits the
-//!      `cv://open-sessions` Tauri event the web UI listens for.
-//!   4. **Window state persistence** (size/position across launches) via
-//!      `tauri-plugin-window-state`.
-//!
-//! ### cv-serve wiring approach
-//! We spawn `cv` via `std::process::Command` (rather than a bundled Tauri *sidecar*) — it's
-//! the simplest thing that compiles and runs everywhere without an extra bundling step. We
-//! search the repo's build outputs `target/{release,debug}/cv` first, then PATH, so a plain
-//! `cargo build -p clustervision` in the repo is enough to make it work in dev. The handle is stored in
-//! Tauri's managed state and killed on `RunEvent::Exit`. A **View → cv serve** menu toggle lets
-//! you start/stop it at runtime.
-//!
-//! To ship a self-contained bundle later, build `cv` (`cargo build -p clustervision --release`) and
-//! either drop the binary on PATH or register it as a Tauri sidecar (see `app/README.md`).
+//!   1. **One native command, `api(path, query)`**, answering `/api/stats` and `/api/search`
+//!      directly via `cv_core` + `cv_search` and delegating every other `/api/*` route to
+//!      [`cv_core::api::route_json`].
+//!   2. **In-process transcript export (`export_session`)**, staging Markdown and OpenSession 0.3
+//!      documents into a private `0600` file and publishing atomically after source verification.
+//!   3. **Streaming zip ingest (`File → Open zip…`)**, reading picked `.zip` archives through a
+//!      `BufReader<File>` rather than buffering whole archives in RAM, and emitting
+//!      `cv://open-sessions` to the webview.
+//!   4. **Window state persistence** via `tauri-plugin-window-state`.
 
-use std::io::Read;
-use std::process::{Child, Command};
-use std::sync::Mutex;
+use std::collections::HashMap;
+use std::io::{BufReader, BufWriter, Read, Seek, Write};
 
+use serde_json::Value;
 use tauri::menu::{AboutMetadataBuilder, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
-use tauri::{AppHandle, Emitter, Manager, RunEvent, Runtime, WebviewWindow};
+use tauri::{AppHandle, Emitter, Manager, Runtime, WebviewWindow};
 use tauri_plugin_dialog::DialogExt;
-
-/// The port the bundled web fleet-dashboard expects `cv serve` on.
-const SERVE_PORT: u16 = 7777;
 
 /// The Tauri event the web UI listens for to load freshly-ingested sessions. Payload is a JSON
 /// string holding a `Session[]` array (the same IR the WASM `ingest_zip` returns).
@@ -44,33 +29,168 @@ const OPEN_SESSIONS_EVENT: &str = "cv://open-sessions";
 /// The public web demo, opened from Help → Open the web demo.
 const WEB_DEMO_URL: &str = "https://emberian.github.io/clustervision/";
 
-/// Handle to the spawned `cv serve` child, kept in Tauri managed state so we can kill it on exit
-/// (and toggle it from the menu).
-#[derive(Default)]
-struct ServeChild(Mutex<Option<Child>>);
+/// Default `GET /api/search` limit, matching `cv search` and `cv serve`.
+const SEARCH_LIMIT: usize = 20;
 
 // ---------------------------------------------------------------------------
 // Zip ingest (File → Open zip…)
 // ---------------------------------------------------------------------------
 
-/// Unzip `bytes` in-memory and ingest the contained files into `Session[]` JSON — the shape the
-/// web UI's WASM `ingest_zip` produces, via the same `cv_core::ingest::ingest_files`.
-fn ingest_zip_bytes(bytes: &[u8]) -> Result<String, String> {
-    let files = cv_core::ingest::archive::extract(std::io::Cursor::new(bytes), Default::default())
-        .map_err(|error| format!("zip: {error:#}"))?;
+/// Stream a seekable `.zip` reader and ingest the contained files into `Session[]` JSON.
+fn ingest_zip_reader(reader: impl Read + Seek) -> Result<String, String> {
+    let files =
+        cv_core::ingest::archive::extract(reader, Default::default()).map_err(|error| format!("zip: {error:#}"))?;
     let sessions = cv_core::ingest::ingest_files(files).map_err(|error| format!("ingesting zip: {error:#}"))?;
     serde_json::to_string(&sessions).map_err(|e| format!("serializing sessions: {e}"))
 }
 
+#[cfg(test)]
+fn ingest_zip_bytes(bytes: &[u8]) -> Result<String, String> {
+    ingest_zip_reader(std::io::Cursor::new(bytes))
+}
+
+fn ingest_zip_file(path: &std::path::Path) -> Result<String, String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("opening {}: {e}", path.display()))?;
+    ingest_zip_reader(BufReader::new(file))
+}
+
 // ---------------------------------------------------------------------------
-// Reading the machine's real sessions — one command over the one read API.
+// Reading and searching the machine's real sessions — one in-process command.
 // ---------------------------------------------------------------------------
 
-/// `GET <path>?<query>` against [`cv_core::api::route_json`], in-process: `path` is a read-API
-/// path (`/api/sessions`, `/api/session/claude/<id>/messages`, …), `query` its raw query string.
+fn resolve_text_sets(query: &cv_core::SessionQuery) -> Result<cv_core::query::TextSets, (u16, String)> {
+    use cv_core::query::{FieldId, TextSets};
+    let needles = query.needles(FieldId::Text);
+    if needles.is_empty() {
+        return Ok(TextSets::empty());
+    }
+    let live = cv_search::LiveRead::of(None).map_err(|e| (503, format!("{e:#}")))?;
+    if live == cv_search::LiveRead::Frozen && !cv_search::default_tantivy_dir().exists() {
+        return Err((503, "`text:` needs a full-text index; build it with `cv index`".into()));
+    }
+    let borrowed: Vec<&str> = needles.iter().map(String::as_str).collect();
+    let (matches, suffix) = cv_search::text_search_ids_suffixed(None, &borrowed, live, &cv_core::sessions())
+        .map_err(|e| (500, format!("opening full-text query index: {e:#}")))?;
+    if suffix.no_index && suffix.unread() > 0 {
+        return Err((
+            503,
+            format!(
+                "`text:` needs a full-text index: {} of {} session(s) were not read live; build it with `cv index`",
+                suffix.unread(),
+                suffix.stale
+            ),
+        ));
+    }
+    let mut sets = HashMap::new();
+    for (needle, result) in needles.into_iter().zip(matches) {
+        let ids = result.map_err(|e| (500, format!("resolving text:{needle:?}: {e:#}")))?;
+        sets.insert(needle, ids);
+    }
+    Ok(TextSets::resolve(query, |needle| {
+        sets.remove(needle).unwrap_or_default()
+    }))
+}
+
+fn api_stats(params: &cv_core::api::Query) -> (u16, Value) {
+    let q = match params.get("q") {
+        Some(s) => match cv_core::SessionQuery::parse(&s) {
+            Ok(q) => Some(q),
+            Err(e) => {
+                return (
+                    400,
+                    serde_json::json!({ "error": e.replace("`cv query`", "`cv schema`") }),
+                )
+            }
+        },
+        None => None,
+    };
+    let mut refs = cv_core::sessions();
+    if let Some(q) = &q {
+        let texts = match resolve_text_sets(q) {
+            Ok(texts) => texts,
+            Err((status, msg)) => return (status, serde_json::json!({ "error": msg })),
+        };
+        if let Err(error) = cv_core::query::filter_refs(&mut refs, q, &texts) {
+            return (500, serde_json::json!({ "error": format!("{error:#}") }));
+        }
+    }
+    (200, cv_core::stats::CorpusStats::compute(&refs).to_json())
+}
+
+fn api_search(params: &cv_core::api::Query) -> (u16, Value) {
+    let bad = |status: u16, msg: &str| (status, serde_json::json!({ "error": msg }));
+    let Some(q) = params.get("q") else {
+        return bad(400, "missing q parameter");
+    };
+    let want = match params.get("harness") {
+        Some(h) => match cv_core::Harness::parse(&h) {
+            Some(h) => Some(h),
+            None => return bad(400, &format!("unknown harness {h:?}")),
+        },
+        None => None,
+    };
+    let limit = match params.unsigned("limit") {
+        Ok(limit) => limit.unwrap_or(SEARCH_LIMIT),
+        Err(error) => return bad(400, &error),
+    };
+    let cwd = params.get("cwd");
+    let flag = |name| {
+        params
+            .get(name)
+            .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    };
+    let (semantic, scan) = (flag("semantic"), flag("scan"));
+    if semantic {
+        return bad(400, "semantic search is not enabled in the desktop build");
+    }
+    let scope = match params.get("kind") {
+        None => cv_search::Scope::Exchange,
+        Some(kind) => match cv_search::Scope::parse(&kind) {
+            Some(scope) => scope,
+            None => return bad(400, &format!("unknown kind {kind:?}: exchange, context or all")),
+        },
+    };
+    if scan && params.get("kind").is_some() {
+        return bad(400, "this mode searches the exchange only; kind= needs the index");
+    }
+    let source = if scan {
+        cv_search::Source::Live
+    } else {
+        cv_search::Source::Index
+    };
+    let filter = cv_search::SearchFilter {
+        harness: want.map(|h| h.as_str()),
+        cwd: cwd.as_deref(),
+        scope,
+    };
+    let live_bytes = match params.unsigned("live_bytes") {
+        Ok(bytes) => bytes.map(|b| b as u64),
+        Err(error) => return bad(400, &error),
+    };
+    let searcher = cv_search::Searcher::default();
+    let found = match searcher.search(&q, filter, limit, source, live_bytes) {
+        Ok(found) => found,
+        Err(e) if scan => return bad(500, &format!("live scan failed: {e:#}")),
+        Err(e) if cv_search::is_invalid_text_query(&e) => return bad(400, &format!("invalid search query: {e:#}")),
+        Err(e) if e.is::<cv_search::BadLiveBytes>() => return bad(500, &format!("{e:#}")),
+        Err(e) => {
+            return bad(
+                503,
+                &format!("{e:#} (or add scan=1 for a slow live scan of every session)"),
+            )
+        }
+    };
+    let context = cv_core::rows::SearchRowContext::new();
+    let rows: Vec<Value> = found.hits.iter().map(|h| cv_search::row(h, &context)).collect();
+    (200, Value::Array(rows))
+}
+
+/// `GET <path>?<query>` in-process: `/api/stats` and `/api/search` answer directly from
+/// `cv_core` + `cv_search`, and every other route delegates to [`cv_core::api::route_json`].
 /// A 2xx returns the JSON body as a string; anything else rejects with `"<status>: <error>"`.
 #[tauri::command]
 fn api(path: String, query: Option<String>) -> Result<String, String> {
+    let raw_query = query.as_deref().unwrap_or("");
     let segments: Vec<String> = path
         .split('?')
         .next()
@@ -81,7 +201,11 @@ fn api(path: String, query: Option<String>) -> Result<String, String> {
         .map(cv_core::api::decode)
         .collect();
     let parts: Vec<&str> = segments.iter().map(String::as_str).collect();
-    let (status, body) = cv_core::api::route_json(&parts, query.as_deref().unwrap_or(""));
+    let (status, body) = match parts.as_slice() {
+        ["api", "stats"] => api_stats(&cv_core::api::Query::parse(raw_query)),
+        ["api", "search"] => api_search(&cv_core::api::Query::parse(raw_query)),
+        _ => cv_core::api::route_json(&parts, raw_query),
+    };
     if (200..300).contains(&status) {
         serde_json::to_string(&body).map_err(|e| format!("serializing {path}: {e}"))
     } else {
@@ -92,8 +216,10 @@ fn api(path: String, query: Option<String>) -> Result<String, String> {
     }
 }
 
-// Full transcript exports stay out of the webview: the existing checked CLI exporter
-// writes a private file beside the destination, published only after successful exit.
+// ---------------------------------------------------------------------------
+// Atomic in-process transcript export
+// ---------------------------------------------------------------------------
+
 struct ExportStage {
     path: std::path::PathBuf,
     file: std::fs::File,
@@ -172,19 +298,11 @@ fn export_destination(path: &std::path::Path) -> Result<Option<ExportDestination
     }))
 }
 
-fn export_to_path(
-    binary: &std::path::Path,
-    harness: &str,
-    id: &str,
-    format: &str,
+fn publish_export(
     destination: &std::path::Path,
     source: &std::path::Path,
+    write_fn: impl FnOnce(&mut std::fs::File) -> Result<(), String>,
 ) -> Result<(), String> {
-    let cli_format = match format {
-        "markdown" => "md",
-        "opensession" => "json",
-        _ => return Err("unknown export format".into()),
-    };
     let parent = destination
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -200,25 +318,8 @@ fn export_to_path(
         return Err("export destination would replace transcript source; choose a separate file".into());
     }
     let before = export_destination(&destination)?;
-    let stage = ExportStage::create(&parent)?;
-    let mut errors = ExportStage::create(&parent)?;
-    let status = Command::new(binary)
-        .args(["export", "--harness", harness, "--format", cli_format, "--", id])
-        .stdin(std::process::Stdio::null())
-        .stdout(stage.file.try_clone().map_err(|e| e.to_string())?)
-        .stderr(errors.file.try_clone().map_err(|e| e.to_string())?)
-        .status()
-        .map_err(|e| format!("starting cv export: {e}"))?;
-    if !status.success() {
-        use std::io::{Seek, SeekFrom};
-        errors.file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
-        let mut message = String::new();
-        (&mut errors.file)
-            .take(4096)
-            .read_to_string(&mut message)
-            .map_err(|e| e.to_string())?;
-        return Err(format!("cv export failed ({status}): {}", message.trim()));
-    }
+    let mut stage = ExportStage::create(&parent)?;
+    write_fn(&mut stage.file)?;
     stage.file.sync_all().map_err(|e| format!("finishing export: {e}"))?;
     if export_destination(&destination)? != before {
         return Err("export destination changed during export; choose the destination again".into());
@@ -229,6 +330,76 @@ fn export_to_path(
     } else {
         std::fs::rename(&stage.path, &destination).map_err(|e| format!("saving export: {e}"))
     }
+}
+
+fn write_session_export(
+    adapter: &dyn cv_core::Adapter,
+    reference: &cv_core::SessionRef,
+    format: &str,
+    file: &mut std::fs::File,
+) -> Result<(), String> {
+    let _reads = cv_core::source::read_scope();
+    let mut out = BufWriter::with_capacity(64 * 1024, file);
+    match format {
+        "markdown" => {
+            let session = cv_core::collect(adapter, reference).map_err(|e| format!("reading transcript: {e:#}"))?;
+            let resolver = session.resolver();
+            cv_core::render::write_markdown(&session, &mut out, &resolver)
+                .map_err(|e| format!("writing markdown export: {e:#}"))?;
+        }
+        "opensession" => {
+            let mut sink = cv_core::api::WindowSink::new(&reference.path, 0, None);
+            let pass = cv_core::stream::Pass {
+                guard: true,
+                ..cv_core::stream::Pass::RECORD
+            };
+            let read = cv_core::stream::stream_counted(
+                adapter,
+                reference,
+                &cv_core::Demand::RICH.with_spans(),
+                &mut sink,
+                pass,
+            )
+            .map_err(|e| format!("reading transcript: {e:#}"))?;
+            let frames = sink.finish().map_err(|e| format!("staging frames: {e:#}"))?;
+            let framing = cv_core::projection::Framing {
+                pretty: true,
+                total: Some(sink.selected),
+                ..cv_core::projection::Framing::default()
+            };
+            cv_core::projection::write_frames(
+                &mut out,
+                &cv_core::harness::opensession::document(&read.session),
+                "messages",
+                &frames,
+                framing,
+            )
+            .map_err(|e| format!("writing opensession export: {e:#}"))?;
+            out.write_all(b"\n")
+                .map_err(|e| format!("writing opensession newline: {e}"))?;
+            if let Some(guard) = read.guard {
+                guard
+                    .verify(reference)
+                    .map_err(|e| format!("transcript changed during export: {e:#}"))?;
+            }
+        }
+        _ => return Err("unknown export format".into()),
+    }
+    out.flush().map_err(|e| format!("flushing export: {e}"))
+}
+
+fn export_session_to_path(harness: &str, id: &str, format: &str, destination: &std::path::Path) -> Result<(), String> {
+    if !matches!(format, "markdown" | "opensession") {
+        return Err("unknown export format".into());
+    }
+    let kind = cv_core::Harness::parse(harness).ok_or("unknown source harness")?;
+    let (reference, adapter) = cv_core::find(id, Some(kind))
+        .map_err(|e| format!("finding transcript source: {e}"))?
+        .ok_or("transcript source not found")?;
+    let primary = cv_core::source::primary_path(&reference);
+    publish_export(destination, &primary, |file| {
+        write_session_export(adapter.as_ref(), &reference, format, file)
+    })
 }
 
 #[tauri::command]
@@ -260,12 +431,7 @@ async fn export_session(app: AppHandle, harness: String, id: String, format: Str
             return Ok(false);
         };
         let destination = picked.into_path().map_err(|e| format!("resolving save path: {e}"))?;
-        let kind = cv_core::Harness::parse(&harness).ok_or("unknown source harness")?;
-        let (reference, _) = cv_core::find(&id, Some(kind))
-            .map_err(|e| format!("finding transcript source: {e}"))?
-            .ok_or("transcript source not found")?;
-        let primary = cv_core::source::primary_path(&reference);
-        export_to_path(&cv_binary(), &harness, &id, &format, &destination, &primary)?;
+        export_session_to_path(&harness, &id, &format, &destination)?;
         Ok(true)
     })
     .await
@@ -276,7 +442,7 @@ async fn export_session(app: AppHandle, harness: String, id: String, format: Str
 // Native application menu
 // ---------------------------------------------------------------------------
 
-/// Build the native application menu (File / View / Help). Menu item IDs are matched in
+/// Build the native application menu (File / Edit / View / Help). Menu item IDs are matched in
 /// [`handle_menu_event`].
 fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     // --- File
@@ -284,9 +450,7 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     let quit = PredefinedMenuItem::quit(app, Some("Quit clustervision"))?;
     let file = Submenu::with_items(app, "File", true, &[&open_zip, &quit])?;
 
-    // --- Edit: without these, macOS gives the webview no Cmd+C/Cmd+V/Cmd+A — a real problem for a
-    // transcript viewer where copying text is the whole point. Predefined items wire to the OS's
-    // standard editing actions for the focused field/selection.
+    // --- Edit: standard macOS/OS editing actions so Cmd+C/Cmd+V/Cmd+A work inside the webview.
     let edit = Submenu::with_items(
         app,
         "Edit",
@@ -306,19 +470,7 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     let reload = MenuItem::with_id(app, "view.reload", "Reload", true, Some("CmdOrCtrl+R"))?;
     let devtools = MenuItem::with_id(app, "view.devtools", "Toggle DevTools", true, Some("CmdOrCtrl+Alt+I"))?;
     let fullscreen = PredefinedMenuItem::fullscreen(app, Some("Toggle Fullscreen"))?;
-    let serve_toggle = MenuItem::with_id(app, "view.serve_toggle", "Toggle cv serve", true, None::<&str>)?;
-    let view = Submenu::with_items(
-        app,
-        "View",
-        true,
-        &[
-            &reload,
-            &devtools,
-            &fullscreen,
-            &PredefinedMenuItem::separator(app)?,
-            &serve_toggle,
-        ],
-    )?;
+    let view = Submenu::with_items(app, "View", true, &[&reload, &devtools, &fullscreen])?;
 
     // --- Help
     let about_meta = AboutMetadataBuilder::new()
@@ -339,7 +491,6 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: MenuEvent) {
         "file.open_zip" => open_zip_via_dialog(app),
         "view.reload" => {
             if let Some(win) = main_window(app) {
-                // Reloading the webview re-fetches frontendDist (web/index.html).
                 let _ = win.eval("window.location.reload()");
             }
         }
@@ -352,11 +503,7 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: MenuEvent) {
                 }
             }
         }
-        "view.serve_toggle" => toggle_serve(app),
         "help.web_demo" => {
-            // Open in the user's default browser via the shell plugin (matches the existing
-            // `shell:allow-open` capability). `Shell::open` is deprecated in favor of
-            // tauri-plugin-opener, but using it avoids pulling in another plugin/permission set.
             #[allow(deprecated)]
             {
                 use tauri_plugin_shell::ShellExt;
@@ -372,12 +519,10 @@ fn main_window<R: Runtime>(app: &AppHandle<R>) -> Option<WebviewWindow<R>> {
     app.get_webview_window("main")
 }
 
-/// File → Open zip…: native picker → in-memory ingest → emit `cv://open-sessions` with the
-/// `Session[]` JSON payload. All failures are surfaced via a native message dialog rather than
-/// silently dropped.
+/// File → Open zip…: native picker → streaming `BufReader<File>` ingest → emit
+/// `cv://open-sessions` with the `Session[]` JSON payload.
 fn open_zip_via_dialog<R: Runtime>(app: &AppHandle<R>) {
     let app = app.clone();
-    // Run the (blocking) native picker off the main thread so we never deadlock the event loop.
     std::thread::spawn(move || {
         let picked = app
             .dialog()
@@ -387,14 +532,13 @@ fn open_zip_via_dialog<R: Runtime>(app: &AppHandle<R>) {
             .blocking_pick_file();
 
         let Some(file_path) = picked else {
-            return; // user cancelled
+            return;
         };
 
         let result = file_path
             .into_path()
             .map_err(|e| format!("resolving picked path: {e}"))
-            .and_then(|p| std::fs::read(&p).map_err(|e| format!("reading {}: {e}", p.display())))
-            .and_then(|bytes| ingest_zip_bytes(&bytes));
+            .and_then(|p| ingest_zip_file(&p));
 
         match result {
             Ok(sessions_json) => {
@@ -415,121 +559,50 @@ fn open_zip_via_dialog<R: Runtime>(app: &AppHandle<R>) {
     });
 }
 
-// ---------------------------------------------------------------------------
-// cv serve lifecycle
-// ---------------------------------------------------------------------------
-
-/// Locate the `cv` binary: the repo's build outputs relative to this crate's manifest dir first
-/// (so a dev `cargo build -p clustervision` works without installing anything), then `cv` on PATH.
-fn cv_binary() -> std::path::PathBuf {
-    let name = if cfg!(windows) { "cv.exe" } else { "cv" };
-    // CARGO_MANIFEST_DIR is `.../clustervision/app/src-tauri`; the workspace target dir is
-    // `.../clustervision/target`.
-    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    if let Some(root) = manifest.parent().and_then(|p| p.parent()) {
-        for profile in ["release", "debug"] {
-            let cand = root.join("target").join(profile).join(name);
-            if cand.exists() {
-                return cand;
-            }
-        }
-    }
-    std::path::PathBuf::from(name)
-}
-
-/// Spawn `cv serve --port 7777`. Errors are logged but non-fatal: the rest of the UI (everything
-/// except the live fleet dashboard) still works without it. Returns the child on success.
-fn spawn_serve() -> Option<Child> {
-    let bin = cv_binary();
-    match Command::new(&bin)
-        .arg("serve")
-        .arg("--port")
-        .arg(SERVE_PORT.to_string())
-        .spawn()
-    {
-        Ok(child) => {
-            eprintln!(
-                "clustervision: launched `{} serve --port {SERVE_PORT}` (pid {})",
-                bin.display(),
-                child.id()
-            );
-            Some(child)
-        }
-        Err(e) => {
-            eprintln!(
-                "clustervision: could not launch cv serve ({}): {e}. The fleet dashboard at \
-                 http://localhost:{SERVE_PORT} will be unavailable (non-fatal). Build it with \
-                 `cargo build -p clustervision --release` or put `cv` on PATH.",
-                bin.display()
-            );
-            None
-        }
-    }
-}
-
-/// View → Toggle cv serve: kill it if running, otherwise (re)spawn it.
-fn toggle_serve<R: Runtime>(app: &AppHandle<R>) {
-    let state = app.state::<ServeChild>();
-    let mut guard = state.0.lock().unwrap();
-    if let Some(mut child) = guard.take() {
-        let _ = child.kill();
-        let _ = child.wait();
-        eprintln!("clustervision: stopped cv serve via menu toggle.");
-    } else {
-        *guard = spawn_serve();
-    }
-}
-
 /// Build and run the Tauri application. Called by `main.rs`.
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
-        // Persist each window's size/position/etc. across launches and restore on startup.
         .plugin(tauri_plugin_window_state::Builder::new().build())
-        .manage(ServeChild::default())
         .invoke_handler(tauri::generate_handler![api, export_session])
         .on_menu_event(handle_menu_event)
         .setup(|app| {
-            // Install the native application menu.
             let menu = build_menu(app.handle())?;
             app.set_menu(menu)?;
-
-            // Launch the fleet-state API so the bundled dashboard works unchanged.
-            if let Some(child) = spawn_serve() {
-                let state = app.state::<ServeChild>();
-                *state.0.lock().unwrap() = Some(child);
-            }
             Ok(())
         })
         .build(tauri::generate_context!())
         .expect("error while building clustervision")
-        .run(|app_handle, event| {
-            // On exit, reap the cv serve child so we don't leave an orphaned server on :7777.
-            if let RunEvent::Exit = event {
-                let state = app_handle.state::<ServeChild>();
-                let child = state.0.lock().unwrap().take();
-                if let Some(mut child) = child {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                }
-            }
-        });
+        .run(|_app_handle, _event| {});
 }
 
 // ---------------------------------------------------------------------------
-// Tests — cover the native logic (zip ingest, the api command, binary lookup). The GUI shell
-// (menu, window, event loop) can't be driven headlessly, but these are the parts with real bug
-// surface, and they run without a webview via plain `cargo test`.
+// Tests — cover the native logic (streaming zip ingest, the api command incl.
+// /api/stats and /api/search, and atomic in-process export publication).
 // ---------------------------------------------------------------------------
 #[cfg(test)]
 mod tests {
     use super::*;
     use cv_core::Session;
-    use std::io::Write as _;
 
-    /// Build an in-memory zip from `(name, bytes)` entries using `Stored` (no compression feature
-    /// needed), returning the raw zip bytes.
+    fn temp_dir(label: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "cv-tauri-{label}-{}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    /// Build an in-memory zip from `(name, bytes)` entries using `Stored`.
     fn make_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
         let opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
@@ -540,25 +613,30 @@ mod tests {
         zw.finish().unwrap().into_inner()
     }
 
-    /// A minimal Claude `.jsonl` transcript: ingest sniffs it by `sessionId` + `type:user|assistant`.
     const CLAUDE_JSONL: &str = concat!(
-        r#"{"type":"user","sessionId":"sess-abc","parentUuid":null,"message":{"role":"user","content":"hello"}}"#,
+        r#"{"type":"user","sessionId":"sess-abc","parentUuid":null,"message":{"role":"user","content":"hello needleword"}}"#,
         "\n",
         r#"{"type":"assistant","sessionId":"sess-abc","parentUuid":null,"message":{"role":"assistant","content":[{"type":"text","text":"hi there"}]}}"#,
         "\n",
     );
 
     #[test]
-    fn ingest_zip_bytes_parses_a_claude_export() {
+    fn ingest_zip_streams_from_file_and_bytes() {
         let zip = make_zip(&[("logs/session.jsonl", CLAUDE_JSONL.as_bytes())]);
         let json = ingest_zip_bytes(&zip).expect("ingest should succeed");
         let sessions: Vec<Session> = serde_json::from_str(&json).expect("valid Session[] JSON");
         assert_eq!(sessions.len(), 1, "one transcript → one session");
         assert_eq!(sessions[0].harness, cv_core::Harness::Claude);
-        assert!(
-            !sessions[0].messages.is_empty(),
-            "the session should carry its messages"
-        );
+        assert!(!sessions[0].messages.is_empty());
+
+        let root = temp_dir("zip-file");
+        let zip_path = root.join("upload.zip");
+        std::fs::write(&zip_path, &zip).unwrap();
+        let streamed_json = ingest_zip_file(&zip_path).expect("streaming file ingest should succeed");
+        let streamed: Vec<Session> = serde_json::from_str(&streamed_json).unwrap();
+        assert_eq!(streamed.len(), 1);
+        assert_eq!(streamed[0].id, sessions[0].id);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -576,7 +654,6 @@ mod tests {
 
     #[test]
     fn ingest_zip_bytes_skips_dirs_and_unknown_files() {
-        // A directory entry and an unrecognized file should yield an empty (but valid) array, no err.
         let zip = make_zip(&[("notes/", b""), ("random.txt", b"just some prose, not a transcript")]);
         let json = ingest_zip_bytes(&zip).expect("ingest should not error on unknown content");
         let sessions: Vec<Session> = serde_json::from_str(&json).unwrap();
@@ -584,107 +661,142 @@ mod tests {
     }
 
     #[test]
-    fn api_command_routes_onto_the_read_api() {
-        // The command is `route_json` behind a path splitter: a known route answers and an unknown
-        // or retired route rejects with 404.
-        let health: serde_json::Value = serde_json::from_str(&api("/api/health".into(), None).unwrap()).unwrap();
-        assert_eq!(health["ok"], true);
-        assert!(api("/api/nope".into(), None).unwrap_err().starts_with("404"));
-        assert!(api("/api/channels".into(), None).unwrap_err().starts_with("404"));
-        assert!(api("/api/sessions".into(), Some("harness=warpdrive".into()))
-            .unwrap_err()
-            .starts_with("400"));
+    fn api_command_routes_read_api_stats_and_search_in_process() {
+        let root = temp_dir("api");
+        let home = root.join("home");
+        let cv_home = root.join("cv-home");
+        let claude_proj = home.join(".claude").join("projects").join("-tmp-proj");
+        std::fs::create_dir_all(&claude_proj).unwrap();
+        std::fs::create_dir_all(&cv_home).unwrap();
+        let transcript = claude_proj.join("sess-abc.jsonl");
+        std::fs::write(&transcript, CLAUDE_JSONL).unwrap();
+
+        let _scope = cv_core::env::Env::from_vars([
+            ("HOME", home.as_os_str()),
+            ("USERPROFILE", home.as_os_str()),
+            ("CLUSTERVISION_HOME", cv_home.as_os_str()),
+        ])
+        .enter();
+        {
+            let health: Value = serde_json::from_str(&api("/api/health".into(), None).unwrap()).unwrap();
+            assert_eq!(health["ok"], true);
+            assert!(api("/api/nope".into(), None).unwrap_err().starts_with("404"));
+            assert!(api("/api/channels".into(), None).unwrap_err().starts_with("404"));
+            assert!(api("/api/sessions".into(), Some("harness=warpdrive".into()))
+                .unwrap_err()
+                .starts_with("400"));
+
+            // In-process /api/stats
+            let stats: Value = serde_json::from_str(&api("/api/stats".into(), None).unwrap()).unwrap();
+            assert_eq!(stats["sessions"], 1);
+            let filtered: Value =
+                serde_json::from_str(&api("/api/stats".into(), Some("q=harness:codex".into())).unwrap()).unwrap();
+            assert_eq!(filtered["sessions"], 0);
+            assert!(api("/api/stats".into(), Some("q=(unclosed".into()))
+                .unwrap_err()
+                .starts_with("400"));
+
+            // In-process /api/search (live suffix when no index exists, plus explicit scan=1)
+            assert!(api("/api/search".into(), None).unwrap_err().starts_with("400"));
+            assert!(api("/api/search".into(), Some("q=needleword&harness=bogus".into()))
+                .unwrap_err()
+                .starts_with("400"));
+            let hits: Vec<Value> =
+                serde_json::from_str(&api("/api/search".into(), Some("q=needleword".into())).unwrap()).unwrap();
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0]["id"], "sess-abc");
+            let scan_hits: Vec<Value> =
+                serde_json::from_str(&api("/api/search".into(), Some("q=needleword&scan=1".into())).unwrap()).unwrap();
+            assert_eq!(scan_hits.len(), 1);
+
+            // In-process export_session_to_path (Markdown and OpenSession 0.3)
+            let md_dest = root.join("out.md");
+            export_session_to_path("claude", "sess-abc", "markdown", &md_dest).unwrap();
+            let md = std::fs::read_to_string(&md_dest).unwrap();
+            assert!(md.contains("needleword"), "markdown export contains transcript");
+
+            let json_dest = root.join("out.opensession.json");
+            export_session_to_path("claude", "sess-abc", "opensession", &json_dest).unwrap();
+            let doc: Value = serde_json::from_str(&std::fs::read_to_string(&json_dest).unwrap()).unwrap();
+            assert_eq!(doc["open_session"], "0.3");
+            assert_eq!(doc["id"], "sess-abc");
+        }
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[cfg(unix)]
     #[test]
     fn export_publication_preserves_destination_on_failure() {
         use std::os::unix::fs::PermissionsExt;
-        let root = std::env::temp_dir().join(format!(
-            "cv-export-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir(&root).unwrap();
-        let script = root.join("cv-test");
+        let root = temp_dir("export-pub");
+        let source = root.join("source.jsonl");
         let destination = root.join("session.json");
+        std::fs::write(&source, CLAUDE_JSONL).unwrap();
         std::fs::write(&destination, "previous complete export").unwrap();
-        std::fs::write(
-            &script,
-            "#!/bin/sh\nprintf partial\nprintf 'broken source' >&2\nexit 1\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let error = export_to_path(&script, "claude", "session", "opensession", &destination, &script).unwrap_err();
+
+        let error = publish_export(&destination, &source, |file| {
+            file.write_all(b"partial").unwrap();
+            Err("broken source".into())
+        })
+        .unwrap_err();
         assert!(error.contains("broken source"));
         assert_eq!(
             std::fs::read_to_string(&destination).unwrap(),
             "previous complete export"
         );
         assert_eq!(std::fs::read_dir(&root).unwrap().count(), 2, "private stages removed");
-        std::fs::write(&script, "#!/bin/sh\nprintf 'complete export'\n").unwrap();
-        export_to_path(&script, "claude", "session", "opensession", &destination, &script).unwrap();
+
+        publish_export(&destination, &source, |file| {
+            file.write_all(b"complete export").map_err(|e| e.to_string())
+        })
+        .unwrap();
         assert_eq!(std::fs::read_to_string(&destination).unwrap(), "complete export");
         assert_eq!(std::fs::read_dir(&root).unwrap().count(), 2, "success stages removed");
         assert_eq!(
             std::fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
             0o600
         );
-        assert!(
-            export_to_path(&script, "claude", "session", "opensession", &script, &script)
-                .unwrap_err()
-                .contains("transcript source")
-        );
+
+        assert!(publish_export(&source, &source, |_| Ok(()))
+            .unwrap_err()
+            .contains("transcript source"));
+
         let alias = root.join("alias");
         std::os::unix::fs::symlink(&destination, &alias).unwrap();
-        assert!(
-            export_to_path(&script, "claude", "session", "opensession", &alias, &script)
-                .unwrap_err()
-                .contains("symlink")
-        );
+        assert!(publish_export(&alias, &source, |_| Ok(()))
+            .unwrap_err()
+            .contains("symlink"));
         std::fs::remove_file(&alias).unwrap();
+
         std::fs::hard_link(&destination, &alias).unwrap();
-        assert!(
-            export_to_path(&script, "claude", "session", "opensession", &alias, &script)
-                .unwrap_err()
-                .contains("hard links")
-        );
+        assert!(publish_export(&alias, &source, |_| Ok(()))
+            .unwrap_err()
+            .contains("hard links"));
         std::fs::remove_file(&alias).unwrap();
-        std::fs::write(
-            &script,
-            "#!/bin/sh\nprintf 'concurrent writer' > \"${0%/*}/session.json\"\nprintf 'complete export'\n",
-        )
-        .unwrap();
-        assert!(
-            export_to_path(&script, "claude", "session", "opensession", &destination, &script)
-                .unwrap_err()
-                .contains("changed during export")
-        );
+
+        let dest_race = destination.clone();
+        assert!(publish_export(&destination, &source, move |file| {
+            std::fs::write(&dest_race, "concurrent writer").unwrap();
+            file.write_all(b"complete export").map_err(|e| e.to_string())
+        })
+        .unwrap_err()
+        .contains("changed during export"));
         assert_eq!(std::fs::read_to_string(&destination).unwrap(), "concurrent writer");
-        std::fs::remove_file(&destination).unwrap();
-        assert!(
-            export_to_path(&script, "claude", "session", "opensession", &destination, &script)
-                .unwrap_err()
-                .contains("changed during export")
-        );
-        assert_eq!(std::fs::read_to_string(&destination).unwrap(), "concurrent writer");
+
+        let dest_rm = destination.clone();
+        assert!(publish_export(&destination, &source, move |file| {
+            std::fs::remove_file(&dest_rm).unwrap();
+            file.write_all(b"complete export").map_err(|e| e.to_string())
+        })
+        .unwrap_err()
+        .contains("changed during export"));
+        assert!(!destination.exists(), "removed destination is not recreated on race");
         assert_eq!(
             std::fs::read_dir(&root).unwrap().count(),
-            2,
+            1,
             "all failed publication stages removed"
         );
         std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn cv_binary_resolves_to_a_cv_path() {
-        // Either a built binary under target/{release,debug}/cv, or the bare PATH fallback — but it
-        // must always end in the executable name so the spawn targets the right thing.
-        let p = cv_binary();
-        let name = if cfg!(windows) { "cv.exe" } else { "cv" };
-        assert_eq!(p.file_name().and_then(|s| s.to_str()), Some(name));
     }
 }

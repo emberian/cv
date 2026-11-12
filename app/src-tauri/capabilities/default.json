@@ -6,8 +6,20 @@
     "main"
   ],
   "permissions": [
-    "core:default",
-    "shell:allow-open",
-    "dialog:default"
+    "core:app:default",
+    "core:event:default",
+    "core:window:default",
+    "core:webview:default",
+    "dialog:allow-open",
+    "dialog:allow-save",
+    "dialog:allow-message",
+    {
+      "identifier": "shell:allow-open",
+      "allow": [
+        {
+          "url": "^https://.*"
+        }
+      ]
+    }
   ]
 }
