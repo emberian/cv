@@ -139,12 +139,12 @@ def prune_gate(binary, root, env, cases=("thinking", "ascii-declass", "unicode-d
         assert result["tokens_freed"] > PAYLOAD // 8
         assert result["before_bytes"] > PAYLOAD and result["after_bytes"] < 2048
         if case == "thinking":
-            assert report["revive_tokens"] == 267 and report["revive_old_tokens"] == 2000
+            assert report["revive_tokens"] == 107 and report["revive_old_tokens"] == 2000
             assert report["usage_rewritten"] == 2
         output_path = Path(result["new_path"])
         if case == "thinking":
             assert output_path.stat().st_size == 1329
-            assert file_digest(output_path) == "bee44f7082b29ac844d352f6d2cf55a52f0f52bce7c80fad30ade403a7cd4ad5"
+            assert file_digest(output_path) == "96ba16a24d651dc47de704cc5d5fcad7a53951bde906f0cf0bff474f93d28317"
         if case == "unicode-declass":
             assert output_path.stat().st_size == 823
             assert file_digest(output_path) == "02277ad8d3b8e96ae49402adf892f2d905d5de5678013df342fa230beec32305"
@@ -427,17 +427,26 @@ CODEX_THINKING_EXPECTED = {'text': ['c6bc76805ca65ae2f0d545d380dd97b7b3cad84630a
 
 
 def gemini_output_digest(path):
-    """Fixed pretty fixture: normalize only validated messages[].id lines (name-based UUID v5),
+    """Fixed pretty or JSONL fixture: normalize only validated message id headers (UUID v5),
     not payload/tool IDs."""
-    pattern = re.compile(rb'(      "id": ")([0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})(",\n)')
+    pretty = re.compile(rb'(      "id": ")([0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})(",\n)')
+    jsonl = re.compile(rb'^(\{"id":")([0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})(",)')
     digest = hashlib.sha256()
     ids = 0
+    bol = True
     with path.open("rb") as source:
         for line in iter(lambda: source.readline(64 << 10), b""):
-            match = pattern.fullmatch(line)
-            if match:
-                line = match[1] + b"00000000-0000-4000-8000-000000000000" + match[3]
-                ids += 1
+            if bol:
+                match = pretty.fullmatch(line)
+                if match:
+                    line = match[1] + b"00000000-0000-4000-8000-000000000000" + match[3]
+                    ids += 1
+                else:
+                    m2 = jsonl.match(line)
+                    if m2:
+                        line = m2[1] + b"00000000-0000-4000-8000-000000000000" + m2[3] + line[m2.end():]
+                        ids += 1
+            bol = line.endswith(b"\n")
             digest.update(line)
     return digest.hexdigest(), ids
 
@@ -534,10 +543,10 @@ def gemini_rehome_gate(binary, root, env):
     peak = checked_peak(json.loads(child.stderr))
     assert report["messages"] == 3 and report["fidelity"] == dict(deltas=[])
     output = Path(report["path"])
-    assert output.stat().st_size == 33555466
+    assert output.stat().st_size == 33555134
     # Frozen complete owned preparation: normalize only generated message UUIDs.
     digest, ids = gemini_output_digest(output)
-    assert ids == 3 and digest == "db3bc67dc2b670cc5d61ec397ff43f6114c7863c6fd51e35f784f91bd19bb3c7"
+    assert ids == 3 and digest == "d7ce3172b16c416d47897dceb23675d968f76b17b298332335fe8908b7732374"
     assert file_digest(source) == original, "same-harness Gemini port modified its source"
     print(json.dumps(dict(case="verified-gemini-complete-rehome", peak_live_rust_bytes=peak,
                           messages=3, output_bytes=output.stat().st_size, normalized_sha256=digest)), flush=True)
