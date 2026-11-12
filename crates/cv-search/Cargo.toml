@@ -1,6 +1,6 @@
 [package]
 name = "cv-search"
-description = "Pure-Rust full-text (tantivy) + semantic (embeddings) search over clustervision sessions."
+description = "Pure-Rust full-text (tantivy), exact trigram, and columnar event search over clustervision sessions."
 readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
@@ -17,20 +17,15 @@ serde.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
 uuid.workspace = true
+memchr = "2"
 
-# Full-text: pure-Rust Lucene-like engine. Always on.
+# Full-text, derived columnar event segments, and roaring posting sets.
 tantivy = "0.26"
-
-# Semantic: distilled *static* embeddings (model2vec). Tiny, no ONNX runtime — just
-# `tokenizers` + `safetensors` + `ndarray`. `hf-hub` lets us fetch + cache a small model
-# (e.g. potion-base-8M, ~30MB) on first use. Gated so a minimal FTS-only build is possible
-# via `--no-default-features`.
-hf-hub = { version = "0.4.3", default-features = false, features = ["ureq"], optional = true }
-model2vec-rs = { version = "0.2", default-features = false, features = ["onig", "hf-hub"], optional = true }
+tantivy-columnar = "0.7"
+tantivy-fst = "0.5"
+roaring = "0.12"
 
 [features]
-default = ["semantic"]
-semantic = ["dep:model2vec-rs", "dep:hf-hub"]
 # Isolated ignored sweep oracle: requested Rust heap and production document chunk size.
 probe-heap = []
 

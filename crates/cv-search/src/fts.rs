@@ -2817,18 +2817,34 @@ fn parse_text_query(
     }
 }
 
-/// The complete set of session IDs matching a full-text query. This reads only the index:
-/// no ranking cap, snippet generation, discovery or transcript access. Chunk documents deduplicate
-/// into their session ID, with the same query syntax and conjunction default as ranked search.
+/// The complete set of session IDs matching a full-text query in [`crate::Scope::Exchange`]. This
+/// reads only the index: no ranking cap, snippet generation, discovery or transcript access. Chunk
+/// documents deduplicate into their session ID, with the same query syntax and conjunction default
+/// as ranked search.
 pub fn text_search_ids(dir: &Path, query: &str) -> Result<HashSet<String>> {
-    let (index, f) = open_existing(dir)?;
-    let reader = index.reader().context("opening index reader")?;
-    matching_ids(&index, &f, &reader.searcher(), query)
+    text_search_ids_scoped(dir, query, crate::Scope::Exchange)
 }
 
-/// Resolve several needles against one reader snapshot. Setup failures fail the operation;
-/// malformed individual queries retain their own errors without discarding other needles.
+/// [`text_search_ids`] evaluated in an explicit [`crate::Scope`].
+pub fn text_search_ids_scoped(dir: &Path, query: &str, scope: crate::Scope) -> Result<HashSet<String>> {
+    let (index, f) = open_existing(dir)?;
+    let reader = index.reader().context("opening index reader")?;
+    matching_ids(&index, &f, &reader.searcher(), query, scope)
+}
+
+/// Resolve several needles against one reader snapshot in [`crate::Scope::Exchange`]. Setup
+/// failures fail the operation; malformed individual queries retain their own errors without
+/// discarding other needles.
 pub fn text_search_ids_batch(dir: &Path, queries: &[&str]) -> Result<Vec<Result<HashSet<String>>>> {
+    text_search_ids_batch_scoped(dir, queries, crate::Scope::Exchange)
+}
+
+/// [`text_search_ids_batch`] evaluated in an explicit [`crate::Scope`].
+pub fn text_search_ids_batch_scoped(
+    dir: &Path,
+    queries: &[&str],
+    scope: crate::Scope,
+) -> Result<Vec<Result<HashSet<String>>>> {
     if queries.is_empty() {
         return Ok(Vec::new());
     }
@@ -2837,7 +2853,7 @@ pub fn text_search_ids_batch(dir: &Path, queries: &[&str]) -> Result<Vec<Result<
     let searcher = reader.searcher();
     Ok(queries
         .iter()
-        .map(|query| matching_ids(&index, &f, &searcher, query))
+        .map(|query| matching_ids(&index, &f, &searcher, query, scope))
         .collect())
 }
 
@@ -2848,6 +2864,17 @@ pub fn text_search_ids_batch(dir: &Path, queries: &[&str]) -> Result<Vec<Result<
 pub fn text_search_ids_suffixed(
     dir: &Path,
     queries: &[&str],
+    live: LiveRead,
+    refs: &[cv_core::SessionRef],
+) -> Result<(Vec<Result<HashSet<String>>>, Suffix)> {
+    text_search_ids_suffixed_scoped(dir, queries, crate::Scope::Exchange, live, refs)
+}
+
+/// [`text_search_ids_suffixed`] evaluated in an explicit [`crate::Scope`].
+pub fn text_search_ids_suffixed_scoped(
+    dir: &Path,
+    queries: &[&str],
+    scope: crate::Scope,
     live: LiveRead,
     refs: &[cv_core::SessionRef],
 ) -> Result<(Vec<Result<HashSet<String>>>, Suffix)> {
@@ -2869,7 +2896,7 @@ pub fn text_search_ids_suffixed(
         .map(|query| -> Result<HashSet<String>> {
             let mut ids = HashSet::new();
             if let Some((index, f, searcher)) = &indexed {
-                let parsed = parse_text_query(index, f, query, crate::Scope::Exchange)?;
+                let parsed = parse_text_query(index, f, query, scope)?;
                 let parsed = live::without_shadowed(f, parsed, shadows);
                 ids.extend(
                     searcher
@@ -2878,7 +2905,7 @@ pub fn text_search_ids_suffixed(
                 );
             }
             if let Some(l) = &live {
-                let parsed = parse_text_query(l.searcher.index(), &l.f, query, crate::Scope::Exchange)?;
+                let parsed = parse_text_query(l.searcher.index(), &l.f, query, scope)?;
                 ids.extend(
                     l.searcher
                         .search(&*parsed, &crate::session_collector::SessionIds(l.f.id))
@@ -2891,8 +2918,14 @@ pub fn text_search_ids_suffixed(
     Ok((matches, suffix))
 }
 
-fn matching_ids(index: &Index, f: &Fields, searcher: &tantivy::Searcher, query: &str) -> Result<HashSet<String>> {
-    let parsed = parse_text_query(index, f, query, crate::Scope::Exchange)?;
+fn matching_ids(
+    index: &Index,
+    f: &Fields,
+    searcher: &tantivy::Searcher,
+    query: &str,
+    scope: crate::Scope,
+) -> Result<HashSet<String>> {
+    let parsed = parse_text_query(index, f, query, scope)?;
     searcher
         .search(&parsed, &crate::session_collector::SessionIds(f.id))
         .context("matching session IDs")
@@ -3314,12 +3347,36 @@ fn hit_of(doc: &TantivyDocument, f: &Fields, id: String, score: f32) -> Hit {
     }
 }
 
+/// Whether [`live_snippet`] has already materialized a complete snippet window and can stop
+/// streaming: on `OR` queries as soon as *any* positive branch has its full trail, and on
+/// conjunctive queries as soon as the primary anchor (`0`) has its full trail (or `matcher.done()`
+/// when no positive terms exist).
+fn snippet_ready(matcher: &cv_core::scan::Matcher, terms_len: usize, is_or: bool) -> bool {
+    const EXCERPT_TRAIL: usize = 120;
+    if matcher.done() {
+        return true;
+    }
+    let complete = |i: usize| {
+        matcher
+            .excerpt_of(i)
+            .is_some_and(|e| e.text.len() >= e.at + e.len + EXCERPT_TRAIL)
+    };
+    if terms_len == 0 {
+        false
+    } else if is_or {
+        (0..terms_len).any(complete)
+    } else {
+        complete(0)
+    }
+}
+
 /// Generate a snippet for a hit by re-reading **just that one session** (streamed), finding the
 /// first query term, and windowing around it — instead of keeping a stored copy of every body.
 ///
 /// Streams under [`Demand::with_spans`] into a [`cv_core::scan::Matcher`], which matches the whole
 /// projection in pieces and keeps only a window, so a session fronted by a giant record (a 700 MB
-/// tool dump) costs its read, not its size in memory; the read stops once every term is placed.
+/// tool dump) costs its read, not its size in memory; the read stops once a complete snippet
+/// excerpt is ready (including when any branch of an `OR` query matches).
 /// The snippet is the first term (in query order) that occurs anywhere, else the head.
 fn live_snippet(path: &str, id: &str, harness: &str, query: &str, scope: crate::Scope) -> Result<String> {
     use cv_core::projection::Searchable;
@@ -3338,6 +3395,8 @@ fn live_snippet(path: &str, id: &str, harness: &str, query: &str, scope: crate::
 
     struct Acc {
         matcher: Matcher,
+        terms_len: usize,
+        is_or: bool,
         resolver: cv_core::Resolver,
         error: Option<anyhow::Error>,
         failed: bool,
@@ -3345,11 +3404,28 @@ fn live_snippet(path: &str, id: &str, harness: &str, query: &str, scope: crate::
         copied_before: Option<chrono::DateTime<chrono::Utc>>,
     }
     impl Acc {
+        fn ready(&self) -> bool {
+            snippet_ready(&self.matcher, self.terms_len, self.is_or)
+        }
+        fn feed_text(&mut self, text: &cv_core::Text) -> Result<()> {
+            let matcher = &mut self.matcher;
+            let terms_len = self.terms_len;
+            let is_or = self.is_or;
+            cv_core::stream::stopped(text.try_for_each_chunk(&self.resolver, 4096, |part| {
+                matcher.push(part);
+                if snippet_ready(matcher, terms_len, is_or) {
+                    Err(cv_core::stream::Stop.into())
+                } else {
+                    Ok(())
+                }
+            }))
+            .map(|_| ())
+        }
         fn block(&mut self, b: &Block) -> Result<()> {
             let none = &mut || Ok(());
             match b {
                 Block::Text { text } | Block::Thinking { text, .. } => {
-                    self.matcher.text(text, &self.resolver, none)?;
+                    self.feed_text(text)?;
                     self.matcher.push("\n");
                 }
                 Block::ToolUse { name, input, .. } => {
@@ -3359,31 +3435,35 @@ fn live_snippet(path: &str, id: &str, harness: &str, query: &str, scope: crate::
                     self.matcher.push("\n");
                 }
                 Block::ToolResult { content, .. } => {
-                    self.matcher.text(content, &self.resolver, none)?;
+                    self.feed_text(content)?;
                     self.matcher.push("\n");
-                    if let Some(p) = b.persisted_output_path() {
-                        let matcher = &mut self.matcher;
-                        let read = cv_core::stream::stopped(cv_core::lazy::read_pieces_checked(
-                            std::path::Path::new(p),
-                            64 * 1024,
-                            |piece| {
-                                matcher.push(piece);
-                                if matcher.done() {
-                                    Err(cv_core::stream::Stop.into())
-                                } else {
-                                    Ok(())
+                    if !self.ready() {
+                        if let Some(p) = b.persisted_output_path() {
+                            let matcher = &mut self.matcher;
+                            let terms_len = self.terms_len;
+                            let is_or = self.is_or;
+                            let read = cv_core::stream::stopped(cv_core::lazy::read_pieces_checked(
+                                std::path::Path::new(p),
+                                64 * 1024,
+                                |piece| {
+                                    matcher.push(piece);
+                                    if snippet_ready(matcher, terms_len, is_or) {
+                                        Err(cv_core::stream::Stop.into())
+                                    } else {
+                                        Ok(())
+                                    }
+                                },
+                            ))?;
+                            match read {
+                                Some(cv_core::lazy::PersistedHead::Text(_)) => matcher.push("\n"),
+                                Some(head) => {
+                                    if let Some(note) = head.indexed_text(p) {
+                                        matcher.push(&note);
+                                        matcher.push("\n");
+                                    }
                                 }
-                            },
-                        ))?;
-                        match read {
-                            Some(cv_core::lazy::PersistedHead::Text(_)) => matcher.push("\n"),
-                            Some(head) => {
-                                if let Some(note) = head.indexed_text(p) {
-                                    matcher.push(&note);
-                                    matcher.push("\n");
-                                }
+                                None => {}
                             }
-                            None => {}
                         }
                     }
                 }
@@ -3416,7 +3496,7 @@ fn live_snippet(path: &str, id: &str, harness: &str, query: &str, scope: crate::
                 return Flow::Continue;
             }
             for b in &m.content {
-                if self.matcher.done() {
+                if self.ready() {
                     break;
                 }
                 if let Err(error) = self.block(b) {
@@ -3424,7 +3504,7 @@ fn live_snippet(path: &str, id: &str, harness: &str, query: &str, scope: crate::
                     return Flow::Stop;
                 }
             }
-            if self.matcher.done() {
+            if self.ready() {
                 Flow::Stop
             } else {
                 Flow::Continue
@@ -3432,8 +3512,12 @@ fn live_snippet(path: &str, id: &str, harness: &str, query: &str, scope: crate::
         }
     }
     let terms = query_terms(query);
+    let terms_len = terms.len();
+    let is_or = query_has_or(query);
     let mut acc = Acc {
-        matcher: Matcher::new(terms.clone(), terms.len()),
+        matcher: Matcher::new(terms, terms_len),
+        terms_len,
+        is_or,
         resolver: cv_core::Resolver::new(Some(PathBuf::from(path))),
         error: None,
         failed: false,
@@ -3448,7 +3532,7 @@ fn live_snippet(path: &str, id: &str, harness: &str, query: &str, scope: crate::
         cv_core::stream::Pass::RECORD,
     )?;
     let head = acc.matcher.finish();
-    Ok(match (0..terms.len()).find_map(|i| acc.matcher.excerpt_of(i)) {
+    Ok(match (0..terms_len).find_map(|i| acc.matcher.excerpt_of(i)) {
         Some(e) => window(&e.text, e.at, e.len),
         None => self::head(&head.text, 200),
     })
@@ -3468,19 +3552,253 @@ fn make_snippet(body: &str, query: &str) -> String {
     head(body, 200)
 }
 
-/// The bare, matchable terms of a tantivy query: drops `field:value` filters and boolean operators,
-/// keeps lowercased word tokens. Used only to locate a snippet window, not for retrieval.
-fn query_terms(query: &str) -> Vec<String> {
-    query
-        .split_whitespace()
-        .filter(|t| {
-            let body = t.strip_prefix(['+', '-']).unwrap_or(t);
-            !is_schema_field_spec(body)
-        })
-        .filter(|t| !matches!(*t, "AND" | "OR" | "NOT"))
-        .map(|t| t.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase())
-        .filter(|t| !t.is_empty())
-        .collect()
+const SNIPPET_TEXT_FIELDS: &[&str] = &["title", "body", "context"];
+
+/// Whether `query` contains an unquoted `OR` boolean operator outside negated groups.
+fn query_has_or(query: &str) -> bool {
+    let bytes = query.as_bytes();
+    let mut i = 0;
+    let mut negate_next = false;
+    while i < bytes.len() {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        if bytes[i] == b'"' {
+            let (_, next) = take_quoted(query, i);
+            i = next;
+            negate_next = false;
+            continue;
+        }
+        if bytes[i] == b'(' {
+            let (inner, next) = take_group(query, i);
+            if !negate_next && query_has_or(inner) {
+                return true;
+            }
+            i = next;
+            negate_next = false;
+            continue;
+        }
+        if bytes[i] == b')' {
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b'-' && i + 1 < bytes.len() && !bytes[i + 1].is_ascii_whitespace() {
+            i = skip_clause_value(query, i + 1);
+            negate_next = false;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && !bytes[i].is_ascii_whitespace() && !matches!(bytes[i], b'(' | b')' | b'"') {
+            i += 1;
+        }
+        let tok = &query[start..i];
+        if tok == "NOT" {
+            negate_next = true;
+            continue;
+        }
+        if tok == "OR" && !negate_next {
+            return true;
+        }
+        if let Some((_, "")) = tok.strip_prefix('+').unwrap_or(tok).split_once(':') {
+            if i < bytes.len() && matches!(bytes[i], b'"' | b'(') {
+                if negate_next {
+                    i = skip_clause_value(query, i);
+                }
+                negate_next = false;
+                continue;
+            }
+        }
+        negate_next = false;
+    }
+    false
+}
+
+fn take_quoted(query: &str, open_quote: usize) -> (String, usize) {
+    let mut out = String::new();
+    let mut escaped = false;
+    for (off, ch) in query[open_quote + 1..].char_indices() {
+        if escaped {
+            out.push(ch);
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == '"' {
+            return (out, open_quote + 1 + off + 1);
+        } else {
+            out.push(ch);
+        }
+    }
+    (out, query.len())
+}
+
+fn take_group(query: &str, open_paren: usize) -> (&str, usize) {
+    let mut depth = 0usize;
+    let mut in_quotes = false;
+    let mut escaped = false;
+    for (off, ch) in query[open_paren..].char_indices() {
+        if in_quotes {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_quotes = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_quotes = true,
+            '(' => depth += 1,
+            ')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return (&query[open_paren + 1..open_paren + off], open_paren + off + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    (&query[open_paren + 1..], query.len())
+}
+
+fn skip_clause_value(query: &str, start: usize) -> usize {
+    let bytes = query.as_bytes();
+    if start >= bytes.len() {
+        return query.len();
+    }
+    if bytes[start] == b'"' {
+        return take_quoted(query, start).1;
+    }
+    if bytes[start] == b'(' {
+        return take_group(query, start).1;
+    }
+    let mut i = start;
+    while i < bytes.len() && !bytes[i].is_ascii_whitespace() && !matches!(bytes[i], b'(' | b')' | b'"') {
+        i += 1;
+    }
+    if query[start..i].ends_with(':') && i < bytes.len() && matches!(bytes[i], b'"' | b'(') {
+        return skip_clause_value(query, i);
+    }
+    i
+}
+
+fn push_normalized_words(raw: &str, out: &mut Vec<String>) {
+    for part in raw.split_whitespace() {
+        let norm = part.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
+        if !norm.is_empty() {
+            out.push(norm);
+        }
+    }
+}
+
+/// The positive, matchable content terms of a tantivy query:
+/// - Drops negated clauses (`-term`, `-"phrase"`, `-(...)`, `NOT <term>`, `NOT (...)`) completely so
+///   negated terms are never targeted or highlighted as matches.
+/// - Extracts positive term values from content text fields (`title:foo` → `foo`, `body:bar` → `bar`,
+///   `context:qux` → `qux`, including quoted/parenthesized field values).
+/// - Drops non-content metadata filter fields (`harness:...`, `cwd:...`, `id:...`, `path:...`, etc.)
+///   and boolean operators (`AND`, `OR`, `NOT`).
+pub fn query_terms(query: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    collect_query_terms(query, &mut out);
+    out
+}
+
+fn collect_query_terms(query: &str, out: &mut Vec<String>) {
+    let bytes = query.as_bytes();
+    let mut i = 0;
+    let mut negate_next = false;
+    while i < bytes.len() {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        if bytes[i] == b')' {
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b'"' {
+            let (phrase, next) = take_quoted(query, i);
+            i = next;
+            if !negate_next {
+                push_normalized_words(&phrase, out);
+            }
+            negate_next = false;
+            continue;
+        }
+        if bytes[i] == b'(' {
+            let (inner, next) = take_group(query, i);
+            i = next;
+            if !negate_next {
+                collect_query_terms(inner, out);
+            }
+            negate_next = false;
+            continue;
+        }
+        if bytes[i] == b'-' && i + 1 < bytes.len() && !bytes[i + 1].is_ascii_whitespace() {
+            i = skip_clause_value(query, i + 1);
+            negate_next = false;
+            continue;
+        }
+        if bytes[i] == b'+' && i + 1 < bytes.len() && matches!(bytes[i + 1], b'"' | b'(') {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && !bytes[i].is_ascii_whitespace() && !matches!(bytes[i], b'(' | b')' | b'"') {
+            i += 1;
+        }
+        let tok = &query[start..i];
+        if tok == "NOT" {
+            negate_next = true;
+            continue;
+        }
+        if matches!(tok, "AND" | "OR") {
+            negate_next = false;
+            continue;
+        }
+        let body = tok.strip_prefix('+').unwrap_or(tok);
+        if let Some((field, "")) = body.split_once(':') {
+            if i < bytes.len() && matches!(bytes[i], b'"' | b'(') {
+                let is_schema = QUERYABLE_TEXT_FIELDS.contains(&field) || QUERYABLE_I64_FIELDS.contains(&field);
+                let is_content = SNIPPET_TEXT_FIELDS.contains(&field);
+                if bytes[i] == b'"' {
+                    let (phrase, next) = take_quoted(query, i);
+                    i = next;
+                    if !negate_next && (!is_schema || is_content) {
+                        push_normalized_words(&phrase, out);
+                    }
+                } else {
+                    let (inner, next) = take_group(query, i);
+                    i = next;
+                    if !negate_next && (!is_schema || is_content) {
+                        collect_query_terms(inner, out);
+                    }
+                }
+                negate_next = false;
+                continue;
+            }
+        }
+        if negate_next {
+            negate_next = false;
+            continue;
+        }
+        if is_schema_field_spec(body) {
+            let (field, rest) = body.split_once(':').expect("schema field spec has ':'");
+            if SNIPPET_TEXT_FIELDS.contains(&field) {
+                // Strip optional boost (`^2.0`) or fuzzy (`~1`) suffix on fielded term values.
+                let clean = rest.split(['^', '~']).next().unwrap_or(rest);
+                push_normalized_words(clean, out);
+            }
+            continue;
+        }
+        push_normalized_words(body, out);
+    }
 }
 
 fn window(body: &str, pos: usize, len: usize) -> String {
@@ -3558,7 +3876,7 @@ mod tests {
                 .unwrap();
         }
         writer.commit().unwrap();
-        let found = crate::Searcher::default()
+        let found = crate::Searcher
             .search_in(
                 &dir,
                 "needle",
@@ -6326,9 +6644,137 @@ mod tests {
     }
 
     #[test]
-    fn query_terms_drops_fields_and_booleans() {
-        let terms = query_terms("harness:claude title:score Tantivy AND bm25:score NOT pandas");
-        assert_eq!(terms, vec!["tantivy", "bm25:score", "pandas"]);
+    fn query_terms_drops_negated_clauses_and_extracts_content_fields() {
+        let terms = query_terms("harness:claude title:score Tantivy AND bm25:score NOT pandas -negated");
+        assert_eq!(terms, vec!["score", "tantivy", "bm25:score"]);
+
+        // Negated groups, phrases, and fielded negations are dropped; positive content fields are extracted.
+        let complex = query_terms(
+            "body:needle -body:forbidden NOT (alpha OR beta) -\"secret phrase\" title:\"hello world\" context:agents",
+        );
+        assert_eq!(complex, vec!["needle", "hello", "world", "agents"]);
+
+        // Snippet matching never highlights negated terms even when the negated term appears earlier in the text.
+        let body = "forbidden preamble before the real needle in the transcript";
+        let snip = make_snippet(body, "body:needle -forbidden NOT preamble");
+        assert!(snip.contains("needle"), "{snip:?}");
+    }
+
+    #[test]
+    fn live_snippet_stops_early_on_or_queries_without_scanning_to_eof() {
+        use std::io::Write;
+        let sdir = tmpdir();
+        let path = sdir.join("or-early.jsonl");
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(
+                f,
+                "{}",
+                serde_json::json!({
+                    "type": "user",
+                    "uuid": "u0",
+                    "sessionId": "or-early",
+                    "message": {"role": "user", "content": format!("found zqbranch here {}", "padding ".repeat(800))}
+                })
+            )
+            .unwrap();
+            for idx in 1..40 {
+                writeln!(
+                    f,
+                    "{}",
+                    serde_json::json!({
+                        "type": "assistant",
+                        "uuid": format!("a{idx}"),
+                        "sessionId": "or-early",
+                        "message": {"role": "assistant", "content": "filler ".repeat(2048)}
+                    })
+                )
+                .unwrap();
+            }
+            // Corrupt trailing JSON line: if live_snippet scanned to EOF waiting for the absent OR
+            // branch, stream_counted would fail on this line. Early stop never reaches it.
+            writeln!(f, "{{corrupt_eof_record_never_reached").unwrap();
+        }
+        let p = path.display().to_string();
+        for q in [
+            "absent_first OR zqbranch",
+            "zqbranch OR absent_second",
+            "(absent_first OR body:zqbranch) -forbidden",
+        ] {
+            let snip = live_snippet(&p, "or-early", "claude", q, crate::Scope::Exchange)
+                .unwrap_or_else(|e| panic!("query {q:?} scanned to corrupt EOF instead of stopping early: {e:#}"));
+            assert!(snip.contains("zqbranch"), "query {q:?} snippet={snip:?}");
+        }
+    }
+
+    #[test]
+    fn text_search_ids_plumbs_scope_across_indexed_and_live_suffix() {
+        let _home = IsolatedHome::new();
+        let dir = tmpdir();
+        let sdir = tmpdir();
+
+        let write_scoped = |id: &str, ctx_word: &str, ex_word: &str| -> PathBuf {
+            let p = sdir.join(format!("{id}.jsonl"));
+            let lines = [
+                serde_json::json!({
+                    "type": "user",
+                    "isMeta": true,
+                    "uuid": "m0",
+                    "sessionId": id,
+                    "message": {"role": "user", "content": format!("injected instruction {ctx_word}")}
+                }),
+                serde_json::json!({
+                    "type": "user",
+                    "uuid": "m1",
+                    "sessionId": id,
+                    "message": {"role": "user", "content": format!("human question {ex_word}")}
+                }),
+            ];
+            std::fs::write(&p, format!("{}\n{}\n", lines[0], lines[1])).unwrap();
+            p
+        };
+
+        let p1 = write_scoped("s-indexed", "ctxalpha", "exbeta");
+        let r1 = sref("s-indexed", "one", p1.display().to_string());
+        index_refs(&dir, std::slice::from_ref(&r1), false).unwrap();
+
+        assert!(text_search_ids_scoped(&dir, "ctxalpha", crate::Scope::Exchange)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            text_search_ids_scoped(&dir, "ctxalpha", crate::Scope::Context).unwrap(),
+            HashSet::from(["s-indexed".to_string()])
+        );
+        assert_eq!(
+            text_search_ids_scoped(&dir, "exbeta", crate::Scope::Context).unwrap(),
+            HashSet::new()
+        );
+        assert_eq!(
+            text_search_ids_batch_scoped(&dir, &["ctxalpha", "exbeta"], crate::Scope::All)
+                .unwrap()
+                .into_iter()
+                .map(Result::unwrap)
+                .collect::<Vec<_>>(),
+            vec![
+                HashSet::from(["s-indexed".to_string()]),
+                HashSet::from(["s-indexed".to_string()]),
+            ]
+        );
+
+        // Live unindexed session respects `Scope` too via `text_search_ids_suffixed_scoped`.
+        let p2 = write_scoped("s-live", "ctxalpha", "exgamma");
+        let r2 = sref("s-live", "two", p2.display().to_string());
+        let refs = vec![r1, r2];
+        let (ex_sets, _) =
+            text_search_ids_suffixed_scoped(&dir, &["ctxalpha"], crate::Scope::Exchange, LiveRead::All, &refs).unwrap();
+        assert!(ex_sets[0].as_ref().unwrap().is_empty());
+
+        let (ctx_sets, _) =
+            text_search_ids_suffixed_scoped(&dir, &["ctxalpha"], crate::Scope::Context, LiveRead::All, &refs).unwrap();
+        assert_eq!(
+            *ctx_sets[0].as_ref().unwrap(),
+            HashSet::from(["s-indexed".to_string(), "s-live".to_string()])
+        );
     }
 
     /// A query made *entirely* of fielded/boolean tokens has no bare terms to window on — the

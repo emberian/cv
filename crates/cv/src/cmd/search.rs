@@ -1,4 +1,4 @@
-//! `cv search` / `cv index` — full-text and semantic search.
+//! `cv search` / `cv index` — full-text and exact substring search.
 
 use crate::util::{parse_harness, short_id};
 use anyhow::Result;
@@ -13,7 +13,6 @@ pub(crate) struct SearchArgs<'a> {
     pub cwd: Option<String>,
     pub filter_query: Option<String>,
     pub limit: usize,
-    pub semantic: bool,
     pub scan: bool,
     pub kind: Option<String>,
     pub live_bytes: Option<u64>,
@@ -44,7 +43,6 @@ pub(crate) fn cmd_search(args: SearchArgs<'_>) -> Result<()> {
         cwd,
         filter_query,
         limit,
-        semantic,
         scan,
         kind,
         live_bytes,
@@ -59,15 +57,11 @@ pub(crate) fn cmd_search(args: SearchArgs<'_>) -> Result<()> {
         },
     };
     let allowed_ids = resolve_allowed_ids(want, cwd.as_deref(), filter_query)?;
-    let source = if semantic {
-        Source::Semantic
+    let source = if scan {
+        eprintln!("(--scan: scanning every transcript live; `cv index` makes search instant)");
+        Source::Live
     } else {
-        if scan {
-            eprintln!("(--scan: scanning every transcript live; `cv index` makes search instant)");
-            Source::Live
-        } else {
-            Source::Index
-        }
+        Source::Index
     };
     let filter = cv_search::SearchFilter {
         harness: want.map(|h| h.as_str()),
@@ -77,18 +71,11 @@ pub(crate) fn cmd_search(args: SearchArgs<'_>) -> Result<()> {
     // The index (+ live suffix of unindexed changes) answers full-text search: an empty result
     // means "no match", and an unusable index is an error naming the cause and the fix, never a
     // silent full scan of every transcript.
-    let found = match cv_search::Searcher::default().search_allowed(
-        query,
-        filter,
-        allowed_ids.as_ref(),
-        limit,
-        source,
-        live_bytes,
-    ) {
+    let found = match cv_search::Searcher.search_allowed(query, filter, allowed_ids.as_ref(), limit, source, live_bytes)
+    {
         Ok(found) => found,
         Err(e) => {
             return match source {
-                Source::Semantic => Err(e.context("semantic search failed (run `cv index --semantic` first?)")),
                 Source::Index if cv_search::is_invalid_text_query(&e) || e.is::<cv_search::BadLiveBytes>() => {
                     crate::util::usage(format!("{e:#}"))
                 }
@@ -147,11 +134,7 @@ fn render(found: Found, query: &str, json: bool) -> Result<()> {
         return Ok(());
     }
     if hits.is_empty() && source != Source::Live {
-        let hint = match source {
-            Source::Semantic => "(semantic; run `cv index --semantic` to (re)build embeddings)",
-            _ => "(index; try `cv index` to refresh)",
-        };
-        println!("no matches for {query:?} {hint}");
+        println!("no matches for {query:?} (index; try `cv index` to refresh)");
         // The likely reasons a recent conversation isn't findable: the index has fallen behind, or
         // the wanted text lives in a *sub-agent* transcript the default index doesn't fold in.
         for note in &notes {
@@ -252,20 +235,9 @@ fn write_json_rows<T>(
     Ok(())
 }
 
-pub(crate) fn cmd_index(
-    semantic: bool,
-    rebuild: bool,
-    subagents: bool,
-    if_changed: bool,
-    strict: bool,
-    json: bool,
-) -> Result<()> {
-    if semantic && subagents {
-        return crate::util::usage("--semantic indexes top-level sessions; --subagents currently applies only to full-text indexing. Run `cv index --subagents` and `cv index --semantic` separately.");
-    }
-
+pub(crate) fn cmd_index(rebuild: bool, subagents: bool, if_changed: bool, strict: bool, json: bool) -> Result<()> {
     let dir = cv_search::default_tantivy_dir();
-    if if_changed && (!semantic || cv_search::default_embeddings_path().exists()) {
+    if if_changed {
         // The timer gate: a stat-only probe (catalog inventory + one stat per session + the
         // index's own stamps) answers whether a pass would find work at all.
         match cv_search::fts::pass_needed(&dir, subagents) {
@@ -296,7 +268,7 @@ pub(crate) fn cmd_index(
         if rebuild { "rebuilding" } else { "updating" },
         if subagents { " (+ sub-agent forest)" } else { "" }
     );
-    let (indexed, refs) = cv_search::index_all(None, rebuild, subagents, strict)?;
+    let (indexed, _refs) = cv_search::index_all(None, rebuild, subagents, strict)?;
     if !json {
         println!(
             "indexed {} top-level session(s) → {}{}",
@@ -309,23 +281,8 @@ pub(crate) fn cmd_index(
             }
         );
     }
-    let mut embedded = None;
-    if semantic {
-        eprintln!("✦ refreshing semantic vectors (downloads a small model on first use)…");
-        let e = cv_search::embed_sessions(None, &refs)?;
-        if !json {
-            println!(
-                "embedded {e} session(s) → {}",
-                cv_search::default_embeddings_path().display()
-            );
-            if let Some(chars) = cv_search::embedded_chars()? {
-                println!("(each vector embeds a session's first {chars} characters: what the model reads)");
-            }
-        }
-        embedded = Some(e);
-    }
     if json {
-        let mut out = serde_json::json!({
+        let out = serde_json::json!({
             "indexed": indexed.total,
             "changed": indexed.changed,
             "removed": indexed.removed,
@@ -333,9 +290,6 @@ pub(crate) fn cmd_index(
             "path": dir,
             "unreadable": indexed.unreadable,
         });
-        if let Some(e) = embedded {
-            out["embedded"] = e.into();
-        }
         println!("{}", serde_json::to_string_pretty(&out)?);
     } else {
         println!("events: extracted on the same pass → try `cv events <id>` / `cv touched <path>`");
@@ -346,16 +300,6 @@ pub(crate) fn cmd_index(
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn unsupported_semantic_forest_combination_fails_before_index_work() {
-        for rebuild in [false, true] {
-            let error = cmd_index(true, rebuild, true, false, false, false).unwrap_err();
-            assert!(error.is::<crate::util::UsageError>());
-            assert!(error.to_string().contains("top-level"));
-            assert!(error.to_string().contains("cv index --subagents"));
-            assert!(error.to_string().contains("cv index --semantic"));
-        }
-    }
 
     #[test]
     fn streamed_search_json_is_the_pretty_hits_object_with_its_total() {
@@ -448,7 +392,7 @@ mod tests {
         );
         cv_search::index_all(None, true, false, false).unwrap();
 
-        let searcher = cv_search::Searcher::default();
+        let searcher = cv_search::Searcher;
         // `--cwd proj-alpha` narrows from 3 matching sessions to the 2 alpha sessions.
         let alpha_only = searcher
             .search_allowed(
