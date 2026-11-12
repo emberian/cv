@@ -814,6 +814,7 @@ cv index                # full-text (tantivy) index (top-level sessions)
 cv index --semantic     # also build embeddings for `cv search --semantic`
 cv index --subagents    # also fold the sub-agent / workflow forest into the index + events
 cv index --rebuild      # clear and rebuild from scratch
+cv index --if-changed   # skip the pass when nothing changed since the last index
 ```
 
 ```text
@@ -823,7 +824,8 @@ indexed 2245 session(s) → ~/.clustervision/tantivy
 embedded 2245 session(s) → ~/.clustervision/embeddings.bin
 ```
 
-Incremental; `--json` reports `indexed`, `changed`, `removed`, `errors`. `--semantic` downloads a
+Incremental; `--if-changed` probes session stamps first and skips the pass on a quiet corpus
+(incompatible with `--rebuild`); `--json` reports `indexed`, `changed`, `removed`, `errors`. `--semantic` downloads a
 ~30 MB model once. `--subagents` tags forest hits with parent, run and agent (can add hundreds of
 MB). The same pass fills the **event catalog** for [`events`](#cv-events), [`touched`](#cv-touched)
 and [`blame`](#cv-blame).

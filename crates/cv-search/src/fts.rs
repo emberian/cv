@@ -2482,6 +2482,103 @@ pub fn has_subagent_docs(dir: &Path) -> bool {
     probe_indexed_sigs(dir).is_none_or(|(_, folded)| !folded.is_empty())
 }
 
+/// Top-level session count recorded in `dir`'s metadata docs (excluding folded sub-agent docs).
+pub fn indexed_top_level_count(dir: &Path) -> Option<usize> {
+    probe_indexed_sigs(dir).map(|(sigs, folded)| sigs.len().saturating_sub(folded.len()))
+}
+
+/// Whether an incremental [`index_sessions`] pass at `dir` would find any work — the gate behind
+/// `cv index --if-changed`, meant for timers that fire whether or not the corpus moved.
+/// `Some(false)` only on a measured quiet window: every preferred candidate's source authority
+/// still holds against its indexed metadata AND every top-level indexed id still names a live
+/// session (a removal is reap work). With `subagents`, folded sub-agent docs are also checked
+/// against their stored source metadata — a forest pass owns them; a plain pass leaves them alone,
+/// so their drift is not its work. `None` when the index can't be opened or read: callers should
+/// run the pass.
+///
+/// A session counts as drift only when its primary source is **landable** — readable and nonempty
+/// — because a pass can only stamp what it can read. A permanently unreadable file or an empty
+/// transcript would fail the same way every pass, so counting it would pin the gate open forever.
+pub fn pass_needed(dir: &Path, subagents: bool) -> Option<bool> {
+    pass_needed_over(dir, &cv_core::sessions(), subagents)
+}
+
+fn landable(sig: (i64, i64)) -> bool {
+    sig.0 != 0 && sig.1 > 0
+}
+
+fn pass_needed_over(dir: &Path, refs: &[cv_core::SessionRef], subagents: bool) -> Option<bool> {
+    let _sources = cv_core::source::read_scope();
+    if !dir.join("meta.json").try_exists().ok()? {
+        return None;
+    }
+    let (index, f) = open_existing(dir).ok()?;
+    let (existing, folded, metadata) = read_indexed_metadata(&index, &f, true).ok()?;
+    let consumer = indexed_consumer(&dir.join("cv-index-id")).ok()??;
+    let dependencies = cv_core::source::Table::<InIndex>::load(&consumer);
+    let mut probe = cv_core::source::Probe::default();
+    let prov = cv_core::events::Provenance::default();
+    let candidates: Vec<&cv_core::SessionRef> = preferred_index_candidates(refs.iter().map(|r| (r, &prov)).collect())
+        .into_iter()
+        .map(|(r, _)| r)
+        .collect();
+    let live_ids: HashSet<&str> = candidates.iter().map(|r| r.id.as_str()).collect();
+    for r in &candidates {
+        if cv_core::harness::for_harness(r.harness).is_none() {
+            continue;
+        }
+        let r = &*live::as_indexed(r, &metadata);
+        let source = probe.snapshot(r);
+        if !landable(sig(source.primary)) {
+            continue;
+        }
+        let fresh = Freshness::of(&existing, &metadata, &dependencies, &mut probe, r, &prov, &source);
+        if !fresh.fresh {
+            return Some(true);
+        }
+    }
+    for id in existing.keys() {
+        if live_ids.contains(id.as_str()) {
+            continue;
+        }
+        if !folded.contains(id) {
+            return Some(true);
+        }
+        if subagents {
+            let Some(m) = metadata.get(id) else {
+                return Some(true);
+            };
+            if std::fs::metadata(&m.session.path)
+                .err()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+            {
+                return Some(true);
+            }
+            let source = probe.snapshot(&m.session);
+            let m_prov = cv_core::events::Provenance {
+                parent_id: m.parent_id.clone(),
+                agent_id: m.agent_id.clone(),
+                workflow: m.workflow.clone(),
+            };
+            if landable(sig(source.primary))
+                && !Freshness::of(
+                    &existing,
+                    &metadata,
+                    &dependencies,
+                    &mut probe,
+                    &m.session,
+                    &m_prov,
+                    &source,
+                )
+                .fresh
+            {
+                return Some(true);
+            }
+        }
+    }
+    Some(false)
+}
+
 /// Index an explicit set of sessions through the real production [`index_session`] path — the same
 /// indexer [`sweep`] drives, minus only the global `discover_all()` scan and the worker pool. Full
 /// rebuild: clears prior contents first. Used by tests so date-field (and chunk) indexing is
@@ -9098,5 +9195,92 @@ mod tests {
             (1, 1, 0, len),
             "a copy is another file and is read whole"
         );
+    }
+
+    #[test]
+    fn pass_needed_quiet_then_each_kind_of_drift() {
+        let _home = IsolatedHome::new();
+        let dir = tmpdir();
+        let sdir = tmpdir();
+        let p = write_claude(&sdir, "s1", "alpha corpus seed");
+        let p2 = write_claude(&sdir, "s2", "beta second session");
+        let r1 = sref("s1", "one", p.clone());
+        let r2 = sref("s2", "two", p2);
+
+        // No index at all → unmeasurable → the caller runs.
+        assert_eq!(pass_needed_over(&dir, std::slice::from_ref(&r1), false), None);
+
+        index_refs(&dir, &[r1.clone(), r2.clone()], false).unwrap();
+        assert_eq!(
+            pass_needed_over(&dir, &[r1.clone(), r2.clone()], false),
+            Some(false),
+            "a measured-quiet window must skip the pass"
+        );
+
+        // Removal: an indexed id the corpus no longer reports is reap work.
+        assert_eq!(pass_needed_over(&dir, std::slice::from_ref(&r1), false), Some(true));
+
+        // Arrival: a live session no pass has stamped is work.
+        index_refs(&dir, std::slice::from_ref(&r1), false).unwrap();
+        assert_eq!(pass_needed_over(&dir, &[r1.clone(), r2.clone()], false), Some(true));
+
+        // Growth: an appended transcript's signature no longer matches its stamp.
+        index_refs(&dir, &[r1.clone(), r2.clone()], false).unwrap();
+        append_claude(&p, "s1", 1, "gamma appended");
+        assert_eq!(pass_needed_over(&dir, &[r1.clone(), r2.clone()], false), Some(true));
+
+        // Caught up again → quiet.
+        index_refs_incremental(&dir, &[r1.clone(), r2.clone()]).unwrap();
+        assert_eq!(pass_needed_over(&dir, &[r1, r2], false), Some(false));
+    }
+
+    #[test]
+    fn pass_needed_folded_drift_counts_only_for_forest_passes() {
+        let _home = IsolatedHome::new();
+        let dir = tmpdir();
+        let sdir = tmpdir();
+        let parent = write_claude(&sdir, "parent1", "alpha parent");
+        let agent = write_subagent(&parent, "agent1", "alpha child");
+        let refs = vec![sref("parent1", "one", parent)];
+
+        index_refs_with_subagents(&dir, &refs, false).unwrap();
+        assert_eq!(pass_needed_over(&dir, &refs, true), Some(false));
+        assert_eq!(pass_needed_over(&dir, &refs, false), Some(false));
+
+        // Grow only the folded transcript.
+        append_claude(agent.to_str().unwrap(), "agent-agent1", 1, "beta child growth");
+
+        assert_eq!(
+            pass_needed_over(&dir, &refs, false),
+            Some(false),
+            "a plain pass leaves folded docs alone — their drift is not its work"
+        );
+        assert_eq!(
+            pass_needed_over(&dir, &refs, true),
+            Some(true),
+            "a forest pass owns folded docs — their drift must open the gate"
+        );
+    }
+
+    #[test]
+    fn pass_needed_checks_the_preferred_copy_only() {
+        let _home = IsolatedHome::new();
+        let dir = tmpdir();
+        let sdir = tmpdir();
+        let p = write_claude(&sdir, "s1", "alpha corpus seed");
+        let r1 = sref("s1", "one", p);
+        index_refs(&dir, std::slice::from_ref(&r1), false).unwrap();
+
+        // An older duplicate at a different path loses preference → not drift.
+        let p_old = write_claude(&sdir, "s1dup", "different, older copy");
+        let mut dup = sref("s1", "one", p_old);
+        dup.updated_at = chrono::DateTime::from_timestamp(0, 0);
+        assert_eq!(pass_needed_over(&dir, &[r1.clone(), dup], false), Some(false));
+
+        // A newer duplicate wins preference → its file is the session now → drift.
+        let p_new = write_claude(&sdir, "s1new", "newer copy content");
+        let mut dup = sref("s1", "one", p_new);
+        dup.updated_at = chrono::DateTime::from_timestamp(3, 0);
+        assert_eq!(pass_needed_over(&dir, &[r1, dup], false), Some(true));
     }
 }

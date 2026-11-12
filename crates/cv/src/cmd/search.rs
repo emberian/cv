@@ -252,9 +252,43 @@ fn write_json_rows<T>(
     Ok(())
 }
 
-pub(crate) fn cmd_index(semantic: bool, rebuild: bool, subagents: bool, strict: bool, json: bool) -> Result<()> {
+pub(crate) fn cmd_index(
+    semantic: bool,
+    rebuild: bool,
+    subagents: bool,
+    if_changed: bool,
+    strict: bool,
+    json: bool,
+) -> Result<()> {
     if semantic && subagents {
         return crate::util::usage("--semantic indexes top-level sessions; --subagents currently applies only to full-text indexing. Run `cv index --subagents` and `cv index --semantic` separately.");
+    }
+
+    let dir = cv_search::default_tantivy_dir();
+    if if_changed && (!semantic || cv_search::default_embeddings_path().exists()) {
+        // The timer gate: a stat-only probe (catalog inventory + one stat per session + the
+        // index's own stamps) answers whether a pass would find work at all.
+        match cv_search::fts::pass_needed(&dir, subagents) {
+            Some(true) => eprintln!("  ↳ corpus moved since the last pass — indexing"),
+            Some(false) => {
+                if json {
+                    let indexed = cv_search::fts::indexed_top_level_count(&dir).unwrap_or(0);
+                    let out = serde_json::json!({
+                        "indexed": indexed,
+                        "changed": 0,
+                        "removed": 0,
+                        "errors": 0,
+                        "path": dir,
+                        "unreadable": [],
+                    });
+                    println!("{}", serde_json::to_string_pretty(&out)?);
+                } else {
+                    println!("index already current — nothing changed since the last pass (skipped)");
+                }
+                return Ok(());
+            }
+            None => eprintln!("  ↳ index unreadable — running the pass"),
+        }
     }
 
     eprintln!(
@@ -263,7 +297,6 @@ pub(crate) fn cmd_index(semantic: bool, rebuild: bool, subagents: bool, strict: 
         if subagents { " (+ sub-agent forest)" } else { "" }
     );
     let (indexed, refs) = cv_search::index_all(None, rebuild, subagents, strict)?;
-    let dir = cv_search::default_tantivy_dir();
     if !json {
         println!(
             "indexed {} top-level session(s) → {}{}",
@@ -316,7 +349,7 @@ mod tests {
     #[test]
     fn unsupported_semantic_forest_combination_fails_before_index_work() {
         for rebuild in [false, true] {
-            let error = cmd_index(true, rebuild, true, false, false).unwrap_err();
+            let error = cmd_index(true, rebuild, true, false, false, false).unwrap_err();
             assert!(error.is::<crate::util::UsageError>());
             assert!(error.to_string().contains("top-level"));
             assert!(error.to_string().contains("cv index --subagents"));

@@ -440,7 +440,7 @@ fn plan(
 /// one whole on every query. The same file (device and inode) is the same session: it is judged,
 /// and when grown resumed, as the index keys it. A different file under another path (a copy, a
 /// move) is not, and is read as it is.
-fn as_indexed<'r>(
+pub(super) fn as_indexed<'r>(
     r: &'r cv_core::SessionRef,
     metadata: &HashMap<String, DiscoveryMetadata>,
 ) -> std::borrow::Cow<'r, cv_core::SessionRef> {

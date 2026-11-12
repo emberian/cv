@@ -533,8 +533,15 @@ fn search_discloses_index_staleness() {
     assert!(!ok && code == 2 && err.contains("CV_LIVE_BYTES=\"50MB\""), "{err}");
     std::fs::remove_file(&config).unwrap();
 
-    // A fresh pass quiets it again.
+    // A fresh pass quiets it again, and `--if-changed` skips a measured-quiet corpus.
     w.cv_ok(&["index"]);
+    let (skip_out, _) = w.cv_ok(&["index", "--if-changed"]);
+    assert!(skip_out.contains("index already current"), "{skip_out}");
+    let (skip_json, _) = w.cv_ok(&["index", "--if-changed", "--json"]);
+    let skip_val: serde_json::Value = serde_json::from_str(&skip_json).unwrap();
+    assert_eq!(skip_val["changed"], 0, "{skip_json}");
+    let (ok, code, _, err) = w.cv(&["index", "--if-changed", "--rebuild"]);
+    assert!(!ok && code == 2, "{err}");
     let (_, err) = w.cv_ok(&["search", "zebrafish", "--json"]);
     assert!(!err.contains("behind") && !err.contains("live:"), "{err}");
 }

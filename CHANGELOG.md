@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- `cv index --if-changed` (`fts::pass_needed`) skips the index sweep when a stat-only probe shows no session or sub-agent drift.
 - Search's live-read budget defaults from `$CV_LIVE_BYTES` (`<bytes>` or `all`), then config `[search] live_bytes`; `--live-bytes` overrides, and the footer names the source.
 - `cv show`, `cv export`, and `/api/session/{h}/{id}/messages` accept `--around ID` (`id:<raw>` for numeric IDs) as well as message indices, composing with `--kind`.
 - `cv index` and `cv search` load resume mark heads on demand per selected stale session instead of scanning all `resume_marks` rows upfront.
