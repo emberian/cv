@@ -15,7 +15,7 @@ use crate::config::Config;
 use crate::ir::{Harness, Session};
 use crate::packs::{pack_idx_path, pack_zst_path, PackBuilder, PayloadAddr, SealedPack};
 use crate::publish::Claim;
-use crate::redact::{scrub_text_with_profile, ScrubProfile};
+use crate::redact::{CompiledProfile, PrincipalPolicy, ScrubProfile, ScrubStats};
 use crate::state::{
     tables::{CustodyAck, PackManifest as LocalStatePackManifest},
     AppendRequest, CaptureInboxRow, DurableReceipt, EventId, StateStore,
@@ -604,15 +604,24 @@ impl Shipper {
     /// Enroll this producer on the remote hub (`POST /api/hub/enroll`).
     pub fn enroll(&self) -> Result<(EnrollResponse, TransportDeliveryAck), HubError> {
         let profile = self.resolved_profile();
-        let host_label = if profile.hostnames && !self.cfg.host_label.is_empty() {
-            scrub_text_with_profile(&self.cfg.host_label, &profile).unwrap_or_else(|_| "[REDACTED:host]".into())
+        let compiled = profile
+            .compile()
+            .map_err(|e| HubError::InvalidArgument(format!("invalid scrub profile: {e:#}")))?;
+        let mut enroll_stats = ScrubStats::default();
+        let repo_root = profile.repo_root.as_deref();
+        let host_label = if !self.cfg.host_label.is_empty() {
+            compiled
+                .scrub_text_cow(&self.cfg.host_label, repo_root, &mut enroll_stats)
+                .into_owned()
         } else {
-            self.cfg.host_label.clone()
+            String::new()
         };
+        let mut metadata = self.cfg.producer_metadata.clone();
+        scrub_json_value_in_place(&mut metadata, &compiled, &profile, repo_root, &mut enroll_stats);
         let req = EnrollRequest {
             producer_id: self.cfg.producer_id.clone(),
             host_label,
-            metadata: self.cfg.producer_metadata.clone(),
+            metadata,
         };
         let (resp, ack) = self.client.post_json("/api/hub/enroll", &req)?;
         if resp.status != 200 {
@@ -741,6 +750,38 @@ impl Shipper {
 
         for commit in pending {
             let loaded_session = load_commit_session(&commit, local_packs_dir)?;
+            let is_session = loaded_session.is_some() || is_session_upsert_envelope(&commit.envelope);
+
+            if !is_session {
+                if !non_session_envelope_matches_filter(&commit.envelope, &profile) {
+                    report.sessions_filtered_out += 1;
+                    prepared.push(PreparedItem {
+                        commit,
+                        scrubbed_envelope: json!({ "kind": "filtered_out" }),
+                        scrubbed_payload: None,
+                    });
+                    continue;
+                }
+                let env_cwd = commit.envelope.get("cwd").and_then(Value::as_str).map(PathBuf::from);
+                let raw_repo_root = profile.repo_root.as_deref().or(env_cwd.as_deref());
+                let mut scrubbed_envelope = commit.envelope.clone();
+                let mut env_stats = ScrubStats::default();
+                scrub_json_value_in_place(
+                    &mut scrubbed_envelope,
+                    &compiled,
+                    &profile,
+                    raw_repo_root,
+                    &mut env_stats,
+                );
+                report.redactions_applied += env_stats.total();
+                prepared.push(PreparedItem {
+                    commit,
+                    scrubbed_envelope,
+                    scrubbed_payload: None,
+                });
+                continue;
+            }
+
             let candidate_session = match loaded_session {
                 Some(ref s) => s.clone(),
                 None => stub_session_from_envelope(&commit.envelope),
@@ -757,12 +798,20 @@ impl Shipper {
             }
 
             report.sessions_admitted += 1;
-            let (scrubbed_session, stats) = compiled
+            let raw_repo_root = profile.repo_root.as_deref().or(candidate_session.cwd.as_deref());
+            let (scrubbed_session, mut stats) = compiled
                 .scrub_session(&candidate_session)
                 .map_err(|e| HubError::Pack(format!("scrubbing session failed: {e:#}")))?;
-            report.redactions_applied += stats.total();
 
-            let scrubbed_envelope = build_scrubbed_envelope(&commit.envelope, &scrubbed_session, &profile)?;
+            let scrubbed_envelope = build_scrubbed_envelope(
+                &commit.envelope,
+                &scrubbed_session,
+                &compiled,
+                &profile,
+                raw_repo_root,
+                &mut stats,
+            );
+            report.redactions_applied += stats.total();
             let scrubbed_payload = if loaded_session.is_some() {
                 let bytes = serde_json::to_vec(&scrubbed_session)?;
                 has_any_payload = true;
@@ -954,9 +1003,178 @@ fn load_commit_session(commit: &SealedCommitEntry, local_packs_dir: &Path) -> Re
     Ok(None)
 }
 
+fn is_session_upsert_envelope(envelope: &Value) -> bool {
+    match envelope.get("kind").and_then(Value::as_str) {
+        Some("session_upsert") => envelope
+            .get("session_id")
+            .or_else(|| envelope.get("id"))
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.is_empty()),
+        None => envelope.get("session").is_some_and(Value::is_object),
+        _ => false,
+    }
+}
+
+fn path_matches_filter_pattern(cwd: &Path, pattern: &Path) -> bool {
+    let pat_str = pattern.to_string_lossy();
+    if let Some(prefix) = pat_str.strip_suffix("/*").or_else(|| pat_str.strip_suffix("/**")) {
+        return cwd.starts_with(Path::new(prefix));
+    }
+    cwd.starts_with(pattern)
+}
+
+fn non_session_envelope_matches_filter(envelope: &Value, profile: &ScrubProfile) -> bool {
+    let is_delete = envelope.get("kind").and_then(Value::as_str) == Some("session_delete");
+    let env_cwd = envelope.get("cwd").and_then(Value::as_str).map(Path::new);
+
+    if let Some(cwd) = env_cwd {
+        if profile
+            .filter
+            .deny_cwds
+            .iter()
+            .any(|deny| path_matches_filter_pattern(cwd, deny))
+        {
+            return false;
+        }
+        if !profile.filter.allow_cwds.is_empty()
+            && !profile
+                .filter
+                .allow_cwds
+                .iter()
+                .any(|allow| path_matches_filter_pattern(cwd, allow))
+        {
+            return false;
+        }
+    } else if !profile.filter.allow_cwds.is_empty() && !is_delete {
+        return false;
+    }
+
+    if !profile.filter.harnesses.is_empty() {
+        if let Some(h_str) = envelope.get("harness").and_then(Value::as_str) {
+            let actual = match Harness::parse(h_str) {
+                Some(h) => h.as_str(),
+                None => h_str,
+            };
+            let accepted = profile.filter.harnesses.iter().any(|want| {
+                let trimmed = want.trim();
+                trimmed.eq_ignore_ascii_case(actual) || Harness::parse(trimmed).is_some_and(|h| h.as_str() == actual)
+            });
+            if !accepted {
+                return false;
+            }
+        }
+    }
+
+    if !profile.filter.tags.is_empty() && !is_delete {
+        let mut have_tags: Vec<&str> = Vec::new();
+        for candidate in [
+            envelope.get("tags"),
+            envelope.pointer("/metadata/cv/tags"),
+            envelope.pointer("/metadata/tags"),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            match candidate {
+                Value::String(s) => have_tags.extend(s.split(',').map(str::trim).filter(|t| !t.is_empty())),
+                Value::Array(items) => have_tags.extend(items.iter().filter_map(Value::as_str)),
+                _ => {}
+            }
+        }
+        if let Some(single) = envelope
+            .get("tag")
+            .or_else(|| envelope.pointer("/metadata/cv/tag"))
+            .and_then(Value::as_str)
+        {
+            have_tags.push(single);
+        }
+        if !profile
+            .filter
+            .tags
+            .iter()
+            .any(|want| have_tags.iter().any(|have| have.eq_ignore_ascii_case(want.trim())))
+        {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn hash_principal_json_value(val: &mut Value, salt: Option<&str>) {
+    let mut hasher = blake3::Hasher::new();
+    if let Some(s) = salt {
+        hasher.update(s.as_bytes());
+        hasher.update(b":");
+    }
+    match &*val {
+        Value::String(s) => {
+            hasher.update(s.as_bytes());
+        }
+        other => {
+            if let Ok(bytes) = super::canonical_json_bytes(other) {
+                hasher.update(&bytes);
+            }
+        }
+    }
+    let hex = hasher.finalize().to_hex();
+    *val = Value::String(format!("sha256:{}", &hex.as_str()[..24]));
+}
+
+fn scrub_json_value_in_place(
+    val: &mut Value,
+    compiled: &CompiledProfile,
+    profile: &ScrubProfile,
+    repo_root: Option<&Path>,
+    stats: &mut ScrubStats,
+) {
+    match val {
+        Value::String(s) => {
+            if let std::borrow::Cow::Owned(clean) = compiled.scrub_text_cow(s, repo_root, stats) {
+                *s = clean;
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                scrub_json_value_in_place(item, compiled, profile, repo_root, stats);
+            }
+        }
+        Value::Object(map) => {
+            match &profile.principal {
+                PrincipalPolicy::Drop => {
+                    if map.remove("principal").is_some() {
+                        stats.principal_transformed = true;
+                    }
+                }
+                PrincipalPolicy::Hash { salt } => {
+                    if let Some(pval) = map.get_mut("principal") {
+                        hash_principal_json_value(pval, salt.as_deref());
+                        stats.principal_transformed = true;
+                    }
+                }
+                PrincipalPolicy::Keep => {}
+            }
+            for (k, v) in map.iter_mut() {
+                if k == "kind" || k == "harness" {
+                    continue;
+                }
+                if k == "principal" && !matches!(profile.principal, PrincipalPolicy::Keep) {
+                    continue;
+                }
+                scrub_json_value_in_place(v, compiled, profile, repo_root, stats);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn stub_session_from_envelope(envelope: &Value) -> Session {
-    let harness_str = envelope.get("harness").and_then(Value::as_str).unwrap_or("claude");
-    let harness = Harness::parse(harness_str).unwrap_or(Harness::Claude);
+    let default_harness = Harness::ALL[0];
+    let harness = envelope
+        .get("harness")
+        .and_then(Value::as_str)
+        .and_then(Harness::parse)
+        .unwrap_or(default_harness);
     let id = envelope
         .get("session_id")
         .or_else(|| envelope.get("id"))
@@ -1006,8 +1224,11 @@ fn stub_session_from_envelope(envelope: &Value) -> Session {
 fn build_scrubbed_envelope(
     raw_envelope: &Value,
     scrubbed_session: &Session,
+    compiled: &CompiledProfile,
     profile: &ScrubProfile,
-) -> Result<Value, HubError> {
+    repo_root: Option<&Path>,
+    stats: &mut ScrubStats,
+) -> Value {
     let kind = raw_envelope
         .get("kind")
         .and_then(Value::as_str)
@@ -1036,15 +1257,12 @@ fn build_scrubbed_envelope(
     });
 
     if let Some(meta) = raw_envelope.get("metadata") {
-        let meta_str = serde_json::to_string(meta)?;
-        let clean_str = scrub_text_with_profile(&meta_str, profile)
-            .map_err(|e| HubError::Pack(format!("scrubbing metadata failed: {e:#}")))?;
-        if let Ok(clean_val) = serde_json::from_str::<Value>(&clean_str) {
-            if let Some(obj) = out.as_object_mut() {
-                obj.insert("metadata".into(), clean_val);
-            }
+        let mut clean_meta = meta.clone();
+        scrub_json_value_in_place(&mut clean_meta, compiled, profile, repo_root, stats);
+        if let Some(obj) = out.as_object_mut() {
+            obj.insert("metadata".into(), clean_meta);
         }
     }
 
-    Ok(out)
+    out
 }

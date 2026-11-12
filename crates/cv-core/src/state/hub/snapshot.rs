@@ -367,10 +367,10 @@ fn parse_envelope_op(
     envelope: &Value,
     payload_addr: Option<PayloadAddr>,
 ) -> ParsedEnvelopeOp {
-    let kind = envelope.get("kind").and_then(Value::as_str).unwrap_or("session_upsert");
-    match kind {
-        "filtered_out" | "heartbeat" | "noop" | "task_event" => return ParsedEnvelopeOp::Ignore,
-        "session_delete" => {
+    let explicit_kind = envelope.get("kind").and_then(Value::as_str);
+    let nested = envelope.get("session").filter(|v| v.is_object());
+    match explicit_kind {
+        Some("session_delete") => {
             if let Some(sid) = envelope
                 .get("session_id")
                 .or_else(|| envelope.get("id"))
@@ -383,16 +383,20 @@ fn parse_envelope_op(
             }
             return ParsedEnvelopeOp::Ignore;
         }
-        _ => {}
+        Some("session_upsert") => {}
+        None if nested.is_some() => {}
+        // Non-session envelopes (`filtered_out`, `receipt`, `hook_receipt`, `lane_start`,
+        // `heartbeat`, `noop`, `task_event`, etc.) stay durably committed in `hub_ingested_events`
+        // and advance `F(p, e)` without mutating or clobbering `hub_sessions`.
+        _ => return ParsedEnvelopeOp::Ignore,
     }
 
-    let nested = envelope.get("session");
     let Some(session_id) = str_field(envelope, nested, "session_id").or_else(|| str_field(envelope, nested, "id"))
     else {
         return ParsedEnvelopeOp::Ignore;
     };
 
-    let harness = str_field(envelope, nested, "harness").unwrap_or_else(|| "claude".to_string());
+    let harness = str_field(envelope, nested, "harness").unwrap_or_else(|| Harness::ALL[0].as_str().to_string());
     let title = str_field(envelope, nested, "title");
     let cwd = str_field(envelope, nested, "cwd");
     let model = str_field(envelope, nested, "model");
@@ -1022,7 +1026,7 @@ impl ExtFacts for PinnedSessionExt<'_> {
 }
 
 fn entry_to_session_ref(entry: &SessionRevisionEntry) -> SessionRef {
-    let harness = Harness::parse(&entry.harness).unwrap_or(Harness::Claude);
+    let harness = Harness::parse(&entry.harness).unwrap_or(Harness::ALL[0]);
     let mut r = SessionRef::new(entry.session_id.clone(), harness, PathBuf::new());
     r.title = entry.title.clone();
     r.cwd = entry.cwd.as_deref().map(PathBuf::from);

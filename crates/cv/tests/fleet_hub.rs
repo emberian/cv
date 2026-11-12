@@ -1247,3 +1247,236 @@ fn fleet_hub_rebuild_from_raw_matches_incremental_bit_for_bit() {
         );
     }
 }
+
+#[test]
+fn fleet_hub_non_session_envelopes_json_scrubbing_and_pack_bounds() {
+    let hub_w = World::in_process("fleet-hub-non-session-bounds", Env::enter_isolated);
+    let hub_home = hub_w.cv_home.clone();
+    let (hub_url, _port, _srv) = spawn_hub_serve(&hub_w, Some("fleet-secret"));
+    let client = HttpClient::new(&hub_url, Some("fleet-secret".into())).unwrap();
+
+    // 1. Verify `upload_pack_stream` enforces uncompressed total & per-record caps (`400 Bad Request`)
+    //    before `SeekableReader::read_range` allocates.
+    let stage_dir = hub_home.join("bomb-stage");
+    let s = make_session("bomb-seed", "/work/public", "Seed", "hi", "ok", 1);
+    let _ = build_pack_with_sessions(&stage_dir, "pack-bomb-check", &[s]);
+    let idx_bytes = fs::read(cv_core::packs::pack_idx_path(&stage_dir, "pack-bomb-check").unwrap()).unwrap();
+    let zst_bytes = fs::read(cv_core::packs::pack_zst_path(&stage_dir, "pack-bomb-check").unwrap()).unwrap();
+    let probe_shipper = Shipper::new(ShipConfig::new("hub", &hub_url, "probe").with_token("fleet-secret")).unwrap();
+    let (seed_up, _) = probe_shipper.upload_pack_files(&stage_dir, "pack-bomb-check").unwrap();
+    let zst_hex = seed_up.pack.blake3_digest;
+    let mut manifest_json: Value = serde_json::from_slice(&idx_bytes).unwrap();
+
+    // Case A: `total_decoded_len` > 1 GiB
+    manifest_json["total_decoded_len"] = json!(2_u64 * 1024 * 1024 * 1024);
+    manifest_json["pack_id"] = json!("pack-bomb-total");
+    let bomb_total_idx = serde_json::to_vec(&manifest_json).unwrap();
+    let mut payload_total = Vec::with_capacity(bomb_total_idx.len() + zst_bytes.len());
+    payload_total.extend_from_slice(&bomb_total_idx);
+    payload_total.extend_from_slice(&zst_bytes);
+    let (resp_total, _) = client
+        .send(
+            "PUT",
+            "/api/hub/packs/pack-bomb-total",
+            Some(PACK_STREAM_CONTENT_TYPE),
+            &[
+                ("X-Cv-Pack-Idx-Len", &bomb_total_idx.len().to_string()),
+                ("X-Cv-Pack-Digest", &zst_hex),
+            ],
+            &payload_total,
+        )
+        .unwrap();
+    assert_eq!(resp_total.status, 400);
+    assert!(
+        String::from_utf8_lossy(&resp_total.body).contains("exceeds max allowed"),
+        "expected total_decoded_len cap error, got: {}",
+        String::from_utf8_lossy(&resp_total.body)
+    );
+
+    // Case B: per-record `span.length` > 256 MiB (while `total_decoded_len` <= 1 GiB)
+    let mut manifest_rec: Value = serde_json::from_slice(&idx_bytes).unwrap();
+    manifest_rec["pack_id"] = json!("pack-bomb-rec");
+    manifest_rec["total_decoded_len"] = json!(512_u64 * 1024 * 1024);
+    manifest_rec["record_index"]["records"][0]["length"] = json!(300_u64 * 1024 * 1024);
+    let bomb_rec_idx = serde_json::to_vec(&manifest_rec).unwrap();
+    let mut payload_rec = Vec::with_capacity(bomb_rec_idx.len() + zst_bytes.len());
+    payload_rec.extend_from_slice(&bomb_rec_idx);
+    payload_rec.extend_from_slice(&zst_bytes);
+    let (resp_rec, _) = client
+        .send(
+            "PUT",
+            "/api/hub/packs/pack-bomb-rec",
+            Some(PACK_STREAM_CONTENT_TYPE),
+            &[
+                ("X-Cv-Pack-Idx-Len", &bomb_rec_idx.len().to_string()),
+                ("X-Cv-Pack-Digest", &zst_hex),
+            ],
+            &payload_rec,
+        )
+        .unwrap();
+    assert_eq!(resp_rec.status, 400);
+    assert!(
+        String::from_utf8_lossy(&resp_rec.body).contains("exceeds max allowed"),
+        "expected per-record length cap error, got: {}",
+        String::from_utf8_lossy(&resp_rec.body)
+    );
+
+    // 2. Verify non-session `capture_inbox` envelopes (`receipt`, `lane_start`) + recursive JSON
+    //    `Value` leaf scrubbing (`producer_metadata`, quoted secrets in `metadata`, `session.cwd`
+    //    `$REPO` rewrite, and non-clobbering of existing `hub_sessions`).
+    let prod_store_dir = hub_home.join("prod-mixed-state");
+    let prod_packs_dir = hub_home.join("prod-mixed-packs");
+    fs::create_dir_all(&prod_packs_dir).unwrap();
+    let prod_store = StateStore::at_dir(&prod_store_dir);
+    let recorder = RecorderServer::start(prod_store.clone(), "prod-mixed").unwrap();
+
+    let quoted_secret = "sk-ant-api03-quotedsecretvalue1234567890abcdef";
+    let enroll_secret = "sk-ant-api03-enrollsecretvalue9876543210fedcba";
+
+    // Event 1: non-session hook receipt with NO `session_id` (must not create `"unknown"` session).
+    let env_1 = json!({
+        "kind": "lane_start",
+        "cwd": "/work/public/sub",
+        "note": format!("lane booted on macbook-secret.local with key \"{quoted_secret}\""),
+        "principal": "alice-raw-principal",
+    });
+    prod_store.append("op-hook-1", "dig-hook-1", &env_1).unwrap();
+
+    // Event 2: real session `sess-keep` in `/work/public` with metadata containing quotes + `/work/public` path.
+    let sess = make_session(
+        "sess-keep",
+        "/work/public",
+        "Preserved Session Title",
+        "keep my messages intact",
+        "42",
+        5,
+    );
+    let mut builder = PackBuilder::create(&prod_packs_dir, "local-mixed-pack").unwrap();
+    let local_addr = builder
+        .append_record("sess-keep", &serde_json::to_vec(&sess).unwrap())
+        .unwrap();
+    builder.seal(Claim::New).unwrap();
+    let env_2 = json!({
+        "kind": "session_upsert",
+        "session_id": "sess-keep",
+        "harness": sess.harness.as_str(),
+        "title": sess.title,
+        "cwd": "/work/public",
+        "message_count": 2,
+        "metadata": {
+            "quoted_blob": format!("header=\"{quoted_secret}\" tail=/work/public/src/main.rs"),
+            "principal": "alice-raw-principal",
+        }
+    });
+    prod_store
+        .append_request(
+            &cv_core::state::AppendRequest::new("op-sess-keep", "dig-sess-keep", env_2)
+                .with_payload_ref(serde_json::to_string(&local_addr).unwrap()),
+        )
+        .unwrap();
+
+    // Event 3: trailing `receipt` referencing `session_id: "sess-keep"` with NO payload — MUST NOT
+    // clobber `sess-keep`'s `title`, `message_count`, or `payload_addr`!
+    let env_3 = json!({
+        "kind": "receipt",
+        "session_id": "sess-keep",
+        "cwd": "/work/public",
+        "detail": "post-tool hook receipt at /Users/ember/.ssh/config",
+    });
+    prod_store
+        .append("op-receipt-after", "dig-receipt-after", &env_3)
+        .unwrap();
+
+    // Event 4: non-session envelope in denied `/work/secret-ops` — MUST be filtered out!
+    let env_4 = json!({
+        "kind": "receipt",
+        "cwd": "/work/secret-ops",
+        "detail": "top-secret-denied-hook-marker",
+    });
+    prod_store.append("op-denied-hook", "dig-denied-hook", &env_4).unwrap();
+
+    recorder.shutdown();
+
+    let toml_cfg = r#"
+[replication.hub]
+private_ips = true
+hostnames = true
+rewrite_home = true
+rewrite_repo = true
+principal = "hash"
+
+[replication.hub.filter]
+allow_cwds = ["/work/public"]
+deny_cwds = ["/work/secret-ops"]
+"#;
+    let parsed_cfg: Config = toml::from_str(toml_cfg).unwrap();
+    let profile = cv_core::state::hub::resolve_replication_profile(&parsed_cfg, "hub");
+
+    let mut ship_cfg = ShipConfig::new("hub", &hub_url, "prod-mixed")
+        .with_token("fleet-secret")
+        .with_host_label("macbook-secret.local")
+        .with_profile(profile);
+    ship_cfg.producer_metadata = json!({
+        "owner_token": format!("bearer=\"{enroll_secret}\""),
+        "home_hint": "/Users/ember/dev",
+        "principal": "alice-raw-principal",
+    });
+
+    let shipper = Shipper::new(ship_cfg).unwrap();
+    let rep = shipper.sync(&prod_store, &prod_packs_dir).unwrap();
+    assert_eq!(rep.events_shipped, 4);
+    assert_eq!(rep.sessions_admitted, 1);
+    assert_eq!(rep.sessions_filtered_out, 1);
+
+    // Check hub sessions: ONLY `sess-keep` exists (no `"unknown"` row), and its title,
+    // message_count (2), metadata (`$REPO/src/main.rs`), and mirrored pack hydration stayed intact!
+    let (page_raw, _) = client.get("/api/hub/sessions").unwrap();
+    let page: HubSessionsPage = page_raw.json().unwrap();
+    assert_eq!(page.total, 1);
+    assert_eq!(page.sessions[0].id, "sess-keep");
+    assert_eq!(page.sessions[0].title.as_deref(), Some("Preserved Session Title"));
+    assert_eq!(page.sessions[0].message_count, 2);
+
+    let (snap_raw, _) = client.get("/api/hub/snapshot").unwrap();
+    let snap: HubSnapshotResponse = snap_raw.json().unwrap();
+    assert_eq!(
+        snap.frontiers[0].contiguous_seq, 4,
+        "all 4 events (including non-session receipts) must advance F(p, e)"
+    );
+    let rev_key = encode_pair_key("prod-mixed", "sess-keep");
+    let rev = snap.snapshot.session_revisions.get(&rev_key).unwrap();
+    let rev_meta_str = serde_json::to_string(&rev.metadata).unwrap();
+    assert!(
+        rev_meta_str.contains("$REPO/src/main.rs"),
+        "session metadata must preserve JSON structure and rewrite session.cwd to $REPO: {rev_meta_str}"
+    );
+    assert!(!rev_meta_str.contains(quoted_secret));
+    assert!(!rev_meta_str.contains("alice-raw-principal"));
+
+    let (hyd_raw, _) = client.get("/api/hub/session/prod-mixed/sess-keep").unwrap();
+    assert_eq!(hyd_raw.status, 200);
+    let hyd_json: Value = hyd_raw.json().unwrap();
+    assert_eq!(hyd_json["messages"].as_array().unwrap().len(), 2);
+
+    // Check enrolled producer metadata & raw hub sqlite bytes: zero leaks anywhere!
+    let (status_raw, _) = client.get("/api/hub/status").unwrap();
+    let status: HubStatusResponse = status_raw.json().unwrap();
+    let status_text = serde_json::to_string(&status).unwrap();
+    let db_bytes = fs::read(hub_home.join("state.db")).unwrap();
+    let db_lossy = String::from_utf8_lossy(&db_bytes);
+    for forbidden in [
+        quoted_secret,
+        enroll_secret,
+        "macbook-secret.local",
+        "/Users/ember",
+        "alice-raw-principal",
+        "/work/secret-ops",
+        "top-secret-denied-hook-marker",
+    ] {
+        assert!(
+            !status_text.contains(forbidden),
+            "hub status leaked {forbidden:?}: {status_text}"
+        );
+        assert!(!db_lossy.contains(forbidden), "hub state.db leaked {forbidden:?}");
+    }
+}

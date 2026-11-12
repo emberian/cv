@@ -16,6 +16,14 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Read, Write};
 
+/// Defensive uncompressed total size cap on uploaded packs (1 GiB) to block multi-frame RLE zstd
+/// bombs before `SeekableReader::read_range` allocates.
+pub const MAX_PACK_DECODED_BYTES: u64 = 1024 * 1024 * 1024;
+/// Defensive record count cap per uploaded `.pack.idx.json` manifest.
+pub const MAX_PACK_RECORDS: usize = 100_000;
+/// Defensive per-record uncompressed byte cap (256 MiB) before `SeekableReader::read_range`.
+pub const MAX_PACK_RECORD_BYTES: u64 = 256 * 1024 * 1024;
+
 fn empty_json_object() -> Value {
     Value::Object(serde_json::Map::new())
 }
@@ -255,6 +263,38 @@ impl HubStore {
                 manifest.pack_id, pack_id
             )));
         }
+        if manifest.total_decoded_len > MAX_PACK_DECODED_BYTES {
+            return Err(HubError::Pack(format!(
+                "pack `{pack_id}` total_decoded_len {} exceeds max allowed {MAX_PACK_DECODED_BYTES}",
+                manifest.total_decoded_len
+            )));
+        }
+        if manifest.record_index.len() > MAX_PACK_RECORDS {
+            return Err(HubError::Pack(format!(
+                "pack `{pack_id}` record count {} exceeds max allowed {MAX_PACK_RECORDS}",
+                manifest.record_index.len()
+            )));
+        }
+        for span in manifest.record_index.records() {
+            if span.length > MAX_PACK_RECORD_BYTES {
+                return Err(HubError::Pack(format!(
+                    "record {:?} in pack `{pack_id}` length {} exceeds max allowed {MAX_PACK_RECORD_BYTES}",
+                    span.anchor, span.length
+                )));
+            }
+            let Some(end) = span.decoded_offset.checked_add(span.length) else {
+                return Err(HubError::Pack(format!(
+                    "record {:?} in pack `{pack_id}` offset+length overflow",
+                    span.anchor
+                )));
+            };
+            if end > manifest.total_decoded_len {
+                return Err(HubError::Pack(format!(
+                    "record {:?} in pack `{pack_id}` end {} exceeds total_decoded_len {}",
+                    span.anchor, end, manifest.total_decoded_len
+                )));
+            }
+        }
 
         let verify_file = staged_zst.file().try_clone()?;
         let reader = SeekableReader::open(verify_file).map_err(|e| {
@@ -262,6 +302,12 @@ impl HubStore {
                 "invalid Zstd-Seekable frame table in uploaded pack `{pack_id}`: {e:#}"
             ))
         })?;
+        if reader.index().total_decoded_len() > MAX_PACK_DECODED_BYTES {
+            return Err(HubError::Pack(format!(
+                "pack `{pack_id}` seekable decoded length {} exceeds max allowed {MAX_PACK_DECODED_BYTES}",
+                reader.index().total_decoded_len()
+            )));
+        }
         if reader.index().total_decoded_len() != manifest.total_decoded_len {
             return Err(HubError::Pack(format!(
                 "pack `{pack_id}` seekable decoded length {} != manifest {}",
