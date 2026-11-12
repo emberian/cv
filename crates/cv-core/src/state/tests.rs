@@ -728,3 +728,110 @@ fn batch_savepoint_rolls_back_failed_item_and_deep_tmpdir_stays_within_sun_len()
     server.shutdown();
     std::fs::remove_dir_all(&dir).ok();
 }
+
+fn dir_listing(dir: &std::path::Path) -> Vec<(String, u64)> {
+    let mut names: Vec<(String, u64)> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| {
+            let e = e.unwrap();
+            (
+                e.file_name().to_string_lossy().into_owned(),
+                e.metadata().unwrap().len(),
+            )
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn frozen_reads_of_a_checkpointed_store_create_no_wal_or_shm_sidecars() {
+    let base = tmp_state_dir("frozen-sidecars");
+    let store = StateStore::at_dir(&base);
+    store.append("op-live", "d-live", &json!({"x": 1})).unwrap();
+    // The last writable connection closed: SQLite checkpointed and removed `-wal`/`-shm`.
+    assert!(!base.join("state.db-wal").exists() && !base.join("state.db-shm").exists());
+    let before = dir_listing(&base);
+    let bytes_before = std::fs::read(base.join("state.db")).unwrap();
+
+    {
+        let _frozen = crate::env::Env::from_vars([("CV_FROZEN", "1")]).enter();
+        assert_eq!(store.inbox_count().unwrap(), 1);
+        assert!(store.get_operation_binding("op-live").unwrap().is_some());
+        assert!(store.list_producers().unwrap().len() <= 1);
+        assert!(store.open_readonly().unwrap().is_some());
+    }
+
+    assert_eq!(
+        dir_listing(&base),
+        before,
+        "--frozen reads must not create state.db-wal / state.db-shm"
+    );
+    assert_eq!(std::fs::read(base.join("state.db")).unwrap(), bytes_before);
+    std::fs::remove_dir_all(&base).ok();
+}
+
+#[test]
+fn frozen_reads_see_committed_wal_frames_without_touching_the_live_store() {
+    let base = tmp_state_dir("frozen-live-wal");
+    let store = StateStore::at_dir(&base);
+    // A live writer holds the store open, so committed rows sit in `-wal` (not yet checkpointed).
+    let writer = store.open_writable().unwrap();
+    store.append("op-wal", "d-wal", &json!({"x": 2})).unwrap();
+    assert!(std::fs::metadata(base.join("state.db-wal")).is_ok_and(|m| m.len() > 0));
+    let before = dir_listing(&base);
+
+    {
+        let _frozen = crate::env::Env::from_vars([("CV_FROZEN", "1")]).enter();
+        assert_eq!(
+            store.inbox_count().unwrap(),
+            1,
+            "frozen read must see WAL-committed rows"
+        );
+        assert!(store.get_operation_binding("op-wal").unwrap().is_some());
+    }
+
+    assert_eq!(
+        dir_listing(&base),
+        before,
+        "--frozen reads must not grow or reset the live WAL"
+    );
+    drop(writer);
+    std::fs::remove_dir_all(&base).ok();
+}
+
+#[test]
+fn frozen_reads_fold_a_retained_wal_without_shm_in_a_private_copy() {
+    let live = tmp_state_dir("frozen-retained-live");
+    let store = StateStore::at_dir(&live);
+    let writer = store.open_writable().unwrap();
+    store.append("op-wal", "d-wal", &json!({"x": 3})).unwrap();
+    // A copy of the store taken while a writer was live: database + WAL frames, no `-shm`.
+    let copied = tmp_state_dir("frozen-retained-copy");
+    std::fs::copy(live.join("state.db"), copied.join("state.db")).unwrap();
+    std::fs::copy(live.join("state.db-wal"), copied.join("state.db-wal")).unwrap();
+    drop(writer);
+    let before = dir_listing(&copied);
+    let wal_before = std::fs::read(copied.join("state.db-wal")).unwrap();
+    assert!(!wal_before.is_empty());
+
+    {
+        let _frozen = crate::env::Env::from_vars([("CV_FROZEN", "1")]).enter();
+        let copy = StateStore::at_dir(&copied);
+        assert_eq!(
+            copy.inbox_count().unwrap(),
+            1,
+            "rows committed only to the WAL must be read"
+        );
+        assert!(copy.get_operation_binding("op-wal").unwrap().is_some());
+    }
+
+    assert_eq!(
+        dir_listing(&copied),
+        before,
+        "--frozen must not recover the WAL in place"
+    );
+    assert_eq!(std::fs::read(copied.join("state.db-wal")).unwrap(), wal_before);
+    std::fs::remove_dir_all(&live).ok();
+    std::fs::remove_dir_all(&copied).ok();
+}
