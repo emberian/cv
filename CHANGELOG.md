@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- `cv rewind` ignores `api-request-blob` and other non-turn records when tracking open tool calls.
 - Breaking: removed `cv mcp`, `scry`, `deferrals`, `splice --generate`, `CV_PACK_LLM`, and retired CLI/HTTP tombstones; `cv pack` uses zero-LLM live-suffix recall.
 - First-class `antigravity` harness (`agy`, `antigravity-cli`, `antigravity-ide`): reads Cortex JSONL step logs, sub-agent trees, and read-only SQLite sidecars under `~/.gemini/antigravity*`.
 - Codex Code Mode `exec` JS calls now classify into `command`, `file_edit`, spawn, and background events across `events`, `touched`, `lanes`, hooks, and `distill`.

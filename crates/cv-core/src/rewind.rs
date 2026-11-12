@@ -1227,17 +1227,26 @@ fn read_line_at(source: &crate::json::JsonSource, file: &std::fs::File, off: u64
     }
 }
 
-/// Update the open tool-call set from one record: an assistant's `tool_use` blocks open calls, a
-/// user record's `tool_result` blocks close them (counted into `closed` past the cut).
+/// Update the open tool-call set from one record: a top-level assistant record's `tool_use` blocks
+/// open calls, a top-level user record's `tool_result` blocks close them (counted into `closed`
+/// past the cut). The record's own `type` decides, as the conversation decoder does: a request
+/// snapshot (`api-request-blob`) embeds the same message shape verbatim and is evidence to keep,
+/// never an event. Sidechain records carry the same types and still count, so [`Facts::turn_kind`],
+/// which excludes them, is not the gate.
 fn track_tool_calls(facts: &Facts, open: &mut HashMap<String, Option<String>>, mut closed: Option<&mut usize>) {
+    let opens = match facts.ty.as_str() {
+        "assistant" => true,
+        "user" => false,
+        _ => return,
+    };
     for b in &facts.blocks {
         match b.ty.as_deref() {
-            Some("tool_use") => {
+            Some("tool_use") if opens => {
                 if let Some(id) = &b.id {
                     open.insert(id.clone(), facts.message_id.clone());
                 }
             }
-            Some("tool_result") if open.remove(b.tool_use_id.as_deref().unwrap_or("")).is_some() => {
+            Some("tool_result") if !opens && open.remove(b.tool_use_id.as_deref().unwrap_or("")).is_some() => {
                 if let Some(c) = closed.as_deref_mut() {
                     *c += 1;
                 }

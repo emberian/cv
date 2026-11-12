@@ -1177,3 +1177,131 @@ fn an_empty_line_is_copied_like_any_blank_one() {
     let res = rewind_session(&sref(&src, SID), &opts(CutAt::End, &dir.join("out"))).unwrap();
     assert_eq!(std::fs::read_to_string(res.new_path).unwrap().lines().nth(1), Some(""));
 }
+
+// ---------------------------------------------------------------------------
+// Request snapshots (`api-request-blob`) are physical evidence, never events
+// ---------------------------------------------------------------------------
+
+/// A top-level `api-request-blob` record embedding a verbatim message, the shape a request
+/// snapshot carries: the same `message.content` blocks a turn has, under a type no turn has.
+fn blob(uuid: &str, message: Value) -> Value {
+    json!({"type": "api-request-blob", "sessionId": SID, "uuid": uuid,
+           "parentUuid": null, "isSidechain": false, "message": message})
+}
+
+fn sidechain_rec(ty: &str, uuid: &str, parent: Option<&str>, message: Value) -> Value {
+    let mut v = rec(ty, uuid, parent, message);
+    v["isSidechain"] = json!(true);
+    v
+}
+
+/// Read `v` the way the rewind pass does (a captured source, so `Facts` has its byte ranges),
+/// then feed it to the tracker.
+fn track(v: &Value, open: &mut HashMap<String, Option<String>>, closed: Option<&mut usize>) {
+    let world = crate::test_world("rewind");
+    let path = world.proj.join("record.jsonl");
+    std::fs::write(&path, v.to_string()).unwrap();
+    let source = crate::json::JsonSource::capture(&path).unwrap();
+    let facts = source
+        .read(
+            crate::json::ReadInput::Range(0, source.len()),
+            crate::json::Validation::Value,
+            |view| Ok(Facts::parse(view)?.0),
+        )
+        .unwrap();
+    track_tool_calls(&facts, open, closed);
+}
+
+fn ids(open: &HashMap<String, Option<String>>) -> Vec<&str> {
+    let mut ids: Vec<&str> = open.keys().map(String::as_str).collect();
+    ids.sort_unstable();
+    ids
+}
+
+#[test]
+fn a_snapshot_replaying_a_closed_use_reopens_nothing() {
+    let mut open = HashMap::new();
+    track(&rec("assistant", "a1", None, bash("toolu_x", "ls")), &mut open, None);
+    track(&rec("user", "r1", Some("a1"), result("toolu_x", "ok")), &mut open, None);
+    track(&blob("snap1", bash("toolu_x", "ls")), &mut open, None);
+    assert!(open.is_empty(), "{open:?}");
+
+    let world = crate::test_world("rewind");
+    let dir = world.proj.clone();
+    let src = dir.join(format!("{SID}.jsonl"));
+    write_jsonl(
+        &src,
+        &[
+            rec("user", "u0", None, text("user", "go")),
+            rec("assistant", "a1", Some("u0"), bash("toolu_x", "ls")),
+            rec("user", "r1", Some("a1"), result("toolu_x", "ok")),
+            blob("snap1", bash("toolu_x", "ls")),
+            rec("assistant", "a2", Some("r1"), text("assistant", "done")),
+        ],
+    );
+    let res = rewind_session(&sref(&src, SID), &opts(CutAt::End, &dir.join("out"))).unwrap();
+    assert_eq!((res.closed_tool_calls, res.open_tool_calls), (0, 0));
+    assert!(res.warnings.is_empty(), "{:?}", res.warnings);
+}
+
+#[test]
+fn a_real_assistant_use_after_the_pair_opens_one() {
+    let mut open = HashMap::new();
+    track(&rec("assistant", "a1", None, bash("toolu_x", "ls")), &mut open, None);
+    track(&rec("user", "r1", Some("a1"), result("toolu_x", "ok")), &mut open, None);
+    track(
+        &rec("assistant", "a2", Some("r1"), bash("toolu_y", "pwd")),
+        &mut open,
+        None,
+    );
+    assert_eq!(ids(&open), ["toolu_y"]);
+}
+
+#[test]
+fn a_snapshot_result_neither_closes_nor_counts() {
+    let mut open = HashMap::new();
+    let mut closed = 0usize;
+    track(&rec("assistant", "a1", None, bash("toolu_x", "ls")), &mut open, None);
+    track(&blob("snap1", result("toolu_x", "ok")), &mut open, Some(&mut closed));
+    assert_eq!(ids(&open), ["toolu_x"]);
+    assert_eq!(closed, 0);
+    track(
+        &rec("user", "r1", Some("a1"), result("toolu_x", "ok")),
+        &mut open,
+        Some(&mut closed),
+    );
+    assert!(open.is_empty(), "{open:?}");
+    assert_eq!(closed, 1);
+}
+
+#[test]
+fn a_same_id_snapshot_replay_stays_closed_but_a_real_reissue_reopens() {
+    let mut open = HashMap::new();
+    track(&rec("assistant", "a1", None, bash("toolu_a", "ls")), &mut open, None);
+    track(&rec("user", "r1", Some("a1"), result("toolu_a", "ok")), &mut open, None);
+    track(&blob("snap1", bash("toolu_a", "ls")), &mut open, None);
+    assert!(open.is_empty(), "{open:?}");
+    track(
+        &rec("assistant", "a2", Some("r1"), bash("toolu_a", "ls")),
+        &mut open,
+        None,
+    );
+    assert_eq!(ids(&open), ["toolu_a"]);
+}
+
+#[test]
+fn sidechain_records_still_count_as_conversation() {
+    let mut open = HashMap::new();
+    track(
+        &sidechain_rec("assistant", "a1", None, bash("toolu_s", "ls")),
+        &mut open,
+        None,
+    );
+    assert_eq!(ids(&open), ["toolu_s"]);
+    track(
+        &sidechain_rec("user", "r1", Some("a1"), result("toolu_s", "ok")),
+        &mut open,
+        None,
+    );
+    assert!(open.is_empty(), "{open:?}");
+}
