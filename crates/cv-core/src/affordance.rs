@@ -412,7 +412,7 @@ pub fn classify_tool_view(h: Harness, name: &str, input: JsonView<'_>) -> Result
         "EnterPlanMode" | "enter_plan_mode" => (Plan, "enter"),
         "ExitPlanMode" | "exit_plan_mode" => (Plan, "exit"),
         // goal
-        "CreateGoal" => (Goal, "create"),
+        "CreateGoal" | "create_goal" => (Goal, "create"),
         "UpdateGoal" | "update_goal" | "SetGoalBudget" => (Goal, "update"),
         "GetGoal" | "get_goal" => (Goal, "read"),
         // schedule
@@ -491,41 +491,7 @@ pub fn spawn_returns(h: Harness, name: &str) -> Option<Returns> {
 /// Extract the spawned child agent identifier (`task_name` or `agent_id`) from a spawn tool's
 /// non-error result payload when structured.
 pub fn spawn_return_id(h: Harness, name: &str, result_text: &str, is_error: bool) -> Option<String> {
-    if is_error {
-        return None;
-    }
-    match h {
-        Harness::Codex if name == "spawn_agent" => {
-            let v: Value = serde_json::from_str(result_text.trim()).ok()?;
-            for key in ["task_name", "agent_id"] {
-                if let Some(id) = v.get(key).and_then(Value::as_str).filter(|s| !s.is_empty()) {
-                    return Some(id.to_string());
-                }
-            }
-            None
-        }
-        Harness::Claude
-        | Harness::Codex
-        | Harness::Grok
-        | Harness::OpenCode
-        | Harness::Gemini
-        | Harness::Hermes
-        | Harness::OpenClaw
-        | Harness::Cursor
-        | Harness::Kimi
-        | Harness::KimiCode
-        | Harness::Qwen
-        | Harness::LmStudio
-        | Harness::Cline
-        | Harness::Roo
-        | Harness::Continue
-        | Harness::Goose
-        | Harness::Zed
-        | Harness::Devin
-        | Harness::ChatGptExport
-        | Harness::ClaudeExport
-        | Harness::OpenSession => None,
-    }
+    crate::tools::classify::spawn_return_id(h, name, result_text, is_error)
 }
 
 /// The deferred-tool wrapper Hermes, OpenClaw 10.1 and Qwen route lazily loaded tools through.
@@ -1107,6 +1073,14 @@ enum Hit<'a> {
         name: &'a str,
         input: &'a Json,
     },
+    ScriptCall {
+        kind: Kind,
+        action: &'static str,
+        tool: String,
+        id: &'a str,
+        summary: String,
+        items: Vec<Item>,
+    },
     Message {
         kind: Kind,
         action: &'static str,
@@ -1283,6 +1257,71 @@ fn hits<'a>(h: Harness, m: &'a Message, resolver: &crate::lazy::Resolver, summar
             continue;
         };
         let Some((kind, action)) = classify_tool_json(h, name, input)? else {
+            if crate::tools::classify::is_codex_exec_call(h, name) {
+                input.with_view(|view| {
+                    crate::tools::classify::visit_tool_ops(
+                        Some(h),
+                        name,
+                        view,
+                        crate::tools::classify::ClassifyOpts {
+                            commands: false,
+                            summaries,
+                        },
+                        |sem| match sem.op {
+                            crate::tools::classify::ToolOp::Affordance {
+                                kind,
+                                action,
+                                summary,
+                                items,
+                            } => {
+                                let summary = if !items.is_empty() {
+                                    if summaries {
+                                        items_summary(&items)
+                                    } else {
+                                        String::new()
+                                    }
+                                } else {
+                                    summary
+                                };
+                                out.push(Hit::ScriptCall {
+                                    kind,
+                                    action,
+                                    tool: sem.tool.into_owned(),
+                                    id,
+                                    summary,
+                                    items,
+                                });
+                            }
+                            crate::tools::classify::ToolOp::Background { job_id, .. }
+                                if matches!(sem.tool.as_ref(), "write_stdin" | "wait") =>
+                            {
+                                out.push(Hit::ScriptCall {
+                                    kind: Kind::BackgroundJob,
+                                    action: "read",
+                                    tool: sem.tool.into_owned(),
+                                    id,
+                                    summary: job_id.map(std::borrow::Cow::into_owned).unwrap_or_default(),
+                                    items: Vec::new(),
+                                });
+                            }
+                            crate::tools::classify::ToolOp::SubagentSpawn { target_hint, .. }
+                                if m.kind == MessageKind::SubagentSpawn =>
+                            {
+                                spawn_calls += 1;
+                                out.push(Hit::ScriptCall {
+                                    kind: Kind::SubagentSpawn,
+                                    action: "spawn",
+                                    tool: sem.tool.into_owned(),
+                                    id,
+                                    summary: target_hint.map(std::borrow::Cow::into_owned).unwrap_or_default(),
+                                    items: Vec::new(),
+                                });
+                            }
+                            _ => {}
+                        },
+                    )
+                })?;
+            }
             continue;
         };
         // A spawn is a spawn when the adapter said so (the message kind); a harness that marks
@@ -1451,6 +1490,24 @@ fn message_rows(harness: Harness, m: &Message, i: usize, resolver: &crate::lazy:
                     source: Source::ToolCall,
                 }
             }
+            Hit::ScriptCall {
+                kind,
+                action,
+                tool,
+                id,
+                summary,
+                items,
+            } => Affordance {
+                kind,
+                action,
+                index: Some(i),
+                timestamp: m.timestamp,
+                tool: Some(tool),
+                tool_use_id: Some(id.to_string()),
+                summary,
+                items,
+                source: Source::ToolCall,
+            },
             Hit::Message { kind, action, tool } => Affordance {
                 kind,
                 action,
@@ -1515,7 +1572,10 @@ impl Counter {
 
     pub fn note(&mut self, m: &Message) -> Result<()> {
         for hit in hits(self.harness, m, &self.resolver, false)? {
-            let (Hit::Call { kind, .. } | Hit::Message { kind, .. } | Hit::Detail { kind, .. }) = hit;
+            let (Hit::Call { kind, .. }
+            | Hit::ScriptCall { kind, .. }
+            | Hit::Message { kind, .. }
+            | Hit::Detail { kind, .. }) = hit;
             *self.counts.entry(kind).or_default() += 1;
         }
         Ok(())
@@ -2405,5 +2465,37 @@ mod tests {
             classify_tool(Harness::Codex, "write_stdin", &json!({"session_id": 42, "chars": ""})),
             Some((Kind::BackgroundJob, "read"))
         );
+
+        let mut s = Session::new("codex-exec-aff", Harness::Codex);
+        let mut m = Message::new(Role::Assistant);
+        m.content.push(Block::ToolUse {
+            id: "call_exec_1".into(),
+            name: "exec".into(),
+            namespace: None,
+            input: json!(
+                "await tools.update_plan({ plan: [{ step: 'Wire classifier', status: 'in_progress' }] });\n\
+                 await tools.create_goal({ objective: 'Full parity' });\n\
+                 await tools.write_stdin({ session_id: 99, chars: '' });"
+            )
+            .into(),
+        });
+        s.messages.push(m);
+        let rows = of_session(&s).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            (rows[0].kind, rows[0].action, rows[0].tool.as_deref()),
+            (Kind::Plan, "write", Some("update_plan"))
+        );
+        assert_eq!(rows[0].items.len(), 1);
+        assert_eq!(
+            (rows[1].kind, rows[1].action, rows[1].tool.as_deref()),
+            (Kind::Goal, "create", Some("create_goal"))
+        );
+        assert_eq!(rows[1].summary, "Full parity");
+        assert_eq!(
+            (rows[2].kind, rows[2].action, rows[2].tool.as_deref()),
+            (Kind::BackgroundJob, "read", Some("write_stdin"))
+        );
+        assert_eq!(rows[2].summary, "99");
     }
 }

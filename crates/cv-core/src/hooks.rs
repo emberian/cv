@@ -57,6 +57,8 @@ pub(crate) struct Payload {
     pub agent_type: Option<String>,
     pub agent_transcript_path: Option<PathBuf>,
     pub last_assistant_message: Option<String>,
+    #[serde(default)]
+    pub tool_name: Option<String>,
     pub tool_input: Option<Value>,
 }
 

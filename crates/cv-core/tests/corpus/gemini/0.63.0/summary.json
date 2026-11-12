@@ -215,7 +215,7 @@
           "grep_search": {
             "calls": 2,
             "edits": 0,
-            "reads": 0,
+            "reads": 2,
             "commands": 0,
             "errors": 0
           },

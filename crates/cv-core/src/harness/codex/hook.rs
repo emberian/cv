@@ -42,13 +42,23 @@ pub(super) fn hook_event(v: &Value) -> Result<Option<Event>> {
             })
         }
     };
-    let edits = p
-        .tool_input
-        .as_ref()
-        .and_then(|tool| tool.get("command"))
-        .and_then(Value::as_str)
-        .map(patch_paths)
-        .unwrap_or_default();
+    let mut edits = Vec::new();
+    if let Some(tool) = &p.tool_input {
+        let name = p.tool_name.as_deref().unwrap_or("apply_patch");
+        crate::tools::classify::visit_tool_ops(
+            Some(Harness::Codex),
+            name,
+            crate::json::JsonView::from(tool),
+            crate::tools::classify::ClassifyOpts::COUNTS,
+            |sem| {
+                if let crate::tools::classify::ToolOp::FileEdit { path, .. } = sem.op {
+                    edits.push(path.into_owned());
+                }
+            },
+        )?;
+        edits.sort();
+        edits.dedup();
+    }
     Ok(Some(Event {
         harness: Harness::Codex,
         session: SessionRef::new(session_id, Harness::Codex, transcript.unwrap_or_default()),
@@ -57,32 +67,6 @@ pub(super) fn hook_event(v: &Value) -> Result<Option<Event>> {
         agent,
         edits,
     }))
-}
-
-/// Every file an `apply_patch` body adds, updates, deletes or moves to, sorted and deduplicated;
-/// nothing for a command that is not a patch.
-fn patch_paths(patch: &str) -> Vec<String> {
-    if patch.trim().lines().next() != Some("*** Begin Patch") {
-        return Vec::new();
-    }
-    let mut paths: Vec<String> = patch
-        .trim()
-        .lines()
-        .filter_map(|line| {
-            [
-                "*** Add File: ",
-                "*** Update File: ",
-                "*** Delete File: ",
-                "*** Move to: ",
-            ]
-            .into_iter()
-            .find_map(|prefix| line.strip_prefix(prefix))
-            .map(str::to_string)
-        })
-        .collect();
-    paths.sort();
-    paths.dedup();
-    paths
 }
 
 #[cfg(test)]
@@ -102,5 +86,15 @@ mod tests {
             ["added.rs", "deleted.rs", "from name.rs", "to name.rs"]
         );
         assert!(event("echo '*** Update File: pretend.rs'").edits.is_empty());
+
+        let code_mode = hook_event(&json!({
+            "session_id": "s",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "exec",
+            "tool_input": "const patch = ['*** Begin Patch', '*** Update File: src/lib.rs', '*** End Patch'].join('\\n'); await tools.apply_patch(patch);"
+        }))
+        .unwrap()
+        .unwrap();
+        assert_eq!(code_mode.edits, ["src/lib.rs"]);
     }
 }

@@ -29,7 +29,6 @@ use anyhow::Result;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
-mod arguments;
 mod spool;
 pub use spool::{EventSpool, SpoolingSink};
 
@@ -39,21 +38,6 @@ pub struct IngestOptions {
     pub force: bool,
     pub subagents: bool,
 }
-
-/// Name fragments that mark a file-keyed tool as *writing* its target.
-const WRITE_HINTS: &[&str] = &["edit", "write", "patch", "notebook", "replace", "create", "save"];
-/// Name fragments that mark a file-keyed tool as *reading* its target.
-const READ_HINTS: &[&str] = &["read", "grep", "glob", "search", "cat", "view", "list"];
-
-/// Input keys (across harnesses) whose string value is the tool's file target.
-const FILE_KEYS: &[&str] = &[
-    "file_path",
-    "absolute_path",
-    "filePath",
-    "notebook_path",
-    "target_file",
-    "path",
-];
 
 /// One normalized thing a session did, extracted from a message's tool blocks.
 ///
@@ -343,6 +327,35 @@ impl EventExtractor {
         Ok(())
     }
 
+    fn note_exec_target(&mut self, target: &str) -> Result<()> {
+        if Path::new(target).is_absolute() {
+            self.inferred_edits.insert(format!("ea{target}"))?;
+        } else {
+            let rel = target.trim_start_matches("./");
+            if !rel.is_empty() {
+                self.inferred_edits.insert(format!("er/{rel}"))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn has_inferred_edit(&mut self, id: &str, path: &str) -> Result<bool> {
+        if self.inferred_edits.contains(&Self::target_key(id, path))? {
+            return Ok(true);
+        }
+        if id.starts_with("exec-") {
+            if self.inferred_edits.contains(&format!("ea{path}"))? {
+                return Ok(true);
+            }
+            for (idx, b) in path.bytes().enumerate() {
+                if b == b'/' && self.inferred_edits.contains(&format!("er{}", &path[idx..]))? {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
     fn complete(&mut self, id: &str) -> Result<()> {
         if self.inferred_edits.contains(&format!("c{id}"))? && self.completed.insert(format!("c{id}"))? {
             self.pending = self.pending.saturating_sub(1);
@@ -398,10 +411,7 @@ fn extract_message(
         if let Some(id) = edit.id {
             let paths: std::collections::BTreeSet<_> = edit.paths.iter().map(|path| absolutize(path, cwd)).collect();
             for path in paths {
-                if !extractor
-                    .inferred_edits
-                    .contains(&EventExtractor::target_key(id, &path))?
-                {
+                if !extractor.has_inferred_edit(id, &path)? {
                     staged.push(Event {
                         msg_idx,
                         ts,
@@ -423,6 +433,9 @@ fn extract_message(
                 for event in staged[before..].iter().filter(|event| event.kind == "file_edit") {
                     if let Some(target) = &event.target {
                         extractor.note_target(id, target)?;
+                        if name == "exec" {
+                            extractor.note_exec_target(target)?;
+                        }
                     }
                 }
             }
@@ -497,51 +510,42 @@ pub(crate) fn extract_call_into(
     Ok(())
 }
 
-/// Heuristic cross-harness classification of one tool invocation into `(kind, target)` rows.
-/// Usually one row; an `apply_patch` body yields one `file_edit` per patched file.
+/// Cross-harness classification of one tool invocation into `(kind, target)` rows via
+/// [`crate::tools::classify::visit_tool_ops`].
 fn classify_tool_view(
     name: &str,
     input: JsonView<'_>,
     cwd: Option<&Path>,
     commands: bool,
 ) -> Result<Vec<(&'static str, Option<String>)>> {
-    let workdir = arguments::file_key(input, &["workdir", "cwd"])?.map(|path| PathBuf::from(absolutize(&path, cwd)));
-    let cwd = workdir.as_deref().or(cwd);
-    let lname = name.to_ascii_lowercase();
-    if lname.contains("patch") {
-        let files = arguments::patch_rows(input)?;
-        if !files.is_empty() {
-            return Ok(files
-                .into_iter()
-                .map(|file| ("file_edit", Some(absolutize(&file, cwd))))
-                .collect());
+    use crate::tools::classify::{ClassifyOpts, ToolOp};
+    let opts = if commands {
+        ClassifyOpts::EVENTS
+    } else {
+        ClassifyOpts::COUNTS
+    };
+    let mut rows = Vec::new();
+    let mut fallback_path = None;
+    crate::tools::classify::visit_tool_ops(None, name, input, opts, |sem| match sem.op {
+        ToolOp::Command { cmd, .. } => rows.push(("command", cmd.map(std::borrow::Cow::into_owned))),
+        ToolOp::FileEdit { path, .. } => rows.push(("file_edit", Some(absolutize(&path, cwd)))),
+        ToolOp::FileRead { path } | ToolOp::Search { path: Some(path), .. } => {
+            rows.push(("file_read", Some(absolutize(&path, cwd))));
         }
+        ToolOp::Other { path: Some(path), .. } if fallback_path.is_none() => {
+            fallback_path = Some(absolutize(&path, cwd));
+        }
+        _ => {}
+    })?;
+    if rows.is_empty() {
+        rows.push(("tool", fallback_path));
     }
-    if let Some(path) = arguments::file_key(input, FILE_KEYS)? {
-        let kind = if WRITE_HINTS.iter().any(|hint| lname.contains(hint)) {
-            "file_edit"
-        } else if READ_HINTS.iter().any(|hint| lname.contains(hint)) {
-            "file_read"
-        } else {
-            "tool"
-        };
-        return Ok(vec![(kind, Some(absolutize(&path, cwd)))]);
-    }
-    if let Some((command, files)) = arguments::command_rows(input, commands)? {
-        let mut rows = vec![("command", command)];
-        rows.extend(
-            files
-                .into_iter()
-                .map(|file| ("file_edit", Some(absolutize(&file, cwd)))),
-        );
-        return Ok(rows);
-    }
-    Ok(vec![("tool", None)])
+    Ok(rows)
 }
 
 /// Full command projection: the string a `command` event's target holds.
 pub(crate) fn command_of_json(input: &Json) -> Result<Option<String>> {
-    input.with_view(arguments::command_string)
+    input.with_view(crate::tools::classify::command_string)
 }
 
 /// Lexically absolutize `p` against the session cwd. Already-absolute paths pass through; with no
@@ -1782,7 +1786,38 @@ mod tests {
     }
 
     fn patch_targets(patch: &str) -> Vec<String> {
-        arguments::patch_rows(crate::json::JsonView::from(&json!(patch))).unwrap()
+        crate::tools::classify::patch_rows(crate::json::JsonView::from(&json!(patch))).unwrap()
+    }
+
+    #[test]
+    fn codex_code_mode_exec_extracts_commands_patches_and_reads() {
+        let script = r#"
+const patch = [
+  "*** Begin Patch",
+  "*** Update File: src/main.rs",
+  "*** Add File: src/new.rs",
+  "*** End Patch",
+].join("\n");
+await tools.apply_patch(patch);
+await tools.exec_command({ cmd: "cargo test --lib", workdir: "/repo" });
+await tools.view_image({ path: "docs/arch.png" });
+"#;
+        let m = msg(vec![tool_use("exec", json!(script))]);
+        let ev = extract(&m, 3, Some(Path::new("/repo")), &crate::lazy::Resolver::new(None)).unwrap();
+        assert_eq!(ev.len(), 4);
+        assert!(ev[0].call);
+        assert!(!ev[1].call && !ev[2].call && !ev[3].call);
+        assert_eq!(
+            ev.iter()
+                .map(|e| (e.kind, e.tool.as_deref().unwrap(), e.target.as_deref().unwrap()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("file_edit", "exec", "/repo/src/main.rs"),
+                ("file_edit", "exec", "/repo/src/new.rs"),
+                ("command", "exec", "cargo test --lib"),
+                ("file_read", "exec", "/repo/docs/arch.png"),
+            ]
+        );
     }
 
     #[test]

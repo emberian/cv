@@ -37,16 +37,9 @@
       },
       "tool_histogram": {
         "tools": {
-          "apply_patch": {
-            "calls": 0,
-            "edits": 1,
-            "reads": 0,
-            "commands": 0,
-            "errors": 0
-          },
           "exec": {
             "calls": 1,
-            "edits": 0,
+            "edits": 1,
             "reads": 0,
             "commands": 0,
             "errors": 0
@@ -154,7 +147,7 @@
         "tools": {
           "exec": {
             "calls": 2,
-            "edits": 0,
+            "edits": 2,
             "reads": 0,
             "commands": 0,
             "errors": 0
@@ -298,7 +291,7 @@
             "calls": 2,
             "edits": 0,
             "reads": 0,
-            "commands": 0,
+            "commands": 2,
             "errors": 0
           }
         },

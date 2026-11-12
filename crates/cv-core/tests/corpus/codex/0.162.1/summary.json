@@ -123,18 +123,11 @@
       },
       "tool_histogram": {
         "tools": {
-          "apply_patch": {
-            "calls": 0,
-            "edits": 1,
-            "reads": 0,
-            "commands": 0,
-            "errors": 0
-          },
           "exec": {
             "calls": 10,
-            "edits": 0,
+            "edits": 3,
             "reads": 0,
-            "commands": 0,
+            "commands": 5,
             "errors": 0
           }
         },
@@ -447,7 +440,7 @@
             "calls": 3,
             "edits": 0,
             "reads": 0,
-            "commands": 0,
+            "commands": 3,
             "errors": 0
           }
         },

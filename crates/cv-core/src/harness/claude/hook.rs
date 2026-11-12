@@ -25,13 +25,23 @@ pub(super) fn hook_event(v: &Value) -> Result<Option<Event>> {
             last_message: p.last_assistant_message.clone(),
         }
     });
-    let edits = p
-        .tool_input
-        .as_ref()
-        .and_then(|tool| tool.get("file_path").or_else(|| tool.get("notebook_path")))
-        .and_then(Value::as_str)
-        .map(|s| vec![s.to_string()])
-        .unwrap_or_default();
+    let mut edits = Vec::new();
+    if let Some(tool) = &p.tool_input {
+        let name = p.tool_name.as_deref().unwrap_or("Edit");
+        crate::tools::classify::visit_tool_ops(
+            Some(Harness::Claude),
+            name,
+            crate::json::JsonView::from(tool),
+            crate::tools::classify::ClassifyOpts::COUNTS,
+            |sem| {
+                if let crate::tools::classify::ToolOp::FileEdit { path, .. } = sem.op {
+                    edits.push(path.into_owned());
+                }
+            },
+        )?;
+        edits.sort();
+        edits.dedup();
+    }
     Ok(Some(Event {
         harness: Harness::Claude,
         session: SessionRef::new(p.session_id, Harness::Claude, transcript.unwrap_or_default()),

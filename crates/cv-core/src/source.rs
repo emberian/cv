@@ -235,7 +235,7 @@ impl std::hash::Hash for Entry {
 /// results as turns; 0.17 wrote 4). Two byte layouts are versioned apart because they are not
 /// rebuilt from transcripts: the task log (durable user data) and a watch cursor (a follower's
 /// position).
-pub const VERSION: u32 = 9;
+pub const VERSION: u32 = 10;
 
 /// Version identity for non-Record read state; keep the same interpretation authority.
 pub(crate) fn consumer_version(consumer: impl std::fmt::Display) -> String {

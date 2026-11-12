@@ -628,30 +628,43 @@ pub fn classify_api_error(e: &ApiErrorNotice) -> Option<&'static str> {
 
 /// One line for a tool call: the tool name plus the argument a reader would look at first.
 pub fn tool_summary(name: &str, input: &crate::json::Json) -> Result<String> {
-    let arg = input.with_view(|view| {
-        for key in [
-            "command",
-            "file_path",
-            "path",
-            "pattern",
-            "query",
-            "description",
-            "prompt",
-            "url",
-            "skill",
-        ] {
-            let Some(value) = view.get(key)? else { continue };
-            if let Some(head) = crate::projection::Head::of_string(value, 80)? {
-                return Ok(head);
+    tool_summary_for(None, name, input)
+}
+
+fn tool_summary_for(harness: Option<crate::ir::Harness>, name: &str, input: &crate::json::Json) -> Result<String> {
+    input.with_view(|view| crate::tools::classify::compact_label(harness, name, view, 80))
+}
+
+fn tool_endpoint(harness: Option<crate::ir::Harness>, name: &str, input: &crate::json::Json) -> Result<Option<String>> {
+    input.with_view(|view| {
+        if !view.is_string()? {
+            for key in ["command", "cmd", "script", "CommandLine"] {
+                if let Some(val) = view.get(key)? {
+                    if let Some(ep) = endpoint_from(val)? {
+                        return Ok(Some(ep));
+                    }
+                }
             }
         }
-        let head = crate::projection::Head::of_json(view, 80)?;
-        Ok(if head == "{}" { String::new() } else { head })
-    })?;
-    Ok(if arg.is_empty() {
-        name.to_string()
-    } else {
-        format!("{name} · {arg}")
+        let mut cmds = Vec::new();
+        crate::tools::classify::visit_tool_ops(
+            harness,
+            name,
+            view,
+            crate::tools::classify::ClassifyOpts::EVENTS,
+            |sem| {
+                if let crate::tools::classify::ToolOp::Command { cmd: Some(cmd), .. } = sem.op {
+                    cmds.push(cmd.into_owned());
+                }
+            },
+        )?;
+        for cmd in cmds {
+            let val = serde_json::Value::String(cmd);
+            if let Some(ep) = endpoint_from(crate::json::JsonView::from(&val))? {
+                return Ok(Some(ep));
+            }
+        }
+        Ok(None)
     })
 }
 
@@ -798,14 +811,12 @@ fn pass(r: &SessionRef) -> Result<Pass> {
                 for b in &m.content {
                     if let Block::ToolUse { name, input, .. } = b {
                         p.tool_calls += 1;
-                        p.last_tool = Some(tool_summary(name, input)?);
+                        p.last_tool = Some(tool_summary_for(Some(r.harness), name, input)?);
                         // Only the lane's OWN shell commands name its endpoint. An `Agent` prompt
                         // or a `Write`n brief that carries `export CV_ENDPOINT=lane:child` is the
                         // CHILD's export; scanning the whole input joined the parent to it.
                         if p.endpoint.is_none() {
-                            p.endpoint = input.with_view(|view| {
-                                view.get("command")?.map(endpoint_from).transpose().map(Option::flatten)
-                            })?;
+                            p.endpoint = tool_endpoint(Some(r.harness), name, input)?;
                         }
                     }
                 }
@@ -1359,6 +1370,40 @@ mod tests {
         assert_eq!(
             tool_summary("TaskStop", &serde_json::json!({}).into()).unwrap(),
             "TaskStop"
+        );
+        assert_eq!(
+            tool_summary_for(
+                Some(crate::ir::Harness::Codex),
+                "exec",
+                &serde_json::json!(
+                    "await tools.exec_command({ cmd: 'export CV_ENDPOINT=lane:worker && cargo test' });"
+                )
+                .into(),
+            )
+            .unwrap(),
+            "exec · export CV_ENDPOINT=lane:worker && cargo test"
+        );
+        assert_eq!(
+            tool_endpoint(
+                Some(crate::ir::Harness::Codex),
+                "exec",
+                &serde_json::json!(
+                    "await tools.exec_command({ cmd: 'export CV_ENDPOINT=lane:worker && cv task inbox' });"
+                )
+                .into(),
+            )
+            .unwrap()
+            .as_deref(),
+            Some("lane:worker")
+        );
+        assert_eq!(
+            tool_endpoint(
+                Some(crate::ir::Harness::Claude),
+                "Agent",
+                &serde_json::json!({"prompt": "export CV_ENDPOINT=lane:child"}).into(),
+            )
+            .unwrap(),
+            None
         );
     }
 }
