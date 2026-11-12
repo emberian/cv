@@ -38,6 +38,10 @@ toml.workspace = true
 # Line splitting on the parse paths (a byte loop was a quarter of a codex parse). Already in the
 # tree through regex.
 memchr = "2"
+# Content-addressed digests for sealed multi-record packs; pure Rust keeps wasm32/i686 C-free.
+blake3 = { version = "1.8.7", features = ["pure"] }
+# Vectorized UTF-8 validation on slice and streaming boundaries (portable scalar on non-simd wasm32).
+simdutf8 = "0.1.5"
 # Floor at 0.9.11 — RUSTSEC-2026-0186 patched there (advisory against 0.9.10).
 memmap2 = { version = ">=0.9.11, <0.10", optional = true }
 
