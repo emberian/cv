@@ -846,6 +846,10 @@ impl ColumnarEventStore {
         if cv_core::env::frozen() {
             return Ok(());
         }
+        self.manifest = ColumnarManifest::default();
+        if !self.dir.exists() {
+            return Ok(());
+        }
         if let Ok(entries) = std::fs::read_dir(&self.dir) {
             for e in entries.flatten() {
                 if e.path().extension().is_some_and(|ext| ext == "clev") {
@@ -853,7 +857,6 @@ impl ColumnarEventStore {
                 }
             }
         }
-        self.manifest = ColumnarManifest::default();
         self.manifest.save_atomic(&self.dir)
     }
 
@@ -879,8 +882,15 @@ impl ColumnarEventStore {
             .collect()
     }
 
-    /// Whether session `r` under `prov` needs event re-ingestion relative to its stored baseline.
-    pub fn needs_ingest(&self, r: &cv_core::SessionRef, prov: &Provenance) -> bool {
+    /// Whether session `r` under `prov` needs event re-ingestion relative to its stored baseline,
+    /// reusing a caller-supplied [`cv_core::source::Baseline`] and [`cv_core::source::Probe`].
+    pub fn needs_ingest_with_probe(
+        &self,
+        r: &cv_core::SessionRef,
+        source: &cv_core::source::Baseline,
+        prov: &Provenance,
+        probe: &mut cv_core::source::Probe,
+    ) -> bool {
         let key = session_key(r.harness.as_str(), &r.id);
         let Some(state) = self.manifest.sessions.get(&key) else {
             return true;
@@ -888,9 +898,14 @@ impl ColumnarEventStore {
         if state.authority != AuthoritySnapshot::of(r, prov) {
             return true;
         }
+        !(state.baseline.fresh(source, probe) || state.baseline.rows_fresh(r, source, probe))
+    }
+
+    /// Whether session `r` under `prov` needs event re-ingestion relative to its stored baseline.
+    pub fn needs_ingest(&self, r: &cv_core::SessionRef, prov: &Provenance) -> bool {
         let mut probe = cv_core::source::Probe::default();
         let now = probe.snapshot(r);
-        !(state.baseline.fresh(&now, &mut probe) || state.baseline.rows_fresh(r, &now, &mut probe))
+        self.needs_ingest_with_probe(r, &now, prov, &mut probe)
     }
 
     /// Record one session's events from `from` (0 = full replacement / rewind; >0 = suffix
@@ -2402,5 +2417,175 @@ mod tests {
         forged2[footer_start + 56..footer_start + 60].copy_from_slice(&crc2.to_le_bytes());
         std::fs::write(&seg_path, &forged2).unwrap();
         assert!(ClevReader::open(&seg_path).is_err());
+    }
+
+    #[test]
+    fn columnar_events_sweep_lifecycle_out_of_band_sql_wipe_vanished_and_rebuild() {
+        use std::io::Write;
+        let tmp = ScratchDir::new();
+        let home = tmp.path().join("cv-home");
+        std::fs::create_dir_all(&home).unwrap();
+        let _env = cv_core::env::Env::from_vars([
+            ("CLUSTERVISION_HOME", home.to_str().unwrap()),
+            ("CLUSTERVISION_CACHE", home.to_str().unwrap()),
+        ])
+        .enter();
+
+        let tantivy_dir = home.join("tantivy");
+        let sessions_dir = tmp.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let pa = sessions_dir.join("sess-a.jsonl");
+        let a = write_claude_session(
+            &pa,
+            "sess-a",
+            "/repo/life",
+            &[json!({
+                "type": "assistant",
+                "sessionId": "sess-a",
+                "timestamp": "2026-10-03T10:00:00Z",
+                "message": {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "a1",
+                        "name": "Read",
+                        "input": { "file_path": "src/alpha_prefix.rs" }
+                    }]
+                }
+            })],
+        );
+        let pb = sessions_dir.join("sess-b.jsonl");
+        let b = write_claude_session(
+            &pb,
+            "sess-b",
+            "/repo/life",
+            &[json!({
+                "type": "assistant",
+                "sessionId": "sess-b",
+                "timestamp": "2026-10-03T10:01:00Z",
+                "message": {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "b1",
+                        "name": "Read",
+                        "input": { "file_path": "src/beta_vanish.rs" }
+                    }]
+                }
+            })],
+        );
+
+        // (i) Pre-ingest `a` into SQLite `events` out-of-band (leaving `events_columnar/` empty),
+        //     then run `index_sessions`: both `a` and `b` must populate `ColumnarEventStore`.
+        cv_core::events::ingest_ref(&a).unwrap();
+        assert!(!cv_core::events::needs_ingest(&a));
+        crate::index_sessions(Some(tantivy_dir.clone()), &[a.clone(), b.clone()], false, false).unwrap();
+
+        let col = ColumnarEventStore::open(crate::default_columnar_events_dir()).unwrap();
+        for sid in ["sess-a", "sess-b"] {
+            assert_event_rows_eq(
+                &col.events_for("claude", sid, None).unwrap(),
+                &cv_core::events::events_for("claude", sid, None).unwrap(),
+            );
+        }
+
+        // (ii) Wipe `events_columnar/` on disk, append a turn to `a` (so `a` grows past its mark
+        //      while SQLite can resume `a` and `b` is fresh in Tantivy + SQLite), then run an
+        //      incremental `index_sessions`: `a` must carry full prefix + suffix in columnar store,
+        //      and `b` must also be backfilled!
+        std::fs::remove_dir_all(crate::default_columnar_events_dir()).unwrap();
+        {
+            let mut f = std::fs::OpenOptions::new().append(true).open(&pa).unwrap();
+            writeln!(
+                f,
+                "{}",
+                json!({
+                    "type": "assistant",
+                    "sessionId": "sess-a",
+                    "timestamp": "2026-10-03T10:05:00Z",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{
+                            "type": "tool_use",
+                            "id": "a2",
+                            "name": "Read",
+                            "input": { "file_path": "src/alpha_suffix.rs" }
+                        }]
+                    }
+                })
+            )
+            .unwrap();
+        }
+        crate::index_sessions(Some(tantivy_dir.clone()), &[a.clone(), b.clone()], false, false).unwrap();
+
+        let col = ColumnarEventStore::open(crate::default_columnar_events_dir()).unwrap();
+        let a_col = col.events_for("claude", "sess-a", None).unwrap();
+        let a_sql = cv_core::events::events_for("claude", "sess-a", None).unwrap();
+        assert_eq!(a_col.len(), 2, "must hold both prefix and suffix events for sess-a");
+        assert_event_rows_eq(&a_col, &a_sql);
+        assert_event_rows_eq(
+            &col.events_for("claude", "sess-b", None).unwrap(),
+            &cv_core::events::events_for("claude", "sess-b", None).unwrap(),
+        );
+        assert_touched_eq(
+            &col.sessions_touching("src/alpha_prefix.rs", false).unwrap(),
+            &cv_core::events::sessions_touching("src/alpha_prefix.rs", false).unwrap(),
+        );
+        assert_touched_eq(
+            &col.sessions_touching("src/alpha_suffix.rs", false).unwrap(),
+            &cv_core::events::sessions_touching("src/alpha_suffix.rs", false).unwrap(),
+        );
+
+        // (iii) Delete `b` from disk and run incremental `index_sessions(&[a])`: `b` must be reaped
+        //       from `ColumnarEventStore` alongside Tantivy.
+        std::fs::remove_file(&pb).unwrap();
+        crate::index_sessions(Some(tantivy_dir.clone()), std::slice::from_ref(&a), false, false).unwrap();
+
+        let col = ColumnarEventStore::open(crate::default_columnar_events_dir()).unwrap();
+        assert!(col.events_for("claude", "sess-b", None).unwrap().is_empty());
+        assert!(col.sessions_touching("src/beta_vanish.rs", false).unwrap().is_empty());
+        assert_eq!(col.events_for("claude", "sess-a", None).unwrap().len(), 2);
+
+        // (iv) Seed an orphaned session directly into `ColumnarEventStore`, then run
+        //      `index_sessions(..., rebuild = true)`: orphan must be cleared and `a` preserved.
+        let p_orphan = sessions_dir.join("orphan.jsonl");
+        let orphan = write_claude_session(
+            &p_orphan,
+            "sess-orphan",
+            "/repo/life",
+            &[json!({
+                "type": "assistant",
+                "sessionId": "sess-orphan",
+                "timestamp": "2026-10-03T10:10:00Z",
+                "message": {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "o1",
+                        "name": "Read",
+                        "input": { "file_path": "src/orphan_only.rs" }
+                    }]
+                }
+            })],
+        );
+        {
+            let mut cs = ColumnarEventStore::open(crate::default_columnar_events_dir()).unwrap();
+            cs.sync_sessions(std::slice::from_ref(&orphan), false, false).unwrap();
+            assert_eq!(cs.events_for("claude", "sess-orphan", None).unwrap().len(), 1);
+        }
+        std::fs::remove_file(&p_orphan).unwrap();
+
+        crate::index_sessions(Some(tantivy_dir), std::slice::from_ref(&a), true, false).unwrap();
+        let col = ColumnarEventStore::open(crate::default_columnar_events_dir()).unwrap();
+        assert!(
+            col.events_for("claude", "sess-orphan", None).unwrap().is_empty(),
+            "rebuild=true must clear orphaned sessions from columnar store"
+        );
+        assert!(col.sessions_touching("src/orphan_only.rs", false).unwrap().is_empty());
+        assert_event_rows_eq(
+            &col.events_for("claude", "sess-a", None).unwrap(),
+            &cv_core::events::events_for("claude", "sess-a", None).unwrap(),
+        );
     }
 }

@@ -1202,8 +1202,10 @@ impl Searchable for VerifyStreamAdapter<'_> {
 struct VerifySink {
     primary_path: PathBuf,
     need_title: bool,
+    need_cwd: bool,
     first_prompt: Option<String>,
     meta_title: Option<String>,
+    cwd: Option<String>,
     copied_before: Option<chrono::DateTime<chrono::Utc>>,
     resolver: cv_core::Resolver,
     dependencies: cv_core::source::ReadSet,
@@ -1223,6 +1225,7 @@ impl VerifySink {
         scope: Scope,
         case_sensitive: bool,
         need_title: bool,
+        need_cwd: bool,
         meter_limit: Option<u64>,
     ) -> Self {
         let exchange =
@@ -1232,8 +1235,10 @@ impl VerifySink {
         Self {
             primary_path: cv_core::source::primary_path(r),
             need_title,
+            need_cwd,
             first_prompt: None,
             meta_title: None,
+            cwd: r.cwd.as_ref().map(|p| p.display().to_string()),
             copied_before: None,
             resolver: cv_core::Resolver::new(Some(r.path.clone())),
             dependencies: Default::default(),
@@ -1271,6 +1276,9 @@ impl MessageSink for VerifySink {
 
     fn meta(&mut self, s: &cv_core::Session) {
         self.meta_title = s.title.clone();
+        if self.cwd.is_none() {
+            self.cwd = s.cwd.as_ref().map(|p| p.display().to_string());
+        }
     }
 
     fn message(&mut self, m: cv_core::Message) -> Flow {
@@ -1335,7 +1343,10 @@ impl MessageSink for VerifySink {
             }
         }
         self.resolver = r;
-        if self.any_done() && (!self.need_title || self.first_prompt.is_some()) {
+        if self.any_done()
+            && (!self.need_title || self.first_prompt.is_some())
+            && (!self.need_cwd || self.cwd.is_some())
+        {
             Flow::Stop
         } else {
             Flow::Continue
@@ -1345,6 +1356,9 @@ impl MessageSink for VerifySink {
 
 struct VerifiedMatch {
     title: String,
+    cwd: Option<String>,
+    created_at: Option<i64>,
+    updated_at: Option<i64>,
     snippet: String,
     metered_bytes: u64,
 }
@@ -1353,6 +1367,7 @@ struct VerifiedMatch {
 fn verify_session_exact(
     r: &cv_core::SessionRef,
     known_title: Option<&str>,
+    required_cwd: Option<&str>,
     expected_baseline: Option<&cv_core::source::Baseline>,
     needle: &str,
     scope: Scope,
@@ -1371,7 +1386,8 @@ fn verify_session_exact(
     }
 
     let need_title = known_title.is_none();
-    let mut sink = VerifySink::new(r, needle, scope, case_sensitive, need_title, meter_limit);
+    let need_cwd = required_cwd.is_some() && r.cwd.is_none();
+    let mut sink = VerifySink::new(r, needle, scope, case_sensitive, need_title, need_cwd, meter_limit);
     sink.copied_before = adapter.copied_before(r, &mut sink);
     let session_meta = adapter
         .try_stream(r, &Demand::LEAN.with_spans(), &mut sink)
@@ -1389,6 +1405,15 @@ fn verify_session_exact(
             return Ok(None);
         }
     }
+
+    let resolved_cwd = sink.cwd.or_else(|| session_meta.cwd.map(|p| p.display().to_string()));
+    if let Some(cwd_sub) = required_cwd {
+        if !resolved_cwd.as_deref().is_some_and(|c| c.contains(cwd_sub)) {
+            return Ok(None);
+        }
+    }
+    let created_at = r.created_at.or(session_meta.created_at).map(|t| t.timestamp());
+    let updated_at = r.updated_at.or(session_meta.updated_at).map(|t| t.timestamp());
 
     let title = match known_title {
         Some(t) => t.to_string(),
@@ -1411,6 +1436,9 @@ fn verify_session_exact(
     if let Some(ex) = body_excerpt {
         return Ok(Some(VerifiedMatch {
             title,
+            cwd: resolved_cwd,
+            created_at,
+            updated_at,
             snippet: snippet(&ex.text, ex.at, ex.len),
             metered_bytes: sink.metered_bytes,
         }));
@@ -1423,6 +1451,9 @@ fn verify_session_exact(
             return Ok(Some(VerifiedMatch {
                 snippet: snippet(&ex.text, ex.at, ex.len),
                 title,
+                cwd: resolved_cwd,
+                created_at,
+                updated_at,
                 metered_bytes: sink.metered_bytes,
             }));
         }
@@ -1440,10 +1471,21 @@ fn expand_sessions(
     let mut chosen: HashMap<String, (cv_core::SessionRef, cv_core::events::Provenance)> = HashMap::new();
     let mut order: Vec<String> = Vec::new();
 
-    let mut insert = |r: cv_core::SessionRef, prov: cv_core::events::Provenance| {
-        if !chosen.contains_key(&r.id) {
+    let mut insert = |r: cv_core::SessionRef, prov: cv_core::events::Provenance| match chosen.get_mut(&r.id) {
+        None => {
             order.push(r.id.clone());
             chosen.insert(r.id.clone(), (r, prov));
+        }
+        Some((old, old_prov)) => {
+            if (!r.path.exists())
+                .cmp(&(!old.path.exists()))
+                .then_with(|| r.preferred_copy_cmp(old))
+                .then_with(|| prov.parent_id.cmp(&old_prov.parent_id))
+                .is_lt()
+            {
+                *old = r;
+                *old_prov = prov;
+            }
         }
     };
 
@@ -1810,37 +1852,20 @@ pub fn search(
     let cq = canon_bytes(query);
     let mut probe = cv_core::source::Probe::default();
 
-    // 1. Identify stale / unindexed sessions in `refs` against `manifest`.
+    // 1. Identify stale / unindexed sessions in `refs` (widening folded subagents when the
+    //    manifest holds `--subagents`) against `manifest`.
+    let fold_subagents = manifest.as_ref().is_some_and(|m| m.has_subagents);
+    let candidates = expand_sessions(refs, fold_subagents)?;
     let newest_indexed = manifest
         .as_ref()
         .and_then(|m| m.sessions.values().filter(|p| p.size >= 0).map(|p| p.mtime).max())
         .unwrap_or(0);
     let mut newest_on_disk = 0i64;
-    let mut stale_refs: Vec<(cv_core::SessionRef, i64, Option<u64>)> = Vec::new();
-    let mut seen_ref_ids = HashSet::new();
+    let mut stale_refs: Vec<(cv_core::SessionRef, cv_core::events::Provenance, i64, Option<u64>)> = Vec::new();
     let mut stale_ids = HashSet::new();
 
-    for r in refs {
-        if !seen_ref_ids.insert(r.id.clone()) {
-            continue;
-        }
-        if let Some(h) = harness_filter {
-            if r.harness.as_str() != h {
-                continue;
-            }
-        }
-        if let Some(cwd_sub) = opts.filter.cwd {
-            if !r.cwd.as_ref().is_some_and(|p| p.to_string_lossy().contains(cwd_sub)) {
-                continue;
-            }
-        }
-        if let Some(ids) = allowed_ids {
-            if !ids.contains(&r.id) {
-                continue;
-            }
-        }
-
-        let snap = probe.snapshot(r);
+    for (r, prov) in candidates {
+        let snap = probe.snapshot(&r);
         let mtime = snap.primary.map_or(0, |id| id.mtime_ns as i64);
         newest_on_disk = newest_on_disk.max(mtime);
 
@@ -1849,20 +1874,44 @@ pub fn search(
             .and_then(|m| m.sessions.get(&r.id))
             .is_some_and(|ptr| {
                 ptr.path == r.path
-                    && (ptr.baseline.fresh(&snap, &mut probe) || ptr.baseline.rows_fresh(r, &snap, &mut probe))
+                    && (ptr.baseline.fresh(&snap, &mut probe) || ptr.baseline.rows_fresh(&r, &snap, &mut probe))
             });
 
         if !is_fresh {
-            suffix.stale += 1;
             stale_ids.insert(r.id.clone());
+        }
+
+        if let Some(h) = harness_filter {
+            if r.harness.as_str() != h {
+                continue;
+            }
+        }
+        if let Some(cwd_sub) = opts.filter.cwd {
+            // Only fast-reject when discovery already knows `r.cwd`; if `r.cwd` is `None`,
+            // defer to the indexed segment metadata (if fresh) or `VerifySink` (if stale/live).
+            if let Some(ref rcwd) = r.cwd {
+                if !rcwd.to_string_lossy().contains(cwd_sub) {
+                    continue;
+                }
+            }
+        }
+        if let Some(ids) = allowed_ids {
+            let admitted = ids.contains(&r.id) || prov.parent_id.as_ref().is_some_and(|p| ids.contains(p));
+            if !admitted {
+                continue;
+            }
+        }
+
+        if !is_fresh {
+            suffix.stale += 1;
             let known_cost = cv_core::harness::for_harness(r.harness).and_then(|ad| {
-                if ad.sqlite_source(r) == Some(true) {
+                if ad.sqlite_source(&r) == Some(true) {
                     None
                 } else {
                     Some(snap.primary_len())
                 }
             });
-            stale_refs.push((r.clone(), mtime, known_cost));
+            stale_refs.push((r, prov, mtime, known_cost));
         }
     }
     suffix.behind_ns = newest_on_disk.saturating_sub(newest_indexed);
@@ -1875,13 +1924,14 @@ pub fn search(
 
     // 2. Live tail verification for stale/unindexed sessions within `opts.live` budget.
     if opts.live != LiveRead::Frozen && !stale_refs.is_empty() {
-        stale_refs.sort_by_key(|(r, mtime, _)| std::cmp::Reverse((*mtime, r.updated_at)));
+        stale_refs.sort_by_key(|(r, _, mtime, _)| std::cmp::Reverse((*mtime, r.updated_at)));
         let mut remaining = match opts.live {
             LiveRead::All => u64::MAX,
             LiveRead::Within(budget, _) => budget,
             LiveRead::Frozen => 0,
         };
-        for (r, _, known_cost) in stale_refs {
+        for (mut r, prov, _, known_cost) in stale_refs {
+            let is_folded = prov.parent_id.is_some();
             match known_cost {
                 Some(cost) if cost > remaining => {
                     suffix.cut += 1;
@@ -1893,6 +1943,7 @@ pub fn search(
                     match verify_session_exact(
                         &r,
                         None,
+                        opts.filter.cwd,
                         None,
                         query,
                         opts.filter.scope,
@@ -1904,19 +1955,22 @@ pub fn search(
                             remaining -= cost;
                             suffix.read += 1;
                             suffix.bytes += cost;
+                            if r.cwd.is_none() {
+                                r.cwd = m.cwd.as_deref().map(PathBuf::from);
+                            }
                             hits.push(Hit {
                                 id: r.id.clone(),
                                 harness: r.harness.as_str().to_string(),
-                                cwd: r.cwd.as_ref().map(|p| p.display().to_string()),
+                                cwd: m.cwd,
                                 title: Some(m.title),
                                 score: 1.0,
                                 snippet: m.snippet,
-                                created_at: r.created_at.map(|t| t.timestamp()),
-                                updated_at: r.updated_at.map(|t| t.timestamp()),
-                                parent_id: None,
-                                agent_id: None,
-                                workflow: None,
-                                session: Some(r),
+                                created_at: m.created_at,
+                                updated_at: m.updated_at,
+                                parent_id: prov.parent_id,
+                                agent_id: prov.agent_id,
+                                workflow: prov.workflow,
+                                session: (!is_folded).then_some(r),
                             });
                         }
                         Ok(None) => {
@@ -1935,6 +1989,7 @@ pub fn search(
                     match verify_session_exact(
                         &r,
                         None,
+                        opts.filter.cwd,
                         None,
                         query,
                         opts.filter.scope,
@@ -1947,19 +2002,22 @@ pub fn search(
                             remaining -= spent;
                             suffix.read += 1;
                             suffix.bytes += spent;
+                            if r.cwd.is_none() {
+                                r.cwd = m.cwd.as_deref().map(PathBuf::from);
+                            }
                             hits.push(Hit {
                                 id: r.id.clone(),
                                 harness: r.harness.as_str().to_string(),
-                                cwd: r.cwd.as_ref().map(|p| p.display().to_string()),
+                                cwd: m.cwd,
                                 title: Some(m.title),
                                 score: 1.0,
                                 snippet: m.snippet,
-                                created_at: r.created_at.map(|t| t.timestamp()),
-                                updated_at: r.updated_at.map(|t| t.timestamp()),
-                                parent_id: None,
-                                agent_id: None,
-                                workflow: None,
-                                session: Some(r),
+                                created_at: m.created_at,
+                                updated_at: m.updated_at,
+                                parent_id: prov.parent_id,
+                                agent_id: prov.agent_id,
+                                workflow: prov.workflow,
+                                session: (!is_folded).then_some(r),
                             });
                         }
                         Ok(None) => {
@@ -2025,6 +2083,7 @@ pub fn search(
                 if let Ok(Some(m)) = verify_session_exact(
                     &doc_ref,
                     Some(&meta.title),
+                    None,
                     Some(&meta.baseline),
                     query,
                     opts.filter.scope,
@@ -2164,14 +2223,15 @@ mod tests {
                     continue;
                 }
             }
+            let Some((exchange_body, context_body, title, parsed_cwd)) = materialize_scoped_streams(&r) else {
+                continue;
+            };
             if let Some(c) = cwd {
-                if !r.cwd.as_ref().is_some_and(|p| p.to_string_lossy().contains(c)) {
+                let eff_cwd = r.cwd.as_ref().map(|p| p.display().to_string()).or(parsed_cwd);
+                if !eff_cwd.as_deref().is_some_and(|p| p.contains(c)) {
                     continue;
                 }
             }
-            let Some((exchange_body, context_body, title)) = materialize_scoped_streams(&r) else {
-                continue;
-            };
             let matches_str = |hay: &str| -> bool {
                 if case_sensitive {
                     hay.contains(query)
@@ -2191,13 +2251,14 @@ mod tests {
         out
     }
 
-    fn materialize_scoped_streams(r: &SessionRef) -> Option<(String, String, String)> {
+    fn materialize_scoped_streams(r: &SessionRef) -> Option<(String, String, String, Option<String>)> {
         struct FullCollector {
             exchange: String,
             context: String,
             in_context: bool,
             first_prompt: Option<String>,
             meta_title: Option<String>,
+            meta_cwd: Option<String>,
             copied_before: Option<chrono::DateTime<chrono::Utc>>,
             resolver: cv_core::Resolver,
         }
@@ -2242,6 +2303,9 @@ mod tests {
         impl MessageSink for FullCollector {
             fn meta(&mut self, s: &cv_core::Session) {
                 self.meta_title = s.title.clone();
+                if self.meta_cwd.is_none() {
+                    self.meta_cwd = s.cwd.as_ref().map(|p| p.display().to_string());
+                }
             }
             fn message(&mut self, m: cv_core::Message) -> Flow {
                 let res = std::mem::replace(&mut self.resolver, cv_core::Resolver::new(None));
@@ -2265,6 +2329,7 @@ mod tests {
             in_context: false,
             first_prompt: None,
             meta_title: None,
+            meta_cwd: None,
             copied_before: None,
             resolver: cv_core::Resolver::new(Some(r.path.clone())),
         };
@@ -2277,7 +2342,8 @@ mod tests {
                 .or(r.title.as_deref()),
             col.first_prompt.as_deref(),
         );
-        Some((col.exchange, col.context, title))
+        let cwd = col.meta_cwd.or_else(|| meta.cwd.map(|p| p.display().to_string()));
+        Some((col.exchange, col.context, title, cwd))
     }
 
     #[test]
@@ -2735,5 +2801,216 @@ mod tests {
         forged2[footer_start + 56..footer_start + 60].copy_from_slice(&crc2.to_le_bytes());
         std::fs::write(&seg_path, &forged2).unwrap();
         assert!(SegmentReader::open(&seg_path).is_err());
+    }
+
+    #[test]
+    fn trigram_folded_subagent_live_tail_and_parsed_cwd_filter_match_oracle() {
+        use std::io::Write;
+        let tmp = ScratchDir::new();
+        let home = tmp.path().join("cv-home");
+        std::fs::create_dir_all(&home).unwrap();
+        let _env = cv_core::env::Env::from_vars([
+            ("CLUSTERVISION_HOME", home.to_str().unwrap()),
+            ("CLUSTERVISION_CACHE", home.to_str().unwrap()),
+        ])
+        .enter();
+
+        let index_dir = tmp.path().join("trigram");
+        let sessions_dir = tmp.path().join("projects").join("-proj");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        // Part A: Folded subagents modified or newly spawned AFTER `sync_sessions(..., true)`.
+        let parent_id = "22222222-2222-2222-2222-222222222222";
+        let parent_path = sessions_dir.join(format!("{parent_id}.jsonl"));
+        let parent = write_claude_jsonl(
+            &parent_path,
+            parent_id,
+            "/repo/alpha",
+            &[json!({
+                "type": "user",
+                "sessionId": parent_id,
+                "uuid": "up",
+                "message": { "role": "user", "content": "ParentRoot::orchestrate" }
+            })],
+        );
+        let sub_dir = sessions_dir.join(parent_id).join("subagents");
+        std::fs::create_dir_all(&sub_dir).unwrap();
+        let sub1_path = sub_dir.join("agent-sub1.jsonl");
+        std::fs::write(
+            &sub1_path,
+            format!(
+                "{}\n",
+                json!({
+                    "type": "user",
+                    "sessionId": parent_id,
+                    "agentId": "sub1",
+                    "cwd": "/repo/alpha",
+                    "uuid": "u-s1-1",
+                    "message": { "role": "user", "content": "Sub1::turn_one initial finding" }
+                })
+            ),
+        )
+        .unwrap();
+
+        let synced = sync_sessions(&index_dir, std::slice::from_ref(&parent), true, true).unwrap();
+        assert_eq!(synced.indexed, 2);
+
+        // Append a second turn to `sub1` AND spawn `sub2` on disk without re-indexing.
+        {
+            let mut f = std::fs::OpenOptions::new().append(true).open(&sub1_path).unwrap();
+            writeln!(
+                f,
+                "{}",
+                json!({
+                    "type": "assistant",
+                    "sessionId": parent_id,
+                    "agentId": "sub1",
+                    "cwd": "/repo/alpha",
+                    "uuid": "a-s1-2",
+                    "message": { "role": "assistant", "content": "Sub1::turn_two appended after sync" }
+                })
+            )
+            .unwrap();
+        }
+        let sub2_path = sub_dir.join("agent-sub2.jsonl");
+        std::fs::write(
+            &sub2_path,
+            format!(
+                "{}\n",
+                json!({
+                    "type": "user",
+                    "sessionId": parent_id,
+                    "agentId": "sub2",
+                    "cwd": "/repo/alpha",
+                    "uuid": "u-s2-1",
+                    "message": { "role": "user", "content": "Sub2::fresh_spawn brand new worker" }
+                })
+            ),
+        )
+        .unwrap();
+
+        for (needle, expected_agent) in [
+            ("Sub1::turn_one", "sub1"),
+            ("Sub1::turn_two", "sub1"),
+            ("Sub2::fresh_spawn", "sub2"),
+        ] {
+            let expected = brute_force_oracle(
+                std::slice::from_ref(&parent),
+                true,
+                needle,
+                Scope::Exchange,
+                true,
+                None,
+                None,
+            );
+            let got = search(
+                &index_dir,
+                needle,
+                TrigramOptions {
+                    case_sensitive: true,
+                    ..Default::default()
+                },
+                std::slice::from_ref(&parent),
+                None,
+            )
+            .unwrap();
+            let got_ids: HashSet<String> = got.hits.iter().map(|h| h.id.clone()).collect();
+            assert_eq!(got_ids, expected, "subagent live tail mismatch on {needle:?}");
+            assert_eq!(got.hits.len(), 1);
+            assert_eq!(got.hits[0].parent_id.as_deref(), Some(parent_id));
+            assert_eq!(got.hits[0].agent_id.as_deref(), Some(expected_agent));
+            assert!(
+                got.hits[0].session.is_none(),
+                "folded subagent hit must preserve subagent provenance instead of top-level live session"
+            );
+        }
+
+        // Part B: SessionRef with `r.cwd = None` whose JSONL sets `"cwd": "/repo/target-only"`.
+        let p_target = sessions_dir.join("cwd-target.jsonl");
+        let mut r_target = write_claude_jsonl(
+            &p_target,
+            "cwd-target",
+            "/repo/target-only",
+            &[json!({
+                "type": "user",
+                "sessionId": "cwd-target",
+                "cwd": "/repo/target-only",
+                "uuid": "ut1",
+                "message": { "role": "user", "content": "CwdDeferred::shared_needle turn1" }
+            })],
+        );
+        r_target.cwd = None;
+
+        let p_other = sessions_dir.join("cwd-other.jsonl");
+        let mut r_other = write_claude_jsonl(
+            &p_other,
+            "cwd-other",
+            "/repo/unrelated",
+            &[json!({
+                "type": "user",
+                "sessionId": "cwd-other",
+                "cwd": "/repo/unrelated",
+                "uuid": "uo1",
+                "message": { "role": "user", "content": "CwdDeferred::shared_needle turn1" }
+            })],
+        );
+        r_other.cwd = None;
+
+        let cwd_refs = vec![r_target.clone(), r_other];
+        let opts_cwd = TrigramOptions {
+            filter: SearchFilter {
+                cwd: Some("target-only"),
+                ..Default::default()
+            },
+            case_sensitive: true,
+            ..Default::default()
+        };
+
+        // 1) Unindexed live tail with `r.cwd == None`:
+        let live_res = search(&index_dir, "CwdDeferred::shared_needle", opts_cwd, &cwd_refs, None).unwrap();
+        let oracle_ids = brute_force_oracle(
+            &cwd_refs,
+            false,
+            "CwdDeferred::shared_needle",
+            Scope::Exchange,
+            true,
+            None,
+            Some("target-only"),
+        );
+        assert_eq!(
+            live_res.hits.iter().map(|h| h.id.clone()).collect::<HashSet<_>>(),
+            oracle_ids
+        );
+        assert_eq!(live_res.hits.len(), 1);
+        assert_eq!(live_res.hits[0].id, "cwd-target");
+        assert_eq!(live_res.hits[0].cwd.as_deref(), Some("/repo/target-only"));
+
+        // 2) Synced into segment, then appended on disk while `r.cwd` remains `None`:
+        let cwd_idx = tmp.path().join("trigram-cwd");
+        sync_sessions(&cwd_idx, &cwd_refs, true, false).unwrap();
+        let seg_res = search(&cwd_idx, "CwdDeferred::shared_needle", opts_cwd, &cwd_refs, None).unwrap();
+        assert_eq!(seg_res.suffix.stale, 0);
+        assert_eq!(seg_res.hits.len(), 1);
+        assert_eq!(seg_res.hits[0].id, "cwd-target");
+
+        {
+            let mut f = std::fs::OpenOptions::new().append(true).open(&p_target).unwrap();
+            writeln!(
+                f,
+                "{}",
+                json!({
+                    "type": "assistant",
+                    "sessionId": "cwd-target",
+                    "cwd": "/repo/target-only",
+                    "uuid": "at2",
+                    "message": { "role": "assistant", "content": "CwdDeferred::turn2_after_append" }
+                })
+            )
+            .unwrap();
+        }
+        let appended_res = search(&cwd_idx, "CwdDeferred::turn2_after_append", opts_cwd, &cwd_refs, None).unwrap();
+        assert_eq!(appended_res.hits.len(), 1);
+        assert_eq!(appended_res.hits[0].id, "cwd-target");
+        assert_eq!(appended_res.hits[0].cwd.as_deref(), Some("/repo/target-only"));
     }
 }

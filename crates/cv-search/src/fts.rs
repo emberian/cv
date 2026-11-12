@@ -495,6 +495,11 @@ fn sweep_decoded(dir: &Path, rebuild: bool, decoded: cv_core::codex_handoff::Rec
     if rebuild {
         writer.delete_all_documents().context("clearing index")?;
         writer.commit().context("commit after clear")?;
+        if !cv_core::env::frozen() {
+            crate::columnar_events::ColumnarEventStore::open(crate::default_columnar_events_dir())
+                .and_then(|mut cs| cs.clear())
+                .context("clearing columnar events")?;
+        }
     }
     let mut state = PlanState::load(&index, &f, dir, rebuild)?;
     let consumer = state.consumer.clone();
@@ -672,8 +677,13 @@ struct Job {
     size: i64,
     /// Rewrite its FTS docs (else the pass only feeds the catalog: events and counts).
     fts: bool,
-    /// Its events are stale: tee the pass into an [`cv_core::events::EventSink`].
+    /// Its events are stale in either SQLite or the derived columnar store: tee the pass into an
+    /// [`cv_core::events::EventSink`].
     events: bool,
+    /// SQLite `events` needs re-ingestion for this session.
+    sql_events: bool,
+    /// Derived columnar `events` store needs re-ingestion for this session.
+    col_events: bool,
     /// The index holds docs for its id, to delete before the new ones land.
     existing: bool,
     /// Only growth relative to the indexed source can be an append. Equal-size timestamp changes
@@ -889,6 +899,11 @@ fn sweep_refs(dir: &Path, refs: &[cv_core::SessionRef], rebuild: bool, subagents
     if rebuild {
         writer.delete_all_documents().context("clearing index")?;
         writer.commit().context("commit after clear")?;
+        if !cv_core::env::frozen() {
+            crate::columnar_events::ColumnarEventStore::open(crate::default_columnar_events_dir())
+                .and_then(|mut cs| cs.clear())
+                .context("clearing columnar events")?;
+        }
     }
     let SweepPlan {
         unchanged,
@@ -905,6 +920,11 @@ fn sweep_refs(dir: &Path, refs: &[cv_core::SessionRef], rebuild: bool, subagents
     } else {
         for id in &missing {
             writer.delete_term(Term::from_field_text(f.id, id));
+        }
+        if !missing.is_empty() && !cv_core::env::frozen() {
+            crate::columnar_events::ColumnarEventStore::open(crate::default_columnar_events_dir())
+                .and_then(|mut cs| cs.remove_sessions_by_id(&missing))
+                .context("reaping vanished sessions from columnar events")?;
         }
         missing.len()
     };
@@ -1032,6 +1052,7 @@ struct PlanState {
     folded: HashSet<String>,
     metadata: HashMap<String, DiscoveryMetadata>,
     event_sync: cv_core::events::SyncTable,
+    col_events: Option<crate::columnar_events::ColumnarEventStore>,
     affordances: cv_core::catalog::AffordanceTable,
     consumer: String,
     dependencies: cv_core::source::Table<InIndex>,
@@ -1046,6 +1067,14 @@ impl PlanState {
             read_indexed_metadata(index, f, true)
                 .context("reading prior index metadata (use cv index --rebuild to replace corrupt metadata)")?
         };
+        let col_events = if rebuild || cv_core::env::frozen() {
+            None
+        } else {
+            Some(
+                crate::columnar_events::ColumnarEventStore::open(crate::default_columnar_events_dir())
+                    .context("opening columnar events store")?,
+            )
+        };
         let consumer = source_consumer(dir)?;
         Ok(Self {
             existing,
@@ -1053,6 +1082,7 @@ impl PlanState {
             metadata,
             // One query each for the event skip-table and the affordance counts `has:<kind>` reads.
             event_sync: cv_core::events::SyncTable::load(),
+            col_events,
             affordances: cv_core::catalog::AffordanceTable::load(),
             dependencies: cv_core::source::Table::load(&consumer),
             consumer,
@@ -1067,6 +1097,7 @@ impl PlanState {
             existing,
             metadata,
             event_sync,
+            col_events,
             affordances,
             dependencies,
             probe,
@@ -1079,7 +1110,12 @@ impl PlanState {
             fresh: fts_fresh,
             dependencies_fresh,
         } = Freshness::of(existing, metadata, dependencies, probe, r, prov, &source);
-        let events = event_sync.needs_ingest(r, &source, prov, probe);
+        let sql_events = event_sync.needs_ingest(r, &source, prov, probe);
+        let col_events_needed = !cv_core::env::frozen()
+            && col_events
+                .as_ref()
+                .is_none_or(|cs| cs.needs_ingest_with_probe(r, &source, prov, probe));
+        let events = sql_events || col_events_needed;
         // Unchanged on every axis → skip entirely (no re-parse beyond the metadata scan).
         // Folded subagents have no independent catalog affordance row; their FTS/event
         // freshness suffices, while top-level sessions also need certified counts.
@@ -1095,11 +1131,14 @@ impl PlanState {
             size,
             fts: !fts_fresh,
             events,
+            sql_events,
+            col_events: col_events_needed,
             existing: existing.contains_key(&r.id),
             grew: existing
                 .get(&r.id)
                 .is_some_and(|&(_, old_size)| old_size > 0 && size > old_size)
-                && (!events || event_sync.can_resume(r, prov)),
+                && (!sql_events || event_sync.can_resume(r, prov))
+                && (!col_events_needed || col_events.as_ref().is_some_and(|cs| cs.can_resume(r, prov))),
             prov: prov.clone(),
             mark: None,
             source,
@@ -3371,27 +3410,48 @@ fn hit_of(doc: &TantivyDocument, f: &Fields, id: String, score: f32) -> Hit {
     }
 }
 
+/// Positive boolean structure over `query_terms` indices used by [`snippet_ready`]:
+/// conjunctive clauses (`All`) require every required branch to have a complete excerpt before
+/// stopping early when `0` is still pending, while disjunctive clauses (`Any`) are satisfied as
+/// soon as any branch has a complete excerpt.
+#[derive(Clone, Debug)]
+enum ClauseExpr {
+    Empty,
+    Term(usize),
+    All(Vec<ClauseExpr>),
+    Any(Vec<ClauseExpr>),
+}
+
+impl ClauseExpr {
+    fn is_ready(&self, complete: &impl Fn(usize) -> bool) -> bool {
+        match self {
+            Self::Empty => false,
+            Self::Term(idx) => complete(*idx),
+            Self::All(items) => !items.is_empty() && items.iter().all(|c| c.is_ready(complete)),
+            Self::Any(items) => items.iter().any(|c| c.is_ready(complete)),
+        }
+    }
+}
+
 /// Whether [`live_snippet`] has already materialized a complete snippet window and can stop
-/// streaming: on `OR` queries as soon as *any* positive branch has its full trail, and on
-/// conjunctive queries as soon as the primary anchor (`0`) has its full trail (or `matcher.done()`
-/// when no positive terms exist).
-fn snippet_ready(matcher: &cv_core::scan::Matcher, terms_len: usize, is_or: bool) -> bool {
+/// streaming: immediately once the primary anchor (`0`) has its full trail, or once every
+/// conjunctive clause in `clauses` has at least one complete positive branch (so absent `OR`
+/// branches never force an EOF scan while nested `(a OR b)` inside `rare_primary (a OR b)` still
+/// waits for `rare_primary`), or `matcher.done()` when no positive terms exist.
+fn snippet_ready(matcher: &cv_core::scan::Matcher, terms_len: usize, clauses: &ClauseExpr) -> bool {
     const EXCERPT_TRAIL: usize = 120;
     if matcher.done() {
         return true;
+    }
+    if terms_len == 0 {
+        return false;
     }
     let complete = |i: usize| {
         matcher
             .excerpt_of(i)
             .is_some_and(|e| e.text.len() >= e.at + e.len + EXCERPT_TRAIL)
     };
-    if terms_len == 0 {
-        false
-    } else if is_or {
-        (0..terms_len).any(complete)
-    } else {
-        complete(0)
-    }
+    complete(0) || clauses.is_ready(&complete)
 }
 
 /// Generate a snippet for a hit by re-reading **just that one session** (streamed), finding the
@@ -3400,7 +3460,7 @@ fn snippet_ready(matcher: &cv_core::scan::Matcher, terms_len: usize, is_or: bool
 /// Streams under [`Demand::with_spans`] into a [`cv_core::scan::Matcher`], which matches the whole
 /// projection in pieces and keeps only a window, so a session fronted by a giant record (a 700 MB
 /// tool dump) costs its read, not its size in memory; the read stops once a complete snippet
-/// excerpt is ready (including when any branch of an `OR` query matches).
+/// excerpt is ready (including when satisfied branches of an `OR` query match).
 /// The snippet is the first term (in query order) that occurs anywhere, else the head.
 fn live_snippet(path: &str, id: &str, harness: &str, query: &str, scope: crate::Scope) -> Result<String> {
     use cv_core::projection::Searchable;
@@ -3420,7 +3480,7 @@ fn live_snippet(path: &str, id: &str, harness: &str, query: &str, scope: crate::
     struct Acc {
         matcher: Matcher,
         terms_len: usize,
-        is_or: bool,
+        clauses: ClauseExpr,
         resolver: cv_core::Resolver,
         error: Option<anyhow::Error>,
         failed: bool,
@@ -3429,15 +3489,15 @@ fn live_snippet(path: &str, id: &str, harness: &str, query: &str, scope: crate::
     }
     impl Acc {
         fn ready(&self) -> bool {
-            snippet_ready(&self.matcher, self.terms_len, self.is_or)
+            snippet_ready(&self.matcher, self.terms_len, &self.clauses)
         }
         fn feed_text(&mut self, text: &cv_core::Text) -> Result<()> {
             let matcher = &mut self.matcher;
             let terms_len = self.terms_len;
-            let is_or = self.is_or;
+            let clauses = &self.clauses;
             cv_core::stream::stopped(text.try_for_each_chunk(&self.resolver, 4096, |part| {
                 matcher.push(part);
-                if snippet_ready(matcher, terms_len, is_or) {
+                if snippet_ready(matcher, terms_len, clauses) {
                     Err(cv_core::stream::Stop.into())
                 } else {
                     Ok(())
@@ -3465,13 +3525,13 @@ fn live_snippet(path: &str, id: &str, harness: &str, query: &str, scope: crate::
                         if let Some(p) = b.persisted_output_path() {
                             let matcher = &mut self.matcher;
                             let terms_len = self.terms_len;
-                            let is_or = self.is_or;
+                            let clauses = &self.clauses;
                             let read = cv_core::stream::stopped(cv_core::lazy::read_pieces_checked(
                                 std::path::Path::new(p),
                                 64 * 1024,
                                 |piece| {
                                     matcher.push(piece);
-                                    if snippet_ready(matcher, terms_len, is_or) {
+                                    if snippet_ready(matcher, terms_len, clauses) {
                                         Err(cv_core::stream::Stop.into())
                                     } else {
                                         Ok(())
@@ -3535,13 +3595,12 @@ fn live_snippet(path: &str, id: &str, harness: &str, query: &str, scope: crate::
             }
         }
     }
-    let terms = query_terms(query);
+    let (terms, clauses) = parse_query_clauses(query);
     let terms_len = terms.len();
-    let is_or = query_has_or(query);
     let mut acc = Acc {
         matcher: Matcher::new(terms, terms_len),
         terms_len,
-        is_or,
+        clauses,
         resolver: cv_core::Resolver::new(Some(PathBuf::from(path))),
         error: None,
         failed: false,
@@ -3577,68 +3636,6 @@ fn make_snippet(body: &str, query: &str) -> String {
 }
 
 const SNIPPET_TEXT_FIELDS: &[&str] = &["title", "body", "context"];
-
-/// Whether `query` contains an unquoted `OR` boolean operator outside negated groups.
-fn query_has_or(query: &str) -> bool {
-    let bytes = query.as_bytes();
-    let mut i = 0;
-    let mut negate_next = false;
-    while i < bytes.len() {
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        if i >= bytes.len() {
-            break;
-        }
-        if bytes[i] == b'"' {
-            let (_, next) = take_quoted(query, i);
-            i = next;
-            negate_next = false;
-            continue;
-        }
-        if bytes[i] == b'(' {
-            let (inner, next) = take_group(query, i);
-            if !negate_next && query_has_or(inner) {
-                return true;
-            }
-            i = next;
-            negate_next = false;
-            continue;
-        }
-        if bytes[i] == b')' {
-            i += 1;
-            continue;
-        }
-        if bytes[i] == b'-' && i + 1 < bytes.len() && !bytes[i + 1].is_ascii_whitespace() {
-            i = skip_clause_value(query, i + 1);
-            negate_next = false;
-            continue;
-        }
-        let start = i;
-        while i < bytes.len() && !bytes[i].is_ascii_whitespace() && !matches!(bytes[i], b'(' | b')' | b'"') {
-            i += 1;
-        }
-        let tok = &query[start..i];
-        if tok == "NOT" {
-            negate_next = true;
-            continue;
-        }
-        if tok == "OR" && !negate_next {
-            return true;
-        }
-        if let Some((_, "")) = tok.strip_prefix('+').unwrap_or(tok).split_once(':') {
-            if i < bytes.len() && matches!(bytes[i], b'"' | b'(') {
-                if negate_next {
-                    i = skip_clause_value(query, i);
-                }
-                negate_next = false;
-                continue;
-            }
-        }
-        negate_next = false;
-    }
-    false
-}
 
 fn take_quoted(query: &str, open_quote: usize) -> (String, usize) {
     let mut out = String::new();
@@ -3709,12 +3706,20 @@ fn skip_clause_value(query: &str, start: usize) -> usize {
     i
 }
 
-fn push_normalized_words(raw: &str, out: &mut Vec<String>) {
+fn push_normalized_words_expr(raw: &str, out: &mut Vec<String>) -> Option<ClauseExpr> {
+    let mut terms = Vec::new();
     for part in raw.split_whitespace() {
         let norm = part.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
         if !norm.is_empty() {
+            let idx = out.len();
             out.push(norm);
+            terms.push(ClauseExpr::Term(idx));
         }
+    }
+    match terms.len() {
+        0 => None,
+        1 => terms.pop(),
+        _ => Some(ClauseExpr::All(terms)),
     }
 }
 
@@ -3726,12 +3731,42 @@ fn push_normalized_words(raw: &str, out: &mut Vec<String>) {
 /// - Drops non-content metadata filter fields (`harness:...`, `cwd:...`, `id:...`, `path:...`, etc.)
 ///   and boolean operators (`AND`, `OR`, `NOT`).
 pub fn query_terms(query: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    collect_query_terms(query, &mut out);
-    out
+    parse_query_clauses(query).0
 }
 
-fn collect_query_terms(query: &str, out: &mut Vec<String>) {
+fn parse_query_clauses(query: &str) -> (Vec<String>, ClauseExpr) {
+    let mut out = Vec::new();
+    let expr = parse_clause_group(query, &mut out).unwrap_or(ClauseExpr::Empty);
+    (out, expr)
+}
+
+fn parse_clause_group(query: &str, out: &mut Vec<String>) -> Option<ClauseExpr> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Op {
+        And,
+        Or,
+    }
+    let mut conjuncts: Vec<ClauseExpr> = Vec::new();
+    let mut pending_op = Op::And;
+    let mut push_item = |expr: Option<ClauseExpr>, pending_op: &mut Op| {
+        if let Some(expr) = expr {
+            if *pending_op == Op::Or && !conjuncts.is_empty() {
+                let prev = conjuncts.pop().expect("non-empty conjuncts");
+                let merged = match prev {
+                    ClauseExpr::Any(mut items) => {
+                        items.push(expr);
+                        ClauseExpr::Any(items)
+                    }
+                    other => ClauseExpr::Any(vec![other, expr]),
+                };
+                conjuncts.push(merged);
+            } else {
+                conjuncts.push(expr);
+            }
+            *pending_op = Op::And;
+        }
+    };
+
     let bytes = query.as_bytes();
     let mut i = 0;
     let mut negate_next = false;
@@ -3750,7 +3785,9 @@ fn collect_query_terms(query: &str, out: &mut Vec<String>) {
             let (phrase, next) = take_quoted(query, i);
             i = next;
             if !negate_next {
-                push_normalized_words(&phrase, out);
+                push_item(push_normalized_words_expr(&phrase, out), &mut pending_op);
+            } else {
+                pending_op = Op::And;
             }
             negate_next = false;
             continue;
@@ -3759,7 +3796,9 @@ fn collect_query_terms(query: &str, out: &mut Vec<String>) {
             let (inner, next) = take_group(query, i);
             i = next;
             if !negate_next {
-                collect_query_terms(inner, out);
+                push_item(parse_clause_group(inner, out), &mut pending_op);
+            } else {
+                pending_op = Op::And;
             }
             negate_next = false;
             continue;
@@ -3767,6 +3806,7 @@ fn collect_query_terms(query: &str, out: &mut Vec<String>) {
         if bytes[i] == b'-' && i + 1 < bytes.len() && !bytes[i + 1].is_ascii_whitespace() {
             i = skip_clause_value(query, i + 1);
             negate_next = false;
+            pending_op = Op::And;
             continue;
         }
         if bytes[i] == b'+' && i + 1 < bytes.len() && matches!(bytes[i + 1], b'"' | b'(') {
@@ -3782,7 +3822,15 @@ fn collect_query_terms(query: &str, out: &mut Vec<String>) {
             negate_next = true;
             continue;
         }
-        if matches!(tok, "AND" | "OR") {
+        if tok == "OR" {
+            if !negate_next {
+                pending_op = Op::Or;
+            }
+            negate_next = false;
+            continue;
+        }
+        if tok == "AND" {
+            pending_op = Op::And;
             negate_next = false;
             continue;
         }
@@ -3795,13 +3843,17 @@ fn collect_query_terms(query: &str, out: &mut Vec<String>) {
                     let (phrase, next) = take_quoted(query, i);
                     i = next;
                     if !negate_next && (!is_schema || is_content) {
-                        push_normalized_words(&phrase, out);
+                        push_item(push_normalized_words_expr(&phrase, out), &mut pending_op);
+                    } else if negate_next {
+                        pending_op = Op::And;
                     }
                 } else {
                     let (inner, next) = take_group(query, i);
                     i = next;
                     if !negate_next && (!is_schema || is_content) {
-                        collect_query_terms(inner, out);
+                        push_item(parse_clause_group(inner, out), &mut pending_op);
+                    } else if negate_next {
+                        pending_op = Op::And;
                     }
                 }
                 negate_next = false;
@@ -3810,6 +3862,7 @@ fn collect_query_terms(query: &str, out: &mut Vec<String>) {
         }
         if negate_next {
             negate_next = false;
+            pending_op = Op::And;
             continue;
         }
         if is_schema_field_spec(body) {
@@ -3817,11 +3870,17 @@ fn collect_query_terms(query: &str, out: &mut Vec<String>) {
             if SNIPPET_TEXT_FIELDS.contains(&field) {
                 // Strip optional boost (`^2.0`) or fuzzy (`~1`) suffix on fielded term values.
                 let clean = rest.split(['^', '~']).next().unwrap_or(rest);
-                push_normalized_words(clean, out);
+                push_item(push_normalized_words_expr(clean, out), &mut pending_op);
             }
             continue;
         }
-        push_normalized_words(body, out);
+        push_item(push_normalized_words_expr(body, out), &mut pending_op);
+    }
+
+    match conjuncts.len() {
+        0 => None,
+        1 => conjuncts.pop(),
+        _ => Some(ClauseExpr::All(conjuncts)),
     }
 }
 
@@ -3860,6 +3919,8 @@ mod tests {
             size,
             fts: true,
             events: true,
+            sql_events: true,
+            col_events: true,
             existing: false,
             grew: false,
             source,
@@ -6728,6 +6789,137 @@ mod tests {
             let snip = live_snippet(&p, "or-early", "claude", q, crate::Scope::Exchange)
                 .unwrap_or_else(|e| panic!("query {q:?} scanned to corrupt EOF instead of stopping early: {e:#}"));
             assert!(snip.contains("zqbranch"), "query {q:?} snippet={snip:?}");
+        }
+    }
+
+    #[test]
+    fn live_snippet_nested_or_in_conjunction_matches_make_snippet_and_stops_early() {
+        use std::io::Write;
+        let sdir = tmpdir();
+
+        // 1. `"rare_primary (common_a OR common_b)"` where `common_a` appears in message 0 (>2 KiB
+        //    before `rare_primary` in message 5): `live_snippet` must NOT stop on `common_a` and
+        //    must agree with `make_snippet` by windowing around `rare_primary`.
+        let p_nested = sdir.join("nested-and-or.jsonl");
+        let mut full_body = String::new();
+        {
+            let mut f = std::fs::File::create(&p_nested).unwrap();
+            let m0 = format!("opening common_a context {}", "padding ".repeat(64));
+            full_body.push_str(&m0);
+            full_body.push('\n');
+            writeln!(
+                f,
+                "{}",
+                serde_json::json!({
+                    "type": "user",
+                    "uuid": "u0",
+                    "sessionId": "nested-and-or",
+                    "message": {"role": "user", "content": m0}
+                })
+            )
+            .unwrap();
+            for idx in 1..5 {
+                let mid = format!("turn {idx} {}", "filler ".repeat(80));
+                full_body.push_str(&mid);
+                full_body.push('\n');
+                writeln!(
+                    f,
+                    "{}",
+                    serde_json::json!({
+                        "type": "assistant",
+                        "uuid": format!("a{idx}"),
+                        "sessionId": "nested-and-or",
+                        "message": {"role": "assistant", "content": mid}
+                    })
+                )
+                .unwrap();
+            }
+            let m5 = format!("deep target rare_primary landed {}", "trailing ".repeat(40));
+            full_body.push_str(&m5);
+            full_body.push('\n');
+            writeln!(
+                f,
+                "{}",
+                serde_json::json!({
+                    "type": "assistant",
+                    "uuid": "a5",
+                    "sessionId": "nested-and-or",
+                    "message": {"role": "assistant", "content": m5}
+                })
+            )
+            .unwrap();
+        }
+        let q_primary = "rare_primary (common_a OR common_b)";
+        let live_primary = live_snippet(
+            &p_nested.display().to_string(),
+            "nested-and-or",
+            "claude",
+            q_primary,
+            crate::Scope::Exchange,
+        )
+        .unwrap();
+        assert_eq!(live_primary, make_snippet(&full_body, q_primary));
+        assert!(live_primary.contains("rare_primary"), "{live_primary:?}");
+
+        // 2. `"(present_a OR absent_b) rare_primary"` and `"(absent_b OR present_a) rare_primary"`
+        //    must both stop once their conjunctive clauses have trailing context instead of
+        //    streaming a giant tail (sentinel corrupt EOF line) looking for `absent_b`.
+        let p_early = sdir.join("conj-or-early.jsonl");
+        let mut clean_prefix = String::new();
+        {
+            let mut f = std::fs::File::create(&p_early).unwrap();
+            let m0 = format!("first branch present_a {}", "pad ".repeat(80));
+            let m1 = format!("required anchor rare_primary {}", "trail ".repeat(80));
+            clean_prefix.push_str(&m0);
+            clean_prefix.push('\n');
+            clean_prefix.push_str(&m1);
+            clean_prefix.push('\n');
+            writeln!(
+                f,
+                "{}",
+                serde_json::json!({
+                    "type": "user",
+                    "uuid": "u0",
+                    "sessionId": "conj-or-early",
+                    "message": {"role": "user", "content": m0}
+                })
+            )
+            .unwrap();
+            writeln!(
+                f,
+                "{}",
+                serde_json::json!({
+                    "type": "assistant",
+                    "uuid": "a1",
+                    "sessionId": "conj-or-early",
+                    "message": {"role": "assistant", "content": m1}
+                })
+            )
+            .unwrap();
+            for idx in 2..40 {
+                writeln!(
+                    f,
+                    "{}",
+                    serde_json::json!({
+                        "type": "assistant",
+                        "uuid": format!("a{idx}"),
+                        "sessionId": "conj-or-early",
+                        "message": {"role": "assistant", "content": "filler ".repeat(2048)}
+                    })
+                )
+                .unwrap();
+            }
+            writeln!(f, "{{corrupt_eof_record_never_reached").unwrap();
+        }
+        let pe = p_early.display().to_string();
+        for q in [
+            "(present_a OR absent_b) rare_primary",
+            "(absent_b OR present_a) rare_primary",
+            "rare_primary (absent_b OR present_a)",
+        ] {
+            let snip = live_snippet(&pe, "conj-or-early", "claude", q, crate::Scope::Exchange)
+                .unwrap_or_else(|e| panic!("query {q:?} scanned to corrupt EOF: {e:#}"));
+            assert_eq!(snip, make_snippet(&clean_prefix, q), "query {q:?}");
         }
     }
 

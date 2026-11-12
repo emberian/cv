@@ -410,6 +410,8 @@ fn plan(
             size: fresh.size,
             fts: true,
             events: false,
+            sql_events: false,
+            col_events: false,
             existing: existing.contains_key(&r.id),
             grew: existing.get(&r.id).is_some_and(|&(_, old)| old > 0 && fresh.size > old),
             source,
