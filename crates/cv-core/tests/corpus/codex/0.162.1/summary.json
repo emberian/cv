@@ -139,7 +139,7 @@
           }
         },
         "total_calls": 10,
-        "total_errors": 0
+        "total_errors": 4
       },
       "lineage": {},
       "model": "gpt-6-luna",
@@ -306,7 +306,7 @@
           }
         },
         "total_calls": 8,
-        "total_errors": 0
+        "total_errors": 1
       },
       "lineage": {},
       "model": "gpt-6-luna",
@@ -452,7 +452,7 @@
           }
         },
         "total_calls": 3,
-        "total_errors": 0
+        "total_errors": 1
       },
       "lineage": {
         "parent": "01a12c67-d6ee-74e3-a296-8c936b563a50",

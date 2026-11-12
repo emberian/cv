@@ -64,6 +64,49 @@ pub(super) fn string(writer: &mut dyn Write, value: &Text, resolver: &Resolver, 
 pub(super) fn argument(writer: &mut dyn Write, value: &Json) -> Result<()> {
     text::generate_string(writer, |builder| value.with_view(|view| builder.push_json(view)))
 }
+
+/// Whether `(name, value)` is a Codex freeform `custom_tool_call` (`exec` or `apply_patch`
+/// carrying a raw string input, or cross-harness `{"raw": "..."}`).
+pub(super) fn is_custom_tool_input(name: &str, value: &Json) -> Result<bool> {
+    if !matches!(name, "exec" | "apply_patch") {
+        return Ok(false);
+    }
+    value.with_view(|view| {
+        if view.is_string()? {
+            return Ok(true);
+        }
+        if !view.is_object()? {
+            return Ok(false);
+        }
+        let mut count = 0usize;
+        let mut raw_str = false;
+        view.for_each_entry(|k, v| {
+            count += 1;
+            if k == "raw" && v.is_string()? {
+                raw_str = true;
+            }
+            Ok(())
+        })?;
+        Ok(count == 1 && raw_str)
+    })
+}
+
+/// Write a `custom_tool_call`'s `input` JSON string directly (unwrapping `{"raw": "..."}` when present).
+pub(super) fn custom_input(writer: &mut dyn Write, value: &Json) -> Result<()> {
+    value.with_view(|view| {
+        if view.is_string()? {
+            let mut w = &mut *writer;
+            return view.write_canonical(&mut w);
+        }
+        if let Some(raw) = view.get("raw")? {
+            if raw.is_string()? {
+                let mut w = &mut *writer;
+                return raw.write_canonical(&mut w);
+            }
+        }
+        argument(writer, value)
+    })
+}
 #[allow(clippy::too_many_arguments)]
 pub(super) fn message(
     lines: &mut JsonlStage,

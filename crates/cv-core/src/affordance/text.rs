@@ -262,6 +262,63 @@ pub(super) fn plain_summary(text: &Text, resolver: &Resolver) -> Result<String> 
     Ok(summary.finish())
 }
 
+/// Detect a Codex Code Mode `exec` / `wait` result that yielded a background V8 cell
+/// (`"Script running with cell ID <id>\n..."`). Streams only the first line.
+pub(super) fn running_cell_summary(
+    text: &Text,
+    resolver: &Resolver,
+    harness: Harness,
+    summaries: bool,
+) -> Result<Option<String>> {
+    match harness {
+        Harness::Codex => {}
+        Harness::Claude
+        | Harness::Grok
+        | Harness::OpenCode
+        | Harness::Gemini
+        | Harness::Hermes
+        | Harness::OpenClaw
+        | Harness::Cursor
+        | Harness::Kimi
+        | Harness::KimiCode
+        | Harness::Qwen
+        | Harness::LmStudio
+        | Harness::Cline
+        | Harness::Roo
+        | Harness::Continue
+        | Harness::Goose
+        | Harness::Zed
+        | Harness::Devin
+        | Harness::ChatGptExport
+        | Harness::ClaudeExport
+        | Harness::OpenSession => return Ok(None),
+    }
+    const PREFIX: &str = "Script running with cell ID ";
+    let mut line = String::new();
+    let mut started = false;
+    until(text, resolver, |mut chunk| {
+        if !started {
+            chunk = chunk.trim_start();
+            started = !chunk.is_empty();
+        }
+        for ch in chunk.chars() {
+            if ch == '\n' || ch == '\r' || line.len() >= 120 {
+                return true;
+            }
+            line.push(ch);
+        }
+        false
+    })?;
+    if !line.starts_with(PREFIX) {
+        return Ok(None);
+    }
+    Ok(Some(if summaries {
+        crate::ir::truncate(line.trim(), SUMMARY_CHARS)
+    } else {
+        String::new()
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

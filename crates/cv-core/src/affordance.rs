@@ -373,8 +373,12 @@ pub fn classify_tool_view(h: Harness, name: &str, input: JsonView<'_>) -> Result
             "skill" => Some((Skill, "load")),
             _ => None,
         },
+        Harness::Codex => match name {
+            "wait" if input.get("cell_id")?.is_some() => Some((BackgroundJob, "read")),
+            "write_stdin" => Some((BackgroundJob, "read")),
+            _ => None,
+        },
         Harness::Claude
-        | Harness::Codex
         | Harness::Grok
         | Harness::Gemini
         | Harness::Cursor
@@ -422,9 +426,12 @@ pub fn classify_tool_view(h: Harness, name: &str, input: JsonView<'_>) -> Result
         }
         "run_shell_command" if flag(input, "is_background")? => (BackgroundJob, "start"),
         "Monitor" | "monitor" => (BackgroundJob, "start"),
-        "BashOutput" | "TaskOutput" | "get_command_or_subagent_output" | "WaitFor" | "CheckBackgroundJob" => {
-            (BackgroundJob, "read")
-        }
+        "BashOutput"
+        | "TaskOutput"
+        | "get_command_or_subagent_output"
+        | "WaitFor"
+        | "CheckBackgroundJob"
+        | "write_stdin" => (BackgroundJob, "read"),
         "KillShell" | "TaskStop" | "kill_command_or_subagent" => (BackgroundJob, "stop"),
         // sub-agents
         n if spawn_returns(h, n).is_some() => (SubagentSpawn, "spawn"),
@@ -437,7 +444,9 @@ pub fn classify_tool_view(h: Harness, name: &str, input: JsonView<'_>) -> Result
         | "ask_user_question"
         | "ask_followup_question"
         | "ask_question"
-        | "AskQuestion" => (Question, "ask"),
+        | "AskQuestion"
+        | "request_user_input"
+        | "request_user_input_async" => (Question, "ask"),
         _ => return Ok(None),
     }))
 }
@@ -448,6 +457,7 @@ pub fn spawn_returns(h: Harness, name: &str) -> Option<Returns> {
     match h {
         // Claude marks a synchronous return itself (from `toolUseResult`), per record.
         Harness::Claude => matches!(name, "Agent" | "Task" | "Workflow").then_some(Returns::Later),
+        Harness::Codex => one("spawn_agent", Returns::Later),
         Harness::OpenCode => match name {
             "task" => Some(Returns::Result),
             "subagent" => Some(Returns::ResultUnless("in the background")),
@@ -466,13 +476,52 @@ pub fn spawn_returns(h: Harness, name: &str) -> Option<Returns> {
         Harness::Roo => one("new_task", Returns::ResultInPrompt("new_task")),
         Harness::Devin => one("run_subagent", Returns::Result),
         Harness::Continue => one("Subagent", Returns::Result),
-        Harness::Codex
-        | Harness::Gemini
+        Harness::Gemini
         | Harness::Cursor
         | Harness::KimiCode
         | Harness::Qwen
         | Harness::LmStudio
         | Harness::Zed
+        | Harness::ChatGptExport
+        | Harness::ClaudeExport
+        | Harness::OpenSession => None,
+    }
+}
+
+/// Extract the spawned child agent identifier (`task_name` or `agent_id`) from a spawn tool's
+/// non-error result payload when structured.
+pub fn spawn_return_id(h: Harness, name: &str, result_text: &str, is_error: bool) -> Option<String> {
+    if is_error {
+        return None;
+    }
+    match h {
+        Harness::Codex if name == "spawn_agent" => {
+            let v: Value = serde_json::from_str(result_text.trim()).ok()?;
+            for key in ["task_name", "agent_id"] {
+                if let Some(id) = v.get(key).and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                    return Some(id.to_string());
+                }
+            }
+            None
+        }
+        Harness::Claude
+        | Harness::Codex
+        | Harness::Grok
+        | Harness::OpenCode
+        | Harness::Gemini
+        | Harness::Hermes
+        | Harness::OpenClaw
+        | Harness::Cursor
+        | Harness::Kimi
+        | Harness::KimiCode
+        | Harness::Qwen
+        | Harness::LmStudio
+        | Harness::Cline
+        | Harness::Roo
+        | Harness::Continue
+        | Harness::Goose
+        | Harness::Zed
+        | Harness::Devin
         | Harness::ChatGptExport
         | Harness::ClaudeExport
         | Harness::OpenSession => None,
@@ -954,13 +1003,17 @@ fn call_summary(kind: Kind, view: JsonView<'_>, items: &[Item]) -> Result<String
         "cron",
         "schedule",
         "skill",
+        "task_name",
         "name",
         "question",
+        "title",
         "goal",
         "objective",
         "instructions",
         "message",
         "reason",
+        "cell_id",
+        "session_id",
         "id",
         "taskId",
     ] {
@@ -1181,6 +1234,17 @@ fn detail_hits<'a>(
                     String::new()
                 },
             });
+        }
+        if !*is_error {
+            if let Some(summary) = text::running_cell_summary(content, resolver, h, summaries)? {
+                out.push(Hit::Detail {
+                    kind: Kind::BackgroundJob,
+                    action: "start",
+                    tool: tool_name.as_deref(),
+                    tool_use_id: Some(tool_use_id),
+                    summary,
+                });
+            }
         }
         if let Some(files) = details
             .as_ref()
@@ -2298,6 +2362,48 @@ mod tests {
                 (MessageKind::SubagentSpawn, Origin::Model),
                 (MessageKind::ToolResult, Origin::Harness),
             ]
+        );
+    }
+
+    #[test]
+    fn codex_modern_affordances_cover_spawns_questions_cells_and_stdin() {
+        assert_eq!(
+            classify_tool(
+                Harness::Codex,
+                "spawn_agent",
+                &json!({"task_name": "helper", "message": "check"})
+            ),
+            Some((Kind::SubagentSpawn, "spawn"))
+        );
+        assert_eq!(spawn_returns(Harness::Codex, "spawn_agent"), Some(Returns::Later));
+        assert_eq!(
+            spawn_return_id(Harness::Codex, "spawn_agent", r#"{"task_name":"/root/helper"}"#, false),
+            Some("/root/helper".into())
+        );
+        assert_eq!(
+            spawn_return_id(
+                Harness::Codex,
+                "spawn_agent",
+                r#"{"agent_id":"019c-abc","nickname":"Zeno"}"#,
+                false
+            ),
+            Some("019c-abc".into())
+        );
+        assert_eq!(spawn_return_id(Harness::Codex, "spawn_agent", "error", true), None);
+        for q in ["request_user_input", "request_user_input_async"] {
+            assert_eq!(
+                classify_tool(Harness::Codex, q, &json!({"title": "Choose branch"})),
+                Some((Kind::Question, "ask"))
+            );
+        }
+        assert_eq!(
+            classify_tool(Harness::Codex, "wait", &json!({"cell_id": "53"})),
+            Some((Kind::BackgroundJob, "read"))
+        );
+        assert_eq!(classify_tool(Harness::Codex, "wait", &json!({"timeout_ms": 100})), None);
+        assert_eq!(
+            classify_tool(Harness::Codex, "write_stdin", &json!({"session_id": 42, "chars": ""})),
+            Some((Kind::BackgroundJob, "read"))
         );
     }
 }

@@ -161,7 +161,7 @@
           }
         },
         "total_calls": 2,
-        "total_errors": 0
+        "total_errors": 2
       },
       "lineage": {},
       "model": "gpt-6-luna",

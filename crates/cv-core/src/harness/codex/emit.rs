@@ -21,6 +21,7 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Emi
     let new_id = opts.new_id.clone().unwrap_or_else(|| Uuid::now_v7().to_string());
     // Which tool calls exist at all, so a result whose call was pruned away can be paired below.
     let called = called_tool_ids(session);
+    let mut custom_calls = std::collections::HashSet::<String>::new();
     // `session_meta.cwd` (and `turn_context.cwd`) are REQUIRED by Codex's decoder (`SessionMeta.cwd:
     // PathBuf`, no default): a meta line without one is undecodable, the thread id can't be read,
     // and resume fails with "failed to parse thread ID from rollout file". A session with no known
@@ -218,8 +219,16 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Emi
                             namespace,
                             input,
                         } => {
+                            let is_custom = writer::is_custom_tool_input(name, input)?;
+                            if is_custom {
+                                custom_calls.insert(id.clone());
+                            }
                             writer::record(&mut lines, &ts, "response_item", |out| {
-                                out.write_all(b"{\"type\":\"function_call\",\"call_id\":")?;
+                                if is_custom {
+                                    out.write_all(b"{\"type\":\"custom_tool_call\",\"call_id\":")?;
+                                } else {
+                                    out.write_all(b"{\"type\":\"function_call\",\"call_id\":")?;
+                                }
                                 serde_json::to_writer(&mut *out, id)?;
                                 out.write_all(b",\"name\":")?;
                                 serde_json::to_writer(&mut *out, name)?;
@@ -227,8 +236,13 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Emi
                                     out.write_all(b",\"namespace\":")?;
                                     serde_json::to_writer(&mut *out, namespace)?;
                                 }
-                                out.write_all(b",\"arguments\":")?;
-                                writer::argument(out, input)?;
+                                if is_custom {
+                                    out.write_all(b",\"input\":")?;
+                                    writer::custom_input(out, input)?;
+                                } else {
+                                    out.write_all(b",\"arguments\":")?;
+                                    writer::argument(out, input)?;
+                                }
                                 out.write_all(b"}")?;
                                 Ok(())
                             })?;
@@ -289,20 +303,34 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Emi
                         // Emit a call shell first so the pair is well-formed and the output's text
                         // still reaches the model, rather than dropping the turn.
                         if is_orphan_result(b, &called) {
-                            writer::value(
-                                &mut lines,
-                                &ts,
-                                "response_item",
-                                &json!({
+                            let orphan_custom = matches!(tool_name.as_deref(), Some("exec" | "apply_patch"));
+                            if orphan_custom {
+                                custom_calls.insert(tool_use_id.clone());
+                            }
+                            let shell = if orphan_custom {
+                                json!({
+                                    "type": "custom_tool_call",
+                                    "call_id": tool_use_id,
+                                    "name": tool_name.clone().unwrap_or_else(|| "unknown".into()),
+                                    "input": "",
+                                })
+                            } else {
+                                json!({
                                     "type": "function_call",
                                     "call_id": tool_use_id,
                                     "name": tool_name.clone().unwrap_or_else(|| "unknown".into()),
                                     "arguments": "{}",
-                                }),
-                            )?;
+                                })
+                            };
+                            writer::value(&mut lines, &ts, "response_item", &shell)?;
                         }
+                        let is_custom_out = custom_calls.contains(tool_use_id.as_str());
                         writer::record(&mut lines, &ts, "response_item", |out| {
-                            out.write_all(b"{\"type\":\"function_call_output\",\"call_id\":")?;
+                            if is_custom_out {
+                                out.write_all(b"{\"type\":\"custom_tool_call_output\",\"call_id\":")?;
+                            } else {
+                                out.write_all(b"{\"type\":\"function_call_output\",\"call_id\":")?;
+                            }
                             serde_json::to_writer(&mut *out, tool_use_id)?;
                             if let Some(name) = tool_name {
                                 out.write_all(b",\"name\":")?;
@@ -478,5 +506,109 @@ mod staged_tests {
         .unwrap();
         assert_eq!(value["output_tokens"], 3);
         assert!(value.get("input_tokens").is_none() && value.get("total_tokens").is_none());
+    }
+
+    #[test]
+    fn custom_tool_calls_and_raw_wrapped_inputs_round_trip() -> Result<()> {
+        use crate::harness::{Adapter, Parse};
+        use crate::ir::{Message, SessionRef};
+        let world = crate::test_world("codex-custom-tool-wire");
+        let mut session = Session::new("source", Harness::Codex);
+        let script = "const r = await tools.exec_command({ cmd: \"cargo check\" });\ntext(r.output);";
+        let patch = "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-a\n+b\n*** End Patch";
+
+        let mut c1 = Message::new(Role::Assistant);
+        c1.content.push(Block::ToolUse {
+            id: "call_exec".into(),
+            name: "exec".into(),
+            namespace: Some("functions".into()),
+            input: json!(script).into(),
+        });
+        let mut r1 = Message::new(Role::Tool);
+        r1.content.push(Block::ToolResult {
+            tool_use_id: "call_exec".into(),
+            content: "Script failed\nWall time 0.1 seconds".into(),
+            is_error: true,
+            tool_name: Some("exec".into()),
+            status: None,
+            details: None,
+        });
+
+        let mut c2 = Message::new(Role::Assistant);
+        c2.content.push(Block::ToolUse {
+            id: "call_patch".into(),
+            name: "apply_patch".into(),
+            namespace: None,
+            input: json!({ "raw": patch }).into(),
+        });
+        let mut r2 = Message::new(Role::Tool);
+        r2.content.push(Block::ToolResult {
+            tool_use_id: "call_patch".into(),
+            content: "Success.".into(),
+            is_error: false,
+            tool_name: Some("apply_patch".into()),
+            status: None,
+            details: None,
+        });
+
+        session.messages = vec![c1, r1, c2, r2];
+        let emitted = emit(
+            &session,
+            &world.base,
+            &EmitOptions {
+                new_id: Some("custom-tools".into()),
+                ..Default::default()
+            },
+        )?;
+        let raw_text = fs::read_to_string(&emitted.path)?;
+        let payload_types: Vec<String> = raw_text
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter(|v| v["type"] == "response_item")
+            .filter_map(|v| v["payload"]["type"].as_str().map(str::to_string))
+            .collect();
+        assert_eq!(
+            payload_types,
+            vec![
+                "custom_tool_call",
+                "custom_tool_call_output",
+                "custom_tool_call",
+                "custom_tool_call_output",
+            ]
+        );
+
+        let adapter = super::super::Codex::with_home(&world.home);
+        let parsed = adapter.parse(&SessionRef::new("custom-tools", adapter.harness(), &emitted.path))?;
+        assert_eq!(parsed.messages.len(), 4);
+        assert_eq!(
+            serde_json::to_value(&parsed.messages[0].content)?,
+            json!([{
+                "type": "tool_use",
+                "id": "call_exec",
+                "name": "exec",
+                "namespace": "functions",
+                "input": script,
+            }])
+        );
+        assert_eq!(
+            serde_json::to_value(&parsed.messages[1].content)?,
+            json!([{
+                "type": "tool_result",
+                "tool_use_id": "call_exec",
+                "content": "Script failed\nWall time 0.1 seconds",
+                "is_error": true,
+                "tool_name": "exec",
+            }])
+        );
+        assert_eq!(
+            serde_json::to_value(&parsed.messages[2].content)?,
+            json!([{
+                "type": "tool_use",
+                "id": "call_patch",
+                "name": "apply_patch",
+                "input": patch,
+            }])
+        );
+        Ok(())
     }
 }

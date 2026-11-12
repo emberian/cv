@@ -133,24 +133,36 @@ impl Codex {
 }
 
 impl Adapter for Codex {
-    /// An MCP call Codex refused because the approval policy could not ask (`never`).
+    /// An MCP call Codex refused because the approval policy could not ask (`never`), or a
+    /// `Plan` (`update_plan`) item completed notice.
     fn record_affordance(
         &self,
         m: &Message,
         first: &crate::affordance::FirstText<'_>,
     ) -> Result<Option<crate::affordance::RecordHit>> {
-        let mcp = m
-            .harness_extra(Harness::Codex)
-            .and_then(|bag| bag.get("item_type"))
-            .and_then(Value::as_str)
-            == Some("McpToolCall");
-        Ok(
-            (mcp && first.contains("requires approval")?).then_some(crate::affordance::RecordHit {
+        let Some(bag) = m.harness_extra(Harness::Codex) else {
+            return Ok(None);
+        };
+        match bag.get("item_type").and_then(Value::as_str) {
+            Some("McpToolCall") if first.contains("requires approval")? => Ok(Some(crate::affordance::RecordHit {
                 kind: crate::affordance::Kind::Approval,
                 action: "deny",
                 tool: "McpToolCall",
-            }),
-        )
+            })),
+            Some("Plan") => Ok(Some(crate::affordance::RecordHit {
+                kind: crate::affordance::Kind::Plan,
+                action: "write",
+                tool: "update_plan",
+            })),
+            _ if bag.get("codex_event").and_then(Value::as_str) == Some("plan") => {
+                Ok(Some(crate::affordance::RecordHit {
+                    kind: crate::affordance::Kind::Plan,
+                    action: "write",
+                    tool: "update_plan",
+                }))
+            }
+            _ => Ok(None),
+        }
     }
 
     fn harness(&self) -> Harness {
@@ -3355,5 +3367,60 @@ mod tests {
         assert_eq!((ws.role, ws.origin), (Role::System, Origin::Harness));
         assert_eq!(ws.extra[crate::ir::CARRIER_KEY]["payload"]["agents_md"], "# AGENTS.md");
         assert!(ws.content.is_empty());
+    }
+
+    #[test]
+    fn custom_tool_call_output_errors_and_modern_affordances_parse() {
+        let lines = vec![
+            r#"{"timestamp":"2026-10-18T00:00:00Z","type":"session_meta","payload":{"id":"aff-1","cwd":"/w","originator":"codex-cli","cli_version":"0.165.0","source":"cli","model_provider":"openai"}}"#.to_string(),
+            r#"{"timestamp":"2026-10-18T00:00:01Z","type":"response_item","payload":{"type":"custom_tool_call","call_id":"c_fail","name":"exec","namespace":"functions","input":"tools.exec_command('bad')"}}"#.to_string(),
+            r#"{"timestamp":"2026-10-18T00:00:02Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"c_fail","output":[{"type":"input_text","text":"Script failed\nWall time 0.0 seconds\nOutput:\n"},{"type":"input_text","text":"Script error:\ntool `exec_command` expects a JSON object"}]}}"#.to_string(),
+            r#"{"timestamp":"2026-10-18T00:00:03Z","type":"response_item","payload":{"type":"custom_tool_call","call_id":"c_cell","name":"exec","namespace":"functions","input":"await new Promise(() => {})"}}"#.to_string(),
+            r#"{"timestamp":"2026-10-18T00:00:04Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"c_cell","output":"Script running with cell ID 53\nWall time 10.0 seconds\nOutput:\nbuilding..."}}"#.to_string(),
+            r#"{"timestamp":"2026-10-18T00:00:05Z","type":"response_item","payload":{"type":"function_call","call_id":"c_wait","name":"wait","arguments":"{\"cell_id\":\"53\",\"yield_time_ms\":30000}"}}"#.to_string(),
+            r#"{"timestamp":"2026-10-18T00:00:06Z","type":"response_item","payload":{"type":"function_call_output","call_id":"c_wait","output":[{"type":"input_text","text":"Script completed\nWall time 18.0 seconds\nOutput:\nok"}]}}"#.to_string(),
+            r#"{"timestamp":"2026-10-18T00:00:07Z","type":"response_item","payload":{"type":"function_call","call_id":"c_spawn","name":"spawn_agent","namespace":"collaboration","arguments":"{\"task_name\":\"verifier\",\"message\":\"run tests\"}"}}"#.to_string(),
+            r#"{"timestamp":"2026-10-18T00:00:08Z","type":"response_item","payload":{"type":"function_call_output","call_id":"c_spawn","output":"{\"task_name\":\"/root/verifier\"}"}}"#.to_string(),
+            r#"{"timestamp":"2026-10-18T00:00:09Z","type":"event_msg","payload":{"type":"item_completed","turn_id":"t1","item":{"type":"Plan","id":"plan-1","text":"1. audit\n2. fix"}}}"#.to_string(),
+        ];
+        let s = parse_jsonl(&lines);
+        let Block::ToolResult { is_error, .. } = &s.messages[1].content[0] else {
+            panic!("expected tool result");
+        };
+        assert!(*is_error, "Script failed array item must mark ToolResult as error");
+        let Block::ToolResult { is_error: ok_err, .. } = &s.messages[5].content[0] else {
+            panic!("expected tool result");
+        };
+        assert!(!*ok_err);
+
+        let rows = crate::affordance::of_session(&s).unwrap();
+        let got: Vec<_> = rows
+            .iter()
+            .map(|r| (r.kind, r.action, r.tool.as_deref(), r.summary.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (
+                    crate::affordance::Kind::BackgroundJob,
+                    "start",
+                    None,
+                    "Script running with cell ID 53"
+                ),
+                (crate::affordance::Kind::BackgroundJob, "read", Some("wait"), "53"),
+                (
+                    crate::affordance::Kind::SubagentSpawn,
+                    "spawn",
+                    Some("spawn_agent"),
+                    "verifier"
+                ),
+                (
+                    crate::affordance::Kind::Plan,
+                    "write",
+                    Some("update_plan"),
+                    "1. audit 2. fix"
+                ),
+            ]
+        );
     }
 }

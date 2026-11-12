@@ -1124,6 +1124,11 @@ impl Reader<'_> {
                     (field("name")?, input)
                 };
                 let mut m = Message::new(Role::Assistant);
+                if name == "spawn_agent"
+                    && sbag(self.session).get("history_mode").and_then(Value::as_str) != Some("paginated")
+                {
+                    m.kind = MessageKind::SubagentSpawn;
+                }
                 m.timestamp = ts;
                 if let Some(status) = str_at(Some(p), "status")? {
                     bag(&mut m).insert("status".into(), Value::String(status));
@@ -1149,18 +1154,23 @@ impl Reader<'_> {
                 let output = p.get("output")?;
                 let (content, images, is_error) = match output {
                     Some(o) if o.is_string()? => {
+                        const PATCH_ERR_PREFIX: &str = "apply_patch verification failed";
+                        let want = if self.ctx.cv_wrote {
+                            ERROR_PREFIX.len().max(PATCH_ERR_PREFIX.len())
+                        } else {
+                            PATCH_ERR_PREFIX.len()
+                        };
                         let mut prefix = String::new();
-                        if self.ctx.cv_wrote {
-                            o.for_each_char(|c| {
-                                prefix.push(c);
-                                prefix.len() < ERROR_PREFIX.len()
-                            })?;
-                        }
+                        o.for_each_char(|c| {
+                            prefix.push(c);
+                            prefix.len() < want
+                        })?;
                         let mut text = d.text(o)?.unwrap_or_default();
-                        let is_error = prefix == ERROR_PREFIX;
-                        if is_error {
+                        let cv_err = self.ctx.cv_wrote && prefix.starts_with(ERROR_PREFIX);
+                        if cv_err {
                             text = text.with_skipped_prefix(ERROR_PREFIX.len())?;
                         }
+                        let is_error = cv_err || prefix.starts_with(PATCH_ERR_PREFIX);
                         (text, Vec::new(), is_error)
                     }
                     _ => {
@@ -1375,13 +1385,45 @@ fn coerce_output(v: Option<JsonView<'_>>) -> Result<(String, Vec<Block>)> {
     Ok((v.resolve()?.to_string(), Vec::new()))
 }
 
-/// Detect a failed tool result from the `success`/`exit_code`/`metadata` markers Codex emits.
+/// Detect a failed tool result from the `success`/`exit_code`/`metadata` markers or `exec`
+/// `"Script failed\n"` / `"Script error:\n"` content items Codex emits.
 fn output_is_error(v: Option<JsonView<'_>>) -> Result<bool> {
-    let Some(v) = v.filter(|v| v.is_object().unwrap_or(false)) else {
+    let Some(v) = v else {
         return Ok(false);
     };
+    if let Some(items) = v.array()? {
+        for it in items {
+            let it = it?;
+            if let Some(text) = it.get("text")?.filter(|t| t.is_string().unwrap_or(false)) {
+                let mut head = String::new();
+                text.for_each_char(|c| {
+                    head.push(c);
+                    head.len() < 16
+                })?;
+                if head.starts_with("Script failed\n")
+                    || head == "Script failed"
+                    || head.starts_with("Script error:\n")
+                    || head.starts_with("Script error:")
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        return Ok(false);
+    }
+    if !v.is_object()? {
+        return Ok(false);
+    }
     if v.get("success")?.map(JsonView::as_bool).transpose()?.flatten() == Some(false) {
         return Ok(true);
     }
-    Ok(matches!(i64_at(v.get("metadata")?, "exit_code")?, Some(c) if c != 0))
+    if matches!(i64_at(v.get("metadata")?, "exit_code")?, Some(c) if c != 0) {
+        return Ok(true);
+    }
+    if let Some(inner) = v.get("output")? {
+        if inner.is_array()? || inner.is_object()? {
+            return output_is_error(Some(inner));
+        }
+    }
+    Ok(false)
 }
