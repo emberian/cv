@@ -1170,6 +1170,11 @@ pub fn proc_start_time_of(pid: i64) -> Option<i64> {
 
 /// Check whether `run` corresponds to a currently live OS process matching `(pid, proc_start_time)`.
 pub fn is_lane_run_alive(run: &LaneRun) -> bool {
+    if let Some(recorded) = &run.boot_id {
+        if crate::lanes::current_boot_id().as_ref() != Some(recorded) {
+            return false;
+        }
+    }
     if run.exited_at.is_some() {
         return false;
     }
@@ -1186,9 +1191,7 @@ pub fn is_lane_run_alive(run: &LaneRun) -> bool {
             }
         }
         if let Some(expected_start) = run.proc_start_time {
-            if let Some(actual_start) = proc_start_time_of(pid) {
-                return actual_start == expected_start;
-            }
+            return proc_start_time_of(pid) == Some(expected_start);
         }
         true
     }

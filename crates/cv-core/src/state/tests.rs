@@ -882,3 +882,51 @@ fn ipc_owner_reads_large_and_slow_frames_on_blocking_accepted_sockets() {
     drop(server);
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn serverless_epochs_are_reused_per_producer_across_store_reopens() {
+    let dir = tmp_state_dir("epoch-reuse");
+    let mut first = None;
+    for i in 0..20 {
+        let store = StateStore::at_dir(&dir).with_producer("producer-a");
+        let receipt = store.append(&format!("op-{i}"), "digest", &json!({})).unwrap();
+        assert_eq!(receipt.event_id.seq, i + 1);
+        assert_eq!(
+            first.get_or_insert(receipt.event_id.epoch.clone()),
+            &receipt.event_id.epoch
+        );
+    }
+    let store = StateStore::at_dir(&dir).with_producer("producer-b");
+    let other = store.append("other", "digest", &json!({})).unwrap();
+    assert_ne!(first.unwrap(), other.event_id.epoch);
+    assert_eq!(other.event_id.seq, 1);
+    let conn = store.open_readonly().unwrap().unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM writer_epochs", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 2);
+    drop(conn);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn direct_lane_liveness_rejects_previous_boot() {
+    let run = LaneRun {
+        run_id: "test".into(),
+        session_id: "test".into(),
+        agent_id: None,
+        agent_type: None,
+        harness: None,
+        pid: Some(i64::from(std::process::id())),
+        proc_start_time: super::tables::proc_start_time_of(i64::from(std::process::id())),
+        boot_id: Some("previous-boot".into()),
+        transcript_path: None,
+        agent_transcript_path: None,
+        cwd: None,
+        started_at: 0,
+        exited_at: None,
+        exit_status: None,
+        last_text: None,
+    };
+    assert!(!is_lane_run_alive(&run));
+}

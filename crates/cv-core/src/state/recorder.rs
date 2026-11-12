@@ -189,15 +189,19 @@ impl StateStore {
             .filter(|s| !s.trim().is_empty())
             .unwrap_or(&self.default_producer);
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut serverless_epoch: Option<String> = None;
+        // A serverless epoch belongs to the producer, not the short-lived hook process.
+        // Ownership plus BEGIN IMMEDIATE serializes reuse and sequence allocation, including
+        // across IPC owner lifetimes. Closed historical epochs are never reopened.
+        let mut serverless_epoch = tx
+            .query_row(
+                "SELECT epoch FROM writer_epochs
+             WHERE producer_id = ?1 AND mode = 'serverless' AND closed_at IS NULL
+             ORDER BY activated_at DESC, epoch DESC LIMIT 1",
+                [producer],
+                |r| r.get(0),
+            )
+            .optional()?;
         let receipt = commit_append_in_tx(&tx, producer, &mut serverless_epoch, "serverless", req)?;
-        if let Some(ref ep) = serverless_epoch {
-            let now_ms = chrono::Utc::now().timestamp_millis();
-            tx.execute(
-                "UPDATE writer_epochs SET closed_at = ?1 WHERE epoch = ?2",
-                rusqlite::params![now_ms, ep],
-            )?;
-        }
         tx.commit()?;
         Ok(receipt)
     }
