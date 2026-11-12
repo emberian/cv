@@ -123,7 +123,7 @@ impl<'a> RangeSource<'a> {
             // a string's quotes (ASCII boundaries), so it is UTF-8.
             return Ok(unsafe { std::str::from_utf8_unchecked(body) });
         }
-        std::str::from_utf8(body).map_err(|_| crate::json::InvalidJson.into())
+        simdutf8::basic::from_utf8(body).map_err(|_| crate::json::InvalidJson.into())
     }
     fn of_bytes(captured: Option<crate::json::JsonSource>, bytes: &'a ByteSource, original: bool) -> Result<Self> {
         let len = bytes.byte_len()?;
@@ -272,6 +272,8 @@ pub(crate) fn scoped<T>(
     f: impl FnOnce(&RangeSource<'_>) -> Result<T>,
 ) -> Result<T> {
     #[cfg(feature = "mmap")]
+    if decoded.is_some()
+        || crate::io_admission::byte_source_policy(captured.path()) == crate::io_admission::ByteSourcePolicy::Mapped
     {
         let mut callback = Some(f);
         if let Some(bytes) = decoded {
@@ -301,8 +303,8 @@ pub(crate) fn scoped<T>(
         let map = if range.len == 0 {
             None
         } else {
-            // SAFETY: a read-only mapping of the checked descriptor, dropped with this scope.
-            // File identity guards detect ordinary changes around it, not atomic snapshots.
+            // SAFETY: a read-only mapping of a private decoded spill or local sealed immutable file,
+            // dropped with this scope.
             Some(unsafe {
                 memmap2::MmapOptions::new()
                     .offset(range.offset)
@@ -323,19 +325,16 @@ pub(crate) fn scoped<T>(
         if decoded.is_none() {
             captured.check_metadata(file.metadata()?)?;
         }
-        result
+        return result;
     }
-    #[cfg(not(feature = "mmap"))]
-    {
-        // The range needs no pre-scoped source here: a positioned RangeSource addresses the
-        // whole capture by absolute offset, and every view applies its own extent to it.
-        let _ = range;
-        let source = match decoded {
-            Some(bytes) => RangeSource::decoded(captured.clone(), bytes)?,
-            None => RangeSource::from_captured(captured.clone())?,
-        };
-        f(&source)
-    }
+    // Positioned RangeSource: mutable external transcripts never mmap (SIGBUS-immune on concurrent
+    // truncation), addressing the capture by absolute offset through bounded read windows.
+    let _ = range;
+    let source = match decoded {
+        Some(bytes) => RangeSource::decoded(captured.clone(), bytes)?,
+        None => RangeSource::from_captured(captured.clone())?,
+    };
+    f(&source)
 }
 
 enum CursorBacking<'a> {
@@ -657,7 +656,7 @@ impl super::super::json::ValidationBytes for Windowed<'_> {
     }
     fn utf8(&mut self, i: usize, end: usize) -> bool {
         if i >= self.start && end <= self.start + self.buf.len() {
-            return std::str::from_utf8(&self.buf[i - self.start..end - self.start]).is_ok();
+            return simdutf8::basic::from_utf8(&self.buf[i - self.start..end - self.start]).is_ok();
         }
         let body = Range {
             offset: self.range.offset + i as u64,

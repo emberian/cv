@@ -34,6 +34,7 @@ pub mod harness;
 pub mod hooks;
 pub mod html;
 pub mod ingest;
+pub mod io_admission;
 pub mod ir;
 mod ir_json;
 pub use ir_json::PrettyJson;
