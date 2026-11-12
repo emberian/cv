@@ -265,6 +265,29 @@ pub fn visit_tool_ops<'a>(
     opts: ClassifyOpts,
     mut emit: impl FnMut(ToolSemantic<'a>),
 ) -> Result<()> {
+    visit_tool_ops_internal(harness, name, input, opts, false, |sem, _| emit(sem))
+}
+
+/// Streaming visitor that also extracts normalized 64-bit line-hunk fingerprints for every
+/// [`ToolOp::FileEdit`] operation (used by [`crate::events`] and derived columnar event segments).
+pub fn visit_tool_ops_with_hunks<'a>(
+    harness: Option<Harness>,
+    name: &'a str,
+    input: JsonView<'a>,
+    opts: ClassifyOpts,
+    emit: impl FnMut(ToolSemantic<'a>, Vec<u64>),
+) -> Result<()> {
+    visit_tool_ops_internal(harness, name, input, opts, true, emit)
+}
+
+fn visit_tool_ops_internal<'a>(
+    harness: Option<Harness>,
+    name: &'a str,
+    input: JsonView<'a>,
+    opts: ClassifyOpts,
+    extract_hunks: bool,
+    mut emit: impl FnMut(ToolSemantic<'a>, Vec<u64>),
+) -> Result<()> {
     let bare = bare_tool_name(name);
 
     // 1. Codex Code Mode `exec` (`custom_tool_call` raw JS string or `{"raw": "..."}`).
@@ -280,7 +303,9 @@ pub fn visit_tool_ops<'a>(
             None
         };
         if let Some(script) = script {
-            scan_codex_exec(&script, opts, &mut |sem| emit(sem.into_owned()));
+            scan_codex_exec(&script, opts, extract_hunks, &mut |sem, hunks| {
+                emit(sem.into_owned(), hunks)
+            });
             return Ok(());
         }
     }
@@ -312,13 +337,16 @@ pub fn visit_tool_ops<'a>(
         } else {
             false
         };
-        emit(ToolSemantic {
-            tool: Cow::Borrowed(name),
-            op: ToolOp::SubagentSpawn {
-                target_hint,
-                has_prompt,
+        emit(
+            ToolSemantic {
+                tool: Cow::Borrowed(name),
+                op: ToolOp::SubagentSpawn {
+                    target_hint,
+                    has_prompt,
+                },
             },
-        });
+            Vec::new(),
+        );
         return Ok(());
     }
 
@@ -331,10 +359,13 @@ pub fn visit_tool_ops<'a>(
         } else {
             None
         };
-        emit(ToolSemantic {
-            tool: Cow::Borrowed(name),
-            op: ToolOp::AgentMessage { recipient },
-        });
+        emit(
+            ToolSemantic {
+                tool: Cow::Borrowed(name),
+                op: ToolOp::AgentMessage { recipient },
+            },
+            Vec::new(),
+        );
         return Ok(());
     }
 
@@ -359,27 +390,33 @@ pub fn visit_tool_ops<'a>(
         } else {
             None
         };
-        emit(ToolSemantic {
-            tool: Cow::Borrowed(name),
-            op: ToolOp::Background { job_id, action },
-        });
+        emit(
+            ToolSemantic {
+                tool: Cow::Borrowed(name),
+                op: ToolOp::Background { job_id, action },
+            },
+            Vec::new(),
+        );
         return Ok(());
     }
 
     // 3. Patch tools (`apply_patch` and `*patch*`).
     let lname = bare.to_ascii_lowercase();
     if lname.contains("patch") {
-        let files = patch_rows(input)?;
+        let files = patch_rows(input, extract_hunks)?;
         if !files.is_empty() {
-            for file in files {
+            for (file, hunks) in files {
                 let path = resolve_workdir(&file, workdir.as_deref());
-                emit(ToolSemantic {
-                    tool: Cow::Borrowed(name),
-                    op: ToolOp::FileEdit {
-                        path: Cow::Owned(path),
-                        is_full_write: false,
+                emit(
+                    ToolSemantic {
+                        tool: Cow::Borrowed(name),
+                        op: ToolOp::FileEdit {
+                            path: Cow::Owned(path),
+                            is_full_write: false,
+                        },
                     },
-                });
+                    hunks,
+                );
             }
             return Ok(());
         }
@@ -389,10 +426,13 @@ pub fn visit_tool_ops<'a>(
             } else {
                 None
             };
-            emit(ToolSemantic {
-                tool: Cow::Borrowed(name),
-                op: ToolOp::Other { path: None, summary },
-            });
+            emit(
+                ToolSemantic {
+                    tool: Cow::Borrowed(name),
+                    op: ToolOp::Other { path: None, summary },
+                },
+                Vec::new(),
+            );
             return Ok(());
         }
     }
@@ -408,10 +448,13 @@ pub fn visit_tool_ops<'a>(
         } else {
             None
         };
-        emit(ToolSemantic {
-            tool: Cow::Borrowed(name),
-            op: ToolOp::Search { path, query },
-        });
+        emit(
+            ToolSemantic {
+                tool: Cow::Borrowed(name),
+                op: ToolOp::Search { path, query },
+            },
+            Vec::new(),
+        );
         return Ok(());
     }
 
@@ -425,17 +468,25 @@ pub fn visit_tool_ops<'a>(
                 .transpose()?
                 .flatten()
                 .is_some();
-        let op = if is_editor_view {
-            ToolOp::FileRead { path }
+        let (op, hunks) = if is_editor_view {
+            (ToolOp::FileRead { path }, Vec::new())
         } else if matches!(
             bare,
             "Write" | "write_file" | "save-file" | "create_file" | "write_to_file"
         ) || lname == "write"
         {
-            ToolOp::FileEdit {
-                path,
-                is_full_write: true,
-            }
+            let hunks = if extract_hunks {
+                extract_file_edit_hunks(input, true)?
+            } else {
+                Vec::new()
+            };
+            (
+                ToolOp::FileEdit {
+                    path,
+                    is_full_write: true,
+                },
+                hunks,
+            )
         } else if matches!(
             bare,
             "Edit"
@@ -448,10 +499,18 @@ pub fn visit_tool_ops<'a>(
                 | "str_replace_editor"
         ) || WRITE_HINTS.iter().any(|hint| lname.contains(hint))
         {
-            ToolOp::FileEdit {
-                path,
-                is_full_write: false,
-            }
+            let hunks = if extract_hunks {
+                extract_file_edit_hunks(input, false)?
+            } else {
+                Vec::new()
+            };
+            (
+                ToolOp::FileEdit {
+                    path,
+                    is_full_write: false,
+                },
+                hunks,
+            )
         } else if matches!(
             bare,
             "Read"
@@ -464,22 +523,28 @@ pub fn visit_tool_ops<'a>(
                 | "read_many_files"
         ) || READ_HINTS.iter().any(|hint| lname.contains(hint))
         {
-            ToolOp::FileRead { path }
+            (ToolOp::FileRead { path }, Vec::new())
         } else {
-            ToolOp::Other {
-                path: Some(path),
-                summary: None,
-            }
+            (
+                ToolOp::Other {
+                    path: Some(path),
+                    summary: None,
+                },
+                Vec::new(),
+            )
         };
-        emit(ToolSemantic {
-            tool: Cow::Borrowed(name),
-            op,
-        });
+        emit(
+            ToolSemantic {
+                tool: Cow::Borrowed(name),
+                op,
+            },
+            hunks,
+        );
         return Ok(());
     }
 
     // 6. Command tools (`command` / `cmd` / `script` / `CommandLine` / `action.command`).
-    if let Some((command, files)) = command_rows(input, opts.commands)? {
+    if let Some((command, files)) = command_rows(input, opts.commands, extract_hunks)? {
         let background = if opts.summaries {
             bool_flag(input, "run_in_background")?
                 || bool_flag(input, "is_background")?
@@ -488,23 +553,29 @@ pub fn visit_tool_ops<'a>(
         } else {
             false
         };
-        emit(ToolSemantic {
-            tool: Cow::Borrowed(name),
-            op: ToolOp::Command {
-                cmd: command.map(Cow::Owned),
-                workdir: workdir.clone().map(Cow::Owned),
-                background,
-            },
-        });
-        for file in files {
-            let resolved = resolve_workdir(&file, workdir.as_deref());
-            emit(ToolSemantic {
+        emit(
+            ToolSemantic {
                 tool: Cow::Borrowed(name),
-                op: ToolOp::FileEdit {
-                    path: Cow::Owned(resolved),
-                    is_full_write: false,
+                op: ToolOp::Command {
+                    cmd: command.map(Cow::Owned),
+                    workdir: workdir.clone().map(Cow::Owned),
+                    background,
                 },
-            });
+            },
+            Vec::new(),
+        );
+        for (file, hunks) in files {
+            let resolved = resolve_workdir(&file, workdir.as_deref());
+            emit(
+                ToolSemantic {
+                    tool: Cow::Borrowed(name),
+                    op: ToolOp::FileEdit {
+                        path: Cow::Owned(resolved),
+                        is_full_write: false,
+                    },
+                },
+                hunks,
+            );
         }
         return Ok(());
     }
@@ -531,15 +602,18 @@ pub fn visit_tool_ops<'a>(
             } else {
                 String::new()
             };
-            emit(ToolSemantic {
-                tool: Cow::Borrowed(name),
-                op: ToolOp::Affordance {
-                    kind,
-                    action,
-                    summary,
-                    items: Vec::new(),
+            emit(
+                ToolSemantic {
+                    tool: Cow::Borrowed(name),
+                    op: ToolOp::Affordance {
+                        kind,
+                        action,
+                        summary,
+                        items: Vec::new(),
+                    },
                 },
-            });
+                Vec::new(),
+            );
             return Ok(());
         }
     }
@@ -550,10 +624,13 @@ pub fn visit_tool_ops<'a>(
     } else {
         None
     };
-    emit(ToolSemantic {
-        tool: Cow::Borrowed(name),
-        op: ToolOp::Other { path: None, summary },
-    });
+    emit(
+        ToolSemantic {
+            tool: Cow::Borrowed(name),
+            op: ToolOp::Other { path: None, summary },
+        },
+        Vec::new(),
+    );
     Ok(())
 }
 
@@ -807,11 +884,268 @@ fn collapse_line(text: &str, max: usize) -> String {
     head.finish()
 }
 
+/// Maximum distinct 64-bit hunk/line fingerprints emitted for one [`ToolOp::FileEdit`], keeping
+/// per-row memory strictly bounded even on multi-megabyte full-file `Write` payloads.
+pub const MAX_HUNK_HASHES_PER_EDIT: usize = 256;
+
+const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0100_0000_01b3;
+const HUNK_HASH_DOMAIN: u8 = 0x01;
+const LINE_HASH_DOMAIN: u8 = 0x02;
+
+#[inline]
+fn fnv_update(mut h: u64, bytes: &[u8]) -> u64 {
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(FNV_PRIME);
+    }
+    h
+}
+
+#[inline]
+fn splitmix_finalize(mut x: u64) -> u64 {
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    let out = x ^ (x >> 31);
+    if out == 0 {
+        1
+    } else {
+        out
+    }
+}
+
+/// Deterministic 64-bit fingerprint of a single nontrivial normalized line (`line.trim()`).
+/// Returns `None` for empty lines or short punctuation-only boilerplate (`{`, `}`, `};`, `);`).
+pub fn hash_normalized_line(line: &str) -> Option<u64> {
+    let trimmed = line.trim();
+    if trimmed.len() < 3 || !trimmed.chars().any(char::is_alphanumeric) {
+        return None;
+    }
+    let mut h = fnv_update(FNV_OFFSET_BASIS, &[LINE_HASH_DOMAIN]);
+    h = fnv_update(h, trimmed.as_bytes());
+    Some(splitmix_finalize(h))
+}
+
+/// Deterministic 64-bit fingerprint of a contiguous block of added/replacement lines.
+/// Empty/whitespace-only lines are skipped and remaining lines are trimmed, so indentation changes,
+/// rebases, cherry-picks, and amends preserve the exact hunk fingerprint.
+pub fn hash_normalized_hunk<'a>(lines: impl IntoIterator<Item = &'a str>) -> Option<u64> {
+    let mut h = fnv_update(FNV_OFFSET_BASIS, &[HUNK_HASH_DOMAIN]);
+    let mut any = false;
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if any {
+            h = fnv_update(h, b"\n");
+        }
+        h = fnv_update(h, trimmed.as_bytes());
+        any = true;
+    }
+    any.then(|| splitmix_finalize(h))
+}
+
+/// Bounded streaming accumulator of 64-bit hunk-block and nontrivial-line fingerprints.
+/// Retains only the current in-flight line fragment (`<= 8 KiB` effective prefix) and up to
+/// [`MAX_HUNK_HASHES_PER_EDIT`] deduplicated `u64` hashes.
+#[derive(Default)]
+struct HunkCollector {
+    line_buf: String,
+    line_overflow: bool,
+    block_state: u64,
+    block_has_lines: bool,
+    line_hashes: Vec<u64>,
+    block_hashes: Vec<u64>,
+}
+
+impl HunkCollector {
+    const MAX_LINE_BYTES: usize = 8192;
+
+    fn push_hash_unique(vec: &mut Vec<u64>, cap: usize, hash: u64) {
+        if vec.len() < cap && !vec.contains(&hash) {
+            vec.push(hash);
+        }
+    }
+
+    fn feed_normalized_added_line(&mut self, raw_line: &str) {
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        if !self.block_has_lines {
+            self.block_state = fnv_update(FNV_OFFSET_BASIS, &[HUNK_HASH_DOMAIN]);
+        } else {
+            self.block_state = fnv_update(self.block_state, b"\n");
+        }
+        self.block_state = fnv_update(self.block_state, trimmed.as_bytes());
+        self.block_has_lines = true;
+
+        if self.line_hashes.len() < MAX_HUNK_HASHES_PER_EDIT {
+            if let Some(lh) = hash_normalized_line(trimmed) {
+                Self::push_hash_unique(&mut self.line_hashes, MAX_HUNK_HASHES_PER_EDIT, lh);
+            }
+        }
+    }
+
+    fn flush_block(&mut self) {
+        if self.block_has_lines {
+            let bh = splitmix_finalize(self.block_state);
+            Self::push_hash_unique(&mut self.block_hashes, MAX_HUNK_HASHES_PER_EDIT, bh);
+            self.block_has_lines = false;
+            self.block_state = 0;
+        }
+    }
+
+    fn push_content_chunk(&mut self, chunk: &str) {
+        for part in chunk.split_inclusive('\n') {
+            let fragment = part.strip_suffix('\n').unwrap_or(part);
+            if !self.line_overflow {
+                let room = Self::MAX_LINE_BYTES.saturating_sub(self.line_buf.len());
+                if fragment.len() <= room {
+                    self.line_buf.push_str(fragment);
+                } else {
+                    let safe = fragment.floor_char_boundary(room);
+                    self.line_buf.push_str(&fragment[..safe]);
+                    self.line_overflow = true;
+                }
+            }
+            if part.ends_with('\n') {
+                let line = std::mem::take(&mut self.line_buf);
+                self.line_overflow = false;
+                self.feed_normalized_added_line(&line);
+            }
+        }
+    }
+
+    fn end_content_segment(&mut self) {
+        if !self.line_buf.is_empty() {
+            let line = std::mem::take(&mut self.line_buf);
+            self.line_overflow = false;
+            self.feed_normalized_added_line(&line);
+        }
+        self.flush_block();
+    }
+
+    fn finish(mut self) -> Vec<u64> {
+        self.end_content_segment();
+        let mut out = self.block_hashes;
+        for lh in self.line_hashes {
+            if out.len() >= MAX_HUNK_HASHES_PER_EDIT {
+                break;
+            }
+            if !out.contains(&lh) {
+                out.push(lh);
+            }
+        }
+        out
+    }
+}
+
+/// Extract normalized 64-bit hunk-block and line fingerprints from an added/replacement content string.
+pub fn extract_content_hunk_hashes(content: &str) -> Vec<u64> {
+    let mut collector = HunkCollector::default();
+    collector.push_content_chunk(content);
+    collector.finish()
+}
+
+/// Extract normalized 64-bit hunk-block and line fingerprints from unified diff or `apply_patch` text.
+/// Contiguous `+` lines (excluding `+++` file headers) form hunk blocks; context/deletion/header lines
+/// flush the current hunk block.
+pub fn extract_diff_hunk_hashes(patch_text: &str) -> Vec<u64> {
+    let mut collector = HunkCollector::default();
+    for raw_line in patch_text.lines() {
+        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+        if let Some(added) = line.strip_prefix('+') {
+            if line.starts_with("+++ ") || line == "+++" {
+                collector.flush_block();
+            } else {
+                collector.feed_normalized_added_line(added);
+            }
+        } else {
+            collector.flush_block();
+        }
+    }
+    collector.finish()
+}
+
 /// Extract every file path added, updated, deleted, or moved to in an `apply_patch` or unified diff.
 pub fn patch_paths(patch_text: &str) -> Vec<String> {
-    let mut patch = Patch::default();
+    let mut patch = Patch::new(false);
+    patch.push(patch_text);
+    patch.finish_paths()
+}
+
+/// Extract `(path, hunk_hashes)` pairs in first-seen file order from an `apply_patch` or unified diff.
+pub fn patch_paths_and_hunks(patch_text: &str) -> Vec<(String, Vec<u64>)> {
+    let mut patch = Patch::new(true);
     patch.push(patch_text);
     patch.finish()
+}
+
+fn extract_file_edit_hunks(view: JsonView<'_>, is_full_write: bool) -> Result<Vec<u64>> {
+    let mut collector = HunkCollector::default();
+    let scalar_keys: &[&str] = if is_full_write {
+        &["content", "Content", "file_text", "text", "new_string", "new_str"]
+    } else {
+        &[
+            "new_string",
+            "new_str",
+            "replacement",
+            "Replacement",
+            "ReplacementContent",
+            "replacement_content",
+            "new_source",
+            "content",
+            "Content",
+        ]
+    };
+    for &key in scalar_keys {
+        if let Some(val) = view.get(key)? {
+            if val.is_string()? {
+                val.for_each_str_chunk(|chunk| {
+                    collector.push_content_chunk(chunk);
+                    Ok(())
+                })?;
+                collector.end_content_segment();
+            }
+        }
+    }
+    if !is_full_write {
+        for (arr_key, item_keys) in [
+            ("edits", &["new_string", "new_str", "replacement", "content"][..]),
+            (
+                "ReplacementChunks",
+                &["ReplacementContent", "replacement_content", "new_string"][..],
+            ),
+            (
+                "replacement_chunks",
+                &["replacement_content", "ReplacementContent", "new_string"][..],
+            ),
+            ("replacements", &["new_string", "replacement", "new_str", "content"][..]),
+        ] {
+            if let Some(arr_view) = view.get(arr_key)? {
+                if let Some(items) = arr_view.array()? {
+                    for item in items {
+                        let item = item?;
+                        for &ik in item_keys {
+                            if let Some(val) = item.get(ik)? {
+                                if val.is_string()? {
+                                    val.for_each_str_chunk(|chunk| {
+                                        collector.push_content_chunk(chunk);
+                                        Ok(())
+                                    })?;
+                                    collector.end_content_segment();
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(collector.finish())
 }
 
 /// Extract the spawned child agent identifier (`task_name`, `agent_id`, `agentId`, or
@@ -988,8 +1322,9 @@ impl Old {
     }
 }
 
-/// Streaming patch-header state machine: retains only candidate header lines and deduplicated
-/// output paths in first-seen order.
+/// Streaming patch-header state machine: retains only candidate header lines, deduplicated
+/// output paths in first-seen order, and (when `collect_hunks` is enabled) per-file normalized
+/// 64-bit hunk/line fingerprints.
 #[derive(Default)]
 pub(crate) struct Patch {
     codex: Header,
@@ -998,9 +1333,23 @@ pub(crate) struct Patch {
     primary: HashMap<String, usize>,
     fallback: HashMap<String, usize>,
     has_old: bool,
+    collect_hunks: bool,
+    line_buf: String,
+    line_overflow: bool,
+    active_primary: Option<String>,
+    active_fallback: Option<String>,
+    primary_hunks: HashMap<String, HunkCollector>,
+    fallback_hunks: HashMap<String, HunkCollector>,
 }
 
 impl Patch {
+    pub(crate) fn new(collect_hunks: bool) -> Self {
+        Self {
+            collect_hunks,
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn push(&mut self, text: &str) {
         for part in text.split_inclusive('\n') {
             let line = part.strip_suffix('\n').unwrap_or(part);
@@ -1010,6 +1359,16 @@ impl Patch {
                 self.old.push(line);
                 self.has_old = self.old.found;
             }
+            if self.collect_hunks && !self.line_overflow {
+                let room = HunkCollector::MAX_LINE_BYTES.saturating_sub(self.line_buf.len());
+                if line.len() <= room {
+                    self.line_buf.push_str(line);
+                } else {
+                    let safe = line.floor_char_boundary(room);
+                    self.line_buf.push_str(&line[..safe]);
+                    self.line_overflow = true;
+                }
+            }
             if part.ends_with('\n') {
                 self.end_line();
             }
@@ -1017,35 +1376,118 @@ impl Patch {
     }
 
     fn end_line(&mut self) {
-        fn add(out: &mut HashMap<String, usize>, value: &str) {
+        fn clean_path(value: &str) -> Option<String> {
             let value = value.trim();
-            if !value.is_empty() && value != "/dev/null" && !value.contains("${") && !out.contains_key(value) {
-                out.insert(value.to_string(), out.len());
-            }
+            (!value.is_empty() && value != "/dev/null" && !value.contains("${")).then(|| value.to_string())
         }
+        fn add(out: &mut HashMap<String, usize>, value: &str) -> Option<String> {
+            let clean = clean_path(value)?;
+            if !out.contains_key(&clean) {
+                out.insert(clean.clone(), out.len());
+            }
+            Some(clean)
+        }
+        let mut switched_file = false;
         if let Some(value) = self.codex.value.take() {
-            add(&mut self.primary, &value);
+            if let Some(prev) = &self.active_primary {
+                if let Some(c) = self.primary_hunks.get_mut(prev) {
+                    c.flush_block();
+                }
+            }
+            self.active_primary = add(&mut self.primary, &value);
+            switched_file = true;
         }
         if let Some(value) = self.unified.value.take() {
-            add(&mut self.fallback, value.trim().trim_start_matches("b/"));
+            if let Some(prev) = &self.active_fallback {
+                if let Some(c) = self.fallback_hunks.get_mut(prev) {
+                    c.flush_block();
+                }
+            }
+            self.active_fallback = add(&mut self.fallback, value.trim().trim_start_matches("b/"));
+            switched_file = true;
+        }
+        if self.collect_hunks {
+            let full_line = std::mem::take(&mut self.line_buf);
+            let full_line = full_line.strip_suffix('\r').unwrap_or(&full_line);
+            self.line_overflow = false;
+            if !switched_file && !full_line.is_empty() {
+                let trimmed_start = full_line.trim_start();
+                if trimmed_start.starts_with("*** End Patch") || trimmed_start.starts_with("diff --git ") {
+                    if let Some(prev) = &self.active_primary {
+                        if let Some(c) = self.primary_hunks.get_mut(prev) {
+                            c.flush_block();
+                        }
+                    }
+                    if let Some(prev) = &self.active_fallback {
+                        if let Some(c) = self.fallback_hunks.get_mut(prev) {
+                            c.flush_block();
+                        }
+                    }
+                    self.active_primary = None;
+                    self.active_fallback = None;
+                } else if let Some(added) = full_line.strip_prefix('+') {
+                    if !(full_line.starts_with("+++ ") || full_line == "+++") {
+                        if let Some(active) = &self.active_primary {
+                            self.primary_hunks
+                                .entry(active.clone())
+                                .or_default()
+                                .feed_normalized_added_line(added);
+                        }
+                        if let Some(active) = &self.active_fallback {
+                            self.fallback_hunks
+                                .entry(active.clone())
+                                .or_default()
+                                .feed_normalized_added_line(added);
+                        }
+                    }
+                } else {
+                    if let Some(active) = &self.active_primary {
+                        if let Some(c) = self.primary_hunks.get_mut(active) {
+                            c.flush_block();
+                        }
+                    }
+                    if let Some(active) = &self.active_fallback {
+                        if let Some(c) = self.fallback_hunks.get_mut(active) {
+                            c.flush_block();
+                        }
+                    }
+                }
+            }
         }
         self.codex = Header::default();
         self.unified = Header::default();
         self.old = Old::default();
     }
 
-    pub(crate) fn finish(mut self) -> Vec<String> {
-        self.end_line();
-        let paths = if !self.primary.is_empty() {
-            self.primary
+    pub(crate) fn finish_paths(self) -> Vec<String> {
+        self.finish().into_iter().map(|(p, _)| p).collect()
+    }
+
+    pub(crate) fn finish(mut self) -> Vec<(String, Vec<u64>)> {
+        if !self.codex.probe.is_empty()
+            || self.codex.value.is_some()
+            || !self.unified.probe.is_empty()
+            || self.unified.value.is_some()
+            || !self.line_buf.is_empty()
+        {
+            self.end_line();
+        }
+        let (paths, mut hunks_map) = if !self.primary.is_empty() {
+            (self.primary, self.primary_hunks)
         } else if self.has_old {
-            self.fallback
+            (self.fallback, self.fallback_hunks)
         } else {
             return Vec::new();
         };
         let mut ordered: Vec<_> = paths.into_iter().collect();
         ordered.sort_unstable_by_key(|(_, position)| *position);
-        ordered.into_iter().map(|(path, _)| path).collect()
+        ordered
+            .into_iter()
+            .map(|(path, _)| {
+                let hunks = hunks_map.remove(&path).map(HunkCollector::finish).unwrap_or_default();
+                (path, hunks)
+            })
+            .collect()
     }
 }
 
@@ -1143,7 +1585,9 @@ impl Trigger {
     }
 }
 
-pub(crate) fn command_rows(view: JsonView<'_>, whole: bool) -> Result<Option<(Option<String>, Vec<String>)>> {
+pub(crate) type CommandWithPatches = (Option<String>, Vec<(String, Vec<u64>)>);
+
+pub(crate) fn command_rows(view: JsonView<'_>, whole: bool, extract_hunks: bool) -> Result<Option<CommandWithPatches>> {
     let mut command = whole.then(String::new);
     let mut trigger = Trigger::default();
     let exists = command_chunks(view, |chunk| {
@@ -1157,7 +1601,7 @@ pub(crate) fn command_rows(view: JsonView<'_>, whole: bool) -> Result<Option<(Op
         return Ok(None);
     }
     let files = if trigger.marker || trigger.apply {
-        let mut patch = Patch::default();
+        let mut patch = Patch::new(extract_hunks);
         command_chunks(view, |chunk| {
             patch.push(chunk);
             Ok(())
@@ -1165,7 +1609,7 @@ pub(crate) fn command_rows(view: JsonView<'_>, whole: bool) -> Result<Option<(Op
         patch
             .finish()
             .into_iter()
-            .filter(|path| trigger.apply || std::path::Path::new(path).is_absolute())
+            .filter(|(path, _)| trigger.apply || std::path::Path::new(path).is_absolute())
             .collect()
     } else {
         Vec::new()
@@ -1173,22 +1617,22 @@ pub(crate) fn command_rows(view: JsonView<'_>, whole: bool) -> Result<Option<(Op
     Ok(Some((command, files)))
 }
 
-fn command_patch_files(cmd: &str) -> Vec<String> {
+fn command_patch_files(cmd: &str, extract_hunks: bool) -> Vec<(String, Vec<u64>)> {
     let mut trigger = Trigger::default();
     trigger.push(cmd);
     if !(trigger.marker || trigger.apply) {
         return Vec::new();
     }
-    let mut patch = Patch::default();
+    let mut patch = Patch::new(extract_hunks);
     patch.push(cmd);
     patch
         .finish()
         .into_iter()
-        .filter(|path| trigger.apply || std::path::Path::new(path).is_absolute())
+        .filter(|(path, _)| trigger.apply || std::path::Path::new(path).is_absolute())
         .collect()
 }
 
-pub(crate) fn patch_rows(view: JsonView<'_>) -> Result<Vec<String>> {
+pub(crate) fn patch_rows(view: JsonView<'_>, extract_hunks: bool) -> Result<Vec<(String, Vec<u64>)>> {
     let mut body = view.is_string()?.then_some(view);
     if body.is_none() {
         for key in ["input", "patch"] {
@@ -1207,7 +1651,7 @@ pub(crate) fn patch_rows(view: JsonView<'_>) -> Result<Vec<String>> {
             }
         }
     }
-    let mut patch = Patch::default();
+    let mut patch = Patch::new(extract_hunks);
     if let Some(body) = body {
         body.for_each_str_chunk(|chunk| {
             patch.push(chunk);
@@ -1267,7 +1711,7 @@ enum JsCall {
         workdir: Option<String>,
     },
     ApplyPatch {
-        direct_paths: Vec<String>,
+        direct_body: Option<String>,
         workdir: Option<String>,
     },
     WriteStdin {
@@ -1313,54 +1757,79 @@ enum JsCall {
     },
 }
 
-fn scan_codex_exec(script: &str, opts: ClassifyOpts, emit: &mut dyn FnMut(ToolSemantic<'_>)) {
+fn scan_codex_exec(
+    script: &str,
+    opts: ClassifyOpts,
+    extract_hunks: bool,
+    emit: &mut dyn FnMut(ToolSemantic<'_>, Vec<u64>),
+) {
     let mut scanner = JsScanner::new(script);
     scanner.scan_all();
 
     if scanner.calls.is_empty() {
         let summary = opts.summaries.then(|| Cow::Owned(collapse_line(script, 80)));
-        emit(ToolSemantic {
-            tool: Cow::Borrowed("exec"),
-            op: ToolOp::Other { path: None, summary },
-        });
+        emit(
+            ToolSemantic {
+                tool: Cow::Borrowed("exec"),
+                op: ToolOp::Other { path: None, summary },
+            },
+            Vec::new(),
+        );
         return;
     }
 
     // Lazily computed script-wide patch header fallback for variable-bound `tools.apply_patch(patch)`.
-    let mut fallback_patch_paths: Option<Vec<String>> = None;
+    let mut fallback_patch_edits: Option<Vec<(String, Vec<u64>)>> = None;
 
     for call in scanner.calls {
         match call {
             JsCall::ExecCommand { cmd, workdir } => {
-                let patch_files = cmd.as_deref().map(command_patch_files).unwrap_or_default();
+                let patch_files = cmd
+                    .as_deref()
+                    .map(|c| command_patch_files(c, extract_hunks))
+                    .unwrap_or_default();
                 let clean_workdir = workdir.filter(|w| !w.is_empty() && !w.contains("${"));
-                emit(ToolSemantic {
-                    tool: Cow::Borrowed("exec_command"),
-                    op: ToolOp::Command {
-                        cmd: if opts.commands { cmd.map(Cow::Owned) } else { None },
-                        workdir: clean_workdir.clone().map(Cow::Owned),
-                        background: false,
-                    },
-                });
-                for file in patch_files {
-                    let path = resolve_workdir(&file, clean_workdir.as_deref());
-                    emit(ToolSemantic {
+                emit(
+                    ToolSemantic {
                         tool: Cow::Borrowed("exec_command"),
-                        op: ToolOp::FileEdit {
-                            path: Cow::Owned(path),
-                            is_full_write: false,
+                        op: ToolOp::Command {
+                            cmd: if opts.commands { cmd.map(Cow::Owned) } else { None },
+                            workdir: clean_workdir.clone().map(Cow::Owned),
+                            background: false,
                         },
-                    });
+                    },
+                    Vec::new(),
+                );
+                for (file, hunks) in patch_files {
+                    let path = resolve_workdir(&file, clean_workdir.as_deref());
+                    emit(
+                        ToolSemantic {
+                            tool: Cow::Borrowed("exec_command"),
+                            op: ToolOp::FileEdit {
+                                path: Cow::Owned(path),
+                                is_full_write: false,
+                            },
+                        },
+                        hunks,
+                    );
                 }
             }
-            JsCall::ApplyPatch { direct_paths, workdir } => {
+            JsCall::ApplyPatch { direct_body, workdir } => {
                 let clean_workdir = workdir.filter(|w| !w.is_empty() && !w.contains("${"));
-                let paths = if !direct_paths.is_empty() {
-                    direct_paths
+                let direct_edits = direct_body
+                    .as_deref()
+                    .map(|body| {
+                        let mut p = Patch::new(extract_hunks);
+                        p.push(body);
+                        p.finish()
+                    })
+                    .unwrap_or_default();
+                let edits = if !direct_edits.is_empty() {
+                    direct_edits
                 } else {
-                    fallback_patch_paths
+                    fallback_patch_edits
                         .get_or_insert_with(|| {
-                            let mut patch = Patch::default();
+                            let mut patch = Patch::new(extract_hunks);
                             for lit in &scanner.literals {
                                 patch.push(lit);
                                 patch.push("\n");
@@ -1369,58 +1838,73 @@ fn scan_codex_exec(script: &str, opts: ClassifyOpts, emit: &mut dyn FnMut(ToolSe
                         })
                         .clone()
                 };
-                if paths.is_empty() {
-                    emit(ToolSemantic {
-                        tool: Cow::Borrowed("apply_patch"),
-                        op: ToolOp::Other {
-                            path: None,
-                            summary: None,
-                        },
-                    });
-                } else {
-                    for file in paths {
-                        let path = resolve_workdir(&file, clean_workdir.as_deref());
-                        emit(ToolSemantic {
+                if edits.is_empty() {
+                    emit(
+                        ToolSemantic {
                             tool: Cow::Borrowed("apply_patch"),
-                            op: ToolOp::FileEdit {
-                                path: Cow::Owned(path),
-                                is_full_write: false,
+                            op: ToolOp::Other {
+                                path: None,
+                                summary: None,
                             },
-                        });
+                        },
+                        Vec::new(),
+                    );
+                } else {
+                    for (file, hunks) in edits {
+                        let path = resolve_workdir(&file, clean_workdir.as_deref());
+                        emit(
+                            ToolSemantic {
+                                tool: Cow::Borrowed("apply_patch"),
+                                op: ToolOp::FileEdit {
+                                    path: Cow::Owned(path),
+                                    is_full_write: false,
+                                },
+                            },
+                            hunks,
+                        );
                     }
                 }
             }
             JsCall::WriteStdin { session_id, has_chars } => {
-                emit(ToolSemantic {
-                    tool: Cow::Borrowed("write_stdin"),
-                    op: ToolOp::Background {
-                        job_id: if opts.summaries {
-                            session_id.map(Cow::Owned)
-                        } else {
-                            None
+                emit(
+                    ToolSemantic {
+                        tool: Cow::Borrowed("write_stdin"),
+                        op: ToolOp::Background {
+                            job_id: if opts.summaries {
+                                session_id.map(Cow::Owned)
+                            } else {
+                                None
+                            },
+                            action: if has_chars { BgAction::Interact } else { BgAction::Poll },
                         },
-                        action: if has_chars { BgAction::Interact } else { BgAction::Poll },
                     },
-                });
+                    Vec::new(),
+                );
             }
             JsCall::ViewImage { path, workdir } => {
                 let clean_workdir = workdir.filter(|w| !w.is_empty() && !w.contains("${"));
                 if let Some(p) = path.filter(|p| !p.is_empty() && !p.contains("${")) {
                     let resolved = resolve_workdir(&p, clean_workdir.as_deref());
-                    emit(ToolSemantic {
-                        tool: Cow::Borrowed("view_image"),
-                        op: ToolOp::FileRead {
-                            path: Cow::Owned(resolved),
+                    emit(
+                        ToolSemantic {
+                            tool: Cow::Borrowed("view_image"),
+                            op: ToolOp::FileRead {
+                                path: Cow::Owned(resolved),
+                            },
                         },
-                    });
+                        Vec::new(),
+                    );
                 } else {
-                    emit(ToolSemantic {
-                        tool: Cow::Borrowed("view_image"),
-                        op: ToolOp::Other {
-                            path: None,
-                            summary: None,
+                    emit(
+                        ToolSemantic {
+                            tool: Cow::Borrowed("view_image"),
+                            op: ToolOp::Other {
+                                path: None,
+                                summary: None,
+                            },
                         },
-                    });
+                        Vec::new(),
+                    );
                 }
             }
             JsCall::UpdatePlan { explanation, items } => {
@@ -1441,104 +1925,128 @@ fn scan_codex_exec(script: &str, opts: ClassifyOpts, emit: &mut dyn FnMut(ToolSe
                 } else {
                     String::new()
                 };
-                emit(ToolSemantic {
-                    tool: Cow::Borrowed("update_plan"),
-                    op: ToolOp::Affordance {
-                        kind: Kind::Plan,
-                        action: "write",
-                        summary,
-                        items: if opts.summaries { items } else { Vec::new() },
+                emit(
+                    ToolSemantic {
+                        tool: Cow::Borrowed("update_plan"),
+                        op: ToolOp::Affordance {
+                            kind: Kind::Plan,
+                            action: "write",
+                            summary,
+                            items: if opts.summaries { items } else { Vec::new() },
+                        },
                     },
-                });
+                    Vec::new(),
+                );
             }
             JsCall::Goal { tool, action, summary } => {
-                emit(ToolSemantic {
-                    tool: Cow::Borrowed(tool),
-                    op: ToolOp::Affordance {
-                        kind: Kind::Goal,
-                        action,
-                        summary: if opts.summaries {
-                            truncate(&summary, 120)
-                        } else {
-                            String::new()
+                emit(
+                    ToolSemantic {
+                        tool: Cow::Borrowed(tool),
+                        op: ToolOp::Affordance {
+                            kind: Kind::Goal,
+                            action,
+                            summary: if opts.summaries {
+                                truncate(&summary, 120)
+                            } else {
+                                String::new()
+                            },
+                            items: Vec::new(),
                         },
-                        items: Vec::new(),
                     },
-                });
+                    Vec::new(),
+                );
             }
             JsCall::SpawnAgent {
                 target_hint,
                 has_prompt,
             } => {
-                emit(ToolSemantic {
-                    tool: Cow::Borrowed("spawn_agent"),
-                    op: ToolOp::SubagentSpawn {
-                        target_hint: if opts.summaries {
-                            target_hint.map(|h| Cow::Owned(truncate(&h, 120)))
-                        } else {
-                            None
+                emit(
+                    ToolSemantic {
+                        tool: Cow::Borrowed("spawn_agent"),
+                        op: ToolOp::SubagentSpawn {
+                            target_hint: if opts.summaries {
+                                target_hint.map(|h| Cow::Owned(truncate(&h, 120)))
+                            } else {
+                                None
+                            },
+                            has_prompt: opts.summaries && has_prompt,
                         },
-                        has_prompt: opts.summaries && has_prompt,
                     },
-                });
+                    Vec::new(),
+                );
             }
             JsCall::AgentMessage { tool, recipient } => {
-                emit(ToolSemantic {
-                    tool: Cow::Borrowed(tool),
-                    op: ToolOp::AgentMessage {
-                        recipient: if opts.summaries {
-                            recipient.map(|r| Cow::Owned(truncate(&r, 120)))
-                        } else {
-                            None
+                emit(
+                    ToolSemantic {
+                        tool: Cow::Borrowed(tool),
+                        op: ToolOp::AgentMessage {
+                            recipient: if opts.summaries {
+                                recipient.map(|r| Cow::Owned(truncate(&r, 120)))
+                            } else {
+                                None
+                            },
                         },
                     },
-                });
+                    Vec::new(),
+                );
             }
             JsCall::BgControl { tool, job_id, action } => {
-                emit(ToolSemantic {
-                    tool: Cow::Borrowed(tool),
-                    op: ToolOp::Background {
-                        job_id: if opts.summaries {
-                            job_id.map(|j| Cow::Owned(truncate(&j, 80)))
-                        } else {
-                            None
+                emit(
+                    ToolSemantic {
+                        tool: Cow::Borrowed(tool),
+                        op: ToolOp::Background {
+                            job_id: if opts.summaries {
+                                job_id.map(|j| Cow::Owned(truncate(&j, 80)))
+                            } else {
+                                None
+                            },
+                            action,
                         },
-                        action,
                     },
-                });
+                    Vec::new(),
+                );
             }
             JsCall::Question { tool, summary } => {
-                emit(ToolSemantic {
-                    tool: Cow::Borrowed(tool),
-                    op: ToolOp::Affordance {
-                        kind: Kind::Question,
-                        action: "ask",
-                        summary: if opts.summaries {
-                            truncate(&summary, 120)
-                        } else {
-                            String::new()
+                emit(
+                    ToolSemantic {
+                        tool: Cow::Borrowed(tool),
+                        op: ToolOp::Affordance {
+                            kind: Kind::Question,
+                            action: "ask",
+                            summary: if opts.summaries {
+                                truncate(&summary, 120)
+                            } else {
+                                String::new()
+                            },
+                            items: Vec::new(),
                         },
-                        items: Vec::new(),
                     },
-                });
+                    Vec::new(),
+                );
             }
             JsCall::WebRun { query } => {
-                emit(ToolSemantic {
-                    tool: Cow::Borrowed("web__run"),
-                    op: ToolOp::Search {
-                        path: None,
-                        query: if opts.summaries { query.map(Cow::Owned) } else { None },
+                emit(
+                    ToolSemantic {
+                        tool: Cow::Borrowed("web__run"),
+                        op: ToolOp::Search {
+                            path: None,
+                            query: if opts.summaries { query.map(Cow::Owned) } else { None },
+                        },
                     },
-                });
+                    Vec::new(),
+                );
             }
             JsCall::Other { tool, summary } => {
-                emit(ToolSemantic {
-                    tool: Cow::Owned(tool),
-                    op: ToolOp::Other {
-                        path: None,
-                        summary: if opts.summaries { summary.map(Cow::Owned) } else { None },
+                emit(
+                    ToolSemantic {
+                        tool: Cow::Owned(tool),
+                        op: ToolOp::Other {
+                            path: None,
+                            summary: if opts.summaries { summary.map(Cow::Owned) } else { None },
+                        },
                     },
-                });
+                    Vec::new(),
+                );
             }
         }
     }
@@ -2149,16 +2657,12 @@ impl<'s> JsScanner<'s> {
                 workdir: prop_str("workdir").or_else(|| prop_str("cwd")),
             },
             "apply_patch" => {
-                let mut direct_paths = Vec::new();
-                if let Some(patch_body) = direct_str
+                let direct_body = direct_str
                     .or_else(|| prop_str("input"))
                     .or_else(|| prop_str("patch"))
-                    .or_else(|| prop_str("cmd"))
-                {
-                    direct_paths = patch_paths(&patch_body);
-                }
+                    .or_else(|| prop_str("cmd"));
                 JsCall::ApplyPatch {
-                    direct_paths,
+                    direct_body,
                     workdir: prop_str("workdir").or_else(|| prop_str("cwd")),
                 }
             }
@@ -2550,7 +3054,7 @@ mod tests {
         }
         assert_eq!(patch.primary.len(), 2000);
         assert_eq!(
-            patch.finish(),
+            patch.finish().into_iter().map(|(p, _)| p).collect::<Vec<_>>(),
             (0..2000).rev().map(|i| format!("file-{i}")).collect::<Vec<_>>()
         );
     }
@@ -2605,7 +3109,11 @@ mod tests {
                     }
                 }
                 patch.push(&text[start..]);
-                assert_eq!(patch.finish(), expected, "width {width}: {text:?}");
+                assert_eq!(
+                    patch.finish().into_iter().map(|(p, _)| p).collect::<Vec<_>>(),
+                    expected,
+                    "width {width}: {text:?}"
+                );
             }
         }
     }
@@ -2807,5 +3315,104 @@ await Promise.all([
                 }
             )]
         );
+    }
+
+    #[test]
+    fn normalized_hunk_hashes_survive_indentation_rebase_and_multi_file_patches() {
+        let collect_hunks = |name: &str, payload: &serde_json::Value| {
+            let j = crate::Json::from(payload.clone());
+            j.with_view(|view| {
+                let mut out = Vec::new();
+                visit_tool_ops_with_hunks(None, name, view, ClassifyOpts::EVENTS, |sem, hunks| {
+                    if let ToolOp::FileEdit { path, .. } = sem.op {
+                        out.push((path.into_owned(), hunks));
+                    }
+                })?;
+                Ok::<_, anyhow::Error>(out)
+            })
+            .unwrap()
+        };
+
+        // 1. Edit vs re-indented git diff hunk: exact block hash AND nontrivial line hashes match,
+        // while trivial brace-only lines (`}`) do not emit standalone line hashes.
+        let edit_hunks = collect_hunks(
+            "Edit",
+            &json!({
+                "file_path": "/repo/src/lib.rs",
+                "old_string": "fn old() {}",
+                "new_string": "  pub fn verify_hunk(x: u64) -> bool {\n      x != 0\n  }\n"
+            }),
+        );
+        assert_eq!(edit_hunks.len(), 1);
+        let rebased_diff = "\
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -10,1 +42,3 @@
+-    fn old() {}
++        pub fn verify_hunk(x: u64) -> bool {
++            x != 0
++        }
+";
+        let diff_hashes = extract_diff_hunk_hashes(rebased_diff);
+        assert_eq!(
+            edit_hunks[0].1, diff_hashes,
+            "re-indented diff produces identical 64-bit hunk & line hashes"
+        );
+        // 1 block hash + 2 nontrivial lines (`pub fn verify_hunk...`, `x != 0`); `}` is excluded as standalone line.
+        assert_eq!(diff_hashes.len(), 3);
+        let line_hash = hash_normalized_line("            x != 0").unwrap();
+        assert!(
+            edit_hunks[0].1.contains(&line_hash),
+            "-L line-range lookup matches normalized line hash"
+        );
+        assert!(
+            hash_normalized_line("   }  ").is_none(),
+            "brace-only boilerplate must not match standalone"
+        );
+
+        // 2. Multi-file apply_patch isolates hunk fingerprints per target file.
+        let patch = "\
+*** Begin Patch
+*** Update File: crates/a.rs
+@@
+-old_a
++let alpha_signal = compute_alpha();
+*** Update File: crates/b.rs
+@@
+-old_b
++let beta_signal = compute_beta();
+*** End Patch";
+        let patched = collect_hunks("apply_patch", &json!({ "patch": patch }));
+        assert_eq!(patched.len(), 2);
+        assert_eq!(patched[0].0, "crates/a.rs");
+        assert_eq!(patched[1].0, "crates/b.rs");
+        assert!(patched[0]
+            .1
+            .contains(&hash_normalized_line("let alpha_signal = compute_alpha();").unwrap()));
+        assert!(!patched[0]
+            .1
+            .contains(&hash_normalized_line("let beta_signal = compute_beta();").unwrap()));
+        assert!(patched[1]
+            .1
+            .contains(&hash_normalized_line("let beta_signal = compute_beta();").unwrap()));
+
+        // 3. MultiEdit / Antigravity multi_replace_file_content aggregates distinct chunk hashes cleanly.
+        let multi = collect_hunks(
+            "multi_replace_file_content",
+            &json!({
+                "TargetFile": "/repo/src/main.rs",
+                "ReplacementChunks": [
+                    { "TargetContent": "a", "ReplacementContent": "const FIRST_CHUNK: usize = 1;" },
+                    { "TargetContent": "b", "ReplacementContent": "const SECOND_CHUNK: usize = 2;" }
+                ]
+            }),
+        );
+        assert_eq!(multi.len(), 1);
+        assert!(multi[0]
+            .1
+            .contains(&hash_normalized_line("const FIRST_CHUNK: usize = 1;").unwrap()));
+        assert!(multi[0]
+            .1
+            .contains(&hash_normalized_line("const SECOND_CHUNK: usize = 2;").unwrap()));
     }
 }

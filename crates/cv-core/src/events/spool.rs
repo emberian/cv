@@ -24,6 +24,8 @@ struct DiskEvent {
     target: Option<String>,
     detail: Option<String>,
     call: bool,
+    #[serde(default)]
+    hunk_hashes: Vec<u64>,
 }
 
 /// The kinds a spooled row may carry; decode admits exactly these.
@@ -46,6 +48,7 @@ fn decode(line: &str) -> Result<Event> {
         target: row.target,
         detail: row.detail,
         call: row.call,
+        hunk_hashes: row.hunk_hashes,
     })
 }
 
@@ -57,7 +60,8 @@ impl Record for Event {
             .into_iter()
             .flatten()
             .map(String::capacity)
-            .sum()
+            .sum::<usize>()
+            + self.hunk_hashes.capacity() * std::mem::size_of::<u64>()
     }
     fn write(&self, writer: &mut impl Write) -> Result<()> {
         serde_json::to_writer(&mut *writer, self).context("serializing event spool row")?;
@@ -109,6 +113,13 @@ impl EventSpool {
     #[cfg(feature = "sqlite")]
     pub(super) fn rows(self) -> Result<impl Iterator<Item = Result<Event>>> {
         self.ordered.rows()
+    }
+    /// Stream staged event rows out of the bounded spool in extraction order.
+    pub fn into_rows(self) -> Result<Box<dyn Iterator<Item = Result<Event>>>> {
+        #[cfg(feature = "sqlite")]
+        return Ok(Box::new(self.ordered.rows()?));
+        #[cfg(not(feature = "sqlite"))]
+        return Ok(Box::new(std::iter::empty()));
     }
 }
 
@@ -288,6 +299,7 @@ mod tests {
             target,
             detail: Some("unicode \u{1f9ed} \"quoted\"\nsecond line".into()),
             call: true,
+            hunk_hashes: vec![0xdead_beef_cafe_babe],
         }
     }
 
