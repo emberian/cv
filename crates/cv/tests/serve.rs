@@ -369,25 +369,18 @@ fn serve_endpoints() {
     let (status, _) = get_json(port, "/api/session/claude/alphasess/subagent/ghost");
     assert_eq!(status, 404);
 
-    // The board routes went away in 0.15.0: a 410 with a pointer, not a bare 404.
+    // Removed and unknown routes → 404; non-GET → 405; OPTIONS preflight → 204 with CORS.
     for route in [
         "/api/board/fleet",
         "/api/claims/fleet",
         "/api/who/fleet?within_secs=60",
         "/api/channels",
+        "/api/definitely/not/a/route",
     ] {
         let (status, v) = get_json(port, route);
-        assert_eq!(status, 410, "{route}: {v}");
-        assert!(
-            v["error"].as_str().unwrap_or_default().contains("removed in 0.15.0"),
-            "{route}: {v}"
-        );
+        assert_eq!(status, 404, "{route}: {v}");
+        assert!(v["error"].is_string(), "{route}: {v}");
     }
-
-    // unknown route → 404; non-GET → 405; OPTIONS preflight → 204 with CORS.
-    let (status, v) = get_json(port, "/api/definitely/not/a/route");
-    assert_eq!(status, 404);
-    assert!(v["error"].is_string(), "{v}");
     let (status, _) = http(port, "POST", "/api/health");
     assert_eq!(status, 405);
     let (status, body) = http(port, "OPTIONS", "/api/health");
@@ -956,14 +949,10 @@ fn serve_tasks_routes() {
     let (_, v) = get_json(port, "/api/tasks/inbox/agent:nobody");
     assert_eq!(v["inbox"].as_array().unwrap().len(), 0, "{v}");
 
-    // The retired land-facet routes answer with a pointer, not a bare 404.
+    // Retired land-facet routes 404 cleanly.
     for route in ["/api/tasks/debt", "/api/tasks/stats"] {
         let (status, v) = get_json(port, route);
-        assert_eq!(status, 410, "{route}: {v}");
-        assert!(
-            v["error"].as_str().unwrap_or_default().contains("removed in 0.15.0"),
-            "{route}: {v}"
-        );
+        assert_eq!(status, 404, "{route}: {v}");
     }
 
     // /api/task/{id}: the full projection resolves by unique prefix (uuid v7 ids from the same
@@ -1560,18 +1549,7 @@ fn serve_carries_the_inbox_and_guards_its_writes() {
     assert_eq!(status, 200, "{v}");
     assert_eq!(v["who"], "ember", "the server's --who is the default inbox: {v}");
     let (status, v) = get_json(port, "/api/backlog");
-    assert_eq!(status, 410, "{v}");
-    assert!(
-        v["error"].as_str().unwrap_or_default().contains("/api/tasks?detail=1"),
-        "{v}"
-    );
-    let raw = raw_post(
-        port,
-        &format!("/api/task/{id}/reopen"),
-        "{}",
-        &[("Content-Type", "application/json")],
-    );
-    assert_eq!(raw_status(&raw), 410, "{raw}");
+    assert_eq!(status, 404, "{v}");
 
     let path = format!("/api/task/{id}/note");
     let body = r#"{"who":"ember","text":"a little flat"}"#;
@@ -1780,15 +1758,14 @@ fn the_inbox_records_the_same_events_as_the_cli() {
     let (status, body) = json_http(port, "POST", &format!("/api/task/{a}/note"), Some("not json"));
     assert_eq!(status, 400, "{body}");
 
-    // The closed items show under the page's Resolved filter; the web-only reopen is a pointer.
+    // The closed items show under the page's Resolved filter; unknown verbs (including reopen) return 400.
     let (status, body) = json_http(port, "GET", "/api/inbox?who=ember", None);
     assert_eq!(status, 200);
     let page: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(page["items"].as_array().unwrap().len(), 0);
     assert_eq!(page["closed"].as_array().unwrap().len(), 2);
     let (status, body) = json_http(port, "POST", &format!("/api/task/{a}/reopen"), Some("{}"));
-    assert_eq!(status, 410, "{body}");
-    assert!(body.contains("removed in 0.17"), "{body}");
+    assert_eq!(status, 400, "{body}");
 
     // One task, with its history; the event feed is the same query as `cv task events`.
     let (status, body) = json_http(port, "GET", &format!("/api/task/{d}?events=1"), None);
@@ -1824,33 +1801,6 @@ fn the_inbox_records_the_same_events_as_the_cli() {
     assert!(json.contains("\"by\": \"web:ember\""), "{json}");
     let (out, _) = w.cv_ok(&["task", "events", "--since", "1h", "--kind", "resolved,done"]);
     assert_eq!(out.lines().count(), 2, "the CLI feed and /api/events agree:\n{out}");
-}
-
-/// The removed names answer with a pointer and exit 2, never silently.
-#[test]
-fn removed_server_spellings_point_at_cv_serve() {
-    let w = world("removed");
-    let out = w
-        .cv_command()
-        .args(["task", "serve", "--bind", "0.0.0.0:7777"])
-        .output()
-        .unwrap();
-    assert_eq!(out.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("`cv serve`"));
-    let out = w
-        .cv_command()
-        .args(["serve", "--port", "0"])
-        .env("CVD_TOKEN", "x")
-        .output()
-        .unwrap();
-    assert_eq!(out.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("CV_SERVE_TOKEN"));
-    let out = w
-        .cv_command()
-        .args(["watch", "--verify-interval", "60"])
-        .output()
-        .unwrap();
-    assert_eq!(out.status.code(), Some(2));
 }
 
 /// The provisional decision lifecycle on the CLI: a provisional resolution reads as "made for

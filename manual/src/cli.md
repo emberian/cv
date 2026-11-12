@@ -784,12 +784,7 @@ cv pack "migrate the daemon" --limit 3 --out CONTEXT.md
 ### `cv task`
 
 Durable dispatch: open/claim/note/done and posed decisions; completion is self-reported. See
-**[the task substrate](tasks.md)** and [the reference](reference.md#cv-task). Verbs removed in 0.15.0
-(`propose`, `reroute`, `pass`, `refute`, `verify`, `debt`, `stats`, `split`, `watch`) error with a pointer.
-
-### The coordination board (removed)
-
-Removed in 0.15.0 (exit 2): use `cv task note`, `cv task events --since <id>`, `cv task claim`.
+**[the task substrate](tasks.md)** and [the reference](reference.md#cv-task).
 
 ### `cv share`
 

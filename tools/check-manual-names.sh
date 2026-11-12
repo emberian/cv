@@ -10,7 +10,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 CV="${1:-target/debug/cv}"
 
-REMOVED_COMMANDS="convert query recall board help"
+REMOVED_COMMANDS="convert query recall help"
 
 fail=0
 

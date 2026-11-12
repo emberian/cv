@@ -5,8 +5,7 @@
 //! (docs/INTERFACE-V2.md §3) — the rows here are the same functions `cv <cmd> --json` prints with.
 //!
 //! No socket or headers. Bounded source-verified read state reuses unchanged transcripts. Every error is a JSON
-//! `{"error": …}` with the status that names it (400 caller mistake, 404 absent, 410 removed with a
-//! pointer, 500 broke).
+//! `{"error": …}` with the status that names it (400 caller mistake, 404 absent, 500 broke).
 
 use crate::ir::{Harness, SessionRef};
 use crate::Session;
@@ -80,29 +79,9 @@ routes! {
 
         GET ["api", "session", harness, id, "workflow", wf, "script"] => workflow_script(harness, id, wf),
 
-        // Removed in 0.15.0 with the coordination board: a pointer, not a silent 404.
-        GET ["api", "board", ..] | GET ["api", "claims", _] | GET ["api", "who", _] | GET ["api", "channels"] => err(
-            410,
-            "removed in 0.15.0 with the coordination board — the task log is the fleet's record: \
-             /api/tasks, /api/tasks/inbox/{who}, /api/task/{id}/events",
-        ),
-
         GET ["api", "tasks"] => tasks(query),
 
-        // Removed in 0.15.0 with the land facet: a pointer, not a silent 404.
-        GET ["api", "tasks", "debt"] | GET ["api", "tasks", "stats"] => err(
-            410,
-            "removed in 0.15.0 with the task land facet — completion is self-reported and labeled; \
-             read /api/tasks and /api/task/{id}",
-        ),
-
         GET ["api", "tasks", "inbox", who] => tasks_inbox(who, query),
-
-        // Removed in 0.17: the inbox page reads the task rows with their backlog columns.
-        GET ["api", "backlog"] => err(
-            410,
-            "removed in 0.17 — read /api/tasks?detail=1 (every open task, oldest first; all=1 adds closed ones)",
-        ),
 
         GET ["api", "task", id] => task_one(id, Query::parse(query).flag("events")),
 
@@ -862,20 +841,16 @@ mod tests {
     }
 
     #[test]
-    fn removed_routes_point_not_404() {
+    fn unknown_and_removed_routes_404() {
         for parts in [
             &["api", "board", "fleet"][..],
             &["api", "channels"],
             &["api", "tasks", "debt"],
+            &["api", "backlog"],
+            &["api", "nope"],
         ] {
-            let (status, v) = route_json(parts, "");
-            assert_eq!(status, 410, "{parts:?}");
-            assert!(v["error"].as_str().unwrap().contains("removed in 0.15.0"), "{v}");
+            assert_eq!(route_json(parts, "").0, 404, "{parts:?}");
         }
-        let (status, v) = route_json(&["api", "backlog"], "");
-        assert_eq!(status, 410);
-        assert!(v["error"].as_str().unwrap().contains("/api/tasks?detail=1"), "{v}");
-        assert_eq!(route_json(&["api", "nope"], "").0, 404);
         assert_eq!(route_json(&["api", "sessions"], "harness=warpdrive").0, 400);
     }
 }

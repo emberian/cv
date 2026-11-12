@@ -585,9 +585,6 @@ enum Cmd {
         /// New session id (default: a fresh UUID).
         #[arg(long)]
         to: Option<String>,
-        // The default start, spelled out; removed in 0.18.0 — hidden so the old flag errors with a pointer.
-        #[arg(long, hide = true)]
-        from_compaction: bool,
         /// Start at the source's first record instead of the last compaction boundary before the
         /// cut (the default: what a resume loads).
         #[arg(long)]
@@ -686,7 +683,7 @@ enum Cmd {
     /// `--model` (a lane that hit one model's usage limit resumes on another).
     Adopt {
         /// Agent ids (`a5d8…` or `agent-a5d8…`, unique prefix ok).
-        #[arg(required_unless_present_any = ["list", "orphans"])]
+        #[arg(required = true)]
         agents: Vec<String>,
         /// The live session that adopts them (default: the newest session in the agent's
         /// project other than the one holding it, printed before acting).
@@ -709,11 +706,6 @@ enum Cmd {
         /// else, nothing is copied: its meta is rewritten in place (`--into S --model ID`).
         #[arg(long, value_name = "ID")]
         model: Option<String>,
-        // Removed in 0.15.0 — hidden so the old spellings error with a pointer (exit 2).
-        #[arg(long, hide = true, value_name = "SESSION")]
-        list: Option<String>,
-        #[arg(long, hide = true)]
-        orphans: bool,
         #[arg(long)]
         json: bool,
     },
@@ -865,9 +857,6 @@ enum Cmd {
         /// Write to this file instead of stdout.
         #[arg(long)]
         file: Option<PathBuf>,
-        // Renamed to `--file` in 0.18.0 (`--out` is a directory everywhere else) — hidden so the old flag errors with a pointer.
-        #[arg(long = "out", hide = true)]
-        out_removed: Option<PathBuf>,
         /// Replace an existing output file by atomic rename (otherwise a taken name exits 2).
         #[arg(long)]
         force: bool,
@@ -929,9 +918,6 @@ enum Cmd {
         /// Archive home (default: $CLUSTERVISION_HOME or ~/.clustervision).
         #[arg(long, value_name = "DIR")]
         home: Option<PathBuf>,
-        // Removed in 0.15.0 with the task verifier — hidden so the old flag errors with a pointer.
-        #[arg(long = "verify-interval", hide = true)]
-        verify_interval: Option<u64>,
     },
     /// The durable archive: every session snapshotted as IR under one home, for search and
     /// safekeeping across machines (`sync` once, `ls`, `path`; `cv watch` keeps it current).
@@ -1052,9 +1038,6 @@ enum Cmd {
         recent: usize,
         #[arg(long)]
         json: bool,
-        // The 0.14 subcommands (`census`, `check`) — hidden so they error with a pointer (exit 2).
-        #[arg(hide = true)]
-        legacy: Option<String>,
     },
     /// The agent quickstart: the things agents do with cv, each as one command line with the JSON
     /// keys it returns.
@@ -1073,54 +1056,6 @@ enum Cmd {
         /// The harness whose payload is on stdin (`claude` or `codex`; default `claude`).
         #[arg(long)]
         harness: Option<String>,
-    },
-
-    // ───────────────────────────── Removed (hidden stubs: error with a pointer, exit 2) ─────────────────────────────
-    #[command(hide = true)]
-    Timeline {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
-        rest: Vec<String>,
-    },
-    #[command(hide = true)]
-    Redact {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
-        rest: Vec<String>,
-    },
-    #[command(hide = true)]
-    Diff {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
-        rest: Vec<String>,
-    },
-    #[command(hide = true)]
-    Fork {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
-        rest: Vec<String>,
-    },
-    #[command(hide = true)]
-    Loom {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
-        rest: Vec<String>,
-    },
-    #[command(hide = true)]
-    Tree {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
-        rest: Vec<String>,
-    },
-    #[command(hide = true)]
-    Compaction {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
-        rest: Vec<String>,
-    },
-    #[command(hide = true)]
-    Prompts {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
-        rest: Vec<String>,
-    },
-    // Removed in 0.15.0 (the coordination board) — same hidden-stub rule.
-    #[command(hide = true)]
-    Board {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
-        rest: Vec<String>,
     },
 }
 
@@ -1200,14 +1135,6 @@ fn run() -> Result<()> {
             return usage("--frozen (CV_FROZEN=1) forbids this command: it writes stores or sessions");
         }
     }
-    for (old, new) in [
-        ("CLAURDVOYANT_HOME", "CLUSTERVISION_HOME"),
-        ("CLAURDVOYANT_MAX_STALE_SECS", "CLUSTERVISION_MAX_STALE_SECS"),
-    ] {
-        if cv_core::env::var_os(old).is_some() {
-            return usage(format!("`${old}` was removed in 0.18.0 — use `${new}`; unset `${old}`"));
-        }
-    }
     // Long-running services scope reuse per request/poll, so cold private snapshots do not
     // survive idle server time. Ordinary commands share one cache across their session reads.
     let _reads = (!matches!(
@@ -1229,7 +1156,17 @@ fn run() -> Result<()> {
             fresh,
             json,
             enrich,
-        } => browse::cmd_ls(browse::LsArgs { harness, cwd, query, limit, sort_by: &sort_by, asc, fresh, json, enrich }),
+        } => browse::cmd_ls(browse::LsArgs {
+            harness,
+            cwd,
+            query,
+            limit,
+            sort_by: &sort_by,
+            asc,
+            fresh,
+            json,
+            enrich,
+        }),
         Cmd::Search {
             query,
             harness,
@@ -1288,17 +1225,19 @@ fn run() -> Result<()> {
             redact,
             redact_only,
             file,
-            out_removed,
             force,
-        } => {
-            if out_removed.is_some() {
-                return usage(
-                    "`cv dataset --out` was renamed to `--file <path>` in 0.18.0 (`--out` is a directory \
-                     everywhere else)",
-                );
-            }
-            reshape::cmd_dataset(reshape::DatasetArgs { format: &format, harness, query, subagents, limit, min_messages, redact, redact_only, file, force })
-        }
+        } => reshape::cmd_dataset(reshape::DatasetArgs {
+            format: &format,
+            harness,
+            query,
+            subagents,
+            limit,
+            min_messages,
+            redact,
+            redact_only,
+            file,
+            force,
+        }),
         Cmd::Port {
             id,
             harness,
@@ -1308,7 +1247,16 @@ fn run() -> Result<()> {
             strict,
             thinking,
             skills,
-        } => port::cmd_port(&id, harness, cwd, out, no_context, strict, thinking.as_deref().map(util::parse_thinking).transpose()?, skills.parse()?),
+        } => port::cmd_port(
+            &id,
+            harness,
+            cwd,
+            out,
+            no_context,
+            strict,
+            thinking.as_deref().map(util::parse_thinking).transpose()?,
+            skills.parse()?,
+        ),
         Cmd::Index {
             semantic,
             rebuild,
@@ -1324,11 +1272,7 @@ fn run() -> Result<()> {
             json,
             wide,
         } => events::cmd_events(&id, harness, kind, subagents, json, wide),
-        Cmd::Touched {
-            path,
-            edits_only,
-            json,
-        } => events::cmd_touched(&path, edits_only, json),
+        Cmd::Touched { path, edits_only, json } => events::cmd_touched(&path, edits_only, json),
         Cmd::Blame { file, lines, show } => blame::cmd_blame(&file, lines.as_deref(), show),
         Cmd::Share {
             id,
@@ -1379,13 +1323,27 @@ fn run() -> Result<()> {
             plan,
             dry_run,
             json,
-        } => {
-            reshape::cmd_prune(reshape::PruneArgs {
-                id: &id, harness, min_size, keep_last, to, force, drop, thinking: drop_thinking,
-                copy_resources, revive: !no_revive, window, keep, declassify,
-                declassify_tokens, declassify_tokens_file, skills_policy: skills.parse()?, plan, dry_run, json,
-            })
-        }
+        } => reshape::cmd_prune(reshape::PruneArgs {
+            id: &id,
+            harness,
+            min_size,
+            keep_last,
+            to,
+            force,
+            drop,
+            thinking: drop_thinking,
+            copy_resources,
+            revive: !no_revive,
+            window,
+            keep,
+            declassify,
+            declassify_tokens,
+            declassify_tokens_file,
+            skills_policy: skills.parse()?,
+            plan,
+            dry_run,
+            json,
+        }),
         Cmd::Rewind {
             id,
             harness,
@@ -1393,33 +1351,37 @@ fn run() -> Result<()> {
             agent,
             out,
             to,
-            from_compaction,
             thinking,
             skills,
             full,
             dry_run,
             json,
-        } => {
-            if from_compaction {
-                return usage(
-                    "`cv rewind --from-compaction` was removed in 0.18.0 — starting at the last compaction boundary is the default; \
-                     pass `--full` for the whole history",
-                );
-            }
-            reshape::cmd_rewind(reshape::RewindArgs { id: &id, harness, agent, at: at.as_deref(), out, to, full, thinking: thinking.as_deref().map(util::parse_thinking).transpose()?, skills_policy: skills.parse()?, dry_run, json, generator: BUILD_VERSION })
-        }
+        } => reshape::cmd_rewind(reshape::RewindArgs {
+            id: &id,
+            harness,
+            agent,
+            at: at.as_deref(),
+            out,
+            to,
+            full,
+            thinking: thinking.as_deref().map(util::parse_thinking).transpose()?,
+            skills_policy: skills.parse()?,
+            dry_run,
+            json,
+            generator: BUILD_VERSION,
+        }),
         Cmd::Config { add_export, rm_export } => config::cmd_config(add_export, rm_export),
         Cmd::Schema { json, commands } => schema::cmd_schema(&build_cli(), json, commands),
-        Cmd::Formats {
-            harness,
-            recent,
-            json,
-            legacy,
-        } => formats::cmd_formats(harness, recent, json, legacy),
+        Cmd::Formats { harness, recent, json } => formats::cmd_formats(harness, recent, json),
         Cmd::Recipes => recipes::cmd_recipes(),
         Cmd::Hooks { action } => hooks::cmd_hooks(action),
         Cmd::Hook { name, harness } => hooks::cmd_hook(name, harness),
-        Cmd::Retire { agent, successor, undo, json } => cmd::retire::cmd_retire(agent, successor, undo, json),
+        Cmd::Retire {
+            agent,
+            successor,
+            undo,
+            json,
+        } => cmd::retire::cmd_retire(agent, successor, undo, json),
         Cmd::Resume { id, harness, launch } => port::cmd_resume(&id, harness, launch),
         Cmd::Workflow {
             id,
@@ -1432,7 +1394,18 @@ fn run() -> Result<()> {
             for_,
             revive,
             revive_all,
-        } => workflow::cmd_workflow(workflow::WorkflowArgs { id: &id, run_id, harness, json, script, results, follow, for_, revive, revive_all }),
+        } => workflow::cmd_workflow(workflow::WorkflowArgs {
+            id: &id,
+            run_id,
+            harness,
+            json,
+            script,
+            results,
+            follow,
+            for_,
+            revive,
+            revive_all,
+        }),
         Cmd::Tools {
             id,
             harness,
@@ -1442,7 +1415,16 @@ fn run() -> Result<()> {
             across,
             timeline,
             json,
-        } => tools::cmd_tools(tools::ToolsArgs { id: &id, harness, agent, tool, workflow: wf, across, timeline, json }),
+        } => tools::cmd_tools(tools::ToolsArgs {
+            id: &id,
+            harness,
+            agent,
+            tool,
+            workflow: wf,
+            across,
+            timeline,
+            json,
+        }),
         Cmd::Lanes {
             id,
             harness,
@@ -1492,16 +1474,7 @@ fn run() -> Result<()> {
             harness,
             cwd,
             home,
-            verify_interval,
-        } => {
-            if verify_interval.is_some() {
-                return usage(
-                    "`--verify-interval` was removed in 0.15.0 — the task git-verifier is gone; \
-                     completion is self-reported and labeled so (`cv task done --observed`)",
-                );
-            }
-            archive::cmd_watch(&archive::Archive::resolve(home)?, interval, harness, cwd)
-        }
+        } => archive::cmd_watch(&archive::Archive::resolve(home)?, interval, harness, cwd),
         Cmd::Archive { home, action } => {
             let a = archive::Archive::resolve(home)?;
             match action {
@@ -1566,31 +1539,16 @@ fn run() -> Result<()> {
             dry_run,
             force,
             model,
-            list,
-            orphans,
             json,
-        } => {
-            if let Some(session) = list {
-                return usage(format!(
-                    "`cv adopt --list <session>` was removed in 0.15.0 — use `cv lanes {session}` (status, model, description per agent)"
-                ));
-            }
-            if orphans {
-                return usage(
-                    "`cv adopt --orphans` was removed in 0.15.0 — use `cv lanes --recent <N> --unfinished [--cwd <project>]` \
-                     (unfinished sub-agents of the project's recent sessions, each row tagged with its session)",
-                );
-            }
-            cmd::adopt::cmd_adopt(cmd::adopt::AdoptArgs {
-                agents,
-                into,
-                from,
-                dry_run,
-                force,
-                model,
-                json,
-            })
-        }
+        } => cmd::adopt::cmd_adopt(cmd::adopt::AdoptArgs {
+            agents,
+            into,
+            from,
+            dry_run,
+            force,
+            model,
+            json,
+        }),
         Cmd::Splice {
             specs,
             session,
@@ -1620,41 +1578,6 @@ fn run() -> Result<()> {
                 json,
             })
         }
-        // Removed commands: one line each, pointing at the replacement; exit 2.
-        Cmd::Timeline { .. } => usage(
-            "`cv timeline` was removed in 0.15.0 — use `cv ls --sort-by updated --asc` (the newest --limit rows, \
-             oldest first; `--json` gives the same session rows)",
-        ),
-        Cmd::Redact { .. } => usage(
-            "`cv redact <id> [--format md|json]` was removed in 0.15.0 — use `cv export <id> --redact [--format md|json]` \
-             (the per-class counts print to stderr); `cv share <id>` for a redacted HTML artifact",
-        ),
-        Cmd::Diff { .. } => usage(
-            "`cv diff` was removed in 0.15.0 — `cv export <id> --format md` each session and diff the two files",
-        ),
-        Cmd::Fork { .. } => usage(
-            "`cv fork <id> --at N` was removed in 0.15.0 — use `cv splice <id>:..N --session` (or `--agent-of <root>`): \
-             the verbatim prefix as a new resumable session",
-        ),
-        Cmd::Loom { .. } => usage(
-            "`cv loom <base> --at N --graft <other> --from M` was removed in 0.15.0 — use `cv splice <base>:..N <other>:M..` \
-             (two spans; `--session`, `--harness <h>` or `--export md` as before)",
-        ),
-        Cmd::Tree { .. } => usage(
-            "`cv tree <id>` was removed in 0.15.0 — use `cv show <id> --tree` (the same threading, then the sub-agent forest)",
-        ),
-        Cmd::Compaction { .. } => usage(
-            "`cv compaction <id>` was removed in 0.15.0 — use `cv show <id> --kind compaction_boundary,compaction_summary` \
-             (`--summaries` and `--json` as before)",
-        ),
-        Cmd::Prompts { .. } => usage(
-            "`cv prompts <id>` was removed in 0.15.0 — use `cv show <id> --kind prompt,answer` \
-             (the same rows; `--json` and `--pre-compaction [N]` as before)",
-        ),
-        Cmd::Board { .. } => usage(
-            "`cv board` was removed in 0.15.0 — the task log is the fleet's record: `cv task note` to say something, \
-             `cv task events --since <id>` to follow it, `cv task claim` to hold work",
-        ),
     }
 }
 
@@ -1722,7 +1645,7 @@ mod tests {
                 );
             }
         }
-        // Names removed in this release are hidden stubs, never visible commands.
+        // Removed commands are gone outright (no hidden stubs).
         for old in [
             "timeline",
             "redact",
@@ -1733,11 +1656,13 @@ mod tests {
             "tree",
             "compaction",
             "prompts",
+            "mcp",
+            "scry",
+            "deferrals",
         ] {
-            assert!(!visible.contains(&old), "{old} must be hidden");
             assert!(
-                cmd.get_subcommands().any(|s| s.get_name() == old),
-                "{old} stub must exist"
+                !cmd.get_subcommands().any(|s| s.get_name() == old),
+                "{old} must not exist"
             );
         }
     }

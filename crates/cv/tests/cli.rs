@@ -49,27 +49,6 @@ fn pos(hay: &str, needle: &str) -> usize {
 // ───────────────────────────── ls ─────────────────────────────
 
 #[test]
-fn removed_rewind_from_compaction_exits_two_with_a_pointer() {
-    let w = World::new("rewind-from-compaction");
-    let (ok, code, _, err) = w.cv(&["rewind", "any", "--from-compaction"]);
-    assert!(!ok && code == 2, "{err}");
-    assert!(err.contains("--from-compaction") && err.contains("--full"), "{err}");
-}
-
-#[test]
-fn removed_claurdvoyant_variables_exit_two_with_a_pointer() {
-    let w = World::new("claurdvoyant-env");
-    for (old, new) in [
-        ("CLAURDVOYANT_HOME", "CLUSTERVISION_HOME"),
-        ("CLAURDVOYANT_MAX_STALE_SECS", "CLUSTERVISION_MAX_STALE_SECS"),
-    ] {
-        let (ok, code, _, err) = w.cv_env(&["ls"], &[(old, "1")]);
-        assert!(!ok && code == 2, "{old}: {err}");
-        assert!(err.contains(old) && err.contains(new), "{err}");
-    }
-}
-
-#[test]
 fn ls_sort_modes_and_filters() {
     let w = World::new("ls");
     standard_corpus(&w);
@@ -881,15 +860,11 @@ fn export_formats() {
     assert!(v.get("open_session").is_none(), "{out}");
     assert_eq!(v["id"], "alphasess", "{out}");
 
-    // HTML left `export` for `share` (the streaming, redacting renderer): the old spelling
-    // points there and exits 2.
-    let (ok, code, _, err) = w.cv(&["export", "alphasess", "--format", "html"]);
-    assert!(!ok && code == 2, "{err}");
-    assert!(err.contains("cv share <id>"), "{err}");
-
-    // Unknown format is an error, not a silent default.
-    let (_, err) = w.cv_fails(&["export", "alphasess", "--format", "docx"]);
-    assert!(err.contains("unknown format"), "{err}");
+    // Unknown format (including html, which `cv share` owns) is an error, not a silent default.
+    for fmt in ["html", "docx"] {
+        let (_, err) = w.cv_fails(&["export", "alphasess", "--format", fmt]);
+        assert!(err.contains("unknown format"), "{fmt}: {err}");
+    }
 }
 
 // ───────────────────────────── prune --json ─────────────────────────────
@@ -1499,10 +1474,9 @@ fn dataset_file_publication_matches_stdout_and_preserves_transcript_aliases() {
     assert_eq!(code, 2, "{error}");
     assert!(error.contains("already exists"), "{error}");
     assert_eq!(fs::read(&output).unwrap(), b"previous artifact");
-    // `--out` is a directory everywhere else; the old spelling points at `--file`.
     let (_, code, _, error) = w.cv(&["dataset", "--out", output.to_str().unwrap()]);
     assert_eq!(code, 2, "{error}");
-    assert!(error.contains("--file"), "{error}");
+    assert!(error.contains("unexpected argument '--out'"), "{error}");
     let (stdout, _) = w.cv_ok(&["dataset", "--file", output.to_str().unwrap(), "--force"]);
     assert!(stdout.is_empty());
     assert_eq!(fs::read(&output).unwrap(), expected.as_bytes());
@@ -1686,61 +1660,34 @@ fn error_paths_exit_nonzero_with_stderr() {
     let (_, err) = w.cv_fails(&["show", "alphasess", "--harness", "marsrover"]);
     assert!(err.contains("unknown harness"), "{err}");
 
-    // Every name this release removed: gone, but never silently — each one exits 2 (a caller
-    // mistake, not a failure) with a line naming the version and the replacement. The 0.11
-    // tombstones left at 0.15; these leave at the next release.
-    let removed: &[(&[&str], &str)] = &[
-        // `timeline` was `ls` with the shown window reversed.
-        (&["timeline", "--limit", "5"], "cv ls --sort-by updated --asc"),
-        // `redact` was `export` with the scrubber in front.
-        (&["redact", "alphasess", "--format", "json"], "cv export <id> --redact"),
-        // `diff` was a role+text prefix compare; export both and use a real diff.
-        (&["diff", "alphasess", "betasess"], "cv export <id> --format md"),
-        // `export --format html` had a second, non-streaming renderer; `share` is the one.
-        (&["export", "alphasess", "--format", "html"], "cv share <id>"),
-        // `adopt --list/--orphans` were lanes tables.
-        (&["adopt", "--list", "alphasess"], "cv lanes alphasess"),
-        (&["adopt", "--orphans"], "cv lanes --recent <N> --unfinished"),
-        // `formats check` needed a checkout: it is the test; `census` is plain `formats`.
-        (
-            &["formats", "check"],
-            "cargo test -p clustervision-core --test formats_manifest",
-        ),
-        (&["formats", "census"], "cv formats"),
-        // `fork` was `splice <id>:..N`; `loom` was a two-span `splice`.
-        (
-            &["fork", "alphasess", "--at", "2", "--session"],
-            "cv splice <id>:..N --session",
-        ),
-        (
-            &["loom", "alphasess", "--at", "2", "--graft", "betasess", "--from", "1"],
-            "cv splice <base>:..N <other>:M..",
-        ),
-        // `tree`, `prompts` and `compaction` were views of one session: `show` flags now.
-        (&["tree", "alphasess"], "cv show <id> --tree"),
-        (&["prompts", "alphasess", "--json"], "cv show <id> --kind prompt,answer"),
-        (
-            &["compaction", "alphasess", "--summaries"],
-            "cv show <id> --kind compaction_boundary,compaction_summary",
-        ),
-    ];
-    for (args, pointer) in removed {
+    // Removed commands and flags are plain unknown names in clap (exit 2, no hidden stubs).
+    for args in [
+        &["timeline", "--limit", "5"][..],
+        &["redact", "alphasess", "--format", "json"],
+        &["diff", "alphasess", "betasess"],
+        &["fork", "alphasess", "--at", "2", "--session"],
+        &["loom", "alphasess", "--at", "2", "--graft", "betasess", "--from", "1"],
+        &["tree", "alphasess"],
+        &["prompts", "alphasess", "--json"],
+        &["compaction", "alphasess", "--summaries"],
+        &["board", "post", "general", "hi"],
+        &["mcp"],
+        &["scry"],
+        &["deferrals", "alphasess"],
+        &["convert", "alphasess"],
+        &["adopt", "--list", "alphasess"],
+        &["adopt", "--orphans"],
+        &["formats", "check"],
+        &["formats", "census"],
+        &["rewind", "alphasess", "--from-compaction"],
+        &["watch", "--verify-interval", "60"],
+        &["prune", "alphasess", "--retrieve", "t1"],
+    ] {
         let (ok, code, out, err) = w.cv(args);
-        assert!(!ok, "cv {args:?} must not still work\nstdout:\n{out}");
+        assert!(!ok, "cv {args:?} must not work\nstdout:\n{out}");
         assert_eq!(code, 2, "cv {args:?} must exit 2 (caller mistake)\nstderr:\n{err}");
         assert!(!err.contains("panicked"), "cv {args:?} panicked:\n{err}");
-        assert!(
-            err.contains("0.15.0") || err.contains("is now"),
-            "cv {args:?} must say when it went away:\n{err}"
-        );
-        assert!(err.contains(pointer), "cv {args:?} must point at {pointer:?}:\n{err}");
     }
-    // The 0.11 tombstones are plain unknown names now: clap's error, still exit 2, no pointer.
-    let (ok, code, _, err) = w.cv(&["convert", "alphasess"]);
-    assert!(!ok && code == 2 && err.contains("unrecognized subcommand"), "{err}");
-    let (ok, code, _, err) = w.cv(&["prune", "alphasess", "--retrieve", "t1"]);
-    assert!(!ok && code == 2 && err.contains("unexpected argument"), "{err}");
-    // The pointers are real: the replacement parses (it fails on the harness, not the grammar).
     let (_, err) = w.cv_fails(&["port", "alphasess", "--harness", "marsrover"]);
     assert!(err.contains("unknown"), "{err}");
 
@@ -2095,10 +2042,10 @@ fn task_surfaces_sanitize_and_age() {
     assert!(out.contains("claimed work (1):"), "inbox groups by reason:\n{out}");
 }
 
-/// The land facet's verbs and flags went away in 0.15.0: each old spelling errors with a pointer
-/// and exit 2, and `done` labels itself self-reported.
+/// Retired task verbs and flags are rejected by clap (exit 2) without writing to the store,
+/// and `done` labels itself self-reported.
 #[test]
-fn task_land_facet_verbs_and_flags_are_removed_with_pointers() {
+fn task_retired_verbs_and_flags_exit_two_and_done_labels_self_reported() {
     let w = World::new("task-land-removed");
     w.cv_ok(&["task", "open", "finish it"]);
     let id = task_id_titled(&w, "finish it");
@@ -2110,23 +2057,18 @@ fn task_land_facet_verbs_and_flags_are_removed_with_pointers() {
         &["task", "verify", "--all"],
         &["task", "debt"],
         &["task", "stats"],
-        &["task", "claim", &id, "--from", "a", "--token", "t"],
-        &["task", "done", &id, "--check-cmd", "true"],
+        &["task", "serve"],
         &["task", "split", &id, "--dry-run"],
         &["task", "watch", "ember"],
+        &["task", "claim", &id, "--from", "a", "--token", "t"],
+        &["task", "done", &id, "--check-cmd", "true"],
+        &["task", "list", "--wide"],
+        &["task", "open", "x", "--channel", "c"],
     ];
     for args in removed {
         let (ok, code, out, err) = w.cv(args);
-        assert!(!ok, "cv {args:?} must not still work\nstdout:\n{out}");
+        assert!(!ok, "cv {args:?} must not work\nstdout:\n{out}");
         assert_eq!(code, 2, "cv {args:?} must exit 2 (caller mistake)\nstderr:\n{err}");
-        assert!(
-            err.contains("removed in 0.15.0"),
-            "cv {args:?} must say when it went away:\n{err}"
-        );
-        assert!(
-            err.contains(" — ") && err.matches('`').count() >= 2,
-            "cv {args:?} must point at a replacement:\n{err}"
-        );
     }
     let (out, _) = w.cv_ok(&["task", "list", "--all"]);
     assert!(
@@ -2139,26 +2081,6 @@ fn task_land_facet_verbs_and_flags_are_removed_with_pointers() {
         out.contains("done:     self-reported") && out.contains("tests green in sess-1"),
         "a completion is labeled as the agent's own word:\n{out}"
     );
-}
-
-/// `cv board` went away in 0.15.0: every spelling errors with a pointer at the task log, exit 2.
-#[test]
-fn board_is_removed_with_a_pointer() {
-    let w = World::new("board-removed");
-    for args in [
-        &["board", "post", "general", "hi"][..],
-        &["board", "read", "general"],
-        &["board", "channels"],
-    ] {
-        let (ok, code, out, err) = w.cv(args);
-        assert!(!ok, "cv {args:?} must not still work\nstdout:\n{out}");
-        assert_eq!(code, 2, "cv {args:?} must exit 2\nstderr:\n{err}");
-        assert!(
-            err.contains("removed in 0.15.0") && err.contains("cv task events"),
-            "{err}"
-        );
-    }
-    assert!(!w.cv_home.join("board").exists(), "nothing wrote a board dir");
 }
 
 // ───────────────────────── cv task ergonomics (0.12.0) ─────────────────────────
@@ -2256,14 +2178,6 @@ fn task_open_relations_tags_and_file_bodies() {
     assert_eq!(cells[1], "open");
     assert_eq!(cells[5], "DEPENDENT: needs the foundation");
     assert_eq!(cells[6], a);
-
-    // `--wide` went away in 0.15.0; the flag points at `show --brief`.
-    let (ok, code, _, err) = w.cv(&["task", "list", "--wide"]);
-    assert!(!ok && code == 2, "{err}");
-    assert!(
-        err.contains("removed in 0.15.0") && err.contains("show <id> --brief"),
-        "{err}"
-    );
 
     // note --file.
     let note = w.base.join("note.txt");
@@ -3090,14 +3004,6 @@ fn adopt_moves_a_stranded_lane_into_the_live_session() {
         rows.iter()
             .any(|r| r["parent_id"] == "deadsess" && r["agent_id"] == aid),
         "{out}"
-    );
-    // The removed flags error with the replacement, exit 2.
-    let (ok, code, _, err) = w.cv(&["adopt", "--list", dead]);
-    assert!(!ok && code == 2 && err.contains("cv lanes deadsess"), "{err}");
-    let (ok, code, _, err) = w.cv(&["adopt", "--orphans"]);
-    assert!(
-        !ok && code == 2 && err.contains("cv lanes --recent <N> --unfinished"),
-        "{err}"
     );
 
     let live_sub = w.home.join(".claude/projects/-work-proj/livesess/subagents");

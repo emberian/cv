@@ -10,22 +10,10 @@ use anyhow::Result;
 use cv_core::formats::{self, Status};
 use cv_core::ir::Harness;
 
-use crate::util::{parse_harness, usage};
+use crate::util::parse_harness;
 
-pub(crate) fn cmd_formats(harness: Option<String>, recent: usize, json: bool, legacy: Option<String>) -> Result<()> {
-    match legacy.as_deref() {
-        None => census(parse_harness(&harness)?, recent, json),
-        Some("census") => {
-            usage("`cv formats census` is now plain `cv formats` (same flags: --harness, --recent, --json)")
-        }
-        Some("check") => usage(
-            "`cv formats check` was removed in 0.15.0 — it needs a source checkout, so it is the test: \
-             `cargo test -p clustervision-core --test formats_manifest`",
-        ),
-        Some(other) => usage(format!(
-            "`cv formats` takes no subcommand (got {other:?}); run `cv formats --help`"
-        )),
-    }
+pub(crate) fn cmd_formats(harness: Option<String>, recent: usize, json: bool) -> Result<()> {
+    census(parse_harness(&harness)?, recent, json)
 }
 
 fn census(harness: Option<Harness>, recent: usize, json_out: bool) -> Result<()> {

@@ -597,7 +597,6 @@ mod tests {
             "GET /api/sessions",
             "GET /api/session/{}/{}/messages",
             "GET /api/session/{}/{}/export",
-            "GET /api/board/*",
             "GET /api/search",
             "POST /api/task/{}/{}",
         ] {

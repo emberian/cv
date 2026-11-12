@@ -714,12 +714,6 @@ pub(crate) fn cmd_export(
             )?;
             *stats.borrow_mut() = st;
         }
-        "html" => {
-            return usage(
-                "`cv export --format html` was removed in 0.15.0 — `cv share <id> [--out FILE]` writes the \
-                 self-contained, redacted HTML artifact (`--no-redact` to keep secrets)",
-            )
-        }
         other => bail!("unknown format {other:?} (use md or json; `cv share` for html)"),
     }
     if redact {

@@ -18,8 +18,7 @@
 //! - `GET /api/lanes?session=<id>`        the sub-agent forest of a session (`cv lanes --tasks`),
 //!   running first, each lane with the `tasks` its endpoint holds.
 //!
-//! The backlog pane reads the read API's `GET /api/tasks?detail=1`; `/api/backlog` and the
-//! web-only `reopen` answer 410 with the pointer.
+//! The backlog pane reads the read API's `GET /api/tasks?detail=1`.
 //!
 //! Every POST takes `who` in the body (else `?who=`, else the server's `--who`).
 
@@ -50,10 +49,6 @@ cv_core::routes! {
             Err(e) => Answer::Json(400, json!({"error": e.to_string()})),
         }),
         GET ["api", "lanes"] => json(api_lanes(q)),
-        POST ["api", "task", _, "reopen"] => json((
-            410,
-            json!({"error": "removed in 0.17 — a closed task stays closed; open a new task (`cv task open`) and note the old id"}),
-        )),
         POST ["api", "task", id, verb] => {
             let who = body
                 .get("who")

@@ -14,7 +14,7 @@ use cv_core::sanitize::sanitize_line;
 use cv_core::task::{self, TaskEvent, TaskEventKind, TaskReadModel, TaskRow, TaskStore};
 
 use super::task_ops::{self, DecisionSpec, EventFilter, Since};
-use crate::util::{fmt_local, usage};
+use crate::util::fmt_local;
 
 /// A text argument that may come from a file: `--body-file`/`--file` (`-` reads stdin). Bodies
 /// were 500-char shell strings before this existed; a brief is a document.
@@ -116,38 +116,6 @@ fn require_from(explicit: Option<String>) -> Result<String> {
     task::require_actor(explicit, "--from")
 }
 
-/// `--token` was the TOFU credential of the retired trust layer. The flag is kept hidden so the
-/// old spelling errors with a pointer (exit 2) instead of being silently accepted.
-fn refuse_token(token: Option<String>) -> Result<()> {
-    if token.is_some() {
-        return usage(
-            "`--token` / `CV_TOKEN` were removed in 0.15.0 — identity is `--from` / `CV_ENDPOINT`, \
-             recorded and labeled, never authenticated",
-        );
-    }
-    Ok(())
-}
-
-/// `--channel` named the board channel task events were mirrored to; the board is gone.
-fn refuse_channel(channel: Option<String>) -> Result<()> {
-    if channel.is_some() {
-        return usage(
-            "`--channel` was removed in 0.15.0 with the coordination board — task events are mirrored \
-             nowhere; follow them with `cv task events --since <id>`",
-        );
-    }
-    Ok(())
-}
-
-/// The pointer every retired land-facet verb prints (exit 2).
-fn removed_land_verb(verb: &str) -> Result<()> {
-    usage(format!(
-        "`cv task {verb}` was removed in 0.15.0 with the land facet — completion is self-reported and \
-         labeled: `cv task done <id> --observed <evidence>`, evidence in `cv task note`, candidates \
-         from `cv task sweep --repo <path>`"
-    ))
-}
-
 #[derive(Subcommand)]
 pub(crate) enum TaskCmd {
     /// Open a new task. Prints its id.
@@ -167,10 +135,6 @@ pub(crate) enum TaskCmd {
         /// (the record outlives the shell it was typed in).
         #[arg(long)]
         issue: Option<String>,
-        // Removed in 0.15.0 with the coordination board — hidden so the old flag errors with a
-        // pointer (exit 2).
-        #[arg(long, hide = true)]
-        channel: Option<String>,
         #[arg(long)]
         assignee: Option<String>,
         /// Comma-separated tags (`deploy,lean`); `list --tag` filters on them. `decision` is refused
@@ -218,9 +182,6 @@ pub(crate) enum TaskCmd {
         /// blocked_by — no alignment, no truncation.
         #[arg(long, conflicts_with = "json")]
         tsv: bool,
-        // Removed in 0.15.0 — hidden so the old flag errors with a pointer (exit 2).
-        #[arg(long, hide = true)]
-        wide: bool,
     },
     /// Show one task (id may be a unique prefix).
     Show {
@@ -251,9 +212,6 @@ pub(crate) enum TaskCmd {
         /// Acting endpoint recorded in `by`. Default: $CV_ENDPOINT.
         #[arg(long)]
         from: Option<String>,
-        // Removed in 0.15.0 — hidden so the old flag errors with a pointer (exit 2).
-        #[arg(long, hide = true)]
-        token: Option<String>,
     },
     /// Release a claim back to open.
     Release {
@@ -261,8 +219,6 @@ pub(crate) enum TaskCmd {
         /// Acting endpoint recorded in `by`. Default: $CV_ENDPOINT.
         #[arg(long)]
         from: Option<String>,
-        #[arg(long, hide = true)]
-        token: Option<String>,
     },
     /// Record a progress note. `cv task note <id> -` reads the note from stdin.
     Note {
@@ -286,13 +242,6 @@ pub(crate) enum TaskCmd {
         /// Pointer to observable evidence (URL, path, session id).
         #[arg(long)]
         observed: Option<String>,
-        // Removed in 0.15.0 — hidden so the old flags error with a pointer (exit 2).
-        #[arg(long = "check-cmd", hide = true)]
-        check_cmd: Option<String>,
-        #[arg(long = "check-file", hide = true)]
-        check_file: Option<PathBuf>,
-        #[arg(long = "check-http", hide = true)]
-        check_http: Option<String>,
         /// A closing note (`-` = stdin), validated with the `done` before appending: the note,
         /// then the done.
         #[arg(long, conflicts_with = "note_file")]
@@ -318,8 +267,6 @@ pub(crate) enum TaskCmd {
         /// Acting endpoint recorded in `by` (must be the assignee or the opener). Default: $CV_ENDPOINT.
         #[arg(long)]
         from: Option<String>,
-        #[arg(long, hide = true)]
-        token: Option<String>,
     },
     /// Kill a task.
     Abandon {
@@ -389,8 +336,6 @@ pub(crate) enum TaskCmd {
         repo: Option<PathBuf>,
         #[arg(long)]
         issue: Option<String>,
-        #[arg(long, hide = true)]
-        channel: Option<String>,
         /// Extra tags (`decision` is always added).
         #[arg(long, value_name = "A,B")]
         tags: Option<String>,
@@ -405,8 +350,6 @@ pub(crate) enum TaskCmd {
         /// Acting endpoint recorded in `by`. Default: $CV_ENDPOINT.
         #[arg(long)]
         from: Option<String>,
-        #[arg(long, hide = true)]
-        token: Option<String>,
     },
     /// Answer a decision: `--accept-default`, or `--choice "<option>"` (one of the posed options).
     /// Records WHO resolved it: pass `--from <you>` or set `CV_ENDPOINT` once. On a decision made
@@ -433,8 +376,6 @@ pub(crate) enum TaskCmd {
         /// The resolver, recorded in `by`. Default: $CV_ENDPOINT.
         #[arg(long)]
         from: Option<String>,
-        #[arg(long, hide = true)]
-        token: Option<String>,
     },
     /// New task events since a point in time, one JSON line each (the poll surface: hand the
     /// last event id back as the next `--since`). `--text` renders one human line per event.
@@ -460,12 +401,6 @@ pub(crate) enum TaskCmd {
         /// One human line per event instead of JSON lines.
         #[arg(long)]
         text: bool,
-    },
-    // Removed in 0.15.0: the inbox is a page on `cv serve` (hidden stub: pointer, exit 2).
-    #[command(hide = true)]
-    Serve {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
-        rest: Vec<String>,
     },
     /// Candidates for closing, from what git and the filesystem say — never closes anything.
     /// Lists non-terminal tasks whose `--issue` path no longer exists, or whose title/body names a
@@ -500,54 +435,6 @@ pub(crate) enum TaskCmd {
         /// Items touched since (`30d`, `2026-09-01`, …).
         #[arg(long, value_name = "WHEN", conflicts_with = "all")]
         since: Option<String>,
-    },
-    // ───────────── Removed in 0.15.0 (hidden stubs: pointer, exit 2) ─────────────
-    /// `split` turned `DECIDE:` notes into decisions; `decide` poses one directly.
-    #[command(hide = true)]
-    Split {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
-        rest: Vec<String>,
-    },
-    /// `watch` was `events --assignee <who> --not-by $CV_ENDPOINT` under a second name.
-    #[command(hide = true)]
-    Watch {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
-        rest: Vec<String>,
-    },
-    #[command(hide = true)]
-    Propose {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
-        rest: Vec<String>,
-    },
-    #[command(hide = true)]
-    Reroute {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
-        rest: Vec<String>,
-    },
-    #[command(hide = true)]
-    Pass {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
-        rest: Vec<String>,
-    },
-    #[command(hide = true)]
-    Refute {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
-        rest: Vec<String>,
-    },
-    #[command(hide = true)]
-    Verify {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
-        rest: Vec<String>,
-    },
-    #[command(hide = true)]
-    Debt {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
-        rest: Vec<String>,
-    },
-    #[command(hide = true)]
-    Stats {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
-        rest: Vec<String>,
     },
 }
 
@@ -725,14 +612,12 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
             body_file,
             repo,
             issue,
-            channel,
             assignee,
             tags,
             blocked_by,
             blocks,
             from,
         } => {
-            refuse_channel(channel)?;
             let repo = canonical_repo(repo)?;
             let issue = absolutize_issue(issue, repo.as_deref());
             let body = body_arg(body, body_file)?;
@@ -795,14 +680,7 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
             since,
             json,
             tsv,
-            wide,
         } => {
-            if wide {
-                return usage(
-                    "`cv task list --wide` was removed in 0.15.0 — `cv task show <id> --brief` has the tags, \
-                     blockers and body line per task; `list --tsv` has the blockers for scripts",
-                );
-            }
             let outcome = fold_loud()?;
             let now = Utc::now();
             let touched_since = scope_window(all, since.as_deref(), now)?;
@@ -909,14 +787,12 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
             }
             Ok(())
         }
-        TaskCmd::Claim { id, from, token } => {
-            refuse_token(token)?;
+        TaskCmd::Claim { id, from } => {
             let from = require_from(from)?;
             let id = resolve_target(&id)?;
             append_event(Some(&id), &from, TaskEventKind::Claimed { assignee: from.clone() }).map(|_| ())
         }
-        TaskCmd::Release { id, from, token } => {
-            refuse_token(token)?;
+        TaskCmd::Release { id, from } => {
             let from = require_from(from)?;
             let id = resolve_target(&id)?;
             append_event(Some(&id), &from, TaskEventKind::Released {}).map(|_| ())
@@ -935,19 +811,10 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
         TaskCmd::Done {
             id,
             observed,
-            check_cmd,
-            check_file,
-            check_http,
             note,
             note_file,
             from,
         } => {
-            if check_cmd.is_some() || check_file.is_some() || check_http.is_some() {
-                return usage(
-                    "`--check-cmd` / `--check-file` / `--check-http` were removed in 0.15.0 — run the \
-                     check yourself and put its result in `--observed`; completion is self-reported",
-                );
-            }
             let note = note_arg(note, note_file)?;
             let id = resolve_target(&id)?;
             close_with_note(
@@ -957,14 +824,7 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                 TaskEventKind::Done { observed, check: None },
             )
         }
-        TaskCmd::Status {
-            id,
-            text,
-            file,
-            from,
-            token,
-        } => {
-            refuse_token(token)?;
+        TaskCmd::Status { id, text, file, from } => {
             let from = require_from(from)?;
             let id = resolve_target(&id)?;
             let text = text_arg(text, file)?.expect("clap requires text or --file");
@@ -1039,15 +899,11 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
             body_file,
             repo,
             issue,
-            channel,
             tags,
             blocks,
             provisional,
             from,
-            token,
         } => {
-            refuse_token(token)?;
-            refuse_channel(channel)?;
             let repo = canonical_repo(repo)?;
             let body = body_arg(body, body_file)?;
             let now = Utc::now();
@@ -1120,9 +976,7 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
             note,
             note_file,
             from,
-            token,
         } => {
-            refuse_token(token)?;
             let note = note_arg(note, note_file)?;
             let outcome = fold_loud()?;
             let id = resolve(&outcome.model, &id)?.to_string();
@@ -1167,10 +1021,6 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
             }
             Ok(())
         }
-        TaskCmd::Split { .. } => usage(
-            "`cv task split` was removed in 0.15.0 — it mined `DECIDE:` notes for questions; pose one directly: \
-             `cv task decide \"<title>\" --for <who> --default \"<option>\" [--option …] [--blocks <id>]`",
-        ),
         TaskCmd::Events {
             since,
             kind,
@@ -1200,26 +1050,6 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
             };
             print_events(&outcome, &f, text)
         }
-        TaskCmd::Watch { .. } => usage(
-            "`cv task watch` was removed in 0.15.0 — it was an alias: \
-             `cv task events --assignee <who> --not-by $CV_ENDPOINT [--since <when>] [--text]`",
-        ),
-        TaskCmd::Serve { .. } => usage(
-            "`cv task serve` was removed in 0.15.0 — `cv serve` carries the inbox at /inbox (and at / without \
-             --web): `--who` for `--assignee`, `--host`/`--port` for `--bind`, `--open` as before",
-        ),
-        TaskCmd::Propose { .. } => removed_land_verb("propose"),
-        TaskCmd::Reroute { .. } => removed_land_verb("reroute"),
-        TaskCmd::Pass { .. } => removed_land_verb("pass"),
-        TaskCmd::Refute { .. } => removed_land_verb("refute"),
-        TaskCmd::Verify { .. } => removed_land_verb("verify"),
-        TaskCmd::Debt { .. } => usage(
-            "`cv task debt` was removed in 0.15.0 with the land facet — `cv task list --all` is the ledger; \
-             `cv task sweep --repo <path>` is what git can say about it",
-        ),
-        TaskCmd::Stats { .. } => usage(
-            "`cv task stats` was removed in 0.15.0 with the land facet — `cv task events --json` is the raw material",
-        ),
     }
 }
 

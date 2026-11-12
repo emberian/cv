@@ -52,12 +52,6 @@ struct Ctx {
 /// whole transcript corpus (secrets included) and the inbox's writes to anyone who can reach the
 /// port, so it demands a bearer token or an explicit `--insecure-expose`, and warns either way.
 pub(crate) fn cmd_serve(opts: ServeOpts) -> Result<()> {
-    if cv_core::env::var_os("CVD_TOKEN").is_some() && cv_core::env::var_os("CV_SERVE_TOKEN").is_none() {
-        return crate::util::usage(
-            "$CVD_TOKEN was renamed $CV_SERVE_TOKEN in 0.15.0 with `cvd serve` → `cv serve` \
-             (or pass --token)",
-        );
-    }
     let token = opts
         .token
         .or_else(|| cv_core::env::var("CV_SERVE_TOKEN").ok())
