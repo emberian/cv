@@ -1033,7 +1033,6 @@ struct PlanState {
     metadata: HashMap<String, DiscoveryMetadata>,
     event_sync: cv_core::events::SyncTable,
     affordances: cv_core::catalog::AffordanceTable,
-    marks: cv_core::resume::MarkTable,
     consumer: String,
     dependencies: cv_core::source::Table<InIndex>,
     probe: cv_core::source::Probe,
@@ -1055,7 +1054,6 @@ impl PlanState {
             // One query each for the event skip-table and the affordance counts `has:<kind>` reads.
             event_sync: cv_core::events::SyncTable::load(),
             affordances: cv_core::catalog::AffordanceTable::load(),
-            marks: cv_core::resume::MarkTable::load(),
             dependencies: cv_core::source::Table::load(&consumer),
             consumer,
             probe: cv_core::source::Probe::default(),
@@ -1070,7 +1068,6 @@ impl PlanState {
             metadata,
             event_sync,
             affordances,
-            marks,
             dependencies,
             probe,
             ..
@@ -1104,7 +1101,7 @@ impl PlanState {
                 .is_some_and(|&(_, old_size)| old_size > 0 && size > old_size)
                 && (!events || event_sync.can_resume(r, prov)),
             prov: prov.clone(),
-            mark: marks.get(r).cloned(),
+            mark: None,
             source,
             dependencies_fresh,
             decoded: None,
@@ -1212,6 +1209,9 @@ fn job_out(
     adapter: &dyn cv_core::Adapter,
 ) -> Out {
     let version = cv_core::resume::version(adapter, RESUME_TAG);
+    // Workers run only after writer admission and the publication recheck. Even a whole-pass
+    // job needs its prior head so failure cleanup can invalidate an obsolete checkpoint.
+    job.mark = marks.head(&job.r);
     let from = resumable_from(&job, &version, marks);
     // A resume the adapter declines touched nothing: read the session whole instead.
     let resumed = match &from {
@@ -8246,6 +8246,29 @@ mod tests {
         );
         assert_eq!(swept.observed.work, SweepWork::default());
         assert_eq!(observe(&dir, &refs, &["zqwarm".into()]), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resume_heads_wait_for_writer_and_only_selected_append_is_read() {
+        let home = IsolatedHome::new();
+        let dir = home.home.join("index");
+        let refs: Vec<_> = ["grow", "still", "also-still"]
+            .into_iter()
+            .map(|id| sref(id, id, write_claude(&home.home, id, "zqseed initial text")))
+            .collect();
+        sweep(&dir, refs.clone(), false, false).unwrap();
+        append_claude(refs[0].path.to_str().unwrap(), "grow", 3, "zqappended");
+        let (index, _) = open_or_create(&dir).unwrap();
+        let writer_lock = open_writer(&index, 15_000_000).unwrap();
+        let err = sweep(&dir, refs.clone(), false, false).err().expect("writer is held");
+        assert!(format!("{err:?}").contains("LockBusy"), "{err:?}");
+        drop(writer_lock);
+
+        let swept = sweep(&dir, refs.clone(), false, false).unwrap();
+        assert_eq!((swept.changed, swept.resumed, swept.errors), (1, 1, 0));
+        let words = vec!["zqseed".into(), "zqappended".into()];
+        assert_eq!(observe(&dir, &refs, &words), whole_sweep(&refs, &words));
     }
 
     #[test]

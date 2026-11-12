@@ -105,8 +105,8 @@ mod imp {
         )
     }
 
-    /// Every mark's head, loaded with one query for a sweep (the states, which can be tens of KB
-    /// each, are read only for the sessions that resume: [`state`]).
+    /// Every mark's head. Index and live planners use [`Reader::head`] instead: SQLite may
+    /// traverse a row's large state to reach its trailing identity, even without selecting state.
     pub struct MarkTable {
         rows: HashMap<(String, String, String), MarkHead>,
     }
@@ -151,9 +151,25 @@ mod imp {
         }
     }
     impl Reader {
+        /// Demand only this session's head, after the caller has selected it for work.
+        pub fn head(&self, r: &SessionRef) -> Option<MarkHead> {
+            self.0.with_connection(|conn| head_in(conn, r)).flatten()
+        }
+
         pub fn state(&self, r: &SessionRef, head: &MarkHead) -> Option<Checkpoint> {
             self.0.with_connection(|conn| state_in(conn, r, head)).flatten()
         }
+    }
+
+    fn head_in(conn: &Connection, r: &SessionRef) -> Option<MarkHead> {
+        let (h, i, p) = key(r);
+        conn.query_row(
+            "SELECT offset, hash, version, identity FROM resume_marks WHERE harness=?1 AND id=?2 AND path=?3",
+            params![h, i, p],
+            |row| Ok(row_head(row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .ok()
+        .flatten()
     }
 
     fn state_in(conn: &Connection, r: &SessionRef, head: &MarkHead) -> Option<Checkpoint> {
@@ -250,6 +266,57 @@ pub fn update(_marks: &[MarkUpdate]) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(all(unix, feature = "sqlite"))]
+    fn demanded_head_uses_the_exact_key_and_rejects_invalid_identity() {
+        let world = cv_testkit::World::in_process("resume-head", crate::env::Env::enter_isolated);
+        let path = world.base.join("session.jsonl");
+        std::fs::write(&path, b"line\n").unwrap();
+        let r = SessionRef::new("selected", crate::Harness::Claude, path.clone());
+        let cp = Checkpoint::new(5);
+        let head = MarkHead::of(&path, &cp, "v1").unwrap();
+        update(&[MarkUpdate {
+            session: r.clone(),
+            mark: Some((head.clone(), cp.clone())),
+        }]);
+        let reader = Reader::default();
+        assert_eq!(reader.head(&r), Some(head.clone()));
+        assert_eq!(MarkTable::load().get(&r), Some(&head));
+        assert!(reader.state(&r, &head).is_some());
+        for other in [
+            SessionRef {
+                id: "other".into(),
+                ..r.clone()
+            },
+            SessionRef {
+                harness: crate::Harness::Codex,
+                ..r.clone()
+            },
+            SessionRef {
+                path: world.base.join("other.jsonl"),
+                ..r.clone()
+            },
+        ] {
+            assert!(reader.head(&other).is_none(), "{other:?}");
+        }
+        let conn = crate::catalog::open_db().unwrap();
+        // A head query neither decodes checkpoint state nor rejects a usable head because the
+        // state is broken; state admission remains a separate, guarded read.
+        conn.execute("UPDATE resume_marks SET state='not a checkpoint'", [])
+            .unwrap();
+        assert_eq!(reader.head(&r), Some(head.clone()));
+        assert!(reader.state(&r, &head).is_none());
+        for identity in [None, Some("broken"), Some("[1]")] {
+            conn.execute("UPDATE resume_marks SET identity=?1", [identity]).unwrap();
+            assert!(reader.head(&r).is_none(), "{identity:?}");
+        }
+        update(&[MarkUpdate {
+            session: r.clone(),
+            mark: None,
+        }]);
+        assert!(reader.head(&r).is_none());
+    }
 
     /// Sampling an open transcript must not move its reader or any cloned handle.
     #[test]
@@ -351,6 +418,9 @@ mod tests {
 pub struct Reader;
 #[cfg(not(feature = "sqlite"))]
 impl Reader {
+    pub fn head(&self, _: &SessionRef) -> Option<MarkHead> {
+        None
+    }
     pub fn state(&self, _: &SessionRef, _: &MarkHead) -> Option<Checkpoint> {
         None
     }
