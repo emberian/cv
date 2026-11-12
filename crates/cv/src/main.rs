@@ -710,13 +710,18 @@ enum Cmd {
         json: bool,
     },
     /// The retired-agent ledger: `cv distill --agent-of` records the sub-agent it replaced, with
-    /// its successor. With no agent, lists who is retired; `<agent> [--successor <id>]` retires
-    /// one by hand; `--undo <agent>` reverses. `cv hooks install --retired` installs the
-    /// PreToolUse guard that refuses a retired agent's tool calls and messages to it.
+    /// its successor. With `--list` (or no agent), lists who is retired; `<agent> [--successor <id>]`
+    /// retires one or updates an existing `PENDING` successor in place; `--undo <agent>` reverses.
+    /// `cv hooks install --retired` installs the PreToolUse guard that refuses a retired agent's
+    /// tool calls and messages to it.
     Retire {
-        /// The agent id (`a5d8…` or `agent-a5d8…`). Omit it to list.
+        /// The agent id (`a5d8…` or `agent-a5d8…`). Omit it (or pass `--list`) to list.
         agent: Option<String>,
-        /// The agent that continues its work (named in the guard's refusal).
+        /// List retired agents (same as omitting `<AGENT>`).
+        #[arg(long, conflicts_with_all = ["agent", "successor", "undo"])]
+        list: bool,
+        /// The agent that continues its work (named in the guard's refusal); updates an existing
+        /// retirement in place.
         #[arg(long, value_name = "ID", requires = "agent", conflicts_with = "undo")]
         successor: Option<String>,
         /// Reverse a retirement.
@@ -1400,6 +1405,7 @@ fn run() -> Result<()> {
         Cmd::Hook { name, harness } => hooks::cmd_hook(name, harness),
         Cmd::Retire {
             agent,
+            list: _,
             successor,
             undo,
             json,
