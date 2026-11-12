@@ -163,7 +163,5 @@ cv index --semantic
 | `cv search <query> --semantic`   | Semantic search (no keyword fallback)               | `--limit` (20)       |
 | `cv pack <task>`                 | Fused ranking → relevant spans, as a context bundle | `--limit` (8)        |
 
-See also [MCP](mcp.md) for search inside a running agent.
-
 [tantivy]: https://github.com/quickwit-oss/tantivy
 [model2vec]: https://github.com/MinishLab/model2vec

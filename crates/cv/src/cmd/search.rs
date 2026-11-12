@@ -82,7 +82,7 @@ fn matches_line(shown: usize, total: usize) -> String {
 /// Render what the search found: the table with harness/short-id/date/title/snippet, the
 /// `N of M matches` footer and the notes, or, with `json`, `{"hits": [...], "total": M}` on
 /// stdout with the SAME hits in the same order — notes on stderr, an empty result `"hits": []` —
-/// so the output pipes cleanly (`cv mcp` relays stderr as its own content block).
+/// so the output pipes cleanly.
 fn render(found: Found, query: &str, json: bool) -> Result<()> {
     let Found {
         hits,

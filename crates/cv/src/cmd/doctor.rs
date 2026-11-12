@@ -1,6 +1,6 @@
 //! `cv doctor` — diagnose why a session's context window keeps filling (and compacting).
 //!
-//! The analysis engine lives in [`cv_core::doctor`] (shared with the `doctor` MCP tool); this module
+//! The analysis engine lives in [`cv_core::doctor`]; this module
 //! resolves the target session(s) and renders stored-payload estimates, recorded prompt usage,
 //! and compaction evidence. First-prompt usage is only a heuristic overhead proxy. With no <id>,
 //! analyzes the most recent session(s) for the current directory.

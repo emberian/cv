@@ -6,9 +6,8 @@ A **task** is a dispatch object: open, claim, note, finish. A **decision** is a 
 question: one event poses it (with the default that stands if nobody speaks), one answers it.
 
 Everything lives in one append-only log, `$CLUSTERVISION_HOME/tasks/events.jsonl`, written under a
-flock. Every state you see is folded from those events; there is no second store. Three
-front-ends render the same shapes: `cv task` (this page), the
-[MCP `task_*` tools](mcp.md#the-task-substrate-over-mcp), and
+flock. Every state you see is folded from those events; there is no second store. Two
+front-ends render the same shapes: `cv task` (this page) and
 [`cv serve`'s task routes](serving.md#task-endpoints), whose `/inbox` page is the human's door.
 
 ## The three laws
@@ -60,7 +59,7 @@ never below eight hex digits.
 `cv task resolve <id> --accept-default | --choice "<option>"`, which needs an identity and is
 terminal (`resolved`). A second `posed` is refused.
 
-A `decision` tag on a task with nothing posed is refused (CLI, MCP and page), naming
+A `decision` tag on a task with nothing posed is refused (CLI and page), naming
 `cv task decide` and its `--default`. A tag-only decision already in a log reads as an assigned
 action. `cv task split` is gone: pose the question.
 
@@ -124,15 +123,14 @@ whose title or body names a branch merged into main (`git branch --merged`, loca
 remote-tracking; a branch name needs a separator, a digit or eight characters). It prints each as
 *probably done* with the reason and never closes one.
 
-All take `--json`: the same rows MCP and the HTTP API serve.
+All take `--json`: the same rows the HTTP API serves.
 
 ## Identity: `CV_ENDPOINT`
 
 The spawner sets `CV_ENDPOINT=agent:<name>` in each agent's environment; every front-end takes
 its default actor from it. Nothing verifies it (law 2).
 
-- **Chat-grade verbs** (`open`, `note`, `done`, `abandon`, `supersede`) default to `cv` on the CLI
-  and `agent` over MCP.
+- **Chat-grade verbs** (`open`, `note`, `done`, `abandon`, `supersede`) default to `cv` on the CLI.
 - **Identity-bearing verbs** (`claim`, `release`, `status`, `resolve`) refuse without one:
 
 ```text

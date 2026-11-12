@@ -300,14 +300,6 @@ fn stdin_readers_on_a_terminal_refuse_or_announce() {
     );
     assert!(stderr.contains("stdin is a terminal"), "{stderr}");
 
-    let (stdin, _master) = terminal_stdin();
-    let mut run = Run::spawn(&w, &strings(&["mcp"]), stdin);
-    let line = run
-        .announced(ANNOUNCE)
-        .expect("mcp on a terminal says what it is waiting for");
-    assert!(line.contains("terminal") && line.contains("Ctrl-D"), "{line}");
-    assert!(run.exited(Duration::from_millis(1500)).is_none(), "mcp keeps serving");
-
     // `task note <id> -` reads its text from stdin and announces that on a terminal.
     let (out, _) = w.cv_ok(&["task", "open", "note stdin target"]);
     let id = out.lines().last().expect("task open prints its id").trim();

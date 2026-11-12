@@ -474,7 +474,7 @@ fn search_json(out: &str) -> (Vec<serde_json::Value>, u64) {
 
 /// The staleness disclosure: once the corpus has outrun the index, a hit list must say so (a
 /// non-empty answer can still be missing rows), a miss must say so, and --json moves it to
-/// stderr so stdout stays pure JSON — `cv mcp` relays stderr as its own content block.
+/// stderr so stdout stays pure JSON.
 #[test]
 fn search_discloses_index_staleness() {
     let w = World::new("searchstale");

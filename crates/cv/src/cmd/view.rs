@@ -347,7 +347,7 @@ fn staged_session_json_inner(
 ///
 /// `as_document` wraps the same bytes as an **OpenSession** document (`docs/OPENSESSION.md`):
 /// the IR's own serialization with `"open_session": "0.3"` as the first key. That marker belongs
-/// to a *document*, not to a `Session` — `cv show --json`, the MCP payloads and `cv serve` all serialize
+/// to a *document*, not to a `Session` — `cv show --json` and `cv serve` serialize
 /// the raw IR and their key sets are pinned — so it is added here, at the one boundary where cv
 /// hands a session to somebody else, and nowhere else.
 fn print_session_json(

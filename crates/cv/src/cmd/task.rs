@@ -1020,7 +1020,7 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
             };
             if json {
                 // The page the text and Markdown render from — the shape `cv serve`'s `/api/inbox`
-                // serves, and whose `items` are the MCP and `/api/tasks/inbox` rows.
+                // serves, and whose `items` are the `/api/tasks/inbox` rows.
                 println!("{}", serde_json::to_string_pretty(&page)?);
             } else if md {
                 print!("{}", task_ops::render_inbox_md(&page));

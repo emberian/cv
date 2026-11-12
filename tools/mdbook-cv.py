@@ -3,7 +3,6 @@
 
   {{#cv-commands}}     every command and argument, from `cv schema --commands --json`
   {{#cv-command-map}}  the `cv --help` groups as a table, each command linked into the reference
-  {{#cv-mcp-tools}}    the MCP roster, from a live `tools/list` of `cv mcp`
 
 The clap tree is the one source of what cv can do; these two directives are how the manual says
 it without a second, hand-kept list. The binary is $CV_BIN, else ../target/debug/cv relative to
@@ -93,48 +92,6 @@ def command_map(schema):
     return "\n".join(out) + "\n"
 
 
-def mcp_tools(schema, tools):
-    group_of = {c["name"].replace(" ", "_"): c["group"] for c in schema}
-    groups = {}
-    for t in tools:
-        groups.setdefault(group_of.get(t["name"], "MCP-only"), []).append(t)
-    order = [c["group"] for c in schema if " " not in c["name"]] + ["MCP-only"]
-    out = []
-    for g in dict.fromkeys(order):
-        if g not in groups:
-            continue
-        out.append(f"### {g}\n")
-        out.append("| Tool | Required | Runs | What it does |")
-        out.append("|---|---|---|---|")
-        for t in groups[g]:
-            desc = " ".join(t["description"].split())
-            m = re.search(r"\s*\(runs (`[^`]*`)\)\.?\s*", desc)
-            runs = m.group(1) if m else "—"
-            if m:
-                desc = (desc[: m.start()] + ". " + desc[m.end():]).strip()
-            first = re.split(r"(?<=[.!?])\s+(?=[A-Z`])", desc, maxsplit=1)[0]
-            first = first if first[-1:] in ".!?" else first + "."
-            req = ", ".join(f"`{r}`" for r in t.get("inputSchema", {}).get("required", [])) or "—"
-            out.append(f"| `{t['name']}` | {req} | {inline(runs, True)} | {inline(first, True)} |")
-        out.append("")
-    return "\n".join(out)
-
-
-def live_tools(cv):
-    msgs = [
-        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}},
-        {"jsonrpc": "2.0", "method": "notifications/initialized"},
-        {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
-    ]
-    stdin = "".join(json.dumps(m) + "\n" for m in msgs)
-    out = subprocess.run([cv, "mcp"], input=stdin, capture_output=True, text=True, check=True).stdout
-    for line in out.splitlines():
-        d = json.loads(line)
-        if d.get("id") == 2:
-            return d["result"]["tools"]
-    sys.exit("mdbook-cv: `cv mcp` answered no tools/list")
-
-
 def walk(items, fn):
     for item in items:
         ch = item.get("Chapter") if isinstance(item, dict) else None
@@ -161,8 +118,6 @@ def main():
             content = content.replace("{{#cv-commands}}", commands(schema()))
         if "{{#cv-command-map}}" in content:
             content = content.replace("{{#cv-command-map}}", command_map(schema()))
-        if "{{#cv-mcp-tools}}" in content:
-            content = content.replace("{{#cv-mcp-tools}}", mcp_tools(schema(), live_tools(cv)))
         return content
 
     walk(book.get("items", book.get("sections", [])), expand)

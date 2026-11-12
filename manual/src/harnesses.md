@@ -67,7 +67,7 @@ multi-instance agent:
 ignored, a directory named twice (e.g. through a symlink) is read once, and a config dir is skipped
 until its `projects/` appears.
 
-Prefer the file: every cv process (CLI, MCP servers, daemon) shares one catalog and reads it, while
+Prefer the file: every cv process (CLI, daemon) shares one catalog and reads it, while
 an environment variable reaches only the processes that have it.
 
 When two roots hold the same session id, `cv ls` lists both and `cv show <id>` opens the most

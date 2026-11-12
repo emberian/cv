@@ -28,10 +28,6 @@ Claude Code sub-agents nest under their parent in the app's transcript view, lab
 prompt, never in the main list. See
 [The app](viewing-and-sharing.md).
 
-### The MCP server isn't responding
-
-`cv mcp` speaks JSON-RPC on stdout, diagnostics on stderr. Register it with `claude mcp add clustervision -- /abs/path/to/cv mcp`. See [MCP](mcp.md).
-
 ### Still stuck?
 
 Open an issue: <https://github.com/emberian/cv/issues>. Weird old transcripts especially

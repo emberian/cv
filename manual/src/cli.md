@@ -94,7 +94,7 @@ substitutions can make a current file differ. A dropped skill can still be invok
 current text. Non-default policies add `skills` (`dropped`, `dropped_chars`, `kept`, `records`) to
 the report and `--json`.
 
-**JSON is snake_case** with RFC 3339 timestamps; `ls`, `search` and MCP share **one** session row:
+**JSON is snake_case** with RFC 3339 timestamps; `ls` and `search` share **one** session row:
 
 ```json
 { "id": "…", "harness": "claude", "path": "…", "cwd": "…", "title": "…",
@@ -111,7 +111,7 @@ take `-q`: `harness:claude (model:fable OR model:opus) msgs>=50 -title:test` ([r
 
 ## Message windows
 
-On [`cv show`](#cv-show), [`cv export`](#cv-export) and MCP `show`; indices are **0-based, end-exclusive**.
+On [`cv show`](#cv-show) and [`cv export`](#cv-export); indices are **0-based, end-exclusive**.
 
 | flag | meaning |
 | --- | --- |
@@ -922,13 +922,13 @@ Bare: the `-q` reference. `--json`: every shape cv emits. `--commands`: the comm
 cv schema                    # the full query-language reference
 cv schema --json             # session_row · session · message · block · query, as JSON
 cv schema --commands         # every command, grouped, with its one-line about
-cv schema --commands --json  # the whole tree with every argument — what generates the MCP tools
+cv schema --commands --json  # the whole tree with every argument
 ```
 
 `--json` shapes: `session_row`, `session`, `message`, `block`, `prompt_row`, `lane`, `deferral`,
 `query`, `subagent_row`, `"task_row"`, and `routes` (every `cv serve` method/path). `--commands --json`
 gives `{ name, group, about, args: [{ name, kind, value_type, possible_values?, default?, help,
-required }] }` per command, from clap; it generates [the MCP tools](mcp.md).
+required }] }` per command, from clap.
 
 #### The query calculus
 

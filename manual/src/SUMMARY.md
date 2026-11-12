@@ -13,7 +13,7 @@
 # The fleet
 
 - [Serving: `cv serve`, `cv watch`, `cv archive`](serving.md)
-- [Inside the harness: MCP and hooks](mcp.md)
+- [Inside the harness: hooks](hooks.md)
 - [The task substrate](tasks.md)
 - [Running a swarm: the orchestrator's instruments](swarm.md)
 

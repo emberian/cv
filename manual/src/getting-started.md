@@ -13,7 +13,7 @@ clustervision fixes all three. It parses [every harness it knows](harnesses.md) 
 - 🔎 **Search** every session — by keyword or by *meaning*.
 - 🖥️ **Browse** your whole corpus in a desktop/web app — a Projects lens, an activity heatmap, side-by-side compare, stats, and **sub-agent trees**.
 - 🚀 **Port** a session into another harness (any of the [emit targets](conversion.md)) or out of its directory jail — one verb, `cv port`.
-- 🧠 **Let running agents read each other's minds** via an MCP server — plus a task substrate: durable dispatch objects and the decisions posed on them, every completion labeled as the agent's own word.
+- 🧠 **Let running agents coordinate** via hooks and a task substrate: durable dispatch objects and the decisions posed on them, every completion labeled as the agent's own word.
 - 📦 **Pack** your whole history into context for the task you're about to start, so you never explain your codebase to an agent twice.
 
 It's open source (MIT/Apache-2.0). Reading, indexing and browser uploads stay local.
@@ -24,7 +24,7 @@ for local generation. Semantic indexing downloads its model on first use.
 
 - New here? [Install](#install) and take [the 60-second tour](#60-second-tour) below.
 - Living in the terminal? **[The CLI](cli.md)** is your map, and the **[command reference](reference.md)** has every flag.
-- Running a fleet of agents? See **[`cv serve` / `cv watch`](serving.md)**, **[MCP](mcp.md)**, and **[tasks](tasks.md)**.
+- Running a fleet of agents? See **[`cv serve` / `cv watch`](serving.md)**, **[hooks](hooks.md)**, and **[tasks](tasks.md)**.
 - Want the pretty pictures? **[The app](viewing-and-sharing.md)**.
 - Curious how it all works? **[Architecture](architecture.md)**.
 
@@ -37,7 +37,7 @@ curl --proto '=https' --tlsv1.2 -LsSf \
   https://github.com/emberian/cv/releases/latest/download/cv-installer.sh | sh
 ```
 
-This installs `cv`, the one binary (`cv mcp`, `cv serve`, `cv watch` and `cv archive` are its subcommands).
+This installs `cv`, the one binary (`cv serve`, `cv watch` and `cv archive` are its subcommands).
 
 Or build from source (uses the toolchain pinned in `rust-toolchain.toml`):
 

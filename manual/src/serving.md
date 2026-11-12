@@ -210,7 +210,7 @@ in 0.15.0).
 
 #### Task endpoints
 
-[Task](tasks.md) rows as in `cv task --json` and the MCP `task_*` tools. Every reply carries
+[Task](tasks.md) rows as in `cv task --json`. Every reply carries
 `warnings`: the task log's replay warnings.
 
 - **`GET /api/tasks`**: `{ "tasks": [...], "warnings": [] }`, oldest first; rows carry `id`,

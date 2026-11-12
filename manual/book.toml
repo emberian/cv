@@ -19,7 +19,7 @@ level = 1
 [output.html.search]
 enable = true
 
-# `{{#cv-commands}}` and `{{#cv-mcp-tools}}`: the reference and the MCP roster, generated from the
+# `{{#cv-commands}}` and `{{#cv-command-map}}`: the reference and command map, generated from the
 # built binary (`$CV_BIN`, else `target/debug/cv`). Build cv before the book.
 [preprocessor.cv]
 command = "python3 ../tools/mdbook-cv.py"
@@ -30,5 +30,6 @@ command = "python3 ../tools/mdbook-cv.py"
 "/daemon.html" = "serving.html"
 "/app.html" = "viewing-and-sharing.html"
 "/share.html" = "viewing-and-sharing.html#sharing-a-transcript-cv-share"
-"/integrations.html" = "mcp.html#hooks-cv-inside-a-running-session"
+"/integrations.html" = "hooks.html"
+"/mcp.html" = "hooks.html"
 "/opensession.html" = "conversion.html#the-opensession-standard"

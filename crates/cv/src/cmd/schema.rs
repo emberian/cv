@@ -1,7 +1,6 @@
 //! `cv schema` — the reference. Bare: the `-q` query-calculus reference (`cv_core::query`).
 //! `--json`: the machine-readable schema of every shape cv emits (session row, session, message,
-//! block, query). `--commands`: the command tree — with `--json` in the exact shape `cv mcp`
-//! generates its tools from (docs/INTERFACE-V2.md §6), produced from clap's own introspection so
+//! block, query). `--commands`: the command tree, produced from clap's own introspection so
 //! names, flags, and help can't drift from the binary.
 
 use anyhow::Result;
@@ -324,9 +323,9 @@ mod tests {
             .unwrap();
     }
 
-    /// `docs/INTERFACE-V2.md` §1 (the command groups) and §6 (the MCP roster) are generated from
-    /// the clap tree between `<!-- begin: … -->`/`<!-- end: … -->` markers, so the contract cannot
-    /// state a command set the binary does not have. `CV_REGEN_CONTRACT=1` rewrites them.
+    /// `docs/INTERFACE-V2.md` §1 (the command groups) is generated from the clap tree between
+    /// `<!-- begin: … -->`/`<!-- end: … -->` markers, so the contract cannot state a command set
+    /// the binary does not have. `CV_REGEN_CONTRACT=1` rewrites it.
     #[test]
     fn contract_tables_are_the_clap_tree() {
         std::thread::Builder::new()
@@ -367,42 +366,15 @@ mod tests {
             s1.push_str(&format!("| `{p}` | {} |\n", ticks(v)));
         }
 
-        let group_of = |tool: &str| {
-            commands
-                .iter()
-                .find(|c| name(c).replace(' ', "_") == tool)
-                .map(|c| c["group"].as_str().unwrap().to_string())
-                .unwrap_or_else(|| "MCP-only".to_string())
-        };
-        let generated = crate::cmd::mcp_tools::CliTools::from_tree(&tree).unwrap().tool_list();
-        let hand = crate::cmd::mcp::base_tool_list();
-        let mut roster: Vec<(String, Vec<String>)> = Vec::new();
-        for t in generated.iter().chain(hand.as_array().unwrap()) {
-            let tool = t["name"].as_str().unwrap().to_string();
-            let g = group_of(&tool);
-            match roster.iter_mut().find(|(have, _)| *have == g) {
-                Some((_, v)) => v.push(tool),
-                None => roster.push((g, vec![tool])),
-            }
-        }
-        let mut s6 = String::from("| group | tools |\n|---|---|\n");
-        for (g, v) in &roster {
-            s6.push_str(&format!("| **{g}** | {} |\n", ticks(v)));
-        }
-
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/INTERFACE-V2.md");
         let doc = std::fs::read_to_string(&path).unwrap();
-        let want = splice_marked(
-            &splice_marked(&doc, "cv schema --commands", &s1),
-            "cv mcp tools/list",
-            &s6,
-        );
+        let want = splice_marked(&doc, "cv schema --commands", &s1);
         if std::env::var_os("CV_REGEN_CONTRACT").is_some() {
             std::fs::write(&path, &want).unwrap();
         } else {
             assert!(
                 doc == want,
-                "docs/INTERFACE-V2.md §1/§6 disagree with the clap tree; regenerate with\n  \
+                "docs/INTERFACE-V2.md §1 disagrees with the clap tree; regenerate with\n  \
                  CV_REGEN_CONTRACT=1 cargo test -p clustervision --bin cv contract_tables\n\
                  and review the diff (a command that appeared or went is a contract change)"
             );
