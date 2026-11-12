@@ -555,7 +555,7 @@ impl<'w> SseWriter<'w> {
         self.peer_closed.is_some_and(|check| check())
     }
 
-    /// Emit one SSE event (`id:`, `event:`, one `data:` line per `\n`, blank line) and flush.
+    /// Emit one SSE event (`id:`, `event:`, one `data:` line per CR/LF/CRLF, blank line) and flush.
     pub(crate) fn event(&mut self, id: Option<&str>, event: Option<&str>, data: &str) -> io::Result<()> {
         self.scratch.clear();
         if let Some(id) = id {
@@ -568,8 +568,10 @@ impl<'w> SseWriter<'w> {
             push_sse_field(&mut self.scratch, event);
             self.scratch.push(b'\n');
         }
-        for line in data.split('\n') {
-            let line = line.strip_suffix('\r').unwrap_or(line);
+        // SSE treats lone CR as a newline too. Normalize CRLF first so it stays one
+        // delimiter, then prefix *every* line; data can never inject id/event fields.
+        let normalized = data.replace("\r\n", "\n");
+        for line in normalized.split(['\r', '\n']) {
             self.scratch.extend_from_slice(b"data: ");
             self.scratch.extend_from_slice(line.as_bytes());
             self.scratch.push(b'\n');
@@ -986,5 +988,17 @@ mod tests {
         let text10 = String::from_utf8(out10).unwrap();
         assert!(!text10.contains("Transfer-Encoding"), "{text10}");
         assert!(text10.ends_with("\r\n\r\nid: 1\ndata: ok\n\n"), "{text10}");
+    }
+    #[test]
+    fn sse_data_cannot_inject_fields_through_lone_carriage_returns() {
+        let mut out = Vec::new();
+        Response::sse(|sse| sse.event(None, None, "first\rid: forged\r\nevent: fake\nlast\r"))
+            .write_to_with(&mut out, false, false, false, None)
+            .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.ends_with("data: first\ndata: id: forged\ndata: event: fake\ndata: last\ndata: \n\n"),
+            "{text:?}"
+        );
     }
 }

@@ -2369,3 +2369,26 @@ fn serve_pages_refuse_framing() {
         );
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn serve_owns_the_local_capture_recorder() {
+    let w = world("serve-recorder");
+    let (_port, _server) = spawn_serve(&w);
+    let store = cv_core::state::StateStore::at_dir(&w.cv_home);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !store.socket_path().exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(store.socket_path().exists(), "serve must start the recorder");
+    let receipt = store.append("serve-test", "digest", &json!({})).unwrap();
+    let conn = store.open_readonly().unwrap().unwrap();
+    let mode: String = conn
+        .query_row(
+            "SELECT mode FROM writer_epochs WHERE epoch = ?1",
+            [&receipt.event_id.epoch],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(mode, "ipc_owner");
+}

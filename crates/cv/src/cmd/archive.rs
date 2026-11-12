@@ -585,6 +585,7 @@ pub fn cmd_watch(
         archive.home.display(),
     );
 
+    let _recorder = super::start_recorder()?;
     // Initial sweep batches all existing sessions into a single sealed pack.
     let initial_refs = discover_filtered(want, cwd_filter.as_deref());
     let init = archive.sync_refs(&initial_refs)?;

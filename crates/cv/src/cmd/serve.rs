@@ -165,6 +165,7 @@ fn run(
         }
     }
 
+    let _recorder = super::start_recorder()?;
     let mut limits = crate::http::Limits::default();
     if hub {
         limits.request = std::time::Duration::from_secs(120);
