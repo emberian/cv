@@ -79,6 +79,9 @@ struct RawRead {
 thread_local! {
     /// Non-blank log lines parsed: the fold test's counter.
     static PARSED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Deterministic fault injection: abort right after `state.db` commits before writing `events.jsonl`.
+    #[cfg(feature = "sqlite")]
+    static CRASH_AFTER_STATE_COMMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// See [`RawRead::committed`].
@@ -203,6 +206,7 @@ impl TaskStore {
         let state = self.state_store_for_fold();
         let start = Fold::stored(&path, state.as_ref());
         let from = start.as_ref().map(Fold::boundary).unwrap_or_default();
+        let read = self.read_events_from_with_applied(from, start.as_ref().map(|f| &f.applied))?;
         let (mut reducer, mut garbage, mut refused) = match start {
             Some(fold) => (
                 TaskReducer::resume(fold.model, fold.applied),
@@ -211,7 +215,6 @@ impl TaskStore {
             ),
             None => (TaskReducer::new(), Vec::new(), Vec::new()),
         };
-        let read = self.read_events_from(from)?;
         let committed = read.committed;
         let mut snapshot = None;
         let take = |reducer: &TaskReducer, refused: &[String], garbage: &[String]| {
@@ -289,28 +292,31 @@ impl TaskStore {
 
         // Replay under the lock: the candidate is validated against the exact state it will
         // land after. A clean stored fold stands for the log's prefix; only what follows is read.
+        let path = self.events_path();
+        let path_existed = path.exists();
         let state_ref = self.state_store_for_fold();
-        let start = Fold::stored(&self.events_path(), state_ref.as_ref())
-            .filter(|fold| fold.garbage.is_empty() && fold.refused.is_empty());
-        let read = self.read_events_from(start.as_ref().map(Fold::boundary).unwrap_or_default())?;
+        let start =
+            Fold::stored(&path, state_ref.as_ref()).filter(|fold| fold.garbage.is_empty() && fold.refused.is_empty());
+        let from = start.as_ref().map(Fold::boundary).unwrap_or_default();
+        let read = self.read_events_from_with_applied(from, start.as_ref().map(|f| &f.applied))?;
         let tail = read.tail;
         if let LogTail::Unrecognized { line_no } = tail {
             bail!(
                 "refusing to append: task log {} line {line_no} is an unrecognized final record \
                 — only an incomplete tail can be recovered; repair the log or upgrade cv before writing",
-                self.events_path().display()
+                path.display()
             );
         }
         if let Some(first) = read.warnings.first() {
             bail!(
                 "refusing to append: task log {} is degraded ({} warning(s); first: {first}) — \
                  repair the log or upgrade cv before writing",
-                self.events_path().display(),
+                path.display(),
                 read.warnings.len()
             );
         }
-        let mut reducer = match start {
-            Some(fold) => TaskReducer::resume(fold.model, fold.applied),
+        let mut reducer = match &start {
+            Some(fold) => TaskReducer::resume(fold.model.clone(), fold.applied.clone()),
             None => TaskReducer::new(),
         };
         for (line_no, ev) in &read.events {
@@ -318,7 +324,7 @@ impl TaskStore {
                 anyhow::anyhow!(
                     "refusing to append: task log {} line {line_no} fails replay ({e}) — an \
                      incomplete model must not be written against",
-                    self.events_path().display()
+                    path.display()
                 )
             })?;
         }
@@ -332,46 +338,99 @@ impl TaskStore {
         }
 
         // Persist authoritative rows inside `state.db` (`task_events`) under `BEGIN IMMEDIATE` +
-        // `synchronous=FULL` before updating the companion JSONL stream.
+        // `synchronous=FULL` before updating the companion JSONL stream, reconciling any prefix
+        // skipped by a stored fold or any prior `state.db` events missing from `events.jsonl`.
         #[cfg(feature = "sqlite")]
-        {
+        let mut missing_for_jsonl: Vec<TaskEvent> = Vec::new();
+        #[cfg(not(feature = "sqlite"))]
+        let missing_for_jsonl: Vec<TaskEvent> = if !path_existed {
+            read.events.iter().map(|(_, ev)| ev.clone()).collect()
+        } else {
+            Vec::new()
+        };
+
+        #[cfg(feature = "sqlite")]
+        let state_conn: rusqlite::Connection = {
             let state = self.state_store();
             let mut conn = state
                 .open_writable()
                 .with_context(|| format!("opening authoritative state.db at {}", state.path().display()))?;
+            let (sync_meta, prev_max_seq) = load_sync_meta(&conn)?;
+            let externally_replaced = path_existed
+                && prev_max_seq > 0
+                && prev_max_seq == sync_meta.synced_seq
+                && sync_meta.synced_prefix.as_ref().is_some_and(|p| !p.holds(&path));
+            let needs_prefix_backfill = path_existed
+                && !externally_replaced
+                && from.offset > 0
+                && (prev_max_seq == 0 || sync_meta.backfilled_offset < from.offset);
+
+            let replaced_events = if externally_replaced {
+                Some(self.read_jsonl_prefix_events(u64::MAX)?)
+            } else {
+                None
+            };
+            let prefix_backfill = if needs_prefix_backfill {
+                Some(self.read_jsonl_prefix_events(from.offset)?)
+            } else {
+                None
+            };
+
+            if !path_existed {
+                missing_for_jsonl = read.events.iter().map(|(_, ev)| ev.clone()).collect();
+            } else if prev_max_seq > sync_meta.synced_seq {
+                let file_events = self.read_jsonl_prefix_events(u64::MAX)?;
+                let in_file: std::collections::HashSet<String> = file_events.into_iter().map(|ev| ev.id).collect();
+                let unsynced = load_task_events_after(&conn, sync_meta.synced_seq)?;
+                for (_, ev) in unsynced {
+                    if !in_file.contains(&ev.id) {
+                        missing_for_jsonl.push(ev);
+                    }
+                }
+            }
+
             let tx = conn
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                 .context("starting state.db task_events transaction")?;
-            for (_, prior) in &read.events {
-                let raw_json = serde_json::to_string(prior).context("serializing prior task event")?;
-                tx.execute(
-                    "INSERT INTO task_events(event_id, task_id, ts, by_actor, raw_json)
-                     VALUES (?1, ?2, ?3, ?4, ?5)
-                     ON CONFLICT(event_id) DO NOTHING",
-                    rusqlite::params![prior.id, prior.task_id, prior.ts.to_rfc3339(), prior.by, raw_json],
-                )?;
+            if let Some(repaired) = &replaced_events {
+                tx.execute("DELETE FROM task_events", [])?;
+                for prior in repaired {
+                    insert_task_event_in(&tx, prior)?;
+                }
+            } else {
+                if let Some(prefix_evs) = &prefix_backfill {
+                    for prior in prefix_evs {
+                        insert_task_event_in(&tx, prior)?;
+                    }
+                }
+                for (_, prior) in &read.events {
+                    insert_task_event_in(&tx, prior)?;
+                }
             }
             for event in &events {
-                let raw_json = serde_json::to_string(event).context("serializing task event")?;
-                tx.execute(
-                    "INSERT INTO task_events(event_id, task_id, ts, by_actor, raw_json)
-                     VALUES (?1, ?2, ?3, ?4, ?5)
-                     ON CONFLICT(event_id) DO NOTHING",
-                    rusqlite::params![event.id, event.task_id, event.ts.to_rfc3339(), event.by, raw_json],
-                )?;
+                insert_task_event_in(&tx, event)?;
             }
             tx.commit().context("committing task_events to state.db")?;
-        }
+
+            #[cfg(test)]
+            if CRASH_AFTER_STATE_COMMIT.with(|flag| flag.replace(false)) {
+                bail!("simulated crash after state.db commit before events.jsonl write");
+            }
+            conn
+        };
 
         // First append to a fresh log stamps the format header (older, header-less logs stay
         // valid: readers treat them as implicit v1).
-        let path = self.events_path();
         let mut line = Vec::new();
-        if matches!(tail, LogTail::NeedsNewline) {
+        if path_existed && matches!(tail, LogTail::NeedsNewline) {
             line.push(b'\n');
         }
-        if !path.exists() {
+        if !path_existed {
             line.extend_from_slice(HEADER_LINE.as_bytes());
+            line.push(b'\n');
+        }
+        for prior in &missing_for_jsonl {
+            serde_json::to_writer(&mut line, prior).context("serializing prior task event")?;
             line.push(b'\n');
         }
         for event in &events {
@@ -379,20 +438,42 @@ impl TaskStore {
             line.push(b'\n');
         }
         let mut f = OpenOptions::new()
+            .read(true)
             .create(true)
             .append(true)
             .open(&path)
-            .with_context(|| format!("opening task log {}", self.events_path().display()))?;
+            .with_context(|| format!("opening task log {}", path.display()))?;
         // Candidate rejection and serialization failure cannot mutate an existing log. Once
         // admitted, discard only the unparseable EOF suffix excluded from the validated history.
-        if let LogTail::Torn { offset } = tail {
-            f.set_len(offset)
-                .with_context(|| format!("repairing incomplete task log tail {}", path.display()))?;
+        if path_existed {
+            if let LogTail::Torn { offset } = tail {
+                f.set_len(offset)
+                    .with_context(|| format!("repairing incomplete task log tail {}", path.display()))?;
+            }
         }
         f.write_all(&line)
-            .with_context(|| format!("appending to task log {}", self.events_path().display()))?;
+            .with_context(|| format!("appending to task log {}", path.display()))?;
         f.sync_data()
-            .with_context(|| format!("syncing task log {}", self.events_path().display()))?;
+            .with_context(|| format!("syncing task log {}", path.display()))?;
+
+        #[cfg(feature = "sqlite")]
+        if let Ok(md) = f.metadata() {
+            let final_len = md.len();
+            let synced_prefix = crate::source::Prefix::of(&f, final_len);
+            let max_seq: i64 = state_conn
+                .query_row("SELECT COALESCE(MAX(seq), 0) FROM task_events", [], |r| r.get(0))
+                .unwrap_or(0);
+            let _ = save_sync_meta(
+                &state_conn,
+                final_len,
+                0,
+                &TaskSyncMeta {
+                    synced_prefix,
+                    synced_seq: max_seq,
+                    backfilled_offset: final_len,
+                },
+            );
+        }
         Ok(Committed {
             events,
             model: reducer.into_model(),
@@ -415,21 +496,30 @@ impl TaskStore {
     /// other unrecognized final rows refuse append. Valid unterminated records need a newline.
     /// A format header is skipped when current, and refused loudly for a newer format version.
     fn read_events(&self) -> Result<RawRead> {
-        self.read_events_from(Committed0::default())
+        self.read_events_from_with_applied(Committed0::default(), None)
     }
 
-    /// [`Self::read_events`] of the lines after `from` (a [`Fold`]'s boundary), numbered on.
-    fn read_events_from(&self, from: Committed0) -> Result<RawRead> {
+    /// [`Self::read_events`] of the lines after `from` (a [`Fold`]'s boundary), numbered on,
+    /// reconciling any committed `state.db` (`task_events`) tail not yet flushed to `events.jsonl`.
+    fn read_events_from_with_applied(
+        &self,
+        from: Committed0,
+        applied_ids: Option<&std::collections::BTreeMap<String, String>>,
+    ) -> Result<RawRead> {
+        #[cfg(not(feature = "sqlite"))]
+        let _ = applied_ids;
+
         use std::io::{Seek, SeekFrom};
         let path = self.events_path();
         let mut file = match File::open(&path) {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 #[cfg(feature = "sqlite")]
-                if from.offset == 0 {
-                    if let Some(db_read) = self.read_events_from_state_db()? {
-                        return Ok(db_read);
+                if let Some(mut db_read) = self.read_events_from_state_db()? {
+                    if let Some(applied) = applied_ids {
+                        db_read.events.retain(|(_, ev)| !applied.contains_key(&ev.id));
                     }
+                    return Ok(db_read);
                 }
                 return Ok(RawRead {
                     events: Vec::new(),
@@ -548,7 +638,8 @@ impl TaskStore {
             }
         }
 
-        let warnings = bad
+        #[cfg_attr(not(feature = "sqlite"), allow(unused_mut))]
+        let mut warnings: Vec<String> = bad
             .into_iter()
             .map(|(n, snippet)| {
                 format!(
@@ -559,12 +650,102 @@ impl TaskStore {
                 )
             })
             .collect();
+
+        #[cfg(feature = "sqlite")]
+        self.reconcile_unsynced_state_events(&mut line_no, applied_ids, &mut events, &mut warnings)?;
+
         Ok(RawRead {
             events,
             warnings,
             tail,
             committed,
         })
+    }
+
+    #[cfg(feature = "sqlite")]
+    fn reconcile_unsynced_state_events(
+        &self,
+        line_no: &mut usize,
+        applied_ids: Option<&std::collections::BTreeMap<String, String>>,
+        events: &mut Vec<(usize, TaskEvent)>,
+        warnings: &mut Vec<String>,
+    ) -> Result<()> {
+        let state = self.state_store();
+        let Some(conn) = state
+            .open_readonly()
+            .with_context(|| format!("opening authoritative state.db at {}", state.path().display()))?
+        else {
+            return Ok(());
+        };
+        let (sync_meta, max_seq) = load_sync_meta(&conn)?;
+        if max_seq <= sync_meta.synced_seq {
+            return Ok(());
+        }
+        let mut stmt = conn.prepare("SELECT seq, raw_json FROM task_events WHERE seq > ?1 ORDER BY seq ASC")?;
+        let rows = stmt.query_map([sync_meta.synced_seq], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (seq, raw_json) = row?;
+            #[cfg(test)]
+            PARSED.with(|n| n.set(n.get() + 1));
+            match serde_json::from_str::<TaskEvent>(&raw_json) {
+                Ok(ev) => {
+                    let already_seen = events.iter().any(|(_, e)| e.id == ev.id)
+                        || applied_ids.is_some_and(|m| m.contains_key(&ev.id));
+                    if !already_seen {
+                        *line_no += 1;
+                        events.push((*line_no, ev));
+                    }
+                }
+                Err(_) => {
+                    let snippet: String = raw_json.chars().take(80).collect();
+                    warnings.push(format!(
+                        "task store {}: row {} is not a valid event: {}",
+                        state.path().display(),
+                        seq,
+                        snippet
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Read parseable events from `events.jsonl[0..limit_offset]` without consulting `state.db`
+    /// (used to backfill a pre-existing JSONL prefix skipped by `Fold::stored`).
+    #[cfg(feature = "sqlite")]
+    fn read_jsonl_prefix_events(&self, limit_offset: u64) -> Result<Vec<TaskEvent>> {
+        use std::io::Read as _;
+        let path = self.events_path();
+        let file = match File::open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e).with_context(|| format!("opening task log {}", path.display())),
+        };
+        let mut reader = BufReader::new(file.take(limit_offset));
+        let mut raw = Vec::new();
+        let mut out = Vec::new();
+        loop {
+            raw.clear();
+            let n = reader
+                .read_until(b'\n', &mut raw)
+                .with_context(|| format!("reading task log {}", path.display()))?;
+            if n == 0 {
+                break;
+            }
+            let Ok(text) = std::str::from_utf8(&raw) else {
+                break;
+            };
+            let line = text.trim();
+            if line.is_empty() || header_version(line).is_some() {
+                continue;
+            }
+            if let Ok(ev) = serde_json::from_str::<TaskEvent>(line) {
+                out.push(ev);
+            }
+        }
+        Ok(out)
     }
 
     #[cfg(feature = "sqlite")]
@@ -607,6 +788,67 @@ impl TaskStore {
             committed: Committed0::default(),
         }))
     }
+}
+
+#[cfg(feature = "sqlite")]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct TaskSyncMeta {
+    synced_prefix: Option<crate::source::Prefix>,
+    synced_seq: i64,
+    backfilled_offset: u64,
+}
+
+#[cfg(feature = "sqlite")]
+fn load_sync_meta(conn: &rusqlite::Connection) -> Result<(TaskSyncMeta, i64)> {
+    use rusqlite::OptionalExtension as _;
+    let max_seq: i64 = conn.query_row("SELECT COALESCE(MAX(seq), 0) FROM task_events", [], |r| r.get(0))?;
+    let raw: Option<String> = conn
+        .query_row("SELECT file_id_json FROM task_sync_meta WHERE slot = 1", [], |r| {
+            r.get::<_, Option<String>>(0)
+        })
+        .optional()?
+        .flatten();
+    let meta = raw
+        .and_then(|s| serde_json::from_str::<TaskSyncMeta>(&s).ok())
+        .unwrap_or_default();
+    Ok((meta, max_seq))
+}
+
+#[cfg(feature = "sqlite")]
+fn save_sync_meta(conn: &rusqlite::Connection, log_len: u64, log_lines: usize, meta: &TaskSyncMeta) -> Result<()> {
+    let raw = serde_json::to_string(meta).context("serializing task_sync_meta")?;
+    conn.execute(
+        "INSERT OR REPLACE INTO task_sync_meta(slot, log_len, log_lines, file_id_json)
+         VALUES (1, ?1, ?2, ?3)",
+        rusqlite::params![log_len as i64, log_lines as i64, raw],
+    )?;
+    Ok(())
+}
+
+#[cfg(feature = "sqlite")]
+fn insert_task_event_in(conn: &rusqlite::Connection, ev: &TaskEvent) -> Result<()> {
+    let raw_json = serde_json::to_string(ev).context("serializing task event")?;
+    conn.execute(
+        "INSERT INTO task_events(event_id, task_id, ts, by_actor, raw_json)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(event_id) DO NOTHING",
+        rusqlite::params![ev.id, ev.task_id, ev.ts.to_rfc3339(), ev.by, raw_json],
+    )?;
+    Ok(())
+}
+
+#[cfg(feature = "sqlite")]
+fn load_task_events_after(conn: &rusqlite::Connection, after_seq: i64) -> Result<Vec<(i64, TaskEvent)>> {
+    let mut stmt = conn.prepare("SELECT seq, raw_json FROM task_events WHERE seq > ?1 ORDER BY seq ASC")?;
+    let rows = stmt.query_map([after_seq], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (seq, raw_json) = row?;
+        if let Ok(ev) = serde_json::from_str::<TaskEvent>(&raw_json) {
+            out.push((seq, ev));
+        }
+    }
+    Ok(out)
 }
 
 /// The warning a replay gives for an event the reducer refused.
@@ -1545,6 +1787,158 @@ mod tests {
                 .append_agent_event(new_event(Some(&task_id), "agent:worker", TaskEventKind::Released {}))
                 .is_err());
         }
+
+        // Non-frozen append AFTER `remove_file(events.jsonl)` must recreate the full history
+        // `[HEADER_LINE, E1, E2, E3]` so subsequent `replay()`/`fold()`/`append()` preserve `t1`
+        // with zero quarantined events!
+        store
+            .append_agent_event(new_event(Some(&task_id), "agent:worker", TaskEventKind::Released {}))
+            .unwrap();
+        let after_recreate = store.replay().unwrap();
+        assert_eq!(after_recreate.events.len(), 3);
+        assert_eq!(after_recreate.quarantined, 0);
+        assert!(after_recreate.warnings.is_empty(), "{:?}", after_recreate.warnings);
+        assert_eq!(after_recreate.model.tasks[&task_id].state, TaskState::Open);
+        assert_eq!(store.fold().unwrap().model.tasks[&task_id].state, TaskState::Open);
+
+        store
+            .append_agent_event(new_event(
+                Some(&task_id),
+                "agent:worker-2",
+                TaskEventKind::Claimed {
+                    assignee: "agent:worker-2".into(),
+                },
+            ))
+            .unwrap();
+        let after_second_append = store.replay().unwrap();
+        assert_eq!(after_second_append.events.len(), 4);
+        assert_eq!(after_second_append.quarantined, 0);
+        assert_eq!(
+            after_second_append.model.tasks[&task_id].assignee.as_deref(),
+            Some("agent:worker-2")
+        );
+
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn crash_after_state_db_commit_before_jsonl_write_surfaces_and_heals_history() {
+        let base = std::env::temp_dir().join(format!("cv-task-crash-sync-{}", uuid::Uuid::now_v7()));
+        let store = TaskStore::at(base.join("tasks"));
+        let task_id = open_task(&store);
+        store.fold().unwrap();
+
+        // Simulate a process committing `E2` (`Claimed` by `agent:alpha`) to `state.db` and dying
+        // before writing `E2` to `events.jsonl`.
+        CRASH_AFTER_STATE_COMMIT.with(|flag| flag.set(true));
+        let e2 = new_event(
+            Some(&task_id),
+            "agent:alpha",
+            TaskEventKind::Claimed {
+                assignee: "agent:alpha".into(),
+            },
+        );
+        let err = store.append_agent_event(e2.clone()).unwrap_err();
+        assert!(err.to_string().contains("simulated crash"), "{err}");
+
+        // `events.jsonl` on disk still contains only `HEADER_LINE` + `E1`, yet `replay()` and
+        // `fold()` immediately surface committed `E2` from authoritative `state.db`!
+        let on_disk = fs::read_to_string(store.events_path()).unwrap();
+        assert_eq!(on_disk.lines().count(), 2, "E2 was not written to events.jsonl");
+
+        let replayed = store.replay().unwrap();
+        assert_eq!(replayed.events.len(), 2);
+        assert_eq!(replayed.model.tasks[&task_id].state, TaskState::Claimed);
+        assert_eq!(replayed.model.tasks[&task_id].assignee.as_deref(), Some("agent:alpha"));
+
+        let folded = store.fold().unwrap();
+        assert_eq!(folded.model.tasks[&task_id].state, TaskState::Claimed);
+        assert_eq!(folded.model.tasks[&task_id].assignee.as_deref(), Some("agent:alpha"));
+
+        // Competing `Claimed` by `agent:beta` must validate CAS against `[E1, E2]` (NOT stale `[E1]`)
+        // and fail closed!
+        let competing = store.append_agent_event(new_event(
+            Some(&task_id),
+            "agent:beta",
+            TaskEventKind::Claimed {
+                assignee: "agent:beta".into(),
+            },
+        ));
+        assert!(competing.is_err(), "competing claim must not validate against stale E1");
+
+        // Subsequent valid append (`Released` by `agent:alpha`) heals `events.jsonl` so it carries
+        // `[HEADER_LINE, E1, E2, E3]` in full!
+        store
+            .append_agent_event(new_event(Some(&task_id), "agent:alpha", TaskEventKind::Released {}))
+            .unwrap();
+        let healed_disk = fs::read_to_string(store.events_path()).unwrap();
+        assert_eq!(
+            healed_disk.lines().count(),
+            4,
+            "events.jsonl must hold header + E1 + E2 + E3"
+        );
+        let final_replay = store.replay().unwrap();
+        assert_eq!(final_replay.events.len(), 3);
+        assert_eq!(final_replay.quarantined, 0);
+        assert_eq!(final_replay.model.tasks[&task_id].state, TaskState::Open);
+
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn fold_before_append_on_preexisting_jsonl_backfills_full_prefix_into_state_db() {
+        let base = std::env::temp_dir().join(format!("cv-task-backfill-{}", uuid::Uuid::now_v7()));
+        let tasks_dir = base.join("tasks");
+        fs::create_dir_all(&tasks_dir).unwrap();
+        let store = TaskStore::at(&tasks_dir);
+
+        // Pre-populate `events.jsonl` with `[E1..E50]` BEFORE `state.db` exists.
+        let mut raw_jsonl = format!("{HEADER_LINE}\n");
+        let open_ev = new_event(None, "agent:seed", open_kind());
+        let task_id = open_ev.task_id.clone();
+        raw_jsonl.push_str(&serde_json::to_string(&open_ev).unwrap());
+        raw_jsonl.push('\n');
+        for i in 2..=50 {
+            let note = new_event(
+                Some(&task_id),
+                "agent:seed",
+                TaskEventKind::Noted {
+                    text: format!("note-{i}"),
+                    session_ref: None,
+                },
+            );
+            raw_jsonl.push_str(&serde_json::to_string(&note).unwrap());
+            raw_jsonl.push('\n');
+        }
+        fs::write(store.events_path(), raw_jsonl).unwrap();
+        assert!(!store.state_store().path().exists());
+
+        // `fold()` checkpoints `task_folds` at `EOF(E1..E50)` without populating `task_events`.
+        let folded = store.fold().unwrap();
+        assert_eq!(folded.model.tasks[&task_id].notes.len(), 49);
+
+        // `append_agent_event(E51)` resumes from `fold.boundary()` and must backfill `E1..E50`
+        // before inserting `E51` into `task_events`!
+        store
+            .append_agent_event(new_event(
+                Some(&task_id),
+                "agent:seed",
+                TaskEventKind::Noted {
+                    text: "note-51".into(),
+                    session_ref: None,
+                },
+            ))
+            .unwrap();
+
+        // Removing `events.jsonl` must still replay all 51 events (`E1..E51`) cleanly from `state.db`!
+        fs::remove_file(store.events_path()).unwrap();
+        let replayed = store.replay().unwrap();
+        assert_eq!(replayed.events.len(), 51);
+        assert_eq!(replayed.quarantined, 0);
+        assert!(replayed.warnings.is_empty(), "{:?}", replayed.warnings);
+        assert_eq!(replayed.model.tasks[&task_id].notes.len(), 50);
 
         fs::remove_dir_all(&base).ok();
     }

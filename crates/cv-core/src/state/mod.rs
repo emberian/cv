@@ -169,6 +169,11 @@ impl StateStore {
     /// would approach macOS's 104-byte `SUN_LEN` limit.
     #[cfg(unix)]
     pub fn socket_path(&self) -> PathBuf {
+        self.socket_path_with_temp_dir(&std::env::temp_dir())
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn socket_path_with_temp_dir(&self, temp_dir: &Path) -> PathBuf {
         use std::os::unix::ffi::OsStrExt;
         let direct = sibling_with_suffix(&self.db_path, "sock");
         if direct.as_os_str().as_bytes().len() <= 96 {
@@ -177,9 +182,13 @@ impl StateStore {
         let canonical_key = normalize_path_key(&self.db_path);
         let hash = crate::digest::sha256_hex(canonical_key.as_bytes());
         let uid = unsafe { libc::geteuid() };
-        std::env::temp_dir()
-            .join(format!("cv-usock-{uid}"))
-            .join(format!("s-{}.sock", &hash[..24]))
+        let sub_dir = format!("cv-usock-{uid}");
+        let file_name = format!("s-{}.sock", &hash[..24]);
+        let candidate = temp_dir.join(&sub_dir).join(&file_name);
+        if candidate.as_os_str().as_bytes().len() <= 96 {
+            return candidate;
+        }
+        PathBuf::from("/tmp").join(sub_dir).join(file_name)
     }
 
     /// Open a migrated writable SQLite connection configured with `WAL` + `synchronous=FULL`.

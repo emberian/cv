@@ -6,7 +6,7 @@ use super::{
     set_restrictive_file_mode, tables::current_process_identity, DurableReceipt, EventId, StateError, StateStore,
 };
 use fs4::fs_std::FileExt;
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs::{File, OpenOptions};
@@ -213,11 +213,12 @@ pub(crate) fn validate_append_request(req: &AppendRequest) -> Result<(), StateEr
     Ok(())
 }
 
-/// Core single-operation state transition inside an already-open `BEGIN IMMEDIATE` transaction.
+/// Core single-operation state transition inside an already-open `BEGIN IMMEDIATE` transaction
+/// (or per-item `SAVEPOINT`).
 ///
 /// Shared identically between [`RecorderServer`] batch commits and serverless fallback commits.
 pub(crate) fn commit_append_in_tx(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     default_producer_id: &str,
     epoch_slot: &mut Option<String>,
     mode: &str,
@@ -713,7 +714,7 @@ fn execute_batch(
     fault: FaultMode,
     stop: &AtomicBool,
 ) -> bool {
-    let tx = match conn.transaction_with_behavior(TransactionBehavior::Immediate) {
+    let mut tx = match conn.transaction_with_behavior(TransactionBehavior::Immediate) {
         Ok(tx) => tx,
         Err(err) => {
             let msg = err.to_string();
@@ -728,19 +729,31 @@ fn execute_batch(
     let mut outcomes = Vec::with_capacity(batch.len());
 
     for item in batch {
-        let resp = match commit_append_in_tx(&tx, producer_id, &mut epoch_slot, "ipc_owner", &item.req) {
-            Ok(receipt) => WireResponse::Committed(receipt),
-            Err(StateError::OperationConflict {
-                op_id,
-                existing_digest,
-                incoming_digest,
-            }) => WireResponse::Conflict {
-                op_id,
-                existing_digest,
-                incoming_digest,
-            },
-            Err(StateError::InvalidArgument(msg)) => WireResponse::InvalidArgument(msg),
-            Err(other) => WireResponse::Error(other.to_string()),
+        let resp = match tx.savepoint() {
+            Ok(sp) => {
+                let mut item_epoch = epoch_slot.clone();
+                match commit_append_in_tx(&sp, producer_id, &mut item_epoch, "ipc_owner", &item.req) {
+                    Ok(receipt) => match sp.commit() {
+                        Ok(()) => {
+                            epoch_slot = item_epoch;
+                            WireResponse::Committed(receipt)
+                        }
+                        Err(err) => WireResponse::Error(err.to_string()),
+                    },
+                    Err(StateError::OperationConflict {
+                        op_id,
+                        existing_digest,
+                        incoming_digest,
+                    }) => WireResponse::Conflict {
+                        op_id,
+                        existing_digest,
+                        incoming_digest,
+                    },
+                    Err(StateError::InvalidArgument(msg)) => WireResponse::InvalidArgument(msg),
+                    Err(other) => WireResponse::Error(other.to_string()),
+                }
+            }
+            Err(err) => WireResponse::Error(err.to_string()),
         };
         outcomes.push((item.stream, resp));
     }

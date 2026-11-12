@@ -618,3 +618,71 @@ fn lane_runs_verify_pid_start_time_liveness_and_lineage_handles_cycles() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[cfg(unix)]
+#[test]
+fn batch_savepoint_rolls_back_failed_item_and_deep_tmpdir_stays_within_sun_len() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let dir = tmp_state_dir("savepoint-sunlen");
+    let store = StateStore::at_dir(&dir);
+
+    // 1. Deep `TMPDIR` (> 80 bytes) plus deep `state.db` (> 96 bytes) must fall back to `/tmp/cv-usock-{uid}/...`
+    //    keeping the socket path strictly <= 96 bytes (well under macOS's 104-byte `SUN_LEN`).
+    let deep_db = dir.join("a".repeat(90)).join("state.db");
+    let deep_store = StateStore::at(&deep_db);
+    let deep_tmpdir = std::path::PathBuf::from(format!("/var/folders/{}", "x".repeat(80)));
+    let fallback_sock = deep_store.socket_path_with_temp_dir(&deep_tmpdir);
+    assert!(
+        fallback_sock.to_string_lossy().starts_with("/tmp/cv-usock-"),
+        "expected /tmp/cv-usock-* fallback, got {}",
+        fallback_sock.display()
+    );
+    assert!(
+        fallback_sock.as_os_str().as_bytes().len() <= 96,
+        "socket path {} exceeded 96 bytes ({})",
+        fallback_sock.display(),
+        fallback_sock.as_os_str().as_bytes().len()
+    );
+
+    // 2. Per-item savepoint in `execute_batch`: if an item fails in SQLite AFTER incrementing
+    //    `epoch_counters`, its savepoint rolls back cleanly without leaving a sequence gap or
+    //    partial producer/counter state.
+    {
+        let conn = store.open_writable().unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER abort_poison_op BEFORE INSERT ON capture_inbox
+             WHEN NEW.op_id = 'poison-op'
+             BEGIN
+                 SELECT RAISE(ABORT, 'simulated capture_inbox failure');
+             END;",
+        )
+        .unwrap();
+    }
+
+    let server = RecorderServer::start(store.clone(), "node-a").unwrap();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+    let mut handles = Vec::new();
+    for (op, dig) in [("good-1", "d1"), ("poison-op", "dp"), ("good-2", "d2")] {
+        let st = store.clone();
+        let b = barrier.clone();
+        handles.push(std::thread::spawn(move || {
+            b.wait();
+            st.append(op, dig, &json!({"op": op}))
+        }));
+    }
+    let res: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    let r1 = res[0].as_ref().expect("good-1 must commit");
+    assert!(res[1].is_err(), "poison-op must fail and roll back its savepoint");
+    let r2 = res[2].as_ref().expect("good-2 must commit");
+
+    // Both `good-1` and `good-2` must get contiguous sequences `{1, 2}` (NEVER `3`), proving
+    // `poison-op`'s `epoch_counters` increment rolled back cleanly inside the batch!
+    let mut seqs = [r1.event_id.seq, r2.event_id.seq];
+    seqs.sort_unstable();
+    assert_eq!(seqs, [1, 2]);
+    assert_eq!(store.inbox_count().unwrap(), 2);
+
+    server.shutdown();
+    std::fs::remove_dir_all(&dir).ok();
+}
