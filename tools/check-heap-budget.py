@@ -641,6 +641,7 @@ def main():
         catalog = root / "catalog"
         catalog.mkdir()
         env = dict(os.environ, CLUSTERVISION_HOME=str(catalog))
+        env.pop("CLUSTERVISION_CACHE", None)
         if args.only == "doctor":
             doctors(args.probe.resolve(), root, env, args.baseline_probe.resolve() if args.baseline_probe else None)
         elif args.only == "metadata-facts":

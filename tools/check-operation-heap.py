@@ -633,6 +633,7 @@ def main():
         (root / "home").mkdir()
         env = dict(os.environ, HOME=str(root / "home"),
                    CLUSTERVISION_HOME=str(root / "catalog"), RAYON_NUM_THREADS="1")
+        env.pop("CLUSTERVISION_CACHE", None)
         binary = args.prune_probe.resolve(strict=True)
         prune_gate(binary, root, env)
         rewind_gate(binary, root, env)

@@ -36,6 +36,7 @@ def campaign(args, root):
     temporary = root / "temporary"
     temporary.mkdir()
     env = dict(os.environ, CLUSTERVISION_HOME=str(scratch), TMPDIR=str(temporary))
+    env.pop("CLUSTERVISION_CACHE", None)
     results = []
     failed = []
     for harness, shape in CASES:
@@ -84,6 +85,7 @@ def hermes_giant(args, root):
     temporary = root / "temporary"
     temporary.mkdir()
     env = dict(os.environ, CLUSTERVISION_HOME=str(catalog), TMPDIR=str(temporary))
+    env.pop("CLUSTERVISION_CACHE", None)
     results = []
     # User rows exercise exact replay dedup; assistant-only cells cannot expose key ownership.
     for shape in ("history", "prompt-only"):
@@ -120,6 +122,7 @@ def giant_discovery(args, root):
     temporary = root / "temporary"
     temporary.mkdir()
     env = dict(os.environ, CLUSTERVISION_HOME=str(catalog), TMPDIR=str(temporary))
+    env.pop("CLUSTERVISION_CACHE", None)
     results = []
     cases = (("devin", "history"), ("devin", "metadata"), ("goose", "history"),
              ("hermes", "history"), ("hermes", "prompt-only"))
