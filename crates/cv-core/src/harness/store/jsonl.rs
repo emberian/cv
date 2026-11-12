@@ -427,6 +427,22 @@ fn lines(
     to: u64,
     mut visit: impl FnMut(Line<'_>) -> anyhow::Result<crate::stream::Flow>,
 ) -> anyhow::Result<()> {
+    if decoded.is_none() {
+        return crate::io_admission::IoAdmission::global().admit_path(source.path(), || {
+            lines_inner(source, file, decoded, from, to, &mut visit)
+        });
+    }
+    lines_inner(source, file, decoded, from, to, &mut visit)
+}
+
+fn lines_inner(
+    source: &crate::json::JsonSource,
+    file: &File,
+    decoded: Decoded<'_>,
+    from: u64,
+    to: u64,
+    mut visit: impl FnMut(Line<'_>) -> anyhow::Result<crate::stream::Flow>,
+) -> anyhow::Result<()> {
     use crate::stream::Flow;
     #[cfg(feature = "mmap")]
     if decoded.is_some()

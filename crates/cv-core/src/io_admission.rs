@@ -112,6 +112,7 @@ struct DeviceSlot {
     next_ticket: u64,
     serving_ticket: u64,
     waiters: VecDeque<u64>,
+    owners: HashMap<std::thread::ThreadId, usize>,
 }
 
 impl DeviceSlot {
@@ -124,6 +125,7 @@ impl DeviceSlot {
             next_ticket: 0,
             serving_ticket: 0,
             waiters: VecDeque::new(),
+            owners: HashMap::new(),
         }
     }
 }
@@ -231,14 +233,24 @@ impl IoAdmission {
     }
 
     /// Acquire a per-device stream permit in fair FIFO order. Blocks only I/O contenders on the
-    /// same saturated device (e.g., serializing rotational HDD bulk reads to 1 stream).
+    /// same saturated device (e.g., serializing rotational HDD bulk reads to 1 stream), and is
+    /// same-thread reentrant per `(self, DeviceId)` so nested sidecar/segment reads inside a
+    /// visitor callback on `max_streams = 1` never self-deadlock.
     pub fn acquire(&self, dev: DeviceId, class_hint: Option<DeviceClass>) -> IoPermit {
+        let tid = std::thread::current().id();
         let lock = self.device_lock(dev, class_hint);
         let mut slot = lock.state.lock().unwrap_or_else(|e| e.into_inner());
         if !slot.overridden {
             if let Some(class) = class_hint {
                 slot.policy = env_override_policy(class);
             }
+        }
+        if let Some(depth) = slot.owners.get_mut(&tid) {
+            *depth += 1;
+            return IoPermit {
+                lock: lock.clone(),
+                owner: tid,
+            };
         }
         let ticket = slot.next_ticket;
         slot.next_ticket = slot.next_ticket.wrapping_add(1);
@@ -251,10 +263,11 @@ impl IoAdmission {
         slot.serving_ticket = ticket;
         slot.active += 1;
         slot.peak_active = slot.peak_active.max(slot.active);
+        slot.owners.insert(tid, 1);
         drop(slot);
         // If additional stream slots remain available on this device, wake the next FIFO waiter.
         lock.ready.notify_all();
-        IoPermit { lock }
+        IoPermit { lock, owner: tid }
     }
 
     /// Acquire admission for `path`'s underlying device and execute `f`.
@@ -328,14 +341,28 @@ impl IoAdmission {
 /// RAII guard holding one active stream slot on a physical device.
 pub struct IoPermit {
     lock: std::sync::Arc<DeviceLock>,
+    owner: std::thread::ThreadId,
 }
 
 impl Drop for IoPermit {
     fn drop(&mut self) {
         let mut slot = self.lock.state.lock().unwrap_or_else(|e| e.into_inner());
-        slot.active = slot.active.saturating_sub(1);
-        drop(slot);
-        self.lock.ready.notify_all();
+        let release_slot = match slot.owners.get_mut(&self.owner) {
+            Some(depth) if *depth > 1 => {
+                *depth -= 1;
+                false
+            }
+            Some(_) => {
+                slot.owners.remove(&self.owner);
+                true
+            }
+            None => true,
+        };
+        if release_slot {
+            slot.active = slot.active.saturating_sub(1);
+            drop(slot);
+            self.lock.ready.notify_all();
+        }
     }
 }
 
@@ -896,123 +923,130 @@ mod macos_bulk {
                 })?;
                 entry_offset = next_entry;
 
-                let mut cursor = 4usize;
-                let returned: AttributeSet = read_unaligned(record, &mut cursor)?;
-
-                let entry_err = if (returned.commonattr & ATTR_CMN_ERROR) != 0 {
-                    let code: u32 = read_unaligned(record, &mut cursor)?;
-                    (code != 0).then_some(code as i32)
-                } else {
-                    None
-                };
-
-                let mut name_os = OsString::new();
-                if (returned.commonattr & ATTR_CMN_NAME) != 0 {
-                    let name_field_pos = cursor;
-                    let name_ref: AttrReference = read_unaligned(record, &mut cursor)?;
-                    let data_start = isize::try_from(name_field_pos)
-                        .ok()
-                        .and_then(|base| base.checked_add(name_ref.attr_dataoffset as isize))
-                        .and_then(|pos| usize::try_from(pos).ok())
-                        .ok_or_else(|| {
-                            io::Error::new(io::ErrorKind::InvalidData, "invalid ATTR_CMN_NAME dataoffset")
-                        })?;
-                    let data_end = data_start
-                        .checked_add(name_ref.attr_length as usize)
-                        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "ATTR_CMN_NAME length overflow"))?;
-                    let raw_name = record.get(data_start..data_end).ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::InvalidData, "ATTR_CMN_NAME out of record bounds")
-                    })?;
-                    let nul = raw_name.iter().position(|&b| b == 0).unwrap_or(raw_name.len());
-                    name_os = OsStr::from_bytes(&raw_name[..nul]).to_os_string();
+                if let Some(entry) = parse_bulk_record(record)? {
+                    out.push(entry);
                 }
-
-                if name_os == "." || name_os == ".." || name_os.is_empty() {
-                    continue;
-                }
-
-                if let Some(code) = entry_err {
-                    out.push(DirEntryAttr {
-                        name: name_os,
-                        file_type: BulkFileType::Other,
-                        ino: 0,
-                        dev: 0,
-                        mtime_ns: 0,
-                        ctime_ns: 0,
-                        size: 0,
-                        entry_error: Some(code),
-                    });
-                    continue;
-                }
-
-                let dev = if (returned.commonattr & ATTR_CMN_DEVID) != 0 {
-                    let raw_dev: libc::dev_t = read_unaligned(record, &mut cursor)?;
-                    raw_dev as u64
-                } else {
-                    0
-                };
-
-                let file_type = if (returned.commonattr & ATTR_CMN_OBJTYPE) != 0 {
-                    let vtype: u32 = read_unaligned(record, &mut cursor)?;
-                    match vtype {
-                        VREG => BulkFileType::File,
-                        VDIR => BulkFileType::Dir,
-                        VLNK => BulkFileType::Symlink,
-                        _ => BulkFileType::Other,
-                    }
-                } else {
-                    BulkFileType::Other
-                };
-
-                let mtime_ns = if (returned.commonattr & ATTR_CMN_MODTIME) != 0 {
-                    let ts: libc::timespec = read_unaligned(record, &mut cursor)?;
-                    let sec = ts.tv_sec.max(0) as u64;
-                    let nsec = ts.tv_nsec.clamp(0, 999_999_999) as u64;
-                    sec.saturating_mul(1_000_000_000).saturating_add(nsec)
-                } else {
-                    0
-                };
-
-                let ctime_ns = if (returned.commonattr & ATTR_CMN_CHGTIME) != 0 {
-                    let ts: libc::timespec = read_unaligned(record, &mut cursor)?;
-                    (ts.tv_sec as i128)
-                        .saturating_mul(1_000_000_000)
-                        .saturating_add(ts.tv_nsec as i128)
-                        .clamp(i64::MIN as i128, i64::MAX as i128) as i64
-                } else {
-                    0
-                };
-
-                let ino = if (returned.commonattr & ATTR_CMN_FILEID) != 0 {
-                    read_unaligned::<u64>(record, &mut cursor)?
-                } else {
-                    0
-                };
-
-                let size = if (returned.fileattr & ATTR_FILE_DATALENGTH) != 0 {
-                    let len: libc::off_t = read_unaligned(record, &mut cursor)?;
-                    if file_type == BulkFileType::File {
-                        len.max(0) as u64
-                    } else {
-                        0
-                    }
-                } else {
-                    0
-                };
-
-                out.push(DirEntryAttr {
-                    name: name_os,
-                    file_type,
-                    ino,
-                    dev,
-                    mtime_ns,
-                    ctime_ns,
-                    size,
-                    entry_error: None,
-                });
             }
         }
         Ok(out)
+    }
+
+    pub(super) fn parse_bulk_record(record: &[u8]) -> io::Result<Option<DirEntryAttr>> {
+        let mut cursor = 4usize;
+        let returned: AttributeSet = read_unaligned(record, &mut cursor)?;
+
+        let entry_err = if (returned.commonattr & ATTR_CMN_ERROR) != 0 {
+            let code: u32 = read_unaligned(record, &mut cursor)?;
+            (code != 0).then_some(code as i32)
+        } else {
+            None
+        };
+
+        let mut name_os = OsString::new();
+        if (returned.commonattr & ATTR_CMN_NAME) != 0 {
+            let name_field_pos = cursor;
+            let name_ref: AttrReference = read_unaligned(record, &mut cursor)?;
+            let data_start = isize::try_from(name_field_pos)
+                .ok()
+                .and_then(|base| base.checked_add(name_ref.attr_dataoffset as isize))
+                .and_then(|pos| usize::try_from(pos).ok())
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid ATTR_CMN_NAME dataoffset"))?;
+            let data_end = data_start
+                .checked_add(name_ref.attr_length as usize)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "ATTR_CMN_NAME length overflow"))?;
+            let raw_name = record
+                .get(data_start..data_end)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "ATTR_CMN_NAME out of record bounds"))?;
+            let nul = raw_name.iter().position(|&b| b == 0).unwrap_or(raw_name.len());
+            name_os = OsStr::from_bytes(&raw_name[..nul]).to_os_string();
+        }
+
+        if name_os == "." || name_os == ".." {
+            return Ok(None);
+        }
+
+        if let Some(code) = entry_err {
+            return Ok(Some(DirEntryAttr {
+                name: name_os,
+                file_type: BulkFileType::Other,
+                ino: 0,
+                dev: 0,
+                mtime_ns: 0,
+                ctime_ns: 0,
+                size: 0,
+                entry_error: Some(code),
+            }));
+        }
+
+        if name_os.is_empty() {
+            return Ok(None);
+        }
+
+        let dev = if (returned.commonattr & ATTR_CMN_DEVID) != 0 {
+            let raw_dev: libc::dev_t = read_unaligned(record, &mut cursor)?;
+            raw_dev as u64
+        } else {
+            0
+        };
+
+        let file_type = if (returned.commonattr & ATTR_CMN_OBJTYPE) != 0 {
+            let vtype: u32 = read_unaligned(record, &mut cursor)?;
+            match vtype {
+                VREG => BulkFileType::File,
+                VDIR => BulkFileType::Dir,
+                VLNK => BulkFileType::Symlink,
+                _ => BulkFileType::Other,
+            }
+        } else {
+            BulkFileType::Other
+        };
+
+        let mtime_ns = if (returned.commonattr & ATTR_CMN_MODTIME) != 0 {
+            let ts: libc::timespec = read_unaligned(record, &mut cursor)?;
+            let sec = ts.tv_sec.max(0) as u64;
+            let nsec = ts.tv_nsec.clamp(0, 999_999_999) as u64;
+            sec.saturating_mul(1_000_000_000).saturating_add(nsec)
+        } else {
+            0
+        };
+
+        let ctime_ns = if (returned.commonattr & ATTR_CMN_CHGTIME) != 0 {
+            let ts: libc::timespec = read_unaligned(record, &mut cursor)?;
+            (ts.tv_sec as i128)
+                .saturating_mul(1_000_000_000)
+                .saturating_add(ts.tv_nsec as i128)
+                .clamp(i64::MIN as i128, i64::MAX as i128) as i64
+        } else {
+            0
+        };
+
+        let ino = if (returned.commonattr & ATTR_CMN_FILEID) != 0 {
+            read_unaligned::<u64>(record, &mut cursor)?
+        } else {
+            0
+        };
+
+        let size = if (returned.fileattr & ATTR_FILE_DATALENGTH) != 0 {
+            let len: libc::off_t = read_unaligned(record, &mut cursor)?;
+            if file_type == BulkFileType::File {
+                len.max(0) as u64
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+
+        Ok(Some(DirEntryAttr {
+            name: name_os,
+            file_type,
+            ino,
+            dev,
+            mtime_ns,
+            ctime_ns,
+            size,
+            entry_error: None,
+        }))
     }
 }
 
@@ -1262,5 +1296,141 @@ mod tests {
             0,
             "mutable external transcript must never be memory-mapped"
         );
+    }
+
+    #[test]
+    fn reentrant_same_thread_acquire_never_deadlocks_on_single_stream_device() {
+        let admission_a = IoAdmission::new();
+        let admission_b = IoAdmission::new();
+        let dev = DeviceId(0xBEEF_0001);
+        admission_a.set_device_override(dev, DeviceClass::RotationalHdd.default_policy());
+        admission_b.set_device_override(dev, DeviceClass::RotationalHdd.default_policy());
+
+        // Nested LIFO acquisition on `max_streams = 1`: active stream count stays 1, never deadlocks.
+        {
+            let p1 = admission_a.acquire(dev, None);
+            assert_eq!(admission_a.active_streams(dev), 1);
+            let p2 = admission_a.acquire(dev, None);
+            assert_eq!(admission_a.active_streams(dev), 1);
+            let p3 = admission_a.acquire(dev, None);
+            assert_eq!(admission_a.active_streams(dev), 1);
+
+            // Independent `IoAdmission` instance has its own `(self, DeviceId)` reentrancy scope.
+            let pb = admission_b.acquire(dev, None);
+            assert_eq!(admission_b.active_streams(dev), 1);
+            drop(pb);
+            assert_eq!(admission_b.active_streams(dev), 0);
+
+            drop(p3);
+            assert_eq!(admission_a.active_streams(dev), 1);
+            drop(p2);
+            assert_eq!(admission_a.active_streams(dev), 1);
+            drop(p1);
+            assert_eq!(admission_a.active_streams(dev), 0);
+        }
+
+        // Out-of-order drop (`drop(outer)` before `drop(inner)`) also keeps the physical slot held
+        // until the last permit on that thread drops.
+        let outer = admission_a.acquire(dev, None);
+        let inner = admission_a.acquire(dev, None);
+        drop(outer);
+        assert_eq!(admission_a.active_streams(dev), 1);
+        drop(inner);
+        assert_eq!(admission_a.active_streams(dev), 0);
+        assert_eq!(admission_a.peak_active_streams(dev), 1);
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn jsonl_lines_serializes_8_threads_on_hdd_and_allows_nested_sidecar_reads() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let world = crate::test_world("io-admission-jsonl-hdd");
+        let dir = world.home.join(".claude/projects/hdd-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let primary = dir.join("primary.jsonl");
+        let sidecar = dir.join("sidecar.jsonl");
+        std::fs::write(&primary, "{\"k\":1}\n{\"k\":2}\n{\"k\":3}\n").unwrap();
+        std::fs::write(&sidecar, "{\"side\":true}\n").unwrap();
+
+        let (dev, orig_class) = inspect_path_device(&primary);
+        struct ResetOverride(DeviceId, DeviceClass);
+        impl Drop for ResetOverride {
+            fn drop(&mut self) {
+                IoAdmission::global().clear_device_override(self.0, self.1);
+            }
+        }
+        IoAdmission::global().set_device_override(dev, DeviceClass::RotationalHdd.default_policy());
+        let _guard = ResetOverride(dev, orig_class);
+
+        let barrier = Arc::new(Barrier::new(8));
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                let bar = barrier.clone();
+                let active = in_flight.clone();
+                let peak = max_in_flight.clone();
+                let primary_path = primary.clone();
+                let sidecar_path = sidecar.clone();
+                s.spawn(move || {
+                    bar.wait();
+                    let reader = crate::harness::store::jsonl::Read::open(&primary_path).unwrap();
+                    let mut line_idx = 0usize;
+                    reader
+                        .lines(0, |_| {
+                            let cur = active.fetch_add(1, Ordering::SeqCst) + 1;
+                            peak.fetch_max(cur, Ordering::SeqCst);
+                            if line_idx == 0 {
+                                // Nested sidecar JSONL read on the same `max_streams = 1` device!
+                                let nested = crate::harness::store::jsonl::Read::open(&sidecar_path).unwrap();
+                                let mut nested_count = 0usize;
+                                nested
+                                    .lines(0, |_| {
+                                        nested_count += 1;
+                                        Ok(crate::stream::Flow::Continue)
+                                    })
+                                    .unwrap();
+                                assert_eq!(nested_count, 1);
+                                std::thread::sleep(std::time::Duration::from_millis(3));
+                            }
+                            line_idx += 1;
+                            active.fetch_sub(1, Ordering::SeqCst);
+                            Ok(crate::stream::Flow::Continue)
+                        })
+                        .unwrap();
+                    assert_eq!(line_idx, 3);
+                });
+            }
+        });
+
+        assert_eq!(
+            max_in_flight.load(Ordering::SeqCst),
+            1,
+            "parallel jsonl::Read::lines bypassed rotational HDD 1-stream admission"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_bulk_record_preserves_nameless_per_entry_error() {
+        // Synthesize a raw `getattrlistbulk` record where `ATTR_CMN_ERROR` (`0x2000_0000`) is set
+        // to `EACCES` and `ATTR_CMN_NAME` (`0x0000_0001`) was NOT populated by the kernel.
+        let mut record = Vec::new();
+        let rec_len: u32 = 4 + 20 + 4;
+        record.extend_from_slice(&rec_len.to_ne_bytes());
+        record.extend_from_slice(&0x2000_0000u32.to_ne_bytes()); // commonattr = ATTR_CMN_ERROR only
+        record.extend_from_slice(&0u32.to_ne_bytes()); // volattr
+        record.extend_from_slice(&0u32.to_ne_bytes()); // dirattr
+        record.extend_from_slice(&0u32.to_ne_bytes()); // fileattr
+        record.extend_from_slice(&0u32.to_ne_bytes()); // forkattr
+        record.extend_from_slice(&(libc::EACCES as u32).to_ne_bytes()); // error code
+
+        let parsed = macos_bulk::parse_bulk_record(&record)
+            .unwrap()
+            .expect("per-entry ATTR_CMN_ERROR without ATTR_CMN_NAME must not be dropped");
+        assert!(parsed.name.is_empty());
+        assert_eq!(parsed.entry_error, Some(libc::EACCES));
     }
 }
