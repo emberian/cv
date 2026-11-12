@@ -1497,6 +1497,10 @@ check("cv-session-list _markup excludes -negated and NOT terms from <mark>", () 
   truthy(!html.includes("<mark>beta</mark>"), "-negated term must not be marked");
   truthy(!html.includes("<mark>gamma</mark>"), "NOT term must not be marked");
   truthy(!html.includes("<mark>omega</mark>"), "-field:value must not be marked");
+  list._query = 'alpha NOT (beta OR title:gamma) -(delta OR "epsilon zeta") title:"eta theta"';
+  eq(list._markup("alpha beta gamma delta epsilon zeta eta theta"),
+    "<mark>alpha</mark> beta gamma delta epsilon zeta <mark>eta theta</mark>",
+    "all terms in negated groups are excluded; positive fielded phrases survive");
   list.parentElement.remove();
 });
 

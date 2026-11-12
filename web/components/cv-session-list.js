@@ -526,14 +526,23 @@ class CvSessionList extends HTMLElement {
   /** Escape the daemon's snippet, then mark the query's positive words inside it (never `-neg` or `NOT neg`). */
   _markup(text) {
     const source = String(text);
-    const rawTokens = this._query.trim().match(/(?:[^\s"]+|"[^"]*")+/g) || [];
+    const rawTokens = this._query.trim().match(/"(?:\\.|[^"\\])*"|[()]|[^\s()"]+/g) || [];
     const terms = [];
+    const excluded = [false];
     let negateNext = false;
-    for (const raw of rawTokens) {
+    for (let raw of rawTokens) {
       if (/^(?:AND|OR)$/i.test(raw)) continue;
       if (/^NOT$/i.test(raw)) { negateNext = true; continue; }
-      if (negateNext || raw.startsWith("-")) { negateNext = false; continue; }
-      const unquoted = raw.replace(/^["(]+|[")]+$/g, "");
+      if (raw === "(") { excluded.push(excluded.at(-1) || negateNext); negateNext = false; continue; }
+      if (raw === ")") { if (excluded.length > 1) excluded.pop(); negateNext = false; continue; }
+      if (raw.startsWith("-")) { negateNext = true; raw = raw.slice(1); }
+      else if (raw.startsWith("+")) raw = raw.slice(1);
+      // A field prefix or unary '-' belongs to the following quoted term or group.
+      if (!raw || /^[\w]+:$/.test(raw)) continue;
+      const skip = excluded.at(-1) || negateNext;
+      negateNext = false;
+      if (skip) continue;
+      const unquoted = raw.replace(/^"|"$/g, "");
       const value = unquoted.includes(":") ? unquoted.slice(unquoted.indexOf(":") + 1).replace(/^"|"$/g, "") : unquoted;
       if (value.length > 1) terms.push(value);
       if (terms.length >= 6) break;
