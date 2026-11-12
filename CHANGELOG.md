@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- `cv search` recognizes symlinked and hard-linked paths to already-indexed transcripts by `(dev, ino)` instead of rereading them whole.
 - `cv watch` wakes immediately on directory changes via `watch::wake` (`inotify` + `eventfd` on Linux, `Condvar` fallback elsewhere).
 - `cv watch` admits live append-only transcript growth and write-once `tool-results/` spills mid-pass instead of restarting from byte 0.
 - `cv rewind` ignores `api-request-blob` and other non-turn records when tracking open tool calls.
