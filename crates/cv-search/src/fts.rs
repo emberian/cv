@@ -2341,17 +2341,27 @@ struct MetadataDecisions {
     fields: Fields,
     harness: Option<String>,
     cwd: Option<String>,
+    allowed_ids: Option<std::sync::Arc<HashSet<String>>>,
     cache: std::sync::Mutex<HashMap<String, MetadataDecision>>,
     #[cfg(test)]
     observed: observe::Query,
 }
 impl MetadataDecisions {
     fn new(searcher: &tantivy::Searcher, fields: &Fields, filter: crate::SearchFilter<'_>) -> Self {
+        Self::new_allowed(searcher, fields, filter, None)
+    }
+    fn new_allowed(
+        searcher: &tantivy::Searcher,
+        fields: &Fields,
+        filter: crate::SearchFilter<'_>,
+        allowed_ids: Option<std::sync::Arc<HashSet<String>>>,
+    ) -> Self {
         Self {
             searcher: searcher.clone(),
             fields: fields.clone(),
             harness: filter.harness.map(str::to_owned),
             cwd: filter.cwd.map(str::to_owned),
+            allowed_ids,
             cache: Default::default(),
             #[cfg(test)]
             observed: Default::default(),
@@ -2380,7 +2390,14 @@ impl MetadataDecisions {
         let doc = self.searcher.doc::<TantivyDocument>(address)?;
         let decision = MetadataDecision {
             address,
-            accepted: metadata_matches(&doc, &self.fields, self.harness.as_deref(), self.cwd.as_deref()),
+            accepted: metadata_matches(
+                &doc,
+                &self.fields,
+                id,
+                self.harness.as_deref(),
+                self.cwd.as_deref(),
+                self.allowed_ids.as_deref(),
+            ),
         };
         self.cache
             .lock()
@@ -2396,12 +2413,26 @@ impl MetadataDecisions {
             .copied()
     }
 }
-fn metadata_matches(doc: &TantivyDocument, fields: &Fields, harness: Option<&str>, cwd: Option<&str>) -> bool {
+fn metadata_matches(
+    doc: &TantivyDocument,
+    fields: &Fields,
+    id: &str,
+    harness: Option<&str>,
+    cwd: Option<&str>,
+    allowed_ids: Option<&HashSet<String>>,
+) -> bool {
     harness.is_none_or(|wanted| doc.get_first(fields.harness).and_then(|value| value.as_str()) == Some(wanted))
         && cwd.is_none_or(|needle| {
             doc.get_first(fields.cwd)
                 .and_then(|value| value.as_str())
                 .is_some_and(|value| value.contains(needle))
+        })
+        && allowed_ids.is_none_or(|ids| {
+            ids.contains(id)
+                || doc
+                    .get_first(fields.parent_id)
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|parent| ids.contains(parent))
         })
 }
 
@@ -2517,6 +2548,152 @@ pub(crate) fn index_refs_with_subagents(dir: &Path, refs: &[cv_core::SessionRef]
     Ok(sweep(dir, refs.to_vec(), false, true)?.changed)
 }
 
+const QUERYABLE_TEXT_FIELDS: &[&str] = &[
+    "id",
+    "kind",
+    "harness",
+    "cwd",
+    "title",
+    "body",
+    "context",
+    "path",
+    "parent_id",
+];
+const QUERYABLE_I64_FIELDS: &[&str] = &["first_msg", "created_at", "updated_at"];
+
+fn is_schema_field_spec(body: &str) -> bool {
+    let Some((field, rest)) = body.split_once(':') else {
+        return false;
+    };
+    if rest.is_empty() || rest.starts_with(':') {
+        return false;
+    }
+    if QUERYABLE_TEXT_FIELDS.contains(&field) {
+        return true;
+    }
+    QUERYABLE_I64_FIELDS.contains(&field)
+        && rest.starts_with(|c: char| c.is_ascii_digit() || matches!(c, '-' | '[' | '{'))
+}
+
+fn escape_phrase_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(c, '\\' | '"') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+fn is_valid_fuzzy_token(body: &str) -> bool {
+    let Some((stem, slop)) = body.split_once('~') else {
+        return false;
+    };
+    !stem.is_empty()
+        && stem.chars().all(|c| c.is_alphanumeric() || c == '_')
+        && slop.chars().all(|c| c.is_ascii_digit())
+}
+
+/// Rewrite natural-language colons and path tokens (`error: foo:bar`, `~/dev/x:123`,
+/// `std::io::Error`, `path::PathBuf`) into quoted phrase tokens while preserving valid Tantivy
+/// schema field filters (`harness:claude`), boolean operators, parentheses, and existing quotes.
+fn sanitize_natural_query(query: &str) -> Option<String> {
+    let mut out = String::with_capacity(query.len() + 8);
+    let mut chars = query.char_indices().peekable();
+    let mut in_quotes = false;
+    let mut escaped = false;
+    let mut changed = false;
+
+    while let Some((idx, ch)) = chars.next() {
+        if in_quotes {
+            out.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_quotes = false;
+            }
+            continue;
+        }
+        if ch == '"' {
+            in_quotes = true;
+            out.push(ch);
+            continue;
+        }
+        if ch.is_whitespace() || matches!(ch, '(' | ')') {
+            out.push(ch);
+            continue;
+        }
+        let mut end = idx + ch.len_utf8();
+        while let Some(&(next_idx, next_ch)) = chars.peek() {
+            if next_ch.is_whitespace() || matches!(next_ch, '(' | ')' | '"') {
+                break;
+            }
+            end = next_idx + next_ch.len_utf8();
+            chars.next();
+        }
+        let tok = &query[idx..end];
+        if !tok.contains([':', '/', '~']) {
+            out.push_str(tok);
+            continue;
+        }
+        let (prefix, body) = match tok.strip_prefix(['+', '-']) {
+            Some(rest) if !rest.is_empty() => (&tok[..1], rest),
+            _ => ("", tok),
+        };
+        if !body.contains([':', '/']) && is_valid_fuzzy_token(body) {
+            out.push_str(tok);
+            continue;
+        }
+        let followed_by_delim = chars.peek().is_some_and(|&(_, next_ch)| matches!(next_ch, '"' | '('));
+        if let Some((field, "")) = body.split_once(':') {
+            if followed_by_delim && QUERYABLE_TEXT_FIELDS.contains(&field) {
+                out.push_str(tok);
+                continue;
+            }
+        }
+        if is_schema_field_spec(body) {
+            let (field, rest) = body.split_once(':').expect("checked above");
+            if rest.starts_with(['[', '{']) || !rest.contains([':', '/', '~', '[', ']', '{', '}', '*', '^']) {
+                out.push_str(tok);
+            } else {
+                changed = true;
+                out.push_str(prefix);
+                out.push_str(field);
+                out.push_str(":\"");
+                out.push_str(&escape_phrase_text(rest));
+                out.push('"');
+                if followed_by_delim {
+                    out.push(' ');
+                }
+            }
+            continue;
+        }
+        changed = true;
+        if body.chars().any(char::is_alphanumeric) {
+            out.push_str(prefix);
+            out.push('"');
+            out.push_str(&escape_phrase_text(body));
+            out.push('"');
+            if followed_by_delim {
+                out.push(' ');
+            }
+        } else {
+            out.push(' ');
+        }
+    }
+
+    if !changed {
+        return None;
+    }
+    if out.trim().is_empty() {
+        return Some("\":\"".to_string());
+    }
+    Some(out)
+}
+
 fn parse_text_query(
     index: &Index,
     f: &Fields,
@@ -2530,9 +2707,17 @@ fn parse_text_query(
     };
     let mut parser = QueryParser::for_index(index, fields);
     parser.set_conjunction_by_default();
-    parser
-        .parse_query(query)
-        .with_context(|| format!("parsing query {query:?}"))
+    match parser.parse_query(query) {
+        Ok(parsed) => Ok(parsed),
+        Err(first_err) => {
+            if let Some(sanitized) = sanitize_natural_query(query) {
+                if let Ok(parsed) = parser.parse_query(&sanitized) {
+                    return Ok(parsed);
+                }
+            }
+            Err(first_err).with_context(|| format!("parsing query {query:?}"))
+        }
+    }
 }
 
 /// The complete set of session IDs matching a full-text query. This reads only the index:
@@ -2747,11 +2932,24 @@ pub(crate) fn search_with_snippets(
 /// Search the index plus the live suffix of `refs` it has not seen ([`live`]), as `live` allows
 /// ([`LiveRead::Frozen`]: the index alone, the suffix only counted). No index at `dir` is an
 /// empty index: every session is unindexed. An index that is there but unusable is an error.
+#[cfg(test)]
 pub(crate) fn search_suffixed(
     dir: &Path,
     query: &str,
     limit: usize,
     filter: crate::SearchFilter<'_>,
+    live: LiveRead,
+    refs: &[cv_core::SessionRef],
+) -> Result<Searched> {
+    search_suffixed_allowed(dir, query, limit, filter, None, live, refs)
+}
+
+pub(crate) fn search_suffixed_allowed(
+    dir: &Path,
+    query: &str,
+    limit: usize,
+    filter: crate::SearchFilter<'_>,
+    allowed_ids: Option<std::sync::Arc<HashSet<String>>>,
     live: LiveRead,
     refs: &[cv_core::SessionRef],
 ) -> Result<Searched> {
@@ -2772,12 +2970,18 @@ pub(crate) fn search_suffixed(
         indexed.as_ref().map(|(_, _, searcher)| searcher),
         live.as_ref().map(|l| &l.searcher),
     );
-    let live_decisions = live
-        .as_ref()
-        .map(|l| std::sync::Arc::new(MetadataDecisions::new(&l.searcher, &l.f, filter)));
+    let needs_filter = filtered(filter) || allowed_ids.is_some();
+    let live_decisions = live.as_ref().map(|l| {
+        std::sync::Arc::new(MetadataDecisions::new_allowed(
+            &l.searcher,
+            &l.f,
+            filter,
+            allowed_ids.clone(),
+        ))
+    });
     // One answer per session: the live meta doc describes a session the suffix read.
     let accept = |decisions: &std::sync::Arc<MetadataDecisions>| {
-        filtered(filter).then(|| {
+        needs_filter.then(|| {
             let (own, live, shadows) = (decisions.clone(), live_decisions.clone(), shadows.clone());
             std::sync::Arc::new(move |id: &str| match &live {
                 Some(live) if shadows.contains_key(id) => live.resolve(id).map(|d| d.accepted),
@@ -2793,9 +2997,9 @@ pub(crate) fn search_suffixed(
             ranked.insert(candidate.id.clone(), (candidate, is_live));
         }
     };
-    let indexed_decisions = indexed
-        .as_ref()
-        .map(|(_, f, searcher)| std::sync::Arc::new(MetadataDecisions::new(searcher, f, filter)));
+    let indexed_decisions = indexed.as_ref().map(|(_, f, searcher)| {
+        std::sync::Arc::new(MetadataDecisions::new_allowed(searcher, f, filter, allowed_ids.clone()))
+    });
     // A side that ranked fewer than `limit` sessions ranked every session it matches; one that
     // filled `limit` may match more, and is counted by a second, unscored pass over its ids.
     let mut counts: Vec<(HashSet<String>, Option<crate::session_collector::SessionFilter>)> = Vec::new();
@@ -3172,7 +3376,10 @@ fn make_snippet(body: &str, query: &str) -> String {
 fn query_terms(query: &str) -> Vec<String> {
     query
         .split_whitespace()
-        .filter(|t| !t.contains(':'))
+        .filter(|t| {
+            let body = t.strip_prefix(['+', '-']).unwrap_or(t);
+            !is_schema_field_spec(body)
+        })
         .filter(|t| !matches!(*t, "AND" | "OR" | "NOT"))
         .map(|t| t.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase())
         .filter(|t| !t.is_empty())
@@ -4387,13 +4594,93 @@ mod tests {
         let _home = IsolatedHome::new();
         let dir = tmpdir();
         open_or_create(&dir).unwrap();
-        let ranked = text_search_indexed(&dir, "no_such_field:value", 1).unwrap_err();
+        let ranked = text_search_indexed(&dir, "(", 1).unwrap_err();
         assert!(crate::is_invalid_text_query(&ranked));
-        let batch = text_search_ids_batch(&dir, &["needle", "no_such_field:value"]).unwrap();
+        let batch = text_search_ids_batch(&dir, &["needle", "("]).unwrap();
         assert!(batch[0].as_ref().unwrap().is_empty());
         assert!(crate::is_invalid_text_query(batch[1].as_ref().unwrap_err()));
         let setup = text_search_ids(&dir.join("missing"), "needle").unwrap_err();
         assert!(!crate::is_invalid_text_query(&setup));
+    }
+
+    #[test]
+    fn bare_colons_and_paths_parse_without_crashing_while_field_queries_still_work() {
+        let _home = IsolatedHome::new();
+        let dir = tmpdir();
+        let (index, f) = open_or_create(&dir).unwrap();
+        let mut writer = open_writer(&index, 15_000_000).unwrap();
+        let add = |writer: &mut Writer, id: &str, harness: &str, cwd: &str, body: &str| {
+            let mut meta = TantivyDocument::new();
+            meta.add_text(f.id, id);
+            meta.add_text(f.kind, KIND_META);
+            meta.add_text(f.harness, harness);
+            meta.add_text(f.cwd, cwd);
+            meta.add_text(f.title, format!("title {id}"));
+            meta.add_text(f.path, format!("/tmp/{id}.jsonl"));
+            meta.add_text(f.preview, body);
+            writer.add_document(meta).unwrap();
+            let mut chunk = TantivyDocument::new();
+            chunk.add_text(f.id, id);
+            chunk.add_text(f.kind, KIND_BODY);
+            chunk.add_i64(f.first_msg, 0);
+            chunk.add_text(f.harness, harness);
+            chunk.add_text(f.cwd, cwd);
+            chunk.add_text(f.title, format!("title {id}"));
+            chunk.add_text(f.body, body);
+            writer.add_document(chunk).unwrap();
+        };
+        add(
+            &mut writer,
+            "s-colon",
+            "claude",
+            "/Users/ember/dev/allgame",
+            "error: foo:bar failed at ~/dev/x:123 with std::io::Error and path::PathBuf",
+        );
+        add(
+            &mut writer,
+            "s-allgame",
+            "codex",
+            "/Users/ember/dev/allgame",
+            "steward the claude_resident bot in ~/dev/allgame: its harness, context/continuity work, open threads, and the Yue kimi resident",
+        );
+        writer.commit().unwrap();
+
+        for q in [
+            "foo:bar",
+            "error: foo:bar",
+            "~/dev/x:123",
+            "std::io::Error",
+            "path::PathBuf",
+            "harness:claude std::io::Error",
+            "title:\"title s-colon\" foo:bar",
+            "(foo:bar OR nonexistent:thing)",
+        ] {
+            let hits = text_search_indexed(&dir, q, 10).unwrap_or_else(|e| panic!("query {q:?} failed: {e:#}"));
+            assert_eq!(hits.len(), 1, "query {q:?} hits={hits:?}");
+            assert_eq!(hits[0].id, "s-colon", "query {q:?}");
+        }
+
+        // Field filter still narrows: s-colon is claude, not codex.
+        assert!(text_search_indexed(&dir, "harness:codex std::io::Error", 10)
+            .unwrap()
+            .is_empty());
+
+        // Real-world `cv pack` prompt with ~/dev/allgame: and slashes never crashes.
+        let pack_hits = text_search_indexed(
+            &dir,
+            "steward the claude_resident bot in ~/dev/allgame: its harness, context/continuity work, open threads, and the Yue kimi resident",
+            10,
+        )
+        .unwrap();
+        assert_eq!(pack_hits.len(), 1);
+        assert_eq!(pack_hits[0].id, "s-allgame");
+
+        // Degenerate bare colon does not crash and does not match everything.
+        assert!(text_search_indexed(&dir, ":", 10).unwrap().is_empty());
+
+        // Broken parentheses alongside a colon still surface as invalid query syntax.
+        let broken = text_search_indexed(&dir, "foo:bar (", 10).unwrap_err();
+        assert!(crate::is_invalid_text_query(&broken));
     }
 
     /// A body winner displays its session's meta document, a meta winner itself; a document the

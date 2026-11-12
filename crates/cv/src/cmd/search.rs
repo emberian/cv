@@ -7,17 +7,49 @@ use cv_core::sanitize::sanitize_line;
 use cv_search::{Found, Note, Source};
 use std::io::Write;
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn cmd_search(
-    query: &str,
-    harness: Option<String>,
-    limit: usize,
-    semantic: bool,
-    scan: bool,
-    kind: Option<String>,
-    live_bytes: Option<u64>,
-    json: bool, // emit `{hits, total}` (session rows + score/snippet/provenance) instead of the table
-) -> Result<()> {
+pub(crate) struct SearchArgs<'a> {
+    pub query: &'a str,
+    pub harness: Option<String>,
+    pub cwd: Option<String>,
+    pub filter_query: Option<String>,
+    pub limit: usize,
+    pub semantic: bool,
+    pub scan: bool,
+    pub kind: Option<String>,
+    pub live_bytes: Option<u64>,
+    pub json: bool, // emit `{hits, total}` (session rows + score/snippet/provenance) instead of the table
+}
+
+fn resolve_allowed_ids(
+    want: Option<cv_core::Harness>,
+    cwd: Option<&str>,
+    filter_query: Option<String>,
+) -> Result<Option<std::collections::HashSet<String>>> {
+    let Some(sq) = crate::cmd::query::build(filter_query)? else {
+        return Ok(None);
+    };
+    let text = crate::cmd::query::text_sets(&sq)?;
+    let mut candidates = cv_core::sessions_for(want);
+    if let Some(needle) = cwd {
+        candidates.retain(|r| r.cwd.as_ref().is_some_and(|p| p.to_string_lossy().contains(needle)));
+    }
+    crate::cmd::query::filter_refs(&mut candidates, &sq, &text)?;
+    Ok(Some(candidates.into_iter().map(|r| r.id).collect()))
+}
+
+pub(crate) fn cmd_search(args: SearchArgs<'_>) -> Result<()> {
+    let SearchArgs {
+        query,
+        harness,
+        cwd,
+        filter_query,
+        limit,
+        semantic,
+        scan,
+        kind,
+        live_bytes,
+        json,
+    } = args;
     let want = parse_harness(&harness)?;
     let scope = match kind.as_deref() {
         None => cv_search::Scope::Exchange,
@@ -26,6 +58,7 @@ pub(crate) fn cmd_search(
             None => return crate::util::usage(format!("unknown --kind {k:?}: exchange, context or all")),
         },
     };
+    let allowed_ids = resolve_allowed_ids(want, cwd.as_deref(), filter_query)?;
     let source = if semantic {
         Source::Semantic
     } else {
@@ -38,13 +71,20 @@ pub(crate) fn cmd_search(
     };
     let filter = cv_search::SearchFilter {
         harness: want.map(|h| h.as_str()),
-        cwd: None,
+        cwd: cwd.as_deref(),
         scope,
     };
-    // The index answers every full-text search: an empty result means "no match", and an index
-    // that is missing or unusable is an error naming the cause and the fix, never a silent scan
-    // of every transcript (minutes on a large corpus).
-    let found = match cv_search::Searcher::default().search(query, filter, limit, source, live_bytes) {
+    // The index (+ live suffix of unindexed changes) answers full-text search: an empty result
+    // means "no match", and an unusable index is an error naming the cause and the fix, never a
+    // silent full scan of every transcript.
+    let found = match cv_search::Searcher::default().search_allowed(
+        query,
+        filter,
+        allowed_ids.as_ref(),
+        limit,
+        source,
+        live_bytes,
+    ) {
         Ok(found) => found,
         Err(e) => {
             return match source {
@@ -308,5 +348,110 @@ mod tests {
         })
         .unwrap();
         assert_eq!(*visits.borrow(), rows);
+    }
+
+    #[test]
+    fn search_cwd_and_query_filter_and_bare_colons_work_end_to_end() {
+        crate::on_main_sized_stack(|| {
+            use clap::Parser;
+            let cli = crate::Cli::try_parse_from([
+                "cv",
+                "search",
+                "error: std::io::Error",
+                "--cwd",
+                "proj-alpha",
+                "-q",
+                "after:2026-06-01",
+                "--limit",
+                "5",
+            ])
+            .expect("cv search --cwd and -q should parse");
+            match cli.cmd {
+                crate::Cmd::Search {
+                    query,
+                    cwd,
+                    filter_query,
+                    limit,
+                    ..
+                } => {
+                    assert_eq!(query, "error: std::io::Error");
+                    assert_eq!(cwd.as_deref(), Some("proj-alpha"));
+                    assert_eq!(filter_query.as_deref(), Some("after:2026-06-01"));
+                    assert_eq!(limit, 5);
+                }
+                _ => panic!("expected Cmd::Search"),
+            }
+        });
+
+        let world = crate::test_world("search-cwd-query-colon");
+        let _p1 = world.write_session(
+            "sess-old-alpha",
+            &[serde_json::json!({
+                "type": "user",
+                "cwd": "/Users/ember/dev/proj-alpha",
+                "timestamp": "2026-01-15T12:00:00Z",
+                "message": {"role": "user", "content": "error: std::io::Error in ~/dev/x:123"}
+            })],
+        );
+        let _p2 = world.write_session(
+            "sess-new-alpha",
+            &[serde_json::json!({
+                "type": "user",
+                "cwd": "/Users/ember/dev/proj-alpha",
+                "timestamp": "2026-08-15T12:00:00Z",
+                "message": {"role": "user", "content": "error: std::io::Error in ~/dev/x:123"}
+            })],
+        );
+        let _p3 = world.write_session(
+            "sess-new-beta",
+            &[serde_json::json!({
+                "type": "user",
+                "cwd": "/Users/ember/dev/proj-beta",
+                "timestamp": "2026-08-15T12:00:00Z",
+                "message": {"role": "user", "content": "error: std::io::Error in ~/dev/x:123"}
+            })],
+        );
+        cv_search::index_all(None, true, false, false).unwrap();
+
+        let searcher = cv_search::Searcher::default();
+        // `--cwd proj-alpha` narrows from 3 matching sessions to the 2 alpha sessions.
+        let alpha_only = searcher
+            .search_allowed(
+                "error: std::io::Error ~/dev/x:123",
+                cv_search::SearchFilter {
+                    harness: None,
+                    cwd: Some("proj-alpha"),
+                    scope: cv_search::Scope::Exchange,
+                },
+                None,
+                20,
+                Source::Index,
+                None,
+            )
+            .unwrap();
+        assert_eq!(alpha_only.total, 2);
+        assert_eq!(alpha_only.hits.len(), 2);
+
+        // Combining `--cwd proj-alpha` + `-q after:2026-06-01` narrows to `sess-new-alpha` in both Index and Live (`--scan`).
+        let allowed = resolve_allowed_ids(None, Some("proj-alpha"), Some("after:2026-06-01".into())).unwrap();
+        for source in [Source::Index, Source::Live] {
+            let filtered = searcher
+                .search_allowed(
+                    "std::io::Error",
+                    cv_search::SearchFilter {
+                        harness: None,
+                        cwd: Some("proj-alpha"),
+                        scope: cv_search::Scope::Exchange,
+                    },
+                    allowed.as_ref(),
+                    20,
+                    source,
+                    None,
+                )
+                .unwrap();
+            assert_eq!(filtered.total, 1, "source={source:?}");
+            assert_eq!(filtered.hits.len(), 1, "source={source:?}");
+            assert_eq!(filtered.hits[0].id, "sess-new-alpha", "source={source:?}");
+        }
     }
 }

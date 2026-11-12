@@ -237,6 +237,12 @@ enum Cmd {
         query: String,
         #[arg(long)]
         harness: Option<String>,
+        /// Only sessions whose cwd contains this substring.
+        #[arg(long, value_name = "DIR")]
+        cwd: Option<String>,
+        /// Query calculus to filter candidate sessions before ranking (same as `cv ls -q`; see `cv schema`).
+        #[arg(long = "query", short = 'q', value_name = "QUERY")]
+        filter_query: Option<String>,
         /// Hits to show. Every match is still counted: the footer says `N of M matches`.
         #[arg(long, default_value_t = 20)]
         limit: usize,
@@ -244,9 +250,12 @@ enum Cmd {
         /// to have been run; downloads a small embedding model on first use.
         #[arg(long)]
         semantic: bool,
-        /// Scan the transcripts live instead of reading the index: slow, matches only each
-        /// session's head, and is never taken unasked. Without it a missing or unusable index is an
-        /// error that names its cause.
+        /// Stream every top-level transcript live (case-insensitive substring match across each
+        /// session's whole searchable exchange) instead of reading the full-text index: slow, skips
+        /// folded-in sub-agent lanes, and is never taken unasked. Without `--scan`, `cv search`
+        /// reads the Tantivy index plus the live suffix of sessions changed since `cv index` (even
+        /// when no index exists yet, unless `--live-bytes 0` or `--frozen`), and errors if an
+        /// existing index is unusable.
         #[arg(long, conflicts_with = "semantic")]
         scan: bool,
         /// Which text to match: `exchange` (default: what the person asked, what the model
@@ -262,8 +271,8 @@ enum Cmd {
         #[arg(long, value_name = "BYTES", conflicts_with_all = ["semantic", "scan"])]
         live_bytes: Option<u64>,
         /// Emit `{"hits": [...], "total": M}` instead of the table — the same hits in the same
-        /// order (--harness/--limit/--semantic respected), each a session row (`id, harness, path,
-        /// cwd, title, created_at, updated_at, message_count, size_bytes`) plus `score`, `snippet`,
+        /// order (--harness/--cwd/-q/--limit/--semantic respected), each a session row (`id, harness,
+        /// path, cwd, title, created_at, updated_at, message_count, size_bytes`) plus `score`, `snippet`,
         /// and the sub-agent provenance `agent_id`/`parent_id`/`workflow`; `total` counts every
         /// session that matched. Nothing else goes to stdout.
         #[arg(long)]
@@ -1195,13 +1204,26 @@ fn run() -> Result<()> {
         Cmd::Search {
             query,
             harness,
+            cwd,
+            filter_query,
             limit,
             semantic,
             scan,
             kind,
             live_bytes,
             json,
-        } => search::cmd_search(&query, harness, limit, semantic, scan, kind, live_bytes, json),
+        } => search::cmd_search(search::SearchArgs {
+            query: &query,
+            harness,
+            cwd,
+            filter_query,
+            limit,
+            semantic,
+            scan,
+            kind,
+            live_bytes,
+            json,
+        }),
         Cmd::Show {
             id,
             harness,

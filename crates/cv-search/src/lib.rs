@@ -181,7 +181,30 @@ impl Searcher {
         source: Source,
         live_bytes: Option<u64>,
     ) -> Result<Found> {
-        self.search_in(&default_tantivy_dir(), query, filter, limit, source, live_bytes)
+        self.search_in_allowed(&default_tantivy_dir(), query, filter, None, limit, source, live_bytes)
+    }
+
+    /// [`search`](Self::search) further restricted to an explicit session-ID allowlist (such as
+    /// the candidate set evaluated by `cv search -q <QUERY>`). Sub-agent hits in the full-text
+    /// index are admitted when either their own ID or their `parent_id` is in `allowed_ids`.
+    pub fn search_allowed(
+        &self,
+        query: &str,
+        filter: SearchFilter<'_>,
+        allowed_ids: Option<&std::collections::HashSet<String>>,
+        limit: usize,
+        source: Source,
+        live_bytes: Option<u64>,
+    ) -> Result<Found> {
+        self.search_in_allowed(
+            &default_tantivy_dir(),
+            query,
+            filter,
+            allowed_ids,
+            limit,
+            source,
+            live_bytes,
+        )
     }
 
     /// Search with an explicit full-text index location; live and semantic sources use their
@@ -191,6 +214,21 @@ impl Searcher {
         dir: &std::path::Path,
         query: &str,
         filter: SearchFilter<'_>,
+        limit: usize,
+        source: Source,
+        live_bytes: Option<u64>,
+    ) -> Result<Found> {
+        self.search_in_allowed(dir, query, filter, None, limit, source, live_bytes)
+    }
+
+    /// [`search_in`](Self::search_in) with an optional session-ID allowlist.
+    #[allow(clippy::too_many_arguments)]
+    pub fn search_in_allowed(
+        &self,
+        dir: &std::path::Path,
+        query: &str,
+        filter: SearchFilter<'_>,
+        allowed_ids: Option<&std::collections::HashSet<String>>,
         limit: usize,
         source: Source,
         live_bytes: Option<u64>,
@@ -205,6 +243,9 @@ impl Searcher {
         if filter.harness.is_some() && harness.is_none() {
             return Ok(found);
         }
+        if allowed_ids.is_some_and(std::collections::HashSet::is_empty) {
+            return Ok(found);
+        }
         let filter = SearchFilter {
             harness: harness.map(cv_core::Harness::as_str),
             ..filter
@@ -212,11 +253,12 @@ impl Searcher {
         match source {
             Source::Live => {
                 let live = cv_core::scan::live_search_filtered(query, harness, limit, |r| {
-                    filter.cwd.is_none_or(|needle| {
-                        r.cwd
-                            .as_ref()
-                            .is_some_and(|path| path.to_string_lossy().contains(needle))
-                    })
+                    allowed_ids.is_none_or(|ids| ids.contains(&r.id))
+                        && filter.cwd.is_none_or(|needle| {
+                            r.cwd
+                                .as_ref()
+                                .is_some_and(|path| path.to_string_lossy().contains(needle))
+                        })
                 })?;
                 found.hits = live.hits.into_iter().map(Hit::from).collect();
                 found.total = live.total;
@@ -232,14 +274,18 @@ impl Searcher {
             }
             Source::Index => {
                 let _sources = cv_core::source::read_scope();
-                let refs = cv_core::sessions_for(harness);
+                let mut refs = cv_core::sessions_for(harness);
+                let shared_allowed = allowed_ids.map(|ids| {
+                    refs.retain(|r| ids.contains(&r.id));
+                    std::sync::Arc::new(ids.clone())
+                });
                 let live = LiveRead::of(live_bytes);
                 let fts::Searched {
                     hits,
                     total,
                     note,
                     suffix,
-                } = fts::search_suffixed(dir, query, limit, filter, live, &refs)?;
+                } = fts::search_suffixed_allowed(dir, query, limit, filter, shared_allowed, live, &refs)?;
                 found.hits = hits;
                 found.total = total;
                 if let Some(why) = note {
@@ -253,7 +299,11 @@ impl Searcher {
                 }
             }
             #[cfg(feature = "semantic")]
-            Source::Semantic => (found.hits, found.total) = self.semantic.search_counted(query, limit, filter)?,
+            Source::Semantic => {
+                (found.hits, found.total) = self
+                    .semantic
+                    .search_counted_allowed(query, limit, filter, allowed_ids)?
+            }
             #[cfg(not(feature = "semantic"))]
             Source::Semantic => anyhow::bail!("semantic search is not built into this cv"),
         }

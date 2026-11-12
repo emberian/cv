@@ -712,10 +712,21 @@ impl SemanticSearch {
     /// [`search`](Self::search), and how many stored sessions the filter admits: every one of
     /// them is ranked, so that is the number of matches the top `k` are drawn from.
     pub fn search_counted(&self, query: &str, k: usize, filter: crate::SearchFilter<'_>) -> Result<(Vec<Hit>, usize)> {
-        self.inner.search(
+        self.search_counted_allowed(query, k, filter, None)
+    }
+
+    pub(crate) fn search_counted_allowed(
+        &self,
+        query: &str,
+        k: usize,
+        filter: crate::SearchFilter<'_>,
+        allowed_ids: Option<&std::collections::HashSet<String>>,
+    ) -> Result<(Vec<Hit>, usize)> {
+        self.inner.search_allowed(
             query,
             k,
             filter,
+            allowed_ids,
             || resolve_model(false),
             load_model,
             |model, query| model.encode_single(query),
@@ -754,11 +765,13 @@ impl<M> ResidentState<M> {
         self.store = None;
         self.model = None;
     }
+    #[allow(clippy::too_many_arguments)]
     fn search(
         &mut self,
         query: &str,
         k: usize,
         filter: crate::SearchFilter<'_>,
+        allowed_ids: Option<&std::collections::HashSet<String>>,
         resolve: impl FnOnce() -> Result<Option<ModelSpec>>,
         load: impl FnOnce(&ModelSpec) -> Result<M>,
         encode: impl FnOnce(&M, &str) -> Vec<f32>,
@@ -828,8 +841,13 @@ impl<M> ResidentState<M> {
             path.display(),
             cached.store.dim
         );
-        let hits = rank_filtered(&cached.store, &q, k, filter);
-        let admitted = cached.store.meta.iter().filter(|meta| admits(filter, meta)).count();
+        let hits = rank_filtered_allowed(&cached.store, &q, k, filter, allowed_ids);
+        let admitted = cached
+            .store
+            .meta
+            .iter()
+            .filter(|meta| admits_allowed(filter, allowed_ids, meta))
+            .count();
         let mut after = Probe::default();
         anyhow::ensure!(
             cached.reads.fresh(&mut after),
@@ -859,11 +877,26 @@ impl<M> ResidentSearch<M> {
             state: std::sync::Mutex::new(ResidentState::new(path)),
         }
     }
+    #[cfg(test)]
     fn search(
         &self,
         query: &str,
         k: usize,
         filter: crate::SearchFilter<'_>,
+        resolve: impl FnOnce() -> Result<Option<ModelSpec>>,
+        load: impl FnOnce(&ModelSpec) -> Result<M>,
+        encode: impl FnOnce(&M, &str) -> Vec<f32>,
+    ) -> Result<(Vec<Hit>, usize)> {
+        self.search_allowed(query, k, filter, None, resolve, load, encode)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn search_allowed(
+        &self,
+        query: &str,
+        k: usize,
+        filter: crate::SearchFilter<'_>,
+        allowed_ids: Option<&std::collections::HashSet<String>>,
         resolve: impl FnOnce() -> Result<Option<ModelSpec>>,
         load: impl FnOnce(&ModelSpec) -> Result<M>,
         encode: impl FnOnce(&M, &str) -> Vec<f32>,
@@ -877,7 +910,7 @@ impl<M> ResidentSearch<M> {
                 state
             }
         };
-        let result = state.search(query, k, filter, resolve, load, encode);
+        let result = state.search(query, k, filter, allowed_ids, resolve, load, encode);
         if result.is_err() {
             state.clear();
         }
@@ -945,14 +978,25 @@ impl Ord for RankedRow<'_> {
     }
 }
 
+#[cfg(test)]
 fn ranked_rows<'a>(store: &'a Store, q: &[f32], k: usize, filter: crate::SearchFilter<'_>) -> Vec<RankedRow<'a>> {
+    ranked_rows_allowed(store, q, k, filter, None)
+}
+
+fn ranked_rows_allowed<'a>(
+    store: &'a Store,
+    q: &[f32],
+    k: usize,
+    filter: crate::SearchFilter<'_>,
+    allowed_ids: Option<&std::collections::HashSet<String>>,
+) -> Vec<RankedRow<'a>> {
     if k == 0 {
         return Vec::new();
     }
     let query = CosineQuery::new(q);
     let mut winners = std::collections::BinaryHeap::new();
     for (index, meta) in store.meta.iter().enumerate() {
-        if !admits(filter, meta) {
+        if !admits_allowed(filter, allowed_ids, meta) {
             continue;
         }
         let candidate = RankedRow {
@@ -974,8 +1018,12 @@ fn ranked_rows<'a>(store: &'a Store, q: &[f32], k: usize, filter: crate::SearchF
     winners.into_sorted_vec()
 }
 
-/// Whether `filter` admits a stored session: its harness, and its cwd containing the needle.
-fn admits(filter: crate::SearchFilter<'_>, meta: &RecordMeta) -> bool {
+/// Whether `filter` admits a stored session: its harness, its cwd containing the needle, and optional id allowlist.
+fn admits_allowed(
+    filter: crate::SearchFilter<'_>,
+    allowed_ids: Option<&std::collections::HashSet<String>>,
+    meta: &RecordMeta,
+) -> bool {
     filter.harness.is_none_or(|h| meta.session.harness.as_str() == h)
         && filter.cwd.is_none_or(|needle| {
             meta.session
@@ -983,10 +1031,22 @@ fn admits(filter: crate::SearchFilter<'_>, meta: &RecordMeta) -> bool {
                 .as_ref()
                 .is_some_and(|cwd| cwd.to_string_lossy().contains(needle))
         })
+        && allowed_ids.is_none_or(|ids| ids.contains(&meta.session.id))
 }
 
+#[cfg(test)]
 fn rank_filtered(store: &Store, q: &[f32], k: usize, filter: crate::SearchFilter<'_>) -> Vec<Hit> {
-    let scored = ranked_rows(store, q, k, filter);
+    rank_filtered_allowed(store, q, k, filter, None)
+}
+
+fn rank_filtered_allowed(
+    store: &Store,
+    q: &[f32],
+    k: usize,
+    filter: crate::SearchFilter<'_>,
+    allowed_ids: Option<&std::collections::HashSet<String>>,
+) -> Vec<Hit> {
+    let scored = ranked_rows_allowed(store, q, k, filter, allowed_ids);
     scored
         .into_iter()
         .map(|row| {
