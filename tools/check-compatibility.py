@@ -169,10 +169,13 @@ def collect(binary, root, routes=None):
     require(isinstance(rows, list) and sorted(r["harness"] for r in rows) == ["claude", "codex"],
             "fixture must discover exactly its Claude and Codex sessions")
     session = json.loads(invoke(binary, env, ["show", "compat-session", "--json"]))
-    requests = "\n".join(json.dumps({"jsonrpc": "2.0", "id": i, "method": method, "params": params})
-                         for i, method, params in [(1, "initialize", {"protocolVersion": "2025-06-18"}), (2, "tools/list", {})]) + "\n"
-    responses = [json.loads(line) for line in invoke(binary, env, ["mcp"], stdin=requests).splitlines()]
-    tools = next(r["result"]["tools"] for r in responses if r.get("id") == 2)
+    if any(c["name"] == "mcp" for c in commands):
+        requests = "\n".join(json.dumps({"jsonrpc": "2.0", "id": i, "method": method, "params": params})
+                             for i, method, params in [(1, "initialize", {"protocolVersion": "2025-06-18"}), (2, "tools/list", {})]) + "\n"
+        responses = [json.loads(line) for line in invoke(binary, env, ["mcp"], stdin=requests).splitlines()]
+        tools = next(r["result"]["tools"] for r in responses if r.get("id") == 2)
+    else:
+        tools = []
     # The schema's field inventories must agree with what the binary actually serializes.
     for row in rows:
         require(set(schema["session_row"]["keys"]) <= row.keys(), "session-row schema drifted from ls JSON")
@@ -198,8 +201,12 @@ def collect(binary, root, routes=None):
 def compare(old, new, accepted=frozenset()):
     old, new = json.loads(json.dumps(old)), json.loads(json.dumps(new))
     for key in ("commands", "tools"):
+        if key in accepted and not new[key]:
+            continue
         before, after = named(old[key]), named(new[key])
         for name, value in before.items():
+            if f"{key}.{name}" in accepted and name not in after:
+                continue
             require(name in after, f"{key}.{name}: removed")
             if key == "commands":
                 value["args"] = named(value["args"])
@@ -210,9 +217,12 @@ def compare(old, new, accepted=frozenset()):
     for key in ("schema", "rows", "session"):
         subset(old[key], new[key], key, accepted)
     for route, response in old["routes"].items():
+        if f"routes.{route}" in accepted and route not in new["routes"]:
+            continue
         require(route in new["routes"], f"HTTP route removed: {route}")
         # A baseline 404 is a route it never had or a fixture it lacks; anything else must hold.
-        require(response["status"] == 404 or response["status"] == new["routes"][route]["status"],
+        require(response["status"] == 404 or response["status"] == new["routes"][route]["status"]
+                or f"routes.{route}.status" in accepted,
                 f"HTTP status changed: {route}: {response['status']} -> {new['routes'][route]['status']}")
 
 

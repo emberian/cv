@@ -76,15 +76,26 @@ jobs:
           echo "fb940a1bfa8b22cf637f7188a30d6e46ed24efd15144a41de4d3c8b3abf44e5b  $baseline/release.tar.xz" | sha256sum -c -
           tar -xJf "$baseline/release.tar.xz" -C "$baseline" --strip-components=1
           python3 -I tools/check-compatibility.py --baseline "$baseline/cv" --candidate target/debug/cv \
-            --accept tools.workflow.inputSchema.properties.follow \
+            --accept tools \
+            --accept commands.mcp \
+            --accept commands.scry \
+            --accept commands.deferrals \
+            --accept commands.adopt.args.agents.required \
+            --accept commands.pack.args.context_bytes \
+            --accept commands.splice.args.generate \
+            --accept commands.splice.args.gen_model \
             --accept commands.rewind.args.from_compaction \
-            --accept tools.rewind.inputSchema.properties.from_compaction \
-            --accept commands.deferrals.args.since \
-            --accept tools.deferrals.inputSchema.properties.since \
             --accept commands.dataset.args.out \
-            --accept tools.dataset.inputSchema.properties.out \
             --accept commands.watch.args.interval.value_type \
-            --accept rows.codex.message_count
+            --accept rows.codex.message_count \
+            --accept 'routes.GET /api/backlog' \
+            --accept 'routes.GET /api/board/*' \
+            --accept 'routes.GET /api/channels' \
+            --accept 'routes.GET /api/claims/{}' \
+            --accept 'routes.GET /api/tasks/debt' \
+            --accept 'routes.GET /api/tasks/stats' \
+            --accept 'routes.GET /api/who/{}' \
+            --accept 'routes.POST /api/task/{}/reopen'
 
       - name: Upgrade from the released 0.16.1 binary
         shell: bash

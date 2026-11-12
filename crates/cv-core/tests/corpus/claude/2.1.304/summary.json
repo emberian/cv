@@ -1368,7 +1368,7 @@
             "system/injected_context",
             "assistant/reply",
             "assistant/reply",
-            "user/injected_context",
+            "user/prompt",
             "assistant/reply",
             "assistant/reply"
           ],

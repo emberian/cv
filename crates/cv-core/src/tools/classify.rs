@@ -874,7 +874,9 @@ fn embedded_json_id_field(trimmed: &str, keys: &[&str]) -> Option<String> {
     }
     let start = trimmed.find('{')?;
     let end = trimmed.rfind('}')?;
-    (end > start).then(|| json_id_field(&trimmed[start..=end], keys)).flatten()
+    (end > start)
+        .then(|| json_id_field(&trimmed[start..=end], keys))
+        .flatten()
 }
 
 fn json_id_field(trimmed: &str, keys: &[&str]) -> Option<String> {

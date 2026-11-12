@@ -94,6 +94,7 @@ impl std::fmt::Debug for SqliteSessionGuard {
 }
 
 impl SqliteSessionGuard {
+    #[cfg(feature = "sqlite")]
     pub(crate) fn new(valid: impl Fn() -> bool + Send + Sync + 'static) -> Arc<Self> {
         Arc::new(Self {
             in_pass: std::sync::atomic::AtomicBool::new(true),
@@ -101,6 +102,7 @@ impl SqliteSessionGuard {
         })
     }
 
+    #[cfg(feature = "sqlite")]
     pub(crate) fn end_pass(&self) {
         self.in_pass.store(false, std::sync::atomic::Ordering::Release);
     }
@@ -202,6 +204,7 @@ impl JsonSource {
         source.check_reads()?;
         Ok(source)
     }
+    #[cfg(feature = "sqlite")]
     pub(crate) fn capture_with_sqlite_guard(
         path: &Path,
         reads: &crate::source::ReadSet,

@@ -80,5 +80,14 @@ class Compatibility(unittest.TestCase):
         with self.assertRaises(compat.Incompatible):
             compat.compare(self.old, new, {"rows.codex.message_count"})
 
+    def test_accepted_command_tools_and_route_removals_are_exact(self):
+        new = copy.deepcopy(self.old)
+        new["commands"].clear()
+        new["tools"].clear()
+        new["routes"].pop("GET /api/sessions")
+        with self.assertRaises(compat.Incompatible):
+            compat.compare(self.old, new, {"commands.show", "tools"})
+        compat.compare(self.old, new, {"commands.show", "tools", "routes.GET /api/sessions"})
+
 
 if __name__ == "__main__": unittest.main()

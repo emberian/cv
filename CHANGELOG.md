@@ -1,7 +1,16 @@
 # Changelog
 
 ## Unreleased
+- Breaking: removed `cv mcp`, `scry`, `deferrals`, `splice --generate`, `CV_PACK_LLM`, and retired CLI/HTTP tombstones; `cv pack` uses zero-LLM live-suffix recall.
 - First-class `antigravity` harness (`agy`, `antigravity-cli`, `antigravity-ide`): reads Cortex JSONL step logs, sub-agent trees, and read-only SQLite sidecars under `~/.gemini/antigravity*`.
+- Codex Code Mode `exec` JS calls now classify into `command`, `file_edit`, spawn, and background events across `events`, `touched`, `lanes`, hooks, and `distill`.
+- `cv distill` tracks tools, commits, state files, and sub-agents across all harnesses in one lazy pass without decoding unread thinking blocks.
+- `cv show --kind` applies `--first`, `--last`, `--range`, and `--max-bytes` after projection, resolves sub-agents, and pairs question tools by `tool_use_id`.
+- Bare sub-agent IDs resolve across `show`, `distill`, `splice`, and `rewind`; `ls` disambiguates UUIDv7 prefixes; `distill`/`splice` alias `--into`; `port` adds `--json`.
+- `cv search` adds `--cwd` and `-q`/`--query` session filters, and quotes bare colons instead of failing Tantivy query parsing.
+- `cv task list --json` emits compact `TaskRow` summaries (`--detail` for full bodies and notes), with `ls` and `close` subcommand aliases.
+- `cv retire --list` prints retired lanes; `current()` chases transitive successor chains and `retire` updates `PENDING` successors in place.
+- Live WAL SQLite reads use MVCC transactions and per-session revisions; `CLUSTERVISION_CACHE` separates caches; `--frozen` permits `--dry-run` and stdout exports.
 - `cv hook receipt` (opt-in, `cv hooks install --receipts`): every Claude Code tool call is appended, hash-chained and fsynced, before it runs; `CV_RECEIPT_STRICT=1` refuses unlogged calls.
 - `cv distill --agent-of` retires a sub-agent source: `$CLUSTERVISION_HOME/retired.jsonl` records it with its successor (`--keep-source` opts out; a `--upto` fork never retires). `cv retire` lists, adds and `--undo`es rows. The opt-in guard `cv hooks install --retired` (PreToolUse on every tool, Claude Code) denies each tool call a retired agent makes and each `SendMessage` to one, naming the successor, so a lane still holding the old id cannot wake a second copy.
 - `cv lanes` and `cv show --agent` skip the `agent-<id>.flat.jsonl` payload sidecar beside a distilled agent.

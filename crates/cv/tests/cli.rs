@@ -3113,7 +3113,14 @@ fn adopt_model_retargets_an_agent_already_in_the_session() {
 
     // A dry run says what it would do and writes nothing.
     let (out, err) = w.cv_ok(&[
-        "adopt", aid, "--into", live, "--model", "claude-new-2", "--dry-run", "--json",
+        "adopt",
+        aid,
+        "--into",
+        live,
+        "--model",
+        "claude-new-2",
+        "--dry-run",
+        "--json",
     ]);
     assert!(
         err.contains("would retarget") && err.contains("claude-old-1 → claude-new-2"),
@@ -3126,7 +3133,15 @@ fn adopt_model_retargets_an_agent_already_in_the_session() {
     // The real run: `model` rewritten, `pickedEffortModel` dropped, the rest kept, the transcript
     // untouched, and nothing else in subagents/.
     let (_, err) = w.cv_ok(&[
-        "adopt", aid, "--into", live, "--from", live, "--model", "claude-new-2", "--force",
+        "adopt",
+        aid,
+        "--into",
+        live,
+        "--from",
+        live,
+        "--model",
+        "claude-new-2",
+        "--force",
     ]);
     assert!(err.contains(&format!("retargeted {aid} in place")), "{err}");
     let m: serde_json::Value = serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
