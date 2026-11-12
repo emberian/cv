@@ -840,9 +840,8 @@ fn agents_in_dir(
         for e in super::side_entries(dir)? {
             let p = e.path();
             // Only `agent-*.jsonl`; skip `journal.jsonl`, the `.meta.json` sidecars and the
-            // `agent-<id>.flat.jsonl` stash `cv distill`/`cv prune` write beside a transcript. Read
-            // as an agent, the stash became a phantom `<id>.flat` lane with no stop, so `cv lanes`
-            // listed it `running` under the real agent's 8-character id.
+            // `agent-<id>.flat.jsonl` payload sidecar `cv distill`/`cv prune` write beside a
+            // transcript (neither a running lane nor an `--agent` target).
             let is_agent = p.extension().and_then(|x| x.to_str()) == Some("jsonl")
                 && p.file_name()
                     .and_then(|n| n.to_str())
@@ -2335,10 +2334,11 @@ mod tests {
             r#"{"agentType":"general-purpose","description":"do task one","toolUseId":"toolu_77"}"#,
         )
         .unwrap();
-        // The elided-payload stash `cv distill` writes beside the agent it creates: not an agent.
+        // A distilled agent's payload sidecar sits beside it: not an agent, so `--agent a111` is
+        // not ambiguous with it and `cv lanes` does not list a phantom `.flat` lane.
         std::fs::write(
             subs.join("agent-a111.flat.jsonl"),
-            "{\"id\":\"toolu_1\",\"slot\":\"content\",\"name\":\"Bash\",\"content\":\"big\"}\n",
+            r#"{"id":"toolu_1","slot":"content","name":"Read","content":"big","size":3,"line_count":1,"kind":"text"}"#,
         )
         .unwrap();
 
@@ -2372,7 +2372,7 @@ mod tests {
 
         FOREST_READS.lock().unwrap().0 = Some(root.clone());
         let tree = subagent_tree(&parent).unwrap();
-        assert_eq!(tree.len(), 3, "two tiers: 1 direct + 2 workflow");
+        assert_eq!(tree.len(), 3, "two tiers: 1 direct + 2 workflow, no `.flat` sidecar");
         // A Rich forest over unchanged transcripts scans none of them again; a change rescans
         // exactly the changed one.
         let scans = |before: usize| -> Vec<PathBuf> {

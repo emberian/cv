@@ -260,11 +260,31 @@ fn agent_meta(source_path: &Path, description: &str, model: Option<&str>) -> Val
 /// read-back (anything the IR carried that the file does not comes back as a warning) and the
 /// resumability rules ([`cv_core::harness::claude::verify_claude_resumable`], an error — it means a bug in cv).
 fn emit_resumable(ir: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<cv_core::EmitResult> {
-    let (res, warnings) = cv_core::emit::emit_verified(ir, cv_core::harness::derived_host(), out_dir, opts)?;
-    for w in &warnings {
+    let (res, report) = cv_core::emit::emit_report(ir, cv_core::harness::derived_host(), out_dir, opts)?;
+    for w in lossy_lines(&report, opts.sidechain_of.is_some()) {
         eprintln!("  ⚠ lossy: {w}");
     }
     Ok(res)
+}
+
+/// The read-back deltas that are a real loss. The emitted IR is this command's own construction,
+/// and two of its fields are named elsewhere: its lineage (`forked_from` the source) by the pack's
+/// `Source:` line, and a sub-agent's title (`distilled: <label>`) by its meta description, the
+/// label a harness shows (the emitter writes no title record for a sidechain). Reporting those as
+/// `⚠ lossy` on every distill taught readers to ignore the line.
+fn lossy_lines(report: &cv_core::emit::FidelityReport, sidechain: bool) -> Vec<String> {
+    report
+        .deltas
+        .iter()
+        .filter(|d| d.what != "lineage" && !(sidechain && d.what == "session title"))
+        .map(|d| {
+            if d.expected {
+                format!("{} (expected: target format policy)", d.describe())
+            } else {
+                d.describe()
+            }
+        })
+        .collect()
 }
 
 /// A root session's transcript, from a path or an id.
@@ -410,6 +430,82 @@ pub(crate) fn cmd_distill(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn distill_keeps_coordinator_messages_recorded_as_meta_turns() -> Result<()> {
+        let world = cv_testkit::World::new("distill-coordinator");
+        let path = world.base.join("agent-acoord.jsonl");
+        let coordinator = |uuid: &str, body: &str| {
+            json!({"type":"user","uuid":uuid,"isMeta":true,"origin":{"kind":"coordinator"},
+                "message":{"role":"user","content":format!("The coordinator sent a message while you were working:\n{body}")}})
+        };
+        let call = |uuid: &str, id: &str| {
+            json!({"type":"assistant","uuid":uuid,"message":{"role":"assistant","model":"claude-test","content":[
+                {"type":"tool_use","id":id,"name":"Bash","input":{"command":"ls","description":"List"}}]}})
+        };
+        let result = |uuid: &str, id: &str| json!({"type":"user","uuid":uuid,"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":id,"content":"a"}]}});
+        let rows = [
+            json!({"type":"user","uuid":"u0","message":{"role":"user","content":"You are the infra lane."}}),
+            call("a1", "t1"),
+            result("r1", "t1"),
+            coordinator(
+                "c1",
+                "Resumed: your state file is `/x/docs/LANE-STATE.md`; ship rehearsal #3.",
+            ),
+            call("a2", "t2"),
+            result("r2", "t2"),
+            coordinator("c2", "Cut 9 moved to 5fdfa393."),
+            call("a3", "t3"),
+            result("r3", "t3"),
+        ];
+        std::fs::write(&path, rows.iter().map(|row| format!("{row}\n")).collect::<String>())?;
+        let (session, _) = load(path.to_str().unwrap(), None)?;
+        let opts = DistillOptions {
+            keep_last: 2,
+            ..Default::default()
+        };
+        let (d, resumed) = prepare_distill(&session, &opts)?.into_resumable_session(&session);
+        assert!(
+            d.head_md
+                .contains("· message delivered while working\n\nResumed: your state file is"),
+            "{}",
+            d.head_md
+        );
+        // A coordinator message inside the verbatim tail is a real user turn of the resumed lane.
+        let tail_prompt = resumed.messages[1..]
+            .iter()
+            .any(|m| m.role == cv_core::Role::User && m.text().unwrap_or_default() == "Cut 9 moved to 5fdfa393.");
+        assert!(
+            tail_prompt,
+            "{:?}",
+            resumed.messages.iter().map(|m| m.text()).collect::<Vec<_>>()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn distill_lossy_lines_skip_what_the_pack_and_meta_carry() {
+        let delta = |what: &str, expected: bool| cv_core::emit::Divergence {
+            what: what.into(),
+            a: "distilled: lane".into(),
+            b: "(none)".into(),
+            expected,
+            at: String::new(),
+        };
+        let report = cv_core::emit::FidelityReport {
+            deltas: vec![
+                delta("lineage", true),
+                delta("session title", false),
+                delta("per-message model", false),
+            ],
+        };
+        assert_eq!(
+            lossy_lines(&report, true),
+            vec!["per-message model: distilled: lane → (none)"]
+        );
+        // A main-thread session has no meta: a lost title is a loss there.
+        assert_eq!(lossy_lines(&report, false).len(), 2);
+    }
     /// Run alone in a fresh process with synthetic inputs. Includes loading, analysis, requested
     /// resume/sidecar emission and reporting; fixture construction and report inspection are outside.
     #[cfg(feature = "probe-heap")]
