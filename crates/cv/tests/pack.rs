@@ -306,16 +306,27 @@ fn pack_session_emits_resumable_claude_session_that_round_trips() {
     let parsed = cv_core::harness::claude::Claude::detect()
         .parse(&sref)
         .expect("claude adapter must re-parse the emitted pack session");
-    assert_eq!(parsed.messages.len(), 2, "user framing + assistant ack");
-    let user_text = parsed.messages[0].text().unwrap_or_default();
-    assert!(user_text.contains("wombat caching layer"), "{user_text}");
-    assert!(
-        user_text.contains("# Context pack"),
-        "bundle must ride in the user turn"
+    assert_eq!(
+        parsed.messages.len(),
+        2,
+        "injected context + user prompt, no fake assistant turn"
     );
-    assert!(user_text.contains("src/cache.rs"), "{user_text}");
-    let ack = parsed.messages[1].text().unwrap_or_default();
-    assert!(ack.contains("Ready to continue"), "{ack}");
+    assert!(
+        parsed.messages.iter().all(|m| m.role != cv_core::ir::Role::Assistant),
+        "pack --format session must never fabricate an assistant turn: {:?}",
+        parsed.messages
+    );
+    assert_eq!(parsed.messages[0].kind, cv_core::ir::MessageKind::InjectedContext);
+    let ctx_text = parsed.messages[0].text().unwrap_or_default();
+    assert!(
+        ctx_text.contains("# Context pack"),
+        "bundle must ride in the injected_context turn: {ctx_text}"
+    );
+    assert!(ctx_text.contains("src/cache.rs"), "{ctx_text}");
+    assert_eq!(parsed.messages[1].role, cv_core::ir::Role::User);
+    assert_eq!(parsed.messages[1].kind, cv_core::ir::MessageKind::Prompt);
+    let user_text = parsed.messages[1].text().unwrap_or_default();
+    assert!(user_text.contains("wombat caching layer"), "{user_text}");
 
     // And the emitted session is discoverable + showable through the CLI itself.
     let (out, _) = w.cv_ok(&["show", &new_id]);

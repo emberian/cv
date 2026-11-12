@@ -240,15 +240,21 @@ const STOPWORDS: &[&str] = &[
     "are", "was", "were", "has", "have", "had", "not", "but", "all",
 ];
 
-/// The task's distinct searchable words (lowercased so Tantivy never reads `NOT`/`TO`/`AND` as
-/// operators) joined with `OR` — the relaxed second-try query. `None` when relaxing can't help.
-fn or_query(task: &str) -> Option<String> {
+/// Distinct lowercase identifier/word tokens (preserving `_`, dropping punctuation and stopwords)
+/// used for relaxed `OR` recall and length-normalized excerpt window scoring.
+fn query_tokens(task: &str) -> Vec<String> {
     let mut seen = HashSet::new();
-    let words: Vec<String> = literal_query(task)
+    literal_query(task)
         .split_whitespace()
         .filter(|w| w.len() > 2 && !STOPWORDS.contains(w) && seen.insert((*w).to_string()))
         .map(str::to_string)
-        .collect();
+        .collect()
+}
+
+/// The task's distinct searchable words (lowercased so Tantivy never reads `NOT`/`TO`/`AND` as
+/// operators) joined with `OR` — the relaxed second-try query. `None` when relaxing can't help.
+fn or_query(task: &str) -> Option<String> {
+    let words = query_tokens(task);
     (words.len() > 1).then(|| words.join(" OR "))
 }
 
@@ -321,8 +327,46 @@ fn fuse(ranked: Vec<(f32, Vec<cv_search::Hit>)>, limit: usize) -> Vec<cv_search:
     picked
 }
 
+/// Length-normalized BM25-style lexical overlap score (scaled to fixed-point `i64` for
+/// [`cv_core::api::MessageWindow`]), preserving `_` inside identifier tokens so snake_case symbols
+/// match whole identifiers and long log dumps do not drown concise answers.
 fn lexical_score<'a>(text: &str, needle: &str, words: impl Iterator<Item = &'a str>) -> i64 {
-    words.filter(|word| text.contains(word)).count() as i64 + if text.contains(needle) { 5 } else { 0 }
+    const K1: f64 = 1.2;
+    const B: f64 = 0.75;
+    const AVG_DL: f64 = 40.0;
+
+    let mut tf: HashMap<&str, usize> = HashMap::new();
+    let mut doc_len: usize = 0;
+    for tok in text
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .filter(|t| !t.is_empty())
+    {
+        doc_len += 1;
+        *tf.entry(tok).or_insert(0) += 1;
+    }
+    if doc_len == 0 {
+        return 0;
+    }
+    let norm = 1.0 - B + B * (doc_len as f64 / AVG_DL);
+    let mut score = 0.0f64;
+    for word in words {
+        let count = tf.get(word).copied().unwrap_or(0) as f64;
+        let eff_tf = if count > 0.0 {
+            count
+        } else if !word.contains('_') && word.len() >= 4 && text.contains(word) {
+            0.35
+        } else {
+            0.0
+        };
+        if eff_tf > 0.0 {
+            score += (eff_tf * (K1 + 1.0)) / (eff_tf + K1 * norm);
+        }
+    }
+    let trimmed_needle = needle.trim();
+    if !trimmed_needle.is_empty() && text.contains(trimmed_needle) {
+        score += (2.5 * (K1 + 1.0)) / (1.0 + K1 * norm);
+    }
+    (score * 10_000.0).round() as i64
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -451,11 +495,7 @@ fn best_window_observing(
     events: Option<&mut cv_core::events::SpoolingSink>,
 ) -> Result<(Excerpt, Option<(usize, usize)>)> {
     let needle = task.to_lowercase();
-    let words: Vec<String> = needle
-        .split_whitespace()
-        .filter(|w| w.len() > 2)
-        .map(str::to_string)
-        .collect();
+    let words = query_tokens(task);
 
     struct WindowSink<'a> {
         events: Option<&'a mut cv_core::events::SpoolingSink>,
@@ -807,31 +847,20 @@ fn emit_pack_session(
     let bundle = md_bundle(task, sources, rollup, bounds);
     let now = Utc::now();
 
-    let mut user = Message::new(Role::User);
-    user.timestamp = Some(now);
-    user.content.push(Block::Text {
-        text: format!(
-            "I'm picking up this task: {task}\n\nBefore we start, here is the relevant context \
-             from my earlier sessions, compiled by `cv pack`:\n\n{bundle}"
-        )
-        .into(),
+    let mut context = Message::of_kind(
+        Role::System,
+        cv_core::ir::MessageKind::InjectedContext,
+        cv_core::ir::Origin::Harness,
+    );
+    context.timestamp = Some(now);
+    context.content.push(Block::Text {
+        text: format!("Relevant context from earlier sessions, compiled by `cv pack`:\n\n{bundle}").into(),
     });
 
-    let mut ack = Message::new(Role::Assistant);
-    ack.timestamp = Some(now);
-    let key_files: Vec<String> = rollup.iter().take(5).map(|(p, ..)| format!("`{p}`")).collect();
-    let files_note = if key_files.is_empty() {
-        String::new()
-    } else {
-        format!(" The files that kept appearing are {}.", key_files.join(", "))
-    };
-    ack.content.push(Block::Text {
-        text: format!(
-            "Understood — I've reviewed the prior context for \"{task}\" ({} earlier \
-             session(s)).{files_note} Ready to continue from there.",
-            sources.len()
-        )
-        .into(),
+    let mut prompt = Message::of_kind(Role::User, cv_core::ir::MessageKind::Prompt, cv_core::ir::Origin::Human);
+    prompt.timestamp = Some(now);
+    prompt.content.push(Block::Text {
+        text: format!("I'm picking up this task: {task}").into(),
     });
 
     let session = Session {
@@ -839,8 +868,11 @@ fn emit_pack_session(
         title: Some(format!("context pack: {}", cv_core::ir::truncate(task, 60))),
         created_at: Some(now),
         updated_at: Some(now),
-        messages: vec![user, ack],
-        ..Session::new(format!("pack-{}", now.timestamp()), to_h)
+        messages: vec![context, prompt],
+        ..Session::new(
+            format!("pack-{}", now.timestamp()),
+            Harness::parse("opensession").expect("opensession"),
+        )
     };
     crate::cmd::port::emit_session_output(
         &session,
@@ -1348,5 +1380,33 @@ mod tests {
         assert!(bundle.contains("Bounds: each excerpt message to 1600 bytes (`--excerpt-bytes`; 0 cut"));
         assert!(bundle.contains("cv show claude:abcdef0123456789 --range 4..9"));
         assert!(!bundle.contains("--range 4-9"));
+    }
+
+    #[test]
+    fn lexical_score_preserves_underscores_and_normalizes_by_document_length() {
+        let words = query_tokens("fix crate::cache_invalidation_bug() in store");
+        assert_eq!(words, vec!["fix", "crate", "cache_invalidation_bug", "store"]);
+
+        let focused = "we fixed cache_invalidation_bug inside store";
+        let verbose = format!("cache_invalidation_bug store {}", "unrelated filler token ".repeat(140));
+        let needle = "fix crate::cache_invalidation_bug() in store";
+        let focused_score = lexical_score(focused, needle, words.iter().map(String::as_str));
+        let verbose_score = lexical_score(&verbose, needle, words.iter().map(String::as_str));
+        assert!(
+            focused_score > verbose_score,
+            "length normalization must prefer concise match ({focused_score}) over 420-word log dump ({verbose_score})"
+        );
+
+        // Snake-case identifier must not falsely match a longer distinct identifier.
+        let partial_only = "unrelated prefix_cache_invalidation_bug_suffix only";
+        let exact_only = "isolated cache_invalidation_bug match";
+        assert!(
+            lexical_score(exact_only, needle, words.iter().map(String::as_str))
+                > lexical_score(partial_only, needle, words.iter().map(String::as_str))
+        );
+        assert_eq!(
+            lexical_score(partial_only, needle, ["cache_invalidation_bug"].into_iter()),
+            0
+        );
     }
 }

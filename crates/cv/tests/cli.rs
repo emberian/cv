@@ -4271,3 +4271,31 @@ fn cli_skills_policy_on_prune_rewind_and_port() {
     assert_eq!(code, 2);
     assert!(error.contains("requires a Claude target"));
 }
+
+#[test]
+fn resume_launch_refuses_gui_only_harnesses_with_exit_two() {
+    let w = World::new("resume-gui-only");
+    let exports_dir = w.base.join("exports");
+    fs::create_dir_all(&exports_dir).unwrap();
+    w.cv_ok(&["config", "--add-export", exports_dir.to_str().unwrap()]);
+
+    let mut session = cv_core::ir::Session::new("gui-doc-1", cv_core::ir::Harness::OpenSession);
+    let mut m = cv_core::ir::Message::new(cv_core::ir::Role::User);
+    m.content.push(cv_core::ir::Block::Text { text: "hello".into() });
+    session.messages.push(m);
+    fs::write(
+        exports_dir.join("gui-doc-1.opensession.json"),
+        serde_json::to_vec(&cv_core::harness::opensession::document(&session)).unwrap(),
+    )
+    .unwrap();
+
+    let (out, _) = w.cv_ok(&["resume", "opensession:gui-doc-1"]);
+    assert!(out.starts_with("# no CLI resume for opensession"), "{out}");
+
+    let (_, code, _, err) = w.cv(&["resume", "opensession:gui-doc-1", "--launch"]);
+    assert_eq!(code, 2, "must exit 2 instead of execvp-ing comment: {err}");
+    assert!(
+        err.contains("cannot --launch opensession") && !err.contains("failed to launch"),
+        "{err}"
+    );
+}

@@ -481,8 +481,10 @@ fn resolve_show_target(
     agent: Option<&str>,
 ) -> Result<(SessionRef, Box<dyn Adapter>, Option<cv_core::AgentRef>)> {
     if let Some(agent_id) = agent {
-        let (parent, adapter) = resolve(id, want)?;
+        let (parent, _parent_adapter) = resolve(id, want)?;
         let sub = resolve_subagent(&parent, agent_id)?;
+        let adapter = cv_core::harness::for_harness(sub.session.harness)
+            .with_context(|| format!("no adapter for {}", sub.session.harness))?;
         return Ok((sub.session.clone(), adapter, Some(sub)));
     }
     let (want, id) = split_harness_id(id, want);
@@ -498,8 +500,10 @@ fn resolve_show_target(
                 return Ok((sub.session.clone(), adapter, Some(sub)));
             }
             if let Some((parent_spec, agent_spec)) = id.split_once('/') {
-                let (parent, adapter) = resolve(parent_spec, want)?;
+                let (parent, _parent_adapter) = resolve(parent_spec, want)?;
                 let sub = resolve_subagent(&parent, agent_spec)?;
+                let adapter = cv_core::harness::for_harness(sub.session.harness)
+                    .with_context(|| format!("no adapter for {}", sub.session.harness))?;
                 return Ok((sub.session.clone(), adapter, Some(sub)));
             }
             cv_core::find(id, want)
@@ -555,9 +559,9 @@ pub(crate) fn resolve_agent_parent_fleetwide(
     match parents.as_slice() {
         [] => Ok(None),
         [parent] => {
-            let adapter = cv_core::harness::for_harness(parent.harness)
-                .with_context(|| format!("no adapter for {}", parent.harness))?;
             let sub = resolve_subagent(parent, agent_id)?;
+            let adapter = cv_core::harness::for_harness(sub.session.harness)
+                .with_context(|| format!("no adapter for {}", sub.session.harness))?;
             Ok(Some(FleetwideSubagent {
                 parent: parent.clone(),
                 adapter,
@@ -588,6 +592,60 @@ pub(crate) fn resolve_agent_parent_fleetwide(
     }
 }
 
+/// Extract a sub-agent's final return value across any harness: the last non-empty assistant text
+/// turn in its transcript, streamed lazily with `Demand::LEAN.with_spans()`.
+fn subagent_final_return(r: &SessionRef) -> Result<Option<String>> {
+    let Some(adapter) = cv_core::harness::for_harness(r.harness) else {
+        return Ok(None);
+    };
+    struct LastAssistantText {
+        resolver: cv_core::Resolver,
+        last: Option<String>,
+        error: Option<anyhow::Error>,
+    }
+    impl cv_core::MessageSink for LastAssistantText {
+        fn meta(&mut self, session: &Session) {
+            self.resolver = session.resolver();
+        }
+        fn take_error(&mut self) -> Option<anyhow::Error> {
+            self.error.take()
+        }
+        fn message(&mut self, m: Message) -> cv_core::Flow {
+            if m.role != cv_core::ir::Role::Assistant {
+                return cv_core::Flow::Continue;
+            }
+            let mut buf = String::new();
+            for b in &m.content {
+                if let Block::Text { text } = b {
+                    match text.try_resolve(&self.resolver) {
+                        Ok(s) => {
+                            if !buf.is_empty() {
+                                buf.push('\n');
+                            }
+                            buf.push_str(&s);
+                        }
+                        Err(err) => {
+                            self.error = Some(err);
+                            return cv_core::Flow::Stop;
+                        }
+                    }
+                }
+            }
+            if !buf.trim().is_empty() {
+                self.last = Some(buf);
+            }
+            cv_core::Flow::Continue
+        }
+    }
+    let mut sink = LastAssistantText {
+        resolver: cv_core::Resolver::new(Some(r.path.clone())),
+        last: None,
+        error: None,
+    };
+    adapter.try_stream(r, &cv_core::Demand::LEAN.with_spans(), &mut sink)?;
+    Ok(sink.last)
+}
+
 /// List the sub-agent forest a session spawned (the `--subagents` view): every direct/`Workflow`
 /// sub-agent with its type, journaled outcome, and final return value. `json` emits the structured
 /// [`AgentRef`] forest (each annotated with its return) for machine consumption.
@@ -607,7 +665,7 @@ fn show_subagents(r: &SessionRef, json: bool) -> Result<()> {
                     obj.insert("agent_id".into(), serde_json::Value::String(s.agent_id().to_string()));
                     // Direct agents have no journaled summary — attach their final return value.
                     if s.result_summary.is_none() {
-                        if let Some(ret) = cv_core::harness::claude::subagent_return(&s.session.path)? {
+                        if let Some(ret) = subagent_final_return(&s.session)? {
                             obj.insert("return".into(), serde_json::Value::String(ret));
                         }
                     }
@@ -632,7 +690,7 @@ fn show_subagents(r: &SessionRef, json: bool) -> Result<()> {
         // the last text turn of its transcript. Transcript-derived, so sanitized at the seam (G5);
         // the `--json` path stays raw.
         if s.result_summary.is_none() {
-            if let Some(ret) = cv_core::harness::claude::subagent_return(&s.session.path)? {
+            if let Some(ret) = subagent_final_return(&s.session)? {
                 println!("  ↩ {}", truncate(&cv_core::sanitize::sanitize_line(&ret), 400));
             }
         }
@@ -898,6 +956,32 @@ fn read_tree(r: &SessionRef, adapter: &dyn Adapter) -> Result<(Session, Vec<Tree
     Ok((session, sink.rows, sink.first_prompt))
 }
 
+fn format_lineage(lineage: &cv_core::ir::Lineage) -> Option<String> {
+    if lineage.is_empty() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    if let Some(p) = &lineage.parent {
+        parts.push(format!("parent {}", short_id(p)));
+    }
+    if let Some(f) = &lineage.forked_from {
+        parts.push(format!("forked from {}", short_id(f)));
+    }
+    if let Some(c) = &lineage.continues {
+        parts.push(format!("continues {}", short_id(c)));
+    }
+    if let Some(c) = &lineage.continued_in {
+        parts.push(format!("continued in {}", short_id(c)));
+    }
+    if let Some(ap) = &lineage.agent_path {
+        parts.push(format!("agent {}", cv_core::sanitize::sanitize_line(ap)));
+    }
+    if let Some(t) = &lineage.spawned_by_tool_use {
+        parts.push(format!("tool {}", short_id(t)));
+    }
+    (!parts.is_empty()).then(|| format!("lineage: {}", parts.join(" · ")))
+}
+
 fn print_tree(r: &SessionRef, adapter: &dyn Adapter) -> Result<()> {
     let (session, rows, first_prompt) = read_tree(r, adapter)?;
     println!(
@@ -905,6 +989,9 @@ fn print_tree(r: &SessionRef, adapter: &dyn Adapter) -> Result<()> {
         cv_core::label_from(session.title.as_deref(), first_prompt.as_deref())
     );
     println!("{} · {} · {} msg", session.harness, session.id, rows.len());
+    if let Some(lineage) = format_lineage(&session.lineage) {
+        println!("{lineage}");
+    }
     println!();
     if rows.iter().any(|row| row.parent.is_some()) {
         walk_tree(&rows, |index, depth| {
@@ -970,11 +1057,12 @@ fn subagent_line(s: &cv_core::AgentRef) -> String {
         .as_deref()
         .map(|st| format!(" [{st}]"))
         .unwrap_or_default();
-    // Prefer the journaled summary (the real outcome); fall back to the task description.
+    // Prefer the journaled summary (the real outcome); fall back to the task description or session title.
     let blurb = s
         .result_summary
         .as_deref()
         .or(s.description.as_deref())
+        .or(s.session.title.as_deref())
         .map(|t| truncate(&cv_core::sanitize::sanitize_line(t), 88))
         .unwrap_or_default();
     format!(
@@ -1026,7 +1114,7 @@ fn walk_tree(rows: &[TreeRow], mut visit: impl FnMut(usize, usize)) {
 }
 
 /// One-line preview of a message for the tree: role (with its kind when that says more than the
-/// role), markers for tool turns / sub-agent spawns, and a text preview.
+/// role), markers for tool turns and IR-typed sub-agent spawns/returns, and a text preview.
 fn tree_line_with_preview(m: &Message, preview: Option<String>) -> String {
     let role = turn_label(m);
     let mut tags = Vec::new();
@@ -1034,22 +1122,21 @@ fn tree_line_with_preview(m: &Message, preview: Option<String>) -> String {
     let has_tool_result = m.content.iter().any(|b| matches!(b, Block::ToolResult { .. }));
     if has_tool_use {
         tags.push("🔧 tool".to_string());
-        // Surface a sub-agent spawn if the tool looks like one.
-        for b in &m.content {
-            if let Block::ToolUse { name, .. } = b {
-                let n = name.to_ascii_lowercase();
-                if n.contains("task") || n.contains("agent") || n.contains("dispatch") || n.contains("spawn") {
-                    tags.push(format!("↳ sub-agent ({name})"));
-                }
-            }
+    }
+    if m.kind == MessageKind::SubagentSpawn {
+        let spawn_tool = m.content.iter().find_map(|b| match b {
+            Block::ToolUse { name, .. } => Some(name.as_str()),
+            _ => None,
+        });
+        match spawn_tool {
+            Some(name) => tags.push(format!("↳ sub-agent ({name})")),
+            None => tags.push("↳ sub-agent".to_string()),
         }
     }
-    if has_tool_result {
+    if m.kind == MessageKind::SubagentReturn {
+        tags.push("↩ sub-agent".to_string());
+    } else if has_tool_result {
         tags.push("↩ result".to_string());
-    }
-    // The adapter said so: a spawn the tool-name heuristic didn't catch.
-    if m.kind == MessageKind::SubagentSpawn && !tags.iter().any(|t| t.starts_with("↳ sub-agent")) {
-        tags.push("↳ sub-agent".to_string());
     }
 
     let preview = preview.unwrap_or_else(|| {
@@ -2858,5 +2945,88 @@ mod tests {
 
         let adapter = cv_core::harness::for_harness(r.harness).unwrap();
         assert_json_windows(adapter.as_ref(), &r);
+    }
+
+    #[test]
+    fn tree_tags_follow_ir_message_kinds_and_lineage_instead_of_tool_name_substrings() {
+        let mut ordinary_task_tool = Message::new(Role::Assistant);
+        ordinary_task_tool.content.push(Block::ToolUse {
+            id: "t1".into(),
+            name: "TaskCreate".into(),
+            namespace: None,
+            input: serde_json::json!({"subject":"write tests"}).into(),
+        });
+        let line = tree_line_with_preview(&ordinary_task_tool, None);
+        assert!(
+            line.contains("🔧 tool") && !line.contains("↳ sub-agent"),
+            "non-spawn tool named TaskCreate must not be tagged as a sub-agent spawn: {line}"
+        );
+
+        let mut spawn = Message::of_kind(Role::Assistant, MessageKind::SubagentSpawn, cv_core::ir::Origin::Model);
+        spawn.content.push(Block::ToolUse {
+            id: "t2".into(),
+            name: "run_worker".into(),
+            namespace: None,
+            input: serde_json::json!({}).into(),
+        });
+        let spawn_line = tree_line_with_preview(&spawn, Some("delegate".into()));
+        assert!(spawn_line.contains("↳ sub-agent (run_worker)"), "{spawn_line}");
+
+        let mut ret = Message::of_kind(Role::Tool, MessageKind::SubagentReturn, cv_core::ir::Origin::Subagent);
+        ret.content.push(Block::ToolResult {
+            tool_use_id: "t2".into(),
+            content: "finished".into(),
+            is_error: false,
+            tool_name: None,
+            status: None,
+            details: None,
+        });
+        let ret_line = tree_line_with_preview(&ret, Some("finished".into()));
+        assert!(ret_line.contains("↩ sub-agent"), "{ret_line}");
+
+        let lineage = cv_core::ir::Lineage {
+            parent: Some("parent-session-12345678".into()),
+            forked_from: Some("fork-origin-87654321".into()),
+            agent_path: Some("worker-1".into()),
+            ..Default::default()
+        };
+        let rendered = format_lineage(&lineage).expect("non-empty lineage");
+        assert!(
+            rendered.contains("parent parent-s")
+                && rendered.contains("forked from fork-ori")
+                && rendered.contains("agent worker-1"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn subagent_final_return_streams_across_non_claude_harnesses() {
+        let world = cv_testkit::World::new("view-subagent-return");
+        let path = world.base.join("sub.opensession.json");
+        let h = Harness::parse("opensession").unwrap();
+        let mut session = Session::new("sub-1", h);
+        let mut prompt = Message::new(Role::User);
+        prompt.content.push(Block::Text {
+            text: "investigate bug".into(),
+        });
+        let mut interim = Message::new(Role::Assistant);
+        interim.content.push(Block::Text {
+            text: "checking files".into(),
+        });
+        let mut done = Message::new(Role::Assistant);
+        done.content.push(Block::Text {
+            text: "root cause found in parser.rs".into(),
+        });
+        session.messages = vec![prompt, interim, done];
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&cv_core::harness::opensession::document(&session)).unwrap(),
+        )
+        .unwrap();
+        let r = SessionRef::new("sub-1", h, &path);
+        assert_eq!(
+            subagent_final_return(&r).unwrap().as_deref(),
+            Some("root cause found in parser.rs")
+        );
     }
 }
