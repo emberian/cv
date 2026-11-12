@@ -1631,10 +1631,10 @@ fn export_redact_scrubs_planted_secret() {
     assert!(out.contains(SECRET), "{out}");
     assert!(!err.contains("redacted"), "{err}");
 
-    // The removed command errors with the replacement, exit 2.
+    // The removed command is a plain unknown subcommand in clap (exit 2).
     let (ok, code, _, err) = w.cv(&["redact", "alphasess", "--stats"]);
     assert!(!ok && code == 2, "{err}");
-    assert!(err.contains("cv export <id> --redact"), "{err}");
+    assert!(err.contains("unrecognized subcommand"), "{err}");
 }
 
 // ───────────────────────────── error-path honesty ─────────────────────────────
@@ -1652,7 +1652,7 @@ fn error_paths_exit_nonzero_with_stderr() {
     assert!(err.contains("no session matching"), "{err}");
 
     let (_, err) = w.cv_fails(&["show", "nonexistent-id", "--tree"]);
-    assert!(err.contains("no session matching"), "{err}");
+    assert!(err.contains("no session (and no sub-agent) matching"), "{err}");
 
     let (_, err) = w.cv_fails(&["resume", "nonexistent-id"]);
     assert!(err.contains("no session matching"), "{err}");
@@ -1791,10 +1791,10 @@ fn stats_and_ls_asc() {
     assert_eq!(rows.len(), 1, "{out}");
     assert_eq!(rows[0]["id"], "alphasess", "{out}");
 
-    // The removed command errors with the replacement, exit 2.
+    // The removed command is a plain unknown subcommand in clap (exit 2).
     let (ok, code, _, err) = w.cv(&["timeline"]);
     assert!(!ok && code == 2, "{err}");
-    assert!(err.contains("cv ls --sort-by updated --asc"), "{err}");
+    assert!(err.contains("unrecognized subcommand"), "{err}");
 }
 
 #[test]
@@ -2700,10 +2700,10 @@ fn task_inbox_unread_and_events_since() {
     let rows: Vec<serde_json::Value> = out.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
     assert_eq!(rows.len(), 2, "{out}");
     assert!(rows.iter().all(|r| r["event"] == "noted"), "{out}");
-    // `watch` was that query under a second name; the name errors with the spelling.
+    // `watch` was removed; clap rejects it as an unrecognized subcommand (exit 2).
     let (ok, code, _, err) = w.cv(&["task", "watch", "--assignee", "ember"]);
     assert!(!ok && code == 2, "{err}");
-    assert!(err.contains("removed in 0.15.0") && err.contains("--not-by"), "{err}");
+    assert!(err.contains("unrecognized subcommand"), "{err}");
 }
 
 // ───────────────────────────── distill ─────────────────────────────

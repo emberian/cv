@@ -585,13 +585,12 @@ mod tests {
 
     #[test]
     fn api_command_routes_onto_the_read_api() {
-        // The command is `route_json` behind a path splitter: a known route answers, an unknown
-        // one rejects with the status, and a removed one carries its pointer.
+        // The command is `route_json` behind a path splitter: a known route answers and an unknown
+        // or retired route rejects with 404.
         let health: serde_json::Value = serde_json::from_str(&api("/api/health".into(), None).unwrap()).unwrap();
         assert_eq!(health["ok"], true);
         assert!(api("/api/nope".into(), None).unwrap_err().starts_with("404"));
-        let gone = api("/api/channels".into(), None).unwrap_err();
-        assert!(gone.starts_with("410") && gone.contains("removed in 0.15.0"), "{gone}");
+        assert!(api("/api/channels".into(), None).unwrap_err().starts_with("404"));
         assert!(api("/api/sessions".into(), Some("harness=warpdrive".into()))
             .unwrap_err()
             .starts_with("400"));

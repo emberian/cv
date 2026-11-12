@@ -6230,8 +6230,8 @@ mod tests {
 
     #[test]
     fn query_terms_drops_fields_and_booleans() {
-        let terms = query_terms("harness:claude Tantivy AND bm25:score NOT pandas");
-        assert_eq!(terms, vec!["tantivy", "pandas"]);
+        let terms = query_terms("harness:claude title:score Tantivy AND bm25:score NOT pandas");
+        assert_eq!(terms, vec!["tantivy", "bm25:score", "pandas"]);
     }
 
     /// A query made *entirely* of fielded/boolean tokens has no bare terms to window on — the
