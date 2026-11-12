@@ -2035,25 +2035,9 @@ pub(crate) fn receipt_line_hash(prev: &str, body: &Value) -> String {
 /// Commit a hash-chained tool receipt transactionally into `state.db` (`receipts` + `capture_inbox`).
 fn commit_receipt(ev: &Event, body: Map<String, Value>) -> Result<cv_core::state::ReceiptRecord> {
     let store = cv_core::state::StateStore::default_store().context("locating state.db for receipt log")?;
-    let rec = store
-        .append_receipt(&ev.session.id, ev.harness.as_str(), body)
-        .context("appending receipt to state.db")?;
-    let op_id = format!("receipt:{}:{}:{}", ev.harness.as_str(), rec.session_id, rec.seq);
-    let envelope = json!({
-        "kind": "tool_receipt",
-        "session_id": rec.session_id,
-        "harness": rec.harness,
-        "seq": rec.seq,
-        "tool_use_id": rec.tool_use_id,
-        "tool_name": rec.tool_name,
-        "receipt_kind": rec.kind,
-        "digest_sha256": rec.digest_sha256,
-        "prev_hash": rec.prev_hash,
-        "receipt_hash": rec.receipt_hash,
-    });
-    store
-        .append(&op_id, &rec.receipt_hash, &envelope)
-        .context("recording receipt in state.db capture_inbox")?;
+    let (rec, _) = store
+        .append_receipt_with_inbox(&ev.session.id, ev.harness.as_str(), body)
+        .context("committing receipt and capture_inbox record to state.db")?;
     Ok(rec)
 }
 

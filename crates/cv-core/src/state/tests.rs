@@ -930,3 +930,43 @@ fn direct_lane_liveness_rejects_previous_boot() {
     };
     assert!(!is_lane_run_alive(&run));
 }
+
+#[test]
+fn append_receipt_with_inbox_commits_or_rolls_back_atomically_in_one_tx() {
+    let dir = tmp_state_dir("atomic-receipt");
+    let store = StateStore::at_dir(&dir);
+
+    // Pre-bind `receipt:claude:sess-conflict:1` with a different digest so the inbox half fails.
+    store
+        .append("receipt:claude:sess-conflict:1", "wrong-digest", &json!({"x": 1}))
+        .unwrap();
+
+    let mut bad_body = serde_json::Map::new();
+    bad_body.insert("kind".into(), json!("pre"));
+    bad_body.insert("tool".into(), json!("Bash"));
+    bad_body.insert("input_sha256".into(), json!("deadbeef"));
+    let err = store
+        .append_receipt_with_inbox("sess-conflict", "claude", bad_body)
+        .unwrap_err();
+    assert!(matches!(err, StateError::OperationConflict { .. }), "{err:?}");
+    assert!(
+        store.receipts_for_session("sess-conflict").unwrap().is_empty(),
+        "failed capture_inbox append must roll back the receipts row in the same transaction"
+    );
+
+    // Clean session commits both `receipts` and `capture_inbox` together.
+    let mut ok_body = serde_json::Map::new();
+    ok_body.insert("kind".into(), json!("pre"));
+    ok_body.insert("tool".into(), json!("Bash"));
+    ok_body.insert("input_sha256".into(), json!("cafebabe"));
+    let (rec, durable) = store.append_receipt_with_inbox("sess-ok", "claude", ok_body).unwrap();
+    assert_eq!(rec.seq, 1);
+    assert!(!durable.replayed);
+    assert_eq!(store.receipts_for_session("sess-ok").unwrap().len(), 1);
+    assert!(store
+        .get_operation_binding("receipt:claude:sess-ok:1")
+        .unwrap()
+        .is_some());
+
+    std::fs::remove_dir_all(&dir).ok();
+}

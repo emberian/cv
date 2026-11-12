@@ -788,7 +788,7 @@ impl StateStore {
         &self,
         session_id: &str,
         harness: &str,
-        mut body: Map<String, Value>,
+        body: Map<String, Value>,
     ) -> Result<ReceiptRecord, StateError> {
         if session_id.trim().is_empty() {
             return Err(StateError::InvalidArgument(
@@ -797,85 +797,57 @@ impl StateStore {
         }
         let mut conn = self.open_writable()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let rec = insert_receipt_in_tx(&tx, session_id, harness, body)?;
+        tx.commit()?;
+        Ok(rec)
+    }
 
-        let prev_row: Option<(i64, String)> = tx
+    /// Atomically commit both a hash-chained `receipts` row and its `capture_inbox` /
+    /// `operation_bindings` record inside a single `BEGIN IMMEDIATE` SQLite transaction.
+    ///
+    /// If either write fails (for example an `OperationConflict` or SQLite error), the entire
+    /// transaction rolls back so `receipts` and `capture_inbox` can never diverge on crash/error.
+    pub fn append_receipt_with_inbox(
+        &self,
+        session_id: &str,
+        harness: &str,
+        body: Map<String, Value>,
+    ) -> Result<(ReceiptRecord, super::DurableReceipt), StateError> {
+        if session_id.trim().is_empty() {
+            return Err(StateError::InvalidArgument(
+                "receipt session_id must not be empty".into(),
+            ));
+        }
+        let mut conn = self.open_writable()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let rec = insert_receipt_in_tx(&tx, session_id, harness, body)?;
+        let op_id = format!("receipt:{}:{}:{}", harness, rec.session_id, rec.seq);
+        let envelope = json!({
+            "kind": "tool_receipt",
+            "session_id": rec.session_id,
+            "harness": rec.harness,
+            "seq": rec.seq,
+            "tool_use_id": rec.tool_use_id,
+            "tool_name": rec.tool_name,
+            "receipt_kind": rec.kind,
+            "digest_sha256": rec.digest_sha256,
+            "prev_hash": rec.prev_hash,
+            "receipt_hash": rec.receipt_hash,
+        });
+        let req = super::AppendRequest::new(op_id, rec.receipt_hash.clone(), envelope);
+        let producer = self.default_producer.as_str();
+        let mut serverless_epoch = tx
             .query_row(
-                "SELECT seq, receipt_hash FROM receipts
-                 WHERE session_id = ?1
-                 ORDER BY seq DESC LIMIT 1",
-                [session_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                "SELECT epoch FROM writer_epochs
+                 WHERE producer_id = ?1 AND mode = 'serverless' AND closed_at IS NULL
+                 ORDER BY activated_at DESC, epoch DESC LIMIT 1",
+                [producer],
+                |r| r.get(0),
             )
             .optional()?;
-
-        let (seq, prev_hash) = match prev_row {
-            Some((last_seq, last_hash)) => ((last_seq + 1) as u64, last_hash),
-            None => (1u64, String::new()),
-        };
-
-        let ts = body
-            .get("ts")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
-        body.entry("v").or_insert_with(|| json!(1));
-        body.insert("session".into(), json!(session_id));
-        body.insert("ts".into(), json!(ts));
-        body.insert("prev".into(), json!(prev_hash));
-
-        let kind = body.get("kind").and_then(Value::as_str).unwrap_or("pre").to_string();
-        let agent_id = body.get("agent").and_then(Value::as_str).map(str::to_string);
-        let tool_use_id = body.get("tool_use_id").and_then(Value::as_str).map(str::to_string);
-        let tool_name = body.get("tool").and_then(Value::as_str).unwrap_or("").to_string();
-        let digest_sha256 = body
-            .get("input_sha256")
-            .or_else(|| body.get("response_sha256"))
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-
-        let unsigned = Value::Object(body.clone());
-        let receipt_hash = compute_receipt_hash(&prev_hash, &unsigned);
-        body.insert("h".into(), json!(receipt_hash));
-        let full_body = Value::Object(body);
-        let body_json = serde_json::to_string(&full_body)?;
-
-        tx.execute(
-            "INSERT INTO receipts(
-                 session_id, seq, ts, harness, agent_id, tool_use_id, tool_name,
-                 kind, digest_sha256, prev_hash, receipt_hash, body_json
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-            rusqlite::params![
-                session_id,
-                seq as i64,
-                ts,
-                harness,
-                agent_id,
-                tool_use_id,
-                tool_name,
-                kind,
-                digest_sha256,
-                prev_hash,
-                receipt_hash,
-                body_json,
-            ],
-        )?;
+        let durable = super::recorder::commit_append_in_tx(&tx, producer, &mut serverless_epoch, "serverless", &req)?;
         tx.commit()?;
-
-        Ok(ReceiptRecord {
-            session_id: session_id.to_string(),
-            seq,
-            ts,
-            harness: harness.to_string(),
-            agent_id,
-            tool_use_id,
-            tool_name,
-            kind,
-            digest_sha256,
-            prev_hash,
-            receipt_hash,
-            body: full_body,
-        })
+        Ok((rec, durable))
     }
 
     /// Return all receipts recorded for `session_id` in chain order (`seq = 1..=N`).
@@ -1200,4 +1172,89 @@ pub fn is_lane_run_alive(run: &LaneRun) -> bool {
         let _ = pid;
         false
     }
+}
+
+fn insert_receipt_in_tx(
+    tx: &rusqlite::Connection,
+    session_id: &str,
+    harness: &str,
+    mut body: Map<String, Value>,
+) -> Result<ReceiptRecord, StateError> {
+    let prev_row: Option<(i64, String)> = tx
+        .query_row(
+            "SELECT seq, receipt_hash FROM receipts
+             WHERE session_id = ?1
+             ORDER BY seq DESC LIMIT 1",
+            [session_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+
+    let (seq, prev_hash) = match prev_row {
+        Some((last_seq, last_hash)) => ((last_seq + 1) as u64, last_hash),
+        None => (1u64, String::new()),
+    };
+
+    let ts = body
+        .get("ts")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+    body.entry("v").or_insert_with(|| json!(1));
+    body.insert("session".into(), json!(session_id));
+    body.insert("ts".into(), json!(ts));
+    body.insert("prev".into(), json!(prev_hash));
+
+    let kind = body.get("kind").and_then(Value::as_str).unwrap_or("pre").to_string();
+    let agent_id = body.get("agent").and_then(Value::as_str).map(str::to_string);
+    let tool_use_id = body.get("tool_use_id").and_then(Value::as_str).map(str::to_string);
+    let tool_name = body.get("tool").and_then(Value::as_str).unwrap_or("").to_string();
+    let digest_sha256 = body
+        .get("input_sha256")
+        .or_else(|| body.get("response_sha256"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+
+    let unsigned = Value::Object(body.clone());
+    let receipt_hash = compute_receipt_hash(&prev_hash, &unsigned);
+    body.insert("h".into(), json!(receipt_hash));
+    let full_body = Value::Object(body);
+    let body_json = serde_json::to_string(&full_body)?;
+
+    tx.execute(
+        "INSERT INTO receipts(
+             session_id, seq, ts, harness, agent_id, tool_use_id, tool_name,
+             kind, digest_sha256, prev_hash, receipt_hash, body_json
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        rusqlite::params![
+            session_id,
+            seq as i64,
+            ts,
+            harness,
+            agent_id,
+            tool_use_id,
+            tool_name,
+            kind,
+            digest_sha256,
+            prev_hash,
+            receipt_hash,
+            body_json,
+        ],
+    )?;
+
+    Ok(ReceiptRecord {
+        session_id: session_id.to_string(),
+        seq,
+        ts,
+        harness: harness.to_string(),
+        agent_id,
+        tool_use_id,
+        tool_name,
+        kind,
+        digest_sha256,
+        prev_hash,
+        receipt_hash,
+        body: full_body,
+    })
 }

@@ -1506,6 +1506,64 @@ fn expand_sessions(
     Ok(order.into_iter().filter_map(|id| chosen.remove(&id)).collect())
 }
 
+fn acquire_trigram_writer_lock(dir: &Path) -> Result<std::fs::File> {
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let lock_path = dir.join(".trigram-writer.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("opening {}", lock_path.display()))?;
+    file.lock()
+        .with_context(|| format!("locking {}", lock_path.display()))?;
+    Ok(file)
+}
+
+fn is_not_found_err(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|ioe| ioe.kind() == std::io::ErrorKind::NotFound)
+    })
+}
+
+/// Stat-only probe answering whether `sync_all` at `dir` has work to do:
+/// - `None` when `manifest.json` does not exist or cannot be read;
+/// - `Some(true)` when the corpus moved (new, modified, vanished, or missing folded subagents);
+/// - `Some(false)` when every session in the corpus matches `manifest.json`.
+pub fn pass_needed(dir: &Path, subagents: bool) -> Option<bool> {
+    let _sources = cv_core::source::read_scope();
+    let manifest = Manifest::load(dir).ok()??;
+    if subagents && !manifest.has_subagents {
+        return Some(true);
+    }
+    let refs = cv_core::sessions();
+    let candidates = expand_sessions(&refs, subagents).ok()?;
+    let mut probe = cv_core::source::Probe::default();
+    let mut seen_ids = HashSet::with_capacity(candidates.len());
+    for (r, _) in candidates {
+        seen_ids.insert(r.id.clone());
+        let is_fresh = manifest.sessions.get(&r.id).is_some_and(|ptr| {
+            let now = probe.snapshot(&r);
+            ptr.path == r.path
+                && (ptr.baseline.fresh(&now, &mut probe) || ptr.baseline.rows_fresh(&r, &now, &mut probe))
+        });
+        if !is_fresh {
+            return Some(true);
+        }
+    }
+    if manifest
+        .sessions
+        .iter()
+        .any(|(id, ptr)| !seen_ids.contains(id) && (subagents || !ptr.folded))
+    {
+        return Some(true);
+    }
+    Some(false)
+}
+
 /// Discover all sessions and synchronize the trigram index at `dir`.
 pub fn sync_all(
     dir: &Path,
@@ -1538,13 +1596,16 @@ pub fn sync_sessions(
     subagents: bool,
 ) -> Result<TrigramSynced> {
     let _sources = cv_core::source::read_scope();
-    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let _writer_lock = acquire_trigram_writer_lock(dir)?;
 
+    let mut prior_rebuild_files = Vec::new();
     let mut manifest = if rebuild {
         if let Ok(entries) = std::fs::read_dir(dir) {
             for e in entries.flatten() {
                 if e.path().extension().is_some_and(|ext| ext == "trg") {
-                    let _ = std::fs::remove_file(e.path());
+                    if let Some(name) = e.file_name().to_str() {
+                        prior_rebuild_files.push(name.to_string());
+                    }
                 }
             }
         }
@@ -1678,10 +1739,17 @@ pub fn sync_sessions(
     manifest.segments = kept_segments;
     manifest.has_subagents = subagents || manifest.sessions.values().any(|p| p.folded);
 
-    let compacted = maybe_compact_segments(dir, &mut manifest)?;
+    let (compacted, compacted_old_files) = maybe_compact_segments(dir, &mut manifest)?;
     manifest.save_atomic(dir)?;
-    for f in dropped_files {
-        let _ = std::fs::remove_file(dir.join(f));
+    let active_files: HashSet<&str> = manifest.segments.iter().map(|s| s.file.as_str()).collect();
+    for f in prior_rebuild_files
+        .into_iter()
+        .chain(dropped_files)
+        .chain(compacted_old_files)
+    {
+        if !active_files.contains(f.as_str()) {
+            let _ = std::fs::remove_file(dir.join(f));
+        }
     }
 
     Ok(TrigramSynced {
@@ -1694,11 +1762,11 @@ pub fn sync_sessions(
     })
 }
 
-fn maybe_compact_segments(dir: &Path, manifest: &mut Manifest) -> Result<bool> {
+fn maybe_compact_segments(dir: &Path, manifest: &mut Manifest) -> Result<(bool, Vec<String>)> {
     let total_rows: usize = manifest.segments.iter().map(|s| s.num_sessions as usize).sum();
     let dead_rows: usize = manifest.segments.iter().map(|s| s.deleted_ords.len()).sum();
     if manifest.segments.len() <= 1 || total_rows == 0 || dead_rows * 2 <= total_rows {
-        return Ok(false);
+        return Ok((false, Vec::new()));
     }
 
     // Re-extract live sessions of fragmented segments (> 50% dead overall).
@@ -1751,7 +1819,7 @@ fn maybe_compact_segments(dir: &Path, manifest: &mut Manifest) -> Result<bool> {
 
     manifest.segments = surviving_segments;
     if live_docs.is_empty() && old_files.is_empty() {
-        return Ok(false);
+        return Ok((false, Vec::new()));
     }
     if !live_docs.is_empty() {
         let mut docs = Vec::with_capacity(live_docs.len());
@@ -1789,10 +1857,7 @@ fn maybe_compact_segments(dir: &Path, manifest: &mut Manifest) -> Result<bool> {
             );
         }
     }
-    for f in old_files {
-        let _ = std::fs::remove_file(dir.join(f));
-    }
-    Ok(true)
+    Ok((true, old_files))
 }
 
 // ---- Query Execution (Indexed Segments + Live Unindexed Tail) --------------------------------
@@ -1814,7 +1879,13 @@ pub fn search(
     allowed_ids: Option<&HashSet<String>>,
 ) -> Result<TrigramFound> {
     let _sources = cv_core::source::read_scope();
-    let manifest = Manifest::load(dir)?;
+    let mut manifest = Manifest::load(dir)?;
+    if manifest.is_none() && opts.live == LiveRead::Frozen {
+        anyhow::bail!(
+            "no trigram index at {}; build it with `cv index --exact`",
+            dir.display()
+        );
+    }
     let mut suffix = Suffix {
         live: opts.live,
         no_index: manifest.is_none(),
@@ -2037,76 +2108,95 @@ pub fn search(
         }
     }
 
-    // 3. Query immutable segments and verify candidate revisions.
-    if let Some(ref manifest) = manifest {
-        for seg_entry in &manifest.segments {
-            let reader = SegmentReader::open(&dir.join(&seg_entry.file))?;
-            let deleted_slots = seg_entry.deleted_slot_bitmap();
-            let slots = reader.query_slots(&cq, &deleted_slots)?;
-            if slots.is_empty() {
-                continue;
+    // 3. Query immutable segments and verify candidate revisions (retrying once if a concurrent
+    //    compactor swapped `manifest.json` and unlinked an older `.trg` segment mid-scan).
+    let live_hits_len = hits.len();
+    let live_verified_docs = verified_docs;
+    for attempt in 0..2 {
+        let seg_res = (|| -> Result<()> {
+            if let Some(ref mf) = manifest {
+                for seg_entry in &mf.segments {
+                    let reader = SegmentReader::open(&dir.join(&seg_entry.file))?;
+                    let deleted_slots = seg_entry.deleted_slot_bitmap();
+                    let slots = reader.query_slots(&cq, &deleted_slots)?;
+                    if slots.is_empty() {
+                        continue;
+                    }
+                    for ord in 0..reader.num_sessions {
+                        let matches_scope = match opts.filter.scope {
+                            Scope::Exchange => slots.contains(ord * 2),
+                            Scope::Context => slots.contains(ord * 2 + 1),
+                            Scope::All => slots.contains(ord * 2) || slots.contains(ord * 2 + 1),
+                        };
+                        if !matches_scope {
+                            continue;
+                        }
+                        let meta = &reader.metas[ord as usize];
+                        if stale_ids.contains(&meta.id) {
+                            continue;
+                        }
+                        if let Some(h) = harness_filter {
+                            if meta.harness != h {
+                                continue;
+                            }
+                        }
+                        if let Some(cwd_sub) = opts.filter.cwd {
+                            if !meta.cwd.as_deref().is_some_and(|c| c.contains(cwd_sub)) {
+                                continue;
+                            }
+                        }
+                        if let Some(ids) = allowed_ids {
+                            let admitted =
+                                ids.contains(&meta.id) || meta.parent_id.as_ref().is_some_and(|p| ids.contains(p));
+                            if !admitted {
+                                continue;
+                            }
+                        }
+                        candidate_docs += 1;
+                        let Some(doc_ref) = meta.to_session_ref() else {
+                            continue;
+                        };
+                        verified_docs += 1;
+                        if let Ok(Some(m)) = verify_session_exact(
+                            &doc_ref,
+                            Some(&meta.title),
+                            None,
+                            Some(&meta.baseline),
+                            query,
+                            opts.filter.scope,
+                            opts.case_sensitive,
+                            None,
+                            &mut probe,
+                        ) {
+                            hits.push(Hit {
+                                id: meta.id.clone(),
+                                harness: meta.harness.clone(),
+                                cwd: meta.cwd.clone(),
+                                title: Some(m.title),
+                                score: 1.0,
+                                snippet: m.snippet,
+                                created_at: meta.created_at,
+                                updated_at: meta.updated_at,
+                                parent_id: meta.parent_id.clone(),
+                                agent_id: meta.agent_id.clone(),
+                                workflow: meta.workflow.clone(),
+                                session: None,
+                            });
+                        }
+                    }
+                }
             }
-            for ord in 0..reader.num_sessions {
-                let matches_scope = match opts.filter.scope {
-                    Scope::Exchange => slots.contains(ord * 2),
-                    Scope::Context => slots.contains(ord * 2 + 1),
-                    Scope::All => slots.contains(ord * 2) || slots.contains(ord * 2 + 1),
-                };
-                if !matches_scope {
-                    continue;
-                }
-                let meta = &reader.metas[ord as usize];
-                if stale_ids.contains(&meta.id) {
-                    continue;
-                }
-                if let Some(h) = harness_filter {
-                    if meta.harness != h {
-                        continue;
-                    }
-                }
-                if let Some(cwd_sub) = opts.filter.cwd {
-                    if !meta.cwd.as_deref().is_some_and(|c| c.contains(cwd_sub)) {
-                        continue;
-                    }
-                }
-                if let Some(ids) = allowed_ids {
-                    let admitted = ids.contains(&meta.id) || meta.parent_id.as_ref().is_some_and(|p| ids.contains(p));
-                    if !admitted {
-                        continue;
-                    }
-                }
-                candidate_docs += 1;
-                let Some(doc_ref) = meta.to_session_ref() else {
-                    continue;
-                };
-                verified_docs += 1;
-                if let Ok(Some(m)) = verify_session_exact(
-                    &doc_ref,
-                    Some(&meta.title),
-                    None,
-                    Some(&meta.baseline),
-                    query,
-                    opts.filter.scope,
-                    opts.case_sensitive,
-                    None,
-                    &mut probe,
-                ) {
-                    hits.push(Hit {
-                        id: meta.id.clone(),
-                        harness: meta.harness.clone(),
-                        cwd: meta.cwd.clone(),
-                        title: Some(m.title),
-                        score: 1.0,
-                        snippet: m.snippet,
-                        created_at: meta.created_at,
-                        updated_at: meta.updated_at,
-                        parent_id: meta.parent_id.clone(),
-                        agent_id: meta.agent_id.clone(),
-                        workflow: meta.workflow.clone(),
-                        session: None,
-                    });
-                }
+            Ok(())
+        })();
+        match seg_res {
+            Ok(()) => break,
+            Err(err) if attempt == 0 && is_not_found_err(&err) => {
+                hits.truncate(live_hits_len);
+                candidate_docs = 0;
+                verified_docs = live_verified_docs;
+                manifest = Manifest::load(dir)?;
             }
+            Err(err) => return Err(err),
         }
     }
 
@@ -3012,5 +3102,80 @@ mod tests {
         assert_eq!(appended_res.hits.len(), 1);
         assert_eq!(appended_res.hits[0].id, "cwd-target");
         assert_eq!(appended_res.hits[0].cwd.as_deref(), Some("/repo/target-only"));
+    }
+
+    #[test]
+    fn frozen_trigram_search_without_manifest_bails_and_concurrent_writers_serialize() {
+        let tmp = ScratchDir::new();
+        let empty_idx = tmp.path().join("unbuilt-trigram");
+        let sessions_dir = tmp.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let r1 = write_claude_jsonl(
+            &sessions_dir.join("s1.jsonl"),
+            "s1",
+            "/repo/frozen",
+            &[json!({
+                "type": "user",
+                "sessionId": "s1",
+                "cwd": "/repo/frozen",
+                "uuid": "u1",
+                "message": { "role": "user", "content": "FrozenNeedle::alpha" }
+            })],
+        );
+        let r2 = write_claude_jsonl(
+            &sessions_dir.join("s2.jsonl"),
+            "s2",
+            "/repo/frozen",
+            &[json!({
+                "type": "user",
+                "sessionId": "s2",
+                "cwd": "/repo/frozen",
+                "uuid": "u2",
+                "message": { "role": "user", "content": "FrozenNeedle::beta" }
+            })],
+        );
+
+        let err = search(
+            &empty_idx,
+            "FrozenNeedle",
+            TrigramOptions {
+                live: LiveRead::Frozen,
+                ..Default::default()
+            },
+            std::slice::from_ref(&r1),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("cv index --exact"),
+            "frozen search without manifest must fail naming `cv index --exact`, got: {err:#}"
+        );
+
+        // Concurrent `sync_sessions` writers on the same directory serialize via `.trigram-writer.lock`.
+        let shared_idx = tmp.path().join("shared-trigram");
+        let all_refs = vec![r1, r2];
+        std::thread::scope(|s| {
+            let idx_a = &shared_idx;
+            let refs_a = &all_refs;
+            let h1 = s.spawn(move || sync_sessions(idx_a, refs_a, false, false).unwrap());
+            let h2 = s.spawn(move || sync_sessions(idx_a, refs_a, false, false).unwrap());
+            h1.join().unwrap();
+            h2.join().unwrap();
+        });
+
+        let res = search(
+            &shared_idx,
+            "FrozenNeedle::",
+            TrigramOptions {
+                live: LiveRead::Frozen,
+                case_sensitive: true,
+                ..Default::default()
+            },
+            &all_refs,
+            None,
+        )
+        .unwrap();
+        assert_eq!(res.hits.len(), 2);
     }
 }

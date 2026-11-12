@@ -140,20 +140,6 @@ fn looks_like_opensession(name: &str, text: &str) -> bool {
             .is_some_and(|head| head.contains("\"open_session\"") || head.contains("\"openSession\""))
 }
 
-fn is_antigravity_brain_member(name: &str) -> bool {
-    let parts: Vec<&str> = name.split(['/', '\\']).filter(|s| !s.is_empty()).collect();
-    let Some(base) = parts.last().copied() else {
-        return false;
-    };
-    let ranked = matches!(base, "transcript_full.jsonl" | "transcript.jsonl" | "overview.txt");
-    ranked
-        && parts
-            .iter()
-            .position(|&seg| seg == "brain")
-            .and_then(|pos| parts.get(pos + 1))
-            .is_some_and(|uuid| !uuid.is_empty())
-}
-
 fn parse_distill_options(opts_json: Option<&str>) -> Result<DistillOptions, String> {
     let mut opts = DistillOptions::default();
     let Some(raw) = opts_json.map(str::trim).filter(|s| !s.is_empty()) else {
@@ -243,8 +229,9 @@ impl WasmStore {
             .map_err(|e| format!("zip: {e:#}"))?;
         let mut summaries = Vec::new();
         let mut skipped: Vec<SkippedEntry> = Vec::new();
-        let mut agy_batch: Vec<(String, Vec<u8>)> = Vec::new();
-        let mut agy_sizes: u64 = 0;
+        let mut deferred_opensessions: Vec<(String, u64, Session)> = Vec::new();
+        let mut pending: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut pending_sizes: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
 
         for (name, raw) in files {
             let size = raw.len() as u64;
@@ -255,22 +242,10 @@ impl WasmStore {
                 });
                 continue;
             }
-            if raw.contains(&0) && std::str::from_utf8(&raw).is_err() {
-                skipped.push(SkippedEntry {
-                    path: name,
-                    reason: "binary file".into(),
-                });
-                continue;
-            }
-            if is_antigravity_brain_member(&name) {
-                agy_sizes = agy_sizes.saturating_add(size);
-                agy_batch.push((name, raw));
-                continue;
-            }
             if let Ok(text) = std::str::from_utf8(&raw) {
                 if looks_like_opensession(&name, text) {
                     match cv_core::harness::opensession::from_str(text) {
-                        Ok(session) => summaries.push(self.upsert(session, Some(&name), Some(size))),
+                        Ok(session) => deferred_opensessions.push((name, size, session)),
                         Err(err) => skipped.push(SkippedEntry {
                             path: name,
                             reason: format!("{err:#}"),
@@ -279,42 +254,27 @@ impl WasmStore {
                     continue;
                 }
             }
-            match cv_core::ingest::ingest_files(vec![(name.clone(), raw)]) {
-                Ok(parsed) if parsed.is_empty() => {
-                    skipped.push(SkippedEntry {
-                        path: name,
-                        reason: "unrecognized transcript format".into(),
-                    });
-                }
-                Ok(parsed) => {
-                    for session in parsed {
-                        summaries.push(self.upsert(session, Some(&name), Some(size)));
-                    }
-                }
-                Err(err) => {
-                    skipped.push(SkippedEntry {
-                        path: name,
-                        reason: format!("{err:#}"),
-                    });
-                }
+            pending_sizes.insert(name.clone(), size);
+            pending.push((name, raw));
+        }
+
+        if !pending.is_empty() {
+            let report = cv_core::ingest::ingest_files_with_report(pending).map_err(|e| format!("ingest: {e:#}"))?;
+            for session in report.sessions {
+                let src_name = session.source_path.as_ref().map(|p| p.to_string_lossy().into_owned());
+                let size = src_name.as_deref().and_then(|n| pending_sizes.get(n).copied());
+                summaries.push(self.upsert(session, src_name.as_deref(), size));
+            }
+            for s in report.skipped {
+                skipped.push(SkippedEntry {
+                    path: s.path,
+                    reason: s.reason,
+                });
             }
         }
 
-        if !agy_batch.is_empty() {
-            match cv_core::ingest::ingest_files(agy_batch) {
-                Ok(parsed) => {
-                    let per_size = (!parsed.is_empty()).then(|| agy_sizes / parsed.len() as u64);
-                    for session in parsed {
-                        summaries.push(self.upsert(session, None, per_size));
-                    }
-                }
-                Err(err) => {
-                    skipped.push(SkippedEntry {
-                        path: "brain/*".into(),
-                        reason: format!("{err:#}"),
-                    });
-                }
-            }
+        for (name, size, session) in deferred_opensessions {
+            summaries.push(self.upsert(session, Some(&name), Some(size)));
         }
 
         Ok(json!({
@@ -647,5 +607,50 @@ mod tests {
         let raw_after = store.messages_inner("claude", "abc", 0, Some(1)).unwrap();
         let after_text = raw_after["messages"][0]["content"][0]["text"].as_str().unwrap();
         assert!(!after_text.contains("alice@example.com"), "{after_text}");
+    }
+
+    /// Wrap `payload` in an RFC 8878 single-segment uncompressed Zstandard frame (`0xFD2FB528`
+    /// magic + 4-byte FCS + 3-byte `Raw_Block` header). Contains both non-UTF-8 magic bytes and
+    /// `0x00` FCS bytes so a naive NUL-byte binary filter would falsely reject it.
+    fn wrap_raw_zstd_frame(payload: &[u8]) -> Vec<u8> {
+        let len = payload.len() as u32;
+        assert!(len < (1 << 21));
+        let mut out = Vec::with_capacity(11 + payload.len());
+        out.extend_from_slice(&0xFD2F_B528u32.to_le_bytes());
+        out.push(0xA0); // Single_Segment_Flag = 1, FCS_Field_Size = 2 (4 bytes)
+        out.extend_from_slice(&len.to_le_bytes());
+        let block_hdr = (len << 3) | 0x01; // Last_Block = 1, Block_Type = 0 (Raw_Block)
+        out.extend_from_slice(&block_hdr.to_le_bytes()[..3]);
+        out.extend_from_slice(payload);
+        assert!(out.contains(&0) && std::str::from_utf8(&out).is_err());
+        out
+    }
+
+    #[test]
+    fn wasm_store_batches_multi_file_cline_dirs_and_decodes_zst_transcripts() {
+        let zst_claude = wrap_raw_zstd_frame(CLAUDE_SAMPLE.as_bytes());
+        let cline_hist =
+            br#"[{"role":"user","content":"fix batch zip"},{"role":"assistant","content":"batched cleanly"}]"#;
+        let cline_meta = br#"{"files_in_context":[]}"#;
+
+        let archive = make_zip(&[
+            ("compressed-claude.jsonl.zst", &zst_claude),
+            ("tasks/cline-42/api_conversation_history.json", cline_hist),
+            ("tasks/cline-42/task_metadata.json", cline_meta),
+        ]);
+
+        let mut store = WasmStore::new();
+        let report = store.ingest_zip_inner(&archive).unwrap();
+        let stubs = report["sessions"].as_array().unwrap();
+        let skipped = report["skipped"].as_array().unwrap();
+        assert!(
+            skipped.is_empty(),
+            "companion metadata and .zst must not skip: {skipped:?}"
+        );
+        assert_eq!(stubs.len(), 2, "{stubs:?}");
+        assert!(stubs
+            .iter()
+            .any(|s| s["harness"] == "claude" && s["id"] == "compressed-claude"));
+        assert!(stubs.iter().any(|s| s["harness"] == "cline" && s["id"] == "cline-42"));
     }
 }

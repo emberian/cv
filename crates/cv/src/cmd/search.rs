@@ -86,20 +86,22 @@ pub(crate) fn cmd_search(args: SearchArgs<'_>) -> Result<()> {
     } else {
         cv_search::Searcher.search_allowed(query, filter, allowed_ids.as_ref(), limit, source, live_bytes)
     };
-    let found = match result {
-        Ok(found) => found,
-        Err(e) => {
-            return match source {
+    let found =
+        match result {
+            Ok(found) => found,
+            Err(e) => return match source {
                 Source::Index if cv_search::is_invalid_text_query(&e) || e.is::<cv_search::BadLiveBytes>() => {
                     crate::util::usage(format!("{e:#}"))
                 }
+                Source::Index if exact => Err(e.context(
+                    "exact substring search needs a usable trigram index (build or refresh with `cv index --exact`)",
+                )),
                 Source::Index => Err(e.context(
                     "full-text search needs a usable index (or pass --scan for a slow live scan of every session)",
                 )),
                 Source::Live => Err(e),
-            }
-        }
-    };
+            },
+        };
     render(found, query, json)
 }
 
@@ -258,21 +260,19 @@ pub(crate) fn cmd_index(
     exact: bool,
 ) -> Result<()> {
     let dir = cv_search::default_tantivy_dir();
-    if exact {
-        let (synced, _) = cv_search::trigram::sync_all(&cv_search::default_trigram_dir(), rebuild, subagents, strict)?;
-        eprintln!(
-            "trigram: {} indexed, {} unchanged, {} unreadable",
-            synced.indexed,
-            synced.unchanged,
-            synced.unreadable.len()
-        );
-    }
-    if if_changed {
+    let trigram_dir = cv_search::default_trigram_dir();
+    let mut trigram_need = Some(true);
+    if if_changed && !rebuild {
         // The timer gate: a stat-only probe (catalog inventory + one stat per session + the
         // index's own stamps) answers whether a pass would find work at all.
-        match cv_search::fts::pass_needed(&dir, subagents) {
-            Some(true) => eprintln!("  ↳ corpus moved since the last pass — indexing"),
-            Some(false) => {
+        let fts_need = cv_search::fts::pass_needed(&dir, subagents);
+        trigram_need = if exact {
+            cv_search::trigram::pass_needed(&trigram_dir, subagents)
+        } else {
+            Some(false)
+        };
+        match (fts_need, trigram_need) {
+            (Some(false), Some(false)) => {
                 if json {
                     let indexed = cv_search::fts::indexed_top_level_count(&dir).unwrap_or(0);
                     let out = serde_json::json!({
@@ -289,8 +289,18 @@ pub(crate) fn cmd_index(
                 }
                 return Ok(());
             }
-            None => eprintln!("  ↳ index unreadable — running the pass"),
+            (None, _) | (_, None) => eprintln!("  ↳ index unreadable — running the pass"),
+            _ => eprintln!("  ↳ corpus moved since the last pass — indexing"),
         }
+    }
+    if exact && (!if_changed || rebuild || trigram_need != Some(false)) {
+        let (synced, _) = cv_search::trigram::sync_all(&trigram_dir, rebuild, subagents, strict)?;
+        eprintln!(
+            "trigram: {} indexed, {} unchanged, {} unreadable",
+            synced.indexed,
+            synced.unchanged,
+            synced.unreadable.len()
+        );
     }
 
     eprintln!(

@@ -381,20 +381,27 @@ class CvForest extends HTMLElement {
    *  Prefers the dedicated `/compactions` scan (complete coverage, paired summary text + span);
    *  falls back to scanning the loaded window's messages when the endpoint is unavailable. */
   _resolveCompactions() {
+    const fin = (v, fallback = null) => {
+      if (v == null || v === "" || typeof v === "boolean") return fallback;
+      const num = typeof v === "number" ? v : Number(v);
+      return Number.isFinite(num) ? num : fallback;
+    };
+    const finSpan = (raw) => {
+      if (!Array.isArray(raw) || raw.length < 2) return null;
+      const a = fin(raw[0], null);
+      const b = fin(raw[1], null);
+      return a != null && b != null ? [a, b] : null;
+    };
     if (Array.isArray(this._compactions)) {
       return this._compactions.map((c) => ({
-        index: c.boundary_msg_idx ?? c.index,
-        summaryIndex: c.summary_msg_idx ?? c.summary_index,
+        index: fin(c.boundary_msg_idx ?? c.index, 0),
+        summaryIndex: fin(c.summary_msg_idx ?? c.summary_index, null),
         trigger: c.trigger,
-        preTokens: c.pre_tokens,
-        durationMs: c.duration_ms,
+        preTokens: fin(c.pre_tokens, null),
+        durationMs: fin(c.duration_ms, null),
         summary: c.summary,
         headline: c.headline,
-        preSpan: Array.isArray(c.pre_compaction_span)
-          ? c.pre_compaction_span
-          : Array.isArray(c.pre_span)
-            ? c.pre_span
-            : null,
+        preSpan: finSpan(c.pre_compaction_span) ?? finSpan(c.pre_span),
         _complete: true,
       }));
     }
@@ -415,8 +422,8 @@ class CvForest extends HTMLElement {
         // The summary that seeds the next window is its own message right after the boundary.
         summaryIndex: msgs[i + 1]?.kind === "compaction_summary" ? i + 1 : null,
         trigger: cm.trigger || e.codex_event || null,
-        preTokens: cm.preTokens ?? cm.pre_tokens ?? null,
-        durationMs: cm.durationMs ?? cm.duration_ms ?? null,
+        preTokens: fin(cm.preTokens ?? cm.pre_tokens, null),
+        durationMs: fin(cm.durationMs ?? cm.duration_ms, null),
         summary: null, preSpan: null, _complete: false,
       });
     });
@@ -951,18 +958,18 @@ class CvForest extends HTMLElement {
       const inWindow = c.index < windowN; // can we preview the surrounding messages inline?
       const hasSummary = !!(c.summary && c.summary.trim());
       return `
-        <div class="cz-item" data-idx="${c.index}">
+        <div class="cz-item" data-idx="${esc(String(c.index))}">
           <div class="cz-num">${i + 1}</div>
           <div class="cz-main">
             <div class="cz-row1">
               <span class="cz-trigger">✂ ${esc(trig)} compaction</span>
-              <span class="muted" style="font-size:12px">at message ${c.index.toLocaleString()}</span>
+              <span class="muted" style="font-size:12px">at message ${esc(c.index.toLocaleString())}</span>
               ${span ? `<span class="muted" style="font-size:12px">· compacted away msgs ${esc(span)}</span>` : ""}
             </div>
             <div class="cz-stats">
-              ${pre != null ? `<span><b>${this._kfmt(pre)}</b> tokens of context rebuilt</span>` : ""}
+              ${pre != null ? `<span><b>${esc(this._kfmt(pre))}</b> tokens of context rebuilt</span>` : ""}
               ${dur ? `<span>took <b>${esc(dur)}</b></span>` : ""}
-              ${c.summaryIndex != null ? `<span>summary seeded at msg ${c.summaryIndex.toLocaleString()}</span>` : ""}
+              ${c.summaryIndex != null ? `<span>summary seeded at msg ${esc(c.summaryIndex.toLocaleString())}</span>` : ""}
             </div>
             ${hasSummary ? `
             <details class="cz-summary" style="margin-top:7px">
@@ -971,8 +978,8 @@ class CvForest extends HTMLElement {
             </details>` : ""}
             ${inWindow ? `
             <div class="cz-jump">
-              <button type="button" class="mini-btn" data-jump-pre="${c.index}" title="The messages just before this compaction (pre-compaction context)">↥ before</button>
-              <button type="button" class="mini-btn" data-jump-post="${c.index}" title="The messages just after this compaction (the summary + continuation)">↧ after</button>
+              <button type="button" class="mini-btn" data-jump-pre="${esc(String(c.index))}" title="The messages just before this compaction (pre-compaction context)">↥ before</button>
+              <button type="button" class="mini-btn" data-jump-post="${esc(String(c.index))}" title="The messages just after this compaction (the summary + continuation)">↧ after</button>
             </div>` : ""}
             <div class="cz-detail" hidden></div>
           </div>
@@ -1022,13 +1029,17 @@ class CvForest extends HTMLElement {
 
   // ── small format helpers ─────────────────────────────────────────────────────
   _kfmt(n) {
-    if (n == null) return "—";
-    if (n >= 1e6) return (n / 1e6).toFixed(n >= 1e7 ? 0 : 1) + "M";
-    if (n >= 1e3) return (n / 1e3).toFixed(n >= 1e4 ? 0 : 1) + "k";
-    return String(n);
+    if (n == null || n === "" || typeof n === "boolean") return "—";
+    const v = typeof n === "number" ? n : Number(n);
+    if (!Number.isFinite(v)) return "—";
+    if (v >= 1e6) return (v / 1e6).toFixed(v >= 1e7 ? 0 : 1) + "M";
+    if (v >= 1e3) return (v / 1e3).toFixed(v >= 1e4 ? 0 : 1) + "k";
+    return String(v);
   }
   _dur(ms) {
-    const s = Math.round(ms / 1000);
+    const v = typeof ms === "number" ? ms : Number(ms);
+    if (ms == null || ms === "" || typeof ms === "boolean" || !Number.isFinite(v)) return "";
+    const s = Math.round(v / 1000);
     if (s < 60) return `${s}s`;
     const m = Math.floor(s / 60);
     return `${m}m${s % 60 ? ` ${s % 60}s` : ""}`;

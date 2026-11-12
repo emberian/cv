@@ -588,10 +588,12 @@ export function fmtCost(usd) {
   return `$${usd.toFixed(2)}`;
 }
 
-/** Compact token count: 1234 → 1.2k. */
+/** Compact token count: 1234 → 1.2k. Coerces untrusted input so non-finite strings never pass raw into innerHTML. */
 export function fmtTokens(n) {
-  if (n == null) return "";
-  if (n >= 1e6) return (n / 1e6).toFixed(n >= 1e7 ? 0 : 1) + "M";
-  if (n >= 1e3) return (n / 1e3).toFixed(n >= 1e4 ? 0 : 1) + "k";
-  return String(n);
+  if (n == null || n === "" || typeof n === "boolean") return "";
+  const v = typeof n === "number" ? n : Number(n);
+  if (!Number.isFinite(v)) return "";
+  if (v >= 1e6) return (v / 1e6).toFixed(v >= 1e7 ? 0 : 1) + "M";
+  if (v >= 1e3) return (v / 1e3).toFixed(v >= 1e4 ? 0 : 1) + "k";
+  return String(v);
 }

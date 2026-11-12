@@ -363,6 +363,38 @@ fn is_sqlite_sidecar(name: &str) -> bool {
     lower.ends_with("-wal") || lower.ends_with("-shm") || lower.ends_with("-journal")
 }
 
+const MAX_ZST_DECOMPRESSED_BYTES: u64 = 256 * 1024 * 1024;
+
+fn is_zst_entry(name: &str, bytes: &[u8]) -> bool {
+    name.to_ascii_lowercase().ends_with(".zst")
+        || bytes.get(..4) == Some(&crate::harness::store::zst::ZSTD_FRAME_MAGIC.to_le_bytes())
+}
+
+fn strip_zst_suffix(name: &str) -> String {
+    if name.len() > 4 && name[name.len() - 4..].eq_ignore_ascii_case(".zst") {
+        name[..name.len() - 4].to_string()
+    } else {
+        name.to_string()
+    }
+}
+
+fn decode_zst_entry(name: &str, bytes: &[u8]) -> Result<(String, Vec<u8>), String> {
+    use std::io::Read as _;
+    let reader = crate::harness::store::zst::decoder(std::io::Cursor::new(bytes)).map_err(|e| format!("zstd: {e}"))?;
+    let mut out = Vec::new();
+    reader
+        .take(MAX_ZST_DECOMPRESSED_BYTES + 1)
+        .read_to_end(&mut out)
+        .map_err(|e| format!("zstd: {e}"))?;
+    if out.len() as u64 > MAX_ZST_DECOMPRESSED_BYTES {
+        return Err(format!(
+            "zstd entry {name:?} decoded past {} bytes",
+            MAX_ZST_DECOMPRESSED_BYTES
+        ));
+    }
+    Ok((strip_zst_suffix(name), out))
+}
+
 /// Ingest `(relative_path, bytes)` pairs and return both parsed sessions and structured
 /// diagnostics for skipped entries.
 pub fn ingest_files_with_report(files: Vec<(String, Vec<u8>)>) -> anyhow::Result<IngestReport> {
@@ -371,7 +403,18 @@ pub fn ingest_files_with_report(files: Vec<(String, Vec<u8>)>) -> anyhow::Result
     let mut agy_candidates: std::collections::BTreeMap<String, (u8, usize, String)> = std::collections::BTreeMap::new();
     let mut pending_unknown: Vec<(String, Vec<u8>)> = Vec::new();
 
-    for (idx, (name, bytes)) in files.into_iter().enumerate() {
+    for (idx, (raw_name, raw_bytes)) in files.into_iter().enumerate() {
+        let (name, bytes) = if is_zst_entry(&raw_name, &raw_bytes) {
+            match decode_zst_entry(&raw_name, &raw_bytes) {
+                Ok(decoded) => decoded,
+                Err(reason) => {
+                    skipped.push(SkippedEntry { path: raw_name, reason });
+                    continue;
+                }
+            }
+        } else {
+            (raw_name, raw_bytes)
+        };
         if is_sqlite_bytes(&name, &bytes) || is_sqlite_sidecar(&name) {
             pending_unknown.push((name, bytes));
             continue;

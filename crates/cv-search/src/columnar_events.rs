@@ -841,6 +841,29 @@ impl ClevReader {
 
 // ---- Public Store & Bounded Batch Recorder ---------------------------------------------------
 
+fn acquire_clev_writer_lock(dir: &Path) -> Result<std::fs::File> {
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let lock_path = dir.join(".clev-writer.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("opening {}", lock_path.display()))?;
+    file.lock()
+        .with_context(|| format!("locking {}", lock_path.display()))?;
+    Ok(file)
+}
+
+fn is_not_found_err(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|ioe| ioe.kind() == std::io::ErrorKind::NotFound)
+    })
+}
+
 /// Derived columnar event store managing immutable `.clev` segments and revision visibility masks.
 pub struct ColumnarEventStore {
     dir: PathBuf,
@@ -855,23 +878,41 @@ impl ColumnarEventStore {
         Ok(Self { dir, manifest })
     }
 
+    fn with_manifest_retry<T>(&self, mut f: impl FnMut(&ColumnarManifest) -> Result<T>) -> Result<T> {
+        match f(&self.manifest) {
+            Ok(val) => Ok(val),
+            Err(err) if is_not_found_err(&err) => {
+                let fresh = ColumnarManifest::load(&self.dir)?.unwrap_or_default();
+                f(&fresh)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
     /// Clear all segments and manifest state on a full rebuild.
     pub fn clear(&mut self) -> Result<()> {
         if cv_core::env::frozen() {
             return Ok(());
         }
-        self.manifest = ColumnarManifest::default();
         if !self.dir.exists() {
+            self.manifest = ColumnarManifest::default();
             return Ok(());
         }
+        let _lock = acquire_clev_writer_lock(&self.dir)?;
+        let mut old_files = Vec::new();
         if let Ok(entries) = std::fs::read_dir(&self.dir) {
             for e in entries.flatten() {
                 if e.path().extension().is_some_and(|ext| ext == "clev") {
-                    let _ = std::fs::remove_file(e.path());
+                    old_files.push(e.path());
                 }
             }
         }
-        self.manifest.save_atomic(&self.dir)
+        self.manifest = ColumnarManifest::default();
+        self.manifest.save_atomic(&self.dir)?;
+        for path in old_files {
+            let _ = std::fs::remove_file(path);
+        }
+        Ok(())
     }
 
     /// Whether any live (non-superseded) event rows exist in the store.
@@ -946,10 +987,17 @@ impl ColumnarEventStore {
         if cv_core::env::frozen() {
             return Ok(false);
         }
+        let _lock = acquire_clev_writer_lock(&self.dir)?;
+        if let Some(fresh) = ColumnarManifest::load(&self.dir)? {
+            self.manifest = fresh;
+        }
         let removed = self.mask_session_all(harness, session_id)?;
         if removed {
-            self.prune_fully_dead_segments()?;
+            let dead_files = self.prune_fully_dead_segments()?;
             self.manifest.save_atomic(&self.dir)?;
+            for f in dead_files {
+                let _ = std::fs::remove_file(self.dir.join(f));
+            }
         }
         Ok(removed)
     }
@@ -958,6 +1006,10 @@ impl ColumnarEventStore {
     pub fn remove_sessions_by_id(&mut self, missing_ids: &[String]) -> Result<usize> {
         if cv_core::env::frozen() || missing_ids.is_empty() {
             return Ok(0);
+        }
+        let _lock = acquire_clev_writer_lock(&self.dir)?;
+        if let Some(fresh) = ColumnarManifest::load(&self.dir)? {
+            self.manifest = fresh;
         }
         let missing_set: std::collections::HashSet<&str> = missing_ids.iter().map(String::as_str).collect();
         let targets: Vec<(String, String)> = self
@@ -974,8 +1026,11 @@ impl ColumnarEventStore {
             }
         }
         if count > 0 {
-            self.prune_fully_dead_segments()?;
+            let dead_files = self.prune_fully_dead_segments()?;
             self.manifest.save_atomic(&self.dir)?;
+            for f in dead_files {
+                let _ = std::fs::remove_file(self.dir.join(f));
+            }
         }
         Ok(count)
     }
@@ -995,6 +1050,7 @@ impl ColumnarEventStore {
     pub fn begin_batch(&mut self) -> ColumnarBatch<'_> {
         ColumnarBatch {
             store: self,
+            writer_lock: None,
             staged_rows: Vec::new(),
             pending_session_segs: BTreeMap::new(),
             new_segment_files: Vec::new(),
@@ -1077,6 +1133,17 @@ impl ColumnarEventStore {
     /// Compact fragmented segments (rewriting live `!superseded` rows when dead ratio > 50%, or
     /// unconditionally when `force = true` and any segment has dead rows or multiple segments exist).
     pub fn compact(&mut self, force: bool) -> Result<bool> {
+        if cv_core::env::frozen() {
+            return Ok(false);
+        }
+        let _lock = acquire_clev_writer_lock(&self.dir)?;
+        if let Some(fresh) = ColumnarManifest::load(&self.dir)? {
+            self.manifest = fresh;
+        }
+        self.compact_locked(force)
+    }
+
+    fn compact_locked(&mut self, force: bool) -> Result<bool> {
         let before = self.manifest.clone();
         let result = self.compact_inner(force);
         if result.is_err() {
@@ -1226,52 +1293,53 @@ impl ColumnarEventStore {
     /// optionally filtered by `kind`.
     pub fn events_for(&self, harness: &str, session_id: &str, kind: Option<&str>) -> Result<Vec<EventRow>> {
         let s_key = session_key(harness, session_id);
-        let Some(state) = self.manifest.sessions.get(&s_key) else {
-            return Ok(Vec::new());
-        };
-        let seg_lookup: HashMap<&str, (usize, &SegmentManifestEntry)> = self
-            .manifest
-            .segments
-            .iter()
-            .enumerate()
-            .map(|(i, s)| (s.file.as_str(), (i, s)))
-            .collect();
-
-        let mut collected: Vec<((i64, String, usize, u32), EventRow)> = Vec::new();
-        for seg_file in &state.segments {
-            let Some(&(seg_ord, seg_entry)) = seg_lookup.get(seg_file.as_str()) else {
-                continue;
+        self.with_manifest_retry(|manifest| {
+            let Some(state) = manifest.sessions.get(&s_key) else {
+                return Ok(Vec::new());
             };
-            let reader = ClevReader::open(&self.dir.join(&seg_entry.file))?;
-            let sup = seg_entry.superseded()?;
-            let mut rows = reader.by_session(&s_key)? - &sup;
-            if let Some(k) = kind {
-                rows &= reader.by_kind(k)?;
+            let seg_lookup: HashMap<&str, (usize, &SegmentManifestEntry)> = manifest
+                .segments
+                .iter()
+                .enumerate()
+                .map(|(i, s)| (s.file.as_str(), (i, s)))
+                .collect();
+
+            let mut collected: Vec<((i64, String, usize, u32), EventRow)> = Vec::new();
+            for seg_file in &state.segments {
+                let Some(&(seg_ord, seg_entry)) = seg_lookup.get(seg_file.as_str()) else {
+                    continue;
+                };
+                let reader = ClevReader::open(&self.dir.join(&seg_entry.file))?;
+                let sup = seg_entry.superseded()?;
+                let mut rows = reader.by_session(&s_key)? - &sup;
+                if let Some(k) = kind {
+                    rows &= reader.by_kind(k)?;
+                }
+                for row_id in rows {
+                    let r = reader.materialize_row(row_id)?;
+                    let msg_idx = r.msg_idx as i64;
+                    let row_kind = r.kind.clone();
+                    collected.push((
+                        (msg_idx, row_kind, seg_ord, row_id),
+                        EventRow {
+                            harness: state.harness.clone(),
+                            session_id: state.session_id.clone(),
+                            msg_idx,
+                            ts: r.ts,
+                            kind: r.kind,
+                            tool: r.tool,
+                            target: r.target,
+                            detail: r.detail,
+                            parent_id: state.authority.parent_id.clone(),
+                            agent_id: state.authority.agent_id.clone(),
+                            workflow: state.authority.workflow.clone(),
+                        },
+                    ));
+                }
             }
-            for row_id in rows {
-                let r = reader.materialize_row(row_id)?;
-                let msg_idx = r.msg_idx as i64;
-                let row_kind = r.kind.clone();
-                collected.push((
-                    (msg_idx, row_kind, seg_ord, row_id),
-                    EventRow {
-                        harness: state.harness.clone(),
-                        session_id: state.session_id.clone(),
-                        msg_idx,
-                        ts: r.ts,
-                        kind: r.kind,
-                        tool: r.tool,
-                        target: r.target,
-                        detail: r.detail,
-                        parent_id: state.authority.parent_id.clone(),
-                        agent_id: state.authority.agent_id.clone(),
-                        workflow: state.authority.workflow.clone(),
-                    },
-                ));
-            }
-        }
-        collected.sort_by(|a, b| a.0.cmp(&b.0));
-        Ok(collected.into_iter().map(|(_, row)| row).collect())
+            collected.sort_by(|a, b| a.0.cmp(&b.0));
+            Ok(collected.into_iter().map(|(_, row)| row).collect())
+        })
     }
 
     /// Sessions whose `file_edit` / `file_read` events touched `path` (by lexical absolutization
@@ -1313,72 +1381,74 @@ impl ColumnarEventStore {
             reads: i64,
             last_ts: Option<i64>,
         }
-        let mut grouped: BTreeMap<(String, String), Acc> = BTreeMap::new();
-
-        for seg_entry in &self.manifest.segments {
-            let reader = ClevReader::open(&self.dir.join(&seg_entry.file))?;
-            let ords = reader.matching_target_ords(&[abs], suffix);
-            if ords.is_empty() {
-                continue;
-            }
-            let mut target_bm = RoaringBitmap::new();
-            for ord in ords {
-                target_bm |= reader.by_target_ord(ord)?;
-            }
-            let file_kinds = reader.by_kind("file_edit")? | reader.by_kind("file_read")?;
-            let sup = seg_entry.superseded()?;
-            let matched_rows = (target_bm & file_kinds) - sup;
-            for row_id in matched_rows {
-                let r = reader.materialize_row(row_id)?;
-                let entry = grouped.entry((r.harness, r.session_id)).or_insert(Acc {
-                    edits: 0,
-                    reads: 0,
-                    last_ts: None,
-                });
-                if r.kind == "file_edit" {
-                    entry.edits += 1;
-                } else if r.kind == "file_read" {
-                    entry.reads += 1;
-                }
-                if let Some(ts) = r.ts {
-                    entry.last_ts = Some(entry.last_ts.map_or(ts, |cur| cur.max(ts)));
-                }
-            }
-        }
-
         let cat = self.catalog_session_lookup();
-        let mut out = Vec::with_capacity(grouped.len());
-        for ((harness, session_id), acc) in grouped {
-            if edits_only && acc.edits == 0 {
-                continue;
-            }
-            let s_key = session_key(&harness, &session_id);
-            let state = self.manifest.sessions.get(&s_key);
-            let title = cat
-                .get(&(harness.clone(), session_id.clone()))
-                .and_then(|m| m.title.clone())
-                .or_else(|| state.and_then(|s| s.meta.title.clone()));
-            out.push(TouchedSession {
-                harness,
-                session_id,
-                title,
-                edits: acc.edits,
-                reads: acc.reads,
-                last_ts: acc.last_ts,
-                parent_id: state.and_then(|s| s.authority.parent_id.clone()),
-                agent_id: state.and_then(|s| s.authority.agent_id.clone()),
-                workflow: state.and_then(|s| s.authority.workflow.clone()),
-            });
-        }
+        self.with_manifest_retry(|manifest| {
+            let mut grouped: BTreeMap<(String, String), Acc> = BTreeMap::new();
 
-        // SQLite `ORDER BY last_ts DESC, es.session_id`: `Some` > `None`, descending `last_ts`, tie-break `session_id` ASC.
-        out.sort_by(|a, b| {
-            b.last_ts
-                .cmp(&a.last_ts)
-                .then_with(|| a.session_id.cmp(&b.session_id))
-                .then_with(|| a.harness.cmp(&b.harness))
-        });
-        Ok(out)
+            for seg_entry in &manifest.segments {
+                let reader = ClevReader::open(&self.dir.join(&seg_entry.file))?;
+                let ords = reader.matching_target_ords(&[abs], suffix);
+                if ords.is_empty() {
+                    continue;
+                }
+                let mut target_bm = RoaringBitmap::new();
+                for ord in ords {
+                    target_bm |= reader.by_target_ord(ord)?;
+                }
+                let file_kinds = reader.by_kind("file_edit")? | reader.by_kind("file_read")?;
+                let sup = seg_entry.superseded()?;
+                let matched_rows = (target_bm & file_kinds) - sup;
+                for row_id in matched_rows {
+                    let r = reader.materialize_row(row_id)?;
+                    let entry = grouped.entry((r.harness, r.session_id)).or_insert(Acc {
+                        edits: 0,
+                        reads: 0,
+                        last_ts: None,
+                    });
+                    if r.kind == "file_edit" {
+                        entry.edits += 1;
+                    } else if r.kind == "file_read" {
+                        entry.reads += 1;
+                    }
+                    if let Some(ts) = r.ts {
+                        entry.last_ts = Some(entry.last_ts.map_or(ts, |cur| cur.max(ts)));
+                    }
+                }
+            }
+
+            let mut out = Vec::with_capacity(grouped.len());
+            for ((harness, session_id), acc) in grouped {
+                if edits_only && acc.edits == 0 {
+                    continue;
+                }
+                let s_key = session_key(&harness, &session_id);
+                let state = manifest.sessions.get(&s_key);
+                let title = cat
+                    .get(&(harness.clone(), session_id.clone()))
+                    .and_then(|m| m.title.clone())
+                    .or_else(|| state.and_then(|s| s.meta.title.clone()));
+                out.push(TouchedSession {
+                    harness,
+                    session_id,
+                    title,
+                    edits: acc.edits,
+                    reads: acc.reads,
+                    last_ts: acc.last_ts,
+                    parent_id: state.and_then(|s| s.authority.parent_id.clone()),
+                    agent_id: state.and_then(|s| s.authority.agent_id.clone()),
+                    workflow: state.and_then(|s| s.authority.workflow.clone()),
+                });
+            }
+
+            // SQLite `ORDER BY last_ts DESC, es.session_id`: `Some` > `None`, descending `last_ts`, tie-break `session_id` ASC.
+            out.sort_by(|a, b| {
+                b.last_ts
+                    .cmp(&a.last_ts)
+                    .then_with(|| a.session_id.cmp(&b.session_id))
+                    .then_with(|| a.harness.cmp(&b.harness))
+            });
+            Ok(out)
+        })
     }
 
     /// Every `file_edit` event on `(abs, rel)` in chronological order (`ORDER BY ts, msg_idx`),
@@ -1396,114 +1466,119 @@ impl ColumnarEventStore {
     pub fn edits_with_hunks_touching_file(&self, abs: &str, rel: &str) -> Result<Vec<EditHunkEvent>> {
         let suffix = format!("/{rel}");
         let cat = self.catalog_session_lookup();
-        let mut raw: Vec<(EditSortKey, EditHunkEvent)> = Vec::new();
-
-        for (seg_ord, seg_entry) in self.manifest.segments.iter().enumerate() {
-            let reader = ClevReader::open(&self.dir.join(&seg_entry.file))?;
-            let ords = reader.matching_target_ords(&[abs, rel], Some(&suffix));
-            if ords.is_empty() {
-                continue;
+        self.with_manifest_retry(|manifest| {
+            let mut raw: Vec<(EditSortKey, EditHunkEvent)> = Vec::new();
+            for (seg_ord, seg_entry) in manifest.segments.iter().enumerate() {
+                let reader = ClevReader::open(&self.dir.join(&seg_entry.file))?;
+                let ords = reader.matching_target_ords(&[abs, rel], Some(&suffix));
+                if ords.is_empty() {
+                    continue;
+                }
+                let mut target_bm = RoaringBitmap::new();
+                for ord in ords {
+                    target_bm |= reader.by_target_ord(ord)?;
+                }
+                let edit_rows = (target_bm & reader.by_kind("file_edit")?) - seg_entry.superseded()?;
+                for row_id in edit_rows {
+                    let r = reader.materialize_row(row_id)?;
+                    let item = Self::build_edit_hunk_event(manifest, r, &cat);
+                    let sort_key = (item.edit.ts, item.edit.msg_idx, seg_ord, row_id);
+                    raw.push((sort_key, item));
+                }
             }
-            let mut target_bm = RoaringBitmap::new();
-            for ord in ords {
-                target_bm |= reader.by_target_ord(ord)?;
-            }
-            let edit_rows = (target_bm & reader.by_kind("file_edit")?) - seg_entry.superseded()?;
-            for row_id in edit_rows {
-                let r = reader.materialize_row(row_id)?;
-                let item = self.build_edit_hunk_event(r, &cat);
-                let sort_key = (item.edit.ts, item.edit.msg_idx, seg_ord, row_id);
-                raw.push((sort_key, item));
-            }
-        }
-
-        raw.sort_by_key(|a| a.0);
-        Ok(merge_edit_hunk_events(raw.into_iter().map(|(_, item)| item)))
+            raw.sort_by_key(|a| a.0);
+            Ok(merge_edit_hunk_events(raw.into_iter().map(|(_, item)| item)))
+        })
     }
 
     /// Persisted `(msg_idx, target, hunk_hashes)` rows for `file_edit` events of one session.
     pub fn edit_hunks_for(&self, harness: &str, session_id: &str) -> Result<Vec<SessionEditHunkRow>> {
         let s_key = session_key(harness, session_id);
-        let Some(state) = self.manifest.sessions.get(&s_key) else {
-            return Ok(Vec::new());
-        };
-        let seg_lookup: HashMap<&str, (usize, &SegmentManifestEntry)> = self
-            .manifest
-            .segments
-            .iter()
-            .enumerate()
-            .map(|(i, s)| (s.file.as_str(), (i, s)))
-            .collect();
-
-        let mut rows_out: Vec<((i64, usize, u32), SessionEditHunkRow)> = Vec::new();
-        for seg_file in &state.segments {
-            let Some(&(seg_ord, seg_entry)) = seg_lookup.get(seg_file.as_str()) else {
-                continue;
+        self.with_manifest_retry(|manifest| {
+            let Some(state) = manifest.sessions.get(&s_key) else {
+                return Ok(Vec::new());
             };
-            let reader = ClevReader::open(&self.dir.join(&seg_entry.file))?;
-            let rows = (reader.by_session(&s_key)? & reader.by_kind("file_edit")?) - seg_entry.superseded()?;
-            for row_id in rows {
-                let r = reader.materialize_row(row_id)?;
-                let msg_idx = r.msg_idx as i64;
-                rows_out.push(((msg_idx, seg_ord, row_id), (msg_idx, r.target, r.hunk_hashes)));
+            let seg_lookup: HashMap<&str, (usize, &SegmentManifestEntry)> = manifest
+                .segments
+                .iter()
+                .enumerate()
+                .map(|(i, s)| (s.file.as_str(), (i, s)))
+                .collect();
+
+            let mut rows_out: Vec<((i64, usize, u32), SessionEditHunkRow)> = Vec::new();
+            for seg_file in &state.segments {
+                let Some(&(seg_ord, seg_entry)) = seg_lookup.get(seg_file.as_str()) else {
+                    continue;
+                };
+                let reader = ClevReader::open(&self.dir.join(&seg_entry.file))?;
+                let rows = (reader.by_session(&s_key)? & reader.by_kind("file_edit")?) - seg_entry.superseded()?;
+                for row_id in rows {
+                    let r = reader.materialize_row(row_id)?;
+                    let msg_idx = r.msg_idx as i64;
+                    rows_out.push(((msg_idx, seg_ord, row_id), (msg_idx, r.target, r.hunk_hashes)));
+                }
             }
-        }
-        rows_out.sort_by_key(|a| a.0);
-        Ok(rows_out.into_iter().map(|(_, item)| item).collect())
+            rows_out.sort_by_key(|a| a.0);
+            Ok(rows_out.into_iter().map(|(_, item)| item).collect())
+        })
     }
 
     /// Structural blame lookup: all live `file_edit` rows across the corpus whose normalized
     /// 64-bit hunk/line fingerprint postings contain `hunk_hash`.
     pub fn edits_matching_hunk(&self, hunk_hash: u64) -> Result<Vec<EditHunkEvent>> {
         let cat = self.catalog_session_lookup();
-        let mut raw: Vec<(EditSortKey, EditHunkEvent)> = Vec::new();
-        for (seg_ord, seg_entry) in self.manifest.segments.iter().enumerate() {
-            let reader = ClevReader::open(&self.dir.join(&seg_entry.file))?;
-            let rows = reader.by_hunk_hash(hunk_hash)? - seg_entry.superseded()?;
-            for row_id in rows {
-                let r = reader.materialize_row(row_id)?;
-                if r.kind != "file_edit" {
-                    continue;
+        self.with_manifest_retry(|manifest| {
+            let mut raw: Vec<(EditSortKey, EditHunkEvent)> = Vec::new();
+            for (seg_ord, seg_entry) in manifest.segments.iter().enumerate() {
+                let reader = ClevReader::open(&self.dir.join(&seg_entry.file))?;
+                let rows = reader.by_hunk_hash(hunk_hash)? - seg_entry.superseded()?;
+                for row_id in rows {
+                    let r = reader.materialize_row(row_id)?;
+                    if r.kind != "file_edit" {
+                        continue;
+                    }
+                    let item = Self::build_edit_hunk_event(manifest, r, &cat);
+                    let sort_key = (item.edit.ts, item.edit.msg_idx, seg_ord, row_id);
+                    raw.push((sort_key, item));
                 }
-                let item = self.build_edit_hunk_event(r, &cat);
-                let sort_key = (item.edit.ts, item.edit.msg_idx, seg_ord, row_id);
-                raw.push((sort_key, item));
             }
-        }
-        raw.sort_by_key(|a| a.0);
-        Ok(merge_edit_hunk_events(raw.into_iter().map(|(_, item)| item)))
+            raw.sort_by_key(|a| a.0);
+            Ok(merge_edit_hunk_events(raw.into_iter().map(|(_, item)| item)))
+        })
     }
 
     /// Tool invocation counts (`call = true` rows, or all non-null `tool` rows) grouped by tool
     /// name descending by count, optionally filtered to one `harness`.
     pub fn tool_counts(&self, harness: Option<&str>) -> Result<Vec<(String, u64)>> {
-        let mut counts: BTreeMap<String, u64> = BTreeMap::new();
-        for seg_entry in &self.manifest.segments {
-            let reader = ClevReader::open(&self.dir.join(&seg_entry.file))?;
-            let sup = seg_entry.superseded()?;
-            let harness_mask = match harness {
-                Some(h) => Some(reader.by_harness(h)?),
-                None => None,
-            };
-            for (tool_name, &(off, len)) in &reader.postings.by_tool {
-                let mut bm = reader.decode_bm(Some((off, len)))? - &sup;
-                if let Some(ref hm) = harness_mask {
-                    bm &= hm;
-                }
-                if let Some(ref call_col) = reader.cols.call {
-                    let c = bm
-                        .into_iter()
-                        .filter(|&row_id| call_col.first(row_id) == Some(true))
-                        .count() as u64;
-                    if c > 0 {
-                        *counts.entry(tool_name.clone()).or_default() += c;
+        self.with_manifest_retry(|manifest| {
+            let mut counts: BTreeMap<String, u64> = BTreeMap::new();
+            for seg_entry in &manifest.segments {
+                let reader = ClevReader::open(&self.dir.join(&seg_entry.file))?;
+                let sup = seg_entry.superseded()?;
+                let harness_mask = match harness {
+                    Some(h) => Some(reader.by_harness(h)?),
+                    None => None,
+                };
+                for (tool_name, &(off, len)) in &reader.postings.by_tool {
+                    let mut bm = reader.decode_bm(Some((off, len)))? - &sup;
+                    if let Some(ref hm) = harness_mask {
+                        bm &= hm;
+                    }
+                    if let Some(ref call_col) = reader.cols.call {
+                        let c = bm
+                            .into_iter()
+                            .filter(|&row_id| call_col.first(row_id) == Some(true))
+                            .count() as u64;
+                        if c > 0 {
+                            *counts.entry(tool_name.clone()).or_default() += c;
+                        }
                     }
                 }
             }
-        }
-        let mut out: Vec<(String, u64)> = counts.into_iter().collect();
-        out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        Ok(out)
+            let mut out: Vec<(String, u64)> = counts.into_iter().collect();
+            out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            Ok(out)
+        })
     }
 
     /// Exact [`cv_core::tools::ToolHistogram`] (`calls`, `edits`, `reads`, `commands`, `errors`,
@@ -1514,81 +1589,83 @@ impl ColumnarEventStore {
         harness: Option<&str>,
         session_id: Option<&str>,
     ) -> Result<cv_core::tools::ToolHistogram> {
-        let mut hist = cv_core::tools::ToolHistogram::default();
-        for seg_entry in &self.manifest.segments {
-            let reader = ClevReader::open(&self.dir.join(&seg_entry.file))?;
-            let sup = seg_entry.superseded()?;
+        self.with_manifest_retry(|manifest| {
+            let mut hist = cv_core::tools::ToolHistogram::default();
+            for seg_entry in &manifest.segments {
+                let reader = ClevReader::open(&self.dir.join(&seg_entry.file))?;
+                let sup = seg_entry.superseded()?;
 
-            let scope_mask: Option<RoaringBitmap> = match (harness, session_id) {
-                (Some(h), Some(sid)) => Some(reader.by_session(&session_key(h, sid))? - &sup),
-                (Some(h), None) => Some(reader.by_harness(h)? - &sup),
-                (None, Some(sid)) => {
-                    let mut m = RoaringBitmap::new();
-                    let suffix = format!("\0{sid}");
-                    for (k, &(off, len)) in &reader.postings.by_session {
-                        if k.ends_with(&suffix) {
-                            m |= reader.decode_bm(Some((off, len)))?;
+                let scope_mask: Option<RoaringBitmap> = match (harness, session_id) {
+                    (Some(h), Some(sid)) => Some(reader.by_session(&session_key(h, sid))? - &sup),
+                    (Some(h), None) => Some(reader.by_harness(h)? - &sup),
+                    (None, Some(sid)) => {
+                        let mut m = RoaringBitmap::new();
+                        let suffix = format!("\0{sid}");
+                        for (k, &(off, len)) in &reader.postings.by_session {
+                            if k.ends_with(&suffix) {
+                                m |= reader.decode_bm(Some((off, len)))?;
+                            }
                         }
+                        Some(m - &sup)
                     }
-                    Some(m - &sup)
-                }
-                (None, None) => None,
-            };
-            if scope_mask.as_ref().is_some_and(RoaringBitmap::is_empty) {
-                continue;
-            }
-
-            let apply_scope = |mut bm: RoaringBitmap| -> RoaringBitmap {
-                bm -= &sup;
-                if let Some(ref sm) = scope_mask {
-                    bm &= sm;
-                }
-                bm
-            };
-
-            let error_rows = apply_scope(reader.by_kind("error")?);
-            let edit_rows = apply_scope(reader.by_kind("file_edit")?);
-            let read_rows = apply_scope(reader.by_kind("file_read")?);
-            let cmd_rows = apply_scope(reader.by_kind("command")?);
-            hist.total_errors += error_rows.len() as usize;
-
-            for (tool_name, &(off, len)) in &reader.postings.by_tool {
-                let bm = apply_scope(reader.decode_bm(Some((off, len)))?);
-                if bm.is_empty() {
+                    (None, None) => None,
+                };
+                if scope_mask.as_ref().is_some_and(RoaringBitmap::is_empty) {
                     continue;
                 }
-                let err_bm = &bm & &error_rows;
-                let non_err = &bm - &err_bm;
-                let calls = match reader.cols.call {
-                    Some(ref call_col) => non_err
-                        .iter()
-                        .filter(|&row_id| call_col.first(row_id) == Some(true))
-                        .count(),
-                    None => 0,
+
+                let apply_scope = |mut bm: RoaringBitmap| -> RoaringBitmap {
+                    bm -= &sup;
+                    if let Some(ref sm) = scope_mask {
+                        bm &= sm;
+                    }
+                    bm
                 };
-                let edits = (&non_err & &edit_rows).len() as usize;
-                let reads = (&non_err & &read_rows).len() as usize;
-                let commands = (&non_err & &cmd_rows).len() as usize;
-                let errors = err_bm.len() as usize;
-                hist.total_calls += calls;
-                let entry = hist.tools.entry(tool_name.clone()).or_default();
-                entry.calls += calls;
-                entry.edits += edits;
-                entry.reads += reads;
-                entry.commands += commands;
-                entry.errors += errors;
+
+                let error_rows = apply_scope(reader.by_kind("error")?);
+                let edit_rows = apply_scope(reader.by_kind("file_edit")?);
+                let read_rows = apply_scope(reader.by_kind("file_read")?);
+                let cmd_rows = apply_scope(reader.by_kind("command")?);
+                hist.total_errors += error_rows.len() as usize;
+
+                for (tool_name, &(off, len)) in &reader.postings.by_tool {
+                    let bm = apply_scope(reader.decode_bm(Some((off, len)))?);
+                    if bm.is_empty() {
+                        continue;
+                    }
+                    let err_bm = &bm & &error_rows;
+                    let non_err = &bm - &err_bm;
+                    let calls = match reader.cols.call {
+                        Some(ref call_col) => non_err
+                            .iter()
+                            .filter(|&row_id| call_col.first(row_id) == Some(true))
+                            .count(),
+                        None => 0,
+                    };
+                    let edits = (&non_err & &edit_rows).len() as usize;
+                    let reads = (&non_err & &read_rows).len() as usize;
+                    let commands = (&non_err & &cmd_rows).len() as usize;
+                    let errors = err_bm.len() as usize;
+                    hist.total_calls += calls;
+                    let entry = hist.tools.entry(tool_name.clone()).or_default();
+                    entry.calls += calls;
+                    entry.edits += edits;
+                    entry.reads += reads;
+                    entry.commands += commands;
+                    entry.errors += errors;
+                }
             }
-        }
-        Ok(hist)
+            Ok(hist)
+        })
     }
 
     fn build_edit_hunk_event(
-        &self,
+        manifest: &ColumnarManifest,
         r: StagedRow,
         cat: &HashMap<(String, String), SessionMetaSnapshot>,
     ) -> EditHunkEvent {
         let s_key = session_key(&r.harness, &r.session_id);
-        let state = self.manifest.sessions.get(&s_key);
+        let state = manifest.sessions.get(&s_key);
         let cat_meta = cat.get(&(r.harness.clone(), r.session_id.clone()));
         let title = cat_meta
             .and_then(|m| m.title.clone())
@@ -1654,6 +1731,7 @@ fn merge_edit_hunk_events(items: impl IntoIterator<Item = EditHunkEvent>) -> Vec
 /// Bounded multi-session batch writer over a [`ColumnarEventStore`].
 pub struct ColumnarBatch<'a> {
     store: &'a mut ColumnarEventStore,
+    writer_lock: Option<std::fs::File>,
     staged_rows: Vec<StagedRow>,
     pending_session_segs: BTreeMap<String, Vec<String>>,
     new_segment_files: Vec<String>,
@@ -1662,6 +1740,19 @@ pub struct ColumnarBatch<'a> {
 }
 
 impl ColumnarBatch<'_> {
+    fn ensure_writer_lock(&mut self) -> Result<()> {
+        if self.writer_lock.is_none() {
+            let lock = acquire_clev_writer_lock(&self.store.dir)?;
+            if !self.dirty {
+                if let Some(fresh) = ColumnarManifest::load(&self.store.dir)? {
+                    self.store.manifest = fresh;
+                }
+            }
+            self.writer_lock = Some(lock);
+        }
+        Ok(())
+    }
+
     /// Whether `r` under `prov` has matching stored prefix authority in this batch/store.
     pub fn can_resume(&self, r: &cv_core::SessionRef, prov: &Provenance) -> bool {
         self.store.can_resume(r, prov)
@@ -1673,6 +1764,7 @@ impl ColumnarBatch<'_> {
         if cv_core::env::frozen() {
             return Ok(());
         }
+        self.ensure_writer_lock()?;
         let s_key = session_key(r.harness.as_str(), &r.id);
         if self.pending_session_segs.contains_key(&s_key) && !self.staged_rows.is_empty() {
             self.flush_chunk()?;
@@ -1697,6 +1789,7 @@ impl ColumnarBatch<'_> {
         if cv_core::env::frozen() {
             return Ok(());
         }
+        self.ensure_writer_lock()?;
         let harness = r.harness.as_str().to_string();
         let s_key = session_key(&harness, &r.id);
         let auth = AuthoritySnapshot::of(r, prov);
@@ -1813,9 +1906,10 @@ impl ColumnarBatch<'_> {
         if cv_core::env::frozen() || !self.dirty {
             return Ok(());
         }
+        self.ensure_writer_lock()?;
         self.flush_chunk()?;
         let dead_files = self.store.prune_fully_dead_segments()?;
-        if !self.store.compact(false)? {
+        if !self.store.compact_locked(false)? {
             self.store.manifest.save_atomic(&self.store.dir)?;
         }
         self.new_segment_files.clear();
@@ -2636,5 +2730,105 @@ mod tests {
             &col.events_for("claude", "sess-a", None).unwrap(),
             &cv_core::events::events_for("claude", "sess-a", None).unwrap(),
         );
+    }
+
+    #[test]
+    fn stale_reader_retries_manifest_on_compacted_segment_unlink_and_concurrent_writers_serialize() {
+        let tmp = ScratchDir::new();
+        let sessions_dir = tmp.path().join("sessions");
+        let col_dir = tmp.path().join("col");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let s1 = write_claude_session(
+            &sessions_dir.join("c1.jsonl"),
+            "c1",
+            "/repo/race",
+            &[json!({
+                "type": "assistant",
+                "sessionId": "c1",
+                "timestamp": "2026-10-04T10:00:00Z",
+                "message": {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "t1",
+                        "name": "Edit",
+                        "input": { "file_path": "/repo/race/src/lib.rs", "old_string": "a", "new_string": "b" }
+                    }]
+                }
+            })],
+        );
+        let s2 = write_claude_session(
+            &sessions_dir.join("c2.jsonl"),
+            "c2",
+            "/repo/race",
+            &[json!({
+                "type": "assistant",
+                "sessionId": "c2",
+                "timestamp": "2026-10-04T10:01:00Z",
+                "message": {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "t2",
+                        "name": "Read",
+                        "input": { "file_path": "/repo/race/src/lib.rs" }
+                    }]
+                }
+            })],
+        );
+
+        // Two separate batches create 2 `.clev` segments.
+        {
+            let mut w = ColumnarEventStore::open(&col_dir).unwrap();
+            w.sync_sessions(std::slice::from_ref(&s1), false, false).unwrap();
+            w.sync_sessions(std::slice::from_ref(&s2), false, false).unwrap();
+            assert_eq!(w.segment_count(), 2);
+        }
+
+        // Open a lock-free reader holding the pre-compaction 2-segment manifest in memory.
+        let stale_reader = ColumnarEventStore::open(&col_dir).unwrap();
+        assert_eq!(stale_reader.segment_count(), 2);
+
+        // Another writer compacts the 2 segments into 1 new segment and unlinks both old `.clev` files!
+        {
+            let mut compactor = ColumnarEventStore::open(&col_dir).unwrap();
+            assert!(compactor.compact(true).unwrap());
+            assert_eq!(compactor.segment_count(), 1);
+        }
+
+        // `stale_reader` still references the unlinked old segment filenames in `self.manifest`,
+        // and must transparently reload `manifest.json` on `NotFound` instead of failing!
+        assert_eq!(stale_reader.events_for("claude", "c1", None).unwrap().len(), 1);
+        assert_eq!(
+            stale_reader
+                .sessions_touching("/repo/race/src/lib.rs", false)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(stale_reader.tool_counts(None).unwrap().len(), 2);
+
+        // Concurrent writers against a second directory must serialize via `.clev-writer.lock`
+        // without losing either session's manifest entry.
+        let conc_dir = tmp.path().join("col-conc");
+        std::thread::scope(|sc| {
+            let d = &conc_dir;
+            let r1 = &s1;
+            let r2 = &s2;
+            let h1 = sc.spawn(move || {
+                let mut w1 = ColumnarEventStore::open(d).unwrap();
+                w1.sync_sessions(std::slice::from_ref(r1), true, false).unwrap();
+            });
+            let h2 = sc.spawn(move || {
+                let mut w2 = ColumnarEventStore::open(d).unwrap();
+                w2.sync_sessions(std::slice::from_ref(r2), true, false).unwrap();
+            });
+            h1.join().unwrap();
+            h2.join().unwrap();
+        });
+        let merged = ColumnarEventStore::open(&conc_dir).unwrap();
+        assert_eq!(merged.events_for("claude", "c1", None).unwrap().len(), 1);
+        assert_eq!(merged.events_for("claude", "c2", None).unwrap().len(), 1);
     }
 }

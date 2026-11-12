@@ -1624,6 +1624,58 @@ await acheck("WasmStore hydrates and pages _wasm stubs in-memory without touchin
   }
 });
 
+check("hostile non-numeric token and compaction metadata cannot inject DOM markup", async () => {
+  const { fmtTokens } = await import("./components/util.js");
+  eq(fmtTokens("<img src=x onerror=alert(1)>"), "", "fmtTokens rejects HTML strings");
+  eq(fmtTokens(true), "", "fmtTokens rejects booleans");
+  eq(fmtTokens(1500), "1.5k", "fmtTokens formats finite numbers");
+
+  const el = document.createElement("cv-forest");
+  el._root = {
+    id: "xss-compaction",
+    harness: "claude",
+    messages: [
+      {
+        role: "system",
+        kind: "compaction_boundary",
+        origin: "harness",
+        content: [],
+        extra: {
+          claude: {
+            compactMetadata: {
+              trigger: "auto",
+              preTokens: "<img src=x onerror=alert(1)>",
+              durationMs: "<svg onload=alert(1)>",
+            },
+          },
+        },
+      },
+    ],
+  };
+  el._compactions = [
+    {
+      boundary_msg_idx: "\"><img src=x onerror=alert(1)>",
+      summary_msg_idx: "<script>alert(1)</" + "script>",
+      trigger: "<b id=bad-trig>auto</b>",
+      pre_tokens: "<img id=bad-pre src=x onerror=alert(1)>",
+      duration_ms: "<svg id=bad-dur onload=alert(1)>",
+      pre_compaction_span: ["<img id=bad-s0>", "<img id=bad-s1>"],
+      summary: "safe summary",
+    },
+  ];
+  const resolved = el._resolveCompactions();
+  eq(resolved[0].index, 0, "hostile boundary_msg_idx coerced to 0");
+  eq(resolved[0].summaryIndex, null, "hostile summary_msg_idx dropped");
+  eq(resolved[0].preTokens, null, "hostile pre_tokens dropped");
+  eq(resolved[0].durationMs, null, "hostile duration_ms dropped");
+  eq(resolved[0].preSpan, null, "hostile pre_compaction_span dropped");
+  eq(el._kfmt("<img id=bad-kfmt src=x>"), "—", "_kfmt rejects non-finite strings");
+  const html = el._compactionHtml({ compactions: resolved });
+  const probe = document.createElement("div");
+  probe.innerHTML = html;
+  eq(probe.querySelectorAll("img, svg, script, #bad-trig, #bad-pre, #bad-dur").length, 0, "zero injected elements");
+});
+
 // ===========================================================================
 // Report
 // ===========================================================================
