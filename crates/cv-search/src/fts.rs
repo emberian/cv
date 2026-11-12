@@ -2817,6 +2817,30 @@ fn parse_text_query(
     }
 }
 
+/// Exact code/substring search over a trigram index directory plus live unindexed `refs`.
+pub fn search_exact(
+    trigram_dir: &Path,
+    query: &str,
+    limit: usize,
+    filter: crate::SearchFilter<'_>,
+    case_sensitive: bool,
+    live: LiveRead,
+    refs: &[cv_core::SessionRef],
+) -> Result<crate::trigram::TrigramFound> {
+    crate::trigram::search(
+        trigram_dir,
+        query,
+        crate::trigram::TrigramOptions {
+            filter,
+            case_sensitive,
+            live,
+            limit,
+        },
+        refs,
+        None,
+    )
+}
+
 /// The complete set of session IDs matching a full-text query in [`crate::Scope::Exchange`]. This
 /// reads only the index: no ranking cap, snippet generation, discovery or transcript access. Chunk
 /// documents deduplicate into their session ID, with the same query syntax and conjunction default

@@ -25,6 +25,7 @@ use std::path::PathBuf;
 pub mod fts;
 mod ingest;
 mod session_collector;
+pub mod trigram;
 
 /// A single search result.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -285,6 +286,69 @@ impl Searcher {
         }
         Ok(found)
     }
+
+    /// Exact code/symbol/substring search backed by the trigram candidate index plus live tail
+    /// verification against matching decoded source revisions.
+    pub fn search_exact(
+        &self,
+        query: &str,
+        filter: SearchFilter<'_>,
+        case_sensitive: bool,
+        limit: usize,
+        live_bytes: Option<u64>,
+    ) -> Result<Found> {
+        self.search_exact_in_allowed(
+            &default_trigram_dir(),
+            query,
+            filter,
+            case_sensitive,
+            None,
+            limit,
+            live_bytes,
+        )
+    }
+
+    /// [`search_exact`](Self::search_exact) with explicit trigram index location and session allowlist.
+    #[allow(clippy::too_many_arguments)]
+    pub fn search_exact_in_allowed(
+        &self,
+        dir: &std::path::Path,
+        query: &str,
+        filter: SearchFilter<'_>,
+        case_sensitive: bool,
+        allowed_ids: Option<&std::collections::HashSet<String>>,
+        limit: usize,
+        live_bytes: Option<u64>,
+    ) -> Result<Found> {
+        let harness = filter.harness.and_then(cv_core::Harness::parse);
+        if filter.harness.is_some() && harness.is_none() {
+            return Ok(Found {
+                hits: Vec::new(),
+                source: Source::Index,
+                notes: Vec::new(),
+                total: 0,
+            });
+        }
+        let _sources = cv_core::source::read_scope();
+        let refs = cv_core::sessions_for(harness);
+        let live = LiveRead::of(live_bytes)?;
+        trigram::search(
+            dir,
+            query,
+            trigram::TrigramOptions {
+                filter: SearchFilter {
+                    harness: harness.map(cv_core::Harness::as_str),
+                    ..filter
+                },
+                case_sensitive,
+                live,
+                limit,
+            },
+            &refs,
+            allowed_ids,
+        )
+        .map(trigram::TrigramFound::into_found)
+    }
 }
 
 /// Durable state directory: `$CLUSTERVISION_HOME` or `~/.clustervision`.
@@ -303,6 +367,11 @@ pub fn cache_dir() -> PathBuf {
 /// Default location of the tantivy full-text index.
 pub fn default_tantivy_dir() -> PathBuf {
     cache_dir().join("tantivy")
+}
+
+/// Default location of the derived trigram substring index.
+pub fn default_trigram_dir() -> PathBuf {
+    cache_dir().join("trigram")
 }
 
 // ---- Convenience wrappers over the default-located indexes ---------------------------------
