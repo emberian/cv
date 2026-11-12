@@ -1,6 +1,19 @@
 # Changelog
 
 ## Unreleased
+- Search snippets exclude every term in negated groups from browser highlighting.
+- Oversized columnar target dictionaries fail explicitly instead of wrapping stored byte offsets.
+- JSONL visitors release device admission before callbacks, avoiding cross-device payload-read deadlocks and serialization of consumer work.
+- `cv index --exact` builds the trigram accelerator; `cv search --exact` finds literal code substrings with source revision verification.
+- `cv serve` and `cv watch` start the local batching recorder when no other process owns it.
+- Hub rebuild preserves published snapshot pins and generations; hydration decodes only selected payload frames.
+- Sealed inbox envelopes move into packs, leaving small verified locators in SQLite.
+- Pack manifests reject overlapping records; hub verification decodes each frame once and rejects changed indexes on replay.
+- Privacy scrubbing covers JSON object keys without dropping colliding values, and path rewrites respect segment boundaries.
+- Archive import stages private files in owner-only temporary directories.
+- SSE data safely handles lone carriage returns; lane liveness rejects boot mismatches through either public entry point.
+- Failed columnar event compaction preserves its in-memory manifest instead of publishing an emptied segment list.
+- Serverless recorder writes reuse a producer epoch, keeping replication frontiers proportional to producers rather than hook calls.
 - `--frozen` reads of `state.db` no longer create `state.db-wal`/`-shm`; a retained WAL without `-shm` is read from a private folded copy.
 - `[privacy]`/`[replication]` scrubbing and `--redact` now cover file and image block references; `$HOME` rewriting catches homes after any delimiter (backticks, `<`, `file://`).
 - `/api/stream` cursors are `<gen>:<offset>`: a cursor from another server run gets an immediate `reset`, and a follower learns every kind it missed.
