@@ -3,11 +3,15 @@
 //! with gap-free contiguous `(producer, epoch)` frontiers, and loud `409 Conflict` quarantine.
 
 use super::snapshot::{
-    latest_snapshot_in_conn, maybe_publish_snapshot_in_tx, recompute_frontier_in_tx, recompute_producer_sessions_in_tx,
+    advance_frontier_in_tx, fold_origin_range_in_tx, latest_snapshot_in_conn, maybe_publish_snapshot_in_tx,
+    recompute_frontier_in_tx, recompute_producer_sessions_in_tx, resolve_producer_sessions_in_tx,
     SnapshotPublicationManifest,
 };
 use super::{canonical_json_bytes, compute_event_digest, EventId, HubError, HubStore, Producer};
-use crate::packs::{pack_idx_path, pack_zst_path, PackManifest, PayloadAddr, SeekableReader};
+use crate::packs::{
+    pack_idx_path, pack_zst_path, sweep_orphan_pack_temps, PackManifest, PayloadAddr, SeekableReader,
+    DEFAULT_ORPHAN_TMP_MAX_AGE,
+};
 use crate::publish::{self, Claim, Set, Staged};
 use chrono::Utc;
 use rusqlite::{OptionalExtension, TransactionBehavior};
@@ -226,6 +230,7 @@ impl HubStore {
         let idx_dest = pack_idx_path(&self.packs_dir, pack_id).map_err(|e| HubError::InvalidArgument(e.to_string()))?;
 
         std::fs::create_dir_all(&self.packs_dir)?;
+        let _ = sweep_orphan_pack_temps(&self.packs_dir, DEFAULT_ORPHAN_TMP_MAX_AGE);
 
         // Stream `.pack.zst` into a staged temp file while incrementally computing whole-file BLAKE3.
         let mut staged_zst =
@@ -766,11 +771,19 @@ impl HubStore {
             )?;
         }
 
+        let mut touched_sessions_by_producer: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         for (producer_id, epoch) in &touched_origins {
-            recompute_frontier_in_tx(&tx, producer_id, epoch, now_ms)?;
+            let (fold_after, new_frontier) = advance_frontier_in_tx(&tx, producer_id, epoch, now_ms)?;
+            let delta_sessions = fold_origin_range_in_tx(&tx, producer_id, epoch, fold_after, new_frontier)?;
+            if !delta_sessions.is_empty() {
+                touched_sessions_by_producer
+                    .entry(producer_id.clone())
+                    .or_default()
+                    .extend(delta_sessions);
+            }
         }
-        for producer_id in &touched_producers {
-            recompute_producer_sessions_in_tx(&tx, producer_id)?;
+        for (producer_id, session_ids) in &touched_sessions_by_producer {
+            resolve_producer_sessions_in_tx(&tx, producer_id, session_ids)?;
         }
 
         let snapshot = maybe_publish_snapshot_in_tx(&tx, now_ms)?;

@@ -61,7 +61,7 @@ fn schema_migrations_are_forward_only_and_independent_of_source_version() {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(hub_tables, 6, "expected 6 v2 hub_* tables");
+        assert_eq!(hub_tables, 8, "expected 8 v3 hub_* tables");
     }
     assert_eq!(
         v1_migrated.get_producer("legacy-v1-prod").unwrap().unwrap().host_label,

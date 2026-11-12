@@ -1209,15 +1209,26 @@ fn fleet_hub_rebuild_from_raw_matches_incremental_bit_for_bit() {
         .unwrap()
         .expect("rebuilt snapshot manifest");
 
-    // Bit-for-bit manifest parity!
+    // Bit-for-bit manifest parity across every coherent SnapshotPublicationManifest field!
     assert_eq!(
         rebuilt_snap.publication_id, snap_before.publication_id,
         "rebuilt publication_id MUST match incremental ingest bit-for-bit"
     );
+    assert_eq!(rebuilt_snap.interpretation_version, snap_before.interpretation_version);
     assert_eq!(rebuilt_snap.origin_frontier, snap_before.origin_frontier);
     assert_eq!(rebuilt_snap.pack_digests, snap_before.pack_digests);
     assert_eq!(rebuilt_snap.session_revisions, snap_before.session_revisions);
+    assert_eq!(rebuilt_snap.view_manifest_ids, snap_before.view_manifest_ids);
+    assert_eq!(rebuilt_snap.control_revision, snap_before.control_revision);
     assert_eq!(rebuilt_snap.quarantine_count, snap_before.quarantine_count);
+    assert!(
+        rebuilt_snap.view_manifest_ids.contains_key("frontiers")
+            && rebuilt_snap.view_manifest_ids.contains_key("packs")
+            && rebuilt_snap.view_manifest_ids.contains_key("sessions"),
+        "expected view_manifest_ids for frontiers/packs/sessions: {:?}",
+        rebuilt_snap.view_manifest_ids
+    );
+    assert!(rebuilt_snap.control_revision >= 3);
 
     // Live HTTP queries after rebuild match incremental ingest bit-for-bit!
     let (status_after_raw, _) = client.get("/api/hub/status").unwrap();
@@ -1641,4 +1652,110 @@ fn pack_replay_commits_to_index_bytes_as_well_as_payload_bytes() {
         .upload_pack_bytes("index", Some("p"), None, &serde_json::to_vec(&changed).unwrap(), &zst)
         .unwrap_err();
     assert!(matches!(err, cv_core::state::hub::HubError::PackConflict { .. }));
+}
+
+#[test]
+fn hub_snapshots_cap_unpinned_history_while_preserving_pinned_and_delta_fold_parity() {
+    let world = World::new("hub-snapshot-bounds-delta");
+    let hub = HubStore::at_home(&world.cv_home);
+
+    // Publish generation 1 and explicitly pin it before churning > MAX_RETAINED_HUB_SNAPSHOTS updates.
+    let seed = make_session("pinned-sess", "/work/pin", "Seed v0", "u", "a", 1);
+    hub.ingest_batch(&IngestBatchRequest {
+        events: vec![make_event("prod-cap", "ep-1", 1, &seed, None)],
+    })
+    .unwrap();
+    let gen1 = hub.get_snapshot(None).unwrap().unwrap();
+    assert_eq!(gen1.hub_generation, 1);
+    assert!(hub.set_snapshot_pinned(&gen1.publication_id, true).unwrap());
+
+    // Push 270 sequential delta updates across two epochs (including non-session heartbeats and a
+    // delete + re-upsert) so unpinned snapshots exceed MAX_RETAINED_HUB_SNAPSHOTS (256).
+    let total_ep1 = (cv_core::state::hub::MAX_RETAINED_HUB_SNAPSHOTS + 12) as u64;
+    let mut gen2_id = String::new();
+    for seq in 2..=total_ep1 {
+        let env = if seq % 25 == 0 {
+            json!({ "kind": "heartbeat", "seq": seq })
+        } else {
+            json!({
+                "kind": "session_upsert",
+                "session_id": "churn-sess",
+                "harness": "claude",
+                "title": format!("Churn rev {seq}"),
+                "cwd": "/work/churn",
+                "updated_at": "2026-06-15T12:10:00Z",
+                "message_count": seq,
+            })
+        };
+        let ev = IngestEventRecord::new(
+            EventId::new("prod-cap", "ep-1", seq),
+            format!("op:ep1:{seq}"),
+            env,
+            None,
+        )
+        .unwrap();
+        let resp = hub.ingest_batch(&IngestBatchRequest { events: vec![ev] }).unwrap();
+        if seq == 2 {
+            gen2_id = resp.snapshot.as_ref().unwrap().publication_id.clone();
+        }
+    }
+
+    // Newer epoch `ep-2` deletes `pinned-sess` and updates `churn-sess` with newer `updated_at`.
+    let del_ev = IngestEventRecord::new(
+        EventId::new("prod-cap", "ep-2", 1),
+        "op:ep2:1",
+        json!({
+            "kind": "session_delete",
+            "session_id": "pinned-sess",
+            "updated_at": "2026-06-15T13:00:00Z",
+        }),
+        None,
+    )
+    .unwrap();
+    let ep2_up = IngestEventRecord::new(
+        EventId::new("prod-cap", "ep-2", 2),
+        "op:ep2:2",
+        json!({
+            "kind": "session_upsert",
+            "session_id": "churn-sess",
+            "harness": "claude",
+            "title": "Winning ep-2 title",
+            "cwd": "/work/churn",
+            "updated_at": "2026-06-15T13:05:00Z",
+            "message_count": 999,
+        }),
+        None,
+    )
+    .unwrap();
+    hub.ingest_batch(&IngestBatchRequest {
+        events: vec![del_ev, ep2_up],
+    })
+    .unwrap();
+
+    // Verify unpinned snapshots are capped at MAX_RETAINED_HUB_SNAPSHOTS (256), unpinned gen 2 was
+    // pruned, and pinned gen 1 remains readable!
+    let conn = hub.state_store().open_readonly().unwrap().unwrap();
+    let unpinned_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM hub_snapshots WHERE pinned = 0", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(unpinned_count as usize, cv_core::state::hub::MAX_RETAINED_HUB_SNAPSHOTS);
+    drop(conn);
+
+    assert!(
+        hub.get_snapshot(Some(&gen2_id)).is_err(),
+        "oldest unpinned snapshot should be pruned once >256 newer snapshots exist"
+    );
+    let pinned_still_here = hub.get_snapshot(Some(&gen1.publication_id)).unwrap().unwrap();
+    assert_eq!(pinned_still_here, gen1);
+
+    // Verify incremental O(delta) fold matches full `rebuild_from_raw` bit-for-bit!
+    let before_rebuild = hub.get_snapshot(None).unwrap().unwrap();
+    assert!(!before_rebuild.session_revisions.contains_key("prod-cap/pinned-sess"));
+    assert_eq!(
+        before_rebuild.session_revisions["prod-cap/churn-sess"].title.as_deref(),
+        Some("Winning ep-2 title")
+    );
+    hub.wipe_derived_views().unwrap();
+    let after_rebuild = hub.rebuild_from_raw().unwrap().unwrap();
+    assert_eq!(after_rebuild, before_rebuild);
 }

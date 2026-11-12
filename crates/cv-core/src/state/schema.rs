@@ -11,12 +11,13 @@ use super::StateError;
 use rusqlite::Connection;
 
 /// Current authoritative `state.db` schema version.
-pub const STATE_SCHEMA_VERSION: i64 = 2;
+pub const STATE_SCHEMA_VERSION: i64 = 3;
 
 /// Ordered forward migrations `(target_version, name, ddl)`.
 pub const MIGRATIONS: &[(i64, &str, &str)] = &[
     (1, "v1_authoritative_state_spine", MIGRATION_V1),
     (2, "v2_fleet_hub", MIGRATION_V2),
+    (3, "v3_hub_delta_and_snapshot_bounds", MIGRATION_V3),
 ];
 
 const MIGRATION_V1: &str = r#"
@@ -287,6 +288,30 @@ CREATE TABLE IF NOT EXISTS hub_snapshots (
 );
 CREATE INDEX IF NOT EXISTS idx_hub_snapshots_pub_id
     ON hub_snapshots(publication_id);
+"#;
+
+const MIGRATION_V3: &str = r#"
+ALTER TABLE hub_snapshots ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE hub_frontiers ADD COLUMN control_events INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE hub_frontiers ADD COLUMN delta_seeded INTEGER NOT NULL DEFAULT 0;
+
+CREATE TABLE IF NOT EXISTS hub_epoch_sessions (
+    producer_id TEXT NOT NULL,
+    session_id  TEXT NOT NULL,
+    epoch       TEXT NOT NULL,
+    is_delete   INTEGER NOT NULL CHECK (is_delete IN (0, 1)),
+    sort_ts_ms  INTEGER NOT NULL,
+    event_seq   INTEGER NOT NULL,
+    entry_json  TEXT,
+    PRIMARY KEY(producer_id, session_id, epoch)
+);
+
+CREATE TABLE IF NOT EXISTS hub_frontier_packs (
+    producer_id TEXT NOT NULL,
+    epoch       TEXT NOT NULL,
+    pack_id     TEXT NOT NULL,
+    PRIMARY KEY(producer_id, epoch, pack_id)
+);
 "#;
 
 /// Read `PRAGMA user_version` from `conn`.

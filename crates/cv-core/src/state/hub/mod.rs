@@ -23,6 +23,7 @@ pub use shipper::{
 pub use snapshot::{
     FrontierStatus, HubSessionRow, HubSessionsPage, HubSnapshotResponse, HubStatusResponse, HydratedHubSession,
     QuarantineRecord, QuarantineSummary, SessionRevisionEntry, SnapshotPublicationManifest,
+    HUB_SNAPSHOT_INTERPRETATION_VERSION, MAX_RETAINED_HUB_SNAPSHOTS,
 };
 
 /// Relative subdirectory under `$CLUSTERVISION_HOME` holding mirrored hub packs.

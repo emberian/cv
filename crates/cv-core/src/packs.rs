@@ -282,6 +282,57 @@ pub fn pack_idx_path(dir: &Path, pack_id: &str) -> Result<PathBuf> {
     Ok(dir.join(format!("{pack_id}.pack.idx.json")))
 }
 
+/// Default retention grace period (15 minutes) before unreferenced `.cv-*.tmp` staged pack files
+/// left behind by hard crashes (`SIGKILL` / power loss) are swept from a pack directory.
+pub const DEFAULT_ORPHAN_TMP_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// Sweep stale `.cv-*.tmp` staged files in `dir` older than `max_age`.
+///
+/// Never follows symlinks and never touches live staged writers younger than `max_age` or any
+/// published `.pack.zst` / `.pack.idx.json` artifact. Safe no-op if `dir` does not exist or under
+/// `--frozen`.
+pub fn sweep_orphan_pack_temps(dir: &Path, max_age: std::time::Duration) -> io::Result<usize> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (dir, max_age);
+        Ok(0)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        if crate::env::frozen() || !dir.is_dir() {
+            return Ok(0);
+        }
+        let now = std::time::SystemTime::now();
+        let mut removed = 0usize;
+        for entry in std::fs::read_dir(dir)? {
+            let Ok(entry) = entry else { continue };
+            let file_name = entry.file_name();
+            let Some(name) = file_name.to_str() else {
+                continue;
+            };
+            if !(name.starts_with(".cv-") && name.ends_with(".tmp")) {
+                continue;
+            }
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
+            if !ft.is_file() {
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            let Ok(mtime) = meta.modified() else {
+                continue;
+            };
+            if now.duration_since(mtime).is_ok_and(|age| age >= max_age) && std::fs::remove_file(entry.path()).is_ok() {
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+}
+
 /// Builder streaming multiple records/payloads into one Zstandard-Seekable pack staged in `dir`,
 /// published atomically via [`publish::Set`] (`Staged` temp write + `fsync` + rename + dir sync).
 pub struct PackBuilder {
@@ -309,6 +360,7 @@ impl PackBuilder {
         let zst_dest = pack_zst_path(dir, &pack_id)?;
         let idx_dest = pack_idx_path(dir, &pack_id)?;
         std::fs::create_dir_all(dir).with_context(|| format!("creating pack directory {}", dir.display()))?;
+        let _ = sweep_orphan_pack_temps(dir, DEFAULT_ORPHAN_TMP_MAX_AGE);
         let staged_zst = Staged::beside(&zst_dest, "pack-zst", 0o644)?;
         let buffered = io::BufWriter::with_capacity(64 * 1024, staged_zst);
         let writer = SeekableWriter::with_options(buffered, frame_size, compression_level);
@@ -826,5 +878,32 @@ mod tests {
         manifest.record_index.records[0].length = 2;
         manifest.record_index.records[1].anchor = "a".into();
         assert!(PackManifest::from_json_slice(&serde_json::to_vec(&manifest).unwrap()).is_err());
+    }
+
+    #[test]
+    fn sweep_orphan_pack_temps_removes_expired_staged_temps_only() -> Result<()> {
+        let world = cv_testkit::World::new("pack-orphan-sweep");
+        let dir = world.base.join("packs");
+        std::fs::create_dir_all(&dir)?;
+
+        let stale_tmp = dir.join(".cv-pack-zst-stale.tmp");
+        let fresh_tmp = dir.join(".cv-pack-zst-fresh.tmp");
+        let keep_pack = dir.join("pack-keep.pack.zst");
+        std::fs::write(&stale_tmp, b"partial crash bytes")?;
+        std::fs::write(&fresh_tmp, b"active writer bytes")?;
+        std::fs::write(&keep_pack, b"sealed pack bytes")?;
+
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&stale_tmp)?
+            .set_modified(past)?;
+
+        let swept = sweep_orphan_pack_temps(&dir, DEFAULT_ORPHAN_TMP_MAX_AGE)?;
+        assert_eq!(swept, 1);
+        assert!(!stale_tmp.exists(), "expired .cv-*.tmp should be swept");
+        assert!(fresh_tmp.exists(), "fresh .cv-*.tmp writer must stay untouched");
+        assert!(keep_pack.exists(), "published .pack.zst must stay untouched");
+        Ok(())
     }
 }

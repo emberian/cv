@@ -9,8 +9,21 @@ use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+
+/// Version of the hub envelope-to-projection fold semantics committed in every
+/// [`SnapshotPublicationManifest`]. Decoupled from [`crate::source::VERSION`] so adapter-level
+/// transcript parser tweaks do not invalidate historical fleet snapshot IDs.
+pub const HUB_SNAPSHOT_INTERPRETATION_VERSION: u32 = 1;
+
+/// Maximum number of unpinned [`SnapshotPublicationManifest`] rows retained in `hub_snapshots`.
+/// Explicitly pinned snapshots (`pinned = 1`) are exempt from retention pruning.
+pub const MAX_RETAINED_HUB_SNAPSHOTS: usize = 256;
+
+const fn default_interpretation_version() -> u32 {
+    HUB_SNAPSHOT_INTERPRETATION_VERSION
+}
 
 fn is_empty_object(v: &Value) -> bool {
     matches!(v, Value::Null) || v.as_object().is_some_and(|m| m.is_empty())
@@ -53,10 +66,16 @@ pub struct SnapshotPublicationManifest {
     pub hub_generation: u64,
     pub publication_id: String,
     pub published_at: i64,
+    #[serde(default = "default_interpretation_version")]
+    pub interpretation_version: u32,
     #[serde(with = "super::origin_frontier_serde")]
     pub origin_frontier: BTreeMap<(String, String), u64>,
     pub pack_digests: BTreeMap<String, String>,
     pub session_revisions: BTreeMap<String, SessionRevisionEntry>,
+    #[serde(default)]
+    pub view_manifest_ids: BTreeMap<String, String>,
+    #[serde(default)]
+    pub control_revision: u64,
     pub quarantine_count: u64,
 }
 
@@ -233,11 +252,36 @@ impl HydratedHubSession {
     }
 }
 
-/// Compute deterministic `publication_id` from a snapshot's canonical content.
-pub(crate) fn compute_publication_id(
+fn view_digest(val: &Value) -> Result<String, HubError> {
+    let canonical = canonical_json_bytes(val)?;
+    let hex = blake3::hash(&canonical).to_hex();
+    Ok(format!("view-{}", &hex.as_str()[..24]))
+}
+
+pub(crate) fn compute_view_manifest_ids(
     origin_frontier: &BTreeMap<(String, String), u64>,
     pack_digests: &BTreeMap<String, String>,
     session_revisions: &BTreeMap<String, SessionRevisionEntry>,
+) -> Result<BTreeMap<String, String>, HubError> {
+    let frontier_encoded: BTreeMap<String, u64> = origin_frontier
+        .iter()
+        .map(|((p, e), &seq)| (encode_pair_key(p, e), seq))
+        .collect();
+    let mut views = BTreeMap::new();
+    views.insert("frontiers".into(), view_digest(&json!(frontier_encoded))?);
+    views.insert("packs".into(), view_digest(&json!(pack_digests))?);
+    views.insert("sessions".into(), view_digest(&json!(session_revisions))?);
+    Ok(views)
+}
+
+/// Compute deterministic `publication_id` from a snapshot's canonical content.
+pub(crate) fn compute_publication_id(
+    interpretation_version: u32,
+    origin_frontier: &BTreeMap<(String, String), u64>,
+    pack_digests: &BTreeMap<String, String>,
+    session_revisions: &BTreeMap<String, SessionRevisionEntry>,
+    view_manifest_ids: &BTreeMap<String, String>,
+    control_revision: u64,
     quarantine_count: u64,
 ) -> Result<String, HubError> {
     let frontier_encoded: BTreeMap<String, u64> = origin_frontier
@@ -246,9 +290,12 @@ pub(crate) fn compute_publication_id(
         .collect();
     let doc = json!({
         "domain": "cv-hub-snapshot-v1",
+        "interpretation_version": interpretation_version,
         "origin_frontier": frontier_encoded,
         "pack_digests": pack_digests,
         "session_revisions": session_revisions,
+        "view_manifest_ids": view_manifest_ids,
+        "control_revision": control_revision,
         "quarantine_count": quarantine_count,
     });
     let canonical = canonical_json_bytes(&doc)?;
@@ -256,7 +303,125 @@ pub(crate) fn compute_publication_id(
     Ok(format!("pub-{}", &hex.as_str()[..24]))
 }
 
-/// Recompute the contiguous origin frontier `F(p, e)` for `(producer_id, epoch)` inside `tx`.
+/// Advance the contiguous origin frontier `F(p, e)` incrementally in `O(delta + buffered)` by
+/// scanning only `seq > old_contiguous_seq` on `idx_hub_ingested_origin_seq`.
+///
+/// Returns `(fold_after_seq, new_contiguous_seq)`. If a pre-v3 row had `delta_seeded == 0`,
+/// `fold_after_seq` is reset to `0` (and `control_events` cleared) so the first v3 delta pass
+/// transparently seeds `hub_epoch_sessions` and `hub_frontier_packs`.
+pub(crate) fn advance_frontier_in_tx(
+    tx: &Transaction<'_>,
+    producer_id: &str,
+    epoch: &str,
+    now_ms: i64,
+) -> Result<(u64, u64), HubError> {
+    let prev: Option<(u64, u64, Option<u64>, bool)> = tx
+        .query_row(
+            "SELECT contiguous_seq, max_received_seq, first_conflict_seq, delta_seeded
+             FROM hub_frontiers
+             WHERE producer_id = ?1 AND epoch = ?2",
+            rusqlite::params![producer_id, epoch],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)? as u64,
+                    r.get::<_, i64>(1)? as u64,
+                    r.get::<_, Option<i64>>(2)?.map(|v| v as u64),
+                    r.get::<_, i64>(3)? != 0,
+                ))
+            },
+        )
+        .optional()?;
+
+    let first_conflict_seq: Option<u64> = match prev {
+        Some((_, _, Some(c), _)) => Some(c),
+        _ => tx
+            .query_row(
+                "SELECT MIN(seq) FROM hub_quarantine WHERE producer_id = ?1 AND epoch = ?2",
+                rusqlite::params![producer_id, epoch],
+                |r| r.get::<_, Option<i64>>(0),
+            )?
+            .map(|v| v as u64),
+    };
+
+    let (old_contiguous_seq, old_max_seq, was_seeded) = prev.map(|(c, m, _, s)| (c, m, s)).unwrap_or((0, 0, true));
+
+    let mut stmt = tx.prepare(
+        "SELECT seq FROM hub_ingested_events
+         WHERE producer_id = ?1 AND epoch = ?2 AND seq > ?3
+         ORDER BY seq ASC",
+    )?;
+    let tail_seqs: Vec<u64> = stmt
+        .query_map(rusqlite::params![producer_id, epoch, old_contiguous_seq as i64], |r| {
+            Ok(r.get::<_, i64>(0)? as u64)
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if prev.is_none() && tail_seqs.is_empty() && first_conflict_seq.is_none() {
+        return Ok((0, 0));
+    }
+
+    let mut contiguous_seq = old_contiguous_seq;
+    for &seq in &tail_seqs {
+        if first_conflict_seq.is_some_and(|conflict| seq >= conflict) {
+            break;
+        }
+        if seq == contiguous_seq + 1 {
+            contiguous_seq = seq;
+        } else if seq > contiguous_seq + 1 {
+            break;
+        }
+    }
+
+    let max_received_seq = tail_seqs
+        .last()
+        .copied()
+        .unwrap_or(old_max_seq)
+        .max(old_max_seq)
+        .max(contiguous_seq);
+    let buffered_count = tail_seqs.iter().filter(|&&s| s > contiguous_seq).count() as u64;
+
+    if !was_seeded {
+        tx.execute(
+            "DELETE FROM hub_epoch_sessions WHERE producer_id = ?1 AND epoch = ?2",
+            rusqlite::params![producer_id, epoch],
+        )?;
+        tx.execute(
+            "DELETE FROM hub_frontier_packs WHERE producer_id = ?1 AND epoch = ?2",
+            rusqlite::params![producer_id, epoch],
+        )?;
+    }
+
+    tx.execute(
+        "INSERT INTO hub_frontiers(
+             producer_id, epoch, contiguous_seq, max_received_seq,
+             buffered_count, first_conflict_seq, updated_at,
+             control_events, delta_seeded
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 1)
+         ON CONFLICT(producer_id, epoch) DO UPDATE SET
+             contiguous_seq = excluded.contiguous_seq,
+             max_received_seq = excluded.max_received_seq,
+             buffered_count = excluded.buffered_count,
+             first_conflict_seq = excluded.first_conflict_seq,
+             updated_at = excluded.updated_at,
+             control_events = CASE WHEN hub_frontiers.delta_seeded = 0 THEN 0 ELSE hub_frontiers.control_events END,
+             delta_seeded = 1",
+        rusqlite::params![
+            producer_id,
+            epoch,
+            contiguous_seq as i64,
+            max_received_seq as i64,
+            buffered_count as i64,
+            first_conflict_seq.map(|v| v as i64),
+            now_ms,
+        ],
+    )?;
+
+    let fold_after = if was_seeded { old_contiguous_seq } else { 0 };
+    Ok((fold_after, contiguous_seq))
+}
+
+/// Recompute the contiguous origin frontier `F(p, e)` from scratch for `(producer_id, epoch)`
+/// inside `tx` (used on loud conflict quarantine and `rebuild_from_raw`).
 ///
 /// `F(p, e) = max { n : 1..=n all present in hub_ingested_events AND n < first_conflict_seq }`.
 pub(crate) fn recompute_frontier_in_tx(
@@ -311,14 +476,16 @@ pub(crate) fn recompute_frontier_in_tx(
     tx.execute(
         "INSERT INTO hub_frontiers(
              producer_id, epoch, contiguous_seq, max_received_seq,
-             buffered_count, first_conflict_seq, updated_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             buffered_count, first_conflict_seq, updated_at,
+             control_events, delta_seeded
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 1)
          ON CONFLICT(producer_id, epoch) DO UPDATE SET
              contiguous_seq = excluded.contiguous_seq,
              max_received_seq = excluded.max_received_seq,
              buffered_count = excluded.buffered_count,
              first_conflict_seq = excluded.first_conflict_seq,
-             updated_at = excluded.updated_at",
+             updated_at = excluded.updated_at,
+             delta_seeded = 1",
         rusqlite::params![
             producer_id,
             epoch,
@@ -383,7 +550,7 @@ fn parse_envelope_op(
             }
             return ParsedEnvelopeOp::Ignore;
         }
-        Some("session_upsert") => {}
+        Some("session_upsert") | Some("session_archive") => {}
         None if nested.is_some() => {}
         // Non-session envelopes (`filtered_out`, `receipt`, `hook_receipt`, `lane_start`,
         // `heartbeat`, `noop`, `task_event`, etc.) stay durably committed in `hub_ingested_events`
@@ -442,129 +609,222 @@ fn parse_envelope_op(
     }))
 }
 
-/// Deterministically fold all conflict-free frontier events (`seq <= F(p, e)`) for `producer_id`
-/// into `hub_sessions`.
-///
-/// Order-independent: events are ordered canonically by `(epoch, seq)` within each epoch and across
-/// epochs by `(updated_at_ms, epoch, seq)`, so out-of-order batch arrival and full rebuilds from
-/// `hub_ingested_events` produce bit-for-bit identical rows.
-pub(crate) fn recompute_producer_sessions_in_tx(tx: &Transaction<'_>, producer_id: &str) -> Result<(), HubError> {
-    tx.execute("DELETE FROM hub_sessions WHERE producer_id = ?1", [producer_id])?;
-
-    let mut stmt = tx.prepare(
-        "SELECT e.epoch, e.seq, e.event_digest, e.envelope_json, e.payload_addr_json
-         FROM hub_ingested_events e
-         JOIN hub_frontiers f
-           ON f.producer_id = e.producer_id AND f.epoch = e.epoch
-         WHERE e.producer_id = ?1 AND e.seq <= f.contiguous_seq
-         ORDER BY e.epoch ASC, e.seq ASC",
-    )?;
-
-    struct Candidate {
-        epoch: String,
-        seq: u64,
-        sort_ts_ms: i64,
-        op: ParsedEnvelopeOp,
+/// Fold events in `(after_seq, upto_seq]` for `(producer_id, epoch)` into `hub_epoch_sessions`,
+/// `hub_frontier_packs`, and `hub_frontiers.control_events`, returning the set of `session_id`s
+/// touched in this delta.
+pub(crate) fn fold_origin_range_in_tx(
+    tx: &Transaction<'_>,
+    producer_id: &str,
+    epoch: &str,
+    after_seq: u64,
+    upto_seq: u64,
+) -> Result<BTreeSet<String>, HubError> {
+    let mut touched_sessions = BTreeSet::new();
+    if upto_seq <= after_seq {
+        return Ok(touched_sessions);
     }
 
-    let mut candidates = Vec::new();
-    let rows = stmt.query_map([producer_id], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, i64>(1)? as u64,
-            r.get::<_, String>(2)?,
-            r.get::<_, String>(3)?,
-            r.get::<_, Option<String>>(4)?,
-        ))
-    })?;
+    let mut stmt = tx.prepare(
+        "SELECT seq, event_digest, envelope_json, payload_addr_json
+         FROM hub_ingested_events
+         WHERE producer_id = ?1 AND epoch = ?2 AND seq > ?3 AND seq <= ?4
+         ORDER BY seq ASC",
+    )?;
+    let rows = stmt.query_map(
+        rusqlite::params![producer_id, epoch, after_seq as i64, upto_seq as i64],
+        |r| {
+            Ok((
+                r.get::<_, i64>(0)? as u64,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?,
+            ))
+        },
+    )?;
 
+    let mut added_control_events = 0u64;
     for row in rows {
-        let (epoch, seq, event_digest, env_str, payload_str) = row?;
+        let (seq, event_digest, env_str, payload_str) = row?;
         let envelope: Value = serde_json::from_str(&env_str)?;
         let payload_addr: Option<PayloadAddr> = match payload_str {
             Some(s) => Some(serde_json::from_str(&s)?),
             None => None,
         };
-        let op = parse_envelope_op(producer_id, &epoch, seq, &event_digest, &envelope, payload_addr);
-        let sort_ts_ms = match &op {
-            ParsedEnvelopeOp::Upsert(entry) => {
-                parse_rfc3339_ms(entry.updated_at.as_deref().or(entry.created_at.as_deref())).unwrap_or(i64::MIN)
-            }
-            ParsedEnvelopeOp::Delete { .. } => {
-                parse_rfc3339_ms(envelope.get("updated_at").and_then(Value::as_str)).unwrap_or(i64::MAX)
-            }
-            ParsedEnvelopeOp::Ignore => continue,
-        };
-        candidates.push(Candidate {
-            epoch,
-            seq,
-            sort_ts_ms,
-            op,
-        });
-    }
+        if let Some(ref addr) = payload_addr {
+            tx.execute(
+                "INSERT OR IGNORE INTO hub_frontier_packs(producer_id, epoch, pack_id)
+                 VALUES (?1, ?2, ?3)",
+                rusqlite::params![producer_id, epoch, addr.pack_id],
+            )?;
+        }
 
-    // Within a single `(producer_id, epoch)`, `seq` is strictly causal. Across distinct epochs of
-    // the same producer, sort by `(sort_ts_ms, epoch, seq)` so newer epochs supersede older ones
-    // deterministically regardless of network arrival order.
-    let multi_epoch = {
-        let first_ep = candidates.first().map(|c| c.epoch.as_str());
-        candidates.iter().any(|c| Some(c.epoch.as_str()) != first_ep)
-    };
-    if multi_epoch {
-        candidates.sort_by(|a, b| {
-            if a.epoch == b.epoch {
-                a.seq.cmp(&b.seq)
-            } else {
-                (a.sort_ts_ms, &a.epoch, a.seq).cmp(&(b.sort_ts_ms, &b.epoch, b.seq))
+        let op = parse_envelope_op(producer_id, epoch, seq, &event_digest, &envelope, payload_addr);
+        match op {
+            ParsedEnvelopeOp::Ignore => {
+                added_control_events += 1;
             }
-        });
-    }
-
-    let mut folded: BTreeMap<String, SessionRevisionEntry> = BTreeMap::new();
-    for cand in candidates {
-        match cand.op {
-            ParsedEnvelopeOp::Ignore => {}
             ParsedEnvelopeOp::Delete { session_id } => {
-                folded.remove(&session_id);
+                let sort_ts_ms =
+                    parse_rfc3339_ms(envelope.get("updated_at").and_then(Value::as_str)).unwrap_or(i64::MAX);
+                tx.execute(
+                    "INSERT OR REPLACE INTO hub_epoch_sessions(
+                         producer_id, session_id, epoch, is_delete, sort_ts_ms, event_seq, entry_json
+                     ) VALUES (?1, ?2, ?3, 1, ?4, ?5, NULL)",
+                    rusqlite::params![producer_id, session_id, epoch, sort_ts_ms, seq as i64],
+                )?;
+                touched_sessions.insert(session_id);
             }
             ParsedEnvelopeOp::Upsert(entry) => {
-                folded.insert(entry.session_id.clone(), *entry);
+                let sort_ts_ms =
+                    parse_rfc3339_ms(entry.updated_at.as_deref().or(entry.created_at.as_deref())).unwrap_or(i64::MIN);
+                let session_id = entry.session_id.clone();
+                let entry_json = serde_json::to_string(&*entry)?;
+                tx.execute(
+                    "INSERT OR REPLACE INTO hub_epoch_sessions(
+                         producer_id, session_id, epoch, is_delete, sort_ts_ms, event_seq, entry_json
+                     ) VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6)",
+                    rusqlite::params![producer_id, session_id, epoch, sort_ts_ms, seq as i64, entry_json],
+                )?;
+                touched_sessions.insert(session_id);
             }
         }
     }
 
-    for entry in folded.values() {
-        let payload_json = match &entry.payload_addr {
-            Some(addr) => Some(serde_json::to_string(addr)?),
-            None => None,
-        };
-        let meta_json = serde_json::to_string(&entry.metadata)?;
+    if added_control_events > 0 {
         tx.execute(
-            "INSERT INTO hub_sessions(
-                 producer_id, session_id, harness, revision, title, cwd, model,
-                 created_at, updated_at, message_count, epoch, event_seq,
-                 payload_addr_json, metadata_json
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-            rusqlite::params![
-                entry.producer_id,
-                entry.session_id,
-                entry.harness,
-                entry.revision,
-                entry.title,
-                entry.cwd,
-                entry.model,
-                entry.created_at,
-                entry.updated_at,
-                entry.message_count as i64,
-                entry.epoch,
-                entry.event_seq as i64,
-                payload_json,
-                meta_json,
-            ],
+            "UPDATE hub_frontiers
+             SET control_events = control_events + ?1
+             WHERE producer_id = ?2 AND epoch = ?3",
+            rusqlite::params![added_control_events as i64, producer_id, epoch],
         )?;
     }
 
+    Ok(touched_sessions)
+}
+
+/// Resolve the winning cross-epoch state for each `session_id` of `producer_id` from
+/// `hub_epoch_sessions` using strict total order `(sort_ts_ms, epoch, event_seq)` and materialize
+/// into `hub_sessions`.
+pub(crate) fn resolve_producer_sessions_in_tx(
+    tx: &Transaction<'_>,
+    producer_id: &str,
+    session_ids: &BTreeSet<String>,
+) -> Result<(), HubError> {
+    for session_id in session_ids {
+        let winner: Option<(i64, Option<String>)> = tx
+            .query_row(
+                "SELECT is_delete, entry_json
+                 FROM hub_epoch_sessions
+                 WHERE producer_id = ?1 AND session_id = ?2
+                 ORDER BY sort_ts_ms DESC, epoch DESC, event_seq DESC
+                 LIMIT 1",
+                rusqlite::params![producer_id, session_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+
+        match winner {
+            None | Some((1, _)) => {
+                tx.execute(
+                    "DELETE FROM hub_sessions WHERE producer_id = ?1 AND session_id = ?2",
+                    rusqlite::params![producer_id, session_id],
+                )?;
+            }
+            Some((_, Some(entry_json))) => {
+                let entry: SessionRevisionEntry = serde_json::from_str(&entry_json)?;
+                let payload_json = match &entry.payload_addr {
+                    Some(addr) => Some(serde_json::to_string(addr)?),
+                    None => None,
+                };
+                let meta_json = serde_json::to_string(&entry.metadata)?;
+                tx.execute(
+                    "INSERT OR REPLACE INTO hub_sessions(
+                         producer_id, session_id, harness, revision, title, cwd, model,
+                         created_at, updated_at, message_count, epoch, event_seq,
+                         payload_addr_json, metadata_json
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                    rusqlite::params![
+                        entry.producer_id,
+                        entry.session_id,
+                        entry.harness,
+                        entry.revision,
+                        entry.title,
+                        entry.cwd,
+                        entry.model,
+                        entry.created_at,
+                        entry.updated_at,
+                        entry.message_count as i64,
+                        entry.epoch,
+                        entry.event_seq as i64,
+                        payload_json,
+                        meta_json,
+                    ],
+                )?;
+            }
+            Some((_, None)) => {
+                tx.execute(
+                    "DELETE FROM hub_sessions WHERE producer_id = ?1 AND session_id = ?2",
+                    rusqlite::params![producer_id, session_id],
+                )?;
+            }
+        }
+    }
     Ok(())
+}
+
+/// Deterministically rebuild all conflict-free frontier state (`seq <= F(p, e)`) for `producer_id`
+/// from scratch via [`fold_origin_range_in_tx`] + [`resolve_producer_sessions_in_tx`].
+///
+/// Shares the exact per-epoch causal collapse and cross-epoch `(sort_ts_ms, epoch, event_seq)`
+/// total order used by incremental `ingest_batch`, guaranteeing bit-for-bit parity under any batch
+/// arrival order or full `rebuild_from_raw`.
+pub(crate) fn recompute_producer_sessions_in_tx(tx: &Transaction<'_>, producer_id: &str) -> Result<(), HubError> {
+    tx.execute("DELETE FROM hub_sessions WHERE producer_id = ?1", [producer_id])?;
+    tx.execute("DELETE FROM hub_epoch_sessions WHERE producer_id = ?1", [producer_id])?;
+    tx.execute("DELETE FROM hub_frontier_packs WHERE producer_id = ?1", [producer_id])?;
+    tx.execute(
+        "UPDATE hub_frontiers SET control_events = 0, delta_seeded = 1 WHERE producer_id = ?1",
+        [producer_id],
+    )?;
+
+    let epochs: Vec<(String, u64)> = {
+        let mut stmt = tx.prepare(
+            "SELECT epoch, contiguous_seq
+             FROM hub_frontiers
+             WHERE producer_id = ?1
+             ORDER BY epoch ASC",
+        )?;
+        let rows = stmt.query_map([producer_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+
+    let mut all_touched = BTreeSet::new();
+    for (epoch, contiguous_seq) in epochs {
+        let touched = fold_origin_range_in_tx(tx, producer_id, &epoch, 0, contiguous_seq)?;
+        all_touched.extend(touched);
+    }
+    resolve_producer_sessions_in_tx(tx, producer_id, &all_touched)?;
+    Ok(())
+}
+
+/// Cap unpinned rows in `hub_snapshots` to `max_unpinned` newest generations while retaining all
+/// pinned (`pinned = 1`) snapshots indefinitely.
+pub(crate) fn prune_unpinned_snapshots_in_tx(tx: &Transaction<'_>, max_unpinned: usize) -> Result<usize, HubError> {
+    let deleted = tx.execute(
+        "DELETE FROM hub_snapshots
+         WHERE pinned = 0
+           AND hub_generation NOT IN (
+               SELECT hub_generation
+               FROM hub_snapshots
+               WHERE pinned = 0
+               ORDER BY hub_generation DESC
+               LIMIT ?1
+           )",
+        [max_unpinned as i64],
+    )?;
+    Ok(deleted)
 }
 
 /// Build the current coherent [`SnapshotPublicationManifest`] from `tx` and publish a new
@@ -576,9 +836,10 @@ pub(crate) fn maybe_publish_snapshot_in_tx(
     now_ms: i64,
 ) -> Result<Option<SnapshotPublicationManifest>, HubError> {
     let mut origin_frontier: BTreeMap<(String, String), u64> = BTreeMap::new();
+    let mut total_control_events = 0u64;
     {
         let mut stmt = tx.prepare(
-            "SELECT producer_id, epoch, contiguous_seq
+            "SELECT producer_id, epoch, contiguous_seq, control_events
              FROM hub_frontiers
              ORDER BY producer_id ASC, epoch ASC",
         )?;
@@ -587,11 +848,13 @@ pub(crate) fn maybe_publish_snapshot_in_tx(
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, i64>(2)? as u64,
+                r.get::<_, i64>(3)? as u64,
             ))
         })?;
         for row in rows {
-            let (p, e, seq) = row?;
+            let (p, e, seq, ctrl) = row?;
             origin_frontier.insert((p, e), seq);
+            total_control_events = total_control_events.saturating_add(ctrl);
         }
     }
 
@@ -601,34 +864,19 @@ pub(crate) fn maybe_publish_snapshot_in_tx(
         return latest_snapshot_in_conn(tx);
     }
 
-    // Collect every pack referenced by conflict-free frontier events (`seq <= contiguous_seq`).
-    let mut referenced_packs = std::collections::BTreeSet::new();
+    // Collect every pack referenced by conflict-free frontier events (`hub_frontier_packs`) in
+    // O(|referenced_packs|) without scanning `hub_ingested_events`.
+    let mut pack_digests: BTreeMap<String, String> = BTreeMap::new();
     {
         let mut stmt = tx.prepare(
-            "SELECT e.payload_addr_json
-             FROM hub_ingested_events e
-             JOIN hub_frontiers f
-               ON f.producer_id = e.producer_id AND f.epoch = e.epoch
-             WHERE e.seq <= f.contiguous_seq AND e.payload_addr_json IS NOT NULL",
+            "SELECT DISTINCT fp.pack_id, hp.blake3_digest
+             FROM hub_frontier_packs fp
+             JOIN hub_packs hp ON hp.pack_id = fp.pack_id
+             ORDER BY fp.pack_id ASC",
         )?;
-        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
         for row in rows {
-            let raw = row?;
-            let addr: PayloadAddr = serde_json::from_str(&raw)?;
-            referenced_packs.insert(addr.pack_id);
-        }
-    }
-
-    let mut pack_digests: BTreeMap<String, String> = BTreeMap::new();
-    for pack_id in referenced_packs {
-        if let Some(digest) = tx
-            .query_row(
-                "SELECT blake3_digest FROM hub_packs WHERE pack_id = ?1",
-                [&pack_id],
-                |r| r.get::<_, String>(0),
-            )
-            .optional()?
-        {
+            let (pack_id, digest) = row?;
             pack_digests.insert(pack_id, digest);
         }
     }
@@ -707,7 +955,21 @@ pub(crate) fn maybe_publish_snapshot_in_tx(
         }
     }
 
-    let publication_id = compute_publication_id(&origin_frontier, &pack_digests, &session_revisions, quarantine_count)?;
+    let interpretation_version = HUB_SNAPSHOT_INTERPRETATION_VERSION;
+    let view_manifest_ids = compute_view_manifest_ids(&origin_frontier, &pack_digests, &session_revisions)?;
+    let control_revision = (origin_frontier.len() as u64)
+        .saturating_add(quarantine_count)
+        .saturating_add(total_control_events);
+
+    let publication_id = compute_publication_id(
+        interpretation_version,
+        &origin_frontier,
+        &pack_digests,
+        &session_revisions,
+        &view_manifest_ids,
+        control_revision,
+        quarantine_count,
+    )?;
 
     if let Some(prev) = latest_snapshot_in_conn(tx)? {
         if prev.publication_id == publication_id {
@@ -743,17 +1005,21 @@ pub(crate) fn maybe_publish_snapshot_in_tx(
         hub_generation: next_gen,
         publication_id: final_pub_id.clone(),
         published_at: now_ms,
+        interpretation_version,
         origin_frontier,
         pack_digests,
         session_revisions,
+        view_manifest_ids,
+        control_revision,
         quarantine_count,
     };
     let manifest_json = serde_json::to_string(&manifest)?;
     tx.execute(
-        "INSERT INTO hub_snapshots(hub_generation, publication_id, published_at, manifest_json)
-         VALUES (?1, ?2, ?3, ?4)",
+        "INSERT INTO hub_snapshots(hub_generation, publication_id, published_at, manifest_json, pinned)
+         VALUES (?1, ?2, ?3, ?4, 0)",
         rusqlite::params![next_gen as i64, final_pub_id, now_ms, manifest_json],
     )?;
+    prune_unpinned_snapshots_in_tx(tx, MAX_RETAINED_HUB_SNAPSHOTS)?;
 
     Ok(Some(manifest))
 }
@@ -1370,13 +1636,31 @@ impl HubStore {
         Ok((manifest, hydrated))
     }
 
-    /// Wipe mutable hub projections (`hub_frontiers`, `hub_sessions`) while preserving raw
-    /// inputs and published snapshot pins. Publications retain the durable generation high-water
-    /// mark; rebuilding a cache must never revoke a client's pinned snapshot.
+    /// Pin or unpin a published snapshot (`publication_id`) so retention pruning never evicts it.
+    pub fn set_snapshot_pinned(&self, publication_id: &str, pinned: bool) -> Result<bool, HubError> {
+        let mut conn = self.store.open_writable()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "UPDATE hub_snapshots SET pinned = ?1 WHERE publication_id = ?2",
+            rusqlite::params![i64::from(pinned), publication_id],
+        )?;
+        tx.commit()?;
+        Ok(changed > 0)
+    }
+
+    /// Wipe mutable hub projections (`hub_frontiers`, `hub_sessions`, `hub_epoch_sessions`,
+    /// `hub_frontier_packs`) while preserving raw inputs and published snapshot pins. Publications
+    /// retain the durable generation high-water mark; rebuilding a cache must never revoke a
+    /// client's pinned snapshot.
     pub fn wipe_derived_views(&self) -> Result<(), HubError> {
         let mut conn = self.store.open_writable()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute_batch("DELETE FROM hub_sessions; DELETE FROM hub_frontiers;")?;
+        tx.execute_batch(
+            "DELETE FROM hub_sessions;
+             DELETE FROM hub_epoch_sessions;
+             DELETE FROM hub_frontier_packs;
+             DELETE FROM hub_frontiers;",
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -1449,7 +1733,12 @@ impl HubStore {
 
         // Published manifests are client pins and the durable generation high-water mark.
         // Rebuild the mutable projections while retaining those immutable publications.
-        tx.execute_batch("DELETE FROM hub_sessions; DELETE FROM hub_frontiers;")?;
+        tx.execute_batch(
+            "DELETE FROM hub_sessions;
+             DELETE FROM hub_epoch_sessions;
+             DELETE FROM hub_frontier_packs;
+             DELETE FROM hub_frontiers;",
+        )?;
 
         let origins: Vec<(String, String)> = {
             let mut stmt = tx.prepare(
@@ -1462,12 +1751,18 @@ impl HubStore {
             mapped.collect::<Result<Vec<_>, _>>()?
         };
 
-        let mut producers = std::collections::BTreeSet::new();
+        let mut producers = BTreeSet::new();
         for (producer_id, epoch) in &origins {
             recompute_frontier_in_tx(&tx, producer_id, epoch, now_ms)?;
             producers.insert(producer_id.clone());
         }
         for producer_id in &producers {
+            tx.execute(
+                "INSERT INTO producers(producer_id, host_label, metadata_json, enrolled_at, updated_at)
+                 VALUES (?1, ?1, '{}', ?2, ?2)
+                 ON CONFLICT(producer_id) DO NOTHING",
+                rusqlite::params![producer_id, now_ms],
+            )?;
             recompute_producer_sessions_in_tx(&tx, producer_id)?;
         }
 
