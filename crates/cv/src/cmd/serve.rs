@@ -128,7 +128,7 @@ fn run(
         web_root,
         token,
         default_who: who,
-        searcher: cv_search::Searcher::default(),
+        searcher: cv_search::Searcher,
     };
     crate::http::serve(listener, crate::http::Limits::default(), move |request| {
         handle(request, &ctx)
@@ -551,7 +551,7 @@ fn search(params: &Query, searcher: &cv_search::Searcher) -> Reply {
             .get(name)
             .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
     };
-    let (semantic, scan) = (flag("semantic"), flag("scan"));
+    let scan = flag("scan");
     let scope = match params.get("kind") {
         None => cv_search::Scope::Exchange,
         Some(kind) => match cv_search::Scope::parse(&kind) {
@@ -559,21 +559,12 @@ fn search(params: &Query, searcher: &cv_search::Searcher) -> Reply {
             None => return bad(400, &format!("unknown kind {kind:?}: exchange, context or all")),
         },
     };
-    if semantic && scan {
-        return bad(400, "semantic=1 conflicts with scan=1");
-    }
-    // The CLI declares --kind as conflicting with --scan and --semantic; the HTTP door keeps the
+    // The CLI declares --kind as conflicting with --scan; the HTTP door keeps the
     // same rule, so one request shape means one thing on both.
-    if (semantic || scan) && params.get("kind").is_some() {
+    if scan && params.get("kind").is_some() {
         return bad(400, "this mode searches the exchange only; kind= needs the index");
     }
-    let source = if semantic {
-        Source::Semantic
-    } else if scan {
-        Source::Live
-    } else {
-        Source::Index
-    };
+    let source = if scan { Source::Live } else { Source::Index };
     let filter = cv_search::SearchFilter {
         harness: want.map(|h| h.as_str()),
         cwd: cwd.as_deref(),
@@ -585,14 +576,6 @@ fn search(params: &Query, searcher: &cv_search::Searcher) -> Reply {
     };
     let found = match searcher.search(&q, filter, limit, source, live_bytes) {
         Ok(found) => found,
-        // A live scan cannot stand in for semantic ranking, so this is an error, exactly as
-        // `cv search --semantic` exits non-zero rather than quietly changing mode.
-        Err(e) if semantic => {
-            return bad(
-                500,
-                &format!("semantic search failed (run `cv index --semantic` first?): {e:#}"),
-            )
-        }
         Err(e) if scan => return bad(500, &format!("live scan failed: {e:#}")),
         Err(e) if cv_search::is_invalid_text_query(&e) => return bad(400, &format!("invalid search query: {e:#}")),
         Err(e) if e.is::<cv_search::BadLiveBytes>() => return bad(500, &format!("{e:#}")),
@@ -902,23 +885,14 @@ mod staged_tests {
 }
 
 #[cfg(test)]
-mod semantic_service_tests {
+mod search_service_tests {
     use super::*;
 
     #[test]
     fn search_rejects_cli_conflicts_before_reading_sources() {
         let _world = crate::test_world("search-conflicts");
-        for flags in [
-            "scan=1&kind=context",
-            "scan=1&kind=all",
-            "scan=1&kind=exchange",
-            "semantic=1&kind=exchange",
-            "scan=1&semantic=1",
-        ] {
-            let (status, body, _) = search(
-                &Query::parse(&format!("q=needle&{flags}")),
-                &cv_search::Searcher::default(),
-            );
+        for flags in ["scan=1&kind=context", "scan=1&kind=all", "scan=1&kind=exchange"] {
+            let (status, body, _) = search(&Query::parse(&format!("q=needle&{flags}")), &cv_search::Searcher);
             assert_eq!(status, 400, "{flags}: {body}");
         }
     }
@@ -930,55 +904,5 @@ mod semantic_service_tests {
             assert!(!token_matches(wrong, "opensesame"), "{wrong:?}");
         }
         assert!(!token_matches("x", ""));
-    }
-
-    #[test]
-    fn semantic_route_uses_service_owned_state_and_observes_replacement() {
-        let dir = std::env::temp_dir().join(format!("cv-serve-semantic-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&dir).unwrap();
-        let path = dir.join("vectors.bin");
-        let metadata = br#"{"model":"unused","projection":1,"records":[]}"#;
-        let mut empty = b"CVEMBED".to_vec();
-        empty.push(cv_core::source::VERSION as u8);
-        empty.extend_from_slice(&0u32.to_le_bytes());
-        empty.extend_from_slice(&0u32.to_le_bytes());
-        empty.extend_from_slice(&(metadata.len() as u64).to_le_bytes());
-        empty.extend_from_slice(metadata);
-        std::fs::write(&path, &empty).unwrap();
-        let semantic = cv_search::Searcher::from(cv_search::SemanticSearch::new(Some(path.clone())));
-        for _ in 0..2 {
-            let (status, body, headers) = route(
-                false,
-                &["api", "search"],
-                "q=anything&semantic=1",
-                &Query::parse("q=anything&semantic=1"),
-                &semantic,
-            );
-            assert_eq!(status, 200);
-            assert_eq!(body, json!([]));
-            assert!(headers
-                .iter()
-                .any(|(name, value)| *name == "X-Cv-Search-Source" && value == "semantic"));
-        }
-        std::fs::write(&path, b"invalid replacement").unwrap();
-        let (status, _, _) = route(
-            false,
-            &["api", "search"],
-            "q=anything&semantic=1",
-            &Query::parse("q=anything&semantic=1"),
-            &semantic,
-        );
-        assert_eq!(status, 500);
-        std::fs::write(&path, &empty).unwrap();
-        let (status, body, _) = route(
-            false,
-            &["api", "search"],
-            "q=anything&semantic=1",
-            &Query::parse("q=anything&semantic=1"),
-            &semantic,
-        );
-        assert_eq!(status, 200);
-        assert_eq!(body, json!([]));
-        std::fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -94,10 +94,6 @@ fn pack_md_no_index_fallback_and_content() {
     let (out, err) = w.cv_ok(&["pack", "wombat caching layer"]);
     assert!(err.contains("no index yet"), "want live-suffix note, stderr:\n{err}");
     assert!(err.contains("the index has not seen live"), "{err}");
-    assert!(
-        err.contains("no embeddings store"),
-        "honest FTS-only note expected:\n{err}"
-    );
 
     // Bundle framing.
     assert!(out.contains("# Context pack: wombat caching layer"), "{out}");
