@@ -1594,6 +1594,11 @@ pub fn est_tokens_resolved(block: &Block, resolver: &crate::lazy::Resolver) -> a
     est_tokens_with(block, |text| text.try_decoded_len(resolver))
 }
 
+/// Token estimate when a lazy text/result/thinking block's decoded byte count was already observed.
+pub(crate) fn est_tokens_with_len(block: &Block, decoded_len: Option<usize>) -> anyhow::Result<u64> {
+    est_tokens_with(block, |text| Ok(decoded_len.unwrap_or_else(|| text.len())))
+}
+
 fn est_tokens_with(
     block: &Block,
     text_len: impl Fn(&crate::lazy::Text) -> anyhow::Result<usize>,

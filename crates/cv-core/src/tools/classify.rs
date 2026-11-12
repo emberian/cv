@@ -555,7 +555,7 @@ pub fn visit_tool_ops<'a>(
 }
 
 impl ToolSemantic<'_> {
-    fn into_owned(self) -> ToolSemantic<'static> {
+    pub fn into_owned(self) -> ToolSemantic<'static> {
         ToolSemantic {
             tool: Cow::Owned(self.tool.into_owned()),
             op: match self.op {
@@ -1687,11 +1687,9 @@ impl<'s> JsScanner<'s> {
                     self.try_read_binding();
                     return;
                 }
-                if !prev_dot && ident == "tools" {
-                    if self.try_read_tools_call() {
-                        self.regex_allowed = false;
-                        return;
-                    }
+                if !prev_dot && ident == "tools" && self.try_read_tools_call() {
+                    self.regex_allowed = false;
+                    return;
                 }
                 self.regex_allowed = matches!(
                     ident,
@@ -2008,7 +2006,7 @@ impl<'s> JsScanner<'s> {
                         self.regex_allowed = false;
                     } else {
                         all_strings = false;
-                        self.skip_balanced_until(&[b',', b']']);
+                        self.skip_balanced_until(b",]");
                     }
                 }
                 // Consume optional `.join("\n")`
@@ -2030,7 +2028,7 @@ impl<'s> JsScanner<'s> {
                                 let q = self.bytes[self.pos];
                                 sep = self.read_quoted_string(q);
                             }
-                            self.skip_balanced_until(&[b')']);
+                            self.skip_balanced_until(b")");
                             if self.pos < self.bytes.len() && self.bytes[self.pos] == b')' {
                                 self.pos += 1;
                             }
@@ -2118,7 +2116,7 @@ impl<'s> JsScanner<'s> {
                 }
             }
             // Consume any remaining arguments up to matching `)` while still scanning nested calls/literals.
-            self.skip_balanced_until(&[b')']);
+            self.skip_balanced_until(b")");
         }
         if self.pos < self.bytes.len() && self.bytes[self.pos] == b')' {
             self.pos += 1;
@@ -2276,7 +2274,7 @@ impl<'s> JsScanner<'s> {
             // Spread `...other`
             if self.pos + 2 < self.bytes.len() && &self.bytes[self.pos..self.pos + 3] == b"..." {
                 self.pos += 3;
-                self.skip_balanced_until(&[b',', b'}']);
+                self.skip_balanced_until(b",}");
                 continue;
             }
             let key = if matches!(b, b'\'' | b'"') {
@@ -2289,7 +2287,7 @@ impl<'s> JsScanner<'s> {
                 None
             };
             let Some(key) = key else {
-                self.skip_balanced_until(&[b',', b'}']);
+                self.skip_balanced_until(b",}");
                 continue;
             };
             self.skip_ws_and_comments();
@@ -2303,7 +2301,7 @@ impl<'s> JsScanner<'s> {
                 continue;
             }
             if self.bytes[self.pos] != b':' {
-                self.skip_balanced_until(&[b',', b'}']);
+                self.skip_balanced_until(b",}");
                 continue;
             }
             self.pos += 1;
@@ -2322,7 +2320,7 @@ impl<'s> JsScanner<'s> {
             }
             let val = self.parse_prop_value();
             obj.props.insert(key, val);
-            self.skip_balanced_until(&[b',', b'}']);
+            self.skip_balanced_until(b",}");
         }
         obj
     }
@@ -2402,7 +2400,7 @@ impl<'s> JsScanner<'s> {
                     items.push(Item { content, status });
                 }
             } else {
-                self.skip_balanced_until(&[b',', b']']);
+                self.skip_balanced_until(b",]");
             }
         }
         items
@@ -2443,7 +2441,7 @@ impl<'s> JsScanner<'s> {
                     first_q = Some(s);
                 }
             } else {
-                self.skip_balanced_until(&[b',', b']']);
+                self.skip_balanced_until(b",]");
             }
         }
         first_q

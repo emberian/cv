@@ -161,6 +161,7 @@ struct Work {
     tail_preparations: usize,
     elided_copy_bytes: usize,
     source_estimates: usize,
+    lazy_block_decodes: usize,
 }
 #[cfg(test)]
 thread_local! { static WORK: std::cell::Cell<Work> = std::cell::Cell::new(Work::default()); }
@@ -494,83 +495,220 @@ fn block_est(b: &Block) -> anyhow::Result<u64> {
     est_tokens(b)
 }
 
-// Count decoded model-visible bodies without retaining them for the analysis lifetime.
-fn message_est_resolved(m: &Message, resolver: &crate::Resolver) -> anyhow::Result<u64> {
-    #[cfg(test)]
-    note_work(|work| work.source_estimates += 1);
-    if !m.is_model_visible() {
-        return Ok(0);
-    }
-    m.content.iter().try_fold(0u64, |sum, block| {
-        Ok(sum + crate::ir::est_tokens_resolved(block, resolver)?)
-    })
-}
+/// Scalar keys safe to project eagerly from a `Json::Source` large-payload tool call without
+/// materializing multi-megabyte file contents, patches, or scripts.
+const SCALAR_META_KEYS: &[&str] = &[
+    "file_path",
+    "absolute_path",
+    "filePath",
+    "path",
+    "Path",
+    "TargetFile",
+    "target_file",
+    "notebook_path",
+    "command",
+    "cmd",
+    "CommandLine",
+    "description",
+    "toolSummary",
+    "to",
+    "target",
+    "Recipient",
+    "recipient",
+];
 
-/// Facts and labels demand just these Write fields; code content contributes its decoded
-/// length. Notes, tail turns and sidecars still demand their complete original values.
+/// Cross-harness tool summary over `Block::ToolUse::input`. Large-payload tools (`Write`,
+/// `write_file`, `apply_patch`, `Edit`, `MultiEdit`, `edit_file`, `replace`, Codex `exec`, etc.)
+/// inspect `Json::Source` via [`crate::json::JsonView`] without materializing code payloads;
+/// note writes, tail turns, and sidecars still retain their full demanded values.
 struct ToolInput<'a> {
     fields: std::borrow::Cow<'a, Value>,
+    ops: Vec<crate::tools::classify::ToolSemantic<'static>>,
     write_bytes: Option<usize>,
 }
 impl<'a> ToolInput<'a> {
-    fn new(name: &str, input: &'a crate::Json, notes: bool, label: bool) -> anyhow::Result<Self> {
-        if name != "Write" || matches!(input, crate::Json::Owned(_)) {
+    fn new(harness: Harness, name: &str, input: &'a crate::Json, notes: bool, label: bool) -> anyhow::Result<Self> {
+        use crate::tools::classify::{is_large_payload_tool, visit_tool_ops, ClassifyOpts, ToolOp};
+        if matches!(input, crate::Json::Owned(_)) || !is_large_payload_tool(Some(harness), name) {
+            let fields = input.resolve()?;
+            let mut ops = Vec::new();
+            visit_tool_ops(
+                Some(harness),
+                name,
+                crate::json::JsonView::from(fields.as_ref()),
+                ClassifyOpts::FULL,
+                |sem| ops.push(sem.into_owned()),
+            )?;
             return Ok(Self {
-                fields: input.resolve()?,
+                fields,
+                ops,
                 write_bytes: None,
             });
         }
         input.with_view(|view| {
+            let mut ops = Vec::new();
+            visit_tool_ops(Some(harness), name, view, ClassifyOpts::FULL, |sem| {
+                ops.push(sem.into_owned());
+            })?;
             let mut fields = serde_json::Map::new();
-            for key in ["file_path", "path", "notebook_path", "command"] {
-                if let Some(value) = view.get(key)? {
-                    if value.is_string()? {
-                        fields.insert(key.to_owned(), value.resolve()?.into_owned());
+            if !view.is_string()? {
+                for &key in SCALAR_META_KEYS {
+                    if let Some(value) = view.get(key)? {
+                        if value.is_string()? {
+                            fields.insert(key.to_owned(), value.resolve()?.into_owned());
+                        }
                     }
                 }
             }
-            let note = notes
-                && fields
-                    .get("file_path")
-                    .and_then(Value::as_str)
-                    .is_some_and(is_note_path);
-            let mut bytes = 0;
-            if let Some(content) = view.get("content")? {
-                if note && content.is_string()? {
-                    let content = content.resolve()?.into_owned();
-                    bytes = content.as_str().map_or(0, str::len);
-                    fields.insert("content".into(), content);
-                } else if label {
-                    content.for_each_str_chunk(|chunk| {
-                        bytes += chunk.len();
-                        Ok(())
-                    })?;
+            let full_write_path: Option<String> = if name == "Write" {
+                fields.get("file_path").and_then(Value::as_str).map(str::to_owned)
+            } else {
+                ops.iter().find_map(|sem| match &sem.op {
+                    ToolOp::FileEdit {
+                        path,
+                        is_full_write: true,
+                    } => Some(path.as_ref().to_owned()),
+                    _ => None,
+                })
+            };
+            let write_bytes = if name == "Write" || full_write_path.is_some() {
+                let note = notes && full_write_path.as_deref().is_some_and(is_note_path);
+                let mut bytes = 0;
+                let content_view = match view.get("content")? {
+                    Some(c) => Some(("content", c)),
+                    None => view.get("Content")?.map(|c| ("Content", c)),
+                };
+                if let Some((ckey, content)) = content_view {
+                    if note && content.is_string()? {
+                        let resolved = content.resolve()?.into_owned();
+                        bytes = resolved.as_str().map_or(0, str::len);
+                        if ckey != "content" {
+                            fields.insert("content".into(), resolved.clone());
+                        }
+                        fields.insert(ckey.into(), resolved);
+                    } else if label {
+                        content.for_each_str_chunk(|chunk| {
+                            bytes += chunk.len();
+                            Ok(())
+                        })?;
+                    }
                 }
-            }
+                Some(bytes)
+            } else {
+                None
+            };
             Ok(Self {
                 fields: std::borrow::Cow::Owned(Value::Object(fields)),
-                write_bytes: Some(bytes),
+                ops,
+                write_bytes,
             })
         })
     }
-    fn label(&self, name: &str) -> String {
-        match self.write_bytes {
-            Some(bytes) => truncate(
-                format!(
-                    "Write {} ({bytes} bytes)",
-                    self.fields.get("file_path").and_then(Value::as_str).unwrap_or("")
-                )
-                .trim(),
-                140,
-            ),
-            None => tool_label(name, &self.fields),
+
+    #[cfg(test)]
+    fn empty() -> Self {
+        Self {
+            fields: std::borrow::Cow::Owned(Value::Null),
+            ops: Vec::new(),
+            write_bytes: None,
         }
+    }
+
+    fn commands(&self) -> Vec<&str> {
+        use crate::tools::classify::ToolOp;
+        let op_cmds: Vec<&str> = self
+            .ops
+            .iter()
+            .filter_map(|sem| match &sem.op {
+                ToolOp::Command { cmd: Some(c), .. } => Some(c.as_ref()),
+                _ => None,
+            })
+            .collect();
+        if op_cmds.len() > 1 {
+            return op_cmds;
+        }
+        if let Some(c) = command_of(&self.fields) {
+            return vec![c];
+        }
+        op_cmds
+    }
+
+    fn primary_command(&self) -> Option<&str> {
+        if let Some(c) = command_of(&self.fields) {
+            return Some(c);
+        }
+        if self.ops.len() == 1 {
+            if let crate::tools::classify::ToolOp::Command { cmd: Some(c), .. } = &self.ops[0].op {
+                return Some(c.as_ref());
+            }
+        }
+        None
+    }
+
+    fn has_spawn(&self) -> bool {
+        self.ops
+            .iter()
+            .any(|sem| matches!(sem.op, crate::tools::classify::ToolOp::SubagentSpawn { .. }))
+    }
+
+    fn spawn_hint(&self) -> Option<&str> {
+        self.ops.iter().find_map(|sem| match &sem.op {
+            crate::tools::classify::ToolOp::SubagentSpawn {
+                target_hint: Some(h), ..
+            } => Some(h.as_ref()),
+            _ => None,
+        })
+    }
+
+    fn label(&self, harness: Harness, name: &str) -> String {
+        if let Some(bytes) = self.write_bytes {
+            let path = if name == "Write" {
+                self.fields.get("file_path").and_then(Value::as_str).unwrap_or("")
+            } else {
+                self.ops
+                    .iter()
+                    .find_map(|sem| match &sem.op {
+                        crate::tools::classify::ToolOp::FileEdit { path, .. } => Some(path.as_ref()),
+                        _ => None,
+                    })
+                    .unwrap_or("")
+            };
+            return truncate(format!("{name} {path} ({bytes} bytes)").trim(), 140);
+        }
+        tool_label_with_ops(harness, name, &self.fields, &self.ops)
     }
 }
 
 /// A short label for one tool call, for the ledger and the facts lists.
+#[cfg(test)]
 fn tool_label(name: &str, input: &Value) -> String {
+    tool_label_with_ops(Harness::Claude, name, input, &[])
+}
+
+fn tool_label_with_ops(
+    harness: Harness,
+    name: &str,
+    input: &Value,
+    ops: &[crate::tools::classify::ToolSemantic<'_>],
+) -> String {
+    use crate::tools::classify::{is_codex_exec_call, ToolOp};
     let s = |k: &str| input.get(k).and_then(Value::as_str).unwrap_or("");
+    let op_file = || {
+        ops.iter()
+            .find_map(|sem| match &sem.op {
+                ToolOp::FileEdit { path, .. } | ToolOp::FileRead { path } => Some(path.as_ref()),
+                ToolOp::Search { path: Some(p), .. } => Some(p.as_ref()),
+                _ => None,
+            })
+            .unwrap_or("")
+    };
+    let claude_path = || {
+        if input.get("file_path").is_some() {
+            s("file_path")
+        } else {
+            op_file()
+        }
+    };
     let l = match name {
         "Bash" => {
             let d = s("description");
@@ -580,13 +718,112 @@ fn tool_label(name: &str, input: &Value) -> String {
                 truncate(d.trim(), 120)
             }
         }
-        "Read" => format!("Read {}", s("file_path")),
-        "Write" => format!("Write {} ({} bytes)", s("file_path"), s("content").len()),
-        "Edit" | "MultiEdit" | "NotebookEdit" => format!("{name} {}", s("file_path")),
-        "Grep" | "Glob" => format!("{name} {:?} {}", s("pattern"), s("path")),
+        "Read" => format!("Read {}", claude_path()),
+        "Write" => format!("Write {} ({} bytes)", claude_path(), s("content").len()),
+        "Edit" | "MultiEdit" | "NotebookEdit" => format!("{name} {}", claude_path()),
+        "Grep" | "Glob" => format!("{name} {:?} {}", s("pattern"), claude_path()),
         "SendMessage" => format!("SendMessage → {}", s("to")),
         "Agent" | "Task" => format!("{name}: {}", s("description")),
-        _ => format!("{name} {}", truncate(&input.to_string(), 100)),
+        _ => {
+            let bare = name.rsplit(':').next().unwrap_or(name);
+            let desc = if !s("description").is_empty() {
+                s("description")
+            } else {
+                s("toolSummary")
+            };
+            let edit_count = ops
+                .iter()
+                .filter(|sem| matches!(sem.op, ToolOp::FileEdit { .. }))
+                .count();
+            if is_codex_exec_call(harness, name) && !ops.is_empty() {
+                let head = match &ops[0].op {
+                    ToolOp::Command { cmd: Some(cmd), .. } => truncate(first_line(cmd), 100),
+                    ToolOp::FileEdit { path, .. } => format!("apply_patch {path}"),
+                    ToolOp::FileRead { path } => format!("{} {path}", ops[0].tool),
+                    ToolOp::SubagentSpawn { target_hint, .. } => {
+                        format!("spawn_agent {}", target_hint.as_deref().unwrap_or(""))
+                            .trim()
+                            .to_string()
+                    }
+                    ToolOp::AgentMessage { recipient } => {
+                        format!("{} → {}", ops[0].tool, recipient.as_deref().unwrap_or(""))
+                            .trim()
+                            .to_string()
+                    }
+                    ToolOp::Background { job_id, .. } => format!("{} {}", ops[0].tool, job_id.as_deref().unwrap_or(""))
+                        .trim()
+                        .to_string(),
+                    ToolOp::Affordance { summary, .. } => format!("{} {summary}", ops[0].tool).trim().to_string(),
+                    ToolOp::Search { query, .. } => format!("{} {}", ops[0].tool, query.as_deref().unwrap_or(""))
+                        .trim()
+                        .to_string(),
+                    _ => ops[0].tool.to_string(),
+                };
+                if ops.len() > 1 {
+                    format!("exec: {head} (+{})", ops.len() - 1)
+                } else {
+                    format!("exec: {head}")
+                }
+            } else if let Some(sem) = ops.first() {
+                match &sem.op {
+                    ToolOp::Command { cmd, .. } => {
+                        if !desc.is_empty() {
+                            truncate(desc.trim(), 120)
+                        } else if let Some(c) = cmd {
+                            truncate(first_line(c), 120)
+                        } else {
+                            bare.to_string()
+                        }
+                    }
+                    ToolOp::FileEdit {
+                        path,
+                        is_full_write: true,
+                    } => {
+                        let content = input
+                            .get("content")
+                            .or_else(|| input.get("Content"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        format!("{bare} {path} ({} bytes)", content.len())
+                    }
+                    ToolOp::FileEdit {
+                        path,
+                        is_full_write: false,
+                    } => {
+                        if edit_count > 1 {
+                            format!("{bare} {path} (+{})", edit_count - 1)
+                        } else {
+                            format!("{bare} {path}")
+                        }
+                    }
+                    ToolOp::FileRead { path } => format!("{bare} {path}"),
+                    ToolOp::Search { query, path } => format!(
+                        "{bare} {:?} {}",
+                        query.as_deref().unwrap_or(""),
+                        path.as_deref().unwrap_or("")
+                    ),
+                    ToolOp::AgentMessage { recipient } => {
+                        format!("{bare} → {}", recipient.as_deref().unwrap_or(""))
+                    }
+                    ToolOp::SubagentSpawn { target_hint, .. } => {
+                        format!("{bare}: {}", target_hint.as_deref().unwrap_or(""))
+                    }
+                    ToolOp::Background { job_id, .. } => {
+                        format!("{bare} {}", job_id.as_deref().unwrap_or(""))
+                    }
+                    ToolOp::Affordance { action, summary, .. } => {
+                        if summary.is_empty() {
+                            format!("{bare} ({action})")
+                        } else {
+                            format!("{bare}: {summary}")
+                        }
+                    }
+                    ToolOp::Other { .. } => format!("{name} {}", truncate(&input.to_string(), 100)),
+                }
+            } else {
+                format!("{name} {}", truncate(&input.to_string(), 100))
+            }
+        }
     };
     truncate(l.trim(), 140)
 }
@@ -651,84 +888,187 @@ pub fn distill_pack(session: &Session, opts: &DistillOptions) -> anyhow::Result<
     Ok(analyze(session, opts, Demand::Pack)?.distilled)
 }
 
-/// Scoped demanded text. Owned blocks borrow directly; lazy fields resolve at most once while
-/// this message is analyzed. Thinking and other unobserved fields never become owned strings.
-struct MessageText<'a> {
-    message: &'a Message,
-    resolver: &'a crate::Resolver,
-    resolved: Option<Vec<Option<String>>>,
+/// Single-pass transcript decoder for [`analyze`].
+///
+/// Lazy `Block::Text` bodies decode at most once and stay cached for `referenced`, the main pass,
+/// `ground`, and `resumable_tail`. Lazy `Block::ToolResult` bodies decode once in the main pass,
+/// record their byte count for `source_est_tokens`, and drop immediately (retaining only clipped
+/// tail outputs). Unread `Thinking` spans validate bounds/stamps in O(1) without escape decoding.
+struct TranscriptCache<'a> {
+    msgs: &'a [Message],
+    resolver: crate::Resolver,
+    decoded_lens: Vec<Vec<Option<usize>>>,
+    texts: Vec<Vec<Option<String>>>,
+    tail_results: HashMap<(usize, usize), String>,
 }
-impl<'a> MessageText<'a> {
-    fn new(message: &'a Message, resolver: &'a crate::Resolver) -> Self {
+impl<'a> TranscriptCache<'a> {
+    fn new(session: &'a Session) -> Self {
+        let msgs = &session.messages;
         Self {
-            message,
-            resolver,
-            resolved: None,
+            msgs,
+            resolver: session.resolver(),
+            decoded_lens: msgs.iter().map(|m| vec![None; m.content.len()]).collect(),
+            texts: msgs.iter().map(|m| vec![None; m.content.len()]).collect(),
+            tail_results: HashMap::new(),
         }
     }
-    fn block(&mut self, index: usize) -> anyhow::Result<&str> {
-        let text = match &self.message.content[index] {
-            Block::Text { text } | Block::Thinking { text, .. } => text,
-            Block::ToolResult { content, .. } => content,
-            _ => anyhow::bail!("distill text requested for a non-text block"),
+
+    fn validate_upfront(&mut self) -> anyhow::Result<()> {
+        for (mi, message) in self.msgs.iter().enumerate() {
+            for (bi, block) in message.content.iter().enumerate() {
+                match block {
+                    Block::Thinking { text, .. } => {
+                        text.validate_unread(&self.resolver)?;
+                        if let Some(inline) = text.inline_str() {
+                            self.decoded_lens[mi][bi] = Some(inline.len());
+                        }
+                    }
+                    Block::Text { text } | Block::ToolResult { content: text, .. } => {
+                        if let Some(inline) = text.inline_str() {
+                            self.decoded_lens[mi][bi] = Some(inline.len());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for block in &message.content {
+                if let Block::ToolUse {
+                    input: input @ crate::Json::Source(_),
+                    ..
+                } = block
+                {
+                    input.with_view(|_| Ok(()))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn text_block(&mut self, mi: usize, bi: usize) -> anyhow::Result<&str> {
+        let Block::Text { text } = &self.msgs[mi].content[bi] else {
+            anyhow::bail!("distill text requested for a non-text block");
         };
-        if let Some(text) = text.inline_str() {
-            return Ok(text);
+        if let Some(inline) = text.inline_str() {
+            self.decoded_lens[mi][bi] = Some(inline.len());
+            return Ok(inline);
         }
-        let resolved = self
-            .resolved
-            .get_or_insert_with(|| (0..self.message.content.len()).map(|_| None).collect());
-        if resolved[index].is_none() {
-            // Malformed legacy escapes retain their raw/lossy fallback, but failed source
-            // reads must propagate for both Span and checked Source carriers.
-            resolved[index] = Some(text.try_resolve(self.resolver)?.into_owned());
+        if self.texts[mi][bi].is_none() {
+            #[cfg(test)]
+            note_work(|work| work.lazy_block_decodes += 1);
+            let owned = text.try_resolve(&self.resolver)?.into_owned();
+            self.decoded_lens[mi][bi] = Some(owned.len());
+            self.texts[mi][bi] = Some(owned);
         }
-        Ok(resolved[index].as_deref().expect("resolved demanded text"))
+        Ok(self.texts[mi][bi].as_deref().expect("cached text block"))
     }
-    fn release(&mut self, index: usize) {
-        if let Some(resolved) = self.resolved.as_mut() {
-            resolved[index] = None;
-        }
-    }
-    fn text(&mut self) -> anyhow::Result<Option<String>> {
+
+    fn message_text(&mut self, mi: usize) -> anyhow::Result<Option<String>> {
         let mut output = String::new();
-        for index in 0..self.message.content.len() {
-            if matches!(&self.message.content[index], Block::Text { .. }) {
+        for bi in 0..self.msgs[mi].content.len() {
+            if matches!(&self.msgs[mi].content[bi], Block::Text { .. }) {
                 if !output.is_empty() {
                     output.push('\n');
                 }
-                output.push_str(self.block(index)?);
+                output.push_str(self.text_block(mi, bi)?);
             }
         }
         Ok((!output.is_empty()).then_some(output))
     }
-}
 
-fn validate_analysis_sources(session: &Session) -> anyhow::Result<()> {
-    let resolver = session.resolver();
-    for message in &session.messages {
-        // Preserve materialize's validation order: text first, then structured arguments.
-        for block in &message.content {
-            let text = match block {
-                Block::Text { text } | Block::Thinking { text, .. } => Some(text),
-                Block::ToolResult { content, .. } => Some(content),
-                _ => None,
-            };
-            if let Some(text) = text.filter(|text| text.is_lazy()) {
-                text.try_for_each_chunk(&resolver, 64 * 1024, |_| Ok(()))?;
-            }
+    fn resolve_tool_result(&mut self, mi: usize, bi: usize) -> anyhow::Result<std::borrow::Cow<'_, str>> {
+        let Block::ToolResult { content, .. } = &self.msgs[mi].content[bi] else {
+            anyhow::bail!("distill tool result requested for a non-result block");
+        };
+        if content.is_lazy() {
+            #[cfg(test)]
+            note_work(|work| work.lazy_block_decodes += 1);
         }
-        for block in &message.content {
-            if let Block::ToolUse {
-                input: input @ crate::Json::Source(_),
-                ..
-            } = block
-            {
-                input.with_view(|_| Ok(()))?;
-            }
-        }
+        let resolved = content.try_resolve(&self.resolver)?;
+        self.decoded_lens[mi][bi] = Some(resolved.len());
+        Ok(resolved)
     }
-    Ok(())
+
+    fn resolve_thinking(&mut self, mi: usize, bi: usize) -> anyhow::Result<String> {
+        let Block::Thinking { text, .. } = &self.msgs[mi].content[bi] else {
+            anyhow::bail!("distill thinking requested for a non-thinking block");
+        };
+        if text.is_lazy() {
+            #[cfg(test)]
+            note_work(|work| work.lazy_block_decodes += 1);
+        }
+        let owned = text.try_resolve(&self.resolver)?.into_owned();
+        self.decoded_lens[mi][bi] = Some(owned.len());
+        Ok(owned)
+    }
+
+    fn delivered(&mut self, harness: Harness, mi: usize) -> anyhow::Result<Option<String>> {
+        let m = &self.msgs[mi];
+        if m.kind != MessageKind::InjectedContext {
+            return Ok(None);
+        }
+        let text = self.message_text(mi)?.unwrap_or_default();
+        Ok(crate::harness::delivered_body(harness, m, &text)
+            .filter(|body| !body.is_empty())
+            .map(str::to_string))
+    }
+
+    fn incoming_text(&mut self, harness: Harness, mi: usize) -> anyhow::Result<Option<String>> {
+        let m = &self.msgs[mi];
+        if m.role == Role::User && m.kind == MessageKind::Prompt {
+            let Some(raw) = self.message_text(mi)? else {
+                return Ok(None);
+            };
+            return Ok(Some(
+                crate::harness::delivered_body(harness, m, &raw)
+                    .map(str::to_string)
+                    .unwrap_or(raw),
+            ));
+        }
+        self.delivered(harness, mi)
+    }
+
+    /// Validate any remaining unread `Text`/`ToolResult` blocks once without retaining strings,
+    /// then compute `source_est_tokens` from already-observed `decoded_lens`.
+    fn finish_and_estimate(&mut self, demand: Demand) -> anyhow::Result<u64> {
+        for (mi, m) in self.msgs.iter().enumerate() {
+            for (bi, block) in m.content.iter().enumerate() {
+                match block {
+                    Block::Text { text } | Block::ToolResult { content: text, .. } => {
+                        if self.decoded_lens[mi][bi].is_none() {
+                            if text.is_lazy() {
+                                #[cfg(test)]
+                                note_work(|work| work.lazy_block_decodes += 1);
+                            }
+                            self.decoded_lens[mi][bi] = Some(text.try_decoded_len(&self.resolver)?);
+                        }
+                    }
+                    Block::Thinking { text, .. }
+                        if demand != Demand::Findings
+                            && m.is_model_visible()
+                            && self.decoded_lens[mi][bi].is_none() =>
+                    {
+                        self.decoded_lens[mi][bi] = Some(text.est_unread_len(&self.resolver)?);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if demand == Demand::Findings {
+            return Ok(0);
+        }
+        let mut total = 0u64;
+        for (mi, m) in self.msgs.iter().enumerate() {
+            #[cfg(test)]
+            note_work(|work| work.source_estimates += 1);
+            if !m.is_model_visible() {
+                continue;
+            }
+            for (bi, block) in m.content.iter().enumerate() {
+                total += crate::ir::est_tokens_with_len(block, self.decoded_lens[mi][bi])?;
+            }
+        }
+        Ok(total)
+    }
 }
 
 fn analysis_label(session: &Session, resolver: &crate::Resolver) -> anyhow::Result<String> {
@@ -750,9 +1090,27 @@ fn analysis_label(session: &Session, resolver: &crate::Resolver) -> anyhow::Resu
     Ok(rest.to_string())
 }
 
+fn simple_shell_read(cmd: &str) -> Option<String> {
+    let c = cmd.trim();
+    let simple = c.starts_with("cat ") || c.starts_with("sed -n");
+    let p = c.split_whitespace().last()?.trim_matches(['\'', '"']);
+    (simple && !c.contains('|') && !c.contains(';') && !c.contains("&&")).then(|| p.to_string())
+}
+
+fn is_sync_spawn_return(harness: Harness, name: &str, out: &str) -> bool {
+    if name == "Agent" || name == "Task" {
+        return true;
+    }
+    match crate::affordance::spawn_returns(harness, name) {
+        Some(crate::affordance::Returns::Result | crate::affordance::Returns::ResultInPrompt(_)) => true,
+        Some(crate::affordance::Returns::ResultUnless(marker)) => !out.contains(marker),
+        Some(crate::affordance::Returns::Later) | None => false,
+    }
+}
+
 fn analyze(session: &Session, opts: &DistillOptions, demand: Demand) -> anyhow::Result<PreparedDistillation> {
-    validate_analysis_sources(session)?;
-    let resolver = session.resolver();
+    let mut cache = TranscriptCache::new(session);
+    cache.validate_upfront()?;
     let msgs = &session.messages;
     let retrieve_ref = opts.retrieve_ref.clone().unwrap_or_else(|| session.id.clone());
 
@@ -764,34 +1122,51 @@ fn analyze(session: &Session, opts: &DistillOptions, demand: Demand) -> anyhow::
     // Documents named in the brief or in any message to the agent are instructions by reference:
     // when the agent reads one, its latest read is kept (capped) in the timeline.
     let mut referenced: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for m in msgs.iter().filter(|_| demand != Demand::Findings) {
-        let Some(t) = incoming_text(session.harness, m, &resolver)? else {
-            continue;
-        };
-        // A resumed distilled lane's opening prompt is its predecessor's pack: only the original
-        // brief inside it names documents as instructions.
-        let t = unwrap_pack(&t).map_or(t, |(brief, _)| brief);
-        for c in re(Re::Path).captures_iter(&t) {
-            referenced.insert(c[1].trim_end_matches(['.', ',', ';', ':', ')', '`', '\'']).to_string());
+    if demand != Demand::Findings {
+        for mi in 0..msgs.len() {
+            let Some(t) = cache.incoming_text(session.harness, mi)? else {
+                continue;
+            };
+            // A resumed distilled lane's opening prompt is its predecessor's pack: only the original
+            // brief inside it names documents as instructions.
+            let t = unwrap_pack(&t).map_or(t, |(brief, _)| brief);
+            for c in re(Re::Path).captures_iter(&t) {
+                referenced.insert(c[1].trim_end_matches(['.', ',', ';', ':', ')', '`', '\'']).to_string());
+            }
         }
     }
-    // tool_use_id → path, for reads of a referenced document (Read, or a plain `cat`/`sed -n` of it).
+    // tool_use_id → path, for reads of a referenced document (Read / read_file / view_file, or a
+    // plain `cat`/`sed -n` of it).
     let mut doc_reads: HashMap<&str, String> = HashMap::new();
     for m in msgs[..tail_start].iter().filter(|_| !referenced.is_empty()) {
         for b in &m.content {
             if let Block::ToolUse { id, name, input, .. } = b {
-                let input = ToolInput::new(name, input, false, false)?;
-                let input = &input.fields;
-                let path = match name.as_str() {
-                    "Read" => input.get("file_path").and_then(Value::as_str).map(String::from),
-                    _ => command_of(input).and_then(|c| {
-                        let c = c.trim();
-                        let simple = c.starts_with("cat ") || c.starts_with("sed -n");
-                        let p = c.split_whitespace().last()?.trim_matches(['\'', '"']);
-                        (simple && !c.contains('|') && !c.contains(';') && !c.contains("&&")).then(|| p.to_string())
-                    }),
+                let summary = ToolInput::new(session.harness, name, input, false, false)?;
+                let mut hit: Option<String> = match name.as_str() {
+                    "Read" => summary
+                        .fields
+                        .get("file_path")
+                        .and_then(Value::as_str)
+                        .map(String::from)
+                        .filter(|p| referenced.contains(p)),
+                    _ => None,
                 };
-                if let Some(p) = path.filter(|p| referenced.contains(p)) {
+                if hit.is_none() && name != "Read" {
+                    hit = summary.ops.iter().find_map(|sem| match &sem.op {
+                        crate::tools::classify::ToolOp::FileRead { path } if referenced.contains(path.as_ref()) => {
+                            Some(path.as_ref().to_owned())
+                        }
+                        _ => None,
+                    });
+                }
+                if hit.is_none() && name != "Read" {
+                    hit = summary
+                        .commands()
+                        .into_iter()
+                        .find_map(simple_shell_read)
+                        .filter(|p| referenced.contains(p));
+                }
+                if let Some(p) = hit {
                     doc_reads.insert(id.as_str(), p);
                 }
             }
@@ -819,12 +1194,11 @@ fn analyze(session: &Session, opts: &DistillOptions, demand: Demand) -> anyhow::
         for b in &m.content {
             if let Block::ToolUse { name, input, .. } = b {
                 if name != "Write" {
-                    let input = ToolInput::new(name, input, false, false)?;
-                    for c in command_of(&input.fields)
-                        .into_iter()
-                        .flat_map(|c| re(Re::CommitFile).captures_iter(c))
-                    {
-                        commit_files.insert(basename(&c[1]).to_string());
+                    let summary = ToolInput::new(session.harness, name, input, false, false)?;
+                    for cmd in summary.commands() {
+                        for c in re(Re::CommitFile).captures_iter(cmd) {
+                            commit_files.insert(basename(&c[1]).to_string());
+                        }
                     }
                 }
             }
@@ -848,10 +1222,9 @@ fn analyze(session: &Session, opts: &DistillOptions, demand: Demand) -> anyhow::
 
     for (i, m) in msgs.iter().enumerate() {
         let in_tail = i >= tail_start;
-        let mut reader = MessageText::new(m, &resolver);
         match (m.role, m.kind) {
             (Role::User, MessageKind::Prompt) if demand != Demand::Findings => {
-                let raw = reader.text()?.unwrap_or_default();
+                let raw = cache.message_text(i)?.unwrap_or_default();
                 let unwrapped = crate::harness::delivered_body(session.harness, m, &raw).map(str::to_string);
                 let text = unwrapped.clone().unwrap_or(raw);
                 if text.trim().is_empty() {
@@ -895,7 +1268,7 @@ fn analyze(session: &Session, opts: &DistillOptions, demand: Demand) -> anyhow::
                     idx: i,
                     when: when(m),
                     heading: "compaction summary (the harness's own digest of what came before)".into(),
-                    body: reader.text()?.unwrap_or_default(),
+                    body: cache.message_text(i)?.unwrap_or_default(),
                 });
             }
             (_, MessageKind::SubagentReturn) if !in_tail && demand != Demand::Findings => {
@@ -904,7 +1277,7 @@ fn analyze(session: &Session, opts: &DistillOptions, demand: Demand) -> anyhow::
                     when: when(m),
                     heading: "sub-agent returned".into(),
                     body: head_tail(
-                        &reader.text()?.unwrap_or_default(),
+                        &cache.message_text(i)?.unwrap_or_default(),
                         opts.note_max,
                         "the full return is in the source transcript",
                     ),
@@ -915,13 +1288,13 @@ fn analyze(session: &Session, opts: &DistillOptions, demand: Demand) -> anyhow::
                     idx: i,
                     when: when(m),
                     heading: "harness error".into(),
-                    body: truncate(reader.text()?.unwrap_or_default().trim(), 300),
+                    body: truncate(cache.message_text(i)?.unwrap_or_default().trim(), 300),
                 });
             }
             (_, MessageKind::InjectedContext) if !in_tail && demand != Demand::Findings => {
                 // A message delivered mid-run (peer agent, coordinator, queued user input). One
                 // message can arrive both as a queued command and as a coordinator turn.
-                if let Some(body) = delivered(session.harness, m, &resolver)? {
+                if let Some(body) = cache.delivered(session.harness, i)? {
                     if delivered_bodies.insert(body.clone()) {
                         timeline.push(Entry {
                             idx: i,
@@ -936,7 +1309,7 @@ fn analyze(session: &Session, opts: &DistillOptions, demand: Demand) -> anyhow::
                 for (index, b) in m.content.iter().enumerate() {
                     match b {
                         Block::Text { .. } if !in_tail => {
-                            let text = reader.block(index)?;
+                            let text = cache.text_block(i, index)?;
                             if text.trim().is_empty() {
                                 continue;
                             }
@@ -947,19 +1320,29 @@ fn analyze(session: &Session, opts: &DistillOptions, demand: Demand) -> anyhow::
                                 body: text.to_string(),
                             });
                         }
-                        Block::ToolUse { name, input, .. } => {
-                            let input = ToolInput::new(name, input, !in_tail, false)?;
-                            let input = &input.fields;
-                            scan_input_facts(name, input, &mut facts);
-                            if let Some(c) = command_of(input) {
+                        Block::ToolUse {
+                            name, input: raw_input, ..
+                        } => {
+                            let summary = ToolInput::new(session.harness, name, raw_input, !in_tail, false)?;
+                            scan_input_facts(name, &summary, &mut facts);
+                            let mut noted_cd = false;
+                            for c in summary.commands() {
                                 facts.note_pid_files(i, c);
                                 if let Some(d) = re(Re::Cd).captures_iter(c).last() {
                                     Facts::note_latest(&mut facts.dirs, i, &d[1]);
+                                    noted_cd = true;
+                                }
+                            }
+                            if !noted_cd && name != "Bash" {
+                                for sem in &summary.ops {
+                                    if let crate::tools::classify::ToolOp::Command { workdir: Some(w), .. } = &sem.op {
+                                        Facts::note_latest(&mut facts.dirs, i, w);
+                                    }
                                 }
                             }
                             if !in_tail {
-                                if let Some(mut e) = own_words_from_tool(i, m, name, input, opts) {
-                                    shorten_commit_note(&mut e, input, &commit_files);
+                                if let Some(mut e) = own_words_from_tool(i, m, name, &summary, raw_input, opts)? {
+                                    shorten_commit_note(&mut e, &summary, &commit_files);
                                     timeline.push(e);
                                 }
                             }
@@ -984,11 +1367,13 @@ fn analyze(session: &Session, opts: &DistillOptions, demand: Demand) -> anyhow::
                         .get(tool_use_id.as_str())
                         .map(|call| (call.name.to_string(), call.input))
                         .unwrap_or_else(|| (tool_name.clone().unwrap_or_default(), &orphan));
-                    let summary = ToolInput::new(&name, original_input, false, true)?;
-                    let label = summary.label(&name);
-                    let input = &summary.fields;
-                    let out = reader.block(index)?;
-                    let outcome = scan_result_facts(i, &name, input, &label, out, *is_error, &mut facts);
+                    let summary = ToolInput::new(session.harness, &name, original_input, false, true)?;
+                    let label = summary.label(session.harness, &name);
+                    let out_cow = cache.resolve_tool_result(i, index)?;
+                    let out = out_cow.as_ref();
+                    let out_len = out.len();
+                    let outcome =
+                        scan_result_facts(session.harness, i, &name, &summary, &label, out, *is_error, &mut facts);
                     if let Some(p) = doc_reads.get(tool_use_id.as_str()) {
                         if !in_tail && demand != Demand::Findings && last_read_of.get(p) == Some(&tool_use_id.as_str())
                         {
@@ -1003,33 +1388,53 @@ fn analyze(session: &Session, opts: &DistillOptions, demand: Demand) -> anyhow::
                             });
                         }
                     }
-                    if (name == "Agent" || name == "Task") && !in_tail && demand != Demand::Findings {
+                    if summary.has_spawn()
+                        && !in_tail
+                        && demand != Demand::Findings
+                        && is_sync_spawn_return(session.harness, &name, out)
+                    {
+                        let desc = if name == "Agent" || name == "Task" {
+                            summary
+                                .fields
+                                .get("description")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .trim()
+                        } else {
+                            summary.spawn_hint().unwrap_or("").trim()
+                        };
                         timeline.push(Entry {
                             idx: i,
                             when: when(m),
-                            heading: format!(
-                                "sub-agent returned ({})",
-                                truncate(
-                                    input.get("description").and_then(Value::as_str).unwrap_or("").trim(),
-                                    80
-                                )
-                            ),
+                            heading: format!("sub-agent returned ({})", truncate(desc, 80)),
                             body: head_tail(out, opts.note_max, &format!("cv cat {retrieve_ref} {tool_use_id}")),
                         });
                     }
-                    let keep_whole = in_tail && out.len() <= opts.tail_result_max;
+                    let keep_whole = in_tail && out_len <= opts.tail_result_max;
                     if !keep_whole && demand != Demand::Findings {
                         elided_outputs += 1;
                     }
                     if !keep_whole && demand == Demand::Full {
                         #[cfg(test)]
-                        note_work(|work| work.elided_copy_bytes += out.len());
+                        note_work(|work| work.elided_copy_bytes += out_len);
                         elided.push(Elided {
                             tool_use_id: tool_use_id.clone(),
                             tool_name: name.clone(),
                             input: original_input.resolve()?.into_owned(),
                             content: out.to_string(),
                         });
+                    }
+                    if in_tail && demand != Demand::Findings && m.is_model_visible() {
+                        let tail_text = if out_len > opts.tail_result_max {
+                            head_tail(
+                                out,
+                                opts.tail_result_max,
+                                &format!("cv cat {retrieve_ref} {tool_use_id}"),
+                            )
+                        } else {
+                            out_cow.into_owned()
+                        };
+                        cache.tail_results.insert((i, index), tail_text);
                     }
                     if !in_tail && opts.ledger {
                         let use_idx = uses.get(tool_use_id.as_str()).map(|c| c.msg).unwrap_or(i);
@@ -1038,17 +1443,15 @@ fn analyze(session: &Session, opts: &DistillOptions, demand: Demand) -> anyhow::
                                 last.1 = use_idx;
                                 last.3 = outcome;
                                 last.4 = tool_use_id.clone();
-                                last.5 = out.len();
+                                last.5 = out_len;
                                 *ledger_runs.last_mut().unwrap() += 1;
                             }
                             _ => {
-                                ledger.push((use_idx, use_idx, label, outcome, tool_use_id.clone(), out.len()));
+                                ledger.push((use_idx, use_idx, label, outcome, tool_use_id.clone(), out_len));
                                 ledger_runs.push(1);
                             }
                         }
                     }
-                    // Results are consumed once; do not retain other results in this message.
-                    reader.release(index);
                 }
             }
             _ => {}
@@ -1057,7 +1460,7 @@ fn analyze(session: &Session, opts: &DistillOptions, demand: Demand) -> anyhow::
         if m.role == Role::Assistant {
             for (index, b) in m.content.iter().enumerate() {
                 if let Block::Text { .. } = b {
-                    let prose = reader.block(index)?;
+                    let prose = cache.text_block(i, index)?;
                     for c in re(Re::Path).captures_iter(prose) {
                         let p = c[1].trim_end_matches(['.', ',', ';', ':', ')', '`']);
                         if plausible_path(p) {
@@ -1074,8 +1477,9 @@ fn analyze(session: &Session, opts: &DistillOptions, demand: Demand) -> anyhow::
     }
 
     // ── render the head ──
-    let label = analysis_label(session, &resolver)?;
+    let label = analysis_label(session, &cache.resolver)?;
     if demand == Demand::Findings {
+        cache.finish_and_estimate(Demand::Findings)?;
         let mut h = String::new();
         let _ = writeln!(h, "## Findings from another lane — {label} (`{}`)\n", session.id);
         // These headings are produced by the extractor. Source Markdown is body content and
@@ -1133,7 +1537,7 @@ fn analyze(session: &Session, opts: &DistillOptions, demand: Demand) -> anyhow::
     );
     let elided_hint = (opts.ledger && elided_outputs > 0).then_some((retrieve_ref.as_str(), elided_outputs));
     render_handoff(&mut h, last_words.as_ref(), &facts, msgs, elided_hint);
-    render_grounding(&mut h, &ground(session.harness, msgs, &uses, &resolver)?);
+    render_grounding(&mut h, &ground(session.harness, msgs, &uses, &mut cache)?);
     if let Some((i, text)) = &brief {
         let _ = writeln!(h, "{BRIEF_HEAD}{i}]\n\n{}\n", text.trim());
     }
@@ -1176,24 +1580,15 @@ fn analyze(session: &Session, opts: &DistillOptions, demand: Demand) -> anyhow::
         h.push('\n');
     }
 
-    let tail = resumable_tail(
-        session.harness,
-        msgs,
-        tail_start,
-        opts,
-        &retrieve_ref,
-        &session.resolver(),
-    )?;
-    let tail_md = render_prepared_tail(&tail, tail_start, opts)?;
+    let tail = resumable_tail(session.harness, msgs, tail_start, opts, &retrieve_ref, &mut cache)?;
+    let tail_md = render_prepared_tail(session.harness, &tail, tail_start, opts)?;
     let tail_tool_calls = tail
         .iter()
         .flat_map(|message| &message.content)
         .filter(|block| matches!(block, Block::ToolUse { .. }))
         .count();
 
-    let source_est_tokens: u64 = msgs.iter().try_fold(0u64, |sum, message| {
-        Ok::<_, anyhow::Error>(sum + message_est_resolved(message, &resolver)?)
-    })?;
+    let source_est_tokens = cache.finish_and_estimate(demand)?;
     let pack_est_tokens = est(&h);
     let tail_est_tokens: u64 = tail
         .iter()
@@ -1233,34 +1628,6 @@ fn analyze(session: &Session, opts: &DistillOptions, demand: Demand) -> anyhow::
         tail,
         keep_last: opts.keep_last,
     })
-}
-
-/// The body of a message delivered to the lane mid-run via an injected-context record (e.g. a
-/// queued command wrapped in harness framing), unwrapped by the session's adapter.
-fn delivered(harness: Harness, m: &Message, resolver: &crate::Resolver) -> anyhow::Result<Option<String>> {
-    if m.kind != MessageKind::InjectedContext {
-        return Ok(None);
-    }
-    let text = MessageText::new(m, resolver).text()?.unwrap_or_default();
-    Ok(crate::harness::delivered_body(harness, m, &text)
-        .filter(|body| !body.is_empty())
-        .map(str::to_string))
-}
-
-/// Everything said to the lane: its prompts (unwrapped when delivered by an agent/coordinator)
-/// and any messages delivered mid-run via injected context.
-fn incoming_text(harness: Harness, m: &Message, resolver: &crate::Resolver) -> anyhow::Result<Option<String>> {
-    if m.role == Role::User && m.kind == MessageKind::Prompt {
-        let Some(raw) = MessageText::new(m, resolver).text()? else {
-            return Ok(None);
-        };
-        return Ok(Some(
-            crate::harness::delivered_body(harness, m, &raw)
-                .map(str::to_string)
-                .unwrap_or(raw),
-        ));
-    }
-    delivered(harness, m, resolver)
 }
 
 // The pack's section headings. The renderer writes them numbered; `unwrap_pack` finds them by
@@ -1422,12 +1789,17 @@ fn is_commit_note(path: &str, content: &str, commit_files: &HashSet<String>) -> 
     commit_files.contains(basename(path)) || content.contains("Co-Authored-By:") || content.contains("Signed-off-by:")
 }
 
-fn shorten_commit_note(e: &mut Entry, input: &Value, commit_files: &HashSet<String>) {
+fn shorten_commit_note(e: &mut Entry, summary: &ToolInput<'_>, commit_files: &HashSet<String>) {
     let Some(rest) = e.heading.strip_prefix("agent wrote ") else {
         return;
     };
     let path = rest.trim_end_matches(" (shell)").to_string();
-    match (input.get("content").and_then(Value::as_str), command_of(input)) {
+    let content = summary
+        .fields
+        .get("content")
+        .or_else(|| summary.fields.get("Content"))
+        .and_then(Value::as_str);
+    match (content, summary.commands().first().copied()) {
         (Some(content), _) if is_commit_note(&path, content, commit_files) => {
             e.heading = format!("agent wrote {path} (commit message)");
             e.body = head_tail(content, COMMIT_NOTE_MAX, COMMIT_NOTE_POINTER);
@@ -1440,55 +1812,219 @@ fn shorten_commit_note(e: &mut Entry, input: &Value, commit_files: &HashSet<Stri
     }
 }
 
-/// The agent's own words carried by a tool call: messages it sent, notes it wrote, agents it spawned.
-fn own_words_from_tool(i: usize, m: &Message, name: &str, input: &Value, opts: &DistillOptions) -> Option<Entry> {
-    let s = |k: &str| input.get(k).and_then(Value::as_str).unwrap_or("");
-    match name {
-        "SendMessage" => Some(Entry {
-            idx: i,
-            when: when(m),
-            heading: format!("agent sent a message → {}", s("to")),
-            body: s("message").to_string(),
-        }),
-        "Write" if is_note_path(s("file_path")) => Some(Entry {
-            idx: i,
-            when: when(m),
-            heading: format!("agent wrote {}", s("file_path")),
-            body: head_tail(s("content"), opts.note_max, "the full file is on disk"),
-        }),
-        "Agent" | "Task" => Some(Entry {
-            idx: i,
-            when: when(m),
-            heading: format!("agent spawned a sub-agent: {}", s("description")),
-            body: head_tail(
-                s("prompt"),
-                opts.note_max.min(2000),
-                "the full prompt is in the source transcript",
-            ),
-        }),
-        _ => {
-            let cmd = command_of(input)?;
-            let target = re(Re::HeredocTarget).captures(cmd)?.get(1)?.as_str().to_string();
-            if !is_note_path(&target) || cmd.starts_with("python") {
-                return None;
+fn view_first_string(view: crate::json::JsonView<'_>, keys: &[&str]) -> anyhow::Result<Option<String>> {
+    if view.is_string()? {
+        return Ok(None);
+    }
+    for &key in keys {
+        if let Some(val) = view.get(key)? {
+            if val.is_string()? {
+                return Ok(val.resolve()?.as_str().map(str::to_owned));
             }
-            Some(Entry {
-                idx: i,
-                when: when(m),
-                heading: format!("agent wrote {target} (shell)"),
-                body: format!(
-                    "```\n{}\n```",
-                    head_tail(cmd, opts.note_max, "the full command is in the source transcript")
-                ),
-            })
         }
     }
+    Ok(None)
 }
 
-fn scan_input_facts(_name: &str, input: &Value, f: &mut Facts) {
-    let mut texts: Vec<&str> = Vec::new();
-    if let Some(c) = command_of(input) {
-        texts.push(c);
+/// Extract a string property value from a simple JS object literal inside a Codex `exec` script
+/// (such as `tools.send_message({ target: "...", message: "..." })`).
+fn js_string_prop(script: &str, keys: &[&str]) -> Option<String> {
+    for &key in keys {
+        for pat in [format!("\"{key}\""), format!("'{key}'"), key.to_string()] {
+            let mut rest = script;
+            while let Some(pos) = rest.find(&pat) {
+                let before_ok =
+                    pos == 0 || !rest.as_bytes()[pos - 1].is_ascii_alphanumeric() && rest.as_bytes()[pos - 1] != b'_';
+                let after = &rest[pos + pat.len()..];
+                let trimmed = after.trim_start();
+                if before_ok {
+                    if let Some(after_colon) = trimmed.strip_prefix(':') {
+                        let val = after_colon.trim_start();
+                        let quote = val.chars().next()?;
+                        if matches!(quote, '"' | '\'' | '`') {
+                            let mut out = String::new();
+                            let mut chars = val[quote.len_utf8()..].chars();
+                            while let Some(ch) = chars.next() {
+                                if ch == '\\' {
+                                    if let Some(esc) = chars.next() {
+                                        match esc {
+                                            'n' => out.push('\n'),
+                                            't' => out.push('\t'),
+                                            'r' => out.push('\r'),
+                                            other => out.push(other),
+                                        }
+                                    }
+                                } else if ch == quote {
+                                    return Some(out);
+                                } else {
+                                    out.push(ch);
+                                }
+                            }
+                        }
+                    }
+                }
+                rest = &rest[pos + pat.len()..];
+            }
+        }
+    }
+    None
+}
+
+fn extract_tool_field(
+    summary: &ToolInput<'_>,
+    raw_input: &crate::Json,
+    keys: &[&str],
+) -> anyhow::Result<Option<String>> {
+    for &k in keys {
+        if let Some(s) = summary.fields.get(k).and_then(Value::as_str) {
+            return Ok(Some(s.to_owned()));
+        }
+    }
+    raw_input.with_view(|view| {
+        if let Some(found) = view_first_string(view, keys)? {
+            return Ok(Some(found));
+        }
+        let script = if view.is_string()? {
+            view.resolve()?.as_str().map(str::to_owned)
+        } else {
+            match view.get("raw")? {
+                Some(raw) if raw.is_string()? => raw.resolve()?.as_str().map(str::to_owned),
+                _ => None,
+            }
+        };
+        Ok(script.and_then(|s| js_string_prop(&s, keys)))
+    })
+}
+
+/// The agent's own words carried by a tool call: messages it sent, notes it wrote, agents it spawned.
+fn own_words_from_tool(
+    i: usize,
+    m: &Message,
+    name: &str,
+    summary: &ToolInput<'_>,
+    raw_input: &crate::Json,
+    opts: &DistillOptions,
+) -> anyhow::Result<Option<Entry>> {
+    use crate::tools::classify::ToolOp;
+    let input = &summary.fields;
+    let s = |k: &str| input.get(k).and_then(Value::as_str).unwrap_or("");
+    match name {
+        "SendMessage" => {
+            return Ok(Some(Entry {
+                idx: i,
+                when: when(m),
+                heading: format!("agent sent a message → {}", s("to")),
+                body: s("message").to_string(),
+            }))
+        }
+        "Write" if is_note_path(s("file_path")) => {
+            return Ok(Some(Entry {
+                idx: i,
+                when: when(m),
+                heading: format!("agent wrote {}", s("file_path")),
+                body: head_tail(s("content"), opts.note_max, "the full file is on disk"),
+            }))
+        }
+        "Write" => {}
+        "Agent" | "Task" => {
+            return Ok(Some(Entry {
+                idx: i,
+                when: when(m),
+                heading: format!("agent spawned a sub-agent: {}", s("description")),
+                body: head_tail(
+                    s("prompt"),
+                    opts.note_max.min(2000),
+                    "the full prompt is in the source transcript",
+                ),
+            }))
+        }
+        _ => {
+            for sem in &summary.ops {
+                match &sem.op {
+                    ToolOp::AgentMessage { recipient } => {
+                        let to = recipient.as_deref().unwrap_or("");
+                        let body = extract_tool_field(
+                            summary,
+                            raw_input,
+                            &["message", "Message", "content", "text", "input"],
+                        )?
+                        .unwrap_or_default();
+                        return Ok(Some(Entry {
+                            idx: i,
+                            when: when(m),
+                            heading: format!("agent sent a message → {to}"),
+                            body,
+                        }));
+                    }
+                    ToolOp::FileEdit {
+                        path,
+                        is_full_write: true,
+                    } if is_note_path(path) => {
+                        let content = input
+                            .get("content")
+                            .or_else(|| input.get("Content"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        return Ok(Some(Entry {
+                            idx: i,
+                            when: when(m),
+                            heading: format!("agent wrote {path}"),
+                            body: head_tail(content, opts.note_max, "the full file is on disk"),
+                        }));
+                    }
+                    ToolOp::SubagentSpawn { target_hint, .. } => {
+                        let desc = target_hint.as_deref().unwrap_or("");
+                        let prompt = extract_tool_field(
+                            summary,
+                            raw_input,
+                            &["prompt", "Prompt", "message", "task", "instructions"],
+                        )?
+                        .unwrap_or_default();
+                        return Ok(Some(Entry {
+                            idx: i,
+                            when: when(m),
+                            heading: format!("agent spawned a sub-agent: {desc}"),
+                            body: head_tail(
+                                &prompt,
+                                opts.note_max.min(2000),
+                                "the full prompt is in the source transcript",
+                            ),
+                        }));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    for cmd in summary.commands() {
+        let Some(caps) = re(Re::HeredocTarget).captures(cmd) else {
+            continue;
+        };
+        let Some(m_target) = caps.get(1) else {
+            continue;
+        };
+        let target = m_target.as_str().to_string();
+        if !is_note_path(&target) || cmd.starts_with("python") {
+            continue;
+        }
+        return Ok(Some(Entry {
+            idx: i,
+            when: when(m),
+            heading: format!("agent wrote {target} (shell)"),
+            body: format!(
+                "```\n{}\n```",
+                head_tail(cmd, opts.note_max, "the full command is in the source transcript")
+            ),
+        }));
+    }
+    Ok(None)
+}
+
+fn scan_input_facts(_name: &str, summary: &ToolInput<'_>, f: &mut Facts) {
+    use crate::tools::classify::ToolOp;
+    let input = &summary.fields;
+    let cmds = summary.commands();
+    for &c in &cmds {
         for h in hosts_in(c) {
             bump(&mut f.hosts, &h);
         }
@@ -1501,16 +2037,31 @@ fn scan_input_facts(_name: &str, input: &Value, f: &mut Facts) {
             bump(&mut f.branches, b);
         }
     }
+    let mut bumped_direct: Vec<&str> = Vec::new();
     for k in ["file_path", "path", "notebook_path"] {
         if let Some(p) = input.get(k).and_then(Value::as_str) {
             if plausible_path(p) {
                 bump(&mut f.paths, p);
+                bumped_direct.push(p);
             }
         }
     }
-    for t in texts {
-        for c in re(Re::Path).captures_iter(t) {
-            let p = c[1].trim_end_matches(['.', ',', ';', ':', ')', '`', '\'']);
+    for sem in &summary.ops {
+        let op_path = match &sem.op {
+            ToolOp::FileEdit { path, .. } | ToolOp::FileRead { path } => Some(path.as_ref()),
+            ToolOp::Search { path: Some(p), .. } | ToolOp::Other { path: Some(p), .. } => Some(p.as_ref()),
+            _ => None,
+        };
+        if let Some(p) = op_path {
+            if plausible_path(p) && !bumped_direct.contains(&p) {
+                bump(&mut f.paths, p);
+                bumped_direct.push(p);
+            }
+        }
+    }
+    for c in cmds {
+        for cap in re(Re::Path).captures_iter(c) {
+            let p = cap[1].trim_end_matches(['.', ',', ';', ':', ')', '`', '\'']);
             if plausible_path(p) {
                 bump(&mut f.paths, p);
             }
@@ -1519,15 +2070,18 @@ fn scan_input_facts(_name: &str, input: &Value, f: &mut Facts) {
 }
 
 /// Mine one tool result; returns its ledger outcome.
+#[allow(clippy::too_many_arguments)]
 fn scan_result_facts(
+    harness: Harness,
     i: usize,
     name: &str,
-    input: &Value,
+    summary: &ToolInput<'_>,
     label: &str,
     out: &str,
     is_error: bool,
     f: &mut Facts,
 ) -> String {
+    let cmds = summary.commands();
     let mut commit_outcome: Option<String> = None;
     for c in re(Re::Commit).captures_iter(out) {
         let (b, sha, subj) = (c[1].to_string(), c[2].to_string(), c[3].trim().to_string());
@@ -1541,10 +2095,12 @@ fn scan_result_facts(
         }
     }
     if commit_outcome.is_none() && !is_error {
-        for (repo, sha, subject) in command_of(input).map(|c| quiet_commits(c, out)).unwrap_or_default() {
-            if f.commit_shas.insert(sha.to_string()) {
-                commit_outcome.get_or_insert_with(|| format!("⊕ [{repo} {sha}] {}", truncate(subject, 90)));
-                f.commits.push((i, repo, sha.to_string(), subject.to_string()));
+        for &cmd in &cmds {
+            for (repo, sha, subject) in quiet_commits(cmd, out) {
+                if f.commit_shas.insert(sha.to_string()) {
+                    commit_outcome.get_or_insert_with(|| format!("⊕ [{repo} {sha}] {}", truncate(subject, 90)));
+                    f.commits.push((i, repo, sha.to_string(), subject.to_string()));
+                }
             }
         }
     }
@@ -1552,8 +2108,10 @@ fn scan_result_facts(
         bump(&mut f.branches, &c[1]);
     }
     if !is_error {
-        if let Some((key, line)) = command_of(input).and_then(|c| git_log_head(c, out)) {
-            f.heads.push((i, key, line));
+        for &cmd in &cmds {
+            if let Some((key, line)) = git_log_head(cmd, out) {
+                f.heads.push((i, key, line));
+            }
         }
     }
     for c in re(Re::Tip).captures_iter(out) {
@@ -1578,7 +2136,15 @@ fn scan_result_facts(
     if let Some(c) = commit_outcome {
         return c;
     }
-    let is_gate = name == "Bash" && command_of(input).is_some_and(|c| re(Re::GateCmd).is_match(c));
+    let is_gate = if name == "Bash" {
+        command_of(&summary.fields).is_some_and(|c| re(Re::GateCmd).is_match(c))
+    } else {
+        summary
+            .ops
+            .iter()
+            .any(|sem| matches!(sem.op, crate::tools::classify::ToolOp::Command { .. }))
+            && cmds.iter().any(|c| re(Re::GateCmd).is_match(c))
+    };
     if is_gate {
         let verdict = out
             .lines()
@@ -1590,6 +2156,11 @@ fn scan_result_facts(
         let verdict = truncate(verdict.trim(), 160);
         f.gates.push((i, label.to_string(), verdict.clone()));
         return format!("⚑ {verdict}");
+    }
+    if name != "Agent" && name != "Task" && summary.has_spawn() && !is_sync_spawn_return(harness, name, out) {
+        if let Some(child_id) = crate::tools::classify::spawn_return_id(harness, name, out, false) {
+            return format!("spawned `{child_id}`");
+        }
     }
     let n = out.lines().filter(|l| !l.trim().is_empty()).count();
     let fl = truncate(first_line(out), 100);
@@ -1722,10 +2293,10 @@ fn is_state_path(p: &str) -> bool {
 
 /// Files a message to the lane calls its state file ("your brief and state file is `…`"): the
 /// infra lane's is `edge/demo/CHECKLIST.md`, which no name rule finds.
-fn named_state_files(harness: Harness, msgs: &[Message], resolver: &crate::Resolver) -> anyhow::Result<Vec<String>> {
+fn named_state_files(harness: Harness, cache: &mut TranscriptCache<'_>) -> anyhow::Result<Vec<String>> {
     let mut named: Vec<String> = Vec::new();
-    for m in msgs {
-        let Some(text) = incoming_text(harness, m, resolver)? else {
+    for mi in 0..cache.msgs.len() {
+        let Some(text) = cache.incoming_text(harness, mi)? else {
             continue;
         };
         let text = unwrap_pack(&text).map_or(text, |(brief, _)| brief);
@@ -1755,16 +2326,38 @@ fn heredoc_body(cmd: &str, target: &str) -> Option<String> {
     Some(lines.join("\n"))
 }
 
+fn note_shell_state(
+    i: usize,
+    cmd: &str,
+    named: &[String],
+    state: &mut Option<(usize, String, String, Option<String>)>,
+) {
+    for c in re(Re::HeredocTarget).captures_iter(cmd) {
+        if is_state(&c[1], named) {
+            let body = heredoc_body(cmd, &c[1]);
+            *state = Some((i, c[1].to_string(), "shell".into(), body));
+        }
+    }
+    // A named state file rewritten in place by a script (`sed -i`, `python3 -`, `perl -i`):
+    // the transcript holds no content.
+    let rewrites = re(Re::InPlace).is_match(cmd);
+    let hit = named.iter().find(|p| rewrites && cmd.contains(basename(p)));
+    if let Some(path) = hit.filter(|_| state.as_ref().is_none_or(|st| st.0 != i)) {
+        *state = Some((i, path.clone(), "a script, in place".into(), None));
+    }
+}
+
 fn ground(
     harness: Harness,
     msgs: &[Message],
     uses: &HashMap<&str, crate::ir::ToolCall<'_>>,
-    resolver: &crate::Resolver,
+    cache: &mut TranscriptCache<'_>,
 ) -> anyhow::Result<Grounding> {
+    use crate::tools::classify::{visit_tool_ops, ClassifyOpts, ToolOp};
     let open_re = re(Re::OpenItem);
     let decided_re = re(Re::Decision);
     let window = tail_cut(msgs, GROUNDING_WINDOW, uses);
-    let named = named_state_files(harness, msgs, resolver)?;
+    let named = named_state_files(harness, cache)?;
     let mut g = Grounding::default();
     let mut open: Vec<(usize, String)> = Vec::new();
     let mut decisions: Vec<(usize, String)> = Vec::new();
@@ -1774,47 +2367,72 @@ fn ground(
         list.push((i, line));
     };
     for (i, m) in msgs.iter().enumerate().filter(|(_, m)| m.role == Role::Assistant) {
-        let mut reader = MessageText::new(m, resolver);
         for (index, block) in m.content.iter().enumerate() {
             let words: String = match block {
-                Block::Text { .. } => reader.block(index)?.to_string(),
+                Block::Text { .. } => cache.text_block(i, index)?.to_string(),
                 Block::ToolUse { name, input, .. } => {
-                    if i < window && name != "SendMessage" {
+                    let bare = name.rsplit(':').next().unwrap_or(name);
+                    let could_message = matches!(
+                        bare,
+                        "SendMessage" | "send_message" | "followup_task" | "send_input" | "team_send_message" | "exec"
+                    );
+                    if i < window && !could_message {
                         continue;
                     }
                     let msg_words: Option<String> = input.with_view(|view| {
                         let string_field = |key: &str| -> anyhow::Result<Option<String>> {
+                            if view.is_string()? {
+                                return Ok(None);
+                            }
                             match view.get(key)? {
                                 Some(v) if v.is_string()? => Ok(v.resolve()?.as_str().map(str::to_owned)),
                                 _ => Ok(None),
                             }
                         };
+                        let mut ops = Vec::new();
+                        visit_tool_ops(Some(harness), name, view, ClassifyOpts::FULL, |sem| {
+                            ops.push(sem.into_owned());
+                        })?;
                         if i >= window {
-                            let path = string_field("file_path")?.unwrap_or_default();
                             match name.as_str() {
-                                "Write" if is_state(&path, &named) => {
-                                    let content = string_field("content")?.unwrap_or_default();
-                                    g.state = Some((i, path, "Write".into(), Some(content)));
+                                "Write" => {
+                                    let path = string_field("file_path")?.unwrap_or_default();
+                                    if is_state(&path, &named) {
+                                        let content = string_field("content")?.unwrap_or_default();
+                                        g.state = Some((i, path, "Write".into(), Some(content)));
+                                    }
                                 }
-                                "Edit" | "MultiEdit" if is_state(&path, &named) => {
-                                    g.state = Some((i, path, "Edit".into(), None));
+                                "Edit" | "MultiEdit" => {
+                                    let path = string_field("file_path")?.unwrap_or_default();
+                                    if is_state(&path, &named) {
+                                        g.state = Some((i, path, "Edit".into(), None));
+                                    }
                                 }
-                                "Write" | "Edit" | "MultiEdit" => {}
-                                _ => {
+                                "Bash" => {
                                     if let Some(cmd) = string_field("command")? {
-                                        for c in re(Re::HeredocTarget).captures_iter(&cmd) {
-                                            if is_state(&c[1], &named) {
-                                                let body = heredoc_body(&cmd, &c[1]);
-                                                g.state = Some((i, c[1].to_string(), "shell".into(), body));
+                                        note_shell_state(i, &cmd, &named, &mut g.state);
+                                    }
+                                }
+                                _ => {
+                                    for sem in &ops {
+                                        match &sem.op {
+                                            ToolOp::FileEdit { path, is_full_write } if is_state(path, &named) => {
+                                                let content = if *is_full_write {
+                                                    let c = match string_field("content")? {
+                                                        Some(c) => Some(c),
+                                                        None => string_field("Content")?,
+                                                    };
+                                                    Some(c.unwrap_or_default())
+                                                } else {
+                                                    None
+                                                };
+                                                g.state =
+                                                    Some((i, path.as_ref().to_owned(), sem.tool.to_string(), content));
                                             }
-                                        }
-                                        // A named state file rewritten in place by a script (`sed -i`,
-                                        // `python3 -`, `perl -i`): the transcript holds no content.
-                                        let rewrites = re(Re::InPlace).is_match(&cmd);
-                                        let hit = named.iter().find(|p| rewrites && cmd.contains(basename(p)));
-                                        if let Some(path) = hit.filter(|_| g.state.as_ref().is_none_or(|st| st.0 != i))
-                                        {
-                                            g.state = Some((i, path.clone(), "a script, in place".into(), None));
+                                            ToolOp::Command { cmd: Some(cmd), .. } => {
+                                                note_shell_state(i, cmd, &named, &mut g.state);
+                                            }
+                                            _ => {}
                                         }
                                     }
                                 }
@@ -1822,6 +2440,24 @@ fn ground(
                         }
                         if name == "SendMessage" {
                             string_field("message")
+                        } else if ops.iter().any(|sem| matches!(sem.op, ToolOp::AgentMessage { .. })) {
+                            if let Some(found) =
+                                view_first_string(view, &["message", "Message", "content", "text", "input"])?
+                            {
+                                Ok(Some(found))
+                            } else {
+                                let script = if view.is_string()? {
+                                    view.resolve()?.as_str().map(str::to_owned)
+                                } else {
+                                    match view.get("raw")? {
+                                        Some(raw) if raw.is_string()? => raw.resolve()?.as_str().map(str::to_owned),
+                                        _ => None,
+                                    }
+                                };
+                                Ok(script.and_then(|s| {
+                                    js_string_prop(&s, &["message", "Message", "content", "text", "input"])
+                                }))
+                            }
                         } else {
                             Ok(None)
                         }
@@ -2071,24 +2707,23 @@ fn clear_resume_usage(message: &mut Message) {
     message.extra.remove(crate::ir::CARRIER_KEY);
 }
 
-/// The tail as real IR turns for a resumable session: thinking dropped (unless asked), recorded
-/// usage stripped (so a resume gate never reads the source's stale near-limit size), oversized
-/// results clipped with a `cv cat` pointer, queued messages turned into user turns, harness-only
-/// records dropped. A trailing call with no result stays here (the pack shows the lane stopped
-/// mid-call); the Claude emitter drops it from a resumable session (`harness::claude::emit::emit`).
+/// The tail as real IR turns for a resumable session, reusing already-decoded blocks from
+/// [`TranscriptCache`] during [`analyze`] so tail `Text` and `ToolResult` blocks are never
+/// decoded a second time.
 fn resumable_tail(
     harness: Harness,
     msgs: &[Message],
     tail_start: usize,
     opts: &DistillOptions,
     retrieve_ref: &str,
-    resolver: &crate::Resolver,
+    cache: &mut TranscriptCache<'_>,
 ) -> anyhow::Result<Vec<Message>> {
     #[cfg(test)]
     note_work(|work| work.tail_preparations += 1);
     let mut out: Vec<Message> = Vec::new();
     let mut delivered_tail: HashSet<String> = HashSet::new();
-    for m in &msgs[tail_start..] {
+    for (offset, m) in msgs[tail_start..].iter().enumerate() {
+        let mi = tail_start + offset;
         if !m.is_model_visible() {
             continue;
         }
@@ -2096,10 +2731,34 @@ fn resumable_tail(
             (Role::Assistant, _) => {
                 let mut m2 = m.clone();
                 clear_resume_usage(&mut m2);
-                if !opts.keep_tail_thinking {
-                    m2.content.retain(|b| !matches!(b, Block::Thinking { .. }));
+                let mut content = Vec::with_capacity(m.content.len());
+                for (bi, block) in m2.content.into_iter().enumerate() {
+                    match block {
+                        Block::Thinking {
+                            signature,
+                            encrypted,
+                            redacted,
+                            ..
+                        } => {
+                            if opts.keep_tail_thinking {
+                                let text = cache.resolve_thinking(mi, bi)?;
+                                content.push(Block::Thinking {
+                                    text: text.into(),
+                                    signature,
+                                    encrypted,
+                                    redacted,
+                                });
+                            }
+                        }
+                        Block::Text { .. } => {
+                            let text = cache.text_block(mi, bi)?.to_string();
+                            content.push(Block::Text { text: text.into() });
+                        }
+                        other => content.push(other),
+                    }
                 }
-                m2.materialize(resolver)?;
+                m2.content = content;
+                m2.materialize(&cache.resolver)?;
                 if !m2.content.is_empty() {
                     out.push(m2);
                 }
@@ -2107,8 +2766,26 @@ fn resumable_tail(
             (Role::Tool, _) | (Role::User, MessageKind::ToolResult) => {
                 let mut m2 = m.clone();
                 clear_resume_usage(&mut m2);
-                m2.materialize(resolver)?;
-                for b in &mut m2.content {
+                let mut already_clipped = vec![false; m2.content.len()];
+                for (bi, b) in m2.content.iter_mut().enumerate() {
+                    match b {
+                        Block::ToolResult { content, .. } => {
+                            if let Some(prepared) = cache.tail_results.remove(&(mi, bi)) {
+                                *content = prepared.into();
+                                already_clipped[bi] = true;
+                            }
+                        }
+                        Block::Text { text } => {
+                            *text = cache.text_block(mi, bi)?.to_string().into();
+                        }
+                        _ => {}
+                    }
+                }
+                m2.materialize(&cache.resolver)?;
+                for (bi, b) in m2.content.iter_mut().enumerate() {
+                    if already_clipped[bi] {
+                        continue;
+                    }
                     if let Block::ToolResult {
                         tool_use_id, content, ..
                     } = b
@@ -2128,7 +2805,12 @@ fn resumable_tail(
             (Role::User, MessageKind::Prompt) => {
                 let mut owned = m.clone();
                 clear_resume_usage(&mut owned);
-                owned.materialize(resolver)?;
+                for (bi, b) in owned.content.iter_mut().enumerate() {
+                    if let Block::Text { text } = b {
+                        *text = cache.text_block(mi, bi)?.to_string().into();
+                    }
+                }
+                owned.materialize(&cache.resolver)?;
                 if let Some(raw) = owned.text() {
                     if let Some(body) = crate::harness::delivered_body(harness, &owned, &raw) {
                         let body = body.to_string();
@@ -2141,7 +2823,7 @@ fn resumable_tail(
                 out.push(owned);
             }
             (_, MessageKind::InjectedContext) => {
-                if let Some(body) = delivered(harness, m, resolver)? {
+                if let Some(body) = cache.delivered(harness, mi)? {
                     if delivered_tail.insert(body.clone()) {
                         let mut u = Message::of_kind(Role::User, MessageKind::Prompt, Origin::Subagent);
                         u.id = m.id.clone();
@@ -2158,7 +2840,12 @@ fn resumable_tail(
     Ok(out)
 }
 
-fn render_prepared_tail(tail: &[Message], tail_start: usize, opts: &DistillOptions) -> anyhow::Result<String> {
+fn render_prepared_tail(
+    harness: Harness,
+    tail: &[Message],
+    tail_start: usize,
+    opts: &DistillOptions,
+) -> anyhow::Result<String> {
     if tail.is_empty() {
         return Ok(String::new());
     }
@@ -2192,15 +2879,19 @@ fn render_prepared_tail(tail: &[Message], tail_start: usize, opts: &DistillOptio
                     let _ = writeln!(s, "**{who}** ({}):\n\n{}\n", when(m), text.trim());
                 }
                 Block::ToolUse { id, name, input, .. } => {
-                    let input = input.resolve()?;
-                    let body = match command_of(&input) {
-                        Some(c) => c.to_string(),
-                        None => serde_json::to_string_pretty(&*input)?,
+                    let summary = ToolInput::new(harness, name, input, false, true)?;
+                    let resolved = input.resolve()?;
+                    let body = match resolved.as_str() {
+                        Some(raw) => raw.to_string(),
+                        None => match summary.primary_command() {
+                            Some(c) => c.to_string(),
+                            None => serde_json::to_string_pretty(&*resolved)?,
+                        },
                     };
                     let _ = writeln!(
                         s,
                         "▶ **{name}** `{id}` — {}\n```\n{}\n```\n",
-                        tool_label(name, &input),
+                        summary.label(harness, name),
                         body.trim()
                     );
                 }
@@ -2238,13 +2929,14 @@ pub fn resume_preamble(d: &Distilled, keep_last: usize) -> String {
 /// carry and is re-linked to the opening prompt, a hook attachment's child is re-linked over the
 /// gap, an unanswered trailing call is dropped (`harness::claude::emit::emit`). This is a selector.
 pub fn resumable_session(session: &Session, d: &Distilled, opts: &DistillOptions) -> anyhow::Result<Session> {
+    let mut cache = TranscriptCache::new(session);
     let tail = resumable_tail(
         session.harness,
         &session.messages,
         d.tail_start,
         opts,
         &d.retrieve_ref,
-        &session.resolver(),
+        &mut cache,
     )?;
     Ok(session_with_tail(session, d, opts.keep_last, tail))
 }
@@ -2744,15 +3436,17 @@ facts text",
             let path = world.base.join(format!("input-{i}.json"));
             std::fs::write(&path, &bytes)?;
             let source = crate::Json::source(&path, 0, bytes.len() as u64)?;
-            let summary = ToolInput::new("Write", &source, true, true)?;
-            assert_eq!(summary.label("Write"), tool_label("Write", &input));
+            let summary = ToolInput::new(Harness::Claude, "Write", &source, true, true)?;
+            assert_eq!(summary.label(Harness::Claude, "Write"), tool_label("Write", &input));
             let message = msg(Role::Assistant, MessageKind::Reply, Vec::new());
             let opts = DistillOptions::default();
+            let owned_json = crate::Json::from(input.clone());
+            let owned_summary = ToolInput::new(Harness::Claude, "Write", &owned_json, true, true)?;
             assert_eq!(
-                own_words_from_tool(0, &message, "Write", &summary.fields, &opts).map(|e| e.body),
-                own_words_from_tool(0, &message, "Write", &input, &opts).map(|e| e.body)
+                own_words_from_tool(0, &message, "Write", &summary, &source, &opts)?.map(|e| e.body),
+                own_words_from_tool(0, &message, "Write", &owned_summary, &owned_json, &opts)?.map(|e| e.body)
             );
-            let brief = ToolInput::new("Write", &source, false, false)?;
+            let brief = ToolInput::new(Harness::Claude, "Write", &source, false, false)?;
             assert!(brief.fields.get("content").is_none());
             let mut session = Session::new("projected-write", Harness::Claude);
             session.messages = vec![
@@ -3470,7 +4164,11 @@ facts text",
         assert!(d.head_md.contains(&expected), "{}", d.head_md);
 
         // Large state files (>24 KB) are carried whole without arbitrary head+tail truncation.
-        let large_body = format!("# Big state\n{}MIDDLE_MARKER_SURVIVES\n{}\n# End", "line a\n".repeat(3000), "line b\n".repeat(3000));
+        let large_body = format!(
+            "# Big state\n{}MIDDLE_MARKER_SURVIVES\n{}\n# End",
+            "line a\n".repeat(3000),
+            "line b\n".repeat(3000)
+        );
         assert!(large_body.len() > 40 * 1024);
         std::fs::write(&checklist, &large_body).unwrap();
         let d_large = distill_pack(
@@ -3643,15 +4341,17 @@ facts text",
             "{}error: first diagnostic\nerror: second diagnostic\nExit code 1\n",
             "progress\n".repeat(10000)
         );
+        let empty = ToolInput::empty();
         assert_eq!(
-            scan_result_facts(0, "Bash", &Value::Null, "command", &output, true, &mut facts),
+            scan_result_facts(Harness::Claude, 0, "Bash", &empty, "command", &output, true, &mut facts),
             "✗ error: first diagnostic"
         );
         assert_eq!(
             scan_result_facts(
+                Harness::Claude,
                 1,
                 "Bash",
-                &Value::Null,
+                &empty,
                 "command",
                 "progress\nlast detail\nExit code 1",
                 true,
@@ -3699,5 +4399,479 @@ facts text",
         ));
         assert!(findings(&source, &Default::default()).is_err());
         assert!(distill_pack(&source, &Default::default()).is_err());
+    }
+
+    #[test]
+    fn codex_exec_and_collaboration_tools_distill_grounding_gates_commits_and_spawns() -> anyhow::Result<()> {
+        let world = cv_testkit::World::new("distill-codex-exec");
+        let state_dir = world.base.join("docs");
+        std::fs::create_dir_all(&state_dir)?;
+        let state_file = state_dir.join("LANE-STATE.md");
+        std::fs::write(&state_file, "# Codex Lane State\n\nwave 2A green\n")?;
+        let state_path = state_file.to_str().unwrap();
+
+        let patch_script = format!(
+            "const patch = [\n  \"*** Begin Patch\",\n  \"*** Update File: /srv/repo/src/lib.rs\",\n  \"@@\",\n  \"+pub fn ok() {{}}\",\n  \"*** Update File: {state_path}\",\n  \"@@\",\n  \"+wave 2A green\",\n  \"+padding {}\",\n  \"*** End Patch\"\n].join(\"\\n\");\nawait tools.apply_patch(patch);\nawait tools.exec_command({{ cmd: \"cargo test -p clustervision-core\", workdir: \"/srv/repo\" }});\n",
+            "x".repeat(65536)
+        );
+        let script_bytes = serde_json::to_vec(&patch_script)?;
+        let script_path = world.base.join("exec-script.json");
+        std::fs::write(&script_path, &script_bytes)?;
+        let script_source = crate::Json::source(&script_path, 0, script_bytes.len() as u64)?;
+
+        // `ToolInput::new` inspects `exec` via `JsonView` without materializing the script into `fields`.
+        let projected = ToolInput::new(Harness::Codex, "exec", &script_source, false, true)?;
+        assert_eq!(projected.fields.as_ref(), &json!({}));
+        assert_eq!(projected.commands(), vec!["cargo test -p clustervision-core"]);
+
+        let mut session = Session::new("codex-lane", Harness::Codex);
+        session.messages = vec![
+            msg(
+                Role::User,
+                MessageKind::Prompt,
+                vec![text(&format!(
+                    "Implement wave 2A per /srv/repo/SPEC.md. Your state file is `{state_path}`."
+                ))],
+            ),
+            msg(
+                Role::Assistant,
+                MessageKind::Reply,
+                vec![Block::ToolUse {
+                    id: "ex1".into(),
+                    name: "exec".into(),
+                    input: json!("await tools.exec_command({ cmd: \"cat /srv/repo/SPEC.md\" });").into(),
+                    namespace: None,
+                }],
+            ),
+            msg(
+                Role::Tool,
+                MessageKind::ToolResult,
+                vec![result("ex1", "# Spec\nAll 6 consumers unified.", false)],
+            ),
+            msg(
+                Role::Assistant,
+                MessageKind::Reply,
+                vec![Block::ToolUse {
+                    id: "ex2".into(),
+                    name: "exec".into(),
+                    input: script_source,
+                    namespace: None,
+                }],
+            ),
+            msg(
+                Role::Tool,
+                MessageKind::ToolResult,
+                vec![result(
+                    "ex2",
+                    "Patch applied.\ntest result: ok. 12 passed; 0 failed",
+                    false,
+                )],
+            ),
+            msg(
+                Role::Assistant,
+                MessageKind::Reply,
+                vec![Block::ToolUse {
+                    id: "sp1".into(),
+                    name: "collaboration:spawn_agent".into(),
+                    input: json!({"task_name": "/root/verifier", "message": "Verify corpus summaries"}).into(),
+                    namespace: Some("collaboration".into()),
+                }],
+            ),
+            msg(
+                Role::Tool,
+                MessageKind::ToolResult,
+                vec![result(
+                    "sp1",
+                    r#"{"task_name":"/root/verifier","nickname":"Locke"}"#,
+                    false,
+                )],
+            ),
+            msg(
+                Role::Assistant,
+                MessageKind::Reply,
+                vec![Block::ToolUse {
+                    id: "sm1".into(),
+                    name: "collaboration:send_message".into(),
+                    input: json!({
+                        "target": "/root/parent",
+                        "message": "Decided: keep 1:1 call_id pairing.\nNext: land wave 2A."
+                    })
+                    .into(),
+                    namespace: Some("collaboration".into()),
+                }],
+            ),
+            msg(Role::Tool, MessageKind::ToolResult, vec![result("sm1", "sent", false)]),
+            msg(
+                Role::Assistant,
+                MessageKind::Reply,
+                vec![Block::ToolUse {
+                    id: "cm1".into(),
+                    name: "exec_command".into(),
+                    input: json!({"cmd": "git commit -m 'tools: unify'"}).into(),
+                    namespace: None,
+                }],
+            ),
+            msg(
+                Role::Tool,
+                MessageKind::ToolResult,
+                vec![result(
+                    "cm1",
+                    "[work/0.19 9a8b7c6d] tools: unify\n 4 files changed",
+                    false,
+                )],
+            ),
+            msg(
+                Role::Assistant,
+                MessageKind::Reply,
+                vec![Block::ToolUse {
+                    id: "tail1".into(),
+                    name: "exec".into(),
+                    input: json!("await tools.exec_command({ cmd: \"git status -s\" });").into(),
+                    namespace: None,
+                }],
+            ),
+            msg(
+                Role::Tool,
+                MessageKind::ToolResult,
+                vec![result("tail1", "clean", false)],
+            ),
+        ];
+
+        let opts = DistillOptions {
+            keep_last: 1,
+            ..Default::default()
+        };
+        let distilled = distill_pack(&session, &opts)?;
+        let head = &distilled.head_md;
+        assert!(
+            head.contains("agent read /srv/repo/SPEC.md (a document named in its instructions)"),
+            "{head}"
+        );
+        assert!(
+            head.contains(&format!(
+                "**State file** `{state_path}` [3] (written by apply_patch; content read from disk when distilled):\n\n~~~~\n# Codex Lane State\n\nwave 2A green\n~~~~"
+            )),
+            "{head}"
+        );
+        assert!(head.contains("Decided: keep 1:1 call_id pairing."), "{head}");
+        assert!(head.contains("Next: land wave 2A."), "{head}");
+        assert!(head.contains("agent spawned a sub-agent: /root/verifier"), "{head}");
+        assert!(head.contains("Verify corpus summaries"), "{head}");
+        assert!(
+            !head.contains("sub-agent returned (/root/verifier)"),
+            "async Codex spawn receipt must not render as synchronous sub-agent return: {head}"
+        );
+        assert!(head.contains("spawned `/root/verifier`"), "{head}");
+        assert!(head.contains("agent sent a message → /root/parent"), "{head}");
+        assert!(head.contains("`/srv/repo/src/lib.rs` ×1"), "{head}");
+        assert!(head.contains("`/srv/repo` [3]"), "{head}");
+        assert!(head.contains("`work/0.19` `9a8b7c6d` tools: unify"), "{head}");
+        assert!(
+            head.contains("exec: apply_patch /srv/repo/src/lib.rs (+2) → test result: ok. 12 passed; 0 failed"),
+            "{head}"
+        );
+        // Tail `exec` renders its raw JS body instead of a JSON-quoted string literal.
+        assert!(
+            distilled
+                .tail_md
+                .contains("▶ **exec** `tail1` — exec: git status -s\n```\nawait tools.exec_command({ cmd: \"git status -s\" });\n```"),
+            "{}",
+            distilled.tail_md
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn antigravity_gemini_tools_distill_without_eager_payload_materialization() -> anyhow::Result<()> {
+        let world = cv_testkit::World::new("distill-antigravity");
+        let huge_code = "pub fn k() {}\n".repeat(16384);
+        let write_code_bytes = serde_json::to_vec(&json!({
+            "Path": "/srv/ag/src/huge.rs",
+            "Content": huge_code,
+        }))?;
+        let write_code_path = world.base.join("write-code.json");
+        std::fs::write(&write_code_path, &write_code_bytes)?;
+        let write_code_src = crate::Json::source(&write_code_path, 0, write_code_bytes.len() as u64)?;
+
+        let edit_bytes = serde_json::to_vec(&json!({
+            "Path": "/srv/ag/src/lib.rs",
+            "Target": "old\n".repeat(8192),
+            "Replacement": "new\n".repeat(8192),
+        }))?;
+        let edit_path = world.base.join("edit-code.json");
+        std::fs::write(&edit_path, &edit_bytes)?;
+        let edit_src = crate::Json::source(&edit_path, 0, edit_bytes.len() as u64)?;
+
+        let state_bytes = serde_json::to_vec(&json!({
+            "Path": "/srv/ag/docs/STATE.md",
+            "Content": "# AG State\n\nall gates green\n",
+        }))?;
+        let state_path = world.base.join("write-state.json");
+        std::fs::write(&state_path, &state_bytes)?;
+        let state_src = crate::Json::source(&state_path, 0, state_bytes.len() as u64)?;
+
+        // Neither large `write_file` code payloads nor `edit_file` diffs materialize into `fields`.
+        let code_summary = ToolInput::new(Harness::Gemini, "write_file", &write_code_src, true, true)?;
+        assert!(code_summary.fields.get("Content").is_none());
+        assert!(code_summary.fields.get("content").is_none());
+        assert_eq!(
+            code_summary.label(Harness::Gemini, "write_file"),
+            format!("write_file /srv/ag/src/huge.rs ({} bytes)", huge_code.len())
+        );
+        let edit_summary = ToolInput::new(Harness::Gemini, "edit_file", &edit_src, true, true)?;
+        assert!(edit_summary.fields.get("Target").is_none());
+        assert!(edit_summary.fields.get("Replacement").is_none());
+
+        let mut session = Session::new("ag-lane", Harness::Gemini);
+        session.messages = vec![
+            msg(
+                Role::User,
+                MessageKind::Prompt,
+                vec![text("Follow /srv/ag/README.md and ship the fix.")],
+            ),
+            msg(
+                Role::Assistant,
+                MessageKind::Reply,
+                vec![Block::ToolUse {
+                    id: "r1".into(),
+                    name: "read_file".into(),
+                    input: json!({"Path": "/srv/ag/README.md"}).into(),
+                    namespace: None,
+                }],
+            ),
+            msg(
+                Role::Tool,
+                MessageKind::ToolResult,
+                vec![result("r1", "# AG Readme\nUse strict mode.", false)],
+            ),
+            msg(
+                Role::Assistant,
+                MessageKind::Reply,
+                vec![
+                    Block::ToolUse {
+                        id: "w1".into(),
+                        name: "write_file".into(),
+                        input: write_code_src,
+                        namespace: None,
+                    },
+                    Block::ToolUse {
+                        id: "ed1".into(),
+                        name: "edit_file".into(),
+                        input: edit_src,
+                        namespace: None,
+                    },
+                    Block::ToolUse {
+                        id: "ws1".into(),
+                        name: "write_file".into(),
+                        input: state_src,
+                        namespace: None,
+                    },
+                ],
+            ),
+            msg(
+                Role::Tool,
+                MessageKind::ToolResult,
+                vec![
+                    result("w1", "created", false),
+                    result("ed1", "edited", false),
+                    result("ws1", "created", false),
+                ],
+            ),
+            msg(
+                Role::Assistant,
+                MessageKind::Reply,
+                vec![Block::ToolUse {
+                    id: "rc1".into(),
+                    name: "run_command".into(),
+                    input: json!({
+                        "CommandLine": "cargo test --lib tools",
+                        "toolSummary": "Run tool classifier tests"
+                    })
+                    .into(),
+                    namespace: None,
+                }],
+            ),
+            msg(
+                Role::Tool,
+                MessageKind::ToolResult,
+                vec![result("rc1", "test result: ok. 20 passed; 0 failed", false)],
+            ),
+            msg(
+                Role::Assistant,
+                MessageKind::Reply,
+                vec![
+                    Block::ToolUse {
+                        id: "sub1".into(),
+                        name: "invoke_subagent".into(),
+                        input: json!({"Role": "Corpus Auditor", "Prompt": "Check golden summaries"}).into(),
+                        namespace: None,
+                    },
+                    Block::ToolUse {
+                        id: "msg1".into(),
+                        name: "send_message".into(),
+                        input: json!({
+                            "Recipient": "parent-coord",
+                            "Message": "Decided: single pass lazy decode."
+                        })
+                        .into(),
+                        namespace: None,
+                    },
+                ],
+            ),
+            msg(
+                Role::Tool,
+                MessageKind::ToolResult,
+                vec![
+                    result("sub1", r#"{"conversationId":"conv-42"}"#, false),
+                    result("msg1", "delivered", false),
+                ],
+            ),
+        ];
+
+        let distilled = distill_pack(
+            &session,
+            &DistillOptions {
+                keep_last: 0,
+                ..Default::default()
+            },
+        )?;
+        let head = &distilled.head_md;
+        assert!(
+            head.contains("agent read /srv/ag/README.md (a document named in its instructions)"),
+            "{head}"
+        );
+        assert!(
+            head.contains("**State file** `/srv/ag/docs/STATE.md` [3] (written by write_file):\n\n~~~~\n# AG State\n\nall gates green\n~~~~"),
+            "{head}"
+        );
+        assert!(head.contains("agent wrote /srv/ag/docs/STATE.md"), "{head}");
+        assert!(
+            head.contains("Run tool classifier tests → test result: ok. 20 passed; 0 failed"),
+            "{head}"
+        );
+        assert!(head.contains("agent spawned a sub-agent: Corpus Auditor"), "{head}");
+        assert!(head.contains("spawned `conv-42`"), "{head}");
+        assert!(head.contains("agent sent a message → parent-coord"), "{head}");
+        assert!(head.contains("Decided: single pass lazy decode."), "{head}");
+        assert!(head.contains("`/srv/ag/src/huge.rs` ×1"), "{head}");
+        assert!(head.contains("`/srv/ag/src/lib.rs` ×1"), "{head}");
+        Ok(())
+    }
+
+    #[test]
+    fn lazy_blocks_decode_once_and_unread_thinking_spans_skip_escape_decode() -> anyhow::Result<()> {
+        let world = cv_testkit::World::new("distill-single-pass-lazy");
+        let make_source_text = |name: &str, body: &str| -> anyhow::Result<crate::Text> {
+            let path = world.base.join(name);
+            let bytes = serde_json::to_vec(body)?;
+            std::fs::write(&path, &bytes)?;
+            let text = crate::Json::source(&path, 0, bytes.len() as u64)?
+                .with_view(|view| view.source_text())?
+                .unwrap();
+            assert!(text.is_lazy(), "{name} must stay lazy SourceText");
+            Ok(text)
+        };
+
+        // Valid JSON string framing (`"..."`) whose interior has `\q`: escape-decoding fails,
+        // whereas unread `Thinking` validation checks bounds/stamp/quotes in O(1) without decoding!
+        let thinking_span_path = world.base.join("thinking-span.txt");
+        let raw_span_body = r#"unread\qthinking"#;
+        std::fs::write(&thinking_span_path, format!("\"{raw_span_body}\""))?;
+        let unread_thinking_span = crate::Text::Span(crate::Span {
+            source: Some(thinking_span_path),
+            offset: 1,
+            len: raw_span_body.len() as u64,
+            escaped: true,
+        });
+
+        let mut source = Session::new("single-pass", Harness::Claude);
+        source.title = Some("Single pass lazy".into());
+        let pad = " context λ".repeat(1024);
+        source.messages = vec![
+            msg(
+                Role::User,
+                MessageKind::Prompt,
+                vec![Block::Text {
+                    text: make_source_text("prompt.json", &format!("Inspect /srv/app/main.rs.{pad}"))?,
+                }],
+            ),
+            msg(
+                Role::Assistant,
+                MessageKind::Reply,
+                vec![
+                    Block::Thinking {
+                        text: unread_thinking_span.clone(),
+                        signature: None,
+                        encrypted: None,
+                        redacted: false,
+                    },
+                    Block::Text {
+                        text: make_source_text("prose.json", &format!("Decided: decode each lazy block once.\n{pad}"))?,
+                    },
+                    call("b1", "cargo test", "Run tests"),
+                ],
+            ),
+            msg(
+                Role::Tool,
+                MessageKind::ToolResult,
+                vec![Block::ToolResult {
+                    tool_use_id: "b1".into(),
+                    content: make_source_text("res1.json", &"line\n".repeat(4096))?,
+                    is_error: false,
+                    tool_name: None,
+                    status: None,
+                    details: None,
+                }],
+            ),
+            msg(
+                Role::Assistant,
+                MessageKind::Reply,
+                vec![
+                    Block::Thinking {
+                        text: unread_thinking_span,
+                        signature: None,
+                        encrypted: None,
+                        redacted: false,
+                    },
+                    call("b2", "git status -s", "Status"),
+                ],
+            ),
+            msg(
+                Role::Tool,
+                MessageKind::ToolResult,
+                vec![Block::ToolResult {
+                    tool_use_id: "b2".into(),
+                    content: make_source_text("res2.json", &"tail-out\n".repeat(4096))?,
+                    is_error: false,
+                    tool_name: None,
+                    status: None,
+                    details: None,
+                }],
+            ),
+        ];
+
+        let opts = DistillOptions {
+            keep_last: 1,
+            keep_tail_thinking: false,
+            ..Default::default()
+        };
+        WORK.with(|cell| cell.set(Work::default()));
+        let pack = distill_pack(&source, &opts)?;
+        let work = WORK.with(|cell| cell.get());
+        // Exactly 4 non-thinking lazy blocks exist (`prompt`, `prose`, `res1`, `res2`): each
+        // decodes once across validation, main pass, grounding, tail prep, and token estimation!
+        assert_eq!(work.lazy_block_decodes, 4, "{work:?}");
+        assert_eq!(work.source_estimates, source.messages.len());
+        assert!(pack.head_md.contains("Decided: decode each lazy block once."));
+        assert!(findings(&source, &opts)?.contains("Decided: decode each lazy block once."));
+
+        // Demanding tail thinking (`keep_tail_thinking: true`) DOES decode the tail `Thinking` span,
+        // catching the malformed `\q` escape.
+        let opts_with_thinking = DistillOptions {
+            keep_tail_thinking: true,
+            ..opts
+        };
+        assert!(prepare_distill(&source, &opts_with_thinking).is_err());
+        Ok(())
     }
 }

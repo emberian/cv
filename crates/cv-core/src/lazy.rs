@@ -262,6 +262,27 @@ impl Text {
             Text::Span(span) => resolver.try_resolved_len(span),
         }
     }
+    /// Validate source identity, bounds, and JSON string framing without chunk-decoding an
+    /// unread block (such as `Thinking` when `!keep_tail_thinking`).
+    pub(crate) fn validate_unread(&self, resolver: &Resolver) -> anyhow::Result<()> {
+        match self {
+            Text::Inline(_) => Ok(()),
+            Text::Source(source) => source.validate_backing(),
+            Text::Span(span) => resolver.source_text(span)?.validate_backing(),
+        }
+    }
+    /// Validate and return the byte length used for token estimation of an unread block:
+    /// skips escape-decoding `Text::Span` while preserving exact `SourceText` counts.
+    pub(crate) fn est_unread_len(&self, resolver: &Resolver) -> anyhow::Result<usize> {
+        match self {
+            Text::Inline(text) => Ok(text.len()),
+            Text::Source(source) => source.try_decoded_len(),
+            Text::Span(span) => {
+                resolver.source_text(span)?.validate_backing()?;
+                Ok(usize::try_from(span.len).unwrap_or(usize::MAX))
+            }
+        }
+    }
     pub fn with_skipped_prefix(mut self, bytes: usize) -> anyhow::Result<Self> {
         match &mut self {
             Text::Inline(text) => {

@@ -126,6 +126,16 @@ impl SourceText {
         };
         Ok((output, truncated))
     }
+    pub(crate) fn validate_backing(&self) -> Result<()> {
+        self.range.with_view(|view| {
+            anyhow::ensure!(view.is_string()?, "source text backing is not a JSON string");
+            Ok(())
+        })?;
+        if self.skip > 0 {
+            self.try_decoded_len()?;
+        }
+        Ok(())
+    }
     pub fn try_decoded_len(&self) -> Result<usize> {
         if self.skip == 0 {
             if let Some(len) = self.known_len {
