@@ -413,8 +413,8 @@ fn lanes_tasks_join_by_exported_endpoint_then_description() {
         let tasks: Vec<serde_json::Value> = serde_json::from_str(&out).unwrap();
         let matches: Vec<_> = tasks.iter().filter(|task| task["title"] == title).collect();
         assert_eq!(matches.len(), 1, "one newly opened task with title {title:?}");
-        // Task projections use `task_id`; the lane's joined task row uses `id`.
-        matches[0]["task_id"].as_str().expect("task id").to_owned()
+        // Both `task list --json` (TaskRow) and the lane's joined task row use `id`.
+        matches[0]["id"].as_str().expect("task id").to_owned()
     };
     let a = open("A: the first lane's task", "lane:lane-a");
     w.cv_ok(&[
@@ -761,4 +761,42 @@ fn universal_subagent_addressing_ls_prefix_and_port_json() {
     assert_eq!(port_val["harness"], "claude", "{port_json}");
     assert!(port_val["path"].as_str().is_some(), "{port_json}");
     assert!(port_val["id"].as_str().is_some(), "{port_json}");
+}
+
+#[test]
+fn task_list_json_emits_task_row_summaries_and_ls_close_aliases() {
+    let w = World::new("task-row-summary");
+    w.cv_ok(&[
+        "task",
+        "open",
+        "compact task row",
+        "--body",
+        "huge task body that should not bloat task list --json",
+        "--assignee",
+        "lane:a",
+        "--from",
+        "orchestrator:root",
+    ]);
+    // `cv task ls --json` aliases `list` and emits TaskRow summaries without body/notes arrays.
+    let (ls_json, _) = w.cv_ok(&["task", "ls", "--json"]);
+    let rows: Vec<serde_json::Value> = serde_json::from_str(&ls_json).unwrap();
+    assert_eq!(rows.len(), 1, "{ls_json}");
+    let id = rows[0]["id"].as_str().expect("TaskRow id").to_string();
+    assert!(rows[0].get("body").is_none(), "TaskRow omits body:\n{ls_json}");
+    assert!(rows[0].get("notes").is_none(), "TaskRow omits notes:\n{ls_json}");
+
+    w.cv_ok(&["task", "note", &id, "progress update", "--from", "lane:a"]);
+
+    // `--detail` opts into full TaskProjection JSON.
+    let (detail_json, _) = w.cv_ok(&["task", "list", "--json", "--detail"]);
+    let full: Vec<serde_json::Value> = serde_json::from_str(&detail_json).unwrap();
+    assert_eq!(full[0]["task_id"], id);
+    assert!(full[0]["body"].as_str().unwrap().contains("huge task body"));
+    assert_eq!(full[0]["notes"].as_array().unwrap().len(), 1);
+
+    // `cv task close` aliases `done`.
+    w.cv_ok(&["task", "close", &id, "--observed", "verified", "--from", "lane:a"]);
+    let (all_json, _) = w.cv_ok(&["task", "ls", "--all", "--json"]);
+    let closed: Vec<serde_json::Value> = serde_json::from_str(&all_json).unwrap();
+    assert_eq!(closed[0]["effective_state"], "done", "{all_json}");
 }

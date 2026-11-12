@@ -1951,7 +1951,7 @@ fn task_id_titled(w: &World, title: &str) -> String {
     let ids: Vec<&str> = tasks
         .iter()
         .filter(|t| t["title"] == title)
-        .map(|t| t["task_id"].as_str().expect("task_id"))
+        .map(|t| t["id"].as_str().expect("id"))
         .collect();
     assert_eq!(ids.len(), 1, "one task titled {title:?}:\n{json}");
     ids[0].to_string()

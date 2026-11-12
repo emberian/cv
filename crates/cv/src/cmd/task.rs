@@ -154,6 +154,7 @@ pub(crate) enum TaskCmd {
     },
     /// List tasks: non-terminal, touched in the last 14 days or involving you ($CV_ENDPOINT).
     /// The hidden count is the last line; `--all` lifts both the window and the terminal filter.
+    #[command(visible_alias = "ls")]
     List {
         /// Filter by state (open|claimed|resolved|done|abandoned|superseded).
         #[arg(long)]
@@ -178,6 +179,9 @@ pub(crate) enum TaskCmd {
         since: Option<String>,
         #[arg(long)]
         json: bool,
+        /// With --json: emit full TaskProjection objects (including body and notes) instead of TaskRow summaries.
+        #[arg(long, requires = "json")]
+        detail: bool,
         /// Tab-separated rows for scripts: full id, state, assignee, repo basename, age, title,
         /// blocked_by — no alignment, no truncation.
         #[arg(long, conflicts_with = "json")]
@@ -237,6 +241,7 @@ pub(crate) enum TaskCmd {
     },
     /// Complete a task. Self-reported and labeled so: `--observed` is free text cv records, never
     /// a claim cv checked. Refused on a decision (answer it with `resolve`).
+    #[command(visible_alias = "close")]
     Done {
         id: String,
         /// Pointer to observable evidence (URL, path, session id).
@@ -679,6 +684,7 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
             all,
             since,
             json,
+            detail,
             tsv,
         } => {
             let outcome = fold_loud()?;
@@ -716,8 +722,12 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                 0
             };
             if json {
-                // The full projections, unchanged wire shape (`show --json` sibling).
-                println!("{}", serde_json::to_string_pretty(&tasks)?);
+                if detail {
+                    println!("{}", serde_json::to_string_pretty(&tasks)?);
+                } else {
+                    let rows: Vec<TaskRow> = tasks.iter().map(|t| TaskRow::full(t)).collect();
+                    println!("{}", serde_json::to_string_pretty(&rows)?);
+                }
                 return Ok(());
             }
             let now = Utc::now();
