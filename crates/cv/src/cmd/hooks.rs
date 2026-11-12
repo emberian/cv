@@ -252,6 +252,10 @@ struct Host {
     trust: bool,
     /// The settings also hold the compaction policy `cv doctor` reports.
     policy: bool,
+    /// PreToolUse/PostToolUse payloads carry `tool_use_id` for the receipt log.
+    receipts: bool,
+    /// PreToolUse payloads carry sub-agent `agent_id` for the retired-agent guard.
+    retired_guard: bool,
 }
 
 /// The one per-harness table of `cv hooks`: `None` for a harness with no verified hook contract.
@@ -265,6 +269,8 @@ fn host(h: Harness) -> Option<Host> {
             edit: None,
             trust: false,
             policy: true,
+            receipts: true,
+            retired_guard: true,
         }),
         Harness::Codex => Some(Host {
             harness: h,
@@ -274,6 +280,8 @@ fn host(h: Harness) -> Option<Host> {
             edit: Some(&CODEX_EDIT),
             trust: true,
             policy: false,
+            receipts: false,
+            retired_guard: false,
         }),
         Harness::Grok
         | Harness::OpenCode
@@ -719,7 +727,7 @@ pub(crate) fn cmd_hooks(cmd: HooksCmd) -> Result<()> {
             ..
         } => {
             let harness = hook_harness(&harness)?;
-            if harness != Harness::Claude {
+            if !host(harness).is_some_and(|h| h.receipts) {
                 bail!("the receipt log reads Claude Code's `tool_use_id`; {harness} is not wired");
             }
             let (settings_path, _) = paths(harness, scope)?;
@@ -772,7 +780,7 @@ pub(crate) fn cmd_hooks(cmd: HooksCmd) -> Result<()> {
             receipts: false,
         } => {
             let harness = hook_harness(&harness)?;
-            if harness != Harness::Claude {
+            if !host(harness).is_some_and(|h| h.retired_guard) {
                 bail!("the retired-agent guard reads Claude Code's sub-agent `agent_id`; {harness} has no such field");
             }
             let (settings_path, _) = paths(harness, scope)?;
