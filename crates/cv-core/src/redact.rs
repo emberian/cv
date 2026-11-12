@@ -547,8 +547,8 @@ fn json_view_any_str(view: crate::json::JsonView<'_>, pred: &mut dyn FnMut(&str)
     }
     let mut found = false;
     let _ = crate::stream::stopped(
-        view.for_each_entry(|_key, val| {
-            if json_view_any_str(val, pred)? {
+        view.for_each_entry(|key, val| {
+            if pred(key) || json_view_any_str(val, pred)? {
                 found = true;
                 return Err(crate::stream::Stop.into());
             }
@@ -720,6 +720,7 @@ impl CompiledProfile {
                             }
                         }
                         crate::ir::Principal::Object(map) => {
+                            scrub_object_keys(map, |key| self.scrub_text_cow(key, repo_root, &mut stats).into_owned());
                             for (_k, val) in map.iter_mut() {
                                 self.scrub_value(val, repo_root, &mut stats);
                             }
@@ -839,7 +840,8 @@ impl CompiledProfile {
                 }
             }
             Value::Object(map) => {
-                for (_k, val) in map.iter_mut() {
+                scrub_object_keys(map, |key| self.scrub_text_cow(key, repo_root, stats).into_owned());
+                for val in map.values_mut() {
                     self.scrub_value(val, repo_root, stats);
                 }
             }
@@ -918,10 +920,9 @@ impl CompiledProfile {
             if let Some(repo) = repo_root {
                 let repo_str = repo.to_string_lossy();
                 let trimmed = repo_str.trim_end_matches(['/', '\\']);
-                if trimmed.len() > 1 && current.contains(trimmed) {
-                    let count = current.matches(trimmed).count();
-                    stats.path_rewrites += count;
-                    current = Cow::Owned(current.replace(trimmed, "$REPO"));
+                if let Cow::Owned(rewritten) = rewrite_path_prefix(&current, trimmed, "$REPO", &mut stats.path_rewrites)
+                {
+                    current = Cow::Owned(rewritten);
                 }
             }
         }
@@ -930,10 +931,9 @@ impl CompiledProfile {
         if self.profile.rewrite_home {
             if let Some(home) = self.env_home.as_deref() {
                 let trimmed = home.trim_end_matches(['/', '\\']);
-                if trimmed.len() > 1 && current.contains(trimmed) {
-                    let count = current.matches(trimmed).count();
-                    stats.path_rewrites += count;
-                    current = Cow::Owned(current.replace(trimmed, "$HOME"));
+                if let Cow::Owned(rewritten) = rewrite_path_prefix(&current, trimmed, "$HOME", &mut stats.path_rewrites)
+                {
+                    current = Cow::Owned(rewritten);
                 }
             }
             let re = home_path_regex();
@@ -1103,6 +1103,55 @@ fn is_inline_data_uri(reference: &str) -> bool {
 /// delimiter (backtick, `<`, `>`, `{`, `|`, CJK brackets, ...), not just an allow-list of them. The
 /// user name runs to the next separator or delimiter and nothing after it is consumed, so two
 /// homes separated by a single character are both rewritten.
+fn rewrite_path_prefix<'a>(text: &'a str, prefix: &str, replacement: &str, count: &mut usize) -> Cow<'a, str> {
+    if prefix.len() <= 1 {
+        return Cow::Borrowed(text);
+    }
+    let path_char = |c: char| c.is_alphanumeric() || "._~-".contains(c);
+    let mut out = String::new();
+    let mut copied = 0;
+    for (start, _) in text.match_indices(prefix) {
+        let end = start + prefix.len();
+        let before = &text[..start];
+        let after = &text[end..];
+        if !(before.is_empty()
+            || before.ends_with("file://")
+            || before
+                .chars()
+                .next_back()
+                .is_some_and(|c| !path_char(c) && c != '/' && c != '\\'))
+            || after.chars().next().is_some_and(path_char)
+        {
+            continue;
+        }
+        out.push_str(&text[copied..start]);
+        out.push_str(replacement);
+        copied = end;
+        *count += 1;
+    }
+    if copied == 0 {
+        Cow::Borrowed(text)
+    } else {
+        out.push_str(&text[copied..]);
+        Cow::Owned(out)
+    }
+}
+
+// Renaming keys must not silently discard a second entry whose name scrubs identically.
+pub(crate) fn scrub_object_keys(map: &mut serde_json::Map<String, Value>, mut scrub: impl FnMut(&str) -> String) {
+    let original = std::mem::take(map);
+    for (key, value) in original {
+        let base = scrub(&key);
+        let mut key = base.clone();
+        let mut suffix = 2;
+        while map.contains_key(&key) {
+            key = format!("{base}#{suffix}");
+            suffix += 1;
+        }
+        map.insert(key, value);
+    }
+}
+
 fn home_path_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
@@ -1232,7 +1281,7 @@ fn scrub_ssh_principals_cow<'a>(s: &'a str, count: &mut usize) -> Cow<'a, str> {
     }
 }
 
-/// Recursively scrub string values inside a JSON value, leaving keys and structure intact.
+/// Recursively scrub JSON strings and object keys. Colliding scrubbed keys retain every value.
 /// Crate-visible so per-block redacting renderers (dataset export) can scrub a tool input without
 /// going through [`redact_message`] on a cloned message.
 pub(crate) fn scrub_value(v: &mut Value, opts: &RedactOptions, stats: &mut RedactStats) {
@@ -1248,7 +1297,8 @@ pub(crate) fn scrub_value(v: &mut Value, opts: &RedactOptions, stats: &mut Redac
             }
         }
         Value::Object(map) => {
-            for (_k, val) in map.iter_mut() {
+            scrub_object_keys(map, |key| scrub_cow(key, opts, stats).into_owned());
+            for val in map.values_mut() {
                 scrub_value(val, opts, stats);
             }
         }
@@ -2677,5 +2727,32 @@ mod tests {
         let wire = serde_json::to_string(&redact(&signed)?)?;
         assert!(!wire.contains(&key), "{wire}");
         Ok(())
+    }
+    #[test]
+    fn privacy_prefixes_respect_path_segments_and_scrub_object_keys() {
+        let _env = crate::env::Env::from_vars([("HOME", "/Users/alice")]).enter();
+        let profile = ScrubProfile {
+            rewrite_home: true,
+            rewrite_repo: true,
+            repo_root: Some(PathBuf::from("/work/repo")),
+            ..Default::default()
+        };
+        let compiled = profile.compile().unwrap();
+        let mut stats = ScrubStats::default();
+        assert_eq!(
+            compiled.scrub_text_cow(
+                "/Users/alice2/file /work/repository /work/repo/file",
+                profile.repo_root.as_deref(),
+                &mut stats
+            ),
+            "$HOME/file /work/repository $REPO/file"
+        );
+        let mut value = serde_json::json!({"/Users/alice/a": 1, "/Users/bob/a": 2});
+        assert!(crate::json::Json::from(value.clone())
+            .with_view(|v| json_view_any_str(v, &mut |s| compiled.text_needs_scrub(s, None)))
+            .unwrap());
+        compiled.scrub_value(&mut value, None, &mut stats);
+        assert_eq!(value.as_object().unwrap().len(), 2);
+        assert!(!value.to_string().contains("Users"));
     }
 }

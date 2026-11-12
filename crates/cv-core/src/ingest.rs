@@ -806,6 +806,18 @@ fn finalize_staged_session(mut s: Session) -> anyhow::Result<Session> {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+fn create_private_staging_dir(path: &std::path::Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    // A unique leaf must be newly created; never follow a pre-existing symlink.
+    builder.create(path)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn ingest_pending_entries(
     pending: Vec<(String, Vec<u8>)>,
     out: &mut Vec<Session>,
@@ -844,7 +856,7 @@ fn ingest_pending_entries(
     }
 
     let temp_root = std::env::temp_dir().join(format!("cv-ingest-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&temp_root)?;
+    create_private_staging_dir(&temp_root)?;
     struct TempGuard(std::path::PathBuf);
     impl Drop for TempGuard {
         fn drop(&mut self) {
@@ -2039,5 +2051,15 @@ mod tests {
             .iter()
             .any(|s| s.harness == Harness::Grok && s.id == "grok-zip-1"));
         assert!(report.skipped.is_empty(), "skipped: {:?}", report.skipped);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn archive_staging_is_private_and_refuses_existing_paths() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!("cv-private-test-{}", uuid::Uuid::new_v4()));
+        create_private_staging_dir(&path).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o700);
+        assert!(create_private_staging_dir(&path).is_err());
+        std::fs::remove_dir(path).unwrap();
     }
 }
