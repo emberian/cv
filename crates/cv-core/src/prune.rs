@@ -876,6 +876,18 @@ fn prune_session_after_stage(
             // Published whole: an existing directory is replaced (with --force), never merged into.
             staged.publish(dst, claim)?;
         }
+        crate::lanes::record_lineage_edge_best_effort(
+            &source_id,
+            &new_id,
+            "pruned_from",
+            Some(harness.as_str()),
+            None,
+            serde_json::json!({
+                "pruned_count": pruned_count,
+                "dropped_turns": dropped_turns,
+                "parent_session_id": parent_session_id,
+            }),
+        );
     }
 
     let now = file.metadata()?.len();

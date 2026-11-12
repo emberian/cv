@@ -285,25 +285,14 @@ fn same_dir(a: &std::path::Path, b: &std::path::Path) -> bool {
 fn print_lane_tasks(l: &Lane, tasks: &[cv_core::lanes::LaneTask]) {
     const SHOWN: usize = 5;
     let Some(endpoint) = l.endpoint.as_deref() else {
-        println!(
-            "          ⚑ no endpoint (no CV_ENDPOINT export in its tool calls, no lane:<name> matches its description)"
-        );
+        println!("          ⚑ no endpoint (no state.db binding or CV_ENDPOINT export in its tool calls)");
         return;
-    };
-    let guessed = if l.endpoint_source == Some(cv_core::lanes::EndpointSource::Description) {
-        " (by description)"
-    } else {
-        ""
     };
     if tasks.is_empty() {
-        println!("          ⚑ {}{guessed}: holds no tasks", sanitize_line(endpoint));
+        println!("          ⚑ {}: holds no tasks", sanitize_line(endpoint));
         return;
     }
-    println!(
-        "          ⚑ {}{guessed}: {} task(s)",
-        sanitize_line(endpoint),
-        tasks.len()
-    );
+    println!("          ⚑ {}: {} task(s)", sanitize_line(endpoint), tasks.len());
     for t in tasks.iter().take(SHOWN) {
         let note = t
             .last_note
@@ -551,7 +540,29 @@ pub(crate) fn cmd_lanes(
             println!("{indent}{}", truncate(&sanitize_line(&d), 140));
         }
         if l.stranded {
-            println!("{indent}→ resume: SendMessage to {}", l.agent_id);
+            let mut reasons = Vec::new();
+            let ob = &l.open_obligations;
+            if ob.open_tool_calls > 0 {
+                reasons.push(format!("{} open tool call(s)", ob.open_tool_calls));
+            }
+            if ob.unreturned_subagents > 0 {
+                reasons.push(format!("{} unreturned sub-agent(s)", ob.unreturned_subagents));
+            }
+            if ob.open_claimed_tasks > 0 {
+                reasons.push(format!("{} claimed task(s)", ob.open_claimed_tasks));
+            }
+            if ob.unanswered_decisions > 0 {
+                reasons.push(format!("{} unanswered decision(s)", ob.unanswered_decisions));
+            }
+            if reasons.is_empty() && l.status_source == cv_core::lanes::StatusSource::ProcessExit {
+                reasons.push("process exited mid-turn".into());
+            }
+            let why = if reasons.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", reasons.join(", "))
+            };
+            println!("{indent}→ resume: SendMessage to {}{why}", l.agent_id);
         }
         match l.failure_cause.as_deref() {
             Some("rate-limited") => println!(
@@ -577,7 +588,7 @@ pub(crate) fn cmd_lanes(
     }
     if stranded > 0 && filter != LaneFilter::Stranded {
         println!(
-            "\n⚠ {stranded} lane(s) stopped on a promise nothing will keep — `--stranded` lists them with resume hints"
+            "\n⚠ {stranded} lane(s) structurally stranded on open obligations — `--stranded` lists them with resume hints"
         );
     }
     if returned > 0 && filter != LaneFilter::Running {

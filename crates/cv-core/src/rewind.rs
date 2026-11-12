@@ -768,6 +768,37 @@ fn rewind_session_after_scan(
         set.add(provenance_file, &res.provenance_path, Claim::New);
         set.add(transcript, &res.new_path, Claim::New);
         set.publish()?;
+
+        crate::lanes::record_lineage_edge_best_effort(
+            &res.source_id,
+            &res.new_id,
+            "rewound_from",
+            Some(r.harness.as_str()),
+            res.evidence.as_ref().map(|e| e.tool_use_id.as_str()),
+            serde_json::json!({
+                "cut_msg_idx": res.cut_msg_idx,
+                "start_msg_idx": res.start_msg_idx,
+                "subagent": res.subagent,
+                "source_session_id": res.source_session_id,
+            }),
+        );
+        if res.subagent {
+            if let Some(ref parent_sid) = res.source_session_id {
+                if parent_sid != &res.source_id && parent_sid != &res.new_id {
+                    crate::lanes::record_lineage_edge_best_effort(
+                        parent_sid,
+                        &res.new_id,
+                        "rewound_from",
+                        Some(r.harness.as_str()),
+                        res.evidence.as_ref().map(|e| e.tool_use_id.as_str()),
+                        serde_json::json!({
+                            "via_subagent": res.source_id,
+                            "cut_msg_idx": res.cut_msg_idx,
+                        }),
+                    );
+                }
+            }
+        }
     }
     Ok(res)
 }

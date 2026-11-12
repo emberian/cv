@@ -1,12 +1,13 @@
-//! `cv doctor` — diagnose why a session's context window keeps filling (and compacting).
+//! `cv doctor` — diagnose why a session's context window keeps filling (and compacting), and
+//! inspect store, index, and storage health.
 //!
-//! The analysis engine lives in [`cv_core::doctor`]; this module
-//! resolves the target session(s) and renders stored-payload estimates, recorded prompt usage,
-//! and compaction evidence. First-prompt usage is only a heuristic overhead proxy. With no <id>,
-//! analyzes the most recent session(s) for the current directory.
+//! The analysis engine lives in [`cv_core::doctor`]; this module resolves the target session(s)
+//! and renders both the **active post-compaction context window** (sliced along the active branch
+//! from the latest `CompactionBoundary` / `CompactionSummary` to tip) and **lifetime history**,
+//! alongside local `state.db` / `catalog.db` / search-index / storage health.
 
 use anyhow::{Context, Result};
-use cv_core::doctor::Report;
+use cv_core::doctor::{Report, StoreHealthReport};
 use cv_core::SessionRef;
 
 fn fmt_tok(n: u64) -> String {
@@ -14,6 +15,22 @@ fn fmt_tok(n: u64) -> String {
         format!("{:.1}k", n as f64 / 1000.0)
     } else {
         n.to_string()
+    }
+}
+
+fn fmt_bytes(n: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let f = n as f64;
+    if f >= GIB {
+        format!("{:.1} GiB", f / GIB)
+    } else if f >= MIB {
+        format!("{:.1} MiB", f / MIB)
+    } else if f >= KIB {
+        format!("{:.1} KiB", f / KIB)
+    } else {
+        format!("{n} B")
     }
 }
 
@@ -53,6 +70,7 @@ pub(crate) fn cmd_doctor(id: Option<String>, harness: Option<String>, recent: us
 
     let mut rep = Report::default();
     let mut label = String::new();
+    let mut single_session_id: Option<String> = None;
     for (r, found) in targets {
         let (rr, adapter) = match found {
             Some(adapter) => (r, adapter),
@@ -60,7 +78,6 @@ pub(crate) fn cmd_doctor(id: Option<String>, harness: Option<String>, recent: us
                 cv_core::find(&r.id, Some(r.harness))?.with_context(|| format!("could not load session {}", r.id))?
             }
         };
-        // Count decoded text in bounded chunks and request only attribution metadata facts.
         let mut pass = rep.session(Some(rr.path.clone()));
         cv_core::stream::stream_counted(
             adapter.as_ref(),
@@ -73,12 +90,25 @@ pub(crate) fn cmd_doctor(id: Option<String>, harness: Option<String>, recent: us
         if label.is_empty() {
             label = crate::util::short_id(&rr.id);
         }
+        if n_targets == 1 {
+            single_session_id = Some(rr.id.clone());
+        }
     }
+
+    let store_health = cv_core::doctor::collect_store_health();
+    let lineage = single_session_id
+        .as_deref()
+        .map(cv_core::lanes::session_lineage)
+        .filter(|l| !l.is_empty());
 
     if json {
         let mut v = rep.to_json();
         if let Some(obj) = v.as_object_mut() {
             obj.insert("hooks".into(), crate::cmd::hooks::doctor_json());
+            obj.insert("store_health".into(), serde_json::to_value(&store_health)?);
+            if let Some(lin) = &lineage {
+                obj.insert("lineage".into(), serde_json::to_value(lin)?);
+            }
             let skipped = cv_core::catalog::skipped_sources();
             if !skipped.is_empty() {
                 obj.insert("skipped_sources".into(), skipped_json(&skipped));
@@ -87,11 +117,95 @@ pub(crate) fn cmd_doctor(id: Option<String>, harness: Option<String>, recent: us
         println!("{}", serde_json::to_string_pretty(&v)?);
         return Ok(());
     }
-    print_report(&rep, &label, n_targets);
+    print_report(&rep, &store_health, lineage.as_ref(), &label, n_targets);
     Ok(())
 }
 
-fn print_report(rep: &Report, label: &str, n_targets: usize) {
+/// Standalone store & system health command entrypoint (`cv doctor --store [--json]`), ready for
+/// `main.rs` dispatch wiring.
+#[allow(dead_code)]
+pub(crate) fn cmd_doctor_store(json: bool) -> Result<()> {
+    let health = cv_core::doctor::collect_store_health();
+    if json {
+        println!("{}", serde_json::to_string_pretty(&health)?);
+        return Ok(());
+    }
+    print_store_health(&health);
+    Ok(())
+}
+
+fn print_store_health(h: &StoreHealthReport) {
+    println!("# store & system doctor\n");
+    println!("SQLite:       bundled {}", h.sqlite_version);
+    println!(
+        "State DB:     {} · {} (+{} WAL) · inbox backlog {} · packs {} ({})",
+        h.state_db.quick_check,
+        fmt_bytes(h.state_db.bytes),
+        fmt_bytes(h.state_db.wal_bytes),
+        h.state_db.capture_inbox_backlog,
+        h.state_db.pack_count,
+        fmt_bytes(h.state_db.pack_bytes),
+    );
+    if let Some(path) = &h.state_db.path {
+        println!("              {path}");
+    }
+    println!(
+        "Catalog DB:   {} · {} (+{} WAL) · {} session row(s)",
+        h.catalog_db.quick_check,
+        fmt_bytes(h.catalog_db.bytes),
+        fmt_bytes(h.catalog_db.wal_bytes),
+        h.catalog_db.session_rows,
+    );
+    if let Some(path) = &h.catalog_db.path {
+        println!("              {path}");
+    }
+    println!(
+        "Indexes:      fts {} ({}) · trigram {} ({}) · columnar {} seg(s) ({})",
+        if h.search_indexes.fts.present {
+            "present"
+        } else {
+            "absent"
+        },
+        fmt_bytes(h.search_indexes.fts.bytes),
+        if h.search_indexes.trigram.present {
+            "present"
+        } else {
+            "absent"
+        },
+        fmt_bytes(h.search_indexes.trigram.bytes),
+        h.search_indexes.columnar_events.clev_segments.unwrap_or(0),
+        fmt_bytes(h.search_indexes.columnar_events.bytes),
+    );
+    let free_desc = match (h.storage.free_bytes, h.storage.total_bytes) {
+        (Some(free), Some(total)) if total > 0 => {
+            format!("{} free of {}", fmt_bytes(free), fmt_bytes(total))
+        }
+        (Some(free), _) => format!("{} free", fmt_bytes(free)),
+        _ => "space unknown".to_string(),
+    };
+    println!(
+        "Storage:      {} (max {} stream(s)) · {}",
+        h.storage.device_class, h.storage.max_streams, free_desc
+    );
+    println!("{}", writer_versions_from_health(&h.catalog_db.writer_versions));
+    if !h.skipped_sources.is_empty() {
+        println!(
+            "Unreadable sources: {} (the store has bytes, the listing has zero)",
+            h.skipped_sources.len()
+        );
+        for s in &h.skipped_sources {
+            println!("  {} {} — {}", s.harness, s.path, s.why);
+        }
+    }
+}
+
+fn print_report(
+    rep: &Report,
+    store_health: &StoreHealthReport,
+    lineage: Option<&cv_core::lanes::SessionLineage>,
+    label: &str,
+    n_targets: usize,
+) {
     let scope = if rep.sessions > 1 {
         format!("{} sessions (this dir)", rep.sessions)
     } else {
@@ -99,18 +213,72 @@ fn print_report(rep: &Report, label: &str, n_targets: usize) {
     };
     println!("# compaction doctor — {scope}\n");
 
-    // The cybernetic layer: are the hooks that make compaction visible from inside the session
-    // installed, and which compaction knobs are in force (settings + environment).
     for line in crate::cmd::hooks::doctor_lines() {
         println!("{line}");
     }
 
     println!("{}", writer_versions_line(cv_core::catalog::writer_versions()));
+    println!("{}", store_health_summary_line(store_health));
     for line in skipped_lines(&cv_core::catalog::skipped_sources()) {
         println!("{line}");
     }
+    if let Some(lin) = lineage {
+        if !lin.ancestors.is_empty() {
+            let chain: Vec<String> = lin
+                .ancestors
+                .iter()
+                .map(|e| format!("{} ({})", crate::util::short_id(&e.src_session_id), e.edge_kind))
+                .collect();
+            println!("Lineage up:  {}", chain.join(" <- "));
+        }
+        if !lin.descendants.is_empty() {
+            let chain: Vec<String> = lin
+                .descendants
+                .iter()
+                .map(|e| format!("{} ({})", crate::util::short_id(&e.dst_session_id), e.edge_kind))
+                .collect();
+            println!("Lineage out: {}", chain.join(", "));
+        }
+    }
 
-    // Compaction summary.
+    // 1. Active Post-Compaction Context Window
+    let aw = &rep.active_window;
+    let win_origin = if aw.from_compaction {
+        "post-compaction slice"
+    } else {
+        "active branch (no compaction)"
+    };
+    println!(
+        "\nActive context window ({win_origin}: {} message(s), {} turn(s), {} est. surviving):",
+        aw.messages,
+        aw.turns,
+        fmt_tok(aw.conv_total())
+    );
+    if let Some(cur) = aw.current_context_tokens {
+        println!("  Current window:   {} recorded prompt tokens", fmt_tok(cur));
+    }
+    if let Some(overhead) = aw.system_and_tools_overhead {
+        println!(
+            "  System + tools:   {} est. overhead (window first prompt minus {} visible turn content)",
+            fmt_tok(overhead),
+            fmt_tok(aw.reconstructed_visible_turn_tokens)
+        );
+    }
+    if aw.token_burn_per_turn > 0 {
+        println!("  Burn velocity:    {}/turn", fmt_tok(aw.token_burn_per_turn));
+    }
+    if aw.from_compaction && aw.conv_total() > 0 {
+        println!(
+            "  Surviving split:  summary {} · tool results {} · thinking {} · reminders {}",
+            fmt_tok(aw.compaction_summary),
+            fmt_tok(aw.tool_results),
+            fmt_tok(aw.thinking),
+            fmt_tok(aw.attachments),
+        );
+    }
+
+    // 2. Lifetime History (across compactions)
+    println!("\nLifetime history:");
     if rep.compactions == 0 {
         println!(
             "Compaction:  never compacted across {} message(s) — healthy ✅",
@@ -128,7 +296,6 @@ fn print_report(rep: &Report, label: &str, n_targets: usize) {
         );
     }
 
-    // Recorded prompt usage and byte-based attribution are different sources of evidence.
     if rep.startup_ctx > 0 {
         println!(
             "First prompt: {} recorded (includes conversation; heuristic proxy for fixed overhead)",
@@ -203,9 +370,6 @@ fn print_report(rep: &Report, label: &str, n_targets: usize) {
         }
     }
 
-    // System reminders by kind — the per-turn context Claude Code itself appends (hook output,
-    // edited-file notices, queued task notifications, CLAUDE.md `instructions`, …). Before these
-    // were itemized they were misread as part of the fixed overhead.
     if rep.attachments > 0 {
         let mut kinds: Vec<(&String, &u64)> = rep.by_attachment.iter().collect();
         kinds.sort_by_key(|k| std::cmp::Reverse(*k.1));
@@ -219,6 +383,48 @@ fn print_report(rep: &Report, label: &str, n_targets: usize) {
     if n_targets == 1 && rep.sessions == 1 {
         println!("  (analyze your whole project: `cv doctor --recent 20`)");
     }
+}
+
+fn store_health_summary_line(h: &StoreHealthReport) -> String {
+    let free = h
+        .storage
+        .free_bytes
+        .map(|b| format!(" · {} free", fmt_bytes(b)))
+        .unwrap_or_default();
+    format!(
+        "Store health: sqlite {} · state.db {} (inbox {}, packs {}) · catalog.db {} ({} rows) · {}{}",
+        h.sqlite_version,
+        h.state_db.quick_check,
+        h.state_db.capture_inbox_backlog,
+        h.state_db.pack_count,
+        h.catalog_db.quick_check,
+        h.catalog_db.session_rows,
+        h.storage.device_class,
+        free,
+    )
+}
+
+fn writer_versions_from_health(obs: &[cv_core::doctor::WriterVersionHealth]) -> String {
+    let rows: Vec<_> = obs
+        .iter()
+        .map(|o| {
+            let status = if o.newer_than_verified {
+                " · newer than verified"
+            } else {
+                ""
+            };
+            format!(
+                "{} observed {} / verified {}{} ({} unknown of {})",
+                o.harness,
+                o.newest.as_deref().unwrap_or("unknown"),
+                o.verified,
+                status,
+                o.unknown,
+                o.sessions
+            )
+        })
+        .collect();
+    format!("Writer versions: {}", rows.join("; "))
 }
 
 /// The sources the last discovery found but could not open: the store has bytes, the listing has
@@ -347,7 +553,6 @@ fn verdict(rep: &Report) -> String {
             100.0 * mcp as f64 / rep.tool_results.max(1) as f64
         ));
     }
-    // A large first prompt merits inspection, but cannot isolate fixed system overhead.
     if rep.startup_ctx >= 50_000 {
         parts.push(format!(
             "first recorded prompt is {} including conversation — inspect initial history, CLAUDE.md and MCP schemas",
@@ -360,8 +565,6 @@ fn verdict(rep: &Report) -> String {
                 .into(),
         );
     }
-    // System reminders (the attachments Claude Code appends per turn) at ≥ 10% are a real, and
-    // steerable, share: background-task notifications, edited-file notices and hook stdout.
     if rep.attachments * 10 >= total && rep.attachments > 0 {
         let mut kinds: Vec<(&String, &u64)> = rep.by_attachment.iter().collect();
         kinds.sort_by_key(|k| std::cmp::Reverse(*k.1));

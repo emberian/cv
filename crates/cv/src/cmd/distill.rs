@@ -214,6 +214,7 @@ pub(crate) fn emit_to(
             let sidecar = write_sidecar(&res.path, elided)?;
             let dir = cwd.clone().or_else(|| ir.cwd.clone());
             let resume = resume_hint(&res.new_id, dir.as_deref());
+            record_loom_lineage(ir, &res.new_id);
             Ok(Emitted {
                 session_id: Some(res.new_id),
                 agent_id: None,
@@ -257,6 +258,18 @@ pub(crate) fn emit_to(
                 cv_core::publish::Claim::New,
             )?;
             let sidecar = write_sidecar(&res.path, elided)?;
+            let derived_agent_sid = format!("agent-{agent}");
+            record_loom_lineage(ir, &derived_agent_sid);
+            cv_core::lanes::record_lineage_edge_best_effort(
+                &root.id,
+                &derived_agent_sid,
+                "parent_subagent",
+                Some(cv_core::harness::derived_host().as_str()),
+                None,
+                json!({
+                    "agent_id": agent,
+                }),
+            );
             Ok(Emitted {
                 session_id: Some(root.id),
                 agent_id: Some(agent.clone()),
@@ -266,6 +279,30 @@ pub(crate) fn emit_to(
                     "from the root session: SendMessage to=\"{agent}\" with the next instruction"
                 )),
             })
+        }
+    }
+}
+
+fn record_loom_lineage(ir: &Session, dst_session_id: &str) {
+    let Some(spans) = ir
+        .extra
+        .get(cv_core::ir::CV_NAMESPACE)
+        .and_then(|v| v.get("loom"))
+        .and_then(Value::as_array)
+    else {
+        return;
+    };
+    for span in spans {
+        if let Some(src_id) = span.get("source_id").and_then(Value::as_str) {
+            let src_harness = span.get("harness").and_then(Value::as_str);
+            cv_core::lanes::record_lineage_edge_best_effort(
+                src_id,
+                dst_session_id,
+                "spliced_from",
+                src_harness,
+                None,
+                span.clone(),
+            );
         }
     }
 }
@@ -405,8 +442,10 @@ pub(crate) fn cmd_distill(
     if let Some(grown) = &grown {
         d.note_grown(grown);
     }
+    let mut with_sources: Vec<(String, String)> = Vec::new();
     for other in with {
         let o = load_findings(other)?;
+        with_sources.push((o.id.clone(), o.harness.as_str().to_string()));
         d.append_findings(&findings(&o, &opts)?);
     }
     let description = format!("distilled: {}", d.label());
@@ -418,6 +457,38 @@ pub(crate) fn cmd_distill(
             (d, emitted)
         }
     };
+    let derived_id = match (&emitted.agent_id, &emitted.session_id) {
+        (Some(agent), _) => Some(format!("agent-{agent}")),
+        (None, Some(sid)) => Some(sid.clone()),
+        _ => None,
+    };
+    if let Some(ref dst) = derived_id {
+        cv_core::lanes::record_lineage_edge_best_effort(
+            &s.id,
+            dst,
+            "distilled_from",
+            Some(s.harness.as_str()),
+            None,
+            json!({
+                "upto": upto,
+                "root_session_id": emitted.session_id,
+                "agent_id": emitted.agent_id,
+            }),
+        );
+        for (with_id, with_harness) in &with_sources {
+            cv_core::lanes::record_lineage_edge_best_effort(
+                with_id,
+                dst,
+                "distilled_from",
+                Some(with_harness.as_str()),
+                None,
+                json!({
+                    "role": "with",
+                    "primary_source_id": s.id,
+                }),
+            );
+        }
+    }
     let mut h = report_text(&d, &emitted);
     if let Some(grown) = &grown {
         let _ = writeln!(h, "  ↳ read {grown}");
