@@ -138,11 +138,31 @@ impl Env {
             .or_else(|| self.home_dir().map(|h| h.join(".local/share")))
     }
 
-    /// `$CLUSTERVISION_HOME`, else `~/.clustervision`: cv's own state (tasks, lanes, roots list).
+    /// `$CLUSTERVISION_HOME` when set and non-empty, else `~/.clustervision`: cv's durable
+    /// user/fleet state (`tasks/`, `lanes.jsonl`, `retired.jsonl`, `receipts/`, `claude-roots`).
     pub fn cv_home(&self) -> Option<PathBuf> {
         self.var_os("CLUSTERVISION_HOME")
+            .filter(|v| !v.is_empty())
             .map(PathBuf::from)
             .or_else(|| self.home_dir().map(|h| h.join(".clustervision")))
+    }
+
+    /// Rebuildable accelerator cache (`catalog.db`, Tantivy full-text index, semantic
+    /// `embeddings.bin`): `$CLUSTERVISION_CACHE` when set and non-empty, else
+    /// `$CLUSTERVISION_HOME` when set and non-empty (so isolated test/scratch homes keep durable
+    /// state and rebuildable caches under one root), else `<cache_dir>/clustervision`
+    /// (`~/Library/Caches/clustervision` on macOS, `$XDG_CACHE_HOME/clustervision` or
+    /// `~/.cache/clustervision` on Linux).
+    pub fn cv_cache(&self) -> Option<PathBuf> {
+        self.var_os("CLUSTERVISION_CACHE")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                self.var_os("CLUSTERVISION_HOME")
+                    .filter(|v| !v.is_empty())
+                    .map(PathBuf::from)
+            })
+            .or_else(|| Some(self.cache_dir()?.join("clustervision")))
     }
 
     /// The environment this thread reads: the innermost entered one, else the process's.
@@ -284,6 +304,11 @@ pub fn cache_dir() -> Option<PathBuf> {
     Env::current().cache_dir()
 }
 
+/// [`Env::cv_cache`] over [`Env::current`].
+pub fn cv_cache() -> Option<PathBuf> {
+    Env::current().cv_cache()
+}
+
 /// `std::env::current_dir` over [`Env::current`] (the working directory is process state; a scope
 /// carries variables only).
 pub fn current_dir() -> Option<PathBuf> {
@@ -395,5 +420,28 @@ mod tests {
         assert!(warn_once("env test accelerator", "first"));
         assert!(!warn_once("env test accelerator", "second"));
         assert!(warn_once("env test other accelerator", "first"));
+    }
+
+    #[test]
+    fn cv_cache_separates_cache_from_durable_home_with_explicit_override_precedence() {
+        // Default: durable state in ~/.clustervision, rebuildable cache in <cache_dir>/clustervision.
+        let default_env = Env::from_vars([("HOME", "/u"), ("XDG_CACHE_HOME", "/u/.cache")]);
+        assert_eq!(default_env.cv_home(), Some(PathBuf::from("/u/.clustervision")));
+        let expected_default_cache = default_env.cache_dir().unwrap().join("clustervision");
+        assert_eq!(default_env.cv_cache(), Some(expected_default_cache));
+
+        // Isolated CLUSTERVISION_HOME keeps both state and cache under that root unless CLUSTERVISION_CACHE overrides cache.
+        let isolated = Env::from_vars([("HOME", "/u"), ("CLUSTERVISION_HOME", "/scratch/cv-home")]);
+        assert_eq!(isolated.cv_home(), Some(PathBuf::from("/scratch/cv-home")));
+        assert_eq!(isolated.cv_cache(), Some(PathBuf::from("/scratch/cv-home")));
+
+        // Explicit CLUSTERVISION_CACHE wins for rebuildable caches while leaving durable cv_home untouched.
+        let split = Env::from_vars([
+            ("HOME", "/u"),
+            ("CLUSTERVISION_HOME", "/durable/cv-home"),
+            ("CLUSTERVISION_CACHE", "/fast/cv-cache"),
+        ]);
+        assert_eq!(split.cv_home(), Some(PathBuf::from("/durable/cv-home")));
+        assert_eq!(split.cv_cache(), Some(PathBuf::from("/fast/cv-cache")));
     }
 }

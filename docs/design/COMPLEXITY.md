@@ -90,7 +90,9 @@ Derived from an outside limit, and said so:
   provider reports it, less `DIGEST_MAX_TOKENS` and the prompt, in bytes (a token is at least a
   byte); `--context-bytes` overrides. The bundle prints bytes sent of the transcript and the limit.
 - Hooks: `hooks.rs` `HOOK_READ_BYTES` 8 MiB, from the 100 ms hook latency and ~4.5 ms/MB. The
-  compact hook's text names the tail it read; a start-pack row names its commit search span.
+  compact hook's text names the tail it read; a start-pack row names its commit search span on
+  plain-text stores, while binary SQLite and compressed stores read through their session adapter
+  within budget instead of raw-seeking binary/compressed tails.
 
 Cost-only (results identical; fallback at file:line):
 - `api/read.rs` `ENTRIES` 1024 continuations, LRU: an evicted read restarts from the session's

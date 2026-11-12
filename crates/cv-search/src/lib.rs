@@ -14,8 +14,10 @@
 //!    cargo feature (default-on, since model2vec is lightweight); a minimal FTS-only build is
 //!    `cargo build -p cv-search --no-default-features`.
 //!
-//! Both indexes live under `$CLUSTERVISION_HOME` (or `~/.clustervision`): the tantivy index in
-//! `…/tantivy/` and the embedding store in `…/embeddings.bin`.
+//! Both rebuildable indexes live under [`cache_dir`] (`$CLUSTERVISION_CACHE`, else
+//! `$CLUSTERVISION_HOME` when set, else `<cache_dir>/clustervision` alongside `catalog.db`): the
+//! tantivy index in `…/tantivy/` and the embedding store in `…/embeddings.bin`, separate from
+//! durable `~/.clustervision` ledgers (`tasks/`, `lanes.jsonl`, `retired.jsonl`, `receipts/`).
 
 use anyhow::Result;
 use std::path::PathBuf;
@@ -311,22 +313,27 @@ impl Searcher {
     }
 }
 
-/// Root directory for cv-search's on-disk state: `$CLUSTERVISION_HOME` or `~/.clustervision`.
+/// Durable state directory: `$CLUSTERVISION_HOME` or `~/.clustervision`.
 pub fn home_dir() -> PathBuf {
-    if let Some(v) = cv_core::env::var_os("CLUSTERVISION_HOME") {
-        return PathBuf::from(v);
-    }
-    cv_core::env::home_dir().map_or_else(|| PathBuf::from("."), |home| home.join(".clustervision"))
+    cv_core::env::Env::current()
+        .cv_home()
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// Root directory for cv-search's rebuildable on-disk indexes (`$CLUSTERVISION_CACHE`, else
+/// `$CLUSTERVISION_HOME` when set, else `<cache_dir>/clustervision`).
+pub fn cache_dir() -> PathBuf {
+    cv_core::env::cv_cache().unwrap_or_else(home_dir)
 }
 
 /// Default location of the tantivy full-text index.
 pub fn default_tantivy_dir() -> PathBuf {
-    home_dir().join("tantivy")
+    cache_dir().join("tantivy")
 }
 
 /// Default location of the semantic embedding store (binary; see `semantic` module docs).
 pub fn default_embeddings_path() -> PathBuf {
-    home_dir().join("embeddings.bin")
+    cache_dir().join("embeddings.bin")
 }
 
 // ---- Convenience wrappers over the default-located indexes ---------------------------------
@@ -459,3 +466,43 @@ pub(crate) use semantic_corpus::{read_corpus_doc, Doc};
 #[cfg(all(test, feature = "probe-heap"))]
 #[global_allocator]
 static PROBE_ALLOCATOR: cv_testkit::heap::Allocator = cv_testkit::heap::Allocator;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn search_cache_paths_honor_clustervision_cache_and_default_outside_durable_home() {
+        {
+            let _scope = cv_core::env::Env::from_vars([("HOME", "/u"), ("XDG_CACHE_HOME", "/u/.cache")]).enter();
+            let expected_cache = cv_core::env::cache_dir().unwrap().join("clustervision");
+            assert_eq!(home_dir(), PathBuf::from("/u/.clustervision"));
+            assert_eq!(default_tantivy_dir(), expected_cache.join("tantivy"));
+            assert_eq!(default_embeddings_path(), expected_cache.join("embeddings.bin"));
+        }
+        {
+            let _scope =
+                cv_core::env::Env::from_vars([("HOME", "/u"), ("CLUSTERVISION_HOME", "/scratch/cv-home")]).enter();
+            assert_eq!(home_dir(), PathBuf::from("/scratch/cv-home"));
+            assert_eq!(default_tantivy_dir(), PathBuf::from("/scratch/cv-home/tantivy"));
+            assert_eq!(
+                default_embeddings_path(),
+                PathBuf::from("/scratch/cv-home/embeddings.bin")
+            );
+        }
+        {
+            let _scope = cv_core::env::Env::from_vars([
+                ("HOME", "/u"),
+                ("CLUSTERVISION_HOME", "/durable/cv-home"),
+                ("CLUSTERVISION_CACHE", "/fast/cv-cache"),
+            ])
+            .enter();
+            assert_eq!(home_dir(), PathBuf::from("/durable/cv-home"));
+            assert_eq!(default_tantivy_dir(), PathBuf::from("/fast/cv-cache/tantivy"));
+            assert_eq!(
+                default_embeddings_path(),
+                PathBuf::from("/fast/cv-cache/embeddings.bin")
+            );
+        }
+    }
+}

@@ -104,12 +104,13 @@ mod imp {
         }
     }
 
+    /// Path to the rebuildable session/event catalog SQLite database (`<cv_cache>/catalog.db`).
+    ///
+    /// Uses [`crate::env::Env::cv_cache`] (`$CLUSTERVISION_CACHE`, else `$CLUSTERVISION_HOME` when
+    /// set in isolated homes/tests, else `<cache_dir>/clustervision`) so `catalog.db` never creates
+    /// split-brain or 0-byte files inside durable `~/.clustervision`.
     pub(crate) fn db_path() -> Option<PathBuf> {
-        let env = crate::env::Env::current();
-        let dir = env
-            .var_os("CLUSTERVISION_HOME")
-            .map(PathBuf::from)
-            .or_else(|| Some(env.cache_dir()?.join("clustervision")))?;
+        let dir = crate::env::Env::current().cv_cache()?;
         if !crate::env::frozen() {
             if let Err(error) = std::fs::create_dir_all(&dir) {
                 crate::env::warn_once("the catalog", format_args!("{}: {error}", dir.display()));
@@ -2267,6 +2268,21 @@ mod imp {
             assert_eq!(
                 changed[0].0, wal,
                 "only WAL invalidates the otherwise unchanged watch set"
+            );
+        }
+
+        #[test]
+        fn db_path_honors_clustervision_cache_without_touching_durable_home() {
+            let w = crate::test_world("catalog-cache-override");
+            let durable = w.base.join("durable-home");
+            let cache = w.base.join("dedicated-cache");
+            w.scope.set("CLUSTERVISION_HOME", &durable);
+            w.scope.set("CLUSTERVISION_CACHE", &cache);
+            let resolved = db_path().expect("db_path");
+            assert_eq!(resolved, cache.join("catalog.db"));
+            assert!(
+                !durable.join("catalog.db").exists(),
+                "durable CLUSTERVISION_HOME must never gain a split-brain catalog.db when CLUSTERVISION_CACHE is set"
             );
         }
 

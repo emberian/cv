@@ -1265,9 +1265,58 @@ fn context(event: &str, text: String) -> Value {
     json!({"hookSpecificOutput": {"hookEventName": event, "additionalContext": text}})
 }
 
-/// Read the last `bytes` of `path`.
+fn is_compressed_store(path: &Path) -> bool {
+    if path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| matches!(ext.to_ascii_lowercase().as_str(), "zst" | "gz" | "xz" | "bz2" | "lz4"))
+    {
+        return true;
+    }
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut magic = [0u8; 4];
+    let n = f.read(&mut magic).unwrap_or(0);
+    // Zstandard frame (0xFD2FB528), Zstandard skippable frame (0x184D2A50..=0x184D2A5F), or gzip (0x1F 0x8B).
+    (n >= 4 && (magic == [0x28, 0xB5, 0x2F, 0xFD] || ((magic[0] & 0xF0) == 0x50 && magic[1..4] == [0x2A, 0x4D, 0x18])))
+        || (n >= 2 && magic[..2] == [0x1F, 0x8B])
+}
+
+fn is_binary_or_compressed_store(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return true;
+    }
+    if path.extension().and_then(|e| e.to_str()).is_some_and(|ext| {
+        matches!(
+            ext.to_ascii_lowercase().as_str(),
+            "db" | "sqlite" | "sqlite3" | "vscdb" | "zst" | "gz" | "xz" | "bz2" | "lz4"
+        )
+    }) {
+        return true;
+    }
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut magic = [0u8; 16];
+    let n = f.read(&mut magic).unwrap_or(0);
+    (n >= 16 && &magic == b"SQLite format 3\0")
+        || (n >= 4
+            && (magic[..4] == [0x28, 0xB5, 0x2F, 0xFD]
+                || ((magic[0] & 0xF0) == 0x50 && magic[1..4] == [0x2A, 0x4D, 0x18])))
+        || (n >= 2 && magic[..2] == [0x1F, 0x8B])
+}
+
+/// Read the last `bytes` of a plain-text transcript `path`. Binary SQLite databases and compressed
+/// archives return `None` so callers never seek raw mid-file binary/compressed bytes as UTF-8.
 fn tail_text(path: &Path, bytes: u64) -> Option<String> {
     use std::io::{Seek, SeekFrom};
+    if is_binary_or_compressed_store(path) {
+        return None;
+    }
     let mut f = std::fs::File::open(path).ok()?;
     let len = f.metadata().ok()?.len();
     let start = len.saturating_sub(bytes);
@@ -1364,15 +1413,17 @@ fn affordance_pointer(id: &str) -> String {
     format!("`cv show {id} --kind plan,schedule,background_job` lists the plan, schedules and background jobs this session holds.")
 }
 
+fn commit_re() -> &'static regex::Regex {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r#"\[([^\]\s\\"]+)(?: \([^)]*\))? ([0-9a-f]{7,40})\] "#).expect("static regex"))
+}
+
 /// What the start pack says of a session's last commit: the short sha of the last
 /// `[branch sha] subject` (a `git commit` result) in the last `bytes` of its transcript — never
 /// a parse of the whole file — or, when none is there and the transcript is longer, how far back
 /// it looked.
 fn last_commit(path: &Path, bytes: u64) -> String {
-    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let re = RE.get_or_init(|| {
-        regex::Regex::new(r#"\[([^\]\s\\"]+)(?: \([^)]*\))? ([0-9a-f]{7,40})\] "#).expect("static regex")
-    });
+    let re = commit_re();
     let Some(text) = tail_text(path, bytes) else {
         return String::new();
     };
@@ -1383,6 +1434,71 @@ fn last_commit(path: &Path, bytes: u64) -> String {
         }
         None => String::new(),
     }
+}
+
+/// Session-aware commit lookup for `hook_start`: plain-text logs tail raw UTF-8 bytes; binary
+/// SQLite stores and small compressed rollouts stream only that session's tool results within
+/// `bytes` instead of seeking raw binary/compressed bytes at EOF.
+fn last_commit_session(r: &SessionRef, bytes: u64) -> String {
+    if !is_binary_or_compressed_store(&r.path) {
+        return last_commit(&r.path, bytes);
+    }
+    if bytes == 0 {
+        return String::new();
+    }
+    if is_compressed_store(&r.path) && std::fs::metadata(&r.path).is_ok_and(|m| m.len() > bytes) {
+        return String::new();
+    }
+    if r.message_count.is_some_and(|n| n > 2_000) {
+        return String::new();
+    }
+    let Some(adapter) = cv_core::harness::rootless(r.harness) else {
+        return String::new();
+    };
+    struct CommitSink {
+        resolver: cv_core::Resolver,
+        remaining: u64,
+        sha: Option<String>,
+    }
+    impl cv_core::MessageSink for CommitSink {
+        fn message(&mut self, m: cv_core::Message) -> cv_core::Flow {
+            let re = commit_re();
+            for block in &m.content {
+                let text = match block {
+                    cv_core::Block::ToolResult { content, .. } => content,
+                    _ => continue,
+                };
+                if self.remaining == 0 {
+                    return cv_core::Flow::Stop;
+                }
+                let Ok(resolved) = text.try_resolve_prefix(&self.resolver, self.remaining) else {
+                    continue;
+                };
+                self.remaining = self.remaining.saturating_sub(resolved.len() as u64);
+                if let Some(c) = re.captures_iter(&resolved).last() {
+                    self.sha = Some(c[2][..7.min(c[2].len())].to_string());
+                }
+            }
+            if self.remaining == 0 {
+                cv_core::Flow::Stop
+            } else {
+                cv_core::Flow::Continue
+            }
+        }
+    }
+    let mut sink = CommitSink {
+        resolver: cv_core::Resolver::new(Some(r.path.clone())),
+        remaining: bytes,
+        sha: None,
+    };
+    let _ = cv_core::stream::stream_counted(
+        adapter,
+        r,
+        &cv_core::Demand::LEAN.with_spans(),
+        &mut sink,
+        cv_core::stream::Pass::default(),
+    );
+    sink.sha.map_or_else(String::new, |sha| format!(" · last commit {sha}"))
 }
 
 fn ago(t: Option<chrono::DateTime<chrono::Utc>>) -> String {
@@ -1448,7 +1564,7 @@ fn hook_start(ev: &Event) -> Result<Option<Value>> {
                 .filter(|t| !t.trim_start().starts_with('<'))
                 .map(|t| cv_core::ir::truncate(&sanitize_line(t), 60))
                 .unwrap_or_else(|| "(untitled)".into());
-            let commit = last_commit(&r.path, tail);
+            let commit = last_commit_session(r, tail);
             let id = selector(r.harness, &r.id);
             lines.push(format!(
                 "- {id} · {} · {} msgs · {title}{commit}",
@@ -1655,7 +1771,7 @@ fn hook_receipt(ev: &Event, payload: &Value) -> Result<Option<Value>> {
     }
     match append_receipt(&ev.session.id, body) {
         Ok(_) => Ok(None),
-        Err(e) if kind == "pre" && std::env::var("CV_RECEIPT_STRICT").as_deref() == Ok("1") => {
+        Err(e) if kind == "pre" && cv_core::env::var("CV_RECEIPT_STRICT").as_deref() == Ok("1") => {
             Ok(Some(json!({"hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
                 "permissionDecision": "deny",
@@ -2048,6 +2164,110 @@ mod tests {
         assert_eq!(last_commit(&p, HOOK_READ_BYTES), " · last commit 0abec0f");
         // None in the tail it read of a longer transcript: it says how far back it looked.
         assert_eq!(last_commit(&p, 64), " · no commit in its last 64 B");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn last_commit_guards_binary_sqlite_and_compressed_stores_from_raw_byte_tailing() {
+        let _world = crate::test_world("hooks-binary-tail-guard");
+        let dir = std::env::temp_dir().join(format!("cv-hooks-bin-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 1. Multi-session Hermes SQLite DB: another session has a commit at the end of the DB,
+        // while our target session has its own commit (and a quiet session has none).
+        let db_path = dir.join("state.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, model TEXT, started_at REAL, ended_at REAL, message_count INTEGER, title TEXT);
+             CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, role TEXT, content TEXT, tool_call_id TEXT, tool_calls TEXT, tool_name TEXT, timestamp REAL);
+             INSERT INTO sessions VALUES ('target-sess', 'm', 100.0, 101.0, 2, 'target');
+             INSERT INTO sessions VALUES ('quiet-sess', 'm', 100.0, 101.0, 1, 'quiet');
+             INSERT INTO sessions VALUES ('other-sess', 'm', 102.0, 103.0, 1, 'other');
+             INSERT INTO messages (session_id, role, content, tool_call_id, tool_name, timestamp)
+                 VALUES ('target-sess', 'tool', '[main a1b2c3d4] target commit\n 1 file changed', 'tc1', 'bash', 100.5);
+             INSERT INTO messages (session_id, role, content, timestamp)
+                 VALUES ('quiet-sess', 'user', 'just reading', 100.5);
+             INSERT INTO messages (session_id, role, content, tool_call_id, tool_name, timestamp)
+                 VALUES ('other-sess', 'tool', '[other 99999999] wrong session commit\n', 'tc2', 'bash', 102.5);",
+        )
+        .unwrap();
+        drop(conn);
+
+        // Raw `tail_text` / `last_commit` refuses binary SQLite files (even with tiny byte cap).
+        assert!(tail_text(&db_path, 64).is_none());
+        assert_eq!(last_commit(&db_path, 64), "");
+
+        // Session-aware lookup extracts ONLY that session's commit via the adapter, never leaking
+        // `other-sess`'s commit or reporting DB file size as "no commit in its last ...".
+        let target_ref = SessionRef::new("target-sess", Harness::Hermes, &db_path);
+        assert_eq!(
+            last_commit_session(&target_ref, HOOK_READ_BYTES),
+            " · last commit a1b2c3d"
+        );
+        let quiet_ref = SessionRef::new("quiet-sess", Harness::Hermes, &db_path);
+        assert_eq!(last_commit_session(&quiet_ref, 64), "");
+
+        // 2. Compressed `.zst` store (zstd magic bytes + fake `[leak deadbeef] ` suffix):
+        // raw `tail_text` / `last_commit` never reads raw bytes from `.zst` or zstd-magic files.
+        let zst_path = dir.join("rollout.jsonl.zst");
+        let mut fake_zst = vec![0x28, 0xB5, 0x2F, 0xFD];
+        fake_zst.extend_from_slice(&vec![b'x'; 256]);
+        fake_zst.extend_from_slice(b"[leak deadbeef] raw tail must never match\n");
+        std::fs::write(&zst_path, &fake_zst).unwrap();
+        assert!(tail_text(&zst_path, HOOK_READ_BYTES).is_none());
+        assert_eq!(last_commit(&zst_path, 64), "");
+
+        let magic_only = dir.join("extensionless-compressed");
+        std::fs::write(&magic_only, &fake_zst).unwrap();
+        assert!(tail_text(&magic_only, HOOK_READ_BYTES).is_none());
+        assert_eq!(last_commit(&magic_only, 64), "");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn hook_receipt_honors_scoped_cv_receipt_strict_env_override() {
+        let dir = std::env::temp_dir().join(format!("cv-hooks-strict-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Make `CLUSTERVISION_HOME` a regular file so creating `<cv_home>/receipts` fails deterministically.
+        let blocked_home = dir.join("not-a-dir");
+        std::fs::write(&blocked_home, "file blocking directory creation").unwrap();
+
+        let ev = Event {
+            harness: Harness::Claude,
+            event: Some("PreToolUse".into()),
+            session: SessionRef::new("s-strict", Harness::Claude, dir.join("s.jsonl")),
+            cwd: None,
+            agent: None,
+            edits: Vec::new(),
+        };
+        let payload = json!({
+            "tool_use_id": "tu-1",
+            "tool_name": "Bash",
+            "tool_input": {"command": "echo hi"},
+        });
+
+        // Without CV_RECEIPT_STRICT=1, a failed receipt write surfaces Err.
+        {
+            let _scope = cv_core::env::Env::from_vars([("CLUSTERVISION_HOME", blocked_home.as_os_str())]).enter();
+            assert!(hook_receipt(&ev, &payload).is_err());
+        }
+
+        // With scoped CV_RECEIPT_STRICT=1 (without touching std::env), PreToolUse returns a structured deny!
+        {
+            let _scope = cv_core::env::Env::from_vars([
+                ("CLUSTERVISION_HOME", blocked_home.as_os_str()),
+                ("CV_RECEIPT_STRICT", std::ffi::OsStr::new("1")),
+            ])
+            .enter();
+            let resp = hook_receipt(&ev, &payload).unwrap().expect("must return deny decision");
+            assert_eq!(resp["hookSpecificOutput"]["permissionDecision"], "deny");
+            assert!(resp["hookSpecificOutput"]["permissionDecisionReason"]
+                .as_str()
+                .unwrap()
+                .contains("CV_RECEIPT_STRICT=1"));
+        }
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }
