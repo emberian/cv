@@ -277,6 +277,18 @@ impl IoAdmission {
         f()
     }
 
+    #[cfg(test)]
+    pub(crate) fn held_by_current_thread(&self, dev: DeviceId) -> bool {
+        let lock = self.device_lock(dev, None);
+        let held = lock
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .owners
+            .contains_key(&std::thread::current().id());
+        held
+    }
+
     pub fn active_streams(&self, dev: DeviceId) -> usize {
         let map = self.devices.lock().unwrap_or_else(|e| e.into_inner());
         map.get(&dev)
@@ -1342,7 +1354,7 @@ mod tests {
 
     #[cfg(not(target_family = "wasm"))]
     #[test]
-    fn jsonl_lines_serializes_8_threads_on_hdd_and_allows_nested_sidecar_reads() {
+    fn jsonl_lines_allow_parallel_callbacks_and_nested_sidecar_reads_on_hdd() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let world = crate::test_world("io-admission-jsonl-hdd");
@@ -1405,10 +1417,9 @@ mod tests {
             }
         });
 
-        assert_eq!(
-            max_in_flight.load(Ordering::SeqCst),
-            1,
-            "parallel jsonl::Read::lines bypassed rotational HDD 1-stream admission"
+        assert!(
+            max_in_flight.load(Ordering::SeqCst) > 1,
+            "device admission must serialize physical reads, not CPU-side visitor callbacks"
         );
     }
 

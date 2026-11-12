@@ -318,6 +318,13 @@ impl<F: std::borrow::Borrow<std::fs::File>> std::io::Read for FileReader<F> {
 /// The platform boundary for positioned source reads. Unix reads leave the shared cursor
 /// untouched; other targets retain their platform's positioned-read or seek fallback.
 pub(crate) fn read_at(file: &std::fs::File, bytes: &mut [u8], at: u64) -> std::io::Result<usize> {
+    // Charge actual positioned I/O, including lazy large-record reads from a visitor.
+    // Never retain admission across parsing or callbacks that can read another device.
+    #[cfg(unix)]
+    let _permit = {
+        use std::os::unix::fs::MetadataExt;
+        crate::io_admission::IoAdmission::global().acquire(crate::io_admission::DeviceId(file.metadata()?.dev()), None)
+    };
     #[cfg(unix)]
     {
         std::os::unix::fs::FileExt::read_at(file, bytes, at)

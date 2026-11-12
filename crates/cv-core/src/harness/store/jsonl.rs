@@ -427,22 +427,6 @@ fn lines(
     to: u64,
     mut visit: impl FnMut(Line<'_>) -> anyhow::Result<crate::stream::Flow>,
 ) -> anyhow::Result<()> {
-    if decoded.is_none() {
-        return crate::io_admission::IoAdmission::global().admit_path(source.path(), || {
-            lines_inner(source, file, decoded, from, to, &mut visit)
-        });
-    }
-    lines_inner(source, file, decoded, from, to, &mut visit)
-}
-
-fn lines_inner(
-    source: &crate::json::JsonSource,
-    file: &File,
-    decoded: Decoded<'_>,
-    from: u64,
-    to: u64,
-    mut visit: impl FnMut(Line<'_>) -> anyhow::Result<crate::stream::Flow>,
-) -> anyhow::Result<()> {
     use crate::stream::Flow;
     #[cfg(feature = "mmap")]
     if decoded.is_some()
@@ -464,6 +448,9 @@ fn lines_inner(
         Some((backing, _)) => document::range::RangeSource::decoded(source.clone(), backing)?,
         None => document::range::RangeSource::from_captured(source.clone())?,
     };
+    // Establish the detected policy once; bytes::read_at admits each physical read.
+    let (dev, class) = crate::io_admission::inspect_path_device(source.path());
+    crate::io_admission::IoAdmission::global().policy_for(dev, Some(class));
     while let Some(frame) = frames.next() {
         let (raw, complete) = frame?;
         let end = frames.offset();
@@ -1081,5 +1068,20 @@ pub(crate) mod tests {
             stop.store(true, Ordering::Relaxed);
             writer.join().unwrap();
         });
+    }
+    #[test]
+    fn jsonl_callbacks_do_not_hold_io_admission_permits() {
+        let world = cv_testkit::World::new("jsonl-admission-callback");
+        let path = world.base.join("rows.jsonl");
+        std::fs::write(&path, b"{\"a\":1}\n").unwrap();
+        let (dev, _) = crate::io_admission::inspect_path_device(&path);
+        let mut visited = false;
+        super::for_each_record(&path, |_| {
+            visited = true;
+            assert!(!crate::io_admission::IoAdmission::global().held_by_current_thread(dev));
+            Ok(())
+        })
+        .unwrap();
+        assert!(visited);
     }
 }
