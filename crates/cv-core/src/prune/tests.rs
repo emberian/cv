@@ -2482,6 +2482,45 @@ fn a_staged_prune_that_breaks_resume_is_refused_and_leaves_nothing() {
     prune_session(crate::Harness::Claude, &src, &opts).unwrap();
 }
 
+/// A live transcript appended to while it is pruned publishes the prefix read and says it grew;
+/// one whose read prefix is rewritten in place refuses.
+#[test]
+fn a_live_source_grown_during_prune_publishes_its_prefix_and_a_rewrite_refuses() {
+    let opts = |id: &str| PruneOptions {
+        min_size: 2048,
+        keep_last: 0,
+        new_id: Some(id.into()),
+        ..Default::default()
+    };
+    let world = crate::test_world("prune");
+    let src = fixture(&world.proj, &"Y".repeat(5000));
+    let len = std::fs::metadata(&src).unwrap().len();
+    let expected = prune_session(crate::Harness::Claude, &src, &opts("aaaa")).unwrap();
+    let res = prune_session_after_stage(crate::Harness::Claude, &src, &opts("bbbb"), || {
+        let mut file = std::fs::OpenOptions::new().append(true).open(&src)?;
+        std::io::Write::write_all(
+            &mut file,
+            b"{\"type\":\"user\",\"uuid\":\"later\",\"message\":{\"role\":\"user\",\"content\":\"later\"}}\n",
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(res.original_size, len);
+    assert_eq!(res.new_size, expected.new_size);
+    let now = std::fs::metadata(&src).unwrap().len();
+    let note = format!("read as of byte offset {len}; the source has grown since ({now} bytes now)");
+    assert_eq!(res.warnings, [note]);
+    let err = prune_session_after_stage(crate::Harness::Claude, &src, &opts("cccc"), || {
+        let mut bytes = std::fs::read(&src)?;
+        bytes[1] = b' ';
+        let mut file = std::fs::OpenOptions::new().write(true).open(&src)?;
+        std::io::Write::write_all(&mut file, &bytes)?;
+        Ok(())
+    })
+    .unwrap_err();
+    assert!(err.to_string().contains("JSON source changed"), "{err}");
+}
+
 /// An empty or blank-only source holds nothing to prune: refused, nothing published.
 #[test]
 fn an_empty_source_is_refused_without_publication() {

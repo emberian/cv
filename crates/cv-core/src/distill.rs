@@ -136,6 +136,15 @@ impl Distilled {
         self.stats.distilled_est_tokens = self.stats.pack_est_tokens + self.stats.tail_est_tokens;
     }
 
+    /// Say, under the pack's title, that the source is a live transcript that grew while it was
+    /// read ([`crate::emit::Grown`]): the pack describes the session as of that point.
+    pub fn note_grown(&mut self, grown: &crate::emit::Grown) {
+        let at = self.head_md.find("\n\n").map_or(0, |i| i + 2);
+        self.head_md.insert_str(at, &format!("> Read {grown}.\n\n"));
+        self.stats.pack_est_tokens = est(&self.head_md);
+        self.stats.distilled_est_tokens = self.stats.pack_est_tokens + self.stats.tail_est_tokens;
+    }
+
     /// The standalone markdown context pack: a fresh agent's first message (candidate c).
     pub fn pack(&self) -> String {
         let mut s = self.head_md.clone();

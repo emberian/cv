@@ -43,6 +43,36 @@ impl Collect {
         self.messages.push(message);
         Ok(())
     }
+    /// The primary's captured length, extended to cover every span the pass kept from it: the
+    /// adapter opens the file after this capture, so a live transcript may have grown in between.
+    /// The extension is a later capture the first admits as growth ([`JsonSource::admits`]).
+    /// `None` when the primary is not a captured file.
+    fn cover_primary_spans(&mut self) -> Result<Option<u64>> {
+        let path = std::path::absolute(&self.primary)?;
+        let Some(captured) = self.sources.get(&path) else {
+            return Ok(None);
+        };
+        let implicit = std::path::absolute(&self.implicit)?;
+        let mut end = 0;
+        for block in self.messages.iter().flat_map(|message| &message.content) {
+            let Some(crate::Text::Span(span)) = block.text() else {
+                continue;
+            };
+            let owner = span.source.as_ref().map(std::path::absolute).transpose()?;
+            if owner.as_ref().unwrap_or(&implicit) == &path {
+                // The span covers a JSON string's body; the string ends at its closing quote.
+                end = end.max(span.offset.saturating_add(span.len).saturating_add(1));
+            }
+        }
+        if end <= captured.len() {
+            return Ok(Some(captured.len()));
+        }
+        let later = JsonSource::capture(&path)?;
+        anyhow::ensure!(captured.admits(&later), "source changed during port preparation");
+        let len = later.len();
+        self.sources.insert(path, later);
+        Ok(Some(len))
+    }
 }
 impl MessageSink for Collect {
     fn message(&mut self, message: crate::Message) -> Flow {
@@ -110,8 +140,9 @@ pub(super) fn parse(
     adapter: &dyn crate::harness::Adapter,
     reference: &SessionRef,
     options: &Demand,
-) -> Result<Session> {
-    Ok(selected(adapter, reference, options, 0, None)?.0)
+) -> Result<(Session, Option<Grown>)> {
+    let (session, _, grown) = selected(adapter, reference, options, 0, None)?;
+    Ok((session, grown))
 }
 
 pub(super) fn selected(
@@ -120,13 +151,20 @@ pub(super) fn selected(
     options: &Demand,
     start: usize,
     end: Option<usize>,
-) -> Result<(Session, usize)> {
+) -> Result<(Session, usize, Option<Grown>)> {
     let primary = adapter.resume_source(reference);
     let snapshot = Probe::default().snapshot_from(reference, &primary);
     let mut reads = snapshot
         .all_reads()
         .ok_or_else(|| anyhow::anyhow!("cannot capture source inventory"))?;
-    reads.record(&primary);
+    // A live append-only transcript grows while it is read: the pass describes the prefix it
+    // captured, so growth is admitted and only a rewrite of that prefix refuses.
+    let appendable = adapter.append_only(reference) && primary == reference.path;
+    if appendable {
+        reads.record_append_only(&primary);
+    } else {
+        reads.record(&primary);
+    }
     let mut sink = Collect {
         messages: Vec::new(),
         index: 0,
@@ -147,10 +185,15 @@ pub(super) fn selected(
         sink.reads.merge(&counted.dependencies);
     }
     let guard = snapshot.with_reads(&sink.reads);
-    anyhow::ensure!(
-        sink.reads.fresh(&mut Probe::default()) && crate::source::unchanged_from(reference, &primary, &guard),
-        "source changed during port preparation"
-    );
+    let now = sink
+        .reads
+        .fresh(&mut Probe::default())
+        .then(|| crate::source::grown_from(reference, &primary, &guard))
+        .flatten();
+    let Some(now) = now else {
+        anyhow::bail!("source changed during port preparation")
+    };
+    let read = sink.cover_primary_spans()?;
     for message in &mut sink.messages {
         for block in &mut message.content {
             let Some(value) = block.text_mut() else { continue };
@@ -162,7 +205,12 @@ pub(super) fn selected(
     if let Some(counted) = counted {
         counted.record_with_source(reference, &guard);
     }
-    Ok((session, sink.index))
+    let grown = read.filter(|read| now > *read).map(|read| Grown {
+        messages: end.unwrap_or(sink.index).min(sink.index),
+        read,
+        now,
+    });
+    Ok((session, sink.index, grown))
 }
 
 #[cfg(test)]
@@ -244,7 +292,7 @@ mod tests {
                 actual_bytes == expected_bytes,
                 "complete overrides Facts construction demand"
             );
-            let actual = super::parse(&adapter, &reference, &checked_options)?;
+            let (actual, _) = super::parse(&adapter, &reference, &checked_options)?;
             assert!(actual
                 .messages
                 .iter()
@@ -480,7 +528,7 @@ mod tests {
         let mut old = crate::stream::collect_with(&adapter, &reference, &Demand::RICH)?;
         old.materialize()?;
         for (start, end) in [(5, Some(6)), (0, Some(0)), (8, Some(2)), (30, None), (11, None)] {
-            let (mut selected, total) = super::super::prepare_selected(&adapter, &reference, start, end)?;
+            let (mut selected, total, _) = super::super::prepare_selected(&adapter, &reference, start, end)?;
             assert_eq!(total, 12);
             let start = start.min(total);
             let end = end.unwrap_or(total).min(total).max(start);
@@ -492,7 +540,7 @@ mod tests {
                 serde_json::to_value(&old.messages[start..end])?
             );
         }
-        let (selected, _) = super::super::prepare_selected(&adapter, &reference, 5, Some(6))?;
+        let (selected, _, _) = super::super::prepare_selected(&adapter, &reference, 5, Some(6))?;
         assert!(matches!(
             &selected.messages[0].content[0],
             Block::Text { text: Text::Source(_) }
@@ -584,7 +632,7 @@ mod tests {
         let adapter = crate::harness::opensession::OpenSession;
         let mut legacy = crate::stream::collect_with(&adapter, &reference, &Demand::RICH)?;
         legacy.materialize()?;
-        let (selected, total) = super::super::prepare_selected(&adapter, &reference, 1, Some(2))?;
+        let (selected, total, _) = super::super::prepare_selected(&adapter, &reference, 1, Some(2))?;
         assert_eq!(selected.harness, Harness::Codex);
         let mut builder = crate::splice::Composition::default();
         builder.push(selected, total, 1, Some(2));
@@ -619,7 +667,7 @@ mod tests {
         old.materialize()?;
         let mut builder = crate::splice::Composition::default();
         for (start, end) in [(1, Some(3)), (2, Some(3))] {
-            let (source, total) = super::super::prepare_selected(&adapter, &reference, start, end)?;
+            let (source, total, _) = super::super::prepare_selected(&adapter, &reference, start, end)?;
             assert_eq!(total, old.messages.len());
             assert_eq!(source.cwd, old.cwd);
             builder.push(source, total, start, end);
@@ -632,6 +680,113 @@ mod tests {
             Harness::Claude,
         );
         assert_eq!(serde_json::to_value(actual)?, serde_json::to_value(expected)?);
+        Ok(())
+    }
+
+    /// A live Claude transcript: the whole read, then `change` to the file before publication.
+    struct Live {
+        change: fn(&Path) -> Result<()>,
+    }
+    impl crate::harness::Adapter for Live {
+        fn harness(&self) -> Harness {
+            Harness::Claude
+        }
+        fn roots(&self) -> Vec<PathBuf> {
+            Vec::new()
+        }
+        fn discover(&self) -> Result<crate::Discovered> {
+            Ok(Default::default())
+        }
+        fn append_only(&self, reference: &SessionRef) -> bool {
+            crate::harness::claude::Claude::detect().append_only(reference)
+        }
+        fn stream(&self, reference: &SessionRef, demand: &Demand, sink: &mut dyn MessageSink) -> Result<Session> {
+            let session = crate::harness::claude::Claude::detect().stream(reference, demand, sink)?;
+            (self.change)(&reference.path)?;
+            Ok(session)
+        }
+    }
+
+    fn live_fixture(name: &str) -> Result<(cv_testkit::World, SessionRef, u64)> {
+        let world = cv_testkit::World::new(name);
+        let path = world.base.join("live.jsonl");
+        let mut bytes = Vec::new();
+        for (i, text) in ["head", "middle", "tail"].iter().enumerate() {
+            let role = if i % 2 == 0 { "user" } else { "assistant" };
+            let content = text.repeat(3000);
+            let row = serde_json::json!({"type":role,"uuid":format!("m{i}"),"message":{"role":role,"content":[{"type":"text","text":content}]}});
+            serde_json::to_writer(&mut bytes, &row)?;
+            bytes.push(b'\n');
+        }
+        fs::write(&path, &bytes)?;
+        let reference = SessionRef::new("live", Harness::Claude, &path);
+        Ok((world, reference, bytes.len() as u64))
+    }
+
+    fn append(path: &Path) -> Result<()> {
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new().append(true).open(path)?;
+        file.write_all(
+            b"{\"type\":\"user\",\"uuid\":\"later\",\"message\":{\"role\":\"user\",\"content\":\"later\"}}\n",
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn selected_live_source_grown_after_read_publishes_its_prefix() -> Result<()> {
+        let (_world, reference, len) = live_fixture("selected-prepare-live-grown")?;
+        let still = Live { change: |_| Ok(()) };
+        let (mut expected, total, grown) = super::super::prepare_selected(&still, &reference, 0, None)?;
+        assert_eq!((total, grown), (3, None));
+        expected.materialize()?;
+        let live = Live { change: append };
+        let (mut actual, total, grown) = super::super::prepare_selected(&live, &reference, 0, None)?;
+        let now = fs::metadata(&reference.path)?.len();
+        assert!(now > len);
+        assert_eq!(total, 3);
+        assert_eq!(
+            grown,
+            Some(Grown {
+                messages: 3,
+                read: len,
+                now
+            })
+        );
+        actual.materialize()?;
+        assert_serialized_equal(&actual, &expected)?;
+        // `--upto N` reads the session as it stood at message N: the note cites the same N.
+        let (_, _, grown) = super::super::prepare_selected(&live, &reference, 0, Some(2))?;
+        assert_eq!(grown.map(|grown| grown.messages), Some(2));
+        assert!(grown.unwrap().to_string().starts_with("as of message 2 / byte offset "));
+        Ok(())
+    }
+
+    #[test]
+    fn selected_live_source_with_its_read_prefix_rewritten_refuses() -> Result<()> {
+        fn rewrite(path: &Path) -> Result<()> {
+            let bytes = fs::read(path)?;
+            let at = bytes.windows(4).position(|w| w == b"head").expect("fixture text");
+            let mut changed = bytes.clone();
+            changed[at..at + 4].copy_from_slice(b"HEAD");
+            // In place, keeping the inode: only the sampled content tells the rewrite apart.
+            use std::io::{Seek, Write};
+            let mut file = fs::OpenOptions::new().write(true).open(path)?;
+            file.seek(std::io::SeekFrom::Start(0))?;
+            file.write_all(&changed)?;
+            Ok(())
+        }
+        fn rewrite_and_grow(path: &Path) -> Result<()> {
+            rewrite(path)?;
+            append(path)
+        }
+        for change in [rewrite as fn(&Path) -> Result<()>, rewrite_and_grow] {
+            let (_world, reference, _) = live_fixture("selected-prepare-live-rewritten")?;
+            let error = super::super::prepare_selected(&Live { change }, &reference, 0, None).unwrap_err();
+            assert!(
+                format!("{error:#}").contains("source changed during port preparation"),
+                "{error:#}"
+            );
+        }
         Ok(())
     }
 
