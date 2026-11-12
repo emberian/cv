@@ -23,7 +23,10 @@ pub const DEFAULT_SEEKABLE_FRAME_SIZE: usize = 2 * 1024 * 1024;
 pub const MAX_SEEKABLE_FRAME_SIZE: u32 = 64 * 1024 * 1024;
 
 const SEEK_DESCRIPTOR_CHECKSUM_FLAG: u8 = 0x80;
-const SEEK_DESCRIPTOR_RESERVED_MASK: u8 = 0x03;
+// Zstandard Seekable Format `Seek_Table_Descriptor`:
+// bit 7 (`0x80`) = Checksum_Flag, bits 6..2 (`0x7C`) = Reserved_Bits (must be 0),
+// bits 1..0 (`0x03`) = Unused_Bits (must be ignored by decoders, never rejected).
+const SEEK_DESCRIPTOR_RESERVED_MASK: u8 = 0x7C;
 const SEEK_FOOTER_LEN: u64 = 9;
 const SKIPPABLE_HEADER_LEN: u64 = 8;
 
@@ -196,8 +199,9 @@ pub fn decompress_independent_frame(compressed: &[u8], expected_decoded_size: u3
     #[cfg(feature = "zstd")]
     {
         let expected = expected_decoded_size as usize;
+        let initial_cap = expected.min(compressed.len().saturating_mul(4).max(64 * 1024));
         let mut reader = decoder(compressed)?.take((expected as u64).saturating_add(1));
-        let mut out = Vec::with_capacity(expected);
+        let mut out = Vec::with_capacity(initial_cap);
         reader.read_to_end(&mut out)?;
         if out.len() != expected {
             return Err(io::Error::new(
@@ -866,14 +870,38 @@ mod tests {
         let empty_bytes = empty_idx.encode_seek_table().unwrap();
         assert_eq!(FrameIndex::parse_slice(&empty_bytes).unwrap(), empty_idx);
 
-        // 2. Non-zero reserved bits in descriptor must fail closed.
-        let mut bad_desc = empty_bytes.clone();
-        let desc_idx = bad_desc.len() - 5;
-        bad_desc[desc_idx] |= 0x01;
-        assert_eq!(
-            FrameIndex::parse_slice(&bad_desc).unwrap_err().kind(),
-            io::ErrorKind::InvalidData
-        );
+        // 2a. Non-zero Reserved_Bits (bits 6..2 = `0x7C`) in descriptor must fail closed.
+        for reserved_bit in [0x04u8, 0x08, 0x10, 0x20, 0x40, 0x7C] {
+            let mut bad_desc = empty_bytes.clone();
+            let desc_idx = bad_desc.len() - 5;
+            bad_desc[desc_idx] |= reserved_bit;
+            assert_eq!(
+                FrameIndex::parse_slice(&bad_desc).unwrap_err().kind(),
+                io::ErrorKind::InvalidData,
+                "reserved descriptor bit {reserved_bit:#04x} must fail closed"
+            );
+        }
+
+        // 2b. Unused_Bits (bits 1..0 = `0x03`) must be ignored and succeed cleanly.
+        for unused_bits in [0x01u8, 0x02, 0x03] {
+            let mut ok_desc = empty_bytes.clone();
+            let desc_idx = ok_desc.len() - 5;
+            ok_desc[desc_idx] |= unused_bits;
+            assert_eq!(
+                FrameIndex::parse_slice(&ok_desc).unwrap(),
+                empty_idx,
+                "unused descriptor bits {unused_bits:#04x} must be accepted"
+            );
+        }
+
+        // 2c. Forged 64 MiB `expected_decoded_size` on a tiny compressed payload fails closed
+        // without preallocating 64 MiB upfront.
+        #[cfg(feature = "zstd")]
+        {
+            let tiny = compress_independent_frame(b"tiny payload", 1).unwrap();
+            let err = decompress_independent_frame(&tiny, MAX_SEEKABLE_FRAME_SIZE).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        }
 
         // 3. `num_frames = u32::MAX` must fail cleanly via checked arithmetic without OOM/panic.
         let mut huge_count = empty_bytes.clone();
