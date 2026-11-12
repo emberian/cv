@@ -3955,6 +3955,11 @@ fn frozen_writer_commands_exit_two_before_resolving_or_writing() {
         vec!["archive", "sync"],
         vec!["watch"],
         vec!["config", "--add-export", "/absent"],
+        vec!["distill", "missing", "--session"],
+        vec!["distill", "missing", "--pack", "/tmp/frozen-pack.md"],
+        vec!["distill", "missing", "--into", "missing-root"],
+        vec!["splice", "missing:..1", "--session"],
+        vec!["splice", "missing:..1", "--out", "/tmp/frozen-splice"],
     ] {
         let mut frozen = vec!["--frozen"];
         frozen.extend_from_slice(&args);
@@ -3969,6 +3974,89 @@ fn frozen_writer_commands_exit_two_before_resolving_or_writing() {
     assert!(!ok && code == 2 && err.contains("--frozen"), "{err}");
     w.cv_ok(&["ls", "--frozen", "--json"]);
     w.cv_ok(&["hooks", "show", "--frozen", "--json"]);
+}
+
+#[test]
+fn frozen_allows_dry_run_and_stdout_only_reshapes_without_touching_stores() {
+    let w = World::new("frozen-dry-stdout");
+    let big = "payload-line\n".repeat(400);
+    w.write_session(
+        "frozensess",
+        &[
+            user_line("frozensess", "u1", "2026-01-01T10:00:00Z", "start work"),
+            assistant_line(
+                "a1",
+                "2026-01-01T10:00:01Z",
+                serde_json::json!([
+                    {"type": "tool_use", "id": "t1", "name": "Read", "input": {"file_path": "/work/a"}}
+                ]),
+            ),
+            serde_json::json!({
+                "type": "user",
+                "uuid": "r1",
+                "parentUuid": "a1",
+                "sessionId": "frozensess",
+                "timestamp": "2026-01-01T10:00:02Z",
+                "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": big}]}
+            }),
+            assistant_line(
+                "a2",
+                "2026-01-01T10:00:03Z",
+                serde_json::json!([{"type": "text", "text": "all done"}]),
+            ),
+        ],
+    );
+    w.write_session(
+        "frozenlive",
+        &[user_line("frozenlive", "u2", "2026-01-01T10:05:00Z", "live session")],
+    );
+    w.write_agent(
+        "frozensess",
+        "fa112233",
+        &serde_json::json!({"agentType": "general-purpose", "description": "frozen test lane", "model": "opus"}),
+        &[
+            user_line("frozensess", "su1", "2026-01-01T10:01:00Z", "sub brief"),
+            assistant_line(
+                "sa1",
+                "2026-01-01T10:01:01Z",
+                serde_json::json!([{"type": "text", "text": "sub reply"}]),
+            ),
+        ],
+    );
+
+    // Seed catalog once before freezing so `CV_FROZEN` snapshot comparisons verify zero writes.
+    w.cv_ok(&["ls", "--json"]);
+    let before = frozen_store_snapshot(&w.cv_home);
+
+    let (prune_out, _) = w.cv_ok(&["--frozen", "prune", "frozensess", "--dry-run", "--json"]);
+    let prune_val: serde_json::Value = serde_json::from_str(&prune_out).unwrap();
+    assert_eq!(prune_val["dry_run"], true);
+
+    let (rw_out, _) = w.cv_ok(&["--frozen", "rewind", "frozensess", "--dry-run", "--json"]);
+    let rw_val: serde_json::Value = serde_json::from_str(&rw_out).unwrap();
+    assert_eq!(rw_val["dry_run"], true);
+
+    let (adopt_out, _) = w.cv_ok(&[
+        "--frozen",
+        "adopt",
+        "fa112233",
+        "--from",
+        "frozensess",
+        "--into",
+        "frozenlive",
+        "--dry-run",
+        "--json",
+    ]);
+    let adopt_val: serde_json::Value = serde_json::from_str(&adopt_out).unwrap();
+    assert_eq!(adopt_val["dry_run"], true);
+
+    let (dist_out, _) = w.cv_ok(&["--frozen", "distill", "frozensess"]);
+    assert!(dist_out.contains("start work"), "{dist_out}");
+
+    let (sp_out, _) = w.cv_ok(&["--frozen", "splice", "frozensess:..2", "--export", "md"]);
+    assert!(sp_out.contains("start work"), "{sp_out}");
+
+    assert_eq!(before, frozen_store_snapshot(&w.cv_home));
 }
 
 #[test]

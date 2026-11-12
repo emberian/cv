@@ -1050,8 +1050,9 @@ enum Cmd {
     /// The agent quickstart: the things agents do with cv, each as one command line with the JSON
     /// keys it returns.
     Recipes,
-    /// Wire cv into Claude Code: install / remove / show the five hooks (`cv hook …`) and the `cv`
-    /// skill in its settings. Idempotent and reversible; agents set this up for themselves.
+    /// Wire cv into Claude Code or Codex: install / remove / show the five hooks (`cv hook …`),
+    /// `--retired` (retired-agent PreToolUse guard), `--receipts` (hash-chained tool receipt log),
+    /// and the `cv` skill in settings. Idempotent and reversible; agents set this up for themselves.
     Hooks {
         #[command(subcommand)]
         action: HooksCmd,
@@ -1122,19 +1123,30 @@ fn run() -> Result<()> {
     if cv_core::env::frozen() {
         let writes = match &cli.cmd {
             Cmd::Index { .. }
-            | Cmd::Prune { .. }
-            | Cmd::Rewind { .. }
-            | Cmd::Adopt { .. }
             | Cmd::Port { .. }
-            | Cmd::Distill { .. }
-            | Cmd::Splice { .. }
+            | Cmd::Share { .. }
             | Cmd::Task { .. }
             | Cmd::Hook { .. }
             | Cmd::Watch { .. } => true,
+            Cmd::Prune { dry_run, .. } | Cmd::Rewind { dry_run, .. } | Cmd::Adopt { dry_run, .. } => !*dry_run,
+            Cmd::Distill {
+                session,
+                agent_of,
+                pack,
+                out,
+                ..
+            } => *session || agent_of.is_some() || pack.is_some() || out.is_some(),
+            Cmd::Splice {
+                session,
+                agent_of,
+                harness,
+                out,
+                ..
+            } => *session || agent_of.is_some() || harness.is_some() || out.is_some(),
             Cmd::Hooks { action } => !matches!(action, HooksCmd::Show { .. }),
             Cmd::Archive { action, .. } => matches!(action, ArchiveCmd::Sync),
             Cmd::Config { add_export, rm_export } => add_export.is_some() || rm_export.is_some(),
-            Cmd::Pack { format, .. } => format == "session",
+            Cmd::Pack { format, out, .. } => format == "session" || out.is_some(),
             Cmd::Resume { launch, .. } => *launch,
             Cmd::Retire { agent, .. } => agent.is_some(),
             _ => false,

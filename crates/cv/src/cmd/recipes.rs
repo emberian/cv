@@ -14,8 +14,7 @@ RFC 3339 timestamps); `cv schema --json` publishes every shape below.
 
 Windows (show, export): --first N · --last N · --range A..B (0-based, end-exclusive; A.. / ..B)
 · --around N [--context K] · --max-bytes N (prints `… continue with --range <next>..`).
-One selector at a time. Piped `cv show` with no selector over 200 KB prints the first and last
-20 messages with a hint between them — pick a window instead of paging the whole thing.
+One selector at a time; with `--kind`, window flags and `--max-bytes` slice the projected rows.
 
  1. Find my own session by cwd
     cv ls --cwd \"$PWD\" --json --limit 5
@@ -36,8 +35,8 @@ One selector at a time. Piped `cv show` with no selector over 200 KB prints the 
 
  4. Fleet search
     cv search \"<words>\" --json --limit 10   # add --semantic for meaning, --harness <h> to narrow
-    → [{id, harness, path, cwd, title, created_at, updated_at, message_count, size_bytes,
-        score, snippet, agent_id, parent_id, workflow}]   (run `cv index` once for instant hits)
+    → {\"hits\": [{id, harness, path, cwd, title, created_at, updated_at, message_count, size_bytes,
+        score, snippet, agent_id, parent_id, workflow}], \"total\": M}   (run `cv index` once for instant hits)
 
  5. Get a workflow lane's prompt (and what it did)
     cv workflow <session> <run|name> --json
