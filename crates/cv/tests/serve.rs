@@ -2323,3 +2323,49 @@ fn serve_hub_routes_gated_by_hub_mode_and_network_auth() {
         "unexpected stderr: {stderr}"
     );
 }
+
+/// Served pages refuse to be framed: the inbox's decision buttons issue same-origin writes, so a
+/// hostile site that could load `/inbox` in an invisible frame could have the person click an
+/// agent's decision through. Every page (inbox and `--web` dashboard) carries the anti-framing
+/// headers; assets carry `nosniff`; the JSON API is unaffected.
+#[test]
+fn serve_pages_refuse_framing() {
+    let w = world("serve-no-framing");
+    let web = write_web_root(&w);
+    let (port, _reaper) = spawn_serve_cfg(&w, &["--web", web.to_str().unwrap()], &[]);
+    for page in ["/inbox", "/", "/index.html", "/some/spa/route"] {
+        let raw = raw_request(port, "GET", page, &[]);
+        assert_eq!(raw_status(&raw), 200, "{page}: {raw}");
+        assert!(
+            header_of(&raw, "Content-Type")
+                .unwrap_or_default()
+                .starts_with("text/html"),
+            "{page}: {raw}"
+        );
+        assert_eq!(header_of(&raw, "X-Frame-Options").as_deref(), Some("DENY"), "{page}");
+        assert_eq!(
+            header_of(&raw, "Content-Security-Policy").as_deref(),
+            Some("frame-ancestors 'none'"),
+            "{page}"
+        );
+        assert_eq!(
+            header_of(&raw, "X-Content-Type-Options").as_deref(),
+            Some("nosniff"),
+            "{page}"
+        );
+    }
+    let asset = raw_request(port, "GET", "/components/cv-forest.js", &[]);
+    assert_eq!(raw_status(&asset), 200, "{asset}");
+    assert_eq!(header_of(&asset, "X-Content-Type-Options").as_deref(), Some("nosniff"));
+
+    // Without `--web` the inbox is the page at `/` too.
+    let (port, _reaper) = spawn_serve(&w);
+    for page in ["/", "/inbox"] {
+        let raw = raw_request(port, "GET", page, &[]);
+        assert_eq!(
+            header_of(&raw, "X-Frame-Options").as_deref(),
+            Some("DENY"),
+            "{page}: {raw}"
+        );
+    }
+}

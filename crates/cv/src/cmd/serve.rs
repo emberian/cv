@@ -866,9 +866,19 @@ fn content_type_for(path: &Path) -> &'static str {
 }
 
 /// A raw-bytes response with a `Content-Type` and no CORS headers (static assets are same-origin).
+///
+/// A page is never framed: the inbox turns decisions into buttons whose same-origin `POST`s pass
+/// every Origin check, so a hostile site that could load it in an invisible frame could have the
+/// person click an agent's decision through (clickjacking). `X-Frame-Options` covers browsers
+/// that predate `frame-ancestors`. `nosniff` keeps a served file from being run as another type.
 fn text_response(status: u16, content_type: &str, body: Vec<u8>) -> Response<'static> {
     let mut resp = Response::bytes(status, body);
     resp.add_header("Content-Type", content_type);
+    resp.add_header("X-Content-Type-Options", "nosniff");
+    if content_type.starts_with("text/html") {
+        resp.add_header("X-Frame-Options", "DENY");
+        resp.add_header("Content-Security-Policy", "frame-ancestors 'none'");
+    }
     resp
 }
 
