@@ -927,3 +927,7 @@ cv recipes
 ```
 
 Agents: run it first.
+
+`cv index --exact` also builds the trigram accelerator (one additional source pass).
+`cv search --exact 'leep 4'` matches literal substrings such as `sleep 40`, with
+revision verification, the existing session filters, and the configured live-read budget.

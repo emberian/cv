@@ -4334,3 +4334,15 @@ fn doctor_store_and_serve_hub_flags_dispatch_cleanly() {
     let (ok, _, _, err) = w.cv(&["serve", "--hub", "--host", "0.0.0.0", "--insecure-expose"]);
     assert!(!ok && err.contains("NEVER allows unauthenticated"), "{err}");
 }
+
+#[test]
+fn exact_search_uses_trigram_index_for_interior_code_substrings() {
+    let w = World::new("exact-trigram-cli");
+    let line = serde_json::json!({"type":"user", "uuid":"needle", "message":{"role":"user", "content":"sleep 40"}});
+    std::fs::write(w.transcript("needle-session"), format!("{line}\n")).unwrap();
+    w.cv_ok(&["index", "--exact"]);
+    assert!(w.cv_home.join("trigram").is_dir());
+    let (out, _) = w.cv_ok(&["search", "leep 4", "--exact", "--json"]);
+    let found: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert!(found["total"].as_u64().unwrap() > 0, "{out}");
+}

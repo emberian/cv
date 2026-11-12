@@ -14,6 +14,7 @@ pub(crate) struct SearchArgs<'a> {
     pub filter_query: Option<String>,
     pub limit: usize,
     pub scan: bool,
+    pub exact: bool,
     pub kind: Option<String>,
     pub live_bytes: Option<u64>,
     pub json: bool, // emit `{hits, total}` (session rows + score/snippet/provenance) instead of the table
@@ -44,6 +45,7 @@ pub(crate) fn cmd_search(args: SearchArgs<'_>) -> Result<()> {
         filter_query,
         limit,
         scan,
+        exact,
         kind,
         live_bytes,
         json,
@@ -71,8 +73,20 @@ pub(crate) fn cmd_search(args: SearchArgs<'_>) -> Result<()> {
     // The index (+ live suffix of unindexed changes) answers full-text search: an empty result
     // means "no match", and an unusable index is an error naming the cause and the fix, never a
     // silent full scan of every transcript.
-    let found = match cv_search::Searcher.search_allowed(query, filter, allowed_ids.as_ref(), limit, source, live_bytes)
-    {
+    let result = if exact {
+        cv_search::Searcher.search_exact_in_allowed(
+            &cv_search::default_trigram_dir(),
+            query,
+            filter,
+            false,
+            allowed_ids.as_ref(),
+            limit,
+            live_bytes,
+        )
+    } else {
+        cv_search::Searcher.search_allowed(query, filter, allowed_ids.as_ref(), limit, source, live_bytes)
+    };
+    let found = match result {
         Ok(found) => found,
         Err(e) => {
             return match source {
@@ -235,8 +249,24 @@ fn write_json_rows<T>(
     Ok(())
 }
 
-pub(crate) fn cmd_index(rebuild: bool, subagents: bool, if_changed: bool, strict: bool, json: bool) -> Result<()> {
+pub(crate) fn cmd_index(
+    rebuild: bool,
+    subagents: bool,
+    if_changed: bool,
+    strict: bool,
+    json: bool,
+    exact: bool,
+) -> Result<()> {
     let dir = cv_search::default_tantivy_dir();
+    if exact {
+        let (synced, _) = cv_search::trigram::sync_all(&cv_search::default_trigram_dir(), rebuild, subagents, strict)?;
+        eprintln!(
+            "trigram: {} indexed, {} unchanged, {} unreadable",
+            synced.indexed,
+            synced.unchanged,
+            synced.unreadable.len()
+        );
+    }
     if if_changed {
         // The timer gate: a stat-only probe (catalog inventory + one stat per session + the
         // index's own stamps) answers whether a pass would find work at all.

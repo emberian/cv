@@ -254,6 +254,9 @@ enum Cmd {
         /// existing index is unusable.
         #[arg(long)]
         scan: bool,
+        /// Match a literal substring with the trigram index and revision-verified source text.
+        #[arg(long, conflicts_with = "scan")]
+        exact: bool,
         /// Which text to match: `exchange` (default: what the person asked, what the model
         /// replied and ran, what came back), `context` (what surrounds it: injected instruction
         /// files, system prompts, skill bodies, hook output, notices, compaction summaries), or
@@ -1020,6 +1023,9 @@ enum Cmd {
         /// Clear and rebuild the index from scratch instead of incrementally updating it.
         #[arg(long)]
         rebuild: bool,
+        /// Also build the trigram accelerator for `cv search --exact` (an additional source pass).
+        #[arg(long)]
+        exact: bool,
         /// Also fold every session's sub-agent forest (its Task/Workflow agent transcripts) into
         /// BOTH the full-text index and the event catalog, tagged with provenance (which agent of
         /// which workflow of which parent). Off by default: it can add ~900MB to the index and many
@@ -1227,6 +1233,7 @@ fn run() -> Result<()> {
             filter_query,
             limit,
             scan,
+            exact,
             kind,
             live_bytes,
             json,
@@ -1237,6 +1244,7 @@ fn run() -> Result<()> {
             filter_query,
             limit,
             scan,
+            exact,
             kind,
             live_bytes,
             json,
@@ -1329,11 +1337,12 @@ fn run() -> Result<()> {
         ),
         Cmd::Index {
             rebuild,
+            exact,
             subagents,
             if_changed,
             strict,
             json,
-        } => search::cmd_index(rebuild, subagents, if_changed, strict, json),
+        } => search::cmd_index(rebuild, subagents, if_changed, strict, json, exact),
         Cmd::Events {
             id,
             harness,
