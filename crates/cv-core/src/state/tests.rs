@@ -835,3 +835,50 @@ fn frozen_reads_fold_a_retained_wal_without_shm_in_a_private_copy() {
     std::fs::remove_dir_all(&live).ok();
     std::fs::remove_dir_all(&copied).ok();
 }
+
+#[cfg(unix)]
+#[test]
+fn ipc_owner_reads_large_and_slow_frames_on_blocking_accepted_sockets() {
+    use std::io::{BufRead, BufReader, Write};
+    let dir = tmp_state_dir("ipc-large-frame");
+    let store = StateStore::at_dir(&dir).with_producer("serverless-peer");
+    let server = RecorderServer::start(store.clone(), "ipc-owner").unwrap();
+    let epoch = server.epoch().to_string();
+
+    // 1. A frame far larger than a Unix socket buffer: the owner must keep reading until the
+    // newline instead of dropping the connection on the first short (would-block) read.
+    let big = "x".repeat(4 * 1024 * 1024);
+    let started = Instant::now();
+    let receipt = store.append("op-big", "dig-big", &json!({"blob": big})).unwrap();
+    assert_eq!(
+        receipt.event_id.epoch, epoch,
+        "the live IPC owner must commit the large frame"
+    );
+    assert!(!receipt.replayed);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "large frame took {:?}: the owner dropped it and the client spun on retries",
+        started.elapsed()
+    );
+
+    // 2. A client that connects and only then (after a pause) sends its request line.
+    let mut stream = std::os::unix::net::UnixStream::connect(server.socket_path()).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(60));
+    let req = AppendRequest::new("op-slow", "dig-slow", json!({"slow": true}));
+    let mut line = serde_json::to_vec(&req).unwrap();
+    line.push(b'\n');
+    stream.write_all(&line).unwrap();
+    let mut reply = String::new();
+    BufReader::new(stream).read_line(&mut reply).unwrap();
+    assert!(
+        reply.contains("Committed") && reply.contains(&epoch),
+        "slow client must get a durable receipt from the owner, got {reply:?}"
+    );
+
+    assert_eq!(store.inbox_count().unwrap(), 2);
+    drop(server);
+    std::fs::remove_dir_all(&dir).ok();
+}

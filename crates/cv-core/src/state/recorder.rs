@@ -456,6 +456,14 @@ impl RecorderServer {
                         match listener.accept() {
                             Ok((mut stream, _)) => {
                                 let tx_conn = tx.clone();
+                                // On macOS/BSD an accepted socket inherits the listener's
+                                // `O_NONBLOCK`, so the read timeout below would never apply: a
+                                // request not yet (or only partly) in the socket buffer would fail
+                                // with `WouldBlock` and be dropped without a reply. A frame larger
+                                // than the buffer could then never be committed through the owner.
+                                if stream.set_nonblocking(false).is_err() {
+                                    continue;
+                                }
                                 // Read client request inline with short timeout; local Unix frames
                                 // arrive in microseconds, and malformed/idle peers time out cleanly.
                                 let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
