@@ -180,6 +180,30 @@ fn run(roots: &[PathBuf], a: &AdoptArgs) -> Result<()> {
             if let Some(m) = &a.model {
                 set_meta_model(&meta_dest, m)?;
             }
+            let agent_session_id = format!("agent-{}", g.agent_id);
+            let host_harness = cv_core::harness::derived_host().as_str();
+            cv_core::lanes::record_lineage_edge_best_effort(
+                &g.session_id,
+                &agent_session_id,
+                "parent_subagent",
+                Some(host_harness),
+                None,
+                json!({
+                    "agent_id": g.agent_id,
+                }),
+            );
+            cv_core::lanes::record_lineage_edge_best_effort(
+                &agent_session_id,
+                &into.session_id,
+                "adopted_into",
+                Some(host_harness),
+                None,
+                json!({
+                    "from_session_id": g.session_id,
+                    "agent_id": g.agent_id,
+                    "model": a.model.as_deref().or(g.model.as_deref()),
+                }),
+            );
         }
         let verb = if a.dry_run { "would adopt" } else { "adopted" };
         let _ = writeln!(

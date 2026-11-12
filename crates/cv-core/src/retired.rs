@@ -95,6 +95,25 @@ pub fn retire(agent: &str, successor: Option<&str>, session_id: Option<&str>) ->
     let raw = load_raw_from_conn(&tx).map_err(sqlite_to_io)?;
     tx.commit().map_err(sqlite_to_io)?;
 
+    if let Some(ref succ) = norm_succ {
+        if !succ.eq_ignore_ascii_case("PENDING") && succ != &agent_id {
+            let src_sid = format!("agent-{agent_id}");
+            let dst_sid = format!("agent-{succ}");
+            crate::lanes::record_lineage_edge_best_effort(
+                &src_sid,
+                &dst_sid,
+                "retired_for",
+                Some("claude"),
+                None,
+                serde_json::json!({
+                    "agent_id": agent_id,
+                    "successor": succ,
+                    "session_id": preserved_session,
+                }),
+            );
+        }
+    }
+
     let mut resolved_map = resolve_chains(&raw);
     Ok(resolved_map.remove(&agent_id).unwrap_or(Retirement {
         ts: now,

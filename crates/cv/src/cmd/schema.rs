@@ -96,16 +96,18 @@ pub(crate) fn data_schema_json() -> Value {
             "description": "one sub-agent in `lanes --json`, launch order",
             "keys": ["agent_id", "session_id", "path", "agent_type", "description", "tool_use_id", "workflow", "model",
                      "started_at", "last_turn_at", "duration_ms", "messages", "tool_calls", "tokens", "status",
-                     "status_source", "last_text", "last_tool", "stranded", "failure_cause", "resets_at", "failure_detail",
-                     "endpoint", "endpoint_source", "tasks"],
+                     "status_source", "last_text", "last_tool", "stranded", "open_obligations", "failure_cause",
+                     "resets_at", "failure_detail", "endpoint", "endpoint_source", "tasks", "lineage"],
             "tokens": ["calls", "input", "cache_read", "cache_write", "output", "total"],
+            "open_obligations": ["unreturned_subagents", "open_tool_calls", "open_claimed_tasks", "unanswered_decisions"],
             "status": "running · returned · completed · stopped · failed · killed · or a journaled workflow status (done / partial / …)",
-            "status_source": ["journal", "task_notification", "subagent_stop", "hook_ledger", "transcript"],
-            "stranded": "status completed/stopped AND the last text's final sentences say it is waiting",
+            "status_source": ["journal", "task_notification", "subagent_stop", "hook_ledger", "process_exit", "transcript"],
+            "stranded": "parked/exited (!running && !failed/killed) AND open_obligations is non-empty or OS process exited mid-turn",
             "failure_cause": "failed/killed lanes only, from the transcript's last uncleared API-error notice: rate-limited · context · stopped (absent = undetermined)",
-            "endpoint": "the CV_ENDPOINT the lane's own shell commands exported first (lane:<name>; an Agent prompt or a written brief does not count), else with --tasks a lane:<slug> assignee matching the description's leading token",
-            "endpoint_source": ["transcript", "description"],
+            "endpoint": "exact binding from state.db lane_endpoints / task provenance, or the first CV_ENDPOINT=<kind>:<name> exported by the lane's own shell commands",
+            "endpoint_source": ["state", "transcript"],
             "tasks": "with --tasks: [{id, title, state, last_note?, last_ts}] the endpoint holds (assignee), newest first",
+            "lineage": "optional {ancestors?, descendants?} multi-generation cross-session LineageEdge graph from state.db",
             "parent_id": "with --recent only: the session whose forest the lane belongs to",
         },
         "query": query::schema_json(),
@@ -569,15 +571,21 @@ mod tests {
             last_text: some("l"),
             last_tool: some("b"),
             stranded: false,
+            open_obligations: Default::default(),
             failure_cause: some("context"),
             resets_at: Some(at),
             failure_detail: some("f"),
             endpoint: some("lane:a"),
             endpoint_source: Some(cv_core::lanes::EndpointSource::Transcript),
             tasks: Some(Vec::new()),
+            lineage: Some(Default::default()),
         };
         let lane = serde_json::to_value(&lane).unwrap();
         assert_eq!(keys(lane["tokens"].clone()), published(&schema["lane"]["tokens"]));
+        assert_eq!(
+            keys(lane["open_obligations"].clone()),
+            published(&schema["lane"]["open_obligations"])
+        );
         assert_eq!(keys(lane), published(&schema["lane"]["keys"]));
     }
 
