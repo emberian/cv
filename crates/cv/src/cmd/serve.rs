@@ -472,10 +472,9 @@ fn allowed_origin(origin: Option<&str>, host_header: Option<&str>, bind_host: &s
     }
     let (default_port, authority) = if let Some(rest) = o.strip_prefix("http://") {
         (80u16, rest)
-    } else if let Some(rest) = o.strip_prefix("https://") {
-        (443u16, rest)
     } else {
-        return None;
+        let rest = o.strip_prefix("https://")?;
+        (443u16, rest)
     };
     let (origin_host, origin_port) = authority_host_port(authority, default_port)?;
     if is_local_name(origin_host, bind_host) {

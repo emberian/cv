@@ -534,9 +534,11 @@ fn line_io(e: LineError) -> io::Error {
     }
 }
 
+type SseBodyFn<'a> = Box<dyn FnOnce(&mut SseWriter<'_>) -> io::Result<()> + 'a>;
+
 enum ResponseBody<'a> {
     Sized { body: Box<dyn Read + 'a>, len: u64 },
-    Sse(Box<dyn FnOnce(&mut SseWriter<'_>) -> io::Result<()> + 'a>),
+    Sse(SseBodyFn<'a>),
 }
 
 /// Framed writer for `text/event-stream` responses (chunked on HTTP/1.1, EOF-delimited on HTTP/1.0).
