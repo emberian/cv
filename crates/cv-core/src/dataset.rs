@@ -222,7 +222,13 @@ fn render_blocks_impl<'a>(
             Block::File { path, mime, .. } => {
                 sep(&mut started, emit)?;
                 emit("[file: ")?;
-                emit(path.as_deref().or(mime.as_deref()).unwrap_or("attachment"))?;
+                match (path.as_deref(), redact.as_mut()) {
+                    // The same scrub `redact_message` applies to a file reference, so the
+                    // per-block path and redact-then-render stay byte-identical.
+                    (Some(path), Some((opts, stats))) => emit(&crate::redact::scrub_cow(path, opts, stats))?,
+                    (Some(path), None) => emit(path)?,
+                    (None, _) => emit(mime.as_deref().unwrap_or("attachment"))?,
+                }
                 emit("]")?;
             }
         }
@@ -1363,6 +1369,15 @@ mod tests {
                     details: None,
                 }],
             ),
+            // An attached file whose reference carries a credential.
+            msg(
+                Role::User,
+                vec![Block::File {
+                    mime: None,
+                    path: Some("https://files.example.com/r.pdf?token=ghp_0123456789abcdefABCDEF0123456789wxyz".into()),
+                    source: None,
+                }],
+            ),
             // A clean message: must render identically (and untouched) under redaction.
             msg(
                 Role::User,
@@ -1385,6 +1400,10 @@ mod tests {
         assert!(got.contains("[REDACTED:api_key]"));
         assert!(!got.contains("sk-abcDEF1234567890ghijkl"));
         assert!(!got.contains("ghp_0123456789abcdef"));
+        assert!(
+            got.contains("[file: https://files.example.com/r.pdf?token=[REDACTED:"),
+            "{got}"
+        );
         assert!(got.contains("thanks, looks good"));
     }
 
