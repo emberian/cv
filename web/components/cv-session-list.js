@@ -2,7 +2,7 @@
 //
 // API:
 //   list.sessions = Session[]          (setter; triggers re-render)
-//   list.searchProvider = async (q, { harness, semantic, signal }) => rows | null
+//   list.searchProvider = async (q, { harness, signal }) => rows | null
 //   list.searchMode = "server" | "local"
 //   emits "select" CustomEvent with detail = { session } when a row is chosen
 //
@@ -36,7 +36,6 @@ class CvSessionList extends HTMLElement {
     this._indicesByKey = new Map();
     this._query = "";
     this._harnessFilter = new Set(); // empty = all
-    this._semantic = false;
     this._sort = "recent";
     this._sortTouched = false;   // until the user picks one, the sort follows the mode
     this._selectedId = null;
@@ -174,7 +173,7 @@ class CvSessionList extends HTMLElement {
    *  are in hand, and the daemon would just return the same sixty. */
   _resort() {
     const kind = this._result.kind;
-    if (kind === "search" || kind === "semantic") {
+    if (kind === "search") {
       this._rows = this._rows.slice().sort(this._cmp());
       this._indexRows(this._rows);
       this._layout({ force: true });
@@ -193,7 +192,7 @@ class CvSessionList extends HTMLElement {
     let raw;
     try {
       const results = await Promise.all(harnesses.map((harness) => this._searchProvider(q, {
-        harness, semantic: this._semantic, limit: SEARCH_LIMIT, signal: ctrl.signal,
+        harness, limit: SEARCH_LIMIT, signal: ctrl.signal,
       })));
       raw = results.some((rows) => rows == null) ? null : results.flat();
     } catch (e) {
@@ -215,7 +214,7 @@ class CvSessionList extends HTMLElement {
     });
     if (this._sort !== "relevance") rows.sort(this._cmp());
     this._applyResults(rows, {
-      kind: this._semantic ? "semantic" : "search",
+      kind: "search",
       n: rows.length,
       truncated: raw.length >= SEARCH_LIMIT,
     });
@@ -280,11 +279,6 @@ class CvSessionList extends HTMLElement {
     }).join("");
 
     const server = this._searchMode === "server";
-    const semChip = server
-      ? `<button type="button" class="chip${this._semantic ? " on" : ""}" data-semantic
-          aria-pressed="${this._semantic}"
-          title="Search by meaning instead of by word — needs cv index --semantic">≈ meaning</button>`
-      : "";
 
     const sortOpts = [
       ...(server ? [["relevance", "Best match"]] : []),
@@ -300,7 +294,7 @@ class CvSessionList extends HTMLElement {
         <input type="search" class="search" placeholder="${esc(this._placeholder())}"
           aria-label="Search sessions" value="${esc(this._query)}" />
         <div class="control-row">
-          <div class="chips" role="group" aria-label="Filter by harness">${harnessChips || '<span class="muted">no sessions</span>'}${semChip}</div>
+          <div class="chips" role="group" aria-label="Filter by harness">${harnessChips || '<span class="muted">no sessions</span>'}</div>
           <label class="sort">
             <span class="muted">Sort</span>
             <select aria-label="Sort sessions">
@@ -337,13 +331,6 @@ class CvSessionList extends HTMLElement {
     });
     this.querySelectorAll(".chip").forEach((btn) => {
       btn.addEventListener("click", () => {
-        if (btn.hasAttribute("data-semantic")) {
-          this._semantic = !this._semantic;
-          btn.classList.toggle("on", this._semantic);
-          btn.setAttribute("aria-pressed", String(this._semantic));
-          this._refresh();
-          return;
-        }
         const h = btn.dataset.harness;
         const on = this._harnessFilter.has(h);
         if (on) this._harnessFilter.delete(h);
@@ -384,7 +371,7 @@ class CvSessionList extends HTMLElement {
       const content = this._sessions.some((session) => session.messages?.length) ? "loaded messages, titles &amp; paths" : "titles &amp; paths only";
       html = `<b>${n.toLocaleString()}</b> of ${total.toLocaleString()} — ${content}`;
     } else {
-      const how = this._result.kind === "semantic" ? "by meaning" : "in message text";
+      const how = "in message text";
       html = this._result.truncated
         ? `top <b>${n.toLocaleString()}</b> matches ${how} · <mark>${esc(truncate(q, 28))}</mark>`
         : `<b>${n.toLocaleString()}</b> match${n === 1 ? "" : "es"} ${how} · <mark>${esc(truncate(q, 28))}</mark>`;

@@ -139,10 +139,7 @@ fn api_search(params: &cv_core::api::Query) -> (u16, Value) {
             .get(name)
             .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
     };
-    let (semantic, scan) = (flag("semantic"), flag("scan"));
-    if semantic {
-        return bad(400, "semantic search is not enabled in the desktop build");
-    }
+    let scan = flag("scan");
     let scope = match params.get("kind") {
         None => cv_search::Scope::Exchange,
         Some(kind) => match cv_search::Scope::parse(&kind) {

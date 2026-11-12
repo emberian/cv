@@ -581,14 +581,16 @@ check("a loaded pool may honestly say it reaches message text", () => {
   has(el.querySelector(".search").placeholder, "messages", "hydrated pools do search messages");
 });
 
-check("with a daemon it promises message text, and offers best-match + meaning", () => {
+check("with a daemon it promises message text and offers best-match, and no meaning toggle", () => {
   const el = makeList(stubs(120));
   el.searchProvider = async () => [];
   el.searchMode = "server";
   has(el.querySelector(".search").placeholder, "message text", "placeholder");
   const opts = [...el.querySelectorAll(".sort option")].map((o) => o.value);
   eq(opts[0], "relevance", "best match is offered first");
-  truthy(el.querySelector(".chip[data-semantic]"), "the semantic toggle appears only here");
+  // Embedding search left in 0.19; a toggle would only relabel lexical hits as "by meaning".
+  eq(el.querySelector(".chip[data-semantic]"), null, "no semantic toggle");
+  eq(/meaning/i.test(el.textContent), false, "nothing promises search by meaning");
 });
 
 check("a message count from another machine is a number before it reaches HTML", () => {

@@ -653,7 +653,7 @@ fn stats(params: &Query) -> (u16, Value) {
     ok(cv_core::stats::CorpusStats::compute(&refs).to_json())
 }
 
-/// `GET /api/search?q=&limit=&harness=&cwd=&kind=&semantic=1&scan=1` — full-text (or `semantic=1`) search over
+/// `GET /api/search?q=&limit=&harness=&cwd=&kind=&scan=1` — full-text search over
 /// the whole corpus, as the JSON array of rows `cv search --json` emits: the §3 session row plus
 /// `score`, `snippet` and the sub-agent provenance trio, shaped by [`cv_core::rows::SearchRow`].
 ///
@@ -665,7 +665,7 @@ fn stats(params: &Query) -> (u16, Value) {
 /// **The index answers, or says why not.** A missing or unusable index is a 503 naming the cause
 /// and the fix, as `cv search` errors; `scan=1` asks for the live scan instead
 /// ([`cv_core::scan::live_search_filtered`]). Which path answered rides on `X-Cv-Search-Source` (`index` |
-/// `semantic` | `live`), with a human sentence in `X-Cv-Search-Note` whenever the answer may be
+/// `live`), with a human sentence in `X-Cv-Search-Note` whenever the answer may be
 /// partial (a stale index, a live scan, a truncation). Both headers are CORS-exposed. The body
 /// stays exactly the CLI's array.
 fn search(params: &Query, searcher: &cv_search::Searcher) -> Reply {

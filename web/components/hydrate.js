@@ -297,7 +297,7 @@ export async function getSubagent(parentHarness, parentId, agentId) {
 // for that case and says which one it is showing.
 // ---------------------------------------------------------------------------
 
-/** `GET /api/search?q=&limit=&harness=&cwd=&semantic=1` — full-text (or embedding) search over
+/** `GET /api/search?q=&limit=&harness=&cwd=` — full-text search over
  *  every session's content, returning the rows `cv search --json` emits: the §3 session row plus
  *  `score`, `snippet`, and the sub-agent provenance `agent_id` / `parent_id` / `workflow`.
  *
@@ -315,7 +315,6 @@ export async function searchSessions(q, opts = {}) {
         limit: opts.limit,
         harness: opts.harness,
         cwd: opts.cwd,
-        semantic: opts.semantic ? 1 : undefined,
       });
       if (opts.signal?.aborted) throw new DOMException("Aborted", "AbortError");
       return Array.isArray(raw) ? raw : null;
@@ -328,7 +327,6 @@ export async function searchSessions(q, opts = {}) {
   if (opts.limit) params.set("limit", String(opts.limit));
   if (opts.harness) params.set("harness", opts.harness);
   if (opts.cwd) params.set("cwd", opts.cwd);
-  if (opts.semantic) params.set("semantic", "1");
   try {
     const resp = await fetch(`${CVD_BASE}/api/search?${params}`, {
       headers: authHeaders({ Accept: "application/json" }),

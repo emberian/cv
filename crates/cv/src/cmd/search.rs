@@ -161,7 +161,7 @@ fn render(found: Found, query: &str, json: bool) -> Result<()> {
             println!("          … {}", sanitize_line(&h.snippet));
             continue;
         }
-        // Dates ride on the hit straight from the index (FTS); semantic hits carry none.
+        // Dates ride on the hit straight from the index.
         let date = h
             .updated_at
             .or(h.created_at)
