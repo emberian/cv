@@ -535,6 +535,9 @@ pub(crate) fn cmd_splice(args: SpliceArgs<'_>) -> Result<()> {
         let label = format!("splice: {}", specs.join(" "));
         let src = first_path.context("splice needs at least one session")?;
         let e = crate::cmd::distill::emit_to(&spliced, &target, &[], &src, &label)?;
+        if let Some(dst_id) = e.session_id.as_deref().or(e.agent_id.as_deref()) {
+            record_splice_lineage(&spliced, dst_id, cv_core::harness::derived_host());
+        }
         let mut h = String::new();
         let _ = writeln!(
             h,
@@ -560,6 +563,40 @@ pub(crate) fn cmd_splice(args: SpliceArgs<'_>) -> Result<()> {
         cwd,
         thinking,
     })
+}
+
+fn record_splice_lineage(spliced: &Session, dst_id: &str, to_h: Harness) {
+    if cv_core::env::frozen() || dst_id.trim().is_empty() {
+        return;
+    }
+    let Ok(store) = cv_core::state::StateStore::default_store() else {
+        return;
+    };
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let mut seen = std::collections::BTreeSet::new();
+    if let Some(arr) = spliced
+        .cv_extra()
+        .and_then(|b| b.get("loom"))
+        .and_then(|v| v.as_array())
+    {
+        for span in arr {
+            let Some(src_id) = span.get("source_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) else {
+                continue;
+            };
+            if src_id == dst_id || !seen.insert(src_id.to_string()) {
+                continue;
+            }
+            let _ = store.record_lineage_edge(&cv_core::state::LineageEdge {
+                src_session_id: src_id.to_string(),
+                dst_session_id: dst_id.to_string(),
+                edge_kind: "spliced_from".into(),
+                harness: Some(to_h.as_str().to_string()),
+                tool_use_id: None,
+                metadata: span.clone(),
+                created_at: now_ms,
+            });
+        }
+    }
 }
 
 /// Shared tail for splice: emit to a harness when `--harness`/`--out` is in play, otherwise
@@ -590,17 +627,20 @@ fn finish_composed(args: ComposedArgs) -> Result<()> {
         if let Some(dir) = &cwd {
             session.cwd = Some(dir.clone());
         }
-        return emit_session(
+        let dst_id = session.id.clone();
+        emit_session(
             &session,
             to_h,
             out,
             EmitOptions {
                 new_cwd: cwd,
+                new_id: Some(dst_id.clone()),
                 thinking,
                 ..Default::default()
             },
-        )
-        .map(drop);
+        )?;
+        record_splice_lineage(&session, &dst_id, to_h);
+        return Ok(());
     }
 
     // Complete checked demands before publishing either the report or the exported document.
@@ -661,6 +701,8 @@ pub(crate) struct DatasetArgs<'a> {
     pub min_messages: usize,
     pub redact: bool,
     pub redact_only: Option<String>,
+    pub active_branch: bool,
+    pub clean_outcome: bool,
     pub file: Option<PathBuf>,
     pub force: bool,
 }
@@ -675,15 +717,21 @@ pub(crate) fn cmd_dataset(args: DatasetArgs<'_>) -> Result<()> {
         min_messages,
         redact,
         redact_only,
+        active_branch,
+        clean_outcome,
         file,
         force,
     } = args;
     use std::io::Write;
     let out = file;
-    let fmt = match format {
-        "chatml" => cv_core::dataset::Format::Chatml,
-        "sharegpt" => cv_core::dataset::Format::ShareGpt,
-        _ => bail!("unknown format {format:?} (use chatml or sharegpt)"),
+    let fmt = match cv_core::dataset::Format::parse(format) {
+        Some(f) => f,
+        None => bail!("unknown format {format:?} (use chatml, sharegpt, or openai-tools)"),
+    };
+    let dataset_opts = cv_core::dataset::DatasetOptions {
+        active_branch_only: active_branch,
+        clean_outcome_only: clean_outcome,
+        include_thinking: true,
     };
     if let Some(path) = &out {
         crate::util::user_file_claim(path, force)?;
@@ -726,6 +774,7 @@ pub(crate) fn cmd_dataset(args: DatasetArgs<'_>) -> Result<()> {
         text_sets: &text_sets,
         fmt,
         redact_opts: redact_opts.as_ref(),
+        dataset_opts: &dataset_opts,
         min_messages,
         limit,
         emitted: &mut emitted,
@@ -826,6 +875,7 @@ struct EmitCtx<'a> {
     text_sets: &'a crate::cmd::query::TextSets,
     fmt: cv_core::dataset::Format,
     redact_opts: Option<&'a cv_core::redact::RedactOptions>,
+    dataset_opts: &'a cv_core::dataset::DatasetOptions,
     min_messages: usize,
     limit: Option<usize>,
     emitted: &'a mut usize,
@@ -849,7 +899,7 @@ impl EmitCtx<'_> {
         let Some(adapter) = cv_core::harness::for_harness(r.harness) else {
             return Ok(DatasetFlow::Continue);
         };
-        let record = match cv_core::dataset::stage_record(
+        let record = match cv_core::dataset::stage_record_with_options(
             adapter.as_ref(),
             r,
             self.fmt,
@@ -857,6 +907,7 @@ impl EmitCtx<'_> {
             self.min_messages,
             self.query,
             self.text_sets,
+            self.dataset_opts,
         ) {
             Ok(record) => record,
             Err(error) if error.is::<cv_core::dataset::InputError>() => {

@@ -64,31 +64,59 @@ fn text_or_stdin(text: String) -> Result<String> {
     }
 }
 
-/// `--issue` absolutized at open time, because the record outlives the shell it was typed in —
-/// a relative `--issue` made `sweep` report "issue path no longer exists" the next day. A
-/// relative path is taken against the current directory; when it is not there but is under the
-/// task's `--repo`, the repo wins (that is where it was meant). Nothing found: joined to the cwd
-/// lexically. Handles (`#42`) and URLs pass through untouched.
+/// `--issue` absolutized at open time when it names a local filesystem path (`./…`, `../…`, `/…`,
+/// `~/…`, `file://…`, or a local `.md`/note file), because the record outlives the shell it was
+/// typed in. External tracker refs (`#42`, `owner/repo#12`, GitLab `group/sub/repo#12`, Jira
+/// `PROJ-123`, URLs) pass through untouched and are never joined onto `<cwd>`.
 fn absolutize_issue(issue: Option<String>, repo: Option<&Path>) -> Option<String> {
     let issue = issue?;
-    let Some(p) = issue_path(&issue) else {
-        return Some(issue);
+    let trimmed = issue.trim();
+    let p_str = match issue_path(trimmed) {
+        Some(p) => p,
+        None => {
+            // Allow an extensionless relative path ONLY if it has no tracker syntax and actually
+            // exists under `--repo`.
+            if !trimmed.is_empty()
+                && !trimmed.contains(char::is_whitespace)
+                && !trimmed.contains('#')
+                && !has_uri_scheme(trimmed)
+                && !is_tracker_key(trimmed)
+                && repo.is_some_and(|r| r.join(trimmed).exists())
+            {
+                trimmed
+            } else {
+                return Some(issue);
+            }
+        }
     };
-    let p = Path::new(p);
-    if p.is_absolute() {
-        return Some(issue);
+    let expanded: PathBuf = if p_str == "~" {
+        match crate::util::dirs_home() {
+            Some(h) => h,
+            None => return Some(issue),
+        }
+    } else if let Some(rest) = p_str.strip_prefix("~/") {
+        match crate::util::dirs_home() {
+            Some(h) => h.join(rest),
+            None => return Some(issue),
+        }
+    } else {
+        PathBuf::from(p_str)
+    };
+    if expanded.is_absolute() {
+        let norm = cv_core::tools::classify::normalize_path(&expanded, None);
+        return Some(norm.display().to_string());
     }
     let cwd = std::env::current_dir().ok();
-    let in_cwd = cwd.as_ref().map(|d| d.join(p));
-    let in_repo = repo.map(|r| r.join(p));
+    let in_cwd = cwd.as_ref().map(|d| d.join(&expanded));
+    let in_repo = repo.map(|r| r.join(&expanded));
     let chosen = match (&in_cwd, &in_repo) {
         (Some(c), _) if c.exists() => c.clone(),
         (_, Some(r)) if r.exists() => r.clone(),
         (Some(c), _) => c.clone(),
         (None, Some(r)) => r.clone(),
-        (None, None) => p.to_path_buf(),
+        (None, None) => expanded,
     };
-    let abs = chosen.canonicalize().unwrap_or(chosen);
+    let abs = cv_core::tools::classify::normalize_path(&chosen, None);
     Some(abs.display().to_string())
 }
 
@@ -445,7 +473,7 @@ pub(crate) enum TaskCmd {
 
 /// Replay the default store, print any log warnings loudly, return the outcome.
 fn replay_loud() -> Result<cv_core::task::ReplayOutcome> {
-    let outcome = task::replay()?;
+    let outcome = cv_core::replay_tasks_frozen_safe()?;
     for w in &outcome.warnings {
         eprintln!("⚠ {}", sanitize_line(w));
     }
@@ -455,6 +483,14 @@ fn replay_loud() -> Result<cv_core::task::ReplayOutcome> {
 /// [`replay_loud`] for a command that reads only the model: the stored fold and the events
 /// appended since ([`cv_core::task::fold`]), with the same warnings, printed the same way.
 fn fold_loud() -> Result<cv_core::task::Folded> {
+    if cv_core::env::frozen() {
+        let outcome = replay_loud()?;
+        return Ok(cv_core::task::Folded {
+            model: outcome.model,
+            warnings: outcome.warnings,
+            quarantined: outcome.quarantined,
+        });
+    }
     let folded = task::fold()?;
     for w in &folded.warnings {
         eprintln!("⚠ {}", sanitize_line(w));
@@ -1456,8 +1492,8 @@ mod tests {
         assert!(branches.contains("feature/remote-only") && branches.contains("origin/feature/remote-only"));
         assert!(!branches.contains("main") && !branches.contains("origin/main"));
         assert_eq!(
-            branch_tokens_in(["feature/compiler_", "_remote-only end"]),
-            branch_tokens("feature/compiler_\n_remote-only end")
+            structural_branches_in_text("`feature/compiler` and refs/heads/feature/remote-only"),
+            BTreeSet::from(["feature/compiler".to_string(), "feature/remote-only".to_string()])
         );
     }
 
@@ -1527,23 +1563,62 @@ mod tests {
     }
 
     #[test]
-    fn sweep_helpers_tell_branches_from_words_and_paths_from_handles() {
-        assert!(branch_like("sdk-ts-repair"));
-        assert!(branch_like("k-ran"));
-        assert!(branch_like("feature/x"));
-        assert!(branch_like("p3b1"));
-        assert!(!branch_like("fix"));
-        assert!(!branch_like("final"));
-        let toks = branch_tokens("one commit on branch `sdk-ts-repair` (see docs/plan.md).");
+    fn sweep_helpers_match_only_structural_branch_refs_and_preserve_external_tracker_handles() {
+        // Explicit structural branch refs match; backticked file paths (`docs/plan.md`) do not.
+        let toks = structural_branches_in_text(
+            "one commit on branch `sdk-ts-repair` (see `docs/plan.md`), branch: feat/auth, refs/heads/release/1.0, task/0196abcd",
+        );
         assert!(toks.contains("sdk-ts-repair"), "{toks:?}");
-        assert!(toks.contains("docs/plan.md"), "{toks:?}");
+        assert!(toks.contains("feat/auth"), "{toks:?}");
+        assert!(toks.contains("release/1.0"), "{toks:?}");
+        assert!(toks.contains("task/0196abcd"), "{toks:?}");
+        assert!(!toks.contains("docs/plan.md"), "{toks:?}");
+
+        // Arbitrary English prose words and slash-separated English phrases never guess branches.
+        let prose = structural_branches_in_text(
+            "Fix auth/login race condition and refactor authentication middleware in controller",
+        );
+        assert!(
+            prose.is_empty(),
+            "prose must never synthesize branch candidates: {prose:?}"
+        );
+
+        let mut tp = proj("Fix auth/login race condition", "2026-07-13T00:00:00Z");
+        tp.tags.push("branch:swarm/worker-1".into());
+        let cands = structural_branch_candidates(&tp);
+        assert!(cands.contains("swarm/worker-1"));
+        assert!(cands.contains(&format!("task/{}", tp.task_id)));
+        assert!(!cands.contains("auth/login"));
+        assert!(!cands.contains("condition"));
+
+        // Local filesystem note paths resolve; GitHub, GitLab, Jira, and URLs never mangle into <cwd>.
         assert_eq!(
             issue_path("claudesplosion/planning/SESSION-STATE.md"),
             Some("claudesplosion/planning/SESSION-STATE.md")
         );
-        assert_eq!(issue_path("#42"), None);
-        assert_eq!(issue_path("https://github.com/x/y/issues/4"), None);
         assert_eq!(issue_path("memory/x.md"), Some("memory/x.md"));
+        assert_eq!(issue_path("./notes/todo"), Some("./notes/todo"));
+        assert_eq!(issue_path("../notes/todo"), Some("../notes/todo"));
+        assert_eq!(issue_path("/var/tmp/spec"), Some("/var/tmp/spec"));
+        assert_eq!(issue_path("~/notes/spec"), Some("~/notes/spec"));
+        assert_eq!(issue_path("file:///tmp/spec.md"), Some("/tmp/spec.md"));
+        assert_eq!(issue_path("#42"), None);
+        assert_eq!(issue_path("owner/repo#12"), None);
+        assert_eq!(issue_path("group/subgroup/repo#12"), None);
+        assert_eq!(issue_path("PROJ-123"), None);
+        assert_eq!(issue_path("CV_CORE-9"), None);
+        assert_eq!(issue_path("https://github.com/x/y/issues/4"), None);
+        assert_eq!(issue_path("linear:ENG-42"), None);
+        assert_eq!(issue_path("nonexistent_owner/nonexistent_repo"), None);
+
+        assert_eq!(
+            absolutize_issue(Some("group/subgroup/repo#12".into()), None).as_deref(),
+            Some("group/subgroup/repo#12")
+        );
+        assert_eq!(
+            absolutize_issue(Some("PROJ-123".into()), None).as_deref(),
+            Some("PROJ-123")
+        );
     }
 
     #[test]
@@ -1612,37 +1687,193 @@ fn has_ref(repo: &Path, name: &str) -> bool {
         .is_ok_and(|o| o.status.success())
 }
 
-/// A branch name worth matching against prose: it must look like a branch, not a word — a
-/// separator or a digit, or eight characters — so a branch called `fix` does not sweep every task
-/// whose body says "fix".
-fn branch_like(name: &str) -> bool {
-    name.contains(['-', '/', '_', '.']) || name.chars().any(|c| c.is_ascii_digit()) || name.len() >= 8
+fn looks_like_file_path(s: &str) -> bool {
+    let Some(ext) = Path::new(s).extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "md" | "markdown"
+            | "txt"
+            | "rst"
+            | "org"
+            | "adoc"
+            | "rs"
+            | "js"
+            | "mjs"
+            | "cjs"
+            | "ts"
+            | "tsx"
+            | "jsx"
+            | "py"
+            | "go"
+            | "c"
+            | "h"
+            | "cpp"
+            | "hpp"
+            | "java"
+            | "kt"
+            | "rb"
+            | "sh"
+            | "zsh"
+            | "bash"
+            | "json"
+            | "jsonl"
+            | "toml"
+            | "yaml"
+            | "yml"
+            | "html"
+            | "css"
+            | "sql"
+            | "lock"
+            | "xml"
+            | "pdf"
+            | "png"
+            | "jpg"
+            | "svg"
+    )
 }
 
-/// The branch-shaped tokens of a text (letters, digits and `-_./`), deduplicated.
+fn is_valid_branch_ref(s: &str) -> bool {
+    s.len() >= 2
+        && !s.starts_with(['.', '/', '-'])
+        && !s.ends_with(['.', '/'])
+        && !s.contains("..")
+        && !s.contains("//")
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'/' | b'.'))
+        && !looks_like_file_path(s)
+}
+
+fn branch_ref_re() -> &'static regex::Regex {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| {
+        regex::Regex::new(
+            r"(?x)
+            `([A-Za-z0-9][A-Za-z0-9._/-]*)`
+            | \brefs/heads/([A-Za-z0-9][A-Za-z0-9._/-]*)
+            | (?i:\bbranch)\s*[:=]\s*`?([A-Za-z0-9][A-Za-z0-9._/-]*)`?
+            | \b(task/[A-Za-z0-9][A-Za-z0-9._/-]*)
+            ",
+        )
+        .expect("static regex")
+    })
+}
+
+fn extract_structural_branches(text: &str, out: &mut BTreeSet<String>) {
+    for cap in branch_ref_re().captures_iter(text) {
+        if let Some(m) = cap.get(1) {
+            let cand = m.as_str().trim_end_matches(['.', '/']);
+            // Backticked spans must look like a structured branch identifier (separator or digit),
+            // never a plain single word like `main` or `fix`.
+            if is_valid_branch_ref(cand) && (cand.contains(['-', '/', '_']) || cand.bytes().any(|b| b.is_ascii_digit()))
+            {
+                out.insert(cand.to_string());
+            }
+        }
+        for group in [2, 3, 4] {
+            if let Some(m) = cap.get(group) {
+                let cand = m.as_str().trim_end_matches(['.', ',', ';', ':', ')']);
+                if is_valid_branch_ref(cand) {
+                    out.insert(cand.to_string());
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
-fn branch_tokens(text: &str) -> BTreeSet<String> {
-    branch_tokens_in([text])
+fn structural_branches_in_text(text: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    extract_structural_branches(text, &mut out);
+    out
 }
 
-fn branch_tokens_in<'a>(texts: impl IntoIterator<Item = &'a str>) -> BTreeSet<String> {
-    texts
-        .into_iter()
-        .flat_map(|text| text.split(|c: char| !(c.is_alphanumeric() || matches!(c, '-' | '_' | '/' | '.'))))
-        .map(|t| t.trim_matches(|c| matches!(c, '.' | '/')))
-        .filter(|t| t.len() >= 3)
-        .map(str::to_string)
-        .collect()
+/// Structural branch candidates for a task: canonical `task/<id>` refs, `branch:<ref>` tags, and
+/// explicit structural refs (`refs/heads/…`, `branch: …`, `task/…`, or backticked branch slugs).
+/// Never guesses branches from bare English prose words.
+fn structural_branch_candidates(t: &task::TaskProjection) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    if !t.task_id.trim().is_empty() {
+        out.insert(format!("task/{}", t.task_id));
+        out.insert(format!("task/{}", prefix(&t.task_id, 8)));
+        out.insert(format!("task/{}", prefix(&t.task_id, 13)));
+    }
+    for tag in &t.tags {
+        if let Some(b) = tag.strip_prefix("branch:").map(str::trim) {
+            if is_valid_branch_ref(b) {
+                out.insert(b.to_string());
+            }
+        }
+    }
+    extract_structural_branches(&t.title, &mut out);
+    extract_structural_branches(&t.body, &mut out);
+    out
 }
 
-/// Does `issue` read as a path (as opposed to `#42` or a URL)? A slash or a file extension and no
-/// whitespace.
+fn is_tracker_key(s: &str) -> bool {
+    let Some((proj, num)) = s.split_once('-') else {
+        return false;
+    };
+    !proj.is_empty()
+        && proj.bytes().next().is_some_and(|b| b.is_ascii_uppercase())
+        && proj
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+        && !num.is_empty()
+        && num.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn has_uri_scheme(s: &str) -> bool {
+    if s.starts_with("file://") {
+        return false;
+    }
+    if s.contains("://") {
+        return true;
+    }
+    if let Some((scheme, _)) = s.split_once(':') {
+        return scheme.len() >= 2
+            && scheme
+                .bytes()
+                .all(|b| b.is_ascii_alphabetic() || matches!(b, b'+' | b'-' | b'.'));
+    }
+    false
+}
+
+fn has_local_note_extension(s: &str) -> bool {
+    let Some(ext) = Path::new(s).extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "md" | "markdown" | "txt" | "rst" | "org" | "adoc" | "json" | "yaml" | "yml" | "toml"
+    )
+}
+
+/// Does `issue` name a local filesystem path rather than an external tracker ref (`#42`,
+/// `owner/repo#12`, GitLab `group/sub/repo#12`, Jira `PROJ-123`, or URLs)?
 fn issue_path(issue: &str) -> Option<&str> {
     let i = issue.trim();
-    let looks = !i.contains(char::is_whitespace)
-        && !i.contains("://")
-        && (i.contains('/') || Path::new(i).extension().is_some());
-    looks.then_some(i)
+    if i.is_empty() || i.contains(char::is_whitespace) || i.contains('#') {
+        return None;
+    }
+    if let Some(rest) = i.strip_prefix("file://") {
+        return (!rest.is_empty()).then_some(rest);
+    }
+    if has_uri_scheme(i) || is_tracker_key(i) {
+        return None;
+    }
+    if i.starts_with('/')
+        || i.starts_with("./")
+        || i.starts_with("../")
+        || i.starts_with("~/")
+        || i == "~"
+        || has_local_note_extension(i)
+        || Path::new(i).exists()
+    {
+        return Some(i);
+    }
+    None
 }
 
 #[derive(serde::Serialize)]
@@ -1698,11 +1929,8 @@ fn cmd_sweep(repo: &Path, main: Option<String>, json: bool) -> Result<()> {
                 reasons.push(format!("issue path no longer exists ({})", tried.join(", ")));
             }
         }
-        let mentioned = branch_tokens_in([t.title.as_str(), t.body.as_str()]);
-        for b in mentioned
-            .iter()
-            .filter(|b| branch_like(b) && merged.contains(b.as_str()))
-        {
+        let mentioned = structural_branch_candidates(t);
+        for b in mentioned.iter().filter(|b| merged.contains(b.as_str())) {
             reasons.push(format!("names branch `{b}`, merged into {main}"));
         }
         if !reasons.is_empty() {

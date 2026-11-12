@@ -42,6 +42,30 @@ impl Event {
     pub fn transcript(&self) -> Option<&Path> {
         (!self.session.path.as_os_str().is_empty()).then_some(self.session.path.as_path())
     }
+
+    /// Ancestor-canonicalized working directory for consistent path matching across symlinked
+    /// roots (e.g. macOS `/var` <-> `/private/var`).
+    pub fn normalized_cwd(&self) -> Option<PathBuf> {
+        self.cwd
+            .as_deref()
+            .filter(|c| !c.as_os_str().is_empty())
+            .map(|c| crate::tools::classify::normalize_path(c, None))
+    }
+
+    /// Every candidate edit target absolutized against [`Self::cwd`] and ancestor-canonicalized
+    /// identically to [`crate::events::absolutize`], even when the target file does not exist yet.
+    pub fn normalized_edits(&self) -> Vec<String> {
+        let mut out = Vec::with_capacity(self.edits.len());
+        for f in &self.edits {
+            if Path::new(f).is_absolute() || self.cwd.is_some() {
+                let norm = crate::tools::classify::absolutize_path(f, self.cwd.as_deref());
+                if !norm.is_empty() && !out.contains(&norm) {
+                    out.push(norm);
+                }
+            }
+        }
+        out
+    }
 }
 
 /// The Claude Code hook payload's fields cv reads; Codex sends the same names. Every other

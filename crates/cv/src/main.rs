@@ -456,6 +456,9 @@ enum Cmd {
         /// for an exact match, else the matched edit).
         #[arg(long)]
         show: bool,
+        /// Emit structured provenance attribution as JSON (`file`, `lines`, `commits`, `event_only_sessions`).
+        #[arg(long)]
+        json: bool,
     },
     /// Diagnose why a session's context window keeps filling and compacting: attribute context
     /// pressure by source (tool results split MCP/builtin, thinking, messages), size the fixed
@@ -842,9 +845,10 @@ enum Cmd {
         redact: bool,
     },
     /// Export the corpus as a fine-tuning dataset (JSONL, one session per line).
-    /// `chatml`/`sharegpt` import directly into Unsloth Studio / TRL / HF — no adapter.
+    /// `chatml`/`sharegpt`/`openai-tools` import directly into Unsloth Studio / TRL / HF — no adapter.
     Dataset {
-        /// `chatml` (default) → {"messages":[…]}, or `sharegpt` → {"conversations":[…]}.
+        /// `chatml` (default) → {"messages":[…]}, `sharegpt` → {"conversations":[…]}, or
+        /// `openai-tools` → structured OpenAI `tool_calls` + `tool_call_id`.
         #[arg(long, default_value = "chatml")]
         format: String,
         /// Only this harness (claude, codex, hermes, …); omit for all.
@@ -874,6 +878,12 @@ enum Cmd {
         /// to strip PEM blocks but keep identities. Implies redaction; overrides `--redact`.
         #[arg(long, value_name = "CLASSES")]
         redact_only: Option<String>,
+        /// Export only the active conversation branch (omitting rewound turns and sidechains).
+        #[arg(long = "active-branch")]
+        active_branch: bool,
+        /// Export only clean-outcome trajectories (omitting sessions ending in errors or unanswered tool calls).
+        #[arg(long = "clean-outcome")]
+        clean_outcome: bool,
         /// Write to this file instead of stdout.
         #[arg(long)]
         file: Option<PathBuf>,
@@ -1135,12 +1145,14 @@ fn run() -> Result<()> {
     let _env = env.enter();
     if cv_core::env::frozen() {
         let writes = match &cli.cmd {
-            Cmd::Index { .. }
-            | Cmd::Port { .. }
-            | Cmd::Share { .. }
-            | Cmd::Task { .. }
-            | Cmd::Hook { .. }
-            | Cmd::Watch { .. } => true,
+            Cmd::Index { .. } | Cmd::Port { .. } | Cmd::Share { .. } | Cmd::Hook { .. } | Cmd::Watch { .. } => true,
+            Cmd::Task { action } => !matches!(
+                action,
+                task::TaskCmd::List { .. }
+                    | task::TaskCmd::Show { .. }
+                    | task::TaskCmd::Inbox { .. }
+                    | task::TaskCmd::Events { .. }
+            ),
             Cmd::Prune { dry_run, .. } | Cmd::Rewind { dry_run, .. } | Cmd::Adopt { dry_run, .. } => !*dry_run,
             Cmd::Distill {
                 session,
@@ -1268,6 +1280,8 @@ fn run() -> Result<()> {
             min_messages,
             redact,
             redact_only,
+            active_branch,
+            clean_outcome,
             file,
             force,
         } => reshape::cmd_dataset(reshape::DatasetArgs {
@@ -1279,6 +1293,8 @@ fn run() -> Result<()> {
             min_messages,
             redact,
             redact_only,
+            active_branch,
+            clean_outcome,
             file,
             force,
         }),
@@ -1319,7 +1335,12 @@ fn run() -> Result<()> {
             wide,
         } => events::cmd_events(&id, harness, kind, subagents, json, wide),
         Cmd::Touched { path, edits_only, json } => events::cmd_touched(&path, edits_only, json),
-        Cmd::Blame { file, lines, show } => blame::cmd_blame(&file, lines.as_deref(), show),
+        Cmd::Blame {
+            file,
+            lines,
+            show,
+            json,
+        } => blame::cmd_blame(&file, lines.as_deref(), show, json),
         Cmd::Share {
             id,
             harness,

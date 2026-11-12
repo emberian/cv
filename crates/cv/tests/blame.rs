@@ -1,9 +1,10 @@
-//! End-to-end `cv blame`: a real (temp) git repo with controlled commit times + a temp
-//! CLUSTERVISION_HOME whose catalog is fed by ingesting a synthetic claude session — then the
-//! actual binary is run against it, in a `cv_testkit::World`. Everything lives in ONE test fn because CLUSTERVISION_HOME is
-//! process-global state for the in-process cv-core calls (parallel test fns would race it).
+//! End-to-end `cv blame`: a real (temp) git repo with controlled commit times + rebase/amend
+//! history + `-L` line-scoped content-hunk attribution + `--json` + `/api/blame` HTTP route.
+//! Everything lives in ONE test fn because `CLUSTERVISION_HOME` is process-global state for
+//! in-process `cv_core` calls.
 
 use cv_testkit::World;
+use serde_json::Value;
 use std::path::Path;
 use std::process::Command;
 use std::{fs, str};
@@ -14,6 +15,9 @@ const EDIT_TS: i64 = 1_780_315_200;
 const COMMIT1_TS: i64 = EDIT_TS + 8 * 60;
 /// A second commit two days later that no session can claim.
 const COMMIT2_TS: i64 = EDIT_TS + 2 * 86_400;
+/// A third squashed/rebased commit 5 days later (far outside `[commit - 6h, commit + 15m]`)
+/// combining two distinct functions authored by two different sessions days earlier.
+const COMMIT3_REBASED_TS: i64 = EDIT_TS + 5 * 86_400;
 
 fn git(repo: &Path, args: &[&str], date: Option<i64>) -> String {
     let mut c = Command::new("git");
@@ -63,7 +67,7 @@ fn blame_end_to_end() {
     // Canonicalize so /var vs /private/var (macOS temp symlink) agrees with git's toplevel.
     let repo = repo_raw.canonicalize().unwrap();
 
-    // --- a real repo with two commits at controlled times ---
+    // --- a real repo with two commits on widget.rs at controlled times ---
     git(&repo, &["init", "-q"], None);
     git(&repo, &["config", "user.email", "t@example.com"], None);
     git(&repo, &["config", "user.name", "t"], None);
@@ -74,8 +78,7 @@ fn blame_end_to_end() {
     fs::write(repo.join("src/widget.rs"), "fn widget() { 2 }\nfn extra() {}\n").unwrap();
     git(&repo, &["commit", "-aqm", "chore: tweak widget"], Some(COMMIT2_TS));
 
-    // --- a synthetic claude session that edited the same file in a DIFFERENT checkout ---
-    // (cwd /historical/checkout: only the repo-relative suffix can match it — the robust path.)
+    // --- a synthetic claude session that edited widget.rs in a DIFFERENT checkout ---
     let jsonl = fixtures.join("blame-e2e.jsonl");
     let lines = [
         serde_json::json!({
@@ -102,7 +105,6 @@ fn blame_end_to_end() {
     fs::write(&jsonl, body).unwrap();
 
     // --- a second session that edited the file hours earlier and then RAN the first commit ---
-    // (its tool result prints the sha: exact evidence that must outrank the closer timed match).
     let sha1 = git(&repo, &["rev-parse", "HEAD~1"], None);
     let short1 = &sha1[..7];
     let exact_jsonl = fixtures.join("exact-e2e.jsonl");
@@ -160,8 +162,7 @@ fn blame_end_to_end() {
         message_count: Some(3),
     };
     cv_core::events::ingest_ref(&r).expect("ingest fixture session");
-    cv_core::catalog::sync(&[r.clone(), rx]);
-    // The edit's msg_idx as the catalog recorded it — asserted against, never assumed.
+    cv_core::catalog::sync(&[r.clone(), rx.clone()]);
     let edit_idx = cv_core::events::events_for("claude", "blame-e2e", Some("file_edit"))
         .unwrap()
         .first()
@@ -184,7 +185,6 @@ fn blame_end_to_end() {
         out.contains("other checkout"),
         "suffix-only match should be labeled:\n{out}"
     );
-    // The hint is copy-pasteable into the 0.11 window grammar: `--range A..B`, never `A-B`.
     let (lo, hi) = ((edit_idx - 3).max(0), edit_idx + 3);
     assert!(out.contains(&format!("cv show blame-e2 --range {lo}..{hi}")), "{out}");
     assert!(
@@ -192,15 +192,15 @@ fn blame_end_to_end() {
         "old `A-B` hint must be gone:\n{out}"
     );
     assert!(out.contains("1 of 2 commit(s) matched an agent session"), "{out}");
-    // The session that ran the commit is proven, and outranks the closer timed match.
-    let exact_at = pos(&out, "exact: commit created here");
+    // CommitSha evidence outranks ContentHunk / Timed, and spells its strength explicitly.
+    let exact_at = pos(&out, "commit created here");
+    assert!(out.contains("exact: commit sha"), "{out}");
     assert!(out[..exact_at].contains("exact-e2"), "{out}");
     assert!(
         exact_at < pos(&out, "8m before commit"),
-        "exact must rank first:\n{out}"
+        "exact commit sha must rank first:\n{out}"
     );
     assert!(out.contains(&format!("cv rewind exact-e2 --at {short1}")), "{out}");
-    // Its 5h-old edit is folded into the exact line, never listed again as a timed match.
     assert_eq!(out.matches("exact-e2").count(), 3, "one match line + two hints:\n{out}");
 
     // --- -L: line 2 was never touched by the tweak, so only the first commit owns it ---
@@ -211,7 +211,6 @@ fn blame_end_to_end() {
     assert!(out.contains("8m before commit"), "{out}");
 
     // --- --show: the range hint indexing must line up with `cv show --range` ---
-    // The best match is now the exact one: its window must contain the commit call itself.
     let (out, err) = cv(&w, &repo, &["blame", "src/widget.rs", "--show"]);
     assert!(
         out.contains("conversation around the edit"),
@@ -222,6 +221,188 @@ fn blame_end_to_end() {
         "evidence msg_idx is misaligned with show --range indexing:\n{out}"
     );
     assert!(out.contains(&format!("{short1} feat: add widget")), "{out}");
+
+    // --- Rebase / cherry-pick / squash survival + `-L a,b` line-scoped ContentHunk + `--json` + `/api/blame` ---
+    // Two sessions edit `src/rebased.rs` on 2026-06-01 (5 DAYS before `COMMIT3_REBASED_TS`!),
+    // plus a distractor session that touches `src/rebased.rs` 5 minutes before `COMMIT3_REBASED_TS`
+    // with unrelated content (heuristic `Timed` only).
+    // - `sess-alpha-hunk` writes lines 1..=2 (`fn alpha_calc() -> i32 { 41 + 1 }`)
+    // - `sess-beta-hunk` writes lines 3..=4 (`fn beta_calc() -> i32 { 99 * 2 }`)
+    // Then a squashed/rebased commit lands 5 days later (`COMMIT3_REBASED_TS`) with a completely new SHA.
+    let alpha_jsonl = fixtures.join("sess-alpha-hunk.jsonl");
+    fs::write(
+        &alpha_jsonl,
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "assistant", "uuid": "ah1", "sessionId": "sess-alpha-hunk",
+                "timestamp": "2026-06-01T12:00:00Z",
+                "message": {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "ta1", "name": "Write",
+                     "input": {"file_path": repo.join("src/rebased.rs"),
+                               "content": "pub fn alpha_calc() -> i32 {\n    41 + 1\n}\n"}}
+                ]}
+            })
+        ),
+    )
+    .unwrap();
+
+    let beta_jsonl = fixtures.join("sess-beta-hunk.jsonl");
+    fs::write(
+        &beta_jsonl,
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "assistant", "uuid": "bh1", "sessionId": "sess-beta-hunk",
+                "timestamp": "2026-06-01T13:00:00Z",
+                "message": {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "tb1", "name": "Edit",
+                     "input": {"file_path": repo.join("src/rebased.rs"),
+                               "old_string": "// placeholder",
+                               "new_string": "pub fn beta_calc() -> i32 {\n    99 * 2\n}"}}
+                ]}
+            })
+        ),
+    )
+    .unwrap();
+
+    // Distractor session 5 minutes before COMMIT3_REBASED_TS (`2026-06-06T11:55:00Z`): inside `[commit - 6h, commit + 15m]`,
+    // but wrote unrelated comment text that was discarded before commit.
+    let timed_jsonl = fixtures.join("sess-timed-only.jsonl");
+    let timed_iso = chrono::DateTime::from_timestamp(COMMIT3_REBASED_TS - 300, 0)
+        .unwrap()
+        .to_rfc3339();
+    fs::write(
+        &timed_jsonl,
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "assistant", "uuid": "tm1", "sessionId": "sess-timed-only",
+                "timestamp": timed_iso,
+                "message": {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "tt1", "name": "Edit",
+                     "input": {"file_path": repo.join("src/rebased.rs"),
+                               "old_string": "old",
+                               "new_string": "// discarded scratch note"}}
+                ]}
+            })
+        ),
+    )
+    .unwrap();
+
+    fs::write(
+        repo.join("src/rebased.rs"),
+        "pub fn alpha_calc() -> i32 {\n    41 + 1\n}\npub fn beta_calc() -> i32 {\n    99 * 2\n}\n",
+    )
+    .unwrap();
+    git(&repo, &["add", "src/rebased.rs"], None);
+    git(
+        &repo,
+        &["commit", "-qm", "feat: squash rebased alpha and beta"],
+        Some(COMMIT3_REBASED_TS),
+    );
+    // Amend the commit with a new timestamp (+1h) to prove rebase/amend changes commit SHA & time
+    // while `ContentHunk` provenance survives intact!
+    git(
+        &repo,
+        &["commit", "--amend", "-qm", "feat: rebased & amended alpha+beta"],
+        Some(COMMIT3_REBASED_TS + 3600),
+    );
+
+    let r_alpha = cv_core::ir::SessionRef {
+        id: "sess-alpha-hunk".into(),
+        harness: cv_core::ir::Harness::Claude,
+        path: alpha_jsonl,
+        cwd: Some(repo.clone()),
+        title: Some("author alpha_calc".into()),
+        created_at: None,
+        updated_at: None,
+        message_count: Some(1),
+    };
+    let r_beta = cv_core::ir::SessionRef {
+        id: "sess-beta-hunk".into(),
+        harness: cv_core::ir::Harness::Claude,
+        path: beta_jsonl,
+        cwd: Some(repo.clone()),
+        title: Some("author beta_calc".into()),
+        created_at: None,
+        updated_at: None,
+        message_count: Some(1),
+    };
+    let r_timed = cv_core::ir::SessionRef {
+        id: "sess-timed-only".into(),
+        harness: cv_core::ir::Harness::Claude,
+        path: timed_jsonl,
+        cwd: Some(repo.clone()),
+        title: Some("scratch edit".into()),
+        created_at: None,
+        updated_at: None,
+        message_count: Some(1),
+    };
+    cv_core::events::ingest_ref(&r_alpha).unwrap();
+    cv_core::events::ingest_ref(&r_beta).unwrap();
+    cv_core::events::ingest_ref(&r_timed).unwrap();
+    cv_core::catalog::sync(&[r, rx, r_alpha, r_beta, r_timed]);
+
+    // 1) `cv blame src/rebased.rs -L 1,2 --json`: ONLY `sess-alpha-hunk` matches as `content_hunk`,
+    //    outranking `sess-timed-only` (`timed`), while `sess-beta-hunk` (5 days old, wrote lines 4..=5)
+    //    is excluded by `-L 1,2` line scoping!
+    let (json_l12, err) = cv(&w, &repo, &["blame", "src/rebased.rs", "-L", "1,2", "--json"]);
+    let rep_l12: Value =
+        serde_json::from_str(&json_l12).unwrap_or_else(|e| panic!("bad JSON ({e}):\n{json_l12}\nstderr:\n{err}"));
+    assert_eq!(rep_l12["in_git_repo"], true);
+    assert_eq!(rep_l12["lines"], serde_json::json!([1, 2]));
+    let matches_l12 = rep_l12["commits"][0]["matches"].as_array().unwrap();
+    assert_eq!(matches_l12[0]["session_id"], "sess-alpha-hunk", "{rep_l12}");
+    assert_eq!(matches_l12[0]["strength"], "content_hunk", "{rep_l12}");
+    assert_eq!(matches_l12[0]["label"], "exact: content hunk", "{rep_l12}");
+    assert!(matches_l12[0]["matched_hunks"].as_u64().unwrap() >= 1, "{rep_l12}");
+    assert!(
+        !matches_l12.iter().any(|m| m["session_id"] == "sess-beta-hunk"),
+        "line-scoped -L 1,2 must NOT match sess-beta-hunk which only wrote lines 4..=5:\n{rep_l12}"
+    );
+    assert!(
+        !matches_l12.iter().any(|m| m["session_id"] == "sess-timed-only"),
+        "line-scoped -L 1,2 suppresses unrelated timed edits once exact content_hunk matches:\n{rep_l12}"
+    );
+
+    // Whole-file `cv blame src/rebased.rs --json` (no `-L`): `content_hunk` authors (`sess-alpha-hunk`,
+    // `sess-beta-hunk`) rank strictly ahead of heuristic `timed` (`sess-timed-only`).
+    let (json_whole, _) = cv(&w, &repo, &["blame", "src/rebased.rs", "--json"]);
+    let rep_whole: Value = serde_json::from_str(&json_whole).unwrap();
+    let matches_whole = rep_whole["commits"][0]["matches"].as_array().unwrap();
+    assert_eq!(matches_whole[0]["strength"], "content_hunk", "{rep_whole}");
+    assert_eq!(matches_whole[1]["strength"], "content_hunk", "{rep_whole}");
+    let timed_match = matches_whole
+        .iter()
+        .find(|m| m["session_id"] == "sess-timed-only")
+        .expect("whole-file blame includes timed fallback below content_hunk");
+    assert_eq!(timed_match["strength"], "timed");
+    assert_eq!(timed_match["label"], "heuristic: time window");
+
+    // 2) `cv blame src/rebased.rs -L 4,5 --json`: flips to `sess-beta-hunk` first (`content_hunk`),
+    //    and excludes `sess-alpha-hunk`!
+    let (json_l45, _) = cv(&w, &repo, &["blame", "src/rebased.rs", "-L", "4,5", "--json"]);
+    let rep_l45: Value = serde_json::from_str(&json_l45).unwrap();
+    let matches_l45 = rep_l45["commits"][0]["matches"].as_array().unwrap();
+    assert_eq!(matches_l45[0]["session_id"], "sess-beta-hunk", "{rep_l45}");
+    assert_eq!(matches_l45[0]["strength"], "content_hunk");
+    assert!(
+        !matches_l45.iter().any(|m| m["session_id"] == "sess-alpha-hunk"),
+        "line-scoped -L 4,5 must NOT match sess-alpha-hunk:\n{rep_l45}"
+    );
+
+    // 3) HTTP API `GET /api/blame?file=<abs>&lines=4,5`: serves the exact same structured provenance!
+    let abs_rebased = repo.join("src/rebased.rs");
+    let encoded_file = urlencoding::encode(abs_rebased.to_str().unwrap());
+    let query = format!("file={encoded_file}&lines=4,5");
+    let (status, api_val) = cv_core::api::route_json(&["api", "blame"], &query);
+    assert_eq!(status, 200, "body: {api_val}");
+    assert_eq!(
+        api_val["commits"][0]["matches"][0]["session_id"], "sess-beta-hunk",
+        "{api_val}"
+    );
+    assert_eq!(api_val["commits"][0]["matches"][0]["strength"], "content_hunk");
 
     // --- not a git repo: degrades to pure event-catalog mode with the same hints ---
     let (out, err) = cv(&w, &base, &["blame", "src/widget.rs"]);

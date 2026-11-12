@@ -355,7 +355,12 @@ fn visit_tool_ops_internal<'a>(
         "SendMessage" | "send_message" | "followup_task" | "send_input" | "team_send_message"
     ) {
         let recipient = if opts.summaries {
-            first_string_prefix(input, &["to", "target", "Recipient", "recipient", "agent_id"], 120)?.map(Cow::Owned)
+            first_string_prefix(
+                input,
+                &["to", "target", "Recipient", "recipient", "agent_id", "id"],
+                120,
+            )?
+            .map(Cow::Owned)
         } else {
             None
         };
@@ -740,17 +745,109 @@ fn classify_bg_tool(harness: Option<Harness>, bare: &str, input: JsonView<'_>) -
     })
 }
 
+fn lexical_clean(path: &std::path::Path) -> std::path::PathBuf {
+    use std::path::{Component, PathBuf};
+    let mut out = PathBuf::new();
+    let is_abs = path.is_absolute();
+    for comp in path.components() {
+        match comp {
+            Component::Prefix(p) => out.push(p.as_os_str()),
+            Component::RootDir => out.push(comp.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                let can_pop = matches!(out.components().next_back(), Some(Component::Normal(_)));
+                if can_pop {
+                    out.pop();
+                } else if !is_abs {
+                    out.push("..");
+                }
+            }
+            Component::Normal(seg) => out.push(seg),
+        }
+    }
+    if out.as_os_str().is_empty() && !path.as_os_str().is_empty() {
+        out.push(".");
+    }
+    out
+}
+
+/// Canonicalize the deepest existing ancestor of `path` (after joining relative paths onto `cwd`
+/// when provided) and append any remaining non-existent lexical tail components.
+///
+/// Resolves OS directory symlinks (such as macOS `/var` <-> `/private/var` and `/tmp` <->
+/// `/private/tmp`) identically whether the target file already exists on disk or has not been
+/// created yet, and degrades cleanly to lexical normalization on targets without filesystem access
+/// (`wasm32-unknown-unknown`) or relative paths with `cwd == None`.
+pub fn normalize_path(path: &std::path::Path, cwd: Option<&std::path::Path>) -> std::path::PathBuf {
+    if path.as_os_str().is_empty() {
+        return std::path::PathBuf::new();
+    }
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else if let Some(base) = cwd.filter(|c| !c.as_os_str().is_empty()) {
+        base.join(path)
+    } else {
+        return lexical_clean(path);
+    };
+    if !joined.is_absolute() {
+        return lexical_clean(&joined);
+    }
+    if let Ok(canon) = std::fs::canonicalize(&joined) {
+        return canon;
+    }
+    let cleaned = lexical_clean(&joined);
+    let mut cur: &std::path::Path = &cleaned;
+    let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
+    while let Some(name) = cur.file_name() {
+        // On macOS, `/home` is an autofs/APFS symlink to `/System/Volumes/Data/home`. Skip bare
+        // `/home` when its child does not exist on disk so Linux transcript paths (`/home/user/…`)
+        // are not rewritten to `/System/Volumes/Data/home/user/…`.
+        let macos_autofs_home = cfg!(target_os = "macos") && cur == std::path::Path::new("/home") && !tail.is_empty();
+        if !macos_autofs_home {
+            if let Ok(canon) = std::fs::canonicalize(cur) {
+                let mut out = canon;
+                for seg in tail.into_iter().rev() {
+                    out.push(seg);
+                }
+                return out;
+            }
+        }
+        tail.push(name);
+        match cur.parent() {
+            Some(parent) => cur = parent,
+            None => break,
+        }
+    }
+    if let Ok(canon) = std::fs::canonicalize(cur) {
+        let mut out = canon;
+        for seg in tail.into_iter().rev() {
+            out.push(seg);
+        }
+        return out;
+    }
+    cleaned
+}
+
+/// String wrapper around [`normalize_path`]: absolutizes relative `p` against `cwd` (or preserves
+/// trimmed relative `p` when `cwd` is `None`) and ancestor-canonicalizes absolute paths.
+pub fn absolutize_path(p: &str, cwd: Option<&std::path::Path>) -> String {
+    if p.is_empty() {
+        return String::new();
+    }
+    if !std::path::Path::new(p).is_absolute() && cwd.filter(|c| !c.as_os_str().is_empty()).is_none() {
+        return p.trim_start_matches("./").to_string();
+    }
+    normalize_path(std::path::Path::new(p), cwd)
+        .to_string_lossy()
+        .into_owned()
+}
+
 fn resolve_workdir(path: &str, workdir: Option<&str>) -> String {
-    if std::path::Path::new(path).is_absolute() {
+    let cwd = workdir.filter(|d| !d.is_empty()).map(std::path::Path::new);
+    if !std::path::Path::new(path).is_absolute() && cwd.is_none() {
         return path.to_string();
     }
-    match workdir {
-        Some(dir) if !dir.is_empty() => {
-            let trimmed = path.trim_start_matches("./");
-            std::path::Path::new(dir).join(trimmed).to_string_lossy().into_owned()
-        }
-        _ => path.to_string(),
-    }
+    absolutize_path(path, cwd)
 }
 
 fn bool_flag(view: JsonView<'_>, key: &str) -> Result<bool> {
@@ -3241,7 +3338,7 @@ await Promise.all([
             (
                 "view_image".into(),
                 ToolOp::FileRead {
-                    path: "/tmp/diagram.png".into()
+                    path: absolutize_path("/tmp/diagram.png", None).into()
                 }
             )
         );
