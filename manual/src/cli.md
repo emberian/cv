@@ -440,9 +440,11 @@ resume with one message after it), **`context`** (prompt too long; relaunch from
 STATUS hand-off), **`stopped`** (no notice, `SubagentStop` after the last turn), else `failed`.
 STATUS shows `failed:rate-limited`; the header counts causes.
 
-**Stranded**: reported *completed*, but its last two sentences say it is waiting
-(`Waiting on notifications`, …; `cv_core::lanes::text_is_waiting`). Nothing will wake it; it never
-counts as done, and `--stranded` lists it with a resume hint.
+**Stranded**: stopped (not `failed`/`killed`) while still holding a recorded open obligation —
+an unreturned sub-agent, an open tool call, a claimed non-terminal task, an unanswered decision —
+or its process exited mid-turn (`open_obligations` in `--json`). Decided from recorded structure,
+never from what its last text says. Nothing will wake it; it never counts as done, and
+`--stranded` lists it with a resume hint.
 
 **`--tasks`** shows up to five tasks each lane's endpoint holds (id, state, title, last note). The
 endpoint is the first `CV_ENDPOINT=<kind>:<name>` the lane's own shell exported

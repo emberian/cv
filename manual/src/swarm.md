@@ -21,7 +21,7 @@ forest, and the inbox is what the human owes.
 | `cv task decide --for <who> --default … --option …` | a decision for the human, with a default the swarm can proceed on | the orchestrator may *act on the default* and say so; the inbox shows it as owed until resolved |
 | `cv task inbox <who>` / `cv serve --open` (the inbox page) | what the human owes, drained in one sitting | pose decisions with defaults *before* the human arrives; poll `cv task events --by <who>` at every check-in |
 | `cv lanes <session> --running` | the forest as a status table: model, start, tokens, calls, last tool, stranded | a row whose token count is frozen for an hour is DEAD even if it says running: stop it, relaunch from its clone |
-| `cv lanes --stranded` | lanes that stopped saying they are waiting for a notification nothing will send | brief lanes to FOREGROUND-wait; resume a stranded lane with one message naming what finished |
+| `cv lanes --stranded` | lanes that stopped while still holding an open obligation (an unreturned sub-agent, an open tool call, a claimed task, an unanswered decision) or whose process died mid-turn | brief lanes to FOREGROUND-wait; resume a stranded lane with one message naming what finished |
 | `cv task show ID --notes-grep PAT` / `--notes-last N` | query a long task without loading it | a 100-note integrator task dumped whole killed a 13-hour lane; **query, never dump** |
 | `cv show <session> --kind prompt,answer` | only what the human said | re-read the brief before any status to the human |
 | `cv show <session> --pre-compaction` | the span a compaction summary lost | after any compaction, read the full turns, not the summary: tactics live in the turns |

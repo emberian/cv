@@ -384,7 +384,8 @@ enum Cmd {
     },
     /// The sub-agent forest as a status table: one row per lane with its model, start, duration,
     /// tokens, tool calls, status and last line — and the strand class (`--stranded`): lanes that
-    /// stopped saying they are waiting for something that will never wake them. `--recent N`
+    /// stopped while still holding an open obligation (an unreturned sub-agent, an open tool call,
+    /// a claimed task, an unanswered decision) or whose process died mid-turn. `--recent N`
     /// reads the forests of a project's N most recent sessions instead of one session's;
     /// with `--unfinished` that is the rescue list for `cv adopt`.
     Lanes {
@@ -407,9 +408,10 @@ enum Cmd {
         /// Only lanes that completed (harness `completed`, or a journaled `done`).
         #[arg(long, group = "lane_filter")]
         done: bool,
-        /// Only stranded lanes: stopped, with a final text that says it is waiting (`Waiting on
-        /// notifications`, `I'll continue when the monitor fires`, …). Each row carries the
-        /// resume hint.
+        /// Only stranded lanes: stopped (not failed or killed) with a recorded open obligation
+        /// (unreturned sub-agent, open tool call, claimed task, unanswered decision) or a process
+        /// that exited mid-turn. Decided from recorded structure, never from what the lane's last
+        /// text says. Each row carries the resume hint.
         #[arg(long, group = "lane_filter")]
         stranded: bool,
         /// Only lanes not finished for real: running, stopped, killed, failed or stranded.
