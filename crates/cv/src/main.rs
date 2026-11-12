@@ -246,23 +246,19 @@ enum Cmd {
         /// Hits to show. Every match is still counted: the footer says `N of M matches`.
         #[arg(long, default_value_t = 20)]
         limit: usize,
-        /// Use semantic (embedding) search instead of full-text. Requires `cv index --semantic`
-        /// to have been run; downloads a small embedding model on first use.
-        #[arg(long)]
-        semantic: bool,
         /// Stream every top-level transcript live (case-insensitive substring match across each
         /// session's whole searchable exchange) instead of reading the full-text index: slow, skips
         /// folded-in sub-agent lanes, and is never taken unasked. Without `--scan`, `cv search`
         /// reads the Tantivy index plus the live suffix of sessions changed since `cv index` (even
         /// when no index exists yet, unless `--live-bytes 0` or `--frozen`), and errors if an
         /// existing index is unusable.
-        #[arg(long, conflicts_with = "semantic")]
+        #[arg(long)]
         scan: bool,
         /// Which text to match: `exchange` (default: what the person asked, what the model
         /// replied and ran, what came back), `context` (what surrounds it: injected instruction
         /// files, system prompts, skill bodies, hook output, notices, compaction summaries), or
         /// `all`. Context repeats across sessions, so it is matched only when asked for.
-        #[arg(long, value_name = "exchange|context|all", conflicts_with_all = ["semantic", "scan"])]
+        #[arg(long, value_name = "exchange|context|all", conflicts_with = "scan")]
         kind: Option<String>,
         /// The index answers plus a live read of the sessions it has not seen as they are now
         /// (grown, rewritten, new since `cv index`), from where the index stopped: all of them by
@@ -270,10 +266,10 @@ enum Cmd {
         /// names what the budget left out. 0 (or global --frozen) answers from the index alone.
         /// Without it, `$CV_LIVE_BYTES` (bytes, or `all`) and then the config's
         /// `[search] live_bytes` set the budget.
-        #[arg(long, value_name = "BYTES", conflicts_with_all = ["semantic", "scan"])]
+        #[arg(long, value_name = "BYTES", conflicts_with = "scan")]
         live_bytes: Option<u64>,
         /// Emit `{"hits": [...], "total": M}` instead of the table — the same hits in the same
-        /// order (--harness/--cwd/-q/--limit/--semantic respected), each a session row (`id, harness,
+        /// order (--harness/--cwd/-q/--limit respected), each a session row (`id, harness,
         /// path, cwd, title, created_at, updated_at, message_count, size_bytes`) plus `score`, `snippet`,
         /// and the sub-agent provenance `agent_id`/`parent_id`/`workflow`; `total` counts every
         /// session that matched. Nothing else goes to stdout.
@@ -1003,10 +999,6 @@ enum Cmd {
     /// Tool-call events (file edits/reads, commands, errors) ride along on the same pass into the
     /// catalog, powering `cv events` and `cv touched`.
     Index {
-        /// Also build semantic embeddings (`cv search --semantic`). Downloads a small embedding
-        /// model (~30MB) on first use.
-        #[arg(long)]
-        semantic: bool,
         /// Clear and rebuild the index from scratch instead of incrementally updating it.
         #[arg(long)]
         rebuild: bool,
@@ -1214,7 +1206,6 @@ fn run() -> Result<()> {
             cwd,
             filter_query,
             limit,
-            semantic,
             scan,
             kind,
             live_bytes,
@@ -1225,7 +1216,6 @@ fn run() -> Result<()> {
             cwd,
             filter_query,
             limit,
-            semantic,
             scan,
             kind,
             live_bytes,
@@ -1314,13 +1304,12 @@ fn run() -> Result<()> {
             json,
         ),
         Cmd::Index {
-            semantic,
             rebuild,
             subagents,
             if_changed,
             strict,
             json,
-        } => search::cmd_index(semantic, rebuild, subagents, if_changed, strict, json),
+        } => search::cmd_index(rebuild, subagents, if_changed, strict, json),
         Cmd::Events {
             id,
             harness,

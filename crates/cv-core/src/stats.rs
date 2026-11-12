@@ -96,10 +96,11 @@ impl CorpusStats {
 /// Token usage rolled up per `(harness, model)`: what `cv stats --tokens` prints.
 ///
 /// Unlike [`CorpusStats`] this parses every transcript (usage lives on assistant messages, not in
-/// the catalog), and it widens each Claude session to its sub-agent forest — direct and `Workflow`
-/// sub-agents are separate transcripts the catalog does not list, and on an orchestrating session
-/// they hold most of the spend. Counts follow [`Usage`]'s disjoint convention, so rows from
-/// different harnesses add up.
+/// the catalog), and it widens each session across **all** sub-agent-capable harnesses (`Claude`,
+/// `Codex`, `Antigravity`, `Hermes`, `Kimi`, `KimiCode`, `Devin`) to its full recursive sub-agent
+/// forest via [`crate::subagent_tree_filtered_of`], deduplicating against catalog rows so neither
+/// off-catalog sidecars nor on-catalog child sessions are missed or double-counted. Counts follow
+/// [`Usage`]'s disjoint convention, so rows from different harnesses add up.
 #[derive(Debug, Clone, Default)]
 pub struct TokenStats {
     /// Sorted by [`TokenRow::total`] descending, ties by harness then model.
@@ -141,6 +142,15 @@ impl TokenRow {
     /// The part that was not a cache read: input + cache writes + output.
     pub fn uncached(&self) -> u64 {
         self.input + self.cache_write + self.output
+    }
+
+    /// Provider-reported `cost_usd` when present, falling back to [`lookup_model_pricing`] over
+    /// `(input, cache_read, cache_write, output)` when the transcript omitted cost.
+    pub fn estimated_cost_usd(&self) -> Option<f64> {
+        self.cost_usd.or_else(|| {
+            lookup_model_pricing(&self.model)
+                .map(|p| p.estimate_usd(self.input, self.cache_read, self.cache_write, self.output))
+        })
     }
 
     fn add(&mut self, u: &Usage) {
@@ -358,6 +368,146 @@ impl Record for UsageHit {
         })
     }
 }
+/// Per-million-token USD rates for optional fallback cost estimation when transcripts omit `cost_usd`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ModelPricing {
+    pub input_per_mtok: f64,
+    pub cache_read_per_mtok: f64,
+    pub cache_write_per_mtok: f64,
+    pub output_per_mtok: f64,
+}
+
+impl ModelPricing {
+    pub const fn new(input: f64, cache_read: f64, cache_write: f64, output: f64) -> Self {
+        Self {
+            input_per_mtok: input,
+            cache_read_per_mtok: cache_read,
+            cache_write_per_mtok: cache_write,
+            output_per_mtok: output,
+        }
+    }
+
+    pub fn estimate_usd(&self, input: u64, cache_read: u64, cache_write: u64, output: u64) -> f64 {
+        (input as f64 * self.input_per_mtok
+            + cache_read as f64 * self.cache_read_per_mtok
+            + cache_write as f64 * self.cache_write_per_mtok
+            + output as f64 * self.output_per_mtok)
+            / 1_000_000.0
+    }
+}
+
+/// Optional fallback pricing table for canonical vendor model identifiers (`provider/model`
+/// prefixes stripped, case-insensitive). Returns `None` for unrecognized/custom model names.
+pub fn lookup_model_pricing(model: &str) -> Option<ModelPricing> {
+    let bare = model.trim();
+    let bare = bare.rsplit('/').next().unwrap_or(bare).to_ascii_lowercase();
+    let m = bare.as_str();
+
+    // Anthropic Claude families
+    if m.starts_with("claude-opus-4-5") || m.starts_with("claude-opus-4-6") || m.starts_with("claude-4-5-opus") {
+        return Some(ModelPricing::new(5.0, 0.50, 6.25, 25.0));
+    }
+    if m.starts_with("claude-opus-4") || m.starts_with("claude-3-opus") {
+        return Some(ModelPricing::new(15.0, 1.50, 18.75, 75.0));
+    }
+    if m.starts_with("claude-sonnet-4")
+        || m.starts_with("claude-3-7-sonnet")
+        || m.starts_with("claude-3-5-sonnet")
+        || m.starts_with("claude-4-sonnet")
+    {
+        return Some(ModelPricing::new(3.0, 0.30, 3.75, 15.0));
+    }
+    if m.starts_with("claude-haiku-4") || m.starts_with("claude-4-5-haiku") {
+        return Some(ModelPricing::new(1.0, 0.10, 1.25, 5.0));
+    }
+    if m.starts_with("claude-3-5-haiku") {
+        return Some(ModelPricing::new(0.80, 0.08, 1.0, 4.0));
+    }
+    if m.starts_with("claude-3-haiku") {
+        return Some(ModelPricing::new(0.25, 0.03, 0.30, 1.25));
+    }
+
+    // OpenAI GPT / o-series / Codex families
+    if m.starts_with("gpt-5-nano") {
+        return Some(ModelPricing::new(0.05, 0.005, 0.05, 0.40));
+    }
+    if m.starts_with("gpt-5-mini") {
+        return Some(ModelPricing::new(0.25, 0.025, 0.25, 2.0));
+    }
+    if m.starts_with("gpt-5") {
+        return Some(ModelPricing::new(1.25, 0.125, 1.25, 10.0));
+    }
+    if m.starts_with("gpt-4.1-nano") {
+        return Some(ModelPricing::new(0.10, 0.025, 0.10, 0.40));
+    }
+    if m.starts_with("gpt-4.1-mini") || m.starts_with("gpt-4o-mini") {
+        return Some(ModelPricing::new(0.40, 0.10, 0.40, 1.60));
+    }
+    if m.starts_with("gpt-4.1") {
+        return Some(ModelPricing::new(2.0, 0.50, 2.0, 8.0));
+    }
+    if m.starts_with("gpt-4o") {
+        return Some(ModelPricing::new(2.50, 1.25, 2.50, 10.0));
+    }
+    if m.starts_with("codex-mini") {
+        return Some(ModelPricing::new(1.50, 0.375, 1.50, 6.0));
+    }
+    if m.starts_with("o4-mini") || m.starts_with("o3-mini") || m.starts_with("o1-mini") {
+        return Some(ModelPricing::new(1.10, 0.275, 1.10, 4.40));
+    }
+    if m.starts_with("o3") {
+        return Some(ModelPricing::new(2.0, 0.50, 2.0, 8.0));
+    }
+    if m.starts_with("o1") {
+        return Some(ModelPricing::new(15.0, 7.50, 15.0, 60.0));
+    }
+
+    // Google Gemini families
+    if m.starts_with("gemini-2.5-pro") || m.starts_with("gemini-3-pro") || m.starts_with("gemini-1.5-pro") {
+        return Some(ModelPricing::new(1.25, 0.3125, 1.25, 10.0));
+    }
+    if m.starts_with("gemini-2.5-flash") || m.starts_with("gemini-3-flash") {
+        return Some(ModelPricing::new(0.30, 0.075, 0.30, 2.50));
+    }
+    if m.starts_with("gemini-2.0-flash") || m.starts_with("gemini-1.5-flash") {
+        return Some(ModelPricing::new(0.10, 0.025, 0.10, 0.40));
+    }
+
+    // DeepSeek, xAI Grok, Alibaba Qwen
+    if m.starts_with("deepseek-reasoner") || m.starts_with("deepseek-r1") {
+        return Some(ModelPricing::new(0.55, 0.14, 0.55, 2.19));
+    }
+    if m.starts_with("deepseek-chat") || m.starts_with("deepseek-v3") {
+        return Some(ModelPricing::new(0.27, 0.07, 0.27, 1.10));
+    }
+    if m.starts_with("grok-3-mini") {
+        return Some(ModelPricing::new(0.30, 0.075, 0.30, 0.50));
+    }
+    if m.starts_with("grok-3") || m.starts_with("grok-4") {
+        return Some(ModelPricing::new(3.0, 0.75, 3.0, 15.0));
+    }
+    if m.starts_with("qwen3-coder") || m.starts_with("qwen-max") {
+        return Some(ModelPricing::new(1.20, 0.30, 1.20, 6.0));
+    }
+
+    None
+}
+
+/// Estimate USD cost for a single [`Usage`] record using provider-reported `cost_usd` first and
+/// [`lookup_model_pricing`] when `cost_usd` is absent.
+pub fn estimate_usage_cost_usd(model: &str, u: &Usage) -> Option<f64> {
+    u.cost_usd.or_else(|| {
+        lookup_model_pricing(model).map(|p| {
+            p.estimate_usd(
+                u.input_tokens.unwrap_or(0),
+                u.cache_read_tokens.unwrap_or(0),
+                u.cache_creation_tokens.unwrap_or(0),
+                u.output_tokens.unwrap_or(0),
+            )
+        })
+    })
+}
+
 /// Token aggregation needs the full forest and its metadata order, without task descriptions or
 /// journaled return bodies ([`crate::SubagentDemand::Sessions`]).
 fn subagent_usage_refs(r: &SessionRef) -> Result<Vec<SessionRef>> {
@@ -367,6 +517,32 @@ fn subagent_usage_refs(r: &SessionRef) -> Result<Vec<SessionRef>> {
             .map(|s| s.session)
             .collect(),
     )
+}
+
+/// Recursively widen `refs` across all sub-agent-capable harnesses (`Claude`, `Codex`,
+/// `Antigravity`, `Hermes`, `Kimi`, `KimiCode`, `Devin`), deduplicating against `refs` and seen
+/// children so neither nested sub-agents nor catalog-listed child sessions are missed or
+/// double-counted.
+fn collect_subagent_forest(refs: &[SessionRef]) -> Result<Vec<SessionRef>> {
+    let mut seen: std::collections::HashSet<(Harness, String, std::path::PathBuf)> =
+        refs.iter().map(|r| (r.harness, r.id.clone(), r.path.clone())).collect();
+    let mut subs = Vec::new();
+    let mut frontier: Vec<SessionRef> = refs.to_vec();
+    while !frontier.is_empty() {
+        let level: Vec<Vec<SessionRef>> = crate::par_flat_map(frontier, |r| vec![subagent_usage_refs(&r)])
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+        let mut next_frontier = Vec::new();
+        for child in level.into_iter().flatten() {
+            let key = (child.harness, child.id.clone(), child.path.clone());
+            if seen.insert(key) {
+                next_frontier.push(child.clone());
+                subs.push(child);
+            }
+        }
+        frontier = next_frontier;
+    }
+    Ok(subs)
 }
 
 fn parse_workers() -> usize {
@@ -435,6 +611,23 @@ impl TokenStats {
         }
         result
     }
+
+    /// Compute [`TokenStats`] and fill omitted `cost_usd` values from [`lookup_model_pricing`].
+    pub fn compute_with_pricing_fallback(refs: &[SessionRef]) -> Result<TokenStats> {
+        Ok(Self::compute(refs)?.with_pricing_fallback())
+    }
+
+    /// Populate `cost_usd` on any [`TokenRow`] that omitted provider-reported cost using
+    /// [`lookup_model_pricing`]. Rows that already carry provider-reported `cost_usd` are kept intact.
+    pub fn with_pricing_fallback(mut self) -> Self {
+        for row in &mut self.rows {
+            if row.cost_usd.is_none() {
+                row.cost_usd = row.estimated_cost_usd();
+            }
+        }
+        self
+    }
+
     fn compute_pass(refs: &[SessionRef], #[cfg(feature = "sqlite")] reuse: bool) -> Result<TokenStats> {
         #[cfg(feature = "sqlite")]
         let cache = usage_cache::Cache::new();
@@ -442,12 +635,7 @@ impl TokenStats {
             sessions: refs.len(),
             ..TokenStats::default()
         };
-        let subs: Vec<SessionRef> = crate::par_flat_map(refs.to_vec(), |r| vec![subagent_usage_refs(&r)])
-            .into_iter()
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .flatten()
-            .collect();
+        let subs = collect_subagent_forest(refs)?;
         stats.subagents = subs.len();
         let mut fold = TokenFold::default();
         // Bound completed spool retention to one spill::ordered::MEMORY_BYTES per configured worker.
@@ -1011,5 +1199,130 @@ mod tests {
         assert!(v["by_harness"].as_object().unwrap().is_empty());
         assert!(v["top_cwds"].as_array().unwrap().is_empty());
         assert!(v["earliest_created"].is_null() && v["latest_updated"].is_null());
+    }
+
+    #[test]
+    fn token_stats_widens_nested_non_claude_subagent_forests_without_double_counting() {
+        let world = crate::test_world("token-stats-antigravity-forest");
+        let app_dir = world.base.join("ag");
+        let parent_id = "11111111-1111-4111-8111-111111111111";
+        let child_id = "22222222-2222-4222-8222-222222222222";
+        let grand_id = "33333333-3333-4333-8333-333333333333";
+
+        let write_ag = |cid: &str, model: &str, inp: u64, out: u64, child: Option<&str>| -> std::path::PathBuf {
+            let brain = app_dir.join("brain").join(cid);
+            let logs = brain.join(".system_generated").join("logs");
+            std::fs::create_dir_all(&logs).unwrap();
+            if let Some(sub_cid) = child {
+                let subs = brain.join(".system_generated").join("subagents");
+                std::fs::create_dir_all(&subs).unwrap();
+                std::fs::write(
+                    subs.join(format!("{sub_cid}.json")),
+                    json!({
+                        "conversationId": sub_cid,
+                        "spawnStepIndex": 1,
+                        "state": "DONE",
+                        "subagentDescriptor": {"typeName": "worker", "role": "Worker"}
+                    })
+                    .to_string(),
+                )
+                .unwrap();
+            }
+            let log_path = logs.join("transcript.jsonl");
+            let lines = [
+                json!({"step_index": 0, "type": "USER_INPUT", "source": "USER_EXPLICIT", "created_at": "2026-11-01T00:00:00Z", "content": "run"}),
+                json!({"step_index": 1, "type": "PLANNER_RESPONSE", "source": "MODEL", "model": model, "created_at": "2026-11-01T00:00:02Z", "content": "ok", "input_tokens": inp, "output_tokens": out}),
+            ];
+            std::fs::write(&log_path, format!("{}\n{}\n", lines[0], lines[1])).unwrap();
+            log_path
+        };
+
+        let p_log = write_ag(parent_id, "gemini-2.5-pro", 100, 50, Some(child_id));
+        let c_log = write_ag(child_id, "gemini-2.5-flash", 200, 40, Some(grand_id));
+        let g_log = write_ag(grand_id, "gemini-2.5-flash", 300, 60, None);
+
+        let p_ref = SessionRef::new(parent_id, Harness::Antigravity, &p_log);
+        let c_ref = SessionRef::new(child_id, Harness::Antigravity, &c_log);
+        let g_ref = SessionRef::new(grand_id, Harness::Antigravity, &g_log);
+
+        // Passing only the parent widens recursively across both nested subagent tiers!
+        let from_parent = TokenStats::compute(std::slice::from_ref(&p_ref)).unwrap();
+        assert_eq!(
+            (from_parent.sessions, from_parent.subagents, from_parent.failed),
+            (1, 2, 0)
+        );
+        assert_eq!(from_parent.total().total(), (100 + 50) + (200 + 40) + (300 + 60));
+
+        // Passing the full discovered catalog (which in Antigravity already includes child & grandchild)
+        // deduplicates forest nodes so subagent spend is counted ONCE, never double-counted!
+        let from_catalog = TokenStats::compute(&[p_ref.clone(), c_ref, g_ref]).unwrap();
+        assert_eq!(
+            (from_catalog.sessions, from_catalog.subagents, from_catalog.failed),
+            (3, 0, 0)
+        );
+        assert_eq!(from_catalog.total().total(), from_parent.total().total());
+
+        // Optional pricing fallback populates omitted cost_usd while preserving default None.
+        let claude_path = app_dir.join("claude-priced.jsonl");
+        std::fs::write(
+            &claude_path,
+            format!(
+                "{}\n",
+                json!({
+                    "type": "assistant",
+                    "message": {
+                        "id": "msg_priced_1",
+                        "role": "assistant",
+                        "model": "claude-sonnet-4-6",
+                        "content": [{"type": "text", "text": "done"}],
+                        "usage": {"input_tokens": 1000, "output_tokens": 500}
+                    }
+                })
+            ),
+        )
+        .unwrap();
+        let claude_ref = SessionRef::new("claude-priced", Harness::Claude, &claude_path);
+        let unpriced = TokenStats::compute(std::slice::from_ref(&claude_ref)).unwrap();
+        assert!(unpriced.total().cost_usd.is_none());
+        let priced = TokenStats::compute_with_pricing_fallback(std::slice::from_ref(&claude_ref)).unwrap();
+        assert!(priced.total().cost_usd.unwrap() > 0.0);
+    }
+
+    #[test]
+    fn model_pricing_fallback_preserves_provider_cost_and_estimates_missing_rows() {
+        let mut t = TokenStats::default();
+        t.fold(
+            [
+                hit(
+                    None,
+                    Harness::Claude,
+                    "anthropic/claude-sonnet-4-5-20250929",
+                    usage(1_000_000, 1_000_000, 0, 100_000),
+                ),
+                hit(
+                    None,
+                    Harness::OpenCode,
+                    "gpt-4o",
+                    Usage {
+                        input_tokens: Some(1_000_000),
+                        cost_usd: Some(9.5),
+                        ..Usage::default()
+                    },
+                ),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+
+        // Provider-reported cost stays untouched; omitted cost is filled on `with_pricing_fallback()`.
+        let sonnet = t.rows.iter().find(|r| r.harness == "claude").unwrap();
+        assert!(sonnet.cost_usd.is_none());
+        // 1M * $3.00 + 1M * $0.30 + 0.1M * $15.00 = $4.80
+        assert!((sonnet.estimated_cost_usd().unwrap() - 4.80).abs() < 1e-9);
+
+        let with_fb = t.with_pricing_fallback();
+        let gpt = with_fb.rows.iter().find(|r| r.harness == "opencode").unwrap();
+        assert_eq!(gpt.cost_usd, Some(9.5), "explicit provider cost is never overwritten");
+        assert!((with_fb.total().cost_usd.unwrap() - (9.5 + 4.80)).abs() < 1e-9);
     }
 }

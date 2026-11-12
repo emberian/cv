@@ -137,11 +137,12 @@ pub(crate) fn cmd_pack(args: PackArgs<'_>) -> Result<()> {
 /// cosine, so the full-text list counts double; semantic stays the recall-broadening channel
 /// (a session ranked in BOTH lists still gets both contributions).
 const FTS_WEIGHT: f32 = 2.0;
+#[cfg(test)]
 const SEM_WEIGHT: f32 = 1.0;
 
 fn recall(task: &str, limit: usize) -> Result<Vec<cv_search::Hit>> {
     let fetch = limit.saturating_mul(4).max(20);
-    let searcher = cv_search::Searcher::default();
+    let searcher = cv_search::Searcher;
     let mut ranked: Vec<(f32, Vec<cv_search::Hit>)> = Vec::new();
 
     match fts_recall_in(&searcher, &cv_search::default_tantivy_dir(), task, fetch) {
@@ -161,22 +162,6 @@ fn recall(task: &str, limit: usize) -> Result<Vec<cv_search::Hit>> {
             }
         }
         Err(e) => eprintln!("(full-text recall unavailable: {e:#})"),
-    }
-
-    if cv_search::default_embeddings_path().exists() {
-        match searcher.search(
-            task,
-            cv_search::SearchFilter::default(),
-            fetch,
-            cv_search::Source::Semantic,
-            None,
-        ) {
-            Ok(found) if !found.hits.is_empty() => ranked.push((SEM_WEIGHT, found.hits)),
-            Ok(_) => {}
-            Err(e) => eprintln!("(semantic recall unavailable: {e:#}; full-text only)"),
-        }
-    } else {
-        eprintln!("(no embeddings store — full-text recall only; `cv index --semantic` adds semantic recall)");
     }
 
     Ok(fuse(ranked, limit))

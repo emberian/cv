@@ -1,50 +1,46 @@
 //! # cv-search
 //!
-//! Pure-Rust search over clustervision sessions, in two flavours:
+//! Pure-Rust search and derived columnar storage over clustervision sessions:
 //!
 //! 1. **Full-text** via [`tantivy`] (a Lucene-like inverted index) — `index_all` builds a
-//!    persistent index, [`Searcher`] queries it and returns highlighted snippets. This is a
-//!    strict upgrade over a SQLite FTS5 index: real tokenization, BM25 scoring, fielded queries
-//!    (`harness:claude foo`), phrase/boolean operators, and fast incremental commits.
+//!    persistent index, [`Searcher`] queries it and returns highlighted snippets. Real
+//!    tokenization, BM25 scoring, fielded queries (`harness:claude foo`), phrase/boolean
+//!    operators, and fast incremental commits.
 //!
-//! 2. **Semantic** via [`model2vec-rs`] (distilled *static* embeddings — tiny, fast, no ONNX
-//!    runtime). `embed_sessions` embeds sessions and persists the vectors; [`Searcher`]
-//!    embeds the query and does a brute-force cosine ranking. For ~1k sessions an in-memory
-//!    `Vec<(id, Vec<f32>)>` scan is plenty — no ANN crate needed. Gated behind the `semantic`
-//!    cargo feature (default-on, since model2vec is lightweight); a minimal FTS-only build is
-//!    `cargo build -p cv-search --no-default-features`.
+//! 2. **Exact trigram substring/symbol search** (`trigram`) — non-positional `roaring` candidate
+//!    postings paired with streaming exact substring verification over decoded source revisions.
 //!
-//! Both rebuildable indexes live under [`cache_dir`] (`$CLUSTERVISION_CACHE`, else
-//! `$CLUSTERVISION_HOME` when set, else `<cache_dir>/clustervision` alongside `catalog.db`): the
-//! tantivy index in `…/tantivy/` and the embedding store in `…/embeddings.bin`, separate from
-//! durable `~/.clustervision` ledgers (`tasks/`, `lanes.jsonl`, `retired.jsonl`, `receipts/`).
+//! 3. **Derived columnar event segments** (`columnar_events`) — immutable `tantivy-columnar` +
+//!    `tantivy-fst` + `roaring` segments with session revision/rewind visibility masks and 64-bit
+//!    edit hunk fingerprints.
+//!
+//! Rebuildable indexes live under [`cache_dir`] (`$CLUSTERVISION_CACHE`, else
+//! `$CLUSTERVISION_HOME` when set, else `<cache_dir>/clustervision` alongside `catalog.db`),
+//! separate from durable `~/.clustervision` ledgers (`tasks/`, `lanes.jsonl`, `retired.jsonl`,
+//! `receipts/`).
 
 use anyhow::Result;
 use std::path::PathBuf;
 
+pub mod columnar_events;
 pub mod fts;
 mod ingest;
-#[cfg(feature = "semantic")]
-pub mod semantic;
-#[cfg(feature = "semantic")]
-mod semantic_corpus;
 mod session_collector;
+pub mod trigram;
 
-/// A single search result, shared by full-text and semantic search.
+/// A single search result.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Hit {
     pub id: String,
     pub harness: String,
     pub cwd: Option<String>,
     pub title: Option<String>,
-    /// Relevance score (BM25 for FTS, cosine similarity for semantic).
+    /// Relevance score (BM25 for FTS, 0.0 for unranked live/exact matches).
     pub score: f32,
     /// A stored preview, or a live excerpt when a displayed full-text hit has been enriched.
     pub snippet: String,
-    /// Unix timestamps carried straight off the FTS index / embedding store, so callers can date
-    /// rows without re-discovering the corpus. `None` when the session itself had no parseable
-    /// dates, or for semantic hits from an embedding store written before dates were recorded
-    /// (re-run `embed_all` to backfill).
+    /// Unix timestamps carried straight off the FTS index, so callers can date rows without
+    /// re-discovering the corpus. `None` when the session itself had no parseable dates.
     #[serde(default)]
     pub created_at: Option<i64>,
     #[serde(default)]
@@ -108,12 +104,11 @@ pub fn row(hit: &Hit, context: &cv_core::rows::SearchRowContext) -> serde_json::
     .to_json_with(context)
 }
 
-/// Which path answers a search: the index (authoritative; an empty result is "no match"), the
-/// semantic vectors, or a live scan of every transcript.
+/// Which path answers a search: the index (authoritative; an empty result is "no match") or a live
+/// scan of every transcript.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Source {
     Index,
-    Semantic,
     Live,
 }
 
@@ -121,7 +116,6 @@ impl Source {
     pub fn as_str(self) -> &'static str {
         match self {
             Source::Index => "index",
-            Source::Semantic => "semantic",
             Source::Live => "live",
         }
     }
@@ -155,23 +149,12 @@ pub struct Found {
 }
 
 /// The one search operation every door renders: `cv search` and `GET /api/search` call this with
-/// the same filter and get the same hits, source and notes; a long-lived service keeps one so the
-/// semantic model and store stay resident.
+/// the same filter and get the same hits, source and notes.
 #[derive(Default)]
-pub struct Searcher {
-    #[cfg(feature = "semantic")]
-    semantic: SemanticSearch,
-}
-
-#[cfg(feature = "semantic")]
-impl From<SemanticSearch> for Searcher {
-    fn from(semantic: SemanticSearch) -> Self {
-        Self { semantic }
-    }
-}
+pub struct Searcher;
 
 impl Searcher {
-    /// Errors are the path's own (an unusable index, an invalid query, a missing model); the
+    /// Errors are the path's own (an unusable index, an invalid query); the
     /// caller adds the door's pointer. Filters apply before ranking. A full-text search answers
     /// from the index plus a live read of what it has not seen: all of it by default, at most
     /// `live_bytes` of source when given (else `$CV_LIVE_BYTES`, else the config's
@@ -210,8 +193,8 @@ impl Searcher {
         )
     }
 
-    /// Search with an explicit full-text index location; live and semantic sources use their
-    /// configured stores. This avoids changing the process environment to select an index.
+    /// Search with an explicit full-text index location; live sources use their configured stores.
+    /// This avoids changing the process environment to select an index.
     pub fn search_in(
         &self,
         dir: &std::path::Path,
@@ -301,16 +284,71 @@ impl Searcher {
                     found.notes.push(Note::NoSubagents);
                 }
             }
-            #[cfg(feature = "semantic")]
-            Source::Semantic => {
-                (found.hits, found.total) = self
-                    .semantic
-                    .search_counted_allowed(query, limit, filter, allowed_ids)?
-            }
-            #[cfg(not(feature = "semantic"))]
-            Source::Semantic => anyhow::bail!("semantic search is not built into this cv"),
         }
         Ok(found)
+    }
+
+    /// Exact code/symbol/substring search backed by the trigram candidate index plus live tail
+    /// verification against matching decoded source revisions.
+    pub fn search_exact(
+        &self,
+        query: &str,
+        filter: SearchFilter<'_>,
+        case_sensitive: bool,
+        limit: usize,
+        live_bytes: Option<u64>,
+    ) -> Result<Found> {
+        self.search_exact_in_allowed(
+            &default_trigram_dir(),
+            query,
+            filter,
+            case_sensitive,
+            None,
+            limit,
+            live_bytes,
+        )
+    }
+
+    /// [`search_exact`](Self::search_exact) with explicit trigram index location and session allowlist.
+    #[allow(clippy::too_many_arguments)]
+    pub fn search_exact_in_allowed(
+        &self,
+        dir: &std::path::Path,
+        query: &str,
+        filter: SearchFilter<'_>,
+        case_sensitive: bool,
+        allowed_ids: Option<&std::collections::HashSet<String>>,
+        limit: usize,
+        live_bytes: Option<u64>,
+    ) -> Result<Found> {
+        let harness = filter.harness.and_then(cv_core::Harness::parse);
+        if filter.harness.is_some() && harness.is_none() {
+            return Ok(Found {
+                hits: Vec::new(),
+                source: Source::Index,
+                notes: Vec::new(),
+                total: 0,
+            });
+        }
+        let _sources = cv_core::source::read_scope();
+        let refs = cv_core::sessions_for(harness);
+        let live = LiveRead::of(live_bytes)?;
+        trigram::search(
+            dir,
+            query,
+            trigram::TrigramOptions {
+                filter: SearchFilter {
+                    harness: harness.map(cv_core::Harness::as_str),
+                    ..filter
+                },
+                case_sensitive,
+                live,
+                limit,
+            },
+            &refs,
+            allowed_ids,
+        )
+        .map(trigram::TrigramFound::into_found)
     }
 }
 
@@ -332,9 +370,14 @@ pub fn default_tantivy_dir() -> PathBuf {
     cache_dir().join("tantivy")
 }
 
-/// Default location of the semantic embedding store (binary; see `semantic` module docs).
-pub fn default_embeddings_path() -> PathBuf {
-    cache_dir().join("embeddings.bin")
+/// Default location of the derived trigram substring index.
+pub fn default_trigram_dir() -> PathBuf {
+    cache_dir().join("trigram")
+}
+
+/// Default location of the derived columnar event store.
+pub fn default_columnar_events_dir() -> PathBuf {
+    cache_dir().join("events_columnar")
 }
 
 // ---- Convenience wrappers over the default-located indexes ---------------------------------
@@ -375,13 +418,36 @@ pub fn is_invalid_text_query(error: &anyhow::Error) -> bool {
     error.is::<tantivy::query::QueryParserError>()
 }
 
+/// Match a single full-text needle against the index (`Scope::Exchange`).
+pub fn text_search_ids(dir: impl Into<Option<PathBuf>>, query: &str) -> Result<std::collections::HashSet<String>> {
+    text_search_ids_scoped(dir, query, Scope::Exchange)
+}
+
+/// Match a single full-text needle in `scope` against the index.
+pub fn text_search_ids_scoped(
+    dir: impl Into<Option<PathBuf>>,
+    query: &str,
+    scope: Scope,
+) -> Result<std::collections::HashSet<String>> {
+    fts::text_search_ids_scoped(&dir.into().unwrap_or_else(default_tantivy_dir), query, scope)
+}
+
 /// Match several full-text needles using one index-reader snapshot. The outer result reports
 /// index setup errors; each returned result independently reports that needle's query error.
 pub fn text_search_ids_batch(
     dir: impl Into<Option<PathBuf>>,
     queries: &[&str],
 ) -> Result<Vec<Result<std::collections::HashSet<String>>>> {
-    fts::text_search_ids_batch(&dir.into().unwrap_or_else(default_tantivy_dir), queries)
+    text_search_ids_batch_scoped(dir, queries, Scope::Exchange)
+}
+
+/// [`text_search_ids_batch`] evaluated in an explicit [`Scope`].
+pub fn text_search_ids_batch_scoped(
+    dir: impl Into<Option<PathBuf>>,
+    queries: &[&str],
+    scope: Scope,
+) -> Result<Vec<Result<std::collections::HashSet<String>>>> {
+    fts::text_search_ids_batch_scoped(&dir.into().unwrap_or_else(default_tantivy_dir), queries, scope)
 }
 
 /// [`text_search_ids_batch`] plus the live suffix the index has not seen (see
@@ -392,8 +458,25 @@ pub fn text_search_ids_suffixed(
     live: LiveRead,
     refs: &[cv_core::SessionRef],
 ) -> Result<(Vec<Result<std::collections::HashSet<String>>>, fts::Suffix)> {
+    text_search_ids_suffixed_scoped(dir, queries, Scope::Exchange, live, refs)
+}
+
+/// [`text_search_ids_suffixed`] evaluated in an explicit [`Scope`].
+pub fn text_search_ids_suffixed_scoped(
+    dir: impl Into<Option<PathBuf>>,
+    queries: &[&str],
+    scope: Scope,
+    live: LiveRead,
+    refs: &[cv_core::SessionRef],
+) -> Result<(Vec<Result<std::collections::HashSet<String>>>, fts::Suffix)> {
     let _sources = cv_core::source::read_scope();
-    fts::text_search_ids_suffixed(&dir.into().unwrap_or_else(default_tantivy_dir), queries, live, refs)
+    fts::text_search_ids_suffixed_scoped(
+        &dir.into().unwrap_or_else(default_tantivy_dir),
+        queries,
+        scope,
+        live,
+        refs,
+    )
 }
 
 /// Rank sessions with stored previews; no source transcripts are read.
@@ -406,7 +489,7 @@ pub fn text_search_indexed(dir: impl Into<Option<PathBuf>>, query: &str, limit: 
 pub struct SearchFilter<'a> {
     pub harness: Option<&'a str>,
     pub cwd: Option<&'a str>,
-    /// Which text a full-text query matches; semantic vectors embed the exchange alone.
+    /// Which text a full-text or trigram query matches.
     pub scope: Scope,
 }
 
@@ -443,26 +526,7 @@ impl Scope {
     }
 }
 
-/// Refresh semantic vectors using the same inventory as the full-text pass.
-#[cfg(feature = "semantic")]
-pub fn embed_sessions(path: impl Into<Option<PathBuf>>, refs: &[cv_core::SessionRef]) -> Result<usize> {
-    semantic::embed_sessions(&path.into().unwrap_or_else(default_embeddings_path), refs)
-}
-
 pub use fts::{BadLiveBytes, Budget, Indexed, LiveRead, Suffix, Unreadable, LIVE_BYTES_VAR};
-/// Explicit lazy semantic state for a long-lived service. One-shot search remains stateless.
-#[cfg(feature = "semantic")]
-pub use semantic::{embedded_chars, SemanticSearch};
-
-/// Embed the query and rank stored session vectors by cosine similarity (default store).
-#[cfg(feature = "semantic")]
-pub fn semantic_search(path: impl Into<Option<PathBuf>>, query: &str, k: usize) -> Result<Vec<Hit>> {
-    let path = path.into().unwrap_or_else(default_embeddings_path);
-    semantic::semantic_search(&path, query, k)
-}
-
-#[cfg(feature = "semantic")]
-pub(crate) use semantic_corpus::{read_corpus_doc, Doc};
 
 #[cfg(all(test, feature = "probe-heap"))]
 #[global_allocator]
@@ -479,16 +543,18 @@ mod tests {
             let expected_cache = cv_core::env::cache_dir().unwrap().join("clustervision");
             assert_eq!(home_dir(), PathBuf::from("/u/.clustervision"));
             assert_eq!(default_tantivy_dir(), expected_cache.join("tantivy"));
-            assert_eq!(default_embeddings_path(), expected_cache.join("embeddings.bin"));
+            assert_eq!(default_trigram_dir(), expected_cache.join("trigram"));
+            assert_eq!(default_columnar_events_dir(), expected_cache.join("events_columnar"));
         }
         {
             let _scope =
                 cv_core::env::Env::from_vars([("HOME", "/u"), ("CLUSTERVISION_HOME", "/scratch/cv-home")]).enter();
             assert_eq!(home_dir(), PathBuf::from("/scratch/cv-home"));
             assert_eq!(default_tantivy_dir(), PathBuf::from("/scratch/cv-home/tantivy"));
+            assert_eq!(default_trigram_dir(), PathBuf::from("/scratch/cv-home/trigram"));
             assert_eq!(
-                default_embeddings_path(),
-                PathBuf::from("/scratch/cv-home/embeddings.bin")
+                default_columnar_events_dir(),
+                PathBuf::from("/scratch/cv-home/events_columnar")
             );
         }
         {
@@ -500,9 +566,10 @@ mod tests {
             .enter();
             assert_eq!(home_dir(), PathBuf::from("/durable/cv-home"));
             assert_eq!(default_tantivy_dir(), PathBuf::from("/fast/cv-cache/tantivy"));
+            assert_eq!(default_trigram_dir(), PathBuf::from("/fast/cv-cache/trigram"));
             assert_eq!(
-                default_embeddings_path(),
-                PathBuf::from("/fast/cv-cache/embeddings.bin")
+                default_columnar_events_dir(),
+                PathBuf::from("/fast/cv-cache/events_columnar")
             );
         }
     }

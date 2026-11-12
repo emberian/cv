@@ -247,6 +247,10 @@ pub(super) fn run_fed(
     // Initialize the catalog before the feeder opens it to invalidate old baselines. Racing
     // first opens can fail SQLite's transition to WAL before any jobs are admitted.
     let mut catalog = cv_core::catalog::Writer::open();
+    let mut col_store = (!cv_core::env::frozen())
+        .then(|| crate::columnar_events::ColumnarEventStore::open(crate::default_columnar_events_dir()))
+        .transpose()
+        .context("opening columnar events store")?;
 
     std::thread::scope(|scope| -> Result<Ran> {
         let (queue, wake) = (&queue, &wake);
@@ -297,6 +301,9 @@ pub(super) fn run_fed(
         let mut since_commit = 0usize;
         let mut ran = Ran::default();
         let mut failure: Option<anyhow::Error> = None;
+        let mut col_batch = col_store
+            .as_mut()
+            .map(crate::columnar_events::ColumnarEventStore::begin_batch);
         for out in rx {
             match out {
                 Out::Begin { id, delete } => {
@@ -346,12 +353,44 @@ pub(super) fn run_fed(
                         .map_or_else(|| job.source.clone(), |c| job.source.with_reads(&c.dependencies));
                     let events_published = match events {
                         Some((from, events)) => {
-                            let result = match catalog.as_mut() {
-                                Some(catalog) => catalog.record_events(&job.r, from, events, &source, &job.prov),
-                                None => cv_core::events::record_spooled_with_source(
-                                    &job.r, from, events, &source, &job.prov,
-                                ),
+                            let need_sql = job.sql_events;
+                            let need_col = job.col_events && col_batch.is_some();
+                            let teed = if need_sql && need_col {
+                                let mut col_copy = cv_core::events::EventSpool::default();
+                                events
+                                    .tee(|ev| col_copy.push(ev.clone()))
+                                    .map(|rebuilt| (Some(rebuilt), Some(col_copy)))
+                            } else if need_col {
+                                Ok((None, Some(events)))
+                            } else {
+                                Ok((need_sql.then_some(events), None))
                             };
+                            let result = teed.and_then(|(sql_spool, col_spool)| {
+                                if let Some(events) = sql_spool {
+                                    match catalog.as_mut() {
+                                        Some(catalog) => {
+                                            catalog.record_events(&job.r, from, events, &source, &job.prov)?
+                                        }
+                                        None => cv_core::events::record_spooled_with_source(
+                                            &job.r, from, events, &source, &job.prov,
+                                        )?,
+                                    }
+                                }
+                                if let (Some(batch), Some(col_spool)) = (col_batch.as_mut(), col_spool) {
+                                    let rows = col_spool.into_rows()?;
+                                    if from == 0 || batch.can_resume(&job.r, &job.prov) {
+                                        batch.stage_session(&job.r, from, rows, &source, &job.prov, None)?;
+                                    } else {
+                                        batch.invalidate_session(&job.r)?;
+                                        anyhow::bail!(
+                                            "columnar event authority mismatch on resumed pass for {} ({})",
+                                            job.r.id,
+                                            job.r.harness
+                                        );
+                                    }
+                                }
+                                Ok(())
+                            });
                             match result {
                                 Ok(()) => true,
                                 Err(err) => {
@@ -422,6 +461,9 @@ pub(super) fn run_fed(
             if since_commit >= COMMIT_EVERY && failure.is_none() {
                 if open.is_empty() {
                     writer.commit().context("interim commit")?;
+                    if let Some(batch) = col_batch.as_mut() {
+                        batch.checkpoint_commit().context("interim columnar commit")?;
+                    }
                     cv_core::resume::update(&std::mem::take(&mut ran.marks));
                     publish_dependencies(&mut ran, consumer);
                     since_commit = 0;
@@ -439,6 +481,9 @@ pub(super) fn run_fed(
         match failure.map_or(fed, Err) {
             Err(e) => Err(e),
             Ok(()) => {
+                if let Some(batch) = col_batch {
+                    batch.commit().context("committing columnar events")?;
+                }
                 shutdown.complete = true;
                 Ok(ran)
             }

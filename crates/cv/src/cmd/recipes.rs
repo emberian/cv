@@ -34,7 +34,7 @@ One selector at a time; with `--kind`, window flags and `--max-bytes` slice the 
     cv show <agent-id>                           # the sub-agent's own transcript (parent resolved fleet-wide)
 
  4. Fleet search
-    cv search \"<words>\" --json --limit 10   # add --semantic for meaning, --harness <h> to narrow
+    cv search \"<words>\" --json --limit 10   # add --harness <h> or --cwd <dir> to narrow
     → {\"hits\": [{id, harness, path, cwd, title, created_at, updated_at, message_count, size_bytes,
         score, snippet, agent_id, parent_id, workflow}], \"total\": M}   (run `cv index` once for instant hits)
 

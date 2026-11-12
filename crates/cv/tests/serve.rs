@@ -1113,12 +1113,6 @@ fn serve_search() {
         assert!(v["error"].as_str().unwrap().contains("q parameter"), "{v}");
     }
 
-    // Semantic vectors embed the exchange alone: asking them for the context is a 400, as the
-    // CLI's --semantic conflicts with --kind.
-    let (status, v) = get_json(port, "/api/search?semantic=1&kind=context&q=zebrafish");
-    assert_eq!(status, 400, "{v}");
-    assert!(v["error"].as_str().unwrap().contains("exchange only"), "{v}");
-
     // Live scan has no context projection; never silently search the exchange instead.
     for kind in ["context", "all"] {
         let (status, v) = get_json(port, &format!("/api/search?scan=1&kind={kind}&q=zebrafish"));

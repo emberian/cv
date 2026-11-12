@@ -30,6 +30,10 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 
 mod spool;
+pub use crate::tools::classify::{
+    extract_content_hunk_hashes, extract_diff_hunk_hashes, hash_normalized_hunk, hash_normalized_line,
+    patch_paths_and_hunks, MAX_HUNK_HASHES_PER_EDIT,
+};
 pub use spool::{EventSpool, SpoolingSink};
 
 /// Controls catalog ingestion over the discovered corpus.
@@ -59,6 +63,9 @@ pub struct Event {
     /// The first row of its `tool_use` block. One call can yield several rows (a patch sent through
     /// the shell is a `command` row plus a `file_edit` per file); counting calls counts these.
     pub call: bool,
+    /// Normalized 64-bit hunk & line fingerprints extracted from `file_edit` operations.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hunk_hashes: Vec<u64>,
 }
 
 /// A [`MessageSink`] that classifies each message's tool blocks into [`Event`]s as it streams past.
@@ -420,6 +427,7 @@ fn extract_message(
                         target: Some(path),
                         detail: None,
                         call: false,
+                        hunk_hashes: Vec::new(),
                     });
                 }
             }
@@ -461,6 +469,7 @@ fn extract_message(
                     target: None,
                     detail,
                     call: false,
+                    hunk_hashes: Vec::new(),
                 });
             }
             _ => {}
@@ -497,7 +506,7 @@ pub(crate) fn extract_call_into(
             .with_view(|view| classify_tool_view(name, view, cwd, commands))?
             .into_iter()
             .enumerate()
-            .map(|(i, (kind, target))| Event {
+            .map(|(i, (kind, target, hunk_hashes))| Event {
                 msg_idx,
                 ts,
                 kind,
@@ -505,19 +514,22 @@ pub(crate) fn extract_call_into(
                 target,
                 detail: None,
                 call: i == 0,
+                hunk_hashes,
             }),
     );
     Ok(())
 }
 
-/// Cross-harness classification of one tool invocation into `(kind, target)` rows via
-/// [`crate::tools::classify::visit_tool_ops`].
+/// Cross-harness classification of one tool invocation into `(kind, target, hunk_hashes)` rows via
+/// [`crate::tools::classify::visit_tool_ops_with_hunks`].
+type ClassifiedToolRow = (&'static str, Option<String>, Vec<u64>);
+
 fn classify_tool_view(
     name: &str,
     input: JsonView<'_>,
     cwd: Option<&Path>,
     commands: bool,
-) -> Result<Vec<(&'static str, Option<String>)>> {
+) -> Result<Vec<ClassifiedToolRow>> {
     use crate::tools::classify::{ClassifyOpts, ToolOp};
     let opts = if commands {
         ClassifyOpts::EVENTS
@@ -526,19 +538,26 @@ fn classify_tool_view(
     };
     let mut rows = Vec::new();
     let mut fallback_path = None;
-    crate::tools::classify::visit_tool_ops(None, name, input, opts, |sem| match sem.op {
-        ToolOp::Command { cmd, .. } => rows.push(("command", cmd.map(std::borrow::Cow::into_owned))),
-        ToolOp::FileEdit { path, .. } => rows.push(("file_edit", Some(absolutize(&path, cwd)))),
+    let mut visit = |sem: crate::tools::classify::ToolSemantic<'_>, hunks: Vec<u64>| match sem.op {
+        ToolOp::Command { cmd, .. } => rows.push(("command", cmd.map(std::borrow::Cow::into_owned), Vec::new())),
+        ToolOp::FileEdit { path, .. } => rows.push(("file_edit", Some(absolutize(&path, cwd)), hunks)),
         ToolOp::FileRead { path } | ToolOp::Search { path: Some(path), .. } => {
-            rows.push(("file_read", Some(absolutize(&path, cwd))));
+            rows.push(("file_read", Some(absolutize(&path, cwd)), Vec::new()));
         }
         ToolOp::Other { path: Some(path), .. } if fallback_path.is_none() => {
             fallback_path = Some(absolutize(&path, cwd));
         }
         _ => {}
-    })?;
+    };
+    if commands {
+        crate::tools::classify::visit_tool_ops_with_hunks(None, name, input, opts, &mut visit)?;
+    } else {
+        crate::tools::classify::visit_tool_ops(None, name, input, opts, |sem| {
+            visit(sem, Vec::new());
+        })?;
+    }
     if rows.is_empty() {
-        rows.push(("tool", fallback_path));
+        rows.push(("tool", fallback_path, Vec::new()));
     }
     Ok(rows)
 }
@@ -677,6 +696,42 @@ pub struct EditEvent {
     pub parent_id: Option<String>,
 }
 
+/// [`EditEvent`] paired with the normalized 64-bit hunk & line fingerprints extracted from the edit.
+#[derive(Debug, Clone)]
+pub struct EditHunkEvent {
+    pub edit: EditEvent,
+    pub hunk_hashes: Vec<u64>,
+}
+
+/// Encode `u64` hunk fingerprints as little-endian bytes (`None` when empty so non-edit rows pay zero bytes).
+pub fn encode_hunk_hashes(hashes: &[u64]) -> Option<Vec<u8>> {
+    if hashes.is_empty() {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(hashes.len() * 8);
+    for &h in hashes {
+        bytes.extend_from_slice(&h.to_le_bytes());
+    }
+    Some(bytes)
+}
+
+/// Persisted `(msg_idx, target, hunk_hashes)` row for a `file_edit` event of one session.
+pub type SessionEditHunkRow = (i64, Option<String>, Vec<u64>);
+
+/// Decode little-endian `u64` hunk fingerprints from a stored SQLite/segment blob.
+pub fn decode_hunk_hashes(blob: Option<&[u8]>) -> Vec<u64> {
+    let Some(bytes) = blob else {
+        return Vec::new();
+    };
+    bytes
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .copied()
+        .map(u64::from_le_bytes)
+        .collect()
+}
+
 #[cfg(feature = "sqlite")]
 mod db {
     use super::*;
@@ -719,18 +774,29 @@ mod db {
                  target TEXT NOT NULL UNIQUE
              );
              CREATE TABLE IF NOT EXISTS events(
-                 session   INTEGER NOT NULL,
-                 msg_idx   INTEGER NOT NULL,
-                 ts        INTEGER,
-                 kind      TEXT NOT NULL,
-                 tool      TEXT,
-                 target_id INTEGER,
-                 detail    TEXT
+                 session     INTEGER NOT NULL,
+                 msg_idx     INTEGER NOT NULL,
+                 ts          INTEGER,
+                 kind        TEXT NOT NULL,
+                 tool        TEXT,
+                 target_id   INTEGER,
+                 detail      TEXT,
+                 hunk_hashes BLOB
              );
              CREATE INDEX IF NOT EXISTS idx_events_session ON events(session);
              CREATE INDEX IF NOT EXISTS idx_events_target ON events(target_id);",
         )
         .ok()?;
+        let has_hunk_col = conn
+            .prepare("PRAGMA table_info(events)")
+            .ok()?
+            .query_map([], |row| row.get::<_, String>(1))
+            .ok()?
+            .any(|name| name.as_deref() == Ok("hunk_hashes"));
+        if !has_hunk_col {
+            conn.execute("ALTER TABLE events ADD COLUMN hunk_hashes BLOB", [])
+                .ok()?;
+        }
         Some(conn)
     }
 
@@ -744,6 +810,9 @@ mod db {
         cwd: Option<String>,
         // Required: old catalogs/checkpoints lack target-level correlation and must replay.
         target_correlation: bool,
+        // Required: pre-0.19 catalogs lack 64-bit edit hunk hashes and replay cleanly on sync.
+        #[serde(default)]
+        hunk_hashes: bool,
     }
 
     impl crate::source::Payload for Attributed {
@@ -758,6 +827,7 @@ mod db {
             workflow: prov.workflow.clone(),
             cwd: r.cwd.as_ref().map(|p| p.to_string_lossy().into_owned()),
             target_correlation: true,
+            hunk_hashes: true,
         }
     }
 
@@ -848,6 +918,23 @@ mod db {
         record_spooled_in(&mut conn, r, from, events, source, prov)
     }
 
+    /// Publish an ordered iterator of [`Event`] rows from `from` with the same atomic replacement
+    /// and source-baseline semantics as [`record_spooled_with_source`]. Allows callers such as
+    /// `cv-search` to tee streamed rows into derived columnar segments without re-parsing.
+    pub fn record_events_with_source(
+        r: &SessionRef,
+        from: usize,
+        events: impl IntoIterator<Item = Result<Event>>,
+        source: &crate::source::Baseline,
+        prov: &Provenance,
+    ) -> Result<()> {
+        if crate::env::frozen() {
+            return Ok(());
+        }
+        let mut conn = open().ok_or_else(|| anyhow::anyhow!("event catalog unavailable"))?;
+        record_from_in(&mut conn, r, from, events, prov, source)
+    }
+
     pub(crate) fn record_spooled_in(
         conn: &mut Connection,
         r: &SessionRef,
@@ -911,8 +998,8 @@ mod db {
             let mut intern = tx.prepare_cached("INSERT OR IGNORE INTO event_targets(target) VALUES(?1)")?;
             let mut intern_id = tx.prepare_cached("SELECT id FROM event_targets WHERE target=?1")?;
             let mut insert = tx.prepare_cached(
-                "INSERT INTO events(session,msg_idx,ts,kind,tool,target_id,detail)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                "INSERT INTO events(session,msg_idx,ts,kind,tool,target_id,detail,hunk_hashes)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
             )?;
             let mut targets: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
             let mut previous = None;
@@ -939,6 +1026,7 @@ mod db {
                         }
                     },
                 };
+                let hunk_blob = encode_hunk_hashes(&e.hunk_hashes);
                 insert.execute(params![
                     session,
                     e.msg_idx as i64,
@@ -947,6 +1035,7 @@ mod db {
                     e.tool,
                     target_id,
                     e.detail,
+                    hunk_blob,
                 ])?;
             }
         }
@@ -1023,25 +1112,34 @@ mod db {
     pub(super) fn collect_sources(refs: Vec<SessionRef>, subagents: bool) -> Result<Vec<(SessionRef, Provenance)>> {
         let mut sources: Vec<_> = refs.into_iter().map(|r| (r, Provenance::default())).collect();
         if subagents {
-            let folded: Vec<_> = sources
+            let mut visited = std::collections::HashSet::new();
+            let mut frontier: Vec<(SessionRef, String, Option<String>)> = sources
                 .iter()
                 .map(|(parent, _)| {
-                    Ok(crate::subagent_tree_of(parent)?
-                        .into_iter()
-                        .map(|sub| {
-                            let provenance = Provenance {
-                                parent_id: Some(parent.id.clone()),
-                                agent_id: Some(sub.agent_id().to_owned()),
-                                workflow: sub.workflow.clone(),
-                            };
-                            (sub.session, provenance)
-                        })
-                        .collect::<Vec<_>>())
+                    visited.insert((parent.harness, parent.id.clone(), parent.path.clone()));
+                    (parent.clone(), parent.id.clone(), None)
                 })
-                .collect::<Result<Vec<_>>>()?
-                .into_iter()
-                .flatten()
                 .collect();
+            let mut folded = Vec::new();
+            while !frontier.is_empty() {
+                let mut next_frontier = Vec::new();
+                for (parent, root_parent_id, inherited_workflow) in frontier {
+                    for sub in crate::subagent_tree_of(&parent)? {
+                        let wf = sub.workflow.clone().or_else(|| inherited_workflow.clone());
+                        let provenance = Provenance {
+                            parent_id: Some(root_parent_id.clone()),
+                            agent_id: Some(sub.agent_id().to_owned()),
+                            workflow: wf.clone(),
+                        };
+                        let key = (sub.session.harness, sub.session.id.clone(), sub.session.path.clone());
+                        if visited.insert(key) {
+                            next_frontier.push((sub.session.clone(), root_parent_id.clone(), wf));
+                        }
+                        folded.push((sub.session, provenance));
+                    }
+                }
+                frontier = next_frontier;
+            }
             sources.extend(folded);
         }
         Ok(preferred_sources(sources))
@@ -1245,6 +1343,91 @@ mod db {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// Same file-matching and ordering semantics as [`edits_touching_file`], additionally
+    /// returning the persisted 64-bit normalized hunk & line fingerprints for each edit.
+    pub fn edits_with_hunks_touching_file(abs: &str, rel: &str) -> Result<Vec<EditHunkEvent>> {
+        let conn = open().context("the event catalog cannot be opened")?;
+        let escaped = rel.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+        let suffix = format!("%/{escaped}");
+        let mut stmt = conn.prepare(
+            "SELECT es.harness, es.session_id, e.msg_idx, e.ts, t.target,
+                    MAX(s.title), MAX(s.cwd), MAX(s.created_at), MAX(s.updated_at), MAX(es.parent_id),
+                    e.hunk_hashes
+             FROM events e
+             JOIN event_targets t ON t.id = e.target_id
+             JOIN event_sessions es ON es.id = e.session
+             LEFT JOIN sessions s ON s.harness = es.harness AND s.id = es.session_id
+             WHERE e.kind = 'file_edit'
+               AND e.target_id IN (SELECT id FROM event_targets
+                                   WHERE target = ?1 OR target = ?2 OR target LIKE ?3 ESCAPE '\\')
+             GROUP BY e.rowid
+             ORDER BY e.ts, e.msg_idx, e.rowid",
+        )?;
+        let raw_rows = stmt.query_map(params![abs, rel, suffix], |row| {
+            let blob: Option<Vec<u8>> = row.get(10)?;
+            Ok(EditHunkEvent {
+                edit: EditEvent {
+                    harness: row.get(0)?,
+                    session_id: row.get(1)?,
+                    msg_idx: row.get(2)?,
+                    ts: row.get(3)?,
+                    target: row.get(4)?,
+                    title: row.get(5)?,
+                    cwd: row.get(6)?,
+                    created_at: row.get(7)?,
+                    updated_at: row.get(8)?,
+                    parent_id: row.get(9)?,
+                },
+                hunk_hashes: decode_hunk_hashes(blob.as_deref()),
+            })
+        })?;
+        // Merge rows that share the same `(harness, session_id, msg_idx, ts, target)` key so row
+        // cardinality matches [`edits_touching_file`] 1:1 while preserving all hunk fingerprints.
+        type EditMergeKey = (String, String, i64, Option<i64>, Option<String>);
+        let mut merged: Vec<EditHunkEvent> = Vec::new();
+        let mut key_to_idx: std::collections::HashMap<EditMergeKey, usize> = std::collections::HashMap::new();
+        for item in raw_rows {
+            let item = item?;
+            let key = (
+                item.edit.harness.clone(),
+                item.edit.session_id.clone(),
+                item.edit.msg_idx,
+                item.edit.ts,
+                item.edit.target.clone(),
+            );
+            if let Some(&idx) = key_to_idx.get(&key) {
+                let dst = &mut merged[idx].hunk_hashes;
+                for h in item.hunk_hashes {
+                    if dst.len() < MAX_HUNK_HASHES_PER_EDIT && !dst.contains(&h) {
+                        dst.push(h);
+                    }
+                }
+            } else {
+                key_to_idx.insert(key, merged.len());
+                merged.push(item);
+            }
+        }
+        Ok(merged)
+    }
+
+    /// Persisted `(msg_idx, target, hunk_hashes)` rows for `file_edit` events of one session.
+    pub fn edit_hunks_for(harness: &str, session_id: &str) -> Result<Vec<SessionEditHunkRow>> {
+        let conn = open().context("the event catalog cannot be opened")?;
+        let mut stmt = conn.prepare(
+            "SELECT e.msg_idx, t.target, e.hunk_hashes
+             FROM events e
+             JOIN event_sessions es ON es.id = e.session
+             LEFT JOIN event_targets t ON t.id = e.target_id
+             WHERE es.harness=?1 AND es.session_id=?2 AND e.kind='file_edit'
+             ORDER BY e.msg_idx, e.rowid",
+        )?;
+        let rows = stmt.query_map(params![harness, session_id], |row| {
+            let blob: Option<Vec<u8>> = row.get(2)?;
+            Ok((row.get(0)?, row.get(1)?, decode_hunk_hashes(blob.as_deref())))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// Whether *any* events have ever been ingested — lets callers distinguish "no sessions
     /// touched this file" from "nobody ran `cv index` yet" and hint accordingly.
     pub fn catalog_has_events() -> bool {
@@ -1361,8 +1544,9 @@ mod db {
 
 #[cfg(feature = "sqlite")]
 pub use db::{
-    catalog_has_events, edits_touching_file, events_for, ingest_all, ingest_ref, ingest_subagent, needs_ingest,
-    record_spooled_with_source, sessions_editing, sessions_touching, SyncTable,
+    catalog_has_events, edit_hunks_for, edits_touching_file, edits_with_hunks_touching_file, events_for, ingest_all,
+    ingest_ref, ingest_subagent, needs_ingest, record_events_with_source, record_spooled_with_source, sessions_editing,
+    sessions_touching, SyncTable,
 };
 
 /// No-op fallbacks without sqlite: extraction still works (the sink is pure), persistence and
@@ -1406,6 +1590,18 @@ mod db_stub {
     ) -> Result<()> {
         Ok(())
     }
+    pub fn record_events_with_source(
+        _r: &SessionRef,
+        _from: usize,
+        events: impl IntoIterator<Item = Result<Event>>,
+        _source: &crate::source::Baseline,
+        _prov: &Provenance,
+    ) -> Result<()> {
+        for e in events {
+            let _ = e?;
+        }
+        Ok(())
+    }
     pub fn ingest_ref(_r: &SessionRef) -> Result<usize> {
         Ok(0)
     }
@@ -1427,14 +1623,21 @@ mod db_stub {
     pub fn edits_touching_file(_abs: &str, _rel: &str) -> Result<Vec<EditEvent>> {
         Ok(Vec::new())
     }
+    pub fn edits_with_hunks_touching_file(_abs: &str, _rel: &str) -> Result<Vec<EditHunkEvent>> {
+        Ok(Vec::new())
+    }
+    pub fn edit_hunks_for(_harness: &str, _session_id: &str) -> Result<Vec<SessionEditHunkRow>> {
+        Ok(Vec::new())
+    }
     pub fn catalog_has_events() -> bool {
         false
     }
 }
 #[cfg(not(feature = "sqlite"))]
 pub use db_stub::{
-    catalog_has_events, edits_touching_file, events_for, ingest_all, ingest_ref, ingest_subagent, needs_ingest,
-    record_spooled_with_source, sessions_editing, sessions_touching, SyncTable,
+    catalog_has_events, edit_hunks_for, edits_touching_file, edits_with_hunks_touching_file, events_for, ingest_all,
+    ingest_ref, ingest_subagent, needs_ingest, record_events_with_source, record_spooled_with_source, sessions_editing,
+    sessions_touching, SyncTable,
 };
 
 #[cfg(test)]
@@ -1640,11 +1843,18 @@ mod tests {
             assert_eq!(
                 source
                     .with_view(|view| classify_tool_view(name, view, Some(Path::new("/w")), true))
-                    .unwrap(),
+                    .unwrap()
+                    .into_iter()
+                    .map(|(k, t, _)| (k, t))
+                    .collect::<Vec<_>>(),
                 expected
             );
             assert_eq!(
-                classify_tool_view(name, JsonView::from(&owned), Some(Path::new("/w")), true).unwrap(),
+                classify_tool_view(name, JsonView::from(&owned), Some(Path::new("/w")), true)
+                    .unwrap()
+                    .into_iter()
+                    .map(|(k, t, _)| (k, t))
+                    .collect::<Vec<_>>(),
                 expected
             );
             let mut message = msg(vec![
@@ -1700,7 +1910,7 @@ mod tests {
             );
             assert!(expected
                 .iter()
-                .any(|(kind, path)| *kind == "file_edit" && path.as_deref() == Some("late.rs")));
+                .any(|(kind, path, _)| *kind == "file_edit" && path.as_deref() == Some("late.rs")));
         }
         std::fs::remove_file(path).unwrap();
     }
@@ -1786,7 +1996,11 @@ mod tests {
     }
 
     fn patch_targets(patch: &str) -> Vec<String> {
-        crate::tools::classify::patch_rows(crate::json::JsonView::from(&json!(patch))).unwrap()
+        crate::tools::classify::patch_rows(crate::json::JsonView::from(&json!(patch)), false)
+            .unwrap()
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect()
     }
 
     #[test]
@@ -2321,5 +2535,54 @@ await tools.view_image({ path: "docs/arch.png" });
         assert!(edits_touching_file("/x/src/parser.rs.bak", "src/parser.rs.bak")
             .unwrap()
             .is_empty());
+
+        // 64-bit hunk hashes persist across SQLite ingest and match re-indented git diff hunks.
+        let hunk_edits = edits_with_hunks_touching_file("/elsewhere/src/parser.rs", "src/parser.rs").unwrap();
+        assert_eq!(hunk_edits.len(), 1);
+        assert_eq!(hunk_edits[0].edit.session_id, "evt-e2e");
+        let per_sess = edit_hunks_for("claude", "evt-e2e").unwrap();
+        assert_eq!(per_sess.len(), 1);
+        assert_eq!(per_sess[0].2, hunk_edits[0].hunk_hashes);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn persisted_edit_hunk_hashes_match_rebased_diff_and_suffix_replacement() {
+        let world = crate::test_world("events-hunk-hashes");
+        let path = world.write_session(
+            "hunk-sess",
+            &[json!({
+                "type": "assistant", "uuid": "a1", "sessionId": "hunk-sess",
+                "timestamp": "2026-07-01T10:00:00Z",
+                "message": {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use", "id": "t1", "name": "Edit",
+                        "input": {
+                            "file_path": "/repo/src/engine.rs",
+                            "old_string": "let cap = 8;",
+                            "new_string": "let cap = compute_dynamic_cap(limit);\nassert!(cap >= 16);"
+                        }
+                    }]
+                }
+            })],
+        );
+        let r = SessionRef::new("hunk-sess", crate::Harness::Claude, &path);
+        assert_eq!(ingest_ref(&r).unwrap(), 1);
+
+        let stored = edits_with_hunks_touching_file("/other-worktree/src/engine.rs", "src/engine.rs").unwrap();
+        assert_eq!(stored.len(), 1);
+        assert!(!stored[0].hunk_hashes.is_empty());
+
+        let rebased_commit_diff = "\
+--- a/src/engine.rs
++++ b/src/engine.rs
+@@ -88,1 +120,2 @@
+-        let cap = 8;
++        let cap = compute_dynamic_cap(limit);
++        assert!(cap >= 16);
+";
+        let diff_hashes = extract_diff_hunk_hashes(rebased_commit_diff);
+        assert_eq!(stored[0].hunk_hashes, diff_hashes);
     }
 }
