@@ -790,18 +790,56 @@ impl SegmentReader {
             path.display()
         );
 
+        let to_usize = |v: u64, what: &str| -> Result<usize> {
+            usize::try_from(v).with_context(|| format!("overflowing {what} in {}", path.display()))
+        };
+        let check_dir = |off: usize, len: usize, what: &str| -> Result<()> {
+            let end = off
+                .checked_add(len)
+                .with_context(|| format!("overflowing {what} range in {}", path.display()))?;
+            anyhow::ensure!(
+                end <= footer_start,
+                "out-of-bounds {what} directory ({off}..{end} > {footer_start}) in {}",
+                path.display()
+            );
+            Ok(())
+        };
+
         let num_sessions = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
-        let unigram_dir_offset = u64::from_le_bytes(footer[0..8].try_into().unwrap()) as usize;
-        let bigram_dir_offset = u64::from_le_bytes(footer[8..16].try_into().unwrap()) as usize;
+        let unigram_dir_offset = to_usize(
+            u64::from_le_bytes(footer[0..8].try_into().unwrap()),
+            "unigram_dir_offset",
+        )?;
+        let bigram_dir_offset = to_usize(
+            u64::from_le_bytes(footer[8..16].try_into().unwrap()),
+            "bigram_dir_offset",
+        )?;
         let num_bigrams = u32::from_le_bytes(footer[16..20].try_into().unwrap()) as usize;
-        let trigram_dir_offset = u64::from_le_bytes(footer[24..32].try_into().unwrap()) as usize;
+        let trigram_dir_offset = to_usize(
+            u64::from_le_bytes(footer[24..32].try_into().unwrap()),
+            "trigram_dir_offset",
+        )?;
         let num_trigrams = u32::from_le_bytes(footer[32..36].try_into().unwrap()) as usize;
-        let meta_offset = u64::from_le_bytes(footer[40..48].try_into().unwrap()) as usize;
-        let meta_len = u64::from_le_bytes(footer[48..56].try_into().unwrap()) as usize;
-        anyhow::ensure!(
-            meta_offset.saturating_add(meta_len) <= footer_start,
-            "out-of-bounds trigram metadata slice"
-        );
+        let meta_offset = to_usize(u64::from_le_bytes(footer[40..48].try_into().unwrap()), "meta_offset")?;
+        let meta_len = to_usize(u64::from_le_bytes(footer[48..56].try_into().unwrap()), "meta_len")?;
+
+        check_dir(unigram_dir_offset, 256 * 12, "unigram")?;
+        check_dir(
+            bigram_dir_offset,
+            num_bigrams
+                .checked_mul(16)
+                .context("overflowing bigram directory size")?,
+            "bigram",
+        )?;
+        check_dir(
+            trigram_dir_offset,
+            num_trigrams
+                .checked_mul(16)
+                .context("overflowing trigram directory size")?,
+            "trigram",
+        )?;
+        check_dir(meta_offset, meta_len, "metadata")?;
+
         let metas: Vec<SegmentDocMeta> = serde_json::from_slice(&bytes[meta_offset..meta_offset + meta_len])
             .context("decoding trigram segment metadata")?;
         anyhow::ensure!(
@@ -821,11 +859,12 @@ impl SegmentReader {
     }
 
     fn decode_bitmap(&self, off: usize, len: usize) -> Result<RoaringBitmap> {
+        let end = off.checked_add(len).context("overflowing trigram posting range")?;
         anyhow::ensure!(
-            off.saturating_add(len) <= self.bytes.len() - FOOTER_BYTES,
+            end <= self.bytes.len() - FOOTER_BYTES,
             "trigram posting slice out of bounds"
         );
-        RoaringBitmap::deserialize_from(Cursor::new(&self.bytes[off..off + len]))
+        RoaringBitmap::deserialize_from(Cursor::new(&self.bytes[off..end]))
             .context("deserializing trigram roaring bitmap")
     }
 
@@ -2646,5 +2685,55 @@ mod tests {
         assert_eq!(budgeted.suffix.stale, 2);
         assert_eq!(budgeted.suffix.read, 1);
         assert_eq!(budgeted.suffix.cut, 1);
+    }
+
+    #[test]
+    fn trigram_segment_reader_rejects_forged_directory_bounds_cleanly() {
+        let tmp = ScratchDir::new();
+        let home = tmp.path().join("cv-home");
+        std::fs::create_dir_all(&home).unwrap();
+        let _env = cv_core::env::Env::from_vars([
+            ("CLUSTERVISION_HOME", home.to_str().unwrap()),
+            ("CLUSTERVISION_CACHE", home.to_str().unwrap()),
+        ])
+        .enter();
+
+        let sess = write_claude_jsonl(
+            &tmp.path().join("s.jsonl"),
+            "s",
+            "/proj",
+            &[json!({
+                "type": "user",
+                "sessionId": "s",
+                "uuid": "u1",
+                "message": { "role": "user", "content": "FileId::admits" }
+            })],
+        );
+        let idx_dir = tmp.path().join("trigram");
+        sync_sessions(&idx_dir, &[sess], true, false).unwrap();
+        let seg_path = std::fs::read_dir(&idx_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|ext| ext == "trg"))
+            .unwrap();
+        let orig = std::fs::read(&seg_path).unwrap();
+        let footer_start = orig.len() - FOOTER_BYTES;
+
+        // Forge `trigram_dir_offset = u64::MAX - 8` with valid recomputed FNV-1a checksum.
+        let mut forged = orig.clone();
+        forged[footer_start + 24..footer_start + 32].copy_from_slice(&(u64::MAX - 8).to_le_bytes());
+        let crc = fnv1a_32(&forged[..footer_start], &forged[footer_start..footer_start + 56]);
+        forged[footer_start + 56..footer_start + 60].copy_from_slice(&crc.to_le_bytes());
+        std::fs::write(&seg_path, &forged).unwrap();
+        assert!(SegmentReader::open(&seg_path).is_err());
+
+        // Forge `num_trigrams = u32::MAX` with valid recomputed FNV-1a checksum.
+        let mut forged2 = orig;
+        forged2[footer_start + 32..footer_start + 36].copy_from_slice(&u32::MAX.to_le_bytes());
+        let crc2 = fnv1a_32(&forged2[..footer_start], &forged2[footer_start..footer_start + 56]);
+        forged2[footer_start + 56..footer_start + 60].copy_from_slice(&crc2.to_le_bytes());
+        std::fs::write(&seg_path, &forged2).unwrap();
+        assert!(SegmentReader::open(&seg_path).is_err());
     }
 }
