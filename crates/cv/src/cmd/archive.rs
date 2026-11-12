@@ -104,24 +104,43 @@ impl Archive {
     pub fn entries_by_key(&self) -> Result<(ArchiveSessionMap, usize)> {
         let manifests =
             cv_core::list_pack_manifests_frozen_safe(&self.home).context("reading pack manifests from state.db")?;
-        let pack_count = manifests.len();
         let packs_dir = self.packs_dir();
+        let mut distinct_packs = std::collections::BTreeSet::new();
+        let mut idx_cache: std::collections::HashMap<String, Option<PackFileManifest>> =
+            std::collections::HashMap::new();
         let mut by_key = BTreeMap::new();
 
         for m in manifests {
-            let idx_file = pack_idx_path(&packs_dir, &m.pack_id)?;
-            let idx_manifest = if idx_file.is_file() {
-                let raw = std::fs::read(&idx_file).with_context(|| format!("reading {}", idx_file.display()))?;
-                Some(PackFileManifest::from_json_slice(&raw)?)
-            } else {
-                None
-            };
+            distinct_packs.insert(m.pack_path.clone());
+            let phys_pack_id = m
+                .index_meta
+                .get("physical_pack_id")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| m.pack_id.split_once("--r").map(|(base, _)| base))
+                .unwrap_or(&m.pack_id)
+                .to_string();
 
             if let Some(sessions_val) = m.index_meta.get("sessions") {
                 let entries: Vec<ArchivedSessionEntry> = serde_json::from_value(sessions_val.clone())
                     .with_context(|| format!("decoding index_meta.sessions for pack {}", m.pack_id))?;
                 for entry in entries {
-                    if let Some(ref idx) = idx_manifest {
+                    let target_pack_id = if !entry.addr.pack_id.is_empty() {
+                        entry.addr.pack_id.as_str()
+                    } else {
+                        phys_pack_id.as_str()
+                    };
+                    if !idx_cache.contains_key(target_pack_id) {
+                        let idx_file = pack_idx_path(&packs_dir, target_pack_id)?;
+                        let loaded = if idx_file.is_file() {
+                            let raw =
+                                std::fs::read(&idx_file).with_context(|| format!("reading {}", idx_file.display()))?;
+                            Some(PackFileManifest::from_json_slice(&raw)?)
+                        } else {
+                            None
+                        };
+                        idx_cache.insert(target_pack_id.to_string(), loaded);
+                    }
+                    if let Some(Some(idx)) = idx_cache.get(target_pack_id) {
                         let anchor = record_anchor(&entry.producer_id, &entry.harness, &entry.id);
                         if let Some(span) = idx.record_index.get(&anchor) {
                             anyhow::ensure!(
@@ -129,7 +148,7 @@ impl Archive {
                                     && span.length == entry.addr.length
                                     && span.blake3_digest == entry.addr.blake3_digest,
                                 "pack {} record span mismatch for {}",
-                                m.pack_id,
+                                target_pack_id,
                                 anchor
                             );
                         }
@@ -139,7 +158,7 @@ impl Archive {
                 }
             }
         }
-        Ok((by_key, pack_count))
+        Ok((by_key, distinct_packs.len()))
     }
 
     /// Deduplicated archived sessions, newest `archived_at` first. Read-only (`--frozen` safe).
@@ -349,12 +368,13 @@ impl Archive {
         let pack_blake3 = cv_core::blake3_hex(&zst_bytes);
         let rel_pack_path = format!("packs/{pack_id}.pack.zst");
 
-        // 2. Append capture envelopes to `StateStore` (`capture_inbox`) with idempotent `op_id`s.
-        let mut min_pos = i64::MAX;
-        let mut max_pos = i64::MIN;
+        // 2. Append capture envelopes to `StateStore` (`capture_inbox`) with pack-scoped `op_id`s
+        //    (preventing retry wedges if an earlier pack failed before publishing) and record each
+        //    archived session's exact `local_commit_pos`.
+        let mut committed = Vec::with_capacity(entries.len());
         for (item, entry) in staged.iter().zip(entries.iter()) {
             let anchor = record_anchor(&producer_id, &item.harness, &item.id);
-            let op_id = format!("archive:{producer_id}:{}:{}:{}", item.harness, item.id, item.blake3_hex);
+            let op_id = format!("archive:{pack_id}:{producer_id}:{}:{}", item.harness, item.id);
             let envelope = json!({
                 "kind": "session_archive",
                 "producer_id": producer_id,
@@ -372,42 +392,93 @@ impl Archive {
             let receipt = store
                 .append_request(&req)
                 .context("appending archive capture envelope to StateStore")?;
-            min_pos = min_pos.min(receipt.local_commit_pos);
-            max_pos = max_pos.max(receipt.local_commit_pos);
+            committed.push((receipt.local_commit_pos, entry.clone()));
         }
 
-        // Count exact inbox rows in `[min_pos..=max_pos]` (handles any concurrent recorder append).
-        let record_count = store
-            .read_inbox_range(min_pos, max_pos)
-            .context("inspecting capture_inbox range")?
-            .len() as u64;
-
-        // 3. Publish pack manifest & drain `[min_pos..=max_pos]` from `capture_inbox`.
-        let state_manifest = StatePackManifest {
-            pack_id: pack_id.clone(),
-            min_commit_pos: min_pos,
-            max_commit_pos: max_pos,
-            record_count,
+        // 3. Publish maximal contiguous `local_commit_pos` sub-runs so any concurrent non-archive
+        //    inbox row (`cv hook receipt` / `cv hook lane`) interleaved between archived sessions
+        //    is never deleted from `capture_inbox`.
+        publish_contiguous_archive_runs(
+            &store,
+            &pack_id,
+            &rel_pack_path,
             byte_len,
-            digest: format!("blake3:{pack_blake3}"),
-            pack_path: rel_pack_path,
-            index_meta: json!({
-                "pack_version": pack_file_manifest.version,
-                "frame_count": pack_file_manifest.frame_count,
-                "total_decoded_len": pack_file_manifest.total_decoded_len,
-                "sessions": entries,
-            }),
-            published_at: archived_at.timestamp_millis(),
-        };
-        store
-            .publish_pack_range(&state_manifest)
-            .context("publishing pack manifest range in StateStore")?;
+            &pack_blake3,
+            &pack_file_manifest,
+            archived_at.timestamp_millis(),
+            committed,
+        )?;
 
         summary.archived = entries.len();
         summary.pack_id = Some(pack_id);
         summary.archived_entries = entries;
         Ok(summary)
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_contiguous_archive_runs(
+    store: &StateStore,
+    pack_id: &str,
+    rel_pack_path: &str,
+    byte_len: u64,
+    pack_blake3: &str,
+    pack_file_manifest: &PackFileManifest,
+    published_at_ms: i64,
+    mut committed: Vec<(i64, ArchivedSessionEntry)>,
+) -> Result<()> {
+    if committed.is_empty() {
+        return Ok(());
+    }
+    committed.sort_by_key(|(pos, _)| *pos);
+    committed.dedup_by_key(|(pos, _)| *pos);
+
+    let mut runs: Vec<Vec<(i64, ArchivedSessionEntry)>> = Vec::new();
+    for (pos, entry) in committed {
+        if let Some(last_run) = runs.last_mut() {
+            if let Some((prev_pos, _)) = last_run.last() {
+                if pos == *prev_pos + 1 {
+                    last_run.push((pos, entry));
+                    continue;
+                }
+            }
+        }
+        runs.push(vec![(pos, entry)]);
+    }
+
+    for (run_idx, run) in runs.into_iter().enumerate() {
+        let min_pos = run.first().expect("non-empty run").0;
+        let max_pos = run.last().expect("non-empty run").0;
+        let record_count = run.len() as u64;
+        debug_assert_eq!((max_pos - min_pos + 1) as u64, record_count);
+        let run_entries: Vec<ArchivedSessionEntry> = run.into_iter().map(|(_, e)| e).collect();
+        let manifest_pack_id = if run_idx == 0 {
+            pack_id.to_string()
+        } else {
+            format!("{pack_id}--r{run_idx}")
+        };
+        let state_manifest = StatePackManifest {
+            pack_id: manifest_pack_id,
+            min_commit_pos: min_pos,
+            max_commit_pos: max_pos,
+            record_count,
+            byte_len,
+            digest: format!("blake3:{pack_blake3}"),
+            pack_path: rel_pack_path.to_string(),
+            index_meta: json!({
+                "physical_pack_id": pack_id,
+                "pack_version": pack_file_manifest.version,
+                "frame_count": pack_file_manifest.frame_count,
+                "total_decoded_len": pack_file_manifest.total_decoded_len,
+                "sessions": run_entries,
+            }),
+            published_at: published_at_ms,
+        };
+        store
+            .publish_pack_range(&state_manifest)
+            .context("publishing pack manifest range in StateStore")?;
+    }
+    Ok(())
 }
 
 fn record_anchor(producer_id: &str, harness: &str, id: &str) -> String {
@@ -501,15 +572,17 @@ pub fn cmd_watch(
     let want = parse_harness(&harness_filter)?;
     let poll = poll_interval(interval_secs)?;
 
-    println!("◉ watching agent sessions → {}", archive.packs_dir().display());
-    println!(
-        "  poll every {:.2}s{}{}; Ctrl-C to stop",
+    // Announce immediately to stderr BEFORE initial discovery/sync (`docs/INTERFACE-V2.md` §2:
+    // daemons announce on stderr within 1s so piped callers know what is running).
+    eprintln!(
+        "cv watch: watching (interval {}s{}{}) -> {}",
         poll.as_secs_f64(),
         want.map(|h| format!(" · harness={h}")).unwrap_or_default(),
         cwd_filter
             .as_deref()
             .map(|c| format!(" · cwd~{c:?}"))
             .unwrap_or_default(),
+        archive.home.display(),
     );
 
     // Initial sweep batches all existing sessions into a single sealed pack.
@@ -518,7 +591,7 @@ pub fn cmd_watch(
     for (who, why) in &init.failed {
         eprintln!("  ! {who}: {why}");
     }
-    println!(
+    eprintln!(
         "  initial sync: {} archived, {} already current",
         init.archived, init.skipped
     );
@@ -710,5 +783,145 @@ mod tests {
             cmd_path(&archive).unwrap();
             assert!(archive.sync_refs(&refs).is_err(), "--frozen must refuse archive sync");
         }
+    }
+
+    #[test]
+    fn interleaved_non_archive_inbox_rows_survive_contiguous_pack_publish_and_retry() {
+        let world = crate::test_world("archive-interleaved-inbox");
+        let archive = Archive {
+            home: world.cv_home.clone(),
+        };
+        let store = archive.state_store();
+        let producer = store.default_producer().to_string();
+
+        // Build one physical sealed pack containing two session records (`s-one` and `s-two`).
+        let packs_dir = archive.packs_dir();
+        let pack_id = "pack-interleaved-test";
+        let mut builder = PackBuilder::create(&packs_dir, pack_id).unwrap();
+        let payload_1 = br#"{"id":"s-one","harness":"claude","messages":[]}"#;
+        let payload_2 = br#"{"id":"s-two","harness":"claude","messages":[]}"#;
+        let addr_1 = builder
+            .append_record(record_anchor(&producer, "claude", "s-one"), payload_1)
+            .unwrap();
+        let addr_2 = builder
+            .append_record(record_anchor(&producer, "claude", "s-two"), payload_2)
+            .unwrap();
+        let pfm = builder.seal(Claim::New).unwrap();
+        let zst_bytes = std::fs::read(pack_zst_path(&packs_dir, pack_id).unwrap()).unwrap();
+        let rel_pack_path = format!("packs/{pack_id}.pack.zst");
+        let pack_blake3 = cv_core::blake3_hex(&zst_bytes);
+        let now = Utc::now();
+
+        // Simulate an earlier failed/aborted pack (`pack-old`) that left `s-one` at `pos = 1`,
+        // followed by a published pack at `pos = 2`, then our new sync pass appending `s-one`
+        // (`pos = 3`), a concurrent `cv hook receipt` interleaving at `pos = 4`, and `s-two`
+        // appending at `pos = 5`.
+        let stale_req = AppendRequest::new(
+            format!("archive:pack-old:{producer}:claude:s-one"),
+            cv_core::blake3_hex(payload_1),
+            json!({"kind": "session_archive", "session_id": "s-one"}),
+        );
+        let pos_stale = store.append_request(&stale_req).unwrap().local_commit_pos;
+        assert_eq!(pos_stale, 1);
+
+        let mid_req = AppendRequest::new(
+            format!("archive:pack-mid:{producer}:claude:s-mid"),
+            "deadbeef",
+            json!({"kind": "session_archive", "session_id": "s-mid"}),
+        );
+        let pos_mid = store.append_request(&mid_req).unwrap().local_commit_pos;
+        assert_eq!(pos_mid, 2);
+        store
+            .publish_pack_range(&StatePackManifest {
+                pack_id: "pack-mid".into(),
+                min_commit_pos: 2,
+                max_commit_pos: 2,
+                record_count: 1,
+                byte_len: 1,
+                digest: "blake3:00".into(),
+                pack_path: "packs/pack-mid.pack.zst".into(),
+                index_meta: json!({"sessions": []}),
+                published_at: now.timestamp_millis(),
+            })
+            .unwrap();
+
+        // Pack-scoped `op_id` gets a fresh `local_commit_pos = 3` (no retry wedge across `pos = 2`!).
+        let r1 = store
+            .append_request(&AppendRequest::new(
+                format!("archive:{pack_id}:{producer}:claude:s-one"),
+                cv_core::blake3_hex(payload_1),
+                json!({"kind": "session_archive", "session_id": "s-one"}),
+            ))
+            .unwrap();
+        assert_eq!(r1.local_commit_pos, 3);
+
+        // Concurrent `cv hook receipt` lands right in the middle at `pos = 4`!
+        let hook_rec = store
+            .append(
+                "receipt:claude:live-sess:1",
+                "hash-1",
+                &json!({"kind": "tool_receipt", "session_id": "live-sess", "seq": 1}),
+            )
+            .unwrap();
+        assert_eq!(hook_rec.local_commit_pos, 4);
+
+        let r2 = store
+            .append_request(&AppendRequest::new(
+                format!("archive:{pack_id}:{producer}:claude:s-two"),
+                cv_core::blake3_hex(payload_2),
+                json!({"kind": "session_archive", "session_id": "s-two"}),
+            ))
+            .unwrap();
+        assert_eq!(r2.local_commit_pos, 5);
+
+        let entry_1 = ArchivedSessionEntry {
+            producer_id: producer.clone(),
+            harness: "claude".into(),
+            id: "s-one".into(),
+            title: Some("One".into()),
+            cwd: None,
+            created_at: None,
+            updated_at: None,
+            message_count: 0,
+            archived_at: now,
+            content_blake3: cv_core::blake3_hex(payload_1),
+            source_len: None,
+            source_mtime_ns: None,
+            addr: addr_1,
+        };
+        let entry_2 = ArchivedSessionEntry {
+            id: "s-two".into(),
+            title: Some("Two".into()),
+            content_blake3: cv_core::blake3_hex(payload_2),
+            addr: addr_2,
+            ..entry_1.clone()
+        };
+
+        publish_contiguous_archive_runs(
+            &store,
+            pack_id,
+            &rel_pack_path,
+            zst_bytes.len() as u64,
+            &pack_blake3,
+            &pfm,
+            now.timestamp_millis(),
+            vec![(r1.local_commit_pos, entry_1), (r2.local_commit_pos, entry_2)],
+        )
+        .unwrap();
+
+        // Interleaved `pos = 4` (`tool_receipt`) and unreferenced `pos = 1` MUST remain in `capture_inbox`,
+        // while `pos = 3` and `pos = 5` were cleanly drained into `pack_manifests`!
+        let remaining = store.read_inbox_range(1, 10).unwrap();
+        let remaining_pos: Vec<i64> = remaining.iter().map(|e| e.local_commit_pos).collect();
+        assert_eq!(remaining_pos, vec![1, 4]);
+        assert_eq!(remaining[1].op_id, "receipt:claude:live-sess:1");
+
+        // `entries()` reads both sub-runs (`pack_id` and `pack_id--r1`), validates `.pack.idx.json`,
+        // and counts distinct physical `pack_path`s (`pack-mid` + `pack-interleaved-test` = 2).
+        let (rows, pack_count) = archive.entries().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(pack_count, 2);
+        assert!(archive.read_session_bytes("claude", "s-one").unwrap().is_some());
+        assert!(archive.read_session_bytes("claude", "s-two").unwrap().is_some());
     }
 }

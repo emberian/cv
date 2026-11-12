@@ -1564,10 +1564,77 @@ fn last_commit(path: &Path, bytes: u64) -> String {
     }
 }
 
+fn is_git_commit_command(cmd: &str) -> bool {
+    let has_git = cmd
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '/'))
+        .any(|tok| tok == "git" || tok.ends_with("/git"));
+    if !has_git {
+        return false;
+    }
+    cmd.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+        .any(|tok| matches!(tok, "commit" | "cherry-pick" | "merge" | "revert" | "rebase" | "am"))
+}
+
+fn scan_messages_rev_for_commit<'a>(
+    msgs: impl Iterator<Item = &'a cv_core::Message>,
+    resolver: &cv_core::Resolver,
+    mut remaining: u64,
+) -> Option<String> {
+    let re = commit_re();
+    for m in msgs {
+        for block in m.content.iter().rev() {
+            let text = match block {
+                cv_core::Block::ToolResult { content, .. } => content,
+                _ => continue,
+            };
+            if remaining == 0 {
+                return None;
+            }
+            let mut block_sha: Option<String> = None;
+            let mut overlap: [u8; 96] = [0; 96];
+            let mut overlap_len: usize = 0;
+            let _ = text.try_for_each_chunk(resolver, 64 * 1024, |chunk| {
+                if remaining == 0 {
+                    return Ok(());
+                }
+                let raw = chunk.as_bytes();
+                let take = raw.len().min(remaining as usize);
+                let slice = &raw[..take];
+                remaining = remaining.saturating_sub(take as u64);
+                if overlap_len == 0 {
+                    if let Some(c) = re.captures_iter(slice).last() {
+                        if let Ok(s) = std::str::from_utf8(&c[2]) {
+                            block_sha = Some(s[..7.min(s.len())].to_string());
+                        }
+                    }
+                } else {
+                    let mut combined = Vec::with_capacity(overlap_len + slice.len());
+                    combined.extend_from_slice(&overlap[..overlap_len]);
+                    combined.extend_from_slice(slice);
+                    if let Some(c) = re.captures_iter(&combined).last() {
+                        if let Ok(s) = std::str::from_utf8(&c[2]) {
+                            block_sha = Some(s[..7.min(s.len())].to_string());
+                        }
+                    }
+                }
+                let keep = slice.len().min(overlap.len());
+                overlap[..keep].copy_from_slice(&slice[slice.len() - keep..]);
+                overlap_len = keep;
+                Ok(())
+            });
+            if block_sha.is_some() {
+                return block_sha;
+            }
+        }
+    }
+    None
+}
+
 /// Session-aware commit lookup for `hook_start`: plain-text logs tail raw bytes directly; binary
-/// SQLite stores and compressed rollouts narrow to the indexed `events` commit position (or the
-/// session's tail messages) and scan `ToolResult` chunks as raw bytes without allocating per-result
-/// `String`s or giving up at 2,000 messages.
+/// SQLite stores and compressed rollouts inspect the tail ring backwards first (newest message
+/// first, so giant intermediate `ToolResult`s never starve a newer commit) and fall back to narrow
+/// `[cmd_idx ..= cmd_idx + 4]` windows around indexed `git commit` events when the last commit sits
+/// >`TAIL_MESSAGES` before EOF.
 fn last_commit_session(r: &SessionRef, bytes: u64) -> String {
     if !is_binary_or_compressed_store(&r.path) {
         return last_commit(&r.path, bytes);
@@ -1581,96 +1648,63 @@ fn last_commit_session(r: &SessionRef, bytes: u64) -> String {
     let Some(adapter) = cv_core::harness::rootless(r.harness) else {
         return String::new();
     };
-    // Consult indexed events when already cataloged: start scanning at the earliest of the
-    // recent `git` command events (or the last `TAIL_MESSAGES` messages, whichever comes first),
-    // so long sessions (>2,000 messages) find their commits without resolving old prefix tool results.
     const TAIL_MESSAGES: usize = 256;
-    let indexed_git_msg = cv_core::events::events_for(r.harness.as_str(), &r.id, Some("command"))
-        .ok()
-        .and_then(|evs| {
-            evs.iter()
-                .rev()
-                .filter(|e| e.target.as_deref().is_some_and(|t| t == "git" || t.ends_with("/git")))
-                .take(16)
-                .last()
-                .map(|e| e.msg_idx.max(0) as u64)
-        });
-    let tail_start = r.message_count.map(|n| n.saturating_sub(TAIL_MESSAGES) as u64);
-    let min_msg_idx = match (indexed_git_msg, tail_start) {
-        (Some(g), Some(t)) => g.min(t),
-        (Some(g), None) => g,
-        (None, Some(t)) => t,
-        (None, None) => 0,
-    };
+    const COMMIT_RESULT_WINDOW: u64 = 4;
 
-    struct CommitSink {
-        resolver: cv_core::Resolver,
-        min_msg_idx: u64,
+    let mut cmd_indices: Vec<u64> = cv_core::events::events_for(r.harness.as_str(), &r.id, Some("command"))
+        .ok()
+        .map(|evs| {
+            let mut idxs: Vec<u64> = evs
+                .iter()
+                .filter(|e| e.target.as_deref().is_some_and(is_git_commit_command))
+                .map(|e| e.msg_idx.max(0) as u64)
+                .collect();
+            idxs.sort_unstable();
+            idxs.dedup();
+            if idxs.len() > 8 {
+                idxs.drain(..idxs.len() - 8);
+            }
+            idxs
+        })
+        .unwrap_or_default();
+    cmd_indices.shrink_to_fit();
+
+    let tail_start = r.message_count.map(|n| n.saturating_sub(TAIL_MESSAGES) as u64);
+
+    struct CommitWindowSink {
+        cmd_windows: Vec<(u64, u64, Vec<cv_core::Message>)>,
+        tail_start: Option<u64>,
+        tail_ring: std::collections::VecDeque<cv_core::Message>,
         seen_msgs: u64,
-        remaining: u64,
-        sha: Option<String>,
     }
-    impl cv_core::MessageSink for CommitSink {
+    impl cv_core::MessageSink for CommitWindowSink {
         fn message(&mut self, m: cv_core::Message) -> cv_core::Flow {
             let idx = self.seen_msgs;
             self.seen_msgs += 1;
-            if idx < self.min_msg_idx {
-                return cv_core::Flow::Continue;
-            }
-            let re = commit_re();
-            for block in &m.content {
-                let text = match block {
-                    cv_core::Block::ToolResult { content, .. } => content,
-                    _ => continue,
-                };
-                if self.remaining == 0 {
-                    return cv_core::Flow::Stop;
+            let in_tail = self.tail_start.is_none_or(|ts| idx >= ts);
+            for (lo, hi, buf) in &mut self.cmd_windows {
+                if idx >= *lo && idx <= *hi {
+                    buf.push(m.clone());
                 }
-                let mut overlap: [u8; 96] = [0; 96];
-                let mut overlap_len: usize = 0;
-                let _ = text.try_for_each_chunk(&self.resolver, 64 * 1024, |chunk| {
-                    if self.remaining == 0 {
-                        return Ok(());
-                    }
-                    let raw = chunk.as_bytes();
-                    let take = raw.len().min(self.remaining as usize);
-                    let slice = &raw[..take];
-                    self.remaining = self.remaining.saturating_sub(take as u64);
-                    if overlap_len == 0 {
-                        if let Some(c) = re.captures_iter(slice).last() {
-                            if let Ok(s) = std::str::from_utf8(&c[2]) {
-                                self.sha = Some(s[..7.min(s.len())].to_string());
-                            }
-                        }
-                    } else {
-                        let mut combined = Vec::with_capacity(overlap_len + slice.len());
-                        combined.extend_from_slice(&overlap[..overlap_len]);
-                        combined.extend_from_slice(slice);
-                        if let Some(c) = re.captures_iter(&combined).last() {
-                            if let Ok(s) = std::str::from_utf8(&c[2]) {
-                                self.sha = Some(s[..7.min(s.len())].to_string());
-                            }
-                        }
-                    }
-                    let keep = slice.len().min(overlap.len());
-                    overlap[..keep].copy_from_slice(&slice[slice.len() - keep..]);
-                    overlap_len = keep;
-                    Ok(())
-                });
             }
-            if self.remaining == 0 {
-                cv_core::Flow::Stop
-            } else {
-                cv_core::Flow::Continue
+            if in_tail {
+                if self.tail_ring.len() == TAIL_MESSAGES {
+                    self.tail_ring.pop_front();
+                }
+                self.tail_ring.push_back(m);
             }
+            cv_core::Flow::Continue
         }
     }
-    let mut sink = CommitSink {
-        resolver: cv_core::Resolver::new(Some(r.path.clone())),
-        min_msg_idx,
+
+    let mut sink = CommitWindowSink {
+        cmd_windows: cmd_indices
+            .into_iter()
+            .map(|c| (c, c.saturating_add(COMMIT_RESULT_WINDOW), Vec::new()))
+            .collect(),
+        tail_start,
+        tail_ring: std::collections::VecDeque::with_capacity(TAIL_MESSAGES),
         seen_msgs: 0,
-        remaining: bytes,
-        sha: None,
     };
     let _ = cv_core::stream::stream_counted(
         adapter,
@@ -1679,7 +1713,19 @@ fn last_commit_session(r: &SessionRef, bytes: u64) -> String {
         &mut sink,
         cv_core::stream::Pass::default(),
     );
-    sink.sha.map_or_else(String::new, |sha| format!(" · last commit {sha}"))
+
+    let resolver = cv_core::Resolver::new(Some(r.path.clone()));
+    // 1. Newest messages in the tail ring win first (scanning backwards from EOF so intermediate
+    //    megabytes of tool output never starve a recent commit).
+    let sha = scan_messages_rev_for_commit(sink.tail_ring.iter().rev(), &resolver, bytes).or_else(|| {
+        // 2. Fall back to narrow `[cmd_idx ..= cmd_idx + 4]` windows around indexed `git commit`
+        //    commands (newest command window first, each with its own `bytes` budget).
+        sink.cmd_windows
+            .iter()
+            .rev()
+            .find_map(|(_, _, win)| scan_messages_rev_for_commit(win.iter().rev(), &resolver, bytes))
+    });
+    sha.map_or_else(String::new, |sha| format!(" · last commit {sha}"))
 }
 
 fn ago(t: Option<chrono::DateTime<chrono::Utc>>) -> String {
@@ -2533,6 +2579,142 @@ mod tests {
                 .unwrap()
                 .contains("CV_RECEIPT_STRICT=1"));
         }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn last_commit_session_finds_indexed_early_commit_over_300_msgs_and_giant_tool_results() {
+        let _world = crate::test_world("hooks-sqlite-indexed-commit-window");
+        let dir = std::env::temp_dir().join(format!("cv-hooks-idx-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("state.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, model TEXT, started_at REAL, ended_at REAL, message_count INTEGER, title TEXT);
+             CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, role TEXT, content TEXT, tool_call_id TEXT, tool_calls TEXT, tool_name TEXT, timestamp REAL);
+             INSERT INTO sessions VALUES ('early-commit-sess', 'm', 100.0, 500.0, 323, 'early');
+             INSERT INTO sessions VALUES ('tail-wins-sess', 'm', 100.0, 500.0, 325, 'tail');",
+        )
+        .unwrap();
+
+        let big_output = "x".repeat(64 * 1024); // 64 KiB * 6 = 384 KiB > HOOK_READ_BYTES (256 KiB)
+        let early_call = r#"[{"id":"tc_early","type":"function","function":{"name":"terminal","arguments":"{\"command\":\"cd /repo && git commit -m 'early fix'\"}"}}]"#;
+        let late_call = r#"[{"id":"tc_late","type":"function","function":{"name":"terminal","arguments":"{\"command\":\"git commit -m 'late fix'\"}"}}]"#;
+
+        // Populate `early-commit-sess`: commit at msg 1..2 (>315 msgs before EOF!), followed by
+        // 384 KiB of non-commit tool results and >300 conversational messages.
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, timestamp) VALUES ('early-commit-sess', 'user', 'start', 100.0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, tool_calls, timestamp) VALUES ('early-commit-sess', 'assistant', '', ?1, 101.0)",
+            [early_call],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, tool_call_id, tool_name, timestamp) VALUES ('early-commit-sess', 'tool', '[main 778899aa] early fix\n 1 file changed', 'tc_early', 'terminal', 102.0)",
+            [],
+        )
+        .unwrap();
+        for i in 0..6 {
+            let tcid = format!("tc_big_{i}");
+            let tc_json = format!(
+                r#"[{{"id":"{tcid}","type":"function","function":{{"name":"terminal","arguments":"{{\"command\":\"cargo test\"}}"}}}}]"#
+            );
+            conn.execute(
+                "INSERT INTO messages (session_id, role, content, tool_calls, timestamp) VALUES ('early-commit-sess', 'assistant', '', ?1, ?2)",
+                rusqlite::params![tc_json, 110.0 + i as f64],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO messages (session_id, role, content, tool_call_id, tool_name, timestamp) VALUES ('early-commit-sess', 'tool', ?1, ?2, 'terminal', ?3)",
+                rusqlite::params![&big_output, tcid, 110.5 + i as f64],
+            )
+            .unwrap();
+        }
+        for i in 0..308 {
+            let role = if i % 2 == 0 { "user" } else { "assistant" };
+            conn.execute(
+                "INSERT INTO messages (session_id, role, content, timestamp) VALUES ('early-commit-sess', ?1, ?2, ?3)",
+                rusqlite::params![role, format!("turn {i}"), 130.0 + i as f64],
+            )
+            .unwrap();
+        }
+
+        // Populate `tail-wins-sess`: early commit (11223344) + 384 KiB of tool results + >300 turns +
+        // unindexed late commit (deadbeef) near EOF!
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, timestamp) VALUES ('tail-wins-sess', 'user', 'start', 100.0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, tool_calls, timestamp) VALUES ('tail-wins-sess', 'assistant', '', ?1, 101.0)",
+            [early_call],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, tool_call_id, tool_name, timestamp) VALUES ('tail-wins-sess', 'tool', '[main 11223344] early commit\n', 'tc_early', 'terminal', 102.0)",
+            [],
+        )
+        .unwrap();
+        for i in 0..308 {
+            let role = if i % 2 == 0 { "user" } else { "assistant" };
+            conn.execute(
+                "INSERT INTO messages (session_id, role, content, timestamp) VALUES ('tail-wins-sess', ?1, ?2, ?3)",
+                rusqlite::params![role, format!("turn {i}"), 130.0 + i as f64],
+            )
+            .unwrap();
+        }
+        for i in 0..6 {
+            let tcid = format!("tc_tail_big_{i}");
+            let tc_json = format!(
+                r#"[{{"id":"{tcid}","type":"function","function":{{"name":"terminal","arguments":"{{\"command\":\"cargo test\"}}"}}}}]"#
+            );
+            conn.execute(
+                "INSERT INTO messages (session_id, role, content, tool_calls, timestamp) VALUES ('tail-wins-sess', 'assistant', '', ?1, ?2)",
+                rusqlite::params![tc_json, 450.0 + i as f64],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO messages (session_id, role, content, tool_call_id, tool_name, timestamp) VALUES ('tail-wins-sess', 'tool', ?1, ?2, 'terminal', ?3)",
+                rusqlite::params![&big_output, tcid, 450.5 + i as f64],
+            )
+            .unwrap();
+        }
+        // Index `tail-wins-sess` BEFORE the final commit is appended so `deadbeef` is unindexed!
+        let mut tail_ref = SessionRef::new("tail-wins-sess", Harness::Hermes, &db_path);
+        tail_ref.message_count = Some(323);
+        cv_core::events::ingest_ref(&tail_ref).unwrap();
+
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, tool_calls, timestamp) VALUES ('tail-wins-sess', 'assistant', '', ?1, 490.0)",
+            [late_call],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, tool_call_id, tool_name, timestamp) VALUES ('tail-wins-sess', 'tool', '[main deadbeef] late fix\n 2 files changed', 'tc_late', 'terminal', 491.0)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut early_ref = SessionRef::new("early-commit-sess", Harness::Hermes, &db_path);
+        early_ref.message_count = Some(323);
+        cv_core::events::ingest_ref(&early_ref).unwrap();
+        assert_eq!(
+            last_commit_session(&early_ref, HOOK_READ_BYTES),
+            " · last commit 778899a"
+        );
+
+        tail_ref.message_count = Some(325);
+        assert_eq!(
+            last_commit_session(&tail_ref, HOOK_READ_BYTES),
+            " · last commit deadbee"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
