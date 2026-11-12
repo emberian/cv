@@ -381,7 +381,11 @@ pub(crate) fn cmd_lanes(
         }
     }
     if with_tasks && all.iter().any(|lane| lane_passes(lane, filter)) {
-        let outcome = cv_core::task::replay()?;
+        let outcome = if cv_core::env::frozen() {
+            cv_core::lanes::replay_tasks_readonly()?
+        } else {
+            cv_core::task::replay()?
+        };
         for w in &outcome.warnings {
             eprintln!("⚠ {}", sanitize_line(w));
         }

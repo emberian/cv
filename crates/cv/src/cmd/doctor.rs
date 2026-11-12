@@ -78,7 +78,7 @@ pub(crate) fn cmd_doctor(id: Option<String>, harness: Option<String>, recent: us
                 cv_core::find(&r.id, Some(r.harness))?.with_context(|| format!("could not load session {}", r.id))?
             }
         };
-        let mut pass = rep.session(Some(rr.path.clone()));
+        let mut pass = rep.session_with_harness(Some(rr.path.clone()), Some(rr.harness));
         cv_core::stream::stream_counted(
             adapter.as_ref(),
             &rr,
@@ -258,11 +258,20 @@ fn print_report(
         println!("  Current window:   {} recorded prompt tokens", fmt_tok(cur));
     }
     if let Some(overhead) = aw.system_and_tools_overhead {
-        println!(
-            "  System + tools:   {} est. overhead (window first prompt minus {} visible turn content)",
-            fmt_tok(overhead),
-            fmt_tok(aw.reconstructed_visible_turn_tokens)
-        );
+        if rep.sessions > 1 {
+            println!(
+                "  System + tools:   {} est. median overhead ({} sessions; latest window minus {} visible turn content)",
+                fmt_tok(overhead),
+                rep.sessions,
+                fmt_tok(aw.reconstructed_visible_turn_tokens)
+            );
+        } else {
+            println!(
+                "  System + tools:   {} est. overhead (window first prompt minus {} visible turn content)",
+                fmt_tok(overhead),
+                fmt_tok(aw.reconstructed_visible_turn_tokens)
+            );
+        }
     }
     if aw.token_burn_per_turn > 0 {
         println!("  Burn velocity:    {}/turn", fmt_tok(aw.token_burn_per_turn));

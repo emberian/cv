@@ -553,6 +553,14 @@ pub fn latest_run_for_endpoint(endpoint: &str) -> Option<crate::state::LaneRun> 
     store.latest_run_for_endpoint(endpoint).ok().flatten()
 }
 
+#[cfg(feature = "sqlite")]
+fn is_clean_stop_exit_status(status: Option<&str>) -> bool {
+    matches!(
+        status.map(str::trim),
+        Some("hook_stop" | "stop_only" | "stopped" | "subagent_stop" | "completed" | "done" | "ok" | "0")
+    )
+}
+
 /// Record one lane lifecycle event (`SubagentStart` / `SubagentStop`) transactionally in
 /// `$CLUSTERVISION_HOME/state.db` (`lane_runs` + `parent_subagent` `lineage_edges`), with zero
 /// flat `lanes.jsonl` writes when `sqlite` is enabled.
@@ -608,29 +616,63 @@ pub fn append_lane_event(ev: &LaneEvent) -> std::io::Result<()> {
                 // preserved across millisecond storage in `lane_runs`.
                 let exited_ms =
                     ev.ts.timestamp_millis() + i64::from(!ev.ts.timestamp_subsec_nanos().is_multiple_of(1_000_000));
-                let active = store
+                let session_runs = store
                     .list_lane_runs_for_session(&ev.session_id)
-                    .map_err(state_err_to_io)?
-                    .into_iter()
+                    .map_err(state_err_to_io)?;
+                let matches_agent = |r: &crate::state::LaneRun| {
+                    r.agent_id.as_deref() == Some(ev.agent_id.as_str())
+                        || (r.agent_id.is_none() && r.session_id == ev.agent_id)
+                };
+                // Prefer an active run; otherwise coalesce onto a matching non-`stop_only` run
+                // already closed by `hook_lane` (`StateStore::record_lane_exit`) for the same stop.
+                let target = session_runs
+                    .iter()
                     .rev()
-                    .find(|r| r.agent_id.as_deref() == Some(ev.agent_id.as_str()) && r.exited_at.is_none());
-                if let Some(existing) = active {
+                    .find(|r| matches_agent(r) && r.exited_at.is_none())
+                    .cloned()
+                    .or_else(|| {
+                        session_runs.into_iter().rev().find(|r| {
+                            matches_agent(r)
+                                && r.exit_status.as_deref() != Some("stop_only")
+                                && r.exited_at.is_some_and(|prev| {
+                                    (exited_ms - prev).abs() <= 60_000
+                                        || r.exit_status.is_none()
+                                        || is_clean_stop_exit_status(r.exit_status.as_deref())
+                                })
+                        })
+                    });
+                if let Some(existing) = target {
+                    let final_exited = existing.exited_at.map_or(exited_ms, |prev| prev.max(exited_ms));
                     let updated = crate::state::LaneRun {
-                        agent_type: ev.agent_type.clone(),
-                        transcript_path: ev.transcript_path.as_ref().map(|p| p.to_string_lossy().into_owned()),
+                        agent_type: ev.agent_type.clone().or(existing.agent_type),
+                        transcript_path: ev
+                            .transcript_path
+                            .as_ref()
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .or(existing.transcript_path),
                         agent_transcript_path: ev
                             .agent_transcript_path
                             .as_ref()
-                            .map(|p| p.to_string_lossy().into_owned()),
-                        cwd: ev.cwd.as_ref().map(|p| p.to_string_lossy().into_owned()),
-                        exited_at: Some(exited_ms),
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .or(existing.agent_transcript_path),
+                        cwd: ev
+                            .cwd
+                            .as_ref()
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .or(existing.cwd),
+                        exited_at: Some(final_exited),
                         exit_status: Some("hook_stop".into()),
-                        last_text: ev.last_text.clone(),
+                        last_text: ev.last_text.clone().or(existing.last_text.clone()),
                         ..existing
                     };
                     store.record_lane_start(&updated).map_err(state_err_to_io)?;
                     store
-                        .record_lane_exit(&updated.run_id, exited_ms, Some("hook_stop"), ev.last_text.as_deref())
+                        .record_lane_exit(
+                            &updated.run_id,
+                            final_exited,
+                            Some("hook_stop"),
+                            updated.last_text.as_deref(),
+                        )
                         .map_err(state_err_to_io)?;
                 } else {
                     let run_id = format!("stop:{}:{}:{}", ev.session_id, ev.agent_id, uuid::Uuid::now_v7());
@@ -1543,8 +1585,10 @@ fn pass(r: &SessionRef) -> Result<Pass> {
 struct AgentStateFacts {
     /// Explicit endpoint bound via `StateStore::bind_lane_endpoint` (`lane_endpoints`).
     bound_endpoint: Option<String>,
+    /// Clean stop timestamp recorded in `lane_runs` (`hook_stop`, `stopped`, `subagent_stop`, …).
+    clean_stop_at: Option<DateTime<Utc>>,
     /// True when the latest `LaneRun` recorded a local OS PID that is no longer alive, or recorded
-    /// an explicit non-hook process exit at or after `last_turn_at`.
+    /// an abnormal non-hook process exit at or after `last_turn_at`.
     process_exited: bool,
     /// When `record_lane_exit` recorded a non-hook exit timestamp, used to verify the lane wasn't
     /// resumed after that exit.
@@ -1558,6 +1602,9 @@ fn load_state_facts_for_forest(
     subs: &[AgentRef],
 ) -> HashMap<String, AgentStateFacts> {
     let mut out: HashMap<String, AgentStateFacts> = HashMap::new();
+    if subs.is_empty() {
+        return out;
+    }
     let Ok(store) = crate::state::StateStore::default_store() else {
         return out;
     };
@@ -1568,66 +1615,128 @@ fn load_state_facts_for_forest(
     let Ok(reader) = crate::harness::store::sqlite::open_ro(db_path) else {
         return out;
     };
+
+    // Build lookup sets covering root `parent_id`, every `sub.session.id` (including nested
+    // workflow children), and every `sub.agent_id()`.
+    let mut session_keys: Vec<String> = Vec::with_capacity(1 + subs.len() * 2);
+    let mut seen_session_keys: HashSet<String> = HashSet::new();
+    if seen_session_keys.insert(parent_id.to_string()) {
+        session_keys.push(parent_id.to_string());
+    }
+    let mut agent_keys: Vec<String> = Vec::with_capacity(subs.len() * 2);
+    let mut seen_agent_keys: HashSet<String> = HashSet::new();
+    let mut key_to_aid: HashMap<String, Vec<String>> = HashMap::new();
+    let mut path_to_aid: HashMap<String, String> = HashMap::new();
+    let push_key = |map: &mut HashMap<String, Vec<String>>, key: String, aid: &str| {
+        let entry = map.entry(key).or_default();
+        if !entry.iter().any(|existing| existing == aid) {
+            entry.push(aid.to_string());
+        }
+    };
+    for sub in subs {
+        let aid = sub.agent_id().to_string();
+        let sid = sub.session.id.clone();
+        if seen_session_keys.insert(sid.clone()) {
+            session_keys.push(sid.clone());
+        }
+        if seen_session_keys.insert(aid.clone()) {
+            session_keys.push(aid.clone());
+        }
+        if seen_agent_keys.insert(aid.clone()) {
+            agent_keys.push(aid.clone());
+        }
+        let prefixed = format!("agent-{aid}");
+        if seen_agent_keys.insert(prefixed.clone()) {
+            agent_keys.push(prefixed.clone());
+        }
+        if seen_agent_keys.insert(sid.clone()) {
+            agent_keys.push(sid.clone());
+        }
+        push_key(&mut key_to_aid, aid.clone(), &aid);
+        push_key(&mut key_to_aid, prefixed.clone(), &aid);
+        if sid != parent_id {
+            push_key(&mut key_to_aid, sid.clone(), &aid);
+        }
+        for qualified in [
+            format!("{parent_id}/{sid}"),
+            format!("{parent_id}/{aid}"),
+            format!("{parent_id}/{prefixed}"),
+        ] {
+            if seen_session_keys.insert(qualified.clone()) {
+                session_keys.push(qualified.clone());
+            }
+            push_key(&mut key_to_aid, qualified, &aid);
+        }
+        path_to_aid.insert(sub.session.path.to_string_lossy().into_owned(), aid);
+    }
+
     let Ok((runs, endpoints_by_run)) = reader.read_snapshot(|conn, _reads| {
         let ver: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap_or(0);
         if ver == 0 {
             return Ok((Vec::new(), HashMap::new()));
         }
-        let mut all_runs: Vec<crate::state::LaneRun> = Vec::new();
-        let map_run = |r: &rusqlite::Row<'_>| -> rusqlite::Result<crate::state::LaneRun> {
-            Ok(crate::state::LaneRun {
-                run_id: r.get(0)?,
-                session_id: r.get(1)?,
-                agent_id: r.get(2)?,
-                agent_type: r.get(3)?,
-                harness: r.get(4)?,
-                pid: r.get(5)?,
-                proc_start_time: r.get(6)?,
-                boot_id: r.get(7)?,
-                transcript_path: r.get(8)?,
-                agent_transcript_path: r.get(9)?,
-                cwd: r.get(10)?,
-                started_at: r.get(11)?,
-                exited_at: r.get(12)?,
-                exit_status: r.get(13)?,
-                last_text: r.get(14)?,
-            })
+        let mut by_run_id: HashMap<String, (i64, crate::state::LaneRun)> = HashMap::new();
+        let map_run = |r: &rusqlite::Row<'_>| -> rusqlite::Result<(i64, crate::state::LaneRun)> {
+            Ok((
+                r.get(0)?,
+                crate::state::LaneRun {
+                    run_id: r.get(1)?,
+                    session_id: r.get(2)?,
+                    agent_id: r.get(3)?,
+                    agent_type: r.get(4)?,
+                    harness: r.get(5)?,
+                    pid: r.get(6)?,
+                    proc_start_time: r.get(7)?,
+                    boot_id: r.get(8)?,
+                    transcript_path: r.get(9)?,
+                    agent_transcript_path: r.get(10)?,
+                    cwd: r.get(11)?,
+                    started_at: r.get(12)?,
+                    exited_at: r.get(13)?,
+                    exit_status: r.get(14)?,
+                    last_text: r.get(15)?,
+                },
+            ))
         };
-        match scope {
-            Some(StopScope::Forest) => {
-                if let Ok(mut stmt) = conn.prepare(
-                    "SELECT run_id, session_id, agent_id, agent_type, harness, pid, proc_start_time,
-                            boot_id, transcript_path, agent_transcript_path, cwd, started_at,
-                            exited_at, exit_status, last_text
-                     FROM lane_runs WHERE agent_id = ?1
-                     ORDER BY started_at ASC, run_id ASC",
-                ) {
-                    let mut seen_agents = HashSet::new();
-                    for sub in subs {
-                        let aid = sub.agent_id();
-                        if !seen_agents.insert(aid) {
-                            continue;
-                        }
-                        if let Ok(rows) = stmt.query_map([aid], map_run) {
-                            all_runs.extend(rows.flatten());
-                        }
-                    }
-                }
-            }
-            _ => {
-                if let Ok(mut stmt) = conn.prepare(
-                    "SELECT run_id, session_id, agent_id, agent_type, harness, pid, proc_start_time,
-                            boot_id, transcript_path, agent_transcript_path, cwd, started_at,
-                            exited_at, exit_status, last_text
-                     FROM lane_runs WHERE session_id = ?1
-                     ORDER BY started_at ASC, run_id ASC",
-                ) {
-                    if let Ok(rows) = stmt.query_map([parent_id], map_run) {
-                        all_runs.extend(rows.flatten());
+        if let Ok(mut by_sid_stmt) = conn.prepare(
+            "SELECT rowid, run_id, session_id, agent_id, agent_type, harness, pid, proc_start_time,
+                    boot_id, transcript_path, agent_transcript_path, cwd, started_at,
+                    exited_at, exit_status, last_text
+             FROM lane_runs WHERE session_id = ?1
+             ORDER BY rowid ASC",
+        ) {
+            for sk in &session_keys {
+                if let Ok(rows) = by_sid_stmt.query_map([sk], map_run) {
+                    for (rowid, run) in rows.flatten() {
+                        by_run_id.entry(run.run_id.clone()).or_insert((rowid, run));
                     }
                 }
             }
         }
+        if let Ok(mut by_aid_stmt) = conn.prepare(
+            "SELECT rowid, run_id, session_id, agent_id, agent_type, harness, pid, proc_start_time,
+                    boot_id, transcript_path, agent_transcript_path, cwd, started_at,
+                    exited_at, exit_status, last_text
+             FROM lane_runs WHERE agent_id = ?1
+             ORDER BY rowid ASC",
+        ) {
+            for ak in &agent_keys {
+                if let Ok(rows) = by_aid_stmt.query_map([ak], map_run) {
+                    for (rowid, run) in rows.flatten() {
+                        by_run_id.entry(run.run_id.clone()).or_insert((rowid, run));
+                    }
+                }
+            }
+        }
+        let mut ordered: Vec<(i64, crate::state::LaneRun)> = by_run_id.into_values().collect();
+        ordered.sort_by(|a, b| {
+            a.1.started_at
+                .cmp(&b.1.started_at)
+                .then(a.0.cmp(&b.0))
+                .then(a.1.run_id.cmp(&b.1.run_id))
+        });
+        let all_runs: Vec<crate::state::LaneRun> = ordered.into_iter().map(|(_, r)| r).collect();
+
         let mut ep_map: HashMap<String, String> = HashMap::new();
         if !all_runs.is_empty() {
             if let Ok(mut ep_stmt) = conn.prepare(
@@ -1654,8 +1763,30 @@ fn load_state_facts_for_forest(
 
     let mut by_agent: HashMap<String, Vec<crate::state::LaneRun>> = HashMap::new();
     for run in runs {
-        if let Some(ref agent_id) = run.agent_id {
-            by_agent.entry(agent_id.clone()).or_default().push(run);
+        // Under `StopScope::Parent`, short `agent_id`s can recur in unrelated parent sessions;
+        // require the run's `session_id` or `agent_transcript_path` to belong to this forest.
+        if scope == Some(StopScope::Parent)
+            && !seen_session_keys.contains(&run.session_id)
+            && !run
+                .agent_transcript_path
+                .as_deref()
+                .is_some_and(|p| path_to_aid.contains_key(p))
+        {
+            continue;
+        }
+        let matched_aids: Option<&[String]> = if let Some(ref raid) = run.agent_id {
+            key_to_aid.get(raid).map(Vec::as_slice)
+        } else if run.session_id != parent_id {
+            key_to_aid.get(&run.session_id).map(Vec::as_slice)
+        } else {
+            None
+        };
+        if let Some(aids) = matched_aids {
+            for aid in aids {
+                by_agent.entry(aid.clone()).or_default().push(run.clone());
+            }
+        } else if let Some(aid) = run.agent_transcript_path.as_deref().and_then(|p| path_to_aid.get(p)) {
+            by_agent.entry(aid.clone()).or_default().push(run);
         }
     }
 
@@ -1664,6 +1795,13 @@ fn load_state_facts_for_forest(
         for run in &agent_runs {
             if let Some(ep) = endpoints_by_run.get(&run.run_id) {
                 facts.bound_endpoint = Some(ep.clone());
+            }
+            if let Some(exited_ms) = run.exited_at {
+                if is_clean_stop_exit_status(run.exit_status.as_deref()) {
+                    if let Some(ts) = DateTime::from_timestamp_millis(exited_ms) {
+                        facts.clean_stop_at = Some(facts.clean_stop_at.map_or(ts, |prev| prev.max(ts)));
+                    }
+                }
             }
         }
         if let Some(latest) = agent_runs
@@ -1676,7 +1814,7 @@ fn load_state_facts_for_forest(
                     facts.process_exited = true;
                 }
             } else if let Some(exited_ms) = latest.exited_at {
-                if !matches!(latest.exit_status.as_deref(), Some("hook_stop" | "stop_only")) {
+                if !is_clean_stop_exit_status(latest.exit_status.as_deref()) {
                     facts.process_exited = true;
                     facts.process_exit_at = DateTime::from_timestamp_millis(exited_ms);
                 }
@@ -1760,11 +1898,20 @@ fn lane_of(
         .unwrap_or_default();
     let agent_id = sub.agent_id().to_string();
     let state_facts = state_facts_map.get(&agent_id);
+    let effective_ledger_stop = match (
+        ledger.get(&agent_id).copied(),
+        state_facts.and_then(|sf| sf.clean_stop_at),
+    ) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    };
     let (status, status_source) = status_of(
         &sub,
         &end,
         notices.get(&agent_id),
-        ledger.get(&agent_id).copied(),
+        effective_ledger_stop,
         state_facts,
         p.ends_in_report,
         Utc::now(),
@@ -1857,6 +2004,133 @@ fn task_store_likely_populated() -> bool {
     home.join("tasks/events.jsonl").is_file() || home.join("state.db").is_file()
 }
 
+fn is_task_log_header(line: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(line)
+        .ok()
+        .and_then(|v| v.get("format")?.as_str().map(|f| f == "cv-task-log"))
+        .unwrap_or(false)
+}
+
+/// Replay the default task store strictly read-only without creating SQLite `-wal`/`-shm`
+/// sidecars (safe under `--frozen` and on read-only mounts).
+pub fn replay_tasks_readonly() -> Result<crate::task::ReplayOutcome> {
+    use std::io::{BufRead as _, BufReader};
+
+    let store = crate::task::TaskStore::default_store();
+    let jsonl_path = store.dir().join("events.jsonl");
+    let mut raw_events: Vec<(usize, crate::task::TaskEvent)> = Vec::new();
+    let mut seen_ids: HashSet<String> = HashSet::new();
+    let mut warnings: Vec<String> = Vec::new();
+
+    match std::fs::File::open(&jsonl_path) {
+        Ok(file) => {
+            let mut reader = BufReader::new(file);
+            let mut buf = Vec::new();
+            let mut line_no = 0usize;
+            loop {
+                buf.clear();
+                let n = reader.read_until(b'\n', &mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                line_no += 1;
+                let Ok(text) = std::str::from_utf8(&buf) else {
+                    warnings.push(format!(
+                        "task log {}: line {line_no} is not valid UTF-8",
+                        jsonl_path.display()
+                    ));
+                    continue;
+                };
+                let line = text.trim();
+                if line.is_empty() || is_task_log_header(line) {
+                    continue;
+                }
+                match serde_json::from_str::<crate::task::TaskEvent>(line) {
+                    Ok(ev) => {
+                        seen_ids.insert(ev.id.clone());
+                        raw_events.push((line_no, ev));
+                    }
+                    Err(_) => {
+                        if buf.ends_with(b"\n") {
+                            let snippet: String = line.chars().take(80).collect();
+                            warnings.push(format!(
+                                "task log {}: line {line_no} is not a valid event: {snippet}",
+                                jsonl_path.display()
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+
+    #[cfg(feature = "sqlite")]
+    {
+        let db_path = store.state_store().path().to_path_buf();
+        if std::fs::metadata(&db_path).is_ok_and(|m| m.is_file() && m.len() > 0) {
+            if let Ok(reader) = crate::harness::store::sqlite::open_ro(&db_path) {
+                let _ = reader.read_snapshot(|conn, _reads| {
+                    let ver: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap_or(0);
+                    if ver == 0 {
+                        return Ok(());
+                    }
+                    let Ok(mut stmt) = conn.prepare("SELECT seq, raw_json FROM task_events ORDER BY seq ASC") else {
+                        return Ok(());
+                    };
+                    let Ok(rows) = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))) else {
+                        return Ok(());
+                    };
+                    for row in rows {
+                        let (seq, raw_json) = row?;
+                        match serde_json::from_str::<crate::task::TaskEvent>(&raw_json) {
+                            Ok(ev) => {
+                                if seen_ids.insert(ev.id.clone()) {
+                                    raw_events.push((seq.max(0) as usize, ev));
+                                }
+                            }
+                            Err(_) => {
+                                let snippet: String = raw_json.chars().take(80).collect();
+                                warnings.push(format!(
+                                    "task store {}: row {} is not a valid event: {}",
+                                    db_path.display(),
+                                    seq,
+                                    snippet
+                                ));
+                            }
+                        }
+                    }
+                    Ok(())
+                });
+            }
+        }
+    }
+
+    let mut reducer = crate::task::TaskReducer::new();
+    let mut events = Vec::with_capacity(raw_events.len());
+    let mut quarantined = 0usize;
+    for (line_no, ev) in raw_events {
+        match reducer.apply(&ev) {
+            Ok(()) => events.push(ev),
+            Err(err) => {
+                quarantined += 1;
+                warnings.push(format!(
+                    "task log {}: line {line_no} quarantined: {err}",
+                    jsonl_path.display()
+                ));
+            }
+        }
+    }
+
+    Ok(crate::task::ReplayOutcome {
+        model: reducer.into_model(),
+        events,
+        warnings,
+        quarantined,
+    })
+}
+
 fn lanes_of_inner(parent: &SessionRef, visited_ancestors: &HashSet<PathBuf>) -> Result<Vec<Lane>> {
     let subs = crate::subagent_tree_of(parent)?;
     if subs.is_empty() {
@@ -1894,9 +2168,9 @@ fn lanes_of_inner(parent: &SessionRef, visited_ancestors: &HashSet<PathBuf>) -> 
     .collect::<Result<Vec<_>>>()?;
 
     // Best-effort read-only check of task/decision obligations when a task store is present,
-    // without failing on broken/directory task logs (explicit `--tasks` / `/api/lanes` reports those).
+    // without creating `-wal`/`-shm` sidecars or failing on broken/directory task logs.
     if !lanes.is_empty() && task_store_likely_populated() {
-        if let Ok(outcome) = crate::task::replay() {
+        if let Ok(outcome) = replay_tasks_readonly() {
             populate_task_obligations(&mut lanes, &outcome.model);
         }
     }
@@ -2306,9 +2580,8 @@ mod tests {
         );
         // Dead OS process transitions out of Running immediately with StatusSource::ProcessExit!
         let dead_proc = AgentStateFacts {
-            bound_endpoint: None,
             process_exited: true,
-            process_exit_at: None,
+            ..Default::default()
         };
         assert_eq!(
             status_of(&sub, &running, None, None, Some(&dead_proc), false, now),

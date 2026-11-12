@@ -189,9 +189,20 @@ impl Report {
     /// decoded text in bounded chunks, and attachment/compaction metadata live in `extra`), then
     /// call [`SessionPass::finish`]. Adapters without a facts projection retain their full metadata.
     pub fn session(&mut self, source: Option<std::path::PathBuf>) -> SessionPass<'_> {
+        self.session_with_harness(source, None)
+    }
+
+    /// Like [`Self::session`], passing `harness` so multi-record streaming model calls sharing one
+    /// response key ([`crate::stats::usage_key`]) deduplicate cleanly in active-window burn sizing.
+    pub fn session_with_harness(
+        &mut self,
+        source: Option<std::path::PathBuf>,
+        harness: Option<crate::Harness>,
+    ) -> SessionPass<'_> {
         self.sessions += 1;
         SessionPass {
             rep: self,
+            harness,
             resolver: crate::lazy::Resolver::new(source),
             names: HashMap::new(),
             unnamed: HashMap::new(),
@@ -276,15 +287,42 @@ impl Report {
     }
 }
 
+fn has_extra_bool(m: &Message, key: &str) -> bool {
+    m.extra.get(key).and_then(Value::as_bool) == Some(true)
+        || m.extra
+            .values()
+            .filter_map(Value::as_object)
+            .any(|obj| obj.get(key).and_then(Value::as_bool) == Some(true))
+}
+
+fn msg_usage_key(harness: Option<crate::Harness>, m: &Message) -> Option<String> {
+    if let Some(h) = harness {
+        if let Some(k) = crate::stats::usage_key(h, m) {
+            return Some(k);
+        }
+    } else if let Some(k) = crate::Harness::ALL.iter().find_map(|&h| crate::stats::usage_key(h, m)) {
+        return Some(k);
+    }
+    m.extra
+        .get("message")
+        .and_then(|v| v.get("id"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(|id| format!("msg:{id}"))
+}
+
 /// Compact per-message attribution facts retained during a single session pass so the active
 /// post-compaction branch can be sliced accurately at [`SessionPass::finish`] without retaining
 /// transcript text in memory.
 struct MsgFact {
     id: Option<String>,
     parent_id: Option<String>,
+    usage_key: Option<String>,
     role: Role,
     kind: MessageKind,
     visible: bool,
+    inactive_branch: bool,
+    sidechain: bool,
     prompt_tokens: Option<u64>,
     compaction_summary: u64,
     user_text: u64,
@@ -322,6 +360,7 @@ impl MsgFact {
 /// usage-derived context sizing and the compaction tally, folded per message.
 pub struct SessionPass<'a> {
     rep: &'a mut Report,
+    harness: Option<crate::Harness>,
     resolver: crate::lazy::Resolver,
     /// `tool_use_id` → tool name, the last call per id wins. A result usually carries only the
     /// id, so results attribute to real tools (and MCP names), not "(unknown tool)".
@@ -377,9 +416,12 @@ impl SessionPass<'_> {
         let mut fact = MsgFact {
             id: m.id.clone(),
             parent_id: m.parent_id.clone(),
+            usage_key: msg_usage_key(self.harness, m),
             role: m.role,
             kind: m.kind,
             visible: m.is_model_visible(),
+            inactive_branch: has_extra_bool(m, "inactive_branch"),
+            sidechain: has_extra_bool(m, "isSidechain"),
             prompt_tokens,
             compaction_summary: 0,
             user_text: 0,
@@ -535,12 +577,23 @@ fn fold_active_window(out: &mut ActiveWindowReport, facts: &[MsgFact], names: &H
 
     let mut user_exchange_turns = 0u64;
     let mut assistant_turns = 0u64;
+    let mut seen_assistant_keys: HashSet<&str> = HashSet::new();
     let mut prompt_readings: Vec<(usize, u64)> = Vec::new();
+    let mut reading_slot_by_key: HashMap<&str, usize> = HashMap::new();
     let mut session_win_conv_total = 0u64;
 
     for (idx, m) in win.iter().enumerate() {
         if let Some(pt) = m.prompt_tokens {
-            prompt_readings.push((idx, pt));
+            if let Some(uk) = m.usage_key.as_deref() {
+                if let Some(&slot) = reading_slot_by_key.get(uk) {
+                    prompt_readings[slot].1 = prompt_readings[slot].1.max(pt);
+                } else {
+                    reading_slot_by_key.insert(uk, prompt_readings.len());
+                    prompt_readings.push((idx, pt));
+                }
+            } else {
+                prompt_readings.push((idx, pt));
+            }
             out.peak_context_tokens = out.peak_context_tokens.max(pt);
         }
         if !m.visible {
@@ -548,7 +601,7 @@ fn fold_active_window(out: &mut ActiveWindowReport, facts: &[MsgFact], names: &H
         }
         if m.role == Role::User && m.kind.is_exchange() {
             user_exchange_turns += 1;
-        } else if m.role == Role::Assistant {
+        } else if m.role == Role::Assistant && m.usage_key.as_deref().is_none_or(|uk| seen_assistant_keys.insert(uk)) {
             assistant_turns += 1;
         }
 
@@ -598,14 +651,20 @@ fn fold_active_window(out: &mut ActiveWindowReport, facts: &[MsgFact], names: &H
     if let Some(&(first_idx, first_pt)) = prompt_readings.first() {
         let reconstructed_before: u64 = win[..first_idx].iter().map(|m| m.visible_tokens()).sum();
         let overhead = first_pt.saturating_sub(reconstructed_before);
-        out.first_prompt_tokens = Some(first_pt);
-        out.reconstructed_visible_turn_tokens = reconstructed_before;
+        // Callers fold sessions newest-first (`Reverse(updated_at)`); preserve the latest
+        // session's window readings rather than overwriting them with older sessions.
+        if out.first_prompt_tokens.is_none() {
+            out.first_prompt_tokens = Some(first_pt);
+            out.reconstructed_visible_turn_tokens = reconstructed_before;
+        }
         out.session_overheads.push(overhead);
         out.system_and_tools_overhead = median_u64(&out.session_overheads);
     }
 
     if let Some(&(_, last_pt)) = prompt_readings.last() {
-        out.current_context_tokens = Some(last_pt);
+        if out.current_context_tokens.is_none() {
+            out.current_context_tokens = Some(last_pt);
+        }
     }
 
     if prompt_readings.len() >= 2 {
@@ -638,24 +697,50 @@ fn median_u64(vals: &[u64]) -> Option<u64> {
     }
 }
 
-/// Prune abandoned sibling forks when `facts` carries an explicit `id`/`parent_id` tree with
-/// multiple conversational children sharing one parent; preserve linear transcripts verbatim.
+/// Prune `inactive_branch` records, embedded sidechain lines inside a non-sidechain main session,
+/// and abandoned sibling/root forks when `facts` carries an explicit `id`/`parent_id` tree.
 fn slice_active_branch(facts: &[MsgFact]) -> Vec<&MsgFact> {
+    let has_main_visible = facts.iter().any(|m| m.visible && !m.inactive_branch && !m.sidechain);
+    let eligible: Vec<&MsgFact> = facts
+        .iter()
+        .filter(|m| !m.inactive_branch && !(has_main_visible && m.sidechain))
+        .collect();
+    if eligible.is_empty() {
+        return eligible;
+    }
+
     let mut id_to_idx: HashMap<&str, usize> = HashMap::new();
-    for (idx, m) in facts.iter().enumerate() {
+    for (idx, m) in eligible.iter().enumerate() {
         if let Some(id) = m.id.as_deref().filter(|s| !s.is_empty()) {
             id_to_idx.insert(id, idx);
         }
     }
     if id_to_idx.is_empty() {
-        return facts.iter().collect();
+        return eligible;
     }
 
-    // Detect whether any parent in `id_to_idx` has >= 2 non-injected children (an actual fork).
+    // Only treat `eligible` as a tree when at least one message links to a parent in `id_to_idx`
+    // (linear transcripts whose adapter/fixture sets `id` with `parent_id = None` on every line
+    // have no tree links to prune).
+    let has_parent_links = eligible
+        .iter()
+        .any(|m| m.parent_id.as_deref().is_some_and(|pid| id_to_idx.contains_key(pid)));
+    if !has_parent_links {
+        return eligible;
+    }
+
+    // Detect whether any parent in `id_to_idx` has >= 2 non-injected children, OR >= 2 root
+    // conversational messages (`id.is_some() && parent_id.is_none()`) appear in the same
+    // compaction epoch (e.g. a Turn-1 rewind).
     let mut child_counts: HashMap<usize, usize> = HashMap::new();
+    let mut epoch_root_conv_count = 0usize;
     let mut has_fork = false;
-    for m in facts {
-        if m.kind == MessageKind::InjectedContext || m.kind == MessageKind::CompactionSummary {
+    for m in &eligible {
+        if matches!(m.kind, MessageKind::CompactionBoundary | MessageKind::CompactionSummary) {
+            epoch_root_conv_count = 0;
+            continue;
+        }
+        if m.kind == MessageKind::InjectedContext {
             continue;
         }
         if let Some(pid) = m.parent_id.as_deref() {
@@ -666,30 +751,37 @@ fn slice_active_branch(facts: &[MsgFact]) -> Vec<&MsgFact> {
                     has_fork = true;
                 }
             }
+        } else if m.id.as_deref().is_some_and(|s| !s.is_empty()) {
+            epoch_root_conv_count += 1;
+            if epoch_root_conv_count >= 2 {
+                has_fork = true;
+            }
         }
     }
     if !has_fork {
-        return facts.iter().collect();
+        return eligible;
     }
 
     // Walk `parent_id` backwards from the last chain-participating message to mark the active spine.
-    let tip_idx = facts
+    let tip_idx = eligible
         .iter()
         .rposition(|m| m.parent_id.as_deref().is_some_and(|pid| id_to_idx.contains_key(pid)))
-        .or_else(|| facts.iter().rposition(|m| m.id.is_some()));
+        .or_else(|| eligible.iter().rposition(|m| m.id.is_some()));
 
     let Some(mut cur) = tip_idx else {
-        return facts.iter().collect();
+        return eligible;
     };
 
-    let mut on_spine = vec![false; facts.len()];
+    let mut on_spine = vec![false; eligible.len()];
     let mut visited = HashSet::new();
+    let mut first_spine_idx = cur;
     loop {
         if !visited.insert(cur) {
             break;
         }
         on_spine[cur] = true;
-        let Some(pid) = facts[cur].parent_id.as_deref() else {
+        first_spine_idx = first_spine_idx.min(cur);
+        let Some(pid) = eligible[cur].parent_id.as_deref() else {
             break;
         };
         let Some(&p_idx) = id_to_idx.get(pid) else {
@@ -698,15 +790,14 @@ fn slice_active_branch(facts: &[MsgFact]) -> Vec<&MsgFact> {
         cur = p_idx;
     }
 
-    facts
-        .iter()
+    eligible
+        .into_iter()
         .enumerate()
         .filter_map(|(idx, m)| {
             if on_spine[idx] {
                 return Some(m);
             }
-            // Retain leaf attachments / compaction summaries / unchained harness markers attached
-            // directly to an active-spine node.
+            // Retain leaf attachments / compaction summaries attached directly to an active-spine node.
             if matches!(m.kind, MessageKind::InjectedContext | MessageKind::CompactionSummary)
                 && m.parent_id
                     .as_deref()
@@ -715,7 +806,10 @@ fn slice_active_branch(facts: &[MsgFact]) -> Vec<&MsgFact> {
             {
                 return Some(m);
             }
-            if m.id.is_none() && m.parent_id.is_none() {
+            if m.id.is_none()
+                && m.parent_id.is_none()
+                && (m.kind == MessageKind::CompactionBoundary || idx >= first_spine_idx)
+            {
                 return Some(m);
             }
             None
@@ -1347,5 +1441,204 @@ mod tests {
         assert!(expected_overhead < 20_000);
         assert_eq!(aw.current_context_tokens, Some(21_400));
         assert_eq!(aw.token_burn_per_turn, 1_400);
+    }
+
+    #[test]
+    fn multi_session_fold_preserves_latest_window_readings_and_computes_median_overhead() {
+        let mut rep = Report::default();
+
+        // Session 1 (folded FIRST = newest session, as `cmd_doctor` sorts `Reverse(updated_at)`):
+        // first_prompt = 25_000, visible user prompt = 500 bytes (~167 tokens), current = 28_000.
+        {
+            let mut p1 = rep.session(None);
+            let mut u = Message::new(Role::User);
+            u.content.push(Block::Text {
+                text: "N".repeat(600).into(),
+            });
+            let mut a1 = Message::new(Role::Assistant);
+            a1.usage = Some(crate::ir::Usage {
+                input_tokens: Some(25_000),
+                ..Default::default()
+            });
+            a1.content.push(Block::Text { text: "ok".into() });
+            let mut u2 = Message::new(Role::User);
+            u2.content.push(Block::Text { text: "more".into() });
+            let mut a2 = Message::new(Role::Assistant);
+            a2.usage = Some(crate::ir::Usage {
+                input_tokens: Some(28_000),
+                ..Default::default()
+            });
+            a2.content.push(Block::Text { text: "done".into() });
+            for m in [u, a1, u2, a2] {
+                assert_eq!(p1.message(m), Flow::Continue);
+            }
+            p1.finish().unwrap();
+        }
+        let newest_visible = rep.active_window.reconstructed_visible_turn_tokens;
+        let newest_overhead = 25_000 - newest_visible;
+
+        // Session 2 (older): first_prompt = 15_000, current = 16_000.
+        {
+            let mut p2 = rep.session(None);
+            let mut u = Message::new(Role::User);
+            u.content.push(Block::Text { text: "hi".into() });
+            let mut a = Message::new(Role::Assistant);
+            a.usage = Some(crate::ir::Usage {
+                input_tokens: Some(15_000),
+                ..Default::default()
+            });
+            a.content.push(Block::Text { text: "ok".into() });
+            for m in [u, a] {
+                assert_eq!(p2.message(m), Flow::Continue);
+            }
+            p2.finish().unwrap();
+        }
+
+        // Session 3 (oldest): first_prompt = 19_000, current = 19_500.
+        {
+            let mut p3 = rep.session(None);
+            let mut u = Message::new(Role::User);
+            u.content.push(Block::Text { text: "hi".into() });
+            let mut a = Message::new(Role::Assistant);
+            a.usage = Some(crate::ir::Usage {
+                input_tokens: Some(19_000),
+                ..Default::default()
+            });
+            a.content.push(Block::Text { text: "ok".into() });
+            for m in [u, a] {
+                assert_eq!(p3.message(m), Flow::Continue);
+            }
+            p3.finish().unwrap();
+        }
+
+        let aw = &rep.active_window;
+        assert_eq!(
+            aw.first_prompt_tokens,
+            Some(25_000),
+            "newest session's first_prompt_tokens must not be overwritten by older sessions"
+        );
+        assert_eq!(aw.reconstructed_visible_turn_tokens, newest_visible);
+        assert_eq!(
+            aw.current_context_tokens,
+            Some(28_000),
+            "newest session's current_context_tokens must be preserved"
+        );
+        // Median of [newest_overhead (~24_800), ~14_999, ~18_999] is ~18_999 (Session 3's overhead).
+        let med = aw.system_and_tools_overhead.unwrap();
+        assert!(med > 18_000 && med < newest_overhead, "median={med}");
+    }
+
+    #[test]
+    fn streaming_multi_record_response_deduplicates_usage_key_in_burn_velocity() {
+        let mut rep = Report::default();
+        let mut pass = rep.session(None);
+
+        // Turn 1: User + 3 streaming Assistant records sharing `message.id = "msg_call_1"` (20_000 prompt tokens).
+        let mut u1 = Message::new(Role::User);
+        u1.content.push(Block::Text { text: "go".into() });
+
+        let streaming_chunk = |msg_id: &str, pt: u64, text: &str| {
+            let mut a = Message::new(Role::Assistant);
+            a.extra.insert("claude".into(), json!({"message.id": msg_id}));
+            a.usage = Some(crate::ir::Usage {
+                input_tokens: Some(pt),
+                ..Default::default()
+            });
+            a.content.push(Block::Text { text: text.into() });
+            a
+        };
+
+        let a1_part1 = streaming_chunk("msg_call_1", 20_000, "thinking...");
+        let a1_part2 = streaming_chunk("msg_call_1", 20_000, "calling tool...");
+        let a1_part3 = streaming_chunk("msg_call_1", 20_000, "done part 1");
+
+        // Turn 2: User + 3 streaming Assistant records sharing `message.id = "msg_call_2"` (23_000 prompt tokens).
+        let mut u2 = Message::new(Role::User);
+        u2.content.push(Block::Text { text: "next".into() });
+        let a2_part1 = streaming_chunk("msg_call_2", 23_000, "step 1");
+        let a2_part2 = streaming_chunk("msg_call_2", 23_000, "step 2");
+        let a2_part3 = streaming_chunk("msg_call_2", 23_000, "final");
+
+        for m in [u1, a1_part1, a1_part2, a1_part3, u2, a2_part1, a2_part2, a2_part3] {
+            assert_eq!(pass.message(m), Flow::Continue);
+        }
+        pass.finish().unwrap();
+
+        let aw = &rep.active_window;
+        assert_eq!(aw.turns, 2);
+        // 2 distinct model calls (`23_000 - 20_000 = 3_000` across `1` step), NOT `3_000 / 5 = 600`!
+        assert_eq!(aw.token_burn_per_turn, 3_000);
+    }
+
+    #[test]
+    fn active_branch_prunes_turn1_root_rewinds_inactive_branches_and_embedded_sidechains() {
+        let mut rep = Report::default();
+        let mut pass = rep.session(None);
+
+        // Abandoned Turn-1 root (`id = "root_old", parent_id = None`) carrying huge tool output.
+        let mut u_old = Message::new(Role::User);
+        u_old.id = Some("root_old".into());
+        u_old.content.push(Block::Text {
+            text: "wrong first question".into(),
+        });
+        let mut a_old = call("t_old", "Bash");
+        a_old.id = Some("a_old".into());
+        a_old.parent_id = Some("root_old".into());
+        let mut tr_old = result("t_old", &"Z".repeat(30_000));
+        tr_old.id = Some("tr_old".into());
+        tr_old.parent_id = Some("a_old".into());
+
+        // Rewound Turn-1 root (`id = "root_new", parent_id = None`) — clean active root!
+        let mut u_new = Message::new(Role::User);
+        u_new.id = Some("root_new".into());
+        u_new.content.push(Block::Text {
+            text: "clean rewound prompt".into(),
+        });
+        let mut a_new = Message::new(Role::Assistant);
+        a_new.id = Some("a_new".into());
+        a_new.parent_id = Some("root_new".into());
+        a_new.usage = Some(crate::ir::Usage {
+            input_tokens: Some(12_000),
+            ..Default::default()
+        });
+        a_new.content.push(Block::Text {
+            text: "clean answer".into(),
+        });
+
+        // Message marked `inactive_branch: true` under harness namespace (`openclaw`).
+        let mut inactive = result("t_inactive", &"I".repeat(20_000));
+        inactive.id = Some("m_inactive".into());
+        inactive.parent_id = Some("a_new".into());
+        inactive
+            .extra
+            .insert("openclaw".into(), json!({"inactive_branch": true}));
+
+        // Embedded `isSidechain: true` subagent record mixed into the main session with 999_999 usage.
+        let mut side = Message::new(Role::Assistant);
+        side.id = Some("sc_1".into());
+        side.parent_id = Some("a_new".into());
+        side.extra.insert("isSidechain".into(), Value::Bool(true));
+        side.usage = Some(crate::ir::Usage {
+            input_tokens: Some(999_999),
+            ..Default::default()
+        });
+        side.content.push(Block::Text {
+            text: "S".repeat(20_000).into(),
+        });
+
+        for m in [u_old, a_old, tr_old, u_new, a_new, inactive, side] {
+            assert_eq!(pass.message(m), Flow::Continue);
+        }
+        pass.finish().unwrap();
+
+        // Lifetime history includes everything stored in the file.
+        assert!(rep.tool_results > 10_000);
+        // Active window contains ONLY `[u_new, a_new]`!
+        let aw = &rep.active_window;
+        assert_eq!(aw.messages, 2);
+        assert_eq!(aw.turns, 1);
+        assert_eq!(aw.tool_results, 0);
+        assert_eq!(aw.current_context_tokens, Some(12_000));
+        assert_eq!(aw.peak_context_tokens, 12_000);
     }
 }

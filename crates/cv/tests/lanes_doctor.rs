@@ -598,3 +598,235 @@ fn multi_generation_lineage_edges_across_distill_adopt_rewind_splice_and_retire(
         "{lane_b}"
     );
 }
+
+#[test]
+fn frozen_lanes_resolves_state_tasks_with_zero_filesystem_mutations() {
+    let w = World::new("lanes-frozen-purity");
+    let sid = "frozensess01";
+    let now = now_rfc3339();
+
+    w.write_session(sid, &[user(sid, "u0", &now, "coordinate frozen check")]);
+    let export_cmd = "export CV_ENDPOINT=lane:frozen-worker && echo ok";
+    write_agent(
+        &w,
+        sid,
+        "fz1",
+        "frozen worker",
+        &[
+            user(sid, "f0", &now, "claim and pause"),
+            assistant_tool("f1", &now, "Bash", json!({"command": export_cmd})),
+            tool_result("f2", &now, "toolu_f1", "ok"),
+            assistant("f3", &now, "Done for now."),
+            subagent_stop("f4", &now),
+        ],
+    );
+
+    // Seed `state.db` (`lane_runs` via `cv hook lane` + `task_events` via `cv task open|claim`).
+    {
+        let payload = json!({
+            "hook_event_name": "SubagentStart",
+            "session_id": sid,
+            "agent_id": "agent-fz1",
+            "agent_type": "general-purpose",
+            "cwd": w.proj.display().to_string(),
+        });
+        let (ok, code, out, err) = w.cv_full(&["hook", "lane"], &[], Some(&payload.to_string()));
+        assert!(ok, "cv hook lane exited {code}: {out} {err}");
+    }
+    w.cv_ok(&["task", "open", "Frozen obligation", "--assignee", "lane:frozen-worker"]);
+    let (ls_out, _) = w.cv_ok(&["task", "ls", "--json"]);
+    let ls_rows: Vec<Value> = serde_json::from_str(&ls_out).unwrap();
+    let task_id = ls_rows[0]["id"].as_str().unwrap().to_string();
+    w.cv_ok(&["task", "claim", &task_id, "--from", "lane:frozen-worker"]);
+
+    // Checkpoint & truncate `state.db` so `-wal` and `-shm` are absent before `--frozen`.
+    {
+        let store = cv_core::state::StateStore::at_dir(&w.cv_home);
+        let conn = store.open_writable().unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+    }
+    assert!(
+        !w.cv_home.join("state.db-wal").exists() && !w.cv_home.join("state.db-shm").exists(),
+        "precondition: WAL/SHM sidecars absent after checkpoint+close"
+    );
+
+    fn snapshot_tree(root: &std::path::Path) -> Vec<(String, u64)> {
+        let mut entries = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            if let Ok(rd) = std::fs::read_dir(&dir) {
+                for entry in rd.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        stack.push(path);
+                    } else if let Ok(meta) = entry.metadata() {
+                        let rel = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().into_owned();
+                        entries.push((rel, meta.len()));
+                    }
+                }
+            }
+        }
+        entries.sort();
+        entries
+    }
+
+    let before = snapshot_tree(&w.cv_home);
+
+    let (lanes_out, _) = w.cv_ok(&["--frozen", "lanes", sid, "--json"]);
+    let rows: Vec<Value> = serde_json::from_str(&lanes_out).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["open_obligations"]["open_claimed_tasks"], 1, "{rows:?}");
+    assert_eq!(rows[0]["stranded"], true, "{rows:?}");
+
+    let (lanes_tasks_out, _) = w.cv_ok(&["--frozen", "lanes", sid, "--tasks", "--json"]);
+    let rows_tasks: Vec<Value> = serde_json::from_str(&lanes_tasks_out).unwrap();
+    assert_eq!(rows_tasks[0]["tasks"].as_array().unwrap().len(), 1, "{rows_tasks:?}");
+
+    let after = snapshot_tree(&w.cv_home);
+    assert!(
+        !w.cv_home.join("state.db-shm").exists() && !w.cv_home.join("state.db-wal").exists(),
+        "--frozen lanes must never create state.db-shm or state.db-wal"
+    );
+    assert_eq!(
+        before, after,
+        "--frozen lanes must not create or mutate any file in CLUSTERVISION_HOME"
+    );
+}
+
+#[test]
+fn hook_lane_exit_coalesces_with_append_stop_and_child_session_runs_bind() {
+    let w = World::new("lanes-hook-coalesce-and-child-sid");
+    let sid = "coalsess01";
+    let now = now_rfc3339();
+
+    w.write_session(sid, &[user(sid, "u0", &now, "spawn lanes")]);
+
+    // 1. Clean `SubagentStop` where `hook_lane` calls `record_lane_exit(..., Some("stopped"))`
+    //    followed by `append_lane_event(Stop)` on a non-report turn (ends in tool_result, 0 open
+    //    obligations): must coalesce into ONE `lane_runs` row, resolve `hook_ledger` (not
+    //    `process_exit`), and keep `stranded == false`!
+    write_agent(
+        &w,
+        sid,
+        "cleanhook",
+        "clean hook stop",
+        &[
+            user(sid, "c0", &now, "run check"),
+            assistant_tool("c1", &now, "Bash", json!({"command": "true"})),
+            tool_result("c2", &now, "toolu_c1", ""),
+        ],
+    );
+
+    // 2. Child run recorded under the child's own `session.id` (`format!("{sid}/agent-childsid")`,
+    //    `agent_id = None`) with a dead OS PID + bound `lane_endpoints`: must resolve both the
+    //    bound endpoint (`endpoint_source == "state"`) and immediate `process_exit`!
+    let mut short_proc = std::process::Command::new("/bin/sh")
+        .args(["-c", "exit 0"])
+        .spawn()
+        .unwrap();
+    let dead_pid = short_proc.id() as i64;
+    let dead_start = cv_core::state::tables::proc_start_time_of(dead_pid);
+    let _ = short_proc.wait();
+
+    write_agent(
+        &w,
+        sid,
+        "childsid",
+        "child-session-keyed run",
+        &[
+            user(sid, "s0", &now, "run"),
+            assistant_tool("s1", &now, "Bash", json!({"command": "echo hi"})),
+        ],
+    );
+
+    let store = cv_core::state::StateStore::at_dir(&w.cv_home);
+    let now_ms = chrono::Utc::now().timestamp_millis() + 2_000;
+    store
+        .record_lane_start(&cv_core::state::LaneRun {
+            run_id: "run-cleanhook-1".into(),
+            session_id: sid.into(),
+            agent_id: Some("cleanhook".into()),
+            agent_type: Some("general-purpose".into()),
+            harness: Some("claude".into()),
+            pid: None,
+            proc_start_time: None,
+            boot_id: None,
+            transcript_path: None,
+            agent_transcript_path: None,
+            cwd: None,
+            started_at: now_ms - 1_000,
+            exited_at: None,
+            exit_status: None,
+            last_text: None,
+        })
+        .unwrap();
+    store
+        .record_lane_exit("run-cleanhook-1", now_ms, Some("stopped"), Some("finished"))
+        .unwrap();
+    {
+        let payload = json!({
+            "hook_event_name": "SubagentStop",
+            "session_id": sid,
+            "agent_id": "cleanhook",
+            "agent_type": "general-purpose",
+            "last_assistant_message": "hook stop",
+            "cwd": w.proj.display().to_string(),
+        });
+        let (ok, code, out, err) = w.cv_full(&["hook", "lane"], &[], Some(&payload.to_string()));
+        assert!(ok, "cv hook lane exited {code}: {out} {err}");
+    }
+
+    let runs_for_parent = store.list_lane_runs_for_session(sid).unwrap();
+    let cleanhook_runs: Vec<_> = runs_for_parent
+        .iter()
+        .filter(|r| r.agent_id.as_deref() == Some("cleanhook"))
+        .collect();
+    assert_eq!(
+        cleanhook_runs.len(),
+        1,
+        "append_lane_event(Stop) must coalesce onto the run closed by record_lane_exit: {cleanhook_runs:?}"
+    );
+    assert_eq!(cleanhook_runs[0].exit_status.as_deref(), Some("hook_stop"));
+
+    // Record child-session-keyed run (`agent_id: None`, `session_id: "{sid}/agent-childsid"`).
+    let child_session_id = format!("{sid}/agent-childsid");
+    store
+        .record_lane_start(&cv_core::state::LaneRun {
+            run_id: "run-childsid-1".into(),
+            session_id: child_session_id,
+            agent_id: None,
+            agent_type: None,
+            harness: Some("claude".into()),
+            pid: Some(dead_pid),
+            proc_start_time: dead_start,
+            boot_id: cv_core::lanes::current_boot_id(),
+            transcript_path: None,
+            agent_transcript_path: None,
+            cwd: None,
+            started_at: now_ms - 500,
+            exited_at: None,
+            exit_status: None,
+            last_text: None,
+        })
+        .unwrap();
+    store.bind_lane_endpoint("run-childsid-1", "lane:child-bound").unwrap();
+
+    let (out_json, _) = w.cv_ok(&["lanes", sid, "--json"]);
+    let rows: Vec<Value> = serde_json::from_str(&out_json).unwrap();
+    let by_id = |id: &str| rows.iter().find(|r| r["agent_id"] == id).unwrap().clone();
+
+    let ch = by_id("cleanhook");
+    assert_eq!(ch["status"], "stopped", "{ch}");
+    assert_eq!(ch["status_source"], "hook_ledger", "{ch}");
+    assert_eq!(
+        ch["stranded"], false,
+        "clean hook_stop with zero open obligations must NOT be marked crashed/stranded: {ch}"
+    );
+
+    let cs = by_id("childsid");
+    assert_eq!(cs["endpoint"], "lane:child-bound", "{cs}");
+    assert_eq!(cs["endpoint_source"], "state", "{cs}");
+    assert_eq!(cs["status"], "stopped", "{cs}");
+    assert_eq!(cs["status_source"], "process_exit", "{cs}");
+    assert_eq!(cs["stranded"], true, "{cs}");
+}
