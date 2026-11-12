@@ -42,10 +42,12 @@ struct Ctx {
     /// The configured bind host, accepted in `Host`/`Origin` checks alongside the loopback names.
     bind_host: String,
     web_root: Option<PathBuf>,
-    /// When set, every `/api/*` request must carry `Authorization: Bearer <token>`.
+    /// When set, every `/api/*` request must carry `Authorization: Bearer <token>` (or `?token=`
+    /// on browser `EventSource` / download GETs that cannot attach custom headers).
     token: Option<String>,
     default_who: Option<String>,
     searcher: cv_search::Searcher,
+    stream: StreamHub,
 }
 
 /// Gatekeep the exposure, then serve until the process is killed: a non-loopback bind serves the
@@ -129,6 +131,7 @@ fn run(
         token,
         default_who: who,
         searcher: cv_search::Searcher::default(),
+        stream: StreamHub::new(),
     };
     crate::http::serve(listener, crate::http::Limits::default(), move |request| {
         handle(request, &ctx)
@@ -137,15 +140,17 @@ fn run(
 
 /// Handle one request: any error becomes a JSON error response.
 fn handle(request: &mut Request<'_>, ctx: &Ctx) {
+    let raw_host = header_value(request, "Host");
     // DNS-rebinding guard: a hostile page can point its own domain at 127.0.0.1 and fetch us
     // same-origin, but it can't forge the Host header — reject anything that isn't our own name.
-    if !host_allowed(header_value(request, "Host").as_deref(), &ctx.bind_host) {
+    if !host_allowed(raw_host.as_deref(), &ctx.bind_host) {
         request.respond(json_response(403, &json!({"error": "forbidden host"}), None, &[]));
         return;
     }
-    // Echoed on API responses only when the Origin is on the local allow-list; never `*`.
+    // Echoed on API responses only when the Origin is on the local allow-list (or same-origin on
+    // an explicit non-loopback bind); never `*`.
     let raw_origin = header_value(request, "Origin");
-    let origin = allowed_origin(raw_origin.as_deref(), &ctx.bind_host);
+    let origin = allowed_origin(raw_origin.as_deref(), raw_host.as_deref(), &ctx.bind_host);
 
     let method = request.method().to_string();
     let raw_url = request.url().to_string();
@@ -201,11 +206,16 @@ fn handle(request: &mut Request<'_>, ctx: &Ctx) {
         }
     }
 
+    let q = cv_core::api::Query::parse(query);
     if let Some(token) = &ctx.token {
-        let authed = header_value(request, "Authorization")
+        let header_ok = header_value(request, "Authorization")
             .and_then(|v| v.strip_prefix("Bearer ").map(str::to_string))
             .is_some_and(|t| token_matches(&t, token));
-        if !authed {
+        let query_ok = !post
+            && (parts.as_slice() == ["api", "stream"]
+                || matches!(parts.as_slice(), ["api", "session", _, _, "export"]))
+            && q.get("token").is_some_and(|t| token_matches(&t, token));
+        if !(header_ok || query_ok) {
             request.respond(json_response(
                 401,
                 &json!({"error": "missing or invalid bearer token"}),
@@ -274,9 +284,11 @@ fn handle(request: &mut Request<'_>, ctx: &Ctx) {
         }
     }
 
-    let q = cv_core::api::Query::parse(query);
     match serve_tasks::route(post, &parts, &q, &body, ctx.default_who.as_deref()) {
         Some(serve_tasks::Answer::Json(status, v)) => {
+            if post && status < 400 {
+                ctx.stream.bump(&["tasks"]);
+            }
             request.respond(json_response(
                 status,
                 &v,
@@ -299,6 +311,10 @@ fn handle(request: &mut Request<'_>, ctx: &Ctx) {
             ));
         }
         None => {
+            if parts.as_slice() == ["api", "stream"] {
+                serve_stream(request, &q, origin.as_deref(), &ctx.stream);
+                return;
+            }
             if let Some(result) = download_export(false, &parts, &q) {
                 match result {
                     Ok(download) => match download.body.reader() {
@@ -379,18 +395,21 @@ fn token_matches(presented: &str, token: &str) -> bool {
     std::hint::black_box(diff) == 0
 }
 
-/// The hostname part of a `Host` header or URL authority: strips a `:port`, unbrackets IPv6.
-fn host_name(authority: &str) -> Option<&str> {
-    fn valid_port(suffix: &str) -> bool {
-        suffix.is_empty()
-            || suffix.strip_prefix(':').is_some_and(|port| {
-                !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()) && port.parse::<u16>().is_ok()
-            })
+/// Parse a `Host` header or URL authority into `(unbracketed_host, effective_port)`.
+fn authority_host_port(authority: &str, default_port: u16) -> Option<(&str, u16)> {
+    fn parse_port(suffix: &str, default_port: u16) -> Option<u16> {
+        if suffix.is_empty() {
+            return Some(default_port);
+        }
+        let port = suffix.strip_prefix(':')?;
+        (!port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()))
+            .then(|| port.parse::<u16>().ok())
+            .flatten()
     }
     if let Some(rest) = authority.strip_prefix('[') {
         let (name, suffix) = rest.split_once(']')?;
         name.parse::<std::net::Ipv6Addr>().ok()?;
-        return valid_port(suffix).then_some(name);
+        return Some((name, parse_port(suffix, default_port)?));
     }
     let (name, suffix) = authority
         .find(':')
@@ -399,14 +418,22 @@ fn host_name(authority: &str) -> Option<&str> {
     (!name.is_empty()
         && name
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b".-".contains(&byte))
-        && valid_port(suffix))
-    .then_some(name)
+            .all(|byte| byte.is_ascii_alphanumeric() || b".-".contains(&byte)))
+    .then(|| Some((name, parse_port(suffix, default_port)?)))
+    .flatten()
+}
+
+/// The hostname part of a `Host` header or URL authority: strips a `:port`, unbrackets IPv6.
+fn host_name(authority: &str) -> Option<&str> {
+    authority_host_port(authority, 80).map(|(name, _)| name)
 }
 
 /// A name this server answers to: the loopback names, or the configured bind host.
 fn is_local_name(name: &str, bind_host: &str) -> bool {
-    name == "127.0.0.1" || name == "::1" || name.eq_ignore_ascii_case("localhost") || name == bind_host
+    name == "127.0.0.1"
+        || name == "::1"
+        || name.eq_ignore_ascii_case("localhost")
+        || name.eq_ignore_ascii_case(bind_host.trim_matches(['[', ']']))
 }
 
 /// Whether a configured bind host is a loopback name/address.
@@ -431,15 +458,36 @@ fn host_allowed(host_header: Option<&str>, bind_host: &str) -> bool {
 }
 
 /// The specific `Origin` to echo in `Access-Control-Allow-Origin`, if it's on the allow-list:
-/// the Tauri app's origins, or an http(s) origin on a local name (any port — a dev dashboard on
-/// e.g. `http://localhost:5173` is same-machine).
-fn allowed_origin(origin: Option<&str>, bind_host: &str) -> Option<String> {
+/// the Tauri app's origins, an http(s) origin on a local name (any port — a dev dashboard on
+/// e.g. `http://localhost:5173` is same-machine), or — when explicitly bound to a non-loopback
+/// interface (`0.0.0.0`, `::`, LAN IP) — a same-origin request whose `Origin` host+port matches
+/// the validated `Host` header.
+fn allowed_origin(origin: Option<&str>, host_header: Option<&str>, bind_host: &str) -> Option<String> {
     let o = origin?;
-    if o == "tauri://localhost" || o == "http://tauri.localhost" {
+    if matches!(
+        o,
+        "tauri://localhost" | "http://tauri.localhost" | "https://tauri.localhost"
+    ) {
         return Some(o.to_string());
     }
-    let authority = o.strip_prefix("http://").or_else(|| o.strip_prefix("https://"))?;
-    is_local_name(host_name(authority)?, bind_host).then(|| o.to_string())
+    let (default_port, authority) = if let Some(rest) = o.strip_prefix("http://") {
+        (80u16, rest)
+    } else if let Some(rest) = o.strip_prefix("https://") {
+        (443u16, rest)
+    } else {
+        return None;
+    };
+    let (origin_host, origin_port) = authority_host_port(authority, default_port)?;
+    if is_local_name(origin_host, bind_host) {
+        return Some(o.to_string());
+    }
+    if !is_loopback_host(bind_host) {
+        let (req_host, req_port) = authority_host_port(host_header?, default_port)?;
+        if origin_host.eq_ignore_ascii_case(req_host) && origin_port == req_port {
+            return Some(o.to_string());
+        }
+    }
+    None
 }
 
 /// A reply: status, JSON body, and any response headers beyond the standard set. Only `/api/search`
@@ -454,6 +502,10 @@ cv_core::routes! {
         GET ["api", "search"] => search(params, searcher),
         GET ["api", "stats"] => {
             let (status, body) = stats(params);
+            (status, body, Vec::new())
+        },
+        GET ["api", "stream"] => {
+            let (status, body) = err(500, "stream is handled before buffered routing");
             (status, body, Vec::new())
         },
         // Every other noun is the one read API every door maps onto.
@@ -842,8 +894,8 @@ fn no_content(origin: Option<&str>) -> Response<'static> {
 
 /// Response headers a cross-origin caller is allowed to READ. A browser hides every non-safelisted
 /// response header from `fetch` unless it is named here, so `/api/search`'s "this answer is
-/// degraded" signal would be invisible to a dashboard on a dev server without it.
-const EXPOSED_HEADERS: &str = "X-Cv-Search-Source, X-Cv-Search-Note, Content-Disposition";
+/// degraded" signal and hit count would be invisible to a dashboard on a dev server without it.
+const EXPOSED_HEADERS: &str = "X-Cv-Search-Source, X-Cv-Search-Note, X-Cv-Search-Total, Content-Disposition";
 
 /// CORS headers echoing the one allowed `origin` — an unlisted origin gets none (the browser then
 /// refuses to share the response with it). `Vary: Origin` keeps caches from mixing the two.
@@ -855,6 +907,308 @@ fn cors_headers(response: &mut Response<'_>, origin: Option<&str>) {
         response.add_header("Access-Control-Allow-Headers", "Authorization, Content-Type");
         response.add_header("Access-Control-Expose-Headers", EXPOSED_HEADERS);
     }
+}
+
+// --- live SSE change stream (`/api/stream`) --------------------------------
+
+const MAX_SSE_FOLLOWERS: usize = 16;
+const SSE_STEP: std::time::Duration = std::time::Duration::from_millis(250);
+const SSE_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(15);
+const SESSION_SCAN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1500);
+
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+struct FileStamp {
+    present: bool,
+    len: u64,
+    modified_ns: u128,
+}
+
+fn file_stamp(path: &Path) -> FileStamp {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return FileStamp::default();
+    };
+    let modified_ns = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_nanos());
+    FileStamp {
+        present: true,
+        len: meta.len(),
+        modified_ns,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct DiskStamp {
+    tasks_log: FileStamp,
+    catalog: (FileStamp, FileStamp),
+    watch: (FileStamp, FileStamp),
+    sessions_digest: u64,
+}
+
+impl DiskStamp {
+    fn capture(cached_sessions_digest: Option<u64>) -> Self {
+        let cv_home = cv_core::env::var_os("CLUSTERVISION_HOME")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| cv_core::env::home_dir().map(|h| h.join(".clustervision")));
+        let tasks_log = cv_home
+            .as_deref()
+            .map(|h| file_stamp(&h.join("tasks").join("events.jsonl")))
+            .unwrap_or_default();
+        let watch = cv_home
+            .as_deref()
+            .map(|h| (file_stamp(&h.join("watches.json")), file_stamp(&h.join("watch"))))
+            .unwrap_or_default();
+        let catalog = cv_core::env::cv_cache()
+            .map(|c| (file_stamp(&c.join("catalog.db")), file_stamp(&c.join("catalog.db-wal"))))
+            .unwrap_or_default();
+        let sessions_digest = cached_sessions_digest.unwrap_or_else(sessions_fingerprint);
+        Self {
+            tasks_log,
+            catalog,
+            watch,
+            sessions_digest,
+        }
+    }
+}
+
+fn sessions_fingerprint() -> u64 {
+    use std::hash::{Hash, Hasher};
+    let refs = cv_core::sessions();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    refs.len().hash(&mut hasher);
+    for r in &refs {
+        r.id.hash(&mut hasher);
+        r.message_count.hash(&mut hasher);
+        if let Some(ts) = r.updated_at {
+            ts.timestamp_millis().hash(&mut hasher);
+        }
+    }
+    hasher.finish()
+}
+
+struct StreamState {
+    cursor: u64,
+    stamp: DiskStamp,
+    last_kinds: Vec<&'static str>,
+    last_session_scan: std::time::Instant,
+}
+
+struct StreamHub {
+    state: std::sync::Mutex<StreamState>,
+    wake: std::sync::Condvar,
+    followers: std::sync::atomic::AtomicUsize,
+}
+
+struct FollowerSlot<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl<'a> FollowerSlot<'a> {
+    fn acquire(counter: &'a std::sync::atomic::AtomicUsize) -> Option<Self> {
+        use std::sync::atomic::Ordering;
+        let mut cur = counter.load(Ordering::Acquire);
+        loop {
+            if cur >= MAX_SSE_FOLLOWERS {
+                return None;
+            }
+            match counter.compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return Some(Self(counter)),
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+}
+
+impl Drop for FollowerSlot<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+impl StreamHub {
+    fn new() -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            state: std::sync::Mutex::new(StreamState {
+                cursor: 1,
+                stamp: DiskStamp::capture(None),
+                last_kinds: vec!["ready"],
+                last_session_scan: now,
+            }),
+            wake: std::sync::Condvar::new(),
+            followers: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn bump(&self, kinds: &[&'static str]) {
+        let fresh_tasks = cv_core::env::var_os("CLUSTERVISION_HOME")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| cv_core::env::home_dir().map(|h| h.join(".clustervision")))
+            .map(|h| file_stamp(&h.join("tasks").join("events.jsonl")))
+            .unwrap_or_default();
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        guard.stamp.tasks_log = fresh_tasks;
+        guard.cursor += 1;
+        guard.last_kinds = kinds.to_vec();
+        drop(guard);
+        self.wake.notify_all();
+    }
+
+    fn refresh(&self) -> (u64, Vec<&'static str>) {
+        let now = std::time::Instant::now();
+        let cached_sessions = {
+            let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if now.duration_since(guard.last_session_scan) >= SESSION_SCAN_INTERVAL {
+                guard.last_session_scan = now;
+                None
+            } else {
+                Some(guard.stamp.sessions_digest)
+            }
+        };
+        let next = DiskStamp::capture(cached_sessions);
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut kinds = Vec::new();
+        if next.tasks_log != guard.stamp.tasks_log {
+            guard.stamp.tasks_log = next.tasks_log;
+            kinds.push("tasks");
+        }
+        let sessions_changed = next.catalog != guard.stamp.catalog
+            || (cached_sessions.is_none() && next.sessions_digest != guard.stamp.sessions_digest);
+        if sessions_changed {
+            guard.stamp.catalog = next.catalog;
+            if cached_sessions.is_none() {
+                guard.stamp.sessions_digest = next.sessions_digest;
+            }
+            kinds.push("sessions");
+        }
+        if next.watch != guard.stamp.watch {
+            guard.stamp.watch = next.watch;
+            kinds.push("watch");
+        }
+        if !kinds.is_empty() {
+            guard.cursor += 1;
+            guard.last_kinds = kinds;
+            let out = (guard.cursor, guard.last_kinds.clone());
+            drop(guard);
+            self.wake.notify_all();
+            return out;
+        }
+        (guard.cursor, guard.last_kinds.clone())
+    }
+
+    fn wait_after(&self, seen: u64, step: std::time::Duration) -> (u64, Vec<&'static str>) {
+        {
+            let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if guard.cursor > seen {
+                return (guard.cursor, guard.last_kinds.clone());
+            }
+            let (guard, _) = self.wake.wait_timeout(guard, step).unwrap_or_else(|e| e.into_inner());
+            if guard.cursor > seen {
+                return (guard.cursor, guard.last_kinds.clone());
+            }
+        }
+        self.refresh()
+    }
+}
+
+fn serve_stream(request: &mut Request<'_>, q: &Query, origin: Option<&str>, hub: &StreamHub) {
+    let last_event_id = header_value(request, "Last-Event-ID");
+    let after = q
+        .get("after")
+        .and_then(|s| s.parse::<u64>().ok())
+        .or_else(|| last_event_id.as_deref().and_then(|s| s.trim().parse::<u64>().ok()));
+    let max_events = q.get("max_events").and_then(|s| s.parse::<usize>().ok());
+    let wait_limit = q
+        .get("wait_ms")
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(std::time::Duration::from_millis);
+    let live = q.flag("follow")
+        || last_event_id.is_some()
+        || header_value(request, "Accept").is_some_and(|a| a.to_ascii_lowercase().contains("text/event-stream"));
+
+    let _slot = if live {
+        match FollowerSlot::acquire(&hub.followers) {
+            Some(slot) => Some(slot),
+            None => {
+                request.respond(json_response(
+                    503,
+                    &json!({"error": "too many active event streams"}),
+                    origin,
+                    &[],
+                ));
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
+    let mut resp = Response::sse(|sse| {
+        let (cur, kinds) = hub.refresh();
+        let mut seen = cur;
+        let mut emitted = 0usize;
+        match after {
+            None => {
+                let payload = json!({"cursor": cur, "kinds": ["ready"]}).to_string();
+                sse.event(Some(&cur.to_string()), Some("change"), &payload)?;
+                if !live || max_events == Some(0) {
+                    return Ok(());
+                }
+            }
+            Some(prev) if cur > prev => {
+                let payload = json!({"cursor": cur, "kinds": kinds}).to_string();
+                sse.event(Some(&cur.to_string()), Some("change"), &payload)?;
+                emitted += 1;
+                if !live || max_events.is_some_and(|m| emitted >= m) {
+                    return Ok(());
+                }
+            }
+            Some(_) if !live => {
+                sse.comment(&format!("cursor {cur}"))?;
+                return Ok(());
+            }
+            Some(_) => {}
+        }
+
+        let started = std::time::Instant::now();
+        let mut last_write = started;
+        loop {
+            if sse.peer_closed() {
+                break;
+            }
+            let step = match wait_limit {
+                Some(limit) => {
+                    let Some(rem) = limit.checked_sub(started.elapsed()) else {
+                        break;
+                    };
+                    if rem.is_zero() {
+                        break;
+                    }
+                    rem.min(SSE_STEP)
+                }
+                None => SSE_STEP,
+            };
+            let (next_cur, next_kinds) = hub.wait_after(seen, step);
+            if next_cur > seen {
+                seen = next_cur;
+                let payload = json!({"cursor": seen, "kinds": next_kinds}).to_string();
+                sse.event(Some(&seen.to_string()), Some("change"), &payload)?;
+                last_write = std::time::Instant::now();
+                emitted += 1;
+                if max_events.is_some_and(|m| emitted >= m) {
+                    break;
+                }
+            } else if last_write.elapsed() >= SSE_KEEPALIVE {
+                sse.comment("keepalive")?;
+                last_write = std::time::Instant::now();
+            }
+        }
+        Ok(())
+    });
+    cors_headers(&mut resp, origin);
+    request.respond(resp);
 }
 
 #[cfg(test)]

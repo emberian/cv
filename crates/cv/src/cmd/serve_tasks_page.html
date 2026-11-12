@@ -124,6 +124,7 @@
     <button data-pane="closed">Closed<span class="n" id="n-closed"></span></button>
     <span class="spacer"></span>
     <input class="filter" id="filter" placeholder="filter  /" aria-label="filter">
+    <button id="tokenbtn" title="bearer token" hidden>🔑</button>
     <button id="refresh" title="reload (r)">↻</button>
     <button id="helpbtn" title="keys (?)">?</button>
   </div>
@@ -137,7 +138,8 @@
   const S = {
     who: '', pane: 'decisions', page: null, lanes: null, backlog: null, events: null,
     requests: {}, eventsError: null, busy: false, expanded: {}, sel: 0, filter: '', lanesSession: '', help: false,
-    backlogRepo: '', backlogState: '', backlogAll: false, eventsMine: false, drafts: {}, discussOpen: {}, doneOpen: {}
+    backlogRepo: '', backlogState: '', backlogAll: false, eventsMine: false, drafts: {}, discussOpen: {}, doneOpen: {},
+    token: '', authNeeded: false, cursor: 0, streamLive: false
   };
   const $ = (s) => document.querySelector(s);
   const el = (tag, attrs, children) => {
@@ -174,8 +176,27 @@
   };
 
   // ---------- params / persistence ----------
+  function saveToken(tok) {
+    S.token = (tok || '').trim();
+    try {
+      if (S.token) sessionStorage.setItem('cv.token', S.token);
+      else sessionStorage.removeItem('cv.token');
+    } catch (e) {}
+  }
+  function authHeaders(extra) {
+    const h = extra ? Object.assign({}, extra) : {};
+    if (S.token) h['Authorization'] = 'Bearer ' + S.token;
+    return h;
+  }
   function params() {
     const p = new URLSearchParams(location.search);
+    const hp = new URLSearchParams((location.hash || '').replace(/^#/, ''));
+    const urlTok = hp.get('token') || p.get('token');
+    if (urlTok) {
+      saveToken(urlTok);
+    } else {
+      try { S.token = sessionStorage.getItem('cv.token') || ''; } catch (e) {}
+    }
     S.who = p.get('who') || localStorage.getItem('cv.who') || '';
     S.pane = p.get('pane') || localStorage.getItem('cv.pane') || 'decisions';
     S.lanesSession = p.get('lanes') || localStorage.getItem('cv.lanes') || '';
@@ -184,13 +205,19 @@
   function persist() {
     try { localStorage.setItem('cv.who', S.who); localStorage.setItem('cv.pane', S.pane); localStorage.setItem('cv.lanes', S.lanesSession); } catch (e) {}
     const p = new URLSearchParams(location.search);
+    p.delete('token');
     if (S.who) p.set('who', S.who); p.set('pane', S.pane); if (S.lanesSession) p.set('lanes', S.lanesSession);
-    history.replaceState(null, '', '?' + p.toString());
+    const hp = new URLSearchParams((location.hash || '').replace(/^#/, ''));
+    hp.delete('token');
+    const hashStr = hp.toString();
+    history.replaceState(null, '', '?' + p.toString() + (hashStr ? '#' + hashStr : ''));
   }
 
   // ---------- loading ----------
   async function jget(url) {
-    const response = await fetch(url, { cache: 'no-store' });
+    const response = await fetch(url, { cache: 'no-store', headers: authHeaders() });
+    if (response.status === 401) S.authNeeded = true;
+    else if (response.ok) S.authNeeded = false;
     const body = await response.json();
     if (!response.ok || body.error) throw new Error(body.error || 'cv serve ' + response.status);
     return body;
@@ -231,7 +258,9 @@
   function loadEvents() {
     const q = new URLSearchParams(); q.set('since', '48h'); if (S.eventsMine && S.who) q.set('by', S.who);
     const token = S.requests.events = (S.requests.events || 0) + 1;
-    return fetch('/api/events?' + q.toString(), { cache: 'no-store' }).then(async (response) => {
+    return fetch('/api/events?' + q.toString(), { cache: 'no-store', headers: authHeaders() }).then(async (response) => {
+      if (response.status === 401) S.authNeeded = true;
+      else if (response.ok) S.authNeeded = false;
       if (!response.ok) throw new Error('cv serve ' + response.status);
       const text = await response.text();
       const rows = text.split('\n').filter(Boolean).map((line) => JSON.parse(line)).reverse();
@@ -261,6 +290,8 @@
     } else { $('#counter').textContent = p && p.error ? p.error : 'loading…'; ['n-decisions', 'n-actions', 'n-closed'].forEach((id) => $('#' + id).textContent = ''); }
     $('#n-lanes').textContent = S.lanes && !S.lanes.error && S.lanes.counts ? ' ' + S.lanes.counts.running + '/' + S.lanes.counts.total : '';
     $('#n-backlog').textContent = S.backlog && !S.backlog.error ? ' ' + S.backlog.count : '';
+    const tb = $('#tokenbtn');
+    if (tb) { tb.hidden = !(S.authNeeded || S.token); tb.classList.toggle('on', Boolean(S.authNeeded)); }
     document.querySelectorAll('#tabs button[data-pane]').forEach((b) => b.classList.toggle('on', b.getAttribute('data-pane') === S.pane));
   }
 
@@ -279,6 +310,7 @@
   function render() {
     counters();
     const main = $('#main'); main.textContent = '';
+    if (S.authNeeded) { renderAuthPrompt(main); return; }
     const items = visibleItems();
     if (S.sel >= items.length) S.sel = Math.max(0, items.length - 1);
     if (S.pane === 'decisions' || S.pane === 'actions' || S.pane === 'closed') {
@@ -406,9 +438,10 @@
     if (S.busy) return;
     S.busy = true; body.who = S.who;
     document.querySelectorAll('.btn').forEach((b) => { b.disabled = true; });
-    fetch('/api/task/' + encodeURIComponent(i.id) + '/' + verb, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
-      .then((r) => r.json()).then((res) => {
+    fetch('/api/task/' + encodeURIComponent(i.id) + '/' + verb, { method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify(body) })
+      .then((r) => { if (r.status === 401) S.authNeeded = true; return r.json(); }).then((res) => {
         S.busy = false;
+        if (S.authNeeded) { render(); return; }
         if (!res.error) { delete S.drafts[(verb === 'note' ? 'note-' : verb + '-') + i.id]; S.discussOpen[i.id] = false; S.doneOpen[i.id] = false; }
         if (res.error) { const e = document.getElementById('err-' + i.id); if (e) e.textContent = res.error; document.querySelectorAll('.btn').forEach((b) => { b.disabled = false; }); return; }
         toast(verb + ' ✓ ' + (res.task_state || ''));
@@ -419,6 +452,30 @@
   function renderLoadError(main, message) {
     main.appendChild(el('div', { class: 'err', role: 'alert', text: message }));
     main.appendChild(el('button', { text: 'Retry loading', onclick: load }));
+  }
+
+  function renderAuthPrompt(main) {
+    const inp = el('input', {
+      class: 'filter mono', id: 'auth-token', type: 'password', value: S.token,
+      placeholder: 'cv serve --token value', 'aria-label': 'bearer token',
+      onkeydown: (ev) => { if (ev.key === 'Enter') submit(); }
+    });
+    const submit = () => {
+      saveToken(inp.value);
+      S.authNeeded = false;
+      connectStream();
+      load();
+    };
+    main.appendChild(el('div', { class: 'card' }, [
+      el('p', { class: 'title', text: 'Bearer token required' }),
+      el('p', { class: 'body', text: 'This server requires Authorization: Bearer <token>. Stored in sessionStorage for this tab only.' }),
+      el('div', { class: 'notebox' }, [
+        inp,
+        el('button', { class: 'btn primary', text: 'Unlock', onclick: submit }),
+        S.token ? el('button', { class: 'btn quiet', text: 'Clear', onclick: () => { saveToken(''); inp.value = ''; } }) : null
+      ])
+    ]));
+    setTimeout(() => inp.focus(), 0);
   }
 
   // ---------- lanes ----------
@@ -587,14 +644,51 @@
     }
   });
 
+  let es = null;
+  let streamRetryT = null;
+  function connectStream() {
+    clearTimeout(streamRetryT);
+    if (es) { try { es.close(); } catch (e) {} es = null; }
+    S.streamLive = false;
+    if (typeof EventSource === 'undefined' || S.authNeeded) return;
+    const q = new URLSearchParams();
+    if (S.cursor) q.set('after', String(S.cursor));
+    if (S.token) q.set('token', S.token);
+    const qs = q.toString();
+    try {
+      es = new EventSource('/api/stream' + (qs ? '?' + qs : ''));
+      es.addEventListener('change', (ev) => {
+        S.streamLive = true;
+        let next = 0;
+        try { next = JSON.parse(ev.data).cursor || parseInt(ev.lastEventId, 10) || 0; } catch (e) {}
+        const had = S.cursor;
+        if (next > S.cursor) S.cursor = next;
+        if (had && next > had && !S.busy) {
+          const active = document.activeElement;
+          if (!active || !active.matches || !active.matches('textarea, input')) load();
+        }
+      });
+      es.onerror = () => {
+        S.streamLive = false;
+        if (es) { try { es.close(); } catch (e) {} es = null; }
+        clearTimeout(streamRetryT);
+        if (!S.authNeeded) streamRetryT = setTimeout(connectStream, 5000);
+      };
+    } catch (e) {
+      S.streamLive = false;
+    }
+  }
+
   function setPane(p) { S.pane = p; S.sel = 0; persist(); load(); }
   document.querySelectorAll('#tabs button[data-pane]').forEach((b) => b.addEventListener('click', () => setPane(b.getAttribute('data-pane'))));
+  $('#tokenbtn').addEventListener('click', () => { S.authNeeded = !S.authNeeded; render(); });
   $('#refresh').addEventListener('click', load);
   $('#helpbtn').addEventListener('click', () => { S.help = !S.help; renderHelp(); });
   $('#filter').addEventListener('input', (ev) => { S.filter = ev.target.value; S.sel = 0; render(); });
   $('#who').addEventListener('change', () => { S.who = $('#who').value.trim(); persist(); load(); });
-  params(); persist(); load();
-  setInterval(() => { if (!S.busy && document.visibilityState === 'visible' && !document.activeElement.matches('textarea, input')) load(); }, 30000);
+  params(); persist();
+  load().then(() => { if (!S.authNeeded) connectStream(); });
+  setInterval(() => { if (!S.busy && !S.streamLive && document.visibilityState === 'visible' && !document.activeElement.matches('textarea, input')) load(); }, 30000);
 })();
 </script>
 </body>
