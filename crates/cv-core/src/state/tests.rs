@@ -36,27 +36,69 @@ fn schema_migrations_are_forward_only_and_independent_of_source_version() {
     assert_eq!(r1.local_commit_pos, 1);
     assert!(!r1.replayed);
 
-    // Forward migration v1 -> v2 preserves every existing authoritative row.
+    // Verify genuine v1 -> v2 migration preserves every v1 row and adds all v2 hub tables.
+    let v1_dir = tmp_state_dir("migrate-v1-to-v2");
+    {
+        let mut raw_conn = rusqlite::Connection::open(v1_dir.join("state.db")).unwrap();
+        apply_migrations_with(&mut raw_conn, 1, &schema::MIGRATIONS[..1]).unwrap();
+        assert_eq!(current_schema_version(&raw_conn).unwrap(), 1);
+        raw_conn
+            .execute(
+                "INSERT INTO producers(producer_id, host_label, metadata_json, enrolled_at, updated_at)
+                 VALUES ('legacy-v1-prod', 'v1-host', '{}', 100, 100)",
+                [],
+            )
+            .unwrap();
+    }
+    let v1_migrated = StateStore::at_dir(&v1_dir);
+    {
+        let conn = v1_migrated.open_writable().unwrap();
+        assert_eq!(current_schema_version(&conn).unwrap(), STATE_SCHEMA_VERSION);
+        let hub_tables: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name LIKE 'hub_%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hub_tables, 6, "expected 6 v2 hub_* tables");
+    }
+    assert_eq!(
+        v1_migrated.get_producer("legacy-v1-prod").unwrap().unwrap().host_label,
+        "v1-host"
+    );
+    std::fs::remove_dir_all(&v1_dir).ok();
+
+    // Forward migration to STATE_SCHEMA_VERSION + 1 preserves every existing authoritative row.
+    let next_ver = STATE_SCHEMA_VERSION + 1;
     let mut extended = schema::MIGRATIONS.to_vec();
     extended.push((
-        2,
-        "v2_test_extension",
-        "CREATE TABLE IF NOT EXISTS custom_v2_notes (note_id TEXT PRIMARY KEY, body TEXT NOT NULL);",
+        next_ver,
+        "v_next_test_extension",
+        "CREATE TABLE IF NOT EXISTS custom_next_notes (note_id TEXT PRIMARY KEY, body TEXT NOT NULL);",
     ));
     {
         let mut conn = store.open_writable().unwrap();
-        apply_migrations_with(&mut conn, 2, &extended).unwrap();
-        assert_eq!(current_schema_version(&conn).unwrap(), 2);
+        apply_migrations_with(&mut conn, next_ver, &extended).unwrap();
+        assert_eq!(current_schema_version(&conn).unwrap(), next_ver);
     }
 
-    // Opening a v2 store with a v1 binary (`STATE_SCHEMA_VERSION == 1`) fails closed without dropping data.
+    // Opening a newer-schema store fails closed without dropping data.
     let err = store.open_writable().unwrap_err();
     assert!(
-        matches!(err, StateError::NewerSchema { found: 2, supported: 1 }),
+        matches!(
+            err,
+            StateError::NewerSchema { found, supported }
+                if found == next_ver && supported == STATE_SCHEMA_VERSION
+        ),
         "unexpected error: {err:?}"
     );
     let ro_err = store.open_readonly().unwrap_err();
-    assert!(matches!(ro_err, StateError::NewerSchema { found: 2, supported: 1 }));
+    assert!(matches!(
+        ro_err,
+        StateError::NewerSchema { found, supported }
+            if found == next_ver && supported == STATE_SCHEMA_VERSION
+    ));
 
     // Resetting `user_version` back to 1 confirms nothing was dropped or corrupted.
     {

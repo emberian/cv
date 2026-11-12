@@ -11,10 +11,13 @@ use super::StateError;
 use rusqlite::Connection;
 
 /// Current authoritative `state.db` schema version.
-pub const STATE_SCHEMA_VERSION: i64 = 1;
+pub const STATE_SCHEMA_VERSION: i64 = 2;
 
 /// Ordered forward migrations `(target_version, name, ddl)`.
-pub const MIGRATIONS: &[(i64, &str, &str)] = &[(1, "v1_authoritative_state_spine", MIGRATION_V1)];
+pub const MIGRATIONS: &[(i64, &str, &str)] = &[
+    (1, "v1_authoritative_state_spine", MIGRATION_V1),
+    (2, "v2_fleet_hub", MIGRATION_V2),
+];
 
 const MIGRATION_V1: &str = r#"
 CREATE TABLE IF NOT EXISTS producers (
@@ -196,6 +199,94 @@ CREATE INDEX IF NOT EXISTS idx_lineage_src
     ON lineage_edges(src_session_id);
 CREATE INDEX IF NOT EXISTS idx_lineage_dst
     ON lineage_edges(dst_session_id);
+"#;
+
+const MIGRATION_V2: &str = r#"
+CREATE TABLE IF NOT EXISTS hub_packs (
+    pack_id            TEXT PRIMARY KEY,
+    producer_id        TEXT,
+    byte_len           INTEGER NOT NULL CHECK (byte_len >= 0),
+    total_decoded_len  INTEGER NOT NULL CHECK (total_decoded_len >= 0),
+    frame_count        INTEGER NOT NULL CHECK (frame_count >= 0),
+    record_count       INTEGER NOT NULL CHECK (record_count >= 0),
+    blake3_digest      TEXT NOT NULL,
+    idx_blake3_digest  TEXT NOT NULL,
+    pack_rel_path      TEXT NOT NULL,
+    idx_rel_path       TEXT NOT NULL,
+    manifest_json      TEXT NOT NULL,
+    received_at        INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS hub_ingested_events (
+    ingest_seq        INTEGER PRIMARY KEY AUTOINCREMENT,
+    producer_id       TEXT NOT NULL,
+    epoch             TEXT NOT NULL,
+    seq               INTEGER NOT NULL CHECK (seq >= 1),
+    op_id             TEXT NOT NULL,
+    event_digest      TEXT NOT NULL,
+    envelope_json     TEXT NOT NULL,
+    payload_addr_json TEXT,
+    ingested_at       INTEGER NOT NULL,
+    UNIQUE(producer_id, epoch, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_hub_ingested_origin_seq
+    ON hub_ingested_events(producer_id, epoch, seq);
+
+CREATE TABLE IF NOT EXISTS hub_quarantine (
+    quarantine_id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    producer_id            TEXT NOT NULL,
+    epoch                  TEXT NOT NULL,
+    seq                    INTEGER NOT NULL CHECK (seq >= 1),
+    op_id                  TEXT NOT NULL,
+    existing_digest        TEXT NOT NULL,
+    conflicting_digest     TEXT NOT NULL,
+    conflicting_envelope   TEXT NOT NULL,
+    conflicting_payload    TEXT,
+    quarantined_at         INTEGER NOT NULL,
+    UNIQUE(producer_id, epoch, seq, conflicting_digest)
+);
+CREATE INDEX IF NOT EXISTS idx_hub_quarantine_origin_seq
+    ON hub_quarantine(producer_id, epoch, seq);
+
+CREATE TABLE IF NOT EXISTS hub_frontiers (
+    producer_id        TEXT NOT NULL,
+    epoch              TEXT NOT NULL,
+    contiguous_seq     INTEGER NOT NULL CHECK (contiguous_seq >= 0),
+    max_received_seq   INTEGER NOT NULL CHECK (max_received_seq >= 0),
+    buffered_count     INTEGER NOT NULL CHECK (buffered_count >= 0),
+    first_conflict_seq INTEGER,
+    updated_at         INTEGER NOT NULL,
+    PRIMARY KEY(producer_id, epoch)
+);
+
+CREATE TABLE IF NOT EXISTS hub_sessions (
+    producer_id       TEXT NOT NULL,
+    session_id        TEXT NOT NULL,
+    harness           TEXT NOT NULL,
+    revision          TEXT NOT NULL,
+    title             TEXT,
+    cwd               TEXT,
+    model             TEXT,
+    created_at        TEXT,
+    updated_at        TEXT,
+    message_count     INTEGER NOT NULL DEFAULT 0,
+    epoch             TEXT NOT NULL,
+    event_seq         INTEGER NOT NULL,
+    payload_addr_json TEXT,
+    metadata_json     TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY(producer_id, session_id)
+);
+CREATE INDEX IF NOT EXISTS idx_hub_sessions_updated
+    ON hub_sessions(updated_at DESC, producer_id ASC, session_id ASC);
+
+CREATE TABLE IF NOT EXISTS hub_snapshots (
+    hub_generation INTEGER PRIMARY KEY,
+    publication_id TEXT NOT NULL UNIQUE,
+    published_at   INTEGER NOT NULL,
+    manifest_json  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_hub_snapshots_pub_id
+    ON hub_snapshots(publication_id);
 "#;
 
 /// Read `PRAGMA user_version` from `conn`.
