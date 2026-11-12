@@ -2217,12 +2217,40 @@ fn serve_sse_stream_auth_and_live_cursor_wakeup() {
             .starts_with("text/event-stream"),
         "{init}"
     );
-    let init_cursor: u64 = init
-        .lines()
-        .find_map(|line| line.strip_prefix("id: "))
-        .and_then(|s| s.trim().parse().ok())
-        .expect("initial SSE cursor id");
-    assert!(init_cursor >= 1, "{init}");
+    // The cursor is `<gen>:<offset>`: the generation names this server process.
+    let sse_cursor = |raw: &str| -> (String, u64) {
+        let id = raw
+            .lines()
+            .find_map(|line| line.strip_prefix("id: "))
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|| panic!("SSE cursor id in {raw}"));
+        let (gen, offset) = id.split_once(':').unwrap_or_else(|| panic!("<gen>:<offset> in {id}"));
+        (
+            gen.to_string(),
+            offset.parse().unwrap_or_else(|_| panic!("offset in {id}")),
+        )
+    };
+    let (gen, init_offset) = sse_cursor(&init);
+    assert!(!gen.is_empty() && init_offset >= 1, "{init}");
+    let init_cursor = format!("{gen}:{init_offset}");
+
+    // A cursor from another generation (a previous run of the server, whose offsets were higher)
+    // or a bare offset is answered at once with a `reset` under this generation: the follower
+    // must reload, not wait for this run's offsets to climb past a number from another run.
+    for stale in ["deadbeef:9000", "9000"] {
+        let reset = raw_request(
+            port,
+            "GET",
+            &format!("/api/stream?after={stale}&follow=1&max_events=1&wait_ms=4000"),
+            &[
+                ("Authorization", "Bearer stream-secret"),
+                ("Accept", "text/event-stream"),
+            ],
+        );
+        assert_eq!(raw_status(&reset), 200, "{reset}");
+        assert!(reset.contains("\"reset\""), "after={stale} must reset: {reset}");
+        assert_eq!(sse_cursor(&reset).0, gen, "{reset}");
+    }
 
     let follower = std::thread::spawn(move || {
         raw_request(
@@ -2254,12 +2282,9 @@ fn serve_sse_stream_auth_and_live_cursor_wakeup() {
 
     let streamed = follower.join().expect("follower thread");
     assert_eq!(raw_status(&streamed), 200, "{streamed}");
-    let next_cursor: u64 = streamed
-        .lines()
-        .find_map(|line| line.strip_prefix("id: "))
-        .and_then(|s| s.trim().parse().ok())
-        .expect("woken SSE cursor id");
-    assert!(next_cursor > init_cursor, "cursor must advance: {streamed}");
+    let (next_gen, next_offset) = sse_cursor(&streamed);
+    assert_eq!(next_gen, gen, "{streamed}");
+    assert!(next_offset > init_offset, "cursor must advance: {streamed}");
     assert!(streamed.contains("\"tasks\""), "{streamed}");
     assert!(
         streamed.ends_with("0\r\n\r\n"),

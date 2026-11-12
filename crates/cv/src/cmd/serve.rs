@@ -1580,14 +1580,59 @@ fn sessions_fingerprint() -> u64 {
     hasher.finish()
 }
 
+/// How many past changes the stream remembers, so a follower that missed several learns the union
+/// of what changed; one that fell further behind is told to reload everything (`reset`).
+const STREAM_HISTORY: usize = 64;
+
 struct StreamState {
     cursor: u64,
     stamp: DiskStamp,
-    last_kinds: Vec<&'static str>,
+    /// `(offset, kinds)` of the most recent changes, oldest first.
+    history: std::collections::VecDeque<(u64, Vec<&'static str>)>,
     last_session_scan: std::time::Instant,
 }
 
+impl StreamState {
+    fn record(&mut self, kinds: Vec<&'static str>) {
+        self.cursor += 1;
+        if self.history.len() == STREAM_HISTORY {
+            self.history.pop_front();
+        }
+        self.history.push_back((self.cursor, kinds));
+    }
+
+    /// Every kind that changed after offset `seen`, in first-seen order. A follower older than
+    /// the remembered history cannot be told exactly what it missed, so it gets `reset`.
+    fn kinds_after(&self, seen: u64) -> Vec<&'static str> {
+        let oldest = self.history.front().map_or(self.cursor + 1, |(offset, _)| *offset);
+        if seen + 1 < oldest {
+            return vec!["reset"];
+        }
+        let mut out: Vec<&'static str> = Vec::new();
+        for (_, kinds) in self.history.iter().filter(|(offset, _)| *offset > seen) {
+            for kind in kinds {
+                if !out.contains(kind) {
+                    out.push(kind);
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Where a follower says it is: nowhere yet, at an offset of this server's generation, or at a
+/// cursor this process never issued (another run's generation, a bare offset, garbage).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StreamResume {
+    Fresh,
+    At(u64),
+    Foreign,
+}
+
 struct StreamHub {
+    /// This process's stream generation. Offsets restart with every `cv serve`, so a cursor is
+    /// `<gen>:<offset>` and one from another generation is never compared by offset alone.
+    gen: String,
     state: std::sync::Mutex<StreamState>,
     wake: std::sync::Condvar,
     followers: std::sync::atomic::AtomicUsize,
@@ -1620,15 +1665,38 @@ impl Drop for FollowerSlot<'_> {
 impl StreamHub {
     fn new() -> Self {
         let now = std::time::Instant::now();
+        let started_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos() as u64);
         Self {
+            gen: format!("{:x}", started_ns ^ (u64::from(std::process::id()) << 44)),
             state: std::sync::Mutex::new(StreamState {
                 cursor: 1,
                 stamp: DiskStamp::capture(None),
-                last_kinds: vec!["ready"],
+                history: std::collections::VecDeque::from([(1, vec!["ready"])]),
                 last_session_scan: now,
             }),
             wake: std::sync::Condvar::new(),
             followers: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// The wire cursor for `offset`: `<gen>:<offset>`.
+    fn cursor_id(&self, offset: u64) -> String {
+        format!("{}:{offset}", self.gen)
+    }
+
+    /// Read a follower's `after=` / `Last-Event-ID` cursor.
+    fn resume_point(&self, raw: Option<&str>, current: u64) -> StreamResume {
+        let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
+            return StreamResume::Fresh;
+        };
+        match raw.split_once(':') {
+            Some((gen, offset)) if gen == self.gen => match offset.parse::<u64>() {
+                Ok(offset) if offset <= current => StreamResume::At(offset),
+                _ => StreamResume::Foreign,
+            },
+            _ => StreamResume::Foreign,
         }
     }
 
@@ -1648,13 +1716,13 @@ impl StreamHub {
         let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
         guard.stamp.tasks_log = fresh_tasks;
         guard.stamp.hub_state = fresh_hub;
-        guard.cursor += 1;
-        guard.last_kinds = kinds.to_vec();
+        guard.record(kinds.to_vec());
         drop(guard);
         self.wake.notify_all();
     }
 
-    fn refresh(&self) -> (u64, Vec<&'static str>) {
+    /// Re-stat the watched stores, record a change if any moved, and return the current offset.
+    fn refresh(&self) -> u64 {
         let now = std::time::Instant::now();
         let cached_sessions = {
             let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -1690,37 +1758,42 @@ impl StreamHub {
             kinds.push("hub");
         }
         if !kinds.is_empty() {
-            guard.cursor += 1;
-            guard.last_kinds = kinds;
-            let out = (guard.cursor, guard.last_kinds.clone());
+            guard.record(kinds);
+            let out = guard.cursor;
             drop(guard);
             self.wake.notify_all();
             return out;
         }
-        (guard.cursor, guard.last_kinds.clone())
+        guard.cursor
+    }
+
+    /// The current offset and every kind that changed after `seen`.
+    fn changes_after(&self, seen: u64) -> (u64, Vec<&'static str>) {
+        let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        (guard.cursor, guard.kinds_after(seen))
     }
 
     fn wait_after(&self, seen: u64, step: std::time::Duration) -> (u64, Vec<&'static str>) {
         {
             let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
             if guard.cursor > seen {
-                return (guard.cursor, guard.last_kinds.clone());
+                return (guard.cursor, guard.kinds_after(seen));
             }
             let (guard, _) = self.wake.wait_timeout(guard, step).unwrap_or_else(|e| e.into_inner());
             if guard.cursor > seen {
-                return (guard.cursor, guard.last_kinds.clone());
+                return (guard.cursor, guard.kinds_after(seen));
             }
         }
-        self.refresh()
+        self.refresh();
+        self.changes_after(seen)
     }
 }
 
 fn serve_stream(request: &mut Request<'_>, q: &Query, origin: Option<&str>, hub: &StreamHub) {
     let last_event_id = header_value(request, "Last-Event-ID");
-    let after = q
-        .get("after")
-        .and_then(|s| s.parse::<u64>().ok())
-        .or_else(|| last_event_id.as_deref().and_then(|s| s.trim().parse::<u64>().ok()));
+    // `after=<gen>:<offset>` (or the same cursor in `Last-Event-ID`, which a reconnecting
+    // EventSource sends by itself).
+    let after: Option<String> = q.get("after").map(|s| s.to_string()).or_else(|| last_event_id.clone());
     let max_events = q.get("max_events").and_then(|s| s.parse::<usize>().ok());
     let wait_limit = q
         .get("wait_ms")
@@ -1748,30 +1821,44 @@ fn serve_stream(request: &mut Request<'_>, q: &Query, origin: Option<&str>, hub:
     };
 
     let mut resp = Response::sse(|sse| {
-        let (cur, kinds) = hub.refresh();
+        let cur = hub.refresh();
         let mut seen = cur;
         let mut emitted = 0usize;
-        match after {
-            None => {
-                let payload = json!({"cursor": cur, "kinds": ["ready"]}).to_string();
-                sse.event(Some(&cur.to_string()), Some("change"), &payload)?;
+        let change = |sse: &mut crate::http::SseWriter<'_>, offset: u64, kinds: &[&'static str]| {
+            let id = hub.cursor_id(offset);
+            let payload = json!({"cursor": id, "kinds": kinds}).to_string();
+            sse.event(Some(&id), Some("change"), &payload)
+        };
+        match hub.resume_point(after.as_deref(), cur) {
+            StreamResume::Fresh => {
+                change(sse, cur, &["ready"])?;
                 if !live || max_events == Some(0) {
                     return Ok(());
                 }
             }
-            Some(prev) if cur > prev => {
-                let payload = json!({"cursor": cur, "kinds": kinds}).to_string();
-                sse.event(Some(&cur.to_string()), Some("change"), &payload)?;
+            // A cursor this process never issued: the follower was watching another run of the
+            // server (offsets restart with each), so anything may have changed since. Say so
+            // now instead of comparing offsets across generations and going quiet.
+            StreamResume::Foreign => {
+                change(sse, cur, &["reset"])?;
                 emitted += 1;
                 if !live || max_events.is_some_and(|m| emitted >= m) {
                     return Ok(());
                 }
             }
-            Some(_) if !live => {
-                sse.comment(&format!("cursor {cur}"))?;
+            StreamResume::At(prev) if cur > prev => {
+                let (_, kinds) = hub.changes_after(prev);
+                change(sse, cur, &kinds)?;
+                emitted += 1;
+                if !live || max_events.is_some_and(|m| emitted >= m) {
+                    return Ok(());
+                }
+            }
+            StreamResume::At(_) if !live => {
+                sse.comment(&format!("cursor {}", hub.cursor_id(cur)))?;
                 return Ok(());
             }
-            Some(_) => {}
+            StreamResume::At(_) => {}
         }
 
         let started = std::time::Instant::now();
@@ -1795,8 +1882,7 @@ fn serve_stream(request: &mut Request<'_>, q: &Query, origin: Option<&str>, hub:
             let (next_cur, next_kinds) = hub.wait_after(seen, step);
             if next_cur > seen {
                 seen = next_cur;
-                let payload = json!({"cursor": seen, "kinds": next_kinds}).to_string();
-                sse.event(Some(&seen.to_string()), Some("change"), &payload)?;
+                change(sse, seen, &next_kinds)?;
                 last_write = std::time::Instant::now();
                 emitted += 1;
                 if max_events.is_some_and(|m| emitted >= m) {
@@ -1889,5 +1975,70 @@ mod search_service_tests {
         assert!(err.to_string().contains("NEVER allows unauthenticated"), "{err}");
         assert!(validate_bind_exposure("0.0.0.0", 7777, Some("hub-secret"), false, true).is_ok());
         assert!(validate_bind_exposure("127.0.0.1", 7777, None, false, true).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+
+    fn hub_in(home: &Path) -> (cv_core::env::Scope, StreamHub) {
+        let scope = cv_core::env::Env::from_vars([
+            ("HOME", home.to_str().unwrap()),
+            ("CLUSTERVISION_HOME", home.join("cvhome").to_str().unwrap()),
+            ("XDG_CACHE_HOME", home.join("cache").to_str().unwrap()),
+        ])
+        .enter();
+        (scope, StreamHub::new())
+    }
+
+    #[test]
+    fn a_follower_that_missed_several_changes_learns_every_kind() {
+        let home = std::env::temp_dir().join(format!("cv-stream-kinds-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let (_scope, hub) = hub_in(&home);
+        let seen = hub.changes_after(0).0;
+        // Three changes land before the follower wakes; the last one alone says only `hub`.
+        hub.bump(&["tasks"]);
+        hub.bump(&["sessions"]);
+        hub.bump(&["hub", "tasks"]);
+        let (cur, kinds) = hub.changes_after(seen);
+        assert_eq!(cur, seen + 3);
+        assert_eq!(kinds, ["tasks", "sessions", "hub"]);
+        assert_eq!(hub.changes_after(seen + 2).1, ["hub", "tasks"]);
+        assert!(hub.changes_after(cur).1.is_empty());
+
+        // Further behind than the remembered history: reload everything.
+        for _ in 0..STREAM_HISTORY + 5 {
+            hub.bump(&["watch"]);
+        }
+        assert_eq!(hub.changes_after(seen).1, ["reset"]);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn cursors_are_scoped_to_the_server_generation() {
+        let home = std::env::temp_dir().join(format!("cv-stream-gen-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let (_scope, hub) = hub_in(&home);
+        hub.bump(&["tasks"]);
+        let cur = hub.changes_after(0).0;
+        let id = hub.cursor_id(cur);
+        assert_eq!(id, format!("{}:{cur}", hub.gen));
+        assert_eq!(hub.resume_point(None, cur), StreamResume::Fresh);
+        assert_eq!(hub.resume_point(Some(""), cur), StreamResume::Fresh);
+        assert_eq!(hub.resume_point(Some(&id), cur), StreamResume::At(cur));
+        assert_eq!(hub.resume_point(Some(&hub.cursor_id(1)), cur), StreamResume::At(1));
+        // Another run's generation, a bare offset from it, an offset this run never reached, junk.
+        for foreign in [
+            "feedface:1",
+            "57",
+            &hub.cursor_id(cur + 40),
+            "x:y:z",
+            &format!("{}:", hub.gen),
+        ] {
+            assert_eq!(hub.resume_point(Some(foreign), cur), StreamResume::Foreign, "{foreign}");
+        }
+        std::fs::remove_dir_all(&home).ok();
     }
 }
