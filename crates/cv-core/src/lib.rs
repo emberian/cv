@@ -44,6 +44,7 @@ pub mod lanes;
 pub mod lazy;
 pub(crate) mod lockfile;
 pub mod offsets;
+pub mod packs;
 pub mod prune;
 pub mod publish;
 pub mod query;
