@@ -1,6 +1,13 @@
 # Changelog
 
 ## Unreleased
+
+## 0.19.1 — 2026-11-13 — hub replication, exact search, and store hardening
+ClusterVision 0.19.1 hardens 0.19.0's `state.db` coordination spine, fleet hub replication,
+Zstd-Seekable pack custody, trigram `--exact` search, zip ingest, and `cv serve` Host-header
+boundaries, while updating harness manifests for Claude Code 2.1.323 and Kimi Code and closing
+read-only `--frozen`, emitter ID, and stdout JSON purity edge cases.
+
 - Hub replication seeds v2 frontiers, uses monotonic UUIDv7 writer epochs, tracks pack eviction per epoch, ships legacy archive packs, and hardens packs to 0600.
 - `state.db` overlays read-only `retired.jsonl` without importing it, `config::save` preserves default-valued `[replication]` overrides, and `cv doctor --store` keeps `catalog.db` strictly read-only.
 - Hermes revision certificates stream `> 2 KiB` cells (falling back inline without `_rowid_`), and malformed SQLite cells increment `extra.cv.skipped_lines`.
