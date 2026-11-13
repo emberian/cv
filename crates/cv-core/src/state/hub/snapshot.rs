@@ -798,8 +798,13 @@ pub(crate) fn resolve_producer_sessions_in_tx(
                 r.get::<_, Option<String>>(4)?,
             ))
         })?;
+        struct SessionWinner {
+            rank: (i64, String, i64),
+            is_delete: i64,
+            entry_json: Option<String>,
+        }
         let mut running_ts = i64::MIN;
-        let mut winner: Option<((i64, String, i64), i64, Option<String>)> = None;
+        let mut winner: Option<SessionWinner> = None;
         for row in rows {
             let (epoch, is_delete, raw_ts, event_seq, entry_json) = row?;
             let effective_ts = if raw_ts == i64::MIN {
@@ -809,11 +814,15 @@ pub(crate) fn resolve_producer_sessions_in_tx(
                 raw_ts
             };
             let rank = (effective_ts, epoch, event_seq);
-            if winner.as_ref().is_none_or(|(best_rank, _, _)| rank > *best_rank) {
-                winner = Some((rank, is_delete, entry_json));
+            if winner.as_ref().is_none_or(|best| rank > best.rank) {
+                winner = Some(SessionWinner {
+                    rank,
+                    is_delete,
+                    entry_json,
+                });
             }
         }
-        let winner = winner.map(|(_, is_delete, entry_json)| (is_delete, entry_json));
+        let winner = winner.map(|w| (w.is_delete, w.entry_json));
 
         match winner {
             None | Some((1, _)) => {
