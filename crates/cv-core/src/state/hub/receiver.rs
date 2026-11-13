@@ -771,6 +771,8 @@ impl HubStore {
             )?;
         }
 
+        super::snapshot::ensure_all_frontiers_seeded_in_tx(&tx, now_ms)?;
+
         let mut touched_sessions_by_producer: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         for (producer_id, epoch) in &touched_origins {
             let (fold_after, new_frontier) = advance_frontier_in_tx(&tx, producer_id, epoch, now_ms)?;

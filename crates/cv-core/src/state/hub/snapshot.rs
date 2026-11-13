@@ -609,6 +609,57 @@ fn parse_envelope_op(
     }))
 }
 
+/// Seed all pre-v3 `hub_frontiers` rows (`delta_seeded = 0`) into `hub_epoch_sessions`,
+/// `hub_frontier_packs`, and `hub_frontiers.control_events`, then materialize affected producers
+/// into `hub_sessions` before incremental folding or snapshot publication.
+pub(crate) fn ensure_all_frontiers_seeded_in_tx(tx: &Transaction<'_>, now_ms: i64) -> Result<(), HubError> {
+    let unseeded: Vec<(String, String, u64)> = {
+        let mut stmt = tx.prepare(
+            "SELECT producer_id, epoch, contiguous_seq
+             FROM hub_frontiers
+             WHERE delta_seeded = 0
+             ORDER BY producer_id ASC, epoch ASC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)? as u64,
+            ))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    if unseeded.is_empty() {
+        return Ok(());
+    }
+
+    let mut touched_by_producer: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (producer_id, epoch, contiguous_seq) in unseeded {
+        tx.execute(
+            "DELETE FROM hub_epoch_sessions WHERE producer_id = ?1 AND epoch = ?2",
+            rusqlite::params![producer_id, epoch],
+        )?;
+        tx.execute(
+            "DELETE FROM hub_frontier_packs WHERE producer_id = ?1 AND epoch = ?2",
+            rusqlite::params![producer_id, epoch],
+        )?;
+        tx.execute(
+            "UPDATE hub_frontiers
+             SET control_events = 0, delta_seeded = 1, updated_at = ?3
+             WHERE producer_id = ?1 AND epoch = ?2",
+            rusqlite::params![producer_id, epoch, now_ms],
+        )?;
+        let touched = fold_origin_range_in_tx(tx, &producer_id, &epoch, 0, contiguous_seq)?;
+        if !touched.is_empty() {
+            touched_by_producer.entry(producer_id).or_default().extend(touched);
+        }
+    }
+    for (producer_id, session_ids) in &touched_by_producer {
+        resolve_producer_sessions_in_tx(tx, producer_id, session_ids)?;
+    }
+    Ok(())
+}
+
 /// Fold events in `(after_seq, upto_seq]` for `(producer_id, epoch)` into `hub_epoch_sessions`,
 /// `hub_frontier_packs`, and `hub_frontiers.control_events`, returning the set of `session_id`s
 /// touched in this delta.
@@ -642,6 +693,18 @@ pub(crate) fn fold_origin_range_in_tx(
         },
     )?;
 
+    let existing_epoch_ts = |session_id: &str| -> Result<Option<i64>, HubError> {
+        Ok(tx
+            .query_row(
+                "SELECT sort_ts_ms FROM hub_epoch_sessions
+                 WHERE producer_id = ?1 AND session_id = ?2 AND epoch = ?3",
+                rusqlite::params![producer_id, session_id, epoch],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+            .filter(|&ts| ts != i64::MIN))
+    };
+
     let mut added_control_events = 0u64;
     for row in rows {
         let (seq, event_digest, env_str, payload_str) = row?;
@@ -664,8 +727,10 @@ pub(crate) fn fold_origin_range_in_tx(
                 added_control_events += 1;
             }
             ParsedEnvelopeOp::Delete { session_id } => {
-                let sort_ts_ms =
-                    parse_rfc3339_ms(envelope.get("updated_at").and_then(Value::as_str)).unwrap_or(i64::MAX);
+                let sort_ts_ms = match parse_rfc3339_ms(envelope.get("updated_at").and_then(Value::as_str)) {
+                    Some(ts) => ts,
+                    None => existing_epoch_ts(&session_id)?.unwrap_or(i64::MIN),
+                };
                 tx.execute(
                     "INSERT OR REPLACE INTO hub_epoch_sessions(
                          producer_id, session_id, epoch, is_delete, sort_ts_ms, event_seq, entry_json
@@ -675,9 +740,11 @@ pub(crate) fn fold_origin_range_in_tx(
                 touched_sessions.insert(session_id);
             }
             ParsedEnvelopeOp::Upsert(entry) => {
-                let sort_ts_ms =
-                    parse_rfc3339_ms(entry.updated_at.as_deref().or(entry.created_at.as_deref())).unwrap_or(i64::MIN);
                 let session_id = entry.session_id.clone();
+                let sort_ts_ms = match parse_rfc3339_ms(entry.updated_at.as_deref().or(entry.created_at.as_deref())) {
+                    Some(ts) => ts,
+                    None => existing_epoch_ts(&session_id)?.unwrap_or(i64::MIN),
+                };
                 let entry_json = serde_json::to_string(&*entry)?;
                 tx.execute(
                     "INSERT OR REPLACE INTO hub_epoch_sessions(
@@ -703,25 +770,50 @@ pub(crate) fn fold_origin_range_in_tx(
 }
 
 /// Resolve the winning cross-epoch state for each `session_id` of `producer_id` from
-/// `hub_epoch_sessions` using strict total order `(sort_ts_ms, epoch, event_seq)` and materialize
-/// into `hub_sessions`.
+/// `hub_epoch_sessions` using strict total order `(effective_ts_ms, epoch, event_seq)` and
+/// materialize into `hub_sessions`.
+///
+/// Epochs that omitted explicit RFC3339 timestamps (`sort_ts_ms == i64::MIN`) inherit the highest
+/// `sort_ts_ms` observed in earlier epochs (`epoch ASC`) for that `(producer_id, session_id)`, so
+/// an untimestamped `session_delete` in a newer epoch supersedes prior epochs without permanently
+/// outranking later timestamped epochs, independent of batch arrival order.
 pub(crate) fn resolve_producer_sessions_in_tx(
     tx: &Transaction<'_>,
     producer_id: &str,
     session_ids: &BTreeSet<String>,
 ) -> Result<(), HubError> {
+    let mut stmt = tx.prepare(
+        "SELECT epoch, is_delete, sort_ts_ms, event_seq, entry_json
+         FROM hub_epoch_sessions
+         WHERE producer_id = ?1 AND session_id = ?2
+         ORDER BY epoch ASC",
+    )?;
     for session_id in session_ids {
-        let winner: Option<(i64, Option<String>)> = tx
-            .query_row(
-                "SELECT is_delete, entry_json
-                 FROM hub_epoch_sessions
-                 WHERE producer_id = ?1 AND session_id = ?2
-                 ORDER BY sort_ts_ms DESC, epoch DESC, event_seq DESC
-                 LIMIT 1",
-                rusqlite::params![producer_id, session_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
+        let rows = stmt.query_map(rusqlite::params![producer_id, session_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, Option<String>>(4)?,
+            ))
+        })?;
+        let mut running_ts = i64::MIN;
+        let mut winner: Option<((i64, String, i64), i64, Option<String>)> = None;
+        for row in rows {
+            let (epoch, is_delete, raw_ts, event_seq, entry_json) = row?;
+            let effective_ts = if raw_ts == i64::MIN {
+                running_ts
+            } else {
+                running_ts = running_ts.max(raw_ts);
+                raw_ts
+            };
+            let rank = (effective_ts, epoch, event_seq);
+            if winner.as_ref().is_none_or(|(best_rank, _, _)| rank > *best_rank) {
+                winner = Some((rank, is_delete, entry_json));
+            }
+        }
+        let winner = winner.map(|(_, is_delete, entry_json)| (is_delete, entry_json));
 
         match winner {
             None | Some((1, _)) => {
@@ -835,6 +927,8 @@ pub(crate) fn maybe_publish_snapshot_in_tx(
     tx: &Transaction<'_>,
     now_ms: i64,
 ) -> Result<Option<SnapshotPublicationManifest>, HubError> {
+    ensure_all_frontiers_seeded_in_tx(tx, now_ms)?;
+
     let mut origin_frontier: BTreeMap<(String, String), u64> = BTreeMap::new();
     let mut total_control_events = 0u64;
     {

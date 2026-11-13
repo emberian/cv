@@ -1911,3 +1911,235 @@ fn cli_archive_sync_to_hub_ships_scrubbed_packs_and_respects_frozen() {
         "expected redaction marker in hydrated session: {hydrated_a_str}"
     );
 }
+
+#[test]
+fn v2_to_v3_upgrade_seeds_untouched_origins_packs_sessions_and_control_events() {
+    let w = World::new("hub-v2-to-v3-seed");
+    let scratch_packs = w.base.join("packs");
+    let store = StateStore::at(w.cv_home.join("state.db"));
+    let hub = HubStore::new(store, w.cv_home.join("hub/packs"));
+
+    let upload_local_pack = |pack_id: &str, sessions: &[Session]| {
+        let built = build_pack_with_sessions(&scratch_packs, pack_id, sessions);
+        let idx = fs::read(scratch_packs.join(format!("{pack_id}.pack.idx.json"))).unwrap();
+        let zst = fs::File::open(scratch_packs.join(format!("{pack_id}.pack.zst"))).unwrap();
+        let up = hub.upload_pack_stream(pack_id, None, None, &idx, zst).unwrap();
+        (built, up.pack.blake3_digest)
+    };
+
+    let s_p1_e1 = make_session("s-p1-e1", "/work/p1", "P1 E1", "q1", "a1", 1);
+    let s_p1_override = make_session("s-shared", "/work/p1", "Old E1 shared", "q", "a", 2);
+    let (packed_p1_e1, dig_p1_e1) = upload_local_pack("pk-p1-e1", &[s_p1_e1.clone(), s_p1_override.clone()]);
+
+    let s_p2_e1 = make_session("s-p2-e1", "/work/p2", "P2 E1", "q2", "a2", 3);
+    let (packed_p2_e1, dig_p2_e1) = upload_local_pack("pk-p2-e1", std::slice::from_ref(&s_p2_e1));
+
+    let ctrl_ev = IngestEventRecord::new(
+        EventId::new("prod-1", "ep-1", 3),
+        "op:prod-1:ep-1:3",
+        json!({"kind": "heartbeat", "ts": "2026-06-15T12:04:00Z"}),
+        None,
+    )
+    .unwrap();
+    hub.ingest_batch(&IngestBatchRequest {
+        events: vec![
+            make_event("prod-1", "ep-1", 1, &packed_p1_e1[0].0, Some(packed_p1_e1[0].1.clone())),
+            make_event("prod-1", "ep-1", 2, &packed_p1_e1[1].0, Some(packed_p1_e1[1].1.clone())),
+            ctrl_ev,
+            make_event("prod-2", "ep-1", 1, &packed_p2_e1[0].0, Some(packed_p2_e1[0].1.clone())),
+        ],
+    })
+    .unwrap();
+
+    // Simulate exact post-`migrate_v2_to_v3` state: `hub_sessions` populated from v2, while
+    // `hub_epoch_sessions` and `hub_frontier_packs` are empty and `hub_frontiers.delta_seeded = 0`.
+    {
+        let conn = rusqlite::Connection::open(w.cv_home.join("state.db")).unwrap();
+        conn.execute_batch(
+            "DELETE FROM hub_epoch_sessions;
+             DELETE FROM hub_frontier_packs;
+             UPDATE hub_frontiers SET control_events = 0, delta_seeded = 0;",
+        )
+        .unwrap();
+    }
+
+    // First post-upgrade ingest touches ONLY `(prod-1, ep-2)` — `(prod-1, ep-1)` and `(prod-2, ep-1)`
+    // are untouched in this batch and MUST still be seeded before snapshot publication!
+    let s_shared_v2 = make_session("s-shared", "/work/p1", "New E2 shared", "q", "a", 15);
+    let (packed_p1_e2, dig_p1_e2) = upload_local_pack("pk-p1-e2", std::slice::from_ref(&s_shared_v2));
+    let resp = hub
+        .ingest_batch(&IngestBatchRequest {
+            events: vec![make_event(
+                "prod-1",
+                "ep-2",
+                1,
+                &packed_p1_e2[0].0,
+                Some(packed_p1_e2[0].1.clone()),
+            )],
+        })
+        .unwrap();
+    let snap = resp.snapshot.expect("post-upgrade snapshot published");
+
+    assert_eq!(snap.pack_digests.get("pk-p1-e1"), Some(&dig_p1_e1));
+    assert_eq!(snap.pack_digests.get("pk-p2-e1"), Some(&dig_p2_e1));
+    assert_eq!(snap.pack_digests.get("pk-p1-e2"), Some(&dig_p1_e2));
+    assert!(snap.session_revisions.contains_key("prod-1/s-p1-e1"));
+    assert!(snap.session_revisions.contains_key("prod-2/s-p2-e1"));
+    assert_eq!(
+        snap.session_revisions["prod-1/s-shared"].title.as_deref(),
+        Some("New E2 shared")
+    );
+    // 3 origins (`prod-1/ep-1`, `prod-1/ep-2`, `prod-2/ep-1`) + 1 control event (`heartbeat`) = 4.
+    assert_eq!(snap.control_revision, 4);
+
+    hub.wipe_derived_views().unwrap();
+    let rebuilt = hub.rebuild_from_raw().unwrap().unwrap();
+    assert_eq!(rebuilt, snap);
+}
+
+#[test]
+fn untimestamped_delete_and_upsert_order_deterministically_across_and_within_epochs() {
+    for reverse_arrival in [false, true] {
+        let label = if reverse_arrival {
+            "hub-ts-order-rev"
+        } else {
+            "hub-ts-order-fwd"
+        };
+        let w = World::new(label);
+        let store = StateStore::at(w.cv_home.join("state.db"));
+        let hub = HubStore::new(store, w.cv_home.join("hub/packs"));
+
+        let ep1_upsert = IngestEventRecord::new(
+            EventId::new("prod-ts", "ep-1", 1),
+            "op:ep1:1",
+            json!({
+                "kind": "session_upsert",
+                "session_id": "s-recreated",
+                "harness": "claude",
+                "title": "ep-1 initial",
+                "updated_at": "2026-06-15T12:00:00Z",
+                "message_count": 2,
+            }),
+            None,
+        )
+        .unwrap();
+        // Untimestamped `session_delete` in `ep-2` deletes `ep-1`, but MUST NOT shadow `ep-3`!
+        let ep2_delete = IngestEventRecord::new(
+            EventId::new("prod-ts", "ep-2", 1),
+            "op:ep2:1",
+            json!({
+                "kind": "session_delete",
+                "session_id": "s-recreated",
+            }),
+            None,
+        )
+        .unwrap();
+        let ep3_upsert = IngestEventRecord::new(
+            EventId::new("prod-ts", "ep-3", 1),
+            "op:ep3:1",
+            json!({
+                "kind": "session_upsert",
+                "session_id": "s-recreated",
+                "harness": "claude",
+                "title": "ep-3 recreated",
+                "updated_at": "2026-06-15T12:05:00Z",
+                "message_count": 4,
+            }),
+            None,
+        )
+        .unwrap();
+
+        if !reverse_arrival {
+            hub.ingest_batch(&IngestBatchRequest {
+                events: vec![ep1_upsert, ep2_delete],
+            })
+            .unwrap();
+            let mid = hub.get_snapshot(None).unwrap().unwrap();
+            assert!(
+                !mid.session_revisions.contains_key("prod-ts/s-recreated"),
+                "untimestamped ep-2 delete must delete ep-1 session"
+            );
+            hub.ingest_batch(&IngestBatchRequest {
+                events: vec![ep3_upsert],
+            })
+            .unwrap();
+        } else {
+            hub.ingest_batch(&IngestBatchRequest {
+                events: vec![ep3_upsert],
+            })
+            .unwrap();
+            hub.ingest_batch(&IngestBatchRequest {
+                events: vec![ep2_delete],
+            })
+            .unwrap();
+            hub.ingest_batch(&IngestBatchRequest {
+                events: vec![ep1_upsert],
+            })
+            .unwrap();
+        }
+
+        // Intra-epoch untimestamped follow-up (`ep-1, seq=2`) after timestamped `seq=1` must keep
+        // `ep-1`'s timestamp and continue outranking `ep-0` (`12:02:00Z < 12:10:00Z`).
+        let ep0_stale = IngestEventRecord::new(
+            EventId::new("prod-ts", "ep-0", 1),
+            "op:ep0:1",
+            json!({
+                "kind": "session_upsert",
+                "session_id": "s-intra",
+                "harness": "claude",
+                "title": "ep-0 stale",
+                "updated_at": "2026-06-15T12:02:00Z",
+                "message_count": 1,
+            }),
+            None,
+        )
+        .unwrap();
+        let ep1_ts = IngestEventRecord::new(
+            EventId::new("prod-ts", "ep-1", 2),
+            "op:ep1:2",
+            json!({
+                "kind": "session_upsert",
+                "session_id": "s-intra",
+                "harness": "claude",
+                "title": "ep-1 timestamped",
+                "updated_at": "2026-06-15T12:10:00Z",
+                "message_count": 3,
+            }),
+            None,
+        )
+        .unwrap();
+        let ep1_followup = IngestEventRecord::new(
+            EventId::new("prod-ts", "ep-1", 3),
+            "op:ep1:3",
+            json!({
+                "kind": "session_upsert",
+                "session_id": "s-intra",
+                "harness": "claude",
+                "title": "ep-1 untimestamped follow-up",
+                "message_count": 5,
+            }),
+            None,
+        )
+        .unwrap();
+        hub.ingest_batch(&IngestBatchRequest {
+            events: vec![ep0_stale, ep1_ts, ep1_followup],
+        })
+        .unwrap();
+
+        let snap = hub.get_snapshot(None).unwrap().unwrap();
+        assert_eq!(
+            snap.session_revisions["prod-ts/s-recreated"].title.as_deref(),
+            Some("ep-3 recreated"),
+            "reverse_arrival={reverse_arrival}: ep-2 untimestamped delete must not shadow ep-3"
+        );
+        assert_eq!(
+            snap.session_revisions["prod-ts/s-intra"].title.as_deref(),
+            Some("ep-1 untimestamped follow-up"),
+            "reverse_arrival={reverse_arrival}: intra-epoch untimestamped upsert must preserve ep-1 sort_ts_ms"
+        );
+
+        hub.wipe_derived_views().unwrap();
+        let rebuilt = hub.rebuild_from_raw().unwrap().unwrap();
+        assert_eq!(rebuilt, snap, "reverse_arrival={reverse_arrival}");
+    }
+}
