@@ -715,17 +715,40 @@ impl Cells {
         row: &rusqlite::Row<'_>,
         i: usize,
     ) -> Result<Option<Cell>> {
+        let mut ignored = false;
+        self.cell_checked(conn, table, column, row, i, &mut ignored)
+    }
+
+    /// [`Self::cell`], setting `*malformed = true` when a non-NULL cell has a non-TEXT storage
+    /// class (e.g. BLOB, INTEGER, REAL).
+    pub(crate) fn cell_checked(
+        &self,
+        conn: &Connection,
+        table: &str,
+        column: &str,
+        row: &rusqlite::Row<'_>,
+        i: usize,
+        malformed: &mut bool,
+    ) -> Result<Option<Cell>> {
         use rusqlite::types::ValueRef;
         let (offset, len) = if self.incremental {
-            if row.get_ref(i + 1)?.as_str_or_null()? != Some("text") {
-                return Ok(None);
+            match row.get_ref(i + 1)?.as_str_or_null()? {
+                None | Some("null") => return Ok(None),
+                Some("text") => append_cell(conn, table, column, row.get(i)?, &self.arena)?,
+                Some(_) => {
+                    *malformed = true;
+                    return Ok(None);
+                }
             }
-            append_cell(conn, table, column, row.get(i)?, &self.arena)?
         } else {
-            let ValueRef::Text(bytes) = row.get_ref(i)? else {
-                return Ok(None);
-            };
-            self.arena.append(|writer| Ok(writer.write_all(bytes)?))?
+            match row.get_ref(i)? {
+                ValueRef::Null => return Ok(None),
+                ValueRef::Text(bytes) => self.arena.append(|writer| Ok(writer.write_all(bytes)?))?,
+                ValueRef::Blob(_) | ValueRef::Integer(_) | ValueRef::Real(_) => {
+                    *malformed = true;
+                    return Ok(None);
+                }
+            }
         };
         Ok((len != 0).then_some(Cell(offset, len)))
     }
@@ -767,53 +790,70 @@ impl Cells {
 
     /// A TEXT cell holding a plain string (not JSON), copied into the arena as one JSON string so
     /// the decoder views it like any other string. None for a cell that is not TEXT, is empty or
-    /// is not UTF-8.
-    pub(crate) fn text(
+    /// is not UTF-8; sets `*malformed = true` when a non-NULL cell has a non-TEXT storage class
+    /// or contains invalid UTF-8 bytes.
+    pub(crate) fn text_checked(
         &self,
         conn: &Connection,
         table: &str,
         column: &str,
         row: &rusqlite::Row<'_>,
         i: usize,
+        malformed: &mut bool,
     ) -> Result<Option<Cell>> {
         let mut valid = false;
         let (offset, len) = self.arena.append(|writer| {
             super::text::generate_string(writer, |builder| {
-                valid = self.chunks(conn, table, column, row, i, |chunk| builder.push(chunk))?;
+                valid = self.chunks_checked(conn, (table, column), row, i, malformed, |chunk| builder.push(chunk))?;
                 Ok(())
             })
         })?;
         Ok((valid && len > 2).then_some(Cell(offset, len)))
     }
 
-    /// Visit the UTF-8 chunks of the TEXT cell `select(column)` put at column `i` of `row`
-    /// without copying it anywhere. False for a cell that is not TEXT or is not UTF-8.
-    pub(crate) fn chunks(
+    fn chunks_checked(
         &self,
         conn: &Connection,
-        table: &str,
-        column: &str,
+        (table, column): (&str, &str),
         row: &rusqlite::Row<'_>,
         i: usize,
+        malformed: &mut bool,
         mut visit: impl FnMut(&str) -> Result<()>,
     ) -> Result<bool> {
         use rusqlite::types::ValueRef;
         if self.incremental {
-            if row.get_ref(i + 1)?.as_str_or_null()? != Some("text") {
-                return Ok(false);
+            match row.get_ref(i + 1)?.as_str_or_null()? {
+                None | Some("null") => return Ok(false),
+                Some("text") => {
+                    let ok = with_cell_reader(conn, table, column, row.get(i)?, |reader, _| {
+                        for_each_utf8(reader, &mut visit)
+                    })?;
+                    if !ok {
+                        *malformed = true;
+                    }
+                    return Ok(ok);
+                }
+                Some(_) => {
+                    *malformed = true;
+                    return Ok(false);
+                }
             }
-            return with_cell_reader(conn, table, column, row.get(i)?, |reader, _| {
-                for_each_utf8(reader, &mut visit)
-            });
         }
-        let ValueRef::Text(bytes) = row.get_ref(i)? else {
-            return Ok(false);
-        };
-        let Ok(text) = std::str::from_utf8(bytes) else {
-            return Ok(false);
-        };
-        visit(text)?;
-        Ok(true)
+        match row.get_ref(i)? {
+            ValueRef::Null => Ok(false),
+            ValueRef::Text(bytes) => {
+                let Ok(text) = std::str::from_utf8(bytes) else {
+                    *malformed = true;
+                    return Ok(false);
+                };
+                visit(text)?;
+                Ok(true)
+            }
+            ValueRef::Blob(_) | ValueRef::Integer(_) | ValueRef::Real(_) => {
+                *malformed = true;
+                Ok(false)
+            }
+        }
     }
 
     /// The captured store and the arena its cells are copied into, where a decoder composes text
@@ -848,12 +888,26 @@ impl Cells {
         cell: Cell,
         f: impl for<'a> FnOnce(crate::json::JsonView<'a>) -> Result<T>,
     ) -> Result<Option<T>> {
+        let mut ignored = false;
+        self.read_checked(cell, &mut ignored, f)
+    }
+
+    /// [`Self::read`], setting `*malformed = true` when `cell` is rejected as invalid JSON/UTF-8.
+    pub(crate) fn read_checked<T>(
+        &self,
+        cell: Cell,
+        malformed: &mut bool,
+        f: impl for<'a> FnOnce(crate::json::JsonView<'a>) -> Result<T>,
+    ) -> Result<Option<T>> {
         match self.source.read(
             ReadInput::Backing(self.arena.clone(), cell.0, cell.1),
             Validation::Value,
             f,
         ) {
-            Err(error) if error.downcast_ref::<crate::json::InvalidJson>().is_some() => Ok(None),
+            Err(error) if error.downcast_ref::<crate::json::InvalidJson>().is_some() => {
+                *malformed = true;
+                Ok(None)
+            }
             result => result.map(Some),
         }
     }

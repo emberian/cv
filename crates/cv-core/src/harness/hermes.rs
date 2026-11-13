@@ -1120,6 +1120,7 @@ fn table_has_rowid(conn: &Connection, table: &str) -> bool {
 }
 
 fn fold_large_cell(conn: &Connection, table: &str, col: &str, rowid: i64, digest: &mut u64) -> Result<()> {
+    use super::store::sqlite::fold_value;
     use crate::source::Rows;
     use std::io::Read as _;
     if let Ok(mut blob) = conn.blob_open(rusqlite::MAIN_DB, table, col, rowid, true) {
@@ -1131,6 +1132,17 @@ fn fold_large_cell(conn: &Connection, table: &str, col: &str, rowid: i64, digest
             }
             *digest = Rows::fold(*digest, &buf[..n]);
         }
+        return Ok(());
+    }
+    let sql = format!(
+        "SELECT \"{}\" FROM \"{}\" WHERE _rowid_ = ?1",
+        col.replace('"', "\"\""),
+        table.replace('"', "\"\"")
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query([rowid])?;
+    if let Some(row) = rows.next()? {
+        *digest = fold_value(*digest, row.get_ref(0)?);
     }
     Ok(())
 }
@@ -1157,6 +1169,8 @@ fn fold_bounded_col(
     if large {
         if let Some(rowid) = rowid {
             fold_large_cell(conn, table, col, rowid, &mut digest)?;
+        } else {
+            digest = fold_value(digest, row.get_ref(at + 2)?);
         }
     } else {
         digest = fold_value(digest, row.get_ref(at + 2)?);
@@ -1221,9 +1235,13 @@ impl MessageRevisionPlan {
         for col in &self.body_cols {
             exprs.push(format!("typeof({col})"));
             exprs.push(format!("octet_length({col})"));
-            exprs.push(format!(
-                "CASE WHEN octet_length({col}) <= {INLINE_REVISION_MAX} THEN {col} END"
-            ));
+            if self.has_rowid {
+                exprs.push(format!(
+                    "CASE WHEN octet_length({col}) <= {INLINE_REVISION_MAX} THEN {col} END"
+                ));
+            } else {
+                exprs.push((*col).to_string());
+            }
         }
         exprs
     }
@@ -1293,9 +1311,13 @@ fn session_revision(conn: &Connection, id: &str) -> Result<crate::source::Rows> 
         let q = format!("\"{}\"", col.replace('"', "\"\""));
         session_exprs.push(format!("typeof({q})"));
         session_exprs.push(format!("octet_length({q})"));
-        session_exprs.push(format!(
-            "CASE WHEN octet_length({q}) <= {INLINE_REVISION_MAX} THEN {q} END"
-        ));
+        if sessions_has_rowid {
+            session_exprs.push(format!(
+                "CASE WHEN octet_length({q}) <= {INLINE_REVISION_MAX} THEN {q} END"
+            ));
+        } else {
+            session_exprs.push(q);
+        }
     }
     let session_sql = format!("SELECT {} FROM sessions WHERE id = ?1", session_exprs.join(", "));
     let msg_plan = MessageRevisionPlan::of(conn);
@@ -1331,9 +1353,13 @@ fn session_revision(conn: &Connection, id: &str) -> Result<crate::source::Rows> 
         }
         if has_prompt_hash {
             let rowid_sel = if prompts_has_rowid { "sp._rowid_" } else { "NULL" };
+            let inline_sel = if prompts_has_rowid {
+                format!("CASE WHEN octet_length(sp.prompt) <= {INLINE_REVISION_MAX} THEN sp.prompt END")
+            } else {
+                "sp.prompt".to_string()
+            };
             let prompt_sql = format!(
-                "SELECT {rowid_sel}, typeof(sp.prompt), octet_length(sp.prompt), \
-                 CASE WHEN octet_length(sp.prompt) <= {INLINE_REVISION_MAX} THEN sp.prompt END \
+                "SELECT {rowid_sel}, typeof(sp.prompt), octet_length(sp.prompt), {inline_sel} \
                  FROM sessions s JOIN system_prompts sp ON sp.hash = s.system_prompt_hash WHERE s.id = ?1"
             );
             let mut stmt = conn.prepare(&prompt_sql)?;
@@ -1549,7 +1575,7 @@ fn stream_conn_with_reads(
         extra.insert(Harness::Hermes.as_str().into(), Value::Object(hermes_bag));
     }
 
-    let s = Session {
+    let mut s = Session {
         cwd: cwd
             .filter(|c| !c.is_empty())
             .map(PathBuf::from)
@@ -1571,6 +1597,7 @@ fn stream_conn_with_reads(
         lineage,
         ..Session::new(r.id.clone(), Harness::Hermes)
     };
+    let mut unparsed = super::Unparsed::default();
 
     // Build the SELECT defensively: required cols always present; optional cols gated by probe.
     // Plain columns are selected by name; every JSON column (and `content`) as a cell, which the
@@ -1640,7 +1667,7 @@ fn stream_conn_with_reads(
             if dedup_generations && !generations.admit(row, &idx, conn, incremental)? {
                 continue;
             }
-            let row = read_row(conn, &cells, row, &idx, &demand)?;
+            let row = read_row(conn, &cells, row, &idx, &demand, &mut unparsed)?;
             let Some(m) = row.into_message(session_origin, demand.tier) else {
                 continue;
             };
@@ -1674,6 +1701,7 @@ fn stream_conn_with_reads(
         }
         Ok(())
     })?;
+    unparsed.note(&mut s);
     Ok(s)
 }
 
@@ -2138,13 +2166,17 @@ fn read_row(
     row: &rusqlite::Row<'_>,
     idx: &impl Fn(&str) -> Option<usize>,
     demand: &Demand,
+    unparsed: &mut super::Unparsed,
 ) -> Result<MsgRow> {
     let (spans, full) = (demand.spans, demand.tier >= Tier::Rich);
+    let mut malformed = false;
     let get_str =
         |name: &str| -> Option<String> { idx(name).and_then(|i| row.get::<_, Option<String>>(i).ok().flatten()) };
     let get_i64 = |name: &str| -> Option<i64> { idx(name).and_then(|i| row.get::<_, Option<i64>>(i).ok().flatten()) };
     let get_extra = |name| full.then(|| get_str(name)).flatten();
-    let cell = |column: &str| cells.cell(conn, "messages", column, row, idx(&format!("{column}#")).unwrap());
+    let cell = |column: &str, bad: &mut bool| {
+        cells.cell_checked(conn, "messages", column, row, idx(&format!("{column}#")).unwrap(), bad)
+    };
     let role = borrowed_text(row, idx("role"));
     let display_kind = get_str("display_kind");
     let compressed_summary = get_i64("_compressed_summary").is_some_and(|n| n != 0);
@@ -2159,7 +2191,7 @@ fn read_row(
     let mut body = None;
     let mut untyped_failed_turn = false;
     {
-        if let Some(text) = cells.text(conn, "messages", "content", row, content_at)? {
+        if let Some(text) = cells.text_checked(conn, "messages", "content", row, content_at, &mut malformed)? {
             let multimodal = role != Some("tool");
             (body, untyped_failed_turn) = cells
                 .read(text, |view| content(view, multimodal, check_failed, spans, cells))?
@@ -2167,9 +2199,9 @@ fn read_row(
         }
     }
 
-    let calls = match cell("tool_calls")? {
+    let calls = match cell("tool_calls", &mut malformed)? {
         Some(calls) => cells
-            .read(calls, |view| {
+            .read_checked(calls, &mut malformed, |view| {
                 let mut calls = Vec::new();
                 if let Some(array) = view.array()? {
                     for call in array {
@@ -2194,14 +2226,22 @@ fn read_row(
         if let Some(content) = borrowed_text(row, idx("reasoning_content")).filter(|c| Some(*c) != summary) {
             reasoning.push(content);
         }
-        if let Some(details) = cell("reasoning_details")? {
-            reasoning.details = cells.read(details, |view| reasoning.read(view, true, full))?.flatten();
-            reasoning.present = true;
+        if let Some(details) = cell("reasoning_details", &mut malformed)? {
+            if let Some(parsed) =
+                cells.read_checked(details, &mut malformed, |view| reasoning.read(view, true, full))?
+            {
+                reasoning.details = parsed;
+                reasoning.present = true;
+            }
         }
         if full || reasoning.encrypted.is_none() {
-            if let Some(items) = cell("codex_reasoning_items")? {
-                reasoning.codex = cells.read(items, |view| reasoning.read(view, false, full))?.flatten();
-                reasoning.present = true;
+            if let Some(items) = cell("codex_reasoning_items", &mut malformed)? {
+                if let Some(parsed) =
+                    cells.read_checked(items, &mut malformed, |view| reasoning.read(view, false, full))?
+                {
+                    reasoning.codex = parsed;
+                    reasoning.present = true;
+                }
             }
         }
     }
@@ -2222,8 +2262,8 @@ fn read_row(
         })
     };
     let codex_message_items = if full {
-        cell("codex_message_items")?
-            .map(|items| cells.read(items, |view| Ok(view.resolve()?.into_owned())))
+        cell("codex_message_items", &mut malformed)?
+            .map(|items| cells.read_checked(items, &mut malformed, |view| Ok(view.resolve()?.into_owned())))
             .transpose()?
             .flatten()
     } else {
@@ -2241,11 +2281,14 @@ fn read_row(
         && !has_body
         && (reasoning.present
             || row_has_extra(row, idx)
-            || cell("codex_message_items")?
-                .map(|items| cells.read(items, |_| Ok(())))
+            || cell("codex_message_items", &mut malformed)?
+                .map(|items| cells.read_checked(items, &mut malformed, |_| Ok(())))
                 .transpose()?
                 .flatten()
                 .is_some());
+    if malformed {
+        unparsed.count();
+    }
     Ok(MsgRow {
         role: get_str("role").unwrap_or_default(),
         body,
@@ -3119,7 +3162,7 @@ mod tests {
             actual.materialize()?;
             let mut expected = full.clone();
             if options.tier < Tier::Rich {
-                expected.extra.clear();
+                expected.extra.retain(|k, _| k == crate::ir::CV_NAMESPACE);
                 for message in &mut expected.messages {
                     let kind = message
                         .harness_extra(Harness::Hermes)
@@ -4940,5 +4983,87 @@ mod tests {
             .stream(target_ref, &stream::Demand::LEAN, &mut SameLengthBodyMutator(&writer))
             .unwrap_err();
         assert!(err.to_string().contains("dependencies changed"), "{err:#}");
+    }
+
+    #[test]
+    fn hermes_counts_malformed_cells_in_skipped_lines_and_hashes_without_rowid_overflow_cells() {
+        let world = crate::test_world("hermes-malformed-and-without-rowid");
+        let db = world.base.join("state.db");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                started_at REAL,
+                ended_at REAL,
+                title TEXT
+            ) WITHOUT ROWID;
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                role TEXT,
+                content TEXT,
+                tool_call_id TEXT,
+                tool_calls TEXT,
+                tool_name TEXT,
+                timestamp REAL
+            ) WITHOUT ROWID;",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions(id, started_at, ended_at, title) VALUES ('s-1', 100.0, 200.0, 'Check')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages(id, session_id, role, content, timestamp) VALUES (1, 's-1', 'user', 'valid turn', 101.0)",
+            [],
+        )
+        .unwrap();
+        // Row 2: BLOB in `content` (non-TEXT storage class -> malformed)
+        conn.execute(
+            "INSERT INTO messages(id, session_id, role, content, timestamp) VALUES (2, 's-1', 'assistant', X'FFFEFD', 102.0)",
+            [],
+        )
+        .unwrap();
+        // Row 3: truncated invalid JSON in `tool_calls` -> malformed
+        conn.execute(
+            "INSERT INTO messages(id, session_id, role, content, tool_calls, timestamp) VALUES (3, 's-1', 'assistant', 'reply with bad tool_calls', '{broken_json', 103.0)",
+            [],
+        )
+        .unwrap();
+
+        let adapter = Hermes::with_db(db.clone());
+        let refs = adapter.discover().unwrap().refs;
+        assert_eq!(refs.len(), 1);
+        let parsed = adapter.parse(&refs[0]).unwrap();
+        assert_eq!(parsed.messages.len(), 2);
+        assert_eq!(
+            parsed.extra["cv"]["skipped_lines"].as_u64(),
+            Some(2),
+            "both malformed SQLite cells must be counted in extra.cv.skipped_lines: {:?}",
+            parsed.extra
+        );
+
+        // Overflow (> 2 KiB) same-length edit on WITHOUT ROWID table must move both
+        // `session_revision` and `rows_conn` even without `_rowid_`.
+        let big_a = format!("head-{}-tail", "a".repeat(8_000));
+        let big_b = format!("head-{}b{}-tail", "a".repeat(4_000), "a".repeat(3_999));
+        assert_eq!(big_a.len(), big_b.len());
+        conn.execute(
+            "INSERT INTO messages(id, session_id, role, content, timestamp) VALUES (4, 's-1', 'assistant', ?1, 104.0)",
+            [&big_a],
+        )
+        .unwrap();
+        let rev_a = session_revision(&conn, "s-1").unwrap();
+        let rows_a = rows_conn(&conn).unwrap();
+        conn.execute("UPDATE messages SET content = ?1 WHERE id = 4", [&big_b])
+            .unwrap();
+        let rev_b = session_revision(&conn, "s-1").unwrap();
+        let rows_b = rows_conn(&conn).unwrap();
+        assert_ne!(rev_a, rev_b, "WITHOUT ROWID overflow edit must move session_revision");
+        assert_ne!(
+            rows_a["s-1"], rows_b["s-1"],
+            "WITHOUT ROWID overflow edit must move rows_conn"
+        );
     }
 }
