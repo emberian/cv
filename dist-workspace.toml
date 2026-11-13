@@ -43,3 +43,7 @@ targets = [
 "actions/checkout" = "d23441a48e516b6c34aea4fa41551a30e30af803" # v6
 "actions/download-artifact" = "37930b1c2abaa49bbe596cd826c3c89aef350131" # v7
 "actions/upload-artifact" = "b7c566a772e6b6bfb58ed0dc250532a479d7789f" # v6
+
+# cargo-dist 0.31 defaults to macos-14, retired by GitHub on 2026-11-02.
+[dist.github-custom-runners]
+aarch64-apple-darwin = "macos-15"
