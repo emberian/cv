@@ -741,7 +741,7 @@ fn resolve_shipper(
 ) -> Result<(String, cv_core::state::hub::Shipper)> {
     let target = target.trim();
     if target.is_empty() {
-        bail!("--to target must not be empty (pass an `http://host:port` hub URL or a `[replication.<name>]` profile)");
+        bail!("--to target must not be empty (pass an `https://host` or `http://host:port` hub URL or a `[replication.<name>]` profile)");
     }
     let cfg = cv_core::config::load();
     let (target_name, hub_url, profile) = if target.starts_with("http://") || target.starts_with("https://") {
@@ -750,12 +750,12 @@ fn resolve_shipper(
     } else {
         if !cfg.replication.contains_key(target) {
             bail!(
-                "unknown replication target `{target}`: pass an `http://host:port` URL or configure `[replication.{target}]` with `url = \"http://...\"` in config.toml"
+                "unknown replication target `{target}`: pass an `https://host` or `http://host:port` URL or configure `[replication.{target}]` with `url = \"https://...\"` in config.toml"
             );
         }
         let prof = cv_core::state::hub::resolve_replication_profile(&cfg, target);
         let Some(url) = prof.url.clone().filter(|u| !u.trim().is_empty()) else {
-            bail!("replication profile `[replication.{target}]` has no `url = \"http://...\"` in config.toml");
+            bail!("replication profile `[replication.{target}]` has no `url = \"https://...\"` in config.toml");
         };
         (target.to_string(), url, prof)
     };

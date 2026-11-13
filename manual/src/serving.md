@@ -36,7 +36,7 @@ aborting. Unreadable resume state is said once on stderr and the session reread.
 
 ```sh
 cv archive sync
-cv archive sync --to http://100.64.0.10:7777 --token s3cret
+cv archive sync --to https://cv.example.com --token s3cret
 cv archive sync --to team-hub                  # uses [replication.team-hub] in config.toml
 ```
 
@@ -48,7 +48,13 @@ archive: /Users/you/.clustervision
 Reruns are cheap (`skipped` = unchanged). Per-session failures go to stderr without aborting.
 Run it from cron or launchd for backups without a resident process. With `--to <target>`, newly
 committed packs and events are scrubbed through `[replication.<target>]` (falling back to
-`[privacy]`) and replicated to a `cv serve --hub` receiver.
+`[privacy]`) and replicated to a `cv serve --hub` receiver. HTTPS targets verify the server certificate
+and hostname using bundled public certificate roots. Redirects are refused, so a hub cannot
+redirect your bearer token or replicated data to another endpoint.
+
+`cv serve` accepts HTTP connections; place a TLS reverse proxy in front of it to expose an
+HTTPS hub. Configure the proxy to preserve an accepted `Host` header and stream SSE responses
+without buffering. Plain HTTP remains available for loopback and private network deployments.
 
 ## `cv watch` — follow live + archive as it happens
 
