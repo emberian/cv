@@ -18,24 +18,143 @@ use std::path::PathBuf;
 pub use crate::redact::{PathRewrite, PrincipalPolicy, PrivacyPolicy, RedactClasses, ScrubProfile, SessionFilter};
 
 /// The parsed config (missing/extra fields tolerated; absent file ⇒ defaults).
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default)]
 pub struct Config {
     /// Dirs or `conversations.json` files holding account data exports to discover. Scanned ≤2 deep.
-    #[serde(default)]
     pub exports: Vec<PathBuf>,
     /// `[search]`: defaults for full-text search.
-    #[serde(default, skip_serializing_if = "Search::is_unset")]
     pub search: Search,
     /// `[privacy]`: default scrubbing & session-admission profile for sharing/exports.
-    #[serde(default, skip_serializing_if = "ScrubProfile::is_unset")]
     pub privacy: ScrubProfile,
     /// `[replication.<name>]`: per-destination scrubbing & filter profiles for fleet/hub sync.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub replication: BTreeMap<String, ScrubProfile>,
     /// Explicit per-target keys present in `[replication.<name>]` when loaded, allowing unset
-    /// fields to inherit `[privacy]` while preserving explicit `false`/`"keep"` overrides.
-    #[serde(skip)]
+    /// fields to inherit `[privacy]` while preserving explicit `false`/`"keep"`/`true`/`[]` overrides.
     pub replication_overrides: BTreeMap<String, serde_json::Map<String, serde_json::Value>>,
+}
+
+impl Serialize for Config {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut len = 1usize;
+        if !self.search.is_unset() {
+            len += 1;
+        }
+        if !self.privacy.is_unset() {
+            len += 1;
+        }
+        if !self.replication.is_empty() {
+            len += 1;
+        }
+        let mut map = serializer.serialize_map(Some(len))?;
+        map.serialize_entry("exports", &self.exports)?;
+        if !self.search.is_unset() {
+            map.serialize_entry("search", &self.search)?;
+        }
+        if !self.privacy.is_unset() {
+            map.serialize_entry("privacy", &self.privacy)?;
+        }
+        if !self.replication.is_empty() {
+            let mut rep_out = BTreeMap::new();
+            for (name, prof) in &self.replication {
+                rep_out.insert(
+                    name,
+                    serialize_replication_entry(prof, self.replication_overrides.get(name)),
+                );
+            }
+            map.serialize_entry("replication", &rep_out)?;
+        }
+        map.end()
+    }
+}
+
+fn serialize_replication_entry(
+    prof: &ScrubProfile,
+    raw_override: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> serde_json::Value {
+    let mut val = serde_json::to_value(prof).unwrap_or_else(|_| serde_json::json!({}));
+    let (serde_json::Value::Object(out), Some(raw)) = (&mut val, raw_override) else {
+        return val;
+    };
+    for (k, raw_v) in raw {
+        match k.as_str() {
+            "private_ips" => {
+                out.insert(k.clone(), serde_json::Value::Bool(prof.private_ips));
+            }
+            "hostnames" => {
+                out.insert(k.clone(), serde_json::Value::Bool(prof.hostnames));
+            }
+            "ssh_principals" => {
+                out.insert(k.clone(), serde_json::Value::Bool(prof.ssh_principals));
+            }
+            "rewrite_home" => {
+                out.insert(k.clone(), serde_json::Value::Bool(prof.rewrite_home));
+            }
+            "rewrite_repo" => {
+                out.insert(k.clone(), serde_json::Value::Bool(prof.rewrite_repo));
+            }
+            "principal" => {
+                if let Ok(pv) = serde_json::to_value(&prof.principal) {
+                    out.insert(k.clone(), pv);
+                }
+            }
+            "path_rewrites" => {
+                if let Ok(prv) = serde_json::to_value(&prof.path_rewrites) {
+                    out.insert(k.clone(), prv);
+                }
+            }
+            "classes" => {
+                if let Some(raw_classes) = raw_v.as_object() {
+                    let cls_entry = out
+                        .entry("classes")
+                        .or_insert_with(|| serde_json::Value::Object(Default::default()));
+                    if let Some(cls_obj) = cls_entry.as_object_mut() {
+                        for ck in raw_classes.keys() {
+                            let flag = match ck.as_str() {
+                                "api_keys" => Some(prof.classes.api_keys),
+                                "private_keys" => Some(prof.classes.private_keys),
+                                "jwts" => Some(prof.classes.jwts),
+                                "emails" => Some(prof.classes.emails),
+                                "blobs" => Some(prof.classes.blobs),
+                                "assignments" => Some(prof.classes.assignments),
+                                _ => None,
+                            };
+                            if let Some(b) = flag {
+                                cls_obj.insert(ck.clone(), serde_json::Value::Bool(b));
+                            }
+                        }
+                    }
+                }
+            }
+            "filter" => {
+                if let Some(raw_filter) = raw_v.as_object() {
+                    let flt_entry = out
+                        .entry("filter")
+                        .or_insert_with(|| serde_json::Value::Object(Default::default()));
+                    if let Some(flt_obj) = flt_entry.as_object_mut() {
+                        for fk in raw_filter.keys() {
+                            let fv = match fk.as_str() {
+                                "allow_cwds" => serde_json::to_value(&prof.filter.allow_cwds).ok(),
+                                "deny_cwds" => serde_json::to_value(&prof.filter.deny_cwds).ok(),
+                                "harnesses" => serde_json::to_value(&prof.filter.harnesses).ok(),
+                                "tags" => serde_json::to_value(&prof.filter.tags).ok(),
+                                _ => None,
+                            };
+                            if let Some(v) = fv {
+                                flt_obj.insert(fk.clone(), v);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {
+                if !out.contains_key(k) && !raw_v.is_null() {
+                    out.insert(k.clone(), raw_v.clone());
+                }
+            }
+        }
+    }
+    val
 }
 
 impl<'de> Deserialize<'de> for Config {
@@ -139,6 +258,15 @@ pub fn save(cfg: &Config) -> Result<PathBuf> {
     };
     let known = toml::Value::try_from(cfg).context("serializing config")?;
     let table = document.as_table_mut().context("config must be a TOML table")?;
+    if cfg.search.is_unset() {
+        table.remove("search");
+    }
+    if cfg.privacy.is_unset() {
+        table.remove("privacy");
+    }
+    if cfg.replication.is_empty() {
+        table.remove("replication");
+    }
     for (key, value) in known.as_table().context("serialized config must be a TOML table")? {
         table.insert(key.clone(), value.clone());
     }
@@ -290,5 +418,61 @@ harnesses = ["claude"]
         let reparsed: Config = toml::from_str(&serialized).unwrap();
         assert_eq!(reparsed.privacy, parsed.privacy);
         assert_eq!(reparsed.replication, parsed.replication);
+    }
+
+    #[test]
+    fn save_preserves_explicit_default_valued_replication_overrides_across_updates() {
+        let _world = crate::test_world("config-replication-override-save");
+        let path = save(&Config::default()).unwrap();
+        let raw = r#"
+exports = ["/tmp/old-export"]
+
+[privacy]
+private_ips = true
+hostnames = true
+principal = "drop"
+
+[privacy.classes]
+jwts = false
+
+[privacy.filter]
+deny_cwds = ["/secret"]
+
+[replication.team-hub]
+url = "http://127.0.0.1:9123/"
+private_ips = false
+principal = "keep"
+
+[replication.team-hub.classes]
+jwts = true
+
+[replication.team-hub.filter]
+deny_cwds = []
+"#;
+        std::fs::write(&path, raw).unwrap();
+
+        // Simulate `cv config --add-export /tmp/new-export`: load_for_update -> mutate exports -> save.
+        let mut cfg = load_for_update().unwrap();
+        cfg.exports.push(PathBuf::from("/tmp/new-export"));
+        save(&cfg).unwrap();
+
+        let reloaded = load_for_update().unwrap();
+        assert_eq!(
+            reloaded.exports,
+            vec![PathBuf::from("/tmp/old-export"), PathBuf::from("/tmp/new-export")]
+        );
+        let resolved = crate::state::hub::resolve_replication_profile(&reloaded, "team-hub");
+        assert!(resolved.hostnames, "unset hostnames must still inherit [privacy]");
+        assert!(!resolved.private_ips, "explicit private_ips = false must survive save");
+        assert_eq!(
+            resolved.principal,
+            PrincipalPolicy::Keep,
+            "explicit principal = 'keep' must survive save"
+        );
+        assert!(resolved.classes.jwts, "explicit classes.jwts = true must survive save");
+        assert!(
+            resolved.filter.deny_cwds.is_empty(),
+            "explicit filter.deny_cwds = [] must survive save"
+        );
     }
 }

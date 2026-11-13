@@ -397,7 +397,12 @@ impl ScrubProfile {
             }
         }
 
-        // Struct-literal fallback when `Config` was constructed in Rust without deserialization.
+        // Struct-literal fallback when `Config` was constructed in Rust without TOML/JSON
+        // deserialization (`raw_override == None`): `ScrubProfile::default()` initializes all
+        // `RedactClasses` booleans to `true` and opt-in flags to `false`, so monotonic Lattice
+        // combination prevents an unset default field from silently re-enabling a disabled class
+        // or disabling an enabled `[privacy]` flag. Deserialized configs always take the exact
+        // key-presence branch above via `Config::replication_overrides`.
         Self {
             url: self.url.clone().or_else(|| base.url.clone()),
             token: self.token.clone().or_else(|| base.token.clone()),
