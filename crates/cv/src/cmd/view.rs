@@ -872,7 +872,11 @@ pub(crate) fn cmd_export(
             )?;
             *stats.borrow_mut() = st;
         }
-        other => bail!("unknown format {other:?} (use md or json; `cv share` for html)"),
+        other => {
+            return crate::util::usage(format!(
+                "unknown format {other:?} (use md or json; `cv share` for html)"
+            ))
+        }
     }
     if redact {
         eprintln!("{}", redaction_summary(&stats.borrow()));

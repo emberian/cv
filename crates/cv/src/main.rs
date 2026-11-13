@@ -1199,6 +1199,7 @@ fn run() -> Result<()> {
             Cmd::Archive { action, .. } => matches!(action, ArchiveCmd::Sync { .. }),
             Cmd::Config { add_export, rm_export } => add_export.is_some() || rm_export.is_some(),
             Cmd::Pack { format, out, .. } => format == "session" || out.is_some(),
+            Cmd::Dataset { file, .. } => file.is_some(),
             Cmd::Resume { launch, .. } => *launch,
             Cmd::Retire { agent, .. } => agent.is_some(),
             _ => false,

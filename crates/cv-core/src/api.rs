@@ -320,7 +320,16 @@ fn lookup(harness: &str, id: &str) -> Result<(SessionRef, Box<dyn crate::Adapter
     match crate::find(id, Some(h)) {
         Ok(Some(found)) => Ok(found),
         Ok(None) => Err(err(404, "session not found")),
-        Err(e) => Err(err(500, &e.to_string())),
+        Err(e) => {
+            let msg = e.to_string();
+            let status =
+                if msg.starts_with("ambiguous session id") || msg.contains("sessions have a sub-agent matching") {
+                    400
+                } else {
+                    500
+                };
+            Err(err(status, &msg))
+        }
     }
 }
 
@@ -939,6 +948,28 @@ mod tests {
             assert_eq!(route_json(parts, "").0, 404, "{parts:?}");
         }
         assert_eq!(route_json(&["api", "sessions"], "harness=warpdrive").0, 400);
+    }
+
+    #[test]
+    fn ambiguous_session_prefix_returns_400_bad_request() {
+        let world = crate::test_world("api-ambiguous-400");
+        let proj = world.home.join(".claude/projects/-tmp");
+        std::fs::create_dir_all(&proj).unwrap();
+        for id in ["ambig-one", "ambig-two"] {
+            let line = serde_json::json!({
+                "type": "user",
+                "sessionId": id,
+                "uuid": "u1",
+                "message": {"role": "user", "content": "hello"}
+            });
+            std::fs::write(proj.join(format!("{id}.jsonl")), format!("{line}\n")).unwrap();
+        }
+        let (status, body) = route_json(&["api", "session", "claude", "ambig"], "");
+        assert_eq!(status, 400, "ambiguous session prefix must return 400: {body}");
+        assert!(body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("ambiguous session id"));
     }
 }
 

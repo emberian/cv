@@ -872,8 +872,8 @@ class CvApp extends HTMLElement {
     const indices = new Map(pool.map((session, index) => [sessionKey(session), index]));
     for (const session of incoming) {
       const key = sessionKey(session);
-      if (session._remote && indices.has(key)) {
-        out[indices.get(key)] = session; // refresh source identity; never rename a remote id
+      if ((session._remote || session._wasm) && indices.has(key)) {
+        out[indices.get(key)] = session; // refresh source/wasm identity; never rename a dropped or remote id
         continue;
       }
       let add = session;

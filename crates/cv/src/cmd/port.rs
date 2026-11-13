@@ -36,7 +36,7 @@ pub(crate) fn cmd_port(
     // The source harness rides on the id (`codex:019e…`); `--harness` is the TARGET.
     let (r, adapter) = crate::cmd::distill::resolve_source(id, None)?;
     let to_h = match &harness {
-        Some(s) => Harness::parse(s).with_context(|| format!("unknown target harness: {s}"))?,
+        Some(s) => Harness::parse(s).ok_or_else(|| crate::util::UsageError(format!("unknown target harness: {s}")))?,
         None => r.harness, // a pure rehome
     };
     if skills_policy != SkillsPolicy::Keep && !cv_core::harness::has_derived_copies(to_h) {

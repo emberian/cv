@@ -126,7 +126,7 @@ fn scope_window(all: bool, since: Option<&str>, now: DateTime<Utc>) -> Result<Op
         return Ok(None);
     }
     match since {
-        Some(s) => Ok(Some(task::parse_since(s, now).map_err(|e| anyhow::anyhow!(e))?)),
+        Some(s) => Ok(Some(task::parse_since(s, now).map_err(crate::util::UsageError)?)),
         None => Ok(Some(now - chrono::Duration::days(14))),
     }
 }
@@ -604,7 +604,7 @@ fn close_with_note(id: &str, from: &str, note: Option<String>, close: TaskEventK
 }
 
 fn resolve<'m>(model: &'m cv_core::task::TaskReadModel, prefix: &str) -> Result<&'m str> {
-    task::resolve_id(model, prefix).map_err(|e| anyhow::anyhow!(e))
+    task::resolve_id(model, prefix).map_err(|e| crate::util::UsageError(e).into())
 }
 
 /// One `cv task list` row: id, age since last event (G8), state, assignee, title — rendered from
@@ -816,20 +816,36 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                 return Ok(());
             }
             let grep = match &notes_grep {
-                Some(p) => Some(regex::RegexBuilder::new(p).case_insensitive(true).build()?),
+                Some(p) => Some(
+                    regex::RegexBuilder::new(p)
+                        .case_insensitive(true)
+                        .build()
+                        .map_err(|e| crate::util::UsageError(format!("invalid --notes-grep regex {p:?}: {e}")))?,
+                ),
                 None => None,
             };
             if json {
-                println!("{}", serde_json::to_string_pretty(t)?);
+                if events {
+                    let history: Vec<_> = outcome.events.iter().filter(|e| e.task_id == id).collect();
+                    let doc = serde_json::json!({
+                        "task": t,
+                        "effective_state": cv_core::task::effective_display(t),
+                        "warnings": outcome.warnings,
+                        "events": history,
+                    });
+                    println!("{}", serde_json::to_string_pretty(&doc)?);
+                } else {
+                    println!("{}", serde_json::to_string_pretty(t)?);
+                }
             } else {
                 print!(
                     "{}",
                     render_show(&outcome.model, t, brief, grep.as_ref(), notes_last, Utc::now())
                 );
-            }
-            if events {
-                let history: Vec<_> = outcome.events.iter().filter(|e| e.task_id == id).collect();
-                println!("{}", serde_json::to_string_pretty(&history)?);
+                if events {
+                    let history: Vec<_> = outcome.events.iter().filter(|e| e.task_id == id).collect();
+                    println!("{}", serde_json::to_string_pretty(&history)?);
+                }
             }
             Ok(())
         }
@@ -954,7 +970,7 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
             let body = body_arg(body, body_file)?;
             let now = Utc::now();
             let deadline = match by {
-                Some(b) => Some(task::parse_deadline(&b, now).map_err(|e| anyhow::anyhow!(e))?),
+                Some(b) => Some(task::parse_deadline(&b, now).map_err(crate::util::UsageError)?),
                 None => None,
             };
             let blocks = if blocks.is_empty() {

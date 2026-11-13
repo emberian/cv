@@ -220,7 +220,7 @@ impl Since {
                 id: Some(s.to_string()),
             });
         }
-        let ts = task::parse_since(s, now).map_err(|e| anyhow::anyhow!(e))?;
+        let ts = task::parse_since(s, now).map_err(crate::util::UsageError)?;
         Ok(Since { ts: Some(ts), id: None })
     }
 

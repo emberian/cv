@@ -58,9 +58,13 @@ pub(crate) fn cmd_pack(args: PackArgs<'_>) -> Result<()> {
         crate::util::user_file_claim(path, force)?;
     }
     let to_h = match (format, &harness) {
-        ("session", Some(s)) => Some(Harness::parse(s).with_context(|| format!("unknown target harness: {s}"))?),
-        ("session", None) => bail!("--format session needs --harness <harness> (e.g. --harness claude)"),
-        (_, Some(_)) => bail!("--harness only applies to --format session"),
+        ("session", Some(s)) => {
+            Some(Harness::parse(s).ok_or_else(|| crate::util::UsageError(format!("unknown target harness: {s}")))?)
+        }
+        ("session", None) => {
+            return crate::util::usage("--format session needs --harness <harness> (e.g. --harness claude)")
+        }
+        (_, Some(_)) => return crate::util::usage("--harness only applies to --format session"),
         _ => None,
     };
     let limit = limit.max(1);

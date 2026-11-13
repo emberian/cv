@@ -156,20 +156,30 @@ fn follow_workflow(r: &cv_core::SessionRef, key: &str, render: Render, wait: Wai
             seen.insert(a.index, state.clone());
             let glyph = state_glyph(Some(&state), "▸");
             let tok = a.tokens.map(|t| format!(" ({} tok)", fmt_int(t))).unwrap_or_default();
-            println!(
+            let line = format!(
                 "{now}  {glyph} {} → {state}{tok}",
                 a.label.as_deref().unwrap_or("(agent)")
             );
+            if render.json {
+                eprintln!("{line}");
+            } else {
+                println!("{line}");
+            }
         }
         let live = matches!(wf.status.as_deref(), None | Some("running") | Some("started"));
         if live && wait.pause(std::time::Duration::from_secs(2)) {
             continue;
         }
         let status = wf.status.as_deref().unwrap_or("?");
-        if live {
-            println!("\n── --for elapsed, run still {status} ──\n");
+        let banner = if live {
+            format!("\n── --for elapsed, run still {status} ──\n")
         } else {
-            println!("\n── run reached {status} ──\n");
+            format!("\n── run reached {status} ──\n")
+        };
+        if render.json {
+            eprintln!("{banner}");
+        } else {
+            println!("{banner}");
         }
         let mut wf = wf;
         wf.attach_journal(&r.path);
@@ -265,6 +275,17 @@ fn workflow_by_name_fleetwide(
             }
         } else {
             refuse_run_flags(run_flags, "ghost launches")?;
+            if render.json {
+                let ghost_list: Vec<_> = ghosts.iter().map(|(_, g)| g).collect();
+                let sessions: Vec<_> = ghosts.iter().map(|(r, _)| &r.id).collect();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &serde_json::json!({"runs": [], "ghost_launches": ghost_list, "sessions": sessions})
+                    )?
+                );
+                return Ok(());
+            }
             println!(
                 "no recorded run named {name:?} — but {} GHOST launch(es) match (state never persisted; crash/kill before write?):\n",
                 ghosts.len()
@@ -304,6 +325,17 @@ fn workflow_by_name_fleetwide(
         return emit_workflow(&wf, render, Some(r.path.as_path()));
     }
     refuse_run_flags(run_flags, "the runs matching a name")?;
+    if render.json {
+        let runs: Vec<_> = hits.iter().map(|(_, w)| w).collect();
+        let sessions: Vec<_> = hits.iter().map(|(r, _)| &r.id).collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(
+                &serde_json::json!({"runs": runs, "ghost_launches": [], "sessions": sessions})
+            )?
+        );
+        return Ok(());
+    }
     println!("# {} workflow run(s) matching {name:?}:\n", hits.len());
     for (r, w) in &hits {
         println!(

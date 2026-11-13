@@ -1326,6 +1326,9 @@ await acheck("failed upload preserves demo and source merge preserves cross-harn
   const merged = app._mergePool([demo], [other]); eq(merged[1].id, "same", "cross-harness id is not renamed");
   const remote = { ...demo, _remote: true, title: "refreshed" };
   const refreshed = app._mergePool([demo], [remote]); eq(refreshed.length, 1, "remote identity refreshed"); eq(refreshed[0].id, "same", "source id unchanged");
+  const wasmDrop = { ...demo, _wasm: true, title: "re-dropped wasm" };
+  const wasmRefreshed = app._mergePool([wasmDrop], [{ ...wasmDrop, title: "updated wasm" }]);
+  eq(wasmRefreshed.length, 1, "wasm re-drop refreshes in place"); eq(wasmRefreshed[0].id, "same", "wasm id unchanged"); eq(wasmRefreshed[0].title, "updated wasm", "wasm payload refreshed");
 });
 check("stats describe the actual loaded page coverage", () => {
   const stats = document.createElement("cv-stats"); stats._asked = true;

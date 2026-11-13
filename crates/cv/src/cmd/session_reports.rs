@@ -358,13 +358,12 @@ pub(crate) fn cmd_lanes(
     };
     let since = match since {
         Some(s) => {
-            let d = cv_core::task::parse_duration(&s)
-                .ok_or_else(|| anyhow::anyhow!("--since takes a duration: 30m, 2h, 1d, 1w (got {s:?})"))?;
-            Some(
-                chrono::Utc::now()
-                    .checked_sub_signed(d)
-                    .ok_or_else(|| anyhow::anyhow!("--since duration is outside the supported date range: {s:?}"))?,
-            )
+            let d = cv_core::task::parse_duration(&s).ok_or_else(|| {
+                crate::util::UsageError(format!("--since takes a duration: 30m, 2h, 1d, 1w (got {s:?})"))
+            })?;
+            Some(chrono::Utc::now().checked_sub_signed(d).ok_or_else(|| {
+                crate::util::UsageError(format!("--since duration is outside the supported date range: {s:?}"))
+            })?)
         }
         None => None,
     };

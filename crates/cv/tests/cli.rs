@@ -4356,3 +4356,44 @@ fn exact_search_uses_trigram_index_for_interior_code_substrings() {
     let found: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert!(found["total"].as_u64().unwrap() > 0, "{out}");
 }
+
+#[test]
+fn frozen_dataset_file_refusal_task_show_json_events_and_usage_exit_codes() {
+    let w = World::new("frozen-dataset-and-exit-codes");
+    standard_corpus(&w);
+
+    // [D1] `--frozen dataset --file <path>` is refused with exit 2 and does not create the file,
+    // while `--frozen dataset` (stdout) succeeds cleanly.
+    let ds_out = w.base.join("frozen-leak.jsonl");
+    let (ok, code, _, err) = w.cv(&["--frozen", "dataset", "--file", ds_out.to_str().unwrap()]);
+    assert!(!ok && code == 2 && err.contains("--frozen"), "{err}");
+    assert!(!ds_out.exists(), "frozen dataset --file must not write output");
+    w.cv_ok(&["--frozen", "dataset"]);
+
+    // [D2] `cv task show <id> --json --events` emits a single parseable JSON document.
+    let (open_out, _) = w.cv_ok(&["task", "open", "check json events", "--from", "agent:test"]);
+    let tid = open_out.lines().last().unwrap().trim().to_string();
+    let (show_json, _) = w.cv_ok(&["task", "show", &tid, "--json", "--events"]);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&show_json).expect("task show --json --events must emit a single valid JSON object");
+    assert_eq!(parsed["task"]["task_id"].as_str(), Some(tid.as_str()));
+    assert!(
+        parsed["events"].as_array().is_some_and(|a| !a.is_empty()),
+        "{show_json}"
+    );
+
+    // [D6] Caller validation mistakes exit with code 2 (UsageError), not 1.
+    for bad_args in [
+        vec!["export", "alphasess", "--format", "docx"],
+        vec!["lanes", "--since", "not-a-duration"],
+        vec!["task", "show", "nonexistent-task-id"],
+        vec!["task", "show", &tid, "--notes-grep", "[unclosed"],
+        vec!["task", "events", "--since", "whenever"],
+        vec!["port", "alphasess", "--harness", "notaharness"],
+        vec!["pack", "needle", "--format", "session"],
+        vec!["pack", "needle", "--format", "md", "--harness", "claude"],
+    ] {
+        let (ok, code, _, err) = w.cv(&bad_args);
+        assert!(!ok && code == 2, "expected exit 2 for {bad_args:?}, got {code}: {err}");
+    }
+}
