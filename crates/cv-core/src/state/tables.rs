@@ -327,6 +327,42 @@ impl StateStore {
             .optional()?)
     }
 
+    /// List durable operation bindings in `[min_pos, max_pos]` ordered by `local_commit_pos`.
+    pub fn list_operation_bindings_range(
+        &self,
+        min_pos: i64,
+        max_pos: i64,
+    ) -> Result<Vec<(String, DurableReceipt)>, StateError> {
+        if min_pos > max_pos {
+            return Ok(Vec::new());
+        }
+        let Some(conn) = self.open_readonly()? else {
+            return Ok(Vec::new());
+        };
+        let mut stmt = conn.prepare(
+            "SELECT op_id, producer_id, epoch, seq, local_commit_pos
+             FROM operation_bindings
+             WHERE local_commit_pos >= ?1 AND local_commit_pos <= ?2
+             ORDER BY local_commit_pos ASC",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![min_pos, max_pos], |r| {
+            let op_id: String = r.get(0)?;
+            let prod: String = r.get(1)?;
+            let epoch: String = r.get(2)?;
+            let seq: i64 = r.get(3)?;
+            let pos: i64 = r.get(4)?;
+            Ok((
+                op_id,
+                DurableReceipt {
+                    event_id: EventId::new(prod, epoch, seq as u64),
+                    local_commit_pos: pos,
+                    replayed: true,
+                },
+            ))
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     /// Read retained rows in `capture_inbox` within `[min_pos, max_pos]` ordered by `local_commit_pos`.
     pub fn read_inbox_range(&self, min_pos: i64, max_pos: i64) -> Result<Vec<CaptureInboxRow>, StateError> {
         if min_pos > max_pos {

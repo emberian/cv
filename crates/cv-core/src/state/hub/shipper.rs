@@ -29,13 +29,31 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// Resolve the [`ScrubProfile`] for replication target `target` (`[replication.<target>]`),
-/// falling back to `[privacy]` when no target-specific profile is configured.
+fn normalize_hub_url_key(url: &str) -> &str {
+    url.trim().trim_end_matches('/')
+}
+
+/// Resolve the [`ScrubProfile`] for replication target `target` (`[replication.<target>]` by name
+/// or matching `url`), inheriting unset fields from `[privacy]` and falling back to `[privacy]`
+/// when no target-specific profile matches.
 pub fn resolve_replication_profile(cfg: &Config, target: &str) -> ScrubProfile {
-    cfg.replication
-        .get(target)
-        .cloned()
-        .unwrap_or_else(|| cfg.privacy.clone())
+    let trimmed = target.trim();
+    let matched = cfg.replication.get_key_value(trimmed).or_else(|| {
+        if trimmed.is_empty() {
+            return None;
+        }
+        let norm_target = normalize_hub_url_key(trimmed);
+        cfg.replication.iter().find(|(_, prof)| {
+            prof.url
+                .as_deref()
+                .is_some_and(|u| !u.trim().is_empty() && normalize_hub_url_key(u) == norm_target)
+        })
+    });
+
+    match matched {
+        Some((name, prof)) => prof.inherit_from(&cfg.privacy, cfg.replication_overrides.get(name)),
+        None => cfg.privacy.clone(),
+    }
 }
 
 /// Stage-1 transport delivery acknowledgement (HTTP response received over TCP; NOT yet a durable
@@ -486,9 +504,10 @@ pub fn capture_discovered_sessions(
     Ok(receipts)
 }
 
-/// Seal all currently unpacked rows in `store.capture_inbox` into a single consolidated local
-/// Zstd-Seekable pack under `local_packs_dir` and atomically transfer ownership via
-/// [`StateStore::publish_pack_range`].
+/// Seal all currently unpacked rows in `store.capture_inbox` into consolidated local
+/// Zstd-Seekable pack(s) under `local_packs_dir` (one pack per maximal contiguous
+/// `local_commit_pos` sub-run so straddling an already-published pack never fails) and atomically
+/// transfer ownership via [`StateStore::publish_pack_range`].
 pub fn seal_local_inbox_to_pack(
     store: &StateStore,
     local_packs_dir: &Path,
@@ -500,79 +519,100 @@ pub fn seal_local_inbox_to_pack(
     }
 
     std::fs::create_dir_all(local_packs_dir)?;
-    let min_pos = rows.first().expect("non-empty").local_commit_pos;
-    let max_pos = rows.last().expect("non-empty").local_commit_pos;
-    let pack_id = match explicit_pack_id {
-        Some(id) => id.to_string(),
-        None => format!(
-            "inbox-{min_pos}-{max_pos}-{}",
-            &uuid::Uuid::new_v4().simple().to_string()[..8]
-        ),
-    };
 
-    let mut builder = PackBuilder::create(local_packs_dir, &pack_id).map_err(|e| HubError::Pack(format!("{e:#}")))?;
-    let mut entries = Vec::with_capacity(rows.len());
-
-    for row in &rows {
-        let new_addr = if let Some(ref pref) = row.payload_ref {
-            let old_addr: PayloadAddr = serde_json::from_str(pref)?;
-            let old_pack =
-                SealedPack::open(local_packs_dir, &old_addr.pack_id).map_err(|e| HubError::Pack(format!("{e:#}")))?;
-            let bytes = old_pack
-                .read_payload(&old_addr)
-                .map_err(|e| HubError::Pack(format!("{e:#}")))?;
-            let anchor = format!("commit:{}", row.local_commit_pos);
-            Some(
-                builder
-                    .append_record(anchor, &bytes)
-                    .map_err(|e| HubError::Pack(format!("{e:#}")))?,
-            )
-        } else if let Some(inline_sess) = row.envelope.get("session") {
-            let bytes = serde_json::to_vec(inline_sess)?;
-            let anchor = format!("commit:{}", row.local_commit_pos);
-            Some(
-                builder
-                    .append_record(anchor, &bytes)
-                    .map_err(|e| HubError::Pack(format!("{e:#}")))?,
-            )
-        } else {
-            None
-        };
-
-        entries.push(SealedCommitEntry {
-            local_commit_pos: row.local_commit_pos,
-            producer_id: row.producer_id.clone(),
-            epoch: row.epoch.clone(),
-            seq: row.seq,
-            op_id: row.op_id.clone(),
-            envelope: row.envelope.clone(),
-            payload_addr: new_addr,
-        });
+    let mut runs: Vec<Vec<CaptureInboxRow>> = Vec::new();
+    for row in rows {
+        if let Some(last_run) = runs.last_mut() {
+            if let Some(prev) = last_run.last() {
+                if row.local_commit_pos == prev.local_commit_pos + 1 {
+                    last_run.push(row);
+                    continue;
+                }
+            }
+        }
+        runs.push(vec![row]);
     }
 
-    // Envelopes are retained evidence, not SQLite index metadata. One addressed record
-    // preserves all commit entries; SQLite holds only its small verified locator.
-    let commits_addr = builder
-        .append_record("inbox-commits", &serde_json::to_vec(&entries)?)
-        .map_err(|e| HubError::Pack(format!("{e:#}")))?;
-    let _sealed_manifest = builder.seal(Claim::New).map_err(|e| HubError::Pack(format!("{e:#}")))?;
-    let zst_path = pack_zst_path(local_packs_dir, &pack_id).map_err(|e| HubError::Pack(format!("{e:#}")))?;
-    let zst_bytes = std::fs::read(&zst_path)?;
-    let pack_digest = blake3::hash(&zst_bytes).to_hex().to_string();
+    let mut last_manifest = None;
+    for (run_idx, run) in runs.into_iter().enumerate() {
+        let min_pos = run.first().expect("non-empty").local_commit_pos;
+        let max_pos = run.last().expect("non-empty").local_commit_pos;
+        let pack_id = match explicit_pack_id {
+            Some(id) if run_idx == 0 => id.to_string(),
+            Some(id) => format!("{id}--r{run_idx}"),
+            None => format!(
+                "inbox-{min_pos}-{max_pos}-{}",
+                &uuid::Uuid::new_v4().simple().to_string()[..8]
+            ),
+        };
 
-    let state_manifest = LocalStatePackManifest {
-        pack_id: pack_id.clone(),
-        min_commit_pos: min_pos,
-        max_commit_pos: max_pos,
-        record_count: rows.len() as u64,
-        byte_len: zst_bytes.len() as u64,
-        digest: pack_digest,
-        pack_path: zst_path.to_string_lossy().into_owned(),
-        index_meta: json!({ "commits_addr": commits_addr }),
-        published_at: Utc::now().timestamp_millis(),
-    };
-    store.publish_pack_range(&state_manifest)?;
-    Ok(Some(state_manifest))
+        let mut builder =
+            PackBuilder::create(local_packs_dir, &pack_id).map_err(|e| HubError::Pack(format!("{e:#}")))?;
+        let mut entries = Vec::with_capacity(run.len());
+
+        for row in &run {
+            let new_addr = if let Some(ref pref) = row.payload_ref {
+                let old_addr: PayloadAddr = serde_json::from_str(pref)?;
+                let old_pack = SealedPack::open(local_packs_dir, &old_addr.pack_id)
+                    .map_err(|e| HubError::Pack(format!("{e:#}")))?;
+                let bytes = old_pack
+                    .read_payload(&old_addr)
+                    .map_err(|e| HubError::Pack(format!("{e:#}")))?;
+                let anchor = format!("commit:{}", row.local_commit_pos);
+                Some(
+                    builder
+                        .append_record(anchor, &bytes)
+                        .map_err(|e| HubError::Pack(format!("{e:#}")))?,
+                )
+            } else if let Some(inline_sess) = row.envelope.get("session") {
+                let bytes = serde_json::to_vec(inline_sess)?;
+                let anchor = format!("commit:{}", row.local_commit_pos);
+                Some(
+                    builder
+                        .append_record(anchor, &bytes)
+                        .map_err(|e| HubError::Pack(format!("{e:#}")))?,
+                )
+            } else {
+                None
+            };
+
+            entries.push(SealedCommitEntry {
+                local_commit_pos: row.local_commit_pos,
+                producer_id: row.producer_id.clone(),
+                epoch: row.epoch.clone(),
+                seq: row.seq,
+                op_id: row.op_id.clone(),
+                envelope: row.envelope.clone(),
+                payload_addr: new_addr,
+            });
+        }
+
+        // Envelopes are retained evidence, not SQLite index metadata. One addressed record
+        // preserves all commit entries; SQLite holds only its small verified locator.
+        let commits_addr = builder
+            .append_record("inbox-commits", &serde_json::to_vec(&entries)?)
+            .map_err(|e| HubError::Pack(format!("{e:#}")))?;
+        let _sealed_manifest = builder.seal(Claim::New).map_err(|e| HubError::Pack(format!("{e:#}")))?;
+        let zst_path = pack_zst_path(local_packs_dir, &pack_id).map_err(|e| HubError::Pack(format!("{e:#}")))?;
+        let zst_bytes = std::fs::read(&zst_path)?;
+        let pack_digest = blake3::hash(&zst_bytes).to_hex().to_string();
+
+        let state_manifest = LocalStatePackManifest {
+            pack_id,
+            min_commit_pos: min_pos,
+            max_commit_pos: max_pos,
+            record_count: run.len() as u64,
+            byte_len: zst_bytes.len() as u64,
+            digest: pack_digest,
+            pack_path: zst_path.to_string_lossy().into_owned(),
+            index_meta: json!({ "commits_addr": commits_addr }),
+            published_at: Utc::now().timestamp_millis(),
+        };
+        store.publish_pack_range(&state_manifest)?;
+        last_manifest = Some(state_manifest);
+    }
+
+    Ok(last_manifest)
 }
 
 /// Replication shipper client driving enrollment, privacy scrubbing, pack upload, batch ingestion,
@@ -709,6 +749,12 @@ impl Shipper {
         let (_, enroll_ack) = self.enroll()?;
         report.transport_acks.push(enroll_ack);
 
+        // Seal any unpacked `capture_inbox` rows (e.g. hook receipts / lane events) into local
+        // pack custody so `capture_inbox` drains to 0 once synced and `cv watch --to` remains idle.
+        if !crate::env::frozen() && store.inbox_count()? > 0 {
+            let _ = seal_local_inbox_to_pack(store, local_packs_dir, None)?;
+        }
+
         let profile = self.resolved_profile();
         let compiled = profile
             .compile()
@@ -836,13 +882,12 @@ impl Shipper {
         // (`publish-before-reference`!). Using a per-payload content-addressed `out_pack_id`
         // ensures `PayloadAddr` is a pure function of `scrubbed_payload`, invariant across
         // retries, `force_reship`, and batch boundaries.
-        let outbound_dir = local_packs_dir.join(".ship-outbound");
-        std::fs::create_dir_all(&outbound_dir)?;
-
         let mut item_addrs: Vec<Option<PayloadAddr>> = vec![None; prepared.len()];
         let mut uploaded_packs: BTreeMap<String, (PayloadAddr, String)> = BTreeMap::new();
 
         if has_any_payload {
+            let outbound_dir = local_packs_dir.join(".ship-outbound");
+            std::fs::create_dir_all(&outbound_dir)?;
             for (idx, item) in prepared.iter().enumerate() {
                 let Some(ref bytes) = item.scrubbed_payload else {
                     continue;
@@ -873,10 +918,20 @@ impl Shipper {
                     .map_err(|e| HubError::Pack(format!("{e:#}")))?;
                 builder.seal(Claim::New).map_err(|e| HubError::Pack(format!("{e:#}")))?;
 
-                let (upload_resp, upload_ack) = self.upload_pack_files(&outbound_dir, &out_pack_id)?;
+                let upload_res = self.upload_pack_files(&outbound_dir, &out_pack_id);
+                let _ = std::fs::remove_file(&out_zst);
+                let _ = std::fs::remove_file(&out_idx);
+                let (upload_resp, upload_ack) = match upload_res {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        let _ = std::fs::remove_dir(&outbound_dir);
+                        return Err(e);
+                    }
+                };
                 report.transport_acks.push(upload_ack);
 
                 if !upload_resp.durable_fsynced {
+                    let _ = std::fs::remove_dir(&outbound_dir);
                     return Err(HubError::Transport {
                         status: Some(200),
                         message: format!("hub did not confirm durable fsync for pack `{out_pack_id}`"),
@@ -887,6 +942,7 @@ impl Shipper {
                 item_addrs[idx] = Some(addr.clone());
                 uploaded_packs.insert(upload_resp.pack.pack_id, (addr, upload_resp.pack.blake3_digest));
             }
+            let _ = std::fs::remove_dir(&outbound_dir);
         }
 
         // Build `IngestBatchRequest` referencing the already-published outbound pack addresses.
@@ -964,6 +1020,7 @@ impl Shipper {
 fn collect_local_commits(store: &StateStore, local_packs_dir: &Path) -> Result<Vec<SealedCommitEntry>, HubError> {
     let mut out = Vec::new();
     for pm in store.list_pack_manifests()? {
+        let mut handled_manifest = false;
         if let Some(value) = pm.index_meta.get("commits_addr") {
             let addr: PayloadAddr = serde_json::from_value(value.clone())?;
             let raw_parent = Path::new(&pm.pack_path).parent();
@@ -974,11 +1031,106 @@ fn collect_local_commits(store: &StateStore, local_packs_dir: &Path) -> Result<V
             let pack = SealedPack::open(dir, &addr.pack_id).map_err(|e| HubError::Pack(format!("{e:#}")))?;
             let bytes = pack.read_payload(&addr).map_err(|e| HubError::Pack(format!("{e:#}")))?;
             out.extend(serde_json::from_slice::<Vec<SealedCommitEntry>>(&bytes)?);
+            handled_manifest = true;
         }
         if let Some(arr) = pm.index_meta.get("commits").and_then(Value::as_array) {
             for val in arr {
                 let entry: SealedCommitEntry = serde_json::from_value(val.clone())?;
                 out.push(entry);
+            }
+            handled_manifest = true;
+        }
+        if !handled_manifest {
+            // Legacy pre-`f4ff1ce0` `archive` pack manifests persisted `index_meta.sessions` and
+            // durable `(op_id, producer_id, epoch, seq, local_commit_pos)` rows in `operation_bindings`
+            // without `commits_addr` or `commits`. Reconstruct their commit entries so `(epoch, seq)`
+            // stays contiguous (`1..=K`) and historical archived sessions ship cleanly.
+            let binding_by_pos: BTreeMap<i64, (String, DurableReceipt)> = store
+                .list_operation_bindings_range(pm.min_commit_pos, pm.max_commit_pos)?
+                .into_iter()
+                .map(|(op_id, rec)| (rec.local_commit_pos, (op_id, rec)))
+                .collect();
+            let phys_pack_id = pm
+                .index_meta
+                .get("physical_pack_id")
+                .and_then(Value::as_str)
+                .or_else(|| pm.pack_id.split_once("--r").map(|(base, _)| base))
+                .unwrap_or(&pm.pack_id);
+            if let Some(sessions) = pm.index_meta.get("sessions").and_then(Value::as_array) {
+                for (idx, sess_val) in sessions.iter().enumerate() {
+                    let pos = pm.min_commit_pos + idx as i64;
+                    let (op_id, producer_id, epoch, seq) = match binding_by_pos.get(&pos) {
+                        Some((op_id, rec)) => (
+                            op_id.clone(),
+                            rec.event_id.producer_id.clone(),
+                            rec.event_id.epoch.clone(),
+                            rec.event_id.seq,
+                        ),
+                        None => {
+                            let prod = sess_val
+                                .get("producer_id")
+                                .and_then(Value::as_str)
+                                .unwrap_or_else(|| store.default_producer())
+                                .to_string();
+                            let harness = sess_val.get("harness").and_then(Value::as_str).unwrap_or("unknown");
+                            let sid = sess_val
+                                .get("id")
+                                .or_else(|| sess_val.get("session_id"))
+                                .and_then(Value::as_str)
+                                .unwrap_or("unknown");
+                            (
+                                format!("archive:{}:{prod}:{harness}:{sid}", pm.pack_id),
+                                prod,
+                                format!("legacy-{}", pm.pack_id),
+                                (idx + 1) as u64,
+                            )
+                        }
+                    };
+                    let mut payload_addr = sess_val
+                        .get("addr")
+                        .and_then(|a| serde_json::from_value::<PayloadAddr>(a.clone()).ok());
+                    if let Some(ref mut addr) = payload_addr {
+                        if addr.pack_id.is_empty() {
+                            addr.pack_id = phys_pack_id.to_string();
+                        }
+                    }
+                    let envelope = json!({
+                        "kind": "session_archive",
+                        "producer_id": producer_id,
+                        "harness": sess_val.get("harness").cloned().unwrap_or(Value::Null),
+                        "session_id": sess_val.get("id").or_else(|| sess_val.get("session_id")).cloned().unwrap_or(Value::Null),
+                        "title": sess_val.get("title").cloned().unwrap_or(Value::Null),
+                        "cwd": sess_val.get("cwd").cloned().unwrap_or(Value::Null),
+                        "created_at": sess_val.get("created_at").cloned().unwrap_or(Value::Null),
+                        "updated_at": sess_val.get("updated_at").cloned().unwrap_or(Value::Null),
+                        "message_count": sess_val.get("message_count").cloned().unwrap_or(json!(0)),
+                        "content_blake3": sess_val.get("content_blake3").cloned().unwrap_or(Value::Null),
+                        "pack_id": payload_addr.as_ref().map(|a| a.pack_id.as_str()).unwrap_or(phys_pack_id),
+                        "decoded_offset": payload_addr.as_ref().map(|a| a.decoded_offset).unwrap_or(0),
+                        "length": payload_addr.as_ref().map(|a| a.length).unwrap_or(0),
+                    });
+                    out.push(SealedCommitEntry {
+                        local_commit_pos: pos,
+                        producer_id,
+                        epoch,
+                        seq,
+                        op_id,
+                        envelope,
+                        payload_addr,
+                    });
+                }
+            } else {
+                for (pos, (op_id, rec)) in binding_by_pos {
+                    out.push(SealedCommitEntry {
+                        local_commit_pos: pos,
+                        producer_id: rec.event_id.producer_id,
+                        epoch: rec.event_id.epoch,
+                        seq: rec.event_id.seq,
+                        op_id,
+                        envelope: json!({ "kind": "noop" }),
+                        payload_addr: None,
+                    });
+                }
             }
         }
     }
@@ -1303,5 +1455,101 @@ mod astra_tests {
             serde_json::to_value(before).unwrap(),
             serde_json::to_value(after).unwrap()
         );
+    }
+
+    #[test]
+    fn seal_local_inbox_splits_around_published_pack_ranges() {
+        let world = cv_testkit::World::new("inbox-straddle-seal");
+        let store = StateStore::at_dir(&world.cv_home);
+        let packs_dir = world.cv_home.join("packs");
+
+        let r1 = store
+            .append("op-1", "dig-1", &json!({"kind": "receipt", "n": 1}))
+            .unwrap();
+        let r2 = store
+            .append("op-2", "dig-2", &json!({"kind": "receipt", "n": 2}))
+            .unwrap();
+        let r3 = store
+            .append("op-3", "dig-3", &json!({"kind": "receipt", "n": 3}))
+            .unwrap();
+        assert_eq!(
+            (r1.local_commit_pos, r2.local_commit_pos, r3.local_commit_pos),
+            (1, 2, 3)
+        );
+
+        // Publish only `[2..=2]` first (simulating `archive sync` interleaved between hook rows 1 and 3).
+        store
+            .publish_pack_range(&LocalStatePackManifest {
+                pack_id: "mid-pack".into(),
+                min_commit_pos: 2,
+                max_commit_pos: 2,
+                record_count: 1,
+                byte_len: 16,
+                digest: "blake3:mid".into(),
+                pack_path: "packs/mid-pack.pack.zst".into(),
+                index_meta: json!({}),
+                published_at: 100,
+            })
+            .unwrap();
+        assert_eq!(store.inbox_count().unwrap(), 2);
+
+        // Sealing the remaining inbox rows `1` and `3` must split into `[1..=1]` and `[3..=3]`.
+        let last = seal_local_inbox_to_pack(&store, &packs_dir, Some("straddle"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(last.pack_id, "straddle--r1");
+        assert_eq!(store.inbox_count().unwrap(), 0);
+
+        let all = collect_local_commits(&store, &packs_dir).unwrap();
+        let positions: Vec<i64> = all.iter().map(|c| c.local_commit_pos).collect();
+        assert_eq!(positions, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn replication_profile_inherits_privacy_and_matches_url_while_respecting_explicit_false() {
+        let raw = r#"
+[privacy]
+private_ips = true
+hostnames = true
+rewrite_home = true
+principal = "drop"
+
+[privacy.classes]
+emails = false
+jwts = false
+
+[privacy.filter]
+deny_cwds = ["/secret"]
+
+[replication.team-hub]
+url = "http://127.0.0.1:9123/"
+token = "hub-tok"
+producer_id = "box-1"
+private_ips = false
+principal = "keep"
+
+[replication.team-hub.classes]
+jwts = true
+
+[replication.team-hub.filter]
+harnesses = ["claude"]
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+
+        for selector in ["team-hub", "http://127.0.0.1:9123", "http://127.0.0.1:9123/"] {
+            let resolved = resolve_replication_profile(&cfg, selector);
+            assert_eq!(resolved.token.as_deref(), Some("hub-tok"), "{selector}");
+            assert_eq!(resolved.producer_id.as_deref(), Some("box-1"), "{selector}");
+            // Inherited from `[privacy]`:
+            assert!(resolved.hostnames, "{selector}");
+            assert!(resolved.rewrite_home, "{selector}");
+            assert!(!resolved.classes.emails, "{selector}");
+            assert_eq!(resolved.filter.deny_cwds, vec![PathBuf::from("/secret")], "{selector}");
+            // Explicit overrides in `[replication.team-hub]` win over `[privacy]`:
+            assert!(!resolved.private_ips, "{selector}");
+            assert_eq!(resolved.principal, PrincipalPolicy::Keep, "{selector}");
+            assert!(resolved.classes.jwts, "{selector}");
+            assert_eq!(resolved.filter.harnesses, vec!["claude"], "{selector}");
+        }
     }
 }

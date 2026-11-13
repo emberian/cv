@@ -2143,3 +2143,130 @@ fn untimestamped_delete_and_upsert_order_deterministically_across_and_within_epo
         assert_eq!(rebuilt, snap, "reverse_arrival={reverse_arrival}");
     }
 }
+
+#[test]
+fn shipper_reconstructs_legacy_archive_packs_drains_inbox_cleans_outbound_and_inherits_privacy() {
+    let hub_w = World::new("hub-legacy-pack-ship");
+    let (hub_url, _port, _reaper) = spawn_hub_serve(&hub_w, Some("legacy-tok"));
+
+    let host_w = World::new("host-legacy-pack-ship");
+    let store = StateStore::at_dir(&host_w.cv_home);
+    let packs_dir = host_w.cv_home.join("packs");
+    let recorder = RecorderServer::start(store.clone(), "prod-legacy").unwrap();
+
+    // Build a physical archive pack with 2 sessions and register a pre-`f4ff1ce0` `pack_manifests`
+    // row whose `index_meta` has ONLY `sessions` (neither `commits_addr` nor `commits`).
+    let s1 = make_session(
+        "leg-1",
+        &host_w.home.join("repo").to_string_lossy(),
+        "Leg 1",
+        "q1",
+        "a1",
+        1,
+    );
+    let s2 = make_session(
+        "leg-2",
+        &host_w.home.join("repo").to_string_lossy(),
+        "Leg 2",
+        "q2",
+        "a2",
+        2,
+    );
+    let built = build_pack_with_sessions(&packs_dir, "pack-legacy-v1", &[s1.clone(), s2.clone()]);
+
+    let mut legacy_sessions_meta = Vec::new();
+    for (sess, addr) in &built {
+        let op_id = format!("archive:pack-legacy-v1:prod-legacy:claude:{}", sess.id);
+        let env = json!({"kind": "session_archive", "session_id": sess.id, "harness": "claude"});
+        store
+            .append_request(
+                &cv_core::state::AppendRequest::new(op_id, "dig", env)
+                    .with_producer("prod-legacy")
+                    .with_payload_ref(serde_json::to_string(addr).unwrap()),
+            )
+            .unwrap();
+        legacy_sessions_meta.push(json!({
+            "producer_id": "prod-legacy",
+            "harness": "claude",
+            "id": sess.id,
+            "title": sess.title,
+            "cwd": sess.cwd,
+            "created_at": sess.created_at,
+            "updated_at": sess.updated_at,
+            "message_count": sess.messages.len(),
+            "archived_at": "2026-06-15T12:05:00Z",
+            "content_blake3": addr.digest_hex(),
+            "addr": addr,
+        }));
+    }
+    let zst_len = fs::metadata(packs_dir.join("pack-legacy-v1.pack.zst")).unwrap().len();
+    store
+        .publish_pack_range(&cv_core::state::tables::PackManifest {
+            pack_id: "pack-legacy-v1".into(),
+            min_commit_pos: 1,
+            max_commit_pos: 2,
+            record_count: 2,
+            byte_len: zst_len,
+            digest: "blake3:legacy".into(),
+            pack_path: "packs/pack-legacy-v1.pack.zst".into(),
+            index_meta: json!({
+                "physical_pack_id": "pack-legacy-v1",
+                "sessions": legacy_sessions_meta,
+            }),
+            published_at: 1000,
+        })
+        .unwrap();
+
+    // Append `seq = 3` as an unsealed `capture_inbox` hook receipt in the SAME writer epoch!
+    store
+        .append_request(
+            &cv_core::state::AppendRequest::new("hook:3", "dig-3", json!({"kind": "receipt", "cwd": "/tmp"}))
+                .with_producer("prod-legacy"),
+        )
+        .unwrap();
+    assert_eq!(store.inbox_count().unwrap(), 1);
+    recorder.shutdown();
+
+    // Configure `[privacy]` (`rewrite_home = true`) and `[replication.my-hub]` (`url`, `token`,
+    // `producer_id`) WITHOUT repeating `rewrite_home` under `[replication.my-hub]`.
+    let cfg_dir = host_w.home.join(".config/clustervision");
+    fs::create_dir_all(&cfg_dir).unwrap();
+    fs::write(
+        cfg_dir.join("config.toml"),
+        format!(
+            "[privacy]\nrewrite_home = true\n\n[replication.my-hub]\nurl = {hub_url:?}\ntoken = \"legacy-tok\"\nproducer_id = \"prod-legacy\"\n"
+        ),
+    )
+    .unwrap();
+
+    // Run `cv archive sync --to <hub_url>` (matching `[replication.my-hub]` by URL without `--token`!).
+    let out = host_w
+        .cv_command()
+        .args(["archive", "sync", "--to", &hub_url])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // 1) `capture_inbox` drained to 0 (`cv watch --to` won't loop HTTP on idle ticks).
+    assert_eq!(store.inbox_count().unwrap(), 0);
+    // 2) `.ship-outbound` staging directory cleaned up completely.
+    assert!(!packs_dir.join(".ship-outbound").exists());
+
+    // 3) All 3 events (`seq = 1..=3`) reached contiguous frontier `3`, and `[privacy]`'s
+    //    `rewrite_home = true` scrubbed `cwd` to `$HOME/repo`!
+    let client = HttpClient::new(&hub_url, Some("legacy-tok".into())).unwrap();
+    let (st_raw, _) = client.get("/api/hub/status").unwrap();
+    let st: HubStatusResponse = st_raw.json().unwrap();
+    assert_eq!(st.frontiers[0].contiguous_seq, 3);
+    let (sess_raw, _) = client.get("/api/hub/sessions").unwrap();
+    let page: HubSessionsPage = sess_raw.json().unwrap();
+    assert_eq!(page.total, 2);
+    for row in &page.sessions {
+        assert_eq!(row.cwd.as_deref(), Some("$HOME/repo"));
+    }
+}

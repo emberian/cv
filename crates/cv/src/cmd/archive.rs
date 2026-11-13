@@ -584,11 +584,12 @@ fn resolve_shipper(
         let prof = cv_core::state::hub::resolve_replication_profile(&cfg, target);
         (target.to_string(), target.to_string(), prof)
     } else {
-        let Some(prof) = cfg.replication.get(target).cloned() else {
+        if !cfg.replication.contains_key(target) {
             bail!(
                 "unknown replication target `{target}`: pass an `http://host:port` URL or configure `[replication.{target}]` with `url = \"http://...\"` in config.toml"
             );
-        };
+        }
+        let prof = cv_core::state::hub::resolve_replication_profile(&cfg, target);
         let Some(url) = prof.url.clone().filter(|u| !u.trim().is_empty()) else {
             bail!("replication profile `[replication.{target}]` has no `url = \"http://...\"` in config.toml");
         };

@@ -366,6 +366,90 @@ impl ScrubProfile {
             custom,
         })
     }
+
+    /// Derive an effective replication [`ScrubProfile`] by inheriting unset fields from `base`
+    /// (`[privacy]`) and overlaying keys explicitly configured in `[replication.<target>]`.
+    pub fn inherit_from(&self, base: &ScrubProfile, raw_override: Option<&serde_json::Map<String, Value>>) -> Self {
+        if let Some(raw_map) = raw_override {
+            if let Ok(Value::Object(mut merged)) = serde_json::to_value(base) {
+                for (k, v) in raw_map {
+                    if matches!(k.as_str(), "classes" | "filter") {
+                        if let Some(over_obj) = v.as_object() {
+                            let entry = merged
+                                .entry(k.clone())
+                                .or_insert_with(|| Value::Object(serde_json::Map::new()));
+                            if !entry.is_object() {
+                                *entry = Value::Object(serde_json::Map::new());
+                            }
+                            if let Some(dst_obj) = entry.as_object_mut() {
+                                for (sk, sv) in over_obj {
+                                    dst_obj.insert(sk.clone(), sv.clone());
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                    merged.insert(k.clone(), v.clone());
+                }
+                if let Ok(resolved) = serde_json::from_value::<ScrubProfile>(Value::Object(merged)) {
+                    return resolved;
+                }
+            }
+        }
+
+        // Struct-literal fallback when `Config` was constructed in Rust without deserialization.
+        Self {
+            url: self.url.clone().or_else(|| base.url.clone()),
+            token: self.token.clone().or_else(|| base.token.clone()),
+            producer_id: self.producer_id.clone().or_else(|| base.producer_id.clone()),
+            classes: RedactClasses {
+                api_keys: self.classes.api_keys && base.classes.api_keys,
+                private_keys: self.classes.private_keys && base.classes.private_keys,
+                jwts: self.classes.jwts && base.classes.jwts,
+                emails: self.classes.emails && base.classes.emails,
+                blobs: self.classes.blobs && base.classes.blobs,
+                assignments: self.classes.assignments && base.classes.assignments,
+            },
+            private_ips: self.private_ips || base.private_ips,
+            hostnames: self.hostnames || base.hostnames,
+            ssh_principals: self.ssh_principals || base.ssh_principals,
+            rewrite_home: self.rewrite_home || base.rewrite_home,
+            rewrite_repo: self.rewrite_repo || base.rewrite_repo,
+            repo_root: self.repo_root.clone().or_else(|| base.repo_root.clone()),
+            path_rewrites: if !self.path_rewrites.is_empty() {
+                self.path_rewrites.clone()
+            } else {
+                base.path_rewrites.clone()
+            },
+            principal: if !self.principal.is_keep() {
+                self.principal.clone()
+            } else {
+                base.principal.clone()
+            },
+            filter: SessionFilter {
+                allow_cwds: if !self.filter.allow_cwds.is_empty() {
+                    self.filter.allow_cwds.clone()
+                } else {
+                    base.filter.allow_cwds.clone()
+                },
+                deny_cwds: if !self.filter.deny_cwds.is_empty() {
+                    self.filter.deny_cwds.clone()
+                } else {
+                    base.filter.deny_cwds.clone()
+                },
+                harnesses: if !self.filter.harnesses.is_empty() {
+                    self.filter.harnesses.clone()
+                } else {
+                    base.filter.harnesses.clone()
+                },
+                tags: if !self.filter.tags.is_empty() {
+                    self.filter.tags.clone()
+                } else {
+                    base.filter.tags.clone()
+                },
+            },
+        }
+    }
 }
 
 /// Pre-compiled [`ScrubProfile`] ready for high-throughput text & session scrubbing.

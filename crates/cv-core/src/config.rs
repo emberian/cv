@@ -18,7 +18,7 @@ use std::path::PathBuf;
 pub use crate::redact::{PathRewrite, PrincipalPolicy, PrivacyPolicy, RedactClasses, ScrubProfile, SessionFilter};
 
 /// The parsed config (missing/extra fields tolerated; absent file ⇒ defaults).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct Config {
     /// Dirs or `conversations.json` files holding account data exports to discover. Scanned ≤2 deep.
     #[serde(default)]
@@ -32,6 +32,44 @@ pub struct Config {
     /// `[replication.<name>]`: per-destination scrubbing & filter profiles for fleet/hub sync.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub replication: BTreeMap<String, ScrubProfile>,
+    /// Explicit per-target keys present in `[replication.<name>]` when loaded, allowing unset
+    /// fields to inherit `[privacy]` while preserving explicit `false`/`"keep"` overrides.
+    #[serde(skip)]
+    pub replication_overrides: BTreeMap<String, serde_json::Map<String, serde_json::Value>>,
+}
+
+impl<'de> Deserialize<'de> for Config {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct WireConfig {
+            #[serde(default)]
+            exports: Vec<PathBuf>,
+            #[serde(default)]
+            search: Search,
+            #[serde(default)]
+            privacy: ScrubProfile,
+            #[serde(default)]
+            replication: BTreeMap<String, serde_json::Value>,
+        }
+        let wire = WireConfig::deserialize(deserializer)?;
+        let mut replication = BTreeMap::new();
+        let mut replication_overrides = BTreeMap::new();
+        for (name, raw_val) in wire.replication {
+            if let serde_json::Value::Object(ref map) = raw_val {
+                replication_overrides.insert(name.clone(), map.clone());
+            }
+            let prof = serde_json::from_value::<ScrubProfile>(raw_val)
+                .map_err(|e| serde::de::Error::custom(format!("in [replication.{name}]: {e}")))?;
+            replication.insert(name, prof);
+        }
+        Ok(Config {
+            exports: wire.exports,
+            search: wire.search,
+            privacy: wire.privacy,
+            replication,
+            replication_overrides,
+        })
+    }
 }
 
 /// The `[search]` table.
