@@ -301,7 +301,7 @@ fn sessions(query: &str) -> (u16, Value) {
 
 /// The transcript's on-disk size, or `None` when it has been deleted since discovery.
 fn size_of(r: &SessionRef) -> Option<u64> {
-    std::fs::metadata(&r.path).ok().map(|m| m.len())
+    crate::source::ref_size(r)
 }
 
 /// Look up one session by harness name + id (or unique prefix), with each failure already a reply.

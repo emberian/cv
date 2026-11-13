@@ -1016,12 +1016,11 @@ fn rows_from(conn: &Connection, walk: &Walk) -> Result<std::collections::HashMap
         let digest = children.entry(parent.to_owned()).or_insert(Rows::SEED);
         *digest = Rows::fold(*digest, &child.to_le_bytes());
     }
-    let msg_cols = super::store::sqlite::columns(conn, "messages");
+    let msg_plan = MessageRevisionPlan::of(conn);
     let mut messages: HashMap<String, (u64, i64, u64)> = HashMap::new();
     {
         let mut exprs = vec!["session_id".to_string()];
-        exprs.extend(message_revision_exprs(&msg_cols));
-        let col_count = exprs.len();
+        exprs.extend(msg_plan.exprs());
         let sql = format!("SELECT {} FROM messages ORDER BY session_id, id", exprs.join(", "));
         let mut stmt = conn.prepare(&sql)?;
         let mut rows = stmt.query([])?;
@@ -1031,13 +1030,9 @@ fn rows_from(conn: &Connection, walk: &Walk) -> Result<std::collections::HashMap
             };
             let entry = messages.entry(id).or_insert((0, 0, Rows::SEED));
             entry.0 += 1;
-            let row_id = row.get::<_, Option<i64>>(1)?.unwrap_or(0);
+            let (row_id, next_digest) = msg_plan.fold_row(conn, row, 1, entry.2)?;
             entry.1 = entry.1.max(row_id);
-            let mut d = entry.2;
-            for i in 1..col_count {
-                d = fold_value(d, row.get_ref(i)?);
-            }
-            entry.2 = d;
+            entry.2 = next_digest;
         }
     }
     let mut meta_rows: HashMap<String, u64> = HashMap::new();
@@ -1100,60 +1095,169 @@ fn rows_from(conn: &Connection, walk: &Walk) -> Result<std::collections::HashMap
     Ok(out)
 }
 
-/// Header-only message row expressions (`id` first) for [`rows_from`] and [`session_revision`]:
-/// small scalar/status columns are read whole, while unbounded body/JSON columns use `typeof` +
-/// `octet_length` so SQLite reads record headers without materializing overflow pages.
-fn message_revision_exprs(msg_cols: &HashSet<String>) -> Vec<String> {
-    let mut exprs = vec![
-        "id".to_string(),
-        "role".to_string(),
-        "tool_call_id".to_string(),
-        "tool_name".to_string(),
-        "timestamp".to_string(),
-    ];
-    for col in [
-        "active",
-        "compacted",
-        "_compressed_summary",
-        "display_kind",
-        "finish_reason",
-        "token_count",
-        "observed",
-        "effect_disposition",
-        "platform_message_id",
-        "message_uid",
-        "tool_call_uid",
-    ] {
-        if msg_cols.contains(col) {
-            exprs.push(col.to_string());
+const INLINE_REVISION_MAX: i64 = 2048;
+
+const MESSAGE_BODY_COLS: &[&str] = &[
+    "content",
+    "tool_calls",
+    "reasoning",
+    "reasoning_content",
+    "reasoning_details",
+    "codex_reasoning_items",
+    "codex_message_items",
+    "api_content",
+    "display_metadata",
+    "absorbed_message_uids",
+    "tool_call_uids",
+];
+
+fn table_has_rowid(conn: &Connection, table: &str) -> bool {
+    conn.prepare(&format!(
+        "SELECT _rowid_ FROM \"{}\" LIMIT 0",
+        table.replace('"', "\"\"")
+    ))
+    .is_ok()
+}
+
+fn fold_large_cell(conn: &Connection, table: &str, col: &str, rowid: i64, digest: &mut u64) -> Result<()> {
+    use crate::source::Rows;
+    use std::io::Read as _;
+    if let Ok(mut blob) = conn.blob_open(rusqlite::MAIN_DB, table, col, rowid, true) {
+        let mut buf = [0u8; 16 * 1024];
+        loop {
+            let n = blob.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            *digest = Rows::fold(*digest, &buf[..n]);
         }
     }
-    for col in [
-        "content",
-        "tool_calls",
-        "reasoning",
-        "reasoning_content",
-        "reasoning_details",
-        "codex_reasoning_items",
-        "codex_message_items",
-        "api_content",
-        "display_metadata",
-        "absorbed_message_uids",
-        "tool_call_uids",
-    ] {
-        if msg_cols.contains(col) {
+    Ok(())
+}
+
+fn fold_bounded_col(
+    conn: &Connection,
+    table: &str,
+    col: &str,
+    rowid: Option<i64>,
+    row: &rusqlite::Row<'_>,
+    at: usize,
+    mut digest: u64,
+) -> Result<u64> {
+    use super::store::sqlite::fold_value;
+    use rusqlite::types::ValueRef;
+    let ty_ref = row.get_ref(at)?;
+    let len_ref = row.get_ref(at + 1)?;
+    digest = fold_value(digest, ty_ref);
+    digest = fold_value(digest, len_ref);
+    let large = matches!(
+        ty_ref,
+        ValueRef::Text([b't', b'e', b'x', b't'] | [b'b', b'l', b'o', b'b'])
+    ) && matches!(len_ref, ValueRef::Integer(n) if n > INLINE_REVISION_MAX);
+    if large {
+        if let Some(rowid) = rowid {
+            fold_large_cell(conn, table, col, rowid, &mut digest)?;
+        }
+    } else {
+        digest = fold_value(digest, row.get_ref(at + 2)?);
+    }
+    Ok(digest)
+}
+
+/// Bounded message-row revision projection for [`rows_from`] and [`session_revision`]:
+/// small scalar/status columns and `<= 2 KiB` inline bodies are read directly from the b-tree
+/// leaf page (`CASE WHEN octet_length(col) <= 2048 THEN col END`), while `> 2 KiB` overflow
+/// cells stream through `sqlite3_blob_open` in 16 KiB stack chunks so same-length `UPDATE`s
+/// always move the digest without ever materializing giant cells in SQLite's VDBE.
+struct MessageRevisionPlan {
+    has_rowid: bool,
+    scalar_cols: Vec<String>,
+    body_cols: Vec<&'static str>,
+}
+
+impl MessageRevisionPlan {
+    fn of(conn: &Connection) -> Self {
+        let msg_cols = super::store::sqlite::columns(conn, "messages");
+        let mut scalar_cols = vec![
+            "id".to_string(),
+            "role".to_string(),
+            "tool_call_id".to_string(),
+            "tool_name".to_string(),
+            "timestamp".to_string(),
+        ];
+        for col in [
+            "active",
+            "compacted",
+            "_compressed_summary",
+            "display_kind",
+            "finish_reason",
+            "token_count",
+            "observed",
+            "effect_disposition",
+            "platform_message_id",
+            "message_uid",
+            "tool_call_uid",
+        ] {
+            if msg_cols.contains(col) {
+                scalar_cols.push(col.to_string());
+            }
+        }
+        let body_cols = MESSAGE_BODY_COLS
+            .iter()
+            .copied()
+            .filter(|col| msg_cols.contains(*col))
+            .collect();
+        Self {
+            has_rowid: table_has_rowid(conn, "messages"),
+            scalar_cols,
+            body_cols,
+        }
+    }
+
+    fn exprs(&self) -> Vec<String> {
+        let mut exprs = Vec::with_capacity(1 + self.scalar_cols.len() + self.body_cols.len() * 3);
+        exprs.push(if self.has_rowid { "_rowid_" } else { "NULL" }.to_string());
+        exprs.extend(self.scalar_cols.iter().cloned());
+        for col in &self.body_cols {
             exprs.push(format!("typeof({col})"));
             exprs.push(format!("octet_length({col})"));
+            exprs.push(format!(
+                "CASE WHEN octet_length({col}) <= {INLINE_REVISION_MAX} THEN {col} END"
+            ));
         }
+        exprs
     }
-    exprs
+
+    fn fold_row(
+        &self,
+        conn: &Connection,
+        row: &rusqlite::Row<'_>,
+        offset: usize,
+        mut digest: u64,
+    ) -> Result<(i64, u64)> {
+        use super::store::sqlite::fold_value;
+        let rowid = if self.has_rowid {
+            row.get::<_, Option<i64>>(offset)?
+        } else {
+            None
+        };
+        let msg_id = row.get::<_, Option<i64>>(offset + 1)?.unwrap_or(0);
+        for i in 0..self.scalar_cols.len() {
+            digest = fold_value(digest, row.get_ref(offset + 1 + i)?);
+        }
+        let base = offset + 1 + self.scalar_cols.len();
+        for (idx, col) in self.body_cols.iter().enumerate() {
+            digest = fold_bounded_col(conn, "messages", col, rowid, row, base + idx * 3, digest)?;
+        }
+        Ok((msg_id, digest))
+    }
 }
 
 /// Exact single-session revision certificate for [`super::store::sqlite::read_session`]: folds
 /// `id`'s compression-chain `sessions` rows, `system_prompts`, stopping parent `end_reason`,
 /// direct children, `state_meta` entries, and `messages` rows (`WHERE session_id = ?1`) using
-/// `octet_length` on body columns so overflow pages are never materialized, touching zero rows
-/// of unrelated sessions in the same database.
+/// inline leaf values (`<= 2 KiB`) and streaming `sqlite3_blob_open` chunks (`> 2 KiB`) so
+/// overflow pages are never materialized whole, touching zero rows of unrelated sessions.
 fn session_revision(conn: &Connection, id: &str) -> Result<crate::source::Rows> {
     use super::store::sqlite::fold_value;
     use crate::source::Rows;
@@ -1167,55 +1271,83 @@ fn session_revision(conn: &Connection, id: &str) -> Result<crate::source::Rows> 
         vec![id.to_string()]
     };
 
+    let sessions_has_rowid = table_has_rowid(conn, "sessions");
+    let prompts_has_rowid = has_prompt_hash && table_has_rowid(conn, "system_prompts");
     let mut session_cols: Vec<String> = super::store::sqlite::columns(conn, "sessions").into_iter().collect();
     session_cols.sort();
-    let mut session_exprs = Vec::with_capacity(session_cols.len() + 2);
+    let mut session_scalars = Vec::new();
+    let mut session_bodies = Vec::new();
     for col in &session_cols {
-        if matches!(col.as_str(), "system_prompt" | "origin_json") {
-            session_exprs.push(format!("typeof(\"{}\")", col.replace('"', "\"\"")));
-            session_exprs.push(format!("octet_length(\"{}\")", col.replace('"', "\"\"")));
+        if col == "system_prompt" || col == "origin_json" {
+            session_bodies.push(col.as_str());
         } else {
-            session_exprs.push(format!("\"{}\"", col.replace('"', "\"\"")));
+            session_scalars.push(col.as_str());
         }
     }
+    let mut session_exprs = Vec::with_capacity(1 + session_scalars.len() + session_bodies.len() * 3);
+    session_exprs.push(if sessions_has_rowid { "_rowid_" } else { "NULL" }.to_string());
+    for col in &session_scalars {
+        session_exprs.push(format!("\"{}\"", col.replace('"', "\"\"")));
+    }
+    for col in &session_bodies {
+        let q = format!("\"{}\"", col.replace('"', "\"\""));
+        session_exprs.push(format!("typeof({q})"));
+        session_exprs.push(format!("octet_length({q})"));
+        session_exprs.push(format!(
+            "CASE WHEN octet_length({q}) <= {INLINE_REVISION_MAX} THEN {q} END"
+        ));
+    }
     let session_sql = format!("SELECT {} FROM sessions WHERE id = ?1", session_exprs.join(", "));
-    let msg_exprs = message_revision_exprs(&super::store::sqlite::columns(conn, "messages"));
+    let msg_plan = MessageRevisionPlan::of(conn);
     let msg_sql = format!(
         "SELECT {} FROM messages WHERE session_id = ?1 ORDER BY id ASC",
-        msg_exprs.join(", ")
+        msg_plan.exprs().join(", ")
     );
 
     let (mut count, mut high, mut digest) = (0u64, 0i64, Rows::SEED);
     digest = Rows::fold(digest, &(chain.len() as u64).to_le_bytes());
     for (idx, sid) in chain.iter().enumerate() {
         digest = Rows::fold(digest, sid.as_bytes());
-        if !session_exprs.is_empty() {
+        if !session_cols.is_empty() {
             let mut stmt = conn.prepare(&session_sql)?;
-            let ncols = stmt.column_count();
             let mut rows = stmt.query([sid])?;
             let mut found = 0u64;
             while let Some(row) = rows.next()? {
                 found += 1;
-                for i in 0..ncols {
-                    digest = fold_value(digest, row.get_ref(i)?);
+                let rowid = if sessions_has_rowid {
+                    row.get::<_, Option<i64>>(0)?
+                } else {
+                    None
+                };
+                for i in 0..session_scalars.len() {
+                    digest = fold_value(digest, row.get_ref(1 + i)?);
+                }
+                let base = 1 + session_scalars.len();
+                for (b_idx, col) in session_bodies.iter().enumerate() {
+                    digest = fold_bounded_col(conn, "sessions", col, rowid, row, base + b_idx * 3, digest)?;
                 }
             }
             digest = Rows::fold(digest, &found.to_le_bytes());
         }
         if has_prompt_hash {
-            let prompt_meta = conn
-                .query_row(
-                    "SELECT typeof(sp.prompt), octet_length(sp.prompt) FROM sessions s JOIN system_prompts sp ON sp.hash = s.system_prompt_hash WHERE s.id = ?1",
-                    [sid],
-                    |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<i64>>(1)?)),
-                )
-                .ok();
-            digest = Rows::fold(digest, &[u8::from(prompt_meta.is_some())]);
-            if let Some((ty, len)) = prompt_meta {
-                if let Some(ty) = ty {
-                    digest = Rows::fold(digest, ty.as_bytes());
-                }
-                digest = Rows::fold(digest, &len.unwrap_or(-1).to_le_bytes());
+            let rowid_sel = if prompts_has_rowid { "sp._rowid_" } else { "NULL" };
+            let prompt_sql = format!(
+                "SELECT {rowid_sel}, typeof(sp.prompt), octet_length(sp.prompt), \
+                 CASE WHEN octet_length(sp.prompt) <= {INLINE_REVISION_MAX} THEN sp.prompt END \
+                 FROM sessions s JOIN system_prompts sp ON sp.hash = s.system_prompt_hash WHERE s.id = ?1"
+            );
+            let mut stmt = conn.prepare(&prompt_sql)?;
+            let mut rows = stmt.query([sid])?;
+            if let Some(row) = rows.next()? {
+                digest = Rows::fold(digest, &[1]);
+                let rowid = if prompts_has_rowid {
+                    row.get::<_, Option<i64>>(0)?
+                } else {
+                    None
+                };
+                digest = fold_bounded_col(conn, "system_prompts", "prompt", rowid, row, 1, digest)?;
+            } else {
+                digest = Rows::fold(digest, &[0]);
             }
         }
         if idx == 0 && has_parent && has_end {
@@ -1234,14 +1366,12 @@ fn session_revision(conn: &Connection, id: &str) -> Result<crate::source::Rows> 
         }
         {
             let mut stmt = conn.prepare(&msg_sql)?;
-            let ncols = stmt.column_count();
             let mut rows = stmt.query([sid])?;
             while let Some(row) = rows.next()? {
                 count += 1;
-                high = high.max(row.get::<_, Option<i64>>(0)?.unwrap_or(0));
-                for i in 0..ncols {
-                    digest = fold_value(digest, row.get_ref(i)?);
-                }
+                let (msg_id, next_digest) = msg_plan.fold_row(conn, row, 0, digest)?;
+                high = high.max(msg_id);
+                digest = next_digest;
             }
         }
     }
@@ -4741,6 +4871,73 @@ mod tests {
         }
         let err = adapter
             .stream(target_ref, &stream::Demand::LEAN, &mut TargetMutator(&writer))
+            .unwrap_err();
+        assert!(err.to_string().contains("dependencies changed"), "{err:#}");
+
+        // Same-length body edits (both inline <= 2 KiB and overflow > 2 KiB) must move both
+        // `session_revision` and `rows_from`, and reject mid-stream `read_session` mutations.
+        let overflow_before = format!("prefix-{}-suffix", "a".repeat(20_000));
+        let overflow_after = format!("prefix-{}b{}-suffix", "a".repeat(10_000), "a".repeat(9_999));
+        assert_eq!(overflow_before.len(), overflow_after.len());
+        writer
+            .execute(
+                "INSERT INTO messages(session_id, role, content, timestamp, active, compacted) \
+                 VALUES('target', 'assistant', ?1, 2100.0, 1, 0)",
+                [&overflow_before],
+            )
+            .unwrap();
+
+        let rev0 = session_revision(&writer, "target").unwrap();
+        let rows0 = rows_conn(&writer).unwrap();
+        let changed = writer
+            .execute(
+                "UPDATE messages SET content = replace(content, 'first', 'third') \
+                 WHERE session_id = 'target' AND content LIKE '%first%'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
+        let rev1 = session_revision(&writer, "target").unwrap();
+        let rows1 = rows_conn(&writer).unwrap();
+        assert_ne!(rev1, rev0, "same-length inline body edit must move session_revision");
+        assert_ne!(
+            rows1["target"], rows0["target"],
+            "same-length inline body edit must move rows_conn"
+        );
+        assert_eq!(rows1["other"], rows0["other"]);
+
+        writer
+            .execute(
+                "UPDATE messages SET content = ?1 WHERE session_id = 'target' AND timestamp = 2100.0",
+                [&overflow_after],
+            )
+            .unwrap();
+        let rev2 = session_revision(&writer, "target").unwrap();
+        let rows2 = rows_conn(&writer).unwrap();
+        assert_ne!(rev2, rev1, "same-length overflow body edit must move session_revision");
+        assert_ne!(
+            rows2["target"], rows1["target"],
+            "same-length overflow body edit must move rows_conn"
+        );
+        assert_eq!(rows2["other"], rows1["other"]);
+
+        struct SameLengthBodyMutator<'a>(&'a Connection);
+        impl MessageSink for SameLengthBodyMutator<'_> {
+            fn meta(&mut self, _: &Session) {
+                self.0
+                    .execute(
+                        "UPDATE messages SET content = replace(content, 'b', 'c') \
+                         WHERE session_id = 'target' AND timestamp = 2100.0",
+                        [],
+                    )
+                    .unwrap();
+            }
+            fn message(&mut self, _: Message) -> Flow {
+                Flow::Continue
+            }
+        }
+        let err = adapter
+            .stream(target_ref, &stream::Demand::LEAN, &mut SameLengthBodyMutator(&writer))
             .unwrap_err();
         assert!(err.to_string().contains("dependencies changed"), "{err:#}");
     }

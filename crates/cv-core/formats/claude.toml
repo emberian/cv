@@ -19,10 +19,19 @@ store = [
 
 [upstream]
 repo = "Claude Code (Bun binary, ~/.local/share/claude/versions/<v>; npm @anthropic-ai/claude-code)"
-commit = "2.1.304 (corpus tests/corpus/claude/2.1.304; earlier 2.1.296, 2.1.278)"
-date = "2026-10-19"
+commit = "2.1.323 (corpus tests/corpus/claude/2.1.304; earlier 2.1.296, 2.1.278)"
+date = "2026-11-12"
 
 [types]
+summary = { status = "generic", note = "sets session title fallback; carried under complete" }
+"ai-title" = { status = "generic", note = "sets session title; carried under complete" }
+"custom-title" = { status = "generic", note = "sets user session title; carried under complete" }
+"continued-in" = { status = "generic", note = "sets lineage.continued_in; carried under complete" }
+"fork-context-ref" = { status = "generic", note = "sets fork lineage + fork_context; carried under complete" }
+"agent-name" = { status = "generic", note = "sets session extra agent_name; carried under complete" }
+tag = { status = "generic", note = "sets session extra tag; carried under complete" }
+relocated = { status = "generic", note = "sets session extra relocated_cwd; carried under complete" }
+"pr-link" = { status = "generic", note = "appends session extra pr_links; carried under complete" }
 mode = { status = "carried", note = "UI mode" }
 "permission-mode" = { status = "carried", note = "permission mode" }
 "atis-latch" = { status = "carried", note = "latch state" }
@@ -30,6 +39,7 @@ mode = { status = "carried", note = "UI mode" }
 "api-request" = { status = "carried", note = "request ledger (2.1.300+): one per API call — params, base/keep + tail blob hashes, cacheControl, requestDigest" }
 "api-request-shape" = { status = "carried", note = "request ledger: the system prompt + tool schemas one or more requests sent, keyed by shapeHash" }
 "api-request-blob" = { status = "carried", note = "request ledger: one request message keyed by hash; its `message` is a request body, never a turn" }
+"tools-used" = { status = "carried", note = "tools used in session {tools, sessionId} (2.1.31x+)" }
 "last-prompt" = { status = "carried", note = "loader leaf pointer {leafUuid, lastPrompt, explicit?, rewound?}" }
 "queue-operation" = { status = "carried", note = "input queue" }
 "cost-state" = { status = "carried", note = "cumulative cost / durations / modelUsage" }
@@ -45,6 +55,14 @@ started = { status = "carried", note = "legacy sub-agent telemetry" }
 result = { status = "carried", note = "legacy sub-agent telemetry / journal result" }
 "x-quota" = { status = "carried", note = "quota record" }
 "system.local_command" = { status = "handled", note = "slash command in/out" }
+"system.stop_hook_summary" = { status = "generic", note = "Stop hook output/error → Notice/Hook; carried under complete" }
+"system.compact_boundary" = { status = "generic", note = "→ CompactionBoundary; carried under complete" }
+"system.api_error" = { status = "generic", note = "→ Error/Harness; carried under complete" }
+"system.model_refusal_fallback" = { status = "generic", note = "→ Error/Harness; carried under complete" }
+"system.model_refusal_no_fallback" = { status = "generic", note = "→ Error/Harness (2.1.32x+); carried under complete" }
+"system.scheduled_task_fire" = { status = "generic", note = "→ Notice/Scheduler; carried under complete" }
+"system.turn_duration" = { status = "ignored", note = "bodyless turn timing; carried under complete" }
+"system.agents_killed" = { status = "ignored", note = "bodyless agent cleanup; carried under complete" }
 "system.away_summary" = { status = "generic", note = "no arm of its own: the `_` arm of system_msg makes every other subtype a Notice/Harness" }
 "system.informational" = { status = "generic", note = "same `_` arm as away_summary" }
 "block.thinking" = { status = "handled", note = "signature-only in Fable-era transcripts" }
@@ -84,6 +102,7 @@ result = { status = "carried", note = "legacy sub-agent telemetry / journal resu
 "attachment.thinking_drop" = { status = "generic", note = "rendered → injected context" }
 "attachment.deferred_tools_record" = { status = "generic", note = "rendered → injected context" }
 "attachment.hook_cancelled" = { status = "generic", note = "rendered → injected context" }
+"attachment.hook_non_blocking_error" = { status = "generic", note = "rendered → injected context; unrendered → carried" }
 "attachment.hook_system_message" = { status = "generic", note = "rendered → injected context" }
 "attachment.hook_additional_context" = { status = "generic", note = "rendered → injected context" }
 "attachment.invoked_skills" = { status = "generic", note = "rendered → injected context" }

@@ -15,7 +15,6 @@
 use crate::events::{EventRow, TouchedSession};
 use crate::ir::{Harness, SessionRef};
 use serde_json::{json, Value};
-use std::path::PathBuf;
 
 /// THE session row (§3): the same nine keys `cv ls --json`, `cv search --json`, `cv serve`'s
 /// `/api/sessions` and the desktop app's `api` command emit. `size_bytes` is passed in because
@@ -67,15 +66,15 @@ pub struct SearchRow<'a> {
 /// statement, without a daemon cache or a retained second collection of hit metadata.
 pub struct SearchRowContext {
     catalog: std::cell::OnceCell<Option<crate::catalog::Reader>>,
-    /// One stat per transcript path: chunked hits repeat a session's path within a response.
-    sizes: std::cell::RefCell<std::collections::HashMap<PathBuf, Option<u64>>>,
+    /// One probe per search response: chunked hits repeat a session's path within a response.
+    probe: std::cell::RefCell<crate::source::Probe>,
 }
 
 impl SearchRowContext {
     pub fn new() -> Self {
         Self {
             catalog: std::cell::OnceCell::new(),
-            sizes: std::cell::RefCell::new(std::collections::HashMap::new()),
+            probe: std::cell::RefCell::new(crate::source::Probe::default()),
         }
     }
 }
@@ -118,13 +117,7 @@ impl SearchRow<'_> {
             "created_at": created,
             "updated_at": updated,
             "message_count": reference.map(|r| r.message_count),
-            "size_bytes": reference.and_then(|r| {
-                *context
-                    .sizes
-                    .borrow_mut()
-                    .entry(r.path.clone())
-                    .or_insert_with(|| std::fs::metadata(&r.path).ok().map(|m| m.len()))
-            }),
+            "size_bytes": reference.and_then(|r| context.probe.borrow_mut().ref_size(r)),
             "score": self.score,
             "snippet": self.snippet,
             "agent_id": self.agent_id,
@@ -137,7 +130,7 @@ impl SearchRow<'_> {
 /// The live-scan twin of [`SearchRow::to_json`]: the ref is in hand, so the row is exact; a live
 /// scan has no score and never walks sub-agents (provenance is null).
 pub fn live_search_row(r: &SessionRef, title: &str, snippet: &str) -> Value {
-    let mut row = session_row(r, std::fs::metadata(&r.path).ok().map(|m| m.len()));
+    let mut row = session_row(r, crate::source::ref_size(r));
     let obj = row.as_object_mut().expect("json object");
     obj.insert("title".into(), json!(title));
     obj.insert("score".into(), Value::Null);

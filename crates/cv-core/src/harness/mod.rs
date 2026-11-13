@@ -301,6 +301,24 @@ pub(crate) fn walk_dir_bulk(
     files_only: bool,
     skipped: &mut Vec<Skipped>,
 ) -> Vec<PathBuf> {
+    walk_dir_bulk_with(
+        root,
+        min_depth,
+        max_depth,
+        files_only,
+        skipped,
+        crate::io_admission::read_dir_bulk,
+    )
+}
+
+fn walk_dir_bulk_with(
+    root: &std::path::Path,
+    min_depth: usize,
+    max_depth: usize,
+    files_only: bool,
+    skipped: &mut Vec<Skipped>,
+    mut read_dir: impl FnMut(&std::path::Path) -> std::io::Result<Vec<crate::io_admission::DirEntryAttr>>,
+) -> Vec<PathBuf> {
     use crate::io_admission::BulkFileType;
     if min_depth > max_depth {
         return Vec::new();
@@ -318,7 +336,7 @@ pub(crate) fn walk_dir_bulk(
 
     let mut stack: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
     while let Some((dir, depth)) = stack.pop() {
-        match crate::io_admission::read_dir_bulk(&dir) {
+        match read_dir(&dir) {
             Ok(mut entries) => {
                 entries.sort_by(|a, b| a.name.cmp(&b.name));
                 let child_depth = depth + 1;
@@ -348,14 +366,29 @@ pub(crate) fn walk_dir_bulk(
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) if err.kind() == std::io::ErrorKind::Unsupported => {
-                return walkdir::WalkDir::new(root)
-                    .min_depth(min_depth)
-                    .max_depth(max_depth)
-                    .into_iter()
-                    .filter_map(|e| e.map_err(|e| skipped.extend(Skipped::walk(&e))).ok())
-                    .filter(|e| !files_only || e.file_type().is_file())
-                    .map(|e| e.into_path())
-                    .collect();
+                if depth == 0 {
+                    return walkdir::WalkDir::new(root)
+                        .sort_by_file_name()
+                        .min_depth(min_depth)
+                        .max_depth(max_depth)
+                        .into_iter()
+                        .filter_map(|e| e.map_err(|e| skipped.extend(Skipped::walk(&e))).ok())
+                        .filter(|e| !files_only || e.file_type().is_file())
+                        .map(|e| e.into_path())
+                        .collect();
+                }
+                let sub_min = min_depth.saturating_sub(depth).max(1);
+                let sub_max = max_depth - depth;
+                out.extend(
+                    walkdir::WalkDir::new(&dir)
+                        .sort_by_file_name()
+                        .min_depth(sub_min)
+                        .max_depth(sub_max)
+                        .into_iter()
+                        .filter_map(|e| e.map_err(|e| skipped.extend(Skipped::walk(&e))).ok())
+                        .filter(|e| !files_only || e.file_type().is_file())
+                        .map(|e| e.into_path()),
+                );
             }
             Err(err) => {
                 if depth == 0 && root.is_file() {
@@ -1407,6 +1440,56 @@ mod tests {
             std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
             assert_eq!(perm_skipped.len(), 1, "{perm_skipped:?}");
             assert_eq!(perm_skipped[0].path, locked);
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn walk_dir_bulk_child_unsupported_falls_back_locally_without_discarding_siblings() {
+        let root = std::env::temp_dir().join(format!("cv-walk-unsup-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(root.join("mount-a/nested")).unwrap();
+        std::fs::create_dir_all(root.join("mount-b/nested")).unwrap();
+        std::fs::write(root.join("mount-a/a1.jsonl"), "{}\n").unwrap();
+        std::fs::write(root.join("mount-a/nested/a2.jsonl"), "{}\n").unwrap();
+        std::fs::write(root.join("mount-b/b1.jsonl"), "{}\n").unwrap();
+        std::fs::write(root.join("mount-b/nested/b2.jsonl"), "{}\n").unwrap();
+
+        let unsupported_dir = root.join("mount-b");
+        for (min_d, max_d, files_only) in [(0, 4, false), (1, 2, false), (2, 3, true), (3, 3, true)] {
+            let mut bulk_calls = std::collections::HashMap::<PathBuf, usize>::new();
+            let mut skipped = Vec::new();
+            let got = walk_dir_bulk_with(&root, min_d, max_d, files_only, &mut skipped, |dir| {
+                *bulk_calls.entry(dir.to_path_buf()).or_default() += 1;
+                if dir == unsupported_dir {
+                    return Err(std::io::Error::from(std::io::ErrorKind::Unsupported));
+                }
+                crate::io_admission::read_dir_bulk(dir)
+            });
+            assert!(skipped.is_empty(), "{skipped:?}");
+            assert_eq!(bulk_calls.get(&root.join("mount-a")), Some(&1));
+
+            let mut native_skipped = Vec::new();
+            let native = walk_dir_bulk(&root, min_d, max_d, files_only, &mut native_skipped);
+            assert!(native_skipped.is_empty());
+            assert_eq!(got, native, "bulk order mismatch for ({min_d}, {max_d}, {files_only})");
+
+            let mut got_sorted = got;
+            got_sorted.sort();
+            let mut expected: Vec<PathBuf> = walkdir::WalkDir::new(&root)
+                .sort_by_file_name()
+                .min_depth(min_d)
+                .max_depth(max_d)
+                .into_iter()
+                .filter_map(std::result::Result::ok)
+                .filter(|e| !files_only || e.file_type().is_file())
+                .map(|e| e.into_path())
+                .collect();
+            expected.sort();
+            assert_eq!(
+                got_sorted, expected,
+                "set mismatch for ({min_d}, {max_d}, {files_only})"
+            );
         }
 
         let _ = std::fs::remove_dir_all(&root);

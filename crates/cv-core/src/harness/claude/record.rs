@@ -229,6 +229,7 @@ pub(crate) const META_TYPES: &[&str] = &[
     "api-request",
     "api-request-shape",
     "api-request-blob",
+    "tools-used",
 ];
 
 /// The keys [`Demand::Facts`] selects: what prune, rewind, fork recognition and the resumability
@@ -826,8 +827,28 @@ impl<'a> Record<'a, '_> {
         m.parent_id = self.top.string("parentUuid")?;
         m.timestamp = self.timestamp()?;
         if let Some(t) = self.top.string("type")? {
+            let record_type = if t == "system" {
+                match self.top.string("subtype")? {
+                    Some(sub) if !sub.is_empty() => format!("system.{sub}"),
+                    _ => t,
+                }
+            } else if t == "attachment" {
+                match self
+                    .top
+                    .get("attachment")
+                    .and_then(|a| a.get("type").ok().flatten())
+                    .filter(|v| v.may_be_string())
+                    .map(|v| v.resolve().map(|v| v.as_str().unwrap_or_default().to_owned()))
+                    .transpose()?
+                {
+                    Some(att) if !att.is_empty() => format!("attachment.{att}"),
+                    _ => t,
+                }
+            } else {
+                t
+            };
             m.harness_extra_mut(Harness::Claude)
-                .insert("record_type".into(), Value::String(t));
+                .insert("record_type".into(), Value::String(record_type));
         }
         m.extra.insert(CARRIER_KEY.into(), self.view.resolve()?.into_owned());
         Ok(m)
@@ -941,15 +962,25 @@ impl<'a> Record<'a, '_> {
         }
         // Since 2.1.302 a retried request is an `api_error` with no `content`: `error` is an object
         // (`formatted`, `message`, `status`) and `retryAttempt`/`maxRetries` say where the retry
-        // loop stood. That is the record of a provider failure the model never saw; render it.
+        // loop stood. `model_refusal_no_fallback` (2.1.32x+) similarly writes `"content": ""` and
+        // puts the human-readable refusal explanation in `apiRefusalExplanation`.
         let retry = if content.is_none() && subtype == "api_error" {
             self.api_error_text()?
         } else {
             None
         };
+        let refusal_fallback = if subtype.starts_with("model_refusal") {
+            self.top
+                .string("apiRefusalExplanation")?
+                .filter(|s| !s.trim().is_empty())
+        } else {
+            None
+        };
         // Subtypes with no human-readable body — keep them out of the message stream.
         let bodyless = matches!(subtype.as_str(), "turn_duration" | "agents_killed");
-        if bodyless || (content.is_none() && retry.is_none() && subtype != "compact_boundary") {
+        if bodyless
+            || (content.is_none() && retry.is_none() && refusal_fallback.is_none() && subtype != "compact_boundary")
+        {
             return Ok(None);
         }
         if let Some(text) = retry {
@@ -964,7 +995,16 @@ impl<'a> Record<'a, '_> {
                 }
             }
         }
-        let text = content.map(|c| c.lazy_text(self.opts.spans)).transpose()?.flatten();
+        let mut text = content.map(|c| c.lazy_text(self.opts.spans)).transpose()?.flatten();
+        if matches!(&text, Some(Text::Inline(s)) if s.trim().is_empty()) {
+            text = None;
+        }
+        if text.is_none() {
+            text = refusal_fallback.map(Text::Inline);
+        }
+        if text.is_none() && subtype != "compact_boundary" {
+            return Ok(None);
+        }
         self.system_msg(text, &subtype)
     }
 
@@ -1000,7 +1040,9 @@ impl<'a> Record<'a, '_> {
         // answered, a Stop hook's output, a scheduled wakeup, or a plain harness notice.
         let (kind, origin) = match subtype {
             "compact_boundary" => (MessageKind::CompactionBoundary, Origin::Harness),
-            "api_error" | "model_refusal_fallback" => (MessageKind::Error, Origin::Harness),
+            "api_error" | "model_refusal_fallback" | "model_refusal_no_fallback" => {
+                (MessageKind::Error, Origin::Harness)
+            }
             "stop_hook_summary" => (MessageKind::Notice, Origin::Hook),
             "scheduled_task_fire" => (MessageKind::Notice, Origin::Scheduler),
             _ => (MessageKind::Notice, Origin::Harness),

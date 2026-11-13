@@ -3239,4 +3239,40 @@ mod tests {
         let _ = stream_str("s1", &text, None, &Demand::LEAN, &mut sink);
         assert_eq!(seen, 1, "Stop after the first message must halt streaming");
     }
+
+    #[test]
+    fn model_refusal_no_fallback_and_qualified_carrier_record_types() {
+        let text = [
+            r#"{"type":"user","sessionId":"s1","uuid":"u0","timestamp":"2026-11-12T00:00:00Z","message":{"role":"user","content":"hi"}}"#,
+            r#"{"type":"system","sessionId":"s1","uuid":"s_ref","timestamp":"2026-11-12T00:00:01Z","subtype":"model_refusal_no_fallback","content":"","apiRefusalCategory":"cyber","apiRefusalExplanation":"Blocked by cyber safeguards.","originalModel":"claude-opus-4-8"}"#,
+            r#"{"type":"system","sessionId":"s1","uuid":"s_blank","timestamp":"2026-11-12T00:00:02Z","subtype":"informational","content":"   "}"#,
+            r#"{"type":"attachment","sessionId":"s1","uuid":"att1","timestamp":"2026-11-12T00:00:03Z","attachment":{"type":"hook_non_blocking_error","hookName":"Stop"}}"#,
+            r#"{"type":"tools-used","sessionId":"s1","tools":["Read","Bash"]}"#,
+        ]
+        .join("\n");
+
+        let parsed = parse_str("s1", &text, None);
+        assert_eq!(parsed.messages.len(), 2, "blank notice and unrendered meta dropped");
+        let refusal = &parsed.messages[1];
+        assert_eq!(refusal.kind, MessageKind::Error);
+        assert_eq!(refusal.origin, Origin::Harness);
+        assert_eq!(refusal.text().as_deref(), Some("Blocked by cyber safeguards."));
+
+        let mut sink = CollectSink::default();
+        stream_str("s1", &text, None, &Demand::COMPLETE, &mut sink);
+        let rtypes: Vec<_> = sink
+            .messages
+            .iter()
+            .filter_map(|m| m.harness_extra(Harness::Claude)?.get("record_type")?.as_str())
+            .collect();
+        assert_eq!(
+            rtypes,
+            [
+                "system.model_refusal_no_fallback",
+                "system.informational",
+                "attachment.hook_non_blocking_error",
+                "tools-used",
+            ]
+        );
+    }
 }

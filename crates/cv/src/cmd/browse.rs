@@ -31,7 +31,7 @@ fn json_rows<'a>(refs: impl Iterator<Item = &'a SessionRef>, limit: usize) -> Ve
             if index % METADATA_BATCH_SIZE == 0 {
                 probe = cv_core::source::Probe::default();
             }
-            probe.size(&r.path).map(|size| (r, size))
+            probe.ref_size(r).map(|size| (r, size))
         })
         .take(limit)
         .map(|(r, size)| (r, session_row(r, Some(size))))

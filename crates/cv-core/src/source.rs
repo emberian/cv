@@ -948,6 +948,34 @@ impl Probe {
         }
     }
 
+    /// Transcript byte size of `r`, resolving directory-backed session keys (`kimi`, `kimi-code`,
+    /// `grok`) to their underlying transcript file rather than the directory inode's metadata size.
+    /// Returns `None` when the session's source has been deleted since discovery.
+    pub fn ref_size(&mut self, r: &SessionRef) -> Option<u64> {
+        let primary = self.primary_path(r);
+        if primary == r.path {
+            return self.size(&r.path);
+        }
+        if let Some(sz) = self.size(&primary) {
+            return Some(sz);
+        }
+        let md = std::fs::metadata(&r.path).ok()?;
+        if md.is_file() {
+            return Some(md.len());
+        }
+        if let Some(meta) = self
+            .adapters
+            .get(&r.harness)
+            .and_then(Option::as_ref)
+            .and_then(|a| a.metadata_file(r))
+        {
+            if let Some(sz) = self.size(&meta) {
+                return Some(sz);
+            }
+        }
+        Some(0)
+    }
+
     /// The entries of directory `path`, read once per operation; an absent directory is empty.
     pub fn list(&mut self, path: &Path) -> Option<std::sync::Arc<Vec<PathBuf>>> {
         let path = absolute(path)?;
@@ -1161,6 +1189,11 @@ fn store_files(adapter: &dyn crate::harness::Adapter, store: &Path) -> Vec<PathB
 /// The built-in adapter's actual append file, which may differ from a directory session key.
 pub fn primary_path(r: &SessionRef) -> PathBuf {
     crate::harness::for_harness(r.harness).map_or_else(|| r.path.clone(), |adapter| adapter.resume_source(r))
+}
+
+/// Transcript byte size of `r` ([`Probe::ref_size`]).
+pub fn ref_size(r: &SessionRef) -> Option<u64> {
+    Probe::default().ref_size(r)
 }
 
 /// A captured source still matches at publication time. Errors never establish freshness.
@@ -2280,5 +2313,33 @@ mod tests {
             !unchanged(&agent, &read_before),
             "a read file's rewrite invalidates the agent"
         );
+    }
+
+    #[test]
+    fn ref_size_resolves_directory_session_transcripts() {
+        let world = crate::test_world("probe-ref-size-dirs");
+        let kimi_code_dir = world.base.join("sessions/wd_demo/session_s1");
+        std::fs::create_dir_all(kimi_code_dir.join("agents/main")).unwrap();
+        let wire_payload = "x".repeat(4096);
+        std::fs::write(kimi_code_dir.join("agents/main/wire.jsonl"), &wire_payload).unwrap();
+        let r_kc = SessionRef::new("s1", Harness::KimiCode, &kimi_code_dir);
+        assert_eq!(super::ref_size(&r_kc), Some(wire_payload.len() as u64));
+
+        let grok_dir = world.base.join("grok/sess1");
+        std::fs::create_dir_all(&grok_dir).unwrap();
+        let grok_payload = "y".repeat(2048);
+        std::fs::write(grok_dir.join("chat_history.jsonl"), &grok_payload).unwrap();
+        let r_grok = SessionRef::new("sess1", Harness::Grok, &grok_dir);
+        assert_eq!(super::ref_size(&r_grok), Some(grok_payload.len() as u64));
+
+        let kimi_dir = world.base.join("kimi/sessions/hash1/sid1");
+        std::fs::create_dir_all(&kimi_dir).unwrap();
+        let kimi_payload = "z".repeat(3000);
+        std::fs::write(kimi_dir.join("context.jsonl"), &kimi_payload).unwrap();
+        let r_kimi = SessionRef::new("sid1", Harness::Kimi, &kimi_dir);
+        assert_eq!(super::ref_size(&r_kimi), Some(kimi_payload.len() as u64));
+
+        std::fs::remove_dir_all(&grok_dir).unwrap();
+        assert_eq!(super::ref_size(&r_grok), None);
     }
 }

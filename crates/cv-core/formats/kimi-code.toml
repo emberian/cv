@@ -58,6 +58,15 @@ date = "2026-10-11"
 "record.file_history.*" = { status = "carried", note = "edit snapshots in file-history/" }
 "record.forked" = { status = "carried", note = "the cut in a kimi fork; lineage comes from state.json forkedFrom" }
 "record.subagent.started" = { status = "carried", note = "" }
+"record.subagent.cancelled" = { status = "carried", note = "" }
+"record.changeNotifier.snapshot" = { status = "carried", note = "external file-change snapshot" }
+"record.config.update" = { status = "carried", note = "runtime config update" }
+"record.environment.set_binding" = { status = "carried", note = "environment binding" }
+"record.interaction.*" = { status = "carried", note = "user interaction request/resolved" }
+"record.metadata" = { status = "carried", note = "session metadata header" }
+"record.profile.bind" = { status = "carried", note = "profile binding" }
+"record.task.waitDelivered" = { status = "carried", note = "background task wait delivery" }
+"record.tool_select.initialized" = { status = "carried", note = "tool selection init" }
 "part.text" = { status = "generic", note = "" }
 "part.image_url" = { status = "generic", note = "" }
 "agent.main" = { status = "generic", note = "the session" }
