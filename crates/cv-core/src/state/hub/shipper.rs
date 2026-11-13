@@ -99,10 +99,20 @@ pub struct HttpClient {
 
 const MAX_HUB_HEADER_BYTES: usize = 64 * 1024;
 const MAX_HUB_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+// Bulk packs may take longer than a socket's idle budget on a healthy slower link.
+// Keep the former 15s no-progress bound, plus a five-minute total operation bound.
+const HUB_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
+const HUB_TOTAL_TIMEOUT: Duration = Duration::from_secs(300);
 
 fn hub_agent(timeout: Duration) -> ureq::Agent {
     ureq::Agent::config_builder()
         .timeout_global(Some(timeout))
+        .timeout_per_read(Some(HUB_IDLE_TIMEOUT))
+        .timeout_per_write(Some(HUB_IDLE_TIMEOUT))
+        .timeout_resolve(Some(HUB_IDLE_TIMEOUT))
+        .timeout_connect(Some(HUB_IDLE_TIMEOUT))
+        .timeout_send_request(Some(HUB_IDLE_TIMEOUT))
+        .timeout_recv_response(Some(HUB_IDLE_TIMEOUT))
         .max_redirects(0)
         .http_status_as_error(false)
         .proxy(None)
@@ -130,7 +140,7 @@ impl HttpClient {
         Ok(Self {
             base_url: uri.to_string().trim_end_matches('/').to_string(),
             bearer_token: bearer_token.filter(|t| !t.is_empty()),
-            agent: hub_agent(Duration::from_secs(15)),
+            agent: hub_agent(HUB_TOTAL_TIMEOUT),
         })
     }
 
