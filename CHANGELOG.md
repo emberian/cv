@@ -4,7 +4,7 @@
 - Hub replication seeds v2 frontiers, uses monotonic UUIDv7 writer epochs, tracks pack eviction per epoch, ships legacy archive packs, and hardens packs to 0600.
 - `state.db` overlays read-only `retired.jsonl` without importing it, `config::save` preserves default-valued `[replication]` overrides, and `cv doctor --store` keeps `catalog.db` strictly read-only.
 - Hermes revision certificates stream `> 2 KiB` cells (falling back inline without `_rowid_`), and malformed SQLite cells increment `extra.cv.skipped_lines`.
-- Claude `2.1.323` `model_refusal_no_fallback` records classify as `error`, Kimi/Grok/multi-session archive sync resolves transcript stats, and `cv formats` updates Claude and Kimi Code manifests.
+- Claude `2.1.323` `model_refusal_no_fallback` records classify as `error`, archive/watch gate idle passes on source baselines, and `cv formats` updates Claude and Kimi Code manifests.
 - Zip ingest isolates staged errors, strips `.zst` UTF-8-safely, and rejects corrupt SQLite; `cv serve` blocks `<short>.<domain>` DNS rebinding and batches `/api/sessions` probes.
 - Trigram `--exact` search meters streamed SQLite `--live-bytes`, re-validates stale segment hits live, bounds `deleted_ords`, and retries FTS opens during segment GC.
 - `cv splice --export json` sends its banner to stderr, `cv adopt` accepts `claude:<id>` selectors, and WASM `distill` rejects oversized 32-bit option bounds.

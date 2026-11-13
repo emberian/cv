@@ -1433,12 +1433,13 @@ fn verify_session_exact(
     let need_cwd = required_cwd.is_some() && r.cwd.is_none();
     let mut sink = VerifySink::new(r, needle, scope, case_sensitive, need_title, need_cwd, meter_limit);
     sink.copied_before = adapter.copied_before(r, &mut sink);
-    let session_meta = adapter
+    let stream_res = adapter
         .try_stream(r, &Demand::LEAN.with_spans(), &mut sink)
-        .with_context(|| format!("verifying {}:{}", r.harness, r.id))?;
+        .with_context(|| format!("verifying {}:{}", r.harness, r.id));
     if sink.over_budget {
         anyhow::bail!("over_budget:{}", sink.metered_bytes);
     }
+    let session_meta = stream_res?;
     if let Some(err) = sink.take_error() {
         return Err(err);
     }
@@ -2104,7 +2105,13 @@ pub fn search(
                     }
                 }
                 None => {
-                    // Metered shared SQLite source
+                    // Metered shared SQLite source: once the live-read budget is exhausted, cut
+                    // immediately instead of letting each subsequent SQLite session stream a first
+                    // chunk against `Some(0)`.
+                    if opts.live != LiveRead::All && remaining == 0 {
+                        suffix.cut += 1;
+                        continue;
+                    }
                     verified_docs += 1;
                     match verify_session_exact(
                         &r,
@@ -2151,8 +2158,12 @@ pub fn search(
                         }
                         Err(e) => {
                             if let Some(rest) = e.to_string().strip_prefix("over_budget:") {
+                                let metered = rest.parse::<u64>().unwrap_or(0);
+                                let spent = metered.min(remaining);
+                                remaining -= spent;
+                                suffix.bytes += spent;
                                 suffix.cut += 1;
-                                suffix.cut_bytes += rest.parse::<u64>().unwrap_or(0);
+                                suffix.cut_bytes += metered;
                             } else {
                                 suffix.failed += 1;
                             }
@@ -2260,7 +2271,9 @@ pub fn search(
                                             Some(live_snap.primary_len())
                                         }
                                     });
-                                    if let Some(cost) = known_cost.filter(|&c| c > remaining) {
+                                    if known_cost.is_none() && opts.live != LiveRead::All && remaining == 0 {
+                                        suffix.cut += 1;
+                                    } else if let Some(cost) = known_cost.filter(|&c| c > remaining) {
                                         suffix.cut += 1;
                                         suffix.cut_bytes += cost;
                                     } else {
@@ -2309,8 +2322,12 @@ pub fn search(
                                             }
                                             Err(e) => {
                                                 if let Some(rest) = e.to_string().strip_prefix("over_budget:") {
+                                                    let metered = rest.parse::<u64>().unwrap_or(0);
+                                                    let spent = metered.min(remaining);
+                                                    remaining -= spent;
+                                                    suffix.bytes += spent;
                                                     suffix.cut += 1;
-                                                    suffix.cut_bytes += rest.parse::<u64>().unwrap_or(0);
+                                                    suffix.cut_bytes += metered;
                                                 } else {
                                                     suffix.failed += 1;
                                                 }
@@ -3416,6 +3433,56 @@ mod tests {
             "after non-matching 4KB session debits a 5KB budget, second 4KB SQLite session must be cut: {:?}",
             budgeted.suffix
         );
+
+        // 2b. Multiple oversized SQLite sessions (`over_budget`) debit `remaining` to 0 on the first
+        //     session and cut all subsequent SQLite sessions immediately without opening/streaming them!
+        let over_db = tmp.path().join("hermes-over-budget.db");
+        let over_conn = rusqlite::Connection::open(&over_db).unwrap();
+        over_conn
+            .execute_batch(
+                "CREATE TABLE sessions (id TEXT PRIMARY KEY, started_at REAL, ended_at REAL, title TEXT);
+                 CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, role TEXT, content TEXT, tool_call_id TEXT, tool_calls TEXT, tool_name TEXT, timestamp REAL);",
+            )
+            .unwrap();
+        let huge_chunk = "z".repeat(200_000);
+        for (idx, ts) in [(1, 300.0), (2, 200.0), (3, 100.0)] {
+            let sid = format!("over-{idx}");
+            over_conn
+                .execute(
+                    "INSERT INTO sessions(id, started_at, ended_at, title) VALUES (?1, ?2, ?2, ?1)",
+                    rusqlite::params![sid, ts],
+                )
+                .unwrap();
+            over_conn
+                .execute(
+                    "INSERT INTO messages(session_id, role, content, timestamp) VALUES (?1, 'user', ?2, ?3)",
+                    rusqlite::params![sid, huge_chunk, ts],
+                )
+                .unwrap();
+        }
+        drop(over_conn);
+        let over_refs = cv_core::harness::hermes::Hermes::with_db(over_db)
+            .discover()
+            .unwrap()
+            .refs;
+        assert_eq!(over_refs.len(), 3);
+        let over_res = search(
+            &sql_idx,
+            "MeteredNeedle::target",
+            TrigramOptions {
+                live: LiveRead::Within(1_000, crate::fts::Budget::Flag),
+                ..Default::default()
+            },
+            &over_refs,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            over_res.verified_docs, 1,
+            "once first over_budget SQLite session exhausts remaining=1000 to 0, remaining 2 must cut before streaming"
+        );
+        assert_eq!(over_res.suffix.cut, 3);
+        assert_eq!(over_res.suffix.bytes, 1_000);
 
         // 3. Segment TOCTOU: when an indexed session's file mutates without `refs` flagging it in step 1
         //    (e.g. `refs` is empty on daemon/cached search after indexing), step 3 detects `Stale` and
