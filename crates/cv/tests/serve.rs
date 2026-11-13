@@ -1343,7 +1343,6 @@ fn request_body_framing_rejects_ambiguous_or_unsupported_headers() {
         vec![("Content-Length", "garbage")],
         vec![("Content-Length", "+0")],
         vec![("Content-Length", "0"), ("Content-Length", "1")],
-        vec![("Content-Length", "0"), ("Transfer-Encoding", "chunked")],
         vec![("Transfer-Encoding", "gzip")],
         vec![("Transfer-Encoding", "gzip, chunked")],
         vec![("Transfer-Encoding", "chunked"), ("Transfer-Encoding", "chunked")],
@@ -1366,6 +1365,27 @@ fn request_body_framing_rejects_ambiguous_or_unsupported_headers() {
     assert_eq!(raw_status(&raw), 200, "{raw}");
 }
 
+/// Hyper applies RFC 9112 transfer-coding precedence, removing Content-Length
+/// before the application sees the request. Pin the boundary it actually uses:
+/// CL=0 must not make chunk bytes become a second HTTP request. Hyper closes
+/// the connection after this response, so no pipelined request can be smuggled.
+#[test]
+fn transfer_encoding_precedence_preserves_pipeline_boundaries() {
+    let w = world("te-precedence");
+    let (port, _server) = spawn_serve(&w);
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    write!(stream, "GET /api/health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: 0\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\nGET /api/health HTTP/1.1\r\nHost: evil.example\r\nConnection: close\r\n\r\n").unwrap();
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw).unwrap();
+    let statuses: Vec<&str> = raw
+        .match_indices("HTTP/1.1 ")
+        .map(|(at, _)| &raw[at + 9..at + 12])
+        .collect();
+    assert_eq!(statuses, ["200"], "{raw}");
+    assert!(raw.to_ascii_lowercase().contains("connection: close\r\n"), "{raw}");
+}
+
 /// Every pipelined request passes the Host check on its own: an allowed first request does not
 /// vouch for the next one on the same connection.
 #[test]
@@ -1381,7 +1401,7 @@ fn pipelined_requests_each_pass_the_host_check() {
         .match_indices("HTTP/1.1 ")
         .map(|(at, _)| &raw[at + 9..at + 12])
         .collect();
-    assert_eq!(statuses, ["200", "403", "403"], "{raw}");
+    assert_eq!(statuses, ["200", "403", "400"], "{raw}");
 }
 
 /// The server's connection cap (`http::Limits::connections`' default): filling it with idle
@@ -2290,6 +2310,29 @@ fn serve_sse_stream_auth_and_live_cursor_wakeup() {
         streamed.ends_with("0\r\n\r\n"),
         "chunked stream must close cleanly: {streamed}"
     );
+}
+
+#[test]
+fn event_streams_do_not_exhaust_the_old_sixteen_follower_limit() {
+    use std::io::BufRead;
+    let w = world("many-sse-followers");
+    let (port, _server) = spawn_serve(&w);
+    let mut streams = Vec::new();
+    for _ in 0..20 {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        write!(
+            stream,
+            "GET /api/stream?follow=1 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAccept: text/event-stream\r\n\r\n"
+        )
+        .unwrap();
+        let mut stream = std::io::BufReader::new(stream);
+        let mut status = String::new();
+        stream.read_line(&mut status).unwrap();
+        assert!(status.starts_with("HTTP/1.1 200"), "{status}");
+        streams.push(stream);
+    }
+    assert_eq!(get_json(port, "/api/health").0, 200);
 }
 
 #[test]

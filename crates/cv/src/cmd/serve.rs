@@ -1,8 +1,8 @@
 //! `cv serve` — one local HTTP server: the read API at `/api/*` (`cv_core::api::route_json`, plus
 //! the two tantivy routes `/api/search` and `/api/stats`), the task inbox page at `/inbox` with
 //! the routes its buttons use (`serve_tasks`), and, with `--web <dir>`, the browser dashboard from
-//! `/`. Without `--web`, `/` is the inbox. A small *synchronous* server ([`crate::http`]), one
-//! thread per connection: the workload is a handful of pollers, and simplicity wins.
+//! `/`. Without `--web`, `/` is the inbox. Axum/Hyper handles HTTP and SSE; bounded streaming bridges keep synchronous
+//! storage operations on blocking workers.
 //!
 //! The transcript corpus is sensitive (it can contain secrets) and the inbox writes identity-bearing
 //! events, so both are locked to local callers: the `Host` header must name this machine (defeats
@@ -69,7 +69,7 @@ struct Ctx {
     /// Whether Fleet Hub endpoints (`/api/hub/*`) are enabled on this server instance.
     hub: bool,
     searcher: cv_search::Searcher,
-    stream: StreamHub,
+    stream: std::sync::Arc<StreamHub>,
 }
 
 fn validate_bind_exposure(host: &str, port: u16, token: Option<&str>, insecure_expose: bool, hub: bool) -> Result<()> {
@@ -177,7 +177,7 @@ fn run(
         default_who: who,
         hub,
         searcher: cv_search::Searcher,
-        stream: StreamHub::new(),
+        stream: std::sync::Arc::new(StreamHub::new()),
     };
     crate::http::serve(listener, limits, move |request| handle(request, &ctx))
 }
@@ -1602,7 +1602,6 @@ fn cors_headers(response: &mut Response<'_>, origin: Option<&str>) {
 
 // --- live SSE change stream (`/api/stream`) --------------------------------
 
-const MAX_SSE_FOLLOWERS: usize = 16;
 const SSE_STEP: std::time::Duration = std::time::Duration::from_millis(250);
 const SSE_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(15);
 const SESSION_SCAN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1500);
@@ -1740,32 +1739,7 @@ struct StreamHub {
     /// `<gen>:<offset>` and one from another generation is never compared by offset alone.
     gen: String,
     state: std::sync::Mutex<StreamState>,
-    wake: std::sync::Condvar,
-    followers: std::sync::atomic::AtomicUsize,
-}
-
-struct FollowerSlot<'a>(&'a std::sync::atomic::AtomicUsize);
-
-impl<'a> FollowerSlot<'a> {
-    fn acquire(counter: &'a std::sync::atomic::AtomicUsize) -> Option<Self> {
-        use std::sync::atomic::Ordering;
-        let mut cur = counter.load(Ordering::Acquire);
-        loop {
-            if cur >= MAX_SSE_FOLLOWERS {
-                return None;
-            }
-            match counter.compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire) {
-                Ok(_) => return Some(Self(counter)),
-                Err(actual) => cur = actual,
-            }
-        }
-    }
-}
-
-impl Drop for FollowerSlot<'_> {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-    }
+    wake: tokio::sync::Notify,
 }
 
 impl StreamHub {
@@ -1782,8 +1756,7 @@ impl StreamHub {
                 history: std::collections::VecDeque::from([(1, vec!["ready"])]),
                 last_session_scan: now,
             }),
-            wake: std::sync::Condvar::new(),
-            followers: std::sync::atomic::AtomicUsize::new(0),
+            wake: tokio::sync::Notify::new(),
         }
     }
 
@@ -1824,7 +1797,7 @@ impl StreamHub {
         guard.stamp.hub_state = fresh_hub;
         guard.record(kinds.to_vec());
         drop(guard);
-        self.wake.notify_all();
+        self.wake.notify_waiters();
     }
 
     /// Re-stat the watched stores, record a change if any moved, and return the current offset.
@@ -1867,7 +1840,7 @@ impl StreamHub {
             guard.record(kinds);
             let out = guard.cursor;
             drop(guard);
-            self.wake.notify_all();
+            self.wake.notify_waiters();
             return out;
         }
         guard.cursor
@@ -1878,28 +1851,12 @@ impl StreamHub {
         let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
         (guard.cursor, guard.kinds_after(seen))
     }
-
-    fn wait_after(&self, seen: u64, step: std::time::Duration) -> (u64, Vec<&'static str>) {
-        {
-            let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            if guard.cursor > seen {
-                return (guard.cursor, guard.kinds_after(seen));
-            }
-            let (guard, _) = self.wake.wait_timeout(guard, step).unwrap_or_else(|e| e.into_inner());
-            if guard.cursor > seen {
-                return (guard.cursor, guard.kinds_after(seen));
-            }
-        }
-        self.refresh();
-        self.changes_after(seen)
-    }
 }
 
-fn serve_stream(request: &mut Request<'_>, q: &Query, origin: Option<&str>, hub: &StreamHub) {
+fn serve_stream(request: &mut Request<'_>, q: &Query, origin: Option<&str>, hub: &std::sync::Arc<StreamHub>) {
+    use axum::response::sse::Event;
     let last_event_id = header_value(request, "Last-Event-ID");
-    // `after=<gen>:<offset>` (or the same cursor in `Last-Event-ID`, which a reconnecting
-    // EventSource sends by itself).
-    let after: Option<String> = q.get("after").map(|s| s.to_string()).or_else(|| last_event_id.clone());
+    let after = q.get("after").or_else(|| last_event_id.clone());
     let max_events = q.get("max_events").and_then(|s| s.parse::<usize>().ok());
     let wait_limit = q
         .get("wait_ms")
@@ -1908,102 +1865,96 @@ fn serve_stream(request: &mut Request<'_>, q: &Query, origin: Option<&str>, hub:
     let live = q.flag("follow")
         || last_event_id.is_some()
         || header_value(request, "Accept").is_some_and(|a| a.to_ascii_lowercase().contains("text/event-stream"));
-
-    let _slot = if live {
-        match FollowerSlot::acquire(&hub.followers) {
-            Some(slot) => Some(slot),
-            None => {
-                request.respond(json_response(
-                    503,
-                    &json!({"error": "too many active event streams"}),
-                    origin,
-                    &[],
-                ));
-                return;
-            }
-        }
-    } else {
-        None
+    let cur = hub.refresh();
+    let change = |offset, kinds: &[&str]| {
+        let id = hub.cursor_id(offset);
+        Event::default()
+            .id(&id)
+            .event("change")
+            .data(json!({"cursor":id,"kinds":kinds}).to_string())
     };
-
-    let mut resp = Response::sse(|sse| {
-        let cur = hub.refresh();
-        let mut seen = cur;
-        let mut emitted = 0usize;
-        let change = |sse: &mut crate::http::SseWriter<'_>, offset: u64, kinds: &[&'static str]| {
-            let id = hub.cursor_id(offset);
-            let payload = json!({"cursor": id, "kinds": kinds}).to_string();
-            sse.event(Some(&id), Some("change"), &payload)
-        };
-        match hub.resume_point(after.as_deref(), cur) {
-            StreamResume::Fresh => {
-                change(sse, cur, &["ready"])?;
-                if !live || max_events == Some(0) {
-                    return Ok(());
+    let (first, emitted, done) = match hub.resume_point(after.as_deref(), cur) {
+        StreamResume::Fresh => (Some(change(cur, &["ready"])), 0, !live || max_events == Some(0)),
+        StreamResume::Foreign => (
+            Some(change(cur, &["reset"])),
+            1,
+            !live || max_events.is_some_and(|n| n <= 1),
+        ),
+        StreamResume::At(prev) if cur > prev => (
+            Some(change(cur, &hub.changes_after(prev).1)),
+            1,
+            !live || max_events.is_some_and(|n| n <= 1),
+        ),
+        StreamResume::At(_) if !live => (
+            Some(Event::default().comment(format!("cursor {}", hub.cursor_id(cur)))),
+            0,
+            true,
+        ),
+        StreamResume::At(_) => (None, 0, false),
+    };
+    let hub = hub.clone();
+    let env = cv_core::env::Env::scoped();
+    let started = std::time::Instant::now();
+    let stream = futures_util::stream::unfold(
+        (first, cur, emitted, done, started),
+        move |(first, mut seen, mut emitted, mut done, mut last_write)| {
+            let hub = hub.clone();
+            let env = env.clone();
+            async move {
+                if let Some(first) = first {
+                    return Some((Ok::<_, std::io::Error>(first), (None, seen, emitted, done, last_write)));
                 }
-            }
-            // A cursor this process never issued: the follower was watching another run of the
-            // server (offsets restart with each), so anything may have changed since. Say so
-            // now instead of comparing offsets across generations and going quiet.
-            StreamResume::Foreign => {
-                change(sse, cur, &["reset"])?;
-                emitted += 1;
-                if !live || max_events.is_some_and(|m| emitted >= m) {
-                    return Ok(());
-                }
-            }
-            StreamResume::At(prev) if cur > prev => {
-                let (_, kinds) = hub.changes_after(prev);
-                change(sse, cur, &kinds)?;
-                emitted += 1;
-                if !live || max_events.is_some_and(|m| emitted >= m) {
-                    return Ok(());
-                }
-            }
-            StreamResume::At(_) if !live => {
-                sse.comment(&format!("cursor {}", hub.cursor_id(cur)))?;
-                return Ok(());
-            }
-            StreamResume::At(_) => {}
-        }
-
-        let started = std::time::Instant::now();
-        let mut last_write = started;
-        loop {
-            if sse.peer_closed() {
-                break;
-            }
-            let step = match wait_limit {
-                Some(limit) => {
-                    let Some(rem) = limit.checked_sub(started.elapsed()) else {
-                        break;
-                    };
-                    if rem.is_zero() {
-                        break;
+                loop {
+                    if done {
+                        return None;
                     }
-                    rem.min(SSE_STEP)
+                    let step = match wait_limit {
+                        Some(limit) => limit.checked_sub(started.elapsed())?.min(SSE_STEP),
+                        None => SSE_STEP,
+                    };
+                    if step.is_zero() {
+                        return None;
+                    }
+                    tokio::select! { _ = hub.wake.notified() => {}, _ = tokio::time::sleep(step) => {} }
+                    // Disk polling is shared/throttled in StreamHub and happens on blocking workers;
+                    // idle followers themselves hold no thread or blocking-worker permit.
+                    let refresh = hub.clone();
+                    let env = env.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let _env = env.map(cv_core::env::Env::reenter);
+                        refresh.refresh()
+                    })
+                    .await
+                    .ok()?;
+                    let (next, kinds) = hub.changes_after(seen);
+                    let event = if next > seen {
+                        seen = next;
+                        emitted += 1;
+                        done = max_events.is_some_and(|n| emitted >= n);
+                        let id = hub.cursor_id(seen);
+                        Some(
+                            Event::default()
+                                .id(&id)
+                                .event("change")
+                                .data(json!({"cursor":id,"kinds":kinds}).to_string()),
+                        )
+                    } else if last_write.elapsed() >= SSE_KEEPALIVE {
+                        Some(Event::default().comment("keepalive"))
+                    } else {
+                        None
+                    };
+                    if let Some(event) = event {
+                        last_write = std::time::Instant::now();
+                        return Some((Ok(event), (None, seen, emitted, done, last_write)));
+                    }
                 }
-                None => SSE_STEP,
-            };
-            let (next_cur, next_kinds) = hub.wait_after(seen, step);
-            if next_cur > seen {
-                seen = next_cur;
-                change(sse, seen, &next_kinds)?;
-                last_write = std::time::Instant::now();
-                emitted += 1;
-                if max_events.is_some_and(|m| emitted >= m) {
-                    break;
-                }
-            } else if last_write.elapsed() >= SSE_KEEPALIVE {
-                sse.comment("keepalive")?;
-                last_write = std::time::Instant::now();
             }
-        }
-        Ok(())
-    });
-    cors_headers(&mut resp, origin);
-    stamp_latest_snapshot(&mut resp, false);
-    request.respond(resp);
+        },
+    );
+    let mut response = Response::events(stream);
+    cors_headers(&mut response, origin);
+    stamp_latest_snapshot(&mut response, false);
+    request.respond(response);
 }
 
 #[cfg(test)]
@@ -2031,12 +1982,12 @@ mod staged_tests {
                         let stage = cv_core::api::route_staged(&parts, "start=0&end=1").unwrap().unwrap();
                         let reader = stage.body.reader().unwrap();
                         staged_response(&stage, reader, None)
-                            .write_to(std::io::sink(), false, false)
+                            .write_body_to(std::io::sink())
                             .unwrap();
                     } else {
                         let (status, value) = cv_core::api::route_json(&parts, "start=0&end=1");
                         json_response(status, &value, None, &[])
-                            .write_to(std::io::sink(), false, false)
+                            .write_body_to(std::io::sink())
                             .unwrap();
                     }
                     let heap = cv_testkit::heap::end(baseline);
