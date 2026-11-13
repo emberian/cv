@@ -278,6 +278,7 @@ fn message_parts(writer: &mut dyn Write, role: &str, parts: &[Part<'_>], resolve
 
 /// Emit Qwen Code 0.25 session JSONL under `out_dir` (see the module doc for what it may be).
 pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<EmitResult> {
+    opts.validate_ids()?;
     crate::emit::validate_native_source(session, Harness::Qwen, opts.thinking)?;
     let resolver = session.resolver();
     let new_id = opts.new_id.clone().unwrap_or_else(|| Uuid::new_v4().to_string());

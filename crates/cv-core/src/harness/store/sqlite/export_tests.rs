@@ -406,6 +406,7 @@ fn exercise_with(
     // successful source/SQL rollback coverage.
     let failure_options = crate::emit::EmitOptions {
         new_id: Some(facts.failure_new_id.into()),
+        force: facts.failure_new_id == "fixed",
         ..options.clone()
     };
     let mut database = Connection::open_in_memory()?;

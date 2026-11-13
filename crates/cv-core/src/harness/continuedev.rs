@@ -123,6 +123,9 @@ impl Adapter for Continue {
 
         // Prefer the index, but only keep entries whose `<id>.json` actually exists.
         for meta in &index {
+            if crate::publish::validate_output_id(&meta.session_id).is_err() {
+                continue;
+            }
             let path = sessions.join(format!("{}.json", meta.session_id));
             if !path.exists() {
                 continue;
@@ -297,6 +300,7 @@ fn optional_string(view: Option<JsonView<'_>>) -> Result<Option<String>> {
 /// The parser backfills `cwd`/`title` from the transcript itself, so writing the index is for
 /// `discover()` fidelity, not correctness; we still write it.
 pub fn emit(session: &Session, out_dir: &Path, opts: &crate::emit::EmitOptions) -> Result<super::EmitResult> {
+    opts.validate_ids()?;
     super::wire::write::check_source_fields(session)?;
     use anyhow::Context;
 

@@ -168,10 +168,12 @@ impl OpenCode {
     }
 
     fn message_dir(&self, sid: &str) -> Option<PathBuf> {
+        crate::publish::validate_output_id(sid).ok()?;
         self.root.as_ref().map(|r| r.join("message").join(sid))
     }
     fn part_dir(&self, mid: &str) -> Option<PathBuf> {
         // Parts are keyed by messageID only: storage/part/<messageID>/<partid>.json
+        crate::publish::validate_output_id(mid).ok()?;
         self.root.as_ref().map(|r| r.join("part").join(mid))
     }
 }

@@ -46,6 +46,7 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Emi
     }
     #[cfg(feature = "sqlite")]
     {
+        opts.validate_ids()?;
         // Reject unreadable sources before creating output; each store also guards its commit.
         crate::harness::wire::write::check_source_fields(session)?;
         emit_opencode_db(session, out_dir, opts)

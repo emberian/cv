@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<EmitResult> {
+    opts.validate_ids()?;
     crate::emit::validate_native_source(session, Harness::Codex, opts.thinking)?;
     let resolver = session.resolver();
     let new_id = opts.new_id.clone().unwrap_or_else(|| Uuid::now_v7().to_string());

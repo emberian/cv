@@ -547,9 +547,13 @@ fn stream_global(
                         unparsed.count();
                         continue;
                     };
-                    cells
-                        .read(cell, |view| record::bubble(view, &cells, spans, ordinal))?
-                        .flatten()
+                    match cells.read(cell, |view| record::bubble(view, &cells, spans, ordinal))? {
+                        Some(msg) => msg,
+                        None => {
+                            unparsed.count();
+                            continue;
+                        }
+                    }
                 } else {
                     record::bubble(row, &cells, spans, ordinal)?
                 };
@@ -1571,6 +1575,12 @@ mod tests {
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[1].model, None);
         assert_eq!(messages.last().unwrap().model.as_deref(), Some("last-model"));
+        drop(conn);
+        let parsed = crate::stream::collect_with(&Cursor::with_user_dir(&world.base), &r, &Demand::RICH).unwrap();
+        assert_eq!(
+            parsed.extra["cv"]["skipped_lines"], 3,
+            "bad-escape, bad-number, and missing external bubbles must all be counted in skipped_lines"
+        );
     }
 
     #[test]

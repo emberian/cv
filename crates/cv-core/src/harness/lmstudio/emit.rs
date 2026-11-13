@@ -228,6 +228,7 @@ fn native_versions(message: &Message) -> Option<(usize, usize)> {
 }
 
 pub(super) fn emit(session: &Session, out_dir: &Path, opts: &crate::emit::EmitOptions) -> Result<EmitResult> {
+    opts.validate_ids()?;
     super::super::wire::write::check_source_fields(session)?;
     let resolver = Resolver::new(session.source_path.clone());
     let created = session.created_at.or(session.updated_at).unwrap_or_else(Utc::now);

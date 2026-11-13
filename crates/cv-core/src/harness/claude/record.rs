@@ -539,7 +539,7 @@ pub(crate) fn usage_context(usage: JsonView<'_>) -> Result<Option<u64>> {
     let context = |fields: &Fields<'_>| -> Result<u64> {
         let mut sum = 0u64;
         for key in USAGE_CTX_KEYS {
-            sum += count(fields, key)?.unwrap_or(0);
+            sum = sum.saturating_add(count(fields, key)?.unwrap_or(0));
         }
         Ok(sum)
     };
@@ -1519,6 +1519,17 @@ mod tests {
             let head = Head::parse(JsonView::from(&value), demand)?;
             assert!(head.is_some(), "object with none of the keys");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn usage_context_saturates_u64_overflow() -> Result<()> {
+        let v: serde_json::Value = serde_json::json!({
+            "input_tokens": u64::MAX,
+            "cache_read_input_tokens": 10u64,
+            "cache_creation_input_tokens": 5u64
+        });
+        assert_eq!(usage_context(JsonView::from(&v))?, Some(u64::MAX));
         Ok(())
     }
 }

@@ -215,7 +215,10 @@ fn each_message_record(
                     if let Some(usage) = &message.usage {
                         let mut tokens = Map::new();
                         if let Some(input) = usage.input_tokens {
-                            tokens.insert("input".into(), json!(input + usage.cache_read_tokens.unwrap_or(0)));
+                            let total_in = input
+                                .checked_add(usage.cache_read_tokens.unwrap_or(0))
+                                .context("Gemini input token count overflows u64")?;
+                            tokens.insert("input".into(), json!(total_in));
                         }
                         if let Some(output) = usage.output_tokens {
                             tokens.insert("output".into(), json!(output));
@@ -333,6 +336,7 @@ pub(super) fn emit(
     opts: &EmitOptions,
     force_jsonl: Option<bool>,
 ) -> Result<EmitResult> {
+    opts.validate_ids()?;
     crate::emit::validate_native_source(session, Harness::Gemini, opts.thinking)?;
     let resolver = session.resolver();
     let new_id = opts.new_id.clone().unwrap_or_else(|| Uuid::new_v4().to_string());

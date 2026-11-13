@@ -850,6 +850,7 @@ pub fn emit_with_harness(
     opts: &crate::emit::EmitOptions,
     harness: Harness,
 ) -> Result<crate::harness::EmitResult> {
+    opts.validate_ids()?;
     let extension = match harness {
         Harness::Roo => "Roo Code",
         _ => "Cline",

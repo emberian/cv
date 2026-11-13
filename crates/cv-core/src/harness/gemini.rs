@@ -1330,6 +1330,9 @@ fn session_ref(s: &Session, path: &Path, harness: Harness) -> SessionRef {
 /// heading), from the session's directory beside `chats/`.
 fn side_affordances(recording: &Path, id: &str) -> Result<Vec<crate::affordance::Affordance>> {
     use crate::affordance::{item_of, json_files, plan_state, Affordance, Kind};
+    if crate::publish::validate_output_id(id).is_err() {
+        return Ok(Vec::new());
+    }
     let Some(project) = chats_project(recording) else {
         return Ok(Vec::new());
     };

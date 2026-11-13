@@ -209,6 +209,9 @@ impl Adapter for Antigravity {
         let summaries = read_summaries_map(&loc.app_data_dir.join("conversation_summaries.db")).unwrap_or_default();
         let mut out = Vec::new();
         for desc in descriptors {
+            if crate::publish::validate_output_id(&desc.conversation_id).is_err() {
+                continue;
+            }
             if !select(&desc.conversation_id, None) {
                 continue;
             }

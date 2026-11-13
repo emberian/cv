@@ -19,6 +19,7 @@ use uuid::Uuid;
 pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<EmitResult> {
     use rusqlite::Connection;
 
+    opts.validate_ids()?;
     // Reject unreadable sources before creating output; the commit guard covers later changes.
     crate::harness::wire::write::check_source_fields(session)?;
     let new_id = opts.new_id.clone().unwrap_or_else(|| Uuid::new_v4().to_string());
@@ -161,7 +162,18 @@ fn write_database(session: &Session, opts: &EmitOptions, new_id: &str, conn: &mu
     let cwd = effective_cwd(session, opts).map(|p| p.to_string_lossy().into_owned());
     let git_branch = branch_of(session);
 
-    // An explicit id replaces its transcript as well as its session row.
+    let exists: bool = tx
+        .query_row("SELECT 1 FROM sessions WHERE id = ?1", [new_id], |_| Ok(true))
+        .unwrap_or(false);
+    if exists && !opts.force {
+        let db_path = tx.path().map(std::path::PathBuf::from).unwrap_or_default();
+        return Err(crate::publish::Exists {
+            path: db_path,
+            hint: "",
+        }
+        .into());
+    }
+    // An explicit id with `opts.force` replaces its transcript as well as its session row.
     tx.execute("DELETE FROM messages WHERE session_id = ?1", [new_id])?;
     let mut session_insert = tx.prepare(
         "INSERT OR REPLACE INTO sessions \
@@ -629,8 +641,12 @@ mod tests {
                 ..Default::default()
             };
             emit(&session, &directory, &options)?;
-            // Replacing a requested id must replace its rows, rather than accumulating copies.
-            emit(&session, &directory, &options)?;
+            // Without `force`, a duplicate id is refused; with `force`, its rows are replaced cleanly.
+            assert!(emit(&session, &directory, &options)
+                .unwrap_err()
+                .downcast_ref::<crate::publish::Exists>()
+                .is_some());
+            emit(&session, &directory, &EmitOptions { force: true, ..options })?;
             let output = rusqlite::Connection::open(&path)?;
             let replay = parsed(&output, &complete)?;
             assert_eq!(message_values(&replay), message_values(&session), "{name}");

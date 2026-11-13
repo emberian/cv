@@ -139,6 +139,7 @@ pub(super) fn emit_after_stage(
     opts: &EmitOptions,
     after_stage: impl FnOnce() -> Result<()>,
 ) -> Result<EmitResult> {
+    opts.validate_ids()?;
     wire::check_source_fields(session)?;
     let resolver = session.resolver();
     // Match explicit-title precedence, first-user selection, whitespace filtering and truncation.

@@ -88,6 +88,7 @@ pub fn workflow_runs_dir(transcript: &Path) -> Option<PathBuf> {
 
 /// `subagents/workflows/<run_id>/`: a run's agent transcripts and its [`JOURNAL`].
 pub fn workflow_run_dir(transcript: &Path, run_id: &str) -> Option<PathBuf> {
+    crate::publish::validate_output_id(run_id).ok()?;
     workflow_runs_dir(transcript).map(|d| d.join(run_id))
 }
 

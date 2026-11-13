@@ -107,6 +107,19 @@ impl EmitOptions {
             crate::publish::Claim::New
         }
     }
+
+    /// Reject path-traversal or empty caller-supplied output identifiers (`new_id` and
+    /// `sidechain_of.{root,agent}`) before any emitter constructs an output path.
+    pub(crate) fn validate_ids(&self) -> Result<()> {
+        if let Some(id) = self.new_id.as_deref() {
+            crate::publish::validate_output_id(id)?;
+        }
+        if let Some(of) = &self.sidechain_of {
+            crate::publish::validate_output_id(&of.root)?;
+            crate::publish::validate_output_id(&of.agent)?;
+        }
+        Ok(())
+    }
 }
 
 /// What [`emit`] does with the model's reasoning.
@@ -247,6 +260,7 @@ fn emitter_for(target: Harness) -> Result<EmitFn, &'static str> {
 /// Emit `session` into `target`'s native format under `out_dir` (the target harness's storage root,
 /// or any directory for a dry run). Returns where it was written + how to resume it.
 pub fn emit(session: &Session, target: Harness, out_dir: &Path, opts: &EmitOptions) -> Result<EmitResult> {
+    opts.validate_ids()?;
     let f = registered_emitter(target)?;
     // Every registered writer consumes guarded fields and projects thinking per block.
     // Keep that contract at the writer boundary so direct and dispatched emission agree.
@@ -3918,5 +3932,117 @@ mod tests {
         );
         assert_eq!(rows[1]["message"]["content"].as_array().unwrap().len(), 1);
         Ok(())
+    }
+
+    #[test]
+    fn emitters_reject_path_traversal_ids_hermes_respects_force_grok_cleans_updates_and_gemini_checks_overflow() {
+        let session = sample_session(Harness::Claude);
+        let out = temp_dir();
+
+        // [C1] Every emitter rejects path traversal in `new_id` and `sidechain_of`.
+        for &target in supported_targets() {
+            for bad_id in ["../escape", "nested/id", "back\\slash", "..", ""] {
+                let err = emit(
+                    &session,
+                    target,
+                    &out,
+                    &EmitOptions {
+                        new_id: Some(bad_id.into()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap_err();
+                assert!(
+                    err.to_string().contains("nonempty filename component"),
+                    "{target} with {bad_id:?}: {err:#}"
+                );
+            }
+        }
+        let sidechain_err = crate::harness::claude::emit(
+            &session,
+            &out,
+            &EmitOptions {
+                sidechain_of: Some(SidechainOf {
+                    root: "valid-root".into(),
+                    agent: "../escaped-agent".into(),
+                }),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(sidechain_err.to_string().contains("nonempty filename component"));
+
+        // [C2] Companion directory helpers reject path traversal identifiers.
+        assert!(crate::harness::claude::sidecar::workflow_run_dir(&out.join("root.jsonl"), "../outside").is_none());
+
+        // [C3] Hermes refuses overwriting an existing session unless `opts.force` is set.
+        #[cfg(feature = "sqlite")]
+        {
+            let hermes_out = temp_dir();
+            let pinned = EmitOptions {
+                new_id: Some("pinned-hermes".into()),
+                ..Default::default()
+            };
+            let first = emit(&session, Harness::Hermes, &hermes_out, &pinned).unwrap();
+            let dup = emit(&session, Harness::Hermes, &hermes_out, &pinned).unwrap_err();
+            assert!(
+                dup.downcast_ref::<crate::publish::Exists>().is_some(),
+                "hermes duplicate without force must return Exists: {dup:#}"
+            );
+            let forced = EmitOptions { force: true, ..pinned };
+            let second = emit(&session, Harness::Hermes, &hermes_out, &forced).unwrap();
+            assert_eq!(second.path, first.path);
+        }
+
+        // [C4] Grok `force: true` removes a stale `updates.jsonl` when replacing with an updates-free session.
+        let grok_out = temp_dir();
+        let mut with_tool = sample_session(Harness::Grok);
+        let mut tool_msg = Message::new(Role::Assistant);
+        tool_msg.content = vec![Block::ToolUse {
+            id: "call_1".into(),
+            name: "bash".into(),
+            namespace: None,
+            input: serde_json::json!({"command": "echo hi"}).into(),
+        }];
+        with_tool.messages.push(tool_msg);
+        let grok_pinned = EmitOptions {
+            new_id: Some("grok-overwrite".into()),
+            ..Default::default()
+        };
+        let g1 = emit(&with_tool, Harness::Grok, &grok_out, &grok_pinned).unwrap();
+        assert!(g1.path.join("updates.jsonl").exists());
+        let mut plain = Session::new("plain", Harness::Grok);
+        plain.cwd = with_tool.cwd.clone();
+        let mut u = Message::new(Role::User);
+        u.content = vec![Block::Text { text: "hello".into() }];
+        plain.messages.push(u);
+        let g2 = emit(
+            &plain,
+            Harness::Grok,
+            &grok_out,
+            &EmitOptions {
+                force: true,
+                ..grok_pinned
+            },
+        )
+        .unwrap();
+        assert_eq!(g2.path, g1.path);
+        assert!(
+            !g2.path.join("updates.jsonl").exists(),
+            "stale updates.jsonl must be removed when forced overwrite has no updates"
+        );
+
+        // [C6] Gemini checked token addition rejects u64 overflow cleanly instead of panicking/wrapping.
+        let mut overflow_sess = sample_session(Harness::Gemini);
+        let mut asst = Message::new(Role::Assistant);
+        asst.content = vec![Block::Text { text: "reply".into() }];
+        asst.usage = Some(crate::ir::Usage {
+            input_tokens: Some(u64::MAX),
+            cache_read_tokens: Some(1),
+            ..Default::default()
+        });
+        overflow_sess.messages.push(asst);
+        let gem_err = emit(&overflow_sess, Harness::Gemini, &temp_dir(), &EmitOptions::default()).unwrap_err();
+        assert!(gem_err.to_string().contains("overflows u64"), "{gem_err:#}");
     }
 }

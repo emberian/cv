@@ -25,6 +25,7 @@ use uuid::Uuid;
 const GROK_ENCODE: &AsciiSet = &CONTROLS.add(b'/').add(b' ').add(b'.').add(b'%').add(b':').add(b'\\');
 
 pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<EmitResult> {
+    opts.validate_ids()?;
     crate::emit::validate_native_source(session, Harness::Grok, opts.thinking)?;
     let resolver = session.resolver();
     let new_id = opts.new_id.clone().unwrap_or_else(|| Uuid::now_v7().to_string());
@@ -243,11 +244,20 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Emi
     let summary = serde_json::to_string_pretty(&summary)?;
     let mut set = crate::publish::Set::new();
     lines.stage_into(&mut set, &session_dir.join("chat_history.jsonl"), opts.claim())?;
-    if !updates.is_empty() {
-        updates.stage_into(&mut set, &session_dir.join("updates.jsonl"), opts.claim())?;
+    let updates_path = session_dir.join("updates.jsonl");
+    let no_updates = updates.is_empty();
+    if !no_updates {
+        updates.stage_into(&mut set, &updates_path, opts.claim())?;
     }
     set.stage(&summary_path, "stage", summary.as_bytes(), opts.claim())?;
     set.publish()?;
+    if no_updates && opts.force {
+        match fs::remove_file(&updates_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("removing stale {}", updates_path.display())),
+        }
+    }
 
     Ok(EmitResult {
         path: session_dir,

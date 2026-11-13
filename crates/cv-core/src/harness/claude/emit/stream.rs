@@ -623,6 +623,7 @@ fn record<'a>(
 }
 
 pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<EmitResult> {
+    opts.validate_ids()?;
     crate::emit::validate_native_source(session, Harness::Claude, opts.thinking)?;
     let (session_id, agent) = match &opts.sidechain_of {
         Some(of) => (of.root.clone(), Some(of.agent.clone())),
