@@ -770,11 +770,22 @@ pub struct StagedReadGuard {
 }
 impl StagedReadGuard {
     pub fn verify(&self, r: &SessionRef) -> Result<()> {
+        self.verify_baseline(r).map(|_| ())
+    }
+
+    /// Verify that the session source is unchanged since capture and return the completed
+    /// [`crate::source::Baseline`] (with recorded dynamic reads and any shared-store
+    /// [`crate::source::Rows`] certificate) for downstream freshness checks.
+    pub fn verify_baseline(&self, r: &SessionRef) -> Result<crate::source::Baseline> {
+        let mut probe = crate::source::Probe::default();
+        let mut baseline = self.source.with_reads(&self.reads);
+        let rows = probe.rows(r);
         anyhow::ensure!(
-            crate::source::unchanged_from(r, &self.primary, &self.source.with_reads(&self.reads)),
+            crate::source::unchanged_with(r, &self.primary, &baseline, &mut probe),
             "session source changed while preparing output"
         );
-        Ok(())
+        baseline.rows = rows;
+        Ok(baseline)
     }
 }
 

@@ -606,7 +606,7 @@ pub(crate) fn record_message_reads(message: &crate::Message, primary: Option<&st
 /// What a consumer captured before reading one session: the primary's identity and the stamp of
 /// its auxiliary paths. Compared one way: [`Baseline::fresh`] (strict) or
 /// [`Baseline::dependencies_fresh`] (auxiliary only, across primary growth).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Baseline {
     pub primary: Option<FileId>,
     pub stamp: Option<Stamp>,

@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::UNIX_EPOCH;
 
 /// Per-session custody metadata persisted inside `pack_manifests.index_meta["sessions"]` and
 /// backed by the companion `.pack.idx.json` `RecordIndex`.
@@ -55,6 +55,8 @@ pub struct ArchivedSessionEntry {
     pub source_len: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_mtime_ns: Option<i128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline: Option<cv_core::source::Baseline>,
     pub addr: PayloadAddr,
 }
 
@@ -214,6 +216,7 @@ impl Archive {
             message_count: usize,
             source_len: Option<u64>,
             source_mtime_ns: Option<i128>,
+            baseline: Option<cv_core::source::Baseline>,
             payload: Vec<u8>,
             blake3_hex: String,
         }
@@ -223,102 +226,98 @@ impl Archive {
         // Deduplicate duplicate refs within the same input slice as well.
         let mut seen_in_pass = std::collections::HashSet::new();
 
-        for r in refs {
-            let harness_str = r.harness.as_str().to_string();
-            let key = (producer_id.clone(), harness_str.clone(), r.id.clone());
-            if !seen_in_pass.insert(key.clone()) {
-                summary.skipped += 1;
-                continue;
-            }
-
-            let primary = cv_core::source::primary_path(r);
-            let (source_len, source_mtime_ns) = source_stat_ref(r, &primary);
-            let self_contained_file = is_self_contained_single_session_file(r);
-            let sqlite_primary = !is_non_sqlite_path(&primary);
-
-            if let Some(prev) = known.get(&key) {
-                let stat_unchanged = self_contained_file
-                    && source_len.is_some()
-                    && source_mtime_ns.is_some()
-                    && prev.source_len == source_len
-                    && prev.source_mtime_ns == source_mtime_ns;
-                let meta_unchanged = !has_untracked_companion_files(r.harness)
-                    && r.updated_at.is_some()
-                    && prev.updated_at == r.updated_at
-                    && r.message_count.is_some_and(|mc| mc == prev.message_count)
-                    && (sqlite_primary
-                        || (source_len.is_some()
-                            && prev.source_len == source_len
-                            && prev.source_mtime_ns == source_mtime_ns));
-                if stat_unchanged || meta_unchanged {
+        for chunk in refs.chunks(PROBE_BATCH) {
+            let mut probe = cv_core::source::Probe::default();
+            for r in chunk {
+                let harness_str = r.harness.as_str().to_string();
+                let key = (producer_id.clone(), harness_str.clone(), r.id.clone());
+                if !seen_in_pass.insert(key.clone()) {
                     summary.skipped += 1;
                     continue;
                 }
-            }
 
-            let Some(adapter) = cv_core::harness::for_harness(r.harness) else {
-                summary
-                    .failed
-                    .push((format!("{}:{}", r.harness, r.id), "no adapter registered".into()));
-                continue;
-            };
+                let primary = probe.primary_path(r);
+                let (source_len, source_mtime_ns) = source_stat_ref(r, &primary);
 
-            let rendered = (|| -> Result<(cv_core::Session, usize, Vec<u8>)> {
-                let mut sink = cv_core::api::WindowSink::new(&r.path, 0, None);
-                let pass = cv_core::stream::Pass {
-                    guard: true,
-                    ..cv_core::stream::Pass::RECORD
+                if let Some(prev) = known.get(&key) {
+                    let unchanged = if let Some(ref prev_base) = prev.baseline {
+                        let now = probe.snapshot_from(r, &primary);
+                        prev_base.fresh(&now, &mut probe) || prev_base.rows_fresh(r, &now, &mut probe)
+                    } else {
+                        is_legacy_entry_unchanged(r, &primary, source_len, source_mtime_ns, prev)
+                    };
+                    if unchanged {
+                        summary.skipped += 1;
+                        continue;
+                    }
+                }
+
+                let Some(adapter) = cv_core::harness::for_harness(r.harness) else {
+                    summary
+                        .failed
+                        .push((format!("{}:{}", r.harness, r.id), "no adapter registered".into()));
+                    continue;
                 };
-                let read = cv_core::stream::stream_counted(
-                    adapter.as_ref(),
-                    r,
-                    &cv_core::Demand::RICH.with_spans(),
-                    &mut sink,
-                    pass,
-                )?;
-                let frames = sink.finish()?;
-                let total = sink.selected;
-                let mut buf = Vec::new();
-                super::session_json::write_session(&mut buf, &read.session, &frames, None, None, total)?;
-                buf.push(b'\n');
-                if let Some(guard) = read.guard {
-                    guard.verify(r)?;
-                }
-                Ok((read.session, total, buf))
-            })();
 
-            let (session_meta, message_count, payload) = match rendered {
-                Ok(v) => v,
-                Err(e) => {
-                    summary.failed.push((format!("{}:{}", r.harness, r.id), e.to_string()));
-                    continue;
-                }
-            };
-            let blake3_hex = cv_core::blake3_hex(&payload);
+                let rendered = (|| -> Result<(cv_core::Session, usize, Vec<u8>, Option<cv_core::source::Baseline>)> {
+                    let mut sink = cv_core::api::WindowSink::new(&r.path, 0, None);
+                    let pass = cv_core::stream::Pass {
+                        guard: true,
+                        ..cv_core::stream::Pass::RECORD
+                    };
+                    let read = cv_core::stream::stream_counted(
+                        adapter.as_ref(),
+                        r,
+                        &cv_core::Demand::RICH.with_spans(),
+                        &mut sink,
+                        pass,
+                    )?;
+                    let frames = sink.finish()?;
+                    let total = sink.selected;
+                    let mut buf = Vec::new();
+                    super::session_json::write_session(&mut buf, &read.session, &frames, None, None, total)?;
+                    buf.push(b'\n');
+                    let baseline = match read.guard {
+                        Some(guard) => Some(guard.verify_baseline(r)?),
+                        None => None,
+                    };
+                    Ok((read.session, total, buf, baseline))
+                })();
 
-            if let Some(prev) = known.get(&key) {
-                if prev.content_blake3 == blake3_hex {
-                    summary.skipped += 1;
-                    continue;
+                let (session_meta, message_count, payload, baseline) = match rendered {
+                    Ok(v) => v,
+                    Err(e) => {
+                        summary.failed.push((format!("{}:{}", r.harness, r.id), e.to_string()));
+                        continue;
+                    }
+                };
+                let blake3_hex = cv_core::blake3_hex(&payload);
+
+                if let Some(prev) = known.get(&key) {
+                    if prev.content_blake3 == blake3_hex {
+                        summary.skipped += 1;
+                        continue;
+                    }
                 }
+
+                staged.push(StagedSession {
+                    harness: harness_str,
+                    id: r.id.clone(),
+                    title: session_meta.title.or_else(|| r.title.clone()),
+                    cwd: session_meta
+                        .cwd
+                        .or_else(|| r.cwd.clone())
+                        .map(|p| p.to_string_lossy().into_owned()),
+                    created_at: session_meta.created_at.or(r.created_at),
+                    updated_at: session_meta.updated_at.or(r.updated_at),
+                    message_count,
+                    source_len,
+                    source_mtime_ns,
+                    baseline,
+                    payload,
+                    blake3_hex,
+                });
             }
-
-            staged.push(StagedSession {
-                harness: harness_str,
-                id: r.id.clone(),
-                title: session_meta.title.or_else(|| r.title.clone()),
-                cwd: session_meta
-                    .cwd
-                    .or_else(|| r.cwd.clone())
-                    .map(|p| p.to_string_lossy().into_owned()),
-                created_at: session_meta.created_at.or(r.created_at),
-                updated_at: session_meta.updated_at.or(r.updated_at),
-                message_count,
-                source_len,
-                source_mtime_ns,
-                payload,
-                blake3_hex,
-            });
         }
 
         if staged.is_empty() {
@@ -361,6 +360,7 @@ impl Archive {
                 content_blake3: item.blake3_hex.clone(),
                 source_len: item.source_len,
                 source_mtime_ns: item.source_mtime_ns,
+                baseline: item.baseline.clone(),
                 addr,
             });
         }
@@ -536,6 +536,8 @@ fn truncate_str(s: &str, max_chars: usize) -> String {
     }
 }
 
+const PROBE_BATCH: usize = 256;
+
 fn is_non_sqlite_path(path: &Path) -> bool {
     let ext = path
         .extension()
@@ -545,21 +547,22 @@ fn is_non_sqlite_path(path: &Path) -> bool {
     !matches!(ext.as_str(), "db" | "sqlite" | "sqlite3" | "vscdb")
 }
 
-/// Returns `true` only when `r.path` is a regular file holding exactly one self-contained session
-/// with no companion sidecar/subagent files and no multi-session sharing.
-fn is_self_contained_single_session_file(r: &SessionRef) -> bool {
-    matches!(
+/// Conservative fallback used only for pre-0.19.1 `pack_manifests` rows recorded before
+/// `ArchivedSessionEntry.baseline` existed; newly archived entries carry a full `Baseline`.
+fn is_legacy_entry_unchanged(
+    r: &SessionRef,
+    primary: &Path,
+    source_len: Option<u64>,
+    source_mtime_ns: Option<i128>,
+    prev: &ArchivedSessionEntry,
+) -> bool {
+    let self_contained_file = matches!(
         r.harness,
         Harness::Codex | Harness::Qwen | Harness::Continue | Harness::LmStudio | Harness::OpenSession
     ) && is_non_sqlite_path(&r.path)
-        && std::fs::metadata(&r.path).is_ok_and(|m| m.is_file())
-}
-
-/// Harnesses whose session output incorporates companion files outside `primary_path(r)` (such as
-/// subagent transcripts, separate `message/`+`part/` trees, or `state.json` metadata).
-fn has_untracked_companion_files(h: Harness) -> bool {
-    matches!(
-        h,
+        && std::fs::metadata(&r.path).is_ok_and(|m| m.is_file());
+    let has_companions = matches!(
+        r.harness,
         Harness::Claude
             | Harness::Antigravity
             | Harness::OpenCode
@@ -569,7 +572,20 @@ fn has_untracked_companion_files(h: Harness) -> bool {
             | Harness::Cline
             | Harness::Roo
             | Harness::Gemini
-    )
+    );
+    let sqlite_primary = !is_non_sqlite_path(primary);
+    let stat_unchanged = self_contained_file
+        && source_len.is_some()
+        && source_mtime_ns.is_some()
+        && prev.source_len == source_len
+        && prev.source_mtime_ns == source_mtime_ns;
+    let meta_unchanged = !has_companions
+        && r.updated_at.is_some()
+        && prev.updated_at == r.updated_at
+        && r.message_count.is_some_and(|mc| mc == prev.message_count)
+        && (sqlite_primary
+            || (source_len.is_some() && prev.source_len == source_len && prev.source_mtime_ns == source_mtime_ns));
+    stat_unchanged || meta_unchanged
 }
 
 fn source_stat_ref(r: &SessionRef, primary: &Path) -> (Option<u64>, Option<i128>) {
@@ -581,29 +597,66 @@ fn source_stat_ref(r: &SessionRef, primary: &Path) -> (Option<u64>, Option<i128>
     }
 }
 
-type WatchStatMap = std::collections::HashMap<(Harness, String, PathBuf), (Option<u64>, Option<SystemTime>)>;
+type WatchBaselineMap = std::collections::HashMap<(Harness, String, PathBuf), cv_core::source::Baseline>;
 
-fn watch_ref_stat(r: &SessionRef) -> Option<(Option<u64>, Option<SystemTime>)> {
-    let primary = cv_core::source::primary_path(r);
-    let m = std::fs::metadata(&primary)
-        .ok()
-        .filter(|m| m.is_file())
-        .or_else(|| std::fs::metadata(&r.path).ok().filter(|m| m.is_file()))?;
-    Some((Some(m.len()), m.modified().ok()))
+fn watch_baseline(r: &SessionRef, probe: &mut cv_core::source::Probe) -> cv_core::source::Baseline {
+    let mut b = probe.snapshot(r).with_reads(&cv_core::source::ReadSet::default());
+    if b.rows.is_none() {
+        b.rows = probe.rows(r);
+    }
+    b
 }
 
-fn filter_watch_candidates(refs: Vec<SessionRef>, seen_stat: &mut WatchStatMap) -> Vec<SessionRef> {
-    let mut candidates = Vec::with_capacity(refs.len());
-    for r in refs {
-        let key = (r.harness, r.id.clone(), r.path.clone());
-        let cur = watch_ref_stat(&r);
-        if is_self_contained_single_session_file(&r) && cur.is_some() && seen_stat.get(&key) == cur.as_ref() {
-            continue;
+fn seed_watch_baselines(
+    refs: &[SessionRef],
+    known: Option<&ArchiveSessionMap>,
+    producer_id: Option<&str>,
+) -> WatchBaselineMap {
+    let mut seen = WatchBaselineMap::with_capacity(refs.len());
+    for chunk in refs.chunks(PROBE_BATCH) {
+        let mut probe = cv_core::source::Probe::default();
+        for r in chunk {
+            let key = (r.harness, r.id.clone(), r.path.clone());
+            if let (Some(known), Some(prod)) = (known, producer_id) {
+                let akey = (prod.to_string(), r.harness.as_str().to_string(), r.id.clone());
+                if let Some(base) = known.get(&akey).and_then(|e| e.baseline.as_ref()) {
+                    let now = probe.snapshot(r);
+                    if base.fresh(&now, &mut probe) || base.rows_fresh(r, &now, &mut probe) {
+                        seen.insert(key, base.clone());
+                        continue;
+                    }
+                }
+            }
+            let base = watch_baseline(r, &mut probe);
+            if base.primary.is_some() {
+                seen.insert(key, base);
+            }
         }
-        if let Some(c) = cur {
-            seen_stat.insert(key, c);
+    }
+    seen
+}
+
+fn filter_watch_candidates(refs: Vec<SessionRef>, seen: &mut WatchBaselineMap) -> Vec<SessionRef> {
+    let mut candidates = Vec::new();
+    for chunk in refs.chunks(PROBE_BATCH) {
+        let mut probe = cv_core::source::Probe::default();
+        for r in chunk {
+            let key = (r.harness, r.id.clone(), r.path.clone());
+            let now = probe.snapshot(r);
+            if let Some(prev) = seen.get(&key) {
+                if prev.fresh(&now, &mut probe) || prev.rows_fresh(r, &now, &mut probe) {
+                    continue;
+                }
+            }
+            let mut next = now.with_reads(&cv_core::source::ReadSet::default());
+            next.rows = probe.rows(r);
+            if next.primary.is_some() {
+                seen.insert(key, next);
+            } else {
+                seen.remove(&key);
+            }
+            candidates.push(r.clone());
         }
-        candidates.push(r);
     }
     candidates
 }
@@ -815,20 +868,18 @@ pub fn cmd_watch(
         }
     }
 
-    // Track last-seen `(len, mtime)` per `(harness, session_id, path)` so unchanged self-contained
-    // single-session files aren't touched between polls, while directory-backed, companion-file,
-    // and multi-session sources never starve sibling or nested transcript updates.
-    let mut seen_stat: WatchStatMap = std::collections::HashMap::new();
-    for r in &initial_refs {
-        if let Some(c) = watch_ref_stat(r) {
-            seen_stat.insert((r.harness, r.id.clone(), r.path.clone()), c);
-        }
-    }
+    // Track full `cv_core::source::Baseline` (primary identity + declared/dynamic dependencies +
+    // shared-store `Rows` certificate) per `(harness, session_id, path)` so idle polls perform
+    // zero session parses across all 22 harnesses while catching companion, subagent, WAL, and
+    // shared multi-session edits.
+    let initial_known = archive.entries_by_key().ok().map(|(m, _)| m);
+    let watch_producer = archive.state_store().default_producer().to_string();
+    let mut seen_baseline = seed_watch_baselines(&initial_refs, initial_known.as_ref(), Some(&watch_producer));
 
     loop {
         std::thread::sleep(poll);
         let refs = discover_filtered(want, cwd_filter.as_deref());
-        let candidates = filter_watch_candidates(refs, &mut seen_stat);
+        let candidates = filter_watch_candidates(refs, &mut seen_baseline);
 
         let mut synced_any = false;
         if !candidates.is_empty() {
@@ -837,6 +888,13 @@ pub fn cmd_watch(
                 eprintln!("  ! {who}: {why}");
             }
             for entry in &batch.archived_entries {
+                if let Some(ref base) = entry.baseline {
+                    for c in &candidates {
+                        if c.harness.as_str() == entry.harness && c.id == entry.id {
+                            seen_baseline.insert((c.harness, c.id.clone(), c.path.clone()), base.clone());
+                        }
+                    }
+                }
                 let now = fmt_local(Utc::now(), "%H:%M:%S");
                 let title = entry.title.as_deref().map(|t| truncate_str(t, 44)).unwrap_or_default();
                 println!(
@@ -915,7 +973,7 @@ pub fn cmd_path(archive: &Archive) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime};
 
     #[test]
     fn packs_archive_batches_sessions_deduplicates_verifies_blake3_and_reads_frozen() {
@@ -1115,6 +1173,7 @@ mod tests {
             content_blake3: cv_core::blake3_hex(payload_1),
             source_len: None,
             source_mtime_ns: None,
+            baseline: None,
             addr: addr_1,
         };
         let entry_2 = ArchivedSessionEntry {
@@ -1178,7 +1237,9 @@ mod tests {
 
         // 1. Directory-backed `kimi-code` session (`r.path` is `.../session_kc1`, transcript is `agents/main/wire.jsonl`).
         let kc_home = world.base.join("kimi-code-home");
-        let wire_path = kc_home.join("sessions/wd1/session_kc1/agents/main/wire.jsonl");
+        let sess_dir = kc_home.join("sessions/wd1/session_kc1");
+        let wire_path = sess_dir.join("agents/main/wire.jsonl");
+        let state_path = sess_dir.join("state.json");
         std::fs::create_dir_all(wire_path.parent().unwrap()).unwrap();
         std::fs::write(
             &wire_path,
@@ -1195,13 +1256,33 @@ mod tests {
         assert_eq!(kc_refs.len(), 1);
         assert!(kc_refs[0].path.is_dir());
 
-        let mut seen = WatchStatMap::new();
-        for r in &kc_refs {
-            if let Some(c) = watch_ref_stat(r) {
-                seen.insert((r.harness, r.id.clone(), r.path.clone()), c);
-            }
-        }
         assert_eq!(archive.sync_refs(&kc_refs).unwrap().archived, 1);
+        let known = archive.entries_by_key().unwrap().0;
+        let prod = archive.state_store().default_producer().to_string();
+        let mut seen = seed_watch_baselines(&kc_refs, Some(&known), Some(&prod));
+
+        // Idle poll on directory-backed `kimi-code` emits ZERO candidates (zero session parses!).
+        assert!(
+            filter_watch_candidates(kc.discover().unwrap().refs, &mut seen).is_empty(),
+            "idle kimi-code poll must emit zero watch candidates"
+        );
+        // Idle `sync_refs` ALSO skips via `prev.baseline.fresh` with zero new packs.
+        let idle_sync = archive.sync_refs(&kc_refs).unwrap();
+        assert_eq!(idle_sync.archived, 0);
+        assert_eq!(idle_sync.skipped, 1);
+
+        // Creating/editing companion `state.json` (without touching `wire.jsonl`!) must surface in watch candidates.
+        std::fs::write(&state_path, r#"{"title":"Updated via state.json"}"#).unwrap();
+        let kc_state_cands = filter_watch_candidates(kc.discover().unwrap().refs, &mut seen);
+        assert_eq!(
+            kc_state_cands.len(),
+            1,
+            "companion state.json mutation must surface in watch candidates"
+        );
+        assert!(
+            filter_watch_candidates(kc.discover().unwrap().refs, &mut seen).is_empty(),
+            "subsequent idle poll after state.json update must be quiet again"
+        );
 
         // Appending to nested `agents/main/wire.jsonl` does NOT touch `session_kc1`'s directory mtime,
         // yet both `filter_watch_candidates` and `Archive::sync_refs` must detect and archive the growth!
@@ -1254,18 +1335,117 @@ mod tests {
                 },
             ]
         };
-        let mut exp_seen = WatchStatMap::new();
-        for r in make_export_refs(&exp_file) {
-            if let Some(c) = watch_ref_stat(&r) {
-                exp_seen.insert((r.harness, r.id.clone(), r.path.clone()), c);
-            }
-        }
+        let mut exp_seen = seed_watch_baselines(&make_export_refs(&exp_file), None, None);
+        assert!(
+            filter_watch_candidates(make_export_refs(&exp_file), &mut exp_seen).is_empty(),
+            "idle multi-session export must emit zero watch candidates"
+        );
         std::fs::write(&exp_file, b"[{}, {}]").unwrap();
         let exp_cands = filter_watch_candidates(make_export_refs(&exp_file), &mut exp_seen);
         assert_eq!(
             exp_cands.len(),
             2,
             "updating shared conversations.json must emit ALL sibling sessions, not just the first"
+        );
+        assert!(
+            filter_watch_candidates(make_export_refs(&exp_file), &mut exp_seen).is_empty(),
+            "subsequent idle poll on updated conversations.json must emit zero candidates"
+        );
+
+        // 3. Prove `Archive::sync_refs` and `filter_watch_candidates` skip idle Claude sessions
+        //    strictly from `Baseline` without invoking `stream_counted`, while catching companion
+        //    task directory edits (`<claude_config>/tasks/<sid>/1.json`).
+        let claude_cfg = world.base.join("claude-cfg");
+        let claude_proj = claude_cfg.join("projects/proj-a");
+        std::fs::create_dir_all(&claude_proj).unwrap();
+        // Deliberately write truncated/unparseable bytes that fail `stream_counted` if parsed,
+        // and seed an `ArchivedSessionEntry` with its current `Baseline`.
+        let unparsed_claude = claude_proj.join("sess-no-parse.jsonl");
+        std::fs::write(&unparsed_claude, b"\xff\xfe\xfd").unwrap();
+        let claude_ref = SessionRef::new("sess-no-parse", Harness::Claude, &unparsed_claude);
+        let mut claude_seen = seed_watch_baselines(std::slice::from_ref(&claude_ref), None, None);
+        assert!(
+            filter_watch_candidates(vec![claude_ref.clone()], &mut claude_seen).is_empty(),
+            "idle Claude session must emit zero watch candidates"
+        );
+
+        let mut probe = cv_core::source::Probe::default();
+        let captured_base = watch_baseline(&claude_ref, &mut probe);
+        let store = archive.state_store();
+        let pack_id = "pack-claude-baseline-proof";
+        let mut builder = PackBuilder::create(&archive.packs_dir(), pack_id).unwrap();
+        let dummy_ir = br#"{"id":"sess-no-parse","harness":"claude","messages":[]}"#;
+        let addr = builder
+            .append_record(record_anchor(&prod, "claude", "sess-no-parse"), dummy_ir)
+            .unwrap();
+        let pfm = builder.seal(Claim::New).unwrap();
+        let zst = std::fs::read(pack_zst_path(&archive.packs_dir(), pack_id).unwrap()).unwrap();
+        let append = store
+            .append_request(&AppendRequest::new(
+                format!("archive:{pack_id}:{prod}:claude:sess-no-parse"),
+                cv_core::blake3_hex(dummy_ir),
+                json!({"kind": "session_archive", "session_id": "sess-no-parse"}),
+            ))
+            .unwrap();
+        publish_contiguous_archive_runs(
+            &store,
+            pack_id,
+            &format!("packs/{pack_id}.pack.zst"),
+            zst.len() as u64,
+            &cv_core::blake3_hex(&zst),
+            &pfm,
+            Utc::now().timestamp_millis(),
+            vec![CommittedArchiveRecord {
+                local_commit_pos: append.local_commit_pos,
+                epoch: append.event_id.epoch,
+                seq: append.event_id.seq,
+                op_id: format!("archive:{pack_id}:{prod}:claude:sess-no-parse"),
+                envelope: json!({"kind": "session_archive", "session_id": "sess-no-parse"}),
+                entry: ArchivedSessionEntry {
+                    producer_id: prod.clone(),
+                    harness: "claude".into(),
+                    id: "sess-no-parse".into(),
+                    title: None,
+                    cwd: None,
+                    created_at: None,
+                    updated_at: None,
+                    message_count: 0,
+                    archived_at: Utc::now(),
+                    content_blake3: cv_core::blake3_hex(dummy_ir),
+                    source_len: Some(3),
+                    source_mtime_ns: None,
+                    baseline: Some(captured_base),
+                    addr,
+                },
+            }],
+        )
+        .unwrap();
+
+        // Because `Baseline::fresh` holds, `sync_refs` skips `sess-no-parse` WITHOUT opening or
+        // parsing `\xff\xfe\xfd`!
+        let skipped_proof = archive.sync_refs(std::slice::from_ref(&claude_ref)).unwrap();
+        assert_eq!(skipped_proof.skipped, 1);
+        assert_eq!(skipped_proof.archived, 0);
+        assert!(
+            skipped_proof.failed.is_empty(),
+            "unchanged Claude baseline must skip before stream_counted: {:?}",
+            skipped_proof.failed
+        );
+
+        // Creating a companion task file `<claude_cfg>/tasks/sess-no-parse/1.json` invalidates
+        // `Baseline::fresh` on both `filter_watch_candidates` and `Archive::sync_refs`!
+        let task_file = claude_cfg.join("tasks/sess-no-parse/1.json");
+        std::fs::create_dir_all(task_file.parent().unwrap()).unwrap();
+        std::fs::write(&task_file, r#"{"id":"1","subject":"Check companion"}"#).unwrap();
+        assert_eq!(
+            filter_watch_candidates(vec![claude_ref.clone()], &mut claude_seen).len(),
+            1,
+            "Claude companion tasks/<sid> edit must surface in watch candidates"
+        );
+        let invalidated = archive.sync_refs(std::slice::from_ref(&claude_ref)).unwrap();
+        assert_eq!(
+            invalidated.skipped, 0,
+            "Claude companion tasks/<sid> edit must invalidate sync_refs baseline fast-path"
         );
     }
 }
