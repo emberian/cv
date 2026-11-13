@@ -648,9 +648,35 @@ mod tests {
             "companion metadata and .zst must not skip: {skipped:?}"
         );
         assert_eq!(stubs.len(), 2, "{stubs:?}");
-        assert!(stubs
+        let claude_stub = stubs
             .iter()
-            .any(|s| s["harness"] == "claude" && s["id"] == "compressed-claude"));
-        assert!(stubs.iter().any(|s| s["harness"] == "cline" && s["id"] == "cline-42"));
+            .find(|s| s["harness"] == "claude" && s["id"] == "compressed-claude")
+            .unwrap();
+        assert_eq!(claude_stub["path"], "compressed-claude.jsonl.zst");
+        assert_eq!(claude_stub["size_bytes"], zst_claude.len() as u64);
+
+        let cline_stub = stubs
+            .iter()
+            .find(|s| s["harness"] == "cline" && s["id"] == "cline-42")
+            .unwrap();
+        assert_eq!(cline_stub["path"], "tasks/cline-42/api_conversation_history.json");
+        assert_eq!(cline_stub["size_bytes"], cline_hist.len() as u64);
+    }
+
+    #[test]
+    fn wasm_store_isolates_corrupt_entries_without_aborting_valid_sessions() {
+        let archive = make_zip(&[
+            ("sessions/abc.jsonl", CLAUDE_SAMPLE.as_bytes()),
+            ("rollout-broken.json", br#"{"session":{},"messages":["#),
+        ]);
+        let mut store = WasmStore::new();
+        let report = store.ingest_zip_inner(&archive).unwrap();
+        let stubs = report["sessions"].as_array().unwrap();
+        let skipped = report["skipped"].as_array().unwrap();
+        assert_eq!(stubs.len(), 1, "{stubs:?}");
+        assert_eq!(stubs[0]["path"], "sessions/abc.jsonl");
+        assert_eq!(stubs[0]["size_bytes"], CLAUDE_SAMPLE.len() as u64);
+        assert_eq!(skipped.len(), 1, "{skipped:?}");
+        assert_eq!(skipped[0]["path"], "rollout-broken.json");
     }
 }

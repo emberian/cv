@@ -506,7 +506,7 @@ pub(crate) fn cmd_splice(args: SpliceArgs<'_>) -> Result<()> {
     } = args;
     if let Some(format) = export.as_deref() {
         if !matches!(format, "json" | "md" | "markdown") {
-            bail!("unknown export format {format:?} (use md or json)");
+            return usage(format!("unknown export format {format:?} (use md or json)"));
         }
     }
     let parsed: Vec<SpliceSpec> = specs.iter().map(|s| parse_splice_spec(s)).collect::<Result<_>>()?;
@@ -523,7 +523,7 @@ pub(crate) fn cmd_splice(args: SpliceArgs<'_>) -> Result<()> {
         composition.push(session, total, sp.start, sp.end);
     }
     let to_h = match &harness {
-        Some(s) => Harness::parse(s).with_context(|| format!("unknown target harness: {s}"))?,
+        Some(s) => Harness::parse(s).ok_or_else(|| crate::util::UsageError(format!("unknown target harness: {s}")))?,
         None => composition
             .first_harness()
             .context("splice needs at least one session")?,
@@ -659,17 +659,23 @@ fn finish_composed(args: ComposedArgs) -> Result<()> {
         }
         _ => None,
     };
-    // Otherwise: print a summary, and with --export, dump the composed session to stdout.
-    println!(
+    // Otherwise: print a summary (to stderr when `--export` owns stdout), and with `--export`
+    // dump the pure composed document to stdout so `cv splice ... --export json` parses cleanly.
+    let header = format!(
         "✦ composed {} ({}) · {} msg",
         short_id(&session.id),
         session.harness.as_str(),
         session.messages.len()
     );
+    if staged.is_some() {
+        eprintln!("{header}");
+    } else {
+        println!("{header}");
+    }
     if let Some(prov) = session.cv_extra().and_then(|b| b.get("loom")) {
         if let Some(arr) = prov.as_array() {
             for p in arr {
-                println!(
+                let line = format!(
                     "  ↳ {} {}[{}..{}]",
                     p.get("harness").and_then(|v| v.as_str()).unwrap_or("?"),
                     p.get("source_id")
@@ -679,6 +685,11 @@ fn finish_composed(args: ComposedArgs) -> Result<()> {
                     p.get("start").and_then(|v| v.as_u64()).unwrap_or(0),
                     p.get("end").and_then(|v| v.as_u64()).unwrap_or(0),
                 );
+                if staged.is_some() {
+                    eprintln!("{line}");
+                } else {
+                    println!("{line}");
+                }
             }
         }
     }
@@ -726,7 +737,11 @@ pub(crate) fn cmd_dataset(args: DatasetArgs<'_>) -> Result<()> {
     let out = file;
     let fmt = match cv_core::dataset::Format::parse(format) {
         Some(f) => f,
-        None => bail!("unknown format {format:?} (use chatml, sharegpt, or openai-tools)"),
+        None => {
+            return usage(format!(
+                "unknown format {format:?} (use chatml, sharegpt, or openai-tools)"
+            ))
+        }
     };
     let dataset_opts = cv_core::dataset::DatasetOptions {
         active_branch_only: active_branch,
@@ -738,14 +753,14 @@ pub(crate) fn cmd_dataset(args: DatasetArgs<'_>) -> Result<()> {
     }
     let want = parse_harness(&harness)?;
     let query = match query {
-        Some(q) => Some(cv_core::SessionQuery::parse(&q).map_err(|e| anyhow::anyhow!(e))?),
+        Some(q) => Some(cv_core::SessionQuery::parse(&q).map_err(crate::util::UsageError)?),
         None => None,
     };
     // `--redact-only <classes>` scopes redaction to specific secret classes (and implies it);
     // plain `--redact` scrubs every class.
     let redact_opts = match &redact_only {
         Some(spec) => Some(cv_core::redact::RedactOptions {
-            classes: cv_core::redact::RedactClasses::parse_only(spec).map_err(|e| anyhow::anyhow!(e))?,
+            classes: cv_core::redact::RedactClasses::parse_only(spec).map_err(crate::util::UsageError)?,
         }),
         None => redact.then(cv_core::redact::RedactOptions::default),
     };

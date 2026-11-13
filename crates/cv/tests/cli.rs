@@ -3495,13 +3495,23 @@ fn rewind_validates_explicit_harness_for_direct_paths_before_writing() {
 #[test]
 fn splice_rejects_invalid_exports_before_source_reads() {
     let w = World::new("splice-export-validation");
-    let (ok, _, stdout, error) = w.cv(&["splice", "nonexistent-source", "--export", "yaml"]);
-    assert!(!ok, "{error}");
+    let (ok, code, stdout, error) = w.cv(&["splice", "nonexistent-source", "--export", "yaml"]);
+    assert!(!ok && code == 2, "{error}");
     assert!(error.contains("unknown export format \"yaml\""), "{error}");
     assert!(
         stdout.is_empty(),
         "failed export must not publish a composition report: {stdout}"
     );
+
+    let (ok, code, _, err) = w.cv(&["dataset", "--format", "parquet"]);
+    assert!(!ok && code == 2 && err.contains("unknown format"), "{err}");
+
+    standard_corpus(&w);
+    let (json_stdout, json_stderr) = w.cv_ok(&["splice", "alphasess:0..2", "--export", "json"]);
+    let parsed: serde_json::Value = serde_json::from_str(&json_stdout)
+        .unwrap_or_else(|e| panic!("splice --export json stdout must be pure JSON: {e}\n{json_stdout}"));
+    assert_eq!(parsed["messages"].as_array().unwrap().len(), 2);
+    assert!(json_stderr.contains("composed"), "{json_stderr}");
 }
 
 /// Claude Code can record foreign models behind a proxy. Replay compatibility cannot be

@@ -187,7 +187,16 @@ fn handle(request: &mut Request<'_>, ctx: &Ctx) {
     let raw_host = header_value(request, "Host");
     // DNS-rebinding guard: a hostile page can point its own domain at 127.0.0.1 and fetch us
     // same-origin, but it can't forge the Host header — reject anything that isn't our own name.
-    if !host_allowed(raw_host.as_deref(), &ctx.bind_host) {
+    // Non-browser API/Hub callers presenting a valid `Authorization: Bearer <token>` header (never
+    // `?token=`, HTML pages, or `OPTIONS` preflights) may use reverse-proxy or container aliases.
+    if !host_allowed_for_request(
+        raw_host.as_deref(),
+        &ctx.bind_host,
+        request.method(),
+        request.url(),
+        header_value(request, "Authorization").as_deref(),
+        ctx.token.as_deref(),
+    ) {
         request.respond(json_response(403, &json!({"error": "forbidden host"}), None, &[]));
         return;
     }
@@ -509,7 +518,7 @@ fn authority_host_port(authority: &str, default_port: u16) -> Option<(&str, u16)
     (!name.is_empty()
         && name
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b".-".contains(&byte)))
+            .all(|byte| byte.is_ascii_alphanumeric() || b".-_".contains(&byte)))
     .then(|| Some((name, parse_port(suffix, default_port)?)))
     .flatten()
 }
@@ -541,9 +550,9 @@ pub(crate) fn is_loopback_host(host: &str) -> bool {
 ///
 /// On loopback binds, only loopback names (`127.0.0.1`, `::1`, `localhost`, or `bind_host`) pass.
 /// On non-loopback binds (`0.0.0.0`, `::`, LAN IP), literal IP addresses (immune to DNS rebinding),
-/// local mDNS (`.local`) / Tailscale (`.ts.net`) names, the explicit `bind_host`, and this
-/// machine's OS hostname pass, while arbitrary external domains (`evil.example.com`) are rejected
-/// `403` to prevent LAN DNS-rebinding attacks.
+/// local mDNS/Tailscale/LAN names (`.local`, `.ts.net`, `.lan`, `.internal`, `.home.arpa`), the
+/// explicit `bind_host`, and this machine's OS hostname (including `<short>.<domain>`) pass, while
+/// arbitrary external domains (`evil.example.com`) are rejected `403` to prevent LAN DNS rebinding.
 fn host_allowed(host_header: Option<&str>, bind_host: &str) -> bool {
     let Some(name) = host_header.and_then(host_name) else {
         return false;
@@ -558,7 +567,10 @@ fn host_allowed(host_header: Option<&str>, bind_host: &str) -> bool {
         return true;
     }
     let lower = name.to_ascii_lowercase();
-    if lower.ends_with(".local") || lower.ends_with(".ts.net") {
+    if [".local", ".ts.net", ".lan", ".internal", ".home.arpa"]
+        .iter()
+        .any(|sfx| lower.ends_with(sfx))
+    {
         return true;
     }
     let os_host = cv_core::state::default_host_label();
@@ -567,12 +579,51 @@ fn host_allowed(host_header: Option<&str>, bind_host: &str) -> bool {
             return true;
         }
         if let Some(short) = os_host.split('.').next().filter(|s| !s.is_empty()) {
-            if name.eq_ignore_ascii_case(short) {
-                return true;
+            if !short.eq_ignore_ascii_case("localhost") {
+                if name.eq_ignore_ascii_case(short) {
+                    return true;
+                }
+                let prefix = format!("{}.", short.to_ascii_lowercase());
+                if lower.starts_with(&prefix) && lower.len() > prefix.len() {
+                    return true;
+                }
             }
         }
     }
     false
+}
+
+fn is_api_request_url(raw_url: &str) -> bool {
+    let path = raw_url
+        .split_once('?')
+        .map_or(raw_url, |(p, _)| p)
+        .trim_end_matches('/');
+    path == "/api" || path.starts_with("/api/")
+}
+
+fn host_allowed_for_request(
+    host_header: Option<&str>,
+    bind_host: &str,
+    method: &str,
+    raw_url: &str,
+    auth_header: Option<&str>,
+    expected_token: Option<&str>,
+) -> bool {
+    if host_allowed(host_header, bind_host) {
+        return true;
+    }
+    if method == "OPTIONS" || !is_api_request_url(raw_url) {
+        return false;
+    }
+    if host_header.and_then(host_name).is_none() {
+        return false;
+    }
+    let Some(expected) = expected_token else {
+        return false;
+    };
+    auth_header
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .is_some_and(|provided| token_matches(provided, expected))
 }
 
 /// The specific `Origin` to echo in `Access-Control-Allow-Origin`, if it's on the allow-list:
@@ -2034,6 +2085,93 @@ mod search_service_tests {
         assert!(err.to_string().contains("NEVER allows unauthenticated"), "{err}");
         assert!(validate_bind_exposure("0.0.0.0", 7777, Some("hub-secret"), false, true).is_ok());
         assert!(validate_bind_exposure("127.0.0.1", 7777, None, false, true).is_ok());
+    }
+
+    #[test]
+    fn host_guard_allows_underscore_lan_and_bearer_api_while_blocking_rebinding() {
+        // Underscore container/LAN names and private LAN suffixes pass on non-loopback binds.
+        assert!(host_allowed(Some("cv_hub.lan:7777"), "0.0.0.0"));
+        assert!(host_allowed(Some("node_1.internal:7777"), "0.0.0.0"));
+        assert!(host_allowed(Some("nas.home.arpa:7777"), "0.0.0.0"));
+        assert!(host_allowed(Some("cv_hub:7777"), "cv_hub"));
+
+        let os_host = cv_core::state::default_host_label();
+        if let Some(short) = os_host.split('.').next().filter(|s| !s.is_empty() && *s != "localhost") {
+            assert!(host_allowed(Some(&format!("{short}.corp.example.com:7777")), "0.0.0.0"));
+        }
+
+        // Unauthenticated foreign domains stay 403 on both loopback and 0.0.0.0.
+        assert!(!host_allowed(Some("evil.example.com:7777"), "0.0.0.0"));
+        assert!(!host_allowed(Some("cv_hub.lan:7777"), "127.0.0.1"));
+
+        // Valid `Authorization: Bearer` header on `/api/*` bypasses Host check for reverse proxies /
+        // Docker service names (`cv_hub:7777`, `hub.example.com`), while unauthenticated requests,
+        // wrong tokens, HTML pages, OPTIONS preflights, and `?token=` query strings remain blocked.
+        assert!(host_allowed_for_request(
+            Some("cv_hub:7777"),
+            "0.0.0.0",
+            "POST",
+            "/api/hub/enroll",
+            Some("Bearer s3cr3t"),
+            Some("s3cr3t"),
+        ));
+        assert!(host_allowed_for_request(
+            Some("hub.proxy.example.com"),
+            "127.0.0.1",
+            "GET",
+            "/api/sessions?limit=5",
+            Some("Bearer s3cr3t"),
+            Some("s3cr3t"),
+        ));
+        // Reject unauthenticated, wrong Bearer, query-string `?token=`, HTML page, OPTIONS, bad Host.
+        assert!(!host_allowed_for_request(
+            Some("evil.example.com"),
+            "0.0.0.0",
+            "GET",
+            "/api/sessions",
+            None,
+            Some("s3cr3t"),
+        ));
+        assert!(!host_allowed_for_request(
+            Some("evil.example.com"),
+            "0.0.0.0",
+            "GET",
+            "/api/sessions",
+            Some("Bearer wrong"),
+            Some("s3cr3t"),
+        ));
+        assert!(!host_allowed_for_request(
+            Some("evil.example.com"),
+            "0.0.0.0",
+            "GET",
+            "/api/stream?token=s3cr3t",
+            None,
+            Some("s3cr3t"),
+        ));
+        assert!(!host_allowed_for_request(
+            Some("evil.example.com"),
+            "0.0.0.0",
+            "GET",
+            "/inbox",
+            Some("Bearer s3cr3t"),
+            Some("s3cr3t"),
+        ));
+        assert!(!host_allowed_for_request(
+            Some("evil.example.com"),
+            "0.0.0.0",
+            "OPTIONS",
+            "/api/hub/enroll",
+            Some("Bearer s3cr3t"),
+            Some("s3cr3t"),
+        ));
+        assert!(!host_allowed_for_request(
+            Some("bad/host"),
+            "0.0.0.0",
+            "GET",
+            "/api/sessions",
+            Some("Bearer s3cr3t"),
+            Some("s3cr3t"),
+        ));
     }
 }
 

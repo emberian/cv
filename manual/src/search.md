@@ -53,12 +53,14 @@ its source.
 
 ### Where the index lives
 
-Under `$CLUSTERVISION_HOME` (default `~/.clustervision`):
+Under `$CLUSTERVISION_CACHE` when set, else `$CLUSTERVISION_HOME` when explicitly set, else the
+platform cache directory (`~/Library/Caches/clustervision/` on macOS, `$XDG_CACHE_HOME/clustervision/`
+or `~/.cache/clustervision/` on Linux) alongside `catalog.db`:
 
-| Index            | Path                                  |
+| Index            | Subdirectory                          |
 | ---------------- | ------------------------------------- |
-| Full-text        | `~/.clustervision/tantivy/`            |
-| Trigram exact    | `~/.clustervision/trigram/`            |
+| Full-text        | `<cache-dir>/tantivy/`                |
+| Trigram exact    | `<cache-dir>/trigram/`                |
 
 ## Full-text search
 

@@ -82,12 +82,20 @@ impl SessionFile {
     }
 }
 
-/// A Claude session by full id or unique prefix, as [`crate::find`] resolves it.
+/// A Claude session by full id, unique prefix, or `claude:<id>` selector, as [`crate::find`] resolves it.
 pub fn find_session(spec: &str) -> Result<SessionFile> {
-    if spec.starts_with("agent-") {
+    let bare = match spec.split_once(':') {
+        Some((prefix, rest)) => match Harness::parse(prefix) {
+            Some(Harness::Claude) => rest,
+            Some(other) => bail!("adopt is Claude-only (got {} selector {spec:?})", other.as_str()),
+            None => spec,
+        },
+        None => spec,
+    };
+    if bare.starts_with("agent-") {
         bail!("{spec} is a sub-agent id; this wants a session id");
     }
-    match crate::find(spec, Some(Harness::Claude))? {
+    match crate::find(bare, Some(Harness::Claude))? {
         // Check the resolved id too: a short selector need not itself start with agent-.
         Some((r, _)) if !r.id.starts_with("agent-") => {
             SessionFile::of(r).with_context(|| format!("{spec}: the transcript has no project dir"))
@@ -657,5 +665,27 @@ mod tests {
         // Adopting into the session that already owns the agent is refused.
         assert!(execute(&plan(agent, vec![], &dead), true, true).is_err());
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn find_session_accepts_claude_prefix_and_rejects_foreign_harness_prefix() {
+        let w = crate::test_world("adopt-find-session-prefix");
+        w.write_session(
+            LIVE,
+            &[serde_json::json!({
+                "type": "user",
+                "sessionId": LIVE,
+                "uuid": "u1",
+                "timestamp": "2026-10-01T00:00:00Z",
+                "message": {"role": "user", "content": "hi"}
+            })],
+        );
+        let bare = find_session(LIVE).unwrap();
+        let prefixed = find_session(&format!("claude:{LIVE}")).unwrap();
+        assert_eq!(prefixed.session_id, bare.session_id);
+        assert_eq!(prefixed.path, bare.path);
+
+        let foreign_err = find_session(&format!("codex:{LIVE}")).unwrap_err().to_string();
+        assert!(foreign_err.contains("Claude-only"), "{foreign_err}");
     }
 }

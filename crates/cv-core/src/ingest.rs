@@ -338,7 +338,13 @@ fn antigravity_id_and_rank(name: &str) -> (String, u8) {
 /// diagnostics. Works without any filesystem access on wasm32, and supports temp-staged SQLite and
 /// companion-file stores on native builds.
 pub fn ingest_files(files: Vec<(String, Vec<u8>)>) -> anyhow::Result<Vec<Session>> {
-    Ok(ingest_files_with_report(files)?.sessions)
+    let (report, first_parse_err) = ingest_files_inner(files)?;
+    if report.sessions.is_empty() {
+        if let Some(err) = first_parse_err {
+            return Err(err);
+        }
+    }
+    Ok(report.sessions)
 }
 
 /// Extract and ingest a `.zip` archive in one call, returning both parsed sessions and structured
@@ -395,89 +401,136 @@ fn decode_zst_entry(name: &str, bytes: &[u8]) -> Result<(String, Vec<u8>), Strin
     Ok((strip_zst_suffix(name), out))
 }
 
+struct PendingEntry {
+    raw_name: String,
+    name: String,
+    bytes: Vec<u8>,
+}
+
+fn stamp_archive_source(mut s: Session, raw_name: &str) -> Session {
+    s.source_path = Some(std::path::PathBuf::from(raw_name));
+    s
+}
+
 /// Ingest `(relative_path, bytes)` pairs and return both parsed sessions and structured
 /// diagnostics for skipped entries.
 pub fn ingest_files_with_report(files: Vec<(String, Vec<u8>)>) -> anyhow::Result<IngestReport> {
+    Ok(ingest_files_inner(files)?.0)
+}
+
+fn ingest_files_inner(files: Vec<(String, Vec<u8>)>) -> anyhow::Result<(IngestReport, Option<anyhow::Error>)> {
     let mut out = Vec::new();
     let mut skipped = Vec::new();
-    let mut agy_candidates: std::collections::BTreeMap<String, (u8, usize, String)> = std::collections::BTreeMap::new();
-    let mut pending_unknown: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut first_parse_err: Option<anyhow::Error> = None;
+    let mut agy_candidates: std::collections::BTreeMap<String, (u8, usize, String, String)> =
+        std::collections::BTreeMap::new();
+    let mut pending_unknown: Vec<PendingEntry> = Vec::new();
+
+    let record_parse_err =
+        |raw_name: String, err: anyhow::Error, skipped: &mut Vec<SkippedEntry>, first: &mut Option<anyhow::Error>| {
+            let reason = format!("parse error: {err:#}");
+            if first.is_none() {
+                *first = Some(err);
+            }
+            skipped.push(SkippedEntry { path: raw_name, reason });
+        };
 
     for (idx, (raw_name, raw_bytes)) in files.into_iter().enumerate() {
         let (name, bytes) = if is_zst_entry(&raw_name, &raw_bytes) {
             match decode_zst_entry(&raw_name, &raw_bytes) {
                 Ok(decoded) => decoded,
                 Err(reason) => {
+                    if first_parse_err.is_none() {
+                        first_parse_err = Some(anyhow::anyhow!("{reason}"));
+                    }
                     skipped.push(SkippedEntry { path: raw_name, reason });
                     continue;
                 }
             }
         } else {
-            (raw_name, raw_bytes)
+            (raw_name.clone(), raw_bytes)
         };
         if is_sqlite_bytes(&name, &bytes) || is_sqlite_sidecar(&name) {
-            pending_unknown.push((name, bytes));
+            pending_unknown.push(PendingEntry { raw_name, name, bytes });
             continue;
         }
         let text = String::from_utf8_lossy(&bytes);
         match sniff(&name, &text) {
             Sniff::Codex { is_jsonl } => {
                 let id = codex_id(&name, &text);
-                out.push(codex::parse_str(&id, &text, is_jsonl, None)?);
+                match codex::parse_str(&id, &text, is_jsonl, None) {
+                    Ok(s) => out.push(stamp_archive_source(s, &raw_name)),
+                    Err(e) => record_parse_err(raw_name, e, &mut skipped, &mut first_parse_err),
+                }
             }
             Sniff::Claude => {
                 let id = file_stem(&name).to_string();
-                out.push(claude::parse_str(&id, &text, None));
+                out.push(stamp_archive_source(claude::parse_str(&id, &text, None), &raw_name));
             }
-            Sniff::Gemini => {
-                out.extend(gemini::parse_all_str(&text, None)?);
-            }
+            Sniff::Gemini => match gemini::parse_all_str(&text, None) {
+                Ok(sessions) => out.extend(sessions.into_iter().map(|s| stamp_archive_source(s, &raw_name))),
+                Err(e) => record_parse_err(raw_name, e, &mut skipped, &mut first_parse_err),
+            },
             Sniff::Antigravity => {
                 let (id, rank) = antigravity_id_and_rank(&name);
                 let replace = agy_candidates
                     .get(&id)
-                    .is_none_or(|(prev_rank, _, _)| rank > *prev_rank);
+                    .is_none_or(|(prev_rank, _, _, _)| rank > *prev_rank);
                 if replace {
-                    agy_candidates.insert(id, (rank, idx, text.into_owned()));
+                    agy_candidates.insert(id, (rank, idx, raw_name, text.into_owned()));
                 }
             }
             Sniff::Qwen => {
                 let id = file_stem(&name).to_string();
-                out.push(qwen::parse_str(&id, &text)?);
+                match qwen::parse_str(&id, &text) {
+                    Ok(s) => out.push(stamp_archive_source(s, &raw_name)),
+                    Err(e) => record_parse_err(raw_name, e, &mut skipped, &mut first_parse_err),
+                }
             }
             Sniff::OpenClaw => {
                 let id = file_stem(&name).to_string();
-                out.push(openclaw::parse_str(&id, &text)?);
+                match openclaw::parse_str(&id, &text) {
+                    Ok(s) => out.push(stamp_archive_source(s, &raw_name)),
+                    Err(e) => record_parse_err(raw_name, e, &mut skipped, &mut first_parse_err),
+                }
             }
-            Sniff::OpenSession => {
-                out.push(opensession::from_str(&text)?);
-            }
-            Sniff::Export => {
-                out.extend(export::parse_all_str(&text)?);
-            }
+            Sniff::OpenSession => match opensession::from_str(&text) {
+                Ok(s) => out.push(stamp_archive_source(s, &raw_name)),
+                Err(e) => record_parse_err(raw_name, e, &mut skipped, &mut first_parse_err),
+            },
+            Sniff::Export => match export::parse_all_str(&text) {
+                Ok(sessions) => out.extend(sessions.into_iter().map(|s| stamp_archive_source(s, &raw_name))),
+                Err(e) => record_parse_err(raw_name, e, &mut skipped, &mut first_parse_err),
+            },
             Sniff::Continue => {
                 let id = file_stem(&name).to_string();
-                out.push(continuedev::parse_str(&id, &text)?);
+                match continuedev::parse_str(&id, &text) {
+                    Ok(s) => out.push(stamp_archive_source(s, &raw_name)),
+                    Err(e) => record_parse_err(raw_name, e, &mut skipped, &mut first_parse_err),
+                }
             }
             Sniff::Unknown => {
-                pending_unknown.push((name, bytes));
+                pending_unknown.push(PendingEntry { raw_name, name, bytes });
             }
         }
     }
-    let mut agy_ordered: Vec<(usize, String, String)> = agy_candidates
+    let mut agy_ordered: Vec<(usize, String, String, String)> = agy_candidates
         .into_iter()
-        .map(|(id, (_rank, idx, text))| (idx, id, text))
+        .map(|(id, (_rank, idx, raw_name, text))| (idx, id, raw_name, text))
         .collect();
-    agy_ordered.sort_by_key(|(idx, _, _)| *idx);
-    for (_, id, text) in agy_ordered {
-        out.push(antigravity::parse_str(&id, &text, None)?);
+    agy_ordered.sort_by_key(|(idx, _, _, _)| *idx);
+    for (_, id, raw_name, text) in agy_ordered {
+        match antigravity::parse_str(&id, &text, None) {
+            Ok(s) => out.push(stamp_archive_source(s, &raw_name)),
+            Err(e) => record_parse_err(raw_name, e, &mut skipped, &mut first_parse_err),
+        }
     }
 
     if !pending_unknown.is_empty() {
-        ingest_pending_entries(pending_unknown, &mut out, &mut skipped)?;
+        ingest_pending_entries(pending_unknown, &mut out, &mut skipped, &mut first_parse_err)?;
     }
 
-    Ok(IngestReport { sessions: out, skipped })
+    Ok((IngestReport { sessions: out, skipped }, first_parse_err))
 }
 
 fn cline_or_roo_harness(path_hint: &str) -> crate::ir::Harness {
@@ -676,46 +729,52 @@ fn parse_cline_ui_messages_bytes(id: &str, harness: crate::ir::Harness, bytes: &
 
 #[cfg(target_arch = "wasm32")]
 fn ingest_pending_entries(
-    pending: Vec<(String, Vec<u8>)>,
+    pending: Vec<PendingEntry>,
     out: &mut Vec<Session>,
     skipped: &mut Vec<SkippedEntry>,
+    _first_parse_err: &mut Option<anyhow::Error>,
 ) -> anyhow::Result<()> {
     #[derive(Default)]
     struct PendingClineDir {
         history: Option<Vec<u8>>,
         ui: Option<Vec<u8>>,
         hint: String,
+        raw_hint: String,
     }
 
     let mut cline_dirs: std::collections::BTreeMap<String, PendingClineDir> = std::collections::BTreeMap::new();
-    let mut other: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut other: Vec<PendingEntry> = Vec::new();
 
-    for (name, bytes) in pending {
-        let base = name.rsplit(['/', '\\']).next().unwrap_or(&name);
-        let parent = name
+    for entry in pending {
+        let base = entry.name.rsplit(['/', '\\']).next().unwrap_or(&entry.name);
+        let parent = entry
+            .name
             .rsplit_once(['/', '\\'])
             .map(|(p, _)| p.to_string())
             .unwrap_or_default();
         match base {
             "api_conversation_history.json" => {
-                let entry = cline_dirs.entry(parent).or_default();
-                entry.history = Some(bytes);
-                entry.hint = name;
+                let dir = cline_dirs.entry(parent).or_default();
+                dir.history = Some(entry.bytes);
+                dir.hint = entry.name;
+                dir.raw_hint = entry.raw_name;
             }
             "ui_messages.json" => {
-                let entry = cline_dirs.entry(parent).or_default();
-                if entry.hint.is_empty() {
-                    entry.hint = name;
+                let dir = cline_dirs.entry(parent).or_default();
+                if dir.hint.is_empty() {
+                    dir.hint = entry.name;
+                    dir.raw_hint = entry.raw_name;
                 }
-                entry.ui = Some(bytes);
+                dir.ui = Some(entry.bytes);
             }
             "task_metadata.json" | "history_item.json" => {
-                let entry = cline_dirs.entry(parent).or_default();
-                if entry.hint.is_empty() {
-                    entry.hint = name;
+                let dir = cline_dirs.entry(parent).or_default();
+                if dir.hint.is_empty() {
+                    dir.hint = entry.name;
+                    dir.raw_hint = entry.raw_name;
                 }
             }
-            _ => other.push((name, bytes)),
+            _ => other.push(entry),
         }
     }
 
@@ -724,32 +783,35 @@ fn ingest_pending_entries(
         let id = cline_task_id_from_rel(&parent);
         if let Some(bytes) = dir.history {
             if let Some(s) = parse_cline_history_bytes(&id, harness, &bytes) {
-                out.push(s);
+                out.push(stamp_archive_source(s, &dir.raw_hint));
                 continue;
             }
         }
         if let Some(bytes) = dir.ui {
             if let Some(s) = parse_cline_ui_messages_bytes(&id, harness, &bytes) {
-                out.push(s);
+                out.push(stamp_archive_source(s, &dir.raw_hint));
                 continue;
             }
         }
         skipped.push(SkippedEntry {
-            path: dir.hint,
+            path: dir.raw_hint,
             reason: "unrecognized or empty Cline/Roo task archive".into(),
         });
     }
 
-    for (name, bytes) in other {
-        if is_sqlite_sidecar(&name) {
+    for entry in other {
+        if is_sqlite_sidecar(&entry.name) {
             continue;
         }
-        let reason = if is_sqlite_bytes(&name, &bytes) {
+        let reason = if is_sqlite_bytes(&entry.name, &entry.bytes) {
             "SQLite store requires native sqlite support".to_string()
         } else {
             "unrecognized or non-transcript file".to_string()
         };
-        skipped.push(SkippedEntry { path: name, reason });
+        skipped.push(SkippedEntry {
+            path: entry.raw_name,
+            reason,
+        });
     }
     Ok(())
 }
@@ -841,10 +903,55 @@ fn claim_dir_files(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+fn staged_archive_name<'a>(
+    candidate: &std::path::Path,
+    staged_paths: &'a [(String, std::path::PathBuf, bool)],
+) -> Option<&'a str> {
+    if let Some((orig, _, _)) = staged_paths.iter().find(|(_, full, _)| full == candidate) {
+        return Some(orig.as_str());
+    }
+    for primary in [
+        "api_conversation_history.json",
+        "ui_messages.json",
+        "chat_history.jsonl",
+        "agents/main/wire.jsonl",
+        "wire.jsonl",
+        "context.jsonl",
+        "summary.json",
+    ] {
+        let target = candidate.join(primary);
+        if let Some((orig, _, _)) = staged_paths.iter().find(|(_, full, _)| full == &target) {
+            return Some(orig.as_str());
+        }
+    }
+    staged_paths
+        .iter()
+        .find(|(orig, full, _)| !is_sqlite_sidecar(orig) && full.starts_with(candidate))
+        .map(|(orig, _, _)| orig.as_str())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn finalize_staged_session(mut s: Session) -> anyhow::Result<Session> {
     s.materialize()?;
     s.source_path = None;
     s.source_stamp = None;
+    Ok(s)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn finalize_staged_with_hint(
+    mut s: Session,
+    staged_paths: &[(String, std::path::PathBuf, bool)],
+    hint: Option<&std::path::Path>,
+) -> anyhow::Result<Session> {
+    let orig_source = s.source_path.take();
+    s = finalize_staged_session(s)?;
+    let archive_name = hint.and_then(|h| staged_archive_name(h, staged_paths)).or_else(|| {
+        orig_source
+            .as_deref()
+            .and_then(|p| staged_archive_name(p, staged_paths))
+    });
+    s.source_path = archive_name.map(std::path::PathBuf::from);
     Ok(s)
 }
 
@@ -862,13 +969,16 @@ fn create_private_staging_dir(path: &std::path::Path) -> std::io::Result<()> {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn ingest_pending_entries(
-    pending: Vec<(String, Vec<u8>)>,
+    pending: Vec<PendingEntry>,
     out: &mut Vec<Session>,
     skipped: &mut Vec<SkippedEntry>,
+    #[cfg_attr(not(feature = "sqlite"), allow(unused_variables))] first_parse_err: &mut Option<anyhow::Error>,
 ) -> anyhow::Result<()> {
     use crate::harness::{Adapter as _, Parse as _};
 
-    let has_stageable = pending.iter().any(|(name, bytes)| {
+    let has_stageable = pending.iter().any(|entry| {
+        let name = &entry.name;
+        let bytes = &entry.bytes;
         let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
         is_sqlite_bytes(name, bytes)
             || is_sqlite_sidecar(name)
@@ -889,9 +999,9 @@ fn ingest_pending_entries(
     });
 
     if !has_stageable {
-        for (name, _) in pending {
+        for entry in pending {
             skipped.push(SkippedEntry {
-                path: name,
+                path: entry.raw_name,
                 reason: "unrecognized or non-transcript file".into(),
             });
         }
@@ -909,10 +1019,10 @@ fn ingest_pending_entries(
     let _guard = TempGuard(temp_root.clone());
 
     let mut staged_paths: Vec<(String, std::path::PathBuf, bool)> = Vec::new();
-    for (name, bytes) in pending {
-        let Some(rel) = sanitize_relative_path(&name) else {
+    for entry in pending {
+        let Some(rel) = sanitize_relative_path(&entry.name) else {
             skipped.push(SkippedEntry {
-                path: name,
+                path: entry.raw_name,
                 reason: "unsafe relative path in archive".into(),
             });
             continue;
@@ -921,9 +1031,9 @@ fn ingest_pending_entries(
         if let Some(parent) = full.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&full, &bytes)?;
-        let sqlite_like = is_sqlite_bytes(&name, &bytes);
-        staged_paths.push((name, full, sqlite_like));
+        std::fs::write(&full, &entry.bytes)?;
+        let sqlite_like = is_sqlite_bytes(&entry.name, &entry.bytes);
+        staged_paths.push((entry.raw_name, full, sqlite_like));
     }
 
     let mut claimed_files: std::collections::HashSet<std::path::PathBuf> = std::collections::HashSet::new();
@@ -993,7 +1103,7 @@ fn ingest_pending_entries(
                 .unwrap_or(SqliteFlavor::Unknown);
             drop(conn);
 
-            let parsed_sqlite: anyhow::Result<Option<Vec<Session>>> = match flavor {
+            let parsed_sqlite: anyhow::Result<Option<Vec<Session>>> = (|| match flavor {
                 SqliteFlavor::OpenClaw => {
                     let oc_state = temp_root.join(format!("_oc_{}", uuid::Uuid::new_v4()));
                     let target_db = oc_state.join("agents/main/agent/openclaw-agent.sqlite");
@@ -1137,17 +1247,28 @@ fn ingest_pending_entries(
                     }
                 }
                 SqliteFlavor::Unknown => Ok(None),
-            };
-            match parsed_sqlite? {
-                Some(mut sessions) => {
+            })();
+            match parsed_sqlite {
+                Ok(Some(sessions)) => {
                     claimed_files.insert(full_path.clone());
-                    out.append(&mut sessions);
+                    out.extend(sessions.into_iter().map(|s| stamp_archive_source(s, orig_name)));
                 }
-                None => {
+                Ok(None) => {
                     claimed_files.insert(full_path.clone());
                     skipped.push(SkippedEntry {
                         path: orig_name.clone(),
                         reason: "unrecognized SQLite schema".into(),
+                    });
+                }
+                Err(err) => {
+                    claimed_files.insert(full_path.clone());
+                    let reason = format!("parse error: {err:#}");
+                    if first_parse_err.is_none() {
+                        *first_parse_err = Some(err);
+                    }
+                    skipped.push(SkippedEntry {
+                        path: orig_name.clone(),
+                        reason,
                     });
                 }
             }
@@ -1184,7 +1305,7 @@ fn ingest_pending_entries(
         for r in &disc.refs {
             if let Ok(s) = grok.parse(r) {
                 claim_grok_dir(&r.path, &mut claimed_files);
-                out.push(finalize_staged_session(s)?);
+                out.push(finalize_staged_with_hint(s, &staged_paths, Some(&r.path))?);
             }
         }
     }
@@ -1212,7 +1333,7 @@ fn ingest_pending_entries(
                         for r in &disc.refs {
                             if let Ok(s) = adapter.parse(r) {
                                 claim_grok_dir(src_dir, &mut claimed_files);
-                                out.push(finalize_staged_session(s)?);
+                                out.push(finalize_staged_with_hint(s, &staged_paths, Some(src_dir))?);
                             }
                         }
                     }
@@ -1227,7 +1348,7 @@ fn ingest_pending_entries(
         for r in &disc.refs {
             if let Ok(s) = lm.parse(r) {
                 claimed_files.insert(r.path.clone());
-                out.push(finalize_staged_session(s)?);
+                out.push(finalize_staged_with_hint(s, &staged_paths, Some(&r.path))?);
             }
         }
     }
@@ -1260,17 +1381,17 @@ fn ingest_pending_entries(
                 crate::harness::cline::stream_task_dir(&dir, &task_id, harness, &crate::Demand::RICH, &mut sink)
             {
                 s.messages = sink.messages;
-                out.push(finalize_staged_session(s)?);
+                out.push(finalize_staged_with_hint(s, &staged_paths, Some(&dir))?);
                 parsed_any = true;
             } else if let Ok(bytes) = std::fs::read(dir.join("api_conversation_history.json")) {
                 if let Some(s) = parse_cline_history_bytes(&task_id, harness, &bytes) {
-                    out.push(finalize_staged_session(s)?);
+                    out.push(finalize_staged_with_hint(s, &staged_paths, Some(&dir))?);
                     parsed_any = true;
                 }
             }
         } else if let Ok(bytes) = std::fs::read(dir.join("ui_messages.json")) {
             if let Some(s) = parse_cline_ui_messages_bytes(&task_id, harness, &bytes) {
-                out.push(finalize_staged_session(s)?);
+                out.push(finalize_staged_with_hint(s, &staged_paths, Some(&dir))?);
                 parsed_any = true;
             }
         }
@@ -1298,7 +1419,7 @@ fn ingest_pending_entries(
                     } else {
                         claimed_files.insert(r.path.clone());
                     }
-                    out.push(finalize_staged_session(s)?);
+                    out.push(finalize_staged_with_hint(s, &staged_paths, Some(&r.path))?);
                 }
             }
         }
@@ -1319,7 +1440,7 @@ fn ingest_pending_entries(
                 } else {
                     claimed_files.insert(r.path.clone());
                 }
-                out.push(finalize_staged_session(s)?);
+                out.push(finalize_staged_with_hint(s, &staged_paths, Some(&r.path))?);
             }
         }
     }
@@ -1346,7 +1467,7 @@ fn ingest_pending_entries(
                     for r in &disc.refs {
                         if let Ok(s) = adapter.parse(r) {
                             claim_dir_files(src_dir, src_dir == temp_root, &mut claimed_files);
-                            out.push(finalize_staged_session(s)?);
+                            out.push(finalize_staged_with_hint(s, &staged_paths, Some(src_dir))?);
                         }
                     }
                 }
@@ -1364,7 +1485,7 @@ fn ingest_pending_entries(
         for r in &disc.refs {
             if let Ok(s) = kc.parse(r) {
                 claim_dir_files(&r.path, false, &mut claimed_files);
-                out.push(finalize_staged_session(s)?);
+                out.push(finalize_staged_with_hint(s, &staged_paths, Some(&r.path))?);
             }
         }
     }
@@ -1394,7 +1515,7 @@ fn ingest_pending_entries(
                     for r in &disc.refs {
                         if let Ok(s) = adapter.parse(r) {
                             claim_dir_files(sdir, sdir == temp_root, &mut claimed_files);
-                            out.push(finalize_staged_session(s)?);
+                            out.push(finalize_staged_with_hint(s, &staged_paths, Some(sdir))?);
                         }
                     }
                 }
@@ -1419,7 +1540,7 @@ fn ingest_pending_entries(
                         if let Ok(s) = adapter.parse(r) {
                             claimed_files.insert(full_path.clone());
                             claimed_files.insert(src_state.clone());
-                            out.push(finalize_staged_session(s)?);
+                            out.push(finalize_staged_with_hint(s, &staged_paths, Some(full_path))?);
                         }
                     }
                 }
@@ -1428,7 +1549,7 @@ fn ingest_pending_entries(
     }
 
     // 6. OpenCode JSON tree (`<storage>/session/**/ses_*.json` + `message/` + `part/`).
-    let mut opencode_roots: Vec<std::path::PathBuf> = Vec::new();
+    let mut opencode_roots: Vec<(std::path::PathBuf, Option<std::path::PathBuf>)> = Vec::new();
     for (_, full_path, _) in &staged_paths {
         if claimed_files.contains(full_path) {
             continue;
@@ -1443,8 +1564,8 @@ fn ingest_pending_entries(
                 .and_then(std::path::Path::parent)
                 .map(std::path::Path::to_path_buf);
             if let Some(sr) = storage_root {
-                if !opencode_roots.contains(&sr) {
-                    opencode_roots.push(sr);
+                if !opencode_roots.iter().any(|(root, _)| root == &sr) {
+                    opencode_roots.push((sr, None));
                 }
             } else {
                 let oc_root = temp_root.join(format!("_ocjson_{}", uuid::Uuid::new_v4()));
@@ -1452,11 +1573,11 @@ fn ingest_pending_entries(
                 std::fs::create_dir_all(&sess_dir)?;
                 std::fs::copy(full_path, sess_dir.join(fname))?;
                 claimed_files.insert(full_path.clone());
-                opencode_roots.push(oc_root);
+                opencode_roots.push((oc_root, Some(full_path.clone())));
             }
         }
     }
-    for sr in opencode_roots {
+    for (sr, hint) in opencode_roots {
         let adapter = crate::harness::opencode::OpenCode::with_root(sr.clone());
         if let Ok(disc) = adapter.discover() {
             for sub in ["session", "message", "part", "project"] {
@@ -1468,7 +1589,11 @@ fn ingest_pending_entries(
             for r in &disc.refs {
                 if let Ok(s) = adapter.parse(r) {
                     claimed_files.insert(r.path.clone());
-                    out.push(finalize_staged_session(s)?);
+                    out.push(finalize_staged_with_hint(
+                        s,
+                        &staged_paths,
+                        hint.as_deref().or(Some(&r.path)),
+                    )?);
                 }
             }
         }
@@ -2104,5 +2229,49 @@ mod tests {
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o700);
         assert!(create_private_staging_dir(&path).is_err());
         std::fs::remove_dir(path).unwrap();
+    }
+
+    #[test]
+    fn isolates_corrupt_entries_into_skipped_and_stamps_archive_source_paths() {
+        let report = ingest_files_with_report(vec![
+            ("dir/good.jsonl".into(), CLAUDE_SAMPLE.as_bytes().to_vec()),
+            ("rollout-2025-01-02-good.jsonl".into(), CODEX_SAMPLE.as_bytes().to_vec()),
+            ("rollout-broken.json".into(), br#"{"session":{},"messages":["#.to_vec()),
+            ("bad.opensession.json".into(), br#"{"open_session":{"#.to_vec()),
+            ("broken.jsonl.zst".into(), b"\x28\xb5\x2f\xfdcorrupt".to_vec()),
+        ])
+        .unwrap();
+
+        assert_eq!(report.sessions.len(), 2);
+        let claude = report.sessions.iter().find(|s| s.harness == Harness::Claude).unwrap();
+        assert_eq!(
+            claude.source_path.as_deref(),
+            Some(std::path::Path::new("dir/good.jsonl"))
+        );
+        let codex = report.sessions.iter().find(|s| s.harness == Harness::Codex).unwrap();
+        assert_eq!(
+            codex.source_path.as_deref(),
+            Some(std::path::Path::new("rollout-2025-01-02-good.jsonl"))
+        );
+
+        assert_eq!(report.skipped.len(), 3, "{:?}", report.skipped);
+        for name in ["rollout-broken.json", "bad.opensession.json", "broken.jsonl.zst"] {
+            assert!(
+                report
+                    .skipped
+                    .iter()
+                    .any(|s| s.path == name && (s.reason.contains("parse error") || s.reason.contains("zstd:"))),
+                "missing skip for {name}: {:?}",
+                report.skipped
+            );
+        }
+
+        // Single-entry broken input through stateless `ingest_files` still surfaces the parse error.
+        let single_err = ingest_files(vec![(
+            "rollout-broken.json".into(),
+            br#"{"session":{},"messages":["#.to_vec(),
+        )])
+        .unwrap_err();
+        assert!(!single_err.to_string().is_empty());
     }
 }

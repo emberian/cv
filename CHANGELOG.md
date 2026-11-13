@@ -1,6 +1,12 @@
 # Changelog
 
 ## Unreleased
+- Hub replication seeds v2 frontiers on upgrade, orders untimestamped deletes across epochs, ships legacy archive files and inbox packs, and inherits `[privacy]` config.
+- `retired.jsonl` imports into `state.db` alongside `lanes.jsonl`, and `cv doctor --store` keeps missing or older `catalog.db` caches strictly read-only.
+- Hermes revision certificates stream `> 2 KiB` cells via `sqlite3_blob_open` so same-length body edits invalidate caches without materializing giant overflow pages.
+- Claude `2.1.323` `model_refusal_no_fallback` records classify as `error`, Kimi/Grok directory listings report transcript byte sizes, and `cv formats` updates Claude and Kimi Code manifests.
+- Zip ingest isolates corrupt entries into `skipped` while preserving archive paths and sizes; `cv serve` accepts underscore/LAN hosts and Bearer-authenticated `/api/*` proxy aliases.
+- `cv splice --export json` sends its composition banner to stderr so stdout stays valid JSON, and `cv adopt` accepts `claude:<id>` session selectors.
 
 ## 0.19.0 — 2026-11-12 — sealed custody, exact search, and the SQLite state spine
 ClusterVision 0.19.0 unifies mutable coordination state in `state.db` (SQLite WAL), replaces loose
