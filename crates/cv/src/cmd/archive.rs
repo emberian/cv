@@ -231,20 +231,25 @@ impl Archive {
                 continue;
             }
 
-            let (source_len, source_mtime_ns) = source_stat(&r.path);
-            let single_file_source = is_single_session_file(&r.path);
+            let primary = cv_core::source::primary_path(r);
+            let (source_len, source_mtime_ns) = source_stat_ref(r, &primary);
+            let self_contained_file = is_self_contained_single_session_file(r);
+            let sqlite_primary = !is_non_sqlite_path(&primary);
 
             if let Some(prev) = known.get(&key) {
-                let stat_unchanged = single_file_source
+                let stat_unchanged = self_contained_file
                     && source_len.is_some()
                     && source_mtime_ns.is_some()
                     && prev.source_len == source_len
                     && prev.source_mtime_ns == source_mtime_ns;
-                let meta_unchanged = r.updated_at.is_some()
+                let meta_unchanged = !has_untracked_companion_files(r.harness)
+                    && r.updated_at.is_some()
                     && prev.updated_at == r.updated_at
                     && r.message_count.is_some_and(|mc| mc == prev.message_count)
-                    && (!single_file_source
-                        || (prev.source_len == source_len && prev.source_mtime_ns == source_mtime_ns));
+                    && (sqlite_primary
+                        || (source_len.is_some()
+                            && prev.source_len == source_len
+                            && prev.source_mtime_ns == source_mtime_ns));
                 if stat_unchanged || meta_unchanged {
                     summary.skipped += 1;
                     continue;
@@ -531,13 +536,76 @@ fn truncate_str(s: &str, max_chars: usize) -> String {
     }
 }
 
-fn is_single_session_file(path: &Path) -> bool {
+fn is_non_sqlite_path(path: &Path) -> bool {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
     !matches!(ext.as_str(), "db" | "sqlite" | "sqlite3" | "vscdb")
+}
+
+/// Returns `true` only when `r.path` is a regular file holding exactly one self-contained session
+/// with no companion sidecar/subagent files and no multi-session sharing.
+fn is_self_contained_single_session_file(r: &SessionRef) -> bool {
+    matches!(
+        r.harness,
+        Harness::Codex | Harness::Qwen | Harness::Continue | Harness::LmStudio | Harness::OpenSession
+    ) && is_non_sqlite_path(&r.path)
+        && std::fs::metadata(&r.path).is_ok_and(|m| m.is_file())
+}
+
+/// Harnesses whose session output incorporates companion files outside `primary_path(r)` (such as
+/// subagent transcripts, separate `message/`+`part/` trees, or `state.json` metadata).
+fn has_untracked_companion_files(h: Harness) -> bool {
+    matches!(
+        h,
+        Harness::Claude
+            | Harness::Antigravity
+            | Harness::OpenCode
+            | Harness::Kimi
+            | Harness::KimiCode
+            | Harness::Grok
+            | Harness::Cline
+            | Harness::Roo
+            | Harness::Gemini
+    )
+}
+
+fn source_stat_ref(r: &SessionRef, primary: &Path) -> (Option<u64>, Option<i128>) {
+    let (len, mtime_ns) = source_stat(primary);
+    if len.is_some() {
+        (len, mtime_ns)
+    } else {
+        source_stat(&r.path)
+    }
+}
+
+type WatchStatMap = std::collections::HashMap<(Harness, String, PathBuf), (Option<u64>, Option<SystemTime>)>;
+
+fn watch_ref_stat(r: &SessionRef) -> Option<(Option<u64>, Option<SystemTime>)> {
+    let primary = cv_core::source::primary_path(r);
+    let m = std::fs::metadata(&primary)
+        .ok()
+        .filter(|m| m.is_file())
+        .or_else(|| std::fs::metadata(&r.path).ok().filter(|m| m.is_file()))?;
+    Some((Some(m.len()), m.modified().ok()))
+}
+
+fn filter_watch_candidates(refs: Vec<SessionRef>, seen_stat: &mut WatchStatMap) -> Vec<SessionRef> {
+    let mut candidates = Vec::with_capacity(refs.len());
+    for r in refs {
+        let key = (r.harness, r.id.clone(), r.path.clone());
+        let cur = watch_ref_stat(&r);
+        if is_self_contained_single_session_file(&r) && cur.is_some() && seen_stat.get(&key) == cur.as_ref() {
+            continue;
+        }
+        if let Some(c) = cur {
+            seen_stat.insert(key, c);
+        }
+        candidates.push(r);
+    }
+    candidates
 }
 
 fn source_stat(path: &Path) -> (Option<u64>, Option<i128>) {
@@ -747,32 +815,20 @@ pub fn cmd_watch(
         }
     }
 
-    // Track last-seen `(len, mtime)` per source file so unchanged files aren't even touched
-    // between polls unless discovery surfaces new/updated refs.
-    let mut seen_stat: std::collections::HashMap<PathBuf, (Option<u64>, Option<SystemTime>)> =
-        std::collections::HashMap::new();
+    // Track last-seen `(len, mtime)` per `(harness, session_id, path)` so unchanged self-contained
+    // single-session files aren't touched between polls, while directory-backed, companion-file,
+    // and multi-session sources never starve sibling or nested transcript updates.
+    let mut seen_stat: WatchStatMap = std::collections::HashMap::new();
     for r in &initial_refs {
-        if let Ok(m) = std::fs::metadata(&r.path) {
-            seen_stat.insert(r.path.clone(), (Some(m.len()), m.modified().ok()));
+        if let Some(c) = watch_ref_stat(r) {
+            seen_stat.insert((r.harness, r.id.clone(), r.path.clone()), c);
         }
     }
 
     loop {
         std::thread::sleep(poll);
         let refs = discover_filtered(want, cwd_filter.as_deref());
-        let mut candidates = Vec::new();
-        for r in refs {
-            let cur = std::fs::metadata(&r.path)
-                .ok()
-                .map(|m| (Some(m.len()), m.modified().ok()));
-            if is_single_session_file(&r.path) && cur.is_some() && seen_stat.get(&r.path) == cur.as_ref() {
-                continue;
-            }
-            if let Some(c) = cur {
-                seen_stat.insert(r.path.clone(), c);
-            }
-            candidates.push(r);
-        }
+        let candidates = filter_watch_candidates(refs, &mut seen_stat);
 
         let mut synced_any = false;
         if !candidates.is_empty() {
@@ -1112,5 +1168,104 @@ mod tests {
         assert_eq!(pack_count, 2);
         assert!(archive.read_session_bytes("claude", "s-one").unwrap().is_some());
         assert!(archive.read_session_bytes("claude", "s-two").unwrap().is_some());
+    }
+
+    #[test]
+    fn watch_candidates_and_sync_refs_track_directory_sessions_and_multi_session_exports() {
+        use cv_core::Adapter as _;
+        let world = cv_testkit::World::new("archive-watch-dir-and-multi");
+        let archive = Archive::resolve(Some(world.cv_home.join("archive"))).unwrap();
+
+        // 1. Directory-backed `kimi-code` session (`r.path` is `.../session_kc1`, transcript is `agents/main/wire.jsonl`).
+        let kc_home = world.base.join("kimi-code-home");
+        let wire_path = kc_home.join("sessions/wd1/session_kc1/agents/main/wire.jsonl");
+        std::fs::create_dir_all(wire_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &wire_path,
+            concat!(
+                r#"{"type":"metadata","protocol_version":"1.0"}"#,
+                "\n",
+                r#"{"timestamp":1710000001.0,"message":{"type":"TurnBegin","payload":{"user_input":"first prompt"}}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let kc = cv_core::harness::kimi_code::KimiCode::with_home(&kc_home);
+        let kc_refs = kc.discover().unwrap().refs;
+        assert_eq!(kc_refs.len(), 1);
+        assert!(kc_refs[0].path.is_dir());
+
+        let mut seen = WatchStatMap::new();
+        for r in &kc_refs {
+            if let Some(c) = watch_ref_stat(r) {
+                seen.insert((r.harness, r.id.clone(), r.path.clone()), c);
+            }
+        }
+        assert_eq!(archive.sync_refs(&kc_refs).unwrap().archived, 1);
+
+        // Appending to nested `agents/main/wire.jsonl` does NOT touch `session_kc1`'s directory mtime,
+        // yet both `filter_watch_candidates` and `Archive::sync_refs` must detect and archive the growth!
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&wire_path).unwrap();
+            writeln!(
+                f,
+                r#"{{"timestamp":1710000002.0,"message":{{"type":"ContentPart","payload":{{"type":"text","text":"second reply"}}}}}}"#
+            )
+            .unwrap();
+        }
+        let kc_refs_after = kc.discover().unwrap().refs;
+        let kc_cands = filter_watch_candidates(kc_refs_after, &mut seen);
+        assert_eq!(
+            kc_cands.len(),
+            1,
+            "nested wire.jsonl append must surface in watch candidates"
+        );
+        assert_eq!(
+            archive.sync_refs(&kc_cands).unwrap().archived,
+            1,
+            "sync_refs must re-archive grown nested wire.jsonl"
+        );
+
+        // 2. Multi-session `chatgpt-export` (`conversations.json` shared by two sessions `cg-1` and `cg-2`).
+        let exp_file = world.base.join("conversations.json");
+        std::fs::write(&exp_file, b"[]").unwrap();
+        let make_export_refs = |path: &Path| {
+            vec![
+                SessionRef {
+                    id: "cg-1".into(),
+                    harness: Harness::ChatGptExport,
+                    path: path.to_path_buf(),
+                    cwd: None,
+                    title: Some("One".into()),
+                    created_at: None,
+                    updated_at: None,
+                    message_count: Some(1),
+                },
+                SessionRef {
+                    id: "cg-2".into(),
+                    harness: Harness::ChatGptExport,
+                    path: path.to_path_buf(),
+                    cwd: None,
+                    title: Some("Two".into()),
+                    created_at: None,
+                    updated_at: None,
+                    message_count: Some(1),
+                },
+            ]
+        };
+        let mut exp_seen = WatchStatMap::new();
+        for r in make_export_refs(&exp_file) {
+            if let Some(c) = watch_ref_stat(&r) {
+                exp_seen.insert((r.harness, r.id.clone(), r.path.clone()), c);
+            }
+        }
+        std::fs::write(&exp_file, b"[{}, {}]").unwrap();
+        let exp_cands = filter_watch_candidates(make_export_refs(&exp_file), &mut exp_seen);
+        assert_eq!(
+            exp_cands.len(),
+            2,
+            "updating shared conversations.json must emit ALL sibling sessions, not just the first"
+        );
     }
 }
