@@ -24,8 +24,8 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+#[cfg(test)]
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -87,49 +87,61 @@ impl RawHttpResponse {
     }
 }
 
-/// Minimal zero-dependency `std::net::TcpStream` HTTP/1.1 client for hub replication and tests.
+/// Synchronous HTTP/HTTPS transport. TLS verifies certificates against Mozilla roots.
+/// Redirects and environment proxies are disabled: credentials and replication evidence go
+/// only to the explicitly configured hub. Protocol framing belongs to ureq.
 #[derive(Debug, Clone)]
 pub struct HttpClient {
-    host: String,
-    port: u16,
-    base_path: String,
+    base_url: String,
     bearer_token: Option<String>,
-    timeout: Duration,
+    agent: ureq::Agent,
+}
+
+const MAX_HUB_HEADER_BYTES: usize = 64 * 1024;
+const MAX_HUB_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+
+fn hub_agent(timeout: Duration) -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_global(Some(timeout))
+        .max_redirects(0)
+        .http_status_as_error(false)
+        .proxy(None)
+        .max_response_header_size(MAX_HUB_HEADER_BYTES)
+        .build()
+        .into()
 }
 
 impl HttpClient {
     pub fn new(base_url: &str, bearer_token: Option<String>) -> Result<Self, HubError> {
-        let rest = base_url
+        let uri: ureq::http::Uri = base_url
             .trim()
-            .strip_prefix("http://")
-            .ok_or_else(|| HubError::InvalidArgument(format!("hub URL must start with `http://`: {base_url:?}")))?;
-        let (authority, path_part) = match rest.find('/') {
-            Some(idx) => (&rest[..idx], &rest[idx..]),
-            None => (rest, ""),
-        };
-        let (host, port) = parse_authority(authority)?;
-        let base_path = path_part.trim_end_matches('/').to_string();
+            .parse()
+            .map_err(|_| HubError::InvalidArgument("invalid hub URL".into()))?;
+        if !matches!(uri.scheme_str(), Some("http" | "https"))
+            || uri.host().is_none_or(str::is_empty)
+            || uri.authority().is_some_and(|a| a.as_str().contains('@'))
+            || uri.query().is_some()
+            || base_url.contains('#')
+        {
+            return Err(HubError::InvalidArgument(
+                "hub URL must use http:// or https:// with a host and optional path, without credentials, query, or fragment".into(),
+            ));
+        }
         Ok(Self {
-            host,
-            port,
-            base_path,
+            base_url: uri.to_string().trim_end_matches('/').to_string(),
             bearer_token: bearer_token.filter(|t| !t.is_empty()),
-            timeout: Duration::from_secs(15),
+            agent: hub_agent(Duration::from_secs(15)),
         })
     }
 
+    /// Total deadline including DNS, TLS, upload, response headers, and body consumption.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = timeout;
+        self.agent = hub_agent(timeout);
         self
     }
 
     pub fn base_url(&self) -> String {
-        let host_fmt = if self.host.contains(':') {
-            format!("[{}]", self.host)
-        } else {
-            self.host.clone()
-        };
-        format!("http://{}:{}{}", host_fmt, self.port, self.base_path)
+        self.base_url.clone()
     }
 
     pub fn get(&self, path: &str) -> Result<(RawHttpResponse, TransportDeliveryAck), HubError> {
@@ -153,271 +165,64 @@ impl HttpClient {
         extra_headers: &[(&str, &str)],
         body: &[u8],
     ) -> Result<(RawHttpResponse, TransportDeliveryAck), HubError> {
-        let rel = if path.starts_with('/') {
-            format!("{}{}", self.base_path, path)
-        } else {
-            format!("{}/{}", self.base_path, path)
-        };
-        let addr_spec = if self.host.contains(':') {
-            format!("[{}]:{}", self.host, self.port)
-        } else {
-            format!("{}:{}", self.host, self.port)
-        };
-        let sock_addr = addr_spec.to_socket_addrs()?.next().ok_or_else(|| HubError::Transport {
-            status: None,
-            message: format!("could not resolve hub address `{addr_spec}`"),
-        })?;
-
-        let mut stream = TcpStream::connect_timeout(&sock_addr, self.timeout)?;
-        let _ = stream.set_nodelay(true);
-        stream.set_read_timeout(Some(self.timeout))?;
-        stream.set_write_timeout(Some(self.timeout))?;
-
-        let mut head = String::with_capacity(256);
-        head.push_str(&format!("{method} {rel} HTTP/1.1\r\n"));
-        head.push_str(&format!("Host: {addr_spec}\r\n"));
-        head.push_str("Connection: close\r\n");
-        if let Some(ref token) = self.bearer_token {
-            head.push_str(&format!("Authorization: Bearer {token}\r\n"));
+        let url = format!("{}/{}", self.base_url, path.trim_start_matches('/'));
+        let mut request = ureq::http::Request::builder().method(method).uri(&url);
+        if let Some(token) = &self.bearer_token {
+            request = request.header("Authorization", format!("Bearer {token}"));
         }
         if let Some(ct) = content_type {
-            head.push_str(&format!("Content-Type: {ct}\r\n"));
+            request = request.header("Content-Type", ct);
         }
-        for (k, v) in extra_headers {
-            head.push_str(&format!("{k}: {v}\r\n"));
+        for (key, value) in extra_headers {
+            request = request.header(*key, *value);
         }
-        if !body.is_empty() || matches!(method, "POST" | "PUT") {
-            head.push_str(&format!("Content-Length: {}\r\n", body.len()));
+        let request = request
+            .body(body)
+            .map_err(|_| HubError::InvalidArgument("invalid hub request".into()))?;
+        let endpoint = format!(
+            "{method} {}",
+            request.uri().path_and_query().map_or("/", |p| p.as_str())
+        );
+        let mut response = self.agent.run(request).map_err(|e| HubError::Transport {
+            status: None,
+            message: e.to_string(),
+        })?;
+        let status = response.status().as_u16();
+        let headers = response
+            .headers()
+            .iter()
+            .map(|(name, value)| (name.to_string(), String::from_utf8_lossy(value.as_bytes()).into_owned()))
+            .collect();
+        // Reject an oversized declared body before reading; also cap decoded chunked/EOF bodies.
+        if response
+            .headers()
+            .get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .is_some_and(|n| n > MAX_HUB_RESPONSE_BYTES as u64)
+        {
+            return Err(HubError::Transport {
+                status: Some(status),
+                message: "hub response exceeds 64 MiB".into(),
+            });
         }
-        head.push_str("\r\n");
-
-        stream.write_all(head.as_bytes())?;
-        if !body.is_empty() {
-            stream.write_all(body)?;
-        }
-        stream.flush()?;
-
-        let resp = read_http_response(stream)?;
+        let body = response
+            .body_mut()
+            .with_config()
+            .limit(MAX_HUB_RESPONSE_BYTES as u64)
+            .read_to_vec()
+            .map_err(|e| HubError::Transport {
+                status: Some(status),
+                message: e.to_string(),
+            })?;
         let ack = TransportDeliveryAck {
-            endpoint: format!("{method} {rel}"),
-            status: resp.status,
-            response_bytes: resp.body.len(),
+            endpoint,
+            status,
+            response_bytes: body.len(),
             received_at: Utc::now().timestamp_millis(),
         };
-        Ok((resp, ack))
+        Ok((RawHttpResponse { status, headers, body }, ack))
     }
-}
-
-fn parse_authority(authority: &str) -> Result<(String, u16), HubError> {
-    if let Some(rest) = authority.strip_prefix('[') {
-        let (host, suffix) = rest
-            .split_once(']')
-            .ok_or_else(|| HubError::InvalidArgument(format!("unclosed IPv6 bracket in authority {authority:?}")))?;
-        let port = if suffix.is_empty() {
-            80
-        } else {
-            suffix
-                .strip_prefix(':')
-                .and_then(|p| p.parse::<u16>().ok())
-                .ok_or_else(|| HubError::InvalidArgument(format!("invalid port in authority {authority:?}")))?
-        };
-        return Ok((host.to_string(), port));
-    }
-    match authority.rsplit_once(':') {
-        Some((host, port_str)) if !host.is_empty() => {
-            let port = port_str
-                .parse::<u16>()
-                .map_err(|_| HubError::InvalidArgument(format!("invalid port in authority {authority:?}")))?;
-            Ok((host.to_string(), port))
-        }
-        _ if !authority.is_empty() => Ok((authority.to_string(), 80)),
-        _ => Err(HubError::InvalidArgument(format!(
-            "empty host in authority {authority:?}"
-        ))),
-    }
-}
-
-const MAX_HUB_HEADER_BYTES: usize = 64 * 1024;
-const MAX_HUB_HEADERS: usize = 128;
-const MAX_HUB_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
-
-fn read_bounded_http_line(reader: &mut impl BufRead, max_bytes: usize, label: &str) -> Result<String, HubError> {
-    let mut buf = Vec::new();
-    reader.take((max_bytes + 1) as u64).read_until(b'\n', &mut buf)?;
-    if buf.len() > max_bytes {
-        return Err(HubError::Transport {
-            status: None,
-            message: format!("HTTP {label} exceeds {max_bytes} bytes"),
-        });
-    }
-    String::from_utf8(buf).map_err(|e| HubError::Transport {
-        status: None,
-        message: format!("HTTP {label} is not valid UTF-8: {e}"),
-    })
-}
-
-fn read_exact_bounded(
-    reader: &mut impl BufRead,
-    out: &mut Vec<u8>,
-    len: usize,
-    status: Option<u16>,
-) -> Result<(), HubError> {
-    out.reserve(len.min(64 * 1024));
-    let before = out.len();
-    reader.take(len as u64).read_to_end(out)?;
-    if out.len() - before != len {
-        return Err(HubError::Transport {
-            status,
-            message: format!(
-                "truncated HTTP body from hub: expected {len} bytes, got {}",
-                out.len() - before
-            ),
-        });
-    }
-    Ok(())
-}
-
-fn read_http_response(stream: TcpStream) -> Result<RawHttpResponse, HubError> {
-    read_http_response_from(BufReader::new(stream))
-}
-
-fn read_http_response_from(mut reader: impl BufRead) -> Result<RawHttpResponse, HubError> {
-    let status_line = read_bounded_http_line(&mut reader, 8 * 1024, "status line")?;
-    if status_line.is_empty() {
-        return Err(HubError::Transport {
-            status: None,
-            message: "empty HTTP response from hub".into(),
-        });
-    }
-    let status = status_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse::<u16>().ok())
-        .ok_or_else(|| HubError::Transport {
-            status: None,
-            message: format!("malformed HTTP status line: {status_line:?}"),
-        })?;
-
-    let mut total_header_bytes = status_line.len();
-    let mut headers = Vec::new();
-    let mut content_length: Option<usize> = None;
-    let mut is_chunked = false;
-    loop {
-        let line = read_bounded_http_line(&mut reader, MAX_HUB_HEADER_BYTES, "header line")?;
-        if line.is_empty() {
-            break;
-        }
-        total_header_bytes = total_header_bytes.saturating_add(line.len());
-        if total_header_bytes > MAX_HUB_HEADER_BYTES {
-            return Err(HubError::Transport {
-                status: Some(status),
-                message: format!("HTTP headers exceed {MAX_HUB_HEADER_BYTES} bytes"),
-            });
-        }
-        let trimmed = line.trim_end_matches(['\r', '\n']);
-        if trimmed.is_empty() {
-            break;
-        }
-        if headers.len() >= MAX_HUB_HEADERS {
-            return Err(HubError::Transport {
-                status: Some(status),
-                message: format!("HTTP response exceeds {MAX_HUB_HEADERS} headers"),
-            });
-        }
-        if let Some((k, v)) = trimmed.split_once(':') {
-            let name = k.trim().to_string();
-            let val = v.trim().to_string();
-            if name.eq_ignore_ascii_case("Content-Length") {
-                let parsed = val.parse::<u64>().map_err(|_| HubError::Transport {
-                    status: Some(status),
-                    message: format!("malformed Content-Length header: {val:?}"),
-                })?;
-                if parsed > MAX_HUB_RESPONSE_BYTES as u64 {
-                    return Err(HubError::Transport {
-                        status: Some(status),
-                        message: format!(
-                            "HTTP response Content-Length {parsed} exceeds max allowed {MAX_HUB_RESPONSE_BYTES}"
-                        ),
-                    });
-                }
-                content_length = Some(parsed as usize);
-            } else if name.eq_ignore_ascii_case("Transfer-Encoding") && val.to_ascii_lowercase().contains("chunked") {
-                is_chunked = true;
-            }
-            headers.push((name, val));
-        }
-    }
-
-    let body = if status == 204 || status == 304 {
-        Vec::new()
-    } else if is_chunked {
-        read_chunked_body(&mut reader, Some(status))?
-    } else if let Some(len) = content_length {
-        let mut buf = Vec::new();
-        read_exact_bounded(&mut reader, &mut buf, len, Some(status))?;
-        buf
-    } else {
-        let mut buf = Vec::new();
-        reader
-            .by_ref()
-            .take((MAX_HUB_RESPONSE_BYTES + 1) as u64)
-            .read_to_end(&mut buf)?;
-        if buf.len() > MAX_HUB_RESPONSE_BYTES {
-            return Err(HubError::Transport {
-                status: Some(status),
-                message: format!("HTTP response body exceeds max allowed {MAX_HUB_RESPONSE_BYTES} bytes"),
-            });
-        }
-        buf
-    };
-
-    Ok(RawHttpResponse { status, headers, body })
-}
-
-fn read_chunked_body(reader: &mut impl BufRead, status: Option<u16>) -> Result<Vec<u8>, HubError> {
-    let mut out = Vec::new();
-    loop {
-        let size_line = read_bounded_http_line(reader, 4096, "chunk size line")?;
-        if size_line.is_empty() {
-            return Err(HubError::Transport {
-                status,
-                message: "unexpected EOF while reading chunked HTTP body".into(),
-            });
-        }
-        let hex = size_line.trim().split(';').next().unwrap_or("").trim();
-        let chunk_len = usize::from_str_radix(hex, 16).map_err(|_| HubError::Transport {
-            status,
-            message: format!("malformed chunk size line: {size_line:?}"),
-        })?;
-        if chunk_len == 0 {
-            loop {
-                let trailer = read_bounded_http_line(reader, 8 * 1024, "chunk trailer")?;
-                if trailer.is_empty() || trailer.trim_end_matches(['\r', '\n']).is_empty() {
-                    break;
-                }
-            }
-            break;
-        }
-        let total = out
-            .len()
-            .checked_add(chunk_len)
-            .filter(|&n| n <= MAX_HUB_RESPONSE_BYTES)
-            .ok_or_else(|| HubError::Transport {
-                status,
-                message: format!("chunked HTTP body exceeds max allowed {MAX_HUB_RESPONSE_BYTES} bytes"),
-            })?;
-        let _ = total;
-        read_exact_bounded(reader, &mut out, chunk_len, status)?;
-        let mut crlf = [0u8; 2];
-        reader.read_exact(&mut crlf)?;
-        if crlf != *b"\r\n" {
-            return Err(HubError::Transport {
-                status,
-                message: "malformed chunk terminator in HTTP body".into(),
-            });
-        }
-    }
-    Ok(out)
 }
 
 /// Configuration for a [`Shipper`] targeting one Fleet Hub.
@@ -426,7 +231,7 @@ pub struct ShipConfig {
     /// Logical replication target key (resolves `[replication.<target_name>]` in `config.toml`,
     /// and serves as `custody_acks.target_hub`).
     pub target_name: String,
-    /// Hub base URL (`http://host:port`).
+    /// Hub base URL (`http://host:port` or verified `https://host`).
     pub hub_url: String,
     /// Optional `Authorization: Bearer <token>` credential.
     pub bearer_token: Option<String>,
@@ -1569,6 +1374,180 @@ fn build_scrubbed_envelope(
 
 #[cfg(test)]
 mod astra_tests {
+    #[test]
+    fn https_transport_verifies_certificate_and_hostname() {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let der = cert.cert.der().clone();
+        let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
+        let config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![der.clone()], key.into())
+            .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            for _ in 0..3 {
+                let (socket, _) = listener.accept().unwrap();
+                socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                socket.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+                let session = rustls::ServerConnection::new(std::sync::Arc::new(config.clone())).unwrap();
+                let mut stream = rustls::StreamOwned::new(session, socket);
+                let mut request = Vec::new();
+                let mut byte = [0];
+                while !request.ends_with(b"\r\n\r\n") {
+                    if stream.read_exact(&mut byte).is_err() {
+                        break;
+                    }
+                    request.push(byte[0]);
+                }
+                if request.ends_with(b"\r\n\r\n") {
+                    stream
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                        .unwrap();
+                    stream.flush().unwrap();
+                }
+            }
+        });
+        // Default trust must reject this locally generated certificate.
+        let mut client = HttpClient::new(&format!("https://localhost:{port}"), None).unwrap();
+        assert!(client.get("/").is_err());
+        // Trust only the test CA, with hostname verification still enabled.
+        client.agent = ureq::Agent::config_builder()
+            .proxy(None)
+            .timeout_global(Some(Duration::from_secs(3)))
+            .tls_config(
+                ureq::tls::TlsConfig::builder()
+                    .root_certs(ureq::tls::RootCerts::new_with_certs(&[
+                        ureq::tls::Certificate::from_der(der.as_ref()).to_owned(),
+                    ]))
+                    .build(),
+            )
+            .build()
+            .into();
+        assert_eq!(client.get("/").unwrap().0.body, b"{}");
+        client.base_url = format!("https://127.0.0.1:{port}");
+        assert!(client.get("/").is_err());
+        server.join().unwrap();
+    }
+
+    fn http_reply(reply: Vec<u8>) -> (String, std::thread::JoinHandle<String>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let thread = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0];
+            while !request.ends_with(b"\r\n\r\n") {
+                socket.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            let _ = socket.write_all(&reply);
+            String::from_utf8(request).unwrap()
+        });
+        (url, thread)
+    }
+
+    #[test]
+    fn http_transport_preserves_status_prefix_auth_and_chunking() {
+        let (url, thread) = http_reply(
+            b"HTTP/1.1 409 Conflict\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n2\r\n{}\r\n0\r\n\r\n"
+                .to_vec(),
+        );
+        let client = HttpClient::new(&format!("{url}/prefix/"), Some("secret".into())).unwrap();
+        let (response, ack) = client.get("/api/hub/status").unwrap();
+        assert_eq!(response.status, 409);
+        assert_eq!(response.body, b"{}");
+        assert_eq!(ack.endpoint, "GET /prefix/api/hub/status");
+        let request = thread.join().unwrap().to_ascii_lowercase();
+        assert!(request.starts_with("get /prefix/api/hub/status http/1.1"));
+        assert!(request.contains("authorization: bearer secret\r\n"));
+    }
+
+    #[test]
+    fn http_transport_does_not_follow_redirects() {
+        let (url, thread) = http_reply(b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1/leak\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec());
+        assert_eq!(
+            HttpClient::new(&url, Some("secret".into()))
+                .unwrap()
+                .get("/")
+                .unwrap()
+                .0
+                .status,
+            302
+        );
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn http_transport_rejects_oversized_and_truncated_bodies() {
+        for reply in [
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                MAX_HUB_RESPONSE_BYTES + 1
+            )
+            .into_bytes(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nshort".to_vec(),
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nffffffffffffffff\r\n".to_vec(),
+            format!(
+                "HTTP/1.1 200 OK\r\nX-Huge: {}\r\n\r\n",
+                "x".repeat(MAX_HUB_HEADER_BYTES)
+            )
+            .into_bytes(),
+        ] {
+            let (url, thread) = http_reply(reply);
+            assert!(HttpClient::new(&url, None).unwrap().get("/").is_err());
+            thread.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn http_transport_deadline_includes_response_body() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut byte = [0];
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                socket.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n")
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+            let _ = socket.write_all(b"{}");
+        });
+        assert!(HttpClient::new(&url, None)
+            .unwrap()
+            .with_timeout(Duration::from_millis(100))
+            .get("/")
+            .is_err());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn http_transport_validates_hub_urls() {
+        for url in [
+            "ftp://example.com",
+            "http://",
+            "http://user:secret@example.com",
+            "http://example.com?q=1",
+            "https://example.com/#fragment",
+        ] {
+            assert!(HttpClient::new(url, None).is_err(), "{url}");
+        }
+        for url in [
+            "https://example.com",
+            "https://[::1]:8443/hub",
+            "http://localhost:1234/",
+        ] {
+            assert!(HttpClient::new(url, None).is_ok(), "{url}");
+        }
+    }
+
     use super::*;
     #[test]
     fn sealed_inbox_keeps_envelopes_in_pack_and_reads_them_back() {
@@ -1747,24 +1726,8 @@ harnesses = ["claude"]
     }
 
     #[test]
-    fn shipper_rejects_unfsynced_ingest_and_oversized_http_responses() {
-        // 1. Oversized Content-Length and chunked bodies fail fast without unbounded allocation.
-        let huge_cl = format!(
-            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
-            MAX_HUB_RESPONSE_BYTES + 1,
-            "{}"
-        );
-        assert!(matches!(
-            read_http_response_from(std::io::Cursor::new(huge_cl.as_bytes())),
-            Err(HubError::Transport { status: Some(200), .. })
-        ));
-        let overflow_chunk = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nffffffffffffffff\r\n";
-        assert!(matches!(
-            read_http_response_from(std::io::Cursor::new(&overflow_chunk[..])),
-            Err(HubError::Transport { status: Some(200), .. })
-        ));
-
-        // 2. `durable_fsynced: false` from `/api/hub/ingest_batch` returns `Err(HubError::Transport)`.
+    fn shipper_rejects_unfsynced_ingest() {
+        // `durable_fsynced: false` from `/api/hub/ingest_batch` returns `Err(HubError::Transport)`.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let srv = std::thread::spawn(move || {

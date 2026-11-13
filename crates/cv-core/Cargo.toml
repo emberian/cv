@@ -49,6 +49,8 @@ memmap2 = { version = ">=0.9.11, <0.10", optional = true }
 # already in the workspace tree via tantivy. wasm32 has neither file locking nor cross-process
 # concurrency, so the store falls back to a plain open there.
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
+# Blocking HTTP/TLS only for native replication; no async runtime in the core.
+ureq = { version = "3.5.2", optional = true, default-features = false, features = ["rustls"] }
 fs4 = { version = "0.13", default-features = false, features = ["sync"] }
 # libzstd decodes compressed sources natively (`store::zst`): already linked into the shipped
 # binary through tantivy, and about 4x ruzstd's decode rate on Codex's compressed rollouts.
@@ -76,7 +78,7 @@ mmap = ["dep:memmap2"]
 # `sqlite` pulls in rusqlite (native C SQLite) for the SQLite-backed adapters (Hermes, Cursor,
 # Goose, Zed, Devin) and the FTS index, plus a zstd decoder for compressed rollouts and blobs.
 # Disable it (e.g. `--no-default-features`) to compile cv-core for wasm32.
-sqlite = ["dep:rusqlite", "zstd"]
+sqlite = ["dep:rusqlite", "dep:ureq", "zstd"]
 # Compressed sources are independent of SQL stores; native libzstd, portable ruzstd.
 zstd = ["dep:ruzstd", "dep:zstd"]
 # `parallel` fans discovery across adapters/files with rayon. Off for wasm32 (no threads); the code
@@ -93,3 +95,7 @@ required-features = ["sqlite"]
 [dev-dependencies]
 syn = { version = "2", features = ["full"] }
 cv-testkit = { path = "../cv-testkit" }
+[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
+# Local verified-HTTPS transport regression server (no external network).
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }

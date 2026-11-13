@@ -49,6 +49,8 @@ const DEPENDENCY_ALLOWLIST: &[&str] = &[
     "simdutf8",
     "thiserror",
     "toml",
+    // Native synchronous hub replication with verified HTTPS; gated by sqlite, absent on wasm.
+    "ureq",
     "uuid",
     "walkdir",
     // Native only: libzstd for compressed sources, already in the shipped binary via tantivy and
