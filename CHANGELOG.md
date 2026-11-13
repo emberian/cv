@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 0.19.2 — 2026-11-13 — maintained HTTP transport and verified HTTPS
+
+- `cv serve` uses axum/Hyper for HTTP and asynchronous SSE, preserving bounded streaming, authorization, connection limits, and stalled-client deadlines.
+- Hub replication uses synchronous ureq with verified HTTPS, bounded responses, and redirects disabled; the core remains synchronous and WASM-compatible.
+
 ## 0.19.1 — 2026-11-13 — hub replication, exact search, and store hardening
 ClusterVision 0.19.1 hardens 0.19.0's `state.db` coordination spine, fleet hub replication,
 Zstd-Seekable pack custody, trigram `--exact` search, zip ingest, and `cv serve` Host-header

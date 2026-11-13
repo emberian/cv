@@ -32,3 +32,11 @@ A reviewed removal is an `--accept <contract path>` on the CI step until the bas
 board/task-shim routes), and widens `show --around` and `export --around` from integer to `N|ID`
 string selectors. `crates/cv/tests/announce.rs` tests pipe and
 terminal behavior; `python3 -I tools/test-compatibility.py` runs the comparator's mutation tests.
+
+## HTTP transport in 0.19.2
+
+HTTP parsing and response framing now use Hyper. Requests without a `Host` header receive
+`400` instead of `403`. For requests carrying both `Content-Length` and chunked
+`Transfer-Encoding`, Hyper uses chunked framing and closes the connection after the response;
+a pipelined request on that connection is not dispatched. Clients must treat header names
+case-insensitively. API routes, authorization checks, and JSON contracts remain unchanged.
