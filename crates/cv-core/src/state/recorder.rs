@@ -275,7 +275,7 @@ pub(crate) fn commit_append_in_tx(
     let epoch = match epoch_slot {
         Some(ep) => ep.clone(),
         None => {
-            let fresh = uuid::Uuid::new_v4().to_string();
+            let fresh = super::tables::allocate_monotonic_epoch(tx, producer_id)?;
             let (pid, proc_start) = current_process_identity();
             tx.execute(
                 "INSERT INTO writer_epochs(epoch, producer_id, mode, pid, proc_start_time, activated_at, closed_at)
@@ -668,7 +668,7 @@ impl Drop for RecorderServer {
 
 fn activate_owner_epoch(conn: &Connection, producer_id: &str) -> Result<String, StateError> {
     let now_ms = chrono::Utc::now().timestamp_millis();
-    let epoch = uuid::Uuid::new_v4().to_string();
+    let epoch = super::tables::allocate_monotonic_epoch(conn, producer_id)?;
     let (pid, proc_start) = current_process_identity();
     conn.execute(
         "INSERT INTO producers(producer_id, host_label, metadata_json, enrolled_at, updated_at)

@@ -970,3 +970,126 @@ fn append_receipt_with_inbox_commits_or_rolls_back_atomically_in_one_tx() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn writer_epochs_are_strictly_monotonic_uuid_v7_even_under_future_clock_skew() {
+    let dir = tmp_state_dir("monotonic-epoch-v7");
+    let store = StateStore::at_dir(&dir);
+
+    let mut epochs = Vec::new();
+    for _ in 0..32 {
+        let ep = store.activate_epoch("prod-mono", "serverless").unwrap().epoch;
+        let parsed = uuid::Uuid::parse_str(&ep).unwrap();
+        assert_eq!(parsed.get_version_num(), 7);
+        epochs.push(ep);
+    }
+    for pair in epochs.windows(2) {
+        assert!(
+            pair[0] < pair[1],
+            "expected strictly increasing UUIDv7 epochs: {} < {}",
+            pair[0],
+            pair[1]
+        );
+    }
+
+    // Simulate a future-skewed UUIDv7 epoch already present in `writer_epochs`, then ensure
+    // subsequent allocations still strictly advance past it while remaining valid UUIDv7.
+    let conn = store.open_writable().unwrap();
+    conn.execute(
+        "INSERT INTO writer_epochs(epoch, producer_id, mode, pid, proc_start_time, activated_at, closed_at)
+         VALUES ('ffffffff-ffff-7eff-bf00-000000000001', 'prod-mono', 'serverless', NULL, NULL, 0, NULL)",
+        [],
+    )
+    .unwrap();
+    let after_skew = super::tables::allocate_monotonic_epoch(&conn, "prod-mono").unwrap();
+    drop(conn);
+    let parsed_after = uuid::Uuid::parse_str(&after_skew).unwrap();
+    assert_eq!(parsed_after.get_version_num(), 7);
+    assert!(
+        after_skew.as_str() > "ffffffff-ffff-7eff-bf00-000000000001",
+        "allocated epoch {after_skew} did not advance past future-skewed epoch"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn is_pack_evictable_requires_custody_for_every_epoch_in_pack_range() {
+    let dir = tmp_state_dir("evict-multi-epoch");
+    let store = StateStore::at_dir(&dir).with_producer("prod-1");
+
+    // Epoch 1 appends pos 1..=2 (`seq` 1..=2).
+    let r1 = store.append("e1-op1", "d1", &json!({"n": 1})).unwrap();
+    let r2 = store.append("e1-op2", "d2", &json!({"n": 2})).unwrap();
+    assert_eq!((r1.local_commit_pos, r2.local_commit_pos), (1, 2));
+    store.close_epoch(&r1.event_id.epoch).unwrap();
+
+    // Epoch 2 appends pos 3..=4 (`seq` 1..=2).
+    let r3 = store.append("e2-op1", "d3", &json!({"n": 3})).unwrap();
+    let r4 = store.append("e2-op2", "d4", &json!({"n": 4})).unwrap();
+    assert_ne!(r1.event_id.epoch, r3.event_id.epoch);
+    assert!(r1.event_id.epoch < r3.event_id.epoch);
+    assert_eq!((r3.local_commit_pos, r4.local_commit_pos), (3, 4));
+
+    store
+        .publish_pack_range(&PackManifest {
+            pack_id: "pack-epoch-1".into(),
+            min_commit_pos: 1,
+            max_commit_pos: 2,
+            record_count: 2,
+            byte_len: 32,
+            digest: "blake3:e1".into(),
+            pack_path: "packs/pack-epoch-1.pack.zst".into(),
+            index_meta: json!({}),
+            published_at: 100,
+        })
+        .unwrap();
+    store
+        .publish_pack_range(&PackManifest {
+            pack_id: "pack-epoch-2".into(),
+            min_commit_pos: 3,
+            max_commit_pos: 4,
+            record_count: 2,
+            byte_len: 32,
+            digest: "blake3:e2".into(),
+            pack_path: "packs/pack-epoch-2.pack.zst".into(),
+            index_meta: json!({}),
+            published_at: 101,
+        })
+        .unwrap();
+
+    // Acknowledge ONLY epoch 2 (`max_commit_pos: 4`). Epoch 1 has zero custody acks!
+    store
+        .record_custody_ack(&CustodyAck {
+            target_hub: "hub-a".into(),
+            producer_id: "prod-1".into(),
+            epoch: r3.event_id.epoch.clone(),
+            contiguous_seq: 2,
+            max_commit_pos: Some(4),
+            pack_id: None,
+            acked_at: 200,
+        })
+        .unwrap();
+
+    assert!(
+        !store.is_pack_evictable("pack-epoch-1", &["hub-a"]).unwrap(),
+        "epoch 2 ack must NOT unlock unacknowledged epoch 1 pack!"
+    );
+    assert!(store.is_pack_evictable("pack-epoch-2", &["hub-a"]).unwrap());
+
+    // Once epoch 1 reaches contiguous_seq >= 2, pack-epoch-1 becomes evictable too.
+    store
+        .record_custody_ack(&CustodyAck {
+            target_hub: "hub-a".into(),
+            producer_id: "prod-1".into(),
+            epoch: r1.event_id.epoch.clone(),
+            contiguous_seq: 2,
+            max_commit_pos: Some(2),
+            pack_id: None,
+            acked_at: 201,
+        })
+        .unwrap();
+    assert!(store.is_pack_evictable("pack-epoch-1", &["hub-a"]).unwrap());
+
+    std::fs::remove_dir_all(&dir).ok();
+}

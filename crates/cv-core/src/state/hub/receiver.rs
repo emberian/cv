@@ -234,7 +234,7 @@ impl HubStore {
 
         // Stream `.pack.zst` into a staged temp file while incrementally computing whole-file BLAKE3.
         let mut staged_zst =
-            Staged::beside(&zst_dest, "hub-pack-zst", 0o644).map_err(|e| HubError::Pack(format!("{e:#}")))?;
+            Staged::beside(&zst_dest, "hub-pack-zst", 0o600).map_err(|e| HubError::Pack(format!("{e:#}")))?;
         let mut hasher = blake3::Hasher::new();
         let mut byte_len = 0u64;
         let mut buf = vec![0u8; 64 * 1024];
@@ -384,7 +384,7 @@ impl HubStore {
             .map_err(|e| HubError::Pack(format!("pack manifest is not UTF-8: {e}")))?;
 
         let mut staged_idx =
-            Staged::beside(&idx_dest, "hub-pack-idx", 0o644).map_err(|e| HubError::Pack(format!("{e:#}")))?;
+            Staged::beside(&idx_dest, "hub-pack-idx", 0o600).map_err(|e| HubError::Pack(format!("{e:#}")))?;
         staged_idx.write_all(idx_bytes)?;
         staged_idx.flush()?;
 

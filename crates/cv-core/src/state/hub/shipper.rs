@@ -538,8 +538,7 @@ pub fn seal_local_inbox_to_pack(
         let min_pos = run.first().expect("non-empty").local_commit_pos;
         let max_pos = run.last().expect("non-empty").local_commit_pos;
         let pack_id = match explicit_pack_id {
-            Some(id) if run_idx == 0 => id.to_string(),
-            Some(id) => format!("{id}--r{run_idx}"),
+            Some(id) => resolve_explicit_run_pack_id(store, id, run_idx, min_pos, max_pos)?,
             None => format!(
                 "inbox-{min_pos}-{max_pos}-{}",
                 &uuid::Uuid::new_v4().simple().to_string()[..8]
@@ -592,7 +591,12 @@ pub fn seal_local_inbox_to_pack(
         let commits_addr = builder
             .append_record("inbox-commits", &serde_json::to_vec(&entries)?)
             .map_err(|e| HubError::Pack(format!("{e:#}")))?;
-        let _sealed_manifest = builder.seal(Claim::New).map_err(|e| HubError::Pack(format!("{e:#}")))?;
+        let seal_claim = if store.get_pack_manifest(&pack_id)?.is_none() {
+            Claim::Replace
+        } else {
+            Claim::New
+        };
+        let _sealed_manifest = builder.seal(seal_claim).map_err(|e| HubError::Pack(format!("{e:#}")))?;
         let zst_path = pack_zst_path(local_packs_dir, &pack_id).map_err(|e| HubError::Pack(format!("{e:#}")))?;
         let zst_bytes = std::fs::read(&zst_path)?;
         let pack_digest = blake3::hash(&zst_bytes).to_hex().to_string();
@@ -613,6 +617,32 @@ pub fn seal_local_inbox_to_pack(
     }
 
     Ok(last_manifest)
+}
+
+fn resolve_explicit_run_pack_id(
+    store: &StateStore,
+    base_id: &str,
+    start_idx: usize,
+    min_pos: i64,
+    max_pos: i64,
+) -> Result<String, HubError> {
+    let mut idx = start_idx;
+    loop {
+        let candidate = if idx == 0 {
+            base_id.to_string()
+        } else {
+            format!("{base_id}--r{idx}")
+        };
+        match store.get_pack_manifest(&candidate)? {
+            None => return Ok(candidate),
+            Some(existing) if existing.min_commit_pos == min_pos && existing.max_commit_pos == max_pos => {
+                return Ok(candidate);
+            }
+            Some(_) => {
+                idx += 1;
+            }
+        }
+    }
 }
 
 /// Replication shipper client driving enrollment, privacy scrubbing, pack upload, batch ingestion,
@@ -1503,6 +1533,68 @@ mod astra_tests {
         let all = collect_local_commits(&store, &packs_dir).unwrap();
         let positions: Vec<i64> = all.iter().map(|c| c.local_commit_pos).collect();
         assert_eq!(positions, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn seal_local_inbox_recovers_after_partial_multi_run_failure_with_same_explicit_pack_id() {
+        let world = cv_testkit::World::new("inbox-partial-retry");
+        let store = StateStore::at_dir(&world.cv_home);
+        let packs_dir = world.cv_home.join("packs");
+
+        store
+            .append("op-1", "dig-1", &json!({"kind": "receipt", "n": 1}))
+            .unwrap();
+        store
+            .append("op-2", "dig-2", &json!({"kind": "receipt", "n": 2}))
+            .unwrap();
+        let missing_ref = serde_json::to_string(&PayloadAddr {
+            pack_id: "temporarily-missing".into(),
+            decoded_offset: 0,
+            length: 4,
+            blake3_digest: *blake3::hash(b"null").as_bytes(),
+        })
+        .unwrap();
+        store
+            .append_request(&crate::state::AppendRequest {
+                op_id: "op-3".into(),
+                req_digest: "dig-3".into(),
+                producer_id: None,
+                envelope: json!({"kind": "session_upsert", "session_id": "s3", "harness": "claude"}),
+                payload_ref: Some(missing_ref.clone()),
+            })
+            .unwrap();
+
+        // Publish `[2..=2]` so inbox splits into `[1..=1]` (run 0) and `[3..=3]` (run 1).
+        store
+            .publish_pack_range(&LocalStatePackManifest {
+                pack_id: "mid-pack".into(),
+                min_commit_pos: 2,
+                max_commit_pos: 2,
+                record_count: 1,
+                byte_len: 16,
+                digest: "blake3:mid".into(),
+                pack_path: "packs/mid-pack.pack.zst".into(),
+                index_meta: json!({}),
+                published_at: 100,
+            })
+            .unwrap();
+
+        // First attempt seals run 0 as `"batch"` and fails on run 1 because `"temporarily-missing"` does not exist yet.
+        assert!(seal_local_inbox_to_pack(&store, &packs_dir, Some("batch")).is_err());
+        assert_eq!(store.inbox_count().unwrap(), 1);
+        assert!(store.get_pack_manifest("batch").unwrap().is_some());
+
+        // Restore the missing payload pack and retry with the exact same explicit pack ID `"batch"`.
+        let mut restore = PackBuilder::create(&packs_dir, "temporarily-missing").unwrap();
+        let restored_addr = restore.append_record("s3", b"null").unwrap();
+        assert_eq!(serde_json::to_string(&restored_addr).unwrap(), missing_ref);
+        restore.seal(Claim::New).unwrap();
+
+        let recovered = seal_local_inbox_to_pack(&store, &packs_dir, Some("batch"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.pack_id, "batch--r1");
+        assert_eq!(store.inbox_count().unwrap(), 0);
     }
 
     #[test]

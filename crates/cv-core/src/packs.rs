@@ -361,7 +361,7 @@ impl PackBuilder {
         let idx_dest = pack_idx_path(dir, &pack_id)?;
         std::fs::create_dir_all(dir).with_context(|| format!("creating pack directory {}", dir.display()))?;
         let _ = sweep_orphan_pack_temps(dir, DEFAULT_ORPHAN_TMP_MAX_AGE);
-        let staged_zst = Staged::beside(&zst_dest, "pack-zst", 0o644)?;
+        let staged_zst = Staged::beside(&zst_dest, "pack-zst", 0o600)?;
         let buffered = io::BufWriter::with_capacity(64 * 1024, staged_zst);
         let writer = SeekableWriter::with_options(buffered, frame_size, compression_level);
         Ok(Self {
@@ -434,7 +434,7 @@ impl PackBuilder {
             codec_checkpoints: self.codec_checkpoints,
         };
         let manifest_bytes = serde_json::to_vec(&manifest).context("serializing pack manifest")?;
-        let mut staged_idx = Staged::beside(&self.idx_dest, "pack-idx", 0o644)?;
+        let mut staged_idx = Staged::beside(&self.idx_dest, "pack-idx", 0o600)?;
         staged_idx.write_all(&manifest_bytes)?;
         staged_idx.flush()?;
 
@@ -904,6 +904,29 @@ mod tests {
         assert!(!stale_tmp.exists(), "expired .cv-*.tmp should be swept");
         assert!(fresh_tmp.exists(), "fresh .cv-*.tmp writer must stay untouched");
         assert!(keep_pack.exists(), "published .pack.zst must stay untouched");
+        Ok(())
+    }
+
+    #[cfg(all(unix, feature = "zstd"))]
+    #[test]
+    fn sealed_pack_artifacts_are_owner_only_0600() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let world = cv_testkit::World::new("pack-mode-0600");
+        let dir = world.base.join("packs");
+        let mut builder = PackBuilder::create(&dir, "private-pack")?;
+        builder.append_record("r1", b"secret session transcript")?;
+        builder.seal(Claim::New)?;
+
+        let zst_mode = std::fs::metadata(pack_zst_path(&dir, "private-pack")?)?
+            .permissions()
+            .mode()
+            & 0o777;
+        let idx_mode = std::fs::metadata(pack_idx_path(&dir, "private-pack")?)?
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(zst_mode, 0o600);
+        assert_eq!(idx_mode, 0o600);
         Ok(())
     }
 }

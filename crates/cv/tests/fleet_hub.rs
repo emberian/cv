@@ -2142,6 +2142,56 @@ fn untimestamped_delete_and_upsert_order_deterministically_across_and_within_epo
         let rebuilt = hub.rebuild_from_raw().unwrap().unwrap();
         assert_eq!(rebuilt, snap, "reverse_arrival={reverse_arrival}");
     }
+
+    // Real writer epochs allocated via `StateStore::activate_epoch` must also order
+    // untimestamped cross-epoch mutations deterministically (never coin-flipping on UUIDv4).
+    let w_real = World::new("hub-ts-order-real-epochs");
+    let prod_store = StateStore::at(w_real.cv_home.join("prod-state.db"));
+    let hub = HubStore::new(
+        StateStore::at(w_real.cv_home.join("hub-state.db")),
+        w_real.cv_home.join("hub/packs"),
+    );
+    for trial in 0..16 {
+        let ep_a = prod_store.activate_epoch("prod-real", "serverless").unwrap().epoch;
+        let ep_b = prod_store.activate_epoch("prod-real", "serverless").unwrap().epoch;
+        let sess_id = format!("s-real-{trial}");
+        let ev_a = IngestEventRecord::new(
+            EventId::new("prod-real", &ep_a, 1),
+            format!("op:{trial}:a"),
+            json!({
+                "kind": "session_upsert",
+                "session_id": sess_id,
+                "harness": "claude",
+                "title": "older-epoch",
+                "message_count": 1,
+            }),
+            None,
+        )
+        .unwrap();
+        let ev_b = IngestEventRecord::new(
+            EventId::new("prod-real", &ep_b, 1),
+            format!("op:{trial}:b"),
+            json!({
+                "kind": "session_upsert",
+                "session_id": sess_id,
+                "harness": "claude",
+                "title": "newer-epoch",
+                "message_count": 2,
+            }),
+            None,
+        )
+        .unwrap();
+        hub.ingest_batch(&IngestBatchRequest {
+            events: vec![ev_b, ev_a],
+        })
+        .unwrap();
+        let snap = hub.get_snapshot(None).unwrap().unwrap();
+        assert_eq!(
+            snap.session_revisions[&format!("prod-real/{sess_id}")].title.as_deref(),
+            Some("newer-epoch"),
+            "trial {trial}: ep_a={ep_a} ep_b={ep_b}"
+        );
+    }
 }
 
 #[test]

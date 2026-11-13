@@ -239,7 +239,7 @@ impl StateStore {
              ON CONFLICT(producer_id) DO NOTHING",
             rusqlite::params![producer_id, default_host_label(), now_ms],
         )?;
-        let epoch = uuid::Uuid::new_v4().to_string();
+        let epoch = allocate_monotonic_epoch(&tx, producer_id)?;
         let (pid, proc_start_time) = current_process_identity();
         tx.execute(
             "INSERT INTO writer_epochs(epoch, producer_id, mode, pid, proc_start_time, activated_at, closed_at)
@@ -547,6 +547,36 @@ impl StateStore {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// Look up a single published pack manifest by `pack_id`.
+    pub fn get_pack_manifest(&self, pack_id: &str) -> Result<Option<PackManifest>, StateError> {
+        let Some(conn) = self.open_readonly()? else {
+            return Ok(None);
+        };
+        conn.query_row(
+            "SELECT pack_id, min_commit_pos, max_commit_pos, record_count, byte_len,
+                    digest, pack_path, index_meta_json, published_at
+             FROM pack_manifests
+             WHERE pack_id = ?1",
+            [pack_id],
+            |r| {
+                let meta_str: String = r.get(7)?;
+                Ok(PackManifest {
+                    pack_id: r.get(0)?,
+                    min_commit_pos: r.get(1)?,
+                    max_commit_pos: r.get(2)?,
+                    record_count: r.get::<_, i64>(3)? as u64,
+                    byte_len: r.get::<_, i64>(4)? as u64,
+                    digest: r.get(5)?,
+                    pack_path: r.get(6)?,
+                    index_meta: serde_json::from_str(&meta_str).unwrap_or_else(|_| json!({})),
+                    published_at: r.get(8)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(StateError::from)
+    }
+
     /// Record a monotonic custody acknowledgement watermark for `(target_hub, producer_id, epoch)`.
     pub fn record_custody_ack(&self, ack: &CustodyAck) -> Result<(), StateError> {
         if ack.target_hub.trim().is_empty() || ack.producer_id.trim().is_empty() || ack.epoch.trim().is_empty() {
@@ -608,34 +638,84 @@ impl StateStore {
     }
 
     /// Never-delete-before-custody gate: returns `true` iff `pack_id` exists and every hub in
-    /// `required_hubs` has acknowledged `max_commit_pos >= manifest.max_commit_pos` (or `pack_id`
-    /// directly). If `required_hubs` is empty, local custody alone applies (`true`).
+    /// `required_hubs` has acknowledged `pack_id` directly or has a contiguous sequence watermark
+    /// covering every `(producer_id, epoch)` bound in `[manifest.min_commit_pos..=manifest.max_commit_pos]`.
+    /// If `required_hubs` is empty, local custody alone applies (`true`).
     pub fn is_pack_evictable(&self, pack_id: &str, required_hubs: &[&str]) -> Result<bool, StateError> {
         let Some(conn) = self.open_readonly()? else {
             return Ok(false);
         };
-        let Some(max_pos): Option<i64> = conn
+        let Some((min_pos, max_pos)): Option<(i64, i64)> = conn
             .query_row(
-                "SELECT max_commit_pos FROM pack_manifests WHERE pack_id = ?1",
+                "SELECT min_commit_pos, max_commit_pos FROM pack_manifests WHERE pack_id = ?1",
                 [pack_id],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?
         else {
             return Ok(false);
         };
+        if required_hubs.is_empty() {
+            return Ok(true);
+        }
+
+        let mut stmt = conn.prepare(
+            "SELECT producer_id, epoch, MAX(seq)
+             FROM operation_bindings
+             WHERE local_commit_pos >= ?1 AND local_commit_pos <= ?2
+             GROUP BY producer_id, epoch",
+        )?;
+        let epoch_reqs: Vec<(String, String, i64)> = stmt
+            .query_map(rusqlite::params![min_pos, max_pos], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
         for &hub in required_hubs {
-            let acked: bool = conn.query_row(
+            let direct_pack_acked: bool = conn.query_row(
                 "SELECT EXISTS(
                      SELECT 1 FROM custody_acks
-                     WHERE target_hub = ?1
-                       AND (pack_id = ?2 OR (max_commit_pos IS NOT NULL AND max_commit_pos >= ?3))
+                     WHERE target_hub = ?1 AND pack_id = ?2
                  )",
-                rusqlite::params![hub, pack_id, max_pos],
+                rusqlite::params![hub, pack_id],
                 |r| r.get(0),
             )?;
-            if !acked {
-                return Ok(false);
+            if direct_pack_acked {
+                continue;
+            }
+
+            if epoch_reqs.is_empty() {
+                let pos_acked: bool = conn.query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM custody_acks
+                         WHERE target_hub = ?1
+                           AND max_commit_pos IS NOT NULL
+                           AND max_commit_pos >= ?2
+                     )",
+                    rusqlite::params![hub, max_pos],
+                    |r| r.get(0),
+                )?;
+                if !pos_acked {
+                    return Ok(false);
+                }
+                continue;
+            }
+
+            for (prod_id, epoch, req_seq) in &epoch_reqs {
+                let seq_acked: bool = conn.query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM custody_acks
+                         WHERE target_hub = ?1
+                           AND producer_id = ?2
+                           AND epoch = ?3
+                           AND contiguous_seq >= ?4
+                     )",
+                    rusqlite::params![hub, prod_id, epoch, req_seq],
+                    |r| r.get(0),
+                )?;
+                if !seq_acked {
+                    return Ok(false);
+                }
             }
         }
         Ok(true)
@@ -1340,4 +1420,47 @@ impl StateStore {
         tx.commit()?;
         Ok(generated)
     }
+}
+
+/// Allocate a time-ordered RFC-9562 UUIDv7 writer epoch that is strictly greater (lexicographically)
+/// than every prior UUIDv7 epoch recorded for `producer_id`, even across same-millisecond bursts
+/// or wall-clock skew.
+pub(crate) fn allocate_monotonic_epoch(
+    conn: &rusqlite::Connection,
+    producer_id: &str,
+) -> Result<String, rusqlite::Error> {
+    let candidate = uuid::Uuid::now_v7();
+    let max_prev: Option<String> = conn
+        .query_row(
+            "SELECT MAX(epoch) FROM writer_epochs
+             WHERE producer_id = ?1 AND length(epoch) = 36 AND substr(epoch, 15, 1) = '7'",
+            [producer_id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+
+    if let Some(prev_str) = max_prev {
+        if let Ok(prev_uuid) = uuid::Uuid::parse_str(&prev_str) {
+            if candidate.as_u128() <= prev_uuid.as_u128() {
+                let next_key = unpack_uuid_v7_key122(prev_uuid.as_u128()).saturating_add(1);
+                return Ok(uuid::Uuid::from_u128(repack_uuid_v7_key122(next_key)).to_string());
+            }
+        }
+    }
+    Ok(candidate.to_string())
+}
+
+fn unpack_uuid_v7_key122(u: u128) -> u128 {
+    let ts48 = (u >> 80) & 0xffff_ffff_ffff;
+    let rand_a12 = (u >> 64) & 0x0fff;
+    let rand_b62 = u & 0x3fff_ffff_ffff_ffff;
+    (ts48 << 74) | (rand_a12 << 62) | rand_b62
+}
+
+fn repack_uuid_v7_key122(key122: u128) -> u128 {
+    let ts48 = (key122 >> 74) & 0xffff_ffff_ffff;
+    let rand_a12 = (key122 >> 62) & 0x0fff;
+    let rand_b62 = key122 & 0x3fff_ffff_ffff_ffff;
+    (ts48 << 80) | (0x7u128 << 76) | (rand_a12 << 64) | (0x2u128 << 62) | rand_b62
 }
