@@ -550,9 +550,10 @@ pub(crate) fn is_loopback_host(host: &str) -> bool {
 ///
 /// On loopback binds, only loopback names (`127.0.0.1`, `::1`, `localhost`, or `bind_host`) pass.
 /// On non-loopback binds (`0.0.0.0`, `::`, LAN IP), literal IP addresses (immune to DNS rebinding),
-/// local mDNS/Tailscale/LAN names (`.local`, `.ts.net`, `.lan`, `.internal`, `.home.arpa`), the
-/// explicit `bind_host`, and this machine's OS hostname (including `<short>.<domain>`) pass, while
-/// arbitrary external domains (`evil.example.com`) are rejected `403` to prevent LAN DNS rebinding.
+/// local mDNS/Tailscale/LAN names (`.local`, `.ts.net`, `.lan`, ".internal", `.home.arpa`), the
+/// explicit `bind_host`, and this machine's exact OS hostname or bare short hostname pass, while
+/// arbitrary external domains (including `<short>.<attacker-domain>`) are rejected `403` to prevent
+/// LAN DNS rebinding.
 fn host_allowed(host_header: Option<&str>, bind_host: &str) -> bool {
     let Some(name) = host_header.and_then(host_name) else {
         return false;
@@ -573,20 +574,15 @@ fn host_allowed(host_header: Option<&str>, bind_host: &str) -> bool {
     {
         return true;
     }
-    let os_host = cv_core::state::default_host_label();
+    let os_host_raw = cv_core::state::default_host_label();
+    let os_host = os_host_raw.trim_end_matches('.');
     if !os_host.is_empty() && !os_host.eq_ignore_ascii_case("localhost") {
-        if name.eq_ignore_ascii_case(&os_host) {
+        if name.eq_ignore_ascii_case(os_host) {
             return true;
         }
         if let Some(short) = os_host.split('.').next().filter(|s| !s.is_empty()) {
-            if !short.eq_ignore_ascii_case("localhost") {
-                if name.eq_ignore_ascii_case(short) {
-                    return true;
-                }
-                let prefix = format!("{}.", short.to_ascii_lowercase());
-                if lower.starts_with(&prefix) && lower.len() > prefix.len() {
-                    return true;
-                }
+            if !short.eq_ignore_ascii_case("localhost") && name.eq_ignore_ascii_case(short) {
+                return true;
             }
         }
     }
@@ -2095,9 +2091,22 @@ mod search_service_tests {
         assert!(host_allowed(Some("nas.home.arpa:7777"), "0.0.0.0"));
         assert!(host_allowed(Some("cv_hub:7777"), "cv_hub"));
 
-        let os_host = cv_core::state::default_host_label();
-        if let Some(short) = os_host.split('.').next().filter(|s| !s.is_empty() && *s != "localhost") {
-            assert!(host_allowed(Some(&format!("{short}.corp.example.com:7777")), "0.0.0.0"));
+        let os_host_raw = cv_core::state::default_host_label();
+        let os_host = os_host_raw.trim_end_matches('.');
+        if !os_host.is_empty() && !os_host.eq_ignore_ascii_case("localhost") {
+            assert!(host_allowed(Some(&format!("{os_host}:7777")), "0.0.0.0"));
+        }
+        if let Some(short) = os_host
+            .split('.')
+            .next()
+            .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("localhost"))
+        {
+            assert!(host_allowed(Some(&format!("{short}:7777")), "0.0.0.0"));
+            assert!(host_allowed(Some(&format!("{short}.local:7777")), "0.0.0.0"));
+            assert!(
+                !host_allowed(Some(&format!("{short}.evil-rebind.example.com:7777")), "0.0.0.0"),
+                "must reject <short>.<attacker-domain> DNS-rebinding Host headers"
+            );
         }
 
         // Unauthenticated foreign domains stay 403 on both loopback and 0.0.0.0.

@@ -294,8 +294,18 @@ fn sessions(query: &str) -> (u16, Value) {
     if let Some(n) = limit {
         refs.truncate(n);
     }
+    const METADATA_BATCH_SIZE: usize = 256;
+    let mut probe = crate::source::Probe::default();
     ok(Value::Array(
-        refs.iter().map(|r| crate::rows::session_row(r, size_of(r))).collect(),
+        refs.iter()
+            .enumerate()
+            .map(|(idx, r)| {
+                if idx > 0 && idx % METADATA_BATCH_SIZE == 0 {
+                    probe = crate::source::Probe::default();
+                }
+                crate::rows::session_row(r, probe.ref_size(r))
+            })
+            .collect(),
     ))
 }
 
@@ -558,9 +568,17 @@ fn subagents(harness: &str, id: &str) -> (u16, Value) {
         Ok(forest) => forest,
         Err(error) => return err(500, &format!("forest read failed: {error:#}")),
     };
+    const METADATA_BATCH_SIZE: usize = 256;
+    let mut probe = crate::source::Probe::default();
     let out: Vec<Value> = forest
         .iter()
-        .map(|s| crate::rows::subagent_row(s, size_of(&s.session)))
+        .enumerate()
+        .map(|(idx, s)| {
+            if idx > 0 && idx % METADATA_BATCH_SIZE == 0 {
+                probe = crate::source::Probe::default();
+            }
+            crate::rows::subagent_row(s, probe.ref_size(&s.session))
+        })
         .collect();
     ok(json!(out))
 }
