@@ -61,30 +61,7 @@ impl<'a> DeclassMatcher<'a> {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum SigmaClass {
-    Cased,
-    Ignorable,
-    Boundary,
-}
-
-/// Query the running std's own context rules, rather than maintaining another Unicode table.
-/// Final sigma ignores Case_Ignorable even when it is also Cased (e.g. U+0345):
-///                         `{c}Σ` ends ς    `A{c}Σ` ends ς
-/// Cased && !Ignorable          true              true
-/// Ignorable                   false             true
-/// !Cased && !Ignorable         false             false
-/// The impossible true/false combination cannot occur. These constant-size probes therefore
-/// classify the three behaviors exactly, including titlecase and overlapping properties.
-pub(super) fn sigma_class(character: char) -> SigmaClass {
-    if format!("{character}Σ").to_lowercase().ends_with('ς') {
-        SigmaClass::Cased
-    } else if format!("A{character}Σ").to_lowercase().ends_with('ς') {
-        SigmaClass::Ignorable
-    } else {
-        SigmaClass::Boundary
-    }
-}
+pub(super) use crate::scan::{sigma_class, SigmaClass};
 
 /// Only capital Σ needs contextual lowercase. A pending sigma can precede an arbitrarily long
 /// ignorable run: advance two bounded matcher states instead of retaining that run's text.

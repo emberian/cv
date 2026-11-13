@@ -1049,6 +1049,9 @@ impl ExactStreamMatcher {
 
     fn flush(&mut self, end: bool) {
         if self.stage.is_empty() {
+            if end && !self.tail.is_empty() {
+                self.piece("", true);
+            }
             return;
         }
         let valid = match std::str::from_utf8(&self.stage) {
@@ -1057,7 +1060,7 @@ impl ExactStreamMatcher {
             Err(_) => {
                 let text = String::from_utf8_lossy(&self.stage).into_owned();
                 self.stage.clear();
-                self.piece(&text);
+                self.piece(&text, end);
                 return;
             }
         };
@@ -1067,10 +1070,10 @@ impl ExactStreamMatcher {
         let rest = self.stage.split_off(valid);
         let staged = std::mem::replace(&mut self.stage, rest);
         let text = String::from_utf8(staged).unwrap_or_default();
-        self.piece(&text);
+        self.piece(&text, end);
     }
 
-    fn piece(&mut self, piece: &str) {
+    fn piece(&mut self, piece: &str, end: bool) {
         if let Some((_, ref mut ex)) = self.excerpt {
             let wanted = ex.at + ex.len + TRAIL_BYTES;
             if ex.text.len() < wanted {
@@ -1081,13 +1084,21 @@ impl ExactStreamMatcher {
         }
         let mut window = std::mem::take(&mut self.tail);
         window.push_str(piece);
-
-        let found_range = if self.case_sensitive {
-            memchr::memmem::find(window.as_bytes(), self.needle.as_bytes()).map(|pos| pos..pos + self.needle.len())
+        let active_end = if self.case_sensitive {
+            window.len()
         } else {
-            let low = window.to_lowercase();
+            cv_core::scan::split_pending_final_sigma(&window, end, 64 * 1024)
+        };
+        let active = &window[..active_end];
+
+        let found_range = if active.is_empty() {
+            None
+        } else if self.case_sensitive {
+            memchr::memmem::find(active.as_bytes(), self.needle.as_bytes()).map(|pos| pos..pos + self.needle.len())
+        } else {
+            let low = active.to_lowercase();
             low.find(self.needle_folded.as_str())
-                .map(|pos| lowercase_source_range(&window, pos..pos + self.needle_folded.len()))
+                .map(|pos| lowercase_source_range(active, pos..pos + self.needle_folded.len()))
         };
 
         if let Some(range) = found_range {
@@ -1106,7 +1117,7 @@ impl ExactStreamMatcher {
             return;
         }
 
-        let from = ceil_char(&window, window.len().saturating_sub(self.keep));
+        let from = ceil_char(&window, active.len().saturating_sub(self.keep)).min(active_end);
         window.drain(..from);
         self.tail_at += from as u64;
         self.tail = window;
@@ -1406,6 +1417,25 @@ enum VerifyOutcome {
     Stale,
 }
 
+#[derive(Debug)]
+struct MeteredVerifyError {
+    metered_bytes: u64,
+    over_budget: bool,
+    source: anyhow::Error,
+}
+
+impl std::fmt::Display for MeteredVerifyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.source)
+    }
+}
+
+impl std::error::Error for MeteredVerifyError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn verify_session_exact(
     r: &cv_core::SessionRef,
@@ -1436,12 +1466,33 @@ fn verify_session_exact(
     let stream_res = adapter
         .try_stream(r, &Demand::LEAN.with_spans(), &mut sink)
         .with_context(|| format!("verifying {}:{}", r.harness, r.id));
+    let metered_bytes = sink.metered_bytes;
     if sink.over_budget {
-        anyhow::bail!("over_budget:{}", sink.metered_bytes);
+        return Err(MeteredVerifyError {
+            metered_bytes,
+            over_budget: true,
+            source: anyhow::anyhow!("over_budget:{metered_bytes}"),
+        }
+        .into());
     }
-    let session_meta = stream_res?;
-    if let Some(err) = sink.take_error() {
-        return Err(err);
+    let session_meta = match stream_res {
+        Ok(m) => m,
+        Err(source) => {
+            return Err(MeteredVerifyError {
+                metered_bytes,
+                over_budget: false,
+                source,
+            }
+            .into())
+        }
+    };
+    if let Some(source) = sink.take_error() {
+        return Err(MeteredVerifyError {
+            metered_bytes,
+            over_budget: false,
+            source,
+        }
+        .into());
     }
 
     if let Some(expected) = expected_baseline {
@@ -1812,69 +1863,44 @@ pub fn sync_sessions(
     })
 }
 
+const MAX_COMPACT_DOCS_PER_SEGMENT: usize = 256;
+const MAX_COMPACT_GRAM_ENTRIES: usize = 4_000_000;
+
 fn maybe_compact_segments(dir: &Path, manifest: &mut Manifest) -> Result<(bool, Vec<String>)> {
+    maybe_compact_segments_with_cap(dir, manifest, MAX_COMPACT_DOCS_PER_SEGMENT)
+}
+
+fn maybe_compact_segments_with_cap(
+    dir: &Path,
+    manifest: &mut Manifest,
+    max_docs_per_seg: usize,
+) -> Result<(bool, Vec<String>)> {
+    let max_docs_per_seg = max_docs_per_seg.max(1);
     let total_rows: usize = manifest.segments.iter().map(|s| s.num_sessions as usize).sum();
     let dead_rows: usize = manifest.segments.iter().map(|s| s.deleted_ords.len()).sum();
     if manifest.segments.len() <= 1 || total_rows == 0 || dead_rows * 2 <= total_rows {
         return Ok((false, Vec::new()));
     }
 
-    // Re-extract live sessions of fragmented segments (> 50% dead overall).
-    let mut live_docs = Vec::new();
+    // Re-extract live sessions of fragmented segments (> 50% dead overall) in bounded segment chunks.
+    let mut batch_docs: Vec<(ExtractedDoc, bool)> = Vec::new();
+    let mut batch_grams: usize = 0;
     let mut old_files = Vec::new();
     let mut surviving_segments = Vec::new();
+    let mut new_segments: Vec<SegmentEntry> = Vec::new();
+    let mut new_ptrs: Vec<(String, SessionPointer)> = Vec::new();
 
-    for seg in std::mem::take(&mut manifest.segments) {
-        if seg.deleted_ords.is_empty() {
-            surviving_segments.push(seg);
-            continue;
+    let flush_batch = |batch: &mut Vec<(ExtractedDoc, bool)>,
+                       grams: &mut usize,
+                       segs_out: &mut Vec<SegmentEntry>,
+                       ptrs_out: &mut Vec<(String, SessionPointer)>|
+     -> Result<()> {
+        if batch.is_empty() {
+            return Ok(());
         }
-        let seg_path = dir.join(&seg.file);
-        let Ok(reader) = SegmentReader::open(&seg_path) else {
-            surviving_segments.push(seg);
-            continue;
-        };
-        let dead: HashSet<u32> = seg.deleted_ords.iter().copied().collect();
-        let mut all_rebuilt = true;
-        let mut rebuilt_for_seg = Vec::new();
-        for (idx, meta) in reader.metas.iter().enumerate() {
-            let ord = idx as u32;
-            if dead.contains(&ord) {
-                continue;
-            }
-            let Some(r) = meta.to_session_ref() else {
-                all_rebuilt = false;
-                break;
-            };
-            let prov = cv_core::events::Provenance {
-                parent_id: meta.parent_id.clone(),
-                agent_id: meta.agent_id.clone(),
-                workflow: meta.workflow.clone(),
-            };
-            match extract_session_grams(&r, &prov) {
-                Ok(doc) => rebuilt_for_seg.push((doc, meta.parent_id.is_some())),
-                Err(_) => {
-                    all_rebuilt = false;
-                    break;
-                }
-            }
-        }
-        if all_rebuilt {
-            old_files.push(seg.file);
-            live_docs.extend(rebuilt_for_seg);
-        } else {
-            surviving_segments.push(seg);
-        }
-    }
-
-    manifest.segments = surviving_segments;
-    if live_docs.is_empty() && old_files.is_empty() {
-        return Ok((false, Vec::new()));
-    }
-    if !live_docs.is_empty() {
-        let mut docs = Vec::with_capacity(live_docs.len());
-        let mut ptrs = Vec::with_capacity(live_docs.len());
-        for (idx, (doc, folded)) in live_docs.into_iter().enumerate() {
+        let mut docs = Vec::with_capacity(batch.len());
+        let mut ptrs = Vec::with_capacity(batch.len());
+        for (idx, (doc, folded)) in std::mem::take(batch).into_iter().enumerate() {
             ptrs.push((
                 doc.meta.id.clone(),
                 idx as u32,
@@ -1886,14 +1912,15 @@ fn maybe_compact_segments(dir: &Path, manifest: &mut Manifest) -> Result<(bool, 
             ));
             docs.push(doc);
         }
+        *grams = 0;
         let seg_file = write_segment(dir, docs)?;
-        manifest.segments.push(SegmentEntry {
+        segs_out.push(SegmentEntry {
             file: seg_file.clone(),
             num_sessions: ptrs.len() as u32,
             deleted_ords: Vec::new(),
         });
         for (id, ord, mtime, size, path, folded, baseline) in ptrs {
-            manifest.sessions.insert(
+            ptrs_out.push((
                 id,
                 SessionPointer {
                     segment: seg_file.clone(),
@@ -1904,8 +1931,82 @@ fn maybe_compact_segments(dir: &Path, manifest: &mut Manifest) -> Result<(bool, 
                     folded,
                     baseline,
                 },
-            );
+            ));
         }
+        Ok(())
+    };
+
+    let compact_res = (|| -> Result<()> {
+        for seg in &manifest.segments {
+            if seg.deleted_ords.is_empty() {
+                surviving_segments.push(seg.clone());
+                continue;
+            }
+            let seg_path = dir.join(&seg.file);
+            let Ok(reader) = SegmentReader::open(&seg_path) else {
+                surviving_segments.push(seg.clone());
+                continue;
+            };
+            let dead: HashSet<u32> = seg.deleted_ords.iter().copied().collect();
+            let mut all_rebuilt = true;
+            let mut rebuilt_for_seg = Vec::new();
+            for (idx, meta) in reader.metas.iter().enumerate() {
+                let ord = idx as u32;
+                if dead.contains(&ord) {
+                    continue;
+                }
+                let Some(r) = meta.to_session_ref() else {
+                    all_rebuilt = false;
+                    break;
+                };
+                let prov = cv_core::events::Provenance {
+                    parent_id: meta.parent_id.clone(),
+                    agent_id: meta.agent_id.clone(),
+                    workflow: meta.workflow.clone(),
+                };
+                match extract_session_grams(&r, &prov) {
+                    Ok(doc) => rebuilt_for_seg.push((doc, meta.parent_id.is_some())),
+                    Err(_) => {
+                        all_rebuilt = false;
+                        break;
+                    }
+                }
+            }
+            if all_rebuilt {
+                old_files.push(seg.file.clone());
+                for (doc, folded) in rebuilt_for_seg {
+                    let doc_grams = doc.exchange.bigrams.len()
+                        + doc.exchange.trigrams.len()
+                        + doc.context.bigrams.len()
+                        + doc.context.trigrams.len();
+                    batch_grams = batch_grams.saturating_add(doc_grams);
+                    batch_docs.push((doc, folded));
+                    if batch_docs.len() >= max_docs_per_seg || batch_grams >= MAX_COMPACT_GRAM_ENTRIES {
+                        flush_batch(&mut batch_docs, &mut batch_grams, &mut new_segments, &mut new_ptrs)?;
+                    }
+                }
+            } else {
+                surviving_segments.push(seg.clone());
+            }
+        }
+        flush_batch(&mut batch_docs, &mut batch_grams, &mut new_segments, &mut new_ptrs)?;
+        Ok(())
+    })();
+
+    if let Err(err) = compact_res {
+        for seg in &new_segments {
+            let _ = std::fs::remove_file(dir.join(&seg.file));
+        }
+        return Err(err);
+    }
+
+    manifest.segments = surviving_segments;
+    if new_segments.is_empty() && old_files.is_empty() {
+        return Ok((false, Vec::new()));
+    }
+    manifest.segments.extend(new_segments);
+    for (id, ptr) in new_ptrs {
+        manifest.sessions.insert(id, ptr);
     }
     Ok((true, old_files))
 }
@@ -2100,6 +2201,8 @@ pub fn search(
                             suffix.bytes += cost;
                         }
                         Err(_) => {
+                            remaining -= cost;
+                            suffix.bytes += cost;
                             suffix.failed += 1;
                         }
                     }
@@ -2157,11 +2260,14 @@ pub fn search(
                             suffix.read += 1;
                         }
                         Err(e) => {
-                            if let Some(rest) = e.to_string().strip_prefix("over_budget:") {
-                                let metered = rest.parse::<u64>().unwrap_or(0);
-                                let spent = metered.min(remaining);
-                                remaining -= spent;
-                                suffix.bytes += spent;
+                            let (metered, over_budget) = e
+                                .downcast_ref::<MeteredVerifyError>()
+                                .map(|m| (m.metered_bytes, m.over_budget))
+                                .unwrap_or((0, false));
+                            let spent = metered.min(remaining);
+                            remaining -= spent;
+                            suffix.bytes += spent;
+                            if over_budget {
                                 suffix.cut += 1;
                                 suffix.cut_bytes += metered;
                             } else {
@@ -2321,11 +2427,14 @@ pub fn search(
                                                 suffix.read += 1;
                                             }
                                             Err(e) => {
-                                                if let Some(rest) = e.to_string().strip_prefix("over_budget:") {
-                                                    let metered = rest.parse::<u64>().unwrap_or(0);
-                                                    let spent = metered.min(remaining);
-                                                    remaining -= spent;
-                                                    suffix.bytes += spent;
+                                                let (metered, over_budget) = e
+                                                    .downcast_ref::<MeteredVerifyError>()
+                                                    .map(|m| (m.metered_bytes, m.over_budget))
+                                                    .unwrap_or((0, false));
+                                                let spent = known_cost.unwrap_or(metered).min(remaining);
+                                                remaining -= spent;
+                                                suffix.bytes += spent;
+                                                if over_budget {
                                                     suffix.cut += 1;
                                                     suffix.cut_bytes += metered;
                                                 } else {
@@ -2336,7 +2445,11 @@ pub fn search(
                                     }
                                 }
                             }
-                            Ok(VerifyOutcome::NoMatch { .. }) | Err(_) => {}
+                            Ok(VerifyOutcome::NoMatch { .. }) => {}
+                            Err(_) => {
+                                suffix.stale += 1;
+                                suffix.failed += 1;
+                            }
                         }
                     }
                 }
@@ -3541,5 +3654,145 @@ mod tests {
         );
         assert_eq!(toctou_res.suffix.stale, 1);
         assert_eq!(toctou_res.suffix.read, 1);
+
+        // 11. Final_Sigma across `PIECE_BYTES` boundary in `ExactStreamMatcher`.
+        let pad = "a".repeat(PIECE_BYTES - "ΟΣ".len());
+        let mut m_false = ExactStreamMatcher::new("ος", false);
+        m_false.feed_bytes(pad.as_bytes());
+        m_false.feed_bytes("ΟΣ".as_bytes());
+        m_false.feed_bytes("Β".as_bytes());
+        assert!(m_false.finish().is_none(), "medial ΟΣΒ must not match final ος");
+
+        let mut m_true = ExactStreamMatcher::new("οσβ", false);
+        m_true.feed_bytes(pad.as_bytes());
+        m_true.feed_bytes("ΟΣ".as_bytes());
+        m_true.feed_bytes("Β".as_bytes());
+        assert!(m_true.finish().is_some(), "medial ΟΣΒ must match οσβ");
+
+        let mut m_eof = ExactStreamMatcher::new("ος", false);
+        m_eof.feed_bytes(pad.as_bytes());
+        m_eof.feed_bytes("ΟΣ".as_bytes());
+        assert!(m_eof.finish().is_some(), "trailing ΟΣ at EOF must match final ος");
+
+        // 12. Failed live reads debit `--live-bytes` instead of reading unbounded failing files,
+        //     and chunked compaction preserves hits across multi-segment output.
+        let bad_zst_path = tmp.path().join("broken-live.jsonl.zst");
+        std::fs::write(&bad_zst_path, b"not-zstd-live-payload").unwrap();
+        let bad_live_ref = cv_core::SessionRef::new("bad-live", cv_core::Harness::Codex, &bad_zst_path);
+        let good_after_path = tmp.path().join("after-bad.jsonl");
+        write_claude_jsonl(
+            &good_after_path,
+            "after-bad",
+            "/repo/budget",
+            &[json!({
+                "type": "user",
+                "sessionId": "after-bad",
+                "cwd": "/repo/budget",
+                "uuid": "u1",
+                "message": { "role": "user", "content": "BudgetDebitToken" }
+            })],
+        );
+        let mut bad_newer = bad_live_ref;
+        bad_newer.updated_at = chrono::DateTime::from_timestamp(100, 0);
+        let mut good_older = cv_core::SessionRef::new("after-bad", cv_core::Harness::Claude, &good_after_path);
+        good_older.updated_at = chrono::DateTime::from_timestamp(50, 0);
+        let empty_idx = tmp.path().join("empty-budget-idx");
+        let debited = search(
+            &empty_idx,
+            "BudgetDebitToken",
+            TrigramOptions {
+                live: LiveRead::of(Some(25)).unwrap(),
+                ..TrigramOptions::default()
+            },
+            &[bad_newer, good_older],
+            None,
+        )
+        .unwrap();
+        assert_eq!(debited.suffix.failed, 1);
+        assert_eq!(
+            debited.suffix.cut, 1,
+            "failed live read must debit budget and cut subsequent session"
+        );
+
+        // 13. Chunked segment compaction splits surviving live sessions into bounded segments.
+        let chunk_idx = tmp.path().join("chunk-compact-idx");
+        let mut c_refs = Vec::new();
+        for n in 0..5 {
+            let p = tmp.path().join(format!("c-{n}.jsonl"));
+            write_claude_jsonl(
+                &p,
+                &format!("c-{n}"),
+                "/repo/chunk",
+                &[json!({
+                    "type": "user",
+                    "sessionId": format!("c-{n}"),
+                    "cwd": "/repo/chunk",
+                    "uuid": "u1",
+                    "message": { "role": "user", "content": format!("ChunkCompactNeedle-{n}") }
+                })],
+            );
+            c_refs.push(cv_core::SessionRef::new(format!("c-{n}"), cv_core::Harness::Claude, p));
+        }
+        sync_sessions(&chunk_idx, &c_refs[..3], false, false).unwrap();
+        sync_sessions(&chunk_idx, &c_refs, false, false).unwrap();
+        let mut man = Manifest::load(&chunk_idx).unwrap().unwrap();
+        assert_eq!(man.segments.len(), 2);
+        man.segments[0].deleted_ords = vec![2];
+        man.segments[1].deleted_ords = vec![0, 1];
+        man.sessions.retain(|k, _| k == "c-0" || k == "c-1");
+        let (did_compact, old_seg_files) = maybe_compact_segments_with_cap(&chunk_idx, &mut man, 1).unwrap();
+        assert!(did_compact);
+        man.save_atomic(&chunk_idx).unwrap();
+        for f in old_seg_files {
+            let _ = std::fs::remove_file(chunk_idx.join(f));
+        }
+        assert_eq!(
+            man.segments.len(),
+            2,
+            "2 surviving sessions with cap=1 must produce 2 segments"
+        );
+        let chunk_res = search(
+            &chunk_idx,
+            "ChunkCompactNeedle-0",
+            TrigramOptions::default(),
+            &c_refs[..2],
+            None,
+        )
+        .unwrap();
+        assert_eq!(chunk_res.hits.len(), 1);
+
+        // 14. Step 3 verification error (corrupted zstd file after indexing) records `stale` + `failed`.
+        let zst_idx = tmp.path().join("zst-err-idx");
+        let zst_path = tmp.path().join("rollout-err.jsonl.zst");
+        let zst_line = format!(
+            "{}\n",
+            json!({
+                "timestamp": "2026-01-01T00:00:00Z",
+                "type": "session_meta",
+                "payload": { "id": "zst-err-1", "timestamp": "2026-01-01T00:00:00Z", "cwd": "/repo/zst" }
+            })
+        ) + &format!(
+            "{}\n",
+            json!({
+                "timestamp": "2026-01-01T00:00:01Z",
+                "type": "response_item",
+                "payload": { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "ZstStep3ErrNeedle" }] }
+            })
+        );
+        std::fs::write(&zst_path, zstd::encode_all(zst_line.as_bytes(), 1).unwrap()).unwrap();
+        let zst_ref = cv_core::SessionRef::new("zst-err-1", cv_core::Harness::Codex, &zst_path);
+        sync_sessions(&zst_idx, &[zst_ref], false, false).unwrap();
+        let orig_len = std::fs::metadata(&zst_path).unwrap().len() as usize;
+        let orig_mtime = std::fs::metadata(&zst_path).unwrap().modified().unwrap();
+        std::fs::write(&zst_path, vec![b'X'; orig_len]).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&zst_path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(orig_mtime))
+            .unwrap();
+        let err_res = search(&zst_idx, "ZstStep3ErrNeedle", TrigramOptions::default(), &[], None).unwrap();
+        assert_eq!(err_res.suffix.stale, 1);
+        assert_eq!(err_res.suffix.failed, 1);
     }
 }

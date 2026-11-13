@@ -45,6 +45,7 @@ const MANIFEST_VERSION: u32 = 1;
 const ROW_GROUP_ROWS: u32 = 4096;
 const MAX_HUNK_HASHES_PER_EDIT: usize = 64;
 const BATCH_FLUSH_ROWS: usize = 16_384;
+const COMPACT_SEGMENT_ROWS: usize = 65_536;
 
 /// Additional optional row metrics carried into columnar event rows when available.
 #[derive(Debug, Clone, Default)]
@@ -1153,13 +1154,20 @@ impl ColumnarEventStore {
     }
 
     fn compact_inner(&mut self, force: bool) -> Result<bool> {
+        self.compact_inner_with_chunk_cap(force, COMPACT_SEGMENT_ROWS)
+    }
+
+    fn compact_inner_with_chunk_cap(&mut self, force: bool, max_rows_per_seg: usize) -> Result<bool> {
+        let max_rows_per_seg = max_rows_per_seg.max(1);
         if cv_core::env::frozen() || self.manifest.segments.is_empty() {
             return Ok(false);
         }
         let total_rows: u64 = self.manifest.segments.iter().map(|s| s.num_rows as u64).sum();
         let dead_rows: u64 = self.manifest.segments.iter().map(|s| s.dead_count()).sum();
+        let live_rows = total_rows.saturating_sub(dead_rows);
+        let min_clean_segments = (live_rows.div_ceil(max_rows_per_seg as u64) as usize).max(1);
         let should_compact = if force {
-            dead_rows > 0 || self.manifest.segments.len() > 1
+            dead_rows > 0 || self.manifest.segments.len() > min_clean_segments
         } else {
             self.manifest.segments.len() > 1 && total_rows > 0 && dead_rows * 2 > total_rows
         };
@@ -1167,45 +1175,84 @@ impl ColumnarEventStore {
             return Ok(false);
         }
 
-        let mut surviving_rows = Vec::new();
+        let mut chunk_rows = Vec::with_capacity(max_rows_per_seg.min(BATCH_FLUSH_ROWS));
+        let mut chunk_sessions: BTreeMap<String, bool> = BTreeMap::new();
         let mut old_files = Vec::new();
-        let mut touched_sessions: BTreeMap<String, bool> = BTreeMap::new();
+        let mut new_segments: Vec<(SegmentManifestEntry, Vec<String>)> = Vec::new();
 
-        for seg in std::mem::take(&mut self.manifest.segments) {
-            let reader = ClevReader::open(&self.dir.join(&seg.file))?;
-            let sup = seg.superseded()?;
-            for row_id in 0..reader.num_rows {
-                if sup.contains(row_id) {
-                    continue;
-                }
-                let row = reader.materialize_row(row_id)?;
-                touched_sessions.insert(session_key(&row.harness, &row.session_id), true);
-                surviving_rows.push(row);
+        let flush_chunk = |dir: &Path,
+                           rows: &mut Vec<StagedRow>,
+                           touched: &mut BTreeMap<String, bool>,
+                           out: &mut Vec<(SegmentManifestEntry, Vec<String>)>|
+         -> Result<()> {
+            if rows.is_empty() {
+                return Ok(());
             }
-            old_files.push(seg.file);
+            let (seg_file, row_groups) = write_clev_segment(dir, rows)?;
+            let num_rows = rows.len() as u32;
+            rows.clear();
+            let s_keys: Vec<String> = std::mem::take(touched).into_keys().collect();
+            out.push((
+                SegmentManifestEntry {
+                    file: seg_file,
+                    num_rows,
+                    superseded_bytes: Vec::new(),
+                    row_groups,
+                },
+                s_keys,
+            ));
+            Ok(())
+        };
+
+        let rewrite_res = (|| -> Result<()> {
+            for seg in &self.manifest.segments {
+                let reader = ClevReader::open(&self.dir.join(&seg.file))?;
+                let sup = seg.superseded()?;
+                for row_id in 0..reader.num_rows {
+                    if sup.contains(row_id) {
+                        continue;
+                    }
+                    let row = reader.materialize_row(row_id)?;
+                    chunk_sessions.insert(session_key(&row.harness, &row.session_id), true);
+                    chunk_rows.push(row);
+                    if chunk_rows.len() >= max_rows_per_seg {
+                        flush_chunk(&self.dir, &mut chunk_rows, &mut chunk_sessions, &mut new_segments)?;
+                    }
+                }
+                old_files.push(seg.file.clone());
+            }
+            flush_chunk(&self.dir, &mut chunk_rows, &mut chunk_sessions, &mut new_segments)?;
+            Ok(())
+        })();
+
+        if let Err(err) = rewrite_res {
+            for (seg, _) in &new_segments {
+                let _ = std::fs::remove_file(self.dir.join(&seg.file));
+            }
+            return Err(err);
         }
 
+        let prev_manifest = self.manifest.clone();
+        self.manifest.segments.clear();
         for st in self.manifest.sessions.values_mut() {
             st.segments.clear();
         }
-
-        if !surviving_rows.is_empty() {
-            let (seg_file, row_groups) = write_clev_segment(&self.dir, &surviving_rows)?;
-            let num_rows = surviving_rows.len() as u32;
-            self.manifest.segments.push(SegmentManifestEntry {
-                file: seg_file.clone(),
-                num_rows,
-                superseded_bytes: Vec::new(),
-                row_groups,
-            });
-            for s_key in touched_sessions.keys() {
-                if let Some(st) = self.manifest.sessions.get_mut(s_key) {
-                    st.segments.push(seg_file.clone());
+        for (seg_entry, s_keys) in new_segments {
+            for s_key in s_keys {
+                if let Some(st) = self.manifest.sessions.get_mut(&s_key) {
+                    st.segments.push(seg_entry.file.clone());
                 }
             }
+            self.manifest.segments.push(seg_entry);
         }
 
-        self.manifest.save_atomic(&self.dir)?;
+        if let Err(err) = self.manifest.save_atomic(&self.dir) {
+            for seg in &self.manifest.segments {
+                let _ = std::fs::remove_file(self.dir.join(&seg.file));
+            }
+            self.manifest = prev_manifest;
+            return Err(err);
+        }
         for f in old_files {
             let _ = std::fs::remove_file(self.dir.join(f));
         }
@@ -2830,5 +2877,38 @@ mod tests {
         let merged = ColumnarEventStore::open(&conc_dir).unwrap();
         assert_eq!(merged.events_for("claude", "c1", None).unwrap().len(), 1);
         assert_eq!(merged.events_for("claude", "c2", None).unwrap().len(), 1);
+
+        // Chunked compaction flushes bounded segments while mapping each session only to its segments.
+        let s3_path = tmp.path().join("c3.jsonl");
+        let s3 = write_claude_session(
+            &s3_path,
+            "c3",
+            "/repo/race",
+            &[json!({
+                "type": "assistant",
+                "sessionId": "c3",
+                "cwd": "/repo/race",
+                "uuid": "u3",
+                "timestamp": "2026-10-04T10:02:00Z",
+                "message": {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "t3",
+                        "name": "Bash",
+                        "input": { "command": "true" }
+                    }]
+                }
+            })],
+        );
+        let mut chunked = ColumnarEventStore::open(&conc_dir).unwrap();
+        chunked.sync_sessions(std::slice::from_ref(&s3), true, false).unwrap();
+        assert_eq!(chunked.segment_count(), 3);
+        assert!(chunked.compact_inner_with_chunk_cap(true, 2).unwrap());
+        assert_eq!(chunked.segment_count(), 2);
+        assert_eq!(chunked.events_for("claude", "c1", None).unwrap().len(), 1);
+        assert_eq!(chunked.events_for("claude", "c2", None).unwrap().len(), 1);
+        assert_eq!(chunked.events_for("claude", "c3", None).unwrap().len(), 1);
+        assert!(!chunked.compact_inner_with_chunk_cap(true, 2).unwrap());
     }
 }

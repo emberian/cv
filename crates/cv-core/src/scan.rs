@@ -157,17 +157,17 @@ impl Matcher {
             Err(_) => {
                 let text = String::from_utf8_lossy(&self.stage).into_owned();
                 self.stage.clear();
-                return self.piece(&text);
+                return self.piece(&text, end);
             }
         };
         let rest = self.stage.split_off(valid);
         let staged = std::mem::replace(&mut self.stage, rest);
         // `valid` ends on a character boundary by construction.
         let text = String::from_utf8(staged).unwrap_or_default();
-        self.piece(&text);
+        self.piece(&text, end);
     }
 
-    fn piece(&mut self, piece: &str) {
+    fn piece(&mut self, piece: &str, end: bool) {
         if self.head.len() < HEAD {
             let take = ceil_char(piece, HEAD - self.head.len());
             self.head.push_str(&piece[..take]);
@@ -180,8 +180,10 @@ impl Matcher {
         }
         let mut window = std::mem::take(&mut self.tail);
         window.push_str(piece);
-        if self.found.iter().any(|f| !f) {
-            let low = window.to_lowercase();
+        let active_end = split_pending_final_sigma(&window, end, 64 * 1024);
+        let active = &window[..active_end];
+        if self.found.iter().any(|f| !f) && !active.is_empty() {
+            let low = active.to_lowercase();
             for (i, needle) in self.needles.iter().enumerate() {
                 if self.found[i] {
                     continue;
@@ -189,7 +191,7 @@ impl Matcher {
                 let Some(pos) = low.find(needle.as_str()) else { continue };
                 self.found[i] = true;
                 if let Some(slot) = self.excerpts.get_mut(i) {
-                    let range = lowercase_source_range(&window, pos..pos + needle.len());
+                    let range = lowercase_source_range(active, pos..pos + needle.len());
                     let from = floor_char(&window, range.start.saturating_sub(LEAD));
                     let mut excerpt = Excerpt {
                         text: String::new(),
@@ -202,7 +204,7 @@ impl Matcher {
                 }
             }
         }
-        let from = ceil_char(&window, window.len().saturating_sub(self.keep));
+        let from = ceil_char(&window, active.len().saturating_sub(self.keep)).min(active_end);
         window.drain(..from);
         self.tail_at += from as u64;
         self.tail = window;
@@ -213,6 +215,45 @@ impl Matcher {
         self.flush(true);
         self.excerpt()
     }
+}
+
+/// Unicode Final_Sigma context class for `character` when following `Σ`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SigmaClass {
+    Cased,
+    Ignorable,
+    Boundary,
+}
+
+/// Query std's own Unicode context rules for Final_Sigma (`{c}Σ` vs `A{c}Σ`).
+pub fn sigma_class(character: char) -> SigmaClass {
+    if format!("{character}Σ").to_lowercase().ends_with('ς') {
+        SigmaClass::Cased
+    } else if format!("A{character}Σ").to_lowercase().ends_with('ς') {
+        SigmaClass::Ignorable
+    } else {
+        SigmaClass::Boundary
+    }
+}
+
+/// When `!end` and `window` ends with `'Σ'` followed only by `Case_Ignorable` characters (within
+/// `max_defer_bytes`), return the byte index of `'Σ'` so callers defer lowercasing `'Σ'` until its
+/// right-hand cased/boundary context arrives on the next chunk or EOF (`end = true`).
+pub fn split_pending_final_sigma(window: &str, end: bool, max_defer_bytes: usize) -> usize {
+    if end || !window.contains('Σ') {
+        return window.len();
+    }
+    for (pos, ch) in window.char_indices().rev() {
+        if window.len() - pos > max_defer_bytes {
+            return window.len();
+        }
+        match sigma_class(ch) {
+            SigmaClass::Ignorable => continue,
+            SigmaClass::Cased if ch == 'Σ' => return pos,
+            SigmaClass::Cased | SigmaClass::Boundary => return window.len(),
+        }
+    }
+    window.len()
 }
 
 impl Searchable for Matcher {
@@ -701,5 +742,34 @@ mod tests {
         assert!(snippet(uni, pos, 6).contains("NEEDLE"));
         // An out-of-range position clamps to an empty window instead of panicking.
         assert_eq!(snippet("short", 900, 6), "");
+    }
+
+    #[test]
+    fn streaming_matcher_resolves_final_sigma_across_chunk_boundary() {
+        // Chunk 1 ends right after capital `'Σ'` (`PIECE = 4096`), followed by `'Β'` in chunk 2:
+        // `'Σ'` before a cased letter lowercases to medial `'σ'`, NOT final `'ς'`.
+        let pad = "a".repeat(PIECE - "ΟΣ".len());
+        let mut m_false = Matcher::new(vec!["ος".into()], 1);
+        m_false.str(&pad);
+        m_false.str("ΟΣ");
+        m_false.str("Β");
+        m_false.finish();
+        assert!(
+            !m_false.anchored(),
+            "medial ΟΣΒ across chunk boundary must not match final ος"
+        );
+
+        let mut m_medial = Matcher::new(vec!["οσβ".into()], 1);
+        m_medial.str(&pad);
+        m_medial.str("ΟΣ");
+        m_medial.str("Β");
+        m_medial.finish();
+        assert!(m_medial.anchored(), "medial ΟΣΒ across chunk boundary must match οσβ");
+
+        let mut m_final_eof = Matcher::new(vec!["ος".into()], 1);
+        m_final_eof.str(&pad);
+        m_final_eof.str("ΟΣ");
+        m_final_eof.finish();
+        assert!(m_final_eof.anchored(), "trailing ΟΣ at EOF must match final ος");
     }
 }

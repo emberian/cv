@@ -2539,22 +2539,44 @@ pub fn indexed_top_level_count(dir: &Path) -> Option<usize> {
 /// — because a pass can only stamp what it can read. A permanently unreadable file or an empty
 /// transcript would fail the same way every pass, so counting it would pin the gate open forever.
 pub fn pass_needed(dir: &Path, subagents: bool) -> Option<bool> {
-    pass_needed_over(dir, &cv_core::sessions(), subagents)
+    let check_catalog = dir == crate::default_tantivy_dir();
+    pass_needed_with_catalog(dir, &cv_core::sessions(), subagents, check_catalog)
 }
 
 fn landable(sig: (i64, i64)) -> bool {
     sig.0 != 0 && sig.1 > 0
 }
 
+#[cfg(test)]
 fn pass_needed_over(dir: &Path, refs: &[cv_core::SessionRef], subagents: bool) -> Option<bool> {
+    pass_needed_with_catalog(dir, refs, subagents, false)
+}
+
+fn pass_needed_with_catalog(
+    dir: &Path,
+    refs: &[cv_core::SessionRef],
+    subagents: bool,
+    check_catalog: bool,
+) -> Option<bool> {
     let _sources = cv_core::source::read_scope();
     if !dir.join("meta.json").try_exists().ok()? {
         return None;
     }
     let (index, f) = open_existing(dir).ok()?;
+    if compaction_candidates(dir, &index).ok()?.is_some() {
+        return Some(true);
+    }
     let (existing, folded, metadata) = read_indexed_metadata(&index, &f, true).ok()?;
     let consumer = indexed_consumer(&dir.join("cv-index-id")).ok()??;
     let dependencies = cv_core::source::Table::<InIndex>::load(&consumer);
+    let check_derived = check_catalog && !cv_core::env::frozen();
+    let event_sync = check_derived.then(cv_core::events::SyncTable::load);
+    let col_events = if check_derived {
+        Some(crate::columnar_events::ColumnarEventStore::open(crate::default_columnar_events_dir()).ok()?)
+    } else {
+        None
+    };
+    let affordances = check_derived.then(cv_core::catalog::AffordanceTable::load);
     let mut probe = cv_core::source::Probe::default();
     let prov = cv_core::events::Provenance::default();
     let candidates: Vec<&cv_core::SessionRef> = preferred_index_candidates(refs.iter().map(|r| (r, &prov)).collect())
@@ -2574,6 +2596,26 @@ fn pass_needed_over(dir: &Path, refs: &[cv_core::SessionRef], subagents: bool) -
         let fresh = Freshness::of(&existing, &metadata, &dependencies, &mut probe, r, &prov, &source);
         if !fresh.fresh {
             return Some(true);
+        }
+        if check_derived {
+            if event_sync
+                .as_ref()
+                .is_some_and(|es| es.needs_ingest(r, &source, &prov, &mut probe))
+            {
+                return Some(true);
+            }
+            if col_events
+                .as_ref()
+                .is_some_and(|cs| cs.needs_ingest_with_probe(r, &source, &prov, &mut probe))
+            {
+                return Some(true);
+            }
+            if affordances
+                .as_ref()
+                .is_some_and(|af| af.counts_with_probe(r, &source, &mut probe).is_none())
+            {
+                return Some(true);
+            }
         }
     }
     for id in existing.keys() {
@@ -2599,8 +2641,8 @@ fn pass_needed_over(dir: &Path, refs: &[cv_core::SessionRef], subagents: bool) -
                 agent_id: m.agent_id.clone(),
                 workflow: m.workflow.clone(),
             };
-            if landable(sig(source.primary))
-                && !Freshness::of(
+            if landable(sig(source.primary)) {
+                if !Freshness::of(
                     &existing,
                     &metadata,
                     &dependencies,
@@ -2610,8 +2652,23 @@ fn pass_needed_over(dir: &Path, refs: &[cv_core::SessionRef], subagents: bool) -
                     &source,
                 )
                 .fresh
-            {
-                return Some(true);
+                {
+                    return Some(true);
+                }
+                if check_derived {
+                    if event_sync
+                        .as_ref()
+                        .is_some_and(|es| es.needs_ingest(&m.session, &source, &m_prov, &mut probe))
+                    {
+                        return Some(true);
+                    }
+                    if col_events
+                        .as_ref()
+                        .is_some_and(|cs| cs.needs_ingest_with_probe(&m.session, &source, &m_prov, &mut probe))
+                    {
+                        return Some(true);
+                    }
+                }
             }
         }
     }
@@ -9971,5 +10028,28 @@ mod tests {
         let mut dup = sref("s1", "one", p_new);
         dup.updated_at = chrono::DateTime::from_timestamp(3, 0);
         assert_eq!(pass_needed_over(&dir, &[r1, dup], false), Some(true));
+    }
+
+    #[test]
+    fn pass_needed_detects_missing_derived_columnar_events_and_compaction() {
+        let _home = IsolatedHome::new();
+        let dir = crate::default_tantivy_dir();
+        let sdir = tmpdir();
+        let p = write_claude(&sdir, "s1", "alpha derived gate");
+        let r1 = sref("s1", "one", p);
+
+        sweep(&dir, vec![r1.clone()], false, false).unwrap();
+        assert_eq!(
+            pass_needed_with_catalog(&dir, std::slice::from_ref(&r1), false, true),
+            Some(false)
+        );
+
+        // Wiping `events_columnar/` while FTS docs stay fresh must re-open `pass_needed`.
+        std::fs::remove_dir_all(crate::default_columnar_events_dir()).unwrap();
+        assert_eq!(
+            pass_needed_with_catalog(&dir, std::slice::from_ref(&r1), false, true),
+            Some(true),
+            "wiped columnar events store must trigger pass_needed"
+        );
     }
 }

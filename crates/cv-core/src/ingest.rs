@@ -370,6 +370,7 @@ fn is_sqlite_sidecar(name: &str) -> bool {
 }
 
 const MAX_ZST_DECOMPRESSED_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_TOTAL_ZST_DECOMPRESSED_BYTES: u64 = 512 * 1024 * 1024;
 
 fn is_zst_entry(name: &str, bytes: &[u8]) -> bool {
     name.to_ascii_lowercase().ends_with(".zst")
@@ -385,19 +386,21 @@ fn strip_zst_suffix(name: &str) -> String {
     name.to_string()
 }
 
-fn decode_zst_entry(name: &str, bytes: &[u8]) -> Result<(String, Vec<u8>), String> {
+fn decode_zst_entry(name: &str, bytes: &[u8], max_bytes: u64, total_cap: u64) -> Result<(String, Vec<u8>), String> {
     use std::io::Read as _;
     let reader = crate::harness::store::zst::decoder(std::io::Cursor::new(bytes)).map_err(|e| format!("zstd: {e}"))?;
     let mut out = Vec::new();
     reader
-        .take(MAX_ZST_DECOMPRESSED_BYTES + 1)
+        .take(max_bytes.saturating_add(1))
         .read_to_end(&mut out)
         .map_err(|e| format!("zstd: {e}"))?;
-    if out.len() as u64 > MAX_ZST_DECOMPRESSED_BYTES {
-        return Err(format!(
-            "zstd entry {name:?} decoded past {} bytes",
-            MAX_ZST_DECOMPRESSED_BYTES
-        ));
+    if out.len() as u64 > max_bytes {
+        if max_bytes < MAX_ZST_DECOMPRESSED_BYTES {
+            return Err(format!(
+                "zstd entry {name:?} exceeded aggregate decompressed budget ({total_cap} bytes)"
+            ));
+        }
+        return Err(format!("zstd entry {name:?} decoded past {max_bytes} bytes"));
     }
     Ok((strip_zst_suffix(name), out))
 }
@@ -420,12 +423,21 @@ pub fn ingest_files_with_report(files: Vec<(String, Vec<u8>)>) -> anyhow::Result
 }
 
 fn ingest_files_inner(files: Vec<(String, Vec<u8>)>) -> anyhow::Result<(IngestReport, Option<anyhow::Error>)> {
+    ingest_files_inner_with_zst_caps(files, MAX_ZST_DECOMPRESSED_BYTES, MAX_TOTAL_ZST_DECOMPRESSED_BYTES)
+}
+
+fn ingest_files_inner_with_zst_caps(
+    files: Vec<(String, Vec<u8>)>,
+    max_entry_zst: u64,
+    max_total_zst: u64,
+) -> anyhow::Result<(IngestReport, Option<anyhow::Error>)> {
     let mut out = Vec::new();
     let mut skipped = Vec::new();
     let mut first_parse_err: Option<anyhow::Error> = None;
     let mut agy_candidates: std::collections::BTreeMap<String, (u8, usize, String, String)> =
         std::collections::BTreeMap::new();
     let mut pending_unknown: Vec<PendingEntry> = Vec::new();
+    let mut zst_total_decoded: u64 = 0;
 
     let record_parse_err =
         |raw_name: String, err: anyhow::Error, skipped: &mut Vec<SkippedEntry>, first: &mut Option<anyhow::Error>| {
@@ -438,8 +450,13 @@ fn ingest_files_inner(files: Vec<(String, Vec<u8>)>) -> anyhow::Result<(IngestRe
 
     for (idx, (raw_name, raw_bytes)) in files.into_iter().enumerate() {
         let (name, bytes) = if is_zst_entry(&raw_name, &raw_bytes) {
-            match decode_zst_entry(&raw_name, &raw_bytes) {
-                Ok(decoded) => decoded,
+            let remaining = max_total_zst.saturating_sub(zst_total_decoded);
+            let entry_cap = max_entry_zst.min(remaining);
+            match decode_zst_entry(&raw_name, &raw_bytes, entry_cap, max_total_zst) {
+                Ok((dec_name, dec_bytes)) => {
+                    zst_total_decoded = zst_total_decoded.saturating_add(dec_bytes.len() as u64);
+                    (dec_name, dec_bytes)
+                }
                 Err(reason) => {
                     if first_parse_err.is_none() {
                         first_parse_err = Some(anyhow::anyhow!("{reason}"));
@@ -2459,6 +2476,20 @@ mod tests {
                 utf8_report.sessions[0].source_path.as_deref(),
                 Some(std::path::Path::new("x🌍yz"))
             );
+
+            // Aggregate post-zstd budget bounds cumulative decompression across multi-entry batches.
+            let sample_len = CLAUDE_SAMPLE.len() as u64;
+            let zst_a = zstd::encode_all(CLAUDE_SAMPLE.as_bytes(), 1).unwrap();
+            let zst_b = zstd::encode_all(CLAUDE_SAMPLE.as_bytes(), 1).unwrap();
+            let (capped, _) = ingest_files_inner_with_zst_caps(
+                vec![("a.jsonl.zst".into(), zst_a), ("b.jsonl.zst".into(), zst_b)],
+                sample_len * 2,
+                sample_len + sample_len / 2,
+            )
+            .unwrap();
+            assert_eq!(capped.sessions.len(), 1);
+            assert_eq!(capped.skipped.len(), 1);
+            assert!(capped.skipped[0].reason.contains("aggregate decompressed budget"));
         }
     }
 }
