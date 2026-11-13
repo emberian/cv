@@ -461,7 +461,8 @@ deny_cwds = []
             reloaded.exports,
             vec![PathBuf::from("/tmp/old-export"), PathBuf::from("/tmp/new-export")]
         );
-        let resolved = crate::state::hub::resolve_replication_profile(&reloaded, "team-hub");
+        let resolved = reloaded.replication["team-hub"]
+            .inherit_from(&reloaded.privacy, reloaded.replication_overrides.get("team-hub"));
         assert!(resolved.hostnames, "unset hostnames must still inherit [privacy]");
         assert!(!resolved.private_ips, "explicit private_ips = false must survive save");
         assert_eq!(
