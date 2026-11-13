@@ -702,13 +702,26 @@ impl StateStore {
             }
 
             for (prod_id, epoch, req_seq) in &epoch_reqs {
+                // `Shipper::sync` with a custom `--producer-id` / `[replication.<target>].producer_id`
+                // records `custody_acks` under the overridden outbound `producer_id`, while
+                // `operation_bindings` retains the local `StateStore` producer. Because `writer_epochs`
+                // (`PRIMARY KEY (epoch)`) uniquely binds each allocated writer epoch to one local
+                // producer in `state.db`, matching either `custody_acks.producer_id = ?2` or an owned
+                // `writer_epochs` row allows custom `--producer-id` targets to evict acknowledged packs
+                // without cross-producer collision.
                 let seq_acked: bool = conn.query_row(
                     "SELECT EXISTS(
                          SELECT 1 FROM custody_acks
                          WHERE target_hub = ?1
-                           AND producer_id = ?2
                            AND epoch = ?3
                            AND contiguous_seq >= ?4
+                           AND (
+                               producer_id = ?2
+                               OR EXISTS(
+                                   SELECT 1 FROM writer_epochs w
+                                   WHERE w.epoch = ?3 AND w.producer_id = ?2
+                               )
+                           )
                      )",
                     rusqlite::params![hub, prod_id, epoch, req_seq],
                     |r| r.get(0),

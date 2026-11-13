@@ -1093,3 +1093,131 @@ fn is_pack_evictable_requires_custody_for_every_epoch_in_pack_range() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn is_pack_evictable_matches_custom_replication_producer_id_via_writer_epochs() {
+    let dir = tmp_state_dir("evict-custom-producer");
+    let store = StateStore::at_dir(&dir).with_producer("local-default-prod");
+
+    let r1 = store.append("op-1", "d1", &json!({"n": 1})).unwrap();
+    store.close_epoch(&r1.event_id.epoch).unwrap();
+    let r2 = store.append("op-2", "d2", &json!({"n": 2})).unwrap();
+    assert_ne!(r1.event_id.epoch, r2.event_id.epoch);
+
+    store
+        .publish_pack_range(&PackManifest {
+            pack_id: "pack-1".into(),
+            min_commit_pos: 1,
+            max_commit_pos: 1,
+            record_count: 1,
+            byte_len: 16,
+            digest: "blake3:p1".into(),
+            pack_path: "packs/pack-1.pack.zst".into(),
+            index_meta: json!({}),
+            published_at: 100,
+        })
+        .unwrap();
+    store
+        .publish_pack_range(&PackManifest {
+            pack_id: "pack-2".into(),
+            min_commit_pos: 2,
+            max_commit_pos: 2,
+            record_count: 1,
+            byte_len: 16,
+            digest: "blake3:p2".into(),
+            pack_path: "packs/pack-2.pack.zst".into(),
+            index_meta: json!({}),
+            published_at: 101,
+        })
+        .unwrap();
+
+    // Simulate `Shipper::sync` configured with custom `--producer-id custom-fleet-box`:
+    // `custody_acks.producer_id` is `"custom-fleet-box"` rather than `"local-default-prod"`.
+    store
+        .record_custody_ack(&CustodyAck {
+            target_hub: "team-hub".into(),
+            producer_id: "custom-fleet-box".into(),
+            epoch: r1.event_id.epoch.clone(),
+            contiguous_seq: 1,
+            max_commit_pos: Some(1),
+            pack_id: None,
+            acked_at: 200,
+        })
+        .unwrap();
+
+    assert!(
+        store.is_pack_evictable("pack-1", &["team-hub"]).unwrap(),
+        "acknowledged pack shipped under custom --producer-id must be evictable"
+    );
+    assert!(
+        !store.is_pack_evictable("pack-2", &["team-hub"]).unwrap(),
+        "unacknowledged second epoch must remain non-evictable"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn hub_v7_epoch_supersedes_pre_upgrade_v4_epoch_on_untimestamped_delete_in_any_arrival_order() {
+    use super::hub::{compute_event_digest, HubStore, IngestBatchRequest, IngestEventRecord};
+
+    // High-hex UUIDv4 epoch from 0.19.0 (`'f' > '0'`) vs post-upgrade 0.19.1 UUIDv7 (`"019..."`).
+    let v4_epoch = "f47ac10b-58cc-4372-a567-0e02b2c3d479";
+    let v7_epoch = "019a7800-0000-7000-8000-000000000001";
+    assert!(v4_epoch > v7_epoch, "lexicographically v4 sorts after v7");
+
+    let upsert_env = json!({
+        "kind": "session_upsert",
+        "session_id": "sess-upgraded",
+        "harness": "claude",
+        "title": "Pre-upgrade session",
+        "updated_at": "2026-11-12T10:00:00Z",
+        "message_count": 3,
+    });
+    let upsert_rec = IngestEventRecord {
+        event_id: EventId::new("prod-up", v4_epoch, 1),
+        op_id: "op-v4-upsert".into(),
+        digest: compute_event_digest("op-v4-upsert", &upsert_env, None).unwrap(),
+        envelope: upsert_env,
+        payload_addr: None,
+    };
+
+    // Untimestamped `session_delete` emitted after upgrading to 0.19.1 (`v7_epoch`).
+    let delete_env = json!({
+        "kind": "session_delete",
+        "session_id": "sess-upgraded",
+        "harness": "claude",
+    });
+    let delete_rec = IngestEventRecord {
+        event_id: EventId::new("prod-up", v7_epoch, 1),
+        op_id: "op-v7-delete".into(),
+        digest: compute_event_digest("op-v7-delete", &delete_env, None).unwrap(),
+        envelope: delete_env,
+        payload_addr: None,
+    };
+
+    for v4_first in [true, false] {
+        let dir = tmp_state_dir(if v4_first { "hub-v4-then-v7" } else { "hub-v7-then-v4" });
+        let hub = HubStore::at_home(&dir);
+        let first_batch = if v4_first {
+            vec![upsert_rec.clone()]
+        } else {
+            vec![delete_rec.clone()]
+        };
+        let second_batch = if v4_first {
+            vec![delete_rec.clone()]
+        } else {
+            vec![upsert_rec.clone()]
+        };
+
+        hub.ingest_batch(&IngestBatchRequest { events: first_batch }).unwrap();
+        let resp = hub.ingest_batch(&IngestBatchRequest { events: second_batch }).unwrap();
+        let snap = resp.snapshot.expect("snapshot published");
+        assert!(
+            !snap.session_revisions.contains_key("prod-up:sess-upgraded"),
+            "0.19.1 UUIDv7 delete must supersede 0.19.0 UUIDv4 upsert (v4_first={v4_first}): {:?}",
+            snap.session_revisions.keys().collect::<Vec<_>>()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}

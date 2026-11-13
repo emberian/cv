@@ -777,6 +777,18 @@ pub(crate) fn fold_origin_range_in_tx(
 /// `sort_ts_ms` observed in earlier epochs (`epoch ASC`) for that `(producer_id, session_id)`, so
 /// an untimestamped `session_delete` in a newer epoch supersedes prior epochs without permanently
 /// outranking later timestamped epochs, independent of batch arrival order.
+fn epoch_generation(epoch: &str) -> u8 {
+    // Pre-0.19.1 writer epochs were random UUIDv4 (`xxxxxxxx-xxxx-4xxx-...`), 93.75% of which
+    // sort lexicographically after 0.19.1 monotonic UUIDv7 (`019...`). Ordering UUIDv4 as
+    // generation 0 before UUIDv7/other epochs (generation 1) ensures post-upgrade epochs
+    // supersede 0.19.0 epochs on untimestamped deletes and same-ms ties regardless of batch order.
+    if epoch.len() == 36 && epoch.as_bytes().get(14) == Some(&b'4') && uuid::Uuid::parse_str(epoch).is_ok() {
+        0
+    } else {
+        1
+    }
+}
+
 pub(crate) fn resolve_producer_sessions_in_tx(
     tx: &Transaction<'_>,
     producer_id: &str,
@@ -785,35 +797,42 @@ pub(crate) fn resolve_producer_sessions_in_tx(
     let mut stmt = tx.prepare(
         "SELECT epoch, is_delete, sort_ts_ms, event_seq, entry_json
          FROM hub_epoch_sessions
-         WHERE producer_id = ?1 AND session_id = ?2
-         ORDER BY epoch ASC",
+         WHERE producer_id = ?1 AND session_id = ?2",
     )?;
     for session_id in session_ids {
-        let rows = stmt.query_map(rusqlite::params![producer_id, session_id], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, i64>(1)?,
-                r.get::<_, i64>(2)?,
-                r.get::<_, i64>(3)?,
-                r.get::<_, Option<String>>(4)?,
-            ))
-        })?;
+        let mut epoch_rows: Vec<(String, i64, i64, i64, Option<String>)> = stmt
+            .query_map(rusqlite::params![producer_id, session_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        epoch_rows.sort_by(|a, b| {
+            epoch_generation(&a.0)
+                .cmp(&epoch_generation(&b.0))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+
         struct SessionWinner {
-            rank: (i64, String, i64),
+            rank: (i64, u8, String, i64),
             is_delete: i64,
             entry_json: Option<String>,
         }
         let mut running_ts = i64::MIN;
         let mut winner: Option<SessionWinner> = None;
-        for row in rows {
-            let (epoch, is_delete, raw_ts, event_seq, entry_json) = row?;
+        for (epoch, is_delete, raw_ts, event_seq, entry_json) in epoch_rows {
             let effective_ts = if raw_ts == i64::MIN {
                 running_ts
             } else {
                 running_ts = running_ts.max(raw_ts);
                 raw_ts
             };
-            let rank = (effective_ts, epoch, event_seq);
+            let generation = epoch_generation(&epoch);
+            let rank = (effective_ts, generation, epoch, event_seq);
             if winner.as_ref().is_none_or(|best| rank > best.rank) {
                 winner = Some(SessionWinner {
                     rank,
