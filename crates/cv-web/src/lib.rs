@@ -149,14 +149,14 @@ fn parse_distill_options(opts_json: Option<&str>) -> Result<DistillOptions, Stri
     let Some(obj) = val.as_object() else {
         return Err("distill options must be a JSON object".into());
     };
-    if let Some(n) = obj.get("keep_last").and_then(Value::as_u64) {
-        opts.keep_last = n as usize;
+    if let Some(n) = parse_bounded_usize(obj, "keep_last")? {
+        opts.keep_last = n;
     }
-    if let Some(n) = obj.get("tail_result_max").and_then(Value::as_u64) {
-        opts.tail_result_max = n as usize;
+    if let Some(n) = parse_bounded_usize(obj, "tail_result_max")? {
+        opts.tail_result_max = n;
     }
-    if let Some(n) = obj.get("note_max").and_then(Value::as_u64) {
-        opts.note_max = n as usize;
+    if let Some(n) = parse_bounded_usize(obj, "note_max")? {
+        opts.note_max = n;
     }
     if let Some(b) = obj.get("keep_tail_thinking").and_then(Value::as_bool) {
         opts.keep_tail_thinking = b;
@@ -168,6 +168,23 @@ fn parse_distill_options(opts_json: Option<&str>) -> Result<DistillOptions, Stri
         opts.retrieve_ref = Some(r.to_string());
     }
     Ok(opts)
+}
+
+fn parse_bounded_usize(obj: &serde_json::Map<String, Value>, key: &str) -> Result<Option<usize>, String> {
+    let Some(v) = obj.get(key) else {
+        return Ok(None);
+    };
+    if v.is_null() {
+        return Ok(None);
+    }
+    let Some(n) = v.as_u64() else {
+        return Err(format!("{key} must be a non-negative integer"));
+    };
+    let bounded = u32::try_from(n)
+        .ok()
+        .and_then(|u| usize::try_from(u).ok())
+        .ok_or_else(|| format!("{key} value {n} exceeds maximum size"))?;
+    Ok(Some(bounded))
 }
 
 fn parse_redact_options(only: Option<&str>) -> Result<RedactOptions, String> {
@@ -678,5 +695,25 @@ mod tests {
         assert_eq!(stubs[0]["size_bytes"], CLAUDE_SAMPLE.len() as u64);
         assert_eq!(skipped.len(), 1, "{skipped:?}");
         assert_eq!(skipped[0]["path"], "rollout-broken.json");
+    }
+
+    #[test]
+    fn parse_distill_options_rejects_wasm32_overflow_and_handles_utf8_zst_archive_names() {
+        assert!(parse_distill_options(Some(r#"{"keep_last": 16, "note_max": 2048}"#)).is_ok());
+        assert!(parse_distill_options(Some(r#"{"keep_last": null}"#)).is_ok());
+
+        // Values >= 2^32 would wrap `n as usize` on `wasm32` (e.g. `4294967297 -> 1`).
+        let err = parse_distill_options(Some(r#"{"keep_last": 4294967297}"#)).unwrap_err();
+        assert!(err.contains("exceeds maximum size"), "{err}");
+        let neg_err = parse_distill_options(Some(r#"{"tail_result_max": -1}"#)).unwrap_err();
+        assert!(neg_err.contains("non-negative integer"), "{neg_err}");
+
+        // Non-ASCII zip entry with zstd magic where `len - 4` falls inside `'🌍'`.
+        let zst_claude = wrap_raw_zstd_frame(CLAUDE_SAMPLE.as_bytes());
+        let archive = make_zip(&[("x🌍yz", &zst_claude)]);
+        let mut store = WasmStore::new();
+        let report = store.ingest_zip_inner(&archive).unwrap();
+        assert_eq!(report["sessions"].as_array().unwrap().len(), 1);
+        assert_eq!(report["sessions"][0]["path"], "x🌍yz");
     }
 }
