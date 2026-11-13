@@ -68,6 +68,7 @@ pub struct SyncSummary {
     pub failed: Vec<(String, String)>,
     pub pack_id: Option<String>,
     pub archived_entries: Vec<ArchivedSessionEntry>,
+    pub verified_baselines: Vec<(String, String, cv_core::source::Baseline)>,
 }
 
 /// Handle to `$CLUSTERVISION_HOME` (`packs/` + `state.db`).
@@ -295,6 +296,9 @@ impl Archive {
 
                 if let Some(prev) = known.get(&key) {
                     if prev.content_blake3 == blake3_hex {
+                        if let Some(base) = baseline {
+                            summary.verified_baselines.push((harness_str, r.id.clone(), base));
+                        }
                         summary.skipped += 1;
                         continue;
                     }
@@ -661,6 +665,39 @@ fn filter_watch_candidates(refs: Vec<SessionRef>, seen: &mut WatchBaselineMap) -
     candidates
 }
 
+fn evict_failed_watch_baselines(refs: &[SessionRef], failed: &[(String, String)], seen: &mut WatchBaselineMap) {
+    if failed.is_empty() {
+        return;
+    }
+    let failed_ids: std::collections::HashSet<&str> = failed.iter().map(|(who, _)| who.as_str()).collect();
+    for r in refs {
+        let tag = format!("{}:{}", r.harness, r.id);
+        if failed_ids.contains(tag.as_str()) {
+            seen.remove(&(r.harness, r.id.clone(), r.path.clone()));
+        }
+    }
+}
+
+fn reconcile_watch_baselines(candidates: &[SessionRef], summary: &SyncSummary, seen: &mut WatchBaselineMap) {
+    for (harness, id, base) in &summary.verified_baselines {
+        for c in candidates {
+            if c.harness.as_str() == harness && &c.id == id {
+                seen.insert((c.harness, c.id.clone(), c.path.clone()), base.clone());
+            }
+        }
+    }
+    for entry in &summary.archived_entries {
+        if let Some(ref base) = entry.baseline {
+            for c in candidates {
+                if c.harness.as_str() == entry.harness && c.id == entry.id {
+                    seen.insert((c.harness, c.id.clone(), c.path.clone()), base.clone());
+                }
+            }
+        }
+    }
+    evict_failed_watch_baselines(candidates, &summary.failed, seen);
+}
+
 fn source_stat(path: &Path) -> (Option<u64>, Option<i128>) {
     let Ok(meta) = std::fs::metadata(path) else {
         return (None, None);
@@ -875,6 +912,7 @@ pub fn cmd_watch(
     let initial_known = archive.entries_by_key().ok().map(|(m, _)| m);
     let watch_producer = archive.state_store().default_producer().to_string();
     let mut seen_baseline = seed_watch_baselines(&initial_refs, initial_known.as_ref(), Some(&watch_producer));
+    evict_failed_watch_baselines(&initial_refs, &init.failed, &mut seen_baseline);
 
     loop {
         std::thread::sleep(poll);
@@ -887,14 +925,8 @@ pub fn cmd_watch(
             for (who, why) in &batch.failed {
                 eprintln!("  ! {who}: {why}");
             }
+            reconcile_watch_baselines(&candidates, &batch, &mut seen_baseline);
             for entry in &batch.archived_entries {
-                if let Some(ref base) = entry.baseline {
-                    for c in &candidates {
-                        if c.harness.as_str() == entry.harness && c.id == entry.id {
-                            seen_baseline.insert((c.harness, c.id.clone(), c.path.clone()), base.clone());
-                        }
-                    }
-                }
                 let now = fmt_local(Utc::now(), "%H:%M:%S");
                 let title = entry.title.as_deref().map(|t| truncate_str(t, 44)).unwrap_or_default();
                 println!(
@@ -1446,6 +1478,29 @@ mod tests {
         assert_eq!(
             invalidated.skipped, 0,
             "Claude companion tasks/<sid> edit must invalidate sync_refs baseline fast-path"
+        );
+        reconcile_watch_baselines(std::slice::from_ref(&claude_ref), &invalidated, &mut claude_seen);
+        assert!(
+            filter_watch_candidates(vec![claude_ref.clone()], &mut claude_seen).is_empty(),
+            "reconciled baseline after companion edit must stay quiet on idle poll"
+        );
+
+        // 4. Prove a failed `sync_refs` read (e.g. corrupt zstd rollout) is evicted from
+        //    `seen_baseline` by `reconcile_watch_baselines` so the next poll retries it instead of
+        //    permanently dropping the session.
+        let bad_zst = world.base.join("corrupt-rollout.jsonl.zst");
+        std::fs::write(&bad_zst, b"not-valid-zstd-frame").unwrap();
+        let bad_ref = SessionRef::new("codex-corrupt", Harness::Codex, &bad_zst);
+        let mut fail_seen = WatchBaselineMap::new();
+        let first_cands = filter_watch_candidates(vec![bad_ref.clone()], &mut fail_seen);
+        assert_eq!(first_cands.len(), 1);
+        let failed_batch = archive.sync_refs(&first_cands).unwrap();
+        assert_eq!(failed_batch.failed.len(), 1);
+        reconcile_watch_baselines(&first_cands, &failed_batch, &mut fail_seen);
+        assert_eq!(
+            filter_watch_candidates(vec![bad_ref.clone()], &mut fail_seen).len(),
+            1,
+            "failed sync_refs session must be evicted from seen_baseline and retried on the next poll"
         );
     }
 }

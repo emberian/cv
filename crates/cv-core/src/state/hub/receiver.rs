@@ -259,7 +259,17 @@ impl HubStore {
         }
 
         let idx_blake3_digest = blake3::hash(idx_bytes).to_hex().to_string();
-        // Both files are immutable commitments: replay cannot silently change the record index.
+        // Serialize the check -> publish -> DB commit critical section across concurrent uploaders
+        // targeting the same (or case-variant) `pack_id`, so a conflicting uploader can never
+        // overwrite published `.pack.zst` / `.pack.idx.json` files before `hub_packs` rejects it.
+        let locks_dir = self.packs_dir.join(".locks");
+        std::fs::create_dir_all(&locks_dir)?;
+        let lock_key = blake3::hash(pack_id.to_lowercase().as_bytes()).to_hex().to_string();
+        let _upload_lock = crate::lockfile::FileLock::acquire(&locks_dir.join(format!("{lock_key}.lock")))
+            .map_err(|e| HubError::Pack(format!("locking pack `{pack_id}`: {e:#}")))?;
+
+        // Both files are immutable commitments: replay cannot silently change the record index,
+        // and case-variant pack IDs must never alias on case-insensitive filesystems.
         // Check existing durable `hub_packs` entry before touching published paths.
         {
             let conn = self.store.open_writable()?;
@@ -267,7 +277,7 @@ impl HubStore {
                 .query_row(
                     "SELECT pack_id, producer_id, byte_len, total_decoded_len, frame_count,
                             record_count, blake3_digest, idx_blake3_digest, received_at
-                     FROM hub_packs WHERE pack_id = ?1",
+                     FROM hub_packs WHERE pack_id = ?1 COLLATE NOCASE",
                     [pack_id],
                     |r| {
                         Ok(MirroredPackRecord {
@@ -286,7 +296,7 @@ impl HubStore {
                 .optional()?;
 
             if let Some(record) = existing {
-                if record.blake3_digest != actual_zst_digest {
+                if record.pack_id != pack_id || record.blake3_digest != actual_zst_digest {
                     return Err(HubError::PackConflict {
                         pack_id: pack_id.to_string(),
                         existing_digest: record.blake3_digest,
@@ -388,7 +398,7 @@ impl HubStore {
         staged_idx.write_all(idx_bytes)?;
         staged_idx.flush()?;
 
-        // If a prior crash published the exact same files before DB commit, check digest or publish fresh.
+        // If a prior crash published the exact same files before DB commit, check both digests before replacing.
         let claim = if zst_dest.exists() || idx_dest.exists() {
             if zst_dest.is_file() {
                 let existing_bytes = std::fs::read(&zst_dest)?;
@@ -398,6 +408,17 @@ impl HubStore {
                         pack_id: pack_id.to_string(),
                         existing_digest: existing_hex,
                         incoming_digest: actual_zst_digest,
+                    });
+                }
+            }
+            if idx_dest.is_file() {
+                let existing_idx = std::fs::read(&idx_dest)?;
+                let existing_idx_hex = blake3::hash(&existing_idx).to_hex().to_string();
+                if existing_idx_hex != idx_blake3_digest {
+                    return Err(HubError::PackConflict {
+                        pack_id: pack_id.to_string(),
+                        existing_digest: existing_idx_hex,
+                        incoming_digest: idx_blake3_digest,
                     });
                 }
             }
@@ -418,19 +439,27 @@ impl HubStore {
         let mut conn = self.store.open_writable()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        if let Some((existing_dig,)) = tx
+        if let Some((existing_id, existing_dig, existing_idx_dig)) = tx
             .query_row(
-                "SELECT blake3_digest FROM hub_packs WHERE pack_id = ?1",
+                "SELECT pack_id, blake3_digest, idx_blake3_digest
+                 FROM hub_packs WHERE pack_id = ?1 COLLATE NOCASE",
                 [pack_id],
-                |r| Ok((r.get::<_, String>(0)?,)),
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)),
             )
             .optional()?
         {
-            if existing_dig != actual_zst_digest {
+            if existing_id != pack_id || existing_dig != actual_zst_digest {
                 return Err(HubError::PackConflict {
                     pack_id: pack_id.to_string(),
                     existing_digest: existing_dig,
                     incoming_digest: actual_zst_digest,
+                });
+            }
+            if existing_idx_dig != idx_blake3_digest {
+                return Err(HubError::PackConflict {
+                    pack_id: pack_id.to_string(),
+                    existing_digest: existing_idx_dig,
+                    incoming_digest: idx_blake3_digest,
                 });
             }
             let record = MirroredPackRecord {
@@ -927,5 +956,61 @@ mod astra_tests {
         let reader = SeekableReader::open(file).unwrap();
         verify_record_digests(&reader, &manifest).unwrap();
         assert_eq!(reader.frames_decoded(), reader.index().len() as u64);
+    }
+
+    #[test]
+    fn upload_pack_rejects_case_variant_and_preserves_committed_files_on_conflict() {
+        let world = cv_testkit::World::new("hub-pack-conflict-safety");
+        let hub = HubStore::at_home(&world.cv_home);
+        let stage = world.base.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+
+        let mut b1 = crate::packs::PackBuilder::create(&stage, "PackAlpha").unwrap();
+        b1.append_record("r1", b"original-payload").unwrap();
+        b1.seal(Claim::New).unwrap();
+        let zst1 = std::fs::read(pack_zst_path(&stage, "PackAlpha").unwrap()).unwrap();
+        let idx1 = std::fs::read(pack_idx_path(&stage, "PackAlpha").unwrap()).unwrap();
+
+        let res1 = hub
+            .upload_pack_bytes("PackAlpha", Some("p1"), None, &idx1, &zst1)
+            .unwrap();
+        assert!(!res1.replayed);
+
+        // Conflicting payload under same pack_id AND case-variant `packalpha` must fail without
+        // overwriting the already-published `PackAlpha.pack.zst` / `.pack.idx.json` on disk.
+        let stage2 = world.base.join("stage2");
+        std::fs::create_dir_all(&stage2).unwrap();
+        let mut b2 = crate::packs::PackBuilder::create(&stage2, "PackAlpha").unwrap();
+        b2.append_record("r1", b"tampered-payload").unwrap();
+        b2.seal(Claim::New).unwrap();
+        let zst2 = std::fs::read(pack_zst_path(&stage2, "PackAlpha").unwrap()).unwrap();
+        let idx2 = std::fs::read(pack_idx_path(&stage2, "PackAlpha").unwrap()).unwrap();
+
+        assert!(matches!(
+            hub.upload_pack_bytes("PackAlpha", Some("p1"), None, &idx2, &zst2),
+            Err(HubError::PackConflict { .. })
+        ));
+
+        let stage3 = world.base.join("stage3");
+        std::fs::create_dir_all(&stage3).unwrap();
+        let mut b3 = crate::packs::PackBuilder::create(&stage3, "packalpha").unwrap();
+        b3.append_record("r1", b"case-variant-payload").unwrap();
+        b3.seal(Claim::New).unwrap();
+        let zst3 = std::fs::read(pack_zst_path(&stage3, "packalpha").unwrap()).unwrap();
+        let idx3 = std::fs::read(pack_idx_path(&stage3, "packalpha").unwrap()).unwrap();
+
+        assert!(matches!(
+            hub.upload_pack_bytes("packalpha", Some("p1"), None, &idx3, &zst3),
+            Err(HubError::PackConflict { .. })
+        ));
+
+        assert_eq!(
+            std::fs::read(pack_zst_path(hub.packs_dir(), "PackAlpha").unwrap()).unwrap(),
+            zst1
+        );
+        assert_eq!(
+            std::fs::read(pack_idx_path(hub.packs_dir(), "PackAlpha").unwrap()).unwrap(),
+            idx1
+        );
     }
 }

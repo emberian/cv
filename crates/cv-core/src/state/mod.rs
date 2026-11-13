@@ -367,23 +367,23 @@ fn open_private_folded_copy(db_path: &Path, wal_path: &Path) -> Result<Connectio
 }
 
 fn immutable_sqlite_uri(path: &Path) -> String {
+    const RESERVED: &percent_encoding::AsciiSet = &percent_encoding::CONTROLS.add(b'%').add(b'?').add(b'#').add(b' ');
     let abs = if path.is_absolute() {
         path.to_path_buf()
     } else {
         std::env::current_dir().unwrap_or_default().join(path)
     };
-    let mut uri = String::from("file:");
-    for b in abs.to_string_lossy().as_bytes() {
-        match *b {
-            b'#' => uri.push_str("%23"),
-            b'?' => uri.push_str("%3f"),
-            b'%' => uri.push_str("%25"),
-            b' ' => uri.push_str("%20"),
-            ch => uri.push(ch as char),
-        }
-    }
-    uri.push_str("?immutable=1");
-    uri
+    #[cfg(unix)]
+    let encoded = {
+        use std::os::unix::ffi::OsStrExt;
+        percent_encoding::percent_encode(abs.as_os_str().as_bytes(), RESERVED).to_string()
+    };
+    #[cfg(not(unix))]
+    let encoded = {
+        let text = format!("/{}", abs.to_string_lossy().replace('\\', "/"));
+        percent_encoding::utf8_percent_encode(&text, RESERVED).to_string()
+    };
+    format!("file:{encoded}?immutable=1")
 }
 
 pub(crate) fn set_restrictive_file_mode(path: &Path) {
@@ -425,4 +425,25 @@ pub(crate) fn ensure_private_dir_0700(dir: &Path) -> Result<(), StateError> {
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod uri_tests {
+    use super::*;
+
+    #[test]
+    fn frozen_safe_readonly_opens_non_ascii_state_db_path() {
+        let world = cv_testkit::World::new("state-non-ascii");
+        let dir = world.base.join("δοκιμή-日本語");
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = StateStore::at_dir(&dir);
+        store.append("op:1", "dig1", &serde_json::json!({"ok": true})).unwrap();
+
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_URI;
+        let conn = Connection::open_with_flags(immutable_sqlite_uri(&dir.join("state.db")), flags).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM capture_inbox", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
 }

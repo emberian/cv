@@ -109,18 +109,19 @@ fn serialize_replication_entry(
                         .entry("classes")
                         .or_insert_with(|| serde_json::Value::Object(Default::default()));
                     if let Some(cls_obj) = cls_entry.as_object_mut() {
-                        for ck in raw_classes.keys() {
+                        for (ck, cv) in raw_classes {
                             let flag = match ck.as_str() {
-                                "api_keys" => Some(prof.classes.api_keys),
-                                "private_keys" => Some(prof.classes.private_keys),
-                                "jwts" => Some(prof.classes.jwts),
-                                "emails" => Some(prof.classes.emails),
-                                "blobs" => Some(prof.classes.blobs),
-                                "assignments" => Some(prof.classes.assignments),
+                                "api_keys" => Some(serde_json::Value::Bool(prof.classes.api_keys)),
+                                "private_keys" => Some(serde_json::Value::Bool(prof.classes.private_keys)),
+                                "jwts" => Some(serde_json::Value::Bool(prof.classes.jwts)),
+                                "emails" => Some(serde_json::Value::Bool(prof.classes.emails)),
+                                "blobs" => Some(serde_json::Value::Bool(prof.classes.blobs)),
+                                "assignments" => Some(serde_json::Value::Bool(prof.classes.assignments)),
+                                _ if !cv.is_null() => Some(cv.clone()),
                                 _ => None,
                             };
-                            if let Some(b) = flag {
-                                cls_obj.insert(ck.clone(), serde_json::Value::Bool(b));
+                            if let Some(v) = flag {
+                                cls_obj.insert(ck.clone(), v);
                             }
                         }
                     }
@@ -132,12 +133,13 @@ fn serialize_replication_entry(
                         .entry("filter")
                         .or_insert_with(|| serde_json::Value::Object(Default::default()));
                     if let Some(flt_obj) = flt_entry.as_object_mut() {
-                        for fk in raw_filter.keys() {
+                        for (fk, fv_raw) in raw_filter {
                             let fv = match fk.as_str() {
                                 "allow_cwds" => serde_json::to_value(&prof.filter.allow_cwds).ok(),
                                 "deny_cwds" => serde_json::to_value(&prof.filter.deny_cwds).ok(),
                                 "harnesses" => serde_json::to_value(&prof.filter.harnesses).ok(),
                                 "tags" => serde_json::to_value(&prof.filter.tags).ok(),
+                                _ if !fv_raw.is_null() => Some(fv_raw.clone()),
                                 _ => None,
                             };
                             if let Some(v) = fv {
@@ -257,26 +259,115 @@ pub fn save(cfg: &Config) -> Result<PathBuf> {
         Err(error) => return Err(error).with_context(|| format!("reading config {}", p.display())),
     };
     let known = toml::Value::try_from(cfg).context("serializing config")?;
+    let known_table = known.as_table().context("serialized config must be a TOML table")?;
     let table = document.as_table_mut().context("config must be a TOML table")?;
-    if cfg.search.is_unset() {
-        table.remove("search");
-    }
-    if cfg.privacy.is_unset() {
-        table.remove("privacy");
-    }
+    update_search_section(table, known_table.get("search"));
+    update_privacy_section(table, known_table.get("privacy"));
     if cfg.replication.is_empty() {
         table.remove("replication");
+    } else if let Some(rep) = known_table.get("replication") {
+        table.insert("replication".into(), rep.clone());
     }
-    for (key, value) in known.as_table().context("serialized config must be a TOML table")? {
-        table.insert(key.clone(), value.clone());
+    if let Some(exports) = known_table.get("exports") {
+        table.insert("exports".into(), exports.clone());
     }
     let body = toml::to_string_pretty(&document).context("serializing config")?;
-    // Replaced whole, never rewritten in place. A symlinked config (a dotfiles checkout) is
-    // replaced at its target, so the link keeps pointing at the new file.
+    // Replaced whole, never rewritten in place, and staged with 0o600 because
+    // `[replication.<name>].token` can hold hub bearer credentials. A symlinked config (dotfiles)
+    // is replaced at its target so the link keeps pointing at the new file.
     let target = std::fs::canonicalize(&p).unwrap_or_else(|_| p.clone());
-    crate::publish::publish_reader(&target, "config", body.as_bytes(), crate::publish::Claim::Replace)
+    let mut staged =
+        crate::publish::Staged::beside(&target, "config", 0o600).with_context(|| format!("staging {}", p.display()))?;
+    std::io::Write::write_all(&mut staged, body.as_bytes()).with_context(|| format!("writing {}", p.display()))?;
+    staged
+        .publish(&target, crate::publish::Claim::Replace)
         .with_context(|| format!("writing {}", p.display()))?;
     Ok(p)
+}
+
+fn update_search_section(doc: &mut toml::map::Map<String, toml::Value>, known: Option<&toml::Value>) {
+    if let Some(existing) = doc.get_mut("search").and_then(toml::Value::as_table_mut) {
+        existing.remove("live_bytes");
+        if let Some(known_tbl) = known.and_then(toml::Value::as_table) {
+            for (k, v) in known_tbl {
+                existing.insert(k.clone(), v.clone());
+            }
+        }
+        if existing.is_empty() {
+            doc.remove("search");
+        }
+    } else if let Some(known_val) = known {
+        doc.insert("search".into(), known_val.clone());
+    } else {
+        doc.remove("search");
+    }
+}
+
+fn update_privacy_section(doc: &mut toml::map::Map<String, toml::Value>, known: Option<&toml::Value>) {
+    const PRIVACY_SCALARS: &[&str] = &[
+        "url",
+        "token",
+        "producer_id",
+        "private_ips",
+        "hostnames",
+        "ssh_principals",
+        "rewrite_home",
+        "rewrite_repo",
+        "principal",
+        "path_rewrites",
+    ];
+    const CLASS_KEYS: &[&str] = &["api_keys", "private_keys", "jwts", "emails", "blobs", "assignments"];
+    const FILTER_KEYS: &[&str] = &["allow_cwds", "deny_cwds", "harnesses", "tags"];
+
+    if let Some(existing) = doc.get_mut("privacy").and_then(toml::Value::as_table_mut) {
+        for k in PRIVACY_SCALARS {
+            existing.remove(*k);
+        }
+        prune_known_subtable(existing, "classes", CLASS_KEYS);
+        prune_known_subtable(existing, "filter", FILTER_KEYS);
+        if let Some(known_tbl) = known.and_then(toml::Value::as_table) {
+            for (k, v) in known_tbl {
+                match (k.as_str(), v.as_table()) {
+                    ("classes" | "filter", Some(sub_known)) => {
+                        let sub_entry = existing
+                            .entry(k.clone())
+                            .or_insert_with(|| toml::Value::Table(Default::default()));
+                        if let Some(sub_tbl) = sub_entry.as_table_mut() {
+                            for (sk, sv) in sub_known {
+                                sub_tbl.insert(sk.clone(), sv.clone());
+                            }
+                        } else {
+                            *sub_entry = v.clone();
+                        }
+                    }
+                    _ => {
+                        existing.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+        }
+        if existing.is_empty() {
+            doc.remove("privacy");
+        }
+    } else if let Some(known_val) = known {
+        doc.insert("privacy".into(), known_val.clone());
+    } else {
+        doc.remove("privacy");
+    }
+}
+
+fn prune_known_subtable(parent: &mut toml::map::Map<String, toml::Value>, key: &str, known_keys: &[&str]) {
+    let remove_whole = if let Some(sub) = parent.get_mut(key).and_then(toml::Value::as_table_mut) {
+        for kk in known_keys {
+            sub.remove(*kk);
+        }
+        sub.is_empty()
+    } else {
+        false
+    };
+    if remove_whole {
+        parent.remove(key);
+    }
 }
 
 #[cfg(test)]
@@ -475,5 +566,62 @@ deny_cwds = []
             resolved.filter.deny_cwds.is_empty(),
             "explicit filter.deny_cwds = [] must survive save"
         );
+    }
+
+    #[test]
+    fn save_preserves_unknown_nested_keys_and_stages_restrictive_mode() {
+        let _world = crate::test_world("config-unknown-nested-and-0600");
+        let path = save(&Config::default()).unwrap();
+        let raw = r#"
+exports = ["/tmp/exp"]
+
+[search]
+future_search_flag = "keep-search"
+
+[privacy]
+future_privacy_flag = "keep-privacy"
+
+[privacy.classes]
+future_class = true
+
+[replication.team-hub]
+url = "http://127.0.0.1:9123/"
+token = "secret-bearer-token"
+
+[replication.team-hub.classes]
+future_rep_class = false
+
+[replication.team-hub.filter]
+future_rep_filter = ["x"]
+"#;
+        std::fs::write(&path, raw).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+
+        let mut cfg = load_for_update().unwrap();
+        cfg.exports.push(PathBuf::from("/tmp/exp2"));
+        save(&cfg).unwrap();
+
+        let doc: toml::Value = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(doc["search"]["future_search_flag"].as_str(), Some("keep-search"));
+        assert_eq!(doc["privacy"]["future_privacy_flag"].as_str(), Some("keep-privacy"));
+        assert_eq!(doc["privacy"]["classes"]["future_class"].as_bool(), Some(true));
+        assert_eq!(
+            doc["replication"]["team-hub"]["classes"]["future_rep_class"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            doc["replication"]["team-hub"]["filter"]["future_rep_filter"][0].as_str(),
+            Some("x")
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "saved config.toml must be mode 0600, got {mode:#o}");
+        }
     }
 }

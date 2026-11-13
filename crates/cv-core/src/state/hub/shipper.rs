@@ -237,11 +237,53 @@ fn parse_authority(authority: &str) -> Result<(String, u16), HubError> {
     }
 }
 
+const MAX_HUB_HEADER_BYTES: usize = 64 * 1024;
+const MAX_HUB_HEADERS: usize = 128;
+const MAX_HUB_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+
+fn read_bounded_http_line(reader: &mut impl BufRead, max_bytes: usize, label: &str) -> Result<String, HubError> {
+    let mut buf = Vec::new();
+    reader.take((max_bytes + 1) as u64).read_until(b'\n', &mut buf)?;
+    if buf.len() > max_bytes {
+        return Err(HubError::Transport {
+            status: None,
+            message: format!("HTTP {label} exceeds {max_bytes} bytes"),
+        });
+    }
+    String::from_utf8(buf).map_err(|e| HubError::Transport {
+        status: None,
+        message: format!("HTTP {label} is not valid UTF-8: {e}"),
+    })
+}
+
+fn read_exact_bounded(
+    reader: &mut impl BufRead,
+    out: &mut Vec<u8>,
+    len: usize,
+    status: Option<u16>,
+) -> Result<(), HubError> {
+    out.reserve(len.min(64 * 1024));
+    let before = out.len();
+    reader.take(len as u64).read_to_end(out)?;
+    if out.len() - before != len {
+        return Err(HubError::Transport {
+            status,
+            message: format!(
+                "truncated HTTP body from hub: expected {len} bytes, got {}",
+                out.len() - before
+            ),
+        });
+    }
+    Ok(())
+}
+
 fn read_http_response(stream: TcpStream) -> Result<RawHttpResponse, HubError> {
-    let mut reader = BufReader::new(stream);
-    let mut status_line = String::new();
-    let n = reader.read_line(&mut status_line)?;
-    if n == 0 {
+    read_http_response_from(BufReader::new(stream))
+}
+
+fn read_http_response_from(mut reader: impl BufRead) -> Result<RawHttpResponse, HubError> {
+    let status_line = read_bounded_http_line(&mut reader, 8 * 1024, "status line")?;
+    if status_line.is_empty() {
         return Err(HubError::Transport {
             status: None,
             message: "empty HTTP response from hub".into(),
@@ -256,24 +298,49 @@ fn read_http_response(stream: TcpStream) -> Result<RawHttpResponse, HubError> {
             message: format!("malformed HTTP status line: {status_line:?}"),
         })?;
 
+    let mut total_header_bytes = status_line.len();
     let mut headers = Vec::new();
     let mut content_length: Option<usize> = None;
     let mut is_chunked = false;
     loop {
-        let mut line = String::new();
-        let read = reader.read_line(&mut line)?;
-        if read == 0 {
+        let line = read_bounded_http_line(&mut reader, MAX_HUB_HEADER_BYTES, "header line")?;
+        if line.is_empty() {
             break;
+        }
+        total_header_bytes = total_header_bytes.saturating_add(line.len());
+        if total_header_bytes > MAX_HUB_HEADER_BYTES {
+            return Err(HubError::Transport {
+                status: Some(status),
+                message: format!("HTTP headers exceed {MAX_HUB_HEADER_BYTES} bytes"),
+            });
         }
         let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed.is_empty() {
             break;
         }
+        if headers.len() >= MAX_HUB_HEADERS {
+            return Err(HubError::Transport {
+                status: Some(status),
+                message: format!("HTTP response exceeds {MAX_HUB_HEADERS} headers"),
+            });
+        }
         if let Some((k, v)) = trimmed.split_once(':') {
             let name = k.trim().to_string();
             let val = v.trim().to_string();
             if name.eq_ignore_ascii_case("Content-Length") {
-                content_length = val.parse::<usize>().ok();
+                let parsed = val.parse::<u64>().map_err(|_| HubError::Transport {
+                    status: Some(status),
+                    message: format!("malformed Content-Length header: {val:?}"),
+                })?;
+                if parsed > MAX_HUB_RESPONSE_BYTES as u64 {
+                    return Err(HubError::Transport {
+                        status: Some(status),
+                        message: format!(
+                            "HTTP response Content-Length {parsed} exceeds max allowed {MAX_HUB_RESPONSE_BYTES}"
+                        ),
+                    });
+                }
+                content_length = Some(parsed as usize);
             } else if name.eq_ignore_ascii_case("Transfer-Encoding") && val.to_ascii_lowercase().contains("chunked") {
                 is_chunked = true;
             }
@@ -284,40 +351,71 @@ fn read_http_response(stream: TcpStream) -> Result<RawHttpResponse, HubError> {
     let body = if status == 204 || status == 304 {
         Vec::new()
     } else if is_chunked {
-        read_chunked_body(&mut reader)?
+        read_chunked_body(&mut reader, Some(status))?
     } else if let Some(len) = content_length {
-        let mut buf = vec![0u8; len];
-        reader.read_exact(&mut buf)?;
+        let mut buf = Vec::new();
+        read_exact_bounded(&mut reader, &mut buf, len, Some(status))?;
         buf
     } else {
         let mut buf = Vec::new();
-        reader.read_to_end(&mut buf)?;
+        reader
+            .by_ref()
+            .take((MAX_HUB_RESPONSE_BYTES + 1) as u64)
+            .read_to_end(&mut buf)?;
+        if buf.len() > MAX_HUB_RESPONSE_BYTES {
+            return Err(HubError::Transport {
+                status: Some(status),
+                message: format!("HTTP response body exceeds max allowed {MAX_HUB_RESPONSE_BYTES} bytes"),
+            });
+        }
         buf
     };
 
     Ok(RawHttpResponse { status, headers, body })
 }
 
-fn read_chunked_body(reader: &mut impl BufRead) -> Result<Vec<u8>, HubError> {
+fn read_chunked_body(reader: &mut impl BufRead, status: Option<u16>) -> Result<Vec<u8>, HubError> {
     let mut out = Vec::new();
     loop {
-        let mut size_line = String::new();
-        reader.read_line(&mut size_line)?;
+        let size_line = read_bounded_http_line(reader, 4096, "chunk size line")?;
+        if size_line.is_empty() {
+            return Err(HubError::Transport {
+                status,
+                message: "unexpected EOF while reading chunked HTTP body".into(),
+            });
+        }
         let hex = size_line.trim().split(';').next().unwrap_or("").trim();
         let chunk_len = usize::from_str_radix(hex, 16).map_err(|_| HubError::Transport {
-            status: None,
+            status,
             message: format!("malformed chunk size line: {size_line:?}"),
         })?;
         if chunk_len == 0 {
-            let mut trailer = String::new();
-            let _ = reader.read_line(&mut trailer);
+            loop {
+                let trailer = read_bounded_http_line(reader, 8 * 1024, "chunk trailer")?;
+                if trailer.is_empty() || trailer.trim_end_matches(['\r', '\n']).is_empty() {
+                    break;
+                }
+            }
             break;
         }
-        let prev = out.len();
-        out.resize(prev + chunk_len, 0);
-        reader.read_exact(&mut out[prev..])?;
+        let total = out
+            .len()
+            .checked_add(chunk_len)
+            .filter(|&n| n <= MAX_HUB_RESPONSE_BYTES)
+            .ok_or_else(|| HubError::Transport {
+                status,
+                message: format!("chunked HTTP body exceeds max allowed {MAX_HUB_RESPONSE_BYTES} bytes"),
+            })?;
+        let _ = total;
+        read_exact_bounded(reader, &mut out, chunk_len, status)?;
         let mut crlf = [0u8; 2];
         reader.read_exact(&mut crlf)?;
+        if crlf != *b"\r\n" {
+            return Err(HubError::Transport {
+                status,
+                message: "malformed chunk terminator in HTTP body".into(),
+            });
+        }
     }
     Ok(out)
 }
@@ -1003,7 +1101,10 @@ impl Shipper {
         // 2. For every outbound pack referenced, the hub echoed its exact verified BLAKE3 digest
         //    in `ingest_resp.verified_pack_digests`!
         if !ingest_resp.durable_fsynced {
-            return Ok(report);
+            return Err(HubError::Transport {
+                status: Some(200),
+                message: "hub did not confirm durable fsync for ingest batch".into(),
+            });
         }
         for (up_id, (_, up_digest)) in &uploaded_packs {
             let verified = ingest_resp.verified_pack_digests.get(up_id);
@@ -1643,5 +1744,84 @@ harnesses = ["claude"]
             assert!(resolved.classes.jwts, "{selector}");
             assert_eq!(resolved.filter.harnesses, vec!["claude"], "{selector}");
         }
+    }
+
+    #[test]
+    fn shipper_rejects_unfsynced_ingest_and_oversized_http_responses() {
+        // 1. Oversized Content-Length and chunked bodies fail fast without unbounded allocation.
+        let huge_cl = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+            MAX_HUB_RESPONSE_BYTES + 1,
+            "{}"
+        );
+        assert!(matches!(
+            read_http_response_from(std::io::Cursor::new(huge_cl.as_bytes())),
+            Err(HubError::Transport { status: Some(200), .. })
+        ));
+        let overflow_chunk = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nffffffffffffffff\r\n";
+        assert!(matches!(
+            read_http_response_from(std::io::Cursor::new(&overflow_chunk[..])),
+            Err(HubError::Transport { status: Some(200), .. })
+        ));
+
+        // 2. `durable_fsynced: false` from `/api/hub/ingest_batch` returns `Err(HubError::Transport)`.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = std::thread::spawn(move || {
+            for i in 0..2 {
+                let (mut sock, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 4096];
+                let _ = std::io::Read::read(&mut sock, &mut buf);
+                let body = if i == 0 {
+                    serde_json::to_vec(&json!({
+                        "producer": {
+                            "producer_id": "prod-1",
+                            "host_label": "box",
+                            "metadata": {},
+                            "enrolled_at": 1,
+                            "updated_at": 1
+                        }
+                    }))
+                    .unwrap()
+                } else {
+                    serde_json::to_vec(&IngestBatchResponse {
+                        accepted_count: 1,
+                        replayed_count: 0,
+                        durable_fsynced: false,
+                        verified_pack_digests: BTreeMap::new(),
+                        custody_acks: Vec::new(),
+                        origin_frontier: BTreeMap::new(),
+                        snapshot: None,
+                    })
+                    .unwrap()
+                };
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                );
+                sock.write_all(head.as_bytes()).unwrap();
+                sock.write_all(&body).unwrap();
+            }
+        });
+
+        let world = cv_testkit::World::new("shipper-unfsynced-ingest");
+        let store = StateStore::at_dir(&world.cv_home);
+        let packs_dir = world.cv_home.join("packs");
+        store
+            .append(
+                "op:1",
+                "dig-1",
+                &json!({"kind": "session_upsert", "session_id": "s1", "harness": "claude"}),
+            )
+            .unwrap();
+        let cfg = ShipConfig::new("hub", format!("http://{addr}"), store.default_producer());
+        let shipper = Shipper::new(cfg).unwrap();
+        let err = shipper.sync(&store, &packs_dir).unwrap_err();
+        srv.join().unwrap();
+        assert!(
+            matches!(err, HubError::Transport { status: Some(200), .. }),
+            "expected Transport error when durable_fsynced is false, got {err:?}"
+        );
+        assert!(store.custody_acks_for("hub").unwrap().is_empty());
     }
 }
