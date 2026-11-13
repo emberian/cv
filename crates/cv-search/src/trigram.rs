@@ -140,8 +140,14 @@ impl SegmentEntry {
     fn deleted_slot_bitmap(&self) -> RoaringBitmap {
         let mut bm = RoaringBitmap::new();
         for &ord in &self.deleted_ords {
-            bm.insert(ord * 2);
-            bm.insert(ord * 2 + 1);
+            if ord < self.num_sessions {
+                if let Some(base) = ord.checked_mul(2) {
+                    bm.insert(base);
+                    if let Some(ctx) = base.checked_add(1) {
+                        bm.insert(ctx);
+                    }
+                }
+            }
         }
         bm
     }
@@ -190,6 +196,25 @@ impl Manifest {
         let manifest: Self = serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))?;
         if manifest.version != MANIFEST_VERSION || manifest.interpretation_version != cv_core::source::VERSION {
             return Ok(None);
+        }
+        for seg in &manifest.segments {
+            anyhow::ensure!(
+                seg.num_sessions <= u32::MAX / 2,
+                "corrupt trigram manifest {}: segment {} num_sessions {} exceeds slot limit",
+                path.display(),
+                seg.file,
+                seg.num_sessions
+            );
+            for &ord in &seg.deleted_ords {
+                anyhow::ensure!(
+                    ord < seg.num_sessions,
+                    "corrupt trigram manifest {}: segment {} deleted ord {} >= num_sessions {}",
+                    path.display(),
+                    seg.file,
+                    ord,
+                    seg.num_sessions
+                );
+            }
         }
         Ok(Some(manifest))
     }
@@ -1004,11 +1029,13 @@ impl ExactStreamMatcher {
                 .is_some_and(|(_, e)| e.text.len() >= e.at + e.len + TRAIL_BYTES)
     }
 
-    fn feed_bytes(&mut self, bytes: &[u8]) {
+    fn feed_bytes(&mut self, bytes: &[u8]) -> u64 {
         if self.done() {
-            return;
+            return 0;
         }
+        let mut accepted = 0u64;
         for part in bytes.chunks(PIECE_BYTES) {
+            accepted += part.len() as u64;
             self.stage.extend_from_slice(part);
             if self.stage.len() >= PIECE_BYTES {
                 self.flush(false);
@@ -1017,6 +1044,7 @@ impl ExactStreamMatcher {
                 }
             }
         }
+        accepted
     }
 
     fn flush(&mut self, end: bool) {
@@ -1094,6 +1122,14 @@ struct VerifyStreamAdapter<'a> {
     matcher: &'a mut ExactStreamMatcher,
     primary_path: &'a Path,
     dependencies: &'a mut cv_core::source::ReadSet,
+    metered: &'a std::cell::Cell<u64>,
+}
+
+impl VerifyStreamAdapter<'_> {
+    fn feed(&mut self, bytes: &[u8]) {
+        let accepted = self.matcher.feed_bytes(bytes);
+        self.metered.set(self.metered.get().saturating_add(accepted));
+    }
 }
 
 impl Searchable for VerifyStreamAdapter<'_> {
@@ -1102,7 +1138,7 @@ impl Searchable for VerifyStreamAdapter<'_> {
     }
 
     fn str(&mut self, s: &str) {
-        self.matcher.feed_bytes(s.as_bytes());
+        self.feed(s.as_bytes());
     }
 
     fn text(
@@ -1129,7 +1165,7 @@ impl Searchable for VerifyStreamAdapter<'_> {
         }
         cv_core::stream::stopped(text.try_for_each_chunk(resolver, PIECE_BYTES, |part| {
             check()?;
-            self.matcher.feed_bytes(part.as_bytes());
+            self.feed(part.as_bytes());
             if self.matcher.done() {
                 Err(cv_core::stream::Stop.into())
             } else {
@@ -1150,12 +1186,14 @@ impl Searchable for VerifyStreamAdapter<'_> {
         }
         struct Writer<'a, 'b> {
             matcher: &'a mut ExactStreamMatcher,
+            metered: &'a std::cell::Cell<u64>,
             check: &'a mut (dyn FnMut() -> Result<()> + 'b),
         }
         impl std::io::Write for Writer<'_, '_> {
             fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
                 (self.check)().map_err(std::io::Error::other)?;
-                self.matcher.feed_bytes(bytes);
+                let accepted = self.matcher.feed_bytes(bytes);
+                self.metered.set(self.metered.get().saturating_add(accepted));
                 Ok(bytes.len())
             }
             fn flush(&mut self) -> std::io::Result<()> {
@@ -1164,6 +1202,7 @@ impl Searchable for VerifyStreamAdapter<'_> {
         }
         json.write_canonical(&mut Writer {
             matcher: self.matcher,
+            metered: self.metered,
             check,
         })
     }
@@ -1175,7 +1214,7 @@ impl Searchable for VerifyStreamAdapter<'_> {
         if let Some(path) = block.persisted_output_path() {
             self.dependencies.record(Path::new(path));
             let read = cv_core::lazy::read_pieces_checked(Path::new(path), PIECE_BYTES, |piece| {
-                self.matcher.feed_bytes(piece.as_bytes());
+                self.feed(piece.as_bytes());
                 if self.matcher.done() {
                     Err(cv_core::stream::Stop.into())
                 } else {
@@ -1191,7 +1230,7 @@ impl Searchable for VerifyStreamAdapter<'_> {
                 cv_core::lazy::PersistedHead::Unreadable(reason) => {
                     anyhow::bail!("reading persisted output {path}: {reason}")
                 }
-                cv_core::lazy::PersistedHead::Text(_) => self.matcher.feed_bytes(b"\n"),
+                cv_core::lazy::PersistedHead::Text(_) => self.feed(b"\n"),
                 cv_core::lazy::PersistedHead::Absent => {}
             }
         }
@@ -1305,28 +1344,26 @@ impl MessageSink for VerifySink {
                 self.context.as_mut()
             };
             if let Some(matcher) = target {
-                let before_tail = matcher.tail_at + matcher.tail.len() as u64;
                 let limit = self.meter_limit;
-                let metered = &mut self.metered_bytes;
-                let over = &mut self.over_budget;
+                let metered_cell = std::cell::Cell::new(self.metered_bytes);
+                let over_cell = std::cell::Cell::new(self.over_budget);
                 let mut adapter = VerifyStreamAdapter {
                     matcher,
                     primary_path: &self.primary_path,
                     dependencies: &mut self.dependencies,
+                    metered: &metered_cell,
                 };
                 let res = cv_core::projection::searchable(&m.content, &r, &mut adapter, &mut || {
                     if let Some(max_b) = limit {
-                        if *metered > max_b {
-                            *over = true;
+                        if metered_cell.get() > max_b {
+                            over_cell.set(true);
                             anyhow::bail!("over trigram live-read budget");
                         }
                     }
                     Ok(())
                 });
-                let after_tail = matcher.tail_at + matcher.tail.len() as u64;
-                self.metered_bytes = self
-                    .metered_bytes
-                    .saturating_add(after_tail.saturating_sub(before_tail));
+                self.metered_bytes = metered_cell.get();
+                self.over_budget |= over_cell.get();
                 if let Some(max_b) = self.meter_limit {
                     if self.metered_bytes > max_b {
                         self.over_budget = true;
@@ -1363,6 +1400,12 @@ struct VerifiedMatch {
     metered_bytes: u64,
 }
 
+enum VerifyOutcome {
+    Matched(VerifiedMatch),
+    NoMatch { metered_bytes: u64 },
+    Stale,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn verify_session_exact(
     r: &cv_core::SessionRef,
@@ -1373,15 +1416,16 @@ fn verify_session_exact(
     scope: Scope,
     case_sensitive: bool,
     meter_limit: Option<u64>,
-    probe: &mut cv_core::source::Probe,
-) -> Result<Option<VerifiedMatch>> {
+    _probe: &mut cv_core::source::Probe,
+) -> Result<VerifyOutcome> {
     let Some(adapter) = cv_core::harness::for_harness(r.harness) else {
-        return Ok(None);
+        return Ok(VerifyOutcome::NoMatch { metered_bytes: 0 });
     };
-    let before = probe.snapshot(r);
     if let Some(expected) = expected_baseline {
-        if !expected.fresh(&before, probe) && !expected.rows_fresh(r, &before, probe) {
-            return Ok(None);
+        let mut pre_probe = cv_core::source::Probe::default();
+        let before = pre_probe.snapshot(r);
+        if !expected.fresh(&before, &mut pre_probe) && !expected.rows_fresh(r, &before, &mut pre_probe) {
+            return Ok(VerifyOutcome::Stale);
         }
     }
 
@@ -1400,16 +1444,19 @@ fn verify_session_exact(
     }
 
     if let Some(expected) = expected_baseline {
-        let after = probe.snapshot(r);
-        if !expected.fresh(&after, probe) && !expected.rows_fresh(r, &after, probe) {
-            return Ok(None);
+        let mut post_probe = cv_core::source::Probe::default();
+        let after = post_probe.snapshot(r);
+        if !expected.fresh(&after, &mut post_probe) && !expected.rows_fresh(r, &after, &mut post_probe) {
+            return Ok(VerifyOutcome::Stale);
         }
     }
 
     let resolved_cwd = sink.cwd.or_else(|| session_meta.cwd.map(|p| p.display().to_string()));
     if let Some(cwd_sub) = required_cwd {
         if !resolved_cwd.as_deref().is_some_and(|c| c.contains(cwd_sub)) {
-            return Ok(None);
+            return Ok(VerifyOutcome::NoMatch {
+                metered_bytes: sink.metered_bytes,
+            });
         }
     }
     let created_at = r.created_at.or(session_meta.created_at).map(|t| t.timestamp());
@@ -1434,7 +1481,7 @@ fn verify_session_exact(
         .or_else(|| sink.context.as_mut().and_then(ExactStreamMatcher::finish));
 
     if let Some(ex) = body_excerpt {
-        return Ok(Some(VerifiedMatch {
+        return Ok(VerifyOutcome::Matched(VerifiedMatch {
             title,
             cwd: resolved_cwd,
             created_at,
@@ -1448,7 +1495,7 @@ fn verify_session_exact(
         let mut title_matcher = ExactStreamMatcher::new(needle, case_sensitive);
         title_matcher.feed_bytes(title.as_bytes());
         if let Some(ex) = title_matcher.finish() {
-            return Ok(Some(VerifiedMatch {
+            return Ok(VerifyOutcome::Matched(VerifiedMatch {
                 snippet: snippet(&ex.text, ex.at, ex.len),
                 title,
                 cwd: resolved_cwd,
@@ -1459,7 +1506,9 @@ fn verify_session_exact(
         }
     }
 
-    Ok(None)
+    Ok(VerifyOutcome::NoMatch {
+        metered_bytes: sink.metered_bytes,
+    })
 }
 
 // ---- Discovery, Folding & Synchronization ----------------------------------------------------
@@ -1994,13 +2043,13 @@ pub fn search(
     let mut verified_docs = 0usize;
 
     // 2. Live tail verification for stale/unindexed sessions within `opts.live` budget.
+    let mut remaining = match opts.live {
+        LiveRead::All => u64::MAX,
+        LiveRead::Within(budget, _) => budget,
+        LiveRead::Frozen => 0,
+    };
     if opts.live != LiveRead::Frozen && !stale_refs.is_empty() {
         stale_refs.sort_by_key(|(r, _, mtime, _)| std::cmp::Reverse((*mtime, r.updated_at)));
-        let mut remaining = match opts.live {
-            LiveRead::All => u64::MAX,
-            LiveRead::Within(budget, _) => budget,
-            LiveRead::Frozen => 0,
-        };
         for (mut r, prov, _, known_cost) in stale_refs {
             let is_folded = prov.parent_id.is_some();
             match known_cost {
@@ -2022,7 +2071,7 @@ pub fn search(
                         None,
                         &mut probe,
                     ) {
-                        Ok(Some(m)) => {
+                        Ok(VerifyOutcome::Matched(m)) => {
                             remaining -= cost;
                             suffix.read += 1;
                             suffix.bytes += cost;
@@ -2044,7 +2093,7 @@ pub fn search(
                                 session: (!is_folded).then_some(r),
                             });
                         }
-                        Ok(None) => {
+                        Ok(VerifyOutcome::NoMatch { .. }) | Ok(VerifyOutcome::Stale) => {
                             remaining -= cost;
                             suffix.read += 1;
                             suffix.bytes += cost;
@@ -2068,7 +2117,7 @@ pub fn search(
                         (opts.live != LiveRead::All).then_some(remaining),
                         &mut probe,
                     ) {
-                        Ok(Some(m)) => {
+                        Ok(VerifyOutcome::Matched(m)) => {
                             let spent = m.metered_bytes.min(remaining);
                             remaining -= spent;
                             suffix.read += 1;
@@ -2091,7 +2140,13 @@ pub fn search(
                                 session: (!is_folded).then_some(r),
                             });
                         }
-                        Ok(None) => {
+                        Ok(VerifyOutcome::NoMatch { metered_bytes }) => {
+                            let spent = metered_bytes.min(remaining);
+                            remaining -= spent;
+                            suffix.read += 1;
+                            suffix.bytes += spent;
+                        }
+                        Ok(VerifyOutcome::Stale) => {
                             suffix.read += 1;
                         }
                         Err(e) => {
@@ -2112,6 +2167,8 @@ pub fn search(
     //    compactor swapped `manifest.json` and unlinked an older `.trg` segment mid-scan).
     let live_hits_len = hits.len();
     let live_verified_docs = verified_docs;
+    let live_suffix = suffix.clone();
+    let live_remaining = remaining;
     for attempt in 0..2 {
         let seg_res = (|| -> Result<()> {
             if let Some(ref mf) = manifest {
@@ -2157,7 +2214,7 @@ pub fn search(
                             continue;
                         };
                         verified_docs += 1;
-                        if let Ok(Some(m)) = verify_session_exact(
+                        match verify_session_exact(
                             &doc_ref,
                             Some(&meta.title),
                             None,
@@ -2168,20 +2225,101 @@ pub fn search(
                             None,
                             &mut probe,
                         ) {
-                            hits.push(Hit {
-                                id: meta.id.clone(),
-                                harness: meta.harness.clone(),
-                                cwd: meta.cwd.clone(),
-                                title: Some(m.title),
-                                score: 1.0,
-                                snippet: m.snippet,
-                                created_at: meta.created_at,
-                                updated_at: meta.updated_at,
-                                parent_id: meta.parent_id.clone(),
-                                agent_id: meta.agent_id.clone(),
-                                workflow: meta.workflow.clone(),
-                                session: None,
-                            });
+                            Ok(VerifyOutcome::Matched(m)) => {
+                                hits.push(Hit {
+                                    id: meta.id.clone(),
+                                    harness: meta.harness.clone(),
+                                    cwd: meta.cwd.clone(),
+                                    title: Some(m.title),
+                                    score: 1.0,
+                                    snippet: m.snippet,
+                                    created_at: meta.created_at,
+                                    updated_at: meta.updated_at,
+                                    parent_id: meta.parent_id.clone(),
+                                    agent_id: meta.agent_id.clone(),
+                                    workflow: meta.workflow.clone(),
+                                    session: None,
+                                });
+                            }
+                            Ok(VerifyOutcome::Stale) => {
+                                // Session mutated between step 1 baseline check and step 3 segment
+                                // verification: fall back to live verification under `opts.live`
+                                // instead of silently dropping it from results!
+                                suffix.stale += 1;
+                                let mut live_probe = cv_core::source::Probe::default();
+                                let live_snap = live_probe.snapshot(&doc_ref);
+                                if live_snap.primary.is_none() {
+                                    // Deleted mid-scan: neither live nor cut.
+                                } else if opts.live == LiveRead::Frozen {
+                                    suffix.cut += 1;
+                                } else {
+                                    let known_cost = cv_core::harness::for_harness(doc_ref.harness).and_then(|ad| {
+                                        if ad.sqlite_source(&doc_ref) == Some(true) {
+                                            None
+                                        } else {
+                                            Some(live_snap.primary_len())
+                                        }
+                                    });
+                                    if let Some(cost) = known_cost.filter(|&c| c > remaining) {
+                                        suffix.cut += 1;
+                                        suffix.cut_bytes += cost;
+                                    } else {
+                                        match verify_session_exact(
+                                            &doc_ref,
+                                            None,
+                                            opts.filter.cwd,
+                                            None,
+                                            query,
+                                            opts.filter.scope,
+                                            opts.case_sensitive,
+                                            known_cost
+                                                .is_none()
+                                                .then(|| (opts.live != LiveRead::All).then_some(remaining))
+                                                .flatten(),
+                                            &mut live_probe,
+                                        ) {
+                                            Ok(VerifyOutcome::Matched(m)) => {
+                                                let spent = known_cost.unwrap_or(m.metered_bytes).min(remaining);
+                                                remaining -= spent;
+                                                suffix.read += 1;
+                                                suffix.bytes += spent;
+                                                hits.push(Hit {
+                                                    id: meta.id.clone(),
+                                                    harness: meta.harness.clone(),
+                                                    cwd: m.cwd.or_else(|| meta.cwd.clone()),
+                                                    title: Some(m.title),
+                                                    score: 1.0,
+                                                    snippet: m.snippet,
+                                                    created_at: m.created_at.or(meta.created_at),
+                                                    updated_at: m.updated_at.or(meta.updated_at),
+                                                    parent_id: meta.parent_id.clone(),
+                                                    agent_id: meta.agent_id.clone(),
+                                                    workflow: meta.workflow.clone(),
+                                                    session: (meta.parent_id.is_none()).then_some(doc_ref),
+                                                });
+                                            }
+                                            Ok(VerifyOutcome::NoMatch { metered_bytes }) => {
+                                                let spent = known_cost.unwrap_or(metered_bytes).min(remaining);
+                                                remaining -= spent;
+                                                suffix.read += 1;
+                                                suffix.bytes += spent;
+                                            }
+                                            Ok(VerifyOutcome::Stale) => {
+                                                suffix.read += 1;
+                                            }
+                                            Err(e) => {
+                                                if let Some(rest) = e.to_string().strip_prefix("over_budget:") {
+                                                    suffix.cut += 1;
+                                                    suffix.cut_bytes += rest.parse::<u64>().unwrap_or(0);
+                                                } else {
+                                                    suffix.failed += 1;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(VerifyOutcome::NoMatch { .. }) | Err(_) => {}
                         }
                     }
                 }
@@ -2194,6 +2332,8 @@ pub fn search(
                 hits.truncate(live_hits_len);
                 candidate_docs = 0;
                 verified_docs = live_verified_docs;
+                suffix = live_suffix.clone();
+                remaining = live_remaining;
                 manifest = Manifest::load(dir)?;
             }
             Err(err) => return Err(err),
@@ -3177,5 +3317,162 @@ mod tests {
         )
         .unwrap();
         assert_eq!(res.hits.len(), 2);
+    }
+
+    #[test]
+    fn trigram_rejects_overflow_deleted_ords_debits_nonmatching_sqlite_live_bytes_and_recovers_mid_scan_stale() {
+        use cv_core::Adapter as _;
+        let tmp = ScratchDir::new();
+        let home = tmp.path().join("cv-home");
+        std::fs::create_dir_all(&home).unwrap();
+        let _env = cv_core::env::Env::from_vars([
+            ("CLUSTERVISION_HOME", home.to_str().unwrap()),
+            ("CLUSTERVISION_CACHE", home.to_str().unwrap()),
+        ])
+        .enter();
+
+        // 1. Overflow `deleted_ords` (`u32::MAX`) cannot panic in `deleted_slot_bitmap` or `Manifest::load`.
+        let forged_seg = SegmentEntry {
+            file: "seg-0.trg".into(),
+            num_sessions: u32::MAX,
+            deleted_ords: vec![u32::MAX, u32::MAX - 1],
+        };
+        assert!(forged_seg.deleted_slot_bitmap().is_empty());
+
+        let bad_idx = tmp.path().join("bad-manifest-idx");
+        std::fs::create_dir_all(&bad_idx).unwrap();
+        let bad_manifest = serde_json::json!({
+            "version": MANIFEST_VERSION,
+            "interpretation_version": cv_core::source::VERSION,
+            "has_subagents": false,
+            "segments": [{
+                "file": "seg-0.trg",
+                "num_sessions": u32::MAX,
+                "deleted_ords": [u32::MAX]
+            }],
+            "sessions": {}
+        });
+        std::fs::write(
+            bad_idx.join("manifest.json"),
+            serde_json::to_vec(&bad_manifest).unwrap(),
+        )
+        .unwrap();
+        assert!(Manifest::load(&bad_idx).is_err());
+
+        // 2. Metered SQLite `--live-bytes` debits non-matching sessions (`NoMatch`) so budget is enforced!
+        let db_path = tmp.path().join("hermes-live.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, started_at REAL, ended_at REAL, title TEXT);
+             CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, role TEXT, content TEXT, tool_call_id TEXT, tool_calls TEXT, tool_name TEXT, timestamp REAL);",
+        )
+        .unwrap();
+        let large_miss = "x".repeat(4_000);
+        conn.execute(
+            "INSERT INTO sessions(id, started_at, ended_at, title) VALUES ('s-miss', 100.0, 200.0, 'Miss')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages(session_id, role, content, timestamp) VALUES ('s-miss', 'user', ?1, 200.0)",
+            [&large_miss],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions(id, started_at, ended_at, title) VALUES ('s-older', 90.0, 100.0, 'Older')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages(session_id, role, content, timestamp) VALUES ('s-older', 'user', ?1, 100.0)",
+            [&format!(" MeteredNeedle::target {}", "y".repeat(4_000))],
+        )
+        .unwrap();
+        drop(conn);
+
+        let hermes = cv_core::harness::hermes::Hermes::with_db(db_path);
+        let h_refs = hermes.discover().unwrap().refs;
+        assert_eq!(h_refs.len(), 2);
+
+        let sql_idx = tmp.path().join("sql-trigram");
+        let budgeted = search(
+            &sql_idx,
+            "MeteredNeedle::target",
+            TrigramOptions {
+                live: LiveRead::Within(5_000, crate::fts::Budget::Flag),
+                ..Default::default()
+            },
+            &h_refs,
+            None,
+        )
+        .unwrap();
+        assert!(
+            budgeted.suffix.bytes >= 4_000,
+            "non-matching metered SQLite session must debit suffix.bytes, got {:?}",
+            budgeted.suffix
+        );
+        assert_eq!(
+            budgeted.suffix.cut, 1,
+            "after non-matching 4KB session debits a 5KB budget, second 4KB SQLite session must be cut: {:?}",
+            budgeted.suffix
+        );
+
+        // 3. Segment TOCTOU: when an indexed session's file mutates without `refs` flagging it in step 1
+        //    (e.g. `refs` is empty on daemon/cached search after indexing), step 3 detects `Stale` and
+        //    falls back to live verification instead of silently dropping the hit!
+        let mut_path = tmp.path().join("mutated.jsonl");
+        let mut_ref = write_claude_jsonl(
+            &mut_path,
+            "mut-1",
+            "/repo/toctou",
+            &[json!({
+                "type": "user",
+                "sessionId": "mut-1",
+                "cwd": "/repo/toctou",
+                "uuid": "u1",
+                "message": { "role": "user", "content": "ToctouNeedle::survives" }
+            })],
+        );
+        let toctou_idx = tmp.path().join("toctou-trigram");
+        sync_sessions(&toctou_idx, std::slice::from_ref(&mut_ref), false, false).unwrap();
+
+        // Append a new turn AFTER indexing, then search with `&[]` (`refs` empty, as when searching
+        // without re-running full discovery) so step 3 itself observes `VerifyOutcome::Stale`.
+        write_claude_jsonl(
+            &mut_path,
+            "mut-1",
+            "/repo/toctou",
+            &[
+                json!({
+                    "type": "user",
+                    "sessionId": "mut-1",
+                    "cwd": "/repo/toctou",
+                    "uuid": "u1",
+                    "message": { "role": "user", "content": "ToctouNeedle::survives" }
+                }),
+                json!({
+                    "type": "assistant",
+                    "sessionId": "mut-1",
+                    "cwd": "/repo/toctou",
+                    "uuid": "u2",
+                    "message": { "role": "assistant", "content": "appended after sync" }
+                }),
+            ],
+        );
+        let toctou_res = search(
+            &toctou_idx,
+            "ToctouNeedle::survives",
+            TrigramOptions::default(),
+            &[],
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            toctou_res.hits.len(),
+            1,
+            "stale segment entry must fall back to live read, not vanish"
+        );
+        assert_eq!(toctou_res.suffix.stale, 1);
+        assert_eq!(toctou_res.suffix.read, 1);
     }
 }

@@ -3096,17 +3096,42 @@ fn query_index(dir: &Path) -> Result<(Index, Fields, tantivy::Searcher)> {
         anyhow::bail!("no full-text index at {}; build it with `cv index`", dir.display());
     }
     // Read-only open: a transient failure here must surface as an error, never as a wiped index.
+    // Retry once after a brief backoff if a concurrent writer swapped `meta.json` and GC'd an old
+    // segment file mid-open before `index.reader()` registered its snapshot.
     let unusable = || {
         format!(
             "the full-text index at {} is unusable; rebuild it with `cv index`",
             dir.display()
         )
     };
-    let (index, f) = open_existing(dir).with_context(unusable)?;
-    let reader = index.reader().with_context(unusable)?;
+    let try_open = || -> Result<(Index, Fields, tantivy::IndexReader)> {
+        let (index, f) = open_existing(dir)?;
+        let reader = index.reader()?;
+        Ok((index, f, reader))
+    };
+    let (index, f, reader) = match try_open() {
+        Ok(opened) => opened,
+        Err(err) if is_transient_open_race(&err) => {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            try_open().with_context(unusable)?
+        }
+        Err(err) => return Err(err).with_context(unusable),
+    };
     let searcher = reader.searcher();
 
     Ok((index, f, searcher))
+}
+
+fn is_transient_open_race(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|ioe| ioe.kind() == std::io::ErrorKind::NotFound)
+            || {
+                let msg = cause.to_string();
+                msg.contains("FileDoesNotExist") || msg.contains("No such file or directory")
+            }
+    })
 }
 
 pub(crate) fn search_with_snippets(
