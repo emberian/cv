@@ -8,6 +8,10 @@
 - Zip ingest isolates staged errors, strips `.zst` UTF-8-safely, and rejects corrupt SQLite; `cv serve` blocks `<short>.<domain>` DNS rebinding and batches `/api/sessions` probes.
 - Trigram `--exact` search meters streamed SQLite `--live-bytes`, re-validates stale segment hits live, bounds `deleted_ords`, and retries FTS opens during segment GC.
 - `cv splice --export json` sends its banner to stderr, `cv adopt` accepts `claude:<id>` selectors, and WASM `distill` rejects oversized 32-bit option bounds.
+- Hub replication locks pack uploads case-insensitively, requires durable ingest fsyncs, bounds HTTP responses, encodes SQLite URIs, hardens `config.toml` to 0600, and reconciles watch baselines.
+- Case-insensitive search folds Greek `Final_Sigma` across chunks, debits failed live reads, wakes `fts::pass_needed` on derived drift, caps aggregate Zstandard decompression, and chunks segment compactions.
+- Emitters and companion lookups reject path-traversal IDs, Hermes emit respects `--force`, Grok cleans stale `updates.jsonl`, token sums guard overflow, and Cursor counts malformed bubbles.
+- `--frozen` refuses `dataset --file`, `task show --json --events` and `workflow --json` keep stdout JSON pure, ambiguous API IDs return 400, and wasm re-drops refresh.
 
 ## 0.19.0 — 2026-11-12 — sealed custody, exact search, and the SQLite state spine
 ClusterVision 0.19.0 unifies mutable coordination state in `state.db` (SQLite WAL), replaces loose
