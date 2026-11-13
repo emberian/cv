@@ -560,23 +560,29 @@ fn is_legacy_entry_unchanged(
     source_mtime_ns: Option<i128>,
     prev: &ArchivedSessionEntry,
 ) -> bool {
-    let self_contained_file = matches!(
-        r.harness,
-        Harness::Codex | Harness::Qwen | Harness::Continue | Harness::LmStudio | Harness::OpenSession
-    ) && is_non_sqlite_path(&r.path)
-        && std::fs::metadata(&r.path).is_ok_and(|m| m.is_file());
-    let has_companions = matches!(
-        r.harness,
+    let (self_contained_file_kind, has_companions) = match r.harness {
+        Harness::Codex | Harness::Qwen | Harness::Continue | Harness::LmStudio | Harness::OpenSession => (true, false),
         Harness::Claude
-            | Harness::Antigravity
-            | Harness::OpenCode
-            | Harness::Kimi
-            | Harness::KimiCode
-            | Harness::Grok
-            | Harness::Cline
-            | Harness::Roo
-            | Harness::Gemini
-    );
+        | Harness::Antigravity
+        | Harness::OpenCode
+        | Harness::Kimi
+        | Harness::KimiCode
+        | Harness::Grok
+        | Harness::Cline
+        | Harness::Roo
+        | Harness::Gemini => (false, true),
+        Harness::Hermes
+        | Harness::OpenClaw
+        | Harness::Cursor
+        | Harness::Goose
+        | Harness::Zed
+        | Harness::Devin
+        | Harness::ChatGptExport
+        | Harness::ClaudeExport => (false, false),
+    };
+    let self_contained_file = self_contained_file_kind
+        && is_non_sqlite_path(&r.path)
+        && std::fs::metadata(&r.path).is_ok_and(|m| m.is_file());
     let sqlite_primary = !is_non_sqlite_path(primary);
     let stat_unchanged = self_contained_file
         && source_len.is_some()

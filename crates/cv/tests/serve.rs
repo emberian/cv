@@ -2468,16 +2468,32 @@ fn serve_api_search_exact_and_non_loopback_host_rebinding_guard() {
     }
 
     for bad_host in ["rebind.attacker.example", &format!("evil.com:{port}")] {
-        let resp = raw_request(
+        // Browser DNS-rebinding paths (unauthenticated, `?token=`, `OPTIONS`, and HTML pages even
+        // with `Authorization: Bearer`) are rejected `403`, while non-browser `/api/*` callers
+        // presenting a valid `Authorization: Bearer` header may traverse reverse-proxy aliases.
+        for (method, url, headers) in [
+            ("GET", "/api/health", &[][..]),
+            ("GET", "/api/health?token=lan-tok", &[][..]),
+            ("OPTIONS", "/api/health", &[("Authorization", "Bearer lan-tok")][..]),
+            ("GET", "/inbox", &[("Authorization", "Bearer lan-tok")][..]),
+        ] {
+            let resp = raw_request(port, method, url, &[&[("Host", bad_host)][..], headers].concat());
+            assert_eq!(
+                raw_status(&resp),
+                403,
+                "DNS-rebind {method} {url} on host {bad_host} must be rejected:\n{resp}"
+            );
+        }
+        let bearer_api = raw_request(
             port,
             "GET",
             "/api/health",
             &[("Host", bad_host), ("Authorization", "Bearer lan-tok")],
         );
         assert_eq!(
-            raw_status(&resp),
-            403,
-            "DNS-rebind host {bad_host} must be rejected:\n{resp}"
+            raw_status(&bearer_api),
+            200,
+            "valid header-Bearer /api/* proxy alias {bad_host} must pass:\n{bearer_api}"
         );
     }
 }

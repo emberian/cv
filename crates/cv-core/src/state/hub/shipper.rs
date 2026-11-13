@@ -1770,8 +1770,35 @@ harnesses = ["claude"]
         let srv = std::thread::spawn(move || {
             for i in 0..2 {
                 let (mut sock, _) = listener.accept().unwrap();
+                let mut req = Vec::new();
                 let mut buf = [0u8; 4096];
-                let _ = std::io::Read::read(&mut sock, &mut buf);
+                let header_end = loop {
+                    let n = std::io::Read::read(&mut sock, &mut buf).unwrap();
+                    if n == 0 {
+                        break req.len();
+                    }
+                    req.extend_from_slice(&buf[..n]);
+                    if let Some(pos) = req.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                let content_len = String::from_utf8_lossy(&req[..header_end])
+                    .lines()
+                    .find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.trim()
+                            .eq_ignore_ascii_case("content-length")
+                            .then(|| v.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                while req.len() < header_end + content_len {
+                    let n = std::io::Read::read(&mut sock, &mut buf).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    req.extend_from_slice(&buf[..n]);
+                }
                 let body = if i == 0 {
                     serde_json::to_vec(&json!({
                         "producer": {
@@ -1796,11 +1823,13 @@ harnesses = ["claude"]
                     .unwrap()
                 };
                 let head = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     body.len()
                 );
                 sock.write_all(head.as_bytes()).unwrap();
                 sock.write_all(&body).unwrap();
+                sock.flush().unwrap();
+                let _ = sock.shutdown(std::net::Shutdown::Write);
             }
         });
 

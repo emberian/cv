@@ -1012,6 +1012,20 @@ tags = ["team-share"]
     let hub_packs_dir = hub_w.cv_home.join("hub/packs");
     for entry in fs::read_dir(&hub_packs_dir).unwrap() {
         let path = entry.unwrap().path();
+        if path.is_dir() {
+            for sub in fs::read_dir(&path).unwrap() {
+                let sub_path = sub.unwrap().path();
+                if sub_path.is_file() {
+                    let label = format!(
+                        "{}/{}",
+                        path.file_name().unwrap().to_string_lossy(),
+                        sub_path.file_name().unwrap().to_string_lossy()
+                    );
+                    hub_corpora.push((label, fs::read(&sub_path).unwrap()));
+                }
+            }
+            continue;
+        }
         let fname = path.file_name().unwrap().to_string_lossy().into_owned();
         hub_corpora.push((fname.clone(), fs::read(&path).unwrap()));
         if let Some(pack_id) = fname.strip_suffix(".pack.idx.json") {
