@@ -113,8 +113,9 @@ cv serve on http://127.0.0.1:54573 — inbox at /, API at /api/* (no --web)
     (if any), else `403` before the store is touched.
   - **Non-loopback binds need a token or `--insecure-expose`**, and warn either way.
 
-  Only `GET` is served, plus `POST` on the inbox write routes; anything else is `405`. Responses
-  are JSON except the event feed and export downloads.
+  Read routes use `GET`; inbox mutations and hub enrollment/ingest use `POST`, and hub pack
+  upload also accepts `PUT`. Unsupported methods return `405`. Responses are JSON except
+  pages, static files, the event feed, and export downloads.
 
 ### Routes
 
