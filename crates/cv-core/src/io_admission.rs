@@ -539,9 +539,9 @@ fn detect_unix_device_class(path: &Path, dev: DeviceId) -> DeviceClass {
         }
     }
     if dev.0 != 0 {
-        // SAFETY: pure bit extraction macros for Linux `dev_t`.
-        let major = unsafe { libc::major(dev.0 as libc::dev_t) };
-        let minor = unsafe { libc::minor(dev.0 as libc::dev_t) };
+        // Linux device-number helpers only extract bits and are safe functions.
+        let major = libc::major(dev.0 as libc::dev_t);
+        let minor = libc::minor(dev.0 as libc::dev_t);
         let sys_path = format!("/sys/dev/block/{major}:{minor}/queue/rotational");
         if let Ok(rot) = std::fs::read_to_string(sys_path) {
             return match rot.trim() {
