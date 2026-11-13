@@ -203,9 +203,27 @@ impl StateStore {
         let mut conn = Connection::open(&self.db_path)?;
         set_restrictive_file_mode(&self.db_path);
         conn.busy_timeout(Duration::from_millis(5_000))?;
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap_or_default();
+        if !mode.eq_ignore_ascii_case("wal") {
+            for attempt in 0..20 {
+                match conn.execute_batch("PRAGMA journal_mode = WAL;") {
+                    Ok(()) => break,
+                    Err(rusqlite::Error::SqliteFailure(err, _))
+                        if matches!(
+                            err.code,
+                            rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                        ) && attempt < 19 =>
+                    {
+                        std::thread::sleep(Duration::from_millis(5 * (attempt + 1)));
+                    }
+                    Err(e) => return Err(StateError::Sqlite(e)),
+                }
+            }
+        }
         conn.execute_batch(
-            "PRAGMA journal_mode = WAL;
-             PRAGMA synchronous = FULL;
+            "PRAGMA synchronous = FULL;
              PRAGMA foreign_keys = ON;",
         )?;
         schema::ensure_migrated(&mut conn)?;

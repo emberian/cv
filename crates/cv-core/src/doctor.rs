@@ -1086,34 +1086,41 @@ pub fn collect_store_health() -> StoreHealthReport {
         },
     };
 
-    // 2. Rebuildable `catalog.db` + writer versions
-    let writer_versions: Vec<WriterVersionHealth> = crate::catalog::writer_versions()
-        .into_iter()
-        .map(|o| {
-            let newer = o
-                .newest
-                .as_deref()
-                .and_then(|v| crate::writer_version::compare(v, o.verified))
-                == Some(std::cmp::Ordering::Greater);
-            WriterVersionHealth {
-                harness: o.harness.to_string(),
-                verified: o.verified.to_string(),
-                newest: o.newest,
-                sessions: o.sessions,
-                unknown: o.unknown,
-                newer_than_verified: newer,
-            }
-        })
-        .collect();
+    // 2. Rebuildable `catalog.db` + writer versions (strictly read-only: never opens `catalog::open()`,
+    //    so an absent `catalog.db` is never created and an older-schema `catalog.db` is never wiped!).
+    let to_wv_health = |obs: Vec<crate::writer_version::Observed>| -> Vec<WriterVersionHealth> {
+        obs.into_iter()
+            .map(|o| {
+                let newer = o
+                    .newest
+                    .as_deref()
+                    .and_then(|v| crate::writer_version::compare(v, o.verified))
+                    == Some(std::cmp::Ordering::Greater);
+                WriterVersionHealth {
+                    harness: o.harness.to_string(),
+                    verified: o.verified.to_string(),
+                    newest: o.newest,
+                    sessions: o.sessions,
+                    unknown: o.unknown,
+                    newer_than_verified: newer,
+                }
+            })
+            .collect()
+    };
 
     let cat_path = cv_cache.as_ref().map(|d| d.join("catalog.db"));
+    let mut raw_skipped: Vec<(crate::Harness, crate::Skipped)> = Vec::new();
     let catalog_db = match cat_path {
         Some(path) => {
             let bytes = file_len_or_zero(&path);
             let wal_bytes = file_len_or_zero(&wal_sidecar(&path));
             let exists = path.is_file();
-            let (quick_check, session_rows) = if !exists || bytes == 0 {
-                ("absent".to_string(), 0)
+            let (quick_check, session_rows, writer_versions) = if !exists || bytes == 0 {
+                (
+                    "absent".to_string(),
+                    0,
+                    to_wv_health(crate::catalog::writer_versions_ro(None)),
+                )
             } else {
                 match crate::harness::store::sqlite::open_ro(&path) {
                     Ok(reader) => match reader.read_snapshot(|conn, _reads| {
@@ -1122,12 +1129,25 @@ pub fn collect_store_health() -> StoreHealthReport {
                             .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get::<_, i64>(0))
                             .map(|n| n.max(0) as u64)
                             .unwrap_or(0);
-                        Ok((qc, rows))
+                        let wv = crate::catalog::writer_versions_ro(Some(conn));
+                        let sk = crate::catalog::skipped_sources_ro(Some(conn));
+                        Ok((qc, rows, to_wv_health(wv), sk))
                     }) {
-                        Ok(pair) => pair,
-                        Err(e) => (format!("error: {e}"), 0),
+                        Ok((qc, rows, wv, sk)) => {
+                            raw_skipped = sk;
+                            (qc, rows, wv)
+                        }
+                        Err(e) => (
+                            format!("error: {e}"),
+                            0,
+                            to_wv_health(crate::catalog::writer_versions_ro(None)),
+                        ),
                     },
-                    Err(e) => (format!("error: {e}"), 0),
+                    Err(e) => (
+                        format!("error: {e}"),
+                        0,
+                        to_wv_health(crate::catalog::writer_versions_ro(None)),
+                    ),
                 }
             };
             CatalogDbHealth {
@@ -1147,7 +1167,7 @@ pub fn collect_store_health() -> StoreHealthReport {
             bytes: 0,
             wal_bytes: 0,
             session_rows: 0,
-            writer_versions,
+            writer_versions: to_wv_health(crate::catalog::writer_versions_ro(None)),
         },
     };
 
@@ -1187,8 +1207,8 @@ pub fn collect_store_health() -> StoreHealthReport {
         }
     };
 
-    // 5. Skipped unreadable harness sources
-    let skipped_sources = crate::catalog::skipped_sources()
+    // 5. Skipped unreadable harness sources (read from the same read-only `catalog.db` snapshot)
+    let skipped_sources = raw_skipped
         .into_iter()
         .map(|(h, s)| SkippedSourceHealth {
             harness: h.as_str().to_string(),
@@ -1640,5 +1660,56 @@ mod tests {
         assert_eq!(aw.tool_results, 0);
         assert_eq!(aw.current_context_tokens, Some(12_000));
         assert_eq!(aw.peak_context_tokens, 12_000);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn collect_store_health_is_strictly_read_only_on_missing_and_older_catalog_db() {
+        let world = crate::test_world("doctor-store-ro");
+        let cache_dir = world.base.join("cv-cache");
+        let _env = crate::env::Env::from_vars([
+            ("CLUSTERVISION_HOME", world.cv_home.as_os_str()),
+            ("CLUSTERVISION_CACHE", cache_dir.as_os_str()),
+        ])
+        .enter();
+
+        // 1. Cold/absent cache & state: must not create `catalog.db` or `state.db`!
+        let cold = collect_store_health();
+        assert!(!cold.catalog_db.exists);
+        assert!(!cold.state_db.exists);
+        assert!(!cache_dir.join("catalog.db").exists());
+        assert!(!world.cv_home.join("state.db").exists());
+
+        // 2. Older-schema `catalog.db` (`user_version = 1`, older than `source::VERSION`):
+        //    `collect_store_health()` must read `session_rows` & `writer_versions` without wiping it!
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let cat_path = cache_dir.join("catalog.db");
+        {
+            let conn = rusqlite::Connection::open(&cat_path).unwrap();
+            conn.execute_batch(
+                "PRAGMA user_version = 1;
+                 CREATE TABLE sessions(id TEXT, harness TEXT, writer_version TEXT);
+                 INSERT INTO sessions VALUES ('s1', 'claude', '2.1.323'), ('s2', 'claude', '2.1.100');",
+            )
+            .unwrap();
+        }
+        let before_bytes = std::fs::read(&cat_path).unwrap();
+
+        let health = collect_store_health();
+        assert!(health.catalog_db.exists);
+        assert_eq!(health.catalog_db.session_rows, 2);
+        let claude_wv = health
+            .catalog_db
+            .writer_versions
+            .iter()
+            .find(|w| w.harness == "claude")
+            .unwrap();
+        assert_eq!(claude_wv.sessions, 2);
+        assert_eq!(claude_wv.newest.as_deref(), Some("2.1.323"));
+        assert_eq!(
+            std::fs::read(&cat_path).unwrap(),
+            before_bytes,
+            "collect_store_health must never mutate or reset an older catalog.db"
+        );
     }
 }

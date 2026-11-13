@@ -1597,7 +1597,12 @@ mod imp {
     /// The sources the last discovery of each harness found but could not open, by harness and
     /// path: catalog knowledge only, as `cv doctor` shows it. Empty on a catalog without any.
     pub fn skipped_sources() -> Vec<(Harness, crate::Skipped)> {
-        let Some(conn) = open() else { return Vec::new() };
+        let conn = open();
+        skipped_sources_ro(conn.as_ref())
+    }
+
+    pub(crate) fn skipped_sources_ro(conn: Option<&Connection>) -> Vec<(Harness, crate::Skipped)> {
+        let Some(conn) = conn else { return Vec::new() };
         let Ok(mut stmt) = conn.prepare("SELECT harness,path,why FROM skipped_sources ORDER BY harness,path") else {
             return Vec::new();
         };
@@ -1626,8 +1631,15 @@ mod imp {
     /// Catalog knowledge only: no transcript probes or backfill. NULL/empty/unsupported versions
     /// count as unknown; the maximum is historical evidence, not a claim of current source validity.
     pub fn writer_versions() -> Vec<crate::writer_version::Observed> {
+        let conn = open();
+        writer_versions_ro(conn.as_ref())
+    }
+
+    /// Read-only `writer_version` census over an already-opened `catalog.db` snapshot (`None` ->
+    /// empty observations), never creating or resetting `catalog.db`.
+    pub(crate) fn writer_versions_ro(conn: Option<&Connection>) -> Vec<crate::writer_version::Observed> {
         let mut result = crate::writer_version::empty_observations();
-        let Some(conn) = open() else { return result };
+        let Some(conn) = conn else { return result };
         // The roster's names, spelled into the statement: harness names are fixed identifiers.
         let names: Vec<String> = result.iter().map(|o| format!("'{}'", o.harness)).collect();
         let sql = format!(
@@ -3221,7 +3233,7 @@ pub use imp::{
 };
 
 #[cfg(feature = "sqlite")]
-pub(crate) use imp::{note_counted_with_source, populate_subagent_facts};
+pub(crate) use imp::{note_counted_with_source, populate_subagent_facts, skipped_sources_ro, writer_versions_ro};
 
 #[cfg(not(feature = "sqlite"))]
 pub(crate) fn populate_subagent_facts(_r: &SessionRef, _facts: &mut SessionQueryFacts) {}

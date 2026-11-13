@@ -46,6 +46,33 @@ pub fn bare(id: &str) -> &str {
     id.strip_prefix("agent-").unwrap_or(id)
 }
 
+fn legacy_jsonl_path() -> PathBuf {
+    crate::env::Env::current()
+        .cv_home()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("retired.jsonl")
+}
+
+/// Read legacy `$CLUSTERVISION_HOME/retired.jsonl` retirements (from pre-`state.db` installations
+/// or portable builds) without mutating disk.
+fn load_legacy_jsonl() -> HashMap<String, Retirement> {
+    let mut out = HashMap::new();
+    let Ok(text) = std::fs::read_to_string(legacy_jsonl_path()) else {
+        return out;
+    };
+    for mut row in text.lines().filter_map(|l| serde_json::from_str::<Retirement>(l).ok()) {
+        let id = bare(&row.agent_id).to_string();
+        row.agent_id = id.clone();
+        row.successor = row.successor.map(|s| bare(&s).to_string());
+        if row.undone {
+            out.remove(&id);
+        } else {
+            out.insert(id, row);
+        }
+    }
+    out
+}
+
 /// Record `agent` as retired, continued by `successor`. Calling `retire` on an already-retired
 /// agent (for example, replacing `--successor PENDING` once the replacement agent is spawned)
 /// updates its retirement transactionally in place and preserves an existing `session_id` when
@@ -55,6 +82,7 @@ pub fn retire(agent: &str, successor: Option<&str>, session_id: Option<&str>) ->
     if crate::env::frozen() {
         return Err(std::io::Error::other("--frozen forbids writing the retired ledger"));
     }
+    let legacy = load_legacy_jsonl();
     let store = crate::state::StateStore::default_store().map_err(state_to_io)?;
     let mut conn = store.open_writable().map_err(state_to_io)?;
     let tx = conn
@@ -67,14 +95,19 @@ pub fn retire(agent: &str, successor: Option<&str>, session_id: Option<&str>) ->
         Some(s) => Some(s.to_string()),
         None => {
             use rusqlite::OptionalExtension;
-            tx.query_row(
-                "SELECT session_id FROM retired_agents WHERE agent_id = ?1 AND undone = 0",
-                [&agent_id],
-                |r| r.get::<_, Option<String>>(0),
-            )
-            .optional()
-            .map_err(sqlite_to_io)?
-            .flatten()
+            let sqlite_row: Option<(Option<String>, i64)> = tx
+                .query_row(
+                    "SELECT session_id, undone FROM retired_agents WHERE agent_id = ?1",
+                    [&agent_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()
+                .map_err(sqlite_to_io)?;
+            match sqlite_row {
+                Some((sess, 0)) => sess,
+                Some((_, _)) => None,
+                None => legacy.get(&agent_id).and_then(|r| r.session_id.clone()),
+            }
         }
     };
 
@@ -92,7 +125,8 @@ pub fn retire(agent: &str, successor: Option<&str>, session_id: Option<&str>) ->
     )
     .map_err(sqlite_to_io)?;
 
-    let raw = load_raw_from_conn(&tx).map_err(sqlite_to_io)?;
+    let mut raw = legacy;
+    overlay_sqlite_rows(&mut raw, &tx).map_err(sqlite_to_io)?;
     tx.commit().map_err(sqlite_to_io)?;
 
     if let Some(ref succ) = norm_succ {
@@ -130,6 +164,7 @@ pub fn undo(agent: &str) -> std::io::Result<bool> {
     if crate::env::frozen() {
         return Err(std::io::Error::other("--frozen forbids writing the retired ledger"));
     }
+    let legacy = load_legacy_jsonl();
     let store = crate::state::StateStore::default_store().map_err(state_to_io)?;
     let mut conn = store.open_writable().map_err(state_to_io)?;
     let tx = conn
@@ -146,30 +181,56 @@ pub fn undo(agent: &str) -> std::io::Result<bool> {
             rusqlite::params![agent_id, ts_str],
         )
         .map_err(sqlite_to_io)?;
+    if updated > 0 {
+        tx.commit().map_err(sqlite_to_io)?;
+        return Ok(true);
+    }
+
+    use rusqlite::OptionalExtension;
+    let exists_in_sqlite: Option<i64> = tx
+        .query_row("SELECT 1 FROM retired_agents WHERE agent_id = ?1", [agent_id], |r| {
+            r.get(0)
+        })
+        .optional()
+        .map_err(sqlite_to_io)?;
+    if exists_in_sqlite.is_none() && legacy.contains_key(agent_id) {
+        tx.execute(
+            "INSERT INTO retired_agents(agent_id, ts, successor, session_id, undone)
+             VALUES (?1, ?2, NULL, NULL, 1)",
+            rusqlite::params![agent_id, ts_str],
+        )
+        .map_err(sqlite_to_io)?;
+        tx.commit().map_err(sqlite_to_io)?;
+        return Ok(true);
+    }
+
     tx.commit().map_err(sqlite_to_io)?;
-    Ok(updated > 0)
+    Ok(false)
 }
 
 #[cfg(feature = "sqlite")]
 fn raw_current() -> HashMap<String, Retirement> {
+    let mut out = load_legacy_jsonl();
     let Ok(store) = crate::state::StateStore::default_store() else {
-        return HashMap::new();
+        return out;
     };
     let Ok(Some(conn)) = store.open_readonly() else {
-        return HashMap::new();
+        return out;
     };
-    load_raw_from_conn(&conn).unwrap_or_default()
+    let _ = overlay_sqlite_rows(&mut out, &conn);
+    out
 }
 
 #[cfg(feature = "sqlite")]
-fn load_raw_from_conn(conn: &rusqlite::Connection) -> rusqlite::Result<HashMap<String, Retirement>> {
-    let mut stmt = conn.prepare("SELECT agent_id, ts, successor, session_id FROM retired_agents WHERE undone = 0")?;
+fn overlay_sqlite_rows(out: &mut HashMap<String, Retirement>, conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare("SELECT agent_id, ts, successor, session_id, undone FROM retired_agents")?;
     let rows = stmt.query_map([], |r| {
         let agent_id: String = r.get(0)?;
         let ts_raw: String = r.get(1)?;
         let ts = ts_raw
             .parse::<DateTime<Utc>>()
             .unwrap_or_else(|_| DateTime::<Utc>::from_timestamp(0, 0).unwrap());
+        let undone = r.get::<_, i64>(4)? != 0;
         Ok((
             agent_id.clone(),
             Retirement {
@@ -177,15 +238,18 @@ fn load_raw_from_conn(conn: &rusqlite::Connection) -> rusqlite::Result<HashMap<S
                 agent_id,
                 successor: r.get(2)?,
                 session_id: r.get(3)?,
-                undone: false,
+                undone,
             },
         ))
     })?;
-    let mut out = HashMap::new();
-    for row in rows.flatten() {
-        out.insert(row.0, row.1);
+    for (id, row) in rows.flatten() {
+        if row.undone {
+            out.remove(&id);
+        } else {
+            out.insert(id, row);
+        }
     }
-    Ok(out)
+    Ok(())
 }
 
 #[cfg(feature = "sqlite")]
@@ -257,18 +321,7 @@ pub fn undo(agent: &str) -> std::io::Result<bool> {
 
 #[cfg(not(feature = "sqlite"))]
 fn raw_current() -> HashMap<String, Retirement> {
-    let mut out = HashMap::new();
-    let Ok(text) = std::fs::read_to_string(ledger_path()) else {
-        return out;
-    };
-    for row in text.lines().filter_map(|l| serde_json::from_str::<Retirement>(l).ok()) {
-        if row.undone {
-            out.remove(&row.agent_id);
-        } else {
-            out.insert(row.agent_id.clone(), row);
-        }
-    }
-    out
+    load_legacy_jsonl()
 }
 
 /// Every agent retired now, by bare id, with transitive `A -> B -> C` successor chains resolved
@@ -419,5 +472,63 @@ mod tests {
         }
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn legacy_retired_jsonl_coexists_with_sqlite_under_frozen_chain_and_undo() {
+        let world = crate::test_world("retired-legacy-jsonl-upgrade");
+        let jsonl = world.cv_home.join("retired.jsonl");
+        std::fs::write(
+            &jsonl,
+            concat!(
+                "{\"ts\":\"2026-06-01T10:00:00Z\",\"agent_id\":\"agent-leg1\",\"successor\":\"agent-leg2\",\"session_id\":\"root-leg\"}\n",
+                "{\"ts\":\"2026-06-01T10:05:00Z\",\"agent_id\":\"leg-reverted\",\"successor\":\"x\"}\n",
+                "{\"ts\":\"2026-06-01T10:06:00Z\",\"agent_id\":\"leg-reverted\",\"undone\":true}\n",
+            ),
+        )
+        .unwrap();
+
+        // 1. Even under `--frozen` with NO `state.db` yet, legacy `retired.jsonl` entries surface!
+        {
+            let _frozen = crate::env::Env::from_vars([
+                ("CLUSTERVISION_HOME", world.cv_home.as_os_str()),
+                ("CV_FROZEN", std::ffi::OsStr::new("1")),
+            ])
+            .enter();
+            let leg = lookup("leg1").expect("legacy leg1 retired");
+            assert_eq!(leg.successor.as_deref(), Some("leg2"));
+            assert_eq!(leg.session_id.as_deref(), Some("root-leg"));
+            assert!(lookup("leg-reverted").is_none());
+            assert!(!world.cv_home.join("state.db").exists());
+        }
+
+        // 2. Retiring `leg2 -> leg3` in `state.db` resolves transitive chain `leg1 -> leg2 -> leg3`
+        //    without mutating `retired.jsonl`!
+        let before_jsonl = std::fs::read(&jsonl).unwrap();
+        retire("leg2", Some("leg3"), None).unwrap();
+        assert_eq!(lookup("leg1").unwrap().successor.as_deref(), Some("leg3"));
+
+        // 3. Updating `leg1` without `session_id` preserves `session_id` from `retired.jsonl`, and
+        //    `undo` on a legacy-only entry records a tombstone in `state.db` without touching `retired.jsonl`.
+        std::fs::write(
+            &jsonl,
+            concat!(
+                "{\"ts\":\"2026-06-01T10:00:00Z\",\"agent_id\":\"agent-leg1\",\"successor\":\"agent-leg2\",\"session_id\":\"root-leg\"}\n",
+                "{\"ts\":\"2026-06-01T10:10:00Z\",\"agent_id\":\"leg-only\",\"successor\":\"succ-z\",\"session_id\":\"root-z\"}\n",
+            ),
+        )
+        .unwrap();
+        let expected_jsonl = std::fs::read(&jsonl).unwrap();
+        assert_ne!(before_jsonl, expected_jsonl);
+        assert!(lookup("leg-only").is_some());
+        assert!(undo("leg-only").unwrap());
+        assert!(lookup("leg-only").is_none());
+        assert!(!undo("leg-only").unwrap(), "second undo returns false");
+
+        retire("leg1", Some("leg4"), None).unwrap();
+        let updated_leg1 = lookup("leg1").unwrap();
+        assert_eq!(updated_leg1.successor.as_deref(), Some("leg4"));
+        assert_eq!(updated_leg1.session_id.as_deref(), Some("root-leg"));
+        assert_eq!(std::fs::read(&jsonl).unwrap(), expected_jsonl);
     }
 }
