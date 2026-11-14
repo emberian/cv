@@ -1,0 +1,6 @@
+{"step_index":408,"source":"MODEL","type":"GENERIC","status":"DONE","created_at":"2026-11-03T02:05:52Z","content":"Scrubbed GENERIC record 0."}
+{"step_index":409,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-03T02:05:56Z","input_tokens":12453,"cache_read_tokens":145108,"output_tokens":420,"thinking":"scrubbed","tool_calls":[{"name":"run_command","args":{"CommandLine":"scrubbed","WaitMsBeforeAsync":10000,"toolSummary":"scrubbed"}}]}
+{"step_index":410,"source":"MODEL","type":"GENERIC","status":"RUNNING","created_at":"2026-11-03T02:06:06Z","content":"Scrubbed GENERIC record 2."}
+{"step_index":410,"source":"MODEL","type":"GENERIC","status":"RUNNING","created_at":"2026-11-03T02:06:06Z","content":"Scrubbed GENERIC record 3."}
+{"step_index":411,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-03T02:06:22Z","input_tokens":2936,"cache_read_tokens":155512,"output_tokens":95,"content":"Scrubbed PLANNER_RESPONSE record 4.","thinking":"scrubbed"}
+{"step_index":412,"source":"SYSTEM","type":"SYSTEM_MESSAGE","status":"DONE","created_at":"2026-11-03T02:06:31Z","content":"Scrubbed SYSTEM_MESSAGE record 5."}

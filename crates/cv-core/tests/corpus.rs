@@ -641,7 +641,11 @@ fn claude_corpus_workflow_runs_read_as_recorded() {
 /// `cv show --kind`.
 const PERSISTED: &[(&str, &[&str])] = &[
     (
-        "antigravity/",
+        "antigravity/installed-1.5.9-lifecycle-2026-11-14$",
+        &["background_job/read"],
+    ),
+    (
+        "antigravity/1.5.6$",
         &[
             "schedule/create",
             "background_job/start",

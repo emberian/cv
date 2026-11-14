@@ -313,7 +313,13 @@ fn visit_tool_ops_internal<'a>(
     let workdir = file_key(input, &["workdir", "cwd", "Cwd"])?;
 
     // 2. Orchestration tools: sub-agent spawns, peer/child messages, and background polling/stopping.
-    if is_spawn_tool(harness, bare) {
+    if is_spawn_tool(harness, bare)
+        || harness
+            .map(|h| crate::affordance::classify_tool_view(h, bare, input))
+            .transpose()?
+            .flatten()
+            .is_some_and(|(kind, _)| kind == crate::affordance::Kind::SubagentSpawn)
+    {
         let target_hint = if opts.summaries {
             first_string_prefix(
                 input,
@@ -333,7 +339,7 @@ fn visit_tool_ops_internal<'a>(
             None
         };
         let has_prompt = if opts.summaries {
-            has_nonempty_string(input, &["prompt", "message", "Prompt", "task", "instructions"])?
+            has_nonempty_string(input, &["prompt", "message", "Prompt", "task", "instructions", "brief"])?
         } else {
             false
         };
@@ -352,7 +358,7 @@ fn visit_tool_ops_internal<'a>(
 
     if matches!(
         bare,
-        "SendMessage" | "send_message" | "followup_task" | "send_input" | "team_send_message"
+        "SendMessage" | "send_message" | "followup_task" | "send_input" | "team_send_message" | "post_message"
     ) {
         let recipient = if opts.summaries {
             first_string_prefix(

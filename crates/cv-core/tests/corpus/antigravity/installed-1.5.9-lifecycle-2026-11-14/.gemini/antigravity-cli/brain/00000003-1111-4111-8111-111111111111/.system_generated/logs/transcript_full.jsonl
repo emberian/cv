@@ -1,0 +1,6 @@
+{"step_index":4881,"source":"MODEL","type":"GENERIC","status":"DONE","created_at":"2026-11-14T08:17:46Z","content":"Scrubbed GENERIC record 0."}
+{"step_index":4882,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-11-14T08:18:29Z","content":"Scrubbed USER_INPUT record 1."}
+{"step_index":4883,"source":"SYSTEM","type":"SYSTEM_MESSAGE","status":"DONE","created_at":"2026-11-14T08:18:45Z","content":"Scrubbed SYSTEM_MESSAGE record 2."}
+{"step_index":4882,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-11-14T08:19:34Z","content":"Scrubbed USER_INPUT record 3."}
+{"step_index":4883,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-14T08:19:34Z","model":"scrubbed","input_tokens":2487,"cache_read_tokens":74176,"output_tokens":1312,"thinking":"scrubbed","tool_calls":[{"name":"manage_task","args":{"Action":"list"}},{"name":"read_board","args":{"limit":20,"since":133}},{"name":"swarm","args":{"action":"status"}}]}
+{"step_index":4884,"source":"MODEL","type":"GENERIC","status":"DONE","created_at":"2026-11-14T08:19:59Z","content":"Scrubbed GENERIC record 5."}

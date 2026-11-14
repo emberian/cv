@@ -77,7 +77,9 @@ impl Read {
 
     /// Records read again by range from this descriptor ([`Records`]).
     pub(crate) fn records(&self) -> Records<'_> {
-        Records::new(&self.source, &self.file)
+        let mut records = Records::new(&self.source, &self.file);
+        records.decoded = self.decoded.clone();
+        records
     }
 
     /// Positioned bytes from the captured descriptor, for an adapter's compression decoder.
@@ -190,7 +192,7 @@ impl Read {
             Ok(flow)
         };
         let read = match &self.decoded {
-            Some((backing, len)) => for_each_decoded_line(&self.source, backing, *len, from, visit),
+            Some((backing, len)) => for_each_decoded_line(&self.source, backing, to.min(*len), from, visit),
             None => for_each_line(&self.source, &self.file, from, to, visit),
         };
         self.check()?;
@@ -620,6 +622,7 @@ pub(crate) struct Records<'s> {
     file: &'s File,
     context: Option<document::range::RangeSource<'static>>,
     buffer: Vec<u8>,
+    decoded: Option<(std::sync::Arc<super::bytes::ByteSource>, u64)>,
 }
 
 impl<'s> Records<'s> {
@@ -629,6 +632,7 @@ impl<'s> Records<'s> {
             file,
             context: None,
             buffer: Vec::new(),
+            decoded: None,
         }
     }
 
@@ -648,6 +652,15 @@ impl<'s> Records<'s> {
         validation: crate::json::Validation,
         f: impl FnOnce(crate::json::JsonView<'_>) -> anyhow::Result<T>,
     ) -> anyhow::Result<T> {
+        if let Some((backing, size)) = &self.decoded {
+            anyhow::ensure!(
+                at.checked_add(len).is_some_and(|end| end <= *size),
+                "record range outside decoded source"
+            );
+            return self
+                .source
+                .read(ReadInput::Backing(backing.clone(), at, len), validation, f);
+        }
         anyhow::ensure!(
             at.checked_add(len).is_some_and(|end| end <= self.source.len()),
             "record range outside its source"

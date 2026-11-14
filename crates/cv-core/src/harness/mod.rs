@@ -665,6 +665,12 @@ pub trait Adapter: Send + Sync {
         Ok(None)
     }
 
+    /// Whether a call launches a child and how that child returns. The default uses
+    /// the shared name table without reading arguments; action-sensitive tools override it.
+    fn spawn_returns(&self, name: &str, _input: &crate::Json) -> anyhow::Result<Option<crate::affordance::Returns>> {
+        Ok(crate::affordance::spawn_returns(self.harness(), name))
+    }
+
     /// The affordances `m`'s harness bag records outside its blocks (a patch or snapshot part
     /// riding the turn), in order. Default: the bag records none.
     fn message_affordances(&self, _m: &Message) -> Vec<crate::affordance::BagHit> {

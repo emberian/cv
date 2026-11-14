@@ -379,6 +379,17 @@ pub fn classify_tool_view(h: Harness, name: &str, input: JsonView<'_>) -> Result
             _ => None,
         },
         Harness::Antigravity => match name {
+            "swarm" => match input
+                .get("action")?
+                .map(|v| input::word(v, &["add", "model"]))
+                .transpose()?
+                .flatten()
+            {
+                Some(0) => Some((SubagentSpawn, "spawn")),
+                Some(1) => Some((ModelChange, "change")),
+                _ => None,
+            },
+            "ask_permission" => Some((Approval, "ask")),
             "schedule" => Some((Schedule, "create")),
             "run_command" if flag(input, "IsDaemon")? => Some((BackgroundJob, "start")),
             "manage_task" => {
@@ -721,8 +732,12 @@ fn refine_spawn(h: Harness, m: &mut Message, open: &mut std::collections::HashMa
         (Role::Assistant, MessageKind::Reply) => {
             let mut spawned = false;
             for b in &m.content {
-                if let Block::ToolUse { id, name, .. } = b {
-                    if let Some(ret) = spawn_returns(h, name) {
+                if let Block::ToolUse { id, name, input, .. } = b {
+                    let returns = match crate::harness::rootless(h) {
+                        Some(adapter) => adapter.spawn_returns(name, input)?,
+                        None => spawn_returns(h, name),
+                    };
+                    if let Some(ret) = returns {
                         spawned = true;
                         if ret != Returns::Later {
                             open.insert(id.clone(), ret);

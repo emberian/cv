@@ -437,15 +437,16 @@ pub(super) fn run_fed(
                         open.remove(&job.r.id);
                     }
                 }
-                Out::Failed { job, err } => {
+                Out::Failed { job, err, transient } => {
                     ran.unreadable.push(Unreadable {
                         id: job.r.id.clone(),
                         harness: job.r.harness.to_string(),
                         reason: cv_core::ir::truncate(&format!("{err:#}"), 512),
                     });
-                    // The session drops out of the index (and its skip-set entry) until a later
-                    // run parses it whole — never frozen in as a truncated body stamped fresh.
-                    if job.fts {
+                    // Partial output can never survive failure. If a source vanished or
+                    // moved before sending any documents, retain the last committed body
+                    // until fresh discovery decides whether it still exists.
+                    if job.fts && (!transient || open.contains(&job.r.id)) {
                         writer.delete_term(Term::from_field_text(f.id, &job.r.id));
                         open.remove(&job.r.id);
                     }
@@ -455,7 +456,9 @@ pub(super) fn run_fed(
                             mark: None,
                         });
                     }
-                    eprintln!("cv: parse failed for {} ({}): {err:#}", job.r.id, job.r.harness);
+                    if !transient {
+                        eprintln!("cv: parse failed for {} ({}): {err:#}", job.r.id, job.r.harness);
+                    }
                 }
             }
             if since_commit >= COMMIT_EVERY && failure.is_none() {

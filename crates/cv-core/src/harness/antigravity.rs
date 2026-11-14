@@ -13,8 +13,10 @@
 //!   > `transcript.jsonl`
 //!   > `overview.txt` (legacy 1.x NDJSON using the same step schema).
 //!
+//! Byte-chunked logs under `logs/chunks/{transcript_full,transcript}/` are a fallback
+//! when their monolithic export is absent. They share the same record codec.
+//!
 //! Explicitly skipped sidecars:
-//! - `brain/<uuid>/.system_generated/logs/chunks/**` (chunked byte-identical copy of `transcript_full.jsonl`)
 //! - `implicit/<uuid>.pb` (AEAD-encrypted implicit context blobs, not sessions)
 //! - `conversations/<uuid>.pb` (Keychain AEAD-encrypted `ProtoStore` trajectory blobs; `cv` never
 //!   touches OS Keychains and reads `overview.txt` + plaintext SQLite/pbtxt sidecars instead)
@@ -154,16 +156,23 @@ impl Adapter for Antigravity {
         }
     }
 
-    fn append_only(&self, r: &SessionRef) -> bool {
-        r.path.is_file()
+    fn append_only(&self, _r: &SessionRef) -> bool {
+        // Completed parallel tools can arrive out of step order, and a later record can
+        // replace a previously exported step. Byte append does not imply message append.
+        false
     }
 
     fn dependencies(&self, r: &SessionRef, _probe: &mut Probe, deps: &mut Dependencies) -> Option<()> {
+        if let Some(directory) = chunk_directory(&r.path) {
+            deps.directories.push(directory.to_path_buf());
+        }
         if let Some(loc) = BrainLoc::from_transcript(&r.path) {
             deps.files
                 .push(loc.app_data_dir.join("annotations").join(format!("{}.pbtxt", loc.id)));
             deps.directories
                 .push(loc.brain_dir.join(".system_generated").join("subagents"));
+            deps.files
+                .push(loc.brain_dir.join(".system_generated/swarm/members.json"));
             #[cfg(feature = "sqlite")]
             {
                 let conv_db = loc.app_data_dir.join("conversations").join(format!("{}.db", loc.id));
@@ -180,12 +189,52 @@ impl Adapter for Antigravity {
         None
     }
 
+    fn spawn_returns(&self, name: &str, input: &Json) -> Result<Option<crate::affordance::Returns>> {
+        if name == "swarm" {
+            let hit = crate::affordance::classify_tool_json(Harness::Antigravity, name, input)?;
+            return Ok(matches!(hit, Some((crate::affordance::Kind::SubagentSpawn, _)))
+                .then_some(crate::affordance::Returns::Later));
+        }
+        Ok(crate::affordance::spawn_returns(Harness::Antigravity, name))
+    }
+
+    fn message_affordances(&self, m: &Message) -> Vec<crate::affordance::BagHit> {
+        let Some(task) = m
+            .extra
+            .get("antigravity")
+            .and_then(|v| v.get("completed_task"))
+            .and_then(Value::as_str)
+        else {
+            return Vec::new();
+        };
+        vec![crate::affordance::BagHit {
+            kind: crate::affordance::Kind::BackgroundJob,
+            action: "complete",
+            tool: "manage_task",
+            summary: task.to_owned(),
+        }]
+    }
+
     fn agent_transcript(&self, parent: &SessionRef, agent_session: &str, _workflow: Option<&str>) -> Option<PathBuf> {
         if agent_session.is_empty() || agent_session.contains(['/', '\\']) {
             return None;
         }
         let loc = BrainLoc::from_transcript(&parent.path)?;
-        select_brain_log(&loc.app_data_dir.join("brain").join(agent_session)).map(|(_, path)| path)
+        select_brain_log(&loc.app_data_dir.join("brain").join(agent_session))
+            .map(|(_, path)| path)
+            .or_else(|| {
+                let descriptor = loc
+                    .brain_dir
+                    .join(".system_generated/subagents")
+                    .join(format!("{agent_session}.json"));
+                descriptor.is_file().then_some(descriptor).or_else(|| {
+                    read_subagent_descriptors(&loc.brain_dir)
+                        .ok()?
+                        .into_iter()
+                        .find(|desc| desc.conversation_id == agent_session)
+                        .map(|desc| desc.path)
+                })
+            })
     }
 
     fn forest(
@@ -216,12 +265,24 @@ impl Adapter for Antigravity {
                 continue;
             }
             let child_brain = loc.app_data_dir.join("brain").join(&desc.conversation_id);
-            let Some((_, child_log)) = select_brain_log(&child_brain) else {
-                continue;
-            };
-            let Some(mut child_ref) = scan_transcript(&desc.conversation_id, &child_log, Some(&loc.app_data_dir))?
-            else {
-                continue;
+            let (mut child_ref, available) = match select_brain_log(&child_brain) {
+                Some((_, child_log)) => {
+                    let Some(reference) = scan_transcript(&desc.conversation_id, &child_log, Some(&loc.app_data_dir))?
+                    else {
+                        continue;
+                    };
+                    (reference, true)
+                }
+                None => {
+                    let descriptor = desc.path.clone();
+                    if !descriptor.is_file() {
+                        continue;
+                    }
+                    (
+                        SessionRef::new(&desc.conversation_id, Harness::Antigravity, descriptor),
+                        false,
+                    )
+                }
             };
             if child_ref.cwd.is_none() {
                 child_ref.cwd = desc.workspace_uris.iter().find_map(|u| file_uri_to_path(u));
@@ -245,7 +306,11 @@ impl Adapter for Antigravity {
                 description: desc.role,
                 tool_use_id,
                 workflow: None,
-                result_status: desc.state.map(|s| s.to_ascii_lowercase()),
+                result_status: match desc.state.as_deref() {
+                    Some("SUBAGENT_STATE_KILLED") => Some("killed".into()),
+                    _ if !available => Some("unavailable".into()),
+                    _ => None,
+                },
                 result_summary: None,
             });
         }
@@ -260,7 +325,7 @@ impl Adapter for Antigravity {
 
         let mut out = crate::Discovered::default();
         // Deduplicate by session UUID across roots, preferring higher-fidelity log ranks
-        // (`transcript_full.jsonl` = 3 > `transcript.jsonl` = 2 > `overview.txt` = 1 > flat `.jsonl` = 0).
+        // (full log = 4 > full chunks = 3 > compact log/chunks = 2 > overview = 1 > flat = 0).
         // Earlier roots win ties (`antigravity-cli` > `antigravity` > `antigravity-ide`).
         struct Candidate {
             rank: u8,
@@ -410,28 +475,62 @@ impl Adapter for Antigravity {
         from: Start<'_>,
         sink: &mut dyn MessageSink,
     ) -> Result<Option<Session>> {
+        if let Some(parent) = descriptor_parent(&r.path) {
+            if matches!(from, Start::Checkpoint(_)) {
+                return Ok(None);
+            }
+            let source = crate::json::JsonSource::capture(&r.path)?;
+            anyhow::ensure!(source.len() <= 1024 * 1024, "oversized Antigravity child descriptor");
+            source.read(
+                crate::json::ReadInput::Document,
+                crate::json::Validation::Value,
+                |view| {
+                    let descriptor = view.resolve()?.into_owned();
+                    let matches = if r.path.file_name().is_some_and(|name| name == "members.json") {
+                        descriptor
+                            .get("members")
+                            .and_then(Value::as_object)
+                            .is_some_and(|members| {
+                                members.values().any(|member| {
+                                    member.get("conversation_id").and_then(Value::as_str) == Some(r.id.as_str())
+                                })
+                            })
+                    } else {
+                        descriptor.get("conversationId").and_then(Value::as_str) == Some(r.id.as_str())
+                    };
+                    anyhow::ensure!(matches, "Antigravity child descriptor identity mismatch");
+                    Ok(())
+                },
+            )?;
+            source.check()?;
+            let mut session = Session::new(&r.id, Harness::Antigravity);
+            session.source_path = Some(r.path.clone());
+            session.title = r.title.clone();
+            session.cwd = r.cwd.clone();
+            session.lineage.parent = Some(parent);
+            session
+                .harness_extra_mut(Harness::Antigravity)
+                .insert("transcript_unavailable".into(), Value::Bool(true));
+            sink.meta(&session);
+            return Ok(Some(session));
+        }
         crate::stream::checked(sink, |sink| {
-            let mut side_reads = ReadSet::default();
             if let Some(loc) = BrainLoc::from_transcript(&r.path) {
                 let pbtxt = loc.app_data_dir.join("annotations").join(format!("{}.pbtxt", loc.id));
-                side_reads.record(&pbtxt);
                 sink.dependency(&pbtxt);
                 #[cfg(feature = "sqlite")]
                 {
                     let conv_db = loc.app_data_dir.join("conversations").join(format!("{}.db", loc.id));
-                    record_sqlite_readset(&conv_db, &mut side_reads);
                     sink.dependency(&conv_db);
                 }
             }
-            let source = crate::json::JsonSource::capture_with_reads(&r.path, &side_reads)?;
-            let input = jsonl::Read::with(source)?;
-            let state = match from {
-                Start::Checkpoint(cp) => match jsonl::restore::<ResumeState>(cp) {
-                    Some(saved) if saved.source == r.path && cp.offset <= input.len() => saved.state,
-                    _ => return Ok(None),
-                },
-                Start::Whole | Start::Prefix(_) => StepState::default(),
-            };
+            // Header enrichment is owned from its read snapshot. Its dependencies still
+            // invalidate cached products, but changing a title or live WAL cannot change
+            // the bytes of a transcript span. Guard those bytes by their own source.
+            let input = open_transcript(&r.path)?;
+            if matches!(from, Start::Checkpoint(_)) {
+                return Ok(None);
+            }
             let (s, enrich) = build_session_header(r, opts);
             let mut spawns = crate::affordance::AffordanceSink::new(Harness::Antigravity, sink);
             spawns.meta(&s);
@@ -440,14 +539,34 @@ impl Adapter for Antigravity {
                 opts: *opts,
                 spans: opts.spans,
                 enrich,
-                state,
+                state: StepState::default(),
                 source_path: Some(r.path.clone()),
             };
             codec
                 .state
                 .child_ids
                 .extend(codec.enrich.known_children.iter().cloned());
-            jsonl::drive(&input, from, codec, &mut spawns)
+            let mut order = StepOrder::default();
+            let to = match from {
+                Start::Prefix(to) => to,
+                _ => input.len(),
+            };
+            input.snapshot(0, to, |line| {
+                order.ingest(&line)?;
+                Ok(Flow::Continue)
+            })?;
+            let mut records = input.records();
+            crate::stream::guarded(&mut spawns, &input, |sink| {
+                let mut stopped = false;
+                for (at, end) in order.steps.into_values() {
+                    if records.read(at, end - at, |view| codec.record(view, at, sink))? == Flow::Stop {
+                        stopped = true;
+                        break;
+                    }
+                }
+                super::note_skipped_lines(codec.session(), order.skipped);
+                codec.finish(stopped, sink).map(Some)
+            })
         })
     }
 }
@@ -524,23 +643,69 @@ pub fn stream_str(
             state: StepState::default(),
             source_path,
         };
-        let mut skipped = 0u64;
-        let mut stopped = false;
+        let mut order = StepOrder::default();
         jsonl::slice(text.as_bytes(), |line| {
-            match line.view {
-                Some(view) => {
-                    if codec.record(view, line.at, &mut spawns)? == Flow::Stop {
-                        stopped = true;
-                        return Ok(Flow::Stop);
-                    }
-                }
-                None => skipped += u64::from(!line.blank),
-            }
+            order.ingest(&line)?;
             Ok(Flow::Continue)
         })?;
-        super::note_skipped_lines(codec.session(), skipped);
+        let mut stopped = false;
+        for (at, end) in order.steps.into_values() {
+            jsonl::slice(&text.as_bytes()[at as usize..end as usize], |line| {
+                if let Some(view) = line.view {
+                    stopped = codec.record(view, at, &mut spawns)? == Flow::Stop;
+                }
+                Ok(Flow::Continue)
+            })?;
+            if stopped {
+                break;
+            }
+        }
+        super::note_skipped_lines(codec.session(), order.skipped);
         codec.finish(stopped, &mut spawns)
     })
+}
+
+/// A surviving child descriptor is evidence of a lane even after its native
+/// transcript has been removed. It carries state, never fabricated conversation text.
+fn descriptor_parent(path: &Path) -> Option<String> {
+    let descriptors = path.parent()?;
+    let is_descriptor = descriptors.file_name()? == "subagents";
+    let is_members = descriptors.file_name()? == "swarm" && path.file_name()? == "members.json";
+    if !(is_descriptor || is_members) || descriptors.parent()?.file_name()? != ".system_generated" {
+        return None;
+    }
+    descriptors.parent()?.parent()?.file_name()?.to_str().map(str::to_owned)
+}
+
+/// Export completion order differs from step order. Keep the last revision of each
+/// index, retaining only byte ranges; decode selected bodies through the same codec.
+#[derive(Default)]
+struct StepOrder {
+    steps: BTreeMap<u64, (u64, u64)>,
+    skipped: u64,
+}
+impl StepOrder {
+    fn ingest(&mut self, line: &jsonl::Line<'_>) -> Result<()> {
+        let index = line
+            .view
+            .map(|view| {
+                Ok::<_, anyhow::Error>(
+                    view.get("step_index")?
+                        .map(JsonView::as_number)
+                        .transpose()?
+                        .flatten()
+                        .and_then(|n| n.as_u64()),
+                )
+            })
+            .transpose()?
+            .flatten();
+        if let Some(index) = index {
+            self.steps.insert(index, (line.at, line.end));
+        } else {
+            self.skipped += u64::from(!line.blank);
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -556,7 +721,10 @@ struct BrainLoc {
 impl BrainLoc {
     /// Match `<appDataDir>/brain/<id>/.system_generated/logs/<filename>`.
     fn from_transcript(path: &Path) -> Option<Self> {
-        let logs_dir = path.parent()?;
+        let logs_dir = match chunk_directory(path) {
+            Some(directory) => directory.parent()?.parent()?,
+            None => path.parent()?,
+        };
         if logs_dir.file_name()?.to_str()? != "logs" {
             return None;
         }
@@ -579,23 +747,78 @@ impl BrainLoc {
     }
 }
 
-/// Prefer `transcript_full.jsonl` (rank 3) > `transcript.jsonl` (rank 2) > `overview.txt` (rank 1).
-/// Never enters `logs/chunks/`.
+/// Prefer full history, including its byte-chunked copy, over the compact projection.
 fn select_brain_log(brain_dir: &Path) -> Option<(u8, PathBuf)> {
     let logs = brain_dir.join(".system_generated").join("logs");
     let full = logs.join("transcript_full.jsonl");
     if full.is_file() {
-        return Some((3, full));
+        return Some((4, full));
+    }
+    let full_chunks = logs.join("chunks/transcript_full/00000000.jsonl");
+    if full_chunks.is_file() {
+        return Some((3, full_chunks));
     }
     let compact = logs.join("transcript.jsonl");
     if compact.is_file() {
         return Some((2, compact));
+    }
+    let compact_chunks = logs.join("chunks/transcript/00000000.jsonl");
+    if compact_chunks.is_file() {
+        return Some((2, compact_chunks));
     }
     let overview = logs.join("overview.txt");
     if overview.is_file() {
         return Some((1, overview));
     }
     None
+}
+
+/// Chunks are fixed-size byte slices, not independent JSONL files: a split can
+/// fall in a JSON escape or a UTF-8 character. Reassemble once in bounded backing.
+fn chunk_directory(path: &Path) -> Option<&Path> {
+    let directory = path.parent()?;
+    (matches!(directory.file_name()?.to_str()?, "transcript" | "transcript_full")
+        && directory.parent()?.file_name()? == "chunks"
+        && directory.parent()?.parent()?.file_name()? == "logs")
+        .then_some(directory)
+}
+
+fn open_transcript(path: &Path) -> Result<jsonl::Read> {
+    let Some(directory) = chunk_directory(path) else {
+        return jsonl::Read::open(path);
+    };
+    let mut reads = ReadSet::default();
+    reads.record(directory);
+    let mut chunks = BTreeMap::new();
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let p = entry.path();
+        if p.extension().and_then(|x| x.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let index = p
+            .file_stem()
+            .and_then(|x| x.to_str())
+            .and_then(|x| x.parse::<u64>().ok())
+            .context("invalid Antigravity chunk filename")?;
+        anyhow::ensure!(
+            chunks.insert(index, p.clone()).is_none(),
+            "duplicate Antigravity chunk number"
+        );
+        reads.record(&p);
+    }
+    anyhow::ensure!(!chunks.is_empty(), "empty Antigravity chunk history");
+    let input = jsonl::Read::with(crate::json::JsonSource::capture_with_reads(path, &reads)?)?;
+    let arena = std::sync::Arc::new(super::store::bytes::ByteSource::arena()?);
+    let (_, len) = arena.append(|output| {
+        for (expected, (index, path)) in chunks.into_iter().enumerate() {
+            anyhow::ensure!(index == expected as u64, "missing Antigravity chunk {expected}");
+            std::io::copy(&mut fs::File::open(&path)?, output)?;
+        }
+        Ok(())
+    })?;
+    input.check()?;
+    Ok(input.decoded(arena, len))
 }
 
 fn looks_like_antigravity_file(path: &Path) -> bool {
@@ -617,6 +840,7 @@ fn looks_like_antigravity_file(path: &Path) -> bool {
 
 #[derive(Default)]
 struct SidecarEnrich {
+    step_usage: BTreeMap<u64, (i64, Usage)>,
     step_models: BTreeMap<u64, String>,
     known_children: BTreeSet<String>,
     subagent_descriptors: BTreeMap<String, Value>,
@@ -624,6 +848,7 @@ struct SidecarEnrich {
 
 #[derive(Debug, Clone)]
 struct SubagentDescriptor {
+    path: PathBuf,
     conversation_id: String,
     spawn_step_index: Option<u64>,
     state: Option<String>,
@@ -690,6 +915,7 @@ fn read_subagent_descriptors(brain_dir: &Path) -> Result<Vec<SubagentDescriptor>
             .map(|arr| arr.iter().filter_map(Value::as_str).map(str::to_owned).collect())
             .unwrap_or_default();
         out.push(SubagentDescriptor {
+            path,
             conversation_id: cid,
             spawn_step_index,
             state,
@@ -698,7 +924,87 @@ fn read_subagent_descriptors(brain_dir: &Path) -> Result<Vec<SubagentDescriptor>
             workspace_uris,
         });
     }
+    let members_path = brain_dir.join(".system_generated/swarm/members.json");
+    if let Ok(source) = crate::json::JsonSource::capture(&members_path) {
+        if source.len() <= 1024 * 1024 {
+            let members = source.read(
+                crate::json::ReadInput::Document,
+                crate::json::Validation::Value,
+                |view| Ok(view.resolve()?.into_owned()),
+            );
+            if let Ok(value) = members {
+                if let Some(members) = value.get("members").and_then(Value::as_object) {
+                    for (name, member) in members {
+                        let Some(id) = member.get("conversation_id").and_then(Value::as_str) else {
+                            continue;
+                        };
+                        let killed = member.get("killed").and_then(Value::as_bool) == Some(true)
+                            || member.get("phase").and_then(Value::as_str) == Some("KILLED");
+                        if let Some(existing) = out.iter_mut().find(|d| d.conversation_id == id) {
+                            if killed {
+                                existing.state = Some("SUBAGENT_STATE_KILLED".into());
+                            }
+                            if existing.type_name.is_none() {
+                                existing.type_name = Some(name.clone());
+                            }
+                            continue;
+                        }
+                        out.push(SubagentDescriptor {
+                            path: members_path.clone(),
+                            conversation_id: id.to_owned(),
+                            spawn_step_index: None,
+                            state: killed.then(|| "SUBAGENT_STATE_KILLED".into()),
+                            type_name: Some(name.clone()),
+                            role: member.get("role").and_then(Value::as_str).map(str::to_owned),
+                            workspace_uris: Vec::new(),
+                        });
+                    }
+                }
+            }
+        }
+    }
     Ok(out)
+}
+
+/// The catalog uses the adapter's topology, including not-yet-created child logs,
+/// rather than a second unbounded JSON parser with a divergent list of sidecars.
+#[cfg(feature = "sqlite")]
+pub(crate) fn forest_dependencies(r: &SessionRef, guard: &mut ReadSet) {
+    let Some(loc) = BrainLoc::from_transcript(&r.path) else {
+        return;
+    };
+    let root = loc.app_data_dir.join("brain");
+    let mut pending = vec![loc.brain_dir];
+    let mut visited = BTreeSet::new();
+    while let Some(brain) = pending.pop() {
+        if !visited.insert(brain.clone()) {
+            continue;
+        }
+        guard.record(&brain.join(".system_generated/subagents"));
+        guard.record(&brain.join(".system_generated/swarm/members.json"));
+        let Ok(descriptors) = read_subagent_descriptors(&brain) else {
+            continue;
+        };
+        for desc in descriptors {
+            guard.record(&desc.path);
+            if crate::publish::validate_output_id(&desc.conversation_id).is_err() {
+                continue;
+            }
+            let child = root.join(&desc.conversation_id);
+            let logs = child.join(".system_generated/logs");
+            guard.record(&logs);
+            for name in [
+                "transcript_full.jsonl",
+                "transcript.jsonl",
+                "overview.txt",
+                "chunks/transcript_full",
+                "chunks/transcript",
+            ] {
+                guard.record(&logs.join(name));
+            }
+            pending.push(child);
+        }
+    }
 }
 
 fn scan_transcript(id: &str, transcript: &Path, app_data_dir: Option<&Path>) -> Result<Option<SessionRef>> {
@@ -728,7 +1034,7 @@ fn scan_transcript(id: &str, transcript: &Path, app_data_dir: Option<&Path>) -> 
         {
             let conv_db = app.join("conversations").join(format!("{id}.db"));
             if conv_db.is_file() {
-                if let Ok(db_meta) = read_conversation_db(&conv_db) {
+                if let Ok(db_meta) = read_conversation_db(&conv_db, false) {
                     if cwd.is_none() {
                         cwd = db_meta.cwd;
                     }
@@ -741,7 +1047,7 @@ fn scan_transcript(id: &str, transcript: &Path, app_data_dir: Option<&Path>) -> 
     }
 
     // Peek head of transcript for `created_at` and fallback prompt title without scanning the body.
-    if let Ok(input) = jsonl::Read::open(transcript) {
+    if let Ok(input) = open_transcript(transcript) {
         let mut inspected = 0usize;
         let _ = input.prefix(64 * 1024, |line| {
             let Some(view) = line.view else {
@@ -852,7 +1158,7 @@ fn build_session_header(r: &SessionRef, opts: &Demand) -> (Session, SidecarEnric
     {
         let conv_db = loc.app_data_dir.join("conversations").join(format!("{}.db", loc.id));
         if conv_db.is_file() {
-            if let Ok(db_meta) = read_conversation_db(&conv_db) {
+            if let Ok(db_meta) = read_conversation_db(&conv_db, true) {
                 if s.cwd.is_none() {
                     s.cwd = db_meta.cwd;
                 }
@@ -872,8 +1178,22 @@ fn build_session_header(r: &SessionRef, opts: &Demand) -> (Session, SidecarEnric
                             .insert("git_root".into(), Value::String(git_root.display().to_string()));
                     }
                 }
+                s.lineage.parent = db_meta.parent_id;
+                if want_extra {
+                    let bag = s.harness_extra_mut(Harness::Antigravity);
+                    for (key, value) in [
+                        ("root_conversation_id", db_meta.root_id),
+                        ("agent_type", db_meta.agent_type),
+                        ("agent_role", db_meta.agent_role),
+                    ] {
+                        if let Some(value) = value {
+                            bag.insert(key.into(), Value::String(value));
+                        }
+                    }
+                }
                 s.model = db_meta.dominant_model;
                 enrich.step_models = db_meta.step_models;
+                enrich.step_usage = db_meta.step_usage;
             }
         }
 
@@ -991,7 +1311,41 @@ impl jsonl::Codec for StepCodec {
         }
     }
 
-    fn record(&mut self, view: JsonView<'_>, _at: u64, sink: &mut dyn MessageSink) -> Result<Flow> {
+    fn record(&mut self, view: JsonView<'_>, at: u64, sink: &mut dyn MessageSink) -> Result<Flow> {
+        struct Native<'a> {
+            inner: &'a mut dyn MessageSink,
+            record: Option<Json>,
+        }
+        impl MessageSink for Native<'_> {
+            fn message(&mut self, mut message: Message) -> Flow {
+                // The synthesized compaction boundary is not another native record.
+                if message.id.is_some() {
+                    if let Some(record) = self.record.take() {
+                        CompleteRecord::attach(
+                            std::slice::from_mut(&mut message),
+                            Harness::Antigravity,
+                            record,
+                            Map::new(),
+                        );
+                    }
+                }
+                self.inner.message(message)
+            }
+            fn take_error(&mut self) -> Option<anyhow::Error> {
+                self.inner.take_error()
+            }
+        }
+        let record = (self.opts.tier == Tier::Complete).then(|| view.to_json()).transpose()?;
+        self.decode(view, at, &mut Native { inner: sink, record })
+    }
+
+    fn finish(self, stopped: bool, sink: &mut dyn MessageSink) -> Result<Session> {
+        self.finish_session(stopped, sink)
+    }
+}
+
+impl StepCodec {
+    fn decode(&mut self, view: JsonView<'_>, _at: u64, sink: &mut dyn MessageSink) -> Result<Flow> {
         let Some(fields) = Fields::parse(view, STEP_KEYS)? else {
             return Ok(Flow::Continue);
         };
@@ -1014,10 +1368,12 @@ impl jsonl::Codec for StepCodec {
             self.state.last_ts = Some(t);
         }
 
-        // Edge case A: if a turn was interrupted/cancelled (`len(GENERIC) < len(tool_calls)`),
-        // clear any stale pending calls as soon as a non-GENERIC step arrives so later turns
-        // never mis-pair.
-        if ty != "GENERIC" {
+        // A new turn supersedes unfinished calls. Background deliveries can interleave
+        // with parallel results and must not discard their pending identities.
+        if matches!(
+            ty.as_str(),
+            "PLANNER_RESPONSE" | "USER_INPUT" | "CHECKPOINT" | "ERROR_MESSAGE"
+        ) {
             self.state.pending_calls.clear();
         }
 
@@ -1085,6 +1441,15 @@ impl jsonl::Codec for StepCodec {
                 }
 
                 m.usage = parse_step_usage(&fields)?;
+                if let Some((seconds, native)) = self.enrich.step_usage.get(&step_index) {
+                    // Export timestamps lose subsecond precision. Match the stored identity
+                    // before supplementing fields omitted by that projection.
+                    if ts.is_some_and(|timestamp| timestamp.timestamp() == *seconds) {
+                        let usage = m.usage.get_or_insert_with(Usage::default);
+                        usage.cache_creation_tokens = native.cache_creation_tokens;
+                        usage.reasoning_tokens = native.reasoning_tokens;
+                    }
+                }
                 attach_step_extras(&mut m, &fields, step_index, &source, status.as_deref(), want_extra)?;
                 Ok(sink.message(m))
             }
@@ -1185,16 +1550,17 @@ impl jsonl::Codec for StepCodec {
                     .is_some_and(|s_id| self.state.child_ids.contains(s_id))
                 {
                     (Role::User, MessageKind::SubagentReturn, Origin::Subagent)
-                } else if sender
-                    .as_deref()
-                    .is_some_and(|s_id| s_id.contains("/task-") || s_id.contains("timer"))
-                {
+                } else if sender.as_deref().is_some_and(|s_id| s_id.contains("timer")) {
                     (Role::System, MessageKind::InjectedContext, Origin::Scheduler)
                 } else {
                     (Role::System, MessageKind::InjectedContext, Origin::Harness)
                 };
 
                 let mut m = Message::of_kind(role, kind, origin);
+                if let Some(task) = sender.as_deref().filter(|id| id.contains("/task-")) {
+                    m.harness_extra_mut(Harness::Antigravity)
+                        .insert("completed_task".into(), Value::String(task.to_owned()));
+                }
                 m.id = Some(step_index.to_string());
                 m.timestamp = ts;
                 push_nonempty_text(&mut m.content, fields.get("content"), self.spans)?;
@@ -1218,6 +1584,15 @@ impl jsonl::Codec for StepCodec {
                 m.timestamp = ts;
                 push_nonempty_text(&mut m.content, fields.get("content"), self.spans)?;
                 m.usage = parse_step_usage(&fields)?;
+                if let Some((seconds, native)) = self.enrich.step_usage.get(&step_index) {
+                    // Export timestamps lose subsecond precision. Match the stored identity
+                    // before supplementing fields omitted by that projection.
+                    if ts.is_some_and(|timestamp| timestamp.timestamp() == *seconds) {
+                        let usage = m.usage.get_or_insert_with(Usage::default);
+                        usage.cache_creation_tokens = native.cache_creation_tokens;
+                        usage.reasoning_tokens = native.reasoning_tokens;
+                    }
+                }
                 attach_step_extras(&mut m, &fields, step_index, &source, status.as_deref(), want_extra)?;
                 Ok(sink.message(m))
             }
@@ -1248,7 +1623,6 @@ impl jsonl::Codec for StepCodec {
                     m.timestamp = ts;
                     m.harness_extra_mut(Harness::Antigravity)
                         .insert("record_type".into(), Value::String(ty));
-                    m.extra.insert(CARRIER_KEY.into(), view.resolve()?.into_owned());
                     return Ok(sink.message(m));
                 }
                 Ok(Flow::Continue)
@@ -1256,7 +1630,7 @@ impl jsonl::Codec for StepCodec {
         }
     }
 
-    fn finish(mut self, _stopped: bool, _sink: &mut dyn MessageSink) -> Result<Session> {
+    fn finish_session(mut self, _stopped: bool, _sink: &mut dyn MessageSink) -> Result<Session> {
         if self.s.created_at.is_none() {
             self.s.created_at = self.state.first_ts;
         }
@@ -1798,7 +2172,7 @@ fn decode_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(String, Summ
 
 #[cfg(feature = "sqlite")]
 fn read_summaries_map(db_path: &Path) -> Result<HashMap<String, SummaryRow>> {
-    super::store::sqlite::read(db_path, |conn, _reads| {
+    super::store::sqlite::open_ro(db_path)?.read_snapshot(|conn, _reads| {
         let Some(select_sql) = summary_columns_sql(conn)? else {
             return Ok(HashMap::new());
         };
@@ -1816,7 +2190,7 @@ fn read_summaries_map(db_path: &Path) -> Result<HashMap<String, SummaryRow>> {
 #[cfg(feature = "sqlite")]
 fn read_summary_one(db_path: &Path, id: &str) -> Result<Option<SummaryRow>> {
     use rusqlite::OptionalExtension as _;
-    super::store::sqlite::read(db_path, |conn, _reads| {
+    super::store::sqlite::open_ro(db_path)?.read_snapshot(|conn, _reads| {
         let Some(select_sql) = summary_columns_sql(conn)? else {
             return Ok(None);
         };
@@ -1850,18 +2224,23 @@ fn parse_sqlite_ts(s: &str) -> Option<DateTime<Utc>> {
 #[cfg(feature = "sqlite")]
 #[derive(Default)]
 struct ConvDbMeta {
+    step_usage: BTreeMap<u64, (i64, Usage)>,
     step_models: BTreeMap<u64, String>,
     dominant_model: Option<String>,
     cwd: Option<PathBuf>,
     git_root: Option<PathBuf>,
     git_branch: Option<String>,
+    parent_id: Option<String>,
+    root_id: Option<String>,
+    agent_type: Option<String>,
+    agent_role: Option<String>,
     created_at: Option<DateTime<Utc>>,
 }
 
 #[cfg(feature = "sqlite")]
-fn read_conversation_db(db_path: &Path) -> Result<ConvDbMeta> {
+fn read_conversation_db(db_path: &Path, details: bool) -> Result<ConvDbMeta> {
     use rusqlite::OptionalExtension as _;
-    super::store::sqlite::read(db_path, |conn, _reads| {
+    super::store::sqlite::open_ro(db_path)?.read_snapshot(|conn, _reads| {
         let mut out = ConvDbMeta::default();
         let has_table = |name: &str| -> Result<bool> {
             Ok(conn
@@ -1897,6 +2276,25 @@ fn read_conversation_db(db_path: &Path) -> Result<ConvDbMeta> {
                 .max_by_key(|(_, count)| *count)
                 .map(|(m, _)| m)
                 .or(first_model);
+        }
+
+        if details && has_table("steps")? {
+            let mut columns = conn.prepare("PRAGMA table_info(steps)")?;
+            let names = columns
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<rusqlite::Result<BTreeSet<_>>>()?;
+            if names.contains("idx") && names.contains("metadata") {
+                let mut stmt =
+                    conn.prepare("SELECT idx, metadata FROM steps WHERE metadata IS NOT NULL ORDER BY idx")?;
+                let mut rows = stmt.query([])?;
+                while let Some(row) = rows.next()? {
+                    if let Ok(bytes) = row.get_ref(1)?.as_blob() {
+                        if let Some(usage) = parse_native_usage(bytes) {
+                            out.step_usage.insert(row.get(0)?, usage);
+                        }
+                    }
+                }
+            }
         }
 
         if has_table("trajectory_metadata_blob")? {
@@ -2007,6 +2405,31 @@ fn parse_gen_metadata_blob(buf: &[u8]) -> Option<(Vec<u64>, String)> {
     Some((steps, model?))
 }
 
+/// Native metadata survives payload clearing at compaction. Keep the richer counters
+/// separate from JSONL's historical text; only match rows with the same step timestamp.
+#[cfg(feature = "sqlite")]
+fn parse_native_usage(buf: &[u8]) -> Option<(i64, Usage)> {
+    let mut pos = 0;
+    let mut seconds = None;
+    let mut usage = Usage::default();
+    while let Some((field, value)) = next_proto_field(buf, &mut pos) {
+        if let (field @ (1 | 9), WireField::Bytes(nested)) = (field, value) {
+            let mut at = 0;
+            while let Some((number, value)) = next_proto_field(nested, &mut at) {
+                if let WireField::Varint(value) = value {
+                    match (field, number) {
+                        (1, 1) => seconds = i64::try_from(value).ok(),
+                        (9, 4) => usage.cache_creation_tokens = Some(value),
+                        (9, 9) => usage.reasoning_tokens = Some(value),
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    (!usage.is_empty()).then_some((seconds?, usage))
+}
+
 /// `trajectory_metadata_blob.data`:
 /// - field `1.1` = workspace `file://` URI (`cwd`)
 /// - field `1.2` = git root `file://` URI
@@ -2043,6 +2466,34 @@ fn parse_trajectory_metadata_blob(buf: &[u8], out: &mut ConvDbMeta) {
                     }
                 }
             }
+            (field @ 5..=7, WireField::Bytes(raw)) => {
+                if let Ok(value) = std::str::from_utf8(raw) {
+                    if !value.is_empty() {
+                        match field {
+                            5 => out.parent_id = Some(value.to_owned()),
+                            6 => out.root_id = Some(value.to_owned()),
+                            7 if out.cwd.is_none() => out.cwd = file_uri_to_path(value),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            (8, WireField::Bytes(spec)) => {
+                let mut sp = 0;
+                while let Some((field, value)) = next_proto_field(spec, &mut sp) {
+                    if let (field @ (1 | 2), WireField::Bytes(raw)) = (field, value) {
+                        if let Ok(value) = std::str::from_utf8(raw) {
+                            if !value.is_empty() {
+                                if field == 1 {
+                                    out.agent_type = Some(value.to_owned());
+                                } else {
+                                    out.agent_role = Some(value.to_owned());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             (2, WireField::Bytes(ts_bytes)) => {
                 let mut tp = 0usize;
                 let mut secs: Option<i64> = None;
@@ -2072,6 +2523,292 @@ mod tests {
 
     const PARENT_ID: &str = "11111111-2222-4333-8444-555555555555";
     const CHILD_ID: &str = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+
+    #[test]
+    fn latest_steps_replay_in_index_order_with_interleaved_deliveries() {
+        let rows = [
+            json!({"step_index":0,"type":"PLANNER_RESPONSE","tool_calls":[
+                {"name":"first","args":{}},{"name":"second","args":{}}]}),
+            json!({"step_index":3,"type":"GENERIC","content":"second result"}),
+            json!({"step_index":1,"type":"SYSTEM_MESSAGE","content":"background notification"}),
+            json!({"step_index":2,"type":"GENERIC","content":"obsolete result","status":"RUNNING"}),
+            json!({"step_index":2,"type":"GENERIC","content":"first result","status":"DONE"}),
+        ];
+        let text = rows.iter().map(|row| format!("{row}\n")).collect::<String>();
+        let world = crate::test_world("agy-step-order");
+        let path = world.base.join("steps.jsonl");
+        fs::write(&path, &text).unwrap();
+        let adapter = Antigravity::with_home(&world.base);
+        let reference = SessionRef::new(PARENT_ID, Harness::Antigravity, &path);
+        assert!(!adapter.append_only(&reference));
+        for session in [
+            parse_str(PARENT_ID, &text, None).unwrap(),
+            adapter.parse(&reference).unwrap(),
+        ] {
+            assert_eq!(
+                session
+                    .messages
+                    .iter()
+                    .map(|m| m.id.as_deref().unwrap())
+                    .collect::<Vec<_>>(),
+                ["0", "1", "2", "3"]
+            );
+            for (index, name, body) in [(2, "first", "first result"), (3, "second", "second result")] {
+                let Block::ToolResult {
+                    tool_use_id,
+                    tool_name,
+                    content,
+                    ..
+                } = &session.messages[index].content[0]
+                else {
+                    panic!("result")
+                };
+                assert_eq!(tool_name.as_deref(), Some(name));
+                let Block::ToolUse { id, .. } = &session.messages[0].content[index - 2] else {
+                    panic!("call")
+                };
+                assert_eq!(tool_use_id, id);
+                assert_eq!(
+                    content
+                        .try_resolve(&crate::lazy::Resolver::new(Some(path.clone())))
+                        .unwrap(),
+                    body
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn chunked_history_reassembles_bytes_and_rejects_missing_chunks() {
+        let world = crate::test_world("agy-chunks");
+        let app = world.base.join("antigravity-cli");
+        let logs = app.join("brain").join(PARENT_ID).join(".system_generated/logs");
+        let chunks = logs.join("chunks/transcript_full");
+        fs::create_dir_all(&chunks).unwrap();
+        let body = "quoted \\\" and λ🦊".repeat(20);
+        let text = format!(
+            "{}\n{}\n",
+            json!({"step_index":2,"type":"PLANNER_RESPONSE","content":body}),
+            json!({"step_index":0,"type":"USER_INPUT","content":"full history"})
+        );
+        // Deliberately splits JSON strings, escapes, and multibyte characters.
+        for (index, bytes) in text.as_bytes().chunks(37).enumerate() {
+            fs::write(chunks.join(format!("{index:08}.jsonl")), bytes).unwrap();
+        }
+        fs::write(
+            logs.join("transcript.jsonl"),
+            "{\"step_index\":0,\"type\":\"USER_INPUT\",\"content\":\"compact only\"}\n",
+        )
+        .unwrap();
+        let adapter = Antigravity::with_home(&app);
+        let discovered = adapter.discover().unwrap();
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0].path, chunks.join("00000000.jsonl"));
+        let session = adapter.parse(&discovered[0]).unwrap();
+        assert_eq!(session.messages.len(), 2);
+        assert_eq!(session.messages[0].id.as_deref(), Some("0"));
+        let Block::Text { text } = &session.messages[1].content[0] else {
+            panic!("text")
+        };
+        assert_eq!(
+            text.try_resolve(&crate::lazy::Resolver::new(Some(discovered[0].path.clone())))
+                .unwrap(),
+            body
+        );
+        fs::remove_file(chunks.join("00000001.jsonl")).unwrap();
+        assert!(adapter
+            .parse(&discovered[0])
+            .unwrap_err()
+            .to_string()
+            .contains("missing Antigravity chunk"));
+    }
+
+    #[test]
+    fn killed_children_remain_in_the_forest_without_a_transcript() {
+        let world = crate::test_world("agy-missing-child");
+        let app = world.base.join("antigravity-cli");
+        let parent = app.join("brain").join(PARENT_ID);
+        let logs = parent.join(".system_generated/logs");
+        let children = parent.join(".system_generated/subagents");
+        fs::create_dir_all(&logs).unwrap();
+        fs::create_dir_all(&children).unwrap();
+        let path = logs.join("transcript_full.jsonl");
+        fs::write(&path, "{}").unwrap();
+        fs::write(
+            children.join(format!("{CHILD_ID}.json")),
+            json!({
+                "conversationId":CHILD_ID,"state":"SUBAGENT_STATE_KILLED","spawnStepIndex":4,
+                "subagentDescriptor":{"typeName":"worker","role":"check parser"}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let adapter = Antigravity::with_home(&app);
+        let parent = SessionRef::new(PARENT_ID, Harness::Antigravity, path);
+        let children = adapter
+            .forest(&parent, crate::SubagentDemand::Rich, None, &|_, _| true)
+            .unwrap();
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].result_status.as_deref(), Some("killed"));
+        let child = adapter.parse(&children[0].session).unwrap();
+        assert!(child.messages.is_empty());
+        assert_eq!(child.lineage.parent.as_deref(), Some(PARENT_ID));
+        assert_eq!(child.extra["antigravity"]["transcript_unavailable"], true);
+        assert_eq!(
+            adapter.agent_transcript(&parent, CHILD_ID, None),
+            Some(children[0].session.path.clone())
+        );
+        // Modern swarms may retain only the members registry after killing a worker.
+        #[cfg(feature = "sqlite")]
+        let mut guard = ReadSet::default();
+        #[cfg(feature = "sqlite")]
+        forest_dependencies(&parent, &mut guard);
+        fs::remove_file(&children[0].session.path).unwrap();
+        let swarm = app.join("brain").join(PARENT_ID).join(".system_generated/swarm");
+        fs::create_dir_all(&swarm).unwrap();
+        fs::write(
+            swarm.join("members.json"),
+            json!({"members": {
+                "reviewer": {"conversation_id":CHILD_ID,"role":"review parser","killed":true}
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        let members = adapter
+            .forest(&parent, crate::SubagentDemand::Rich, None, &|_, _| true)
+            .unwrap();
+        assert_eq!(members.len(), 1);
+        #[cfg(feature = "sqlite")]
+        assert!(!guard.fresh(&mut Probe::default()));
+        assert_eq!(members[0].agent_type.as_deref(), Some("reviewer"));
+        assert_eq!(members[0].result_status.as_deref(), Some("killed"));
+        let child = adapter.parse(&members[0].session).unwrap();
+        assert!(child.messages.is_empty());
+        assert_eq!(child.lineage.parent.as_deref(), Some(PARENT_ID));
+    }
+
+    #[test]
+    fn complete_mode_preserves_known_and_future_records() {
+        let records = [
+            json!({"step_index":0,"type":"USER_INPUT","content":"hello","future":{"value":7}}),
+            json!({"step_index":1,"type":"CHECKPOINT","content":"summary","future":"kept"}),
+            json!({"step_index":2,"type":"FUTURE_TYPE","payload":{"opaque":true}}),
+        ];
+        struct Collect(Vec<Message>);
+        impl MessageSink for Collect {
+            fn message(&mut self, m: Message) -> Flow {
+                self.0.push(m);
+                Flow::Continue
+            }
+        }
+        let mut sink = Collect(Vec::new());
+        let text = records.iter().map(|r| format!("{r}\n")).collect::<String>();
+        stream_str(PARENT_ID, &text, None, &Demand::COMPLETE, &mut sink).unwrap();
+        let actual = sink
+            .0
+            .iter()
+            .filter(|m| m.id.is_some())
+            .map(|m| serde_json::to_value(m).unwrap()["extra"]["_record"].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(actual, records);
+    }
+
+    #[test]
+    fn swarm_spawns_approvals_and_task_deliveries_have_distinct_affordances() {
+        let records = [
+            json!({"step_index":0,"type":"PLANNER_RESPONSE","tool_calls":[
+                {"name":"swarm","args":{"action":"status"}},
+                {"name":"swarm","args":{"action":"add","name":"worker","brief":"inspect"}},
+                {"name":"ask_permission","args":{"Action":"unsandboxed","Reason":"build"}}
+            ]}),
+            json!({"step_index":1,"type":"SYSTEM_MESSAGE","content":format!("<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-14T00:00:00Z sender={PARENT_ID}/task-7\nTask finished\n</SYSTEM_MESSAGE>")}),
+        ];
+        let text = records.iter().map(|r| format!("{r}\n")).collect::<String>();
+        let session = parse_str(PARENT_ID, &text, None).unwrap();
+        assert_eq!(session.messages[0].kind, MessageKind::SubagentSpawn);
+        let message = &session.messages[1];
+        assert_ne!(message.origin, Origin::Scheduler);
+        let hits = ROOTLESS.message_affordances(message);
+        assert_eq!(
+            (hits[0].kind, hits[0].action, hits[0].summary.as_str()),
+            (
+                crate::affordance::Kind::BackgroundJob,
+                "complete",
+                format!("{PARENT_ID}/task-7").as_str()
+            )
+        );
+        for (name, args, expected) in [
+            ("swarm", json!({"action":"status"}), None),
+            (
+                "swarm",
+                json!({"action":"add"}),
+                Some((crate::affordance::Kind::SubagentSpawn, "spawn")),
+            ),
+            (
+                "swarm",
+                json!({"action":"model"}),
+                Some((crate::affordance::Kind::ModelChange, "change")),
+            ),
+            (
+                "ask_permission",
+                json!({}),
+                Some((crate::affordance::Kind::Approval, "ask")),
+            ),
+        ] {
+            assert_eq!(
+                crate::affordance::classify_tool_json(Harness::Antigravity, name, &Json::Owned(args)).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_changes_do_not_invalidate_transcript_bytes() {
+        let world = crate::test_world("agy-live-metadata");
+        let app = world.base.join("antigravity-cli");
+        let logs = app.join("brain").join(PARENT_ID).join(".system_generated/logs");
+        let annotations = app.join("annotations");
+        fs::create_dir_all(&logs).unwrap();
+        fs::create_dir_all(&annotations).unwrap();
+        let title = annotations.join(format!("{PARENT_ID}.pbtxt"));
+        fs::write(&title, "title: \"before\"\n").unwrap();
+        let path = logs.join("transcript_full.jsonl");
+        fs::write(
+            &path,
+            "{\"step_index\":0,\"type\":\"USER_INPUT\",\"content\":\"hello\"}\n",
+        )
+        .unwrap();
+        struct Update {
+            title: PathBuf,
+            messages: Vec<Message>,
+        }
+        impl MessageSink for Update {
+            fn message(&mut self, message: Message) -> Flow {
+                fs::write(&self.title, "title: \"after\"\n").unwrap();
+                self.messages.push(message);
+                Flow::Continue
+            }
+        }
+        let mut sink = Update {
+            title,
+            messages: Vec::new(),
+        };
+        let session = Antigravity::with_home(&app)
+            .stream(
+                &SessionRef::new(PARENT_ID, Harness::Antigravity, &path),
+                &Demand::RICH.with_spans(),
+                &mut sink,
+            )
+            .unwrap();
+        assert_eq!(session.title.as_deref(), Some("before"));
+        let Block::Text { text } = &sink.messages[0].content[0] else {
+            panic!("text")
+        };
+        assert_eq!(
+            text.try_resolve(&crate::lazy::Resolver::new(Some(path))).unwrap(),
+            "hello"
+        );
+    }
 
     #[test]
     fn persisted_output_notices_ignore_quoted_transcripts() {
@@ -2443,9 +3180,19 @@ mod tests {
             let conn = rusqlite::Connection::open(&conv_db).unwrap();
             conn.execute_batch(
                 "CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB);
-                 CREATE TABLE trajectory_metadata_blob (id TEXT PRIMARY KEY, data BLOB);",
+                 CREATE TABLE trajectory_metadata_blob (id TEXT PRIMARY KEY, data BLOB);
+                 CREATE TABLE steps (idx INTEGER PRIMARY KEY, metadata BLOB);",
             )
             .unwrap();
+            let mut timestamp = Vec::new();
+            pb_u64(1, 1_794_398_401, &mut timestamp);
+            let mut usage = Vec::new();
+            pb_u64(4, 12, &mut usage);
+            pb_u64(9, 3, &mut usage);
+            let mut metadata = Vec::new();
+            pb_bytes(1, &timestamp, &mut metadata);
+            pb_bytes(9, &usage, &mut metadata);
+            conn.execute("INSERT INTO steps VALUES (1, ?1)", [&metadata]).unwrap();
             let mut sub_model = Vec::new();
             pb_bytes(19, b"gemini-4-argon", &mut sub_model);
             let mut packed_steps = Vec::new();
@@ -2465,6 +3212,12 @@ mod tests {
             let mut traj_blob = Vec::new();
             pb_bytes(1, &ws_sub, &mut traj_blob);
             pb_bytes(2, &ts_sub, &mut traj_blob);
+            pb_bytes(5, PARENT_ID.as_bytes(), &mut traj_blob);
+            pb_bytes(6, PARENT_ID.as_bytes(), &mut traj_blob);
+            let mut spec = Vec::new();
+            pb_bytes(1, b"researcher", &mut spec);
+            pb_bytes(2, b"Inspect the storage contract", &mut spec);
+            pb_bytes(8, &spec, &mut traj_blob);
             conn.execute(
                 "INSERT INTO trajectory_metadata_blob (id, data) VALUES ('main', ?1)",
                 [&traj_blob],
@@ -2482,12 +3235,21 @@ mod tests {
         crate::harness::assert_no_flat_keys(&s);
         assert_eq!(s.model.as_deref(), Some("gemini-4-argon"));
         assert_eq!(s.messages[1].model.as_deref(), Some("gemini-4-argon"));
+        assert_eq!(s.messages[1].usage.as_ref().unwrap().reasoning_tokens, Some(3));
+        assert_eq!(s.messages[1].usage.as_ref().unwrap().cache_creation_tokens, Some(12));
         assert_eq!(
             s.git.as_ref().and_then(|g| g.branch.as_deref()),
             Some("feat/antigravity")
         );
         assert_eq!(s.lineage.parent.as_deref(), Some(PARENT_ID));
         assert_eq!(s.lineage.agent_path.as_deref(), Some("research"));
+
+        // Native lineage survives a missing summary catalog.
+        fs::remove_file(&sum_db).unwrap();
+        let native = adapter.parse(&refs[0]).unwrap();
+        assert_eq!(native.lineage.parent.as_deref(), Some(PARENT_ID));
+        assert_eq!(native.extra["antigravity"]["agent_type"], "researcher");
+        assert_eq!(native.extra["antigravity"]["root_conversation_id"], PARENT_ID);
 
         // Ensure zero `-wal` / `-shm` coordination files were created next to either SQLite DB!
         for db in [&sum_db, &conv_db] {

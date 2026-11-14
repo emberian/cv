@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Antigravity replays revised steps correctly, reads chunked history, preserves missing-child lanes, and enriches native lineage, usage, swarm, approval, and background-task events.
+- Search retries changing sources and reports disappearing sessions without flooding the terminal with parse failures.
+
 - Antigravity search ignores persisted-output notices inside quoted transcripts, preventing “File name too long” failures during indexing.
 
 ## 0.19.3 — 2026-11-13 — parser termination and malformed-input recovery

@@ -1248,48 +1248,7 @@ mod imp {
                     guard.record(&sidecar);
                 }
             }
-            Harness::Antigravity => {
-                let sys_dir = r
-                    .path
-                    .ancestors()
-                    .find(|p| p.file_name().is_some_and(|n| n == ".system_generated"));
-                let sub_dir = sys_dir
-                    .map(|sys| sys.join("subagents"))
-                    .unwrap_or_else(|| r.path.join(".system_generated").join("subagents"));
-                let brain_root = sys_dir
-                    .and_then(|sys| sys.parent())
-                    .and_then(|brain| brain.parent())
-                    .or_else(|| r.path.parent());
-                guard.record(&sub_dir);
-                if let Ok(entries) = std::fs::read_dir(&sub_dir) {
-                    for entry in entries.flatten() {
-                        let desc_path = entry.path();
-                        guard.record(&desc_path);
-                        if desc_path.extension().and_then(|x| x.to_str()) != Some("json") {
-                            continue;
-                        }
-                        let cid = std::fs::read_to_string(&desc_path)
-                            .ok()
-                            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-                            .and_then(|val| {
-                                val.get("conversationId")
-                                    .and_then(serde_json::Value::as_str)
-                                    .filter(|s| !s.is_empty())
-                                    .map(str::to_owned)
-                            })
-                            .or_else(|| desc_path.file_stem().and_then(|s| s.to_str()).map(str::to_owned));
-                        if let (Some(root), Some(cid)) = (brain_root, cid) {
-                            if !cid.is_empty() && !cid.contains('/') && !cid.contains('\\') && cid != ".." {
-                                let child_logs = root.join(&cid).join(".system_generated").join("logs");
-                                guard.record(&child_logs);
-                                for name in ["transcript_full.jsonl", "transcript.jsonl", "overview.txt"] {
-                                    guard.record(&child_logs.join(name));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            Harness::Antigravity => crate::harness::antigravity::forest_dependencies(r, &mut guard),
             Harness::Kimi => {
                 guard.record(&r.path);
                 let sub_dir = r.path.join("subagents");
@@ -3150,7 +3109,7 @@ mod imp {
             // 2. Antigravity: `<parent_brain>/.system_generated/subagents/<cid>.json` exists BEFORE
             //    `<app_data_dir>/brain/<cid>/.system_generated/logs/transcript.jsonl` is created.
             //    Creating the child transcript later without touching parent or `<cid>.json` MUST
-            //    invalidate `subagent_guard` and refresh `subagent_count` 0 -> 1!
+            //    invalidate `subagent_guard` and replace the metadata-only child with its transcript.
             let w_agy = crate::test_world("agy-pending-child-guard");
             let app_data = w_agy.base.join("antigravity");
             let parent_logs = app_data
@@ -3188,7 +3147,7 @@ mod imp {
             let agy_ref = SessionRef::new("agy-parent", Harness::Antigravity, &agy_parent_log);
             let mut agy_facts = SessionQueryFacts::default();
             populate_subagent_facts(&agy_ref, &mut agy_facts);
-            assert_eq!(agy_facts.subagent_count, Some(0));
+            assert_eq!(agy_facts.subagent_count, Some(1));
             assert!(agy_facts.subagent_guard.fresh(&mut crate::source::Probe::default()));
 
             // Create child transcript under `<app_data>/brain/agy-child/.system_generated/logs/`

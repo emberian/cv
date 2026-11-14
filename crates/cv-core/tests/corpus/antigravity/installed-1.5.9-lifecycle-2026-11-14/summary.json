@@ -1,0 +1,164 @@
+{
+  "sessions": [
+    {
+      "id": "00000001-1111-4111-8111-111111111111",
+      "path": ".gemini/antigravity-cli/brain/00000001-1111-4111-8111-111111111111/.system_generated/logs/transcript_full.jsonl",
+      "messages": 5,
+      "sequence": [
+        "tool/tool_result",
+        "assistant/reply",
+        "tool/tool_result",
+        "assistant/reply",
+        "system/injected_context"
+      ],
+      "blocks": {
+        "text": 2,
+        "thinking": 2,
+        "tool_result": 2,
+        "tool_use": 1
+      },
+      "tools": [
+        "run_command"
+      ],
+      "usage_messages": 2,
+      "model_messages": 0,
+      "compaction_boundaries": [],
+      "subagent_spawns": 0,
+      "subagent_returns": 0,
+      "affordances": {},
+      "tool_histogram": {
+        "tools": {
+          "run_command": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 1,
+            "errors": 0
+          }
+        },
+        "total_calls": 1,
+        "total_errors": 0
+      },
+      "lineage": {},
+      "model": null,
+      "skipped_lines": 0
+    },
+    {
+      "id": "00000002-1111-4111-8111-111111111111",
+      "path": ".gemini/antigravity-cli/brain/00000002-1111-4111-8111-111111111111/.system_generated/logs/transcript_full.jsonl",
+      "messages": 4,
+      "sequence": [
+        "assistant/reply",
+        "tool/tool_result",
+        "tool/tool_result",
+        "assistant/reply"
+      ],
+      "blocks": {
+        "thinking": 1,
+        "tool_result": 2,
+        "tool_use": 3
+      },
+      "tools": [
+        "replace_file_content",
+        " view_file",
+        "view_file"
+      ],
+      "usage_messages": 2,
+      "model_messages": 0,
+      "compaction_boundaries": [],
+      "subagent_spawns": 0,
+      "subagent_returns": 0,
+      "affordances": {},
+      "tool_histogram": {
+        "tools": {
+          " view_file": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 1
+          },
+          "replace_file_content": {
+            "calls": 1,
+            "edits": 1,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "view_file": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 3,
+        "total_errors": 1
+      },
+      "lineage": {},
+      "model": null,
+      "skipped_lines": 0
+    },
+    {
+      "id": "00000003-1111-4111-8111-111111111111",
+      "path": ".gemini/antigravity-cli/brain/00000003-1111-4111-8111-111111111111/.system_generated/logs/transcript_full.jsonl",
+      "messages": 4,
+      "sequence": [
+        "tool/tool_result",
+        "user/prompt",
+        "assistant/reply",
+        "tool/tool_result"
+      ],
+      "blocks": {
+        "text": 1,
+        "thinking": 1,
+        "tool_result": 2,
+        "tool_use": 3
+      },
+      "tools": [
+        "manage_task",
+        "read_board",
+        "swarm"
+      ],
+      "usage_messages": 1,
+      "model_messages": 0,
+      "compaction_boundaries": [],
+      "subagent_spawns": 0,
+      "subagent_returns": 0,
+      "affordances": {
+        "background_job/read": 1
+      },
+      "tool_histogram": {
+        "tools": {
+          "manage_task": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "read_board": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "swarm": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          }
+        },
+        "total_calls": 3,
+        "total_errors": 0
+      },
+      "lineage": {},
+      "model": null,
+      "skipped_lines": 0
+    }
+  ]
+}

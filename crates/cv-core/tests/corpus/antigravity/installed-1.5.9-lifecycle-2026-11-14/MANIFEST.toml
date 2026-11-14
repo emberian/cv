@@ -1,0 +1,10 @@
+# Selected harness-written records; private text/arguments redacted, ordering preserved.
+harness = "antigravity"
+version = "installed-1.5.9-lifecycle-2026-11-14"
+generated = "2026-11-14"
+model_calls = 0
+scenarios = ["duplicate_running_step", "parallel_completion_order", "revised_step_indices"]
+source = "Read-only snapshots of installed CLI full logs; selected contiguous step ranges."
+scrub = "Session IDs replaced; free text and argument string values redacted except protocol action enums. Native keys, tool names, timestamps, counters, statuses and record order retained."
+installed_cli = "1.5.9"
+writer_version = "Not recorded per row; the captured history may span earlier CLI versions."

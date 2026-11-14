@@ -723,6 +723,7 @@ enum Out {
     Failed {
         job: Job,
         err: anyhow::Error,
+        transient: bool,
     },
 }
 
@@ -1260,12 +1261,14 @@ fn job_out(
     let whole = |job: &Job| {
         job_pass(job, f, tx, admission, adapter, None).and_then(|p| p.context("a whole pass never declines"))
     };
+    let mut failure_source = job.source.clone();
     let mut result = resumed.unwrap_or_else(|| whole(&job));
     // A source that changed under the pass (a writer, a rewrite) is retried once, whole; the
     // retry's first doc deletes whatever the failed pass sent. A failure on unchanged sources is
     // the session's own and is reported.
     if result.is_err() && !cv_core::source::unchanged(&job.r, &job.source) {
         job.existing |= job.fts;
+        failure_source = cv_core::source::Probe::default().snapshot(&job.r);
         result = whole(&job);
     }
     match result {
@@ -1293,7 +1296,10 @@ fn job_out(
                 callbacks: p.callbacks,
             }
         }
-        Err(err) => Out::Failed { job, err },
+        Err(err) => {
+            let transient = !job.r.path.exists() || !cv_core::source::unchanged(&job.r, &failure_source);
+            Out::Failed { job, err, transient }
+        }
     }
 }
 
@@ -1420,7 +1426,9 @@ fn job_pass(
     }
     let source = std::fs::File::open(adapter.resume_source(&job.r))
         .inspect_err(|error| {
-            cv_core::env::warn_once("index source handle", format_args!("{}: {error}", job.r.path.display()));
+            if error.kind() != std::io::ErrorKind::NotFound {
+                cv_core::env::warn_once("index source handle", format_args!("{}: {error}", job.r.path.display()));
+            }
         })
         .ok();
     let mut events = match from {
@@ -8774,6 +8782,32 @@ mod tests {
         );
         let unchanged = sweep(&dir, vec![r], false, false).unwrap();
         assert_eq!((unchanged.changed, unchanged.observed.work.callbacks), (0, 0));
+    }
+
+    #[test]
+    fn source_disappearing_before_read_keeps_committed_index_until_rediscovery() {
+        let _home = IsolatedHome::new();
+        let (dir, sdir) = (tmpdir(), tmpdir());
+        let path = write_claude(&sdir, "vanishing", "zqcommitted");
+        let r = sref("vanishing", "vanishing", path.clone());
+        index_refs(&dir, std::slice::from_ref(&r), false).unwrap();
+        std::fs::write(&path, "{}\n").unwrap();
+        *BEFORE_PASS.lock().unwrap() = Some((
+            PathBuf::from(&path),
+            Box::new(|source| match std::fs::remove_file(source) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(e.into()),
+            }),
+        ));
+        let result = sweep(&dir, vec![r], false, false);
+        *BEFORE_PASS.lock().unwrap() = None;
+        let swept = result.unwrap();
+        assert_eq!(swept.errors, 1);
+        assert_eq!(text_search_indexed(&dir, "zqcommitted", 10).unwrap().len(), 1);
+        let swept = sweep(&dir, Vec::new(), false, false).unwrap();
+        assert_eq!(swept.removed, 1);
+        assert!(text_search_indexed(&dir, "zqcommitted", 10).unwrap().is_empty());
     }
 
     /// A pass that fails while its source changes is read again, whole, once; one that fails on
