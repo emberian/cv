@@ -2606,17 +2606,8 @@ impl<'s> JsScanner<'s> {
                 self.regex_allowed = true;
                 let mut parts = Vec::new();
                 let mut all_strings = true;
-                while self.pos < self.bytes.len() {
-                    self.skip_ws_and_comments();
-                    if self.pos >= self.bytes.len() {
-                        break;
-                    }
+                while !self.finish_container(b']') {
                     let cur = self.bytes[self.pos];
-                    if cur == b']' {
-                        self.pos += 1;
-                        self.regex_allowed = false;
-                        break;
-                    }
                     if cur == b',' {
                         self.pos += 1;
                         self.regex_allowed = true;
@@ -2873,23 +2864,31 @@ impl<'s> JsScanner<'s> {
         self.calls.push(call);
     }
 
+    /// End a container at EOF or any closing delimiter. Leave mismatched closers for the
+    /// enclosing reader: retrying `skip_balanced_until` there would never advance.
+    fn finish_container(&mut self, close: u8) -> bool {
+        self.skip_ws_and_comments();
+        match self.bytes.get(self.pos).copied() {
+            None => true,
+            Some(b @ (b')' | b']' | b'}')) => {
+                if b == close {
+                    self.pos += 1;
+                    self.regex_allowed = false;
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn parse_object_literal(&mut self) -> JsObj {
         debug_assert_eq!(self.bytes[self.pos], b'{');
         self.pos += 1;
         self.regex_allowed = true;
         let mut obj = JsObj::default();
 
-        while self.pos < self.bytes.len() {
-            self.skip_ws_and_comments();
-            if self.pos >= self.bytes.len() {
-                break;
-            }
+        while !self.finish_container(b'}') {
             let b = self.bytes[self.pos];
-            if b == b'}' {
-                self.pos += 1;
-                self.regex_allowed = false;
-                break;
-            }
             if b == b',' {
                 self.pos += 1;
                 self.regex_allowed = true;
@@ -2997,17 +2996,8 @@ impl<'s> JsScanner<'s> {
         debug_assert_eq!(self.bytes[self.pos], b'[');
         self.pos += 1;
         let mut items = Vec::new();
-        while self.pos < self.bytes.len() {
-            self.skip_ws_and_comments();
-            if self.pos >= self.bytes.len() {
-                break;
-            }
+        while !self.finish_container(b']') {
             let b = self.bytes[self.pos];
-            if b == b']' {
-                self.pos += 1;
-                self.regex_allowed = false;
-                break;
-            }
             if b == b',' {
                 self.pos += 1;
                 continue;
@@ -3034,17 +3024,8 @@ impl<'s> JsScanner<'s> {
         debug_assert_eq!(self.bytes[self.pos], b'[');
         self.pos += 1;
         let mut first_q = None;
-        while self.pos < self.bytes.len() {
-            self.skip_ws_and_comments();
-            if self.pos >= self.bytes.len() {
-                break;
-            }
+        while !self.finish_container(b']') {
             let b = self.bytes[self.pos];
-            if b == b']' {
-                self.pos += 1;
-                self.regex_allowed = false;
-                break;
-            }
             if b == b',' {
                 self.pos += 1;
                 continue;
@@ -3216,6 +3197,42 @@ mod tests {
                     expected,
                     "width {width}: {text:?}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn codex_exec_recovers_from_mismatched_container_closers() {
+        // Each specialized container reader must yield on an enclosing delimiter, including
+        // when the expression skipper reaches it after a property, spread, or nested value.
+        let prefixes = [
+            "tools.exec_command({",
+            "tools.exec_command({cmd:",
+            "tools.exec_command({cmd: value",
+            "tools.exec_command({...value",
+            "tools.exec_command({[key]: value",
+            "tools.exec_command({method() {}",
+            "const parts = [",
+            "const parts = [value",
+            "tools.update_plan({plan: [",
+            "tools.update_plan({plan: [value",
+            "tools.web__run({search_query: [",
+            "tools.web__run({search_query: [value",
+        ];
+        for prefix in prefixes {
+            for close in [")", "]", "}", "", " /* unfinished"] {
+                let script = format!("{prefix}{close}\n; tools.exec_command({{cmd: 'recovered'}});");
+                let mut scanner = JsScanner::new(&script);
+                scanner.scan_all();
+                assert_eq!(scanner.pos, script.len(), "{script}");
+                if !close.contains("/*") {
+                    assert!(
+                        scanner.calls.iter().any(|call| matches!(call,
+                            JsCall::ExecCommand { cmd: Some(cmd), .. } if cmd == "recovered"
+                        )),
+                        "{script}"
+                    );
+                }
             }
         }
     }
