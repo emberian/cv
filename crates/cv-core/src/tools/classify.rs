@@ -2159,6 +2159,7 @@ struct JsScanner<'s> {
     bytes: &'s [u8],
     pos: usize,
     regex_allowed: bool,
+    nesting: usize,
     bindings: HashMap<String, String>,
     literals: Vec<String>,
     calls: Vec<JsCall>,
@@ -2206,6 +2207,9 @@ fn is_ident_continue(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b >= 0x80
 }
 
+// Bound recursive semantic extraction; deeper syntax is still scanned without descent.
+const JS_MAX_NESTING: usize = 64;
+
 impl<'s> JsScanner<'s> {
     fn new(src: &'s str) -> Self {
         Self {
@@ -2213,6 +2217,7 @@ impl<'s> JsScanner<'s> {
             bytes: src.as_bytes(),
             pos: 0,
             regex_allowed: true,
+            nesting: 0,
             bindings: HashMap::new(),
             literals: Vec::new(),
             calls: Vec::new(),
@@ -2508,6 +2513,11 @@ impl<'s> JsScanner<'s> {
     }
 
     fn read_template_literal(&mut self) -> String {
+        if self.nesting >= JS_MAX_NESTING {
+            // At the cap, preserve the literal but do not descend into interpolations.
+            return self.read_quoted_string(b'`');
+        }
+        self.nesting += 1;
         debug_assert_eq!(self.bytes[self.pos], b'`');
         self.pos += 1;
         let mut out = String::new();
@@ -2515,6 +2525,7 @@ impl<'s> JsScanner<'s> {
             let b = self.bytes[self.pos];
             if b == b'`' {
                 self.pos += 1;
+                self.nesting -= 1;
                 return out;
             }
             if b == b'\\' {
@@ -2556,6 +2567,7 @@ impl<'s> JsScanner<'s> {
             out.push(ch);
             self.pos += ch.len_utf8();
         }
+        self.nesting -= 1;
         out
     }
 
@@ -2666,6 +2678,9 @@ impl<'s> JsScanner<'s> {
     }
 
     fn try_read_tools_call(&mut self) -> bool {
+        if self.nesting >= JS_MAX_NESTING {
+            return false;
+        }
         let saved = self.pos;
         self.skip_ws_and_comments();
         if self.pos >= self.bytes.len() {
@@ -2717,6 +2732,7 @@ impl<'s> JsScanner<'s> {
     }
 
     fn parse_tool_call_args(&mut self, tool_name: &str) {
+        self.nesting += 1;
         self.skip_ws_and_comments();
         let mut obj = JsObj::default();
         let mut direct_str: Option<String> = None;
@@ -2862,6 +2878,7 @@ impl<'s> JsScanner<'s> {
             }
         };
         self.calls.push(call);
+        self.nesting -= 1;
     }
 
     /// End a container at EOF or any closing delimiter. Leave mismatched closers for the
@@ -2885,6 +2902,15 @@ impl<'s> JsScanner<'s> {
         debug_assert_eq!(self.bytes[self.pos], b'{');
         self.pos += 1;
         self.regex_allowed = true;
+        if self.nesting >= JS_MAX_NESTING {
+            self.skip_balanced_until(b"}");
+            if self.bytes.get(self.pos) == Some(&b'}') {
+                self.pos += 1;
+            }
+            self.regex_allowed = false;
+            return JsObj::default();
+        }
+        self.nesting += 1;
         let mut obj = JsObj::default();
 
         while !self.finish_container(b'}') {
@@ -2945,6 +2971,7 @@ impl<'s> JsScanner<'s> {
             obj.props.insert(key, val);
             self.skip_balanced_until(b",}");
         }
+        self.nesting -= 1;
         obj
     }
 
@@ -3234,6 +3261,30 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn codex_exec_deep_nesting_resumes_after_bounded_extraction() {
+        for (open, close) in [
+            ("tools.exec_command({cmd:", "})"),
+            ("{plan:[", "]}"),
+            ("{search_query:[", "]}"),
+            ("`${", "}`"),
+        ] {
+            let script = "tools.update_plan(".to_owned()
+                + &open.repeat(5000)
+                + "'leaf'"
+                + &close.repeat(5000)
+                + ")"
+                + "; tools.exec_command({cmd: 'after'});";
+            let mut scanner = JsScanner::new(&script);
+            scanner.scan_all();
+            assert_eq!(scanner.pos, script.len());
+            assert_eq!(scanner.nesting, 0);
+            assert!(scanner.calls.iter().any(|call| matches!(call,
+                JsCall::ExecCommand { cmd: Some(cmd), .. } if cmd == "after"
+            )));
         }
     }
 
