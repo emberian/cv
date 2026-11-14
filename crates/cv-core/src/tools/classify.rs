@@ -2573,6 +2573,9 @@ impl<'s> JsScanner<'s> {
 
     /// Track simple `const x = "..."` or `const patch = ["...", "..."].join("\n")` bindings.
     fn try_read_binding(&mut self) {
+        if self.nesting >= JS_MAX_NESTING {
+            return;
+        }
         self.skip_ws_and_comments();
         if self.pos >= self.bytes.len() || !is_ident_start(self.bytes[self.pos]) {
             return;
@@ -2591,11 +2594,15 @@ impl<'s> JsScanner<'s> {
         if self.pos >= self.bytes.len() {
             return;
         }
+        // Array elements and `.join(...)` arguments can contain nested declarations.
+        // Count this descent too, even when no tools call, object, or template is involved.
+        self.nesting += 1;
         if let Some(val) = self.try_read_string_or_array_join() {
             if self.bindings.len() < 256 {
                 self.bindings.insert(name, val);
             }
         }
+        self.nesting -= 1;
     }
 
     fn try_read_string_or_array_join(&mut self) -> Option<String> {
@@ -3271,6 +3278,8 @@ mod tests {
             ("{plan:[", "]}"),
             ("{search_query:[", "]}"),
             ("`${", "}`"),
+            ("const a = [(() => {", "return 0; })()];"),
+            ("const a = ['x'].join((() => {", "return ''; })());"),
         ] {
             let script = "tools.update_plan(".to_owned()
                 + &open.repeat(5000)
