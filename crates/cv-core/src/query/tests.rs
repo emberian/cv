@@ -631,3 +631,21 @@ fn created_is_never_answered_from_the_update_time() {
     };
     assert_eq!(q("created>2026-05-01").eval(&parsed).unwrap(), Tri::False);
 }
+
+#[test]
+fn excessive_query_nesting_is_an_error() {
+    for (open, close) in [("(", ")"), ("NOT ", ""), ("NOT (", ")")] {
+        let source = format!("{}id:a{}", open.repeat(12_000), close.repeat(12_000));
+        let err = SessionQuery::parse(&source).unwrap_err();
+        assert!(err.contains("query nesting exceeds 64 levels"), "{err}");
+    }
+    // The bound is nesting, not total operators: a wide query still parses normally.
+    let wide = std::iter::repeat_n("id:a", 1_000).collect::<Vec<_>>().join(" OR ");
+    assert!(SessionQuery::parse(&wide).is_ok());
+    for (open, close) in [("(", ")"), ("NOT ", "")] {
+        let source = format!("{}id:a{}", open.repeat(MAX_QUERY_DEPTH), close.repeat(MAX_QUERY_DEPTH));
+        assert!(SessionQuery::parse(&source).is_ok());
+        let over = format!("{open}{source}{close}");
+        assert!(SessionQuery::parse(&over).is_err());
+    }
+}

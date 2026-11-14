@@ -412,7 +412,7 @@ impl SessionQuery {
         let expr = if p.toks.is_empty() {
             Expr::All
         } else {
-            let e = p.parse_or()?;
+            let e = p.parse_or(0)?;
             if p.i < p.toks.len() {
                 return Err(format!(
                     "unexpected {:?} (unbalanced parens?) — see `cv schema`",
@@ -891,6 +891,9 @@ fn lex(input: &str) -> Result<Vec<Tok>, String> {
 // Parser (recursive descent).
 // ---------------------------------------------------------------------------
 
+// Bound parser recursion and the expression tree traversed by evaluation and drop.
+const MAX_QUERY_DEPTH: usize = 64;
+
 struct Parser {
     toks: Vec<Tok>,
     i: usize,
@@ -901,11 +904,11 @@ impl Parser {
         self.toks.get(self.i)
     }
 
-    fn parse_or(&mut self) -> Result<Expr, String> {
-        let mut terms = vec![self.parse_and()?];
+    fn parse_or(&mut self, depth: usize) -> Result<Expr, String> {
+        let mut terms = vec![self.parse_and(depth)?];
         while matches!(self.peek(), Some(Tok::Or)) {
             self.i += 1;
-            terms.push(self.parse_and()?);
+            terms.push(self.parse_and(depth)?);
         }
         Ok(if terms.len() == 1 {
             terms.pop().unwrap()
@@ -914,17 +917,17 @@ impl Parser {
         })
     }
 
-    fn parse_and(&mut self) -> Result<Expr, String> {
-        let mut terms = vec![self.parse_unary()?];
+    fn parse_and(&mut self, depth: usize) -> Result<Expr, String> {
+        let mut terms = vec![self.parse_unary(depth)?];
         loop {
             match self.peek() {
                 // Explicit AND, or juxtaposition (anything that can start a unary) = implicit AND.
                 Some(Tok::And) => {
                     self.i += 1;
-                    terms.push(self.parse_unary()?);
+                    terms.push(self.parse_unary(depth)?);
                 }
                 Some(Tok::Word(_)) | Some(Tok::Not) | Some(Tok::LParen) => {
-                    terms.push(self.parse_unary()?);
+                    terms.push(self.parse_unary(depth)?);
                 }
                 _ => break,
             }
@@ -936,19 +939,24 @@ impl Parser {
         })
     }
 
-    fn parse_unary(&mut self) -> Result<Expr, String> {
+    fn parse_unary(&mut self, depth: usize) -> Result<Expr, String> {
+        if depth > MAX_QUERY_DEPTH {
+            return Err(format!(
+                "query nesting exceeds {MAX_QUERY_DEPTH} levels — see `cv schema`"
+            ));
+        }
         if matches!(self.peek(), Some(Tok::Not)) {
             self.i += 1;
-            return Ok(Expr::Not(Box::new(self.parse_unary()?)));
+            return Ok(Expr::Not(Box::new(self.parse_unary(depth + 1)?)));
         }
-        self.parse_primary()
+        self.parse_primary(depth)
     }
 
-    fn parse_primary(&mut self) -> Result<Expr, String> {
+    fn parse_primary(&mut self, depth: usize) -> Result<Expr, String> {
         match self.peek() {
             Some(Tok::LParen) => {
                 self.i += 1;
-                let e = self.parse_or()?;
+                let e = self.parse_or(depth + 1)?;
                 match self.peek() {
                     Some(Tok::RParen) => {
                         self.i += 1;
