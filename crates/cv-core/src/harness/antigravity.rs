@@ -1434,10 +1434,13 @@ fn peek_view_prefix(view: JsonView<'_>, max_bytes: usize) -> Result<String> {
 // ---------------------------------------------------------------------------
 
 fn extract_persisted_output_path(head: &str) -> Option<String> {
-    const MARKER: &str = "You can find the full output in a file at ";
-    let idx = head.find(MARKER)?;
-    let rest = &head[idx + MARKER.len()..];
-    let token = rest.lines().next()?.trim().trim_end_matches('.');
+    // A tool can read another transcript containing this notice as escaped JSON.
+    // Only a standalone harness notice points to this result's persisted output;
+    // searching anywhere in the body mistakes quoted previews for filenames.
+    const MARKER: &str =
+        "The tool's output was truncated due to being too long. You can find the full output in a file at ";
+    let rest = head.lines().find_map(|line| line.strip_prefix(MARKER))?;
+    let token = rest.trim().trim_end_matches('.');
     if token.is_empty() {
         return None;
     }
@@ -2069,6 +2072,42 @@ mod tests {
 
     const PARENT_ID: &str = "11111111-2222-4333-8444-555555555555";
     const CHILD_ID: &str = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+
+    #[test]
+    fn persisted_output_notices_ignore_quoted_transcripts() {
+        let path = "/workspace/demo/.system_generated/steps/229/output.txt";
+        let notice = format!(
+            "The tool's output was truncated due to being too long. You can find the full output in a file at file://{path}.\n\nHere is a preview with the middle of the output truncated:\npreview"
+        );
+        let quoted = serde_json::to_string(&json!({"content": notice})).unwrap();
+        for (body, expected) in [
+            (notice.clone(), Some(path)),
+            (format!("Created At: today\nCompleted At: today\n{notice}"), Some(path)),
+            (
+                format!("<SYSTEM_MESSAGE>\nTask finished with result:\n{notice}\n</SYSTEM_MESSAGE>"),
+                Some(path),
+            ),
+            (format!("File Path: transcript.jsonl\n{quoted}"), None),
+            (
+                format!(
+                    "File Path: transcript.jsonl\n{}",
+                    serde_json::to_string(&quoted).unwrap()
+                ),
+                None,
+            ),
+        ] {
+            let jsonl = serde_json::to_string(&json!({
+                "step_index": 244,
+                "source": "MODEL",
+                "type": "GENERIC",
+                "status": "DONE",
+                "content": body
+            }))
+            .unwrap();
+            let session = parse_str(PARENT_ID, &jsonl, None).unwrap();
+            assert_eq!(session.messages[0].content[0].persisted_output_path(), expected);
+        }
+    }
 
     #[test]
     fn parses_steps_tools_denials_compaction_and_subagents() {
