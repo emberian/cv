@@ -2468,7 +2468,7 @@ impl<'s> JsScanner<'s> {
                 }
             }
             b'x' if self.pos + 2 <= self.bytes.len() => {
-                if let Ok(code) = u8::from_str_radix(&self.src[self.pos..self.pos + 2], 16) {
+                if let Ok(code) = u8::from_str_radix(self.src.get(self.pos..self.pos + 2).unwrap_or(""), 16) {
                     buf.push(code as char);
                     self.pos += 2;
                 }
@@ -2489,7 +2489,7 @@ impl<'s> JsScanner<'s> {
                         self.pos += 1;
                     }
                 } else if self.pos + 4 <= self.bytes.len() {
-                    if let Ok(code) = u32::from_str_radix(&self.src[self.pos..self.pos + 4], 16) {
+                    if let Ok(code) = u32::from_str_radix(self.src.get(self.pos..self.pos + 4).unwrap_or(""), 16) {
                         if let Some(ch) = char::from_u32(code) {
                             buf.push(ch);
                         }
@@ -3235,6 +3235,29 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn codex_exec_malformed_hex_escapes_preserve_utf8_boundaries() {
+        for escape in [r"\x🦀", r"\x€", r"\u€aa", r"\u🦀a", r"\u{🦀}", r"\x", r"\u"] {
+            for quote in ["'", "\"", "`"] {
+                let script = format!(
+                    "tools.exec_command({{cmd: {quote}{escape}{quote}}}); tools.exec_command({{cmd: 'after'}});"
+                );
+                let mut scanner = JsScanner::new(&script);
+                scanner.scan_all();
+                assert_eq!(scanner.pos, script.len(), "{script}");
+                assert!(
+                    scanner.calls.iter().any(|call| matches!(call,
+                        JsCall::ExecCommand { cmd: Some(cmd), .. } if cmd == "after"
+                    )),
+                    "{script}"
+                );
+            }
+        }
+        let mut scanner = JsScanner::new(r"'\x41\u0042\u{1F980}'");
+        scanner.scan_all();
+        assert_eq!(scanner.literals, ["AB🦀"]);
     }
 
     #[test]
