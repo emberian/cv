@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.19.3 — 2026-11-13 — parser termination and malformed-input recovery
+
+- JavaScript tool classification terminates on mismatched delimiters and handles malformed Unicode escapes without panicking, preventing runaway search workers.
+- JavaScript semantic extraction bounds recursive nesting while continuing to scan subsequent tool calls.
+- Deeply nested session queries return a nesting-limit error instead of overflowing the stack in CLI and HTTP requests.
+
 ## 0.19.2 — 2026-11-13 — maintained HTTP transport and verified HTTPS
 
 - `cv serve` uses axum/Hyper for HTTP and asynchronous SSE, preserving bounded streaming, authorization, connection limits, and stalled-client deadlines.

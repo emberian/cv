@@ -425,7 +425,7 @@ dependencies = [
 
 [[package]]
 name = "clustervision-app"
-version = "0.19.2"
+version = "0.19.3"
 dependencies = [
  "clustervision-core",
  "cv-search",
@@ -440,7 +440,7 @@ dependencies = [
 
 [[package]]
 name = "clustervision-core"
-version = "0.19.2"
+version = "0.19.3"
 dependencies = [
  "anyhow",
  "blake3",
@@ -651,7 +651,7 @@ checksum = "52560adf09603e58c9a7ee1fe1dcb95a16927b17c127f0ac02d6e768a0e25bc1"
 
 [[package]]
 name = "cv-search"
-version = "0.19.2"
+version = "0.19.3"
 dependencies = [
  "anyhow",
  "chrono",

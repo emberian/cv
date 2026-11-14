@@ -27,8 +27,8 @@ hyper-util = { version = "0.1", features = ["tokio", "service"] }
 # default; a CLI whose output is made for pipes must die quietly like every other
 # unix tool. Unix-only (no-op dep elsewhere).
 libc = "0.2"
-cv-core = { path = "../cv-core", version = "0.19.2", package = "clustervision-core" }
-cv-search = { path = "../cv-search", version = "0.19.2" }
+cv-core = { path = "../cv-core", version = "0.19.3", package = "clustervision-core" }
+cv-search = { path = "../cv-search", version = "0.19.3" }
 clap.workspace = true
 anyhow.workspace = true
 serde.workspace = true
