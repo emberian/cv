@@ -117,10 +117,11 @@ fn grouped_help(cmd: &clap::Command) -> String {
     help_template = "{before-help}{about-with-newline}\n{usage-heading} {usage}\n\nOptions:\n{options}\n{after-help}"
 )]
 struct Cli {
-    /// Leave cv's stores untouched (also CV_FROZEN=1). Normally full reads record counts and
-    /// affordances, and events refreshes stale sessions for later reads. Frozen reads record
-    /// nothing: events streams stale sessions, ls keeps unknown counts as a dash, and scan/usage
-    /// caches and skipped sources are not saved. Commands that write stores or sessions exit 2.
+    /// Leave cv's stores untouched (also CV_FROZEN=1 or CV_FROZEN=true). Normally full reads
+    /// record counts and affordances, and events refreshes stale sessions for later reads. Frozen
+    /// reads record nothing: events streams stale sessions, ls keeps unknown counts as a dash,
+    /// hooks enforce guards without writing telemetry, and scan/usage caches are not saved.
+    /// Commands that write stores or sessions exit 2.
     #[arg(long, global = true)]
     frozen: bool,
 
@@ -1171,41 +1172,64 @@ fn run() -> Result<()> {
     cv_core::env::Env::install(env.clone());
     let _env = env.enter();
     if cv_core::env::frozen() {
-        let writes = match &cli.cmd {
-            Cmd::Index { .. } | Cmd::Port { .. } | Cmd::Share { .. } | Cmd::Hook { .. } | Cmd::Watch { .. } => true,
-            Cmd::Task { action } => !matches!(
-                action,
+        let write_hint: Option<&str> = match &cli.cmd {
+            Cmd::Hook { .. } => None,
+            Cmd::Index { .. } => {
+                Some("use `cv search --scan` or `cv ls --fresh` for live reads, or run with CV_FROZEN=0")
+            }
+            Cmd::Port { .. } | Cmd::Share { .. } | Cmd::Watch { .. } => {
+                Some("run with CV_FROZEN=0 when writing sessions or stores is intended")
+            }
+            Cmd::Task { action } => match action {
                 task::TaskCmd::List { .. }
-                    | task::TaskCmd::Show { .. }
-                    | task::TaskCmd::Inbox { .. }
-                    | task::TaskCmd::Events { .. }
-            ),
-            Cmd::Prune { dry_run, .. } | Cmd::Rewind { dry_run, .. } | Cmd::Adopt { dry_run, .. } => !*dry_run,
+                | task::TaskCmd::Show { .. }
+                | task::TaskCmd::Inbox { .. }
+                | task::TaskCmd::Events { .. }
+                | task::TaskCmd::Sweep { .. } => None,
+                _ => Some("`cv task list|show|inbox|events|sweep` are read-only; run with CV_FROZEN=0 to mutate tasks"),
+            },
+            Cmd::Prune { dry_run, .. } | Cmd::Rewind { dry_run, .. } | Cmd::Adopt { dry_run, .. } => {
+                (!*dry_run).then_some("pass --dry-run to preview without writing, or run with CV_FROZEN=0")
+            }
             Cmd::Distill {
                 session,
                 agent_of,
                 pack,
                 out,
                 ..
-            } => *session || agent_of.is_some() || pack.is_some() || out.is_some(),
+            } => (*session || agent_of.is_some() || pack.is_some() || out.is_some())
+                .then_some("omit --session/--agent-of/--pack/--out to print to stdout, or run with CV_FROZEN=0"),
             Cmd::Splice {
                 session,
                 agent_of,
                 harness,
                 out,
                 ..
-            } => *session || agent_of.is_some() || harness.is_some() || out.is_some(),
-            Cmd::Hooks { action } => !matches!(action, HooksCmd::Show { .. }),
-            Cmd::Archive { action, .. } => matches!(action, ArchiveCmd::Sync { .. }),
-            Cmd::Config { add_export, rm_export } => add_export.is_some() || rm_export.is_some(),
-            Cmd::Pack { format, out, .. } => format == "session" || out.is_some(),
-            Cmd::Dataset { file, .. } => file.is_some(),
-            Cmd::Resume { launch, .. } => *launch,
-            Cmd::Retire { agent, .. } => agent.is_some(),
-            _ => false,
+            } => (*session || agent_of.is_some() || harness.is_some() || out.is_some()).then_some(
+                "omit --session/--agent-of/--harness/--out (e.g. --export md) to print to stdout, or run with CV_FROZEN=0",
+            ),
+            Cmd::Hooks { action } => (!matches!(action, HooksCmd::Show { .. }))
+                .then_some("use `cv hooks show` to inspect hook state, or run with CV_FROZEN=0"),
+            Cmd::Archive { action, .. } => matches!(action, ArchiveCmd::Sync { .. })
+                .then_some("use `cv archive ls` or `cv archive path` to inspect, or run with CV_FROZEN=0"),
+            Cmd::Config { add_export, rm_export } => (add_export.is_some() || rm_export.is_some())
+                .then_some("run `cv config` without flags to inspect, or run with CV_FROZEN=0"),
+            Cmd::Pack { format, out, .. } => (format == "session" || out.is_some())
+                .then_some("use `--format md` without --out to print to stdout, or run with CV_FROZEN=0"),
+            Cmd::Dataset { file, .. } => file
+                .is_some()
+                .then_some("omit --file to stream JSONL to stdout, or run with CV_FROZEN=0"),
+            Cmd::Resume { launch, .. } => (*launch)
+                .then_some("omit --launch to print the resume command, or run with CV_FROZEN=0"),
+            Cmd::Retire { agent, .. } => agent
+                .is_some()
+                .then_some("use `cv retire --list` to inspect retired agents, or run with CV_FROZEN=0"),
+            _ => None,
         };
-        if writes {
-            return usage("--frozen (CV_FROZEN=1) forbids this command: it writes stores or sessions");
+        if let Some(hint) = write_hint {
+            return usage(format!(
+                "--frozen (CV_FROZEN=1) forbids this command: it writes stores or sessions ({hint})"
+            ));
         }
     }
     // Long-running services scope reuse per request/poll, so cold private snapshots do not

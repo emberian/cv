@@ -250,41 +250,60 @@ impl StateStore {
         }
 
         let ro_flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-        let wal_path = path_with_suffix(&self.db_path, "-wal");
-        let wal_nonempty = || std::fs::metadata(&wal_path).is_ok_and(|m| m.len() > 0);
-        let conn = if crate::env::frozen() {
-            // A plain `SQLITE_OPEN_READ_ONLY` open of a WAL-mode database creates `-shm` (and an
-            // empty `-wal`) whenever they are absent, which `--frozen` forbids. So:
-            // - checkpointed store (no WAL frames): `immutable=1` opens nothing but the database;
-            // - live store (`-wal` has frames and its `-shm` exists): the WAL-aware reader reuses
-            //   the existing coordination files and creates none;
-            // - retained WAL without `-shm` (a copied or crashed store): read a private folded
-            //   copy, never recovering the WAL next to the original.
-            if !wal_nonempty() {
-                let uri = immutable_sqlite_uri(&self.db_path);
-                Connection::open_with_flags(uri, ro_flags | OpenFlags::SQLITE_OPEN_URI)?
-            } else if path_with_suffix(&self.db_path, "-shm").exists() {
-                Connection::open_with_flags(&self.db_path, ro_flags)?
+        let has_sidecar_frames =
+            || sidecar_nonempty(&self.db_path, "-wal") || sidecar_nonempty(&self.db_path, "-journal");
+        let open_immutable = || -> Result<(Connection, i64), StateError> {
+            let uri = immutable_sqlite_uri(&self.db_path);
+            let c = Connection::open_with_flags(uri, ro_flags | OpenFlags::SQLITE_OPEN_URI)?;
+            let _ = c.busy_timeout(Duration::from_millis(5_000));
+            let _ = c.execute_batch("PRAGMA query_only = ON;");
+            let ver = schema::current_schema_version(&c)?;
+            Ok((c, ver))
+        };
+        let open_folded = || -> Result<(Connection, i64), StateError> {
+            let c = open_private_folded_copy(&self.db_path)?;
+            let ver = schema::current_schema_version(&c)?;
+            Ok((c, ver))
+        };
+
+        let (conn, ver) = if crate::env::frozen() {
+            // A plain `SQLITE_OPEN_READ_ONLY` open of a WAL-mode database creates `-shm`/`-wal`
+            // when absent and writes a reader slot into `-shm` when present, mutating the store
+            // directory (and failing in read-only sandboxes). Under `--frozen`:
+            // - checkpointed store (no `-wal`/`-journal` frames): `immutable=1` opens only `state.db`;
+            // - live or retained WAL/journal frames: fold into a private temporary copy and read
+            //   that copy with `immutable=1`, leaving `state.db`, `-wal`, and `-shm` untouched.
+            if !has_sidecar_frames() {
+                open_immutable()?
             } else {
-                open_private_folded_copy(&self.db_path, &wal_path)?
+                open_folded()?
             }
         } else {
-            match Connection::open_with_flags(&self.db_path, ro_flags) {
-                Ok(c) => c,
-                Err(primary_err) => {
-                    // Only fall back to `immutable=1` when no non-empty `-wal` sidecar exists (e.g. a
-                    // checkpointed store on a read-only mount where SQLite cannot create `-shm`).
-                    if wal_nonempty() {
-                        return Err(StateError::Sqlite(primary_err));
+            let direct = (|| -> Result<(Connection, i64), rusqlite::Error> {
+                let c = Connection::open_with_flags(&self.db_path, ro_flags)?;
+                let _ = c.busy_timeout(Duration::from_millis(5_000));
+                let _ = c.execute_batch("PRAGMA query_only = ON;");
+                let ver: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+                Ok((c, ver))
+            })();
+            match direct {
+                Ok(pair) => pair,
+                Err(primary_err) if is_readonly_or_lock_fallback_err(&primary_err) => {
+                    // On read-only mounts, Seatbelt sandboxes, `0444` `-shm` files, or lock
+                    // contention, SQLite may fail either at `open_with_flags` or lazily on the
+                    // first read (`PRAGMA user_version`) with `SQLITE_READONLY_CANTINIT`,
+                    // `SQLITE_CANTOPEN`, `SQLITE_PERM`, or `SQLITE_BUSY`. Degrade to `immutable=1`
+                    // when checkpointed, or fold WAL/journal frames in a private temp copy so
+                    // WAL-committed retirements and tasks remain visible.
+                    if !has_sidecar_frames() {
+                        open_immutable().map_err(|_| StateError::Sqlite(primary_err))?
+                    } else {
+                        open_folded().map_err(|_| StateError::Sqlite(primary_err))?
                     }
-                    let uri = immutable_sqlite_uri(&self.db_path);
-                    Connection::open_with_flags(uri, ro_flags | OpenFlags::SQLITE_OPEN_URI)
-                        .map_err(|_| StateError::Sqlite(primary_err))?
                 }
+                Err(primary_err) => return Err(StateError::Sqlite(primary_err)),
             }
         };
-        let _ = conn.busy_timeout(Duration::from_millis(2_000));
-        let ver = schema::current_schema_version(&conn)?;
         if ver > schema::STATE_SCHEMA_VERSION {
             return Err(StateError::NewerSchema {
                 found: ver,
@@ -337,33 +356,113 @@ fn path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(os)
 }
 
-/// Read a store whose `-wal` holds frames but whose `-shm` is gone without recovering it in place:
-/// copy the database and WAL into a private directory, fold the WAL into that copy, and hand back
-/// an `immutable=1` connection over it. The copy is unlinked once the connection holds it open
-/// (where the platform refuses to unlink an open file it is left for the OS temp cleaner).
-fn open_private_folded_copy(db_path: &Path, wal_path: &Path) -> Result<Connection, StateError> {
-    let dir = std::env::temp_dir().join(format!("cv-state-frozen-{}", uuid::Uuid::new_v4().simple()));
-    #[cfg(unix)]
-    ensure_private_dir_0700(&dir)?;
-    #[cfg(not(unix))]
-    std::fs::create_dir_all(&dir)?;
-    let copy = dir.join("state.db");
-    let opened = (|| -> Result<Connection, StateError> {
-        std::fs::copy(db_path, &copy)?;
-        std::fs::copy(wal_path, path_with_suffix(&copy, "-wal"))?;
-        set_restrictive_file_mode(&copy);
-        {
-            let fold = Connection::open(&copy)?;
-            let _mode: String = fold.query_row("PRAGMA journal_mode = DELETE", [], |r| r.get(0))?;
+fn sidecar_nonempty(path: &Path, suffix: &str) -> bool {
+    std::fs::metadata(path_with_suffix(path, suffix)).is_ok_and(|m| m.len() > 0)
+}
+
+fn is_readonly_or_lock_fallback_err(err: &rusqlite::Error) -> bool {
+    let Some(sqlite_err) = err.sqlite_error() else {
+        return false;
+    };
+    matches!(
+        sqlite_err.code,
+        rusqlite::ErrorCode::DatabaseBusy
+            | rusqlite::ErrorCode::DatabaseLocked
+            | rusqlite::ErrorCode::ReadOnly
+            | rusqlite::ErrorCode::CannotOpen
+            | rusqlite::ErrorCode::PermissionDenied
+            | rusqlite::ErrorCode::SystemIoFailure
+    ) || (sqlite_err.extended_code & 0xff) == rusqlite::ffi::SQLITE_PROTOCOL
+}
+
+fn copy_optional_sidecar(src: &Path, dst: &Path) -> std::io::Result<bool> {
+    match std::fs::copy(src, dst) {
+        Ok(bytes) => {
+            set_restrictive_file_mode(dst);
+            Ok(bytes > 0)
         }
-        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_URI;
-        let conn = Connection::open_with_flags(immutable_sqlite_uri(&copy), flags)?;
-        // Touch the file so the connection holds it open before the directory entry goes away.
-        let _: i64 = conn.query_row("PRAGMA schema_version", [], |r| r.get(0))?;
-        Ok(conn)
-    })();
-    let _ = std::fs::remove_dir_all(&dir);
-    opened
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+fn private_temp_base() -> PathBuf {
+    crate::env::var_os("TMPDIR")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir())
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+/// Read a store whose `-wal` or `-journal` holds frames without touching `-shm` or recovering in
+/// place: copy the database and sidecars into a private `0700` directory, fold them into that copy
+/// (`0600` so read-only `0444` source files still fold cleanly), and hand back an `immutable=1`
+/// `query_only` connection over it. The copy is unlinked once the connection holds its fd open.
+fn open_private_folded_copy(db_path: &Path) -> Result<Connection, StateError> {
+    const MAX_ATTEMPTS: usize = 4;
+    let wal_src = path_with_suffix(db_path, "-wal");
+    let journal_src = path_with_suffix(db_path, "-journal");
+
+    for attempt in 0..MAX_ATTEMPTS {
+        let dir = private_temp_base().join(format!("cv-state-frozen-{}", uuid::Uuid::new_v4().simple()));
+        #[cfg(unix)]
+        ensure_private_dir_0700(&dir)?;
+        #[cfg(not(unix))]
+        std::fs::create_dir_all(&dir)?;
+        let copy = dir.join("state.db");
+        let copy_wal = path_with_suffix(&copy, "-wal");
+        let copy_journal = path_with_suffix(&copy, "-journal");
+
+        let before = std::fs::metadata(db_path)
+            .ok()
+            .and_then(|m| Some((m.len(), m.modified().ok()?)));
+        let wal_before = std::fs::metadata(&wal_src).ok().map(|m| m.len()).unwrap_or(0);
+
+        let opened = (|| -> Result<Connection, StateError> {
+            std::fs::copy(db_path, &copy)?;
+            set_restrictive_file_mode(&copy);
+            let copied_wal = copy_optional_sidecar(&wal_src, &copy_wal)?;
+            let copied_journal = copy_optional_sidecar(&journal_src, &copy_journal)?;
+
+            let after = std::fs::metadata(db_path)
+                .ok()
+                .and_then(|m| Some((m.len(), m.modified().ok()?)));
+            let wal_after = std::fs::metadata(&wal_src).ok().map(|m| m.len()).unwrap_or(0);
+            if attempt + 1 < MAX_ATTEMPTS && before != after && wal_after < wal_before {
+                return Err(StateError::Io(std::io::Error::other(
+                    "state.db checkpointed concurrently during snapshot copy",
+                )));
+            }
+
+            if copied_wal || copied_journal {
+                let fold = Connection::open(&copy)?;
+                let _mode: String = fold.query_row("PRAGMA journal_mode = DELETE", [], |r| r.get(0))?;
+            }
+            let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_URI;
+            let conn = Connection::open_with_flags(immutable_sqlite_uri(&copy), flags)?;
+            let _ = conn.busy_timeout(Duration::from_millis(5_000));
+            let _ = conn.execute_batch("PRAGMA query_only = ON;");
+            // Touch the file so the connection holds it open before the directory entry goes away.
+            let _: i64 = conn.query_row("PRAGMA schema_version", [], |r| r.get(0))?;
+            Ok(conn)
+        })();
+        let _ = std::fs::remove_dir_all(&dir);
+        match opened {
+            Ok(conn) => return Ok(conn),
+            Err(err) => {
+                let after = std::fs::metadata(db_path)
+                    .ok()
+                    .and_then(|m| Some((m.len(), m.modified().ok()?)));
+                let wal_after = std::fs::metadata(&wal_src).ok().map(|m| m.len()).unwrap_or(0);
+                if attempt + 1 < MAX_ATTEMPTS && (before != after || wal_after != wal_before) {
+                    std::thread::sleep(Duration::from_millis(2));
+                    continue;
+                }
+                return Err(err);
+            }
+        }
+    }
+    Err(StateError::Io(std::io::Error::other("failed to snapshot state.db")))
 }
 
 fn immutable_sqlite_uri(path: &Path) -> String {

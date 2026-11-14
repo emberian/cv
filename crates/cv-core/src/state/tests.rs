@@ -779,7 +779,13 @@ fn frozen_reads_see_committed_wal_frames_without_touching_the_live_store() {
     let writer = store.open_writable().unwrap();
     store.append("op-wal", "d-wal", &json!({"x": 2})).unwrap();
     assert!(std::fs::metadata(base.join("state.db-wal")).is_ok_and(|m| m.len() > 0));
+    assert!(base.join("state.db-shm").exists());
     let before = dir_listing(&base);
+    let shm_bytes_before = std::fs::read(base.join("state.db-shm")).unwrap();
+    let shm_mtime_before = std::fs::metadata(base.join("state.db-shm"))
+        .unwrap()
+        .modified()
+        .unwrap();
 
     {
         let _frozen = crate::env::Env::from_vars([("CV_FROZEN", "1")]).enter();
@@ -796,8 +802,90 @@ fn frozen_reads_see_committed_wal_frames_without_touching_the_live_store() {
         before,
         "--frozen reads must not grow or reset the live WAL"
     );
+    assert_eq!(
+        std::fs::read(base.join("state.db-shm")).unwrap(),
+        shm_bytes_before,
+        "--frozen reads must not write reader marks into state.db-shm"
+    );
+    assert_eq!(
+        std::fs::metadata(base.join("state.db-shm"))
+            .unwrap()
+            .modified()
+            .unwrap(),
+        shm_mtime_before,
+        "--frozen reads must preserve state.db-shm mtime"
+    );
     drop(writer);
     std::fs::remove_dir_all(&base).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn readonly_sandbox_wal_store_reads_retirements_and_scales_concurrently() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let live = tmp_state_dir("sandbox-wal-live");
+    let store = StateStore::at_dir(&live);
+    let writer = store.open_writable().unwrap();
+    {
+        let _seed = crate::env::Env::from_vars([("CLUSTERVISION_HOME", live.as_os_str())]).enter();
+        crate::retired::retire("agent-sandboxed", Some("agent-successor"), Some("sess-parent")).unwrap();
+    }
+    assert!(std::fs::metadata(live.join("state.db-wal")).is_ok_and(|m| m.len() > 0));
+
+    // Copy `state.db`, `state.db-wal`, and `state.db-shm` into a directory locked down to 0444/0555
+    // (simulating a Seatbelt / read-only sandbox with uncheckpointed WAL retirements).
+    let ro_dir = tmp_state_dir("sandbox-wal-ro");
+    for name in ["state.db", "state.db-wal", "state.db-shm"] {
+        let src = live.join(name);
+        if src.exists() {
+            let dst = ro_dir.join(name);
+            std::fs::copy(&src, &dst).unwrap();
+            std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o444)).unwrap();
+        }
+    }
+    drop(writer);
+    std::fs::set_permissions(&ro_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    // 1. Non-frozen `retired::current()` inside a read-only sandbox still sees WAL retirements.
+    {
+        let _env = crate::env::Env::from_vars([("CLUSTERVISION_HOME", ro_dir.as_os_str())]).enter();
+        let map = crate::retired::current();
+        assert_eq!(
+            map.get("sandboxed").and_then(|r| r.successor.as_deref()),
+            Some("successor")
+        );
+    }
+
+    // 2. 8 concurrent `--frozen` subagents read the WAL-backed read-only store cleanly without contention.
+    let handles: Vec<_> = (0..8)
+        .map(|_| {
+            let ro_copy = ro_dir.clone();
+            std::thread::spawn(move || {
+                let _env = crate::env::Env::from_vars([
+                    ("CLUSTERVISION_HOME", ro_copy.to_str().unwrap()),
+                    ("CV_FROZEN", "true"),
+                ])
+                .enter();
+                let map = crate::retired::current();
+                assert_eq!(
+                    map.get("sandboxed").and_then(|r| r.successor.as_deref()),
+                    Some("successor")
+                );
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    // Restore permissions so cleanup succeeds.
+    std::fs::set_permissions(&ro_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    for entry in std::fs::read_dir(&ro_dir).unwrap().flatten() {
+        let _ = std::fs::set_permissions(entry.path(), std::fs::Permissions::from_mode(0o600));
+    }
+    std::fs::remove_dir_all(&live).ok();
+    std::fs::remove_dir_all(&ro_dir).ok();
 }
 
 #[test]

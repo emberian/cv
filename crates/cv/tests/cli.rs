@@ -4035,10 +4035,24 @@ fn frozen_writer_commands_exit_two_before_resolving_or_writing() {
         assert_eq!(before, frozen_store_snapshot(&w.cv_home));
     }
     let (ok, code, _, err) = w.cv_env(&["index"], &[("CV_FROZEN", "1")]);
-    assert!(!ok && code == 2 && err.contains("--frozen"), "{err}");
+    assert!(
+        !ok && code == 2 && err.contains("--frozen") && err.contains("cv search --scan"),
+        "{err}"
+    );
+    let (ok, code, _, err) = w.cv_env(&["prune", "missing"], &[("CV_FROZEN", "true")]);
+    assert!(
+        !ok && code == 2 && err.contains("--frozen") && err.contains("--dry-run"),
+        "{err}"
+    );
+    let (ok, code, _, err) = w.cv_env(&["retire", "agent-1"], &[("CV_FROZEN", "1")]);
+    assert!(
+        !ok && code == 2 && err.contains("--frozen") && err.contains("cv retire --list"),
+        "{err}"
+    );
     w.cv_ok(&["ls", "--frozen", "--json"]);
     w.cv_ok(&["hooks", "show", "--frozen", "--json"]);
     w.cv_ok(&["task", "list", "--frozen", "--json"]);
+    w.cv_ok(&["retire", "--list", "--frozen", "--json"]);
     assert_eq!(before, frozen_store_snapshot(&w.cv_home));
 }
 

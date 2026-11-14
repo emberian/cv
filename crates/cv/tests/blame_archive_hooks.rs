@@ -534,6 +534,8 @@ fn task_sweep_structural_branches_issue_tracker_refs_and_frozen_task_gates() {
     w.cv_ok(&["--frozen", "task", "show", &id1, "--json"]);
     w.cv_ok(&["--frozen", "task", "inbox", "cv", "--json"]);
     w.cv_ok(&["--frozen", "task", "events"]);
+    let (frozen_sweep, _) = w.cv_ok(&["--frozen", "task", "sweep", "--repo", repo.to_str().unwrap(), "--json"]);
+    assert_eq!(frozen_sweep, sweep_out);
     let mut after_frozen = std::collections::BTreeMap::new();
     snapshot_tree(&w.cv_home, &w.cv_home, &mut after_frozen);
     assert_eq!(
