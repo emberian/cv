@@ -24,7 +24,6 @@ date = "2026-11-11"
 
 [types]
 "table.steps" = { status = "handled", note = "metadata retains native reasoning/cache-write usage after payload compaction; historical text remains in full logs" }
-"store.swarm" = { status = "handled", note = "swarm/members.json supplements child descriptors, including killed workers without surviving transcripts" }
 # Per-session & summary SQLite sidecars (opened strictly read-only via harness::store::sqlite).
 "table.conversation_summaries" = { status = "handled", note = "summary catalog (title, workspace_uris, parent_conversation_id, agent_name)" }
 "column.conversation_id" = { status = "handled", note = "primary key UUID" }
