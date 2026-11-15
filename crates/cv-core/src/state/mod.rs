@@ -13,6 +13,7 @@ pub mod tables;
 #[cfg(test)]
 mod tests;
 
+use crate::harness::store::sqlite::SnapshotDirectory;
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -114,6 +115,29 @@ pub fn sqlite_version() -> &'static str {
 /// Bundled SQLite integer version (`3_051_003` or newer).
 pub fn sqlite_version_number() -> i32 {
     rusqlite::version_number()
+}
+
+/// Read-only state connection and ownership of any private snapshot backing it.
+///
+/// Since 0.20, [`StateStore::open_readonly`] returns this owner rather than a bare
+/// `rusqlite::Connection`. Borrowed connection operations remain available through `Deref`;
+/// explicit Rust return-type annotations must use `StateReadConnection`. CLI and JSON are unchanged.
+/// Mutable access to the connection owner is intentionally withheld: replacing it would detach
+/// the live connection from the snapshot lifetime.
+#[derive(Debug)]
+pub struct StateReadConnection {
+    // Rust drops fields in declaration order. Close SQLite before removing its backing files,
+    // including on Windows, where SQLite does not open database handles with FILE_SHARE_DELETE.
+    connection: Connection,
+    _snapshot: Option<SnapshotDirectory>,
+}
+
+impl std::ops::Deref for StateReadConnection {
+    type Target = Connection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.connection
+    }
 }
 
 /// Lightweight handle to an authoritative `state.db` location.
@@ -235,7 +259,7 @@ impl StateStore {
     /// files untouched; ordinary WAL readers may update SQLite coordination sidecars.
     ///
     /// Returns `Ok(None)` when `state.db` does not exist yet or is an uninitialized 0-version file.
-    pub fn open_readonly(&self) -> Result<Option<Connection>, StateError> {
+    pub fn open_readonly(&self) -> Result<Option<StateReadConnection>, StateError> {
         let meta = match std::fs::metadata(&self.db_path) {
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -252,7 +276,7 @@ impl StateStore {
         }
 
         let ro_flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-        let open_folded = || -> Result<(Connection, i64), StateError> {
+        let open_folded = || -> Result<(StateReadConnection, i64), StateError> {
             let c = open_private_folded_copy(&self.db_path)?;
             let ver = schema::current_schema_version(&c)?;
             Ok((c, ver))
@@ -271,7 +295,13 @@ impl StateStore {
                 Ok((c, ver))
             })();
             match direct {
-                Ok(pair) => pair,
+                Ok((connection, ver)) => (
+                    StateReadConnection {
+                        connection,
+                        _snapshot: None,
+                    },
+                    ver,
+                ),
                 Err(primary_err) if is_readonly_or_lock_fallback_err(&primary_err) => {
                     // Recovery and reader marks may require writes even on a read-only open.
                     // Fold a stable private copy instead, including any retained WAL/journal.
@@ -369,12 +399,16 @@ fn private_temp_base() -> PathBuf {
 /// Read a stable store snapshot, including any WAL/journal frames, without touching source SHM or recovering in
 /// place: copy the database and sidecars into a private `0700` directory, fold them into that copy
 /// (`0600` so read-only `0444` source files still fold cleanly), and hand back an `immutable=1`
-/// `query_only` connection over it. The copy is unlinked once the connection holds its fd open.
-fn open_private_folded_copy(db_path: &Path) -> Result<Connection, StateError> {
+/// `query_only` connection over it. Unlink immediately where allowed; the owner retries removal
+/// after the connection closes on platforms that prohibit deleting an open database.
+fn open_private_folded_copy(db_path: &Path) -> Result<StateReadConnection, StateError> {
     open_private_folded_copy_with_check(db_path, || {})
 }
 
-fn open_private_folded_copy_with_check(db_path: &Path, mut copied: impl FnMut()) -> Result<Connection, StateError> {
+fn open_private_folded_copy_with_check(
+    db_path: &Path,
+    mut copied: impl FnMut(),
+) -> Result<StateReadConnection, StateError> {
     const MAX_ATTEMPTS: usize = 4;
     let wal_src = path_with_suffix(db_path, "-wal");
     let journal_src = path_with_suffix(db_path, "-journal");
@@ -385,7 +419,8 @@ fn open_private_folded_copy_with_check(db_path: &Path, mut copied: impl FnMut())
         ensure_private_dir_0700(&dir)?;
         #[cfg(not(unix))]
         std::fs::create_dir_all(&dir)?;
-        let copy = dir.join("state.db");
+        let snapshot = SnapshotDirectory::retain_owned(dir).map_err(std::io::Error::other)?;
+        let copy = snapshot.path().join("state.db");
         let copy_wal = path_with_suffix(&copy, "-wal");
         let copy_journal = path_with_suffix(&copy, "-journal");
 
@@ -415,13 +450,20 @@ fn open_private_folded_copy_with_check(db_path: &Path, mut copied: impl FnMut())
             let conn = Connection::open_with_flags(immutable_sqlite_uri(&copy), flags)?;
             let _ = conn.busy_timeout(Duration::from_millis(5_000));
             let _ = conn.execute_batch("PRAGMA query_only = ON;");
-            // Touch the file so the connection holds it open before the directory entry goes away.
+            // Validate the private database before handing ownership to the caller.
             let _: i64 = conn.query_row("PRAGMA schema_version", [], |r| r.get(0))?;
             Ok(conn)
         })();
-        let _ = std::fs::remove_dir_all(&dir);
         match opened {
-            Ok(conn) => return Ok(conn),
+            Ok(connection) => {
+                // Preserve Unix's crash-safe unlink while the fd keeps the snapshot alive.
+                // Windows rejects unlinking SQLite's open handle; ownership retries on close.
+                snapshot.remove_now();
+                return Ok(StateReadConnection {
+                    connection,
+                    _snapshot: Some(snapshot),
+                });
+            }
             Err(err) => {
                 if attempt + 1 < MAX_ATTEMPTS && before != identities() {
                     std::thread::sleep(Duration::from_millis(2));

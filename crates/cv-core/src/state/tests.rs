@@ -1360,3 +1360,59 @@ fn private_state_snapshot_retries_changed_wal_and_refuses_an_unstable_final_copy
     drop(writer);
     std::fs::remove_dir_all(base).unwrap();
 }
+
+#[test]
+fn frozen_state_backing_is_owned_until_connection_closes() {
+    let world = crate::test_world("state-read-owner");
+    let temporary = world.base.join("private-snapshots");
+    std::fs::create_dir(&temporary).unwrap();
+    let store = StateStore::at(world.cv_home.join("state.db"));
+    store.append("before", "before", &json!({})).unwrap();
+    let before = std::fs::read(store.path()).unwrap();
+    let before_identity = crate::source::FileId::at(store.path());
+    let conn = {
+        let _frozen = crate::env::Env::from_vars([("TMPDIR", temporary.as_os_str())])
+            .with_frozen()
+            .enter();
+        store.open_readonly().unwrap().unwrap()
+    };
+    let backing = conn._snapshot.as_ref().unwrap().path().to_owned();
+    #[cfg(windows)]
+    assert!(
+        backing.join("state.db").exists(),
+        "Windows keeps the open backing until close"
+    );
+    #[cfg(unix)]
+    assert!(
+        !backing.exists(),
+        "Unix must preserve immediate unlink for crash-safe cleanup"
+    );
+    let count: i64 = conn
+        .query_row("SELECT count(*) FROM capture_inbox", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 1);
+    assert!(conn.execute("DELETE FROM capture_inbox", []).is_err());
+    drop(conn);
+    assert!(
+        !backing.exists(),
+        "close SQLite before removing its backing, including on Windows"
+    );
+    assert_eq!(std::fs::read_dir(&temporary).unwrap().count(), 0);
+    assert_eq!(std::fs::read(store.path()).unwrap(), before);
+    assert_eq!(crate::source::FileId::at(store.path()), before_identity);
+}
+
+#[test]
+fn rejected_state_snapshot_releases_its_private_backing() {
+    let world = crate::test_world("state-read-owner-failure");
+    let temporary = world.base.join("private-snapshots");
+    std::fs::create_dir(&temporary).unwrap();
+    let store = StateStore::at(world.cv_home.join("state.db"));
+    std::fs::write(store.path(), b"not a SQLite database").unwrap();
+    let _frozen = crate::env::Env::from_vars([("TMPDIR", temporary.as_os_str())])
+        .with_frozen()
+        .enter();
+    assert!(store.open_readonly().is_err());
+    assert_eq!(std::fs::read_dir(&temporary).unwrap().count(), 0);
+    assert_eq!(std::fs::read(store.path()).unwrap(), b"not a SQLite database");
+}

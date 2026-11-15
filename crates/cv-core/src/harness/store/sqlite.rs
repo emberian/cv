@@ -38,6 +38,7 @@ pub(crate) use derived::DERIVE_OPENS;
 mod selection;
 mod snapshots;
 pub(crate) use selection::Selection;
+pub(crate) use snapshots::SnapshotDirectory;
 
 const LIVE_WAL_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(50);
 const COLD_SNAPSHOT_TTL: std::time::Duration = std::time::Duration::from_millis(250);

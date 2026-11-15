@@ -236,6 +236,37 @@ impl Owner {
     }
 }
 
+/// An operation-owned SQLite backing directory, removed only if its identity still matches.
+/// Keep this guard after its connection field so Windows closes the database before cleanup.
+#[derive(Debug)]
+pub(crate) struct SnapshotDirectory {
+    path: PathBuf,
+    identity: Identity,
+}
+
+impl SnapshotDirectory {
+    pub(crate) fn retain_owned(path: PathBuf) -> Result<Self> {
+        let path = std::path::absolute(path)?;
+        let identity = snapshot_identity(&path)?;
+        Ok(Self { path, identity })
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Unix can unlink an open backing immediately; Windows may need the owner's drop retry.
+    pub(crate) fn remove_now(&self) {
+        remove_snapshot_directory(&self.path, self.identity);
+    }
+}
+
+impl Drop for SnapshotDirectory {
+    fn drop(&mut self) {
+        self.remove_now();
+    }
+}
+
 /// Bind individual cold backings to their directory inode too: the owning tree's
 /// recognition record does not authorize an eagerly dropped backing at a reused path.
 pub(super) fn snapshot_identity(path: &Path) -> Result<Identity> {
@@ -481,6 +512,21 @@ mod tests {
         };
         (Scratch(directory), namespace)
     }
+    #[test]
+    fn owned_snapshot_directory_cleanup_preserves_a_replacement() {
+        let (scratch, _) = fixture();
+        let path = scratch.0.join("backing");
+        fs::create_dir(&path).unwrap();
+        let owned = SnapshotDirectory::retain_owned(path.clone()).unwrap();
+        let moved = scratch.0.join("moved-backing");
+        fs::rename(&path, &moved).unwrap();
+        fs::create_dir(&path).unwrap();
+        fs::write(path.join("replacement"), b"keep").unwrap();
+        drop(owned);
+        assert_eq!(fs::read(path.join("replacement")).unwrap(), b"keep");
+        assert!(moved.exists());
+    }
+
     /// Beside a writable catalog, private; a frozen environment keeps the temporary directory.
     #[test]
     fn namespace_stages_beside_the_catalog_unless_frozen() {

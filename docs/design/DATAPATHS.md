@@ -101,6 +101,21 @@ Registry: `cv-core/src/harness/mod.rs`; implementations under `cv-core/src/harne
 Directory entry sizes and whole database sizes are **not** per-session transcript byte counts.
 Compressed, encoded, scanned, decoded and emitted bytes must be labeled separately.
 
+## State read connection ownership
+
+Frozen state reads and read-only fallback snapshots retain cleanup ownership until the
+SQLite connection closes. Unix unlinks the private backing immediately while its open file
+keeps the snapshot alive, preserving cleanup even if the process is killed. Windows prohibits
+deleting an open SQLite database; the guard retries removal after the connection closes.
+The guard reuses native SQLite snapshot identity checks, so cleanup cannot remove a different
+directory substituted at the same path. Failed opens release their private backing as well.
+
+Rust API compatibility in 0.20: `StateStore::open_readonly` now returns
+`Result<Option<StateReadConnection>, StateError>`. The owner implements `Deref`
+to `rusqlite::Connection`, preserving borrowed query operations and inferred callers; explicit
+return-type annotations must change. It withholds mutable ownership access so the connection
+cannot be replaced and separated from its backing. CLI commands and JSON shapes are unchanged.
+
 ## Full-text schema replacement
 
 An incompatible full-text index is never cleared at open. The indexer locks its existing
