@@ -827,3 +827,44 @@ fn a_linked_attachment_missing_at_read_time_is_a_coverage_limitation() {
     let present = only(sessions(&world.base)).1;
     assert!(!limitations(&present).contains(&"missing_attachments".to_owned()));
 }
+
+#[test]
+fn the_forest_names_the_call_that_spawned_each_child_or_none() {
+    let world = world("agy-writer-forest-calls");
+    // Children of `invoke_subagent`: the forest's call is the one the session records.
+    let root = store(&world, "1.5.9-subagents", true);
+    let read = sessions(&root);
+    let mut linked = 0;
+    for (reference, session) in read.values() {
+        let Some(described) = session.extra["antigravity"]["subagents"].as_object() else {
+            continue;
+        };
+        let stored_calls: Vec<String> = stored_calls(&stored(&root, &reference.id))
+            .into_iter()
+            .map(|(id, _, _)| id)
+            .collect();
+        for agent in cv_core::subagent_tree_of(reference).unwrap() {
+            let call = agent.tool_use_id.expect("the store names the spawning call");
+            assert_eq!(described[&agent.session.id]["call_id"], call.as_str());
+            assert!(stored_calls.contains(&call), "{call} is not a call the writer stored");
+            linked += 1;
+        }
+    }
+    assert!(linked >= 2, "the capture has two children");
+
+    // Swarm members: `spawnStepIndex` is not their spawn, so the forest names no call
+    // rather than one that matches nothing.
+    let root = store(&world, "1.5.9-swarm", true);
+    let (coordinator, _) = members(&root);
+    let read = sessions(&root);
+    let (reference, _) = &read[&coordinator];
+    let calls: Vec<String> = stored_calls(&stored(&root, &coordinator))
+        .into_iter()
+        .map(|(id, _, _)| id)
+        .collect();
+    for agent in cv_core::subagent_tree_of(reference).unwrap() {
+        if let Some(call) = agent.tool_use_id {
+            assert!(calls.contains(&call), "{call} is not a call the writer stored");
+        }
+    }
+}

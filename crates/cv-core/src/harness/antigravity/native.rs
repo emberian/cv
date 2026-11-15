@@ -61,6 +61,77 @@ pub(super) fn open(path: &Path, complete: bool) -> Result<jsonl::Read> {
     Ok(input.decoded(output, len))
 }
 
+/// The `invoke_subagent` call that created each of `children`, from the typed result
+/// that names the conversation (`InvokeSubagent.results[].conversation_id`). The registry's
+/// `spawnStepIndex` is not that step: parallel spawns all record the last result.
+pub(super) fn spawn_calls(path: &Path, children: &[&str]) -> Result<BTreeMap<String, String>> {
+    let mut calls = BTreeMap::new();
+    if children.is_empty() {
+        return Ok(calls);
+    }
+    sqlite::open_ro(path)?.read_snapshot(|conn, _| {
+        if !sqlite::table_exists(conn, "steps") {
+            return Ok(());
+        }
+        // SQLite finds the rows that mention a child; only those are staged and decoded.
+        let mentions = vec!["instr(step_payload, CAST(? AS BLOB)) > 0"; children.len()].join(" OR ");
+        let mut query = conn.prepare(&format!(
+            "SELECT idx FROM steps WHERE step_payload IS NOT NULL AND ({mentions}) ORDER BY idx"
+        ))?;
+        let rows: Vec<i64> = query
+            .query_map(rusqlite::params_from_iter(children.iter()), |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        let stage = Stage::new()?;
+        let file = &stage.file;
+        for row in rows {
+            let (at, len) = stage.append(|out| {
+                sqlite::with_cell_reader(conn, "steps", "step_payload", row, |reader, _| {
+                    std::io::copy(reader, out)?;
+                    Ok(())
+                })
+            })?;
+            let step = Proto::read(file, at, len)?;
+            let inner = |message: &Proto, number: u32| message.last(number).map(|f| f.message(file)).transpose();
+            let text = |message: &Proto, number: u32| message.last(number).and_then(|f| f.string(file, 256).ok());
+            let Some(call) = inner(&step, 5)?
+                .map(|metadata| inner(&metadata, 4))
+                .transpose()?
+                .flatten()
+            else {
+                continue;
+            };
+            let (Some(id), Some("invoke_subagent")) = (text(&call, 1), text(&call, 2).as_deref()) else {
+                continue;
+            };
+            let Some(result) = inner(&step, 140)?
+                .map(|generic| inner(&generic, 2))
+                .transpose()?
+                .flatten()
+            else {
+                continue;
+            };
+            let Some(any) = inner(&result, 6)? else {
+                continue;
+            };
+            if !text(&any, 1).is_some_and(|url| url.ends_with("/exa.cortex.core.tools.InvokeSubagent")) {
+                continue;
+            }
+            let Some(spawned) = inner(&any, 2)? else {
+                continue;
+            };
+            for created in spawned.repeated(2) {
+                if let Some(child) = text(&created.message(file)?, 1) {
+                    if children.contains(&child.as_str()) {
+                        calls.entry(child).or_insert_with(|| id.clone());
+                    }
+                }
+            }
+        }
+        Ok(())
+    })?;
+    Ok(calls)
+}
+
 /// Private staging for native cells and for text assembled from them. One unlinked file
 /// serves many rows: a file per row cost an open, an unlink and a close for each of a
 /// session's thousands of steps. Ranges are immutable once appended.

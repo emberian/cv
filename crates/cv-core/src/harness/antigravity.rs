@@ -311,6 +311,16 @@ impl Adapter for Antigravity {
         }
         #[cfg(feature = "sqlite")]
         let summaries = read_summaries_map(&loc.app_data_dir.join("conversation_summaries.db")).unwrap_or_default();
+        #[cfg(feature = "sqlite")]
+        let spawn_calls = {
+            let children: Vec<&str> = descriptors.iter().map(|desc| desc.conversation_id.as_str()).collect();
+            let store = loc.app_data_dir.join("conversations").join(format!("{}.db", loc.id));
+            if store.is_file() {
+                native::spawn_calls(&store, &children).unwrap_or_default()
+            } else {
+                BTreeMap::new()
+            }
+        };
         let mut out = Vec::new();
         for desc in descriptors {
             if crate::publish::validate_output_id(&desc.conversation_id).is_err() {
@@ -351,9 +361,11 @@ impl Adapter for Antigravity {
                 .is_some_and(|t| !t.trim().is_empty());
                 apply_summary_fallback(&mut child_ref, sum, has_pbtxt);
             }
-            let tool_use_id = desc
-                .spawn_step_index
-                .map(|step| derived_call_id("antigravity", format!("{step}.0")));
+            // Only the store names the spawning call; `spawnStepIndex` does not identify it.
+            #[cfg(feature = "sqlite")]
+            let tool_use_id = spawn_calls.get(&desc.conversation_id).cloned();
+            #[cfg(not(feature = "sqlite"))]
+            let tool_use_id = None;
             out.push(crate::AgentRef {
                 session: child_ref,
                 agent_type: desc.type_name,
