@@ -53,6 +53,11 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[cfg(feature = "sqlite")]
+mod merge;
+#[cfg(feature = "sqlite")]
+mod native;
+
 const APP_DATA_SUBDIRS: &[&str] = &["antigravity-cli", "antigravity", "antigravity-ide"];
 
 const DENIALS: &[Denial] = &[
@@ -220,21 +225,19 @@ impl Adapter for Antigravity {
             return None;
         }
         let loc = BrainLoc::from_transcript(&parent.path)?;
-        select_brain_log(&loc.app_data_dir.join("brain").join(agent_session))
-            .map(|(_, path)| path)
-            .or_else(|| {
-                let descriptor = loc
-                    .brain_dir
-                    .join(".system_generated/subagents")
-                    .join(format!("{agent_session}.json"));
-                descriptor.is_file().then_some(descriptor).or_else(|| {
-                    read_subagent_descriptors(&loc.brain_dir)
-                        .ok()?
-                        .into_iter()
-                        .find(|desc| desc.conversation_id == agent_session)
-                        .map(|desc| desc.path)
-                })
+        select_session_source(&loc.app_data_dir, agent_session).or_else(|| {
+            let descriptor = loc
+                .brain_dir
+                .join(".system_generated/subagents")
+                .join(format!("{agent_session}.json"));
+            descriptor.is_file().then_some(descriptor).or_else(|| {
+                read_subagent_descriptors(&loc.brain_dir)
+                    .ok()?
+                    .into_iter()
+                    .find(|desc| desc.conversation_id == agent_session)
+                    .map(|desc| desc.path)
             })
+        })
     }
 
     fn forest(
@@ -264,9 +267,8 @@ impl Adapter for Antigravity {
             if !select(&desc.conversation_id, None) {
                 continue;
             }
-            let child_brain = loc.app_data_dir.join("brain").join(&desc.conversation_id);
-            let (mut child_ref, available) = match select_brain_log(&child_brain) {
-                Some((_, child_log)) => {
+            let (mut child_ref, available) = match select_session_source(&loc.app_data_dir, &desc.conversation_id) {
+                Some(child_log) => {
                     let Some(reference) = scan_transcript(&desc.conversation_id, &child_log, Some(&loc.app_data_dir))?
                     else {
                         continue;
@@ -385,6 +387,27 @@ impl Adapter for Antigravity {
                 }
             }
 
+            #[cfg(feature = "sqlite")]
+            for entry in super::read_dir_bulk_kept(&root.join("conversations"), &mut out.skipped) {
+                let path = root.join("conversations").join(&entry.name);
+                if !is_native_store(&path) || !path.is_file() {
+                    continue;
+                }
+                let Some(id) = path.file_stem().and_then(|s| s.to_str()).map(str::to_owned) else {
+                    continue;
+                };
+                if candidates.get(&id).is_none_or(|candidate| candidate.rank == 0) {
+                    candidates.insert(
+                        id,
+                        Candidate {
+                            rank: 1,
+                            transcript: path,
+                            app_data_dir: Some(root.clone()),
+                        },
+                    );
+                }
+            }
+
             // Also support flat `*.jsonl` transcripts when `with_home` points directly at a
             // directory of exported Antigravity step logs (excluding `history.jsonl`).
             for entry in super::read_dir_bulk_kept(root, &mut out.skipped) {
@@ -475,6 +498,21 @@ impl Adapter for Antigravity {
         from: Start<'_>,
         sink: &mut dyn MessageSink,
     ) -> Result<Option<Session>> {
+        // An exporter can create the full-log file before its first flush. Empty
+        // history has no precedence over a surviving compact or native store.
+        let fallback = if fs::metadata(&r.path).is_ok_and(|meta| meta.len() == 0) {
+            BrainLoc::from_transcript(&r.path)
+                .and_then(|loc| select_session_source(&loc.app_data_dir, &loc.id))
+                .filter(|path| path != &r.path)
+                .map(|path| {
+                    let mut reference = r.clone();
+                    reference.path = path;
+                    reference
+                })
+        } else {
+            None
+        };
+        let r = fallback.as_ref().unwrap_or(r);
         if let Some(parent) = descriptor_parent(&r.path) {
             if matches!(from, Start::Checkpoint(_)) {
                 return Ok(None);
@@ -511,6 +549,15 @@ impl Adapter for Antigravity {
             session
                 .harness_extra_mut(Harness::Antigravity)
                 .insert("transcript_unavailable".into(), Value::Bool(true));
+            crate::coverage::ReadCoverage {
+                sources: [crate::coverage::ReadCoverage::MEMBER_REGISTRY.into()].into(),
+                limitations: [
+                    crate::coverage::ReadCoverage::METADATA_ONLY.into(),
+                    crate::coverage::ReadCoverage::MISSING_HISTORY.into(),
+                ]
+                .into(),
+            }
+            .attach(&mut session);
             sink.meta(&session);
             return Ok(Some(session));
         }
@@ -527,13 +574,19 @@ impl Adapter for Antigravity {
             // Header enrichment is owned from its read snapshot. Its dependencies still
             // invalidate cached products, but changing a title or live WAL cannot change
             // the bytes of a transcript span. Guard those bytes by their own source.
+            #[cfg(feature = "sqlite")]
+            let input = if is_native_store(&r.path) {
+                native::open(&r.path, opts.tier == Tier::Complete)?
+            } else {
+                open_transcript(&r.path)?
+            };
+            #[cfg(not(feature = "sqlite"))]
             let input = open_transcript(&r.path)?;
             if matches!(from, Start::Checkpoint(_)) {
                 return Ok(None);
             }
             let (s, enrich) = build_session_header(r, opts);
             let mut spawns = crate::affordance::AffordanceSink::new(Harness::Antigravity, sink);
-            spawns.meta(&s);
             let mut codec = StepCodec {
                 s,
                 opts: *opts,
@@ -555,6 +608,40 @@ impl Adapter for Antigravity {
                 order.ingest(&line)?;
                 Ok(Flow::Continue)
             })?;
+            #[cfg(feature = "sqlite")]
+            if !is_native_store(&r.path) {
+                if let Some(loc) = BrainLoc::from_transcript(&r.path) {
+                    let db = loc.app_data_dir.join("conversations").join(format!("{}.db", loc.id));
+                    if db.is_file() {
+                        // A missing or changing sidecar must not erase surviving export history.
+                        if let Ok(verified) = merge::verified(&input, &order, &db) {
+                            if !verified.is_empty() {
+                                order
+                                    .coverage
+                                    .sources
+                                    .insert(crate::coverage::ReadCoverage::NATIVE_STORE.into());
+                                order
+                                    .coverage
+                                    .limitations
+                                    .insert(crate::coverage::ReadCoverage::UNSUPPORTED_NATIVE_FIELDS.into());
+                            }
+                            codec.enrich.verified = verified;
+                        }
+                    }
+                }
+            }
+            if order.coverage.sources.is_empty() {
+                order.coverage.sources.insert(
+                    if r.path.extension().is_some_and(|ext| ext == "db") {
+                        crate::coverage::ReadCoverage::NATIVE_STORE
+                    } else {
+                        crate::coverage::ReadCoverage::EXPORTED_HISTORY
+                    }
+                    .into(),
+                );
+            }
+            order.coverage.attach(&mut codec.s);
+            spawns.meta(&codec.s);
             let mut records = input.records();
             crate::stream::guarded(&mut spawns, &input, |sink| {
                 let mut stopped = false;
@@ -634,7 +721,6 @@ pub fn stream_str(
             ..Session::new(id, Harness::Antigravity)
         };
         let mut spawns = crate::affordance::AffordanceSink::new(Harness::Antigravity, sink);
-        spawns.meta(&s);
         let mut codec = StepCodec {
             s,
             opts: *opts,
@@ -648,6 +734,12 @@ pub fn stream_str(
             order.ingest(&line)?;
             Ok(Flow::Continue)
         })?;
+        order
+            .coverage
+            .sources
+            .insert(crate::coverage::ReadCoverage::EXPORTED_HISTORY.into());
+        order.coverage.attach(&mut codec.s);
+        spawns.meta(&codec.s);
         let mut stopped = false;
         for (at, end) in order.steps.into_values() {
             jsonl::slice(&text.as_bytes()[at as usize..end as usize], |line| {
@@ -683,9 +775,46 @@ fn descriptor_parent(path: &Path) -> Option<String> {
 struct StepOrder {
     steps: BTreeMap<u64, (u64, u64)>,
     skipped: u64,
+    coverage: crate::coverage::ReadCoverage,
 }
 impl StepOrder {
     fn ingest(&mut self, line: &jsonl::Line<'_>) -> Result<()> {
+        use crate::coverage::ReadCoverage;
+        if let Some(view) = line.view {
+            if view.get("native_store")?.is_some() {
+                self.coverage.sources.insert(ReadCoverage::NATIVE_STORE.into());
+                if view.get("native_unsupported")?.is_some() {
+                    self.coverage
+                        .limitations
+                        .insert(ReadCoverage::UNSUPPORTED_NATIVE_FIELDS.into());
+                }
+                if view.get("native_missing_attachments")?.is_some() {
+                    self.coverage
+                        .limitations
+                        .insert(ReadCoverage::MISSING_ATTACHMENTS.into());
+                }
+                if view.get("native_cleared")?.is_some() || view.get("native_missing_payloads")?.is_some() {
+                    self.coverage.limitations.insert(ReadCoverage::MISSING_PAYLOADS.into());
+                }
+            } else {
+                self.coverage.sources.insert(ReadCoverage::EXPORTED_HISTORY.into());
+                if let Some(calls) = view.get("tool_calls")?.map(JsonView::array).transpose()?.flatten() {
+                    for call in calls {
+                        if call?
+                            .get("id")?
+                            .map(JsonView::string)
+                            .transpose()?
+                            .flatten()
+                            .is_none_or(|id| id.is_empty())
+                        {
+                            self.coverage
+                                .limitations
+                                .insert(ReadCoverage::INFERRED_TOOL_IDENTITY.into());
+                        }
+                    }
+                }
+            }
+        }
         let index = line
             .view
             .map(|view| {
@@ -721,6 +850,16 @@ struct BrainLoc {
 impl BrainLoc {
     /// Match `<appDataDir>/brain/<id>/.system_generated/logs/<filename>`.
     fn from_transcript(path: &Path) -> Option<Self> {
+        #[cfg(feature = "sqlite")]
+        if is_native_store(path) {
+            let app_data_dir = path.parent()?.parent()?.to_path_buf();
+            let id = path.file_stem()?.to_str()?.to_owned();
+            return Some(Self {
+                brain_dir: app_data_dir.join("brain").join(&id),
+                app_data_dir,
+                id,
+            });
+        }
         let logs_dir = match chunk_directory(path) {
             Some(directory) => directory.parent()?.parent()?,
             None => path.parent()?,
@@ -747,30 +886,45 @@ impl BrainLoc {
     }
 }
 
+fn select_session_source(root: &Path, id: &str) -> Option<PathBuf> {
+    let log = select_brain_log(&root.join("brain").join(id));
+    if let Some((rank, path)) = &log {
+        if *rank > 0 {
+            return Some(path.clone());
+        }
+    }
+    #[cfg(feature = "sqlite")]
+    {
+        let path = root.join("conversations").join(format!("{id}.db"));
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    log.map(|(_, path)| path)
+}
+
 /// Prefer full history, including its byte-chunked copy, over the compact projection.
 fn select_brain_log(brain_dir: &Path) -> Option<(u8, PathBuf)> {
     let logs = brain_dir.join(".system_generated").join("logs");
-    let full = logs.join("transcript_full.jsonl");
-    if full.is_file() {
-        return Some((4, full));
+    let mut empty = None;
+    for (rank, name) in [
+        (4, "transcript_full.jsonl"),
+        (3, "chunks/transcript_full/00000000.jsonl"),
+        (2, "transcript.jsonl"),
+        (2, "chunks/transcript/00000000.jsonl"),
+        (1, "overview.txt"),
+    ] {
+        let path = logs.join(name);
+        if let Ok(meta) = fs::metadata(&path) {
+            if meta.is_file() {
+                if meta.len() > 0 {
+                    return Some((rank, path));
+                }
+                empty.get_or_insert((0, path));
+            }
+        }
     }
-    let full_chunks = logs.join("chunks/transcript_full/00000000.jsonl");
-    if full_chunks.is_file() {
-        return Some((3, full_chunks));
-    }
-    let compact = logs.join("transcript.jsonl");
-    if compact.is_file() {
-        return Some((2, compact));
-    }
-    let compact_chunks = logs.join("chunks/transcript/00000000.jsonl");
-    if compact_chunks.is_file() {
-        return Some((2, compact_chunks));
-    }
-    let overview = logs.join("overview.txt");
-    if overview.is_file() {
-        return Some((1, overview));
-    }
-    None
+    empty
 }
 
 /// Chunks are fixed-size byte slices, not independent JSONL files: a split can
@@ -783,7 +937,23 @@ fn chunk_directory(path: &Path) -> Option<&Path> {
         .then_some(directory)
 }
 
+fn is_native_store(path: &Path) -> bool {
+    path.extension().is_some_and(|x| x == "db")
+        && path
+            .parent()
+            .is_some_and(|p| p.file_name().is_some_and(|n| n == "conversations"))
+}
+
 fn open_transcript(path: &Path) -> Result<jsonl::Read> {
+    #[cfg(not(feature = "sqlite"))]
+    anyhow::ensure!(
+        !is_native_store(path),
+        "reading native Antigravity stores requires SQLite support"
+    );
+    #[cfg(feature = "sqlite")]
+    if is_native_store(path) {
+        return native::open(path, false);
+    }
     let Some(directory) = chunk_directory(path) else {
         return jsonl::Read::open(path);
     };
@@ -840,7 +1010,8 @@ fn looks_like_antigravity_file(path: &Path) -> bool {
 
 #[derive(Default)]
 struct SidecarEnrich {
-    step_usage: BTreeMap<u64, (i64, Usage)>,
+    #[cfg(feature = "sqlite")]
+    verified: BTreeMap<u64, merge::Match>,
     step_models: BTreeMap<u64, String>,
     known_children: BTreeSet<String>,
     subagent_descriptors: BTreeMap<String, Value>,
@@ -1008,6 +1179,21 @@ pub(crate) fn forest_dependencies(r: &SessionRef, guard: &mut ReadSet) {
 }
 
 fn scan_transcript(id: &str, transcript: &Path, app_data_dir: Option<&Path>) -> Result<Option<SessionRef>> {
+    #[cfg(feature = "sqlite")]
+    if is_native_store(transcript) {
+        let metadata = read_conversation_db(transcript, false)?;
+        let mut reference = SessionRef::new(id, Harness::Antigravity, transcript);
+        reference.cwd = metadata.cwd;
+        reference.created_at = metadata.created_at;
+        reference.updated_at = fs::metadata(transcript)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .map(DateTime::from);
+        if let Some(root) = app_data_dir {
+            reference.title = read_pbtxt_title(&root.join("annotations").join(format!("{id}.pbtxt")));
+        }
+        return Ok(Some(reference));
+    }
     let meta = match fs::metadata(transcript) {
         Ok(m) if m.is_file() => m,
         Ok(_) => return Ok(None),
@@ -1192,8 +1378,9 @@ fn build_session_header(r: &SessionRef, opts: &Demand) -> (Session, SidecarEnric
                     }
                 }
                 s.model = db_meta.dominant_model;
-                enrich.step_models = db_meta.step_models;
-                enrich.step_usage = db_meta.step_usage;
+                if is_native_store(&r.path) {
+                    enrich.step_models = db_meta.step_models;
+                }
             }
         }
 
@@ -1262,6 +1449,19 @@ const STEP_KEYS: &[&str] = &[
     "error",
     "media",
     "truncated_fields",
+    "native_store",
+    "native_cleared",
+    "native_missing_payloads",
+    "native_unsupported",
+    "native_missing_attachments",
+    "native_content",
+    "native_tool_id",
+    "native_tool_name",
+    "cache_creation_tokens",
+    "reasoning_tokens",
+    "thinking_signature",
+    "thinking_redacted",
+    "native_output_uri",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1384,6 +1584,11 @@ impl StepCodec {
                 m.id = Some(step_index.to_string());
                 m.timestamp = ts;
                 push_nonempty_text(&mut m.content, fields.get("content"), self.spans)?;
+                if let Some(parts) = fields.get("native_content").map(JsonView::array).transpose()?.flatten() {
+                    for part in parts {
+                        push_nonempty_text(&mut m.content, Some(part?), self.spans)?;
+                    }
+                }
                 push_media_blocks(&mut m.content, fields.get("media"))?;
                 attach_step_extras(&mut m, &fields, step_index, &source, status.as_deref(), want_extra)?;
                 Ok(sink.message(m))
@@ -1392,25 +1597,39 @@ impl StepCodec {
                 let mut m = Message::of_kind(Role::Assistant, MessageKind::Reply, Origin::Model);
                 m.id = Some(step_index.to_string());
                 m.timestamp = ts;
-                m.model = self
-                    .enrich
-                    .step_models
-                    .get(&step_index)
-                    .cloned()
-                    .or_else(|| self.s.model.clone());
+                m.model = if fields.get("native_store").is_some() {
+                    self.enrich
+                        .step_models
+                        .get(&step_index)
+                        .cloned()
+                        .or_else(|| self.s.model.clone())
+                } else {
+                    None
+                };
 
                 if let Some(thinking_view) = fields.get("thinking") {
                     if let Some(text) = nonempty_view_text(thinking_view, self.spans)? {
                         m.content.push(Block::Thinking {
                             text,
-                            signature: None,
+                            signature: {
+                                let signature = fields.string("thinking_signature")?;
+                                #[cfg(feature = "sqlite")]
+                                let signature = signature.or_else(|| {
+                                    self.enrich.verified.get(&step_index).and_then(|m| m.signature.clone())
+                                });
+                                signature
+                            },
                             encrypted: None,
-                            redacted: false,
+                            redacted: fields
+                                .value("thinking_redacted")?
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false),
                         });
                     }
                 }
 
                 push_nonempty_text(&mut m.content, fields.get("content"), self.spans)?;
+                push_media_blocks(&mut m.content, fields.get("media"))?;
 
                 if let Some(calls) = fields.get("tool_calls").map(JsonView::array).transpose()?.flatten() {
                     for (k, item) in calls.enumerate() {
@@ -1426,7 +1645,25 @@ impl StepCodec {
                             .map(|v| v.argument(self.spans))
                             .transpose()?
                             .unwrap_or_else(|| Json::Owned(json!({})));
-                        let call_id = derived_call_id("antigravity", format!("{step_index}.{k}"));
+                        let input = match item.get("arguments")? {
+                            Some(arguments) => arguments.encoded_argument()?,
+                            None => input,
+                        };
+                        let call_id = item
+                            .get("id")?
+                            .map(JsonView::string)
+                            .transpose()?
+                            .flatten()
+                            .filter(|id| !id.is_empty())
+                            .unwrap_or_else(|| derived_call_id("antigravity", format!("{step_index}.{k}")));
+                        #[cfg(feature = "sqlite")]
+                        let call_id = self
+                            .enrich
+                            .verified
+                            .get(&step_index)
+                            .and_then(|m| m.calls.get(k))
+                            .cloned()
+                            .unwrap_or(call_id);
                         self.state.pending_calls.push_back(PendingCall {
                             id: call_id.clone(),
                             name: name.clone(),
@@ -1441,14 +1678,11 @@ impl StepCodec {
                 }
 
                 m.usage = parse_step_usage(&fields)?;
-                if let Some((seconds, native)) = self.enrich.step_usage.get(&step_index) {
-                    // Export timestamps lose subsecond precision. Match the stored identity
-                    // before supplementing fields omitted by that projection.
-                    if ts.is_some_and(|timestamp| timestamp.timestamp() == *seconds) {
-                        let usage = m.usage.get_or_insert_with(Usage::default);
-                        usage.cache_creation_tokens = native.cache_creation_tokens;
-                        usage.reasoning_tokens = native.reasoning_tokens;
-                    }
+                #[cfg(feature = "sqlite")]
+                if let Some(native) = self.enrich.verified.get(&step_index).and_then(|m| m.usage.as_ref()) {
+                    let usage = m.usage.get_or_insert_with(Usage::default);
+                    usage.cache_creation_tokens = native.cache_creation_tokens.or(usage.cache_creation_tokens);
+                    usage.reasoning_tokens = native.reasoning_tokens.or(usage.reasoning_tokens);
                 }
                 attach_step_extras(&mut m, &fields, step_index, &source, status.as_deref(), want_extra)?;
                 Ok(sink.message(m))
@@ -1458,9 +1692,25 @@ impl StepCodec {
                 m.id = Some(step_index.to_string());
                 m.timestamp = ts;
 
-                let (tool_use_id, tool_name) = match self.state.pending_calls.pop_front() {
+                let explicit_id = fields.string("native_tool_id")?.filter(|id| !id.is_empty());
+                #[cfg(feature = "sqlite")]
+                let explicit_id =
+                    explicit_id.or_else(|| self.enrich.verified.get(&step_index).and_then(|m| m.result.clone()));
+                let selected = if let Some(id) = &explicit_id {
+                    self.state
+                        .pending_calls
+                        .iter()
+                        .position(|call| &call.id == id)
+                        .and_then(|at| self.state.pending_calls.remove(at))
+                } else {
+                    self.state.pending_calls.pop_front()
+                };
+                let (tool_use_id, tool_name) = match selected {
                     Some(call) => (call.id, Some(call.name)),
-                    None => (derived_call_id("antigravity", step_index), None),
+                    None => (
+                        explicit_id.unwrap_or_else(|| derived_call_id("antigravity", step_index)),
+                        fields.string("native_tool_name")?,
+                    ),
                 };
 
                 let is_error = matches!(status.as_deref(), Some("ERROR" | "INVALID"));
@@ -1476,7 +1726,12 @@ impl StepCodec {
                     .transpose()?
                     .unwrap_or_default();
 
-                let details = extract_persisted_output_path(&head).map(|path| {
+                let persisted = fields
+                    .string("native_output_uri")?
+                    .and_then(|uri| file_uri_to_path(&uri))
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .or_else(|| extract_persisted_output_path(&head));
+                let details = persisted.map(|path| {
                     json!({
                         "persistedOutput": { "path": path }
                     })
@@ -1564,6 +1819,7 @@ impl StepCodec {
                 m.id = Some(step_index.to_string());
                 m.timestamp = ts;
                 push_nonempty_text(&mut m.content, fields.get("content"), self.spans)?;
+                push_media_blocks(&mut m.content, fields.get("media"))?;
                 attach_step_extras(&mut m, &fields, step_index, &source, status.as_deref(), want_extra)?;
                 if want_extra {
                     if let Some(sender) = sender {
@@ -1584,14 +1840,11 @@ impl StepCodec {
                 m.timestamp = ts;
                 push_nonempty_text(&mut m.content, fields.get("content"), self.spans)?;
                 m.usage = parse_step_usage(&fields)?;
-                if let Some((seconds, native)) = self.enrich.step_usage.get(&step_index) {
-                    // Export timestamps lose subsecond precision. Match the stored identity
-                    // before supplementing fields omitted by that projection.
-                    if ts.is_some_and(|timestamp| timestamp.timestamp() == *seconds) {
-                        let usage = m.usage.get_or_insert_with(Usage::default);
-                        usage.cache_creation_tokens = native.cache_creation_tokens;
-                        usage.reasoning_tokens = native.reasoning_tokens;
-                    }
+                #[cfg(feature = "sqlite")]
+                if let Some(native) = self.enrich.verified.get(&step_index).and_then(|m| m.usage.as_ref()) {
+                    let usage = m.usage.get_or_insert_with(Usage::default);
+                    usage.cache_creation_tokens = native.cache_creation_tokens.or(usage.cache_creation_tokens);
+                    usage.reasoning_tokens = native.reasoning_tokens.or(usage.reasoning_tokens);
                 }
                 attach_step_extras(&mut m, &fields, step_index, &source, status.as_deref(), want_extra)?;
                 Ok(sink.message(m))
@@ -1685,6 +1938,8 @@ fn parse_step_usage(fields: &Fields<'_>) -> Result<Option<Usage>> {
         input_tokens,
         output_tokens,
         cache_read_tokens,
+        cache_creation_tokens: u64_field("cache_creation_tokens"),
+        reasoning_tokens: u64_field("reasoning_tokens"),
         ..Default::default()
     };
     Ok((!usage.is_empty()).then_some(usage))
@@ -2224,7 +2479,6 @@ fn parse_sqlite_ts(s: &str) -> Option<DateTime<Utc>> {
 #[cfg(feature = "sqlite")]
 #[derive(Default)]
 struct ConvDbMeta {
-    step_usage: BTreeMap<u64, (i64, Usage)>,
     step_models: BTreeMap<u64, String>,
     dominant_model: Option<String>,
     cwd: Option<PathBuf>,
@@ -2238,7 +2492,7 @@ struct ConvDbMeta {
 }
 
 #[cfg(feature = "sqlite")]
-fn read_conversation_db(db_path: &Path, details: bool) -> Result<ConvDbMeta> {
+fn read_conversation_db(db_path: &Path, _details: bool) -> Result<ConvDbMeta> {
     use rusqlite::OptionalExtension as _;
     super::store::sqlite::open_ro(db_path)?.read_snapshot(|conn, _reads| {
         let mut out = ConvDbMeta::default();
@@ -2276,25 +2530,6 @@ fn read_conversation_db(db_path: &Path, details: bool) -> Result<ConvDbMeta> {
                 .max_by_key(|(_, count)| *count)
                 .map(|(m, _)| m)
                 .or(first_model);
-        }
-
-        if details && has_table("steps")? {
-            let mut columns = conn.prepare("PRAGMA table_info(steps)")?;
-            let names = columns
-                .query_map([], |row| row.get::<_, String>(1))?
-                .collect::<rusqlite::Result<BTreeSet<_>>>()?;
-            if names.contains("idx") && names.contains("metadata") {
-                let mut stmt =
-                    conn.prepare("SELECT idx, metadata FROM steps WHERE metadata IS NOT NULL ORDER BY idx")?;
-                let mut rows = stmt.query([])?;
-                while let Some(row) = rows.next()? {
-                    if let Ok(bytes) = row.get_ref(1)?.as_blob() {
-                        if let Some(usage) = parse_native_usage(bytes) {
-                            out.step_usage.insert(row.get(0)?, usage);
-                        }
-                    }
-                }
-            }
         }
 
         if has_table("trajectory_metadata_blob")? {
@@ -2403,31 +2638,6 @@ fn parse_gen_metadata_blob(buf: &[u8]) -> Option<(Vec<u64>, String)> {
         }
     }
     Some((steps, model?))
-}
-
-/// Native metadata survives payload clearing at compaction. Keep the richer counters
-/// separate from JSONL's historical text; only match rows with the same step timestamp.
-#[cfg(feature = "sqlite")]
-fn parse_native_usage(buf: &[u8]) -> Option<(i64, Usage)> {
-    let mut pos = 0;
-    let mut seconds = None;
-    let mut usage = Usage::default();
-    while let Some((field, value)) = next_proto_field(buf, &mut pos) {
-        if let (field @ (1 | 9), WireField::Bytes(nested)) = (field, value) {
-            let mut at = 0;
-            while let Some((number, value)) = next_proto_field(nested, &mut at) {
-                if let WireField::Varint(value) = value {
-                    match (field, number) {
-                        (1, 1) => seconds = i64::try_from(value).ok(),
-                        (9, 4) => usage.cache_creation_tokens = Some(value),
-                        (9, 9) => usage.reasoning_tokens = Some(value),
-                        _ => {}
-                    }
-                }
-            }
-        }
-    }
-    (!usage.is_empty()).then_some((seconds?, usage))
 }
 
 /// `trajectory_metadata_blob.data`:
@@ -3234,9 +3444,10 @@ mod tests {
         let s = adapter.parse(&refs[0]).unwrap();
         crate::harness::assert_no_flat_keys(&s);
         assert_eq!(s.model.as_deref(), Some("gemini-4-argon"));
-        assert_eq!(s.messages[1].model.as_deref(), Some("gemini-4-argon"));
-        assert_eq!(s.messages[1].usage.as_ref().unwrap().reasoning_tokens, Some(3));
-        assert_eq!(s.messages[1].usage.as_ref().unwrap().cache_creation_tokens, Some(12));
+        // Metadata alone cannot identify the historical revision of this reply.
+        assert_eq!(s.messages[1].model, None);
+        assert_eq!(s.messages[1].usage.as_ref().unwrap().reasoning_tokens, None);
+        assert_eq!(s.messages[1].usage.as_ref().unwrap().cache_creation_tokens, None);
         assert_eq!(
             s.git.as_ref().and_then(|g| g.branch.as_deref()),
             Some("feat/antigravity")
