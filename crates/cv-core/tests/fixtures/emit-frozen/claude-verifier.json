@@ -1,9 +1,9 @@
 {
 "00 None": "<path>: not a JSON record",
 "00 Some(\"agent\")": "<path>: not a JSON record",
-"01 None": "ok",
+"01 None": "<path>: parentUuid cycle at b",
 "01 Some(\"agent\")": "<path>:1: a sub-agent record must carry isSidechain:true and agentId \"agent\"",
-"02 None": "ok",
+"02 None": "<path>: parentUuid cycle at a",
 "02 Some(\"agent\")": "<path>:1: a sub-agent record must carry isSidechain:true and agentId \"agent\"",
 "03 None": "ok",
 "03 Some(\"agent\")": "<path>:1: a sub-agent record must carry isSidechain:true and agentId \"agent\"",

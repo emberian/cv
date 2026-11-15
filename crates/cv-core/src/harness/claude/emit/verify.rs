@@ -21,6 +21,8 @@ struct Facts {
 enum Key {
     /// A `parentUuid` naming no record in the file.
     Parent(String),
+    /// A parent walk revisits a UUID instead of terminating at a root.
+    Cycle(String),
     /// A `tool_use` id with no `tool_result`.
     Call(String),
     /// The record (by `uuid`) carries the wrong identity.
@@ -156,6 +158,37 @@ fn scan(source: &JsonSource, file: &fs::File, label: &Path, agent: Option<&str>,
             });
         }
     }
+    // Parent existence alone admits self-links and multi-record cycles. Check every component,
+    // including detached branches, once; a valid resume walk must terminate.
+    let mut checked = HashSet::new();
+    let mut starts: Vec<_> = links.keys().collect();
+    starts.sort();
+    for start in starts {
+        let mut path = HashSet::new();
+        let mut at = start;
+        while !checked.contains(at) {
+            if !path.insert(at.clone()) {
+                // Canonical identity lets derived copies retain the same inherited cycle even
+                // when their walk enters it through a different branch.
+                let mut key = at;
+                let mut cursor = links.get(at).and_then(Option::as_ref).expect("cycle parent");
+                while cursor != at {
+                    key = key.min(cursor);
+                    cursor = links.get(cursor).and_then(Option::as_ref).expect("cycle parent");
+                }
+                breaks.push(Break {
+                    key: Key::Cycle(key.clone()),
+                    message: format!("{}: parentUuid cycle at {key}", label.display()),
+                });
+                break;
+            }
+            let Some(Some(parent)) = links.get(at) else {
+                break;
+            };
+            at = parent;
+        }
+        checked.extend(path);
+    }
     Ok(Scan {
         breaks,
         ids,
@@ -222,5 +255,25 @@ pub(super) fn verify_derived(
             new.message
         )),
         None => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod cycle_tests {
+    use super::*;
+
+    #[test]
+    fn parent_walk_rejects_self_and_detached_cycles_but_accepts_branches() -> Result<()> {
+        let world = cv_testkit::World::new("parent-cycles");
+        let path = world.base.join("session.jsonl");
+        for rows in [
+            "{\"type\":\"user\",\"uuid\":\"a\",\"parentUuid\":\"a\"}\n",
+            "{\"uuid\":\"a\",\"parentUuid\":\"b\"}\n{\"uuid\":\"b\",\"parentUuid\":\"a\"}\n{\"type\":\"user\",\"uuid\":\"leaf\"}\n",
+        ] {
+            fs::write(&path, rows)?;
+            assert!(verify(&path, None).unwrap_err().to_string().contains("parentUuid cycle"));
+        }
+        fs::write(&path, "{\"uuid\":\"root\"}\n{\"uuid\":\"left\",\"parentUuid\":\"root\"}\n{\"type\":\"user\",\"uuid\":\"right\",\"parentUuid\":\"root\"}\n")?;
+        verify(&path, None)
     }
 }
