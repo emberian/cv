@@ -80,23 +80,33 @@ What these captures establish about the writer, as distinct from the reader:
 - `phase` is `RUNNING` for every member that is not killed. The words `waiting` and
   `working` appear only in the `swarm status` tool result.
 
+Added with the fleet-measured reconciliation (`tests/antigravity_reconcile.rs`,
+`antigravity_native_shapes.rs`, `antigravity_roots.rs`; shapes and counts from 501
+real stores, all text synthetic) and on the captures:
+
+| Contract | Check |
+|---|---|
+| Rendered export | A result under its header, a tagged prompt and an exported `error` verify their native steps; a body that is not a line-aligned block does not. |
+| Native-only steps | Head, interior and tail steps are read in step order beside verified steps; beside a divergent revision or an unreadable store the read reports `unreconciled_history`. |
+| Cleared rows, typed results | A row cleared to `Step.type` keeps kind and tool identity; payload scalars reach `details.payload`; every `InvokeSubagent` child links to its call. |
+| Removed log, mirrors | A session whose discovered log disappeared reads from what survives; mirrored roots yield one session. |
+| Bounded reads | Discovery and a header read stay under 4 MiB beside a 16 MiB `gen_metadata` row; id, tool and text sinks stay under 8 MiB beside a 24 MiB image; a history stages in a fixed number of files. |
+| Forest call, title, upload, accounting | Capture tests in `antigravity_writer.rs`: the forest names the stored spawning call; a resumed session is titled by step 0 in both layouts; a missing exported upload is read from the store; only `1.5.9-compaction-resume` reports `unsupported_native_fields`. |
+
 Still requiring dedicated writer-generated scenarios and independent assertions:
 
-- Audio/video prompt payloads; lazy output resolution after the source changes;
-  recovery of a missing exported upload from the store's inline bytes (reported as
-  `missing_attachments` today).
+- Audio/video prompt payloads; lazy output resolution after the source changes.
 - Structured generic results. Across these captures every step type is one the reader
   interprets, and no result used the struct/value fields (10, 11) the reader decodes.
   16 of 33 results instead carry a typed `Any` (field 6: `RunCommand`, `ManageTask`,
-  `InvokeSubagent`), which is not normalized; its content repeats the text and render
-  fields in the cases seen. Writer-generated render-only payloads after native clearing.
+  `InvokeSubagent`); its scalar facts are read into `details.payload`.
+  Writer-generated render-only payloads after native clearing.
 - Renamed members, a worker captured mid-turn (`wake_mode` while working), and a
   lane status for a parked or idle child: `cv lanes` shows every live member as
   running.
-- The forest's spawn call ID. `spawnStepIndex` is the result step for
-  `invoke_subagent` and an unrelated step for swarm members; the forest still
-  derives `<step>.0` from it, which matches no call. The session's `subagents`
-  entries carry the real `call_id`.
+- The forest's spawn call ID for swarm members. For `invoke_subagent` children it is
+  the call whose typed result names the child (`spawnStepIndex` is not: parallel
+  spawns all record the last result); a swarm member gets none.
 - Native `CLEARED` rows from the writer; other interaction kinds than permission
   (`ask_question` was not driven).
 - Full/compact/chunk/native promotion during a live read.

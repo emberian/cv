@@ -73,9 +73,28 @@ was removed, and a step is not rewritten after export: a backgrounded command st
 `RUNNING` there while the store revises it to `DONE` or `CANCELED`. Reading both
 layouts therefore replays every step the export lacks from the store, in step order,
 and takes a terminal status from the store for a result whose call ID a verified
-planner step issued. The exported body is kept. Acceptance still requires the newest
-comparable step to verify; a typed request is compared inside its `<USER_REQUEST>`
-envelope.
+planner step issued. The exported body is kept.
+
+A planner step is exported verbatim and compared exactly. Every other step is the
+same revision when its native body is one line-aligned block of the exported text
+(inside the `<USER_REQUEST>` envelope, under a result's `Created At:` header, inside a
+system-message wrapper or checkpoint prose, or as a failure's `error`), at the same
+index, type and second. A native-only step is read when the nearest comparable
+exported step on each side verifies (one side may have none); otherwise, or when the
+store cannot be read, the read reports `unreconciled_history`. A step exported while
+it ran, and a request the export decorated, are not comparable: they neither verify
+nor reject. Measured on 499 real sessions (2026-11-14): `inferred_tool_identity` on
+50 (cleared planner rows keep no call ids), none unreconciled.
+
+A row cleared down to `Step.type` keeps its kind and tool identity
+(`missing_payloads`). `GenericStepResult.payload` (`Any`) scalars for ReadFile,
+RunCommand, FileEdit, ManageTask, SendMessage, Schedule, ManageSubagents,
+InvokeSubagent and SearchWeb reach `ToolResult.details.payload`. A verified exported
+step whose linked upload is gone is read from its native row when the store kept the
+bytes. `unsupported_native_fields` is per-type accounting (`native/account.rs`): it
+fires for a field that is neither read nor listed there as bookkeeping or a second
+rendering. `gen_metadata` rows hold whole model requests (12 MiB seen); only the slug
+and step indices are read, never during discovery.
 
 Permission interactions live on the tool step (`requested_interaction` 133,
 `completed_interaction` 147 with the allow flag) and nowhere in the export. Print
@@ -90,6 +109,10 @@ the helper's native parent is the coordinator.
 `agy --conversation <id>` is the installed CLI's resume contract, matching the
 existing `cv resume` implementation. A resumed conversation keeps its ID and root in
 the store (verified from a native-only resume). No native import/export command was found.
+The CLI resumes from its own app data dir (`$JETSKI_APP_DATA_DIR`, else
+`~/.gemini/antigravity-cli`): when that root holds no `conversations/<id>.db` or
+`.pb`, `cv resume` says so before the command (from the store layout; not verified by
+launching the CLI).
 The adapter remains read-only; native emission is explicitly unsupported. IR export
 is available and is not advertised as an executable native conversation.
 
@@ -102,11 +125,11 @@ capabilities. The spike does **not** establish support for every native feature.
 |---|---|
 | Native step reader | Stream selected protobuf fields through bounded SQLite cell readers; handle SQLite-only sessions. Reconcile cleared payloads with full logs without losing history or pairing unrelated revisions. |
 | Exact tool identity | Preserve native call IDs, original names/arguments and explicit result associations; cover parallel same-name calls and reused indices. Retries and interrupted calls are covered by `1.5.9-interruption`. FIFO inference remains a JSONL fallback. |
-| Native payload fidelity | Permission state, stop reasons, task identity and prompt media are read. Still open: structured tool results from the writer, other interaction kinds, the upstream error's status text (only its user-facing message is normalized), and recovering a missing exported upload from the store. COMPLETE must preserve unsupported native fields with provenance. |
+| Native payload fidelity | Permission state, stop reasons, task identity and prompt media are read. Still open: structured tool results from the writer, other interaction kinds, the upstream error's status text (only its user-facing message is normalized), checkpoint sections and snapshots, and hook results (reported as `unsupported_native_fields`). COMPLETE must preserve unsupported native fields with provenance. |
 | Live replacement atomicity | Stage a session replacement until all source guards pass. A rewrite after documents begin currently removes partial output and may remove the old indexed body; it must retain the prior committed revision. |
-| Root and format transitions | Test log disappearance with a surviving native DB, full/compact/chunk promotion, mirror divergence, CLI/IDE archives and summary-only records. Discovery must choose coherent readable evidence. |
+| Root and format transitions | A log removed after discovery falls back to the surviving store; mirrored roots yield one session; a re-created log is titled from the store's first prompt. Open: a mirror is chosen by export rank alone, never recency; summary-only catalog rows are not listed; empty native databases are listed as empty sessions. |
 | Metadata freshness | Use per-session summary revision certificates rather than invalidating every session on the shared summary WAL. Verify title/lineage updates with no transcript write. |
-| Swarm semantics | Spawn call IDs, board delivery versus child returns and registry member state are read (`1.5.9-swarm`, `1.5.9-subagents`). Still open: waiting versus working (the registry's `phase` does not say; no member was captured mid-turn), a lane status for parked or idle children, the forest's `tool_use_id` (derived from `spawnStepIndex`, which matches no call), renamed members (the CLI has no rename). |
+| Swarm semantics | Spawn call IDs, board delivery versus child returns and registry member state are read (`1.5.9-swarm`, `1.5.9-subagents`). Still open: waiting versus working (the registry's `phase` does not say; no member was captured mid-turn), a lane status for parked or idle children, renamed members (the CLI has no rename). |
 | Native feature corpus | Captured: permissions, cancellation and retry, background tasks, swarm, children, prompt media, manual compaction and native-only resume. Still to capture: skills, modes, questions, writer-cleared rows, audio/video. Add portable/no-SQLite expectations explicitly. |
 | Resume and emission | Test root-aware resume for mirrored CLI/desktop/IDE stores. Do not enable native writing until a supported import contract and round-trip tests exist. |
 
