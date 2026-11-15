@@ -1,7 +1,8 @@
 # Complexity: what each path costs, and the no-mode-switch rule
 
-The 0.18 complexity audit, done by reading the code. Use this page to check a change: find the
-row for the path, and make sure its cost after the change is still what the row says.
+The 0.18 complexity audit, with subsequent corrections named below. Use this page to check a
+change: find the row for the path, and check its cost against current code. The 0.20 backlog
+reconciliation is in [`0.20/BACKLOG.md`](0.20/BACKLOG.md).
 
 Variables: s is the session's size, n the number of sessions, S the store's size, k the
 sub-agents, e the events, and L the lane-ledger rows. "One change" means one session appended
@@ -56,10 +57,6 @@ or rewritten. Paths are relative to `crates/`.
 | Task log, event listers (`events`, `show`, inbox) | O(E) | O(E) | O(E) | `task/store.rs` `replay` |
 
 ## Open (structural, not yet fixed)
-
-- **Exports roster cache** (`harness/export/native.rs` `CACHE_BYTES` 8 MiB, 8 entries): a mode
-  switch. Past it every conversation read re-parses its whole archive, O(n_a·S_a). Owned by the
-  open-cliffs lane (the exports offset index), as are that lane's other items.
 
 - **`agent-…` lookups** read the catalog, not a rediscovery, but still list each session's
   sidecar dir. A by-id index cannot replace that: the scan cache holds an agent only after a
@@ -120,8 +117,19 @@ Cost-only (results identical; fallback at file:line):
   `BODY_LIMIT` 1 MiB (serve.rs:258) refuse a request with a stated 4xx; `DRAIN_LIMIT` decides
   only whether a connection is kept. `sqlite/snapshots.rs` `RECORD_LIMIT` refuses a corrupt record.
 
-Open (not yet decided against the rule; each bounds what the user sees): none. The exports
-roster cache (`export/native.rs` `CACHE_BYTES`) is structural, above.
+Open (not yet decided against the rule; each bounds what the user sees): none.
+
+The export metadata roster has an 8 MiB / eight-archive cache, with selected reads admitted
+under half that byte budget (`harness/export/native.rs`). Above admission, one full scan builds
+a source-validated ID-to-range index; subsequent selected reads reuse positions instead of
+rescanning unrelated conversations. The index is memoized in-process and persisted when a
+writable SQLite catalog is available. A new process can reuse a valid persisted record. A
+portable build, an unavailable catalog, or a frozen cold process without that record still
+pays one archive scan per process. Offset metadata grows with conversation IDs and archives;
+it is not a constant-heap guarantee. Discovery still scans an uncached archive.
+`selected_reads_past_the_roster_cache_scan_the_archive_once` checks scan reuse, cross-process
+catalog reuse and invalidation; the duplicate-selection test checks identical selection on
+both sides of admission. This replaces the old blanket O(n_a·S_a) selected-read claim.
 
 Removed mode switches:
 - Watch `METADATA_BYTES` 16 KiB: a completed read's session metadata was kept only under it, so

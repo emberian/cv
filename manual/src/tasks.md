@@ -5,9 +5,12 @@ Tasks let a fleet commit to work, and let a human see what was said about it, by
 A **task** is a dispatch object: open, claim, note, finish. A **decision** is a task with a posed
 question: one event poses it (with the default that stands if nobody speaks), one answers it.
 
-Everything lives in one append-only log, `$CLUSTERVISION_HOME/tasks/events.jsonl`, written under a
-flock. Every state you see is folded from those events; there is no second store. Two
-front-ends render the same shapes: `cv task` (this page) and
+Task history is append-only. In the standard SQLite build, accepted batches commit to
+`$CLUSTERVISION_HOME/state.db` before the companion `tasks/events.jsonl` stream is updated.
+Readers recover committed events even if that stream is missing or an append stopped between
+the two writes; a later append reconciles it. Without SQLite, the JSONL stream is authoritative.
+Writers hold `tasks/events.lock` across validation and append, and read models fold the accepted
+events. Two front-ends render the same shapes: `cv task` (this page) and
 [`cv serve`'s task routes](serving.md#task-endpoints), whose `/inbox` page is the human's door.
 
 ## The three laws
