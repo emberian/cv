@@ -1,0 +1,73 @@
+{
+  "sessions": [
+    {
+      "id": "a73af76c-8fec-4bfb-a132-50922f43e7f4",
+      "path": ".gemini/antigravity-cli/brain/a73af76c-8fec-4bfb-a132-50922f43e7f4/.system_generated/logs/transcript_full.jsonl",
+      "messages": 16,
+      "sequence": [
+        "user/prompt",
+        "assistant/reply",
+        "tool/tool_result",
+        "tool/tool_result",
+        "tool/tool_result",
+        "assistant/reply",
+        "tool/tool_result",
+        "assistant/reply",
+        "tool/tool_result",
+        "tool/tool_result",
+        "assistant/reply",
+        "system/injected_context",
+        "system/injected_context",
+        "assistant/reply",
+        "system/injected_context",
+        "assistant/reply"
+      ],
+      "blocks": {
+        "text": 7,
+        "tool_result": 6,
+        "tool_use": 6
+      },
+      "tools": [
+        "run_command",
+        "run_command",
+        "run_command",
+        "manage_task",
+        "manage_task",
+        "manage_task"
+      ],
+      "usage_messages": 0,
+      "model_messages": 0,
+      "compaction_boundaries": [],
+      "subagent_spawns": 0,
+      "subagent_returns": 0,
+      "affordances": {
+        "background_job/complete": 3,
+        "background_job/read": 2,
+        "background_job/stop": 1
+      },
+      "tool_histogram": {
+        "tools": {
+          "manage_task": {
+            "calls": 3,
+            "edits": 0,
+            "reads": 0,
+            "commands": 0,
+            "errors": 0
+          },
+          "run_command": {
+            "calls": 3,
+            "edits": 0,
+            "reads": 0,
+            "commands": 3,
+            "errors": 0
+          }
+        },
+        "total_calls": 6,
+        "total_errors": 0
+      },
+      "lineage": {},
+      "model": null,
+      "skipped_lines": 0
+    }
+  ]
+}

@@ -1,0 +1,70 @@
+{
+  "title": "Fixture swarm",
+  "members": {
+    "alpha": {
+      "conversation_id": "42561721-7f30-43d8-8547-3ea712864d3d",
+      "role": "worker",
+      "desired_state": "RUNNING",
+      "desired_model": "gemini-3.1-pro-preview",
+      "applied_model": "gemini-3.1-pro-preview",
+      "workspace_mode": "inherit",
+      "phase": "RUNNING",
+      "wake_mode": "mentions",
+      "wait_since": 4,
+      "last_read_seq": 4,
+      "last_nudged_seq": 4,
+      "last_park_blocked_seq": 0,
+      "killed": false,
+      "model": "gemini-3.1-pro-preview"
+    },
+    "beta": {
+      "conversation_id": "48bcbfc3-6e89-46bb-8960-a70ca2ac880f",
+      "role": "worker",
+      "desired_state": "RUNNING",
+      "desired_model": "gemini-3.1-pro-preview",
+      "applied_model": "gemini-3.1-pro-preview",
+      "workspace_mode": "inherit",
+      "phase": "RUNNING",
+      "wake_mode": "mentions",
+      "wait_since": 5,
+      "last_read_seq": 2,
+      "last_nudged_seq": 5,
+      "last_park_blocked_seq": 0,
+      "killed": false,
+      "model": "gemini-3.1-pro-preview"
+    },
+    "coordinator": {
+      "conversation_id": "994dea8c-3496-40b6-8999-3fa265ea5b99",
+      "role": "coordinator",
+      "desired_state": "RUNNING",
+      "desired_model": "gemini-3.1-pro-preview",
+      "applied_model": "gemini-3.1-pro-preview",
+      "workspace_mode": "inherit",
+      "phase": "RUNNING",
+      "wake_mode": "mentions",
+      "wait_since": 4,
+      "last_read_seq": 4,
+      "last_nudged_seq": 4,
+      "last_park_blocked_seq": 0,
+      "killed": false,
+      "model": "gemini-3.1-pro-preview"
+    },
+    "gamma": {
+      "conversation_id": "6da89cc5-a5fd-4608-aa21-2106eeff5e13",
+      "role": "worker",
+      "added_by": "beta",
+      "desired_state": "KILLED",
+      "desired_model": "gemini-3.1-pro-preview",
+      "applied_model": "gemini-3.1-pro-preview",
+      "workspace_mode": "inherit",
+      "phase": "KILLED",
+      "wake_mode": "working",
+      "wait_since": 5,
+      "last_read_seq": 5,
+      "last_nudged_seq": 5,
+      "last_park_blocked_seq": 0,
+      "killed": true,
+      "model": "gemini-3.1-pro-preview"
+    }
+  }
+}

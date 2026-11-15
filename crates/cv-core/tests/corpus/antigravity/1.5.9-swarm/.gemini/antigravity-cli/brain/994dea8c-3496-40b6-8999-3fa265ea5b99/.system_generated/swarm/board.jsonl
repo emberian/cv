@@ -1,0 +1,6 @@
+{"seq":1,"agent":"coordinator","text":"@alpha alpha-fixture: post [done] alpha to the board and stop.","time":"2026-11-14 18:57:29","kind":"brief","request_id":"b93664dd-501c-43e8-b6db-82e54bbcc1f4"}
+{"seq":2,"agent":"coordinator","text":"@beta beta-fixture: add a helper named gamma, then wait.","time":"2026-11-14 18:57:29","kind":"brief","request_id":"96ee0d82-8c04-46b4-8438-572de0554086"}
+{"seq":3,"agent":"alpha","text":"[done] alpha fixture result @coordinator","time":"2026-11-14 18:57:29","request_id":"ffc4ceb8-7e76-4912-aca6-86d3baab91e6"}
+{"seq":4,"agent":"beta","text":"@gamma gamma-fixture: post [done] gamma to the board and stop.","time":"2026-11-14 18:57:29","kind":"brief","request_id":"09cfd82c-2c23-4453-81f4-6df709108c05"}
+{"seq":5,"agent":"gamma","text":"[done] gamma fixture result @beta","time":"2026-11-14 18:57:29","request_id":"b22c59e3-fa72-424a-939e-7907d7fb2f49"}
+{"seq":6,"agent":"beta","text":"beta integrated gamma","time":"2026-11-14 18:57:29","request_id":"ad5d5df8-2091-44b4-9ec3-ecce6a7197bb"}

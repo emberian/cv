@@ -1,0 +1,36 @@
+{
+  "sessions": [
+    {
+      "id": "c8acf534-cad6-4c36-a443-f4a1c574c457",
+      "path": ".gemini/antigravity-cli/conversations/c8acf534-cad6-4c36-a443-f4a1c574c457.db",
+      "messages": 6,
+      "sequence": [
+        "user/prompt",
+        "assistant/reply",
+        "user/prompt",
+        "assistant/reply",
+        "user/prompt",
+        "assistant/reply"
+      ],
+      "blocks": {
+        "image": 1,
+        "text": 6
+      },
+      "tools": [],
+      "usage_messages": 0,
+      "model_messages": 0,
+      "compaction_boundaries": [],
+      "subagent_spawns": 0,
+      "subagent_returns": 0,
+      "affordances": {},
+      "tool_histogram": {
+        "tools": {},
+        "total_calls": 0,
+        "total_errors": 0
+      },
+      "lineage": {},
+      "model": null,
+      "skipped_lines": 0
+    }
+  ]
+}

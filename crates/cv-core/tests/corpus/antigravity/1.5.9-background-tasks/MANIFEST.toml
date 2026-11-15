@@ -1,0 +1,14 @@
+# Real CLI-written native steps; never regenerate a committed version.
+harness = "antigravity"
+version = "1.5.9-background-tasks"
+generated = "2026-11-14"
+writer_version = "1.5.9"
+writer_sha256 = "fad3628ad91fe8613a72f074a1c5fde7cd816517788a5b9be96703f7d256741a"
+model_calls = 0
+mock_calls = 6
+cli_invocations = 1
+scenarios = ["three_background_tasks", "interleaved_completion", "killed_task", "task_status_poll"]
+source = "Installed CLI writer against deterministic loopback Gemini SSE responses; no real credentials or upstream requests."
+isolation = "Fresh HOME/app-data/XDG paths; OS sandbox denies non-loopback network and writes outside scratch except PTY devices."
+selection = "SQLite backup; steps, trajectory_meta and the lineage fields of trajectory metadata retained, other tables emptied; writer files kept beside the store: transcript_full.jsonl."
+scrub = "Equal-width scratch-path replacement preserves every protobuf length; no synthetic step encoding. Image bytes remain native."

@@ -1,0 +1,89 @@
+{
+  "sessions": [
+    {
+      "id": "43402b16-1cd2-4c47-a6d3-75e4051f50ee",
+      "path": ".gemini/antigravity-cli/conversations/43402b16-1cd2-4c47-a6d3-75e4051f50ee.db",
+      "messages": 5,
+      "sequence": [
+        "user/prompt",
+        "assistant/reply",
+        "tool/tool_result",
+        "assistant/reply",
+        "tool/tool_result"
+      ],
+      "blocks": {
+        "text": 2,
+        "tool_result": 2,
+        "tool_use": 2
+      },
+      "tools": [
+        "run_command",
+        "run_command"
+      ],
+      "usage_messages": 0,
+      "model_messages": 0,
+      "compaction_boundaries": [],
+      "subagent_spawns": 0,
+      "subagent_returns": 0,
+      "affordances": {
+        "approval/deny": 1
+      },
+      "tool_histogram": {
+        "tools": {
+          "run_command": {
+            "calls": 2,
+            "edits": 0,
+            "reads": 0,
+            "commands": 2,
+            "errors": 1
+          }
+        },
+        "total_calls": 2,
+        "total_errors": 1
+      },
+      "lineage": {},
+      "model": null,
+      "skipped_lines": 0
+    },
+    {
+      "id": "f8a82f05-d0b6-408b-8e38-10c4307f0ce8",
+      "path": ".gemini/antigravity-cli/conversations/f8a82f05-d0b6-408b-8e38-10c4307f0ce8.db",
+      "messages": 3,
+      "sequence": [
+        "user/prompt",
+        "assistant/reply",
+        "tool/tool_result"
+      ],
+      "blocks": {
+        "text": 1,
+        "tool_result": 1,
+        "tool_use": 1
+      },
+      "tools": [
+        "run_command"
+      ],
+      "usage_messages": 0,
+      "model_messages": 0,
+      "compaction_boundaries": [],
+      "subagent_spawns": 0,
+      "subagent_returns": 0,
+      "affordances": {},
+      "tool_histogram": {
+        "tools": {
+          "run_command": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 1,
+            "errors": 0
+          }
+        },
+        "total_calls": 1,
+        "total_errors": 0
+      },
+      "lineage": {},
+      "model": null,
+      "skipped_lines": 0
+    }
+  ]
+}

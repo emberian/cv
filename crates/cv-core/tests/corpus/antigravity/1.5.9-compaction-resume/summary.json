@@ -1,0 +1,52 @@
+{
+  "sessions": [
+    {
+      "id": "bc50c17a-7e9f-4b92-81fd-a6d102b4007f",
+      "path": ".gemini/antigravity-cli/brain/bc50c17a-7e9f-4b92-81fd-a6d102b4007f/.system_generated/logs/transcript_full.jsonl",
+      "messages": 10,
+      "sequence": [
+        "user/prompt",
+        "system/injected_context",
+        "assistant/reply",
+        "tool/tool_result",
+        "assistant/reply",
+        "user/prompt",
+        "system/injected_context",
+        "assistant/reply",
+        "tool/tool_result",
+        "assistant/reply"
+      ],
+      "blocks": {
+        "text": 8,
+        "tool_result": 2,
+        "tool_use": 2
+      },
+      "tools": [
+        "run_command",
+        "run_command"
+      ],
+      "usage_messages": 0,
+      "model_messages": 0,
+      "compaction_boundaries": [],
+      "subagent_spawns": 0,
+      "subagent_returns": 0,
+      "affordances": {},
+      "tool_histogram": {
+        "tools": {
+          "run_command": {
+            "calls": 2,
+            "edits": 0,
+            "reads": 0,
+            "commands": 2,
+            "errors": 0
+          }
+        },
+        "total_calls": 2,
+        "total_errors": 0
+      },
+      "lineage": {},
+      "model": null,
+      "skipped_lines": 0
+    }
+  ]
+}

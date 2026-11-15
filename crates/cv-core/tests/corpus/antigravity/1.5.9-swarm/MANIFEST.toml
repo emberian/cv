@@ -1,0 +1,14 @@
+# Real CLI-written native steps; never regenerate a committed version.
+harness = "antigravity"
+version = "1.5.9-swarm"
+generated = "2026-11-14"
+writer_version = "1.5.9"
+writer_sha256 = "fad3628ad91fe8613a72f074a1c5fde7cd816517788a5b9be96703f7d256741a"
+model_calls = 0
+mock_calls = 12
+cli_invocations = 1
+scenarios = ["swarm_coordinator", "two_workers", "worker_added_helper", "board_posts", "parked_worker", "killed_member"]
+source = "Installed CLI writer against deterministic loopback Gemini SSE responses; no real credentials or upstream requests."
+isolation = "Fresh HOME/app-data/XDG paths; OS sandbox denies non-loopback network and writes outside scratch except PTY devices."
+selection = "SQLite backup; steps, trajectory_meta and the lineage fields of trajectory metadata retained, other tables emptied; writer files kept beside the store: 42561721-7f30-43d8-8547-3ea712864d3d.json, 48bcbfc3-6e89-46bb-8960-a70ca2ac880f.json, 6da89cc5-a5fd-4608-aa21-2106eeff5e13.json, board.jsonl, members.json, swarm.json, transcript_full.jsonl."
+scrub = "Equal-width scratch-path replacement preserves every protobuf length; no synthetic step encoding. Image bytes remain native."
