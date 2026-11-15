@@ -454,12 +454,47 @@ fn pack_selected_without_task_uses_bounded_overview_with_source_locations() {
             content.contains("worker found a parser gap") && content.contains("--agent a123"),
             "{content}"
         );
-        assert!(
-            content.contains(source.to_str().unwrap()) && content.contains("--around N"),
-            "{content}"
-        );
+        assert!(content.contains("cv show claude:orient --around N"), "{content}");
         assert!(!err.contains("no index"), "{err}");
     }
+    let (child, _) = w.cv_ok(&[
+        "show",
+        source.to_str().unwrap(),
+        "--agent",
+        "a123",
+        "--kind",
+        "overview",
+    ]);
+    assert!(
+        child.contains(&format!("cv show claude:{} --agent a123 --around N", source.display())),
+        "{child}"
+    );
+}
+
+#[test]
+fn overview_and_pack_citations_use_native_id_for_shared_database_sessions() {
+    let w = World::new("overview-shared-db");
+    let root = w.home.join(".hermes");
+    fs::create_dir_all(&root).unwrap();
+    let db = rusqlite::Connection::open(root.join("state.db")).unwrap();
+    db.execute_batch("CREATE TABLE sessions(id TEXT PRIMARY KEY, source TEXT, started_at REAL, ended_at REAL, title TEXT);
+        CREATE TABLE messages(id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, content TEXT,
+        tool_call_id TEXT, tool_calls TEXT, tool_name TEXT, timestamp REAL);
+        INSERT INTO sessions VALUES('native-hermes-session','cli',100,200,'Shared database');
+        INSERT INTO messages(id,session_id,role,content,timestamp) VALUES(1,'native-hermes-session','user','inspect the shared database',101);")
+        .unwrap();
+    drop(db);
+    for args in [
+        vec!["show", "hermes:native-hermes-session", "--kind", "overview"],
+        vec!["pack", "--session", "hermes:native-hermes-session"],
+        vec!["pack", "database", "--session", "hermes:native-hermes-session"],
+    ] {
+        let (out, _) = w.cv_ok(&args);
+        assert!(out.contains("cv show hermes:native-hermes-session"), "{out}");
+        assert!(!out.contains("state.db") && !out.contains("hermes:state"), "{out}");
+    }
+    let (out, _) = w.cv_ok(&["show", "hermes:native-hermes-session", "--around", "0"]);
+    assert!(out.contains("inspect the shared database"), "{out}");
 }
 
 #[test]

@@ -82,19 +82,21 @@ pub(crate) fn cmd_pack(args: PackArgs<'_>) -> Result<()> {
             .iter()
             .map(|spec| {
                 let (harness, id) = crate::util::split_harness_id(spec, None);
-                crate::cmd::distill::resolve_source(id, harness)
+                let (session, adapter) = crate::cmd::distill::resolve_source(id, harness)?;
+                let selector = Path::new(id).is_file().then(|| format!("{}:{id}", session.harness));
+                Ok((session, adapter, selector))
             })
             .collect::<Result<Vec<_>>>()?;
         let mut seen = HashSet::new();
-        for (session, adapter) in selected {
+        for (session, adapter, selector) in selected {
             if !seen.insert((session.harness, session.id.clone(), session.path.clone())) {
                 continue;
             }
             let path = session.path.clone();
             let source = if use_overview {
-                build_overview_source(session, excerpt_bytes)
+                build_overview_source(session, excerpt_bytes, selector)
             } else {
-                build_source(session, adapter.as_ref(), query, excerpt_bytes, true)
+                build_source(session, adapter.as_ref(), query, excerpt_bytes, selector)
             };
             sources.push(source.with_context(|| format!("reading selected session {}", path.display()))?);
         }
@@ -114,7 +116,7 @@ pub(crate) fn cmd_pack(args: PackArgs<'_>) -> Result<()> {
         }
         for hit in hits {
             let source = resolve_hit(&hit)
-                .and_then(|(session, adapter)| build_source(session, adapter.as_ref(), query, excerpt_bytes, false));
+                .and_then(|(session, adapter)| build_source(session, adapter.as_ref(), query, excerpt_bytes, None));
             match source {
                 Ok(source) => sources.push(source),
                 Err(error) => eprintln!("cv pack: skipping {} ({}): {error:#}", short_id(&hit.id), hit.harness),
@@ -401,8 +403,8 @@ type Excerpt = Vec<(Role, String, bool)>;
 struct PackSource {
     session: cv_core::SessionRef,
     overview: Option<serde_json::Value>,
-    /// Explicit selections link back to their path so duplicate native IDs remain distinguishable.
-    selected: bool,
+    /// Explicit path selections retain their caller spelling; other sources use native IDs.
+    selector: Option<String>,
     /// Window around the best match of the task.
     excerpt: Excerpt,
     /// 0-based `[lo, hi)` message window the excerpt came from — the `cv show --range` hint.
@@ -430,7 +432,7 @@ fn build_source(
     adapter: &dyn cv_core::Adapter,
     task: &str,
     excerpt_bytes: usize,
-    selected: bool,
+    selector: Option<String>,
 ) -> Result<PackSource> {
     // Carry the resolved source through the read, including path-selected duplicate IDs.
     let mut resolved = session.clone();
@@ -442,7 +444,7 @@ fn build_source(
     Ok(PackSource {
         session: resolved,
         overview: None,
-        selected,
+        selector,
         excerpt,
         excerpt_range,
         edits,
@@ -451,7 +453,11 @@ fn build_source(
     })
 }
 
-fn build_overview_source(session: cv_core::SessionRef, excerpt_bytes: usize) -> Result<PackSource> {
+fn build_overview_source(
+    session: cv_core::SessionRef,
+    excerpt_bytes: usize,
+    selector: Option<String>,
+) -> Result<PackSource> {
     let overview = cv_core::overview::read(
         &session,
         &cv_core::overview::OverviewOptions {
@@ -465,7 +471,7 @@ fn build_overview_source(session: cv_core::SessionRef, excerpt_bytes: usize) -> 
     Ok(PackSource {
         session,
         overview: Some(serde_json::to_value(overview)?),
-        selected: true,
+        selector,
         excerpt: Vec::new(),
         excerpt_range: None,
         edits: BTreeMap::new(),
@@ -814,7 +820,7 @@ fn md_bundle(task: &str, sources: &[PackSource], rollup: &[(String, usize, i64, 
             hit_cwd(&s.session)
         );
         if let Some(overview) = &s.overview {
-            out.push_str(&super::overview::render(overview));
+            out.push_str(&super::overview::render(overview, s.selector.as_deref(), None));
             out.push('\n');
         }
         if !s.excerpt.is_empty() {
@@ -831,11 +837,11 @@ fn md_bundle(task: &str, sources: &[PackSource], rollup: &[(String, usize, i64, 
             let cmds: Vec<String> = s.commands.iter().map(|c| format!("`{c}`")).collect();
             let _ = writeln!(out, "Commands run: {}\n", cmds.join(", "));
         }
-        let selector = if s.selected {
-            crate::util::shell_quote(&format!("{}:{}", s.session.harness, s.session.path.display()))
-        } else {
-            format!("{}:{}", s.session.harness, s.session.id)
-        };
+        let selector = crate::util::shell_quote(
+            s.selector
+                .as_deref()
+                .unwrap_or(&format!("{}:{}", s.session.harness, s.session.id)),
+        );
         let more = match s.excerpt_range {
             Some((lo, hi)) => format!("cv show {selector} --range {lo}..{hi}"),
             None => format!("cv show {selector}"),
@@ -881,7 +887,7 @@ fn prompt_bundle(task: &str, sources: &[PackSource], rollup: &[(String, usize, i
             hit_cwd(&s.session)
         );
         if let Some(overview) = &s.overview {
-            out.push_str(&super::overview::render(overview));
+            out.push_str(&super::overview::render(overview, s.selector.as_deref(), None));
             out.push('\n');
         }
         for (role, text, _) in &s.excerpt {
@@ -1472,7 +1478,7 @@ mod tests {
                 updated_at: None,
                 message_count: None,
             },
-            selected: false,
+            selector: None,
             overview: None,
             excerpt: Vec::new(),
             excerpt_range: Some((4, 9)),

@@ -5,13 +5,13 @@ use cv_core::sanitize::sanitize_line;
 use cv_core::SessionRef;
 use serde_json::Value;
 
-pub(crate) fn print(r: &SessionRef, json: bool) -> Result<()> {
+pub(crate) fn print(r: &SessionRef, json: bool, source: &str, agent: Option<&str>) -> Result<()> {
     let overview = cv_core::overview::read(r, &Default::default())?;
     let value = serde_json::to_value(overview)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&value)?);
     } else {
-        print!("{}", render(&value));
+        print!("{}", render(&value, Some(source), agent));
     }
     Ok(())
 }
@@ -31,16 +31,21 @@ fn excerpt(out: &mut String, row: &Value, key: &str) {
     }
 }
 
-pub(crate) fn render(value: &Value) -> String {
+pub(crate) fn render(value: &Value, source: Option<&str>, agent: Option<&str>) -> String {
     let session = &value["session"];
     let selector = format!("{}:{}", text(session, "harness"), text(session, "id"));
-    let path = text(session, "path");
-    let source_selector = if path.is_empty() {
-        selector.clone()
-    } else {
-        format!("{}:{path}", text(session, "harness"))
+    // A shared SQLite path is not a session selector. Preserve an explicit caller path,
+    // otherwise address the native session ID recorded in the overview.
+    let quoted_selector = cv_core::harness::shell_quote(source.unwrap_or(&selector));
+    let message_selector = match agent {
+        Some(agent) => format!("{quoted_selector} --agent {}", cv_core::harness::shell_quote(agent)),
+        None => quoted_selector.clone(),
     };
-    let quoted_selector = cv_core::harness::shell_quote(&source_selector);
+    let worker_parent = if agent.is_some() {
+        cv_core::harness::shell_quote(&selector)
+    } else {
+        quoted_selector
+    };
     let mut out = format!("{}\n{}\n", text(session, "title"), selector);
     for (field, heading) in [
         ("requests", "Requests"),
@@ -74,7 +79,7 @@ pub(crate) fn render(value: &Value) -> String {
                     }
                     excerpt(&mut out, row, "last_text");
                     out.push_str(&format!(
-                        "    cv show {quoted_selector} --agent {}\n",
+                        "    cv show {worker_parent} --agent {}\n",
                         cv_core::harness::shell_quote(&text(row, "agent_id"))
                     ));
                 }
@@ -118,7 +123,7 @@ pub(crate) fn render(value: &Value) -> String {
         out.push_str(&format!("\n{}\n", coverage.summary()));
     }
     out.push_str(&format!(
-        "\nRead surrounding messages: cv show {quoted_selector} --around N\n"
+        "\nRead surrounding messages: cv show {message_selector} --around N\n"
     ));
     out
 }
