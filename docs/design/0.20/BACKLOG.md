@@ -145,6 +145,20 @@ per-search cost (session rows, meta docs, dependency table and one stat per sess
 far the index trails) is ordinary frozen search's freshness contract; batch queries skip it. The
 byte count in the original report was not measured.
 
+**Fleet repeated-query follow-up (pack_selection, 2026-11-14).** Fleet's `agentmap` issues
+individual `cv --frozen search --json` processes under `cv_max_inflight`; later background
+refreshes should see later index commits. There is no existing query-cohort scheduler.
+`cv serve` currently invokes the same stateless search path, including discovery and source
+freshness assessment, so keeping that server alive alone does not remove this work.
+An isolated new-session/rewrite probe confirmed that `PreparedIndex::refresh()` sees later
+commits, while an unreopened batch reader remains pinned. Prepared queries also skip source
+freshness assessment and use stored snippets: they are not a drop-in semantic replacement.
+Next: agree which freshness notes and snippet behavior Fleet needs, then evaluate a bounded
+worker pool with explicit per-request reader refresh using the existing batch/search surface.
+Keep admission limits, deadlines, restart/error handling, and the existing JSON consumer
+contract explicit. Do not silently pin a Fleet reader or add a separate search service.
+The probe's timings and conditions are in the accompanying commit, not a fleet-wide speedup claim.
+
 **Exports: old quadratic claim is stale, with qualifications.**
 `harness/export/native.rs` already builds a source-validated ID/range map after the metadata
 roster exceeds admission. Selected reads reuse it in-process; SQLite catalog persistence
