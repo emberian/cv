@@ -64,21 +64,21 @@ fn distill_unsettled_refuses_resume_but_allows_explicit_snapshot() {
     let (ok, _, pack, err) = w.cv(&["distill", "unsettled-source"]);
     assert!(ok, "{err}");
     assert!(pack.contains("## Unsettled calls"));
-    let (ok, _, _, err) = w.cv(&[
+    let (ok, _, report, err) = w.cv(&[
         "distill",
         "unsettled-source",
         "--session",
         "--out",
         output.to_str().unwrap(),
         "--allow-unsettled",
+        "--json",
     ]);
     assert!(ok, "{err}");
-    assert!(output.exists());
-    let transcript = std::fs::read_dir(&output)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .find(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
-        .unwrap();
+    let report: serde_json::Value = serde_json::from_str(&report).unwrap();
+    // --out is a store root; the Claude emitter places main-thread transcripts in a
+    // project directory beneath it. Follow the published path instead of guessing layout.
+    let transcript = std::path::PathBuf::from(report["emitted"]["path"].as_str().unwrap());
+    assert!(transcript.starts_with(&output), "{report}");
     let transcript = std::fs::read_to_string(transcript).unwrap();
     assert!(transcript.contains("Unsettled calls"));
     assert!(transcript.contains("`build`"));
