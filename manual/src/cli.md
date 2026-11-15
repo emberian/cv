@@ -821,7 +821,7 @@ Prepays the live read search would do; run it whenever convenient.
 cv index                # full-text (tantivy) index (top-level sessions)
 cv index --exact        # also build the trigram accelerator for `cv search --exact`
 cv index --subagents    # also fold the sub-agent / workflow forest into the index + events
-cv index --rebuild      # clear and rebuild from scratch
+cv index --rebuild      # reread all sessions; retain old history until replacement succeeds
 cv index --if-changed   # skip the pass when nothing changed since the last index
 ```
 

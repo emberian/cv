@@ -1038,11 +1038,12 @@ enum Cmd {
     /// Build/refresh the tantivy full-text index that makes `cv search` instant.
     ///
     /// Incremental by default: only changed/new sessions are re-indexed and vanished ones reaped,
-    /// so routine refreshes are fast and light. Use `--rebuild` to clear and rebuild from scratch.
+    /// so routine refreshes are fast and light. Use `--rebuild` to reread every session while
+    /// retaining previously indexed history until its replacement is ready.
     /// Tool-call events (file edits/reads, commands, errors) ride along on the same pass into the
     /// catalog, powering `cv events` and `cv touched`.
     Index {
-        /// Clear and rebuild the index from scratch instead of incrementally updating it.
+        /// Reread every session, retaining previously indexed history until replacement succeeds.
         #[arg(long)]
         rebuild: bool,
         /// Also build the trigram accelerator for `cv search --exact` (an additional source pass).

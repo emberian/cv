@@ -28,13 +28,15 @@ indexed 412 session(s) → /Users/you/.clustervision/tantivy
 ```
 
 `cv index` is incremental: it reads only new or changed sessions and reaps vanished ones.
-`--rebuild` starts from scratch. `--if-changed` skips the pass when a stat-only probe shows no
-session drift.
+`--rebuild` rereads every session. A failed replacement keeps that session's previously indexed
+history available for retry. An incompatible index schema is replaced only after the complete
+replacement has been built and validated. Incomplete discovery never prunes unseen history.
+`--if-changed` skips the pass when a stat-only probe shows no session drift.
 `--subagents` also indexes the sub-agent and workflow forest (off by default; it can add
 hundreds of MB).
 
-A session that cannot be read (changed twice during the pass, or a failed read) stays out until
-a later pass; `cv index` warns with the count and exits 0. `--json` lists each with its reason;
+A session that cannot be read (changed twice during the pass, or a failed read) keeps its last
+committed searchable revision, if any; `cv index` warns with the count and exits 0. `--json` lists each with its reason;
 `--strict` exits 1. A persisted tool output it cannot open is dropped with a note; the session is
 still indexed.
 
