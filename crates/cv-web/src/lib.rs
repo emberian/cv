@@ -339,6 +339,13 @@ impl WasmStore {
         Ok(row)
     }
 
+    fn overview_inner(&self, harness: &str, id: &str) -> Result<Value, String> {
+        let entry = self.find_entry(harness, id)?;
+        let overview =
+            cv_core::overview::from_session(&entry.session, &Default::default()).map_err(|e| format!("{e:#}"))?;
+        serde_json::to_value(overview).map_err(|e| e.to_string())
+    }
+
     fn messages_inner(&self, harness: &str, id: &str, start: usize, end: Option<usize>) -> Result<Value, String> {
         if let Some(e) = end {
             if e < start {
@@ -467,6 +474,20 @@ impl WasmStore {
         to_json_string(&head)
     }
 
+    /// Return a bounded overview using the shared collector without serializing the full session.
+    pub fn overview(&self, harness: &str, id: &str) -> Result<String, JsValue> {
+        let overview = self.overview_inner(harness, id).map_err(|e| JsValue::from_str(&e))?;
+        to_json_string(&overview)
+    }
+
+    /// Project an already-loaded JSON import without resolving its native ID against another store.
+    pub fn overview_json(&self, session_json: &str) -> Result<String, JsValue> {
+        let session: Session = serde_json::from_str(session_json).map_err(|e| js_err("session", e))?;
+        let overview =
+            cv_core::overview::from_session(&session, &Default::default()).map_err(|e| js_err("overview", e))?;
+        to_json_string(&overview)
+    }
+
     /// Return `[start, end)` messages in the exact `/api/session/{harness}/{id}/messages` envelope.
     pub fn messages(&self, harness: &str, id: &str, start: usize, end: Option<usize>) -> Result<String, JsValue> {
         let win = self
@@ -592,6 +613,16 @@ mod tests {
         let head = store.session_head_inner("claude", "abc").unwrap();
         assert_eq!(head["total"], 4);
         assert_eq!(head["model"], "claude-sonnet-4-5");
+
+        // A bounded overview reads retained Rust data, with anchors into the same message windows.
+        let overview = store.overview_inner("claude", "abc").unwrap();
+        assert!(overview["session"].get("messages").is_none());
+        let request = &overview["requests"][0];
+        let anchor = request["msg_idx"].as_u64().unwrap() as usize;
+        let source = store.messages_inner("claude", "abc", anchor, Some(anchor + 1)).unwrap();
+        assert_eq!(request["text"], source["messages"][0]["content"][0]["text"]);
+        assert_eq!(overview["commands"][0]["command"], "cargo test --workspace");
+        assert_eq!(store.find_entry("claude", "abc").unwrap().session.messages.len(), 4);
 
         // Deterministic distill directly from WASM memory.
         let distilled = store

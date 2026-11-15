@@ -67,7 +67,7 @@ import {
 } from "./components/util.js";
 import {
   getAuthToken, setAuthToken, authHeaders, registerWasmStore,
-  hydrateSession, getMessages, getSessionHead, searchSessions, probeSearch, getCorpusStats,
+  hydrateSession, getMessages, getSessionHead, getOverview, searchSessions, probeSearch, getCorpusStats,
 } from "./components/hydrate.js";
 import { canInvokeNative, listen } from "./tauri.js";
 import { blockToText, messagesToChat, generate, getKey, setKey, MODEL_PRESETS, DEFAULT_MODEL } from "./openrouter.js";
@@ -811,6 +811,106 @@ const deferred = () => {
   const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
   return { promise, resolve, reject };
 };
+suite("Session overview");
+const overviewFixture = {
+  requests: [{ msg_idx: 900, text: "Keep <script>literal<\/script> intact", truncated: true }],
+  files: [{ msg_idx: 901, kind: "file_read", path: "/project/design.md", present: false }],
+  commands: [{ msg_idx: 902, tool: "Bash", command: "cargo test", truncated: false }],
+  workers: [{ session_id: "worker-session", agent_id: "worker-agent", description: "Review", status: "returned", status_source: "explicit", last_text: "Needs a caller", truncated: false }],
+  omitted: { requests: 12, files: 0, commands: 0, workers: 0 },
+  warnings: ["Worker result is unavailable."],
+  read_coverage: { sources: ["native_store"], limitations: ["missing_payloads"] },
+};
+function overviewTranscript(id = "overview") {
+  const transcript = document.createElement("cv-transcript");
+  transcript._mountEvents = () => {};
+  transcript._mountSubagents = () => {};
+  transcript.session = { id, harness: "claude", messages: [], _remote: true, _paged: true };
+  return transcript;
+}
+await acheck("overview is on demand, escapes excerpts and loads only a surrounding window", async () => {
+  const original = globalThis.fetch, requests = [];
+  globalThis.fetch = async (url) => {
+    const u = new URL(url); requests.push(u);
+    if (u.pathname.endsWith("/overview")) return Response.json(overviewFixture);
+    if (u.pathname.endsWith("/messages")) return Response.json({ start: 898, messages: [{ role: "user", kind: "prompt", content: [{ type: "text", text: "surrounding evidence" }] }] });
+    if (u.pathname.endsWith("/subagent/worker-agent")) return Response.json({ id: "worker-session", harness: "claude", messages: [] });
+    throw new Error(`Unexpected read: ${u.pathname}`);
+  };
+  try {
+    const transcript = overviewTranscript();
+    eq(requests.length, 0, "render does not fetch overview");
+    await transcript._toggleOverview(transcript.session);
+    eq(requests.length, 1, "one bounded overview request");
+    truthy(transcript.textContent.includes("Keep <script>literal<\/script> intact…"), "escaped shortened excerpt");
+    eq(transcript.querySelectorAll("script").length, 0, "source cannot create markup");
+    truthy(transcript.textContent.includes("12 more requests omitted"), "omissions visible");
+    truthy(transcript.textContent.includes("missing now"), "current missing file visible");
+    truthy(transcript.textContent.includes("missing payloads"), "coverage visible");
+    const panel = transcript.querySelector(".overview-panel");
+    await transcript._overviewContext(transcript.session, panel, 900);
+    eq(requests[1].searchParams.get("start"), "898", "context starts near the anchor");
+    eq(requests[1].searchParams.get("end"), "903", "five-message bound");
+    truthy(panel.querySelector(".overview-context").textContent.includes("surrounding evidence"), "context rendered");
+    await transcript._overviewWorker(transcript.session, panel, overviewFixture.workers[0]);
+    eq(requests[2].pathname, "/api/session/claude/overview/subagent/worker-agent", "existing parent-relative worker route");
+    truthy(panel.querySelector("cv-transcript"), "worker opens in reader");
+    await transcript._toggleOverview(transcript.session); await transcript._toggleOverview(transcript.session);
+    eq(requests.length, 3, "reopening keeps bounded result");
+  } finally { globalThis.fetch = original; }
+});
+await acheck("old overview and context responses cannot replace the current selection", async () => {
+  const original = globalThis.fetch, old = deferred(), first = deferred(), next = deferred();
+  globalThis.fetch = async (url) => {
+    const u = new URL(url);
+    if (u.pathname.endsWith("/overview")) return { ok: true, json: () => old.promise };
+    return { ok: true, json: () => u.searchParams.get("start") === "8" ? first.promise : next.promise };
+  };
+  try {
+    const transcript = overviewTranscript("old");
+    const loading = transcript._toggleOverview(transcript.session);
+    transcript.session = { id: "new", harness: "claude", messages: [], _remote: true };
+    old.resolve(overviewFixture); await loading;
+    eq(transcript.querySelector(".overview-panel"), null, "late overview ignored");
+    await transcript._toggleOverview(transcript.session);
+    const panel = transcript.querySelector(".overview-panel");
+    const a = transcript._overviewContext(transcript.session, panel, 10);
+    const b = transcript._overviewContext(transcript.session, panel, 20);
+    next.resolve({ start: 18, messages: [{ role: "user", content: [{ type: "text", text: "new context" }] }] }); await b;
+    first.resolve({ start: 8, messages: [{ role: "user", content: [{ type: "text", text: "old context" }] }] }); await a;
+    truthy(panel.textContent.includes("new context"), "latest context kept");
+    truthy(!panel.textContent.includes("old context"), "stale context ignored");
+  } finally { globalThis.fetch = original; }
+});
+await acheck("stored and imported overviews use Rust accessors, never remote ID lookup or full hydration", async () => {
+  const original = globalThis.fetch, calls = [];
+  globalThis.fetch = async () => { throw new Error("Local overview must not hit HTTP"); };
+  registerWasmStore({
+    overview: (harness, id) => { calls.push([harness, id]); return JSON.stringify(overviewFixture); },
+    overview_json: (json) => { calls.push(JSON.parse(json).messages.length); return JSON.stringify(overviewFixture); },
+    session: () => { throw new Error("Overview must not serialize the stored session"); },
+  });
+  try {
+    await getOverview({ harness: "claude", id: "stored", _wasm: true, _stub: true });
+    await getOverview({ harness: "claude", id: "stored", messages: [{ role: "user", content: [] }] });
+    eq(JSON.stringify(calls), JSON.stringify([["claude", "stored"], 1]), "source identity preserved");
+  } finally { registerWasmStore(null); globalThis.fetch = original; }
+});
+await acheck("overview failure stays visible and retry can recover", async () => {
+  const original = globalThis.fetch; let fail = true;
+  globalThis.fetch = async () => fail ? new Response("unavailable", { status: 503 }) : Response.json(overviewFixture);
+  try {
+    const transcript = overviewTranscript();
+    await transcript._toggleOverview(transcript.session);
+    truthy(transcript.textContent.includes("Couldn't load overview"), "failure is not empty success");
+    fail = false;
+    const toggle = transcript._toggleOverview.bind(transcript); let retried;
+    transcript._toggleOverview = (session) => (retried = toggle(session));
+    transcript.querySelector(".overview-panel button").click();
+    await retried;
+    truthy(transcript.textContent.includes("Keep <script>literal<\/script> intact"), "retry reads again");
+  } finally { globalThis.fetch = original; }
+});
 async function hydrationFixture(body) {
   const original = globalThis.fetch;
   const heads = new Map(), windows = new Map(), requests = [];

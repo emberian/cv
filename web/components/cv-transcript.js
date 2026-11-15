@@ -13,7 +13,7 @@ import {
 } from "./util.js";
 import { canInvokeNative, invoke } from "../tauri.js";
 import { renderMarkdown, renderCodeBlock } from "../markdown.js";
-import { getSubagents, getSubagent, getEvents, hydrateSession, getAuthToken, PAGE, CVD_BASE } from "./hydrate.js";
+import { getSubagents, getSubagent, getEvents, getOverview, getMessages, hydrateSession, getAuthToken, PAGE, CVD_BASE } from "./hydrate.js";
 
 /** Collapse whitespace and cut to `max` — for one-line peeks and rule details. */
 function truncateLine(s, max) {
@@ -244,6 +244,110 @@ class CvTranscript extends HTMLElement {
     this._renderPager();
   }
 
+  // ---- on-demand overview -------------------------------------------------
+  async _toggleOverview(session) {
+    let panel = this.querySelector(".overview-panel");
+    if (panel) {
+      panel.hidden = !panel.hidden;
+      this.querySelector("[data-overview]")?.setAttribute("aria-expanded", String(!panel.hidden));
+      return;
+    }
+    const generation = this._generation;
+    panel = document.createElement("section");
+    panel.className = "overview-panel sub-panel";
+    panel.setAttribute("aria-label", "Session overview");
+    panel.innerHTML = `<div class="sub-list muted" role="status">Loading overview…</div>`;
+    this.querySelector(".transcript-header")?.insertAdjacentElement("afterend", panel);
+    this.querySelector("[data-overview]")?.setAttribute("aria-expanded", "true");
+    try {
+      const overview = await getOverview(session);
+      if (generation !== this._generation || this._session !== session) return;
+      panel.innerHTML = this._overviewHtml(overview);
+      panel.querySelectorAll("[data-overview-message]").forEach((button) => {
+        button.addEventListener("click", () => this._overviewContext(session, panel, +button.dataset.overviewMessage));
+      });
+      panel.querySelectorAll("[data-overview-worker]").forEach((button) => {
+        button.addEventListener("click", () => this._overviewWorker(session, panel, overview.workers[+button.dataset.overviewWorker]));
+      });
+    } catch (error) {
+      if (generation !== this._generation || this._session !== session) return;
+      panel.innerHTML = `<div class="sub-list"><p class="muted" role="status">Couldn't load overview: ${esc(error?.message || error)}</p><button type="button" class="mini-btn">Retry overview</button></div>`;
+      panel.querySelector("button").addEventListener("click", () => { panel.remove(); this._toggleOverview(session); });
+    }
+  }
+
+  _overviewHtml(overview) {
+    const excerpt = (row, text) => `<button type="button" class="overview-excerpt" title="Show surrounding messages" data-overview-message="${esc(row.msg_idx)}"><span class="muted">#${esc(row.msg_idx)}${row.ts ? ` · ${esc(fmtTime(row.ts))}` : ""}</span> ${esc(text)}${row.truncated ? "…" : ""}</button>`;
+    const sections = [
+      ["Requests", "requests", (row) => excerpt(row, row.text)],
+      ["Files", "files", (row) => `${excerpt(row, `${row.kind === "file_edit" ? "edit" : "read"}: ${row.path}`)}<span class="muted"> · ${row.present === true ? "present now" : row.present === false ? "missing now" : "not checked"}</span>`],
+      ["Commands", "commands", (row) => excerpt(row, row.command ?? `${row.tool}: command unavailable`)],
+      ["Workers", "workers", (row, i) => `<button type="button" class="overview-excerpt" data-overview-worker="${i}">${esc(row.description || row.agent_id || row.session_id || "Worker")}</button><span class="muted"> · ${esc(row.status || "unknown")}${row.status_source ? ` (${esc(row.status_source)})` : ""}</span>${row.last_text ? `<p>${esc(row.last_text)}${row.truncated ? "…" : ""}</p>` : ""}`],
+    ];
+    return `<div class="sub-list">${sections.map(([title, key, render]) => {
+      const rows = overview[key] || [];
+      const count = overview.omitted?.[key];
+      const omitted = Number.isSafeInteger(count) && count > 0 ? count : 0;
+      const noun = key === "files" ? "file event" : title.toLowerCase().slice(0, -1);
+      return `<h3>${title}</h3>${rows.length ? `<ul>${rows.map((row, i) => `<li>${render(row, i)}</li>`).join("")}</ul>` : '<p class="muted">No entries.</p>'}${omitted ? `<p class="muted">${omitted} more ${noun}${omitted === 1 ? "" : "s"} omitted.</p>` : ""}`;
+    }).join("")}${overview.read_coverage ? `<p class="muted">Sources: ${esc((overview.read_coverage.sources || []).join(", ").replaceAll("_", " ") || "unassessed")}${overview.read_coverage.limitations?.length ? ` · ${esc(overview.read_coverage.limitations.join(", ").replaceAll("_", " "))}` : ""}</p>` : ""}${(overview.warnings || []).map((warning) => `<p class="muted">${esc(warning)}</p>`).join("")}<div class="overview-context" aria-live="polite"></div></div>`;
+  }
+
+  async _overviewContext(session, panel, index) {
+    if (!Number.isSafeInteger(index) || index < 0) return;
+    const generation = this._generation;
+    const request = this._overviewRequest = (this._overviewRequest || 0) + 1;
+    const host = panel.querySelector(".overview-context");
+    host.querySelectorAll("[data-lazy-body]").forEach((body) => this._lazyBodies.delete(body.dataset.lazyBody));
+    host.textContent = "Loading surrounding messages…";
+    const start = Math.max(0, index - 2), end = index + 3;
+    try {
+      const window = session._remote || session._stub || session._paged || session._wasm
+        ? await getMessages(session, start, end)
+        : { start, messages: (session.messages || []).slice(start, end) };
+      if (generation !== this._generation || this._session !== session || request !== this._overviewRequest) return;
+      if (!window?.messages?.length) throw new Error("These messages are unavailable.");
+      // Reuse the transcript renderer, without splice picks referring into an unloaded prefix.
+      const pickMode = this._pickMode;
+      let html;
+      try {
+        this._pickMode = false;
+        html = window.messages.map((message, i) => this._messageHtml(message, window.start + i)).join("");
+      } finally { this._pickMode = pickMode; }
+      host.innerHTML = `<h3>Messages ${window.start}–${window.start + window.messages.length - 1}</h3>${html}`;
+      this._wireBlocks(host);
+      host.scrollIntoView?.({ block: "nearest" });
+    } catch (error) {
+      if (generation === this._generation && request === this._overviewRequest) host.textContent = error?.message || String(error);
+    }
+  }
+
+  async _overviewWorker(session, panel, worker) {
+    if (!worker) return;
+    if (!worker.agent_id && worker.session_id) {
+      this.dispatchEvent(new CustomEvent("open-session-id", {
+        detail: { id: worker.session_id, harness: worker.harness || session.harness, from: session }, bubbles: true,
+      }));
+      return;
+    }
+    const generation = this._generation;
+    const request = this._overviewRequest = (this._overviewRequest || 0) + 1;
+    const host = panel.querySelector(".overview-context");
+    host.querySelectorAll("[data-lazy-body]").forEach((body) => this._lazyBodies.delete(body.dataset.lazyBody));
+    host.textContent = "Loading worker…";
+    try {
+      if (!worker.agent_id) throw new Error("No worker transcript is recorded.");
+      const full = await getSubagent(session.harness, session.id, worker.agent_id);
+      if (generation !== this._generation || this._session !== session || request !== this._overviewRequest) return;
+      full._isSubagent = true;
+      const nested = document.createElement("cv-transcript");
+      host.replaceChildren(nested);
+      nested.session = full;
+    } catch (error) {
+      if (generation === this._generation && request === this._overviewRequest) host.textContent = `Couldn't load worker: ${error?.message || error}`;
+    }
+  }
+
   // ---- events panel --------------------------------------------------------
   // What the session DID: file edits/commands/errors from the event catalog (cv serve's `/events`
   // endpoint / the desktop's `local_events`). Collapsible, below the header, mirroring the
@@ -398,6 +502,9 @@ class CvTranscript extends HTMLElement {
 
   // Header-level controls (export buttons) — wired once per render.
   _wireHeader(s) {
+    const overview = this.querySelector("[data-overview]");
+    overview?.setAttribute("aria-expanded", String(!!this.querySelector(".overview-panel:not([hidden])")));
+    overview?.addEventListener("click", () => this._toggleOverview(s));
     for (const [format, selector] of [["opensession", "[data-export-json]"], ["markdown", "[data-export-md]"]]) {
       this.querySelector(selector)?.addEventListener("click", async (e) => {
         const button = e.currentTarget;
@@ -593,6 +700,7 @@ class CvTranscript extends HTMLElement {
           <cv-harness-badge harness="${esc(h)}"></cv-harness-badge>
           <h2>${esc(sessionLabel(s))}</h2>
           <div class="th-actions">
+            <button type="button" class="mini-btn" data-overview aria-expanded="false">Overview</button>
             <button type="button" class="mini-btn" data-export-md title="Download complete transcript as Markdown">⬇ .md</button>
             <button type="button" class="mini-btn" data-export-json title="Download complete transcript as OpenSession JSON">⬇ .json</button>
           </div>

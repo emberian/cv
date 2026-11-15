@@ -186,6 +186,22 @@ export async function getSessionHead(stub) {
   }
 }
 
+/** Bounded, shared Rust overview. Never hydrate a whole session to construct it in JS. */
+export async function getOverview(session) {
+  if (!session?.harness || !session?.id) throw new Error("No session selected.");
+  if (session._wasm) {
+    if (!wasmStoreRef?.overview) throw new Error("Overview is unavailable in this browser build.");
+    return JSON.parse(wasmStoreRef.overview(session.harness, session.id));
+  }
+  if (session._remote || session._stub || session._paged) {
+    return apiGet(sessionPath(session.harness, session.id, "/overview"));
+  }
+  // JSON imports already live in JS. Run the same Rust collector over that existing value;
+  // do not look up an unrelated on-disk session with a matching native ID.
+  if (!wasmStoreRef?.overview_json) throw new Error("Overview requires the browser WASM module for imported sessions.");
+  return JSON.parse(wasmStoreRef.overview_json(JSON.stringify(session)));
+}
+
 /** The session's extracted tool events (file edits/reads, commands, errors), in transcript
  *  order, optionally filtered by kind. Empty on any error — the events panel simply doesn't
  *  appear. Each row's `ts` is an RFC 3339 string. */
