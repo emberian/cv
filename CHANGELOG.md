@@ -19,6 +19,20 @@
 - Claude resume validation rejects cyclic parent links, including detached cycles.
 - Frozen reads use stable private SQLite snapshots without modifying source WAL/SHM; connection ownership prevents premature cleanup and leaked temporary databases.
 - Frozen hooks enforce retirement/edit guards while skipping lane and non-strict receipt writes; task sweep permits frozen reads, and writer refusals name alternatives.
+- Persisted-output pointers resolve only to files inside the session's own store; a stub naming any other path is kept as text, never read or indexed.
+- An unreadable retired ledger is an error: the guard refuses calls that would wake an agent, and `cv retire` fails instead of listing legacy rows.
+- Frozen search and listing beside a running cv writer read a private catalog copy instead of rediscovering every store and calling every session stale.
+- `cv index` keeps sessions whose whole store root is absent (unmounted or moved) instead of reaping them, and says so.
+- Live sessions resume from their marks: a session written during a pass, or a Codex rollout read mid-turn, is no longer reread whole.
+- Antigravity exports recover native tool-call ids and steps the export never wrote (cancelled tools, upstream errors, history before a resume) by matching rendered steps.
+- Antigravity reads permission requests and answers, kills as `background_job/stop`, interrupted replies, idle-child returns, swarm members, and typed tool results in `details.payload`.
+- Antigravity native reads are about ten times faster; cleared rows keep their kind; `unsupported_native_fields` appears only for a field left unread.
+- Antigravity sessions are titled by their first prompt; prompt images survive a missing upload; the sub-agent forest names the real spawning call.
+- `cv resume` warns when the Antigravity CLI root does not hold the conversation it would resume.
+- `cv distill` tracks Claude background work by task, settles Codex compound polls per call, and settles Antigravity cancellations by the task they name.
+- Distill budgets measure what the target loads and say which; `--json` adds `budget` and `unsettled`; facts note a later identical run.
+- `cv show --around`, `cv tools` and live search no longer materialise inline image bytes.
+- `cv task show` prints the newest three notes (`--all` for every note); `cv task open` warns on a similar open title.
 
 ## 0.19.3 — 2026-11-13 — parser termination and malformed-input recovery
 

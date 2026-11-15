@@ -1,9 +1,10 @@
 # 0.20 candidate: reliable live histories and trustworthy handoffs
 
-Status: implementation integrated and code frozen at `d7e8506c`; candidate version
-`0.20.0`, source-reader version 13. Integration owner: Codex. This is not a public
-release announcement. Local release gates have passed. The adapter, IR, query API and existing routes
-remain the product shape.
+Status: candidate version `0.20.0`, source-reader version 13, unreleased and untagged. Code was
+first frozen at `d7e8506c` (integration owner: Codex); a second review pass by Claude Fable on
+2026-11-15 found and fixed further defects against the real fleet, listed first in
+[BACKLOG.md](BACKLOG.md). This is not a public release announcement. The adapter, IR, query API
+and existing routes remain the product shape.
 
 ## Implemented outcomes
 
@@ -79,18 +80,11 @@ remain the product shape.
 
 ## Remaining work and limits
 
-Dedicated writer-generated scenarios are still needed for permissions, retries,
-cancellation, broader media/attachments, nested swarms, live source promotion and
-native-only resume roots. Unknown or unrecoverable content remains disclosed;
-no claim of complete Antigravity fidelity or native emission follows from indexing.
-
-Ordinary frozen-search/fleet costs remain separate from batch-query improvements.
-Frozen state opens copy the database and sidecars for a stable private snapshot;
-on filesystems without cheap cloning, repeated opens can copy the whole database
-repeatedly. `retired::raw_current` also retains a legacy fallback: if read-only state
-opening fails under churn, SQLite-only retirements can be omitted. These are
-follow-up performance and correctness work, respectively, not closed by successful
-frozen read tests.
+The second pass closed the retirement fallback, the reproducible form of issue 33, persisted-output
+containment, absent-root pruning, live-session rereads and the Antigravity export reconciliation,
+and added seven real-writer captures. What remains is listed, in order of consequence, under
+"Still open after this pass" in the backlog. No claim of complete Antigravity fidelity or native
+emission follows from indexing.
 
 [BACKLOG.md](BACKLOG.md) contains reconciled task dispositions and acceptance criteria
 for these follow-ups. The read-only inventory found 15 nominally open local tasks

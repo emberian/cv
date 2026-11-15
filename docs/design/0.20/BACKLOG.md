@@ -12,6 +12,47 @@ issue or agent note is a lead, not a current compatibility or performance guaran
 release outcomes and their integration gates belong in the sibling release plan; this page
 keeps their provenance and separates unresolved work from obsolete requests.
 
+## Second pass (Claude Fable, 2026-11-15)
+
+An independent review of the integrated candidate, with four delegated lanes run against the real
+fleet on one machine (10,201 sessions, 499 to 509 of them Antigravity). Every row is implemented
+and tested on main; numbers and conditions are in the commit messages and [PERF.md](../PERF.md).
+
+| Area | Defect found in the candidate | Outcome |
+|---|---|---|
+| Persisted-output pointers | A stub's path was opened as written: any tool output could put a private file into the index, and a transcript tail read as a path failed the session (the original ENAMETOOLONG report, fixed before only in one Antigravity parser) | Claude, Antigravity and Kimi Code resolve a claim only to the file shape their harness spills, beside the transcript (`source::contained_sidecar`); anything else is `persistedOutput.unresolved` and unread |
+| Retirement ledger | An unreadable `state.db` read as the legacy rows alone (1 to 5 of 150 frozen reads under a looping writer) | `retired::current` is fallible; the hook refuses calls that wake an agent, `cv retire` fails; frozen state snapshots accept a copy within one WAL generation, 0 refusals in the same churn |
+| Issue 33 | Reproduced: a frozen command beside any cv writer could not open the catalog and rediscovered the fleet (21 s, every session called stale) | Read from the leased private copy; 4 s and 66 stale on the same workload. The fixed fleet-proportional freshness cost of an ordinary frozen search (about 7.8 G instructions) remains and is the contract; `--batch` avoids it |
+| Index pruning | An unmounted or moved store root reaped every session indexed from it, exit 0 | Kept and named; a deleted file is still reaped |
+| Live sessions | Every pass and every non-frozen search reread each live session whole (no baseline published under growth; no mark on a held Codex reply) | Resume marks; live search 11.5 to 13.3 s became 1.8 to 3.5 s |
+| Antigravity reconciliation | Exports wrap every non-planner step, so no tool result recovered a native call id and 294 interior native-only steps were dropped silently | Matched as the writer renders them; `inferred_tool_identity` 486 to 50 sessions, step gaps 104 to 2, fleet parse 102 s to 10.4 s |
+| Antigravity writer coverage | One real capture | Seven more real 1.5.9 captures (permissions, interruption, background tasks, swarm, sub-agents, prompt media, compaction and resume); eight reader defects fixed; see the [coverage matrix](ANTIGRAVITY-COVERAGE.md) |
+| Handoff lifecycle | On 58 Claude transcripts, 59 launches reported settled without evidence and 322 ended ones left unsettled; Codex compound polls gave a running PTY another command's exit | Correlated by task identity per harness; see [HANDOFF.md](HANDOFF.md) for the remaining 129 Claude rows |
+| Distill budgets | Checked against the Markdown pack for every target | Measured on what the target loads, and named |
+
+Still open after this pass, most consequential first:
+
+1. **Agent lookup by id** costs 8.0 G instructions and 0.47 s for `cv --frozen show <agent-id>` (a
+   miss 2.0 s) against 0.05 s for a session id; `cv lanes` 0.49 s. Measured, not implemented: needs
+   a by-id catalog table with directory guards (exact and prefix ids, ambiguity, new children,
+   changed roots).
+2. **120 Claude launches stay unsettled despite an ending**: their task notifications are
+   `queued_command` attachments without a rendered body, or replayed as origin-less user text.
+   The Claude record codec should keep an unrendered task-notification attachment as injected
+   context; that changes corpus goldens.
+3. **Antigravity**: `cv lanes` shows parked swarm workers as running (no writer evidence yet for
+   what `wake_mode` means); `FileEdit.diff`, GenerateImage/DefineSubagent payloads and blob
+   references are retained in COMPLETE only; non-permission interactions (`ask_question`) were not
+   driven; audio/video prompts are refused by the CLI's ACP server; a rename action does not exist.
+   `agy` was never launched for a resume, so the resume caveat is derived from store layout.
+4. **Index contracts not adversarially tested here**: schema-migration crash boundaries,
+   a derived write failing after FTS publication and the reverse, held-generation freshness. The
+   existing tests were read, none added.
+5. **First index on the fixed binary, cold-cache costs and physical I/O** are unmeasured
+   (`getrusage` block counts are zero on this host).
+6. A mount point left as an empty directory inside a root still reads as a removal.
+7. Free-prose supersession and tokenizer-backed budgets, as HANDOFF.md states.
+
 ## Candidate implementation and outstanding scope
 
 The implementation lanes are integrated. This remains an unpublished 0.20.0 candidate;
@@ -51,8 +92,8 @@ tracker disposition, not a claim that the audit changed the ledger.
 | `019f6ef7-0469-7680-a8af-0bcf921aa706` | Verifiable Done checks | Superseded: `--check-*` retired; filesystem/git observations are sweep candidates, not automatic task closure |
 | `019f6ef7-047c-7b33-b8ab-1807bbaafdf2` | Harden saw_change receipts | Superseded with removed receipt/land authority; no current sensor-hardening feature is implied by this old task |
 | `019f6f36-7715-7bb0-8ac7-bf44ddf9ce32` | `ls --json` consumer gaps / issue 15 | Implemented with explicit costs: `size_bytes` in base rows; git/display-title via `--enrich`; `--fresh` refreshes discovery. `browse.rs`, `session_row_has_the_contract_keys`, `ls_json_enrich_adds_git_branch_and_synthesized_title`, `ls_json_fresh_enumerates_a_previously_empty_project_and_drops_deleted_rows`. Do not restore historical camelCase keys |
-| `01a0fab1-9b64-75d2-a57a-f60324aebb07` | Default task show to three notes | Open, P2 UX. `render_show` still defaults to all notes; explicit `--notes-last`, grep and brief already exist. Choose/document a default and preserve an explicit complete-history option |
-| `01a0fab1-9b7a-7e90-8744-db9a305bc7cb` | Warn on near-duplicate task titles | Open, P2 UX. Current Open validates relations/tags and appends without title similarity checks. A warning must preserve intentional duplicates and avoid a hidden rejection threshold |
+| `01a0fab1-9b64-75d2-a57a-f60324aebb07` | Default task show to three notes | Implemented. The text view prints the newest three and counts the rest; `--all` prints every note, `--json` is whole. `task_show_notes_last_and_grep` |
+| `01a0fab1-9b7a-7e90-8744-db9a305bc7cb` | Warn on near-duplicate task titles | Implemented as a stderr warning after the open, never a refusal: same words, a word-prefix, or three shared words at 60%. `task_open_warns_on_a_similar_open_title_and_opens_anyway` |
 | `01a10891-5134-7191-a4c0-eca1bbe18da4` | Keep reshape parentUuid chains connected | Implemented at the shared emitter. `reshape_verbs_emit_resumable` walks all emitted parents for main and subagent output across distill, fork, splice and port; `claude_emit_relinks_parents_over_dropped_system_records` covers omitted records. Preserve this invariant while changing handoff behavior |
 | `01a114d0-35f5-7871-9196-9b12085bedb8` | Refuse distill over max tokens | Implemented aggregate `--max-bytes` / `--max-estimated-tokens` checks before writes or retirement; `distill_budget_checks_aggregate_before_publishing`. Exact tokenizer/target overhead accounting remains open |
 | `01a114d0-3614-7990-9951-876d176ddbdd` | Do not preserve superseded facts | Partially addressed: newest-per-key git observations say “last seen”; historical facts retain indices. Arbitrary prose decision/open-item supersession remains open; see HANDOFF.md |
@@ -68,14 +109,12 @@ are corrected alongside this audit.
 
 ## Architecture and performance follow-through
 
-**Issue 33: repeated frozen search.** The 0.18 cost report lacks an exact query, invocation,
-revision, corpus and counter source; it does not establish transcript I/O. Measure index setup,
-discovery, query evaluation, stored documents and live/snippet reads separately. Implemented
-batch queries explicitly hold a snapshot and say freshness was not assessed;
-ordinary frozen search retains its freshness contract. Tests cover no-hit, broad, malformed,
-stale and absent-index behavior. Early index validation and held-generation freshness also
-landed for ordinary search. These changes do not constitute a reproduction of the original
-report or a fleet-wide cost measurement.
+**Issue 33: repeated frozen search, reproduced and fixed in its severe form.** A frozen command
+beside a running cv writer found frames in `catalog.db-wal`, could not open the catalog and
+rediscovered the fleet with no scan cache. It now reads the leased private copy. The remaining
+per-search cost (session rows, meta docs, dependency table and one stat per session, to say how
+far the index trails) is ordinary frozen search's freshness contract; batch queries skip it. The
+byte count in the original report was not measured.
 
 **Exports: old quadratic claim is stale, with qualifications.**
 `harness/export/native.rs` already builds a source-validated ID/range map after the metadata
@@ -89,35 +128,25 @@ remaining costs, not the old claim that each selected conversation always rescan
 A persistent portable index or bounded offset-store redesign should follow a measured workload,
 with selection/parity and freshness tests intact.
 
-**Agent lookup remains a real scaling candidate.** `workflow_sessions` reads the freshness-probed
-catalog, then `find_subagent_parents` checks each workflow session's sidecar directory. The test
+**Agent lookup is measured and user-visible, not yet fixed.** See item 1 of the second pass.
 `agent_lookups_read_the_catalog_not_a_rediscovery` rules out rediscovery, not directory work
-proportional to sessions. A by-ID inventory needs directory guards so newly written/copied
-agents and duplicate IDs are not missed. Measure candidate-directory work first; acceptance
-should cover exact and prefix matches, ambiguous IDs, new children and changed roots. P2 unless
-fleet evidence makes this a frequent-user bottleneck.
+proportional to sessions.
 
-**Fleet numbers remain dated.** `PERF.md` reports dated 0.17 measurements and explicitly leaves
-first listing, full recount, repeated unchanged indexing and upgrade cost open. Rust heap gates
-do not bound native SQLite allocations or whole-process footprint; compressed and decoded
-bytes are different quantities. Neither the offset test nor a new query counter closes these
-measurement gaps. Keep raw result artifacts out of the repository; record conditions and results
-in commit messages. Arbitrary prefix-edit detection remains the documented sampled-mark limit,
-not a new unacknowledged 0.20 guarantee.
+**Fleet numbers are current for warm caches.** `PERF.md` records the 0.20 measurements on the
+10,185-session fleet. First index on the fixed binary, a full recount, cold caches and physical
+I/O remain unmeasured. Rust heap gates do not bound native SQLite allocations or whole-process
+footprint. Keep raw result artifacts out of the repository.
 
-**Frozen state snapshot cost, open.** `StateStore::open_readonly` captures a stable private
-copy for each frozen open, including relevant WAL/journal sidecars. This protects source files
-and holds cleanup ownership until SQLite closes, but on filesystems without cheap cloning it
-can repeatedly copy the complete database. Measure repeated task/retirement reads separately
-from query evaluation; investigate a reusable, identity-validated snapshot or shared read scope.
-Any optimization must preserve no source writes and consistency under checkpoint/replacement.
+**Frozen state snapshot cost, measured small.** Frozen task commands open the state snapshot zero
+times and `cv retire` once (about 1.7 ms on APFS, debug build, 299 KiB store). A catalog with
+uncheckpointed frames is copied once per source state per process and released at exit. On a
+filesystem without cloning each such command still copies the whole file; a reusable
+identity-validated copy across processes is the remaining idea, unmeasured.
 
-**Retirement fallback under churn, open correctness work.** `retired::raw_current` starts with
-legacy JSONL and returns that map if `open_readonly` fails; SQLite-only retirements can therefore
-be omitted when a stable state snapshot cannot be obtained. Make unavailable/indeterminate
-state explicit rather than presenting the legacy subset as complete. Add tests with SQLite-only
-retirements, concurrent replacement/checkpoint churn and forced read failure, including hook
-consumers. Successful frozen-state tests do not close this fallback gap.
+**Retirement fallback under churn, closed.** An unreadable store is an error, not the legacy
+subset; see the second pass. `an_unreadable_store_is_an_error_not_the_legacy_subset`,
+`frozen_reads_under_writer_churn_never_omit_a_committed_retirement`,
+`retired_guard_and_list_report_an_unreadable_ledger`.
 
 **Tiny corrupted Tantivy files now fail at the read boundary.** Migration testing reproduced an
 upstream Tantivy 0.26.1 panic: `Footer::extract_footer` checks for four bytes before slicing
