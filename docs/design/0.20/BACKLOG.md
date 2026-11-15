@@ -2,7 +2,7 @@
 
 This is the maintained release backlog, not a dump of historical open labels. The read-only
 2026-11-14 inventory at `d95e2143` was reconciled at `d7e8506c`, through the second pass below,
-and against approved feature additions at `6809bfa5`. Sources are the local ledger
+and against the subsequent approved feature additions. Sources are the local ledger
 (`CV_FROZEN=1 cv task list --repo … --all --json --detail`),
 [GitHub issue 33](https://github.com/emberian/cv/issues/33), current code/manuals and focused tests.
 The inventory had 24 tasks: 15 open, nine done; seven open tasks were tagged `landed-verify`.
@@ -13,10 +13,9 @@ issue or agent note is a lead, not a current compatibility or performance guaran
 release outcomes and their integration gates belong in the sibling release plan; this page
 keeps their provenance and separates unresolved work from obsolete requests.
 
-## Current additions (`6809bfa5`)
+## Current additions
 
-Implemented in cv; final composed gates are underway. These add to the earlier validated
-candidate, rather than inheriting its gate result.
+Implemented in cv, with local workspace and focused integration gates completed.
 
 | User action | Implemented contract | Code/test witness |
 |---|---|---|
@@ -24,13 +23,15 @@ candidate, rather than inheriting its gate result.
 | Open `show --kind overview`, the overview API, or reader Overview | Shared initial/recent requests, workers, file events and commands retain source indexes, omission counts and coverage. File presence is current metadata; file bodies are not read. Imported sessions disclose unavailable worker/file checks | `cv-core/src/overview.rs`, `api.rs`, `cv-web/src/lib.rs`; CLI/API parity tests and `web/selftest.html`; [viewing manual](../../../manual/src/viewing-and-sharing.md#session-overview) |
 | Inspect `show --kind context` and API windows | Saved per-call usage and compaction rows retain original indexes, deduplicate repeated provider records and label saved estimates. Unknown limits remain null; no live remaining-context estimate | `cv-core/src/context.rs`; `tests/context.rs`; [context contract](../../../manual/src/cli.md#saved-token-usage---kind-context) |
 | Follow `lanes --follow [--for …] [--json]` | One parent's initial and changed rows, including final transitions after a selection filter stops matching; no idle duplicates; deadline/interrupt exits | `cmd/session_reports.rs`; `tests/worker_follow.rs`; [lanes manual](../../../manual/src/cli.md#cv-lanes) |
-| Read `resume --json` | Literal program/argument array, cwd, hint and warning; GUI-only targets remain explicit. Never launches; conflicts with `--launch` | `cmd/port.rs` resume JSON tests; [resume manual](../../../manual/src/cli.md#cv-resume) |
+| Read `resume --json` | Literal program/argument array, cwd, environment, hint and warning; GUI-only targets remain explicit. Never launches; conflicts with `--launch` | `cmd/port.rs` resume JSON tests; [resume manual](../../../manual/src/cli.md#cv-resume) |
 
-**Separate Fleet consumer work:** `d58a1cce` in the Fleet repository preserves distinct
-harness/ID/path sources, timestamp precision and unknown counts, uses the configured cv binary
-and shared roots/TMPDIR, and refuses ambiguous exact IDs. Scoped tests passed there. The
-exact-source map/doctor selectors and native `cv resume --json` follow-up are being composed
-against the new cv binary; no Fleet merge, push or deployment is claimed by this tracker.
+**Separate Fleet consumer work:** `d58a1cce`, `6def5a7e` and `73586c1b` in the Fleet repository preserve distinct
+harness/ID/path sources, timestamp precision and unknown counts, use the configured cv binary
+and shared roots/TMPDIR, and refuse ambiguous exact IDs. Scoped tests passed there. The
+exact-source map/doctor selectors and native `cv resume --json` consumer passed composition
+checks against the new cv binary, including duplicate IDs across Claude/Codex profile homes.
+Shared-store paths use IDs and unaddressable duplicates are refused. No Fleet merge, push or
+deployment is claimed by this tracker.
 
 **Still open:** Fleet retains its frozen-plus-unfrozen listing workaround until the affected
 root/harness incident is reproduced. Ordinary search retains fleet-proportional freshness work;
@@ -71,8 +72,8 @@ Still open after this pass, most consequential first:
    what `wake_mode` means); `FileEdit.diff`, GenerateImage/DefineSubagent payloads and blob
    references are retained in COMPLETE only; non-permission interactions (`ask_question`) were not
    driven; audio/video prompts are refused by the CLI's ACP server; a rename action does not exist.
-   The writer capture covers store-only resume; new cv/Fleet native-resume selection still
-   needs its own composition checks.
+   The writer capture covers store-only resume; native Agy resume through cv/Fleet has not
+   been launched by these checks. Claude/Codex profile selection has separate composition tests.
 4. **Index contracts not adversarially tested here**: schema-migration crash boundaries,
    a derived write failing after FTS publication and the reverse, held-generation freshness. The
    existing tests were read, none added.
@@ -153,7 +154,7 @@ freshness assessment, so keeping that server alive alone does not remove this wo
 An isolated new-session/rewrite probe confirmed that `PreparedIndex::refresh()` sees later
 commits, while an unreopened batch reader remains pinned. Prepared queries also skip source
 freshness assessment and use stored snippets: they are not a drop-in semantic replacement.
-Next: agree which freshness notes and snippet behavior Fleet needs, then evaluate a bounded
+Next: specify which freshness notes and snippet behavior Fleet needs, then evaluate a bounded
 worker pool with explicit per-request reader refresh using the existing batch/search surface.
 Keep admission limits, deadlines, restart/error handling, and the existing JSON consumer
 contract explicit. Do not silently pin a Fleet reader or add a separate search service.
@@ -215,7 +216,7 @@ panics or forking Tantivy; arbitrary corruption recovery is not implied.
   usage accounting, doctor and complete-mode exports. Added native-only sessions must not steal
   an existing exported session's identity or silently duplicate tool/usage records.
 
-The earlier candidate passed local workspace, portable/WASM/corpus, package, compatibility,
-upgrade, pinned-Codex, manual, desktop and browser gates. Final composed gates for the new
-features at `6809bfa5` are underway. Their focused tests are witnesses above, not a substitute
-for those final checks; no public release or Fleet deployment is asserted here.
+Local workspace, portable/WASM/corpus, package, compatibility/upgrade, pinned-Codex, manual,
+macOS desktop and browser gates passed, including focused source-selection follow-ups.
+Heap gates and controlled parse comparisons passed. No public release or Fleet deployment
+is asserted here.

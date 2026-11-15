@@ -1,10 +1,10 @@
 # 0.20 candidate: reliable live histories and trustworthy handoffs
 
 Status: candidate `0.20.0`, source-reader version 13, unreleased and untagged. The current
-feature reconciliation is against `6809bfa5`; final integration gates are underway. The earlier
-candidate passed its gates before these additions. Claude Fable's second review pass fixed
+feature set has passed local integration gates, including the source-selection follow-ups.
+Claude Fable's second review pass fixed
 further real-fleet defects, recorded in [BACKLOG.md](BACKLOG.md). This remains the existing
-adapter, IR, query API and command surfaces; `fn` is outside this release's scope.
+adapter, IR, query API and command surfaces.
 
 ## Implemented outcomes
 
@@ -50,7 +50,9 @@ adapter, IR, query API and command surfaces; `fn` is outside this release's scop
    windows expose recorded usage and compaction rows, deduplicating repeated provider
    records and preserving unknown values. `lanes --follow` emits initial workers and changed
    status/results through a deadline or interruption. `resume --json` returns literal
-   program/arguments, cwd, hints and warnings without launching a process.
+   program/arguments, cwd, environment, hints and warnings without launching a process.
+   Doctor and resume accept individual transcript paths; Claude/Codex resume plans pin
+   the selected profile home, while unsupported source selections fail explicitly.
 
 ## Completed implementation lanes
 
@@ -66,7 +68,7 @@ adapter, IR, query API and command surfaces; `fn` is outside this release's scop
 | backlog_audit | Historical task reconciliation, corrected design claims and independent tool/web/desktop gates |
 | selected pack / overview | Explicit sources, optional-task overview, shared CLI/API/reader projection and source links |
 | context / worker following | Saved context rows, `lanes --follow` changes and non-launching resume JSON |
-| integration | Additions integrated through `6809bfa5`; final composed gates underway |
+| integration | Read/selection additions and source-routing follow-ups integrated; local gates passed |
 
 ## Acceptance evidence and its limits
 
@@ -86,10 +88,11 @@ adapter, IR, query API and command surfaces; `fn` is outside this release's scop
 - The native-image counting gate bounds additional live Rust allocations;
   public image reads still own data-URI strings. It does not bound SQLite/C memory,
   mappings or total process footprint. See the coverage matrix's media boundary.
-- The earlier candidate passed workspace, portable/WASM, corpus, package, compatibility,
-  upgrade, pinned-Codex, manual, browser and native desktop gates. The newly integrated
-  selection/overview/context/follow/resume changes have focused regression tests; final
-  composed gates are underway. Earlier passes do not certify the new integrated tree.
+- Workspace build/tests/clippy, focused integration follow-ups, portable/WASM and corpus
+  checks, package verification, compatibility/upgrade, pinned-Codex hooks, manual and
+  browser gates passed. Desktop check/tests passed on macOS. Heap gates passed; controlled
+  baseline/candidate parse comparisons passed after a load-sensitive concurrent run.
+  These local checks do not establish support on every operating system.
 
 ## Remaining work and limits
 

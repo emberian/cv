@@ -175,6 +175,7 @@ enum Cmd {
     },
     /// Print a single session (by `harness:id` or a unique id prefix).
     Show {
+        /// Session ID/prefix or individual transcript path; use harness:path to select the reader.
         id: String,
         #[arg(long)]
         harness: Option<String>,
