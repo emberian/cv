@@ -183,6 +183,9 @@ struct EventState {
 }
 
 impl MessageSink for EventSink {
+    fn tier(&self) -> crate::Tier {
+        crate::Tier::Facts
+    }
     fn dependency(&mut self, path: &std::path::Path) {
         if !self.latch.failed() {
             self.dependencies.record(path);

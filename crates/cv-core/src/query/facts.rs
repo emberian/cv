@@ -456,6 +456,9 @@ impl FactSink {
 }
 
 impl crate::MessageSink for FactSink {
+    fn tier(&self) -> crate::Tier {
+        crate::Tier::Facts
+    }
     fn take_error(&mut self) -> Option<anyhow::Error> {
         self.fail.take()
     }

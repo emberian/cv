@@ -156,7 +156,9 @@ pub enum Flow {
 pub trait MessageSink {
     /// The richest tier the next delivered message needs. Advisory: under a [`Tier::Rich`] read
     /// an adapter with a facts path may build that message at [`Tier::Facts`]
-    /// ([`Demand::for_sink`]); record acceptance, source checks and EOF session facts never
+    /// ([`Demand::for_sink`]). A facts-only consumer of a span read also accepts an adapter's
+    /// existing inline-media marker instead of encoded bytes. Selected public payload/render
+    /// consumers keep `Rich`. Record acceptance, source checks and EOF session facts never
     /// weaken. Wrappers forward or combine their consumers' tiers.
     fn tier(&self) -> Tier {
         Tier::Rich
@@ -469,6 +471,9 @@ impl Checkpoint {
 pub struct Discard;
 
 impl MessageSink for Discard {
+    fn tier(&self) -> crate::Tier {
+        crate::Tier::Facts
+    }
     fn message(&mut self, _m: Message) -> Flow {
         Flow::Continue
     }

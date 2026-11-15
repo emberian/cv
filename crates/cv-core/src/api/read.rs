@@ -273,6 +273,9 @@ pub(super) fn head(cache: &Cache, adapter: &dyn Adapter, r: &SessionRef) -> Resu
             reads: ReadSet,
         }
         impl crate::MessageSink for Counter {
+            fn tier(&self) -> crate::Tier {
+                crate::Tier::Facts
+            }
             fn message(&mut self, message: crate::Message) -> Flow {
                 crate::source::record_message_reads(&message, Some(&self.primary), &mut self.reads);
                 self.total += 1;

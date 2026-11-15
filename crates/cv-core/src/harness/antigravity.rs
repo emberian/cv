@@ -1621,6 +1621,9 @@ impl jsonl::Codec for StepCodec {
             record: Option<Json>,
         }
         impl MessageSink for Native<'_> {
+            fn tier(&self) -> Tier {
+                self.inner.tier()
+            }
             fn message(&mut self, mut message: Message) -> Flow {
                 // The synthesized compaction boundary is not another native record.
                 if message.id.is_some() {
@@ -1734,6 +1737,11 @@ impl StepCodec {
         }
 
         let want_extra = self.opts.tier >= Tier::Rich;
+        // Spans alone are not permission to discard media: public windows and
+        // render/export sinks still request Rich. Reducers need presence and MIME.
+        let media_marker = self.opts.spans
+            && self.opts.tier != Tier::Complete
+            && (matches!(self.opts.tier, Tier::Discovery | Tier::Usage | Tier::Facts) || sink.tier() <= Tier::Facts);
         match ty.as_str() {
             "USER_INPUT" => {
                 let mut m = Message::of_kind(Role::User, MessageKind::Prompt, Origin::Human);
@@ -1745,7 +1753,7 @@ impl StepCodec {
                         push_nonempty_text(&mut m.content, Some(part?), self.spans)?;
                     }
                 }
-                push_media_blocks(&mut m.content, fields.get("media"))?;
+                push_media_blocks(&mut m.content, fields.get("media"), media_marker)?;
                 attach_step_extras(&mut m, &fields, step_index, &source, status.as_deref(), want_extra)?;
                 Ok(sink.message(m))
             }
@@ -1784,7 +1792,7 @@ impl StepCodec {
                 }
 
                 push_nonempty_text(&mut m.content, fields.get("content"), self.spans)?;
-                push_media_blocks(&mut m.content, fields.get("media"))?;
+                push_media_blocks(&mut m.content, fields.get("media"), media_marker)?;
 
                 if let Some(calls) = fields.get("tool_calls").map(JsonView::array).transpose()?.flatten() {
                     for (k, item) in calls.enumerate() {
@@ -1944,7 +1952,7 @@ impl StepCodec {
                     status: norm_status,
                     details,
                 });
-                push_media_blocks(&mut m.content, fields.get("media"))?;
+                push_media_blocks(&mut m.content, fields.get("media"), media_marker)?;
                 attach_step_extras(&mut m, &fields, step_index, &source, status.as_deref(), want_extra)?;
                 Ok(sink.message(m))
             }
@@ -1986,7 +1994,7 @@ impl StepCodec {
                 m.id = Some(step_index.to_string());
                 m.timestamp = ts;
                 push_nonempty_text(&mut m.content, fields.get("content"), self.spans)?;
-                push_media_blocks(&mut m.content, fields.get("media"))?;
+                push_media_blocks(&mut m.content, fields.get("media"), media_marker)?;
                 attach_step_extras(&mut m, &fields, step_index, &source, status.as_deref(), want_extra)?;
                 if want_extra {
                     if let Some(sender) = sender {
@@ -2154,14 +2162,57 @@ fn push_nonempty_text(blocks: &mut Vec<Block>, view: Option<JsonView<'_>>, spans
     Ok(())
 }
 
-fn push_media_blocks(blocks: &mut Vec<Block>, media_view: Option<JsonView<'_>>) -> Result<()> {
+fn is_inline_base64(uri: JsonView<'_>) -> Result<bool> {
+    if peek_view_prefix(uri, 5)? != "data:" {
+        return Ok(false);
+    }
+    let mut suffix = [0u8; 7];
+    let mut encoded = false;
+    crate::stream::stopped(
+        uri.for_each_str_chunk(|chunk| {
+            for byte in chunk.bytes() {
+                if byte == b',' {
+                    encoded = suffix == *b";base64";
+                    return Err(crate::stream::Stop.into());
+                }
+                suffix.copy_within(1.., 0);
+                suffix[6] = byte;
+            }
+            Ok(())
+        })
+        .map(|_| ()),
+    )?;
+    Ok(encoded)
+}
+
+fn push_media_blocks(blocks: &mut Vec<Block>, media_view: Option<JsonView<'_>>, marker: bool) -> Result<()> {
     let Some(items) = media_view.map(JsonView::array).transpose()?.flatten() else {
         return Ok(());
     };
     for item in items {
         let item = item?;
         let mime = item.get("mime_type")?.map(JsonView::string).transpose()?.flatten();
-        let uri = item.get("uri")?.map(JsonView::string).transpose()?.flatten();
+        let uri_view = item.get("uri")?;
+        if marker {
+            if let Some(uri) = uri_view {
+                if is_inline_base64(uri)? {
+                    blocks.push(if mime.as_deref().is_some_and(|m| m.starts_with("image/")) {
+                        Block::Image {
+                            media_type: mime,
+                            data_ref: Some("base64:inline".into()),
+                        }
+                    } else {
+                        Block::File {
+                            mime,
+                            path: None,
+                            source: Some("base64:inline".into()),
+                        }
+                    });
+                    continue;
+                }
+            }
+        }
+        let uri = uri_view.map(JsonView::string).transpose()?.flatten();
         let Some(raw_uri) = uri.filter(|u| !u.is_empty()) else {
             continue;
         };

@@ -253,6 +253,9 @@ fn usage_hits(
         reads: Option<crate::source::ReadSet>,
     }
     impl crate::MessageSink for Sink {
+        fn tier(&self) -> crate::Tier {
+            crate::Tier::Facts
+        }
         fn message(&mut self, m: Message) -> Flow {
             if let Some(usage) = m
                 .usage

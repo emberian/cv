@@ -1018,7 +1018,8 @@ pub enum Block {
     Image {
         #[serde(skip_serializing_if = "Option::is_none")]
         media_type: Option<String>,
-        /// Path or opaque reference; we don't inline image bytes into the IR.
+        /// Path or opaque reference, including an owned inline data URI. This is not a lazy
+        /// byte span; reducer reads may use a format's existing inline-media marker.
         #[serde(skip_serializing_if = "Option::is_none")]
         data_ref: Option<String>,
     },

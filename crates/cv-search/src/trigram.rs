@@ -555,6 +555,9 @@ impl Searchable for IndexGramSink {
 }
 
 impl MessageSink for IndexGramSink {
+    fn tier(&self) -> cv_core::Tier {
+        cv_core::Tier::Facts
+    }
     fn take_error(&mut self) -> Option<anyhow::Error> {
         self.failed |= self.err.is_some();
         self.err
@@ -1309,6 +1312,9 @@ impl VerifySink {
 }
 
 impl MessageSink for VerifySink {
+    fn tier(&self) -> cv_core::Tier {
+        cv_core::Tier::Facts
+    }
     fn take_error(&mut self) -> Option<anyhow::Error> {
         self.failed |= self.err.is_some();
         self.err

@@ -1,0 +1,156 @@
+//! End-to-end allocation regression for native inline media. The allocator counts
+//! live Rust allocations; SQLite/C allocation, mappings, and stacks are separate.
+#![cfg(feature = "sqlite")]
+use cv_core::harness::antigravity::Antigravity;
+use cv_core::{Block, Demand, Flow, Harness, Message, MessageSink, SessionRef, Tier};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+#[global_allocator]
+static ALLOCATOR: cv_testkit::heap::Allocator = cv_testkit::heap::Allocator;
+const ID: &str = "cccccccc-2222-4333-8444-555555555555";
+
+fn varint(mut n: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    loop {
+        let byte = (n & 127) as u8;
+        n >>= 7;
+        out.push(byte | if n == 0 { 0 } else { 128 });
+        if n == 0 {
+            return out;
+        }
+    }
+}
+fn header(field: usize, len: usize) -> Vec<u8> {
+    [varint(field << 3 | 2), varint(len)].concat()
+}
+fn field(field: usize, bytes: &[u8]) -> Vec<u8> {
+    [header(field, bytes.len()), bytes.to_vec()].concat()
+}
+fn database(root: &Path, id: &str, len: usize) -> PathBuf {
+    let dir = root.join("conversations");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!("{id}.db"));
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_payload BLOB, step_format INTEGER DEFAULT 0);",
+    )
+    .unwrap();
+    let mime = field(1, b"image/png");
+    let media = [mime, header(2, len)].concat();
+    let input = [header(9, media.len() + len), media].concat();
+    let prefix = [vec![8, 14, 32, 3], header(19, input.len() + len), input].concat();
+    conn.execute(
+        "INSERT INTO steps(idx,step_payload) VALUES (0,zeroblob(?1))",
+        [prefix.len() + len],
+    )
+    .unwrap();
+    let mut blob = conn
+        .blob_open(rusqlite::MAIN_DB, "steps", "step_payload", 0, false)
+        .unwrap();
+    blob.write_all(&prefix).unwrap();
+    let chunk = [b'x'; 8192];
+    let mut remaining = len;
+    while remaining > 0 {
+        let n = remaining.min(chunk.len());
+        blob.write_all(&chunk[..n]).unwrap();
+        remaining -= n;
+    }
+    drop(blob);
+    drop(conn);
+    path
+}
+fn image(session: &cv_core::Session) -> &str {
+    session
+        .messages
+        .iter()
+        .flat_map(|m| &m.content)
+        .find_map(|block| match block {
+            Block::Image { media_type, data_ref } => {
+                assert_eq!(media_type.as_deref(), Some("image/png"));
+                data_ref.as_deref()
+            }
+            _ => None,
+        })
+        .expect("image remains first-class")
+}
+
+// One test keeps global allocation observation isolated from parallel test fixtures.
+#[test]
+fn native_image_counter_is_bounded_and_public_payloads_remain_complete() {
+    let world = cv_testkit::World::in_process("agy-media-budget", cv_core::env::Env::enter_isolated);
+    let large_root = world.base.join("large");
+    let reference = SessionRef::new(ID, Harness::Antigravity, database(&large_root, ID, 24 << 20));
+    let adapter = Antigravity::with_home(&large_root);
+    struct Images(usize, bool);
+    impl MessageSink for Images {
+        fn tier(&self) -> Tier {
+            Tier::Facts
+        }
+        fn message(&mut self, message: Message) -> Flow {
+            for block in message.content {
+                if let Block::Image { media_type, data_ref } = block {
+                    assert_eq!(media_type.as_deref(), Some("image/png"));
+                    self.1 &= data_ref.as_deref() == Some("base64:inline");
+                    self.0 += 1;
+                }
+            }
+            Flow::Continue
+        }
+    }
+    let mut images = Images(0, true);
+    let mut discard = cv_core::stream::Discard;
+    let mut events = cv_core::events::EventSink::new(None);
+    let mut reducers = cv_core::TeeSink::new(&mut discard, &mut events);
+    let mut sink = cv_core::TeeSink::new(&mut reducers, &mut images);
+    let before = cv_testkit::heap::begin();
+    let read = cv_core::stream::stream_counted(
+        &adapter,
+        &reference,
+        &Demand::LEAN.with_spans(),
+        &mut sink,
+        cv_core::stream::Pass::default(),
+    )
+    .unwrap();
+    let heap = cv_testkit::heap::end(before);
+    drop(sink);
+    drop(reducers);
+    assert!(read.counted.is_some());
+    assert_eq!(images.0, 1);
+    println!(
+        "inline_image_bytes={} peak_rust_bytes={}",
+        24 << 20,
+        heap.peak_above_baseline_bytes
+    );
+    assert!(
+        heap.peak_above_baseline_bytes < 8 << 20,
+        "counting allocated {} bytes for a 24 MiB inline image",
+        heap.peak_above_baseline_bytes
+    );
+
+    assert!(images.1, "reducer did not receive the existing inline-media marker");
+
+    // Public payload requests use the existing String IR and retain actual data,
+    // even when the public API internally uses a span-capable read.
+    let root = world.home.join(".gemini/antigravity-cli");
+    let reference = SessionRef::new(ID, Harness::Antigravity, database(&root, ID, 3));
+    let adapter = Antigravity::with_home(&root);
+    let expected = "data:image/png;base64,eHh4";
+    for demand in [Demand::LEAN, Demand::LEAN.with_spans(), Demand::RICH, Demand::COMPLETE] {
+        let session = cv_core::stream::collect_with(&adapter, &reference, &demand).unwrap();
+        assert_eq!(image(&session), expected);
+        let markdown = cv_core::render::to_markdown(&session).unwrap();
+        assert!(markdown.contains("_[image]_"), "existing Markdown image marker changed");
+    }
+    for extra in [false, true] {
+        let (status, reply) = cv_core::api::route_json(
+            &["api", "session", "antigravity", ID, "messages"],
+            &format!("extra={extra}"),
+        );
+        assert_eq!(status, 200);
+        assert_eq!(reply["messages"][0]["content"][0]["data_ref"], expected);
+    }
+    let (status, head) = cv_core::api::route_json(&["api", "session", "antigravity", ID, "head"], "");
+    assert_eq!(status, 200);
+    assert_eq!(head["total"], 1);
+}

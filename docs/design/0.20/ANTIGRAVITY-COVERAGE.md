@@ -55,3 +55,29 @@ Still requiring dedicated writer-generated scenarios and independent assertions:
 A successful index pass establishes neither payload completeness nor native
 round-trip emission. Any uncovered or unrecoverable content must remain visible
 through the shared read-coverage contract.
+
+### Inline media allocation boundary
+
+The native protobuf reader and base64 projector use bounded buffers, but public
+image payloads are not lazy IR fields: `Block::Image.data_ref` is an owned string.
+An explicit inline image therefore needs approximately `4 * ceil(bytes / 3)`
+bytes plus its data-URI header, with additional copies possible during collection
+or JSON serialization. RICH/COMPLETE reads, selected public `/messages` windows
+with either `extra=false` or `extra=true`, and requested render/export reads retain
+that data in their IR. Markdown still renders its existing `_[image]_` marker;
+it does not serialize the image bytes. Generic LEAN reads are not silently changed
+to image placeholders.
+
+A span read whose consumer explicitly requests reducer facts keeps the image
+block and MIME with the existing `base64:inline` marker. Counting, API head reads,
+FTS/trigram ingestion, exact verification, and live text snippets advertise that
+reducer demand; internal USAGE/FACTS span reads also avoid decoding the inline URI into a string. This is a consumer distinction,
+not a promise that every LEAN or span read has bounded media allocations.
+
+`antigravity_media_budget` exercises the complete native SQLite-to-counting path
+with a 24 MiB inline image, requiring less than 8 MiB additional peak live Rust
+allocation while preserving its image count. It also checks real data URIs through
+public API windows and inline parses, and preserves Markdown's existing image
+marker. The allocator excludes
+SQLite/C allocations, mappings, and stacks. Lazy first-class media payloads would
+require a separate IR design; they remain outside this release's boundedness claim.

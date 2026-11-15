@@ -1362,6 +1362,9 @@ struct CallbackCounter<'a> {
 }
 #[cfg(test)]
 impl cv_core::MessageSink for CallbackCounter<'_> {
+    fn tier(&self) -> cv_core::Tier {
+        self.inner.tier()
+    }
     fn message(&mut self, message: cv_core::Message) -> cv_core::Flow {
         self.callbacks += 1;
         self.inner.message(message)
@@ -2126,6 +2129,9 @@ impl std::io::Write for JsonChunks<'_, '_> {
 }
 
 impl cv_core::MessageSink for ChunkSink<'_> {
+    fn tier(&self) -> cv_core::Tier {
+        cv_core::Tier::Facts
+    }
     fn take_error(&mut self) -> Option<anyhow::Error> {
         self.failed |= self.err.is_some();
         self.err
@@ -3646,6 +3652,9 @@ fn live_snippet(path: &str, id: &str, harness: &str, query: &str, scope: crate::
         }
     }
     impl MessageSink for Acc {
+        fn tier(&self) -> cv_core::Tier {
+            cv_core::Tier::Facts
+        }
         fn take_error(&mut self) -> Option<anyhow::Error> {
             self.failed |= self.error.is_some();
             self.error.take().or_else(|| {

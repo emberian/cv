@@ -4,6 +4,7 @@
 
 - Search does not certify held results as fresh using dependency records from a concurrent index replacement.
 - Frozen state reads retain snapshot cleanup ownership until SQLite closes, preventing leaked temporary databases on Windows.
+- Antigravity counting and text search avoid allocating inline image bytes while public JSON and explicit image reads retain their payloads.
 
 - Search retains last-good sessions through failed replacements and rebuilds; incomplete discovery updates healthy sessions without pruning unseen history.
 - Corrupt short search segments fail cleanly and can be rebuilt without panicking.
