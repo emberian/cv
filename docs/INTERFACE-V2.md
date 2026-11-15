@@ -159,7 +159,7 @@ every command of the clap tree on a pipe under this contract.
   (+ `display_title`, `git` under `--enrich`; + `score`, `snippet`, `agent_id`, `parent_id`,
   `workflow` from `search`). `cv schema --json` publishes this list as `session_row`, with
   `subagent_row` (a forest member: the session row + its sidecar facts), `task_row`, `session`,
-  `message`, `block`, `prompt_row`, `lane` and `query`; the manual's architecture
+  `message`, `block`, `prompt_row`, `context_row`, `overview`, `lane` and `query`; the manual's architecture
   chapter is the prose.
 - A **message** is the IR `Message`. A **block** is the IR `Block`, tagged by `type`.
 - A **context row** (`show --kind context --json`, `GET /api/session/{harness}/{id}/context`)
@@ -176,6 +176,32 @@ every command of the clap tree on a pipe under this contract.
   `--first/--last/--range` and API `first/last/start-end` select projected rows; `--around` / API
   `around` anchors to an original message index or ID, with `context` rows on each side (default
   five). API `[start,end)` is half-open and mixed selector families are rejected.
+
+### Session overview
+
+`show --kind overview --json` and `/api/session/{harness}/{id}/overview` return one object:
+`session, requests, workers, files, commands, omitted, warnings`, with optional `read_coverage`.
+`session` keeps the existing session-row shape. Requests, files and commands carry zero-based
+source `msg_idx` and nullable RFC 3339 `ts`; those indices open the full surrounding exchange.
+Requests contain `text, truncated`; commands contain `tool, command, truncated`, with a null
+command when the tool's dynamic input cannot be reconstructed statically. File entries contain
+`kind, path, present`: `present` describes current local metadata, not the file's state when the
+agent read it, and is null when unavailable or unchecked. No file bodies are read for this view.
+
+The default selects the first and last four human requests without duplication, twelve recent
+file-event occurrences, eight recent commands, and twelve newest discoverable workers. Worker
+rows contain `session_id, agent_id, path, status, status_source, description, last_text, truncated`;
+`truncated` covers either text field. Existing lane status semantics apply: a recorded return
+is not evidence of integration. Workers launched outside the adapter's known forest can be absent.
+`omitted` gives counts for each list; file counts are occurrences, not unique paths. Native parent
+read failures are errors; independent worker-discovery failures appear in `warnings`. Imported
+sessions disclose that worker discovery and local file availability were not checked.
+
+Excerpts default to 1,200 UTF-8 bytes; full evidence remains available through ordinary message
+and worker views. Selection bounds output, not the source traversal or worker-forest read cost.
+`read_coverage` has the same meanings as the parent read's coverage below, including unassessed
+when absent. This view reuses the message stream and event classifier without a new identity or
+relations store.
 
 ## 4. The IR (cv-core `ir.rs`)
 
