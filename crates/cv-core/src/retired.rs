@@ -54,11 +54,14 @@ fn legacy_jsonl_path() -> PathBuf {
 }
 
 /// Read legacy `$CLUSTERVISION_HOME/retired.jsonl` retirements (from pre-`state.db` installations
-/// or portable builds) without mutating disk.
-fn load_legacy_jsonl() -> HashMap<String, Retirement> {
+/// or portable builds) without mutating disk. A missing file is an empty ledger; a file that
+/// exists and cannot be read is an error, never an empty ledger.
+fn load_legacy_jsonl() -> std::io::Result<HashMap<String, Retirement>> {
     let mut out = HashMap::new();
-    let Ok(text) = std::fs::read_to_string(legacy_jsonl_path()) else {
-        return out;
+    let text = match std::fs::read_to_string(legacy_jsonl_path()) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(e) => return Err(e),
     };
     for mut row in text.lines().filter_map(|l| serde_json::from_str::<Retirement>(l).ok()) {
         let id = bare(&row.agent_id).to_string();
@@ -70,7 +73,7 @@ fn load_legacy_jsonl() -> HashMap<String, Retirement> {
             out.insert(id, row);
         }
     }
-    out
+    Ok(out)
 }
 
 /// Record `agent` as retired, continued by `successor`. Calling `retire` on an already-retired
@@ -82,7 +85,7 @@ pub fn retire(agent: &str, successor: Option<&str>, session_id: Option<&str>) ->
     if crate::env::frozen() {
         return Err(std::io::Error::other("--frozen forbids writing the retired ledger"));
     }
-    let legacy = load_legacy_jsonl();
+    let legacy = load_legacy_jsonl()?;
     let store = crate::state::StateStore::default_store().map_err(state_to_io)?;
     let mut conn = store.open_writable().map_err(state_to_io)?;
     let tx = conn
@@ -164,7 +167,7 @@ pub fn undo(agent: &str) -> std::io::Result<bool> {
     if crate::env::frozen() {
         return Err(std::io::Error::other("--frozen forbids writing the retired ledger"));
     }
-    let legacy = load_legacy_jsonl();
+    let legacy = load_legacy_jsonl()?;
     let store = crate::state::StateStore::default_store().map_err(state_to_io)?;
     let mut conn = store.open_writable().map_err(state_to_io)?;
     let tx = conn
@@ -209,16 +212,20 @@ pub fn undo(agent: &str) -> std::io::Result<bool> {
 }
 
 #[cfg(feature = "sqlite")]
-fn raw_current() -> HashMap<String, Retirement> {
-    let mut out = load_legacy_jsonl();
-    let Ok(store) = crate::state::StateStore::default_store() else {
-        return out;
+fn raw_current() -> std::io::Result<HashMap<String, Retirement>> {
+    let mut out = load_legacy_jsonl()?;
+    let store = match crate::state::StateStore::default_store() {
+        Ok(store) => store,
+        Err(crate::state::StateError::NoHome) => return Ok(out),
+        Err(e) => return Err(state_to_io(e)),
     };
-    let Ok(Some(conn)) = store.open_readonly() else {
-        return out;
+    // `Ok(None)` is a store that does not exist yet. Any failure to read one that does exist
+    // must not degrade to the legacy subset: its retirements would silently stop being enforced.
+    let Some(conn) = store.open_readonly().map_err(state_to_io)? else {
+        return Ok(out);
     };
-    let _ = overlay_sqlite_rows(&mut out, &conn);
-    out
+    overlay_sqlite_rows(&mut out, &conn).map_err(sqlite_to_io)?;
+    Ok(out)
 }
 
 #[cfg(feature = "sqlite")]
@@ -242,7 +249,8 @@ fn overlay_sqlite_rows(out: &mut HashMap<String, Retirement>, conn: &rusqlite::C
             },
         ))
     })?;
-    for (id, row) in rows.flatten() {
+    for row in rows {
+        let (id, row) = row?;
         if row.undone {
             out.remove(&id);
         } else {
@@ -289,9 +297,10 @@ fn append_fallback(row: &Retirement) -> std::io::Result<()> {
 #[cfg(not(feature = "sqlite"))]
 pub fn retire(agent: &str, successor: Option<&str>, session_id: Option<&str>) -> std::io::Result<Retirement> {
     let agent_id = bare(agent).to_string();
-    let session_id = session_id
-        .map(str::to_string)
-        .or_else(|| raw_current().get(&agent_id).and_then(|prev| prev.session_id.clone()));
+    let session_id = match session_id {
+        Some(s) => Some(s.to_string()),
+        None => raw_current()?.get(&agent_id).and_then(|prev| prev.session_id.clone()),
+    };
     let row = Retirement {
         ts: Utc::now(),
         agent_id,
@@ -300,13 +309,13 @@ pub fn retire(agent: &str, successor: Option<&str>, session_id: Option<&str>) ->
         undone: false,
     };
     append_fallback(&row)?;
-    Ok(lookup(&row.agent_id).unwrap_or(row))
+    Ok(lookup(&row.agent_id)?.unwrap_or(row))
 }
 
 #[cfg(not(feature = "sqlite"))]
 pub fn undo(agent: &str) -> std::io::Result<bool> {
     let agent = bare(agent);
-    let was = raw_current().contains_key(agent);
+    let was = raw_current()?.contains_key(agent);
     if was {
         append_fallback(&Retirement {
             ts: Utc::now(),
@@ -320,14 +329,17 @@ pub fn undo(agent: &str) -> std::io::Result<bool> {
 }
 
 #[cfg(not(feature = "sqlite"))]
-fn raw_current() -> HashMap<String, Retirement> {
+fn raw_current() -> std::io::Result<HashMap<String, Retirement>> {
     load_legacy_jsonl()
 }
 
 /// Every agent retired now, by bare id, with transitive `A -> B -> C` successor chains resolved
 /// to the live terminal successor (cycle-guarded). Empty when there is no ledger.
-pub fn current() -> HashMap<String, Retirement> {
-    resolve_chains(&raw_current())
+///
+/// An error means the ledger exists and could not be read: the set of retired agents is
+/// unknown, not empty. A guard must not treat that as "nobody is retired".
+pub fn current() -> std::io::Result<HashMap<String, Retirement>> {
+    Ok(resolve_chains(&raw_current()?))
 }
 
 fn resolve_chains(raw: &HashMap<String, Retirement>) -> HashMap<String, Retirement> {
@@ -362,9 +374,9 @@ fn resolve_chains(raw: &HashMap<String, Retirement>) -> HashMap<String, Retireme
     out
 }
 
-/// The retirement of `agent`, if it is retired now.
-pub fn lookup(agent: &str) -> Option<Retirement> {
-    current().remove(bare(agent))
+/// The retirement of `agent`, if it is retired now. Errors as [`current`] does.
+pub fn lookup(agent: &str) -> std::io::Result<Option<Retirement>> {
+    Ok(current()?.remove(bare(agent)))
 }
 
 #[cfg(test)]
@@ -374,21 +386,21 @@ mod tests {
     #[test]
     fn retire_lookup_undo_round_trip() {
         let _world = crate::test_world("retired-ledger");
-        assert!(lookup("a1").is_none());
+        assert!(lookup("a1").unwrap().is_none());
         retire("agent-a1", Some("agent-b2"), Some("root")).unwrap();
-        let r = lookup("a1").expect("retired");
+        let r = lookup("a1").unwrap().expect("retired");
         assert_eq!(r.successor.as_deref(), Some("b2"));
         assert_eq!(r.session_id.as_deref(), Some("root"));
         assert!(
-            lookup("agent-a1").is_some(),
+            lookup("agent-a1").unwrap().is_some(),
             "the agent- prefix addresses the same agent"
         );
-        assert!(lookup("b2").is_none(), "the successor is not retired");
+        assert!(lookup("b2").unwrap().is_none(), "the successor is not retired");
         assert!(undo("a1").unwrap());
-        assert!(lookup("a1").is_none());
+        assert!(lookup("a1").unwrap().is_none());
         assert!(!undo("a1").unwrap(), "undoing twice reports it was not retired");
         retire("a3", None, None).unwrap();
-        assert!(lookup("a3").is_some());
+        assert!(lookup("a3").unwrap().is_some());
 
         #[cfg(feature = "sqlite")]
         {
@@ -405,18 +417,18 @@ mod tests {
         let _world = crate::test_world("retired-chains");
         // Start with PENDING, then update in place without --undo; session_id is preserved.
         retire("agent-a", Some("PENDING"), Some("root-1")).unwrap();
-        assert_eq!(lookup("a").unwrap().successor.as_deref(), Some("PENDING"));
+        assert_eq!(lookup("a").unwrap().unwrap().successor.as_deref(), Some("PENDING"));
         retire("a", Some("agent-b"), None).unwrap();
-        let a = lookup("a").unwrap();
+        let a = lookup("a").unwrap().unwrap();
         assert_eq!(a.successor.as_deref(), Some("b"));
         assert_eq!(a.session_id.as_deref(), Some("root-1"));
 
         // Transitive A -> B -> C -> D resolves every retired hop to live D.
         retire("b", Some("PENDING"), None).unwrap();
-        assert_eq!(lookup("a").unwrap().successor.as_deref(), Some("PENDING"));
+        assert_eq!(lookup("a").unwrap().unwrap().successor.as_deref(), Some("PENDING"));
         retire("b", Some("c"), None).unwrap();
         retire("c", Some("d"), None).unwrap();
-        let all = current();
+        let all = current().unwrap();
         assert_eq!(all["a"].successor.as_deref(), Some("d"));
         assert_eq!(all["b"].successor.as_deref(), Some("d"));
         assert_eq!(all["c"].successor.as_deref(), Some("d"));
@@ -424,17 +436,17 @@ mod tests {
 
         // Terminal retirement without a successor clears stale pointers to dead intermediates.
         retire("d", None, None).unwrap();
-        assert_eq!(lookup("a").unwrap().successor, None);
+        assert_eq!(lookup("a").unwrap().unwrap().successor, None);
         assert!(undo("d").unwrap());
-        assert_eq!(lookup("a").unwrap().successor.as_deref(), Some("d"));
+        assert_eq!(lookup("a").unwrap().unwrap().successor.as_deref(), Some("d"));
 
         // Cycle guard: X -> Y -> X terminates cleanly with no live successor.
         retire("x", Some("y"), None).unwrap();
         retire("y", Some("x"), None).unwrap();
-        assert_eq!(lookup("x").unwrap().successor, None);
-        assert_eq!(lookup("y").unwrap().successor, None);
+        assert_eq!(lookup("x").unwrap().unwrap().successor, None);
+        assert_eq!(lookup("y").unwrap().unwrap().successor, None);
         retire("self", Some("self"), None).unwrap();
-        assert_eq!(lookup("self").unwrap().successor, None);
+        assert_eq!(lookup("self").unwrap().unwrap().successor, None);
     }
 
     #[cfg(feature = "sqlite")]
@@ -460,7 +472,7 @@ mod tests {
                 ("CV_FROZEN", std::ffi::OsStr::new("1")),
             ])
             .enter();
-            let all = current();
+            let all = current().unwrap();
             assert_eq!(all.len(), 16);
             for i in 0..16 {
                 let r = &all[&format!("w{i}")];
@@ -471,6 +483,96 @@ mod tests {
             assert!(undo("w0").is_err());
         }
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn an_unreadable_store_is_an_error_not_the_legacy_subset() {
+        let world = crate::test_world("retired-unreadable");
+        std::fs::write(
+            world.cv_home.join("retired.jsonl"),
+            "{\"ts\":\"2026-06-01T10:00:00Z\",\"agent_id\":\"legacy-one\",\"successor\":\"legacy-two\"}\n",
+        )
+        .unwrap();
+        retire("sqlite-only", Some("next"), None).unwrap();
+        let both = current().unwrap();
+        assert!(both.contains_key("legacy-one") && both.contains_key("sqlite-only"));
+
+        let db = world.cv_home.join("state.db");
+        for sidecar in ["state.db-wal", "state.db-shm"] {
+            let _ = std::fs::remove_file(world.cv_home.join(sidecar));
+        }
+        std::fs::write(&db, vec![b'x'; 8192]).unwrap();
+        for frozen in [false, true] {
+            let _env = crate::env::Env::from_vars([
+                ("CLUSTERVISION_HOME", world.cv_home.as_os_str()),
+                ("CV_FROZEN", std::ffi::OsStr::new(if frozen { "1" } else { "0" })),
+            ])
+            .enter();
+            assert!(
+                current().is_err(),
+                "frozen={frozen}: an unreadable store must not read as the legacy rows alone"
+            );
+            assert!(lookup("legacy-one").is_err(), "frozen={frozen}");
+        }
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn frozen_reads_under_writer_churn_never_omit_a_committed_retirement() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = std::env::temp_dir().join(format!("cv-retired-churn-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let _env = crate::env::Env::from_vars([("CLUSTERVISION_HOME", dir.as_os_str())]).enter();
+            retire("pinned", Some("successor"), None).unwrap();
+        }
+        let stop = AtomicBool::new(false);
+        let (mut read, mut failed) = (0usize, 0usize);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let _env = crate::env::Env::from_vars([("CLUSTERVISION_HOME", dir.as_os_str())]).enter();
+                let store = crate::state::StateStore::at_dir(&dir);
+                let mut i = 0usize;
+                while !stop.load(Ordering::Relaxed) {
+                    retire(&format!("churn-{}", i % 7), Some("PENDING"), None).unwrap();
+                    if i % 3 == 0 {
+                        let conn = store.open_writable().unwrap();
+                        let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+                    }
+                    i += 1;
+                }
+            });
+            // A failed assertion must still stop the writer, or the scope never joins.
+            struct StopOnDrop<'a>(&'a AtomicBool);
+            impl Drop for StopOnDrop<'_> {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::Relaxed);
+                }
+            }
+            let _stop = StopOnDrop(&stop);
+            let _env = crate::env::Env::from_vars([
+                ("CLUSTERVISION_HOME", dir.as_os_str()),
+                ("CV_FROZEN", std::ffi::OsStr::new("1")),
+            ])
+            .enter();
+            for _ in 0..150 {
+                match current() {
+                    Ok(all) => {
+                        read += 1;
+                        assert_eq!(
+                            all.get("pinned").and_then(|r| r.successor.as_deref()),
+                            Some("successor"),
+                            "a successful read is complete"
+                        );
+                    }
+                    Err(_) => failed += 1,
+                }
+            }
+        });
+        eprintln!("retired churn: {read} complete reads, {failed} refused");
+        assert!(read > 0, "every frozen read failed under churn ({failed} errors)");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -495,10 +597,10 @@ mod tests {
                 ("CV_FROZEN", std::ffi::OsStr::new("1")),
             ])
             .enter();
-            let leg = lookup("leg1").expect("legacy leg1 retired");
+            let leg = lookup("leg1").unwrap().expect("legacy leg1 retired");
             assert_eq!(leg.successor.as_deref(), Some("leg2"));
             assert_eq!(leg.session_id.as_deref(), Some("root-leg"));
-            assert!(lookup("leg-reverted").is_none());
+            assert!(lookup("leg-reverted").unwrap().is_none());
             assert!(!world.cv_home.join("state.db").exists());
         }
 
@@ -506,7 +608,7 @@ mod tests {
         //    without mutating `retired.jsonl`!
         let before_jsonl = std::fs::read(&jsonl).unwrap();
         retire("leg2", Some("leg3"), None).unwrap();
-        assert_eq!(lookup("leg1").unwrap().successor.as_deref(), Some("leg3"));
+        assert_eq!(lookup("leg1").unwrap().unwrap().successor.as_deref(), Some("leg3"));
 
         // 3. Updating `leg1` without `session_id` preserves `session_id` from `retired.jsonl`, and
         //    `undo` on a legacy-only entry records a tombstone in `state.db` without touching `retired.jsonl`.
@@ -520,13 +622,13 @@ mod tests {
         .unwrap();
         let expected_jsonl = std::fs::read(&jsonl).unwrap();
         assert_ne!(before_jsonl, expected_jsonl);
-        assert!(lookup("leg-only").is_some());
+        assert!(lookup("leg-only").unwrap().is_some());
         assert!(undo("leg-only").unwrap());
-        assert!(lookup("leg-only").is_none());
+        assert!(lookup("leg-only").unwrap().is_none());
         assert!(!undo("leg-only").unwrap(), "second undo returns false");
 
         retire("leg1", Some("leg4"), None).unwrap();
-        let updated_leg1 = lookup("leg1").unwrap();
+        let updated_leg1 = lookup("leg1").unwrap().unwrap();
         assert_eq!(updated_leg1.successor.as_deref(), Some("leg4"));
         assert_eq!(updated_leg1.session_id.as_deref(), Some("root-leg"));
         assert_eq!(std::fs::read(&jsonl).unwrap(), expected_jsonl);

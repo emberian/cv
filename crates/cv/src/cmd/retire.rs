@@ -43,7 +43,15 @@ pub(crate) fn cmd_retire(agent: Option<String>, successor: Option<String>, undo:
 
 fn format_list(json_out: bool) -> Result<String> {
     use std::fmt::Write as _;
-    let mut rows: Vec<_> = cv_core::retired::current().into_values().collect();
+    let mut rows: Vec<_> = cv_core::retired::current()
+        .with_context(|| {
+            format!(
+                "reading the retired ledger at {}",
+                cv_core::retired::ledger_path().display()
+            )
+        })?
+        .into_values()
+        .collect();
     rows.sort_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.agent_id.cmp(&b.agent_id)));
     if json_out {
         let mut s = serde_json::to_string_pretty(&rows)?;

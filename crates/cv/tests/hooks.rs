@@ -1044,6 +1044,73 @@ fn the_compact_hook_names_what_its_budget_left_unread() {
     assert!(ctx.contains("--kind compaction_boundary,compaction_summary"), "{ctx}");
 }
 
+/// A store that exists and cannot be read leaves "who is retired" unknown. The guard refuses the
+/// calls that would wake an agent, allows the rest with the cause on stderr, and `cv retire`
+/// fails instead of listing the legacy rows as the whole ledger.
+#[test]
+fn retired_guard_and_list_report_an_unreadable_ledger() {
+    let w = World::new("retired-unreadable-ledger");
+    fs::create_dir_all(&w.cv_home).unwrap();
+    fs::write(
+        w.cv_home.join("retired.jsonl"),
+        "{\"ts\":\"2026-06-01T10:00:00Z\",\"agent_id\":\"legacylane\",\"successor\":\"legacynext\"}\n",
+    )
+    .unwrap();
+    cv_ok(&w, &["retire", "oldlane", "--successor", "newlane"]);
+    let listed = cv_ok(&w, &["retire", "--json"]);
+    assert!(listed.contains("oldlane") && listed.contains("legacylane"), "{listed}");
+
+    for sidecar in ["state.db-wal", "state.db-shm"] {
+        let _ = fs::remove_file(w.cv_home.join(sidecar));
+    }
+    fs::write(w.cv_home.join("state.db"), vec![b'x'; 8192]).unwrap();
+
+    let (ok, _, out, err) = w.cv(&["retire", "--json"]);
+    assert!(!ok, "listing an unreadable ledger must fail, got:\n{out}");
+    assert!(!out.contains("legacylane"), "{out}");
+    assert!(err.contains("retired ledger"), "{err}");
+
+    for frozen in [&[][..], &[("CV_FROZEN", "1")][..]] {
+        let (out, err) = hook_full(
+            &w,
+            &["hook", "retired", "--harness", "claude"],
+            &with(
+                common(&w, "livesess", "PreToolUse"),
+                json!({"tool_name": "SendMessage", "tool_input": {"to": "oldlane", "message": "wake up"}}),
+            ),
+            frozen,
+        );
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("{e}: {out:?} / {err}"));
+        assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "deny", "{out}");
+        let reason = v["hookSpecificOutput"]["permissionDecisionReason"].as_str().unwrap();
+        assert!(
+            reason.contains("could not be read") && reason.contains("oldlane"),
+            "{reason}"
+        );
+
+        // An ordinary call and a background poll are not agent wakes: allowed, with the cause said.
+        for (tool, input) in [
+            ("Read", json!({"file_path": "/work/proj/a.rs"})),
+            ("BashOutput", json!({"bash_id": "bash_7"})),
+        ] {
+            let (out, err) = hook_full(
+                &w,
+                &["hook", "retired", "--harness", "claude"],
+                &with(
+                    common(&w, "livesess", "PreToolUse"),
+                    json!({"agent_id": "agent-oldlane", "tool_name": tool, "tool_input": input}),
+                ),
+                frozen,
+            );
+            assert_eq!(out, "", "{tool}");
+            assert!(
+                err.contains("could not be read") && err.contains("allowed"),
+                "{tool}: {err}"
+            );
+        }
+    }
+}
+
 fn snapshot_cv_home(dir: &std::path::Path) -> Vec<(String, Option<std::time::SystemTime>, Vec<u8>)> {
     if !dir.exists() {
         return Vec::new();

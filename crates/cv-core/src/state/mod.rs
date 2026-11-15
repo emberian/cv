@@ -409,7 +409,10 @@ fn open_private_folded_copy_with_check(
     db_path: &Path,
     mut copied: impl FnMut(),
 ) -> Result<StateReadConnection, StateError> {
-    const MAX_ATTEMPTS: usize = 4;
+    // A writer between the copies makes one attempt unusable. Each attempt samples the store
+    // again, so many short waits (about a quarter second in total) find a quiet moment more
+    // often than a few long ones: a busy store costs a reader time rather than its answer.
+    const MAX_ATTEMPTS: u32 = 32;
     let wal_src = path_with_suffix(db_path, "-wal");
     let journal_src = path_with_suffix(db_path, "-journal");
 
@@ -426,7 +429,9 @@ fn open_private_folded_copy_with_check(
 
         let identities = || [db_path, wal_src.as_path(), journal_src.as_path()].map(crate::source::FileId::at);
         let before = identities();
+        let wal_before = wal_generation(&wal_src);
 
+        let unstable = std::cell::Cell::new(false);
         let opened = (|| -> Result<Connection, StateError> {
             std::fs::copy(db_path, &copy)?;
             set_restrictive_file_mode(&copy);
@@ -434,9 +439,9 @@ fn open_private_folded_copy_with_check(
             let copied_journal = copy_optional_sidecar(&journal_src, &copy_journal)?;
 
             copied();
-            // Check every source, including WAL resets of equal length and rollback journals.
             // Never accept an unstable copy, including on the final retry.
-            if before[0].is_none() || before != identities() {
+            if !snapshot_copy_is_consistent(&before, &identities(), wal_before, &wal_src, &copy_wal) {
+                unstable.set(true);
                 return Err(StateError::Io(std::io::Error::other(
                     "state.db or its sidecars changed during snapshot copy",
                 )));
@@ -465,8 +470,8 @@ fn open_private_folded_copy_with_check(
                 });
             }
             Err(err) => {
-                if attempt + 1 < MAX_ATTEMPTS && before != identities() {
-                    std::thread::sleep(Duration::from_millis(2));
+                if attempt + 1 < MAX_ATTEMPTS && (unstable.get() || before != identities()) {
+                    std::thread::sleep(Duration::from_millis(1 << attempt.min(3)));
                     continue;
                 }
                 return Err(err);
@@ -474,6 +479,48 @@ fn open_private_folded_copy_with_check(
         }
     }
     Err(StateError::Io(std::io::Error::other("failed to snapshot state.db")))
+}
+
+/// The 32-byte header of a write-ahead log: its salts and checkpoint sequence change whenever
+/// SQLite restarts the log. `None` when there is no log or it has no complete header.
+fn wal_generation(wal: &Path) -> Option<[u8; 32]> {
+    use std::io::Read;
+    let mut header = [0u8; 32];
+    std::fs::File::open(wal).ok()?.read_exact(&mut header).ok()?;
+    Some(header)
+}
+
+/// Whether the copy taken between `before` and `after` opens as one committed state.
+///
+/// With a write-ahead log, every page a checkpoint has moved into the database is still in the
+/// log until the log restarts, and frames are only ever appended to it. A database copied first
+/// and a log copied after it, both within one log generation, therefore recover to a committed
+/// state however many commits or checkpoint writes landed in between: recovery stops at the last
+/// whole commit and reads every checkpointed page from the log. Only a restart (a changed header)
+/// or a replaced database file breaks that. Without a log nothing protects a torn database copy,
+/// so every file must be unchanged.
+fn snapshot_copy_is_consistent(
+    before: &[Option<crate::source::FileId>; 3],
+    after: &[Option<crate::source::FileId>; 3],
+    wal_before: Option<[u8; 32]>,
+    wal_src: &Path,
+    copy_wal: &Path,
+) -> bool {
+    let (Some(db_before), Some(db_after)) = (before[0], after[0]) else {
+        return false;
+    };
+    if before[2] != after[2] {
+        return false;
+    }
+    match (wal_before, wal_generation(wal_src)) {
+        (Some(generation), Some(now)) => {
+            generation == now
+                && wal_generation(copy_wal) == Some(generation)
+                && (db_before.dev, db_before.ino) == (db_after.dev, db_after.ino)
+        }
+        (None, None) => before == after,
+        _ => false,
+    }
 }
 
 fn immutable_sqlite_uri(path: &Path) -> String {

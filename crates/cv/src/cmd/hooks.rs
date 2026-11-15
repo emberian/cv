@@ -1958,6 +1958,16 @@ fn hook_lane(ev: &Event, payload: &Value) -> Result<Option<Value>> {
 /// covering Claude `SendMessage` (`to`), Codex `send_input` (`id`) and Code Mode `exec`, OpenCode /
 /// Antigravity `send_message`, `Task`/`Agent` `resume`, and `write_stdin`/`wait_agent`.
 fn retired_targets_in_tool_call(harness: Harness, payload: &Value) -> Vec<String> {
+    tool_call_targets(harness, payload, false)
+}
+
+/// The agents a tool call would wake: message recipients and resumed sub-agents, without the
+/// background job ids a poll or stdin write names.
+fn agents_woken_by_tool_call(harness: Harness, payload: &Value) -> Vec<String> {
+    tool_call_targets(harness, payload, true)
+}
+
+fn tool_call_targets(harness: Harness, payload: &Value, wakes_only: bool) -> Vec<String> {
     use cv_core::tools::classify::{visit_tool_ops, BgAction, ClassifyOpts, ToolOp};
     let Some(tool_name) = payload.get("tool_name").and_then(Value::as_str) else {
         return Vec::new();
@@ -1976,7 +1986,7 @@ fn retired_targets_in_tool_call(harness: Harness, payload: &Value) -> Vec<String
             ToolOp::Background {
                 job_id: Some(id),
                 action: BgAction::Interact | BgAction::Poll,
-            } => targets.push(id.into_owned()),
+            } if !wakes_only => targets.push(id.into_owned()),
             ToolOp::SubagentSpawn {
                 target_hint: Some(hint),
                 ..
@@ -1997,7 +2007,10 @@ fn hook_retired(ev: &Event, payload: &Value) -> Result<Option<Value>> {
     if ev.event.as_deref() != Some("PreToolUse") {
         return Ok(None);
     }
-    let retired = cv_core::retired::current();
+    let retired = match cv_core::retired::current() {
+        Ok(retired) => retired,
+        Err(e) => return retired_ledger_unreadable(ev, payload, &e),
+    };
     if retired.is_empty() {
         return Ok(None);
     }
@@ -2033,6 +2046,30 @@ fn hook_retired(ev: &Event, payload: &Value) -> Result<Option<Value>> {
         "hookEventName": "PreToolUse",
         "permissionDecision": "deny",
         "permissionDecisionReason": reason,
+    }})))
+}
+
+/// The ledger exists and could not be read, so who is retired is unknown. A call that would wake
+/// another agent is refused, because waking a retired lane is the harm this guard exists to stop
+/// and the caller can retry. Every other call is allowed with the cause on stderr: refusing them
+/// would stop every agent on the machine for as long as the store stays unreadable.
+fn retired_ledger_unreadable(ev: &Event, payload: &Value, err: &std::io::Error) -> Result<Option<Value>> {
+    let ledger = cv_core::retired::ledger_path();
+    let Some(to) = agents_woken_by_tool_call(ev.harness, payload).into_iter().next() else {
+        anyhow::bail!(
+            "the retired ledger at {} could not be read ({err}); this call was allowed without checking it",
+            ledger.display()
+        );
+    };
+    Ok(Some(json!({"hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "deny",
+        "permissionDecisionReason": format!(
+            "cv: the retired ledger at {} could not be read ({err}), so cv cannot tell whether {to} is retired; \
+             a message to a retired agent would wake a second copy of its lane. Retry this call. If it keeps \
+             failing, `cv retire --list` shows the same error; tell the user rather than routing around it.",
+            ledger.display()
+        ),
     }})))
 }
 

@@ -850,7 +850,7 @@ fn readonly_sandbox_wal_store_reads_retirements_and_scales_concurrently() {
     // 1. Non-frozen `retired::current()` inside a read-only sandbox still sees WAL retirements.
     {
         let _env = crate::env::Env::from_vars([("CLUSTERVISION_HOME", ro_dir.as_os_str())]).enter();
-        let map = crate::retired::current();
+        let map = crate::retired::current().unwrap();
         assert_eq!(
             map.get("sandboxed").and_then(|r| r.successor.as_deref()),
             Some("successor")
@@ -867,7 +867,7 @@ fn readonly_sandbox_wal_store_reads_retirements_and_scales_concurrently() {
                     ("CV_FROZEN", "true"),
                 ])
                 .enter();
-                let map = crate::retired::current();
+                let map = crate::retired::current().unwrap();
                 assert_eq!(
                     map.get("sandboxed").and_then(|r| r.successor.as_deref()),
                     Some("successor")
@@ -1329,35 +1329,153 @@ fn frozen_checkpoint_connection_remains_a_snapshot_after_later_writes() {
 }
 
 #[test]
-fn private_state_snapshot_retries_changed_wal_and_refuses_an_unstable_final_copy() {
+fn private_state_snapshot_admits_wal_growth_and_refuses_a_restarted_log() {
     let base = tmp_state_dir("frozen-copy-retry");
     let store = StateStore::at_dir(&base);
     let writer = store.open_writable().unwrap();
     store.append("before", "before", &json!({})).unwrap();
+    let rows = |conn: &super::StateReadConnection| -> i64 {
+        conn.query_row("SELECT count(*) FROM capture_inbox", [], |r| r.get(0))
+            .unwrap()
+    };
+
+    // A commit appended to the same log generation after the copy leaves the copy a committed
+    // state: one attempt, and the snapshot is the store as of the copy.
+    let mut attempts = 0;
+    let conn = super::open_private_folded_copy_with_check(&store.db_path, || {
+        attempts += 1;
+        store.append("after", "after", &json!({})).unwrap();
+    })
+    .unwrap();
+    assert_eq!((attempts, rows(&conn)), (1, 1));
+    drop(conn);
+
+    // A checkpoint that restarts the log between the copies can pair an old database with a new
+    // log. That attempt is discarded and the retry reads every commit.
+    let restart = |id: &str| {
+        writer.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        store.append(id, id, &json!({})).unwrap();
+    };
     let mut attempts = 0;
     let conn = super::open_private_folded_copy_with_check(&store.db_path, || {
         attempts += 1;
         if attempts == 1 {
-            store.append("after", "after", &json!({})).unwrap();
+            restart("restarted");
         }
     })
     .unwrap();
-    assert_eq!(attempts, 2);
-    let count: i64 = conn
-        .query_row("SELECT count(*) FROM capture_inbox", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(count, 2, "retry must include the newer WAL commit");
+    assert_eq!((attempts, rows(&conn)), (2, 3));
     drop(conn);
 
     let mut attempts = 0;
     let result = super::open_private_folded_copy_with_check(&store.db_path, || {
         attempts += 1;
-        let id = format!("racing-{attempts}");
-        store.append(&id, &id, &json!({})).unwrap();
+        restart(&format!("racing-{attempts}"));
     });
-    assert!(result.is_err(), "the final retry must not accept changing source files");
-    assert_eq!(attempts, 4);
+    assert!(result.is_err(), "the final retry must not accept a restarted log");
+    assert_eq!(attempts, 32);
     drop(writer);
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+struct StopOnDrop<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl Drop for StopOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Frozen opens race a writer that commits, checkpoints into the database file and restarts the
+/// log. Each transaction (two inserts and two deletes over a bounded window) is either wholly in
+/// a snapshot or absent from it.
+#[test]
+fn frozen_snapshots_are_committed_states_under_commit_and_checkpoint_churn() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    const WINDOW: i64 = 40;
+    let base = tmp_state_dir("frozen-copy-churn");
+    let store = StateStore::at_dir(&base);
+    store
+        .open_writable()
+        .unwrap()
+        .execute_batch(
+            "CREATE TABLE left_side(n INTEGER PRIMARY KEY, pad BLOB);
+             CREATE TABLE right_side(n INTEGER PRIMARY KEY, pad BLOB);",
+        )
+        .unwrap();
+    let stop = AtomicBool::new(false);
+    let (mut opened, mut refused, mut newest) = (0usize, 0usize, 0i64);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let writer = store.open_writable().unwrap();
+            // Durability is not under test; fast commits race the copies harder.
+            writer.execute_batch("PRAGMA synchronous = OFF;").unwrap();
+            let mut n = 0i64;
+            while !stop.load(Ordering::Relaxed) {
+                n += 1;
+                // Several pages per commit, so a torn copy would show as a mismatch.
+                writer
+                    .execute_batch(&format!(
+                        "BEGIN IMMEDIATE;
+                         INSERT INTO left_side VALUES ({n}, randomblob(6000));
+                         DELETE FROM left_side WHERE n <= {n} - {WINDOW};
+                         INSERT INTO right_side VALUES ({n}, randomblob(6000));
+                         DELETE FROM right_side WHERE n <= {n} - {WINDOW};
+                         COMMIT;"
+                    ))
+                    .unwrap();
+                match n % 11 {
+                    0 => writer.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap(),
+                    5 => writer.execute_batch("PRAGMA wal_checkpoint(PASSIVE);").unwrap(),
+                    _ => {}
+                }
+            }
+        });
+        // A failed assertion must still stop the writer, or the scope never joins.
+        let _stop = StopOnDrop(&stop);
+        let _frozen = crate::env::Env::from_vars([("CV_FROZEN", "1")]).enter();
+        for round in 0..200 {
+            let conn = match store.open_readonly() {
+                Ok(conn) => conn.unwrap(),
+                Err(_) => {
+                    refused += 1;
+                    continue;
+                }
+            };
+            opened += 1;
+            let side = |table: &str| -> (i64, i64, i64) {
+                conn.query_row(
+                    &format!("SELECT count(*), coalesce(min(n), 0), coalesce(max(n), 0) FROM {table}"),
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap()
+            };
+            let (count, oldest, latest) = side("left_side");
+            assert_eq!(
+                side("right_side"),
+                (count, oldest, latest),
+                "half of a transaction is visible"
+            );
+            assert_eq!(
+                count,
+                latest.min(WINDOW),
+                "rows are missing from the window ending at {latest}"
+            );
+            assert!(
+                latest >= newest,
+                "a later snapshot went back in time: {latest} < {newest}"
+            );
+            newest = latest;
+            if round % 20 == 0 {
+                let check: String = conn.query_row("PRAGMA integrity_check", [], |r| r.get(0)).unwrap();
+                assert_eq!(check, "ok");
+            }
+        }
+    });
+    eprintln!("frozen churn: {opened} snapshots, {refused} refused, {newest} commits seen");
+    assert!(opened >= 150, "{refused} of 200 frozen opens were refused under churn");
+    assert!(newest > 0);
     std::fs::remove_dir_all(base).unwrap();
 }
 
