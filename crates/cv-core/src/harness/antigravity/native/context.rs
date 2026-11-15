@@ -43,6 +43,13 @@ pub(super) fn user(file: &File, input: &Proto, out: &mut impl Write) -> Result<(
             }
         }
     }
+    // A command with no expansion (`/compact`) leaves every item empty. What the
+    // person typed is then the whole prompt; with item text it would repeat mentions.
+    if first {
+        if let Some(typed) = input.last(2).filter(|field| nonempty(*field)) {
+            component(file, typed, out, &mut first)?;
+        }
+    }
     out.write_all(b"],\"native_scope_items\":[")?;
     let mut first = true;
     for item in input.repeated(3) {
@@ -77,7 +84,14 @@ fn scope(message: &Proto) -> Option<wire::Field> {
         .copied()
 }
 
+fn nonempty(field: wire::Field) -> bool {
+    matches!(field.value, wire::Value::Bytes { len, .. } if len > 0)
+}
+
 fn component(file: &File, field: wire::Field, out: &mut impl Write, first: &mut bool) -> Result<()> {
+    if !nonempty(field) {
+        return Ok(());
+    }
     if !*first {
         out.write_all(b",")?;
     }
@@ -319,6 +333,29 @@ mod tests {
         );
         assert_eq!(output["native_scope_items"][0]["display_name"], "Display only");
         assert!(output["native_scope_items"][0].get("model_facing_text").is_none());
+    }
+
+    #[test]
+    fn a_command_without_expansion_keeps_the_typed_prompt() {
+        // Written by CLI 1.5.9 for `/compact`: the typed text, an empty text item and a
+        // slash-command scope with a name and no model-facing body.
+        let slash = bytes(1, &[bytes(1, b"compact"), vec![24, 1]].concat());
+        let input = [
+            bytes(2, b"/compact"),
+            bytes(3, &bytes(2, &bytes(27, &slash))),
+            bytes(3, &bytes(1, b"")),
+        ]
+        .concat();
+        let output = projection(&input, false);
+        assert_eq!(output["native_content"], serde_json::json!(["/compact"]));
+        assert_eq!(output["native_scope_items"][0]["name"], "compact");
+
+        // Item text wins: the typed form of a mention would repeat its path.
+        let input = [bytes(2, b"read this@[/work/a.rs]"), bytes(3, &bytes(1, b"read this"))].concat();
+        assert_eq!(
+            projection(&input, false)["native_content"],
+            serde_json::json!(["read this"])
+        );
     }
 
     #[test]
