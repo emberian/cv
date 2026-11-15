@@ -38,6 +38,10 @@ while `cv search --batch` reads queries from stdin. The command schema reports t
 argument as optional, so CI accepts `commands.search.args.query.required`; existing invocations
 retain their meaning. Batch answers have their own documented, opt-in JSON shape.
 
+0.20 also makes the positional pack task conditional: `cv pack TASK` retains corpus recall,
+while `cv pack --session SOURCE` produces a bounded overview without a task. CI accepts
+`commands.pack.args.task.required`; existing task-based invocations retain their meaning.
+
 ## HTTP transport in 0.19.2
 
 HTTP parsing and response framing now use Hyper. Requests without a `Host` header receive

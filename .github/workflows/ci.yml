@@ -87,6 +87,7 @@ jobs:
             --accept commands.search.args.query.required \
             --accept commands.index.args.semantic \
             --accept commands.pack.args.context_bytes \
+            --accept commands.pack.args.task.required \
             --accept commands.splice.args.generate \
             --accept commands.splice.args.gen_model \
             --accept commands.rewind.args.from_compaction \
