@@ -45,6 +45,7 @@ mod observe;
 #[cfg(test)]
 use observe::{body_hash, SweepWork};
 mod live;
+mod migration;
 mod prepared;
 mod staging;
 mod sweep;
@@ -93,6 +94,10 @@ struct Fields {
 }
 
 fn build_schema() -> Schema {
+    build_schema_with_consumer(None)
+}
+
+fn build_schema_with_consumer(consumer: Option<&str>) -> Schema {
     let mut b = Schema::builder();
     b.add_text_field("id", STRING | STORED);
     b.add_text_field("kind", STRING | STORED);
@@ -113,6 +118,9 @@ fn build_schema() -> Schema {
     b.add_text_field("agent_id", STRING | STORED); // stored attribution
     b.add_text_field("workflow", STRING | STORED); // stored attribution
     b.add_bool_field(&format_field(), tantivy::schema::NumericOptions::default());
+    if let Some(id) = consumer {
+        b.add_bool_field(&format!("cv_consumer_{id}"), tantivy::schema::NumericOptions::default());
+    }
     b.build()
 }
 
@@ -172,38 +180,20 @@ fn fields_current(schema: &Schema) -> bool {
     .all(|f| schema.get_field(f).is_ok())
 }
 
-/// Open the index at `dir` for **indexing**: created when absent, and an existing index with a
-/// stale schema (see [`schema_current`]) is transparently rebuilt fresh so the binary self-heals
-/// on upgrade — the caller's sweep repopulates it. Any *other* open failure (corruption, a
-/// transient IO/lock error) propagates: only a positively-identified schema mismatch may delete;
-/// read-only callers use [`open_existing`], which never deletes anything.
+/// Open or create a compatible index. Schema replacement belongs to the sweep boundary,
+/// where a complete, successful generation can be published without destroying the old one.
 fn open_or_create(dir: &Path) -> Result<(Index, Fields)> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating tantivy dir {}", dir.display()))?;
-    // No `meta.json` → nothing here is an index (a fresh dir, or stray leftovers from a failed
-    // create): safe to start clean.
-    if !dir.join("meta.json").exists() {
-        std::fs::remove_dir_all(dir).with_context(|| format!("clearing incomplete index at {}", dir.display()))?;
-        std::fs::create_dir_all(dir).with_context(|| format!("recreating tantivy dir {}", dir.display()))?;
-        let index = Index::create_in_dir(dir, build_schema())
-            .with_context(|| format!("creating tantivy index in {}", dir.display()))?;
-        let fields = fields_of(&index.schema())?;
-        return Ok((index, fields));
-    }
-    let index = Index::open_in_dir(dir).with_context(|| {
-        format!(
-            "opening tantivy index at {} (if it is corrupt, delete the directory and re-run `cv index`)",
-            dir.display()
-        )
-    })?;
-    if schema_current(&index.schema()) {
-        let fields = fields_of(&index.schema())?;
-        return Ok((index, fields));
-    }
-    // Positively identified as an older-schema index → rebuild fresh.
-    std::fs::remove_dir_all(dir).with_context(|| format!("clearing stale-schema index at {}", dir.display()))?;
-    std::fs::create_dir_all(dir).with_context(|| format!("recreating tantivy dir {}", dir.display()))?;
-    let index = Index::create_in_dir(dir, build_schema())
-        .with_context(|| format!("creating tantivy index in {}", dir.display()))?;
+    let index = if !dir.join("meta.json").try_exists()? {
+        Index::create_in_dir(dir, build_schema())
+            .with_context(|| format!("creating tantivy index in {}", dir.display()))?
+    } else {
+        Index::open_in_dir(dir).with_context(|| format!("opening tantivy index at {}", dir.display()))?
+    };
+    anyhow::ensure!(
+        schema_current(&index.schema()),
+        "full-text schema changed; run a complete `cv index` migration"
+    );
     let fields = fields_of(&index.schema())?;
     Ok((index, fields))
 }
@@ -306,6 +296,13 @@ const DEAD_RATIO: f32 = 0.5;
 /// next run started it again. Merging is [`compact`]'s job, sized by bytes, run to completion.
 fn open_writer(index: &Index, heap: usize) -> Result<Writer> {
     let writer = Writer::new(index, heap)?;
+    // A handle opened before a schema migration must never write its old schema into the
+    // replacement generation. The writer lock now protects this check until writer drop.
+    let current = Index::open(index.directory().clone())?;
+    anyhow::ensure!(
+        current.schema() == index.schema(),
+        "index schema changed while opening writer; retry indexing"
+    );
     writer.set_merge_policy(Box::new(tantivy::indexer::NoMergePolicy));
     Ok(writer)
 }
@@ -451,7 +448,17 @@ pub fn index_all(
     subagents: bool,
     strict: bool,
 ) -> Result<(Indexed, Vec<cv_core::SessionRef>)> {
-    let (swept, refs) = sweep_all(dir, rebuild, subagents)?;
+    let (swept, refs) = if let Some(migration) = migration::Migration::prepare(dir, rebuild)? {
+        // Migration requires authoritative discovery before ingest. The ordinary compatible
+        // path keeps its decode-once handoff and partial-success behavior.
+        let _sources = cv_core::source::read_scope();
+        let refs = cv_core::discover_all_checked()?;
+        let swept = sweep_refs(migration.path(), &refs, true, subagents)?;
+        migration.publish(&swept)?;
+        (swept, refs)
+    } else {
+        sweep_all(dir, rebuild, subagents)?
+    };
     Ok((report(swept, rebuild, strict)?, refs))
 }
 
@@ -548,7 +555,7 @@ pub fn index_sessions(
     subagents: bool,
 ) -> Result<usize> {
     let _sources = cv_core::source::read_scope();
-    Ok(report(sweep_refs(dir, refs.as_ref(), rebuild, subagents)?, rebuild, false)?.total)
+    Ok(report(sweep_migrating(dir, refs.as_ref(), rebuild, subagents)?, rebuild, false)?.total)
 }
 
 /// A session a sweep could not read, and why.
@@ -748,6 +755,9 @@ enum Delete {
 /// keyed by their canonical path; the open that mints an identity moves those rows to it.
 fn source_consumer(dir: &Path) -> Result<String> {
     use std::io::Write;
+    if let Some(consumer) = migration::consumer(dir)? {
+        return Ok(consumer);
+    }
     let file = dir.join("cv-index-id");
     let read = |file: &Path| indexed_consumer(file);
     if let Some(consumer) = read(&file)? {
@@ -859,7 +869,17 @@ fn preferred_index_copies(refs: Vec<cv_core::SessionRef>) -> Vec<cv_core::Sessio
 /// holds their docs, so a crash between the two can never leave a mark ahead of the index.
 #[cfg(test)]
 pub(crate) fn sweep(dir: &Path, refs: Vec<cv_core::SessionRef>, rebuild: bool, subagents: bool) -> Result<Swept> {
-    sweep_refs(dir, &refs, rebuild, subagents)
+    sweep_migrating(dir, &refs, rebuild, subagents)
+}
+
+fn sweep_migrating(dir: &Path, refs: &[cv_core::SessionRef], rebuild: bool, subagents: bool) -> Result<Swept> {
+    if let Some(migration) = migration::Migration::prepare(dir, rebuild)? {
+        let swept = sweep_refs(migration.path(), refs, true, subagents)?;
+        migration.publish(&swept)?;
+        Ok(swept)
+    } else {
+        sweep_refs(dir, refs, rebuild, subagents)
+    }
 }
 
 fn sweep_refs(dir: &Path, refs: &[cv_core::SessionRef], rebuild: bool, subagents: bool) -> Result<Swept> {
@@ -2590,7 +2610,9 @@ fn pass_needed_with_catalog(
         return Some(true);
     }
     let (existing, folded, metadata) = read_indexed_metadata(&index, &f, true).ok()?;
-    let consumer = indexed_consumer(&dir.join("cv-index-id")).ok()??;
+    let consumer = migration::consumer(dir)
+        .ok()?
+        .or_else(|| indexed_consumer(&dir.join("cv-index-id")).ok().flatten())?;
     let dependencies = cv_core::source::Table::<InIndex>::load(&consumer);
     let check_derived = check_catalog && !cv_core::env::frozen();
     let event_sync = check_derived.then(cv_core::events::SyncTable::load);
@@ -8859,6 +8881,9 @@ mod tests {
             let existing = Index::open_in_dir(&*dir).unwrap();
             assert_eq!(existing.reader().unwrap().searcher().num_docs(), 1);
             drop(existing);
+            assert!(open_or_create(&dir).is_err());
+            let migration = migration::Migration::prepare(&dir, false).unwrap().unwrap();
+            migration.publish(&Swept::default()).unwrap();
             let (new, _) = open_or_create(&dir).unwrap();
             assert!(schema_current(&new.schema()));
             assert_eq!(new.reader().unwrap().searcher().num_docs(), 0);

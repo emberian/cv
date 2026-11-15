@@ -101,6 +101,32 @@ Registry: `cv-core/src/harness/mod.rs`; implementations under `cv-core/src/harne
 Directory entry sizes and whole database sizes are **not** per-session transcript byte counts.
 Compressed, encoded, scanned, decoded and emitted bytes must be labeled separately.
 
+## Full-text schema replacement
+
+An incompatible full-text index is never cleared at open. The indexer locks its existing
+Tantivy writer lock, discovers a complete inventory, and builds a replacement in a private
+`.cv-migrate-<uuid>` directory inside the index. Any skipped discovery source, parse failure,
+or publication error rejects the replacement. Explicit rebuild also uses this path when a
+compatible index's stored metadata is corrupt. `index_sessions` accepts the caller's already
+complete inventory; callers must not pass a partial discovery result as authoritative.
+
+After every staged writer has closed, the replacement's readers and segment checksums are
+validated. Immutable segment files are hard-linked into the original directory and its entries
+synced. Under Tantivy's metadata lock, the managed-file list is replaced and synced, then
+`meta.json` is atomically replaced and the directory synced again. Failure before that metadata
+switch keeps the original schema and body; failure after it leaves a complete replacement.
+An empty, unindexed schema stamp holds the new consumer UUID, so source dependency identity
+switches in exactly the same record. Ordinary commits preserve this stamp automatically.
+Counts and events from successful source passes remain independently valid if the FTS
+migration is abandoned; the abandoned FTS consumer never becomes the active index identity.
+
+Existing prepared readers retain their old segment files. Those files are deliberately no
+longer in Tantivy's managed-file list, so later garbage collection cannot delete them while
+another process may still use them. Old segment files and stages left by killed processes
+consume disk until the index is retired; there is no automatic cross-process lease reclamation.
+Only a stage owned by the current invocation is removed on normal completion or failure.
+The original index directory remains the public path, including for callers with explicit paths.
+
 ## Consumer inventory
 
 | Operation | Actual work | Optimization boundary |

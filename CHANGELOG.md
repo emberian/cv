@@ -7,6 +7,7 @@
 - Distill enforces aggregate byte or estimated-token budgets before publication and requires explicit snapshots for unsettled calls.
 - Distill correlates Claude and Antigravity background completions with initiating commands, keeping unfinished output out of build verdicts.
 - Claude resume validation rejects cyclic parent links, including detached cycles.
+- Index schema upgrades preserve the previous generation until complete, validated replacement; failed discovery or indexing leaves existing readers intact.
 
 - Antigravity replays revised steps correctly, reads chunked history, preserves missing-child lanes, and enriches native lineage, usage, swarm, approval, and background-task events.
 - Search retries changing sources and reports disappearing sessions without flooding the terminal with parse failures.
