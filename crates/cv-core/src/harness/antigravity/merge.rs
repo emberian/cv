@@ -9,12 +9,23 @@ pub(super) struct Match {
     pub signature: Option<String>,
     pub usage: Option<Usage>,
     pub planner_details: Option<Value>,
+    /// The native revision of a result whose call a verified planner step names.
+    pub revised: Option<Revised>,
+}
+/// The writer keeps revising a tool step after exporting it: a backgrounded command's
+/// acknowledgement stays `RUNNING` in the log while the store records how it ended.
+pub(super) struct Revised {
+    pub status: String,
+    pub task_details: Option<Value>,
+    pub interaction: Option<Value>,
 }
 pub(super) struct Verified {
     pub matches: BTreeMap<u64, Match>,
     pub native: jsonl::Read,
-    pub tail: StepOrder,
-    pub rejected_tail: bool,
+    /// Steps the export never wrote: cancelled tools, upstream errors, history before a
+    /// re-created log, and steps newer than its last flush.
+    pub native_only: StepOrder,
+    pub rejected: bool,
 }
 struct Fingerprint(blake3::Hasher);
 impl Write for Fingerprint {
@@ -28,9 +39,31 @@ impl Write for Fingerprint {
 }
 fn fingerprint(view: JsonView<'_>) -> Result<blake3::Hash> {
     let mut hash = Fingerprint(blake3::Hasher::new());
+    let user = view.get("type")?.map(JsonView::string).transpose()?.flatten().as_deref() == Some("USER_INPUT");
     for key in ["type", "content", "thinking"] {
         hash.write_all(key.as_bytes())?;
         let mut value = view.get(key)?;
+        // The export wraps the typed request in model-facing metadata; the store keeps
+        // the request alone, as one item. Compare the request, never the wrapper.
+        if key == "content" && user {
+            let request = match value {
+                Some(content) => content
+                    .string()?
+                    .map(|text| super::exported_user_request(&text).map(str::to_owned).unwrap_or(text)),
+                None => match view.get("native_content")?.map(JsonView::array).transpose()?.flatten() {
+                    Some(mut parts) => match (parts.next().transpose()?, parts.next().transpose()?) {
+                        (Some(only), None) => only.string()?,
+                        _ => None,
+                    },
+                    None => None,
+                },
+            };
+            if let Some(request) = request {
+                hash.write_all(request.as_bytes())?;
+            }
+            hash.write_all(&[0])?;
+            continue;
+        }
         // The native user shape stores text as items; a single item is exactly
         // the same body as the export's content string, without guessing joins.
         if key == "content" && value.is_none() {
@@ -81,7 +114,7 @@ pub(super) fn verified(
     order: &StepOrder,
     path: &Path,
     complete: bool,
-    include_tail: bool,
+    include_native_only: bool,
 ) -> Result<Verified> {
     let native = super::native::open(path, complete)?;
     let mut expected = BTreeMap::new();
@@ -94,8 +127,7 @@ pub(super) fn verified(
     }
     let mut matches = BTreeMap::new();
     let mut known_calls = BTreeSet::new();
-    let mut tail = StepOrder::default();
-    let max_exported = order.steps.keys().next_back().copied();
+    let mut native_only = StepOrder::default();
     let mut newest_comparable = None;
     native.snapshot(0, native.len(), |line| {
         let Some(view) = line.view else {
@@ -110,27 +142,28 @@ pub(super) fn verified(
         else {
             return Ok(Flow::Continue);
         };
-        if include_tail && max_exported.is_some_and(|max| index > max) {
-            tail.ingest(&line)?;
+        if !expected.contains_key(&index) {
+            if include_native_only {
+                native_only.ingest(&line)?;
+            }
             return Ok(Flow::Continue);
         }
         if view.get("native_cleared")?.is_some() {
             return Ok(Flow::Continue);
         }
         let equal = expected.get(&index) == Some(&fingerprint(view)?);
-        if expected.contains_key(&index)
-            && matches!(
-                view.get("type")?
-                    .map(JsonView::string)
-                    .transpose()?
-                    .flatten()
-                    .as_deref(),
-                Some("USER_INPUT" | "PLANNER_RESPONSE")
-            )
-        {
+        let kind = view.get("type")?.map(JsonView::string).transpose()?.flatten();
+        // A request the export decorated with mentions cannot be compared; only a
+        // planner body that differs is evidence of another revision.
+        if kind.as_deref() == Some("PLANNER_RESPONSE") || (kind.as_deref() == Some("USER_INPUT") && equal) {
             newest_comparable = Some(equal);
         }
         if !equal {
+            if kind.as_deref() == Some("GENERIC") {
+                if let Some(revised) = revision(view, &known_calls)? {
+                    matches.insert(index, revised);
+                }
+            }
             return Ok(Flow::Continue);
         }
         let mut matched = Match::default();
@@ -169,14 +202,40 @@ pub(super) fn verified(
     })?;
     native.check()?;
     input.check()?;
-    let rejected_tail = !tail.steps.is_empty() && newest_comparable != Some(true);
-    if rejected_tail {
-        tail.steps.clear();
+    let rejected = !native_only.steps.is_empty() && newest_comparable != Some(true);
+    if rejected {
+        native_only.steps.clear();
     }
     Ok(Verified {
         matches,
         native,
-        tail,
-        rejected_tail,
+        native_only,
+        rejected,
     })
+}
+
+/// A result row whose body differs from the export is still the same call when the
+/// store names a call ID that a verified planner step issued.
+fn revision(view: JsonView<'_>, known_calls: &BTreeSet<String>) -> Result<Option<Match>> {
+    let Some(id) = view
+        .get("native_tool_id")?
+        .map(JsonView::string)
+        .transpose()?
+        .flatten()
+        .filter(|id| known_calls.contains(id))
+    else {
+        return Ok(None);
+    };
+    let Some(fields) = Fields::parse(view, STEP_KEYS)? else {
+        return Ok(None);
+    };
+    Ok(Some(Match {
+        result: Some(id),
+        revised: Some(Revised {
+            status: fields.string("status")?.unwrap_or_default(),
+            task_details: fields.value("native_task_details")?,
+            interaction: fields.value("native_interaction")?,
+        }),
+        ..Match::default()
+    }))
 }

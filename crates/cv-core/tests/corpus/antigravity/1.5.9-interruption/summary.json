@@ -3,15 +3,17 @@
     {
       "id": "91e0fa66-2deb-4108-b123-ac36f5a36ec9",
       "path": ".gemini/antigravity-cli/brain/91e0fa66-2deb-4108-b123-ac36f5a36ec9/.system_generated/logs/transcript_full.jsonl",
-      "messages": 13,
+      "messages": 15,
       "sequence": [
         "user/prompt",
         "assistant/reply",
+        "tool/tool_result",
         "user/prompt",
         "assistant/reply",
         "tool/tool_result",
         "assistant/reply",
         "user/prompt",
+        "system/error",
         "user/prompt",
         "assistant/reply",
         "user/prompt",
@@ -20,8 +22,8 @@
         "assistant/reply"
       ],
       "blocks": {
-        "text": 10,
-        "tool_result": 1,
+        "text": 11,
+        "tool_result": 2,
         "tool_use": 2
       },
       "tools": [

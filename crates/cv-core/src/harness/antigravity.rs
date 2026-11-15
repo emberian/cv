@@ -632,7 +632,7 @@ impl Adapter for Antigravity {
                 Ok(Flow::Continue)
             })?;
             #[cfg(feature = "sqlite")]
-            let mut native_tail = None;
+            let mut native_only = None;
             #[cfg(feature = "sqlite")]
             if !is_native_store(&r.path) {
                 if let Some(loc) = BrainLoc::from_transcript(&r.path) {
@@ -646,7 +646,9 @@ impl Adapter for Antigravity {
                             opts.tier == Tier::Complete,
                             matches!(from, Start::Whole),
                         ) {
-                            if !verified.matches.is_empty() || !verified.tail.steps.is_empty() || verified.rejected_tail
+                            if !verified.matches.is_empty()
+                                || !verified.native_only.steps.is_empty()
+                                || verified.rejected
                             {
                                 order
                                     .coverage
@@ -658,12 +660,15 @@ impl Adapter for Antigravity {
                                     .insert(crate::coverage::ReadCoverage::UNSUPPORTED_NATIVE_FIELDS.into());
                             }
                             codec.enrich.verified = verified.matches;
-                            if verified.rejected_tail {
+                            if verified.rejected {
                                 order.coverage.limitations.insert("unreconciled_history".into());
-                            } else if !verified.tail.steps.is_empty() {
-                                order.coverage.sources.extend(verified.tail.coverage.sources);
-                                order.coverage.limitations.extend(verified.tail.coverage.limitations);
-                                native_tail = Some((verified.native, verified.tail.steps));
+                            } else if !verified.native_only.steps.is_empty() {
+                                order.coverage.sources.extend(verified.native_only.coverage.sources);
+                                order
+                                    .coverage
+                                    .limitations
+                                    .extend(verified.native_only.coverage.limitations);
+                                native_only = Some((verified.native, verified.native_only.steps));
                             }
                         }
                     }
@@ -696,9 +701,9 @@ impl Adapter for Antigravity {
                 })?;
             }
             #[cfg(feature = "sqlite")]
-            if let Some((native, tail)) = &native_tail {
+            if let Some((native, steps)) = &native_only {
                 let mut records = native.records();
-                for (at, end) in tail.values() {
+                for (at, end) in steps.values() {
                     records.read(*at, end - at, |view| {
                         if codec.inferred_identity(view)? {
                             order
@@ -714,27 +719,55 @@ impl Adapter for Antigravity {
             spawns.meta(&codec.s);
             let mut records = input.records();
             crate::stream::guarded(&mut spawns, &input, |sink| {
-                let mut stopped = false;
-                for (at, end) in order.steps.into_values() {
-                    if records.read(at, end - at, |view| codec.record(view, at, sink))? == Flow::Stop {
-                        stopped = true;
-                        break;
-                    }
-                }
                 #[cfg(feature = "sqlite")]
-                if !stopped {
-                    if let Some((native, tail)) = native_tail {
-                        let mut records = native.records();
-                        stopped = crate::stream::guarded(sink, &native, |sink| {
-                            for (at, end) in tail.into_values() {
-                                if records.read(at, end - at, |view| codec.record(view, at, sink))? == Flow::Stop {
+                let stopped = match native_only {
+                    // Both sources replay as one conversation, in step order: a step the
+                    // export never wrote sits between the exported steps around it.
+                    Some((native, steps)) => {
+                        let mut merged: BTreeMap<u64, (bool, u64, u64)> = order
+                            .steps
+                            .iter()
+                            .map(|(index, (at, end))| (*index, (false, *at, *end)))
+                            .collect();
+                        merged.extend(steps.into_iter().map(|(index, (at, end))| (index, (true, at, end))));
+                        let mut native_records = native.records();
+                        let stopped = crate::stream::guarded(sink, &native, |sink| {
+                            for (from_native, at, end) in merged.into_values() {
+                                let flow = if from_native {
+                                    native_records.read(at, end - at, |view| codec.record(view, at, sink))?
+                                } else {
+                                    records.read(at, end - at, |view| codec.record(view, at, sink))?
+                                };
+                                if flow == Flow::Stop {
                                     return Ok(true);
                                 }
                             }
                             Ok(false)
                         })?;
+                        stopped
                     }
-                }
+                    None => {
+                        let mut stopped = false;
+                        for (at, end) in order.steps.values() {
+                            if records.read(*at, end - at, |view| codec.record(view, *at, sink))? == Flow::Stop {
+                                stopped = true;
+                                break;
+                            }
+                        }
+                        stopped
+                    }
+                };
+                #[cfg(not(feature = "sqlite"))]
+                let stopped = {
+                    let mut stopped = false;
+                    for (at, end) in order.steps.values() {
+                        if records.read(*at, end - at, |view| codec.record(view, *at, sink))? == Flow::Stop {
+                            stopped = true;
+                            break;
+                        }
+                    }
+                    stopped
+                };
                 super::note_skipped_lines(codec.session(), order.skipped);
                 codec.finish(stopped, sink).map(Some)
             })
@@ -1560,6 +1593,7 @@ const STEP_KEYS: &[&str] = &[
     "native_planner_details",
     "native_tool_id",
     "native_tool_name",
+    "native_interaction",
     "cache_creation_tokens",
     "reasoning_tokens",
     "thinking_signature",
@@ -1898,6 +1932,22 @@ impl StepCodec {
                     ),
                 };
 
+                // The export stops revising a step once it is written; the store's later
+                // terminal status for the same call replaces a stale running one.
+                #[cfg(feature = "sqlite")]
+                let revised = self
+                    .enrich
+                    .verified
+                    .get(&step_index)
+                    .and_then(|m| m.revised.as_ref())
+                    .filter(|native| {
+                        matches!(
+                            status.as_deref(),
+                            Some("RUNNING" | "PENDING" | "WAITING" | "QUEUED" | "GENERATING")
+                        ) && matches!(native.status.as_str(), "DONE" | "CANCELED" | "ERROR" | "INVALID")
+                    });
+                #[cfg(feature = "sqlite")]
+                let status = revised.map(|native| native.status.clone()).or(status);
                 let is_error = matches!(status.as_deref(), Some("ERROR" | "INVALID"));
                 let norm_status = status.as_deref().map(normalize_step_status);
 
@@ -1966,6 +2016,17 @@ impl StepCodec {
                 });
                 push_media_blocks(&mut m.content, fields.get("media"), media_marker)?;
                 attach_step_extras(&mut m, &fields, step_index, &source, status.as_deref(), want_extra)?;
+                #[cfg(feature = "sqlite")]
+                if let Some(native) = revised {
+                    // Job identity drives lifecycle decoding at every tier.
+                    let bag = m.harness_extra_mut(Harness::Antigravity);
+                    if let Some(task) = &native.task_details {
+                        bag.insert("task_details".into(), task.clone());
+                    }
+                    if let Some(interaction) = &native.interaction {
+                        bag.insert("interaction".into(), interaction.clone());
+                    }
+                }
                 Ok(sink.message(m))
             }
             "SYSTEM_MESSAGE" => {
@@ -2274,6 +2335,7 @@ fn attach_step_extras(
         ("native_planner_details", "planner_details"),
         ("native_scope_items", "scope_items"),
         ("native_task_details", "task_details"),
+        ("native_interaction", "interaction"),
     ] {
         if let Some(value) = fields.value(field)? {
             bag.insert(key.into(), value);
@@ -2446,13 +2508,15 @@ fn unwrap_system_message_body(text: &str) -> Option<&str> {
     Some(inner)
 }
 
+/// The typed request inside the export's `<USER_REQUEST>` envelope. The writer appends
+/// `<ADDITIONAL_METADATA>` and settings notices after the closing tag.
+fn exported_user_request(text: &str) -> Option<&str> {
+    let inner = text.trim().strip_prefix("<USER_REQUEST>")?;
+    Some(inner.split_once("</USER_REQUEST>").map_or(inner, |(request, _)| request).trim())
+}
+
 fn unwrap_user_request(text: &str) -> &str {
-    let trimmed = text.trim();
-    if let Some(inner) = trimmed.strip_prefix("<USER_REQUEST>") {
-        let inner = inner.strip_suffix("</USER_REQUEST>").unwrap_or(inner);
-        return inner.trim();
-    }
-    trimmed
+    exported_user_request(text).unwrap_or_else(|| text.trim())
 }
 
 fn looks_like_uuid(s: &str) -> bool {

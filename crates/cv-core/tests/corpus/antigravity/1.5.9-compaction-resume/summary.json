@@ -3,8 +3,16 @@
     {
       "id": "bc50c17a-7e9f-4b92-81fd-a6d102b4007f",
       "path": ".gemini/antigravity-cli/brain/bc50c17a-7e9f-4b92-81fd-a6d102b4007f/.system_generated/logs/transcript_full.jsonl",
-      "messages": 10,
+      "messages": 18,
       "sequence": [
+        "user/prompt",
+        "assistant/reply",
+        "tool/tool_result",
+        "assistant/reply",
+        "user/prompt",
+        "system/injected_context",
+        "system/compaction_boundary",
+        "system/compaction_summary",
         "user/prompt",
         "system/injected_context",
         "assistant/reply",
@@ -17,31 +25,34 @@
         "assistant/reply"
       ],
       "blocks": {
-        "text": 8,
-        "tool_result": 2,
-        "tool_use": 2
+        "text": 14,
+        "tool_result": 3,
+        "tool_use": 3
       },
       "tools": [
+        "run_command",
         "run_command",
         "run_command"
       ],
       "usage_messages": 0,
       "model_messages": 0,
-      "compaction_boundaries": [],
+      "compaction_boundaries": [
+        6
+      ],
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {},
       "tool_histogram": {
         "tools": {
           "run_command": {
-            "calls": 2,
+            "calls": 3,
             "edits": 0,
             "reads": 0,
-            "commands": 2,
+            "commands": 3,
             "errors": 0
           }
         },
-        "total_calls": 2,
+        "total_calls": 3,
         "total_errors": 0
       },
       "lineage": {},
