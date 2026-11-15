@@ -584,3 +584,26 @@ fn pack_selected_duplicate_ids_keep_their_paths_and_event_facts() {
         );
     }
 }
+
+/// A pack is read from other directories than the one it was made in.
+#[test]
+fn relative_transcript_selection_is_cited_by_its_absolute_path() {
+    let w = World::new("selected-relative");
+    pack_corpus(&w);
+    let path = w.transcript("wombatsess");
+    let relative = path.strip_prefix(&w.base).unwrap().to_str().unwrap();
+    // The child's working directory is the base with its links resolved.
+    let cited = format!(
+        "cv show claude:{}",
+        w.base.canonicalize().unwrap().join(relative).display()
+    );
+    for args in [
+        vec!["pack", "--session", relative],
+        vec!["pack", "wombat", "--session", relative],
+        vec!["show", relative, "--kind", "overview"],
+    ] {
+        let (out, _) = w.cv_ok(&args);
+        assert!(out.contains(&cited), "{args:?}\n{out}");
+        assert!(!out.contains(&format!("claude:{relative}")), "{args:?}\n{out}");
+    }
+}

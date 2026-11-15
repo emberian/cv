@@ -46,7 +46,9 @@ pub(crate) fn render(value: &Value, source: Option<&str>, agent: Option<&str>) -
     } else {
         quoted_selector
     };
-    let mut out = format!("{}\n{}\n", text(session, "title"), selector);
+    let title = text(session, "title");
+    let title = if title.is_empty() { "(untitled)" } else { &title };
+    let mut out = format!("{title}\n{selector}\n");
     for (field, heading) in [
         ("requests", "Requests"),
         ("workers", "Workers"),

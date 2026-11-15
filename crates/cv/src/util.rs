@@ -139,6 +139,16 @@ pub(crate) fn parse_harness(s: &Option<String>) -> Result<Option<Harness>> {
     }
 }
 
+/// The selector a later `cv show` can reuse for `source`: a transcript path is made absolute,
+/// since a pack or overview is read from other directories than the one that produced it.
+pub(crate) fn source_selector(harness: cv_core::Harness, source: &str) -> String {
+    let path = std::path::Path::new(source);
+    match path.is_file().then(|| std::path::absolute(path).ok()).flatten() {
+        Some(path) => format!("{harness}:{}", path.display()),
+        None => format!("{harness}:{source}"),
+    }
+}
+
 /// A shared store path supplies no session key. Antigravity's SQLite file is one conversation;
 /// other adapters' rows stores need the native ID that discovery normally carries alongside it.
 pub(crate) fn require_session_file(r: &cv_core::SessionRef, adapter: &dyn cv_core::Adapter) -> Result<()> {
@@ -284,6 +294,18 @@ impl WindowArgs {
             }));
         }
         Ok(self.window_with(|_| unreachable!())?.map(KindSelector::Rows))
+    }
+
+    /// As [`Self::kind_selector_in`] for a view whose rows print their original message index:
+    /// `--around N` names that message, as `--around ID` does, not the Nth projected row.
+    pub(crate) fn message_selector_in(&self, adapter: &dyn Adapter, r: &SessionRef) -> Result<Option<KindSelector>> {
+        match &self.around {
+            Some(cv_core::api::Around::Index(msg_index)) => Ok(Some(KindSelector::AroundMessage {
+                msg_index: *msg_index,
+                context: self.context,
+            })),
+            _ => self.kind_selector_in(adapter, r),
+        }
     }
 
     /// Whether a selector is given, checked without reading a session (a bad `--range` errors).

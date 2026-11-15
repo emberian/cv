@@ -92,6 +92,8 @@ fn context_view_api_matches_projected_cli_windows() {
             vec!["--around", "boundary", "--context", "1"],
             "around=boundary&context=1",
         ),
+        // A number is the original message index in both, not a position among the rows.
+        (vec!["--around", "1", "--context", "0"], "around=1&context=0"),
     ] {
         let (status, body) = cv_core::api::route_json(path, query);
         assert_eq!(status, 200, "{body}");
@@ -106,6 +108,7 @@ fn context_view_api_matches_projected_cli_windows() {
     ] {
         assert_eq!(cv_core::api::route_json(path, query).0, 400, "{query}");
     }
+    assert_eq!(rows(&w, &["--around", "1", "--context", "0"])[0]["index"], 1);
     assert!(rows(&w, &["--last", "0"]).as_array().unwrap().is_empty());
     assert_eq!(rows(&w, &["--pre-compaction"])[0]["index"], 1);
     let limited = rows(&w, &["--max-bytes", "1"]);

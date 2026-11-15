@@ -329,7 +329,7 @@ pub(crate) fn cmd_show(
                     return usage("the overview selects bounded excerpts across the session; drop the window flags and use --around on a source message");
                 }
                 let (want, source_id) = split_harness_id(id, parse_harness(&harness)?);
-                let source = format!("{}:{source_id}", want.unwrap_or(r.harness));
+                let source = crate::util::source_selector(want.unwrap_or(r.harness), source_id);
                 crate::cmd::overview::print(&r, json, &source, agent.as_deref())
             }
             KindView::Said { prompts, answers } => {
@@ -351,7 +351,7 @@ pub(crate) fn cmd_show(
             KindView::Context => {
                 let win = KindWindow {
                     pre_compaction: pre_compaction_span(&r, pre_compaction)?,
-                    selector: window.kind_selector_in(adapter.as_ref(), &r)?,
+                    selector: window.message_selector_in(adapter.as_ref(), &r)?,
                     max_bytes: window.max_bytes,
                 };
                 print_context(&r, adapter.as_ref(), win, json)

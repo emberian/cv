@@ -83,7 +83,9 @@ pub(crate) fn cmd_pack(args: PackArgs<'_>) -> Result<()> {
             .map(|spec| {
                 let (harness, id) = crate::util::split_harness_id(spec, None);
                 let (session, adapter) = crate::cmd::distill::resolve_source(id, harness)?;
-                let selector = Path::new(id).is_file().then(|| format!("{}:{id}", session.harness));
+                let selector = Path::new(id)
+                    .is_file()
+                    .then(|| crate::util::source_selector(session.harness, id));
                 Ok((session, adapter, selector))
             })
             .collect::<Result<Vec<_>>>()?;
