@@ -4,6 +4,7 @@ mod context;
 mod identity;
 mod interaction;
 mod media;
+mod payload;
 mod render;
 mod wire;
 use super::super::store::{bytes::ByteSource, sqlite};
@@ -83,21 +84,26 @@ fn calls(file: &File, p: &Proto, out: &mut impl Write) -> Result<()> {
     Ok(())
 }
 fn project(file: &File, step: &Proto, index: u64, complete: bool, out: &mut impl Write) -> Result<()> {
-    let kind = if step.last(19).is_some() {
-        "USER_INPUT"
-    } else if step.last(20).is_some() {
-        "PLANNER_RESPONSE"
-    } else if step.last(140).is_some() {
-        "GENERIC"
-    } else if step.last(114).is_some() {
-        "SYSTEM_MESSAGE"
-    } else if step.last(30).is_some() {
-        "CHECKPOINT"
-    } else if step.last(24).is_some() {
-        "ERROR_MESSAGE"
-    } else {
-        "NATIVE_UNKNOWN"
-    };
+    // The `step` member set names the type. A cleared row can lose its member and keep
+    // only `Step.type` (CortexStepType): its kind, order and tool identity still stand.
+    const KINDS: [(u32, u64, &str); 6] = [
+        (19, 14, "USER_INPUT"),
+        (20, 15, "PLANNER_RESPONSE"),
+        (140, 132, "GENERIC"),
+        (114, 101, "SYSTEM_MESSAGE"),
+        (30, 23, "CHECKPOINT"),
+        (24, 17, "ERROR_MESSAGE"),
+    ];
+    let declared = scalar(step, 1);
+    let (kind, payload) = KINDS
+        .iter()
+        .find_map(|(member, _, kind)| step.last(*member).map(|payload| (*kind, Some(payload))))
+        .or_else(|| {
+            let (_, _, kind) = KINDS.iter().find(|(_, ty, _)| declared == Some(*ty))?;
+            Some((*kind, None))
+        })
+        .unwrap_or(("NATIVE_UNKNOWN", None));
+    let payload = payload.map(|payload| payload.message(file)).transpose()?;
     let status = match scalar(step, 4).unwrap_or(0) {
         1 => "PENDING",
         2 => "RUNNING",
@@ -172,27 +178,24 @@ fn project(file: &File, step: &Proto, index: u64, complete: bool, out: &mut impl
     }
     let mut missing_attachments = false;
     interaction::project(file, step, out)?;
-    match kind {
-        "USER_INPUT" => {
-            let input = step.last(19).unwrap().message(file)?;
-            context::user(file, &input, out)?;
-            text(file, &input, 1, "content", out)?;
-            missing_attachments |= media::project(file, &input, 9, out)?;
+    match (kind, &payload) {
+        ("USER_INPUT", Some(input)) => {
+            context::user(file, input, out)?;
+            text(file, input, 1, "content", out)?;
+            missing_attachments |= media::project(file, input, 9, out)?;
         }
-        "PLANNER_RESPONSE" => {
-            let response = step.last(20).unwrap().message(file)?;
-            text(file, &response, 1, "content", out)?;
-            text(file, &response, 3, "thinking", out)?;
-            text(file, &response, 4, "thinking_signature", out)?;
-            if scalar(&response, 5) == Some(1) {
+        ("PLANNER_RESPONSE", Some(response)) => {
+            text(file, response, 1, "content", out)?;
+            text(file, response, 3, "thinking", out)?;
+            text(file, response, 4, "thinking_signature", out)?;
+            if scalar(response, 5) == Some(1) {
                 out.write_all(b",\"thinking_redacted\":true")?;
             }
-            calls(file, &response, out)?;
-            identity::planner(file, &response, out)?;
-            missing_attachments |= media::project(file, &response, 20, out)?;
+            calls(file, response, out)?;
+            identity::planner(file, response, out)?;
+            missing_attachments |= media::project(file, response, 20, out)?;
         }
-        "GENERIC" => {
-            let generic = step.last(140).unwrap().message(file)?;
+        ("GENERIC", Some(generic)) => {
             if let Some(field) = generic.last(2) {
                 let result = field.message(file)?;
                 let has_content = if result.last(1).is_some() {
@@ -213,17 +216,18 @@ fn project(file: &File, step: &Proto, index: u64, complete: bool, out: &mut impl
                     }
                 }
                 text(file, &result, 7, "native_output_uri", out)?;
+                if let Some(any) = result.last(6) {
+                    payload::project(file, &any.message(file)?, out)?;
+                }
                 missing_attachments |= media::project(file, &result, 4, out)?;
             }
         }
-        "SYSTEM_MESSAGE" => {
-            let message = step.last(114).unwrap().message(file)?;
-            text(file, &message, 1, "content", out)?;
-            missing_attachments |= media::project(file, &message, 6, out)?;
+        ("SYSTEM_MESSAGE", Some(message)) => {
+            text(file, message, 1, "content", out)?;
+            missing_attachments |= media::project(file, message, 6, out)?;
         }
-        "CHECKPOINT" => text(file, &step.last(30).unwrap().message(file)?, 5, "content", out)?,
-        "ERROR_MESSAGE" => {
-            let message = step.last(24).unwrap().message(file)?;
+        ("CHECKPOINT", Some(checkpoint)) => text(file, checkpoint, 5, "content", out)?,
+        ("ERROR_MESSAGE", Some(message)) => {
             if let Some(error) = message.last(3) {
                 let error = error.message(file)?;
                 let preferred = [1, 9, 3, 2, 5].into_iter().find(|number| error.last(*number).is_some());

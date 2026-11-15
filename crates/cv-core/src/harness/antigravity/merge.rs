@@ -19,6 +19,8 @@ pub(super) struct Match {
     pub interaction: Option<Value>,
     /// The native revision of a result whose body is not the exported one.
     pub revised: Option<Revised>,
+    /// The typed result of the verified revision; not kept for a result matched by call alone.
+    pub payload: Option<Value>,
 }
 /// The writer keeps revising a tool step after exporting it: a backgrounded command's
 /// acknowledgement stays `RUNNING` in the log while the store records how it ended.
@@ -398,6 +400,7 @@ pub(super) fn verified(
                 matched.usage = parse_step_usage(&fields)?;
                 matched.planner_details = fields.value("native_planner_details")?;
                 matched.interaction = fields.value("native_interaction")?;
+                matched.payload = fields.value("native_payload")?;
             }
             Ok(Some(matched))
         })?;

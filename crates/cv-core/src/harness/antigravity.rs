@@ -1651,6 +1651,7 @@ const STEP_KEYS: &[&str] = &[
     "thinking_signature",
     "thinking_redacted",
     "native_output_uri",
+    "native_payload",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1973,14 +1974,24 @@ impl StepCodec {
                 #[cfg(feature = "sqlite")]
                 let explicit_id =
                     explicit_id.or_else(|| self.enrich.verified.get(&step_index).and_then(|m| m.result.clone()));
-                let selected = if let Some(id) = &explicit_id {
-                    self.state
-                        .pending_calls
-                        .iter()
-                        .position(|call| &call.id == id)
-                        .and_then(|at| self.state.pending_calls.remove(at))
-                } else {
-                    self.state.pending_calls.pop_front()
+                // A native id cannot name a call whose own id was not recoverable (its planner
+                // row was cleared, so the exported call has a derived id): such calls are
+                // answered in order, which the planner step's inferred identity discloses.
+                let derived = derived_call_id("antigravity", "");
+                let selected = match &explicit_id {
+                    Some(id) => match self.state.pending_calls.iter().position(|call| &call.id == id) {
+                        Some(at) => self.state.pending_calls.remove(at),
+                        None if self
+                            .state
+                            .pending_calls
+                            .front()
+                            .is_some_and(|call| call.id.starts_with(&derived)) =>
+                        {
+                            self.state.pending_calls.pop_front()
+                        }
+                        None => None,
+                    },
+                    None => self.state.pending_calls.pop_front(),
                 };
                 let (tool_use_id, tool_name) = match selected {
                     Some(call) => (call.id, Some(call.name)),
@@ -2024,22 +2035,36 @@ impl StepCodec {
                     .and_then(|uri| file_uri_to_path(&uri))
                     .map(|path| path.to_string_lossy().into_owned())
                     .or_else(|| extract_persisted_output_path(&head));
-                let details = persisted.map(|claimed| {
+                let mut details = persisted.map(|claimed| {
                     let resolved = self
                         .source_path
                         .as_deref()
                         .and_then(|transcript| spilled_output(transcript, &claimed));
                     json!({ "persistedOutput": Block::persisted_output(resolved, &claimed, None) })
                 });
+                let payload = fields.value("native_payload")?;
+                #[cfg(feature = "sqlite")]
+                let payload = payload.or_else(|| self.enrich.verified.get(&step_index).and_then(|m| m.payload.clone()));
 
-                let spawned = match tool_name.as_deref() {
+                // The typed result names every child; the text names at most the first.
+                let typed = payload
+                    .as_ref()
+                    .filter(|_| tool_name.as_deref() == Some("invoke_subagent"))
+                    .and_then(|payload| payload.get("conversation_ids")?.as_array())
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|id| id.as_str().map(str::to_owned));
+                let named = match tool_name.as_deref() {
                     Some("invoke_subagent") => extract_spawned_conversation_id(&head),
                     Some("swarm") => extract_swarm_added(&head),
                     _ => None,
                 };
-                if let Some(child_id) = spawned {
+                for child_id in typed.chain(named) {
                     self.state.child_ids.insert(child_id.clone());
                     self.state.spawned_children.insert(child_id, tool_use_id.clone());
+                }
+                if let Some(payload) = payload {
+                    details.get_or_insert_with(|| json!({}))["payload"] = payload;
                 }
 
                 let error_text = fields.string("error")?.filter(|e| !e.is_empty());

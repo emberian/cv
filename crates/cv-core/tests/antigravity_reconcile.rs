@@ -424,3 +424,39 @@ fn identical_bodies_at_two_indices_keep_their_own_native_usage() {
         .collect();
     assert_eq!(reasoning, [11, 22]);
 }
+
+#[test]
+fn a_native_result_answers_an_exported_call_whose_planner_row_was_cleared() {
+    // The cleared planner row keeps no call ids; the cancelled result exists only natively.
+    let session = read(
+        "agy-reconcile-cleared-planner",
+        &[
+            (0, prompt(0, "Check the target")),
+            (1, step(15, 5, Some((20, vec![])), metadata(1, None, None))),
+            (2, result(2, 6, "native-X", "cancelled")),
+            (3, planner(3, "Stopped", &[], None)),
+        ],
+        &[
+            exported_prompt(0, 0, "Check the target"),
+            exported(
+                1,
+                1,
+                "PLANNER_RESPONSE",
+                "DONE",
+                json!({"content":"Checking","tool_calls":[{"name":"run_command","args":{}}]}),
+            ),
+            exported_planner(3, 3, "Stopped", false),
+        ],
+    );
+    let call = session
+        .messages
+        .iter()
+        .flat_map(|m| &m.content)
+        .find_map(|block| match block {
+            Block::ToolUse { id, .. } => Some(id.as_str()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(result_ids(&session), [call], "the result must not be orphaned");
+    assert!(limitations(&session).contains(ReadCoverage::INFERRED_TOOL_IDENTITY));
+}
