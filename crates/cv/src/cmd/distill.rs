@@ -167,6 +167,23 @@ pub(crate) struct Emitted {
     pub(crate) path: Option<PathBuf>,
     pub(crate) sidecar_path: Option<PathBuf>,
     pub(crate) resume: Option<String>,
+    /// Size on disk of the transcript the harness reads, envelopes and escaping included.
+    pub(crate) transcript_bytes: Option<u64>,
+    /// Size on disk of the elided outputs. `cv cat` reads them; the harness never loads them.
+    pub(crate) sidecar_bytes: Option<u64>,
+}
+
+impl Emitted {
+    fn sized(mut self) -> Self {
+        let size = |path: &Option<PathBuf>| {
+            path.as_ref()
+                .and_then(|path| std::fs::metadata(path).ok())
+                .map(|meta| meta.len())
+        };
+        self.transcript_bytes = size(&self.path);
+        self.sidecar_bytes = size(&self.sidecar_path);
+        self
+    }
 }
 
 fn write_sidecar(transcript: &Path, elided: &[cv_core::distill::Elided]) -> Result<Option<PathBuf>> {
@@ -221,7 +238,9 @@ pub(crate) fn emit_to(
                 path: Some(res.path),
                 sidecar_path: sidecar,
                 resume: Some(resume),
-            })
+                ..Default::default()
+            }
+            .sized())
         }
         Target::AgentOf { root, model } => {
             let root = root_transcript(root)?;
@@ -278,7 +297,9 @@ pub(crate) fn emit_to(
                 resume: Some(format!(
                     "from the root session: SendMessage to=\"{agent}\" with the next instruction"
                 )),
-            })
+                ..Default::default()
+            }
+            .sized())
         }
     }
 }
@@ -365,7 +386,7 @@ fn root_transcript(root: &str) -> Result<SessionRef> {
 }
 
 /// The human report (stderr side of [`report`]).
-fn report_text(d: &Distilled, e: &Emitted) -> String {
+fn report_text(d: &Distilled, e: &Emitted, measured: &cv_core::distill::Measured) -> String {
     let mut h = String::new();
     let s = &d.stats;
     let before = s.recorded_context_tokens.unwrap_or(s.source_est_tokens);
@@ -393,11 +414,26 @@ fn report_text(d: &Distilled, e: &Emitted) -> String {
         "  ↳ kept: brief, {} timeline entries, {} commits, {} errors; elided {} tool outputs",
         s.timeline_entries, s.commits, s.errors, s.elided_outputs
     );
+    let _ = writeln!(
+        h,
+        "  ↳ budget measured on the {}: {} bytes, ~{} tokens by cv's byte estimate (the harness's own system prompt and tools come on top)",
+        measured.what, measured.bytes, measured.estimated_tokens
+    );
+    let on_disk = |bytes: Option<u64>| {
+        bytes
+            .map(|bytes| format!(" ({bytes} bytes on disk)"))
+            .unwrap_or_default()
+    };
     if let Some(p) = &e.path {
-        let _ = writeln!(h, "  ↳ wrote {}", p.display());
+        let _ = writeln!(h, "  ↳ wrote {}{}", p.display(), on_disk(e.transcript_bytes));
     }
     if let Some(p) = &e.sidecar_path {
-        let _ = writeln!(h, "  ↳ sidecar {}", p.display());
+        let _ = writeln!(
+            h,
+            "  ↳ sidecar {}{}, never loaded by the harness",
+            p.display(),
+            on_disk(e.sidecar_bytes)
+        );
     }
     if let Some(r) = &e.resume {
         let _ = writeln!(h, "  ↳ resume: {r}");
@@ -468,14 +504,21 @@ pub(crate) fn cmd_distill(
         with_sources.push((o.id.clone(), o.harness.as_str().to_string()));
         d.append_findings(&findings(&o, &opts)?);
     }
-    d.check_budget(max_bytes, max_estimated_tokens)?;
     let description = format!("distilled: {}", d.label());
-    let (d, emitted) = match products {
-        Products::Pack(d) => (d, Emitted::default()),
+    // The ceiling applies to what the target loads: the pack itself, or the session about to be
+    // emitted. Either is measured whole, after every --with source, before anything is written.
+    let (d, emitted, measured) = match products {
+        Products::Pack(d) => {
+            let measured = d.pack_load();
+            measured.check(max_bytes, max_estimated_tokens)?;
+            (d, Emitted::default(), measured)
+        }
         Products::Resume(prepared) => {
             let (d, ir) = prepared.into_resumable_session(&s);
+            let measured = cv_core::distill::session_load(&ir)?;
+            measured.check(max_bytes, max_estimated_tokens)?;
             let emitted = emit_to(&ir, &target, &d.elided, &src_path, &description)?;
-            (d, emitted)
+            (d, emitted, measured)
         }
     };
     let derived_id = match (&emitted.agent_id, &emitted.session_id) {
@@ -510,7 +553,7 @@ pub(crate) fn cmd_distill(
             );
         }
     }
-    let mut h = report_text(&d, &emitted);
+    let mut h = report_text(&d, &emitted, &measured);
     if let Some(grown) = &grown {
         let _ = writeln!(h, "  ↳ read {grown}");
     }
@@ -532,8 +575,7 @@ pub(crate) fn cmd_distill(
         crate::util::write_user_file(p, d.pack().as_bytes(), force)?;
         let _ = writeln!(h, "  ↳ pack {}", p.display());
     }
-    let mut out =
-        json!({"stats": d.stats, "emitted": emitted, "pack_path": pack, "retired": retired, "unsettled": d.unsettled});
+    let mut out = json!({"stats": d.stats, "emitted": emitted, "pack_path": pack, "retired": retired, "unsettled": d.unsettled, "budget": measured});
     if let Some(grown) = grown {
         out["grown"] = json!(grown);
     }

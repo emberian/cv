@@ -47,6 +47,98 @@ fn distill_budget_checks_aggregate_before_publishing() {
 }
 
 #[test]
+fn distill_budget_names_and_measures_what_the_target_loads() {
+    let w = World::new("distill-budget-measured");
+    source(&w, "measured-source", false);
+    let (ok, _, pack, err) = w.cv(&["distill", "measured-source"]);
+    assert!(ok, "{err}");
+    let json = |args: &[&str]| -> serde_json::Value {
+        let (ok, _, report, err) = w.cv(args);
+        assert!(ok, "{err}");
+        serde_json::from_str(&report).unwrap()
+    };
+    let packed = json(&["distill", "measured-source", "--json"]);
+    assert_eq!(packed["budget"]["what"], "markdown pack");
+    assert_eq!(packed["budget"]["bytes"], pack.len());
+    // A resumable session loads the preamble and the tail's real turns, not the Markdown tail.
+    let first = w.base.join("first");
+    let resumed = json(&[
+        "distill",
+        "measured-source",
+        "--session",
+        "--out",
+        first.to_str().unwrap(),
+        "--json",
+    ]);
+    let what = resumed["budget"]["what"].as_str().unwrap();
+    assert!(what.starts_with("resumable session content"), "{resumed}");
+    let loaded = resumed["budget"]["bytes"].as_u64().unwrap();
+    let transcript = std::path::PathBuf::from(resumed["emitted"]["path"].as_str().unwrap());
+    let opening = std::fs::read_to_string(&transcript).unwrap();
+    let opening: serde_json::Value =
+        serde_json::from_str(opening.lines().find(|line| line.contains("[cv distill]")).unwrap()).unwrap();
+    let prompt = opening["message"]["content"]
+        .as_str()
+        .map(str::len)
+        .unwrap_or_else(|| opening["message"]["content"][0]["text"].as_str().unwrap().len());
+    assert!(
+        loaded >= prompt as u64 && prompt > packed["stats"]["pack_est_tokens"].as_u64().unwrap() as usize,
+        "{resumed}"
+    );
+    assert_eq!(
+        resumed["emitted"]["transcript_bytes"],
+        std::fs::metadata(&transcript).unwrap().len()
+    );
+    assert!(resumed["emitted"]["transcript_bytes"].as_u64().unwrap() > loaded);
+    // One byte under what would be loaded refuses and writes nothing; the exact size is accepted.
+    let refused = w.base.join("refused");
+    let under = (loaded - 1).to_string();
+    let (ok, _, _, err) = w.cv(&[
+        "distill",
+        "measured-source",
+        "--session",
+        "--out",
+        refused.to_str().unwrap(),
+        "--max-bytes",
+        &under,
+    ]);
+    assert!(!ok);
+    assert!(
+        err.contains("resumable session content") && err.contains("exceeding --max-bytes"),
+        "{err}"
+    );
+    assert!(!refused.exists());
+    let exact = w.base.join("exact");
+    let (ok, _, _, err) = w.cv(&[
+        "distill",
+        "measured-source",
+        "--session",
+        "--out",
+        exact.to_str().unwrap(),
+        "--max-bytes",
+        &loaded.to_string(),
+    ]);
+    assert!(ok, "{err}");
+    assert!(
+        err.contains("budget measured on the resumable session content"),
+        "{err}"
+    );
+    let tokens = (resumed["budget"]["estimated_tokens"].as_u64().unwrap() - 1).to_string();
+    let (ok, _, _, err) = w.cv(&[
+        "distill",
+        "measured-source",
+        "--session",
+        "--out",
+        refused.to_str().unwrap(),
+        "--max-estimated-tokens",
+        &tokens,
+    ]);
+    assert!(!ok);
+    assert!(err.contains("system prompt and tools come on top"), "{err}");
+    assert!(!refused.exists());
+}
+
+#[test]
 fn distill_unsettled_refuses_resume_but_allows_explicit_snapshot() {
     let w = World::new("distill-unsettled");
     source(&w, "unsettled-source", true);

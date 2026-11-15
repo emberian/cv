@@ -138,6 +138,63 @@ pub struct Unsettled {
     pub why: String,
 }
 
+/// The quantity a budget was checked against. Bytes are exact. Tokens are cv's byte estimate,
+/// not a tokenizer's count, and exclude what the target harness adds itself (its system prompt
+/// and tool definitions).
+#[derive(Debug, Clone, Serialize)]
+pub struct Measured {
+    pub what: &'static str,
+    pub bytes: usize,
+    pub estimated_tokens: u64,
+}
+
+impl Measured {
+    /// Refuse rather than truncate: nothing was emitted when this fails.
+    pub fn check(&self, max_bytes: Option<usize>, max_estimated_tokens: Option<u64>) -> anyhow::Result<()> {
+        let Measured {
+            what,
+            bytes,
+            estimated_tokens,
+        } = self;
+        if let Some(limit) = max_bytes {
+            anyhow::ensure!(
+                *bytes <= limit,
+                "{what} is {bytes} bytes, exceeding --max-bytes {limit}; nothing emitted"
+            );
+        }
+        if let Some(limit) = max_estimated_tokens {
+            anyhow::ensure!(
+                *estimated_tokens <= limit,
+                "{what} is approximately {estimated_tokens} tokens by cv's byte heuristic (the harness's own \
+                 system prompt and tools come on top), exceeding --max-estimated-tokens {limit}; nothing emitted"
+            );
+        }
+        Ok(())
+    }
+}
+
+/// What a harness loads into context from a resumable session: every block's model-visible
+/// content (the opening prompt with its preamble and pack, then the tail's real turns). Record
+/// envelopes and JSON escaping in the emitted file are not content, and the sidecar is never
+/// loaded.
+pub fn session_load(session: &Session) -> anyhow::Result<Measured> {
+    let (mut bytes, mut estimated_tokens) = (0usize, 0u64);
+    for block in session.messages.iter().flat_map(|message| &message.content) {
+        estimated_tokens += est_tokens(block)?;
+        bytes += match block {
+            Block::Text { text } | Block::ToolResult { content: text, .. } => text.len(),
+            Block::Thinking { text, signature, .. } => text.len() + signature.as_ref().map_or(0, String::len),
+            Block::ToolUse { input, .. } => serde_json::to_string(input.resolve()?.as_ref())?.len(),
+            _ => 0,
+        };
+    }
+    Ok(Measured {
+        what: "resumable session content (preamble, pack and tail turns)",
+        bytes,
+        estimated_tokens,
+    })
+}
+
 /// The result of [`prepare_distill`].
 #[derive(Debug, Clone)]
 pub struct Distilled {
@@ -182,22 +239,19 @@ impl Distilled {
         self.stats.distilled_est_tokens = self.stats.pack_est_tokens + self.stats.tail_est_tokens;
     }
 
-    /// Refuse an oversized aggregate after all findings have been appended. The token
-    /// ceiling uses cv's documented byte estimate, not a model tokenizer or context limit.
+    /// The Markdown pack as a budget quantity: its exact bytes, and cv's estimate of the pack
+    /// head plus the tail's real turns.
+    pub fn pack_load(&self) -> Measured {
+        Measured {
+            what: "markdown pack",
+            bytes: self.head_md.len().saturating_add(self.tail_md.len()),
+            estimated_tokens: self.stats.distilled_est_tokens,
+        }
+    }
+
+    /// Refuse an oversized Markdown pack after all findings have been appended.
     pub fn check_budget(&self, max_bytes: Option<usize>, max_estimated_tokens: Option<u64>) -> anyhow::Result<()> {
-        let bytes = self.head_md.len().saturating_add(self.tail_md.len());
-        if let Some(limit) = max_bytes {
-            anyhow::ensure!(
-                bytes <= limit,
-                "distilled pack is {bytes} bytes, exceeding --max-bytes {limit}; nothing emitted"
-            );
-        }
-        if let Some(limit) = max_estimated_tokens {
-            anyhow::ensure!(self.stats.distilled_est_tokens <= limit,
-                "distilled context is approximately {} tokens by cv's byte heuristic, exceeding --max-estimated-tokens {limit}; nothing emitted",
-                self.stats.distilled_est_tokens);
-        }
-        Ok(())
+        self.pack_load().check(max_bytes, max_estimated_tokens)
     }
 
     /// The standalone markdown context pack: a fresh agent's first message (candidate c).

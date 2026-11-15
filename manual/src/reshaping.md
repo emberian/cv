@@ -88,25 +88,44 @@ lane never wrote down (it was in signature-only thinking).
 
 ## Budgets and unfinished work
 
-`cv distill ID --max-bytes 200000` refuses an aggregate Markdown pack over the exact UTF-8
-byte limit, including the tail and every `--with` finding. `--max-estimated-tokens 80000`
-limits cv's existing head-plus-tail token estimate. This is a byte heuristic, not a tokenizer
-measurement or a guarantee about a model's context window; harness system prompts, tool
-schemas and the resume preamble cost additional context. Both limits are checked before
-publishing a session, sidecar, pack, lineage edge or source retirement. Nothing is silently
-trimmed to meet them.
+`cv distill ID --max-bytes 200000` refuses output over an exact UTF-8 byte limit, and
+`--max-estimated-tokens 80000` output over cv's token estimate. Both measure what the target
+loads, whole, after every `--with` finding:
 
-Resumable `--session` and `--agent-of` outputs refuse when the source grew during capture or
-calls lack observed terminal results. Missing results establish uncertainty, not that a job is
-still running. Explicit failures and cancellations settle calls. Claude background launches
-remain unsettled until their native task notification (queued or delivered); Antigravity
-background launches settle when their matching task completion or terminal status poll arrives.
-Codex cells and PTY sessions remain unsettled until their explicit completion; a finished Code
-Mode wrapper does not settle a nested process. These completions are attributed to the command that launched them, and running output is not a build verdict.
+- a standalone pack: the Markdown pack;
+- `--session` and `--agent-of`: the content of the session about to be emitted, which is the
+  preamble, the pack and the tail's real turns. The transcript file is larger (record envelopes,
+  JSON escaping) and the sidecar of elided outputs is never loaded; the report gives both sizes
+  on disk.
 
-Use `--allow-unsettled` for an intentional snapshot after inspecting the source. The emitted
-context lists unresolved call IDs, as standalone packs always do. This does not stop or join
-jobs, and cannot recover job identity or completion evidence that the harness has discarded.
+The report and `--json` (`budget`) name the quantity measured. The token figure is a byte
+heuristic, not a tokenizer's count or a guarantee about a context window, and the harness adds
+its own system prompt and tool schemas on top. Both limits are checked before publishing a
+session, sidecar, pack, lineage edge or source retirement. Nothing is trimmed to meet them.
+
+Resumable `--session` and `--agent-of` outputs refuse when the source grew during capture or a
+call has no terminal evidence, and the refusal lists each such call with what is missing. A
+missing result establishes uncertainty, not that a job is still running. Explicit failures and
+cancellations settle calls. Background work settles only from evidence that names it:
+
+- Claude: a launch (a background command, one moved to the background on timeout or by a
+  message, an agent, an agent resumed by `SendMessage`, a monitor, a workflow) stays open until
+  a task notification for it, a `TaskOutput` poll whose payload status is terminal, a `TaskStop`
+  acknowledgement naming it, or a monitor's expiry notice. A poll that merely returned settles
+  nothing.
+- Antigravity: a matching task completion or cancellation message, a terminal status poll, or
+  a kill acknowledgement naming the task.
+- Codex: a cell or PTY session ends from its own result. In a script with several process
+  calls, results are attributed only when there is exactly one per call, in order; a finished
+  Code Mode wrapper does not settle a process it left running.
+
+A completion is attributed to the command that launched the job, and running output is not a
+build verdict.
+
+Use `--allow-unsettled` for an intentional snapshot after inspecting the source. The pack's
+hand-off lists every unresolved call (label, id, what is missing), in standalone packs too, and
+`--json` carries them as `unsettled`. This does not stop or join jobs, and cannot recover job
+identity or completion evidence that the harness has discarded.
 
 ## The dangling-parent trap
 

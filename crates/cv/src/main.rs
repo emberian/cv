@@ -658,13 +658,15 @@ enum Cmd {
         /// Keep the agent's thinking blocks inside the verbatim tail (dropped by default).
         #[arg(long)]
         keep_tail_thinking: bool,
-        /// Refuse an aggregate markdown pack above this byte count, including --with findings.
+        /// Refuse output above this byte count, --with findings included: the Markdown pack, or with
+        /// --session/--agent-of the content of the session to be emitted (preamble, pack, tail turns).
         #[arg(long)]
         max_bytes: Option<usize>,
-        /// Refuse context above cv's byte-based token estimate (not a model tokenizer limit).
+        /// Refuse the same quantity above cv's byte-based token estimate (not a tokenizer's count; the
+        /// harness's own system prompt and tools come on top).
         #[arg(long)]
         max_estimated_tokens: Option<u64>,
-        /// Allow resumable output when calls lack terminal results or the source grew during reading.
+        /// Allow resumable output when calls lack terminal evidence or the source grew during reading.
         #[arg(long)]
         allow_unsettled: bool,
         /// Omit the one-line-per-tool-call ledger.
