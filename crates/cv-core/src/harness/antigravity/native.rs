@@ -247,7 +247,7 @@ fn project(file: &File, step: &Proto, index: u64, complete: bool, out: &mut impl
             if n == 0 {
                 break;
             }
-            for (byte, pair) in bytes[..n].iter().zip(hex.chunks_exact_mut(2)) {
+            for (byte, pair) in bytes[..n].iter().zip(hex.as_chunks_mut::<2>().0) {
                 pair[0] = digits[(byte >> 4) as usize];
                 pair[1] = digits[(byte & 15) as usize];
             }
