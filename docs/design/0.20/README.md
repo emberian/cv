@@ -33,10 +33,12 @@ has landed. The existing adapter, IR, query API and routes remain the product sh
 |---|---|---|
 | agy_native | Bounded protobuf reader, SQLite-only discovery, reconciliation, exact native associations and payloads | Implementing |
 | agy_coverage | Native contract/feature matrix, scrubbed real-store fixtures, adversarial lifecycle tests and independent review | Implementing |
-| atomic_index | Shared bounded staging and coherent FTS/event/count/baseline publication | Implementing |
-| search_work | Prepared/batch search, frozen work accounting and repeated-query regression checks | Implementing |
+| atomic_index | Shared bounded staging and coherent FTS/event/count/baseline publication | Foundation integrated; compatible rebuild retention in progress |
+| index_migration | Build and validate replacement schema before atomically publishing it | Implementing |
+| search_work | Prepared/batch search, frozen work accounting and repeated-query regression checks | Prepared reader and batch CLI integrated; default-query investigation continues |
 | handoff | Distill budgets, unfinished work, supersession and resumability | Implementing |
-| fidelity | Shared coverage contract and show/doctor/API visibility | Core contract integrated; consumers in progress |
+| fidelity | Shared coverage contract and show/doctor/API visibility | Contract and consumers integrated; native composition tests in progress |
+| backlog_audit | Reconcile historical tasks and independently review consumer contracts | Inventory and corrections integrated |
 | integration | Resolve interfaces, reconcile backlog, integrate, run composed release gates and install | Active |
 
 Each lane uses its own worktree, target and scratch CV home. Harness homes are
@@ -78,12 +80,10 @@ in-flight handoff and parent-chain validation need code/test reconciliation.
 Task display and duplicate-title UX are secondary candidates, not substitutes for
 release outcomes above. Real task stores are not mutated by this work.
 
-`COMPLEXITY.md` still describes the exports roster-cache cliff as open, while the
-current reader contains an offset-index fallback. Verify its composed behavior and
-then reconcile the document; do not reimplement an already-landed mechanism.
-`DATAPATHS.md` also carries dated open claims and fleet measurements. Update claims
-only against actual code and tests. Fresh fleet measurements belong in commit
-messages, not committed result files.
+The audit verified the existing export offset-index fallback and corrected stale
+roster-cache, retired-command and task-authority claims. Remaining costs and exact
+task dispositions are in [BACKLOG.md](BACKLOG.md). Fresh fleet measurements belong
+in commit messages, not committed result files.
 
 ## Integration findings
 
@@ -96,6 +96,12 @@ messages, not committed result files.
 - Several historical task-ledger items describe machinery intentionally removed
   by the current task contract. Reconciliation must distinguish removed designs,
   implemented work needing closure, and reproduced defects.
+- Native `CLEARED` is not a completion verdict and does not mean every field was
+  removed. Real records retain useful rendered text; decode available content while
+  reporting the historical payload loss.
+- Prepared search holds an explicitly indexed snapshot. Ordinary frozen search
+  still assesses source freshness and can enrich snippets; its remaining costs
+  must be measured separately rather than declared fixed by the batch mode.
 
 ## Integration and release
 
