@@ -381,6 +381,30 @@ fn plan(
         Some(consumer) if indexed.is_some() => cv_core::source::Table::<InIndex>::load(&consumer),
         _ => Default::default(),
     };
+    // Dependency rows are mutable independently of a held Tantivy reader. A replacement can
+    // publish a new baseline with the same (mtime, size), which must not certify older docs.
+    // Check *after* loading the rows: a later commit cannot alter this owned table; a commit
+    // before/during the load makes the held coverage conservatively stale. Delete opstamps
+    // matter too: segment IDs alone would miss deletion-only commits.
+    let dependencies = if let Some(indexed) = &indexed {
+        let current = indexed
+            .searcher
+            .index()
+            .load_metas()
+            .context("checking query snapshot authority")?;
+        let segments: std::collections::BTreeMap<_, _> = current
+            .segments
+            .iter()
+            .map(|segment| (segment.id(), segment.delete_opstamp()))
+            .collect();
+        if &segments == indexed.searcher.generation().segments() {
+            dependencies
+        } else {
+            Default::default()
+        }
+    } else {
+        dependencies
+    };
     let reader = cv_core::resume::Reader::default();
     let mut probe = cv_core::source::Probe::default();
     let newest_indexed = existing

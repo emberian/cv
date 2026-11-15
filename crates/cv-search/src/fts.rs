@@ -5120,6 +5120,120 @@ mod tests {
     }
 
     #[test]
+    fn freshness_does_not_certify_old_snapshot_with_new_identity_restored_baseline() {
+        for (live, query, expected_reads) in [(LiveRead::Frozen, "oldneedle", 0), (LiveRead::All, "newneedle", 1)] {
+            let _home = IsolatedHome::new();
+            let (index, sources) = (tmpdir(), tmpdir());
+            let refs = vec![sref(
+                "changing",
+                "selected",
+                write_claude(&sources, "changing", "oldneedle"),
+            )];
+            index_refs(&index, &refs, false).unwrap();
+            let prepared = PreparedIndex::open(&index).unwrap();
+            let consumer = indexed_consumer(&index.join("cv-index-id")).unwrap();
+            let unchanged = search_suffixed(
+                &index,
+                "oldneedle",
+                1,
+                crate::SearchFilter::default(),
+                LiveRead::Frozen,
+                &refs,
+            )
+            .unwrap();
+            assert_eq!(unchanged.suffix.stale, 0);
+            let modified = std::fs::metadata(&refs[0].path).unwrap().modified().unwrap();
+            let answer = search_suffixed_allowed(&index, query, 1, crate::SearchFilter::default(), None, live, || {
+                write_claude(&sources, "changing", "newneedle");
+                std::fs::File::options()
+                    .write(true)
+                    .open(&refs[0].path)
+                    .unwrap()
+                    .set_times(std::fs::FileTimes::new().set_modified(modified))
+                    .unwrap();
+                index_refs(&index, &refs, false).unwrap();
+                assert_eq!(indexed_consumer(&index.join("cv-index-id")).unwrap(), consumer);
+                &refs
+            })
+            .unwrap();
+            assert_eq!(answer.total, 1, "the selected frozen/live revision must match");
+            assert_eq!(
+                answer.suffix.stale, 1,
+                "freshness must assess that same reader's older revision"
+            );
+            assert_eq!(answer.suffix.read, expected_reads);
+            let pinned = prepared
+                .search("oldneedle", 1, crate::SearchFilter::default(), None)
+                .unwrap();
+            assert_eq!(pinned.total, 1);
+            assert!(!pinned.source_freshness_assessed);
+        }
+    }
+
+    #[test]
+    fn freshness_rejects_dependency_authority_after_deletion_only_commit() {
+        let _home = IsolatedHome::new();
+        let (dir, sources) = (tmpdir(), tmpdir());
+        let refs = vec![sref(
+            "deleted-body",
+            "selected",
+            write_claude(&sources, "deleted-body", "oldneedle"),
+        )];
+        index_refs(&dir, &refs, false).unwrap();
+        let index = Index::open_in_dir(&*dir).unwrap();
+        let fields = fields_of(&index.schema()).unwrap();
+        // Put metadata and body in one segment, so deleting the body changes only its delete stamp.
+        let mut writer: tantivy::IndexWriter<TantivyDocument> = index.writer_with_num_threads(1, 50_000_000).unwrap();
+        writer.set_merge_policy(Box::new(tantivy::indexer::NoMergePolicy));
+        let ids: Vec<_> = index
+            .searchable_segment_metas()
+            .unwrap()
+            .iter()
+            .map(|segment| segment.id())
+            .collect();
+        if ids.len() > 1 {
+            writer.merge(&ids).wait().unwrap();
+        }
+        writer.commit().unwrap();
+        drop(writer);
+        let reader = index.reader().unwrap();
+        let held = reader.searcher();
+        assert_eq!(held.generation().segments().len(), 1);
+        let answer = search_suffixed_allowed(
+            &dir,
+            "oldneedle",
+            1,
+            crate::SearchFilter::default(),
+            None,
+            LiveRead::Frozen,
+            || {
+                let mut writer: tantivy::IndexWriter<TantivyDocument> =
+                    index.writer_with_num_threads(1, 50_000_000).unwrap();
+                writer.set_merge_policy(Box::new(tantivy::indexer::NoMergePolicy));
+                writer.delete_query(Box::new(kind_query(&fields, KIND_BODY))).unwrap();
+                writer.commit().unwrap();
+                let current: std::collections::BTreeMap<_, _> = index
+                    .load_metas()
+                    .unwrap()
+                    .segments
+                    .iter()
+                    .map(|segment| (segment.id(), segment.delete_opstamp()))
+                    .collect();
+                assert_eq!(
+                    current.keys().collect::<Vec<_>>(),
+                    held.generation().segments().keys().collect::<Vec<_>>()
+                );
+                assert_ne!(&current, held.generation().segments());
+                &refs
+            },
+        )
+        .unwrap();
+        assert_eq!(answer.total, 1);
+        assert_eq!(answer.suffix.stale, 1);
+        assert_eq!(answer.suffix.read, 0);
+    }
+
+    #[test]
     fn prepared_queries_pin_snapshot_bound_selected_reads_and_refresh() {
         let _home = IsolatedHome::new();
         let (index, sources) = (tmpdir(), tmpdir());

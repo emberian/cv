@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Search does not certify held results as fresh using dependency records from a concurrent index replacement.
+
 - Search retains last-good sessions through failed replacements and rebuilds; incomplete discovery updates healthy sessions without pruning unseen history.
 - Corrupt short search segments fail cleanly and can be rebuilt without panicking.
 
