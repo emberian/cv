@@ -4,6 +4,8 @@
 
 - Full-text search supports reusable indexed snapshots and NDJSON batch queries with explicit freshness semantics and per-query work counters.
 - Show, Markdown, doctor, and API metadata expose Antigravity read sources and known coverage gaps, including metadata-only members and unavailable payloads.
+- Distill enforces aggregate byte or estimated-token budgets before publication and requires explicit snapshots for unsettled calls.
+- Distill correlates Claude and Antigravity background completions with initiating commands, keeping unfinished output out of build verdicts.
 - Claude resume validation rejects cyclic parent links, including detached cycles.
 
 - Antigravity replays revised steps correctly, reads chunked history, preserves missing-child lanes, and enriches native lineage, usage, swarm, approval, and background-task events.

@@ -165,6 +165,24 @@ impl Distilled {
         self.stats.distilled_est_tokens = self.stats.pack_est_tokens + self.stats.tail_est_tokens;
     }
 
+    /// Refuse an oversized aggregate after all findings have been appended. The token
+    /// ceiling uses cv's documented byte estimate, not a model tokenizer or context limit.
+    pub fn check_budget(&self, max_bytes: Option<usize>, max_estimated_tokens: Option<u64>) -> anyhow::Result<()> {
+        let bytes = self.head_md.len().saturating_add(self.tail_md.len());
+        if let Some(limit) = max_bytes {
+            anyhow::ensure!(
+                bytes <= limit,
+                "distilled pack is {bytes} bytes, exceeding --max-bytes {limit}; nothing emitted"
+            );
+        }
+        if let Some(limit) = max_estimated_tokens {
+            anyhow::ensure!(self.stats.distilled_est_tokens <= limit,
+                "distilled context is approximately {} tokens by cv's byte heuristic, exceeding --max-estimated-tokens {limit}; nothing emitted",
+                self.stats.distilled_est_tokens);
+        }
+        Ok(())
+    }
+
     /// The standalone markdown context pack: a fresh agent's first message (candidate c).
     pub fn pack(&self) -> String {
         let mut s = self.head_md.clone();
@@ -214,6 +232,173 @@ enum Demand {
     Full,
     Pack,
     Findings,
+}
+
+/// Calls whose observed history does not establish a terminal result. Absence is
+/// uncertainty, not proof that a process is still running. Explicit cancellation and
+/// failure settle a call; a running result does not.
+pub fn unsettled_calls(session: &Session) -> anyhow::Result<Vec<String>> {
+    let mut open = std::collections::BTreeSet::new();
+    let mut jobs = HashMap::new();
+    let uses = tool_index(&session.messages);
+    let resolver = crate::lazy::Resolver::new(session.source_path.clone());
+    for message in &session.messages {
+        if session.harness == Harness::Claude {
+            if let Some((id, status, _)) = queued_task_notice(message).and_then(task_notice) {
+                if terminal_status(status) {
+                    open.remove(id);
+                } else {
+                    open.insert(id.to_owned());
+                }
+            }
+        }
+        for block in &message.content {
+            match block {
+                Block::ToolUse { id, .. } => {
+                    open.insert(id.clone());
+                }
+                Block::ToolResult {
+                    tool_use_id,
+                    status,
+                    content,
+                    is_error,
+                    ..
+                } => {
+                    // Lifecycle envelopes fit in a small prefix; do not decode entire logs again.
+                    let out = if matches!(session.harness, Harness::Claude | Harness::Antigravity) {
+                        crate::harness::store::document::text_head(content, &resolver, 2048, true)?.0
+                    } else {
+                        String::new()
+                    };
+                    if let Some(job) = background_job(session.harness, &out) {
+                        jobs.insert(job.to_owned(), tool_use_id.clone());
+                    }
+                    let name = uses.get(tool_use_id.as_str()).map(|call| call.name).unwrap_or("");
+                    if let Some((job, status)) = polled_task(session.harness, name, &out) {
+                        if terminal_status(status) {
+                            if let Some(id) = jobs.get(job) {
+                                open.remove(id);
+                            }
+                        }
+                    }
+                    if result_unsettled(session.harness, status.as_deref(), &out, *is_error) {
+                        open.insert(tool_use_id.clone());
+                    } else {
+                        open.remove(tool_use_id);
+                    }
+                }
+                Block::Text { text }
+                    if session.harness == Harness::Claude
+                        && matches!(message.kind, MessageKind::InjectedContext | MessageKind::SubagentReturn) =>
+                {
+                    let text = crate::harness::store::document::text_head(text, &resolver, 2048, true)?.0;
+                    if let Some((id, status, _)) = task_notice(&text) {
+                        if terminal_status(status) {
+                            open.remove(id);
+                        } else {
+                            open.insert(id.to_owned());
+                        }
+                    }
+                }
+                Block::Text { text }
+                    if session.harness == Harness::Antigravity && message.kind == MessageKind::InjectedContext =>
+                {
+                    let text = crate::harness::store::document::text_head(text, &resolver, 2048, true)?.0;
+                    if let Some((job, _)) = antigravity_completion(message, &text) {
+                        if let Some(id) = jobs.get(job) {
+                            open.remove(id);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(open.into_iter().collect())
+}
+
+fn terminal_status(status: &str) -> bool {
+    matches!(
+        status.trim().to_ascii_lowercase().as_str(),
+        "completed"
+            | "complete"
+            | "done"
+            | "success"
+            | "succeeded"
+            | "failed"
+            | "error"
+            | "invalid"
+            | "canceled"
+            | "cancelled"
+            | "killed"
+            | "stopped"
+    )
+}
+
+fn result_unsettled(harness: Harness, status: Option<&str>, out: &str, is_error: bool) -> bool {
+    if is_error {
+        return false;
+    }
+    if status.is_some_and(|s| !terminal_status(s)) {
+        return true;
+    }
+    background_job(harness, out).is_some()
+        || harness == Harness::Claude
+            && (out.starts_with("Command running in background with ID:")
+                || out.starts_with("Command running in the background with ID:")
+                || out.starts_with("Async agent launched successfully."))
+}
+
+/// Native Antigravity launch acknowledgement; skip only its timestamp envelope.
+fn background_job(harness: Harness, out: &str) -> Option<&str> {
+    if harness != Harness::Antigravity {
+        return None;
+    }
+    let body = out
+        .lines()
+        .find(|line| !line.starts_with("Created At:") && !line.starts_with("Completed At:"))?;
+    body.strip_prefix("Tool is running as a background task with task id: ")
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+}
+
+fn polled_task<'a>(harness: Harness, name: &str, out: &'a str) -> Option<(&'a str, &'a str)> {
+    if harness != Harness::Antigravity || name != "manage_task" {
+        return None;
+    }
+    let mut lines = out
+        .lines()
+        .filter(|line| !line.starts_with("Created At:") && !line.starts_with("Completed At:"));
+    let job = lines.next()?.strip_prefix("Task: ")?.trim();
+    let status = lines.next()?.strip_prefix("Status: ")?.trim();
+    Some((job, status))
+}
+
+fn antigravity_completion<'a>(message: &'a Message, body: &'a str) -> Option<(&'a str, &'a str)> {
+    let job = message.extra.get("antigravity")?.get("completed_task")?.as_str()?;
+    let marker = format!("content=Task id \"{job}\" finished with result:\n");
+    let (_, output) = body.split_once(&marker)?;
+    Some((job, output.trim_end_matches("</SYSTEM_MESSAGE>").trim()))
+}
+
+fn queued_task_notice(message: &Message) -> Option<&str> {
+    let row = message.extra.get(crate::ir::CARRIER_KEY)?;
+    (row.get("type")?.as_str()? == "queue-operation" && row.get("operation")?.as_str()? == "enqueue")
+        .then(|| row.get("content")?.as_str())
+        .flatten()
+}
+
+/// Claude's native completion wrapper names the initiating call, not a polling call.
+/// Only consume this on harness-injected messages; quoted user prose is not completion evidence.
+fn task_notice(text: &str) -> Option<(&str, &str, &str)> {
+    let text = text.strip_prefix("<task-notification>")?;
+    let tag = |name: &str| -> Option<&str> {
+        text.split_once(&format!("<{name}>"))?
+            .1
+            .split_once(&format!("</{name}>"))
+            .map(|(body, _)| body.trim())
+    };
+    Some((tag("tool-use-id")?, tag("status")?, tag("summary").unwrap_or("")))
 }
 
 /// Prepare the pack, statistics, sidecar roster and resumable tail together. CLI resume routes
@@ -1200,6 +1385,8 @@ fn analyze_with_policy(
     let retrieve_ref = opts.retrieve_ref.clone().unwrap_or_else(|| session.id.clone());
 
     let uses = tool_index(msgs);
+    let mut background_jobs: HashMap<String, String> = HashMap::new();
+    let mut completed_notices = HashSet::new();
     let tool_calls = uses.len();
 
     let tail_start = tail_cut(msgs, opts.keep_last, &uses);
@@ -1312,6 +1499,61 @@ fn analyze_with_policy(
 
     for (i, m) in msgs.iter().enumerate() {
         let in_tail = i >= tail_start;
+        if session.harness == Harness::Claude {
+            let body = if let Some(body) = queued_task_notice(m) {
+                Some(body.to_owned())
+            } else if matches!(m.kind, MessageKind::InjectedContext | MessageKind::SubagentReturn) {
+                cache.message_text(i)?
+            } else {
+                None
+            };
+            if let Some(body) = body {
+                if let Some((id, status, summary_text)) = task_notice(&body) {
+                    if terminal_status(status) && completed_notices.insert(body.clone()) {
+                        if let Some(call) = uses.get(id) {
+                            let summary = ToolInput::new(session.harness, call.name, call.input, false, true)?;
+                            let label = summary.label(session.harness, call.name);
+                            let output = format!("{status}: {summary_text}");
+                            scan_result_facts(
+                                session.harness,
+                                i,
+                                call.name,
+                                &summary,
+                                &label,
+                                &output,
+                                matches!(status, "failed" | "error"),
+                                &mut facts,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        if session.harness == Harness::Antigravity && m.kind == MessageKind::InjectedContext {
+            if let Some(body) = cache.message_text(i)? {
+                if let Some((job, output)) = antigravity_completion(m, &body) {
+                    if let Some(call) = background_jobs.get(job).and_then(|id| uses.get(id.as_str())) {
+                        let summary = ToolInput::new(session.harness, call.name, call.input, false, true)?;
+                        let label = summary.label(session.harness, call.name);
+                        let failed = output.lines().any(|line| {
+                            line.strip_prefix("Command exited with code ")
+                                .and_then(|code| code.trim_end_matches('.').parse::<i32>().ok())
+                                .is_some_and(|code| code != 0)
+                        });
+                        scan_result_facts(
+                            session.harness,
+                            i,
+                            call.name,
+                            &summary,
+                            &label,
+                            output,
+                            failed,
+                            &mut facts,
+                        );
+                    }
+                }
+            }
+        }
         match (m.role, m.kind) {
             (Role::User, MessageKind::Prompt) if demand != Demand::Findings => {
                 let raw = cache.message_text(i)?.unwrap_or_default();
@@ -1447,6 +1689,7 @@ fn analyze_with_policy(
                         tool_use_id,
                         is_error,
                         tool_name,
+                        status,
                         ..
                     } = b
                     else {
@@ -1462,8 +1705,55 @@ fn analyze_with_policy(
                     let out_cow = cache.resolve_tool_result(i, index)?;
                     let out = out_cow.as_ref();
                     let out_len = out.len();
-                    let outcome =
-                        scan_result_facts(session.harness, i, &name, &summary, &label, out, *is_error, &mut facts);
+                    if let Some(job) = background_job(session.harness, out) {
+                        background_jobs.insert(job.to_owned(), tool_use_id.clone());
+                    }
+                    let polled = polled_task(session.harness, &name, out)
+                        .filter(|(_, status)| terminal_status(status))
+                        .and_then(|(job, status)| {
+                            background_jobs
+                                .get(job)
+                                .and_then(|id| uses.get(id.as_str()))
+                                .map(|call| (call, status))
+                        });
+                    let outcome = if let Some((call, job_status)) = polled {
+                        let summary = ToolInput::new(session.harness, call.name, call.input, false, true)?;
+                        let label = summary.label(session.harness, call.name);
+                        let output = format!("{job_status}: {out}");
+                        let failed = matches!(job_status.to_ascii_lowercase().as_str(), "failed" | "error" | "invalid");
+                        if matches!(
+                            job_status.to_ascii_lowercase().as_str(),
+                            "canceled" | "cancelled" | "killed" | "stopped"
+                        ) {
+                            format!("{job_status}: {label}")
+                        } else {
+                            scan_result_facts(
+                                session.harness,
+                                i,
+                                call.name,
+                                &summary,
+                                &label,
+                                &output,
+                                failed,
+                                &mut facts,
+                            )
+                        }
+                    } else if result_unsettled(session.harness, status.as_deref(), out, *is_error) {
+                        "unfinished: no terminal result observed".to_owned()
+                    } else if status.as_deref().is_some_and(|s| {
+                        matches!(
+                            s.to_ascii_lowercase().as_str(),
+                            "canceled" | "cancelled" | "killed" | "stopped"
+                        )
+                    }) {
+                        "stopped: no successful completion implied".to_owned()
+                    } else {
+                        let failed = *is_error
+                            || status.as_deref().is_some_and(|s| {
+                                matches!(s.to_ascii_lowercase().as_str(), "failed" | "error" | "invalid")
+                            });
+                        scan_result_facts(session.harness, i, &name, &summary, &label, out, failed, &mut facts)
+                    };
                     if let Some(p) = doc_reads.get(tool_use_id.as_str()) {
                         if !in_tail && demand != Demand::Findings && last_read_of.get(p) == Some(&tool_use_id.as_str())
                         {
@@ -3197,6 +3487,221 @@ pub(crate) mod tests {
             status: None,
             details: None,
         }
+    }
+
+    #[test]
+    fn aggregate_budgets_refuse_without_truncating() -> anyhow::Result<()> {
+        let s = Session::new("budget", Harness::Claude);
+        let mut d = distill_pack(&s, &Default::default())?;
+        let bytes = d.pack().len();
+        let tokens = d.stats.distilled_est_tokens;
+        d.check_budget(Some(bytes), Some(tokens))?;
+        assert!(d.check_budget(Some(bytes - 1), None).is_err());
+        assert!(d.check_budget(None, Some(tokens - 1)).is_err());
+        d.append_findings("Additional lane findings: λλλλλλλλλλλλλλλλλλλλ");
+        assert!(d.check_budget(Some(bytes), None).is_err());
+        assert!(d.check_budget(None, Some(tokens)).is_err());
+        assert!(d.pack().contains("Additional lane findings"));
+        Ok(())
+    }
+
+    #[test]
+    fn unfinished_results_are_not_verdicts_and_terminal_results_settle() -> anyhow::Result<()> {
+        let mut s = Session::new("unfinished", Harness::Antigravity);
+        let mut pending = result("build", "test result: ok. 12 passed", false);
+        if let Block::ToolResult { status, .. } = &mut pending {
+            *status = Some("running".into());
+        }
+        s.messages = vec![
+            msg(
+                Role::Assistant,
+                MessageKind::Reply,
+                vec![call("build", "cargo test", "test the build")],
+            ),
+            msg(Role::Tool, MessageKind::ToolResult, vec![pending]),
+        ];
+        assert_eq!(unsettled_calls(&s)?, vec!["build"]);
+        let d = distill_pack(
+            &s,
+            &DistillOptions {
+                keep_last: 0,
+                ..Default::default()
+            },
+        )?;
+        assert!(!d.head_md.contains("**Build/test verdicts**"), "{}", d.head_md);
+        for status in ["completed", "failed", "canceled", "cancelled", "error", "killed"] {
+            let mut done = result("build", "test result: FAILED. 1 failed", status == "failed");
+            if let Block::ToolResult { status: field, .. } = &mut done {
+                *field = Some(status.into());
+            }
+            s.messages.push(msg(Role::Tool, MessageKind::ToolResult, vec![done]));
+            assert!(unsettled_calls(&s)?.is_empty(), "{status}");
+            s.messages.pop();
+        }
+        s.messages.push(msg(
+            Role::Tool,
+            MessageKind::ToolResult,
+            vec![result("build", "test result: ok. 12 passed", false)],
+        ));
+        let d = distill_pack(
+            &s,
+            &DistillOptions {
+                keep_last: 0,
+                ..Default::default()
+            },
+        )?;
+        assert!(d.head_md.contains("**Build/test verdicts**"));
+        Ok(())
+    }
+
+    #[test]
+    fn claude_background_completion_is_attributed_to_initiating_call() -> anyhow::Result<()> {
+        let mut s = Session::new("background", Harness::Claude);
+        s.messages = vec![
+            msg(
+                Role::Assistant,
+                MessageKind::Reply,
+                vec![call("build", "cargo test", "run regression suite")],
+            ),
+            msg(
+                Role::Tool,
+                MessageKind::ToolResult,
+                vec![result(
+                    "build",
+                    "Command running in background with ID: bg1. Output is being written to: /tmp/log",
+                    false,
+                )],
+            ),
+        ];
+        assert_eq!(unsettled_calls(&s)?, vec!["build"]);
+        let notice = "<task-notification>\n<task-id>bg1</task-id>\n<tool-use-id>build</tool-use-id>\n<status>completed</status>\n<summary>Background command completed (exit code 0)</summary>\n</task-notification>";
+        // Quoting a native wrapper in a user prompt must not settle a call.
+        s.messages
+            .push(msg(Role::User, MessageKind::Prompt, vec![text(notice)]));
+        assert_eq!(unsettled_calls(&s)?, vec!["build"]);
+        let mut queued = msg(Role::System, MessageKind::InjectedContext, vec![]);
+        queued.extra.insert(
+            crate::ir::CARRIER_KEY.into(),
+            json!({"type":"queue-operation", "operation":"enqueue", "content":notice}),
+        );
+        s.messages.push(queued);
+        assert!(
+            unsettled_calls(&s)?.is_empty(),
+            "queued completion is evidence before delivery"
+        );
+        s.messages
+            .push(msg(Role::System, MessageKind::InjectedContext, vec![text(notice)]));
+        assert!(unsettled_calls(&s)?.is_empty());
+        let d = distill_pack(
+            &s,
+            &DistillOptions {
+                keep_last: 0,
+                ..Default::default()
+            },
+        )?;
+        assert!(
+            d.head_md
+                .contains("run regression suite → completed: Background command completed (exit code 0)"),
+            "{}",
+            d.head_md
+        );
+        assert!(!d.head_md.contains("→ Command running in background"));
+        Ok(())
+    }
+
+    #[test]
+    fn antigravity_background_completion_settles_original_call_and_preserves_failure() -> anyhow::Result<()> {
+        let mut s = Session::new("background", Harness::Antigravity);
+        s.messages = vec![
+            msg(Role::Assistant, MessageKind::Reply, vec![call("build", "cargo test", "run regression suite")]),
+            msg(Role::Tool, MessageKind::ToolResult, vec![result("build", "Created At: 2026-11-14T00:00:00Z\nTool is running as a background task with task id: session/task-7\nTask Description: cargo test", false)]),
+        ];
+        assert_eq!(unsettled_calls(&s)?, vec!["build"]);
+        let mut completion = msg(Role::System, MessageKind::InjectedContext, vec![text("<SYSTEM_MESSAGE>\n[Message] sender=session/task-7 priority=MESSAGE_PRIORITY_HIGH content=Task id \"session/task-7\" finished with result:\nCommand exited with code 1.\nerror: regression failed\n</SYSTEM_MESSAGE>")]);
+        completion
+            .harness_extra_mut(Harness::Antigravity)
+            .insert("completed_task".into(), json!("session/task-7"));
+        s.messages.push(completion);
+        assert!(unsettled_calls(&s)?.is_empty());
+        let d = distill_pack(
+            &s,
+            &DistillOptions {
+                keep_last: 0,
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(d.stats.errors, 1);
+        assert!(
+            d.head_md.contains("run regression suite → error: regression failed"),
+            "{}",
+            d.head_md
+        );
+        assert!(!d.head_md.contains("**Build/test verdicts**"));
+        Ok(())
+    }
+
+    #[test]
+    fn antigravity_terminal_task_poll_settles_launch_without_notification() -> anyhow::Result<()> {
+        let mut s = Session::new("polled", Harness::Antigravity);
+        s.messages = vec![
+            msg(
+                Role::Assistant,
+                MessageKind::Reply,
+                vec![call("build", "cargo test", "original test run")],
+            ),
+            msg(
+                Role::Tool,
+                MessageKind::ToolResult,
+                vec![result(
+                    "build",
+                    "Tool is running as a background task with task id: session/task-7",
+                    false,
+                )],
+            ),
+            msg(
+                Role::Assistant,
+                MessageKind::Reply,
+                vec![Block::ToolUse {
+                    id: "poll".into(),
+                    name: "manage_task".into(),
+                    namespace: None,
+                    input: json!({"Action":"status", "TaskId":"session/task-7"}).into(),
+                }],
+            ),
+            msg(
+                Role::Tool,
+                MessageKind::ToolResult,
+                vec![result(
+                    "poll",
+                    "Task: session/task-7\nStatus: RUNNING\nLog: file:///tmp/log",
+                    false,
+                )],
+            ),
+        ];
+        assert_eq!(unsettled_calls(&s)?, vec!["build"]);
+        s.messages.push(msg(
+            Role::Tool,
+            MessageKind::ToolResult,
+            vec![result(
+                "poll",
+                "Task: session/task-7\nStatus: DONE\ntest result: ok. 12 passed",
+                false,
+            )],
+        ));
+        assert!(unsettled_calls(&s)?.is_empty());
+        let d = distill_pack(
+            &s,
+            &DistillOptions {
+                keep_last: 0,
+                ..Default::default()
+            },
+        )?;
+        assert!(
+            d.head_md.contains("original test run → test result: ok. 12 passed"),
+            "{}",
+            d.head_md
+        );
+        Ok(())
     }
 
     fn digest(bytes: impl AsRef<[u8]>) -> Value {

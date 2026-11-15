@@ -657,6 +657,15 @@ enum Cmd {
         /// Keep the agent's thinking blocks inside the verbatim tail (dropped by default).
         #[arg(long)]
         keep_tail_thinking: bool,
+        /// Refuse an aggregate markdown pack above this byte count, including --with findings.
+        #[arg(long)]
+        max_bytes: Option<usize>,
+        /// Refuse context above cv's byte-based token estimate (not a model tokenizer limit).
+        #[arg(long)]
+        max_estimated_tokens: Option<u64>,
+        /// Allow resumable output when calls lack terminal results or the source grew during reading.
+        #[arg(long)]
+        allow_unsettled: bool,
         /// Omit the one-line-per-tool-call ledger.
         #[arg(long)]
         no_ledger: bool,
@@ -1632,6 +1641,9 @@ fn run() -> Result<()> {
             note_max,
             keep_tail_thinking,
             no_ledger,
+            max_bytes,
+            max_estimated_tokens,
+            allow_unsettled,
             upto,
             with,
             pack,
@@ -1654,7 +1666,21 @@ fn run() -> Result<()> {
             };
             let target = cmd::distill::target(session, agent_of, model, cwd, out)?;
             let retire = !keep_source && upto.is_none();
-            cmd::distill::cmd_distill(&id, harness, opts, upto, &with, pack, force, target, retire, json)
+            cmd::distill::cmd_distill(
+                &id,
+                harness,
+                opts,
+                upto,
+                &with,
+                pack,
+                force,
+                target,
+                retire,
+                json,
+                max_bytes,
+                max_estimated_tokens,
+                allow_unsettled,
+            )
         }
         Cmd::Adopt {
             agents,

@@ -86,6 +86,27 @@ What a distilled lane cannot answer, by design: a detail that lived only in a fi
 (the read is elided; a resumed lane has tools and `cv cat`, so it can re-read), and a "why" the
 lane never wrote down (it was in signature-only thinking).
 
+## Budgets and unfinished work
+
+`cv distill ID --max-bytes 200000` refuses an aggregate Markdown pack over the exact UTF-8
+byte limit, including the tail and every `--with` finding. `--max-estimated-tokens 80000`
+limits cv's existing head-plus-tail token estimate. This is a byte heuristic, not a tokenizer
+measurement or a guarantee about a model's context window; harness system prompts, tool
+schemas and the resume preamble cost additional context. Both limits are checked before
+publishing a session, sidecar, pack, lineage edge or source retirement. Nothing is silently
+trimmed to meet them.
+
+Resumable `--session` and `--agent-of` outputs refuse when the source grew during capture or
+calls lack observed terminal results. Missing results establish uncertainty, not that a job is
+still running. Explicit failures and cancellations settle calls. Claude background launches
+remain unsettled until their native task notification (queued or delivered); Antigravity
+background launches settle when their matching task completion or terminal status poll arrives. These completions
+are attributed to the command that launched them, and running output is not a build verdict.
+
+Use `--allow-unsettled` for an intentional snapshot after inspecting the source. The emitted
+context lists unresolved call IDs, as standalone packs always do. This does not stop or join
+jobs, and cannot recover job identity or completion evidence that the harness has discarded.
+
 ## The dangling-parent trap
 
 Claude Code loads a session by walking `parentUuid` back from the newest record and **stops at the
@@ -96,7 +117,7 @@ happened to hold. The Claude emitter therefore owns the rule, for every verb tha
 transcript (`distill`, `splice`, `port`, `pack --format session`): a parent that names a record not
 in the file is re-linked to the record before it, a call whose result is not in the file is dropped,
 and the records carry one identity (a main-thread session, or a sub-agent of the named root).
-`emit_verified` re-reads the file and asserts all three; `emit::tests::reshape_verbs_emit_resumable`
+`emit_verified` re-reads the file and asserts all three, also rejecting parent cycles; `emit::tests::reshape_verbs_emit_resumable`
 and `tests/cli.rs::distill_emits_a_whole_resumable_session_and_a_sub_agent` walk the chain the way
 Claude does.
 

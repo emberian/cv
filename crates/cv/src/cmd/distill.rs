@@ -417,6 +417,9 @@ pub(crate) fn cmd_distill(
     target: Target,
     retire_source: bool,
     json_out: bool,
+    max_bytes: Option<usize>,
+    max_estimated_tokens: Option<u64>,
+    allow_unsettled: bool,
 ) -> Result<()> {
     let want = parse_harness(&harness)?;
     if let Some(path) = &pack {
@@ -426,6 +429,11 @@ pub(crate) fn cmd_distill(
         Some(n) => load_upto(spec, want, n)?,
         None => load_distill(spec, want)?,
     };
+    let unsettled = cv_core::distill::unsettled_calls(&s)?;
+    if !matches!(target, Target::PackOnly) && !allow_unsettled && (!unsettled.is_empty() || grown.is_some()) {
+        bail!("source has {} calls without terminal results{}; resumable handoff refused before emission; inspect the source or use --allow-unsettled for an intentional snapshot",
+            unsettled.len(), if grown.is_some() { " and grew during reading" } else { "" });
+    }
     enum Products {
         Pack(Distilled),
         Resume(PreparedDistillation),
@@ -448,6 +456,11 @@ pub(crate) fn cmd_distill(
         with_sources.push((o.id.clone(), o.harness.as_str().to_string()));
         d.append_findings(&findings(&o, &opts)?);
     }
+    if !unsettled.is_empty() {
+        d.append_findings(&format!("\n## Unsettled calls\n\nNo terminal result was observed for: {}. This does not prove they are still running; inspect their original session before retrying.\n",
+            unsettled.iter().map(|id| format!("`{id}`")).collect::<Vec<_>>().join(", ")));
+    }
+    d.check_budget(max_bytes, max_estimated_tokens)?;
     let description = format!("distilled: {}", d.label());
     let (d, emitted) = match products {
         Products::Pack(d) => (d, Emitted::default()),
@@ -637,7 +650,9 @@ mod tests {
         let json_out = std::env::var("CV_DISTILL_PROBE_REPORT").as_deref() != Ok("human");
         let pack = (mode != "stdout").then(|| destination.join("pack.md"));
         let baseline = cv_testkit::heap::begin();
-        let result = cmd_distill(&source, None, opts, upto, &with, pack, false, target, false, json_out);
+        let result = cmd_distill(
+            &source, None, opts, upto, &with, pack, false, target, false, json_out, None, None, true,
+        );
         let heap = cv_testkit::heap::end(baseline);
         eprintln!("CV_DISTILL_HEAP {}", serde_json::to_string(&heap)?);
         result
