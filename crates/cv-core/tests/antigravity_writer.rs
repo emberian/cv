@@ -80,7 +80,7 @@ fn varint(bytes: &[u8], at: &mut usize) -> u64 {
 }
 
 /// Length-delimited values of `field`, in order. Other wire types are skipped.
-fn nested<'a>(bytes: &'a [u8], field: u64) -> Vec<&'a [u8]> {
+fn nested(bytes: &[u8], field: u64) -> Vec<&[u8]> {
     let (mut at, mut out) = (0, Vec::new());
     while at < bytes.len() {
         let key = varint(bytes, &mut at);
@@ -181,7 +181,7 @@ fn ids(session: &Session) -> Vec<String> {
     session.messages.iter().filter_map(|m| m.id.clone()).collect()
 }
 
-fn by_id<'a>(session: &'a Session, id: u64) -> &'a Message {
+fn by_id(session: &Session, id: u64) -> &Message {
     let id = id.to_string();
     session
         .messages
@@ -278,7 +278,10 @@ fn permission_request_decision_and_tool_status_are_read() {
     assert!(body(session, by_id(session, 2)).contains("approved fixture\r\n"));
     let refusal = body(session, by_id(session, 4));
     assert!(refusal.contains("user denied permission to run command"));
-    assert!(!refusal.contains("denied fixture\r\n"), "a denied command has no output");
+    assert!(
+        !refusal.contains("denied fixture\r\n"),
+        "a denied command has no output"
+    );
     assert_eq!(
         native(by_id(session, 2))["interaction"],
         json!({"kind": "permission", "action": "command", "target": "printf 'approved fixture\\n'", "decision": "approved"})
@@ -296,7 +299,10 @@ fn permission_request_decision_and_tool_status_are_read() {
     assert_eq!(approvals.len(), 2);
     assert_eq!((approvals[0].1.as_str(), &approvals[0].2), ("approve", &None));
     assert_eq!(approvals[0].3, "command printf 'approved fixture\\n'");
-    assert_eq!((approvals[1].1.as_str(), approvals[1].2.as_ref()), ("deny", Some(&denied)));
+    assert_eq!(
+        (approvals[1].1.as_str(), approvals[1].2.as_ref()),
+        ("deny", Some(&denied))
+    );
 
     // Print mode cannot ask: the writer cancels the gated step and records no interaction.
     let (reference, session) = headless[0];
@@ -324,16 +330,32 @@ fn steps_absent_from_the_export_are_read_from_the_store() {
         let retried = call_with(&steps, "retried fixture finished");
         assert_eq!(steps.len(), 15);
         if exported {
-            let log = fs::read_to_string(root.join("brain").join(&session.id).join(".system_generated/logs/transcript_full.jsonl")).unwrap();
+            let log = fs::read_to_string(
+                root.join("brain")
+                    .join(&session.id)
+                    .join(".system_generated/logs/transcript_full.jsonl"),
+            )
+            .unwrap();
             let written: Vec<u64> = log
                 .lines()
-                .map(|line| serde_json::from_str::<Value>(line).unwrap()["step_index"].as_u64().unwrap())
+                .map(|line| {
+                    serde_json::from_str::<Value>(line).unwrap()["step_index"]
+                        .as_u64()
+                        .unwrap()
+                })
                 .collect();
-            assert!(!written.contains(&2) && !written.contains(&8), "the writer exported neither step");
+            assert!(
+                !written.contains(&2) && !written.contains(&8),
+                "the writer exported neither step"
+            );
             assert_eq!(sources(&session), ["exported_history", "native_store"]);
         }
         // Every stored step is one message, in step order, whichever source carried it.
-        assert_eq!(ids(&session), (0..15).map(|i| i.to_string()).collect::<Vec<_>>(), "exported={exported}");
+        assert_eq!(
+            ids(&session),
+            (0..15).map(|i| i.to_string()).collect::<Vec<_>>(),
+            "exported={exported}"
+        );
         assert!(!limitations(&session).contains(&"unreconciled_history".to_owned()));
 
         let outcome = results(&session);
@@ -345,7 +367,11 @@ fn steps_absent_from_the_export_are_read_from_the_store() {
         assert!(body(&session, by_id(&session, 5)).contains("retried fixture finished\r\n"));
         // Both commands were approved through ACP before they ran; the export has no such field.
         for step in [2, 5] {
-            assert_eq!(native(by_id(&session, step))["interaction"]["decision"], "approved", "exported={exported}");
+            assert_eq!(
+                native(by_id(&session, step))["interaction"]["decision"],
+                "approved",
+                "exported={exported}"
+            );
         }
 
         let failure = by_id(&session, 8);
@@ -353,8 +379,14 @@ fn steps_absent_from_the_export_are_read_from_the_store() {
         assert!(body(&session, failure).contains("fixture error"));
 
         // STOP_REASON 18 is CLIENT_STREAM_ERROR; the dropped stream has no stop reason at all.
-        assert_eq!(body(&session, by_id(&session, 12)), "partial reply before interruption ");
-        assert_eq!(native(by_id(&session, 12))["planner_details"]["stop"], "client_stream_error");
+        assert_eq!(
+            body(&session, by_id(&session, 12)),
+            "partial reply before interruption "
+        );
+        assert_eq!(
+            native(by_id(&session, 12))["planner_details"]["stop"],
+            "client_stream_error"
+        );
         assert_eq!(native(by_id(&session, 12))["interrupted"], true);
         assert!(native(by_id(&session, 10))["planner_details"].get("stop").is_none());
         assert_eq!(native(by_id(&session, 14))["planner_details"]["stop"], "stop_pattern");
@@ -374,20 +406,34 @@ fn a_resumed_conversation_keeps_the_history_its_recreated_export_lacks() {
         let (_, session) = only(sessions(&root));
         let steps = stored(&root, &session.id);
         if exported {
-            let log = fs::read_to_string(root.join("brain").join(&session.id).join(".system_generated/logs/transcript_full.jsonl")).unwrap();
+            let log = fs::read_to_string(
+                root.join("brain")
+                    .join(&session.id)
+                    .join(".system_generated/logs/transcript_full.jsonl"),
+            )
+            .unwrap();
             let first: Value = serde_json::from_str(log.lines().next().unwrap()).unwrap();
-            assert_eq!(first["step_index"], 7, "the writer re-created its log at the native-only resume");
+            assert_eq!(
+                first["step_index"], 7,
+                "the writer re-created its log at the native-only resume"
+            );
         }
         let expected: Vec<String> = steps.iter().map(|s| s.index.to_string()).collect();
         assert_eq!(ids(&session), expected, "exported={exported}");
         assert_eq!(expected.len(), 17);
         assert!(!limitations(&session).contains(&"unreconciled_history".to_owned()));
         assert!(session.lineage.parent.is_none());
-        assert_eq!(session.extra["antigravity"]["root_conversation_id"], session.id.as_str());
+        assert_eq!(
+            session.extra["antigravity"]["root_conversation_id"],
+            session.id.as_str()
+        );
 
-        assert_eq!(body(&session, by_id(&session, 0)).contains("resume-fixture: first turn"), true);
+        assert!(body(&session, by_id(&session, 0)).contains("resume-fixture: first turn"));
         assert_eq!(body(&session, by_id(&session, 3)), "first: done.");
-        assert!(body(&session, by_id(&session, 4)).contains("/compact"), "the typed command is the prompt");
+        assert!(
+            body(&session, by_id(&session, 4)).contains("/compact"),
+            "the typed command is the prompt"
+        );
         let boundaries = session
             .messages
             .iter()
@@ -399,8 +445,16 @@ fn a_resumed_conversation_keeps_the_history_its_recreated_export_lacks() {
         assert!(body(&session, summary).contains("FIXTURE SUMMARY: the user ran one pre-compaction fixture command"));
         assert_eq!(body(&session, by_id(&session, 16)), "third: done.");
         assert_eq!(results(&session).len(), 3);
-        assert!(results(&session).values().all(|r| r == &[(Some("completed".into()), false)]));
-        reads.push(session.messages.iter().map(|m| (m.id.clone(), m.kind)).collect::<Vec<_>>());
+        assert!(results(&session)
+            .values()
+            .all(|r| r == &[(Some("completed".into()), false)]));
+        reads.push(
+            session
+                .messages
+                .iter()
+                .map(|m| (m.id.clone(), m.kind))
+                .collect::<Vec<_>>(),
+        );
     }
     assert_eq!(reads[0], reads[1], "both sources describe one conversation");
 }
@@ -421,10 +475,19 @@ fn killed_and_finished_background_tasks_settle_distinctly() {
         assert_eq!(steps[2..5].iter().map(|s| s.status).collect::<Vec<_>>(), [3, 3, 6]);
 
         let outcome = results(&session);
-        assert_eq!(outcome[&doomed], [(Some("canceled".into()), false)], "exported={exported}");
+        assert_eq!(
+            outcome[&doomed],
+            [(Some("canceled".into()), false)],
+            "exported={exported}"
+        );
         assert_eq!(outcome[&slow], [(Some("completed".into()), false)]);
         assert_eq!(outcome[&fast], [(Some("completed".into()), false)]);
-        let task = |step: u64| native(by_id(&session, step))["task_details"]["id"].as_str().unwrap().to_owned();
+        let task = |step: u64| {
+            native(by_id(&session, step))["task_details"]["id"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
         let (slow_task, fast_task, doomed_task) = (task(2), task(3), task(4));
         assert!(slow_task.ends_with("/task-2") && fast_task.ends_with("/task-3") && doomed_task.ends_with("/task-4"));
 
@@ -440,7 +503,11 @@ fn killed_and_finished_background_tasks_settle_distinctly() {
             .collect();
         assert_eq!(
             delivered,
-            [("canceled_task", doomed_task.clone()), ("completed_task", fast_task.clone()), ("completed_task", slow_task.clone())]
+            [
+                ("canceled_task", doomed_task.clone()),
+                ("completed_task", fast_task.clone()),
+                ("completed_task", slow_task.clone())
+            ]
         );
         let jobs: Vec<(String, String)> = affordances(&root, &reference)
             .into_iter()
@@ -449,10 +516,17 @@ fn killed_and_finished_background_tasks_settle_distinctly() {
             .collect();
         assert_eq!(
             jobs,
-            [("stop".to_owned(), doomed_task), ("complete".to_owned(), fast_task), ("complete".to_owned(), slow_task)]
+            [
+                ("stop".to_owned(), doomed_task),
+                ("complete".to_owned(), fast_task),
+                ("complete".to_owned(), slow_task)
+            ]
         );
         assert!(!body(&session, by_id(&session, 4)).contains("never printed\r\n"));
-        assert!(body(&session, by_id(&session, 8)).contains("cancelled."), "the kill acknowledgement");
+        assert!(
+            body(&session, by_id(&session, 8)).contains("cancelled."),
+            "the kill acknowledgement"
+        );
         assert!(cv_core::distill::unsettled_calls(&session).unwrap().is_empty());
 
         // Before any notification: the killed launch is already settled; in the exported
@@ -500,7 +574,14 @@ fn swarm_members_board_deliveries_and_lineage_are_read() {
     let mut expected = vec![alpha.clone(), beta.clone(), gamma.clone()];
     expected.sort();
     assert_eq!(children, expected);
-    let state = |id: &str| forest.iter().find(|a| a.session.id == id).unwrap().result_status.clone();
+    let state = |id: &str| {
+        forest
+            .iter()
+            .find(|a| a.session.id == id)
+            .unwrap()
+            .result_status
+            .clone()
+    };
     assert_eq!(state(&gamma).as_deref(), Some("killed"));
     assert_eq!(state(&alpha), None);
     let described = session.extra["antigravity"]["subagents"].as_object().unwrap();
@@ -515,11 +596,17 @@ fn swarm_members_board_deliveries_and_lineage_are_read() {
     }
     // Each `swarm add` result names the conversation it created: the call is the spawn.
     let steps = stored(&root, &coordinator);
-    assert_eq!(described[&alpha]["call_id"], call_with(&steps, "alpha-fixture").as_str());
+    assert_eq!(
+        described[&alpha]["call_id"],
+        call_with(&steps, "alpha-fixture").as_str()
+    );
     assert_eq!(described[&beta]["call_id"], call_with(&steps, "beta-fixture").as_str());
     assert!(described[&gamma].get("call_id").is_none(), "beta added gamma");
     let nested = read[&beta].1.extra["antigravity"]["subagents"].as_object().unwrap();
-    assert_eq!(nested[&gamma]["call_id"], call_with(&stored(&root, &beta), "gamma-fixture").as_str());
+    assert_eq!(
+        nested[&gamma]["call_id"],
+        call_with(&stored(&root, &beta), "gamma-fixture").as_str()
+    );
 
     // A board delivery is not a child's final return, whoever the writer names as sender.
     let board: Vec<u64> = session
@@ -532,7 +619,10 @@ fn swarm_members_board_deliveries_and_lineage_are_read() {
         for message in &session.messages {
             assert_ne!(message.kind, MessageKind::SubagentReturn, "{}", body(session, message));
             if body(session, message).contains("[swarm] new board message #") {
-                assert_eq!((message.kind, message.origin), (MessageKind::InjectedContext, Origin::Harness));
+                assert_eq!(
+                    (message.kind, message.origin),
+                    (MessageKind::InjectedContext, Origin::Harness)
+                );
                 assert!(native(message)["board_message"].is_u64());
             }
         }
@@ -548,9 +638,17 @@ fn swarm_members_board_deliveries_and_lineage_are_read() {
         assert!(read[&coordinator].1.lineage.parent.is_none());
         for (name, id) in [("alpha", &alpha), ("beta", &beta), ("gamma", &gamma)] {
             let (reference, session) = &read[id];
-            assert_eq!(session.lineage.parent.as_deref(), Some(coordinator.as_str()), "{name} exported={exported}");
+            assert_eq!(
+                session.lineage.parent.as_deref(),
+                Some(coordinator.as_str()),
+                "{name} exported={exported}"
+            );
             // The assignment is the worker's prompt; the board notice before it is not.
-            let prompts: Vec<_> = session.messages.iter().filter(|m| m.kind == MessageKind::Prompt).collect();
+            let prompts: Vec<_> = session
+                .messages
+                .iter()
+                .filter(|m| m.kind == MessageKind::Prompt)
+                .collect();
             assert_eq!(prompts.len(), 1, "{name} exported={exported}");
             assert_eq!(prompts[0].origin, Origin::Subagent);
             let assignment = body(session, prompts[0]);
@@ -603,16 +701,35 @@ fn an_idle_child_notice_is_its_return_to_the_parent() {
         // Child one goes idle after its reply and again after the parent's list call;
         // child two after its delayed reply.
         assert!(returns.len() >= 2, "exported={exported}: {returns:?}");
-        assert!(returns.iter().any(|(id, text)| id == &one && text == "child one final result"));
-        assert!(returns.iter().any(|(id, text)| id == &two && text.starts_with("child two ")));
+        assert!(returns
+            .iter()
+            .any(|(id, text)| id == &one && text == "child one final result"));
+        assert!(returns
+            .iter()
+            .any(|(id, text)| id == &two && text.starts_with("child two ")));
         let rows = affordances(&root, reference);
-        assert_eq!(rows.iter().filter(|row| row.0 == "subagent_return").count(), returns.len());
+        assert_eq!(
+            rows.iter().filter(|row| row.0 == "subagent_return").count(),
+            returns.len()
+        );
         let spawned = parent.extra["antigravity"]["subagents"].as_object().unwrap();
-        assert_eq!(spawned[&one]["call_id"], call_with(&steps, "child-one-fixture").as_str());
-        assert_eq!(spawned[&two]["call_id"], call_with(&steps, "child-two-fixture").as_str());
+        assert_eq!(
+            spawned[&one]["call_id"],
+            call_with(&steps, "child-one-fixture").as_str()
+        );
+        assert_eq!(
+            spawned[&two]["call_id"],
+            call_with(&steps, "child-two-fixture").as_str()
+        );
         if exported {
-            assert_eq!(reference.title.as_deref(), Some("parent-fixture: start two fixture children"));
-            assert_eq!(read[&one].0.title.as_deref(), Some("child-one-fixture: reply with your result."));
+            assert_eq!(
+                reference.title.as_deref(),
+                Some("parent-fixture: start two fixture children")
+            );
+            assert_eq!(
+                read[&one].0.title.as_deref(),
+                Some("child-one-fixture: reply with your result.")
+            );
         }
     }
 }
@@ -694,8 +811,11 @@ fn a_linked_attachment_missing_at_read_time_is_a_coverage_limitation() {
          step_payload BLOB, step_format INTEGER DEFAULT 0);",
     )
     .unwrap();
-    conn.execute("INSERT INTO steps(idx,step_type,status,step_payload) VALUES (0,14,3,?1)", [payload])
-        .unwrap();
+    conn.execute(
+        "INSERT INTO steps(idx,step_type,status,step_payload) VALUES (0,14,3,?1)",
+        [payload],
+    )
+    .unwrap();
     drop(conn);
     let missing = only(sessions(&world.base)).1;
     assert!(limitations(&missing).contains(&"missing_attachments".to_owned()));

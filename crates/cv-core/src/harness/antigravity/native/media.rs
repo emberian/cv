@@ -180,7 +180,12 @@ mod tests {
         // A linked file that exists is the reference; one that is gone yields to the bytes.
         let existing = std::env::current_exe().unwrap();
         let existing = existing.to_str().unwrap();
-        let item = [bytes(1, b"image/png"), bytes(2, b"inline"), bytes(5, existing.as_bytes())].concat();
+        let item = [
+            bytes(1, b"image/png"),
+            bytes(2, b"inline"),
+            bytes(5, existing.as_bytes()),
+        ]
+        .concat();
         assert_eq!(projected(&item).unwrap()["media"][0]["uri"], existing);
         let gone = [
             bytes(1, b"image/png"),

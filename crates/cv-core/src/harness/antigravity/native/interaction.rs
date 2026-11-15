@@ -83,9 +83,7 @@ mod tests {
         }
         // A completed interaction with no permission response decides nothing.
         let unanswered = bytes(147, &[spec, bytes(2, &bytes(1, b"trajectory"))].concat());
-        assert!(projection(&unanswered)["native_interaction"]
-            .get("decision")
-            .is_none());
+        assert!(projection(&unanswered)["native_interaction"].get("decision").is_none());
         // Another interaction kind is not a permission.
         assert!(projection(&bytes(133, &bytes(5, b"question")))
             .get("native_interaction")

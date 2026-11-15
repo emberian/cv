@@ -741,10 +741,11 @@ impl Adapter for Antigravity {
             spawns.meta(&codec.s);
             let mut records = input.records();
             crate::stream::guarded(&mut spawns, &input, |sink| {
+                let mut stopped = false;
+                // Both sources replay as one conversation, in step order: a step the
+                // export never wrote sits between the exported steps around it.
                 #[cfg(feature = "sqlite")]
-                let stopped = match native_only {
-                    // Both sources replay as one conversation, in step order: a step the
-                    // export never wrote sits between the exported steps around it.
+                let merged = match native_only {
                     Some((native, steps)) => {
                         let mut merged: BTreeMap<u64, (bool, u64, u64)> = order
                             .steps
@@ -753,7 +754,7 @@ impl Adapter for Antigravity {
                             .collect();
                         merged.extend(steps.into_iter().map(|(index, (at, end))| (index, (true, at, end))));
                         let mut native_records = native.records();
-                        let stopped = crate::stream::guarded(sink, &native, |sink| {
+                        stopped = crate::stream::guarded(sink, &native, |sink| {
                             for (from_native, at, end) in merged.into_values() {
                                 let flow = if from_native {
                                     native_records.read(at, end - at, |view| codec.record(view, at, sink))?
@@ -766,30 +767,20 @@ impl Adapter for Antigravity {
                             }
                             Ok(false)
                         })?;
-                        stopped
+                        true
                     }
-                    None => {
-                        let mut stopped = false;
-                        for (at, end) in order.steps.values() {
-                            if records.read(*at, end - at, |view| codec.record(view, *at, sink))? == Flow::Stop {
-                                stopped = true;
-                                break;
-                            }
-                        }
-                        stopped
-                    }
+                    None => false,
                 };
                 #[cfg(not(feature = "sqlite"))]
-                let stopped = {
-                    let mut stopped = false;
+                let merged = false;
+                if !merged {
                     for (at, end) in order.steps.values() {
                         if records.read(*at, end - at, |view| codec.record(view, *at, sink))? == Flow::Stop {
                             stopped = true;
                             break;
                         }
                     }
-                    stopped
-                };
+                }
                 super::note_skipped_lines(codec.session(), order.skipped);
                 codec.finish(stopped, sink).map(Some)
             })
@@ -2120,11 +2111,7 @@ impl StepCodec {
                     .and_then(idle_child)
                     .map(|(child, _)| child)
                     .filter(|child| self.state.child_ids.contains(*child))
-                    .or_else(|| {
-                        sender
-                            .as_deref()
-                            .filter(|id| self.state.child_ids.contains(*id))
-                    })
+                    .or_else(|| sender.as_deref().filter(|id| self.state.child_ids.contains(*id)))
                     .map(str::to_owned);
 
                 let (role, kind, origin) = if board.is_some() {
@@ -2624,7 +2611,12 @@ fn unwrap_system_message_body(text: &str) -> Option<&str> {
 /// `<ADDITIONAL_METADATA>` and settings notices after the closing tag.
 fn exported_user_request(text: &str) -> Option<&str> {
     let inner = text.trim().strip_prefix("<USER_REQUEST>")?;
-    Some(inner.split_once("</USER_REQUEST>").map_or(inner, |(request, _)| request).trim())
+    Some(
+        inner
+            .split_once("</USER_REQUEST>")
+            .map_or(inner, |(request, _)| request)
+            .trim(),
+    )
 }
 
 /// CLI 1.5.9 reports a child's reply through the system sender:

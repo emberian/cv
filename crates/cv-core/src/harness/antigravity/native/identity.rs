@@ -173,7 +173,11 @@ mod tests {
     #[test]
     fn stop_reasons_are_named_and_an_absent_one_is_not_invented() {
         // CLI 1.5.9 wrote 2 for a finished reply and 18 for a stream the client cancelled.
-        for (reason, name) in [(2, "stop_pattern"), (18, "client_stream_error"), (16, "client_canceled")] {
+        for (reason, name) in [
+            (2, "stop_pattern"),
+            (18, "client_stream_error"),
+            (16, "client_canceled"),
+        ] {
             let projected = projection(&[bytes(1, b"reply"), number(12, reason)].concat());
             assert_eq!(projected["stop_reason"], reason);
             assert_eq!(projected["stop"], name);

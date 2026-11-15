@@ -40,7 +40,13 @@ impl Write for Fingerprint {
 }
 fn fingerprint(view: JsonView<'_>) -> Result<blake3::Hash> {
     let mut hash = Fingerprint(blake3::Hasher::new());
-    let user = view.get("type")?.map(JsonView::string).transpose()?.flatten().as_deref() == Some("USER_INPUT");
+    let user = view
+        .get("type")?
+        .map(JsonView::string)
+        .transpose()?
+        .flatten()
+        .as_deref()
+        == Some("USER_INPUT");
     for key in ["type", "content", "thinking"] {
         hash.write_all(key.as_bytes())?;
         let mut value = view.get(key)?;

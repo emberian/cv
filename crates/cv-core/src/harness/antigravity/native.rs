@@ -415,7 +415,10 @@ mod tests {
         assert!(projected.get("native_missing_attachments").is_none());
         let link_only = [bytes(1, b"image/png"), bytes(5, gone)].concat();
         let projected = projection(&bytes(19, &bytes(9, &link_only)), false);
-        assert_eq!(projected["media"][0]["uri"], "file:///nonexistent/cv-fixture/upload.png");
+        assert_eq!(
+            projected["media"][0]["uri"],
+            "file:///nonexistent/cv-fixture/upload.png"
+        );
         assert_eq!(projected["native_missing_attachments"], true);
     }
 
