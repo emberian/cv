@@ -277,7 +277,17 @@ pub(crate) fn exercise_frozen(
     exercise_with(
         target,
         |mode, rows| {
-            let digest = crate::digest::sha256_hex(&serde_json::to_vec(rows)?);
+            let mut rows = rows.clone();
+            if target == Harness::OpenCode {
+                // The v1 oracle was recorded at 0.19.3. Check the live producer stamp,
+                // then normalize only that volatile field for the historical digest.
+                // Keep every schema, message and other session field under the frozen check.
+                for session in rows["session"].as_array_mut().expect("OpenCode session rows") {
+                    assert_eq!(session[5], env!("CARGO_PKG_VERSION"), "emitted producer version");
+                    session[5] = json!("0.19.3");
+                }
+            }
+            let digest = crate::digest::sha256_hex(&serde_json::to_vec(&rows)?);
             frozen
                 .0
                 .insert(format!("{target}-{mode}"), json!({ "logical": digest }));
