@@ -97,6 +97,13 @@ measurement gaps. Keep raw result artifacts out of the repository; record condit
 in commit messages. Arbitrary prefix-edit detection remains the documented sampled-mark limit,
 not a new unacknowledged 0.20 guarantee.
 
+**Tiny corrupted Tantivy files need a boundary guard.** Migration testing reproduced an
+upstream Tantivy 0.26.1 panic: `Footer::extract_footer` checks for four bytes before slicing
+eight. A 4–7-byte truncated segment can therefore panic instead of returning a corruption
+error. The schema migration and explicit corrupt-store rebuild tests cover ordinary reported
+errors, not this case. P1 hardening: reject undersized footer-bearing files at the read boundary
+or update to a verified upstream fix; retain a regression using the actual tiny file.
+
 ## Compatibility checks for integration
 
 - Keep stored logs and older session envelopes readable. Read coverage is optional metadata;
