@@ -217,17 +217,16 @@ impl Adapter for Antigravity {
     }
 
     fn message_affordances(&self, m: &Message) -> Vec<crate::affordance::BagHit> {
-        let Some(task) = m
-            .extra
-            .get("antigravity")
-            .and_then(|v| v.get("completed_task"))
-            .and_then(Value::as_str)
-        else {
-            return Vec::new();
+        let bag = m.extra.get("antigravity");
+        let task = |key: &str| bag.and_then(|v| v.get(key)).and_then(Value::as_str);
+        let (action, task) = match (task("completed_task"), task("canceled_task")) {
+            (Some(task), _) => ("complete", task),
+            (None, Some(task)) => ("stop", task),
+            (None, None) => return Vec::new(),
         };
         vec![crate::affordance::BagHit {
             kind: crate::affordance::Kind::BackgroundJob,
-            action: "complete",
+            action,
             tool: "manage_task",
             summary: task.to_owned(),
         }]
@@ -2001,8 +2000,12 @@ impl StepCodec {
 
                 let mut m = Message::of_kind(role, kind, origin);
                 if let Some(task) = sender.as_deref().filter(|id| id.contains("/task-")) {
-                    m.harness_extra_mut(Harness::Antigravity)
-                        .insert("completed_task".into(), Value::String(task.to_owned()));
+                    // A killed task is announced by the same sender as a finished one.
+                    let canceled = head.contains(&format!("content=Task id \"{task}\" was canceled"));
+                    m.harness_extra_mut(Harness::Antigravity).insert(
+                        if canceled { "canceled_task" } else { "completed_task" }.into(),
+                        Value::String(task.to_owned()),
+                    );
                 }
                 m.id = Some(step_index.to_string());
                 m.timestamp = ts;

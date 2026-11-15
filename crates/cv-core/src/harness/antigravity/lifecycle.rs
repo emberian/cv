@@ -60,7 +60,17 @@ pub(super) fn message(message: &Message, body: &str) -> Observation {
     if message.kind != MessageKind::InjectedContext {
         return Observation::default();
     }
-    let Some((job, output)) = completion(message, body) else {
+    if let Some((job, output)) = notice(message, body, "canceled_task", "was canceled") {
+        return Observation {
+            updates: vec![Update {
+                target: Target::Job(job.to_owned()),
+                status: Status::Stopped,
+                output: Some(output.to_owned()),
+            }],
+            ..Default::default()
+        };
+    }
+    let Some((job, output)) = notice(message, body, "completed_task", "finished") else {
         return Observation::default();
     };
     let failed = output.lines().any(|line| {
@@ -100,9 +110,9 @@ fn polled_task<'a>(name: &str, out: &'a str) -> Option<(&'a str, &'a str)> {
     ))
 }
 
-fn completion<'a>(message: &'a Message, body: &'a str) -> Option<(&'a str, &'a str)> {
-    let job = message.extra.get("antigravity")?.get("completed_task")?.as_str()?;
-    let marker = format!("content=Task id \"{job}\" finished with result:\n");
+fn notice<'a>(message: &'a Message, body: &'a str, key: &str, verb: &str) -> Option<(&'a str, &'a str)> {
+    let job = message.extra.get("antigravity")?.get(key)?.as_str()?;
+    let marker = format!("content=Task id \"{job}\" {verb} with result:\n");
     let (_, output) = body.split_once(&marker)?;
     Some((job, output.trim_end_matches("</SYSTEM_MESSAGE>").trim()))
 }
@@ -163,6 +173,36 @@ mod tests {
                 expected,
                 "{body}"
             );
+        }
+    }
+
+    #[test]
+    fn a_cancellation_notice_stops_its_job_and_a_completion_notice_completes_it() {
+        // Bodies as CLI 1.5.9 wrote them for a killed and a finished background command.
+        for (key, body, expected) in [
+            (
+                "canceled_task",
+                "[Message] timestamp=2026-11-15T02:27:15Z sender=session/task-4 priority=MESSAGE_PRIORITY_LOW content=Task id \"session/task-4\" was canceled with result:\nTool execution was canceled\nLog: file:///tmp/task-4.log",
+                Status::Stopped,
+            ),
+            (
+                "completed_task",
+                "[Message] timestamp=2026-11-15T02:27:16Z sender=session/task-4 priority=MESSAGE_PRIORITY_HIGH content=Task id \"session/task-4\" finished with result:\nCommand exited with code 0.\n\nCommand output:\nok",
+                Status::Complete,
+            ),
+        ] {
+            let mut delivered = Message::of_kind(
+                crate::ir::Role::System,
+                MessageKind::InjectedContext,
+                crate::ir::Origin::Harness,
+            );
+            delivered
+                .extra
+                .insert("antigravity".into(), serde_json::json!({key: "session/task-4"}));
+            let observation = message(&delivered, body);
+            assert_eq!(observation.updates.len(), 1, "{key}");
+            assert_eq!(observation.updates[0].status, expected);
+            assert!(matches!(&observation.updates[0].target, Target::Job(job) if job == "session/task-4"));
         }
     }
 

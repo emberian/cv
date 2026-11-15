@@ -41,9 +41,9 @@
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {
-        "background_job/complete": 3,
+        "background_job/complete": 2,
         "background_job/read": 2,
-        "background_job/stop": 1
+        "background_job/stop": 2
       },
       "tool_histogram": {
         "tools": {
