@@ -86,10 +86,17 @@ impl State {
                         self.calls.insert(id);
                         continue;
                     }
-                    self.calls.remove(&id);
-                    self.uncertain.remove(&id);
+                    // Evidence naming a call settles it once: a notice that follows a poll or a
+                    // sibling update which already settled the call is not a second completion.
+                    let open = [
+                        self.calls.remove(&id),
+                        self.uncertain.remove(&id),
+                        self.job_counts.remove(&id).is_some(),
+                    ];
+                    if !open.contains(&true) {
+                        continue;
+                    }
                     self.jobs.retain(|_, owner| owner != &id);
-                    self.job_counts.remove(&id);
                     self.terminal.remove(&id);
                     id
                 }
@@ -142,10 +149,25 @@ impl State {
         completed
     }
 
-    pub fn unsettled(mut self) -> Vec<String> {
-        self.calls.extend(self.jobs.into_values());
-        self.calls.extend(self.uncertain);
-        self.calls.into_iter().collect()
+    /// Every call without terminal evidence, with what is missing. A call can have several.
+    pub fn unsettled(self) -> Vec<(String, String)> {
+        let mut rows: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+        for call in self.calls {
+            rows.entry(call).or_default().push("no terminal result".into());
+        }
+        let mut jobs: Vec<_> = self.jobs.into_iter().collect();
+        jobs.sort();
+        for (job, call) in jobs {
+            rows.entry(call)
+                .or_default()
+                .push(format!("job `{job}` not seen to end"));
+        }
+        for call in self.uncertain {
+            rows.entry(call)
+                .or_default()
+                .push("result hides job identity or completion".into());
+        }
+        rows.into_iter().map(|(call, why)| (call, why.join("; "))).collect()
     }
 }
 
@@ -226,5 +248,126 @@ mod tests {
             assert_eq!(completions[0].output.as_deref(), Some("earlier terminal evidence"));
             assert!(state.unsettled().is_empty());
         }
+    }
+
+    fn job(id: &str, status: Status) -> Update {
+        Update {
+            target: Target::Job(id.into()),
+            status,
+            output: None,
+        }
+    }
+
+    fn call(id: &str, status: Status) -> Update {
+        Update {
+            target: Target::Call(id.into()),
+            status,
+            output: None,
+        }
+    }
+
+    #[test]
+    fn poll_evidence_settles_the_launch_once_and_a_later_notice_adds_nothing() {
+        let mut state = State::default();
+        state.call("launch");
+        let launched = state.result(
+            "launch",
+            Observation {
+                started_jobs: vec!["job".into()],
+                ..Default::default()
+            },
+        );
+        assert!(launched.pending);
+        state.call("poll-running");
+        let running = state.result(
+            "poll-running",
+            Observation {
+                acting_on: Some("job".into()),
+                ..Default::default()
+            },
+        );
+        assert!(running.pending && running.completions.is_empty());
+        assert_eq!(
+            state_unsettled(&mut state),
+            [("launch".to_owned(), "job `job` not seen to end".to_owned())]
+        );
+        state.call("poll-done");
+        let done = state.result(
+            "poll-done",
+            Observation {
+                acting_on: Some("job".into()),
+                updates: vec![job("job", Status::Failed)],
+                ..Default::default()
+            },
+        );
+        assert!(!done.pending);
+        assert_eq!(done.completions.len(), 1);
+        assert_eq!(done.completions[0].call, "launch");
+        assert_eq!(done.completions[0].status, Status::Failed);
+        let notice = state.message(Observation {
+            updates: vec![job("job", Status::Failed), call("launch", Status::Failed)],
+            ..Default::default()
+        });
+        assert!(notice.is_empty());
+        assert!(state.unsettled().is_empty());
+    }
+
+    #[test]
+    fn a_notice_naming_task_and_call_completes_the_owner_exactly_once() {
+        for known_job in [true, false] {
+            let mut state = State::default();
+            state.call("launch");
+            state.result(
+                "launch",
+                Observation {
+                    status: if known_job { Status::Complete } else { Status::Pending },
+                    started_jobs: if known_job { vec!["job".into()] } else { Vec::new() },
+                    ..Default::default()
+                },
+            );
+            let completions = state.message(Observation {
+                updates: vec![job("job", Status::Complete), call("launch", Status::Complete)],
+                ..Default::default()
+            });
+            assert_eq!(completions.len(), 1, "known job: {known_job}");
+            assert_eq!(completions[0].call, "launch");
+            assert!(state.unsettled().is_empty());
+        }
+    }
+
+    #[test]
+    fn a_resumed_job_belongs_to_the_call_that_resumed_it() {
+        let mut state = State::default();
+        for id in ["spawn", "resume"] {
+            state.call(id);
+            state.result(
+                id,
+                Observation {
+                    started_jobs: vec!["agent".into()],
+                    ..Default::default()
+                },
+            );
+            if id == "spawn" {
+                let first = state.message(Observation {
+                    updates: vec![job("agent", Status::Complete), call("spawn", Status::Complete)],
+                    ..Default::default()
+                });
+                assert_eq!(first.len(), 1);
+            }
+        }
+        assert_eq!(
+            state_unsettled(&mut state),
+            [("resume".to_owned(), "job `agent` not seen to end".to_owned())]
+        );
+    }
+
+    fn state_unsettled(state: &mut State) -> Vec<(String, String)> {
+        State {
+            calls: state.calls.clone(),
+            jobs: state.jobs.clone(),
+            uncertain: state.uncertain.clone(),
+            ..Default::default()
+        }
+        .unsettled()
     }
 }

@@ -429,11 +429,6 @@ pub(crate) fn cmd_distill(
         Some(n) => load_upto(spec, want, n)?,
         None => load_distill(spec, want)?,
     };
-    let unsettled = cv_core::distill::unsettled_calls(&s)?;
-    if !matches!(target, Target::PackOnly) && !allow_unsettled && (!unsettled.is_empty() || grown.is_some()) {
-        bail!("source has {} calls without terminal results{}; resumable handoff refused before emission; inspect the source or use --allow-unsettled for an intentional snapshot",
-            unsettled.len(), if grown.is_some() { " and grew during reading" } else { "" });
-    }
     enum Products {
         Pack(Distilled),
         Resume(PreparedDistillation),
@@ -447,6 +442,23 @@ pub(crate) fn cmd_distill(
         Products::Pack(d) => d,
         Products::Resume(prepared) => &mut prepared.distilled,
     };
+    if !matches!(target, Target::PackOnly) && !allow_unsettled && (!d.unsettled.is_empty() || grown.is_some()) {
+        let mut refusal = format!(
+            "source has {} calls without terminal evidence{}; resumable handoff refused before emission; inspect the source or use --allow-unsettled for an intentional snapshot",
+            d.unsettled.len(),
+            if grown.is_some() { " and grew during reading" } else { "" }
+        );
+        for call in &d.unsettled {
+            let _ = write!(
+                refusal,
+                "\n  {} {} ({})",
+                call.id,
+                call.label.lines().next().unwrap_or_default(),
+                call.why
+            );
+        }
+        bail!(refusal);
+    }
     if let Some(grown) = &grown {
         d.note_grown(grown);
     }
@@ -455,10 +467,6 @@ pub(crate) fn cmd_distill(
         let o = load_findings(other)?;
         with_sources.push((o.id.clone(), o.harness.as_str().to_string()));
         d.append_findings(&findings(&o, &opts)?);
-    }
-    if !unsettled.is_empty() {
-        d.append_findings(&format!("\n## Unsettled calls\n\nNo terminal result was observed for: {}. This does not prove they are still running; inspect their original session before retrying.\n",
-            unsettled.iter().map(|id| format!("`{id}`")).collect::<Vec<_>>().join(", ")));
     }
     d.check_budget(max_bytes, max_estimated_tokens)?;
     let description = format!("distilled: {}", d.label());
@@ -524,7 +532,8 @@ pub(crate) fn cmd_distill(
         crate::util::write_user_file(p, d.pack().as_bytes(), force)?;
         let _ = writeln!(h, "  ↳ pack {}", p.display());
     }
-    let mut out = json!({"stats": d.stats, "emitted": emitted, "pack_path": pack, "retired": retired});
+    let mut out =
+        json!({"stats": d.stats, "emitted": emitted, "pack_path": pack, "retired": retired, "unsettled": d.unsettled});
     if let Some(grown) = grown {
         out["grown"] = json!(grown);
     }

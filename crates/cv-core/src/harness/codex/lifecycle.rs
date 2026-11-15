@@ -193,6 +193,7 @@ mod tests {
                 body,
                 status: None,
                 is_error: false,
+                details: None,
             };
             let observation = tool_result(&result);
             assert_eq!(observation.status, expected);
@@ -217,6 +218,7 @@ mod tests {
                 body: "Script terminated",
                 status,
                 is_error,
+                details: None,
             };
             assert_eq!(tool_result(&result).status, expected);
         }
@@ -238,6 +240,7 @@ mod tests {
             body: "Process exited with code 1\nOutput:\nerror",
             status: None,
             is_error: false,
+            details: None,
         };
         let observation = tool_result(&result);
         assert_eq!(observation.status, Status::Failed);

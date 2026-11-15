@@ -166,6 +166,7 @@ mod tests {
                 body,
                 status,
                 is_error: false,
+                details: None,
             });
             assert_eq!(observation.started_jobs, ["session/task-7"]);
             assert_eq!(
@@ -220,6 +221,7 @@ mod tests {
                 body: "Tool is running as a background task with task id: session/task-7",
                 status,
                 is_error,
+                details: None,
             });
             assert_eq!(observation.status, expected);
             assert!(observation.started_jobs.is_empty());

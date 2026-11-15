@@ -126,9 +126,23 @@ pub struct DistillStats {
     pub elided_outputs: usize,
 }
 
+/// A source call whose history holds no terminal evidence.
+#[derive(Debug, Clone, Serialize)]
+pub struct Unsettled {
+    pub id: String,
+    /// What the call was, as the ledger labels it; empty when the source holds no such call.
+    pub label: String,
+    /// The source message that made the call.
+    pub message: Option<usize>,
+    /// Which evidence is missing.
+    pub why: String,
+}
+
 /// The result of [`prepare_distill`].
 #[derive(Debug, Clone)]
 pub struct Distilled {
+    /// Calls the source never showed ending. The pack's hand-off lists them.
+    pub unsettled: Vec<Unsettled>,
     /// Brief + timeline + facts + ledger (the part that replaces the head of the transcript).
     pub head_md: String,
     /// The verbatim tail rendered as markdown (used by the pack; the resumable session carries the
@@ -241,73 +255,8 @@ enum Demand {
 /// uncertainty, not proof that a process is still running. Explicit cancellation and
 /// failure settle a call; a running result does not.
 pub fn unsettled_calls(session: &Session) -> anyhow::Result<Vec<String>> {
-    let mut lifecycle = lifecycle::State::default();
-    // Decoding IR evidence needs an adapter's codec, never discovery of its live store.
-    let adapter = crate::harness::for_harness_with_root(session.harness, std::path::Path::new(""));
-    let needs_body = adapter.as_ref().is_some_and(|a| a.lifecycle_body_required());
-    let uses = tool_index(&session.messages);
-    let resolver = session.resolver();
-    for message in &session.messages {
-        if let Some(adapter) = &adapter {
-            let mut body = String::new();
-            if needs_body && lifecycle_message_kind(message.kind) {
-                for block in &message.content {
-                    if let Block::Text { text } = block {
-                        if !body.is_empty() && body.len() < 2048 {
-                            body.push('\n');
-                        }
-                        let remaining = 2048usize.saturating_sub(body.len());
-                        if remaining == 0 {
-                            break;
-                        }
-                        let prefix = crate::harness::store::document::text_head(text, &resolver, remaining, false)?.0;
-                        body.push_str(&prefix);
-                    }
-                }
-            }
-            lifecycle.message(adapter.message_lifecycle(message, &body));
-        }
-        for block in &message.content {
-            match block {
-                Block::ToolUse { id, .. } => lifecycle.call(id),
-                Block::ToolResult {
-                    tool_use_id,
-                    status,
-                    content,
-                    is_error,
-                    tool_name,
-                    ..
-                } => {
-                    // Safety preflight reads bounded envelopes, not a second copy of full logs.
-                    let body = if needs_body {
-                        crate::harness::store::document::text_head(content, &resolver, 2048, true)?.0
-                    } else {
-                        String::new()
-                    };
-                    let original = uses.get(tool_use_id.as_str());
-                    let name = original.map(|call| call.name).or(tool_name.as_deref()).unwrap_or("");
-                    let summary = original
-                        .filter(|_| needs_body)
-                        .map(|call| ToolInput::new(session.harness, call.name, call.input, false, true))
-                        .transpose()?;
-                    let result = LifecycleResult {
-                        message: Some(message),
-                        tool: name,
-                        ops: summary.as_ref().map_or(&[], |s| s.ops.as_slice()),
-                        body: &body,
-                        status: status.as_deref(),
-                        is_error: *is_error,
-                    };
-                    let observation = adapter
-                        .as_ref()
-                        .map_or_else(|| Observation::result(&result), |a| a.tool_result_lifecycle(&result));
-                    lifecycle.result(tool_use_id, observation);
-                }
-                _ => {}
-            }
-        }
-    }
-    Ok(lifecycle.unsettled())
+    let analysis = analyze(session, &DistillOptions::default(), Demand::Findings)?;
+    Ok(analysis.distilled.unsettled.into_iter().map(|call| call.id).collect())
 }
 
 fn lifecycle_message_kind(kind: MessageKind) -> bool {
@@ -1407,6 +1356,12 @@ fn analyze_with_policy(
     // first idx, last idx, label, outcome, the last call's tool_use id and output bytes
     let mut ledger: Vec<(usize, usize, String, String, String, usize)> = Vec::new();
     let mut ledger_runs: Vec<usize> = Vec::new(); // repeat count per ledger row
+                                                  // A background launch's row is written at its acknowledgement and rewritten when it ends.
+    let settle_row = |ledger: &mut Vec<(usize, usize, String, String, String, usize)>, call: &str, outcome: &str| {
+        if let Some(row) = ledger.iter_mut().rev().find(|row| row.4 == call) {
+            row.3 = format!("{outcome} (ended after its acknowledgement)");
+        }
+    };
     let mut elided: Vec<Elided> = Vec::new();
     let mut elided_outputs = 0usize;
     let mut delivered_bodies: HashSet<String> = HashSet::new();
@@ -1425,7 +1380,7 @@ fn analyze_with_policy(
                 if let Some(call) = uses.get(completion.call.as_str()) {
                     let summary = ToolInput::new(session.harness, call.name, call.input, false, true)?;
                     let label = summary.label(session.harness, call.name);
-                    lifecycle_facts(
+                    let outcome = lifecycle_facts(
                         session.harness,
                         i,
                         call.name,
@@ -1435,6 +1390,160 @@ fn analyze_with_policy(
                         completion.status,
                         &mut facts,
                     );
+                    settle_row(&mut ledger, &completion.call, &outcome);
+                }
+            }
+        }
+        // A result is read wherever its record puts it: Claude writes some beside a text block
+        // in one user record, which is then not a tool-result turn.
+        for (index, b) in m.content.iter().enumerate().filter(|_| m.role != Role::Assistant) {
+            let Block::ToolResult {
+                tool_use_id,
+                is_error,
+                tool_name,
+                status,
+                details,
+                ..
+            } = b
+            else {
+                continue;
+            };
+            let orphan = crate::Json::from(Value::Null);
+            let (name, original_input) = uses
+                .get(tool_use_id.as_str())
+                .map(|call| (call.name.to_string(), call.input))
+                .unwrap_or_else(|| (tool_name.clone().unwrap_or_default(), &orphan));
+            let summary = ToolInput::new(session.harness, &name, original_input, false, true)?;
+            let label = summary.label(session.harness, &name);
+            let out_cow = cache.resolve_tool_result(i, index)?;
+            let out = out_cow.as_ref();
+            let out_len = out.len();
+            let result = LifecycleResult {
+                message: Some(m),
+                tool: &name,
+                ops: &summary.ops,
+                body: out,
+                status: status.as_deref(),
+                is_error: *is_error,
+                details: details.as_ref(),
+            };
+            let observation = adapter
+                .as_ref()
+                .map_or_else(|| Observation::result(&result), |a| a.tool_result_lifecycle(&result));
+            let observed = lifecycle.result(tool_use_id, observation);
+            let result_out = observed.output.as_deref().unwrap_or(out);
+            let mut attributed = None;
+            for completion in &observed.completions {
+                if let Some(call) = uses.get(completion.call.as_str()) {
+                    let summary = ToolInput::new(session.harness, call.name, call.input, false, true)?;
+                    let label = summary.label(session.harness, call.name);
+                    let outcome = lifecycle_facts(
+                        session.harness,
+                        i,
+                        call.name,
+                        &summary,
+                        &label,
+                        completion.output.as_deref().unwrap_or(result_out),
+                        completion.status,
+                        &mut facts,
+                    );
+                    if completion.call != *tool_use_id {
+                        settle_row(&mut ledger, &completion.call, &outcome);
+                    }
+                    attributed = Some(outcome);
+                }
+            }
+            let outcome = if observed.pending {
+                "unfinished: no terminal result observed".to_owned()
+            } else if let Some(outcome) = attributed {
+                outcome
+            } else {
+                lifecycle_facts(
+                    session.harness,
+                    i,
+                    &name,
+                    &summary,
+                    &label,
+                    result_out,
+                    observed.status,
+                    &mut facts,
+                )
+            };
+            if let Some(p) = doc_reads.get(tool_use_id.as_str()) {
+                if !in_tail && demand != Demand::Findings && last_read_of.get(p) == Some(&tool_use_id.as_str()) {
+                    timeline.push(Entry {
+                        idx: i,
+                        when: when(m),
+                        heading: format!("agent read {p} (a document named in its instructions)"),
+                        body: format!(
+                            "```\n{}\n```",
+                            head_tail(out, opts.note_max, &format!("cv cat {retrieve_ref} {tool_use_id}"))
+                        ),
+                    });
+                }
+            }
+            if summary.has_spawn()
+                && !in_tail
+                && demand != Demand::Findings
+                && is_sync_spawn_return(session.harness, &name, out)
+            {
+                let desc = if name == "Agent" || name == "Task" {
+                    summary
+                        .fields
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .trim()
+                } else {
+                    summary.spawn_hint().unwrap_or("").trim()
+                };
+                timeline.push(Entry {
+                    idx: i,
+                    when: when(m),
+                    heading: format!("sub-agent returned ({})", truncate(desc, 80)),
+                    body: head_tail(out, opts.note_max, &format!("cv cat {retrieve_ref} {tool_use_id}")),
+                });
+            }
+            let keep_whole = in_tail && out_len <= opts.tail_result_max;
+            if !keep_whole && demand != Demand::Findings {
+                elided_outputs += 1;
+            }
+            if !keep_whole && demand == Demand::Full {
+                #[cfg(test)]
+                note_work(|work| work.elided_copy_bytes += out_len);
+                elided.push(Elided {
+                    tool_use_id: tool_use_id.clone(),
+                    tool_name: name.clone(),
+                    input: original_input.resolve()?.into_owned(),
+                    content: out.to_string(),
+                });
+            }
+            if in_tail && demand != Demand::Findings && m.is_model_visible() {
+                let tail_text = if out_len > opts.tail_result_max {
+                    head_tail(
+                        out,
+                        opts.tail_result_max,
+                        &format!("cv cat {retrieve_ref} {tool_use_id}"),
+                    )
+                } else {
+                    out_cow.into_owned()
+                };
+                cache.tail_results.insert((i, index), tail_text);
+            }
+            if !in_tail && opts.ledger {
+                let use_idx = uses.get(tool_use_id.as_str()).map(|c| c.msg).unwrap_or(i);
+                match ledger.last_mut() {
+                    Some(last) if last.2 == label => {
+                        last.1 = use_idx;
+                        last.3 = outcome;
+                        last.4 = tool_use_id.clone();
+                        last.5 = out_len;
+                        *ledger_runs.last_mut().unwrap() += 1;
+                    }
+                    _ => {
+                        ledger.push((use_idx, use_idx, label, outcome, tool_use_id.clone(), out_len));
+                        ledger_runs.push(1);
+                    }
                 }
             }
         }
@@ -1571,154 +1680,6 @@ fn analyze_with_policy(
                     }
                 }
             }
-            (Role::Tool, _) | (Role::User, MessageKind::ToolResult) => {
-                for (index, b) in m.content.iter().enumerate() {
-                    let Block::ToolResult {
-                        tool_use_id,
-                        is_error,
-                        tool_name,
-                        status,
-                        ..
-                    } = b
-                    else {
-                        continue;
-                    };
-                    let orphan = crate::Json::from(Value::Null);
-                    let (name, original_input) = uses
-                        .get(tool_use_id.as_str())
-                        .map(|call| (call.name.to_string(), call.input))
-                        .unwrap_or_else(|| (tool_name.clone().unwrap_or_default(), &orphan));
-                    let summary = ToolInput::new(session.harness, &name, original_input, false, true)?;
-                    let label = summary.label(session.harness, &name);
-                    let out_cow = cache.resolve_tool_result(i, index)?;
-                    let out = out_cow.as_ref();
-                    let out_len = out.len();
-                    let result = LifecycleResult {
-                        message: Some(m),
-                        tool: &name,
-                        ops: &summary.ops,
-                        body: out,
-                        status: status.as_deref(),
-                        is_error: *is_error,
-                    };
-                    let observation = adapter
-                        .as_ref()
-                        .map_or_else(|| Observation::result(&result), |a| a.tool_result_lifecycle(&result));
-                    let observed = lifecycle.result(tool_use_id, observation);
-                    let result_out = observed.output.as_deref().unwrap_or(out);
-                    let mut attributed = None;
-                    for completion in &observed.completions {
-                        if let Some(call) = uses.get(completion.call.as_str()) {
-                            let summary = ToolInput::new(session.harness, call.name, call.input, false, true)?;
-                            let label = summary.label(session.harness, call.name);
-                            attributed = Some(lifecycle_facts(
-                                session.harness,
-                                i,
-                                call.name,
-                                &summary,
-                                &label,
-                                completion.output.as_deref().unwrap_or(result_out),
-                                completion.status,
-                                &mut facts,
-                            ));
-                        }
-                    }
-                    let outcome = if observed.pending {
-                        "unfinished: no terminal result observed".to_owned()
-                    } else if let Some(outcome) = attributed {
-                        outcome
-                    } else {
-                        lifecycle_facts(
-                            session.harness,
-                            i,
-                            &name,
-                            &summary,
-                            &label,
-                            result_out,
-                            observed.status,
-                            &mut facts,
-                        )
-                    };
-                    if let Some(p) = doc_reads.get(tool_use_id.as_str()) {
-                        if !in_tail && demand != Demand::Findings && last_read_of.get(p) == Some(&tool_use_id.as_str())
-                        {
-                            timeline.push(Entry {
-                                idx: i,
-                                when: when(m),
-                                heading: format!("agent read {p} (a document named in its instructions)"),
-                                body: format!(
-                                    "```\n{}\n```",
-                                    head_tail(out, opts.note_max, &format!("cv cat {retrieve_ref} {tool_use_id}"))
-                                ),
-                            });
-                        }
-                    }
-                    if summary.has_spawn()
-                        && !in_tail
-                        && demand != Demand::Findings
-                        && is_sync_spawn_return(session.harness, &name, out)
-                    {
-                        let desc = if name == "Agent" || name == "Task" {
-                            summary
-                                .fields
-                                .get("description")
-                                .and_then(Value::as_str)
-                                .unwrap_or("")
-                                .trim()
-                        } else {
-                            summary.spawn_hint().unwrap_or("").trim()
-                        };
-                        timeline.push(Entry {
-                            idx: i,
-                            when: when(m),
-                            heading: format!("sub-agent returned ({})", truncate(desc, 80)),
-                            body: head_tail(out, opts.note_max, &format!("cv cat {retrieve_ref} {tool_use_id}")),
-                        });
-                    }
-                    let keep_whole = in_tail && out_len <= opts.tail_result_max;
-                    if !keep_whole && demand != Demand::Findings {
-                        elided_outputs += 1;
-                    }
-                    if !keep_whole && demand == Demand::Full {
-                        #[cfg(test)]
-                        note_work(|work| work.elided_copy_bytes += out_len);
-                        elided.push(Elided {
-                            tool_use_id: tool_use_id.clone(),
-                            tool_name: name.clone(),
-                            input: original_input.resolve()?.into_owned(),
-                            content: out.to_string(),
-                        });
-                    }
-                    if in_tail && demand != Demand::Findings && m.is_model_visible() {
-                        let tail_text = if out_len > opts.tail_result_max {
-                            head_tail(
-                                out,
-                                opts.tail_result_max,
-                                &format!("cv cat {retrieve_ref} {tool_use_id}"),
-                            )
-                        } else {
-                            out_cow.into_owned()
-                        };
-                        cache.tail_results.insert((i, index), tail_text);
-                    }
-                    if !in_tail && opts.ledger {
-                        let use_idx = uses.get(tool_use_id.as_str()).map(|c| c.msg).unwrap_or(i);
-                        match ledger.last_mut() {
-                            Some(last) if last.2 == label => {
-                                last.1 = use_idx;
-                                last.3 = outcome;
-                                last.4 = tool_use_id.clone();
-                                last.5 = out_len;
-                                *ledger_runs.last_mut().unwrap() += 1;
-                            }
-                            _ => {
-                                ledger.push((use_idx, use_idx, label, outcome, tool_use_id.clone(), out_len));
-                                ledger_runs.push(1);
-                            }
-                        }
-                    }
-                }
-            }
             _ => {}
         }
         // Paths the agent itself names in prose count toward the path index too.
@@ -1740,6 +1701,27 @@ fn analyze_with_policy(
             }
         }
     }
+
+    let unsettled = lifecycle
+        .unsettled()
+        .into_iter()
+        .map(|(id, why)| {
+            let call = uses.get(id.as_str());
+            let label = call
+                .map(|call| {
+                    ToolInput::new(session.harness, call.name, call.input, false, true)
+                        .map(|summary| summary.label(session.harness, call.name))
+                })
+                .transpose()?
+                .unwrap_or_default();
+            Ok(Unsettled {
+                id,
+                label,
+                message: call.map(|call| call.msg),
+                why,
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
 
     // ── render the head ──
     let label = analysis_label(session, &cache.resolver)?;
@@ -1777,6 +1759,7 @@ fn analyze_with_policy(
                 retrieve_ref,
                 brief_text: None,
                 earlier_md: String::new(),
+                unsettled,
             },
             tail: Vec::new(),
             keep_last: opts.keep_last,
@@ -1803,7 +1786,7 @@ fn analyze_with_policy(
         session.id,
     );
     let elided_hint = (opts.ledger && elided_outputs > 0).then_some((retrieve_ref.as_str(), elided_outputs));
-    render_handoff(&mut h, last_words.as_ref(), &facts, msgs, elided_hint);
+    render_handoff(&mut h, last_words.as_ref(), &facts, msgs, elided_hint, &unsettled);
     render_grounding(
         &mut h,
         &ground(session, msgs, &uses, &mut cache, live_fs, session.updated_at)?,
@@ -1896,6 +1879,7 @@ fn analyze_with_policy(
             retrieve_ref,
             brief_text: brief.map(|(_, text)| text),
             earlier_md: earlier,
+            unsettled,
         },
         tail,
         keep_last: opts.keep_last,
@@ -2510,6 +2494,7 @@ fn render_handoff(
     f: &Facts,
     msgs: &[Message],
     elided: Option<(&str, usize)>,
+    unsettled: &[Unsettled],
 ) {
     let newest = |list: &[(usize, String, String)], n: usize| -> Vec<String> {
         let mut seen = HashSet::new();
@@ -2531,7 +2516,13 @@ fn render_handoff(
             .collect::<Vec<_>>()
             .join(" · ")
     };
-    if last_words.is_none() && heads.is_empty() && tips.is_empty() && f.pid_files.is_empty() && elided.is_none() {
+    if last_words.is_none()
+        && heads.is_empty()
+        && tips.is_empty()
+        && f.pid_files.is_empty()
+        && elided.is_none()
+        && unsettled.is_empty()
+    {
         return;
     }
     let _ = writeln!(
@@ -2561,6 +2552,25 @@ fn render_handoff(
             "- **Directories it worked in** (newest last): {}",
             recent(&f.dirs, 4)
         );
+    }
+    if !unsettled.is_empty() {
+        let _ = writeln!(
+            h,
+            "- **Unresolved calls** ({}): the source never shows these ending. That is not proof they \
+             are still running, and nothing here says they succeeded: check each before relying on \
+             it or starting it again.",
+            unsettled.len()
+        );
+        for call in unsettled {
+            let at = call.message.map(|i| format!("[{i}] ")).unwrap_or_default();
+            let _ = writeln!(
+                h,
+                "  - {at}{} · `{}` · {}",
+                truncate(first_line(&call.label), 160),
+                call.id,
+                call.why
+            );
+        }
     }
     // On session 698fc87d no successor ran `cv cat` once: nothing in the pack named an id.
     if let Some((reference, n)) = elided {

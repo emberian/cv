@@ -34,6 +34,8 @@ pub struct ToolResult<'a> {
     pub body: &'a str,
     pub status: Option<&'a str>,
     pub is_error: bool,
+    /// The result block's structured sidecar, when the adapter kept one at this read's tier.
+    pub details: Option<&'a serde_json::Value>,
 }
 
 #[derive(Debug, Clone)]
