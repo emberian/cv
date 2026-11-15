@@ -1514,6 +1514,8 @@ fn scan_transcript(id: &str, transcript: &Path, app_data_dir: Option<&Path>) -> 
     };
     let mtime: Option<DateTime<Utc>> = meta.modified().ok().map(Into::into);
 
+    // Only the store-backed build retitles from the first native prompt.
+    #[cfg_attr(not(feature = "sqlite"), allow(unused_mut))]
     let mut title = app_data_dir
         .and_then(|app| read_pbtxt_title(&app.join("annotations").join(format!("{id}.pbtxt"))))
         .filter(|t| !t.trim().is_empty());

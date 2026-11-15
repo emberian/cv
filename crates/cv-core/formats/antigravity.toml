@@ -5,7 +5,7 @@
 # tests/formats_manifest.rs holds it to the adapter source.
 
 harness = "antigravity"
-source_files = ["harness/antigravity.rs"]
+source_files = ["harness/antigravity.rs", "harness/antigravity/native.rs", "harness/antigravity/native/meta.rs"]
 ignore_literals = []
 store = [
   "$JETSKI_APP_DATA_DIR or ~/.gemini/{antigravity-cli,antigravity,antigravity-ide}/brain/<uuid>/.system_generated/logs/transcript_full.jsonl",

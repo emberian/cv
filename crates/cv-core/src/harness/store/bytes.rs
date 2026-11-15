@@ -60,7 +60,7 @@ thread_local! {
     static SPILLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 /// Temporary files this thread has created: a test's count of an operation's staging.
-#[cfg(test)]
+#[cfg(all(test, feature = "sqlite"))]
 pub(crate) fn spills_created() -> usize {
     SPILLS.with(std::cell::Cell::get)
 }

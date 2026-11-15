@@ -134,7 +134,7 @@ impl Read {
     }
 
     /// The decoded copy's bytes, for a test of what an adapter projected.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "sqlite"))]
     pub(crate) fn decoded_bytes(&self) -> Option<Vec<u8>> {
         let (backing, len) = self.decoded.as_ref()?;
         let mut bytes = Vec::new();
