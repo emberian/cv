@@ -16,7 +16,7 @@ keeps their provenance and separates unresolved work from obsolete requests.
 ## Current additions (`6809bfa5`)
 
 Implemented in cv; final composed gates are underway. These add to the earlier validated
-candidate, rather than inheriting its gate result. `fn` is excluded from this release.
+candidate, rather than inheriting its gate result.
 
 | User action | Implemented contract | Code/test witness |
 |---|---|---|
