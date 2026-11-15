@@ -40,6 +40,29 @@ fn context_view_counts_calls_once_keeps_unknowns_and_labels_saved_estimates() {
     let rows = rows(&w, &[]);
     let rows = rows.as_array().unwrap();
     assert_eq!(rows.len(), 4, "{rows:#?}");
+    let (schema, _) = w.cv_ok(&["schema", "--json"]);
+    let schema: Value = serde_json::from_str(&schema).unwrap();
+    let keys: std::collections::BTreeSet<_> = schema["context_row"]["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|key| key.as_str().unwrap())
+        .collect();
+    for row in rows {
+        assert_eq!(
+            row.as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>(),
+            keys
+        );
+        assert!(schema["context_row"]["kind"].as_array().unwrap().contains(&row["kind"]));
+        assert!(schema["context_row"]["usage_basis"]
+            .as_array()
+            .unwrap()
+            .contains(&row["usage_basis"]));
+    }
     assert_eq!(rows[0]["index"], 1);
     assert_eq!(rows[0]["prompt_tokens"], 115);
     assert_eq!(rows[0]["usage"]["cache_read_tokens"], 100);

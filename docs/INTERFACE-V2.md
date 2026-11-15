@@ -162,6 +162,20 @@ every command of the clap tree on a pipe under this contract.
   `message`, `block`, `prompt_row`, `lane` and `query`; the manual's architecture
   chapter is the prose.
 - A **message** is the IR `Message`. A **block** is the IR `Block`, tagged by `type`.
+- A **context row** (`show --kind context --json`, `GET /api/session/{harness}/{id}/context`)
+  is `{ index, timestamp, kind, model, usage, usage_basis, prompt_tokens, context_window,
+  pre_compaction_tokens, trigger }`. Both interfaces return an array in transcript order;
+  `kind` is `usage`, `compaction_boundary`, or `context_limit`, and `index` is the original
+  message index. Unknown or inapplicable row values are `null`; missing components inside the
+  normalized IR `usage` object are omitted. An empty selection or no usable records gives `[]`.
+  Prompt counts sum recorded uncached input, cache reads and cache writes; repeated cumulative
+  notices and split records for the same provider response contribute once. Limits are shown
+  only on records that explicitly carry them. `usage_basis: estimated` marks saved
+  `prune --revive` estimates; `recorded` means saved counts, not independently measured context.
+  This projection computes no new estimates or remaining-context guesses and stores no history.
+  `--first/--last/--range` and API `first/last/start-end` select projected rows; `--around` / API
+  `around` anchors to an original message index or ID, with `context` rows on each side (default
+  five). API `[start,end)` is half-open and mixed selector families are rejected.
 
 ## 4. The IR (cv-core `ir.rs`)
 
