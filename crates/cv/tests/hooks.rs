@@ -1045,8 +1045,8 @@ fn the_compact_hook_names_what_its_budget_left_unread() {
 }
 
 /// A store that exists and cannot be read leaves "who is retired" unknown. The guard refuses the
-/// calls that would wake an agent, allows the rest with the cause on stderr, and `cv retire`
-/// fails instead of listing the legacy rows as the whole ledger.
+/// calls that would wake an agent and allows the rest silently; `cv retire` fails instead of
+/// listing the legacy rows as the whole ledger.
 #[test]
 fn retired_guard_and_list_report_an_unreadable_ledger() {
     let w = World::new("retired-unreadable-ledger");
@@ -1088,7 +1088,7 @@ fn retired_guard_and_list_report_an_unreadable_ledger() {
             "{reason}"
         );
 
-        // An ordinary call and a background poll are not agent wakes: allowed, with the cause said.
+        // An ordinary call and a background poll are not agent wakes: allowed, without noise.
         for (tool, input) in [
             ("Read", json!({"file_path": "/work/proj/a.rs"})),
             ("BashOutput", json!({"bash_id": "bash_7"})),
@@ -1102,11 +1102,7 @@ fn retired_guard_and_list_report_an_unreadable_ledger() {
                 ),
                 frozen,
             );
-            assert_eq!(out, "", "{tool}");
-            assert!(
-                err.contains("could not be read") && err.contains("allowed"),
-                "{tool}: {err}"
-            );
+            assert_eq!((out.as_str(), err.as_str()), ("", ""), "{tool}");
         }
     }
 }

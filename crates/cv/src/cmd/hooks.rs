@@ -2051,15 +2051,13 @@ fn hook_retired(ev: &Event, payload: &Value) -> Result<Option<Value>> {
 
 /// The ledger exists and could not be read, so who is retired is unknown. A call that would wake
 /// another agent is refused, because waking a retired lane is the harm this guard exists to stop
-/// and the caller can retry. Every other call is allowed with the cause on stderr: refusing them
-/// would stop every agent on the machine for as long as the store stays unreadable.
+/// and the caller can retry. Every other call is allowed, silently: refusing them, or printing on
+/// each, would stop or flood every agent on the machine for as long as the store stays unreadable.
+/// `cv retire` reports the same failure to whoever looks.
 fn retired_ledger_unreadable(ev: &Event, payload: &Value, err: &std::io::Error) -> Result<Option<Value>> {
     let ledger = cv_core::retired::ledger_path();
     let Some(to) = agents_woken_by_tool_call(ev.harness, payload).into_iter().next() else {
-        anyhow::bail!(
-            "the retired ledger at {} could not be read ({err}); this call was allowed without checking it",
-            ledger.display()
-        );
+        return Ok(None);
     };
     Ok(Some(json!({"hookSpecificOutput": {
         "hookEventName": "PreToolUse",
