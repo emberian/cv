@@ -24,7 +24,7 @@ impl Migration {
         if !dir.join("meta.json").try_exists()? {
             return Ok(None);
         }
-        let index = Index::open_in_dir(dir).context("checking full-text index schema")?;
+        let index = directory::open(dir, false).context("checking full-text index schema")?;
         let needs_replacement = |index: &Index| -> Result<bool> {
             if !schema_current(&index.schema()) {
                 return Ok(true);
@@ -39,7 +39,7 @@ impl Migration {
             .acquire_lock(&INDEX_WRITER_LOCK)
             .context("locking full-text index for schema migration; retry after the active writer finishes")?;
         // A migration may have completed between the first open and acquiring the lock.
-        if !needs_replacement(&Index::open_in_dir(dir)?)? {
+        if !needs_replacement(&directory::open(dir, false)?)? {
             return Ok(None);
         }
         let id = uuid::Uuid::new_v4().to_string();
@@ -51,7 +51,7 @@ impl Migration {
             directory,
             _writer_lock: writer_lock,
         };
-        Index::create_in_dir(&migration.stage, build_schema_with_consumer(Some(&id)))?;
+        directory::create(&migration.stage, build_schema_with_consumer(Some(&id)))?;
         Ok(Some(migration))
     }
 

@@ -44,6 +44,7 @@
 mod observe;
 #[cfg(test)]
 use observe::{body_hash, SweepWork};
+mod directory;
 mod live;
 mod migration;
 mod prepared;
@@ -185,10 +186,10 @@ fn fields_current(schema: &Schema) -> bool {
 fn open_or_create(dir: &Path) -> Result<(Index, Fields)> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating tantivy dir {}", dir.display()))?;
     let index = if !dir.join("meta.json").try_exists()? {
-        Index::create_in_dir(dir, build_schema())
+        directory::create(dir, build_schema())
             .with_context(|| format!("creating tantivy index in {}", dir.display()))?
     } else {
-        Index::open_in_dir(dir).with_context(|| format!("opening tantivy index at {}", dir.display()))?
+        directory::open(dir, false).with_context(|| format!("opening tantivy index at {}", dir.display()))?
     };
     anyhow::ensure!(
         schema_current(&index.schema()),
@@ -202,10 +203,7 @@ fn open_or_create(dir: &Path) -> Result<(Index, Fields)> {
 /// failure during a search must not wipe an index that took an hour to build. A stale-schema index
 /// is an error pointing at `cv index` (whose path is the one allowed to rebuild).
 fn open_existing(dir: &Path) -> Result<(Index, Fields)> {
-    let directory = tantivy::directory::MmapDirectory::open(dir)
-        .map(|inner| ReadDir(inner, dir.to_path_buf()))
-        .with_context(|| format!("opening tantivy index at {}", dir.display()))?;
-    let index = Index::open(directory).with_context(|| format!("opening tantivy index at {}", dir.display()))?;
+    let index = directory::open(dir, true).with_context(|| format!("opening tantivy index at {}", dir.display()))?;
     if !schema_current(&index.schema()) {
         anyhow::bail!(
             "full-text index at {} was built by an older cv — run `cv index` to rebuild it",
@@ -214,66 +212,6 @@ fn open_existing(dir: &Path) -> Result<(Index, Fields)> {
     }
     let fields = fields_of(&index.schema())?;
     Ok((index, fields))
-}
-
-/// The index directory as a query opens it. tantivy holds `.tantivy-meta.lock` while a reader
-/// opens its segments, so a writer's garbage collection cannot delete a file between the listing
-/// and the open, and it takes that lock by opening the file for writing, which a sandbox that
-/// denies writes to the home refuses. A reader needs no write for it: a shared lock on the lock
-/// file opened read-only still excludes the writer's exclusive one, and readers no longer queue
-/// behind each other. With no lock file no writer has run in this directory. A query asks for no
-/// other lock (the writer lock belongs to `cv index`), so any other is refused.
-#[derive(Clone, Debug)]
-struct ReadDir(tantivy::directory::MmapDirectory, PathBuf);
-
-impl tantivy::Directory for ReadDir {
-    fn get_file_handle(
-        &self,
-        path: &Path,
-    ) -> Result<std::sync::Arc<dyn tantivy::directory::FileHandle>, tantivy::directory::error::OpenReadError> {
-        self.0.get_file_handle(path)
-    }
-    fn delete(&self, path: &Path) -> Result<(), tantivy::directory::error::DeleteError> {
-        self.0.delete(path)
-    }
-    fn exists(&self, path: &Path) -> Result<bool, tantivy::directory::error::OpenReadError> {
-        self.0.exists(path)
-    }
-    fn open_write(
-        &self,
-        path: &Path,
-    ) -> Result<tantivy::directory::WritePtr, tantivy::directory::error::OpenWriteError> {
-        self.0.open_write(path)
-    }
-    fn atomic_read(&self, path: &Path) -> Result<Vec<u8>, tantivy::directory::error::OpenReadError> {
-        self.0.atomic_read(path)
-    }
-    fn atomic_write(&self, path: &Path, data: &[u8]) -> std::io::Result<()> {
-        self.0.atomic_write(path, data)
-    }
-    fn sync_directory(&self) -> std::io::Result<()> {
-        self.0.sync_directory()
-    }
-    fn watch(&self, callback: tantivy::directory::WatchCallback) -> tantivy::Result<tantivy::directory::WatchHandle> {
-        self.0.watch(callback)
-    }
-    fn acquire_lock(
-        &self,
-        lock: &tantivy::directory::Lock,
-    ) -> Result<tantivy::directory::DirectoryLock, tantivy::directory::error::LockError> {
-        use tantivy::directory::{error::LockError, DirectoryLock};
-        if lock.filepath != tantivy::directory::META_LOCK.filepath {
-            return Err(LockError::LockBusy);
-        }
-        match std::fs::File::open(self.1.join(&lock.filepath)) {
-            Ok(file) => {
-                file.lock_shared().map_err(LockError::wrap_io_error)?;
-                Ok(DirectoryLock::from(Box::new(file)))
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(DirectoryLock::from(Box::new(()))),
-            Err(error) => Err(LockError::wrap_io_error(error)),
-        }
-    }
 }
 
 const COMMIT_EVERY: usize = 256;
