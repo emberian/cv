@@ -1224,6 +1224,66 @@ pub fn primary_path(r: &SessionRef) -> PathBuf {
     crate::harness::for_harness(r.harness).map_or_else(|| r.path.clone(), |adapter| adapter.resume_source(r))
 }
 
+/// Which sessions' stores are not there, as a consumer about to reap must ask.
+///
+/// A session a complete discovery did not list was either removed from its store or sits in a
+/// store that is itself gone: an unmounted volume, a home restored without it, a root that
+/// moved. Adapters list only the roots that exist ([`crate::harness::Adapter::roots`]), so the
+/// second case arrives as a successful inventory of nothing. It is told from the first by the
+/// filesystem: the session's primary source is missing and the nearest directory that still
+/// exists above it lies outside every root its harness has now. Deleting a transcript, a project
+/// directory or a database leaves that directory inside a root, and is a removal.
+#[derive(Default)]
+pub struct Presence {
+    roots: HashMap<Option<Harness>, Vec<PathBuf>>,
+}
+
+impl Presence {
+    /// The nearest existing directory above `r`'s missing source when no present root of its
+    /// harness holds it; `None` when the source exists or was removed from a store that is there.
+    pub fn absent_store(&mut self, r: &SessionRef) -> Option<PathBuf> {
+        let adapter = crate::harness::for_harness(r.harness)?;
+        self.absent(&adapter.resume_source(r), Some(r.harness))
+    }
+
+    /// [`Self::absent_store`] for a consumer that kept a session's path without its harness:
+    /// judged against the roots of every harness.
+    pub fn absent_path(&mut self, path: &Path) -> Option<PathBuf> {
+        self.absent(path, None)
+    }
+
+    fn absent(&mut self, source: &Path, harness: Option<Harness>) -> Option<PathBuf> {
+        // A path that cannot be examined (EACCES, EIO on a failing mount) is not evidence of a
+        // removal either: it is reported as the absent store itself.
+        let mut nearest = None;
+        for path in source.ancestors() {
+            match path.try_exists() {
+                Ok(true) if path == source => return None,
+                Ok(true) => {
+                    nearest = Some(path);
+                    break;
+                }
+                Ok(false) => {}
+                Err(_) => return Some(path.to_owned()),
+            }
+        }
+        let nearest = nearest?;
+        let nearest = nearest.canonicalize().unwrap_or_else(|_| nearest.to_owned());
+        let roots = self.roots.entry(harness).or_insert_with(|| {
+            let adapters = match harness {
+                Some(harness) => crate::harness::for_harness(harness).into_iter().collect(),
+                None => crate::harness::all(),
+            };
+            adapters
+                .iter()
+                .flat_map(|adapter| adapter.roots())
+                .map(|root| root.canonicalize().unwrap_or(root))
+                .collect()
+        });
+        (!roots.iter().any(|root| nearest.starts_with(root))).then_some(nearest)
+    }
+}
+
 /// Transcript byte size of `r` ([`Probe::ref_size`]).
 pub fn ref_size(r: &SessionRef) -> Option<u64> {
     Probe::default().ref_size(r)

@@ -1749,10 +1749,14 @@ pub fn sync_sessions(
         .collect();
 
     let mut removed = 0usize;
+    // A session whose store is gone (an unmounted root) is not one removed from its store:
+    // its grams wait for the store, as its full-text docs do.
+    let mut presence = cv_core::source::Presence::default();
     let vanished: Vec<String> = manifest
         .sessions
         .iter()
         .filter(|(id, ptr)| !seen_ids.contains(*id) && (subagents || !ptr.folded))
+        .filter(|(_, ptr)| presence.absent_path(&ptr.path).is_none())
         .map(|(id, _)| id.clone())
         .collect();
     for id in vanished {

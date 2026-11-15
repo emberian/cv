@@ -534,6 +534,14 @@ fn report(swept: Swept, rebuild: bool, strict: bool) -> Result<Indexed> {
             );
         }
     }
+    for kept in &swept.absent {
+        eprintln!(
+            "cv: warning: kept {} indexed session(s) of {} whose store is absent (nothing below {}); they answer searches as last indexed until the store returns",
+            kept.sessions,
+            kept.harness,
+            kept.nearest.display()
+        );
+    }
     let unread = swept.unreadable.len();
     anyhow::ensure!(
         swept.errors == unread,
@@ -579,6 +587,8 @@ pub(crate) struct Swept {
     pub unreadable: Vec<Unreadable>,
     /// Sessions reaped because their files are gone.
     pub removed: usize,
+    /// Indexed sessions kept because their store is gone, not they from it.
+    absent: Vec<AbsentStore>,
     /// Sessions read only from their mark on.
     pub resumed: usize,
     #[cfg(test)]
@@ -865,6 +875,7 @@ fn sweep_refs_after(
                 total,
                 copies,
                 unchanged: plan.unchanged,
+                absent: plan.absent,
                 ..Default::default()
             });
         }
@@ -878,6 +889,7 @@ fn sweep_refs_after(
         unchanged,
         jobs,
         missing,
+        absent,
         retained,
         consumer,
     } = plan;
@@ -909,6 +921,7 @@ fn sweep_refs_after(
         changed: ran.changed,
         unchanged,
         removed,
+        absent,
         resumed: ran.resumed,
         errors: ran.errors + ran.unreadable.len(),
         first_error: ran.first_error,
@@ -918,10 +931,20 @@ fn sweep_refs_after(
     })
 }
 
+/// Indexed sessions of one harness kept because their store is not there.
+#[derive(Debug)]
+pub(crate) struct AbsentStore {
+    harness: cv_core::Harness,
+    sessions: usize,
+    /// The nearest directory that still exists above one of them.
+    nearest: PathBuf,
+}
+
 struct SweepPlan {
     unchanged: usize,
     jobs: Vec<Job>,
     missing: Vec<String>,
+    absent: Vec<AbsentStore>,
     retained: HashSet<String>,
     consumer: String,
 }
@@ -992,11 +1015,33 @@ impl SweepPlanner<'_> {
             unchanged += usize::from(fts_fresh);
             jobs.extend(job);
         }
-        let missing = if prune_missing {
+        let mut missing = if prune_missing {
             missing_ids(&state.existing, &seen, &state.folded, subagents)
         } else {
             Vec::new()
         };
+        // An inventory that lacks a session because its whole store is gone (an unmounted
+        // volume) does not authorize reaping it: only a store that is there can say so.
+        let mut presence = cv_core::source::Presence::default();
+        let mut absent: Vec<AbsentStore> = Vec::new();
+        missing.retain(|id| {
+            let Some(indexed) = state.metadata.get(id).map(|m| &m.session) else {
+                return true;
+            };
+            let Some(nearest) = presence.absent_store(indexed) else {
+                return true;
+            };
+            seen.insert(id.clone());
+            match absent.iter_mut().find(|kept| kept.harness == indexed.harness) {
+                Some(kept) => kept.sessions += 1,
+                None => absent.push(AbsentStore {
+                    harness: indexed.harness,
+                    sessions: 1,
+                    nearest,
+                }),
+            }
+            false
+        });
         if !subagents {
             seen.extend(state.folded);
         }
@@ -1004,6 +1049,7 @@ impl SweepPlanner<'_> {
             unchanged,
             jobs,
             missing,
+            absent,
             retained: seen,
             consumer: state.consumer,
         })
