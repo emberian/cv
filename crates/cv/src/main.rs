@@ -918,10 +918,14 @@ enum Cmd {
         #[arg(long)]
         force: bool,
     },
-    /// Compile a context bundle for a new task from your whole session corpus.
+    /// Compile a context bundle from selected sessions or sessions recalled for a task.
     Pack {
-        /// What you're about to work on — recall finds the relevant past spans.
-        task: String,
+        /// What you're about to work on — recall finds relevant spans, or focuses the selected sessions.
+        #[arg(required_unless_present = "sessions")]
+        task: Option<String>,
+        /// Read only these sessions (harness:id, unique prefix, or transcript path). Repeat to select more.
+        #[arg(long = "session", value_name = "SESSION")]
+        sessions: Vec<String>,
         /// Output shape: `md` (CLAUDE.md-style digest, default), `prompt` (system prompt),
         /// or `session` (a synthetic resumable session — see `--harness`).
         #[arg(long, default_value = "md", value_parser = ["md", "prompt", "session"])]
@@ -929,7 +933,7 @@ enum Cmd {
         /// Target harness when `--format session`.
         #[arg(long)]
         harness: Option<String>,
-        /// Max past sessions to draw from.
+        /// Max sessions to recall for a task. Explicit --session selections are all included.
         #[arg(long, default_value_t = 8)]
         limit: usize,
         /// Write the md/prompt bundle to this file, or `--format session` under this directory.
@@ -1426,6 +1430,7 @@ fn run() -> Result<()> {
         } => share::cmd_share(&id, harness, out, force, no_redact),
         Cmd::Pack {
             task,
+            sessions,
             format,
             harness,
             limit,
@@ -1435,7 +1440,8 @@ fn run() -> Result<()> {
             json,
             excerpt_bytes,
         } => pack::cmd_pack(pack::PackArgs {
-            task: &task,
+            task: task.as_deref(),
+            sessions: &sessions,
             format: &format,
             harness,
             limit,

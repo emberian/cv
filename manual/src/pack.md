@@ -13,6 +13,21 @@ cv pack "fix the parser" --format session --harness claude  # a synthetic resuma
 cv pack "migrate the daemon" --limit 3                  # draw from at most 3 past sessions
 ```
 
+Select sources directly when you already know which conversations you need:
+
+```sh
+cv pack --session claude:SESSION --session codex:SESSION
+cv pack "unfinished UI work" --session /path/to/transcript.jsonl
+```
+
+`--session` accepts an ID, `harness:ID`, or transcript path; prefix a non-Claude path with
+its harness, for example `codex:/path/to/rollout.jsonl`. It bypasses corpus
+search and does not need an index. An optional task focuses excerpts within those sources;
+without one, the pack begins with their opening messages. All explicit sources are included
+(`--limit` only limits search recall). Repeating one source includes it once; different paths
+with matching native IDs remain separate. A missing or unreadable selected source fails the
+command before an output file is written.
+
 ## The pipeline
 
 1. **Recall.** The task is run through `cv_search::Searcher` against the full-text
@@ -50,6 +65,7 @@ many items each cut; distinct commands run are kept whole.
 |---|---|
 | `--format md\|prompt\|session` | output shape (default `md`) |
 | `--harness <h>` | target harness, for (and only for) `--format session` |
-| `--limit N` | max past sessions to draw from (default 8) |
+| `--session SESSION` | explicitly select a source; repeat for more; bypasses search |
+| `--limit N` | max sessions to recall by task (default 8; does not trim explicit selections) |
 | `--out <path>` | write the bundle to a file instead of stdout |
 | `--excerpt-bytes N` | bytes of one message an excerpt shows (default 1600) |

@@ -1,6 +1,6 @@
 //! `cv pack` — compile a context bundle for a new task from the session corpus.
 //!
-//! Pipeline: **recall** (full-text + live suffix via [`cv_search::Searcher`], plus semantic when
+//! Pipeline: explicit source selection or **recall** (full-text + live suffix via [`cv_search::Searcher`], plus semantic when
 //! embeddings exist, fused by reciprocal rank and deduped by session) → **distill** (an extractive
 //! digest per recalled span: the best-matching message window plus the session's file-edit/command
 //! events from the catalog — no LLM, no network) → **emit** (`md` | `prompt` | `session`).
@@ -30,7 +30,8 @@ const MAX_FILES_PER_SOURCE: usize = 8;
 const MAX_ROLLUP: usize = 12;
 
 pub(crate) struct PackArgs<'a> {
-    pub task: &'a str,
+    pub task: Option<&'a str>,
+    pub sessions: &'a [String],
     pub format: &'a str,
     pub harness: Option<String>,
     pub limit: usize,
@@ -45,6 +46,7 @@ pub(crate) struct PackArgs<'a> {
 pub(crate) fn cmd_pack(args: PackArgs<'_>) -> Result<()> {
     let PackArgs {
         task,
+        sessions,
         format,
         harness,
         limit,
@@ -69,30 +71,55 @@ pub(crate) fn cmd_pack(args: PackArgs<'_>) -> Result<()> {
     };
     let limit = limit.max(1);
 
-    // 1. RECALL — the most relevant past sessions for the task.
-    let hits = recall(task, limit)?;
-    if hits.is_empty() {
-        if json {
-            println!(
-                "{}",
-                serde_json::json!({"task": task, "format": format, "sources": [], "content": null, "path": null})
+    let query = task.unwrap_or("");
+    let task = task.unwrap_or("Selected sessions");
+    let mut sources = Vec::new();
+    if !sessions.is_empty() {
+        // Explicit input is authoritative: never recall outside it or silently omit a bad source.
+        // Resolve all selections before reading so a bad final selector cannot publish a partial pack.
+        let selected = sessions
+            .iter()
+            .map(|spec| {
+                let (harness, id) = crate::util::split_harness_id(spec, None);
+                crate::cmd::distill::resolve_source(id, harness)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut seen = HashSet::new();
+        for (session, adapter) in selected {
+            if !seen.insert((session.harness, session.id.clone(), session.path.clone())) {
+                continue;
+            }
+            let path = session.path.clone();
+            sources.push(
+                build_source(session, adapter.as_ref(), query, excerpt_bytes, true)
+                    .with_context(|| format!("reading selected session {}", path.display()))?,
             );
-        } else {
-            println!("no relevant past sessions for {task:?} — nothing to pack");
         }
-        return Ok(());
-    }
-
-    // 2. DISTILL — one structured digest per recalled span.
-    let mut sources: Vec<PackSource> = Vec::with_capacity(hits.len());
-    for hit in hits {
-        match build_source(&hit, task, excerpt_bytes) {
-            Ok(s) => sources.push(s),
-            Err(e) => eprintln!("cv pack: skipping {} ({}): {e:#}", short_id(&hit.id), hit.harness),
+    } else {
+        // Search still selects candidates for the original task-only form.
+        let hits = recall(query, limit)?;
+        if hits.is_empty() {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({"task": task, "format": format, "sources": [], "content": null, "path": null})
+                );
+            } else {
+                println!("no relevant past sessions for {task:?} — nothing to pack");
+            }
+            return Ok(());
         }
-    }
-    if sources.is_empty() {
-        bail!("recall matched sessions but none could be read back from disk (stale index? run `cv index`)");
+        for hit in hits {
+            let source = resolve_hit(&hit)
+                .and_then(|(session, adapter)| build_source(session, adapter.as_ref(), query, excerpt_bytes, false));
+            match source {
+                Ok(source) => sources.push(source),
+                Err(error) => eprintln!("cv pack: skipping {} ({}): {error:#}", short_id(&hit.id), hit.harness),
+            }
+        }
+        if sources.is_empty() {
+            bail!("recall matched sessions but none could be read back from disk (stale index? run `cv index`)");
+        }
     }
     let (rollup, rollup_dropped) = rollup_files(&sources);
     let bounds = Bounds {
@@ -366,10 +393,12 @@ fn lexical_score<'a>(text: &str, needle: &str, words: impl Iterator<Item = &'a s
 /// `--excerpt-bytes` (marked `…`).
 type Excerpt = Vec<(Role, String, bool)>;
 
-/// One recalled session, distilled: identity off the hit, the best-matching excerpt window, and
+/// One resolved session, distilled: its metadata, the best-matching excerpt window, and
 /// the catalog's record of what the session actually DID.
 struct PackSource {
-    hit: cv_search::Hit,
+    session: cv_core::SessionRef,
+    /// Explicit selections link back to their path so duplicate native IDs remain distinguishable.
+    selected: bool,
     /// Window around the best match of the task.
     excerpt: Excerpt,
     /// 0-based `[lo, hi)` message window the excerpt came from — the `cv show --range` hint.
@@ -382,18 +411,33 @@ struct PackSource {
     commands: Vec<String>,
 }
 
-fn build_source(hit: &cv_search::Hit, task: &str, excerpt_bytes: usize) -> Result<PackSource> {
-    let want = Harness::parse(&hit.harness);
-    let (r, adapter) =
-        cv_core::find(&hit.id, want)?.with_context(|| format!("session {} no longer on disk", short_id(&hit.id)))?;
+fn resolve_hit(hit: &cv_search::Hit) -> Result<(cv_core::SessionRef, Box<dyn cv_core::Adapter>)> {
+    if let Some(session) = &hit.session {
+        let adapter = cv_core::harness::for_harness(session.harness)
+            .with_context(|| format!("no adapter for {}", session.harness))?;
+        return Ok((session.clone(), adapter));
+    }
+    cv_core::find(&hit.id, Harness::parse(&hit.harness))?
+        .with_context(|| format!("session {} no longer on disk", short_id(&hit.id)))
+}
 
-    // Stale events ride the excerpt pass; event failure remains best effort.
-    let (excerpt, excerpt_range) = best_window_and_ingest(adapter.as_ref(), &r, task, excerpt_bytes)?;
-    let rows = cv_core::events::events_for(r.harness.as_str(), &r.id, None)?;
+fn build_source(
+    session: cv_core::SessionRef,
+    adapter: &dyn cv_core::Adapter,
+    task: &str,
+    excerpt_bytes: usize,
+    selected: bool,
+) -> Result<PackSource> {
+    // Carry the resolved source through the read, including path-selected duplicate IDs.
+    let mut resolved = session.clone();
+    let (excerpt, excerpt_range) =
+        best_window_and_ingest_meta(adapter, &session, task, excerpt_bytes, Some(&mut resolved))?;
+    let rows = cv_core::events::read_ref(&session, None)?;
     let EventFacts { edits, reads, commands } = event_facts(&rows);
 
     Ok(PackSource {
-        hit: hit.clone(),
+        session: resolved,
+        selected,
         excerpt,
         excerpt_range,
         edits,
@@ -442,18 +486,29 @@ fn event_facts(rows: &[cv_core::events::EventRow]) -> EventFacts {
 
 /// Stream the session once (lazy spans, head-capped per message) and return a compact window of
 /// `(role, trimmed text)` around the message that best matches `task`, plus its `[lo, hi)` range.
+#[cfg(test)]
 fn best_window_and_ingest(
     adapter: &dyn cv_core::Adapter,
     r: &cv_core::SessionRef,
     task: &str,
     limit: usize,
 ) -> Result<(Excerpt, Option<(usize, usize)>)> {
+    best_window_and_ingest_meta(adapter, r, task, limit, None)
+}
+
+fn best_window_and_ingest_meta(
+    adapter: &dyn cv_core::Adapter,
+    r: &cv_core::SessionRef,
+    task: &str,
+    limit: usize,
+    metadata: Option<&mut cv_core::SessionRef>,
+) -> Result<(Excerpt, Option<(usize, usize)>)> {
     if !cv_core::events::needs_ingest(r) {
-        return best_window(adapter, r, task, limit);
+        return best_window_observing(adapter, r, task, limit, None, metadata);
     }
     let source = cv_core::source::Probe::default().snapshot(r);
     let mut events = cv_core::events::SpoolingSink::new(r.cwd.clone()).with_source(r.path.clone());
-    let result = best_window_observing(adapter, r, task, limit, Some(&mut events))?;
+    let result = best_window_observing(adapter, r, task, limit, Some(&mut events), metadata)?;
     let source = source.with_reads(events.inner().dependencies());
     // The ingest rides the read the pack needed anyway; failing it costs only a later re-ingest.
     if cv_core::source::unchanged(r, &source) {
@@ -467,13 +522,14 @@ fn best_window_and_ingest(
     Ok(result)
 }
 
+#[cfg(test)]
 fn best_window(
     adapter: &dyn cv_core::Adapter,
     r: &cv_core::ir::SessionRef,
     task: &str,
     limit: usize,
 ) -> Result<(Excerpt, Option<(usize, usize)>)> {
-    best_window_observing(adapter, r, task, limit, None)
+    best_window_observing(adapter, r, task, limit, None, None)
 }
 
 fn best_window_observing(
@@ -482,6 +538,7 @@ fn best_window_observing(
     task: &str,
     limit: usize,
     events: Option<&mut cv_core::events::SpoolingSink>,
+    metadata: Option<&mut cv_core::SessionRef>,
 ) -> Result<(Excerpt, Option<(usize, usize)>)> {
     let needle = task.to_lowercase();
     let words = query_tokens(task);
@@ -552,7 +609,13 @@ fn best_window_observing(
         window: cv_core::api::MessageWindow::best(),
         error: None,
     };
-    adapter.try_stream(r, &Demand::LEAN.with_spans(), &mut sink)?;
+    let meta = adapter.try_stream(r, &Demand::LEAN.with_spans(), &mut sink)?;
+    if let Some(r) = metadata {
+        r.cwd = meta.cwd.or_else(|| r.cwd.take());
+        r.title = meta.title.or_else(|| r.title.take());
+        r.created_at = meta.created_at.or(r.created_at);
+        r.updated_at = meta.updated_at.or(r.updated_at);
+    }
     let selected = sink.window.finish();
     let range = selected
         .first()
@@ -661,18 +724,15 @@ fn files_dropped(s: &PackSource) -> usize {
 // ------------------------------------------------------------------------------------------------
 
 /// `YYYY-MM-DD` off the hit's dates, or a dashed placeholder.
-fn hit_date(hit: &cv_search::Hit) -> String {
+fn hit_date(hit: &cv_core::SessionRef) -> String {
     hit.updated_at
         .or(hit.created_at)
-        .and_then(|t| crate::util::fmt_local_ts(t, "%Y-%m-%d"))
+        .and_then(|t| crate::util::fmt_local_ts(t.timestamp(), "%Y-%m-%d"))
         .unwrap_or_else(|| "----------".into())
 }
 
-fn hit_cwd(hit: &cv_search::Hit) -> String {
-    hit.cwd
-        .as_deref()
-        .map(|c| home_rel(Path::new(c)))
-        .unwrap_or_else(|| "(no cwd)".into())
+fn hit_cwd(hit: &cv_core::SessionRef) -> String {
+    hit.cwd.as_deref().map(home_rel).unwrap_or_else(|| "(no cwd)".into())
 }
 
 /// `path (3 edits)` / `path (read)` listing for one source, edits first, capped.
@@ -710,13 +770,13 @@ fn md_bundle(task: &str, sources: &[PackSource], rollup: &[(String, usize, i64, 
     let _ = writeln!(out, "{}\n", bounds_line(sources, bounds));
 
     for s in sources {
-        let title = s.hit.title.as_deref().unwrap_or("(untitled)");
+        let title = s.session.title.as_deref().unwrap_or("(untitled)");
         let _ = writeln!(
             out,
             "## {title} ({}, {}, {})\n",
-            s.hit.harness,
-            hit_date(&s.hit),
-            hit_cwd(&s.hit)
+            s.session.harness,
+            hit_date(&s.session),
+            hit_cwd(&s.session)
         );
         if !s.excerpt.is_empty() {
             let _ = writeln!(out, "Key excerpt:\n");
@@ -732,9 +792,14 @@ fn md_bundle(task: &str, sources: &[PackSource], rollup: &[(String, usize, i64, 
             let cmds: Vec<String> = s.commands.iter().map(|c| format!("`{c}`")).collect();
             let _ = writeln!(out, "Commands run: {}\n", cmds.join(", "));
         }
+        let selector = if s.selected {
+            crate::util::shell_quote(&format!("{}:{}", s.session.harness, s.session.path.display()))
+        } else {
+            format!("{}:{}", s.session.harness, s.session.id)
+        };
         let more = match s.excerpt_range {
-            Some((lo, hi)) => format!("cv show {}:{} --range {lo}..{hi}", s.hit.harness, s.hit.id),
-            None => format!("cv show {}:{}", s.hit.harness, s.hit.id),
+            Some((lo, hi)) => format!("cv show {selector} --range {lo}..{hi}"),
+            None => format!("cv show {selector}"),
         };
         let _ = writeln!(out, "(full context: `{more}`)\n");
     }
@@ -767,14 +832,14 @@ fn prompt_bundle(task: &str, sources: &[PackSource], rollup: &[(String, usize, i
     );
     let _ = writeln!(out, "{}\n", bounds_line(sources, bounds));
     for (i, s) in sources.iter().enumerate() {
-        let title = s.hit.title.as_deref().unwrap_or("(untitled)");
+        let title = s.session.title.as_deref().unwrap_or("(untitled)");
         let _ = writeln!(
             out,
             "{}. In \"{title}\" ({}, {}, in {}):",
             i + 1,
-            s.hit.harness,
-            hit_date(&s.hit),
-            hit_cwd(&s.hit)
+            s.session.harness,
+            hit_date(&s.session),
+            hit_cwd(&s.session)
         );
         for (role, text, _) in &s.excerpt {
             let _ = writeln!(out, "   {} said:", cv_core::render::role_label(*role));
@@ -1354,7 +1419,17 @@ mod tests {
     #[test]
     fn context_pack_hints_use_the_current_range_syntax_and_full_identity() {
         let source = PackSource {
-            hit: hit("abcdef0123456789", ""),
+            session: cv_core::SessionRef {
+                id: "abcdef0123456789".into(),
+                harness: Harness::Claude,
+                path: "/tmp/example.jsonl".into(),
+                cwd: None,
+                title: None,
+                created_at: None,
+                updated_at: None,
+                message_count: None,
+            },
+            selected: false,
             excerpt: Vec::new(),
             excerpt_range: Some((4, 9)),
             edits: BTreeMap::new(),

@@ -782,6 +782,7 @@ cv pack "tantivy chunked indexing"                       # CLAUDE.md-style bundl
 cv pack "fix the parser" --format prompt                 # shaped as a system prompt
 cv pack "fix the parser" --format session --harness claude   # a synthetic resumable session
 cv pack "migrate the daemon" --limit 3 --out CONTEXT.md
+cv pack --session claude:SESSION --session /path/to/transcript.jsonl
 ```
 
 `--format` is `md`, `prompt` or `session`. Details: **[`cv pack` — the context compiler](pack.md)**.

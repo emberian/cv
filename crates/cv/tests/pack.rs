@@ -357,3 +357,115 @@ fn pack_rejects_bad_arguments() {
     assert_eq!(code, 2, "{err}");
     assert!(err.contains("unexpected argument '--to'"), "{err}");
 }
+
+#[test]
+fn pack_selected_sessions_need_no_index_and_never_recall_outside_selection() {
+    let w = World::new("selected");
+    pack_corpus(&w);
+    let (out, err) = w.cv_ok(&["pack", "quokka census", "--session", "claude:wombatsess", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let content = v["content"].as_str().unwrap();
+    assert!(content.contains("wombat cache design"), "{content}");
+    assert!(content.contains("cargo test -p cache"), "{content}");
+    assert!(!content.contains("seventeen quokkas"), "{content}");
+    assert!(!content.contains("parser chokes"), "{content}");
+    assert!(!err.contains("recall") && !err.contains("no index"), "{err}");
+
+    let (out, err) = w.cv_ok(&[
+        "pack",
+        "--session",
+        "claude:wombatsess",
+        "--session",
+        "claude:quokkasess",
+        "--limit",
+        "1",
+    ]);
+    assert!(out.contains("from 2 past session(s)"), "{out}");
+    assert!(out.contains("wombat") && out.contains("seventeen quokkas"), "{out}");
+    assert!(!err.contains("no index"), "{err}");
+}
+
+#[test]
+fn pack_selected_sources_fail_before_writing_a_partial_bundle() {
+    let w = World::new("selected-error");
+    pack_corpus(&w);
+    let dest = w.base.join("context.md");
+    let (out, err) = w.cv_fails(&[
+        "pack",
+        "--session",
+        "wombatsess",
+        "--session",
+        "missing-session",
+        "--out",
+        dest.to_str().unwrap(),
+    ]);
+    assert!(out.is_empty(), "{out}");
+    assert!(err.contains("missing-session"), "{err}");
+    assert!(
+        !dest.exists(),
+        "invalid explicit selection must not publish a partial pack"
+    );
+    let (_, code, _, _) = w.cv(&["pack"]);
+    assert_eq!(code, 2);
+}
+
+#[test]
+fn pack_selected_duplicate_ids_keep_their_paths_and_event_facts() {
+    let w = World::new("selected-paths");
+    let make = |name: &str| {
+        vec![
+            serde_json::json!({"type":"ai-title", "aiTitle":name}),
+            user_line("duplicate", "p1", "2026-02-01T10:00:00Z", name),
+            assistant_line(
+                "p2",
+                "2026-02-01T10:01:00Z",
+                serde_json::json!([
+                    {"type":"text", "text":format!("result for {name}")},
+                    {"type":"tool_use", "id":"call-1", "name":"Bash", "input":{"command":format!("echo {name}")}}
+                ]),
+            ),
+        ]
+    };
+    let first = w.write_session("duplicate", &make("first-path"));
+    let second_dir = w.home.join(".claude/projects/second project");
+    fs::create_dir_all(&second_dir).unwrap();
+    let second = second_dir.join("duplicate.jsonl");
+    fs::write(&second, cv_testkit::jsonl(&make("second-path"))).unwrap();
+    // Repeated selection of one exact source is deduplicated; another path with the same id is not.
+    for frozen in [false, true] {
+        let mut args = vec![
+            "pack",
+            "--session",
+            first.to_str().unwrap(),
+            "--session",
+            second.to_str().unwrap(),
+            "--session",
+            first.to_str().unwrap(),
+        ];
+        if frozen {
+            args.push("--frozen");
+        }
+        let (out, _) = w.cv_ok(&args);
+        assert!(out.contains("from 2 past session(s)"), "{out}");
+        let first_section = out
+            .split("## first-path")
+            .nth(1)
+            .unwrap()
+            .split("## second-path")
+            .next()
+            .unwrap();
+        let second_section = out.split("## second-path").nth(1).unwrap();
+        assert!(
+            first_section.contains("echo first-path") && !first_section.contains("echo second-path"),
+            "{out}"
+        );
+        assert!(
+            second_section.contains("echo second-path") && !second_section.contains("echo first-path"),
+            "{out}"
+        );
+        assert!(
+            out.contains(first.to_str().unwrap()) && out.contains(second.to_str().unwrap()),
+            "{out}"
+        );
+    }
+}
