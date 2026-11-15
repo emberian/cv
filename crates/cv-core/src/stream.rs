@@ -1698,7 +1698,7 @@ mod tests {
     fn a_resumed_pass_is_the_rest_of_the_whole_pass() {
         let transcripts = corpus_transcripts();
         assert!(transcripts.len() >= 20, "corpus moved? found {}", transcripts.len());
-        let mut resumed = 0;
+        let (mut resumed, mut held) = (0, 0);
         for r in &transcripts {
             let (full, session, counted) = pass(r, None);
             assert!(full.cps.len() > 1, "{}: no checkpoints", r.path.display());
@@ -1710,11 +1710,17 @@ mod tests {
                 assert_eq!(rest.msgs, full.msgs[n..], "{at}: messages");
                 assert_eq!(s, session, "{at}: session");
                 assert_eq!((c.turns, &c.counts), (counted.turns, &counted.counts), "{at}: counts");
-                assert!(rest.cps == full.cps[i + 1..], "{at}: later checkpoints");
+                // A pass that ends on output its codec holds marks the record that created it
+                // (`jsonl::Codec::held`); the pass resumed there ends on that same mark.
+                let ends_held = i + 1 == full.cps.len() && !rest.msgs.is_empty() && !rest.cps.is_empty();
+                let later = if ends_held { &full.cps[i..] } else { &full.cps[i + 1..] };
+                assert!(rest.cps == later, "{at}: later checkpoints");
+                held += usize::from(ends_held);
                 resumed += 1;
             }
         }
         assert!(resumed > 200, "only {resumed} resumes");
+        eprintln!("resumed={resumed} ending on a held mark={held}");
     }
 
     /// Native Qwen records finalize their own messages, but emission needs prefix call/model

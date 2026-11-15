@@ -448,6 +448,7 @@ fn plan(
             prov: prov.clone(),
             mark: reader.head(r),
             decoded: None,
+            appended: None,
         };
         let from = resumable_from(&job, &cv_core::resume::version(adapter.as_ref(), RESUME_TAG), &reader);
         let cost = if adapter.sqlite_source(r) == Some(true) {

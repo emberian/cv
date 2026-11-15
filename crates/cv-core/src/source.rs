@@ -716,6 +716,30 @@ impl Baseline {
         old.matches_except(now, probe, &store) && probe.rows(r) == Some(rows)
     }
 
+    /// [`Self::with_reads`] for a pass over an append-only primary that left a resume mark:
+    /// `sample` is the primary's prefix as this baseline captured it, taken before the pass.
+    /// The record then publishes though the primary grew under the pass ([`publish_in`]): it
+    /// still names the captured length, so the next pass finds the session stale and resumes
+    /// at the mark. Without it a session written during every pass never had a record, and
+    /// was read whole by every pass and every search.
+    pub fn with_reads_appended(&self, reads: &ReadSet, primary: &Path, sample: Prefix) -> Self {
+        let mut reads = reads.clone();
+        if let Some(path) = absolute(primary) {
+            reads.entries.insert(
+                path.clone(),
+                Entry {
+                    path,
+                    state: self.primary,
+                    prefix: None,
+                    grows: Some(sample),
+                    resumes: None,
+                    gains: false,
+                },
+            );
+        }
+        self.with_reads(&reads)
+    }
+
     /// Attach the read set captured by this consumer's complete pass, never another consumer's.
     pub fn with_reads(&self, reads: &ReadSet) -> Self {
         let stamp = (|| {
@@ -1477,7 +1501,8 @@ pub(crate) fn digest(bytes: &[u8]) -> u64 {
 
 /// Publish `payload` in the same transaction as the consumer's own SQL output. A failure,
 /// returned with its reason, must roll back both. Only a complete pass (its read set recorded)
-/// over a source still unchanged publishes; `probe` is the transaction's one, created after its
+/// over a source still unchanged publishes, or one whose read set names its primary append-only
+/// ([`Baseline::with_reads_appended`]) and whose primary only grew; `probe` is the transaction's one, created after its
 /// passes.
 #[cfg(feature = "sqlite")]
 pub(crate) fn publish_in<T: Payload>(
@@ -1503,7 +1528,11 @@ pub(crate) fn publish_in<T: Payload>(
     // A shared store's certificate is taken before the identity check: the store unchanged since
     // the capture means the certificate describes the rows this pass read.
     let rows = if T::BY_ROWS { probe.rows(r) } else { None };
-    if complete && unchanged_with(r, &probe.primary_path(r), baseline, probe) {
+    let primary = probe.primary_path(r);
+    if complete
+        && (unchanged_with(r, &primary, baseline, probe)
+            || admitted_with(r, &primary, baseline, Some(None), probe).is_some())
+    {
         let baseline = Baseline {
             rows,
             ..baseline.clone()

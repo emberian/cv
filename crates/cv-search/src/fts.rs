@@ -659,6 +659,9 @@ struct Job {
     mark: Option<cv_core::resume::MarkHead>,
     /// The bytes discovery already decoded for it, read instead of decoding again.
     decoded: Option<cv_core::codex_handoff::Decoded>,
+    /// Set by the pass when it left a mark: the primary's prefix as [`Self::source`] captured
+    /// it. Its baselines then publish though the session was written under the pass.
+    appended: Option<cv_core::source::Prefix>,
 }
 
 /// What a sweep worker hands the writer thread, in order per session.
@@ -1172,6 +1175,7 @@ impl PlanState {
             source,
             dependencies_fresh,
             decoded: None,
+            appended: None,
         };
         (
             fts_fresh,
@@ -1296,7 +1300,7 @@ fn job_out(mut job: Job, f: &Fields, marks: &cv_core::resume::Reader, adapter: &
                 }
             }
             #[cfg(test)]
-            if let Some((source, hook)) = AFTER_PASS.lock().unwrap().as_mut() {
+            for (source, hook) in AFTER_PASS.lock().unwrap().iter_mut() {
                 if *source == adapter.resume_source(&job.r) {
                     hook(source);
                 }
@@ -1307,6 +1311,7 @@ fn job_out(mut job: Job, f: &Fields, marks: &cv_core::resume::Reader, adapter: &
                     cp,
                 ))
             });
+            job.appended = mark.as_ref().and(p.appended);
             Out::Done {
                 documents: p.documents,
                 job: Box::new(job),
@@ -1381,6 +1386,8 @@ struct JobPass {
     /// The resume source, opened before the pass: its mark describes this file, not whatever the
     /// path names once the pass is over.
     source: Option<std::fs::File>,
+    /// That file's prefix at the length the job's baseline captured, sampled before the pass.
+    appended: Option<cv_core::source::Prefix>,
 }
 
 /// Tests: runs between a pass over this resume source and the mark taken for it (keyed by the
@@ -1388,7 +1395,7 @@ struct JobPass {
 #[cfg(test)]
 type AfterPass = Box<dyn FnMut(&std::path::Path) + Send>;
 #[cfg(test)]
-static AFTER_PASS: std::sync::Mutex<Option<(PathBuf, AfterPass)>> = std::sync::Mutex::new(None);
+static AFTER_PASS: std::sync::Mutex<Vec<(PathBuf, AfterPass)>> = std::sync::Mutex::new(Vec::new());
 
 /// Fail a staged reader after a prefix was admitted, before publication can commit.
 #[cfg(test)]
@@ -1460,6 +1467,10 @@ fn job_pass(
             }
         })
         .ok();
+    let appended = source
+        .as_ref()
+        .zip(job.source.primary)
+        .and_then(|(file, captured)| cv_core::source::Prefix::of(file, captured.len));
     let mut events = match from {
         None => cv_core::events::SpoolingSink::new(job.r.cwd.clone()),
         Some(cp) => cv_core::events::SpoolingSink::resume(cp).context("checkpoint without events")?,
@@ -1531,6 +1542,7 @@ fn job_pass(
         events,
         last: done.last,
         source,
+        appended,
     }))
 }
 
@@ -2214,10 +2226,14 @@ impl cv_core::MessageSink for ChunkSink<'_> {
 
     /// The read's end, between chunk boundaries: a mark that keeps the open docs' text, so the
     /// next pass reads only what was appended and still writes the docs a whole pass would.
-    /// Always keeping the docs open, even when a chunk boundary is due: a whole pass flushes at
-    /// its next spaced checkpoint, and so does a pass resumed here.
+    /// Not while a chunk boundary is due: a doc flushed since the last boundary is in neither
+    /// the mark's open text nor before every doc the resumed pass replaces
+    /// ([`resumes_docs_at`] starts at the older open buffer), so a pass resumed here would
+    /// delete it and never write it again. The read then keeps its last boundary mark. A read
+    /// that ends on a record the codec still holds reaches this with the boundary due, since
+    /// no boundary checkpoint is offered between that record and the end.
     fn wants_final_checkpoint(&mut self, _offset: u64) -> bool {
-        self.keep_open = !self.failed && self.err.is_none();
+        self.keep_open = !self.failed && self.err.is_none() && !self.boundary_due;
         self.keep_open
     }
 
@@ -4066,6 +4082,7 @@ mod tests {
             prov: Default::default(),
             mark: None,
             decoded: None,
+            appended: None,
         }
     }
 
@@ -9530,14 +9547,14 @@ mod tests {
         std::fs::write(&replacement, body("zqnewword")).unwrap();
         let r = sref("renamed", "renamed", path.to_string_lossy().into_owned());
         let pending = replacement.clone();
-        *AFTER_PASS.lock().unwrap() = Some((
+        AFTER_PASS.lock().unwrap().push((
             path.clone(),
             Box::new(move |source| {
                 let _ = std::fs::rename(&pending, source);
             }),
         ));
         let first = sweep(&dir, vec![r.clone()], false, false);
-        *AFTER_PASS.lock().unwrap() = None;
+        AFTER_PASS.lock().unwrap().retain(|(source, _)| *source != path);
         first.unwrap();
         assert!(!replacement.exists(), "the hook replaced the transcript");
         let head = cv_core::resume::MarkTable::load().get(&r).unwrap().clone();
@@ -9556,6 +9573,129 @@ mod tests {
         assert_eq!((swept.changed, swept.resumed), (1, 0));
         assert!(text_search(&dir, "zqoldword", 10).unwrap().is_empty());
         assert_eq!(text_search(&dir, "zqnewword", 10).unwrap().len(), 1);
+    }
+
+    /// A live session is written while the pass reads it. Its documents, events and mark describe
+    /// what the pass read, and its baselines must publish at the length captured before the
+    /// pass: the next pass then reads only what was appended. Unpublished, every pass and every
+    /// search read such a session whole for as long as it stayed live.
+    #[cfg(unix)]
+    #[test]
+    fn a_session_appended_under_its_pass_resumes_on_the_next() {
+        use std::io::Write;
+        let home = IsolatedHome::new();
+        let (dir, sdir) = (tmpdir(), tmpdir());
+        let path = sdir.join("live.jsonl");
+        let line = |i: usize, marker: &str| {
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "type": "user", "uuid": format!("u{i}"), "sessionId": "live",
+                    "message": {"role": "user", "content": format!("{} {marker}", "stable payload ".repeat(200))}
+                })
+            )
+        };
+        let body: String = (0..20).map(|i| line(i, "ordinary")).collect();
+        std::fs::write(&path, &body).unwrap();
+        let r = sref("live", "live", path.to_string_lossy().into_owned());
+        let append = |text: String| {
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(text.as_bytes())
+                .unwrap()
+        };
+        let late = line(20, "zqlateword");
+        AFTER_PASS.lock().unwrap().push((
+            path.clone(),
+            Box::new(move |source| {
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(source)
+                    .unwrap()
+                    .write_all(late.as_bytes())
+                    .unwrap();
+            }),
+        ));
+        let first = sweep(&dir, vec![r.clone()], false, false);
+        AFTER_PASS.lock().unwrap().retain(|(source, _)| *source != path);
+        let first = first.unwrap();
+        assert_eq!((first.changed, first.errors), (1, 0));
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len() as usize,
+            body.len() + line(20, "zqlateword").len()
+        );
+        let consumer = source_consumer(&dir).unwrap();
+        let record = cv_core::source::Table::<InIndex>::load(&consumer);
+        let published = record.get(&r).expect("the pass published its search baseline");
+        assert_eq!(published.baseline.primary.unwrap().len as usize, body.len());
+        assert!(cv_core::events::SyncTable::load().can_resume(&r, &Default::default()));
+        // Stale, as it must be: the appended line is not indexed yet.
+        assert_eq!(pass_needed_over(&dir, std::slice::from_ref(&r), false), Some(true));
+        assert!(text_search(&dir, "zqlateword", 10).unwrap().is_empty());
+
+        append(line(21, "zqlaterword"));
+        let second = sweep(&dir, vec![r.clone()], false, false).unwrap();
+        assert_eq!((second.changed, second.resumed, second.errors), (1, 1, 0));
+        assert_eq!(text_search(&dir, "zqlateword", 10).unwrap().len(), 1);
+        assert_eq!(text_search(&dir, "zqlaterword", 10).unwrap().len(), 1);
+        assert_eq!(pass_needed_over(&dir, std::slice::from_ref(&r), false), Some(false));
+        let resumed_docs = all_docs(&dir);
+        let events = cv_core::events::events_for("claude", "live", None).unwrap().len();
+        drop(home);
+
+        // The same file indexed whole in a fresh home holds the same documents.
+        let _clean_home = IsolatedHome::new();
+        let clean = tmpdir();
+        sweep(&clean, vec![r], false, false).unwrap();
+        assert_eq!(resumed_docs, all_docs(&clean));
+        assert_eq!(
+            events,
+            cv_core::events::events_for("claude", "live", None).unwrap().len()
+        );
+    }
+
+    /// A Codex rollout ends on an assistant message its reader holds for the usage record that
+    /// may follow. Such a read left no mark, so the rollout was read whole after every append;
+    /// its mark now sits at the record that created the held message.
+    #[test]
+    fn a_rollout_ending_on_a_held_reply_resumes_after_an_append() {
+        use std::io::Write;
+        let home = IsolatedHome::new();
+        let (dir, sdir) = (tmpdir(), tmpdir());
+        let path = sdir.join("rollout-2026-01-01T00-00-00-held.jsonl");
+        std::fs::write(&path, rollout("held", "2026-01-01T00:00:00Z", "zqfirstturn")).unwrap();
+        let r = cv_core::SessionRef {
+            harness: cv_core::Harness::Codex,
+            ..sref("held", "held", path.to_string_lossy().into_owned())
+        };
+        let first = sweep(&dir, vec![r.clone()], false, false).unwrap();
+        assert_eq!((first.changed, first.errors), (1, 0));
+        let head = cv_core::resume::MarkTable::load().get(&r).cloned();
+        let head = head.expect("a read that ends on a held reply leaves a mark");
+        assert!(head.offset() < std::fs::metadata(&path).unwrap().len());
+        assert_eq!(text_search(&dir, "zqfirstturn", 10).unwrap().len(), 1);
+
+        let more = rollout("held", "2026-01-01T00:01:00Z", "zqsecondturn");
+        let turn: String = more.lines().skip(1).map(|line| format!("{line}\n")).collect();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(turn.as_bytes())
+            .unwrap();
+        let second = sweep(&dir, vec![r.clone()], false, false).unwrap();
+        assert_eq!((second.changed, second.resumed, second.errors), (1, 1, 0));
+        assert_eq!(text_search(&dir, "zqfirstturn", 10).unwrap().len(), 1);
+        assert_eq!(text_search(&dir, "zqsecondturn", 10).unwrap().len(), 1);
+        let resumed_docs = all_docs(&dir);
+        drop(home);
+
+        let _clean_home = IsolatedHome::new();
+        let clean = tmpdir();
+        sweep(&clean, vec![r], false, false).unwrap();
+        assert_eq!(resumed_docs, all_docs(&clean));
     }
 
     /// Equal-size edits require a whole pass even when the old checkpoint's samples match.

@@ -391,9 +391,18 @@ pub(super) fn run_fed(
                         }
                         // Only stamp events after a complete pass: a parse error leaves the sync rows
                         // untouched so the session is retried next run.
+                        // A pass that left a mark over an append-only primary publishes its
+                        // baselines though the session was written under it.
+                        let read_at = |reads: &cv_core::source::ReadSet| match job.appended {
+                            Some(sample) => {
+                                job.source
+                                    .with_reads_appended(reads, &cv_core::source::primary_path(&job.r), sample)
+                            }
+                            None => job.source.with_reads(reads),
+                        };
                         let source = counted
                             .as_ref()
-                            .map_or_else(|| job.source.clone(), |c| job.source.with_reads(&c.dependencies));
+                            .map_or_else(|| job.source.clone(), |c| read_at(&c.dependencies));
                         let events_published = match events {
                             Some((from, events)) => {
                                 let need_sql = job.sql_events;
@@ -474,8 +483,7 @@ pub(super) fn run_fed(
                         }
                         ran.resumed += usize::from(resumed);
                         if job.fts {
-                            ran.dependencies
-                                .push((job.r.clone(), job.source.with_reads(&fts_reads)));
+                            ran.dependencies.push((job.r.clone(), read_at(&fts_reads)));
                             ran.changed += 1;
                             ran.completed.insert(job.r.id.clone());
                         }

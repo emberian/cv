@@ -336,6 +336,8 @@ impl Adapter for Codex {
                 opts,
                 input: &rollout.input,
                 held: Vec::new(),
+                near_end: false,
+                held_from: None,
             };
             jsonl::drive(&rollout.input, from, codec, sink)
         })
@@ -747,10 +749,21 @@ struct Transcript<'r> {
     opts: &'r stream::Demand,
     input: &'r jsonl::Read,
     held: Vec<Message>,
+    /// The driver said the read's end is near: keep [`Self::held_from`].
+    near_end: bool,
+    /// The record that created the held message and the state before it, with whether the
+    /// session metadata had gone to the sink by then.
+    held_from: Option<(u64, Value, bool)>,
 }
 
 impl jsonl::Codec for Transcript<'_> {
     fn record(&mut self, view: JsonView<'_>, at: u64, sink: &mut dyn MessageSink) -> Result<Flow> {
+        // The state before this record, in case the message it creates is still held when the
+        // read ends ([`jsonl::Codec::held`]).
+        let clean = match self.near_end {
+            true => Some((at, serde_json::to_value(&self.state)?, self.state.meta_sent)),
+            false => None,
+        };
         let ResumeState {
             session: s,
             ctx,
@@ -782,12 +795,33 @@ impl jsonl::Codec for Transcript<'_> {
             sink.meta(s);
             *meta_sent = true;
         }
-        Ok(flush_all_but_held(&mut self.held, sink))
+        // A record that pushed messages replaced whatever was held: the held one is its last.
+        // Only a record whose one message is the held one can be read again from its start:
+        // the sink already has the earlier messages of a record that pushed several.
+        let pushed = self.held.len().saturating_sub(before);
+        let flow = flush_all_but_held(&mut self.held, sink);
+        if self.held.is_empty() {
+            self.held_from = None;
+        } else if pushed != 0 {
+            self.held_from = clean.filter(|_| pushed == 1);
+        }
+        Ok(flow)
     }
 
     /// A trailing assistant is provisional until its usage arrives.
     fn settled(&self) -> bool {
         self.held.is_empty()
+    }
+
+    fn near_end(&mut self) {
+        self.near_end = true;
+    }
+
+    /// The session metadata goes to the sink once: a state from before it went cannot resume
+    /// a sink that has it.
+    fn held(&self) -> Option<(u64, &Value)> {
+        let (at, state, meta_sent) = self.held_from.as_ref()?;
+        (*meta_sent == self.state.meta_sent).then_some((*at, state))
     }
 
     fn demand(&self) -> stream::Demand {
@@ -1518,6 +1552,7 @@ mod tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus/codex");
         let mut files = 0;
         let mut resumes = 0;
+        let mut held_marks = 0;
         for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
             if !entry.file_type().is_file() || entry.path().extension().is_none_or(|e| e != "jsonl") {
                 continue;
@@ -1544,24 +1579,112 @@ mod tests {
                         serde_json::to_value(&suffix.messages).unwrap(),
                         serde_json::to_value(&full.messages[*count..]).unwrap()
                     );
+                    let delivered = suffix.messages.len();
                     resumed.messages = full.messages[..*count].iter().cloned().chain(suffix.messages).collect();
                     assert_eq!(
                         serde_json::to_value(resumed).unwrap(),
                         serde_json::to_value(&shell).unwrap()
                     );
-                    assert_eq!(
-                        suffix.checkpoints,
-                        full.checkpoints[index + 1..]
-                            .iter()
-                            .map(|(n, cp)| (n - count, cp.clone()))
-                            .collect::<Vec<_>>()
-                    );
+                    let later = full.checkpoints[index + 1..]
+                        .iter()
+                        .map(|(n, cp)| (n - count, cp.clone()))
+                        .collect::<Vec<_>>();
+                    // A read that ends on a held message marks the record that created it; the
+                    // read resumed there delivers that message and ends on the same mark.
+                    if later.is_empty() && delivered > 0 && suffix.checkpoints.first().is_some_and(|(n, _)| *n == 0) {
+                        assert_eq!(suffix.checkpoints, vec![(0, cp.clone())]);
+                        held_marks += 1;
+                    } else {
+                        assert_eq!(suffix.checkpoints, later);
+                    }
                     resumes += 1;
                 }
             }
         }
-        eprintln!("codex native files={files} exact suffix resumes={resumes}");
+        eprintln!("codex native files={files} exact suffix resumes={resumes} held marks={held_marks}");
         assert!(files >= 16 && resumes > 100);
+        assert!(held_marks > 0, "no corpus rollout ends on a held message");
+    }
+
+    /// A sink that takes only a read's end mark, as the index does between its chunk boundaries.
+    #[derive(Default)]
+    struct EndMark {
+        messages: Vec<Message>,
+        mark: Option<(usize, Checkpoint)>,
+    }
+    impl MessageSink for EndMark {
+        fn message(&mut self, m: Message) -> Flow {
+            self.messages.push(m);
+            Flow::Continue
+        }
+        fn wants_checkpoint(&mut self, _: u64) -> bool {
+            false
+        }
+        fn wants_final_checkpoint(&mut self, _: u64) -> bool {
+            true
+        }
+        fn checkpoint(&mut self, cp: &mut Checkpoint) {
+            self.mark = Some((self.messages.len(), cp.clone()));
+        }
+    }
+
+    /// Every corpus rollout, cut after each of its lines as a live session is found mid-turn:
+    /// the read of the cut leaves a mark whenever a settled record lies near its end, and the
+    /// read of the whole file resumed at that mark delivers what a whole read does.
+    #[test]
+    fn a_rollout_cut_at_any_line_leaves_a_mark_that_resumes_exactly() {
+        let world = crate::test_world("codex-end-marks");
+        let adapter = Codex::with_home(&world.home.join(".codex"));
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus/codex");
+        let opts = stream::Demand::LEAN.with_spans();
+        let (mut cuts, mut unsettled, mut held_marks) = (0, 0, 0);
+        for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
+            if !entry.file_type().is_file() || entry.path().extension().is_none_or(|e| e != "jsonl") {
+                continue;
+            }
+            let bytes = fs::read(entry.path()).unwrap();
+            let path = world.base.join(entry.file_name());
+            fs::write(&path, &bytes).unwrap();
+            let r = SessionRef::new("oracle", Harness::Codex, path.clone());
+            let mut expected = EndMark::default();
+            let mut shell = buffered_pass(&r, &opts, &mut expected);
+            shell.messages = expected.messages;
+            let whole = serde_json::to_value(&shell).unwrap();
+            let ends: Vec<usize> = bytes
+                .iter()
+                .enumerate()
+                .filter_map(|(i, byte)| (*byte == b'\n').then_some(i + 1))
+                .collect();
+            for end in ends {
+                fs::write(&path, &bytes[..end]).unwrap();
+                let mut cut = EndMark::default();
+                buffered_pass(&r, &opts, &mut cut);
+                fs::write(&path, &bytes).unwrap();
+                cuts += 1;
+                let Some((count, mark)) = cut.mark else {
+                    unsettled += 1;
+                    continue;
+                };
+                held_marks += usize::from(mark.offset < end as u64);
+                assert!(mark.offset <= end as u64);
+                let mut suffix = EndMark::default();
+                let mut resumed = adapter
+                    .transcript(&r, &opts, crate::stream::Start::Checkpoint(&mark), &mut suffix)
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("{}: mark at {} of cut {end} declined", path.display(), mark.offset));
+                resumed.messages = cut.messages[..count].iter().cloned().chain(suffix.messages).collect();
+                assert_eq!(
+                    serde_json::to_value(&resumed).unwrap(),
+                    whole,
+                    "{}: cut {end}, mark {}",
+                    path.display(),
+                    mark.offset
+                );
+            }
+        }
+        eprintln!("codex cuts={cuts} without a mark={unsettled} held marks={held_marks}");
+        assert!(held_marks > 100, "held marks {held_marks} of {cuts} cuts");
+        assert!(unsettled * 20 < cuts, "{unsettled} of {cuts} cuts left no mark");
     }
 
     #[test]

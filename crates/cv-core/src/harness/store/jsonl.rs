@@ -216,6 +216,19 @@ pub(crate) trait Codec {
         true
     }
 
+    /// The records from here to the read's end lie within [`HELD_TAIL`] of it: a codec that
+    /// holds output back starts keeping what [`Self::held`] answers with.
+    fn near_end(&mut self) {}
+
+    /// While not [`Self::settled`]: the start of the record that created what is held and the
+    /// codec's state as it was before that record, when it kept one ([`Self::near_end`]). The
+    /// sink has every message before that record and none from it on, so a read resumed there
+    /// with that state delivers exactly what this one still owes. Without it a read that ends
+    /// unsettled leaves no mark, and its file is read whole after every append.
+    fn held(&self) -> Option<(u64, &serde_json::Value)> {
+        None
+    }
+
     /// The demand this codec's state depends on: a checkpoint keeps it, and a read at another
     /// declines it. A codec whose state is the same at every demand answers the default.
     fn demand(&self) -> crate::stream::Demand;
@@ -281,6 +294,10 @@ pub(crate) fn checkpoint<C: Codec>(
     cp
 }
 
+/// How far before a read's end a codec keeps its state for [`Codec::held`]: a state per record
+/// is paid only here, and a read whose last settled record lies further back leaves no mark.
+const HELD_TAIL: u64 = 1 << 20;
+
 /// The one JSONL transcript read: records `from..to` of `read` (a whole read starts at 0, a
 /// resumed one at its checkpoint, `to` is EOF unless a past length is asked for), each through
 /// `codec`. The driver owns the rest: declining a checkpoint past EOF, counting rejected lines
@@ -313,12 +330,23 @@ pub(crate) fn drive<C: Codec>(
     }
     crate::stream::guarded(sink, read, |guard| {
         let mut stopped = false;
+        let mut near_end = false;
+        // The rejected lines before the record [`Codec::held`] names.
+        let mut held_skipped = skipped;
         read.snapshot(at, to, |line| {
+            if !near_end && line.at.saturating_add(HELD_TAIL) >= to {
+                near_end = true;
+                codec.near_end();
+            }
             match line.view {
                 Some(view) => {
+                    let before = skipped;
                     if codec.record(view, line.at, guard)? == Flow::Stop || guard.failed() {
                         stopped = true;
                         return Ok(Flow::Stop);
+                    }
+                    if codec.held().is_some_and(|(held_at, _)| held_at == line.at) {
+                        held_skipped = before;
                     }
                 }
                 None => skipped += u64::from(!line.blank),
@@ -333,6 +361,16 @@ pub(crate) fn drive<C: Codec>(
                 let mut cp = crate::stream::Checkpoint::new(line.end);
                 stamp(&mut cp, codec.demand(), skipped, &codec.state());
                 guard.checkpoint(&mut cp);
+            } else if !settled && line.end >= to && !read.is_decoded() {
+                // The read ends on output the codec still holds: its mark is the start of the
+                // record that created it. A line the writer has not finished lies after it.
+                if let Some((held_at, state)) = codec.held() {
+                    if guard.wants_final_checkpoint(held_at) {
+                        let mut cp = crate::stream::Checkpoint::new(held_at);
+                        stamp(&mut cp, codec.demand(), held_skipped, state);
+                        guard.checkpoint(&mut cp);
+                    }
+                }
             }
             stopped = guard.failed();
             Ok(if stopped { Flow::Stop } else { Flow::Continue })
