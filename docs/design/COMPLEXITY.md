@@ -44,8 +44,7 @@ or rewritten. Paths are relative to `crates/`.
 | `cv search` | O(postings) + `limit` snippets | same | + suffix read (all; `--live-bytes` bounds it) | `cv-search` `search_suffixed` |
 | `stats --tokens` | O(S) | O(n) cache loads + a bounded sweep | one source reparsed | `stats/usage_cache.rs` |
 | Sessions API page / head | O(start) / O(s) | O(page) from its continuation / a hit | O(start) / O(s) | `api/read.rs` |
-| `cv scry` / watch poll | O(n) stats per tick | O(n) | O(appended) from the anchor | `watch.rs`, `watch/read.rs` |
-| MCP `observe_stream` | O(n) stats | same | O(appended); a cursor from another process rereads each changed session once | `watch.rs` `Readers` |
+| Watch poll | O(n) stats per tick | O(n) | O(appended) from the anchor | `watch.rs`, `watch/read.rs` |
 | `cv watch` archive | O(S) | O(n) baseline checks + 2n stats | O(appended) | `watch.rs` `offer_sources`, `archive/reuse.rs` |
 | `events ingest` | O(S) | O(n) | one reparse | `events.rs` `ingest_all` |
 | Workflow listing | O(r) state parses + r stats | same | same | `claude_workflow.rs` |
@@ -74,8 +73,7 @@ Flags, complete by default (the output states a bound the caller set):
 - `--live-bytes` / `live_bytes` (search), else `$CV_LIVE_BYTES`, else config `[search] live_bytes`:
   unset reads every stale session; set, the footer names the budget, its source and what it left
   out (`fts/live.rs` `LiveRead`).
-- `show` windows and `--max-bytes`; MCP `show` adds none; `observe_stream` `max_messages`
-  (`more_pending`) and `char_cap` (`char_cap`, `truncated` in the output).
+- `show` windows and `--max-bytes`.
 
 - `cv pack --excerpt-bytes` (default 1600; was `MSG_RESOLVE_BYTES`, `EXCERPT_SOFT/HARD_CHARS`)
   and the curation caps `MAX_COMMANDS`, `COMMAND_CHARS`, `MAX_FILES_PER_SOURCE`, `MAX_ROLLUP`: a

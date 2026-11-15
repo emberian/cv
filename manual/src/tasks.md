@@ -23,8 +23,9 @@ events. Two front-ends render the same shapes: `cv task` (this page) and
 3. **Small.** A few thousand lines.
 
 The land facet (reviewed revisions, tokens, receipts) was removed in 0.15.0: `propose`, `pass`,
-`refute`, `reroute`, `verify`, `debt`, `stats`, `--token`/`CV_TOKEN` and `--check-*` exit with a
-pointer. Old logs still replay; those events change no state.
+`refute`, `reroute`, `verify`, `debt`, `stats`, `--token` and `--check-*` are no longer accepted
+CLI inputs (usage error, exit 2); `CV_TOKEN` provides no authentication. Old logs still replay;
+those events change no state.
 
 ## The base lifecycle
 
