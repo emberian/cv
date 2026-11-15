@@ -744,6 +744,7 @@ The native resume command; `--launch` runs it from the session's cwd.
 ```sh
 cv resume da9174f4
 cv resume da9174f4 --launch
+cv resume da9174f4 --json
 ```
 
 ```text
@@ -752,6 +753,11 @@ claude --resume da9174f4-…
 ```
 
 Desktop/IDE-only harnesses get a note instead.
+
+`--json` prints `id`, `harness`, `program`, `args`, `cwd`, `hint`, and `warning`. Arguments are
+an array of literal strings, without shell quoting. A GUI-only target has a null `program`,
+empty `args`, and a manual `hint`. An unavailable native store is reported in `warning`, just
+as in the text output. This mode never launches anything and cannot be combined with `--launch`.
 
 ---
 

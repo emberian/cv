@@ -4423,6 +4423,13 @@ fn resume_names_an_antigravity_session_the_cli_cannot_resume() {
         "{out}"
     );
     assert_eq!(lines.last(), Some(format!("agy --conversation {id}").as_str()), "{out}");
+    let (out, _) = w.cv_ok(&["resume", &format!("antigravity:{id}"), "--json"]);
+    let row: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(row["program"], "agy");
+    assert_eq!(row["args"], serde_json::json!(["--conversation", id]));
+    assert!(row["warning"].as_str().unwrap().contains("antigravity-ide"));
+    let (_, code, _, _) = w.cv(&["resume", &format!("antigravity:{id}"), "--json", "--launch"]);
+    assert_eq!(code, 2);
 }
 
 #[test]
@@ -4444,6 +4451,11 @@ fn resume_launch_refuses_gui_only_harnesses_with_exit_two() {
 
     let (out, _) = w.cv_ok(&["resume", "opensession:gui-doc-1"]);
     assert!(out.starts_with("# no CLI resume for opensession"), "{out}");
+    let (out, _) = w.cv_ok(&["resume", "opensession:gui-doc-1", "--json"]);
+    let row: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert!(row["program"].is_null());
+    assert_eq!(row["args"], serde_json::json!([]));
+    assert!(row["hint"].as_str().unwrap().contains("no CLI resume for opensession"));
 
     let (_, code, _, err) = w.cv(&["resume", "opensession:gui-doc-1", "--launch"]);
     assert_eq!(code, 2, "must exit 2 instead of execvp-ing comment: {err}");

@@ -224,11 +224,19 @@ pub(crate) enum ResumeTarget {
     GuiOnly { hint: String },
 }
 
-pub(crate) fn cmd_resume(id: &str, harness: Option<String>, launch: bool) -> Result<()> {
+pub(crate) fn cmd_resume(id: &str, harness: Option<String>, launch: bool, json: bool) -> Result<()> {
     let want = parse_harness(&harness)?;
     let (r, adapter) = resolve(id, want)?;
     let cwd = r.cwd.clone();
     let caveat = adapter.resume_caveat(&r);
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&resume_json(r.harness, &r.id, cwd.as_deref(), caveat.as_deref()))?
+        );
+        return Ok(());
+    }
 
     if launch {
         let (program, args) = match resume_target(r.harness, &r.id) {
@@ -263,6 +271,17 @@ pub(crate) fn cmd_resume(id: &str, harness: Option<String>, launch: bool) -> Res
         println!("{line}");
     }
     Ok(())
+}
+
+fn resume_json(harness: Harness, id: &str, cwd: Option<&Path>, warning: Option<&str>) -> serde_json::Value {
+    let (program, args, hint) = match resume_target(harness, id) {
+        ResumeTarget::Cli { program, args } => (Some(program), args, None),
+        ResumeTarget::GuiOnly { hint } => (None, Vec::new(), Some(hint)),
+    };
+    serde_json::json!({
+        "id": id, "harness": harness.as_str(), "program": program, "args": args,
+        "cwd": cwd, "hint": hint, "warning": warning,
+    })
 }
 
 /// The resume incantation `cv resume` prints, as lines: `cd <cwd>` (when known), then the
@@ -416,6 +435,23 @@ mod context_tests {
         assert_eq!(copy_context_if_absent(&source, &destination).unwrap(), None);
         assert!(destination.is_symlink());
         assert!(!missing.exists());
+    }
+
+    #[test]
+    fn resume_json_keeps_arguments_unquoted_and_gui_hints_separate() {
+        let id = "session with 'quotes' and $shell";
+        let cwd = Path::new("/work/a folder/it's here");
+        let row = resume_json(Harness::Claude, id, Some(cwd), Some("use the original profile"));
+        assert_eq!(row["program"], "claude");
+        assert_eq!(row["args"], serde_json::json!(["--resume", id]));
+        assert_eq!(row["cwd"], cwd.to_str().unwrap());
+        assert_eq!(row["warning"], "use the original profile");
+        assert!(row["hint"].is_null());
+        let gui = resume_json(Harness::OpenSession, "document", None, None);
+        assert!(gui["program"].is_null());
+        assert_eq!(gui["args"], serde_json::json!([]));
+        assert!(gui["hint"].as_str().unwrap().contains("no CLI resume"));
+        assert!(gui["cwd"].is_null());
     }
 
     #[test]

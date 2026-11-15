@@ -856,6 +856,9 @@ enum Cmd {
         /// Actually spawn the harness (cd to the session's cwd) instead of just printing.
         #[arg(long)]
         launch: bool,
+        /// Print the executable, argument array, cwd and any manual hint/warning as JSON.
+        #[arg(long, conflicts_with = "launch")]
+        json: bool,
     },
 
     /// Export a session to markdown or OpenSession JSON (stdout); `cv share` is the HTML artifact.
@@ -1534,7 +1537,12 @@ fn run() -> Result<()> {
             undo,
             json,
         } => cmd::retire::cmd_retire(agent, successor, undo, json),
-        Cmd::Resume { id, harness, launch } => port::cmd_resume(&id, harness, launch),
+        Cmd::Resume {
+            id,
+            harness,
+            launch,
+            json,
+        } => port::cmd_resume(&id, harness, launch, json),
         Cmd::Workflow {
             id,
             run_id,
