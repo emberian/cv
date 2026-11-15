@@ -116,7 +116,10 @@ fn polled_task<'a>(name: &str, out: &'a str) -> Option<(&'a str, &'a str)> {
 fn completion<'a>(message: &'a Message, body: &'a str) -> Option<(&'a str, bool, &'a str)> {
     // The adapter tags a cancellation notice `canceled_task` and a finish `completed_task`.
     let native = message.extra.get("antigravity")?;
-    let job = native.get("completed_task").or_else(|| native.get("canceled_task"))?.as_str()?;
+    let job = native
+        .get("completed_task")
+        .or_else(|| native.get("canceled_task"))?
+        .as_str()?;
     let (_, rest) = body.split_once(&format!("content=Task id \"{job}\" "))?;
     let (canceled, output) = match rest.strip_prefix("finished with result:\n") {
         Some(output) => (false, output),
