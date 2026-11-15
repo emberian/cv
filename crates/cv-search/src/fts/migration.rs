@@ -17,6 +17,8 @@ pub(super) struct Migration {
     stage: PathBuf,
     directory: MmapDirectory,
     _writer_lock: DirectoryLock,
+    linked: Vec<PathBuf>,
+    publication_attempted: bool,
 }
 
 impl Migration {
@@ -50,6 +52,8 @@ impl Migration {
             stage,
             directory,
             _writer_lock: writer_lock,
+            linked: Vec::new(),
+            publication_attempted: false,
         };
         directory::create(&migration.stage, build_schema_with_consumer(Some(&id)))?;
         Ok(Some(migration))
@@ -63,12 +67,23 @@ impl Migration {
         self.publish_with(swept, |_| Ok(()))
     }
 
-    fn publish_with(self, swept: &Swept, mut checkpoint: impl FnMut(Publication) -> Result<()>) -> Result<()> {
-        anyhow::ensure!(
-            swept.errors == 0 && swept.unreadable.is_empty(),
-            "full-text schema migration incomplete ({} failed sources or publications); previous index retained",
-            swept.errors.max(swept.unreadable.len())
-        );
+    fn publish_with(mut self, swept: &Swept, mut checkpoint: impl FnMut(Publication) -> Result<()>) -> Result<()> {
+        if swept.errors != 0 || !swept.unreadable.is_empty() {
+            let reason = swept
+                .first_error
+                .clone()
+                .or_else(|| {
+                    swept
+                        .unreadable
+                        .first()
+                        .map(|failure| format!("{} ({}): {}", failure.id, failure.harness, failure.reason))
+                })
+                .unwrap_or_else(|| "source or derived-state publication failed".to_owned());
+            anyhow::bail!(
+                "full-text schema migration incomplete ({} failed sources or publications); previous index retained: {}",
+                swept.errors.max(swept.unreadable.len()), cv_core::ir::truncate(&reason, 512)
+            );
+        }
         let (replacement, _) = open_existing(&self.stage)?;
         // Opening all segments validates the published generation before anything visible moves.
         let reader: tantivy::IndexReader = replacement.reader()?;
@@ -88,6 +103,7 @@ impl Migration {
             // Committed segment files are already synced by Tantivy before its meta commit.
             std::fs::hard_link(self.stage.join(&path), self.dir.join(&path))
                 .with_context(|| format!("publishing index segment {}", path.display()))?;
+            self.linked.push(path);
         }
         self.directory.sync_directory()?;
         let _meta_lock = self.directory.acquire_lock(&META_LOCK)?;
@@ -96,6 +112,9 @@ impl Migration {
         self.directory.atomic_write(Path::new(".managed.json"), &managed)?;
         self.directory.sync_directory()?;
         checkpoint(Publication::BeforeMetadata)?;
+        // An I/O error after rename can leave a successfully published metadata file. From
+        // this point onward its segment files must survive even an uncertain return status.
+        self.publication_attempted = true;
         self.directory.atomic_write(Path::new("meta.json"), &metadata)?;
         self.directory.sync_directory()?;
         checkpoint(Publication::AfterMetadata)?;
@@ -107,6 +126,11 @@ impl Drop for Migration {
     fn drop(&mut self) {
         // Only this invocation's unpublished/staged directory belongs to us. Crash leftovers
         // from other invocations are never swept blindly; they cannot replace the active index.
+        if !self.publication_attempted {
+            for path in &self.linked {
+                let _ = std::fs::remove_file(self.dir.join(path));
+            }
+        }
         let _ = std::fs::remove_dir_all(&self.stage);
     }
 }
@@ -170,6 +194,10 @@ mod tests {
         let migration = Migration::prepare(&dir, false).unwrap().unwrap();
         let stage = migration.path().to_owned();
         fill_stage(&migration);
+        let staged_files = Index::open_in_dir(migration.path())
+            .unwrap()
+            .directory()
+            .list_managed_files();
         assert_ne!(source_consumer(migration.path()).unwrap(), old_consumer);
         assert!(
             Migration::prepare(&dir, false).is_err(),
@@ -180,6 +208,14 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("cancel before metadata"));
         assert!(!stage.exists());
+        for path in staged_files {
+            if path != Path::new("meta.json") {
+                assert!(
+                    !dir.join(path).exists(),
+                    "failed attempt must not accumulate its segment files"
+                );
+            }
+        }
         assert_eq!(std::fs::read(dir.join("meta.json")).unwrap(), before);
         assert_eq!(source_consumer(&dir).unwrap(), old_consumer);
         assert_eq!(
@@ -256,6 +292,83 @@ mod tests {
         assert_eq!(std::fs::read(dir.join("meta.json")).unwrap(), before);
         assert_eq!(index_sessions(&dir, &[good], false, false).unwrap(), 1);
         assert_eq!(text_search(&dir, "migration", 10).unwrap().len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn migration_retry_cannot_resume_from_globally_advanced_derived_state() {
+        use std::io::Write;
+        let world = cv_testkit::World::in_process("migration-derived-state", cv_core::env::Env::enter_isolated);
+        let dir = world.base.join("index");
+        let line = |id: &str, text: &str| serde_json::json!({"type":"user", "uuid":id, "message":{"role":"user","content":text}});
+        let path = world.write_session("source", &[line("first", "originalneedle")]);
+        let reference = cv_core::SessionRef::new("source", cv_core::Harness::Claude, &path);
+        index_sessions(&dir, std::slice::from_ref(&reference), false, false).unwrap();
+        let original_counts = cv_core::catalog::AffordanceTable::load().counts(&reference).unwrap();
+        let original_mark = cv_core::resume::MarkTable::load().get(&reference).unwrap().clone();
+        let original_consumer = source_consumer(&dir).unwrap();
+        let dependency = || -> Vec<u8> {
+            rusqlite::Connection::open(world.cv_home.join("catalog.db"))
+                .unwrap()
+                .query_row(
+                    "SELECT record FROM source_dependencies WHERE consumer=?1 AND id='source'",
+                    [&original_consumer],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        let original_dependency = dependency();
+        let (retained_index, fields, retained) = query_index(&dir).unwrap();
+        // Model an older format without changing any populated field positions or old segments.
+        let mut metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("meta.json")).unwrap()).unwrap();
+        metadata["schema"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|field| field["name"] != format_field());
+        MmapDirectory::open(&dir)
+            .unwrap()
+            .atomic_write(Path::new("meta.json"), &serde_json::to_vec(&metadata).unwrap())
+            .unwrap();
+        let before = std::fs::read(dir.join("meta.json")).unwrap();
+        writeln!(
+            std::fs::OpenOptions::new().append(true).open(&path).unwrap(),
+            "{}",
+            serde_json::json!({"type":"assistant", "uuid":"second", "message":{"role":"assistant", "content":[{"type":"text","text":"appendedneedle"},{"type":"tool_use","id":"plan","name":"TodoWrite","input":{"todos":[{"content":"verified plan","status":"pending"}]}}]}})
+        )
+        .unwrap();
+        let missing = cv_core::SessionRef::new("missing", cv_core::Harness::Claude, world.base.join("missing.jsonl"));
+        let migration = Migration::prepare(&dir, false).unwrap().unwrap();
+        let swept = {
+            let _sources = cv_core::source::read_scope();
+            sweep_refs(migration.path(), &[reference.clone(), missing], true, false).unwrap()
+        };
+        assert_eq!((swept.changed, swept.errors), (1, 1), "{:?}", swept.unreadable);
+        let failure = migration.publish(&swept).unwrap_err();
+        assert!(failure.to_string().contains("migration incomplete"), "{failure:#}");
+        assert!(
+            failure.to_string().contains("missing"),
+            "migration failure must identify its first failed source: {failure:#}"
+        );
+        assert_eq!(std::fs::read(dir.join("meta.json")).unwrap(), before);
+        assert_eq!(source_consumer(&dir).unwrap(), original_consumer);
+        assert_eq!(dependency(), original_dependency);
+        // Global consumers certify the independently completed new source pass. They do not
+        // certify the old FTS generation, whose metadata and consumer remain unchanged.
+        assert_ne!(
+            cv_core::catalog::AffordanceTable::load().counts(&reference).unwrap(),
+            original_counts
+        );
+        assert!(!cv_core::events::needs_ingest(&reference));
+        assert!(cv_core::resume::MarkTable::load().get(&reference).unwrap().offset() > original_mark.offset());
+        let query = QueryParser::for_index(&retained_index, vec![fields.body])
+            .parse_query("appendedneedle")
+            .unwrap();
+        assert_eq!(retained.search(&query, &tantivy::collector::Count).unwrap(), 0);
+        let retried = sweep_migrating(&dir, std::slice::from_ref(&reference), false, false).unwrap();
+        assert_eq!((retried.changed, retried.resumed, retried.errors), (1, 0, 0));
+        assert_eq!(text_search(&dir, "originalneedle", 10).unwrap().len(), 1);
+        assert_eq!(text_search(&dir, "appendedneedle", 10).unwrap().len(), 1);
     }
 
     #[cfg(unix)]

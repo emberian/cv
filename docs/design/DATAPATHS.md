@@ -119,6 +119,9 @@ An empty, unindexed schema stamp holds the new consumer UUID, so source dependen
 switches in exactly the same record. Ordinary commits preserve this stamp automatically.
 Counts and events from successful source passes remain independently valid if the FTS
 migration is abandoned; the abandoned FTS consumer never becomes the active index identity.
+Their shared resume marks may also advance after that verified source pass. A retried migration
+starts with an empty index, so it has no indexed prefix to resume: it must index the whole
+source despite those newer global counts, events and checkpoints.
 
 Existing prepared readers retain their old segment files. Those files are deliberately no
 longer in Tantivy's managed-file list, so later garbage collection cannot delete them while
