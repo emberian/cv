@@ -20,6 +20,7 @@ pub(super) fn open(path: &Path, complete: bool) -> Result<jsonl::Read> {
     let source = crate::json::JsonSource::capture_with_reads(path, &reads)?;
     let input = jsonl::Read::with(source)?;
     let output = Arc::new(ByteSource::arena()?);
+    let mut stage = Stage::new()?;
     sqlite::open_ro(path)?.read_snapshot(|conn, _| {
         let columns = sqlite::Select::of(conn, "steps");
         anyhow::ensure!(
@@ -28,29 +29,61 @@ pub(super) fn open(path: &Path, complete: bool) -> Result<jsonl::Read> {
         );
         let mut query = conn.prepare("SELECT idx, step_format FROM steps ORDER BY idx")?;
         let mut rows = query.query([])?;
-        while let Some(row) = rows.next()? {
-            let index: i64 = row.get(0)?;
-            let format: i64 = row.get(1)?;
-            anyhow::ensure!(format == 0, "unsupported Antigravity native step format {format}");
-            anyhow::ensure!(index >= 0, "negative Antigravity step index");
-            // Each cell is privately staged, then projected with positioned bounded
-            // readers. No protobuf string or tool argument needs an owned full copy.
-            let cell = ByteSource::arena()?;
-            let (_, len) = cell.append(|out| {
-                sqlite::with_cell_reader(conn, "steps", "step_payload", index, |reader, _| {
-                    std::io::copy(reader, out)?;
-                    Ok(())
-                })
-            })?;
-            let file = cell.file()?;
-            let step = Proto::read(&file, 0, len)?;
-            output.append(|mut out| project(&file, &step, index as u64, complete, &mut out))?;
-        }
+        output.append(|mut out| {
+            while let Some(row) = rows.next()? {
+                let index: i64 = row.get(0)?;
+                let format: i64 = row.get(1)?;
+                anyhow::ensure!(format == 0, "unsupported Antigravity native step format {format}");
+                anyhow::ensure!(index >= 0, "negative Antigravity step index");
+                // Each cell is privately staged, then projected with positioned bounded
+                // readers. No protobuf string or tool argument needs an owned full copy.
+                if stage.used.get() >= Stage::RENEW {
+                    stage = Stage::new()?;
+                }
+                let cell = stage.append(|out| {
+                    sqlite::with_cell_reader(conn, "steps", "step_payload", index, |reader, _| {
+                        std::io::copy(reader, out)?;
+                        Ok(())
+                    })
+                })?;
+                let step = Proto::read(&stage.file, cell.0, cell.1)?;
+                project(&stage, &step, cell, index as u64, complete, &mut out)?;
+            }
+            Ok(())
+        })?;
         Ok(())
     })?;
     input.check()?;
     let len = output.byte_len()?;
     Ok(input.decoded(output, len))
+}
+
+/// Private staging for native cells and for text assembled from them. One unlinked file
+/// serves many rows: a file per row cost an open, an unlink and a close for each of a
+/// session's thousands of steps. Ranges are immutable once appended.
+pub(super) struct Stage {
+    arena: ByteSource,
+    file: File,
+    used: std::cell::Cell<u64>,
+}
+impl Stage {
+    /// Staged bytes after which the next row starts a new file, releasing the old one.
+    const RENEW: u64 = 64 << 20;
+
+    fn new() -> Result<Self> {
+        let arena = ByteSource::arena()?;
+        let file = arena.file()?;
+        Ok(Self {
+            arena,
+            file,
+            used: Default::default(),
+        })
+    }
+    fn append(&self, write: impl FnOnce(&mut dyn Write) -> Result<()>) -> Result<(u64, u64)> {
+        let range = self.arena.append(write)?;
+        self.used.set(range.0 + range.1);
+        Ok(range)
+    }
 }
 
 fn scalar(p: &Proto, field: u32) -> Option<u64> {
@@ -83,7 +116,15 @@ fn calls(file: &File, p: &Proto, out: &mut impl Write) -> Result<()> {
     out.write_all(b"]")?;
     Ok(())
 }
-fn project(file: &File, step: &Proto, index: u64, complete: bool, out: &mut impl Write) -> Result<()> {
+fn project(
+    stage: &Stage,
+    step: &Proto,
+    cell: (u64, u64),
+    index: u64,
+    complete: bool,
+    out: &mut impl Write,
+) -> Result<()> {
+    let file = &stage.file;
     // The `step` member set names the type. A cleared row can lose its member and keep
     // only `Step.type` (CortexStepType): its kind, order and tool identity still stand.
     const KINDS: [(u32, u64, &str); 6] = [
@@ -202,9 +243,9 @@ fn project(file: &File, step: &Proto, index: u64, complete: bool, out: &mut impl
                     text(file, &result, 1, "content", out)?;
                     true
                 } else if let Some(structure) = result.last(10) {
-                    structured_content(file, structure.message(file)?, true, out)?
+                    structured_content(stage, structure.message(file)?, true, out)?
                 } else if let Some(value) = result.last(11) {
-                    structured_content(file, value.message(file)?, false, out)?
+                    structured_content(stage, value.message(file)?, false, out)?
                 } else {
                     false
                 };
@@ -212,7 +253,7 @@ fn project(file: &File, step: &Proto, index: u64, complete: bool, out: &mut impl
                     let info = info.message(file)?;
                     render::agents(file, &info, out)?;
                     if !has_content {
-                        render::content(file, &info, out)?;
+                        render::content(stage, &info, out)?;
                     }
                 }
                 text(file, &result, 7, "native_output_uri", out)?;
@@ -250,9 +291,7 @@ fn project(file: &File, step: &Proto, index: u64, complete: bool, out: &mut impl
     }
     if complete {
         out.write_all(b",\"native_record\":{\"encoding\":\"protobuf-hex\",\"data\":\"")?;
-        let mut reader = file.try_clone()?;
-        use std::io::Seek;
-        reader.rewind()?;
+        let mut reader = wire::range(file, cell.0, cell.1)?;
         let mut bytes = [0u8; 8192];
         let digits = b"0123456789abcdef";
         let mut hex = [0u8; 16384];
@@ -273,10 +312,10 @@ fn project(file: &File, step: &Proto, index: u64, complete: bool, out: &mut impl
     Ok(())
 }
 
-fn structured_content(file: &File, message: Proto, structure: bool, out: &mut impl Write) -> Result<bool> {
-    let staged = ByteSource::arena()?;
+fn structured_content(stage: &Stage, message: Proto, structure: bool, out: &mut impl Write) -> Result<bool> {
+    let file = &stage.file;
     let mut supported = false;
-    staged.append(|mut output| {
+    let (at, len) = stage.append(|mut output| {
         supported = if structure {
             struct_json(file, &message, &mut output, 0)?
         } else {
@@ -286,7 +325,7 @@ fn structured_content(file: &File, message: Proto, structure: bool, out: &mut im
     })?;
     if supported {
         out.write_all(b",\"content\":")?;
-        crate::projection::write_json_string(out, staged.reader()?)?;
+        crate::projection::write_json_string(out, wire::range(file, at, len)?)?;
     }
     Ok(supported)
 }
@@ -384,12 +423,13 @@ mod tests {
     }
 
     fn projection(data: &[u8], complete: bool) -> serde_json::Value {
-        let cell = ByteSource::arena().unwrap();
-        cell.append(|out| Ok(out.write_all(data)?)).unwrap();
-        let file = cell.file().unwrap();
-        let message = Proto::read(&file, 0, data.len() as u64).unwrap();
+        // An earlier row in the same staging file: ranges, not the file, bound a cell.
+        let stage = Stage::new().unwrap();
+        stage.append(|out| Ok(out.write_all(b"earlier row")?)).unwrap();
+        let cell = stage.append(|out| Ok(out.write_all(data)?)).unwrap();
+        let message = Proto::read(&stage.file, cell.0, cell.1).unwrap();
         let mut output = Vec::new();
-        project(&file, &message, 17, complete, &mut output).unwrap();
+        project(&stage, &message, cell, 17, complete, &mut output).unwrap();
         serde_json::from_slice(&output).unwrap()
     }
 

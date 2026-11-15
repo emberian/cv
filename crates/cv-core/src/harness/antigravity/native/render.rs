@@ -1,19 +1,19 @@
 //! Retained UI content survives some native payload clearing. Project its known
 //! semantics without treating a rendered command or exit code as a step status.
-use super::{wire, ByteSource, File, Proto, Result, Write};
+use super::{wire, File, Proto, Result, Stage, Write};
 
 /// Emit a body only when the primary result was absent. Text stays in a private
 /// arena so unsupported-only render records do not manufacture an empty result.
-pub(super) fn content(file: &File, info: &Proto, out: &mut impl Write) -> Result<bool> {
-    let staged = ByteSource::arena()?;
+pub(super) fn content(stage: &Stage, info: &Proto, out: &mut impl Write) -> Result<bool> {
+    let file = &stage.file;
     let mut present = false;
-    staged.append(|mut output| {
+    let (at, len) = stage.append(|mut output| {
         body(file, info, &mut output, &mut present, 0)?;
         Ok(())
     })?;
     if present {
         out.write_all(b",\"content\":")?;
-        crate::projection::write_json_string(out, staged.reader()?)?;
+        crate::projection::write_json_string(out, wire::range(file, at, len)?)?;
     }
     Ok(present)
 }
@@ -182,13 +182,12 @@ mod tests {
     }
 
     fn project(data: &[u8]) -> (bool, serde_json::Value) {
-        let staged = ByteSource::arena().unwrap();
-        staged.append(|out| Ok(out.write_all(data)?)).unwrap();
-        let file = staged.file().unwrap();
-        let info = Proto::read(&file, 0, data.len() as u64).unwrap();
+        let stage = Stage::new().unwrap();
+        let (at, len) = stage.append(|out| Ok(out.write_all(data)?)).unwrap();
+        let info = Proto::read(&stage.file, at, len).unwrap();
         let mut output = b"{\"sentinel\":true".to_vec();
-        let present = content(&file, &info, &mut output).unwrap();
-        agents(&file, &info, &mut output).unwrap();
+        let present = content(&stage, &info, &mut output).unwrap();
+        agents(&stage.file, &info, &mut output).unwrap();
         output.extend_from_slice(b"}");
         (present, serde_json::from_slice(&output).unwrap())
     }

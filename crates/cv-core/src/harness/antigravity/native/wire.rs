@@ -20,38 +20,54 @@ pub(super) struct Field {
     pub value: Value,
 }
 
+/// Fields of one message. Real steps hold tens; the bound keeps a hostile or corrupt
+/// cell from turning each two bytes into a 24-byte descriptor (6 MiB at the limit).
+const MAX_FIELDS: usize = 1 << 18;
+
 #[derive(Debug, Default)]
 pub(super) struct Message {
     fields: Vec<Field>,
 }
 
 impl Message {
+    /// A staged cell: the one range checked against the file. Every nested range is
+    /// bounded by the message that holds it.
     pub fn read(file: &File, at: u64, len: u64) -> Result<Self> {
         let end = at.checked_add(len).context("protobuf message range overflow")?;
         ensure!(end <= file.metadata()?.len(), "protobuf message outside staged cell");
+        Self::parse(file, at, end)
+    }
+
+    fn parse(file: &File, mut at: u64, end: u64) -> Result<Self> {
         let mut fields = Vec::new();
-        let mut at = at;
+        // Field headers are read a window at a time: a positioned syscall per window
+        // that holds headers, not per field. Payloads are skipped, never read here.
+        let mut window = [0u8; 512];
+        let (mut held_at, mut held) = (0u64, 0usize);
         while at < end {
-            // Two maximum-width varints cover a tag and length. Reading a fixed
-            // header avoids a positioned syscall for every byte of every tag.
-            let mut header = [0u8; 20];
-            let n = (end - at).min(header.len() as u64) as usize;
-            exact_at(file, &mut header[..n], at)?;
+            // A descriptor is 24 bytes for as little as two bytes of input.
+            ensure!(fields.len() < MAX_FIELDS, "protobuf message has too many fields");
+            // Two maximum-width varints cover a tag and length.
+            let n = (end - at).min(20) as usize;
+            if at < held_at || at + n as u64 > held_at + held as u64 {
+                held = (end - at).min(window.len() as u64) as usize;
+                held_at = at;
+                exact_at(file, &mut window[..held], at)?;
+            }
+            let header = &window[(at - held_at) as usize..][..n];
             let mut offset = 0;
-            let tag = varint(&header[..n], &mut offset)?;
+            let tag = varint(header, &mut offset)?;
             let number = u32::try_from(tag >> 3).context("protobuf field number overflow")?;
             ensure!((1..=0x1fff_ffff).contains(&number), "invalid protobuf field number");
             let value = match tag & 7 {
-                0 => Value::Varint(varint(&header[..n], &mut offset)?),
+                0 => Value::Varint(varint(header, &mut offset)?),
                 1 => {
-                    let bytes = header[..n]
-                        .get(offset..offset + 8)
-                        .context("truncated protobuf fixed64")?;
+                    let bytes = header.get(offset..offset + 8).context("truncated protobuf fixed64")?;
                     offset += 8;
                     Value::Fixed64(u64::from_le_bytes(bytes.try_into()?))
                 }
                 2 => {
-                    let len = varint(&header[..n], &mut offset)?;
+                    let len = varint(header, &mut offset)?;
                     let start = at
                         .checked_add(offset as u64)
                         .context("protobuf field offset overflow")?;
@@ -65,9 +81,7 @@ impl Message {
                     continue;
                 }
                 5 => {
-                    let bytes = header[..n]
-                        .get(offset..offset + 4)
-                        .context("truncated protobuf fixed32")?;
+                    let bytes = header.get(offset..offset + 4).context("truncated protobuf fixed32")?;
                     offset += 4;
                     Value::Fixed32(u32::from_le_bytes(bytes.try_into()?))
                 }
@@ -108,7 +122,11 @@ impl Field {
         let Value::Bytes { at, len } = self.value else {
             anyhow::bail!("protobuf message field is not length-delimited")
         };
-        Message::read(file, at, len)
+        Message::parse(
+            file,
+            at,
+            at.checked_add(len).context("protobuf message range overflow")?,
+        )
     }
 
     pub fn reader(self, file: &File) -> Result<RangeReader<'_>> {
@@ -116,7 +134,6 @@ impl Field {
             anyhow::bail!("protobuf byte field is not length-delimited")
         };
         let end = at.checked_add(len).context("protobuf byte range overflow")?;
-        ensure!(end <= file.metadata()?.len(), "protobuf bytes outside staged cell");
         Ok(RangeReader { file, at, end })
     }
 
@@ -158,6 +175,13 @@ impl Field {
         out.write_all(b"\"")?;
         Ok(())
     }
+}
+
+/// A reader over one staged range, checked against the file.
+pub(super) fn range(file: &File, at: u64, len: u64) -> Result<RangeReader<'_>> {
+    let end = at.checked_add(len).context("protobuf byte range overflow")?;
+    ensure!(end <= file.metadata()?.len(), "protobuf bytes outside staged cell");
+    Ok(RangeReader { file, at, end })
 }
 
 pub(super) struct RangeReader<'a> {
@@ -256,6 +280,13 @@ mod tests {
             let file = staged_file(&bytes);
             assert!(Message::read(&file, 0, bytes.len() as u64).is_err(), "{bytes:?}");
         }
+        let many = [8, 1].repeat(MAX_FIELDS + 1);
+        let file = staged_file(&many);
+        assert_eq!(
+            Message::read(&file, 0, 2 * MAX_FIELDS as u64).unwrap().fields().len(),
+            MAX_FIELDS
+        );
+        assert!(Message::read(&file, 0, many.len() as u64).is_err());
         let file = staged_file(&[]);
         assert!(Message::read(&file, u64::MAX, 2).is_err());
         assert!(Message::read(&file, 0, 1).is_err());
