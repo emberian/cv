@@ -653,8 +653,9 @@ impl Adapter for Antigravity {
                 order.ingest(&line)?;
                 Ok(Flow::Continue)
             })?;
+            // Native steps the export lacks, read from the native projection at their index.
             #[cfg(feature = "sqlite")]
-            let mut native_only = None;
+            let mut native_only: Option<(jsonl::Read, StepOrder)> = None;
             #[cfg(feature = "sqlite")]
             if !is_native_store(&r.path) {
                 if let Some(loc) = BrainLoc::from_transcript(&r.path) {
@@ -670,7 +671,7 @@ impl Adapter for Antigravity {
                         ) {
                             if !verified.matches.is_empty()
                                 || !verified.native_only.steps.is_empty()
-                                || verified.rejected
+                                || verified.unreconciled
                             {
                                 order
                                     .coverage
@@ -682,15 +683,17 @@ impl Adapter for Antigravity {
                                     .insert(crate::coverage::ReadCoverage::UNSUPPORTED_NATIVE_FIELDS.into());
                             }
                             codec.enrich.verified = verified.matches;
-                            if verified.rejected {
-                                order.coverage.limitations.insert("unreconciled_history".into());
-                            } else if !verified.native_only.steps.is_empty() {
-                                order.coverage.sources.extend(verified.native_only.coverage.sources);
+                            if verified.unreconciled {
                                 order
                                     .coverage
                                     .limitations
-                                    .extend(verified.native_only.coverage.limitations);
-                                native_only = Some((verified.native, verified.native_only.steps));
+                                    .insert(crate::coverage::ReadCoverage::UNRECONCILED_HISTORY.into());
+                            }
+                            if !verified.native_only.steps.is_empty() {
+                                let found = &verified.native_only.coverage;
+                                order.coverage.sources.extend(found.sources.iter().cloned());
+                                order.coverage.limitations.extend(found.limitations.iter().cloned());
+                                native_only = Some((verified.native, verified.native_only));
                             }
                         }
                     }
@@ -723,9 +726,9 @@ impl Adapter for Antigravity {
                 })?;
             }
             #[cfg(feature = "sqlite")]
-            if let Some((native, steps)) = &native_only {
+            if let Some((native, found)) = &native_only {
                 let mut records = native.records();
-                for (at, end) in steps.values() {
+                for (at, end) in found.steps.values() {
                     records.read(*at, end - at, |view| {
                         if codec.inferred_identity(view)? {
                             order
@@ -739,49 +742,47 @@ impl Adapter for Antigravity {
             }
             order.coverage.attach(&mut codec.s);
             spawns.meta(&codec.s);
+            let skipped = order.skipped;
+            #[cfg(feature = "sqlite")]
+            if let Some((native, found)) = native_only {
+                // One pass in step order over both sources, each under its own guard.
+                let mut merged: BTreeMap<u64, (bool, u64, u64)> = order
+                    .steps
+                    .into_iter()
+                    .map(|(index, (at, end))| (index, (false, at, end)))
+                    .collect();
+                merged.extend(
+                    found
+                        .steps
+                        .into_iter()
+                        .map(|(index, (at, end))| (index, (true, at, end))),
+                );
+                let mut exported = input.records();
+                let mut natives = native.records();
+                return crate::stream::guarded(&mut spawns, &input, |sink| {
+                    let stopped = crate::stream::guarded(sink, &native, |sink| {
+                        for (from_native, at, end) in merged.into_values() {
+                            let records = if from_native { &mut natives } else { &mut exported };
+                            if records.read(at, end - at, |view| codec.record(view, at, sink))? == Flow::Stop {
+                                return Ok(true);
+                            }
+                        }
+                        Ok(false)
+                    })?;
+                    super::note_skipped_lines(codec.session(), skipped);
+                    codec.finish(stopped, sink).map(Some)
+                });
+            }
             let mut records = input.records();
             crate::stream::guarded(&mut spawns, &input, |sink| {
                 let mut stopped = false;
-                // Both sources replay as one conversation, in step order: a step the
-                // export never wrote sits between the exported steps around it.
-                #[cfg(feature = "sqlite")]
-                let merged = match native_only {
-                    Some((native, steps)) => {
-                        let mut merged: BTreeMap<u64, (bool, u64, u64)> = order
-                            .steps
-                            .iter()
-                            .map(|(index, (at, end))| (*index, (false, *at, *end)))
-                            .collect();
-                        merged.extend(steps.into_iter().map(|(index, (at, end))| (index, (true, at, end))));
-                        let mut native_records = native.records();
-                        stopped = crate::stream::guarded(sink, &native, |sink| {
-                            for (from_native, at, end) in merged.into_values() {
-                                let flow = if from_native {
-                                    native_records.read(at, end - at, |view| codec.record(view, at, sink))?
-                                } else {
-                                    records.read(at, end - at, |view| codec.record(view, at, sink))?
-                                };
-                                if flow == Flow::Stop {
-                                    return Ok(true);
-                                }
-                            }
-                            Ok(false)
-                        })?;
-                        true
-                    }
-                    None => false,
-                };
-                #[cfg(not(feature = "sqlite"))]
-                let merged = false;
-                if !merged {
-                    for (at, end) in order.steps.values() {
-                        if records.read(*at, end - at, |view| codec.record(view, *at, sink))? == Flow::Stop {
-                            stopped = true;
-                            break;
-                        }
+                for (at, end) in order.steps.into_values() {
+                    if records.read(at, end - at, |view| codec.record(view, at, sink))? == Flow::Stop {
+                        stopped = true;
+                        break;
                     }
                 }
-                super::note_skipped_lines(codec.session(), order.skipped);
+                super::note_skipped_lines(codec.session(), skipped);
                 codec.finish(stopped, sink).map(Some)
             })
         })

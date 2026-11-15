@@ -230,6 +230,10 @@ fn project(file: &File, step: &Proto, index: u64, complete: bool, out: &mut impl
                 if let Some(number) = preferred {
                     text(file, &error, number, "content", out)?;
                 }
+                // The export's `error` is the short error, whichever text is preferred.
+                if step.last(31).is_none() {
+                    text(file, &error, 2, "error", out)?;
+                }
             }
         }
         _ => {}
