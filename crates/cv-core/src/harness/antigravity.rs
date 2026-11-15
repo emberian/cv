@@ -641,7 +641,10 @@ impl Adapter for Antigravity {
                 .state
                 .child_ids
                 .extend(codec.enrich.known_children.iter().cloned());
-            let mut order = StepOrder::default();
+            let mut order = StepOrder {
+                local: true,
+                ..StepOrder::default()
+            };
             let to = match from {
                 Start::Prefix(to) => to,
                 _ => input.len(),
@@ -929,6 +932,8 @@ struct StepOrder {
     steps: BTreeMap<u64, (u64, u64)>,
     skipped: u64,
     coverage: crate::coverage::ReadCoverage,
+    /// Reading a store on this machine: an exported media path can be checked.
+    local: bool,
 }
 impl StepOrder {
     fn ingest(&mut self, line: &jsonl::Line<'_>) -> Result<()> {
@@ -951,6 +956,22 @@ impl StepOrder {
                 }
             } else {
                 self.coverage.sources.insert(ReadCoverage::EXPORTED_HISTORY.into());
+                if self.local {
+                    if let Some(media) = view.get("media")?.map(JsonView::array).transpose()?.flatten() {
+                        for item in media {
+                            // An inline data URI can be megabytes; a path is short.
+                            let Some(uri) = item?.get("uri")? else {
+                                continue;
+                            };
+                            let uri = peek_view_prefix(uri, 4097)?;
+                            if uri.len() <= 4096 && attachment_missing(&uri) {
+                                self.coverage
+                                    .limitations
+                                    .insert(ReadCoverage::MISSING_ATTACHMENTS.into());
+                            }
+                        }
+                    }
+                }
                 if let Some(calls) = view.get("tool_calls")?.map(JsonView::array).transpose()?.flatten() {
                     for call in calls {
                         if call?
@@ -2673,6 +2694,14 @@ pub(crate) fn file_uri_to_path(uri: &str) -> Option<PathBuf> {
         rest
     };
     Some(PathBuf::from(percent_decode(path_part)))
+}
+
+/// A media reference to a local file that no longer exists. A reference that is not a
+/// path or `file:` URI cannot be checked and is not reported.
+pub(crate) fn attachment_missing(uri: &str) -> bool {
+    file_uri_to_path(uri)
+        .or_else(|| uri.starts_with('/').then(|| PathBuf::from(uri)))
+        .is_some_and(|path| !path.exists())
 }
 
 fn percent_decode(input: &str) -> String {

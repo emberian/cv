@@ -619,6 +619,51 @@ fn an_idle_child_notice_is_its_return_to_the_parent() {
 
 // ---- prompt media ----------------------------------------------------------------------------
 
+#[test]
+fn a_prompt_image_survives_the_loss_of_its_stored_upload() {
+    let world = world("agy-writer-media");
+    let root = store(&world, "1.5.9-prompt-media", false);
+    let (_, session) = only(sessions(&root));
+    let steps = stored(&root, &session.id);
+    // UserInput(19).media(9): mime(1), inline bytes(2) and the writer's stored copy(5).
+    let media = nested(nested(&steps[0].payload, 19)[0], 9);
+    assert_eq!(media.len(), 1);
+    let upload = string(media[0], 5).unwrap();
+    assert!(upload.contains("/.user_uploaded/") && !Path::new(&upload).exists());
+    assert!(!nested(media[0], 2).is_empty());
+
+    let prompt = by_id(&session, 0);
+    assert_eq!(body(&session, prompt), "inline-image fixture prompt");
+    let images: Vec<_> = prompt
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            Block::Image { media_type, data_ref } => Some((media_type.as_deref(), data_ref.as_deref())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(images, [(Some("image/png"), Some(PIXEL))]);
+    assert!(!limitations(&session).contains(&"missing_attachments".to_owned()));
+
+    // Linked files are references into the workspace, not payloads the store owns.
+    let linked = by_id(&session, 2);
+    assert_eq!(body(&session, linked), "linked-attachment fixture prompt");
+    assert!(linked.content.iter().all(|block| matches!(block, Block::Text { .. })));
+    let scope: Vec<&str> = native(linked)["scope_items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| {
+            assert_eq!(item["kind"], "file");
+            item["uri"].as_str().unwrap().rsplit('/').next().unwrap()
+        })
+        .collect();
+    assert_eq!(scope, ["linked.png", "notes.txt"]);
+    // The ACP server advertises no audio support and stores nothing for an audio block.
+    let audio = by_id(&session, 4);
+    assert_eq!(body(&session, audio), "audio fixture prompt");
+    assert_eq!(audio.content.len(), 1);
+}
 
 fn len(field: u64, value: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
@@ -633,3 +678,32 @@ fn len(field: u64, value: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Not a capture: one stored prompt whose media names a file and carries no bytes.
+#[test]
+fn a_linked_attachment_missing_at_read_time_is_a_coverage_limitation() {
+    let world = world("agy-writer-missing-attachment");
+    let attachment = world.base.join("upload.png");
+    let media = [len(1, b"image/png"), len(5, attachment.to_str().unwrap().as_bytes())].concat();
+    let input = [len(3, &len(1, b"see attachment")), len(9, &media)].concat();
+    let payload = [vec![8, 14, 32, 3], len(19, &input)].concat();
+    let directory = world.base.join("conversations");
+    fs::create_dir_all(&directory).unwrap();
+    let conn = rusqlite::Connection::open(directory.join("11111111-2222-4333-8444-555555555555.db")).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, status INTEGER,
+         step_payload BLOB, step_format INTEGER DEFAULT 0);",
+    )
+    .unwrap();
+    conn.execute("INSERT INTO steps(idx,step_type,status,step_payload) VALUES (0,14,3,?1)", [payload])
+        .unwrap();
+    drop(conn);
+    let missing = only(sessions(&world.base)).1;
+    assert!(limitations(&missing).contains(&"missing_attachments".to_owned()));
+    assert!(missing.messages[0]
+        .content
+        .iter()
+        .any(|block| matches!(block, Block::Image { data_ref: Some(path), .. } if Path::new(path) == attachment)));
+    fs::write(&attachment, b"present").unwrap();
+    let present = only(sessions(&world.base)).1;
+    assert!(!limitations(&present).contains(&"missing_attachments".to_owned()));
+}

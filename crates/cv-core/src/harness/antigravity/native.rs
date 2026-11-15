@@ -170,13 +170,14 @@ fn project(file: &File, step: &Proto, index: u64, complete: bool, out: &mut impl
     if let Some(details) = step.last(148) {
         context::task(file, &details.message(file)?, out)?;
     }
+    let mut missing_attachments = false;
     interaction::project(file, step, out)?;
     match kind {
         "USER_INPUT" => {
             let input = step.last(19).unwrap().message(file)?;
             context::user(file, &input, out)?;
             text(file, &input, 1, "content", out)?;
-            media::project(file, &input, 9, out)?;
+            missing_attachments |= media::project(file, &input, 9, out)?;
         }
         "PLANNER_RESPONSE" => {
             let response = step.last(20).unwrap().message(file)?;
@@ -188,7 +189,7 @@ fn project(file: &File, step: &Proto, index: u64, complete: bool, out: &mut impl
             }
             calls(file, &response, out)?;
             identity::planner(file, &response, out)?;
-            media::project(file, &response, 20, out)?;
+            missing_attachments |= media::project(file, &response, 20, out)?;
         }
         "GENERIC" => {
             let generic = step.last(140).unwrap().message(file)?;
@@ -212,13 +213,13 @@ fn project(file: &File, step: &Proto, index: u64, complete: bool, out: &mut impl
                     }
                 }
                 text(file, &result, 7, "native_output_uri", out)?;
-                media::project(file, &result, 4, out)?;
+                missing_attachments |= media::project(file, &result, 4, out)?;
             }
         }
         "SYSTEM_MESSAGE" => {
             let message = step.last(114).unwrap().message(file)?;
             text(file, &message, 1, "content", out)?;
-            media::project(file, &message, 6, out)?;
+            missing_attachments |= media::project(file, &message, 6, out)?;
         }
         "CHECKPOINT" => text(file, &step.last(30).unwrap().message(file)?, 5, "content", out)?,
         "ERROR_MESSAGE" => {
@@ -235,6 +236,9 @@ fn project(file: &File, step: &Proto, index: u64, complete: bool, out: &mut impl
     }
     if status == "CLEARED" {
         out.write_all(b",\"native_missing_payloads\":true")?;
+    }
+    if missing_attachments {
+        out.write_all(b",\"native_missing_attachments\":true")?;
     }
     if complete {
         out.write_all(b",\"native_record\":{\"encoding\":\"protobuf-hex\",\"data\":\"")?;
@@ -383,12 +387,14 @@ mod tests {
 
     #[test]
     fn native_media_and_missing_payloads_are_distinct() {
-        let uri_media = [bytes(1, b"image/png"), bytes(5, b"file:///tmp/example.png")].concat();
+        let existing = std::env::current_exe().unwrap();
+        let existing = existing.to_str().unwrap();
+        let uri_media = [bytes(1, b"image/png"), bytes(5, existing.as_bytes())].concat();
         let inline_media = [bytes(1, b"image/png"), bytes(2, b"image bytes")].concat();
         for (field, media_field) in [(19, 9), (20, 20), (114, 6)] {
             let content = [bytes(1, b"caption"), bytes(media_field, &uri_media)].concat();
             let projected = projection(&bytes(field, &content), false);
-            assert_eq!(projected["media"][0]["uri"], "file:///tmp/example.png");
+            assert_eq!(projected["media"][0]["uri"], existing);
             assert_eq!(projected["media"][0]["mime_type"], "image/png");
             assert!(projected.get("native_missing_attachments").is_none());
             assert!(projected.get("native_missing_payloads").is_none());
@@ -399,7 +405,18 @@ mod tests {
         }
         let result = [bytes(1, b"output"), bytes(4, &uri_media)].concat();
         let projected = projection(&bytes(140, &bytes(2, &result)), false);
-        assert_eq!(projected["media"][0]["uri"], "file:///tmp/example.png");
+        assert_eq!(projected["media"][0]["uri"], existing);
+
+        // A linked file that is gone: its inline copy is read; with no copy the step says so.
+        let gone = b"file:///nonexistent/cv-fixture/upload.png";
+        let both = [bytes(1, b"image/png"), bytes(2, b"image bytes"), bytes(5, gone)].concat();
+        let projected = projection(&bytes(19, &bytes(9, &both)), false);
+        assert_eq!(projected["media"][0]["uri"], "data:image/png;base64,aW1hZ2UgYnl0ZXM=");
+        assert!(projected.get("native_missing_attachments").is_none());
+        let link_only = [bytes(1, b"image/png"), bytes(5, gone)].concat();
+        let projected = projection(&bytes(19, &bytes(9, &link_only)), false);
+        assert_eq!(projected["media"][0]["uri"], "file:///nonexistent/cv-fixture/upload.png");
+        assert_eq!(projected["native_missing_attachments"], true);
     }
 
     #[test]

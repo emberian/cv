@@ -5,7 +5,9 @@ use anyhow::{ensure, Context, Result};
 use std::fs::File;
 use std::io::{Read, Write};
 
-pub(super) fn project(file: &File, parent: &Message, number: u32, out: &mut impl Write) -> Result<()> {
+/// Returns whether any item names a local file that is gone and carries no bytes of its own.
+pub(super) fn project(file: &File, parent: &Message, number: u32, out: &mut impl Write) -> Result<bool> {
+    let mut missing = false;
     out.write_all(b",\"media\":[")?;
     for (i, field) in parent.repeated(number).enumerate() {
         if i != 0 {
@@ -14,12 +16,20 @@ pub(super) fn project(file: &File, parent: &Message, number: u32, out: &mut impl
         let item = field.message(file)?;
         out.write_all(b"{\"native\":true")?;
         super::text(file, &item, 1, "mime_type", out)?;
-        if item
+        let link = item
             .last(5)
-            .is_some_and(|field| matches!(field.value, super::wire::Value::Bytes { len, .. } if len > 0))
-        {
+            .filter(|field| matches!(field.value, super::wire::Value::Bytes { len, .. } if len > 0));
+        // A prompt image is stored twice: inline, and as a file beside the exported
+        // logs. The file is the cheap reference while it exists; the bytes outlive it.
+        let gone = match link {
+            Some(link) => local_file_missing(file, link)?,
+            None => false,
+        };
+        let inline = item.last(2);
+        if link.is_some() && !(gone && inline.is_some()) {
             super::text(file, &item, 5, "uri", out)?;
-        } else if let Some(data) = item.last(2) {
+            missing |= gone;
+        } else if let Some(data) = inline {
             let mime = inline_mime(file, &item)?;
             write!(out, ",\"uri\":\"data:{mime};base64,")?;
             base64(data.reader(file)?, out)?;
@@ -32,7 +42,16 @@ pub(super) fn project(file: &File, parent: &Message, number: u32, out: &mut impl
         out.write_all(b"}")?;
     }
     out.write_all(b"]")?;
-    Ok(())
+    Ok(missing)
+}
+
+/// Only a path or `file:` URI can be checked; any other reference is not known missing.
+fn local_file_missing(file: &File, link: super::wire::Field) -> Result<bool> {
+    let mut uri = String::new();
+    if link.reader(file)?.take(4097).read_to_string(&mut uri).is_err() || uri.len() > 4096 {
+        return Ok(false);
+    }
+    Ok(crate::harness::antigravity::attachment_missing(&uri))
 }
 
 fn inline_mime(file: &File, item: &Message) -> Result<String> {
@@ -158,13 +177,21 @@ mod tests {
     }
     #[test]
     fn existing_uri_takes_precedence_and_invalid_mime_is_rejected() {
-        let item = [
+        // A linked file that exists is the reference; one that is gone yields to the bytes.
+        let existing = std::env::current_exe().unwrap();
+        let existing = existing.to_str().unwrap();
+        let item = [bytes(1, b"image/png"), bytes(2, b"inline"), bytes(5, existing.as_bytes())].concat();
+        assert_eq!(projected(&item).unwrap()["media"][0]["uri"], existing);
+        let gone = [
             bytes(1, b"image/png"),
             bytes(2, b"inline"),
-            bytes(5, b"file:///tmp/image.png"),
+            bytes(5, b"file:///nonexistent/cv-fixture/image.png"),
         ]
         .concat();
-        assert_eq!(projected(&item).unwrap()["media"][0]["uri"], "file:///tmp/image.png");
+        assert_eq!(
+            projected(&gone).unwrap()["media"][0]["uri"],
+            "data:image/png;base64,aW5saW5l"
+        );
         let empty_uri = [bytes(1, b"image/png"), bytes(2, b"x"), bytes(5, b"")].concat();
         assert_eq!(
             projected(&empty_uri).unwrap()["media"][0]["uri"],
