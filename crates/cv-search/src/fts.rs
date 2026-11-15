@@ -43,8 +43,10 @@ mod observe;
 #[cfg(test)]
 use observe::{body_hash, SweepWork};
 mod live;
+mod prepared;
 mod sweep;
 pub use live::{BadLiveBytes, Budget, LiveRead, Suffix, LIVE_BYTES_VAR};
+pub use prepared::{IndexedAnswer, PreparedIndex, QueryWork};
 use sweep::*;
 
 use crate::ingest::{Admission, AdmittedDocument, Writer};
@@ -2390,6 +2392,8 @@ struct MetadataDecisions {
     cwd: Option<String>,
     allowed_ids: Option<std::sync::Arc<HashSet<String>>>,
     cache: std::sync::Mutex<HashMap<String, MetadataDecision>>,
+    stored_reads: std::sync::atomic::AtomicU64,
+    metadata_queries: std::sync::atomic::AtomicU64,
     #[cfg(test)]
     observed: observe::Query,
 }
@@ -2410,6 +2414,8 @@ impl MetadataDecisions {
             cwd: filter.cwd.map(str::to_owned),
             allowed_ids,
             cache: Default::default(),
+            stored_reads: Default::default(),
+            metadata_queries: Default::default(),
             #[cfg(test)]
             observed: Default::default(),
         }
@@ -2427,6 +2433,7 @@ impl MetadataDecisions {
         // A failed lookup is the query's error and is not cached.
         #[cfg(test)]
         self.observed.queries.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.metadata_queries.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let address = meta_addr(&self.searcher, &self.fields, id)
             .map_err(|error| tantivy::TantivyError::InternalError(format!("{error:#}")))?
             .ok_or_else(|| missing_meta(id))?;
@@ -2434,6 +2441,7 @@ impl MetadataDecisions {
         self.observed
             .stored_reads
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.stored_reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let doc = self.searcher.doc::<TantivyDocument>(address)?;
         let decision = MetadataDecision {
             address,
@@ -2976,12 +2984,10 @@ pub fn text_search_ids_batch_scoped(
     if queries.is_empty() {
         return Ok(Vec::new());
     }
-    let (index, f) = open_existing(dir)?;
-    let reader = index.reader().context("opening index reader")?;
-    let searcher = reader.searcher();
+    let prepared = PreparedIndex::open(dir)?;
     Ok(queries
         .iter()
-        .map(|query| matching_ids(&index, &f, &searcher, query, scope))
+        .map(|query| prepared.matching_ids(query, scope))
         .collect())
 }
 
@@ -3427,6 +3433,9 @@ fn indexed_hit(
     decisions: &MetadataDecisions,
 ) -> Result<Hit> {
     let (score, id) = (candidate.score, candidate.id);
+    decisions
+        .stored_reads
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let head: crate::session_collector::StoredHead<2> =
         searcher.doc(candidate.addr).context("loading stored doc header")?;
     let load_candidate = || -> Result<TantivyDocument> {
@@ -3445,6 +3454,9 @@ fn indexed_hit(
         })?
         .as_str()
         == Some(KIND_META);
+    decisions
+        .stored_reads
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let doc = if is_meta {
         load_candidate()?
     } else {
@@ -3457,7 +3469,12 @@ fn indexed_hit(
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 decision.address
             }
-            None => meta_addr(searcher, f, &id)?.ok_or_else(|| missing_meta(&id))?,
+            None => {
+                decisions
+                    .metadata_queries
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                meta_addr(searcher, f, &id)?.ok_or_else(|| missing_meta(&id))?
+            }
         };
         searcher.doc(address).context("reading search metadata")?
     };
@@ -4891,6 +4908,85 @@ mod tests {
 
     /// Write a minimal one-message Claude transcript so `live_snippet` has a real file to re-read,
     /// and return its path. `body` becomes the single user message's text.
+    #[test]
+    fn prepared_queries_pin_snapshot_bound_selected_reads_and_refresh() {
+        let _home = IsolatedHome::new();
+        let (index, sources) = (tmpdir(), tmpdir());
+        let mut refs = vec![sref("needle", "selected", write_claude(&sources, "needle", "zqneedle"))];
+        index_refs(&index, &refs, false).unwrap();
+        let mut prepared = PreparedIndex::open(&index).unwrap();
+        let filter = crate::SearchFilter::default();
+        let first = prepared.search("zqneedle", 1, filter, None).unwrap();
+        assert_eq!(first.total, 1);
+        assert_eq!(first.work.source_bytes, 0);
+        assert_eq!(first.work.index_bytes, None);
+        assert_eq!(first.work.stored_document_reads, 2);
+        assert_eq!(first.work.predicate_sessions, 0);
+        assert_eq!(first.work.metadata_lookup_queries, 1);
+        let snapshot = first.snapshot_id;
+        for i in 0..64 {
+            let id = format!("unrelated-{i}");
+            refs.push(sref(&id, "other", write_claude(&sources, &id, "unrelated")));
+        }
+        index_refs(&index, &refs, false).unwrap();
+        assert_eq!(prepared.search("unrelated", 10, filter, None).unwrap().total, 0);
+        assert!(prepared.search("(broken", 10, filter, None).is_err());
+        assert_eq!(
+            prepared.search("zqneedle", 1, filter, None).unwrap().snapshot_id,
+            snapshot
+        );
+        prepared.refresh().unwrap();
+        let fresh = prepared.search("zqneedle", 1, filter, None).unwrap();
+        assert_ne!(fresh.snapshot_id, snapshot);
+        assert_eq!(fresh.work.stored_document_reads, first.work.stored_document_reads);
+        assert_eq!(fresh.work.discovery_sessions, 0);
+        for scope in [crate::Scope::Exchange, crate::Scope::Context, crate::Scope::All] {
+            for (harness, cwd) in [
+                (None, None),
+                (Some("claude"), Some("/home/u")),
+                (Some("codex"), None),
+                (None, Some("absent")),
+            ] {
+                let filter = crate::SearchFilter { harness, cwd, scope };
+                let actual = prepared.search("zqneedle", 10, filter, None).unwrap();
+                let expected = text_search_indexed_filtered(&index, "zqneedle", 10, filter).unwrap();
+                assert_eq!(
+                    serde_json::to_value(actual.hits).unwrap(),
+                    serde_json::to_value(expected).unwrap()
+                );
+            }
+        }
+        let broad = prepared.search("unrelated", 2, filter, None).unwrap();
+        assert_eq!((broad.hits.len(), broad.total), (2, 64));
+        let empty = prepared.search("missing", 2, filter, None).unwrap();
+        assert_eq!(empty.work.stored_document_reads, 0);
+        let allowed = std::sync::Arc::new(HashSet::from(["unrelated-3".to_owned()]));
+        let filtered = prepared.search("unrelated", 2, filter, Some(allowed)).unwrap();
+        assert_eq!(filtered.total, 1);
+        assert_eq!(filtered.work.predicate_sessions, 64);
+        assert_eq!(filtered.work.metadata_lookup_queries, 64);
+        assert_eq!(filtered.work.stored_document_reads, 66);
+        assert_eq!(filtered.hits[0].id, "unrelated-3");
+        assert_eq!(prepared.search("unrelated", 0, filter, None).unwrap().total, 64);
+        let batch = text_search_ids_batch(&index, &["zqneedle", "(broken", "missing"]).unwrap();
+        assert_eq!(
+            batch[0].as_ref().unwrap(),
+            &prepared.matching_ids("zqneedle", crate::Scope::Exchange).unwrap()
+        );
+        assert!(batch[1].is_err());
+        assert!(batch[2].as_ref().unwrap().is_empty());
+        for r in &refs {
+            std::fs::remove_file(&r.path).unwrap();
+        }
+        assert_eq!(prepared.search("zqneedle", 1, filter, None).unwrap().total, 1);
+        assert!(PreparedIndex::open(&sources).is_err());
+        let snapshot = prepared.snapshot_id().to_owned();
+        std::fs::rename(&*index, sources.join("moved-index")).unwrap();
+        assert!(prepared.refresh().is_err());
+        assert_eq!(prepared.snapshot_id(), snapshot);
+        assert_eq!(prepared.search("zqneedle", 1, filter, None).unwrap().total, 1);
+    }
+
     fn write_claude(dir: &Path, id: &str, body: &str) -> String {
         let p = dir.join(format!("{id}.jsonl"));
         let line = serde_json::json!({

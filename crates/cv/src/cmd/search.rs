@@ -8,6 +8,7 @@ use cv_search::{Found, Note, Source};
 use std::io::Write;
 
 pub(crate) struct SearchArgs<'a> {
+    pub batch: bool,
     pub query: &'a str,
     pub harness: Option<String>,
     pub cwd: Option<String>,
@@ -40,6 +41,7 @@ fn resolve_allowed_ids(
 pub(crate) fn cmd_search(args: SearchArgs<'_>) -> Result<()> {
     let SearchArgs {
         query,
+        batch,
         harness,
         cwd,
         filter_query,
@@ -58,6 +60,16 @@ pub(crate) fn cmd_search(args: SearchArgs<'_>) -> Result<()> {
             None => return crate::util::usage(format!("unknown --kind {k:?}: exchange, context or all")),
         },
     };
+    if batch {
+        return batch_search(
+            cv_search::SearchFilter {
+                harness: want.map(|h| h.as_str()),
+                cwd: cwd.as_deref(),
+                scope,
+            },
+            limit,
+        );
+    }
     let allowed_ids = resolve_allowed_ids(want, cwd.as_deref(), filter_query)?;
     let source = if scan {
         eprintln!("(--scan: scanning every transcript live; `cv index` makes search instant)");
@@ -103,6 +115,46 @@ pub(crate) fn cmd_search(args: SearchArgs<'_>) -> Result<()> {
             },
         };
     render(found, query, json)
+}
+
+/// A streaming batch pins the index once; malformed queries do not discard later requests.
+fn batch_search(filter: cv_search::SearchFilter<'_>, limit: usize) -> Result<()> {
+    use std::io::{BufRead, IsTerminal};
+    anyhow::ensure!(
+        !std::io::stdin().is_terminal(),
+        "search --batch reads JSON query strings from piped stdin"
+    );
+    let prepared = cv_search::PreparedIndex::open(&cv_search::default_tantivy_dir())?;
+    let mut output = std::io::BufWriter::new(std::io::stdout().lock());
+    // A malformed/oversized request is isolated to its line. Drain rejected input
+    // without retaining it, then continue with the next query.
+    const MAX_QUERY_LINE: u64 = 1024 * 1024;
+    let mut input = std::io::stdin().lock();
+    loop {
+        let mut line = Vec::new();
+        let read = std::io::Read::take(&mut input, MAX_QUERY_LINE + 1).read_until(b'\n', &mut line)?;
+        if read == 0 {
+            break;
+        }
+        let result = if read as u64 > MAX_QUERY_LINE {
+            if !line.ends_with(b"\n") {
+                input.skip_until(b'\n')?;
+            }
+            Err(anyhow::anyhow!("batch query line exceeds 1048576-byte input limit"))
+        } else {
+            serde_json::from_slice::<String>(&line)
+                .map_err(anyhow::Error::from)
+                .and_then(|query| prepared.search(&query, limit, filter, None))
+        };
+        let row = match result {
+            Ok(answer) => serde_json::json!({"answer":answer,"setup_micros":prepared.setup_micros()}),
+            Err(error) => serde_json::json!({"error":format!("{error:#}"),"snapshot_id":prepared.snapshot_id()}),
+        };
+        serde_json::to_writer(&mut output, &row)?;
+        writeln!(output)?;
+        output.flush()?;
+    }
+    Ok(())
 }
 
 /// A note in the CLI's words. The sub-agent miss is prose for the table only.

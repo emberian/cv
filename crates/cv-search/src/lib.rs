@@ -24,6 +24,7 @@ use std::path::PathBuf;
 
 pub mod columnar_events;
 pub mod fts;
+pub use fts::{IndexedAnswer, PreparedIndex, QueryWork};
 mod ingest;
 mod session_collector;
 pub mod trigram;

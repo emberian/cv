@@ -444,6 +444,42 @@ fn search_json_emits_machine_readable_hits() {
     assert!(out.contains("2 of 2 matches") && !out.contains("use --limit"), "{out}");
 }
 
+#[test]
+fn search_batch_pins_index_and_continues_after_invalid_or_oversized_requests() {
+    let w = World::new("search-batch");
+    standard_corpus(&w);
+    w.cv_ok(&["index"]);
+    let (single, _) = w.cv_ok(&["search", "zebrafish", "--harness", "claude", "--frozen", "--json"]);
+    let (expected, total) = search_json(&single);
+    let input = format!(
+        "\"zebrafish\"\nnot-json\n\"(broken\"\n{}\n\"missing\"\n\"zebrafish\"\n",
+        "x".repeat(1_048_577)
+    );
+    let (ok, _, out, err) = w.cv_stdin(&["search", "--batch", "--harness", "claude"], &input);
+    assert!(ok, "{err}");
+    assert!(err.is_empty(), "{err}");
+    let rows: Vec<serde_json::Value> = out.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+    assert_eq!(rows.len(), 6);
+    assert_eq!(rows[0]["answer"]["total"], total);
+    assert_eq!(rows[0]["answer"]["hits"][0]["id"], expected[0]["id"]);
+    for row in &rows[1..4] {
+        assert!(row["error"].is_string(), "{row}");
+    }
+    assert!(rows[3]["error"].as_str().unwrap().contains("1048576-byte"));
+    assert_eq!(rows[4]["answer"]["total"], 0);
+    assert_eq!(rows[4]["answer"]["work"]["stored_document_reads"], 0);
+    assert_eq!(rows[0]["answer"]["snapshot_id"], rows[5]["answer"]["snapshot_id"]);
+    assert_eq!(rows[5]["answer"]["source_freshness_assessed"], false);
+    assert_eq!(rows[5]["answer"]["work"]["source_bytes"], 0);
+    for flags in [
+        vec!["search", "--batch", "-q", "title:alpha"],
+        vec!["search", "--batch", "--exact"],
+    ] {
+        let (ok, _, _, _) = w.cv(&flags);
+        assert!(!ok);
+    }
+}
+
 /// `cv search --json`'s stdout: `{"hits": [...], "total": M}`, as its hits and total.
 fn search_json(out: &str) -> (Vec<serde_json::Value>, u64) {
     let v: serde_json::Value = serde_json::from_str(out.trim()).expect("stdout must be pure JSON");

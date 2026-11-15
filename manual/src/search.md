@@ -115,6 +115,46 @@ could not be read.
 in discovery order, without operators or ranking, and says so on stderr. Invalid query syntax is
 an error, never a fallback to scanning. `--kind` cannot be combined with `--scan`.
 
+## Repeated queries over an indexed snapshot
+
+```sh
+printf '%s\n' '"retry backoff"' '"harness:claude timeout"' | cv search --batch --limit 10
+```
+
+`--batch` opens one full-text reader and accepts one JSON string query per line on stdin.
+Each response is one JSON object: `{"answer": {...}, "setup_micros": N}` or
+`{"error": "...", "snapshot_id": "..."}`. Invalid JSON, invalid query syntax and input lines
+larger than 1 MiB return an error for that request; subsequent requests continue. Output is
+never silently shortened. `--limit` limits returned hits; `total` counts all matching sessions,
+including with `--limit 0`. Startup errors (such as a missing index) fail the command.
+
+All queries share the command's `--harness`, `--cwd`, `--kind` and `--limit` settings.
+Filters use the metadata stored in that snapshot. `-q`, `--scan`, `--exact` and `--live-bytes`
+are explicitly unsupported in batch mode. Full-text query syntax remains the same.
+
+This mode does no session discovery, source reads or live snippet enrichment. Hits contain
+stored previews and describe the revisions that were indexed; subsequently changed or removed
+sources remain represented, and never-indexed sessions are absent. `source_freshness_assessed`
+is therefore `false`. Normal `--frozen` still discovers sessions to report stale coverage;
+batch deliberately answers a different question: what matches this pinned index snapshot?
+Compare matching IDs, totals and scores using identical scope and filters on unchanged sources;
+live snippets and freshness disclosures need not match.
+
+Every answer includes a stable, opaque `snapshot_id` for the reader lifetime and
+`indexed_documents` (metadata and text chunks, **not** session count). This ID is not a source
+revision or commit hash. Commits made while the batch runs remain invisible. Start another
+batch to reopen. Library callers can reuse `cv_search::PreparedIndex::{open, search,
+matching_ids}` and explicitly `refresh`; successful refresh starts a new reader lifetime,
+while failed refresh leaves the previous snapshot usable. Caller-provided ID allowlists are
+applied anew on every `search`; a folded child matches its own or its parent's allowed ID.
+
+`work` reports per-query logical work: top-level ranking/count passes, metadata lookup queries,
+distinct sessions evaluated for predicates, stored-document reader calls and returned hits.
+Source bytes, discovery sessions and live snippet reads are zero for this path. `index_bytes`
+is `null` because physical/mapped index I/O is not instrumented; logical reads are not bytes or
+page faults. `evaluation_micros` is query wall time. `setup_micros` is the one-time reader-open
+cost repeated for reference, not an additional cost paid for each answer.
+
 ## Exact substring search (`--exact`)
 
 ```sh
