@@ -1,115 +1,99 @@
-# 0.20: reliable live histories and trustworthy handoffs
+# 0.20 candidate: reliable live histories and trustworthy handoffs
 
-Status: active implementation, authorized by Ember on 2026-11-14. Integration owner:
-Codex. This is a release target and acceptance contract, not a claim that the work
-has landed. The existing adapter, IR, query API and routes remain the product shape.
+Status: implementation integrated and code frozen at `d7e8506c`; candidate version
+`0.20.0`, source-reader version 13. Integration owner: Codex. This is not a public
+release announcement. Local release gates have passed. The adapter, IR, query API and existing routes
+remain the product shape.
 
-## Release outcomes
+## Implemented outcomes
 
-1. **Faithful Antigravity histories.** Read native SQLite as well as full/compact/
-   chunked exports; reconcile native identities with historical text retained only
-   in logs. Preserve exact tool associations, meaningful native payloads and unknown
-   records. Report missing or unsupported data explicitly. A successful index pass
-   alone is not the acceptance test.
-2. **Safe live publication.** A failed read, rewrite, cancellation or replacement
-   cannot erase the last committed searchable session or publish fresh derived
-   state for an incomplete body. Stage with bounded memory; preserve coherent
-   counts, events, source baselines and resume marks through publication failures.
-3. **Efficient repeated search.** Reuse an indexed reader for batch/persistent
-   callers. Measure query work separately from discovery, source reads, index setup
-   and snippet enrichment. Preserve matching/filter semantics and the read-only
-   frozen contract; state indexed coverage and freshness assessment accurately.
-4. **Trustworthy handoffs.** Distill identifies pending work and distinguishes
-   superseded observations from current facts. Preserve call/result attribution,
-   validate resumability, and enforce explicit output budgets before publishing
-   artifacts or retiring sources. Estimates must be labelled as estimates.
-5. **Visible fidelity.** Existing show/doctor/API surfaces tell readers when history
-   is export-only, metadata-only, missing observed payloads, or uses inferred
-   identity. Lack of an assessment never means complete. Keep old stored IR readable.
+1. **Antigravity histories from native stores and exports.** SQLite-only discovery,
+   full/compact/chunked history, revised steps and retained rendered output are
+   supported. Historical enrichment requires matching evidence; timestamps alone
+   cannot transfer usage between revisions. A native tail joins an export only
+   across a verified overlap; conflicting or unanchored history is disclosed as
+   `unreconciled_history`. Native media and binary signatures retain explicit
+   representations. This is reading support, not native round-trip emission.
+2. **Last-good search revisions survive failed updates.** Reads stage before
+   publication; incomplete discovery updates healthy sessions without pruning
+   unseen history. Compatible rebuilds retain failed revisions, and schema upgrades
+   publish a replacement generation only after complete validation. Derived-state
+   failures remain retryable. Tiny truncated Tantivy segments produce errors rather
+   than panics. Query freshness uses the same held generation as ranking.
+3. **Repeated search has an explicit snapshot contract.** `PreparedIndex` and
+   `cv search --batch` reuse one index reader and expose logical work counters.
+   NDJSON framing isolates malformed requests; filters, counts and refresh behavior
+   have regression coverage. Batch does no discovery or source reads and explicitly
+   does not assess source freshness. Ordinary frozen search retains its separate
+   freshness and snippet behavior; the original issue 33 workload is not reproduced.
+4. **Handoffs enforce budgets and preserve unresolved work.** Aggregate byte and
+   estimated-token ceilings are checked before publication/retirement. Typed harness
+   lifecycle observations correlate supported Claude, Antigravity and Codex jobs
+   with initiating calls, including rewritten native results and nested PTYs.
+   Failed/stopped children cannot become successful merely because siblings finish.
+   Resumable distill refuses unsettled calls unless an explicit snapshot is requested.
+   Claude emitted parent chains also reject cycles.
+5. **Known coverage limits are visible.** Show, Markdown, doctor and API metadata
+   preserve optional read coverage, including late-discovered gaps and metadata-only
+   members. Unknown identifiers survive JSON round trips; absence means unassessed.
+   Frozen state reads use stable private SQLite snapshots without source-side writes,
+   with snapshot ownership retained until the connection closes.
 
-## Work ownership
+## Completed implementation lanes
 
-| Lane | Scope | State |
-|---|---|---|
-| agy_native | Bounded protobuf reader, SQLite-only discovery, reconciliation, exact native associations and payloads | Implementing |
-| agy_coverage | Native contract/feature matrix, scrubbed real-store fixtures, adversarial lifecycle tests and independent review | Implementing |
-| atomic_index | Shared bounded staging and coherent FTS/event/count/baseline publication | Foundation integrated; compatible rebuild retention in progress |
-| index_migration | Build and validate replacement schema before atomically publishing it | Implementing |
-| search_work | Prepared/batch search, frozen work accounting and repeated-query regression checks | Prepared reader and batch CLI integrated; default-query investigation continues |
-| handoff | Distill budgets, unfinished work, supersession and resumability | Implementing |
-| fidelity | Shared coverage contract and show/doctor/API visibility | Contract and consumers integrated; native composition tests in progress |
-| backlog_audit | Reconcile historical tasks and independently review consumer contracts | Inventory and corrections integrated |
-| integration | Resolve interfaces, reconcile backlog, integrate, run composed release gates and install | Active |
+| Lane | Integrated result |
+|---|---|
+| agy_native | Bounded wire reading, native discovery/reconciliation, payloads, identities and guarded native tails |
+| agy_coverage | Independent lifecycle checks and separate scrubbed real-writer lifecycle/background/media corpora |
+| atomic_index | Bounded staging, last-good replacement/rebuild behavior, complete-discovery pruning and retryable derived state |
+| index_migration | Validated replacement generations, migration failure retention and truncated-segment refusal |
+| search_work | Prepared/batch queries, work counters, early index validation and held-generation freshness |
+| handoff | Aggregate budgets, typed job ownership/completion, explicit unsettled snapshots and cycle rejection |
+| fidelity | Shared coverage metadata, final-metadata propagation, independent API/doctor/Markdown/media tests |
+| backlog_audit | Historical task reconciliation, corrected design claims and independent tool/web/desktop gates |
+| integration | Code integration and local release gates complete |
 
-Each lane uses its own worktree, target and scratch CV home. Harness homes are
-read-only. Scoped checks run in lanes; the full workspace and release gates run on
-integrated code. Research output and private native schemas/transcripts stay outside
-Git. New corpus versions preserve provenance; synthetic fixtures are labelled as such.
+## Acceptance evidence and its limits
 
-## Acceptance scenarios
+- `antigravity_lifecycle` independently exercises native-only and mirrored stores,
+  missing children, revision identities, cleared payloads, malformed wire input and
+  unknown native fields. `antigravity_fidelity` checks public read surfaces, guarded
+  native tails, signatures and media. Real-writer captures are identified separately
+  from synthetic fixtures in [the coverage matrix](ANTIGRAVITY-COVERAGE.md).
+- Search tests cover failed replacement, incomplete discovery, compatible rebuild,
+  schema migration, changing dependencies, retry, held-reader freshness, corruption,
+  prepared-reader parity and bounded staging. This is not a claim that independent
+  databases share one crash-atomic transaction; incomplete derived state must stay
+  detectable and repairable.
+- [HANDOFF.md](HANDOFF.md) records exact protocol coverage and unresolved cases.
+  Newest-per-key git facts do not solve semantic supersession of arbitrary prose.
+  Token estimates are not tokenizer counts or target-harness context guarantees.
+- The native-image counting gate bounds additional live Rust allocations;
+  public image reads still own data-URI strings. It does not bound SQLite/C memory,
+  mappings or total process footprint. See the coverage matrix's media boundary.
+- Full workspace build, clippy and tests, plus final portable, WASM and corpus gates,
+  passed on the frozen candidate. Package, compatibility, upgrade, pinned-Codex
+  hooks, manual build/names and dist plan also passed. Tool controls and browser
+  gates passed; native macOS desktop check/tests passed at `8cdd6db6`. These local
+  gates do not imply testing every supported operating system.
 
-- Parallel same-name tool calls complete out of order; reused step indices replace
-  earlier revisions without fabricating returns or merging unrelated native records.
-- Compaction clears native payloads while logs retain history; export disappearance
-  leaves a readable native store; missing history is visible rather than invented.
-- Source rewrite/delete after discovery, during parsing, and during publication:
-  previous committed text survives failed replacement, failed work stays stale,
-  and a successful later pass replaces it without duplicates.
-- Repeated bounded indexed queries over increasing unrelated data: accounting
-  distinguishes setup/evaluation/metadata/source work. Include broad matches,
-  no hits, malformed queries, stale/absent indexes and equivalent filters.
-- Nested or renamed swarm members, killed workers without transcripts, waiting
-  workers and peer messages remain distinguishable from completed child returns.
-- A handoff with pending, canceled, failed and completed jobs preserves those
-  distinctions. Aggregate output budgets fail before writes; later evidence does
-  not leave an earlier conclusion presented as current.
-- JSON, text, doctor, search, events and portable builds agree on relevant semantics;
-  native-only functionality states its availability in builds without SQLite.
+## Remaining work and limits
 
-## Backlog reconciliation
+Dedicated writer-generated scenarios are still needed for permissions, retries,
+cancellation, broader media/attachments, nested swarms, live source promotion and
+native-only resume roots. Unknown or unrecoverable content remains disclosed;
+no claim of complete Antigravity fidelity or native emission follows from indexing.
 
-Read-only inventory on 2026-11-14 found one open GitHub issue:
-[#33](https://github.com/emberian/cv/issues/33), repeated frozen-search work and
-accounting. Its reported expensive query is not yet a controlled reproduction.
-There were no open PRs at inventory time.
+Ordinary frozen-search/fleet costs remain separate from batch-query improvements.
+Frozen state opens copy the database and sidecars for a stable private snapshot;
+on filesystems without cheap cloning, repeated opens can copy the whole database
+repeatedly. `retired::raw_current` also retains a legacy fallback: if read-only state
+opening fails under churn, SQLite-only retirements can be omitted. These are
+follow-up performance and correctness work, respectively, not closed by successful
+frozen read tests.
 
-The local task ledger had 15 open cv tasks, seven tagged `landed-verify`, and nine
-completed tasks. Open labels are leads, not proof of missing implementation. In
-particular, distill budgets, superseded facts, background result attribution,
-in-flight handoff and parent-chain validation need code/test reconciliation.
-Task display and duplicate-title UX are secondary candidates, not substitutes for
-release outcomes above. Real task stores are not mutated by this work.
-
-The audit verified the existing export offset-index fallback and corrected stale
-roster-cache, retired-command and task-authority claims. Remaining costs and exact
-task dispositions are in [BACKLOG.md](BACKLOG.md). Fresh fleet measurements belong
-in commit messages, not committed result files.
-
-## Integration findings
-
-- Independent lifecycle tests exposed a pre-existing merge error: index plus
-  second-resolution timestamp can attach native usage from another revision.
-  Enrichment must require verified identity; usage is not exempt from that rule.
-- Index publication must batch completed staged sessions and defer derived state
-  until durable commit. A commit for every session would introduce a new scaling
-  problem and is not the intended production design.
-- Several historical task-ledger items describe machinery intentionally removed
-  by the current task contract. Reconciliation must distinguish removed designs,
-  implemented work needing closure, and reproduced defects.
-- Native `CLEARED` is not a completion verdict and does not mean every field was
-  removed. Real records retain useful rendered text; decode available content while
-  reporting the historical payload loss.
-- Prepared search holds an explicitly indexed snapshot. Ordinary frozen search
-  still assesses source freshness and can enrich snippets; its remaining costs
-  must be measured separately rather than declared fixed by the batch mode.
-
-## Integration and release
-
-Resolve shared interfaces before merging dependent lanes. Use small commits with
-scoped evidence, then test composition on the integration branch. Run the project
-CI checks, native/portable/WASM builds, package verification, manual names/build,
-web/inbox tests, compatibility checks and relevant heap/performance gates. Validate
-against scratch copies/indexes with live harness stores read-only. Set the candidate
-version before packaging; install the integrated binary only after these gates pass.
-Do not call unfinished native
-coverage complete merely to make a release label.
+[BACKLOG.md](BACKLOG.md) contains reconciled task dispositions and acceptance criteria
+for these follow-ups. The read-only inventory found 15 nominally open local tasks
+and one open GitHub issue, [33](https://github.com/emberian/cv/issues/33); no real task
+store was changed. Measurements belong in commit messages, not committed result
+files. Candidate status remains in effect; local validation is not publication.

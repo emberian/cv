@@ -2,33 +2,23 @@
 
 ## Unreleased
 
-- Search does not certify held results as fresh using dependency records from a concurrent index replacement.
-- Frozen state reads retain snapshot cleanup ownership until SQLite closes, preventing leaked temporary databases on Windows.
-- Antigravity counting and text search avoid allocating inline image bytes while public JSON and explicit image reads retain their payloads.
-
-- Search retains last-good sessions through failed replacements and rebuilds; incomplete discovery updates healthy sessions without pruning unseen history.
-- Corrupt short search segments fail cleanly and can be rebuilt without panicking.
-
-- Search validates indexes before discovery, shares one snapshot for freshness and ranking, and skips unused frozen resume checkpoints.
-
-- Full-text search supports reusable indexed snapshots and NDJSON batch queries with explicit freshness semantics and per-query work counters.
-- Show, Markdown, doctor, and API metadata expose Antigravity read sources and known coverage gaps, including metadata-only members and unavailable payloads.
-- Distill tracks native Antigravity task identities through rewritten terminal results without mistaking historical backgrounding for ongoing work.
-- Distill preserves failed or stopped child outcomes when remaining background jobs later succeed.
-- Distill tracks Codex cells and nested PTY jobs through explicit completion, preserving unfinished work and attributing final output to initiating commands.
-- Distill enforces aggregate byte or estimated-token budgets before publication and requires explicit snapshots for unsettled calls.
-- Distill correlates Claude and Antigravity background completions with initiating commands, keeping unfinished output out of build verdicts.
-- Claude resume validation rejects cyclic parent links, including detached cycles.
-- Index schema upgrades preserve the previous generation until complete, validated replacement; failed discovery or indexing leaves existing readers intact.
-- Antigravity appends verified native history beyond stale exports and preserves binary thinking signatures with explicit encoding metadata.
-- Antigravity reads native SQLite history, recovers retained rendered output, preserves inline media and task context, and verifies historical tool identities.
-
-- Antigravity replays revised steps correctly, reads chunked history, preserves missing-child lanes, and enriches native lineage, usage, swarm, approval, and background-task events.
-- Search retries changing sources and reports disappearing sessions without flooding the terminal with parse failures.
+- Antigravity reads native SQLite and full, compact, or chunked exports, preserving revised steps, retained rendered output, media, task context, and missing-child lanes.
+- Antigravity verifies historical tool identities, usage, and native tails before merging; binary thinking signatures retain explicit encoding metadata.
+- Antigravity enriches native lineage, swarm, approval, and background-task events while reporting missing, unsupported, or unreconciled history.
+- Show, Markdown, doctor, and API metadata expose read sources and known coverage gaps, including metadata-only members and unavailable payloads.
+- Antigravity counting and text search avoid allocating inline image bytes; public JSON and explicit image reads retain their payloads.
 - Antigravity search ignores persisted-output notices inside quoted transcripts, preventing “File name too long” failures during indexing.
-- `cv hook` subcommands run cleanly under `--frozen` (`CV_FROZEN=1`/`true`), enforcing `retired` and `edit` guards while silently skipping lane and non-strict receipt writes.
-- Frozen reads use stable private SQLite snapshots without modifying source WAL/SHM; read-only mounts retain committed state.
-- `cv task sweep` allows `--frozen`, and writer refusals name read-only alternatives.
+- Search retains last-good revisions through failed replacements, rebuilds, and incomplete discovery; schema upgrades publish only complete, validated generations.
+- Search retries changing sources and summarizes disappearing sessions instead of flooding the terminal with parse failures.
+- Search validates indexes before discovery, binds freshness to the queried generation, and skips unused frozen resume checkpoints.
+- Corrupt short search segments fail cleanly and can be rebuilt without panicking.
+- Full-text search supports reusable indexed snapshots and NDJSON batch queries with explicit freshness semantics and per-query work counters.
+- Distill enforces aggregate byte or estimated-token budgets before publication and requires explicit snapshots for unsettled calls.
+- Distill attributes supported Claude, Antigravity, and Codex background results to initiating commands, preserving unfinished work across native rewrites, cells, and nested PTYs.
+- Distill preserves failed or stopped child outcomes when remaining background jobs later succeed; unfinished output does not establish build verdicts.
+- Claude resume validation rejects cyclic parent links, including detached cycles.
+- Frozen reads use stable private SQLite snapshots without modifying source WAL/SHM; connection ownership prevents premature cleanup and leaked temporary databases.
+- Frozen hooks enforce retirement/edit guards while skipping lane and non-strict receipt writes; task sweep permits frozen reads, and writer refusals name alternatives.
 
 ## 0.19.3 — 2026-11-13 — parser termination and malformed-input recovery
 
