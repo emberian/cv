@@ -2520,6 +2520,32 @@ claimed body
     let _ = d;
 }
 
+/// Opening a task whose title restates an open one in the same repo warns and still opens it; a
+/// finished task, another repo, or different work is not mentioned.
+#[test]
+fn task_open_warns_on_a_similar_open_title_and_opens_anyway() {
+    let w = World::new("similar-title");
+    let (first, err) = w.cv_ok(&["task", "open", "CV: migrate the index schema"]);
+    assert_eq!(err, "", "nothing to compare against yet");
+    let id = |stdout: &str| stdout.lines().last().unwrap().trim().to_string();
+    let first = id(&first);
+    let (second, err) = w.cv_ok(&["task", "open", "migrate the index schema to v14"]);
+    let second = id(&second);
+    assert!(
+        err.contains("has a similar title: CV: migrate the index schema"),
+        "{err}"
+    );
+    assert!(err.contains(&first[..8]), "{err}");
+    assert_ne!(second, first, "the second task exists");
+    let (_, err) = w.cv_ok(&["task", "open", "rewrite the hooks installer"]);
+    assert_eq!(err, "");
+
+    w.cv_ok(&["task", "done", &first, "--from", "lane:x"]);
+    w.cv_ok(&["task", "done", &second, "--from", "lane:x"]);
+    let (_, err) = w.cv_ok(&["task", "open", "migrate the index schema"]);
+    assert_eq!(err, "", "finished tasks are not duplicates of new work");
+}
+
 /// `show --notes-last N` keeps the newest N notes, `--notes-grep` the matching ones; both say how
 /// many of the total they kept.
 #[test]
@@ -2555,21 +2581,21 @@ fn task_show_notes_last_and_grep() {
     // The default text view is the newest three and says how to get the rest; JSON is whole.
     let (out, _) = w.cv_ok(&["task", "show", &parent]);
     assert!(
-        out.contains("notes:    3 of 4 (newest last) — --notes-all for every note"),
+        out.contains("notes:    3 of 4 (newest last) — --all for every note"),
         "{out}"
     );
     assert!(
         !out.contains("move the build base") && out.contains("PUSH also") && out.contains("JOIN-SOLANA"),
         "{out}"
     );
-    let (out, _) = w.cv_ok(&["task", "show", &parent, "--notes-all"]);
+    let (out, _) = w.cv_ok(&["task", "show", &parent, "--all"]);
     assert!(
         out.contains("move the build base") && !out.contains("notes:    "),
         "{out}"
     );
     let (out, _) = w.cv_ok(&["task", "show", &parent, "--json"]);
     assert!(out.contains("move the build base"), "{out}");
-    w.cv_fails(&["task", "show", &parent, "--notes-all", "--notes-last", "1"]);
+    w.cv_fails(&["task", "show", &parent, "--all", "--notes-last", "1"]);
 }
 
 /// `note <id> -` and `--body -` read stdin; a relative `--issue` is absolutized at open time
@@ -3832,7 +3858,11 @@ fn show_and_doctor_read_a_session_its_writer_is_appending_to() {
 #[test]
 fn index_json_rejects_unreadable_tool_output_and_retries_after_repair() {
     let w = World::new("index-unreadable-output");
-    let output = w.transcript("degraded").with_extension("").join("tool-results").join("big.txt");
+    let output = w
+        .transcript("degraded")
+        .with_extension("")
+        .join("tool-results")
+        .join("big.txt");
     fs::create_dir_all(&output).unwrap(); // Deterministic failed read, including as root.
     let stub = format!(
         "<persisted-output>\nOutput too large (66KB). Full output saved to: {}\n\nPreview (first 2KB):\nzqpreview\n</persisted-output>",

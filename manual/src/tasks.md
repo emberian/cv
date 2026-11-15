@@ -170,7 +170,10 @@ task 019f6e4b-74c5-74f0-a493-1f8131ca38d5  [done]  action
   note (lane:mira, 2026-07-17 00:31): ids are v7 on task/uuid-ids; tests green
 ```
 
-The text view prints the newest three notes and counts the rest; `--notes-all` prints every
+`cv task open` warns on stderr when an open task in the same repo has a similar title (the same
+words, one a prefix of the other, or 60% of their words shared), and opens the task anyway.
+
+The text view prints the newest three notes and counts the rest; `--all` prints every
 note, `--notes-last N` and `--notes-grep PAT` query them, and `--json` always carries them all.
 
 `cv task show <id> --events` (`GET /api/task/{id}/events`) prints the raw history: here `opened`,

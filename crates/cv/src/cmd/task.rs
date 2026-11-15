@@ -231,13 +231,13 @@ pub(crate) enum TaskCmd {
         /// Print only the pinned STATUS text (exit 1 when none is pinned).
         #[arg(long, conflicts_with_all = ["json", "brief", "events"])]
         status: bool,
-        /// Only the last N notes. The text view shows the newest 3 unless this, `--notes-all`,
+        /// Only the last N notes. The text view shows the newest 3 unless this, `--all`,
         /// `--notes-grep` or `--brief` says otherwise; `--json` always carries every note.
         #[arg(long = "notes-last", value_name = "N")]
         notes_last: Option<usize>,
         /// Every note in full.
-        #[arg(long = "notes-all", conflicts_with = "notes_last")]
-        notes_all: bool,
+        #[arg(long, conflicts_with = "notes_last")]
+        all: bool,
         /// Only notes matching this regex (case-insensitive).
         #[arg(long = "notes-grep", value_name = "PATTERN")]
         notes_grep: Option<String>,
@@ -680,6 +680,22 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                 };
                 (res(blocked_by)?, res(blocks)?)
             };
+            // Open tasks that likely name the same work, read before this one exists. A
+            // duplicate is sometimes meant, so this warns after the open and never refuses it.
+            let similar: Vec<(String, String)> = match fold_loud() {
+                Ok(folded) => {
+                    let plen = prefix_len(&folded.model);
+                    folded
+                        .model
+                        .tasks
+                        .values()
+                        .filter(|t| !t.state.is_terminal() && t.repo == repo)
+                        .filter(|t| task_ops::similar_titles(&t.title, &title))
+                        .map(|t| (prefix(&t.task_id, plen).to_string(), t.title.clone()))
+                        .collect()
+                }
+                Err(_) => Vec::new(),
+            };
             let from = from_or_cv(from);
             // Validate the task, tags and relations together before writing: a refused tag
             // (a bare `decision`) or relation leaves no half-opened task.
@@ -712,6 +728,14 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
             }
             append_batch(batch)?;
             println!("{id}");
+            for (other, title) in similar.iter().take(3) {
+                eprintln!(
+                    "⚠ open task {} has a similar title: {} (opened this one too; `cv task show {}`)",
+                    sanitize_line(other),
+                    sanitize_line(title),
+                    sanitize_line(other)
+                );
+            }
             Ok(())
         }
         TaskCmd::List {
@@ -801,7 +825,7 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
             brief,
             status,
             notes_last,
-            notes_all,
+            all,
             notes_grep,
         } => {
             let outcome = replay_loud()?;
@@ -850,7 +874,7 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                         t,
                         brief,
                         grep.as_ref(),
-                        shown_notes(notes_last, notes_all, brief, grep.is_some()),
+                        shown_notes(notes_last, all, brief, grep.is_some()),
                         Utc::now()
                     )
                 );
@@ -1131,12 +1155,12 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
 /// costs its reader the context it was opened to save; the full history stays one flag away.
 const DEFAULT_SHOWN_NOTES: usize = 3;
 
-/// The note limit `show` applies: an explicit `--notes-last`, none for `--notes-all`, a query
+/// The note limit `show` applies: an explicit `--notes-last`, none for `--all`, a query
 /// (`--notes-grep`) or the one-line `--brief` view, and the default otherwise.
-fn shown_notes(notes_last: Option<usize>, notes_all: bool, brief: bool, grep: bool) -> Option<usize> {
+fn shown_notes(notes_last: Option<usize>, all: bool, brief: bool, grep: bool) -> Option<usize> {
     match notes_last {
         Some(n) => Some(n),
-        None if notes_all || brief || grep => None,
+        None if all || brief || grep => None,
         None => Some(DEFAULT_SHOWN_NOTES),
     }
 }
@@ -1314,7 +1338,7 @@ fn render_show(
             if brief {
                 " — one line each; drop --brief for the full text"
             } else if grep.is_none() {
-                " — --notes-all for every note, --notes-grep PAT to query"
+                " — --all for every note, --notes-grep PAT to query"
             } else {
                 ""
             }

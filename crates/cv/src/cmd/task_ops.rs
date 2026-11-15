@@ -469,6 +469,37 @@ pub(crate) const INBOX_GROUPS: &[(InboxReason, &str)] = &[
 ];
 
 /// The first non-empty line of a text, trimmed and capped.
+/// A title's words for comparison: lowercase alphanumeric runs, without a leading `TAG:`.
+fn title_words(title: &str) -> Vec<String> {
+    let title = match title.split_once(':') {
+        Some((tag, rest)) if !tag.is_empty() && tag.chars().all(|c| c.is_ascii_uppercase() || c == '-') => rest,
+        _ => title,
+    };
+    title
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_lowercase)
+        .collect()
+}
+
+/// Whether two task titles likely name the same work: the same words, one a word-prefix of the
+/// other, or at least three shared words making up 60% of all their distinct words. It only
+/// decides a warning at `cv task open`; nothing is refused on it.
+pub(crate) fn similar_titles(a: &str, b: &str) -> bool {
+    let (a, b) = (title_words(a), title_words(b));
+    let (short, long) = if a.len() <= b.len() { (&a, &b) } else { (&b, &a) };
+    if short.is_empty() {
+        return false;
+    }
+    if long.starts_with(short) && (short.len() >= 3 || short.len() == long.len()) {
+        return true;
+    }
+    let (a, b): (std::collections::BTreeSet<_>, std::collections::BTreeSet<_>) =
+        (a.iter().collect(), b.iter().collect());
+    let shared = a.intersection(&b).count();
+    shared >= 3 && shared * 5 >= a.union(&b).count() * 3
+}
+
 pub(crate) fn first_line(text: &str, max: usize) -> String {
     let l = text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
     truncate(&sanitize_line(l), max)
@@ -691,6 +722,40 @@ fn md_block(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn similar_titles_flag_restatements_and_leave_distinct_work_alone() {
+        for (a, b) in [
+            ("fix the flaky search test", "Fix the flaky search test."),
+            (
+                "CV: cv task open warns on a near-duplicate open title",
+                "cv task open warns on a near-duplicate open title",
+            ),
+            (
+                "migrate the index schema",
+                "migrate the index schema to v14 with validation",
+            ),
+            (
+                "warn on near duplicate task titles",
+                "warn on near-duplicate titles of a task",
+            ),
+        ] {
+            assert!(similar_titles(a, b), "{a:?} / {b:?}");
+            assert!(similar_titles(b, a), "{b:?} / {a:?}");
+        }
+        for (a, b) in [
+            ("fix the flaky search test", "fix the flaky hooks test in CI on macOS"),
+            ("review", "review the antigravity adapter"),
+            ("index", "search"),
+            ("", ""),
+            (
+                "cv task show defaults to three notes",
+                "cv task open warns on a duplicate title",
+            ),
+        ] {
+            assert!(!similar_titles(a, b), "{a:?} / {b:?}");
+        }
+    }
 
     #[test]
     fn event_text_sanitizes_record_identifiers_and_tags_while_json_keeps_wire_values() {
