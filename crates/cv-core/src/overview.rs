@@ -108,6 +108,7 @@ pub fn read(r: &SessionRef, opts: &OverviewOptions) -> Result<Overview> {
         guard.verify(r)?;
     }
     let mut reference = r.clone();
+    reference.id = streamed.session.id.clone();
     reference.message_count = streamed.counted.as_ref().map(|counts| counts.turns);
     reference.cwd = streamed.session.cwd.clone().or(reference.cwd);
     reference.title = streamed.session.title.clone().or(reference.title);
@@ -118,7 +119,7 @@ pub fn read(r: &SessionRef, opts: &OverviewOptions) -> Result<Overview> {
         file.present = present(&file.path);
     }
     if opts.worker_limit > 0 {
-        match crate::lanes::lanes_of(r) {
+        match crate::lanes::lanes_of(&reference) {
             Ok(lanes) => {
                 overview.omitted.workers = lanes.len().saturating_sub(opts.worker_limit);
                 overview.workers = lanes
@@ -547,6 +548,26 @@ mod tests {
         assert_eq!(overview.files[0].present, Some(false));
         assert_eq!(overview.files[0].msg_idx, 0);
         assert_eq!(overview.warnings.len(), 1);
+        Ok(())
+    }
+    #[test]
+    fn explicit_path_uses_recorded_session_id_instead_of_filename() -> Result<()> {
+        let dir = cv_testkit::temp_dir("overview-recorded-id");
+        let file = dir.join("copied-transcript.jsonl");
+        let row = serde_json::json!({"type":"session_meta", "payload": {
+            "id":"native-codex-id", "cwd":"/example", "timestamp":"2026-11-15T00:00:00Z"
+        }});
+        std::fs::write(&file, format!("{row}\n"))?;
+        let reference = SessionRef::from_path(file, Harness::Codex);
+        let overview = read(
+            &reference,
+            &OverviewOptions {
+                worker_limit: 0,
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(overview.session["id"], "native-codex-id");
+        assert_eq!(overview.session["cwd"], "/example");
         Ok(())
     }
     #[test]
