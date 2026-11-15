@@ -383,6 +383,12 @@ struct Facts {
     pid_files: Vec<(usize, String)>,
     /// Directories it `cd`'d into, newest last.
     dirs: Vec<(usize, String)>,
+    /// Per gate and per error row, the run it came from ([`Facts::run_key`]), when it had one.
+    gate_runs: Vec<Option<String>>,
+    error_runs: Vec<Option<String>>,
+    /// The newest message at which each run finished without error, and the newest gate verdict's.
+    ok_at: HashMap<String, usize>,
+    gate_at: HashMap<String, usize>,
 }
 
 impl Facts {
@@ -391,6 +397,22 @@ impl Facts {
         list.retain(|(_, v)| v != value);
         list.push((i, value.to_string()));
     }
+    /// Identity of a run for supersession: the exact command text in the directory the lane last
+    /// changed to. Only a later result of the identical run says anything about an earlier one;
+    /// a similar command, the same description or later prose never does.
+    fn run_key(&self, commands: &[&str]) -> Option<String> {
+        let dir = self.dirs.last().map_or("", |(_, dir)| dir.as_str());
+        (!commands.is_empty()).then(|| format!("{dir}\u{0}{}", commands.join("\u{0}")))
+    }
+
+    /// What later evidence of the identical run says about the row mined at `i`.
+    fn superseded(i: usize, run: &Option<String>, later: &HashMap<String, usize>, what: &str) -> String {
+        match run.as_ref().and_then(|run| later.get(run)) {
+            Some(at) if *at > i => format!(" ({what} [{at}])"),
+            _ => String::new(),
+        }
+    }
+
     fn note_pid_files(&mut self, i: usize, text: &str) {
         for c in re(Re::PidFile).captures_iter(text) {
             Self::note_latest(&mut self.pid_files, i, &c[1]);
@@ -2436,6 +2458,10 @@ fn scan_result_facts(
     f: &mut Facts,
 ) -> String {
     let cmds = summary.commands();
+    let run = f.run_key(&cmds);
+    if let (false, Some(run)) = (is_error, &run) {
+        f.ok_at.insert(run.clone(), i);
+    }
     let mut commit_outcome: Option<String> = None;
     for c in re(Re::Commit).captures_iter(out) {
         let (b, sha, subj) = (c[1].to_string(), c[2].to_string(), c[3].trim().to_string());
@@ -2485,6 +2511,7 @@ fn scan_result_facts(
             .unwrap_or("");
         let line = truncate(line.trim(), 200);
         f.errors.push((i, label.to_string(), line.clone()));
+        f.error_runs.push(run);
         return format!("✗ {line}");
     }
     if let Some(c) = commit_outcome {
@@ -2509,6 +2536,10 @@ fn scan_result_facts(
             .unwrap_or("(no output)");
         let verdict = truncate(verdict.trim(), 160);
         f.gates.push((i, label.to_string(), verdict.clone()));
+        if let Some(run) = &run {
+            f.gate_at.insert(run.clone(), i);
+        }
+        f.gate_runs.push(run);
         return format!("⚑ {verdict}");
     }
     if name != "Agent" && name != "Task" && summary.has_spawn() && !is_sync_spawn_return(harness, name, out) {
@@ -3047,15 +3078,17 @@ fn render_facts(h: &mut String, f: &Facts) {
     if !f.gates.is_empty() {
         let _ = writeln!(h, "- **Build/test verdicts** (most recent last):");
         let skip = f.gates.len().saturating_sub(25);
-        for (i, label, v) in f.gates.iter().skip(skip) {
-            let _ = writeln!(h, "  - [{i}] {label} → {v}");
+        for ((i, label, v), run) in f.gates.iter().zip(&f.gate_runs).skip(skip) {
+            let later = Facts::superseded(*i, run, &f.gate_at, "superseded: the identical command ran again at");
+            let _ = writeln!(h, "  - [{i}] {label} → {v}{later}");
         }
     }
     if !f.errors.is_empty() {
         let _ = writeln!(h, "- **Tool errors hit** ({}):", f.errors.len());
         let skip = f.errors.len().saturating_sub(40);
-        for (i, label, line) in f.errors.iter().skip(skip) {
-            let _ = writeln!(h, "  - [{i}] {label} → {line}");
+        for ((i, label, line), run) in f.errors.iter().zip(&f.error_runs).skip(skip) {
+            let later = Facts::superseded(*i, run, &f.ok_at, "the identical command later succeeded at");
+            let _ = writeln!(h, "  - [{i}] {label} → {line}{later}");
         }
     }
     h.push('\n');
@@ -3456,6 +3489,88 @@ pub(crate) mod tests {
             status: None,
             details: None,
         }
+    }
+
+    #[test]
+    fn only_a_later_result_of_the_identical_run_supersedes_a_gate_or_an_error() -> anyhow::Result<()> {
+        let mut msgs = vec![msg(Role::User, MessageKind::Prompt, vec![text("Fix the gate.")])];
+        let mut run = |id: &str, cmd: &str, out: &str, err: bool| {
+            msgs.push(msg(
+                Role::Assistant,
+                MessageKind::Reply,
+                vec![call(id, cmd, "Run the gate")],
+            ));
+            msgs.push(msg(Role::Tool, MessageKind::ToolResult, vec![result(id, out, err)]));
+        };
+        run(
+            "red",
+            "cd /w/a && cargo test -p gate",
+            "error[E0308]: mismatched types",
+            true,
+        );
+        run(
+            "other-dir",
+            "cd /w/b && cargo test -p gate",
+            "test result: ok. 2 passed; 0 failed",
+            false,
+        );
+        run(
+            "similar",
+            "cd /w/a && cargo test -p gate --lib",
+            "test result: ok. 1 passed; 0 failed",
+            false,
+        );
+        run(
+            "green",
+            "cd /w/a && cargo test -p gate",
+            "test result: ok. 9 passed; 0 failed",
+            false,
+        );
+        run(
+            "red-again",
+            "cd /w/a && cargo test -p other",
+            "error: could not compile",
+            true,
+        );
+        run(
+            "green-again",
+            "cd /w/a && cargo test -p gate",
+            "test result: ok. 9 passed; 0 failed",
+            false,
+        );
+        let mut session = Session::new("agent-supersede", Harness::Claude);
+        session.messages = msgs;
+        let d = distill_pack(
+            &session,
+            &DistillOptions {
+                keep_last: 0,
+                ..Default::default()
+            },
+        )?;
+        let row = |needle: &str| {
+            let facts = &d.head_md[d.head_md.find(FACTS_HEAD).unwrap()..d.head_md.find(LEDGER_HEAD).unwrap()];
+            facts
+                .lines()
+                .find(|line| line.contains(needle))
+                .unwrap_or_else(|| panic!("no fact row with {needle}:\n{facts}"))
+                .to_owned()
+        };
+        assert!(
+            row("[2] ").ends_with("mismatched types (the identical command later succeeded at [12])"),
+            "{}",
+            row("[2] ")
+        );
+        assert!(row("[10] ").ends_with("could not compile"), "{}", row("[10] "));
+        assert!(
+            row("[8] ").ends_with("9 passed; 0 failed (superseded: the identical command ran again at [12])"),
+            "{}",
+            row("[8] ")
+        );
+        // Another directory, a similar command and the newest run are nobody's successor.
+        for current in ["[4] ", "[6] ", "[12] "] {
+            assert!(row(current).ends_with("failed"), "{}", row(current));
+        }
+        Ok(())
     }
 
     #[test]
