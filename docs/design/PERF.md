@@ -100,6 +100,55 @@ for the new identity, the index rebuild for the `context` field and the title ru
 re-embed) were **not measured**: the upgrade run was stopped for load. Expect one full reread of
 every session by the catalog and one by the indexer, and one re-embed of every session's exchange.
 
+**0.20 candidate fleet (2026-11-14, 2d8f123e and the search-fleet fixes on it).** Release
+builds, `/usr/bin/time -l`, the real HOME read-only, a fresh scratch `CLUSTERVISION_HOME`. The
+fleet is 10,185 top-level sessions: 6,192 Codex rollouts (5,673 `.jsonl.zst`), 1,896 Claude,
+722 Gemini, 501 Antigravity, 328 opencode, 186 Cursor, 174 Kimi and seven smaller stores.
+Sessions were being written throughout, and the host load was 10-45 except where stated.
+Physical I/O was not measured: `getrusage` reports zero block operations on this APFS host, and
+the page cache could not be dropped, so every number is warm-cache. Instructions retired are
+the comparable figure; wall times carry the load.
+
+| operation | 2d8f123e | with the fixes |
+|---|---|---|
+| `cv index`, first pass on an empty home | 7.50 T, 1,188 s at load 100-160; RSS 4.65 GB, footprint 788 MB | not rerun |
+| `cv index`, only live sessions changed | 144-170 G, 15-18 s; 42-62 read, 0-3 resumed | 30-67 G, 3.5-9 s; 24-47 read, 24-35 resumed |
+| `cv search` (live), 20 hits | 118 G, 11.5-13.3 s; 51 sessions and 494 MiB read live | 16-34 G, 1.8-3.5 s; 16-33 sessions, 0.26-30 MiB |
+| `cv --frozen search`, no hit / 20 hits | 9.2 G, 2.0 s / 16.5-17.4 G, 3.9-4.7 s | 7.8 G, 0.8 s / 11.8 G, 1.2 s (load differs; no change intended) |
+| `cv --frozen search --batch`, 20 queries | | 0.99 G, 0.10-0.15 s in all; reader setup 1.8-2.6 ms, evaluation 91-131 ms |
+| the same 20 queries as 20 `--frozen search` runs | | 236 G, 24.7 s; identical totals |
+| `cv ls`, first run on an empty home | | 933 G, 21.3 s; footprint 181 MB |
+| `cv ls`, warm | 3.6-5.4 G, 0.7-1.1 s | 3.0-4.5 G, 0.3-0.4 s (load differs; no change intended) |
+| `cv --frozen show --json`, 122 MB native Antigravity store | 21.0 G, 2.1-2.5 s system time | 10.0 G, 0.6-0.7 s; output identical |
+| `cv --frozen show <agent-id>` / a session id | 8.0 G, 0.47 s / 0.56 G, 0.05 s | unchanged |
+
+The first pass indexed 10,147 sessions; four Antigravity sessions deleted between discovery and
+their read were reported in one warning and gone by the next pass. No path-length error and no
+per-session parse line appeared in any pass. The home it built: 3.2 GB of tantivy segments,
+2.0 GB of columnar events, and a 2.9 GB `catalog.db` of which resume marks are 1.39 GB (1,971
+rows) and event targets with their index 1.3 GB.
+
+What the numbers say:
+
+- **An "unchanged" pass is the live sessions.** Baselines held for every quiet session,
+  compressed rollouts included (10,095-10,160 of 10,185 unchanged per pass). Before the fixes
+  each live session was read whole every pass: one written during its own pass published no
+  baseline, and a Codex rollout read mid-turn left no mark.
+- **An ordinary frozen search pays for the fleet, a batch query for the query.** About 7.8 G
+  per invocation is fixed: the session rows, every meta document, the index's dependency
+  records and one stat per session, all to state how far the index trails. Evaluation is
+  5-10 ms. Twenty lookups cost 236 G apart and 1 G in one batch. This is the reproducible
+  part of issue 33: repeated lookups belong in `--batch`.
+- **A frozen command beside a running writer rediscovers the fleet.** With a non-empty
+  `catalog.db-wal` (any other `cv` holding the catalog open), a frozen open declines the
+  catalog, so every `--frozen` command rereads the stores: 916-931 G and 21-23 s each here,
+  and the search footer calls all 10,185 sessions stale. Reproduce on a copy of a built home:
+  hold a SQLite connection open after one write to `catalog.db`, then run
+  `cv --frozen search <anything>`. Open: a frozen reader needs a snapshot of a catalog whose
+  WAL has frames, as `state.db` already has.
+- **Agent ids resolve ten times slower than session ids** (8.0 G against 0.56 G; a miss is
+  33.7 G, 2.0 s). The catalog rows are loaded and 849 sidecar directories listed per lookup.
+
 Peak requested Rust heap, before -> after the datapaths pass (2026-10-12..14; not re-measured
 here, the CI heap gates that bound them pass; compressed Codex now also gated, 6.4 MB flat):
 
@@ -139,15 +188,13 @@ signal, which no harness provides.
 
 ## Open measurement gaps
 
-Audited against `git log v0.17.0..HEAD` on 2026-10-21:
+Audited against `git log v0.17.0..HEAD` on 2026-10-21, fleet items again on 2026-11-14:
 
-- **First listing and full recount remain unmeasured on the current fleet.** Count deferral
-  (`08a8dfb8`, `734af650`, `2ab873aa`, `80295ea7`, `a200e811`, `d358ff0e`) changed the work;
-  the 0.17 measurements above cannot stand in for a new composed run with compressed Codex.
-- **Repeated unchanged indexing needs fleet confirmation.** `6049df0a` removed discovery's
-  writer-observation work and `1aec79ae` checks unchanged compressed rollouts. These close that
-  regression case, not the historical fleet-wide second-pass measurement. No current fleet
-  result establishes that every baseline holds across repeated passes.
+- **Full recount remains unmeasured on the current fleet.** First listing and repeated
+  indexing were measured on 2026-11-14 (above). A recount with the catalog deleted was not.
+- **Cold-cache and physical I/O figures do not exist.** Every fleet number above is warm-cache
+  instructions and wall time; no byte counter covers index or source reads of an ordinary
+  search (`--batch` reports logical work only).
 - **Upgrade cost is unknown.** The 0.16.1 upgrade gate (`1ff6669c`) checks migrated output against
   a clean index; it does not measure fleet upgrade time, heap or re-embedding cost.
 - **Arbitrary prefix-edit detection remains limited** by the samples described above. A full
