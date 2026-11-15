@@ -25,8 +25,12 @@ pub(crate) struct ShowView {
 
 /// What `--kind` selects: each family has one compact view.
 pub(super) enum KindView {
+    Overview,
     /// `prompt` / `answer`: what the person said (`session_reports::print_prompts`).
-    Said { prompts: bool, answers: bool },
+    Said {
+        prompts: bool,
+        answers: bool,
+    },
     /// `compaction_boundary` / `compaction_summary`: the compaction seams, each boundary paired
     /// with its summary (`compaction::print_compactions`).
     Compactions,
@@ -39,6 +43,7 @@ pub(super) fn parse_kinds(spec: &str) -> Result<KindView> {
     #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
     enum Family {
         Said,
+        Overview,
         Compactions,
         Affordances,
     }
@@ -47,12 +52,14 @@ pub(super) fn parse_kinds(spec: &str) -> Result<KindView> {
     let kinds: Vec<&str> = spec.split(',').map(str::trim).filter(|k| !k.is_empty()).collect();
     let words: Vec<&str> = cv_core::affordance::Kind::ALL.iter().map(|k| k.as_str()).collect();
     let accepted = format!(
-        "`--kind` takes `prompt,answer` (what the person said), \
+        "`--kind` takes `overview`, `prompt,answer` (what the person said), \
          `compaction_boundary,compaction_summary` (the compaction seams), or affordances: {} (`affordances` is all of them)",
         words.join(",")
     );
     let family = |k: &str| {
-        if SAID.contains(&k) {
+        if k == "overview" {
+            Some(Family::Overview)
+        } else if SAID.contains(&k) {
             Some(Family::Said)
         } else if SEAMS.contains(&k) {
             Some(Family::Compactions)
@@ -72,6 +79,7 @@ pub(super) fn parse_kinds(spec: &str) -> Result<KindView> {
             prompts: kinds.contains(&"prompt"),
             answers: kinds.contains(&"answer"),
         }),
+        [Family::Overview] => Ok(KindView::Overview),
         [Family::Compactions] => Ok(KindView::Compactions),
         [Family::Affordances] => Ok(KindView::Affordances(
             cv_core::affordance::parse_kinds(&kinds).expect("every word checked above"),
@@ -241,6 +249,12 @@ pub(crate) fn cmd_show(
 
     if let Some(kind) = kind {
         return match kind {
+            KindView::Overview => {
+                if selector || window.max_bytes.is_some() || pre_compaction.is_some() {
+                    return usage("the overview selects bounded excerpts across the session; drop the window flags and use --around on a source message");
+                }
+                crate::cmd::overview::print(&r, json)
+            }
             KindView::Said { prompts, answers } => {
                 let win = KindWindow {
                     pre_compaction: pre_compaction_span(&r, pre_compaction)?,
@@ -481,13 +495,18 @@ fn resolve_show_target(
     agent: Option<&str>,
 ) -> Result<(SessionRef, Box<dyn Adapter>, Option<cv_core::AgentRef>)> {
     if let Some(agent_id) = agent {
-        let (parent, _parent_adapter) = resolve(id, want)?;
+        let (want, id) = split_harness_id(id, want);
+        let (parent, _parent_adapter) = crate::cmd::distill::resolve_source(id, want)?;
         let sub = resolve_subagent(&parent, agent_id)?;
         let adapter = cv_core::harness::for_harness(sub.session.harness)
             .with_context(|| format!("no adapter for {}", sub.session.harness))?;
         return Ok((sub.session.clone(), adapter, Some(sub)));
     }
     let (want, id) = split_harness_id(id, want);
+    if std::path::Path::new(id).is_file() {
+        let (r, adapter) = crate::cmd::distill::resolve_source(id, want)?;
+        return Ok((r, adapter, None));
+    }
     if id.starts_with("agent-") {
         if let Some((sub, adapter)) = resolve_agent_fleetwide(id, want)? {
             return Ok((sub.session.clone(), adapter, Some(sub)));

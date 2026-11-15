@@ -4525,3 +4525,51 @@ fn frozen_dataset_file_refusal_task_show_json_events_and_usage_exit_codes() {
         assert!(!ok && code == 2, "expected exit 2 for {bad_args:?}, got {code}: {err}");
     }
 }
+
+#[test]
+fn overview_links_initial_and_recent_requests_without_dumping_history() {
+    let w = World::new("overview-cli");
+    let mut lines = (0..7)
+        .map(|i| {
+            user_line(
+                "overview-session",
+                &format!("u{i}"),
+                "2026-10-01T00:00:00Z",
+                &format!("request {i}"),
+            )
+        })
+        .collect::<Vec<_>>();
+    lines.push(assistant_line(
+        "tools",
+        "2026-10-01T00:00:01Z",
+        serde_json::json!([
+            {"type":"tool_use","id":"read-note","name":"Read","input":{"file_path":"/missing/design-note.md"}},
+            {"type":"tool_use","id":"test","name":"Bash","input":{"command":"cargo test overview"}}
+        ]),
+    ));
+    let source = w.write_session("overview-session", &lines);
+    let before = fs::read(&source).unwrap();
+    let (out, _) = w.cv_ok(&["show", "overview-session", "--kind", "overview", "--json"]);
+    let report: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let requests = report["requests"].as_array().unwrap();
+    assert_eq!(requests.len(), 5, "{out}");
+    assert_eq!(requests[0]["text"], "request 0");
+    assert_eq!(requests[4]["text"], "request 6");
+    assert_eq!(requests[4]["msg_idx"], 6);
+    assert_eq!(report["omitted"]["requests"], 2);
+    assert_eq!(report["files"][0]["path"], "/missing/design-note.md");
+    assert_eq!(report["files"][0]["present"], false);
+    assert_eq!(report["commands"][0]["command"], "cargo test overview");
+    assert_eq!(fs::read(&source).unwrap(), before);
+    let path_selector = format!("claude:{}", source.display());
+    let (by_path, _) = w.cv_ok(&["show", &path_selector, "--kind", "overview", "--json"]);
+    let by_path: serde_json::Value = serde_json::from_str(&by_path).unwrap();
+    assert_eq!(by_path["requests"], report["requests"]);
+    let (human, _) = w.cv_ok(&["show", "overview-session", "--kind", "overview"]);
+    assert!(human.contains("request 0") && human.contains("request 6"), "{human}");
+    assert!(human.contains("--around N") && human.contains("(missing)"), "{human}");
+    let (ok, _, _, error) = w.cv(&["show", "overview-session", "--kind", "overview", "--last", "2"]);
+    assert!(!ok && error.contains("overview"), "{error}");
+    let (ok, _, _, error) = w.cv(&["show", "overview-session", "--kind", "overview,prompt"]);
+    assert!(!ok && error.contains("mixes"), "{error}");
+}

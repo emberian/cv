@@ -161,3 +161,17 @@ Redaction is a best-effort pattern scrubber, not a guarantee — for anything se
 Rendering **streams**: each message is parsed, scrubbed, rendered, written to disk, and dropped, so peak memory stays at roughly the largest single message no matter how long the transcript is. A multi-thousand-message session shares fine.
 
 The honest limit is the *output* size, not memory: the artifact contains the full session, so a session with megabytes of tool output becomes an HTML file of megabytes (a ~2,700-message codex session lands around 7 MB). Browsers open that without complaint, but it's a chunky attachment. There's no `--range` on `share` yet; if you want to share a slice of a huge session, [`splice`](cli.md#cv-splice) the span you care about into a new session and share *that*.
+
+## Session overview
+
+`cv show <session> --kind overview` gives a bounded starting view: the initial and recent human
+requests, worker replies, referenced files, and recent commands. Each request, file event and
+command includes its transcript index; use `cv show <session> --around N` to read the surrounding
+exchange. An exact transcript path, optionally prefixed with its harness, also works as a show
+selector when multiple files have the same session ID.
+
+`--json` returns the same overview as `GET /api/session/{harness}/{id}/overview`. Counts under
+`omitted` say what the overview left out. File presence describes the current filesystem; the
+view does not read or copy referenced file contents. A truncated worker reply remains available
+through `cv show <parent> --agent <agent-id>`. Overview selects excerpts across the whole session;
+use the transcript view for `--last`, `--range`, `--around` or `--max-bytes`.

@@ -67,6 +67,8 @@ routes! {
 
         GET ["api", "session", harness, id, "head"] => session_head(harness, id),
 
+        GET ["api", "session", harness, id, "overview"] => session_overview(harness, id),
+
         GET ["api", "session", harness, id, "messages"] => messages(harness, id, query),
 
         GET ["api", "session", harness, id, "events"] => session_events(harness, id, query),
@@ -349,6 +351,17 @@ fn complete_session_json(adapter: &dyn crate::Adapter, reference: &SessionRef) -
     let output = serde_json::to_value(&session)?;
     read.guard.expect("guarded pass").verify(reference)?;
     Ok(output)
+}
+
+fn session_overview(harness: &str, id: &str) -> (u16, Value) {
+    let (r, _) = match lookup(harness, id) {
+        Ok(found) => found,
+        Err(error) => return error,
+    };
+    match crate::overview::read(&r, &Default::default()).and_then(|overview| Ok(serde_json::to_value(overview)?)) {
+        Ok(value) => ok(value),
+        Err(error) => err(500, &format!("overview read failed: {error:#}")),
+    }
 }
 
 fn session(harness: &str, id: &str) -> (u16, Value) {

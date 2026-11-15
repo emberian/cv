@@ -12,6 +12,7 @@ pub(crate) mod doctor;
 pub(crate) mod events;
 pub(crate) mod formats;
 pub(crate) mod hooks;
+pub(crate) mod overview;
 pub(crate) mod pack;
 pub(crate) mod port;
 pub(crate) mod query;

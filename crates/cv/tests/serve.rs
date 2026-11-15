@@ -8,7 +8,7 @@ mod common;
 use common::world;
 use cv_core::rows::SEARCH_ROW_KEYS;
 use cv_testkit::http::status as raw_status;
-use cv_testkit::World;
+use cv_testkit::{claude, World};
 use serde_json::{json, Value};
 use std::fs;
 use std::io::{Read, Write};
@@ -2562,4 +2562,33 @@ fn serve_owns_the_local_capture_recorder() {
         )
         .unwrap();
     assert_eq!(mode, "ipc_owner");
+}
+
+#[test]
+fn overview_http_matches_the_cli_projection() {
+    let w = World::new("overview-http");
+    w.write_session(
+        "overview-http-session",
+        &[
+            claude::user(
+                "overview-http-session",
+                "u0",
+                "2026-10-01T00:00:00Z",
+                "Build the original feature",
+            ),
+            claude::user(
+                "overview-http-session",
+                "u1",
+                "2026-10-01T00:00:01Z",
+                "Keep the later correction",
+            ),
+        ],
+    );
+    let (out, _) = w.cv_ok(&["show", "overview-http-session", "--kind", "overview", "--json"]);
+    let expected: Value = serde_json::from_str(&out).unwrap();
+    let (port, _server) = spawn_serve(&w);
+    let (status, actual) = get_json(port, "/api/session/claude/overview-http-session/overview");
+    assert_eq!(status, 200, "{actual}");
+    assert_eq!(actual, expected);
+    assert_eq!(get_json(port, "/api/session/claude/missing-overview/overview").0, 404);
 }

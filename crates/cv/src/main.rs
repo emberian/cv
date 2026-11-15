@@ -204,7 +204,8 @@ enum Cmd {
         /// With `--json`, the IR itself: every message carries the same `parent_id`.
         #[arg(long, conflicts_with_all = ["kind", "subagents", "agent", "pre_compaction"])]
         tree: bool,
-        /// Only messages of these kinds, comma-separated, as a compact view. `prompt,answer`: what
+        /// `overview`: initial/recent requests, workers, referenced files and commands, with bounded excerpts.
+        /// Other message kinds, comma-separated, select a compact view. `prompt,answer`: what
         /// the person said — every typed prompt and question-tool answer with its index and
         /// timestamp, printed whole (`--json`: `index, timestamp, kind, text` rows; window flags
         /// and `--max-bytes` slice the projected rows). `compaction_boundary,compaction_summary`: every compaction seam — trigger,
