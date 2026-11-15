@@ -44,12 +44,16 @@ mod observe;
 use observe::{body_hash, SweepWork};
 mod live;
 mod prepared;
+mod staging;
 mod sweep;
 pub use live::{BadLiveBytes, Budget, LiveRead, Suffix, LIVE_BYTES_VAR};
 pub use prepared::{IndexedAnswer, PreparedIndex, QueryWork};
+use staging::DocumentBatch;
 use sweep::*;
 
-use crate::ingest::{Admission, AdmittedDocument, Writer};
+#[cfg(test)]
+use crate::ingest::AdmittedDocument;
+use crate::ingest::{Admission, Writer};
 use crate::Hit;
 use anyhow::{Context, Result};
 use cv_core::scan::{ceil_char, floor_char};
@@ -702,15 +706,10 @@ struct Job {
 
 /// What a sweep worker hands the writer thread, in order per session.
 enum Out {
-    /// A session's FTS rewrite starts, its old docs (those `delete` names) going first.
-    Begin {
-        id: String,
-        delete: Delete,
-    },
-    Doc(AdmittedDocument),
     /// A session's read finished: its events (from the message index given on), counts and new
     /// mark are the writer's to record.
     Done {
+        documents: Option<(Delete, DocumentBatch)>,
         job: Box<Job>,
         events: Option<(usize, cv_core::events::EventSpool)>,
         counted: Option<cv_core::stream::Counted>,
@@ -836,14 +835,15 @@ fn preferred_index_copies(refs: Vec<cv_core::SessionRef>) -> Vec<cv_core::Sessio
 /// once for FTS docs, events and affordance counts. Everything that writes stays on this thread,
 /// fed by a bounded channel: the tantivy writer (so a session's delete precedes its docs, in
 /// opstamp order) and every catalog write (sqlite has one writer anyway). Peak memory is bounded
-/// at both queues: raw document byte reservations survive the producer channel and Tantivy's
-/// internal 10,000-document pipeline until indexing consumes each document. The shared
+/// at both queues: completed passes use bounded spools; replayed documents keep byte reservations
+/// through Tantivy's internal 10,000-document pipeline until indexing consumes each document. The shared
 /// [`crate::ingest::DOCUMENT_BYTES`] guard is independent of Tantivy's 50 MB arena budget.
-/// Each worker also owns its body buffer and at most one document waiting for admission; parser
+/// Each worker stages a complete validated session in a bounded, privately owned spill. Parser
 /// working sets and merge allocations remain separate. Source pressure additionally stays under
-/// [`IN_FLIGHT_BYTES`] of estimated transcript (a larger session runs alone). Interim commits land only when no session is half-sent, so a crash never leaves a
-/// truncated session stamped fresh; past [`COMMIT_EVERY`] × 8 uncommitted docs the workers drain
-/// to make one.
+/// [`IN_FLIGHT_BYTES`] of estimated transcript (a larger session runs alone). The writer replays
+/// complete sessions and commits batches of [`COMMIT_EVERY`] documents or sessions. Metadata is
+/// published only after the FTS commit; failed replay rolls back the entire uncommitted batch,
+/// preserving the last good revision. A session is never divided across commits.
 ///
 /// **Resumption:** a claude or plain-`.jsonl` codex transcript that has grown since the last pass
 /// is read only from that pass's last [`cv_core::stream::Checkpoint`] (its mark, one per file in
@@ -1223,33 +1223,20 @@ fn resumed_docs(f: &Fields, id: &str, n: usize) -> tantivy::query::BooleanQuery 
 }
 
 /// Read one job and send what it found; `false` when the writer hung up.
-fn run_job(
-    mut job: Job,
-    f: &Fields,
-    tx: &std::sync::mpsc::SyncSender<Out>,
-    admission: &std::sync::Arc<Admission>,
-    marks: &cv_core::resume::Reader,
-) -> bool {
+fn run_job(mut job: Job, f: &Fields, tx: &std::sync::mpsc::SyncSender<Out>, marks: &cv_core::resume::Reader) -> bool {
     let Some(adapter) = cv_core::harness::for_harness(job.r.harness) else {
         return true;
     };
     // Bytes discovery decoded stay alive for this pass only.
     let out = match job.decoded.take() {
-        Some(decoded) => decoded.run(|| job_out(job, f, tx, admission, marks, adapter.as_ref())),
-        None => job_out(job, f, tx, admission, marks, adapter.as_ref()),
+        Some(decoded) => decoded.run(|| job_out(job, f, marks, adapter.as_ref())),
+        None => job_out(job, f, marks, adapter.as_ref()),
     };
     tx.send(out).is_ok()
 }
 
-/// Read `job`'s session, sending its docs as they come; what the writer records once it is read.
-fn job_out(
-    mut job: Job,
-    f: &Fields,
-    tx: &std::sync::mpsc::SyncSender<Out>,
-    admission: &std::sync::Arc<Admission>,
-    marks: &cv_core::resume::Reader,
-    adapter: &dyn cv_core::Adapter,
-) -> Out {
+/// Stage one validated source revision before the writer replaces its previous documents.
+fn job_out(mut job: Job, f: &Fields, marks: &cv_core::resume::Reader, adapter: &dyn cv_core::Adapter) -> Out {
     let version = cv_core::resume::version(adapter, RESUME_TAG);
     // Workers run only after writer admission and the publication recheck. Even a whole-pass
     // job needs its prior head so failure cleanup can invalidate an obsolete checkpoint.
@@ -1257,16 +1244,14 @@ fn job_out(
     let from = resumable_from(&job, &version, marks);
     // A resume the adapter declines touched nothing: read the session whole instead.
     let resumed = match &from {
-        Some(cp) => job_pass(&job, f, tx, admission, adapter, Some(cp)).transpose(),
+        Some(cp) => job_pass(&job, f, adapter, Some(cp)).transpose(),
         None => None,
     };
-    let whole = |job: &Job| {
-        job_pass(job, f, tx, admission, adapter, None).and_then(|p| p.context("a whole pass never declines"))
-    };
+    let whole = |job: &Job| job_pass(job, f, adapter, None).and_then(|p| p.context("a whole pass never declines"));
     let mut failure_source = job.source.clone();
     let mut result = resumed.unwrap_or_else(|| whole(&job));
     // A source that changed under the pass (a writer, a rewrite) is retried once, whole; the
-    // retry's first doc deletes whatever the failed pass sent. A failure on unchanged sources is
+    // failed staging is discarded before retrying. A failure on unchanged sources is
     // the session's own and is reported.
     if result.is_err() && !cv_core::source::unchanged(&job.r, &job.source) {
         job.existing |= job.fts;
@@ -1288,6 +1273,7 @@ fn job_out(
                 ))
             });
             Out::Done {
+                documents: p.documents,
                 job: Box::new(job),
                 events: p.events,
                 counted: p.counted,
@@ -1349,6 +1335,7 @@ fn resumable_from(job: &Job, version: &str, marks: &cv_core::resume::Reader) -> 
 
 /// What one pass over a job's session found.
 struct JobPass {
+    documents: Option<(Delete, DocumentBatch)>,
     #[cfg(test)]
     callbacks: usize,
     resumed: bool,
@@ -1410,12 +1397,10 @@ impl cv_core::MessageSink for CallbackCounter<'_> {
 }
 
 /// One pass over `job`'s session — from `from` when given — feeding what the job needs: FTS docs
-/// to the writer, events, counts. `Ok(None)`: the adapter declined to resume, nothing was sent.
+/// into bounded staging, events, counts. `Ok(None)`: the adapter declined to resume.
 fn job_pass(
     job: &Job,
     f: &Fields,
-    tx: &std::sync::mpsc::SyncSender<Out>,
-    admission: &std::sync::Arc<Admission>,
     adapter: &dyn cv_core::Adapter,
     from: Option<&cv_core::stream::Checkpoint>,
 ) -> Result<Option<JobPass>> {
@@ -1450,28 +1435,16 @@ fn job_pass(
     let event_sink: &mut dyn cv_core::MessageSink = &mut measured;
     #[cfg(not(test))]
     let event_sink: &mut dyn cv_core::MessageSink = &mut events;
+    let mut documents = None;
     let done = if job.fts {
         let delete = match (from, job.existing) {
             (Some(cp), _) => Delete::From(resumes_docs_at(cp).unwrap_or(first)),
             (None, true) => Delete::All,
             (None, false) => Delete::Nothing,
         };
-        // The rewrite begins with the first doc (every pass that runs ends in the meta doc), so a
-        // declined resume sends nothing at all.
-        let mut begun = false;
-        let mut send = |doc: TantivyDocument| -> Result<()> {
-            if !begun {
-                tx.send(Out::Begin {
-                    id: job.r.id.clone(),
-                    delete,
-                })
-                .map_err(|_| anyhow::anyhow!("index writer closed"))?;
-                begun = true;
-            }
-            tx.send(Out::Doc(admission.document(doc)?))
-                .map_err(|_| anyhow::anyhow!("index writer closed"))
-        };
-        index_session(
+        let mut batch = DocumentBatch::default();
+        let mut send = |doc: TantivyDocument| batch.push(doc);
+        let result = index_session(
             &mut send,
             f,
             adapter,
@@ -1482,7 +1455,11 @@ fn job_pass(
             job.prov.clone(),
             from,
         )?
-        .map(|(_, done, reads)| (done, reads))
+        .map(|(_, done, reads)| (done, reads));
+        if result.is_some() {
+            documents = Some((delete, batch));
+        }
+        result
     } else {
         let opts = cv_core::Demand::LEAN.with_spans();
         resumed(cv_core::stream::stream_counted(
@@ -1503,6 +1480,7 @@ fn job_pass(
         None
     };
     Ok(Some(JobPass {
+        documents,
         #[cfg(test)]
         callbacks,
         fts_reads: reads,
@@ -1583,16 +1561,8 @@ fn index_session(
     Ok(Some((sink.docs, done, sink.dependencies)))
 }
 
-/// [`index_session`] straight into `writer`, guaranteeing the writer holds **no** docs for the
-/// session on error, and recording what the pass counted (tests drive this; the sweep's writer
-/// thread does the same with [`Out::Failed`]).
-///
-/// A large session flushes chunk docs into the writer *while* streaming, so a mid-stream parse
-/// error would otherwise leave a truncated head behind — and since every chunk doc is stamped with
-/// the full current `(mtime, size)`, the skip-set would then skip the session forever, freezing
-/// the truncation in. Deleting by the shared id term on the error path removes those partial docs
-/// (tantivy applies operations in opstamp order, so this cannot touch docs added by a later pass);
-/// the id drops out of the skip-set entirely and is retried on the next run.
+/// Test helper using the same completed-pass staging contract as the sweep. A parse failure
+/// leaves previous documents untouched; a writer failure rolls back uncommitted operations.
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn index_session_clean(
@@ -1606,22 +1576,24 @@ fn index_session_clean(
     prov: cv_core::events::Provenance,
 ) -> Result<(usize, cv_core::source::ReadSet)> {
     let source = cv_core::source::Probe::default().snapshot(r);
+    let mut documents = DocumentBatch::default();
     let result = {
-        let mut add = |doc: TantivyDocument| -> Result<()> { writer.add_document(doc).map(|_| ()) };
+        let mut add = |doc: TantivyDocument| -> Result<()> { documents.push(doc) };
         index_session(&mut add, f, adapter, r, mtime, size, events, prov, None)
             .and_then(|done| done.context("a whole pass never declines"))
     };
     match result {
         Ok((docs, done, reads)) => {
+            if let Err(error) = documents.replay(|doc| writer.add_document(doc).map(|_| ())) {
+                writer.rollback()?;
+                return Err(error);
+            }
             if let Some(c) = done.counted {
                 c.record_with_source(r, &source);
             }
             Ok((docs, reads))
         }
-        Err(e) => {
-            writer.delete_term(Term::from_field_text(f.id, &r.id));
-            Err(e)
-        }
+        Err(e) => Err(e),
     }
 }
 
@@ -4274,9 +4246,6 @@ mod tests {
             Some((IN_FLIGHT_BYTES / 2, 2)),
             "the waiting medium group now runs"
         );
-        queue.draining = true;
-        assert_eq!(queue.next_fitting(), None);
-        queue.draining = false;
         queue.stopped = true;
         assert_eq!(queue.next_fitting(), None);
 
@@ -4493,6 +4462,90 @@ mod tests {
         ));
         assert!(cv_core::resume::MarkTable::load().get(&r).is_none());
         assert!(cv_core::catalog::AffordanceTable::load().counts(&r).is_none());
+    }
+
+    #[test]
+    fn closed_writer_admission_rolls_back_replacement_without_advancing_metadata() {
+        let home = IsolatedHome::new();
+        let dir = tmpdir();
+        let path = write_claude(&home.home, "closed", "zqretained");
+        let r = cv_core::SessionRef::new("closed", cv_core::Harness::Claude, path);
+        index_refs(&dir, std::slice::from_ref(&r), true).unwrap();
+        write_claude(&home.home, "closed", "zqnewbody");
+        let (index, fields) = open_or_create(&dir).unwrap();
+        let consumer = source_consumer(&dir).unwrap();
+        let mut writer = open_writer(&index, 15_000_000).unwrap();
+        writer.admission.close();
+        let job = Job {
+            existing: true,
+            ..ingest_job(r.clone())
+        };
+        let error = run_jobs(&mut writer, &fields, vec![job], &consumer).err().unwrap();
+        assert!(format!("{error:#}").contains("index document admission closed"));
+        drop(writer);
+        assert_eq!(text_search_indexed(&dir, "zqretained", 10).unwrap().len(), 1);
+        assert!(text_search_indexed(&dir, "zqnewbody", 10).unwrap().is_empty());
+        assert!(cv_core::source::Table::<InIndex>::load(&consumer).get(&r).is_none());
+        assert!(cv_core::events::needs_ingest(&r));
+    }
+
+    #[test]
+    fn completed_sessions_commit_in_batches_and_failed_batch_preserves_previous_revisions() {
+        let home = IsolatedHome::new();
+        let dir = tmpdir();
+        // Small sessions each produce one body and one metadata document. The initial pass
+        // must batch them, then a failure just after its first checkpoint must keep that
+        // checkpoint while rolling back every replacement in the next batch.
+        let refs: Vec<_> = (0..130)
+            .map(|n| {
+                let id = format!("batch{n:03}");
+                let path = write_claude(&home.home, &id, "zqprevious");
+                cv_core::SessionRef::new(id, cv_core::Harness::Claude, path)
+            })
+            .collect();
+        let (index, fields) = open_or_create(&dir).unwrap();
+        let consumer = source_consumer(&dir).unwrap();
+        let mut writer = open_writer(&index, 15_000_000).unwrap();
+        let ran = run_fed(&mut writer, &fields, &consumer, 1, |feed| {
+            feed.push(refs.iter().cloned().map(ingest_job).collect())
+        })
+        .unwrap();
+        assert_eq!(ran.changed, 130);
+        assert_eq!(ran.observed.work.documents, 260);
+        assert_eq!(ran.observed.work.commits, 2, "never one commit per session");
+        drop(writer);
+        for r in &refs {
+            write_claude(&home.home, &r.id, "zqreplaced");
+        }
+        let mut writer = open_writer(&index, 15_000_000).unwrap();
+        writer.fail_after(COMMIT_EVERY + 1);
+        let result = run_fed(&mut writer, &fields, &consumer, 1, |feed| {
+            feed.push(
+                refs.iter()
+                    .cloned()
+                    .map(|r| Job {
+                        existing: true,
+                        ..ingest_job(r)
+                    })
+                    .collect(),
+            )
+        });
+        assert!(format!("{:#}", result.err().unwrap()).contains("injected index consumer failure"));
+        drop(writer);
+        assert_eq!(text_search_indexed(&dir, "zqreplaced", 200).unwrap().len(), 128);
+        assert_eq!(text_search_indexed(&dir, "zqprevious", 200).unwrap().len(), 2);
+        let baselines = cv_core::source::Table::<InIndex>::load(&consumer);
+        for r in &refs[..2] {
+            assert!(baselines.get(r).is_none(), "rolled-back revisions remain stale");
+            assert!(
+                cv_core::events::needs_ingest(r),
+                "events cannot advance past a failed FTS batch"
+            );
+        }
+        let retried = sweep(&dir, refs, false, false).unwrap();
+        assert_eq!((retried.changed, retried.errors), (2, 0));
+        assert!(text_search_indexed(&dir, "zqprevious", 200).unwrap().is_empty());
+        assert_eq!(text_search_indexed(&dir, "zqreplaced", 200).unwrap().len(), 130);
     }
 
     /// A pass that cannot invalidate a session's old baseline (the catalog cannot be opened: the
@@ -8896,11 +8949,23 @@ mod tests {
                 Err(e) => Err(e.into()),
             }),
         ));
-        let result = sweep(&dir, vec![r], false, false);
+        let result = sweep(&dir, vec![r.clone()], false, false);
         *BEFORE_PASS.lock().unwrap() = None;
         let swept = result.unwrap();
         assert_eq!(swept.errors, 1);
         assert_eq!(text_search_indexed(&dir, "zqcommitted", 10).unwrap().len(), 1);
+        let searched = search_suffixed(
+            &dir,
+            "zqcommitted",
+            10,
+            crate::SearchFilter::default(),
+            LiveRead::All,
+            &[r],
+        )
+        .unwrap();
+        assert_eq!(searched.hits.len(), 1, "live failure retains the last good indexed hit");
+        assert_eq!(searched.suffix.failed, 1);
+        assert!(searched.suffix.unread_line().unwrap().contains("unreadable"));
         let swept = sweep(&dir, Vec::new(), false, false).unwrap();
         assert_eq!(swept.removed, 1);
         assert!(text_search_indexed(&dir, "zqcommitted", 10).unwrap().is_empty());
@@ -8964,9 +9029,10 @@ mod tests {
         assert_eq!(swept.unreadable[0].id, "flaky");
         assert!(swept.unreadable[0].reason.contains("injected read failure"));
         assert_eq!(text_search(&dir, "zqmore", 10).unwrap().len(), 1, "the rest committed");
-        assert!(
-            text_search(&dir, "zqfirst", 10).unwrap().is_empty(),
-            "never a stale body"
+        assert_eq!(
+            text_search_indexed(&dir, "zqfirst", 10).unwrap().len(),
+            1,
+            "retain the last good body while reporting the failed revision"
         );
         let indexed = report(swept, false, false).unwrap();
         assert_eq!(indexed.unreadable.len(), 1);

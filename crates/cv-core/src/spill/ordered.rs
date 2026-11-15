@@ -8,7 +8,7 @@ use std::io::{BufRead, BufReader, BufWriter, Seek, Write};
 const MEMORY_BYTES: usize = 256 * 1024;
 const IO_BYTES: usize = 64 * 1024;
 
-pub(crate) trait Record: Sized {
+pub trait Record: Sized {
     type ReadState: Default;
     /// Heap retained by this record, excluding its inline struct (charged by container capacity).
     fn heap_bytes(&self) -> usize;
@@ -71,7 +71,7 @@ pub(crate) fn read_string(reader: &mut impl BufRead, limit: Option<usize>) -> Re
     }
 }
 
-pub(crate) struct Ordered<T> {
+pub struct Ordered<T> {
     memory: VecDeque<T>,
     heap_bytes: usize,
     spill: Option<Spill>,
@@ -106,7 +106,7 @@ impl<T: Record> Ordered<T> {
             }
         }
     }
-    pub(crate) fn push(&mut self, row: T) -> Result<()> {
+    pub fn push(&mut self, row: T) -> Result<()> {
         let slots = if self.memory.len() == self.memory.capacity() {
             self.memory.capacity().max(4).saturating_mul(2)
         } else {
@@ -151,7 +151,7 @@ impl<T: Record> Ordered<T> {
             .write_all(bytes)?;
         Ok(())
     }
-    pub(crate) fn rows(mut self) -> Result<Rows<T>> {
+    pub fn rows(mut self) -> Result<Rows<T>> {
         let reader = if let Some(spill) = &mut self.spill {
             let mut writer = spill.writer.take().unwrap();
             writer.flush().context("flushing ordered spool")?;
@@ -173,7 +173,7 @@ impl<T: Record> Ordered<T> {
         })
     }
 }
-pub(crate) struct Rows<T: Record> {
+pub struct Rows<T: Record> {
     // Reader closes before the ownership guard removes its path on platforms without unlink.
     reader: Option<BufReader<File>>,
     spool: Ordered<T>,

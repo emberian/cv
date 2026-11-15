@@ -6,6 +6,7 @@ use super::*;
 pub(super) struct SweepWork {
     pub(super) callbacks: usize,
     pub(super) documents: usize,
+    pub(super) commits: usize,
     pub(super) body_bytes: usize,
     pub(super) writer_opened: bool,
 }

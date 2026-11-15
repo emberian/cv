@@ -25,7 +25,6 @@ pub(super) struct Queue {
     groups: std::collections::BTreeMap<(u64, u64), Vec<Job>>,
     arrived: u64,
     pub(super) in_flight: u64,
-    pub(super) draining: bool,
     pub(super) stopped: bool,
     /// No more groups will arrive.
     pub(super) closed: bool,
@@ -42,7 +41,6 @@ impl Queue {
             groups: Default::default(),
             arrived: 0,
             in_flight: 0,
-            draining: false,
             stopped: false,
             closed: false,
             deferred: Vec::new(),
@@ -61,7 +59,7 @@ impl Queue {
     }
     /// The key of the group [`Self::take_fitting`] would take.
     pub(super) fn next_fitting(&self) -> Option<(u64, u64)> {
-        if self.stopped || self.draining {
+        if self.stopped {
             return None;
         }
         let room = IN_FLIGHT_BYTES.saturating_sub(self.in_flight);
@@ -143,7 +141,7 @@ pub(super) struct Ran {
     /// Event and search baseline publications that failed: the catalog could not be written.
     pub(super) errors: usize,
     pub(super) first_error: Option<String>,
-    /// Sessions whose read failed: each stays out of the index until a later pass reads it.
+    /// Sessions whose read failed: their last good indexed revisions remain available and stale.
     pub(super) unreadable: Vec<Unreadable>,
     /// Sessions whose FTS docs were rewritten.
     pub(super) changed: usize,
@@ -263,7 +261,6 @@ pub(super) fn run_fed(
         }));
         for _ in 0..workers {
             let tx = tx.clone();
-            let admission = &admission;
             scope.spawn(cv_core::env::carry(move || {
                 let marks = cv_core::resume::Reader::default();
                 sources.run(|| loop {
@@ -282,7 +279,7 @@ pub(super) fn run_fed(
                     let Some((bytes, group)) = group else { return };
                     let _reservation = GroupReservation { queue, wake, bytes };
                     for job in group {
-                        if !run_job(job, f, &tx, admission, &marks) {
+                        if !run_job(job, f, &tx, &marks) {
                             return; // the writer is gone
                         }
                     }
@@ -297,187 +294,216 @@ pub(super) fn run_fed(
             admission: &admission,
             complete: false,
         };
-        let mut open: HashSet<String> = HashSet::new();
+        let mut pending = Vec::new();
+        let mut pending_bytes = 0usize;
         let mut since_commit = 0usize;
         let mut ran = Ran::default();
         let mut failure: Option<anyhow::Error> = None;
         let mut col_batch = col_store
             .as_mut()
             .map(crate::columnar_events::ColumnarEventStore::begin_batch);
-        for out in rx {
-            match out {
-                Out::Begin { id, delete } => {
-                    match delete {
-                        Delete::Nothing => {}
-                        Delete::All => {
-                            writer.delete_term(Term::from_field_text(f.id, &id));
-                        }
-                        Delete::From(n) => {
-                            if let Err(e) = writer.delete_query(Box::new(resumed_docs(f, &id, n))) {
-                                failure.get_or_insert(e.into());
+        for out in rx.into_iter().map(Some).chain(std::iter::once(None)) {
+            if failure.is_some() {
+                continue;
+            }
+            let ready = match out {
+                Some(mut out @ Out::Done { .. }) => {
+                    if let Out::Done { documents, job, .. } = &mut out {
+                        if let Some((delete, batch)) = documents.take() {
+                            let publish = (|| -> Result<()> {
+                                match delete {
+                                    Delete::Nothing => {}
+                                    Delete::All => {
+                                        writer.delete_term(Term::from_field_text(f.id, &job.r.id));
+                                    }
+                                    Delete::From(n) => {
+                                        writer.delete_query(Box::new(resumed_docs(f, &job.r.id, n)))?;
+                                    }
+                                }
+                                batch.replay(|doc| {
+                                    let doc = admission.document(doc)?;
+                                    #[cfg(test)]
+                                    ran.observed.document(&doc, f);
+                                    writer.add_admitted(doc)?;
+                                    since_commit += 1;
+                                    Ok(())
+                                })
+                            })();
+                            if let Err(error) = publish {
+                                failure = Some(error);
                                 shutdown.stop();
+                                writer.rollback().context("rolling back failed FTS batch")?;
+                                pending.clear();
+                                continue;
                             }
                         }
                     }
-                    open.insert(id);
-                }
-                Out::Doc(doc) => {
-                    #[cfg(test)]
-                    ran.observed.document(&doc, f);
-                    if failure.is_none() {
-                        if let Err(e) = writer.add_admitted(doc) {
-                            failure = Some(e);
-                            shutdown.stop();
-                        }
+                    if let Out::Done { mark, .. } = &out {
+                        // Event spools retain at most 256 KiB before spilling; checkpoint
+                        // state remains owned until this batch publishes its marks.
+                        pending_bytes = pending_bytes
+                            .saturating_add(256 * 1024)
+                            .saturating_add(mark.as_ref().map_or(0, |(_, cp)| staging::checkpoint_bytes(cp)));
                     }
-                    since_commit += 1;
-                }
-                Out::Done {
-                    job,
-                    events,
-                    counted,
-                    mark,
-                    resumed,
-                    fts_reads,
-                    #[cfg(test)]
-                    callbacks,
-                } => {
+                    pending.push(out);
+                    if since_commit < COMMIT_EVERY && pending.len() < COMMIT_EVERY && pending_bytes < 64 * 1024 * 1024 {
+                        continue;
+                    }
+                    writer.commit().context("committing staged FTS batch")?;
                     #[cfg(test)]
                     {
-                        ran.observed.work.callbacks += callbacks;
+                        ran.observed.work.commits += 1;
                     }
-                    // Only stamp events after a complete pass: a parse error leaves the sync rows
-                    // untouched so the session is retried next run.
-                    let source = counted
-                        .as_ref()
-                        .map_or_else(|| job.source.clone(), |c| job.source.with_reads(&c.dependencies));
-                    let events_published = match events {
-                        Some((from, events)) => {
-                            let need_sql = job.sql_events;
-                            let need_col = job.col_events && col_batch.is_some();
-                            let teed = if need_sql && need_col {
-                                let mut col_copy = cv_core::events::EventSpool::default();
-                                events
-                                    .tee(|ev| col_copy.push(ev.clone()))
-                                    .map(|rebuilt| (Some(rebuilt), Some(col_copy)))
-                            } else if need_col {
-                                Ok((None, Some(events)))
-                            } else {
-                                Ok((need_sql.then_some(events), None))
-                            };
-                            let result = teed.and_then(|(sql_spool, col_spool)| {
-                                if let Some(events) = sql_spool {
-                                    match catalog.as_mut() {
-                                        Some(catalog) => {
-                                            catalog.record_events(&job.r, from, events, &source, &job.prov)?
+                    since_commit = 0;
+                    pending_bytes = 0;
+                    std::mem::take(&mut pending)
+                }
+                Some(out) => vec![out],
+                None => {
+                    if !pending.is_empty() {
+                        writer.commit().context("committing final staged FTS batch")?;
+                        #[cfg(test)]
+                        {
+                            ran.observed.work.commits += 1;
+                        }
+                    }
+                    std::mem::take(&mut pending)
+                }
+            };
+            for out in ready {
+                match out {
+                    Out::Done {
+                        documents: _,
+                        job,
+                        events,
+                        counted,
+                        mark,
+                        resumed,
+                        fts_reads,
+                        #[cfg(test)]
+                        callbacks,
+                    } => {
+                        #[cfg(test)]
+                        {
+                            ran.observed.work.callbacks += callbacks;
+                        }
+                        // Only stamp events after a complete pass: a parse error leaves the sync rows
+                        // untouched so the session is retried next run.
+                        let source = counted
+                            .as_ref()
+                            .map_or_else(|| job.source.clone(), |c| job.source.with_reads(&c.dependencies));
+                        let events_published = match events {
+                            Some((from, events)) => {
+                                let need_sql = job.sql_events;
+                                let need_col = job.col_events && col_batch.is_some();
+                                let teed = if need_sql && need_col {
+                                    let mut col_copy = cv_core::events::EventSpool::default();
+                                    events
+                                        .tee(|ev| col_copy.push(ev.clone()))
+                                        .map(|rebuilt| (Some(rebuilt), Some(col_copy)))
+                                } else if need_col {
+                                    Ok((None, Some(events)))
+                                } else {
+                                    Ok((need_sql.then_some(events), None))
+                                };
+                                let result = teed.and_then(|(sql_spool, col_spool)| {
+                                    if let Some(events) = sql_spool {
+                                        match catalog.as_mut() {
+                                            Some(catalog) => {
+                                                catalog.record_events(&job.r, from, events, &source, &job.prov)?
+                                            }
+                                            None => cv_core::events::record_spooled_with_source(
+                                                &job.r, from, events, &source, &job.prov,
+                                            )?,
                                         }
-                                        None => cv_core::events::record_spooled_with_source(
-                                            &job.r, from, events, &source, &job.prov,
-                                        )?,
                                     }
-                                }
-                                if let (Some(batch), Some(col_spool)) = (col_batch.as_mut(), col_spool) {
-                                    let rows = col_spool.into_rows()?;
-                                    if from == 0 || batch.can_resume(&job.r, &job.prov) {
-                                        batch.stage_session(&job.r, from, rows, &source, &job.prov, None)?;
-                                    } else {
-                                        batch.invalidate_session(&job.r)?;
-                                        anyhow::bail!(
-                                            "columnar event authority mismatch on resumed pass for {} ({})",
-                                            job.r.id,
-                                            job.r.harness
+                                    if let (Some(batch), Some(col_spool)) = (col_batch.as_mut(), col_spool) {
+                                        let rows = col_spool.into_rows()?;
+                                        if from == 0 || batch.can_resume(&job.r, &job.prov) {
+                                            batch.stage_session(&job.r, from, rows, &source, &job.prov, None)?;
+                                        } else {
+                                            batch.invalidate_session(&job.r)?;
+                                            anyhow::bail!(
+                                                "columnar event authority mismatch on resumed pass for {} ({})",
+                                                job.r.id,
+                                                job.r.harness
+                                            );
+                                        }
+                                    }
+                                    Ok(())
+                                });
+                                match result {
+                                    Ok(()) => true,
+                                    Err(err) => {
+                                        ran.errors += 1;
+                                        ran.first_error.get_or_insert_with(|| {
+                                            cv_core::ir::truncate(
+                                                &format!(
+                                                    "event publication failed for {} ({}): {err:#}",
+                                                    job.r.id, job.r.harness
+                                                ),
+                                                512,
+                                            )
+                                        });
+                                        eprintln!(
+                                            "cv: event publication failed for {} ({}): {err:#}",
+                                            job.r.id, job.r.harness
                                         );
+                                        false
                                     }
-                                }
-                                Ok(())
-                            });
-                            match result {
-                                Ok(()) => true,
-                                Err(err) => {
-                                    ran.errors += 1;
-                                    ran.first_error.get_or_insert_with(|| {
-                                        cv_core::ir::truncate(
-                                            &format!(
-                                                "event publication failed for {} ({}): {err:#}",
-                                                job.r.id, job.r.harness
-                                            ),
-                                            512,
-                                        )
-                                    });
-                                    eprintln!(
-                                        "cv: event publication failed for {} ({}): {err:#}",
-                                        job.r.id, job.r.harness
-                                    );
-                                    false
                                 }
                             }
+                            None => true,
+                        };
+                        if let Some(c) = counted {
+                            match catalog.as_mut() {
+                                Some(catalog) => catalog.record_counted(&job.r, &job.source, c),
+                                None => c.record_with_source(&job.r, &job.source),
+                            }
                         }
-                        None => true,
-                    };
-                    if let Some(c) = counted {
-                        match catalog.as_mut() {
-                            Some(catalog) => catalog.record_counted(&job.r, &job.source, c),
-                            None => c.record_with_source(&job.r, &job.source),
+                        if mark.is_some() || job.mark.is_some() {
+                            // A mark must describe persisted event rows as well as FTS docs. If the
+                            // SQL transaction failed, retry the entire event pass rather than resume
+                            // past a missing suffix and incorrectly stamp it fresh.
+                            ran.marks.push(cv_core::resume::MarkUpdate {
+                                session: job.r.clone(),
+                                mark: if events_published { mark } else { None },
+                            });
+                        }
+                        ran.resumed += usize::from(resumed);
+                        if job.fts {
+                            ran.dependencies
+                                .push((job.r.clone(), job.source.with_reads(&fts_reads)));
+                            ran.changed += 1;
                         }
                     }
-                    if mark.is_some() || job.mark.is_some() {
-                        // A mark must describe persisted event rows as well as FTS docs. If the
-                        // SQL transaction failed, retry the entire event pass rather than resume
-                        // past a missing suffix and incorrectly stamp it fresh.
-                        ran.marks.push(cv_core::resume::MarkUpdate {
-                            session: job.r.clone(),
-                            mark: if events_published { mark } else { None },
+                    Out::Failed { job, err, transient } => {
+                        ran.unreadable.push(Unreadable {
+                            id: job.r.id.clone(),
+                            harness: job.r.harness.to_string(),
+                            reason: cv_core::ir::truncate(&format!("{err:#}"), 512),
                         });
-                    }
-                    ran.resumed += usize::from(resumed);
-                    if job.fts {
-                        ran.dependencies
-                            .push((job.r.clone(), job.source.with_reads(&fts_reads)));
-                        ran.changed += 1;
-                        open.remove(&job.r.id);
-                    }
-                }
-                Out::Failed { job, err, transient } => {
-                    ran.unreadable.push(Unreadable {
-                        id: job.r.id.clone(),
-                        harness: job.r.harness.to_string(),
-                        reason: cv_core::ir::truncate(&format!("{err:#}"), 512),
-                    });
-                    // Partial output can never survive failure. If a source vanished or
-                    // moved before sending any documents, retain the last committed body
-                    // until fresh discovery decides whether it still exists.
-                    if job.fts && (!transient || open.contains(&job.r.id)) {
-                        writer.delete_term(Term::from_field_text(f.id, &job.r.id));
-                        open.remove(&job.r.id);
-                    }
-                    if job.mark.is_some() {
-                        ran.marks.push(cv_core::resume::MarkUpdate {
-                            session: job.r.clone(),
-                            mark: None,
-                        });
-                    }
-                    if !transient {
-                        eprintln!("cv: parse failed for {} ({}): {err:#}", job.r.id, job.r.harness);
+                        // A failed pass never reaches the writer: keep its last committed
+                        // body and stale dependency baseline, regardless of failure cause.
+                        if job.mark.is_some() {
+                            ran.marks.push(cv_core::resume::MarkUpdate {
+                                session: job.r.clone(),
+                                mark: None,
+                            });
+                        }
+                        if !transient {
+                            eprintln!("cv: parse failed for {} ({}): {err:#}", job.r.id, job.r.harness);
+                        }
                     }
                 }
             }
-            if since_commit >= COMMIT_EVERY && failure.is_none() {
-                if open.is_empty() {
-                    writer.commit().context("interim commit")?;
-                    if let Some(batch) = col_batch.as_mut() {
-                        batch.checkpoint_commit().context("interim columnar commit")?;
-                    }
-                    cv_core::resume::update(&std::mem::take(&mut ran.marks));
-                    publish_dependencies(&mut ran, consumer);
-                    since_commit = 0;
-                    let mut q = queue.lock().unwrap();
-                    q.draining = false;
-                    drop(q);
-                    wake.notify_all();
-                } else if since_commit >= 8 * COMMIT_EVERY {
-                    queue.lock().unwrap().draining = true;
-                }
+            if let Some(batch) = col_batch.as_mut() {
+                batch
+                    .checkpoint_commit()
+                    .context("publishing committed columnar events")?;
             }
+            cv_core::resume::update(&std::mem::take(&mut ran.marks));
+            publish_dependencies(&mut ran, consumer);
         }
         let fed = fed.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic));
         ran.unreadable.append(&mut queue.lock().unwrap().deferred);

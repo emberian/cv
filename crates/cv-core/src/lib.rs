@@ -1121,3 +1121,8 @@ mod copy_authority_tests {
 
 /// Harness writer observations and corpus verification versions.
 pub mod writer_version;
+
+/// Bounded, operation-owned staging for atomic publication across consumers.
+pub mod staging {
+    pub use crate::spill::ordered::{Ordered, Record, Rows};
+}
