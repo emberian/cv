@@ -20,7 +20,7 @@ Below: where each keeps sessions, whether cv **parses** it, and whether it can *
 | **OpenCode** | `~/.local/share/opencode/storage/` | ✓ | ✓ | `session/**/ses_*.json`, `message/<sid>/*.json`, `part/<msgid>/*.json`; `subtask` parts spawn sub-sessions. Two storage generations. |
 | **OpenClaw** | `~/.openclaw/agents/<agentId>/sessions/<sid>.jsonl` | ✓ | ✓ | `sessions.json` index + JSONL; header `version` v1/v2 linear, v3 parent-linked (migrated in place). ACP-bridged sessions are text-only. |
 | **Gemini CLI** | `~/.gemini/tmp/<projectHash>/chats/session-*.json\|jsonl` | ✓ | ✓ | Chat recordings, `checkpoint-*.json`, `logs.json` fallback; sub-agents at `chats/<parentId>/<id>.jsonl`. |
-| **Antigravity (Google)** | `~/.gemini/{antigravity-cli,antigravity,antigravity-ide}/brain/<uuid>/` | ✓ | — | `$JETSKI_APP_DATA_DIR` overrides; Cortex JSONL step logs (`transcript_full.jsonl` > `transcript.jsonl` > `overview.txt`), sub-agent descriptors, and read-only SQLite sidecars (`conversation_summaries.db`, `conversations/<uuid>.db`). Encrypted `*.pb` is skipped. |
+| **Antigravity (Google)** | `~/.gemini/{antigravity-cli,antigravity,antigravity-ide}/` | ✓ | — | `$JETSKI_APP_DATA_DIR` overrides; exported history under `brain/<uuid>/`, native steps in `conversations/<uuid>.db`, and swarm registries. Read-only; [coverage and source selection](#reading-antigravity). |
 | **Hermes (Nous)** | `~/.hermes/state.db` (SQLite) | ✓ | ✓ | `$HERMES_HOME` overrides. No cwd stored. Compression chains linked by `parent_session_id`. |
 | **Kimi CLI** | `~/.kimi/sessions/<md5(cwd)>/<uuid>/context.jsonl` | ✓ | — | Frozen since 2026-06 (kimi-cli migrates it to `~/.kimi-code`). `$KIMI_SHARE_DIR` overrides; cwd from `kimi.json` `work_dirs[]`; legacy `<hash>/<uuid>.jsonl`; `wire.jsonl` enriches. |
 | **Kimi Code** | `~/.kimi-code/sessions/wd_<slug>_<sha256(cwd)[:12]>/session_<uuid>/` | ✓ | — | `$KIMI_CODE_HOME` overrides. `state.json` holds cwd, title, agent map; `agents/<agentId>/wire.jsonl` per agent; large outputs in `tool-results/`. |
@@ -74,6 +74,27 @@ an environment variable reaches only the processes that have it.
 When two roots hold the same session id, `cv ls` lists both and `cv show <id>` opens the most
 recently updated.
 
+## Reading Antigravity
+
+cv prefers nonempty exported history: full JSONL (including contiguous byte chunks), then
+compact history and overview. These exports can retain text that Antigravity clears from its
+native database during compaction. When exports are missing or empty, cv reads native steps
+from `conversations/<uuid>.db`. Native reads require SQLite support, enabled in standard builds;
+portable builds without it report native databases as unsupported. Encrypted `*.pb` stores
+remain unsupported.
+
+Native reads preserve recorded tool IDs. Enriching exported calls and results with native
+identities requires matching recorded content; step index and timestamp alone are insufficient.
+Fallback associations are labeled as inferred. `cv show`, Markdown exports, `cv doctor` and API
+metadata expose the sources used and known gaps, including cleared payloads and metadata-only
+children. A source label does not certify complete feature support.
+
+Complete core reads (`Demand::COMPLETE`) retain unknown native fields as original protobuf
+records; normal views may not interpret them. Antigravity access is read-only: cv can export
+its IR, but cannot emit a runnable native Antigravity conversation. The
+[feature coverage matrix](https://github.com/emberian/cv/blob/main/docs/design/0.20/ANTIGRAVITY-COVERAGE.md)
+tracks supported projections and remaining gaps.
+
 ## Sub-agents
 
 cv attaches child agents to their parent as a tree ([viewing](viewing-and-sharing.md)):
@@ -85,8 +106,10 @@ cv attaches child agents to their parent as a tree ([viewing](viewing-and-sharin
   marked `model_config._delegate_from`.
 - **Grok**: `session_kind: "subagent"` (primaries carry `agent_name`), kept in message `extra`.
 - **Gemini**: `chats/<parentId>/<id>.jsonl`; **Qwen**: `subagents/<parentId>/agent-<id>.jsonl`.
-- **Antigravity**: `brain/<parent>/.system_generated/subagents/<child>.json` descriptors and
-  `invoke_subagent` results link `brain/<child>/` sessions (`lineage.parent`, `spawned_by_tool_use`).
+- **Antigravity**: `brain/<parent>/.system_generated/subagents/<child>.json` descriptors,
+  `swarm/members.json` registries and native lineage link children. A surviving registry keeps a
+  child visible as metadata-only when its history is unavailable; an `ALIVE` member is not proof
+  that its worker is currently running.
 - **OpenCode**: `subtask` parts (own prompt, agent and model), beside `agent` mention parts.
 - **Zed**: its own `threads.db` row with `parent_id` (0.3.0 blobs add
   `subagent_context{parent_thread_id, depth}`), kept as `Session::lineage.parent`, `depth` in
@@ -98,7 +121,8 @@ Hermes (`state.db`), Cursor (`state.vscdb`), Goose (`sessions.db`), Zed (`thread
 (`sessions.db`) keep everything in SQLite; OpenCode 2.x, newer OpenClaw stores and Antigravity
 (`conversation_summaries.db`, `conversations/<uuid>.db`) use it beside files. All open read-only (a WAL database through a private snapshot, so cv never writes a
 `-wal`/`-shm`), and each adapter probes `PRAGMA table_info` and selects only existing columns, so an
-older schema degrades instead of failing. Codex and Grok SQLite files are only indexes.
+supported older schemas can degrade gracefully. Unsupported Antigravity native step encodings
+are reported explicitly. Codex and Grok SQLite files are only indexes.
 
 ## The two desktop apps are not harnesses
 
