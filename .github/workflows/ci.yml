@@ -84,6 +84,7 @@ jobs:
             --accept commands.deferrals \
             --accept commands.adopt.args.agents.required \
             --accept commands.search.args.semantic \
+            --accept commands.search.args.query.required \
             --accept commands.index.args.semantic \
             --accept commands.pack.args.context_bytes \
             --accept commands.splice.args.generate \

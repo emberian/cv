@@ -33,6 +33,11 @@ board/task-shim routes), and widens `show --around` and `export --around` from i
 string selectors. `crates/cv/tests/announce.rs` tests pipe and
 terminal behavior; `python3 -I tools/test-compatibility.py` runs the comparator's mutation tests.
 
+0.20 makes the positional search query conditional: ordinary `cv search` still requires it,
+while `cv search --batch` reads queries from stdin. The command schema reports the positional
+argument as optional, so CI accepts `commands.search.args.query.required`; existing invocations
+retain their meaning. Batch answers have their own documented, opt-in JSON shape.
+
 ## HTTP transport in 0.19.2
 
 HTTP parsing and response framing now use Hyper. Requests without a `Host` header receive
