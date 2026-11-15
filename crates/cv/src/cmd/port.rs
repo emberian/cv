@@ -248,7 +248,8 @@ pub(crate) fn cmd_resume(id: &str, harness: Option<String>, launch: bool, json: 
 
     if json {
         let mut plan = resume_json(r.harness, &r.id, cwd.as_deref(), caveat.as_deref());
-        plan["env"] = serde_json::to_value(&env)?;
+        plan["env"] = serde_json::to_value(&env.set)?;
+        plan["unset_env"] = serde_json::to_value(&env.unset)?;
         plan["path"] = serde_json::to_value(&r.path)?;
         println!("{}", serde_json::to_string_pretty(&plan)?);
         return Ok(());
@@ -268,10 +269,12 @@ pub(crate) fn cmd_resume(id: &str, harness: Option<String>, launch: bool, json: 
             eprintln!("⚠ {caveat}");
         }
         eprintln!("✦ launching: (cd {}) {} {}", home_rel(&dir), program, args.join(" "));
-        let status = std::process::Command::new(program)
-            .args(&args)
-            .envs(&env)
-            .current_dir(&dir)
+        let mut command = std::process::Command::new(program);
+        command.args(&args).envs(&env.set).current_dir(&dir);
+        for name in &env.unset {
+            command.env_remove(name);
+        }
+        let status = command
             .status()
             .with_context(|| format!("failed to launch {program:?}"))?;
         if !status.success() {
@@ -285,10 +288,16 @@ pub(crate) fn cmd_resume(id: &str, harness: Option<String>, launch: bool, json: 
         println!("# {caveat}");
     }
     let mut lines = resume_lines(r.harness, &r.id, cwd.as_deref());
-    if !env.is_empty() {
+    if !env.set.is_empty() || !env.unset.is_empty() {
         let assignments = env
+            .unset
             .iter()
-            .map(|(key, value)| format!("{key}={}", shell_quote(value)))
+            .map(|name| format!("-u {name}"))
+            .chain(
+                env.set
+                    .iter()
+                    .map(|(key, value)| format!("{key}={}", shell_quote(value))),
+            )
             .collect::<Vec<_>>()
             .join(" ");
         if let Some(command) = lines.last_mut() {
@@ -301,13 +310,18 @@ pub(crate) fn cmd_resume(id: &str, harness: Option<String>, launch: bool, json: 
     Ok(())
 }
 
-/// Pin native commands to the selected source's home, including an ID found in an extra root.
-/// Export files and child transcripts cannot be safely addressed with the native resume CLI.
-fn resume_environment(
-    r: &cv_core::SessionRef,
-    explicit_path: bool,
-) -> Result<std::collections::BTreeMap<String, String>> {
-    let mut env = std::collections::BTreeMap::new();
+/// What a launch must change in the caller's environment to address the selected store.
+#[derive(Default)]
+struct ResumeEnv {
+    set: std::collections::BTreeMap<String, String>,
+    /// Inherited variables that would select another store and have no equivalent value.
+    unset: Vec<&'static str>,
+}
+
+/// Select the source's native home, including an ID found in an extra root. Export files and
+/// child transcripts cannot be safely addressed with the native resume CLI.
+fn resume_environment(r: &cv_core::SessionRef, explicit_path: bool) -> Result<ResumeEnv> {
+    let mut env = ResumeEnv::default();
     if matches!(resume_target(r.harness, &r.id), ResumeTarget::GuiOnly { .. })
         || (!explicit_path && !matches!(r.harness, Harness::Claude | Harness::Codex))
     {
@@ -320,34 +334,85 @@ fn resume_environment(
     if !native_resume_filename(r.harness, &path, &r.id) {
         return usage(format!("cannot safely resume {} from {}: the native filename does not address session {}; restore its native filename or port the transcript into a supported store", r.harness, path.display(), r.id));
     }
-    let root = match r.harness {
-        Harness::Claude if !r.id.starts_with("agent-") && !r.id.ends_with(".flat") => path
-            .parent()
-            .and_then(Path::parent)
-            .filter(|p| p.file_name().is_some_and(|n| n == "projects"))
-            .and_then(Path::parent)
-            .map(|p| ("CLAUDE_CONFIG_DIR", p)),
-        Harness::Codex => path.ancestors().skip(1).find_map(|p| {
-            let relative = path.strip_prefix(p).ok()?;
-            let components: Vec<_> = relative.iter().collect();
-            let valid = if p.file_name().is_some_and(|n| n == "sessions") {
-                components.len() == 4
-                    && components[..3].iter().zip([4, 2, 2]).all(|(s, len)| {
-                        s.to_str()
-                            .is_some_and(|s| s.len() == len && s.bytes().all(|c| c.is_ascii_digit()))
-                    })
-            } else {
-                p.file_name().is_some_and(|n| n == "archived_sessions") && components.len() == 1
-            };
-            valid.then(|| p.parent().map(|p| ("CODEX_HOME", p))).flatten()
-        }),
+    let selected = match r.harness {
+        Harness::Claude if !r.id.starts_with("agent-") && !r.id.ends_with(".flat") => claude_profile(&r.path, &path)
+            .map(|profile| match profile {
+                ClaudeProfile::Ambient => {}
+                ClaudeProfile::HomeDefault => env.unset.push("CLAUDE_CONFIG_DIR"),
+                ClaudeProfile::Dir(dir) => {
+                    env.set
+                        .insert("CLAUDE_CONFIG_DIR".into(), dir.to_string_lossy().into_owned());
+                }
+            }),
+        Harness::Codex => path
+            .ancestors()
+            .skip(1)
+            .find_map(|p| {
+                let relative = path.strip_prefix(p).ok()?;
+                let components: Vec<_> = relative.iter().collect();
+                let valid = if p.file_name().is_some_and(|n| n == "sessions") {
+                    components.len() == 4
+                        && components[..3].iter().zip([4, 2, 2]).all(|(s, len)| {
+                            s.to_str()
+                                .is_some_and(|s| s.len() == len && s.bytes().all(|c| c.is_ascii_digit()))
+                        })
+                } else {
+                    p.file_name().is_some_and(|n| n == "archived_sessions") && components.len() == 1
+                };
+                valid.then(|| p.parent()).flatten()
+            })
+            .map(|home| {
+                // Codex canonicalizes CODEX_HOME itself, and naming its default changes nothing.
+                env.set.insert("CODEX_HOME".into(), home.to_string_lossy().into_owned());
+            }),
         _ => None,
     };
-    let Some((key, root)) = root else {
+    if selected.is_none() {
         return usage(format!("cannot safely resume {} from {}: no native store can be selected for this source; use the original harness/profile or port it into a supported native store", r.harness, path.display()));
-    };
-    env.insert(key.into(), root.to_string_lossy().into_owned());
+    }
     Ok(env)
+}
+
+enum ClaudeProfile {
+    /// The caller's environment already reads this transcript's projects directory.
+    Ambient,
+    /// `~/.claude`, while the caller's `CLAUDE_CONFIG_DIR` names another directory.
+    HomeDefault,
+    Dir(std::path::PathBuf),
+}
+
+/// Which Claude config directory holds `<dir>/projects/<project>/<id>.jsonl`.
+///
+/// Claude Code treats "unset" and "set to `~/.claude`" as different profiles: with the variable
+/// set, `.claude.json` is read from inside the directory and the macOS keychain service gains a
+/// hash of the directory's spelling (2.1.325 `getGlobalClaudeFile` and the secure-storage service
+/// name). So the default profile is selected by leaving or making the variable unset, never by
+/// naming it, and another profile keeps the spelling it was selected with.
+fn claude_profile(selected: &Path, canonical: &Path) -> Option<ClaudeProfile> {
+    let projects = canonical.parent()?.parent()?;
+    let holds = |dir: &Path| dir.join("projects").canonicalize().is_ok_and(|p| p == projects);
+    let home_default = cv_core::env::home_dir().map(|home| home.join(".claude"));
+    let ambient = cv_core::env::var_os("CLAUDE_CONFIG_DIR")
+        .filter(|dir| !dir.is_empty())
+        .map(std::path::PathBuf::from);
+    if ambient.as_deref().or(home_default.as_deref()).is_some_and(holds) {
+        return Some(ClaudeProfile::Ambient);
+    }
+    if ambient.is_some() && home_default.as_deref().is_some_and(holds) {
+        return Some(ClaudeProfile::HomeDefault);
+    }
+    // The path as selected first: a symlinked `projects` has no config directory above its target.
+    let spelled = std::path::absolute(selected).ok();
+    let dir = [spelled.as_deref(), Some(canonical)]
+        .into_iter()
+        .flatten()
+        .find_map(|path| {
+            let dir = path.parent()?.parent()?;
+            (dir.file_name()? == "projects").then(|| dir.parent()).flatten()
+        })
+        .filter(|dir| holds(dir))
+        .map(Path::to_path_buf)?;
+    Some(ClaudeProfile::Dir(dir))
 }
 
 /// Native discovery must be able to find the file by the ID we pass to the harness.

@@ -8,6 +8,7 @@
 
 - Resume validates native transcript filenames before producing Claude/Codex commands; Codex’s supported compressed rollouts remain resumable.
 - Doctor and resume accept exact transcript sources; Claude and Codex resume plans preserve selected profile homes and reject unaddressable exports.
+- Resume never names Claude’s default profile through `CLAUDE_CONFIG_DIR`, which would select other credentials; JSON plans add `unset_env`.
 - `cv lanes --follow` streams changed worker states and results, keeps final transitions visible through filters, and supports deadlines and parent-labelled JSON.
 - `cv resume --json` returns executable arguments, working directory, manual resume hints, and native-store caveats without launching the harness.
 - Antigravity reads native SQLite and full, compact, or chunked exports, preserving revised steps, retained rendered output, media, task context, and missing-child lanes.

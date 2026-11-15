@@ -39,10 +39,9 @@ fn exact_source_doctor_and_resume_select_the_requested_claude_root() {
     let plan: Value = serde_json::from_str(&out).unwrap();
     assert_eq!(plan["id"], ID);
     assert_eq!(plan["args"], json!(["--resume", ID]));
-    assert_eq!(
-        plan["env"]["CLAUDE_CONFIG_DIR"],
-        config.canonicalize().unwrap().to_str().unwrap()
-    );
+    // The directory keeps the spelling it was selected with: Claude keys credentials on it.
+    assert_eq!(plan["env"]["CLAUDE_CONFIG_DIR"], config.to_str().unwrap());
+    assert_eq!(plan["unset_env"], json!([]));
     assert_eq!(plan["cwd"], w.base.to_str().unwrap());
     assert_eq!(plan["path"], transcript.to_str().unwrap());
     let (out, _) = w.cv_ok(&["resume", "--harness", "claude", transcript.to_str().unwrap()]);
@@ -124,7 +123,7 @@ fn exact_source_resume_launch_passes_selected_home_and_cwd() {
     assert_eq!(
         lines,
         [
-            config.canonicalize().unwrap().to_str().unwrap(),
+            config.to_str().unwrap(),
             w.base.canonicalize().unwrap().to_str().unwrap(),
             "--resume",
             ID
@@ -171,4 +170,71 @@ fn exact_source_resume_refuses_codex_filenames_native_lookup_cannot_address() {
             "{err}"
         );
     }
+}
+
+/// Claude Code reads another global config and keychain entry whenever `CLAUDE_CONFIG_DIR` is
+/// set, even to `~/.claude`, so the default profile is never named.
+#[test]
+fn default_claude_profile_is_resumed_without_naming_its_directory() {
+    let w = World::new("resume-default-profile");
+    w.write_session(
+        ID,
+        &[claude::with(claude::user(ID, "u1", TS, "hello"), json!({"cwd":w.base}))],
+    );
+    let path = w.transcript(ID);
+    for selector in [ID.to_string(), format!("claude:{}", path.display())] {
+        let (out, _) = w.cv_ok(&["resume", &selector, "--json"]);
+        let plan: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(plan["env"], json!({}), "{selector}");
+        assert_eq!(plan["unset_env"], json!([]), "{selector}");
+        let (out, _) = w.cv_ok(&["resume", &selector]);
+        assert!(out.ends_with(&format!("\nclaude --resume {ID}\n")), "{out}");
+    }
+
+    // From an environment that selects another profile, the default is reached by unsetting.
+    let other = w.base.join("other");
+    fs::create_dir_all(other.join("projects")).unwrap();
+    let env = [("CLAUDE_CONFIG_DIR", other.to_str().unwrap())];
+    let (ok, _, out, err) = w.cv_env(
+        &["resume", path.to_str().unwrap(), "--harness", "claude", "--json"],
+        &env,
+    );
+    assert!(ok, "{err}");
+    let plan: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(plan["env"], json!({}));
+    assert_eq!(plan["unset_env"], json!(["CLAUDE_CONFIG_DIR"]));
+    let (ok, _, out, err) = w.cv_env(&["resume", path.to_str().unwrap(), "--harness", "claude"], &env);
+    assert!(ok, "{err}");
+    assert!(
+        out.contains(&format!("env -u CLAUDE_CONFIG_DIR claude --resume {ID}")),
+        "{out}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn ambient_claude_profile_with_shared_projects_keeps_its_own_identity() {
+    // `$CLAUDE_CONFIG_DIR/projects` may be a link to another profile's history. The caller's
+    // profile already reads the transcript, so its credentials stay selected.
+    let w = World::new("resume-linked-projects");
+    w.write_session(
+        ID,
+        &[claude::with(claude::user(ID, "u1", TS, "hello"), json!({"cwd":w.base}))],
+    );
+    let profile = w.base.join("work");
+    fs::create_dir_all(&profile).unwrap();
+    std::os::unix::fs::symlink(w.home.join(".claude/projects"), profile.join("projects")).unwrap();
+    let env = [("CLAUDE_CONFIG_DIR", profile.to_str().unwrap())];
+    let (ok, _, out, err) = w.cv_env(&["resume", ID, "--json"], &env);
+    assert!(ok, "{err}");
+    let plan: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(plan["env"], json!({}));
+    assert_eq!(plan["unset_env"], json!([]));
+
+    // Selected from outside that profile, through the link: the linked profile is named as spelled.
+    let linked = profile.join("projects/-work-proj").join(format!("{ID}.jsonl"));
+    let (out, _) = w.cv_ok(&["resume", "--harness", "claude", linked.to_str().unwrap(), "--json"]);
+    let plan: Value = serde_json::from_str(&out).unwrap();
+    // Reached through the home default too, which wins: no variable is needed.
+    assert_eq!(plan["env"], json!({}));
 }

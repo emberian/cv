@@ -763,19 +763,24 @@ cv resume claude:/profiles/work/projects/-repo/session.jsonl --json
 
 ```text
 cd ~/pug/clustervision
-env CLAUDE_CONFIG_DIR=/profiles/work claude --resume da9174f4-…
+claude --resume da9174f4-…
 ```
 
 Desktop/IDE-only harnesses get a note instead.
 
-`--json` prints `id`, `harness`, `path`, `program`, `args`, `cwd`, `env`, `hint`, and `warning`.
-Arguments are an array of literal strings, without shell quoting. `env` contains environment
-variables to set when executing the command. A GUI-only target has a null `program`,
+`--json` prints `id`, `harness`, `path`, `program`, `args`, `cwd`, `env`, `unset_env`, `hint`, and
+`warning`. Arguments are an array of literal strings, without shell quoting. `env` contains
+environment variables to set and `unset_env` names inherited ones to remove when executing the
+command from the environment `cv` ran in. A GUI-only target has a null `program`,
 empty `args`, and a manual `hint`. An unavailable native store is reported in `warning`, just
 as in the text output. This mode never launches anything and cannot be combined with `--launch`.
 
 Claude and Codex resume plans preserve the selected native store through `CLAUDE_CONFIG_DIR`
-and `CODEX_HOME`, including sessions found in extra roots. An explicit transcript path must use
+and `CODEX_HOME`, including sessions found in extra roots. A Claude session the current
+environment already reads gets no variable: Claude Code uses a different global config file and
+keychain entry whenever `CLAUDE_CONFIG_DIR` is set, even to `~/.claude`. A session in `~/.claude`
+resumed from an environment that names another profile prints `env -u CLAUDE_CONFIG_DIR …`;
+another profile is named with the path it was selected by. An explicit transcript path must use
 the native projects/session layout and filename; copied exports and Claude child transcripts are
 refused. Codex's native `.jsonl.zst` rollouts remain supported.
 Other CLI harnesses currently require an ID selector instead of an exact path. A shared database
