@@ -327,6 +327,9 @@ impl ScanSink {
 }
 
 impl MessageSink for ScanSink {
+    fn tier(&self) -> crate::Tier {
+        crate::Tier::Facts
+    }
     fn take_error(&mut self) -> Option<anyhow::Error> {
         self.error
             .take()

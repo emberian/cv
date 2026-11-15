@@ -205,6 +205,9 @@ struct HistogramSink {
 }
 
 impl MessageSink for HistogramSink {
+    fn tier(&self) -> crate::Tier {
+        crate::Tier::Facts
+    }
     fn take_error(&mut self) -> Option<anyhow::Error> {
         self.state.take_error()
     }
@@ -276,6 +279,9 @@ impl CallSink {
 }
 
 impl MessageSink for CallSink {
+    fn tier(&self) -> crate::Tier {
+        crate::Tier::Facts
+    }
     fn take_error(&mut self) -> Option<anyhow::Error> {
         self.state.take_error()
     }

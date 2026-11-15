@@ -133,6 +133,9 @@ impl TitleUsers {
     }
 }
 impl cv_core::MessageSink for TitleUsers {
+    fn tier(&self) -> cv_core::stream::Tier {
+        cv_core::stream::Tier::Facts
+    }
     fn message(&mut self, m: cv_core::Message) -> cv_core::Flow {
         // Only a prompt can title a session (`Message::prompt_title`).
         if m.role != cv_core::Role::User || m.kind != cv_core::MessageKind::Prompt || self.fallback.is_some() {

@@ -152,6 +152,9 @@ pub fn message_index(adapter: &dyn crate::Adapter, r: &crate::SessionRef, id: &s
         found: Option<usize>,
     }
     impl crate::stream::MessageSink for Find<'_> {
+        fn tier(&self) -> crate::Tier {
+            crate::Tier::Facts
+        }
         fn message(&mut self, m: crate::Message) -> crate::stream::Flow {
             if m.id.as_deref() == Some(self.id) {
                 self.found = Some(self.at);

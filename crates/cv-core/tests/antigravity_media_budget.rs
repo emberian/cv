@@ -130,6 +130,22 @@ fn native_image_counter_is_bounded_and_public_payloads_remain_complete() {
 
     assert!(images.1, "reducer did not receive the existing inline-media marker");
 
+    // Consumers that read ids, tool names or text over a span read never need the bytes.
+    let before = cv_testkit::heap::begin();
+    assert_eq!(cv_core::api::message_index(&adapter, &reference, "0").unwrap(), Some(0));
+    assert_eq!(
+        cv_core::api::message_index(&adapter, &reference, "absent").unwrap(),
+        None
+    );
+    let tools = cv_core::tools::ToolHistogram::from_stream(&adapter, &reference).unwrap();
+    assert_eq!(tools.distinct(), 0);
+    let heap = cv_testkit::heap::end(before);
+    assert!(
+        heap.peak_above_baseline_bytes < 8 << 20,
+        "id and tool lookups allocated {} bytes for a 24 MiB inline image",
+        heap.peak_above_baseline_bytes
+    );
+
     // Public payload requests use the existing String IR and retain actual data,
     // even when the public API internally uses a span-capable read.
     let root = world.home.join(".gemini/antigravity-cli");

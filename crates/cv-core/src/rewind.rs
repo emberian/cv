@@ -291,6 +291,9 @@ impl CommitEvidenceSink {
 }
 
 impl MessageSink for CommitEvidenceSink {
+    fn tier(&self) -> crate::Tier {
+        crate::Tier::Facts
+    }
     fn take_error(&mut self) -> Option<anyhow::Error> {
         self.fail.take()
     }

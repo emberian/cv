@@ -604,6 +604,9 @@ fn subagent_final_return(r: &SessionRef) -> Result<Option<String>> {
         error: Option<anyhow::Error>,
     }
     impl cv_core::MessageSink for LastAssistantText {
+        fn tier(&self) -> cv_core::stream::Tier {
+            cv_core::stream::Tier::Facts
+        }
         fn meta(&mut self, session: &Session) {
             self.resolver = session.resolver();
         }
