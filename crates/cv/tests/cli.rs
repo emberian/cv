@@ -1731,8 +1731,9 @@ fn error_paths_exit_nonzero_with_stderr() {
     let (_, err) = w.cv_fails(&["show", "nonexistent-id", "--tree"]);
     assert!(err.contains("no session (and no sub-agent) matching"), "{err}");
 
+    // `resume` resolves sources as `show` does since it accepts transcript paths.
     let (_, err) = w.cv_fails(&["resume", "nonexistent-id"]);
-    assert!(err.contains("no session matching"), "{err}");
+    assert!(err.contains("no session (and no sub-agent) matching"), "{err}");
 
     let (_, err) = w.cv_fails(&["show", "alphasess", "--harness", "marsrover"]);
     assert!(err.contains("unknown harness"), "{err}");
