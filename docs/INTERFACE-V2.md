@@ -213,10 +213,12 @@ Rules:
 
 `Session.extra.cv.read_coverage` records evidence about a read using two extensible string sets:
 `sources` (`exported_history`, `native_store`, `member_registry`) and `limitations`
-(`metadata_only`, `missing_history`, `missing_payloads`, `missing_attachments`,
+(`metadata_only`, `missing_history`, `unreconciled_history`, `missing_payloads`, `missing_attachments`,
 `unsupported_native_fields`, `inferred_tool_identity`). Absence means unassessed; a source set
 or an empty limitation set does not certify complete support. Missing data is reported only
-when observed, separately from fields cv does not interpret. These facts survive lean/facts
+when observed, separately from fields cv does not interpret. `unreconciled_history` means newer
+native records exist but cannot safely be joined to the selected history, rather than absent
+stored bytes. These facts survive lean/facts
 reads and OpenSession storage. Unknown identifiers remain readable and round-trip unchanged.
 
 Plain show and Markdown report the sources and consequences in a compact line; a gap found

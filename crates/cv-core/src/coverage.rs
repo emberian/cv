@@ -19,6 +19,7 @@ impl ReadCoverage {
     pub const MEMBER_REGISTRY: &'static str = "member_registry";
     pub const METADATA_ONLY: &'static str = "metadata_only";
     pub const MISSING_HISTORY: &'static str = "missing_history";
+    pub const UNRECONCILED_HISTORY: &'static str = "unreconciled_history";
     pub const MISSING_PAYLOADS: &'static str = "missing_payloads";
     pub const MISSING_ATTACHMENTS: &'static str = "missing_attachments";
     pub const UNSUPPORTED_NATIVE_FIELDS: &'static str = "unsupported_native_fields";
@@ -47,6 +48,7 @@ impl ReadCoverage {
         let limitation = |s: &str| match s {
             Self::METADATA_ONLY => "metadata only; no conversation text".to_owned(),
             Self::MISSING_HISTORY => "some history is unavailable".to_owned(),
+            Self::UNRECONCILED_HISTORY => "newer native history could not be reconciled".to_owned(),
             Self::MISSING_PAYLOADS => "some recorded payloads are unavailable".to_owned(),
             Self::MISSING_ATTACHMENTS => "some referenced attachments are unavailable".to_owned(),
             Self::UNSUPPORTED_NATIVE_FIELDS => "some native fields are not interpreted".to_owned(),
