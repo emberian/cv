@@ -13,6 +13,10 @@ pub(super) fn planner(file: &File, response: &Proto, out: &mut impl Write) -> Re
     if let Some(reason) = response.last(12).and_then(|field| field.u64()) {
         key("stop_reason", out, &mut first)?;
         write!(out, "{}", reason as i32)?;
+        if let Some(name) = stop_name(reason) {
+            key("stop", out, &mut first)?;
+            write!(out, "\"{name}\"")?;
+        }
     }
     if let Some(duration) = response.last(11) {
         let duration = duration.message(file)?;
@@ -48,6 +52,34 @@ pub(super) fn planner(file: &File, response: &Proto, out: &mut impl Write) -> Re
     }
     out.write_all(b"}")?;
     Ok(())
+}
+
+/// `codeium_common.StopReason` in the 1.5.9 descriptors. A model stream the client
+/// cancelled is written as 18, not 16; a stream the peer dropped has no value at all.
+fn stop_name(reason: u64) -> Option<&'static str> {
+    Some(match reason {
+        1 => "incomplete",
+        2 => "stop_pattern",
+        3 => "max_tokens",
+        4 => "min_log_prob",
+        5 => "max_newlines",
+        6 => "exit_scope",
+        7 => "nonfinite_logit_or_prob",
+        8 => "first_non_whitespace_line",
+        9 => "partial",
+        10 => "function_call",
+        11 => "content_filter",
+        12 => "non_insertion",
+        13 => "error",
+        14 => "improper_format",
+        15 => "other",
+        16 => "client_canceled",
+        17 => "client_tool_parse_error",
+        18 => "client_stream_error",
+        19 => "client_looping",
+        20 => "client_invalid_message_order",
+        _ => return None,
+    })
 }
 
 fn signature_bytes(file: &File, signature: Field, out: &mut impl Write) -> Result<()> {
@@ -137,6 +169,20 @@ mod tests {
             })
         );
         assert!(projected.get("signature").is_none());
+    }
+    #[test]
+    fn stop_reasons_are_named_and_an_absent_one_is_not_invented() {
+        // CLI 1.5.9 wrote 2 for a finished reply and 18 for a stream the client cancelled.
+        for (reason, name) in [(2, "stop_pattern"), (18, "client_stream_error"), (16, "client_canceled")] {
+            let projected = projection(&[bytes(1, b"reply"), number(12, reason)].concat());
+            assert_eq!(projected["stop_reason"], reason);
+            assert_eq!(projected["stop"], name);
+        }
+        let dropped = projection(&bytes(1, b"partial reply"));
+        assert!(dropped.get("stop_reason").is_none() && dropped.get("stop").is_none());
+        let future = projection(&number(12, 77));
+        assert_eq!(future["stop_reason"], 77);
+        assert!(future.get("stop").is_none());
     }
     #[test]
     fn planner_message_duration_and_unknown_stop_reason_are_preserved() {

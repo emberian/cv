@@ -1860,6 +1860,17 @@ impl StepCodec {
                     usage.reasoning_tokens = native.reasoning_tokens.or(usage.reasoning_tokens);
                 }
                 attach_step_extras(&mut m, &fields, step_index, &source, status.as_deref(), want_extra)?;
+                // The step is DONE either way; only the stop reason says the reply was cut off.
+                if want_extra {
+                    let bag = m.harness_extra_mut(Harness::Antigravity);
+                    let stop = bag
+                        .get("planner_details")
+                        .and_then(|details| details.get("stop"))
+                        .and_then(Value::as_str);
+                    if matches!(stop, Some("error" | "client_canceled" | "client_stream_error")) {
+                        bag.insert("interrupted".into(), Value::Bool(true));
+                    }
+                }
                 Ok(sink.message(m))
             }
             "GENERIC" => {
