@@ -145,6 +145,8 @@ pub(super) struct Ran {
     pub(super) unreadable: Vec<Unreadable>,
     /// Sessions whose FTS docs were rewritten.
     pub(super) changed: usize,
+    /// Committed identities used to avoid forcing early decoded sessions twice on rebuild.
+    pub(super) completed: HashSet<String>,
     /// Sessions read from their mark on.
     pub(super) resumed: usize,
     /// Mark updates still waiting for the commit that holds their docs.
@@ -475,6 +477,7 @@ pub(super) fn run_fed(
                             ran.dependencies
                                 .push((job.r.clone(), job.source.with_reads(&fts_reads)));
                             ran.changed += 1;
+                            ran.completed.insert(job.r.id.clone());
                         }
                     }
                     Out::Failed { job, err, transient } => {

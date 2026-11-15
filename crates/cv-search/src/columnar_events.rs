@@ -1005,19 +1005,31 @@ impl ColumnarEventStore {
 
     /// Remove any session whose `session_id` is in `missing_ids` (used by `fts::sweep` reaping).
     pub fn remove_sessions_by_id(&mut self, missing_ids: &[String]) -> Result<usize> {
-        if cv_core::env::frozen() || missing_ids.is_empty() {
+        if missing_ids.is_empty() {
+            return Ok(0);
+        }
+        let missing_set: std::collections::HashSet<&str> = missing_ids.iter().map(String::as_str).collect();
+        self.remove_sessions_matching(|id| missing_set.contains(id))
+    }
+
+    /// Rebuild cleanup after discovery: keep every selected identity, including failed reads.
+    pub(crate) fn retain_sessions_by_id(&mut self, retained: &std::collections::HashSet<String>) -> Result<usize> {
+        self.remove_sessions_matching(|id| !retained.contains(id))
+    }
+
+    fn remove_sessions_matching(&mut self, matches: impl Fn(&str) -> bool) -> Result<usize> {
+        if cv_core::env::frozen() {
             return Ok(0);
         }
         let _lock = acquire_clev_writer_lock(&self.dir)?;
         if let Some(fresh) = ColumnarManifest::load(&self.dir)? {
             self.manifest = fresh;
         }
-        let missing_set: std::collections::HashSet<&str> = missing_ids.iter().map(String::as_str).collect();
         let targets: Vec<(String, String)> = self
             .manifest
             .sessions
             .values()
-            .filter(|s| missing_set.contains(s.session_id.as_str()))
+            .filter(|s| matches(&s.session_id))
             .map(|s| (s.harness.clone(), s.session_id.clone()))
             .collect();
         let mut count = 0usize;

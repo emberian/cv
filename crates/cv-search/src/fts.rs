@@ -35,6 +35,8 @@
 //!
 //! Indexing is **incremental** by default: only sessions whose file signature changed (plus new ones)
 //! are (re)written, and sessions whose files vanished are deleted. A full rebuild is `rebuild=true`.
+//! Complete validated revisions replace old ones in atomic batches. Failed reads keep the last
+//! good searchable body and remain stale; rebuild forces rereads without clearing good revisions.
 //! Snippets are generated **live** from the top hits (re-reading the session, capped) rather than
 //! from a stored copy of every body — which is what keeps the on-disk index small.
 
@@ -417,7 +419,7 @@ const CHUNK_BYTES: usize = if cfg!(all(test, not(feature = "probe-heap"))) {
 /// Incremental by default: a session whose freshness signature already matches the index is
 /// **skipped** (no re-parse cost beyond the metadata scan, no rewrite); changed sessions are
 /// replaced; new ones added; and sessions whose source files no longer exist are deleted. Pass
-/// `rebuild = true` to clear and rebuild from scratch. Returns the number of sessions discovered
+/// `rebuild = true` to force complete rereads while retaining each prior revision until replaced. Returns the number of sessions discovered
 /// (not just the changed ones).
 ///
 /// **Chunked ingestion:** each session streams message-by-message into a bounded body buffer that
@@ -457,10 +459,10 @@ pub fn index_all(
 fn sweep_all(dir: &Path, rebuild: bool, subagents: bool) -> Result<(Swept, Vec<cv_core::SessionRef>)> {
     let sources = cv_core::source::read_scope();
     let (handoff, decoded) = cv_core::codex_handoff::channel(DECODED_WINDOW, decoded_slots());
-    let (early, refs) = std::thread::scope(|scope| {
+    let (early, inventory) = std::thread::scope(|scope| {
         let sources = &sources;
         let discovery = scope.spawn(cv_core::env::carry(move || {
-            sources.run(|| cv_core::discover_all_handing_off(handoff))
+            sources.run(|| cv_core::discover_all_handing_off_inventory(handoff))
         }));
         let early = sweep_decoded(dir, rebuild, decoded);
         let refs = discovery
@@ -469,9 +471,18 @@ fn sweep_all(dir: &Path, rebuild: bool, subagents: bool) -> Result<(Swept, Vec<c
         (early, refs)
     });
     let early = early?;
-    // An early rebuild already cleared the index; clearing again would discard its commits.
-    // With no early decodes, the full sweep still owns the rebuild clear.
-    let mut swept = sweep_refs(dir, &refs, rebuild && early.is_none(), subagents)?;
+    let cv_core::DiscoveryInventory { refs, errors } = inventory;
+    // A rebuild forces every selected session once, including those discovery did not decode.
+    // Already completed early copies still undergo the full freshness/authority check.
+    let empty = HashSet::new();
+    let rebuilt = early.as_ref().map_or(&empty, |ran| &ran.completed);
+    let mut swept = sweep_refs_after(dir, &refs, rebuild, subagents, rebuilt, errors == 0)?;
+    if errors != 0 {
+        swept.errors += errors;
+        swept.first_error.get_or_insert_with(|| {
+            format!("discovery incomplete ({errors} source errors); preserved sessions absent from this inventory")
+        });
+    }
     if let Some(early) = early {
         // Early sessions are fresh to the full plan; count them where they were read. Their
         // failures stayed stale, and the full plan read them again.
@@ -498,16 +509,7 @@ fn sweep_decoded(dir: &Path, rebuild: bool, decoded: cv_core::codex_handoff::Rec
     };
     let (index, f) = open_or_create(dir)?;
     let mut writer = open_writer(&index, 50_000_000)?;
-    if rebuild {
-        writer.delete_all_documents().context("clearing index")?;
-        writer.commit().context("commit after clear")?;
-        if !cv_core::env::frozen() {
-            crate::columnar_events::ColumnarEventStore::open(crate::default_columnar_events_dir())
-                .and_then(|mut cs| cs.clear())
-                .context("clearing columnar events")?;
-        }
-    }
-    let mut state = PlanState::load(&index, &f, dir, rebuild)?;
+    let mut state = PlanState::load(&index, &f, dir)?;
     let consumer = state.consumer.clone();
     let mut ran = run_fed(&mut writer, &f, &consumer, available_workers(), move |feed| {
         let top = cv_core::events::Provenance::default();
@@ -519,7 +521,7 @@ fn sweep_decoded(dir: &Path, rebuild: bool, decoded: cv_core::codex_handoff::Rec
             let mut item = Some(handed);
             while let Some((r, bytes)) = item {
                 if ids.insert(r.id.clone()) {
-                    if let (_, Some(mut job)) = state.job(&r, &top) {
+                    if let (_, Some(mut job)) = state.job(&r, &top, rebuild) {
                         job.decoded = Some(bytes);
                         jobs.push(job);
                     }
@@ -705,6 +707,8 @@ struct Job {
 }
 
 /// What a sweep worker hands the writer thread, in order per session.
+// The test-only staged-reader fault counter crosses Clippy's variant-difference threshold.
+#[cfg_attr(test, allow(clippy::large_enum_variant))]
 enum Out {
     /// A session's read finished: its events (from the message index given on), counts and new
     /// mark are the writer's to record.
@@ -720,7 +724,7 @@ enum Out {
         #[cfg(test)]
         callbacks: usize,
     },
-    /// A session's read failed: any docs it sent are deleted and it stays stale.
+    /// A session's staging failed: its previous committed body remains available and stale.
     Failed {
         job: Job,
         err: anyhow::Error,
@@ -859,6 +863,17 @@ pub(crate) fn sweep(dir: &Path, refs: Vec<cv_core::SessionRef>, rebuild: bool, s
 }
 
 fn sweep_refs(dir: &Path, refs: &[cv_core::SessionRef], rebuild: bool, subagents: bool) -> Result<Swept> {
+    sweep_refs_after(dir, refs, rebuild, subagents, &HashSet::new(), true)
+}
+
+fn sweep_refs_after(
+    dir: &Path,
+    refs: &[cv_core::SessionRef],
+    rebuild: bool,
+    subagents: bool,
+    rebuilt: &HashSet<String>,
+    prune_missing: bool,
+) -> Result<Swept> {
     let (index, f) = open_or_create(dir)?;
     let total = refs.len();
     let copies = total - refs.iter().map(|r| &r.id).collect::<HashSet<_>>().len();
@@ -869,6 +884,8 @@ fn sweep_refs(dir: &Path, refs: &[cv_core::SessionRef], rebuild: bool, subagents
         refs,
         rebuild,
         subagents,
+        rebuilt,
+        prune_missing,
     };
     // Readers can decide an unchanged sweep without starting Tantivy worker threads. If a
     // different writer publishes while we plan, retry against one stable committed snapshot.
@@ -899,39 +916,32 @@ fn sweep_refs(dir: &Path, refs: &[cv_core::SessionRef], rebuild: bool, subagents
     // The mutation plan must describe the metadata protected by the writer lock, rather than
     // a previously observed index. Ordinary single-writer refreshes need no second plan.
     let plan = planner.under_writer(plan, &planned_meta, &writer)?;
-    if rebuild {
-        writer.delete_all_documents().context("clearing index")?;
-        writer.commit().context("commit after clear")?;
-        if !cv_core::env::frozen() {
-            crate::columnar_events::ColumnarEventStore::open(crate::default_columnar_events_dir())
-                .and_then(|mut cs| cs.clear())
-                .context("clearing columnar events")?;
-        }
-    }
     let SweepPlan {
         unchanged,
         jobs,
         missing,
+        retained,
         consumer,
     } = plan;
     let mut ran = run_jobs(&mut writer, &f, jobs, &consumer)?;
 
-    // Reap sessions that disappeared from disk since the last index (incremental only). A plain
-    // refresh never reaps the folded sub-agent forest — see [`missing_ids`].
-    let removed = if rebuild {
-        0
-    } else {
-        for id in &missing {
-            writer.delete_term(Term::from_field_text(f.id, id));
-        }
-        if !missing.is_empty() && !cv_core::env::frozen() {
-            crate::columnar_events::ColumnarEventStore::open(crate::default_columnar_events_dir())
-                .and_then(|mut cs| cs.remove_sessions_by_id(&missing))
-                .context("reaping vanished sessions from columnar events")?;
-        }
-        missing.len()
-    };
+    // Reap only identities absent from completed discovery. A failed read is still present,
+    // so rebuilding retains its last good body too. Plain refresh preserves folded agents.
+    for id in &missing {
+        writer.delete_term(Term::from_field_text(f.id, id));
+    }
+    if !missing.is_empty() && !cv_core::env::frozen() {
+        crate::columnar_events::ColumnarEventStore::open(crate::default_columnar_events_dir())
+            .and_then(|mut cs| cs.remove_sessions_by_id(&missing))
+            .context("reaping vanished sessions from columnar events")?;
+    }
+    let removed = missing.len();
     writer.commit().context("committing index")?;
+    if rebuild && prune_missing && !cv_core::env::frozen() {
+        crate::columnar_events::ColumnarEventStore::open(crate::default_columnar_events_dir())
+            .and_then(|mut cs| cs.retain_sessions_by_id(&retained))
+            .context("reaping unselected columnar sessions after rebuild")?;
+    }
     cv_core::resume::update(&ran.marks);
     publish_dependencies(&mut ran, &consumer);
     compact(dir, &index, &mut writer)?;
@@ -954,6 +964,7 @@ struct SweepPlan {
     unchanged: usize,
     jobs: Vec<Job>,
     missing: Vec<String>,
+    retained: HashSet<String>,
     consumer: String,
 }
 
@@ -964,6 +975,8 @@ struct SweepPlanner<'a> {
     refs: &'a [cv_core::SessionRef],
     rebuild: bool,
     subagents: bool,
+    rebuilt: &'a HashSet<String>,
+    prune_missing: bool,
 }
 
 impl SweepPlanner<'_> {
@@ -984,8 +997,10 @@ impl SweepPlanner<'_> {
             refs,
             rebuild,
             subagents,
+            rebuilt,
+            prune_missing,
         } = *self;
-        let mut state = PlanState::load(index, f, dir, rebuild)?;
+        let mut state = PlanState::load(index, f, dir)?;
         let mut seen: HashSet<String> = HashSet::new();
         let mut jobs: Vec<Job> = Vec::new();
         let mut unchanged = 0;
@@ -1015,15 +1030,23 @@ impl SweepPlanner<'_> {
             .collect();
         for (r, prov) in preferred_index_candidates(candidates) {
             seen.insert(r.id.clone());
-            let (fts_fresh, job) = state.job(r, prov);
+            let (fts_fresh, job) = state.job(r, prov, rebuild && !rebuilt.contains(&r.id));
             unchanged += usize::from(fts_fresh);
             jobs.extend(job);
         }
-        let missing = missing_ids(&state.existing, &seen, &state.folded, subagents);
+        let missing = if prune_missing {
+            missing_ids(&state.existing, &seen, &state.folded, subagents)
+        } else {
+            Vec::new()
+        };
+        if !subagents {
+            seen.extend(state.folded);
+        }
         Ok(SweepPlan {
             unchanged,
             jobs,
             missing,
+            retained: seen,
             consumer: state.consumer,
         })
     }
@@ -1063,14 +1086,10 @@ struct PlanState {
 }
 
 impl PlanState {
-    fn load(index: &Index, f: &Fields, dir: &Path, rebuild: bool) -> Result<Self> {
-        let (existing, folded, metadata) = if rebuild {
-            Default::default()
-        } else {
-            read_indexed_metadata(index, f, true)
-                .context("reading prior index metadata (use cv index --rebuild to replace corrupt metadata)")?
-        };
-        let col_events = if rebuild || cv_core::env::frozen() {
+    fn load(index: &Index, f: &Fields, dir: &Path) -> Result<Self> {
+        let (existing, folded, metadata) = read_indexed_metadata(index, f, true)
+            .context("reading prior index metadata (use cv index --rebuild to replace corrupt metadata)")?;
+        let col_events = if cv_core::env::frozen() {
             None
         } else {
             Some(
@@ -1095,7 +1114,7 @@ impl PlanState {
 
     /// Whether `r`'s docs are fresh, and the job reading it, unless it is unchanged on every
     /// axis or no adapter reads its harness.
-    fn job(&mut self, r: &cv_core::SessionRef, prov: &cv_core::events::Provenance) -> (bool, Option<Job>) {
+    fn job(&mut self, r: &cv_core::SessionRef, prov: &cv_core::events::Provenance, force: bool) -> (bool, Option<Job>) {
         let Self {
             existing,
             metadata,
@@ -1113,6 +1132,7 @@ impl PlanState {
             fresh: fts_fresh,
             dependencies_fresh,
         } = Freshness::of(existing, metadata, dependencies, probe, r, prov, &source);
+        let fts_fresh = fts_fresh && !force;
         let sql_events = event_sync.needs_ingest(r, &source, prov, probe);
         let col_events_needed = !cv_core::env::frozen()
             && col_events
@@ -1137,9 +1157,10 @@ impl PlanState {
             sql_events,
             col_events: col_events_needed,
             existing: existing.contains_key(&r.id),
-            grew: existing
-                .get(&r.id)
-                .is_some_and(|&(_, old_size)| old_size > 0 && size > old_size)
+            grew: !force
+                && existing
+                    .get(&r.id)
+                    .is_some_and(|&(_, old_size)| old_size > 0 && size > old_size)
                 && (!sql_events || event_sync.can_resume(r, prov))
                 && (!col_events_needed || col_events.as_ref().is_some_and(|cs| cs.can_resume(r, prov))),
             prov: prov.clone(),
@@ -1261,6 +1282,16 @@ fn job_out(mut job: Job, f: &Fields, marks: &cv_core::resume::Reader, adapter: &
     match result {
         Ok(p) => {
             #[cfg(test)]
+            let mut p = p;
+            #[cfg(test)]
+            if let Some((path, after)) = REPLAY_FAILURE.lock().unwrap().as_ref() {
+                if *path == job.r.path {
+                    if let Some((_, batch)) = &mut p.documents {
+                        batch.fail_replay_after = Some(*after);
+                    }
+                }
+            }
+            #[cfg(test)]
             if let Some((source, hook)) = AFTER_PASS.lock().unwrap().as_mut() {
                 if *source == adapter.resume_source(&job.r) {
                     hook(source);
@@ -1354,6 +1385,10 @@ struct JobPass {
 type AfterPass = Box<dyn FnMut(&std::path::Path) + Send>;
 #[cfg(test)]
 static AFTER_PASS: std::sync::Mutex<Option<(PathBuf, AfterPass)>> = std::sync::Mutex::new(None);
+
+/// Fail a staged reader after a prefix was admitted, before publication can commit.
+#[cfg(test)]
+static REPLAY_FAILURE: std::sync::Mutex<Option<(PathBuf, usize)>> = std::sync::Mutex::new(None);
 
 /// Tests: runs before each pass over this resume source; an error it returns is that pass's.
 #[cfg(test)]
@@ -4465,6 +4500,92 @@ mod tests {
     }
 
     #[test]
+    fn staged_reader_failure_rolls_back_a_prefix_and_keeps_last_good_revision() {
+        let home = IsolatedHome::new();
+        let dir = tmpdir();
+        let path = write_claude(&home.home, "replay", "zqretained");
+        let r = cv_core::SessionRef::new("replay", cv_core::Harness::Claude, path);
+        index_refs(&dir, std::slice::from_ref(&r), true).unwrap();
+        write_claude(&home.home, "replay", &"zqdiscarded ".repeat(100 * CHUNK_BYTES));
+        *REPLAY_FAILURE.lock().unwrap() = Some((r.path.clone(), 2));
+        let result = sweep(&dir, vec![r.clone()], false, false);
+        *REPLAY_FAILURE.lock().unwrap() = None;
+        let error = result.err().unwrap();
+        assert!(format!("{error:#}").contains("injected staged document read failure"));
+        assert_eq!(text_search_indexed(&dir, "zqretained", 10).unwrap().len(), 1);
+        assert!(text_search_indexed(&dir, "zqdiscarded", 10).unwrap().is_empty());
+        let consumer = source_consumer(&dir).unwrap();
+        assert!(cv_core::source::Table::<InIndex>::load(&consumer).get(&r).is_none());
+        assert!(cv_core::events::needs_ingest(&r));
+        assert_eq!(sweep(&dir, vec![r], false, false).unwrap().changed, 1);
+        assert!(text_search_indexed(&dir, "zqretained", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn incomplete_discovery_updates_healthy_sessions_without_pruning_unseen_revisions() {
+        let home = IsolatedHome::new();
+        let dir = tmpdir();
+        let refs: Vec<_> = ["unseen", "healthy"]
+            .into_iter()
+            .map(|id| {
+                let path = write_claude(&home.home, id, &format!("zq{id}"));
+                cv_core::SessionRef::new(id, cv_core::Harness::Claude, path)
+            })
+            .collect();
+        sweep(&dir, refs.clone(), false, false).unwrap();
+        write_claude(&home.home, "healthy", "zqreplacement");
+        let result = sweep_refs_after(&dir, &refs[1..], true, false, &HashSet::new(), false).unwrap();
+        assert_eq!((result.changed, result.removed, result.errors), (1, 0, 0));
+        assert_eq!(text_search_indexed(&dir, "zqunseen", 10).unwrap().len(), 1);
+        assert_eq!(text_search_indexed(&dir, "zqreplacement", 10).unwrap().len(), 1);
+        let events = crate::columnar_events::ColumnarEventStore::open(crate::default_columnar_events_dir()).unwrap();
+        assert!(!events.needs_ingest(&refs[0], &Default::default()));
+    }
+
+    #[test]
+    fn compatible_rebuild_preserves_failed_revisions_and_forces_unchanged_sessions() {
+        let home = IsolatedHome::new();
+        let dir = tmpdir();
+        let refs: Vec<_> = ["failed", "steady"]
+            .into_iter()
+            .map(|id| {
+                let path = write_claude(&home.home, id, &format!("zq{id}"));
+                cv_core::SessionRef::new(id, cv_core::Harness::Claude, path)
+            })
+            .collect();
+        let initial = sweep(&dir, refs.clone(), false, false).unwrap();
+        assert_eq!(initial.changed, 2);
+        *BEFORE_PASS.lock().unwrap() = Some((
+            refs[0].path.clone(),
+            Box::new(|_| anyhow::bail!("rebuild read failure")),
+        ));
+        let result = sweep(&dir, refs.clone(), true, false);
+        *BEFORE_PASS.lock().unwrap() = None;
+        let rebuilt = result.unwrap();
+        assert_eq!(
+            (rebuilt.changed, rebuilt.errors),
+            (1, 1),
+            "unchanged steady source was forced"
+        );
+        assert_eq!(text_search_indexed(&dir, "zqfailed", 10).unwrap().len(), 1);
+        assert_eq!(text_search_indexed(&dir, "zqsteady", 10).unwrap().len(), 1);
+        let consumer = source_consumer(&dir).unwrap();
+        assert!(cv_core::source::Table::<InIndex>::load(&consumer)
+            .get(&refs[0])
+            .is_none());
+        let events = crate::columnar_events::ColumnarEventStore::open(crate::default_columnar_events_dir()).unwrap();
+        assert!(
+            !events.needs_ingest(&refs[0], &Default::default()),
+            "rebuild never clears previous event revisions"
+        );
+        let retried = sweep(&dir, refs.clone(), false, false).unwrap();
+        assert_eq!((retried.changed, retried.errors), (1, 0));
+        let reaped = sweep(&dir, vec![refs[1].clone()], true, false).unwrap();
+        assert_eq!((reaped.changed, reaped.removed), (1, 1));
+        assert!(text_search_indexed(&dir, "zqfailed", 10).unwrap().is_empty());
+    }
+
+    #[test]
     fn closed_writer_admission_rolls_back_replacement_without_advancing_metadata() {
         let home = IsolatedHome::new();
         let dir = tmpdir();
@@ -6281,6 +6402,8 @@ mod tests {
             refs: std::slice::from_ref(&r),
             rebuild: false,
             subagents: false,
+            rebuilt: &HashSet::new(),
+            prune_missing: true,
         }
         .plan()
         .unwrap();
@@ -9329,6 +9452,8 @@ mod tests {
             refs: &refs,
             rebuild: false,
             subagents: false,
+            rebuilt: &HashSet::new(),
+            prune_missing: true,
         };
         let metadata = std::fs::read(dir.join("meta.json")).unwrap();
         let plan = planner.plan().unwrap();

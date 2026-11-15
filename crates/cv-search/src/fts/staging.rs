@@ -6,13 +6,26 @@ use tantivy::schema::{Document, Field, Value};
 use tantivy::TantivyDocument;
 
 #[derive(Default)]
-pub(super) struct DocumentBatch(Ordered<StagedDocument>);
+pub(super) struct DocumentBatch {
+    documents: Ordered<StagedDocument>,
+    #[cfg(test)]
+    pub(super) fail_replay_after: Option<usize>,
+}
 impl DocumentBatch {
     pub(super) fn push(&mut self, document: TantivyDocument) -> Result<()> {
-        self.0.push(StagedDocument(document))
+        self.documents.push(StagedDocument(document))
     }
     pub(super) fn replay(self, mut consume: impl FnMut(TantivyDocument) -> Result<()>) -> Result<()> {
-        for document in self.0.rows()? {
+        let documents = self.documents.rows()?;
+        #[cfg(test)]
+        let documents = documents.enumerate().map(|(read, document)| {
+            anyhow::ensure!(
+                self.fail_replay_after != Some(read),
+                "injected staged document read failure"
+            );
+            document
+        });
+        for document in documents {
             consume(document?.0)?;
         }
         Ok(())
