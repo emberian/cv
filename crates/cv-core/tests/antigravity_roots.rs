@@ -105,3 +105,27 @@ fn mirrored_roots_yield_one_session_from_the_fullest_readable_export() {
     let coverage = cv_core::coverage::ReadCoverage::of_session(&session).unwrap();
     assert!(!coverage.sources.contains(cv_core::coverage::ReadCoverage::NATIVE_STORE));
 }
+
+#[test]
+fn resume_is_qualified_when_the_cli_root_does_not_hold_the_conversation() {
+    let world = World::in_process("agy-roots-resume", cv_core::env::Env::enter_isolated);
+    let gemini = world.home.join(".gemini");
+    let (cli, ide) = (gemini.join("antigravity-cli"), gemini.join("antigravity-ide"));
+    fs::create_dir_all(&cli).unwrap();
+    // Only the IDE mirror has this conversation, and only as an export.
+    log(&ide, "transcript_full.jsonl", "ide request");
+    let adapter = Antigravity::with_home(&world.home);
+    let reference = adapter.discover().unwrap().remove(0);
+    let caveat = adapter
+        .resume_caveat(&reference)
+        .expect("agy cannot resume this session");
+    assert!(caveat.contains("antigravity-cli/conversations"), "{caveat}");
+    assert!(caveat.contains("antigravity-ide"), "{caveat}");
+
+    // Once the CLI root holds the native conversation, the command stands unqualified,
+    // wherever cv read the richer history from.
+    native(&cli, "cli native request");
+    assert_eq!(adapter.resume_caveat(&reference), None);
+    let reference = adapter.discover().unwrap().remove(0);
+    assert_eq!(adapter.resume_caveat(&reference), None);
+}

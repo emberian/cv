@@ -226,8 +226,9 @@ pub(crate) enum ResumeTarget {
 
 pub(crate) fn cmd_resume(id: &str, harness: Option<String>, launch: bool) -> Result<()> {
     let want = parse_harness(&harness)?;
-    let (r, _adapter) = resolve(id, want)?;
+    let (r, adapter) = resolve(id, want)?;
     let cwd = r.cwd.clone();
+    let caveat = adapter.resume_caveat(&r);
 
     if launch {
         let (program, args) = match resume_target(r.harness, &r.id) {
@@ -239,6 +240,9 @@ pub(crate) fn cmd_resume(id: &str, harness: Option<String>, launch: bool) -> Res
         let dir = cwd
             .clone()
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        if let Some(caveat) = &caveat {
+            eprintln!("⚠ {caveat}");
+        }
         eprintln!("✦ launching: (cd {}) {} {}", home_rel(&dir), program, args.join(" "));
         let status = std::process::Command::new(program)
             .args(&args)
@@ -251,7 +255,10 @@ pub(crate) fn cmd_resume(id: &str, harness: Option<String>, launch: bool) -> Res
         return Ok(());
     }
 
-    // Print the incantation.
+    // Print the incantation, after what the store says about it as a shell comment.
+    if let Some(caveat) = &caveat {
+        println!("# {caveat}");
+    }
     for line in resume_lines(r.harness, &r.id, cwd.as_deref()) {
         println!("{line}");
     }

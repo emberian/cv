@@ -4399,6 +4399,33 @@ fn cli_skills_policy_on_prune_rewind_and_port() {
 }
 
 #[test]
+fn resume_names_an_antigravity_session_the_cli_cannot_resume() {
+    let w = World::new("resume-agy-root");
+    let id = "11111111-2222-4333-8444-555555555555";
+    // The CLI root exists; the conversation is only an export in the IDE mirror.
+    fs::create_dir_all(w.home.join(".gemini/antigravity-cli")).unwrap();
+    let logs = w
+        .home
+        .join(".gemini/antigravity-ide/brain")
+        .join(id)
+        .join(".system_generated/logs");
+    fs::create_dir_all(&logs).unwrap();
+    fs::write(
+        logs.join("transcript_full.jsonl"),
+        "{\"step_index\":0,\"source\":\"USER_EXPLICIT\",\"type\":\"USER_INPUT\",\"status\":\"DONE\",\"content\":\"hello\"}\n",
+    )
+    .unwrap();
+    let (out, _) = w.cv_ok(&["resume", &format!("antigravity:{id}")]);
+    let mut lines = out.lines();
+    let caveat = lines.next().unwrap();
+    assert!(
+        caveat.starts_with("# agy resumes conversations stored in") && caveat.contains("antigravity-ide"),
+        "{out}"
+    );
+    assert_eq!(lines.last(), Some(format!("agy --conversation {id}").as_str()), "{out}");
+}
+
+#[test]
 fn resume_launch_refuses_gui_only_harnesses_with_exit_two() {
     let w = World::new("resume-gui-only");
     let exports_dir = w.base.join("exports");

@@ -174,6 +174,29 @@ impl Adapter for Antigravity {
         }
     }
 
+    /// `agy --conversation <id>` reads its own app data dir (`$JETSKI_APP_DATA_DIR`, else
+    /// `~/.gemini/antigravity-cli`). There is no import: a session read only from an export,
+    /// or from the desktop or IDE root, is not resumable there.
+    fn resume_caveat(&self, r: &SessionRef) -> Option<String> {
+        let cli = match crate::env::var_os("JETSKI_APP_DATA_DIR") {
+            Some(explicit) => PathBuf::from(explicit),
+            None => crate::env::home_dir()?.join(".gemini").join(APP_DATA_SUBDIRS[0]),
+        };
+        let conversations = cli.join("conversations");
+        if ["db", "pb"]
+            .iter()
+            .any(|extension| conversations.join(format!("{}.{extension}", r.id)).is_file())
+        {
+            return None;
+        }
+        Some(format!(
+            "agy resumes conversations stored in {}; {} is not there (read from {}) and agy has no import",
+            conversations.display(),
+            r.id,
+            r.path.display()
+        ))
+    }
+
     fn append_only(&self, _r: &SessionRef) -> bool {
         // Completed parallel tools can arrive out of step order, and a later record can
         // replace a previously exported step. Byte append does not imply message append.

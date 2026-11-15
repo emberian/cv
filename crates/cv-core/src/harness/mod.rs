@@ -834,6 +834,13 @@ pub trait Adapter: Send + Sync {
         WatchPolicy::Tree
     }
 
+    /// What stands between `r` and this harness's own resume command, when the store shows it:
+    /// the session was read from somewhere the harness's CLI does not resume from. Default:
+    /// the adapter knows of nothing.
+    fn resume_caveat(&self, _r: &SessionRef) -> Option<String> {
+        None
+    }
+
     /// Whether `r`'s transcript only ever grows by appending lines, so its first `n` bytes pin a
     /// past state, read back by [`Self::transcript`] from
     /// [`Start::Prefix`](crate::stream::Start::Prefix). A follower records a byte mark for such a
