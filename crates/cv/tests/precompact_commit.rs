@@ -258,3 +258,48 @@ fn a_record_from_an_earlier_window_becomes_the_next_windows_carry() {
     assert_eq!(store::load_carry(&root, "claude", sid).unwrap().items, vec![ruling]);
     assert!(store::load_record(&root, "claude", sid).unwrap().is_none());
 }
+
+/// A summary call that fails fast is not started again at once: the follower waits out a pause
+/// that doubles with each failure in a row. Before the pause, a dead summary server was retried on
+/// the wake its own failure sent, as fast as the loop turned (on our hub, about 1.3 million log
+/// lines an hour and most of a core, all day). Here the server's port refuses every connection;
+/// over 6 seconds the follower may try at most twice (at 0 s and after the 5 s pause).
+#[test]
+fn a_failed_summary_waits_a_pause_before_it_is_tried_again() {
+    let w = World::new("precompact-retry-pause");
+    let sid = "aaaaaaaa-0000-4000-8000-0000000000f2";
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let line = |ty: &str, uuid: &str, parent: Option<&str>, message: Value| {
+        json!({"type": ty, "sessionId": sid, "uuid": uuid, "parentUuid": parent, "isSidechain": false,
+            "cwd": "/work/proj", "timestamp": now, "message": message})
+    };
+    w.write_session(
+        sid,
+        &[
+            line("user", "u1", None, json!({"role": "user", "content": "port the parser"})),
+            line(
+                "assistant",
+                "a1",
+                Some("u1"),
+                json!({"role": "assistant", "model": "m", "content": [{"type": "text", "text": "Porting it."}],
+                    "usage": {"input_tokens": 5000, "output_tokens": 5}}),
+            ),
+        ],
+    );
+    // Port 9 (discard) refuses on a host with nothing listening there: each call fails at once.
+    let (_, _, _, err) = w.cv_env(
+        &[
+            "watch", "--kind", "precompact", "--for", "6s", "--harness", "claude", "--compact-at", "1000",
+            "--idle-secs", "0", "--prepare-native", "--model", "m", "--base-url", "http://127.0.0.1:9/v1",
+        ],
+        &[],
+    );
+    let failed = err.lines().filter(|l| l.contains("summary failed")).count();
+    assert!(failed >= 1, "the follower started no summary at all; stderr:\n{err}");
+    assert!(
+        failed <= 2,
+        "a failed summary was tried {failed} times in 6 s; it should wait out its pause\nfirst lines:\n{}",
+        err.lines().take(12).collect::<Vec<_>>().join("\n")
+    );
+    assert!(err.contains("tried again in 5s"), "the first failure names its pause; stderr:\n{err}");
+}
