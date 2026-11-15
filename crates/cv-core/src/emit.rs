@@ -1004,7 +1004,9 @@ mod tests {
             namespace: None,
         });
         session.messages.push(carrier_call);
-        // Duplicate UUID/tool IDs, raw content overrides, and forward parents keep their old rules.
+        // Duplicate UUID/tool IDs, raw content overrides, and acyclic forward parents retain
+        // their wire behavior. The future node must explicitly root at u: an implicit parent
+        // would follow the preceding duplicate a and close the a -> future -> a cycle.
         let mut override_msg = Message::new(Role::Assistant);
         override_msg.id = Some("a".into());
         override_msg.parent_id = Some("future".into());
@@ -1014,6 +1016,7 @@ mod tests {
         session.messages.push(override_msg);
         let mut future = Message::new(Role::User);
         future.id = Some("future".into());
+        future.parent_id = Some("u".into());
         future.content = vec![
             Block::Text { text: "mixed".into() },
             Block::Image {
@@ -1072,6 +1075,65 @@ mod tests {
             }
         }
         frozen.check()?;
+        Ok(())
+    }
+
+    #[test]
+    fn claude_checked_writer_rejects_explicit_and_implicit_parent_cycles_before_publication() -> Result<()> {
+        let world = crate::test_world("claude-checked-cycle");
+        for explicit in [false, true] {
+            let mut session = Session::new("source", Harness::Claude);
+            session.cwd = Some("/synthetic/claude-cycle".into());
+            for (id, role, parent) in [
+                ("u", Role::User, None),
+                ("a", Role::Assistant, Some("future")),
+                ("future", Role::User, explicit.then_some("a")),
+            ] {
+                let mut message = Message::new(role);
+                message.id = Some(id.into());
+                message.parent_id = parent.map(str::to_owned);
+                message.content.push(Block::Text { text: id.into() });
+                session.messages.push(message);
+            }
+            // Without an explicit parent, the writer's chronological fallback would make
+            // future point to a. Both that introduced cycle and an existing source cycle
+            // must fail; a parent merely existing somewhere in the output is insufficient.
+            for mode in ThinkingMode::ALL {
+                for sidechain in [false, true] {
+                    for direct in [false, true] {
+                        let out = world
+                            .base
+                            .join(format!("{explicit}-{}-{sidechain}-{direct}", mode.as_str()));
+                        let opts = EmitOptions {
+                            new_id: Some("fixed-id".into()),
+                            thinking: mode,
+                            sidechain_of: sidechain.then(|| SidechainOf {
+                                root: "root".into(),
+                                agent: "agent".into(),
+                            }),
+                            ..Default::default()
+                        };
+                        let result = if direct {
+                            crate::harness::claude::emit::emit(&session, &out, &opts)
+                        } else {
+                            emit(&session, Harness::Claude, &out, &opts)
+                        };
+                        let error = result.unwrap_err();
+                        assert!(error.to_string().contains("parentUuid cycle"), "{error:#}");
+                        if out.exists() {
+                            for entry in walkdir::WalkDir::new(&out) {
+                                let entry = entry?;
+                                assert!(
+                                    entry.file_type().is_dir(),
+                                    "failed emission left {}",
+                                    entry.path().display()
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
