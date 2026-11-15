@@ -231,9 +231,13 @@ pub(crate) enum TaskCmd {
         /// Print only the pinned STATUS text (exit 1 when none is pinned).
         #[arg(long, conflicts_with_all = ["json", "brief", "events"])]
         status: bool,
-        /// Only the last N notes.
+        /// Only the last N notes. The text view shows the newest 3 unless this, `--notes-all`,
+        /// `--notes-grep` or `--brief` says otherwise; `--json` always carries every note.
         #[arg(long = "notes-last", value_name = "N")]
         notes_last: Option<usize>,
+        /// Every note in full.
+        #[arg(long = "notes-all", conflicts_with = "notes_last")]
+        notes_all: bool,
         /// Only notes matching this regex (case-insensitive).
         #[arg(long = "notes-grep", value_name = "PATTERN")]
         notes_grep: Option<String>,
@@ -797,6 +801,7 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
             brief,
             status,
             notes_last,
+            notes_all,
             notes_grep,
         } => {
             let outcome = replay_loud()?;
@@ -840,7 +845,14 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
             } else {
                 print!(
                     "{}",
-                    render_show(&outcome.model, t, brief, grep.as_ref(), notes_last, Utc::now())
+                    render_show(
+                        &outcome.model,
+                        t,
+                        brief,
+                        grep.as_ref(),
+                        shown_notes(notes_last, notes_all, brief, grep.is_some()),
+                        Utc::now()
+                    )
                 );
                 if events {
                     let history: Vec<_> = outcome.events.iter().filter(|e| e.task_id == id).collect();
@@ -1115,6 +1127,20 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
     }
 }
 
+/// How many notes the text view of `cv task show` prints by default. A long task dumped whole
+/// costs its reader the context it was opened to save; the full history stays one flag away.
+const DEFAULT_SHOWN_NOTES: usize = 3;
+
+/// The note limit `show` applies: an explicit `--notes-last`, none for `--notes-all`, a query
+/// (`--notes-grep`) or the one-line `--brief` view, and the default otherwise.
+fn shown_notes(notes_last: Option<usize>, notes_all: bool, brief: bool, grep: bool) -> Option<usize> {
+    match notes_last {
+        Some(n) => Some(n),
+        None if notes_all || brief || grep => None,
+        None => Some(DEFAULT_SHOWN_NOTES),
+    }
+}
+
 /// `cv task show <id>` as text: the pinned STATUS first (with `brief`, only it and the title), then
 /// the completion label, the fields, relations, the decision facet, and the notes `grep` and
 /// `notes_last` keep. Every free-text field came from the durable log — sanitized at render (G5).
@@ -1287,6 +1313,8 @@ fn render_show(
             t.notes.len(),
             if brief {
                 " — one line each; drop --brief for the full text"
+            } else if grep.is_none() {
+                " — --notes-all for every note, --notes-grep PAT to query"
             } else {
                 ""
             }

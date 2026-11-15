@@ -170,6 +170,9 @@ task 019f6e4b-74c5-74f0-a493-1f8131ca38d5  [done]  action
   note (lane:mira, 2026-07-17 00:31): ids are v7 on task/uuid-ids; tests green
 ```
 
+The text view prints the newest three notes and counts the rest; `--notes-all` prints every
+note, `--notes-last N` and `--notes-grep PAT` query them, and `--json` always carries them all.
+
 `cv task show <id> --events` (`GET /api/task/{id}/events`) prints the raw history: here `opened`,
 `claimed`, `noted`, `done`. An unknown `cv task events --kind` exits 2 listing the known kinds;
 `/api/events?kind=` returns 400.

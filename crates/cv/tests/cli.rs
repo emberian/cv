@@ -2551,6 +2551,25 @@ fn task_show_notes_last_and_grep() {
     );
     let (out, _) = w.cv_ok(&["task", "show", &parent, "--notes-grep", "k-portal"]);
     assert!(out.contains("notes:    1 of 4") && out.contains("K-PORTAL"), "{out}");
+
+    // The default text view is the newest three and says how to get the rest; JSON is whole.
+    let (out, _) = w.cv_ok(&["task", "show", &parent]);
+    assert!(
+        out.contains("notes:    3 of 4 (newest last) — --notes-all for every note"),
+        "{out}"
+    );
+    assert!(
+        !out.contains("move the build base") && out.contains("PUSH also") && out.contains("JOIN-SOLANA"),
+        "{out}"
+    );
+    let (out, _) = w.cv_ok(&["task", "show", &parent, "--notes-all"]);
+    assert!(
+        out.contains("move the build base") && !out.contains("notes:    "),
+        "{out}"
+    );
+    let (out, _) = w.cv_ok(&["task", "show", &parent, "--json"]);
+    assert!(out.contains("move the build base"), "{out}");
+    w.cv_fails(&["task", "show", &parent, "--notes-all", "--notes-last", "1"]);
 }
 
 /// `note <id> -` and `--body -` read stdin; a relative `--issue` is absolutized at open time
