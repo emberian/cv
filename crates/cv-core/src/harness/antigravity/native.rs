@@ -609,6 +609,64 @@ mod tests {
         assert_eq!(projected["content"], "User facing failure");
     }
 
+    /// A history's temporary files do not grow with its steps, and each step's projection,
+    /// its retained wire record included, is the one it has alone.
+    #[test]
+    fn a_native_history_is_staged_in_a_fixed_number_of_files() {
+        let list = [bytes(1, &bytes(3, b"hello\nworld")), bytes(1, &uint(4, 1))].concat();
+        let entry = [bytes(1, b"values"), bytes(2, &bytes(6, &list))].concat();
+        let structured = bytes(140, &bytes(2, &bytes(10, &bytes(1, &entry))));
+        let rendered = bytes(140, &bytes(2, &bytes(3, &bytes(2, b"rendered markdown"))));
+        let prompt = bytes(19, &bytes(1, b"a prompt"));
+        let steps = |n: usize| -> Vec<Vec<u8>> {
+            (0..n)
+                .map(|i| [uint(4, 3), [&structured, &rendered, &prompt][i % 3].clone()].concat())
+                .collect()
+        };
+        let read = |tag: &str, steps: &[Vec<u8>]| {
+            let world = crate::test_world(tag);
+            let path = world.base.join("session.db");
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch("CREATE TABLE steps(idx INTEGER PRIMARY KEY, step_format INTEGER, step_payload BLOB);")
+                .unwrap();
+            for (idx, payload) in steps.iter().enumerate() {
+                conn.execute(
+                    "INSERT INTO steps VALUES(?1, 0, ?2)",
+                    rusqlite::params![idx as i64, payload],
+                )
+                .unwrap();
+            }
+            drop(conn);
+            let before = super::super::super::store::bytes::spills_created();
+            let read = open(&path, true).unwrap();
+            let created = super::super::super::store::bytes::spills_created() - before;
+            let lines: Vec<serde_json::Value> = read
+                .decoded_bytes()
+                .unwrap()
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+                .map(|line| serde_json::from_slice(line).unwrap())
+                .collect();
+            (created, lines)
+        };
+        let (few_files, few) = read("antigravity-native-few", &steps(3));
+        let many_steps = steps(60);
+        let (many_files, many) = read("antigravity-native-many", &many_steps);
+        assert_eq!(few.len(), 3);
+        assert_eq!(many.len(), 60);
+        assert_eq!(many_files, few_files, "temporary files grew with the step count");
+        for (index, (line, data)) in many.iter().zip(&many_steps).enumerate() {
+            let mut alone = projection(data, true);
+            alone["step_index"] = index.into();
+            assert_eq!(line, &alone, "step {index}");
+            // The retained wire record is the step's own range of the shared staging file.
+            let expected: String = data.iter().map(|byte| format!("{byte:02x}")).collect();
+            assert_eq!(line["native_record"]["data"], expected, "step {index}");
+        }
+        assert_eq!(many[1]["content"], "rendered markdown");
+        assert_eq!(many[2]["content"], "a prompt");
+    }
+
     #[test]
     fn native_unknown_step_format_is_rejected() {
         let world = crate::test_world("antigravity-native-format");

@@ -133,6 +133,16 @@ impl Read {
         self.source.check()
     }
 
+    /// The decoded copy's bytes, for a test of what an adapter projected.
+    #[cfg(test)]
+    pub(crate) fn decoded_bytes(&self) -> Option<Vec<u8>> {
+        let (backing, len) = self.decoded.as_ref()?;
+        let mut bytes = Vec::new();
+        backing.copy_to(&mut bytes).ok()?;
+        bytes.truncate(*len as usize);
+        Some(bytes)
+    }
+
     /// This source read through `backing`, its decoded copy (`len` bytes at its start): views
     /// keep the original's identity and its completion guards.
     pub(crate) fn decoded(mut self, backing: std::sync::Arc<super::bytes::ByteSource>, len: u64) -> Self {

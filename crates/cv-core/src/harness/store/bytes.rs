@@ -55,8 +55,19 @@ pub(crate) struct Spill {
     path: std::path::PathBuf,
     linked: bool,
 }
+#[cfg(test)]
+thread_local! {
+    static SPILLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+/// Temporary files this thread has created: a test's count of an operation's staging.
+#[cfg(test)]
+pub(crate) fn spills_created() -> usize {
+    SPILLS.with(std::cell::Cell::get)
+}
 impl Spill {
     pub(crate) fn create(append: bool) -> std::io::Result<Self> {
+        #[cfg(test)]
+        SPILLS.with(|n| n.set(n.get() + 1));
         let path = std::env::temp_dir().join(format!("cv-byte-source-{}", uuid::Uuid::new_v4()));
         let mut options = std::fs::OpenOptions::new();
         options.read(true).write(true).append(append).create_new(true);
