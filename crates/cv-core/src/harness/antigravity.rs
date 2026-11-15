@@ -172,6 +172,11 @@ impl Adapter for Antigravity {
         }
     }
 
+    /// Each conversation is its own SQLite file.
+    fn path_selects_session(&self, _r: &SessionRef) -> bool {
+        true
+    }
+
     /// `agy --conversation <id>` reads its own app data dir (`$JETSKI_APP_DATA_DIR`, else
     /// `~/.gemini/antigravity-cli`). There is no import: a session read only from an export,
     /// or from the desktop or IDE root, is not resumable there.

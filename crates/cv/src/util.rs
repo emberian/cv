@@ -152,7 +152,7 @@ pub(crate) fn source_selector(harness: cv_core::Harness, source: &str) -> String
 /// A shared store path supplies no session key. Antigravity's SQLite file is one conversation;
 /// other adapters' rows stores need the native ID that discovery normally carries alongside it.
 pub(crate) fn require_session_file(r: &cv_core::SessionRef, adapter: &dyn cv_core::Adapter) -> Result<()> {
-    if r.harness != cv_core::Harness::Antigravity && adapter.rows_store(r).as_ref() == Some(&r.path) {
+    if !adapter.path_selects_session(r) {
         return usage(format!(
             "{} is a shared {} store, not a session selector; use {}:<session-id> instead",
             r.path.display(),

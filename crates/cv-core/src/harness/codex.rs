@@ -134,7 +134,62 @@ impl Codex {
     }
 }
 
+/// Whether Codex's own lookup finds `name` by thread `id`. Codex 0.169 `RolloutFileName::parse`:
+/// a plain or native-compressed rollout, a 19-character local timestamp, the thread UUID and an
+/// optional distinct rollout UUID.
+/// <https://github.com/openai/codex/blob/rust-v0.169.0/codex-rs/rollout/src/rollout_file_name.rs>
+fn rollout_names_thread(name: &str, id: &str) -> bool {
+    let name = name.strip_suffix(".zst").unwrap_or(name);
+    let Some(core) = name.strip_prefix("rollout-").and_then(|s| s.strip_suffix(".jsonl")) else {
+        return false;
+    };
+    let Some(stamp) = core.get(..19) else { return false };
+    if core.get(19..20) != Some("-") || chrono::NaiveDateTime::parse_from_str(stamp, "%Y-%m-%dT%H-%M-%S").is_err() {
+        return false;
+    }
+    let ids = &core[20..];
+    let (thread, rollout) = ids.split_once('_').unwrap_or((ids, ids));
+    thread == id && uuid::Uuid::parse_str(thread).is_ok() && uuid::Uuid::parse_str(rollout).is_ok()
+}
+
 impl Adapter for Codex {
+    /// `codex resume <id>` reads `$CODEX_HOME/sessions/YYYY/MM/DD/` and `archived_sessions/`.
+    /// Codex canonicalizes `CODEX_HOME` itself, and its default named explicitly is the same home.
+    fn resume_env(&self, r: &SessionRef) -> Option<Result<super::ResumeEnv, String>> {
+        let Ok(path) = r.path.canonicalize() else {
+            return Some(Err(format!("{} cannot be read", r.path.display())));
+        };
+        if !path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|name| rollout_names_thread(name, &r.id))
+        {
+            return Some(Err(format!("the native filename does not address session {}; restore its native filename or port the transcript into a supported store", r.id)));
+        }
+        let home = path.ancestors().skip(1).find_map(|p| {
+            let relative = path.strip_prefix(p).ok()?;
+            let components: Vec<_> = relative.iter().collect();
+            let valid = if p.file_name().is_some_and(|n| n == "sessions") {
+                components.len() == 4
+                    && components[..3].iter().zip([4, 2, 2]).all(|(s, len)| {
+                        s.to_str()
+                            .is_some_and(|s| s.len() == len && s.bytes().all(|c| c.is_ascii_digit()))
+                    })
+            } else {
+                p.file_name().is_some_and(|n| n == "archived_sessions") && components.len() == 1
+            };
+            valid.then(|| p.parent()).flatten()
+        });
+        Some(match home {
+            Some(home) => {
+                let mut env = super::ResumeEnv::default();
+                env.set.insert("CODEX_HOME".into(), home.to_string_lossy().into_owned());
+                Ok(env)
+            }
+            None => Err("no native store can be selected for this source; use the original harness/profile or port it into a supported native store".into()),
+        })
+    }
+
     fn lifecycle_body_required(&self) -> bool {
         true
     }
@@ -1130,6 +1185,27 @@ fn listed(path: &Path, mut s: Session, ctx: &CodexCtx) -> SessionRef {
 mod tests {
     use super::*;
     use crate::stream::Checkpoint;
+
+    #[test]
+    fn resume_filename_keeps_native_compressed_and_reverted_rollouts() {
+        let id = "11111111-2222-4333-8444-555555555555";
+        let rollout = "66666666-7777-4888-8999-aaaaaaaaaaaa";
+        for suffix in [
+            format!("{id}.jsonl"),
+            format!("{id}.jsonl.zst"),
+            format!("{id}_{rollout}.jsonl.zst"),
+        ] {
+            assert!(super::rollout_names_thread(
+                &format!("rollout-2026-11-01T00-00-00-{suffix}"),
+                id
+            ));
+        }
+        assert!(!super::rollout_names_thread(&format!("{id}.jsonl"), id));
+        assert!(!super::rollout_names_thread(
+            &format!("rollout-2026-11-01T00-00-00-{rollout}.jsonl"),
+            id
+        ));
+    }
 
     #[test]
     fn hook_forest_verifies_native_parents_and_follows_descendants() {

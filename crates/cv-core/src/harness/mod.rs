@@ -575,6 +575,15 @@ impl Capabilities {
 /// Incremental reads are optional: checkpoint/resume methods default to declining, while
 /// source and dependency methods describe the inputs consumers must validate before reuse.
 ///
+/// Environment changes for launching a harness's CLI on one store ([`Adapter::resume_env`]),
+/// relative to the environment of the calling process.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ResumeEnv {
+    pub set: std::collections::BTreeMap<String, String>,
+    /// Inherited variables that select another store and have no equivalent value.
+    pub unset: Vec<&'static str>,
+}
+
 /// `Send + Sync` so [`crate::discover_all`] can fan discovery across adapters in parallel. Every
 /// adapter holds only path data (connections are opened per call), so this bound is always satisfied.
 pub trait Adapter: Send + Sync {
@@ -832,6 +841,19 @@ pub trait Adapter: Send + Sync {
     /// Default: as a directory change ([`WatchPolicy::Tree`]).
     fn watch_policy(&self, _r: &SessionRef) -> WatchPolicy {
         WatchPolicy::Tree
+    }
+
+    /// What the harness's own resume command must change in the caller's environment to read the
+    /// store holding `r`, or why that command cannot address `r` at all. Default: no opinion; the
+    /// harness resumes by ID from wherever it keeps its sessions.
+    fn resume_env(&self, _r: &SessionRef) -> Option<Result<ResumeEnv, String>> {
+        None
+    }
+
+    /// Whether `r`'s path alone names one session. Default: unless it is a store many sessions
+    /// share ([`Self::rows_store`]).
+    fn path_selects_session(&self, r: &SessionRef) -> bool {
+        self.rows_store(r).as_ref() != Some(&r.path)
     }
 
     /// What stands between `r` and this harness's own resume command, when the store shows it:

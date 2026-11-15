@@ -242,7 +242,7 @@ pub(crate) fn cmd_resume(id: &str, harness: Option<String>, launch: bool, json: 
         r.id = read.session.id;
         r.cwd = read.session.cwd;
     }
-    let env = resume_environment(&r, explicit_path)?;
+    let env = resume_environment(&r, adapter.as_ref(), explicit_path)?;
     let cwd = r.cwd.clone();
     let caveat = adapter.resume_caveat(&r);
 
@@ -310,138 +310,28 @@ pub(crate) fn cmd_resume(id: &str, harness: Option<String>, launch: bool, json: 
     Ok(())
 }
 
-/// What a launch must change in the caller's environment to address the selected store.
-#[derive(Default)]
-struct ResumeEnv {
-    set: std::collections::BTreeMap<String, String>,
-    /// Inherited variables that would select another store and have no equivalent value.
-    unset: Vec<&'static str>,
-}
-
 /// Select the source's native home, including an ID found in an extra root. Export files and
 /// child transcripts cannot be safely addressed with the native resume CLI.
-fn resume_environment(r: &cv_core::SessionRef, explicit_path: bool) -> Result<ResumeEnv> {
-    let mut env = ResumeEnv::default();
-    if matches!(resume_target(r.harness, &r.id), ResumeTarget::GuiOnly { .. })
-        || (!explicit_path && !matches!(r.harness, Harness::Claude | Harness::Codex))
-    {
-        return Ok(env);
+fn resume_environment(
+    r: &cv_core::SessionRef,
+    adapter: &dyn cv_core::Adapter,
+    explicit_path: bool,
+) -> Result<cv_core::harness::ResumeEnv> {
+    if matches!(resume_target(r.harness, &r.id), ResumeTarget::GuiOnly { .. }) {
+        return Ok(Default::default());
     }
-    let path = r
-        .path
-        .canonicalize()
-        .with_context(|| format!("reading resume source {}", r.path.display()))?;
-    if !native_resume_filename(r.harness, &path, &r.id) {
-        return usage(format!("cannot safely resume {} from {}: the native filename does not address session {}; restore its native filename or port the transcript into a supported store", r.harness, path.display(), r.id));
-    }
-    let selected = match r.harness {
-        Harness::Claude if !r.id.starts_with("agent-") && !r.id.ends_with(".flat") => claude_profile(&r.path, &path)
-            .map(|profile| match profile {
-                ClaudeProfile::Ambient => {}
-                ClaudeProfile::HomeDefault => env.unset.push("CLAUDE_CONFIG_DIR"),
-                ClaudeProfile::Dir(dir) => {
-                    env.set
-                        .insert("CLAUDE_CONFIG_DIR".into(), dir.to_string_lossy().into_owned());
-                }
-            }),
-        Harness::Codex => path
-            .ancestors()
-            .skip(1)
-            .find_map(|p| {
-                let relative = path.strip_prefix(p).ok()?;
-                let components: Vec<_> = relative.iter().collect();
-                let valid = if p.file_name().is_some_and(|n| n == "sessions") {
-                    components.len() == 4
-                        && components[..3].iter().zip([4, 2, 2]).all(|(s, len)| {
-                            s.to_str()
-                                .is_some_and(|s| s.len() == len && s.bytes().all(|c| c.is_ascii_digit()))
-                        })
-                } else {
-                    p.file_name().is_some_and(|n| n == "archived_sessions") && components.len() == 1
-                };
-                valid.then(|| p.parent()).flatten()
-            })
-            .map(|home| {
-                // Codex canonicalizes CODEX_HOME itself, and naming its default changes nothing.
-                env.set.insert("CODEX_HOME".into(), home.to_string_lossy().into_owned());
-            }),
-        _ => None,
+    let why = match adapter.resume_env(r) {
+        Some(Ok(env)) => return Ok(env),
+        Some(Err(why)) => why,
+        // No store selection for this harness: an ID resumes wherever its CLI looks.
+        None if !explicit_path => return Ok(Default::default()),
+        None => "no native store can be selected for this source; use the original harness/profile or port it into a supported native store".into(),
     };
-    if selected.is_none() {
-        return usage(format!("cannot safely resume {} from {}: no native store can be selected for this source; use the original harness/profile or port it into a supported native store", r.harness, path.display()));
-    }
-    Ok(env)
-}
-
-enum ClaudeProfile {
-    /// The caller's environment already reads this transcript's projects directory.
-    Ambient,
-    /// `~/.claude`, while the caller's `CLAUDE_CONFIG_DIR` names another directory.
-    HomeDefault,
-    Dir(std::path::PathBuf),
-}
-
-/// Which Claude config directory holds `<dir>/projects/<project>/<id>.jsonl`.
-///
-/// Claude Code treats "unset" and "set to `~/.claude`" as different profiles: with the variable
-/// set, `.claude.json` is read from inside the directory and the macOS keychain service gains a
-/// hash of the directory's spelling (2.1.325 `getGlobalClaudeFile` and the secure-storage service
-/// name). So the default profile is selected by leaving or making the variable unset, never by
-/// naming it, and another profile keeps the spelling it was selected with.
-fn claude_profile(selected: &Path, canonical: &Path) -> Option<ClaudeProfile> {
-    let projects = canonical.parent()?.parent()?;
-    let holds = |dir: &Path| dir.join("projects").canonicalize().is_ok_and(|p| p == projects);
-    let home_default = cv_core::env::home_dir().map(|home| home.join(".claude"));
-    let ambient = cv_core::env::var_os("CLAUDE_CONFIG_DIR")
-        .filter(|dir| !dir.is_empty())
-        .map(std::path::PathBuf::from);
-    if ambient.as_deref().or(home_default.as_deref()).is_some_and(holds) {
-        return Some(ClaudeProfile::Ambient);
-    }
-    if ambient.is_some() && home_default.as_deref().is_some_and(holds) {
-        return Some(ClaudeProfile::HomeDefault);
-    }
-    // The path as selected first: a symlinked `projects` has no config directory above its target.
-    let spelled = std::path::absolute(selected).ok();
-    let dir = [spelled.as_deref(), Some(canonical)]
-        .into_iter()
-        .flatten()
-        .find_map(|path| {
-            let dir = path.parent()?.parent()?;
-            (dir.file_name()? == "projects").then(|| dir.parent()).flatten()
-        })
-        .filter(|dir| holds(dir))
-        .map(Path::to_path_buf)?;
-    Some(ClaudeProfile::Dir(dir))
-}
-
-/// Native discovery must be able to find the file by the ID we pass to the harness.
-fn native_resume_filename(harness: Harness, path: &Path, id: &str) -> bool {
-    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-        return false;
-    };
-    match harness {
-        Harness::Claude => name == format!("{id}.jsonl"),
-        Harness::Codex => {
-            // Codex 0.169 RolloutFileName::parse: plain or native-compressed rollout,
-            // 19-character local timestamp, thread UUID, optional distinct rollout UUID.
-            // https://github.com/openai/codex/blob/rust-v0.169.0/codex-rs/rollout/src/rollout_file_name.rs
-            let name = name.strip_suffix(".zst").unwrap_or(name);
-            let Some(core) = name.strip_prefix("rollout-").and_then(|s| s.strip_suffix(".jsonl")) else {
-                return false;
-            };
-            let Some(stamp) = core.get(..19) else { return false };
-            if core.get(19..20) != Some("-")
-                || chrono::NaiveDateTime::parse_from_str(stamp, "%Y-%m-%dT%H-%M-%S").is_err()
-            {
-                return false;
-            }
-            let ids = &core[20..];
-            let (thread, rollout) = ids.split_once('_').unwrap_or((ids, ids));
-            thread == id && uuid::Uuid::parse_str(thread).is_ok() && uuid::Uuid::parse_str(rollout).is_ok()
-        }
-        _ => true,
-    }
+    usage(format!(
+        "cannot safely resume {} from {}: {why}",
+        r.harness,
+        r.path.display()
+    ))
 }
 
 fn resume_json(harness: Harness, id: &str, cwd: Option<&Path>, warning: Option<&str>) -> serde_json::Value {
@@ -606,29 +496,6 @@ mod context_tests {
         assert_eq!(copy_context_if_absent(&source, &destination).unwrap(), None);
         assert!(destination.is_symlink());
         assert!(!missing.exists());
-    }
-
-    #[test]
-    fn resume_filename_keeps_native_compressed_and_reverted_rollouts() {
-        let id = "11111111-2222-4333-8444-555555555555";
-        let rollout = "66666666-7777-4888-8999-aaaaaaaaaaaa";
-        for suffix in [
-            format!("{id}.jsonl"),
-            format!("{id}.jsonl.zst"),
-            format!("{id}_{rollout}.jsonl.zst"),
-        ] {
-            assert!(native_resume_filename(
-                Harness::Codex,
-                Path::new(&format!("rollout-2026-11-01T00-00-00-{suffix}")),
-                id
-            ));
-        }
-        assert!(!native_resume_filename(
-            Harness::Claude,
-            Path::new(&format!("{id}.jsonl.zst")),
-            id
-        ));
-        assert!(!native_resume_filename(Harness::Claude, Path::new("renamed.jsonl"), id));
     }
 
     #[test]

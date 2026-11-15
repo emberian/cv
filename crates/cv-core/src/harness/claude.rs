@@ -258,6 +258,61 @@ fn projects_dir(entry: PathBuf) -> Option<PathBuf> {
 }
 
 impl Adapter for Claude {
+    /// `claude --resume <id>` reads `<config dir>/projects/<project>/<id>.jsonl`.
+    ///
+    /// Claude Code treats "unset" and "set to `~/.claude`" as different profiles: with
+    /// `CLAUDE_CONFIG_DIR` set, `.claude.json` is read from inside the directory and the macOS
+    /// keychain service gains a hash of the directory's spelling (2.1.325 `getGlobalClaudeFile`
+    /// and the secure-storage service name). So the default profile is selected by leaving or
+    /// making the variable unset, never by naming it, and another profile keeps the spelling it
+    /// was selected with.
+    fn resume_env(&self, r: &SessionRef) -> Option<Result<super::ResumeEnv, String>> {
+        const NO_STORE: &str = "no native store can be selected for this source; use the original harness/profile or port it into a supported native store";
+        let Ok(canonical) = r.path.canonicalize() else {
+            return Some(Err(format!("{} cannot be read", r.path.display())));
+        };
+        if canonical.file_name().and_then(|n| n.to_str()) != Some(&format!("{}.jsonl", r.id)) {
+            return Some(Err(format!("the native filename does not address session {}; restore its native filename or port the transcript into a supported store", r.id)));
+        }
+        if r.id.starts_with("agent-") || r.id.ends_with(".flat") {
+            return Some(Err(NO_STORE.into()));
+        }
+        let Some(projects) = canonical.parent().and_then(Path::parent) else {
+            return Some(Err(NO_STORE.into()));
+        };
+        let holds = |dir: &Path| dir.join("projects").canonicalize().is_ok_and(|p| p == projects);
+        let home_default = crate::env::home_dir().map(|home| home.join(".claude"));
+        let ambient = crate::env::var_os("CLAUDE_CONFIG_DIR")
+            .filter(|dir| !dir.is_empty())
+            .map(PathBuf::from);
+        let mut env = super::ResumeEnv::default();
+        if ambient.as_deref().or(home_default.as_deref()).is_some_and(holds) {
+            return Some(Ok(env));
+        }
+        if ambient.is_some() && home_default.as_deref().is_some_and(holds) {
+            env.unset.push("CLAUDE_CONFIG_DIR");
+            return Some(Ok(env));
+        }
+        // The path as selected first: a symlinked `projects` has no config directory above its target.
+        let spelled = std::path::absolute(&r.path).ok();
+        let dir = [spelled.as_deref(), Some(canonical.as_path())]
+            .into_iter()
+            .flatten()
+            .find_map(|path| {
+                let dir = path.parent()?.parent()?;
+                (dir.file_name()? == "projects").then(|| dir.parent()).flatten()
+            })
+            .filter(|dir| holds(dir));
+        Some(match dir {
+            Some(dir) => {
+                env.set
+                    .insert("CLAUDE_CONFIG_DIR".into(), dir.to_string_lossy().into_owned());
+                Ok(env)
+            }
+            None => Err(NO_STORE.into()),
+        })
+    }
+
     fn lifecycle_body_required(&self) -> bool {
         true
     }
