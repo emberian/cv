@@ -769,6 +769,7 @@ pub(super) fn record(
         return Ok(Flow::Continue);
     };
     r.stamp(&mut msg);
+    contain_persisted_outputs(&mut msg, session.source_path.as_deref());
     // Keep the message model record-local; the session default is the first non-synthetic
     // model encountered in this read, so a window can have a different session default.
     if session.model.is_none() && msg.model.as_deref() != Some(SYNTHETIC_MODEL) {
@@ -1322,6 +1323,52 @@ fn block(item: JsonView<'_>, spans: bool) -> Result<Option<Block>> {
 }
 
 const PERSISTED: &str = "<persisted-output>";
+
+/// Replace each stub's claimed path, which [`block`] recorded as the transcript wrote it, with
+/// the file it names inside this transcript's store. Every turn passes through here before a
+/// sink sees it, so no reader is handed a path the transcript merely asserted.
+fn contain_persisted_outputs(msg: &mut Message, transcript: Option<&Path>) {
+    for block in &mut msg.content {
+        let Block::ToolResult {
+            details: Some(details), ..
+        } = block
+        else {
+            continue;
+        };
+        let Some(Value::Object(stub)) = details.get_mut(super::PERSISTED_OUTPUT_KEY) else {
+            continue;
+        };
+        let Some(Value::String(claimed)) = stub.remove("path") else {
+            continue;
+        };
+        let size = match stub.remove("size") {
+            Some(Value::String(size)) => Some(size),
+            _ => None,
+        };
+        let resolved = transcript.and_then(|transcript| spilled_output(transcript, &claimed));
+        details[super::PERSISTED_OUTPUT_KEY] = Block::persisted_output(resolved, &claimed, size);
+    }
+}
+
+/// The file a stub's `<...>/<session>/tool-results/<file>` names in the store `transcript` is in.
+/// Claude Code spills a session's oversized outputs there, and a resumed or forked session keeps
+/// stubs that name the session it came from, in this project or another. The claim is resolved
+/// by those names beside the transcript, so a store copied elsewhere still finds its files, and
+/// nothing of any other shape is a persisted output.
+fn spilled_output(transcript: &Path, claimed: &str) -> Option<PathBuf> {
+    // `<project>/<sid>.jsonl`, or a sub-agent's `<project>/<sid>/subagents/...`.
+    let project = transcript
+        .ancestors()
+        .find(|dir| dir.file_name().is_some_and(|name| name == "subagents"))
+        .and_then(|subagents| subagents.parent()?.parent())
+        .or_else(|| transcript.parent())?;
+    let shaped = |scope: &Path, below: usize| {
+        let path = crate::source::contained_sidecar(scope, claimed)?;
+        let inside: Vec<_> = path.strip_prefix(scope).ok()?.components().collect();
+        (inside.len() == below && inside[below - 2].as_os_str() == "tool-results").then_some(path)
+    };
+    shaped(project, 3).or_else(|| shaped(project.parent()?, 4))
+}
 
 /// The usage counters of a `message.usage` object; anything else counts nothing.
 fn parse_usage(v: JsonView<'_>) -> Result<Usage> {

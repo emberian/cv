@@ -1187,6 +1187,38 @@ fn store_files(adapter: &dyn crate::harness::Adapter, store: &Path) -> Vec<PathB
         .collect()
 }
 
+/// Where a file a transcript points at lives inside `scope`, the directory its harness keeps that
+/// session's files in; `None` when the pointer does not name a file there.
+///
+/// The pointer is text from the transcript: a tool result can say anything, so a path it names
+/// is never opened as written. One inside `scope` is accepted. Any other is re-rooted at its last
+/// component named like `scope`, which also finds the file beside a store that was copied or
+/// mirrored to another root. `..`, control characters and over-long names never resolve.
+pub fn contained_sidecar(scope: &Path, pointer: &str) -> Option<PathBuf> {
+    use std::path::Component;
+    const MAX_POINTER_BYTES: usize = 4096;
+    const MAX_NAME_BYTES: usize = 255;
+    if pointer.is_empty() || pointer.len() > MAX_POINTER_BYTES || pointer.chars().any(char::is_control) {
+        return None;
+    }
+    let pointer = Path::new(pointer);
+    let mut names = Vec::new();
+    for component in pointer.components() {
+        match component {
+            Component::Normal(name) if name.len() <= MAX_NAME_BYTES => names.push(name),
+            Component::Normal(_) | Component::ParentDir => return None,
+            Component::RootDir | Component::Prefix(_) | Component::CurDir => {}
+        }
+    }
+    if let Ok(inside) = pointer.strip_prefix(scope) {
+        return (!inside.as_os_str().is_empty()).then(|| scope.join(inside));
+    }
+    let scope_name = scope.file_name()?;
+    let at = names.iter().rposition(|name| *name == scope_name)?;
+    let inside: PathBuf = names[at + 1..].iter().collect();
+    (!inside.as_os_str().is_empty()).then(|| scope.join(inside))
+}
+
 /// The built-in adapter's actual append file, which may differ from a directory session key.
 pub fn primary_path(r: &SessionRef) -> PathBuf {
     crate::harness::for_harness(r.harness).map_or_else(|| r.path.clone(), |adapter| adapter.resume_source(r))
@@ -2342,5 +2374,39 @@ mod tests {
 
         std::fs::remove_dir_all(&grok_dir).unwrap();
         assert_eq!(super::ref_size(&r_grok), None);
+    }
+}
+
+#[cfg(test)]
+mod sidecar_tests {
+    use super::contained_sidecar;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn a_pointer_resolves_inside_its_scope_or_not_at_all() {
+        let scope = Path::new("/store/sessions/abc");
+        let inside = |pointer: &str| contained_sidecar(scope, pointer);
+        assert_eq!(
+            inside("/store/sessions/abc/out/1.txt"),
+            Some(PathBuf::from("/store/sessions/abc/out/1.txt"))
+        );
+        // Written under another root: found beside this copy, at the last component so named.
+        assert_eq!(
+            inside("/Users/u/abc/x/abc/out/1.txt"),
+            Some(PathBuf::from("/store/sessions/abc/out/1.txt"))
+        );
+        for refused in [
+            "",
+            "/store/sessions/abc",
+            "/store/sessions/abcd/out/1.txt",
+            "/store/sessions/other/out/1.txt",
+            "/store/sessions/abc/out/../../../../etc/passwd",
+            "/store/sessions/abc/out/1.txt\n/etc/passwd",
+            "/etc/passwd",
+        ] {
+            assert_eq!(inside(refused), None, "{refused:?}");
+        }
+        assert_eq!(inside(&format!("/store/sessions/abc/{}", "n".repeat(256))), None);
+        assert_eq!(inside(&format!("/store/sessions/abc/{}", "d/".repeat(2100))), None);
     }
 }

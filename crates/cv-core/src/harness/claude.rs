@@ -1829,12 +1829,13 @@ mod tests {
     fn persisted_output_stubs_are_annotated() {
         // A too-large tool output goes to `<session>/tool-results/<id>.txt`; the transcript (and the
         // model) get only this stub. The stub stays the content; the path rides in `details`.
-        let stub = "<persisted-output>\nOutput too large (66KB). Full output saved to: /tmp/proj/sess/tool-results/bgz.txt\n\nPreview (first 2KB):\nhello\n</persisted-output>";
+        let stub = "<persisted-output>\nOutput too large (66KB). Full output saved to: /Users/u/.claude/projects/proj/s1/tool-results/bgz.txt\n\nPreview (first 2KB):\nhello\n</persisted-output>";
         let line = serde_json::json!({"type":"user","sessionId":"s1","uuid":"u1","timestamp":"2026-09-19T00:00:00Z",
             "message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":stub}]}})
         .to_string();
         let mut sink = CollectSink::default();
-        stream_str("s1", &line, None, &Demand::LEAN, &mut sink);
+        let transcript = PathBuf::from("/Users/u/.claude/projects/proj/s1.jsonl");
+        stream_str("s1", &line, Some(transcript), &Demand::LEAN, &mut sink);
         let Block::ToolResult { content, details, .. } = &sink.messages[0].content[0] else {
             panic!("expected a tool result");
         };
@@ -1843,7 +1844,10 @@ mod tests {
             "the stub — what the model saw — stays the content"
         );
         let d = details.as_ref().expect("persisted output recorded");
-        assert_eq!(d["persistedOutput"]["path"], "/tmp/proj/sess/tool-results/bgz.txt");
+        assert_eq!(
+            d["persistedOutput"]["path"],
+            "/Users/u/.claude/projects/proj/s1/tool-results/bgz.txt"
+        );
         assert_eq!(d["persistedOutput"]["size"], "66KB");
         // an ordinary result carries no details
         let plain = serde_json::json!({"type":"user","sessionId":"s1","uuid":"u2","timestamp":"2026-09-19T00:00:00Z",
@@ -1963,6 +1967,64 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// The stub is text a tool printed, so the path in it is a claim. Only a file of the shape
+    /// Claude Code spills to, inside the store the transcript is in, becomes a readable pointer.
+    #[test]
+    fn persisted_output_claims_resolve_only_inside_the_transcripts_store() {
+        let read = |transcript: Option<&str>, claimed: &str| {
+            let stub = format!("<persisted-output>\nOutput too large (1KB). Full output saved to: {claimed}\n\nPreview (first 2KB):\nx\n</persisted-output>");
+            let line =
+                serde_json::json!({"type":"user","sessionId":"s1","uuid":"u1","timestamp":"2026-09-19T00:00:00Z",
+                "message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":stub}]}})
+                .to_string();
+            let s = parse_str("s1", &line, transcript.map(PathBuf::from));
+            let d = details(&s.messages[0])[PERSISTED_OUTPUT_KEY].clone();
+            (
+                s.messages[0].content[0].persisted_output_path().map(str::to_owned),
+                d["unresolved"].as_str().map(str::to_owned),
+            )
+        };
+        let root = "/home/u/.claude/projects/-work-app/s1.jsonl";
+        let agent = "/home/u/.claude/projects/-work-app/s1/subagents/workflows/wf/agent-a.jsonl";
+        let own = "/home/u/.claude/projects/-work-app/s1/tool-results/a.txt";
+        for transcript in [root, agent] {
+            assert_eq!(read(Some(transcript), own).0.as_deref(), Some(own), "{transcript}");
+        }
+        // A resumed or forked session keeps stubs naming the session it came from.
+        let earlier = "/home/u/.claude/projects/-work-app/s0/tool-results/a.txt";
+        assert_eq!(read(Some(root), earlier).0.as_deref(), Some(earlier));
+        let elsewhere = "/home/u/.claude/projects/-work-lib/s9/tool-results/a.txt";
+        assert_eq!(read(Some(root), elsewhere).0.as_deref(), Some(elsewhere));
+        // A store copied to another machine or root finds the file beside the copy.
+        assert_eq!(
+            read(Some("/mirror/host-a/projects/-work-app/s1.jsonl"), own)
+                .0
+                .as_deref(),
+            Some("/mirror/host-a/projects/-work-app/s1/tool-results/a.txt")
+        );
+
+        for outside in [
+            "/home/u/.ssh/id_ed25519",
+            "/home/u/.claude/projects/-work-app/s1.jsonl",
+            "/home/u/.claude/projects/-work-app/s1/tool-results/../../../../../.ssh/id_ed25519",
+            "/home/u/.claude/projects/-work-app/s1/tool-results/deeper/a.txt",
+            "/home/u/.claude/projects/-work-app/s1/notes/a.txt",
+            "/etc/tool-results/passwd",
+            "relative/tool-results/a.txt",
+        ] {
+            let (path, unresolved) = read(Some(root), outside);
+            assert_eq!(path, None, "{outside} must not become a readable pointer");
+            assert_eq!(unresolved.as_deref(), Some(outside));
+        }
+        // A read with no file behind it has no store to resolve in.
+        assert_eq!(read(None, own), (None, Some(own.to_owned())));
+        // A transcript tail mistaken for a path is neither opened nor echoed whole.
+        let tail = format!("/home/u/{}", "x".repeat(5000));
+        let (path, unresolved) = read(Some(root), &tail);
+        assert_eq!(path, None);
+        assert_eq!(unresolved.unwrap().chars().count(), 300);
+    }
+
     #[test]
     fn persisted_output_pointer_rides_alongside_the_sidecar() {
         // cv's derived `persistedOutput` pointer and Claude's own sidecar must BOTH survive on the
@@ -1975,7 +2037,7 @@ mod tests {
         let scalar = serde_json::json!({"type":"user","sessionId":"s1","uuid":"u2","timestamp":"2026-09-19T00:00:01Z",
             "toolUseResult":"Error: Exit code 64",
             "message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t2","content":stub,"is_error":true}]}});
-        let s = parse_str("s1", &format!("{obj}\n{scalar}\n"), None);
+        let s = parse_str("s", &format!("{obj}\n{scalar}\n"), Some(PathBuf::from("/tmp/s.jsonl")));
 
         let d = details(&s.messages[0]);
         assert_eq!(d["stdout"], "hi", "the sidecar survives");

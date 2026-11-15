@@ -1064,11 +1064,32 @@ impl Block {
     /// For a tool result whose real output was too large for the transcript and went to a file
     /// (Claude Code's `<persisted-output>` stub → `<session>/tool-results/<id>.txt`): where that
     /// file lives. The block's `content` is the stub the model saw; this is the rest.
+    ///
+    /// The path is always inside the session's own store: adapters resolve the transcript's
+    /// claim with [`crate::source::contained_sidecar`] and record it through
+    /// [`Block::persisted_output`]. Readers may open it as it stands.
     pub fn persisted_output_path(&self) -> Option<&str> {
         match self {
             Block::ToolResult { details: Some(d), .. } => d.pointer("/persistedOutput/path")?.as_str(),
             _ => None,
         }
+    }
+
+    /// The `details.persistedOutput` an adapter records for a spilled tool output the transcript
+    /// says is at `claimed`. `resolved` is where the adapter found that file inside the session's
+    /// own store ([`crate::source::contained_sidecar`]), recorded as `path`. A claim that names
+    /// no such file is kept as `unresolved` text, which no reader opens.
+    pub fn persisted_output(resolved: Option<PathBuf>, claimed: &str, size: Option<String>) -> serde_json::Value {
+        const SHOWN: usize = 300;
+        let mut out = serde_json::Map::new();
+        match resolved {
+            Some(path) => out.insert("path".into(), path.to_string_lossy().into_owned().into()),
+            None => out.insert("unresolved".into(), truncate(claimed, SHOWN).into()),
+        };
+        if let Some(size) = size {
+            out.insert("size".into(), size.into());
+        }
+        serde_json::Value::Object(out)
     }
 }
 

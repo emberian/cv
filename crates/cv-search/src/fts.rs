@@ -6026,12 +6026,61 @@ mod tests {
         );
     }
 
+    /// A tool result can print anything, including a stub that names a private file. Only a file
+    /// Claude Code would have spilled for a session of this store is read into the index; a
+    /// forged claim is neither indexed nor a reason to fail the session.
+    #[test]
+    fn a_stub_naming_a_file_outside_the_store_is_not_read_into_the_index() {
+        let _home = IsolatedHome::new();
+        let (dir, sdir, private) = (tmpdir(), tmpdir(), tmpdir());
+        let secret = private.join("credentials");
+        std::fs::write(&secret, "zqprivatetoken").unwrap();
+        let spilled = sdir.join("forged").join("tool-results").join("real.txt");
+        std::fs::create_dir_all(spilled.parent().unwrap()).unwrap();
+        std::fs::write(&spilled, "zqspilledword").unwrap();
+        let stub = |path: &str| {
+            format!("<persisted-output>\nOutput too large (1KB). Full output saved to: {path}\n\nPreview (first 2KB):\nzqpreview\n</persisted-output>")
+        };
+        let result = |uuid: &str, content: String| {
+            serde_json::json!({"type":"user","uuid":uuid,"sessionId":"forged",
+                "message":{"role":"user","content":[{"type":"tool_result","tool_use_id":uuid,"content":content}]}})
+        };
+        let long_tail = format!("{}/{}", sdir.display(), "t".repeat(9000));
+        let lines = [
+            result("u1", stub(&secret.to_string_lossy())),
+            result(
+                "u2",
+                stub(&format!(
+                    "{}/forged/tool-results/../../../{}",
+                    sdir.display(),
+                    secret.display()
+                )),
+            ),
+            result("u3", stub(&long_tail)),
+            result("u4", stub(&spilled.to_string_lossy())),
+        ];
+        let path = sdir.join("forged.jsonl");
+        std::fs::write(&path, lines.iter().map(|l| format!("{l}\n")).collect::<String>()).unwrap();
+        let swept = sweep(
+            &dir,
+            vec![sref("forged", "forged", path.to_string_lossy().into_owned())],
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!((swept.changed, swept.errors), (1, 0));
+        assert_eq!(text_search(&dir, "zqspilledword", 10).unwrap().len(), 1);
+        assert_eq!(text_search(&dir, "zqpreview", 10).unwrap().len(), 1);
+        assert!(text_search(&dir, "zqprivatetoken", 10).unwrap().is_empty());
+    }
+
     #[test]
     fn adopted_output_read_sets_invalidate_search_and_survive_resume() {
         let _home = IsolatedHome::new();
-        let (dir, sdir, external) = (tmpdir(), tmpdir(), tmpdir());
+        let (dir, sdir) = (tmpdir(), tmpdir());
         // Adoption retains an absolute pointer into a different parent's directory.
-        let file = external.join("output.txt");
+        let file = sdir.join("first-parent").join("tool-results").join("output.txt");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         let stub = format!(
             "<persisted-output>\nFull output saved to: {}\n\nPreview (first 2KB):\npreview\n</persisted-output>",
             file.display()
@@ -9370,7 +9419,7 @@ mod tests {
     fn an_unreadable_persisted_output_fails_publication_and_retries_after_repair() {
         let _home = IsolatedHome::new();
         let (dir, sdir) = (tmpdir(), tmpdir());
-        let output = sdir.join("tool-results").join("big.txt");
+        let output = sdir.join("s").join("tool-results").join("big.txt");
         std::fs::create_dir_all(output.parent().unwrap()).unwrap();
         std::fs::create_dir(&output).unwrap();
         let stub = format!(

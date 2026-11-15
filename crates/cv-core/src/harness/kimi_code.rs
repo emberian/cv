@@ -334,6 +334,10 @@ impl Adapter for KimiCode {
                 },
                 _ => Ctx::new(opts),
             };
+            let ctx = Ctx {
+                sidecars: Some(split_agent_path(&r.path).0.join("agents")),
+                ..ctx
+            };
             let (s, wire) = session_header(r);
             if let Start::Checkpoint(cp) = from {
                 if fs::metadata(&wire)?.len() < cp.offset {
@@ -477,6 +481,7 @@ impl SavedCtx {
             native_subagents: self.native_subagents,
             facts,
             stopped: false,
+            sidecars: None,
         }
     }
 }
@@ -954,6 +959,10 @@ struct Ctx<'a> {
     facts: Map<String, Value>,
     #[serde(skip)]
     stopped: bool,
+    /// The session's `agents` directory, which an `output_path:` line is resolved inside;
+    /// `None` reads no file.
+    #[serde(skip)]
+    sidecars: Option<PathBuf>,
 }
 
 impl<'a> Ctx<'a> {
@@ -968,6 +977,7 @@ impl<'a> Ctx<'a> {
             native_subagents: false,
             facts: Map::new(),
             stopped: false,
+            sidecars: None,
         }
     }
     fn init_model(&mut self, initial: Option<&str>) {
@@ -1305,8 +1315,17 @@ impl<'a> Ctx<'a> {
                 details.insert("truncated".into(), Value::Bool(true));
             }
         }
-        if let Some(path) = path {
-            details.insert("persistedOutput".into(), serde_json::json!({"path":path}));
+        if let Some(claimed) = path {
+            // `<session>/agents/<agent>/tool-results/<file>`, resolved inside this session only.
+            let resolved = self.sidecars.as_deref().and_then(|agents| {
+                let path = crate::source::contained_sidecar(agents, &claimed)?;
+                let inside: Vec<_> = path.strip_prefix(agents).ok()?.components().collect();
+                (inside.len() == 3 && inside[1].as_os_str() == "tool-results").then_some(path)
+            });
+            details.insert(
+                "persistedOutput".into(),
+                Block::persisted_output(resolved, &claimed, None),
+            );
         }
         let mut message = Message::of_kind(Role::Tool, MessageKind::ToolResult, Origin::Harness);
         if !self.native_subagents
@@ -3213,9 +3232,13 @@ mod tests {
         assert!(is_error);
         let d = details.as_ref().unwrap();
         assert_eq!(d["truncated"], true);
+        // The wire names the file where the writer's machine had it; it is read beside this store.
         assert_eq!(
             d["persistedOutput"]["path"],
-            "/Users/u/.kimi-code/sessions/x/agents/main/tool-results/Bash-tool_B-abc.txt"
+            r.path
+                .join("agents/main/tool-results/Bash-tool_B-abc.txt")
+                .to_string_lossy()
+                .as_ref()
         );
         assert_eq!(
             s.messages[3].timestamp.map(|t| t.timestamp_millis()),

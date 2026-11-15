@@ -96,6 +96,14 @@ fn print_result(
                     return Ok(());
                 }
                 eprintln!("⚠ persisted output {p} is missing — printing the transcript's stub instead");
+            } else if let Some(claimed) = details
+                .as_ref()
+                .and_then(|d| d.pointer("/persistedOutput/unresolved"))
+                .and_then(|v| v.as_str())
+            {
+                eprintln!(
+                    "⚠ the transcript says the full output is at {claimed}, which is not a file in this session's store — printing the stub instead"
+                );
             }
             let text = content
                 .try_resolve(&resolver)

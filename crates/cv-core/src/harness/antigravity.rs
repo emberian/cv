@@ -1906,10 +1906,12 @@ impl StepCodec {
                     .and_then(|uri| file_uri_to_path(&uri))
                     .map(|path| path.to_string_lossy().into_owned())
                     .or_else(|| extract_persisted_output_path(&head));
-                let details = persisted.map(|path| {
-                    json!({
-                        "persistedOutput": { "path": path }
-                    })
+                let details = persisted.map(|claimed| {
+                    let resolved = self
+                        .source_path
+                        .as_deref()
+                        .and_then(|transcript| spilled_output(transcript, &claimed));
+                    json!({ "persistedOutput": Block::persisted_output(resolved, &claimed, None) })
                 });
 
                 if matches!(tool_name.as_deref(), Some("invoke_subagent")) {
@@ -2303,6 +2305,19 @@ fn peek_view_prefix(view: JsonView<'_>, max_bytes: usize) -> Result<String> {
 // ---------------------------------------------------------------------------
 // Text & sidecar parsing helpers
 // ---------------------------------------------------------------------------
+
+/// The file a truncation notice names, inside the conversation it belongs to. Antigravity spills
+/// a step's full output under `brain/<id>/.system_generated/`; a claim is resolved against this
+/// conversation's directory, or a sibling conversation's by the same shape, and nowhere else.
+fn spilled_output(transcript: &Path, claimed: &str) -> Option<PathBuf> {
+    let brain_dir = BrainLoc::from_transcript(transcript)?.brain_dir;
+    let generated = |scope: &Path, at: usize| {
+        let path = crate::source::contained_sidecar(scope, claimed)?;
+        let mut inside = path.strip_prefix(scope).ok()?.components();
+        (inside.nth(at)?.as_os_str() == ".system_generated" && inside.next().is_some()).then_some(path)
+    };
+    generated(&brain_dir, 0).or_else(|| generated(brain_dir.parent()?, 1))
+}
 
 fn extract_persisted_output_path(head: &str) -> Option<String> {
     // A tool can read another transcript containing this notice as escaped JSON.
@@ -3264,17 +3279,35 @@ mod tests {
 
     #[test]
     fn persisted_output_notices_ignore_quoted_transcripts() {
-        let path = "/workspace/demo/.system_generated/steps/229/output.txt";
+        let transcript = PathBuf::from(format!(
+            "/store/brain/{PARENT_ID}/.system_generated/logs/transcript_full.jsonl"
+        ));
+        let claimed =
+            format!("/Users/u/.gemini/antigravity-cli/brain/{PARENT_ID}/.system_generated/steps/229/output.txt");
+        let resolved = format!("/store/brain/{PARENT_ID}/.system_generated/steps/229/output.txt");
+        let (path, resolved) = (claimed.as_str(), resolved.as_str());
         let notice = format!(
             "The tool's output was truncated due to being too long. You can find the full output in a file at file://{path}.\n\nHere is a preview with the middle of the output truncated:\npreview"
         );
         let quoted = serde_json::to_string(&json!({"content": notice})).unwrap();
         for (body, expected) in [
-            (notice.clone(), Some(path)),
-            (format!("Created At: today\nCompleted At: today\n{notice}"), Some(path)),
+            (notice.clone(), Some(resolved)),
+            (
+                format!("Created At: today\nCompleted At: today\n{notice}"),
+                Some(resolved),
+            ),
             (
                 format!("<SYSTEM_MESSAGE>\nTask finished with result:\n{notice}\n</SYSTEM_MESSAGE>"),
-                Some(path),
+                Some(resolved),
+            ),
+            // A notice naming a file outside the conversation's directory is not a pointer.
+            (notice.replace(path, "/Users/u/.ssh/id_ed25519"), None),
+            (
+                notice.replace(
+                    path,
+                    &format!("/Users/u/.gemini/antigravity-cli/brain/{PARENT_ID}/notes.md"),
+                ),
+                None,
             ),
             (format!("File Path: transcript.jsonl\n{quoted}"), None),
             (
@@ -3293,7 +3326,7 @@ mod tests {
                 "content": body
             }))
             .unwrap();
-            let session = parse_str(PARENT_ID, &jsonl, None).unwrap();
+            let session = parse_str(PARENT_ID, &jsonl, Some(transcript.clone())).unwrap();
             assert_eq!(session.messages[0].content[0].persisted_output_path(), expected);
         }
     }
@@ -3415,10 +3448,15 @@ mod tests {
             (Some(1200), Some(400), Some(95))
         );
 
-        // Step 3: Truncated output path extracted
+        // Step 3: the truncation notice's path is extracted; with no store behind this read it
+        // stays a claim no reader opens.
+        assert_eq!(s.messages[2].content[0].persisted_output_path(), None);
+        let Block::ToolResult { details: Some(d), .. } = &s.messages[2].content[0] else {
+            panic!("expected a tool result with details");
+        };
         assert_eq!(
-            s.messages[2].content[0].persisted_output_path(),
-            Some("/workspace/demo/.system_generated/steps/3/output.txt")
+            d["persistedOutput"]["unresolved"],
+            "/workspace/demo/.system_generated/steps/3/output.txt"
         );
 
         // Step 4: Permission denial surfaces via Affordance

@@ -32,8 +32,9 @@ pub enum PersistedHead {
     /// No file at the path: the output was never kept, or was cleaned up.
     Absent,
     Text(String),
-    /// The file exists but cannot be read here (permissions, not a regular file): a session that
-    /// references it degrades to its transcript, the reason noted, rather than failing.
+    /// The file exists but cannot be read here (permissions, not a regular file). An index pass
+    /// fails the session and retries it, so a partial index is never published as whole; a live
+    /// snippet notes the reason and shows the transcript.
     Unreadable(String),
 }
 
