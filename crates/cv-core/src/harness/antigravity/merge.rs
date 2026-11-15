@@ -35,6 +35,9 @@ pub(super) struct Verified {
     pub native_only: StepOrder,
     /// A native step the export lacks could not be placed beside verified history.
     pub unreconciled: bool,
+    /// Verified exported steps whose linked media file is gone while the store kept
+    /// the bytes: each is read from its native row (it is in `native_only`).
+    pub recovered_media: BTreeSet<u64>,
 }
 
 const HEAD: usize = 32;
@@ -348,8 +351,22 @@ pub(super) fn verified(
     let mut known_calls = BTreeSet::new();
     let mut native_only = StepOrder::default();
     let mut native_records = native.records();
+    let mut recovered_media = BTreeSet::new();
+    for index in &order.missing_media {
+        let Some(step) = steps.get(index).filter(|_| verdicts.get(index) == Some(&true)) else {
+            continue;
+        };
+        let kept = native_records.read(step.at, step.end - step.at, |view| {
+            let media = view.get("media")?.map(JsonView::array).transpose()?.flatten();
+            Ok(view.get("native_missing_attachments")?.is_none()
+                && media.is_some_and(|mut items| items.next().is_some()))
+        })?;
+        if kept {
+            recovered_media.insert(*index);
+        }
+    }
     for (index, step) in &steps {
-        if accepted.contains(index) {
+        if accepted.contains(index) || recovered_media.contains(index) {
             native.snapshot(step.at, step.end, |line| {
                 native_only.ingest(&line)?;
                 Ok(Flow::Continue)
@@ -415,6 +432,7 @@ pub(super) fn verified(
         native,
         native_only,
         unreconciled,
+        recovered_media,
     })
 }
 

@@ -729,6 +729,9 @@ impl Adapter for Antigravity {
                                     .insert(crate::coverage::ReadCoverage::UNSUPPORTED_NATIVE_FIELDS.into());
                             }
                             codec.enrich.verified = verified.matches;
+                            for index in &verified.recovered_media {
+                                order.missing_media.remove(index);
+                            }
                             if verified.unreconciled {
                                 order
                                     .coverage
@@ -744,6 +747,12 @@ impl Adapter for Antigravity {
                         }
                     }
                 }
+            }
+            if !order.missing_media.is_empty() {
+                order
+                    .coverage
+                    .limitations
+                    .insert(crate::coverage::ReadCoverage::MISSING_ATTACHMENTS.into());
             }
             if order.coverage.sources.is_empty() {
                 order.coverage.sources.insert(
@@ -972,10 +981,13 @@ struct StepOrder {
     coverage: crate::coverage::ReadCoverage,
     /// Reading a store on this machine: an exported media path can be checked.
     local: bool,
+    /// Exported steps that link a media file which is no longer there.
+    missing_media: BTreeSet<u64>,
 }
 impl StepOrder {
     fn ingest(&mut self, line: &jsonl::Line<'_>) -> Result<()> {
         use crate::coverage::ReadCoverage;
+        let mut missing_media = false;
         if let Some(view) = line.view {
             if view.get("native_store")?.is_some() {
                 self.coverage.sources.insert(ReadCoverage::NATIVE_STORE.into());
@@ -1002,11 +1014,7 @@ impl StepOrder {
                                 continue;
                             };
                             let uri = peek_view_prefix(uri, 4097)?;
-                            if uri.len() <= 4096 && attachment_missing(&uri) {
-                                self.coverage
-                                    .limitations
-                                    .insert(ReadCoverage::MISSING_ATTACHMENTS.into());
-                            }
+                            missing_media |= uri.len() <= 4096 && attachment_missing(&uri);
                         }
                     }
                 }
@@ -1042,6 +1050,12 @@ impl StepOrder {
             .flatten();
         if let Some(index) = index {
             self.steps.insert(index, (line.at, line.end));
+            // The last revision of a step decides.
+            if missing_media {
+                self.missing_media.insert(index);
+            } else {
+                self.missing_media.remove(&index);
+            }
         } else {
             self.skipped += u64::from(!line.blank);
         }

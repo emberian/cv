@@ -886,3 +886,62 @@ fn a_resumed_conversation_is_titled_by_its_first_prompt_in_both_layouts() {
         }
     }
 }
+
+/// The capture keeps only the store. Its exported layout is rebuilt here the way the writer
+/// renders the first prompt: the request in its envelope, the upload as a linked file.
+#[test]
+fn an_exported_prompt_whose_upload_is_gone_reads_the_image_the_store_kept() {
+    let world = world("agy-writer-media-exported");
+    let root = store(&world, "1.5.9-prompt-media", false);
+    let (_, native_only) = only(sessions(&root));
+    let steps = stored(&root, &native_only.id);
+    let media = nested(nested(&steps[0].payload, 19)[0], 9);
+    let upload = string(media[0], 5).unwrap();
+    assert!(!Path::new(upload.trim_start_matches("file://")).exists());
+    // Step.metadata(5).created_at(1).seconds(1), a varint.
+    let created = nested(nested(&steps[0].payload, 5)[0], 1)[0];
+    assert_eq!(created[0], 8);
+    let seconds = varint(created, &mut 1) as i64;
+    let stamp = chrono::DateTime::from_timestamp(seconds, 0).unwrap().to_rfc3339();
+    let record = json!({
+        "step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "status": "DONE",
+        "created_at": stamp,
+        "content": "<USER_REQUEST>\ninline-image fixture prompt\n</USER_REQUEST>",
+        "media": [{"mime_type": "image/png", "uri": upload}],
+    });
+    let logs = root.join("brain").join(&native_only.id).join(".system_generated/logs");
+    fs::create_dir_all(&logs).unwrap();
+    fs::write(logs.join("transcript_full.jsonl"), format!("{record}\n")).unwrap();
+
+    let (reference, session) = only(sessions(&root));
+    assert!(reference.path.ends_with("transcript_full.jsonl"));
+    let prompt = by_id(&session, 0);
+    assert_eq!(body(&session, prompt), "inline-image fixture prompt");
+    let images: Vec<_> = prompt
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            Block::Image { media_type, data_ref } => Some((media_type.as_deref(), data_ref.as_deref())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(images, [(Some("image/png"), Some(PIXEL))]);
+    assert!(!limitations(&session).contains(&"missing_attachments".to_owned()));
+    assert_eq!(
+        ids(&session),
+        ids(&native_only),
+        "both layouts describe one conversation"
+    );
+
+    // An export that is another revision of the prompt keeps its own link and says so.
+    let record = json!({
+        "step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "status": "DONE",
+        "created_at": stamp,
+        "content": "<USER_REQUEST>\na different request\n</USER_REQUEST>",
+        "media": [{"mime_type": "image/png", "uri": upload}],
+    });
+    fs::write(logs.join("transcript_full.jsonl"), format!("{record}\n")).unwrap();
+    let (_, session) = only(sessions(&root));
+    assert!(body(&session, by_id(&session, 0)).contains("a different request"));
+    assert!(limitations(&session).contains(&"missing_attachments".to_owned()));
+}
