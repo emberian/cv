@@ -1309,3 +1309,54 @@ fn hub_v7_epoch_supersedes_pre_upgrade_v4_epoch_on_untimestamped_delete_in_any_a
         std::fs::remove_dir_all(&dir).ok();
     }
 }
+
+#[test]
+fn frozen_checkpoint_connection_remains_a_snapshot_after_later_writes() {
+    let base = tmp_state_dir("frozen-checkpoint-lifetime");
+    let store = StateStore::at_dir(&base);
+    store.append("before", "before", &json!({})).unwrap();
+    let conn = {
+        let _frozen = crate::env::Env::default().with_frozen().enter();
+        store.open_readonly().unwrap().unwrap()
+    };
+    store.append("after", "after", &json!({})).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT count(*) FROM capture_inbox", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 1, "a frozen connection must not follow later checkpoints");
+    drop(conn);
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn private_state_snapshot_retries_changed_wal_and_refuses_an_unstable_final_copy() {
+    let base = tmp_state_dir("frozen-copy-retry");
+    let store = StateStore::at_dir(&base);
+    let writer = store.open_writable().unwrap();
+    store.append("before", "before", &json!({})).unwrap();
+    let mut attempts = 0;
+    let conn = super::open_private_folded_copy_with_check(&store.db_path, || {
+        attempts += 1;
+        if attempts == 1 {
+            store.append("after", "after", &json!({})).unwrap();
+        }
+    })
+    .unwrap();
+    assert_eq!(attempts, 2);
+    let count: i64 = conn
+        .query_row("SELECT count(*) FROM capture_inbox", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 2, "retry must include the newer WAL commit");
+    drop(conn);
+
+    let mut attempts = 0;
+    let result = super::open_private_folded_copy_with_check(&store.db_path, || {
+        attempts += 1;
+        let id = format!("racing-{attempts}");
+        store.append(&id, &id, &json!({})).unwrap();
+    });
+    assert!(result.is_err(), "the final retry must not accept changing source files");
+    assert_eq!(attempts, 4);
+    drop(writer);
+    std::fs::remove_dir_all(base).unwrap();
+}

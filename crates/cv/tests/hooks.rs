@@ -430,6 +430,14 @@ fn each_hook_answers_the_docs_payload_for_its_event() {
         "{reason}"
     );
     assert!(reason.contains("`cv show alphases --last 10`"), "{reason}");
+    let frozen = hook(
+        &w,
+        "edit",
+        &edit("hooksess", "/work/proj/src/widget.rs"),
+        &[("CV_FROZEN", "1")],
+    );
+    let frozen: serde_json::Value = serde_json::from_str(&frozen).unwrap();
+    assert_eq!(frozen["hookSpecificOutput"]["permissionDecision"], "ask");
     // A relative path resolves against the hook's cwd.
     let out = hook(&w, "edit", &edit("hooksess", "src/widget.rs"), &[]);
     assert!(out.contains("\"ask\""), "{out}");
@@ -450,6 +458,9 @@ fn each_hook_answers_the_docs_payload_for_its_event() {
             "tool_name": "apply_patch", "tool_input": {"command": "*** Begin Patch\n*** Add File: src/untracked.rs\n+new\n*** Update File: src/widget.rs\n@@\n-a\n+b\n*** End Patch"}
         }),
     );
+    let frozen = codex_hook(&w, "edit", &codex_patch, &[("CV_FROZEN", "1")]);
+    let frozen: serde_json::Value = serde_json::from_str(&frozen).unwrap();
+    assert_eq!(frozen["hookSpecificOutput"]["permissionDecision"], "deny");
     let out = codex_hook(&w, "edit", &codex_patch, &[]);
     let output: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(output["hookSpecificOutput"]["permissionDecision"], "deny");
@@ -1329,4 +1340,51 @@ fn hooks_fail_open_on_corrupt_store_unknown_harness_and_other_harnesses() {
         &[("CV_FROZEN", "1"), ("CLUSTERVISION_HOME", bad_home.to_str().unwrap())],
     );
     assert_eq!((out.as_str(), err.as_str()), ("", ""));
+}
+
+#[test]
+fn frozen_claude_and_codex_guards_deny_with_json_and_exit_zero() {
+    let w = World::new("frozen-guard-exits");
+    cv_ok(&w, &["retire", "old", "--successor", "new"]);
+    for harness in ["claude", "codex"] {
+        for (name, extra, strict) in [
+            (
+                "retired",
+                json!({"session_id": "old", "tool_name": "Read", "tool_input": {}}),
+                false,
+            ),
+            (
+                "retired",
+                json!({"agent_id": "agent-old", "tool_name": "exec", "tool_input": "malformed ("}),
+                false,
+            ),
+            (
+                "retired",
+                json!({"tool_name": "Agent", "tool_input": {"resume": "old"}}),
+                false,
+            ),
+            ("receipt", json!({"tool_name": "Read", "tool_input": {}}), true),
+        ] {
+            let env = [
+                ("CV_FROZEN", "1"),
+                ("CV_RECEIPT_STRICT", if strict { "1" } else { "0" }),
+            ];
+            let (out, err) = hook_full(
+                &w,
+                &["hook", name, "--harness", harness],
+                &with(common(&w, "active", "PreToolUse"), extra),
+                &env,
+            );
+            assert!(err.is_empty(), "{harness}: {err}");
+            let out: serde_json::Value = serde_json::from_str(&out).unwrap();
+            assert_eq!(out["hookSpecificOutput"]["permissionDecision"], "deny", "{harness}");
+        }
+        let (out, err) = hook_full(
+            &w,
+            &["hook", "receipt", "--harness", harness],
+            &common(&w, "old", "PostToolUse"),
+            &[("CV_FROZEN", "1"), ("CV_RECEIPT_STRICT", "1")],
+        );
+        assert_eq!((out.as_str(), err.as_str()), ("", ""));
+    }
 }
