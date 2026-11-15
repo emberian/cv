@@ -40,7 +40,7 @@
         "edit_file"
       ],
       "usage_messages": 4,
-      "model_messages": 3,
+      "model_messages": 0,
       "compaction_boundaries": [
         10
       ],
@@ -128,7 +128,7 @@
         "send_message"
       ],
       "usage_messages": 2,
-      "model_messages": 2,
+      "model_messages": 0,
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,

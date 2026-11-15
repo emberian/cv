@@ -3,11 +3,11 @@
 These independent acceptance checks define the native reading guarantees for
 0.20. The outstanding scenarios below remain separate from those guarantees.
 
-`tests/antigravity_lifecycle.rs` uses synthetic protobuf encodings derived from the
-installed 1.5.9 field descriptors. It deliberately avoids sharing the production
-encoder/decoder, and it is not a harness-written corpus version. Every test uses
-an isolated CV home and owned SQLite files. Private conversation content and
-extracted descriptor sets are not repository fixtures.
+The synthetic cases in `tests/antigravity_lifecycle.rs` use protobuf encodings
+derived from installed 1.5.9 field descriptors without sharing the production
+encoder/decoder. They are explicitly separate from the real-writer corpus case.
+Every test uses an isolated CV home and owned SQLite files. Private conversation
+content and extracted descriptor sets are not repository fixtures.
 
 | Contract | Independent acceptance check |
 |---|---|
@@ -26,19 +26,27 @@ extracted descriptor sets are not repository fixtures.
 | Thinking fidelity | A native textual thinking signature is retained in the IR. |
 | Future native type | COMPLETE demand reports uninterpreted native steps rather than silently succeeding empty. |
 | Future nested field | COMPLETE retains the original wire bytes and discloses unsupported normalization. |
+| Retained render after clearing | Native terminal output remains readable and discloses omitted lines and missing original payloads. |
 
 The existing `installed-1.5.9-lifecycle-2026-11-14` corpus contains scrubbed
 harness-written full-log ranges covering duplicate running steps, parallel
 completion order, and revised step indices. Its label identifies the installed
 CLI at capture, not a proven writer version for every historical row. It does
-not cover the native-only, media, or broader swarm scenarios below.
+not cover native-only, media, or broader swarm scenarios.
+
+The `1.5.9-native-background-media` corpus is a new real CLI 1.5.9 capture
+from an isolated scratch home, driven by a deterministic local Gemini endpoint.
+It includes native-only SQLite history, a background command and its completion
+message, and an inline image tool result. The generator verifies the writer
+version, records the executable hash, and enforces OS-level write/network bounds.
+The lifecycle test checks the recovered image bytes and background output.
 
 Still requiring dedicated writer-generated scenarios and independent assertions:
 
 - Permission requests and their responses; interruption, cancellation and retries.
-- Inline image/audio/video payloads, linked attachments, missing attachment files,
+- Inline prompt image/audio/video payloads, linked attachments, missing attachment files,
   and lazy output resolution after the source changes.
-- Structured generic results and render-only payloads after native clearing.
+- Structured generic results and writer-generated render-only payloads after native clearing.
 - Multi-child spawns, nested/renamed swarms, peer-board versus final-result delivery,
   and waiting versus actively running workers.
 - Full/compact/chunk/native promotion during a live read; native DB-only resume roots.

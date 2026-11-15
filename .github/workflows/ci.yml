@@ -50,7 +50,9 @@ jobs:
       # The corpus generators' shared key proxy (every translator, every generator's own launch
       # line) against a local mock upstream, and scrub.py over a synthetic store. No network.
       - name: Corpus tools
-        run: python3 -I tools/harness-corpus/test_tools.py
+        run: |
+          python3 -I tools/harness-corpus/test_tools.py
+          python3 -I tools/harness-corpus/antigravity/test_generate.py
 
       - name: Build provenance in linked worktrees and archives
         run: python3 -I tools/test-build-provenance.py

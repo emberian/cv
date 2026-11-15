@@ -1,0 +1,59 @@
+{
+  "sessions": [
+    {
+      "id": "6b8ae29a-002d-4223-a77a-832feffec00c",
+      "path": ".gemini/antigravity-cli/conversations/6b8ae29a-002d-4223-a77a-832feffec00c.db",
+      "messages": 7,
+      "sequence": [
+        "user/prompt",
+        "assistant/reply",
+        "tool/tool_result",
+        "tool/tool_result",
+        "assistant/reply",
+        "system/injected_context",
+        "assistant/reply"
+      ],
+      "blocks": {
+        "image": 1,
+        "text": 4,
+        "tool_result": 2,
+        "tool_use": 2
+      },
+      "tools": [
+        "run_command",
+        "read_file"
+      ],
+      "usage_messages": 0,
+      "model_messages": 0,
+      "compaction_boundaries": [],
+      "subagent_spawns": 0,
+      "subagent_returns": 0,
+      "affordances": {
+        "background_job/complete": 1
+      },
+      "tool_histogram": {
+        "tools": {
+          "read_file": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 1,
+            "commands": 0,
+            "errors": 0
+          },
+          "run_command": {
+            "calls": 1,
+            "edits": 0,
+            "reads": 0,
+            "commands": 1,
+            "errors": 0
+          }
+        },
+        "total_calls": 2,
+        "total_errors": 0
+      },
+      "lineage": {},
+      "model": null,
+      "skipped_lines": 0
+    }
+  ]
+}

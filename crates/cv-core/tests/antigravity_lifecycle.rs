@@ -442,6 +442,8 @@ fn exact_native_revision_enriches_exported_parallel_call_identity() {
     let (calls, results) = tool_ids(&session);
     assert_eq!(calls, ["native-A", "native-B"]);
     assert_eq!(results, ["native-B", "native-A"]);
+    let limitations = session.extra["cv"]["read_coverage"]["limitations"].as_array().unwrap();
+    assert!(limitations.iter().all(|v| v != "inferred_tool_identity"));
 }
 
 #[test]
@@ -486,4 +488,69 @@ fn empty_export_does_not_hide_existing_native_history() {
     assert_eq!(refs.len(), 1);
     assert_eq!(refs[0].path, native);
     assert_eq!(text(&adapter.parse(&refs[0]).unwrap()), "recover native request");
+}
+
+#[test]
+fn real_writer_native_background_completion_and_image_survive() {
+    let world = world("agy-real-writer-background-media");
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/corpus/antigravity/1.5.9-native-background-media/.gemini/antigravity-cli/conversations");
+    let source = fs::read_dir(fixture).unwrap().next().unwrap().unwrap().path();
+    let directory = world.base.join("conversations");
+    fs::create_dir(&directory).unwrap();
+    fs::copy(&source, directory.join(source.file_name().unwrap())).unwrap();
+    let adapter = Antigravity::with_home(&world.base);
+    let reference = adapter.discover().unwrap().remove(0);
+    let session = adapter.parse(&reference).unwrap();
+    assert_eq!(session.messages.len(), 7);
+    assert!(text(&session).contains("background fixture done"));
+    let expected = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLbtAAAAABJRU5ErkJggg==";
+    assert!(session
+        .messages
+        .iter()
+        .flat_map(|m| &m.content)
+        .any(|block| matches!(block,
+        Block::Image { media_type: Some(mime), data_ref: Some(data) } if mime == "image/png" && data == expected)));
+    let limitations = session.extra["cv"]["read_coverage"]["limitations"].as_array().unwrap();
+    assert!(limitations.iter().all(|v| v != "missing_attachments"));
+}
+
+#[test]
+fn cleared_native_result_keeps_retained_terminal_render() {
+    let world = world("agy-cleared-retained-terminal");
+    // StepRenderInfo.content_blocks(10) -> ContentBlock.terminal(3), whose
+    // fields are command1,cwd2,exit_code3,output4,truncated_lines5.
+    let terminal = [
+        bytes(1, "fixture-check"),
+        bytes(2, "/home/corpus/project"),
+        number(3, 0),
+        bytes(4, "retained terminal output"),
+        number(5, 12),
+    ]
+    .concat();
+    let render = bytes(10, bytes(3, terminal));
+    let payload = step(132, 5, 140, bytes(2, bytes(3, render)), vec![]);
+    let path = database(&world.base, PARENT, &[(0, 132, 5, payload)]);
+    let adapter = Antigravity::with_home(&world.base);
+    let session = adapter
+        .parse(&SessionRef::new(PARENT, Harness::Antigravity, path))
+        .unwrap();
+    let resolver = cv_core::lazy::Resolver::new(session.source_path.clone());
+    let result = session
+        .messages
+        .iter()
+        .flat_map(|m| &m.content)
+        .find_map(|block| match block {
+            Block::ToolResult { content, .. } => Some(content.try_resolve(&resolver).unwrap().into_owned()),
+            _ => None,
+        })
+        .expect("retained native render must remain readable");
+    assert!(result.contains("retained terminal output"));
+    assert!(result.contains("12 earlier output lines omitted"));
+    assert!(result.contains("exit code: 0"));
+    let limitations = session.extra["cv"]["read_coverage"]["limitations"].as_array().unwrap();
+    assert!(
+        limitations.iter().any(|v| v == "missing_payloads"),
+        "render text cannot recover the cleared body"
+    );
 }
