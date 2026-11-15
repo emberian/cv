@@ -1304,6 +1304,7 @@ fn hits<'a>(h: Harness, m: &'a Message, resolver: &crate::lazy::Resolver, summar
                         view,
                         crate::tools::classify::ClassifyOpts {
                             commands: false,
+                            command_limit: None,
                             summaries,
                         },
                         |sem| match sem.op {

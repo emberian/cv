@@ -83,6 +83,8 @@ pub struct ClassifyOpts {
     /// Materialize full command strings on [`ToolOp::Command`]. When `false`, command chunks
     /// stream only for patch header detection and `cmd` is `None`.
     pub commands: bool,
+    /// Retain at most this many UTF-8 bytes of command text; `None` keeps it whole.
+    pub command_limit: Option<usize>,
     /// Populate human-readable summaries, search queries, spawn hints, and message recipients.
     pub summaries: bool,
 }
@@ -90,14 +92,17 @@ pub struct ClassifyOpts {
 impl ClassifyOpts {
     pub const COUNTS: Self = Self {
         commands: false,
+        command_limit: None,
         summaries: false,
     };
     pub const EVENTS: Self = Self {
         commands: true,
+        command_limit: None,
         summaries: false,
     };
     pub const FULL: Self = Self {
         commands: true,
+        command_limit: None,
         summaries: true,
     };
 }
@@ -555,7 +560,7 @@ fn visit_tool_ops_internal<'a>(
     }
 
     // 6. Command tools (`command` / `cmd` / `script` / `CommandLine` / `action.command`).
-    if let Some((command, files)) = command_rows(input, opts.commands, extract_hunks)? {
+    if let Some((command, files)) = command_rows_bounded(input, opts.commands, extract_hunks, opts.command_limit)? {
         let background = if opts.summaries {
             bool_flag(input, "run_in_background")?
                 || bool_flag(input, "is_background")?
@@ -1695,12 +1700,27 @@ impl Trigger {
 
 pub(crate) type CommandWithPatches = (Option<String>, Vec<(String, Vec<u64>)>);
 
-pub(crate) fn command_rows(view: JsonView<'_>, whole: bool, extract_hunks: bool) -> Result<Option<CommandWithPatches>> {
+fn command_rows_bounded(
+    view: JsonView<'_>,
+    whole: bool,
+    extract_hunks: bool,
+    limit: Option<usize>,
+) -> Result<Option<CommandWithPatches>> {
     let mut command = whole.then(String::new);
+    let mut command_full = false;
     let mut trigger = Trigger::default();
     let exists = command_chunks(view, |chunk| {
         if let Some(command) = &mut command {
-            command.push_str(chunk);
+            if !command_full {
+                let mut end = chunk
+                    .len()
+                    .min(limit.unwrap_or(usize::MAX).saturating_sub(command.len()));
+                while !chunk.is_char_boundary(end) {
+                    end -= 1;
+                }
+                command.push_str(&chunk[..end]);
+                command_full = end < chunk.len();
+            }
         }
         trigger.push(chunk);
         Ok(())
@@ -1901,7 +1921,20 @@ fn scan_codex_exec(
                     ToolSemantic {
                         tool: Cow::Borrowed("exec_command"),
                         op: ToolOp::Command {
-                            cmd: if opts.commands { cmd.map(Cow::Owned) } else { None },
+                            cmd: if opts.commands {
+                                cmd.map(|mut cmd| {
+                                    if let Some(limit) = opts.command_limit {
+                                        let mut end = limit.min(cmd.len());
+                                        while !cmd.is_char_boundary(end) {
+                                            end -= 1;
+                                        }
+                                        cmd.truncate(end);
+                                    }
+                                    Cow::Owned(cmd)
+                                })
+                            } else {
+                                None
+                            },
                             workdir: clean_workdir.clone().map(Cow::Owned),
                             background: false,
                         },
