@@ -62,6 +62,7 @@ mod tests {
             (Some("canceled"), false, Status::Stopped),
         ] {
             let observation = tool_result(&ToolResult {
+                message: None,
                 tool: "Bash",
                 ops: &[],
                 body: "Command running in background with ID: job",

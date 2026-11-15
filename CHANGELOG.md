@@ -12,6 +12,7 @@
 
 - Full-text search supports reusable indexed snapshots and NDJSON batch queries with explicit freshness semantics and per-query work counters.
 - Show, Markdown, doctor, and API metadata expose Antigravity read sources and known coverage gaps, including metadata-only members and unavailable payloads.
+- Distill tracks native Antigravity task identities through rewritten terminal results without mistaking historical backgrounding for ongoing work.
 - Distill preserves failed or stopped child outcomes when remaining background jobs later succeed.
 - Distill tracks Codex cells and nested PTY jobs through explicit completion, preserving unfinished work and attributing final output to initiating commands.
 - Distill enforces aggregate byte or estimated-token budgets before publication and requires explicit snapshots for unsettled calls.

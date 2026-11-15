@@ -187,6 +187,7 @@ mod tests {
             ("Script terminated\nWall time: 0.1 seconds\nOutput:\n", Status::Stopped),
         ] {
             let result = ToolResult {
+                message: None,
                 tool: "wait",
                 ops: &ops,
                 body,
@@ -210,6 +211,7 @@ mod tests {
             (None, true, Status::Failed),
         ] {
             let result = ToolResult {
+                message: None,
                 tool: "exec",
                 ops: &[],
                 body: "Script terminated",
@@ -230,6 +232,7 @@ mod tests {
             },
         }];
         let result = ToolResult {
+            message: None,
             tool: "write_stdin",
             ops: &ops,
             body: "Process exited with code 1\nOutput:\nerror",

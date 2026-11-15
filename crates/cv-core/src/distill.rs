@@ -291,6 +291,7 @@ pub fn unsettled_calls(session: &Session) -> anyhow::Result<Vec<String>> {
                         .map(|call| ToolInput::new(session.harness, call.name, call.input, false, true))
                         .transpose()?;
                     let result = LifecycleResult {
+                        message: Some(message),
                         tool: name,
                         ops: summary.as_ref().map_or(&[], |s| s.ops.as_slice()),
                         body: &body,
@@ -1593,6 +1594,7 @@ fn analyze_with_policy(
                     let out = out_cow.as_ref();
                     let out_len = out.len();
                     let result = LifecycleResult {
+                        message: Some(m),
                         tool: &name,
                         ops: &summary.ops,
                         body: out,

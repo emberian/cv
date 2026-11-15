@@ -27,6 +27,8 @@ impl Status {
 
 /// Bounded text is sufficient for safety preflight; full text may be supplied for facts.
 pub struct ToolResult<'a> {
+    /// Originating record, for provider-native metadata retained alongside result text.
+    pub message: Option<&'a crate::ir::Message>,
     pub tool: &'a str,
     pub ops: &'a [ToolSemantic<'static>],
     pub body: &'a str,

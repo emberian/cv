@@ -44,7 +44,6 @@ impl State {
         }
         // A wait can reveal a new child before completing its parent cell. Preserve ownership
         // and attach starts first so parent completion cannot settle the whole invocation early.
-        let started = !observation.started_jobs.is_empty();
         for job in observation.started_jobs {
             if let std::collections::hash_map::Entry::Vacant(entry) = self.jobs.entry(job) {
                 entry.insert(owner.clone());
@@ -63,7 +62,6 @@ impl State {
         Outcome {
             status: observation.status,
             pending: !observation.status.is_terminal()
-                || started
                 || observation.uncertain
                 || self.job_counts.contains_key(&owner)
                 || self.uncertain.contains(&owner),
@@ -162,6 +160,35 @@ fn severity(status: Status) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rewritten_terminal_result_settles_once_before_later_notification() {
+        let mut state = State::default();
+        state.call("launch");
+        let update = || Update {
+            target: Target::Job("job".into()),
+            status: Status::Complete,
+            output: None,
+        };
+        let result = state.result(
+            "launch",
+            Observation {
+                started_jobs: vec!["job".into()],
+                updates: vec![update()],
+                ..Default::default()
+            },
+        );
+        assert!(!result.pending);
+        assert_eq!(result.completions.len(), 1);
+        assert_eq!(result.completions[0].call, "launch");
+        assert!(state
+            .message(Observation {
+                updates: vec![update()],
+                ..Default::default()
+            })
+            .is_empty());
+        assert!(state.unsettled().is_empty());
+    }
 
     #[test]
     fn terminal_sibling_failure_or_stop_survives_later_success() {

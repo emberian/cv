@@ -513,6 +513,54 @@ fn real_writer_native_background_completion_and_image_survive() {
         Block::Image { media_type: Some(mime), data_ref: Some(data) } if mime == "image/png" && data == expected)));
     let limitations = session.extra["cv"]["read_coverage"]["limitations"].as_array().unwrap();
     assert!(limitations.iter().all(|v| v != "missing_attachments"));
+
+    let launch = session
+        .messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .find_map(|block| match block {
+            Block::ToolUse { id, name, .. } if name == "run_command" => Some(id.clone()),
+            _ => None,
+        })
+        .expect("captured background launch call");
+    let completion = session
+        .messages
+        .iter()
+        .position(|message| {
+            message
+                .extra
+                .get("antigravity")
+                .and_then(|extra| extra.get("completed_task"))
+                .is_some()
+        })
+        .expect("captured native SYSTEM_MESSAGE completion");
+    assert!(
+        cv_core::distill::unsettled_calls(&session).unwrap().is_empty(),
+        "native completion settles every captured call"
+    );
+    let result_index = session
+        .messages
+        .iter()
+        .position(|message| {
+            message
+                .content
+                .iter()
+                .any(|block| matches!(block, Block::ToolResult {tool_use_id, ..} if tool_use_id == &launch))
+        })
+        .expect("captured native launch result");
+    let mut pending = session.clone();
+    pending.messages.truncate(result_index);
+    assert!(cv_core::distill::unsettled_calls(&pending).unwrap().contains(&launch));
+    pending.messages.push(session.messages[result_index].clone());
+    assert!(
+        !cv_core::distill::unsettled_calls(&pending).unwrap().contains(&launch),
+        "the native final revision already contains authoritative terminal output"
+    );
+    pending.messages = session.messages[..completion].to_vec();
+    assert!(
+        cv_core::distill::unsettled_calls(&pending).unwrap().is_empty(),
+        "background metadata cannot turn completed work into an ongoing job"
+    );
 }
 
 #[test]
