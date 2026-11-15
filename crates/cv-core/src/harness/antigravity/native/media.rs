@@ -63,7 +63,7 @@ fn inline_mime(file: &File, item: &Message) -> Result<String> {
     Ok(mime)
 }
 
-fn base64(mut input: impl Read, out: &mut impl Write) -> Result<()> {
+pub(super) fn base64(mut input: impl Read, out: &mut impl Write) -> Result<()> {
     const DIGITS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut bytes = [0u8; 6144];
     let mut encoded = [0u8; 8192];

@@ -1,6 +1,7 @@
 //! Bounded native protobuf projection. JSONL remains the historical authority when
 //! present: native CLEARED steps are not replacements for retained exported text.
 mod context;
+mod identity;
 mod media;
 mod render;
 mod wire;
@@ -184,6 +185,7 @@ fn project(file: &File, step: &Proto, index: u64, complete: bool, out: &mut impl
                 out.write_all(b",\"thinking_redacted\":true")?;
             }
             calls(file, &response, out)?;
+            identity::planner(file, &response, out)?;
             media::project(file, &response, 20, out)?;
         }
         "GENERIC" => {

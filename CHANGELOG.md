@@ -14,6 +14,7 @@
 - Distill correlates Claude and Antigravity background completions with initiating commands, keeping unfinished output out of build verdicts.
 - Claude resume validation rejects cyclic parent links, including detached cycles.
 - Index schema upgrades preserve the previous generation until complete, validated replacement; failed discovery or indexing leaves existing readers intact.
+- Antigravity appends verified native history beyond stale exports and preserves binary thinking signatures with explicit encoding metadata.
 - Antigravity reads native SQLite history, recovers retained rendered output, preserves inline media and task context, and verifies historical tool identities.
 
 - Antigravity replays revised steps correctly, reads chunked history, preserves missing-child lanes, and enriches native lineage, usage, swarm, approval, and background-task events.

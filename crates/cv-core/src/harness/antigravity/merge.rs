@@ -8,6 +8,13 @@ pub(super) struct Match {
     pub result: Option<String>,
     pub signature: Option<String>,
     pub usage: Option<Usage>,
+    pub planner_details: Option<Value>,
+}
+pub(super) struct Verified {
+    pub matches: BTreeMap<u64, Match>,
+    pub native: jsonl::Read,
+    pub tail: StepOrder,
+    pub rejected_tail: bool,
 }
 struct Fingerprint(blake3::Hasher);
 impl Write for Fingerprint {
@@ -23,7 +30,20 @@ fn fingerprint(view: JsonView<'_>) -> Result<blake3::Hash> {
     let mut hash = Fingerprint(blake3::Hasher::new());
     for key in ["type", "content", "thinking"] {
         hash.write_all(key.as_bytes())?;
-        if let Some(value) = view.get(key)? {
+        let mut value = view.get(key)?;
+        // The native user shape stores text as items; a single item is exactly
+        // the same body as the export's content string, without guessing joins.
+        if key == "content" && value.is_none() {
+            if let Some(mut parts) = view.get("native_content")?.map(JsonView::array).transpose()?.flatten() {
+                if let Some(first) = parts.next() {
+                    let first = first?;
+                    if parts.next().is_none() {
+                        value = Some(first);
+                    }
+                }
+            }
+        }
+        if let Some(value) = value {
             value.write_canonical(&mut hash)?;
         }
         hash.write_all(&[0])?;
@@ -56,8 +76,14 @@ fn fingerprint(view: JsonView<'_>) -> Result<blake3::Hash> {
     }
     Ok(hash.0.finalize())
 }
-pub(super) fn verified(input: &jsonl::Read, order: &StepOrder, path: &Path) -> Result<BTreeMap<u64, Match>> {
-    let native = super::native::open(path, false)?;
+pub(super) fn verified(
+    input: &jsonl::Read,
+    order: &StepOrder,
+    path: &Path,
+    complete: bool,
+    include_tail: bool,
+) -> Result<Verified> {
+    let native = super::native::open(path, complete)?;
     let mut expected = BTreeMap::new();
     let mut records = input.records();
     for (index, (at, end)) in &order.steps {
@@ -68,13 +94,13 @@ pub(super) fn verified(input: &jsonl::Read, order: &StepOrder, path: &Path) -> R
     }
     let mut matches = BTreeMap::new();
     let mut known_calls = BTreeSet::new();
+    let mut tail = StepOrder::default();
+    let max_exported = order.steps.keys().next_back().copied();
+    let mut newest_comparable = None;
     native.snapshot(0, native.len(), |line| {
         let Some(view) = line.view else {
             return Ok(Flow::Continue);
         };
-        if view.get("native_cleared")?.is_some() {
-            return Ok(Flow::Continue);
-        }
         let Some(index) = view
             .get("step_index")?
             .map(JsonView::as_number)
@@ -84,7 +110,27 @@ pub(super) fn verified(input: &jsonl::Read, order: &StepOrder, path: &Path) -> R
         else {
             return Ok(Flow::Continue);
         };
-        if expected.get(&index) != Some(&fingerprint(view)?) {
+        if include_tail && max_exported.is_some_and(|max| index > max) {
+            tail.ingest(&line)?;
+            return Ok(Flow::Continue);
+        }
+        if view.get("native_cleared")?.is_some() {
+            return Ok(Flow::Continue);
+        }
+        let equal = expected.get(&index) == Some(&fingerprint(view)?);
+        if expected.contains_key(&index)
+            && matches!(
+                view.get("type")?
+                    .map(JsonView::string)
+                    .transpose()?
+                    .flatten()
+                    .as_deref(),
+                Some("USER_INPUT" | "PLANNER_RESPONSE")
+            )
+        {
+            newest_comparable = Some(equal);
+        }
+        if !equal {
             return Ok(Flow::Continue);
         }
         let mut matched = Match::default();
@@ -116,11 +162,21 @@ pub(super) fn verified(input: &jsonl::Read, order: &StepOrder, path: &Path) -> R
             .flatten();
         if let Some(fields) = Fields::parse(view, STEP_KEYS)? {
             matched.usage = parse_step_usage(&fields)?;
+            matched.planner_details = fields.value("native_planner_details")?;
         }
         matches.insert(index, matched);
         Ok(Flow::Continue)
     })?;
     native.check()?;
     input.check()?;
-    Ok(matches)
+    let rejected_tail = !tail.steps.is_empty() && newest_comparable != Some(true);
+    if rejected_tail {
+        tail.steps.clear();
+    }
+    Ok(Verified {
+        matches,
+        native,
+        tail,
+        rejected_tail,
+    })
 }

@@ -1,0 +1,175 @@
+//! Planner and tool-call identity metadata. Binary signatures stay explicitly
+//! encoded bytes; they are never substituted for the planner's text signature.
+use super::wire::{Field, Message as Proto};
+use anyhow::Result;
+use std::fs::File;
+use std::io::Write;
+
+pub(super) fn planner(file: &File, response: &Proto, out: &mut impl Write) -> Result<()> {
+    out.write_all(b",\"native_planner_details\":{")?;
+    let mut first = true;
+    text(file, response, 6, "message_id", out, &mut first)?;
+    text(file, response, 15, "provider_message_id", out, &mut first)?;
+    if let Some(reason) = response.last(12).and_then(|field| field.u64()) {
+        key("stop_reason", out, &mut first)?;
+        write!(out, "{}", reason as i32)?;
+    }
+    if let Some(duration) = response.last(11) {
+        let duration = duration.message(file)?;
+        key("thinking_duration", out, &mut first)?;
+        let seconds = duration.last(1).and_then(|field| field.u64()).unwrap_or(0) as i64;
+        let nanos = duration.last(2).and_then(|field| field.u64()).unwrap_or(0) as i32;
+        write!(out, "{{\"seconds\":{seconds},\"nanos\":{nanos}}}")?;
+    }
+    if let Some(signature) = response.last(14) {
+        key("thinking_signature", out, &mut first)?;
+        signature_bytes(file, signature, out)?;
+    }
+    if response.last(7).is_some() {
+        key("tool_calls", out, &mut first)?;
+        out.write_all(b"[")?;
+        for (i, call) in response.repeated(7).enumerate() {
+            if i > 0 {
+                out.write_all(b",")?;
+            }
+            let call = call.message(file)?;
+            out.write_all(b"{")?;
+            let mut first = true;
+            text(file, &call, 1, "id", out, &mut first)?;
+            text(file, &call, 2, "name", out, &mut first)?;
+            text(file, &call, 6, "thought_signature", out, &mut first)?;
+            if let Some(signature) = call.last(7) {
+                key("thinking_signature", out, &mut first)?;
+                signature_bytes(file, signature, out)?;
+            }
+            out.write_all(b"}")?;
+        }
+        out.write_all(b"]")?;
+    }
+    out.write_all(b"}")?;
+    Ok(())
+}
+
+fn signature_bytes(file: &File, signature: Field, out: &mut impl Write) -> Result<()> {
+    out.write_all(b"{\"encoding\":\"base64\",\"data\":\"")?;
+    super::media::base64(signature.reader(file)?, out)?;
+    out.write_all(b"\"}")?;
+    Ok(())
+}
+
+fn key(name: &str, out: &mut impl Write, first: &mut bool) -> Result<()> {
+    if !*first {
+        out.write_all(b",")?;
+    }
+    *first = false;
+    write!(out, "\"{name}\":")?;
+    Ok(())
+}
+
+fn text(file: &File, message: &Proto, number: u32, name: &str, out: &mut impl Write, first: &mut bool) -> Result<()> {
+    if let Some(field) = message.last(number) {
+        key(name, out, first)?;
+        field.write_json_string(file, out)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn varint(mut value: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let b = (value & 127) as u8;
+            value >>= 7;
+            out.push(b | if value == 0 { 0 } else { 128 });
+            if value == 0 {
+                return out;
+            }
+        }
+    }
+    fn bytes(field: u64, value: &[u8]) -> Vec<u8> {
+        [varint((field << 3) | 2), varint(value.len() as u64), value.to_vec()].concat()
+    }
+    fn number(field: u64, value: u64) -> Vec<u8> {
+        [varint(field << 3), varint(value)].concat()
+    }
+    fn projection(bytes: &[u8]) -> serde_json::Value {
+        let source = crate::harness::store::bytes::ByteSource::arena().unwrap();
+        source
+            .append(|out| {
+                out.write_all(bytes)?;
+                Ok(())
+            })
+            .unwrap();
+        let file = source.file().unwrap();
+        let response = Proto::read(&file, 0, bytes.len() as u64).unwrap();
+        let mut out = b"{\"test\":true".to_vec();
+        planner(&file, &response, &mut out).unwrap();
+        out.push(b'}');
+        serde_json::from_slice::<serde_json::Value>(&out).unwrap()["native_planner_details"].clone()
+    }
+    #[test]
+    fn binary_planner_and_tool_signatures_remain_distinct_from_text() {
+        let call = [
+            bytes(1, b"call-id"),
+            bytes(2, b"run_command"),
+            bytes(6, b"text-thought-signature"),
+            bytes(7, &[0, 255, 128, 1]),
+        ]
+        .concat();
+        let data = [
+            bytes(4, b"planner-text-signature"),
+            bytes(14, &[255, 0, 128]),
+            bytes(7, &call),
+        ]
+        .concat();
+        let projected = projection(&data);
+        assert_eq!(
+            projected["thinking_signature"],
+            serde_json::json!({"encoding":"base64", "data":"/wCA"})
+        );
+        assert_eq!(
+            projected["tool_calls"][0],
+            serde_json::json!({
+                "id":"call-id", "name":"run_command", "thought_signature":"text-thought-signature",
+                "thinking_signature":{"encoding":"base64", "data":"AP+AAQ=="}
+            })
+        );
+        assert!(projected.get("signature").is_none());
+    }
+    #[test]
+    fn planner_message_duration_and_unknown_stop_reason_are_preserved() {
+        let duration = [number(1, 2), number(2, 123_456_789)].concat();
+        let data = [
+            bytes(6, b"message-id"),
+            bytes(15, b"provider-id"),
+            number(12, 1234),
+            bytes(11, &duration),
+        ]
+        .concat();
+        assert_eq!(
+            projection(&data),
+            serde_json::json!({
+                "message_id":"message-id", "provider_message_id":"provider-id", "stop_reason":1234,
+                "thinking_duration":{"seconds":2,"nanos":123456789}
+            })
+        );
+        let signed = [number(1, (-2i64) as u64), number(2, (-123i64) as u64)].concat();
+        assert_eq!(
+            projection(&bytes(11, &signed))["thinking_duration"],
+            serde_json::json!({"seconds":-2,"nanos":-123})
+        );
+        assert_eq!(
+            projection(&bytes(11, &[]))["thinking_duration"],
+            serde_json::json!({"seconds":0,"nanos":0})
+        );
+    }
+    #[test]
+    fn empty_binary_signature_preserves_presence() {
+        assert_eq!(
+            projection(&bytes(14, &[]))["thinking_signature"],
+            serde_json::json!({"encoding":"base64", "data":""})
+        );
+    }
+}

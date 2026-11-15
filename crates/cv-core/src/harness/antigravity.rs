@@ -620,13 +620,22 @@ impl Adapter for Antigravity {
                 Ok(Flow::Continue)
             })?;
             #[cfg(feature = "sqlite")]
+            let mut native_tail = None;
+            #[cfg(feature = "sqlite")]
             if !is_native_store(&r.path) {
                 if let Some(loc) = BrainLoc::from_transcript(&r.path) {
                     let db = loc.app_data_dir.join("conversations").join(format!("{}.db", loc.id));
                     if db.is_file() {
                         // A missing or changing sidecar must not erase surviving export history.
-                        if let Ok(verified) = merge::verified(&input, &order, &db) {
-                            if !verified.is_empty() {
+                        if let Ok(verified) = merge::verified(
+                            &input,
+                            &order,
+                            &db,
+                            opts.tier == Tier::Complete,
+                            matches!(from, Start::Whole),
+                        ) {
+                            if !verified.matches.is_empty() || !verified.tail.steps.is_empty() || verified.rejected_tail
+                            {
                                 order
                                     .coverage
                                     .sources
@@ -636,7 +645,14 @@ impl Adapter for Antigravity {
                                     .limitations
                                     .insert(crate::coverage::ReadCoverage::UNSUPPORTED_NATIVE_FIELDS.into());
                             }
-                            codec.enrich.verified = verified;
+                            codec.enrich.verified = verified.matches;
+                            if verified.rejected_tail {
+                                order.coverage.limitations.insert("unreconciled_history".into());
+                            } else if !verified.tail.steps.is_empty() {
+                                order.coverage.sources.extend(verified.tail.coverage.sources);
+                                order.coverage.limitations.extend(verified.tail.coverage.limitations);
+                                native_tail = Some((verified.native, verified.tail.steps));
+                            }
                         }
                     }
                 }
@@ -667,6 +683,21 @@ impl Adapter for Antigravity {
                     Ok(Flow::Continue)
                 })?;
             }
+            #[cfg(feature = "sqlite")]
+            if let Some((native, tail)) = &native_tail {
+                let mut records = native.records();
+                for (at, end) in tail.values() {
+                    records.read(*at, end - at, |view| {
+                        if codec.inferred_identity(view)? {
+                            order
+                                .coverage
+                                .limitations
+                                .insert(crate::coverage::ReadCoverage::INFERRED_TOOL_IDENTITY.into());
+                        }
+                        Ok(Flow::Continue)
+                    })?;
+                }
+            }
             order.coverage.attach(&mut codec.s);
             spawns.meta(&codec.s);
             let mut records = input.records();
@@ -676,6 +707,20 @@ impl Adapter for Antigravity {
                     if records.read(at, end - at, |view| codec.record(view, at, sink))? == Flow::Stop {
                         stopped = true;
                         break;
+                    }
+                }
+                #[cfg(feature = "sqlite")]
+                if !stopped {
+                    if let Some((native, tail)) = native_tail {
+                        let mut records = native.records();
+                        stopped = crate::stream::guarded(sink, &native, |sink| {
+                            for (at, end) in tail.into_values() {
+                                if records.read(at, end - at, |view| codec.record(view, at, sink))? == Flow::Stop {
+                                    return Ok(true);
+                                }
+                            }
+                            Ok(false)
+                        })?;
                     }
                 }
                 super::note_skipped_lines(codec.session(), order.skipped);
@@ -1500,6 +1545,7 @@ const STEP_KEYS: &[&str] = &[
     "native_agent_refs",
     "native_scope_items",
     "native_task_details",
+    "native_planner_details",
     "native_tool_id",
     "native_tool_name",
     "cache_creation_tokens",
@@ -1773,6 +1819,18 @@ impl StepCodec {
                     }
                 }
 
+                #[cfg(feature = "sqlite")]
+                if want_extra {
+                    if let Some(details) = self
+                        .enrich
+                        .verified
+                        .get(&step_index)
+                        .and_then(|m| m.planner_details.as_ref())
+                    {
+                        m.harness_extra_mut(Harness::Antigravity)
+                            .insert("planner_details".into(), details.clone());
+                    }
+                }
                 m.usage = parse_step_usage(&fields)?;
                 #[cfg(feature = "sqlite")]
                 if let Some(native) = self.enrich.verified.get(&step_index).and_then(|m| m.usage.as_ref()) {
@@ -1935,6 +1993,18 @@ impl StepCodec {
                 m.id = Some(step_index.to_string());
                 m.timestamp = ts;
                 push_nonempty_text(&mut m.content, fields.get("content"), self.spans)?;
+                #[cfg(feature = "sqlite")]
+                if want_extra {
+                    if let Some(details) = self
+                        .enrich
+                        .verified
+                        .get(&step_index)
+                        .and_then(|m| m.planner_details.as_ref())
+                    {
+                        m.harness_extra_mut(Harness::Antigravity)
+                            .insert("planner_details".into(), details.clone());
+                    }
+                }
                 m.usage = parse_step_usage(&fields)?;
                 #[cfg(feature = "sqlite")]
                 if let Some(native) = self.enrich.verified.get(&step_index).and_then(|m| m.usage.as_ref()) {
@@ -2121,6 +2191,7 @@ fn attach_step_extras(
         bag.insert("status".into(), Value::String(st.to_string()));
     }
     for (field, key) in [
+        ("native_planner_details", "planner_details"),
         ("native_scope_items", "scope_items"),
         ("native_task_details", "task_details"),
     ] {
