@@ -128,6 +128,10 @@ larger than 1 MiB return an error for that request; subsequent requests continue
 never silently shortened. `--limit` limits returned hits; `total` counts all matching sessions,
 including with `--limit 0`. Startup errors (such as a missing index) fail the command.
 
+Batch `hits` use the library `Hit` schema: timestamps are Unix seconds, and there are no
+`path`, `message_count` or `size_bytes` fields. Ordinary `--json` emits enriched session rows;
+its row schema is not interchangeable with batch hits.
+
 All queries share the command's `--harness`, `--cwd`, `--kind` and `--limit` settings.
 Filters use the metadata stored in that snapshot. `-q`, `--scan`, `--exact` and `--live-bytes`
 are explicitly unsupported in batch mode. Full-text query syntax remains the same.

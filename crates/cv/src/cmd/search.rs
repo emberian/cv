@@ -445,7 +445,7 @@ mod tests {
                     limit,
                     ..
                 } => {
-                    assert_eq!(query, "error: std::io::Error");
+                    assert_eq!(query.as_deref(), Some("error: std::io::Error"));
                     assert_eq!(cwd.as_deref(), Some("proj-alpha"));
                     assert_eq!(filter_query.as_deref(), Some("after:2026-06-01"));
                     assert_eq!(limit, 5);

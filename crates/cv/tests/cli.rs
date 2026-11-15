@@ -452,7 +452,7 @@ fn search_batch_pins_index_and_continues_after_invalid_or_oversized_requests() {
     let (single, _) = w.cv_ok(&["search", "zebrafish", "--harness", "claude", "--frozen", "--json"]);
     let (expected, total) = search_json(&single);
     let input = format!(
-        "\"zebrafish\"\nnot-json\n\"(broken\"\n{}\n\"missing\"\n\"zebrafish\"\n",
+        "\"zebrafish\"\r\nnot-json\n\"(broken\"\n{}\n\"missing\"\n\"zebrafish\"",
         "x".repeat(1_048_577)
     );
     let (ok, _, out, err) = w.cv_stdin(&["search", "--batch", "--harness", "claude"], &input);
@@ -474,6 +474,8 @@ fn search_batch_pins_index_and_continues_after_invalid_or_oversized_requests() {
     for flags in [
         vec!["search", "--batch", "-q", "title:alpha"],
         vec!["search", "--batch", "--exact"],
+        vec!["search", "--batch", "--scan"],
+        vec!["search", "--batch", "--live-bytes", "0"],
     ] {
         let (ok, _, _, _) = w.cv(&flags);
         assert!(!ok);
