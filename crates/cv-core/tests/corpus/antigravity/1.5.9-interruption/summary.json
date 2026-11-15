@@ -35,7 +35,9 @@
       "compaction_boundaries": [],
       "subagent_spawns": 0,
       "subagent_returns": 0,
-      "affordances": {},
+      "affordances": {
+        "approval/approve": 2
+      },
       "tool_histogram": {
         "tools": {
           "run_command": {

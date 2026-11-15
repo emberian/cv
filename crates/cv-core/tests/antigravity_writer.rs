@@ -256,6 +256,60 @@ fn only(map: BTreeMap<String, (SessionRef, Session)>) -> (SessionRef, Session) {
 
 // ---- permissions -----------------------------------------------------------------------------
 
+#[test]
+fn permission_request_decision_and_tool_status_are_read() {
+    let world = world("agy-writer-permissions");
+    let root = store(&world, "1.5.9-permissions", false);
+    let read = sessions(&root);
+    assert_eq!(read.len(), 2);
+    let (asked, headless): (Vec<_>, Vec<_>) = read
+        .values()
+        .partition(|(_, session)| body(session, &session.messages[0]).contains("two gated"));
+    let (reference, session) = asked[0];
+    let steps = stored(&root, &session.id);
+    let approved = call_with(&steps, "approved fixture");
+    let denied = call_with(&steps, "denied fixture");
+    // CORTEX_STEP_STATUS: 3 DONE, 7 ERROR, 6 CANCELED.
+    assert_eq!(steps.iter().map(|s| s.status).collect::<Vec<_>>(), [3, 3, 3, 3, 7]);
+
+    let outcome = results(session);
+    assert_eq!(outcome[&approved], [(Some("completed".into()), false)]);
+    assert_eq!(outcome[&denied], [(Some("error".into()), true)]);
+    assert!(body(session, by_id(session, 2)).contains("approved fixture\r\n"));
+    let refusal = body(session, by_id(session, 4));
+    assert!(refusal.contains("user denied permission to run command"));
+    assert!(!refusal.contains("denied fixture\r\n"), "a denied command has no output");
+    assert_eq!(
+        native(by_id(session, 2))["interaction"],
+        json!({"kind": "permission", "action": "command", "target": "printf 'approved fixture\\n'", "decision": "approved"})
+    );
+    assert_eq!(
+        native(by_id(session, 4))["interaction"],
+        json!({"kind": "permission", "action": "command", "target": "printf 'denied fixture\\n'", "decision": "denied"})
+    );
+    // The approval row is the interaction's own (no call of its own); the denial row is
+    // the refused call's.
+    let approvals: Vec<_> = affordances(&root, reference)
+        .into_iter()
+        .filter(|row| row.0 == "approval")
+        .collect();
+    assert_eq!(approvals.len(), 2);
+    assert_eq!((approvals[0].1.as_str(), &approvals[0].2), ("approve", &None));
+    assert_eq!(approvals[0].3, "command printf 'approved fixture\\n'");
+    assert_eq!((approvals[1].1.as_str(), approvals[1].2.as_ref()), ("deny", Some(&denied)));
+
+    // Print mode cannot ask: the writer cancels the gated step and records no interaction.
+    let (reference, session) = headless[0];
+    let steps = stored(&root, &session.id);
+    let gated = call_with(&steps, "headless fixture");
+    assert_eq!(steps.last().unwrap().status, 6);
+    assert_eq!(results(session)[&gated], [(Some("canceled".into()), false)]);
+    let last = session.messages.last().unwrap();
+    assert!(native(last).get("interaction").is_none());
+    assert!(!body(session, last).contains("Command exited"));
+    assert!(affordances(&root, reference).iter().all(|row| row.0 != "approval"));
+    assert!(cv_core::distill::unsettled_calls(session).unwrap().is_empty());
+}
 
 // ---- interruption, retry, upstream errors -----------------------------------------------------
 
@@ -289,6 +343,10 @@ fn steps_absent_from_the_export_are_read_from_the_store() {
         let cancelled = body(&session, by_id(&session, 2));
         assert!(!cancelled.contains("interrupted fixture finished\r\n") && !cancelled.contains("Command exited"));
         assert!(body(&session, by_id(&session, 5)).contains("retried fixture finished\r\n"));
+        // Both commands were approved through ACP before they ran; the export has no such field.
+        for step in [2, 5] {
+            assert_eq!(native(by_id(&session, step))["interaction"]["decision"], "approved", "exported={exported}");
+        }
 
         let failure = by_id(&session, 8);
         assert_eq!(failure.kind, MessageKind::Error);

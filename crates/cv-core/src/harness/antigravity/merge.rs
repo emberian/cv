@@ -9,6 +9,8 @@ pub(super) struct Match {
     pub signature: Option<String>,
     pub usage: Option<Usage>,
     pub planner_details: Option<Value>,
+    /// The permission request and its answer, which the export does not carry.
+    pub interaction: Option<Value>,
     /// The native revision of a result whose call a verified planner step names.
     pub revised: Option<Revised>,
 }
@@ -17,7 +19,6 @@ pub(super) struct Match {
 pub(super) struct Revised {
     pub status: String,
     pub task_details: Option<Value>,
-    pub interaction: Option<Value>,
 }
 pub(super) struct Verified {
     pub matches: BTreeMap<u64, Match>,
@@ -196,6 +197,7 @@ pub(super) fn verified(
         if let Some(fields) = Fields::parse(view, STEP_KEYS)? {
             matched.usage = parse_step_usage(&fields)?;
             matched.planner_details = fields.value("native_planner_details")?;
+            matched.interaction = fields.value("native_interaction")?;
         }
         matches.insert(index, matched);
         Ok(Flow::Continue)
@@ -231,10 +233,10 @@ fn revision(view: JsonView<'_>, known_calls: &BTreeSet<String>) -> Result<Option
     };
     Ok(Some(Match {
         result: Some(id),
+        interaction: fields.value("native_interaction")?,
         revised: Some(Revised {
             status: fields.string("status")?.unwrap_or_default(),
             task_details: fields.value("native_task_details")?,
-            interaction: fields.value("native_interaction")?,
         }),
         ..Match::default()
     }))

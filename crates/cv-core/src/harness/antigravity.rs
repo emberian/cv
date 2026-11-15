@@ -218,6 +218,20 @@ impl Adapter for Antigravity {
 
     fn message_affordances(&self, m: &Message) -> Vec<crate::affordance::BagHit> {
         let bag = m.extra.get("antigravity");
+        // A denial already surfaces through its refusal text; an approval leaves no
+        // trace in the result body.
+        if let Some(interaction) = bag
+            .and_then(|v| v.get("interaction"))
+            .filter(|i| i.get("decision").and_then(Value::as_str) == Some("approved"))
+        {
+            let part = |key: &str| interaction.get(key).and_then(Value::as_str).unwrap_or_default();
+            return vec![crate::affordance::BagHit {
+                kind: crate::affordance::Kind::Approval,
+                action: "approve",
+                tool: "permission",
+                summary: format!("{} {}", part("action"), part("target")),
+            }];
+        }
         let task = |key: &str| bag.and_then(|v| v.get(key)).and_then(Value::as_str);
         let (action, task) = match (task("completed_task"), task("canceled_task")) {
             (Some(task), _) => ("complete", task),
@@ -2016,16 +2030,24 @@ impl StepCodec {
                 });
                 push_media_blocks(&mut m.content, fields.get("media"), media_marker)?;
                 attach_step_extras(&mut m, &fields, step_index, &source, status.as_deref(), want_extra)?;
+                // Job identity and a permission answer drive lifecycle and affordance
+                // decoding at every tier.
+                let interaction = fields.value("native_interaction")?;
                 #[cfg(feature = "sqlite")]
-                if let Some(native) = revised {
-                    // Job identity drives lifecycle decoding at every tier.
-                    let bag = m.harness_extra_mut(Harness::Antigravity);
-                    if let Some(task) = &native.task_details {
-                        bag.insert("task_details".into(), task.clone());
-                    }
-                    if let Some(interaction) = &native.interaction {
-                        bag.insert("interaction".into(), interaction.clone());
-                    }
+                let interaction = interaction.or_else(|| {
+                    self.enrich
+                        .verified
+                        .get(&step_index)
+                        .and_then(|m| m.interaction.clone())
+                });
+                if let Some(interaction) = interaction {
+                    m.harness_extra_mut(Harness::Antigravity)
+                        .insert("interaction".into(), interaction);
+                }
+                #[cfg(feature = "sqlite")]
+                if let Some(task) = revised.and_then(|native| native.task_details.as_ref()) {
+                    m.harness_extra_mut(Harness::Antigravity)
+                        .insert("task_details".into(), task.clone());
                 }
                 Ok(sink.message(m))
             }
@@ -2335,7 +2357,6 @@ fn attach_step_extras(
         ("native_planner_details", "planner_details"),
         ("native_scope_items", "scope_items"),
         ("native_task_details", "task_details"),
-        ("native_interaction", "interaction"),
     ] {
         if let Some(value) = fields.value(field)? {
             bag.insert(key.into(), value);

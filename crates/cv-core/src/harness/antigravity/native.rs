@@ -2,6 +2,7 @@
 //! present: native CLEARED steps are not replacements for retained exported text.
 mod context;
 mod identity;
+mod interaction;
 mod media;
 mod render;
 mod wire;
@@ -169,6 +170,7 @@ fn project(file: &File, step: &Proto, index: u64, complete: bool, out: &mut impl
     if let Some(details) = step.last(148) {
         context::task(file, &details.message(file)?, out)?;
     }
+    interaction::project(file, step, out)?;
     match kind {
         "USER_INPUT" => {
             let input = step.last(19).unwrap().message(file)?;

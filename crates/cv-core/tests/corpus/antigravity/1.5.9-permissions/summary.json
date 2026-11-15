@@ -26,6 +26,7 @@
       "subagent_spawns": 0,
       "subagent_returns": 0,
       "affordances": {
+        "approval/approve": 1,
         "approval/deny": 1
       },
       "tool_histogram": {
