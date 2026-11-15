@@ -36,7 +36,7 @@ has landed. The existing adapter, IR, query API and routes remain the product sh
 | atomic_index | Shared bounded staging and coherent FTS/event/count/baseline publication | Implementing |
 | search_work | Prepared/batch search, frozen work accounting and repeated-query regression checks | Implementing |
 | handoff | Distill budgets, unfinished work, supersession and resumability | Implementing |
-| fidelity | Shared coverage contract and show/doctor/API visibility | Implementing |
+| fidelity | Shared coverage contract and show/doctor/API visibility | Core contract integrated; consumers in progress |
 | integration | Resolve interfaces, reconcile backlog, integrate, run composed release gates and install | Active |
 
 Each lane uses its own worktree, target and scratch CV home. Harness homes are
@@ -84,6 +84,18 @@ then reconcile the document; do not reimplement an already-landed mechanism.
 `DATAPATHS.md` also carries dated open claims and fleet measurements. Update claims
 only against actual code and tests. Fresh fleet measurements belong in commit
 messages, not committed result files.
+
+## Integration findings
+
+- Independent lifecycle tests exposed a pre-existing merge error: index plus
+  second-resolution timestamp can attach native usage from another revision.
+  Enrichment must require verified identity; usage is not exempt from that rule.
+- Index publication must batch completed staged sessions and defer derived state
+  until durable commit. A commit for every session would introduce a new scaling
+  problem and is not the intended production design.
+- Several historical task-ledger items describe machinery intentionally removed
+  by the current task contract. Reconciliation must distinguish removed designs,
+  implemented work needing closure, and reproduced defects.
 
 ## Integration and release
 
