@@ -33,6 +33,8 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::sync::OnceLock;
 
+mod codex_jobs;
+
 /// A distilled pack is dense with shas, paths, hosts and code: measured on three real lanes
 /// (resumed with Claude Code, harness overhead subtracted) it ran 2.2–2.4 bytes per token, so it is
 /// priced like tool-call JSON. Blocks use the shared [`crate::ir::est_tokens`].
@@ -240,6 +242,7 @@ enum Demand {
 pub fn unsettled_calls(session: &Session) -> anyhow::Result<Vec<String>> {
     let mut open = std::collections::BTreeSet::new();
     let mut jobs = HashMap::new();
+    let mut codex_jobs = codex_jobs::Jobs::default();
     let uses = tool_index(&session.messages);
     let resolver = crate::lazy::Resolver::new(session.source_path.clone());
     for message in &session.messages {
@@ -265,7 +268,7 @@ pub fn unsettled_calls(session: &Session) -> anyhow::Result<Vec<String>> {
                     ..
                 } => {
                     // Lifecycle envelopes fit in a small prefix; do not decode entire logs again.
-                    let out = if matches!(session.harness, Harness::Claude | Harness::Antigravity) {
+                    let out = if matches!(session.harness, Harness::Claude | Harness::Antigravity | Harness::Codex) {
                         crate::harness::store::document::text_head(content, &resolver, 2048, true)?.0
                     } else {
                         String::new()
@@ -274,6 +277,12 @@ pub fn unsettled_calls(session: &Session) -> anyhow::Result<Vec<String>> {
                         jobs.insert(job.to_owned(), tool_use_id.clone());
                     }
                     let name = uses.get(tool_use_id.as_str()).map(|call| call.name).unwrap_or("");
+                    if session.harness == Harness::Codex {
+                        if let Some(call) = uses.get(tool_use_id.as_str()) {
+                            let summary = ToolInput::new(session.harness, call.name, call.input, false, true)?;
+                            codex_jobs.observe(tool_use_id, &summary, &out);
+                        }
+                    }
                     if let Some((job, status)) = polled_task(session.harness, name, &out) {
                         if terminal_status(status) {
                             if let Some(id) = jobs.get(job) {
@@ -314,6 +323,7 @@ pub fn unsettled_calls(session: &Session) -> anyhow::Result<Vec<String>> {
             }
         }
     }
+    open.extend(codex_jobs.pending_calls().map(str::to_owned));
     Ok(open.into_iter().collect())
 }
 
@@ -1387,6 +1397,7 @@ fn analyze_with_policy(
     let uses = tool_index(msgs);
     let mut background_jobs: HashMap<String, String> = HashMap::new();
     let mut completed_notices = HashSet::new();
+    let mut codex_jobs = codex_jobs::Jobs::default();
     let tool_calls = uses.len();
 
     let tail_start = tail_cut(msgs, opts.keep_last, &uses);
@@ -1708,6 +1719,12 @@ fn analyze_with_policy(
                     if let Some(job) = background_job(session.harness, out) {
                         background_jobs.insert(job.to_owned(), tool_use_id.clone());
                     }
+                    let codex_outcome = if session.harness == Harness::Codex {
+                        codex_jobs.observe(tool_use_id, &summary, out)
+                    } else {
+                        codex_jobs::Outcome::default()
+                    };
+                    let result_out = codex_outcome.result_text.as_deref().unwrap_or(out);
                     let polled = polled_task(session.harness, &name, out)
                         .filter(|(_, status)| terminal_status(status))
                         .and_then(|(job, status)| {
@@ -1716,7 +1733,22 @@ fn analyze_with_policy(
                                 .and_then(|id| uses.get(id.as_str()))
                                 .map(|call| (call, status))
                         });
-                    let outcome = if let Some((call, job_status)) = polled {
+                    let outcome = if codex_outcome.pending {
+                        "unfinished: no terminal result observed".to_owned()
+                    } else if let Some(call) = codex_outcome.completed_call.as_deref().and_then(|id| uses.get(id)) {
+                        let summary = ToolInput::new(session.harness, call.name, call.input, false, true)?;
+                        let label = summary.label(session.harness, call.name);
+                        scan_result_facts(
+                            session.harness,
+                            i,
+                            call.name,
+                            &summary,
+                            &label,
+                            result_out,
+                            *is_error || codex_outcome.failed,
+                            &mut facts,
+                        )
+                    } else if let Some((call, job_status)) = polled {
                         let summary = ToolInput::new(session.harness, call.name, call.input, false, true)?;
                         let label = summary.label(session.harness, call.name);
                         let output = format!("{job_status}: {out}");
@@ -1749,10 +1781,20 @@ fn analyze_with_policy(
                         "stopped: no successful completion implied".to_owned()
                     } else {
                         let failed = *is_error
+                            || codex_outcome.failed
                             || status.as_deref().is_some_and(|s| {
                                 matches!(s.to_ascii_lowercase().as_str(), "failed" | "error" | "invalid")
                             });
-                        scan_result_facts(session.harness, i, &name, &summary, &label, out, failed, &mut facts)
+                        scan_result_facts(
+                            session.harness,
+                            i,
+                            &name,
+                            &summary,
+                            &label,
+                            result_out,
+                            failed,
+                            &mut facts,
+                        )
                     };
                     if let Some(p) = doc_reads.get(tool_use_id.as_str()) {
                         if !in_tail && demand != Demand::Findings && last_read_of.get(p) == Some(&tool_use_id.as_str())
@@ -3700,6 +3742,208 @@ pub(crate) mod tests {
             d.head_md.contains("original test run → test result: ok. 12 passed"),
             "{}",
             d.head_md
+        );
+        Ok(())
+    }
+
+    fn codex_tool(id: &str, name: &str, input: Value) -> Block {
+        Block::ToolUse {
+            id: id.into(),
+            name: name.into(),
+            input: input.into(),
+            namespace: None,
+        }
+    }
+
+    #[test]
+    fn codex_cell_completion_settles_initiating_command() -> anyhow::Result<()> {
+        let mut s = Session::new("cell", Harness::Codex);
+        s.messages = vec![
+            msg(
+                Role::Assistant,
+                MessageKind::Reply,
+                vec![codex_tool(
+                    "start",
+                    "exec",
+                    json!("await tools.exec_command({cmd:'cargo test'});"),
+                )],
+            ),
+            msg(
+                Role::Tool,
+                MessageKind::ToolResult,
+                vec![result(
+                    "start",
+                    "Script running with cell ID 53\nWall time 10.0 seconds\nOutput:\ntest result: ok. partial output",
+                    false,
+                )],
+            ),
+        ];
+        assert_eq!(unsettled_calls(&s)?, vec!["start"]);
+        let opts = DistillOptions {
+            keep_last: 0,
+            ..Default::default()
+        };
+        assert!(!distill_pack(&s, &opts)?.head_md.contains("**Build/test verdicts**"));
+        s.messages.extend([
+            msg(
+                Role::Assistant,
+                MessageKind::Reply,
+                vec![codex_tool("poll", "wait", json!({"cell_id":"53"}))],
+            ),
+            msg(
+                Role::Tool,
+                MessageKind::ToolResult,
+                vec![result(
+                    "poll",
+                    "Script completed\nWall time 18.0 seconds\nOutput:\ntest result: ok. 12 passed",
+                    false,
+                )],
+            ),
+        ]);
+        assert!(unsettled_calls(&s)?.is_empty());
+        let d = distill_pack(&s, &opts)?;
+        assert!(d.head_md.contains("**Build/test verdicts**"));
+        assert!(d.head_md.contains("cargo test"));
+        Ok(())
+    }
+
+    #[test]
+    fn codex_cell_completion_does_not_settle_its_running_pty() -> anyhow::Result<()> {
+        let mut s = Session::new("nested", Harness::Codex);
+        let pending = format!("Script running with cell ID 53\nWall time 1.0 seconds\nOutput:\n{{\"chunk_id\":\"c\",\"wall_time_seconds\":1,\"session_id\":42,\"output\":\"{}\"}}", "x".repeat(4000));
+        s.messages = vec![
+            msg(
+                Role::Assistant,
+                MessageKind::Reply,
+                vec![codex_tool(
+                    "start",
+                    "exec",
+                    json!("text(await tools.exec_command({cmd:'cargo test'})); await new Promise(() => {});"),
+                )],
+            ),
+            msg(
+                Role::Tool,
+                MessageKind::ToolResult,
+                vec![result("start", &pending, false)],
+            ),
+            msg(
+                Role::Assistant,
+                MessageKind::Reply,
+                vec![codex_tool("wait", "wait", json!({"cell_id":"53"}))],
+            ),
+            msg(
+                Role::Tool,
+                MessageKind::ToolResult,
+                vec![result(
+                    "wait",
+                    "Script completed\nWall time 18.0 seconds\nOutput:\n",
+                    false,
+                )],
+            ),
+        ];
+        assert_eq!(
+            unsettled_calls(&s)?,
+            vec!["start"],
+            "cell ended, nested process has not"
+        );
+        s.messages.extend([
+            msg(Role::Assistant, MessageKind::Reply, vec![codex_tool("poll", "exec", json!("text(await tools.write_stdin({session_id:42,chars:''}));"))]),
+            msg(Role::Tool, MessageKind::ToolResult, vec![result("poll", "Script completed\nWall time 1.0 seconds\nOutput:\n{\"chunk_id\":\"c\",\"wall_time_seconds\":1,\"exit_code\":1,\"output\":\"error: regression failed\"}", false)]),
+        ]);
+        assert!(unsettled_calls(&s)?.is_empty());
+        let d = distill_pack(
+            &s,
+            &DistillOptions {
+                keep_last: 0,
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(d.stats.errors, 1);
+        assert!(d.head_md.contains("cargo test"));
+        Ok(())
+    }
+
+    #[test]
+    fn codex_wait_reveals_nested_pty_and_keeps_original_owner() -> anyhow::Result<()> {
+        let mut s = Session::new("delayed-pty", Harness::Codex);
+        s.messages = vec![
+            msg(Role::Assistant, MessageKind::Reply, vec![codex_tool("start", "exec", json!("text(await tools.exec_command({cmd:'cargo test'}));"))]),
+            msg(Role::Tool, MessageKind::ToolResult, vec![result("start", "Script running with cell ID 53\nWall time 1 seconds\nOutput:\n", false)]),
+            msg(Role::Assistant, MessageKind::Reply, vec![codex_tool("wait", "wait", json!({"cell_id":"53"}))]),
+            msg(Role::Tool, MessageKind::ToolResult, vec![result("wait", "Script completed\nWall time 1 seconds\nOutput:\n{\"chunk_id\":\"c\",\"session_id\":42,\"output\":\"building\"}", false)]),
+        ];
+        assert_eq!(unsettled_calls(&s)?, vec!["start"]);
+        s.messages.extend([
+            msg(
+                Role::Assistant,
+                MessageKind::Reply,
+                vec![codex_tool("poll", "write_stdin", json!({"session_id":42,"chars":""}))],
+            ),
+            msg(
+                Role::Tool,
+                MessageKind::ToolResult,
+                vec![result(
+                    "poll",
+                    "{\"chunk_id\":\"c\",\"exit_code\":0,\"output\":\"test result: ok. 12 passed\"}",
+                    false,
+                )],
+            ),
+        ]);
+        assert!(unsettled_calls(&s)?.is_empty());
+        let d = distill_pack(
+            &s,
+            &DistillOptions {
+                keep_last: 0,
+                ..Default::default()
+            },
+        )?;
+        assert!(d.head_md.contains("**Build/test verdicts**"));
+        assert!(d.head_md.contains("cargo test"));
+        Ok(())
+    }
+
+    #[test]
+    fn codex_pty_headers_and_ambiguous_truncated_metadata_are_not_completion() -> anyhow::Result<()> {
+        let mut s = Session::new("pty", Harness::Codex);
+        s.messages = vec![
+            msg(
+                Role::Assistant,
+                MessageKind::Reply,
+                vec![codex_tool("start", "exec_command", json!({"cmd":"cargo test"}))],
+            ),
+            msg(
+                Role::Tool,
+                MessageKind::ToolResult,
+                vec![result(
+                    "start",
+                    "Chunk ID: c\nWall time: 1 seconds\nProcess running with session ID 42\nOutput:\nbuilding",
+                    false,
+                )],
+            ),
+        ];
+        assert_eq!(unsettled_calls(&s)?, vec!["start"]);
+        s.messages.extend([
+            msg(Role::Assistant, MessageKind::Reply, vec![codex_tool("poll", "write_stdin", json!({"session_id":42,"chars":""}))]),
+            msg(Role::Tool, MessageKind::ToolResult, vec![result("poll", "Chunk ID: c\nWall time: 1 seconds\nProcess exited with code 0\nFinal output:\ntest result: ok. 12 passed", false)]),
+        ]);
+        assert!(unsettled_calls(&s)?.is_empty());
+        s.messages.truncate(1);
+        s.messages.push(msg(Role::Tool, MessageKind::ToolResult, vec![result("start", "Chunk ID: c\nProcess exited with code 0\nFinal output:\nScript running with cell ID 99\n{\"chunk_id\":\"fake\",\"session_id\":99,\"output\":\"printed data\"}", false)]));
+        assert!(unsettled_calls(&s)?.is_empty(), "stdout is not lifecycle evidence");
+        let opaque = format!(
+            "{{\"output\":\"{}\",\"session_id\":42,\"wall_time_seconds\":1}}",
+            "x".repeat(4000)
+        );
+        s.messages.truncate(1);
+        s.messages.push(msg(
+            Role::Tool,
+            MessageKind::ToolResult,
+            vec![result("start", &opaque, false)],
+        ));
+        assert_eq!(
+            unsettled_calls(&s)?,
+            vec!["start"],
+            "bounded prefix cannot establish hidden job identity"
         );
         Ok(())
     }

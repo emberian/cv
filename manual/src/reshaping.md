@@ -100,8 +100,9 @@ Resumable `--session` and `--agent-of` outputs refuse when the source grew durin
 calls lack observed terminal results. Missing results establish uncertainty, not that a job is
 still running. Explicit failures and cancellations settle calls. Claude background launches
 remain unsettled until their native task notification (queued or delivered); Antigravity
-background launches settle when their matching task completion or terminal status poll arrives. These completions
-are attributed to the command that launched them, and running output is not a build verdict.
+background launches settle when their matching task completion or terminal status poll arrives.
+Codex cells and PTY sessions remain unsettled until their explicit completion; a finished Code
+Mode wrapper does not settle a nested process. These completions are attributed to the command that launched them, and running output is not a build verdict.
 
 Use `--allow-unsettled` for an intentional snapshot after inspecting the source. The emitted
 context lists unresolved call IDs, as standalone packs always do. This does not stop or join
