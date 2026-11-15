@@ -1,10 +1,10 @@
 # 0.20 candidate: reliable live histories and trustworthy handoffs
 
-Status: candidate version `0.20.0`, source-reader version 13, unreleased and untagged. Code was
-first frozen at `d7e8506c` (integration owner: Codex); a second review pass by Claude Fable on
-2026-11-15 found and fixed further defects against the real fleet, listed first in
-[BACKLOG.md](BACKLOG.md). This is not a public release announcement. The adapter, IR, query API
-and existing routes remain the product shape.
+Status: candidate `0.20.0`, source-reader version 13, unreleased and untagged. The current
+feature reconciliation is against `6809bfa5`; final integration gates are underway. The earlier
+candidate passed its gates before these additions. Claude Fable's second review pass fixed
+further real-fleet defects, recorded in [BACKLOG.md](BACKLOG.md). This remains the existing
+adapter, IR, query API and command surfaces; `fn` is outside this release's scope.
 
 ## Implemented outcomes
 
@@ -26,7 +26,8 @@ and existing routes remain the product shape.
    NDJSON framing isolates malformed requests; filters, counts and refresh behavior
    have regression coverage. Batch does no discovery or source reads and explicitly
    does not assess source freshness. Ordinary frozen search retains its separate
-   freshness and snippet behavior; the original issue 33 workload is not reproduced.
+   freshness and snippet behavior. The second pass reproduced and fixed issue 33’s
+   severe catalog-WAL rediscovery failure; ordinary per-query freshness work remains.
 4. **Handoffs enforce budgets and preserve unresolved work.** Aggregate byte and
    estimated-token ceilings are checked before publication/retirement. Typed harness
    lifecycle observations correlate supported Claude, Antigravity and Codex jobs
@@ -39,6 +40,17 @@ and existing routes remain the product shape.
    members. Unknown identifiers survive JSON round trips; absence means unassessed.
    Frozen state reads use stable private SQLite snapshots without source-side writes,
    with snapshot ownership retained until the connection closes.
+6. **Select and orient around known sources.** Repeated `pack --session` selections bypass
+   corpus search and need no index. A task is optional: without one, the shared overview
+   selects initial/recent requests, worker replies, file events and commands with source
+   locations and omission counts. `show --kind overview`, the overview API route and the
+   reader's on-demand Overview button expose the same bounded evidence. Imported browser
+   sessions require WASM and disclose that worker discovery/file checks were not performed.
+7. **Inspect saved context and follow workers.** `show --kind context` and matching API
+   windows expose recorded usage and compaction rows, deduplicating repeated provider
+   records and preserving unknown values. `lanes --follow` emits initial workers and changed
+   status/results through a deadline or interruption. `resume --json` returns literal
+   program/arguments, cwd, hints and warnings without launching a process.
 
 ## Completed implementation lanes
 
@@ -52,7 +64,9 @@ and existing routes remain the product shape.
 | handoff | Aggregate budgets, typed job ownership/completion, explicit unsettled snapshots and cycle rejection |
 | fidelity | Shared coverage metadata, final-metadata propagation, independent API/doctor/Markdown/media tests |
 | backlog_audit | Historical task reconciliation, corrected design claims and independent tool/web/desktop gates |
-| integration | Code integration and local release gates complete |
+| selected pack / overview | Explicit sources, optional-task overview, shared CLI/API/reader projection and source links |
+| context / worker following | Saved context rows, `lanes --follow` changes and non-launching resume JSON |
+| integration | Additions integrated through `6809bfa5`; final composed gates underway |
 
 ## Acceptance evidence and its limits
 
@@ -72,19 +86,23 @@ and existing routes remain the product shape.
 - The native-image counting gate bounds additional live Rust allocations;
   public image reads still own data-URI strings. It does not bound SQLite/C memory,
   mappings or total process footprint. See the coverage matrix's media boundary.
-- Full workspace build, clippy and tests, plus final portable, WASM and corpus gates,
-  passed on the frozen candidate. Package, compatibility, upgrade, pinned-Codex
-  hooks, manual build/names and dist plan also passed. Tool controls and browser
-  gates passed; native macOS desktop check/tests passed at `8cdd6db6`. These local
-  gates do not imply testing every supported operating system.
+- The earlier candidate passed workspace, portable/WASM, corpus, package, compatibility,
+  upgrade, pinned-Codex, manual, browser and native desktop gates. The newly integrated
+  selection/overview/context/follow/resume changes have focused regression tests; final
+  composed gates are underway. Earlier passes do not certify the new integrated tree.
 
 ## Remaining work and limits
 
 The second pass closed the retirement fallback, the reproducible form of issue 33, persisted-output
 containment, absent-root pruning, live-session rereads and the Antigravity export reconciliation,
 and added seven real-writer captures. What remains is listed, in order of consequence, under
-"Still open after this pass" in the backlog. No claim of complete Antigravity fidelity or native
-emission follows from indexing.
+"Still open after this pass" in the backlog. Ordinary search freshness remains fleet-proportional;
+Fleet’s dual frozen/unfrozen listing workaround remains pending incident reproduction. Overview
+bounds output, not parent traversal or worker discovery cost. No claim of complete Antigravity
+fidelity or native emission follows from indexing.
+
+Fleet’s `d58a1cce` reader correction is a separate repository commit, not a cv change. Its exact-source
+and native-resume follow-up is awaiting composition checks; no Fleet merge or deployment is claimed.
 
 [BACKLOG.md](BACKLOG.md) contains reconciled task dispositions and acceptance criteria
 for these follow-ups. The read-only inventory found 15 nominally open local tasks

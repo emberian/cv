@@ -1,16 +1,43 @@
 # 0.20 backlog: reconciled scope and remaining work
 
-This is the maintained release backlog, not a dump of historical open labels. Reconciled on
-2026-11-14: initial inventory at `d95e2143`, implementation reconciliation at candidate
-`d7e8506c`, using the read-only local task ledger (`cv task list --repo … --all
---json --detail`, `CV_FROZEN=1`), [GitHub issue 33](https://github.com/emberian/cv/issues/33),
-current implementations and focused tests. The local ledger had 24 tasks: 15 open, nine done;
-seven open tasks were tagged `landed-verify`. No ledger state was changed by this audit.
+This is the maintained release backlog, not a dump of historical open labels. The read-only
+2026-11-14 inventory at `d95e2143` was reconciled at `d7e8506c`, through the second pass below,
+and against approved feature additions at `6809bfa5`. Sources are the local ledger
+(`CV_FROZEN=1 cv task list --repo … --all --json --detail`),
+[GitHub issue 33](https://github.com/emberian/cv/issues/33), current code/manuals and focused tests.
+The inventory had 24 tasks: 15 open, nine done; seven open tasks were tagged `landed-verify`.
+No ledger state was changed by this audit.
 
 Update a row when its implementation and acceptance evidence land. A historical `done`, closed
 issue or agent note is a lead, not a current compatibility or performance guarantee. Concrete
 release outcomes and their integration gates belong in the sibling release plan; this page
 keeps their provenance and separates unresolved work from obsolete requests.
+
+## Current additions (`6809bfa5`)
+
+Implemented in cv; final composed gates are underway. These add to the earlier validated
+candidate, rather than inheriting its gate result. `fn` is excluded from this release.
+
+| User action | Implemented contract | Code/test witness |
+|---|---|---|
+| Select known conversations with `pack --session` | Repeated IDs/harness IDs/paths bypass recall and need no index. Optional task focuses excerpts; no task uses bounded overview. All selected sources participate, distinct paths sharing a native ID remain separate, and read failure precedes output publication | `cmd/pack.rs`; `tests/pack.rs` selected-source, no-task, duplicate-ID and partial-publication tests; [pack manual](../../../manual/src/pack.md) |
+| Open `show --kind overview`, the overview API, or reader Overview | Shared initial/recent requests, workers, file events and commands retain source indexes, omission counts and coverage. File presence is current metadata; file bodies are not read. Imported sessions disclose unavailable worker/file checks | `cv-core/src/overview.rs`, `api.rs`, `cv-web/src/lib.rs`; CLI/API parity tests and `web/selftest.html`; [viewing manual](../../../manual/src/viewing-and-sharing.md#session-overview) |
+| Inspect `show --kind context` and API windows | Saved per-call usage and compaction rows retain original indexes, deduplicate repeated provider records and label saved estimates. Unknown limits remain null; no live remaining-context estimate | `cv-core/src/context.rs`; `tests/context.rs`; [context contract](../../../manual/src/cli.md#saved-token-usage---kind-context) |
+| Follow `lanes --follow [--for …] [--json]` | One parent's initial and changed rows, including final transitions after a selection filter stops matching; no idle duplicates; deadline/interrupt exits | `cmd/session_reports.rs`; `tests/worker_follow.rs`; [lanes manual](../../../manual/src/cli.md#cv-lanes) |
+| Read `resume --json` | Literal program/argument array, cwd, hint and warning; GUI-only targets remain explicit. Never launches; conflicts with `--launch` | `cmd/port.rs` resume JSON tests; [resume manual](../../../manual/src/cli.md#cv-resume) |
+
+**Separate Fleet consumer work:** `d58a1cce` in the Fleet repository preserves distinct
+harness/ID/path sources, timestamp precision and unknown counts, uses the configured cv binary
+and shared roots/TMPDIR, and refuses ambiguous exact IDs. Scoped tests passed there. The
+exact-source map/doctor selectors and native `cv resume --json` follow-up are being composed
+against the new cv binary; no Fleet merge, push or deployment is claimed by this tracker.
+
+**Still open:** Fleet retains its frozen-plus-unfrozen listing workaround until the affected
+root/harness incident is reproduced. Ordinary search retains fleet-proportional freshness work;
+repeated-search consumer measurements remain separate from the already implemented batch
+snapshot API. Overview's bounded output does not bound parent traversal or worker-forest reads.
+The [native coverage matrix](ANTIGRAVITY-COVERAGE.md) and [handoff limits](HANDOFF.md) remain the
+source of unresolved Agy and lifecycle cases.
 
 ## Second pass (Claude Fable, 2026-11-15)
 
@@ -44,7 +71,8 @@ Still open after this pass, most consequential first:
    what `wake_mode` means); `FileEdit.diff`, GenerateImage/DefineSubagent payloads and blob
    references are retained in COMPLETE only; non-permission interactions (`ask_question`) were not
    driven; audio/video prompts are refused by the CLI's ACP server; a rename action does not exist.
-   `agy` was never launched for a resume, so the resume caveat is derived from store layout.
+   The writer capture covers store-only resume; new cv/Fleet native-resume selection still
+   needs its own composition checks.
 4. **Index contracts not adversarially tested here**: schema-migration crash boundaries,
    a derived write failing after FTS publication and the reverse, held-generation freshness. The
    existing tests were read, none added.
@@ -65,18 +93,19 @@ closed in the real ledger by this audit.
 | P0 | Preserve last-good search state on failed updates | Implemented staging, compatible rebuild retention, incomplete-discovery pruning guards and validated schema replacement. `fts.rs` failure/rebuild tests and `fts/migration.rs` tests retain retryability and detect incomplete derived state |
 | P0 | Preserve native tool identity, usage and payload attribution | Implemented verified enrichment; timestamp-only matching cannot transfer usage across revisions. Conflicting/unanchored native tails disclose `unreconciled_history`; native emission and universal fidelity remain outside the claim |
 | P1 | Make read sources and known gaps visible | Implemented optional `extra.cv.read_coverage` through text, JSON/API and doctor, including late metadata. Independent fidelity and media-budget tests cover public windows; absence remains unassessed |
-| P1 | Reuse repeated indexed-query setup | Implemented `PreparedIndex` and NDJSON `--batch`, pinned snapshots, filters/counts, per-line errors and logical work counters. Ordinary frozen search validates its index before discovery and binds freshness to the held generation; issue 33's original cost report remains unverified |
+| P1 | Reuse repeated indexed-query setup | Implemented `PreparedIndex` and NDJSON `--batch`, pinned snapshots, filters/counts, per-line errors and logical work counters. Ordinary frozen search validates its index before discovery and binds freshness to the held generation; the severe issue 33 catalog-WAL rediscovery failure was reproduced and fixed; per-query freshness cost remains |
 | P1 | Budgeted handoffs and explicit unresolved work | Implemented supported lifecycle protocols, aggregate budgets, unsettled snapshots and cycle rejection. [HANDOFF.md](HANDOFF.md) separates these guarantees from semantic supersession, unknown lifecycle patterns and tokenizer accounting |
-| P1 | Current composed fleet performance evidence | Still open. Separate ordinary frozen/live and batch queries, cold/warm setup, unchanged/retry indexing, compressed Codex, native Agy and state snapshot costs. Record measurements and conditions in commit messages |
+| P1 | Performance follow-through | Warm-fleet second-pass evidence exists. Cold/first-index costs, physical I/O, ordinary freshness work and consumer dual reads remain open; measure new overview/selected-pack paths separately. Record results in commit messages |
 
-Native coverage follow-up is concrete: the [outstanding writer-generated scenarios and media
-allocation boundary](ANTIGRAVITY-COVERAGE.md) cover permissions/cancellation/retries, prompt media
-and linked attachments, structured generic/render-only results, nested swarms/peer delivery,
-live source promotion, native-only resume roots and giant/portable native reads. The independent
-[`antigravity_fidelity` tests](../../../crates/cv-core/tests/antigravity_fidelity.rs) and
-[`antigravity_lifecycle` tests](../../../crates/cv-core/tests/antigravity_lifecycle.rs) are current
-witnesses, not proof of those remaining scenarios. Reading native metadata does not establish
-that cv can plant an Agy session or recover identities the producer never recorded.
+The [coverage matrix](ANTIGRAVITY-COVERAGE.md) now includes real permission, interruption/retry,
+background, swarm/subagent, prompt-image and compaction/resume captures. Remaining cases include
+audio/video, structured generic/render-only and native-cleared payloads, non-permission
+interactions, parked-worker status/spawn links, live source promotion and giant/portable native
+reads. See the matrix for the exact boundaries, including owned inline-media allocations.
+[`antigravity_writer`](../../../crates/cv-core/tests/antigravity_writer.rs),
+[`antigravity_fidelity`](../../../crates/cv-core/tests/antigravity_fidelity.rs) and
+[`antigravity_lifecycle`](../../../crates/cv-core/tests/antigravity_lifecycle.rs) are current
+witnesses, not proof of all native fidelity or round-trip emission.
 
 ## Local task reconciliation
 
@@ -172,7 +201,7 @@ panics or forking Tantivy; arbitrary corruption recovery is not implied.
   usage accounting, doctor and complete-mode exports. Added native-only sessions must not steal
   an existing exported session's identity or silently duplicate tool/usage records.
 
-Full workspace build/clippy/tests, final portable/WASM/corpus checks, package, compatibility,
-upgrade, pinned-Codex hooks, manual build/names and dist plan have passed locally. Earlier native
-desktop and browser checks are recorded in the release plan. Installation, main integration and
-push remain pending; no public release is asserted here.
+The earlier candidate passed local workspace, portable/WASM/corpus, package, compatibility,
+upgrade, pinned-Codex, manual, desktop and browser gates. Final composed gates for the new
+features at `6809bfa5` are underway. Their focused tests are witnesses above, not a substitute
+for those final checks; no public release or Fleet deployment is asserted here.
