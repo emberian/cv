@@ -202,7 +202,12 @@ impl Adapter for Antigravity {
 
     fn delivered_body<'a>(&self, m: &Message, text: &'a str) -> Option<&'a str> {
         if m.origin == Origin::Subagent || m.kind == MessageKind::InjectedContext {
-            return unwrap_system_message_body(text);
+            let body = unwrap_system_message_body(text)?;
+            if m.kind == MessageKind::SubagentReturn {
+                // What the child said, without the harness's idle notice around it.
+                return Some(idle_child(body).map_or(body, |(_, response)| response));
+            }
+            return Some(body);
         }
         None
     }
@@ -1174,6 +1179,9 @@ struct SubagentDescriptor {
     type_name: Option<String>,
     role: Option<String>,
     workspace_uris: Vec<String>,
+    /// The swarm registry's own record of this member: name, who added it, and the
+    /// distinct phase, desired-state, wake-mode and killed fields.
+    member: Map<String, Value>,
 }
 
 fn read_subagent_descriptors(brain_dir: &Path) -> Result<Vec<SubagentDescriptor>> {
@@ -1241,8 +1249,10 @@ fn read_subagent_descriptors(brain_dir: &Path) -> Result<Vec<SubagentDescriptor>
             type_name,
             role,
             workspace_uris,
+            member: Map::new(),
         });
     }
+    let own = brain_dir.file_name().and_then(|name| name.to_str());
     let members_path = brain_dir.join(".system_generated/swarm/members.json");
     if let Ok(source) = crate::json::JsonSource::capture(&members_path) {
         if source.len() <= 1024 * 1024 {
@@ -1257,6 +1267,17 @@ fn read_subagent_descriptors(brain_dir: &Path) -> Result<Vec<SubagentDescriptor>
                         let Some(id) = member.get("conversation_id").and_then(Value::as_str) else {
                             continue;
                         };
+                        // The registry lists its owner (the coordinator) among the members.
+                        if Some(id) == own {
+                            continue;
+                        }
+                        let mut record = Map::new();
+                        record.insert("member".into(), Value::String(name.clone()));
+                        for key in ["added_by", "phase", "desired_state", "wake_mode", "killed"] {
+                            if let Some(value) = member.get(key) {
+                                record.insert(key.into(), value.clone());
+                            }
+                        }
                         let killed = member.get("killed").and_then(Value::as_bool) == Some(true)
                             || member.get("phase").and_then(Value::as_str) == Some("KILLED");
                         if let Some(existing) = out.iter_mut().find(|d| d.conversation_id == id) {
@@ -1266,6 +1287,7 @@ fn read_subagent_descriptors(brain_dir: &Path) -> Result<Vec<SubagentDescriptor>
                             if existing.type_name.is_none() {
                                 existing.type_name = Some(name.clone());
                             }
+                            existing.member = record;
                             continue;
                         }
                         out.push(SubagentDescriptor {
@@ -1276,6 +1298,7 @@ fn read_subagent_descriptors(brain_dir: &Path) -> Result<Vec<SubagentDescriptor>
                             type_name: Some(name.clone()),
                             role: member.get("role").and_then(Value::as_str).map(str::to_owned),
                             workspace_uris: Vec::new(),
+                            member: record,
                         });
                     }
                 }
@@ -1400,7 +1423,7 @@ fn scan_transcript(id: &str, transcript: &Path, app_data_dir: Option<&Path>) -> 
                         .get("step_index")
                         .and_then(|v| v.as_number().ok().flatten())
                         .and_then(|n| n.as_u64());
-                    if ty == "USER_INPUT" || (ty == "SYSTEM_MESSAGE" && idx == Some(0)) {
+                    if ty == "USER_INPUT" || (ty == "SYSTEM_MESSAGE" && idx.is_some_and(|i| i <= 1)) {
                         if let Some(raw) = fields.string("content")? {
                             let body = if ty == "SYSTEM_MESSAGE" {
                                 unwrap_system_message_body(&raw).unwrap_or(&raw)
@@ -1408,7 +1431,8 @@ fn scan_transcript(id: &str, transcript: &Path, app_data_dir: Option<&Path>) -> 
                                 unwrap_user_request(&raw)
                             };
                             let cleaned = body.trim();
-                            if !cleaned.is_empty() {
+                            // A swarm worker's log opens with a board wake; its brief follows.
+                            if !cleaned.is_empty() && board_wake(cleaned).is_none() {
                                 let mut head = crate::projection::Head::bounded(crate::projection::Head::TITLE);
                                 head.push(cleaned);
                                 title = Some(head.finish());
@@ -1481,6 +1505,7 @@ fn build_session_header(r: &SessionRef, opts: &Demand) -> (Session, SidecarEnric
                 if let Some(role) = d.role {
                     entry.insert("role".into(), Value::String(role));
                 }
+                entry.extend(d.member);
                 enrich
                     .subagent_descriptors
                     .insert(d.conversation_id, Value::Object(entry));
@@ -1629,6 +1654,9 @@ struct StepState {
     first_ts: Option<DateTime<Utc>>,
     last_ts: Option<DateTime<Utc>>,
     inferred_parent: Option<String>,
+    /// A prompt or a model turn has been read: later deliveries are not the opening brief.
+    #[serde(default)]
+    opened: bool,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -1781,6 +1809,9 @@ impl StepCodec {
             "PLANNER_RESPONSE" | "USER_INPUT" | "CHECKPOINT" | "ERROR_MESSAGE"
         ) {
             self.state.pending_calls.clear();
+        }
+        if matches!(ty.as_str(), "PLANNER_RESPONSE" | "USER_INPUT") {
+            self.state.opened = true;
         }
 
         let want_extra = self.opts.tier >= Tier::Rich;
@@ -1988,11 +2019,14 @@ impl StepCodec {
                     json!({ "persistedOutput": Block::persisted_output(resolved, &claimed, None) })
                 });
 
-                if matches!(tool_name.as_deref(), Some("invoke_subagent")) {
-                    if let Some(child_id) = extract_spawned_conversation_id(&head) {
-                        self.state.child_ids.insert(child_id.clone());
-                        self.state.spawned_children.insert(child_id, tool_use_id.clone());
-                    }
+                let spawned = match tool_name.as_deref() {
+                    Some("invoke_subagent") => extract_spawned_conversation_id(&head),
+                    Some("swarm") => extract_swarm_added(&head),
+                    _ => None,
+                };
+                if let Some(child_id) = spawned {
+                    self.state.child_ids.insert(child_id.clone());
+                    self.state.spawned_children.insert(child_id, tool_use_id.clone());
                 }
 
                 let error_text = fields.string("error")?.filter(|e| !e.is_empty());
@@ -2059,21 +2093,37 @@ impl StepCodec {
                     .transpose()?
                     .unwrap_or_default();
                 let sender = extract_system_message_sender(&head);
+                let delivered = unwrap_system_message_body(&head);
+                let board = delivered.and_then(board_wake);
+                let returned = delivered
+                    .and_then(idle_child)
+                    .map(|(child, _)| child)
+                    .filter(|child| self.state.child_ids.contains(*child))
+                    .or_else(|| {
+                        sender
+                            .as_deref()
+                            .filter(|id| self.state.child_ids.contains(*id))
+                    })
+                    .map(str::to_owned);
 
-                let (role, kind, origin) = if step_index == 0
+                let (role, kind, origin) = if board.is_some() {
+                    // A board post wakes every member it concerns; it is neither the
+                    // worker's brief nor a child's return.
+                    (Role::System, MessageKind::InjectedContext, Origin::Harness)
+                } else if !self.state.opened
                     && sender
                         .as_deref()
                         .is_some_and(|s_id| looks_like_uuid(s_id) && s_id != self.s.id)
                 {
+                    // The first delivery from another conversation, before any turn, is
+                    // the brief this one was started with.
+                    self.state.opened = true;
                     let parent = sender.clone().unwrap();
                     if self.state.inferred_parent.is_none() {
                         self.state.inferred_parent = Some(parent);
                     }
                     (Role::User, MessageKind::Prompt, Origin::Subagent)
-                } else if sender
-                    .as_deref()
-                    .is_some_and(|s_id| self.state.child_ids.contains(s_id))
-                {
+                } else if returned.is_some() {
                     (Role::User, MessageKind::SubagentReturn, Origin::Subagent)
                 } else if sender.as_deref().is_some_and(|s_id| s_id.contains("timer")) {
                     (Role::System, MessageKind::InjectedContext, Origin::Scheduler)
@@ -2089,6 +2139,14 @@ impl StepCodec {
                         if canceled { "canceled_task" } else { "completed_task" }.into(),
                         Value::String(task.to_owned()),
                     );
+                }
+                if let Some(seq) = board {
+                    m.harness_extra_mut(Harness::Antigravity)
+                        .insert("board_message".into(), Value::Number(seq.into()));
+                }
+                if let Some(child) = returned.filter(|_| kind == MessageKind::SubagentReturn) {
+                    m.harness_extra_mut(Harness::Antigravity)
+                        .insert("returned_child".into(), Value::String(child));
                 }
                 m.id = Some(step_index.to_string());
                 m.timestamp = ts;
@@ -2511,15 +2569,27 @@ fn extract_system_message_sender(head: &str) -> Option<String> {
     None
 }
 
+/// The exported form is `<preamble>\n\n<SYSTEM_MESSAGE>\n[Message] … content=<body>\n
+/// </SYSTEM_MESSAGE>`; the native store keeps `[Message] … content=<body>` alone. The
+/// preamble itself names the tag ("The following is a <SYSTEM_MESSAGE> not actually sent
+/// by the user"), so the envelope is the tag after it.
 fn unwrap_system_message_body(text: &str) -> Option<&str> {
-    let open = text.find("<SYSTEM_MESSAGE>")?;
-    let inner = &text[open + "<SYSTEM_MESSAGE>".len()..];
-    let inner = inner.strip_suffix("</SYSTEM_MESSAGE>").unwrap_or_else(|| {
-        inner
-            .rfind("</SYSTEM_MESSAGE>")
-            .map(|end| &inner[..end])
-            .unwrap_or(inner)
-    });
+    const PREAMBLE: &str = "The following is a <SYSTEM_MESSAGE> not actually sent by the user.";
+    let text = text.trim_start();
+    let enveloped = text.strip_prefix(PREAMBLE).unwrap_or(text);
+    let inner = match enveloped.find("<SYSTEM_MESSAGE>") {
+        Some(open) => {
+            let inner = &enveloped[open + "<SYSTEM_MESSAGE>".len()..];
+            inner.strip_suffix("</SYSTEM_MESSAGE>").unwrap_or_else(|| {
+                inner
+                    .rfind("</SYSTEM_MESSAGE>")
+                    .map(|end| &inner[..end])
+                    .unwrap_or(inner)
+            })
+        }
+        None if text.starts_with("[Message]") => text,
+        None => return None,
+    };
     let inner = inner.trim();
     if let Some(rest) = inner.strip_prefix("[Message]") {
         if let Some(c_idx) = rest.find(" content=") {
@@ -2534,6 +2604,39 @@ fn unwrap_system_message_body(text: &str) -> Option<&str> {
 fn exported_user_request(text: &str) -> Option<&str> {
     let inner = text.trim().strip_prefix("<USER_REQUEST>")?;
     Some(inner.split_once("</USER_REQUEST>").map_or(inner, |(request, _)| request).trim())
+}
+
+/// CLI 1.5.9 reports a child's reply through the system sender:
+/// `Subagent <conversation> has gone idle. This was the subagent's most recent response: <reply>`.
+fn idle_child(body: &str) -> Option<(&str, &str)> {
+    let (id, rest) = body.strip_prefix("Subagent ")?.split_once(" has gone idle.")?;
+    if !looks_like_uuid(id) {
+        return None;
+    }
+    let response = rest
+        .strip_prefix(" This was the subagent's most recent response: ")
+        .unwrap_or(rest);
+    Some((id, response.trim()))
+}
+
+/// `[swarm] new board message #<seq>`: a wake for a post on the shared board. Its sender
+/// field names a member, but not reliably the one who posted.
+fn board_wake(body: &str) -> Option<u64> {
+    let seq = body.strip_prefix("[swarm] new board message #")?;
+    let digits = seq.len() - seq.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    seq[..digits].parse().ok()
+}
+
+/// The conversation a `swarm` call added: `{"status":"added",…,"conversation_id":"<id>"}`
+/// on its own line of the result.
+fn extract_swarm_added(head: &str) -> Option<String> {
+    let line = head.lines().find(|line| line.starts_with('{'))?;
+    let value: Value = serde_json::from_str(line).ok()?;
+    if value.get("status").and_then(Value::as_str) != Some("added") {
+        return None;
+    }
+    let id = value.get("conversation_id").and_then(Value::as_str)?;
+    looks_like_uuid(id).then(|| id.to_owned())
 }
 
 fn unwrap_user_request(text: &str) -> &str {

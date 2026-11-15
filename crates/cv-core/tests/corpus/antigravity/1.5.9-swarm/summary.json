@@ -5,8 +5,8 @@
       "path": ".gemini/antigravity-cli/brain/42561721-7f30-43d8-8547-3ea712864d3d/.system_generated/logs/transcript_full.jsonl",
       "messages": 5,
       "sequence": [
-        "user/prompt",
         "system/injected_context",
+        "user/prompt",
         "assistant/reply",
         "tool/tool_result",
         "assistant/reply"
@@ -49,8 +49,8 @@
       "path": ".gemini/antigravity-cli/brain/48bcbfc3-6e89-46bb-8960-a70ca2ac880f/.system_generated/logs/transcript_full.jsonl",
       "messages": 12,
       "sequence": [
-        "user/prompt",
         "system/injected_context",
+        "user/prompt",
         "system/injected_context",
         "assistant/subagent_spawn",
         "tool/tool_result",
@@ -119,8 +119,8 @@
       "path": ".gemini/antigravity-cli/brain/6da89cc5-a5fd-4608-aa21-2106eeff5e13/.system_generated/logs/transcript_full.jsonl",
       "messages": 5,
       "sequence": [
-        "user/prompt",
         "system/injected_context",
+        "user/prompt",
         "assistant/reply",
         "tool/tool_result",
         "assistant/reply"
@@ -169,7 +169,7 @@
         "tool/tool_result",
         "tool/tool_result",
         "assistant/reply",
-        "user/subagent_return",
+        "system/injected_context",
         "system/injected_context",
         "assistant/reply",
         "tool/tool_result",
@@ -197,9 +197,8 @@
       "model_messages": 0,
       "compaction_boundaries": [],
       "subagent_spawns": 1,
-      "subagent_returns": 1,
+      "subagent_returns": 0,
       "affordances": {
-        "subagent_return/return": 1,
         "subagent_spawn/spawn": 2
       },
       "tool_histogram": {

@@ -480,9 +480,142 @@ fn members(root: &Path) -> (String, Value) {
     panic!("capture has no swarm registry")
 }
 
+#[test]
+fn swarm_members_board_deliveries_and_lineage_are_read() {
+    let world = world("agy-writer-swarm");
+    let root = store(&world, "1.5.9-swarm", true);
+    let (coordinator, registry) = members(&root);
+    let member = |name: &str| registry[name]["conversation_id"].as_str().unwrap().to_owned();
+    let (alpha, beta, gamma) = (member("alpha"), member("beta"), member("gamma"));
+    assert_eq!(member("coordinator"), coordinator);
+    assert_eq!(registry["gamma"]["added_by"], "beta");
+    let read = sessions(&root);
+    assert_eq!(read.len(), 4);
+
+    // The coordinator is a member of its own registry, never its own child.
+    let (reference, session) = &read[&coordinator];
+    let forest = cv_core::subagent_tree_of(reference).unwrap();
+    let mut children: Vec<_> = forest.iter().map(|agent| agent.session.id.clone()).collect();
+    children.sort();
+    let mut expected = vec![alpha.clone(), beta.clone(), gamma.clone()];
+    expected.sort();
+    assert_eq!(children, expected);
+    let state = |id: &str| forest.iter().find(|a| a.session.id == id).unwrap().result_status.clone();
+    assert_eq!(state(&gamma).as_deref(), Some("killed"));
+    assert_eq!(state(&alpha), None);
+    let described = session.extra["antigravity"]["subagents"].as_object().unwrap();
+    assert!(!described.contains_key(&coordinator));
+    for (name, id) in [("alpha", &alpha), ("beta", &beta), ("gamma", &gamma)] {
+        let entry = &described[id];
+        assert_eq!(entry["member"], name);
+        assert_eq!(entry["killed"], registry[name]["killed"]);
+        assert_eq!(entry["wake_mode"], registry[name]["wake_mode"]);
+        assert_eq!(entry["phase"], registry[name]["phase"]);
+        assert_eq!(entry.get("added_by"), registry[name].get("added_by"));
+    }
+    // Each `swarm add` result names the conversation it created: the call is the spawn.
+    let steps = stored(&root, &coordinator);
+    assert_eq!(described[&alpha]["call_id"], call_with(&steps, "alpha-fixture").as_str());
+    assert_eq!(described[&beta]["call_id"], call_with(&steps, "beta-fixture").as_str());
+    assert!(described[&gamma].get("call_id").is_none(), "beta added gamma");
+    let nested = read[&beta].1.extra["antigravity"]["subagents"].as_object().unwrap();
+    assert_eq!(nested[&gamma]["call_id"], call_with(&stored(&root, &beta), "gamma-fixture").as_str());
+
+    // A board delivery is not a child's final return, whoever the writer names as sender.
+    let board: Vec<u64> = session
+        .messages
+        .iter()
+        .filter_map(|m| native(m).get("board_message")?.as_u64())
+        .collect();
+    assert!(!board.is_empty());
+    for (_, session) in read.values() {
+        for message in &session.messages {
+            assert_ne!(message.kind, MessageKind::SubagentReturn, "{}", body(session, message));
+            if body(session, message).contains("[swarm] new board message #") {
+                assert_eq!((message.kind, message.origin), (MessageKind::InjectedContext, Origin::Harness));
+                assert!(native(message)["board_message"].is_u64());
+            }
+        }
+    }
+    let rows = affordances(&root, reference);
+    assert_eq!(rows.iter().filter(|row| row.0 == "subagent_spawn").count(), 2);
+    assert_eq!(rows.iter().filter(|row| row.0 == "subagent_return").count(), 0);
+
+    // The writer records the coordinator as every worker's parent, including the helper's.
+    for exported in [true, false] {
+        let root = store(&world, "1.5.9-swarm", exported);
+        let read = sessions(&root);
+        assert!(read[&coordinator].1.lineage.parent.is_none());
+        for (name, id) in [("alpha", &alpha), ("beta", &beta), ("gamma", &gamma)] {
+            let (reference, session) = &read[id];
+            assert_eq!(session.lineage.parent.as_deref(), Some(coordinator.as_str()), "{name} exported={exported}");
+            // The assignment is the worker's prompt; the board notice before it is not.
+            let prompts: Vec<_> = session.messages.iter().filter(|m| m.kind == MessageKind::Prompt).collect();
+            assert_eq!(prompts.len(), 1, "{name} exported={exported}");
+            assert_eq!(prompts[0].origin, Origin::Subagent);
+            let assignment = body(session, prompts[0]);
+            assert!(assignment.contains(&format!("{name}-fixture:")), "{assignment}");
+            if exported {
+                let title = reference.title.as_deref().unwrap();
+                assert!(!title.contains("not actually sent by the user"), "{title}");
+            }
+        }
+    }
+}
 
 // ---- invoked subagents ------------------------------------------------------------------------
 
+#[test]
+fn an_idle_child_notice_is_its_return_to_the_parent() {
+    let world = world("agy-writer-subagents");
+    for exported in [true, false] {
+        let root = store(&world, "1.5.9-subagents", exported);
+        let read = sessions(&root);
+        assert_eq!(read.len(), 3);
+        let (reference, parent) = read
+            .values()
+            .find(|(_, session)| session.lineage.parent.is_none())
+            .unwrap();
+        let steps = stored(&root, &parent.id);
+        let child = |marker: &str| {
+            read.values()
+                .find(|(_, s)| s.messages.iter().any(|m| body(s, m).contains(marker)) && s.id != parent.id)
+                .map(|(_, s)| s.id.clone())
+                .unwrap()
+        };
+        let (one, two) = (child("child-one-fixture"), child("child-two-fixture"));
+        for id in [&one, &two] {
+            assert_eq!(read[id].1.lineage.parent.as_deref(), Some(parent.id.as_str()));
+        }
+        let returns: Vec<(String, String)> = parent
+            .messages
+            .iter()
+            .filter(|m| m.kind == MessageKind::SubagentReturn)
+            .map(|m| {
+                assert_eq!(m.origin, Origin::Subagent);
+                let raw = body(parent, m);
+                let delivered = cv_core::harness::delivered_body(Harness::Antigravity, m, &raw)
+                    .unwrap()
+                    .to_owned();
+                (native(m)["returned_child"].as_str().unwrap().to_owned(), delivered)
+            })
+            .collect();
+        // Child one goes idle after its reply and again after the parent's list call;
+        // child two after its delayed reply.
+        assert!(returns.len() >= 2, "exported={exported}: {returns:?}");
+        assert!(returns.iter().any(|(id, text)| id == &one && text == "child one final result"));
+        assert!(returns.iter().any(|(id, text)| id == &two && text.starts_with("child two ")));
+        let rows = affordances(&root, reference);
+        assert_eq!(rows.iter().filter(|row| row.0 == "subagent_return").count(), returns.len());
+        let spawned = parent.extra["antigravity"]["subagents"].as_object().unwrap();
+        assert_eq!(spawned[&one]["call_id"], call_with(&steps, "child-one-fixture").as_str());
+        assert_eq!(spawned[&two]["call_id"], call_with(&steps, "child-two-fixture").as_str());
+        if exported {
+            assert_eq!(reference.title.as_deref(), Some("parent-fixture: start two fixture children"));
+            assert_eq!(read[&one].0.title.as_deref(), Some("child-one-fixture: reply with your result."));
+        }
+    }
+}
 
 // ---- prompt media ----------------------------------------------------------------------------
 

@@ -12,9 +12,9 @@
         "assistant/reply",
         "tool/tool_result",
         "tool/tool_result",
-        "system/injected_context",
+        "user/subagent_return",
         "assistant/reply",
-        "system/injected_context",
+        "user/subagent_return",
         "assistant/reply"
       ],
       "blocks": {
@@ -32,8 +32,9 @@
       "model_messages": 0,
       "compaction_boundaries": [],
       "subagent_spawns": 1,
-      "subagent_returns": 0,
+      "subagent_returns": 2,
       "affordances": {
+        "subagent_return/return": 2,
         "subagent_spawn/spawn": 2
       },
       "tool_histogram": {
