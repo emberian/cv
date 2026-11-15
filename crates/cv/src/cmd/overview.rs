@@ -51,7 +51,11 @@ pub(crate) fn render(value: &Value) -> String {
         out.push_str(&format!("\n{heading}\n"));
         let rows = value[field].as_array().map(Vec::as_slice).unwrap_or_default();
         if rows.is_empty() {
-            out.push_str("  None recorded.\n");
+            out.push_str(if field == "workers" {
+                "  No worker records found; discovery limits, if any, are listed below.\n"
+            } else {
+                "  None recorded.\n"
+            });
         }
         for row in rows {
             let index = row.get("msg_idx").and_then(Value::as_u64);

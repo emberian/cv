@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Session overviews collect initial and recent requests, worker replies, referenced files, and commands with links back to their messages.
+- CLI, API, and reader overviews collect initial and recent requests, worker replies, referenced files, and commands with links to their messages.
 - Pack accepts explicit sessions or transcript paths, with optional task-focused excerpts, without searching other conversations or requiring an index.
 - Show recorded context usage, cache tokens, and compaction boundaries with `show --kind context` and the shared read API.
 
