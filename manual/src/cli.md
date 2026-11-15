@@ -440,8 +440,17 @@ cv lanes 0c315aee --done          # finished for real
 cv lanes 0c315aee --stranded      # the strand class, each with `→ resume: SendMessage to <agentId>`
 cv lanes 0c315aee --tasks         # each lane joined to the tasks its endpoint holds, with the last note
 cv lanes 0c315aee --json          # [{agent_id, model, tokens: {total, …}, status, status_source, last_text, stranded, …}]
+cv lanes 0c315aee --follow --for 5m # initial worker rows, then status/result changes
+cv lanes 0c315aee --follow --json # one changed row per line, including parent_id/harness/path
 cv lanes --recent 10 --unfinished # the project's 10 most recent sessions: every lane not finished for real
 ```
+
+`--follow` follows one parent; `--for` implies it and sets a deadline. Each JSON line is the
+normal lane row plus `parent_id`, `parent_harness`, and `parent_path`. Unchanged workers are not
+repeated as time passes. Filters select workers to start following, then their final changes
+are still printed when they stop matching (for example, `--running` reports completion).
+Following continues until the deadline or Ctrl-C, including when no workers are currently active.
+Ordinary `--json` remains one array; `--recent` cannot be combined with following.
 
 `--recent N` reads the N most recent Claude Code and Codex sessions in `--cwd` (default: here).
 With `--unfinished` (running, stopped, killed, failed, stranded) it is the rescue list for

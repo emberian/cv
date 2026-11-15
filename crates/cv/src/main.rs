@@ -437,7 +437,13 @@ enum Cmd {
         /// own tool calls, else its description's leading token) holds, with the last note.
         #[arg(long)]
         tasks: bool,
-        /// Emit the lanes as one JSON array (snake_case; `cv schema` has the shape).
+        /// Follow one session's workers, printing their initial state and subsequent changes.
+        #[arg(long, short = 'f', conflicts_with = "recent")]
+        follow: bool,
+        /// Follow for this long (30s, 5m, 2h); implies --follow.
+        #[arg(id = "for", long, value_name = "DURATION", conflicts_with = "recent")]
+        for_: Option<String>,
+        /// Emit one JSON array, or changed lane rows as NDJSON with parent_id when following.
         #[arg(long)]
         json: bool,
     },
@@ -1596,6 +1602,8 @@ fn run() -> Result<()> {
             unfinished,
             since,
             tasks,
+            follow,
+            for_,
             json,
         } => {
             let filter = if running {
@@ -1620,7 +1628,11 @@ fn run() -> Result<()> {
                 },
                 (None, None) => unreachable!("clap requires <ID> unless --recent is present"),
             };
-            session_reports::cmd_lanes(scope, filter, since, tasks, json)
+            if follow || for_.is_some() {
+                session_reports::follow_lanes(scope, filter, since, tasks, json, for_.as_deref())
+            } else {
+                session_reports::cmd_lanes(scope, filter, since, tasks, json)
+            }
         }
         Cmd::Doctor {
             id,

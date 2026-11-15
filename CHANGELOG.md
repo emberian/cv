@@ -6,6 +6,7 @@
 - Pack accepts explicit sessions or transcript paths, with optional task-focused excerpts, without searching other conversations or requiring an index.
 - Show recorded context usage, cache tokens, and compaction boundaries with `show --kind context` and the shared read API.
 
+- `cv lanes --follow` streams changed worker states and results, keeps final transitions visible through filters, and supports deadlines and parent-labelled JSON.
 - `cv resume --json` returns executable arguments, working directory, manual resume hints, and native-store caveats without launching the harness.
 - Antigravity reads native SQLite and full, compact, or chunked exports, preserving revised steps, retained rendered output, media, task context, and missing-child lanes.
 - Antigravity verifies historical tool identities, usage, and native tails before merging; binary thinking signatures retain explicit encoding metadata.

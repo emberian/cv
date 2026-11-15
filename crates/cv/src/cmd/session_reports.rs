@@ -263,6 +263,110 @@ pub(crate) enum LaneScope {
     Recent { n: usize, dir: std::path::PathBuf },
 }
 
+fn lane_since(since: Option<String>) -> Result<Option<DateTime<Utc>>> {
+    since
+        .map(|s| {
+            let d = cv_core::task::parse_duration(&s).ok_or_else(|| {
+                crate::util::UsageError(format!("--since takes a duration: 30m, 2h, 1d, 1w (got {s:?})"))
+            })?;
+            chrono::Utc::now().checked_sub_signed(d).ok_or_else(|| {
+                crate::util::UsageError(format!("--since duration is outside the supported date range: {s:?}")).into()
+            })
+        })
+        .transpose()
+}
+
+/// Follow one forest. A filter selects workers to start following; their final transition is
+/// still printed when it stops matching (e.g. --running must show a worker completing).
+pub(crate) fn follow_lanes(
+    scope: LaneScope,
+    filter: LaneFilter,
+    since: Option<String>,
+    with_tasks: bool,
+    json: bool,
+    for_: Option<&str>,
+) -> Result<()> {
+    use std::io::Write;
+    use std::time::Duration;
+
+    let wait = crate::util::Wait::resolve(true, for_)?;
+    let since = lane_since(since)?;
+    let LaneScope::Session { id, harness } = scope else {
+        return crate::util::usage("lanes --follow needs one session, not --recent");
+    };
+    wait.announce("lanes", &format!("workers of {id}"));
+    let (parent, _) = resolve(&id, parse_harness(&harness)?)?;
+    let interval = Duration::from_secs(1);
+    let mut wake = cv_core::watch::wake::Wake::new(interval)?;
+    if let Some(dir) = parent.path.parent() {
+        let _ = wake.watch(dir); // Polling also covers missing directories and unsupported watchers.
+    }
+    let mut seen = std::collections::HashMap::new();
+    loop {
+        // End this read scope before waiting; a follow pass must see new source generations.
+        let lanes = {
+            let _reads = cv_core::source::read_scope();
+            let mut lanes = cv_core::lanes::lanes_of(&parent)?;
+            if with_tasks && !lanes.is_empty() {
+                let outcome = if cv_core::env::frozen() {
+                    cv_core::lanes::replay_tasks_readonly()?
+                } else {
+                    cv_core::task::replay()?
+                };
+                for warning in &outcome.warnings {
+                    eprintln!("⚠ {}", sanitize_line(warning));
+                }
+                cv_core::lanes::attach_tasks(&mut lanes, &outcome.model);
+            }
+            lanes
+        };
+        for lane in lanes {
+            if let Some(dir) = lane.path.parent() {
+                let _ = wake.watch(dir);
+            }
+            let key = (lane.agent_id.clone(), lane.path.clone());
+            let row = lane_follow_row(&parent, &lane)?;
+            let mut comparable = row.clone();
+            comparable.as_object_mut().expect("lane row").remove("duration_ms");
+            if seen.get(&key) == Some(&comparable) {
+                continue;
+            }
+            if !seen.contains_key(&key) && (!lane_passes(&lane, filter) || since.is_some_and(|t| !lane.active_since(t)))
+            {
+                continue;
+            }
+            seen.insert(key, comparable);
+            if json {
+                println!("{}", serde_json::to_string(&row)?);
+            } else {
+                let detail = lane.last_text.as_deref().or(lane.last_tool.as_deref()).unwrap_or("");
+                println!(
+                    "{}  {}  {}  {}",
+                    fmt_local(Utc::now(), "%H:%M:%S"),
+                    sanitize_line(&lane.agent_id),
+                    lane.status,
+                    truncate(&sanitize_line(detail), 160)
+                );
+                if let Some(tasks) = &lane.tasks {
+                    print_lane_tasks(&lane, tasks);
+                }
+            }
+            std::io::stdout().flush()?;
+        }
+        if !wait.pause_with_wake(&mut wake, interval)? {
+            return Ok(());
+        }
+    }
+}
+
+fn lane_follow_row(parent: &SessionRef, lane: &Lane) -> Result<serde_json::Value> {
+    let mut row = serde_json::to_value(lane)?;
+    row["parent_id"] = serde_json::json!(parent.id);
+    row["parent_harness"] = serde_json::json!(parent.harness.as_str());
+    row["parent_path"] = serde_json::json!(parent.path);
+    Ok(row)
+}
+
 fn lane_passes(l: &Lane, f: LaneFilter) -> bool {
     match f {
         LaneFilter::All => true,
@@ -356,17 +460,7 @@ pub(crate) fn cmd_lanes(
             )
         }
     };
-    let since = match since {
-        Some(s) => {
-            let d = cv_core::task::parse_duration(&s).ok_or_else(|| {
-                crate::util::UsageError(format!("--since takes a duration: 30m, 2h, 1d, 1w (got {s:?})"))
-            })?;
-            Some(chrono::Utc::now().checked_sub_signed(d).ok_or_else(|| {
-                crate::util::UsageError(format!("--since duration is outside the supported date range: {s:?}"))
-            })?)
-        }
-        None => None,
-    };
+    let since = lane_since(since)?;
     // Which forest each lane came from, keyed by its transcript path: a `Lane` carries only its
     // own `agent-…` ref, and an adopted agent can sit in two sessions at once.
     let mut parent_of: std::collections::HashMap<std::path::PathBuf, String> = std::collections::HashMap::new();

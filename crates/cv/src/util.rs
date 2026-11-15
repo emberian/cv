@@ -83,19 +83,36 @@ impl Wait {
 
     /// Sleep one `interval`, cut short by the deadline; false once there is nothing left to wait for.
     pub(crate) fn pause(&self, interval: std::time::Duration) -> bool {
-        let left = match self {
-            Wait::Once => return false,
+        let Some(left) = self.delay(interval) else { return false };
+        std::thread::sleep(left);
+        true
+    }
+
+    /// Wait for file activity, with the same deadline as polling followers.
+    pub(crate) fn pause_with_wake(
+        &self,
+        wake: &mut cv_core::watch::wake::Wake,
+        interval: std::time::Duration,
+    ) -> Result<bool> {
+        let Some(left) = self.delay(interval) else {
+            return Ok(false);
+        };
+        wake.wait(Some(left))?;
+        Ok(true)
+    }
+
+    fn delay(&self, interval: std::time::Duration) -> Option<std::time::Duration> {
+        Some(match self {
+            Wait::Once => return None,
             Wait::Until(None) => interval,
             Wait::Until(Some((deadline, _))) => {
                 let left = deadline.saturating_duration_since(std::time::Instant::now());
                 if left.is_zero() {
-                    return false;
+                    return None;
                 }
                 interval.min(left)
             }
-        };
-        std::thread::sleep(left);
-        true
+        })
     }
 }
 
