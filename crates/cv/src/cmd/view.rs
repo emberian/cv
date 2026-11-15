@@ -590,6 +590,7 @@ fn resolve_show_target(
     let (want, id) = split_harness_id(id, want);
     if std::path::Path::new(id).is_file() {
         let (r, adapter) = crate::cmd::distill::resolve_source(id, want)?;
+        crate::util::require_session_file(&r, adapter.as_ref())?;
         return Ok((r, adapter, None));
     }
     if id.starts_with("agent-") {

@@ -136,8 +136,15 @@ fn exact_source_shared_database_requires_a_native_session_id() {
     let w = World::new("resume-shared-source");
     let path = w.base.join("state.db");
     fs::write(&path, []).unwrap();
-    for verb in ["doctor", "resume"] {
-        let (_, code, _, err) = w.cv(&[verb, "--harness", "hermes", path.to_str().unwrap(), "--json"]);
+    let selector = format!("hermes:{}", path.display());
+    for args in [
+        vec!["doctor", &selector, "--json"],
+        vec!["resume", &selector, "--json"],
+        vec!["show", &selector],
+        vec!["show", &selector, "--kind", "overview"],
+        vec!["pack", "--session", &selector],
+    ] {
+        let (_, code, _, err) = w.cv(&args);
         assert_eq!(code, 2, "{err}");
         assert!(
             err.contains("shared hermes store") && err.contains("hermes:<session-id>"),

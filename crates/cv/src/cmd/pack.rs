@@ -86,6 +86,9 @@ pub(crate) fn cmd_pack(args: PackArgs<'_>) -> Result<()> {
                 let selector = Path::new(id)
                     .is_file()
                     .then(|| crate::util::source_selector(session.harness, id));
+                if selector.is_some() {
+                    crate::util::require_session_file(&session, adapter.as_ref())?;
+                }
                 Ok((session, adapter, selector))
             })
             .collect::<Result<Vec<_>>>()?;
