@@ -40,6 +40,7 @@
 mod emit;
 mod hook;
 mod legacy;
+mod lifecycle;
 mod record;
 pub use emit::emit;
 
@@ -134,6 +135,14 @@ impl Codex {
 }
 
 impl Adapter for Codex {
+    fn lifecycle_body_required(&self) -> bool {
+        true
+    }
+
+    fn tool_result_lifecycle(&self, result: &super::lifecycle::ToolResult<'_>) -> super::lifecycle::Observation {
+        lifecycle::tool_result(result)
+    }
+
     /// An MCP call Codex refused because the approval policy could not ask (`never`), or a
     /// `Plan` (`update_plan`) item completed notice.
     fn record_affordance(

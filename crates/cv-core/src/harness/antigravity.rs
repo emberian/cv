@@ -53,6 +53,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+mod lifecycle;
 #[cfg(feature = "sqlite")]
 mod merge;
 #[cfg(feature = "sqlite")]
@@ -143,6 +144,18 @@ fn existing_app_dirs(gemini_dir: &Path) -> Vec<PathBuf> {
 }
 
 impl Adapter for Antigravity {
+    fn lifecycle_body_required(&self) -> bool {
+        true
+    }
+
+    fn tool_result_lifecycle(&self, result: &super::lifecycle::ToolResult<'_>) -> super::lifecycle::Observation {
+        lifecycle::tool_result(result)
+    }
+
+    fn message_lifecycle(&self, message: &Message, body: &str) -> super::lifecycle::Observation {
+        lifecycle::message(message, body)
+    }
+
     fn harness(&self) -> Harness {
         Harness::Antigravity
     }

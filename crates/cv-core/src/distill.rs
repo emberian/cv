@@ -33,7 +33,8 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::sync::OnceLock;
 
-mod codex_jobs;
+mod lifecycle;
+use crate::harness::lifecycle::{Observation, Status, ToolResult as LifecycleResult};
 
 /// A distilled pack is dense with shas, paths, hosts and code: measured on three real lanes
 /// (resumed with Claude Code, harness overhead subtracted) it ran 2.2–2.4 bytes per token, so it is
@@ -240,175 +241,79 @@ enum Demand {
 /// uncertainty, not proof that a process is still running. Explicit cancellation and
 /// failure settle a call; a running result does not.
 pub fn unsettled_calls(session: &Session) -> anyhow::Result<Vec<String>> {
-    let mut open = std::collections::BTreeSet::new();
-    let mut jobs = HashMap::new();
-    let mut codex_jobs = codex_jobs::Jobs::default();
+    let mut lifecycle = lifecycle::State::default();
+    // Decoding IR evidence needs an adapter's codec, never discovery of its live store.
+    let adapter = crate::harness::for_harness_with_root(session.harness, std::path::Path::new(""));
+    let needs_body = adapter.as_ref().is_some_and(|a| a.lifecycle_body_required());
     let uses = tool_index(&session.messages);
-    let resolver = crate::lazy::Resolver::new(session.source_path.clone());
+    let resolver = session.resolver();
     for message in &session.messages {
-        if session.harness == Harness::Claude {
-            if let Some((id, status, _)) = queued_task_notice(message).and_then(task_notice) {
-                if terminal_status(status) {
-                    open.remove(id);
-                } else {
-                    open.insert(id.to_owned());
+        if let Some(adapter) = &adapter {
+            let mut body = String::new();
+            if needs_body && lifecycle_message_kind(message.kind) {
+                for block in &message.content {
+                    if let Block::Text { text } = block {
+                        if !body.is_empty() && body.len() < 2048 {
+                            body.push('\n');
+                        }
+                        let remaining = 2048usize.saturating_sub(body.len());
+                        if remaining == 0 {
+                            break;
+                        }
+                        let prefix = crate::harness::store::document::text_head(text, &resolver, remaining, false)?.0;
+                        body.push_str(&prefix);
+                    }
                 }
             }
+            lifecycle.message(adapter.message_lifecycle(message, &body));
         }
         for block in &message.content {
             match block {
-                Block::ToolUse { id, .. } => {
-                    open.insert(id.clone());
-                }
+                Block::ToolUse { id, .. } => lifecycle.call(id),
                 Block::ToolResult {
                     tool_use_id,
                     status,
                     content,
                     is_error,
+                    tool_name,
                     ..
                 } => {
-                    // Lifecycle envelopes fit in a small prefix; do not decode entire logs again.
-                    let out = if matches!(session.harness, Harness::Claude | Harness::Antigravity | Harness::Codex) {
+                    // Safety preflight reads bounded envelopes, not a second copy of full logs.
+                    let body = if needs_body {
                         crate::harness::store::document::text_head(content, &resolver, 2048, true)?.0
                     } else {
                         String::new()
                     };
-                    if let Some(job) = background_job(session.harness, &out) {
-                        jobs.insert(job.to_owned(), tool_use_id.clone());
-                    }
-                    let name = uses.get(tool_use_id.as_str()).map(|call| call.name).unwrap_or("");
-                    if session.harness == Harness::Codex {
-                        if let Some(call) = uses.get(tool_use_id.as_str()) {
-                            let summary = ToolInput::new(session.harness, call.name, call.input, false, true)?;
-                            codex_jobs.observe(tool_use_id, &summary, &out);
-                        }
-                    }
-                    if let Some((job, status)) = polled_task(session.harness, name, &out) {
-                        if terminal_status(status) {
-                            if let Some(id) = jobs.get(job) {
-                                open.remove(id);
-                            }
-                        }
-                    }
-                    if result_unsettled(session.harness, status.as_deref(), &out, *is_error) {
-                        open.insert(tool_use_id.clone());
-                    } else {
-                        open.remove(tool_use_id);
-                    }
-                }
-                Block::Text { text }
-                    if session.harness == Harness::Claude
-                        && matches!(message.kind, MessageKind::InjectedContext | MessageKind::SubagentReturn) =>
-                {
-                    let text = crate::harness::store::document::text_head(text, &resolver, 2048, true)?.0;
-                    if let Some((id, status, _)) = task_notice(&text) {
-                        if terminal_status(status) {
-                            open.remove(id);
-                        } else {
-                            open.insert(id.to_owned());
-                        }
-                    }
-                }
-                Block::Text { text }
-                    if session.harness == Harness::Antigravity && message.kind == MessageKind::InjectedContext =>
-                {
-                    let text = crate::harness::store::document::text_head(text, &resolver, 2048, true)?.0;
-                    if let Some((job, _)) = antigravity_completion(message, &text) {
-                        if let Some(id) = jobs.get(job) {
-                            open.remove(id);
-                        }
-                    }
+                    let original = uses.get(tool_use_id.as_str());
+                    let name = original.map(|call| call.name).or(tool_name.as_deref()).unwrap_or("");
+                    let summary = original
+                        .filter(|_| needs_body)
+                        .map(|call| ToolInput::new(session.harness, call.name, call.input, false, true))
+                        .transpose()?;
+                    let result = LifecycleResult {
+                        tool: name,
+                        ops: summary.as_ref().map_or(&[], |s| s.ops.as_slice()),
+                        body: &body,
+                        status: status.as_deref(),
+                        is_error: *is_error,
+                    };
+                    let observation = adapter
+                        .as_ref()
+                        .map_or_else(|| Observation::result(&result), |a| a.tool_result_lifecycle(&result));
+                    lifecycle.result(tool_use_id, observation);
                 }
                 _ => {}
             }
         }
     }
-    open.extend(codex_jobs.pending_calls().map(str::to_owned));
-    Ok(open.into_iter().collect())
+    Ok(lifecycle.unsettled())
 }
 
-fn terminal_status(status: &str) -> bool {
+fn lifecycle_message_kind(kind: MessageKind) -> bool {
     matches!(
-        status.trim().to_ascii_lowercase().as_str(),
-        "completed"
-            | "complete"
-            | "done"
-            | "success"
-            | "succeeded"
-            | "failed"
-            | "error"
-            | "invalid"
-            | "canceled"
-            | "cancelled"
-            | "killed"
-            | "stopped"
+        kind,
+        MessageKind::InjectedContext | MessageKind::SubagentReturn | MessageKind::Carrier
     )
-}
-
-fn result_unsettled(harness: Harness, status: Option<&str>, out: &str, is_error: bool) -> bool {
-    if is_error {
-        return false;
-    }
-    if status.is_some_and(|s| !terminal_status(s)) {
-        return true;
-    }
-    background_job(harness, out).is_some()
-        || harness == Harness::Claude
-            && (out.starts_with("Command running in background with ID:")
-                || out.starts_with("Command running in the background with ID:")
-                || out.starts_with("Async agent launched successfully."))
-}
-
-/// Native Antigravity launch acknowledgement; skip only its timestamp envelope.
-fn background_job(harness: Harness, out: &str) -> Option<&str> {
-    if harness != Harness::Antigravity {
-        return None;
-    }
-    let body = out
-        .lines()
-        .find(|line| !line.starts_with("Created At:") && !line.starts_with("Completed At:"))?;
-    body.strip_prefix("Tool is running as a background task with task id: ")
-        .map(str::trim)
-        .filter(|id| !id.is_empty())
-}
-
-fn polled_task<'a>(harness: Harness, name: &str, out: &'a str) -> Option<(&'a str, &'a str)> {
-    if harness != Harness::Antigravity || name != "manage_task" {
-        return None;
-    }
-    let mut lines = out
-        .lines()
-        .filter(|line| !line.starts_with("Created At:") && !line.starts_with("Completed At:"));
-    let job = lines.next()?.strip_prefix("Task: ")?.trim();
-    let status = lines.next()?.strip_prefix("Status: ")?.trim();
-    Some((job, status))
-}
-
-fn antigravity_completion<'a>(message: &'a Message, body: &'a str) -> Option<(&'a str, &'a str)> {
-    let job = message.extra.get("antigravity")?.get("completed_task")?.as_str()?;
-    let marker = format!("content=Task id \"{job}\" finished with result:\n");
-    let (_, output) = body.split_once(&marker)?;
-    Some((job, output.trim_end_matches("</SYSTEM_MESSAGE>").trim()))
-}
-
-fn queued_task_notice(message: &Message) -> Option<&str> {
-    let row = message.extra.get(crate::ir::CARRIER_KEY)?;
-    (row.get("type")?.as_str()? == "queue-operation" && row.get("operation")?.as_str()? == "enqueue")
-        .then(|| row.get("content")?.as_str())
-        .flatten()
-}
-
-/// Claude's native completion wrapper names the initiating call, not a polling call.
-/// Only consume this on harness-injected messages; quoted user prose is not completion evidence.
-fn task_notice(text: &str) -> Option<(&str, &str, &str)> {
-    let text = text.strip_prefix("<task-notification>")?;
-    let tag = |name: &str| -> Option<&str> {
-        text.split_once(&format!("<{name}>"))?
-            .1
-            .split_once(&format!("</{name}>"))
-            .map(|(body, _)| body.trim())
-    };
-    Some((tag("tool-use-id")?, tag("status")?, tag("summary").unwrap_or("")))
 }
 
 /// Prepare the pack, statistics, sidecar roster and resumable tail together. CLI resume routes
@@ -1395,9 +1300,8 @@ fn analyze_with_policy(
     let retrieve_ref = opts.retrieve_ref.clone().unwrap_or_else(|| session.id.clone());
 
     let uses = tool_index(msgs);
-    let mut background_jobs: HashMap<String, String> = HashMap::new();
-    let mut completed_notices = HashSet::new();
-    let mut codex_jobs = codex_jobs::Jobs::default();
+    let adapter = crate::harness::for_harness_with_root(session.harness, std::path::Path::new(""));
+    let mut lifecycle = lifecycle::State::default();
     let tool_calls = uses.len();
 
     let tail_start = tail_cut(msgs, opts.keep_last, &uses);
@@ -1510,58 +1414,26 @@ fn analyze_with_policy(
 
     for (i, m) in msgs.iter().enumerate() {
         let in_tail = i >= tail_start;
-        if session.harness == Harness::Claude {
-            let body = if let Some(body) = queued_task_notice(m) {
-                Some(body.to_owned())
-            } else if matches!(m.kind, MessageKind::InjectedContext | MessageKind::SubagentReturn) {
-                cache.message_text(i)?
+        if let Some(adapter) = &adapter {
+            let body = if adapter.lifecycle_body_required() && lifecycle_message_kind(m.kind) {
+                cache.message_text(i)?.unwrap_or_default()
             } else {
-                None
+                String::new()
             };
-            if let Some(body) = body {
-                if let Some((id, status, summary_text)) = task_notice(&body) {
-                    if terminal_status(status) && completed_notices.insert(body.clone()) {
-                        if let Some(call) = uses.get(id) {
-                            let summary = ToolInput::new(session.harness, call.name, call.input, false, true)?;
-                            let label = summary.label(session.harness, call.name);
-                            let output = format!("{status}: {summary_text}");
-                            scan_result_facts(
-                                session.harness,
-                                i,
-                                call.name,
-                                &summary,
-                                &label,
-                                &output,
-                                matches!(status, "failed" | "error"),
-                                &mut facts,
-                            );
-                        }
-                    }
-                }
-            }
-        }
-        if session.harness == Harness::Antigravity && m.kind == MessageKind::InjectedContext {
-            if let Some(body) = cache.message_text(i)? {
-                if let Some((job, output)) = antigravity_completion(m, &body) {
-                    if let Some(call) = background_jobs.get(job).and_then(|id| uses.get(id.as_str())) {
-                        let summary = ToolInput::new(session.harness, call.name, call.input, false, true)?;
-                        let label = summary.label(session.harness, call.name);
-                        let failed = output.lines().any(|line| {
-                            line.strip_prefix("Command exited with code ")
-                                .and_then(|code| code.trim_end_matches('.').parse::<i32>().ok())
-                                .is_some_and(|code| code != 0)
-                        });
-                        scan_result_facts(
-                            session.harness,
-                            i,
-                            call.name,
-                            &summary,
-                            &label,
-                            output,
-                            failed,
-                            &mut facts,
-                        );
-                    }
+            for completion in lifecycle.message(adapter.message_lifecycle(m, &body)) {
+                if let Some(call) = uses.get(completion.call.as_str()) {
+                    let summary = ToolInput::new(session.harness, call.name, call.input, false, true)?;
+                    let label = summary.label(session.harness, call.name);
+                    lifecycle_facts(
+                        session.harness,
+                        i,
+                        call.name,
+                        &summary,
+                        &label,
+                        completion.output.as_deref().unwrap_or(&body),
+                        completion.status,
+                        &mut facts,
+                    );
                 }
             }
         }
@@ -1664,8 +1536,12 @@ fn analyze_with_policy(
                             });
                         }
                         Block::ToolUse {
-                            name, input: raw_input, ..
+                            id,
+                            name,
+                            input: raw_input,
+                            ..
                         } => {
+                            lifecycle.call(id);
                             let summary = ToolInput::new(session.harness, name, raw_input, !in_tail, false)?;
                             scan_input_facts(name, &summary, &mut facts);
                             let mut noted_cd = false;
@@ -1716,83 +1592,48 @@ fn analyze_with_policy(
                     let out_cow = cache.resolve_tool_result(i, index)?;
                     let out = out_cow.as_ref();
                     let out_len = out.len();
-                    if let Some(job) = background_job(session.harness, out) {
-                        background_jobs.insert(job.to_owned(), tool_use_id.clone());
-                    }
-                    let codex_outcome = if session.harness == Harness::Codex {
-                        codex_jobs.observe(tool_use_id, &summary, out)
-                    } else {
-                        codex_jobs::Outcome::default()
+                    let result = LifecycleResult {
+                        tool: &name,
+                        ops: &summary.ops,
+                        body: out,
+                        status: status.as_deref(),
+                        is_error: *is_error,
                     };
-                    let result_out = codex_outcome.result_text.as_deref().unwrap_or(out);
-                    let polled = polled_task(session.harness, &name, out)
-                        .filter(|(_, status)| terminal_status(status))
-                        .and_then(|(job, status)| {
-                            background_jobs
-                                .get(job)
-                                .and_then(|id| uses.get(id.as_str()))
-                                .map(|call| (call, status))
-                        });
-                    let outcome = if codex_outcome.pending {
-                        "unfinished: no terminal result observed".to_owned()
-                    } else if let Some(call) = codex_outcome.completed_call.as_deref().and_then(|id| uses.get(id)) {
-                        let summary = ToolInput::new(session.harness, call.name, call.input, false, true)?;
-                        let label = summary.label(session.harness, call.name);
-                        scan_result_facts(
-                            session.harness,
-                            i,
-                            call.name,
-                            &summary,
-                            &label,
-                            result_out,
-                            *is_error || codex_outcome.failed,
-                            &mut facts,
-                        )
-                    } else if let Some((call, job_status)) = polled {
-                        let summary = ToolInput::new(session.harness, call.name, call.input, false, true)?;
-                        let label = summary.label(session.harness, call.name);
-                        let output = format!("{job_status}: {out}");
-                        let failed = matches!(job_status.to_ascii_lowercase().as_str(), "failed" | "error" | "invalid");
-                        if matches!(
-                            job_status.to_ascii_lowercase().as_str(),
-                            "canceled" | "cancelled" | "killed" | "stopped"
-                        ) {
-                            format!("{job_status}: {label}")
-                        } else {
-                            scan_result_facts(
+                    let observation = adapter
+                        .as_ref()
+                        .map_or_else(|| Observation::result(&result), |a| a.tool_result_lifecycle(&result));
+                    let observed = lifecycle.result(tool_use_id, observation);
+                    let result_out = observed.output.as_deref().unwrap_or(out);
+                    let mut attributed = None;
+                    for completion in &observed.completions {
+                        if let Some(call) = uses.get(completion.call.as_str()) {
+                            let summary = ToolInput::new(session.harness, call.name, call.input, false, true)?;
+                            let label = summary.label(session.harness, call.name);
+                            attributed = Some(lifecycle_facts(
                                 session.harness,
                                 i,
                                 call.name,
                                 &summary,
                                 &label,
-                                &output,
-                                failed,
+                                completion.output.as_deref().unwrap_or(result_out),
+                                completion.status,
                                 &mut facts,
-                            )
+                            ));
                         }
-                    } else if result_unsettled(session.harness, status.as_deref(), out, *is_error) {
+                    }
+                    let outcome = if observed.pending {
                         "unfinished: no terminal result observed".to_owned()
-                    } else if status.as_deref().is_some_and(|s| {
-                        matches!(
-                            s.to_ascii_lowercase().as_str(),
-                            "canceled" | "cancelled" | "killed" | "stopped"
-                        )
-                    }) {
-                        "stopped: no successful completion implied".to_owned()
+                    } else if let Some(outcome) = attributed {
+                        outcome
                     } else {
-                        let failed = *is_error
-                            || codex_outcome.failed
-                            || status.as_deref().is_some_and(|s| {
-                                matches!(s.to_ascii_lowercase().as_str(), "failed" | "error" | "invalid")
-                            });
-                        scan_result_facts(
+                        lifecycle_facts(
                             session.harness,
                             i,
                             &name,
                             &summary,
                             &label,
                             result_out,
-                            failed,
+                            observed.status,
                             &mut facts,
                         )
                     };
@@ -2518,6 +2359,26 @@ fn scan_input_facts(_name: &str, summary: &ToolInput<'_>, f: &mut Facts) {
             if let Some(bare) = bare_filename(tok) {
                 bump(&mut f.paths, bare);
             }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lifecycle_facts(
+    harness: Harness,
+    i: usize,
+    name: &str,
+    summary: &ToolInput<'_>,
+    label: &str,
+    out: &str,
+    status: Status,
+    facts: &mut Facts,
+) -> String {
+    match status {
+        Status::Pending => "unfinished: no terminal result observed".to_owned(),
+        Status::Stopped => "stopped: no successful completion implied".to_owned(),
+        Status::Complete | Status::Failed => {
+            scan_result_facts(harness, i, name, summary, label, out, status == Status::Failed, facts)
         }
     }
 }

@@ -32,6 +32,7 @@ pub mod grok;
 pub mod hermes;
 pub mod kimi;
 pub mod kimi_code;
+pub mod lifecycle;
 pub mod lmstudio;
 pub mod openclaw;
 pub mod opencode;
@@ -577,6 +578,21 @@ impl Capabilities {
 /// `Send + Sync` so [`crate::discover_all`] can fan discovery across adapters in parallel. Every
 /// adapter holds only path data (connections are opened per call), so this bound is always satisfied.
 pub trait Adapter: Send + Sync {
+    /// Decode provider-native asynchronous result envelopes into shared lifecycle evidence.
+    fn tool_result_lifecycle(&self, result: &lifecycle::ToolResult<'_>) -> lifecycle::Observation {
+        lifecycle::Observation::result(result)
+    }
+
+    /// Decode native task notifications; ordinary message text is not completion evidence.
+    fn message_lifecycle(&self, _message: &Message, _body: &str) -> lifecycle::Observation {
+        lifecycle::Observation::default()
+    }
+
+    /// Whether lifecycle preflight needs a bounded prefix of native result/message text.
+    fn lifecycle_body_required(&self) -> bool {
+        false
+    }
+
     fn harness(&self) -> Harness;
 
     /// Every on-disk root this adapter reads sessions from (resolved against `$HOME`, existing

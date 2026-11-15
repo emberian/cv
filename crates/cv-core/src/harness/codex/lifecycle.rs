@@ -1,21 +1,43 @@
-//! Explicit Codex cell/PTY envelopes, kept separate from command stdout.
-use super::ToolInput;
-use crate::tools::classify::ToolOp;
+//! Native Codex cell and PTY lifecycle envelopes.
+use crate::harness::lifecycle::{Observation, Status, Target, ToolResult, Update};
+use crate::tools::classify::{ToolOp, ToolSemantic};
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
 
-#[derive(Default)]
-pub(super) struct Jobs {
-    owners: HashMap<String, String>,
-    uncertain: HashSet<String>,
-}
-
-#[derive(Default)]
-pub(super) struct Outcome {
-    pub pending: bool,
-    pub failed: bool,
-    pub completed_call: Option<String>,
-    pub result_text: Option<String>,
+pub(super) fn tool_result(result: &ToolResult<'_>) -> Observation {
+    let mut observation = Observation::result(result);
+    let acting_on = poll_job(result.ops);
+    let has_process = result
+        .ops
+        .iter()
+        .any(|op| matches!(op.op, ToolOp::Command { .. }) || op.tool.ends_with("write_stdin"));
+    let envelope = envelope(result.body, has_process);
+    let status = if envelope.pty_exit.is_some_and(|code| code != 0) {
+        Status::Failed
+    } else {
+        envelope.status
+    };
+    if observation.status == Status::Complete {
+        observation.status = status;
+    }
+    if let Some(job) = &acting_on {
+        let done = if job.starts_with("cell:") {
+            envelope.cell_done
+        } else {
+            envelope.pty_exit.is_some()
+        };
+        if done {
+            observation.updates.push(Update {
+                target: Target::Job(job.clone()),
+                status,
+                output: None,
+            });
+        }
+    }
+    observation.acting_on = acting_on;
+    observation.started_jobs = envelope.running;
+    observation.uncertain = envelope.uncertain;
+    observation.output = envelope.result_text;
+    observation
 }
 
 #[derive(Default)]
@@ -23,60 +45,13 @@ struct Envelope {
     running: Vec<String>,
     cell_done: bool,
     pty_exit: Option<i64>,
-    failed: bool,
+    status: Status,
     uncertain: bool,
     result_text: Option<String>,
 }
 
-impl Jobs {
-    pub fn pending_calls(&self) -> impl Iterator<Item = &str> {
-        self.owners.values().chain(self.uncertain.iter()).map(String::as_str)
-    }
-
-    pub fn observe(&mut self, id: &str, input: &ToolInput<'_>, out: &str) -> Outcome {
-        let poll = poll_job(input);
-        let owner = poll
-            .as_ref()
-            .and_then(|job| self.owners.get(job))
-            .cloned()
-            .unwrap_or_else(|| id.to_owned());
-        let has_process = input
-            .ops
-            .iter()
-            .any(|op| matches!(op.op, ToolOp::Command { .. }) || op.tool.ends_with("write_stdin"));
-        let envelope = envelope(out, has_process);
-        for job in &envelope.running {
-            self.owners.entry(job.clone()).or_insert_with(|| owner.clone());
-        }
-        if envelope.uncertain {
-            self.uncertain.insert(owner);
-        }
-        let mut completed_call = None;
-        if let Some(job) = poll {
-            let done = if job.starts_with("cell:") {
-                envelope.cell_done
-            } else {
-                envelope.pty_exit.is_some()
-            };
-            if done {
-                if let Some(owner) = self.owners.remove(&job) {
-                    if !self.owners.values().any(|id| id == &owner) && !self.uncertain.contains(&owner) {
-                        completed_call = Some(owner);
-                    }
-                }
-            }
-        }
-        Outcome {
-            pending: !envelope.running.is_empty() || envelope.uncertain,
-            failed: envelope.failed || envelope.pty_exit.is_some_and(|code| code != 0),
-            completed_call,
-            result_text: envelope.result_text,
-        }
-    }
-}
-
-fn poll_job(input: &ToolInput<'_>) -> Option<String> {
-    let mut jobs = input.ops.iter().filter_map(|op| {
+fn poll_job(ops: &[ToolSemantic<'_>]) -> Option<String> {
+    let mut jobs = ops.iter().filter_map(|op| {
         let ToolOp::Background { job_id: Some(id), .. } = &op.op else {
             return None;
         };
@@ -114,7 +89,13 @@ fn envelope(out: &str, has_process: bool) -> Envelope {
         && ["Script completed", "Script failed", "Script terminated"]
             .iter()
             .any(|s| out.starts_with(s));
-    result.failed = script && (out.starts_with("Script failed") || out.starts_with("Script terminated"));
+    result.status = if out.starts_with("Script failed") {
+        Status::Failed
+    } else if out.starts_with("Script terminated") {
+        Status::Stopped
+    } else {
+        Status::Complete
+    };
     if script || has_process {
         // Direct exec_command returns JSON; functions.exec prints one JSON item per line.
         let metadata = if script {
@@ -181,4 +162,83 @@ fn process_metadata(text: &str) -> Option<(Option<String>, Option<i64>, Option<S
         _ => None,
     };
     Some((session, exit, output))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::classify::BgAction;
+
+    #[test]
+    fn cell_wait_distinguishes_completion_failure_and_termination() {
+        let ops = [ToolSemantic {
+            tool: "wait".into(),
+            op: ToolOp::Background {
+                job_id: Some("53".into()),
+                action: BgAction::Poll,
+            },
+        }];
+        for (body, expected) in [
+            (
+                "Script completed\nWall time: 0.1 seconds\nOutput:\nok",
+                Status::Complete,
+            ),
+            ("Script failed\nWall time: 0.1 seconds\nOutput:\nerror", Status::Failed),
+            ("Script terminated\nWall time: 0.1 seconds\nOutput:\n", Status::Stopped),
+        ] {
+            let result = ToolResult {
+                tool: "wait",
+                ops: &ops,
+                body,
+                status: None,
+                is_error: false,
+            };
+            let observation = tool_result(&result);
+            assert_eq!(observation.status, expected);
+            assert_eq!(observation.acting_on.as_deref(), Some("cell:53"));
+            assert_eq!(observation.updates.len(), 1);
+            assert!(matches!(&observation.updates[0].target, Target::Job(id) if id == "cell:53"));
+            assert_eq!(observation.updates[0].status, expected);
+        }
+    }
+
+    #[test]
+    fn native_termination_preserves_explicit_invocation_status() {
+        for (status, is_error, expected) in [
+            (Some("running"), false, Status::Pending),
+            (Some("failed"), false, Status::Failed),
+            (None, true, Status::Failed),
+        ] {
+            let result = ToolResult {
+                tool: "exec",
+                ops: &[],
+                body: "Script terminated",
+                status,
+                is_error,
+            };
+            assert_eq!(tool_result(&result).status, expected);
+        }
+    }
+
+    #[test]
+    fn nonzero_process_exit_remains_failed() {
+        let ops = [ToolSemantic {
+            tool: "write_stdin".into(),
+            op: ToolOp::Background {
+                job_id: Some("71".into()),
+                action: BgAction::Poll,
+            },
+        }];
+        let result = ToolResult {
+            tool: "write_stdin",
+            ops: &ops,
+            body: "Process exited with code 1\nOutput:\nerror",
+            status: None,
+            is_error: false,
+        };
+        let observation = tool_result(&result);
+        assert_eq!(observation.status, Status::Failed);
+        assert_eq!(observation.updates.len(), 1);
+        assert_eq!(observation.updates[0].status, Status::Failed);
+    }
 }

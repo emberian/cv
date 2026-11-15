@@ -16,6 +16,7 @@ pub mod adopt;
 pub(crate) mod emit;
 mod fork;
 mod hook;
+mod lifecycle;
 mod metadata;
 mod notification;
 pub(crate) mod record;
@@ -257,6 +258,18 @@ fn projects_dir(entry: PathBuf) -> Option<PathBuf> {
 }
 
 impl Adapter for Claude {
+    fn lifecycle_body_required(&self) -> bool {
+        true
+    }
+
+    fn tool_result_lifecycle(&self, result: &super::lifecycle::ToolResult<'_>) -> super::lifecycle::Observation {
+        lifecycle::tool_result(result)
+    }
+
+    fn message_lifecycle(&self, message: &Message, body: &str) -> super::lifecycle::Observation {
+        lifecycle::message(message, body)
+    }
+
     fn harness(&self) -> Harness {
         Harness::Claude
     }

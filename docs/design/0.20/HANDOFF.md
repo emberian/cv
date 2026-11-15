@@ -10,6 +10,8 @@ Owner: handoff lane. Scope: distill output, completion evidence, and emitted Cla
 - In-flight task `01a114d0-3652-7813-a96c-e6fcc5c02bd0`: default resumable distill refuses uncertain source calls or a growing capture before publication. Explicit failure/cancellation settles a call. `--allow-unsettled` is an intentional snapshot with unresolved call IDs carried in its context; plain packs carry the same disclosure.
 - Parent task `01a10891-5134-7191-a4c0-eca1bbe18da4`: whole-chain emission and missing-parent validation already exist, including main-thread/sub-agent reshape coverage. Added linear parent-cycle detection across all components, including detached branches. Derived rewrites retain the existing policy permitting defects already in their source.
 
+Lifecycle decoding belongs to each harness adapter: typed observations describe invocation status, job starts, terminal updates, and native notification identity. Shared distill code tracks ownership and unresolved work without provider branches. A stopped or failed child remains stopped or failed when its remaining sibling jobs later finish successfully.
+
 ## Still open
 
 - General background lifecycle correlation for Claude polling-only histories without notifications, and Antigravity kill acknowledgements that lack explicit task/status evidence. Do not infer terminal status from a successful poll call alone. Native Antigravity CLEARED records may have lost arguments/results/job IDs; preserve uncertainty. Codex compound polls with ambiguous ownership and bounded JSON envelopes that hide identity after long output also remain uncertain.
