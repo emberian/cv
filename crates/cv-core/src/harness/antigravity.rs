@@ -540,9 +540,14 @@ impl Adapter for Antigravity {
         from: Start<'_>,
         sink: &mut dyn MessageSink,
     ) -> Result<Option<Session>> {
-        // An exporter can create the full-log file before its first flush. Empty
-        // history has no precedence over a surviving compact or native store.
-        let fallback = if fs::metadata(&r.path).is_ok_and(|meta| meta.len() == 0) {
+        // An exporter can create the full-log file before its first flush, and a log
+        // can be removed after discovery chose it. Empty or missing history has no
+        // precedence over a surviving chunked, compact or native store of the session.
+        let unusable = match fs::metadata(&r.path) {
+            Ok(meta) => meta.len() == 0,
+            Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+        };
+        let fallback = if unusable {
             BrainLoc::from_transcript(&r.path)
                 .and_then(|loc| select_session_source(&loc.app_data_dir, &loc.id))
                 .filter(|path| path != &r.path)
