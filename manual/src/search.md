@@ -107,7 +107,10 @@ With `--live-bytes 268435456`:
 With no index, every session is unindexed and read live (the cost of `cv index`, every time).
 `--frozen` or `--live-bytes 0` answers from the index alone; with no index, `--frozen` exits
 naming `cv index`. An unusable index is always an error. The live read builds its private index
-in a temporary directory and removes it, so a read-only home is still searchable. A `-q text:`
+in a temporary directory and removes it, so a read-only home is still searchable. Frozen disables
+live suffix ingestion and cache writes; discovery, freshness probes and selected-hit snippet
+enrichment can still read source files. Use `--batch` for an indexed snapshot without those reads.
+A `-q text:`
 predicate resolves the same way (all of it); it exits 2 only when a session without an index
 could not be read.
 

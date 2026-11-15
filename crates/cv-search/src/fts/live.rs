@@ -261,7 +261,7 @@ pub(super) struct Live {
 
 /// The indexed side a live read is planned against.
 pub(super) struct Indexed<'a> {
-    pub(super) index: &'a Index,
+    pub(super) searcher: &'a tantivy::Searcher,
     pub(super) f: &'a Fields,
 }
 
@@ -374,7 +374,7 @@ fn plan(
     suffix: &mut Suffix,
 ) -> Result<Vec<Pending>> {
     let (existing, _, metadata) = match &indexed {
-        Some(i) => read_indexed_metadata(i.index, i.f, true).context("reading index metadata")?,
+        Some(i) => read_indexed_metadata_from(i.searcher, i.f, true).context("reading index metadata")?,
         None => Default::default(),
     };
     let dependencies = match indexed_consumer(&dir.join("cv-index-id"))? {
@@ -404,6 +404,11 @@ fn plan(
             continue;
         }
         suffix.stale += 1;
+        // Frozen needs freshness coverage, but will never consume a resume checkpoint.
+        // Do not read/decode large saved parser state or sample its source prefix.
+        if suffix.live == LiveRead::Frozen {
+            continue;
+        }
         let job = Job {
             r: r.clone(),
             mtime: fresh.mtime,

@@ -2321,9 +2321,16 @@ type IndexedMetadata = (
 );
 
 fn read_indexed_metadata(index: &Index, f: &Fields, read_metadata: bool) -> Result<IndexedMetadata> {
-    use tantivy::collector::DocSetCollector;
     let reader = index.reader().context("opening index reader")?;
-    let searcher = reader.searcher();
+    read_indexed_metadata_from(&reader.searcher(), f, read_metadata)
+}
+
+fn read_indexed_metadata_from(
+    searcher: &tantivy::Searcher,
+    f: &Fields,
+    read_metadata: bool,
+) -> Result<IndexedMetadata> {
+    use tantivy::collector::DocSetCollector;
     let mut out = HashMap::new();
     let mut folded = HashSet::new();
     let mut metadata = HashMap::new();
@@ -3048,7 +3055,7 @@ pub fn text_search_ids_suffixed_scoped(
     };
     let (live, suffix) = live::read(
         dir,
-        indexed.as_ref().map(|(index, f, _)| live::Indexed { index, f }),
+        indexed.as_ref().map(|(_, f, searcher)| live::Indexed { searcher, f }),
         refs,
         live,
     )?;
@@ -3259,27 +3266,29 @@ pub(crate) fn search_suffixed(
     live: LiveRead,
     refs: &[cv_core::SessionRef],
 ) -> Result<Searched> {
-    search_suffixed_allowed(dir, query, limit, filter, None, live, refs)
+    search_suffixed_allowed(dir, query, limit, filter, None, live, || refs)
 }
 
-pub(crate) fn search_suffixed_allowed(
+pub(crate) fn search_suffixed_allowed<R: AsRef<[cv_core::SessionRef]>>(
     dir: &Path,
     query: &str,
     limit: usize,
     filter: crate::SearchFilter<'_>,
     allowed_ids: Option<std::sync::Arc<HashSet<String>>>,
     live: LiveRead,
-    refs: &[cv_core::SessionRef],
+    discover: impl FnOnce() -> R,
 ) -> Result<Searched> {
     let indexed = if dir.join("meta.json").exists() || live == LiveRead::Frozen {
         Some(query_index(dir)?)
     } else {
         None
     };
+    // Validate/open first: an unusable index must not trigger expensive discovery.
+    let refs = discover();
     let (live, suffix) = live::read(
         dir,
-        indexed.as_ref().map(|(index, f, _)| live::Indexed { index, f }),
-        refs,
+        indexed.as_ref().map(|(_, f, searcher)| live::Indexed { searcher, f }),
+        refs.as_ref(),
         live,
     )?;
     let empty = HashMap::new();
@@ -5102,8 +5111,76 @@ mod tests {
         }
     }
 
-    /// Write a minimal one-message Claude transcript so `live_snippet` has a real file to re-read,
-    /// and return its path. `body` becomes the single user message's text.
+    #[test]
+    fn unusable_search_index_refuses_before_discovery() {
+        let _home = IsolatedHome::new();
+        let dir = tmpdir();
+        for live in [LiveRead::Frozen, LiveRead::All] {
+            if live == LiveRead::All {
+                std::fs::write(dir.join("meta.json"), "invalid index metadata").unwrap();
+            }
+            let result = search_suffixed_allowed(
+                &dir,
+                "needle",
+                1,
+                crate::SearchFilter::default(),
+                None,
+                live,
+                || -> Vec<cv_core::SessionRef> { panic!("discovery must not run before index validation") },
+            );
+            assert!(result.is_err());
+        }
+        let old_dir = tmpdir();
+        let mut old = serde_json::to_value(build_schema()).unwrap();
+        old.as_array_mut()
+            .unwrap()
+            .retain(|field| field["name"] != format_field());
+        let old_schema: Schema = serde_json::from_value(old).unwrap();
+        Index::create_in_dir(&*old_dir, old_schema).unwrap();
+        let result = search_suffixed_allowed(
+            &old_dir,
+            "needle",
+            1,
+            crate::SearchFilter::default(),
+            None,
+            LiveRead::Frozen,
+            || -> Vec<cv_core::SessionRef> { panic!("old schema must fail before discovery") },
+        );
+        assert!(format!("{:#}", result.err().unwrap()).contains("older cv"));
+    }
+
+    #[test]
+    fn freshness_uses_the_query_snapshot_when_discovery_overlaps_a_commit() {
+        let _home = IsolatedHome::new();
+        let (index, sources) = (tmpdir(), tmpdir());
+        let refs = vec![sref(
+            "changing",
+            "selected",
+            write_claude(&sources, "changing", "oldneedle"),
+        )];
+        index_refs(&index, &refs, false).unwrap();
+        let answer = search_suffixed_allowed(
+            &index,
+            "oldneedle",
+            1,
+            crate::SearchFilter::default(),
+            None,
+            LiveRead::Frozen,
+            || {
+                write_claude(&sources, "changing", "newneedle with a longer replacement");
+                index_refs(&index, &refs, false).unwrap();
+                &refs
+            },
+        )
+        .unwrap();
+        assert_eq!(answer.total, 1, "ranking retains the reader opened before discovery");
+        assert_eq!(
+            answer.suffix.stale, 1,
+            "freshness must assess that same reader's older revision"
+        );
+        assert_eq!(answer.suffix.read, 0);
+    }
+
     #[test]
     fn prepared_queries_pin_snapshot_bound_selected_reads_and_refresh() {
         let _home = IsolatedHome::new();
@@ -5183,6 +5260,7 @@ mod tests {
         assert_eq!(prepared.search("zqneedle", 1, filter, None).unwrap().total, 1);
     }
 
+    /// Write a minimal native user message whose body is the supplied text.
     fn write_claude(dir: &Path, id: &str, body: &str) -> String {
         let p = dir.join(format!("{id}.jsonl"));
         let line = serde_json::json!({

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Search validates indexes before discovery, shares one snapshot for freshness and ranking, and skips unused frozen resume checkpoints.
+
 - Full-text search supports reusable indexed snapshots and NDJSON batch queries with explicit freshness semantics and per-query work counters.
 - Show, Markdown, doctor, and API metadata expose Antigravity read sources and known coverage gaps, including metadata-only members and unavailable payloads.
 - Distill enforces aggregate byte or estimated-token budgets before publication and requires explicit snapshots for unsettled calls.

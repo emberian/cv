@@ -261,18 +261,20 @@ impl Searcher {
             }
             Source::Index => {
                 let _sources = cv_core::source::read_scope();
-                let mut refs = cv_core::sessions_for(harness);
-                let shared_allowed = allowed_ids.map(|ids| {
-                    refs.retain(|r| ids.contains(&r.id));
-                    std::sync::Arc::new(ids.clone())
-                });
+                let shared_allowed = allowed_ids.map(|ids| std::sync::Arc::new(ids.clone()));
                 let live = LiveRead::of(live_bytes)?;
                 let fts::Searched {
                     hits,
                     total,
                     note,
                     suffix,
-                } = fts::search_suffixed_allowed(dir, query, limit, filter, shared_allowed, live, &refs)?;
+                } = fts::search_suffixed_allowed(dir, query, limit, filter, shared_allowed, live, || {
+                    let mut refs = cv_core::sessions_for(harness);
+                    if let Some(ids) = allowed_ids {
+                        refs.retain(|r| ids.contains(&r.id));
+                    }
+                    refs
+                })?;
                 found.hits = hits;
                 found.total = total;
                 if let Some(why) = note {
