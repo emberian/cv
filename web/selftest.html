@@ -896,6 +896,32 @@ await acheck("stored and imported overviews use Rust accessors, never remote ID 
     eq(JSON.stringify(calls), JSON.stringify([["claude", "stored"], 1]), "source identity preserved");
   } finally { registerWasmStore(null); globalThis.fetch = original; }
 });
+await acheck("late worker success and failure cannot replace a newer message window", async () => {
+  const original = globalThis.fetch, worker = deferred(), failure = deferred();
+  globalThis.fetch = async (url) => {
+    const path = new URL(url).pathname;
+    if (path.endsWith("/overview")) return Response.json(overviewFixture);
+    if (path.endsWith("/subagent/slow")) return { ok: true, json: () => worker.promise };
+    if (path.endsWith("/subagent/failing")) return { ok: true, json: () => failure.promise };
+    if (path.endsWith("/messages")) return Response.json({ start: 18, messages: [{ role: "user", content: [{ type: "text", text: "selected message window" }] }] });
+    throw new Error(`Unexpected read: ${path}`);
+  };
+  try {
+    const transcript = overviewTranscript();
+    await transcript._toggleOverview(transcript.session);
+    const panel = transcript.querySelector(".overview-panel");
+    const pending = transcript._overviewWorker(transcript.session, panel, { agent_id: "slow" });
+    await transcript._overviewContext(transcript.session, panel, 20);
+    worker.resolve({ id: "old-worker", harness: "claude", messages: [] }); await pending;
+    eq(panel.querySelector("cv-transcript"), null, "old worker cannot mount over the message window");
+    truthy(panel.textContent.includes("selected message window"), "message window survives late worker success");
+    const rejected = transcript._overviewWorker(transcript.session, panel, { agent_id: "failing" });
+    await transcript._overviewContext(transcript.session, panel, 20);
+    failure.reject(new Error("old worker failure")); await rejected;
+    truthy(panel.textContent.includes("selected message window"), "message window survives late worker failure");
+    truthy(!panel.textContent.includes("old worker failure"), "obsolete failure is not shown");
+  } finally { globalThis.fetch = original; }
+});
 await acheck("overview failure stays visible and retry can recover", async () => {
   const original = globalThis.fetch; let fail = true;
   globalThis.fetch = async () => fail ? new Response("unavailable", { status: 503 }) : Response.json(overviewFixture);
