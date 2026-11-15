@@ -51,8 +51,9 @@ adapter, IR, query API and command surfaces.
    records and preserving unknown values. `lanes --follow` emits initial workers and changed
    status/results through a deadline or interruption. `resume --json` returns literal
    program/arguments, cwd, environment, hints and warnings without launching a process.
-   Doctor and resume accept individual transcript paths; Claude/Codex resume plans pin
-   the selected profile home, while unsupported source selections fail explicitly.
+   Doctor and resume accept individual transcript paths; Claude/Codex resume plans select
+   the source's profile home relative to the caller's environment (Claude's default profile is
+   left unnamed), while unsupported source selections fail explicitly.
 
 ## Completed implementation lanes
 

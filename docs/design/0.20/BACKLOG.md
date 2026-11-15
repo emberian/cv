@@ -23,7 +23,7 @@ Implemented in cv, with local workspace and focused integration gates completed.
 | Open `show --kind overview`, the overview API, or reader Overview | Shared initial/recent requests, workers, file events and commands retain source indexes, omission counts and coverage. File presence is current metadata; file bodies are not read. Imported sessions disclose unavailable worker/file checks | `cv-core/src/overview.rs`, `api.rs`, `cv-web/src/lib.rs`; CLI/API parity tests and `web/selftest.html`; [viewing manual](../../../manual/src/viewing-and-sharing.md#session-overview) |
 | Inspect `show --kind context` and API windows | Saved per-call usage and compaction rows retain original indexes, deduplicate repeated provider records and label saved estimates. Unknown limits remain null; no live remaining-context estimate | `cv-core/src/context.rs`; `tests/context.rs`; [context contract](../../../manual/src/cli.md#saved-token-usage---kind-context) |
 | Follow `lanes --follow [--for …] [--json]` | One parent's initial and changed rows, including final transitions after a selection filter stops matching; no idle duplicates; deadline/interrupt exits | `cmd/session_reports.rs`; `tests/worker_follow.rs`; [lanes manual](../../../manual/src/cli.md#cv-lanes) |
-| Read `resume --json` | Literal program/argument array, cwd, environment, hint and warning; GUI-only targets remain explicit. Never launches; conflicts with `--launch` | `cmd/port.rs` resume JSON tests; [resume manual](../../../manual/src/cli.md#cv-resume) |
+| Read `resume --json` | Literal program/argument array, cwd, `env` to set and `unset_env` to remove relative to the caller's environment, hint and warning; GUI-only targets remain explicit. Claude's default profile is never named in `CLAUDE_CONFIG_DIR`. Never launches; conflicts with `--launch` | `cmd/port.rs` resume JSON tests, `tests/source_resume.rs`; [resume manual](../../../manual/src/cli.md#cv-resume) |
 
 **Separate Fleet consumer work:** `d58a1cce`, `6def5a7e` and `73586c1b` in the Fleet repository preserve distinct
 harness/ID/path sources, timestamp precision and unknown counts, use the configured cv binary
@@ -39,6 +39,18 @@ repeated-search consumer measurements remain separate from the already implement
 snapshot API. Overview's bounded output does not bound parent traversal or worker-forest reads.
 The [native coverage matrix](ANTIGRAVITY-COVERAGE.md) and [handoff limits](HANDOFF.md) remain the
 source of unresolved Agy and lifecycle cases.
+
+**Open after the read-feature review (2026-11-14):**
+
+1. An ID that exists in two roots (two Claude profiles holding the same session) resolves to the
+   first root without a note in `show`, `resume`, `lanes` and the API routes; only a transcript
+   path selects the other copy. Fleet refuses such IDs itself. An ambiguity error listing both
+   paths is the candidate fix; it changes the selector contract for every command.
+2. `lanes --follow` ends with an error if one forest read fails mid-follow (a child removed
+   between listing and reading). Not reproduced; a torn trailing record is tolerated.
+3. Whether `codex resume <id>` reaches a rollout under `archived_sessions` depends on the Codex
+   version's lookup scope; cv emits a plan for it without a caveat. Unverified against a binary.
+4. A sub-agent's overview lists its parent's delegation prompt under Requests.
 
 ## Second pass (Claude Fable, 2026-11-15)
 
