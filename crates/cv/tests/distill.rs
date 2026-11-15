@@ -123,6 +123,37 @@ fn distill_budget_names_and_measures_what_the_target_loads() {
         err.contains("budget measured on the resumable session content"),
         "{err}"
     );
+    // A --with source is part of what is loaded: a limit that fits the lane alone refuses the
+    // aggregate, and the emitted opening prompt carries the other lane's findings exactly once.
+    source(&w, "measured-other", false);
+    let limit = loaded.to_string();
+    let with = [
+        "distill",
+        "measured-source",
+        "--with",
+        "measured-other",
+        "--session",
+        "--out",
+    ];
+    let (ok, _, _, err) = w.cv(&[&with[..], &[refused.to_str().unwrap(), "--max-bytes", &limit]].concat());
+    assert!(!ok);
+    assert!(err.contains("exceeding --max-bytes"), "{err}");
+    assert!(!refused.exists());
+    let joined = w.base.join("joined");
+    let aggregate = json(&[&with[..], &[joined.to_str().unwrap(), "--json"]].concat());
+    assert!(aggregate["budget"]["bytes"].as_u64().unwrap() > loaded, "{aggregate}");
+    let transcript = std::fs::read_to_string(aggregate["emitted"]["path"].as_str().unwrap()).unwrap();
+    assert_eq!(transcript.matches("## Findings from another lane").count(), 1);
+    let ids: Vec<String> = transcript
+        .lines()
+        .filter_map(|line| {
+            serde_json::from_str::<serde_json::Value>(line).ok()?["uuid"]
+                .as_str()
+                .map(str::to_owned)
+        })
+        .collect();
+    let distinct: std::collections::HashSet<&String> = ids.iter().collect();
+    assert_eq!(ids.len(), distinct.len(), "{ids:?}");
     let tokens = (resumed["budget"]["estimated_tokens"].as_u64().unwrap() - 1).to_string();
     let (ok, _, _, err) = w.cv(&[
         "distill",

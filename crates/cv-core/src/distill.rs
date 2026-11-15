@@ -249,11 +249,6 @@ impl Distilled {
         }
     }
 
-    /// Refuse an oversized Markdown pack after all findings have been appended.
-    pub fn check_budget(&self, max_bytes: Option<usize>, max_estimated_tokens: Option<u64>) -> anyhow::Result<()> {
-        self.pack_load().check(max_bytes, max_estimated_tokens)
-    }
-
     /// The standalone markdown context pack: a fresh agent's first message (candidate c).
     pub fn pack(&self) -> String {
         let mut s = self.head_md.clone();
@@ -311,13 +306,6 @@ enum Demand {
 pub fn unsettled_calls(session: &Session) -> anyhow::Result<Vec<String>> {
     let analysis = analyze(session, &DistillOptions::default(), Demand::Findings)?;
     Ok(analysis.distilled.unsettled.into_iter().map(|call| call.id).collect())
-}
-
-fn lifecycle_message_kind(kind: MessageKind) -> bool {
-    matches!(
-        kind,
-        MessageKind::InjectedContext | MessageKind::SubagentReturn | MessageKind::Carrier
-    )
 }
 
 /// Prepare the pack, statistics, sidecar roster and resumable tail together. CLI resume routes
@@ -690,10 +678,6 @@ fn est(s: &str) -> u64 {
     est_tokens_bytes(s.len(), PACK_KIND)
 }
 
-fn block_est(b: &Block) -> anyhow::Result<u64> {
-    est_tokens(b)
-}
-
 /// Scalar keys safe to project eagerly from a `Json::Source` large-payload tool call without
 /// materializing multi-megabyte file contents, patches, or scripts.
 const SCALAR_META_KEYS: &[&str] = &[
@@ -879,11 +863,6 @@ impl<'a> ToolInput<'a> {
 }
 
 /// A short label for one tool call, for the ledger and the facts lists.
-#[cfg(test)]
-fn tool_label(name: &str, input: &Value) -> String {
-    tool_label_with_ops(Harness::Claude, name, input, &[])
-}
-
 fn tool_label_with_ops(
     harness: Harness,
     name: &str,
@@ -1447,7 +1426,11 @@ fn analyze_with_policy(
     for (i, m) in msgs.iter().enumerate() {
         let in_tail = i >= tail_start;
         if let Some(adapter) = &adapter {
-            let body = if adapter.lifecycle_body_required() && lifecycle_message_kind(m.kind) {
+            let body = if adapter.lifecycle_body_required()
+                && matches!(
+                    m.kind,
+                    MessageKind::InjectedContext | MessageKind::SubagentReturn | MessageKind::Carrier
+                ) {
                 cache.message_text(i)?.unwrap_or_default()
             } else {
                 String::new()
@@ -1922,7 +1905,7 @@ fn analyze_with_policy(
     let tail_est_tokens: u64 = tail
         .iter()
         .flat_map(|m| &m.content)
-        .try_fold(0u64, |sum, block| Ok::<_, anyhow::Error>(sum + block_est(block)?))?;
+        .try_fold(0u64, |sum, block| Ok::<_, anyhow::Error>(sum + est_tokens(block)?))?;
     let recorded_context_tokens = msgs
         .iter()
         .rev()
@@ -3579,12 +3562,12 @@ pub(crate) mod tests {
         let mut d = distill_pack(&s, &Default::default())?;
         let bytes = d.pack().len();
         let tokens = d.stats.distilled_est_tokens;
-        d.check_budget(Some(bytes), Some(tokens))?;
-        assert!(d.check_budget(Some(bytes - 1), None).is_err());
-        assert!(d.check_budget(None, Some(tokens - 1)).is_err());
+        d.pack_load().check(Some(bytes), Some(tokens))?;
+        assert!(d.pack_load().check(Some(bytes - 1), None).is_err());
+        assert!(d.pack_load().check(None, Some(tokens - 1)).is_err());
         d.append_findings("Additional lane findings: λλλλλλλλλλλλλλλλλλλλ");
-        assert!(d.check_budget(Some(bytes), None).is_err());
-        assert!(d.check_budget(None, Some(tokens)).is_err());
+        assert!(d.pack_load().check(Some(bytes), None).is_err());
+        assert!(d.pack_load().check(None, Some(tokens)).is_err());
         assert!(d.pack().contains("Additional lane findings"));
         Ok(())
     }
@@ -4410,7 +4393,10 @@ facts text",
             std::fs::write(&path, &bytes)?;
             let source = crate::Json::source(&path, 0, bytes.len() as u64)?;
             let summary = ToolInput::new(Harness::Claude, "Write", &source, true, true)?;
-            assert_eq!(summary.label(Harness::Claude, "Write"), tool_label("Write", &input));
+            assert_eq!(
+                summary.label(Harness::Claude, "Write"),
+                tool_label_with_ops(Harness::Claude, "Write", &input, &[])
+            );
             let message = msg(Role::Assistant, MessageKind::Reply, Vec::new());
             let opts = DistillOptions::default();
             let owned_json = crate::Json::from(input.clone());
