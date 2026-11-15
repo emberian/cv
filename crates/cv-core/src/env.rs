@@ -35,6 +35,10 @@ thread_local! {
     static SCOPED: RefCell<Option<Arc<Env>>> = const { RefCell::new(None) };
 }
 
+fn parse_frozen(v: &OsStr) -> bool {
+    v == "1" || v.to_str().is_some_and(|s| s.eq_ignore_ascii_case("true"))
+}
+
 impl Env {
     /// The process environment, with `dirs`' home and cache dirs.
     pub fn from_process() -> Env {
@@ -42,7 +46,7 @@ impl Env {
             vars: std::env::vars_os().collect(),
             home: dirs::home_dir(),
             cache: dirs::cache_dir(),
-            frozen: std::env::var_os("CV_FROZEN").is_some_and(|v| v == "1"),
+            frozen: std::env::var_os("CV_FROZEN").as_deref().is_some_and(parse_frozen),
             retained: Default::default(),
         }
     }
@@ -65,7 +69,7 @@ impl Env {
     }
 
     fn derive(&mut self) {
-        self.frozen = self.vars.get(OsStr::new("CV_FROZEN")).is_some_and(|v| v == "1");
+        self.frozen = self.vars.get(OsStr::new("CV_FROZEN")).is_some_and(|v| parse_frozen(v));
         let var = |k: &str| self.var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from);
         let home = if cfg!(windows) { var("USERPROFILE") } else { var("HOME") };
         let cache = if cfg!(target_os = "macos") {
@@ -390,9 +394,19 @@ mod tests {
         let _outer = Env::from_vars([("CV_FROZEN", "0")]).enter();
         assert!(!frozen());
         {
+            let _false_str = Env::from_vars([("CV_FROZEN", "false")]).enter();
+            assert!(!frozen());
+        }
+        {
             let _inner = Env::from_vars([("CV_FROZEN", "1")]).enter();
             assert!(frozen());
             assert!(std::thread::spawn(carry(frozen)).join().unwrap());
+        }
+        {
+            let _true_str = Env::from_vars([("CV_FROZEN", "true")]).enter();
+            assert!(frozen());
+            let _upper = Env::from_vars([("CV_FROZEN", "TRUE")]).enter();
+            assert!(frozen());
         }
         assert!(!frozen());
         let _flag = Env::default().with_frozen().enter();

@@ -19,8 +19,10 @@
 
 - Antigravity replays revised steps correctly, reads chunked history, preserves missing-child lanes, and enriches native lineage, usage, swarm, approval, and background-task events.
 - Search retries changing sources and reports disappearing sessions without flooding the terminal with parse failures.
-
 - Antigravity search ignores persisted-output notices inside quoted transcripts, preventing “File name too long” failures during indexing.
+- `cv hook` subcommands run cleanly under `--frozen` (`CV_FROZEN=1`/`true`), enforcing `retired` and `edit` guards while silently skipping lane and non-strict receipt writes.
+- Frozen reads use stable private SQLite snapshots without modifying source WAL/SHM; read-only mounts retain committed state.
+- `cv task sweep` allows `--frozen`, and writer refusals name read-only alternatives.
 
 ## 0.19.3 — 2026-11-13 — parser termination and malformed-input recovery
 

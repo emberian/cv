@@ -430,6 +430,14 @@ fn each_hook_answers_the_docs_payload_for_its_event() {
         "{reason}"
     );
     assert!(reason.contains("`cv show alphases --last 10`"), "{reason}");
+    let frozen = hook(
+        &w,
+        "edit",
+        &edit("hooksess", "/work/proj/src/widget.rs"),
+        &[("CV_FROZEN", "1")],
+    );
+    let frozen: serde_json::Value = serde_json::from_str(&frozen).unwrap();
+    assert_eq!(frozen["hookSpecificOutput"]["permissionDecision"], "ask");
     // A relative path resolves against the hook's cwd.
     let out = hook(&w, "edit", &edit("hooksess", "src/widget.rs"), &[]);
     assert!(out.contains("\"ask\""), "{out}");
@@ -450,6 +458,9 @@ fn each_hook_answers_the_docs_payload_for_its_event() {
             "tool_name": "apply_patch", "tool_input": {"command": "*** Begin Patch\n*** Add File: src/untracked.rs\n+new\n*** Update File: src/widget.rs\n@@\n-a\n+b\n*** End Patch"}
         }),
     );
+    let frozen = codex_hook(&w, "edit", &codex_patch, &[("CV_FROZEN", "1")]);
+    let frozen: serde_json::Value = serde_json::from_str(&frozen).unwrap();
+    assert_eq!(frozen["hookSpecificOutput"]["permissionDecision"], "deny");
     let out = codex_hook(&w, "edit", &codex_patch, &[]);
     let output: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(output["hookSpecificOutput"]["permissionDecision"], "deny");
@@ -1031,4 +1042,349 @@ fn the_compact_hook_names_what_its_budget_left_unread() {
         "{ctx}"
     );
     assert!(ctx.contains("--kind compaction_boundary,compaction_summary"), "{ctx}");
+}
+
+fn snapshot_cv_home(dir: &std::path::Path) -> Vec<(String, Option<std::time::SystemTime>, Vec<u8>)> {
+    if !dir.exists() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    fn walk(
+        root: &std::path::Path,
+        cur: &std::path::Path,
+        out: &mut Vec<(String, Option<std::time::SystemTime>, Vec<u8>)>,
+    ) {
+        let Ok(entries) = fs::read_dir(cur) else { return };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            let rel = p.strip_prefix(root).unwrap().to_string_lossy().into_owned();
+            if p.is_dir() {
+                out.push((format!("{rel}/"), None, Vec::new()));
+                walk(root, &p, out);
+            } else if p.is_file() {
+                let mtime = fs::metadata(&p).ok().and_then(|m| m.modified().ok());
+                let bytes = fs::read(&p).unwrap_or_default();
+                out.push((rel, mtime, bytes));
+            }
+        }
+    }
+    walk(dir, dir, &mut out);
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// Regression test for the `CV_FROZEN=1` + `PreToolUse: cv hook retired` footgun:
+/// every `cv hook` subcommand runs under `CV_FROZEN=1` / `--frozen` / `CV_FROZEN=true` without
+/// exiting 2, spamming stderr, or mutating `$CLUSTERVISION_HOME`, while `hook retired` still
+/// enforces retired-agent policy cleanly.
+#[test]
+fn frozen_hooks_never_brick_tool_calls_and_still_enforce_retired_policy() {
+    let w = World::new("frozen-hooks");
+
+    // 1. Cold nonexistent CLUSTERVISION_HOME: `CV_FROZEN=1 cv hook retired --harness claude`
+    // allows Read, Glob, Grep, Edit, and Agent tool calls without creating any directories/files.
+    let cold_home = w.base.join("cold-cv-home");
+    for (tool, input) in [
+        ("Read", json!({"file_path": "/work/proj/src/lib.rs"})),
+        ("Glob", json!({"pattern": "**/*.rs"})),
+        ("Grep", json!({"pattern": "frozen"})),
+        (
+            "Edit",
+            json!({"file_path": "/work/proj/src/lib.rs", "old_string": "a", "new_string": "b"}),
+        ),
+        ("Agent", json!({"description": "check tests", "prompt": "run tests"})),
+    ] {
+        let payload = with(
+            common(&w, "livesess", "PreToolUse"),
+            json!({"tool_name": tool, "tool_input": input}),
+        );
+        let (out, err) = hook_full(
+            &w,
+            &["hook", "retired", "--harness", "claude"],
+            &payload,
+            &[("CV_FROZEN", "1"), ("CLUSTERVISION_HOME", cold_home.to_str().unwrap())],
+        );
+        assert_eq!(out, "", "unexpected stdout for {tool}: {out}");
+        assert_eq!(err, "", "unexpected stderr for {tool}: {err}");
+        assert!(!cold_home.exists(), "cold CLUSTERVISION_HOME must remain absent");
+    }
+
+    // 2. Seed a session, catalog, task decision, and retired agent, plus hold a live SQLite writer
+    // open so uncheckpointed WAL frames + `-shm` exist in `$CLUSTERVISION_HOME`.
+    w.write_session(
+        "alphasess",
+        &[
+            user("alphasess", "u0", "2026-10-01T10:00:00Z", "initial prompt"),
+            assistant_tool(
+                "a0",
+                "2026-10-01T10:00:05Z",
+                "Edit",
+                json!({"file_path": "/work/proj/conflict.rs", "old_string": "x", "new_string": "y"}),
+            ),
+            boundary("b0", "2026-10-01T10:00:10Z"),
+        ],
+    );
+    cv_ok(&w, &["ls", "--json"]);
+    cv_ok(&w, &["events", "alphasess", "--json"]);
+    cv_ok(&w, &["task", "open", "seed state.db"]);
+    let live_writer = rusqlite::Connection::open(w.cv_home.join("state.db")).unwrap();
+    live_writer.execute_batch("BEGIN DEFERRED;").unwrap();
+    let _: i64 = live_writer
+        .query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get(0))
+        .unwrap();
+    cv_ok(&w, &["retire", "oldlane", "--successor", "newlane"]);
+    assert!(
+        fs::metadata(w.cv_home.join("state.db-wal")).is_ok_and(|m| m.len() > 0),
+        "retirement should sit in live WAL while reader/writer snapshot is open"
+    );
+
+    let before = snapshot_cv_home(&w.cv_home);
+
+    // Active agent/session tool calls under CV_FROZEN=1 pass silently.
+    for frozen_env in [[("CV_FROZEN", "1")], [("CV_FROZEN", "true")]] {
+        let (out, err) = hook_full(
+            &w,
+            &["hook", "retired", "--harness", "claude"],
+            &with(
+                common(&w, "livesess", "PreToolUse"),
+                json!({"agent_id": "activelane", "tool_name": "Read", "tool_input": {"file_path": "/work/proj/a.rs"}}),
+            ),
+            &frozen_env,
+        );
+        assert_eq!(out, "");
+        assert_eq!(err, "");
+    }
+
+    // Explicit `--frozen` flag also works on `cv hook retired`.
+    let (out, err) = hook_full(
+        &w,
+        &["--frozen", "hook", "retired", "--harness", "claude"],
+        &with(
+            common(&w, "livesess", "PreToolUse"),
+            json!({"tool_name": "Grep", "tool_input": {"pattern": "needle"}}),
+        ),
+        &[],
+    );
+    assert_eq!(out, "");
+    assert_eq!(err, "");
+
+    // Retired caller and message/resume to retired target STILL deny cleanly under CV_FROZEN=1!
+    let (deny_self, err_self) = hook_full(
+        &w,
+        &["hook", "retired", "--harness", "claude"],
+        &with(
+            common(&w, "livesess", "PreToolUse"),
+            json!({"agent_id": "agent-oldlane", "tool_name": "Read", "tool_input": {"file_path": "/work/proj/a.rs"}}),
+        ),
+        &[("CV_FROZEN", "1")],
+    );
+    assert_eq!(err_self, "");
+    let v_self: serde_json::Value = serde_json::from_str(&deny_self).unwrap();
+    assert_eq!(v_self["hookSpecificOutput"]["permissionDecision"], "deny");
+    assert!(
+        v_self["hookSpecificOutput"]["permissionDecisionReason"]
+            .as_str()
+            .unwrap()
+            .contains("newlane"),
+        "{deny_self}"
+    );
+
+    let (deny_msg, err_msg) = hook_full(
+        &w,
+        &["hook", "retired", "--harness", "claude"],
+        &with(
+            common(&w, "livesess", "PreToolUse"),
+            json!({"tool_name": "SendMessage", "tool_input": {"to": "oldlane", "message": "wake up"}}),
+        ),
+        &[("CV_FROZEN", "1")],
+    );
+    assert_eq!(err_msg, "");
+    let v_msg: serde_json::Value = serde_json::from_str(&deny_msg).unwrap();
+    assert_eq!(v_msg["hookSpecificOutput"]["permissionDecision"], "deny");
+    assert!(
+        v_msg["hookSpecificOutput"]["permissionDecisionReason"]
+            .as_str()
+            .unwrap()
+            .contains("newlane"),
+        "{deny_msg}"
+    );
+
+    // Every other `cv hook` subcommand (`lane`, `receipt`, `edit`, `start`, `decisions`, `compact`)
+    // also succeeds with exit 0, zero stderr errors, and zero store writes under CV_FROZEN=1.
+    let (lane_out, lane_err) = hook_full(
+        &w,
+        &["hook", "lane", "--harness", "claude"],
+        &with(
+            common(&w, "livesess", "SubagentStart"),
+            json!({"agent_id": "sub1", "agent_type": "Explore"}),
+        ),
+        &[("CV_FROZEN", "1")],
+    );
+    assert_eq!((lane_out.as_str(), lane_err.as_str()), ("", ""));
+
+    let (rcpt_out, rcpt_err) = hook_full(
+        &w,
+        &["hook", "receipt", "--harness", "claude"],
+        &with(
+            common(&w, "livesess", "PreToolUse"),
+            json!({"tool_use_id": "toolu_1", "tool_name": "Read", "tool_input": {"file_path": "/work/proj/a.rs"}}),
+        ),
+        &[("CV_FROZEN", "1")],
+    );
+    assert_eq!((rcpt_out.as_str(), rcpt_err.as_str()), ("", ""));
+
+    // Under CV_RECEIPT_STRICT=1 + CV_FROZEN=1, PreToolUse receipt denies cleanly via JSON (exit 0).
+    let (strict_out, strict_err) = hook_full(
+        &w,
+        &["hook", "receipt", "--harness", "claude"],
+        &with(
+            common(&w, "livesess", "PreToolUse"),
+            json!({"tool_use_id": "toolu_2", "tool_name": "Read", "tool_input": {"file_path": "/work/proj/a.rs"}}),
+        ),
+        &[("CV_FROZEN", "1"), ("CV_RECEIPT_STRICT", "1")],
+    );
+    assert_eq!(strict_err, "");
+    let strict_v: serde_json::Value = serde_json::from_str(&strict_out).unwrap();
+    assert_eq!(strict_v["hookSpecificOutput"]["permissionDecision"], "deny");
+
+    let (_, edit_err) = hook_full(
+        &w,
+        &["hook", "edit", "--harness", "claude"],
+        &with(
+            common(&w, "livesess", "PreToolUse"),
+            json!({"tool_name": "Edit", "tool_input": {"file_path": "/work/proj/conflict.rs"}}),
+        ),
+        &[("CV_FROZEN", "1")],
+    );
+    assert_eq!(edit_err, "");
+
+    let (_, start_err) = hook_full(
+        &w,
+        &["hook", "start", "--harness", "claude"],
+        &common(&w, "livesess", "SessionStart"),
+        &[("CV_FROZEN", "1")],
+    );
+    assert_eq!(start_err, "");
+
+    let (_, dec_err) = hook_full(
+        &w,
+        &["hook", "decisions", "--harness", "claude"],
+        &common(&w, "livesess", "UserPromptSubmit"),
+        &[("CV_FROZEN", "1")],
+    );
+    assert_eq!(dec_err, "");
+
+    let (cmp_out, cmp_err) = hook_full(
+        &w,
+        &["hook", "compact", "--harness", "claude"],
+        &with(common(&w, "alphasess", "SessionStart"), json!({"source": "compact"})),
+        &[("CV_FROZEN", "1")],
+    );
+    assert_eq!(cmp_err, "");
+    assert!(context_of(&cmp_out).contains("context compacted"), "{cmp_out}");
+
+    assert_eq!(
+        before,
+        snapshot_cv_home(&w.cv_home),
+        "CV_FROZEN=1 hooks must leave $CLUSTERVISION_HOME byte- and mtime-identical"
+    );
+    drop(live_writer);
+}
+
+#[test]
+fn hooks_fail_open_on_corrupt_store_unknown_harness_and_other_harnesses() {
+    let w = World::new("hook-resilience");
+    cv_ok(&w, &["retire", "retired-peer", "--successor", "fresh-peer"]);
+
+    // 1. Cross-harness `--harness gemini` / `--harness antigravity` works cleanly for `hook retired`
+    // (allowing unretired calls and denying messages to retired agents) rather than exiting 1.
+    let allow = with(
+        common(&w, "gsess", "PreToolUse"),
+        json!({"tool_name": "read_file", "tool_input": {"path": "a.rs"}}),
+    );
+    let (out, err) = hook_full(
+        &w,
+        &["hook", "retired", "--harness", "gemini"],
+        &allow,
+        &[("CV_FROZEN", "1")],
+    );
+    assert_eq!((out.as_str(), err.as_str()), ("", ""));
+
+    let msg_retired = with(
+        common(&w, "gsess", "PreToolUse"),
+        json!({"tool_name": "send_message", "tool_input": {"to": "retired-peer", "message": "hi"}}),
+    );
+    let (deny, err) = hook_full(
+        &w,
+        &["hook", "retired", "--harness", "antigravity"],
+        &msg_retired,
+        &[("CV_FROZEN", "1")],
+    );
+    assert_eq!(err, "");
+    let v: serde_json::Value = serde_json::from_str(&deny).unwrap();
+    assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "deny");
+
+    // 2. A typo in `--harness` logs to stderr and still exits 0 (fail-open).
+    let (out, err) = hook_full(&w, &["hook", "retired", "--harness", "bogus-harness"], &allow, &[]);
+    assert_eq!(out, "");
+    assert!(err.contains("unknown harness"), "{err}");
+
+    // 3. Corrupt `state.db` or unusable `CLUSTERVISION_HOME` never bricks tool calls.
+    let bad_home = w.base.join("corrupt-home");
+    fs::create_dir_all(&bad_home).unwrap();
+    fs::write(bad_home.join("state.db"), b"corrupt-sqlite-bytes").unwrap();
+    let (out, err) = hook_full(
+        &w,
+        &["hook", "retired", "--harness", "claude"],
+        &allow,
+        &[("CV_FROZEN", "1"), ("CLUSTERVISION_HOME", bad_home.to_str().unwrap())],
+    );
+    assert_eq!((out.as_str(), err.as_str()), ("", ""));
+}
+
+#[test]
+fn frozen_claude_and_codex_guards_deny_with_json_and_exit_zero() {
+    let w = World::new("frozen-guard-exits");
+    cv_ok(&w, &["retire", "old", "--successor", "new"]);
+    for harness in ["claude", "codex"] {
+        for (name, extra, strict) in [
+            (
+                "retired",
+                json!({"session_id": "old", "tool_name": "Read", "tool_input": {}}),
+                false,
+            ),
+            (
+                "retired",
+                json!({"agent_id": "agent-old", "tool_name": "exec", "tool_input": "malformed ("}),
+                false,
+            ),
+            (
+                "retired",
+                json!({"tool_name": "Agent", "tool_input": {"resume": "old"}}),
+                false,
+            ),
+            ("receipt", json!({"tool_name": "Read", "tool_input": {}}), true),
+        ] {
+            let env = [
+                ("CV_FROZEN", "1"),
+                ("CV_RECEIPT_STRICT", if strict { "1" } else { "0" }),
+            ];
+            let (out, err) = hook_full(
+                &w,
+                &["hook", name, "--harness", harness],
+                &with(common(&w, "active", "PreToolUse"), extra),
+                &env,
+            );
+            assert!(err.is_empty(), "{harness}: {err}");
+            let out: serde_json::Value = serde_json::from_str(&out).unwrap();
+            assert_eq!(out["hookSpecificOutput"]["permissionDecision"], "deny", "{harness}");
+        }
+        let (out, err) = hook_full(
+            &w,
+            &["hook", "receipt", "--harness", harness],
+            &common(&w, "old", "PostToolUse"),
+            &[("CV_FROZEN", "1"), ("CV_RECEIPT_STRICT", "1")],
+        );
+        assert_eq!((out.as_str(), err.as_str()), ("", ""));
+    }
 }

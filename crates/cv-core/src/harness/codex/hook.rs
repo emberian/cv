@@ -43,21 +43,23 @@ pub(super) fn hook_event(v: &Value) -> Result<Option<Event>> {
         }
     };
     let mut edits = Vec::new();
-    if let Some(tool) = &p.tool_input {
-        let name = p.tool_name.as_deref().unwrap_or("apply_patch");
-        crate::tools::classify::visit_tool_ops(
-            Some(Harness::Codex),
-            name,
-            crate::json::JsonView::from(tool),
-            crate::tools::classify::ClassifyOpts::COUNTS,
-            |sem| {
-                if let crate::tools::classify::ToolOp::FileEdit { path, .. } = sem.op {
-                    edits.push(path.into_owned());
-                }
-            },
-        )?;
-        edits.sort();
-        edits.dedup();
+    if matches!(p.hook_event_name.as_deref(), Some("PreToolUse") | None) {
+        if let Some(tool) = &p.tool_input {
+            let name = p.tool_name.as_deref().unwrap_or("apply_patch");
+            let _ = crate::tools::classify::visit_tool_ops(
+                Some(Harness::Codex),
+                name,
+                crate::json::JsonView::from(tool),
+                crate::tools::classify::ClassifyOpts::COUNTS,
+                |sem| {
+                    if let crate::tools::classify::ToolOp::FileEdit { path, .. } = sem.op {
+                        edits.push(path.into_owned());
+                    }
+                },
+            );
+            edits.sort();
+            edits.dedup();
+        }
     }
     Ok(Some(Event {
         harness: Harness::Codex,

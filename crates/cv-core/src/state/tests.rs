@@ -779,7 +779,13 @@ fn frozen_reads_see_committed_wal_frames_without_touching_the_live_store() {
     let writer = store.open_writable().unwrap();
     store.append("op-wal", "d-wal", &json!({"x": 2})).unwrap();
     assert!(std::fs::metadata(base.join("state.db-wal")).is_ok_and(|m| m.len() > 0));
+    assert!(base.join("state.db-shm").exists());
     let before = dir_listing(&base);
+    let shm_bytes_before = std::fs::read(base.join("state.db-shm")).unwrap();
+    let shm_mtime_before = std::fs::metadata(base.join("state.db-shm"))
+        .unwrap()
+        .modified()
+        .unwrap();
 
     {
         let _frozen = crate::env::Env::from_vars([("CV_FROZEN", "1")]).enter();
@@ -796,8 +802,90 @@ fn frozen_reads_see_committed_wal_frames_without_touching_the_live_store() {
         before,
         "--frozen reads must not grow or reset the live WAL"
     );
+    assert_eq!(
+        std::fs::read(base.join("state.db-shm")).unwrap(),
+        shm_bytes_before,
+        "--frozen reads must not write reader marks into state.db-shm"
+    );
+    assert_eq!(
+        std::fs::metadata(base.join("state.db-shm"))
+            .unwrap()
+            .modified()
+            .unwrap(),
+        shm_mtime_before,
+        "--frozen reads must preserve state.db-shm mtime"
+    );
     drop(writer);
     std::fs::remove_dir_all(&base).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn readonly_sandbox_wal_store_reads_retirements_and_scales_concurrently() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let live = tmp_state_dir("sandbox-wal-live");
+    let store = StateStore::at_dir(&live);
+    let writer = store.open_writable().unwrap();
+    {
+        let _seed = crate::env::Env::from_vars([("CLUSTERVISION_HOME", live.as_os_str())]).enter();
+        crate::retired::retire("agent-sandboxed", Some("agent-successor"), Some("sess-parent")).unwrap();
+    }
+    assert!(std::fs::metadata(live.join("state.db-wal")).is_ok_and(|m| m.len() > 0));
+
+    // Copy `state.db`, `state.db-wal`, and `state.db-shm` into a directory locked down to 0444/0555
+    // (simulating a Seatbelt / read-only sandbox with uncheckpointed WAL retirements).
+    let ro_dir = tmp_state_dir("sandbox-wal-ro");
+    for name in ["state.db", "state.db-wal", "state.db-shm"] {
+        let src = live.join(name);
+        if src.exists() {
+            let dst = ro_dir.join(name);
+            std::fs::copy(&src, &dst).unwrap();
+            std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o444)).unwrap();
+        }
+    }
+    drop(writer);
+    std::fs::set_permissions(&ro_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    // 1. Non-frozen `retired::current()` inside a read-only sandbox still sees WAL retirements.
+    {
+        let _env = crate::env::Env::from_vars([("CLUSTERVISION_HOME", ro_dir.as_os_str())]).enter();
+        let map = crate::retired::current();
+        assert_eq!(
+            map.get("sandboxed").and_then(|r| r.successor.as_deref()),
+            Some("successor")
+        );
+    }
+
+    // 2. 8 concurrent `--frozen` subagents read the WAL-backed read-only store cleanly without contention.
+    let handles: Vec<_> = (0..8)
+        .map(|_| {
+            let ro_copy = ro_dir.clone();
+            std::thread::spawn(move || {
+                let _env = crate::env::Env::from_vars([
+                    ("CLUSTERVISION_HOME", ro_copy.to_str().unwrap()),
+                    ("CV_FROZEN", "true"),
+                ])
+                .enter();
+                let map = crate::retired::current();
+                assert_eq!(
+                    map.get("sandboxed").and_then(|r| r.successor.as_deref()),
+                    Some("successor")
+                );
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    // Restore permissions so cleanup succeeds.
+    std::fs::set_permissions(&ro_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    for entry in std::fs::read_dir(&ro_dir).unwrap().flatten() {
+        let _ = std::fs::set_permissions(entry.path(), std::fs::Permissions::from_mode(0o600));
+    }
+    std::fs::remove_dir_all(&live).ok();
+    std::fs::remove_dir_all(&ro_dir).ok();
 }
 
 #[test]
@@ -1220,4 +1308,55 @@ fn hub_v7_epoch_supersedes_pre_upgrade_v4_epoch_on_untimestamped_delete_in_any_a
         );
         std::fs::remove_dir_all(&dir).ok();
     }
+}
+
+#[test]
+fn frozen_checkpoint_connection_remains_a_snapshot_after_later_writes() {
+    let base = tmp_state_dir("frozen-checkpoint-lifetime");
+    let store = StateStore::at_dir(&base);
+    store.append("before", "before", &json!({})).unwrap();
+    let conn = {
+        let _frozen = crate::env::Env::default().with_frozen().enter();
+        store.open_readonly().unwrap().unwrap()
+    };
+    store.append("after", "after", &json!({})).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT count(*) FROM capture_inbox", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 1, "a frozen connection must not follow later checkpoints");
+    drop(conn);
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn private_state_snapshot_retries_changed_wal_and_refuses_an_unstable_final_copy() {
+    let base = tmp_state_dir("frozen-copy-retry");
+    let store = StateStore::at_dir(&base);
+    let writer = store.open_writable().unwrap();
+    store.append("before", "before", &json!({})).unwrap();
+    let mut attempts = 0;
+    let conn = super::open_private_folded_copy_with_check(&store.db_path, || {
+        attempts += 1;
+        if attempts == 1 {
+            store.append("after", "after", &json!({})).unwrap();
+        }
+    })
+    .unwrap();
+    assert_eq!(attempts, 2);
+    let count: i64 = conn
+        .query_row("SELECT count(*) FROM capture_inbox", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 2, "retry must include the newer WAL commit");
+    drop(conn);
+
+    let mut attempts = 0;
+    let result = super::open_private_folded_copy_with_check(&store.db_path, || {
+        attempts += 1;
+        let id = format!("racing-{attempts}");
+        store.append(&id, &id, &json!({})).unwrap();
+    });
+    assert!(result.is_err(), "the final retry must not accept changing source files");
+    assert_eq!(attempts, 4);
+    drop(writer);
+    std::fs::remove_dir_all(base).unwrap();
 }

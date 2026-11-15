@@ -252,6 +252,7 @@ mod imp {
             .inspect_err(note_sql)
             .ok()?;
         conn.busy_timeout(Duration::from_secs(5)).inspect_err(note_sql).ok()?;
+        let _ = conn.execute_batch("PRAGMA query_only = ON;");
         let stored: String = conn
             .query_row(
                 "SELECT value FROM catalog_meta WHERE key='discovery_version'",

@@ -66,6 +66,31 @@ impl Event {
         }
         out
     }
+
+    /// Generic hook payload decoding for harnesses without a dedicated
+    /// [`Adapter::hook_event`](crate::harness::Adapter::hook_event) override when `cv hook` is
+    /// invoked with standard Claude-compatible hook JSON (`retired`, `receipt`, `decisions`, `start`).
+    pub fn from_generic_payload(harness: Harness, v: &Value) -> Result<Event> {
+        let p = Payload::decode(v)?;
+        let transcript = p.transcript();
+        let agent = p.agent_id.as_deref().map(|id| {
+            let id = id.strip_prefix("agent-").unwrap_or(id).to_string();
+            Agent {
+                id,
+                kind: p.agent_type.clone(),
+                transcript: p.agent_transcript(),
+                last_message: p.last_assistant_message.clone(),
+            }
+        });
+        Ok(Event {
+            harness,
+            session: SessionRef::new(p.session_id, harness, transcript.unwrap_or_default()),
+            event: p.hook_event_name,
+            cwd: p.cwd,
+            agent,
+            edits: Vec::new(),
+        })
+    }
 }
 
 /// The Claude Code hook payload's fields cv reads; Codex sends the same names. Every other

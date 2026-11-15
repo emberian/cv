@@ -549,10 +549,13 @@ fn open_cold_ro_inner(
         // std::fs::copy uses clonefile on APFS and bounded OS copying elsewhere. Never copy
         // SHM: it contains live coordination state; SQLite rebuilds it only in our directory.
         std::fs::copy(path, &snapshot.database)?;
+        crate::state::set_restrictive_file_mode(&snapshot.database);
         for suffix in ["-wal", "-journal"] {
             let original = sidecar(path, suffix);
             if original.exists() {
-                std::fs::copy(original, sidecar(&snapshot.database, suffix))?;
+                let dst = sidecar(&snapshot.database, suffix);
+                std::fs::copy(original, &dst)?;
+                crate::state::set_restrictive_file_mode(&dst);
             }
         }
         if let Some(hook) = copied.take() {

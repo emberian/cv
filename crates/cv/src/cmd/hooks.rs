@@ -1291,17 +1291,6 @@ pub(crate) fn doctor_json() -> Value {
 
 // ───────────────────────────── the hook bodies ─────────────────────────────
 
-/// The harness a `cv hook` call speaks for: `--harness`, else Claude (the default every
-/// `cv hooks` subcommand names).
-fn hook_call_harness(flag: Option<&str>) -> Result<Harness> {
-    if cv_core::env::var_os("CV_HOOK_HARNESS").is_some() {
-        return crate::util::usage(
-            "`$CV_HOOK_HARNESS` was removed in 0.18.0 — `cv hooks install codex` writes `--harness codex`",
-        );
-    }
-    hook_harness(flag.unwrap_or("claude"))
-}
-
 /// `cv hook <name>`: read stdin, run the body, print its one-line JSON (or nothing). A body that
 /// fails prints its error on stderr and still exits 0 — a hook must never block the harness. A
 /// terminal on stdin means no harness is calling: usage, exit 2, instead of waiting for JSON.
@@ -1313,7 +1302,19 @@ pub(crate) fn cmd_hook(name: HookName, harness: Option<String>) -> Result<()> {
             name.as_str()
         ));
     }
-    let harness = hook_call_harness(harness.as_deref())?;
+    if cv_core::env::var_os("CV_HOOK_HARNESS").is_some() {
+        return crate::util::usage(
+            "`$CV_HOOK_HARNESS` was removed in 0.18.0 — `cv hooks install codex` writes `--harness codex`",
+        );
+    }
+    let raw_harness = harness.as_deref().unwrap_or("claude");
+    let Some(harness) = Harness::parse(raw_harness) else {
+        eprintln!(
+            "cv hook {}: unknown harness {raw_harness:?}; nothing to do",
+            name.as_str()
+        );
+        return Ok(());
+    };
     let mut raw = String::new();
     let _ = std::io::stdin().read_to_string(&mut raw);
     let payload: Value = match serde_json::from_str(&raw) {
@@ -1328,7 +1329,18 @@ pub(crate) fn cmd_hook(name: HookName, harness: Option<String>) -> Result<()> {
     };
     let decoded = cv_core::harness::rootless(harness)
         .context("no adapter")
-        .and_then(|adapter| adapter.hook_event(&payload));
+        .and_then(|adapter| adapter.hook_event(&payload))
+        .and_then(|ev| match ev {
+            Some(ev) => Ok(Some(ev)),
+            None if matches!(
+                name,
+                HookName::Retired | HookName::Receipt | HookName::Decisions | HookName::Start
+            ) =>
+            {
+                cv_core::hooks::Event::from_generic_payload(harness, &payload).map(Some)
+            }
+            None => Ok(None),
+        });
     let out = match decoded {
         Ok(None) => Ok(None),
         Ok(Some(event)) => match name {
@@ -1814,6 +1826,7 @@ fn hook_start(ev: &Event) -> Result<Option<Value>> {
 
 /// `SubagentStart` / `SubagentStop`: record the lane run in `state.db` (`lane_runs` +
 /// `lane_endpoints`) and append one row to the lane ledger; no output, no model action.
+/// Under `--frozen` (`CV_FROZEN=1`), telemetry writes are skipped silently.
 fn hook_lane(ev: &Event, payload: &Value) -> Result<Option<Value>> {
     let event = match ev.event.as_deref() {
         Some("SubagentStart") => cv_core::lanes::LaneEventKind::Start,
@@ -1823,6 +1836,9 @@ fn hook_lane(ev: &Event, payload: &Value) -> Result<Option<Value>> {
     let Some(agent) = ev.agent.as_ref() else {
         return Ok(None);
     };
+    if cv_core::env::frozen() {
+        return Ok(None);
+    }
     let now = chrono::Utc::now();
     let now_ms = now.timestamp_millis();
     let last_text = agent
@@ -1846,38 +1862,67 @@ fn hook_lane(ev: &Event, payload: &Value) -> Result<Option<Value>> {
     })
     .context("appending to the lane ledger")?;
 
-    if !cv_core::env::frozen() {
-        if let Ok(store) = cv_core::state::StateStore::default_store() {
-            let bare_id = cv_core::retired::bare(&agent.id).to_string();
-            let pid = payload.get("pid").and_then(Value::as_i64).or_else(|| {
-                #[cfg(unix)]
-                {
-                    let ppid = unsafe { libc::getppid() } as i64;
-                    (ppid > 1).then_some(ppid)
-                }
-                #[cfg(not(unix))]
-                {
-                    None
-                }
-            });
-            let proc_start_time = pid.and_then(cv_core::state::tables::proc_start_time_of);
-            let derived_agent_tp = agent.transcript.clone().or_else(|| {
-                cv_core::harness::rootless(ev.harness).and_then(|a| a.agent_transcript(&ev.session, &bare_id, None))
-            });
-            let existing = store
-                .list_lane_runs_for_session(&ev.session.id)
-                .unwrap_or_default()
-                .into_iter()
-                .rev()
-                .find(|r| r.agent_id.as_deref() == Some(bare_id.as_str()));
+    if let Ok(store) = cv_core::state::StateStore::default_store() {
+        let bare_id = cv_core::retired::bare(&agent.id).to_string();
+        let pid = payload.get("pid").and_then(Value::as_i64).or_else(|| {
+            #[cfg(unix)]
+            {
+                let ppid = unsafe { libc::getppid() } as i64;
+                (ppid > 1).then_some(ppid)
+            }
+            #[cfg(not(unix))]
+            {
+                None
+            }
+        });
+        let proc_start_time = pid.and_then(cv_core::state::tables::proc_start_time_of);
+        let derived_agent_tp = agent.transcript.clone().or_else(|| {
+            cv_core::harness::rootless(ev.harness).and_then(|a| a.agent_transcript(&ev.session, &bare_id, None))
+        });
+        let existing = store
+            .list_lane_runs_for_session(&ev.session.id)
+            .unwrap_or_default()
+            .into_iter()
+            .rev()
+            .find(|r| r.agent_id.as_deref() == Some(bare_id.as_str()));
 
-            let target_run_id = match event {
-                cv_core::lanes::LaneEventKind::Start => {
-                    let active_existing = existing.filter(|r| r.exited_at.is_none());
-                    let rid = active_existing
-                        .as_ref()
-                        .map(|r| r.run_id.clone())
-                        .unwrap_or_else(|| format!("{}:{bare_id}", ev.session.id));
+        let target_run_id = match event {
+            cv_core::lanes::LaneEventKind::Start => {
+                let active_existing = existing.filter(|r| r.exited_at.is_none());
+                let rid = active_existing
+                    .as_ref()
+                    .map(|r| r.run_id.clone())
+                    .unwrap_or_else(|| format!("{}:{bare_id}", ev.session.id));
+                let _ = store.record_lane_start(&cv_core::state::LaneRun {
+                    run_id: rid.clone(),
+                    session_id: ev.session.id.clone(),
+                    agent_id: Some(bare_id),
+                    agent_type: agent.kind.clone(),
+                    harness: Some(ev.harness.as_str().to_string()),
+                    pid,
+                    proc_start_time,
+                    boot_id: active_existing
+                        .and_then(|r| r.boot_id)
+                        .or_else(cv_core::lanes::current_boot_id),
+                    transcript_path: ev.transcript().map(|p| p.to_string_lossy().into_owned()),
+                    agent_transcript_path: derived_agent_tp.map(|p| p.to_string_lossy().into_owned()),
+                    cwd: resolved_cwd.as_ref().map(|p| p.to_string_lossy().into_owned()),
+                    started_at: now_ms,
+                    exited_at: None,
+                    exit_status: None,
+                    last_text: None,
+                });
+                rid
+            }
+            cv_core::lanes::LaneEventKind::Stop => {
+                let rid = existing
+                    .as_ref()
+                    .map(|r| r.run_id.clone())
+                    .unwrap_or_else(|| format!("{}:{bare_id}", ev.session.id));
+                let updated = store
+                    .record_lane_exit(&rid, now_ms, Some("hook_stop"), last_text.as_deref())
+                    .unwrap_or(false);
+                if !updated {
                     let _ = store.record_lane_start(&cv_core::state::LaneRun {
                         run_id: rid.clone(),
                         session_id: ev.session.id.clone(),
@@ -1886,54 +1931,23 @@ fn hook_lane(ev: &Event, payload: &Value) -> Result<Option<Value>> {
                         harness: Some(ev.harness.as_str().to_string()),
                         pid,
                         proc_start_time,
-                        boot_id: active_existing
-                            .and_then(|r| r.boot_id)
-                            .or_else(cv_core::lanes::current_boot_id),
+                        boot_id: None,
                         transcript_path: ev.transcript().map(|p| p.to_string_lossy().into_owned()),
                         agent_transcript_path: derived_agent_tp.map(|p| p.to_string_lossy().into_owned()),
                         cwd: resolved_cwd.as_ref().map(|p| p.to_string_lossy().into_owned()),
                         started_at: now_ms,
-                        exited_at: None,
-                        exit_status: None,
-                        last_text: None,
+                        exited_at: Some(now_ms),
+                        exit_status: Some("stop_only".into()),
+                        last_text,
                     });
-                    rid
                 }
-                cv_core::lanes::LaneEventKind::Stop => {
-                    let rid = existing
-                        .as_ref()
-                        .map(|r| r.run_id.clone())
-                        .unwrap_or_else(|| format!("{}:{bare_id}", ev.session.id));
-                    let updated = store
-                        .record_lane_exit(&rid, now_ms, Some("hook_stop"), last_text.as_deref())
-                        .unwrap_or(false);
-                    if !updated {
-                        let _ = store.record_lane_start(&cv_core::state::LaneRun {
-                            run_id: rid.clone(),
-                            session_id: ev.session.id.clone(),
-                            agent_id: Some(bare_id),
-                            agent_type: agent.kind.clone(),
-                            harness: Some(ev.harness.as_str().to_string()),
-                            pid,
-                            proc_start_time,
-                            boot_id: None,
-                            transcript_path: ev.transcript().map(|p| p.to_string_lossy().into_owned()),
-                            agent_transcript_path: derived_agent_tp.map(|p| p.to_string_lossy().into_owned()),
-                            cwd: resolved_cwd.as_ref().map(|p| p.to_string_lossy().into_owned()),
-                            started_at: now_ms,
-                            exited_at: Some(now_ms),
-                            exit_status: Some("stop_only".into()),
-                            last_text,
-                        });
-                    }
-                    rid
-                }
-            };
-            if let Ok(ep) = cv_core::env::var("CV_ENDPOINT") {
-                let ep = ep.trim();
-                if !ep.is_empty() {
-                    let _ = store.bind_lane_endpoint(&target_run_id, ep);
-                }
+                rid
+            }
+        };
+        if let Ok(ep) = cv_core::env::var("CV_ENDPOINT") {
+            let ep = ep.trim();
+            if !ep.is_empty() {
+                let _ = store.bind_lane_endpoint(&target_run_id, ep);
             }
         }
     }
@@ -2051,6 +2065,16 @@ fn hook_receipt(ev: &Event, payload: &Value) -> Result<Option<Value>> {
         Some("PostToolUse") => "post",
         _ => return Ok(None),
     };
+    if cv_core::env::frozen() {
+        if kind == "pre" && cv_core::env::var("CV_RECEIPT_STRICT").as_deref() == Ok("1") {
+            return Ok(Some(json!({"hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": "cv receipt: --frozen (CV_FROZEN=1) forbids writing receipts to state.db; CV_RECEIPT_STRICT=1 refuses unreceipted calls",
+            }})));
+        }
+        return Ok(None);
+    }
     let field = |k: &str| payload.get(k).cloned().unwrap_or(Value::Null);
     let mut body = Map::new();
     body.insert("v".into(), json!(1));
@@ -2109,6 +2133,9 @@ fn minutes_since_modified(path: &Path) -> Option<i64> {
 /// [`cv_core::tools::classify::normalize_path`], so symlinked ancestors (`/var` ↔ `/private/var`)
 /// resolve identically even when the target file does not exist yet. Nothing printed = allow.
 fn hook_edit(ev: &Event) -> Result<Option<Value>> {
+    if ev.edits.is_empty() {
+        return Ok(None);
+    }
     let Some(guard) = cv_core::hooks::Guard::of(ev) else {
         return Ok(None);
     };
