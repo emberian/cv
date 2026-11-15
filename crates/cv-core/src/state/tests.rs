@@ -1434,7 +1434,7 @@ fn frozen_snapshots_are_committed_states_under_commit_and_checkpoint_churn() {
         // A failed assertion must still stop the writer, or the scope never joins.
         let _stop = StopOnDrop(&stop);
         let _frozen = crate::env::Env::from_vars([("CV_FROZEN", "1")]).enter();
-        for round in 0..200 {
+        for round in 0..200u32 {
             let conn = match store.open_readonly() {
                 Ok(conn) => conn.unwrap(),
                 Err(_) => {
@@ -1467,7 +1467,7 @@ fn frozen_snapshots_are_committed_states_under_commit_and_checkpoint_churn() {
                 "a later snapshot went back in time: {latest} < {newest}"
             );
             newest = latest;
-            if round % 20 == 0 {
+            if round.is_multiple_of(20) {
                 let check: String = conn.query_row("PRAGMA integrity_check", [], |r| r.get(0)).unwrap();
                 assert_eq!(check, "ok");
             }

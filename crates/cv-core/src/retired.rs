@@ -537,7 +537,7 @@ mod tests {
                 let mut i = 0usize;
                 while !stop.load(Ordering::Relaxed) {
                     retire(&format!("churn-{}", i % 7), Some("PENDING"), None).unwrap();
-                    if i % 3 == 0 {
+                    if i.is_multiple_of(3) {
                         let conn = store.open_writable().unwrap();
                         let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
                     }
