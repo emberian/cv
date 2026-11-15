@@ -196,6 +196,7 @@ SHELL_DOCTOR_CONVERSATIONAL = {
 }
 
 SHELL_DOCTOR_EXPECTED = {
+    "read_coverage": [],
     "sessions": 1, "messages": 1, "compactions": 0, "auto_compactions": 0,
     "pre_tokens": [], "fixed_overhead_est": 0, "peak_context": 0,
     "conversational": SHELL_DOCTOR_CONVERSATIONAL,
