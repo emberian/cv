@@ -33,6 +33,16 @@ const SUMMARY_TIMEOUT: Duration = Duration::from_secs(900);
 /// appended bytes are the next read's.
 const RETRY_FIRST: Duration = Duration::from_secs(5);
 const RETRY_MAX: Duration = Duration::from_secs(600);
+
+/// The pause before a session whose summary call failed is tried again: [`RETRY_FIRST`], doubled
+/// by each further failure in a row, up to [`RETRY_MAX`]; a written summary clears it. Without it a
+/// summary call that fails fast (a refused connection, a 4xx) was started again on the wake its
+/// own failure sent, as fast as the loop could turn. Cost-only.
+fn summary_pause(failures: u32) -> Duration {
+    RETRY_FIRST
+        .saturating_mul(1 << failures.saturating_sub(1).min(16))
+        .min(RETRY_MAX)
+}
 /// A lease older than this is another owner's that died: the summary call's own timeout and a
 /// minute. Cost-only.
 const LEASE_STALE: Duration = Duration::from_secs(900 + 60);
@@ -454,6 +464,9 @@ struct Live {
     found: Vec<(usize, String, String)>,
     /// The window's message ids (index, id): what a narrative cite may name.
     ids: Vec<(usize, String)>,
+    /// Summary calls for this session that failed in a row, and when the next may start.
+    failures: u32,
+    not_before: Option<Instant>,
 }
 
 impl Live {
@@ -474,6 +487,8 @@ impl Live {
             summaries: Vec::new(),
             found: Vec::new(),
             ids: Vec::new(),
+            failures: 0,
+            not_before: None,
         }
     }
 
@@ -1289,12 +1304,22 @@ fn watch(
                         live.span.retain(|(i, _)| *i > cut);
                         live.record = Some(record);
                     }
+                    live.failures = 0;
+                    live.not_before = None;
                 }
                 Err(e) => {
-                    eprintln!("precompact: {} summary failed: {e:#}", short_id(&live.r.id));
+                    live.failures = live.failures.saturating_add(1);
+                    let pause = summary_pause(live.failures);
+                    live.not_before = Some(Instant::now() + pause);
+                    eprintln!(
+                        "precompact: {} summary failed: {e:#}; tried again in {}s",
+                        short_id(&live.r.id),
+                        pause.as_secs()
+                    );
                     let _ = store::event(
                         &root,
-                        json!({"event": "failed", "harness": live.r.harness.as_str(), "session": live.r.id, "error": format!("{e:#}")}),
+                        json!({"event": "failed", "harness": live.r.harness.as_str(), "session": live.r.id, "error": format!("{e:#}"),
+                               "failures": live.failures, "retry_s": pause.as_secs()}),
                     );
                 }
             }
@@ -1302,9 +1327,18 @@ fn watch(
 
         // Decide, and start what is due.
         let mut next_idle: Option<u64> = None;
+        // The soonest end of a pause after a failed summary: the loop wakes for it.
+        let mut paused: Option<Instant> = None;
         for live in lives.values_mut() {
             if live.job {
                 continue;
+            }
+            if let Some(at) = live.not_before {
+                if at > Instant::now() {
+                    paused = Some(paused.map_or(at, |p| p.min(at)));
+                    continue;
+                }
+                live.not_before = None;
             }
             if live.native() && !settings.prepare_native {
                 if live.said != "native" {
@@ -1454,6 +1488,11 @@ fn watch(
         let timeout = match (timeout, retry) {
             (Some(t), Some(r)) => Some(t.min(r)),
             (t, r) => t.or(r),
+        };
+        let paused = paused.map(|at| at.saturating_duration_since(Instant::now()).max(Duration::from_secs(1)));
+        let timeout = match (timeout, paused) {
+            (Some(t), Some(p)) => Some(t.min(p)),
+            (t, p) => t.or(p),
         };
         // A home with no session yet places no root, so nothing would ever wake the loop: look
         // again on the fallback tick until the first session places them.
@@ -2230,6 +2269,17 @@ fn same_generation(path: &Path, before: Option<cv_core::source::FileId>) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A failed summary's pause doubles from [`RETRY_FIRST`] and stops at [`RETRY_MAX`].
+    #[test]
+    fn a_failed_summary_pause_doubles_to_its_ceiling() {
+        assert_eq!(summary_pause(1), RETRY_FIRST);
+        assert_eq!(summary_pause(2), RETRY_FIRST * 2);
+        assert_eq!(summary_pause(4), RETRY_FIRST * 8);
+        assert_eq!(summary_pause(8), RETRY_MAX);
+        assert_eq!(summary_pause(u32::MAX), RETRY_MAX);
+        assert_eq!(summary_pause(0), RETRY_FIRST, "no failure yet reads as the first pause, never a zero one");
+    }
 
     /// A swap commits only the generation its anchor check read: a write since, a torn last
     /// line or a missing file refuses it.
