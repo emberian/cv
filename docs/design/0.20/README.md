@@ -109,6 +109,7 @@ Resolve shared interfaces before merging dependent lanes. Use small commits with
 scoped evidence, then test composition on the integration branch. Run the project
 CI checks, native/portable/WASM builds, package verification, manual names/build,
 web/inbox tests, compatibility checks and relevant heap/performance gates. Validate
-against scratch copies/indexes with live harness stores read-only. Only then bump
-the release version and install the integrated binary; do not call unfinished native
+against scratch copies/indexes with live harness stores read-only. Set the candidate
+version before packaging; install the integrated binary only after these gates pass.
+Do not call unfinished native
 coverage complete merely to make a release label.
