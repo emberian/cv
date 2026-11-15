@@ -89,7 +89,10 @@ mod native {
         path
     }
     fn api(suffix: &str) -> Value {
-        let (status, reply) = cv_core::api::route_json(&["api", "session", "antigravity", ID, suffix], "");
+        api_query(suffix, "")
+    }
+    fn api_query(suffix: &str, query: &str) -> Value {
+        let (status, reply) = cv_core::api::route_json(&["api", "session", "antigravity", ID, suffix], query);
         assert_eq!(status, 200, "{reply}");
         reply
     }
@@ -130,6 +133,180 @@ mod native {
                     .contains(ReadCoverage::NATIVE_STORE));
             }
         }
+    }
+
+    #[test]
+    fn matching_native_tail_remains_visible_beside_nonempty_historical_export() {
+        let world = World::in_process("agy-native-tail", cv_core::env::Env::enter_isolated);
+        let root = world.home.join(".gemini/antigravity-cli");
+        let prompt = "retained exported prompt";
+        let tail = "new native reply after the exported prefix";
+        database(
+            &root,
+            &[
+                [number(1, 14), number(4, 3), bytes(19, bytes(3, bytes(1, prompt)))].concat(),
+                [number(1, 15), number(4, 3), bytes(20, bytes(1, tail))].concat(),
+            ],
+        );
+        let logs = root.join("brain").join(ID).join(".system_generated/logs");
+        fs::create_dir_all(&logs).unwrap();
+        let export = logs.join("transcript_full.jsonl");
+        fs::write(
+            &export,
+            format!(
+                "{}\n",
+                json!({"step_index":0,"type":"USER_INPUT","status":"DONE","content":prompt})
+            ),
+        )
+        .unwrap();
+        let adapter = Antigravity::with_home(&root);
+        let reference = SessionRef::new(ID, Harness::Antigravity, export);
+        for demand in [Demand::LEAN, Demand::FACTS, Demand::COMPLETE] {
+            let session = cv_core::stream::collect_with(&adapter, &reference, &demand).unwrap();
+            let messages = serde_json::to_value(&session.messages).unwrap();
+            let texts = messages
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|m| m["content"].as_array().unwrap())
+                .filter(|block| block["type"] == "text")
+                .map(|block| block["text"].as_str().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(texts, [prompt, tail]);
+            let coverage = ReadCoverage::of_session(&session).unwrap();
+            assert!(coverage.sources.contains(ReadCoverage::EXPORTED_HISTORY));
+            assert!(coverage.sources.contains(ReadCoverage::NATIVE_STORE));
+        }
+        let reply = api("messages");
+        assert_eq!(reply["messages"][0]["content"][0]["text"], prompt);
+        assert_eq!(reply["messages"][1]["content"][0]["text"], tail);
+        assert_eq!(api("head")["total"], 2);
+    }
+
+    #[test]
+    fn conflicting_latest_overlap_keeps_export_and_reports_unreconciled_native_tail() {
+        let world = World::in_process("agy-conflicting-tail", cv_core::env::Env::enter_isolated);
+        let root = world.home.join(".gemini/antigravity-cli");
+        let prompt = "shared earlier prompt";
+        let exported_answer = "retained original answer";
+        let newer_tail = "continuation of a conflicting native revision";
+        database(
+            &root,
+            &[
+                [number(1, 14), number(4, 3), bytes(19, bytes(3, bytes(1, prompt)))].concat(),
+                [
+                    number(1, 15),
+                    number(4, 3),
+                    bytes(20, bytes(1, "different native answer at reused index")),
+                ]
+                .concat(),
+                [number(1, 15), number(4, 3), bytes(20, bytes(1, newer_tail))].concat(),
+            ],
+        );
+        let logs = root.join("brain").join(ID).join(".system_generated/logs");
+        fs::create_dir_all(&logs).unwrap();
+        let export = logs.join("transcript_full.jsonl");
+        fs::write(
+            &export,
+            format!(
+                "{}\n{}\n",
+                json!({"step_index":0,"type":"USER_INPUT","status":"DONE","content":prompt}),
+                json!({"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","content":exported_answer})
+            ),
+        )
+        .unwrap();
+        let adapter = Antigravity::with_home(&root);
+        let reference = SessionRef::new(ID, Harness::Antigravity, export);
+        let session = cv_core::stream::collect_with(&adapter, &reference, &Demand::COMPLETE).unwrap();
+        let coverage = ReadCoverage::of_session(&session).unwrap();
+        assert!(coverage.limitations.contains(ReadCoverage::UNRECONCILED_HISTORY));
+        assert!(!coverage.limitations.contains(ReadCoverage::MISSING_HISTORY));
+        assert!(!coverage.limitations.contains(ReadCoverage::MISSING_PAYLOADS));
+        let reply = api("messages");
+        assert_eq!(reply["messages"].as_array().unwrap().len(), 2);
+        assert_eq!(reply["messages"][1]["content"][0]["text"], exported_answer);
+        assert!(evidence(&reply["session"]["extra"]["cv"]["read_coverage"])
+            .limitations
+            .contains(ReadCoverage::UNRECONCILED_HISTORY));
+        assert_eq!(api("head")["total"], 2);
+    }
+
+    #[test]
+    fn newer_native_indices_without_shared_history_are_not_blindly_appended() {
+        let world = World::in_process("agy-unanchored-tail", cv_core::env::Env::enter_isolated);
+        let root = world.home.join(".gemini/antigravity-cli");
+        let path = database(
+            &root,
+            &[[
+                number(1, 15),
+                number(4, 3),
+                bytes(20, bytes(1, "unanchored native reply")),
+            ]
+            .concat()],
+        );
+        let connection = rusqlite::Connection::open(path).unwrap();
+        connection.execute("UPDATE steps SET idx=1", []).unwrap();
+        drop(connection);
+        let logs = root.join("brain").join(ID).join(".system_generated/logs");
+        fs::create_dir_all(&logs).unwrap();
+        fs::write(
+            logs.join("transcript_full.jsonl"),
+            format!(
+                "{}\n",
+                json!({"step_index":0,"type":"USER_INPUT","status":"DONE","content":"exported prompt"})
+            ),
+        )
+        .unwrap();
+        let reply = api("messages");
+        assert_eq!(reply["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(reply["messages"][0]["content"][0]["text"], "exported prompt");
+        assert!(evidence(&reply["session"]["extra"]["cv"]["read_coverage"])
+            .limitations
+            .contains(ReadCoverage::UNRECONCILED_HISTORY));
+    }
+
+    #[test]
+    fn binary_planner_and_call_signatures_survive_rich_api_metadata() {
+        let world = World::in_process("agy-binary-signatures", cv_core::env::Env::enter_isolated);
+        let root = world.home.join(".gemini/antigravity-cli");
+        let call = [
+            bytes(1, "native-call"),
+            bytes(2, "run_command"),
+            bytes(3, "{}"),
+            bytes(7, [0xff, 0, 0x80]),
+        ]
+        .concat();
+        let response = [
+            bytes(1, "answer"),
+            bytes(3, "thinking"),
+            bytes(4, "legacy textual signature"),
+            bytes(14, [0, 0xff, 0x80, b'\n']),
+            bytes(7, call),
+        ]
+        .concat();
+        database(&root, &[[number(1, 15), number(4, 3), bytes(20, response)].concat()]);
+        let reply = api_query("messages", "extra=1");
+        let details = reply["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find_map(|message| message.pointer("/extra/antigravity/planner_details"))
+            .expect("rich metadata preserves recorded binary signatures");
+        assert_eq!(
+            details["thinking_signature"],
+            json!({"encoding":"base64","data":"AP+ACg=="})
+        );
+        assert_eq!(details["tool_calls"][0]["id"], "native-call");
+        assert_eq!(
+            details["tool_calls"][0]["thinking_signature"],
+            json!({"encoding":"base64","data":"/wCA"})
+        );
+        assert!(reply["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|m| m["content"].as_array().unwrap())
+            .any(|block| block["type"] == "thinking" && block["signature"] == "legacy textual signature"));
     }
 
     #[test]

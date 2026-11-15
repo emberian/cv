@@ -78,8 +78,10 @@ recently updated.
 
 cv prefers nonempty exported history: full JSONL (including contiguous byte chunks), then
 compact history and overview. These exports can retain text that Antigravity clears from its
-native database during compaction. When exports are missing or empty, cv reads native steps
-from `conversations/<uuid>.db`. Native reads require SQLite support, enabled in standard builds;
+native database during compaction. A matching latest shared user/assistant step allows newer
+native steps to extend a stale export; otherwise that additional history is flagged as
+unreconciled. When exports are missing or empty, cv reads native steps from
+`conversations/<uuid>.db`. Native reads require SQLite support, enabled in standard builds;
 portable builds without it report native databases as unsupported. Encrypted `*.pb` stores
 remain unsupported.
 
