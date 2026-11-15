@@ -317,6 +317,9 @@ fn resume_environment(
         .path
         .canonicalize()
         .with_context(|| format!("reading resume source {}", r.path.display()))?;
+    if !native_resume_filename(r.harness, &path, &r.id) {
+        return usage(format!("cannot safely resume {} from {}: the native filename does not address session {}; restore its native filename or port the transcript into a supported store", r.harness, path.display(), r.id));
+    }
     let root = match r.harness {
         Harness::Claude if !r.id.starts_with("agent-") && !r.id.ends_with(".flat") => path
             .parent()
@@ -345,6 +348,35 @@ fn resume_environment(
     };
     env.insert(key.into(), root.to_string_lossy().into_owned());
     Ok(env)
+}
+
+/// Native discovery must be able to find the file by the ID we pass to the harness.
+fn native_resume_filename(harness: Harness, path: &Path, id: &str) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    match harness {
+        Harness::Claude => name == format!("{id}.jsonl"),
+        Harness::Codex => {
+            // Codex 0.169 RolloutFileName::parse: plain or native-compressed rollout,
+            // 19-character local timestamp, thread UUID, optional distinct rollout UUID.
+            // https://github.com/openai/codex/blob/rust-v0.169.0/codex-rs/rollout/src/rollout_file_name.rs
+            let name = name.strip_suffix(".zst").unwrap_or(name);
+            let Some(core) = name.strip_prefix("rollout-").and_then(|s| s.strip_suffix(".jsonl")) else {
+                return false;
+            };
+            let Some(stamp) = core.get(..19) else { return false };
+            if core.get(19..20) != Some("-")
+                || chrono::NaiveDateTime::parse_from_str(stamp, "%Y-%m-%dT%H-%M-%S").is_err()
+            {
+                return false;
+            }
+            let ids = &core[20..];
+            let (thread, rollout) = ids.split_once('_').unwrap_or((ids, ids));
+            thread == id && uuid::Uuid::parse_str(thread).is_ok() && uuid::Uuid::parse_str(rollout).is_ok()
+        }
+        _ => true,
+    }
 }
 
 fn resume_json(harness: Harness, id: &str, cwd: Option<&Path>, warning: Option<&str>) -> serde_json::Value {
@@ -509,6 +541,29 @@ mod context_tests {
         assert_eq!(copy_context_if_absent(&source, &destination).unwrap(), None);
         assert!(destination.is_symlink());
         assert!(!missing.exists());
+    }
+
+    #[test]
+    fn resume_filename_keeps_native_compressed_and_reverted_rollouts() {
+        let id = "11111111-2222-4333-8444-555555555555";
+        let rollout = "66666666-7777-4888-8999-aaaaaaaaaaaa";
+        for suffix in [
+            format!("{id}.jsonl"),
+            format!("{id}.jsonl.zst"),
+            format!("{id}_{rollout}.jsonl.zst"),
+        ] {
+            assert!(native_resume_filename(
+                Harness::Codex,
+                Path::new(&format!("rollout-2026-11-01T00-00-00-{suffix}")),
+                id
+            ));
+        }
+        assert!(!native_resume_filename(
+            Harness::Claude,
+            Path::new(&format!("{id}.jsonl.zst")),
+            id
+        ));
+        assert!(!native_resume_filename(Harness::Claude, Path::new("renamed.jsonl"), id));
     }
 
     #[test]

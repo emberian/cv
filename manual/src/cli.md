@@ -776,7 +776,8 @@ as in the text output. This mode never launches anything and cannot be combined 
 
 Claude and Codex resume plans preserve the selected native store through `CLAUDE_CONFIG_DIR`
 and `CODEX_HOME`, including sessions found in extra roots. An explicit transcript path must use
-the native projects/session layout; copied exports and Claude child transcripts are refused.
+the native projects/session layout and filename; copied exports and Claude child transcripts are
+refused. Codex's native `.jsonl.zst` rollouts remain supported.
 Other CLI harnesses currently require an ID selector instead of an exact path. A shared database
 path alone cannot select a conversation: use `harness:ID`.
 

@@ -146,3 +146,29 @@ fn exact_source_shared_database_requires_a_native_session_id() {
         );
     }
 }
+
+#[test]
+fn exact_source_resume_refuses_codex_filenames_native_lookup_cannot_address() {
+    let w = World::new("resume-codex-native-filename");
+    let day = w.base.join("profile/sessions/2026/11/01");
+    fs::create_dir_all(&day).unwrap();
+    for name in [
+        "renamed.jsonl".to_string(),
+        format!("rollout-2026-11-01T00-00-00Z-{ID}.jsonl"),
+        "rollout-2026-11-01T00-00-00-66666666-7777-4888-8999-aaaaaaaaaaaa.jsonl".to_string(),
+        format!("rollout-2026-11-01T00-00-00-{ID}.jsonl.tmp"),
+    ] {
+        let path = day.join(name);
+        fs::write(
+            &path,
+            jsonl(&[json!({"timestamp":TS,"type":"session_meta","payload":{"id":ID,"cwd":w.base}})]),
+        )
+        .unwrap();
+        let (_, code, _, err) = w.cv(&["resume", "--harness", "codex", path.to_str().unwrap(), "--json"]);
+        assert_eq!(code, 2, "{err}");
+        assert!(
+            err.contains("native filename does not address session") && err.contains(ID),
+            "{err}"
+        );
+    }
+}

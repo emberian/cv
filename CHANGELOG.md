@@ -6,6 +6,7 @@
 - Pack accepts explicit sessions or transcript paths, with bounded overviews or task-focused excerpts, without searching other conversations or requiring an index.
 - Show recorded context usage, cache tokens, and compaction boundaries with `show --kind context` and the shared read API.
 
+- Resume validates native transcript filenames before producing Claude/Codex commands; Codex’s supported compressed rollouts remain resumable.
 - Doctor and resume accept exact transcript sources; Claude and Codex resume plans preserve selected profile homes and reject unaddressable exports.
 - `cv lanes --follow` streams changed worker states and results, keeps final transitions visible through filters, and supports deadlines and parent-labelled JSON.
 - `cv resume --json` returns executable arguments, working directory, manual resume hints, and native-store caveats without launching the harness.
