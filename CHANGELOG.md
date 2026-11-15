@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Search retains last-good sessions through failed replacements and rebuilds; incomplete discovery updates healthy sessions without pruning unseen history.
+- Corrupt short search segments fail cleanly and can be rebuilt without panicking.
+
 - Search validates indexes before discovery, shares one snapshot for freshness and ranking, and skips unused frozen resume checkpoints.
 
 - Full-text search supports reusable indexed snapshots and NDJSON batch queries with explicit freshness semantics and per-query work counters.

@@ -251,7 +251,7 @@ impl std::hash::Hash for Entry {
 /// rebuilt from transcripts: the task log (durable user data) and a watch cursor (a follower's
 /// position).
 // 12: Antigravity revision replay, native usage/lineage and surviving child lanes.
-pub const VERSION: u32 = 12;
+pub const VERSION: u32 = 13;
 
 /// Version identity for non-Record read state; keep the same interpretation authority.
 pub(crate) fn consumer_version(consumer: impl std::fmt::Display) -> String {
