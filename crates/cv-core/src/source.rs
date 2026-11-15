@@ -1230,9 +1230,11 @@ pub fn primary_path(r: &SessionRef) -> PathBuf {
 /// store that is itself gone: an unmounted volume, a home restored without it, a root that
 /// moved. Adapters list only the roots that exist ([`crate::harness::Adapter::roots`]), so the
 /// second case arrives as a successful inventory of nothing. It is told from the first by the
-/// filesystem: the session's primary source is missing and the nearest directory that still
-/// exists above it lies outside every root its harness has now. Deleting a transcript, a project
-/// directory or a database leaves that directory inside a root, and is a removal.
+/// filesystem: the session's primary source is missing, so is the directory that held it, and
+/// the nearest directory that still exists above them lies outside every root its harness has
+/// now. A transcript or database deleted from a directory that is still there is a removal
+/// wherever that directory is (a caller may index sessions outside every root); so is a deleted
+/// project directory, which leaves the nearest existing directory inside a root.
 #[derive(Default)]
 pub struct Presence {
     roots: HashMap<Option<Harness>, Vec<PathBuf>>,
@@ -1268,6 +1270,9 @@ impl Presence {
             }
         }
         let nearest = nearest?;
+        if source.parent() == Some(nearest) {
+            return None;
+        }
         let nearest = nearest.canonicalize().unwrap_or_else(|_| nearest.to_owned());
         let roots = self.roots.entry(harness).or_insert_with(|| {
             let adapters = match harness {
