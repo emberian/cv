@@ -89,7 +89,7 @@ Fallback associations are labeled as inferred. `cv show`, Markdown exports, `cv 
 metadata expose the sources used and known gaps, including cleared payloads and metadata-only
 children. A source label does not certify complete feature support.
 
-Complete core reads (`Demand::COMPLETE`) retain unknown native fields as original protobuf
+Complete core reads (`Demand::COMPLETE`) retain unknown native step fields as original protobuf
 records; normal views may not interpret them. Antigravity access is read-only: cv can export
 its IR, but cannot emit a runnable native Antigravity conversation. The
 [feature coverage matrix](https://github.com/emberian/cv/blob/main/docs/design/0.20/ANTIGRAVITY-COVERAGE.md)

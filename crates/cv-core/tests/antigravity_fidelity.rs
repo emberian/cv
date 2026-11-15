@@ -24,13 +24,20 @@ fn empty_exports_and_empty_tool_lists_do_not_invent_inferred_tool_associations()
 #[test]
 fn portable_native_database_read_is_an_explicit_unsupported_error() {
     use cv_core::harness::Parse;
+    use cv_core::Adapter;
     let world = World::in_process("agy-portable-coverage", cv_core::env::Env::enter_isolated);
     let root = world.home.join(".gemini/antigravity-cli");
     let dir = root.join("conversations");
     fs::create_dir_all(&dir).unwrap();
     let path = dir.join(format!("{ID}.db"));
     fs::write(&path, b"SQLite format 3\0synthetic database bytes").unwrap();
-    let error = Antigravity::with_home(&root)
+    let adapter = Antigravity::with_home(&root);
+    let discovered = adapter.discover().unwrap();
+    assert!(discovered
+        .skipped
+        .iter()
+        .any(|skipped| skipped.path == path && skipped.why.to_lowercase().contains("sqlite")));
+    let error = adapter
         .parse(&SessionRef::new(ID, Harness::Antigravity, path))
         .expect_err("portable build must not interpret native DB bytes as empty JSONL");
     let error = format!("{error:#}").to_lowercase();
@@ -148,7 +155,7 @@ mod native {
         assert!(coverage.limitations.contains(ReadCoverage::MISSING_PAYLOADS));
         assert!(
             !coverage.limitations.contains(ReadCoverage::MISSING_ATTACHMENTS),
-            "stored inline bytes are unsupported, not absent"
+            "stored inline bytes are present"
         );
         let reply = api("messages");
         assert_eq!(evidence(&reply["session"]["extra"]["cv"]["read_coverage"]), coverage);
@@ -158,6 +165,13 @@ mod native {
             .iter()
             .flat_map(|m| m["content"].as_array().unwrap())
             .any(|block| block["type"] == "image" && block["data_ref"] == uri));
+        assert!(reply["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|m| m["content"].as_array().unwrap())
+            .any(|block| block["type"] == "image"
+                && block["data_ref"] == "data:image/png;base64,c3RvcmVkIGlubGluZSBpbWFnZSBieXRlcw=="));
         let mut report = cv_core::doctor::Report::default();
         let mut pass = report.session_with_harness(None, Some(Harness::Antigravity));
         let shell = adapter.try_stream(&reference, &Demand::FACTS, &mut pass).unwrap();
