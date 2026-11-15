@@ -460,3 +460,15 @@ fn a_native_result_answers_an_exported_call_whose_planner_row_was_cleared() {
     assert_eq!(result_ids(&session), [call], "the result must not be orphaned");
     assert!(limitations(&session).contains(ReadCoverage::INFERRED_TOOL_IDENTITY));
 }
+
+#[test]
+fn an_unreadable_native_store_beside_an_export_is_disclosed() {
+    // A row that is not a protobuf message: the native store cannot be compared at all.
+    let session = read(
+        "agy-reconcile-unreadable",
+        &[(0, prompt(0, "Check the target")), (1, vec![0x80])],
+        &[exported_prompt(0, 0, "Check the target")],
+    );
+    assert_eq!(kinds(&session), [MessageKind::Prompt], "exported history survives");
+    assert!(limitations(&session).contains(ReadCoverage::UNRECONCILED_HISTORY));
+}

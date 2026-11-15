@@ -687,14 +687,22 @@ impl Adapter for Antigravity {
                 if let Some(loc) = BrainLoc::from_transcript(&r.path) {
                     let db = loc.app_data_dir.join("conversations").join(format!("{}.db", loc.id));
                     if db.is_file() {
-                        // A missing or changing sidecar must not erase surviving export history.
-                        if let Ok(verified) = merge::verified(
+                        // A changing or unreadable sidecar must not erase surviving export
+                        // history; whatever it holds beyond the export is then unaccounted for.
+                        let verified = merge::verified(
                             &input,
                             &order,
                             &db,
                             opts.tier == Tier::Complete,
                             matches!(from, Start::Whole),
-                        ) {
+                        );
+                        if verified.is_err() {
+                            order
+                                .coverage
+                                .limitations
+                                .insert(crate::coverage::ReadCoverage::UNRECONCILED_HISTORY.into());
+                        }
+                        if let Ok(verified) = verified {
                             if !verified.matches.is_empty()
                                 || !verified.native_only.steps.is_empty()
                                 || verified.unreconciled
