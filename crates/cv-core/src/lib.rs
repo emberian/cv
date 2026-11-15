@@ -287,7 +287,7 @@ use anyhow::Result;
 /// [`sessions`] a trustworthy fast read afterwards. Most read-side callers want [`sessions`]
 /// instead; call this when you need a guaranteed-fresh scan (e.g. `cv ls --fresh`, indexers).
 pub fn discover_all() -> Vec<SessionRef> {
-    discover_all_with_catalog(catalog::Reader::open())
+    discover_all_inventory().refs
 }
 
 /// [`discover_all`], handing every rollout it decodes in full to `handoff`'s consumer (an index
@@ -296,7 +296,36 @@ pub fn discover_all_handing_off(handoff: codex_handoff::Handoff) -> Vec<SessionR
     codex_handoff::within(&Some(handoff), discover_all)
 }
 
-fn discover_all_with_catalog(mut catalog: Option<catalog::Reader>) -> Vec<SessionRef> {
+/// Full discovery's available sessions and failures. A partial inventory remains useful for
+/// refreshing found sessions, but must never authorize deleting absent sessions from derived stores.
+pub struct DiscoveryInventory {
+    pub refs: Vec<SessionRef>,
+    /// Failed adapters plus individually skipped sources. Details are reported during discovery
+    /// and, for skipped sources, recorded in the catalog.
+    pub errors: usize,
+}
+
+pub fn discover_all_inventory() -> DiscoveryInventory {
+    discover_all_with_catalog(catalog::Reader::open())
+}
+
+/// Full discovery that refuses an incomplete inventory. Whole-store replacement must not
+/// mistake an adapter failure or skipped source for an authoritative empty result.
+pub fn discover_all_checked() -> Result<Vec<SessionRef>> {
+    let inventory = discover_all_inventory();
+    anyhow::ensure!(
+        inventory.errors == 0,
+        "session discovery was incomplete; previous full-text index retained"
+    );
+    Ok(inventory.refs)
+}
+
+/// Full discovery with a completeness result and the decode-once handoff.
+pub fn discover_all_handing_off_inventory(handoff: codex_handoff::Handoff) -> DiscoveryInventory {
+    codex_handoff::within(&Some(handoff), discover_all_inventory)
+}
+
+fn discover_all_with_catalog(mut catalog: Option<catalog::Reader>) -> DiscoveryInventory {
     let _sources = source::read_scope();
     let _cache_scope = catalog.as_ref().map(catalog::Reader::discovery_scope);
     let discovery = discover_cache::read::Context::current();
@@ -404,11 +433,16 @@ fn discover_all_with_catalog(mut catalog: Option<catalog::Reader>) -> Vec<Sessio
         catalog.record_skipped(&skipped);
     }
     drop((publications, skipped));
-    results
+    let errors = results
+        .iter()
+        .map(|(_, _, found, _)| found.as_ref().map_or(1, |f| f.skipped.len()))
+        .sum();
+    let refs = results
         .into_iter()
         .filter_map(|(_, _, found, _)| found)
         .flat_map(|found| found.refs)
-        .collect()
+        .collect();
+    DiscoveryInventory { refs, errors }
 }
 
 /// The one stderr line a discovery that could not open some sources prints per process; the
@@ -497,7 +531,7 @@ fn sessions_impl() -> (Vec<SessionRef>, bool) {
             "cv: note: re-discovering the fleet once for this cv version (minutes on a large fleet; `cv index` after upgrading does it ahead of time)"
         );
     }
-    (discover_all_with_catalog(catalog), true)
+    (discover_all_with_catalog(catalog).refs, true)
 }
 
 /// Re-discover one harness and replace its catalog rows + watches — the probe's scoped escalation.
