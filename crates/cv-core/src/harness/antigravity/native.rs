@@ -4,6 +4,7 @@ mod context;
 mod identity;
 mod interaction;
 mod media;
+mod meta;
 mod payload;
 mod render;
 mod wire;
@@ -13,6 +14,8 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::sync::Arc;
 use wire::Message as Proto;
+
+pub(super) use meta::read as metadata;
 
 pub(super) fn open(path: &Path, complete: bool) -> Result<jsonl::Read> {
     let mut reads = ReadSet::default();

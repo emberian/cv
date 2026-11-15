@@ -137,9 +137,24 @@ impl Field {
         Ok(RangeReader { file, at, end })
     }
 
+    /// A packed repeated varint field, bounded like any scalar metadata.
+    pub fn varints(self, file: &File, max_bytes: usize) -> Result<Vec<u64>> {
+        let mut reader = self.reader(file)?;
+        ensure!(
+            reader.end - reader.at <= max_bytes as u64,
+            "protobuf packed field exceeds its limit"
+        );
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes)?;
+        let (mut at, mut values) = (0, Vec::new());
+        while at < bytes.len() {
+            values.push(varint(&bytes, &mut at)?);
+        }
+        Ok(values)
+    }
+
     /// Scalar metadata only. Callers must name a maximum, and oversize input is
     /// refused rather than silently truncated. Body text uses the streaming writer.
-    #[cfg(test)]
     pub fn string(self, file: &File, max_bytes: usize) -> Result<String> {
         let mut reader = self.reader(file)?;
         ensure!(

@@ -30,10 +30,8 @@
 //! - `conversation_summaries.db` (`#[cfg(feature = "sqlite")]`, opened via [`super::store::sqlite`])
 //!   — `conversation_summaries` catalog (`title`, `preview`, `workspace_uris`,
 //!   `parent_conversation_id`, `agent_name`, `source`, `project_id`, `last_modified_time`).
-//! - `conversations/<uuid>.db` (`#[cfg(feature = "sqlite")]`, opened via [`super::store::sqlite`])
-//!   — `gen_metadata` (per-step model slug in protobuf field `1.19`, step indices in field `2`)
-//!   and `trajectory_metadata_blob` (workspace URI `1.1`, git root `1.2`, git branch `1.4`,
-//!   created timestamp `2`).
+//! - `conversations/<uuid>.db` (`#[cfg(feature = "sqlite")]`): native steps and their
+//!   metadata tables, read by the `native` module.
 
 use super::store::document::Fields;
 use super::store::jsonl::{self, Codec as _};
@@ -1393,7 +1391,7 @@ pub(crate) fn forest_dependencies(r: &SessionRef, guard: &mut ReadSet) {
 fn scan_transcript(id: &str, transcript: &Path, app_data_dir: Option<&Path>) -> Result<Option<SessionRef>> {
     #[cfg(feature = "sqlite")]
     if is_native_store(transcript) {
-        let metadata = read_conversation_db(transcript, false)?;
+        let metadata = native::metadata(transcript, false)?;
         let mut reference = SessionRef::new(id, Harness::Antigravity, transcript);
         reference.cwd = metadata.cwd;
         reference.created_at = metadata.created_at;
@@ -1432,7 +1430,7 @@ fn scan_transcript(id: &str, transcript: &Path, app_data_dir: Option<&Path>) -> 
         {
             let conv_db = app.join("conversations").join(format!("{id}.db"));
             if conv_db.is_file() {
-                if let Ok(db_meta) = read_conversation_db(&conv_db, false) {
+                if let Ok(db_meta) = native::metadata(&conv_db, false) {
                     if cwd.is_none() {
                         cwd = db_meta.cwd;
                     }
@@ -1558,7 +1556,7 @@ fn build_session_header(r: &SessionRef, opts: &Demand) -> (Session, SidecarEnric
     {
         let conv_db = loc.app_data_dir.join("conversations").join(format!("{}.db", loc.id));
         if conv_db.is_file() {
-            if let Ok(db_meta) = read_conversation_db(&conv_db, true) {
+            if let Ok(db_meta) = native::metadata(&conv_db, true) {
                 if s.cwd.is_none() {
                     s.cwd = db_meta.cwd;
                 }
@@ -3008,256 +3006,6 @@ fn parse_sqlite_ts(s: &str) -> Option<DateTime<Utc>> {
             .ok()
             .map(|ndt| ndt.and_utc())
     })
-}
-
-#[cfg(feature = "sqlite")]
-#[derive(Default)]
-struct ConvDbMeta {
-    step_models: BTreeMap<u64, String>,
-    dominant_model: Option<String>,
-    cwd: Option<PathBuf>,
-    git_root: Option<PathBuf>,
-    git_branch: Option<String>,
-    parent_id: Option<String>,
-    root_id: Option<String>,
-    agent_type: Option<String>,
-    agent_role: Option<String>,
-    created_at: Option<DateTime<Utc>>,
-}
-
-#[cfg(feature = "sqlite")]
-fn read_conversation_db(db_path: &Path, _details: bool) -> Result<ConvDbMeta> {
-    use rusqlite::OptionalExtension as _;
-    super::store::sqlite::open_ro(db_path)?.read_snapshot(|conn, _reads| {
-        let mut out = ConvDbMeta::default();
-        let has_table = |name: &str| -> Result<bool> {
-            Ok(conn
-                .query_row(
-                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
-                    [name],
-                    |_| Ok(()),
-                )
-                .optional()?
-                .is_some())
-        };
-
-        if has_table("gen_metadata")? {
-            let mut counts: BTreeMap<String, usize> = BTreeMap::new();
-            let mut first_model: Option<String> = None;
-            let mut stmt = conn.prepare("SELECT data FROM gen_metadata ORDER BY idx ASC")?;
-            let blobs = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
-            for blob in blobs {
-                let bytes = blob?;
-                if let Some((steps, model)) = parse_gen_metadata_blob(&bytes) {
-                    if first_model.is_none() {
-                        first_model = Some(model.clone());
-                    }
-                    let weight = steps.len().max(1);
-                    *counts.entry(model.clone()).or_default() += weight;
-                    for step in steps {
-                        out.step_models.insert(step, model.clone());
-                    }
-                }
-            }
-            out.dominant_model = counts
-                .into_iter()
-                .max_by_key(|(_, count)| *count)
-                .map(|(m, _)| m)
-                .or(first_model);
-        }
-
-        if has_table("trajectory_metadata_blob")? {
-            let blob: Option<Vec<u8>> = conn
-                .query_row(
-                    "SELECT data FROM trajectory_metadata_blob WHERE id = 'main' LIMIT 1",
-                    [],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            if let Some(bytes) = blob {
-                parse_trajectory_metadata_blob(&bytes, &mut out);
-            }
-        }
-        Ok(out)
-    })
-}
-
-#[cfg(feature = "sqlite")]
-fn read_varint(buf: &[u8], pos: &mut usize) -> Option<u64> {
-    let mut val = 0u64;
-    let mut shift = 0u32;
-    while *pos < buf.len() && shift < 64 {
-        let byte = buf[*pos];
-        *pos += 1;
-        val |= u64::from(byte & 0x7f) << shift;
-        if byte & 0x80 == 0 {
-            return Some(val);
-        }
-        shift += 7;
-    }
-    None
-}
-
-#[cfg(feature = "sqlite")]
-enum WireField<'a> {
-    Varint(u64),
-    Bytes(&'a [u8]),
-    Other,
-}
-
-#[cfg(feature = "sqlite")]
-fn next_proto_field<'a>(buf: &'a [u8], pos: &mut usize) -> Option<(u64, WireField<'a>)> {
-    if *pos >= buf.len() {
-        return None;
-    }
-    let tag = read_varint(buf, pos)?;
-    let field_no = tag >> 3;
-    if field_no == 0 {
-        return None;
-    }
-    match tag & 0x07 {
-        0 => Some((field_no, WireField::Varint(read_varint(buf, pos)?))),
-        1 => {
-            *pos = pos.checked_add(8)?;
-            (*pos <= buf.len()).then_some((field_no, WireField::Other))
-        }
-        2 => {
-            let len = usize::try_from(read_varint(buf, pos)?).ok()?;
-            let end = pos.checked_add(len)?;
-            if end > buf.len() {
-                return None;
-            }
-            let slice = &buf[*pos..end];
-            *pos = end;
-            Some((field_no, WireField::Bytes(slice)))
-        }
-        5 => {
-            *pos = pos.checked_add(4)?;
-            (*pos <= buf.len()).then_some((field_no, WireField::Other))
-        }
-        _ => None,
-    }
-}
-
-/// `gen_metadata.data`: field `2` = Cortex `step_index` (packed or repeated varints),
-/// field `1.19` = model slug UTF-8 string (e.g. `"gemini-4-argon"`).
-#[cfg(feature = "sqlite")]
-fn parse_gen_metadata_blob(buf: &[u8]) -> Option<(Vec<u64>, String)> {
-    let mut pos = 0usize;
-    let mut steps = Vec::new();
-    let mut model: Option<String> = None;
-    while let Some((field_no, val)) = next_proto_field(buf, &mut pos) {
-        match (field_no, val) {
-            (2, WireField::Varint(step)) => steps.push(step),
-            (2, WireField::Bytes(packed)) => {
-                let mut p = 0usize;
-                while let Some(step) = read_varint(packed, &mut p) {
-                    steps.push(step);
-                }
-            }
-            (1, WireField::Bytes(sub)) => {
-                let mut sp = 0usize;
-                while let Some((sf, sval)) = next_proto_field(sub, &mut sp) {
-                    if let (19, WireField::Bytes(raw_str)) = (sf, sval) {
-                        if let Ok(s) = std::str::from_utf8(raw_str) {
-                            let trimmed = s.trim();
-                            if !trimmed.is_empty() {
-                                model = Some(trimmed.to_string());
-                            }
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    Some((steps, model?))
-}
-
-/// `trajectory_metadata_blob.data`:
-/// - field `1.1` = workspace `file://` URI (`cwd`)
-/// - field `1.2` = git root `file://` URI
-/// - field `1.4` = git branch
-/// - field `2` (`google.protobuf.Timestamp`: `2.1` seconds, `2.2` nanos) = `created_at`
-#[cfg(feature = "sqlite")]
-fn parse_trajectory_metadata_blob(buf: &[u8], out: &mut ConvDbMeta) {
-    let mut pos = 0usize;
-    while let Some((field_no, val)) = next_proto_field(buf, &mut pos) {
-        match (field_no, val) {
-            (1, WireField::Bytes(ws)) => {
-                let mut wp = 0usize;
-                while let Some((wf, wval)) = next_proto_field(ws, &mut wp) {
-                    if let WireField::Bytes(raw) = wval {
-                        let Ok(s) = std::str::from_utf8(raw) else {
-                            continue;
-                        };
-                        let s = s.trim();
-                        if s.is_empty() {
-                            continue;
-                        }
-                        match wf {
-                            1 if out.cwd.is_none() => {
-                                out.cwd = file_uri_to_path(s).or_else(|| Some(PathBuf::from(s)));
-                            }
-                            2 if out.git_root.is_none() => {
-                                out.git_root = file_uri_to_path(s).or_else(|| Some(PathBuf::from(s)));
-                            }
-                            4 if out.git_branch.is_none() => {
-                                out.git_branch = Some(s.to_string());
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-            (field @ 5..=7, WireField::Bytes(raw)) => {
-                if let Ok(value) = std::str::from_utf8(raw) {
-                    if !value.is_empty() {
-                        match field {
-                            5 => out.parent_id = Some(value.to_owned()),
-                            6 => out.root_id = Some(value.to_owned()),
-                            7 if out.cwd.is_none() => out.cwd = file_uri_to_path(value),
-                            _ => {}
-                        }
-                    }
-                }
-            }
-            (8, WireField::Bytes(spec)) => {
-                let mut sp = 0;
-                while let Some((field, value)) = next_proto_field(spec, &mut sp) {
-                    if let (field @ (1 | 2), WireField::Bytes(raw)) = (field, value) {
-                        if let Ok(value) = std::str::from_utf8(raw) {
-                            if !value.is_empty() {
-                                if field == 1 {
-                                    out.agent_type = Some(value.to_owned());
-                                } else {
-                                    out.agent_role = Some(value.to_owned());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            (2, WireField::Bytes(ts_bytes)) => {
-                let mut tp = 0usize;
-                let mut secs: Option<i64> = None;
-                let mut nanos: u32 = 0;
-                while let Some((tf, tval)) = next_proto_field(ts_bytes, &mut tp) {
-                    if let WireField::Varint(v) = tval {
-                        match tf {
-                            1 => secs = i64::try_from(v).ok(),
-                            2 => nanos = u32::try_from(v).unwrap_or(0),
-                            _ => {}
-                        }
-                    }
-                }
-                if let Some(secs) = secs.filter(|&s| s > 0) {
-                    out.created_at = DateTime::from_timestamp(secs, nanos);
-                }
-            }
-            _ => {}
-        }
-    }
 }
 
 #[cfg(test)]

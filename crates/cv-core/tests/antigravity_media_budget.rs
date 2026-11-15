@@ -146,6 +146,59 @@ fn native_image_counter_is_bounded_and_public_payloads_remain_complete() {
         heap.peak_above_baseline_bytes
     );
 
+    // gen_metadata rows carry whole model requests (12 MiB seen in a real store). A session
+    // header needs a model slug and step indices from them; discovery needs neither.
+    let meta_root = world.base.join("metadata");
+    let path = database(&meta_root, ID, 3);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB, size INTEGER NOT NULL DEFAULT 0);",
+    )
+    .unwrap();
+    // GeneratorMetadata: chat_model(1){ request(2): 16 MiB, model slug(19) }, step_indices(2) = 0.
+    let request = 16usize << 20;
+    let slug = field(19, b"synthetic-model");
+    let prefix = [
+        header(1, header(2, request).len() + request + slug.len()),
+        header(2, request),
+    ]
+    .concat();
+    let suffix = [slug, vec![16, 0]].concat();
+    conn.execute(
+        "INSERT INTO gen_metadata(idx,data) VALUES (0,zeroblob(?1))",
+        [prefix.len() + request + suffix.len()],
+    )
+    .unwrap();
+    let mut blob = conn
+        .blob_open(rusqlite::MAIN_DB, "gen_metadata", "data", 0, false)
+        .unwrap();
+    blob.write_all(&prefix).unwrap();
+    for _ in 0..request / 8192 {
+        blob.write_all(&[b'x'; 8192]).unwrap();
+    }
+    blob.write_all(&suffix).unwrap();
+    drop(blob);
+    drop(conn);
+    let adapter = Antigravity::with_home(&meta_root);
+    let before = cv_testkit::heap::begin();
+    let found = cv_core::Adapter::discover(&adapter).unwrap();
+    let heap = cv_testkit::heap::end(before);
+    assert_eq!(found.len(), 1);
+    assert!(
+        heap.peak_above_baseline_bytes < 4 << 20,
+        "discovery allocated {} bytes beside a 16 MiB metadata row",
+        heap.peak_above_baseline_bytes
+    );
+    let before = cv_testkit::heap::begin();
+    let session = cv_core::stream::collect_with(&adapter, &found[0], &Demand::LEAN.with_spans()).unwrap();
+    let heap = cv_testkit::heap::end(before);
+    assert_eq!(session.model.as_deref(), Some("synthetic-model"));
+    assert!(
+        heap.peak_above_baseline_bytes < 4 << 20,
+        "a session header allocated {} bytes for a 16 MiB metadata row",
+        heap.peak_above_baseline_bytes
+    );
+
     // Public payload requests use the existing String IR and retain actual data,
     // even when the public API internally uses a span-capable read.
     let root = world.home.join(".gemini/antigravity-cli");
