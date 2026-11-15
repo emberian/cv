@@ -3832,7 +3832,7 @@ fn show_and_doctor_read_a_session_its_writer_is_appending_to() {
 #[test]
 fn index_json_rejects_unreadable_tool_output_and_retries_after_repair() {
     let w = World::new("index-unreadable-output");
-    let output = w.base.join("elsewhere").join("tool-results").join("big.txt");
+    let output = w.transcript("degraded").with_extension("").join("tool-results").join("big.txt");
     fs::create_dir_all(&output).unwrap(); // Deterministic failed read, including as root.
     let stub = format!(
         "<persisted-output>\nOutput too large (66KB). Full output saved to: {}\n\nPreview (first 2KB):\nzqpreview\n</persisted-output>",
