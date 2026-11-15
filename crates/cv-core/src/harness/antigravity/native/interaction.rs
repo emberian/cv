@@ -5,7 +5,8 @@
 //! kinds stay uninterpreted wire, disclosed by the step's unsupported-field coverage.
 use super::{File, Proto, Result, Write};
 
-pub(super) fn project(file: &File, step: &Proto, out: &mut impl Write) -> Result<()> {
+/// Whether a permission interaction was found and written.
+pub(super) fn project(file: &File, step: &Proto, out: &mut impl Write) -> Result<bool> {
     let completed = step.last(147).map(|field| field.message(file)).transpose()?;
     let asked = match &completed {
         Some(completed) => match completed.last(1) {
@@ -19,7 +20,7 @@ pub(super) fn project(file: &File, step: &Proto, out: &mut impl Write) -> Result
         None => None,
     };
     let Some(request) = asked.or(requested) else {
-        return Ok(());
+        return Ok(false);
     };
     out.write_all(b",\"native_interaction\":{\"kind\":\"permission\"")?;
     if let Some(resource) = request.message(file)?.last(1) {
@@ -36,7 +37,7 @@ pub(super) fn project(file: &File, step: &Proto, out: &mut impl Write) -> Result
         write!(out, ",\"decision\":\"{}\"", if allowed { "approved" } else { "denied" })?;
     }
     out.write_all(b"}")?;
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(test)]

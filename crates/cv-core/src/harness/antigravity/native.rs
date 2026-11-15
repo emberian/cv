@@ -1,5 +1,6 @@
 //! Bounded native protobuf projection. JSONL remains the historical authority when
 //! present: native CLEARED steps are not replacements for retained exported text.
+mod account;
 mod context;
 mod identity;
 mod interaction;
@@ -247,9 +248,8 @@ fn project(
         out,
         "{{\"step_index\":{index},\"type\":\"{kind}\",\"status\":\"{status}\",\"native_store\":true"
     )?;
-    // The selected projection does not yet interpret every native field. COMPLETE
-    // retains the original wire record, but the normalized view must disclose this.
-    out.write_all(b",\"native_unsupported\":true")?;
+    // COMPLETE retains the wire record; the normalized view discloses what it left unread.
+    let mut unsupported = account::unread_fields(file, step, kind, payload.as_ref())?;
     if status == "CLEARED" {
         out.write_all(b",\"native_cleared\":true")?;
     }
@@ -302,7 +302,9 @@ fn project(
         context::task(file, &details.message(file)?, out)?;
     }
     let mut missing_attachments = false;
-    interaction::project(file, step, out)?;
+    // An interaction of a kind other than a permission request stays uninterpreted.
+    let interpreted = interaction::project(file, step, out)?;
+    unsupported |= !interpreted && (step.last(133).is_some() || step.last(147).is_some());
     match (kind, &payload) {
         ("USER_INPUT", Some(input)) => {
             context::user(file, input, out)?;
@@ -333,6 +335,9 @@ fn project(
                 } else {
                     false
                 };
+                // A structured result with a member that is not JSON (a genai content or
+                // function value) is not normalized.
+                unsupported |= !has_content && (result.last(10).is_some() || result.last(11).is_some());
                 if let Some(info) = result.last(3) {
                     let info = info.message(file)?;
                     render::agents(file, &info, out)?;
@@ -342,7 +347,7 @@ fn project(
                 }
                 text(file, &result, 7, "native_output_uri", out)?;
                 if let Some(any) = result.last(6) {
-                    payload::project(file, &any.message(file)?, out)?;
+                    unsupported |= !payload::project(file, &any.message(file)?, out)?;
                 }
                 missing_attachments |= media::project(file, &result, 4, out)?;
             }
@@ -372,6 +377,9 @@ fn project(
     }
     if missing_attachments {
         out.write_all(b",\"native_missing_attachments\":true")?;
+    }
+    if unsupported {
+        out.write_all(b",\"native_unsupported\":true")?;
     }
     if complete {
         out.write_all(b",\"native_record\":{\"encoding\":\"protobuf-hex\",\"data\":\"")?;
@@ -532,7 +540,8 @@ mod tests {
             assert!(projected.get("native_missing_payloads").is_none());
             let projected = projection(&bytes(field, &bytes(media_field, &inline_media)), false);
             assert!(projected.get("native_missing_attachments").is_none());
-            assert_eq!(projected["native_unsupported"], true);
+            // Inline media is read: nothing on this step is left uninterpreted.
+            assert!(projected.get("native_unsupported").is_none());
             assert!(projected.get("native_missing_payloads").is_none());
         }
         let result = [bytes(1, b"output"), bytes(4, &uri_media)].concat();
@@ -559,7 +568,8 @@ mod tests {
         for status in [2, 3, 5, 6] {
             let data = [uint(4, status), bytes(140, &[])].concat();
             let projected = projection(&data, true);
-            assert_eq!(projected["native_unsupported"], true);
+            // An empty result holds no field a decoder skipped.
+            assert!(projected.get("native_unsupported").is_none());
             assert_eq!(projected.get("native_missing_payloads").is_some(), status == 5);
             assert_eq!(projected["native_record"]["encoding"], "protobuf-hex");
             let expected: String = data.iter().map(|byte| format!("{byte:02x}")).collect();

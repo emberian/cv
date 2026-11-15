@@ -945,3 +945,53 @@ fn an_exported_prompt_whose_upload_is_gone_reads_the_image_the_store_kept() {
     assert!(body(&session, by_id(&session, 0)).contains("a different request"));
     assert!(limitations(&session).contains(&"missing_attachments".to_owned()));
 }
+
+#[test]
+fn unsupported_native_fields_names_only_captures_with_a_field_nothing_reads() {
+    let world = world("agy-writer-unsupported");
+    let reports = |version: &str, exported: bool| -> Vec<bool> {
+        let root = store(&world, version, exported);
+        sessions(&root)
+            .values()
+            .map(|(_, session)| limitations(session).contains(&"unsupported_native_fields".to_owned()))
+            .collect()
+    };
+    // Permissions, cancellation, background tasks, swarm members, children and prompt
+    // media are all interpreted: none of these reads leaves a field unread.
+    for version in [
+        "1.5.9-permissions",
+        "1.5.9-interruption",
+        "1.5.9-background-tasks",
+        "1.5.9-swarm",
+        "1.5.9-subagents",
+        "1.5.9-prompt-media",
+        "1.5.9-native-background-media",
+    ] {
+        for exported in [false, true] {
+            assert!(
+                reports(version, exported).iter().all(|reported| !reported),
+                "{version} exported={exported}"
+            );
+        }
+    }
+    // A compaction checkpoint stores more than the summary that is read
+    // (CortexStepCheckpoint: accumulated sections 26, captured requests 30, parent
+    // messages 31, artifact, subagent and task snapshots 14, 20, 21).
+    for exported in [false, true] {
+        assert_eq!(
+            reports("1.5.9-compaction-resume", exported),
+            [true],
+            "exported={exported}"
+        );
+    }
+    let root = store(&world, "1.5.9-compaction-resume", false);
+    let (_, session) = only(sessions(&root));
+    let unread = stored(&root, &session.id).iter().any(|step| {
+        nested(&step.payload, 30).iter().any(|checkpoint| {
+            [14, 20, 21, 26, 30, 31]
+                .iter()
+                .any(|field| !nested(checkpoint, *field).is_empty())
+        })
+    });
+    assert!(unread, "the stored checkpoint holds one of the fields the reader skips");
+}

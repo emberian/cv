@@ -723,10 +723,12 @@ impl Adapter for Antigravity {
                                     .coverage
                                     .sources
                                     .insert(crate::coverage::ReadCoverage::NATIVE_STORE.into());
-                                order
-                                    .coverage
-                                    .limitations
-                                    .insert(crate::coverage::ReadCoverage::UNSUPPORTED_NATIVE_FIELDS.into());
+                                if verified.unread_fields {
+                                    order
+                                        .coverage
+                                        .limitations
+                                        .insert(crate::coverage::ReadCoverage::UNSUPPORTED_NATIVE_FIELDS.into());
+                                }
                             }
                             codec.enrich.verified = verified.matches;
                             for index in &verified.recovered_media {

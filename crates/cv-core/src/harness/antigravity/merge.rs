@@ -35,6 +35,8 @@ pub(super) struct Verified {
     pub native_only: StepOrder,
     /// A native step the export lacks could not be placed beside verified history.
     pub unreconciled: bool,
+    /// Some native step holds a field no decoder reads.
+    pub unread_fields: bool,
     /// Verified exported steps whose linked media file is gone while the store kept
     /// the bytes: each is read from its native row (it is in `native_only`).
     pub recovered_media: BTreeSet<u64>,
@@ -283,10 +285,12 @@ pub(super) fn verified(
 ) -> Result<Verified> {
     let native = super::native::open(path, complete)?;
     let mut steps = BTreeMap::new();
+    let mut unread_fields = false;
     native.snapshot(0, native.len(), |line| {
         let Some(view) = line.view else {
             return Ok(Flow::Continue);
         };
+        unread_fields |= view.get("native_unsupported")?.is_some();
         let Some(index) = index(view)? else {
             return Ok(Flow::Continue);
         };
@@ -432,6 +436,7 @@ pub(super) fn verified(
         native,
         native_only,
         unreconciled,
+        unread_fields,
         recovered_media,
     })
 }

@@ -316,7 +316,14 @@ mod native {
         let uri = "https://example.invalid/image.png";
         let attachment = [bytes(1, "image/png"), bytes(5, uri)].concat();
         let inline = [bytes(1, "image/png"), bytes(2, "stored inline image bytes")].concat();
-        let response = [bytes(1, "A reply with media"), bytes(20, attachment), bytes(20, inline)].concat();
+        // raw_thinking (16) is a field no decoder reads: the step reports it.
+        let response = [
+            bytes(1, "A reply with media"),
+            bytes(20, attachment),
+            bytes(20, inline),
+            bytes(16, "raw thinking"),
+        ]
+        .concat();
         let path = database(
             &root,
             &[
