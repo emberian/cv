@@ -18,6 +18,15 @@ use wire::Message as Proto;
 pub(super) use meta::read as metadata;
 
 pub(super) fn open(path: &Path, complete: bool) -> Result<jsonl::Read> {
+    read(path, complete, -1)
+}
+
+/// The first `rows` steps only: what discovery needs to title a session.
+pub(super) fn head(path: &Path, rows: u32) -> Result<jsonl::Read> {
+    read(path, false, i64::from(rows))
+}
+
+fn read(path: &Path, complete: bool, limit: i64) -> Result<jsonl::Read> {
     let mut reads = ReadSet::default();
     record_sqlite_readset(path, &mut reads);
     let source = crate::json::JsonSource::capture_with_reads(path, &reads)?;
@@ -30,8 +39,9 @@ pub(super) fn open(path: &Path, complete: bool) -> Result<jsonl::Read> {
             columns.has("idx") && columns.has("step_payload") && columns.has("step_format"),
             "unsupported Antigravity native steps schema"
         );
-        let mut query = conn.prepare("SELECT idx, step_format FROM steps ORDER BY idx")?;
-        let mut rows = query.query([])?;
+        // A negative LIMIT is no limit.
+        let mut query = conn.prepare("SELECT idx, step_format FROM steps ORDER BY idx LIMIT ?1")?;
+        let mut rows = query.query([limit])?;
         output.append(|mut out| {
             while let Some(row) = rows.next()? {
                 let index: i64 = row.get(0)?;

@@ -868,3 +868,21 @@ fn the_forest_names_the_call_that_spawned_each_child_or_none() {
         }
     }
 }
+
+#[test]
+fn a_resumed_conversation_is_titled_by_its_first_prompt_in_both_layouts() {
+    let world = world("agy-writer-resume-title");
+    for exported in [true, false] {
+        let root = store(&world, "1.5.9-compaction-resume", exported);
+        let (reference, session) = only(sessions(&root));
+        let first = body(&session, by_id(&session, 0));
+        assert!(first.contains("resume-fixture: first turn"));
+        for title in [reference.title.as_deref(), session.title.as_deref()] {
+            let title = title.unwrap_or_else(|| panic!("untitled, exported={exported}"));
+            assert!(
+                title.contains("resume-fixture: first turn"),
+                "exported={exported}: {title:?} is not the step 0 prompt"
+            );
+        }
+    }
+}

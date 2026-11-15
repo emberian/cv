@@ -1408,6 +1408,66 @@ pub(crate) fn forest_dependencies(r: &SessionRef, guard: &mut ReadSet) {
     }
 }
 
+/// Steps inspected for a title and a creation time.
+const HEAD_STEPS: u32 = 8;
+
+/// A title from the first prompt (or a child's brief) and the first timestamp, each only
+/// if still unset, from at most [`HEAD_STEPS`] leading steps. Returns the first step index.
+fn peek_head(input: &jsonl::Read, title: &mut Option<String>, created_at: &mut Option<DateTime<Utc>>) -> Option<u64> {
+    let mut inspected = 0;
+    let mut first = None;
+    let _ = input.prefix(64 * 1024, |line| {
+        let Some(view) = line.view else {
+            return Ok(Flow::Continue);
+        };
+        inspected += 1;
+        if let Some(fields) = Fields::parse(view, &["step_index", "type", "created_at", "content", "native_content"])? {
+            let idx = fields
+                .get("step_index")
+                .and_then(|v| v.as_number().ok().flatten())
+                .and_then(|n| n.as_u64());
+            first = first.or(idx);
+            if created_at.is_none() {
+                if let Some(ts_str) = fields.string("created_at")? {
+                    *created_at = super::parse_ts(&ts_str);
+                }
+            }
+            if title.is_none() {
+                let ty = fields.string("type")?.unwrap_or_default();
+                if ty == "USER_INPUT" || (ty == "SYSTEM_MESSAGE" && idx.is_some_and(|i| i <= 1)) {
+                    // The store keeps a typed request as items; the first is its text.
+                    let raw = match fields.string("content")? {
+                        Some(raw) => Some(raw),
+                        None => match fields.get("native_content").map(JsonView::array).transpose()?.flatten() {
+                            Some(mut parts) => parts.next().transpose()?.map(JsonView::string).transpose()?.flatten(),
+                            None => None,
+                        },
+                    };
+                    if let Some(raw) = raw {
+                        let body = if ty == "SYSTEM_MESSAGE" {
+                            unwrap_system_message_body(&raw).unwrap_or(&raw)
+                        } else {
+                            unwrap_user_request(&raw)
+                        };
+                        let cleaned = body.trim();
+                        // A swarm worker's log opens with a board wake; its brief follows.
+                        if !cleaned.is_empty() && board_wake(cleaned).is_none() {
+                            let mut head = crate::projection::Head::bounded(crate::projection::Head::TITLE);
+                            head.push(cleaned);
+                            *title = Some(head.finish());
+                        }
+                    }
+                }
+            }
+        }
+        if (created_at.is_some() && title.is_some()) || inspected >= HEAD_STEPS {
+            return Ok(Flow::Stop);
+        }
+        Ok(Flow::Continue)
+    });
+    first
+}
+
 fn scan_transcript(id: &str, transcript: &Path, app_data_dir: Option<&Path>) -> Result<Option<SessionRef>> {
     #[cfg(feature = "sqlite")]
     if is_native_store(transcript) {
@@ -1421,6 +1481,12 @@ fn scan_transcript(id: &str, transcript: &Path, app_data_dir: Option<&Path>) -> 
             .map(DateTime::from);
         if let Some(root) = app_data_dir {
             reference.title = read_pbtxt_title(&root.join("annotations").join(format!("{id}.pbtxt")));
+        }
+        if reference.title.as_deref().is_none_or(|title| title.trim().is_empty()) {
+            reference.title = None;
+            if let Ok(head) = native::head(transcript, HEAD_STEPS) {
+                peek_head(&head, &mut reference.title, &mut reference.created_at);
+            }
         }
         return Ok(Some(reference));
     }
@@ -1463,49 +1529,25 @@ fn scan_transcript(id: &str, transcript: &Path, app_data_dir: Option<&Path>) -> 
     }
 
     // Peek head of transcript for `created_at` and fallback prompt title without scanning the body.
-    if let Ok(input) = open_transcript(transcript) {
-        let mut inspected = 0usize;
-        let _ = input.prefix(64 * 1024, |line| {
-            let Some(view) = line.view else {
-                return Ok(Flow::Continue);
-            };
-            inspected += 1;
-            if let Some(fields) = Fields::parse(view, &["step_index", "type", "created_at", "content"])? {
-                if created_at.is_none() {
-                    if let Some(ts_str) = fields.string("created_at")? {
-                        created_at = super::parse_ts(&ts_str);
-                    }
-                }
-                if title.is_none() {
-                    let ty = fields.string("type")?.unwrap_or_default();
-                    let idx = fields
-                        .get("step_index")
-                        .and_then(|v| v.as_number().ok().flatten())
-                        .and_then(|n| n.as_u64());
-                    if ty == "USER_INPUT" || (ty == "SYSTEM_MESSAGE" && idx.is_some_and(|i| i <= 1)) {
-                        if let Some(raw) = fields.string("content")? {
-                            let body = if ty == "SYSTEM_MESSAGE" {
-                                unwrap_system_message_body(&raw).unwrap_or(&raw)
-                            } else {
-                                unwrap_user_request(&raw)
-                            };
-                            let cleaned = body.trim();
-                            // A swarm worker's log opens with a board wake; its brief follows.
-                            if !cleaned.is_empty() && board_wake(cleaned).is_none() {
-                                let mut head = crate::projection::Head::bounded(crate::projection::Head::TITLE);
-                                head.push(cleaned);
-                                title = Some(head.finish());
-                            }
-                        }
-                    }
-                }
+    let mut prompt = None;
+    let first = open_transcript(transcript)
+        .ok()
+        .and_then(|input| peek_head(&input, &mut prompt, &mut created_at));
+    // A log re-created at a resume starts mid-conversation: the store has the first prompt.
+    #[cfg(feature = "sqlite")]
+    if title.is_none() && first != Some(0) {
+        if let Some(store) = app_data_dir
+            .map(|app| app.join("conversations").join(format!("{id}.db")))
+            .filter(|store| store.is_file())
+        {
+            if let Ok(head) = native::head(&store, HEAD_STEPS) {
+                peek_head(&head, &mut title, &mut None);
             }
-            if (created_at.is_some() && title.is_some()) || inspected >= 8 {
-                return Ok(Flow::Stop);
-            }
-            Ok(Flow::Continue)
-        });
+        }
     }
+    #[cfg(not(feature = "sqlite"))]
+    let _ = first;
+    let title = title.or(prompt);
 
     Ok(Some(SessionRef {
         id: id.to_string(),
