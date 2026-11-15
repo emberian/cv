@@ -3,7 +3,7 @@
 ## Unreleased
 
 - CLI, API, and reader overviews collect initial and recent requests, worker replies, referenced files, and commands with links to their messages.
-- Pack accepts explicit sessions or transcript paths, with optional task-focused excerpts, without searching other conversations or requiring an index.
+- Pack accepts explicit sessions or transcript paths, with bounded overviews or task-focused excerpts, without searching other conversations or requiring an index.
 - Show recorded context usage, cache tokens, and compaction boundaries with `show --kind context` and the shared read API.
 
 - `cv lanes --follow` streams changed worker states and results, keeps final transitions visible through filters, and supports deadlines and parent-labelled JSON.

@@ -381,8 +381,85 @@ fn pack_selected_sessions_need_no_index_and_never_recall_outside_selection() {
         "1",
     ]);
     assert!(out.contains("from 2 past session(s)"), "{out}");
-    assert!(out.contains("wombat") && out.contains("seventeen quokkas"), "{out}");
+    assert!(out.contains("wombat") && out.contains("quokkas in the census"), "{out}");
     assert!(!err.contains("no index"), "{err}");
+}
+
+#[test]
+fn pack_selected_without_task_uses_bounded_overview_with_source_locations() {
+    let w = World::new("selected-overview");
+    let mut lines = (0..8)
+        .map(|i| {
+            user_line(
+                "orient",
+                &format!("u{i}"),
+                "2026-02-01T10:00:00Z",
+                &format!("request {i}"),
+            )
+        })
+        .collect::<Vec<_>>();
+    lines.push(assistant_line(
+        "tools", "2026-02-01T10:01:00Z",
+        serde_json::json!([
+            {"type":"tool_use", "id":"read", "name":"Read", "input":{"file_path":"/work/design.md"}},
+            {"type":"tool_use", "id":"run", "name":"Bash", "input":{"command":format!("cargo test {} END_OF_LONG_COMMAND", "x".repeat(300))}}
+        ]),
+    ));
+    let source = w.write_session("orient", &lines);
+    w.write_agent(
+        "orient",
+        "a123",
+        &serde_json::json!({"description":"worker audit"}),
+        &[
+            user_line("orient", "child-user", "2026-02-01T10:01:00Z", "inspect the parser"),
+            assistant_line(
+                "child-reply",
+                "2026-02-01T10:02:00Z",
+                serde_json::json!([{"type":"text", "text":"worker found a parser gap"}]),
+            ),
+        ],
+    );
+    for format in ["md", "prompt"] {
+        let (out, err) = w.cv_ok(&[
+            "pack",
+            "--session",
+            "orient",
+            "--excerpt-bytes",
+            "256",
+            "--format",
+            format,
+            "--json",
+        ]);
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let content = value["content"].as_str().unwrap();
+        assert!(
+            content.contains("request 0") && content.contains("request 7"),
+            "{content}"
+        );
+        assert!(!content.contains("request 1"), "{content}");
+        assert!(
+            content.contains("3 more omitted") && content.contains("[7]"),
+            "{content}"
+        );
+        assert!(
+            content.contains("[8]") && content.contains("/work/design.md"),
+            "{content}"
+        );
+        assert!(
+            content.contains("cargo test") && !content.contains("END_OF_LONG_COMMAND"),
+            "{content}"
+        );
+        assert!(content.contains("… open the source"), "{content}");
+        assert!(
+            content.contains("worker found a parser gap") && content.contains("--agent a123"),
+            "{content}"
+        );
+        assert!(
+            content.contains(source.to_str().unwrap()) && content.contains("--around N"),
+            "{content}"
+        );
+        assert!(!err.contains("no index"), "{err}");
+    }
 }
 
 #[test]
@@ -432,7 +509,7 @@ fn pack_selected_duplicate_ids_keep_their_paths_and_event_facts() {
     let second = second_dir.join("duplicate.jsonl");
     fs::write(&second, cv_testkit::jsonl(&make("second-path"))).unwrap();
     // Repeated selection of one exact source is deduplicated; another path with the same id is not.
-    for frozen in [false, true] {
+    for (frozen, focused) in [(false, false), (true, false), (false, true), (true, true)] {
         let mut args = vec![
             "pack",
             "--session",
@@ -444,6 +521,9 @@ fn pack_selected_duplicate_ids_keep_their_paths_and_event_facts() {
         ];
         if frozen {
             args.push("--frozen");
+        }
+        if focused {
+            args.push("result");
         }
         let (out, _) = w.cv_ok(&args);
         assert!(out.contains("from 2 past session(s)"), "{out}");

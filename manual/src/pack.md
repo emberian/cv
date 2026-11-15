@@ -23,7 +23,8 @@ cv pack "unfinished UI work" --session /path/to/transcript.jsonl
 `--session` accepts an ID, `harness:ID`, or transcript path; prefix a non-Claude path with
 its harness, for example `codex:/path/to/rollout.jsonl`. It bypasses corpus
 search and does not need an index. An optional task focuses excerpts within those sources;
-without one, the pack begins with their opening messages. All explicit sources are included
+without one, the pack includes their first and recent requests, worker replies, referenced files,
+and commands, with message indexes and source links. All explicit sources are included
 (`--limit` only limits search recall). Repeating one source includes it once; different paths
 with matching native IDs remain separate. A missing or unreadable selected source fails the
 command before an output file is written.
@@ -57,7 +58,10 @@ command before an output file is written.
 
 A pack is a bounded bundle by design, and its header says so: a `Bounds:` line
 names each bound (excerpt bytes, 8 files per source, 12 rollup files) and how
-many items each cut; distinct commands run are kept whole.
+many items each cut; task-focused packs keep distinct commands whole. Selected packs without a
+task use the overview bounds: five requests, eight file events, eight commands, and twelve workers
+per source, with request, command, and worker text capped by `--excerpt-bytes`. They report omitted
+items per source; file events are a recent sample, not an exhaustive file-change inventory.
 
 ## Flags
 

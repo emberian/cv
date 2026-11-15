@@ -72,6 +72,7 @@ pub(crate) fn cmd_pack(args: PackArgs<'_>) -> Result<()> {
     let limit = limit.max(1);
 
     let query = task.unwrap_or("");
+    let use_overview = task.is_none();
     let task = task.unwrap_or("Selected sessions");
     let mut sources = Vec::new();
     if !sessions.is_empty() {
@@ -90,10 +91,12 @@ pub(crate) fn cmd_pack(args: PackArgs<'_>) -> Result<()> {
                 continue;
             }
             let path = session.path.clone();
-            sources.push(
+            let source = if use_overview {
+                build_overview_source(session, excerpt_bytes)
+            } else {
                 build_source(session, adapter.as_ref(), query, excerpt_bytes, true)
-                    .with_context(|| format!("reading selected session {}", path.display()))?,
-            );
+            };
+            sources.push(source.with_context(|| format!("reading selected session {}", path.display()))?);
         }
     } else {
         // Search still selects candidates for the original task-only form.
@@ -397,6 +400,7 @@ type Excerpt = Vec<(Role, String, bool)>;
 /// the catalog's record of what the session actually DID.
 struct PackSource {
     session: cv_core::SessionRef,
+    overview: Option<serde_json::Value>,
     /// Explicit selections link back to their path so duplicate native IDs remain distinguishable.
     selected: bool,
     /// Window around the best match of the task.
@@ -437,12 +441,36 @@ fn build_source(
 
     Ok(PackSource {
         session: resolved,
+        overview: None,
         selected,
         excerpt,
         excerpt_range,
         edits,
         reads,
         commands,
+    })
+}
+
+fn build_overview_source(session: cv_core::SessionRef, excerpt_bytes: usize) -> Result<PackSource> {
+    let overview = cv_core::overview::read(
+        &session,
+        &cv_core::overview::OverviewOptions {
+            file_limit: MAX_FILES_PER_SOURCE,
+            excerpt_bytes,
+            ..Default::default()
+        },
+    )?;
+    // The overview's standard session row includes metadata from the same streaming read.
+    let session = serde_json::from_value(overview.session.clone())?;
+    Ok(PackSource {
+        session,
+        overview: Some(serde_json::to_value(overview)?),
+        selected: true,
+        excerpt: Vec::new(),
+        excerpt_range: None,
+        edits: BTreeMap::new(),
+        reads: BTreeMap::new(),
+        commands: Vec::new(),
     })
 }
 
@@ -701,6 +729,13 @@ struct Bounds {
 /// The header line naming every bound of a pack and what each cut, e.g. `Bounds: each excerpt
 /// message to 1600 bytes (--excerpt-bytes; 2 cut, marked …), …`.
 fn bounds_line(sources: &[PackSource], bounds: &Bounds) -> String {
+    if sources.iter().any(|s| s.overview.is_some()) {
+        let opts = cv_core::overview::OverviewOptions::default();
+        return format!(
+            "Bounds per source: {} requests (first and recent), {MAX_FILES_PER_SOURCE} file events, {} commands, {} workers; text excerpts to {} bytes (`--excerpt-bytes`; cuts marked …). Omitted items are reported per source.",
+            opts.request_limit, opts.command_limit, opts.worker_limit, bounds.excerpt_bytes
+        );
+    }
     let excerpts_cut: usize = sources
         .iter()
         .map(|s| s.excerpt.iter().filter(|(_, _, cut)| *cut).count())
@@ -778,6 +813,10 @@ fn md_bundle(task: &str, sources: &[PackSource], rollup: &[(String, usize, i64, 
             hit_date(&s.session),
             hit_cwd(&s.session)
         );
+        if let Some(overview) = &s.overview {
+            out.push_str(&super::overview::render(overview));
+            out.push('\n');
+        }
         if !s.excerpt.is_empty() {
             let _ = writeln!(out, "Key excerpt:\n");
             for (role, text, _) in &s.excerpt {
@@ -841,6 +880,10 @@ fn prompt_bundle(task: &str, sources: &[PackSource], rollup: &[(String, usize, i
             hit_date(&s.session),
             hit_cwd(&s.session)
         );
+        if let Some(overview) = &s.overview {
+            out.push_str(&super::overview::render(overview));
+            out.push('\n');
+        }
         for (role, text, _) in &s.excerpt {
             let _ = writeln!(out, "   {} said:", cv_core::render::role_label(*role));
             for line in text.lines() {
@@ -1430,6 +1473,7 @@ mod tests {
                 message_count: None,
             },
             selected: false,
+            overview: None,
             excerpt: Vec::new(),
             excerpt_range: Some((4, 9)),
             edits: BTreeMap::new(),
