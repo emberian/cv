@@ -60,17 +60,7 @@ pub(super) fn message(message: &Message, body: &str) -> Observation {
     if message.kind != MessageKind::InjectedContext {
         return Observation::default();
     }
-    if let Some((job, output)) = notice(message, body, "canceled_task", "was canceled") {
-        return Observation {
-            updates: vec![Update {
-                target: Target::Job(job.to_owned()),
-                status: Status::Stopped,
-                output: Some(output.to_owned()),
-            }],
-            ..Default::default()
-        };
-    }
-    let Some((job, output)) = notice(message, body, "completed_task", "finished") else {
+    let Some((job, canceled, output)) = completion(message, body) else {
         return Observation::default();
     };
     let failed = output.lines().any(|line| {
@@ -81,7 +71,11 @@ pub(super) fn message(message: &Message, body: &str) -> Observation {
     Observation {
         updates: vec![Update {
             target: Target::Job(job.to_owned()),
-            status: if failed { Status::Failed } else { Status::Complete },
+            status: match (canceled, failed) {
+                (true, _) => Status::Stopped,
+                (false, true) => Status::Failed,
+                (false, false) => Status::Complete,
+            },
             output: Some(output.to_owned()),
         }],
         ..Default::default()
@@ -104,17 +98,31 @@ fn polled_task<'a>(name: &str, out: &'a str) -> Option<(&'a str, &'a str)> {
     let mut lines = out
         .lines()
         .filter(|line| !line.starts_with("Created At:") && !line.starts_with("Completed At:"));
+    let first = lines.next()?;
+    // A kill is acknowledged by naming the task it cancelled.
+    if let Some(job) = first
+        .strip_prefix("Task \"")
+        .and_then(|rest| rest.strip_suffix("\" cancelled."))
+    {
+        return Some((job, "cancelled"));
+    }
     Some((
-        lines.next()?.strip_prefix("Task: ")?.trim(),
+        first.strip_prefix("Task: ")?.trim(),
         lines.next()?.strip_prefix("Status: ")?.trim(),
     ))
 }
 
-fn notice<'a>(message: &'a Message, body: &'a str, key: &str, verb: &str) -> Option<(&'a str, &'a str)> {
-    let job = message.extra.get("antigravity")?.get(key)?.as_str()?;
-    let marker = format!("content=Task id \"{job}\" {verb} with result:\n");
-    let (_, output) = body.split_once(&marker)?;
-    Some((job, output.trim_end_matches("</SYSTEM_MESSAGE>").trim()))
+/// The task a native message reports ended, whether it was canceled, and its result.
+fn completion<'a>(message: &'a Message, body: &'a str) -> Option<(&'a str, bool, &'a str)> {
+    // The adapter tags a cancellation notice `canceled_task` and a finish `completed_task`.
+    let native = message.extra.get("antigravity")?;
+    let job = native.get("completed_task").or_else(|| native.get("canceled_task"))?.as_str()?;
+    let (_, rest) = body.split_once(&format!("content=Task id \"{job}\" "))?;
+    let (canceled, output) = match rest.strip_prefix("finished with result:\n") {
+        Some(output) => (false, output),
+        None => (true, rest.strip_prefix("was canceled with result:\n")?),
+    };
+    Some((job, canceled, output.trim_end_matches("</SYSTEM_MESSAGE>").trim()))
 }
 
 #[cfg(test)]
@@ -225,6 +233,62 @@ mod tests {
             });
             assert_eq!(observation.status, expected);
             assert!(observation.started_jobs.is_empty());
+        }
+    }
+
+    #[test]
+    fn cancellation_is_evidence_only_where_it_names_the_task() {
+        // Real shapes: manage_task's kill acknowledgement and the native canceled message.
+        let kill = |body: &str| {
+            tool_result(&ToolResult {
+                message: None,
+                tool: "manage_task",
+                ops: &[],
+                body,
+                status: Some("completed"),
+                is_error: false,
+                details: None,
+            })
+        };
+        let named = kill("Created At: 2026-11-13T15:37:47-08:00\nTask \"session/task-7\" cancelled.");
+        assert_eq!(named.acting_on.as_deref(), Some("session/task-7"));
+        assert_eq!(named.updates.len(), 1);
+        assert_eq!(named.updates[0].status, Status::Stopped);
+        for body in [
+            "Task cancelled.",
+            "Cancelled.",
+            "Task: session/task-7\nStatus: RUNNING\nLog: file:///x",
+        ] {
+            assert!(kill(body).updates.is_empty(), "{body}");
+        }
+        let mut notice = Message::of_kind(
+            crate::ir::Role::System,
+            MessageKind::InjectedContext,
+            crate::ir::Origin::Harness,
+        );
+        notice.extra.insert(
+            "antigravity".into(),
+            serde_json::json!({"completed_task":"session/task-7"}),
+        );
+        let wrap = |content: &str| {
+            format!("<SYSTEM_MESSAGE>\n[Message] sender=session/task-7 content={content}\n</SYSTEM_MESSAGE>")
+        };
+        let canceled = message(
+            &notice,
+            &wrap("Task id \"session/task-7\" was canceled with result:\nTool execution was canceled\nLog: file:///x"),
+        );
+        assert_eq!(canceled.updates.len(), 1);
+        assert_eq!(canceled.updates[0].status, Status::Stopped);
+        let finished = message(
+            &notice,
+            &wrap("Task id \"session/task-7\" finished with result:\nCommand exited with code 0."),
+        );
+        assert_eq!(finished.updates[0].status, Status::Complete);
+        for content in [
+            "Task id \"session/task-8\" was canceled with result:\nx",
+            "Task id \"session/task-7\" is running",
+        ] {
+            assert!(message(&notice, &wrap(content)).updates.is_empty(), "{content}");
         }
     }
 }
