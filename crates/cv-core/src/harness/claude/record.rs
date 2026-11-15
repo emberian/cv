@@ -15,6 +15,7 @@ use crate::stream::Tier;
 /// Every top-level key any record kind reads. One selection pass per record; a field is
 /// resolved only by the branch that needs it.
 const TOP: &[&str] = &[
+    "_cv_orig_ctx",
     "type",
     "uuid",
     "parentUuid",
@@ -1233,6 +1234,9 @@ impl<'a> Record<'a, '_> {
             bag.insert("sourceToolUseID".into(), Value::String(id));
         }
         if matches!(tier, Tier::Usage | Tier::Facts) {
+            if let Some(original) = self.value("_cv_orig_ctx")?.filter(|v| v.is_number()) {
+                bag.insert("_cv_orig_ctx".into(), original);
+            }
             if let Some(id) = body_string("id")? {
                 bag.insert(format!("{MESSAGE_EXTRA_PREFIX}id"), Value::String(id));
             }

@@ -194,6 +194,15 @@ The reply has the actual indices, `total_known` (+ `total` at EOF) and `has_more
 `cv events --json` rows in transcript order (`ts` RFC 3339, plus the provenance trio); optional
 `kind=`. A stale or missing catalog row is re-ingested first.
 
+#### `GET /api/session/{harness}/{id}/context`
+
+The same array as `cv show --kind context --json`: saved usage, recorded context limits and
+compaction boundaries, retaining original message indices. `start`/`end` select context rows
+`[start,end)`; alternatively use `first=N`, `last=N`, or `around=N|ID` with `context=K` rows on
+each side (default `5`). Mixed selectors, malformed numbers and unknown message IDs return `400`.
+Missing row values remain `null` and absent `usage` components are omitted; `usage_basis`
+distinguishes recorded usage from saved prune estimates.
+
 #### `GET /api/session/{harness}/{id}/compactions`
 
 `cv show --kind compaction_boundary --json` rows (`boundary_msg_idx, summary_msg_idx, trigger,

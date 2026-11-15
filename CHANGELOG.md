@@ -4,6 +4,7 @@
 
 - Session overviews collect initial and recent requests, worker replies, referenced files, and commands with links back to their messages.
 - Pack accepts explicit sessions or transcript paths, with optional task-focused excerpts, without searching other conversations or requiring an index.
+- Show recorded context usage, cache tokens, and compaction boundaries with `show --kind context` and the shared read API.
 
 - Antigravity reads native SQLite and full, compact, or chunked exports, preserving revised steps, retained rendered output, media, task context, and missing-child lanes.
 - Antigravity verifies historical tool identities, usage, and native tails before merging; binary thinking signatures retain explicit encoding metadata.

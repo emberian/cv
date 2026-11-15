@@ -219,11 +219,11 @@ on a terminal or a pipe; a window or `--max-bytes` bounds it.
 
 #### Views
 
-`--kind` takes one of three families: `prompt,answer`; `compaction_boundary,compaction_summary`; or affordances
+`--kind` takes one view family: `prompt,answer`; `compaction_boundary,compaction_summary`; affordances
 (`plan`, `goal`, `schedule`, `background_job`, `skill`, `hook`, `question`, `approval`,
 `checkpoint`, `branch`, `fork`, `model_change`, `subagent_spawn`, `subagent_return`, or all as
-`affordances`). Unknown or mixed exits 2; compaction rows ignore windows; row views reject
-`--max-bytes`. A slash-loaded Claude skill counts once per activation.
+`affordances`); or `context`. Unknown or mixed exits 2. Compaction views cover the whole session
+and reject window flags. A slash-loaded Claude skill counts once per activation.
 
 #### The threading: `--tree`
 
@@ -268,6 +268,28 @@ cv show 77230e3d --kind compaction_boundary --json   # boundaries + each one's p
 ```
 
 It works on every harness that records compaction; either kind selects the same paired rows.
+
+#### Saved token usage: `--kind context`
+
+```sh
+cv show da9174f4 --kind context --last 10
+cv show da9174f4 --kind context --around 125 --context 3 --json
+```
+
+A timeline of saved per-call usage and compaction boundaries. Each row retains its original
+message `index`. Prompt tokens include uncached input, cache reads, and cache writes; the JSON
+also retains those components, output and reasoning tokens, and recorded cost. Repeated Codex
+cumulative notices and split records for the same provider response contribute once.
+
+Context limits appear only when the transcript records them. Missing row values are `null` in
+JSON and `—` in text; absent components inside `usage` are omitted, as in the IR. The view
+computes no token estimates or remaining-context guesses. Saved usage
+rewritten by `prune --revive` is labeled `estimated`; other usage is labeled `recorded`.
+Compaction rows include the trigger and pre-compaction size when recorded.
+
+`--first`, `--last`, and `--range` select context rows; `--around` locates an original message
+index or ID, with `--context` rows on each side. `--pre-compaction` filters by the discarded
+message span. `--max-bytes` keeps whole rows and prints a continuation hint.
 
 ### `cv cat`
 

@@ -215,6 +215,8 @@ enum Cmd {
         /// `approval`, `checkpoint`, `branch`, `fork`, `model_change`, or `affordances` for all —
         /// lists those rows across harnesses, side stores included (`--json`: `kind, action,
         /// index, timestamp, tool, tool_use_id, summary, items, source` rows).
+        /// `context`: saved per-call usage, context limits and compaction boundaries; window
+        /// flags select context rows, retaining original message indices for --around.
         #[arg(long, value_name = "KIND,…", conflicts_with = "subagents")]
         kind: Option<String>,
         /// With the compaction kinds: print each summary in full, not just its head.

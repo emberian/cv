@@ -75,6 +75,8 @@ routes! {
 
         GET ["api", "session", harness, id, "compactions"] => compactions(harness, id),
 
+        GET ["api", "session", harness, id, "context"] => context(harness, id, query),
+
         GET ["api", "touched"] => touched(query),
 
         GET ["api", "session", harness, id, "subagents"] => subagents(harness, id),
@@ -527,6 +529,63 @@ fn session_events(harness: &str, id: &str, query: &str) -> (u16, Value) {
     };
     let out: Vec<Value> = rows.iter().map(crate::rows::event_row).collect();
     ok(json!(out))
+}
+
+/// Saved usage and compaction rows. `start`/`end`, `first`, and `last` select projected rows;
+/// `around` selects by original transcript index/message ID, with `context` rows on either side.
+/// Returns the same array as `show --kind context --json`.
+fn context(harness: &str, id: &str, query: &str) -> (u16, Value) {
+    let params = Query::parse(query);
+    let read = || -> Result<Value, (u16, Value)> {
+        let number = |key| params.unsigned(key).map_err(|e| err(400, &e));
+        let start = number("start")?;
+        let end = number("end")?;
+        let first = number("first")?;
+        let last = number("last")?;
+        let nearby = number("context")?;
+        let around = params.get("around");
+        let families = usize::from(start.is_some() || end.is_some())
+            + usize::from(first.is_some())
+            + usize::from(last.is_some())
+            + usize::from(around.is_some());
+        if families > 1 {
+            return Err(err(400, "choose start/end, first, last, or around"));
+        }
+        if nearby.is_some() && around.is_none() {
+            return Err(err(400, "context requires around"));
+        }
+        if end.is_some_and(|end| end < start.unwrap_or(0)) {
+            return Err(err(400, "end must be >= start"));
+        }
+        let (r, adapter) = lookup(harness, id)?;
+        let around = match around {
+            None => None,
+            Some(value) => {
+                let at = match parse_around(&value).map_err(|e| err(400, &e))? {
+                    Around::Index(index) => index,
+                    Around::Id(id) => message_index(adapter.as_ref(), &r, &id)
+                        .map_err(|e| err(500, &format!("stream failed: {e:#}")))?
+                        .ok_or_else(|| err(400, &format!("no message {id:?} in session {}", r.id)))?,
+                };
+                Some((at, nearby.unwrap_or(5)))
+            }
+        };
+        let rows =
+            crate::context::read(adapter.as_ref(), &r).map_err(|e| err(500, &format!("stream failed: {e:#}")))?;
+        Ok(json!(crate::context::window(
+            rows,
+            crate::context::ContextWindow {
+                start: start.unwrap_or(0),
+                end: first.or(end),
+                last,
+                around,
+            }
+        )))
+    };
+    match read() {
+        Ok(rows) => ok(rows),
+        Err(error) => error,
+    }
 }
 
 /// `GET /api/session/{harness}/{id}/compactions` — every compaction boundary in the session, in

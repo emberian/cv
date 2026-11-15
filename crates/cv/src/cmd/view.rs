@@ -34,6 +34,7 @@ pub(super) enum KindView {
     /// `compaction_boundary` / `compaction_summary`: the compaction seams, each boundary paired
     /// with its summary (`compaction::print_compactions`).
     Compactions,
+    Context,
     /// `plan`, `schedule`, `background_job`, … (or `affordances`, all of them): the affordance rows
     /// (`cv_core::affordance`, `docs/design/AFFORDANCES.md`).
     Affordances(std::collections::HashSet<cv_core::affordance::Kind>),
@@ -45,6 +46,7 @@ pub(super) fn parse_kinds(spec: &str) -> Result<KindView> {
         Said,
         Overview,
         Compactions,
+        Context,
         Affordances,
     }
     const SAID: [&str; 2] = ["prompt", "answer"];
@@ -53,7 +55,7 @@ pub(super) fn parse_kinds(spec: &str) -> Result<KindView> {
     let words: Vec<&str> = cv_core::affordance::Kind::ALL.iter().map(|k| k.as_str()).collect();
     let accepted = format!(
         "`--kind` takes `overview`, `prompt,answer` (what the person said), \
-         `compaction_boundary,compaction_summary` (the compaction seams), or affordances: {} (`affordances` is all of them)",
+         `compaction_boundary,compaction_summary` (the compaction seams), `context` (recorded usage), or affordances: {} (`affordances` is all of them)",
         words.join(",")
     );
     let family = |k: &str| {
@@ -61,6 +63,8 @@ pub(super) fn parse_kinds(spec: &str) -> Result<KindView> {
             Some(Family::Overview)
         } else if SAID.contains(&k) {
             Some(Family::Said)
+        } else if k == "context" {
+            Some(Family::Context)
         } else if SEAMS.contains(&k) {
             Some(Family::Compactions)
         } else if k == "affordances" || cv_core::affordance::Kind::parse(k).is_some() {
@@ -81,6 +85,7 @@ pub(super) fn parse_kinds(spec: &str) -> Result<KindView> {
         }),
         [Family::Overview] => Ok(KindView::Overview),
         [Family::Compactions] => Ok(KindView::Compactions),
+        [Family::Context] => Ok(KindView::Context),
         [Family::Affordances] => Ok(KindView::Affordances(
             cv_core::affordance::parse_kinds(&kinds).expect("every word checked above"),
         )),
@@ -166,6 +171,76 @@ pub(crate) struct KindWindow {
     pub pre_compaction: Option<(usize, Option<usize>)>,
     pub selector: Option<KindSelector>,
     pub max_bytes: Option<usize>,
+}
+
+fn context_line(row: &cv_core::context::ContextRow) -> String {
+    let n = |value: Option<u64>| value.map_or_else(|| "—".into(), |n| n.to_string());
+    let usage = row.usage.as_ref();
+    let model = cv_core::sanitize::sanitize_line(row.model.as_deref().unwrap_or("—"));
+    if row.kind == "compaction_boundary" {
+        format!(
+            "[{}] compaction  before={}  trigger={}\n",
+            row.index,
+            n(row.pre_compaction_tokens),
+            cv_core::sanitize::sanitize_line(row.trigger.as_deref().unwrap_or("—"))
+        )
+    } else {
+        format!(
+            "[{}] {}  prompt={}  cached={}  cache_write={}  output={}  limit={}  {}  {}\n",
+            row.index,
+            row.kind,
+            n(row.prompt_tokens),
+            n(usage.and_then(|u| u.cache_read_tokens)),
+            n(usage.and_then(|u| u.cache_creation_tokens)),
+            n(usage.and_then(|u| u.output_tokens)),
+            n(row.context_window),
+            row.usage_basis.unwrap_or("recorded"),
+            model
+        )
+    }
+}
+
+fn print_context(r: &SessionRef, adapter: &dyn Adapter, win: KindWindow, json: bool) -> Result<()> {
+    let mut rows = cv_core::context::read(adapter, r)?;
+    if let Some((start, end)) = win.pre_compaction {
+        rows.retain(|row| row.index >= start && end.is_none_or(|end| row.index < end));
+    }
+    let (rows, next) = slice_and_budget(
+        rows,
+        win.selector,
+        win.max_bytes,
+        if json { 5 } else { 150 },
+        |row| Some(row.index),
+        |row| {
+            if json {
+                let pretty = serde_json::to_string_pretty(row)?;
+                Ok(pretty.len() + 2 * pretty.lines().count() + 2)
+            } else {
+                Ok(context_line(row).len())
+            }
+        },
+    )?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+        if let Some(next) = next {
+            eprintln!("{}", continue_hint(next));
+        }
+    } else {
+        println!(
+            "# context of {} — saved token counts; prompt includes cache reads/writes",
+            short_id(&r.id)
+        );
+        if rows.is_empty() {
+            println!("No usage, context-limit, or compaction records in this selection.");
+        }
+        for row in rows {
+            print!("{}", context_line(&row));
+        }
+        if let Some(next) = next {
+            println!("{}", continue_hint(next));
+        }
+    }
+    Ok(())
 }
 
 /// `show --kind plan,schedule,…`: the affordance rows of one session, transcript rows in message
@@ -270,6 +345,14 @@ pub(crate) fn cmd_show(
                     max_bytes: window.max_bytes,
                 };
                 print_affordances(&r, adapter.as_ref(), &kinds, win, json)
+            }
+            KindView::Context => {
+                let win = KindWindow {
+                    pre_compaction: pre_compaction_span(&r, pre_compaction)?,
+                    selector: window.kind_selector_in(adapter.as_ref(), &r)?,
+                    max_bytes: window.max_bytes,
+                };
+                print_context(&r, adapter.as_ref(), win, json)
             }
             KindView::Compactions => {
                 if selector || window.max_bytes.is_some() || pre_compaction.is_some() {
@@ -2704,6 +2787,8 @@ mod tests {
             })
         ));
         assert!(matches!(parse_kinds("compaction_summary"), Ok(KindView::Compactions)));
+        assert!(matches!(parse_kinds("context"), Ok(KindView::Context)));
+        assert!(parse_kinds("context,prompt").is_err());
         match parse_kinds("plan,schedule") {
             Ok(KindView::Affordances(k)) => assert_eq!(k, [Kind::Plan, Kind::Schedule].into_iter().collect()),
             _ => panic!("plan,schedule is the affordance view"),
