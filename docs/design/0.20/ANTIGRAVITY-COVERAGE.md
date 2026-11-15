@@ -41,15 +41,65 @@ message, and an inline image tool result. The generator verifies the writer
 version, records the executable hash, and enforces OS-level write/network bounds.
 The lifecycle test checks the recovered image bytes and background output.
 
+### Real-writer scenarios
+
+Seven further 1.5.9 captures come from the same generator (`--scenario`), driven
+through `--print` and the CLI's ACP server. `tests/antigravity_writer.rs` reads each
+in the layouts it can have (exported log beside the store, and the store alone) and
+takes its expectations from the scripted scenario and a schema-less walk of the
+stored bytes, not from the adapter's decoder.
+
+| Capture | Asserted from writer bytes |
+|---|---|
+| `1.5.9-permissions` | An approved and a denied command carry `interaction` (action, target, decision); result status `completed` / `error`; `approval/approve` and `approval/deny` rows. Print mode records no interaction: the gated step is `canceled`, without error text. |
+| `1.5.9-interruption` | The cancelled tool (step 2) and the upstream error (step 8) are absent from the export and read from the store, in step order, in both layouts; each call has one result; the retry completes; a cancelled stream is `interrupted` (stop reason 18), a dropped stream has no stop reason. |
+| `1.5.9-background-tasks` | Three launches finishing out of launch order; the killed one is `canceled` in both layouts although the export still says `RUNNING`; its notice is `background_job/stop`, the others `complete`; before any notice only the killed launch is settled in the exported layout. |
+| `1.5.9-swarm` | The coordinator is not its own child; three members with registry state (`member`, `added_by`, `phase`, `desired_state`, `wake_mode`, `killed`); `swarm add` call IDs per child, the helper's in the worker that added it; board wakes are never returns or prompts; each worker's prompt is its assignment; the coordinator is every worker's native parent. |
+| `1.5.9-subagents` | Idle notices from the system sender are the children's returns (`returned_child`, delivered body is the reply); spawn call IDs; child titles are their briefs. |
+| `1.5.9-prompt-media` | An inline prompt image is read from the row when the writer's stored copy is gone; linked files are scope items; an audio block stores nothing. |
+| `1.5.9-compaction-resume` | A conversation resumed from its store alone re-creates its export from step 7; steps 0-6, the compaction boundary and its summary included, are read from the store; `/compact` is the prompt text; root and ID are unchanged. |
+
+Every public consumer was run once on each capture in each layout (`ls`, `show`,
+`show --json`, `--kind affordances`, `--tree`, `--subagents`, `export` md and json,
+`doctor`, `distill`, `events`, `lanes`, `tools`, `index`, `search`, `formats`):
+353 runs, none failed. Text from store-only steps is found by `cv search` through
+the exported layout.
+
+What these captures establish about the writer, as distinct from the reader:
+
+- The exported log omits cancelled tool steps and upstream error steps, restarts at
+  the resume point when its directory was removed, and never revises a step after
+  writing it. The store has the latest revision of every step.
+- A kill leaves three records: the `manage_task` result `Task "<id>" cancelled.`,
+  the launch step revised to `CANCELED`, and a low-priority `was canceled` notice.
+- A child's reply reaches its parent as `Subagent <id> has gone idle…` from the
+  system sender. A swarm worker's final reply reaches nobody; only board posts do.
+- A board wake's `sender` is a member ID that is not reliably the poster.
+- A helper a worker adds has the coordinator as its native parent; `added_by` in the
+  registry is the only record of who added it.
+- `phase` is `RUNNING` for every member that is not killed. The words `waiting` and
+  `working` appear only in the `swarm status` tool result.
+
 Still requiring dedicated writer-generated scenarios and independent assertions:
 
-- Permission requests and their responses; interruption, cancellation and retries.
-- Inline prompt image/audio/video payloads, linked attachments, missing attachment files,
-  and lazy output resolution after the source changes.
-- Structured generic results and writer-generated render-only payloads after native clearing.
-- Multi-child spawns, nested/renamed swarms, peer-board versus final-result delivery,
-  and waiting versus actively running workers.
-- Full/compact/chunk/native promotion during a live read; native DB-only resume roots.
+- Audio/video prompt payloads; lazy output resolution after the source changes;
+  recovery of a missing exported upload from the store's inline bytes (reported as
+  `missing_attachments` today).
+- Structured generic results. Across these captures every step type is one the reader
+  interprets, and no result used the struct/value fields (10, 11) the reader decodes.
+  16 of 33 results instead carry a typed `Any` (field 6: `RunCommand`, `ManageTask`,
+  `InvokeSubagent`), which is not normalized; its content repeats the text and render
+  fields in the cases seen. Writer-generated render-only payloads after native clearing.
+- Renamed members, a worker captured mid-turn (`wake_mode` while working), and a
+  lane status for a parked or idle child: `cv lanes` shows every live member as
+  running.
+- The forest's spawn call ID. `spawnStepIndex` is the result step for
+  `invoke_subagent` and an unrelated step for swarm members; the forest still
+  derives `<step>.0` from it, which matches no call. The session's `subagents`
+  entries carry the real `call_id`.
+- Native `CLEARED` rows from the writer; other interaction kinds than permission
+  (`ask_question` was not driven).
+- Full/compact/chunk/native promotion during a live read.
 - Giant native cells, malformed length limits and portable reader equivalence.
 
 A successful index pass establishes neither payload completeness nor native
