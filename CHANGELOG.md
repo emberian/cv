@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Full-text search supports reusable indexed snapshots and NDJSON batch queries with explicit freshness semantics and per-query work counters.
+- Show, Markdown, doctor, and API metadata expose Antigravity read sources and known coverage gaps, including metadata-only members and unavailable payloads.
 
 - Antigravity replays revised steps correctly, reads chunked history, preserves missing-child lanes, and enriches native lineage, usage, swarm, approval, and background-task events.
 - Search retries changing sources and reports disappearing sessions without flooding the terminal with parse failures.

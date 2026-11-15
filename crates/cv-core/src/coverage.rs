@@ -42,7 +42,7 @@ impl ReadCoverage {
             Self::EXPORTED_HISTORY => "exported history".to_owned(),
             Self::NATIVE_STORE => "native store".to_owned(),
             Self::MEMBER_REGISTRY => "member registry".to_owned(),
-            other => format!("unrecognized source ({})", other.escape_default()),
+            _ => "unrecognized source (see JSON metadata)".to_owned(),
         };
         let limitation = |s: &str| match s {
             Self::METADATA_ONLY => "metadata only; no conversation text".to_owned(),
@@ -51,7 +51,7 @@ impl ReadCoverage {
             Self::MISSING_ATTACHMENTS => "some referenced attachments are unavailable".to_owned(),
             Self::UNSUPPORTED_NATIVE_FIELDS => "some native fields are not interpreted".to_owned(),
             Self::INFERRED_TOOL_IDENTITY => "tool associations are inferred".to_owned(),
-            other => format!("unrecognized limitation ({})", other.escape_default()),
+            _ => "unrecognized limitation (see JSON metadata)".to_owned(),
         };
         let mut parts = self.sources.iter().map(|s| source(s)).collect::<Vec<_>>();
         parts.extend(self.limitations.iter().map(|s| limitation(s)));

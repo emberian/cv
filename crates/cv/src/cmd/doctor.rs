@@ -79,13 +79,14 @@ pub(crate) fn cmd_doctor(id: Option<String>, harness: Option<String>, recent: us
             }
         };
         let mut pass = rep.session_with_harness(Some(rr.path.clone()), Some(rr.harness));
-        cv_core::stream::stream_counted(
+        let read = cv_core::stream::stream_counted(
             adapter.as_ref(),
             &rr,
             &cv_core::Demand::FACTS.with_spans(),
             &mut pass,
             cv_core::stream::Pass::RECORD,
         )?;
+        cv_core::MessageSink::meta(&mut pass, &read.session);
         pass.finish()?;
         if label.is_empty() {
             label = crate::util::short_id(&rr.id);
@@ -212,6 +213,14 @@ fn print_report(
         format!("session {label}")
     };
     println!("# compaction doctor — {scope}\n");
+    for read in &rep.read_coverage {
+        println!(
+            "Read coverage {}:{}: {}",
+            read.harness,
+            read.id.escape_debug(),
+            read.coverage.summary()
+        );
+    }
 
     for line in crate::cmd::hooks::doctor_lines() {
         println!("{line}");

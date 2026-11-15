@@ -70,6 +70,14 @@ impl WindowSink {
         }
     }
 
+    /// Retain initial header facts while publishing the latest evidence from the read.
+    pub(super) fn finish_meta(&mut self, session: &Session) {
+        match &mut self.meta {
+            Some(meta) => super::update_read_coverage(meta, session),
+            None => self.meta = Some(super::session_meta_json(session)),
+        }
+    }
+
     /// Select the last `n` messages instead of `[start, end)`.
     pub fn tail(mut self, n: usize) -> Self {
         self.window = MessageWindow::new(self.start, self.end).tail(n);
@@ -192,9 +200,7 @@ impl MessageSink for WindowSink {
         self.fail.take()
     }
     fn meta(&mut self, s: &Session) {
-        if self.meta.is_none() {
-            self.meta = Some(super::session_meta_json(s));
-        }
+        self.finish_meta(s);
         if s.source_path.is_some() {
             self.resolver = s.resolver();
         }

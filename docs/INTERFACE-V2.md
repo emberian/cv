@@ -209,6 +209,22 @@ Rules:
   have no way to learn the model. An adapter may omit a model its store never recorded, never one
   it did.
 
+### Read coverage
+
+`Session.extra.cv.read_coverage` records evidence about a read using two extensible string sets:
+`sources` (`exported_history`, `native_store`, `member_registry`) and `limitations`
+(`metadata_only`, `missing_history`, `missing_payloads`, `missing_attachments`,
+`unsupported_native_fields`, `inferred_tool_identity`). Absence means unassessed; a source set
+or an empty limitation set does not certify complete support. Missing data is reported only
+when observed, separately from fields cv does not interpret. These facts survive lean/facts
+reads and OpenSession storage. Unknown identifiers remain readable and round-trip unchanged.
+
+Plain show and Markdown report the sources and consequences in a compact line; a gap found
+after streaming the header appears at the end. Doctor reports each assessed session once,
+with structured `read_coverage` entries in JSON. Windowed API reads retain the same namespaced
+session metadata even when message extras are disabled. Coverage describes evidence consulted
+by that read, so a partial window cannot certify the unread tail.
+
 ## 5. Fidelity verifier v2 (`emit_verified`)
 
 After emitting, re-parse the output and diff per message: role sequence, kind sequence, block type

@@ -206,6 +206,7 @@ pub(super) fn window(
         let mut whole = WindowSink::page(&primary, start, end, false, reads);
         let shell = adapter.try_stream(r, &opts, &mut whole)?;
         verify(r, &primary, &retry_before, &whole)?;
+        whole.finish_meta(&shell);
         return Ok((shell, whole));
     }
     // `stable` is `verify`'s primary check on this same baseline and read set.
@@ -221,7 +222,9 @@ pub(super) fn window(
             },
         });
     }
-    Ok((shell.expect("a stream or accepted resume returned metadata"), sink))
+    let shell = shell.expect("a stream or accepted resume returned metadata");
+    sink.finish_meta(&shell);
+    Ok((shell, sink))
 }
 
 fn verify(r: &SessionRef, primary: &std::path::Path, before: &Baseline, sink: &WindowSink) -> Result<()> {
@@ -475,6 +478,47 @@ mod tests {
         }
         file.flush().unwrap();
         SessionRef::new("cached-pages", Harness::Claude, path)
+    }
+
+    #[test]
+    fn read_coverage_window_publishes_late_returned_evidence() {
+        use crate::coverage::ReadCoverage;
+        struct Late;
+        impl Adapter for Late {
+            fn harness(&self) -> Harness {
+                Harness::OpenSession
+            }
+            fn roots(&self) -> Vec<std::path::PathBuf> {
+                Vec::new()
+            }
+            fn discover(&self) -> Result<crate::Discovered> {
+                Ok(Default::default())
+            }
+            fn stream(&self, r: &SessionRef, _: &Demand, sink: &mut dyn MessageSink) -> Result<Session> {
+                let mut session = Session::new(&r.id, Harness::OpenSession);
+                session.title = Some("initial title".into());
+                sink.meta(&session);
+                sink.message(Message::new(crate::Role::Assistant));
+                session.title = Some("final title".into());
+                let mut coverage = ReadCoverage::default();
+                coverage.sources.insert(ReadCoverage::NATIVE_STORE.into());
+                coverage.limitations.insert(ReadCoverage::MISSING_PAYLOADS.into());
+                coverage.attach(&mut session);
+                Ok(session)
+            }
+        }
+        let world = cv_testkit::World::new("coverage-api-window");
+        let r = fixture(&world, 1);
+        let cache = Cache::default();
+        for extra in [false, true] {
+            let (shell, mut sink) = window(&cache, &Late, &r, 0, None, extra).unwrap();
+            let reply = result(&shell, &mut sink);
+            assert_eq!(reply["meta"]["title"], "initial title");
+            assert_eq!(
+                reply["meta"]["extra"]["cv"]["read_coverage"]["limitations"],
+                json!(["missing_payloads"])
+            );
+        }
     }
 
     #[test]

@@ -1170,6 +1170,7 @@ fn tree_line_with_preview(m: &Message, preview: Option<String>) -> String {
 /// Everything a streamed renderer needs for a session's header — derived from the cheap
 /// [`SessionRef`] (label/cwd) plus the model captured from the first assistant turn.
 pub(crate) struct HeaderInfo {
+    coverage: Option<cv_core::coverage::ReadCoverage>,
     harness: Harness,
     id: String,
     cwd: Option<PathBuf>,
@@ -1238,6 +1239,7 @@ fn stream_session_render_inner<W: std::io::Write>(
 
     /// The header fields a `meta` call delivers.
     struct Meta {
+        coverage: Option<cv_core::coverage::ReadCoverage>,
         title: Option<String>,
         model: Option<String>,
         cwd: Option<PathBuf>,
@@ -1255,6 +1257,8 @@ fn stream_session_render_inner<W: std::io::Write>(
 
     struct Sink<'w, W, H, R> {
         frames: Frames<'w, W>,
+        printed_coverage: Option<cv_core::coverage::ReadCoverage>,
+        coverage: Option<cv_core::coverage::ReadCoverage>,
         harness: Harness,
         id: String,
         cwd: Option<PathBuf>,
@@ -1280,6 +1284,7 @@ fn stream_session_render_inner<W: std::io::Write>(
     }
     impl<W: std::io::Write, H: Fn(&HeaderInfo) -> String, R: Fn(&Message) -> Result<String>> Sink<'_, W, H, R> {
         fn apply_meta(&mut self, s: Meta) {
+            self.coverage = s.coverage;
             self.title = s.title;
             if self.model.is_none() {
                 self.model = s.model;
@@ -1324,6 +1329,7 @@ fn stream_session_render_inner<W: std::io::Write>(
         }
         fn header_now(&self) -> String {
             (self.header)(&HeaderInfo {
+                coverage: self.coverage.clone(),
                 harness: self.harness,
                 id: self.id.clone(),
                 cwd: self.cwd.clone(),
@@ -1339,6 +1345,7 @@ fn stream_session_render_inner<W: std::io::Write>(
             let head = self.header_now();
             self.bytes += head.len();
             self.frames.start(&head);
+            self.printed_coverage = self.coverage.clone();
             if let Some(mut buffered) = self.checked_buf.take() {
                 if self.frames.result.is_ok() {
                     self.frames.result = buffered.flush().and_then(|()| {
@@ -1367,6 +1374,7 @@ fn stream_session_render_inner<W: std::io::Write>(
             // adapters' discovery title differs from the parsed one (codex's discovery title is the
             // first user record, which the parse skips). Model/cwd fill in if discovery lacked them.
             let meta = Meta {
+                coverage: cv_core::coverage::ReadCoverage::of_session(s),
                 title: s.title.clone(),
                 model: s.model.clone(),
                 cwd: s.cwd.clone(),
@@ -1497,6 +1505,8 @@ fn stream_session_render_inner<W: std::io::Write>(
     };
     let mut sink = Sink {
         frames: Frames::new(out),
+        printed_coverage: None,
+        coverage: None,
         harness: r.harness,
         id: r.id.clone(),
         cwd: r.cwd.clone(),
@@ -1534,11 +1544,19 @@ fn stream_session_render_inner<W: std::io::Write>(
         guard: checked,
         ..cv_core::stream::Pass::RECORD
     };
-    let guard = cv_core::stream::stream_counted(adapter, r, &parse_opts, &mut sink, pass)?.guard;
+    let read = cv_core::stream::stream_counted(adapter, r, &parse_opts, &mut sink, pass)?;
     sink.finish_tail();
+    // Returned metadata also carries omissions discovered after an eager header was printed.
+    // Keep the stream bounded and report the final evidence once, without replaying its body.
+    sink.coverage = cv_core::coverage::ReadCoverage::of_session(&read.session);
+    if sink.frames.printed && sink.coverage != sink.printed_coverage {
+        if let Some(coverage) = &sink.coverage {
+            sink.frames.write(&format!("Read coverage: {}\n\n", coverage.summary()));
+        }
+    }
     sink.flush_header(); // short sessions (no assistant turn / < HOLDBACK msgs) flush here
     sink.frames.result?;
-    if let Some(guard) = guard {
+    if let Some(guard) = read.guard {
         guard.verify(r)?;
     }
     Ok(RenderOutcome {
@@ -1550,12 +1568,16 @@ fn stream_session_render_inner<W: std::io::Write>(
 /// Header for `cv show` (mirrors the old eager header exactly).
 pub(crate) fn show_header(h: &HeaderInfo) -> String {
     format!(
-        "# {}\n{} · {} · {}{}\n\n",
+        "# {}\n{} · {} · {}{}\n{}\n",
         h.label,
         h.harness,
         h.id,
         h.cwd.as_deref().map(home_rel).unwrap_or_else(|| "?".into()),
         h.model.as_ref().map(|m| format!(" · {m}")).unwrap_or_default(),
+        h.coverage
+            .as_ref()
+            .map(|c| format!("Read coverage: {}\n", c.summary()))
+            .unwrap_or_default(),
     )
 }
 
@@ -1610,14 +1632,18 @@ fn persisted_path(details: Option<&serde_json::Value>) -> Option<&str> {
 
 /// Header for `cv export md`: [`cv_core::render::md_header`] from the streamed header facts.
 fn md_header(h: &HeaderInfo) -> String {
-    cv_core::render::md_header(
+    let mut header = cv_core::render::md_header(
         &h.label,
         h.harness,
         &h.id,
         h.cwd.as_deref(),
         h.model.as_deref(),
         h.created_at,
-    )
+    );
+    if let Some(coverage) = &h.coverage {
+        header.push_str(&format!("Read coverage: {}\n\n", coverage.summary()));
+    }
+    header
 }
 
 /// One `cv export md` section: [`cv_core::render::write_md_message`] as a `String`.
@@ -1631,6 +1657,87 @@ fn md_message(m: &Message, resolver: &cv_core::Resolver) -> Result<String> {
 mod tests {
     use super::*;
     use cv_core::ir::Role;
+
+    #[test]
+    fn read_coverage_survives_early_headers_and_metadata_only_sessions() -> Result<()> {
+        use cv_core::coverage::ReadCoverage;
+        struct Covered(bool);
+        impl Adapter for Covered {
+            fn harness(&self) -> Harness {
+                Harness::Antigravity
+            }
+            fn roots(&self) -> Vec<PathBuf> {
+                Vec::new()
+            }
+            fn discover(&self) -> Result<cv_core::Discovered> {
+                Ok(Default::default())
+            }
+            fn stream(
+                &self,
+                r: &SessionRef,
+                _: &cv_core::Demand,
+                sink: &mut dyn cv_core::MessageSink,
+            ) -> Result<Session> {
+                let mut session = Session::new(&r.id, Harness::Antigravity);
+                session.title = Some("covered session".into());
+                session.model = Some("model".into());
+                let mut coverage = ReadCoverage::default();
+                coverage.sources.insert(ReadCoverage::NATIVE_STORE.into());
+                coverage.attach(&mut session);
+                sink.meta(&session);
+                if self.0 {
+                    let mut message = Message::new(Role::Assistant);
+                    message.content.push(Block::Text {
+                        text: "body before late gap".into(),
+                    });
+                    sink.message(message);
+                    coverage.limitations.insert(ReadCoverage::MISSING_PAYLOADS.into());
+                } else {
+                    coverage
+                        .limitations
+                        .extend([ReadCoverage::METADATA_ONLY.into(), ReadCoverage::MISSING_HISTORY.into()]);
+                }
+                // The returned session is authoritative even without another sink.meta call.
+                coverage.attach(&mut session);
+                Ok(session)
+            }
+        }
+        let r = SessionRef::new("covered", Harness::Antigravity, "/nonexistent/coverage.jsonl");
+        for has_body in [false, true] {
+            for markdown in [false, true] {
+                let mut out = Vec::new();
+                let resolver = cv_core::Resolver::new(None);
+                stream_session_render(
+                    &Covered(has_body),
+                    &r,
+                    &mut out,
+                    if markdown { md_header } else { show_header },
+                    |m| {
+                        if markdown {
+                            md_message(m, &resolver)
+                        } else {
+                            show_message(m)
+                        }
+                    },
+                    RenderOpts::default(),
+                )?;
+                let text = String::from_utf8(out)?;
+                if has_body {
+                    assert!(
+                        text.find("body before late gap").expect("rendered body")
+                            < text.find("some recorded payloads are unavailable").expect("late gap"),
+                        "{text}"
+                    );
+                    assert_eq!(text.matches("some recorded payloads are unavailable").count(), 1);
+                } else {
+                    assert!(text.contains("metadata only; no conversation text"), "{text}");
+                    assert!(text.contains("some history is unavailable"), "{text}");
+                    assert_eq!(text.matches("Read coverage:").count(), 1);
+                }
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn fleetwide_agent_selection_honors_harness_and_zero_compaction_is_usage_error() {

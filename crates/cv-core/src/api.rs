@@ -406,7 +406,16 @@ fn session_meta_json(s: &Session) -> Value {
     if let Some(principal) = &s.principal {
         meta["principal"] = json!(principal);
     }
+    update_read_coverage(&mut meta, s);
     meta
+}
+
+// Read coverage is session metadata, including for lean windows that omit message extras.
+// Unlike the initial title/model, evidence may grow after the first metadata callback.
+fn update_read_coverage(meta: &mut Value, s: &Session) {
+    if let Some(coverage) = s.cv_extra().and_then(|extra| extra.get("read_coverage")) {
+        meta["extra"]["cv"]["read_coverage"] = coverage.clone();
+    }
 }
 
 /// `GET /api/session/{harness}/{id}/messages?start=&end=&around=&context=&extra=` — the window
@@ -460,15 +469,10 @@ fn message_window(harness: &str, id: &str, query: &str) -> Result<(SessionRef, W
         end = Some(center.saturating_add(ctx).saturating_add(1));
     }
 
-    let (shell, mut sink) = match read::window(read::shared(), adapter.as_ref(), &r, start, end, want_extra) {
+    let (_, sink) = match read::window(read::shared(), adapter.as_ref(), &r, start, end, want_extra) {
         Ok(value) => value,
         Err(e) => return Err(err(500, &format!("stream failed: {e:#}"))),
     };
-    // Preserve first pushed metadata; readers which never push it use the returned shell.
-    if sink.meta.is_none() {
-        sink.meta = Some(session_meta_json(&shell));
-    }
-
     Ok((r, sink))
 }
 
@@ -976,6 +980,25 @@ mod tests {
 #[cfg(test)]
 mod principal_tests {
     use super::*;
+
+    #[test]
+    fn window_metadata_preserves_read_coverage_without_message_extras() {
+        let mut session = Session::new("member", crate::Harness::Antigravity);
+        assert!(session_meta_json(&session).get("extra").is_none());
+        let evidence =
+            json!({"sources":["member_registry"], "limitations":["metadata_only","future_gap"], "future_field":42});
+        session.cv_extra_mut().insert("read_coverage".into(), evidence.clone());
+        session
+            .harness_extra_mut(crate::Harness::Antigravity)
+            .insert("large_raw_data".into(), json!({"unrelated":true}));
+        assert_eq!(
+            session_meta_json(&session)["extra"],
+            json!({"cv":{"read_coverage":evidence}})
+        );
+        let mut initial = session_meta_json(&Session::new("member", crate::Harness::Antigravity));
+        update_read_coverage(&mut initial, &session);
+        assert_eq!(initial["extra"]["cv"]["read_coverage"], evidence);
+    }
 
     #[test]
     fn window_metadata_preserves_principal_only_when_present() {

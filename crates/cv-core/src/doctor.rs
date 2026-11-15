@@ -156,6 +156,8 @@ impl ActiveWindowReport {
 /// (CLI) or serialize ([`Report::to_json`], for `--json` and the MCP tool).
 #[derive(Default, Debug, Clone, Serialize)]
 pub struct Report {
+    /// Explicit coverage evidence only; absent sessions have not been assessed.
+    pub read_coverage: Vec<crate::coverage::SessionCoverage>,
     pub sessions: u64,
     pub messages: u64,
     // Estimated token equivalents of cumulative stored content, by source (lifetime history)
@@ -202,6 +204,7 @@ impl Report {
         self.sessions += 1;
         SessionPass {
             rep: self,
+            coverage: None,
             harness,
             resolver: crate::lazy::Resolver::new(source),
             names: HashMap::new(),
@@ -269,6 +272,7 @@ impl Report {
             "by_tool": tools.clone(),
         });
         json!({
+            "read_coverage": self.read_coverage,
             "sessions": self.sessions,
             "messages": self.messages,
             "compactions": self.compactions,
@@ -360,6 +364,7 @@ impl MsgFact {
 /// usage-derived context sizing and the compaction tally, folded per message.
 pub struct SessionPass<'a> {
     rep: &'a mut Report,
+    coverage: Option<crate::coverage::SessionCoverage>,
     harness: Option<crate::Harness>,
     resolver: crate::lazy::Resolver,
     /// `tool_use_id` → tool name, the last call per id wins. A result usually carries only the
@@ -383,6 +388,9 @@ impl SessionPass<'_> {
             return Err(error);
         }
         let rep = &mut *self.rep;
+        if let Some(coverage) = self.coverage.take() {
+            rep.read_coverage.push(coverage);
+        }
         for (id, t) in self.unnamed {
             let name = self.names.get(&id).map_or("(unknown tool)", String::as_str);
             let e = rep.by_tool.entry(name.to_string()).or_default();
@@ -818,6 +826,9 @@ fn slice_active_branch(facts: &[MsgFact]) -> Vec<&MsgFact> {
 }
 
 impl MessageSink for SessionPass<'_> {
+    fn meta(&mut self, session: &crate::Session) {
+        self.coverage = crate::coverage::SessionCoverage::of_session(session);
+    }
     fn take_error(&mut self) -> Option<anyhow::Error> {
         self.latch.take("doctor source read")
     }
@@ -1230,6 +1241,28 @@ pub fn collect_store_health() -> StoreHealthReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_coverage_reports_empty_sessions_and_final_metadata_once() {
+        use crate::coverage::ReadCoverage;
+        let mut session = crate::Session::new("member", crate::Harness::Antigravity);
+        let mut coverage = ReadCoverage::default();
+        coverage.sources.insert(ReadCoverage::MEMBER_REGISTRY.into());
+        coverage.attach(&mut session);
+        let mut report = Report::default();
+        let mut pass = report.session_with_harness(None, Some(crate::Harness::Antigravity));
+        pass.meta(&session);
+        coverage
+            .limitations
+            .extend([ReadCoverage::METADATA_ONLY.into(), ReadCoverage::MISSING_HISTORY.into()]);
+        coverage.attach(&mut session);
+        pass.meta(&session);
+        pass.finish().unwrap();
+        let json = report.to_json();
+        assert_eq!(json["read_coverage"].as_array().unwrap().len(), 1);
+        assert_eq!(json["read_coverage"][0]["id"], "member");
+        assert_eq!(json["read_coverage"][0]["coverage"], serde_json::json!(coverage));
+    }
 
     fn result(id: &str, body: &str) -> Message {
         let mut m = Message::new(Role::Tool);

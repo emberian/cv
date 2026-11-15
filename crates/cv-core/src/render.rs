@@ -23,6 +23,9 @@ pub fn write_markdown(s: &Session, out: &mut impl Write, resolver: &crate::Resol
         )
         .as_bytes(),
     )?;
+    if let Some(coverage) = crate::coverage::ReadCoverage::of_session(s) {
+        writeln!(out, "Read coverage: {}\n", coverage.summary())?;
+    }
     for message in &s.messages {
         write_md_message(message, out, resolver)?;
     }
