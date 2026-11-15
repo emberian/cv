@@ -75,6 +75,12 @@ impl std::ops::Deref for ReadConnection {
 }
 
 impl ReadConnection {
+    /// The private copy this reader is on, when the store needed one. Another read-only
+    /// connection may open it for as long as this reader is kept.
+    pub(crate) fn private_backing(&self) -> Option<&Path> {
+        self._snapshot.as_deref().map(|snapshot| snapshot.database.as_path())
+    }
+
     #[cfg(test)]
     pub(crate) fn reads(&self) -> &crate::source::ReadSet {
         &self.reads

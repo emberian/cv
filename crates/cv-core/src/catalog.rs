@@ -186,8 +186,10 @@ mod imp {
         #[cfg(test)]
         OPEN_COUNT.with(|n| n.set(n.get() + 1));
         if crate::env::frozen() {
-            // Even mode=ro can create/update WAL shared memory.
-            return open_checkpoint(path);
+            // Even mode=ro can create/update WAL shared memory. A catalog another cv process is
+            // writing is read through a private snapshot rather than not at all: falling back to
+            // discovery would rescan every store and call every session stale.
+            return open_checkpoint(path).or_else(|| open_frozen_snapshot(path));
         }
         let conn = match open_writable(path) {
             Ok(conn) => Some(conn),
@@ -237,6 +239,39 @@ mod imp {
         }
         let conn = read_only_connection(path, "immutable=1")?;
         checkpoint_only(path).then_some(conn)
+    }
+
+    /// A catalog with uncheckpointed frames, read from the private copy the SQLite store
+    /// reader keeps: one copy per state of the source however many times this process opens
+    /// it, owned by a lease that a later process reclaims if this one dies. The reader that
+    /// owns the copy is held for the process, since callers take bare connections.
+    fn open_frozen_snapshot(path: &Path) -> Option<Connection> {
+        use crate::harness::store::sqlite::{open_ro, read_scope, ReadConnection};
+        static HELD: std::sync::Mutex<Option<ReadConnection>> = std::sync::Mutex::new(None);
+        extern "C" fn release() {
+            if let Ok(mut held) = HELD.try_lock() {
+                held.take();
+            }
+        }
+        // Reclaims the copies of processes that died holding one.
+        let _scope = read_scope();
+        let owner = open_ro(path)
+            .inspect_err(|error| {
+                crate::env::warn_once("the catalog", format_args!("{}: {error:#}", path.display()));
+            })
+            .ok()?;
+        let conn = read_only_connection(owner.private_backing()?, "mode=ro");
+        // The previous owner goes with its copy once the source has moved on. Connections
+        // already open on it keep their files on Unix; Windows removes them when they close.
+        let mut held = HELD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if held.replace(owner).is_none() {
+            // An ordinary exit removes the copy; the lease covers every other end.
+            #[cfg(unix)]
+            unsafe {
+                libc::atexit(release);
+            }
+        }
+        conn
     }
 
     fn read_only_connection(path: &Path, query: &str) -> Option<Connection> {
@@ -2285,6 +2320,62 @@ mod imp {
                 serde_json::to_value(listed).unwrap(),
                 serde_json::to_value(&discovered).unwrap()
             );
+        }
+
+        /// A frozen read beside a live writer serves the warm route from a private snapshot
+        /// that includes the writer's uncheckpointed commits, takes one copy for all its opens,
+        /// and takes another only after the source changes.
+        #[test]
+        fn frozen_reads_a_catalog_with_uncheckpointed_frames_through_one_snapshot() {
+            let w = crate::test_world("reader-frozen-wal");
+            let r = db_ref(Harness::Claude, w.base.join("recorded"));
+            sync(std::slice::from_ref(&r));
+            let path = db_path().unwrap();
+            let writer = open_db().unwrap();
+            let stamp = |version: &str| {
+                writer
+                    .execute_batch(&format!(
+                        "PRAGMA wal_autocheckpoint=0; UPDATE sessions SET writer_version='{version}';"
+                    ))
+                    .unwrap();
+            };
+            stamp("9.0.0");
+            assert!(open_checkpoint(&path).is_none(), "the log holds frames");
+            let source = || {
+                let mut files: Vec<_> = std::fs::read_dir(&w.cv_home)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .filter(|path| path.is_file())
+                    .map(|path| (path.clone(), FileId::at(&path)))
+                    .collect();
+                files.sort_by(|a, b| a.0.cmp(&b.0));
+                files
+            };
+            let before = source();
+            {
+                let _frozen = crate::env::Env::from_vars([
+                    ("CLUSTERVISION_HOME", w.cv_home.as_os_str()),
+                    ("HOME", w.home.as_os_str()),
+                ])
+                .with_frozen()
+                .enter();
+                let version = || -> String {
+                    open_at(&path)
+                        .expect("a frozen open beside a writer")
+                        .query_row("SELECT writer_version FROM sessions", [], |r| r.get(0))
+                        .unwrap()
+                };
+                let backing = |conn: &Connection| conn.path().map(str::to_owned);
+                assert_eq!(version(), "9.0.0");
+                let (first, second) = (open_at(&path).unwrap(), open_at(&path).unwrap());
+                assert_eq!(backing(&first), backing(&second), "every open shares one copy");
+                assert_ne!(backing(&first).as_deref(), path.to_str(), "the source is not opened");
+                assert_eq!(before, source(), "nothing beside the source was written");
+                stamp("9.1.0");
+                std::thread::sleep(Duration::from_millis(300));
+                assert_eq!(version(), "9.1.0", "a changed source is copied again");
+            }
+            drop(writer);
         }
 
         #[test]
