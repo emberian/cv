@@ -408,6 +408,17 @@ impl Adapter for Antigravity {
                 }
             }
 
+            #[cfg(not(feature = "sqlite"))]
+            for entry in super::read_dir_bulk_kept(&root.join("conversations"), &mut out.skipped) {
+                let path = root.join("conversations").join(&entry.name);
+                if is_native_store(&path) && path.is_file() {
+                    out.skipped.push(crate::Skipped {
+                        path,
+                        why: "reading native Antigravity stores requires SQLite support".into(),
+                    });
+                }
+            }
+
             // Also support flat `*.jsonl` transcripts when `with_home` points directly at a
             // directory of exported Antigravity step logs (excluding `history.jsonl`).
             for entry in super::read_dir_bulk_kept(root, &mut out.skipped) {
@@ -640,6 +651,22 @@ impl Adapter for Antigravity {
                     .into(),
                 );
             }
+            order
+                .coverage
+                .limitations
+                .remove(crate::coverage::ReadCoverage::INFERRED_TOOL_IDENTITY);
+            let mut coverage_records = input.records();
+            for (at, end) in order.steps.values() {
+                coverage_records.read(*at, end - at, |view| {
+                    if codec.inferred_identity(view)? {
+                        order
+                            .coverage
+                            .limitations
+                            .insert(crate::coverage::ReadCoverage::INFERRED_TOOL_IDENTITY.into());
+                    }
+                    Ok(Flow::Continue)
+                })?;
+            }
             order.coverage.attach(&mut codec.s);
             spawns.meta(&codec.s);
             let mut records = input.records();
@@ -738,6 +765,23 @@ pub fn stream_str(
             .coverage
             .sources
             .insert(crate::coverage::ReadCoverage::EXPORTED_HISTORY.into());
+        order
+            .coverage
+            .limitations
+            .remove(crate::coverage::ReadCoverage::INFERRED_TOOL_IDENTITY);
+        for (at, end) in order.steps.values() {
+            jsonl::slice(&text.as_bytes()[*at as usize..*end as usize], |line| {
+                if let Some(view) = line.view {
+                    if codec.inferred_identity(view)? {
+                        order
+                            .coverage
+                            .limitations
+                            .insert(crate::coverage::ReadCoverage::INFERRED_TOOL_IDENTITY.into());
+                    }
+                }
+                Ok(Flow::Continue)
+            })?;
+        }
         order.coverage.attach(&mut codec.s);
         spawns.meta(&codec.s);
         let mut stopped = false;
@@ -1378,9 +1422,7 @@ fn build_session_header(r: &SessionRef, opts: &Demand) -> (Session, SidecarEnric
                     }
                 }
                 s.model = db_meta.dominant_model;
-                if is_native_store(&r.path) {
-                    enrich.step_models = db_meta.step_models;
-                }
+                enrich.step_models = db_meta.step_models;
             }
         }
 
@@ -1455,6 +1497,9 @@ const STEP_KEYS: &[&str] = &[
     "native_unsupported",
     "native_missing_attachments",
     "native_content",
+    "native_agent_refs",
+    "native_scope_items",
+    "native_task_details",
     "native_tool_id",
     "native_tool_name",
     "cache_creation_tokens",
@@ -1545,6 +1590,58 @@ impl jsonl::Codec for StepCodec {
 }
 
 impl StepCodec {
+    /// Assess the selected revisions using the same explicit/matched identity
+    /// choices as decoding, before metadata is delivered to a streaming consumer.
+    fn inferred_identity(&self, view: JsonView<'_>) -> Result<bool> {
+        let index = view
+            .get("step_index")?
+            .map(JsonView::as_number)
+            .transpose()?
+            .flatten()
+            .and_then(|n| n.as_u64())
+            .unwrap_or(0);
+        #[cfg(feature = "sqlite")]
+        let verified = self.enrich.verified.get(&index);
+        #[cfg(not(feature = "sqlite"))]
+        let _ = index;
+        if view
+            .get("type")?
+            .map(JsonView::string)
+            .transpose()?
+            .flatten()
+            .as_deref()
+            == Some("GENERIC")
+        {
+            let explicit = view
+                .get("native_tool_id")?
+                .map(JsonView::string)
+                .transpose()?
+                .flatten()
+                .is_some_and(|id| !id.is_empty());
+            #[cfg(feature = "sqlite")]
+            let explicit = explicit || verified.is_some_and(|m| m.result.is_some());
+            return Ok(!explicit);
+        }
+        if let Some(calls) = view.get("tool_calls")?.map(JsonView::array).transpose()?.flatten() {
+            for (at, call) in calls.enumerate() {
+                let explicit = call?
+                    .get("id")?
+                    .map(JsonView::string)
+                    .transpose()?
+                    .flatten()
+                    .is_some_and(|id| !id.is_empty());
+                #[cfg(feature = "sqlite")]
+                let explicit = explicit || verified.is_some_and(|m| m.calls.get(at).is_some());
+                #[cfg(not(feature = "sqlite"))]
+                let _ = at;
+                if !explicit {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
     fn decode(&mut self, view: JsonView<'_>, _at: u64, sink: &mut dyn MessageSink) -> Result<Flow> {
         let Some(fields) = Fields::parse(view, STEP_KEYS)? else {
             return Ok(Flow::Continue);
@@ -1597,12 +1694,11 @@ impl StepCodec {
                 let mut m = Message::of_kind(Role::Assistant, MessageKind::Reply, Origin::Model);
                 m.id = Some(step_index.to_string());
                 m.timestamp = ts;
-                m.model = if fields.get("native_store").is_some() {
-                    self.enrich
-                        .step_models
-                        .get(&step_index)
-                        .cloned()
-                        .or_else(|| self.s.model.clone())
+                let native_identity = fields.get("native_store").is_some();
+                #[cfg(feature = "sqlite")]
+                let native_identity = native_identity || self.enrich.verified.contains_key(&step_index);
+                m.model = if native_identity {
+                    self.enrich.step_models.get(&step_index).cloned()
                 } else {
                     None
                 };
@@ -2023,6 +2119,17 @@ fn attach_step_extras(
     }
     if let Some(st) = status {
         bag.insert("status".into(), Value::String(st.to_string()));
+    }
+    for (field, key) in [
+        ("native_scope_items", "scope_items"),
+        ("native_task_details", "task_details"),
+    ] {
+        if let Some(value) = fields.value(field)? {
+            bag.insert(key.into(), value);
+        }
+    }
+    if let Some(references) = fields.value("native_agent_refs")? {
+        bag.insert("agent_references".into(), references);
     }
     if let Some(trunc) = fields.value("truncated_fields")? {
         if trunc.as_array().is_some_and(|a| !a.is_empty()) {

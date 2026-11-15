@@ -1,5 +1,8 @@
 //! Bounded native protobuf projection. JSONL remains the historical authority when
 //! present: native CLEARED steps are not replacements for retained exported text.
+mod context;
+mod media;
+mod render;
 mod wire;
 use super::super::store::{bytes::ByteSource, sqlite};
 use super::*;
@@ -67,7 +70,11 @@ fn calls(file: &File, p: &Proto, out: &mut impl Write) -> Result<()> {
         out.write_all(b"{\"native\":true")?;
         text(file, &call, 1, "id", out)?;
         text(file, &call, 2, "name", out)?;
-        text(file, &call, 3, "arguments", out)?;
+        if call.last(3).is_some() {
+            text(file, &call, 3, "arguments", out)?;
+        } else {
+            text(file, &call, 4, "arguments", out)?;
+        }
         out.write_all(b"}")?;
     }
     out.write_all(b"]")?;
@@ -152,23 +159,21 @@ fn project(file: &File, step: &Proto, index: u64, complete: bool, out: &mut impl
             }
         }
     }
+    if let Some(error) = step.last(31) {
+        let error = error.message(file)?;
+        if let Some(number) = [1, 9, 3, 2, 5].into_iter().find(|number| error.last(*number).is_some()) {
+            text(file, &error, number, "error", out)?;
+        }
+    }
+    if let Some(details) = step.last(148) {
+        context::task(file, &details.message(file)?, out)?;
+    }
     match kind {
         "USER_INPUT" => {
             let input = step.last(19).unwrap().message(file)?;
-            out.write_all(b",\"native_content\":[")?;
-            let mut first = true;
-            for item in input.repeated(3) {
-                if let Some(field) = item.message(file)?.last(1) {
-                    if !first {
-                        out.write_all(b",")?;
-                    }
-                    first = false;
-                    field.write_json_string(file, out)?;
-                }
-            }
-            out.write_all(b"]")?;
+            context::user(file, &input, out)?;
             text(file, &input, 1, "content", out)?;
-            media(file, &input, 9, out)?;
+            media::project(file, &input, 9, out)?;
         }
         "PLANNER_RESPONSE" => {
             let response = step.last(20).unwrap().message(file)?;
@@ -179,27 +184,37 @@ fn project(file: &File, step: &Proto, index: u64, complete: bool, out: &mut impl
                 out.write_all(b",\"thinking_redacted\":true")?;
             }
             calls(file, &response, out)?;
-            media(file, &response, 20, out)?;
+            media::project(file, &response, 20, out)?;
         }
         "GENERIC" => {
             let generic = step.last(140).unwrap().message(file)?;
             if let Some(field) = generic.last(2) {
                 let result = field.message(file)?;
-                if result.last(1).is_some() {
+                let has_content = if result.last(1).is_some() {
                     text(file, &result, 1, "content", out)?;
+                    true
                 } else if let Some(structure) = result.last(10) {
-                    structured_content(file, structure.message(file)?, true, out)?;
+                    structured_content(file, structure.message(file)?, true, out)?
                 } else if let Some(value) = result.last(11) {
-                    structured_content(file, value.message(file)?, false, out)?;
+                    structured_content(file, value.message(file)?, false, out)?
+                } else {
+                    false
+                };
+                if let Some(info) = result.last(3) {
+                    let info = info.message(file)?;
+                    render::agents(file, &info, out)?;
+                    if !has_content {
+                        render::content(file, &info, out)?;
+                    }
                 }
                 text(file, &result, 7, "native_output_uri", out)?;
-                media(file, &result, 4, out)?;
+                media::project(file, &result, 4, out)?;
             }
         }
         "SYSTEM_MESSAGE" => {
             let message = step.last(114).unwrap().message(file)?;
             text(file, &message, 1, "content", out)?;
-            media(file, &message, 6, out)?;
+            media::project(file, &message, 6, out)?;
         }
         "CHECKPOINT" => text(file, &step.last(30).unwrap().message(file)?, 5, "content", out)?,
         "ERROR_MESSAGE" => {
@@ -239,28 +254,6 @@ fn project(file: &File, step: &Proto, index: u64, complete: bool, out: &mut impl
         out.write_all(b"\"}")?;
     }
     out.write_all(b"}\n")?;
-    Ok(())
-}
-
-/// URI attachments fit the existing IR. Inline-only/blobref media remain retained
-/// in COMPLETE wire records and explicitly mark this normalized view incomplete.
-fn media(file: &File, parent: &Proto, number: u32, out: &mut impl Write) -> Result<()> {
-    out.write_all(b",\"media\":[")?;
-    for (i, field) in parent.repeated(number).enumerate() {
-        if i != 0 {
-            out.write_all(b",")?;
-        }
-        let item = field.message(file)?;
-        out.write_all(b"{\"native\":true")?;
-        text(file, &item, 1, "mime_type", out)?;
-        text(file, &item, 5, "uri", out)?;
-        text(file, &item, 4, "description", out)?;
-        text(file, &item, 9, "display_name", out)?;
-        // Inline/blob bytes exist in the retained wire record. Their unsupported
-        // normalization is not evidence of missing stored data.
-        out.write_all(b"}")?;
-    }
-    out.write_all(b"]")?;
     Ok(())
 }
 
@@ -434,6 +427,23 @@ mod tests {
         assert!(projected.get("native_missing_payloads").is_none());
         assert_eq!(projected["native_unsupported"], true);
         assert!(projected.get("content").is_none());
+    }
+
+    #[test]
+    fn generic_native_error_details_are_not_lost() {
+        let data = [uint(4, 7), bytes(140, &[]), bytes(31, &bytes(3, b"Command failed"))].concat();
+        let projected = projection(&data, false);
+        assert_eq!(projected["type"], "GENERIC");
+        assert_eq!(projected["status"], "ERROR");
+        assert_eq!(projected["error"], "Command failed");
+    }
+
+    #[test]
+    fn invalid_native_arguments_remain_available() {
+        let call = [bytes(1, b"call-id"), bytes(2, b"tool"), bytes(4, b"{broken")].concat();
+        let data = bytes(20, &bytes(7, &call));
+        let projected = projection(&data, false);
+        assert_eq!(projected["tool_calls"][0]["arguments"], "{broken");
     }
 
     #[test]
