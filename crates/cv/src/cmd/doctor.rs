@@ -43,8 +43,14 @@ pub(crate) fn cmd_doctor(id: Option<String>, harness: Option<String>, recent: us
 
     // Resolve the target session(s). An explicit id arrives with its adapter (resolve found it);
     // the recent listing carries refs the loop below still has to load.
+    let mut exact_source = false;
     let targets: Vec<(SessionRef, Option<Box<dyn cv_core::Adapter>>)> = if let Some(id) = &id {
-        let (r, adapter) = crate::util::resolve(id, want)?;
+        let (want, source) = crate::util::split_harness_id(id, want);
+        exact_source = std::path::Path::new(source).is_file();
+        let (r, adapter) = crate::cmd::distill::resolve_source(source, want)?;
+        if exact_source {
+            crate::util::require_session_file(&r, adapter.as_ref())?;
+        }
         vec![(r, Some(adapter))]
     } else {
         let cwd = std::env::current_dir().ok();
@@ -74,9 +80,10 @@ pub(crate) fn cmd_doctor(id: Option<String>, harness: Option<String>, recent: us
     for (r, found) in targets {
         let (rr, adapter) = match found {
             Some(adapter) => (r, adapter),
-            None => {
-                cv_core::find(&r.id, Some(r.harness))?.with_context(|| format!("could not load session {}", r.id))?
-            }
+            None => (
+                r.clone(),
+                cv_core::harness::for_harness(r.harness).with_context(|| format!("no adapter for {}", r.harness))?,
+            ),
         };
         let mut pass = rep.session_with_harness(Some(rr.path.clone()), Some(rr.harness));
         let read = cv_core::stream::stream_counted(
@@ -91,7 +98,8 @@ pub(crate) fn cmd_doctor(id: Option<String>, harness: Option<String>, recent: us
         if label.is_empty() {
             label = crate::util::short_id(&rr.id);
         }
-        if n_targets == 1 {
+        // The lineage lookup is ID-only; it must not attach another root's same-ID family.
+        if n_targets == 1 && !exact_source {
             single_session_id = Some(rr.id.clone());
         }
     }

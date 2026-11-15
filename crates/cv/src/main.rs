@@ -486,7 +486,7 @@ enum Cmd {
     /// system+tools overhead from token usage, and pair it with compaction frequency. With no
     /// <id>, analyzes the most recent session(s) for the current directory.
     Doctor {
-        /// Session id (prefix ok). Omit to analyze recent sessions in the current project.
+        /// Session id (prefix ok) or harness:/transcript/path. Omit for recent sessions here.
         id: Option<String>,
         #[arg(long)]
         harness: Option<String>,
@@ -856,13 +856,14 @@ enum Cmd {
     },
     /// Print (or with --launch, run) the resume incantation for a session in its native harness.
     Resume {
+        /// Session id, harness:id, or harness:/transcript/path (native Claude/Codex layouts).
         id: String,
         #[arg(long)]
         harness: Option<String>,
         /// Actually spawn the harness (cd to the session's cwd) instead of just printing.
         #[arg(long)]
         launch: bool,
-        /// Print the executable, argument array, cwd and any manual hint/warning as JSON.
+        /// Print executable, arguments, cwd, environment, source path and manual hint/warning as JSON.
         #[arg(long, conflicts_with = "launch")]
         json: bool,
     },

@@ -559,7 +559,10 @@ written after the commit are scanned. Rebased, cherry-picked or silenced (`-q`) 
 Why does context keep filling up? `cv doctor` sizes the transcript by source against recorded
 prompt sizes and compactions. It also shows **Writer versions** (newest Claude/Codex writer seen
 versus newest verified, plus unknown-version sessions) and skipped sources (`skipped_sources` in
-`--json`; the previous list if recording failed).
+`--json`; the previous list if recording failed). Use `harness:/transcript/path` or
+`--harness H /transcript/path` to select a particular file when several stores contain the same
+session ID. Shared database paths need `harness:ID` instead. Explicit file reads omit the
+ID-only lineage lookup, which cannot distinguish copied sessions.
 
 ```sh
 cv doctor da9174f4
@@ -567,6 +570,7 @@ cv doctor                       # the most recent session for the current direct
 cv doctor --recent 20           # aggregate the last 20 sessions for this cwd
 cv doctor --store               # diagnose local stores (state.db, catalog.db, packs, search segments, disk health)
 cv doctor da9174f4 --json
+cv doctor claude:/profiles/work/projects/-repo/session.jsonl --json
 ```
 
 ```text
@@ -754,19 +758,27 @@ The native resume command; `--launch` runs it from the session's cwd.
 cv resume da9174f4
 cv resume da9174f4 --launch
 cv resume da9174f4 --json
+cv resume claude:/profiles/work/projects/-repo/session.jsonl --json
 ```
 
 ```text
 cd ~/pug/clustervision
-claude --resume da9174f4-…
+env CLAUDE_CONFIG_DIR=/profiles/work claude --resume da9174f4-…
 ```
 
 Desktop/IDE-only harnesses get a note instead.
 
-`--json` prints `id`, `harness`, `program`, `args`, `cwd`, `hint`, and `warning`. Arguments are
-an array of literal strings, without shell quoting. A GUI-only target has a null `program`,
+`--json` prints `id`, `harness`, `path`, `program`, `args`, `cwd`, `env`, `hint`, and `warning`.
+Arguments are an array of literal strings, without shell quoting. `env` contains environment
+variables to set when executing the command. A GUI-only target has a null `program`,
 empty `args`, and a manual `hint`. An unavailable native store is reported in `warning`, just
 as in the text output. This mode never launches anything and cannot be combined with `--launch`.
+
+Claude and Codex resume plans preserve the selected native store through `CLAUDE_CONFIG_DIR`
+and `CODEX_HOME`, including sessions found in extra roots. An explicit transcript path must use
+the native projects/session layout; copied exports and Claude child transcripts are refused.
+Other CLI harnesses currently require an ID selector instead of an exact path. A shared database
+path alone cannot select a conversation: use `harness:ID`.
 
 ---
 

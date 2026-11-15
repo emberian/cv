@@ -11,7 +11,7 @@
 //! fidelity, including provider signatures and identifiers. Other targets use the text policy in
 //! portable mode.
 
-use crate::util::{home_rel, parse_harness, resolve, shell_quote, usage};
+use crate::util::{home_rel, parse_harness, shell_quote, usage};
 use anyhow::{bail, Context, Result};
 use cv_core::harness::claude::skills::SkillsPolicy;
 use cv_core::ir::{Harness, Session};
@@ -226,15 +226,31 @@ pub(crate) enum ResumeTarget {
 
 pub(crate) fn cmd_resume(id: &str, harness: Option<String>, launch: bool, json: bool) -> Result<()> {
     let want = parse_harness(&harness)?;
-    let (r, adapter) = resolve(id, want)?;
+    let (want, source) = crate::util::split_harness_id(id, want);
+    let explicit_path = Path::new(source).is_file();
+    let (mut r, adapter) = crate::cmd::distill::resolve_source(source, want)?;
+    if explicit_path {
+        crate::util::require_session_file(&r, adapter.as_ref())?;
+        // A path ref starts with its filename, not necessarily the native session ID or cwd.
+        let read = cv_core::stream::stream_counted(
+            adapter.as_ref(),
+            &r,
+            &cv_core::Demand::FACTS,
+            &mut cv_core::stream::Discard,
+            cv_core::stream::Pass::RECORD,
+        )?;
+        r.id = read.session.id;
+        r.cwd = read.session.cwd;
+    }
+    let env = resume_environment(&r, explicit_path)?;
     let cwd = r.cwd.clone();
     let caveat = adapter.resume_caveat(&r);
 
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&resume_json(r.harness, &r.id, cwd.as_deref(), caveat.as_deref()))?
-        );
+        let mut plan = resume_json(r.harness, &r.id, cwd.as_deref(), caveat.as_deref());
+        plan["env"] = serde_json::to_value(&env)?;
+        plan["path"] = serde_json::to_value(&r.path)?;
+        println!("{}", serde_json::to_string_pretty(&plan)?);
         return Ok(());
     }
 
@@ -254,6 +270,7 @@ pub(crate) fn cmd_resume(id: &str, harness: Option<String>, launch: bool, json: 
         eprintln!("✦ launching: (cd {}) {} {}", home_rel(&dir), program, args.join(" "));
         let status = std::process::Command::new(program)
             .args(&args)
+            .envs(&env)
             .current_dir(&dir)
             .status()
             .with_context(|| format!("failed to launch {program:?}"))?;
@@ -267,10 +284,67 @@ pub(crate) fn cmd_resume(id: &str, harness: Option<String>, launch: bool, json: 
     if let Some(caveat) = &caveat {
         println!("# {caveat}");
     }
-    for line in resume_lines(r.harness, &r.id, cwd.as_deref()) {
+    let mut lines = resume_lines(r.harness, &r.id, cwd.as_deref());
+    if !env.is_empty() {
+        let assignments = env
+            .iter()
+            .map(|(key, value)| format!("{key}={}", shell_quote(value)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        if let Some(command) = lines.last_mut() {
+            *command = format!("env {assignments} {command}");
+        }
+    }
+    for line in lines {
         println!("{line}");
     }
     Ok(())
+}
+
+/// Pin native commands to the selected source's home, including an ID found in an extra root.
+/// Export files and child transcripts cannot be safely addressed with the native resume CLI.
+fn resume_environment(
+    r: &cv_core::SessionRef,
+    explicit_path: bool,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    let mut env = std::collections::BTreeMap::new();
+    if matches!(resume_target(r.harness, &r.id), ResumeTarget::GuiOnly { .. })
+        || (!explicit_path && !matches!(r.harness, Harness::Claude | Harness::Codex))
+    {
+        return Ok(env);
+    }
+    let path = r
+        .path
+        .canonicalize()
+        .with_context(|| format!("reading resume source {}", r.path.display()))?;
+    let root = match r.harness {
+        Harness::Claude if !r.id.starts_with("agent-") && !r.id.ends_with(".flat") => path
+            .parent()
+            .and_then(Path::parent)
+            .filter(|p| p.file_name().is_some_and(|n| n == "projects"))
+            .and_then(Path::parent)
+            .map(|p| ("CLAUDE_CONFIG_DIR", p)),
+        Harness::Codex => path.ancestors().skip(1).find_map(|p| {
+            let relative = path.strip_prefix(p).ok()?;
+            let components: Vec<_> = relative.iter().collect();
+            let valid = if p.file_name().is_some_and(|n| n == "sessions") {
+                components.len() == 4
+                    && components[..3].iter().zip([4, 2, 2]).all(|(s, len)| {
+                        s.to_str()
+                            .is_some_and(|s| s.len() == len && s.bytes().all(|c| c.is_ascii_digit()))
+                    })
+            } else {
+                p.file_name().is_some_and(|n| n == "archived_sessions") && components.len() == 1
+            };
+            valid.then(|| p.parent().map(|p| ("CODEX_HOME", p))).flatten()
+        }),
+        _ => None,
+    };
+    let Some((key, root)) = root else {
+        return usage(format!("cannot safely resume {} from {}: no native store can be selected for this source; use the original harness/profile or port it into a supported native store", r.harness, path.display()));
+    };
+    env.insert(key.into(), root.to_string_lossy().into_owned());
+    Ok(env)
 }
 
 fn resume_json(harness: Harness, id: &str, cwd: Option<&Path>, warning: Option<&str>) -> serde_json::Value {

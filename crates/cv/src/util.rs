@@ -139,6 +139,20 @@ pub(crate) fn parse_harness(s: &Option<String>) -> Result<Option<Harness>> {
     }
 }
 
+/// A shared store path supplies no session key. Antigravity's SQLite file is one conversation;
+/// other adapters' rows stores need the native ID that discovery normally carries alongside it.
+pub(crate) fn require_session_file(r: &cv_core::SessionRef, adapter: &dyn cv_core::Adapter) -> Result<()> {
+    if r.harness != cv_core::Harness::Antigravity && adapter.rows_store(r).as_ref() == Some(&r.path) {
+        return usage(format!(
+            "{} is a shared {} store, not a session selector; use {}:<session-id> instead",
+            r.path.display(),
+            r.harness,
+            r.harness
+        ));
+    }
+    Ok(())
+}
+
 /// Split an optional `<harness>:<id>` prefix off an id. Only treats the part before the first `:`
 /// as a harness when it actually names one; otherwise the whole string is the id and `fallback`
 /// (a `--harness` flag) applies. Every command that takes an id accepts this form.
