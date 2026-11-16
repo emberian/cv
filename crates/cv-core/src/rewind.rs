@@ -1231,7 +1231,7 @@ fn read_line_at(source: &crate::json::JsonSource, file: &std::fs::File, off: u64
 /// open calls, a top-level user record's `tool_result` blocks close them (counted into `closed`
 /// past the cut). The record's own `type` decides, as the conversation decoder does: a request
 /// snapshot (`api-request-blob`) embeds the same message shape verbatim and is evidence to keep,
-/// never an event (task/10455). Sidechain records carry the same types and still count, so
+/// never an event. Sidechain records carry the same types and still count, so
 /// [`Facts::turn_kind`], which excludes them, is not the gate.
 fn track_tool_calls(facts: &Facts, open: &mut HashMap<String, Option<String>>, mut closed: Option<&mut usize>) {
     let opens = match facts.ty.as_str() {

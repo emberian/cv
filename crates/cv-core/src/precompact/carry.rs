@@ -535,7 +535,7 @@ pub fn ids(messages: &[(String, String)]) -> Vec<Id> {
 /// The longest line [`lines`] copies: past it a line is a dump, not a statement.
 const LINE_MAX: usize = 400;
 
-/// Whether a line states a sha, a row (`fleet/204`) or a count: `9 of 12`, `130 tests`, `$1.51`,
+/// Whether a line states a sha, a row (`issue/204`) or a count: `9 of 12`, `130 tests`, `$1.51`,
 /// `42%`, `61 ms`.
 fn states_a_measure(line: &str) -> bool {
     use std::sync::OnceLock;
@@ -868,7 +868,7 @@ mod tests {
                 turn(
                     "assistant",
                     "a",
-                    "Landed 0e4c8385a9 with 130 tests passing.\nNothing else here.\n[tool call: Bash {\"command\":\"fleet chat post 'held fleet/204 open'\\nls\"}]",
+                    "Landed 0e4c8385a9 with 130 tests passing.\nNothing else here.\n[tool call: Bash {\"command\":\"chat post 'held issue/204 open'\\nls\"}]",
                 ),
                 turn("user", "r", "[tool result] 2 of 9 modules red\ndone"),
             ],
@@ -879,7 +879,7 @@ mod tests {
             got,
             [
                 ("a", "Landed 0e4c8385a9 with 130 tests passing.", Source::Said),
-                ("a", "fleet chat post 'held fleet/204 open'", Source::Ran),
+                ("a", "chat post 'held issue/204 open'", Source::Ran),
                 ("r", "2 of 9 modules red", Source::Read),
             ]
         );
@@ -1080,7 +1080,7 @@ mod tests {
         assert_eq!(quotes, ["push main after the review"]);
         // A record written before the count: its items start counting from this window.
         let mut old = Carry::default();
-        old.items.push(item(Section::Fact, "the host is odie", "t2"));
+        old.items.push(item(Section::Fact, "the host is alpha", "t2"));
         let carry = old.merge(at(50, Vec::new(), Marks::default()), &LIMITS);
         assert_eq!(carry.items[0].seen, Some(50));
     }
@@ -1154,7 +1154,7 @@ mod tests {
             "the seat has a 1M context",
             "CLAUDE_CODE_AUTO_COMPACT_WINDOW=400000",
             "the land fix shipped on 2026-10-23",
-            "I am meta-claude, fleet integrator and lead.",
+            "I am the lead seat.",
         ] {
             assert!(!noise(line), "{line}");
         }
@@ -1380,7 +1380,7 @@ mod tests {
         let found = ids(&[
             (
                 "a1".into(),
-                "committed 19e91340 on task/11058, see /work/cv-home/x.log.".into(),
+                "committed 19e91340 on task/1234, see /tmp/cv-home/x.log.".into(),
             ),
             (
                 "a2".into(),
@@ -1392,8 +1392,8 @@ mod tests {
             names,
             [
                 "19e91340",
-                "task/11058",
-                "/work/cv-home/x.log",
+                "task/1234",
+                "/tmp/cv-home/x.log",
                 "https://github.com/akapug/cv/pull/3"
             ]
         );

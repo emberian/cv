@@ -1179,7 +1179,7 @@ fn an_empty_line_is_copied_like_any_blank_one() {
 }
 
 // ---------------------------------------------------------------------------
-// task/10455 — the request snapshot is physical evidence, never a tool event
+// The request snapshot is physical evidence, never a tool event
 // ---------------------------------------------------------------------------
 
 /// A top-level `api-request-blob` record embedding a verbatim message, the shape a request
