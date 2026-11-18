@@ -924,6 +924,14 @@ enum Cmd {
         /// Export only clean-outcome trajectories (omitting sessions ending in errors or unanswered tool calls).
         #[arg(long = "clean-outcome")]
         clean_outcome: bool,
+        /// `session` (default): one record per session in `--format`. `cycle`: one flat record per
+        /// turn the person sent after the session's first — `report` (last assistant text before
+        /// it), `prompt`, `plan` (first assistant text after it), tool counts of the span before
+        /// and after, `commit_after`/`push_after`, `queued` (typed mid-turn) and `proof` (`record`:
+        /// the record says a person sent it; `adapter`: only cv's prompt kind does). `--format`
+        /// and `--clean-outcome` do not apply to cycles.
+        #[arg(long, default_value = "session", value_parser = ["session", "cycle"])]
+        unit: String,
         /// Write to this file instead of stdout.
         #[arg(long)]
         file: Option<PathBuf>,
@@ -1374,6 +1382,7 @@ fn run() -> Result<()> {
             redact_only,
             active_branch,
             clean_outcome,
+            unit,
             file,
             force,
         } => reshape::cmd_dataset(reshape::DatasetArgs {
@@ -1387,6 +1396,7 @@ fn run() -> Result<()> {
             redact_only,
             active_branch,
             clean_outcome,
+            cycles: unit == "cycle",
             file,
             force,
         }),

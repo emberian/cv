@@ -15,6 +15,7 @@
 
 #[cfg(test)]
 use crate::json::{ReadInput, Validation};
+pub mod cycles;
 mod deferred;
 
 use crate::ir::{Block, Message, MessageKind, Role, Session};
@@ -414,11 +415,21 @@ fn select_active_branch_indices(messages: &[Message]) -> Vec<usize> {
             break;
         }
         chain.push(idx);
-        cur = messages[idx]
-            .parent_id
-            .as_deref()
-            .filter(|p| !p.is_empty())
-            .and_then(|p| by_id.get(p).copied());
+        cur = match messages[idx].parent_id.as_deref().filter(|p| !p.is_empty()) {
+            // A parent no message carries is a record the adapter did not keep as a message
+            // (a silent hook, a bookkeeping line): the chain runs on through the nearest earlier
+            // kept message, which is where that record sat, instead of ending the branch there.
+            Some(p) => by_id
+                .get(p)
+                .copied()
+                .or_else(|| (0..idx).rev().find(|&i| !is_inactive_or_sidechain(&messages[i]))),
+            // A compaction boundary starts a new parent chain (Claude Code links it to the window
+            // before only through `logicalParentUuid`): the conversation continues before it.
+            None if messages[idx].kind == MessageKind::CompactionBoundary => {
+                (0..idx).rev().find(|&i| !is_inactive_or_sidechain(&messages[i]))
+            }
+            None => None,
+        };
     }
     chain.reverse();
     if let Some((0, first)) = messages.iter().enumerate().next() {
@@ -2229,6 +2240,44 @@ mod tests {
         staged.publish(&mut actual)?;
         assert_eq!(actual, expected);
         Ok(())
+    }
+
+    #[test]
+    fn active_branch_runs_through_a_parent_the_adapter_did_not_keep() {
+        // Claude Code threads a reply through records cv keeps no message for (a silent hook
+        // attachment): the reply's parent is such a record, so its id resolves to no message.
+        let mut u1 = msg(Role::User, vec![Block::Text { text: "q".into() }]);
+        u1.id = Some("u1".into());
+        let mut a1 = msg(Role::Assistant, vec![Block::Text { text: "first".into() }]);
+        a1.id = Some("a1".into());
+        a1.parent_id = Some("u1".into());
+        let mut u2 = msg(Role::User, vec![Block::Text { text: "again".into() }]);
+        u2.id = Some("u2".into());
+        u2.parent_id = Some("a1".into());
+        let mut a2 = msg(Role::Assistant, vec![Block::Text { text: "second".into() }]);
+        a2.id = Some("a2".into());
+        a2.parent_id = Some("silent-hook".into());
+        let opts = DatasetOptions {
+            active_branch_only: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            select_trajectory(&[u1.clone(), a1.clone(), u2.clone(), a2.clone()], &opts),
+            Some(vec![0, 1, 2, 3])
+        );
+        // A compaction boundary has no parent; the window before it is still the branch.
+        let mut b = msg(Role::System, vec![]);
+        b.kind = MessageKind::CompactionBoundary;
+        b.id = Some("b".into());
+        let mut s1 = msg(Role::User, vec![Block::Text { text: "summary".into() }]);
+        s1.kind = MessageKind::CompactionSummary;
+        s1.id = Some("s1".into());
+        s1.parent_id = Some("b".into());
+        a2.parent_id = Some("s1".into());
+        assert_eq!(
+            select_trajectory(&[u1, a1, u2, b, s1, a2], &opts),
+            Some(vec![0, 1, 2, 3, 4, 5])
+        );
     }
 
     #[test]

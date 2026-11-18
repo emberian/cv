@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- `cv dataset --unit cycle` emits one record per human turn: prior report, prompt, next plan, tool spans, commit flag, queued and proof.
+- Claude queued mid-turn messages without rendered text are read as injected turns; `--active-branch` continues through parents cv does not keep.
 - CLI, API, and reader overviews collect initial and recent requests, worker replies, referenced files, and commands with links to their messages.
 - Pack accepts explicit sessions or transcript paths, with bounded overviews or task-focused excerpts, without searching other conversations or requiring an index.
 - Show recorded context usage, cache tokens, and compaction boundaries with `show --kind context` and the shared read API.

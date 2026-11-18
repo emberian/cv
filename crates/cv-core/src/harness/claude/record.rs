@@ -30,6 +30,7 @@ const TOP: &[&str] = &[
     "scheduledTaskId",
     "scheduledFireId",
     "turnOrigin",
+    "promptSource",
     "origin",
     "toolUseResult",
     "error",
@@ -867,33 +868,54 @@ impl<'a> Record<'a, '_> {
     /// see its text. `origin` is [`Origin::Hook`] for `hook_*` attachments (a user-configured
     /// hook's stdout) and [`Origin::Harness`] otherwise. The attachment kind always rides in
     /// `extra["claude"]["attachment_type"]`; the full `attachment` object only under rich demand.
+    ///
+    /// A `queued_command` (a message the person typed while the agent was mid-turn) is delivered
+    /// to the model even when the record keeps no `rendered[]` (Claude Code before ~2.1.23x): its
+    /// `attachment.prompt` is then the text, and its `commandMode` (`prompt` or
+    /// `task-notification`) and `origin` ride in the bag at every tier, so a reader can tell the
+    /// person's mid-turn words from a queued notification without rich demand.
     fn attachment(&self) -> Result<Option<Message>> {
-        let Some(rendered) = self.top.get("rendered").map(|v| v.array()).transpose()?.flatten() else {
-            return Ok(None);
-        };
         let Some(attachment) = self.top.get("attachment").filter(|v| v.is_object().unwrap_or(false)) else {
             return Ok(None);
         };
-        let mut blocks = Vec::new();
-        for item in rendered {
-            let item = item?;
-            let text = match item.get("content")? {
-                Some(content) => content.lazy_text(self.opts.spans)?,
-                None => None,
-            };
-            if let Some(text) = text {
-                blocks.push(Block::Text { text });
-            }
-        }
-        if blocks.is_empty() {
-            return Ok(None);
-        }
         let att_type = attachment
             .get("type")?
             .filter(|v| v.may_be_string())
             .map(|v| v.resolve().map(|v| v.as_str().unwrap_or_default().to_owned()))
             .transpose()?
             .unwrap_or_else(|| "attachment".into());
+        let queued = att_type == "queued_command";
+        let mut blocks = Vec::new();
+        if let Some(rendered) = self.top.get("rendered").map(|v| v.array()).transpose()?.flatten() {
+            for item in rendered {
+                let item = item?;
+                let text = match item.get("content")? {
+                    Some(content) => content.lazy_text(self.opts.spans)?,
+                    None => None,
+                };
+                if let Some(text) = text {
+                    blocks.push(Block::Text { text });
+                }
+            }
+        }
+        if blocks.is_empty() && queued {
+            if let Some(prompt) = attachment.get("prompt")? {
+                if prompt.may_be_string() {
+                    if let Some(text) = prompt.lazy_text(self.opts.spans)? {
+                        blocks.push(Block::Text { text });
+                    }
+                } else if let Some(items) = prompt.array()? {
+                    for item in items {
+                        if let Some(block) = block(item?, self.opts.spans)? {
+                            blocks.push(block);
+                        }
+                    }
+                }
+            }
+        }
+        if blocks.is_empty() {
+            return Ok(None);
+        }
         let mut m = if self.opts.tier == Tier::Complete {
             self.carrier()?
         } else {
@@ -923,6 +945,13 @@ impl<'a> Record<'a, '_> {
         }
         let bag = m.harness_extra_mut(Harness::Claude);
         bag.insert("attachment_type".into(), Value::String(att_type));
+        if queued && self.opts.tier < Tier::Rich {
+            for key in ["commandMode", "origin"] {
+                if let Some(val) = attachment.get(key)? {
+                    bag.insert(key.into(), val.resolve()?.into_owned());
+                }
+            }
+        }
         for (key, val) in rich {
             bag.insert(key.into(), val);
         }
@@ -1232,6 +1261,24 @@ impl<'a> Record<'a, '_> {
         // correlation fact prevents counting the tool invocation and its injected body twice.
         if let Some(id) = self.top.string("sourceToolUseID")? {
             bag.insert("sourceToolUseID".into(), Value::String(id));
+        }
+        // Who typed a person-side turn, as the record states it: `promptSource` (`typed`,
+        // `queued`, `suggestion_accepted`, `system`), `turnOrigin`, `origin.kind`. Kept at every
+        // tier so a reader can grade how strongly a prompt is attested (older records lack them).
+        if role == Role::User && !matches!(tier, Tier::Facts | Tier::Usage) {
+            for key in ["promptSource", "turnOrigin"] {
+                if let Some(val) = self.top.string(key)? {
+                    bag.insert(key.into(), Value::String(val));
+                }
+            }
+            if let Some(kind) = self.top.get("origin").map(|o| o.get("kind")).transpose()?.flatten() {
+                if kind.may_be_string() {
+                    bag.insert(
+                        "origin".into(),
+                        serde_json::json!({ "kind": kind.resolve()?.into_owned() }),
+                    );
+                }
+            }
         }
         if matches!(tier, Tier::Usage | Tier::Facts) {
             if let Some(original) = self.value("_cv_orig_ctx")?.filter(|v| v.is_number()) {

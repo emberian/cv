@@ -714,6 +714,7 @@ pub(crate) struct DatasetArgs<'a> {
     pub redact_only: Option<String>,
     pub active_branch: bool,
     pub clean_outcome: bool,
+    pub cycles: bool,
     pub file: Option<PathBuf>,
     pub force: bool,
 }
@@ -730,6 +731,7 @@ pub(crate) fn cmd_dataset(args: DatasetArgs<'_>) -> Result<()> {
         redact_only,
         active_branch,
         clean_outcome,
+        cycles,
         file,
         force,
     } = args;
@@ -790,6 +792,7 @@ pub(crate) fn cmd_dataset(args: DatasetArgs<'_>) -> Result<()> {
         fmt,
         redact_opts: redact_opts.as_ref(),
         dataset_opts: &dataset_opts,
+        cycles,
         min_messages,
         limit,
         emitted: &mut emitted,
@@ -837,6 +840,7 @@ pub(crate) fn cmd_dataset(args: DatasetArgs<'_>) -> Result<()> {
     }
     let dest = out.as_ref().map(|p| format!(" to {}", p.display())).unwrap_or_default();
     let forest = if subagents { " (incl. sub-agent forest)" } else { "" };
+    let format = if cycles { "cycle" } else { format };
     eprintln!("✦ {format}: wrote {emitted} record(s){dest}{forest} ({skipped} skipped)");
     Ok(())
 }
@@ -891,6 +895,8 @@ struct EmitCtx<'a> {
     fmt: cv_core::dataset::Format,
     redact_opts: Option<&'a cv_core::redact::RedactOptions>,
     dataset_opts: &'a cv_core::dataset::DatasetOptions,
+    /// `--unit cycle`: stage one record per human-turn cycle instead of one per session.
+    cycles: bool,
     min_messages: usize,
     limit: Option<usize>,
     emitted: &'a mut usize,
@@ -914,16 +920,30 @@ impl EmitCtx<'_> {
         let Some(adapter) = cv_core::harness::for_harness(r.harness) else {
             return Ok(DatasetFlow::Continue);
         };
-        let record = match cv_core::dataset::stage_record_with_options(
-            adapter.as_ref(),
-            r,
-            self.fmt,
-            self.redact_opts,
-            self.min_messages,
-            self.query,
-            self.text_sets,
-            self.dataset_opts,
-        ) {
+        let staged = if self.cycles {
+            cv_core::dataset::cycles::stage_cycles(
+                adapter.as_ref(),
+                r,
+                self.redact_opts,
+                self.min_messages,
+                self.query,
+                self.text_sets,
+                self.dataset_opts,
+            )
+        } else {
+            cv_core::dataset::stage_record_with_options(
+                adapter.as_ref(),
+                r,
+                self.fmt,
+                self.redact_opts,
+                self.min_messages,
+                self.query,
+                self.text_sets,
+                self.dataset_opts,
+            )
+            .map(|record| record.map(|record| (record, 1)))
+        };
+        let record = match staged {
             Ok(record) => record,
             Err(error) if error.is::<cv_core::dataset::InputError>() => {
                 eprintln!("cv dataset: skipping {} ({}): {error:#}", r.id, r.harness);
@@ -931,9 +951,9 @@ impl EmitCtx<'_> {
             }
             Err(error) => return Err(error),
         };
-        if let Some(record) = record {
+        if let Some((record, records)) = record {
             record.publish(self.writer)?;
-            *self.emitted += 1;
+            *self.emitted += records;
             if self.limit.is_some_and(|l| *self.emitted >= l) {
                 return Ok(DatasetFlow::LimitHit);
             }
