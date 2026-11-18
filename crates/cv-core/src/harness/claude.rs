@@ -13,6 +13,7 @@ use crate::source::{Dependencies, Probe};
 /// `cv adopt`: move a sub-agent stranded by a dead session into a live one — Claude-only byte
 /// surgery on this store's layout, so it lives beside the adapter that knows it.
 pub mod adopt;
+mod chain;
 pub(crate) mod emit;
 mod fork;
 mod hook;
@@ -470,6 +471,12 @@ impl Adapter for Claude {
             .is_some_and(|n| n.starts_with("agent-"))
         {
             deps.files.push(r.path.with_extension("meta.json"));
+            // A segment split off by a resume is read with the ones it continues ([`chain`]).
+            let before = chain::before(&r.path);
+            if let Some(root) = before.first() {
+                deps.files.push(root.with_extension("meta.json"));
+            }
+            deps.files.extend(before);
         }
         // Claude Code writes each spilled output once, before the record naming it: a new file
         // there is a later record's, never a change to what a read of the transcript so far saw.
@@ -539,7 +546,9 @@ impl Adapter for Claude {
 
     /// A checkpoint keeps the session accumulated so far (the spawn tracker holds nothing at a
     /// line boundary: Claude's spawns all return later, as their own records). A prefix read is
-    /// the session as it was, without the other files a fork source is found in.
+    /// the session as it was, without the other files a fork source is found in. An agent split
+    /// off by a resume reads the segments it continues first ([`chain`]), unless the read maps its
+    /// messages to this file's bytes (offsets).
     fn transcript(
         &self,
         r: &SessionRef,
@@ -548,16 +557,27 @@ impl Adapter for Claude {
         sink: &mut dyn MessageSink,
     ) -> Result<Option<Session>> {
         crate::stream::checked(sink, |sink| {
-            let session = match from {
-                Start::Checkpoint(cp) => match jsonl::restore(cp) {
-                    Some(session) => session,
-                    None => return Ok(None),
+            // A read whose offsets map messages to this file's bytes (rewind) reads it alone.
+            let before = if opts.offsets {
+                Vec::new()
+            } else {
+                chain::before(&r.path)
+            };
+            let mut session = match from {
+                // A mark taken before the segments were joined resumes no joined read.
+                Start::Checkpoint(cp) => match jsonl::restore::<Session>(cp) {
+                    Some(session) if before.is_empty() || session.lineage.continues.is_some() => session,
+                    _ => return Ok(None),
                 },
                 _ => new_session_for(&r.id, Some(r.path.clone()), opts),
             };
+            let mut spawns = crate::affordance::AffordanceSink::new(Harness::Claude, sink);
+            let fresh = !matches!(from, Start::Checkpoint(_));
+            if fresh && join(&mut session, &before, opts, &mut spawns)? == Flow::Stop {
+                return Ok(Some(session));
+            }
             let read = jsonl::Read::open(&r.path)?;
             let codec = Transcript { session, opts };
-            let mut spawns = crate::affordance::AffordanceSink::new(Harness::Claude, sink);
             let Some(s) = jsonl::drive(&read, from, codec, &mut spawns)? else {
                 return Ok(None);
             };
@@ -577,6 +597,33 @@ impl Adapter for Claude {
     fn copied_before(&self, r: &SessionRef, sink: &mut dyn MessageSink) -> Option<chrono::DateTime<chrono::Utc>> {
         fork::copied_before(&r.path, sink)
     }
+}
+
+/// The segments an agent transcript continues ([`chain::before`]), read into `session` oldest
+/// first: the turns before the resume that split it, and the meta its spawn wrote. Their records
+/// carry no offsets, which name places in the file read, not in these.
+fn join(session: &mut Session, before: &[PathBuf], opts: &Demand, sink: &mut dyn MessageSink) -> Result<Flow> {
+    let Some(root) = before.first() else {
+        return Ok(Flow::Continue);
+    };
+    session.lineage.continues = before.last().and_then(|p| chain::session_of(p));
+    if opts.tier != Tier::Usage && session.lineage.spawned_by_tool_use.is_none() {
+        apply_meta(session, &root.with_extension("meta.json"));
+    }
+    for segment in before {
+        sink.dependency(segment);
+        let mut flow = Flow::Continue;
+        jsonl::Read::open(segment)?.lines(0, |line| {
+            if let Some(view) = line.view {
+                flow = record::record(session, view, None, opts, sink)?;
+            }
+            Ok(flow)
+        })?;
+        if flow == Flow::Stop {
+            return Ok(flow);
+        }
+    }
+    Ok(Flow::Continue)
 }
 
 /// A `--fork-session` copy names no source; the records it shares with one do ([`fork`]). Runs
@@ -709,8 +756,17 @@ fn apply_subagent_lineage(s: &mut Session, path: &std::path::Path, rich: bool) {
     if !rich {
         return;
     }
-    let (agent_type, description, tool_use_id) = read_meta(&path.with_extension("meta.json")).unwrap_or_else(|error| {
-        crate::env::warn_once("agent metadata", format!("{}: {error:#}", path.display()));
+    apply_meta(s, &path.with_extension("meta.json"));
+    if let Some(run) = workflow_run {
+        s.harness_extra_mut(Harness::Claude)
+            .insert("workflow_run".into(), Value::String(run));
+    }
+}
+
+/// The spawning call, agent type and description an `agent-<id>.meta.json` names.
+fn apply_meta(s: &mut Session, meta: &Path) {
+    let (agent_type, description, tool_use_id) = read_meta(meta).unwrap_or_else(|error| {
+        crate::env::warn_once("agent metadata", format!("{}: {error:#}", meta.display()));
         Default::default()
     });
     s.lineage.spawned_by_tool_use = tool_use_id;
@@ -720,9 +776,6 @@ fn apply_subagent_lineage(s: &mut Session, path: &std::path::Path, rich: bool) {
     }
     if let Some(d) = description {
         bag.insert("agent_description".into(), Value::String(d));
-    }
-    if let Some(run) = workflow_run {
-        bag.insert("workflow_run".into(), Value::String(run));
     }
 }
 
@@ -877,10 +930,12 @@ fn subagent_forest(
     };
 
     let mut out: Vec<AgentRef> = Vec::new();
+    // An agent a resume moved to another session is read where it continued ([`chain`]).
+    let beside = chain::Beside::of(parent_path);
 
     // Tier 1: directly-spawned sub-agents at `subagents/agent-*.jsonl`.
     if workflow.is_none() {
-        out.extend(agents_in_dir(&base, None, demand, select)?);
+        out.extend(agents_in_dir(&base, None, &beside, demand, select)?);
     }
 
     // Tier 2: workflow sub-agents at `subagents/workflows/<wf>/agent-*.jsonl`, grouped by run id,
@@ -895,7 +950,7 @@ fn subagent_forest(
             .collect();
         let groups = crate::par_flat_map(wf_dirs, |wf_dir| {
             let run_id = wf_dir.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
-            vec![agents_in_dir(&wf_dir, Some(&run_id), demand, select)]
+            vec![agents_in_dir(&wf_dir, Some(&run_id), &beside, demand, select)]
         });
         for group in groups {
             out.extend(group?);
@@ -924,10 +979,12 @@ fn record_forest_read(kind: &'static str, path: &Path) {
 
 /// Scan one directory for `agent-*.jsonl` transcripts, pairing each with its `*.meta.json` sidecar
 /// and (for workflow dirs) the journaled result for its agentId. `wf` is `Some(run_id)`
-/// for a workflow dir, `None` for the top-level `subagents/` dir.
+/// for a workflow dir, `None` for the top-level `subagents/` dir. An agent that continued under
+/// another session ([`chain::Beside::tip`]) is that newest segment, read whole, under its spawn's meta.
 fn agents_in_dir(
     dir: &Path,
     wf: Option<&str>,
+    beside: &chain::Beside,
     demand: crate::SubagentDemand,
     select: &(impl Fn(&str, Option<&str>) -> bool + Sync),
 ) -> Result<Vec<AgentRef>> {
@@ -961,6 +1018,7 @@ fn agents_in_dir(
     };
     crate::par_discovery_filter_map(paths, |p| {
         Some((|| -> Result<Option<AgentRef>> {
+            let p = beside.tip(&p);
             #[cfg(test)]
             record_forest_read("transcript", &p);
             // Every demand reads the agent's metadata through the per-file scan cache: a Rich
@@ -973,8 +1031,8 @@ fn agents_in_dir(
                 None => return Ok(None),
             };
             let meta = match demand {
-                crate::SubagentDemand::Rich => read_meta(&p.with_extension("meta.json"))?,
-                crate::SubagentDemand::Tools => (read_agent_type(&p.with_extension("meta.json"))?, None, None),
+                crate::SubagentDemand::Rich => read_meta(&chain::meta(&p))?,
+                crate::SubagentDemand::Tools => (read_agent_type(&chain::meta(&p))?, None, None),
                 crate::SubagentDemand::Sessions => (None, None, None),
             };
             let agent_id = session.id.strip_prefix("agent-").unwrap_or(&session.id).to_string();
@@ -1236,13 +1294,17 @@ pub fn task_notices(parent_path: &std::path::Path) -> Result<std::collections::H
 /// result, `Err` with the reason a scan failed.
 fn cached_metadata(path: &Path) -> Result<Option<SessionRef>> {
     crate::discover_cache::cached_scan_continued(path, metadata::LAYER, |from| {
-        let (reference, checkpoint) = scan_at(path, from)?;
+        let (reference, checkpoint, before) = scan_at(path, from)?;
         let continuation = checkpoint.and_then(|checkpoint| {
             let head = crate::resume::MarkHead::of(path, &checkpoint, metadata::LAYER)?;
+            let mut dependencies = crate::source::ReadSet::default();
+            for segment in &before {
+                dependencies.record(segment);
+            }
             Some(crate::discover_cache::ScanContinuation {
                 head,
                 checkpoint,
-                dependencies: Default::default(),
+                dependencies,
             })
         });
         Ok((Some(reference), continuation))
@@ -1254,7 +1316,8 @@ fn scan(path: &Path) -> Result<SessionRef> {
     Ok(scan_at(path, None)?.0)
 }
 
-fn scan_at(path: &Path, from: Option<&Checkpoint>) -> Result<(SessionRef, Option<Checkpoint>)> {
+/// The scan from `from`, and the segments a fresh one read first ([`chain::before`]).
+fn scan_at(path: &Path, from: Option<&Checkpoint>) -> Result<(SessionRef, Option<Checkpoint>, Vec<PathBuf>)> {
     let read = jsonl::Read::open(path)?;
     let source = read.source();
     let (mut scan, offset) = metadata::Scan::restore(path, from);
@@ -1263,11 +1326,16 @@ fn scan_at(path: &Path, from: Option<&Checkpoint>) -> Result<(SessionRef, Option
     metadata::FRAMED.with(|frames| frames.borrow_mut().push((offset, source.len() - offset)));
     #[cfg(test)]
     record_forest_read("scan", path);
+    // A fresh scan of an agent split off by a resume counts the segments it continues first.
+    let before = if offset == 0 { chain::before(path) } else { Vec::new() };
+    for segment in &before {
+        scan.read(&jsonl::Read::open(segment)?, 0)?;
+    }
     scan.read(&read, offset)?;
     let checkpoint = scan.checkpoint();
     let (session, writer_version) = scan.finish();
     crate::discover_cache::read::Context::current().observe_writer(&session, writer_version.as_deref());
-    Ok((session, checkpoint))
+    Ok((session, checkpoint, before))
 }
 
 /// The classification shared by owned and borrowed records. Content storage never chooses kind.

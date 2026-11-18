@@ -332,3 +332,236 @@ fn tools_cross_agent_queries() {
     assert!(tl.contains("tool call(s) (chronological)"), "{tl}");
     assert!(tl.contains("orch") && tl.contains("aBUILD"), "agents tagged:\n{tl}");
 }
+
+/// A background agent outlives an in-place `/resume`: its next records go to the resumed session's
+/// `subagents/`, starting from the parent of the last record in the first session's copy, with no
+/// meta beside them. The spawn, the meta and the earlier turns stay under the first session; the
+/// resumed transcript holds none of its tool calls, a resent prompt (two prompts on one parent),
+/// and the agent's notification naming the first session's tool call.
+fn split_by_resume(tag: &str) -> World {
+    use cv_testkit::claude::with;
+    let w = World::new(tag);
+    let (first, resumed, agent, spawn) = ("sess-first", "sess-resumed", "a5f1170c0de000001", "toolu_spawn");
+    let rec = |base: serde_json::Value, sid: &str, uuid: &str, parent: Option<&str>| {
+        with(
+            base,
+            serde_json::json!({"sessionId": sid, "uuid": uuid, "parentUuid": parent}),
+        )
+    };
+    let side = |r: serde_json::Value| with(r, serde_json::json!({"isSidechain": true, "agentId": agent}));
+    let user = |sid: &str, uuid: &str, parent: Option<&str>, ts: &str, content: serde_json::Value| {
+        rec(
+            serde_json::json!({"type": "user", "timestamp": ts, "cwd": "/work/proj",
+                "message": {"role": "user", "content": content}}),
+            sid,
+            uuid,
+            parent,
+        )
+    };
+    let said = |sid: &str, uuid: &str, parent: &str, ts: &str, blocks: serde_json::Value| {
+        rec(assistant_tools(uuid, ts, blocks), sid, uuid, Some(parent))
+    };
+    let text = |t: &str| serde_json::json!([{"type": "text", "text": t}]);
+    let result = |id: &str, out: &str| serde_json::json!([{"type": "tool_result", "tool_use_id": id, "content": out}]);
+    let note = format!(
+        "<task-notification>\n<task-id>{agent}</task-id>\n<tool-use-id>{spawn}</tool-use-id>\n<status>completed</status>\n<summary>Agent \"survey the rivers\" completed</summary>\n</task-notification>"
+    );
+
+    w.write_session(
+        first,
+        &[
+            user(first, "o-u1", None, "2026-01-02T10:00:00Z", "start the survey".into()),
+            said(
+                first,
+                "o-a1",
+                "o-u1",
+                "2026-01-02T10:00:01Z",
+                serde_json::json!([tool_use(
+                    spawn,
+                    "Agent",
+                    serde_json::json!({"description": "survey the rivers", "prompt": "count the rivers",
+                        "subagent_type": "general-purpose", "run_in_background": true})
+                )]),
+            ),
+            user(
+                first,
+                "o-r1",
+                Some("o-a1"),
+                "2026-01-02T10:00:02Z",
+                result(spawn, &format!("Async agent launched successfully.\nagentId: {agent}")),
+            ),
+            said(
+                first,
+                "o-a2",
+                "o-r1",
+                "2026-01-02T10:00:03Z",
+                text("launched the survey"),
+            ),
+            serde_json::json!({"type": "last-prompt", "leafUuid": "o-a2", "sessionId": first}),
+        ],
+    );
+    w.write_agent(
+        first,
+        agent,
+        &serde_json::json!({"agentType": "general-purpose", "description": "survey the rivers",
+            "toolUseId": spawn, "spawnDepth": 1}),
+        &[
+            side(user(
+                first,
+                "x-u1",
+                None,
+                "2026-01-02T10:00:02Z",
+                "count the rivers".into(),
+            )),
+            side(said(
+                first,
+                "x-a1",
+                "x-u1",
+                "2026-01-02T10:00:04Z",
+                serde_json::json!([tool_use(
+                    "toolu_x1",
+                    "Bash",
+                    serde_json::json!({"command": "ls rivers"})
+                )]),
+            )),
+            side(user(
+                first,
+                "x-r1",
+                Some("x-a1"),
+                "2026-01-02T10:00:05Z",
+                result("toolu_x1", "ochrebank"),
+            )),
+            side(said(
+                first,
+                "x-a2",
+                "x-r1",
+                "2026-01-02T10:00:06Z",
+                serde_json::json!([{"type": "text", "text": "the first river is ochrebank"},
+                    tool_use("toolu_x2", "Bash", serde_json::json!({"command": "wc rivers"}))]),
+            )),
+            serde_json::json!({"type": "api-request", "sessionId": first, "timestamp": "2026-01-02T10:00:06Z"}),
+        ],
+    );
+
+    w.write_session(
+        resumed,
+        &[
+            user(
+                resumed,
+                "n-u1",
+                None,
+                "2026-01-02T10:01:00Z",
+                "here is where we were".into(),
+            ),
+            said(resumed, "n-a1", "n-u1", "2026-01-02T10:01:01Z", text("understood")),
+            user(
+                resumed,
+                "n-u2",
+                Some("n-a1"),
+                "2026-01-02T10:01:02Z",
+                "first try".into(),
+            ),
+            serde_json::json!({"type": "last-prompt", "leafUuid": "n-u2", "sessionId": resumed}),
+            user(
+                resumed,
+                "n-u2b",
+                Some("n-a1"),
+                "2026-01-02T10:01:05Z",
+                "second try".into(),
+            ),
+            said(
+                resumed,
+                "n-a2",
+                "n-u2b",
+                "2026-01-02T10:01:06Z",
+                text("answering the second try"),
+            ),
+            serde_json::json!({"type": "queue-operation", "operation": "enqueue", "sessionId": resumed,
+                "timestamp": "2026-01-02T10:02:00Z", "content": note}),
+            serde_json::json!({"type": "queue-operation", "operation": "remove", "sessionId": resumed,
+                "timestamp": "2026-01-02T10:02:00Z", "content": note}),
+            rec(
+                serde_json::json!({"type": "attachment", "timestamp": "2026-01-02T10:02:00Z",
+                    "attachment": {"type": "queued_command", "prompt": note, "commandMode": "task-notification"},
+                    "rendered": [{"content": note}], "renderedInHumanTurn": true}),
+                resumed,
+                "n-q1",
+                Some("n-a2"),
+            ),
+            said(
+                resumed,
+                "n-a3",
+                "n-q1",
+                "2026-01-02T10:02:01Z",
+                text("the survey came back"),
+            ),
+            serde_json::json!({"type": "last-prompt", "leafUuid": "n-a3", "sessionId": resumed}),
+        ],
+    );
+    let tail = [
+        side(rec(
+            serde_json::json!({"type": "attachment", "timestamp": "2026-01-02T10:01:10Z",
+                "attachment": {"type": "hook_success", "hookName": "PostToolUse", "hookEvent": "PostToolUse", "content": ""}}),
+            resumed,
+            "y-h1",
+            Some("x-a2"),
+        )),
+        side(user(
+            resumed,
+            "y-r2",
+            Some("x-a2"),
+            "2026-01-02T10:01:11Z",
+            result("toolu_x2", "2 rivers"),
+        )),
+        side(said(
+            resumed,
+            "y-a3",
+            "y-r2",
+            "2026-01-02T10:01:59Z",
+            text("two rivers: ochrebank and viridianford"),
+        )),
+    ];
+    let dir = w.proj.join(resumed).join("subagents");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join(format!("agent-{agent}.jsonl")), jsonl(&tail)).unwrap();
+    w
+}
+
+#[test]
+fn an_agent_split_by_a_resume_reads_whole_from_either_session() {
+    let w = split_by_resume("resume-split");
+    let ids = |out: &str| -> Vec<String> {
+        let v: serde_json::Value = serde_json::from_str(out).unwrap();
+        v["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|m| m["id"].as_str().map(str::to_owned))
+            .collect()
+    };
+    let whole = ["x-u1", "x-a1", "x-r1", "x-a2", "y-r2", "y-a3"];
+
+    // By its id, from the session that spawned it, and from the one it continued in: one agent,
+    // its spawn's call and meta, and where it continues from.
+    for args in [
+        vec!["show", "agent-a5f1170c0de000001", "--json"],
+        vec!["show", "sess-first", "--agent", "a5f1170c0de000001", "--json"],
+        vec!["show", "sess-resumed", "--agent", "a5f1170c0de000001", "--json"],
+    ] {
+        let (out, _) = w.cv_ok(&args);
+        assert_eq!(ids(&out), whole, "{args:?}");
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["lineage"]["continues"], "sess-first", "{args:?}");
+        assert_eq!(v["lineage"]["spawned_by_tool_use"], "toolu_spawn", "{args:?}");
+        assert_eq!(v["extra"]["claude"]["agent_type"], "general-purpose", "{args:?}");
+    }
+
+    // Each session's forest lists it under its spawn's description, ending where it ended.
+    for sid in ["sess-first", "sess-resumed"] {
+        let (subs, _) = w.cv_ok(&["show", sid, "--subagents"]);
+        assert!(subs.contains("survey the rivers"), "{sid}:\n{subs}");
+        assert!(subs.contains("viridianford"), "{sid}:\n{subs}");
+        let (lanes, _) = w.cv_ok(&["lanes", sid]);
+        assert!(lanes.contains("1 completed"), "{sid}:\n{lanes}");
+    }
+}

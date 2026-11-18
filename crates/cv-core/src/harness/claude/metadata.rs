@@ -10,7 +10,7 @@ thread_local! { pub(super) static FRAMED: std::cell::RefCell<Vec<(u64,u64)>> = c
 
 /// The continuation's checkpoint layer, and with the scan cache's interpretation (the one
 /// stored-format version, [`crate::source::VERSION`]) its whole version: not the cv release.
-pub(super) const LAYER: &str = "claude.discovery.v2";
+pub(super) const LAYER: &str = "claude.discovery.v3";
 
 #[derive(Clone, Serialize, Deserialize)]
 struct State {
@@ -261,14 +261,14 @@ mod tests {
         for (tail, appended) in tails {
             let old = format!("{prefix}{tail}");
             fs::write(&path, &old).unwrap();
-            let (before, cp) = scan_at(&path, None).unwrap();
+            let (before, cp, _) = scan_at(&path, None).unwrap();
             assert_eq!(reading(before), frozen(old.as_bytes()));
             let cp = cp.unwrap();
             assert_eq!(cp.offset, prefix.len() as u64);
             let grown = format!("{old}{appended}");
             fs::write(&path, &grown).unwrap();
             FRAMED.with(|frames| frames.borrow_mut().clear());
-            let (resumed, next) = scan_at(&path, Some(&cp)).unwrap();
+            let (resumed, next, _) = scan_at(&path, Some(&cp)).unwrap();
             assert_eq!(reading(resumed), frozen(grown.as_bytes()));
             assert_eq!(
                 FRAMED.with(|frames| frames.borrow().clone()),

@@ -158,7 +158,7 @@ fn modified(path: &Path) -> Option<DateTime<Utc>> {
 
 /// Whether `path` holds `needle` anywhere, over bounded windows that keep the needle's length
 /// minus one byte between reads.
-fn holds(path: &Path, needle: &str) -> bool {
+pub(super) fn holds(path: &Path, needle: &str) -> bool {
     let Ok(file) = fs::File::open(path) else {
         return false;
     };
