@@ -42,18 +42,32 @@ fn str_at<'v>(v: Option<&'v serde_json::Value>, path: &[&str]) -> Option<&'v str
     v.as_str()
 }
 
-/// Prompt prefixes that are shell passthrough, not a message to the agent.
-const SHELL_PASSTHROUGH: [&str; 3] = ["<bash-input>", "<bash-stdout>", "<bash-stderr>"];
+/// Prompt heads that are not a message the person wrote to the agent: shell passthrough, and
+/// harness wrappers older Claude Code records leave attributed to the person (a slash command
+/// whose record opens with `<command-message>`, a task notification with no `origin`).
+const NOT_TYPED: [&str; 10] = [
+    "<bash-input>",
+    "<bash-stdout>",
+    "<bash-stderr>",
+    "<command-name>",
+    "<command-message>",
+    "<command-args>",
+    "<local-command-stdout>",
+    "<local-command-stderr>",
+    "<local-command-caveat>",
+    "<task-notification>",
+];
 
 /// A turn relayed from another agent by a coordinator carries a `[from <seat>]` mark.
 fn is_relayed(text: &Option<String>) -> bool {
     text.as_deref().is_some_and(|t| t.trim_start().starts_with("[from "))
 }
 
-/// Whether a prompt's text is typed for the agent (not shell passthrough).
+/// Whether a prompt's text is typed for the agent: not empty, not shell passthrough, not a harness
+/// wrapper.
 pub fn is_typed_prompt_text(text: &str) -> bool {
     let t = text.trim_start();
-    !SHELL_PASSTHROUGH.iter().any(|p| t.starts_with(p))
+    !t.is_empty() && !NOT_TYPED.iter().any(|p| t.starts_with(p))
 }
 
 /// The shell command line a tool call carries, when it is one: Claude `Bash` `command`, Codex
@@ -614,6 +628,22 @@ mod tests {
         assert_eq!(cycles[1]["proof"], "adapter");
         assert_eq!(cycles[1]["relayed"], true);
         assert_eq!(cycles[0]["relayed"], false);
+    }
+
+    #[test]
+    fn harness_wrappers_attributed_to_the_person_are_no_turn() {
+        let mut s = session();
+        for (id, t) in [
+            (
+                "c1",
+                "<command-message>goal</command-message>\n<command-name>/goal</command-name>",
+            ),
+            ("n1", "<task-notification>\n<task-id>x</task-id>\n</task-notification>"),
+            ("e1", "  "),
+        ] {
+            s.push(msg(id, MessageKind::Prompt, vec![text(t)]));
+        }
+        assert_eq!(cut(&s, None).len(), 2);
     }
 
     #[test]
