@@ -137,6 +137,7 @@ pub(crate) fn verify(
         | Harness::Continue
         | Harness::Qwen
         | Harness::Cursor
+        | Harness::Pi
         | Harness::Goose
         | Harness::Zed
         | Harness::Devin

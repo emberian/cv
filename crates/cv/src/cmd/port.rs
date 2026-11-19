@@ -441,6 +441,7 @@ pub(crate) fn resume_target(h: Harness, id: &str) -> ResumeTarget {
             args: vec!["--resume".into(), id.into()],
         },
         Harness::LmStudio
+        | Harness::Pi
         | Harness::Roo
         | Harness::Zed
         | Harness::ChatGptExport

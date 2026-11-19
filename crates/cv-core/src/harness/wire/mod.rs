@@ -205,10 +205,194 @@ pub(crate) fn text_title(content: Option<crate::json::JsonView<'_>>) -> anyhow::
     Ok(title)
 }
 
+/// Pi's assistant envelope, also persisted by OpenClaw. Selection stays on the checked JSON view.
+pub(crate) const PI_ASSISTANT_FIELDS: &[&str] = &[
+    "api",
+    "provider",
+    "responseModel",
+    "responseId",
+    "stopReason",
+    "diagnostics",
+    "usage",
+    "errorMessage",
+    "errorCode",
+    "errorType",
+];
+
+/// An assistant API failure, shared by discovery's turn count and message classification.
+pub(crate) fn assistant_failed(body: &super::store::document::Fields<'_>) -> anyhow::Result<bool> {
+    Ok(body.string("errorMessage")?.is_some_and(|e| !e.is_empty())
+        || body.string("stopReason")?.as_deref() == Some("error"))
+}
+
+/// One assistant-envelope decoder, without sharing either store's navigation.
+/// OpenClaw retains its native fact keys and existing usage mapping; Pi retains its normalized
+/// keys and reasoning count. Both retain the complete raw usage, including future fields.
+pub(crate) fn pi_assistant_metadata(
+    m: &mut crate::ir::Message,
+    body: &super::store::document::Fields<'_>,
+    harness: crate::ir::Harness,
+) -> anyhow::Result<()> {
+    use crate::ir::{Harness, MessageKind, Origin, Usage};
+    let failed = assistant_failed(body)?;
+    let openclaw = harness == Harness::OpenClaw;
+    let stored = |native: &'static str, normalized: &'static str| {
+        if openclaw {
+            native
+        } else {
+            normalized
+        }
+    };
+    let usage = body.value("usage")?;
+    if let Some(usage) = &usage {
+        let get = |k: &str| usage.get(k).and_then(Value::as_u64);
+        let u = Usage {
+            input_tokens: get("input"),
+            output_tokens: get("output"),
+            cache_read_tokens: get("cacheRead"),
+            cache_creation_tokens: get("cacheWrite"),
+            reasoning_tokens: if openclaw { None } else { get("reasoning") },
+            cost_usd: usage.pointer("/cost/total").and_then(Value::as_f64),
+        };
+        m.usage = (!u.is_empty()).then_some(u);
+    }
+    let mut bag = serde_json::Map::new();
+    for (key, normalized) in [
+        ("api", "api"),
+        ("provider", "provider"),
+        ("responseModel", "response_model"),
+        ("responseId", "response_id"),
+        ("stopReason", "stop_reason"),
+        ("diagnostics", "diagnostics"),
+    ] {
+        if let Some(value) = body.value(key)?.filter(|v| !v.is_null()) {
+            bag.insert(stored(key, normalized).into(), value);
+        }
+    }
+    if let Some(usage) = usage {
+        bag.insert("usage_raw".into(), usage);
+    }
+    if failed {
+        let mut err = serde_json::Map::new();
+        for (key, normalized) in [
+            ("errorMessage", "error_message"),
+            ("errorCode", "error_code"),
+            ("errorType", "error_type"),
+        ] {
+            if let Some(value) = body.value(key)?.filter(|v| !v.is_null()) {
+                err.insert(stored(key, normalized).into(), value);
+            }
+        }
+        bag.insert("error".into(), Value::Object(err));
+        m.kind = MessageKind::Error;
+        m.origin = Origin::Harness;
+    }
+    if !bag.is_empty() {
+        m.harness_extra_mut(harness).extend(bag);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn assistant_metadata_preserves_each_harness_contract() -> anyhow::Result<()> {
+        use crate::harness::store::document::Fields;
+        use crate::ir::{Harness, Message, MessageKind, Origin, Role};
+        let body = json!({
+            "provider": "synthetic", "responseModel": "invented-model", "responseId": "invented-id",
+            "stopReason": "error", "errorMessage": "invented error", "errorCode": 400,
+            "errorType": null, "diagnostics": {"invented": true},
+            "usage": {"input": 0, "output": 3, "cacheRead": 0, "cacheWrite": 0,
+                "reasoning": 2, "cost": {"total": 0.0}, "future": {"invented": true}}
+        });
+        let fields = Fields::parse((&body).into(), PI_ASSISTANT_FIELDS)?.expect("object");
+        for harness in [Harness::OpenClaw, Harness::Pi] {
+            let mut message = Message::new(Role::Assistant);
+            pi_assistant_metadata(&mut message, &fields, harness)?;
+            assert!(assistant_failed(&fields)?);
+            assert_eq!(message.kind, MessageKind::Error);
+            assert_eq!(message.origin, Origin::Harness);
+            let usage = message.usage.as_ref().expect("present-zero usage");
+            assert_eq!(usage.input_tokens, Some(0));
+            assert_eq!(usage.cache_read_tokens, Some(0));
+            assert_eq!(usage.cost_usd, Some(0.0));
+            assert_eq!(
+                usage.reasoning_tokens,
+                if harness == Harness::Pi { Some(2) } else { None }
+            );
+            let bag = message.harness_extra(harness).expect("selected namespace");
+            assert_eq!(bag["usage_raw"], body["usage"]);
+            assert_eq!(bag["diagnostics"], body["diagnostics"]);
+            let (model, id, stop, error, code, absent) = if harness == Harness::OpenClaw {
+                (
+                    "responseModel",
+                    "responseId",
+                    "stopReason",
+                    "errorMessage",
+                    "errorCode",
+                    "response_model",
+                )
+            } else {
+                (
+                    "response_model",
+                    "response_id",
+                    "stop_reason",
+                    "error_message",
+                    "error_code",
+                    "responseModel",
+                )
+            };
+            assert_eq!(bag[model], body["responseModel"]);
+            assert_eq!(bag[id], body["responseId"]);
+            assert_eq!(bag[stop], body["stopReason"]);
+            assert_eq!(bag["error"][error], body["errorMessage"]);
+            assert_eq!(bag["error"][code], body["errorCode"]);
+            assert_eq!(bag["error"].as_object().expect("error object").len(), 2);
+            assert!(!bag.contains_key(absent));
+            assert_eq!(message.extra.len(), 1, "no facts in the other namespace");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn assistant_metadata_keeps_missing_zero_and_failure_poles_distinct() -> anyhow::Result<()> {
+        use crate::harness::store::document::Fields;
+        use crate::ir::{Harness, Message, Role};
+        for body in [json!({}), json!({"errorMessage": "", "stopReason": "stop"})] {
+            let fields = Fields::parse((&body).into(), PI_ASSISTANT_FIELDS)?.expect("object");
+            for harness in [Harness::OpenClaw, Harness::Pi] {
+                let mut message = Message::new(Role::Assistant);
+                pi_assistant_metadata(&mut message, &fields, harness)?;
+                assert!(!assistant_failed(&fields)?);
+                assert!(message.is_turn());
+                assert!(message.usage.is_none());
+            }
+        }
+        for body in [
+            json!({"errorMessage": "invented error"}),
+            json!({"stopReason": "error"}),
+        ] {
+            let fields = Fields::parse((&body).into(), PI_ASSISTANT_FIELDS)?.expect("object");
+            for harness in [Harness::OpenClaw, Harness::Pi] {
+                let mut message = Message::new(Role::Assistant);
+                pi_assistant_metadata(&mut message, &fields, harness)?;
+                assert!(assistant_failed(&fields)?);
+                assert!(!message.is_turn());
+            }
+        }
+        let body = json!({"usage": {"input": 0}});
+        let fields = Fields::parse((&body).into(), PI_ASSISTANT_FIELDS)?.expect("object");
+        for harness in [Harness::OpenClaw, Harness::Pi] {
+            let mut message = Message::new(Role::Assistant);
+            pi_assistant_metadata(&mut message, &fields, harness)?;
+            assert_eq!(message.usage.expect("zero is present").input_tokens, Some(0));
+        }
+        Ok(())
+    }
 
     #[test]
     fn joined_text_preserves_parts_singleton_spans_and_source_guards() -> anyhow::Result<()> {

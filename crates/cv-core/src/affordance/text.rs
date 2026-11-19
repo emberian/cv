@@ -279,6 +279,7 @@ pub(super) fn running_cell_summary(
         | Harness::Antigravity
         | Harness::Hermes
         | Harness::OpenClaw
+        | Harness::Pi
         | Harness::Cursor
         | Harness::Kimi
         | Harness::KimiCode

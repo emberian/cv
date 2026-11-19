@@ -1214,6 +1214,7 @@ mod imp {
             | Harness::OpenCode
             | Harness::Gemini
             | Harness::OpenClaw
+            | Harness::Pi
             | Harness::Cursor
             | Harness::Qwen
             | Harness::LmStudio
@@ -1318,6 +1319,7 @@ mod imp {
             | Harness::OpenCode
             | Harness::Gemini
             | Harness::OpenClaw
+            | Harness::Pi
             | Harness::Cursor
             | Harness::Qwen
             | Harness::LmStudio

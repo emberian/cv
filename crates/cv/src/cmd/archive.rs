@@ -561,7 +561,7 @@ fn is_legacy_entry_unchanged(
     prev: &ArchivedSessionEntry,
 ) -> bool {
     let (self_contained_file_kind, has_companions) = match r.harness {
-        Harness::Codex | Harness::Qwen | Harness::Continue | Harness::LmStudio | Harness::OpenSession => (true, false),
+        Harness::Codex | Harness::Qwen | Harness::Continue | Harness::LmStudio | Harness::Pi | Harness::OpenSession => (true, false),
         Harness::Claude
         | Harness::Antigravity
         | Harness::OpenCode

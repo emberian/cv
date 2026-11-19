@@ -104,6 +104,7 @@ fn reparse_with(
         Harness::Hermes => anyhow::bail!("re-parse for {target} not supported"),
         Harness::Cursor
         | Harness::Antigravity
+        | Harness::Pi
         | Harness::Goose
         | Harness::Zed
         | Harness::Devin
@@ -523,6 +524,7 @@ pub(crate) fn holds_fields(h: Harness) -> &'static [Field] {
         Harness::OpenSession => &[Principal],
         Harness::Cursor
         | Harness::Antigravity
+        | Harness::Pi
         | Harness::Kimi
         | Harness::KimiCode
         | Harness::Goose
@@ -625,6 +627,7 @@ pub(crate) fn write_rules(h: Harness) -> WriteRules {
         | Harness::Continue
         | Harness::Cursor
         | Harness::Antigravity
+        | Harness::Pi
         | Harness::Goose
         | Harness::Zed
         | Harness::Devin

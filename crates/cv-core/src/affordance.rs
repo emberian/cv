@@ -410,6 +410,7 @@ pub fn classify_tool_view(h: Harness, name: &str, input: JsonView<'_>) -> Result
         Harness::Claude
         | Harness::Grok
         | Harness::Gemini
+        | Harness::Pi
         | Harness::Cursor
         | Harness::LmStudio
         | Harness::Cline
@@ -507,6 +508,7 @@ pub fn spawn_returns(h: Harness, name: &str) -> Option<Returns> {
         Harness::Continue => one("Subagent", Returns::Result),
         Harness::Antigravity => one("invoke_subagent", Returns::Later),
         Harness::Gemini
+        | Harness::Pi
         | Harness::Cursor
         | Harness::KimiCode
         | Harness::Qwen

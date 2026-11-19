@@ -82,6 +82,7 @@ harnesses! {
     Antigravity => "antigravity",
     Hermes => "hermes",
     OpenClaw => "openclaw",
+    Pi => "pi",
     /// Cursor IDE (chat/composer history in `state.vscdb`).
     Cursor => "cursor",
     /// Kimi CLI (MoonshotAI), `~/.kimi` — the legacy store, frozen since the 2026-06 migration.
@@ -126,6 +127,7 @@ impl Harness {
             "antigravity" | "agy" | "antigravity-cli" | "antigravity-ide" => Harness::Antigravity,
             "hermes" | "hermes-agent" => Harness::Hermes,
             "openclaw" | "claw" => Harness::OpenClaw,
+            "pi" | "pi-coding-agent" => Harness::Pi,
             "cursor" => Harness::Cursor,
             "kimi" | "kimi-cli" => Harness::Kimi,
             "kimi-code" | "kimicode" | "kimi2" => Harness::KimiCode,
@@ -287,6 +289,7 @@ impl Harness {
             | Harness::Antigravity
             | Harness::Hermes
             | Harness::OpenClaw
+            | Harness::Pi
             | Harness::Cursor
             | Harness::Kimi
             | Harness::KimiCode

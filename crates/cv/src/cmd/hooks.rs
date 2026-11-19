@@ -300,6 +300,7 @@ fn host(h: Harness) -> Option<Host> {
         | Harness::Goose
         | Harness::Zed
         | Harness::Devin
+        | Harness::Pi
         | Harness::ChatGptExport
         | Harness::ClaudeExport
         | Harness::OpenSession => None,
@@ -1385,6 +1386,7 @@ fn selector(harness: Harness, id: &str) -> String {
         | Harness::Goose
         | Harness::Zed
         | Harness::Devin
+        | Harness::Pi
         | Harness::ChatGptExport
         | Harness::ClaudeExport
         | Harness::OpenSession => format!("{harness}:{}", short_id(id)),

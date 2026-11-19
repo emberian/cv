@@ -1,0 +1,35 @@
+# formats/pi.toml — the vocabulary cv's `pi` adapter is checked against (docs/INTERFACE-V2.md §7).
+# Lists only what the source cannot say: an item the adapter has a match arm for is `handled` by inference and is
+# not listed. generic = interpreted by a blanket rule; carried = verbatim under ParseOptions::complete only;
+# ignored = known and deliberately skipped; handled = interpreted, but not by a match arm.
+# tests/formats_manifest.rs holds it to the adapter source.
+
+harness = "pi"
+source_files = ["harness/pi.rs", "harness/pi/record.rs", "harness/wire/anthropic.rs", "harness/wire/mod.rs"]
+# Record FIELDS the parser names while copying the rest of an entry into extra[pi] —
+# first-class in the IR, so they are not vocabulary.
+ignore_literals = ["message"]
+store = [
+  "$PI_CODING_AGENT_DIR/sessions/*.jsonl",
+  "$HOME/.pi/agent/sessions/*.jsonl",
+  "an explicit pool RUNDIR's session/*.jsonl (with_roots)",
+]
+
+[upstream]
+repo = "pi-coding-agent (linuxbrew install; docs/session-format.md)"
+commit = "1.0.2"
+date = "2026-11-19"
+
+[types]
+"role.user" = { status = "generic", note = "" }
+"role.assistant" = { status = "generic", note = "" }
+"role.toolResult" = { status = "generic", note = "toolCallId/toolName/isError carried in extra[pi]" }
+"role.system" = { status = "generic", note = "the compaction checkpoint's systemMessage is a full object, carried in extra[pi]" }
+"block.text" = { status = "generic", note = "" }
+"block.thinking" = { status = "generic", note = "" }
+"block.toolCall" = { status = "generic", note = "arguments, not input" }
+"block.image" = { status = "generic", note = "" }
+"tree.parentId" = { status = "handled", note = "the projection walks the leaf's parent chain; the latest compaction's firstKeptEntryId bounds it" }
+"tree.leaf" = { status = "generic", note = "the last entry is the default leaf (Pi's own rule); no literal names it" }
+"context_edit" = { status = "ignored", note = "append-only context edits are not yet projected; the reader emits the tree as written" }
+"writer" = { status = "ignored", note = "the writer is not implemented; the reader is the first deliverable" }
