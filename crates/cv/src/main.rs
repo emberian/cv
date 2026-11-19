@@ -518,9 +518,27 @@ enum Cmd {
         #[arg(long = "drop-thinking")]
         drop_thinking: bool,
         /// Also copy the session's subagents/workflows dir under the new id (off by default; can be
-        /// hundreds of MB for big sessions). Resume doesn't need it — only cv's forest features do.
+        /// hundreds of MB for big sessions), verbatim. A resume in a new process doesn't need it —
+        /// cv's forest features do; for a session resumed in place, see --carry-agents.
         #[arg(long)]
         copy_resources: bool,
+        /// Carry the source's sub-agents into the new session, for a successor that the process
+        /// owning them resumes in place (`/resume <new-id>`): Claude Code loads a background agent
+        /// from the CURRENT session's `subagents/`, and without its files there the agent re-enters
+        /// on the parent's model as `general-purpose`, without its brief. `meta` (the bare flag)
+        /// copies each `agent-<id>.meta.json`: model and type survive. `=full` also copies each
+        /// `agent-<id>.jsonl` (`sessionId` restamped): brief and cache survive too. An agent that is
+        /// mid-turn keeps writing after the copy; what it writes then is not in it (unmeasured).
+        #[arg(
+            long,
+            value_name = "meta|full",
+            num_args = 0..=1,
+            require_equals = true,
+            default_missing_value = "meta",
+            value_parser = ["meta", "full"],
+            conflicts_with = "copy_resources"
+        )]
+        carry_agents: Option<String>,
         /// Preserve the original `usage` records byte-for-byte (opt out of revive). By default,
         /// prune corrects the recorded context size so a maxed-out session will resume: Claude
         /// Code's resume gate reads the last turn's stored `usage` (input+cache) as the current
@@ -616,6 +634,22 @@ enum Cmd {
         /// Restored Claude skills: keep all, drop all, or drop entries whose files changed or disappeared.
         #[arg(long = "skills", value_parser = ["keep", "drop", "drop-stale"], default_value = "keep")]
         skills: String,
+        /// Carry the source's sub-agents into the new session, for a successor that the process
+        /// owning them resumes in place (`/resume <new-id>`): Claude Code loads a background agent
+        /// from the CURRENT session's `subagents/`, and without its files there the agent re-enters
+        /// on the parent's model as `general-purpose`, without its brief. `meta` (the bare flag)
+        /// copies each `agent-<id>.meta.json`: model and type survive. `=full` also copies each
+        /// `agent-<id>.jsonl` (`sessionId` restamped): brief and cache survive too. An agent that is
+        /// mid-turn keeps writing after the copy; what it writes then is not in it (unmeasured).
+        #[arg(
+            long,
+            value_name = "meta|full",
+            num_args = 0..=1,
+            require_equals = true,
+            default_missing_value = "meta",
+            value_parser = ["meta", "full"]
+        )]
+        carry_agents: Option<String>,
         /// Report the window that would be written without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -1128,6 +1162,12 @@ enum ArchiveCmd {
     Path,
 }
 
+/// `--carry-agents[=meta|full]` as the core's mode; `None` without the flag.
+fn parse_carry(mode: Option<&str>) -> Result<Option<cv_core::harness::claude::adopt::Carry>> {
+    mode.map(|m| m.parse::<cv_core::harness::claude::adopt::Carry>())
+        .transpose()
+}
+
 /// The clap tree with the grouped listing attached (`after_help` is computed from the tree itself,
 /// so it can't drift from the commands).
 fn build_cli() -> clap::Command {
@@ -1411,6 +1451,7 @@ fn run() -> Result<()> {
             drop,
             drop_thinking,
             copy_resources,
+            carry_agents,
             no_revive,
             window,
             keep,
@@ -1431,6 +1472,7 @@ fn run() -> Result<()> {
             drop,
             thinking: drop_thinking,
             copy_resources,
+            carry_agents: parse_carry(carry_agents.as_deref())?,
             revive: !no_revive,
             window,
             keep,
@@ -1451,6 +1493,7 @@ fn run() -> Result<()> {
             to,
             thinking,
             skills,
+            carry_agents,
             full,
             dry_run,
             json,
@@ -1464,6 +1507,7 @@ fn run() -> Result<()> {
             full,
             thinking: thinking.as_deref().map(util::parse_thinking).transpose()?,
             skills_policy: skills.parse()?,
+            carry_agents: parse_carry(carry_agents.as_deref())?,
             dry_run,
             json,
             generator: BUILD_VERSION,
@@ -1725,6 +1769,39 @@ mod tests {
         let err = resolve_declassify_tokens(None, Some(dir.join("nope.txt"))).unwrap_err();
         assert!(err.to_string().contains("declassify-tokens-file"), "{err}");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// What `--carry-agents` parsed to on `cv rewind` / `cv prune`.
+    fn carry_of(args: &[&str]) -> Option<String> {
+        match Cli::try_parse_from(args.iter().copied()).unwrap().cmd {
+            Cmd::Rewind { carry_agents, .. } | Cmd::Prune { carry_agents, .. } => carry_agents,
+            _ => panic!("not a rewind or prune"),
+        }
+    }
+
+    /// Off without the flag; the bare flag is `meta` and never eats the id; `full` needs `=`.
+    #[test]
+    fn carry_agents_is_off_by_default_bare_is_meta_and_full_needs_equals() {
+        crate::on_main_sized_stack(|| {
+            for verb in ["rewind", "prune"] {
+                assert_eq!(carry_of(&["cv", verb, "abc"]), None);
+                assert_eq!(
+                    carry_of(&["cv", verb, "--carry-agents", "abc"]).as_deref(),
+                    Some("meta")
+                );
+                assert_eq!(
+                    carry_of(&["cv", verb, "abc", "--carry-agents=full"]).as_deref(),
+                    Some("full")
+                );
+                assert!(Cli::try_parse_from(["cv", verb, "abc", "--carry-agents=all"]).is_err());
+            }
+            assert!(Cli::try_parse_from(["cv", "prune", "abc", "--carry-agents", "--copy-resources"]).is_err());
+            assert_eq!(parse_carry(None).unwrap(), None);
+            assert_eq!(
+                parse_carry(Some("full")).unwrap(),
+                Some(cv_core::harness::claude::adopt::Carry::Full)
+            );
+        });
     }
 
     #[test]

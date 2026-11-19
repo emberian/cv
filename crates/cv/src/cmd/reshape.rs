@@ -3,6 +3,7 @@
 use crate::cmd::port::emit_session;
 use crate::util::{dry_run_nulls, parse_harness, parse_range, report, short_id, usage};
 use anyhow::{bail, Context, Result};
+use cv_core::harness::claude::adopt::{self, Carried, Carry, SessionFile};
 use cv_core::harness::claude::skills::SkillsPolicy;
 use cv_core::ir::{human_bytes, Harness, Session};
 use cv_core::EmitOptions;
@@ -52,6 +53,7 @@ pub(crate) struct PruneArgs<'a> {
     pub drop: bool,
     pub thinking: bool,
     pub copy_resources: bool,
+    pub carry_agents: Option<Carry>,
     pub revive: bool,
     pub window: Option<u64>,
     pub keep: Option<String>,
@@ -84,6 +86,7 @@ pub(crate) fn cmd_prune(args: PruneArgs<'_>) -> Result<()> {
         drop,
         thinking,
         copy_resources,
+        carry_agents,
         revive,
         window,
         keep,
@@ -113,6 +116,7 @@ pub(crate) fn cmd_prune(args: PruneArgs<'_>) -> Result<()> {
             r.harness
         );
     }
+    carry_agents_source(carry_agents, &r)?;
 
     let pinned_id = to.is_some(); // --to: the new id is caller-chosen, so a dry run can still report it
     let opts = cv_core::prune::PruneOptions {
@@ -139,6 +143,7 @@ pub(crate) fn cmd_prune(args: PruneArgs<'_>) -> Result<()> {
         Some(refused) => crate::util::UsageError(refused.to_string()).into(),
         None => e,
     })?;
+    let carried = carry_agents_into(carry_agents, &r.path, &res.new_path, &res.new_id, dry_run)?;
 
     let mut v = serde_json::to_value(&res)?;
     v["harness"] = r.harness.as_str().into();
@@ -158,6 +163,7 @@ pub(crate) fn cmd_prune(args: PruneArgs<'_>) -> Result<()> {
         &["new_path", "sidecar_path", "copied_resources"],
         &["new_id"],
     );
+    carried_json(&mut v, carried.as_ref(), dry_run && !pinned_id)?;
 
     let mut h = String::new();
     let pct = if res.original_size > 0 {
@@ -227,6 +233,7 @@ pub(crate) fn cmd_prune(args: PruneArgs<'_>) -> Result<()> {
     for w in &res.warnings {
         let _ = writeln!(h, "  ⚠ {w}");
     }
+    carried_lines(&mut h, carried.as_ref(), dry_run);
     if !dry_run {
         let _ = writeln!(h, "  new session: {}", res.new_path.display());
         if let Some(sc) = &res.sidecar_path {
@@ -252,6 +259,94 @@ pub(crate) fn skills_line(h: &mut String, s: &cv_core::harness::claude::skills::
             h,
             "  skills ({}): dropped {} restored skill(s), {} chars, kept {} · {} record(s) rewritten",
             s.policy, s.dropped, s.dropped_chars, s.kept, s.records
+        );
+    }
+}
+
+// ---------- carried agents ----------
+
+/// `--carry-agents` copies a session's own `subagents/`; a sub-agent transcript has none.
+fn carry_agents_source(mode: Option<Carry>, r: &cv_core::ir::SessionRef) -> Result<()> {
+    if mode.is_some() && cv_core::rewind::is_subagent(r) {
+        return usage(format!(
+            "--carry-agents carries a top-level session's sub-agents; {} is itself a sub-agent",
+            short_id(&r.id)
+        ));
+    }
+    Ok(())
+}
+
+/// `--carry-agents`: copy the source session's sub-agents under the session just derived from it
+/// (see [`adopt::carry`]). `None` without the flag. The derived transcript is already published
+/// when this runs, so a carry that fails says the session exists without (all of) its agents.
+fn carry_agents_into(
+    mode: Option<Carry>,
+    source: &std::path::Path,
+    new_path: &std::path::Path,
+    new_id: &str,
+    dry_run: bool,
+) -> Result<Option<Carried>> {
+    let Some(mode) = mode else {
+        return Ok(None);
+    };
+    let (Some(from), Some(into)) = (SessionFile::at(source), SessionFile::at(new_path)) else {
+        bail!("--carry-agents: {} has no project dir", source.display());
+    };
+    let carried = adopt::carry(&from, &into, mode, !dry_run).with_context(|| {
+        if dry_run {
+            format!("--carry-agents={}", mode.as_str())
+        } else {
+            format!(
+                "the new session {new_id} is written, but --carry-agents={} did not finish: its sub-agents under {} are incomplete",
+                mode.as_str(),
+                into.subagents_dir().display()
+            )
+        }
+    })?;
+    Ok(Some(carried))
+}
+
+/// The `carried_agents` object of a `--json` report, only with `--carry-agents`. A dry run whose
+/// new id is not pinned names no destination.
+fn carried_json(v: &mut serde_json::Value, carried: Option<&Carried>, unnamed: bool) -> Result<()> {
+    if let Some(carried) = carried {
+        let mut c = serde_json::to_value(carried)?;
+        if unnamed {
+            c["into"] = serde_json::Value::Null;
+        }
+        v["carried_agents"] = c;
+    }
+    Ok(())
+}
+
+/// Report what `--carry-agents` copied, and what each mode leaves behind.
+fn carried_lines(h: &mut String, carried: Option<&Carried>, dry_run: bool) {
+    let Some(c) = carried else { return };
+    let verb = if dry_run { "would carry" } else { "carried" };
+    let transcripts = match c.mode {
+        "full" => format!(
+            " and {} transcript(s) ({})",
+            c.transcripts,
+            human_bytes(c.transcript_bytes as u64)
+        ),
+        _ => String::new(),
+    };
+    let _ = writeln!(
+        h,
+        "  agents:  {verb} {} spawn record(s){transcripts} (--carry-agents={})",
+        c.metas, c.mode
+    );
+    if c.mode == "meta" && c.metas > 0 {
+        let _ = writeln!(
+            h,
+            "           meta keeps each agent's model and type; its brief and cache need --carry-agents=full"
+        );
+    }
+    if c.nested_transcripts_left > 0 {
+        let _ = writeln!(
+            h,
+            "  ⚠ {} workflow agent transcript(s) were not carried, only their spawn records",
+            c.nested_transcripts_left
         );
     }
 }
@@ -293,6 +388,7 @@ pub(crate) struct RewindArgs<'a> {
     pub full: bool,
     pub thinking: Option<cv_core::emit::ThinkingMode>,
     pub skills_policy: SkillsPolicy,
+    pub carry_agents: Option<Carry>,
     pub dry_run: bool,
     pub json: bool,
     pub generator: &'a str,
@@ -309,6 +405,7 @@ pub(crate) fn cmd_rewind(args: RewindArgs<'_>) -> Result<()> {
         full,
         thinking,
         skills_policy,
+        carry_agents,
         dry_run,
         json,
         generator,
@@ -327,6 +424,7 @@ pub(crate) fn cmd_rewind(args: RewindArgs<'_>) -> Result<()> {
             short_id(&r.id)
         ));
     }
+    carry_agents_source(carry_agents, &r)?;
 
     let pinned = to.is_some();
     let res = cv_core::rewind::rewind_session(
@@ -342,6 +440,7 @@ pub(crate) fn cmd_rewind(args: RewindArgs<'_>) -> Result<()> {
             generator: generator.to_string(),
         },
     )?;
+    let carried = carry_agents_into(carry_agents, &r.path, &res.new_path, &res.new_id, dry_run)?;
     let cwd = res.cwd.as_deref().map(std::path::Path::new);
     let resume = crate::cmd::port::resume_lines(r.harness, &res.new_id, cwd);
     // Claude Code finds a session by its project dir; a rewind written anywhere else must be moved
@@ -353,6 +452,7 @@ pub(crate) fn cmd_rewind(args: RewindArgs<'_>) -> Result<()> {
     v["harness"] = r.harness.as_str().into();
     v["resume"] = serde_json::json!(resume);
     dry_run_nulls(&mut v, pinned, &["new_path", "provenance_path"], &["new_id", "resume"]);
+    carried_json(&mut v, carried.as_ref(), dry_run && !pinned)?;
 
     let mut h = String::new();
     let tag = if res.dry_run {
@@ -426,6 +526,7 @@ pub(crate) fn cmd_rewind(args: RewindArgs<'_>) -> Result<()> {
             res.cut_cwd.as_deref().unwrap_or_default()
         );
     }
+    carried_lines(&mut h, carried.as_ref(), res.dry_run);
     if !res.dry_run {
         let _ = writeln!(h, "  new session: {}", res.new_path.display());
         let _ = writeln!(h, "  provenance:  {}", res.provenance_path.display());

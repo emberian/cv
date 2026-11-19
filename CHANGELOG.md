@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- `rewind` and `prune` take `--carry-agents[=meta|full]`: the new session keeps its sub-agents' spawn records (and transcripts) for an in-place `/resume`.
+
 ## 0.19.3 — 2026-11-13 — parser termination and malformed-input recovery
 
 - JavaScript tool classification terminates on mismatched delimiters and handles malformed Unicode escapes without panicking, preventing runaway search workers.

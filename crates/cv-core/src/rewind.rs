@@ -40,6 +40,11 @@
 //! rewind of one emits a standalone top-level session: own session id, `isSidechain: false`, the
 //! `agentId` tag dropped (top-level records don't carry it), written to the parent's project dir.
 //!
+//! A rewind of a top-level session carries no `subagents/` dir: a session resumed in a new process
+//! needs none. One resumed in place by the process that owns live sub-agents does (Claude Code
+//! loads an agent from the current session's dir); [`crate::harness::claude::adopt::carry`] copies
+//! them under the new id, which `cv rewind --carry-agents` runs after the rewind is published.
+//!
 //! ## Provenance
 //!
 //! Next to the derived `<new-id>.jsonl` goes `<new-id>.rewind.json`: the source (id, path, bytes,
