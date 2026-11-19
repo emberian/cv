@@ -13,10 +13,19 @@ pub(super) struct Accumulator {
     answered: std::collections::HashSet<String>,
     resolver: crate::lazy::Resolver,
     latch: crate::stream::Latch,
+    /// The harness the session was read from, on the side a writer is about to write
+    /// ([`Features::note`]); `None` on the side read back.
+    written_from: Option<Harness>,
 }
 impl Accumulator {
-    pub(super) fn new(target: Harness, thinking: ThinkingMode, resolver: crate::lazy::Resolver) -> Self {
+    pub(super) fn new(
+        target: Harness,
+        thinking: ThinkingMode,
+        resolver: crate::lazy::Resolver,
+        written_from: Option<Harness>,
+    ) -> Self {
         Self {
+            written_from,
             target,
             thinking,
             features: Features::default(),
@@ -40,7 +49,7 @@ impl Accumulator {
             self.pending.push(facts);
         } else {
             self.features
-                .note(self.target, self.thinking, &facts, false, &|_| false);
+                .note(self.target, self.thinking, &facts, false, &|_| false, self.written_from);
         }
         Ok(())
     }
@@ -53,6 +62,7 @@ impl Accumulator {
                     message,
                     metadata.model.is_some(),
                     &|b| matches!(b, Block::ToolUse { id, .. } if !self.answered.contains(id.as_str())),
+                    self.written_from,
                 );
             }
         }
@@ -84,8 +94,24 @@ impl MessageSink for Accumulator {
     }
 }
 
+/// The features of `session` as `target`'s writer is about to write it.
 pub(in crate::emit) fn source_features(target: Harness, thinking: ThinkingMode, session: &Session) -> Result<Features> {
-    let mut accumulator = Accumulator::new(target, thinking, session.resolver());
+    features(target, thinking, session, Some(session.harness))
+}
+
+/// The features of `session` as `target`'s reader read it back.
+#[cfg(test)]
+pub(in crate::emit) fn read_features(target: Harness, thinking: ThinkingMode, session: &Session) -> Result<Features> {
+    features(target, thinking, session, None)
+}
+
+fn features(
+    target: Harness,
+    thinking: ThinkingMode,
+    session: &Session,
+    written_from: Option<Harness>,
+) -> Result<Features> {
+    let mut accumulator = Accumulator::new(target, thinking, session.resolver(), written_from);
     for message in &session.messages {
         accumulator.note(message)?;
     }
@@ -120,7 +146,10 @@ fn project(message: &Message, resolver: &crate::lazy::Resolver, target: Harness)
     facts.model = message.model.as_ref().map(|_| String::new());
     facts.usage = message.usage.clone();
     if message.is_carrier() {
-        facts.extra.insert(crate::ir::CARRIER_KEY.into(), Value::Null);
+        // An empty record: enough for `is_carrier` and for the Claude writer's `system_fate`.
+        facts
+            .extra
+            .insert(crate::ir::CARRIER_KEY.into(), Value::Object(Default::default()));
     }
     let mut text_started = false;
     for block in &message.content {

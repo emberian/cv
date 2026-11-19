@@ -10,6 +10,12 @@
 //! sidechain identity are the Claude emitter's rules (`harness::claude::emit::emit`): a span's source
 //! parents that still resolve are kept, the cut points are re-linked, a span lifted from a sub-agent
 //! joins the main thread. `cv splice` calls this.
+//!
+//! A selected message keeps the record it was read from (`emit::prepare_replayable`,
+//! [`Demand::records`](crate::stream::Demand)), so a span emitted into its own harness is
+//! written back as it was: a person's mid-turn message and an attached file are `attachment`
+//! records in a Claude transcript, and they arrive as those records. A record is only its own
+//! harness's: [`Composition::finish`] drops the ones the target could not replay.
 
 use crate::ir::{GitInfo, Harness, Message, Principal, Session};
 use std::path::PathBuf;
@@ -33,6 +39,8 @@ pub struct Composition {
     owner: Option<Owner>,
     messages: Vec<Message>,
     provenance: Vec<serde_json::Value>,
+    /// Each pushed window's harness and how many messages it contributed, in push order.
+    windows: Vec<(Harness, usize)>,
 }
 impl Composition {
     pub fn push(&mut self, mut source: Session, total: usize, start: usize, end: Option<usize>) {
@@ -41,6 +49,7 @@ impl Composition {
         self.provenance.push(serde_json::json!({
             "source_id": source.id, "harness": source.harness.as_str(), "start": start, "end": end,
         }));
+        self.windows.push((source.harness, source.messages.len()));
         self.messages.append(&mut source.messages);
         match &mut self.owner {
             Some(owner) => {
@@ -66,7 +75,20 @@ impl Composition {
         self.owner.as_ref().map(|owner| owner.harness)
     }
     pub fn finish(self, new_id: Option<String>, harness: Harness) -> Session {
-        let messages = self.messages;
+        let mut messages = self.messages;
+        // A record replays only into the harness that wrote it. For any other target the
+        // message goes as its IR, and that target's writer says what it does with it.
+        let mut at = 0;
+        for (source, len) in self.windows {
+            if source != harness {
+                for message in &mut messages[at..at + len] {
+                    if message.kind != crate::ir::MessageKind::Carrier {
+                        message.extra.remove(crate::ir::CARRIER_KEY);
+                    }
+                }
+            }
+            at += len;
+        }
         // Provenance is cv's own fact about a session cv synthesized, not something read out of a
         // harness store, so it lives in the `cv` namespace — `Session::extra` has no flat keys
         // (docs/INTERFACE-V2.md §4).

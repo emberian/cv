@@ -291,9 +291,13 @@ impl Record<'_> {
             if let Some(parent) = &parent {
                 top.set("parentUuid", parent);
             }
-            // Carriers only rewrite identity fields they originally held.
-            if top.get("sessionId").is_some() {
-                top.set("sessionId", &identity);
+            // Carriers only rewrite identity fields they originally held. Every spelling of
+            // the session id is this session's: a record replayed with its source's would name
+            // another session.
+            for key in crate::harness::claude::IDENTITY.session_keys {
+                if top.get(key).is_some() {
+                    top.set(key, &identity);
+                }
             }
             if top.get("cwd").is_some() {
                 top.set("cwd", &cwd);
@@ -458,17 +462,6 @@ impl ParentLinks {
         parent
     }
 }
-/// A foreign-session message written as one of Claude Code's special record kinds (a compaction
-/// boundary or summary, an injected-context attachment) rather than an ordinary turn.
-fn special_kind(session: &Session, message: &Message) -> Option<MessageKind> {
-    (session.harness != Harness::Claude
-        && matches!(
-            message.kind,
-            MessageKind::CompactionBoundary | MessageKind::CompactionSummary | MessageKind::InjectedContext
-        ))
-    .then_some(message.kind)
-}
-
 fn record<'a>(
     message: &'a Message,
     c: &Context<'a>,
@@ -489,13 +482,17 @@ fn record<'a>(
             sidecar: None,
         }));
     }
-    let special = special_kind(c.session, message);
+    let fate = system_fate(c.session.harness, message);
+    let special = match fate {
+        SystemFate::Special(kind) => Some(kind),
+        _ => None,
+    };
     let parent = message
         .parent_id
         .clone()
         .map(|p| dropped.resolve(p))
         .unwrap_or_else(|| previous.clone());
-    if special.is_none() && message.role == Role::System {
+    if let SystemFate::Unwritten(_) = fate {
         if let Some(id) = &message.id {
             dropped.insert(id.clone(), parent);
         }
@@ -652,9 +649,11 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Emi
         .messages
         .iter()
         .map(|message| {
-            let special = special_kind(session, message).is_some();
-            (carrier_record_of(message).is_none() && (special || message.role != Role::System))
-                .then(|| message.id.clone().unwrap_or_else(|| Uuid::new_v4().to_string()))
+            matches!(
+                system_fate(session.harness, message),
+                SystemFate::Turn | SystemFate::Special(_)
+            )
+            .then(|| message.id.clone().unwrap_or_else(|| Uuid::new_v4().to_string()))
         })
         .collect();
     let mut answered = HashSet::new();

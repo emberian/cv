@@ -769,6 +769,10 @@ pub(super) fn record(
     let Some(mut msg) = message else {
         return Ok(Flow::Continue);
     };
+    // A system-role message has no generated wire form: its record is the only way back.
+    if opts.records && msg.role == Role::System && !msg.extra.contains_key(CARRIER_KEY) {
+        msg.extra.insert(CARRIER_KEY.into(), r.view.resolve()?.into_owned());
+    }
     r.stamp(&mut msg);
     contain_persisted_outputs(&mut msg, session.source_path.as_deref());
     // Keep the message model record-local; the session default is the first non-synthetic
@@ -862,9 +866,9 @@ impl<'a> Record<'a, '_> {
 
     /// A model-visible `attachment` record (one with a non-empty `rendered[]`) as a
     /// [`Role::System`] message: one text block per rendered item, exactly the text appended to
-    /// the prompt. `None` when nothing was rendered. Under `complete` the message is also a carrier
-    /// of the record, so the emitter preserves its JSON values and key order while lean consumers still
-    /// see its text. `origin` is [`Origin::Hook`] for `hook_*` attachments (a user-configured
+    /// the prompt. `None` when nothing was rendered. Under `complete`, or a demand for records,
+    /// the message is also a carrier of the record, so the emitter preserves its JSON values and
+    /// key order while lean consumers still see its text. `origin` is [`Origin::Hook`] for `hook_*` attachments (a user-configured
     /// hook's stdout) and [`Origin::Harness`] otherwise. The attachment kind always rides in
     /// `extra["claude"]["attachment_type"]`; the full `attachment` object only under rich demand.
     fn attachment(&self) -> Result<Option<Message>> {
@@ -894,7 +898,7 @@ impl<'a> Record<'a, '_> {
             .map(|v| v.resolve().map(|v| v.as_str().unwrap_or_default().to_owned()))
             .transpose()?
             .unwrap_or_else(|| "attachment".into());
-        let mut m = if self.opts.tier == Tier::Complete {
+        let mut m = if self.opts.tier == Tier::Complete || self.opts.records {
             self.carrier()?
         } else {
             Message::new(Role::System)
@@ -1261,10 +1265,18 @@ impl<'a> Record<'a, '_> {
         // Format-complete: capture EVERY remaining top-level + message-level field (beyond the
         // first-classed ones) so `parse → emit` reproduces the record with no dropped keys. The
         // already-captured fields are re-confirmed, not duplicated. This is also the only producer
-        // of the bag's verbatim `toolUseResult`, the complete-mode replay fallback.
-        if opts.tier == Tier::Complete {
+        // of the bag's verbatim `toolUseResult`, the complete-mode replay fallback. A demand for
+        // records captures the same fields at its own tier; there a `toolUseResult` already on
+        // its result block is not owned twice.
+        if opts.tier == Tier::Complete || opts.records {
+            let mirrored = opts.tier != Tier::Complete
+                && tier >= Tier::Rich
+                && blocks.iter().any(|b| matches!(b, Block::ToolResult { .. }));
             self.view.for_each_entry(|key, value| {
-                if !CLAUDE_FIRSTCLASS_TOP.contains(&key) && !bag.contains_key(key) {
+                if !CLAUDE_FIRSTCLASS_TOP.contains(&key)
+                    && !bag.contains_key(key)
+                    && !(mirrored && key == TOOL_USE_RESULT_KEY)
+                {
                     bag.insert(key.to_owned(), value.resolve()?.into_owned());
                 }
                 Ok(())

@@ -73,6 +73,14 @@ pub struct Demand {
     /// `Message.extra[`[`offsets::OFFSET_KEY`](crate::offsets::OFFSET_KEY)`]` (`cv rewind`'s
     /// message-to-byte pass). Only span-tracking JSONL paths (Claude, Codex) stamp.
     pub offsets: bool,
+    /// Each message keeps what its own record held, so an emit into the same harness writes it
+    /// back as it was: a turn keeps every field of its record in its harness bag, and a message
+    /// the harness writes as a record of its own kind (Claude's `attachment` and `system`
+    /// records, read as system-role messages) keeps that record verbatim under
+    /// [`CARRIER_KEY`](crate::ir::CARRIER_KEY). The message stream stays the tier's: the same
+    /// messages at the same indices. Adapters without such records ignore it.
+    #[serde(default)]
+    pub records: bool,
 }
 
 impl Demand {
@@ -89,6 +97,7 @@ impl Demand {
             tier,
             spans: false,
             offsets: false,
+            records: false,
         }
     }
 
@@ -105,6 +114,11 @@ impl Demand {
     /// The same demand with record offsets stamped.
     pub const fn with_offsets(self) -> Self {
         Demand { offsets: true, ..self }
+    }
+
+    /// The same demand with each message keeping its record ([`Demand::records`]).
+    pub const fn with_records(self) -> Self {
+        Demand { records: true, ..self }
     }
 
     /// The tier one message is built at, given its sink's [`MessageSink::tier`]: a sink may

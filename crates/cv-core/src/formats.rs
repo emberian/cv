@@ -195,6 +195,7 @@ fn finding(harness: &str, kind: FindingKind, item: impl Into<String>, detail: im
         a: kind.as_str().into(),
         b: detail.into(),
         expected: false,
+        why: None,
         at: harness.into(),
     }
 }
