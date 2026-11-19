@@ -624,6 +624,7 @@ cv prune 3b829648 --keep 0..400                    # …or keep an explicit turn
 cv prune 3b829648 --json                           # + the report as one JSON object on stdout
 cv prune 3b829648 --declassify --declassify-tokens-file terms.txt
 cv prune 3b829648 --plan plan.json                 # the caller's own keep / pointer / excerpt / drop
+cv prune 3b829648 --carry-agents                   # its sub-agents come along under the new id
 
 cv cat <new-id> toolu_abc123                       # fetch a stashed original back out
 ```
@@ -736,7 +737,8 @@ A span emitted into its own harness is written back as it was read: each selecte
 its record, so a Claude span's `attachment` and `system` records (a message typed while the agent
 worked, a file attached with `@`, hook output) arrive as those records, in place, under the new
 session id. A message that cannot be written is named by kind with the reason
-(`system:notice: 2 → 0 (the source harness's record has no Claude form)`).
+(`system:notice: 2 → 0 (the source harness's record has no Claude form)`). `--carry-agents` takes
+the sub-agents of each Claude session a span came from.
 
 ### `cv port`
 

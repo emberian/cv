@@ -4,6 +4,8 @@
 
 - Splice into a Claude session replays attachment and system records verbatim (mid-turn messages, attached files); an unwritten system turn is named by kind and reason.
 - `prune --plan` takes `messages` by record uuid, plus `pointer`, `drop` and excerpt `lines`; it warns when a kept reply rests on nothing kept.
+- `--carry-agents[=meta|full]` on prune, rewind and `splice --session` copies sub-agent spawn records and restamped transcripts under the new session id.
+- `adopt --join --from A --into B` puts an agent's earlier records before those it wrote into B after an in-place resume.
 - Prune reports what a resume reads (the last request's recorded input and cache tokens) beside the records revive rewrote; emitted Claude records restamp `session_id` too.
 - CLI, API, and reader overviews collect initial and recent requests, worker replies, referenced files, and commands with links to their messages.
 - Pack accepts explicit sessions or transcript paths, with bounded overviews or task-focused excerpts, without searching other conversations or requiring an index.

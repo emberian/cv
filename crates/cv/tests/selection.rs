@@ -573,3 +573,195 @@ fn prune_says_which_recorded_size_a_resume_reads_and_what_revive_rewrote() {
         .sum::<u64>();
     assert_eq!(sum, 500_000);
 }
+
+// ───────────────────────────── --carry-agents ─────────────────────────────
+
+/// A session with one background agent (a typed one on its own model) and one workflow agent.
+/// Each derived session takes them along under its own id: the spawn record verbatim, the
+/// transcript restamped, so an agent re-entered after the move is still itself.
+#[test]
+fn carry_agents_takes_spawn_records_and_transcripts_to_the_new_session() {
+    const SID: &str = "5e1ec7ed-0000-4000-8000-000000000004";
+    let w = World::new("carry-agents");
+    let line = |ty: &str, uuid: &str, parent: Option<&str>, content: Value| {
+        json!({"type": ty, "uuid": uuid, "parentUuid": parent, "sessionId": SID, "timestamp": "2026-03-04T07:00:00Z",
+            "cwd": "/work/proj", "message": {"role": ty, "model": "claude-opus-5", "content": content}})
+    };
+    let source = w.write_session(
+        SID,
+        &[
+            line("user", "u1", None, json!("survey the orchard")),
+            line(
+                "assistant",
+                "a1",
+                Some("u1"),
+                json!([{"type": "text", "text": "an agent is on it"}]),
+            ),
+            line("user", "u2", Some("a1"), json!("and the hedges")),
+            line(
+                "assistant",
+                "a2",
+                Some("u2"),
+                json!([{"type": "text", "text": "noted"}]),
+            ),
+        ],
+    );
+    let meta = json!({"agentType": "Explore", "model": "sonnet", "description": "survey the orchard",
+        "toolUseId": "toolu_spawn"});
+    let agent_line = |uuid: &str, parent: Option<&str>, role: &str, text: &str| {
+        json!({"type": role, "uuid": uuid, "parentUuid": parent, "sessionId": SID, "agentId": "a0123456789abcdef",
+            "isSidechain": true, "timestamp": "2026-03-04T07:00:01Z", "cwd": "/work/proj",
+            "message": {"role": role, "content": text}})
+    };
+    w.write_agent(
+        SID,
+        "a0123456789abcdef",
+        &meta,
+        &[
+            agent_line("b1", None, "user", "count the apple trees, then wait"),
+            agent_line("b2", Some("b1"), "assistant", "forty apple trees"),
+        ],
+    );
+    let run = w.proj.join(SID).join("subagents/workflows/run-7");
+    fs::create_dir_all(&run).unwrap();
+    fs::write(
+        run.join("agent-w1.meta.json"),
+        r#"{"agentType":"builder","model":"opus"}"#,
+    )
+    .unwrap();
+
+    let carried_to = |new_id: &str, what: &str| {
+        let sub = w.proj.join(new_id).join("subagents");
+        let kept: Value =
+            serde_json::from_str(&fs::read_to_string(sub.join("agent-a0123456789abcdef.meta.json")).unwrap())
+                .unwrap_or_else(|e| panic!("{what}: {e}"));
+        assert_eq!(kept, meta, "{what}: the spawn record is carried verbatim");
+        assert_eq!(
+            fs::read_to_string(sub.join("workflows/run-7/agent-w1.meta.json")).unwrap(),
+            r#"{"agentType":"builder","model":"opus"}"#,
+            "{what}: a workflow agent keeps its run folder"
+        );
+        let lines = rows(&sub.join("agent-a0123456789abcdef.jsonl"));
+        assert_eq!(lines.len(), 2, "{what}");
+        for l in &lines {
+            assert_eq!(l["sessionId"], new_id, "{what}: restamped");
+            assert_eq!(l["agentId"], "a0123456789abcdef", "{what}");
+        }
+        assert_eq!(
+            lines[0]["message"]["content"], "count the apple trees, then wait",
+            "{what}: the brief"
+        );
+    };
+    let report = |args: &[&str]| -> Value {
+        let (out, err) = w.cv_ok(args);
+        assert!(err.contains("agents:      2 spawn record(s), 1 transcript(s)"), "{err}");
+        serde_json::from_str(out.trim()).unwrap()
+    };
+
+    let pruned = report(&["prune", SID, "--carry-agents", "--json"]);
+    assert_eq!(pruned["carried_agents"]["metas"], 2, "{pruned}");
+    carried_to(pruned["new_id"].as_str().unwrap(), "prune");
+
+    let rewound = report(&["rewind", SID, "--at", "1", "--carry-agents", "--json"]);
+    carried_to(rewound["new_id"].as_str().unwrap(), "rewind");
+
+    let (head, tail) = (format!("{SID}:..2"), format!("{SID}:2.."));
+    let spliced = report(&["splice", &head, &tail, "--session", "--carry-agents", "--json"]);
+    assert_eq!(
+        spliced["carried_agents"]["duplicates"], 0,
+        "one source, named twice: {spliced}"
+    );
+    carried_to(spliced["session_id"].as_str().unwrap(), "splice");
+
+    // `meta`: the spawn records alone. Without the flag nothing is carried, as before.
+    let (out, _) = w.cv_ok(&["prune", SID, "--carry-agents=meta", "--json"]);
+    let lean: Value = serde_json::from_str(out.trim()).unwrap();
+    let sub = w.proj.join(lean["new_id"].as_str().unwrap()).join("subagents");
+    assert!(sub.join("agent-a0123456789abcdef.meta.json").is_file());
+    assert!(!sub.join("agent-a0123456789abcdef.jsonl").exists());
+    let (out, _) = w.cv_ok(&["prune", SID, "--json"]);
+    let plain: Value = serde_json::from_str(out.trim()).unwrap();
+    assert!(!w.proj.join(plain["new_id"].as_str().unwrap()).exists());
+    assert!(plain.get("carried_agents").is_none(), "{plain}");
+    // The source's agents are untouched.
+    let original = rows(&w.proj.join(SID).join("subagents/agent-a0123456789abcdef.jsonl"));
+    assert!(original.iter().all(|l| l["sessionId"] == SID));
+    assert!(source.is_file());
+}
+
+/// The shape an in-place `/resume` leaves when an agent was mid-turn: the new session's folder
+/// holds a file that begins with the agent's next assistant record and has no meta; the brief,
+/// the earlier records and the meta are in the old session's folder. `cv adopt --join` puts the
+/// old records first and copies the meta, and a repeat changes nothing.
+#[test]
+fn adopt_join_puts_a_moved_agents_earlier_records_before_what_the_new_session_holds() {
+    const OLD: &str = "5e1ec7ed-0000-4000-8000-000000000005";
+    const NEW: &str = "5e1ec7ed-0000-4000-8000-000000000006";
+    const AGENT: &str = "a0123456789abcdef";
+    let w = World::new("adopt-join");
+    for sid in [OLD, NEW] {
+        w.write_session(
+            sid,
+            &[
+                json!({"type": "user", "uuid": format!("{sid}-u"), "parentUuid": null, "sessionId": sid,
+                "timestamp": "2026-03-05T07:00:00Z", "cwd": "/work/proj",
+                "message": {"role": "user", "content": "survey the orchard"}}),
+            ],
+        );
+    }
+    let line = |uuid: &str, parent: Option<&str>, sid: &str, role: &str, text: &str| {
+        json!({"type": role, "uuid": uuid, "parentUuid": parent, "sessionId": sid, "agentId": AGENT,
+            "isSidechain": true, "timestamp": "2026-03-05T07:00:01Z", "cwd": "/work/proj",
+            "message": {"role": role, "content": text}})
+    };
+    let meta = json!({"agentType": "Explore", "model": "sonnet", "description": "count the trees"});
+    w.write_agent(
+        OLD,
+        AGENT,
+        &meta,
+        &[
+            line("b1", None, OLD, "user", "count the apple trees, then wait"),
+            line("b2", Some("b1"), OLD, "assistant", "counting the first row"),
+        ],
+    );
+    // What the agent wrote after the move: no meta beside it.
+    let moved = w.proj.join(NEW).join("subagents");
+    fs::create_dir_all(&moved).unwrap();
+    let tail = cv_testkit::jsonl(&[
+        line("b3", Some("b2"), NEW, "assistant", "forty apple trees"),
+        line("b4", Some("b3"), NEW, "user", "and the pears"),
+    ]);
+    let transcript = moved.join(format!("agent-{AGENT}.jsonl"));
+    fs::write(&transcript, &tail).unwrap();
+
+    let (out, err) = w.cv_ok(&["adopt", "--join", "--from", OLD, "--into", NEW, "--json"]);
+    let report: Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(report["carried_agents"]["joined"], 1, "{report}");
+    assert_eq!(report["carried_agents"]["metas"], 1, "{report}");
+    assert!(err.contains("1 transcript(s) joined"), "{err}");
+    let joined = rows(&transcript);
+    let ids: Vec<&str> = joined.iter().map(|r| r["uuid"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["b1", "b2", "b3", "b4"], "the old records go first");
+    assert!(joined.iter().all(|r| r["sessionId"] == NEW && r["agentId"] == AGENT));
+    assert_eq!(joined[0]["message"]["content"], "count the apple trees, then wait");
+    assert!(
+        fs::read_to_string(&transcript).unwrap().ends_with(&tail),
+        "what the new session held is byte for byte where it was"
+    );
+    let kept: Value =
+        serde_json::from_str(&fs::read_to_string(moved.join(format!("agent-{AGENT}.meta.json"))).unwrap()).unwrap();
+    assert_eq!(kept, meta);
+
+    let before = fs::read_to_string(&transcript).unwrap();
+    let (out, _) = w.cv_ok(&["adopt", "--join", "--from", OLD, "--into", NEW, "--json"]);
+    let again: Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(
+        (&again["carried_agents"]["joined"], &again["carried_agents"]["already"]),
+        (&json!(0), &json!(2)),
+        "{again}"
+    );
+    assert_eq!(fs::read_to_string(&transcript).unwrap(), before);
+    // The old session's folder is read, never written.
+    let old = rows(&w.proj.join(OLD).join(format!("subagents/agent-{AGENT}.jsonl")));
+    assert!(old.len() == 2 && old.iter().all(|r| r["sessionId"] == OLD));
+}

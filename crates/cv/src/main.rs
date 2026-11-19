@@ -538,6 +538,14 @@ enum Cmd {
         /// hundreds of MB for big sessions). Resume doesn't need it — only cv's forest features do.
         #[arg(long)]
         copy_resources: bool,
+        /// Take the session's sub-agents along: copy each agent's spawn record (`meta`: it keeps
+        /// its model and type) and, by default, its transcript restamped (`full`: its brief and
+        /// cache too) under the new session id. Claude Code re-enters a background agent from the
+        /// CURRENT session's folder, so after an in-place `/resume` of the new session an agent
+        /// that was not carried runs on the parent's model with no brief. Files are copied as they
+        /// stand: what an agent mid-turn writes after the copy is not carried.
+        #[arg(long, value_name = "WHAT", num_args = 0..=1, default_missing_value = "full", value_parser = ["meta", "full"], conflicts_with = "copy_resources")]
+        carry_agents: Option<String>,
         /// Preserve the original `usage` records byte-for-byte (opt out of revive). By default,
         /// prune corrects the recorded context size so a maxed-out session will resume: Claude
         /// Code's resume gate reads the last turn's stored `usage` (input+cache) as the current
@@ -639,6 +647,15 @@ enum Cmd {
         /// Restored Claude skills: keep all, drop all, or drop entries whose files changed or disappeared.
         #[arg(long = "skills", value_parser = ["keep", "drop", "drop-stale"], default_value = "keep")]
         skills: String,
+        /// Take the session's sub-agents along: copy each agent's spawn record (`meta`: it keeps
+        /// its model and type) and, by default, its transcript restamped (`full`: its brief and
+        /// cache too) under the new session id. Claude Code re-enters a background agent from the
+        /// CURRENT session's folder, so after an in-place `/resume` of the new session an agent
+        /// that was not carried runs on the parent's model with no brief. Files are copied as they
+        /// stand: what an agent mid-turn writes after the copy is not carried. Every agent of
+        /// the source goes, those spawned after the cut included.
+        #[arg(long, value_name = "WHAT", num_args = 0..=1, default_missing_value = "full", value_parser = ["meta", "full"])]
+        carry_agents: Option<String>,
         /// Report the window that would be written without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -735,7 +752,7 @@ enum Cmd {
     /// `--model` (a lane that hit one model's usage limit resumes on another).
     Adopt {
         /// Agent ids (`a5d8…` or `agent-a5d8…`, unique prefix ok).
-        #[arg(required = true)]
+        #[arg(required_unless_present = "join")]
         agents: Vec<String>,
         /// The live session that adopts them (default: the newest session in the agent's
         /// project other than the one holding it, printed before acting).
@@ -751,6 +768,14 @@ enum Cmd {
         /// Replace an agent file already present in the live session.
         #[arg(long)]
         force: bool,
+        /// Join `--from`'s agents (all of them, or the full ids named) into `--into`, a session
+        /// that may already hold them in part: an agent mid-turn when its parent moved there by
+        /// an in-place `/resume` keeps writing into the new session's folder, a file that begins
+        /// mid-conversation, with no meta. The old records go first, then the records only the
+        /// new file holds; a missing meta is copied; nothing is replaced, and a repeat changes
+        /// nothing. What `--carry-agents` does at a prune, rewind or splice, after the fact.
+        #[arg(long, requires_all = ["from", "into"], conflicts_with_all = ["force", "model"])]
+        join: bool,
         /// The model the adopted sub-agent runs on when resumed, written to its `agent-<id>.meta.json`
         /// (`opus`, `sonnet`, a full model id, or `inherit`: the root's current model, which is
         /// also what a meta without `model` means). Default: the copied meta's own value. The
@@ -796,6 +821,15 @@ enum Cmd {
         /// Emit a resumable main-thread Claude session (new id) under the Claude store or --out.
         #[arg(long, conflicts_with_all = ["agent_of", "harness", "export"])]
         session: bool,
+        /// Take the session's sub-agents along: copy each agent's spawn record (`meta`: it keeps
+        /// its model and type) and, by default, its transcript restamped (`full`: its brief and
+        /// cache too) under the new session id. Claude Code re-enters a background agent from the
+        /// CURRENT session's folder, so after an in-place `/resume` of the new session an agent
+        /// that was not carried runs on the parent's model with no brief. Files are copied as they
+        /// stand: what an agent mid-turn writes after the copy is not carried. With --session:
+        /// the agents of every Claude session a span came from.
+        #[arg(long, value_name = "WHAT", num_args = 0..=1, default_missing_value = "full", value_parser = ["meta", "full"], requires = "session")]
+        carry_agents: Option<String>,
         /// Emit a new sub-agent transcript owned by this ROOT session (id or transcript path).
         #[arg(
             long,
@@ -1481,6 +1515,7 @@ fn run() -> Result<()> {
             drop,
             drop_thinking,
             copy_resources,
+            carry_agents,
             no_revive,
             window,
             keep,
@@ -1501,6 +1536,7 @@ fn run() -> Result<()> {
             drop,
             thinking: drop_thinking,
             copy_resources,
+            carry_agents: carry_agents.as_deref().map(str::parse).transpose()?,
             revive: !no_revive,
             window,
             keep,
@@ -1522,6 +1558,7 @@ fn run() -> Result<()> {
             thinking,
             skills,
             full,
+            carry_agents,
             dry_run,
             json,
         } => reshape::cmd_rewind(reshape::RewindArgs {
@@ -1534,6 +1571,7 @@ fn run() -> Result<()> {
             full,
             thinking: thinking.as_deref().map(util::parse_thinking).transpose()?,
             skills_policy: skills.parse()?,
+            carry_agents: carry_agents.as_deref().map(str::parse).transpose()?,
             dry_run,
             json,
             generator: BUILD_VERSION,
@@ -1752,6 +1790,7 @@ fn run() -> Result<()> {
             from,
             dry_run,
             force,
+            join,
             model,
             json,
         } => cmd::adopt::cmd_adopt(cmd::adopt::AdoptArgs {
@@ -1760,12 +1799,14 @@ fn run() -> Result<()> {
             from,
             dry_run,
             force,
+            join,
             model,
             json,
         }),
         Cmd::Splice {
             specs,
             session,
+            carry_agents,
             agent_of,
             harness,
             out,
@@ -1789,6 +1830,7 @@ fn run() -> Result<()> {
                 cwd,
                 thinking: util::parse_thinking(&thinking)?,
                 resumable,
+                carry_agents: carry_agents.as_deref().map(str::parse).transpose()?,
                 json,
             })
         }

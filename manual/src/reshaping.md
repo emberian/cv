@@ -51,6 +51,20 @@ its payload, or a result planned one way inside a record the plan drops refuses 
 kept reply whose turn's tool results were all dropped or pointered "rests on nothing kept"
 (`plan.rests_on_nothing` in `--json`).
 
+`--carry-agents[=meta|full]` on `prune`, `rewind` and `splice --session` takes the session's
+sub-agents along. Claude Code re-enters a background agent from the current session's
+`subagents/` folder, and a derived session has a new id: without its `agent-<id>.meta.json` the
+agent comes back on the parent's model as a general-purpose agent, and without its transcript it
+has no brief. `meta` copies the spawn records verbatim; `full` (the default) also copies each
+transcript with the session id restamped. Files are copied as they stand, a line at a time.
+
+An agent that is mid-turn when its parent moves keeps running and writes its next records into
+the new session's folder: a file that begins mid-conversation, with no meta. So a transcript the
+new session already holds is joined, never skipped or replaced: the source's records first, then
+the records only the new file holds, and a missing meta is copied. `cv adopt --join --from <old>
+--into <new>` does the same after the fact, for every agent of the old session or the ids named,
+and a repeat changes nothing.
+
 What a session wrote and read on disk is already a mechanical listing, paths from its tool calls:
 `cv events <id> --kind file_edit` and `--kind file_read` (`--json`, `--subagents`), one streamed
 pass. It is worth pasting into the précis of whatever a plan drops.

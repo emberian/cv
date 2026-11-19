@@ -13,6 +13,7 @@ use crate::source::{Dependencies, Probe};
 /// `cv adopt`: move a sub-agent stranded by a dead session into a live one — Claude-only byte
 /// surgery on this store's layout, so it lives beside the adapter that knows it.
 pub mod adopt;
+pub mod carry;
 pub(crate) mod emit;
 mod fork;
 mod hook;

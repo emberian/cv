@@ -47,6 +47,8 @@ pub(crate) struct AdoptArgs {
     pub from: Option<String>,
     pub dry_run: bool,
     pub force: bool,
+    /// Join instead of adopting (see `Cmd::Adopt`).
+    pub join: bool,
     /// Written to each adopted agent's meta `model` (see `Cmd::Adopt`).
     pub model: Option<String>,
     pub json: bool,
@@ -75,7 +77,43 @@ pub(crate) fn cmd_adopt(a: AdoptArgs) -> Result<()> {
     run(&roots, &a)
 }
 
+/// `--join`: the agents of `--from` carried into `--into`, a session that may already hold
+/// them in part (`cv_core::harness::claude::carry`).
+fn join(a: &AdoptArgs) -> Result<()> {
+    use cv_core::harness::claude::carry::{carry_agents, CarryAgents};
+    let (Some(from), Some(into)) = (a.from.as_deref(), a.into.as_deref()) else {
+        return usage("--join takes the two sessions: --from <SESSION> --into <SESSION>");
+    };
+    let (from, into) = (session(from)?, session(into)?);
+    let carried = carry_agents(
+        std::slice::from_ref(&from.path),
+        &into.path,
+        &into.session_id,
+        CarryAgents::Full,
+        &a.agents,
+        a.dry_run,
+    )?;
+    let verb = if a.dry_run { "would join" } else { "joined" };
+    let h = match &carried {
+        Some(c) => format!(
+            "✦ {verb} {} → {}: {}\n",
+            short_id(&from.session_id),
+            short_id(&into.session_id),
+            crate::cmd::reshape::carried_line(c)
+        ),
+        None => format!("✦ {} holds no such agents\n", short_id(&from.session_id)),
+    };
+    report(
+        a.json,
+        &h,
+        &json!({"from": from.session_id, "into": into.session_id, "carried_agents": carried, "written": !a.dry_run}),
+    )
+}
+
 fn run(roots: &[PathBuf], a: &AdoptArgs) -> Result<()> {
+    if a.join {
+        return join(a);
+    }
     let from = a.from.as_deref().map(session).transpose()?;
     let into_given = a.into.as_deref().map(session).transpose()?;
 
