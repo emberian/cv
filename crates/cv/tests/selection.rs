@@ -654,7 +654,10 @@ fn carry_agents_takes_spawn_records_and_transcripts_to_the_new_session() {
     };
     let report = |args: &[&str]| -> Value {
         let (out, err) = w.cv_ok(args);
-        assert!(err.contains("agents:      2 spawn record(s), 1 transcript(s)"), "{err}");
+        assert!(
+            err.contains("agents:      2 spawn record(s) copied, 1 transcript(s) copied → "),
+            "{err}"
+        );
         serde_json::from_str(out.trim()).unwrap()
     };
 
@@ -738,7 +741,16 @@ fn adopt_join_puts_a_moved_agents_earlier_records_before_what_the_new_session_ho
     let report: Value = serde_json::from_str(out.trim()).unwrap();
     assert_eq!(report["carried_agents"]["joined"], 1, "{report}");
     assert_eq!(report["carried_agents"]["metas"], 1, "{report}");
-    assert!(err.contains("1 transcript(s) joined"), "{err}");
+    // The line says what happened, first, and never leads with a count of nothing.
+    let said = err.lines().find(|l| l.starts_with("✦ joined")).expect("the join line");
+    let (_, did) = said.split_once(": ").unwrap();
+    let (did, to) = did.rsplit_once(" → ").unwrap();
+    assert_eq!(
+        did,
+        "1 spawn record(s) copied, 1 transcript(s) joined (the source's records first, then what the session already held)"
+    );
+    assert!(!did.contains("0 "), "{said}");
+    assert!(to.ends_with("subagents"), "{said}");
     let joined = rows(&transcript);
     let ids: Vec<&str> = joined.iter().map(|r| r["uuid"].as_str().unwrap()).collect();
     assert_eq!(ids, ["b1", "b2", "b3", "b4"], "the old records go first");
@@ -753,7 +765,8 @@ fn adopt_join_puts_a_moved_agents_earlier_records_before_what_the_new_session_ho
     assert_eq!(kept, meta);
 
     let before = fs::read_to_string(&transcript).unwrap();
-    let (out, _) = w.cv_ok(&["adopt", "--join", "--from", OLD, "--into", NEW, "--json"]);
+    let (out, err) = w.cv_ok(&["adopt", "--join", "--from", OLD, "--into", NEW, "--json"]);
+    assert!(err.contains(": 2 file(s) already there, left as they are → "), "{err}");
     let again: Value = serde_json::from_str(out.trim()).unwrap();
     assert_eq!(
         (&again["carried_agents"]["joined"], &again["carried_agents"]["already"]),

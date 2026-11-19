@@ -36,24 +36,28 @@ fn carry(
     Ok(carried)
 }
 
-/// What a carry did, in one line.
+/// What a carry did, in one line: what happened first, each clause only when it did, then where.
 pub(crate) fn carried_line(c: &Carried) -> String {
-    let mut line = format!(
-        "{} spawn record(s), {} transcript(s) → {}",
-        c.metas,
-        c.transcripts,
-        c.dir.display()
-    );
-    if c.joined > 0 {
-        let _ = write!(
-            line,
-            "; {} transcript(s) joined: the source's records put before what the session already held",
-            c.joined
-        );
-    }
-    if c.already > 0 {
-        let _ = write!(line, "; {} file(s) already there, left as they are", c.already);
-    }
+    let clauses = [
+        (c.metas, "spawn record(s) copied"),
+        (c.transcripts, "transcript(s) copied"),
+        (
+            c.joined,
+            "transcript(s) joined (the source's records first, then what the session already held)",
+        ),
+        (c.already, "file(s) already there, left as they are"),
+    ];
+    let done: Vec<String> = clauses
+        .iter()
+        .filter(|(n, _)| *n > 0)
+        .map(|(n, what)| format!("{n} {what}"))
+        .collect();
+    let mut line = if done.is_empty() {
+        "nothing to carry".to_string()
+    } else {
+        done.join(", ")
+    };
+    let _ = write!(line, " → {}", c.dir.display());
     if c.duplicates > 0 {
         let _ = write!(line, " ({} file(s) another source already supplied)", c.duplicates);
     }
