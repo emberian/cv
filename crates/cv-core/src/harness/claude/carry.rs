@@ -16,10 +16,21 @@
 //! destination has none. Joining again changes nothing, so a carry can be repeated after the
 //! move to pick up what an agent wrote to the old folder in between.
 //!
-//! Every file is read and written a line at a time and published by rename; memory is one
-//! line plus, for a join, the two files' record ids.
+//! A transcript goes through the path an adoption takes: the source is captured and checked
+//! ([`JsonSource`]), its records restamped by [`crate::derive`], the staged copy checked against
+//! the resumability rules ([`crate::derive::verify`]) before anything is published, and the
+//! transcript published with its meta as one set. For a join, that checked copy of the source
+//! is the head, and the destination's own records are appended after the check: an agent that
+//! is still running has an unanswered call the source never had. A source whose last record is
+//! unfinished (its writer is mid-append) is carried up to that record, and the report says so.
+//!
+//! Every file is read and written a record at a time; memory is one record plus the files'
+//! record ranges and, for a join, their record ids.
 
 use super::sidecar;
+use crate::harness::store::jsonl::ranges::{self, Range};
+use crate::ir::Harness;
+use crate::json::{InvalidJson, JsonSource};
 use anyhow::{Context, Result};
 use std::collections::HashSet;
 use std::io::{BufRead, Read, Seek, Write};
@@ -57,12 +68,17 @@ pub struct Carried {
     /// Transcripts the destination already held part of: the source's records were put before
     /// the records only the destination holds.
     pub joined: usize,
+    /// Copied or joined transcripts whose last record was unfinished when they were read (a
+    /// writer was mid-append): carried up to it, never with a broken record.
+    pub unfinished: usize,
     /// Files the destination already held whole (a meta of its own, a transcript holding every
     /// source record): left as they are.
     pub already: usize,
     /// Files an earlier source had already supplied (a splice of several sessions holding one
     /// agent): the first source's copy stands.
     pub duplicates: usize,
+    /// Bytes of the copied and joined transcripts as written.
+    pub transcript_bytes: u64,
 }
 
 struct Entry {
@@ -89,6 +105,10 @@ fn collect(dir: &Path, relative: &Path, mode: CarryAgents, only: &[String], out:
             continue;
         }
         let Some(name) = name.to_str() else { continue };
+        // `<stem>.flat.jsonl` is a prune sidecar, never a transcript.
+        if name.ends_with(".flat.jsonl") {
+            continue;
+        }
         let (id, transcript) = match (name.strip_suffix(".meta.json"), name.strip_suffix(".jsonl")) {
             (Some(stem), _) => (stem.strip_prefix("agent-"), false),
             (None, Some(stem)) if mode == CarryAgents::Full => (stem.strip_prefix("agent-"), true),
@@ -106,19 +126,20 @@ fn collect(dir: &Path, relative: &Path, mode: CarryAgents, only: &[String], out:
     Ok(())
 }
 
-/// One line of a transcript, without its newline.
-fn lines(path: &Path, mut each: impl FnMut(&[u8]) -> Result<()>) -> Result<u64> {
-    let mut reader = std::io::BufReader::with_capacity(64 * 1024, std::fs::File::open(path)?);
+/// Each line of the first `limit` bytes of `reader`, without its newline; `false` for one the
+/// bytes end inside.
+fn lines(reader: impl Read, limit: u64, mut each: impl FnMut(&[u8], bool) -> Result<()>) -> Result<()> {
+    let mut reader = std::io::BufReader::with_capacity(64 * 1024, reader.take(limit));
     let mut line = Vec::new();
-    let mut read = 0u64;
     loop {
         line.clear();
-        let n = reader.read_until(b'\n', &mut line)?;
-        if n == 0 {
-            return Ok(read);
+        if reader.read_until(b'\n', &mut line)? == 0 {
+            return Ok(());
         }
-        read += n as u64;
-        each(line.strip_suffix(b"\n").unwrap_or(&line))?;
+        match line.strip_suffix(b"\n") {
+            Some(whole) => each(whole, true)?,
+            None => each(&line, false)?,
+        }
     }
 }
 
@@ -131,99 +152,190 @@ fn uuid_of(line: &[u8]) -> Option<String> {
     serde_json::from_slice::<Id>(line).ok()?.uuid
 }
 
-/// `line` with its session id restamped; a line that is not a record, or carries no session
-/// id, as it is.
-fn write_restamped(line: &[u8], new_id: &str, out: &mut impl Write) -> Result<()> {
-    match std::str::from_utf8(line)
-        .ok()
-        .and_then(|text| crate::restamp_line(text, new_id))
-    {
-        Some(stamped) => out.write_all(stamped.as_bytes())?,
-        None => out.write_all(line)?,
-    }
-    out.write_all(b"\n")?;
-    Ok(())
-}
-
 enum Outcome {
     Copied,
     Joined,
     Already,
 }
 
-/// The source transcript restamped at `to`, joined with what `to` already holds.
-fn transcript(from: &Path, to: &Path, new_id: &str, dry_run: bool) -> Result<Outcome> {
-    use crate::publish::{Claim, Staged};
+/// What [`transcript`] did with one agent.
+struct Done {
+    outcome: Outcome,
+    bytes: u64,
+    unfinished: bool,
+    meta: bool,
+}
+
+/// A meta staged for `to`, with the guard on its source.
+fn stage_meta(from: &Path, to: &Path) -> Result<(crate::publish::Staged, JsonSource, std::fs::File)> {
+    let source = JsonSource::capture(from).with_context(|| format!("reading {}", from.display()))?;
+    let mut file = std::fs::File::open(from)?;
+    source.check_metadata(file.metadata()?)?;
+    // No more exposed than the spawn record it copies.
+    let mut staged = crate::publish::Staged::beside(to, "carry", crate::publish::mode_of(&file))?;
+    std::io::copy(&mut file, &mut staged)?;
+    Ok((staged, source, file))
+}
+
+/// The source transcript restamped at `to`, joined with what `to` already holds, published
+/// with its `meta` (source, destination) when the destination has none.
+fn transcript(from: &Path, to: &Path, new_id: &str, meta: Option<(&Path, &Path)>, dry_run: bool) -> Result<Done> {
+    use crate::publish::{Claim, Set, Staged};
+    let identity = super::IDENTITY;
+    let source = JsonSource::capture(from).with_context(|| format!("reading {}", from.display()))?;
+    let file = std::fs::File::open(from)?;
+    source.check_metadata(file.metadata()?)?;
+    let extent = Range {
+        offset: 0,
+        len: source.len(),
+    };
+    let mut rows = ranges::records(&file, extent)?.collect::<Result<Vec<(Range, bool)>>>()?;
+    let read = |&(range, complete): &(Range, bool)| {
+        crate::derive::Select::read(&source, &file, range, complete, true, &identity)
+    };
+    // A last row with no newline that is not one JSON value: its writer is mid-append.
+    let mut unfinished = false;
+    if let Some(last) = rows.last().filter(|(_, complete)| !complete) {
+        if read(last).is_err_and(|error| error.is::<InvalidJson>()) {
+            rows.pop();
+            unfinished = true;
+        }
+    }
+    let carried_len = rows.last().map_or(0, |(range, _)| range.offset + range.len);
+
     let existing = std::fs::symlink_metadata(to).is_ok();
     let mut held = HashSet::new();
-    let mut held_bytes = 0;
+    let mut held_len = 0u64;
     if existing {
-        held_bytes = lines(to, |line| {
+        held_len = std::fs::metadata(to)?.len();
+        lines(std::fs::File::open(to)?, held_len, |line, _| {
             held.extend(uuid_of(line));
             Ok(())
         })?;
     }
-    // The source's record ids, and whether the destination lacks any of them.
-    let mut source = HashSet::new();
+    // The carried records' ids, and whether the destination lacks any of them.
+    let mut ids = HashSet::new();
     let mut missing = !existing;
-    lines(from, |line| {
+    lines(std::fs::File::open(from)?, carried_len, |line, _| {
         if let Some(uuid) = uuid_of(line) {
             missing |= !held.contains(&uuid);
-            source.insert(uuid);
+            ids.insert(uuid);
         }
         Ok(())
     })?;
-    if !missing {
-        return Ok(Outcome::Already);
-    }
-    let outcome = if existing { Outcome::Joined } else { Outcome::Copied };
-    if dry_run {
-        return Ok(outcome);
-    }
     drop(held);
-    if let Some(parent) = to.parent() {
-        std::fs::create_dir_all(parent)?;
+    let meta = meta.filter(|(_, to)| std::fs::symlink_metadata(to).is_err());
+    if !missing {
+        // Its meta alone may still be owed.
+        if let (Some((meta_from, meta_to)), false) = (meta, dry_run) {
+            let (staged, guard, guarded) = stage_meta(meta_from, meta_to)?;
+            guard.check_metadata(guarded.metadata()?)?;
+            guard.check()?;
+            staged.publish(meta_to, Claim::New)?;
+        }
+        return Ok(Done {
+            outcome: Outcome::Already,
+            bytes: 0,
+            unfinished: false,
+            meta: meta.is_some(),
+        });
     }
-    let mode = match std::fs::File::open(if existing { to } else { from }) {
-        Ok(file) => crate::publish::mode_of(&file),
-        Err(_) => 0o600,
+    let rewrite = crate::derive::Rewrite {
+        session_id: new_id,
+        standalone: false,
+        identity,
     };
-    let mut staged = std::io::BufWriter::with_capacity(64 * 1024, Staged::beside(to, "carry", mode)?);
-    lines(from, |line| write_restamped(line, new_id, &mut staged))?;
-    if !existing {
-        let staged = staged.into_inner().map_err(|e| e.into_error())?;
-        staged.publish(to, Claim::New)?;
-        return Ok(outcome);
+    let outcome = if existing { Outcome::Joined } else { Outcome::Copied };
+    let ends_whole = rows.last().is_none_or(|(_, complete)| *complete);
+    if dry_run {
+        let head = crate::derive::derive(&source, &file, rows.iter().map(read), &rewrite, &mut std::io::sink())?;
+        let mut bytes = head.bytes as u64;
+        if existing {
+            lines(std::fs::File::open(to)?, held_len, |line, whole| {
+                if whole && !uuid_of(line).is_some_and(|uuid| ids.contains(&uuid)) {
+                    bytes += line.len() as u64 + 1;
+                }
+                Ok(())
+            })?;
+        }
+        return Ok(Done {
+            outcome,
+            bytes,
+            unfinished,
+            meta: meta.is_some(),
+        });
     }
-    // Then what only the destination holds, in its order. An agent may still be appending:
-    // whatever arrived since the last pass is copied too, until a pass finds nothing new.
-    let mut at = 0u64;
-    let mut end = held_bytes;
-    for _ in 0..8 {
-        let mut file = std::fs::File::open(to)?;
-        file.seek(std::io::SeekFrom::Start(at))?;
-        let mut reader = std::io::BufReader::with_capacity(64 * 1024, file.take(end - at));
-        let mut line = Vec::new();
-        loop {
-            line.clear();
-            if reader.read_until(b'\n', &mut line)? == 0 {
+    if let Some(parent) = to.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    // The head: the source's records, restamped and checked as an adoption's are.
+    let mode = crate::publish::mode_of(&file);
+    let mut staged = std::io::BufWriter::with_capacity(64 * 1024, Staged::beside(to, "carry", mode)?);
+    let head = crate::derive::derive(&source, &file, rows.iter().map(read), &rewrite, &mut staged)?;
+    let mut staged = staged.into_inner().map_err(|e| e.into_error())?;
+    source.check_metadata(file.metadata()?)?;
+    source.check()?;
+    let agent = crate::derive::agent_of(from);
+    crate::derive::verify(Harness::Claude, &source, &file, agent, staged.path(), to, agent)?;
+    let mut bytes = head.bytes as u64;
+    if existing {
+        // Then what only the destination holds, in its order, whole records only. An agent may
+        // still be appending: what arrived since the last pass is copied too, until a pass finds
+        // nothing new. Its own unfinished last record is left out like the source's.
+        let mut out = std::io::BufWriter::with_capacity(64 * 1024, staged.file());
+        if !ends_whole {
+            out.write_all(b"\n")?;
+            bytes += 1;
+        }
+        let (mut at, mut end) = (0u64, held_len);
+        let mut cut = false;
+        for _ in 0..8 {
+            let mut reader = std::fs::File::open(to)?;
+            reader.seek(std::io::SeekFrom::Start(at))?;
+            let mut consumed = 0u64;
+            cut = false;
+            lines(reader, end - at, |line, whole| {
+                if !whole && serde_json::from_slice::<serde::de::IgnoredAny>(line).is_err() {
+                    cut = true;
+                    return Ok(());
+                }
+                consumed += line.len() as u64 + u64::from(whole);
+                if !uuid_of(line).is_some_and(|uuid| ids.contains(&uuid)) {
+                    out.write_all(line)?;
+                    out.write_all(b"\n")?;
+                    bytes += line.len() as u64 + 1;
+                }
+                Ok(())
+            })?;
+            at += consumed;
+            end = std::fs::metadata(to)?.len();
+            if end <= at || (cut && consumed == 0) {
                 break;
             }
-            let body = line.strip_suffix(b"\n").unwrap_or(&line);
-            if !uuid_of(body).is_some_and(|uuid| source.contains(&uuid)) {
-                staged.write_all(body)?;
-                staged.write_all(b"\n")?;
-            }
         }
-        at = end;
-        end = std::fs::metadata(to)?.len();
-        if end <= at {
-            break;
-        }
+        unfinished |= cut;
+        out.flush()?;
     }
-    let staged = staged.into_inner().map_err(|e| e.into_error())?;
-    staged.publish(to, Claim::Replace)?;
-    Ok(outcome)
+    // One set, the meta first: a published transcript always has its meta.
+    let mut set = Set::new();
+    let mut guards = Vec::new();
+    if let Some((meta_from, meta_to)) = meta {
+        let (meta_staged, guard, guarded) = stage_meta(meta_from, meta_to)?;
+        guards.push((guard, guarded));
+        set.add(meta_staged, meta_to, Claim::New);
+    }
+    for (guard, guarded) in &guards {
+        guard.check_metadata(guarded.metadata()?)?;
+        guard.check()?;
+    }
+    set.add(staged, to, if existing { Claim::Replace } else { Claim::New });
+    set.publish()?;
+    Ok(Done {
+        outcome,
+        bytes,
+        unfinished,
+        meta: meta.is_some(),
+    })
 }
 
 /// Carry the agents of each of `sources` (main transcripts) to the session at `destination`
@@ -246,9 +358,10 @@ pub fn carry_agents(
         ..Carried::default()
     };
     for source in sources {
-        let Some(dir) = sidecar::subagents_dir(source).filter(|dir| *dir != target) else {
+        let Some(dir) = sidecar::subagents_dir(source) else {
             continue;
         };
+        anyhow::ensure!(dir != target, "session {new_id} cannot carry its agents into itself");
         let mut found = Vec::new();
         collect(&dir, Path::new(""), mode, only, &mut found)?;
         for entry in found {
@@ -262,27 +375,53 @@ pub fn carry_agents(
     if entries.is_empty() {
         return Ok(None);
     }
-    for entry in &entries {
+    // Transcripts first, each with its meta as one set; then the metas that have none.
+    let metas: std::collections::HashMap<&Path, &Path> = entries
+        .iter()
+        .filter(|e| !e.transcript)
+        .map(|e| (e.to.as_path(), e.from.as_path()))
+        .collect();
+    let mut paired = HashSet::new();
+    for entry in entries.iter().filter(|e| e.transcript) {
         let to = target.join(&entry.to);
-        let context = || format!("carrying {}", entry.from.display());
-        if entry.transcript {
-            match transcript(&entry.from, &to, new_id, dry_run).with_context(context)? {
-                Outcome::Copied => carried.transcripts += 1,
-                Outcome::Joined => carried.joined += 1,
-                Outcome::Already => carried.already += 1,
+        let meta_rel = entry.to.with_extension("meta.json");
+        let meta_to = target.join(&meta_rel);
+        let meta = metas.get(meta_rel.as_path()).map(|from| (*from, meta_to.as_path()));
+        let done = transcript(&entry.from, &to, new_id, meta, dry_run)
+            .with_context(|| format!("carrying {}", entry.from.display()))?;
+        if meta.is_some() {
+            paired.insert(meta_rel);
+            if done.meta {
+                carried.metas += 1;
+            } else {
+                // The destination's own spawn record stands (a retargeted model, say).
+                carried.already += 1;
             }
-        } else if std::fs::symlink_metadata(&to).is_ok() {
-            // The destination's own spawn record stands (a retargeted model, say).
+        }
+        match done.outcome {
+            Outcome::Copied => carried.transcripts += 1,
+            Outcome::Joined => carried.joined += 1,
+            Outcome::Already => carried.already += 1,
+        }
+        carried.unfinished += usize::from(done.unfinished);
+        carried.transcript_bytes += done.bytes;
+    }
+    for entry in entries.iter().filter(|e| !e.transcript && !paired.contains(&e.to)) {
+        let to = target.join(&entry.to);
+        if std::fs::symlink_metadata(&to).is_ok() {
             carried.already += 1;
-        } else {
-            carried.metas += 1;
-            if !dry_run {
-                if let Some(parent) = to.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                let file = std::fs::File::open(&entry.from).with_context(context)?;
-                crate::publish::publish_reader(&to, "carry", file, crate::publish::Claim::New).with_context(context)?;
+            continue;
+        }
+        carried.metas += 1;
+        if !dry_run {
+            let context = || format!("carrying {}", entry.from.display());
+            if let Some(parent) = to.parent() {
+                std::fs::create_dir_all(parent)?;
             }
+            let (staged, guard, guarded) = stage_meta(&entry.from, &to).with_context(context)?;
+            guard.check_metadata(guarded.metadata()?)?;
+            guard.check()?;
+            staged.publish(&to, crate::publish::Claim::New).with_context(context)?;
         }
     }
     Ok(Some(carried))
@@ -293,11 +432,16 @@ mod tests {
     use super::*;
 
     fn record(uuid: &str, parent: Option<&str>, session: &str, role: &str, text: &str) -> String {
-        serde_json::json!({"type": role, "uuid": uuid, "parentUuid": parent, "sessionId": session,
+        let line = serde_json::json!({"type": role, "uuid": uuid, "parentUuid": parent, "sessionId": session,
             "session_id": session, "agentId": "a1", "isSidechain": true,
-            "message": {"role": role, "content": text}})
-        .to_string()
-            + "\n"
+            "message": {"role": role, "content": text}});
+        format!("{line}\n")
+    }
+    fn counts(c: &Carried) -> (usize, usize, usize, usize, usize) {
+        (c.metas, c.transcripts, c.joined, c.already, c.unfinished)
+    }
+    fn carry(old: &Path, new: &Path, id: &str, mode: CarryAgents, dry: bool) -> Result<Carried> {
+        Ok(carry_agents(std::slice::from_ref(&old.to_path_buf()), new, id, mode, &[], dry)?.expect("agents"))
     }
 
     #[test]
@@ -316,68 +460,65 @@ mod tests {
                 "old",
                 "assistant",
                 "old beds, sessionId stays in text",
-            )
-            + "not a record\n";
+            );
         std::fs::write(sub.join("agent-a1.jsonl"), &transcript)?;
         std::fs::write(
             sub.join("workflows/run-1/agent-w1.meta.json"),
             r#"{"agentType":"builder"}"#,
         )?;
         std::fs::write(sub.join("workflows/run-1/journal.jsonl"), "{}\n")?;
+        // A spawn record whose transcript was never written still comes along; a prune sidecar
+        // is no transcript.
+        std::fs::write(sub.join("agent-c2.meta.json"), r#"{"agentType":"general-purpose"}"#)?;
+        std::fs::write(sub.join("agent-a1.flat.jsonl"), "{}\n")?;
         let new = world.proj.join("new.jsonl");
         let sources = [old.clone(), old.clone()];
 
-        let dry = carry_agents(&sources[..1], &new, "new", CarryAgents::Full, &[], true)?.unwrap();
-        assert_eq!((dry.metas, dry.transcripts), (2, 1));
+        let dry = carry(&old, &new, "new", CarryAgents::Full, true)?;
+        assert_eq!(counts(&dry), (3, 1, 0, 0, 0));
         assert!(!world.proj.join("new").exists(), "a dry run writes nothing");
 
         let carried = carry_agents(&sources, &new, "new", CarryAgents::Full, &[], false)?.unwrap();
         let dst = world.proj.join("new/subagents");
-        assert_eq!(
-            carried,
-            Carried {
-                dir: dst.clone(),
-                metas: 2,
-                transcripts: 1,
-                joined: 0,
-                already: 0,
-                duplicates: 3
-            }
-        );
+        assert_eq!((counts(&carried), carried.duplicates), ((3, 1, 0, 0, 0), 4));
+        assert_eq!(carried.dir, dst);
         assert_eq!(std::fs::read_to_string(dst.join("agent-a1.meta.json"))?, meta);
+        assert_eq!(
+            std::fs::read_to_string(dst.join("agent-c2.meta.json"))?,
+            r#"{"agentType":"general-purpose"}"#
+        );
         assert_eq!(
             std::fs::read_to_string(dst.join("workflows/run-1/agent-w1.meta.json"))?,
             r#"{"agentType":"builder"}"#
         );
         assert!(!dst.join("workflows/run-1/journal.jsonl").exists());
-        let restamped = transcript
-            .replace(r#""sessionId":"old""#, r#""sessionId":"new""#)
-            .replace(r#""session_id":"old""#, r#""session_id":"new""#);
-        assert_eq!(std::fs::read_to_string(dst.join("agent-a1.jsonl"))?, restamped);
+        // The three agent files, the run folder, and no staging file left beside them.
+        assert_eq!(std::fs::read_dir(&dst)?.count(), 4);
+        let out = std::fs::read_to_string(dst.join("agent-a1.jsonl"))?;
+        assert_eq!(
+            (carried.transcript_bytes, dry.transcript_bytes),
+            (out.len() as u64, out.len() as u64)
+        );
+        // Only the top-level session ids changed: swapping them back gives the source bytes.
+        assert_eq!(out.matches(r#":"new""#).count(), 4);
+        assert_eq!(crate::restamp::restamp(&out, "old").body, transcript);
         // The source is untouched, and carrying again changes nothing.
         assert_eq!(std::fs::read_to_string(sub.join("agent-a1.jsonl"))?, transcript);
-        let again = carry_agents(&sources[..1], &new, "new", CarryAgents::Full, &[], false)?.unwrap();
-        assert_eq!(
-            (again.metas, again.transcripts, again.joined, again.already),
-            (0, 0, 0, 3)
-        );
-        assert_eq!(std::fs::read_to_string(dst.join("agent-a1.jsonl"))?, restamped);
+        let again = carry(&old, &new, "new", CarryAgents::Full, false)?;
+        assert_eq!(counts(&again), (0, 0, 0, 4, 0));
+        assert_eq!(std::fs::read_to_string(dst.join("agent-a1.jsonl"))?, out);
 
         let lean = world.proj.join("lean.jsonl");
-        let carried = carry_agents(
-            &sources[..1],
-            &lean,
-            "lean",
-            CarryAgents::Meta,
-            &["agent-a1".into()],
-            false,
-        )?;
+        let only = ["agent-a1".to_string()];
+        let carried = carry_agents(&sources[..1], &lean, "lean", CarryAgents::Meta, &only, false)?;
         assert_eq!(carried.map(|c| (c.metas, c.transcripts)), Some((1, 0)));
         assert!(!world.proj.join("lean/subagents/agent-a1.jsonl").exists());
         assert!(
             !world.proj.join("lean/subagents/workflows").exists(),
             "only a1 was asked for"
         );
+        // A session is never its own successor.
+        assert!(carry(&old, &old, "old", CarryAgents::Meta, false).is_err());
         Ok(())
     }
 
@@ -399,8 +540,14 @@ mod tests {
         std::fs::write(from.join("agent-a1.meta.json"), meta)?;
         let brief = record("b1", None, "old", "user", "count the trees, then wait");
         let early = record("b2", Some("b1"), "old", "assistant", "counting the first row");
+        // What the agent wrote after the move ends with a call still running: a break the
+        // source never had, which the check of the head must not see.
+        let running = serde_json::json!({"type": "assistant", "uuid": "b5", "parentUuid": "b4", "sessionId": "new",
+            "agentId": "a1", "isSidechain": true, "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "toolu_running", "name": "Bash", "input": {"command": "count"}}]}});
         let tail = record("b3", Some("b2"), "new", "assistant", "forty trees")
-            + &record("b4", Some("b3"), "new", "user", "and the hedges");
+            + &record("b4", Some("b3"), "new", "user", "and the hedges")
+            + &format!("{running}\n");
         std::fs::write(from.join("agent-a1.jsonl"), format!("{brief}{early}"))?;
         std::fs::write(into.join("agent-a1.jsonl"), &tail)?;
         let new = world.proj.join("new.jsonl");
@@ -409,35 +556,85 @@ mod tests {
                 .replace(r#""session_id":"old""#, r#""session_id":"new""#)
         };
 
-        let dry = carry_agents(std::slice::from_ref(&old), &new, "new", CarryAgents::Full, &[], true)?.unwrap();
-        assert_eq!((dry.metas, dry.joined), (1, 1));
+        let dry = carry(&old, &new, "new", CarryAgents::Full, true)?;
+        assert_eq!(counts(&dry), (1, 0, 1, 0, 0));
         assert_eq!(std::fs::read_to_string(into.join("agent-a1.jsonl"))?, tail, "dry");
 
-        let carried = carry_agents(std::slice::from_ref(&old), &new, "new", CarryAgents::Full, &[], false)?.unwrap();
-        assert_eq!((carried.metas, carried.transcripts, carried.joined), (1, 0, 1));
+        let carried = carry(&old, &new, "new", CarryAgents::Full, false)?;
+        assert_eq!(counts(&carried), (1, 0, 1, 0, 0));
         let joined = stamp(&format!("{brief}{early}")) + &tail;
         assert_eq!(std::fs::read_to_string(into.join("agent-a1.jsonl"))?, joined);
+        assert_eq!(
+            (carried.transcript_bytes, dry.transcript_bytes),
+            (joined.len() as u64, joined.len() as u64)
+        );
         assert_eq!(std::fs::read_to_string(into.join("agent-a1.meta.json"))?, meta);
-        // Every record once, each parent before its child.
+        // Every record once, each parent before its child; nothing staged is left.
         let ids: Vec<String> = joined.lines().filter_map(|l| uuid_of(l.as_bytes())).collect();
-        assert_eq!(ids, ["b1", "b2", "b3", "b4"]);
+        assert_eq!(ids, ["b1", "b2", "b3", "b4", "b5"]);
+        assert_eq!(std::fs::read_dir(&into)?.count(), 2);
 
         // The agent wrote one more record to the OLD folder after an earlier carry: a repeat
         // puts it where the source has it, before the records only the new folder holds.
         let late = record("b2x", Some("b2"), "old", "assistant", "the second row");
         std::fs::write(from.join("agent-a1.jsonl"), format!("{brief}{early}{late}"))?;
-        let again = carry_agents(std::slice::from_ref(&old), &new, "new", CarryAgents::Full, &[], false)?.unwrap();
-        assert_eq!((again.metas, again.joined, again.already), (0, 1, 1));
+        let again = carry(&old, &new, "new", CarryAgents::Full, false)?;
+        assert_eq!(counts(&again), (0, 0, 1, 1, 0));
         let rejoined = stamp(&format!("{brief}{early}{late}")) + &tail;
         assert_eq!(std::fs::read_to_string(into.join("agent-a1.jsonl"))?, rejoined);
-        let settled = carry_agents(std::slice::from_ref(&old), &new, "new", CarryAgents::Full, &[], false)?.unwrap();
-        assert_eq!((settled.joined, settled.already), (0, 2));
+        let settled = carry(&old, &new, "new", CarryAgents::Full, false)?;
+        assert_eq!(counts(&settled), (0, 0, 0, 2, 0));
         assert_eq!(std::fs::read_to_string(into.join("agent-a1.jsonl"))?, rejoined);
         // The old folder is never written.
         assert_eq!(
             std::fs::read_to_string(from.join("agent-a1.jsonl"))?,
             format!("{brief}{early}{late}")
         );
+        Ok(())
+    }
+
+    /// A transcript whose writer is mid-append ends in a record that is not whole. The carry
+    /// takes what is whole and says so; it neither writes the broken record nor refuses. The
+    /// same holds for the destination's own last record in a join.
+    #[test]
+    fn an_unfinished_last_record_is_left_out_and_counted() -> Result<()> {
+        let world = crate::test_world("carry-agents-unfinished");
+        let old = world.proj.join("old.jsonl");
+        std::fs::write(&old, "{}\n")?;
+        let from = world.proj.join("old/subagents");
+        std::fs::create_dir_all(&from)?;
+        let whole =
+            record("b1", None, "old", "user", "count the trees") + &record("b2", Some("b1"), "old", "assistant", "one");
+        let half = r#"{"type":"assistant","uuid":"b3","parentUuid":"b2","sessionId":"old","agentId":"a1","isSidech"#;
+        std::fs::write(from.join("agent-a1.jsonl"), format!("{whole}{half}"))?;
+        let stamped = whole
+            .replace(r#""sessionId":"old""#, r#""sessionId":"new""#)
+            .replace(r#""session_id":"old""#, r#""session_id":"new""#);
+
+        let new = world.proj.join("new.jsonl");
+        let carried = carry(&old, &new, "new", CarryAgents::Full, false)?;
+        assert_eq!(counts(&carried), (0, 1, 0, 0, 1));
+        let to = world.proj.join("new/subagents/agent-a1.jsonl");
+        assert_eq!(std::fs::read_to_string(&to)?, stamped);
+
+        // A join whose destination also ends mid-record: its whole records follow the head.
+        let joined = world.proj.join("join.jsonl");
+        let into = world.proj.join("join/subagents");
+        std::fs::create_dir_all(&into)?;
+        let tail = record("b4", Some("b2"), "join", "assistant", "two");
+        std::fs::write(into.join("agent-a1.jsonl"), format!("{tail}{{\"type\":\"user\",\"uu"))?;
+        std::fs::write(from.join("agent-a1.jsonl"), &whole)?;
+        let carried = carry(&old, &joined, "join", CarryAgents::Full, false)?;
+        assert_eq!(counts(&carried), (0, 0, 1, 0, 1));
+        assert_eq!(
+            std::fs::read_to_string(into.join("agent-a1.jsonl"))?,
+            stamped.replace(r#":"new""#, r#":"join""#) + &tail
+        );
+        // A whole line that is not a record is refused for that agent, as an adoption refuses it.
+        std::fs::write(from.join("agent-a1.jsonl"), format!("{whole}not a record\n"))?;
+        let refused = carry(&old, &world.proj.join("third.jsonl"), "third", CarryAgents::Full, false);
+        assert!(refused.is_err());
+        assert!(!world.proj.join("third/subagents/agent-a1.jsonl").exists());
         Ok(())
     }
 }

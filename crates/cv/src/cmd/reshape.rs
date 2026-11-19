@@ -13,19 +13,43 @@ use std::path::PathBuf;
 
 // ---------- carrying agents (prune, rewind, splice) ----------
 
+/// `--carry-agents` copies a session's own `subagents/`; a sub-agent transcript has none.
+fn carry_source(mode: Option<CarryAgents>, r: &cv_core::ir::SessionRef) -> Result<()> {
+    if mode.is_some() && cv_core::rewind::is_subagent(r) {
+        return usage(format!(
+            "--carry-agents carries a top-level session's sub-agents; {} is itself a sub-agent",
+            short_id(&r.id)
+        ));
+    }
+    Ok(())
+}
+
 /// `--carry-agents`, after the new session is written: the report line, and the JSON's
-/// `carried_agents` (null when the sources have no agents).
+/// `carried_agents` (null when the sources have no agents). `unnamed`: a dry run whose new id
+/// is not pinned, so the folder it would write has no name to report.
 fn carry(
     mode: CarryAgents,
     sources: &[PathBuf],
     new_path: &std::path::Path,
     new_id: &str,
-    dry_run: bool,
+    (dry_run, unnamed): (bool, bool),
     h: &mut String,
-) -> Result<Option<Carried>> {
-    let carried = carry_agents(sources, new_path, new_id, mode, &[], dry_run)
-        .with_context(|| format!("the new session {new_id} is written; carrying its agents failed"))?;
+) -> Result<serde_json::Value> {
+    let carried = carry_agents(sources, new_path, new_id, mode, &[], dry_run).with_context(|| {
+        if dry_run {
+            "--carry-agents".to_string()
+        } else {
+            format!("the new session {new_id} is written; carrying its agents failed")
+        }
+    })?;
+    let mut v = serde_json::to_value(&carried)?;
     match &carried {
+        Some(c) if unnamed => {
+            v["dir"] = serde_json::Value::Null;
+            let line = carried_line(c);
+            let did = line.split(" → ").next().unwrap_or_default();
+            let _ = writeln!(h, "  agents:      {did} → the new session's subagents/");
+        }
         Some(c) => {
             let _ = writeln!(h, "  agents:      {}", carried_line(c));
         }
@@ -33,7 +57,7 @@ fn carry(
             let _ = writeln!(h, "  agents:      the source has none to carry");
         }
     }
-    Ok(carried)
+    Ok(v)
 }
 
 /// What a carry did, in one line: what happened first, each clause only when it did, then where.
@@ -45,6 +69,7 @@ pub(crate) fn carried_line(c: &Carried) -> String {
             c.joined,
             "transcript(s) joined (the source's records first, then what the session already held)",
         ),
+        (c.unfinished, "transcript(s) carried up to an unfinished last record"),
         (c.already, "file(s) already there, left as they are"),
     ];
     let done: Vec<String> = clauses
@@ -162,6 +187,7 @@ pub(crate) fn cmd_prune(args: PruneArgs<'_>) -> Result<()> {
     }
     let want = parse_harness(&harness)?;
     let (r, _adapter) = crate::cmd::distill::resolve_source(id, want)?;
+    carry_source(carry_agents, &r)?;
 
     if !cv_core::harness::has_derived_copies(r.harness) {
         bail!(
@@ -331,10 +357,10 @@ pub(crate) fn cmd_prune(args: PruneArgs<'_>) -> Result<()> {
             let _ = writeln!(h, "  resources:   copied subagents/workflows → {}", rc.display());
         }
     }
-    // A sub-agent pruned on its own has no agents of its own to carry.
-    if let Some(mode) = carry_agents.filter(|_| res.parent_session_id.is_none()) {
+    if let Some(mode) = carry_agents {
         let sources = std::slice::from_ref(&r.path);
-        v["carried_agents"] = serde_json::to_value(carry(mode, sources, &res.new_path, &res.new_id, dry_run, &mut h)?)?;
+        let dry = (dry_run, dry_run && !pinned_id);
+        v["carried_agents"] = carry(mode, sources, &res.new_path, &res.new_id, dry, &mut h)?;
     }
     if !dry_run {
         let _ = writeln!(h, "  resume with: claude --resume {}", res.new_id);
@@ -418,6 +444,7 @@ pub(crate) fn cmd_rewind(args: RewindArgs<'_>) -> Result<()> {
         Some(a) => crate::cmd::view::resolve_subagent(&r, a)?.session,
         None => r,
     };
+    carry_source(carry_agents, &r)?;
     if !cv_core::harness::has_derived_copies(r.harness) {
         return usage(format!(
             "cv rewind currently supports Claude Code sessions only (got {}) — `cv splice {}:..N` composes a \
@@ -525,10 +552,10 @@ pub(crate) fn cmd_rewind(args: RewindArgs<'_>) -> Result<()> {
             res.cut_cwd.as_deref().unwrap_or_default()
         );
     }
-    if let Some(mode) = carry_agents.filter(|_| !res.subagent) {
+    if let Some(mode) = carry_agents {
         let sources = std::slice::from_ref(&r.path);
-        v["carried_agents"] =
-            serde_json::to_value(carry(mode, sources, &res.new_path, &res.new_id, res.dry_run, &mut h)?)?;
+        let dry = (res.dry_run, res.dry_run && !pinned);
+        v["carried_agents"] = carry(mode, sources, &res.new_path, &res.new_id, dry, &mut h)?;
     }
     if !res.dry_run {
         let _ = writeln!(h, "  new session: {}", res.new_path.display());
@@ -667,7 +694,7 @@ pub(crate) fn cmd_splice(args: SpliceArgs<'_>) -> Result<()> {
         }
         let mut v = serde_json::to_value(&e)?;
         if let (Some(mode), Some(path), Some(id), None) = (carry_agents, &e.path, &e.session_id, &e.agent_id) {
-            v["carried_agents"] = serde_json::to_value(carry(mode, &agent_sources, path, id, false, &mut h)?)?;
+            v["carried_agents"] = carry(mode, &agent_sources, path, id, (false, false), &mut h)?;
         }
         if let Some(r) = &e.resume {
             let _ = writeln!(h, "  ↳ resume: {r}");

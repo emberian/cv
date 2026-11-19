@@ -687,9 +687,54 @@ fn carry_agents_takes_spawn_records_and_transcripts_to_the_new_session() {
     assert!(!w.proj.join(plain["new_id"].as_str().unwrap()).exists());
     assert!(plain.get("carried_agents").is_none(), "{plain}");
     // The source's agents are untouched.
-    let original = rows(&w.proj.join(SID).join("subagents/agent-a0123456789abcdef.jsonl"));
+    let agent = w.proj.join(SID).join("subagents/agent-a0123456789abcdef.jsonl");
+    let original = rows(&agent);
     assert!(original.iter().all(|l| l["sessionId"] == SID));
     assert!(source.is_file());
+
+    // The bare flag never takes the id after it.
+    let (out, _) = w.cv_ok(&["prune", "--carry-agents", SID, "--json"]);
+    let first: Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(first["carried_agents"]["transcripts"], 1, "{first}");
+    // A dry run whose id is not pinned names no folder it would write.
+    let (out, err) = w.cv_ok(&["prune", SID, "--carry-agents", "--dry-run", "--json"]);
+    let dry: Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(
+        (&dry["carried_agents"]["dir"], &dry["carried_agents"]["metas"]),
+        (&Value::Null, &json!(2)),
+        "{dry}"
+    );
+    assert!(
+        err.contains("2 spawn record(s) copied, 1 transcript(s) copied → the new session's subagents/"),
+        "{err}"
+    );
+    // A sub-agent has no agents of its own: a usage error before anything is written.
+    let before = fs::read_dir(&w.proj).unwrap().count();
+    let (ok, code, _, err) = w.cv(&["prune", "agent-a0123456789abcdef", "--carry-agents"]);
+    assert!(
+        !ok && code == 2 && err.contains("is itself a sub-agent"),
+        "{code} {err}"
+    );
+    assert_eq!(fs::read_dir(&w.proj).unwrap().count(), before);
+
+    // An agent mid-append: its unfinished last record is left out, and the line says so.
+    let mut live = fs::OpenOptions::new().append(true).open(&agent).unwrap();
+    std::io::Write::write_all(&mut live, br#"{"type":"assistant","uuid":"b3","parentUu"#).unwrap();
+    let (out, err) = w.cv_ok(&["prune", SID, "--carry-agents", "--json"]);
+    let cut: Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(cut["carried_agents"]["unfinished"], 1, "{cut}");
+    assert!(
+        err.contains(
+            "2 spawn record(s) copied, 1 transcript(s) copied, 1 transcript(s) carried up to an unfinished last record → "
+        ),
+        "{err}"
+    );
+    let carried = w
+        .proj
+        .join(cut["new_id"].as_str().unwrap())
+        .join("subagents/agent-a0123456789abcdef.jsonl");
+    assert_eq!(rows(&carried).len(), 2, "whole records only");
+    assert!(fs::read_to_string(&carried).unwrap().ends_with("}\n"));
 }
 
 /// The shape an in-place `/resume` leaves when an agent was mid-turn: the new session's folder
