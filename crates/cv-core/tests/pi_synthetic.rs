@@ -10,7 +10,7 @@
 
 use cv_core::harness::pi::Pi;
 use cv_core::harness::Adapter;
-use cv_core::ir::{Block, Harness, Message};
+use cv_core::ir::{Block, Harness, Message, MessageKind, Role};
 use cv_core::stream::{Demand, Flow, MessageSink};
 use std::path::PathBuf;
 
@@ -44,12 +44,13 @@ fn read(dir: &PathBuf, path: &PathBuf, demand: &Demand) -> Collect {
     sink
 }
 
-/// The text of a message, joined from its text blocks.
+/// The text of a message, joined from its text blocks and any tool result's content.
 fn text(m: &Message) -> String {
     m.content
         .iter()
         .filter_map(|b| match b {
             Block::Text { text } => Some(text.inline_str().unwrap_or_default().to_string()),
+            Block::ToolResult { content, .. } => Some(content.inline_str().unwrap_or_default().to_string()),
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -135,9 +136,68 @@ fn a_context_edit_with_content_replaces_its_target() {
     ]);
     let c = read(&dir, &path, &Demand::LEAN);
     let texts: Vec<String> = c.0.iter().map(text).collect();
+    assert_eq!(c.0.len(), 2, "exactly two turns: the edit adds no message of its own");
+    assert_eq!(texts, vec!["rewritten".to_string(), "reply".to_string()], "the target is replaced in place, not duplicated");
     assert!(!texts.iter().any(|t| t == "original"), "the original text is gone");
-    assert!(texts.iter().any(|t| t == "rewritten"), "the replacement is in the context");
-    assert!(texts.iter().any(|t| t == "reply"), "the other turn survives");
+    // THE TARGET KEEPS ITS IDENTITY: the edit changes the content, not who said it.
+    let edited = c.0.iter().find(|m| text(m) == "rewritten").expect("the edited turn");
+    assert_eq!(edited.id.as_deref(), Some("m1"), "the target's id survives, not the edit's");
+    assert_eq!(edited.role, Role::User, "the target's role survives");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_context_edit_replacing_an_assistant_turn_keeps_its_role_and_usage() {
+    let (dir, path) = session("edit-assistant", &[
+        HEADER,
+        r#"{"type":"message","id":"m1","parentId":"s1","timestamp":"2026-11-19T10:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"ask"}]}}"#,
+        r#"{"type":"message","id":"m2","parentId":"m1","timestamp":"2026-11-19T10:00:02.000Z","message":{"role":"assistant","content":[{"type":"text","text":"original answer"}],"usage":{"input":10,"output":20,"cacheRead":0,"cacheWrite":0,"reasoning":5,"cost":{"total":0.5}}}}"#,
+        r#"{"type":"context_edit","id":"e1","parentId":"m2","timestamp":"2026-11-19T10:00:03.000Z","targetId":"m2","replacement":{"content":[{"type":"text","text":"rewritten answer"}]}}"#,
+    ]);
+    let c = read(&dir, &path, &Demand::LEAN);
+    let edited = c.0.iter().find(|m| text(m) == "rewritten answer").expect("the edited turn");
+    assert_eq!(edited.id.as_deref(), Some("m2"), "the assistant target's id survives");
+    assert_eq!(edited.role, Role::Assistant, "an assistant turn stays an assistant turn");
+    let usage = edited.usage.as_ref().expect("the target's usage survives the edit");
+    assert_eq!(usage.output_tokens, Some(20), "the target's usage is not lost");
+    assert_eq!(usage.reasoning_tokens, Some(5), "the target's reasoning count is not lost");
+    assert!(!c.0.iter().any(|m| text(m) == "original answer"), "the original text is gone");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_context_edit_replacing_a_tool_result_keeps_its_call_id() {
+    let (dir, path) = session("edit-tool", &[
+        HEADER,
+        r#"{"type":"message","id":"m1","parentId":"s1","timestamp":"2026-11-19T10:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"run it"}]}}"#,
+        r#"{"type":"message","id":"m2","parentId":"m1","timestamp":"2026-11-19T10:00:02.000Z","message":{"role":"toolResult","toolCallId":"call-7","toolName":"bash","isError":false,"content":[{"type":"text","text":"original output"}]}}"#,
+        r#"{"type":"context_edit","id":"e1","parentId":"m2","timestamp":"2026-11-19T10:00:03.000Z","targetId":"m2","replacement":{"content":[{"type":"text","text":"rewritten output"}]}}"#,
+    ]);
+    let c = read(&dir, &path, &Demand::LEAN);
+    let edited = c.0.iter().find(|m| text(m) == "rewritten output").expect("the edited tool result");
+    assert_eq!(edited.id.as_deref(), Some("m2"), "the tool result's id survives");
+    assert_eq!(edited.role, Role::Tool, "a tool result stays a tool result");
+    let call = edited.content.iter().find_map(|b| match b {
+        Block::ToolResult { tool_use_id, .. } => Some(tool_use_id.clone()),
+        _ => None,
+    }).expect("the tool result block survives");
+    assert_eq!(call, "call-7", "the tool call id survives the edit");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn complete_keeps_the_original_content_and_the_edit_record() {
+    let (dir, path) = session("edit-complete", &[
+        HEADER,
+        r#"{"type":"message","id":"m1","parentId":"s1","timestamp":"2026-11-19T10:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"original"}]}}"#,
+        r#"{"type":"context_edit","id":"e1","parentId":"m1","timestamp":"2026-11-19T10:00:02.000Z","targetId":"m1","replacement":{"content":[{"type":"text","text":"rewritten"}]}}"#,
+    ]);
+    let c = read(&dir, &path, &Demand::COMPLETE);
+    let texts: Vec<String> = c.0.iter().map(text).collect();
+    assert!(texts.iter().any(|t| t == "original"), "complete keeps the original content");
+    assert!(!texts.iter().any(|t| t == "rewritten"), "complete does not apply the edit");
+    let carrier = c.0.iter().find(|m| m.kind == MessageKind::Carrier).expect("the edit record is carried");
+    assert_eq!(carrier.id.as_deref(), Some("e1"), "the carrier is the edit's own record");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

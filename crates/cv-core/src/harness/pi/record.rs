@@ -90,9 +90,9 @@ fn entries(source: &JsonSource) -> Result<(Vec<Entry>, Option<Value>)> {
 /// An older retained compaction contributes no messages of its own. Emitting the kept span in file
 /// order would put the compaction last and keep the pre-compaction system messages, which is a
 /// different context from the one the model saw.
-fn projection(entries: &[Entry]) -> Vec<usize> {
+fn projection(entries: &[Entry]) -> (Vec<usize>, HashMap<usize, usize>) {
     if entries.is_empty() {
-        return Vec::new();
+        return (Vec::new(), HashMap::new());
     }
     let by_id: HashMap<&str, usize> = entries
         .iter()
@@ -124,7 +124,7 @@ fn projection(entries: &[Entry]) -> Vec<usize> {
     }
     let Some(comp_pos) = latest else {
         // no compaction: the whole chain is the context, with any context_edit applied
-        return apply_context_edits(&entries, &chain, chain.clone());
+        return apply_context_edits(entries, &chain, chain.clone());
     };
     let kept_id = entries[chain[comp_pos]].kept_id.as_deref();
     let kept_from = kept_id
@@ -152,7 +152,7 @@ fn projection(entries: &[Entry]) -> Vec<usize> {
             out.push(i);
         }
     }
-    apply_context_edits(&entries, &chain, out)
+    apply_context_edits(entries, &chain, out)
 }
 
 /// Apply the branch-local `context_edit` entries to a projection.
@@ -165,7 +165,11 @@ fn projection(entries: &[Entry]) -> Vec<usize> {
 /// session's context), and the LAST edit naming a target wins, which is what an append-only log
 /// means. An edit whose target is not in the projection is a no-op: it names an entry the
 /// compaction already dropped.
-fn apply_context_edits(entries: &[Entry], chain: &[usize], mut out: Vec<usize>) -> Vec<usize> {
+fn apply_context_edits(
+    entries: &[Entry],
+    chain: &[usize],
+    mut out: Vec<usize>,
+) -> (Vec<usize>, HashMap<usize, usize>) {
     // the last edit per target, in chain order
     let mut edits: HashMap<&str, usize> = HashMap::new();
     for &i in chain {
@@ -176,31 +180,32 @@ fn apply_context_edits(entries: &[Entry], chain: &[usize], mut out: Vec<usize>) 
         }
     }
     if edits.is_empty() {
-        return out;
+        return (out, HashMap::new());
     }
     let by_id: HashMap<&str, usize> = entries
         .iter()
         .enumerate()
         .map(|(i, e)| (e.id.as_str(), i))
         .collect();
+    // A NULL REPLACEMENT DROPS THE TARGET. A replacement keeps the target at its position: the
+    // edit changes what the model sees, not who said it, so the target's role, id, parent,
+    // timestamp and metadata all stay and only its content is swapped at emit time.
     out.retain(|&i| {
-        // an entry is dropped when the last edit naming it has a null replacement
         match edits.get(entries[i].id.as_str()) {
             Some(&edit) => !entries[edit].replacement_is_null,
             None => true,
         }
     });
-    // a replacement's content is emitted in the target's place, so the projection keeps the
-    // target's position but the edit's body; the reader emits the edit entry itself for that.
+    let mut replacements: HashMap<usize, usize> = HashMap::new();
     for (&target, &edit) in &edits {
         if entries[edit].replacement_is_null {
             continue;
         }
-        if let Some(pos) = by_id.get(target).and_then(|t| out.iter().position(|&i| i == *t)) {
-            out[pos] = edit;
+        if let Some(&t) = by_id.get(target) {
+            replacements.insert(t, edit);
         }
     }
-    out
+    (out, replacements)
 }
 
 /// One session's metadata, without its messages.
@@ -253,10 +258,10 @@ pub(super) fn stream(
     // (the entries before the compaction's kept boundary). A full-history search or a full-graph
     // no-op writer cannot recover those from the projection, so it must see them. The projection is
     // what the MODEL saw; the chain is what the SESSION holds, and `complete` asks for the latter.
-    let order = if opts.tier == Tier::Complete {
+    let (order, replacements) = if opts.tier == Tier::Complete {
         let mut all: Vec<usize> = (0..entries.len()).collect();
         all.sort_by_key(|&i| entries[i].offset);   // file order, which is the chain's own order
-        all
+        (all, HashMap::new())
     } else {
         projection(&entries)
     };
@@ -307,10 +312,16 @@ pub(super) fn stream(
         at += n as u64;
     }
 
-    // emit in the projection's order
+    // emit in the projection's order. A REPLACED TARGET keeps its own record and identity; the
+    // edit's replacement content is handed to the emitter, which swaps only the content.
     for &i in &order {
         let Some(v) = bodies.get(&entries[i].offset) else { continue };
-        if emit_entry(v, &mut s, opts, sink)? == Flow::Stop {
+        let replacement = replacements
+            .get(&i)
+            .and_then(|&edit| bodies.get(&entries[edit].offset))
+            .and_then(|e| e.get("replacement"))
+            .filter(|r| !r.is_null());
+        if emit_entry(v, replacement, &mut s, opts, sink)? == Flow::Stop {
             break;
         }
     }
@@ -318,7 +329,13 @@ pub(super) fn stream(
 }
 
 /// One entry → its messages.
-fn emit_entry(v: &Value, s: &mut Session, opts: &Demand, sink: &mut dyn MessageSink) -> Result<Flow> {
+fn emit_entry(
+    v: &Value,
+    replacement: Option<&Value>,
+    s: &mut Session,
+    opts: &Demand,
+    sink: &mut dyn MessageSink,
+) -> Result<Flow> {
     let kind = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
     let id = v.get("id").and_then(|x| x.as_str()).unwrap_or_default().to_string();
     let parent = v.get("parentId").and_then(|x| x.as_str()).map(str::to_string);
@@ -333,12 +350,17 @@ fn emit_entry(v: &Value, s: &mut Session, opts: &Demand, sink: &mut dyn MessageS
             msg.id = Some(id);
             msg.parent_id = parent;
             msg.timestamp = ts;
+            // A REPLACEMENT SWAPS ONLY THE CONTENT. The target keeps its role, id, parent,
+            // timestamp, model and every metadata field: an edit changes what the model sees, not
+            // who said it. Replacing an assistant turn must stay an assistant turn with its usage
+            // and tool pairing; replacing a tool result must stay a tool result with its call id.
+            let replaced = replacement.and_then(|r| r.get("content"));
             if role == "toolResult" {
                 // A TOOL RESULT IS A MESSAGE ROLE, not a content block: `blocks_from` would turn its
                 // content array into Text blocks and lose the call id. The block is pushed
                 // explicitly, the same way OpenClaw's codec does (record.rs:511-537), so the shared
                 // IR's `tool_use_id` is what generic pairing and every writer read.
-                let content = m.get("content");
+                let content = replaced.or_else(|| m.get("content"));
                 let text = match content {
                     Some(Value::String(s)) => s.clone(),
                     Some(Value::Array(items)) => items
@@ -368,7 +390,7 @@ fn emit_entry(v: &Value, s: &mut Session, opts: &Demand, sink: &mut dyn MessageS
                         .filter(|block| matches!(block, Block::Image { .. })),
                 );
             } else {
-                msg.content = blocks_from_value(m.get("content"), opts.spans);
+                msg.content = blocks_from_value(replaced.or_else(|| m.get("content")), opts.spans);
             }
             if let Some(model) = m.get("model").and_then(|x| x.as_str()) {
                 msg.model = Some(model.to_string());
@@ -378,6 +400,9 @@ fn emit_entry(v: &Value, s: &mut Session, opts: &Demand, sink: &mut dyn MessageS
                     (&m).into(), crate::harness::wire::PI_ASSISTANT_FIELDS,
                 )?.context("assistant metadata must be an object")?;
                 crate::harness::wire::pi_assistant_metadata(&mut msg, &fields, Harness::Pi)?;
+            }
+            if replacement.is_some() {
+                msg.harness_extra_mut(Harness::Pi).insert("context_edit".into(), Value::from(true));
             }
             if opts.tier == Tier::Complete {
                 msg.harness_extra_mut(Harness::Pi).insert("native".into(), v.clone());
@@ -464,22 +489,20 @@ fn emit_entry(v: &Value, s: &mut Session, opts: &Demand, sink: &mut dyn MessageS
             Ok(sink.message(m))
         }
         "context_edit" => {
-            // A REPLACEMENT IS EMITTED IN THE TARGET'S PLACE, as a user turn carrying the new
-            // content: that is what the model sees where the target used to be. A null
-            // replacement drops the target and emits nothing (the projection already removed it).
-            let Some(replacement) = v.get("replacement").filter(|r| !r.is_null()) else {
-                return Ok(Flow::Continue);
-            };
-            let mut msg = Message::new(Role::User);
-            msg.id = Some(id);
-            msg.parent_id = parent;
-            msg.timestamp = ts;
-            msg.content = blocks_from_value(replacement.get("content"), opts.spans);
-            msg.harness_extra_mut(Harness::Pi).insert("context_edit".into(), Value::from(true));
+            // AN EDIT HAS NO MESSAGE OF ITS OWN. Its effect is applied to the TARGET, which keeps
+            // its own identity and position (see the `message` arm). Under `complete` the edit's
+            // own record is still carried, so a writer can clone it rather than lose it.
             if opts.tier == Tier::Complete {
-                msg.harness_extra_mut(Harness::Pi).insert("native".into(), v.clone());
+                let mut carrier = Message::of_kind(Role::System, MessageKind::Carrier, Origin::Harness);
+                carrier.id = Some(id);
+                carrier.parent_id = parent;
+                carrier.timestamp = ts;
+                let bag = carrier.harness_extra_mut(Harness::Pi);
+                bag.insert("record_type".into(), Value::from("context_edit"));
+                bag.insert("native".into(), v.clone());
+                return Ok(sink.message(carrier));
             }
-            Ok(sink.message(msg))
+            Ok(Flow::Continue)
         }
         _ => Ok(Flow::Continue),
     }
