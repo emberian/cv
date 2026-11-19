@@ -45,6 +45,17 @@ impl SessionFile {
     pub fn subagents_dir(&self) -> PathBuf {
         self.project_dir.join(&self.session_id).join("subagents")
     }
+
+    /// The session whose transcript is (or is about to be) at `path`, `<project>/<id>.jsonl`:
+    /// what [`carry`] takes for a session a rewind or prune derives, which no catalog lists yet.
+    pub fn at(path: &Path) -> Option<SessionFile> {
+        Some(SessionFile {
+            session_id: path.file_stem()?.to_str()?.to_string(),
+            project_dir: path.parent()?.to_path_buf(),
+            modified: std::fs::metadata(path).and_then(|m| m.modified()).ok(),
+            path: path.to_path_buf(),
+        })
+    }
 }
 
 /// One sub-agent transcript directly under a session's `subagents/` dir.
@@ -342,6 +353,168 @@ fn execute_after_stage(
     })
 }
 
+// ---------- carry: a derived session keeps its source's agents ----------
+
+/// How much of each sub-agent `cv rewind` / `cv prune` carry into the session they derive
+/// (`--carry-agents`), for a successor the process that owns the agents resumes in place.
+///
+/// Claude Code (read in 2.1.327) loads a background agent from the CURRENT session's
+/// `subagents/` dir. With no `agent-<id>.meta.json` there the agent re-enters on the parent's
+/// model as `general-purpose`; with no `agent-<id>.jsonl` there its original brief is missing
+/// from the request and its messages are written to the prompt cache again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Carry {
+    /// Each agent's spawn record (`agent-<id>.meta.json`), verbatim: keeps its model and type.
+    Meta,
+    /// The spawn record and the transcript (`agent-<id>.jsonl`, `sessionId` restamped as an
+    /// adoption does): also keeps its brief and its cache.
+    Full,
+}
+
+impl Carry {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Carry::Meta => "meta",
+            Carry::Full => "full",
+        }
+    }
+}
+
+impl std::str::FromStr for Carry {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "meta" => Ok(Carry::Meta),
+            "full" => Ok(Carry::Full),
+            _ => bail!("--carry-agents takes meta or full (got {s:?})"),
+        }
+    }
+}
+
+/// What [`carry`] copied (or, dry, would copy).
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Carried {
+    /// `meta` or `full`.
+    pub mode: &'static str,
+    /// The derived session's `subagents/` dir.
+    pub into: PathBuf,
+    /// Spawn records copied, at any depth.
+    pub metas: usize,
+    /// Transcripts copied (`full` only): the agents directly under `subagents/`.
+    pub transcripts: usize,
+    pub transcript_bytes: usize,
+    /// `full` only: agent transcripts below the top level (workflow agents) left behind; their
+    /// spawn records are still carried.
+    pub nested_transcripts_left: usize,
+}
+
+const CARRY_HINT: &str = " (the session already holds this agent)";
+
+/// Copy `from`'s sub-agents into `into`, a session derived from it, under the same relative paths
+/// in `<project>/<into>/subagents/`. Every spawn record goes, whatever its `finished` says (it is
+/// `true` while an agent only waits on its shell). A session with no `subagents/` dir carries
+/// nothing. Nothing in `from` is written; a name already taken in `into` is refused.
+///
+/// A transcript is copied as it stands when this runs. What an agent that is mid-turn writes
+/// after the copy lands in whichever session folder its process then has current, and is not in
+/// the copy; how Claude Code joins the two was not measured.
+pub fn carry(from: &SessionFile, into: &SessionFile, mode: Carry, write: bool) -> Result<Carried> {
+    let src = from.subagents_dir();
+    let dst = into.subagents_dir();
+    if from.session_id == into.session_id || src == dst {
+        bail!("session {} cannot carry its agents into itself", from.session_id);
+    }
+    let mut carried = Carried {
+        mode: mode.as_str(),
+        into: dst.clone(),
+        ..Default::default()
+    };
+    if !src.is_dir() {
+        return Ok(carried);
+    }
+    // Transcripts first, each published with its spawn record as one set, as an adoption is.
+    let mut done = std::collections::HashSet::new();
+    if mode == Carry::Full {
+        let mut agents = agents_in(from, "");
+        agents.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
+        for agent in agents {
+            let p = plan(agent, vec![], into);
+            let adopted = execute(&p, write, false).with_context(|| format!("carrying agent {}", p.agent.agent_id))?;
+            carried.transcripts += 1;
+            carried.transcript_bytes += adopted.bytes;
+            if p.dest_meta.is_some() {
+                carried.metas += 1;
+                done.insert(PathBuf::from(format!("agent-{}.meta.json", p.agent.agent_id)));
+            }
+        }
+    }
+    // Then every spawn record not yet there, verbatim: workflow agents' (one level down) and
+    // those whose transcript was never written.
+    let mut metas = Vec::new();
+    let mut nested = 0usize;
+    carried_files(&src, Path::new(""), &mut metas, &mut nested)?;
+    metas.sort();
+    let mut set = crate::publish::Set::new();
+    let mut sources = Vec::new();
+    for rel in metas {
+        if done.contains(&rel) {
+            continue;
+        }
+        let to = dst.join(&rel);
+        crate::publish::refuse_existing(&to, CARRY_HINT)?;
+        carried.metas += 1;
+        if !write {
+            continue;
+        }
+        let from_path = src.join(&rel);
+        let dir = to.parent().context("destination has no parent dir")?;
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        let source =
+            crate::json::JsonSource::capture(&from_path).with_context(|| format!("reading {}", from_path.display()))?;
+        let mut file = std::fs::File::open(&from_path)?;
+        source.check_metadata(file.metadata()?)?;
+        // No more exposed than the spawn record it copies.
+        let mut staged = crate::publish::Staged::create(dir, "carry", crate::publish::mode_of(&file))?;
+        std::io::copy(&mut file, &mut staged)?;
+        sources.push((source, file));
+        set.add(staged, to, crate::publish::Claim::New);
+    }
+    for (source, file) in &sources {
+        source.check_metadata(file.metadata()?)?;
+        source.check()?;
+    }
+    set.publish()?;
+    if mode == Carry::Full {
+        carried.nested_transcripts_left = nested;
+    }
+    Ok(carried)
+}
+
+/// The relative path of every `agent-*.meta.json` under `dir`, and how many agent transcripts
+/// sit below its top level.
+fn carried_files(dir: &Path, rel: &Path, metas: &mut Vec<PathBuf>, nested: &mut usize) -> Result<()> {
+    for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
+        let entry = entry?;
+        let file_name = entry.file_name();
+        let rel = rel.join(&file_name);
+        if entry.file_type()?.is_dir() {
+            carried_files(&entry.path(), &rel, metas, nested)?;
+            continue;
+        }
+        let Some(name) = file_name.to_str() else { continue };
+        if !name.starts_with("agent-") {
+            continue;
+        }
+        if name.ends_with(".meta.json") {
+            metas.push(rel);
+        } else if name.ends_with(".jsonl") && !name.ends_with(".flat.jsonl") && rel.components().count() > 1 {
+            *nested += 1;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -396,6 +569,152 @@ mod tests {
             Harness::Claude,
         ))
         .unwrap()
+    }
+
+    const NEW: &str = "33333333-3333-4333-8333-333333333333";
+    const WORKFLOW_META: &str = r#"{"agentType":"Explore","model":"sonnet"}"#;
+
+    /// The session a rewind or prune just derived from `DEAD`: its transcript is published, its
+    /// `subagents/` dir is not there yet.
+    fn derived(root: &Path) -> SessionFile {
+        let path = root.join("-tmp-proj").join(format!("{NEW}.jsonl"));
+        std::fs::write(
+            &path,
+            format!(
+                "{{\"type\":\"user\",\"sessionId\":\"{NEW}\",\"message\":{{\"role\":\"user\",\"content\":\"go\"}}}}\n"
+            ),
+        )
+        .unwrap();
+        SessionFile::at(&path).unwrap()
+    }
+
+    /// A workflow agent one level below `subagents/`, with its spawn record and a transcript.
+    fn workflow_agent(from: &SessionFile) {
+        let run = from.subagents_dir().join("workflows").join("wf_1");
+        std::fs::create_dir_all(&run).unwrap();
+        std::fs::write(run.join("agent-b1.meta.json"), WORKFLOW_META).unwrap();
+        std::fs::write(run.join("agent-b1.jsonl"), "{}\n").unwrap();
+    }
+
+    #[test]
+    fn carry_mode_parses_meta_and_full_only() {
+        assert_eq!("meta".parse::<Carry>().unwrap(), Carry::Meta);
+        assert_eq!("full".parse::<Carry>().unwrap(), Carry::Full);
+        assert!("all".parse::<Carry>().is_err());
+        assert_eq!((Carry::Meta.as_str(), Carry::Full.as_str()), ("meta", "full"));
+    }
+
+    #[test]
+    fn carry_meta_copies_every_spawn_record_verbatim_and_no_transcript() {
+        let root = fixture("carry-meta");
+        let from = sf(&root, DEAD);
+        let into = derived(&root);
+        workflow_agent(&from);
+        let name = format!("agent-{AGENT}.meta.json");
+        let meta = std::fs::read(from.subagents_dir().join(&name)).unwrap();
+        let transcript = std::fs::read(from.subagents_dir().join(format!("agent-{AGENT}.jsonl"))).unwrap();
+
+        // Dry: counted, nothing written.
+        let dry = carry(&from, &into, Carry::Meta, false).unwrap();
+        assert_eq!((dry.metas, dry.transcripts), (2, 0));
+        assert!(!into.subagents_dir().exists());
+
+        let carried = carry(&from, &into, Carry::Meta, true).unwrap();
+        assert_eq!(
+            (
+                carried.mode,
+                carried.metas,
+                carried.transcripts,
+                carried.nested_transcripts_left
+            ),
+            ("meta", 2, 0, 0)
+        );
+        let dst = into.subagents_dir();
+        assert_eq!(carried.into, dst);
+        assert_eq!(std::fs::read(dst.join(&name)).unwrap(), meta);
+        assert_eq!(
+            std::fs::read_to_string(dst.join("workflows").join("wf_1").join("agent-b1.meta.json")).unwrap(),
+            WORKFLOW_META
+        );
+        // Spawn records only, and no staging file left beside them.
+        assert!(!dst.join(format!("agent-{AGENT}.jsonl")).exists());
+        assert!(!dst.join("workflows").join("wf_1").join("agent-b1.jsonl").exists());
+        assert_eq!(std::fs::read_dir(&dst).unwrap().count(), 2);
+        // The source is untouched.
+        assert_eq!(std::fs::read(from.subagents_dir().join(&name)).unwrap(), meta);
+        assert_eq!(
+            std::fs::read(from.subagents_dir().join(format!("agent-{AGENT}.jsonl"))).unwrap(),
+            transcript
+        );
+
+        // A second carry refuses the names it already holds and changes nothing.
+        let err = format!("{:#}", carry(&from, &into, Carry::Meta, true).unwrap_err());
+        assert!(err.contains("refusing to overwrite"), "{err}");
+        assert_eq!(std::fs::read(dst.join(&name)).unwrap(), meta);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn carry_full_restamps_the_transcripts_and_copies_every_spawn_record() {
+        let root = fixture("carry-full");
+        let from = sf(&root, DEAD);
+        let into = derived(&root);
+        workflow_agent(&from);
+        let src = from.subagents_dir();
+        // A spawn record whose transcript was never written still comes along.
+        std::fs::write(src.join("agent-c2.meta.json"), r#"{"agentType":"general-purpose"}"#).unwrap();
+        let name = format!("agent-{AGENT}.jsonl");
+        let transcript = std::fs::read_to_string(src.join(&name)).unwrap();
+
+        let dry = carry(&from, &into, Carry::Full, false).unwrap();
+        assert_eq!((dry.metas, dry.transcripts, dry.nested_transcripts_left), (3, 1, 1));
+        assert!(!into.subagents_dir().exists());
+
+        let carried = carry(&from, &into, Carry::Full, true).unwrap();
+        assert_eq!(
+            (
+                carried.mode,
+                carried.metas,
+                carried.transcripts,
+                carried.nested_transcripts_left
+            ),
+            ("full", 3, 1, 1)
+        );
+        let dst = into.subagents_dir();
+        let out = std::fs::read_to_string(dst.join(&name)).unwrap();
+        assert_eq!((carried.transcript_bytes, dry.transcript_bytes), (out.len(), out.len()));
+        // Only the top-level session ids changed: swapping them back gives the source bytes.
+        assert_eq!(out.matches(NEW).count(), 2);
+        assert_eq!(restamp(&out, DEAD).body, transcript);
+        for meta in [format!("agent-{AGENT}.meta.json"), "agent-c2.meta.json".to_string()] {
+            assert_eq!(
+                std::fs::read(dst.join(&meta)).unwrap(),
+                std::fs::read(src.join(&meta)).unwrap()
+            );
+        }
+        // A workflow agent keeps its spawn record; its transcript is reported, not carried.
+        let run = dst.join("workflows").join("wf_1");
+        assert_eq!(
+            std::fs::read_to_string(run.join("agent-b1.meta.json")).unwrap(),
+            WORKFLOW_META
+        );
+        assert!(!run.join("agent-b1.jsonl").exists());
+        assert_eq!(std::fs::read_to_string(src.join(&name)).unwrap(), transcript);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn carry_from_a_session_with_no_agents_writes_nothing() {
+        let root = fixture("carry-none");
+        let into = derived(&root);
+        for mode in [Carry::Meta, Carry::Full] {
+            let carried = carry(&sf(&root, LIVE), &into, mode, true).unwrap();
+            assert_eq!((carried.metas, carried.transcripts), (0, 0));
+        }
+        assert!(!into.project_dir.join(NEW).exists());
+        // A session is never its own successor.
+        assert!(carry(&into, &into, Carry::Meta, true).is_err());
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
