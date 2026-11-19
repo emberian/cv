@@ -538,13 +538,15 @@ enum Cmd {
         /// hundreds of MB for big sessions). Resume doesn't need it — only cv's forest features do.
         #[arg(long)]
         copy_resources: bool,
-        /// Take the session's sub-agents along: copy each agent's spawn record (`meta`: it keeps
-        /// its model and type) and, by default, its transcript restamped (`full`: its brief and
-        /// cache too) under the new session id. Claude Code re-enters a background agent from the
-        /// CURRENT session's folder, so after an in-place `/resume` of the new session an agent
-        /// that was not carried runs on the parent's model with no brief. Files are copied as they
-        /// stand: what an agent mid-turn writes after the copy is not carried.
-        #[arg(long, value_name = "WHAT", num_args = 0..=1, default_missing_value = "full", value_parser = ["meta", "full"], conflicts_with = "copy_resources")]
+        /// Take the session's sub-agents along under the new session id: each agent's spawn record
+        /// (it keeps its model and type) and its transcript, restamped (its brief and cache too).
+        /// `--carry-agents=meta` is for a caller who wants the spawn records only; a value needs
+        /// `=`, so the bare flag never takes the session id. Claude Code re-enters a background
+        /// agent from the CURRENT session's folder, so after an in-place `/resume` of the new
+        /// session an agent that was not carried runs on the parent's model with no brief. A
+        /// transcript the new session already holds is joined, never replaced; `cv adopt --join`
+        /// repeats the carry after the move.
+        #[arg(long, value_name = "meta|full", num_args = 0..=1, require_equals = true, default_missing_value = "full", value_parser = ["meta", "full"], conflicts_with = "copy_resources")]
         carry_agents: Option<String>,
         /// Preserve the original `usage` records byte-for-byte (opt out of revive). By default,
         /// prune corrects the recorded context size so a maxed-out session will resume: Claude
@@ -647,14 +649,16 @@ enum Cmd {
         /// Restored Claude skills: keep all, drop all, or drop entries whose files changed or disappeared.
         #[arg(long = "skills", value_parser = ["keep", "drop", "drop-stale"], default_value = "keep")]
         skills: String,
-        /// Take the session's sub-agents along: copy each agent's spawn record (`meta`: it keeps
-        /// its model and type) and, by default, its transcript restamped (`full`: its brief and
-        /// cache too) under the new session id. Claude Code re-enters a background agent from the
-        /// CURRENT session's folder, so after an in-place `/resume` of the new session an agent
-        /// that was not carried runs on the parent's model with no brief. Files are copied as they
-        /// stand: what an agent mid-turn writes after the copy is not carried. Every agent of
+        /// Take the session's sub-agents along under the new session id: each agent's spawn record
+        /// (it keeps its model and type) and its transcript, restamped (its brief and cache too).
+        /// `--carry-agents=meta` is for a caller who wants the spawn records only; a value needs
+        /// `=`, so the bare flag never takes the session id. Claude Code re-enters a background
+        /// agent from the CURRENT session's folder, so after an in-place `/resume` of the new
+        /// session an agent that was not carried runs on the parent's model with no brief. A
+        /// transcript the new session already holds is joined, never replaced; `cv adopt --join`
+        /// repeats the carry after the move. Every agent of
         /// the source goes, those spawned after the cut included.
-        #[arg(long, value_name = "WHAT", num_args = 0..=1, default_missing_value = "full", value_parser = ["meta", "full"])]
+        #[arg(long, value_name = "meta|full", num_args = 0..=1, require_equals = true, default_missing_value = "full", value_parser = ["meta", "full"])]
         carry_agents: Option<String>,
         /// Report the window that would be written without writing anything.
         #[arg(long)]
@@ -821,14 +825,16 @@ enum Cmd {
         /// Emit a resumable main-thread Claude session (new id) under the Claude store or --out.
         #[arg(long, conflicts_with_all = ["agent_of", "harness", "export"])]
         session: bool,
-        /// Take the session's sub-agents along: copy each agent's spawn record (`meta`: it keeps
-        /// its model and type) and, by default, its transcript restamped (`full`: its brief and
-        /// cache too) under the new session id. Claude Code re-enters a background agent from the
-        /// CURRENT session's folder, so after an in-place `/resume` of the new session an agent
-        /// that was not carried runs on the parent's model with no brief. Files are copied as they
-        /// stand: what an agent mid-turn writes after the copy is not carried. With --session:
+        /// Take the session's sub-agents along under the new session id: each agent's spawn record
+        /// (it keeps its model and type) and its transcript, restamped (its brief and cache too).
+        /// `--carry-agents=meta` is for a caller who wants the spawn records only; a value needs
+        /// `=`, so the bare flag never takes the session id. Claude Code re-enters a background
+        /// agent from the CURRENT session's folder, so after an in-place `/resume` of the new
+        /// session an agent that was not carried runs on the parent's model with no brief. A
+        /// transcript the new session already holds is joined, never replaced; `cv adopt --join`
+        /// repeats the carry after the move. With --session:
         /// the agents of every Claude session a span came from.
-        #[arg(long, value_name = "WHAT", num_args = 0..=1, default_missing_value = "full", value_parser = ["meta", "full"], requires = "session")]
+        #[arg(long, value_name = "meta|full", num_args = 0..=1, require_equals = true, default_missing_value = "full", value_parser = ["meta", "full"], requires = "session")]
         carry_agents: Option<String>,
         /// Emit a new sub-agent transcript owned by this ROOT session (id or transcript path).
         #[arg(
@@ -1865,6 +1871,37 @@ mod tests {
         let err = resolve_declassify_tokens(None, Some(dir.join("nope.txt"))).unwrap_err();
         assert!(err.to_string().contains("declassify-tokens-file"), "{err}");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// What `--carry-agents` parsed to on `cv prune`, `cv rewind` or `cv splice`.
+    fn carry_of(args: &[&str]) -> Option<String> {
+        match Cli::try_parse_from(args.iter().copied()).unwrap().cmd {
+            Cmd::Prune { carry_agents, .. } | Cmd::Rewind { carry_agents, .. } | Cmd::Splice { carry_agents, .. } => {
+                carry_agents
+            }
+            _ => panic!("not a prune, rewind or splice"),
+        }
+    }
+
+    /// Off without the flag; the bare flag is `full` and never takes the id after it; a value
+    /// needs `=`.
+    #[test]
+    fn carry_agents_is_off_by_default_bare_is_full_and_a_value_needs_equals() {
+        crate::on_main_sized_stack(|| {
+            for verb in [&["prune"][..], &["rewind"], &["splice", "--session"]] {
+                let args = |rest: &[&'static str]| [&["cv"][..], verb, rest].concat();
+                assert_eq!(carry_of(&args(&["abc"])), None);
+                assert_eq!(carry_of(&args(&["--carry-agents", "abc"])).as_deref(), Some("full"));
+                assert_eq!(carry_of(&args(&["abc", "--carry-agents"])).as_deref(), Some("full"));
+                assert_eq!(
+                    carry_of(&args(&["abc", "--carry-agents=meta"])).as_deref(),
+                    Some("meta")
+                );
+                assert!(Cli::try_parse_from(args(&["abc", "--carry-agents=all"])).is_err());
+            }
+            assert!(Cli::try_parse_from(["cv", "prune", "abc", "--carry-agents", "--copy-resources"]).is_err());
+            assert!(Cli::try_parse_from(["cv", "splice", "abc", "--carry-agents"]).is_err());
+        });
     }
 
     #[test]
