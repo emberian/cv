@@ -1683,6 +1683,7 @@ fn source_turn_projection_matches_frozen_composition() -> Result<()> {
                         &HashMap::new(),
                         user,
                         thinking && !user,
+                        &HashSet::new(),
                     )?;
                     assert_frozen_plan(&format!("turn-{case}-{drop}-{thinking}-{min_hits}"), plan.as_ref());
                 }

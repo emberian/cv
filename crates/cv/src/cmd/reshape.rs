@@ -201,10 +201,11 @@ pub(crate) fn cmd_prune(args: PruneArgs<'_>) -> Result<()> {
             (Some(estimated), Some(recorded)) => {
                 let _ = writeln!(
                     h,
-                    "  revived: rewrote recorded context {}k → estimated {}k across {} usage record(s) — resume acceptance unverified",
+                    "  revived: {} usage record(s) recorded above the post-prune estimate were rewritten to it: \
+                     highest recorded {}k → estimated {}k (bytes and recorded deltas, with margins; not a measurement)",
+                    res.usage_rewritten,
                     recorded / 1000,
                     estimated / 1000,
-                    res.usage_rewritten,
                 );
             }
             _ => {
@@ -212,16 +213,49 @@ pub(crate) fn cmd_prune(args: PruneArgs<'_>) -> Result<()> {
             }
         }
     }
+    // The number the harness acts on is neither of those two unless it is the last record's.
+    if let (Some(before), Some(after)) = (res.last_request_tokens, res.last_request_tokens_after) {
+        let now = if after == before {
+            "unchanged".to_string()
+        } else {
+            format!("→ {}k (the estimate) — resume acceptance unverified", after / 1000)
+        };
+        let _ = writeln!(
+            h,
+            "  resume reads the last request's recorded size (input + cache read + cache creation): {}k, {now}",
+            before / 1000,
+        );
+    }
     if let Some(p) = &res.plan {
         let _ = writeln!(
             h,
-            "  plan: {} kept · {} précis · {} excerpt(s) · {} attachment(s) dropped · {} payload bytes removed",
+            "  plan: {} kept · {} pointer(s) · {} précis · {} excerpt(s) · dropped {} result(s), {} record(s), \
+             {} attachment(s) by kind · {} payload bytes removed",
             p.keep,
+            p.pointer,
             p.precis,
             p.excerpt,
+            p.results_dropped,
+            p.records_dropped,
             p.attachments_dropped,
             human_bytes(p.bytes_saved),
         );
+        // The one thing a selection can get wrong and still be a valid session.
+        const SHOWN: usize = 8;
+        for u in p.rests_on_nothing.iter().take(SHOWN) {
+            let _ = writeln!(
+                h,
+                "  ⚠ reply {} rests on nothing kept: its turn's {} tool result(s) were all dropped or pointered",
+                u.reply, u.results
+            );
+        }
+        if p.rests_on_nothing.len() > SHOWN {
+            let _ = writeln!(
+                h,
+                "  ⚠ … and {} more replies that rest on nothing kept (--json lists them)",
+                p.rests_on_nothing.len() - SHOWN
+            );
+        }
     }
     skills_line(&mut h, &res.skills);
     for w in &res.warnings {
