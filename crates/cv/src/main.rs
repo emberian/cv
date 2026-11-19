@@ -535,7 +535,8 @@ enum Cmd {
         #[arg(long = "drop-thinking")]
         drop_thinking: bool,
         /// Also copy the session's subagents/workflows dir under the new id (off by default; can be
-        /// hundreds of MB for big sessions). Resume doesn't need it — only cv's forest features do.
+        /// hundreds of MB for big sessions), verbatim. A resume in a new process doesn't need it —
+        /// cv's forest features do; for a session resumed in place, see --carry-agents.
         #[arg(long)]
         copy_resources: bool,
         /// Take the session's sub-agents along under the new session id: each agent's spawn record

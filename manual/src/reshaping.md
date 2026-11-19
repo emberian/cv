@@ -56,7 +56,11 @@ sub-agents along. Claude Code re-enters a background agent from the current sess
 `subagents/` folder, and a derived session has a new id: without its `agent-<id>.meta.json` the
 agent comes back on the parent's model as a general-purpose agent, and without its transcript it
 has no brief. `meta` copies the spawn records verbatim; `full` (the default) also copies each
-transcript with the session id restamped. Files are copied as they stand, a line at a time.
+transcript with the session id restamped. A value needs `=` (`--carry-agents=meta`), so the bare
+flag never takes the session id after it. A transcript goes the way an adoption does: the source is
+checked while it is read, the staged copy is checked against the resume rules, and it is published
+with its meta as one set. A source whose last record is unfinished (its writer is mid-append) is
+carried up to that record, and the report says so.
 
 An agent that is mid-turn when its parent moves keeps running and writes its next records into
 the new session's folder: a file that begins mid-conversation, with no meta. So a transcript the
