@@ -49,9 +49,11 @@ fn carry(
             let line = carried_line(c);
             let did = line.split(" → ").next().unwrap_or_default();
             let _ = writeln!(h, "  agents:      {did} → the new session's subagents/");
+            refused_lines(h, c);
         }
         Some(c) => {
             let _ = writeln!(h, "  agents:      {}", carried_line(c));
+            refused_lines(h, c);
         }
         None => {
             let _ = writeln!(h, "  agents:      the source has none to carry");
@@ -70,6 +72,7 @@ pub(crate) fn carried_line(c: &Carried) -> String {
             "transcript(s) joined (the source's records first, then what the session already held)",
         ),
         (c.unfinished, "transcript(s) carried up to an unfinished last record"),
+        (c.refused.len(), "transcript(s) refused"),
         (c.already, "file(s) already there, left as they are"),
     ];
     let done: Vec<String> = clauses
@@ -87,6 +90,18 @@ pub(crate) fn carried_line(c: &Carried) -> String {
         let _ = write!(line, " ({} file(s) another source already supplied)", c.duplicates);
     }
     line
+}
+
+/// One line per transcript a carry refused, under [`carried_line`]: a warning, the session is
+/// written either way.
+pub(crate) fn refused_lines(h: &mut String, c: &Carried) {
+    const SHOWN: usize = 8;
+    for r in c.refused.iter().take(SHOWN) {
+        let _ = writeln!(h, "  ⚠ agent {} not carried: {}", r.agent, r.why);
+    }
+    if c.refused.len() > SHOWN {
+        let _ = writeln!(h, "  ⚠ … and {} more (--json lists them)", c.refused.len() - SHOWN);
+    }
 }
 
 // ---------- prune ----------

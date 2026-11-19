@@ -60,7 +60,10 @@ transcript with the session id restamped. A value needs `=` (`--carry-agents=met
 flag never takes the session id after it. A transcript goes the way an adoption does: the source is
 checked while it is read, the staged copy is checked against the resume rules, and it is published
 with its meta as one set. A source whose last record is unfinished (its writer is mid-append) is
-carried up to that record, and the report says so.
+carried up to that record, and the report says so. A transcript whose content is refused (a whole
+line that is not a record, a copy the check will not pass) is skipped and named under the line;
+its spawn record still goes and every other agent is carried. The session is written, so `prune`,
+`rewind` and `splice` exit 0 with the warning; `cv adopt --join` exits 1.
 
 An agent that is mid-turn when its parent moves keeps running and writes its next records into
 the new session's folder: a file that begins mid-conversation, with no meta. So a transcript the

@@ -23,6 +23,8 @@
 //! is the head, and the destination's own records are appended after the check: an agent that
 //! is still running has an unanswered call the source never had. A source whose last record is
 //! unfinished (its writer is mid-append) is carried up to that record, and the report says so.
+//! A transcript whose content is refused (a whole line that is not a record, a copy the check
+//! will not pass) is skipped and named; its meta still goes, and every other agent is carried.
 //!
 //! Every file is read and written a record at a time; memory is one record plus the files'
 //! record ranges and, for a join, their record ids.
@@ -79,6 +81,37 @@ pub struct Carried {
     pub duplicates: usize,
     /// Bytes of the copied and joined transcripts as written.
     pub transcript_bytes: u64,
+    /// Transcripts not carried because of what they hold: skipped, the rest carried. Each one's
+    /// meta still goes, so the agent keeps its model and type and loses its brief.
+    pub refused: Vec<Refusal>,
+}
+
+/// One transcript the carry refused.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Refusal {
+    /// The agent id.
+    pub agent: String,
+    pub why: String,
+}
+
+/// A transcript refused for its content: not an error of the carry, which goes on.
+#[derive(Debug)]
+struct Refused(String);
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for Refused {}
+
+/// `error` as a [`Refused`] when it is about the transcript's content: a line that is not one
+/// JSON record, or a copy the resume check will not pass. An I/O failure stays what it is.
+fn refusal(error: anyhow::Error) -> anyhow::Error {
+    if error.is::<InvalidJson>() || error.root_cause().downcast_ref::<std::io::Error>().is_none() {
+        Refused(format!("{error:#}")).into()
+    } else {
+        error
+    }
 }
 
 struct Entry {
@@ -248,7 +281,8 @@ fn transcript(from: &Path, to: &Path, new_id: &str, meta: Option<(&Path, &Path)>
     let outcome = if existing { Outcome::Joined } else { Outcome::Copied };
     let ends_whole = rows.last().is_none_or(|(_, complete)| *complete);
     if dry_run {
-        let head = crate::derive::derive(&source, &file, rows.iter().map(read), &rewrite, &mut std::io::sink())?;
+        let head = crate::derive::derive(&source, &file, rows.iter().map(read), &rewrite, &mut std::io::sink())
+            .map_err(refusal)?;
         let mut bytes = head.bytes as u64;
         if existing {
             lines(std::fs::File::open(to)?, held_len, |line, whole| {
@@ -271,12 +305,12 @@ fn transcript(from: &Path, to: &Path, new_id: &str, meta: Option<(&Path, &Path)>
     // The head: the source's records, restamped and checked as an adoption's are.
     let mode = crate::publish::mode_of(&file);
     let mut staged = std::io::BufWriter::with_capacity(64 * 1024, Staged::beside(to, "carry", mode)?);
-    let head = crate::derive::derive(&source, &file, rows.iter().map(read), &rewrite, &mut staged)?;
+    let head = crate::derive::derive(&source, &file, rows.iter().map(read), &rewrite, &mut staged).map_err(refusal)?;
     let mut staged = staged.into_inner().map_err(|e| e.into_error())?;
     source.check_metadata(file.metadata()?)?;
     source.check()?;
     let agent = crate::derive::agent_of(from);
-    crate::derive::verify(Harness::Claude, &source, &file, agent, staged.path(), to, agent)?;
+    crate::derive::verify(Harness::Claude, &source, &file, agent, staged.path(), to, agent).map_err(refusal)?;
     let mut bytes = head.bytes as u64;
     if existing {
         // Then what only the destination holds, in its order, whole records only. An agent may
@@ -387,8 +421,21 @@ pub fn carry_agents(
         let meta_rel = entry.to.with_extension("meta.json");
         let meta_to = target.join(&meta_rel);
         let meta = metas.get(meta_rel.as_path()).map(|from| (*from, meta_to.as_path()));
-        let done = transcript(&entry.from, &to, new_id, meta, dry_run)
-            .with_context(|| format!("carrying {}", entry.from.display()))?;
+        let done = match transcript(&entry.from, &to, new_id, meta, dry_run) {
+            Ok(done) => done,
+            // What this transcript holds will not change on a repeat: skip it and carry the rest.
+            // Its meta is left for the pass below.
+            Err(error) => match error.downcast::<Refused>() {
+                Ok(Refused(why)) => {
+                    carried.refused.push(Refusal {
+                        agent: crate::derive::agent_of(&entry.from).unwrap_or_default().to_string(),
+                        why,
+                    });
+                    continue;
+                }
+                Err(error) => return Err(error.context(format!("carrying {}", entry.from.display()))),
+            },
+        };
         if meta.is_some() {
             paired.insert(meta_rel);
             if done.meta {
@@ -630,11 +677,59 @@ mod tests {
             std::fs::read_to_string(into.join("agent-a1.jsonl"))?,
             stamped.replace(r#":"new""#, r#":"join""#) + &tail
         );
-        // A whole line that is not a record is refused for that agent, as an adoption refuses it.
-        std::fs::write(from.join("agent-a1.jsonl"), format!("{whole}not a record\n"))?;
-        let refused = carry(&old, &world.proj.join("third.jsonl"), "third", CarryAgents::Full, false);
-        assert!(refused.is_err());
-        assert!(!world.proj.join("third/subagents/agent-a1.jsonl").exists());
+        Ok(())
+    }
+
+    /// One transcript the carry refuses must not cost the others: of three agents in name order
+    /// the middle one holds a whole line that is not a record. The first and third are carried,
+    /// the middle one's meta goes and its transcript does not, it is named, and a repeat changes
+    /// nothing.
+    #[test]
+    fn a_refused_transcript_is_skipped_and_named_and_the_rest_are_carried() -> Result<()> {
+        let world = crate::test_world("carry-agents-refused");
+        let old = world.proj.join("old.jsonl");
+        std::fs::write(&old, "{}\n")?;
+        let from = world.proj.join("old/subagents");
+        std::fs::create_dir_all(&from)?;
+        let agent = |id: &str, extra: &str| -> Result<()> {
+            let lines = record("b1", None, "old", "user", "count")
+                .replace(r#""agentId":"a1""#, &format!(r#""agentId":"{id}""#));
+            std::fs::write(from.join(format!("agent-{id}.jsonl")), format!("{lines}{extra}"))?;
+            std::fs::write(
+                from.join(format!("agent-{id}.meta.json")),
+                format!(r#"{{"description":"{id}"}}"#),
+            )?;
+            Ok(())
+        };
+        agent("a1", "")?;
+        agent("a2", "not a record\n")?;
+        agent("a3", "")?;
+        let new = world.proj.join("new.jsonl");
+        let into = world.proj.join("new/subagents");
+        for dry in [true, false] {
+            let carried = carry(&old, &new, "new", CarryAgents::Full, dry)?;
+            assert_eq!(counts(&carried), (3, 2, 0, 0, 0), "dry {dry}");
+            assert_eq!(carried.refused.len(), 1);
+            assert_eq!(carried.refused[0].agent, "a2");
+            assert!(
+                carried.refused[0].why.contains("is not one JSON value"),
+                "{:?}",
+                carried.refused
+            );
+        }
+        for id in ["a1", "a3"] {
+            assert!(into.join(format!("agent-{id}.jsonl")).is_file(), "{id}");
+        }
+        assert!(!into.join("agent-a2.jsonl").exists());
+        assert_eq!(
+            std::fs::read_to_string(into.join("agent-a2.meta.json"))?,
+            r#"{"description":"a2"}"#
+        );
+        assert_eq!(std::fs::read_dir(&into)?.count(), 5, "no staging file left");
+        // A repeat refuses the same one and changes nothing.
+        let again = carry(&old, &new, "new", CarryAgents::Full, false)?;
+        assert_eq!((counts(&again), again.refused.len()), ((0, 0, 0, 5, 0), 1));
+        assert_eq!(std::fs::read_dir(&into)?.count(), 5);
         Ok(())
     }
 }

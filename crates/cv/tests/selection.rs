@@ -823,3 +823,86 @@ fn adopt_join_puts_a_moved_agents_earlier_records_before_what_the_new_session_ho
     let old = rows(&w.proj.join(OLD).join(format!("subagents/agent-{AGENT}.jsonl")));
     assert!(old.len() == 2 && old.iter().all(|r| r["sessionId"] == OLD));
 }
+
+/// One transcript the carry refuses must not cost the others. Three agents in name order, the
+/// middle one holding a whole line that is not a record: the session is written and the command
+/// exits 0, the first and third are carried, the middle one keeps its spawn record and is named.
+/// `adopt --join`, whose whole job is the carry, exits 1.
+#[test]
+fn a_refused_agent_transcript_is_skipped_and_named_and_the_others_are_carried() {
+    const SID: &str = "5e1ec7ed-0000-4000-8000-000000000007";
+    let w = World::new("carry-refused");
+    w.write_session(
+        SID,
+        &[
+            json!({"type": "user", "uuid": "u1", "parentUuid": null, "sessionId": SID,
+            "timestamp": "2026-03-06T07:00:00Z", "cwd": "/work/proj",
+            "message": {"role": "user", "content": "survey the orchard"}}),
+            json!({"type": "assistant", "uuid": "a1", "parentUuid": "u1", "sessionId": SID,
+            "timestamp": "2026-03-06T07:00:01Z", "cwd": "/work/proj",
+            "message": {"role": "assistant", "model": "claude-opus-5", "content": [{"type": "text", "text": "on it"}]}}),
+        ],
+    );
+    let ids = ["a000000000000001", "a000000000000002", "a000000000000003"];
+    for id in ids {
+        let path = w.write_agent(
+            SID,
+            id,
+            &json!({"agentType": "Explore", "description": id}),
+            &[
+                json!({"type": "user", "uuid": "b1", "parentUuid": null, "sessionId": SID, "agentId": id,
+                "isSidechain": true, "message": {"role": "user", "content": "count the trees"}}),
+            ],
+        );
+        if id == ids[1] {
+            let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
+            std::io::Write::write_all(&mut file, b"not a record\n").unwrap();
+        }
+    }
+    let (ok, code, out, err) = w.cv(&["prune", SID, "--carry-agents", "--json"]);
+    assert!(ok && code == 0, "the session is written: {code}\n{err}");
+    let report: Value = serde_json::from_str(out.trim()).unwrap();
+    let c = &report["carried_agents"];
+    assert_eq!((&c["metas"], &c["transcripts"]), (&json!(3), &json!(2)), "{report}");
+    assert_eq!(c["refused"].as_array().unwrap().len(), 1, "{report}");
+    assert_eq!(c["refused"][0]["agent"], ids[1], "{report}");
+    assert!(
+        c["refused"][0]["why"]
+            .as_str()
+            .unwrap()
+            .contains("is not one JSON value"),
+        "{report}"
+    );
+    assert!(
+        err.contains("agents:      3 spawn record(s) copied, 2 transcript(s) copied, 1 transcript(s) refused → "),
+        "{err}"
+    );
+    assert!(
+        err.contains(&format!("  ⚠ agent {} not carried: the record at byte ", ids[1])),
+        "{err}"
+    );
+    let new_id = report["new_id"].as_str().unwrap();
+    let sub = w.proj.join(new_id).join("subagents");
+    for id in [ids[0], ids[2]] {
+        assert_eq!(rows(&sub.join(format!("agent-{id}.jsonl"))).len(), 1, "{id}");
+    }
+    assert!(!sub.join(format!("agent-{}.jsonl", ids[1])).exists());
+    assert!(
+        sub.join(format!("agent-{}.meta.json", ids[1])).is_file(),
+        "its spawn record still goes"
+    );
+    assert_eq!(fs::read_dir(&sub).unwrap().count(), 5);
+
+    // The join after the fact: everything else is already there, and the refusal is its failure.
+    let (ok, code, out, err) = w.cv(&["adopt", "--join", "--from", SID, "--into", new_id, "--json"]);
+    assert!(!ok && code == 1, "{code}\n{err}");
+    let again: Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(again["carried_agents"]["already"], 5, "{again}");
+    assert_eq!(again["carried_agents"]["refused"][0]["agent"], ids[1], "{again}");
+    assert!(
+        err.contains(": 1 transcript(s) refused, 5 file(s) already there, left as they are → "),
+        "{err}"
+    );
+    assert!(err.contains(&format!("  ⚠ agent {} not carried: ", ids[1])), "{err}");
+    assert_eq!(fs::read_dir(&sub).unwrap().count(), 5, "a repeat changes nothing");
+}

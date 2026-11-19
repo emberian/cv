@@ -94,7 +94,7 @@ fn join(a: &AdoptArgs) -> Result<()> {
         a.dry_run,
     )?;
     let verb = if a.dry_run { "would join" } else { "joined" };
-    let h = match &carried {
+    let mut h = match &carried {
         Some(c) => format!(
             "✦ {verb} {} → {}: {}\n",
             short_id(&from.session_id),
@@ -103,11 +103,20 @@ fn join(a: &AdoptArgs) -> Result<()> {
         ),
         None => format!("✦ {} holds no such agents\n", short_id(&from.session_id)),
     };
+    let refused = carried.as_ref().map_or(0, |c| c.refused.len());
+    if let Some(c) = &carried {
+        crate::cmd::reshape::refused_lines(&mut h, c);
+    }
     report(
         a.json,
         &h,
         &json!({"from": from.session_id, "into": into.session_id, "carried_agents": carried, "written": !a.dry_run}),
-    )
+    )?;
+    // The carry is this command's whole job: a transcript it refused is a failure of it.
+    if refused > 0 {
+        anyhow::bail!("{refused} transcript(s) were refused; every other agent was carried");
+    }
+    Ok(())
 }
 
 fn run(roots: &[PathBuf], a: &AdoptArgs) -> Result<()> {
