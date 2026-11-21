@@ -594,6 +594,7 @@ pub(super) fn record(
     view: JsonView<'_>,
     at: Option<u64>,
     opts: &crate::stream::Demand,
+    skipped_parents: &mut std::collections::BTreeMap<String, Option<String>>,
     sink: &mut dyn MessageSink,
 ) -> Result<Flow> {
     // A record that is not an object carries nothing (Value's lookups all miss).
@@ -643,7 +644,7 @@ pub(super) fn record(
                     session.title = Some(t);
                 }
             }
-            return r.carry_or_skip(sink);
+            return r.carry_or_skip(skipped_parents, sink);
         }
         "custom-title" => {
             if let Some(t) = r.top.string("customTitle")? {
@@ -652,7 +653,7 @@ pub(super) fn record(
                     .harness_extra_mut(Harness::Claude)
                     .insert("custom_title".into(), Value::String(t));
             }
-            return r.carry_or_skip(sink);
+            return r.carry_or_skip(skipped_parents, sink);
         }
         "summary" => {
             if session.title.is_none() {
@@ -660,7 +661,7 @@ pub(super) fn record(
                     session.title = Some(t);
                 }
             }
-            return r.carry_or_skip(sink);
+            return r.carry_or_skip(skipped_parents, sink);
         }
         // Session-level facts. The continuation pointer is first-class lineage; the derived agent
         // name, a `/tag`, a fork's relocated cwd and the linked PR(s) are Claude facts in
@@ -669,7 +670,7 @@ pub(super) fn record(
             if let Some(id) = r.top.string("continuedInSessionId")? {
                 session.lineage.continued_in = Some(id);
             }
-            return r.carry_or_skip(sink);
+            return r.carry_or_skip(skipped_parents, sink);
         }
         // A fork sub-agent's first record (2.1.302+, `subagent_type: fork`): the child's context is
         // the parent transcript up to `parentLastUuid` (`contextLength` records), so the parent is
@@ -690,7 +691,7 @@ pub(super) fn record(
                     .harness_extra_mut(Harness::Claude)
                     .insert("fork_context".into(), Value::Object(cut));
             }
-            return r.carry_or_skip(sink);
+            return r.carry_or_skip(skipped_parents, sink);
         }
         "agent-name" | "tag" | "relocated" | "pr-link" => {
             let (from, to) = match ty {
@@ -710,7 +711,7 @@ pub(super) fn record(
                     bag.insert(to.into(), Value::String(value));
                 }
             }
-            return r.carry_or_skip(sink);
+            return r.carry_or_skip(skipped_parents, sink);
         }
         // Model-visible attachments. Since ~2.1.23x the system reminders Claude Code appends to the
         // prompt — hook output, edited-file notices, queued task notifications, CLAUDE.md
@@ -743,20 +744,21 @@ pub(super) fn record(
             }
             return match r.attachment()? {
                 Some(mut m) => {
+                    r.bridge_parent(&mut m, skipped_parents);
                     r.stamp(&mut m);
                     Ok(sink.message(m))
                 }
-                None => r.carry_or_skip(sink),
+                None => r.carry_or_skip(skipped_parents, sink),
             };
         }
         // The rest of [`META_TYPES`]: bookkeeping. The lean passes drop it; `complete` carries it
         // verbatim as round-trippable carrier messages.
-        t if META_TYPES.contains(&t) => return r.carry_or_skip(sink),
+        t if META_TYPES.contains(&t) => return r.carry_or_skip(skipped_parents, sink),
         "user" | "assistant" | "system" | "" => {}
         // Any other record is a bookkeeping record we haven't met yet (Claude Code adds a few per
         // release), whether or not it has a `message` field: only the three types above are turns.
         // Carry it in `complete` mode so round-trips stay lossless, skip it otherwise.
-        _ => return r.carry_or_skip(sink),
+        _ => return r.carry_or_skip(skipped_parents, sink),
     }
 
     note_conversation_metadata(
@@ -772,8 +774,10 @@ pub(super) fn record(
         _ => None,
     };
     let Some(mut msg) = message else {
+        r.note_skipped(skipped_parents)?;
         return Ok(Flow::Continue);
     };
+    r.bridge_parent(&mut msg, skipped_parents);
     r.stamp(&mut msg);
     contain_persisted_outputs(&mut msg, session.source_path.as_deref());
     // Keep the message model record-local; the session default is the first non-synthetic
@@ -813,14 +817,63 @@ impl<'a> Record<'a, '_> {
         }
     }
 
+    /// Record a skipped record's `uuid -> parentUuid` (or `logicalParentUuid`) link with path
+    /// compression so later emitted turns keep an intact `parent_id` chain across dropped hooks,
+    /// `command_permissions`, and bodyless system records.
+    fn note_skipped(&self, skipped_parents: &mut std::collections::BTreeMap<String, Option<String>>) -> Result<()> {
+        if self.opts.tier == Tier::Complete {
+            return Ok(());
+        }
+        let Some(uuid) = self.top.string("uuid")?.filter(|u| !u.is_empty()) else {
+            return Ok(());
+        };
+        let raw = match self.top.string("parentUuid")?.filter(|p| !p.is_empty()) {
+            Some(p) => Some(p),
+            None => self.top.string("logicalParentUuid")?.filter(|p| !p.is_empty()),
+        };
+        let bridged = match raw {
+            Some(p) => match skipped_parents.get(&p) {
+                Some(target) => target.clone(),
+                None => Some(p),
+            },
+            None => None,
+        };
+        skipped_parents.insert(uuid, bridged);
+        Ok(())
+    }
+
+    /// Resolve an emitted message's `parent_id` across any skipped ancestors.
+    fn bridge_parent(
+        &self,
+        msg: &mut Message,
+        skipped_parents: &mut std::collections::BTreeMap<String, Option<String>>,
+    ) {
+        if self.opts.tier == Tier::Complete {
+            return;
+        }
+        if let Some(id) = msg.id.as_deref() {
+            skipped_parents.remove(id);
+        }
+        if let Some(p) = msg.parent_id.as_deref() {
+            if let Some(bridged) = skipped_parents.get(p) {
+                msg.parent_id = bridged.clone();
+            }
+        }
+    }
+
     /// Carry the record verbatim under `complete`, skip it otherwise — the shared tail of every
     /// non-conversational record arm.
-    fn carry_or_skip(&self, sink: &mut dyn MessageSink) -> Result<Flow> {
-        Ok(if self.opts.tier == Tier::Complete {
-            sink.message(self.carrier()?)
+    fn carry_or_skip(
+        &self,
+        skipped_parents: &mut std::collections::BTreeMap<String, Option<String>>,
+        sink: &mut dyn MessageSink,
+    ) -> Result<Flow> {
+        if self.opts.tier == Tier::Complete {
+            Ok(sink.message(self.carrier()?))
         } else {
-            Flow::Continue
-        })
+            self.note_skipped(skipped_parents)?;
+            Ok(Flow::Continue)
+        }
     }
 
     /// A non-conversational meta record carried verbatim under [`crate::stream::Demand::COMPLETE`] so a
@@ -1128,7 +1181,15 @@ impl<'a> Record<'a, '_> {
             None => Message::synthesized(kind, origin),
         };
         m.id = self.top.string("uuid")?;
-        m.parent_id = self.top.string("parentUuid")?;
+        m.parent_id =
+            self.top
+                .string("parentUuid")?
+                .filter(|p| !p.is_empty())
+                .or(if kind == MessageKind::CompactionBoundary {
+                    self.top.string("logicalParentUuid")?.filter(|p| !p.is_empty())
+                } else {
+                    None
+                });
         m.timestamp = self.timestamp()?;
         if !bag.is_empty() {
             m.extra.insert(Harness::Claude.as_str().into(), Value::Object(bag));

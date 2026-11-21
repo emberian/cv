@@ -24,25 +24,23 @@ impl DeferredMessage {
         // The query has already inspected the original message. Keep `id`/`parent_id` and tool
         // call linkage (`id`, `tool_use_id`, `tool_name`) for `Format::OpenAiTools` and active-branch
         // trajectory selection, while dropping unconsumed rich sidecars/usage from the private spool.
-        let is_sidechain = message
-            .extra
-            .get("isSidechain")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-            || message
-                .extra
-                .get("cv")
-                .and_then(|v| v.get("inactive_branch"))
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
+        let inactive = super::is_inactive_branch(&message);
+        let sidechain = super::is_sidechain(&message);
         message.timestamp = None;
         message.model = None;
         message.usage = None;
         message.extra = serde_json::Map::new();
-        if is_sidechain {
+        if inactive || sidechain {
+            let mut cv = serde_json::Map::new();
+            if inactive {
+                cv.insert("inactive_branch".into(), serde_json::Value::Bool(true));
+            }
+            if sidechain {
+                cv.insert("isSidechain".into(), serde_json::Value::Bool(true));
+            }
             message
                 .extra
-                .insert("isSidechain".into(), serde_json::Value::Bool(true));
+                .insert(crate::ir::CV_NAMESPACE.into(), serde_json::Value::Object(cv));
         }
         message.complete_record = None;
         let mut sources = Vec::new();
@@ -162,6 +160,12 @@ impl Record for DeferredMessage {
         self.sources.capacity() * std::mem::size_of::<(SourceSlot, SourceDescriptor)>()
             + self.message.id.as_ref().map_or(0, String::capacity)
             + self.message.parent_id.as_ref().map_or(0, String::capacity)
+            + self
+                .message
+                .extra
+                .iter()
+                .map(|(key, value)| 1024 + key.capacity() + value_heap(value))
+                .sum::<usize>()
             + self.message.content.capacity() * std::mem::size_of::<Block>()
             + self
                 .message

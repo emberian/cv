@@ -577,15 +577,18 @@ impl Adapter for Claude {
         sink: &mut dyn MessageSink,
     ) -> Result<Option<Session>> {
         crate::stream::checked(sink, |sink| {
-            let session = match from {
-                Start::Checkpoint(cp) => match jsonl::restore(cp) {
-                    Some(session) => session,
+            let state = match from {
+                Start::Checkpoint(cp) => match jsonl::restore::<TranscriptState>(cp) {
+                    Some(state) => state,
                     None => return Ok(None),
                 },
-                _ => new_session_for(&r.id, Some(r.path.clone()), opts),
+                _ => TranscriptState {
+                    session: new_session_for(&r.id, Some(r.path.clone()), opts),
+                    skipped_parents: std::collections::BTreeMap::new(),
+                },
             };
             let read = jsonl::Read::open(&r.path)?;
-            let codec = Transcript { session, opts };
+            let codec = Transcript { state, opts };
             let mut spawns = crate::affordance::AffordanceSink::new(Harness::Claude, sink);
             let Some(s) = jsonl::drive(&read, from, codec, &mut spawns)? else {
                 return Ok(None);
@@ -643,8 +646,9 @@ pub fn stream_str(
     let mut spawns = crate::affordance::AffordanceSink::new(Harness::Claude, sink);
     // Pure-string path (parse_str, tests): no file offsets, so all content stays inline.
     let mut skipped = super::Unparsed::default();
+    let mut skipped_parents = std::collections::BTreeMap::new();
     let result = jsonl::slice(text.as_bytes(), |line| match line.view {
-        Some(view) => record::record(&mut session, view, None, opts, &mut spawns),
+        Some(view) => record::record(&mut session, view, None, opts, &mut skipped_parents, &mut spawns),
         None => {
             skipped.0 += u64::from(!line.blank);
             Ok(Flow::Continue)
@@ -658,16 +662,32 @@ pub fn stream_str(
     session
 }
 
-/// The Claude record codec over one captured transcript: each record accumulates into the session
-/// (a checkpoint's, or a fresh shell at 0). The shared driver owns source identity checks.
-struct Transcript<'r> {
+#[derive(serde::Serialize, serde::Deserialize)]
+struct TranscriptState {
+    #[serde(flatten)]
     session: Session,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    skipped_parents: std::collections::BTreeMap<String, Option<String>>,
+}
+
+/// The Claude record codec over one captured transcript: each record accumulates into the session
+/// (a checkpoint's, or a fresh shell at 0) while bridging skipped record `uuid -> parentUuid`
+/// links. The shared driver owns source identity checks.
+struct Transcript<'r> {
+    state: TranscriptState,
     opts: &'r Demand,
 }
 
 impl jsonl::Codec for Transcript<'_> {
     fn record(&mut self, view: crate::json::JsonView<'_>, at: u64, sink: &mut dyn MessageSink) -> Result<Flow> {
-        record::record(&mut self.session, view, Some(at), self.opts, sink)
+        record::record(
+            &mut self.state.session,
+            view,
+            Some(at),
+            self.opts,
+            &mut self.state.skipped_parents,
+            sink,
+        )
     }
 
     fn demand(&self) -> Demand {
@@ -675,15 +695,15 @@ impl jsonl::Codec for Transcript<'_> {
     }
 
     fn session(&mut self) -> &mut Session {
-        &mut self.session
+        &mut self.state.session
     }
 
     fn state(&self) -> impl serde::Serialize + '_ {
-        &self.session
+        &self.state
     }
 
     fn finish(self, _: bool, _: &mut dyn MessageSink) -> Result<Session> {
-        Ok(self.session)
+        Ok(self.state.session)
     }
 }
 
@@ -1836,7 +1856,8 @@ mod tests {
             Some("edited_text_file")
         );
         assert_eq!(att.id.as_deref(), Some("t2"));
-        assert_eq!(att.parent_id.as_deref(), Some("t1"));
+        // `t1` was dropped (unrendered hook), so `t2` bridges its parent link to `u0`.
+        assert_eq!(att.parent_id.as_deref(), Some("u0"));
         assert!(att.text().unwrap().contains("/x.md was modified"));
         assert!(!cl(att).contains_key("attachment"), "bulk keeps extra lean");
 
@@ -1850,6 +1871,7 @@ mod tests {
         let mut sink = CollectSink::default();
         stream_str("s1", &text, None, &Demand::COMPLETE, &mut sink);
         assert_eq!(sink.messages.len(), 4);
+        assert_eq!(sink.messages[2].parent_id.as_deref(), Some("t1"));
         let carried: Vec<_> = sink
             .messages
             .iter()

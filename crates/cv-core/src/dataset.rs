@@ -350,16 +350,20 @@ impl Default for DatasetOptions {
     }
 }
 
-fn is_inactive_or_sidechain(m: &Message) -> bool {
-    m.extra
-        .get("isSidechain")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
+pub(super) fn has_extra_bool(m: &Message, key: &str) -> bool {
+    m.extra.get(key).and_then(serde_json::Value::as_bool) == Some(true)
         || m.extra
-            .get("cv")
-            .and_then(|v| v.get("inactive_branch"))
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
+            .values()
+            .filter_map(serde_json::Value::as_object)
+            .any(|obj| obj.get(key).and_then(serde_json::Value::as_bool) == Some(true))
+}
+
+pub(super) fn is_inactive_branch(m: &Message) -> bool {
+    has_extra_bool(m, "inactive_branch")
+}
+
+pub(super) fn is_sidechain(m: &Message) -> bool {
+    has_extra_bool(m, "isSidechain")
 }
 
 /// Select the message indices to export under `opts`, or `None` if `clean_outcome_only` rejects
@@ -377,9 +381,14 @@ pub fn select_trajectory(messages: &[Message], opts: &DatasetOptions) -> Option<
 }
 
 fn select_active_branch_indices(messages: &[Message]) -> Vec<usize> {
+    let has_main_visible = messages
+        .iter()
+        .any(|m| m.is_model_visible() && !is_inactive_branch(m) && !is_sidechain(m));
+    let excluded = |m: &Message| is_inactive_branch(m) || (has_main_visible && is_sidechain(m));
+
     let mut by_id: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
     for (idx, m) in messages.iter().enumerate() {
-        if is_inactive_or_sidechain(m) {
+        if excluded(m) {
             continue;
         }
         if let Some(id) = m.id.as_deref().filter(|s| !s.is_empty()) {
@@ -388,22 +397,18 @@ fn select_active_branch_indices(messages: &[Message]) -> Vec<usize> {
     }
     let leaf = (0..messages.len()).rev().find(|&i| {
         let m = &messages[i];
-        !is_inactive_or_sidechain(m)
+        !excluded(m)
             && (m.is_model_visible() || m.kind == MessageKind::Error)
             && m.id.as_deref().is_some_and(|s| !s.is_empty())
     });
     let Some(leaf_idx) = leaf else {
-        return (0..messages.len())
-            .filter(|&i| !is_inactive_or_sidechain(&messages[i]))
-            .collect();
+        return (0..messages.len()).filter(|&i| !excluded(&messages[i])).collect();
     };
     let has_parent_links = messages
         .iter()
-        .any(|m| !is_inactive_or_sidechain(m) && m.parent_id.as_deref().is_some_and(|p| !p.is_empty()));
+        .any(|m| !excluded(m) && m.parent_id.as_deref().is_some_and(|p| !p.is_empty()));
     if !has_parent_links {
-        return (0..messages.len())
-            .filter(|&i| !is_inactive_or_sidechain(&messages[i]))
-            .collect();
+        return (0..messages.len()).filter(|&i| !excluded(&messages[i])).collect();
     }
 
     let mut chain = Vec::new();
@@ -414,17 +419,32 @@ fn select_active_branch_indices(messages: &[Message]) -> Vec<usize> {
             break;
         }
         chain.push(idx);
-        cur = messages[idx]
-            .parent_id
-            .as_deref()
-            .filter(|p| !p.is_empty())
-            .and_then(|p| by_id.get(p).copied());
+        cur = match messages[idx].parent_id.as_deref().filter(|p| !p.is_empty()) {
+            Some(p) => by_id.get(p).copied(),
+            // A compaction boundary with no recorded parent link (`parentUuid` /
+            // `logicalParentUuid`) on a harness that resets parent chains at compaction
+            // continues from the active turn immediately preceding the boundary.
+            None if messages[idx].kind == MessageKind::CompactionBoundary => {
+                (0..idx).rev().find(|&i| !excluded(&messages[i]))
+            }
+            // A compaction summary immediately after an id-less compaction boundary steps onto
+            // that boundary so the pre-compaction window stays connected.
+            None if messages[idx].kind == MessageKind::CompactionSummary
+                && idx > 0
+                && messages[idx - 1].kind == MessageKind::CompactionBoundary
+                && messages[idx - 1].id.is_none()
+                && !excluded(&messages[idx - 1]) =>
+            {
+                Some(idx - 1)
+            }
+            None => None,
+        };
     }
     chain.reverse();
     if let Some((0, first)) = messages.iter().enumerate().next() {
         if first.kind == MessageKind::SystemPrompt
             && first.id.is_none()
-            && !is_inactive_or_sidechain(first)
+            && !excluded(first)
             && chain.first().copied() != Some(0)
         {
             chain.insert(0, 0);
@@ -1081,6 +1101,7 @@ pub fn stage_record_with_options(
                     let keep = if self.needs_trajectory_pass {
                         training_role(&message, chat).is_some()
                             || message.kind == MessageKind::Error
+                            || message.kind == MessageKind::CompactionBoundary
                             || message.id.is_some()
                     } else {
                         training_role(&message, chat).is_some() && !message_is_empty(&message)
@@ -2321,6 +2342,147 @@ mod tests {
             None,
             &opts
         )?);
+        Ok(())
+    }
+
+    #[test]
+    fn active_branch_bridges_skipped_claude_records_and_compaction_without_stitching_rewinds() -> anyhow::Result<()> {
+        let active_opts = DatasetOptions {
+            active_branch_only: true,
+            ..Default::default()
+        };
+
+        // 1. Rewind across a skipped `command_permissions` attachment: `u2_good` links to `perm_1`
+        //    (parent `u1`), which sits physically AFTER abandoned `[a1_bad, u2_bad, a2_bad]`.
+        //    Parent bridging connects `u2_good -> u1` and omits the entire abandoned branch.
+        let rewound_jsonl = [
+            r#"{"type":"user","sessionId":"s","uuid":"u1","parentUuid":null,"message":{"role":"user","content":"initial prompt"}}"#,
+            r#"{"type":"assistant","sessionId":"s","uuid":"a1_bad","parentUuid":"u1","message":{"role":"assistant","model":"claude-fable-5-1","content":[{"type":"text","text":"wrong approach"}]}}"#,
+            r#"{"type":"user","sessionId":"s","uuid":"u2_bad","parentUuid":"a1_bad","message":{"role":"user","content":"abandoned follow-up"}}"#,
+            r#"{"type":"assistant","sessionId":"s","uuid":"a2_bad","parentUuid":"u2_bad","message":{"role":"assistant","model":"claude-fable-5-1","content":[{"type":"text","text":"abandoned reply"}]}}"#,
+            r#"{"type":"attachment","sessionId":"s","uuid":"perm_1","parentUuid":"u1","attachment":{"type":"command_permissions","allowedTools":["Bash"]}}"#,
+            r#"{"type":"user","sessionId":"s","uuid":"u2_good","parentUuid":"perm_1","message":{"role":"user","content":"rewound follow-up"}}"#,
+            r#"{"type":"system","subtype":"stop_hook_summary","sessionId":"s","uuid":"sh_1","parentUuid":"u2_good","hookCount":1,"hasOutput":false,"hookErrors":[]}"#,
+            r#"{"type":"assistant","sessionId":"s","uuid":"a2_good","parentUuid":"sh_1","message":{"role":"assistant","model":"claude-fable-5-1","content":[{"type":"text","text":"clean rewound answer"}]}}"#,
+        ]
+        .join("\n");
+
+        let world = crate::test_world("dataset-active-branch-claude");
+        let path = world.proj.join("s.jsonl");
+        std::fs::write(&path, &rewound_jsonl)?;
+        let adapter = crate::harness::claude::Claude::with_config_dir(&world.proj);
+        let r = crate::ir::SessionRef::new("s", Harness::Claude, &path);
+        let staged = stage_record_with_options(
+            &adapter,
+            &r,
+            Format::Chatml,
+            None,
+            1,
+            None,
+            &Default::default(),
+            &active_opts,
+        )?
+        .expect("staged record");
+        let mut bytes = Vec::new();
+        staged.publish(&mut bytes)?;
+        let exported: Value = serde_json::from_slice(&bytes)?;
+        assert_eq!(
+            exported["messages"],
+            json!([
+                {"role": "user", "content": "initial prompt"},
+                {"role": "user", "content": "rewound follow-up"},
+                {"role": "assistant", "content": "clean rewound answer"}
+            ]),
+            "abandoned rewound turns must never be stitched across perm_1"
+        );
+
+        // 2. Claude `compact_boundary` carrying `logicalParentUuid` connects pre-compaction active
+        //    turns while still omitting an abandoned branch before compaction.
+        let compacted_jsonl = [
+            r#"{"type":"user","sessionId":"c","uuid":"u1","parentUuid":null,"message":{"role":"user","content":"first"}}"#,
+            r#"{"type":"assistant","sessionId":"c","uuid":"a1_good","parentUuid":"u1","message":{"role":"assistant","model":"claude-fable-5-1","content":[{"type":"text","text":"good pre-compact"}]}}"#,
+            r#"{"type":"assistant","sessionId":"c","uuid":"a1_abandoned","parentUuid":"u1","message":{"role":"assistant","model":"claude-fable-5-1","content":[{"type":"text","text":"abandoned pre-compact"}]}}"#,
+            r#"{"type":"system","subtype":"compact_boundary","sessionId":"c","uuid":"cb1","parentUuid":null,"logicalParentUuid":"a1_good","compactMetadata":{"trigger":"manual","preTokens":1000}}"#,
+            r#"{"type":"user","sessionId":"c","uuid":"cs1","parentUuid":"cb1","isCompactSummary":true,"message":{"role":"user","content":"compacted summary"}}"#,
+            r#"{"type":"assistant","sessionId":"c","uuid":"a2","parentUuid":"cs1","message":{"role":"assistant","model":"claude-fable-5-1","content":[{"type":"text","text":"post-compact reply"}]}}"#,
+        ]
+        .join("\n");
+        let parsed_compact = crate::harness::claude::parse_str("c", &compacted_jsonl, None);
+        let mut compact_out = Vec::new();
+        assert!(write_record_with_options(
+            &parsed_compact,
+            &mut compact_out,
+            Format::Chatml,
+            None,
+            &active_opts
+        )?);
+        let compact_val: Value = serde_json::from_slice(&compact_out)?;
+        assert_eq!(
+            compact_val["messages"],
+            json!([
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": "good pre-compact"},
+                {"role": "system", "content": "compacted summary"},
+                {"role": "assistant", "content": "post-compact reply"}
+            ])
+        );
+
+        // 3. Parentless and id-less `CompactionBoundary` on harnesses without boundary parent links.
+        let mut u1 = msg(Role::User, vec![Block::Text { text: "q".into() }]);
+        u1.id = Some("u1".into());
+        let mut a1 = msg(Role::Assistant, vec![Block::Text { text: "a1".into() }]);
+        a1.id = Some("a1".into());
+        a1.parent_id = Some("u1".into());
+        let mut boundary_idless = Message::synthesized(MessageKind::CompactionBoundary, crate::ir::Origin::Harness);
+        boundary_idless.id = None;
+        boundary_idless.parent_id = None;
+        let mut summary = msg(Role::User, vec![Block::Text { text: "summary".into() }]);
+        summary.kind = MessageKind::CompactionSummary;
+        summary.id = Some("s1".into());
+        summary.parent_id = None;
+        let mut a2 = msg(Role::Assistant, vec![Block::Text { text: "a2".into() }]);
+        a2.id = Some("a2".into());
+        a2.parent_id = Some("s1".into());
+        assert_eq!(
+            select_trajectory(&[u1.clone(), a1.clone(), boundary_idless, summary, a2], &active_opts),
+            Some(vec![0, 1, 2, 3, 4])
+        );
+
+        // 4. Per-harness `inactive_branch`, embedded `isSidechain` in a main session, and
+        //    all-`isSidechain` sub-agent transcripts (`--subagents --active-branch`).
+        let mut inactive = msg(
+            Role::Assistant,
+            vec![Block::Text {
+                text: "off-branch".into(),
+            }],
+        );
+        inactive.id = Some("off".into());
+        inactive.parent_id = Some("u1".into());
+        inactive
+            .extra
+            .insert("openclaw".into(), json!({"inactive_branch": true}));
+        let mut embedded_side = msg(Role::Assistant, vec![Block::Text { text: "side".into() }]);
+        embedded_side.id = Some("sc".into());
+        embedded_side.parent_id = Some("a1".into());
+        embedded_side
+            .extra
+            .insert("claude".into(), json!({"isSidechain": true}));
+        assert_eq!(
+            select_trajectory(&[u1, a1, inactive, embedded_side], &active_opts),
+            Some(vec![0, 1])
+        );
+
+        let sub_jsonl = [
+            r#"{"type":"user","sessionId":"p","uuid":"su1","parentUuid":null,"isSidechain":true,"agentId":"ag1","message":{"role":"user","content":"subagent brief"}}"#,
+            r#"{"type":"assistant","sessionId":"p","uuid":"sa1","parentUuid":"su1","isSidechain":true,"agentId":"ag1","message":{"role":"assistant","model":"claude-fable-5-1","content":[{"type":"text","text":"subagent done"}]}}"#,
+        ]
+        .join("\n");
+        let sub_parsed = crate::harness::claude::parse_str("agent-ag1", &sub_jsonl, None);
+        let mut sub_out = Vec::new();
+        assert!(
+            write_record_with_options(&sub_parsed, &mut sub_out, Format::Chatml, None, &active_opts)?,
+            "an all-sidechain sub-agent transcript must not be emptied by --active-branch"
+        );
         Ok(())
     }
 }
