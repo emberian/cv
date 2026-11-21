@@ -10,7 +10,7 @@ thread_local! { pub(super) static FRAMED: std::cell::RefCell<Vec<(u64,u64)>> = c
 
 /// The continuation's checkpoint layer, and with the scan cache's interpretation (the one
 /// stored-format version, [`crate::source::VERSION`]) its whole version: not the cv release.
-pub(super) const LAYER: &str = "claude.discovery.v2";
+pub(super) const LAYER: &str = "claude.discovery.v3";
 
 #[derive(Clone, Serialize, Deserialize)]
 struct State {

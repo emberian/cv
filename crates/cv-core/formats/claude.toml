@@ -77,7 +77,7 @@ result = { status = "carried", note = "legacy sub-agent telemetry / journal resu
 "attachment.total_tokens_reminder" = { status = "generic", note = "rendered → injected context" }
 "attachment.batching_reminder_sent" = { status = "generic", note = "rendered → injected context" }
 "attachment.bash_output_audience_note" = { status = "generic", note = "rendered → injected context" }
-"attachment.queued_command" = { status = "generic", note = "rendered → injected context" }
+"attachment.queued_command" = { status = "generic", note = "rendered or prompt → injected context" }
 "attachment.silent_turn_reminder" = { status = "generic", note = "rendered → injected context" }
 "attachment.edited_text_file" = { status = "generic", note = "rendered → injected context" }
 "attachment.task_reminder" = { status = "generic", note = "rendered → injected context" }

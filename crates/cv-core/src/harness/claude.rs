@@ -351,6 +351,14 @@ impl Adapter for Claude {
                 tool: "slash command",
             }));
         }
+        if m.harness_extra(Harness::Claude)
+            .and_then(|bag| bag.get("attachment"))
+            .and_then(|att| att.get("commandMode"))
+            .and_then(Value::as_str)
+            == Some("prompt")
+        {
+            return Ok(None);
+        }
         Ok(first.starts_with("<task-notification>")?.then_some(RecordHit {
             kind: Kind::BackgroundJob,
             action: "complete",
@@ -455,10 +463,31 @@ impl Adapter for Claude {
 
     fn delivered_body<'a>(&self, m: &crate::ir::Message, text: &'a str) -> Option<&'a str> {
         if m.kind == MessageKind::InjectedContext && self.attachment_kind(m) == Some("queued_command") {
-            return Some(strip_system_reminder(text));
+            let att = m.harness_extra(Harness::Claude).and_then(|b| b.get("attachment"));
+            let mode = att.and_then(|a| a.get("commandMode")).and_then(Value::as_str);
+            let origin = att
+                .and_then(|a| a.get("origin"))
+                .and_then(|o| o.get("kind"))
+                .and_then(Value::as_str);
+            if mode.is_some_and(|m| m != "prompt") || origin.is_some_and(|o| o != "human") {
+                return None;
+            }
+            let (body, _) = unwrap_delivered(text)?;
+            return (!body.is_empty()).then_some(body);
         }
-        if m.role == Role::User && m.origin == Origin::Subagent {
-            return Some(text.trim_start().strip_prefix(COORDINATOR_HEAD).unwrap_or(text).trim());
+        if m.role == Role::User && m.kind == MessageKind::Prompt {
+            let (body, framed) = unwrap_delivered(text)?;
+            if body.is_empty() {
+                return None;
+            }
+            let queued = m
+                .harness_extra(Harness::Claude)
+                .and_then(|b| b.get("promptSource"))
+                .and_then(Value::as_str)
+                == Some("queued");
+            if m.origin == Origin::Subagent || framed || queued {
+                return Some(body);
+            }
         }
         None
     }
@@ -766,13 +795,59 @@ pub const SYNTHETIC_MODEL: &str = "<synthetic>";
 /// `origin.kind = "coordinator"`).
 const COORDINATOR_HEAD: &str = "The coordinator sent a message while you were working:";
 
-fn strip_system_reminder(s: &str) -> &str {
+const DELIVERED_HEADS: [&str; 3] = [
+    "The user sent the following message:",
+    "The user sent a new message while you were working:",
+    COORDINATOR_HEAD,
+];
+
+const DELIVERED_TAILS: [&str; 3] = [
+    "Please address this message and continue with your tasks.",
+    "Address this before completing your current task.",
+    "IMPORTANT: After completing your current task, you MUST address the user's message above. Do not ignore it.",
+];
+
+fn is_notification_body(s: &str) -> bool {
+    let s = s.trim_start();
+    s.starts_with("<task-notification>") || s.starts_with("[SYSTEM NOTIFICATION - NOT USER INPUT]")
+}
+
+/// Strip optional `<system-reminder>` tags and Claude Code's mid-run delivery heads/tails,
+/// returning `(body, had_framing)`. Rejects background task notifications (`None`).
+fn unwrap_delivered(s: &str) -> Option<(&str, bool)> {
     let s = s.trim();
-    let s = s
-        .strip_prefix("<system-reminder")
-        .map(|r| r.split_once('>').map(|x| x.1).unwrap_or(r))
-        .unwrap_or(s);
-    s.strip_suffix("</system-reminder>").unwrap_or(s).trim()
+    if is_notification_body(s) {
+        return None;
+    }
+    let (mut body, mut framed) = match s.strip_prefix("<system-reminder") {
+        Some(rest) => {
+            let inner = rest.split_once('>').map(|(_, after)| after).unwrap_or(rest);
+            let inner = inner.strip_suffix("</system-reminder>").unwrap_or(inner).trim();
+            (inner, true)
+        }
+        None => (s, false),
+    };
+    if is_notification_body(body) {
+        return None;
+    }
+    for head in DELIVERED_HEADS {
+        if let Some(rest) = body.strip_prefix(head) {
+            body = rest.trim();
+            framed = true;
+            break;
+        }
+    }
+    for tail in DELIVERED_TAILS {
+        if let Some(rest) = body.strip_suffix(tail) {
+            body = rest.trim();
+            framed = true;
+            break;
+        }
+    }
+    if is_notification_body(body) {
+        return None;
+    }
+    Some((body, framed))
 }
 
 fn user_origin_from(scheduled: bool, is_meta: bool, kind: Option<&str>) -> Origin {
@@ -1204,6 +1279,21 @@ pub fn task_notices(parent_path: &std::path::Path) -> Result<std::collections::H
         let content = match head.ty.as_str() {
             "user" => head.top.get("message").map(|m| m.get("content")).transpose()?.flatten(),
             "queue-operation" => head.top.get("content"),
+            "attachment" => match head
+                .top
+                .get("attachment")
+                .map(|a| super::store::document::Fields::parse(a, &["type", "commandMode", "prompt"]))
+                .transpose()?
+                .flatten()
+            {
+                Some(att)
+                    if att.string("type")?.as_deref() == Some("queued_command")
+                        && att.string("commandMode")?.as_deref() != Some("prompt") =>
+                {
+                    att.get("prompt")
+                }
+                _ => None,
+            },
             _ => None,
         };
         let Some(content) = content.filter(|v| v.is_string().unwrap_or(false)) else {
@@ -1401,6 +1491,9 @@ const CLAUDE_EXTRA_TOP: &[&str] = &[
     "isMeta",
     "isCompactSummary",
     "isApiErrorMessage",
+    "promptSource",
+    "turnOrigin",
+    "origin",
     "agentId",
     "slug",
     "version",
@@ -1934,6 +2027,7 @@ mod tests {
             "timestamp": "2026-09-19T00:00:00Z",
             "logicalParentUuid": "u0", "isSidechain": true, "isMeta": true,
             "isCompactSummary": true, "isApiErrorMessage": false,
+            "promptSource": "typed", "turnOrigin": "human", "origin": {"kind": "human"},
             "agentId": "a4a55af", "slug": "magical-wondering-rabbit", "version": "2.1.278",
             "requestId": "req_123", "parentToolUseID": "toolu_parent", "toolUseID": "toolu_self",
             "sourceToolAssistantUUID": "u-src", "sourceToolUseID": "toolu_self",
@@ -3404,5 +3498,192 @@ mod tests {
                 "tools-used",
             ]
         );
+    }
+
+    #[test]
+    fn unrendered_queued_commands_settle_lifecycle_without_polluting_distill_or_affordances() {
+        let notice_xml =
+            "<task-notification>\\n<task-id>b1</task-id>\\n<status>completed</status>\\n<summary>done</summary>\\n</task-notification>";
+        let text = [
+            r#"{"type":"user","sessionId":"s1","uuid":"u1","timestamp":"2026-10-01T00:00:00Z","promptSource":"typed","turnOrigin":"human","origin":{"kind":"human","producer":"cli","runId":"r-99"},"message":{"role":"user","content":"start background build"}}"#.to_string(),
+            r#"{"type":"assistant","sessionId":"s1","uuid":"a1","parentUuid":"u1","timestamp":"2026-10-01T00:00:01Z","message":{"role":"assistant","model":"claude-fable-5-1","content":[{"type":"tool_use","id":"call_bg","name":"Bash","input":{"command":"cargo build","run_in_background":true}}]}}"#.into(),
+            r#"{"type":"user","sessionId":"s1","uuid":"tr1","parentUuid":"a1","timestamp":"2026-10-01T00:00:02Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_bg","content":"Command running in background with ID: b1."}]}}"#.into(),
+            // Unrendered user-queued prompt quoting `<task-notification>`: must NOT settle b1 or count as a BackgroundJob affordance.
+            format!(
+                r#"{{"type":"attachment","sessionId":"s1","uuid":"qp1","parentUuid":"tr1","timestamp":"2026-10-01T00:00:03Z","attachment":{{"type":"queued_command","commandMode":"prompt","origin":{{"kind":"human"}},"prompt":"{notice_xml}"}}}}"#
+            ),
+            // Unrendered human mid-turn prompt + wrapped user echo.
+            r#"{"type":"attachment","sessionId":"s1","uuid":"qp2","parentUuid":"qp1","timestamp":"2026-10-01T00:00:04Z","attachment":{"type":"queued_command","commandMode":"prompt","origin":{"kind":"human"},"prompt":"also check clippy"}}"#.into(),
+            r#"{"type":"user","sessionId":"s1","uuid":"ue2","parentUuid":"qp2","timestamp":"2026-10-01T00:00:04Z","promptSource":"queued","message":{"role":"user","content":"<system-reminder>\nThe user sent a new message while you were working:\nalso check clippy\n\nIMPORTANT: After completing your current task, you MUST address the user's message above. Do not ignore it.\n</system-reminder>"}}"#.into(),
+            // Unrendered task notification (`BACKLOG.md` #2): settles b1 at every tier, never leaks into distill!
+            format!(
+                r#"{{"type":"attachment","sessionId":"s1","uuid":"qn1","parentUuid":"ue2","timestamp":"2026-10-01T00:00:05Z","attachment":{{"type":"queued_command","commandMode":"task-notification","origin":{{"kind":"task-notification"}},"prompt":"{notice_xml}"}}}}"#
+            ),
+            // Rendered notification with `[SYSTEM NOTIFICATION - NOT USER INPUT]` preamble and no commandMode: also excluded from distill.
+            format!(
+                r#"{{"type":"attachment","sessionId":"s1","uuid":"qn2","parentUuid":"qn1","timestamp":"2026-10-01T00:00:06Z","attachment":{{"type":"queued_command"}},"rendered":[{{"content":"<system-reminder>\n[SYSTEM NOTIFICATION - NOT USER INPUT]\n\n{notice_xml}\n</system-reminder>"}}]}}"#
+            ),
+            // Synthetic user record (`isSynthetic: true`): not a turn, matching discovery count.
+            r#"{"type":"user","sessionId":"s1","uuid":"syn1","parentUuid":"qn2","timestamp":"2026-10-01T00:00:07Z","isSynthetic":true,"message":{"role":"user","content":"synthetic harness reminder"}}"#.into(),
+            r#"{"type":"assistant","sessionId":"s1","uuid":"a2","parentUuid":"syn1","timestamp":"2026-10-01T00:00:08Z","message":{"role":"assistant","model":"claude-fable-5-1","content":[{"type":"text","text":"Build and clippy passed."}]}}"#.into(),
+        ]
+        .join("\n");
+
+        // 1. Consistent attachment nesting & non-clobbering provenance across Lean, Facts, Rich, Complete.
+        for demand in [Demand::LEAN, Demand::FACTS, Demand::RICH, Demand::COMPLETE] {
+            let mut sink = CollectSink::default();
+            let mut s = stream_str("s1", &text, None, &demand, &mut sink);
+            s.messages = sink.messages;
+            crate::harness::assert_no_flat_keys(&s);
+
+            let qp1 = s.messages.iter().find(|m| m.id.as_deref() == Some("qp1")).unwrap();
+            let qn1 = s.messages.iter().find(|m| m.id.as_deref() == Some("qn1")).unwrap();
+            assert_eq!(qp1.kind, MessageKind::InjectedContext);
+            assert_eq!(qn1.kind, MessageKind::InjectedContext);
+            assert!(!qp1.is_turn() && !qn1.is_turn());
+            assert_eq!(
+                cl(qp1)
+                    .get("attachment")
+                    .and_then(|a| a.get("commandMode"))
+                    .and_then(Value::as_str),
+                Some("prompt"),
+                "tier {:?}",
+                demand.tier
+            );
+            assert_eq!(
+                cl(qn1)
+                    .get("attachment")
+                    .and_then(|a| a.get("commandMode"))
+                    .and_then(Value::as_str),
+                Some("task-notification"),
+                "tier {:?}",
+                demand.tier
+            );
+            // User-typed `commandMode: "prompt"` quoting `<task-notification>` never settles lifecycle.
+            assert!(
+                lifecycle::message(qp1, &qp1.text().unwrap()).updates.is_empty(),
+                "tier {:?}",
+                demand.tier
+            );
+            assert_eq!(
+                lifecycle::message(qn1, &qn1.text().unwrap()).updates.len(),
+                1,
+                "tier {:?}",
+                demand.tier
+            );
+        }
+
+        // 2. Lean vs Rich/Complete `origin` preservation + round-trip emit.
+        let mut lean_sink = CollectSink::default();
+        stream_str("s1", &text, None, &Demand::LEAN, &mut lean_sink);
+        assert_eq!(cl(&lean_sink.messages[0])["promptSource"], "typed");
+        assert_eq!(
+            cl(&lean_sink.messages[0])["origin"],
+            serde_json::json!({"kind": "human"})
+        );
+
+        for demand in [Demand::RICH, Demand::COMPLETE] {
+            let mut sink = CollectSink::default();
+            let mut s = stream_str("s1", &text, None, &demand, &mut sink);
+            s.messages = sink.messages;
+            assert_eq!(
+                cl(&s.messages[0])["origin"],
+                serde_json::json!({"kind": "human", "producer": "cli", "runId": "r-99"}),
+                "full origin object preserved at {:?}",
+                demand.tier
+            );
+        }
+        let mut complete_sink = CollectSink::default();
+        let mut complete = stream_str("s1", &text, None, &Demand::COMPLETE, &mut complete_sink);
+        complete.messages = complete_sink.messages;
+        let out_dir = cv_testkit::temp_dir("claude-origin-roundtrip");
+        let emitted = emit::emit(&complete, &out_dir, &crate::emit::EmitOptions::default()).unwrap();
+        let reparsed = parse_str(&emitted.new_id, &fs::read_to_string(&emitted.path).unwrap(), None);
+        assert_eq!(
+            cl(&reparsed.messages[0])["origin"],
+            serde_json::json!({"kind": "human", "producer": "cli", "runId": "r-99"})
+        );
+
+        // 3. `isSynthetic: true` agrees between full parse (`Message::is_turn`) and `metadata::Scan` (`counts_as_turn`),
+        //    and `task_notices` picks up unrendered `attachment` `queued_command` notifications while ignoring `prompt`.
+        let transcript_path = out_dir.join("s1.jsonl");
+        fs::write(&transcript_path, &text).unwrap();
+        let parsed = parse_str("s1", &text, Some(transcript_path.clone()));
+        let syn = parsed
+            .messages
+            .iter()
+            .find(|m| m.id.as_deref() == Some("syn1"))
+            .unwrap();
+        assert_eq!(
+            (syn.kind, syn.origin, syn.is_turn()),
+            (MessageKind::InjectedContext, Origin::Harness, false)
+        );
+        let scanned = scan(&transcript_path).unwrap();
+        assert_eq!(
+            scanned.message_count,
+            Some(parsed.messages.iter().filter(|m| m.is_turn()).count())
+        );
+        let notices = task_notices(&transcript_path).unwrap();
+        assert_eq!(notices.get("b1").map(|n| n.status.as_str()), Some("completed"));
+        fs::remove_dir_all(&out_dir).ok();
+
+        // 4. Affordances: `qn1` counts as a BackgroundJob completion, `qp1` (`commandMode: "prompt"`) does not.
+        let affs = crate::affordance::of_session(&parsed).unwrap();
+        let bg_completes: Vec<_> = affs
+            .iter()
+            .filter(|a| a.kind == crate::affordance::Kind::BackgroundJob && a.action == "complete")
+            .collect();
+        assert_eq!(bg_completes.len(), 1, "{bg_completes:?}");
+
+        // 5. `delivered_body` + `distill`: task notifications never leak into timeline or resumed tail;
+        //    wrapped `user` echo deduplicates with `queued_command`, and ordinary prompts return `None`.
+        assert_eq!(
+            ROOTLESS.delivered_body(&parsed.messages[0], "start background build"),
+            None
+        );
+        let distilled = crate::distill::prepare_distill(
+            &parsed,
+            &crate::distill::DistillOptions {
+                keep_last: 4,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let pack = distilled.distilled.pack();
+        assert!(
+            !pack.contains("<task-notification>"),
+            "notification leaked into pack:\n{pack}"
+        );
+        assert!(
+            !pack.contains("SYSTEM NOTIFICATION"),
+            "preamble leaked into pack:\n{pack}"
+        );
+        let (_, resumed) = distilled.into_resumable_session(&parsed);
+        for m in &resumed.messages {
+            let body = m.text().unwrap_or_default();
+            assert!(
+                !body.contains("<task-notification>"),
+                "notification leaked into tail: {body}"
+            );
+            assert!(!body.contains("<system-reminder>"), "wrapper leaked into tail: {body}");
+        }
+        let clippy_mentions = resumed
+            .messages
+            .iter()
+            .filter(|m| m.text().unwrap_or_default().contains("also check clippy"))
+            .count();
+        assert_eq!(clippy_mentions, 1, "queued attachment + wrapped echo deduplicated once");
+
+        // All 3 mid-run heads and 3 tails unwrap cleanly on both `InjectedContext` and `Prompt`.
+        let mut coordinator = Message::of_kind(Role::User, MessageKind::Prompt, Origin::Subagent);
+        for (head, tail) in [
+            ("The user sent the following message:", "Please address this message and continue with your tasks."),
+            ("The user sent a new message while you were working:", "IMPORTANT: After completing your current task, you MUST address the user's message above. Do not ignore it."),
+            (COORDINATOR_HEAD, "Address this before completing your current task."),
+        ] {
+            let wrapped = format!("<system-reminder>\n{head}\nship wave 2\n\n{tail}\n</system-reminder>");
+            coordinator.content = vec![Block::Text { text: wrapped.clone().into() }];
+            assert_eq!(ROOTLESS.delivered_body(&coordinator, &wrapped), Some("ship wave 2"));
+        }
     }
 }
