@@ -1,5 +1,6 @@
 //! A reshape carries what its caller selected: a splice into a Claude session writes each
-//! system-role record back as it was. Every fixture here is invented text.
+//! system-role record back as it was, and `cv prune --plan` takes the caller's judgment of each
+//! message and tool result. Every fixture here is invented text.
 
 use cv_testkit::World;
 use serde_json::{json, Value};
@@ -595,4 +596,448 @@ fn prune_says_which_recorded_size_a_resume_reads_and_what_revive_rewrote() {
         .map(|k| u[*k].as_u64().unwrap())
         .sum::<u64>();
     assert_eq!(sum, 500_000);
+}
+
+// ───────────────────────────── prune --plan: the caller's selection ─────────────────────────────
+
+const PLAN: &str = "5e1ec7ed-0000-4000-8000-000000000002";
+
+fn turn(ty: &str, uuid: &str, parent: Option<&str>, content: Value) -> Value {
+    json!({"type": ty, "uuid": uuid, "parentUuid": parent, "sessionId": PLAN, "timestamp": "2026-03-02T09:00:00Z",
+        "cwd": "/work/proj", "message": {"role": ty, "model": "claude-opus-5", "content": content}})
+}
+fn call(uuid: &str, parent: &str, id: &str) -> Value {
+    turn(
+        "assistant",
+        uuid,
+        Some(parent),
+        json!([{"type": "tool_use", "id": id, "name": "Bash", "input": {"command": format!("survey {id}")}}]),
+    )
+}
+fn result(uuid: &str, parent: &str, id: &str, text: &str) -> Value {
+    let mut v = turn(
+        "user",
+        uuid,
+        Some(parent),
+        json!([{"type": "tool_result", "tool_use_id": id, "content": text}]),
+    );
+    v["toolUseResult"] = json!({"stdout": text});
+    v
+}
+
+/// The person's message: two typed lines, a pasted block of forty, one typed line.
+fn typed_with_paste() -> String {
+    let paste: String = (1..=40).map(|i| format!("pasted row {i}\n")).collect();
+    format!("please sort the seed list\nkeep the heirlooms first\n{paste}that is the whole list")
+}
+fn rows_text() -> String {
+    (1..=60).map(|i| format!("row {i}\n")).collect()
+}
+
+/// Two turns. The first reads four results and has a file attached and a hook's output; the
+/// second reads one.
+fn planned_session(w: &World) -> PathBuf {
+    let long = "soil sample ".repeat(400);
+    let mut file = json!({"type": "attachment", "uuid": "f1", "parentUuid": "r4", "sessionId": PLAN,
+        "timestamp": "2026-03-02T09:00:00Z", "cwd": "/work/proj",
+        "attachment": {"type": "file", "filename": "/work/proj/ferns.md", "displayPath": "ferns.md"},
+        "rendered": [{"content": "Called the Read tool with: ferns.md"}, {"content": "ferns like shade"}],
+        "renderedRole": "user"});
+    file["attachment"]["content"] = json!({"type": "text"});
+    let hook = json!({"type": "attachment", "uuid": "h1", "parentUuid": "f1", "sessionId": PLAN,
+        "timestamp": "2026-03-02T09:00:00Z", "cwd": "/work/proj",
+        "attachment": {"type": "hook_success", "hookName": "PostToolUse", "content": "status line refreshed"},
+        "rendered": [{"content": "<system-reminder>status line refreshed</system-reminder>"}]});
+    w.write_session(
+        PLAN,
+        &[
+            turn("user", "u1", None, json!(typed_with_paste())),
+            call("a1", "u1", "t_keep"),
+            result("r1", "a1", "t_keep", "the beds face south"),
+            call("a2", "r1", "t_ptr"),
+            result("r2", "a2", "t_ptr", &long),
+            call("a3", "r2", "t_exc"),
+            result("r3", "a3", "t_exc", &rows_text()),
+            call("a4", "r3", "t_drop"),
+            result("r4", "a4", "t_drop", "nothing found in the shed"),
+            file,
+            hook,
+            turn(
+                "assistant",
+                "a5",
+                Some("h1"),
+                json!([{"type": "text", "text": "sorted, heirlooms first"}]),
+            ),
+            turn("user", "u2", Some("a5"), json!("and the bulbs?")),
+            call("a6", "u2", "t_bulbs"),
+            result("r6", "a6", "t_bulbs", "forty bulbs in the cellar"),
+            turn(
+                "assistant",
+                "a7",
+                Some("r6"),
+                json!([{"type": "text", "text": "forty bulbs, cellar"}]),
+            ),
+        ],
+    )
+}
+
+fn write_plan(w: &World, name: &str, plan: Value) -> String {
+    let path = w.base.join(name);
+    fs::write(&path, plan.to_string()).unwrap();
+    path.to_str().unwrap().to_owned()
+}
+
+#[test]
+fn prune_plan_carries_the_callers_selection_per_message_and_tool_result() {
+    let w = World::new("plan-selection");
+    let source = planned_session(&w);
+    let plan = write_plan(
+        &w,
+        "plan.json",
+        json!({
+            "results": {
+                "t_keep": {"action": "keep"},
+                "t_ptr": {"action": "pointer"},
+                "t_exc": {"action": "excerpt", "lines": ["2-3", "58-"]},
+                "t_drop": {"action": "drop"},
+                "t_bulbs": {"action": "pointer"}
+            },
+            "messages": {
+                // Their typed lines stay; the paste between them goes behind the marker.
+                "u1": {"action": "excerpt", "lines": ["1-2", "43-"]},
+                "f1": {"action": "pointer"},
+                "h1": {"action": "drop"}
+            }
+        }),
+    );
+    let (out, err) = w.cv_ok(&["prune", PLAN, "--plan", &plan, "--json"]);
+    let report: Value = serde_json::from_str(out.trim()).unwrap();
+    let p = &report["plan"];
+    assert_eq!(
+        (
+            &p["keep"],
+            &p["pointer"],
+            &p["excerpt"],
+            &p["results_dropped"],
+            &p["records_dropped"]
+        ),
+        (&json!(1), &json!(3), &json!(2), &json!(1), &json!(3)),
+        "{report}"
+    );
+    let new_id = report["new_id"].as_str().unwrap();
+    let path = source.with_file_name(format!("{new_id}.jsonl"));
+    let written = rows(&path);
+    let by: HashMap<&str, &Value> = written
+        .iter()
+        .filter_map(|r| Some((r.get("uuid")?.as_str()?, r)))
+        .collect();
+    let order: Vec<&str> = written.iter().filter_map(|r| r.get("uuid")?.as_str()).collect();
+    // The dropped hook record is gone, and the dropped result with its call and their records.
+    assert_eq!(
+        order,
+        ["u1", "a1", "r1", "a2", "r2", "a3", "r3", "f1", "a5", "u2", "a6", "r6", "a7"],
+        "{err}"
+    );
+    assert!(!fs::read_to_string(&path).unwrap().contains("t_drop"));
+    assert_threaded(&path);
+
+    let marker = |text: &str, id: &str| {
+        text.starts_with(&format!("[PRUNED id={id} ")) && text.contains(&format!("cv cat {new_id} {id}"))
+    };
+    // keep: verbatim.
+    assert_eq!(by["r1"]["message"]["content"][0]["content"], "the beds face south");
+    // pointer: the marker and nothing else.
+    let pointer = by["r2"]["message"]["content"][0]["content"].as_str().unwrap();
+    assert!(marker(pointer, "t_ptr") && !pointer.contains('\n'), "{pointer}");
+    // excerpt by lines: the named lines verbatim, in order, the rest behind the marker.
+    let excerpt = by["r3"]["message"]["content"][0]["content"].as_str().unwrap();
+    let (head, kept) = excerpt.split_once('\n').unwrap();
+    assert!(marker(head, "t_exc"), "{head}");
+    assert_eq!(
+        kept,
+        "[… lines 2-3]\nrow 2\nrow 3\n[… lines 58-]\nrow 58\nrow 59\nrow 60"
+    );
+    // A person's message: their own words verbatim, the pasted block pointered.
+    let typed = by["u1"]["message"]["content"].as_str().unwrap();
+    let (head, kept) = typed.split_once('\n').unwrap();
+    assert!(marker(head, "u1"), "{head}");
+    assert_eq!(
+        kept,
+        "[… lines 1-2]\nplease sort the seed list\nkeep the heirlooms first\n[… lines 43-]\nthat is the whole list"
+    );
+    // An attachment: what the model is sent goes behind markers; the record stays what it was.
+    for (i, item) in by["f1"]["rendered"].as_array().unwrap().iter().enumerate() {
+        assert!(marker(item["content"].as_str().unwrap(), &format!("f1#r{i}")), "{item}");
+    }
+    assert_eq!(by["f1"]["attachment"]["filename"], "/work/proj/ferns.md");
+
+    // Nothing is lost: `cv cat` reopens every original.
+    let cat = |id: &str| w.cv_ok(&["cat", new_id, id]).0;
+    assert_eq!(cat("t_ptr").trim_end(), "soil sample ".repeat(400).trim_end());
+    assert_eq!(cat("t_exc").trim_end(), rows_text().trim_end());
+    assert_eq!(cat("t_drop").trim_end(), "nothing found in the shed");
+    assert!(cat("t_drop#call").contains("survey t_drop"));
+    assert_eq!(cat("u1").trim_end(), typed_with_paste());
+    assert_eq!(cat("f1#r1").trim_end(), "ferns like shade");
+    assert!(cat("h1").contains("status line refreshed"));
+
+    // The one rule checked for the caller: a warning, and the session is written all the same.
+    assert_eq!(
+        p["rests_on_nothing"],
+        json!([{"reply": "a7", "results": 1}]),
+        "{report}"
+    );
+    assert!(
+        err.contains("reply a7 rests on nothing kept: its turn's 1 tool result(s) were all dropped or pointered"),
+        "{err}"
+    );
+    assert!(!err.contains("reply a5"), "the first turn kept a result: {err}");
+}
+
+#[test]
+fn a_plan_that_does_not_fit_is_refused_whole_and_no_plan_is_todays_default() {
+    let w = World::new("plan-refusals");
+    let source = planned_session(&w);
+    let before = fs::read_dir(source.parent().unwrap()).unwrap().count();
+    let bad = write_plan(
+        &w,
+        "bad.json",
+        json!({
+            "results": {
+                "t_exc": {"action": "excerpt", "lines": ["61-70"]},
+                "t_ptr": {"action": "excerpt", "lines": ["1-5"]},
+                "t_keep": {"action": "keep"}
+            },
+            "messages": {"nope": {"action": "drop"}, "a1": {"action": "drop"}, "u2": {"action": "excerpt"}}
+        }),
+    );
+    let (ok, code, _, err) = w.cv(&["prune", PLAN, "--plan", &bad]);
+    assert!(!ok && code == 2, "{err}");
+    for problem in [
+        "t_exc: line 61 is past the payload's 60 line(s)",
+        "t_ptr: line 5 is past the payload's 1 line(s)",
+        "nope: no record with this uuid in the session",
+        "t_keep: planned as keep, but the plan drops the record that holds it or its call",
+        "u2: an excerpt names what it keeps",
+    ] {
+        assert!(err.contains(problem), "missing {problem:?} in:\n{err}");
+    }
+    assert_eq!(
+        fs::read_dir(source.parent().unwrap()).unwrap().count(),
+        before,
+        "nothing written"
+    );
+
+    // No plan: size and age decide, as they did. A person's words are not a payload.
+    let (out, _) = w.cv_ok(&["prune", PLAN, "--keep-last", "0", "--min-size", "1024", "--json"]);
+    let report: Value = serde_json::from_str(out.trim()).unwrap();
+    assert!(report["plan"].is_null(), "{report}");
+    let path = source.with_file_name(format!("{}.jsonl", report["new_id"].as_str().unwrap()));
+    let written = rows(&path);
+    let content = |uuid: &str| {
+        let r = written.iter().find(|r| r["uuid"] == uuid).unwrap();
+        r["message"]["content"].clone()
+    };
+    assert_eq!(content("u1"), json!(typed_with_paste()));
+    assert!(content("r2")[0]["content"]
+        .as_str()
+        .unwrap()
+        .starts_with("[PRUNED id=t_ptr "));
+    assert_eq!(content("r1")[0]["content"], "the beds face south");
+    assert_eq!(written.len(), 16);
+}
+
+#[test]
+fn plan_handles_image_only_messages_mixed_result_blocks_crlf_overlaps_and_filtered_warnings() {
+    const EDGE: &str = "5e1ec7ed-0000-4000-8000-000000000004";
+    let w = World::new("plan-edge-cases");
+    let rec = |ty: &str, uuid: &str, parent: Option<&str>, content: Value| {
+        json!({"type": ty, "uuid": uuid, "parentUuid": parent, "sessionId": EDGE,
+            "timestamp": "2026-03-04T09:00:00Z", "cwd": "/work/proj",
+            "message": {"role": ty, "model": "claude-opus-5", "content": content}})
+    };
+    let mut multi_result = rec(
+        "user",
+        "r_multi",
+        Some("a_multi"),
+        json!([
+            {"type": "tool_result", "tool_use_id": "t_drop_1", "content": "discarded result"},
+            {"type": "tool_result", "tool_use_id": "t_keep_2", "content": "kept result"}
+        ]),
+    );
+    multi_result["toolUseResult"] = json!({"stdout": "kept mirror payload"});
+
+    let mut api_err = rec(
+        "assistant",
+        "a_err",
+        Some("r_err"),
+        json!([{"type": "text", "text": "API Error: 529 Overloaded"}]),
+    );
+    api_err["isApiErrorMessage"] = json!(true);
+    api_err["message"]["model"] = json!("<synthetic>");
+
+    let crlf_text = (1..=8).map(|i| format!("crlf line {i}\r\n")).collect::<String>();
+    let source = w.write_session(
+        EDGE,
+        &[
+            // Turn 0 (will be windowed out in the `--keep` check below):
+            rec("user", "u_old", None, json!("old turn")),
+            rec(
+                "assistant",
+                "a_old_call",
+                Some("u_old"),
+                json!([{"type": "tool_use", "id": "t_old", "name": "Bash", "input": {"command": "echo old"}}]),
+            ),
+            rec(
+                "user",
+                "r_old",
+                Some("a_old_call"),
+                json!([{"type": "tool_result", "tool_use_id": "t_old", "content": "old output"}]),
+            ),
+            rec(
+                "assistant",
+                "a_old_reply",
+                Some("r_old"),
+                json!([{"type": "text", "text": "old conclusion"}]),
+            ),
+            // Turn 1: image-only user message + thinking-only assistant + parallel [drop, keep] + CRLF excerpt + API error:
+            rec(
+                "user",
+                "u_img",
+                Some("a_old_reply"),
+                json!([{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}}]),
+            ),
+            rec(
+                "assistant",
+                "a_think",
+                Some("u_img"),
+                json!([{"type": "thinking", "thinking": "inspecting image", "signature": "sig"}]),
+            ),
+            rec(
+                "assistant",
+                "a_multi",
+                Some("a_think"),
+                json!([
+                    {"type": "tool_use", "id": "t_drop_1", "name": "Bash", "input": {"command": "one"}},
+                    {"type": "tool_use", "id": "t_keep_2", "name": "Bash", "input": {"command": "two"}}
+                ]),
+            ),
+            multi_result,
+            rec(
+                "assistant",
+                "a_crlf",
+                Some("r_multi"),
+                json!([{"type": "tool_use", "id": "t_crlf", "name": "Read", "input": {"file_path": "dos.txt"}}]),
+            ),
+            rec(
+                "user",
+                "r_crlf",
+                Some("a_crlf"),
+                json!([{"type": "tool_result", "tool_use_id": "t_crlf", "content": crlf_text}]),
+            ),
+            // Turn 2: tool result pointered, followed only by a `<synthetic>` API error (not a reply!):
+            rec("user", "u_err", Some("r_crlf"), json!("retry check")),
+            rec(
+                "assistant",
+                "a_err_call",
+                Some("u_err"),
+                json!([{"type": "tool_use", "id": "t_err", "name": "Bash", "input": {"command": "fail"}}]),
+            ),
+            rec(
+                "user",
+                "r_err",
+                Some("a_err_call"),
+                json!([{"type": "tool_result", "tool_use_id": "t_err", "content": "transient"}]),
+            ),
+            api_err,
+        ],
+    );
+
+    // Excerpt on an image-only message is still refused.
+    let bad_img = write_plan(
+        &w,
+        "bad-img.json",
+        json!({"messages": {"u_img": {"action": "excerpt", "lines": ["1"]}}}),
+    );
+    let (ok, code, _, err) = w.cv(&["prune", EDGE, "--plan", &bad_img]);
+    assert!(
+        !ok && code == 2 && err.contains("u_img: an excerpt needs a text payload"),
+        "{err}"
+    );
+
+    // Pointer on image-only message, [drop, keep] preserving kept toolUseResult, CRLF + overlapping
+    // lines merged without `\r` or duplicates, `--drop-thinking` not inflating `plan.records_dropped`,
+    // and windowed-out (`u_old..a_old_reply`) + `<synthetic>` (`a_err`) excluded from `rests_on_nothing`.
+    let good = write_plan(
+        &w,
+        "good-edge.json",
+        json!({
+            "results": {
+                "t_old": {"action": "pointer"},
+                "t_drop_1": {"action": "drop"},
+                "t_keep_2": {"action": "keep"},
+                "t_crlf": {"action": "excerpt", "lines": ["3-5", "1-3", "7-8"]},
+                "t_err": {"action": "pointer"}
+            },
+            "messages": {
+                "u_img": {"action": "precis", "precis": "diagram of south beds"}
+            }
+        }),
+    );
+    let (out, err) = w.cv_ok(&[
+        "prune",
+        EDGE,
+        "--plan",
+        &good,
+        "--keep",
+        "4..",
+        "--drop-thinking",
+        "--keep-last",
+        "0",
+        "--json",
+    ]);
+    let report: Value = serde_json::from_str(out.trim()).unwrap();
+    let p = &report["plan"];
+    // `a_think` was emptied by `--drop-thinking`, NOT by `--plan`, so `records_dropped` stays 0!
+    assert_eq!(p["records_dropped"], 0, "{report}");
+    assert_eq!(p["results_dropped"], 1, "{report}");
+    assert_eq!(p["precis"], 1, "{report}");
+    // Neither windowed-out `a_old_reply` nor synthetic API error `a_err` triggers `rests_on_nothing`!
+    assert_eq!(p["rests_on_nothing"], json!([]), "{report}\n{err}");
+
+    let new_id = report["new_id"].as_str().unwrap();
+    let path = source.with_file_name(format!("{new_id}.jsonl"));
+    let written = rows(&path);
+    let by: HashMap<&str, &Value> = written
+        .iter()
+        .filter_map(|r| Some((r.get("uuid")?.as_str()?, r)))
+        .collect();
+    assert!(!by.contains_key("a_think"), "thinking-only record removed");
+    assert_threaded(&path);
+
+    // Fix #5: image-only `u_img` was replaced with `[PRUNED id=u_img#b0 ...]\ndiagram of south beds`,
+    // and `cv cat` recovers the original image block JSON!
+    let img_text = by["u_img"]["message"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        img_text.starts_with("[PRUNED id=u_img#b0 ") && img_text.ends_with("\ndiagram of south beds"),
+        "{img_text}"
+    );
+    let cat_img = w.cv_ok(&["cat", new_id, "u_img#b0"]).0;
+    assert!(cat_img.contains("iVBORw0KGgo="), "{cat_img}");
+
+    // Fix #6: `r_multi` keeps only `t_keep_2`, and its `toolUseResult` stays `{"stdout": "kept mirror payload"}`
+    // (NOT overwritten by a `t_drop_1#tur` string marker!).
+    let r_multi_blocks = by["r_multi"]["message"]["content"].as_array().unwrap();
+    assert_eq!(r_multi_blocks.len(), 1);
+    assert_eq!(r_multi_blocks[0]["tool_use_id"], "t_keep_2");
+    assert_eq!(by["r_multi"]["toolUseResult"], json!({"stdout": "kept mirror payload"}));
+
+    // Fix #7: overlapping `["3-5", "1-3", "7-8"]` merged into `1-5` + `7-8` with zero `\r`s or duplicates!
+    let crlf_out = by["r_crlf"]["message"]["content"][0]["content"].as_str().unwrap();
+    assert!(!crlf_out.contains('\r'), "stray CR in {crlf_out:?}");
+    let (_, kept_crlf) = crlf_out.split_once('\n').unwrap();
+    assert_eq!(
+        kept_crlf,
+        "[… lines 1-5]\ncrlf line 1\ncrlf line 2\ncrlf line 3\ncrlf line 4\ncrlf line 5\n[… lines 7-8]\ncrlf line 7\ncrlf line 8"
+    );
 }

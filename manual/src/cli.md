@@ -623,6 +623,7 @@ cv prune 3b829648 --window 120000                  # keep the newest turns fitti
 cv prune 3b829648 --keep 0..400                    # …or keep an explicit turn-index window
 cv prune 3b829648 --json                           # + the report as one JSON object on stdout
 cv prune 3b829648 --declassify --declassify-tokens-file terms.txt
+cv prune 3b829648 --plan plan.json                 # the caller's own keep / pointer / excerpt / drop
 
 cv cat <new-id> toolu_abc123                       # fetch a stashed original back out
 ```
@@ -637,7 +638,8 @@ By default prune **revives** a maxed session: Claude Code's resume gate reads th
 on 28 calibration prunes). The report names both numbers: the highest record it rewrote and the
 estimate, and on its own line what a resume reads, the LAST request's input + cache read + cache
 creation, which is unchanged when it was already under the estimate (`resume_reads_tokens_before`
-and `_after` in `--json`). `--no-revive` keeps records byte for byte. `--declassify` snips prose
+and `_after` in `--json`). `--no-revive` keeps records byte for byte. `--plan` takes a selection
+per tool result and per record ([Reshaping](reshaping.md)). `--declassify` snips prose
 dense in your terms; cv ships no list. `--json` reports on stdout (`null` paths under `--dry-run`).
 
 Prune and adoption refuse a source line that is not one JSON record, and an empty transcript.

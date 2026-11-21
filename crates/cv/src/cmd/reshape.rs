@@ -229,13 +229,33 @@ pub(crate) fn cmd_prune(args: PruneArgs<'_>) -> Result<()> {
     if let Some(p) = &res.plan {
         let _ = writeln!(
             h,
-            "  plan: {} kept · {} précis · {} excerpt(s) · {} attachment(s) dropped · {} payload bytes removed",
+            "  plan: {} kept · {} pointer(s) · {} précis · {} excerpt(s) · dropped {} result(s), {} record(s), \
+             {} attachment(s) by kind · {} payload bytes removed",
             p.keep,
+            p.pointer,
             p.precis,
             p.excerpt,
+            p.results_dropped,
+            p.records_dropped,
             p.attachments_dropped,
             human_bytes(p.bytes_saved),
         );
+        // The one thing a selection can get wrong and still be a valid session.
+        const SHOWN: usize = 8;
+        for u in p.rests_on_nothing.iter().take(SHOWN) {
+            let _ = writeln!(
+                h,
+                "  ⚠ reply {} rests on nothing kept: its turn's {} tool result(s) were all dropped or pointered",
+                u.reply, u.results
+            );
+        }
+        if p.rests_on_nothing.len() > SHOWN {
+            let _ = writeln!(
+                h,
+                "  ⚠ … and {} more replies that rest on nothing kept (--json lists them)",
+                p.rests_on_nothing.len() - SHOWN
+            );
+        }
     }
     skills_line(&mut h, &res.skills);
     for w in &res.warnings {

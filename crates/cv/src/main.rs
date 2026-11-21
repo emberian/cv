@@ -576,12 +576,18 @@ enum Cmd {
         /// Restored Claude skills: keep all, drop all, or drop entries whose files changed or disappeared.
         #[arg(long = "skills", value_parser = ["keep", "drop", "drop-stale"], default_value = "keep")]
         skills: String,
-        /// Decide tool results by a plan file instead of --min-size/--keep-last: `{"results":
-        /// {"<tool_use_id>": {"action": "keep" | "precis" | "excerpt", "precis": "…", "keep":
-        /// ["literal passage", …]}}, "attachments": {"drop_kinds": ["hook_success", …]}}`. Only
-        /// planned results change; a précis or excerpt follows the usual marker and `cv cat` returns
-        /// the original. Dropped attachments are stashed by record uuid. A plan naming unknown ids,
-        /// or passages not in their payload, is refused (exit 2) before anything is written.
+        /// Carry the caller's own selection instead of --min-size/--keep-last: `{"results":
+        /// {"<tool_use_id>": {"action": …}}, "messages": {"<record uuid>": {"action": …}},
+        /// "attachments": {"drop_kinds": ["hook_success", …]}}`. An action is `keep`, `pointer`
+        /// (the marker alone), `precis` (`"precis": "…"`), `excerpt` (`"keep": ["literal passage",
+        /// …]` and/or `"lines": ["3-10", "40-"]`, 1-based, the rest behind the marker) or `drop`.
+        /// Only what the plan names changes, and `cv cat` returns every original: a dropped
+        /// record by its uuid, a dropped result by its id (its call goes with it, as
+        /// `<id>#call`). `messages` names a prompt, a reply or an attachment; a block pasted
+        /// inside a person's message is not marked in the transcript, so keep their own lines
+        /// with an excerpt. A plan naming unknown ids, or passages or lines not in their payload,
+        /// is refused (exit 2) before anything is written. The summary names each kept reply
+        /// whose turn's tool results were all dropped or pointered.
         #[arg(long, value_name = "PATH", conflicts_with = "min_size")]
         plan: Option<PathBuf>,
         /// Report what would be pruned without writing anything.

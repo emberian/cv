@@ -21,13 +21,39 @@ path): same transcript, bulky old tool payloads lifted into a sidecar, written a
 session under a new id. It never plants the result under a live parent; `cv adopt` moves child
 transcripts between parents.
 
-`cv prune --plan <plan.json>` takes the choice of payloads from a judge (a rewound copy of the
-session, say) instead of `--min-size`/`--keep-last`. Each listed `tool_use_id` is `keep`, `precis`
-(the marker, then the précis) or `excerpt` (the précis, then literal passages of the payload in
-their order, between `[…]` lines); unlisted results stay verbatim, and `cv cat <new-id> <id>`
-returns every original. `attachments.drop_kinds` removes attachment records of those types,
-stashed by record uuid, their children relinked. An unknown id or a passage that is not in its
-payload refuses the whole plan (exit 2) before anything is written.
+`cv prune --plan <plan.json>` carries a selection made by whoever holds the context (the agent
+itself, or a judge on a rewound copy) instead of `--min-size`/`--keep-last`. `results` names tool
+results by `tool_use_id` and `messages` names records by `uuid` (a prompt, a reply, an
+attachment); each is `keep`, `pointer` (the marker alone), `precis` (the marker, then the précis),
+`excerpt` (the précis, then what is kept verbatim in payload order: literal passages between `[…]`
+lines, and 1-based `lines` such as `"3-10"` or `"40-"` under a line naming them) or `drop`.
+Everything unlisted stays verbatim, and `cv cat <new-id> <id>` returns every original: a dropped
+record by its uuid, a dropped result by its id with its call as `<id>#call`, a replaced message by
+its uuid (`<uuid>#b<n>` per content block, `<uuid>#r<n>` per rendered item of an attachment).
+
+```json
+{"results":  {"toolu_01": {"action": "pointer"},
+              "toolu_02": {"action": "excerpt", "lines": ["1-12", "240-"]},
+              "toolu_03": {"action": "drop"}},
+ "messages": {"<uuid of a message with a pasted log>": {"action": "excerpt", "lines": ["1-2", "400-"]},
+              "<uuid of a stale attachment>": {"action": "drop"}},
+ "attachments": {"drop_kinds": ["hook_success"]}}
+```
+
+A dropped result takes its call with it and a dropped record takes the calls and results it holds
+with their other halves, so the result is always a session Claude Code resumes; a record left
+with no content goes too, its children relinked. A transcript does not mark where a block pasted
+into a person's message begins, so the plan keeps their own lines with an excerpt. An attachment
+takes `pointer`, `precis` or `drop`: its `rendered` text, which is what a resume sends, goes
+behind the marker and the record stays what it was. An unknown id, a passage or line that is not in
+its payload, or a result planned one way inside a record the plan drops refuses the whole plan
+(exit 2) before anything is written. One thing is checked for the caller and only warned about: a
+kept reply whose turn's tool results were all dropped or pointered "rests on nothing kept"
+(`plan.rests_on_nothing` in `--json`).
+
+What a session wrote and read on disk is already a mechanical listing, paths from its tool calls:
+`cv events <id> --kind file_edit` and `--kind file_read` (`--json`, `--subagents`), one streamed
+pass. It is worth pasting into the précis of whatever a plan drops.
 
 ## How Claude Code stores a sub-agent
 
