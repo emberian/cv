@@ -28,23 +28,32 @@ store = [
   "…/brain/<uuid>/.system_generated/logs/overview.txt",
   "…/brain/<uuid>/.system_generated/subagents/<child-uuid>.json",
   "…/brain/<uuid>/.system_generated/swarm/members.json",
+  "…/brain/<uuid>/.system_generated/swarm/board.jsonl",
   "…/annotations/<uuid>.pbtxt",
   "…/conversations/<uuid>.db",
   "…/conversation_summaries.db",
 ]
 
 [upstream]
-repo = "Google Antigravity (agy CLI + Antigravity 2.0 / IDE Cortex trajectory_store; corpus 1.5.6–1.5.9)"
-commit = "1.5.9"
-date = "2026-11-15"
+repo = "Google Antigravity (agy CLI + Antigravity 2.0 / IDE Cortex trajectory_store; corpus 1.0.x–1.5.13)"
+commit = "1.5.13"
+date = "2026-11-21"
 
 [types]
 "table.steps" = { status = "handled", note = "metadata retains native reasoning/cache-write usage after payload compaction; historical text remains in full logs" }
 "column.idx" = { status = "handled", note = "zero-based Cortex step index" }
 "column.step_payload" = { status = "handled", note = "protobuf CortexStep wire cell" }
 "column.step_format" = { status = "handled", note = "step storage format enum" }
+"column.step_type" = { status = "handled", note = "fallback CortexStepType enum when cleared from step_payload" }
+"column.status" = { status = "handled", note = "fallback step status enum and conversation_summaries status" }
+"column.metadata" = { status = "handled", note = "fallback CortexStepMetadata wire cell when absent from step_payload" }
+"column.error_details" = { status = "handled", note = "fallback CortexErrorDetails wire cell when absent from step_payload" }
+"column.permissions" = { status = "handled", note = "fallback TrajectoryPermissions wire cell when absent from step_payload" }
+"column.task_details" = { status = "handled", note = "fallback CortexTaskDetails wire cell when absent from step_payload" }
+"column.render_info" = { status = "handled", note = "fallback RenderInfo wire cell when step_payload carries no body or embedded render" }
 # Per-session & summary SQLite sidecars (opened strictly read-only via harness::store::sqlite).
-"table.conversation_summaries" = { status = "handled", note = "summary catalog (title, workspace_uris, parent_conversation_id, agent_name)" }
+# (`column.killed` and `column.group_id` are handled by inference via match arms in `antigravity.rs`.)
+"table.conversation_summaries" = { status = "handled", note = "summary catalog (title, workspace_uris, parent_conversation_id, agent_name, killed, status, group_id, raw_summary)" }
 "column.conversation_id" = { status = "handled", note = "primary key UUID" }
 "column.title" = { status = "handled", note = "session title" }
 "column.preview" = { status = "handled", note = "fallback title preview" }
@@ -54,27 +63,35 @@ date = "2026-11-15"
 "column.source" = { status = "handled", note = "trajectory source enum -> extra" }
 "column.project_id" = { status = "handled", note = "project identifier -> extra" }
 "column.last_modified_time" = { status = "handled", note = "catalog updated_at timestamp" }
+"column.raw_summary" = { status = "handled", note = "1.5.13+ CascadeTrajectorySummary protobuf wire cell" }
 "table.gen_metadata" = { status = "handled", note = "per-step protobuf blob carrying model slug (field 1.19) and step indices (field 2)" }
 "table.trajectory_metadata_blob" = { status = "handled", note = "main trajectory protobuf carrying workspace URI (1.1), git root (1.2), git branch (1.4), created_at (2)" }
 "column.id" = { status = "handled", note = "metadata row identifier" }
 "column.data" = { status = "handled", note = "protobuf metadata wire cell" }
-"table.trajectory_meta" = { status = "ignored", note = "duplicate trajectory header bookkeeping superseded by trajectory_metadata_blob" }
+"table.trajectory_meta" = { status = "handled", note = "fallback trajectory_type and source when trajectory_metadata_blob is absent" }
+"column.trajectory_type" = { status = "handled", note = "trajectory type enum -> extra" }
 "table.executor_metadata" = { status = "ignored", note = "runtime executor scratch state" }
-"table.parent_references" = { status = "ignored", note = "parent reference index superseded by trajectory_metadata_blob and conversation_summaries" }
+"table.parent_references" = { status = "handled", note = "fallback CortexTrajectoryReference parent lineage when trajectory_metadata_blob omits parent_id" }
 "table.battle_mode_infos" = { status = "ignored", note = "arena/battle UI state, not session turns" }
 
 # Typed google.protobuf.Any tool result payloads projected in native/payload.rs.
+# (`payload.exa.cortex.core.tools.Schedule` is handled by inference via `Some("exa.cortex.core.tools.Schedule")` in `lifecycle.rs`.)
 "payload.exa.cortex.core.tools.ReadFile" = { status = "handled", note = "scalar line/byte range facts" }
 "payload.exa.cortex.core.tools.RunCommand" = { status = "handled", note = "exit code, timeout, shell, cwd, and sandbox facts" }
 "payload.exa.cortex.core.tools.FileEdit" = { status = "handled", note = "path, diff_stats, and artifact flag" }
 "payload.exa.cortex.core.tools.ManageTask" = { status = "handled", note = "action and task_ids" }
 "payload.exa.cortex.core.tools.SendMessage" = { status = "handled", note = "recipient and recipient_name" }
-"payload.exa.cortex.core.tools.ManageSubagents" = { status = "handled", note = "action and conversation_ids" }
+"payload.exa.cortex.core.tools.ManageSubagents" = { status = "handled", note = "action, conversation_ids, and subagent step indices" }
 "payload.exa.cortex.core.tools.InvokeSubagent" = { status = "handled", note = "subagents spec scalars, conversation_ids, and task_mode" }
 "payload.exa.cortex.core.tools.DefineSubagent" = { status = "handled", note = "name and description" }
 "payload.exa.cortex.core.tools.GenerateImage" = { status = "handled", note = "image paths, URI, byte size, aspect ratio, and model" }
-"payload.exa.cortex.core.tools.AskQuestion" = { status = "handled", note = "questions, selected options, write-in response, and skip flag" }
+"payload.exa.cortex.core.tools.AskQuestion" = { status = "handled", note = "questions, options, selected options, write-in response, and skip flag" }
 "payload.exa.cortex.core.tools.SearchWeb" = { status = "handled", note = "query and domain" }
+"payload.exa.cortex.core.tools.MomaSearch" = { status = "handled", note = "query scalar" }
+"payload.exa.cortex.core.tools.Finish" = { status = "handled", note = "arguments_json and has_result_schema flag" }
+"payload.exa.cortex.core.tools.ListResources" = { status = "handled", note = "server_name and resource uris" }
+"payload.exa.cortex.core.tools.ReadResource" = { status = "handled", note = "server_name and uri" }
+"payload.exa.cortex.core.tools.McpTool" = { status = "handled", note = "server_name, result_uri, and progress_message" }
 "payload.gemini_coder.Step" = { status = "handled", note = "legacy wrapped step tool kind" }
 
 # Alternate history layouts and deliberately skipped non-transcript / encrypted sidecars.
