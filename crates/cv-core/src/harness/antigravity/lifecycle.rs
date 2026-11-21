@@ -24,9 +24,9 @@ pub(super) fn tool_result(result: &ToolResult<'_>) -> Observation {
             .and_then(|(code, _)| code.parse::<i32>().ok());
         let terminal = match observation.status {
             Status::Failed | Status::Stopped => Some(observation.status),
-            Status::Complete if result.status.is_some() => {
-                exit.map(|code| if code == 0 { Status::Complete } else { Status::Failed })
-            }
+            Status::Complete if result.status.is_some() => exit
+                .map(|code| if code == 0 { Status::Complete } else { Status::Failed })
+                .or_else(|| schedule_terminal(result)),
             _ => None,
         };
         if let Some(status) = terminal {
@@ -60,6 +60,22 @@ pub(super) fn message(message: &Message, body: &str) -> Observation {
     if message.kind != MessageKind::InjectedContext {
         return Observation::default();
     }
+    if let Some(job) = message
+        .extra
+        .get("antigravity")
+        .and_then(|native| native.get("completed_schedule"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| !id.is_empty())
+    {
+        return Observation {
+            updates: vec![Update {
+                target: Target::Job(job.to_owned()),
+                status: Status::Complete,
+                output: None,
+            }],
+            ..Default::default()
+        };
+    }
     let Some((job, canceled, output)) = completion(message, body) else {
         return Observation::default();
     };
@@ -82,13 +98,44 @@ pub(super) fn message(message: &Message, body: &str) -> Observation {
     }
 }
 
-fn background_job(out: &str) -> Option<&str> {
+pub(super) fn background_job(out: &str) -> Option<&str> {
     let body = out
         .lines()
         .find(|line| !line.starts_with("Created At:") && !line.starts_with("Completed At:"))?;
     body.strip_prefix("Tool is running as a background task with task id: ")
         .map(str::trim)
         .filter(|id| !id.is_empty())
+}
+
+fn schedule_terminal(result: &ToolResult<'_>) -> Option<Status> {
+    let payload = result
+        .details
+        .and_then(|d| d.get("payload"))
+        .or_else(|| {
+            result
+                .message
+                .and_then(|m| m.extra.get("antigravity"))
+                .and_then(|extra| extra.get("payload").or_else(|| extra.get("native_payload")))
+        })
+        .filter(|p| p.get("type").and_then(serde_json::Value::as_str) == Some("exa.cortex.core.tools.Schedule"))?;
+    let cancelled_by = payload
+        .get("cancelled_by")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty());
+    let outcome = payload
+        .get("outcome")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty());
+    if cancelled_by.is_some() || matches!(outcome, Some("cancelled" | "canceled" | "stopped" | "aborted")) {
+        return Some(Status::Stopped);
+    }
+    if matches!(outcome, Some("failed" | "error")) {
+        return Some(Status::Failed);
+    }
+    if outcome.is_none() && background_job(result.body).is_some() {
+        return None;
+    }
+    Some(Status::Complete)
 }
 
 fn polled_task<'a>(name: &str, out: &'a str) -> Option<(&'a str, &'a str)> {
@@ -120,12 +167,27 @@ fn completion<'a>(message: &'a Message, body: &'a str) -> Option<(&'a str, bool,
         .get("completed_task")
         .or_else(|| native.get("canceled_task"))?
         .as_str()?;
-    let (_, rest) = body.split_once(&format!("content=Task id \"{job}\" "))?;
-    let (canceled, output) = match rest.strip_prefix("finished with result:\n") {
-        Some(output) => (false, output),
-        None => (true, rest.strip_prefix("was canceled with result:\n")?),
+    let delivered = super::unwrap_system_message_body(body)?;
+    let rest = delivered.strip_prefix(&format!("Task id \"{job}\" "))?;
+    let (canceled, output) = if let Some(output) = strip_result_header(rest, "finished with result:") {
+        (false, output)
+    } else if let Some(output) = strip_result_header(rest, "was canceled with result:") {
+        (true, output)
+    } else if rest == "was canceled" {
+        (true, "")
+    } else {
+        return None;
     };
     Some((job, canceled, output.trim_end_matches("</SYSTEM_MESSAGE>").trim()))
+}
+
+fn strip_result_header<'a>(rest: &'a str, header: &str) -> Option<&'a str> {
+    let tail = rest.strip_prefix(header)?;
+    if tail.is_empty() {
+        Some("")
+    } else {
+        tail.strip_prefix('\n').or_else(|| tail.strip_prefix("\r\n"))
+    }
 }
 
 #[cfg(test)]

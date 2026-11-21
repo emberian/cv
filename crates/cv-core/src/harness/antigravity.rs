@@ -366,6 +366,21 @@ impl Adapter for Antigravity {
         Ok(crate::affordance::spawn_returns(Harness::Antigravity, name))
     }
 
+    fn record_affordance(
+        &self,
+        m: &Message,
+        _first: &crate::affordance::FirstText<'_>,
+    ) -> Result<Option<crate::affordance::RecordHit>> {
+        if m.origin == Origin::Scheduler {
+            return Ok(Some(crate::affordance::RecordHit {
+                kind: crate::affordance::Kind::Schedule,
+                action: "fire",
+                tool: "schedule",
+            }));
+        }
+        Ok(None)
+    }
+
     fn message_affordances(&self, m: &Message) -> Vec<crate::affordance::BagHit> {
         let bag = m.extra.get("antigravity");
         // A denial already surfaces through its refusal text; an approval leaves no
@@ -2329,9 +2344,19 @@ struct PendingCall {
     name: String,
 }
 
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct ScheduleSpec {
+    max_fires: Option<u64>,
+    fires_seen: u64,
+}
+
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 struct StepState {
     pending_calls: VecDeque<PendingCall>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    schedule_calls: BTreeMap<String, Option<u64>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    scheduled_tasks: BTreeMap<String, ScheduleSpec>,
     child_ids: BTreeSet<String>,
     spawned_children: BTreeMap<String, String>,
     first_ts: Option<DateTime<Utc>>,
@@ -2492,6 +2517,7 @@ impl StepCodec {
             "PLANNER_RESPONSE" | "USER_INPUT" | "CHECKPOINT" | "ERROR_MESSAGE"
         ) {
             self.state.pending_calls.clear();
+            self.state.schedule_calls.clear();
         }
         if matches!(ty.as_str(), "PLANNER_RESPONSE" | "USER_INPUT") {
             self.state.opened = true;
@@ -2588,6 +2614,11 @@ impl StepCodec {
                             .and_then(|m| m.calls.get(k))
                             .cloned()
                             .unwrap_or(call_id);
+                        if name == "schedule" {
+                            self.state
+                                .schedule_calls
+                                .insert(call_id.clone(), schedule_max_fires(&input)?);
+                        }
                         self.state.pending_calls.push_back(PendingCall {
                             id: call_id.clone(),
                             name: name.clone(),
@@ -2732,6 +2763,36 @@ impl StepCodec {
                     self.state.child_ids.insert(child_id.clone());
                     self.state.spawned_children.insert(child_id, tool_use_id.clone());
                 }
+                let scheduled_call = self.state.schedule_calls.remove(&tool_use_id);
+                let is_schedule = scheduled_call.is_some() || tool_name.as_deref() == Some("schedule");
+                if is_schedule && !is_error && !matches!(status.as_deref(), Some("CANCELED")) {
+                    let native_task_id = fields
+                        .value("native_task_details")?
+                        .and_then(|t| t.get("id")?.as_str().map(str::to_owned));
+                    #[cfg(feature = "sqlite")]
+                    let native_task_id = native_task_id.or_else(|| {
+                        revised
+                            .and_then(|native| native.task_details.as_ref())
+                            .and_then(|t| t.get("id")?.as_str().map(str::to_owned))
+                    });
+                    if let Some(task_id) = lifecycle::background_job(&head)
+                        .map(str::to_owned)
+                        .or(native_task_id)
+                        .filter(|id| !id.is_empty())
+                    {
+                        let max_fires = scheduled_call.flatten().or_else(|| {
+                            payload
+                                .as_ref()
+                                .and_then(|p| p.get("mode")?.as_str())
+                                .filter(|mode| matches!(*mode, "timer" | "one_shot" | "duration"))
+                                .map(|_| 1)
+                        });
+                        self.state.scheduled_tasks.entry(task_id).or_insert(ScheduleSpec {
+                            max_fires,
+                            fires_seen: 0,
+                        });
+                    }
+                }
                 if let Some(payload) = payload {
                     details.get_or_insert_with(|| json!({}))["payload"] = payload;
                 }
@@ -2831,6 +2892,25 @@ impl StepCodec {
                     .or_else(|| sender.as_deref().filter(|id| self.state.child_ids.contains(*id)))
                     .map(str::to_owned);
 
+                let task_notice = sender.as_deref().filter(|id| id.contains("/task-")).map(|task| {
+                    let finished = delivered
+                        .is_some_and(|body| body.starts_with(&format!("Task id \"{task}\" finished with result:")));
+                    let canceled =
+                        delivered.is_some_and(|body| body.starts_with(&format!("Task id \"{task}\" was canceled")));
+                    if finished {
+                        ("completed_task", task.to_owned(), false, false)
+                    } else if canceled {
+                        ("canceled_task", task.to_owned(), false, false)
+                    } else if let Some(spec) = self.state.scheduled_tasks.get_mut(task) {
+                        spec.fires_seen += 1;
+                        let settled = spec.max_fires == Some(spec.fires_seen);
+                        ("task_sender", task.to_owned(), true, settled)
+                    } else {
+                        ("task_sender", task.to_owned(), false, false)
+                    }
+                });
+                let scheduled_fire = task_notice.as_ref().is_some_and(|(_, _, fire, _)| *fire);
+
                 let (role, kind, origin) = if board.is_some() {
                     // A board post wakes every member it concerns; it is neither the
                     // worker's brief nor a child's return.
@@ -2850,20 +2930,19 @@ impl StepCodec {
                     (Role::User, MessageKind::Prompt, Origin::Subagent)
                 } else if returned.is_some() {
                     (Role::User, MessageKind::SubagentReturn, Origin::Subagent)
-                } else if sender.as_deref().is_some_and(|s_id| s_id.contains("timer")) {
+                } else if scheduled_fire || sender.as_deref().is_some_and(|s_id| s_id.contains("timer")) {
                     (Role::System, MessageKind::InjectedContext, Origin::Scheduler)
                 } else {
                     (Role::System, MessageKind::InjectedContext, Origin::Harness)
                 };
 
                 let mut m = Message::of_kind(role, kind, origin);
-                if let Some(task) = sender.as_deref().filter(|id| id.contains("/task-")) {
-                    // A killed task is announced by the same sender as a finished one.
-                    let canceled = head.contains(&format!("content=Task id \"{task}\" was canceled"));
-                    m.harness_extra_mut(Harness::Antigravity).insert(
-                        if canceled { "canceled_task" } else { "completed_task" }.into(),
-                        Value::String(task.to_owned()),
-                    );
+                if let Some((key, task, _, settled_schedule)) = task_notice {
+                    let bag = m.harness_extra_mut(Harness::Antigravity);
+                    bag.insert(key.into(), Value::String(task.clone()));
+                    if settled_schedule {
+                        bag.insert("completed_schedule".into(), Value::String(task));
+                    }
                 }
                 if let Some(seq) = board {
                     m.harness_extra_mut(Harness::Antigravity)
@@ -2992,6 +3071,27 @@ impl StepCodec {
         }
         Ok(self.s)
     }
+}
+
+fn schedule_max_fires(input: &Json) -> Result<Option<u64>> {
+    input.with_view(|view| {
+        if view
+            .get("DurationSeconds")?
+            .map(JsonView::as_number)
+            .transpose()?
+            .flatten()
+            .is_some()
+        {
+            return Ok(Some(1));
+        }
+        Ok(view
+            .get("MaxIterations")?
+            .map(JsonView::as_number)
+            .transpose()?
+            .flatten()
+            .and_then(|n| n.as_u64())
+            .filter(|n| *n > 0))
+    })
 }
 
 fn normalize_step_status(status: &str) -> String {
@@ -4312,7 +4412,7 @@ mod tests {
                 {"name":"swarm","args":{"action":"add","name":"worker","brief":"inspect"}},
                 {"name":"ask_permission","args":{"Action":"unsandboxed","Reason":"build"}}
             ]}),
-            json!({"step_index":1,"type":"SYSTEM_MESSAGE","content":format!("<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-14T00:00:00Z sender={PARENT_ID}/task-7\nTask finished\n</SYSTEM_MESSAGE>")}),
+            json!({"step_index":1,"type":"SYSTEM_MESSAGE","content":format!("<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-14T00:00:00Z sender={PARENT_ID}/task-7 content=Task id \"{PARENT_ID}/task-7\" finished with result:\nCommand exited with code 0.\n</SYSTEM_MESSAGE>")}),
         ];
         let text = records.iter().map(|r| format!("{r}\n")).collect::<String>();
         let session = parse_str(PARENT_ID, &text, None).unwrap();

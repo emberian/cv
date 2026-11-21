@@ -69,7 +69,6 @@ date = "2026-11-15"
 "payload.exa.cortex.core.tools.FileEdit" = { status = "handled", note = "path, diff_stats, and artifact flag" }
 "payload.exa.cortex.core.tools.ManageTask" = { status = "handled", note = "action and task_ids" }
 "payload.exa.cortex.core.tools.SendMessage" = { status = "handled", note = "recipient and recipient_name" }
-"payload.exa.cortex.core.tools.Schedule" = { status = "handled", note = "mode, outcome, iterations, and cancelled_by" }
 "payload.exa.cortex.core.tools.ManageSubagents" = { status = "handled", note = "action and conversation_ids" }
 "payload.exa.cortex.core.tools.InvokeSubagent" = { status = "handled", note = "subagents spec scalars, conversation_ids, and task_mode" }
 "payload.exa.cortex.core.tools.DefineSubagent" = { status = "handled", note = "name and description" }
