@@ -41,12 +41,13 @@ fn read(path: &Path, complete: bool, limit: i64) -> Result<jsonl::Read> {
             "unsupported Antigravity native steps schema"
         );
         // A negative LIMIT is no limit.
-        let mut query = conn.prepare("SELECT idx, step_format FROM steps ORDER BY idx LIMIT ?1")?;
+        let mut query = conn.prepare("SELECT rowid, idx, step_format FROM steps ORDER BY idx LIMIT ?1")?;
         let mut rows = query.query([limit])?;
         output.append(|mut out| {
             while let Some(row) = rows.next()? {
-                let index: i64 = row.get(0)?;
-                let format: i64 = row.get(1)?;
+                let rowid: i64 = row.get(0)?;
+                let index: i64 = row.get(1)?;
+                let format: i64 = row.get(2)?;
                 anyhow::ensure!(format == 0, "unsupported Antigravity native step format {format}");
                 anyhow::ensure!(index >= 0, "negative Antigravity step index");
                 // Each cell is privately staged, then projected with positioned bounded
@@ -54,12 +55,7 @@ fn read(path: &Path, complete: bool, limit: i64) -> Result<jsonl::Read> {
                 if stage.used.get() >= Stage::RENEW {
                     stage = Stage::new()?;
                 }
-                let cell = stage.append(|out| {
-                    sqlite::with_cell_reader(conn, "steps", "step_payload", index, |reader, _| {
-                        std::io::copy(reader, out)?;
-                        Ok(())
-                    })
-                })?;
+                let cell = stage.cell(conn, "steps", "step_payload", rowid)?;
                 let step = Proto::read(&stage.file, cell.0, cell.1)?;
                 project(&stage, &step, cell, index as u64, complete, &mut out)?;
             }
@@ -87,7 +83,7 @@ pub(super) fn spawn_calls(path: &Path, children: &[&str]) -> Result<BTreeMap<Str
         // SQLite finds the rows that mention a child; only those are staged and decoded.
         let mentions = vec!["instr(step_payload, CAST(? AS BLOB)) > 0"; children.len()].join(" OR ");
         let mut query = conn.prepare(&format!(
-            "SELECT idx FROM steps WHERE step_payload IS NOT NULL AND ({mentions}) ORDER BY idx"
+            "SELECT rowid FROM steps WHERE step_payload IS NOT NULL AND ({mentions}) ORDER BY idx"
         ))?;
         let rows: Vec<i64> = query
             .query_map(rusqlite::params_from_iter(children.iter()), |row| row.get(0))?
@@ -95,12 +91,7 @@ pub(super) fn spawn_calls(path: &Path, children: &[&str]) -> Result<BTreeMap<Str
         let stage = Stage::new()?;
         let file = &stage.file;
         for row in rows {
-            let (at, len) = stage.append(|out| {
-                sqlite::with_cell_reader(conn, "steps", "step_payload", row, |reader, _| {
-                    std::io::copy(reader, out)?;
-                    Ok(())
-                })
-            })?;
+            let (at, len) = stage.cell(conn, "steps", "step_payload", row)?;
             let step = Proto::read(file, at, len)?;
             let inner = |message: &Proto, number: u32| message.last(number).map(|f| f.message(file)).transpose();
             let text = |message: &Proto, number: u32| message.last(number).and_then(|f| f.string(file, 256).ok());
@@ -154,6 +145,8 @@ pub(super) struct Stage {
 impl Stage {
     /// Staged bytes after which the next row starts a new file, releasing the old one.
     const RENEW: u64 = 64 << 20;
+    /// Maximum single SQLite BLOB cell staged into disk scratch (guards hostile `zeroblob`s).
+    const MAX_CELL_BYTES: u64 = 256 << 20;
 
     fn new() -> Result<Self> {
         let arena = ByteSource::arena()?;
@@ -169,6 +162,33 @@ impl Stage {
         self.used.set(range.0 + range.1);
         Ok(range)
     }
+    fn cell(&self, conn: &rusqlite::Connection, table: &str, column: &str, rowid: i64) -> Result<(u64, u64)> {
+        self.append(|out| {
+            sqlite::with_cell_reader(conn, table, column, rowid, |reader, len| {
+                anyhow::ensure!(
+                    len as u64 <= Self::MAX_CELL_BYTES,
+                    "native SQLite cell in {table}.{column} exceeds {} MiB limit",
+                    Self::MAX_CELL_BYTES >> 20
+                );
+                let copied = std::io::copy(&mut reader.take(Self::MAX_CELL_BYTES + 1), out)?;
+                anyhow::ensure!(
+                    copied <= Self::MAX_CELL_BYTES,
+                    "native SQLite cell in {table}.{column} exceeds {} MiB limit",
+                    Self::MAX_CELL_BYTES >> 20
+                );
+                Ok(())
+            })
+        })
+    }
+}
+
+fn timestamp(ts: &Proto) -> Option<DateTime<Utc>> {
+    let seconds = scalar(ts, 1).and_then(|s| i64::try_from(s).ok())?;
+    let nanos = match scalar(ts, 2) {
+        Some(n) => u32::try_from(n).ok().filter(|&n| n < 1_000_000_000)?,
+        None => 0,
+    };
+    DateTime::from_timestamp(seconds, nanos)
 }
 
 fn scalar(p: &Proto, field: u32) -> Option<u64> {
@@ -264,11 +284,8 @@ fn project(
             _ => "UNSPECIFIED",
         };
         write!(out, ",\"source\":\"{source}\"")?;
-        if let Some(timestamp) = meta.last(1) {
-            let ts = timestamp.message(file)?;
-            if let Some(ts) = scalar(&ts, 1)
-                .and_then(|seconds| DateTime::from_timestamp(seconds as i64, scalar(&ts, 2).unwrap_or(0) as u32))
-            {
+        if let Some(ts_field) = meta.last(1) {
+            if let Some(ts) = timestamp(&ts_field.message(file)?) {
                 write!(out, ",\"created_at\":{}", serde_json::to_string(&ts.to_rfc3339())?)?;
             }
         }
@@ -327,17 +344,23 @@ fn project(
                 let result = field.message(file)?;
                 let has_content = if result.last(1).is_some() {
                     text(file, &result, 1, "content", out)?;
+                    if let Some(structure) = result.last(10) {
+                        unsupported |= !structured_result(stage, structure.message(file)?, true, out)?;
+                    } else if let Some(value) = result.last(11) {
+                        unsupported |= !structured_result(stage, value.message(file)?, false, out)?;
+                    }
                     true
                 } else if let Some(structure) = result.last(10) {
-                    structured_content(stage, structure.message(file)?, true, out)?
+                    let ok = structured_content(stage, structure.message(file)?, true, out)?;
+                    unsupported |= !ok;
+                    ok
                 } else if let Some(value) = result.last(11) {
-                    structured_content(stage, value.message(file)?, false, out)?
+                    let ok = structured_content(stage, value.message(file)?, false, out)?;
+                    unsupported |= !ok;
+                    ok
                 } else {
                     false
                 };
-                // A structured result with a member that is not JSON (a genai content or
-                // function value) is not normalized.
-                unsupported |= !has_content && (result.last(10).is_some() || result.last(11).is_some());
                 if let Some(info) = result.last(3) {
                     let info = info.message(file)?;
                     render::agents(file, &info, out)?;
@@ -356,7 +379,10 @@ fn project(
             text(file, message, 1, "content", out)?;
             missing_attachments |= media::project(file, message, 6, out)?;
         }
-        ("CHECKPOINT", Some(checkpoint)) => text(file, checkpoint, 5, "content", out)?,
+        ("CHECKPOINT", Some(checkpoint)) => {
+            text(file, checkpoint, 5, "content", out)?;
+            context::checkpoint(file, checkpoint, out)?;
+        }
         ("ERROR_MESSAGE", Some(message)) => {
             if let Some(error) = message.last(3) {
                 let error = error.message(file)?;
@@ -364,9 +390,11 @@ fn project(
                 if let Some(number) = preferred {
                     text(file, &error, number, "content", out)?;
                 }
-                // The export's `error` is the short error, whichever text is preferred.
+                // The export's `error` is the short or full error, whichever text is preferred.
                 if step.last(31).is_none() {
-                    text(file, &error, 2, "error", out)?;
+                    if let Some(err_num) = [2, 3].into_iter().find(|number| error.last(*number).is_some()) {
+                        text(file, &error, err_num, "error", out)?;
+                    }
                 }
             }
         }
@@ -404,7 +432,7 @@ fn project(
     Ok(())
 }
 
-fn structured_content(stage: &Stage, message: Proto, structure: bool, out: &mut impl Write) -> Result<bool> {
+fn stage_structured(stage: &Stage, message: Proto, structure: bool) -> Result<(bool, u64, u64)> {
     let file = &stage.file;
     let mut supported = false;
     let (at, len) = stage.append(|mut output| {
@@ -415,9 +443,23 @@ fn structured_content(stage: &Stage, message: Proto, structure: bool, out: &mut 
         };
         Ok(())
     })?;
+    Ok((supported, at, len))
+}
+
+fn structured_content(stage: &Stage, message: Proto, structure: bool, out: &mut impl Write) -> Result<bool> {
+    let (supported, at, len) = stage_structured(stage, message, structure)?;
     if supported {
         out.write_all(b",\"content\":")?;
-        crate::projection::write_json_string(out, wire::range(file, at, len)?)?;
+        crate::projection::write_json_string(out, wire::range(&stage.file, at, len)?)?;
+    }
+    Ok(supported)
+}
+
+fn structured_result(stage: &Stage, message: Proto, structure: bool, out: &mut impl Write) -> Result<bool> {
+    let (supported, at, len) = stage_structured(stage, message, structure)?;
+    if supported {
+        out.write_all(b",\"native_structured_result\":")?;
+        std::io::copy(&mut wire::range(&stage.file, at, len)?, out)?;
     }
     Ok(supported)
 }
@@ -593,6 +635,29 @@ mod tests {
         assert!(projected.get("native_missing_payloads").is_none());
         assert_eq!(projected["native_unsupported"], true);
         assert!(projected.get("content").is_none());
+
+        // When result.text(1) is also present, 10/11 project into native_structured_result
+        // and still propagate unsupported genai.Value variants.
+        let both = bytes(
+            140,
+            &bytes(2, &[bytes(1, b"text summary"), bytes(10, &bytes(1, &entry))].concat()),
+        );
+        let projected = projection(&both, false);
+        assert_eq!(projected["content"], "text summary");
+        assert_eq!(
+            projected["native_structured_result"],
+            serde_json::json!({"values": ["hello\nworld", true]})
+        );
+        assert!(projected.get("native_unsupported").is_none());
+
+        let both_unsupported = bytes(
+            140,
+            &bytes(2, &[bytes(1, b"text summary"), bytes(11, &bytes(7, &[]))].concat()),
+        );
+        let projected = projection(&both_unsupported, false);
+        assert_eq!(projected["content"], "text summary");
+        assert!(projected.get("native_structured_result").is_none());
+        assert_eq!(projected["native_unsupported"], true);
     }
 
     #[test]
@@ -617,6 +682,50 @@ mod tests {
         let details = [bytes(1, b"User facing failure"), bytes(3, b"Internal details")].concat();
         let projected = projection(&bytes(24, &bytes(3, &details)), false);
         assert_eq!(projected["content"], "User facing failure");
+        assert_eq!(projected["error"], "Internal details");
+    }
+
+    #[test]
+    fn explicit_rowid_cell_cap_and_bad_timestamps_are_safe() {
+        let world = crate::test_world("antigravity-native-bounds");
+        let path = world.base.join("nonpk.db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        // Non-INTEGER PRIMARY KEY `idx INT` assigns rowid=1 to idx=0.
+        conn.execute_batch(
+            "CREATE TABLE steps(idx INT, step_format INT, step_payload BLOB);
+             CREATE TABLE gen_metadata(idx INT, data BLOB);",
+        )
+        .unwrap();
+        let prompt = bytes(19, &bytes(1, b"rowid zero index"));
+        conn.execute("INSERT INTO steps VALUES(0, 0, ?1)", [&prompt]).unwrap();
+        let model = [bytes(1, &bytes(19, b"gemini-4-pro")), uint(2, 0)].concat();
+        conn.execute("INSERT INTO gen_metadata VALUES(0, ?1)", [&model])
+            .unwrap();
+        drop(conn);
+
+        let read = open(&path, false).unwrap();
+        let line: serde_json::Value = serde_json::from_slice(&read.decoded_bytes().unwrap()).unwrap();
+        assert_eq!(line["step_index"], 0);
+        assert_eq!(line["content"], "rowid zero index");
+        let meta = metadata(&path, true).unwrap();
+        assert_eq!(meta.dominant_model.as_deref(), Some("gemini-4-pro"));
+
+        // Oversized zeroblob(>256 MiB) is rejected before copying into scratch.
+        let huge = world.base.join("huge.db");
+        let conn = rusqlite::Connection::open(&huge).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE steps(idx INTEGER PRIMARY KEY, step_format INTEGER, step_payload BLOB);
+             INSERT INTO steps VALUES(0, 0, zeroblob(270000000));",
+        )
+        .unwrap();
+        drop(conn);
+        let err = open(&huge, false).err().expect("oversized cell must fail");
+        assert!(format!("{err:#}").contains("exceeds 256 MiB limit"), "{err:#}");
+
+        // Overflowing timestamp nanos omit created_at instead of truncating mod 2^32.
+        let bad_ts = bytes(5, &bytes(1, &[uint(1, 1_700_000_000), uint(2, 1 << 32)].concat()));
+        let projected = projection(&[bad_ts, bytes(19, &bytes(1, b"ok"))].concat(), false);
+        assert!(projected.get("created_at").is_none());
     }
 
     /// A history's temporary files do not grow with its steps, and each step's projection,

@@ -376,7 +376,11 @@ fn steps_absent_from_the_export_are_read_from_the_store() {
 
         let failure = by_id(&session, 8);
         assert_eq!(failure.kind, MessageKind::Error);
-        assert!(body(&session, failure).contains("fixture error"));
+        assert_eq!(
+            body(&session, failure),
+            "UNAVAILABLE (code 503): fixture error",
+            "exported={exported}"
+        );
 
         // STOP_REASON 18 is CLIENT_STREAM_ERROR; the dropped stream has no stop reason at all.
         assert_eq!(
@@ -443,6 +447,15 @@ fn a_resumed_conversation_keeps_the_history_its_recreated_export_lacks() {
         let summary = by_id(&session, 6);
         assert_eq!(summary.kind, MessageKind::CompactionSummary);
         assert!(body(&session, summary).contains("FIXTURE SUMMARY: the user ran one pre-compaction fixture command"));
+        assert_eq!(
+            native(summary)["checkpoint_details"],
+            json!({
+                "included_step_index_end": 6,
+                "total_subagent_count": 0,
+                "captured_requests": ["resume-fixture: first turn", "/compact"]
+            }),
+            "exported={exported}"
+        );
         assert_eq!(body(&session, by_id(&session, 16)), "third: done.");
         assert_eq!(results(&session).len(), 3);
         assert!(results(&session)
@@ -956,8 +969,9 @@ fn unsupported_native_fields_names_only_captures_with_a_field_nothing_reads() {
             .map(|(_, session)| limitations(session).contains(&"unsupported_native_fields".to_owned()))
             .collect()
     };
-    // Permissions, cancellation, background tasks, swarm members, children and prompt
-    // media are all interpreted: none of these reads leaves a field unread.
+    // Permissions, cancellation, background tasks, swarm members, children, prompt media,
+    // native background media and compaction checkpoints are all interpreted: none of the
+    // 8 real-writer captures leaves a field unread.
     for version in [
         "1.5.9-permissions",
         "1.5.9-interruption",
@@ -966,6 +980,7 @@ fn unsupported_native_fields_names_only_captures_with_a_field_nothing_reads() {
         "1.5.9-subagents",
         "1.5.9-prompt-media",
         "1.5.9-native-background-media",
+        "1.5.9-compaction-resume",
     ] {
         for exported in [false, true] {
             assert!(
@@ -974,24 +989,4 @@ fn unsupported_native_fields_names_only_captures_with_a_field_nothing_reads() {
             );
         }
     }
-    // A compaction checkpoint stores more than the summary that is read
-    // (CortexStepCheckpoint: accumulated sections 26, captured requests 30, parent
-    // messages 31, artifact, subagent and task snapshots 14, 20, 21).
-    for exported in [false, true] {
-        assert_eq!(
-            reports("1.5.9-compaction-resume", exported),
-            [true],
-            "exported={exported}"
-        );
-    }
-    let root = store(&world, "1.5.9-compaction-resume", false);
-    let (_, session) = only(sessions(&root));
-    let unread = stored(&root, &session.id).iter().any(|step| {
-        nested(&step.payload, 30).iter().any(|checkpoint| {
-            [14, 20, 21, 26, 30, 31]
-                .iter()
-                .any(|field| !nested(checkpoint, *field).is_empty())
-        })
-    });
-    assert!(unread, "the stored checkpoint holds one of the fields the reader skips");
 }

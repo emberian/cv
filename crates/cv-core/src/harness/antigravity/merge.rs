@@ -15,6 +15,9 @@ pub(super) struct Match {
     pub signature: Option<String>,
     pub usage: Option<Usage>,
     pub planner_details: Option<Value>,
+    pub checkpoint_details: Option<Value>,
+    pub task_details: Option<Value>,
+    pub structured_result: Option<Value>,
     /// The permission request and its answer, which the export does not carry.
     pub interaction: Option<Value>,
     /// The native revision of a result whose body is not the exported one.
@@ -420,6 +423,9 @@ pub(super) fn verified(
             if let Some(fields) = Fields::parse(view, STEP_KEYS)? {
                 matched.usage = parse_step_usage(&fields)?;
                 matched.planner_details = fields.value("native_planner_details")?;
+                matched.checkpoint_details = fields.value("native_checkpoint_details")?;
+                matched.task_details = fields.value("native_task_details")?;
+                matched.structured_result = fields.value("native_structured_result")?;
                 matched.interaction = fields.value("native_interaction")?;
                 matched.payload = fields.value("native_payload")?;
             }

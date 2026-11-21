@@ -368,4 +368,106 @@ mod native {
         assert!(markdown.contains("some recorded payloads are unavailable"));
         assert!(markdown.contains("some native fields are not interpreted"));
     }
+
+    #[test]
+    fn lean_and_verified_reads_preserve_task_details_structured_results_and_interaction_tiers() {
+        let world = World::in_process("agy-lean-task-interaction", cv_core::env::Env::enter_isolated);
+        let root = world.home.join(".gemini/antigravity-cli");
+        let call_a = [bytes(1, "call-task"), bytes(2, "run_command"), bytes(3, "{}")].concat();
+        let call_b = [bytes(1, "call-q"), bytes(2, "ask_question"), bytes(3, "{}")].concat();
+        let planner = [
+            number(1, 15),
+            number(4, 3),
+            bytes(5, bytes(1, number(1, 1_700_000_000))),
+            bytes(
+                20,
+                [bytes(1, "Running"), bytes(7, call_a.clone()), bytes(7, call_b.clone())].concat(),
+            ),
+        ]
+        .concat();
+        let entry = [bytes(1, "exit"), bytes(2, number(4, 1))].concat();
+        let res_a = [
+            number(1, 132),
+            number(4, 3),
+            bytes(5, [bytes(1, number(1, 1_700_000_001)), bytes(4, call_a)].concat()),
+            bytes(
+                140,
+                bytes(2, [bytes(1, "task started"), bytes(10, bytes(1, entry))].concat()),
+            ),
+            bytes(148, [bytes(1, format!("{ID}/task-1")), number(6, 1)].concat()),
+        ]
+        .concat();
+        let res_b = [
+            number(1, 132),
+            number(4, 3),
+            bytes(5, [bytes(1, number(1, 1_700_000_002)), bytes(4, call_b)].concat()),
+            bytes(140, bytes(2, bytes(1, "answered"))),
+            bytes(147, bytes(1, bytes(22, []))),
+        ]
+        .concat();
+        let db_path = database(&root, &[planner, res_a, res_b]);
+        let adapter = Antigravity::with_home(&root);
+
+        // Native-only at LEAN/FACTS keeps task_details, omits non-permission interaction,
+        // and surfaces non-permission interaction + structured_result on RICH.
+        let native_ref = SessionRef::new(ID, Harness::Antigravity, &db_path);
+        for demand in [Demand::LEAN, Demand::FACTS] {
+            let s = cv_core::stream::collect_with(&adapter, &native_ref, &demand).unwrap();
+            assert_eq!(
+                s.messages[1].extra["antigravity"]["task_details"]["id"],
+                format!("{ID}/task-1")
+            );
+            assert!(s.messages[2]
+                .extra
+                .get("antigravity")
+                .and_then(|v| v.get("interaction"))
+                .is_none());
+        }
+        let rich = cv_core::stream::collect_with(&adapter, &native_ref, &Demand::RICH).unwrap();
+        let cv_core::Block::ToolResult { details: Some(d), .. } = &rich.messages[1].content[0] else {
+            panic!("expected structured result details");
+        };
+        assert_eq!(d["result"], json!({"exit": true}));
+        assert_eq!(
+            rich.messages[2].extra["antigravity"]["interaction"],
+            json!({"kind": "unsupported", "native_field": 22})
+        );
+        assert!(ReadCoverage::of_session(&rich)
+            .unwrap()
+            .limitations
+            .contains(ReadCoverage::UNSUPPORTED_NATIVE_FIELDS));
+
+        // Verified export merge also preserves task_details at LEAN and structured_result at RICH.
+        let logs = root.join("brain").join(ID).join(".system_generated/logs");
+        fs::create_dir_all(&logs).unwrap();
+        let export = logs.join("transcript_full.jsonl");
+        let lines = [
+            json!({"step_index":0,"type":"PLANNER_RESPONSE","status":"DONE","created_at":"2023-11-14T22:13:20Z","content":"Running","tool_calls":[{"name":"run_command","args":{}},{"name":"ask_question","args":{}}]}),
+            json!({"step_index":1,"type":"GENERIC","status":"DONE","created_at":"2023-11-14T22:13:21Z","content":"Created At: 2023-11-14T22:13:21Z\ntask started"}),
+            json!({"step_index":2,"type":"GENERIC","status":"DONE","created_at":"2023-11-14T22:13:22Z","content":"Created At: 2023-11-14T22:13:22Z\nanswered"}),
+        ];
+        fs::write(&export, lines.iter().map(|r| format!("{r}\n")).collect::<String>()).unwrap();
+        let exp_ref = SessionRef::new(ID, Harness::Antigravity, &export);
+        let lean_merged = cv_core::stream::collect_with(&adapter, &exp_ref, &Demand::LEAN).unwrap();
+        assert_eq!(
+            lean_merged.messages[1].extra["antigravity"]["task_details"]["id"],
+            format!("{ID}/task-1")
+        );
+        let rich_merged = cv_core::stream::collect_with(&adapter, &exp_ref, &Demand::RICH).unwrap();
+        let cv_core::Block::ToolResult { details: Some(d), .. } = &rich_merged.messages[1].content[0] else {
+            panic!("expected merged structured result");
+        };
+        assert_eq!(d["result"], json!({"exit": true}));
+
+        // Oversized >256 KiB pbtxt annotation is safely ignored.
+        let annotations = root.join("annotations");
+        fs::create_dir_all(&annotations).unwrap();
+        fs::write(
+            annotations.join(format!("{ID}.pbtxt")),
+            format!("title: \"{}\"\n", "x".repeat(300 * 1024)),
+        )
+        .unwrap();
+        let discovered = adapter.discover().unwrap();
+        assert!(discovered[0].title.as_deref().is_none_or(|t| t.len() < 1024));
+    }
 }

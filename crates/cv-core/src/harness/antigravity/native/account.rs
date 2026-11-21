@@ -13,7 +13,7 @@ const STEP: &[u32] = &[1, 4, 5, 19, 20, 24, 30, 31, 114, 133, 140, 147, 148];
 /// Read: created_at 1, source 3, tool_call 4, model_usage 9.
 const METADATA: &[u32] = &[
     1, 3, 4, 9, // read
-    5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 19, 20, 21, 22, 23, 24, 25, 26, 27, 30, 31, 32, 33, 35, 36, 38, 39,
+    5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 30, 31, 32, 33, 35, 36, 38, 39,
 ];
 /// Read: id 1, name 2, arguments 3 or invalid arguments 4, signatures 6 and 7.
 const TOOL_CALL: &[u32] = &[1, 2, 3, 4, 5, 6, 7];
@@ -28,11 +28,13 @@ const GENERIC: &[u32] = &[2, 1];
 const RESULT: &[u32] = &[1, 3, 4, 6, 7, 10, 11];
 /// Read: message 1, media 6.
 const SYSTEM_MESSAGE: &[u32] = &[1, 6, 2, 3, 4];
-/// Read: session summary 5.
-const CHECKPOINT: &[u32] = &[5, 1, 3, 9, 11, 12, 15, 16, 17, 24, 25, 27, 28, 29];
+/// Read: session summary 5, step bounds 1/11/12/27, snapshots & captured requests 14/20/21/26/30/31.
+const CHECKPOINT: &[u32] = &[
+    5, 12, 14, 20, 21, 26, 30, 31, 1, 3, 9, 11, 15, 16, 17, 24, 25, 27, 28, 29,
+];
 /// Read: error 3.
 const ERROR_MESSAGE: &[u32] = &[3, 4, 5];
-/// Read: the first present of 1, 9, 3, 2, 5 and the short error 2.
+/// Read: the first present of 1, 9, 3, 2, 5 and the short/full error 2 or 3.
 const ERROR_DETAILS: &[u32] = &[1, 2, 3, 5, 9, 4, 6, 7, 11, 12];
 /// Read: id, log, progress, description, flags, title, time.
 const TASK: &[u32] = &[1, 2, 3, 4, 5, 6, 7, 8];

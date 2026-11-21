@@ -5,21 +5,48 @@
 //! kinds stay uninterpreted wire, disclosed by the step's unsupported-field coverage.
 use super::{File, Proto, Result, Write};
 
-/// Whether a permission interaction was found and written.
+/// Whether a permission interaction was found and written. Non-permission interactions
+/// on `133`/`147` emit an `"unsupported"` marker for `Tier::Rich`+ while returning `false`
+/// so `unsupported_native_fields` remains accurate.
 pub(super) fn project(file: &File, step: &Proto, out: &mut impl Write) -> Result<bool> {
     let completed = step.last(147).map(|field| field.message(file)).transpose()?;
-    let asked = match &completed {
-        Some(completed) => match completed.last(1) {
-            Some(spec) => spec.message(file)?.last(21),
-            None => None,
-        },
+    let asked_spec = match &completed {
+        Some(completed) => completed.last(1).map(|spec| spec.message(file)).transpose()?,
         None => None,
     };
-    let requested = match step.last(133) {
-        Some(field) => field.message(file)?.last(2),
-        None => None,
-    };
+    let asked = asked_spec.as_ref().and_then(|spec| spec.last(21));
+    let requested_msg = step.last(133).map(|field| field.message(file)).transpose()?;
+    let requested = requested_msg.as_ref().and_then(|req| req.last(2));
     let Some(request) = asked.or(requested) else {
+        let unsupported_field = if completed.is_some() {
+            asked_spec
+                .as_ref()
+                .and_then(|spec| spec.fields().last().map(|f| f.number))
+                .or_else(|| {
+                    completed
+                        .as_ref()
+                        .and_then(|c| c.last(2))
+                        .and_then(|r| r.message(file).ok())
+                        .and_then(|r| {
+                            r.fields()
+                                .iter()
+                                .rev()
+                                .find(|f| !matches!(f.number, 1 | 2 | 24 | 25))
+                                .map(|f| f.number)
+                        })
+                })
+                .or(Some(147))
+        } else if let Some(req) = &requested_msg {
+            req.fields().last().map(|f| f.number).or(Some(133))
+        } else {
+            None
+        };
+        if let Some(native_field) = unsupported_field {
+            write!(
+                out,
+                ",\"native_interaction\":{{\"kind\":\"unsupported\",\"native_field\":{native_field}}}"
+            )?;
+        }
         return Ok(false);
     };
     out.write_all(b",\"native_interaction\":{\"kind\":\"permission\"")?;
@@ -58,36 +85,51 @@ mod tests {
         out
     }
 
-    fn projection(data: &[u8]) -> serde_json::Value {
+    fn projection(data: &[u8]) -> (bool, serde_json::Value) {
         let staged = ByteSource::arena().unwrap();
         staged.append(|out| Ok(out.write_all(data)?)).unwrap();
         let file = staged.file().unwrap();
         let step = Proto::read(&file, 0, data.len() as u64).unwrap();
         let mut out = b"{\"sentinel\":true".to_vec();
-        project(&file, &step, &mut out).unwrap();
+        let interpreted = project(&file, &step, &mut out).unwrap();
         out.push(b'}');
-        serde_json::from_slice(&out).unwrap()
+        (interpreted, serde_json::from_slice(&out).unwrap())
     }
 
     #[test]
     fn an_open_request_has_no_decision_and_an_answer_is_never_assumed() {
         let resource = [bytes(1, b"command"), bytes(2, b"make test")].concat();
         let open = bytes(133, &bytes(2, &bytes(1, &resource)));
+        let (interpreted, val) = projection(&open);
+        assert!(interpreted);
         assert_eq!(
-            projection(&open)["native_interaction"],
+            val["native_interaction"],
             serde_json::json!({"kind": "permission", "action": "command", "target": "make test"})
         );
         let spec = bytes(1, &bytes(21, &bytes(1, &resource)));
         for (answer, decision) in [(vec![8, 1], "approved"), (bytes(4, b""), "denied")] {
             let completed = bytes(147, &[spec.clone(), bytes(2, &bytes(21, &answer))].concat());
-            assert_eq!(projection(&completed)["native_interaction"]["decision"], decision);
+            let (interpreted, val) = projection(&completed);
+            assert!(interpreted);
+            assert_eq!(val["native_interaction"]["decision"], decision);
         }
         // A completed interaction with no permission response decides nothing.
         let unanswered = bytes(147, &[spec, bytes(2, &bytes(1, b"trajectory"))].concat());
-        assert!(projection(&unanswered)["native_interaction"].get("decision").is_none());
-        // Another interaction kind is not a permission.
-        assert!(projection(&bytes(133, &bytes(5, b"question")))
-            .get("native_interaction")
-            .is_none());
+        let (interpreted, val) = projection(&unanswered);
+        assert!(interpreted);
+        assert!(val["native_interaction"].get("decision").is_none());
+        // Non-permission interactions emit an unsupported marker and return false.
+        let (interpreted, val) = projection(&bytes(133, &bytes(5, b"question")));
+        assert!(!interpreted);
+        assert_eq!(
+            val["native_interaction"],
+            serde_json::json!({"kind": "unsupported", "native_field": 5})
+        );
+        let (interpreted, val) = projection(&bytes(147, &bytes(1, &bytes(22, &[]))));
+        assert!(!interpreted);
+        assert_eq!(
+            val["native_interaction"],
+            serde_json::json!({"kind": "unsupported", "native_field": 22})
+        );
     }
 }

@@ -257,18 +257,229 @@ pub(super) fn task(file: &File, details: &Proto, out: &mut impl Write) -> Result
         }
     }
     if let Some(timestamp) = details.last(8) {
-        let timestamp = timestamp.message(file)?;
-        let seconds = timestamp.last(1).and_then(|f| f.u64()).unwrap_or(0) as i64;
-        let nanos = timestamp.last(2).and_then(|f| f.u64()).unwrap_or(0);
-        let timestamp = chrono::DateTime::from_timestamp(seconds, u32::try_from(nanos)?)
-            .ok_or_else(|| anyhow::anyhow!("invalid native background task timestamp"))?;
-        write!(
-            out,
-            ",\"moved_to_background_at\":{}",
-            serde_json::to_string(&timestamp.to_rfc3339())?
-        )?;
+        if let Some(timestamp) = super::timestamp(&timestamp.message(file)?) {
+            write!(
+                out,
+                ",\"moved_to_background_at\":{}",
+                serde_json::to_string(&timestamp.to_rfc3339())?
+            )?;
+        }
     }
     out.write_all(b"}")?;
+    Ok(())
+}
+
+pub(super) fn checkpoint(file: &File, checkpoint: &Proto, out: &mut impl Write) -> Result<()> {
+    const DETAIL_FIELDS: &[u32] = &[1, 11, 12, 14, 20, 21, 26, 27, 30, 31];
+    if !DETAIL_FIELDS.iter().any(|n| checkpoint.last(*n).is_some()) {
+        return Ok(());
+    }
+    out.write_all(b",\"native_checkpoint_details\":{")?;
+    let mut first = true;
+    let mut key = |name: &str, out: &mut dyn Write| -> Result<()> {
+        if !std::mem::take(&mut first) {
+            out.write_all(b",")?;
+        }
+        write!(out, "\"{name}\":")?;
+        Ok(())
+    };
+    for (number, name) in [
+        (1, "checkpoint_index"),
+        (11, "included_step_index_start"),
+        (12, "included_step_index_end"),
+        (27, "total_subagent_count"),
+    ] {
+        if let Some(value) = checkpoint.last(number).and_then(|f| f.u64()) {
+            key(name, out)?;
+            write!(out, "{value}")?;
+        }
+    }
+    for (number, name) in [(30, "captured_requests"), (31, "captured_parent_messages")] {
+        if checkpoint.last(number).is_some() {
+            key(name, out)?;
+            out.write_all(b"[")?;
+            let mut first_item = true;
+            for item in checkpoint.repeated(number) {
+                if let Some(text) = item.message(file)?.last(1) {
+                    if !std::mem::take(&mut first_item) {
+                        out.write_all(b",")?;
+                    }
+                    text.write_json_string(file, out)?;
+                }
+            }
+            out.write_all(b"]")?;
+        }
+    }
+    if checkpoint.last(14).is_some() {
+        key("artifact_snapshots", out)?;
+        out.write_all(b"[")?;
+        for (i, item) in checkpoint.repeated(14).enumerate() {
+            if i != 0 {
+                out.write_all(b",")?;
+            }
+            let snap = item.message(file)?;
+            out.write_all(b"{")?;
+            let mut inner_first = true;
+            obj_strings(file, &snap, &[(1, "name"), (3, "uri")], out, &mut inner_first)?;
+            obj_numbers(&snap, &[(5, "review_state")], out, &mut inner_first)?;
+            if let Some(ts) = snap.last(4) {
+                if let Some(ts) = super::timestamp(&ts.message(file)?) {
+                    obj_key("last_edited", out, &mut inner_first)?;
+                    serde_json::to_writer(&mut *out, &ts.to_rfc3339())?;
+                }
+            }
+            out.write_all(b"}")?;
+        }
+        out.write_all(b"]")?;
+    }
+    if checkpoint.last(20).is_some() {
+        key("subagent_snapshots", out)?;
+        out.write_all(b"[")?;
+        for (i, item) in checkpoint.repeated(20).enumerate() {
+            if i != 0 {
+                out.write_all(b",")?;
+            }
+            let snap = item.message(file)?;
+            out.write_all(b"{")?;
+            let mut inner_first = true;
+            if let Some(spec) = snap.last(4) {
+                let spec = spec.message(file)?;
+                obj_strings(file, &spec, &[(1, "type_name"), (2, "role")], out, &mut inner_first)?;
+            }
+            if let Some(res) = snap.last(5) {
+                let res = res.message(file)?;
+                obj_strings(
+                    file,
+                    &res,
+                    &[(1, "conversation_id"), (2, "log_uri")],
+                    out,
+                    &mut inner_first,
+                )?;
+            }
+            if let Some(killed) = snap.last(6).and_then(|f| f.u64()) {
+                obj_key("killed", out, &mut inner_first)?;
+                write!(out, "{}", killed != 0)?;
+            }
+            if let Some(idx) = snap.last(7).and_then(|f| f.u64()) {
+                obj_key("spawn_step_index", out, &mut inner_first)?;
+                write!(out, "{}", idx as i64)?;
+            }
+            out.write_all(b"}")?;
+        }
+        out.write_all(b"]")?;
+    }
+    if checkpoint.last(21).is_some() {
+        key("running_task_snapshots", out)?;
+        out.write_all(b"[")?;
+        for (i, item) in checkpoint.repeated(21).enumerate() {
+            if i != 0 {
+                out.write_all(b",")?;
+            }
+            let snap = item.message(file)?;
+            out.write_all(b"{")?;
+            let mut inner_first = true;
+            obj_strings(
+                file,
+                &snap,
+                &[
+                    (1, "task_id"),
+                    (2, "tool_name"),
+                    (3, "tool_summary"),
+                    (4, "description"),
+                    (7, "log_uri"),
+                ],
+                out,
+                &mut inner_first,
+            )?;
+            obj_numbers(&snap, &[(6, "step_index")], out, &mut inner_first)?;
+            if let Some(daemon) = snap.last(8).and_then(|f| f.u64()) {
+                obj_key("is_daemon", out, &mut inner_first)?;
+                write!(out, "{}", daemon != 0)?;
+            }
+            if let Some(ts) = snap.last(5) {
+                if let Some(ts) = super::timestamp(&ts.message(file)?) {
+                    obj_key("start_time", out, &mut inner_first)?;
+                    serde_json::to_writer(&mut *out, &ts.to_rfc3339())?;
+                }
+            }
+            out.write_all(b"}")?;
+        }
+        out.write_all(b"]")?;
+    }
+    if checkpoint.last(26).is_some() {
+        key("accumulated_sections", out)?;
+        out.write_all(b"[")?;
+        for (i, item) in checkpoint.repeated(26).enumerate() {
+            if i != 0 {
+                out.write_all(b",")?;
+            }
+            let sec = item.message(file)?;
+            out.write_all(b"{")?;
+            let mut inner_first = true;
+            obj_strings(
+                file,
+                &sec,
+                &[(1, "key"), (2, "title"), (3, "icon")],
+                out,
+                &mut inner_first,
+            )?;
+            if let Some(max_items) = sec.last(6).and_then(|f| f.u64()) {
+                obj_key("max_visible_items", out, &mut inner_first)?;
+                write!(out, "{}", max_items as i64)?;
+            }
+            if sec.last(4).is_some() {
+                obj_key("item_ids", out, &mut inner_first)?;
+                out.write_all(b"[")?;
+                let mut first_id = true;
+                for acc in sec.repeated(4) {
+                    if let Some(id) = acc.message(file)?.last(1) {
+                        if !std::mem::take(&mut first_id) {
+                            out.write_all(b",")?;
+                        }
+                        id.write_json_string(file, out)?;
+                    }
+                }
+                out.write_all(b"]")?;
+            }
+            out.write_all(b"}")?;
+        }
+        out.write_all(b"]")?;
+    }
+    out.write_all(b"}")?;
+    Ok(())
+}
+
+fn obj_key(name: &str, out: &mut impl Write, first: &mut bool) -> Result<()> {
+    if !std::mem::take(first) {
+        out.write_all(b",")?;
+    }
+    write!(out, "\"{name}\":")?;
+    Ok(())
+}
+
+fn obj_strings(
+    file: &File,
+    message: &Proto,
+    fields: &[(u32, &str)],
+    out: &mut impl Write,
+    first: &mut bool,
+) -> Result<()> {
+    for (number, name) in fields {
+        if let Some(field) = message.last(*number) {
+            obj_key(name, out, first)?;
+            field.write_json_string(file, out)?;
+        }
+    }
+    Ok(())
+}
+
+fn obj_numbers(message: &Proto, fields: &[(u32, &str)], out: &mut impl Write, first: &mut bool) -> Result<()> {
+    for (number, name) in fields {
+        if let Some(value) = message.last(*number).and_then(|f| f.u64()) {
+            obj_key(name, out, first)?;
+            write!(out, "{value}")?;
+        }
+    }
     Ok(())
 }
 
@@ -393,5 +604,61 @@ mod tests {
         assert_eq!(task["is_daemon"], true);
         assert_eq!(task["moved_to_background_at"], "1970-01-01T00:00:01+00:00");
         assert!(task.get("status").is_none());
+
+        // Overflowing nanos do not abort the session; only the bad timestamp is omitted.
+        let bad_nanos = [bytes(1, b"task-bad-ts"), bytes(8, &[8, 1, 16, 255, 255, 255, 255, 15])].concat();
+        let output = projection(&bad_nanos, true);
+        assert_eq!(output["native_task_details"]["id"], "task-bad-ts");
+        assert!(output["native_task_details"].get("moved_to_background_at").is_none());
+    }
+
+    #[test]
+    fn checkpoint_details_decode_bounds_requests_and_snapshots() {
+        let staged = ByteSource::arena().unwrap();
+        let data = [
+            vec![8, 2, 88, 0, 96, 6, 216, 1, 1],
+            bytes(14, &[bytes(1, b"plan.md"), bytes(3, b"file:///brain/plan.md")].concat()),
+            bytes(
+                20,
+                &[
+                    bytes(4, &[bytes(1, b"self"), bytes(2, b"helper")].concat()),
+                    bytes(5, &bytes(1, b"child-uuid")),
+                    vec![48, 1, 56, 3],
+                ]
+                .concat(),
+            ),
+            bytes(
+                21,
+                &[bytes(1, b"sess/task-1"), bytes(2, b"run_command"), vec![48, 2, 64, 1]].concat(),
+            ),
+            bytes(
+                26,
+                &[bytes(1, b"sec"), bytes(2, b"Section"), bytes(4, &bytes(1, b"item-1"))].concat(),
+            ),
+            bytes(30, &bytes(1, b"first prompt")),
+            bytes(30, &bytes(1, b"/compact")),
+            bytes(31, &bytes(1, b"parent msg")),
+        ]
+        .concat();
+        staged.append(|out| Ok(out.write_all(&data)?)).unwrap();
+        let file = staged.file().unwrap();
+        let msg = Proto::read(&file, 0, data.len() as u64).unwrap();
+        let mut out = b"{\"sentinel\":true".to_vec();
+        checkpoint(&file, &msg, &mut out).unwrap();
+        out.push(b'}');
+        let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let cp = &value["native_checkpoint_details"];
+        assert_eq!(cp["checkpoint_index"], 2);
+        assert_eq!(cp["included_step_index_start"], 0);
+        assert_eq!(cp["included_step_index_end"], 6);
+        assert_eq!(cp["total_subagent_count"], 1);
+        assert_eq!(cp["captured_requests"], serde_json::json!(["first prompt", "/compact"]));
+        assert_eq!(cp["captured_parent_messages"], serde_json::json!(["parent msg"]));
+        assert_eq!(cp["artifact_snapshots"][0]["name"], "plan.md");
+        assert_eq!(cp["subagent_snapshots"][0]["conversation_id"], "child-uuid");
+        assert_eq!(cp["subagent_snapshots"][0]["killed"], true);
+        assert_eq!(cp["running_task_snapshots"][0]["task_id"], "sess/task-1");
+        assert_eq!(cp["running_task_snapshots"][0]["is_daemon"], true);
+        assert_eq!(cp["accumulated_sections"][0]["item_ids"], serde_json::json!(["item-1"]));
     }
 }

@@ -1754,6 +1754,8 @@ const STEP_KEYS: &[&str] = &[
     "native_scope_items",
     "native_task_details",
     "native_planner_details",
+    "native_checkpoint_details",
+    "native_structured_result",
     "native_tool_id",
     "native_tool_name",
     "native_interaction",
@@ -2177,12 +2179,23 @@ impl StepCodec {
                 if let Some(payload) = payload {
                     details.get_or_insert_with(|| json!({}))["payload"] = payload;
                 }
+                let structured_result = fields.value("native_structured_result")?;
+                #[cfg(feature = "sqlite")]
+                let structured_result = structured_result.or_else(|| {
+                    self.enrich
+                        .verified
+                        .get(&step_index)
+                        .and_then(|m| m.structured_result.clone())
+                });
+                if let Some(structured) = structured_result {
+                    details.get_or_insert_with(|| json!({}))["result"] = structured;
+                }
 
                 let error_text = fields.string("error")?.filter(|e| !e.is_empty());
                 let content = match error_text {
                     Some(err) => {
                         let body = fields.string("content")?.unwrap_or_default();
-                        if body.is_empty() {
+                        if body.is_empty() || err.contains(&body) {
                             Text::Inline(err)
                         } else if body.contains(&err) {
                             fields
@@ -2214,7 +2227,7 @@ impl StepCodec {
                 push_media_blocks(&mut m.content, fields.get("media"), media_marker)?;
                 attach_step_extras(&mut m, &fields, step_index, &source, status.as_deref(), want_extra)?;
                 // Job identity and a permission answer drive lifecycle and affordance
-                // decoding at every tier.
+                // decoding at every tier; non-permission interactions attach on Rich+.
                 let interaction = fields.value("native_interaction")?;
                 #[cfg(feature = "sqlite")]
                 let interaction = interaction.or_else(|| {
@@ -2224,13 +2237,24 @@ impl StepCodec {
                         .and_then(|m| m.interaction.clone())
                 });
                 if let Some(interaction) = interaction {
-                    m.harness_extra_mut(Harness::Antigravity)
-                        .insert("interaction".into(), interaction);
+                    if want_extra || interaction.get("kind").and_then(Value::as_str) == Some("permission") {
+                        m.harness_extra_mut(Harness::Antigravity)
+                            .insert("interaction".into(), interaction);
+                    }
                 }
+                let task = fields.value("native_task_details")?;
                 #[cfg(feature = "sqlite")]
-                if let Some(task) = revised.and_then(|native| native.task_details.as_ref()) {
+                let task = task
+                    .or_else(|| revised.and_then(|native| native.task_details.clone()))
+                    .or_else(|| {
+                        self.enrich
+                            .verified
+                            .get(&step_index)
+                            .and_then(|m| m.task_details.clone())
+                    });
+                if let Some(task) = task {
                     m.harness_extra_mut(Harness::Antigravity)
-                        .insert("task_details".into(), task.clone());
+                        .insert("task_details".into(), task);
                 }
                 Ok(sink.message(m))
             }
@@ -2318,14 +2342,15 @@ impl StepCodec {
                 push_nonempty_text(&mut m.content, fields.get("content"), self.spans)?;
                 #[cfg(feature = "sqlite")]
                 if want_extra {
-                    if let Some(details) = self
-                        .enrich
-                        .verified
-                        .get(&step_index)
-                        .and_then(|m| m.planner_details.as_ref())
-                    {
-                        m.harness_extra_mut(Harness::Antigravity)
-                            .insert("planner_details".into(), details.clone());
+                    if let Some(matched) = self.enrich.verified.get(&step_index) {
+                        if let Some(details) = matched.planner_details.as_ref() {
+                            m.harness_extra_mut(Harness::Antigravity)
+                                .insert("planner_details".into(), details.clone());
+                        }
+                        if let Some(details) = matched.checkpoint_details.as_ref() {
+                            m.harness_extra_mut(Harness::Antigravity)
+                                .insert("checkpoint_details".into(), details.clone());
+                        }
                     }
                 }
                 m.usage = parse_step_usage(&fields)?;
@@ -2345,8 +2370,10 @@ impl StepCodec {
                 let err = fields.string("error")?.unwrap_or_default();
                 let body = fields.string("content")?.unwrap_or_default();
                 let combined = match (err.is_empty(), body.is_empty()) {
-                    (false, false) if body != err && !body.contains(&err) => Some(format!("{err}\n{body}")),
-                    (false, _) => Some(err),
+                    (false, false) if err.contains(&body) => Some(err),
+                    (false, false) if body.contains(&err) => Some(body),
+                    (false, false) => Some(format!("{err}\n{body}")),
+                    (false, true) => Some(err),
                     (true, false) => Some(body),
                     (true, true) => None,
                 };
@@ -2558,6 +2585,7 @@ fn attach_step_extras(
     }
     for (field, key) in [
         ("native_planner_details", "planner_details"),
+        ("native_checkpoint_details", "checkpoint_details"),
         ("native_scope_items", "scope_items"),
         ("native_task_details", "task_details"),
     ] {
@@ -2863,9 +2891,21 @@ fn hex_val(b: u8) -> Option<u8> {
     }
 }
 
-/// Parse `annotations/<uuid>.pbtxt` (`title: "..."` with C/textproto escapes).
+const MAX_PBTXT_BYTES: usize = 256 * 1024;
+
+/// Parse `annotations/<uuid>.pbtxt` (`title: "..."` with C/textproto escapes), bounded to 256 KiB.
 fn read_pbtxt_title(path: &Path) -> Option<String> {
-    let text = fs::read_to_string(path).ok()?;
+    use std::io::Read as _;
+    let file = fs::File::open(path).ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() || meta.len() > MAX_PBTXT_BYTES as u64 {
+        return None;
+    }
+    let mut text = String::new();
+    file.take(MAX_PBTXT_BYTES as u64 + 1).read_to_string(&mut text).ok()?;
+    if text.len() > MAX_PBTXT_BYTES {
+        return None;
+    }
     parse_pbtxt_title(&text)
 }
 

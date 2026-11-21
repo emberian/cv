@@ -37,19 +37,14 @@ pub(in super::super) fn read(db_path: &Path, models: bool) -> Result<Meta> {
             if stage.used.get() >= Stage::RENEW {
                 stage = Stage::new()?;
             }
-            let (at, len) = stage.append(|out| {
-                sqlite::with_cell_reader(conn, table, "data", rowid, |reader, _| {
-                    std::io::copy(reader, out)?;
-                    Ok(())
-                })
-            })?;
+            let (at, len) = stage.cell(conn, table, "data", rowid)?;
             let file = stage.file.try_clone()?;
             Ok(Proto::read(&file, at, len).ok().map(|message| (file, message)))
         };
         if models && sqlite::table_exists(conn, "gen_metadata") {
             let mut counts: BTreeMap<String, usize> = BTreeMap::new();
             let mut first_model = None;
-            let mut query = conn.prepare("SELECT idx FROM gen_metadata WHERE data IS NOT NULL ORDER BY idx")?;
+            let mut query = conn.prepare("SELECT rowid FROM gen_metadata WHERE data IS NOT NULL ORDER BY idx")?;
             let mut rows = query.query([])?;
             while let Some(row) = rows.next()? {
                 let Some((file, message)) = cell("gen_metadata", row.get(0)?)? else {
