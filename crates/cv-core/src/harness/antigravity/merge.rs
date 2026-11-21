@@ -271,6 +271,9 @@ fn compare(exported: JsonView<'_>, kind: Option<&str>, native: &NativeStep, prin
             }
         }
     }
+    if print.content.is_none() && print.error.is_none() {
+        return Ok(None);
+    }
     // A step exported while it ran is an earlier revision of the finished native row,
     // and a request the export decorated (expanded mentions, several items) cannot be
     // compared: neither is evidence of a divergent history, nor an identity.
@@ -330,7 +333,7 @@ pub(super) fn verified(
         };
         let verdict = records.read(*at, end - at, |view| {
             let kind = string(view, "type")?;
-            if kind.as_deref() == Some("GENERIC") && step.kind == kind && second(view)? == step.second {
+            if kind.as_deref().is_some_and(is_tool_step_type) && step.kind == kind && second(view)? == step.second {
                 results.insert(*index);
             }
             match &step.print {

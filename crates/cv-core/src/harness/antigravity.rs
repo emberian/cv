@@ -293,14 +293,17 @@ impl Adapter for Antigravity {
                 .push(loc.brain_dir.join(".system_generated").join("subagents"));
             deps.files
                 .push(loc.brain_dir.join(".system_generated/swarm/members.json"));
+            deps.files
+                .push(loc.brain_dir.join(".system_generated/swarm/board.jsonl"));
             if let Some(reg) = find_swarm_registry(&loc.app_data_dir, &loc.id, None) {
                 if reg.coordinator_id != loc.id {
-                    deps.files.push(
-                        loc.app_data_dir
-                            .join("brain")
-                            .join(&reg.coordinator_id)
-                            .join(".system_generated/swarm/members.json"),
-                    );
+                    let coord_swarm = loc
+                        .app_data_dir
+                        .join("brain")
+                        .join(&reg.coordinator_id)
+                        .join(".system_generated/swarm");
+                    deps.files.push(coord_swarm.join("members.json"));
+                    deps.files.push(coord_swarm.join("board.jsonl"));
                 }
             }
             #[cfg(feature = "sqlite")]
@@ -454,8 +457,10 @@ impl Adapter for Antigravity {
             let children: Vec<&str> = descriptors.iter().map(|desc| desc.conversation_id.as_str()).collect();
             spawn_calls_in_session(&loc.app_data_dir, &loc.id, Some(&r.path), &children)
         };
+        let mut board: Option<SwarmBoard> = None;
         let mut out = Vec::new();
-        for desc in descriptors {
+        #[cfg_attr(not(feature = "sqlite"), allow(unused_mut))]
+        for mut desc in descriptors {
             if crate::publish::validate_output_id(&desc.conversation_id).is_err() {
                 continue;
             }
@@ -493,6 +498,8 @@ impl Adapter for Antigravity {
                 child_ref.cwd = desc.workspace_uris.iter().find_map(|u| file_uri_to_path(u));
             }
             #[cfg(feature = "sqlite")]
+            let mut sum_killed = false;
+            #[cfg(feature = "sqlite")]
             if let Some(sum) = summaries.get(&desc.conversation_id) {
                 let has_pbtxt = read_pbtxt_title(
                     &loc.app_data_dir
@@ -501,6 +508,25 @@ impl Adapter for Antigravity {
                 )
                 .is_some_and(|t| !t.trim().is_empty());
                 apply_summary_fallback(&mut child_ref, sum, has_pbtxt);
+                sum_killed = sum.killed;
+                if desc.type_name.is_none() {
+                    desc.type_name = sum.agent_type.clone().or_else(|| sum.agent_name.clone());
+                }
+                if desc.role.is_none() {
+                    desc.role.clone_from(&sum.agent_role);
+                }
+            }
+            #[cfg(not(feature = "sqlite"))]
+            let sum_killed = false;
+            let mut result_summary = None;
+            if !available {
+                if let Some(member_name) = desc.member.get("member").and_then(Value::as_str) {
+                    let swarm_board = board.get_or_insert_with(|| read_swarm_board(&loc.brain_dir));
+                    result_summary = swarm_board.last_summaries.get(member_name).cloned();
+                    if child_ref.title.is_none() {
+                        child_ref.title = swarm_board.brief_titles.get(member_name).cloned();
+                    }
+                }
             }
             // Only the parent's own store/transcript names the spawning call; `spawnStepIndex` does not identify it.
             let tool_use_id = spawn_calls.get(&desc.conversation_id).cloned();
@@ -512,10 +538,11 @@ impl Adapter for Antigravity {
                 workflow: None,
                 result_status: match desc.state.as_deref() {
                     Some("SUBAGENT_STATE_KILLED") => Some("killed".into()),
+                    _ if sum_killed => Some("killed".into()),
                     _ if !available => Some("unavailable".into()),
                     _ => None,
                 },
-                result_summary: None,
+                result_summary,
             });
         }
         out.sort_by_key(|a| std::cmp::Reverse(a.session.created_at));
@@ -1160,6 +1187,8 @@ impl Adapter for Antigravity {
             if let Some(loc) = BrainLoc::from_transcript(&r.path) {
                 let pbtxt = loc.app_data_dir.join("annotations").join(format!("{}.pbtxt", loc.id));
                 sink.dependency(&pbtxt);
+                sink.dependency(&loc.brain_dir.join(".system_generated/swarm/members.json"));
+                sink.dependency(&loc.brain_dir.join(".system_generated/swarm/board.jsonl"));
                 #[cfg(feature = "sqlite")]
                 {
                     let conv_db = loc.app_data_dir.join("conversations").join(format!("{}.db", loc.id));
@@ -1422,6 +1451,30 @@ impl Adapter for Antigravity {
 // Pure in-memory JSONL entrypoints (`ingest`, tests, wasm32)
 // ---------------------------------------------------------------------------
 
+pub(super) fn is_tool_step_type(ty: &str) -> bool {
+    matches!(
+        ty,
+        "GENERIC"
+            | "RUN_COMMAND"
+            | "VIEW_FILE"
+            | "LIST_DIRECTORY"
+            | "CODE_ACTION"
+            | "WRITE_TO_FILE"
+            | "FILE_CHANGE"
+            | "GREP_SEARCH"
+            | "FIND"
+            | "COMMAND_STATUS"
+            | "READ_URL_CONTENT"
+            | "SEARCH_WEB"
+            | "MCP_TOOL"
+            | "LIST_RESOURCES"
+            | "READ_RESOURCE"
+            | "FINISH"
+            | "INVOKE_SUBAGENT"
+            | "ASK_QUESTION"
+    )
+}
+
 /// Sniff whether a single JSONL line is an Antigravity Cortex step record.
 pub(crate) fn is_step_record_view(view: JsonView<'_>) -> bool {
     let Ok(Some(fields)) = Fields::parse(view, &["step_index", "source", "type"]) else {
@@ -1442,10 +1495,17 @@ pub(crate) fn is_step_record_view(view: JsonView<'_>) -> bool {
         return false;
     };
     is_known_source(&source)
-        && matches!(
-            ty.as_str(),
-            "USER_INPUT" | "PLANNER_RESPONSE" | "GENERIC" | "SYSTEM_MESSAGE" | "CHECKPOINT" | "ERROR_MESSAGE"
-        )
+        && (is_tool_step_type(&ty)
+            || matches!(
+                ty.as_str(),
+                "USER_INPUT"
+                    | "PLANNER_RESPONSE"
+                    | "SYSTEM_MESSAGE"
+                    | "CHECKPOINT"
+                    | "ERROR_MESSAGE"
+                    | "EPHEMERAL_MESSAGE"
+                    | "CONVERSATION_HISTORY"
+            ))
 }
 
 fn is_known_source(source: &str) -> bool {
@@ -1849,6 +1909,7 @@ fn looks_like_antigravity_file(path: &Path) -> bool {
 struct SidecarEnrich {
     #[cfg(feature = "sqlite")]
     verified: BTreeMap<u64, merge::Match>,
+    has_native_db: bool,
     step_models: BTreeMap<u64, String>,
     known_children: BTreeSet<String>,
     subagent_descriptors: BTreeMap<String, Value>,
@@ -2008,6 +2069,7 @@ pub(crate) fn forest_dependencies(r: &SessionRef, guard: &mut ReadSet) {
         }
         guard.record(&brain.join(".system_generated/subagents"));
         guard.record(&brain.join(".system_generated/swarm/members.json"));
+        guard.record(&brain.join(".system_generated/swarm/board.jsonl"));
         let Ok(descriptors) = read_subagent_descriptors(&brain) else {
             continue;
         };
@@ -2217,13 +2279,20 @@ fn build_session_header(r: &SessionRef, opts: &Demand) -> (Session, SidecarEnric
         ..Session::new(r.id.clone(), Harness::Antigravity)
     };
     let mut enrich = SidecarEnrich::default();
+    #[cfg(feature = "sqlite")]
+    if is_native_store(&r.path) {
+        enrich.has_native_db = true;
+    }
 
     let Some(loc) = BrainLoc::from_transcript(&r.path) else {
         return (s, enrich);
     };
 
-    let pbtxt_title = read_pbtxt_title(&loc.app_data_dir.join("annotations").join(format!("{}.pbtxt", loc.id)))
-        .filter(|t| !t.trim().is_empty());
+    #[cfg_attr(not(feature = "sqlite"), allow(unused_mut))]
+    let mut annotations =
+        read_pbtxt_annotations(&loc.app_data_dir.join("annotations").join(format!("{}.pbtxt", loc.id)))
+            .unwrap_or_default();
+    let pbtxt_title = annotations.title.clone().filter(|t| !t.trim().is_empty());
     #[cfg(feature = "sqlite")]
     let has_pbtxt = pbtxt_title.is_some();
     if let Some(pbtxt_title) = pbtxt_title {
@@ -2270,43 +2339,16 @@ fn build_session_header(r: &SessionRef, opts: &Demand) -> (Session, SidecarEnric
         let sum_db = loc.app_data_dir.join("conversation_summaries.db");
         if sum_db.is_file() {
             if let Ok(Some(sum)) = read_summary_one(&sum_db, &loc.id) {
-                if !has_pbtxt {
-                    if let Some(sum_title) = sum.title {
-                        s.title = Some(sum_title);
-                    } else if s.title.is_none() {
-                        s.title = sum.preview;
-                    }
-                } else if s.title.is_none() {
-                    s.title = sum.title.or(sum.preview);
-                }
-                if s.cwd.is_none() {
-                    s.cwd = sum.cwd;
-                }
-                if s.updated_at.is_none() {
-                    s.updated_at = sum.updated_at;
-                }
-                if let Some(parent) = sum.parent_id.filter(|p| !p.is_empty()) {
-                    s.lineage.parent = Some(parent);
-                }
-                if let Some(agent_name) = sum.agent_name.filter(|a| !a.is_empty()) {
-                    if s.lineage.parent.is_some() && s.lineage.agent_path.is_none() {
-                        s.lineage.agent_path = Some(agent_name.clone());
-                    }
-                    if want_extra {
-                        s.harness_extra_mut(Harness::Antigravity)
-                            .insert("agent_name".into(), Value::String(agent_name));
-                    }
-                }
-                if want_extra {
-                    let bag = s.harness_extra_mut(Harness::Antigravity);
-                    if let Some(source) = sum.source.filter(|x| !x.is_empty()) {
-                        bag.insert("source".into(), Value::String(source));
-                    }
-                    if let Some(project_id) = sum.project_id.filter(|x| !x.is_empty()) {
-                        bag.insert("project_id".into(), Value::String(project_id));
-                    }
-                }
+                apply_summary_to_session(&mut s, &sum, has_pbtxt, want_extra);
+                annotations.merge_fallback(&sum.annotations);
             }
+        }
+    }
+
+    if want_extra {
+        if let Some(ann_val) = annotations.to_extra_value() {
+            s.harness_extra_mut(Harness::Antigravity)
+                .insert("annotations".into(), ann_val);
         }
     }
 
@@ -2383,6 +2425,8 @@ struct StepState {
     first_ts: Option<DateTime<Utc>>,
     last_ts: Option<DateTime<Utc>>,
     inferred_parent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    settings_model: Option<String>,
     /// A prompt or a model turn has been read: later deliveries are not the opening brief.
     #[serde(default)]
     opened: bool,
@@ -2476,7 +2520,7 @@ impl StepCodec {
             .transpose()?
             .flatten()
             .as_deref()
-            == Some("GENERIC")
+            .is_some_and(is_tool_step_type)
         {
             let explicit = view
                 .get("native_tool_id")?
@@ -2552,6 +2596,11 @@ impl StepCodec {
             && (matches!(self.opts.tier, Tier::Discovery | Tier::Usage | Tier::Facts) || sink.tier() <= Tier::Facts);
         match ty.as_str() {
             "USER_INPUT" => {
+                if let Some(content_view) = fields.get("content") {
+                    if let Some(model) = extract_view_settings_model(content_view)? {
+                        self.state.settings_model = Some(model);
+                    }
+                }
                 let origin = if self.s.lineage.parent.is_some() || self.state.inferred_parent.is_some() {
                     Origin::Subagent
                 } else {
@@ -2582,6 +2631,9 @@ impl StepCodec {
                 } else {
                     None
                 };
+                if m.model.is_none() && !self.enrich.has_native_db {
+                    m.model = self.state.settings_model.clone();
+                }
 
                 if let Some(thinking_view) = fields.get("thinking") {
                     if let Some(text) = nonempty_view_text(thinking_view, self.spans)? {
@@ -2691,7 +2743,7 @@ impl StepCodec {
                 }
                 Ok(sink.message(m))
             }
-            "GENERIC" => {
+            t if is_tool_step_type(t) => {
                 let mut m = Message::of_kind(Role::Tool, MessageKind::ToolResult, Origin::Harness);
                 m.id = Some(step_index.to_string());
                 m.timestamp = ts;
@@ -2773,17 +2825,20 @@ impl StepCodec {
                 let payload = payload.or_else(|| self.enrich.verified.get(&step_index).and_then(|m| m.payload.clone()));
 
                 // The typed result names every child; the text names at most the first.
+                let is_invoke_subagent = tool_name.as_deref() == Some("invoke_subagent") || ty == "INVOKE_SUBAGENT";
                 let typed = payload
                     .as_ref()
-                    .filter(|_| tool_name.as_deref() == Some("invoke_subagent"))
+                    .filter(|_| is_invoke_subagent)
                     .and_then(|payload| payload.get("conversation_ids")?.as_array())
                     .into_iter()
                     .flatten()
                     .filter_map(|id| id.as_str().map(str::to_owned));
-                let named: Vec<String> = match tool_name.as_deref() {
-                    Some("invoke_subagent") => extract_spawned_conversation_id(&head).into_iter().collect(),
-                    Some("swarm") => extract_swarm_added_ids(&head),
-                    _ => Vec::new(),
+                let named: Vec<String> = if is_invoke_subagent {
+                    extract_spawned_conversation_id(&head).into_iter().collect()
+                } else if tool_name.as_deref() == Some("swarm") {
+                    extract_swarm_added_ids(&head)
+                } else {
+                    Vec::new()
                 };
                 for child_id in typed.chain(named) {
                     self.state.child_ids.insert(child_id.clone());
@@ -2869,6 +2924,10 @@ impl StepCodec {
                 });
                 push_media_blocks(&mut m.content, fields.get("media"), media_marker)?;
                 attach_step_extras(&mut m, &fields, step_index, &source, status.as_deref(), want_extra)?;
+                if want_extra && ty != "GENERIC" {
+                    m.harness_extra_mut(Harness::Antigravity)
+                        .insert("step_type".into(), Value::String(ty));
+                }
                 // Job identity and a permission answer drive lifecycle and affordance
                 // decoding at every tier; non-permission interactions attach on Rich+.
                 let interaction = fields.value("native_interaction")?;
@@ -2900,6 +2959,37 @@ impl StepCodec {
                         .insert("task_details".into(), task);
                 }
                 Ok(sink.message(m))
+            }
+            "EPHEMERAL_MESSAGE" => {
+                let mut m = Message::of_kind(Role::System, MessageKind::InjectedContext, Origin::Harness);
+                m.id = Some(step_index.to_string());
+                m.timestamp = ts;
+                push_nonempty_text(&mut m.content, fields.get("content"), self.spans)?;
+                push_media_blocks(&mut m.content, fields.get("media"), media_marker)?;
+                attach_step_extras(&mut m, &fields, step_index, &source, status.as_deref(), want_extra)?;
+                Ok(sink.message(m))
+            }
+            "CONVERSATION_HISTORY" => {
+                let mut content = Vec::new();
+                push_nonempty_text(&mut content, fields.get("content"), self.spans)?;
+                push_media_blocks(&mut content, fields.get("media"), media_marker)?;
+                if !content.is_empty() {
+                    let mut m = Message::of_kind(Role::System, MessageKind::InjectedContext, Origin::Harness);
+                    m.id = Some(step_index.to_string());
+                    m.timestamp = ts;
+                    m.content = content;
+                    attach_step_extras(&mut m, &fields, step_index, &source, status.as_deref(), want_extra)?;
+                    return Ok(sink.message(m));
+                }
+                if self.opts.tier == Tier::Complete {
+                    let mut m = Message::of_kind(Role::System, MessageKind::Carrier, Origin::Harness);
+                    m.id = Some(step_index.to_string());
+                    m.timestamp = ts;
+                    m.harness_extra_mut(Harness::Antigravity)
+                        .insert("record_type".into(), Value::String(ty));
+                    return Ok(sink.message(m));
+                }
+                Ok(Flow::Continue)
             }
             "SYSTEM_MESSAGE" => {
                 const SYS_PEEK_BYTES: usize = 64 * 1024;
@@ -3068,6 +3158,9 @@ impl StepCodec {
             if self.s.updated_at.is_none_or(|prev| last > prev) {
                 self.s.updated_at = Some(last);
             }
+        }
+        if self.s.model.is_none() && !self.enrich.has_native_db {
+            self.s.model = self.state.settings_model;
         }
         let sender_parent = self.state.inferred_parent.clone();
         if self.s.lineage.parent.is_none() {
@@ -3557,8 +3650,94 @@ struct SwarmMember {
 #[derive(Debug, Clone)]
 struct SwarmRegistry {
     coordinator_id: String,
+    title: Option<String>,
     by_name: BTreeMap<String, SwarmMember>,
     name_by_id: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Default)]
+struct SwarmBoard {
+    brief_titles: BTreeMap<String, String>,
+    last_summaries: BTreeMap<String, String>,
+}
+
+const MAX_BOARD_BYTES: u64 = 4 * 1024 * 1024;
+
+fn read_swarm_board(brain_dir: &Path) -> SwarmBoard {
+    use std::io::Read as _;
+    let mut out = SwarmBoard::default();
+    let board_path = brain_dir.join(".system_generated/swarm/board.jsonl");
+    let Ok(file) = fs::File::open(&board_path) else {
+        return out;
+    };
+    let Ok(meta) = file.metadata() else {
+        return out;
+    };
+    if !meta.is_file() || meta.len() > MAX_BOARD_BYTES {
+        return out;
+    }
+    let mut text = String::new();
+    if file.take(MAX_BOARD_BYTES + 1).read_to_string(&mut text).is_err() || text.len() as u64 > MAX_BOARD_BYTES {
+        return out;
+    }
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(val) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
+        let kind = val.get("kind").and_then(Value::as_str);
+        let Some(msg_text) = val.get("text").and_then(Value::as_str) else {
+            continue;
+        };
+        if kind == Some("brief") {
+            let trimmed_text = msg_text.trim_start();
+            if let Some(after_at) = trimmed_text.strip_prefix('@') {
+                let end = after_at.find(char::is_whitespace).unwrap_or(after_at.len());
+                let member = &after_at[..end];
+                let body = after_at[end..].trim();
+                if !member.is_empty() && !body.is_empty() {
+                    let mut head = crate::projection::Head::bounded(crate::projection::Head::TITLE);
+                    head.push(body);
+                    out.brief_titles
+                        .entry(member.to_owned())
+                        .or_insert_with(|| head.finish());
+                }
+            }
+        } else if let Some(agent) = val.get("agent").and_then(Value::as_str) {
+            let body = msg_text.trim();
+            if !agent.is_empty() && !body.is_empty() {
+                out.last_summaries.insert(agent.to_owned(), body.to_owned());
+            }
+        }
+    }
+    out
+}
+
+fn read_swarm_title(brain_dir: &Path) -> Option<String> {
+    let members_path = brain_dir.join(".system_generated/swarm/members.json");
+    let source = crate::json::JsonSource::capture(&members_path).ok()?;
+    if source.len() > 1024 * 1024 {
+        return None;
+    }
+    source
+        .read(
+            crate::json::ReadInput::Document,
+            crate::json::Validation::Value,
+            |view| {
+                Ok(view
+                    .get("title")?
+                    .map(JsonView::string)
+                    .transpose()?
+                    .flatten()
+                    .map(|t| t.trim().to_owned())
+                    .filter(|t| !t.is_empty()))
+            },
+        )
+        .ok()
+        .flatten()
 }
 
 fn read_swarm_registry(brain_dir: &Path) -> Option<SwarmRegistry> {
@@ -3575,6 +3754,12 @@ fn read_swarm_registry(brain_dir: &Path) -> Option<SwarmRegistry> {
             |view| Ok(view.resolve()?.into_owned()),
         )
         .ok()?;
+    let title = value
+        .get("title")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
     let members = value.get("members")?.as_object()?;
     let mut by_name = BTreeMap::new();
     let mut name_by_id = BTreeMap::new();
@@ -3611,6 +3796,7 @@ fn read_swarm_registry(brain_dir: &Path) -> Option<SwarmRegistry> {
     }
     (!by_name.is_empty()).then_some(SwarmRegistry {
         coordinator_id,
+        title,
         by_name,
         name_by_id,
     })
@@ -3742,7 +3928,20 @@ fn find_sidecar_parent(app_data_dir: &Path, child_id: &str) -> Option<String> {
 }
 
 fn enrich_child_lineage(s: &mut Session, app_data_dir: &Path, sender_parent: Option<&str>, want_extra: bool) {
+    if want_extra {
+        if let Some(title) = read_swarm_title(&app_data_dir.join("brain").join(&s.id)) {
+            s.harness_extra_mut(Harness::Antigravity)
+                .insert("swarm_title".into(), Value::String(title));
+        }
+    }
     if let Some(reg) = find_swarm_registry(app_data_dir, &s.id, s.lineage.parent.as_deref().or(sender_parent)) {
+        if want_extra {
+            if let Some(title) = &reg.title {
+                s.harness_extra_mut(Harness::Antigravity)
+                    .entry("swarm_title")
+                    .or_insert_with(|| Value::String(title.clone()));
+            }
+        }
         if s.id != reg.coordinator_id {
             s.lineage.parent = Some(reg.coordinator_id.clone());
             if let Some(member_name) = reg.name_by_id.get(&s.id) {
@@ -3805,7 +4004,7 @@ fn unwrap_user_request(text: &str) -> &str {
     exported_user_request(text).unwrap_or_else(|| text.trim())
 }
 
-fn looks_like_uuid(s: &str) -> bool {
+pub(crate) fn looks_like_uuid(s: &str) -> bool {
     let bytes = s.as_bytes();
     bytes.len() == 36
         && bytes[8] == b'-'
@@ -3816,6 +4015,153 @@ fn looks_like_uuid(s: &str) -> bool {
             .iter()
             .enumerate()
             .all(|(i, b)| matches!(i, 8 | 13 | 18 | 23) || b.is_ascii_hexdigit())
+}
+
+const MAX_SETTINGS_TAG_BYTES: usize = 16 * 1024;
+
+/// Stream-scan a `USER_INPUT` `content` string for `<USER_SETTINGS_CHANGE>...</USER_SETTINGS_CHANGE>`
+/// blocks without allocating the surrounding prompt/metadata when no tag is present.
+fn extract_view_settings_model(view: JsonView<'_>) -> Result<Option<String>> {
+    const OPEN: &str = "<USER_SETTINGS_CHANGE>";
+    const CLOSE: &str = "</USER_SETTINGS_CHANGE>";
+
+    let mut carry = String::new();
+    let mut inside: Option<String> = None;
+    let mut found: Option<String> = None;
+
+    let res = view.for_each_str_chunk(|chunk| {
+        carry.push_str(chunk);
+        loop {
+            if let Some(buf) = &mut inside {
+                if let Some(end) = carry.find(CLOSE) {
+                    let take = MAX_SETTINGS_TAG_BYTES.saturating_sub(buf.len()).min(end);
+                    buf.push_str(&carry[..carry.floor_char_boundary(take)]);
+                    if let Some(model) = parse_user_settings_model(buf) {
+                        found = Some(model);
+                    }
+                    inside = None;
+                    carry.drain(..end + CLOSE.len());
+                } else {
+                    let safe = carry.len().saturating_sub(CLOSE.len() - 1);
+                    let safe = carry.floor_char_boundary(safe);
+                    if safe > 0 {
+                        let take = MAX_SETTINGS_TAG_BYTES.saturating_sub(buf.len()).min(safe);
+                        buf.push_str(&carry[..carry.floor_char_boundary(take)]);
+                        carry.drain(..safe);
+                    }
+                    break;
+                }
+            } else if let Some(start) = carry.find(OPEN) {
+                inside = Some(String::new());
+                carry.drain(..start + OPEN.len());
+            } else {
+                let safe = carry.len().saturating_sub(OPEN.len() - 1);
+                let safe = carry.floor_char_boundary(safe);
+                if safe > 0 {
+                    carry.drain(..safe);
+                }
+                break;
+            }
+        }
+        Ok(())
+    });
+    res?;
+    Ok(found)
+}
+
+fn clean_settings_model_token(raw: &str) -> Option<String> {
+    let token = raw
+        .trim()
+        .trim_end_matches(',')
+        .trim()
+        .trim_matches(|c| matches!(c, '"' | '\'' | '`'))
+        .trim();
+    if token.is_empty() || token.len() > 128 || token.contains('\n') {
+        return None;
+    }
+    if matches!(
+        token.to_ascii_lowercase().as_str(),
+        "none" | "null" | "unspecified" | "default" | "auto"
+    ) {
+        return None;
+    }
+    Some(token.to_owned())
+}
+
+fn parse_user_settings_model(block: &str) -> Option<String> {
+    let trimmed = block.trim();
+    if trimmed.starts_with('{') {
+        if let Ok(val) = serde_json::from_str::<Value>(trimmed) {
+            for key in ["model", "Model", "model_name", "modelSelection", "Model Selection"] {
+                if let Some(m) = val
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .and_then(clean_settings_model_token)
+                {
+                    return Some(m);
+                }
+            }
+        }
+    }
+    let mut result = None;
+    for line in trimmed.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // Key-value forms: `Model: ...`, `"model": "..."`, `model = ...`, `Model Selection: ...`
+        if let Some((k, v)) = line.split_once(':').or_else(|| line.split_once('=')) {
+            let key_norm = k
+                .trim()
+                .trim_start_matches(['-', '*'])
+                .trim()
+                .trim_matches(|c| matches!(c, '"' | '\'' | '`'))
+                .trim()
+                .to_ascii_lowercase();
+            if matches!(
+                key_norm.as_str(),
+                "model" | "model selection" | "model_selection" | "model_name" | "model_id"
+            ) {
+                let mut rhs = v.trim();
+                if let Some((before_sentence, _)) = rhs.split_once(". ") {
+                    rhs = before_sentence;
+                }
+                rhs = rhs.strip_suffix('.').unwrap_or(rhs).trim();
+                if let Some((_, after_arrow)) = rhs.rsplit_once("->") {
+                    rhs = after_arrow;
+                } else if rhs.to_ascii_lowercase().starts_with("from ") {
+                    if let Some((_, after_to)) = rhs.rsplit_once(" to ") {
+                        rhs = after_to;
+                    }
+                }
+                if let Some(m) = clean_settings_model_token(rhs) {
+                    result = Some(m);
+                    continue;
+                }
+            }
+        }
+        // Prose form (`The user changed setting `Model Selection` from None to Gemini 3.1 Pro. No need...`):
+        // Split at `. ` (never inside `3.1` since version dots are followed by digits, not spaces).
+        let first = line.split_once(". ").map_or(line, |(first, _)| first);
+        let sentence = first.strip_suffix('.').unwrap_or(first).trim();
+        let lower = sentence.to_ascii_lowercase();
+        if let Some(model_pos) = lower.find("model") {
+            let tail = &sentence[model_pos..];
+            let tail_lower = &lower[model_pos..];
+            let candidate = if let Some((_, after_arrow)) = tail.rsplit_once("->") {
+                Some(after_arrow)
+            } else if let Some(from_pos) = tail_lower.find(" from ") {
+                let after_from = &tail[from_pos + " from ".len()..];
+                after_from.split_once(" to ").map(|(_, after_to)| after_to)
+            } else {
+                tail.split_once(" to ").map(|(_, after_to)| after_to)
+            };
+            if let Some(m) = candidate.and_then(clean_settings_model_token) {
+                result = Some(m);
+            }
+        }
+    }
+    result
 }
 
 pub(crate) fn file_uri_to_path(uri: &str) -> Option<PathBuf> {
@@ -3877,8 +4223,72 @@ fn hex_val(b: u8) -> Option<u8> {
 
 pub(crate) const MAX_PBTXT_BYTES: usize = 256 * 1024;
 
-/// Parse `annotations/<uuid>.pbtxt` (`title: "..."` with C/textproto escapes), bounded to 256 KiB.
-fn read_pbtxt_title(path: &Path) -> Option<String> {
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct Annotations {
+    pub title: Option<String>,
+    pub archived: Option<bool>,
+    pub starred: Option<bool>,
+    pub pinned: Option<bool>,
+    pub tags: Vec<String>,
+    pub group_id: Option<String>,
+    pub active_profile: Option<String>,
+}
+
+impl Annotations {
+    #[cfg(feature = "sqlite")]
+    fn merge_fallback(&mut self, fallback: &Annotations) {
+        if self.title.is_none() {
+            self.title.clone_from(&fallback.title);
+        }
+        if self.archived.is_none() {
+            self.archived = fallback.archived;
+        }
+        if self.starred.is_none() {
+            self.starred = fallback.starred;
+        }
+        if self.pinned.is_none() {
+            self.pinned = fallback.pinned;
+        }
+        if self.tags.is_empty() && !fallback.tags.is_empty() {
+            self.tags.clone_from(&fallback.tags);
+        }
+        if self.group_id.is_none() {
+            self.group_id.clone_from(&fallback.group_id);
+        }
+        if self.active_profile.is_none() {
+            self.active_profile.clone_from(&fallback.active_profile);
+        }
+    }
+
+    fn to_extra_value(&self) -> Option<Value> {
+        let mut map = Map::new();
+        if let Some(archived) = self.archived {
+            map.insert("archived".into(), Value::Bool(archived));
+        }
+        if let Some(starred) = self.starred {
+            map.insert("starred".into(), Value::Bool(starred));
+        }
+        if let Some(pinned) = self.pinned {
+            map.insert("pinned".into(), Value::Bool(pinned));
+        }
+        if !self.tags.is_empty() {
+            map.insert(
+                "tags".into(),
+                Value::Array(self.tags.iter().cloned().map(Value::String).collect()),
+            );
+        }
+        if let Some(group_id) = self.group_id.as_ref().filter(|s| !s.is_empty()) {
+            map.insert("group_id".into(), Value::String(group_id.clone()));
+        }
+        if let Some(profile) = self.active_profile.as_ref().filter(|s| !s.is_empty()) {
+            map.insert("active_profile".into(), Value::String(profile.clone()));
+        }
+        (!map.is_empty()).then_some(Value::Object(map))
+    }
+}
+
+/// Parse `annotations/<uuid>.pbtxt` in one bounded pass (`MAX_PBTXT_BYTES`).
+fn read_pbtxt_annotations(path: &Path) -> Option<Annotations> {
     use std::io::Read as _;
     let file = fs::File::open(path).ok()?;
     let meta = file.metadata().ok()?;
@@ -3890,12 +4300,22 @@ fn read_pbtxt_title(path: &Path) -> Option<String> {
     if text.len() > MAX_PBTXT_BYTES {
         return None;
     }
-    parse_pbtxt_title(&text)
+    Some(parse_pbtxt_annotations(&text))
+}
+
+fn read_pbtxt_title(path: &Path) -> Option<String> {
+    read_pbtxt_annotations(path).and_then(|a| a.title)
 }
 
 #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
 pub(crate) fn enrich_ingested_session_from_app_dir(s: &mut Session, app_data_dir: &Path, has_pbtxt: bool) {
     let mut enrich = SidecarEnrich::default();
+    let mut annotations =
+        read_pbtxt_annotations(&app_data_dir.join("annotations").join(format!("{}.pbtxt", s.id))).unwrap_or_default();
+    let has_pbtxt = has_pbtxt || annotations.title.as_deref().is_some_and(|t| !t.trim().is_empty());
+    if let Some(pbtxt_title) = annotations.title.clone().filter(|t| !t.trim().is_empty()) {
+        s.title = Some(pbtxt_title);
+    }
     let conv_db = app_data_dir.join("conversations").join(format!("{}.db", s.id));
     if conv_db.is_file() {
         apply_native_db_metadata(&conv_db, true, s, &mut enrich);
@@ -3903,93 +4323,147 @@ pub(crate) fn enrich_ingested_session_from_app_dir(s: &mut Session, app_data_dir
     let sum_db = app_data_dir.join("conversation_summaries.db");
     if sum_db.is_file() {
         if let Ok(Some(sum)) = read_summary_one(&sum_db, &s.id) {
-            if !has_pbtxt {
-                if let Some(sum_title) = sum.title {
-                    s.title = Some(sum_title);
-                } else if s.title.is_none() {
-                    s.title = sum.preview;
-                }
-            }
-            if s.cwd.is_none() {
-                s.cwd = sum.cwd;
-            }
-            if s.updated_at.is_none() {
-                s.updated_at = sum.updated_at;
-            }
-            if let Some(parent) = sum.parent_id.filter(|p| !p.is_empty()) {
-                s.lineage.parent = Some(parent);
-            }
-            if let Some(agent_name) = sum.agent_name.filter(|a| !a.is_empty()) {
-                if s.lineage.parent.is_some() && s.lineage.agent_path.is_none() {
-                    s.lineage.agent_path = Some(agent_name.clone());
-                }
-                s.harness_extra_mut(Harness::Antigravity)
-                    .insert("agent_name".into(), Value::String(agent_name));
-            }
-            let bag = s.harness_extra_mut(Harness::Antigravity);
-            if let Some(source) = sum.source.filter(|x| !x.is_empty()) {
-                bag.insert("source".into(), Value::String(source));
-            }
-            if let Some(project_id) = sum.project_id.filter(|x| !x.is_empty()) {
-                bag.insert("project_id".into(), Value::String(project_id));
-            }
+            apply_summary_to_session(s, &sum, has_pbtxt, true);
+            annotations.merge_fallback(&sum.annotations);
         }
+    }
+    if let Some(ann_val) = annotations.to_extra_value() {
+        s.harness_extra_mut(Harness::Antigravity)
+            .insert("annotations".into(), ann_val);
     }
 }
 
-pub(crate) fn parse_pbtxt_title(text: &str) -> Option<String> {
+fn unescape_pbtxt_quoted(rest: &str) -> Option<(String, &str)> {
+    let rest = rest.trim_start();
+    let quote = match rest.as_bytes().first().copied()? {
+        q @ (b'"' | b'\'') => q,
+        _ => return None,
+    };
+    let raw = &rest.as_bytes()[1..];
+    let mut bytes = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        match raw[i] {
+            b if b == quote => {
+                let s = String::from_utf8(bytes).ok()?;
+                return Some((s, &rest[1 + i + 1..]));
+            }
+            b'\\' if i + 1 < raw.len() => {
+                i += 1;
+                match raw[i] {
+                    b'n' => bytes.push(b'\n'),
+                    b'r' => bytes.push(b'\r'),
+                    b't' => bytes.push(b'\t'),
+                    b'\\' => bytes.push(b'\\'),
+                    b'"' => bytes.push(b'"'),
+                    b'\'' => bytes.push(b'\''),
+                    b'x' if i + 2 < raw.len() => {
+                        if let (Some(hi), Some(lo)) = (hex_val(raw[i + 1]), hex_val(raw[i + 2])) {
+                            bytes.push((hi << 4) | lo);
+                            i += 2;
+                        }
+                    }
+                    b'0'..=b'7' => {
+                        let mut val = raw[i] - b'0';
+                        for _ in 0..2 {
+                            if i + 1 < raw.len() && (b'0'..=b'7').contains(&raw[i + 1]) {
+                                i += 1;
+                                val = (val << 3) | (raw[i] - b'0');
+                            } else {
+                                break;
+                            }
+                        }
+                        bytes.push(val);
+                    }
+                    other => bytes.push(other),
+                }
+            }
+            ch => bytes.push(ch),
+        }
+        i += 1;
+    }
+    String::from_utf8(bytes).ok().map(|s| (s, ""))
+}
+
+fn parse_pbtxt_bool(rest: &str) -> Option<bool> {
+    let token = rest.split('#').next()?.trim().trim_end_matches([',', ';']).trim();
+    match token {
+        "true" | "True" | "TRUE" | "t" | "1" => Some(true),
+        "false" | "False" | "FALSE" | "f" | "0" => Some(false),
+        _ => None,
+    }
+}
+
+pub(crate) fn parse_pbtxt_annotations(text: &str) -> Annotations {
+    let mut out = Annotations::default();
     for line in text.lines() {
         let trimmed = line.trim();
-        let Some(rest) = trimmed.strip_prefix("title:") else {
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let Some((key, rest)) = trimmed.split_once(':') else {
             continue;
         };
-        let rest = rest.trim();
-        let Some(quoted) = rest.strip_prefix('"') else {
-            continue;
-        };
-        let mut bytes = Vec::with_capacity(quoted.len());
-        let raw = quoted.as_bytes();
-        let mut i = 0;
-        while i < raw.len() {
-            match raw[i] {
-                b'"' => break,
-                b'\\' if i + 1 < raw.len() => {
-                    i += 1;
-                    match raw[i] {
-                        b'n' => bytes.push(b'\n'),
-                        b'r' => bytes.push(b'\r'),
-                        b't' => bytes.push(b'\t'),
-                        b'\\' => bytes.push(b'\\'),
-                        b'"' => bytes.push(b'"'),
-                        b'\'' => bytes.push(b'\''),
-                        b'x' if i + 2 < raw.len() => {
-                            if let (Some(hi), Some(lo)) = (hex_val(raw[i + 1]), hex_val(raw[i + 2])) {
-                                bytes.push((hi << 4) | lo);
-                                i += 2;
-                            }
+        match key.trim() {
+            "title" if out.title.is_none() => {
+                out.title = unescape_pbtxt_quoted(rest).map(|(s, _)| s);
+            }
+            "archived" => {
+                if let Some(b) = parse_pbtxt_bool(rest) {
+                    out.archived = Some(b);
+                }
+            }
+            "starred" => {
+                if let Some(b) = parse_pbtxt_bool(rest) {
+                    out.starred = Some(b);
+                }
+            }
+            "pinned" => {
+                if let Some(b) = parse_pbtxt_bool(rest) {
+                    out.pinned = Some(b);
+                }
+            }
+            "tags" => {
+                let rest = rest.trim_start();
+                if let Some(mut list) = rest.strip_prefix('[') {
+                    while let Some((tag, rem)) = unescape_pbtxt_quoted(list) {
+                        let t = tag.trim();
+                        if !t.is_empty() {
+                            out.tags.push(t.to_owned());
                         }
-                        b'0'..=b'7' => {
-                            let mut val = raw[i] - b'0';
-                            for _ in 0..2 {
-                                if i + 1 < raw.len() && (b'0'..=b'7').contains(&raw[i + 1]) {
-                                    i += 1;
-                                    val = (val << 3) | (raw[i] - b'0');
-                                } else {
-                                    break;
-                                }
-                            }
-                            bytes.push(val);
-                        }
-                        other => bytes.push(other),
+                        list = rem.trim_start().strip_prefix(',').unwrap_or(rem);
+                    }
+                } else if let Some((tag, _)) = unescape_pbtxt_quoted(rest) {
+                    let t = tag.trim();
+                    if !t.is_empty() {
+                        out.tags.push(t.to_owned());
                     }
                 }
-                ch => bytes.push(ch),
             }
-            i += 1;
+            "group_id" => {
+                if let Some((val, _)) = unescape_pbtxt_quoted(rest) {
+                    let v = val.trim();
+                    if !v.is_empty() {
+                        out.group_id = Some(v.to_owned());
+                    }
+                }
+            }
+            "active_profile" => {
+                if let Some((val, _)) = unescape_pbtxt_quoted(rest) {
+                    let v = val.trim();
+                    if !v.is_empty() {
+                        out.active_profile = Some(v.to_owned());
+                    }
+                }
+            }
+            _ => {}
         }
-        return String::from_utf8(bytes).ok();
     }
-    None
+    out
+}
+
+pub(crate) fn parse_pbtxt_title(text: &str) -> Option<String> {
+    parse_pbtxt_annotations(text).title
 }
 
 // ---------------------------------------------------------------------------
@@ -4018,6 +4492,7 @@ fn record_sink_sqlite_deps(db: &Path, sink: &mut dyn MessageSink) {
 
 #[cfg(feature = "sqlite")]
 fn apply_native_db_metadata(conv_db: &Path, want_extra: bool, s: &mut Session, enrich: &mut SidecarEnrich) {
+    enrich.has_native_db = true;
     if let Ok(db_meta) = native::metadata(conv_db, true) {
         if s.cwd.is_none() {
             s.cwd = db_meta.cwd;
@@ -4054,6 +4529,13 @@ fn apply_native_db_metadata(conv_db: &Path, want_extra: bool, s: &mut Session, e
                 if let Some(value) = value {
                     bag.entry(key).or_insert(Value::String(value));
                 }
+            }
+            if let Some(tt) = db_meta.trajectory_type {
+                bag.entry("trajectory_type").or_insert_with(|| Value::Number(tt.into()));
+            }
+            if let Some(ts) = db_meta.trajectory_source {
+                bag.entry("trajectory_source")
+                    .or_insert_with(|| Value::Number(ts.into()));
             }
         }
         if s.model.is_none() {
@@ -4127,11 +4609,21 @@ struct SummaryRow {
     title: Option<String>,
     preview: Option<String>,
     cwd: Option<PathBuf>,
+    git_root: Option<PathBuf>,
+    git_branch: Option<String>,
     parent_id: Option<String>,
+    root_id: Option<String>,
     agent_name: Option<String>,
+    agent_type: Option<String>,
+    agent_role: Option<String>,
     source: Option<String>,
     project_id: Option<String>,
+    created_at: Option<DateTime<Utc>>,
     updated_at: Option<DateTime<Utc>>,
+    killed: bool,
+    status: Option<String>,
+    fork_parent_id: Option<String>,
+    annotations: Annotations,
 }
 
 #[cfg(feature = "sqlite")]
@@ -4152,8 +4644,92 @@ fn apply_summary_fallback(sref: &mut SessionRef, sum: &SummaryRow, has_pbtxt_tit
     if sref.cwd.is_none() {
         sref.cwd.clone_from(&sum.cwd);
     }
+    if let Some(created) = sum.created_at {
+        let from_mtime = sref.created_at.is_some()
+            && sref.created_at == sref.updated_at
+            && fs::metadata(&sref.path)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .map(DateTime::<Utc>::from)
+                == sref.created_at;
+        if sref.created_at.is_none() || from_mtime {
+            sref.created_at = Some(created);
+        }
+    }
     if sref.updated_at.is_none() {
-        sref.updated_at = sum.updated_at;
+        sref.updated_at = sum.updated_at.or(sum.created_at);
+    }
+}
+
+#[cfg(feature = "sqlite")]
+fn apply_summary_to_session(s: &mut Session, sum: &SummaryRow, has_pbtxt_title: bool, want_extra: bool) {
+    if !has_pbtxt_title {
+        if let Some(sum_title) = sum.title.as_ref().filter(|t| !t.trim().is_empty()) {
+            s.title = Some(sum_title.clone());
+        } else if s.title.is_none() {
+            s.title = sum.preview.clone().filter(|t| !t.trim().is_empty());
+        }
+    } else if s.title.is_none() {
+        s.title = sum
+            .title
+            .clone()
+            .filter(|t| !t.trim().is_empty())
+            .or_else(|| sum.preview.clone().filter(|t| !t.trim().is_empty()));
+    }
+    if s.cwd.is_none() {
+        s.cwd.clone_from(&sum.cwd);
+    }
+    if s.created_at.is_none() {
+        s.created_at = sum.created_at;
+    }
+    if s.updated_at.is_none() {
+        s.updated_at = sum.updated_at.or(sum.created_at);
+    }
+    if s.git.is_none() {
+        if let Some(branch) = &sum.git_branch {
+            s.git = Some(GitInfo {
+                branch: Some(branch.clone()),
+                commit: None,
+                remote: None,
+            });
+        }
+    }
+    if let Some(parent) = sum.parent_id.as_ref().filter(|p| !p.is_empty()) {
+        if s.lineage.parent.is_none() {
+            s.lineage.parent = Some(parent.clone());
+        }
+    }
+    if let Some(agent_name) = sum.agent_name.as_ref().filter(|a| !a.is_empty()) {
+        if s.lineage.parent.is_some() && s.lineage.agent_path.is_none() {
+            s.lineage.agent_path = Some(agent_name.clone());
+        }
+        if want_extra {
+            s.harness_extra_mut(Harness::Antigravity)
+                .insert("agent_name".into(), Value::String(agent_name.clone()));
+        }
+    }
+    if want_extra {
+        let bag = s.harness_extra_mut(Harness::Antigravity);
+        if let Some(git_root) = &sum.git_root {
+            bag.entry("git_root")
+                .or_insert_with(|| Value::String(git_root.display().to_string()));
+        }
+        for (key, value) in [
+            ("root_conversation_id", sum.root_id.as_ref()),
+            ("agent_type", sum.agent_type.as_ref()),
+            ("agent_role", sum.agent_role.as_ref()),
+            ("source", sum.source.as_ref()),
+            ("project_id", sum.project_id.as_ref()),
+            ("status", sum.status.as_ref()),
+            ("forked_from", sum.fork_parent_id.as_ref()),
+        ] {
+            if let Some(val) = value.filter(|x| !x.is_empty()) {
+                bag.entry(key).or_insert_with(|| Value::String(val.clone()));
+            }
+        }
+        if sum.killed {
+            bag.entry("killed").or_insert(Value::Bool(true));
+        }
     }
 }
 
@@ -4173,8 +4749,16 @@ fn summary_columns_sql(conn: &rusqlite::Connection) -> Result<Option<String>> {
             format!("NULL AS {name}")
         }
     };
+    let raw_col = if cols.contains("raw_summary") {
+        format!(
+            "CASE WHEN length(raw_summary) <= {} THEN raw_summary ELSE NULL END AS raw_summary",
+            SummaryRow::MAX_RAW_SUMMARY_BYTES
+        )
+    } else {
+        "NULL AS raw_summary".to_string()
+    };
     Ok(Some(format!(
-        "SELECT conversation_id, {}, {}, {}, {}, {}, {}, {}, {} FROM conversation_summaries",
+        "SELECT conversation_id, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {} FROM conversation_summaries",
         pick("title"),
         pick("preview"),
         pick("workspace_uris"),
@@ -4183,36 +4767,75 @@ fn summary_columns_sql(conn: &rusqlite::Connection) -> Result<Option<String>> {
         pick("source"),
         pick("project_id"),
         pick("last_modified_time"),
+        pick("killed"),
+        pick("status"),
+        pick("group_id"),
+        raw_col,
     )))
 }
 
 #[cfg(feature = "sqlite")]
-fn decode_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(String, SummaryRow)> {
+fn decode_summary_row(
+    row: &rusqlite::Row<'_>,
+    stage: &mut Option<native::Stage>,
+) -> rusqlite::Result<(String, SummaryRow)> {
+    use rusqlite::types::ValueRef;
+    let opt_text = |idx: usize| -> rusqlite::Result<Option<String>> {
+        Ok(match row.get_ref(idx)? {
+            ValueRef::Text(t) => std::str::from_utf8(t)
+                .ok()
+                .map(str::to_owned)
+                .filter(|s| !s.trim().is_empty()),
+            ValueRef::Integer(i) => Some(i.to_string()),
+            _ => None,
+        })
+    };
     let id: String = row.get(0)?;
-    let title: Option<String> = row.get(1)?;
-    let preview: Option<String> = row.get(2)?;
-    let workspace_uris: Option<String> = row.get(3)?;
-    let parent_id: Option<String> = row.get(4)?;
-    let agent_name: Option<String> = row.get(5)?;
-    let source: Option<String> = row.get(6)?;
-    let project_id: Option<String> = row.get(7)?;
-    let last_modified: Option<String> = row.get(8)?;
-
+    let title = opt_text(1)?;
+    let preview = opt_text(2)?;
+    let workspace_uris = opt_text(3)?;
+    let parent_id = opt_text(4)?.map(|s| s.trim().to_owned());
+    let agent_name = opt_text(5)?.map(|s| s.trim().to_owned());
+    let source = opt_text(6)?.map(|s| s.trim().to_owned());
+    let project_id = opt_text(7)?.map(|s| s.trim().to_owned());
+    let last_modified = opt_text(8)?;
+    let col_killed = match row.get_ref(9)? {
+        ValueRef::Integer(i) => Some(i != 0),
+        ValueRef::Text(t) => match std::str::from_utf8(t).ok().map(str::trim) {
+            Some("1") => Some(true),
+            Some("0") => Some(false),
+            Some(s) if s.eq_ignore_ascii_case("true") => Some(true),
+            Some(s) if s.eq_ignore_ascii_case("false") => Some(false),
+            _ => None,
+        },
+        _ => None,
+    };
+    let status = opt_text(10)?.map(|s| s.trim().to_owned());
+    let group_id = opt_text(11)?.map(|s| s.trim().to_owned());
+    let mut annotations = Annotations::default();
+    if let Some(gid) = group_id {
+        annotations.group_id = Some(gid);
+    }
     let cwd = workspace_uris.as_deref().and_then(first_workspace_uri_path);
     let updated_at = last_modified.as_deref().and_then(parse_sqlite_ts);
-    Ok((
-        id,
-        SummaryRow {
-            title: title.filter(|s| !s.trim().is_empty()),
-            preview: preview.filter(|s| !s.trim().is_empty()),
-            cwd,
-            parent_id: parent_id.filter(|s| !s.trim().is_empty()),
-            agent_name: agent_name.filter(|s| !s.trim().is_empty()),
-            source: source.filter(|s| !s.trim().is_empty()),
-            project_id: project_id.filter(|s| !s.trim().is_empty()),
-            updated_at,
-        },
-    ))
+    let mut summary_row = SummaryRow {
+        title,
+        preview,
+        cwd,
+        parent_id,
+        agent_name,
+        source,
+        project_id,
+        updated_at,
+        killed: col_killed.unwrap_or(false),
+        status,
+        annotations,
+        ..SummaryRow::default()
+    };
+    if let ValueRef::Blob(b) | ValueRef::Text(b) = row.get_ref(12)? {
+        summary_row.merge_raw_summary(stage, b);
+    }
+    Ok((id, summary_row))
 }
 
 #[cfg(feature = "sqlite")]
@@ -4222,10 +4845,11 @@ fn read_summaries_map(db_path: &Path) -> Result<HashMap<String, SummaryRow>> {
             return Ok(HashMap::new());
         };
         let mut stmt = conn.prepare(&select_sql)?;
-        let rows = stmt.query_map([], decode_summary_row)?;
+        let mut stage = None;
+        let mut rows = stmt.query([])?;
         let mut map = HashMap::new();
-        for item in rows {
-            let (id, sum) = item?;
+        while let Some(row) = rows.next()? {
+            let (id, sum) = decode_summary_row(row, &mut stage)?;
             map.insert(id, sum);
         }
         Ok(map)
@@ -4240,8 +4864,9 @@ fn read_summary_one(db_path: &Path, id: &str) -> Result<Option<SummaryRow>> {
             return Ok(None);
         };
         let sql = format!("{select_sql} WHERE conversation_id = ?1");
+        let mut stage = None;
         let row = conn
-            .query_row(&sql, [id], decode_summary_row)
+            .query_row(&sql, [id], |r| decode_summary_row(r, &mut stage))
             .optional()?
             .map(|(_, sum)| sum);
         Ok(row)
