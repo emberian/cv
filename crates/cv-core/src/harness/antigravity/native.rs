@@ -87,9 +87,10 @@ fn read(path: &Path, complete: bool, limit: i64) -> Result<jsonl::Read> {
     Ok(input.decoded(output, len))
 }
 
-/// The `invoke_subagent` call that created each of `children`, from the typed result
-/// that names the conversation (`InvokeSubagent.results[].conversation_id`). The registry's
-/// `spawnStepIndex` is not that step: parallel spawns all record the last result.
+/// The `invoke_subagent` or `swarm` (`action: "add"`) call that created each of `children`,
+/// from the result that names the conversation (`InvokeSubagent.results[].conversation_id` or
+/// `swarm`'s `{"status":"added",...}` JSON). The registry's `spawnStepIndex` is not that step:
+/// parallel spawns all record the last result.
 pub(super) fn spawn_calls(path: &Path, children: &[&str]) -> Result<BTreeMap<String, String>> {
     let mut calls = BTreeMap::new();
     if children.is_empty() {
@@ -121,9 +122,12 @@ pub(super) fn spawn_calls(path: &Path, children: &[&str]) -> Result<BTreeMap<Str
             else {
                 continue;
             };
-            let (Some(id), Some("invoke_subagent")) = (text(&call, 1), text(&call, 2).as_deref()) else {
+            let (Some(id), Some(tool)) = (text(&call, 1), text(&call, 2)) else {
                 continue;
             };
+            if !matches!(tool.as_str(), "invoke_subagent" | "swarm") {
+                continue;
+            }
             let Some(result) = inner(&step, 140)?
                 .map(|generic| inner(&generic, 2))
                 .transpose()?
@@ -131,6 +135,16 @@ pub(super) fn spawn_calls(path: &Path, children: &[&str]) -> Result<BTreeMap<Str
             else {
                 continue;
             };
+            if tool == "swarm" {
+                if let Some(body) = result.last(1).and_then(|f| f.string(file, 64 * 1024).ok()) {
+                    for child in super::extract_swarm_added_ids(&body) {
+                        if children.contains(&child.as_str()) {
+                            calls.entry(child).or_insert_with(|| id.clone());
+                        }
+                    }
+                }
+                continue;
+            }
             let Some(any) = inner(&result, 6)? else {
                 continue;
             };

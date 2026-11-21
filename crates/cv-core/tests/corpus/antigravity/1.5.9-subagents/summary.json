@@ -92,7 +92,8 @@
         "total_errors": 0
       },
       "lineage": {
-        "parent": "19d3235c-c899-451a-975f-2c92d7c99959"
+        "parent": "19d3235c-c899-451a-975f-2c92d7c99959",
+        "spawned_by_tool_use": "3ebb56a9-919c-4e58-a2a4-14a71008d1b0"
       },
       "model": null,
       "skipped_lines": 0
@@ -123,7 +124,8 @@
         "total_errors": 0
       },
       "lineage": {
-        "parent": "19d3235c-c899-451a-975f-2c92d7c99959"
+        "parent": "19d3235c-c899-451a-975f-2c92d7c99959",
+        "spawned_by_tool_use": "b753afb8-825e-4f28-ad0e-9eff7e08b44a"
       },
       "model": null,
       "skipped_lines": 0

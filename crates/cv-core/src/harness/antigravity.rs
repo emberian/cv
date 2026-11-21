@@ -293,6 +293,16 @@ impl Adapter for Antigravity {
                 .push(loc.brain_dir.join(".system_generated").join("subagents"));
             deps.files
                 .push(loc.brain_dir.join(".system_generated/swarm/members.json"));
+            if let Some(reg) = find_swarm_registry(&loc.app_data_dir, &loc.id, None) {
+                if reg.coordinator_id != loc.id {
+                    deps.files.push(
+                        loc.app_data_dir
+                            .join("brain")
+                            .join(&reg.coordinator_id)
+                            .join(".system_generated/swarm/members.json"),
+                    );
+                }
+            }
             #[cfg(feature = "sqlite")]
             {
                 let conv_db = loc.app_data_dir.join("conversations").join(format!("{}.db", loc.id));
@@ -425,15 +435,9 @@ impl Adapter for Antigravity {
         }
         #[cfg(feature = "sqlite")]
         let summaries = read_summaries_map(&loc.app_data_dir.join("conversation_summaries.db")).unwrap_or_default();
-        #[cfg(feature = "sqlite")]
         let spawn_calls = {
             let children: Vec<&str> = descriptors.iter().map(|desc| desc.conversation_id.as_str()).collect();
-            let store = loc.app_data_dir.join("conversations").join(format!("{}.db", loc.id));
-            if store.is_file() {
-                native::spawn_calls(&store, &children).unwrap_or_default()
-            } else {
-                BTreeMap::new()
-            }
+            spawn_calls_in_session(&loc.app_data_dir, &loc.id, Some(&r.path), &children)
         };
         let mut out = Vec::new();
         for desc in descriptors {
@@ -475,11 +479,8 @@ impl Adapter for Antigravity {
                 .is_some_and(|t| !t.trim().is_empty());
                 apply_summary_fallback(&mut child_ref, sum, has_pbtxt);
             }
-            // Only the store names the spawning call; `spawnStepIndex` does not identify it.
-            #[cfg(feature = "sqlite")]
+            // Only the parent's own store/transcript names the spawning call; `spawnStepIndex` does not identify it.
             let tool_use_id = spawn_calls.get(&desc.conversation_id).cloned();
-            #[cfg(not(feature = "sqlite"))]
-            let tool_use_id = None;
             out.push(crate::AgentRef {
                 session: child_ref,
                 agent_type: desc.type_name,
@@ -496,6 +497,343 @@ impl Adapter for Antigravity {
         }
         out.sort_by_key(|a| std::cmp::Reverse(a.session.created_at));
         Ok(out)
+    }
+
+    fn subagent_end(&self, transcript: &Path) -> Result<Option<crate::lanes::SubagentEnd>> {
+        if descriptor_parent(transcript).is_some() {
+            return Ok(None);
+        }
+        let id = BrainLoc::from_transcript(transcript)
+            .map(|loc| loc.id)
+            .or_else(|| transcript.file_stem().and_then(|s| s.to_str()).map(str::to_owned))
+            .unwrap_or_default();
+        let reference = SessionRef::new(id, Harness::Antigravity, transcript);
+        let mut saw_any = false;
+        let mut last_turn_at: Option<DateTime<Utc>> = None;
+        let mut has_nonterminal_step = false;
+        let mut open_tools: BTreeSet<String> = BTreeSet::new();
+        let mut trailing_wake = false;
+        let mut saw_assistant_or_abort = false;
+        let mut last_assistant_zero_tools = false;
+        let mut swarm_wait_ids: BTreeSet<String> = BTreeSet::new();
+        let mut completed_swarm_wait = false;
+        let mut ended_in_abort = false;
+
+        let session = self.try_stream(
+            &reference,
+            &Demand::RICH.with_spans(),
+            &mut crate::stream::TryFnSink::new(|m: Message| {
+                if m.kind == MessageKind::CompactionBoundary {
+                    open_tools.clear();
+                    return Ok(Flow::Continue);
+                }
+                saw_any = true;
+                if let Some(ts) = m.timestamp {
+                    last_turn_at = Some(last_turn_at.map_or(ts, |prev| prev.max(ts)));
+                }
+                if m.extra
+                    .get("antigravity")
+                    .and_then(|bag| bag.get("status"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|st| matches!(st, "RUNNING" | "PENDING" | "WAITING" | "QUEUED" | "GENERATING"))
+                {
+                    has_nonterminal_step = true;
+                }
+                if m.is_model_visible() {
+                    for b in &m.content {
+                        match b {
+                            Block::ToolUse { id, .. } if !id.is_empty() => {
+                                open_tools.insert(id.clone());
+                            }
+                            Block::ToolResult { tool_use_id, .. } if !tool_use_id.is_empty() => {
+                                open_tools.remove(tool_use_id);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                match m.role {
+                    Role::User if matches!(m.kind, MessageKind::Prompt | MessageKind::SubagentReturn) => {
+                        trailing_wake = true;
+                        ended_in_abort = false;
+                    }
+                    Role::System if m.kind == MessageKind::InjectedContext => {
+                        trailing_wake = true;
+                        ended_in_abort = false;
+                    }
+                    Role::System if m.kind == MessageKind::Error => {
+                        saw_assistant_or_abort = true;
+                        trailing_wake = false;
+                        ended_in_abort = true;
+                    }
+                    Role::Assistant => {
+                        saw_assistant_or_abort = true;
+                        trailing_wake = false;
+                        ended_in_abort = m
+                            .extra
+                            .get("antigravity")
+                            .and_then(|bag| bag.get("interrupted"))
+                            .and_then(Value::as_bool)
+                            == Some(true);
+                        swarm_wait_ids.clear();
+                        completed_swarm_wait = false;
+                        let mut tool_count = 0usize;
+                        for b in &m.content {
+                            if let Block::ToolUse { id, name, .. } = b {
+                                tool_count += 1;
+                                if name == "swarm_wait" && !id.is_empty() {
+                                    swarm_wait_ids.insert(id.clone());
+                                }
+                            }
+                        }
+                        last_assistant_zero_tools = tool_count == 0;
+                    }
+                    Role::Tool => {
+                        for b in &m.content {
+                            if let Block::ToolResult {
+                                tool_use_id,
+                                status,
+                                is_error,
+                                ..
+                            } = b
+                            {
+                                if swarm_wait_ids.contains(tool_use_id)
+                                    && status.as_deref() == Some("completed")
+                                    && !*is_error
+                                {
+                                    completed_swarm_wait = true;
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                Ok(Flow::Continue)
+            }),
+        )?;
+
+        if !saw_any {
+            return Ok(None);
+        }
+        let parked = !has_nonterminal_step
+            && open_tools.is_empty()
+            && !trailing_wake
+            && saw_assistant_or_abort
+            && (last_assistant_zero_tools || completed_swarm_wait || ended_in_abort);
+        let is_swarm_member = session
+            .harness_extra(Harness::Antigravity)
+            .and_then(|bag| bag.get("member"))
+            .is_some();
+        Ok(Some(if parked {
+            crate::lanes::SubagentEnd {
+                last_turn_at,
+                stopped_at: Some(last_turn_at.unwrap_or(DateTime::UNIX_EPOCH)),
+                parked_status: is_swarm_member.then(|| "waiting".to_string()),
+                active: false,
+                api_error: None,
+            }
+        } else {
+            crate::lanes::SubagentEnd {
+                last_turn_at,
+                stopped_at: None,
+                parked_status: None,
+                active: true,
+                api_error: None,
+            }
+        }))
+    }
+
+    fn task_notices(&self, parent: &SessionRef) -> Result<std::collections::HashMap<String, crate::lanes::TaskNotice>> {
+        struct NoticeCollector {
+            resolver: crate::lazy::Resolver,
+            swarm_reg: Option<SwarmRegistry>,
+            parent_id: String,
+            send_recipients: BTreeMap<String, String>,
+            notices: std::collections::HashMap<String, crate::lanes::TaskNotice>,
+            error: Option<anyhow::Error>,
+        }
+        impl MessageSink for NoticeCollector {
+            fn meta(&mut self, session: &Session) {
+                if session.source_path.is_some() {
+                    self.resolver = session.resolver();
+                }
+            }
+            fn message(&mut self, m: Message) -> Flow {
+                let res = (|| -> Result<()> {
+                    if m.role == Role::Assistant {
+                        for b in &m.content {
+                            if let Block::ToolUse { id, name, input, .. } = b {
+                                if name == "send_message" && !id.is_empty() {
+                                    if let Some(recipient) = input
+                                        .with_view(|v| v.get("Recipient")?.map(JsonView::string).transpose())?
+                                        .flatten()
+                                        .filter(|s| !s.is_empty())
+                                    {
+                                        self.send_recipients.insert(id.clone(), recipient);
+                                    }
+                                }
+                            }
+                        }
+                    } else if m.kind == MessageKind::SubagentReturn {
+                        if let Some(child) = m
+                            .extra
+                            .get("antigravity")
+                            .and_then(|bag| bag.get("returned_child"))
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.is_empty())
+                        {
+                            self.notices.insert(
+                                child.to_string(),
+                                crate::lanes::TaskNotice {
+                                    status: "completed".to_string(),
+                                    ts: m.timestamp,
+                                },
+                            );
+                        }
+                    } else if m.role == Role::Tool {
+                        for b in &m.content {
+                            let Block::ToolResult {
+                                tool_use_id,
+                                content,
+                                is_error,
+                                tool_name,
+                                ..
+                            } = b
+                            else {
+                                continue;
+                            };
+                            if *is_error {
+                                continue;
+                            }
+                            match tool_name.as_deref() {
+                                Some("send_message") => {
+                                    if let Some(recipient) = self.send_recipients.remove(tool_use_id) {
+                                        self.notices.remove(&recipient);
+                                    }
+                                }
+                                Some("manage_subagents") => {
+                                    let head = content.try_resolve_prefix(&self.resolver, 64 * 1024)?;
+                                    if let Some(line) = head.lines().map(str::trim).find(|l| l.starts_with('[')) {
+                                        if let Ok(Value::Array(items)) = serde_json::from_str::<Value>(line) {
+                                            for item in items {
+                                                let cid = item.get("conversationId").and_then(Value::as_str);
+                                                let state = item.get("state").and_then(Value::as_str);
+                                                if let (Some(cid), Some(state)) = (cid, state) {
+                                                    let mapped = match state {
+                                                        "idle" => Some("completed"),
+                                                        "running" => Some("running"),
+                                                        "killed" => Some("killed"),
+                                                        "stopped" => Some("stopped"),
+                                                        _ => None,
+                                                    };
+                                                    if let Some(status) = mapped {
+                                                        self.notices.insert(
+                                                            cid.to_string(),
+                                                            crate::lanes::TaskNotice {
+                                                                status: status.to_string(),
+                                                                ts: m.timestamp,
+                                                            },
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                Some("swarm") => {
+                                    if let Some(reg) = &self.swarm_reg {
+                                        let head = content.try_resolve_prefix(&self.resolver, 64 * 1024)?;
+                                        if let Some(line) = head.lines().map(str::trim).find(|l| l.starts_with('{')) {
+                                            if let Ok(val) = serde_json::from_str::<Value>(line) {
+                                                if val.get("status").and_then(Value::as_str) == Some("killed") {
+                                                    if let Some(cid) = val
+                                                        .get("name")
+                                                        .and_then(Value::as_str)
+                                                        .and_then(|n| reg.by_name.get(n))
+                                                        .map(|m_info| &m_info.conversation_id)
+                                                        .filter(|cid| *cid != &self.parent_id)
+                                                    {
+                                                        self.notices.insert(
+                                                            cid.clone(),
+                                                            crate::lanes::TaskNotice {
+                                                                status: "killed".to_string(),
+                                                                ts: m.timestamp,
+                                                            },
+                                                        );
+                                                    }
+                                                } else if val.get("status").is_none() {
+                                                    if let Some(members) = val.get("members").and_then(Value::as_array)
+                                                    {
+                                                        for item in members {
+                                                            let Some(name) = item.get("name").and_then(Value::as_str)
+                                                            else {
+                                                                continue;
+                                                            };
+                                                            let Some(m_info) = reg.by_name.get(name) else {
+                                                                continue;
+                                                            };
+                                                            if m_info.conversation_id == self.parent_id {
+                                                                continue;
+                                                            }
+                                                            let killed = item.get("killed").and_then(Value::as_bool)
+                                                                == Some(true);
+                                                            let state = if killed {
+                                                                Some("killed")
+                                                            } else {
+                                                                item.get("state").and_then(Value::as_str)
+                                                            };
+                                                            if let Some(st) = state.filter(|st| {
+                                                                matches!(
+                                                                    *st,
+                                                                    "waiting"
+                                                                        | "working"
+                                                                        | "stopped"
+                                                                        | "killed"
+                                                                        | "running"
+                                                                )
+                                                            }) {
+                                                                self.notices.insert(
+                                                                    m_info.conversation_id.clone(),
+                                                                    crate::lanes::TaskNotice {
+                                                                        status: st.to_string(),
+                                                                        ts: m.timestamp,
+                                                                    },
+                                                                );
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    Ok(())
+                })();
+                if let Err(err) = res {
+                    self.error = Some(err);
+                    return Flow::Stop;
+                }
+                Flow::Continue
+            }
+            fn take_error(&mut self) -> Option<anyhow::Error> {
+                self.error.take()
+            }
+        }
+        let swarm_reg = BrainLoc::from_transcript(&parent.path).and_then(|loc| read_swarm_registry(&loc.brain_dir));
+        let mut collector = NoticeCollector {
+            resolver: crate::lazy::Resolver::new(Some(parent.path.clone())),
+            swarm_reg,
+            parent_id: parent.id.clone(),
+            send_recipients: BTreeMap::new(),
+            notices: std::collections::HashMap::new(),
+            error: None,
+        };
+        self.try_stream(parent, &Demand::RICH.with_spans(), &mut collector)?;
+        Ok(collector.notices)
     }
 
     fn discover(&self) -> Result<crate::Discovered> {
@@ -777,6 +1115,9 @@ impl Adapter for Antigravity {
             session.title = r.title.clone();
             session.cwd = r.cwd.clone();
             session.lineage.parent = Some(parent);
+            if let Some(app_data_dir) = descriptor_app_data_dir(&r.path) {
+                enrich_child_lineage(&mut session, &app_data_dir, None, opts.tier >= Tier::Rich);
+            }
             session
                 .harness_extra_mut(Harness::Antigravity)
                 .insert("transcript_unavailable".into(), Value::Bool(true));
@@ -1194,6 +1535,12 @@ fn descriptor_parent(path: &Path) -> Option<String> {
         return None;
     }
     descriptors.parent()?.parent()?.file_name()?.to_str().map(str::to_owned)
+}
+
+fn descriptor_app_data_dir(path: &Path) -> Option<PathBuf> {
+    let brain_dir = path.parent()?.parent()?.parent()?;
+    let brain_root = brain_dir.parent()?;
+    (brain_root.file_name()?.to_str()? == "brain").then(|| brain_root.parent().map(Path::to_path_buf))?
 }
 
 /// Export completion order differs from step order. Keep the last revision of each
@@ -2376,10 +2723,10 @@ impl StepCodec {
                     .into_iter()
                     .flatten()
                     .filter_map(|id| id.as_str().map(str::to_owned));
-                let named = match tool_name.as_deref() {
-                    Some("invoke_subagent") => extract_spawned_conversation_id(&head),
-                    Some("swarm") => extract_swarm_added(&head),
-                    _ => None,
+                let named: Vec<String> = match tool_name.as_deref() {
+                    Some("invoke_subagent") => extract_spawned_conversation_id(&head).into_iter().collect(),
+                    Some("swarm") => extract_swarm_added_ids(&head),
+                    _ => Vec::new(),
                 };
                 for child_id in typed.chain(named) {
                     self.state.child_ids.insert(child_id.clone());
@@ -2617,8 +2964,17 @@ impl StepCodec {
                 self.s.updated_at = Some(last);
             }
         }
+        let sender_parent = self.state.inferred_parent.clone();
         if self.s.lineage.parent.is_none() {
             self.s.lineage.parent = self.state.inferred_parent;
+        }
+        if let Some(loc) = self.source_path.as_deref().and_then(BrainLoc::from_transcript) {
+            enrich_child_lineage(
+                &mut self.s,
+                &loc.app_data_dir,
+                sender_parent.as_deref(),
+                self.opts.tier >= Tier::Rich,
+            );
         }
         if self.opts.tier >= Tier::Rich
             && (!self.enrich.subagent_descriptors.is_empty() || !self.state.spawned_children.is_empty())
@@ -3014,16 +3370,276 @@ fn board_wake(body: &str) -> Option<u64> {
     seq[..digits].parse().ok()
 }
 
-/// The conversation a `swarm` call added: `{"status":"added",…,"conversation_id":"<id>"}`
-/// on its own line of the result.
-fn extract_swarm_added(head: &str) -> Option<String> {
-    let line = head.lines().find(|line| line.starts_with('{'))?;
-    let value: Value = serde_json::from_str(line).ok()?;
-    if value.get("status").and_then(Value::as_str) != Some("added") {
+/// Conversations a `swarm` call added: `{"status":"added",…,"conversation_id":"<id>"}`
+/// (plus sharded `conversation_ids` / `members` forms).
+pub(super) fn extract_swarm_added_ids(head: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut push_id = |id: &str| {
+        if looks_like_uuid(id) && !out.iter().any(|existing| existing == id) {
+            out.push(id.to_owned());
+        }
+    };
+    let collect_from = |value: &Value, push_id: &mut dyn FnMut(&str)| {
+        if value.get("status").and_then(Value::as_str) != Some("added") {
+            return;
+        }
+        if let Some(id) = value.get("conversation_id").and_then(Value::as_str) {
+            push_id(id);
+        }
+        if let Some(ids) = value.get("conversation_ids").and_then(Value::as_array) {
+            for id in ids.iter().filter_map(Value::as_str) {
+                push_id(id);
+            }
+        }
+        match value.get("members") {
+            Some(Value::Array(items)) => {
+                for item in items {
+                    if let Some(id) = item.get("conversation_id").and_then(Value::as_str) {
+                        push_id(id);
+                    }
+                }
+            }
+            Some(Value::Object(map)) => {
+                for item in map.values() {
+                    if let Some(id) = item.get("conversation_id").and_then(Value::as_str) {
+                        push_id(id);
+                    }
+                }
+            }
+            _ => {}
+        }
+    };
+    for line in head.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('{') {
+            if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+                collect_from(&value, &mut push_id);
+            }
+        }
+    }
+    out
+}
+
+#[derive(Debug, Clone)]
+struct SwarmMember {
+    name: String,
+    conversation_id: String,
+    added_by: Option<String>,
+    record: Map<String, Value>,
+}
+
+#[derive(Debug, Clone)]
+struct SwarmRegistry {
+    coordinator_id: String,
+    by_name: BTreeMap<String, SwarmMember>,
+    name_by_id: BTreeMap<String, String>,
+}
+
+fn read_swarm_registry(brain_dir: &Path) -> Option<SwarmRegistry> {
+    let coordinator_id = brain_dir.file_name()?.to_str()?.to_owned();
+    let members_path = brain_dir.join(".system_generated/swarm/members.json");
+    let source = crate::json::JsonSource::capture(&members_path).ok()?;
+    if source.len() > 1024 * 1024 {
         return None;
     }
-    let id = value.get("conversation_id").and_then(Value::as_str)?;
-    looks_like_uuid(id).then(|| id.to_owned())
+    let value = source
+        .read(
+            crate::json::ReadInput::Document,
+            crate::json::Validation::Value,
+            |view| Ok(view.resolve()?.into_owned()),
+        )
+        .ok()?;
+    let members = value.get("members")?.as_object()?;
+    let mut by_name = BTreeMap::new();
+    let mut name_by_id = BTreeMap::new();
+    for (name, member) in members {
+        let Some(id) = member
+            .get("conversation_id")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        let mut record = Map::new();
+        record.insert("member".into(), Value::String(name.clone()));
+        for key in ["added_by", "phase", "desired_state", "wake_mode", "killed"] {
+            if let Some(val) = member.get(key) {
+                record.insert(key.into(), val.clone());
+            }
+        }
+        let added_by = member
+            .get("added_by")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        name_by_id.insert(id.to_owned(), name.clone());
+        by_name.insert(
+            name.clone(),
+            SwarmMember {
+                name: name.clone(),
+                conversation_id: id.to_owned(),
+                added_by,
+                record,
+            },
+        );
+    }
+    (!by_name.is_empty()).then_some(SwarmRegistry {
+        coordinator_id,
+        by_name,
+        name_by_id,
+    })
+}
+
+fn find_swarm_registry(app_data_dir: &Path, session_id: &str, parent_hint: Option<&str>) -> Option<SwarmRegistry> {
+    let brain_root = app_data_dir.join("brain");
+    let check_brain = |id: &str| -> Option<SwarmRegistry> {
+        let reg = read_swarm_registry(&brain_root.join(id))?;
+        reg.name_by_id.contains_key(session_id).then_some(reg)
+    };
+    if let Some(reg) = check_brain(session_id) {
+        return Some(reg);
+    }
+    if let Some(parent) = parent_hint.filter(|p| !p.is_empty() && *p != session_id) {
+        if let Some(reg) = check_brain(parent) {
+            return Some(reg);
+        }
+    }
+    let entries = fs::read_dir(&brain_root).ok()?;
+    for entry in entries.flatten() {
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        if !ft.is_dir() && !(ft.is_symlink() && entry.path().is_dir()) {
+            continue;
+        }
+        let Some(dir_id) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if dir_id == session_id || parent_hint == Some(dir_id.as_str()) {
+            continue;
+        }
+        if let Some(reg) = check_brain(&dir_id) {
+            return Some(reg);
+        }
+    }
+    None
+}
+
+fn spawn_calls_in_session(
+    app_data_dir: &Path,
+    spawner_id: &str,
+    transcript_hint: Option<&Path>,
+    children: &[&str],
+) -> BTreeMap<String, String> {
+    if children.is_empty() {
+        return BTreeMap::new();
+    }
+    #[cfg(feature = "sqlite")]
+    {
+        let store = app_data_dir.join("conversations").join(format!("{spawner_id}.db"));
+        if store.is_file() {
+            return native::spawn_calls(&store, children).unwrap_or_default();
+        }
+    }
+    let log = transcript_hint
+        .filter(|p| !is_native_store(p) && descriptor_parent(p).is_none() && p.is_file())
+        .map(Path::to_path_buf)
+        .or_else(|| {
+            select_session_source(app_data_dir, spawner_id)
+                .filter(|p| !is_native_store(p) && descriptor_parent(p).is_none())
+        });
+    let Some(log) = log else {
+        return BTreeMap::new();
+    };
+    jsonl_spawn_calls(&log, spawner_id, children).unwrap_or_default()
+}
+
+fn jsonl_spawn_calls(path: &Path, spawner_id: &str, children: &[&str]) -> Result<BTreeMap<String, String>> {
+    let input = open_transcript(path)?;
+    let mut order = StepOrder::default();
+    input.snapshot(0, input.len(), |line| {
+        order.ingest(&line)?;
+        Ok(Flow::Continue)
+    })?;
+    let mut codec = StepCodec {
+        s: Session::new(spawner_id, Harness::Antigravity),
+        opts: Demand::LEAN.with_spans(),
+        spans: true,
+        enrich: SidecarEnrich::default(),
+        state: StepState::default(),
+        source_path: None,
+    };
+    let mut discard = crate::stream::Discard;
+    let mut records = input.records();
+    for (at, end) in order.steps.into_values() {
+        records.read(at, end - at, |view| codec.decode(view, at, &mut discard))?;
+    }
+    Ok(codec
+        .state
+        .spawned_children
+        .into_iter()
+        .filter(|(cid, _)| children.contains(&cid.as_str()))
+        .collect())
+}
+
+fn enrich_child_lineage(s: &mut Session, app_data_dir: &Path, sender_parent: Option<&str>, want_extra: bool) {
+    if let Some(reg) = find_swarm_registry(app_data_dir, &s.id, s.lineage.parent.as_deref().or(sender_parent)) {
+        if s.id != reg.coordinator_id {
+            s.lineage.parent = Some(reg.coordinator_id.clone());
+            if let Some(member_name) = reg.name_by_id.get(&s.id) {
+                let member = &reg.by_name[member_name];
+                // Walk `added_by` chain (cycle-guarded) to build `/coordinator/.../<member>`.
+                let mut chain = vec![member.name.as_str()];
+                let mut visited = BTreeSet::from([member.name.as_str()]);
+                let mut cur = member.added_by.as_deref();
+                while let Some(adder) = cur {
+                    if !visited.insert(adder) {
+                        break;
+                    }
+                    chain.push(adder);
+                    cur = reg.by_name.get(adder).and_then(|m| m.added_by.as_deref());
+                }
+                if chain.last().copied() != Some("coordinator") && reg.by_name.contains_key("coordinator") {
+                    chain.push("coordinator");
+                }
+                chain.reverse();
+                s.lineage.agent_path = Some(format!("/{}", chain.join("/")));
+
+                let adder_member = member.added_by.as_deref().and_then(|adder| reg.by_name.get(adder));
+                let spawner_id = adder_member
+                    .map(|m| m.conversation_id.as_str())
+                    .unwrap_or(&reg.coordinator_id);
+                let mut calls = spawn_calls_in_session(app_data_dir, spawner_id, None, &[s.id.as_str()]);
+                if let Some(call_id) = calls.remove(&s.id) {
+                    s.lineage.spawned_by_tool_use = Some(call_id);
+                }
+
+                if want_extra {
+                    let bag = s.harness_extra_mut(Harness::Antigravity);
+                    for (k, v) in &member.record {
+                        bag.insert(k.clone(), v.clone());
+                    }
+                    if let Some(adder_m) = adder_member {
+                        bag.insert("added_by_id".into(), Value::String(adder_m.conversation_id.clone()));
+                    }
+                }
+            }
+        }
+        return;
+    }
+    if s.lineage.spawned_by_tool_use.is_none() {
+        if let Some(parent_id) = s.lineage.parent.clone() {
+            let mut calls = spawn_calls_in_session(app_data_dir, &parent_id, None, &[s.id.as_str()]);
+            if let Some(call_id) = calls.remove(&s.id) {
+                s.lineage.spawned_by_tool_use = Some(call_id);
+            } else if let Some(spawner) = sender_parent.filter(|sp| *sp != parent_id && *sp != s.id) {
+                let mut calls = spawn_calls_in_session(app_data_dir, spawner, None, &[s.id.as_str()]);
+                if let Some(call_id) = calls.remove(&s.id) {
+                    s.lineage.spawned_by_tool_use = Some(call_id);
+                }
+            }
+        }
+    }
 }
 
 fn unwrap_user_request(text: &str) -> &str {
@@ -4338,5 +4954,167 @@ mod tests {
         let parsed = parse_str("44444444-4444-4444-8444-444444444444", &line, None).unwrap();
         assert_eq!(parsed.title.as_deref(), Some("Fix chunked zip ingest"));
         assert_eq!(parsed.messages[0].extra["antigravity"]["source"], "USER_IMPLICIT");
+    }
+
+    #[test]
+    fn swarm_turn_boundary_park_mid_turn_wake_and_jsonl_sharded_spawns() {
+        let world = crate::test_world("agy-swarm-park-and-shards");
+        let app = world.base.join("antigravity-cli");
+        let coord_id = PARENT_ID;
+        let shard1 = "22222222-2222-4222-8222-222222222221";
+        let shard2 = "22222222-2222-4222-8222-222222222222";
+        let helper = "33333333-3333-4333-8333-333333333333";
+
+        let write_log = |id: &str, rows: &[Value]| -> PathBuf {
+            let dir = app.join("brain").join(id).join(".system_generated/logs");
+            fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("transcript_full.jsonl");
+            let text: String = rows.iter().map(|r| format!("{r}\n")).collect();
+            fs::write(&path, text).unwrap();
+            path
+        };
+
+        let swarm_dir = app.join("brain").join(coord_id).join(".system_generated/swarm");
+        fs::create_dir_all(&swarm_dir).unwrap();
+        fs::write(
+            swarm_dir.join("members.json"),
+            json!({
+                "members": {
+                    "coordinator": {"conversation_id": coord_id, "role": "coordinator"},
+                    "worker-1": {"conversation_id": shard1, "role": "worker", "wake_mode": "mentions", "phase": "RUNNING", "killed": false},
+                    "worker-2": {"conversation_id": shard2, "role": "worker", "wake_mode": "mentions", "phase": "RUNNING", "killed": false},
+                    "helper": {"conversation_id": helper, "role": "worker", "added_by": "worker-1", "wake_mode": "mentions", "phase": "RUNNING", "killed": false}
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let coord_path = write_log(
+            coord_id,
+            &[
+                json!({"step_index":0,"type":"USER_INPUT","status":"DONE","created_at":"2026-11-15T03:00:00Z","content":"run sharded swarm"}),
+                json!({"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-15T03:00:01Z","tool_calls":[
+                    {"name":"swarm","args":{"action":"add","name":"worker","n":2,"brief":"do shard"}}
+                ]}),
+                json!({"step_index":2,"type":"GENERIC","status":"DONE","created_at":"2026-11-15T03:00:01Z","content":json!({
+                    "status":"added",
+                    "conversation_ids":[shard1, shard2]
+                }).to_string()}),
+            ],
+        );
+
+        // `shard1`: added `helper` and completed `GENERIC`, with NO subsequent `PLANNER_RESPONSE` yet => mid-turn (`running`)!
+        let shard1_path = write_log(
+            shard1,
+            &[
+                json!({"step_index":0,"type":"SYSTEM_MESSAGE","status":"DONE","created_at":"2026-11-15T03:00:01Z","content":format!("<SYSTEM_MESSAGE>\n[Message] sender={coord_id} content=do shard 1\n</SYSTEM_MESSAGE>")}),
+                json!({"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-15T03:00:02Z","tool_calls":[
+                    {"name":"swarm","args":{"action":"add","name":"helper","brief":"help shard 1"}}
+                ]}),
+                json!({"step_index":2,"type":"GENERIC","status":"DONE","created_at":"2026-11-15T03:00:02Z","content":json!({
+                    "status":"added","name":"helper","conversation_id":helper
+                }).to_string()}),
+            ],
+        );
+
+        // `shard2`: parked on `swarm_wait`, then woken by a trailing board message => mid-turn (`running`), then after removing wake => `"waiting"`.
+        let shard2_woken = [
+            json!({"step_index":0,"type":"SYSTEM_MESSAGE","status":"DONE","created_at":"2026-11-15T03:00:01Z","content":format!("<SYSTEM_MESSAGE>\n[Message] sender={coord_id} content=do shard 2\n</SYSTEM_MESSAGE>")}),
+            json!({"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-15T03:00:02Z","tool_calls":[
+                {"name":"post_message","args":{"text":"shard 2 interim"}},
+                {"name":"swarm_wait","args":{"since":1}}
+            ]}),
+            json!({"step_index":2,"type":"GENERIC","status":"DONE","created_at":"2026-11-15T03:00:02Z","content":"{\"status\":\"posted\",\"seq\":2}"}),
+            json!({"step_index":3,"type":"GENERIC","status":"DONE","created_at":"2026-11-15T03:00:02Z","content":"Waiting for a message..."}),
+            json!({"step_index":4,"type":"SYSTEM_MESSAGE","status":"DONE","created_at":"2026-11-15T03:00:03Z","content":format!("<SYSTEM_MESSAGE>\n[Message] sender={coord_id} content=[swarm] new board message #3\n</SYSTEM_MESSAGE>")}),
+        ];
+        let shard2_path = write_log(shard2, &shard2_woken);
+
+        // `helper`: ended at 0-tool `PLANNER_RESPONSE` => parked (`"waiting"`), unless coordinator `swarm status` says `"stopped"`.
+        let _helper_path = write_log(
+            helper,
+            &[
+                json!({"step_index":0,"type":"SYSTEM_MESSAGE","status":"DONE","created_at":"2026-11-15T03:00:02Z","content":format!("<SYSTEM_MESSAGE>\n[Message] sender={shard1} content=help shard 1\n</SYSTEM_MESSAGE>")}),
+                json!({"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-15T03:00:03Z","content":"helper finished"}),
+            ],
+        );
+
+        let adapter = Antigravity::with_home(&world.base);
+        let coord_ref = SessionRef::new(coord_id, Harness::Antigravity, &coord_path);
+        let forest = adapter
+            .forest(&coord_ref, crate::SubagentDemand::Rich, None, &|_, _| true)
+            .unwrap();
+        assert_eq!(forest.len(), 3);
+        let find_ref = |id: &str| forest.iter().find(|a| a.session.id == id).unwrap();
+        assert_eq!(find_ref(shard1).tool_use_id.as_deref(), Some("cv:antigravity:1.0"));
+        assert_eq!(find_ref(shard2).tool_use_id.as_deref(), Some("cv:antigravity:1.0"));
+        assert_eq!(find_ref(helper).tool_use_id, None);
+
+        let helper_sess = adapter.parse(&find_ref(helper).session).unwrap();
+        assert_eq!(helper_sess.lineage.parent.as_deref(), Some(coord_id));
+        assert_eq!(
+            helper_sess.lineage.agent_path.as_deref(),
+            Some("/coordinator/worker-1/helper")
+        );
+        assert_eq!(
+            helper_sess.lineage.spawned_by_tool_use.as_deref(),
+            Some("cv:antigravity:1.0")
+        );
+        assert_eq!(helper_sess.extra["antigravity"]["added_by_id"], shard1);
+
+        assert_eq!(
+            adapter.subagent_end(&shard1_path).unwrap().unwrap().stopped(),
+            Some(false)
+        );
+        assert_eq!(
+            adapter.subagent_end(&shard2_path).unwrap().unwrap().stopped(),
+            Some(false)
+        );
+
+        let lanes = crate::lanes::lanes_of(&coord_ref).unwrap();
+        let status = |id: &str| {
+            lanes
+                .iter()
+                .find(|l| l.session_id == id)
+                .unwrap()
+                .status
+                .as_str()
+                .to_owned()
+        };
+        assert_eq!(status(shard1), "running");
+        assert_eq!(status(shard2), "running");
+        assert_eq!(status(helper), "waiting");
+
+        // Park shard2 by dropping the trailing wake, and add a newer `swarm status` reporting `helper` as `"stopped"`.
+        write_log(shard2, &shard2_woken[..4]);
+        write_log(
+            coord_id,
+            &[
+                json!({"step_index":0,"type":"USER_INPUT","status":"DONE","created_at":"2026-11-15T03:00:00Z","content":"run sharded swarm"}),
+                json!({"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-15T03:00:01Z","tool_calls":[
+                    {"name":"swarm","args":{"action":"add","name":"worker","n":2,"brief":"do shard"}}
+                ]}),
+                json!({"step_index":2,"type":"GENERIC","status":"DONE","created_at":"2026-11-15T03:00:01Z","content":json!({
+                    "status":"added","conversation_ids":[shard1, shard2]
+                }).to_string()}),
+                json!({"step_index":3,"type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-15T03:00:05Z","tool_calls":[
+                    {"name":"swarm","args":{"action":"status"}}
+                ]}),
+                json!({"step_index":4,"type":"GENERIC","status":"DONE","created_at":"2026-11-15T03:00:05Z","content":json!({
+                    "members":[
+                        {"name":"worker-1","state":"working","killed":false},
+                        {"name":"worker-2","state":"waiting","killed":false},
+                        {"name":"helper","state":"stopped","killed":false}
+                    ]
+                }).to_string()}),
+            ],
+        );
+        let lanes2 = crate::lanes::lanes_of(&coord_ref).unwrap();
+        let lane2 = |id: &str| lanes2.iter().find(|l| l.session_id == id).unwrap();
+        assert_eq!(lane2(shard1).status.as_str(), "running");
+        assert_eq!(lane2(shard2).status.as_str(), "waiting");
+        assert_eq!(lane2(shard2).last_text.as_deref(), Some("shard 2 interim"));
+        assert_eq!(lane2(helper).status, crate::lanes::LaneStatus::Stopped);
     }
 }

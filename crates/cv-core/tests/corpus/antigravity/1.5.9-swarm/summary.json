@@ -39,7 +39,9 @@
         "total_errors": 0
       },
       "lineage": {
-        "parent": "994dea8c-3496-40b6-8999-3fa265ea5b99"
+        "parent": "994dea8c-3496-40b6-8999-3fa265ea5b99",
+        "spawned_by_tool_use": "05406928-3e03-4370-b7e0-ad4f3868b5b2",
+        "agent_path": "/coordinator/alpha"
       },
       "model": null,
       "skipped_lines": 0
@@ -109,7 +111,9 @@
         "total_errors": 0
       },
       "lineage": {
-        "parent": "994dea8c-3496-40b6-8999-3fa265ea5b99"
+        "parent": "994dea8c-3496-40b6-8999-3fa265ea5b99",
+        "spawned_by_tool_use": "102acb36-2075-4570-9a5d-7a8e99ef5e2b",
+        "agent_path": "/coordinator/beta"
       },
       "model": null,
       "skipped_lines": 0
@@ -153,7 +157,9 @@
         "total_errors": 0
       },
       "lineage": {
-        "parent": "994dea8c-3496-40b6-8999-3fa265ea5b99"
+        "parent": "994dea8c-3496-40b6-8999-3fa265ea5b99",
+        "spawned_by_tool_use": "2bc1758b-4766-4303-a3b6-1073c102082b",
+        "agent_path": "/coordinator/beta/gamma"
       },
       "model": null,
       "skipped_lines": 0

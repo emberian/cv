@@ -1025,13 +1025,21 @@ pub enum StopScope {
 }
 
 /// Where a sub-agent transcript ends: the timestamp of its last conversational record (`user` or
-/// `assistant`) and of its last `SubagentStop` hook attachment.
+/// `assistant`) and of its last `SubagentStop` hook attachment (or turn-boundary park).
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct SubagentEnd {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_turn_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stopped_at: Option<DateTime<Utc>>,
+    /// When parked (`stopped() == Some(true)`), the harness's own parked state word when distinct
+    /// from `"stopped"` (e.g. `"waiting"` for a swarm member asleep on the board).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parked_status: Option<String>,
+    /// True when the child's own step log is mid-turn (or has an unanswered wake message), even
+    /// within the same 1-second timestamp tick as an earlier park.
+    #[serde(skip)]
+    pub active: bool,
     /// The last API-error notice (`isApiErrorMessage`) with no real turn after it — what killed
     /// the agent, if anything did. A resume clears it (the next real record is a new turn).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1065,6 +1073,9 @@ impl SubagentEnd {
     /// Parked (a `SubagentStop` fired after the last turn)? `None` when the transcript has no
     /// stop record at all.
     pub fn stopped(&self) -> Option<bool> {
+        if self.active {
+            return Some(false);
+        }
         let stop = self.stopped_at?;
         Some(self.last_turn_at.is_none_or(|t| stop >= t))
     }
@@ -1487,6 +1498,7 @@ struct Pass {
 fn pass(r: &SessionRef) -> Result<Pass> {
     let adapter = crate::harness::for_harness(r.harness).context("unsupported lane harness")?;
     let mut p = Pass::default();
+    let mut last_board_post: Option<String> = None;
     let mut seen = HashSet::new();
     let mut open_tools: HashSet<String> = HashSet::new();
     // Only response identity is needed beyond the ordinary IR. Keep source-backed arguments
@@ -1561,6 +1573,15 @@ fn pass(r: &SessionRef) -> Result<Pass> {
                     if let Block::ToolUse { name, input, .. } = b {
                         p.tool_calls += 1;
                         p.last_tool = Some(tool_summary_for(Some(r.harness), name, input)?);
+                        if name == "post_message" {
+                            if let Some(posted) = input
+                                .with_view(|view| view.get("text")?.map(crate::json::JsonView::string).transpose())?
+                                .flatten()
+                                .filter(|text| !text.trim().is_empty())
+                            {
+                                last_board_post = Some(posted);
+                            }
+                        }
                         // Only the lane's OWN shell commands name its endpoint. An `Agent` prompt
                         // or a `Write`n brief that carries `export CV_ENDPOINT=lane:child` is the
                         // CHILD's export; scanning the whole input joined the parent to it.
@@ -1575,6 +1596,9 @@ fn pass(r: &SessionRef) -> Result<Pass> {
     )?;
     if p.model.is_none() {
         p.model = session.model.clone();
+    }
+    if p.last_text.is_none() {
+        p.last_text = last_board_post;
     }
     p.open_tool_calls = open_tools.len();
     Ok(p)
@@ -1847,17 +1871,37 @@ fn status_of(
     // A notification that post-dates the last turn describes the current stop; an older one
     // describes a stop the agent has since been resumed from.
     if let Some(n) = notice {
+        let notice_running = matches!(n.status.as_str(), "working" | "running");
         let current = match (n.ts, end.last_turn_at) {
-            (Some(nt), Some(lt)) => nt >= lt,
-            (Some(_), None) => true,
+            (Some(nt), Some(lt)) => {
+                if (notice_running && end.stopped() == Some(true))
+                    || (!notice_running
+                        && end.stopped() == Some(false)
+                        && !matches!(n.status.as_str(), "killed" | "failed"))
+                {
+                    nt > lt
+                } else {
+                    nt >= lt
+                }
+            }
+            (Some(_), None) => !(notice_running && end.stopped() == Some(true)),
             (None, _) => end.stopped() == Some(true),
         };
         if current {
-            return (LaneStatus::Recorded(n.status.clone()), StatusSource::TaskNotification);
+            let status = match n.status.as_str() {
+                "working" | "running" => LaneStatus::Running,
+                "stopped" => LaneStatus::Stopped,
+                _ => LaneStatus::Recorded(n.status.clone()),
+            };
+            return (status, StatusSource::TaskNotification);
         }
     }
     if end.stopped() == Some(true) {
-        return (LaneStatus::Stopped, StatusSource::SubagentStop);
+        let status = match end.parked_status.as_deref() {
+            Some(word) if !word.is_empty() => LaneStatus::Recorded(word.to_string()),
+            _ => LaneStatus::Stopped,
+        };
+        return (status, StatusSource::SubagentStop);
     }
     if let Some(sf) = state_facts.filter(|sf| sf.process_exited) {
         let current = match (sf.process_exit_at, end.last_turn_at) {
@@ -2599,7 +2643,7 @@ mod tests {
         let stopped = SubagentEnd {
             stopped_at: DateTime::from_timestamp(10, 0),
             last_turn_at: DateTime::from_timestamp(5, 0),
-            api_error: None,
+            ..SubagentEnd::default()
         };
         assert_eq!(failure_cause("failed", &stopped), Some("stopped"));
         let usage = ApiErrorNotice {
@@ -2633,8 +2677,7 @@ mod tests {
         let now = DateTime::from_timestamp(105, 0).unwrap();
         let running = SubagentEnd {
             last_turn_at: DateTime::from_timestamp(100, 0),
-            stopped_at: None,
-            api_error: None,
+            ..SubagentEnd::default()
         };
         assert_eq!(
             status_of(&sub, &running, None, None, None, false, now),

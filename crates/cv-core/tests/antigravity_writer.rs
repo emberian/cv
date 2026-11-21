@@ -597,6 +597,32 @@ fn swarm_members_board_deliveries_and_lineage_are_read() {
     };
     assert_eq!(state(&gamma).as_deref(), Some("killed"));
     assert_eq!(state(&alpha), None);
+
+    let lanes = cv_core::lanes::lanes_of(reference).unwrap();
+    assert_eq!(lanes.len(), 3);
+    let lane_of = |id: &str| lanes.iter().find(|l| l.session_id == id).unwrap();
+    for (id, want_status, want_text) in [
+        (&alpha, "waiting", "alpha final reply"),
+        (&beta, "waiting", "beta integrated gamma"),
+        (&gamma, "killed", "gamma final reply"),
+    ] {
+        let lane = lane_of(id);
+        assert_eq!(lane.status.as_str(), want_status, "{id}");
+        assert!(!lane.is_running() && !lane.is_done() && !lane.stranded, "{lane:?}");
+        assert_eq!(lane.last_text.as_deref(), Some(want_text), "{id}");
+    }
+    let overview = cv_core::overview::read(reference, &cv_core::overview::OverviewOptions::default()).unwrap();
+    assert_eq!(overview.workers.len(), 3);
+    for (id, want_status, want_text) in [
+        (&alpha, "waiting", "alpha final reply"),
+        (&beta, "waiting", "beta integrated gamma"),
+        (&gamma, "killed", "gamma final reply"),
+    ] {
+        let worker = overview.workers.iter().find(|w| &w.session_id == id).unwrap();
+        assert_eq!(worker.status.as_str(), want_status, "{id}");
+        assert_eq!(worker.last_text.as_deref(), Some(want_text), "{id}");
+    }
+
     let described = session.extra["antigravity"]["subagents"].as_object().unwrap();
     assert!(!described.contains_key(&coordinator));
     for (name, id) in [("alpha", &alpha), ("beta", &beta), ("gamma", &gamma)] {
@@ -648,14 +674,46 @@ fn swarm_members_board_deliveries_and_lineage_are_read() {
     for exported in [true, false] {
         let root = store(&world, "1.5.9-swarm", exported);
         let read = sessions(&root);
+        let alpha_call = call_with(&stored(&root, &coordinator), "alpha-fixture");
+        let beta_call = call_with(&stored(&root, &coordinator), "beta-fixture");
+        let gamma_call = call_with(&stored(&root, &beta), "gamma-fixture");
         assert!(read[&coordinator].1.lineage.parent.is_none());
-        for (name, id) in [("alpha", &alpha), ("beta", &beta), ("gamma", &gamma)] {
+        for (name, id, want_path, want_call) in [
+            ("alpha", &alpha, "/coordinator/alpha", alpha_call.as_str()),
+            ("beta", &beta, "/coordinator/beta", beta_call.as_str()),
+            ("gamma", &gamma, "/coordinator/beta/gamma", gamma_call.as_str()),
+        ] {
             let (reference, session) = &read[id];
             assert_eq!(
                 session.lineage.parent.as_deref(),
                 Some(coordinator.as_str()),
                 "{name} exported={exported}"
             );
+            assert_eq!(
+                session.lineage.spawned_by_tool_use.as_deref(),
+                Some(want_call),
+                "{name} exported={exported}"
+            );
+            if exported {
+                assert_eq!(
+                    session.lineage.agent_path.as_deref(),
+                    Some(want_path),
+                    "{name} exported={exported}"
+                );
+                let child_bag = &session.extra["antigravity"];
+                assert_eq!(child_bag["member"], name);
+                assert_eq!(child_bag["wake_mode"], registry[name]["wake_mode"]);
+                assert_eq!(child_bag["phase"], registry[name]["phase"]);
+                assert_eq!(child_bag["killed"], registry[name]["killed"]);
+                assert_eq!(child_bag.get("added_by"), registry[name].get("added_by"));
+                if name == "gamma" {
+                    assert_eq!(child_bag["added_by_id"], beta.as_str());
+                } else {
+                    assert!(child_bag.get("added_by_id").is_none());
+                }
+            } else {
+                assert_eq!(session.lineage.agent_path, None);
+            }
             // The assignment is the worker's prompt; the board notice before it is not.
             let prompts: Vec<_> = session
                 .messages
@@ -725,16 +783,26 @@ fn an_idle_child_notice_is_its_return_to_the_parent() {
             rows.iter().filter(|row| row.0 == "subagent_return").count(),
             returns.len()
         );
-        let spawned = parent.extra["antigravity"]["subagents"].as_object().unwrap();
-        assert_eq!(
-            spawned[&one]["call_id"],
-            call_with(&steps, "child-one-fixture").as_str()
-        );
-        assert_eq!(
-            spawned[&two]["call_id"],
-            call_with(&steps, "child-two-fixture").as_str()
-        );
         if exported {
+            let spawned = parent.extra["antigravity"]["subagents"].as_object().unwrap();
+            let one_call = call_with(&steps, "child-one-fixture");
+            let two_call = call_with(&steps, "child-two-fixture");
+            assert_eq!(spawned[&one]["call_id"], one_call.as_str());
+            assert_eq!(spawned[&two]["call_id"], two_call.as_str());
+            assert_eq!(
+                read[&one].1.lineage.spawned_by_tool_use.as_deref(),
+                Some(one_call.as_str())
+            );
+            assert_eq!(
+                read[&two].1.lineage.spawned_by_tool_use.as_deref(),
+                Some(two_call.as_str())
+            );
+            let lanes = cv_core::lanes::lanes_of(reference).unwrap();
+            assert_eq!(lanes.len(), 2);
+            for lane in &lanes {
+                assert_eq!(lane.status.as_str(), "completed", "{lane:?}");
+                assert!(lane.is_done() && !lane.stranded, "{lane:?}");
+            }
             assert_eq!(
                 reference.title.as_deref(),
                 Some("parent-fixture: start two fixture children")
@@ -742,6 +810,15 @@ fn an_idle_child_notice_is_its_return_to_the_parent() {
             assert_eq!(
                 read[&one].0.title.as_deref(),
                 Some("child-one-fixture: reply with your result.")
+            );
+        } else {
+            assert_eq!(
+                read[&one].1.lineage.spawned_by_tool_use.as_deref(),
+                Some(call_with(&steps, "child-one-fixture").as_str())
+            );
+            assert_eq!(
+                read[&two].1.lineage.spawned_by_tool_use.as_deref(),
+                Some(call_with(&steps, "child-two-fixture").as_str())
             );
         }
     }
@@ -865,21 +942,29 @@ fn the_forest_names_the_call_that_spawned_each_child_or_none() {
     }
     assert!(linked >= 2, "the capture has two children");
 
-    // Swarm members: `spawnStepIndex` is not their spawn, so the forest names no call
-    // rather than one that matches nothing.
+    // Swarm members: direct `swarm add` children get the coordinator's call ID; helpers added
+    // by another worker (`gamma`, `added_by: "beta"`) keep `tool_use_id: None` on the coordinator's
+    // `AgentRef`.
     let root = store(&world, "1.5.9-swarm", true);
-    let (coordinator, _) = members(&root);
+    let (coordinator, registry) = members(&root);
+    let gamma = registry["gamma"]["conversation_id"].as_str().unwrap();
     let read = sessions(&root);
     let (reference, _) = &read[&coordinator];
     let calls: Vec<String> = stored_calls(&stored(&root, &coordinator))
         .into_iter()
         .map(|(id, _, _)| id)
         .collect();
+    let mut direct_linked = 0;
     for agent in cv_core::subagent_tree_of(reference).unwrap() {
-        if let Some(call) = agent.tool_use_id {
+        if agent.session.id == gamma {
+            assert_eq!(agent.tool_use_id, None, "coordinator did not issue gamma's swarm add");
+        } else {
+            let call = agent.tool_use_id.expect("coordinator swarm add names child");
             assert!(calls.contains(&call), "{call} is not a call the writer stored");
+            direct_linked += 1;
         }
     }
+    assert_eq!(direct_linked, 2);
 }
 
 #[test]
