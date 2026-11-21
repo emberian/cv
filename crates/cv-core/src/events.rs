@@ -8,7 +8,8 @@
 //! (line of code → the session whose reasoning wrote it).
 //!
 //! Tool names differ wildly across harnesses (claude `Edit`/`Read`/`Bash`, codex
-//! `shell`/`apply_patch`/`local_shell`, gemini `run_shell_command`/`write_file`/`replace`, …), so
+//! `shell`/`apply_patch`/`local_shell`, gemini `run_shell_command`/`write_file`/`replace`,
+//! antigravity `edit_file`/`replace_file_content`/`view_file`/`run_command`, pi `edit`/`write`/`read`/`bash`, …), so
 //! classification is heuristic: a file-path key in the input plus a read/write-flavored name, a
 //! command key, or a recognizable `apply_patch` body whose per-file headers are mined for targets.
 //! Unrecognized tools degrade to `kind='tool'` rather than being dropped.
@@ -2588,5 +2589,138 @@ await tools.view_image({ path: "docs/arch.png" });
 ";
         let diff_hashes = extract_diff_hunk_hashes(rebased_commit_diff);
         assert_eq!(stored[0].hunk_hashes, diff_hashes);
+    }
+
+    #[test]
+    fn antigravity_and_pi_tools_extract_events_and_hunk_fingerprints() {
+        let cwd = Path::new("/repo");
+        let m = msg(vec![
+            // Antigravity 1.0.x / 1.5.x reads & searches
+            tool_use("read_file", json!({"Path": "src/lib.rs"})),
+            tool_use("view_file", json!({"AbsolutePath": "/repo/src/view.rs"})),
+            tool_use("view_file", json!({"AbsolutePathUri": "file:///repo/src/uri.rs"})),
+            tool_use("view_file_outline", json!({"AbsolutePath": "/repo/src/outline.rs"})),
+            tool_use(
+                "view_code_item",
+                json!({"File": "/repo/src/item.rs", "NodePaths": ["Foo"]}),
+            ),
+            tool_use("grep_search", json!({"Query": "parse", "SearchPath": "crates"})),
+            tool_use("find_by_name", json!({"Pattern": "*.rs", "SearchDirectory": "src"})),
+            tool_use("list_dir", json!({"DirectoryPath": "docs"})),
+            tool_use("search_web", json!({"query": "rust", "domain": "docs.rs"})),
+            tool_use("read_url_content", json!({"Url": "https://docs.rs"})),
+            // Antigravity 1.0.x / 1.5.x edits
+            tool_use(
+                "write_file",
+                json!({"Path": "src/a.rs", "Content": "pub fn agy_write() {}\n"}),
+            ),
+            tool_use(
+                "write_to_file",
+                json!({"TargetFile": "src/b.rs", "CodeContent": "pub fn agy_write_to() {}\n"}),
+            ),
+            tool_use(
+                "edit_file",
+                json!({"Path": "src/c.rs", "Target": "old()", "Replacement": "agy_edit_file();"}),
+            ),
+            tool_use(
+                "replace_file_content",
+                json!({
+                    "TargetFile": "src/d.rs",
+                    "TargetContent": "old()",
+                    "ReplacementContent": "agy_replace_content();"
+                }),
+            ),
+            tool_use(
+                "multi_replace_file_content",
+                json!({
+                    "TargetFile": "src/e.rs",
+                    "ReplacementChunks": [
+                        {"TargetContent": "x", "ReplacementContent": "agy_multi_chunk_one();"},
+                        {"TargetContent": "y", "ReplacementContent": "agy_multi_chunk_two();"}
+                    ]
+                }),
+            ),
+            // Antigravity commands & background controls
+            tool_use("run_command", json!({"CommandLine": "cargo test", "Cwd": "/repo"})),
+            tool_use("manage_task", json!({"Action": "status", "TaskId": "s/task-1"})),
+            tool_use("command_status", json!({"CommandId": "cmd-1"})),
+            tool_use("send_command_input", json!({"CommandId": "cmd-1", "Terminate": true})),
+            // Pi v3 tools
+            tool_use("bash", json!({"command": "cargo check", "timeout": 10})),
+            tool_use("read", json!({"path": "src/pi_read.rs", "offset": 1, "limit": 20})),
+            tool_use(
+                "write",
+                json!({"path": "src/pi_write.rs", "content": "pub fn pi_written() {}\n"}),
+            ),
+            tool_use(
+                "edit",
+                json!({"path": "src/pi_edit1.rs", "oldText": "a", "newText": "pi_single_edit_line();"}),
+            ),
+            tool_use(
+                "edit",
+                json!({
+                    "path": "src/pi_edit2.rs",
+                    "edits": [{"oldText": "b", "newText": "pi_multi_edit_line();"}]
+                }),
+            ),
+            tool_use("grep", json!({"pattern": "fn main", "path": "src"})),
+            tool_use("find", json!({"pattern": "*.rs", "path": "crates"})),
+            tool_use("ls", json!({"path": "tests"})),
+        ]);
+
+        let ev = extract(&m, 0, Some(cwd), &crate::lazy::Resolver::new(None)).unwrap();
+        let summary: Vec<(&str, Option<&str>, Option<&str>, bool)> = ev
+            .iter()
+            .map(|e| {
+                (
+                    e.kind,
+                    e.tool.as_deref(),
+                    e.target.as_deref(),
+                    !e.hunk_hashes.is_empty(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("file_read", Some("read_file"), Some("/repo/src/lib.rs"), false),
+                ("file_read", Some("view_file"), Some("/repo/src/view.rs"), false),
+                ("file_read", Some("view_file"), Some("/repo/src/uri.rs"), false),
+                (
+                    "file_read",
+                    Some("view_file_outline"),
+                    Some("/repo/src/outline.rs"),
+                    false
+                ),
+                ("file_read", Some("view_code_item"), Some("/repo/src/item.rs"), false),
+                ("file_read", Some("grep_search"), Some("/repo/crates"), false),
+                ("file_read", Some("find_by_name"), Some("/repo/src"), false),
+                ("file_read", Some("list_dir"), Some("/repo/docs"), false),
+                ("tool", Some("search_web"), None, false),
+                ("tool", Some("read_url_content"), None, false),
+                ("file_edit", Some("write_file"), Some("/repo/src/a.rs"), true),
+                ("file_edit", Some("write_to_file"), Some("/repo/src/b.rs"), true),
+                ("file_edit", Some("edit_file"), Some("/repo/src/c.rs"), true),
+                ("file_edit", Some("replace_file_content"), Some("/repo/src/d.rs"), true),
+                (
+                    "file_edit",
+                    Some("multi_replace_file_content"),
+                    Some("/repo/src/e.rs"),
+                    true
+                ),
+                ("command", Some("run_command"), Some("cargo test"), false),
+                ("tool", Some("manage_task"), None, false),
+                ("tool", Some("command_status"), None, false),
+                ("tool", Some("send_command_input"), None, false),
+                ("command", Some("bash"), Some("cargo check"), false),
+                ("file_read", Some("read"), Some("/repo/src/pi_read.rs"), false),
+                ("file_edit", Some("write"), Some("/repo/src/pi_write.rs"), true),
+                ("file_edit", Some("edit"), Some("/repo/src/pi_edit1.rs"), true),
+                ("file_edit", Some("edit"), Some("/repo/src/pi_edit2.rs"), true),
+                ("file_read", Some("grep"), Some("/repo/src"), false),
+                ("file_read", Some("find"), Some("/repo/crates"), false),
+                ("file_read", Some("ls"), Some("/repo/tests"), false),
+            ]
+        );
     }
 }

@@ -449,3 +449,305 @@ fn the_harness_is_pi() {
     let adapter = Pi::with_roots(vec![PathBuf::from("/nonexistent")]);
     assert_eq!(adapter.harness(), Harness::Pi);
 }
+
+#[test]
+fn pi_v3_tools_classify_extract_events_hunk_fingerprints_and_compact_labels() {
+    use cv_core::tools::classify::{
+        compact_label, extract_diff_hunk_hashes, hash_normalized_line, is_large_payload_tool,
+        visit_tool_ops_with_hunks, ClassifyOpts, ToolOp,
+    };
+
+    let world = World::in_process("pi-synth-tools-events", Env::enter_isolated);
+    let cwd = world.base.join("repo");
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    let big_pad = "x".repeat(70_000);
+    let lines = [
+        json!({
+            "type": "session",
+            "version": 3,
+            "id": "pi-tools-v3",
+            "timestamp": "2026-11-19T11:00:00.000Z",
+            "cwd": cwd,
+        })
+        .to_string(),
+        json!({
+            "type": "message",
+            "id": "u1",
+            "parentId": "pi-tools-v3",
+            "timestamp": "2026-11-19T11:00:01.000Z",
+            "message": {
+                "role": "user",
+                "content": [{"type": "text", "text": "inspect, edit, and test the crate"}]
+            }
+        })
+        .to_string(),
+        json!({
+            "type": "message",
+            "id": "a1",
+            "parentId": "u1",
+            "timestamp": "2026-11-19T11:00:02.000Z",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "toolCall",
+                        "id": "c-ls",
+                        "name": "ls",
+                        "arguments": {"path": "src"}
+                    },
+                    {
+                        "type": "toolCall",
+                        "id": "c-find",
+                        "name": "find",
+                        "arguments": {"pattern": "*.rs", "path": "src"}
+                    },
+                    {
+                        "type": "toolCall",
+                        "id": "c-grep",
+                        "name": "grep",
+                        "arguments": {"pattern": "fn parse_header", "path": "src"}
+                    },
+                    {
+                        "type": "toolCall",
+                        "id": "c-read",
+                        "name": "read",
+                        "arguments": {"path": "src/lib.rs", "offset": 1, "limit": 80}
+                    },
+                    {
+                        "type": "toolCall",
+                        "id": "c-write",
+                        "name": "write",
+                        "arguments": {
+                            "path": "src/generated.rs",
+                            "content": "pub fn generated_seed() -> u64 {\n    0xdead_beef\n}\n",
+                            "pad": big_pad,
+                        }
+                    },
+                    {
+                        "type": "toolCall",
+                        "id": "c-edit-single",
+                        "name": "edit",
+                        "arguments": {
+                            "path": "src/lib.rs",
+                            "oldText": "let limit = 16;",
+                            "newText": "let limit = compute_pi_limit(input);\nassert!(limit > 0);",
+                            "pad": big_pad,
+                        }
+                    },
+                    {
+                        "type": "toolCall",
+                        "id": "c-edit-multi",
+                        "name": "edit",
+                        "arguments": {
+                            "path": "src/parser.rs",
+                            "edits": [
+                                {
+                                    "oldText": "fn alpha() {}",
+                                    "newText": "pub fn alpha_v3() -> bool {\n    true\n}"
+                                },
+                                {
+                                    "oldText": "fn beta() {}",
+                                    "newText": "pub fn beta_v3() -> usize {\n    42\n}"
+                                }
+                            ]
+                        }
+                    },
+                    {
+                        "type": "toolCall",
+                        "id": "c-bash",
+                        "name": "bash",
+                        "arguments": {"command": "cargo test --lib", "timeout": 30}
+                    }
+                ]
+            }
+        })
+        .to_string(),
+        json!({
+            "type": "message",
+            "id": "r-err",
+            "parentId": "a1",
+            "timestamp": "2026-11-19T11:00:03.000Z",
+            "message": {
+                "role": "toolResult",
+                "toolCallId": "c-bash",
+                "toolName": "bash",
+                "isError": true,
+                "content": [{"type": "text", "text": "test parser::alpha failed"}]
+            }
+        })
+        .to_string(),
+    ];
+    let line_refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+    let (dir, path) = session(&world, "pi-tools-v3", &line_refs);
+
+    assert!(is_large_payload_tool(Some(Harness::Pi), "write"));
+    assert!(is_large_payload_tool(Some(Harness::Pi), "edit"));
+
+    let adapter = Pi::with_roots(vec![dir]);
+    let refs = adapter.discover().expect("discover").refs;
+    let r = refs.iter().find(|r| r.path == path).expect("session ref");
+
+    // Stream with spans so >64 KiB write/edit arguments exercise lazy Json::Source views.
+    let mut spanned = Collect::default();
+    let s = adapter
+        .stream(r, &Demand::LEAN.with_spans(), &mut spanned)
+        .expect("stream with spans");
+    let asst = spanned
+        .0
+        .iter()
+        .find(|m| m.id.as_deref() == Some("a1"))
+        .expect("assistant message");
+
+    let mut labels = Vec::new();
+    let mut classified = Vec::new();
+    for block in &asst.content {
+        if let Block::ToolUse { name, input, .. } = block {
+            if matches!(name.as_str(), "write" | "edit") && input.resolve().unwrap().get("pad").is_some() {
+                assert!(
+                    matches!(input, cv_core::Json::Source(_)),
+                    "{name} >64 KiB must stay lazy"
+                );
+            }
+            let label = input
+                .with_view(|v| compact_label(Some(Harness::Pi), name, v, 80))
+                .unwrap();
+            labels.push(label);
+            input
+                .with_view(|v| {
+                    visit_tool_ops_with_hunks(Some(Harness::Pi), name, v, ClassifyOpts::FULL, |sem, hunks| {
+                        classified.push((sem.into_owned(), hunks));
+                    })
+                })
+                .unwrap();
+        }
+    }
+
+    assert_eq!(
+        labels,
+        vec![
+            "ls · src",
+            "find · *.rs",
+            "grep · fn parse_header",
+            "read · src/lib.rs",
+            "write · src/generated.rs",
+            "edit · src/lib.rs",
+            "edit · src/parser.rs",
+            "bash · cargo test --lib",
+        ]
+    );
+
+    assert_eq!(classified.len(), 8);
+    assert_eq!(
+        classified[0].0.op,
+        ToolOp::Search {
+            path: Some("src".into()),
+            query: None
+        }
+    );
+    assert_eq!(
+        classified[1].0.op,
+        ToolOp::Search {
+            path: Some("src".into()),
+            query: Some("*.rs".into())
+        }
+    );
+    assert_eq!(
+        classified[2].0.op,
+        ToolOp::Search {
+            path: Some("src".into()),
+            query: Some("fn parse_header".into())
+        }
+    );
+    assert_eq!(
+        classified[3].0.op,
+        ToolOp::FileRead {
+            path: "src/lib.rs".into()
+        }
+    );
+    assert_eq!(
+        classified[4].0.op,
+        ToolOp::FileEdit {
+            path: "src/generated.rs".into(),
+            is_full_write: true
+        }
+    );
+    assert_eq!(
+        classified[5].0.op,
+        ToolOp::FileEdit {
+            path: "src/lib.rs".into(),
+            is_full_write: false
+        }
+    );
+    assert_eq!(
+        classified[6].0.op,
+        ToolOp::FileEdit {
+            path: "src/parser.rs".into(),
+            is_full_write: false
+        }
+    );
+    assert_eq!(
+        classified[7].0.op,
+        ToolOp::Command {
+            cmd: Some("cargo test --lib".into()),
+            workdir: None,
+            background: false
+        }
+    );
+
+    // Verify hunk fingerprints for write, single-hunk edit (oldText/newText), and multi-hunk edit (edits[]).
+    let single_rebased_diff = "\
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -12,1 +44,2 @@
+-    let limit = 16;
++        let limit = compute_pi_limit(input);
++        assert!(limit > 0);
+";
+    assert_eq!(
+        classified[5].1,
+        extract_diff_hunk_hashes(single_rebased_diff),
+        "Pi single edit newText hashes must match re-indented git diff"
+    );
+    assert!(classified[4].1.contains(&hash_normalized_line("0xdead_beef").unwrap()));
+    assert!(classified[6]
+        .1
+        .contains(&hash_normalized_line("pub fn alpha_v3() -> bool {").unwrap()));
+    assert!(classified[6]
+        .1
+        .contains(&hash_normalized_line("pub fn beta_v3() -> usize {").unwrap()));
+
+    // Verify ToolHistogram stream vs whole-session parity.
+    let hist_stream = cv_core::tools::ToolHistogram::from_stream(&adapter, r).unwrap();
+    let hist_msgs = cv_core::tools::ToolHistogram::from_messages(spanned.0.iter(), s.cwd.as_deref()).unwrap();
+    assert_eq!(
+        serde_json::to_value(&hist_stream).unwrap(),
+        serde_json::to_value(&hist_msgs).unwrap()
+    );
+    assert_eq!(hist_stream.total_calls, 8);
+    assert_eq!(hist_stream.total_errors, 1);
+    assert_eq!(hist_stream.tools["ls"].reads, 1);
+    assert_eq!(hist_stream.tools["find"].reads, 1);
+    assert_eq!(hist_stream.tools["grep"].reads, 1);
+    assert_eq!(hist_stream.tools["read"].reads, 1);
+    assert_eq!(hist_stream.tools["write"].edits, 1);
+    assert_eq!(hist_stream.tools["edit"].edits, 2);
+    assert_eq!(hist_stream.tools["bash"].commands, 1);
+    assert_eq!(hist_stream.tools["bash"].errors, 1);
+
+    // Verify end-to-end EventSink / SQLite catalog ingestion when sqlite is enabled.
+    #[cfg(feature = "sqlite")]
+    {
+        let canonical_cwd = cv_core::events::absolutize(cwd.to_str().unwrap(), None);
+        let n = cv_core::events::ingest_ref(r).unwrap();
+        assert_eq!(n, 9, "8 tool calls + 1 error result");
+        let rows = cv_core::events::events_for("pi", "pi-tools-v3", None).unwrap();
+        assert_eq!(rows.len(), 9);
+        let touched = cv_core::events::sessions_touching(&format!("{canonical_cwd}/src/lib.rs"), false).unwrap();
+        assert_eq!(touched.len(), 1);
+        assert_eq!((touched[0].reads, touched[0].edits), (1, 1));
+        let hunks = cv_core::events::edit_hunks_for("pi", "pi-tools-v3").unwrap();
+        assert_eq!(hunks.len(), 3, "write + 2 edit calls persist hunk hashes");
+        assert!(hunks.iter().all(|(_, _, hashes)| !hashes.is_empty()));
+    }
+}

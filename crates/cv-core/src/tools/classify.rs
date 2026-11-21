@@ -122,6 +122,9 @@ pub(crate) const FILE_KEYS: &[&str] = &[
     "path",
     "TargetFile",
     "Path",
+    "AbsolutePath",
+    "AbsolutePathUri",
+    "File",
 ];
 
 const SEARCH_PATH_KEYS: &[&str] = &[
@@ -136,6 +139,8 @@ const SEARCH_PATH_KEYS: &[&str] = &[
     "DirectoryPath",
     "dir_path",
     "Path",
+    "AbsolutePath",
+    "AbsolutePathUri",
 ];
 
 const HEADERS: &[&str] = &["*** Update File:", "*** Add File:", "*** Delete File:", "*** Move to:"];
@@ -249,15 +254,18 @@ pub fn is_large_payload_tool(harness: Option<Harness>, name: &str) -> bool {
         || matches!(
             bare,
             "Write"
+                | "write"
                 | "write_file"
                 | "save-file"
                 | "create_file"
                 | "write_to_file"
                 | "Edit"
+                | "edit"
                 | "MultiEdit"
                 | "NotebookEdit"
                 | "edit_file"
                 | "replace"
+                | "replace_file_content"
                 | "multi_replace_file_content"
                 | "str_replace_based_edit_tool"
                 | "str_replace_editor"
@@ -285,6 +293,18 @@ pub fn visit_tool_ops_with_hunks<'a>(
     emit: impl FnMut(ToolSemantic<'a>, Vec<u64>),
 ) -> Result<()> {
     visit_tool_ops_internal(harness, name, input, opts, true, emit)
+}
+
+fn is_swarm_add(bare: &str, input: JsonView<'_>) -> Result<bool> {
+    if bare != "swarm" {
+        return Ok(false);
+    }
+    Ok(input
+        .get("action")?
+        .map(|v| input::word(v, &["add"]))
+        .transpose()?
+        .flatten()
+        .is_some())
 }
 
 fn visit_tool_ops_internal<'a>(
@@ -320,13 +340,12 @@ fn visit_tool_ops_internal<'a>(
     let workdir = file_key(input, &["workdir", "cwd", "Cwd"])?;
 
     // 2. Orchestration tools: sub-agent spawns, peer/child messages, and background polling/stopping.
-    if is_spawn_tool(harness, bare)
-        || harness
-            .map(|h| crate::affordance::classify_tool_view(h, bare, input))
-            .transpose()?
-            .flatten()
-            .is_some_and(|(kind, _)| kind == crate::affordance::Kind::SubagentSpawn)
-    {
+    let spawn_by_affordance = match harness {
+        Some(h) => crate::affordance::classify_tool_view(h, bare, input)?
+            .is_some_and(|(kind, _)| kind == crate::affordance::Kind::SubagentSpawn),
+        None => is_swarm_add(bare, input)?,
+    };
+    if is_spawn_tool(harness, bare) || spawn_by_affordance {
         let target_hint = if opts.summaries {
             first_string_prefix(
                 input,
@@ -368,12 +387,15 @@ fn visit_tool_ops_internal<'a>(
         "SendMessage" | "send_message" | "followup_task" | "send_input" | "team_send_message" | "post_message"
     ) {
         let recipient = if opts.summaries {
-            first_string_prefix(
+            match first_string_prefix(
                 input,
                 &["to", "target", "Recipient", "recipient", "agent_id", "id"],
                 120,
-            )?
-            .map(Cow::Owned)
+            )? {
+                Some(r) => Some(Cow::Owned(r)),
+                None if bare == "post_message" => Some(Cow::Borrowed("board")),
+                None => None,
+            }
         } else {
             None
         };
@@ -455,14 +477,30 @@ fn visit_tool_ops_internal<'a>(
         }
     }
 
-    // 4. Dedicated search tools (`Grep`, `Glob`, `grep_search`, `find_by_name`, `glob`, `web_search`).
+    // 4. Dedicated search, directory, and URL inspection tools.
     if matches!(
         bare,
-        "Grep" | "Glob" | "grep_search" | "find_by_name" | "glob" | "search_web" | "web_search"
+        "Grep"
+            | "grep"
+            | "Glob"
+            | "glob"
+            | "find"
+            | "ls"
+            | "grep_search"
+            | "find_by_name"
+            | "list_dir"
+            | "search_web"
+            | "web_search"
+            | "read_url_content"
     ) {
         let path = file_key(input, SEARCH_PATH_KEYS)?.map(|p| Cow::Owned(resolve_workdir(&p, workdir.as_deref())));
         let query = if opts.summaries {
-            first_string_prefix(input, &["pattern", "query", "Query", "Pattern", "url"], 120)?.map(Cow::Owned)
+            first_string_prefix(
+                input,
+                &["pattern", "query", "Query", "Pattern", "url", "Url", "domain"],
+                120,
+            )?
+            .map(Cow::Owned)
         } else {
             None
         };
@@ -493,25 +531,22 @@ fn visit_tool_ops_internal<'a>(
             "Write" | "write_file" | "save-file" | "create_file" | "write_to_file"
         ) || lname == "write"
         {
+            let is_full_write = !(bare == "write_file" && (bool_flag(input, "Append")? || bool_flag(input, "append")?));
             let hunks = if extract_hunks {
-                extract_file_edit_hunks(input, true)?
+                extract_file_edit_hunks(input, is_full_write)?
             } else {
                 Vec::new()
             };
-            (
-                ToolOp::FileEdit {
-                    path,
-                    is_full_write: true,
-                },
-                hunks,
-            )
+            (ToolOp::FileEdit { path, is_full_write }, hunks)
         } else if matches!(
             bare,
             "Edit"
+                | "edit"
                 | "MultiEdit"
                 | "NotebookEdit"
                 | "replace"
                 | "edit_file"
+                | "replace_file_content"
                 | "multi_replace_file_content"
                 | "str_replace_based_edit_tool"
                 | "str_replace_editor"
@@ -532,6 +567,7 @@ fn visit_tool_ops_internal<'a>(
         } else if matches!(
             bare,
             "Read"
+                | "read"
                 | "NotebookRead"
                 | "read_file"
                 | "view_file"
@@ -563,14 +599,10 @@ fn visit_tool_ops_internal<'a>(
 
     // 6. Command tools (`command` / `cmd` / `script` / `CommandLine` / `action.command`).
     if let Some((command, files)) = command_rows_bounded(input, opts.commands, extract_hunks, opts.command_limit)? {
-        let background = if opts.summaries {
-            bool_flag(input, "run_in_background")?
-                || bool_flag(input, "is_background")?
-                || bool_flag(input, "background")?
-                || bool_flag(input, "IsDaemon")?
-        } else {
-            false
-        };
+        let background = bool_flag(input, "run_in_background")?
+            || bool_flag(input, "is_background")?
+            || bool_flag(input, "background")?
+            || bool_flag(input, "IsDaemon")?;
         emit(
             ToolSemantic {
                 tool: Cow::Borrowed(name),
@@ -602,7 +634,7 @@ fn visit_tool_ops_internal<'a>(
     if let Some(h) = harness {
         if let Some((kind, action)) = crate::affordance::classify_tool_view(h, name, input)? {
             let summary = if opts.summaries {
-                first_string_prefix(
+                match first_string_prefix(
                     input,
                     &[
                         "explanation",
@@ -613,10 +645,20 @@ fn visit_tool_ops_internal<'a>(
                         "title",
                         "prompt",
                         "Prompt",
+                        "question",
+                        "CronExpression",
+                        "cron",
                     ],
                     120,
-                )?
-                .unwrap_or_default()
+                )? {
+                    Some(s) => s,
+                    None => match first_question_prefix(input, 120)? {
+                        Some(q) => q,
+                        None => {
+                            first_scalar_prefix(input, &["DurationSeconds", "name", "model"], 120)?.unwrap_or_default()
+                        }
+                    },
+                }
             } else {
                 String::new()
             };
@@ -751,7 +793,28 @@ fn classify_bg_tool(harness: Option<Harness>, bare: &str, input: JsonView<'_>) -
         | "command_status"
         | "wait_agent"
         | "bg_output" => Some(BgAction::Poll),
-        "write_stdin" | "send_command_input" => Some(BgAction::Interact),
+        "write_stdin" => Some(BgAction::Interact),
+        "send_command_input" => Some(if bool_flag(input, "Terminate")? || bool_flag(input, "terminate")? {
+            BgAction::Stop
+        } else {
+            BgAction::Interact
+        }),
+        "manage_task" => {
+            let action_view = match input.get("Action")? {
+                Some(v) => Some(v),
+                None => input.get("action")?,
+            };
+            let action = match action_view
+                .map(|v| input::word(v, &["kill", "send_input", "list", "status"]))
+                .transpose()?
+                .flatten()
+            {
+                Some(0) => BgAction::Stop,
+                Some(1) => BgAction::Interact,
+                _ => BgAction::Poll,
+            };
+            Some(action)
+        }
         "TaskStop" | "KillShell" | "kill_command_or_subagent" | "interrupt_agent" | "close_agent" | "bg_kill" => {
             Some(BgAction::Stop)
         }
@@ -904,6 +967,19 @@ fn has_nonempty_string(view: JsonView<'_>, keys: &[&str]) -> Result<bool> {
     Ok(first_string_prefix(view, keys, 8)?.is_some())
 }
 
+fn first_question_prefix(view: JsonView<'_>, cap: usize) -> Result<Option<String>> {
+    let Some(questions) = view.get("questions")?.map(JsonView::array).transpose()?.flatten() else {
+        return Ok(None);
+    };
+    for q in questions {
+        let q = q?;
+        if let Some(head) = first_string_prefix(q, &["question", "Question"], cap)? {
+            return Ok(Some(head));
+        }
+    }
+    Ok(None)
+}
+
 fn fallback_summary(view: JsonView<'_>, cap: usize) -> Result<Option<String>> {
     for key in [
         "command",
@@ -916,11 +992,17 @@ fn fallback_summary(view: JsonView<'_>, cap: usize) -> Result<Option<String>> {
         "query",
         "Query",
         "description",
+        "Description",
+        "ScriptPath",
+        "Name",
         "prompt",
         "Prompt",
+        "question",
         "message",
         "Message",
+        "text",
         "url",
+        "Url",
         "skill",
         "objective",
         "explanation",
@@ -932,12 +1014,79 @@ fn fallback_summary(view: JsonView<'_>, cap: usize) -> Result<Option<String>> {
             }
         }
     }
+    if let Some(q) = first_question_prefix(view, cap)? {
+        return Ok(Some(q));
+    }
     let head = crate::projection::Head::of_json(view, cap)?;
     Ok((!head.is_empty() && head != "{}").then_some(head))
 }
 
+fn structured_compact_arg(bare: &str, input: JsonView<'_>, max: usize) -> Result<Option<Option<String>>> {
+    match bare {
+        "swarm" => {
+            let act = first_string_prefix(input, &["action"], max)?;
+            let target = first_string_prefix(input, &["name", "title", "model"], max)?;
+            Ok(Some(match (act, target) {
+                (Some(a), Some(t)) => Some(collapse_line(&format!("{a} {t}"), max)),
+                (Some(a), None) => Some(collapse_line(&a, max)),
+                (None, Some(t)) => Some(collapse_line(&t, max)),
+                (None, None) => None,
+            }))
+        }
+        "post_message" => {
+            if let Some(text) = first_string_prefix(input, &["text", "message", "Message"], max)? {
+                let line = collapse_line(&text, max);
+                if !line.is_empty() {
+                    return Ok(Some(Some(line)));
+                }
+            }
+            Ok(None)
+        }
+        "manage_task" | "manage_subagents" => {
+            let act = first_string_prefix(input, &["Action", "action"], max)?;
+            let id = first_scalar_prefix(
+                input,
+                &["TaskId", "task_id", "ConversationId", "conversation_id", "id"],
+                max,
+            )?;
+            Ok(Some(match (act, id) {
+                (Some(a), Some(i)) => Some(collapse_line(&format!("{a} {i}"), max)),
+                (Some(a), None) => Some(collapse_line(&a, max)),
+                (None, Some(i)) => Some(collapse_line(&i, max)),
+                (None, None) => None,
+            }))
+        }
+        "read_board" => {
+            if bool_flag(input, "status")? {
+                return Ok(Some(Some(truncate("status", max))));
+            }
+            if let Some(since) = first_scalar_prefix(input, &["since"], max)? {
+                return Ok(Some(Some(truncate(&format!("since {since}"), max))));
+            }
+            Ok(Some(None))
+        }
+        "swarm_wait" => {
+            if let Some(since) = first_scalar_prefix(input, &["since"], max)? {
+                return Ok(Some(Some(truncate(&format!("since {since}"), max))));
+            }
+            Ok(Some(None))
+        }
+        _ => Ok(None),
+    }
+}
+
 /// One-line human-readable summary of a tool call (`"{name} · {arg}"`, or `"{name}"` when empty).
 pub fn compact_label(harness: Option<Harness>, name: &str, input: JsonView<'_>, max: usize) -> Result<String> {
+    let bare = bare_tool_name(name);
+    let is_str = input.is_string()?;
+    if !is_str {
+        if let Some(explicit) = structured_compact_arg(bare, input, max)? {
+            return Ok(match explicit {
+                Some(arg) if !arg.is_empty() => format!("{name} · {arg}"),
+                _ => name.to_string(),
+            });
+        }
+    }
     let mut first_arg: Option<String> = None;
     let mut op_count = 0usize;
     visit_tool_ops(harness, name, input, ClassifyOpts::FULL, |sem| {
@@ -957,13 +1106,13 @@ pub fn compact_label(harness: Option<Harness>, name: &str, input: JsonView<'_>, 
             } => Some(truncate(&dir, max)),
             ToolOp::Command { .. } => None,
             ToolOp::FileEdit { path, .. } | ToolOp::FileRead { path } => Some(truncate(&path, max)),
-            ToolOp::Search { query: Some(q), .. } => Some(truncate(&q, max)),
+            ToolOp::Search { query: Some(q), .. } => Some(collapse_line(&q, max)),
             ToolOp::Search { path: Some(p), .. } => Some(truncate(&p, max)),
             ToolOp::Search { .. } => None,
             ToolOp::SubagentSpawn {
                 target_hint: Some(hint),
                 ..
-            } => Some(truncate(&hint, max)),
+            } => Some(collapse_line(&hint, max)),
             ToolOp::SubagentSpawn { .. } => None,
             ToolOp::AgentMessage {
                 recipient: Some(to), ..
@@ -971,20 +1120,20 @@ pub fn compact_label(harness: Option<Harness>, name: &str, input: JsonView<'_>, 
             ToolOp::AgentMessage { .. } => None,
             ToolOp::Background { job_id: Some(id), .. } => Some(truncate(&id, max)),
             ToolOp::Background { .. } => None,
-            ToolOp::Affordance { summary, .. } if !summary.is_empty() => Some(truncate(&summary, max)),
+            ToolOp::Affordance { summary, .. } if !summary.is_empty() => Some(collapse_line(&summary, max)),
             ToolOp::Affordance { .. } => None,
-            ToolOp::Other { summary: Some(s), .. } => Some(truncate(&s, max)),
+            ToolOp::Other { summary: Some(s), .. } => Some(collapse_line(&s, max)),
             ToolOp::Other { path: Some(p), .. } => Some(truncate(&p, max)),
             ToolOp::Other { .. } => None,
         };
     })?;
     // Preserve fast direct key lookup if an affordance/other tool had a standard descriptive field.
-    if first_arg.is_none() && !input.is_string()? {
-        first_arg = fallback_summary(input, max)?;
+    if first_arg.is_none() && !is_str {
+        first_arg = fallback_summary(input, max)?.map(|s| collapse_line(&s, max));
     }
     Ok(match first_arg {
         Some(arg) if !arg.is_empty() => {
-            if op_count > 1 && is_codex_exec(harness, bare_tool_name(name)) {
+            if op_count > 1 && is_codex_exec(harness, bare) {
                 format!("{name} · {arg} (+{})", op_count - 1)
             } else {
                 format!("{name} · {arg}")
@@ -1202,15 +1351,30 @@ pub fn patch_paths_and_hunks(patch_text: &str) -> Vec<(String, Vec<u64>)> {
 fn extract_file_edit_hunks(view: JsonView<'_>, is_full_write: bool) -> Result<Vec<u64>> {
     let mut collector = HunkCollector::default();
     let scalar_keys: &[&str] = if is_full_write {
-        &["content", "Content", "file_text", "text", "new_string", "new_str"]
+        &[
+            "content",
+            "Content",
+            "CodeContent",
+            "code_content",
+            "file_text",
+            "text",
+            "new_string",
+            "new_str",
+            "newText",
+            "new_text",
+        ]
     } else {
         &[
             "new_string",
             "new_str",
+            "newText",
+            "new_text",
             "replacement",
             "Replacement",
             "ReplacementContent",
             "replacement_content",
+            "CodeContent",
+            "code_content",
             "new_source",
             "content",
             "Content",
@@ -1229,7 +1393,18 @@ fn extract_file_edit_hunks(view: JsonView<'_>, is_full_write: bool) -> Result<Ve
     }
     if !is_full_write {
         for (arr_key, item_keys) in [
-            ("edits", &["new_string", "new_str", "replacement", "content"][..]),
+            (
+                "edits",
+                &[
+                    "new_string",
+                    "new_str",
+                    "newText",
+                    "new_text",
+                    "replacement",
+                    "Replacement",
+                    "content",
+                ][..],
+            ),
             (
                 "ReplacementChunks",
                 &["ReplacementContent", "replacement_content", "new_string"][..],
@@ -1238,7 +1413,18 @@ fn extract_file_edit_hunks(view: JsonView<'_>, is_full_write: bool) -> Result<Ve
                 "replacement_chunks",
                 &["replacement_content", "ReplacementContent", "new_string"][..],
             ),
-            ("replacements", &["new_string", "replacement", "new_str", "content"][..]),
+            (
+                "replacements",
+                &[
+                    "new_string",
+                    "new_str",
+                    "newText",
+                    "new_text",
+                    "replacement",
+                    "Replacement",
+                    "content",
+                ][..],
+            ),
         ] {
             if let Some(arr_view) = view.get(arr_key)? {
                 if let Some(items) = arr_view.array()? {
@@ -1823,11 +2009,51 @@ fn starts_with_patch_header(view: JsonView<'_>) -> Result<bool> {
     Ok(buf.lines().next().map(str::trim_end) == Some(PREFIX))
 }
 
+fn strip_file_uri(raw: &str) -> Option<String> {
+    let rest = raw.strip_prefix("file://")?;
+    let rest = rest.strip_prefix("localhost").unwrap_or(rest);
+    if rest.is_empty() {
+        return None;
+    }
+    let path_part = if rest.len() >= 3
+        && rest.as_bytes()[0] == b'/'
+        && rest.as_bytes()[1].is_ascii_alphabetic()
+        && rest.as_bytes()[2] == b':'
+    {
+        &rest[1..]
+    } else {
+        rest
+    };
+    let bytes = path_part.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(hex_str) = std::str::from_utf8(&bytes[i + 1..i + 3]) {
+                if let Ok(val) = u8::from_str_radix(hex_str, 16) {
+                    decoded.push(val);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        decoded.push(bytes[i]);
+        i += 1;
+    }
+    Some(String::from_utf8_lossy(&decoded).into_owned())
+}
+
 pub(crate) fn file_key(view: JsonView<'_>, keys: &[&str]) -> Result<Option<String>> {
     for key in keys {
         if let Some(value) = view.get(key)? {
             if let Some(path) = input::string(value)? {
-                return Ok((!path.is_empty()).then_some(path));
+                if path.is_empty() {
+                    return Ok(None);
+                }
+                if let Some(uri_path) = strip_file_uri(&path) {
+                    return Ok((!uri_path.is_empty()).then_some(uri_path));
+                }
+                return Ok(Some(path));
             }
         }
     }
@@ -3659,5 +3885,475 @@ await Promise.all([
         assert!(multi[0]
             .1
             .contains(&hash_normalized_line("const SECOND_CHUNK: usize = 2;").unwrap()));
+    }
+
+    #[test]
+    fn antigravity_1_0_and_1_5_and_pi_v3_tools_classify_hunks_and_compact_labels() {
+        // Large payload guards cover Antigravity 1.0.x/1.5.x and Pi v3 file-mutation tools.
+        for (h, tool) in [
+            (Some(Harness::Antigravity), "write_file"),
+            (Some(Harness::Antigravity), "write_to_file"),
+            (Some(Harness::Antigravity), "edit_file"),
+            (Some(Harness::Antigravity), "replace_file_content"),
+            (Some(Harness::Antigravity), "multi_replace_file_content"),
+            (Some(Harness::Pi), "write"),
+            (Some(Harness::Pi), "edit"),
+        ] {
+            assert!(is_large_payload_tool(h, tool), "{tool} must stream via JsonView");
+        }
+
+        // Antigravity file reads across 1.0.x (AbsolutePath, AbsolutePathUri, File) and 1.5.x (Path).
+        for (tool, payload, want_path) in [
+            ("read_file", json!({"Path": "/repo/src/lib.rs"}), "/repo/src/lib.rs"),
+            (
+                "view_file",
+                json!({"AbsolutePath": "/repo/src/view.rs", "StartLine": 1, "EndLine": 50}),
+                "/repo/src/view.rs",
+            ),
+            (
+                "view_file",
+                json!({"AbsolutePathUri": "file:///repo/my%20dir/uri.rs"}),
+                "/repo/my dir/uri.rs",
+            ),
+            (
+                "view_file_outline",
+                json!({"AbsolutePath": "/repo/src/outline.rs"}),
+                "/repo/src/outline.rs",
+            ),
+            (
+                "view_code_item",
+                json!({"File": "/repo/src/item.rs", "NodePaths": ["Foo.bar"]}),
+                "/repo/src/item.rs",
+            ),
+        ] {
+            assert_eq!(
+                collect_ops(Some(Harness::Antigravity), tool, &payload),
+                vec![(tool.into(), ToolOp::FileRead { path: want_path.into() })]
+            );
+        }
+
+        // Antigravity file edits + `Append` semantics + normalized hunk fingerprints.
+        let collect_edit = |h: Harness, name: &str, payload: serde_json::Value| {
+            let dir = std::env::temp_dir().join(format!("cv-classify-src-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let p = dir.join("arg.json");
+            let raw = serde_json::to_vec(&payload).unwrap();
+            std::fs::write(&p, &raw).unwrap();
+            let src = crate::Json::source(&p, 0, raw.len() as u64).unwrap();
+            let res = src
+                .with_view(|view| {
+                    let mut out = Vec::new();
+                    visit_tool_ops_with_hunks(Some(h), name, view, ClassifyOpts::FULL, |sem, hunks| {
+                        out.push((sem.into_owned().op, hunks));
+                    })?;
+                    Ok(out)
+                })
+                .unwrap();
+            std::fs::remove_dir_all(dir).unwrap();
+            res
+        };
+
+        let wf_full = collect_edit(
+            Harness::Antigravity,
+            "write_file",
+            json!({"Path": "/repo/a.rs", "Content": "pub fn full_write_alpha() {}\n"}),
+        );
+        assert_eq!(
+            wf_full[0].0,
+            ToolOp::FileEdit {
+                path: "/repo/a.rs".into(),
+                is_full_write: true
+            }
+        );
+        assert!(wf_full[0]
+            .1
+            .contains(&hash_normalized_line("pub fn full_write_alpha() {}").unwrap()));
+
+        let wf_append = collect_edit(
+            Harness::Antigravity,
+            "write_file",
+            json!({"Path": "/repo/a.rs", "Content": "pub fn appended_tail() {}\n", "Append": true}),
+        );
+        assert_eq!(
+            wf_append[0].0,
+            ToolOp::FileEdit {
+                path: "/repo/a.rs".into(),
+                is_full_write: false
+            }
+        );
+        assert!(wf_append[0]
+            .1
+            .contains(&hash_normalized_line("pub fn appended_tail() {}").unwrap()));
+
+        let wtf = collect_edit(
+            Harness::Antigravity,
+            "write_to_file",
+            json!({"TargetFile": "/repo/b.rs", "CodeContent": "pub fn legacy_write_to_file() {}\n"}),
+        );
+        assert_eq!(
+            wtf[0].0,
+            ToolOp::FileEdit {
+                path: "/repo/b.rs".into(),
+                is_full_write: true
+            }
+        );
+        assert!(wtf[0]
+            .1
+            .contains(&hash_normalized_line("pub fn legacy_write_to_file() {}").unwrap()));
+
+        let ef = collect_edit(
+            Harness::Antigravity,
+            "edit_file",
+            json!({"Path": "/repo/c.rs", "Target": "old()", "Replacement": "new_edit_file_call();"}),
+        );
+        assert_eq!(
+            ef[0].0,
+            ToolOp::FileEdit {
+                path: "/repo/c.rs".into(),
+                is_full_write: false
+            }
+        );
+        assert!(ef[0]
+            .1
+            .contains(&hash_normalized_line("new_edit_file_call();").unwrap()));
+
+        let rfc = collect_edit(
+            Harness::Antigravity,
+            "replace_file_content",
+            json!({
+                "TargetFile": "/repo/d.rs",
+                "TargetContent": "old_block()",
+                "ReplacementContent": "new_replace_file_content();"
+            }),
+        );
+        assert_eq!(
+            rfc[0].0,
+            ToolOp::FileEdit {
+                path: "/repo/d.rs".into(),
+                is_full_write: false
+            }
+        );
+        assert!(rfc[0]
+            .1
+            .contains(&hash_normalized_line("new_replace_file_content();").unwrap()));
+
+        // Pi v3 `write` and `edit` (`oldText`/`newText` + `edits[]`) hunk extraction.
+        let pi_edit_single = collect_edit(
+            Harness::Pi,
+            "edit",
+            json!({"path": "src/pi.rs", "oldText": "x = 1", "newText": "let x = compute_pi_single();"}),
+        );
+        assert_eq!(
+            pi_edit_single[0].0,
+            ToolOp::FileEdit {
+                path: "src/pi.rs".into(),
+                is_full_write: false
+            }
+        );
+        assert!(pi_edit_single[0]
+            .1
+            .contains(&hash_normalized_line("let x = compute_pi_single();").unwrap()));
+
+        let pi_edit_multi = collect_edit(
+            Harness::Pi,
+            "edit",
+            json!({
+                "path": "src/pi.rs",
+                "edits": [
+                    {"oldText": "a", "newText": "const PI_MULTI_ONE: u32 = 1;"},
+                    {"oldText": "b", "newText": "const PI_MULTI_TWO: u32 = 2;"}
+                ]
+            }),
+        );
+        assert!(pi_edit_multi[0]
+            .1
+            .contains(&hash_normalized_line("const PI_MULTI_ONE: u32 = 1;").unwrap()));
+        assert!(pi_edit_multi[0]
+            .1
+            .contains(&hash_normalized_line("const PI_MULTI_TWO: u32 = 2;").unwrap()));
+
+        // Commands & background task controls (`run_command`, `manage_task`, `command_status`, `send_command_input`).
+        let mut daemon_events = Vec::new();
+        visit_tool_ops(
+            Some(Harness::Antigravity),
+            "run_command",
+            JsonView::from(&json!({"CommandLine": "cargo watch -x check", "Cwd": "/repo", "IsDaemon": true})),
+            ClassifyOpts::EVENTS,
+            |sem| daemon_events.push(sem.into_owned().op),
+        )
+        .unwrap();
+        assert_eq!(
+            daemon_events,
+            vec![ToolOp::Command {
+                cmd: Some("cargo watch -x check".into()),
+                workdir: Some("/repo".into()),
+                background: true,
+            }]
+        );
+
+        for (tool, payload, want_id, want_action) in [
+            ("manage_task", json!({"Action": "list"}), None, BgAction::Poll),
+            (
+                "manage_task",
+                json!({"Action": "status", "TaskId": "s/task-2"}),
+                Some("s/task-2"),
+                BgAction::Poll,
+            ),
+            (
+                "manage_task",
+                json!({"Action": "send_input", "TaskId": "s/task-2", "Input": "y\n"}),
+                Some("s/task-2"),
+                BgAction::Interact,
+            ),
+            (
+                "manage_task",
+                json!({"Action": "kill", "TaskId": "s/task-4"}),
+                Some("s/task-4"),
+                BgAction::Stop,
+            ),
+            (
+                "command_status",
+                json!({"CommandId": "cmd-9"}),
+                Some("cmd-9"),
+                BgAction::Poll,
+            ),
+            (
+                "send_command_input",
+                json!({"CommandId": "cmd-9", "Input": "ok\n", "Terminate": false}),
+                Some("cmd-9"),
+                BgAction::Interact,
+            ),
+            (
+                "send_command_input",
+                json!({"CommandId": "cmd-9", "Terminate": true}),
+                Some("cmd-9"),
+                BgAction::Stop,
+            ),
+        ] {
+            assert_eq!(
+                collect_ops(Some(Harness::Antigravity), tool, &payload),
+                vec![(
+                    tool.into(),
+                    ToolOp::Background {
+                        job_id: want_id.map(Into::into),
+                        action: want_action,
+                    }
+                )]
+            );
+        }
+
+        // Search / web / directory across Antigravity and Pi.
+        for (h, tool, payload, want_path, want_query) in [
+            (
+                Some(Harness::Antigravity),
+                "grep_search",
+                json!({"Query": "ToolSemantic", "SearchPath": "/repo/crates"}),
+                Some("/repo/crates"),
+                Some("ToolSemantic"),
+            ),
+            (
+                Some(Harness::Antigravity),
+                "find_by_name",
+                json!({"Pattern": "*.rs", "SearchDirectory": "/repo/src"}),
+                Some("/repo/src"),
+                Some("*.rs"),
+            ),
+            (
+                Some(Harness::Antigravity),
+                "list_dir",
+                json!({"DirectoryPath": "/repo/docs"}),
+                Some("/repo/docs"),
+                None,
+            ),
+            (
+                Some(Harness::Antigravity),
+                "search_web",
+                json!({"query": "rust tantivy", "domain": "docs.rs"}),
+                None,
+                Some("rust tantivy"),
+            ),
+            (
+                Some(Harness::Antigravity),
+                "read_url_content",
+                json!({"Url": "https://docs.rs/tantivy"}),
+                None,
+                Some("https://docs.rs/tantivy"),
+            ),
+            (
+                Some(Harness::Pi),
+                "grep",
+                json!({"pattern": "fn main", "path": "src"}),
+                Some("src"),
+                Some("fn main"),
+            ),
+            (
+                Some(Harness::Pi),
+                "find",
+                json!({"pattern": "*.toml", "path": "."}),
+                Some("."),
+                Some("*.toml"),
+            ),
+            (
+                Some(Harness::Pi),
+                "ls",
+                json!({"path": "crates/cv-core"}),
+                Some("crates/cv-core"),
+                None,
+            ),
+        ] {
+            assert_eq!(
+                collect_ops(h, tool, &payload),
+                vec![(
+                    tool.into(),
+                    ToolOp::Search {
+                        path: want_path.map(Into::into),
+                        query: want_query.map(Into::into),
+                    }
+                )]
+            );
+        }
+
+        // Orchestration: post_message / send_message / ask_question / schedule / run_workflow.
+        assert_eq!(
+            collect_ops(
+                Some(Harness::Antigravity),
+                "post_message",
+                &json!({"text": "@coordinator [done] green"})
+            ),
+            vec![(
+                "post_message".into(),
+                ToolOp::AgentMessage {
+                    recipient: Some("board".into())
+                }
+            )]
+        );
+        assert_eq!(
+            collect_ops(
+                Some(Harness::Antigravity),
+                "send_message",
+                &json!({"Recipient": "worker-uuid", "Message": "proceed"})
+            ),
+            vec![(
+                "send_message".into(),
+                ToolOp::AgentMessage {
+                    recipient: Some("worker-uuid".into())
+                }
+            )]
+        );
+        assert_eq!(
+            collect_ops(
+                Some(Harness::Antigravity),
+                "ask_question",
+                &json!({"questions": [{"question": "Use zero-copy view?", "options": ["Yes", "No"]}]})
+            ),
+            vec![(
+                "ask_question".into(),
+                ToolOp::Affordance {
+                    kind: Kind::Question,
+                    action: "ask",
+                    summary: "Use zero-copy view?".into(),
+                    items: Vec::new(),
+                }
+            )]
+        );
+        assert_eq!(
+            collect_ops(
+                Some(Harness::Antigravity),
+                "run_workflow",
+                &json!({"Description": "Fan out crate checks", "ScriptPath": "/repo/wf.py"})
+            ),
+            vec![(
+                "run_workflow".into(),
+                ToolOp::Other {
+                    path: None,
+                    summary: Some("Fan out crate checks".into()),
+                }
+            )]
+        );
+
+        // Crisp `compact_label` summaries for `cv lanes` `last_tool` on both Antigravity and Pi.
+        let label = |h: Option<Harness>, name: &str, val: serde_json::Value| {
+            compact_label(h, name, JsonView::from(&val), 80).unwrap()
+        };
+        assert_eq!(
+            label(Some(Harness::Pi), "read", json!({"path": "src/lib.rs", "offset": 1})),
+            "read · src/lib.rs"
+        );
+        assert_eq!(
+            label(
+                Some(Harness::Pi),
+                "edit",
+                json!({"path": "src/lib.rs", "oldText": "a", "newText": "b"})
+            ),
+            "edit · src/lib.rs"
+        );
+        assert_eq!(
+            label(
+                Some(Harness::Pi),
+                "bash",
+                json!({"command": "cargo test -p cv-core", "timeout": 10})
+            ),
+            "bash · cargo test -p cv-core"
+        );
+        assert_eq!(
+            label(
+                Some(Harness::Antigravity),
+                "run_command",
+                json!({"CommandLine": "cargo test", "WaitMsBeforeAsync": 5000})
+            ),
+            "run_command · cargo test"
+        );
+        assert_eq!(
+            label(
+                Some(Harness::Antigravity),
+                "post_message",
+                json!({"text": "@coordinator [done] all tests pass"})
+            ),
+            "post_message · @coordinator [done] all tests pass"
+        );
+        assert_eq!(
+            label(
+                Some(Harness::Antigravity),
+                "swarm",
+                json!({"action": "add", "name": "alpha", "brief": "audit parser"})
+            ),
+            "swarm · add alpha"
+        );
+        assert_eq!(
+            label(Some(Harness::Antigravity), "swarm", json!({"action": "status"})),
+            "swarm · status"
+        );
+        assert_eq!(
+            label(
+                Some(Harness::Antigravity),
+                "swarm",
+                json!({"action": "kill", "name": "gamma"})
+            ),
+            "swarm · kill gamma"
+        );
+        assert_eq!(
+            label(
+                Some(Harness::Antigravity),
+                "manage_task",
+                json!({"Action": "kill", "TaskId": "task-4"})
+            ),
+            "manage_task · kill task-4"
+        );
+        assert_eq!(
+            label(Some(Harness::Antigravity), "read_board", json!({"since": 42})),
+            "read_board · since 42"
+        );
+        assert_eq!(
+            label(Some(Harness::Antigravity), "swarm_wait", json!({"since": 42})),
+            "swarm_wait · since 42"
+        );
+        assert_eq!(
+            label(
+                Some(Harness::Antigravity),
+                "ask_question",
+                json!({"questions": [{"question": "Proceed with merge?", "options": ["Yes", "No"]}]})
+            ),
+            "ask_question · Proceed with merge?"
+        );
     }
 }

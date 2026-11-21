@@ -461,7 +461,15 @@ pub fn classify_tool_view(h: Harness, name: &str, input: JsonView<'_>) -> Result
         | "get_command_or_subagent_output"
         | "WaitFor"
         | "CheckBackgroundJob"
+        | "command_status"
         | "write_stdin" => (BackgroundJob, "read"),
+        "send_command_input" => {
+            if flag(input, "Terminate")? || flag(input, "terminate")? {
+                (BackgroundJob, "stop")
+            } else {
+                (BackgroundJob, "update")
+            }
+        }
         "KillShell" | "TaskStop" | "kill_command_or_subagent" => (BackgroundJob, "stop"),
         // sub-agents
         n if spawn_returns(h, n).is_some() => (SubagentSpawn, "spawn"),
@@ -1008,6 +1016,7 @@ fn call_summary(kind: Kind, view: JsonView<'_>, items: &[Item]) -> Result<String
         "CommandLine",
         "cron",
         "CronExpression",
+        "DurationSeconds",
         "schedule",
         "skill",
         "task_name",
@@ -1023,6 +1032,8 @@ fn call_summary(kind: Kind, view: JsonView<'_>, items: &[Item]) -> Result<String
         "session_id",
         "id",
         "taskId",
+        "TaskId",
+        "CommandId",
     ] {
         if let Some(value) = view
             .get(key)?
@@ -1063,6 +1074,14 @@ fn call_summary(kind: Kind, view: JsonView<'_>, items: &[Item]) -> Result<String
             .flatten()
         {
             parts.push(status);
+        }
+        if parts.is_empty() && kind == Kind::BackgroundJob {
+            for key in ["Action", "action"] {
+                if let Some(act) = view.get(key)?.map(|v| input::prefix(v, 120)).transpose()?.flatten() {
+                    parts.push(act);
+                    break;
+                }
+            }
         }
     }
     let mut text = crate::projection::Head::bounded(120);
@@ -2257,6 +2276,109 @@ mod tests {
         assert_eq!(
             classify_tool(Harness::Claude, "TaskList", &none),
             Some((Kind::Plan, "read"))
+        );
+        assert_eq!(
+            classify_tool(Harness::Antigravity, "run_command", &json!({"CommandLine": "sleep 2"})),
+            None
+        );
+        assert_eq!(
+            classify_tool(
+                Harness::Antigravity,
+                "run_command",
+                &json!({"CommandLine": "cargo watch", "IsDaemon": true})
+            ),
+            Some((Kind::BackgroundJob, "start"))
+        );
+        assert_eq!(
+            classify_tool(Harness::Antigravity, "command_status", &json!({"CommandId": "cmd-1"})),
+            Some((Kind::BackgroundJob, "read"))
+        );
+        assert_eq!(
+            classify_tool(
+                Harness::Antigravity,
+                "send_command_input",
+                &json!({"CommandId": "cmd-1", "Input": "y\n", "Terminate": false})
+            ),
+            Some((Kind::BackgroundJob, "update"))
+        );
+        assert_eq!(
+            classify_tool(
+                Harness::Antigravity,
+                "send_command_input",
+                &json!({"CommandId": "cmd-1", "Terminate": true})
+            ),
+            Some((Kind::BackgroundJob, "stop"))
+        );
+        assert_eq!(
+            classify_tool(
+                Harness::Antigravity,
+                "run_workflow",
+                &json!({"Description": "check crates", "ScriptPath": "/w/wf.py"})
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn antigravity_1_0_and_1_5_tool_summaries_and_affordances() {
+        let mut s = Session::new("agy-aff", Harness::Antigravity);
+        let mut m = Message::new(Role::Assistant);
+        m.content = vec![
+            Block::ToolUse {
+                id: "q1".into(),
+                name: "ask_question".into(),
+                namespace: None,
+                input: json!({
+                    "questions": [
+                        {"question": "Which output format?", "options": ["(Recommended) JSON", "TOML"]}
+                    ]
+                })
+                .into(),
+            },
+            Block::ToolUse {
+                id: "sc1".into(),
+                name: "schedule".into(),
+                namespace: None,
+                input: json!({"DurationSeconds": 60, "Prompt": "Poll watcher"}).into(),
+            },
+            Block::ToolUse {
+                id: "mt1".into(),
+                name: "manage_task".into(),
+                namespace: None,
+                input: json!({"Action": "list"}).into(),
+            },
+            Block::ToolUse {
+                id: "mt2".into(),
+                name: "manage_task".into(),
+                namespace: None,
+                input: json!({"Action": "kill", "TaskId": "agy-aff/task-4"}).into(),
+            },
+            Block::ToolUse {
+                id: "cs1".into(),
+                name: "command_status".into(),
+                namespace: None,
+                input: json!({"CommandId": "cmd-42"}).into(),
+            },
+            Block::ToolUse {
+                id: "sci1".into(),
+                name: "send_command_input".into(),
+                namespace: None,
+                input: json!({"CommandId": "cmd-42", "Terminate": true}).into(),
+            },
+        ];
+        s.messages.push(m);
+        let rows = of_session(&s).unwrap();
+        let got: Vec<(Kind, &str, &str)> = rows.iter().map(|r| (r.kind, r.action, r.summary.as_str())).collect();
+        assert_eq!(
+            got,
+            vec![
+                (Kind::Question, "ask", "Which output format?"),
+                (Kind::Schedule, "create", "Poll watcher · 60"),
+                (Kind::BackgroundJob, "read", "list"),
+                (Kind::BackgroundJob, "stop", "agy-aff/task-4"),
+                (Kind::BackgroundJob, "read", "cmd-42"),
+                (Kind::BackgroundJob, "stop", "cmd-42"),
+            ]
         );
     }
 
