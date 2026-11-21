@@ -69,6 +69,21 @@ pub(crate) fn resolve_source(
     spec: &str,
     harness: Option<Harness>,
 ) -> Result<(SessionRef, Box<dyn cv_core::harness::Adapter>)> {
+    resolve_source_with_note(spec, harness, true)
+}
+
+pub(crate) fn resolve_source_quiet(
+    spec: &str,
+    harness: Option<Harness>,
+) -> Result<(SessionRef, Box<dyn cv_core::harness::Adapter>)> {
+    resolve_source_with_note(spec, harness, false)
+}
+
+fn resolve_source_with_note(
+    spec: &str,
+    harness: Option<Harness>,
+    warn_shadowed: bool,
+) -> Result<(SessionRef, Box<dyn cv_core::harness::Adapter>)> {
     let p = Path::new(spec);
     if p.is_file() {
         let h = harness.unwrap_or_else(cv_core::harness::derived_host);
@@ -89,7 +104,11 @@ pub(crate) fn resolve_source(
             }
             if !p.exists() {
                 if let Some((parent_spec, agent_spec)) = id.split_once('/') {
-                    let (parent, adapter) = resolve(parent_spec, want)?;
+                    let (parent, adapter) = if warn_shadowed {
+                        resolve(parent_spec, want)?
+                    } else {
+                        crate::util::resolve_quiet(parent_spec, want)?
+                    };
                     let sub = crate::cmd::view::resolve_subagent(&parent, agent_spec)?;
                     return Ok((sub.session, adapter));
                 }
@@ -99,7 +118,12 @@ pub(crate) fn resolve_source(
         Err(e) => Err(e),
     };
     match found {
-        Ok(Some(hit)) => Ok(hit),
+        Ok(Some((r, adapter))) => {
+            if warn_shadowed {
+                crate::util::warn_if_shadowed(&r);
+            }
+            Ok((r, adapter))
+        }
         Ok(None) => usage(format!("no session (and no sub-agent) matching {id:?}")),
         Err(e) => resolve_found(Err(e), id, want),
     }

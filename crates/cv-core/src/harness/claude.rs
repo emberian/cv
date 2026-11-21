@@ -1223,11 +1223,18 @@ fn agents_in_dir(
             // Every demand reads the agent's metadata through the per-file scan cache: a Rich
             // forest (`show --tree`, `--subagents`, the sessions API, lanes) rescanned every
             // agent transcript on every call. An unopenable transcript fails the forest even on a
-            // cache hit.
-            fs::File::open(&p)?;
-            let session = match cached_metadata(&p)? {
-                Some(session) => session,
-                None => return Ok(None),
+            // cache hit, while a child genuinely unlinked after directory listing is skipped.
+            if let Err(err) = fs::File::open(&p).map_err(anyhow::Error::from) {
+                if super::vanished_at(&p, &err) {
+                    return Ok(None);
+                }
+                return Err(err);
+            }
+            let session = match cached_metadata(&p) {
+                Ok(Some(session)) => session,
+                Ok(None) => return Ok(None),
+                Err(err) if super::vanished_at(&p, &err) => return Ok(None),
+                Err(err) => return Err(err),
             };
             let meta = match demand {
                 crate::SubagentDemand::Rich => read_meta(&chain::meta(&p))?,

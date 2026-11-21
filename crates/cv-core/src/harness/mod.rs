@@ -251,6 +251,13 @@ pub(crate) fn is_not_found(error: &anyhow::Error) -> bool {
         .any(|e| e.kind() == std::io::ErrorKind::NotFound)
 }
 
+/// `error` is a `NotFound` AND `path` itself is absent (`symlink_metadata` is `NotFound`), so a
+/// child transcript unlinked mid-pass is skipped while broken symlinks, `EACCES`, and corrupt
+/// records still fail.
+pub(crate) fn vanished_at(path: &std::path::Path, error: &anyhow::Error) -> bool {
+    is_not_found(error) && std::fs::symlink_metadata(path).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+}
+
 /// Enumerate direct entries of `dir` via [`crate::io_admission::read_dir_bulk`] (`getattrlistbulk`
 /// on macOS, portable `read_dir` + `symlink_metadata` elsewhere), recording non-`NotFound`
 /// directory or per-entry errors into `skipped`.

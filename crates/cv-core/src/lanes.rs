@@ -2001,6 +2001,21 @@ fn lane_of(
     })
 }
 
+fn lane_or_vanished(
+    sub: AgentRef,
+    notices: &HashMap<String, TaskNotice>,
+    ledger: &HashMap<String, DateTime<Utc>>,
+    state_facts_map: &HashMap<String, AgentStateFacts>,
+    visited_ancestors: &HashSet<PathBuf>,
+) -> Option<Result<Lane>> {
+    let path = sub.session.path.clone();
+    match lane_of(sub, notices, ledger, state_facts_map, visited_ancestors) {
+        Ok(lane) => Some(Ok(lane)),
+        Err(err) if crate::harness::vanished_at(&path, &err) => None,
+        Err(err) => Some(Err(err)),
+    }
+}
+
 fn task_store_likely_populated() -> bool {
     let Some(home) = crate::env::Env::current().cv_home() else {
         return false;
@@ -2209,7 +2224,7 @@ fn lanes_of_inner(parent: &SessionRef, visited_ancestors: &HashSet<PathBuf>) -> 
     next_visited.insert(parent.path.clone());
 
     let mut lanes = crate::par_filter_map(subs, |s| {
-        Some(lane_of(s, &notices, &ledger, &state_facts, &next_visited))
+        lane_or_vanished(s, &notices, &ledger, &state_facts, &next_visited)
     })
     .into_iter()
     .collect::<Result<Vec<_>>>()?;
@@ -2802,5 +2817,85 @@ mod tests {
             .unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn vanished_child_is_skipped_while_broken_symlink_unreadable_and_corrupt_fail() {
+        use cv_testkit::claude;
+        let w = crate::test_world("lanes-vanished-child");
+        let ts = "2026-11-01T00:00:00Z";
+        let parent_path = w.write_session("parent-sess", &[claude::user("parent-sess", "p1", ts, "spawn")]);
+        w.write_agent(
+            "parent-sess",
+            "live",
+            &serde_json::json!({"agentType": "general-purpose", "description": "stay"}),
+            &[claude::user("parent-sess", "w1", ts, "stay")],
+        );
+        let vanished_path = w.write_agent(
+            "parent-sess",
+            "gone",
+            &serde_json::json!({"agentType": "general-purpose", "description": "vanish"}),
+            &[claude::user("parent-sess", "w2", ts, "vanish")],
+        );
+        let parent = SessionRef::new("parent-sess", crate::ir::Harness::Claude, &parent_path);
+
+        // Simulate a child disappearing after subagent_tree_of listed it, before lane_of reads it.
+        let subs = crate::subagent_tree_of(&parent).unwrap();
+        assert_eq!(subs.len(), 2);
+        std::fs::remove_file(&vanished_path).unwrap();
+        let kept: Vec<Lane> = subs
+            .into_iter()
+            .filter_map(|s| lane_or_vanished(s, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashSet::new()))
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].agent_id, "live");
+
+        // Fresh lanes_of pass after unlink also succeeds with the surviving child.
+        let after = lanes_of(&parent).unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].agent_id, "live");
+
+        let subagents_dir = vanished_path.parent().unwrap();
+
+        // Corrupt child metadata sidecar still fails the pass (not treated as vanished).
+        let corrupt = w.write_agent(
+            "parent-sess",
+            "corrupt",
+            &serde_json::json!({"agentType": "general-purpose"}),
+            &[claude::user("parent-sess", "wc", ts, "corrupt meta")],
+        );
+        let corrupt_meta = corrupt.with_extension("meta.json");
+        std::fs::write(&corrupt_meta, "{not valid json\n").unwrap();
+        assert!(lanes_of(&parent).is_err(), "corrupt child metadata must error");
+        std::fs::remove_file(&corrupt).unwrap();
+        std::fs::remove_file(&corrupt_meta).unwrap();
+
+        #[cfg(unix)]
+        {
+            // Broken symlink fails (File::open is NotFound, but symlink_metadata succeeds).
+            let broken = subagents_dir.join("agent-broken.jsonl");
+            std::os::unix::fs::symlink(subagents_dir.join("does-not-exist.jsonl"), &broken).unwrap();
+            assert!(lanes_of(&parent).is_err(), "broken symlink child must error");
+            std::fs::remove_file(&broken).unwrap();
+
+            // Unreadable child (EACCES) fails when not running as root.
+            if unsafe { libc::geteuid() } != 0 {
+                use std::os::unix::fs::PermissionsExt;
+                let unreadable = w.write_agent(
+                    "parent-sess",
+                    "denied",
+                    &serde_json::json!({"agentType": "general-purpose"}),
+                    &[claude::user("parent-sess", "w3", ts, "secret")],
+                );
+                // Warm cache first so we also prove cached hits still enforce File::open EACCES.
+                assert_eq!(lanes_of(&parent).unwrap().len(), 2);
+                std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+                let res = lanes_of(&parent);
+                std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o644)).unwrap();
+                std::fs::remove_file(&unreadable).unwrap();
+                assert!(res.is_err(), "EACCES child must error even after cache warm");
+            }
+        }
     }
 }

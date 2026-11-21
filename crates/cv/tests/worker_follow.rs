@@ -180,3 +180,67 @@ fn lanes_follow_stops_on_sigint() {
         std::thread::sleep(Duration::from_millis(20));
     }
 }
+
+#[test]
+fn lanes_follow_survives_vanished_child_mid_poll() {
+    let w = running_world();
+    let ephemeral = w.write_agent(
+        SESSION,
+        "worker-ephemeral",
+        &json!({"agentType":"general-purpose", "description":"ephemeral"}),
+        &[
+            claude::user(SESSION, "e1", TS, "ephemeral"),
+            claude::assistant(
+                "e2",
+                TS,
+                "test",
+                json!([claude::tool_use("ecall", "Bash", json!({"command":"sleep 1"}))]),
+            ),
+        ],
+    );
+    let (mut child, rx) = follow(
+        &w,
+        &["lanes", SESSION, "--running", "--follow", "--for", "4s", "--json"],
+    );
+    let mut initial_ids = [
+        row(&rx)["agent_id"].as_str().unwrap().to_owned(),
+        row(&rx)["agent_id"].as_str().unwrap().to_owned(),
+    ];
+    initial_ids.sort();
+    assert_eq!(initial_ids, [AGENT, "worker-ephemeral"]);
+
+    // Unlink one child mid-follow while the other completes.
+    std::fs::remove_file(&ephemeral).unwrap();
+    let _ = std::fs::remove_file(ephemeral.with_extension("meta.json"));
+
+    let agent = w
+        .proj
+        .join(SESSION)
+        .join("subagents")
+        .join(format!("agent-{AGENT}.jsonl"));
+    append(
+        &agent,
+        &[
+            claude::tool_result("w3", "2026-11-01T00:01:00Z", "call1", "built"),
+            claude::assistant(
+                "w4",
+                "2026-11-01T00:01:01Z",
+                "test",
+                json!([{"type":"text","text":"Survived unlink."}]),
+            ),
+        ],
+    );
+    append(
+        &w.transcript(SESSION),
+        &[claude::notification("2026-11-01T00:01:02Z", AGENT, "completed")],
+    );
+
+    let mut changed = row(&rx);
+    if changed["status"] != "completed" {
+        changed = row(&rx);
+    }
+    assert_eq!(changed["agent_id"], AGENT);
+    assert_eq!(changed["status"], "completed");
+    assert_eq!(changed["last_text"], "Survived unlink.");
+    wait_success(&mut child);
+}

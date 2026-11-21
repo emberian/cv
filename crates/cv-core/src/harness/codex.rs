@@ -190,6 +190,21 @@ impl Adapter for Codex {
         })
     }
 
+    fn resume_caveat(&self, r: &SessionRef) -> Option<String> {
+        let is_archived = |p: &Path| {
+            p.parent()
+                .and_then(|dir| dir.file_name())
+                .is_some_and(|name| name == "archived_sessions")
+        };
+        if is_archived(&r.path) || r.path.canonicalize().ok().as_deref().is_some_and(is_archived) {
+            return Some(format!(
+                "rollout is archived at {}; some codex versions only resume active sessions under sessions/ unless unarchived",
+                r.path.display()
+            ));
+        }
+        None
+    }
+
     fn lifecycle_body_required(&self) -> bool {
         true
     }

@@ -616,7 +616,10 @@ fn resolve_show_target(
         Err(e) => Err(e),
     };
     match found {
-        Ok(Some((r, adapter))) => Ok((r, adapter, None)),
+        Ok(Some((r, adapter))) => {
+            crate::util::warn_if_shadowed(&r);
+            Ok((r, adapter, None))
+        }
         Ok(None) => usage(format!("no session (and no sub-agent) matching {id:?}")),
         Err(e) => resolve_found(Err(e), id, want).map(|(r, a)| (r, a, None)),
     }

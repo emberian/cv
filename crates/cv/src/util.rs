@@ -179,8 +179,61 @@ pub(crate) fn split_harness_id(spec: &str, fallback: Option<Harness>) -> (Option
 /// constrained by `--harness`. An unknown id is a [`UsageError`] (exit 2); an ambiguous prefix lists
 /// every candidate as a `harness:full-id` line and exits 2 too, so the caller can paste one back.
 pub(crate) fn resolve(spec: &str, harness: Option<Harness>) -> Result<(SessionRef, Box<dyn Adapter>)> {
+    let (r, adapter) = resolve_quiet(spec, harness)?;
+    warn_if_shadowed(&r);
+    Ok((r, adapter))
+}
+
+/// [`resolve`] without emitting the stderr shadowed-copy note (used by HTTP polling handlers).
+pub(crate) fn resolve_quiet(spec: &str, harness: Option<Harness>) -> Result<(SessionRef, Box<dyn Adapter>)> {
     let (want, id) = split_harness_id(spec, harness);
     resolve_found(cv_core::find(id, want), id, want)
+}
+
+/// Count distinct live transcript paths across roots that share `(r.harness, &r.id)` besides
+/// `r.path`. Returns `0` in the normal single-copy case.
+pub(crate) fn shadowed_copy_count(r: &SessionRef) -> usize {
+    let mut candidates = cv_core::catalog::lookup(&r.id, Some(r.harness));
+    if candidates.is_empty() && cv_core::env::frozen() {
+        candidates = cv_core::sessions_for(Some(r.harness));
+    }
+    if candidates.len() <= 1 {
+        return 0;
+    }
+    let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let selected = canon(&r.path);
+    let mut others = std::collections::BTreeSet::new();
+    for cand in candidates {
+        if cand.id == r.id && cand.path != r.path && cand.path.exists() {
+            let c = canon(&cand.path);
+            if c != selected {
+                others.insert(c);
+            }
+        }
+    }
+    others.len()
+}
+
+/// Concise caveat when `(r.harness, &r.id)` has older live copies shadowed in other roots.
+pub(crate) fn shadowed_copy_caveat(r: &SessionRef) -> Option<String> {
+    let shadowed = shadowed_copy_count(r);
+    if shadowed == 0 {
+        return None;
+    }
+    let noun = if shadowed == 1 { "copy" } else { "copies" };
+    Some(format!(
+        "{}:{} has {shadowed} shadowed {noun} in another root; selected newest {} (pass {}:<path> to select another)",
+        r.harness,
+        r.id,
+        r.path.display(),
+        r.harness,
+    ))
+}
+
+pub(crate) fn warn_if_shadowed(r: &SessionRef) {
+    if let Some(msg) = shadowed_copy_caveat(r) {
+        eprintln!("✦ note: {msg}");
+    }
 }
 
 /// Map a `find`/`find_cheap` outcome to the CLI contract: `None` → unknown (exit 2), the core's

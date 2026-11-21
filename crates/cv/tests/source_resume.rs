@@ -69,6 +69,18 @@ fn exact_source_resume_reads_codex_native_id_and_home() {
             home.canonicalize().unwrap().to_str().unwrap()
         );
         assert_eq!(plan["cwd"], w.base.to_str().unwrap());
+        let (plain, _) = w.cv_ok(&["resume", "--harness", "codex", path.to_str().unwrap()]);
+        if dir == "archived_sessions" {
+            let warning = plan["warning"].as_str().expect("archived rollout warning");
+            assert!(
+                warning.contains("archived") && warning.contains(path.to_str().unwrap()),
+                "{warning}"
+            );
+            assert!(plain.starts_with("# rollout is archived at "), "{plain}");
+        } else {
+            assert!(plan["warning"].is_null(), "{plan}");
+            assert!(!plain.starts_with("# "), "{plain}");
+        }
     }
 }
 
@@ -298,4 +310,64 @@ fn pi_resume_selects_custom_agent_dir_unsets_override_for_default_and_refuses_lo
     let (_, code, _, err) = w.cv(&["resume", "--harness", "pi", loose.to_str().unwrap(), "--json"]);
     assert_eq!(code, 2, "{err}");
     assert!(err.contains("cannot safely resume pi"), "{err}");
+}
+
+#[test]
+fn shadowed_duplicate_id_across_roots_warns_and_explicit_path_silences_it() {
+    let w = World::new("resume-shadowed-id");
+    w.write_session(
+        ID,
+        &[claude::with(
+            claude::user(ID, "u1", "2026-01-01T00:00:00Z", "older default copy"),
+            json!({"cwd": w.base}),
+        )],
+    );
+    let older = w.transcript(ID);
+    let extra = w.base.join("seat-profile");
+    let newer = extra.join("projects/-project").join(format!("{ID}.jsonl"));
+    fs::create_dir_all(newer.parent().unwrap()).unwrap();
+    fs::write(
+        &newer,
+        jsonl(&[claude::with(
+            claude::user(ID, "u2", "2026-02-01T00:00:00Z", "newer seat copy"),
+            json!({"cwd": w.base}),
+        )]),
+    )
+    .unwrap();
+    let env = [("CLUSTERVISION_CLAUDE_ROOTS", extra.to_str().unwrap())];
+
+    let (ok, _, out, err) = w.cv_env(&["show", ID], &env);
+    assert!(ok, "{err}");
+    assert!(out.contains("newer seat copy"), "{out}");
+    assert!(
+        err.contains("shadowed copy") && err.contains(newer.to_str().unwrap()) && err.contains("claude:<path>"),
+        "{err}"
+    );
+
+    let (ok, _, _, err) = w.cv_env(&["doctor", ID, "--json"], &env);
+    assert!(ok, "{err}");
+    assert!(
+        err.contains("shadowed copy") && err.contains(newer.to_str().unwrap()),
+        "{err}"
+    );
+
+    let (ok, _, out, err) = w.cv_env(&["resume", ID, "--json"], &env);
+    assert!(ok, "{err}");
+    let plan: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(plan["path"], newer.to_str().unwrap());
+    let warning = plan["warning"].as_str().expect("shadowed copy warning");
+    assert!(
+        warning.contains("shadowed copy") && warning.contains("claude:<path>"),
+        "{warning}"
+    );
+    assert!(err.contains("shadowed copy"), "{err}");
+
+    // Selecting either copy by explicit path is unambiguous and emits no shadowed-copy warning.
+    let explicit_old = format!("claude:{}", older.display());
+    let (ok, _, out, err) = w.cv_env(&["resume", &explicit_old, "--json"], &env);
+    assert!(ok, "{err}");
+    let plan: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(plan["path"], older.to_str().unwrap());
+    assert!(plan["warning"].is_null(), "{plan}");
+    assert!(err.is_empty(), "{err}");
 }

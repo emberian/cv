@@ -1031,7 +1031,12 @@ impl SweepPlanner<'_> {
             let Some(indexed) = state.metadata.get(id).map(|m| &m.session) else {
                 return true;
             };
-            let Some(nearest) = presence.absent_store(indexed) else {
+            let recorded_dev = state
+                .dependencies
+                .get(indexed)
+                .and_then(|record| record.baseline.primary)
+                .map(|file| file.dev);
+            let Some(nearest) = presence.absent_store_with_dev(indexed, recorded_dev) else {
                 return true;
             };
             seen.insert(id.clone());
@@ -10772,5 +10777,61 @@ mod tests {
             Some(true),
             "wiped columnar events store must trigger pass_needed"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sweep_keeps_sessions_under_unmounted_empty_mountpoint_and_reaps_same_dev_rm() {
+        let w = cv_testkit::World::in_process("sweep-unmounted-mountpoint", cv_core::env::Env::enter_isolated);
+        let dir = crate::default_tantivy_dir();
+        let projects = w.home.join(".claude/projects");
+        let mnt_same = projects.join("-mnt-same");
+        let mnt_vol = projects.join("-mnt-vol");
+        std::fs::create_dir_all(&mnt_same).unwrap();
+        std::fs::create_dir_all(&mnt_vol).unwrap();
+        let p_same = PathBuf::from(write_claude(&mnt_same, "s-same", "samevoltoken"));
+        let p_vol = PathBuf::from(write_claude(&mnt_vol, "s-vol", "unmountedvoltoken"));
+
+        let (initial, refs) = sweep_all(&dir, false, false).unwrap();
+        assert_eq!(initial.total, 2);
+        let r_vol = refs.iter().find(|r| r.id == "s-vol").unwrap().clone();
+
+        // Simulate `s-vol` having been indexed while `-mnt-vol` had another filesystem mounted.
+        let consumer = source_consumer(&dir).unwrap();
+        let mut baseline = cv_core::source::Table::<InIndex>::load(&consumer)
+            .get(&r_vol)
+            .expect("indexed dependency baseline")
+            .baseline
+            .clone();
+        let real_dev = baseline.primary.expect("primary FileId").dev;
+        assert_ne!(real_dev, 0);
+        let other_dev = if real_dev == 1 { 2 } else { 1 };
+        baseline.primary.as_mut().unwrap().dev = other_dev;
+        let encoded = cv_core::source::Record::new(baseline, InIndex).encode();
+        let conn = rusqlite::Connection::open(w.cv_home.join("catalog.db")).unwrap();
+        conn.execute(
+            "UPDATE source_dependencies SET record=?1 WHERE consumer=?2 AND id='s-vol'",
+            rusqlite::params![encoded, consumer],
+        )
+        .unwrap();
+        drop(conn);
+
+        // Both directories are now empty inside `~/.claude/projects`: `-mnt-same` is a same-dev
+        // deletion (reap), whereas `-mnt-vol` has a different st_dev than recorded (keep + warn).
+        std::fs::remove_file(&p_same).unwrap();
+        std::fs::remove_file(&p_vol).unwrap();
+
+        let (swept, after_refs) = sweep_all(&dir, false, false).unwrap();
+        assert!(after_refs.is_empty());
+        assert_eq!(swept.removed, 1, "same-device removal must reap");
+        assert_eq!(swept.absent.len(), 1, "unmounted mount-point must be retained");
+        assert_eq!(swept.absent[0].harness, cv_core::Harness::Claude);
+        assert_eq!(swept.absent[0].sessions, 1);
+        assert_eq!(swept.absent[0].nearest, mnt_vol.canonicalize().unwrap());
+
+        let reader = PreparedIndex::open(&dir).unwrap();
+        let filter = crate::SearchFilter::default();
+        assert_eq!(reader.search("samevoltoken", 10, filter, None).unwrap().total, 0);
+        assert_eq!(reader.search("unmountedvoltoken", 10, filter, None).unwrap().total, 1);
     }
 }

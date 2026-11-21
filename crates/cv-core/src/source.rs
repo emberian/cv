@@ -1275,17 +1275,25 @@ impl Presence {
     /// The nearest existing directory above `r`'s missing source when no present root of its
     /// harness holds it; `None` when the source exists or was removed from a store that is there.
     pub fn absent_store(&mut self, r: &SessionRef) -> Option<PathBuf> {
+        self.absent_store_with_dev(r, None)
+    }
+
+    /// [`Self::absent_store`] using the Unix `st_dev` (`FileId.dev`) recorded when `r`'s primary
+    /// source was indexed. When `nearest` is an empty directory whose `st_dev` differs from a
+    /// non-zero `recorded_dev`, `nearest` is an unmounted mount-point stub rather than an `rm` /
+    /// `rm -rf` on the same filesystem, so its indexed sessions are kept until the mount returns.
+    pub fn absent_store_with_dev(&mut self, r: &SessionRef, recorded_dev: Option<u64>) -> Option<PathBuf> {
         let adapter = crate::harness::for_harness(r.harness)?;
-        self.absent(&adapter.resume_source(r), Some(r.harness))
+        self.absent(&adapter.resume_source(r), Some(r.harness), recorded_dev)
     }
 
     /// [`Self::absent_store`] for a consumer that kept a session's path without its harness:
     /// judged against the roots of every harness.
     pub fn absent_path(&mut self, path: &Path) -> Option<PathBuf> {
-        self.absent(path, None)
+        self.absent(path, None, None)
     }
 
-    fn absent(&mut self, source: &Path, harness: Option<Harness>) -> Option<PathBuf> {
+    fn absent(&mut self, source: &Path, harness: Option<Harness>, recorded_dev: Option<u64>) -> Option<PathBuf> {
         // A path that cannot be examined (EACCES, EIO on a failing mount) is not evidence of a
         // removal either: it is reported as the absent store itself.
         let mut nearest = None;
@@ -1301,6 +1309,9 @@ impl Presence {
             }
         }
         let nearest = nearest?;
+        if unmounted_mountpoint(nearest, recorded_dev) {
+            return Some(nearest.canonicalize().unwrap_or_else(|_| nearest.to_owned()));
+        }
         if source.parent() == Some(nearest) {
             return None;
         }
@@ -1317,6 +1328,22 @@ impl Presence {
                 .collect()
         });
         (!roots.iter().any(|root| nearest.starts_with(root))).then_some(nearest)
+    }
+}
+
+fn unmounted_mountpoint(nearest: &Path, recorded_dev: Option<u64>) -> bool {
+    let Some(recorded_dev) = recorded_dev.filter(|&d| d != 0) else {
+        return false;
+    };
+    let Some(nearest_dev) = FileId::at(nearest).map(|id| id.dev).filter(|&d| d != 0) else {
+        return false;
+    };
+    if nearest_dev == recorded_dev {
+        return false;
+    }
+    match std::fs::read_dir(nearest) {
+        Ok(mut entries) => entries.next().is_none(),
+        Err(_) => true,
     }
 }
 
@@ -2475,6 +2502,57 @@ mod tests {
 
         std::fs::remove_dir_all(&grok_dir).unwrap();
         assert_eq!(super::ref_size(&r_grok), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn absent_store_with_dev_keeps_unmounted_empty_mountpoint_and_reaps_same_device_removal() {
+        let world = crate::test_world("presence-unmounted-dev");
+        let projects = world.home.join(".claude/projects");
+        let mnt_proj = projects.join("-mnt-work");
+        std::fs::create_dir_all(&mnt_proj).unwrap();
+        let sess = mnt_proj.join("s1.jsonl");
+        std::fs::write(&sess, "{}\n").unwrap();
+        let real_dev = FileId::at(&sess).unwrap().dev;
+        assert_ne!(real_dev, 0);
+        let other_dev = if real_dev == 1 { 2 } else { 1 };
+        let r = SessionRef::new("s1", Harness::Claude, &sess);
+
+        // Unlink the transcript so `-mnt-work` is now an empty directory inside `~/.claude/projects`.
+        std::fs::remove_file(&sess).unwrap();
+        let mut presence = Presence::default();
+        assert_eq!(
+            presence.absent_store_with_dev(&r, Some(real_dev)),
+            None,
+            "same-device rm must still reap"
+        );
+        assert_eq!(presence.absent_store_with_dev(&r, None), None);
+        assert_eq!(presence.absent_store_with_dev(&r, Some(0)), None);
+        assert_eq!(
+            presence.absent_store_with_dev(&r, Some(other_dev)),
+            Some(mnt_proj.canonicalize().unwrap()),
+            "empty mount-point directory inside root with different st_dev must be kept"
+        );
+
+        // Non-empty directory on another st_dev is an active store, not an unmounted stub.
+        let sibling = mnt_proj.join("other.jsonl");
+        std::fs::write(&sibling, "{}\n").unwrap();
+        assert_eq!(presence.absent_store_with_dev(&r, Some(other_dev)), None);
+        std::fs::remove_file(&sibling).unwrap();
+
+        // Removing `-mnt-work` (and testkit's default empty `world.proj`) leaves `~/.claude/projects` empty.
+        let _ = std::fs::remove_dir_all(&world.proj);
+        std::fs::remove_dir(&mnt_proj).unwrap();
+        assert_eq!(
+            presence.absent_store_with_dev(&r, Some(real_dev)),
+            None,
+            "same-device rm -rf of last project dir must still reap"
+        );
+        assert_eq!(
+            presence.absent_store_with_dev(&r, Some(other_dev)),
+            Some(projects.canonicalize().unwrap()),
+            "empty root mount-point directory with different st_dev must be kept"
+        );
     }
 }
 

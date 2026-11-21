@@ -228,7 +228,11 @@ pub(crate) fn cmd_resume(id: &str, harness: Option<String>, launch: bool, json: 
     let want = parse_harness(&harness)?;
     let (want, source) = crate::util::split_harness_id(id, want);
     let explicit_path = Path::new(source).is_file();
-    let (mut r, adapter) = crate::cmd::distill::resolve_source(source, want)?;
+    let (mut r, adapter) = if launch {
+        crate::cmd::distill::resolve_source_quiet(source, want)?
+    } else {
+        crate::cmd::distill::resolve_source(source, want)?
+    };
     if explicit_path {
         crate::util::require_session_file(&r, adapter.as_ref())?;
         // A path ref starts with its filename, not necessarily the native session ID or cwd.
@@ -244,7 +248,17 @@ pub(crate) fn cmd_resume(id: &str, harness: Option<String>, launch: bool, json: 
     }
     let env = resume_environment(&r, adapter.as_ref(), explicit_path)?;
     let cwd = r.cwd.clone();
-    let caveat = adapter.resume_caveat(&r);
+    let caveat = match (
+        adapter.resume_caveat(&r),
+        (!explicit_path)
+            .then(|| crate::util::shadowed_copy_caveat(&r))
+            .flatten(),
+    ) {
+        (Some(a), Some(b)) => Some(format!("{a}; {b}")),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    };
 
     if json {
         let mut plan = resume_json(r.harness, &r.id, cwd.as_deref(), caveat.as_deref());
