@@ -44,7 +44,7 @@ Shared-store paths use IDs and unaddressable duplicates are refused. No Fleet me
 deployment is claimed by this tracker.
 
 **Still open:** `cv --frozen` now retains refreshed discovery rows in memory when catalog writes are
-skipped (`d67e994d`); retiring Fleet's consumer-side dual frozen/unfrozen listing workaround remains
+skipped (`a246351c`); retiring Fleet's consumer-side dual frozen/unfrozen listing workaround remains
 separate consumer work. Ordinary search retains fleet-proportional freshness work;
 repeated-search consumer measurements remain separate from the batch snapshot and in-place refresh
 API. Overview's bounded output does not bound parent traversal or worker-forest reads.
