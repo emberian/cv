@@ -463,13 +463,21 @@ impl Adapter for Antigravity {
                 continue;
             }
             let (mut child_ref, available) = match select_session_source(&loc.app_data_dir, &desc.conversation_id) {
-                Some(child_log) => {
-                    let Some(reference) = scan_transcript(&desc.conversation_id, &child_log, Some(&loc.app_data_dir))?
-                    else {
-                        continue;
-                    };
-                    (reference, true)
-                }
+                Some(child_log) => match scan_transcript(&desc.conversation_id, &child_log, Some(&loc.app_data_dir)) {
+                    Ok(Some(reference)) => (reference, true),
+                    Ok(None) => continue,
+                    Err(err) if super::vanished_at(&child_log, &err) => {
+                        let descriptor = desc.path.clone();
+                        if !descriptor.is_file() {
+                            continue;
+                        }
+                        (
+                            SessionRef::new(&desc.conversation_id, Harness::Antigravity, descriptor),
+                            false,
+                        )
+                    }
+                    Err(err) => return Err(err),
+                },
                 None => {
                     let descriptor = desc.path.clone();
                     if !descriptor.is_file() {
@@ -1803,7 +1811,10 @@ fn open_transcript(path: &Path) -> Result<jsonl::Read> {
         );
         reads.record(&p);
     }
-    anyhow::ensure!(!chunks.is_empty(), "empty Antigravity chunk history");
+    if chunks.is_empty() {
+        fs::File::open(path)?;
+        anyhow::bail!("empty Antigravity chunk history");
+    }
     let input = jsonl::Read::with(crate::json::JsonSource::capture_with_reads(path, &reads)?)?;
     let arena = std::sync::Arc::new(super::store::bytes::ByteSource::arena()?);
     let (_, len) = arena.append(|output| {
@@ -2095,10 +2106,16 @@ fn peek_head(input: &jsonl::Read, title: &mut Option<String>, created_at: &mut O
 fn scan_transcript(id: &str, transcript: &Path, app_data_dir: Option<&Path>) -> Result<Option<SessionRef>> {
     #[cfg(feature = "sqlite")]
     if is_native_store(transcript) {
-        if !native::has_steps(transcript)? {
+        if !native::has_steps(transcript).or_else(|err| {
+            fs::File::open(transcript)?;
+            Err(err)
+        })? {
             return Ok(None);
         }
-        let metadata = native::metadata(transcript, false)?;
+        let metadata = native::metadata(transcript, false).or_else(|err| {
+            fs::File::open(transcript)?;
+            Err(err)
+        })?;
         let mut reference = SessionRef::new(id, Harness::Antigravity, transcript);
         reference.cwd = metadata.cwd;
         reference.created_at = metadata.created_at;
@@ -5258,5 +5275,162 @@ mod tests {
         assert_eq!(lane2(shard2).status.as_str(), "waiting");
         assert_eq!(lane2(shard2).last_text.as_deref(), Some("shard 2 interim"));
         assert_eq!(lane2(helper).status, crate::lanes::LaneStatus::Stopped);
+    }
+
+    #[test]
+    fn forest_and_lanes_skip_vanished_child_and_chunk_while_failing_on_corrupt_json() {
+        let world = crate::test_world("agy-vanished-child-chunk");
+        let app = world.base.join("antigravity-cli");
+        let coord_id = PARENT_ID;
+        let live_id = "44444444-4444-4444-8444-444444444441";
+        let chunk_id = "44444444-4444-4444-8444-444444444442";
+        let unavail_id = "44444444-4444-4444-8444-444444444443";
+
+        let coord_dir = app.join("brain").join(coord_id).join(".system_generated");
+        let sub_dir = coord_dir.join("subagents");
+        fs::create_dir_all(&sub_dir).unwrap();
+        fs::create_dir_all(coord_dir.join("logs")).unwrap();
+        let coord_path = coord_dir.join("logs/transcript_full.jsonl");
+        fs::write(
+            &coord_path,
+            format!(
+                "{}\n",
+                json!({"step_index":0,"type":"USER_INPUT","status":"DONE","created_at":"2026-11-15T04:00:00Z","content":"run workers"})
+            ),
+        )
+        .unwrap();
+
+        let write_desc = |id: &str, name: &str| -> PathBuf {
+            let p = sub_dir.join(format!("{id}.json"));
+            fs::write(
+                &p,
+                json!({
+                    "conversationId": id,
+                    "subagentDescriptor": {"typeName": name, "role": "worker"}
+                })
+                .to_string(),
+            )
+            .unwrap();
+            p
+        };
+        write_desc(live_id, "live");
+        let chunk_desc = write_desc(chunk_id, "chunked");
+
+        let live_logs = app.join("brain").join(live_id).join(".system_generated/logs");
+        fs::create_dir_all(&live_logs).unwrap();
+        fs::write(
+            live_logs.join("transcript_full.jsonl"),
+            format!(
+                "{}\n{}\n",
+                json!({"step_index":0,"type":"SYSTEM_MESSAGE","status":"DONE","created_at":"2026-11-15T04:00:01Z","content":"go"}),
+                json!({"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-15T04:00:02Z","content":"live ok"})
+            ),
+        )
+        .unwrap();
+
+        let chunk_dir = app
+            .join("brain")
+            .join(chunk_id)
+            .join(".system_generated/logs/chunks/transcript_full");
+        fs::create_dir_all(&chunk_dir).unwrap();
+        let chunk_file = chunk_dir.join("00000000.jsonl");
+        fs::write(
+            &chunk_file,
+            format!(
+                "{}\n{}\n",
+                json!({"step_index":0,"type":"SYSTEM_MESSAGE","status":"DONE","created_at":"2026-11-15T04:00:01Z","content":"go chunk"}),
+                json!({"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-15T04:00:02Z","content":"chunk ok"})
+            ),
+        )
+        .unwrap();
+
+        let adapter = Antigravity::with_home(&world.base);
+        let coord_ref = SessionRef::new(coord_id, Harness::Antigravity, &coord_path);
+        let initial_lanes = crate::lanes::lanes_of(&coord_ref).unwrap();
+        assert_eq!(initial_lanes.len(), 2);
+
+        // Unlinking `00000000.jsonl` while leaving `chunks/transcript_full/` empty surfaces NotFound
+        // (`vanished_at == true`), so mid-pass `lanes` skips it instead of aborting on "empty Antigravity chunk history".
+        fs::remove_file(&chunk_file).unwrap();
+        let err = open_transcript(&chunk_file).err().expect("unlinked chunk must error");
+        assert!(
+            crate::harness::vanished_at(&chunk_file, &err),
+            "unlinked chunk must satisfy vanished_at: {err:#}"
+        );
+
+        #[cfg(unix)]
+        {
+            // A broken symlink at `00000000.jsonl` fails `File::open` with NotFound, but `symlink_metadata`
+            // succeeds, so `vanished_at` is false and broken symlinks still fail.
+            std::os::unix::fs::symlink(chunk_dir.join("missing-target.jsonl"), &chunk_file).unwrap();
+            let sym_err = open_transcript(&chunk_file).err().expect("broken symlink must error");
+            assert!(
+                !crate::harness::vanished_at(&chunk_file, &sym_err),
+                "broken symlink must not be treated as vanished"
+            );
+            fs::remove_file(&chunk_file).unwrap();
+        }
+
+        // If the descriptor remains while the chunk vanished, forest falls back to unavailable;
+        // once the descriptor is also unlinked, lanes_of skips the vanished worker cleanly.
+        let with_desc_only = crate::lanes::lanes_of(&coord_ref).unwrap();
+        assert_eq!(with_desc_only.len(), 2);
+        assert_eq!(
+            with_desc_only
+                .iter()
+                .find(|l| l.session_id == chunk_id)
+                .unwrap()
+                .status
+                .as_str(),
+            "unavailable"
+        );
+        fs::remove_file(&chunk_desc).unwrap();
+        let surviving = crate::lanes::lanes_of(&coord_ref).unwrap();
+        assert_eq!(surviving.len(), 1);
+        assert_eq!(surviving[0].session_id, live_id);
+
+        // Corrupt JSON in a descriptor read by `parse` (or corrupt SQLite child store in `forest`) still fails.
+        let unavail_desc = write_desc(unavail_id, "unavail");
+        let forest = adapter
+            .forest(&coord_ref, crate::SubagentDemand::Rich, None, &|_, _| true)
+            .unwrap();
+        let unavail_ref = forest
+            .iter()
+            .find(|a| a.session.id == unavail_id)
+            .unwrap()
+            .session
+            .clone();
+        fs::write(&unavail_desc, "{corrupt json\n").unwrap();
+        let corrupt_err = adapter
+            .parse(&unavail_ref)
+            .expect_err("corrupt descriptor JSON must fail");
+        assert!(!crate::harness::vanished_at(&unavail_desc, &corrupt_err));
+        fs::remove_file(&unavail_desc).unwrap();
+
+        #[cfg(feature = "sqlite")]
+        {
+            let vanished_db = app.join("conversations/44444444-4444-4444-8444-444444444444.db");
+            let db_err = scan_transcript("44444444-4444-4444-8444-444444444444", &vanished_db, Some(&app))
+                .expect_err("missing native child store must surface NotFound");
+            assert!(
+                crate::harness::vanished_at(&vanished_db, &db_err),
+                "vanished native child store must satisfy vanished_at: {db_err:#}"
+            );
+        }
+
+        // Corrupt chunk filename in an active child log fails `lanes_of` rather than silently skipping.
+        let bad_chunk_id = "44444444-4444-4444-8444-444444444445";
+        let _bad_chunk_desc = write_desc(bad_chunk_id, "badchunk");
+        let bad_chunk_dir = app
+            .join("brain")
+            .join(bad_chunk_id)
+            .join(".system_generated/logs/chunks/transcript_full");
+        fs::create_dir_all(&bad_chunk_dir).unwrap();
+        fs::write(bad_chunk_dir.join("00000000.jsonl"), "{}\n").unwrap();
+        fs::write(bad_chunk_dir.join("corrupt.jsonl"), "{not json\n").unwrap();
+        assert!(
+            crate::lanes::lanes_of(&coord_ref).is_err(),
+            "corrupt chunk entry must fail lanes_of"
+        );
     }
 }
