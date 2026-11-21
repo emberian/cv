@@ -5,25 +5,44 @@
 # tests/formats_manifest.rs holds it to the adapter source.
 
 harness = "antigravity"
-source_files = ["harness/antigravity.rs", "harness/antigravity/native.rs", "harness/antigravity/native/meta.rs"]
-ignore_literals = []
+source_files = [
+  "harness/antigravity.rs",
+  "harness/antigravity/lifecycle.rs",
+  "harness/antigravity/merge.rs",
+  "harness/antigravity/native.rs",
+  "harness/antigravity/native/account.rs",
+  "harness/antigravity/native/context.rs",
+  "harness/antigravity/native/identity.rs",
+  "harness/antigravity/native/interaction.rs",
+  "harness/antigravity/native/media.rs",
+  "harness/antigravity/native/meta.rs",
+  "harness/antigravity/native/payload.rs",
+  "harness/antigravity/native/render.rs",
+  "harness/antigravity/native/wire.rs",
+]
+ignore_literals = ["history.jsonl", "json", "jsonl", "transcript", "transcript_full"]
 store = [
-  "$JETSKI_APP_DATA_DIR or ~/.gemini/{antigravity-cli,antigravity,antigravity-ide}/brain/<uuid>/.system_generated/logs/transcript_full.jsonl",
+  "$ANTIGRAVITY_APP_DATA_DIR, $JETSKI_APP_DATA_DIR, or ${ANTIGRAVITY_GEMINI_DIR:-~/.gemini}/{antigravity-cli,antigravity,antigravity-ide}/brain/<uuid>/.system_generated/logs/transcript_full.jsonl",
   "…/brain/<uuid>/.system_generated/logs/transcript.jsonl",
+  "…/brain/<uuid>/.system_generated/logs/chunks/{transcript_full,transcript}/<index>.jsonl",
   "…/brain/<uuid>/.system_generated/logs/overview.txt",
   "…/brain/<uuid>/.system_generated/subagents/<child-uuid>.json",
+  "…/brain/<uuid>/.system_generated/swarm/members.json",
   "…/annotations/<uuid>.pbtxt",
   "…/conversations/<uuid>.db",
   "…/conversation_summaries.db",
 ]
 
 [upstream]
-repo = "Google Antigravity (agy CLI + Antigravity 2.0 / IDE Cortex trajectory_store; corpus 1.5.6)"
-commit = "1.5.6"
-date = "2026-11-11"
+repo = "Google Antigravity (agy CLI + Antigravity 2.0 / IDE Cortex trajectory_store; corpus 1.5.6–1.5.9)"
+commit = "1.5.9"
+date = "2026-11-15"
 
 [types]
 "table.steps" = { status = "handled", note = "metadata retains native reasoning/cache-write usage after payload compaction; historical text remains in full logs" }
+"column.idx" = { status = "handled", note = "zero-based Cortex step index" }
+"column.step_payload" = { status = "handled", note = "protobuf CortexStep wire cell" }
+"column.step_format" = { status = "handled", note = "step storage format enum" }
 # Per-session & summary SQLite sidecars (opened strictly read-only via harness::store::sqlite).
 "table.conversation_summaries" = { status = "handled", note = "summary catalog (title, workspace_uris, parent_conversation_id, agent_name)" }
 "column.conversation_id" = { status = "handled", note = "primary key UUID" }
@@ -37,6 +56,27 @@ date = "2026-11-11"
 "column.last_modified_time" = { status = "handled", note = "catalog updated_at timestamp" }
 "table.gen_metadata" = { status = "handled", note = "per-step protobuf blob carrying model slug (field 1.19) and step indices (field 2)" }
 "table.trajectory_metadata_blob" = { status = "handled", note = "main trajectory protobuf carrying workspace URI (1.1), git root (1.2), git branch (1.4), created_at (2)" }
+"column.id" = { status = "handled", note = "metadata row identifier" }
+"column.data" = { status = "handled", note = "protobuf metadata wire cell" }
+"table.trajectory_meta" = { status = "ignored", note = "duplicate trajectory header bookkeeping superseded by trajectory_metadata_blob" }
+"table.executor_metadata" = { status = "ignored", note = "runtime executor scratch state" }
+"table.parent_references" = { status = "ignored", note = "parent reference index superseded by trajectory_metadata_blob and conversation_summaries" }
+"table.battle_mode_infos" = { status = "ignored", note = "arena/battle UI state, not session turns" }
+
+# Typed google.protobuf.Any tool result payloads projected in native/payload.rs.
+"payload.exa.cortex.core.tools.ReadFile" = { status = "handled", note = "scalar line/byte range facts" }
+"payload.exa.cortex.core.tools.RunCommand" = { status = "handled", note = "exit code, timeout, shell, cwd, and sandbox facts" }
+"payload.exa.cortex.core.tools.FileEdit" = { status = "handled", note = "path, diff_stats, and artifact flag" }
+"payload.exa.cortex.core.tools.ManageTask" = { status = "handled", note = "action and task_ids" }
+"payload.exa.cortex.core.tools.SendMessage" = { status = "handled", note = "recipient and recipient_name" }
+"payload.exa.cortex.core.tools.Schedule" = { status = "handled", note = "mode, outcome, iterations, and cancelled_by" }
+"payload.exa.cortex.core.tools.ManageSubagents" = { status = "handled", note = "action and conversation_ids" }
+"payload.exa.cortex.core.tools.InvokeSubagent" = { status = "handled", note = "subagents spec scalars, conversation_ids, and task_mode" }
+"payload.exa.cortex.core.tools.DefineSubagent" = { status = "handled", note = "name and description" }
+"payload.exa.cortex.core.tools.GenerateImage" = { status = "handled", note = "image paths, URI, byte size, aspect ratio, and model" }
+"payload.exa.cortex.core.tools.AskQuestion" = { status = "handled", note = "questions, selected options, write-in response, and skip flag" }
+"payload.exa.cortex.core.tools.SearchWeb" = { status = "handled", note = "query and domain" }
+"payload.gemini_coder.Step" = { status = "handled", note = "legacy wrapped step tool kind" }
 
 # Alternate history layouts and deliberately skipped non-transcript / encrypted sidecars.
 "store.chunks" = { status = "handled", note = "logs/chunks/{transcript_full,transcript}/*.jsonl are contiguous byte slices; reassembled when the corresponding monolithic log is absent" }

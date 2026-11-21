@@ -93,19 +93,74 @@ pub struct Antigravity {
 /// Rootless instance for static capability/affordance queries (`super::rootless`).
 pub(crate) static ROOTLESS: Antigravity = Antigravity { roots: Vec::new() };
 
+fn non_empty_env_path(key: &str) -> Option<PathBuf> {
+    crate::env::var_os(key).filter(|v| !v.is_empty()).map(PathBuf::from)
+}
+
+fn gemini_root_dir() -> Option<PathBuf> {
+    non_empty_env_path("ANTIGRAVITY_GEMINI_DIR").or_else(|| crate::env::home_dir().map(|h| h.join(".gemini")))
+}
+
+fn default_cli_app_dir() -> Option<PathBuf> {
+    gemini_root_dir().map(|g| g.join(APP_DATA_SUBDIRS[0]))
+}
+
+fn active_cli_app_dir() -> Option<PathBuf> {
+    non_empty_env_path("ANTIGRAVITY_APP_DATA_DIR")
+        .or_else(|| non_empty_env_path("JETSKI_APP_DATA_DIR"))
+        .or_else(default_cli_app_dir)
+}
+
+fn has_native_conversation(app_data_dir: &Path, id: &str) -> bool {
+    let conversations = app_data_dir.join("conversations");
+    ["db", "pb"]
+        .iter()
+        .any(|ext| conversations.join(format!("{id}.{ext}")).is_file())
+}
+
+fn same_app_dir(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => std::path::absolute(a).ok() == std::path::absolute(b).ok(),
+    }
+}
+
 impl Antigravity {
     pub fn detect() -> Self {
-        if let Some(explicit) = crate::env::var_os("JETSKI_APP_DATA_DIR") {
-            let dir = PathBuf::from(explicit);
+        if let Some(dir) =
+            non_empty_env_path("ANTIGRAVITY_APP_DATA_DIR").or_else(|| non_empty_env_path("JETSKI_APP_DATA_DIR"))
+        {
             return Antigravity {
                 roots: dir.exists().then_some(dir).into_iter().collect(),
             };
         }
-        let roots = crate::env::home_dir()
-            .map(|h| h.join(".gemini"))
+        let roots = gemini_root_dir()
             .map(|gemini| existing_app_dirs(&gemini))
             .unwrap_or_default();
         Antigravity { roots }
+    }
+
+    fn select_resume_app_dir(&self, r: &SessionRef) -> Option<PathBuf> {
+        let spelled = std::path::absolute(&r.path).unwrap_or_else(|_| r.path.clone());
+        if let Some(loc) = BrainLoc::from_transcript(&spelled) {
+            if loc.id == r.id && has_native_conversation(&loc.app_data_dir, &r.id) {
+                return Some(loc.app_data_dir);
+            }
+        }
+        if let Some(active) = active_cli_app_dir() {
+            if has_native_conversation(&active, &r.id) {
+                return Some(active);
+            }
+        }
+        if let Some(def) = default_cli_app_dir() {
+            if has_native_conversation(&def, &r.id) {
+                return Some(def);
+            }
+        }
+        self.roots
+            .iter()
+            .find(|root| has_native_conversation(root, &r.id))
+            .cloned()
     }
 
     /// Construct an adapter scoped strictly inside `root`:
@@ -177,21 +232,42 @@ impl Adapter for Antigravity {
         true
     }
 
-    /// `agy --conversation <id>` reads its own app data dir (`$JETSKI_APP_DATA_DIR`, else
-    /// `~/.gemini/antigravity-cli`). There is no import: a session read only from an export,
-    /// or from the desktop or IDE root, is not resumable there.
-    fn resume_caveat(&self, r: &SessionRef) -> Option<String> {
-        let cli = match crate::env::var_os("JETSKI_APP_DATA_DIR") {
-            Some(explicit) => PathBuf::from(explicit),
-            None => crate::env::home_dir()?.join(".gemini").join(APP_DATA_SUBDIRS[0]),
-        };
-        let conversations = cli.join("conversations");
-        if ["db", "pb"]
-            .iter()
-            .any(|extension| conversations.join(format!("{}.{extension}", r.id)).is_file())
+    fn resume_env(&self, r: &SessionRef) -> Option<std::result::Result<super::ResumeEnv, String>> {
+        let target = self.select_resume_app_dir(r)?;
+        let mut env = super::ResumeEnv::default();
+        if active_cli_app_dir()
+            .as_deref()
+            .is_some_and(|act| same_app_dir(act, &target))
         {
+            return Some(Ok(env));
+        }
+        if default_cli_app_dir()
+            .as_deref()
+            .is_some_and(|def| same_app_dir(def, &target))
+        {
+            for key in ["ANTIGRAVITY_APP_DATA_DIR", "JETSKI_APP_DATA_DIR"] {
+                if non_empty_env_path(key).is_some() {
+                    env.unset.push(key);
+                }
+            }
+            return Some(Ok(env));
+        }
+        let val = target.to_string_lossy().into_owned();
+        env.set.insert("ANTIGRAVITY_APP_DATA_DIR".into(), val.clone());
+        env.set.insert("JETSKI_APP_DATA_DIR".into(), val);
+        Some(Ok(env))
+    }
+
+    /// `agy --conversation <id>` reads its app data dir (`$ANTIGRAVITY_APP_DATA_DIR`,
+    /// `$JETSKI_APP_DATA_DIR`, or `${ANTIGRAVITY_GEMINI_DIR:-~/.gemini}/antigravity-cli`).
+    /// When a native `conversations/<id>.{db,pb}` exists in the active or selected app data
+    /// dir, `resume_env` addresses it directly; export-only transcripts have no import.
+    fn resume_caveat(&self, r: &SessionRef) -> Option<String> {
+        if self.select_resume_app_dir(r).is_some() {
             return None;
         }
+        let cli = active_cli_app_dir()?;
+        let conversations = cli.join("conversations");
         Some(format!(
             "agy resumes conversations stored in {}; {} is not there (read from {}) and agy has no import",
             conversations.display(),
@@ -1009,7 +1085,10 @@ pub(crate) fn is_step_record_view(view: JsonView<'_>) -> bool {
 }
 
 fn is_known_source(source: &str) -> bool {
-    matches!(source, "USER_EXPLICIT" | "MODEL" | "SYSTEM" | "SYSTEM_SDK")
+    matches!(
+        source,
+        "USER_EXPLICIT" | "USER_IMPLICIT" | "MODEL" | "SYSTEM" | "SYSTEM_SDK"
+    )
 }
 
 /// Parse an Antigravity JSONL transcript from memory without filesystem access.
@@ -1071,6 +1150,17 @@ pub fn stream_str(
                             .limitations
                             .insert(crate::coverage::ReadCoverage::INFERRED_TOOL_IDENTITY.into());
                     }
+                }
+                Ok(Flow::Continue)
+            })?;
+        }
+        for (at, end) in order.steps.values().take(HEAD_STEPS as usize) {
+            if codec.s.title.is_some() {
+                break;
+            }
+            jsonl::slice(&text.as_bytes()[*at as usize..*end as usize], |line| {
+                if let Some(view) = line.view {
+                    peek_step_head_view(view, &mut codec.s.title, &mut None)?;
                 }
                 Ok(Flow::Continue)
             })?;
@@ -1208,9 +1298,8 @@ struct BrainLoc {
 }
 
 impl BrainLoc {
-    /// Match `<appDataDir>/brain/<id>/.system_generated/logs/<filename>`.
+    /// Match `<appDataDir>/brain/<id>/.system_generated/logs/<filename>` or `<appDataDir>/conversations/<id>.db`.
     fn from_transcript(path: &Path) -> Option<Self> {
-        #[cfg(feature = "sqlite")]
         if is_native_store(path) {
             let app_data_dir = path.parent()?.parent()?.to_path_buf();
             let id = path.file_stem()?.to_str()?.to_owned();
@@ -1574,6 +1663,53 @@ pub(crate) fn forest_dependencies(r: &SessionRef, guard: &mut ReadSet) {
 /// Steps inspected for a title and a creation time.
 const HEAD_STEPS: u32 = 8;
 
+fn peek_step_head_view(
+    view: JsonView<'_>,
+    title: &mut Option<String>,
+    created_at: &mut Option<DateTime<Utc>>,
+) -> Result<Option<u64>> {
+    let Some(fields) = Fields::parse(view, &["step_index", "type", "created_at", "content", "native_content"])? else {
+        return Ok(None);
+    };
+    let idx = fields
+        .get("step_index")
+        .and_then(|v| v.as_number().ok().flatten())
+        .and_then(|n| n.as_u64());
+    if created_at.is_none() {
+        if let Some(ts_str) = fields.string("created_at")? {
+            *created_at = super::parse_ts(&ts_str);
+        }
+    }
+    if title.is_none() {
+        let ty = fields.string("type")?.unwrap_or_default();
+        if ty == "USER_INPUT" || (ty == "SYSTEM_MESSAGE" && idx.is_some_and(|i| i <= 1)) {
+            // The store keeps a typed request as items; the first is its text.
+            let raw = match fields.string("content")? {
+                Some(raw) => Some(raw),
+                None => match fields.get("native_content").map(JsonView::array).transpose()?.flatten() {
+                    Some(mut parts) => parts.next().transpose()?.map(JsonView::string).transpose()?.flatten(),
+                    None => None,
+                },
+            };
+            if let Some(raw) = raw {
+                let body = if ty == "SYSTEM_MESSAGE" {
+                    unwrap_system_message_body(&raw).unwrap_or(&raw)
+                } else {
+                    unwrap_user_request(&raw)
+                };
+                let cleaned = body.trim();
+                // A swarm worker's log opens with a board wake; its brief follows.
+                if !cleaned.is_empty() && board_wake(cleaned).is_none() {
+                    let mut head = crate::projection::Head::bounded(crate::projection::Head::TITLE);
+                    head.push(cleaned);
+                    *title = Some(head.finish());
+                }
+            }
+        }
+    }
+    Ok(idx)
+}
+
 /// A title from the first prompt (or a child's brief) and the first timestamp, each only
 /// if still unset, from at most [`HEAD_STEPS`] leading steps. Returns the first step index.
 fn peek_head(input: &jsonl::Read, title: &mut Option<String>, created_at: &mut Option<DateTime<Utc>>) -> Option<u64> {
@@ -1584,45 +1720,8 @@ fn peek_head(input: &jsonl::Read, title: &mut Option<String>, created_at: &mut O
             return Ok(Flow::Continue);
         };
         inspected += 1;
-        if let Some(fields) = Fields::parse(view, &["step_index", "type", "created_at", "content", "native_content"])? {
-            let idx = fields
-                .get("step_index")
-                .and_then(|v| v.as_number().ok().flatten())
-                .and_then(|n| n.as_u64());
-            first = first.or(idx);
-            if created_at.is_none() {
-                if let Some(ts_str) = fields.string("created_at")? {
-                    *created_at = super::parse_ts(&ts_str);
-                }
-            }
-            if title.is_none() {
-                let ty = fields.string("type")?.unwrap_or_default();
-                if ty == "USER_INPUT" || (ty == "SYSTEM_MESSAGE" && idx.is_some_and(|i| i <= 1)) {
-                    // The store keeps a typed request as items; the first is its text.
-                    let raw = match fields.string("content")? {
-                        Some(raw) => Some(raw),
-                        None => match fields.get("native_content").map(JsonView::array).transpose()?.flatten() {
-                            Some(mut parts) => parts.next().transpose()?.map(JsonView::string).transpose()?.flatten(),
-                            None => None,
-                        },
-                    };
-                    if let Some(raw) = raw {
-                        let body = if ty == "SYSTEM_MESSAGE" {
-                            unwrap_system_message_body(&raw).unwrap_or(&raw)
-                        } else {
-                            unwrap_user_request(&raw)
-                        };
-                        let cleaned = body.trim();
-                        // A swarm worker's log opens with a board wake; its brief follows.
-                        if !cleaned.is_empty() && board_wake(cleaned).is_none() {
-                            let mut head = crate::projection::Head::bounded(crate::projection::Head::TITLE);
-                            head.push(cleaned);
-                            *title = Some(head.finish());
-                        }
-                    }
-                }
-            }
-        }
+        let idx = peek_step_head_view(view, title, created_at)?;
+        first = first.or(idx);
         if (created_at.is_some() && title.is_some()) || inspected >= HEAD_STEPS {
             return Ok(Flow::Stop);
         }
@@ -3001,7 +3100,7 @@ fn hex_val(b: u8) -> Option<u8> {
     }
 }
 
-const MAX_PBTXT_BYTES: usize = 256 * 1024;
+pub(crate) const MAX_PBTXT_BYTES: usize = 256 * 1024;
 
 /// Parse `annotations/<uuid>.pbtxt` (`title: "..."` with C/textproto escapes), bounded to 256 KiB.
 fn read_pbtxt_title(path: &Path) -> Option<String> {
@@ -3019,7 +3118,51 @@ fn read_pbtxt_title(path: &Path) -> Option<String> {
     parse_pbtxt_title(&text)
 }
 
-fn parse_pbtxt_title(text: &str) -> Option<String> {
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
+pub(crate) fn enrich_ingested_session_from_app_dir(s: &mut Session, app_data_dir: &Path, has_pbtxt: bool) {
+    let mut enrich = SidecarEnrich::default();
+    let conv_db = app_data_dir.join("conversations").join(format!("{}.db", s.id));
+    if conv_db.is_file() {
+        apply_native_db_metadata(&conv_db, true, s, &mut enrich);
+    }
+    let sum_db = app_data_dir.join("conversation_summaries.db");
+    if sum_db.is_file() {
+        if let Ok(Some(sum)) = read_summary_one(&sum_db, &s.id) {
+            if !has_pbtxt {
+                if let Some(sum_title) = sum.title {
+                    s.title = Some(sum_title);
+                } else if s.title.is_none() {
+                    s.title = sum.preview;
+                }
+            }
+            if s.cwd.is_none() {
+                s.cwd = sum.cwd;
+            }
+            if s.updated_at.is_none() {
+                s.updated_at = sum.updated_at;
+            }
+            if let Some(parent) = sum.parent_id.filter(|p| !p.is_empty()) {
+                s.lineage.parent = Some(parent);
+            }
+            if let Some(agent_name) = sum.agent_name.filter(|a| !a.is_empty()) {
+                if s.lineage.parent.is_some() && s.lineage.agent_path.is_none() {
+                    s.lineage.agent_path = Some(agent_name.clone());
+                }
+                s.harness_extra_mut(Harness::Antigravity)
+                    .insert("agent_name".into(), Value::String(agent_name));
+            }
+            let bag = s.harness_extra_mut(Harness::Antigravity);
+            if let Some(source) = sum.source.filter(|x| !x.is_empty()) {
+                bag.insert("source".into(), Value::String(source));
+            }
+            if let Some(project_id) = sum.project_id.filter(|x| !x.is_empty()) {
+                bag.insert("project_id".into(), Value::String(project_id));
+            }
+        }
+    }
+}
+
+pub(crate) fn parse_pbtxt_title(text: &str) -> Option<String> {
     for line in text.lines() {
         let trimmed = line.trim();
         let Some(rest) = trimmed.strip_prefix("title:") else {
@@ -4162,5 +4305,38 @@ mod tests {
         let parsed = parse_str("33333333-3333-4333-8333-333333333333", &transcript, None).unwrap();
         assert_eq!(parsed.lineage.parent.as_deref(), Some(parent_id));
         assert_eq!(parsed.messages[0].origin, Origin::Subagent);
+        assert_eq!(
+            parsed.title.as_deref(),
+            Some("[Message] sender=11111111-1111-4111-8111-111111111111 Assigned work")
+        );
+    }
+
+    #[test]
+    fn portable_brain_loc_user_implicit_source_and_stream_str_unwrapped_title() {
+        let loc = BrainLoc::from_transcript(Path::new("/app/data/conversations/abcd-1234.db"))
+            .expect("native .db path resolves without sqlite feature");
+        assert_eq!(loc.app_data_dir, Path::new("/app/data"));
+        assert_eq!(loc.brain_dir, Path::new("/app/data/brain/abcd-1234"));
+        assert_eq!(loc.id, "abcd-1234");
+
+        let line = serde_json::json!({
+            "step_index": 0,
+            "source": "USER_IMPLICIT",
+            "type": "USER_INPUT",
+            "status": "DONE",
+            "content": "<USER_REQUEST>\nFix chunked zip ingest\n</USER_REQUEST>\n<ADDITIONAL_METADATA>ignored</ADDITIONAL_METADATA>"
+        })
+        .to_string();
+        let mut matched = false;
+        jsonl::slice(line.as_bytes(), |l| {
+            matched = l.view.is_some_and(is_step_record_view);
+            Ok(Flow::Stop)
+        })
+        .unwrap();
+        assert!(matched, "USER_IMPLICIT must be recognized as a known step source");
+
+        let parsed = parse_str("44444444-4444-4444-8444-444444444444", &line, None).unwrap();
+        assert_eq!(parsed.title.as_deref(), Some("Fix chunked zip ingest"));
+        assert_eq!(parsed.messages[0].extra["antigravity"]["source"], "USER_IMPLICIT");
     }
 }

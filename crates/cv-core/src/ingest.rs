@@ -399,7 +399,7 @@ fn antigravity_id_and_rank(name: &str) -> (String, u8) {
     let parts: Vec<&str> = name.split(['/', '\\']).filter(|s| !s.is_empty()).collect();
     let base = parts.last().copied().unwrap_or(name);
     let rank = match base {
-        "transcript_full.jsonl" => 3,
+        "transcript_full.jsonl" => 4,
         "transcript.jsonl" => 2,
         "overview.txt" => 1,
         _ => 0,
@@ -411,7 +411,74 @@ fn antigravity_id_and_rank(name: &str) -> (String, u8) {
             }
         }
     }
+    if rank > 0 {
+        if let Some(sys_pos) = parts.iter().position(|&seg| seg == ".system_generated") {
+            if sys_pos > 0 {
+                return (parts[sys_pos - 1].to_owned(), rank);
+            }
+        }
+    }
     (file_stem(name).to_owned(), rank)
+}
+
+/// Match `…/logs/chunks/{transcript_full,transcript}/<index>.jsonl` and extract
+/// `(session_id, rank, parsed_chunk_index)`.
+fn parse_antigravity_chunk_path(name: &str) -> Option<(String, u8, Result<u64, &'static str>)> {
+    let parts: Vec<&str> = name.split(['/', '\\']).filter(|s| !s.is_empty()).collect();
+    let &[.., chunks_seg, kind_seg, file_seg] = parts.as_slice() else {
+        return None;
+    };
+    if chunks_seg != "chunks" || !file_seg.to_ascii_lowercase().ends_with(".jsonl") {
+        return None;
+    }
+    let rank = match kind_seg {
+        "transcript_full" => 3,
+        "transcript" => 2,
+        _ => return None,
+    };
+    let id = parts
+        .iter()
+        .position(|&seg| seg == "brain")
+        .and_then(|pos| parts.get(pos + 1).copied())
+        .filter(|uuid| !uuid.is_empty() && *uuid != ".system_generated")
+        .or_else(|| {
+            parts
+                .iter()
+                .position(|&seg| seg == ".system_generated")
+                .and_then(|pos| pos.checked_sub(1).map(|i| parts[i]))
+        })
+        .unwrap_or("antigravity-chunks")
+        .to_owned();
+    let stem = &file_seg[..file_seg.len() - ".jsonl".len()];
+    let parsed = stem.parse::<u64>().map_err(|_| "invalid Antigravity chunk filename");
+    Some((id, rank, parsed))
+}
+
+fn parse_antigravity_pbtxt_id(name: &str) -> Option<String> {
+    let parts: Vec<&str> = name.split(['/', '\\']).filter(|s| !s.is_empty()).collect();
+    let &[.., dir_seg, file_seg] = parts.as_slice() else {
+        return None;
+    };
+    if dir_seg != "annotations" || !file_seg.to_ascii_lowercase().ends_with(".pbtxt") {
+        return None;
+    }
+    let stem = &file_seg[..file_seg.len() - ".pbtxt".len()];
+    (!stem.is_empty()).then(|| stem.to_owned())
+}
+
+fn is_antigravity_companion(name: &str) -> bool {
+    let parts: Vec<&str> = name.split(['/', '\\']).filter(|s| !s.is_empty()).collect();
+    let Some(&base) = parts.last() else {
+        return false;
+    };
+    if base.eq_ignore_ascii_case("history.jsonl") || parse_antigravity_pbtxt_id(name).is_some() {
+        return true;
+    }
+    match parts.as_slice() {
+        [.., ".system_generated", "subagents", f] => f.to_ascii_lowercase().ends_with(".json"),
+        [.., ".system_generated", "swarm", "members.json"] => true,
+        _ => false,
+    }
 }
 
 /// Ingest a set of in-memory files (e.g. the contents of an uploaded zip) into sessions.
@@ -514,11 +581,20 @@ fn ingest_files_inner_with_zst_caps(
     max_entry_zst: u64,
     max_total_zst: u64,
 ) -> anyhow::Result<(IngestReport, Option<anyhow::Error>)> {
+    struct PendingAgyChunks {
+        first_idx: usize,
+        first_raw_name: String,
+        slices: std::collections::BTreeMap<u64, Vec<u8>>,
+        err: Option<(String, anyhow::Error)>,
+    }
+
     let mut out = Vec::new();
     let mut skipped = Vec::new();
     let mut first_parse_err: Option<anyhow::Error> = None;
     let mut agy_candidates: std::collections::BTreeMap<String, (u8, usize, String, String)> =
         std::collections::BTreeMap::new();
+    let mut agy_chunks: std::collections::BTreeMap<(String, u8), PendingAgyChunks> = std::collections::BTreeMap::new();
+    let mut agy_pbtxt_titles: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
     let mut pending_unknown: Vec<PendingEntry> = Vec::new();
     let mut zst_total_decoded: u64 = 0;
 
@@ -552,6 +628,38 @@ fn ingest_files_inner_with_zst_caps(
             (raw_name.clone(), raw_bytes)
         };
         if is_sqlite_bytes(&name, &bytes) || is_sqlite_sidecar(&name) {
+            pending_unknown.push(PendingEntry { raw_name, name, bytes });
+            continue;
+        }
+        if let Some((id, rank, chunk_res)) = parse_antigravity_chunk_path(&name) {
+            let group = agy_chunks.entry((id, rank)).or_insert_with(|| PendingAgyChunks {
+                first_idx: idx,
+                first_raw_name: raw_name.clone(),
+                slices: std::collections::BTreeMap::new(),
+                err: None,
+            });
+            match chunk_res {
+                Ok(chunk_idx) => {
+                    if group.slices.insert(chunk_idx, bytes).is_some() && group.err.is_none() {
+                        group.err = Some((raw_name, anyhow::anyhow!("duplicate Antigravity chunk number")));
+                    }
+                }
+                Err(msg) => {
+                    if group.err.is_none() {
+                        group.err = Some((raw_name, anyhow::anyhow!("{msg}")));
+                    }
+                }
+            }
+            continue;
+        }
+        if let Some(pbtxt_id) = parse_antigravity_pbtxt_id(&name) {
+            if bytes.len() <= antigravity::MAX_PBTXT_BYTES {
+                if let Ok(pbtxt_str) = std::str::from_utf8(&bytes) {
+                    if let Some(title) = antigravity::parse_pbtxt_title(pbtxt_str).filter(|t| !t.trim().is_empty()) {
+                        agy_pbtxt_titles.insert(pbtxt_id, title);
+                    }
+                }
+            }
             pending_unknown.push(PendingEntry { raw_name, name, bytes });
             continue;
         }
@@ -622,6 +730,34 @@ fn ingest_files_inner_with_zst_caps(
             }
         }
     }
+    for ((id, rank), group) in agy_chunks {
+        let superseded = agy_candidates
+            .get(&id)
+            .is_some_and(|(prev_rank, _, _, _)| *prev_rank >= rank);
+        if superseded {
+            continue;
+        }
+        if let Some((bad_path, err)) = group.err {
+            record_parse_err(bad_path, err, &mut skipped, &mut first_parse_err);
+            continue;
+        }
+        let mut combined = Vec::new();
+        let mut gap_err = None;
+        for (expected, (actual, slice)) in group.slices.into_iter().enumerate() {
+            if actual != expected as u64 {
+                gap_err = Some(anyhow::anyhow!("missing Antigravity chunk {expected}"));
+                break;
+            }
+            combined.extend_from_slice(&slice);
+        }
+        if let Some(err) = gap_err {
+            record_parse_err(group.first_raw_name, err, &mut skipped, &mut first_parse_err);
+            continue;
+        }
+        let text = String::from_utf8_lossy(&combined).into_owned();
+        agy_candidates.insert(id, (rank, group.first_idx, group.first_raw_name, text));
+    }
+
     let mut agy_ordered: Vec<(usize, String, String, String)> = agy_candidates
         .into_iter()
         .map(|(id, (_rank, idx, raw_name, text))| (idx, id, raw_name, text))
@@ -635,7 +771,25 @@ fn ingest_files_inner_with_zst_caps(
     }
 
     if !pending_unknown.is_empty() {
-        ingest_pending_entries(pending_unknown, &mut out, &mut skipped, &mut first_parse_err)?;
+        ingest_pending_entries(
+            pending_unknown,
+            &agy_pbtxt_titles,
+            &mut out,
+            &mut skipped,
+            &mut first_parse_err,
+        )?;
+    }
+
+    {
+        use crate::harness::Adapter as _;
+        let agy_harness = antigravity::ROOTLESS.harness();
+        for s in &mut out {
+            if s.harness == agy_harness {
+                if let Some(title) = agy_pbtxt_titles.get(&s.id) {
+                    s.title = Some(title.clone());
+                }
+            }
+        }
     }
 
     Ok((IngestReport { sessions: out, skipped }, first_parse_err))
@@ -838,6 +992,7 @@ fn parse_cline_ui_messages_bytes(id: &str, harness: crate::ir::Harness, bytes: &
 #[cfg(target_arch = "wasm32")]
 fn ingest_pending_entries(
     pending: Vec<PendingEntry>,
+    _agy_pbtxt_titles: &std::collections::BTreeMap<String, String>,
     out: &mut Vec<Session>,
     skipped: &mut Vec<SkippedEntry>,
     _first_parse_err: &mut Option<anyhow::Error>,
@@ -908,7 +1063,7 @@ fn ingest_pending_entries(
     }
 
     for entry in other {
-        if is_sqlite_sidecar(&entry.name) {
+        if is_sqlite_sidecar(&entry.name) || is_antigravity_companion(&entry.name) {
             continue;
         }
         let reason = if is_sqlite_bytes(&entry.name, &entry.bytes) {
@@ -1078,11 +1233,14 @@ fn create_private_staging_dir(path: &std::path::Path) -> std::io::Result<()> {
 #[cfg(not(target_arch = "wasm32"))]
 fn ingest_pending_entries(
     pending: Vec<PendingEntry>,
+    agy_pbtxt_titles: &std::collections::BTreeMap<String, String>,
     out: &mut Vec<Session>,
     skipped: &mut Vec<SkippedEntry>,
     first_parse_err: &mut Option<anyhow::Error>,
 ) -> anyhow::Result<()> {
     use crate::harness::{Adapter as _, Parse as _};
+    #[cfg(not(feature = "sqlite"))]
+    let _ = agy_pbtxt_titles;
 
     let has_stageable = pending.iter().any(|entry| {
         let name = &entry.name;
@@ -1108,6 +1266,9 @@ fn ingest_pending_entries(
 
     if !has_stageable {
         for entry in pending {
+            if is_sqlite_sidecar(&entry.name) || is_antigravity_companion(&entry.name) {
+                continue;
+            }
             skipped.push(SkippedEntry {
                 path: entry.raw_name,
                 reason: "unrecognized or non-transcript file".into(),
@@ -1147,6 +1308,8 @@ fn ingest_pending_entries(
     let mut claimed_files: std::collections::HashSet<std::path::PathBuf> = std::collections::HashSet::new();
     #[cfg(feature = "sqlite")]
     let mut visited_cursor_user_dirs: std::collections::HashSet<std::path::PathBuf> = std::collections::HashSet::new();
+    #[cfg(feature = "sqlite")]
+    let mut visited_antigravity_dirs: std::collections::HashSet<std::path::PathBuf> = std::collections::HashSet::new();
 
     #[cfg(feature = "sqlite")]
     for (orig_name, full_path, sqlite_like) in &staged_paths {
@@ -1160,6 +1323,10 @@ fn ingest_pending_entries(
             Hermes,
             OpenCode,
             Zed,
+            Antigravity {
+                has_steps: bool,
+                has_summaries: bool,
+            },
             Cursor {
                 has_disk_kv: bool,
                 has_item_table: bool,
@@ -1175,6 +1342,19 @@ fn ingest_pending_entries(
                 // an empty `SqliteFlavor::Unknown` database.
                 let _: i64 = raw.query_row("SELECT count(*) FROM sqlite_schema", [], |r| r.get(0))?;
                 let has_table = |t: &str| crate::harness::store::sqlite::table_exists(raw, t);
+                let has_agy_steps = has_table("steps")
+                    && raw
+                        .prepare("PRAGMA table_info(steps)")
+                        .and_then(|mut st| {
+                            let cols: Vec<String> = st
+                                .query_map([], |row| row.get::<_, String>(1))?
+                                .filter_map(Result::ok)
+                                .collect();
+                            Ok(cols.iter().any(|c| c == "step_payload") && cols.iter().any(|c| c == "step_format"))
+                        })
+                        .unwrap_or(false);
+                let has_agy_summaries = has_table("conversation_summaries");
+                let has_agy_meta = has_table("trajectory_metadata_blob");
                 if has_table("session_windows") && has_table("transcript_events") {
                     Ok(SqliteFlavor::OpenClaw)
                 } else if has_table("sessions") && has_table("message_nodes") {
@@ -1199,6 +1379,11 @@ fn ingest_pending_entries(
                     Ok(SqliteFlavor::OpenCode)
                 } else if has_table("threads") {
                     Ok(SqliteFlavor::Zed)
+                } else if has_agy_steps || has_agy_summaries || has_agy_meta {
+                    Ok(SqliteFlavor::Antigravity {
+                        has_steps: has_agy_steps,
+                        has_summaries: has_agy_summaries,
+                    })
                 } else if has_table("cursorDiskKV")
                     || has_table("ItemTable")
                     || (has_table("blobs") && has_table("meta"))
@@ -1284,6 +1469,102 @@ fn ingest_pending_entries(
                         sessions.push(finalize_staged_session(adapter.parse(r)?)?);
                     }
                     Ok(Some(sessions))
+                }
+                SqliteFlavor::Antigravity {
+                    has_steps,
+                    has_summaries,
+                } => {
+                    let existing_app_dir = full_path.parent().and_then(|parent| {
+                        if parent.file_name().and_then(|n| n.to_str()) == Some("conversations") {
+                            parent.parent().map(std::path::Path::to_path_buf)
+                        } else if full_path.file_name().and_then(|n| n.to_str()) == Some("conversation_summaries.db") {
+                            Some(parent.to_path_buf())
+                        } else {
+                            None
+                        }
+                    });
+                    if let Some(app_dir) = existing_app_dir {
+                        if !visited_antigravity_dirs.insert(app_dir.clone()) {
+                            Ok(Some(Vec::new()))
+                        } else {
+                            for sub in ["conversations", "annotations", "brain"] {
+                                let d = app_dir.join(sub);
+                                if d.is_dir() {
+                                    claim_dir_files(&d, false, &mut claimed_files);
+                                }
+                            }
+                            claimed_files.insert(app_dir.join("conversation_summaries.db"));
+                            let agy_harness = antigravity::ROOTLESS.harness();
+                            let mut existing_ids = std::collections::HashSet::new();
+                            for s in out.iter_mut() {
+                                if s.harness == agy_harness {
+                                    let has_pbtxt = agy_pbtxt_titles.contains_key(&s.id);
+                                    antigravity::enrich_ingested_session_from_app_dir(s, &app_dir, has_pbtxt);
+                                    existing_ids.insert(s.id.clone());
+                                }
+                            }
+                            let adapter = antigravity::Antigravity::with_home(&app_dir);
+                            let disc = adapter.discover()?;
+                            for r in &disc.refs {
+                                if existing_ids.contains(&r.id) {
+                                    continue;
+                                }
+                                let s = finalize_staged_with_hint(adapter.parse(r)?, &staged_paths, Some(&r.path))?;
+                                out.push(s);
+                            }
+                            for sk in &disc.skipped {
+                                let archive_path = staged_archive_name(&sk.path, &staged_paths)
+                                    .map(str::to_owned)
+                                    .unwrap_or_else(|| orig_name.clone());
+                                let err = anyhow::anyhow!("{}", sk.why);
+                                let reason = format!("parse error: {err:#}");
+                                if first_parse_err.is_none() {
+                                    *first_parse_err = Some(err);
+                                }
+                                skipped.push(SkippedEntry {
+                                    path: archive_path,
+                                    reason,
+                                });
+                            }
+                            Ok(Some(Vec::new()))
+                        }
+                    } else if has_steps {
+                        let agy_dir = temp_root.join(format!("_agy_{}", uuid::Uuid::new_v4()));
+                        let stem = file_stem(orig_name);
+                        let dst = agy_dir.join("conversations").join(format!("{stem}.db"));
+                        copy_sqlite_with_sidecars(full_path, &dst)?;
+                        if let Some(parent) = full_path.parent() {
+                            let sibling_sum = parent.join("conversation_summaries.db");
+                            if sibling_sum.is_file() {
+                                copy_sqlite_with_sidecars(&sibling_sum, &agy_dir.join("conversation_summaries.db"))?;
+                                claimed_files.insert(sibling_sum);
+                            }
+                        }
+                        let agy_harness = antigravity::ROOTLESS.harness();
+                        let adapter = antigravity::Antigravity::with_home(&agy_dir);
+                        let disc = adapter.discover()?;
+                        let mut sessions = Vec::new();
+                        for r in &disc.refs {
+                            if out.iter().any(|s| s.harness == agy_harness && s.id == r.id) {
+                                continue;
+                            }
+                            sessions.push(finalize_staged_session(adapter.parse(r)?)?);
+                        }
+                        Ok(Some(sessions))
+                    } else {
+                        if has_summaries {
+                            let agy_harness = antigravity::ROOTLESS.harness();
+                            let agy_dir = temp_root.join(format!("_agy_sum_{}", uuid::Uuid::new_v4()));
+                            copy_sqlite_with_sidecars(full_path, &agy_dir.join("conversation_summaries.db"))?;
+                            for s in out.iter_mut() {
+                                if s.harness == agy_harness {
+                                    let has_pbtxt = agy_pbtxt_titles.contains_key(&s.id);
+                                    antigravity::enrich_ingested_session_from_app_dir(s, &agy_dir, has_pbtxt);
+                                }
+                            }
+                        }
+                        Ok(Some(Vec::new()))
+                    }
                 }
                 SqliteFlavor::Cursor {
                     has_disk_kv,
@@ -1851,7 +2132,7 @@ fn ingest_pending_entries(
     }
 
     for (orig_name, full_path, _) in staged_paths {
-        if is_sqlite_sidecar(&orig_name) || claimed_files.contains(&full_path) {
+        if is_sqlite_sidecar(&orig_name) || is_antigravity_companion(&orig_name) || claimed_files.contains(&full_path) {
             continue;
         }
         skipped.push(SkippedEntry {
@@ -2625,5 +2906,163 @@ mod tests {
             assert_eq!(capped.skipped.len(), 1);
             assert!(capped.skipped[0].reason.contains("aggregate decompressed budget"));
         }
+    }
+
+    #[test]
+    fn reassembles_chunked_antigravity_archives_claims_companions_and_reports_gaps() {
+        let id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        let full_jsonl = concat!(
+            "{\"step_index\":0,\"source\":\"USER_IMPLICIT\",\"type\":\"USER_INPUT\",\"status\":\"DONE\",\"created_at\":\"2026-11-15T10:00:00Z\",\"content\":\"<USER_REQUEST>\\nLaunch 🚀 \\u0041lpha\\n</USER_REQUEST>\"}\n",
+            "{\"step_index\":1,\"source\":\"MODEL\",\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"created_at\":\"2026-11-15T10:00:01Z\",\"content\":\"ack\"}\n"
+        );
+        let raw = full_jsonl.as_bytes();
+        // Split right inside the 4-byte UTF-8 '🚀' (`0xF0, 0x9F, 0x9A, 0x80`) AND inside `\u0041`!
+        let rocket_pos = raw.windows(4).position(|w| w == "🚀".as_bytes()).unwrap();
+        let esc_pos = raw.windows(6).position(|w| w == br"\u0041").unwrap();
+        let chunk0 = raw[..rocket_pos + 2].to_vec();
+        let chunk1 = raw[rocket_pos + 2..esc_pos + 3].to_vec();
+        let chunk2 = raw[esc_pos + 3..].to_vec();
+
+        let report = ingest_files_with_report(vec![
+            ("antigravity-cli/history.jsonl".into(), br#"{"prompt":"hi"}"#.to_vec()),
+            (
+                format!("antigravity-cli/annotations/{id}.pbtxt"),
+                b"title: \"Custom Pbtxt Title\"\n".to_vec(),
+            ),
+            (
+                format!("antigravity-cli/brain/{id}/.system_generated/subagents/child-1.json"),
+                br#"{"conversationId":"11111111-1111-4111-8111-111111111111"}"#.to_vec(),
+            ),
+            (
+                format!("antigravity-cli/brain/{id}/.system_generated/swarm/members.json"),
+                br#"{"members":[]}"#.to_vec(),
+            ),
+            (
+                format!("antigravity-cli/brain/{id}/.system_generated/logs/chunks/transcript_full/00000001.jsonl"),
+                chunk1,
+            ),
+            (
+                format!("antigravity-cli/brain/{id}/.system_generated/logs/chunks/transcript_full/00000000.jsonl"),
+                chunk0,
+            ),
+            (
+                format!("antigravity-cli/brain/{id}/.system_generated/logs/chunks/transcript_full/00000002.jsonl"),
+                chunk2,
+            ),
+        ])
+        .unwrap();
+
+        assert!(report.skipped.is_empty(), "skipped: {:?}", report.skipped);
+        assert_eq!(report.sessions.len(), 1);
+        let s = &report.sessions[0];
+        assert_eq!(s.harness, Harness::Antigravity);
+        assert_eq!(s.id, id);
+        assert_eq!(s.title.as_deref(), Some("Custom Pbtxt Title"));
+        assert_eq!(s.messages.len(), 2);
+        assert_eq!(
+            s.messages[0].text().as_deref(),
+            Some("<USER_REQUEST>\nLaunch 🚀 Alpha\n</USER_REQUEST>")
+        );
+
+        // Without pbtxt, unwrapped prompt becomes Session::title.
+        let unwrapped = ingest_files(vec![(
+            format!("brain/{id}/.system_generated/logs/chunks/transcript/00000000.jsonl"),
+            raw.to_vec(),
+        )])
+        .unwrap();
+        assert_eq!(unwrapped[0].title.as_deref(), Some("Launch 🚀 Alpha"));
+
+        // Missing chunk 00000001 surfaces a parse error.
+        let gap_err = ingest_files(vec![
+            (
+                format!("brain/{id}/.system_generated/logs/chunks/transcript_full/00000000.jsonl"),
+                b"{".to_vec(),
+            ),
+            (
+                format!("brain/{id}/.system_generated/logs/chunks/transcript_full/00000002.jsonl"),
+                b"}\n".to_vec(),
+            ),
+        ])
+        .unwrap_err();
+        assert!(gap_err.to_string().contains("missing Antigravity chunk 1"), "{gap_err}");
+    }
+
+    #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
+    #[test]
+    fn ingests_antigravity_sqlite_conversations_and_summaries_without_duplicates() {
+        let world = crate::test_world("ingest-sqlite-antigravity");
+        let id_native = "11111111-2222-4333-8444-555555555555";
+        let id_exported = "66666666-7777-4888-8999-aaaaaaaaaaaa";
+
+        let conv_db = world.base.join("native.db");
+        {
+            let conn = rusqlite::Connection::open(&conv_db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_payload BLOB NOT NULL, step_format INTEGER NOT NULL DEFAULT 0);",
+            )
+            .unwrap();
+            // Step{type(1)=USER_INPUT(14), status(4)=DONE(3), user_input(19){items(3){text(1)="hi native zip"}}}
+            let text = b"hi native zip";
+            let text_f = [vec![0x0a, text.len() as u8], text.to_vec()].concat();
+            let input = [vec![(3 << 3) | 2, text_f.len() as u8], text_f].concat();
+            let step = [vec![8, 14, 32, 3], vec![(19 << 3) | 2, 1, input.len() as u8], input].concat();
+            conn.execute("INSERT INTO steps (idx, step_payload) VALUES (0, ?1)", [step])
+                .unwrap();
+        }
+
+        let sum_db = world.base.join("conversation_summaries.db");
+        {
+            let conn = rusqlite::Connection::open(&sum_db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE conversation_summaries (
+                    conversation_id TEXT PRIMARY KEY,
+                    title TEXT,
+                    preview TEXT,
+                    workspace_uris TEXT,
+                    parent_conversation_id TEXT,
+                    agent_name TEXT,
+                    source TEXT,
+                    project_id TEXT,
+                    last_modified_time TEXT
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO conversation_summaries (conversation_id, title, workspace_uris) VALUES (?1, 'Summary Native Title', '[\"file:///work/agy\"]'), (?2, 'Summary Export Title', '[\"file:///work/exp\"]')",
+                rusqlite::params![id_native, id_exported],
+            )
+            .unwrap();
+        }
+
+        let conv_bytes = std::fs::read(&conv_db).unwrap();
+        let sum_bytes = std::fs::read(&sum_db).unwrap();
+        let exported_jsonl = br#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","content":"exported prompt"}"#.to_vec();
+
+        let report = ingest_files_with_report(vec![
+            (
+                format!("antigravity-cli/conversations/{id_native}.db"),
+                conv_bytes.clone(),
+            ),
+            (format!("antigravity-cli/conversations/{id_exported}.db"), conv_bytes),
+            (
+                format!("antigravity-cli/brain/{id_exported}/.system_generated/logs/transcript_full.jsonl"),
+                exported_jsonl,
+            ),
+            ("antigravity-cli/conversation_summaries.db".into(), sum_bytes),
+        ])
+        .unwrap();
+
+        assert!(report.skipped.is_empty(), "skipped: {:?}", report.skipped);
+        assert_eq!(report.sessions.len(), 2);
+        let native_s = report.sessions.iter().find(|s| s.id == id_native).unwrap();
+        assert_eq!(native_s.harness, Harness::Antigravity);
+        assert_eq!(native_s.title.as_deref(), Some("Summary Native Title"));
+        assert_eq!(native_s.cwd.as_deref(), Some(std::path::Path::new("/work/agy")));
+        assert_eq!(native_s.messages[0].text().as_deref(), Some("hi native zip"));
+
+        let exp_s = report.sessions.iter().find(|s| s.id == id_exported).unwrap();
+        assert_eq!(exp_s.title.as_deref(), Some("Summary Export Title"));
+        assert_eq!(exp_s.cwd.as_deref(), Some(std::path::Path::new("/work/exp")));
+        assert_eq!(exp_s.messages[0].text().as_deref(), Some("exported prompt"));
     }
 }

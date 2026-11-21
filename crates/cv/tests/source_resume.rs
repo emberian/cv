@@ -371,3 +371,125 @@ fn shadowed_duplicate_id_across_roots_warns_and_explicit_path_silences_it() {
     assert!(plan["warning"].is_null(), "{plan}");
     assert!(err.is_empty(), "{err}");
 }
+
+fn write_antigravity_native_db(app_dir: &Path, id: &str, text: &str) -> std::path::PathBuf {
+    let dir = app_dir.join("conversations");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!("{id}.db"));
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_payload BLOB, step_format INTEGER NOT NULL DEFAULT 0);",
+    )
+    .unwrap();
+    let raw = text.as_bytes();
+    let text_f = [vec![0x0a, raw.len() as u8], raw.to_vec()].concat();
+    let input = [vec![(3 << 3) | 2, text_f.len() as u8], text_f].concat();
+    let step = [vec![8, 14, 32, 3], vec![(19 << 3) | 2, 1, input.len() as u8], input].concat();
+    conn.execute("INSERT INTO steps (idx, step_payload) VALUES (0, ?1)", [step])
+        .unwrap();
+    path
+}
+
+#[test]
+fn antigravity_resume_selects_profile_unsets_overrides_and_distinguishes_export_paths() {
+    let w = World::new("resume-antigravity-source");
+    let cli_dir = w.home.join(".gemini/antigravity-cli");
+    let ide_dir = w.home.join(".gemini/antigravity-ide");
+    let custom_dir = w.base.join("custom agy app");
+    let id_ide = "22222222-3333-4444-8555-666666666666";
+    let id_exp = "77777777-8888-4999-8aaa-bbbbbbbbbbbb";
+
+    // 1. Default ~/.gemini/antigravity-cli/conversations/<id>.db needs no env overrides and emits no caveat.
+    let cli_db = write_antigravity_native_db(&cli_dir, ID, "hello default cli");
+    for selector in [format!("antigravity:{ID}"), format!("antigravity:{}", cli_db.display())] {
+        let (out, _) = w.cv_ok(&["resume", &selector, "--json"]);
+        let plan: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(plan["program"], "agy", "{selector}");
+        assert_eq!(plan["args"], json!(["--conversation", ID]), "{selector}");
+        assert_eq!(plan["env"], json!({}), "{selector}");
+        assert_eq!(plan["unset_env"], json!([]), "{selector}");
+        assert!(plan["warning"].is_null(), "{selector}: {plan}");
+    }
+
+    // 2. Empty env vars are ignored (still default CLI profile).
+    let (ok, _, out, err) = w.cv_env(
+        &["resume", &format!("antigravity:{ID}"), "--json"],
+        &[
+            ("ANTIGRAVITY_APP_DATA_DIR", ""),
+            ("JETSKI_APP_DATA_DIR", ""),
+            ("ANTIGRAVITY_GEMINI_DIR", ""),
+        ],
+    );
+    assert!(ok, "{err}");
+    let plan: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(plan["env"], json!({}));
+    assert_eq!(plan["unset_env"], json!([]));
+
+    // 3. Ambient ANTIGRAVITY_APP_DATA_DIR + JETSKI_APP_DATA_DIR pointing elsewhere are unset when resuming default CLI DB.
+    let custom_db = write_antigravity_native_db(&custom_dir, id_ide, "hello custom app");
+    let (ok, _, out, err) = w.cv_env(
+        &["resume", "--harness", "antigravity", cli_db.to_str().unwrap(), "--json"],
+        &[
+            ("ANTIGRAVITY_APP_DATA_DIR", custom_dir.to_str().unwrap()),
+            ("JETSKI_APP_DATA_DIR", custom_dir.to_str().unwrap()),
+        ],
+    );
+    assert!(ok, "{err}");
+    let plan: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(plan["env"], json!({}));
+    assert_eq!(
+        plan["unset_env"],
+        json!(["ANTIGRAVITY_APP_DATA_DIR", "JETSKI_APP_DATA_DIR"])
+    );
+
+    // 4. Explicit /custom/conversations/<id>.db and non-default ~/.gemini/antigravity-ide/conversations/<id>.db set both env vars and suppress caveat.
+    let (out, _) = w.cv_ok(&[
+        "resume",
+        "--harness",
+        "antigravity",
+        custom_db.to_str().unwrap(),
+        "--json",
+    ]);
+    let plan: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(plan["id"], id_ide);
+    assert_eq!(plan["env"]["ANTIGRAVITY_APP_DATA_DIR"], custom_dir.to_str().unwrap());
+    assert_eq!(plan["env"]["JETSKI_APP_DATA_DIR"], custom_dir.to_str().unwrap());
+    assert_eq!(plan["unset_env"], json!([]));
+    assert!(plan["warning"].is_null(), "{plan}");
+
+    let _ide_db = write_antigravity_native_db(&ide_dir, id_ide, "hello ide native");
+    let (out, _) = w.cv_ok(&["resume", &format!("antigravity:{id_ide}"), "--json"]);
+    let plan: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(plan["env"]["ANTIGRAVITY_APP_DATA_DIR"], ide_dir.to_str().unwrap());
+    assert_eq!(plan["env"]["JETSKI_APP_DATA_DIR"], ide_dir.to_str().unwrap());
+    assert!(plan["warning"].is_null(), "{plan}");
+
+    // 5. Export-only session (no conversations/<id>.{db,pb}): ID-based exits 0 with # caveat, explicit path exits 2!
+    let exp_log = ide_dir
+        .join("brain")
+        .join(id_exp)
+        .join(".system_generated/logs/transcript_full.jsonl");
+    fs::create_dir_all(exp_log.parent().unwrap()).unwrap();
+    fs::write(
+        &exp_log,
+        format!(
+            "{}\n",
+            json!({"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","content":"export only"})
+        ),
+    )
+    .unwrap();
+
+    let (out, _) = w.cv_ok(&["resume", &format!("antigravity:{id_exp}")]);
+    assert!(out.contains("# agy resumes conversations stored in"), "{out}");
+    assert!(out.contains(&format!("agy --conversation {id_exp}")), "{out}");
+
+    let (_, code, _, err) = w.cv(&[
+        "resume",
+        "--harness",
+        "antigravity",
+        exp_log.to_str().unwrap(),
+        "--json",
+    ]);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("cannot safely resume antigravity"), "{err}");
+}
