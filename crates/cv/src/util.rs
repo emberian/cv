@@ -193,11 +193,13 @@ pub(crate) fn resolve_quiet(spec: &str, harness: Option<Harness>) -> Result<(Ses
 /// Count distinct live transcript paths across roots that share `(r.harness, &r.id)` besides
 /// `r.path`. Returns `0` in the normal single-copy case.
 pub(crate) fn shadowed_copy_count(r: &SessionRef) -> usize {
-    let mut candidates = cv_core::catalog::lookup(&r.id, Some(r.harness));
-    if candidates.is_empty() && cv_core::env::frozen() {
-        candidates = cv_core::sessions_for(Some(r.harness));
-    }
-    if candidates.len() <= 1 {
+    let candidates = cv_core::catalog::lookup_exact_authoritative(&r.id, r.harness).unwrap_or_else(|| {
+        cv_core::sessions_for(Some(r.harness))
+            .into_iter()
+            .filter(|c| c.id == r.id)
+            .collect()
+    });
+    if candidates.is_empty() || (candidates.len() == 1 && candidates[0].path == r.path) {
         return 0;
     }
     let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());

@@ -2453,6 +2453,10 @@ mod imp {
     /// harness. Order: exact-id matches first. Empty on any error or a cold catalog.
     pub fn lookup(id: &str, harness: Option<Harness>) -> Vec<SessionRef> {
         let Some(conn) = open() else { return Vec::new() };
+        lookup_in(&conn, id, harness)
+    }
+
+    fn lookup_in(conn: &Connection, id: &str, harness: Option<Harness>) -> Vec<SessionRef> {
         let upper = prefix_end(id);
         // Binary prefix ranges use idx_sessions_id; LIKE's case-folded comparison would scan
         // the entire table despite that index, and disagree with literal Rust ID matching.
@@ -2471,6 +2475,51 @@ mod imp {
         let rows = stmt.query_map(params![id, upper, harness.map(Harness::as_str)], row_to_ref);
         let Ok(rows) = rows else { return Vec::new() };
         rows.flatten().flatten().filter(|r| r.id.starts_with(id)).collect()
+    }
+
+    fn has_unwatched_root_in(conn: &Connection, h: Harness) -> Option<bool> {
+        let Some(a) = crate::harness::for_harness(h) else {
+            return Some(false);
+        };
+        let roots = a.roots();
+        let mut stmt = conn
+            .prepare("SELECT path FROM watched WHERE harness=?1")
+            .inspect_err(note_sql)
+            .ok()?;
+        let watched: HashSet<String> = stmt
+            .query_map([h.as_str()], |r| r.get::<_, String>(0))
+            .inspect_err(note_sql)
+            .ok()?
+            .collect::<rusqlite::Result<_>>()
+            .inspect_err(note_sql)
+            .ok()?;
+        Some(
+            (!roots.is_empty() && watched.is_empty())
+                || roots
+                    .iter()
+                    .any(|r| r.exists() && !watched.contains(r.to_string_lossy().as_ref())),
+        )
+    }
+
+    /// Exact-id catalog rows for `(id, harness)` when `catalog.db` is openable and covers the
+    /// current roots (and under `--frozen`, `harness` is fresh in [`probe_stale_in`]). Returns
+    /// `None` when the catalog is unavailable, missing an added root, or stale under `--frozen`,
+    /// so callers fall back to harness discovery.
+    pub fn lookup_exact_authoritative(id: &str, harness: Harness) -> Option<Vec<SessionRef>> {
+        let conn = open()?;
+        if crate::env::frozen() {
+            if probe_stale_in(&conn)?.contains(&harness) {
+                return None;
+            }
+        } else if has_unwatched_root_in(&conn, harness)? {
+            return None;
+        }
+        Some(
+            lookup_in(&conn, id, Some(harness))
+                .into_iter()
+                .filter(|r| r.id == id)
+                .collect(),
+        )
     }
 
     #[cfg(test)]
@@ -3986,8 +4035,8 @@ pub(crate) use imp::{all_sessions, db_path, open_at, open_db, watches_for};
 
 #[cfg(feature = "sqlite")]
 pub use imp::{
-    events_codec_version, harness_codec_version, lookup, note_affordances_with_source, session_indexed_fields,
-    skipped_sources, sync, writer_versions, AffordanceTable,
+    events_codec_version, harness_codec_version, lookup, lookup_exact_authoritative, note_affordances_with_source,
+    session_indexed_fields, skipped_sources, sync, writer_versions, AffordanceTable,
 };
 
 #[cfg(feature = "sqlite")]
@@ -4089,6 +4138,10 @@ pub fn writer_versions() -> Vec<crate::writer_version::Observed> {
 #[cfg(not(feature = "sqlite"))]
 pub fn lookup(_id: &str, _harness: Option<Harness>) -> Vec<SessionRef> {
     Vec::new()
+}
+#[cfg(not(feature = "sqlite"))]
+pub fn lookup_exact_authoritative(_id: &str, _harness: Harness) -> Option<Vec<SessionRef>> {
+    None
 }
 #[cfg(not(feature = "sqlite"))]
 pub(crate) fn watches_for(

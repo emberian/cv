@@ -493,3 +493,75 @@ fn antigravity_resume_selects_profile_unsets_overrides_and_distinguishes_export_
     assert_eq!(code, 2, "{err}");
     assert!(err.contains("cannot safely resume antigravity"), "{err}");
 }
+
+#[test]
+fn frozen_show_and_unavailable_catalog_warn_on_shadowed_copy_after_single_row_warm() {
+    let w = World::new("frozen-shadowed-warm-catalog");
+    w.write_session(
+        ID,
+        &[claude::with(
+            claude::user(ID, "u1", "2026-01-01T00:00:00Z", "initial default copy"),
+            json!({"cwd": w.base}),
+        )],
+    );
+    cv_testkit::settle(&w.home);
+
+    // Warm `catalog.db` while only 1 copy exists, and verify single-copy `--frozen show` is quiet.
+    w.cv_ok(&["ls"]);
+    let (_, quiet_err) = w.cv_ok(&["--frozen", "show", ID]);
+    assert!(!quiet_err.contains("shadowed copy"), "{quiet_err}");
+
+    // Add a second root WITHOUT updating `catalog.db`, then run `cv --frozen show <id>`.
+    let extra = w.base.join("seat-profile");
+    let second = extra.join("projects/-project").join(format!("{ID}.jsonl"));
+    fs::create_dir_all(second.parent().unwrap()).unwrap();
+    fs::write(
+        &second,
+        jsonl(&[claude::with(
+            claude::user(ID, "u2", "2026-02-01T00:00:00Z", "second root copy"),
+            json!({"cwd": w.base}),
+        )]),
+    )
+    .unwrap();
+    let env_one = [("CLUSTERVISION_CLAUDE_ROOTS", extra.to_str().unwrap())];
+
+    let (ok, _, _, err) = w.cv_env(&["--frozen", "show", ID], &env_one);
+    assert!(ok, "{err}");
+    assert!(err.contains("shadowed copy") && err.contains("claude:<path>"), "{err}");
+
+    // Delete the 1 cataloged copy while two uncataloged roots hold live copies (`--frozen` in-memory refresh).
+    fs::remove_file(w.transcript(ID)).unwrap();
+    let extra2 = w.base.join("seat-profile-2");
+    let third = extra2.join("projects/-project").join(format!("{ID}.jsonl"));
+    fs::create_dir_all(third.parent().unwrap()).unwrap();
+    fs::write(
+        &third,
+        jsonl(&[claude::with(
+            claude::user(ID, "u3", "2026-03-01T00:00:00Z", "third root newest copy"),
+            json!({"cwd": w.base}),
+        )]),
+    )
+    .unwrap();
+    let roots_both = format!("{}:{}", extra.display(), extra2.display());
+    let env_two = [("CLUSTERVISION_CLAUDE_ROOTS", roots_both.as_str())];
+
+    let (ok, _, out, err) = w.cv_env(&["--frozen", "show", ID], &env_two);
+    assert!(ok, "{err}");
+    assert!(out.contains("third root newest copy"), "{out}");
+    assert!(
+        err.contains("shadowed copy") && err.contains(third.to_str().unwrap()),
+        "{err}"
+    );
+
+    // Unopenable `catalog.db` under `!frozen` also falls back to discovery and emits the shadowed-copy note.
+    let cat_db = w.cv_home.join("catalog.db");
+    let _ = fs::remove_file(&cat_db);
+    fs::create_dir_all(&cat_db).unwrap();
+    let (ok, _, out, err) = w.cv_env(&["show", ID], &env_two);
+    assert!(ok, "{err}");
+    assert!(out.contains("third root newest copy"), "{out}");
+    assert!(
+        err.contains("shadowed copy") && err.contains(third.to_str().unwrap()),
+        "{err}"
+    );
+}
