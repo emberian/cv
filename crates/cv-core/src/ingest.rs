@@ -5,7 +5,7 @@
 //! OWNED BY the wasm-ingest work. `cv-core::lib` declares this module.
 
 use crate::harness::store::document::range::{RangeSource, Validation};
-use crate::harness::{antigravity, claude, codex, continuedev, export, gemini, openclaw, opensession, qwen};
+use crate::harness::{antigravity, claude, codex, continuedev, export, gemini, openclaw, opensession, pi, qwen};
 use crate::ir::Session;
 use crate::json::JsonView;
 use serde::{Deserialize, Serialize};
@@ -65,6 +65,7 @@ enum Sniff {
     Antigravity,
     Qwen,
     OpenClaw,
+    Pi,
     OpenSession,
     Export,
     Continue,
@@ -195,15 +196,8 @@ fn sniff(name: &str, text: &str) -> Sniff {
                 return Sniff::Qwen;
             }
             if is_jsonl {
-                if inspect(first, |raw| {
-                    let v = fields(raw);
-                    v.string("type").as_deref() == Some("session")
-                        && v.get("version").is_some()
-                        && v.get("id").is_some()
-                })
-                .unwrap_or(false)
-                {
-                    return Sniff::OpenClaw;
+                if let Some(session_sniff) = sniff_session_jsonl(name, first, text) {
+                    return session_sniff;
                 }
                 if inspect(first, |raw| {
                     let v = fields(raw);
@@ -284,6 +278,95 @@ fn sniff(name: &str, text: &str) -> Sniff {
         inspected += 1;
     }
     Sniff::Unknown
+}
+
+/// Disambiguate OpenClaw vs Pi coding-agent JSONL transcripts, which share the
+/// `{"type":"session","version":3,"id":...}` header shape.
+fn sniff_session_jsonl(name: &str, first: &str, text: &str) -> Option<Sniff> {
+    let (version, session_id) = inspect(first, |raw| {
+        let v = fields(raw);
+        if v.string("type").as_deref() != Some("session") || v.get("id").is_none() {
+            return None;
+        }
+        let ver = v.get("version")?;
+        let ver_num = ver.as_number().ok().flatten().and_then(|n| n.as_i64());
+        Some((ver_num, v.string("id").unwrap_or_default()))
+    })
+    .flatten()?;
+
+    for seg in name.split(['/', '\\']) {
+        if seg.eq_ignore_ascii_case(".pi") || seg.eq_ignore_ascii_case("pi-coding-agent") {
+            return Some(Sniff::Pi);
+        }
+        if seg.eq_ignore_ascii_case(".openclaw") || seg.eq_ignore_ascii_case("openclaw") {
+            return Some(Sniff::OpenClaw);
+        }
+    }
+
+    let mut saw_v3_branch = false;
+    let mut seen_parents = std::collections::HashSet::new();
+    for line in text.lines().map(str::trim).filter(|l| !l.is_empty()).skip(1).take(512) {
+        #[derive(PartialEq, Eq)]
+        enum Verdict {
+            Neutral,
+            Pi,
+            OpenClaw,
+        }
+        let mut parent_id: Option<String> = None;
+        let verdict = inspect(line, |raw| {
+            let v = fields(raw);
+            let ty = v.string("type").unwrap_or_default();
+            parent_id = v.string("parentId").filter(|s| !s.is_empty());
+            match ty.as_str() {
+                "context_edit" => return Verdict::Pi,
+                "compaction" if v.get("systemMessage").is_some() => return Verdict::Pi,
+                "leaf" | "reset" | "branch_summary" | "custom_message" | "custom" | "label" => {
+                    return Verdict::OpenClaw;
+                }
+                "message" => {
+                    if let Some(m) = v.get("message").map(fields) {
+                        if m.get("usage").map(fields).and_then(|u| u.get("reasoning")).is_some() {
+                            return Verdict::Pi;
+                        }
+                        if m.get("provenance").is_some()
+                            || m.string("provider").as_deref() == Some("openclaw")
+                            || matches!(
+                                m.string("role").as_deref(),
+                                Some("bashExecution" | "branchSummary" | "compactionSummary" | "custom")
+                            )
+                        {
+                            return Verdict::OpenClaw;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            if version == Some(3) && !session_id.is_empty() && parent_id.as_deref() == Some(session_id.as_str()) {
+                return Verdict::Pi;
+            }
+            Verdict::Neutral
+        })
+        .unwrap_or(Verdict::Neutral);
+
+        match verdict {
+            Verdict::Pi => return Some(Sniff::Pi),
+            Verdict::OpenClaw => return Some(Sniff::OpenClaw),
+            Verdict::Neutral => {
+                if version == Some(3) {
+                    if let Some(p) = parent_id {
+                        if !seen_parents.insert(p) {
+                            saw_v3_branch = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if version == Some(3) && saw_v3_branch {
+        return Some(Sniff::Pi);
+    }
+    Some(Sniff::OpenClaw)
 }
 
 /// Pull a session id out of a Codex transcript's meta/header if present, else fall back to stem.
@@ -508,6 +591,13 @@ fn ingest_files_inner_with_zst_caps(
             Sniff::OpenClaw => {
                 let id = file_stem(&name).to_string();
                 match openclaw::parse_str(&id, &text) {
+                    Ok(s) => out.push(stamp_archive_source(s, &raw_name)),
+                    Err(e) => record_parse_err(raw_name, e, &mut skipped, &mut first_parse_err),
+                }
+            }
+            Sniff::Pi => {
+                let id = file_stem(&name).to_string();
+                match pi::parse_str(&id, &text) {
                     Ok(s) => out.push(stamp_archive_source(s, &raw_name)),
                     Err(e) => record_parse_err(raw_name, e, &mut skipped, &mut first_parse_err),
                 }
@@ -1912,6 +2002,7 @@ mod tests {
                 Sniff::OpenSession => 8,
                 Sniff::Export => 9,
                 Sniff::Continue => 10,
+                Sniff::Pi => 11,
             }
         }
         let body = "large escaped λ\n\"".repeat(5000);
@@ -2094,6 +2185,49 @@ mod tests {
 
         assert_eq!(report.skipped.len(), 1);
         assert_eq!(report.skipped[0].path, "README.txt");
+    }
+
+    #[test]
+    fn disambiguates_pi_from_openclaw_and_projects_context() {
+        let pi_edited = [
+            r#"{"type":"session","version":3,"id":"pi-s1","timestamp":"2026-11-19T10:00:00Z","cwd":"/work/pi"}"#,
+            r#"{"type":"message","id":"m1","parentId":null,"timestamp":"2026-11-19T10:00:01Z","message":{"role":"user","content":[{"type":"text","text":"secret draft"}]}}"#,
+            r#"{"type":"message","id":"m2","parentId":"m1","timestamp":"2026-11-19T10:00:02Z","message":{"role":"assistant","content":[{"type":"text","text":"answer"}]}}"#,
+            r#"{"type":"context_edit","id":"e1","parentId":"m2","timestamp":"2026-11-19T10:00:03Z","targetId":"m1","replacement":{"content":[{"type":"text","text":"redacted prompt"}]}}"#,
+        ]
+        .join("\n");
+
+        let pi_by_path = [
+            r#"{"type":"session","version":3,"id":"pi-s2","timestamp":"2026-11-19T10:00:00Z","cwd":"/work/pi"}"#,
+            r#"{"type":"message","id":"m1","parentId":null,"timestamp":"2026-11-19T10:00:01Z","message":{"role":"user","content":[{"type":"text","text":"hello pi"}]}}"#,
+        ]
+        .join("\n");
+
+        let openclaw_v3 = [
+            r#"{"type":"session","version":3,"id":"oc-v3","timestamp":"2026-05-29T10:00:00Z","cwd":"/work/oc"}"#,
+            r#"{"type":"message","id":"m1","parentId":null,"timestamp":"2026-05-29T10:00:01Z","message":{"role":"user","content":"hello openclaw v3"}}"#,
+            r#"{"type":"message","id":"m2","parentId":"m1","timestamp":"2026-05-29T10:00:02Z","message":{"role":"assistant","provider":"openclaw","model":"delivery-mirror","content":[{"type":"text","text":"ok"}]}}"#,
+        ]
+        .join("\n");
+
+        let report = ingest_files_with_report(vec![
+            ("uploads/session-a.jsonl".into(), pi_edited.into_bytes()),
+            (".pi/agent/sessions/session-b.jsonl".into(), pi_by_path.into_bytes()),
+            ("sessions/oc-v3.jsonl".into(), openclaw_v3.into_bytes()),
+        ])
+        .unwrap();
+
+        assert_eq!(report.sessions.len(), 3);
+        let s1 = report.sessions.iter().find(|s| s.id == "pi-s1").expect("pi-s1");
+        assert_eq!(s1.harness, Harness::Pi);
+        assert_eq!(s1.messages.len(), 2);
+        assert_eq!(s1.messages[0].text().as_deref(), Some("redacted prompt"));
+
+        let s2 = report.sessions.iter().find(|s| s.id == "pi-s2").expect("pi-s2");
+        assert_eq!(s2.harness, Harness::Pi);
+
+        let oc = report.sessions.iter().find(|s| s.id == "oc-v3").expect("oc-v3");
+        assert_eq!(oc.harness, Harness::OpenClaw);
     }
 
     #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]

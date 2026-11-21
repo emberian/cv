@@ -245,3 +245,57 @@ fn ambient_claude_profile_with_shared_projects_keeps_its_own_identity() {
     // Reached through the home default too, which wins: no variable is needed.
     assert_eq!(plan["env"], json!({}));
 }
+
+#[test]
+fn pi_resume_selects_custom_agent_dir_unsets_override_for_default_and_refuses_loose_files() {
+    let w = World::new("resume-pi-source");
+    let default_path = w.home.join(".pi/agent/sessions/proj").join(format!("{ID}.jsonl"));
+    fs::create_dir_all(default_path.parent().unwrap()).unwrap();
+    let rows = jsonl(&[
+        json!({"type":"session","version":3,"id":ID,"cwd":w.base,"timestamp":TS}),
+        json!({"type":"message","id":"m1","parentId":null,"message":{"role":"user","content":"hello pi"}}),
+    ]);
+    fs::write(&default_path, &rows).unwrap();
+
+    // Default ~/.pi/agent/sessions needs no env override.
+    let (out, _) = w.cv_ok(&["resume", &format!("pi:{ID}"), "--json"]);
+    let plan: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(plan["program"], "pi");
+    assert_eq!(plan["args"], json!(["--session", ID]));
+    assert_eq!(plan["env"], json!({}));
+    assert_eq!(plan["unset_env"], json!([]));
+    assert_eq!(plan["cwd"], w.base.to_str().unwrap());
+
+    // Custom agent dir sets PI_CODING_AGENT_DIR and extracts native header id from timestamped filename.
+    let custom_agent = w.base.join("custom pi agent");
+    let custom_path = custom_agent
+        .join("sessions/proj")
+        .join(format!("2026-11-01T00-00-00_{ID}.jsonl"));
+    fs::create_dir_all(custom_path.parent().unwrap()).unwrap();
+    fs::write(&custom_path, &rows).unwrap();
+    let (out, _) = w.cv_ok(&["resume", "--harness", "pi", custom_path.to_str().unwrap(), "--json"]);
+    let plan: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(plan["id"], ID);
+    assert_eq!(plan["program"], "pi");
+    assert_eq!(plan["args"], json!(["--session", ID]));
+    assert_eq!(plan["env"]["PI_CODING_AGENT_DIR"], custom_agent.to_str().unwrap());
+    assert_eq!(plan["unset_env"], json!([]));
+
+    // With ambient PI_CODING_AGENT_DIR pointing at custom_agent, resuming default_path unsets it.
+    let env = [("PI_CODING_AGENT_DIR", custom_agent.to_str().unwrap())];
+    let (ok, _, out, err) = w.cv_env(
+        &["resume", "--harness", "pi", default_path.to_str().unwrap(), "--json"],
+        &env,
+    );
+    assert!(ok, "{err}");
+    let plan: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(plan["env"], json!({}));
+    assert_eq!(plan["unset_env"], json!(["PI_CODING_AGENT_DIR"]));
+
+    // Loose export file outside any <agent_dir>/sessions/ tree is refused with exit 2.
+    let loose = w.base.join("export.jsonl");
+    fs::write(&loose, &rows).unwrap();
+    let (_, code, _, err) = w.cv(&["resume", "--harness", "pi", loose.to_str().unwrap(), "--json"]);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("cannot safely resume pi"), "{err}");
+}

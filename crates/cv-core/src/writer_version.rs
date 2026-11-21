@@ -11,6 +11,7 @@ pub fn verified(h: Harness) -> Option<&'static str> {
         Harness::Claude => Some("2.1.304"),
         Harness::Codex => Some("0.163.0"),
         Harness::Grok
+        | Harness::Pi
         | Harness::OpenCode
         | Harness::Gemini
         | Harness::Antigravity

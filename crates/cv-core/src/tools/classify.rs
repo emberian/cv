@@ -162,6 +162,7 @@ fn is_codex_exec(harness: Option<Harness>, bare: &str) -> bool {
             | Harness::Antigravity
             | Harness::Hermes
             | Harness::OpenClaw
+            | Harness::Pi
             | Harness::Cursor
             | Harness::Kimi
             | Harness::KimiCode
@@ -199,6 +200,7 @@ fn is_spawn_tool(harness: Option<Harness>, bare: &str) -> bool {
             | Harness::OpenCode
             | Harness::Hermes
             | Harness::OpenClaw
+            | Harness::Pi
             | Harness::Kimi
             | Harness::Qwen
             | Harness::LmStudio
@@ -720,6 +722,7 @@ fn classify_bg_tool(harness: Option<Harness>, bare: &str, input: JsonView<'_>) -
             | Harness::Antigravity
             | Harness::Hermes
             | Harness::OpenClaw
+            | Harness::Pi
             | Harness::Cursor
             | Harness::Kimi
             | Harness::KimiCode
@@ -1288,6 +1291,7 @@ pub fn spawn_return_id(h: Harness, name: &str, result_text: &str, is_error: bool
         | Harness::Antigravity
         | Harness::Hermes
         | Harness::OpenClaw
+        | Harness::Pi
         | Harness::Cursor
         | Harness::Kimi
         | Harness::KimiCode

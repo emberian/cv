@@ -39,6 +39,7 @@ pub mod opencode;
 /// cv's own **OpenSession** interchange documents (`docs/OPENSESSION.md`) — the format
 /// `cv export --format json` writes — read back into the IR.
 pub mod opensession;
+pub mod pi;
 pub mod qwen;
 pub mod roo;
 pub mod store;
@@ -1022,6 +1023,7 @@ const ORDER: [Harness; Harness::COUNT] = [
     Harness::Gemini,
     Harness::Antigravity,
     Harness::OpenClaw,
+    Harness::Pi,
     Harness::Kimi,
     Harness::KimiCode,
     Harness::Qwen,
@@ -1079,6 +1081,7 @@ pub fn rootless(h: Harness) -> Option<&'static dyn Adapter> {
         Harness::Gemini => &gemini::ROOTLESS,
         Harness::Antigravity => &antigravity::ROOTLESS,
         Harness::OpenClaw => &openclaw::ROOTLESS,
+        Harness::Pi => &pi::ROOTLESS,
         Harness::Kimi => &kimi::ROOTLESS,
         Harness::KimiCode => &kimi_code::ROOTLESS,
         Harness::Qwen => &qwen::ROOTLESS,
@@ -1142,6 +1145,7 @@ pub fn for_harness(h: Harness) -> Option<Box<dyn Adapter>> {
         Harness::Gemini => Box::new(gemini::Gemini::detect()),
         Harness::Antigravity => Box::new(antigravity::Antigravity::detect()),
         Harness::OpenClaw => Box::new(openclaw::OpenClaw::detect()),
+        Harness::Pi => Box::new(pi::Pi::detect()),
         Harness::Kimi => Box::new(kimi::Kimi::detect()),
         Harness::KimiCode => Box::new(kimi_code::KimiCode::detect()),
         Harness::Qwen => Box::new(qwen::Qwen::detect()),
@@ -1182,6 +1186,7 @@ pub fn for_harness_with_root(h: Harness, root: &Path) -> Option<Box<dyn Adapter>
         Harness::Gemini => Box::new(gemini::Gemini::with_home(root)),
         Harness::Antigravity => Box::new(antigravity::Antigravity::with_home(root)),
         Harness::OpenClaw => Box::new(openclaw::OpenClaw::with_state_dir(root)),
+        Harness::Pi => Box::new(pi::Pi::with_root(root)),
         Harness::Kimi => Box::new(kimi::Kimi::with_home(root)),
         Harness::KimiCode => Box::new(kimi_code::KimiCode::with_home(root)),
         Harness::Qwen => Box::new(qwen::Qwen::with_home(root)),

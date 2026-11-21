@@ -246,6 +246,7 @@ fn emitter_for(target: Harness) -> Result<EmitFn, &'static str> {
         // `~/.kimi-code` on open, so a session written there was a port to nowhere.
         Harness::Cursor
         | Harness::Antigravity
+        | Harness::Pi
         | Harness::Goose
         | Harness::Zed
         | Harness::Devin
