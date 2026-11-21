@@ -515,7 +515,7 @@ fn message(top: &Fields<'_>, common: &Common, spans: bool) -> Result<Vec<Message
         }
         "assistant" => {
             blocks(&mut m, content, keep_source)?;
-            assistant_meta(&mut m, &body)?;
+            crate::harness::wire::pi_assistant_metadata(&mut m, &body, Harness::OpenClaw)?;
         }
         "user" | "system" => match content {
             Some(c) if c.is_string()? => m.content.push(Block::Text {
@@ -615,12 +615,6 @@ fn message(top: &Fields<'_>, common: &Common, spans: bool) -> Result<Vec<Message
     Ok(vec![boundary, m])
 }
 
-/// An assistant reply that is an API failure (`errorMessage`, or `stopReason: "error"`).
-fn failed(body: &Fields<'_>) -> Result<bool> {
-    Ok(string(body.get("errorMessage"))?.is_some_and(|e| !e.is_empty())
-        || string(body.get("stopReason"))?.as_deref() == Some("error"))
-}
-
 /// Whether a `message` entry's body is a turn ([`Message::is_turn`]) as [`message`] kinds it: a
 /// `user` message that [`user_provenance`] leaves a prompt, or an `assistant` reply that is not a
 /// failure. Reads `role`, `provenance`, `errorMessage` and `stopReason`, never content.
@@ -630,7 +624,7 @@ pub(super) fn is_turn(body: &Fields<'_>) -> Result<bool> {
             Some(p) if p.is_object()? => user_provenance(&*p.resolve()?).0 == MessageKind::Prompt,
             _ => true,
         },
-        Some("assistant") => !failed(body)?,
+        Some("assistant") => !crate::harness::wire::assistant_failed(body)?,
         _ => false,
     })
 }
@@ -652,67 +646,6 @@ fn user_provenance(p: &Value) -> (MessageKind, Origin) {
         "internal_system" => (MessageKind::InjectedContext, Origin::Harness),
         _ => (MessageKind::Prompt, Origin::Human),
     }
-}
-
-/// Capture assistant-level metadata (provider/api/model/usage/stop/diagnostics) into the harness
-/// bag, and an API failure into the `Error` kind (`extra["openclaw"]["error"]`).
-fn assistant_meta(m: &mut Message, body: &Fields<'_>) -> Result<()> {
-    let failed = failed(body)?;
-    let usage = body.value("usage")?;
-    if let Some(usage) = &usage {
-        m.usage = parse_usage(usage);
-    }
-    let mut bag = serde_json::Map::new();
-    for key in [
-        "api",
-        "provider",
-        "responseModel",
-        "responseId",
-        "stopReason",
-        "diagnostics",
-    ] {
-        if let Some(val) = present(body.get(key))? {
-            bag.insert(key.into(), val);
-        }
-    }
-    if let Some(usage) = usage {
-        // The full usage object also carries per-bucket cost and `contextUsage`; keep it verbatim.
-        bag.insert("usage_raw".into(), usage);
-    }
-    if failed {
-        let mut err = serde_json::Map::new();
-        for key in ["errorMessage", "errorCode", "errorType"] {
-            if let Some(val) = present(body.get(key))? {
-                err.insert(key.into(), val);
-            }
-        }
-        bag.insert("error".into(), Value::Object(err));
-        m.kind = MessageKind::Error;
-        m.origin = Origin::Harness;
-    }
-    if !bag.is_empty() {
-        m.harness_extra_mut(Harness::OpenClaw).extend(bag);
-    }
-    Ok(())
-}
-
-/// `usage{input, output, cacheRead, cacheWrite, totalTokens, cost{…, total}}` → [`Usage`].
-fn parse_usage(usage: &Value) -> Option<Usage> {
-    let get = |k: &str| usage.get(k).and_then(Value::as_u64);
-    let u = Usage {
-        input_tokens: get("input"),
-        output_tokens: get("output"),
-        cache_read_tokens: get("cacheRead"),
-        cache_creation_tokens: get("cacheWrite"),
-        cost_usd: usage.pointer("/cost/total").and_then(Value::as_f64),
-        ..Usage::default()
-    };
-    let any = u.input_tokens.is_some()
-        || u.output_tokens.is_some()
-        || u.cache_read_tokens.is_some()
-        || u.cache_creation_tokens.is_some()
-        || u.cost_usd.is_some();
-    any.then_some(u)
 }
 
 /// The custom message roles keep their role name and fields in the harness bag.
