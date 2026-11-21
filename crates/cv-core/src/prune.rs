@@ -181,6 +181,15 @@ pub struct PruneResult {
     /// `--revive`: the stale figure it replaced — the largest pre-revive usage total in the loaded window.
     #[serde(skip)]
     pub revive_old_tokens: Option<u64>,
+    /// What Claude Code sizes the session by before it sends anything on resume: the last
+    /// main-thread request's recorded `usage` (input + cache read + cache creation, the last
+    /// request iteration when the record has iterations), as the source recorded it. `None`
+    /// when no kept record carries usage.
+    #[serde(rename = "resume_reads_tokens_before", skip_serializing_if = "Option::is_none")]
+    pub last_request_tokens: Option<u64>,
+    /// The same record in the new session: the estimate when revive rewrote it, else unchanged.
+    #[serde(rename = "resume_reads_tokens_after", skip_serializing_if = "Option::is_none")]
+    pub last_request_tokens_after: Option<u64>,
     /// Data-safety warnings (e.g. a `--window` tail that exceeds its budget because a single turn is
     /// bigger than the whole budget). Also echoed to stderr.
     pub warnings: Vec<String>,
@@ -243,6 +252,8 @@ struct Decision {
     /// A tool payload (`toolUseResult` or a `tool_result` body) larger than `--min-size`.
     payload: bool,
     thinking: bool,
+    /// `message.content` is already `[]`, which `replay::drop_records` removes under `--drop-thinking`.
+    empty_content_array: bool,
     /// `--plan`: a tool result here gets a planned précis or excerpt.
     planned: bool,
     /// `--plan`: tool results here the plan keeps verbatim.
@@ -632,6 +643,9 @@ fn prune_session_after_stage(
     let mut plan_report = opts.plan.as_ref().map(|_| PlanReport::default());
     // `--plan` attachment drops: removed after staging with their children relinked.
     let mut dropped_records: HashSet<String> = HashSet::new();
+    // The last kept main-thread request's recorded context: what a resume sizes the session by.
+    let mut last_request_tokens = None;
+    let mut last_request_rewritable = false;
 
     for (idx, (facts, range)) in parsed.into_iter().zip(lines.iter()).enumerate() {
         let Some(facts) = facts else {
@@ -759,12 +773,14 @@ fn prune_session_after_stage(
             replacements: Vec::new(),
             root: needs_root,
         };
+        let mut emptied_by_thinking = false;
         if let Some(plan) = plan {
             selection.record = Some(plan.record);
             selection.replacements = plan.replacements;
             pruned_count += plan.payloads.len();
             est_tokens_saved += plan.saved;
             image_blocks += plan.images;
+            emptied_by_thinking = plan.emptied_by_thinking;
             if let Some(report) = plan_report.as_mut() {
                 report.precis += plan.planned.precis;
                 report.excerpt += plan.planned.excerpt;
@@ -792,6 +808,16 @@ fn prune_session_after_stage(
             },
             &mut scan,
         )?;
+        let gone = facts.facts.uuid.as_ref().is_some_and(|u| dropped_records.contains(u))
+            || emptied_by_thinking
+            || (opts.thinking && facts.empty_content_array);
+        if !gone && facts.facts.is_compact_boundary() {
+            last_request_rewritable = false;
+        }
+        if !gone && !facts.sidechain() && facts.facts.usage_in.is_some_and(|n| n > 0) {
+            last_request_tokens = facts.facts.usage_in;
+            last_request_rewritable = true;
+        }
         if opts.revive {
             // A dropped attachment carries no marker, but its recorded span no longer holds it.
             let found = scan.found || facts.facts.uuid.as_ref().is_some_and(|u| dropped_records.contains(u));
@@ -913,6 +939,13 @@ fn prune_session_after_stage(
         window_real_tokens: window_real,
         revive_tokens,
         revive_old_tokens,
+        last_request_tokens,
+        // Revive rewrites every record after the last compaction boundary above its estimate,
+        // the last one included.
+        last_request_tokens_after: last_request_tokens.map(|last| match revive_tokens {
+            Some(estimate) if last_request_rewritable && last > estimate => estimate,
+            _ => last,
+        }),
         warnings,
         skills,
         plan: plan_report,
@@ -950,6 +983,8 @@ fn decide(
         payload |= large(*result)?;
     }
     let thinking = facts.blocks.iter().any(|b| b.ty.as_deref() == Some("thinking"));
+    let empty_content_array =
+        facts.blocks.is_empty() && body.content.map(|c| c.is_array()).transpose()?.unwrap_or(false);
     let (mut planned, mut plan_keep, mut drop_attachment) = (false, 0, None);
     if let Some(plan) = &opts.plan {
         if facts.ty == "user" {
@@ -1028,6 +1063,7 @@ fn decide(
         est,
         payload,
         thinking,
+        empty_content_array,
         planned,
         plan_keep,
         drop_attachment,
@@ -1187,6 +1223,8 @@ struct SourcePrune {
     images: usize,
     /// `--plan`: the précis and excerpts among `payloads`, and the payload bytes they removed.
     planned: PlanReport,
+    /// `--drop-thinking`: every content block of the record was thinking and was removed.
+    emptied_by_thinking: bool,
 }
 
 /// Compatibility test entry for the source user pass; turn composition uses the same planner.
@@ -1241,8 +1279,10 @@ fn source_turn_prune(
         let mut kept_blocks = Vec::new();
         let mut planned_report = PlanReport::default();
         let mut planned_any = false;
+        let mut total_blocks = 0usize;
         for (index, original_block) in blocks.into_iter().flatten().enumerate() {
             let original_block = original_block?;
+            total_blocks += 1;
             if opts.revive {
                 block_sources.push(original_block.to_json()?);
             }
@@ -1532,6 +1572,7 @@ fn source_turn_prune(
             estimate,
             images,
             planned: planned_report,
+            emptied_by_thinking: total_blocks > 0 && omitted.len() == total_blocks,
         }))
     })?;
     Ok(planned)

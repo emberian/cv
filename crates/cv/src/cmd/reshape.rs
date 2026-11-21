@@ -201,16 +201,30 @@ pub(crate) fn cmd_prune(args: PruneArgs<'_>) -> Result<()> {
             (Some(estimated), Some(recorded)) => {
                 let _ = writeln!(
                     h,
-                    "  revived: rewrote recorded context {}k → estimated {}k across {} usage record(s) — resume acceptance unverified",
+                    "  revived: {} usage record(s) recorded above the post-prune estimate were rewritten to it: \
+                     highest recorded {}k → estimated {}k (bytes and recorded deltas, with margins; not a measurement)",
+                    res.usage_rewritten,
                     recorded / 1000,
                     estimated / 1000,
-                    res.usage_rewritten,
                 );
             }
             _ => {
                 let _ = writeln!(h, "  revive: no recorded usage required an estimated-window rewrite");
             }
         }
+    }
+    // The number the harness acts on is neither of those two unless it is the last record's.
+    if let (Some(before), Some(after)) = (res.last_request_tokens, res.last_request_tokens_after) {
+        let now = if after == before {
+            "unchanged".to_string()
+        } else {
+            format!("→ {}k (the estimate) — resume acceptance unverified", after / 1000)
+        };
+        let _ = writeln!(
+            h,
+            "  resume reads the last request's recorded size (input + cache read + cache creation): {}k, {now}",
+            before / 1000,
+        );
     }
     if let Some(p) = &res.plan {
         let _ = writeln!(

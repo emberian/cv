@@ -475,3 +475,124 @@ fn spliced_claude_compaction_boundary_reports_zero_spurious_fidelity_deltas() {
         .iter()
         .any(|r| r["uuid"] == "cb1" && r["subtype"] == "compact_boundary"));
 }
+
+// ───────────────────────────── prune: the count it prints ─────────────────────────────
+
+/// A session whose context shrank before the prune: an early request recorded 900k, the last
+/// one 500k. Revive rewrites the records above its estimate; the harness sizes a resume by the
+/// LAST record. The report names both, and skips a trailing thinking-only record removed by
+/// `--drop-thinking`.
+#[test]
+fn prune_says_which_recorded_size_a_resume_reads_and_what_revive_rewrote() {
+    const SID: &str = "5e1ec7ed-0000-4000-8000-000000000003";
+    let w = World::new("prune-count");
+    let usage = |context: u64| {
+        json!({"input_tokens": 100, "cache_read_input_tokens": context - 300,
+        "cache_creation_input_tokens": 200, "output_tokens": 50})
+    };
+    let record = |ty: &str, uuid: &str, parent: Option<&str>, content: Value, usage: Option<Value>| {
+        let mut v = json!({"type": ty, "uuid": uuid, "parentUuid": parent, "sessionId": SID,
+            "timestamp": "2026-03-03T08:00:00Z", "cwd": "/work/proj",
+            "message": {"role": ty, "model": "claude-opus-5", "content": content}});
+        if let Some(usage) = usage {
+            v["message"]["usage"] = usage;
+        }
+        v
+    };
+    let source = w.write_session(
+        SID,
+        &[
+            record("user", "u1", None, json!("count the seedlings"), None),
+            record(
+                "assistant",
+                "a1",
+                Some("u1"),
+                json!([{"type": "text", "text": "counting"}]),
+                Some(usage(900_000)),
+            ),
+            record("user", "u2", Some("a1"), json!("and the trays?"), None),
+            record(
+                "assistant",
+                "a2",
+                Some("u2"),
+                json!([{"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "ls trays"}}]),
+                Some(usage(499_000)),
+            ),
+            record(
+                "user",
+                "r1",
+                Some("a2"),
+                json!([{"type": "tool_result", "tool_use_id": "t1", "content": "tray ".repeat(2000)}]),
+                None,
+            ),
+            record(
+                "assistant",
+                "a3",
+                Some("r1"),
+                json!([{"type": "text", "text": "twelve trays"}]),
+                Some(usage(500_000)),
+            ),
+            record(
+                "assistant",
+                "a4_think",
+                Some("a3"),
+                json!([{"type": "thinking", "thinking": "double-checking count", "signature": "sig1"}]),
+                Some(usage(510_000)),
+            ),
+        ],
+    );
+
+    // Without `--drop-thinking`, `a4_think` survives and is the last request (510k).
+    let (out, err) = w.cv_ok(&["prune", SID, "--keep-last", "0", "--min-size", "1024", "--json"]);
+    let report: Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(report["resume_reads_tokens_before"], 510_000, "{report}");
+    assert_eq!(report["resume_reads_tokens_after"], 510_000, "{report}");
+    assert_eq!(report["revived"]["usage_records_rewritten"], 1, "{report}");
+    assert_eq!(report["revived"]["recorded_tokens_before"], 900_000, "{report}");
+    let estimate = report["revived"]["recorded_tokens_after"].as_u64().unwrap();
+    assert!((510_000..900_000).contains(&estimate), "{report}");
+    assert!(
+        err.contains(
+            "1 usage record(s) recorded above the post-prune estimate were rewritten to it: highest recorded 900k"
+        ),
+        "{err}"
+    );
+    assert!(
+        err.contains(
+            "resume reads the last request's recorded size (input + cache read + cache creation): 510k, unchanged"
+        ),
+        "{err}"
+    );
+
+    // With `--drop-thinking`, `a4_think` is emptied and removed; `a3` (500k) is now the last request.
+    let (out2, err2) = w.cv_ok(&[
+        "prune",
+        SID,
+        "--keep-last",
+        "0",
+        "--min-size",
+        "1024",
+        "--drop-thinking",
+        "--json",
+    ]);
+    let report2: Value = serde_json::from_str(out2.trim()).unwrap();
+    assert_eq!(report2["resume_reads_tokens_before"], 500_000, "{report2}");
+    assert_eq!(report2["resume_reads_tokens_after"], 500_000, "{report2}");
+    assert!(
+        err2.contains(
+            "resume reads the last request's recorded size (input + cache read + cache creation): 500k, unchanged"
+        ),
+        "{err2}"
+    );
+    let path = source.with_file_name(format!("{}.jsonl", report2["new_id"].as_str().unwrap()));
+    let written = rows(&path);
+    assert!(!written.iter().any(|r| r["uuid"] == "a4_think"));
+    let last = written.into_iter().rfind(|r| r.get("uuid").is_some()).unwrap();
+    assert_eq!(last["uuid"], "a3");
+    let u = &last["message"]["usage"];
+    let sum = ["input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"]
+        .iter()
+        .map(|k| u[*k].as_u64().unwrap())
+        .sum::<u64>();
+    assert_eq!(sum, 500_000);
+}

@@ -634,7 +634,10 @@ counts. `--window` and `--keep` drop whole turns.
 
 By default prune **revives** a maxed session: Claude Code's resume gate reads the last recorded
 `usage`, so prune lowers recorded usage to its estimate of the new prompt (+5%; 1% under to 52% over
-on 28 calibration prunes). `--no-revive` keeps records byte for byte. `--declassify` snips prose
+on 28 calibration prunes). The report names both numbers: the highest record it rewrote and the
+estimate, and on its own line what a resume reads, the LAST request's input + cache read + cache
+creation, which is unchanged when it was already under the estimate (`resume_reads_tokens_before`
+and `_after` in `--json`). `--no-revive` keeps records byte for byte. `--declassify` snips prose
 dense in your terms; cv ships no list. `--json` reports on stdout (`null` paths under `--dry-run`).
 
 Prune and adoption refuse a source line that is not one JSON record, and an empty transcript.
