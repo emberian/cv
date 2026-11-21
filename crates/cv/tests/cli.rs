@@ -4758,3 +4758,89 @@ fn overview_links_initial_and_recent_requests_without_dumping_history() {
     let (ok, _, _, error) = w.cv(&["show", "overview-session", "--kind", "overview,prompt"]);
     assert!(!ok && error.contains("mixes"), "{error}");
 }
+
+#[test]
+fn frozen_ls_and_show_observe_added_and_modified_sessions_without_mutating_catalog() {
+    use std::io::Write as _;
+    let w = World::new("frozen-ls-show-stale-refresh");
+    let existing = w.write_session(
+        "existing-frozen-test",
+        &[user_line(
+            "existing-frozen-test",
+            "u0",
+            "2026-10-01T00:00:00Z",
+            "original prompt",
+        )],
+    );
+    cv_testkit::settle(&w.home);
+    let (warm_ls, _) = w.cv_ok(&["ls", "--json"]);
+    let warm_rows: Vec<serde_json::Value> = serde_json::from_str(&warm_ls).unwrap();
+    assert_eq!(warm_rows.len(), 1);
+    assert_eq!(warm_rows[0]["id"], "existing-frozen-test");
+    assert_eq!(warm_rows[0]["message_count"], 1);
+
+    // Checkpoint catalog.db cleanly if a WAL sidecar was left open, then snapshot $CLUSTERVISION_HOME.
+    {
+        let db = w.cv_home.join("catalog.db");
+        if db.exists() {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+        }
+    }
+    let snapshot_home = || {
+        let mut files = std::collections::BTreeMap::new();
+        for entry in fs::read_dir(&w.cv_home).unwrap() {
+            let p = entry.unwrap().path();
+            if p.is_file() {
+                files.insert(p.clone(), fs::read(&p).unwrap());
+            }
+        }
+        files
+    };
+    let before = snapshot_home();
+
+    // Modify existing transcript and add a brand-new transcript after catalog.db was warmed.
+    let mut f = fs::OpenOptions::new().append(true).open(&existing).unwrap();
+    writeln!(
+        f,
+        "{}",
+        user_line("existing-frozen-test", "u1", "2026-10-01T00:01:00Z", "appended prompt",)
+    )
+    .unwrap();
+    writeln!(f, r#"{{"type":"ai-title","aiTitle":"Fresh Frozen Title"}}"#).unwrap();
+    drop(f);
+
+    w.write_session(
+        "brand-new-frozen-sess",
+        &[user_line(
+            "brand-new-frozen-sess",
+            "n0",
+            "2026-10-01T00:02:00Z",
+            "brand new session body",
+        )],
+    );
+
+    // `cv --frozen ls` must immediately reflect both the modified session and the new session.
+    let (frozen_ls, _) = w.cv_ok(&["--frozen", "ls", "--json"]);
+    let rows: Vec<serde_json::Value> = serde_json::from_str(&frozen_ls).unwrap();
+    assert_eq!(rows.len(), 2, "{frozen_ls}");
+    let new_row = rows
+        .iter()
+        .find(|r| r["id"] == "brand-new-frozen-sess")
+        .expect("new session in --frozen ls");
+    assert_eq!(new_row["message_count"], 1);
+    let mod_row = rows.iter().find(|r| r["id"] == "existing-frozen-test").unwrap();
+    assert_eq!(mod_row["message_count"], 2);
+    assert_eq!(mod_row["title"], "Fresh Frozen Title");
+
+    // `cv --frozen show <new-id>` must also immediately resolve and render the new session.
+    let (shown, _) = w.cv_ok(&["--frozen", "show", "brand-new-frozen-sess"]);
+    assert!(shown.contains("brand new session body"), "{shown}");
+
+    // Nothing in $CLUSTERVISION_HOME was created or mutated.
+    assert_eq!(
+        snapshot_home(),
+        before,
+        "--frozen ls/show must not mutate catalog.db or create -wal/-shm sidecars"
+    );
+}

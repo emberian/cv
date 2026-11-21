@@ -819,25 +819,27 @@ mod imp {
         refs: &[SessionRef],
         watches: &[(PathBuf, Watched)],
         sources: &SourceRows,
-    ) {
+    ) -> bool {
         if crate::env::frozen() {
-            return;
+            return false;
         }
         // Reserve the writer before reading old rows; deferred upgrades cannot wait safely.
         let Ok(tx) = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .inspect_err(note_sql)
         else {
-            return;
+            return false;
         };
         if publish_harness_in(&tx, h, refs, watches, sources)
             .inspect_err(note_sql)
             .is_ok()
         {
-            if let Err(error) = tx.commit() {
-                note_sql(&error);
+            match tx.commit() {
+                Ok(()) => return true,
+                Err(error) => note_sql(&error),
             }
         }
+        false
     }
 
     #[cfg(test)]

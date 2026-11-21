@@ -82,8 +82,9 @@ impl Reader {
         refs: &[SessionRef],
         watches: &[(std::path::PathBuf, super::Watched)],
         before: &super::PrimaryReads,
-    ) {
+    ) -> bool {
         let _ = (h, refs, watches, before);
+        false
     }
 
     pub(crate) fn persist_discovery(&mut self, prune: bool) {
@@ -241,9 +242,12 @@ impl Reader {
         refs: &[SessionRef],
         watches: &[(std::path::PathBuf, super::Watched)],
         before: &super::PrimaryReads,
-    ) {
+    ) -> bool {
+        if crate::env::frozen() {
+            return false;
+        }
         let sources = super::imp::prepare_sources(h, refs, before);
-        super::imp::replace_prepared_in(&mut self.conn.lock().unwrap(), h, refs, watches, &sources);
+        super::imp::replace_prepared_in(&mut self.conn.lock().unwrap(), h, refs, watches, &sources)
     }
 
     pub(crate) fn persist_discovery(&mut self, prune: bool) {

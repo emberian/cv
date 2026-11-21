@@ -1071,7 +1071,6 @@ const ORDER: [Harness; Harness::COUNT] = [
 ];
 
 /// `h`'s place in registration order: where its rows sit in the catalog's listing.
-#[cfg(feature = "sqlite")]
 pub(crate) fn rank(h: Harness) -> usize {
     ORDER.iter().position(|o| *o == h).expect("ORDER names every harness")
 }

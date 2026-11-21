@@ -516,15 +516,18 @@ fn sessions_impl() -> (Vec<SessionRef>, bool) {
         .is_some_and(|t| (chrono::Utc::now().timestamp() - t) < max_stale);
     if fresh_enough {
         if let Some(stale) = catalog.as_ref().and_then(catalog::Reader::probe_stale) {
+            let mut unpersisted = Vec::new();
             if !stale.is_empty() {
                 let reader = catalog.as_mut().expect("staleness was read through this owner");
                 for h in stale {
-                    refresh_harness(h, reader);
+                    if let Some(fresh) = refresh_harness(h, reader) {
+                        unpersisted.push((h, fresh));
+                    }
                 }
                 reader.persist_discovery(false);
             }
             if let Some(rows) = catalog.as_ref().and_then(catalog::Reader::all_sessions) {
-                return (rows, false);
+                return (splice_refreshed_sessions(rows, unpersisted), false);
             }
         }
     }
@@ -537,9 +540,50 @@ fn sessions_impl() -> (Vec<SessionRef>, bool) {
 }
 
 /// Re-discover one harness and replace its catalog rows + watches — the probe's scoped escalation.
-/// On a discover error the previous rows are kept (matching [`discover_all`]'s tolerance).
-fn refresh_harness(h: Harness, catalog: &mut catalog::Reader) {
-    let _ = discover_harness(h, Some(catalog));
+/// Returns `Some(fresh_refs)` when discovery succeeded without persisting to `catalog.db` (e.g.
+/// under `--frozen` or a read-only catalog) so the caller can splice them in memory; on a discover
+/// error `None` keeps the previous catalog rows (matching [`discover_all`]'s tolerance).
+fn refresh_harness(h: Harness, catalog: &mut catalog::Reader) -> Option<Vec<SessionRef>> {
+    let (refs, persisted) = discover_harness_inner(h, Some(catalog))?;
+    (!persisted).then_some(refs)
+}
+
+/// Replace any stale harnesses' catalog rows in memory when their scoped refresh did not persist
+/// to `catalog.db`, preserving discovery's registration order and last-occurrence deduplication.
+fn splice_refreshed_sessions(
+    mut rows: Vec<SessionRef>,
+    unpersisted: Vec<(Harness, Vec<SessionRef>)>,
+) -> Vec<SessionRef> {
+    if unpersisted.is_empty() {
+        return rows;
+    }
+    let mut replacements = std::collections::BTreeMap::new();
+    for (h, refs) in unpersisted {
+        let last: std::collections::HashMap<(String, String), usize> = refs
+            .iter()
+            .enumerate()
+            .map(|(i, r)| ((r.id.clone(), r.path.to_string_lossy().into_owned()), i))
+            .collect();
+        let deduped: Vec<SessionRef> = refs
+            .into_iter()
+            .enumerate()
+            .filter(|(i, r)| last.get(&(r.id.clone(), r.path.to_string_lossy().into_owned())) == Some(i))
+            .map(|(_, r)| r)
+            .collect();
+        replacements.insert(harness::rank(h), deduped);
+    }
+    rows.retain(|r| !replacements.contains_key(&harness::rank(r.harness)));
+    for (rank, fresh) in replacements {
+        if fresh.is_empty() {
+            continue;
+        }
+        let at = rows
+            .iter()
+            .position(|r| harness::rank(r.harness) > rank)
+            .unwrap_or(rows.len());
+        rows.splice(at..at, fresh);
+    }
+    rows
 }
 
 #[cfg(test)]
@@ -550,14 +594,20 @@ thread_local! {
 
 /// Enumerate one complete harness scope without certifying freshness of the rest of the fleet.
 /// Returns the freshly discovered refs even when the catalog cannot be opened or published.
-fn discover_harness(h: Harness, mut catalog: Option<&mut catalog::Reader>) -> Option<Vec<SessionRef>> {
+fn discover_harness(h: Harness, catalog: Option<&mut catalog::Reader>) -> Option<Vec<SessionRef>> {
+    discover_harness_inner(h, catalog).map(|(refs, _)| refs)
+}
+
+fn discover_harness_inner(h: Harness, mut catalog: Option<&mut catalog::Reader>) -> Option<(Vec<SessionRef>, bool)> {
     #[cfg(test)]
     HARNESS_DISCOVERIES.with(|n| n.set(n.get() + 1));
     let a = harness::for_harness(h)?;
     let _sources = source::read_scope();
     let _cache_scope = catalog.as_ref().map(|reader| reader.discovery_scope());
+    let writable = !env::frozen();
     let before = catalog
         .as_ref()
+        .filter(|_| writable)
         .map(|reader| reader.capture_primary_reads(a.as_ref()))
         .unwrap_or_default();
     let roots = a.roots();
@@ -573,12 +623,15 @@ fn discover_harness(h: Harness, mut catalog: Option<&mut catalog::Reader>) -> Op
         }
     };
     note_skipped(&[(h, &skipped)]);
+    let mut persisted = false;
     if let Some(reader) = catalog.as_mut() {
         reader.refill_turns(refs.iter_mut());
-        reader.replace_harness(h, &refs, &catalog::watches_for(a.as_ref(), &roots, &refs), &before);
-        reader.record_skipped(&[(h, &skipped)]);
+        if writable {
+            persisted = reader.replace_harness(h, &refs, &catalog::watches_for(a.as_ref(), &roots, &refs), &before);
+            reader.record_skipped(&[(h, &skipped)]);
+        }
     }
-    Some(refs)
+    Some((refs, persisted))
 }
 
 /// Map `f` over `items`, keeping the `Some` results — in parallel when the `parallel` feature is on
@@ -1158,6 +1211,126 @@ mod copy_authority_tests {
         );
         let prefix = SessionRef::new("same-longer", Harness::Claude, tie.path);
         assert_eq!(pick(vec![prefix, old.clone()], "same").unwrap().unwrap().path, old.path);
+    }
+
+    #[test]
+    #[cfg(feature = "sqlite")]
+    fn frozen_sessions_and_lookup_retain_scoped_refresh_in_memory_without_mutating_catalog() {
+        use std::io::Write as _;
+        let w = crate::test_world("frozen-stale-refresh");
+        let existing = w.write_session(
+            "existing-sess",
+            &[serde_json::json!({
+                "type": "user",
+                "uuid": "u1",
+                "sessionId": "existing-sess",
+                "message": {"role": "user", "content": "initial prompt"}
+            })],
+        );
+        cv_testkit::settle(&w.home);
+        let initial = discover_all();
+        assert_eq!(initial.len(), 1);
+        assert_eq!(initial[0].id, "existing-sess");
+        assert_eq!(initial[0].message_count, Some(1));
+
+        // Checkpoint catalog.db so no WAL sidecars exist and snapshot every file in cv_home.
+        if let Some(conn) = catalog::open_db() {
+            let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+        }
+        let snapshot_cv_home = || {
+            let mut out = std::collections::BTreeMap::new();
+            for entry in std::fs::read_dir(&w.cv_home).unwrap() {
+                let p = entry.unwrap().path();
+                if p.is_file() {
+                    out.insert(p.clone(), (source::FileId::at(&p), std::fs::read(&p).unwrap()));
+                }
+            }
+            out
+        };
+        let before_cv_home = snapshot_cv_home();
+
+        // Append a turn + title to `existing-sess` and add a brand-new session in Claude AND Codex
+        // (a harness that previously had 0 rows in catalog.db) so splicing tests both replacement
+        // and registration-order insertion.
+        writeln!(
+            std::fs::OpenOptions::new().append(true).open(&existing).unwrap(),
+            "{}",
+            serde_json::json!({
+                "type": "user",
+                "uuid": "u2",
+                "sessionId": "existing-sess",
+                "message": {"role": "user", "content": "second prompt"}
+            })
+        )
+        .unwrap();
+        writeln!(
+            std::fs::OpenOptions::new().append(true).open(&existing).unwrap(),
+            "{}",
+            serde_json::json!({"type": "ai-title", "aiTitle": "Updated Title"})
+        )
+        .unwrap();
+        w.write_session(
+            "added-claude",
+            &[serde_json::json!({
+                "type": "user",
+                "uuid": "n1",
+                "sessionId": "added-claude",
+                "message": {"role": "user", "content": "fresh under frozen"}
+            })],
+        );
+        let codex_dir = w.home.join(".codex/sessions");
+        std::fs::create_dir_all(&codex_dir).unwrap();
+        std::fs::write(
+            codex_dir.join("rollout-added-codex.jsonl"),
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"added-codex\"}}\n",
+        )
+        .unwrap();
+
+        {
+            let _frozen = env::Env::from_vars([
+                ("CLUSTERVISION_HOME", w.cv_home.as_os_str()),
+                ("HOME", w.home.as_os_str()),
+            ])
+            .with_frozen()
+            .enter();
+
+            let (listed, was_full) = sessions_impl();
+            assert!(
+                !was_full,
+                "warm catalog under --frozen must use scoped refresh, not full scan"
+            );
+            let ids: Vec<(&str, Harness)> = listed.iter().map(|r| (r.id.as_str(), r.harness)).collect();
+            assert!(ids.contains(&("existing-sess", Harness::Claude)), "{ids:?}");
+            assert!(ids.contains(&("added-claude", Harness::Claude)), "{ids:?}");
+            assert!(ids.contains(&("added-codex", Harness::Codex)), "{ids:?}");
+            // Registration order: all Claude rows precede Codex rows.
+            let first_codex = listed.iter().position(|r| r.harness == Harness::Codex).unwrap();
+            assert!(listed[..first_codex].iter().all(|r| r.harness == Harness::Claude));
+
+            let updated = listed.iter().find(|r| r.id == "existing-sess").unwrap();
+            assert_eq!(updated.message_count, Some(2));
+            assert_eq!(updated.title.as_deref(), Some("Updated Title"));
+
+            let found_new = find_cheap("added-claude", None)
+                .unwrap()
+                .expect("new session resolves via find_cheap");
+            assert_eq!(found_new.0.id, "added-claude");
+            let found_codex = find_cheap("added-codex", None)
+                .unwrap()
+                .expect("new codex session resolves");
+            assert_eq!(found_codex.0.id, "added-codex");
+        }
+
+        // catalog.db on disk was NOT mutated at all (and raw `cataloged_sessions` still has only the old row).
+        assert_eq!(
+            snapshot_cv_home(),
+            before_cv_home,
+            "--frozen must not mutate catalog.db or create sidecars"
+        );
+        let persisted_only = cataloged_sessions();
+        assert_eq!(persisted_only.len(), 1);
+        assert_eq!(persisted_only[0].id, "existing-sess");
+        assert_eq!(persisted_only[0].message_count, Some(1));
     }
 }
 
