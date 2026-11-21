@@ -27,6 +27,25 @@ pub(super) fn head(path: &Path, rows: u32) -> Result<jsonl::Read> {
     read(path, false, i64::from(rows))
 }
 
+/// Validates the native `steps` schema for discovery: `Err` when `path` is not a valid SQLite
+/// database or lacks `steps(idx, step_payload, step_format)`, `Ok(false)` when `steps` holds
+/// zero rows, and `Ok(true)` when at least one step row is present.
+pub(super) fn has_steps(path: &Path) -> Result<bool> {
+    use rusqlite::OptionalExtension as _;
+    sqlite::open_ro(path)?.read_snapshot(|conn, _| {
+        let _: i64 = conn.query_row("SELECT count(*) FROM sqlite_schema", [], |r| r.get(0))?;
+        let columns = sqlite::Select::of(conn, "steps");
+        anyhow::ensure!(
+            columns.has("idx") && columns.has("step_payload") && columns.has("step_format"),
+            "unsupported Antigravity native steps schema"
+        );
+        let row: Option<i64> = conn
+            .query_row("SELECT 1 FROM steps LIMIT 1", [], |r| r.get(0))
+            .optional()?;
+        Ok(row.is_some())
+    })
+}
+
 fn read(path: &Path, complete: bool, limit: i64) -> Result<jsonl::Read> {
     let mut reads = ReadSet::default();
     record_sqlite_readset(path, &mut reads);

@@ -221,9 +221,42 @@ impl Adapter for Antigravity {
             {
                 let conv_db = loc.app_data_dir.join("conversations").join(format!("{}.db", loc.id));
                 record_sqlite_deps(&conv_db, &mut deps.files);
+                record_sqlite_deps(&loc.app_data_dir.join("conversation_summaries.db"), &mut deps.files);
+                for root in &self.roots {
+                    if root != &loc.app_data_dir {
+                        record_sqlite_deps(
+                            &root.join("conversations").join(format!("{}.db", loc.id)),
+                            &mut deps.files,
+                        );
+                    }
+                }
             }
         }
         Some(())
+    }
+
+    fn rows_store(&self, r: &SessionRef) -> Option<PathBuf> {
+        #[cfg(feature = "sqlite")]
+        {
+            BrainLoc::from_transcript(&r.path).map(|loc| loc.app_data_dir.join("conversation_summaries.db"))
+        }
+        #[cfg(not(feature = "sqlite"))]
+        {
+            let _ = r;
+            None
+        }
+    }
+
+    fn rows(&self, store: &Path) -> Option<std::collections::HashMap<String, crate::source::Rows>> {
+        #[cfg(feature = "sqlite")]
+        {
+            summary_rows(store)
+        }
+        #[cfg(not(feature = "sqlite"))]
+        {
+            let _ = store;
+            None
+        }
     }
 
     fn delivered_body<'a>(&self, m: &Message, text: &'a str) -> Option<&'a str> {
@@ -396,10 +429,11 @@ impl Adapter for Antigravity {
 
         let mut out = crate::Discovered::default();
         // Deduplicate by session UUID across roots, preferring higher-fidelity log ranks
-        // (full log = 4 > full chunks = 3 > compact log/chunks = 2 > overview = 1 > flat = 0).
-        // Earlier roots win ties (`antigravity-cli` > `antigravity` > `antigravity-ide`).
+        // (full log = 4 > full chunks = 3 > compact log/chunks = 2 > overview/native = 1 > flat = 0)
+        // and breaking equal-rank ties by mtime, then earlier root (`antigravity-cli` > `antigravity` > `antigravity-ide`).
         struct Candidate {
             rank: u8,
+            mtime: Option<std::time::SystemTime>,
             transcript: PathBuf,
             app_data_dir: Option<PathBuf>,
         }
@@ -429,7 +463,7 @@ impl Adapter for Antigravity {
                     };
                     if id.starts_with('.') {
                         continue;
-                    }
+                    };
                     let brain_dir = brain_root.join(&entry.name);
                     let is_dir = entry.file_type == crate::io_admission::BulkFileType::Dir
                         || (entry.file_type == crate::io_admission::BulkFileType::Symlink && brain_dir.is_dir());
@@ -439,15 +473,17 @@ impl Adapter for Antigravity {
                     let Some((rank, log_path)) = select_brain_log(&brain_dir) else {
                         continue;
                     };
+                    let mtime = file_mtime(&log_path);
                     let replace = match candidates.get(id) {
                         None => true,
-                        Some(prev) => rank > prev.rank,
+                        Some(prev) => (rank, mtime) > (prev.rank, prev.mtime),
                     };
                     if replace {
                         candidates.insert(
                             id.to_string(),
                             Candidate {
                                 rank,
+                                mtime,
                                 transcript: log_path,
                                 app_data_dir: Some(root.clone()),
                             },
@@ -465,15 +501,34 @@ impl Adapter for Antigravity {
                 let Some(id) = path.file_stem().and_then(|s| s.to_str()).map(str::to_owned) else {
                     continue;
                 };
-                if candidates.get(&id).is_none_or(|candidate| candidate.rank == 0) {
-                    candidates.insert(
-                        id,
-                        Candidate {
-                            rank: 1,
-                            transcript: path,
-                            app_data_dir: Some(root.clone()),
-                        },
-                    );
+                let mtime = file_mtime(&path);
+                let prev_rank = candidates.get(&id).map(|c| c.rank);
+                let wins_tie = candidates
+                    .get(&id)
+                    .is_none_or(|prev| (1u8, mtime) > (prev.rank, prev.mtime));
+                if !wins_tie {
+                    continue;
+                }
+                match native::has_steps(&path) {
+                    Ok(true) => {
+                        candidates.insert(
+                            id,
+                            Candidate {
+                                rank: 1,
+                                mtime,
+                                transcript: path,
+                                app_data_dir: Some(root.clone()),
+                            },
+                        );
+                    }
+                    Ok(false) => {}
+                    // Only report a broken/non-step DB when no exported brain log already owns the ID
+                    // (1.5.6 stores metadata-only `.db` sidecars without a `steps` table beside brain logs).
+                    Err(err) => {
+                        if prev_rank.is_none_or(|r| r == 0) {
+                            out.keep(&path, Err::<(), _>(err));
+                        }
+                    }
                 }
             }
 
@@ -504,7 +559,14 @@ impl Adapter for Antigravity {
                     continue;
                 }
                 let id = fname.trim_end_matches(".jsonl").to_string();
-                if id.is_empty() || candidates.contains_key(&id) {
+                if id.is_empty() {
+                    continue;
+                }
+                let mtime = file_mtime(&path);
+                let wins_tie = candidates
+                    .get(&id)
+                    .is_none_or(|prev| (0u8, mtime) > (prev.rank, prev.mtime));
+                if !wins_tie {
                     continue;
                 }
                 if looks_like_antigravity_file(&path) {
@@ -512,6 +574,7 @@ impl Adapter for Antigravity {
                         id,
                         Candidate {
                             rank: 0,
+                            mtime,
                             transcript: path,
                             app_data_dir: None,
                         },
@@ -534,7 +597,14 @@ impl Adapter for Antigravity {
                         .join("subagents"),
                 );
                 #[cfg(feature = "sqlite")]
-                record_sqlite_readset(&app_dir.join("conversations").join(format!("{id}.db")), &mut reads);
+                {
+                    record_sqlite_readset(&app_dir.join("conversations").join(format!("{id}.db")), &mut reads);
+                    for root in &self.roots {
+                        if root != app_dir {
+                            record_sqlite_readset(&root.join("conversations").join(format!("{id}.db")), &mut reads);
+                        }
+                    }
+                }
             }
             let res = crate::discover_cache::cached_scan_with_reads(&cand.transcript, reads, || {
                 scan_transcript(&id, &cand.transcript, cand.app_data_dir.as_deref())
@@ -653,7 +723,13 @@ impl Adapter for Antigravity {
                 #[cfg(feature = "sqlite")]
                 {
                     let conv_db = loc.app_data_dir.join("conversations").join(format!("{}.db", loc.id));
-                    sink.dependency(&conv_db);
+                    record_sink_sqlite_deps(&conv_db, sink);
+                    record_sink_sqlite_deps(&loc.app_data_dir.join("conversation_summaries.db"), sink);
+                    for root in &self.roots {
+                        if root != &loc.app_data_dir {
+                            record_sink_sqlite_deps(&root.join("conversations").join(format!("{}.db", loc.id)), sink);
+                        }
+                    }
                 }
             }
             // Header enrichment is owned from its read snapshot. Its dependencies still
@@ -702,54 +778,105 @@ impl Adapter for Antigravity {
             #[cfg(feature = "sqlite")]
             if !is_native_store(&r.path) {
                 if let Some(loc) = BrainLoc::from_transcript(&r.path) {
-                    let db = loc.app_data_dir.join("conversations").join(format!("{}.db", loc.id));
-                    if db.is_file() {
-                        // A changing or unreadable sidecar must not erase surviving export
-                        // history; whatever it holds beyond the export is then unaccounted for.
-                        let verified = merge::verified(
-                            &input,
-                            &order,
-                            &db,
-                            opts.tier == Tier::Complete,
-                            matches!(from, Start::Whole),
-                        );
-                        if verified.is_err() {
+                    let local_db = loc.app_data_dir.join("conversations").join(format!("{}.db", loc.id));
+                    let local_mtime = local_db.is_file().then(|| file_mtime(&local_db)).flatten();
+                    let cross_db = self
+                        .roots
+                        .iter()
+                        .filter(|root| *root != &loc.app_data_dir)
+                        .map(|root| root.join("conversations").join(format!("{}.db", loc.id)))
+                        .filter(|cand| cand.is_file())
+                        .filter_map(|cand| {
+                            let cand_mtime = file_mtime(&cand);
+                            if !local_db.is_file() || cand_mtime > local_mtime {
+                                Some((cand_mtime, cand))
+                            } else {
+                                None
+                            }
+                        })
+                        .max_by(|(a_mtime, _), (b_mtime, _)| a_mtime.cmp(b_mtime))
+                        .map(|(_, path)| path);
+
+                    fn adopt_verified(
+                        verified: merge::Verified,
+                        order: &mut StepOrder,
+                        codec: &mut StepCodec,
+                        native_only: &mut Option<(jsonl::Read, StepOrder)>,
+                    ) {
+                        if !verified.matches.is_empty()
+                            || !verified.native_only.steps.is_empty()
+                            || verified.unreconciled
+                        {
+                            order
+                                .coverage
+                                .sources
+                                .insert(crate::coverage::ReadCoverage::NATIVE_STORE.into());
+                            if verified.unread_fields {
+                                order
+                                    .coverage
+                                    .limitations
+                                    .insert(crate::coverage::ReadCoverage::UNSUPPORTED_NATIVE_FIELDS.into());
+                            }
+                        }
+                        codec.enrich.verified = verified.matches;
+                        for index in &verified.recovered_media {
+                            order.missing_media.remove(index);
+                        }
+                        if verified.unreconciled {
                             order
                                 .coverage
                                 .limitations
                                 .insert(crate::coverage::ReadCoverage::UNRECONCILED_HISTORY.into());
                         }
-                        if let Ok(verified) = verified {
-                            if !verified.matches.is_empty()
-                                || !verified.native_only.steps.is_empty()
-                                || verified.unreconciled
-                            {
-                                order
-                                    .coverage
-                                    .sources
-                                    .insert(crate::coverage::ReadCoverage::NATIVE_STORE.into());
-                                if verified.unread_fields {
-                                    order
-                                        .coverage
-                                        .limitations
-                                        .insert(crate::coverage::ReadCoverage::UNSUPPORTED_NATIVE_FIELDS.into());
-                                }
+                        if !verified.native_only.steps.is_empty() {
+                            let found = &verified.native_only.coverage;
+                            order.coverage.sources.extend(found.sources.iter().cloned());
+                            order.coverage.limitations.extend(found.limitations.iter().cloned());
+                            *native_only = Some((verified.native, verified.native_only));
+                        }
+                    }
+
+                    // A cross-root native DB (e.g. CLI resuming an IDE-mirrored export) is adopted
+                    // only when overlapping steps verify with zero conflicts; unrelated divergent
+                    // copies in another root stay separate and never flag unreconciled_history.
+                    let mut adopted_cross = false;
+                    if let Some(cross_db) = cross_db {
+                        if let Ok(verified) = merge::verified(
+                            &input,
+                            &order,
+                            &cross_db,
+                            opts.tier == Tier::Complete,
+                            matches!(from, Start::Whole),
+                        ) {
+                            if verified.overlaps_verified && !verified.unreconciled {
+                                apply_native_db_metadata(
+                                    &cross_db,
+                                    opts.tier >= Tier::Rich,
+                                    &mut codec.s,
+                                    &mut codec.enrich,
+                                );
+                                adopt_verified(verified, &mut order, &mut codec, &mut native_only);
+                                adopted_cross = true;
                             }
-                            codec.enrich.verified = verified.matches;
-                            for index in &verified.recovered_media {
-                                order.missing_media.remove(index);
-                            }
-                            if verified.unreconciled {
+                        }
+                    }
+
+                    if !adopted_cross && local_db.is_file() {
+                        // A changing or unreadable sidecar must not erase surviving export
+                        // history; whatever it holds beyond the export is then unaccounted for.
+                        match merge::verified(
+                            &input,
+                            &order,
+                            &local_db,
+                            opts.tier == Tier::Complete,
+                            matches!(from, Start::Whole),
+                        ) {
+                            Ok(verified) => adopt_verified(verified, &mut order, &mut codec, &mut native_only),
+                            Err(_) => {
                                 order
                                     .coverage
                                     .limitations
                                     .insert(crate::coverage::ReadCoverage::UNRECONCILED_HISTORY.into());
-                            }
-                            if !verified.native_only.steps.is_empty() {
-                                let found = &verified.native_only.coverage;
-                                order.coverage.sources.extend(found.sources.iter().cloned());
-                                order.coverage.limitations.extend(found.limitations.iter().cloned());
-                                native_only = Some((verified.native, verified.native_only));
                             }
                         }
                     }
@@ -1129,11 +1256,26 @@ fn select_session_source(root: &Path, id: &str) -> Option<PathBuf> {
     #[cfg(feature = "sqlite")]
     {
         let path = root.join("conversations").join(format!("{id}.db"));
-        if path.is_file() {
+        if path.is_file() && native::has_steps(&path).unwrap_or(false) {
             return Some(path);
         }
     }
     log.map(|(_, path)| path)
+}
+
+fn file_mtime(path: &Path) -> Option<std::time::SystemTime> {
+    let base = fs::metadata(path).ok().and_then(|m| m.modified().ok());
+    #[cfg(feature = "sqlite")]
+    if is_native_store(path) {
+        let mut wal_os = path.as_os_str().to_os_string();
+        wal_os.push("-wal");
+        let wal = fs::metadata(Path::new(&wal_os))
+            .ok()
+            .filter(|m| m.len() > 0)
+            .and_then(|m| m.modified().ok());
+        return base.max(wal);
+    }
+    base
 }
 
 /// Prefer full history, including its byte-chunked copy, over the compact projection.
@@ -1492,6 +1634,9 @@ fn peek_head(input: &jsonl::Read, title: &mut Option<String>, created_at: &mut O
 fn scan_transcript(id: &str, transcript: &Path, app_data_dir: Option<&Path>) -> Result<Option<SessionRef>> {
     #[cfg(feature = "sqlite")]
     if is_native_store(transcript) {
+        if !native::has_steps(transcript)? {
+            return Ok(None);
+        }
         let metadata = native::metadata(transcript, false)?;
         let mut reference = SessionRef::new(id, Harness::Antigravity, transcript);
         reference.cwd = metadata.cwd;
@@ -1641,42 +1786,7 @@ fn build_session_header(r: &SessionRef, opts: &Demand) -> (Session, SidecarEnric
     {
         let conv_db = loc.app_data_dir.join("conversations").join(format!("{}.db", loc.id));
         if conv_db.is_file() {
-            if let Ok(db_meta) = native::metadata(&conv_db, true) {
-                if s.cwd.is_none() {
-                    s.cwd = db_meta.cwd;
-                }
-                if s.created_at.is_none() {
-                    s.created_at = db_meta.created_at;
-                }
-                if let Some(branch) = db_meta.git_branch {
-                    s.git = Some(GitInfo {
-                        branch: Some(branch),
-                        commit: None,
-                        remote: None,
-                    });
-                }
-                if let Some(git_root) = db_meta.git_root {
-                    if want_extra {
-                        s.harness_extra_mut(Harness::Antigravity)
-                            .insert("git_root".into(), Value::String(git_root.display().to_string()));
-                    }
-                }
-                s.lineage.parent = db_meta.parent_id;
-                if want_extra {
-                    let bag = s.harness_extra_mut(Harness::Antigravity);
-                    for (key, value) in [
-                        ("root_conversation_id", db_meta.root_id),
-                        ("agent_type", db_meta.agent_type),
-                        ("agent_role", db_meta.agent_role),
-                    ] {
-                        if let Some(value) = value {
-                            bag.insert(key.into(), Value::String(value));
-                        }
-                    }
-                }
-                s.model = db_meta.dominant_model;
-                enrich.step_models = db_meta.step_models;
-            }
+            apply_native_db_metadata(&conv_db, want_extra, &mut s, &mut enrich);
         }
 
         let sum_db = loc.app_data_dir.join("conversation_summaries.db");
@@ -2976,6 +3086,111 @@ fn record_sqlite_deps(db: &Path, out: &mut Vec<PathBuf>) {
         os.push(suffix);
         out.push(PathBuf::from(os));
     }
+}
+
+#[cfg(feature = "sqlite")]
+fn record_sink_sqlite_deps(db: &Path, sink: &mut dyn MessageSink) {
+    sink.dependency(db);
+    for suffix in ["-wal", "-journal"] {
+        let mut os = db.as_os_str().to_os_string();
+        os.push(suffix);
+        sink.dependency(Path::new(&os));
+    }
+}
+
+#[cfg(feature = "sqlite")]
+fn apply_native_db_metadata(conv_db: &Path, want_extra: bool, s: &mut Session, enrich: &mut SidecarEnrich) {
+    if let Ok(db_meta) = native::metadata(conv_db, true) {
+        if s.cwd.is_none() {
+            s.cwd = db_meta.cwd;
+        }
+        if s.created_at.is_none() {
+            s.created_at = db_meta.created_at;
+        }
+        if s.git.is_none() {
+            if let Some(branch) = db_meta.git_branch {
+                s.git = Some(GitInfo {
+                    branch: Some(branch),
+                    commit: None,
+                    remote: None,
+                });
+            }
+        }
+        if let Some(git_root) = db_meta.git_root {
+            if want_extra {
+                s.harness_extra_mut(Harness::Antigravity)
+                    .entry("git_root")
+                    .or_insert_with(|| Value::String(git_root.display().to_string()));
+            }
+        }
+        if s.lineage.parent.is_none() {
+            s.lineage.parent = db_meta.parent_id;
+        }
+        if want_extra {
+            let bag = s.harness_extra_mut(Harness::Antigravity);
+            for (key, value) in [
+                ("root_conversation_id", db_meta.root_id),
+                ("agent_type", db_meta.agent_type),
+                ("agent_role", db_meta.agent_role),
+            ] {
+                if let Some(value) = value {
+                    bag.entry(key).or_insert(Value::String(value));
+                }
+            }
+        }
+        if s.model.is_none() {
+            s.model = db_meta.dominant_model;
+        }
+        for (step, model) in db_meta.step_models {
+            enrich.step_models.entry(step).or_insert(model);
+        }
+    }
+}
+
+#[cfg(feature = "sqlite")]
+fn summary_rows(store: &Path) -> Option<HashMap<String, crate::source::Rows>> {
+    use crate::source::Rows;
+    let app_data_dir = store.parent()?;
+    let mut certificates = super::store::sqlite::Certificates::default();
+    let seed = Rows {
+        count: 0,
+        high: 0,
+        digest: Rows::SEED,
+    };
+    if let Ok(entries) = fs::read_dir(app_data_dir.join("brain")) {
+        for entry in entries.flatten() {
+            if let Ok(name) = entry.file_name().into_string() {
+                if !name.starts_with('.') {
+                    certificates.0.entry(name).or_insert(seed);
+                }
+            }
+        }
+    }
+    if let Ok(entries) = fs::read_dir(app_data_dir.join("conversations")) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if is_native_store(&path) {
+                if let Some(id) = path.file_stem().and_then(|s| s.to_str()) {
+                    certificates.0.entry(id.to_owned()).or_insert(seed);
+                }
+            }
+        }
+    }
+    if store.try_exists().ok()? {
+        super::store::sqlite::open_ro(store)
+            .ok()?
+            .read_snapshot(|conn, _| {
+                if !super::store::sqlite::table_exists(conn, "conversation_summaries") {
+                    return Ok(());
+                }
+                if let Some(select_sql) = summary_columns_sql(conn)? {
+                    certificates.digest(conn, &format!("{select_sql} ORDER BY conversation_id"))?;
+                }
+                Ok(())
+            })
+            .ok()?;
+    }
+    Some(certificates.0)
 }
 
 #[cfg(feature = "sqlite")]

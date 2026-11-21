@@ -123,16 +123,40 @@ mod native {
                     assert!(coverage.limitations.contains(ReadCoverage::UNSUPPORTED_NATIVE_FIELDS));
                 }
             }
-            for (suffix, pointer) in [
-                ("head", "/extra/cv/read_coverage"),
-                ("messages", "/session/extra/cv/read_coverage"),
-            ] {
-                let reply = api(suffix);
-                assert!(evidence(reply.pointer(pointer).unwrap())
-                    .sources
-                    .contains(ReadCoverage::NATIVE_STORE));
+            if unknown {
+                for (suffix, pointer) in [
+                    ("head", "/extra/cv/read_coverage"),
+                    ("messages", "/session/extra/cv/read_coverage"),
+                ] {
+                    let reply = api(suffix);
+                    assert!(evidence(reply.pointer(pointer).unwrap())
+                        .sources
+                        .contains(ReadCoverage::NATIVE_STORE));
+                }
+            } else {
+                // An empty 0-row native shell DB is omitted from discovery while remaining
+                // directly readable via `collect_with` above.
+                let discovered = adapter.discover().unwrap();
+                assert!(discovered.refs.is_empty());
+                assert!(discovered.skipped.is_empty());
+                let (status, _) = cv_core::api::route_json(&["api", "session", "antigravity", ID, "head"], "");
+                assert_eq!(status, 404);
             }
         }
+
+        // A `.db` in `conversations/` without the `steps` schema is reported in `Discovered::skipped`.
+        let world = World::in_process("agy-missing-steps-schema", cv_core::env::Env::enter_isolated);
+        let root = world.home.join(".gemini/antigravity-cli");
+        fs::create_dir_all(root.join("conversations")).unwrap();
+        let bad_db = root.join("conversations").join(format!("{ID}.db"));
+        rusqlite::Connection::open(&bad_db)
+            .unwrap()
+            .execute_batch("CREATE TABLE unrelated (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        let discovered = Antigravity::with_home(&root).discover().unwrap();
+        assert!(discovered.refs.is_empty());
+        assert_eq!(discovered.skipped.len(), 1);
+        assert_eq!(discovered.skipped[0].path, bad_db);
     }
 
     #[test]

@@ -36,6 +36,8 @@ pub(super) struct Verified {
     pub native: jsonl::Read,
     /// Native steps the export lacks, each beside verified exported steps.
     pub native_only: StepOrder,
+    /// Every comparable overlapping step matched, with at least one verified overlap.
+    pub overlaps_verified: bool,
     /// A native step the export lacks could not be placed beside verified history.
     pub unreconciled: bool,
     /// Some native step holds a field no decoder reads.
@@ -340,6 +342,7 @@ pub(super) fn verified(
             verdicts.insert(*index, equal);
         }
     }
+    let overlaps_verified = verdicts.values().any(|&v| v) && verdicts.values().all(|&v| v);
     let mut accepted = BTreeSet::new();
     let mut unreconciled = false;
     for index in steps.keys().filter(|index| !order.steps.contains_key(index)) {
@@ -441,6 +444,7 @@ pub(super) fn verified(
         matches,
         native,
         native_only,
+        overlaps_verified,
         unreconciled,
         unread_fields,
         recovered_media,
