@@ -241,9 +241,10 @@ enum Cmd {
     Search {
         #[arg(required_unless_present = "batch", conflicts_with = "batch")]
         query: Option<String>,
-        /// Read JSON query strings from stdin, one per line, over one pinned index snapshot.
-        /// Emits one JSON answer/error per line; no discovery, live reads or current-source
-        /// freshness checks. Filters and stored previews describe indexed revisions.
+        /// Read JSON query strings or `{"query", "refresh"}` / `{"refresh": true}` request objects
+        /// from stdin, one per line, over one pinned index snapshot. Emits one JSON answer,
+        /// refresh ack, or error per line; no discovery, live reads or current-source freshness
+        /// checks. Filters and stored previews describe indexed revisions.
         #[arg(long, conflicts_with_all = ["scan", "exact", "filter_query", "live_bytes"])]
         batch: bool,
         #[arg(long)]

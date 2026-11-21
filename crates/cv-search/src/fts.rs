@@ -5335,6 +5335,7 @@ mod tests {
         prepared.refresh().unwrap();
         let fresh = prepared.search("zqneedle", 1, filter, None).unwrap();
         assert_ne!(fresh.snapshot_id, snapshot);
+        assert_eq!(prepared.indexed_documents(), fresh.indexed_documents);
         assert_eq!(fresh.work.stored_document_reads, first.work.stored_document_reads);
         assert_eq!(fresh.work.discovery_sessions, 0);
         for scope in [crate::Scope::Exchange, crate::Scope::Context, crate::Scope::All] {

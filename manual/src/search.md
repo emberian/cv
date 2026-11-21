@@ -123,15 +123,19 @@ an error, never a fallback to scanning. `--kind` cannot be combined with `--scan
 ## Repeated queries over an indexed snapshot
 
 ```sh
-printf '%s\n' '"retry backoff"' '"harness:claude timeout"' | cv search --batch --limit 10
+printf '%s\n' '"retry backoff"' '{"refresh":true,"query":"harness:claude timeout"}' | cv search --batch --limit 10
 ```
 
-`--batch` opens one full-text reader and accepts one JSON string query per line on stdin.
-Each response is one JSON object: `{"answer": {...}, "setup_micros": N}` or
-`{"error": "...", "snapshot_id": "..."}`. Invalid JSON, invalid query syntax and input lines
-larger than 1 MiB return an error for that request; subsequent requests continue. Output is
-never silently shortened. `--limit` limits returned hits; `total` counts all matching sessions,
-including with `--limit 0`. Startup errors (such as a missing index) fail the command.
+`--batch` opens one full-text reader and accepts one JSON request per line on stdin: a query
+string (`"..."`), `{"query": "...", "refresh": true|false}` (`refresh` defaults to `false`), or
+`{"refresh": true}` alone to reopen the index in place. Query lines emit
+`{"answer": {...}, "setup_micros": N}`, standalone refresh lines emit
+`{"refreshed": true, "snapshot_id": "...", "indexed_documents": D, "setup_micros": N}`, and
+rejected lines emit `{"error": "...", "snapshot_id": "..."}`. Invalid JSON, empty or unknown-key
+objects, invalid query syntax, failed refreshes and input lines larger than 1 MiB return an error
+for that request while keeping the prior snapshot active for subsequent requests. Output is never
+silently shortened. `--limit` limits returned hits; `total` counts all matching sessions, including
+with `--limit 0`. Startup errors (such as a missing index) fail the command.
 
 Batch `hits` use the library `Hit` schema: timestamps are Unix seconds, and there are no
 `path`, `message_count` or `size_bytes` fields. Ordinary `--json` emits enriched session rows;
@@ -151,10 +155,11 @@ live snippets and freshness disclosures need not match.
 
 Every answer includes a stable, opaque `snapshot_id` for the reader lifetime and
 `indexed_documents` (metadata and text chunks, **not** session count). This ID is not a source
-revision or commit hash. Commits made while the batch runs remain invisible. Start another
-batch to reopen. Library callers can reuse `cv_search::PreparedIndex::{open, search,
-matching_ids}` and explicitly `refresh`; successful refresh starts a new reader lifetime,
-while failed refresh leaves the previous snapshot usable. Caller-provided ID allowlists are
+revision or commit hash. Commits made while the batch runs remain invisible until a request passes
+`"refresh": true`, which atomically reopens the index and starts a new `snapshot_id` (leaving the
+previous snapshot usable if reopening fails). Library callers can reuse
+`cv_search::PreparedIndex::{open, search, matching_ids, indexed_documents}` and explicitly
+`refresh`. Caller-provided ID allowlists are
 applied anew on every `search`; a folded child matches its own or its parent's allowed ID.
 
 `work` reports per-query logical work: top-level ranking/count passes, metadata lookup queries,

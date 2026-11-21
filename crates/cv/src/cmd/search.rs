@@ -117,14 +117,33 @@ pub(crate) fn cmd_search(args: SearchArgs<'_>) -> Result<()> {
     render(found, query, json)
 }
 
-/// A streaming batch pins the index once; malformed queries do not discard later requests.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BatchControl {
+    #[serde(default, deserialize_with = "explicit_string")]
+    query: Option<String>,
+    #[serde(default)]
+    refresh: bool,
+}
+
+fn explicit_string<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Option<String>, D::Error> {
+    <String as serde::Deserialize>::deserialize(d).map(Some)
+}
+
+enum BatchOutcome {
+    Answer(cv_search::IndexedAnswer),
+    Refreshed,
+}
+
+/// A streaming batch pins the index once and refreshes in place on request; malformed queries
+/// or failed refreshes do not discard the active snapshot or later requests.
 fn batch_search(filter: cv_search::SearchFilter<'_>, limit: usize) -> Result<()> {
     use std::io::{BufRead, IsTerminal};
     anyhow::ensure!(
         !std::io::stdin().is_terminal(),
         "search --batch reads JSON query strings from piped stdin"
     );
-    let prepared = cv_search::PreparedIndex::open(&cv_search::default_tantivy_dir())?;
+    let mut prepared = cv_search::PreparedIndex::open(&cv_search::default_tantivy_dir())?;
     let mut output = std::io::BufWriter::new(std::io::stdout().lock());
     // A malformed/oversized request is isolated to its line. Drain rejected input
     // without retaining it, then continue with the next query.
@@ -136,18 +155,49 @@ fn batch_search(filter: cv_search::SearchFilter<'_>, limit: usize) -> Result<()>
         if read == 0 {
             break;
         }
-        let result = if read as u64 > MAX_QUERY_LINE {
+        let result: Result<BatchOutcome> = if read as u64 > MAX_QUERY_LINE {
             if !line.ends_with(b"\n") {
                 input.skip_until(b'\n')?;
             }
             Err(anyhow::anyhow!("batch query line exceeds 1048576-byte input limit"))
+        } else if line
+            .iter()
+            .find(|b| !matches!(**b, b' ' | b'\t' | b'\r' | b'\n'))
+            .is_some_and(|&b| b == b'{')
+        {
+            serde_json::from_slice::<BatchControl>(&line)
+                .map_err(anyhow::Error::from)
+                .and_then(|req| match (req.refresh, req.query) {
+                    (false, None) => Err(anyhow::anyhow!(
+                        "batch request object must specify \"query\" or \"refresh\": true"
+                    )),
+                    (true, None) => {
+                        prepared.refresh()?;
+                        Ok(BatchOutcome::Refreshed)
+                    }
+                    (refresh, Some(query)) => {
+                        if refresh {
+                            prepared.refresh()?;
+                        }
+                        prepared.search(&query, limit, filter, None).map(BatchOutcome::Answer)
+                    }
+                })
         } else {
             serde_json::from_slice::<String>(&line)
                 .map_err(anyhow::Error::from)
                 .and_then(|query| prepared.search(&query, limit, filter, None))
+                .map(BatchOutcome::Answer)
         };
         let row = match result {
-            Ok(answer) => serde_json::json!({"answer":answer,"setup_micros":prepared.setup_micros()}),
+            Ok(BatchOutcome::Answer(answer)) => {
+                serde_json::json!({"answer":answer,"setup_micros":prepared.setup_micros()})
+            }
+            Ok(BatchOutcome::Refreshed) => serde_json::json!({
+                "refreshed": true,
+                "snapshot_id": prepared.snapshot_id(),
+                "indexed_documents": prepared.indexed_documents(),
+                "setup_micros": prepared.setup_micros(),
+            }),
             Err(error) => serde_json::json!({"error":format!("{error:#}"),"snapshot_id":prepared.snapshot_id()}),
         };
         serde_json::to_writer(&mut output, &row)?;

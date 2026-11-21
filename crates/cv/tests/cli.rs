@@ -482,6 +482,130 @@ fn search_batch_pins_index_and_continues_after_invalid_or_oversized_requests() {
     }
 }
 
+#[test]
+fn search_batch_refreshes_snapshot_in_place_and_survives_failed_refresh() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::Stdio;
+
+    let w = World::new("search-batch-refresh");
+    standard_corpus(&w);
+    w.cv_ok(&["index"]);
+
+    let mut child = w
+        .cv_command()
+        .args(["search", "--batch", "--harness", "claude"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    let mut ask = |line: &str| -> serde_json::Value {
+        writeln!(stdin, "{line}").unwrap();
+        stdin.flush().unwrap();
+        let mut resp = String::new();
+        let n = stdout.read_line(&mut resp).unwrap();
+        assert!(n > 0, "batch stream closed unexpectedly on {line}");
+        serde_json::from_str(&resp).unwrap()
+    };
+
+    let initial = ask("\"midbatchquokka\"");
+    assert_eq!(initial["answer"]["total"], 0);
+    let snap1 = initial["answer"]["snapshot_id"].as_str().unwrap().to_owned();
+    let docs1 = initial["answer"]["indexed_documents"].as_u64().unwrap();
+
+    // Commit a new session to the index while the batch process stays open.
+    let p1 = w.proj.join("midbatch-one.jsonl");
+    fs::write(
+        &p1,
+        format!(
+            "{}\n",
+            user_line("midbatch-one", "m1", "2026-06-10T00:00:00Z", "spotted a midbatchquokka")
+        ),
+    )
+    .unwrap();
+    w.cv_ok(&["index"]);
+
+    // Invisible before an explicit refresh, whether asked by string or object.
+    let stale_str = ask("\"midbatchquokka\"");
+    assert_eq!(stale_str["answer"]["total"], 0);
+    assert_eq!(stale_str["answer"]["snapshot_id"], snap1);
+    let stale_obj = ask(r#"{"query":"midbatchquokka","refresh":false}"#);
+    assert_eq!(stale_obj["answer"]["total"], 0);
+    assert_eq!(stale_obj["answer"]["snapshot_id"], snap1);
+
+    // Invalid control objects emit per-line errors and keep snap1 active.
+    for bad in [
+        r#"{}"#,
+        r#"{"refresh":false}"#,
+        r#"{"unknown":true}"#,
+        r#"{"query":null,"refresh":true}"#,
+    ] {
+        let err = ask(bad);
+        assert!(err["error"].is_string(), "{bad} -> {err}");
+        assert_eq!(err["snapshot_id"], snap1, "{bad} -> {err}");
+    }
+
+    // Standalone refresh reopens the reader and advances snapshot_id + indexed_documents.
+    let refreshed = ask(r#"{"refresh":true}"#);
+    assert_eq!(refreshed["refreshed"], true, "{refreshed}");
+    let snap2 = refreshed["snapshot_id"].as_str().unwrap().to_owned();
+    assert_ne!(snap2, snap1);
+    assert!(refreshed["indexed_documents"].as_u64().unwrap() > docs1, "{refreshed}");
+    assert!(refreshed["setup_micros"].is_u64(), "{refreshed}");
+
+    let after_refresh = ask("\"midbatchquokka\"");
+    assert_eq!(after_refresh["answer"]["total"], 1);
+    assert_eq!(after_refresh["answer"]["hits"][0]["id"], "midbatch-one");
+    assert_eq!(after_refresh["answer"]["snapshot_id"], snap2);
+
+    // Combined {"refresh": true, "query": "..."} refreshes and searches in one round-trip.
+    let p2 = w.proj.join("midbatch-two.jsonl");
+    fs::write(
+        &p2,
+        format!(
+            "{}\n",
+            user_line(
+                "midbatch-two",
+                "m2",
+                "2026-06-11T00:00:00Z",
+                "spotted a secondbatchpangolin"
+            )
+        ),
+    )
+    .unwrap();
+    w.cv_ok(&["index"]);
+
+    let combined = ask(r#"{"refresh":true,"query":"secondbatchpangolin"}"#);
+    assert_eq!(combined["answer"]["total"], 1, "{combined}");
+    assert_eq!(combined["answer"]["hits"][0]["id"], "midbatch-two");
+    let snap3 = combined["answer"]["snapshot_id"].as_str().unwrap().to_owned();
+    assert_ne!(snap3, snap2);
+
+    // A failed refresh reports an error on that line while preserving snap3 for later queries.
+    let index_dir = w.cv_home.join("tantivy");
+    let moved_dir = w.cv_home.join("tantivy-moved");
+    fs::rename(&index_dir, &moved_dir).unwrap();
+    for failing in [
+        r#"{"refresh":true}"#,
+        r#"{"refresh":true,"query":"secondbatchpangolin"}"#,
+    ] {
+        let failed = ask(failing);
+        assert!(failed["error"].is_string(), "{failing} -> {failed}");
+        assert_eq!(failed["snapshot_id"], snap3, "{failing} -> {failed}");
+    }
+    let still_alive = ask("\"secondbatchpangolin\"");
+    assert_eq!(still_alive["answer"]["total"], 1, "{still_alive}");
+    assert_eq!(still_alive["answer"]["snapshot_id"], snap3);
+
+    drop(stdin);
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(out.stderr.is_empty(), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
 /// `cv search --json`'s stdout: `{"hits": [...], "total": M}`, as its hits and total.
 fn search_json(out: &str) -> (Vec<serde_json::Value>, u64) {
     let v: serde_json::Value = serde_json::from_str(out.trim()).expect("stdout must be pure JSON");

@@ -67,6 +67,9 @@ impl PreparedIndex {
     pub fn snapshot_id(&self) -> &str {
         &self.snapshot_id
     }
+    pub fn indexed_documents(&self) -> u64 {
+        self.searcher.num_docs()
+    }
     /// Wall-clock reader setup, paid once at open/refresh, not per query.
     pub fn setup_micros(&self) -> u64 {
         self.setup_micros

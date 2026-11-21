@@ -43,7 +43,7 @@ rows (`cv events --help`). Global `--frozen` (or `CV_FROZEN=1`), resolved once b
 nothing: stale events stream directly, `cv ls` keeps the dash for an unknown count, and the
 catalog (including skipped sources), scan cache and usage cache are not written. Commands
 whose purpose is writing stores or sessions (`index`, hook installation/removal, reshaping,
-`task`, archive sync/watch and config updates) exit 2. Explicit export output is still allowed.
+`task`, archive sync/watch and config updates) exit 2. Explicit stdout export is still allowed.
 
 ## Existing foundations to retain
 
