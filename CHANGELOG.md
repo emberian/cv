@@ -50,6 +50,13 @@
 - `cv prune --plan` adds per-record `messages`, `pointer`, `drop`, and inclusive `lines` excerpts recoverable via `cv cat`, and reports last-request resume context sizes.
 - `prune`, `rewind`, and `splice --session` add `--carry-agents[=meta|full]` to carry or join Claude sub-agents; `cv adopt --join` prepends earlier turns idempotently.
 - `cv rewind` verifies its captured source prefix hash even when a rewritten transcript keeps identical `stat` metadata.
+- `cv search --batch` accepts `{"query": "...", "refresh": true}` and `{"refresh": true}` to reopen updated index snapshots in place without restarting.
+- `lanes --follow` skips vanished children, `resume` warns on archived Codex rollouts, CLI IDs note shadowed cross-root copies, and `index` preserves unmounted mountpoints.
+- `catalog.db` indexes sub-agent stems with directory-stat guards for fast `agent-<id>` lookups, and `--frozen` retains refreshed discovery rows in memory without writes.
+- Antigravity decodes native checkpoints and scalar tool payloads, certifies per-session `conversation_summaries.db` rows, filters empty databases, and merges verified cross-root native tails.
+- Archive ingest reads Antigravity chunked logs and native SQLite stores, and `cv resume` selects or clears Antigravity profile environment variables.
+- Antigravity tracks parked `waiting` swarm lanes, `post_message` summaries, `swarm add` lineage, and `schedule` reminders without false background-job completions.
+- Claude, Codex, and Antigravity mark parent-delegated sub-agent prompts as `Origin::Subagent`, keeping delegation briefs out of human overview requests.
 
 ## 0.19.3 — 2026-11-13 — parser termination and malformed-input recovery
 

@@ -54,10 +54,10 @@ stored bytes, not from the adapter's decoder.
 | `1.5.9-permissions` | An approved and a denied command carry `interaction` (action, target, decision); result status `completed` / `error`; `approval/approve` and `approval/deny` rows. Print mode records no interaction: the gated step is `canceled`, without error text. |
 | `1.5.9-interruption` | The cancelled tool (step 2) and the upstream error (step 8) are absent from the export and read from the store, in step order, in both layouts; each call has one result; the retry completes; a cancelled stream is `interrupted` (stop reason 18), a dropped stream has no stop reason. |
 | `1.5.9-background-tasks` | Three launches finishing out of launch order; the killed one is `canceled` in both layouts although the export still says `RUNNING`; its notice is `background_job/stop`, the others `complete`; before any notice only the killed launch is settled in the exported layout. |
-| `1.5.9-swarm` | The coordinator is not its own child; three members with registry state (`member`, `added_by`, `phase`, `desired_state`, `wake_mode`, `killed`); `swarm add` call IDs per child, the helper's in the worker that added it; board wakes are never returns or prompts; each worker's prompt is its assignment; the coordinator is every worker's native parent. |
-| `1.5.9-subagents` | Idle notices from the system sender are the children's returns (`returned_child`, delivered body is the reply); spawn call IDs; child titles are their briefs. |
+| `1.5.9-swarm` | The coordinator is not its own child; three members with registry state (`member`, `added_by`, `phase`, `desired_state`, `wake_mode`, `killed`); `lanes` and `overview` report parked members as `waiting` (`killed` for `gamma`) with `post_message.text` `last_text` fallback; `swarm add` call IDs per child (`spawned_by_tool_use`) and `/coordinator/…/<member>` `agent_path` (`gamma` -> `beta`'s call ID and `/coordinator/beta/gamma`); board wakes are never returns or prompts; each worker's prompt is `Origin::Subagent`; the coordinator is every worker's native parent. |
+| `1.5.9-subagents` | Idle notices from the system sender are the children's returns (`returned_child`, delivered body is the reply, `lanes` status `completed`); spawn call IDs (`spawned_by_tool_use`); child prompts are `Origin::Subagent` and child titles are their briefs. |
 | `1.5.9-prompt-media` | An inline prompt image is read from the row when the writer's stored copy is gone; linked files are scope items; an audio block stores nothing. |
-| `1.5.9-compaction-resume` | A conversation resumed from its store alone re-creates its export from step 7; steps 0-6, the compaction boundary and its summary included, are read from the store; `/compact` is the prompt text; root and ID are unchanged. |
+| `1.5.9-compaction-resume` | A conversation resumed from its store alone re-creates its export from step 7; steps 0-6, the compaction boundary (`checkpoint_details`) and its summary included, are read from the store; `/compact` is the prompt text; root and ID are unchanged. |
 
 Every public consumer was run once on each capture in each layout (`ls`, `show`,
 `show --json`, `--kind affordances`, `--tree`, `--subagents`, `export` md and json,
@@ -91,24 +91,25 @@ real stores, all text synthetic) and on the captures:
 | Cleared rows, typed results | A row cleared to `Step.type` keeps kind and tool identity; payload scalars reach `details.payload`; every `InvokeSubagent` child links to its call. |
 | Removed log, mirrors | A session whose discovered log disappeared reads from what survives; mirrored roots yield one session. |
 | Bounded reads | Discovery and a header read stay under 4 MiB beside a 16 MiB `gen_metadata` row; id, tool and text sinks stay under 8 MiB beside a 24 MiB image; a history stages in a fixed number of files. |
-| Forest call, title, upload, accounting | Capture tests in `antigravity_writer.rs`: the forest names the stored spawning call; a resumed session is titled by step 0 in both layouts; a missing exported upload is read from the store; only `1.5.9-compaction-resume` reports `unsupported_native_fields`. |
+| Forest call, title, upload, accounting | Capture tests in `antigravity_writer.rs`: the forest names the stored spawning call for direct `invoke_subagent` and `swarm add` children while child sessions carry `spawned_by_tool_use` and `agent_path`; a resumed session is titled by step 0 in both layouts; a missing exported upload is read from the store; none of the 8 real-writer captures reports `unsupported_native_fields`. |
 
 Still requiring dedicated writer-generated scenarios and independent assertions:
 
 - Audio/video prompt payloads; lazy output resolution after the source changes.
-- Structured generic results. Across these captures every step type is one the reader
-  interprets, and no result used the struct/value fields (10, 11) the reader decodes.
-  16 of 33 results instead carry a typed `Any` (field 6: `RunCommand`, `ManageTask`,
-  `InvokeSubagent`); its scalar facts are read into `details.payload`.
-  Writer-generated render-only payloads after native clearing.
-- Renamed members, a worker captured mid-turn (`wake_mode` while working), and a
-  lane status for a parked or idle child: `cv lanes` shows every live member as
-  running.
-- The forest's spawn call ID for swarm members. For `invoke_subagent` children it is
-  the call whose typed result names the child (`spawnStepIndex` is not: parallel
-  spawns all record the last result); a swarm member gets none.
-- Native `CLEARED` rows from the writer; other interaction kinds than permission
-  (`ask_question` was not driven).
+- Writer-generated structured generic results and render-only payloads after native
+  clearing. Across these captures every step type is one the reader interprets, and no
+  writer capture used the generic `struct`/`value` fields (10, 11) that synthetic
+  `antigravity_fidelity` tests verify (`details.result`). 16 of 33 capture results carry
+  a typed `Any` (field 6: `RunCommand`, `ManageTask`, `InvokeSubagent`); scalar specs
+  for `DefineSubagent`, `GenerateImage` and `AskQuestion` are also decoded into
+  `details.payload`.
+- Renamed swarm members and a worker captured mid-turn (`wake_mode` while working).
+  Parked members in `1.5.9-swarm` report `waiting` in `cv lanes` and `overview` from
+  turn-boundary state and `swarm status` notices, and direct/helper `swarm add` calls
+  populate `spawned_by_tool_use` and `agent_path`.
+- Native `CLEARED` rows from the writer; writer-driven non-permission interaction kinds
+  (`ask_question` is decoded on `Tier::Rich`+ in synthetic fidelity tests, not yet driven
+  through the real writer).
 - Full/compact/chunk/native promotion during a live read.
 - Giant native cells, malformed length limits and portable reader equivalence.
 

@@ -31,6 +31,9 @@ Implemented in cv, with local workspace and focused integration gates completed.
 | Shape records and inspect context in `prune --plan` | Per-record `messages` alongside `results`, `pointer`/`drop` actions, 1-based inclusive `lines` excerpts, sidecar stashes recoverable via `cv cat`, and `resume_reads_tokens_before`/`_after` reporting the last surviving request's context size | `prune/plan.rs`, `prune.rs`, `cmd/reshape.rs`; `tests/selection.rs`; [reshaping manual](../../../manual/src/reshaping.md) |
 | Carry or join Claude sub-agents with `--carry-agents` and `adopt --join` | `--carry-agents[=meta\|full]` on `prune`, `rewind` and `splice --session` copies spawn records and restamped/joined root-to-tip transcripts with containment checks; `cv adopt --join` prepends earlier turns idempotently | `harness/claude/{carry,adopt}.rs`, `cmd/{reshape,adopt}.rs`; `tests/selection.rs`; [adopt manual](../../../manual/src/cli.md#cv-adopt) |
 | Verify `rewind` prefix hashes on same-stat rewrites | `PrefixReadGuard` verifies captured BLAKE3 prefix digests across `source.len()` even when `FileId` metadata matches (sub-jiffy same-size `O_TRUNC` rewrites) | `json.rs`, `rewind.rs` `prefix_read_guard_rejects_same_file_id_when_prefix_hash_differs` |
+| Refresh `search --batch` snapshots in place | NDJSON batch stdin accepts `{"query": …, "refresh": true\|false}` and standalone `{"refresh": true}` alongside bare query strings, isolating invalid objects or failed refreshes while keeping the prior snapshot active | `cv-search/src/fts/prepared.rs`, `cmd/search.rs`; `tests/cli.rs`; [search manual](../../../manual/src/search.md) |
+| Index sub-agent stems and retain `--frozen` refreshes in memory | `catalog::SCHEMA` 12 `subagent_parents`/`subagents` tables with directory-stat guards (`WATCH_FUDGE = 2s`, zero-alloc `Probe::file_id`) resolve `agent-<id>` without fleet `read_dir` scans; unpersisted `--frozen` refreshes splice in memory | `catalog.rs`, `catalog/{order,reader}.rs`, `lib.rs`, `source.rs`; `copy_authority_tests`, `tests/{forest,cli}.rs` |
+| Read Antigravity checkpoints, summary certificates, zip stores, swarm lanes and schedules | `CortexStepCheckpoint` and scalar `Any` payloads decode with zero unread fields across all 8 captures; `conversation_summaries.db` row certificates, cross-root native tails, chunked/SQLite zip ingest, `resume_env`, swarm `waiting` lanes/`swarm add` lineage, `schedule` timers and `Origin::Subagent` prompts | `harness/antigravity*`, `ingest.rs`, `lanes.rs`, `overview.rs`; `tests/{antigravity_*,source_resume}.rs` |
 
 **Separate Fleet consumer work:** `d58a1cce`, `6def5a7e` and `73586c1b` in the Fleet repository preserve distinct
 harness/ID/path sources, timestamp precision and unknown counts, use the configured cv binary
@@ -40,24 +43,30 @@ checks against the new cv binary, including duplicate IDs across Claude/Codex pr
 Shared-store paths use IDs and unaddressable duplicates are refused. No Fleet merge, push or
 deployment is claimed by this tracker.
 
-**Still open:** Fleet retains its frozen-plus-unfrozen listing workaround until the affected
-root/harness incident is reproduced. Ordinary search retains fleet-proportional freshness work;
-repeated-search consumer measurements remain separate from the already implemented batch
-snapshot API. Overview's bounded output does not bound parent traversal or worker-forest reads.
+**Still open:** `cv --frozen` now retains refreshed discovery rows in memory when catalog writes are
+skipped (`d67e994d`); retiring Fleet's consumer-side dual frozen/unfrozen listing workaround remains
+separate consumer work. Ordinary search retains fleet-proportional freshness work;
+repeated-search consumer measurements remain separate from the batch snapshot and in-place refresh
+API. Overview's bounded output does not bound parent traversal or worker-forest reads.
 The [native coverage matrix](ANTIGRAVITY-COVERAGE.md) and [handoff limits](HANDOFF.md) remain the
 source of unresolved Agy and lifecycle cases.
 
-**Open after the read-feature review (2026-11-14):**
+**Resolved from the read-feature review (2026-11-14):**
 
-1. An ID that exists in two roots (two Claude profiles holding the same session) resolves to the
-   first root without a note in `show`, `resume`, `lanes` and the API routes; only a transcript
-   path selects the other copy. Fleet refuses such IDs itself. An ambiguity error listing both
-   paths is the candidate fix; it changes the selector contract for every command.
-2. `lanes --follow` ends with an error if one forest read fails mid-follow (a child removed
-   between listing and reading). Not reproduced; a torn trailing record is tolerated.
-3. Whether `codex resume <id>` reaches a rollout under `archived_sessions` depends on the Codex
-   version's lookup scope; cv emits a plan for it without a caveat. Unverified against a binary.
-4. A sub-agent's overview lists its parent's delegation prompt under Requests.
+1. **Cross-root duplicate IDs (closed):** `cv_core::find` preserves newest-copy `preferred_copy_cmp`
+   for HTTP/Tauri/pack compatibility, while CLI ID resolution (`show`, `doctor`, `distill`, `resume`,
+   `lanes`) emits a non-fatal shadowed-copy `stderr` note (and `resume` `warning`/comment) naming the
+   selected path and `<harness>:<path>`; explicit path selectors silence it (`tests/source_resume.rs`).
+2. **`lanes --follow` vanished child (closed):** `harness::vanished_at` and `lanes::lane_or_vanished`
+   skip children unlinked between directory listing and reading (`NotFound` on open and
+   `symlink_metadata`), while broken symlinks, `EACCES` and corrupt `.meta.json` sidecars still
+   return errors (`tests/worker_follow.rs`).
+3. **Codex `archived_sessions` rollout caveat (closed):** `Codex::resume_caveat` warns on rollouts
+   under `archived_sessions/` in text comments and `resume --json` `warning` (`tests/source_resume.rs`).
+4. **Sub-agent delegation prompts in overview (closed):** Claude (`isSidechain: true`), Codex
+   (post-`inherit_before` child prompts) and Antigravity (`USER_INPUT` with parent lineage, including
+   up-front sidecar resolution) classify parent-delegated prompts as `Origin::Subagent`, excluding
+   them from human `requests` in `overview` (`overview.rs`, `tests/antigravity_writer.rs`).
 
 ## Second pass (Claude Fable, 2026-11-15)
 
@@ -79,10 +88,12 @@ and tested on main; numbers and conditions are in the commit messages and [PERF.
 
 Still open after this pass, most consequential first:
 
-1. **Agent lookup by id** costs 8.0 G instructions and 0.47 s for `cv --frozen show <agent-id>` (a
-   miss 2.0 s) against 0.05 s for a session id; `cv lanes` 0.49 s. Measured, not implemented: needs
-   a by-id catalog table with directory guards (exact and prefix ids, ambiguity, new children,
-   changed roots).
+1. **Agent lookup by id (closed)**: `catalog::SCHEMA` 12 indexes `subagent_parents` and `subagents`
+   (`idx_subagents_stem`, `idx_subagents_parent`) with compact directory-stat guards (`WATCH_FUDGE = 2s`
+   and cached `Probe::file_id`), resolving exact/prefix agent IDs with zero warm `read_dir` calls,
+   preserving ambiguity errors, handling `--frozen` post-warm spawns/deletions in memory, and falling
+   back to parallel filename scans when `catalog.db` or `sqlite` is unavailable (`copy_authority_tests`,
+   `tests/forest.rs`).
 2. **Unrendered `queued_command` task notifications (closed; origin-less plain user text remains bounded)**:
    Claude's record codec now reads unrendered `queued_command` attachments (`attachment.prompt`) as
    `InjectedContext` with `commandMode` and `origin` under `extra["claude"]["attachment"]` at every
@@ -90,18 +101,26 @@ Still open after this pass, most consequential first:
    affordance false positives (`unrendered_queued_commands_settle_lifecycle_without_polluting_distill_or_affordances`).
    Replayed plain user text lacking any notification marker or non-human origin remains governed by
    [HANDOFF.md](HANDOFF.md).
-3. **Antigravity**: `cv lanes` shows parked swarm workers as running (no writer evidence yet for
-   what `wake_mode` means); `FileEdit.diff`, GenerateImage/DefineSubagent payloads and blob
-   references are retained in COMPLETE only; non-permission interactions (`ask_question`) were not
-   driven; audio/video prompts are refused by the CLI's ACP server; a rename action does not exist.
-   The writer capture covers store-only resume; native Agy resume through cv/Fleet has not
-   been launched by these checks. Claude/Codex profile selection has separate composition tests.
+3. **Antigravity (partially closed; writer-capture gaps remain)**: `cv lanes` and `overview` now
+   report parked swarm workers as `waiting` (with `post_message.text` `last_text` fallback and `swarm add`
+   `spawned_by_tool_use` + `agent_path` lineage); `CortexStepCheckpoint` (`checkpoint_details`), scalar
+   `GenerateImage`/`DefineSubagent`/`AskQuestion`/`InvokeSubagent` `subagents` payloads, generic
+   `struct`/`value` results and non-permission `Tier::Rich`+ interactions decode with zero
+   `unsupported_native_fields` across all 8 real-writer captures; `conversation_summaries.db` uses
+   per-session row certificates, empty `0`-row DBs filter out in discovery, chunked/SQLite archives
+   ingest from zip, and `Antigravity::resume_env` selects/unsets profile env vars. Still open:
+   `FileEdit.diff` and blob references remain `COMPLETE`-only; `ask_question` and native `CLEARED` rows
+   still lack real-writer captures; audio/video prompts are refused by the CLI's ACP server; a rename
+   action does not exist; live `agy` process launch through Fleet remains external.
 4. **Index contracts not adversarially tested here**: schema-migration crash boundaries,
    a derived write failing after FTS publication and the reverse, held-generation freshness. The
    existing tests were read, none added.
 5. **First index on the fixed binary, cold-cache costs and physical I/O** are unmeasured
    (`getrusage` block counts are zero on this host).
-6. A mount point left as an empty directory inside a root still reads as a removal.
+6. **Empty mount-point directory inside a root (closed)**: `Presence::absent_store_with_dev` checks
+   the nearest existing directory's `st_dev` against the indexed primary's recorded `FileId.dev`,
+   retaining indexed sessions under empty unmounted mount-point stubs while still reaping same-device
+   deletions (`source::tests`, `fts.rs`).
 7. Free-prose supersession and tokenizer-backed budgets, as HANDOFF.md states.
 
 ## Candidate implementation and outstanding scope
@@ -116,15 +135,16 @@ closed in the real ledger by this audit.
 | P0 | Preserve last-good search state on failed updates | Implemented staging, compatible rebuild retention, incomplete-discovery pruning guards and validated schema replacement. `fts.rs` failure/rebuild tests and `fts/migration.rs` tests retain retryability and detect incomplete derived state |
 | P0 | Preserve native tool identity, usage and payload attribution | Implemented verified enrichment; timestamp-only matching cannot transfer usage across revisions. Conflicting/unanchored native tails disclose `unreconciled_history`; native emission and universal fidelity remain outside the claim |
 | P1 | Make read sources and known gaps visible | Implemented optional `extra.cv.read_coverage` through text, JSON/API and doctor, including late metadata. Independent fidelity and media-budget tests cover public windows; absence remains unassessed |
-| P1 | Reuse repeated indexed-query setup | Implemented `PreparedIndex` and NDJSON `--batch`, pinned snapshots, filters/counts, per-line errors and logical work counters. Ordinary frozen search validates its index before discovery and binds freshness to the held generation; the severe issue 33 catalog-WAL rediscovery failure was reproduced and fixed; per-query freshness cost remains |
-| P1 | Budgeted handoffs and explicit unresolved work | Implemented supported lifecycle protocols, aggregate budgets, unsettled snapshots and cycle rejection. [HANDOFF.md](HANDOFF.md) separates these guarantees from semantic supersession, unknown lifecycle patterns and tokenizer accounting |
-| P1 | Performance follow-through | Warm-fleet second-pass evidence exists. Cold/first-index costs, physical I/O, ordinary freshness work and consumer dual reads remain open; measure new overview/selected-pack paths separately. Record results in commit messages |
+| P1 | Reuse repeated indexed-query setup | Implemented `PreparedIndex` and NDJSON `--batch` (including opt-in `{"query": …, "refresh": true}` and standalone `{"refresh": true}` in-place snapshot refresh), pinned snapshots, filters/counts, per-line errors and logical work counters. Ordinary frozen search validates its index before discovery and binds freshness to the held generation; the severe issue 33 catalog-WAL rediscovery failure was reproduced and fixed; per-query freshness cost remains |
+| P1 | Budgeted handoffs and explicit unresolved work | Implemented supported lifecycle protocols (including Antigravity `schedule` timers/bounded crons), aggregate budgets, unsettled snapshots and cycle rejection. [HANDOFF.md](HANDOFF.md) separates these guarantees from semantic supersession, unknown lifecycle patterns and tokenizer accounting |
+| P1 | Performance follow-through | Warm-fleet second-pass evidence and `catalog::SCHEMA` 12 sub-agent stem indexing landed. Cold/first-index costs, physical I/O, ordinary freshness work and consumer dual reads remain open; measure new overview/selected-pack paths separately. Record results in commit messages |
 
 The [coverage matrix](ANTIGRAVITY-COVERAGE.md) now includes real permission, interruption/retry,
-background, swarm/subagent, prompt-image and compaction/resume captures. Remaining cases include
-audio/video, structured generic/render-only and native-cleared payloads, non-permission
-interactions, parked-worker status/spawn links, live source promotion and giant/portable native
-reads. See the matrix for the exact boundaries, including owned inline-media allocations.
+background, swarm/subagent, prompt-image and compaction/resume captures, with zero
+`unsupported_native_fields` across all 8 captures, parked `waiting` swarm lanes and `swarm add`
+lineage. Remaining writer-capture gaps include audio/video, writer-driven structured generic/render-only
+and native-cleared rows, renamed or mid-turn swarm members, non-permission interactions (`ask_question`),
+live source promotion and giant/portable native reads. See the matrix for the exact boundaries, including owned inline-media allocations.
 [`antigravity_writer`](../../../crates/cv-core/tests/antigravity_writer.rs),
 [`antigravity_fidelity`](../../../crates/cv-core/tests/antigravity_fidelity.rs) and
 [`antigravity_lifecycle`](../../../crates/cv-core/tests/antigravity_lifecycle.rs) are current
@@ -176,8 +196,10 @@ freshness assessment, so keeping that server alive alone does not remove this wo
 An isolated new-session/rewrite probe confirmed that `PreparedIndex::refresh()` sees later
 commits, while an unreopened batch reader remains pinned. Prepared queries also skip source
 freshness assessment and use stored snippets: they are not a drop-in semantic replacement.
+`cv search --batch` now supports explicit per-line `{"query": …, "refresh": true}` and standalone
+`{"refresh": true}` snapshot reopens while preserving the active snapshot on error.
 Next: specify which freshness notes and snippet behavior Fleet needs, then evaluate a bounded
-worker pool with explicit per-request reader refresh using the existing batch/search surface.
+worker pool using that explicit per-request refresh surface.
 Keep admission limits, deadlines, restart/error handling, and the existing JSON consumer
 contract explicit. Do not silently pin a Fleet reader or add a separate search service.
 The probe's timings and conditions are in the accompanying commit, not a fleet-wide speedup claim.
@@ -194,9 +216,9 @@ remaining costs, not the old claim that each selected conversation always rescan
 A persistent portable index or bounded offset-store redesign should follow a measured workload,
 with selection/parity and freshness tests intact.
 
-**Agent lookup is measured and user-visible, not yet fixed.** See item 1 of the second pass.
-`agent_lookups_read_the_catalog_not_a_rediscovery` rules out rediscovery, not directory work
-proportional to sessions.
+**Agent lookup by ID, closed via directory-stat-guarded catalog index.** See item 1 of the second pass:
+`catalog::SCHEMA` 12 indexes sub-agent stems in `catalog.db`, eliminating session-proportional
+`read_dir` scans on warm exact and prefix lookups (`copy_authority_tests`, `tests/forest.rs`).
 
 **Fleet numbers are current for warm caches.** `PERF.md` records the 0.20 measurements on the
 10,185-session fleet. First index on the fixed binary, a full recount, cold caches and physical
