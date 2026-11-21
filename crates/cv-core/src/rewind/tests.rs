@@ -976,6 +976,42 @@ fn rewind_prefix_receipt_accepts_appends_and_rejects_source_mutations() {
 }
 
 #[test]
+fn prefix_read_guard_rejects_same_file_id_when_prefix_hash_differs() {
+    let world = crate::test_world("rewind-same-stat-prefix");
+    let path = world.proj.join(format!("{SID}.jsonl"));
+    write_jsonl(&path, &[rec("user", "u", None, text("user", "original prefix"))]);
+    let original = std::fs::read(&path).unwrap();
+    let (guard, file) = PrefixReadGuard::capture(&path).unwrap();
+    let captured_id = crate::source::FileId::of(&file.metadata().unwrap()).unwrap();
+    guard.verify_at(&file, &captured_id).unwrap();
+
+    // Simulate a same-length O_TRUNC rewrite inside one coarse clock tick (identical FileId,
+    // mutated prefix bytes): stat equality must not short-circuit prefix verification.
+    let mut changed = original.clone();
+    let start = changed
+        .windows(b"original".len())
+        .position(|w| w == b"original")
+        .unwrap();
+    changed[start..start + 8].copy_from_slice(b"modified");
+    assert_eq!(changed.len(), original.len());
+    std::fs::write(&path, &changed).unwrap();
+    let after_meta = file.metadata().unwrap();
+    let after_id = crate::source::FileId::of(&after_meta).unwrap();
+    assert_eq!(
+        (after_id.dev, after_id.ino, after_id.len),
+        (captured_id.dev, captured_id.ino, captured_id.len)
+    );
+    let err = guard.verify_at(&file, &captured_id).unwrap_err();
+    assert!(err.to_string().contains("JSON source changed"), "{err}");
+
+    // Restoring the original prefix bytes and appending past the captured length succeeds.
+    let mut restored = original;
+    restored.extend_from_slice(b"\n");
+    std::fs::write(&path, &restored).unwrap();
+    guard.verify(&file).unwrap();
+}
+
+#[test]
 fn rewind_rejects_output_ids_that_escape_the_output_directory() {
     let world = crate::test_world("rewind");
     let dir = world.proj.clone();

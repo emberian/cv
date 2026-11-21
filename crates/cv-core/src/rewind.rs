@@ -556,17 +556,43 @@ pub fn is_subagent(r: &SessionRef) -> bool {
 /// of the bytes actually copied.
 struct PrefixReadGuard {
     source: crate::json::JsonSource,
+    prefix: Option<crate::source::Prefix>,
 }
 impl PrefixReadGuard {
     fn capture(path: &Path) -> Result<(Self, std::fs::File)> {
         let source = crate::json::JsonSource::capture(path)?;
         let file = std::fs::File::open(path)?;
-        source.check_metadata(file.metadata()?)?;
-        Ok((Self { source }, file))
+        source.verify_file(&file)?;
+        let prefix = (!source.has_prefix())
+            .then(|| {
+                crate::source::Prefix::of(&file, source.len())
+                    .with_context(|| format!("JSON source changed: {}", source.path().display()))
+            })
+            .transpose()?;
+        Ok((Self { source, prefix }, file))
     }
     fn verify(&self, file: &std::fs::File) -> Result<()> {
-        self.source.check_metadata(file.metadata()?)?;
+        self.source.verify_file(file)?;
+        if let Some(prefix) = &self.prefix {
+            anyhow::ensure!(
+                crate::source::Prefix::of(file, self.source.len()) == Some(*prefix),
+                "JSON source changed: {}",
+                self.source.path().display()
+            );
+        }
         self.source.check()
+    }
+    #[cfg(test)]
+    fn verify_at(&self, file: &std::fs::File, now: &crate::source::FileId) -> Result<()> {
+        self.source.verify_file_at(file, now)?;
+        if let Some(prefix) = &self.prefix {
+            anyhow::ensure!(
+                crate::source::Prefix::of(file, self.source.len()) == Some(*prefix),
+                "JSON source changed: {}",
+                self.source.path().display()
+            );
+        }
+        Ok(())
     }
 }
 

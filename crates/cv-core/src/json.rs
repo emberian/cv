@@ -307,9 +307,31 @@ impl JsonSource {
     pub(crate) fn len(&self) -> u64 {
         self.0.identity.len
     }
+    pub(crate) fn has_prefix(&self) -> bool {
+        self.0.prefix.is_some()
+    }
     pub(crate) fn check_metadata(&self, metadata: Metadata) -> Result<()> {
         anyhow::ensure!(
             self.holds(&file_id(&metadata)?),
+            "JSON source changed: {}",
+            self.0.path.display()
+        );
+        self.check_reads()
+    }
+    /// [`Self::check_metadata`] on `file` plus, when a [`Prefix`] was captured, re-sampling `file`
+    /// across the captured length without short-circuiting on `*now == self.0.identity`: rejects a
+    /// same-length in-place rewrite (`O_TRUNC` within one coarse clock tick) where `stat` alone is
+    /// unchanged.
+    pub(crate) fn verify_file(&self, file: &std::fs::File) -> Result<()> {
+        self.verify_file_at(file, &file_id(&file.metadata()?)?)
+    }
+    pub(crate) fn verify_file_at(&self, file: &std::fs::File, now: &FileId) -> Result<()> {
+        let prefix_ok = self
+            .0
+            .prefix
+            .is_none_or(|prefix| Prefix::of(file, self.len()) == Some(prefix));
+        anyhow::ensure!(
+            prefix_ok && self.holds(now),
             "JSON source changed: {}",
             self.0.path.display()
         );
