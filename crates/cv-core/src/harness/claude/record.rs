@@ -180,6 +180,7 @@ impl<'a> Head<'a> {
                 "isCompactSummary",
                 "isMeta",
                 "isSynthetic",
+                "isSidechain",
                 "scheduledTaskId",
                 "scheduledFireId",
                 "turnOrigin",
@@ -439,6 +440,10 @@ fn user_origin(top: &Fields<'_>) -> Result<Origin> {
     };
     let is_meta = top.get("isMeta").map(|v| v.as_bool()).transpose()?.flatten() == Some(true)
         || top.get("isSynthetic").map(|v| v.as_bool()).transpose()?.flatten() == Some(true);
+    let is_sidechain = top.get("isSidechain").map(|v| v.as_bool()).transpose()?.flatten() == Some(true);
+    if !scheduled && !is_meta && origin_kind.is_none() && is_sidechain {
+        return Ok(Origin::Subagent);
+    }
     Ok(user_origin_from(scheduled, is_meta, origin_kind.as_deref()))
 }
 

@@ -594,4 +594,205 @@ mod tests {
         assert!(from_session(&session, &OverviewOptions::default()).is_err());
         Ok(())
     }
+
+    #[test]
+    fn subagent_delegation_prompts_are_excluded_from_human_requests() -> Result<()> {
+        let dir = cv_testkit::temp_dir("overview-subagent-delegation");
+        let opts = OverviewOptions {
+            worker_limit: 0,
+            ..Default::default()
+        };
+
+        // 1. Claude sub-agent transcript (`isSidechain: true`)
+        let claude_dir = dir.join("claude/proj/parent-1/subagents");
+        std::fs::create_dir_all(&claude_dir)?;
+        let claude_path = claude_dir.join("agent-worker.jsonl");
+        std::fs::write(
+            &claude_path,
+            format!(
+                "{}\n{}\n",
+                serde_json::json!({
+                    "type": "user",
+                    "uuid": "u1",
+                    "sessionId": "parent-1",
+                    "agentId": "worker",
+                    "isSidechain": true,
+                    "message": {"role": "user", "content": "Audit exports in crates/cv-core"}
+                }),
+                serde_json::json!({
+                    "type": "assistant",
+                    "uuid": "a1",
+                    "parentUuid": "u1",
+                    "sessionId": "parent-1",
+                    "agentId": "worker",
+                    "isSidechain": true,
+                    "message": {"role": "assistant", "model": "claude-sonnet-4-6", "content": [{"type": "text", "text": "Audited."}]}
+                }),
+            ),
+        )?;
+        let claude_ref = SessionRef::from_path(claude_path, Harness::Claude);
+        let claude_overview = read(&claude_ref, &opts)?;
+        assert!(
+            claude_overview.requests.is_empty(),
+            "Claude sidechain prompt must not appear in human requests: {:?}",
+            claude_overview.requests
+        );
+
+        // 2. Codex sub-agent rollouts (both paginated `response_item` and legacy `event_msg`)
+        let codex_paginated = dir.join("rollout-codex-child-paginated.jsonl");
+        std::fs::write(
+            &codex_paginated,
+            [
+                serde_json::json!({
+                    "ordinal": 0,
+                    "type": "session_meta",
+                    "payload": {
+                        "id": "codex-child-1",
+                        "parent_thread_id": "codex-parent-1",
+                        "subagent_history_start_ordinal": 2,
+                        "cwd": "/repo"
+                    }
+                }),
+                serde_json::json!({
+                    "ordinal": 1,
+                    "type": "response_item",
+                    "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Parent human turn"}]}
+                }),
+                serde_json::json!({
+                    "ordinal": 2,
+                    "type": "response_item",
+                    "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Delegated sub-agent task"}]}
+                }),
+                serde_json::json!({
+                    "ordinal": 3,
+                    "type": "response_item",
+                    "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Done."}]}
+                }),
+            ]
+            .into_iter()
+            .map(|row| format!("{row}\n"))
+            .collect::<String>(),
+        )?;
+        let codex_overview = read(&SessionRef::from_path(codex_paginated, Harness::Codex), &opts)?;
+        assert!(
+            codex_overview.requests.is_empty(),
+            "Codex paginated sub-agent prompt must not appear in human requests: {:?}",
+            codex_overview.requests
+        );
+
+        let codex_events = dir.join("rollout-codex-child-events.jsonl");
+        std::fs::write(
+            &codex_events,
+            [
+                serde_json::json!({
+                    "ordinal": 0,
+                    "type": "session_meta",
+                    "payload": {
+                        "id": "codex-child-2",
+                        "parent_thread_id": "codex-parent-1",
+                        "subagent_history_start_ordinal": 2,
+                        "cwd": "/repo"
+                    }
+                }),
+                serde_json::json!({
+                    "ordinal": 1,
+                    "type": "event_msg",
+                    "payload": {"type": "user_message", "message": "Parent human turn"}
+                }),
+                serde_json::json!({
+                    "ordinal": 2,
+                    "type": "event_msg",
+                    "payload": {"type": "user_message", "message": "Delegated sub-agent event prompt"}
+                }),
+                serde_json::json!({
+                    "ordinal": 3,
+                    "type": "event_msg",
+                    "payload": {"type": "agent_message", "message": "Done."}
+                }),
+            ]
+            .into_iter()
+            .map(|row| format!("{row}\n"))
+            .collect::<String>(),
+        )?;
+        let codex_events_overview = read(&SessionRef::from_path(codex_events, Harness::Codex), &opts)?;
+        assert!(
+            codex_events_overview.requests.is_empty(),
+            "Codex event_msg sub-agent prompt must not appear in human requests: {:?}",
+            codex_events_overview.requests
+        );
+
+        // 3. Antigravity child transcript with `USER_INPUT` vs top-level parent transcript
+        let agy_parent_id = "11111111-2222-4333-8444-555555555555";
+        let agy_child_id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        let agy_root = dir.join("antigravity-cli");
+        let parent_logs = agy_root
+            .join("brain")
+            .join(agy_parent_id)
+            .join(".system_generated/logs");
+        let parent_subs = agy_root
+            .join("brain")
+            .join(agy_parent_id)
+            .join(".system_generated/subagents");
+        let child_logs = agy_root.join("brain").join(agy_child_id).join(".system_generated/logs");
+        std::fs::create_dir_all(&parent_logs)?;
+        std::fs::create_dir_all(&parent_subs)?;
+        std::fs::create_dir_all(&child_logs)?;
+        let parent_path = parent_logs.join("transcript_full.jsonl");
+        std::fs::write(
+            &parent_path,
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "step_index": 0,
+                    "source": "USER_EXPLICIT",
+                    "type": "USER_INPUT",
+                    "status": "DONE",
+                    "content": "Human top-level request"
+                })
+            ),
+        )?;
+        std::fs::write(
+            parent_subs.join(format!("{agy_child_id}.json")),
+            serde_json::json!({
+                "conversationId": agy_child_id,
+                "state": "SUBAGENT_STATE_ALIVE",
+                "subagentDescriptor": {"typeName": "worker", "role": "inspect"}
+            })
+            .to_string(),
+        )?;
+        let child_path = child_logs.join("transcript_full.jsonl");
+        std::fs::write(
+            &child_path,
+            format!(
+                "{}\n{}\n",
+                serde_json::json!({
+                    "step_index": 0,
+                    "source": "USER_IMPLICIT",
+                    "type": "USER_INPUT",
+                    "status": "DONE",
+                    "content": "Delegated Antigravity prompt"
+                }),
+                serde_json::json!({
+                    "step_index": 1,
+                    "source": "MODEL",
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "content": "Done."
+                })
+            ),
+        )?;
+        let parent_overview = read(
+            &SessionRef::new(agy_parent_id, Harness::Antigravity, parent_path),
+            &opts,
+        )?;
+        assert_eq!(parent_overview.requests.len(), 1);
+        assert_eq!(parent_overview.requests[0].text, "Human top-level request");
+        let child_overview = read(&SessionRef::new(agy_child_id, Harness::Antigravity, child_path), &opts)?;
+        assert!(
+            child_overview.requests.is_empty(),
+            "Antigravity child USER_INPUT must not appear in human requests: {:?}",
+            child_overview.requests
+        );
+        Ok(())
+    }
 }

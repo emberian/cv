@@ -254,12 +254,12 @@ impl Reader<'_> {
             Some("session_meta") => self.meta(payload)?,
             Some("turn_context") => self.turn_context(payload, ts)?,
             Some("event_msg") => {
-                if !self.event(payload, ts)? && self.ctx.complete {
+                if !self.event(payload, ts, inherited)? && self.ctx.complete {
                     self.carry(v, ts)?;
                 }
             }
             Some("response_item") => {
-                if !self.item(payload, ts)? && self.ctx.complete {
+                if !self.item_at(payload, ts, inherited)? && self.ctx.complete {
                     self.carry(v, ts)?;
                 }
             }
@@ -475,7 +475,7 @@ impl Reader<'_> {
     ///
     /// Returns whether the record is represented in the IR (as a message, merged usage or session
     /// metadata); `false` lets the record carry verbatim under `stream::Demand::COMPLETE`.
-    fn event(&mut self, payload: Option<JsonView<'_>>, ts: Option<DateTime<Utc>>) -> Result<bool> {
+    fn event(&mut self, payload: Option<JsonView<'_>>, ts: Option<DateTime<Utc>>, inherited: bool) -> Result<bool> {
         let Some(p) = payload else { return Ok(false) };
         let has_events = self.has_events;
         let head = Payload::of(p)?;
@@ -486,6 +486,8 @@ impl Reader<'_> {
                 if let Some(text) = body.map(|b| self.demand.text(b)).transpose()?.flatten() {
                     let mut m = if injected(body)? {
                         Message::of_kind(Role::User, MessageKind::InjectedContext, Origin::Harness)
+                    } else if self.session.lineage.parent.is_some() && !inherited {
+                        Message::of_kind(Role::User, MessageKind::Prompt, Origin::Subagent)
                     } else {
                         Message::new(Role::User)
                     };
@@ -964,6 +966,10 @@ impl Reader<'_> {
 
     /// A `response_item` payload or a legacy `items[]` entry. Returns whether it is represented.
     pub(super) fn item(&mut self, payload: Option<JsonView<'_>>, ts: Option<DateTime<Utc>>) -> Result<bool> {
+        self.item_at(payload, ts, false)
+    }
+
+    fn item_at(&mut self, payload: Option<JsonView<'_>>, ts: Option<DateTime<Utc>>, inherited: bool) -> Result<bool> {
         let Some(p) = payload else { return Ok(false) };
         let d = self.demand;
         let head = Payload::of(p)?;
@@ -995,6 +1001,9 @@ impl Reader<'_> {
                         }
                         _ if injected(content)? => {
                             Message::of_kind(Role::User, MessageKind::InjectedContext, Origin::Harness)
+                        }
+                        _ if self.session.lineage.parent.is_some() && !inherited => {
+                            Message::of_kind(Role::User, MessageKind::Prompt, Origin::Subagent)
                         }
                         _ => Message::new(Role::User),
                     };

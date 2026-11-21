@@ -2293,6 +2293,10 @@ fn build_session_header(r: &SessionRef, opts: &Demand) -> (Session, SidecarEnric
         }
     }
 
+    if s.lineage.parent.is_none() {
+        s.lineage.parent = find_sidecar_parent(&loc.app_data_dir, &loc.id);
+    }
+
     (s, enrich)
 }
 
@@ -2531,7 +2535,12 @@ impl StepCodec {
             && (matches!(self.opts.tier, Tier::Discovery | Tier::Usage | Tier::Facts) || sink.tier() <= Tier::Facts);
         match ty.as_str() {
             "USER_INPUT" => {
-                let mut m = Message::of_kind(Role::User, MessageKind::Prompt, Origin::Human);
+                let origin = if self.s.lineage.parent.is_some() || self.state.inferred_parent.is_some() {
+                    Origin::Subagent
+                } else {
+                    Origin::Human
+                };
+                let mut m = Message::of_kind(Role::User, MessageKind::Prompt, origin);
                 m.id = Some(step_index.to_string());
                 m.timestamp = ts;
                 push_nonempty_text(&mut m.content, fields.get("content"), self.spans)?;
@@ -3680,6 +3689,39 @@ fn jsonl_spawn_calls(path: &Path, spawner_id: &str, children: &[&str]) -> Result
         .into_iter()
         .filter(|(cid, _)| children.contains(&cid.as_str()))
         .collect())
+}
+
+fn find_sidecar_parent(app_data_dir: &Path, child_id: &str) -> Option<String> {
+    if let Some(reg) = find_swarm_registry(app_data_dir, child_id, None) {
+        if reg.coordinator_id != child_id {
+            return Some(reg.coordinator_id);
+        }
+    }
+    let brain_root = app_data_dir.join("brain");
+    let entries = fs::read_dir(&brain_root).ok()?;
+    for entry in entries.flatten() {
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        if !ft.is_dir() && !(ft.is_symlink() && entry.path().is_dir()) {
+            continue;
+        }
+        let Some(dir_id) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if dir_id == child_id {
+            continue;
+        }
+        if brain_root
+            .join(&dir_id)
+            .join(".system_generated/subagents")
+            .join(format!("{child_id}.json"))
+            .is_file()
+        {
+            return Some(dir_id);
+        }
+    }
+    None
 }
 
 fn enrich_child_lineage(s: &mut Session, app_data_dir: &Path, sender_parent: Option<&str>, want_extra: bool) {
