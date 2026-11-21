@@ -319,16 +319,33 @@ const HELD_TAIL: u64 = 1 << 20;
 pub(crate) fn drive<C: Codec>(
     read: &Read,
     from: crate::stream::Start<'_>,
+    codec: C,
+    sink: &mut dyn crate::stream::MessageSink,
+) -> anyhow::Result<Option<crate::ir::Session>> {
+    drive_from(read, from, 0, 0, codec, sink)
+}
+
+/// [`drive`] starting whole reads at `base_offset` (`0` unless earlier runs in the same file were
+/// already replayed via a cross-session chain) and seeding `skipped` with `initial_skipped` from
+/// predecessor slices.
+pub(crate) fn drive_from<C: Codec>(
+    read: &Read,
+    from: crate::stream::Start<'_>,
+    base_offset: u64,
+    initial_skipped: u64,
     mut codec: C,
     sink: &mut dyn crate::stream::MessageSink,
 ) -> anyhow::Result<Option<crate::ir::Session>> {
     use crate::stream::{Flow, MessageSink, Start};
     let len = read.len();
     let (at, to, mut skipped) = match from {
-        Start::Whole => (0, len, 0),
+        Start::Whole => (base_offset, len, initial_skipped),
         Start::Prefix(to) => (0, to.min(len), 0),
         Start::Checkpoint(_) if read.is_decoded() => return Ok(None),
         Start::Checkpoint(cp) => {
+            if cp.offset < base_offset {
+                return Ok(None);
+            }
             let Some((_, skipped)) = restore_at::<serde::de::IgnoredAny>(cp, codec.demand()) else {
                 return Ok(None);
             };

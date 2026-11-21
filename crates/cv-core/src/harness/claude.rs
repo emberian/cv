@@ -13,6 +13,7 @@ use crate::source::{Dependencies, Probe};
 /// `cv adopt`: move a sub-agent stranded by a dead session into a live one — Claude-only byte
 /// surgery on this store's layout, so it lives beside the adapter that knows it.
 pub mod adopt;
+pub(super) mod chain;
 pub(crate) mod emit;
 mod fork;
 mod hook;
@@ -381,6 +382,10 @@ impl Adapter for Claude {
         task_notices(&parent.path)
     }
 
+    fn subagent_owner(&self, subagent_path: &std::path::Path) -> Option<SessionRef> {
+        chain::owner(subagent_path)
+    }
+
     /// Claude Code writes one JSONL line per content block of a streamed response, each
     /// repeating the response's `usage`, and a resumed session copies its predecessor's history
     /// into the new file, so the same `message.id` recurs within and across transcripts.
@@ -541,13 +546,19 @@ impl Adapter for Claude {
         }
     }
 
-    fn dependencies(&self, r: &SessionRef, _probe: &mut Probe, deps: &mut Dependencies) -> Option<()> {
+    fn dependencies(&self, r: &SessionRef, probe: &mut Probe, deps: &mut Dependencies) -> Option<()> {
         if r.path
             .file_name()
             .and_then(|n| n.to_str())
             .is_some_and(|n| n.starts_with("agent-"))
         {
             deps.files.push(r.path.with_extension("meta.json"));
+            // A segment split off by an in-place resume is read with the ones it continues ([`chain`]).
+            let before = chain::predecessors_with_probe(&r.path, Some(probe));
+            if let Some(root) = before.first() {
+                deps.files.push(root.with_extension("meta.json"));
+            }
+            deps.files.extend(before);
         }
         // Claude Code writes each spilled output once, before the record naming it: a new file
         // there is a later record's, never a change to what a read of the transcript so far saw.
@@ -617,7 +628,9 @@ impl Adapter for Claude {
 
     /// A checkpoint keeps the session accumulated so far (the spawn tracker holds nothing at a
     /// line boundary: Claude's spawns all return later, as their own records). A prefix read is
-    /// the session as it was, without the other files a fork source is found in.
+    /// the session as it was, without the other files a fork source is found in. An agent split
+    /// off by a resume reads the segments it continues first ([`chain`]), unless the read maps its
+    /// messages to this file's bytes (`offsets`) or stops at a byte prefix.
     fn transcript(
         &self,
         r: &SessionRef,
@@ -626,20 +639,35 @@ impl Adapter for Claude {
         sink: &mut dyn MessageSink,
     ) -> Result<Option<Session>> {
         crate::stream::checked(sink, |sink| {
-            let state = match from {
+            let (prefix_runs, tail_start) = if opts.offsets || matches!(from, Start::Prefix(_)) {
+                (Vec::new(), 0)
+            } else {
+                chain::prefix_and_tail(&r.path)
+            };
+            let mut state = match from {
+                // A mark taken before the segments were joined resumes no joined read.
                 Start::Checkpoint(cp) => match jsonl::restore::<TranscriptState>(cp) {
-                    Some(state) => state,
-                    None => return Ok(None),
+                    Some(state) if prefix_runs.is_empty() || state.session.lineage.continues.is_some() => state,
+                    _ => return Ok(None),
                 },
                 _ => TranscriptState {
                     session: new_session_for(&r.id, Some(r.path.clone()), opts),
                     skipped_parents: std::collections::BTreeMap::new(),
                 },
             };
+            let mut spawns = crate::affordance::AffordanceSink::new(Harness::Claude, sink);
+            let mut before_skipped = 0u64;
+            if !matches!(from, Start::Checkpoint(_)) {
+                let (flow, skipped) = join(&mut state, &prefix_runs, opts, &mut spawns)?;
+                before_skipped = skipped;
+                if flow == Flow::Stop {
+                    super::note_skipped_lines(&mut state.session, before_skipped);
+                    return Ok(Some(state.session));
+                }
+            }
             let read = jsonl::Read::open(&r.path)?;
             let codec = Transcript { state, opts };
-            let mut spawns = crate::affordance::AffordanceSink::new(Harness::Claude, sink);
-            let Some(s) = jsonl::drive(&read, from, codec, &mut spawns)? else {
+            let Some(s) = jsonl::drive_from(&read, from, tail_start, before_skipped, codec, &mut spawns)? else {
                 return Ok(None);
             };
             Ok(Some(match from {
@@ -658,6 +686,44 @@ impl Adapter for Claude {
     fn copied_before(&self, r: &SessionRef, sink: &mut dyn MessageSink) -> Option<chrono::DateTime<chrono::Utc>> {
         fork::copied_before(&r.path, sink)
     }
+}
+
+/// The slices an agent transcript continues ([`chain::prefix_and_tail`]), read into `state`
+/// oldest first: the turns before the resume that split it, the skipped-record `uuid -> parentUuid`
+/// bridges across them, and the meta its spawn wrote. Their records carry no offsets, which name
+/// places in the file read, not in these; malformed lines are counted and combined with the primary
+/// driver's `skipped_lines`.
+fn join(
+    state: &mut TranscriptState,
+    before: &[chain::RunSlice],
+    opts: &Demand,
+    sink: &mut dyn MessageSink,
+) -> Result<(Flow, u64)> {
+    let Some(root) = before.first() else {
+        return Ok((Flow::Continue, 0));
+    };
+    state.session.lineage.continues = before.last().and_then(|s| chain::session_of(&s.path));
+    if opts.tier != Tier::Usage && state.session.lineage.spawned_by_tool_use.is_none() {
+        apply_meta(&mut state.session, &root.path.with_extension("meta.json"));
+    }
+    let mut skipped = 0u64;
+    for slice in before {
+        sink.dependency(&slice.path);
+        let mut flow = Flow::Continue;
+        jsonl::Read::open(&slice.path)?.snapshot(slice.start, slice.end, |line| {
+            match line.view {
+                Some(view) => {
+                    flow = record::record(&mut state.session, view, None, opts, &mut state.skipped_parents, sink)?
+                }
+                None => skipped += u64::from(!line.blank),
+            }
+            Ok(flow)
+        })?;
+        if flow == Flow::Stop {
+            return Ok((flow, skipped));
+        }
+    }
+    Ok((Flow::Continue, skipped))
 }
 
 /// A `--fork-session` copy names no source; the records it shares with one do ([`fork`]). Runs
@@ -807,8 +873,17 @@ fn apply_subagent_lineage(s: &mut Session, path: &std::path::Path, rich: bool) {
     if !rich {
         return;
     }
-    let (agent_type, description, tool_use_id) = read_meta(&path.with_extension("meta.json")).unwrap_or_else(|error| {
-        crate::env::warn_once("agent metadata", format!("{}: {error:#}", path.display()));
+    apply_meta(s, &path.with_extension("meta.json"));
+    if let Some(run) = workflow_run {
+        s.harness_extra_mut(Harness::Claude)
+            .insert("workflow_run".into(), Value::String(run));
+    }
+}
+
+/// The spawning call, agent type and description an `agent-<id>.meta.json` names.
+fn apply_meta(s: &mut Session, meta: &Path) {
+    let (agent_type, description, tool_use_id) = read_meta(meta).unwrap_or_else(|error| {
+        crate::env::warn_once("agent metadata", format!("{}: {error:#}", meta.display()));
         Default::default()
     });
     s.lineage.spawned_by_tool_use = tool_use_id;
@@ -818,9 +893,6 @@ fn apply_subagent_lineage(s: &mut Session, path: &std::path::Path, rich: bool) {
     }
     if let Some(d) = description {
         bag.insert("agent_description".into(), Value::String(d));
-    }
-    if let Some(run) = workflow_run {
-        bag.insert("workflow_run".into(), Value::String(run));
     }
 }
 
@@ -1042,10 +1114,13 @@ fn subagent_forest(
     };
 
     let mut out: Vec<AgentRef> = Vec::new();
+    // Lazily constructed only when at least one `agent-*.jsonl` is selected, so sessions with no
+    // sub-agents pay zero directory scans or stats.
+    let beside: std::sync::OnceLock<chain::Beside> = std::sync::OnceLock::new();
 
     // Tier 1: directly-spawned sub-agents at `subagents/agent-*.jsonl`.
     if workflow.is_none() {
-        out.extend(agents_in_dir(&base, None, demand, select)?);
+        out.extend(agents_in_dir(&base, None, parent_path, &beside, demand, select)?);
     }
 
     // Tier 2: workflow sub-agents at `subagents/workflows/<wf>/agent-*.jsonl`, grouped by run id,
@@ -1060,7 +1135,14 @@ fn subagent_forest(
             .collect();
         let groups = crate::par_flat_map(wf_dirs, |wf_dir| {
             let run_id = wf_dir.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
-            vec![agents_in_dir(&wf_dir, Some(&run_id), demand, select)]
+            vec![agents_in_dir(
+                &wf_dir,
+                Some(&run_id),
+                parent_path,
+                &beside,
+                demand,
+                select,
+            )]
         });
         for group in groups {
             out.extend(group?);
@@ -1089,10 +1171,13 @@ fn record_forest_read(kind: &'static str, path: &Path) {
 
 /// Scan one directory for `agent-*.jsonl` transcripts, pairing each with its `*.meta.json` sidecar
 /// and (for workflow dirs) the journaled result for its agentId. `wf` is `Some(run_id)`
-/// for a workflow dir, `None` for the top-level `subagents/` dir.
+/// for a workflow dir, `None` for the top-level `subagents/` dir. An agent that continued under
+/// another session ([`chain::Beside::tip`]) is that newest segment, read whole, under its spawn's meta.
 fn agents_in_dir(
     dir: &Path,
     wf: Option<&str>,
+    parent_path: &Path,
+    beside: &std::sync::OnceLock<chain::Beside>,
     demand: crate::SubagentDemand,
     select: &(impl Fn(&str, Option<&str>) -> bool + Sync),
 ) -> Result<Vec<AgentRef>> {
@@ -1116,8 +1201,12 @@ fn agents_in_dir(
             }
         }
     }
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let beside = beside.get_or_init(|| chain::Beside::of(parent_path));
     let rich = demand == crate::SubagentDemand::Rich;
-    let journal = if rich && wf.is_some() && !paths.is_empty() {
+    let journal = if rich && wf.is_some() {
         #[cfg(test)]
         record_forest_read("journal", &dir.join("journal.jsonl"));
         sidecar::journal_results_checked(dir)?
@@ -1126,6 +1215,7 @@ fn agents_in_dir(
     };
     crate::par_discovery_filter_map(paths, |p| {
         Some((|| -> Result<Option<AgentRef>> {
+            let p = beside.tip(&p);
             #[cfg(test)]
             record_forest_read("transcript", &p);
             // Every demand reads the agent's metadata through the per-file scan cache: a Rich
@@ -1138,8 +1228,8 @@ fn agents_in_dir(
                 None => return Ok(None),
             };
             let meta = match demand {
-                crate::SubagentDemand::Rich => read_meta(&p.with_extension("meta.json"))?,
-                crate::SubagentDemand::Tools => (read_agent_type(&p.with_extension("meta.json"))?, None, None),
+                crate::SubagentDemand::Rich => read_meta(&chain::meta(&p))?,
+                crate::SubagentDemand::Tools => (read_agent_type(&chain::meta(&p))?, None, None),
                 crate::SubagentDemand::Sessions => (None, None, None),
             };
             let agent_id = session.id.strip_prefix("agent-").unwrap_or(&session.id).to_string();
@@ -1191,158 +1281,161 @@ fn read_meta(path: &Path) -> Result<(Option<String>, Option<String>, Option<Stri
 /// `Agent` tool_result). Reads one record at a time and retains the last substantive assistant text.
 /// `None` for an empty transcript or one with no substantive assistant text; failed reads return an error.
 pub fn subagent_return(path: &std::path::Path) -> Result<Option<String>> {
-    let read = jsonl::Read::open(path)?;
     let mut last = None;
-    read.lines(0, |line| {
-        let Some(head) = line
-            .view
-            .map(|view| record::Head::parse(view, record::Demand::Message))
-            .transpose()?
-            .flatten()
-        else {
-            return Ok(Flow::Continue);
-        };
-        if head.ty == "assistant" {
-            let items = head.top.get("message").map(|m| m.get("content")).transpose()?.flatten();
-            if let Some(items) = items.map(|v| v.array()).transpose()?.flatten() {
-                let mut buf = String::new();
-                for item in items {
-                    let Some(fields) = super::store::document::Fields::parse(item?, &["type", "text"])? else {
-                        continue;
-                    };
-                    if fields.string("type")?.as_deref() == Some("text") {
-                        if let Some(text) = fields.string("text")? {
-                            if !buf.is_empty() {
-                                buf.push('\n');
+    for slice in chain::runs(path) {
+        let read = jsonl::Read::open(&slice.path)?;
+        read.snapshot(slice.start, slice.end, |line| {
+            let Some(head) = line
+                .view
+                .map(|view| record::Head::parse(view, record::Demand::Message))
+                .transpose()?
+                .flatten()
+            else {
+                return Ok(Flow::Continue);
+            };
+            if head.ty == "assistant" {
+                let items = head.top.get("message").map(|m| m.get("content")).transpose()?.flatten();
+                if let Some(items) = items.map(|v| v.array()).transpose()?.flatten() {
+                    let mut buf = String::new();
+                    for item in items {
+                        let Some(fields) = super::store::document::Fields::parse(item?, &["type", "text"])? else {
+                            continue;
+                        };
+                        if fields.string("type")?.as_deref() == Some("text") {
+                            if let Some(text) = fields.string("text")? {
+                                if !buf.is_empty() {
+                                    buf.push('\n');
+                                }
+                                buf.push_str(&text);
                             }
-                            buf.push_str(&text);
                         }
                     }
-                }
-                if !buf.trim().is_empty() {
-                    last = Some(buf);
+                    if !buf.trim().is_empty() {
+                        last = Some(buf);
+                    }
                 }
             }
-        }
-        Ok(Flow::Continue)
-    })?;
+            Ok(Flow::Continue)
+        })?;
+    }
     Ok(last)
 }
 
 pub fn subagent_end(path: &std::path::Path) -> Result<SubagentEnd> {
     let mut end = SubagentEnd::default();
-    let read = jsonl::Read::open(path)?;
-    let result = read.lines(0, |line| {
-        let Some(head) = line
-            .view
-            .map(|view| record::Head::parse(view, record::Demand::Message))
-            .transpose()?
-            .flatten()
-        else {
-            return Ok(Flow::Continue);
-        };
-        let ts = head.top.string("timestamp")?.as_deref().and_then(parse_ts);
-        match head.ty.as_str() {
-            kind @ ("user" | "assistant") => {
-                if let Some(ts) = ts {
-                    end.last_turn_at = Some(end.last_turn_at.map_or(ts, |t: DateTime<Utc>| t.max(ts)));
-                }
-                let message = head
-                    .top
-                    .get("message")
-                    .map(|m| super::store::document::Fields::parse(m, &["content", "model"]))
-                    .transpose()?
-                    .flatten();
-                if head
-                    .top
-                    .get("isApiErrorMessage")
-                    .map(|v| v.as_bool())
-                    .transpose()?
-                    .flatten()
-                    == Some(true)
-                {
-                    let mut text = String::new();
-                    if let Some(content) = message.as_ref().and_then(|m| m.get("content")) {
-                        if let Some(blocks) = content.array()? {
-                            let mut first = true;
-                            for block in blocks {
-                                let Some(fields) = super::store::document::Fields::parse(block?, &["text"])? else {
-                                    continue;
-                                };
-                                if let Some(part) = fields.string("text")? {
-                                    if !first {
-                                        text.push(' ');
-                                    }
-                                    first = false;
-                                    text.push_str(&part);
-                                }
-                            }
-                        } else if content.is_string()? {
-                            text = content.resolve()?.as_str().unwrap_or_default().to_string();
-                        }
+    for slice in chain::runs(path) {
+        let read = jsonl::Read::open(&slice.path)?;
+        read.snapshot(slice.start, slice.end, |line| {
+            let Some(head) = line
+                .view
+                .map(|view| record::Head::parse(view, record::Demand::Message))
+                .transpose()?
+                .flatten()
+            else {
+                return Ok(Flow::Continue);
+            };
+            let ts = head.top.string("timestamp")?.as_deref().and_then(parse_ts);
+            match head.ty.as_str() {
+                kind @ ("user" | "assistant") => {
+                    if let Some(ts) = ts {
+                        end.last_turn_at = Some(end.last_turn_at.map_or(ts, |t: DateTime<Utc>| t.max(ts)));
                     }
-                    let status = head
+                    let message = head
                         .top
-                        .get("apiErrorStatus")
-                        .map(|v| v.as_number())
+                        .get("message")
+                        .map(|m| super::store::document::Fields::parse(m, &["content", "model"]))
+                        .transpose()?
+                        .flatten();
+                    if head
+                        .top
+                        .get("isApiErrorMessage")
+                        .map(|v| v.as_bool())
                         .transpose()?
                         .flatten()
-                        .and_then(|n| n.as_u64());
-                    let resets_at = line
-                        .view
-                        .unwrap()
-                        .get("quotaLimits")?
-                        .map(|v| v.get("resetsAt"))
+                        == Some(true)
+                    {
+                        let mut text = String::new();
+                        if let Some(content) = message.as_ref().and_then(|m| m.get("content")) {
+                            if let Some(blocks) = content.array()? {
+                                let mut first = true;
+                                for block in blocks {
+                                    let Some(fields) = super::store::document::Fields::parse(block?, &["text"])? else {
+                                        continue;
+                                    };
+                                    if let Some(part) = fields.string("text")? {
+                                        if !first {
+                                            text.push(' ');
+                                        }
+                                        first = false;
+                                        text.push_str(&part);
+                                    }
+                                }
+                            } else if content.is_string()? {
+                                text = content.resolve()?.as_str().unwrap_or_default().to_string();
+                            }
+                        }
+                        let status = head
+                            .top
+                            .get("apiErrorStatus")
+                            .map(|v| v.as_number())
+                            .transpose()?
+                            .flatten()
+                            .and_then(|n| n.as_u64());
+                        let resets_at = line
+                            .view
+                            .unwrap()
+                            .get("quotaLimits")?
+                            .map(|v| v.get("resetsAt"))
+                            .transpose()?
+                            .flatten()
+                            .map(|v| v.as_number())
+                            .transpose()?
+                            .flatten()
+                            .and_then(|n| n.as_i64())
+                            .and_then(|s| DateTime::from_timestamp(s, 0));
+                        end.api_error = Some(ApiErrorNotice {
+                            ts,
+                            text,
+                            error: head.top.string("error")?,
+                            status,
+                            resets_at,
+                        });
+                    } else if kind == "user"
+                        || message
+                            .as_ref()
+                            .map(|m| m.string("model"))
+                            .transpose()?
+                            .flatten()
+                            .as_deref()
+                            != Some(SYNTHETIC_MODEL)
+                    {
+                        end.api_error = None;
+                    }
+                }
+                "attachment" => {
+                    let hook = head
+                        .top
+                        .get("attachment")
+                        .map(|v| v.get("hookEvent"))
                         .transpose()?
-                        .flatten()
-                        .map(|v| v.as_number())
-                        .transpose()?
-                        .flatten()
-                        .and_then(|n| n.as_i64())
-                        .and_then(|s| DateTime::from_timestamp(s, 0));
-                    end.api_error = Some(ApiErrorNotice {
-                        ts,
-                        text,
-                        error: head.top.string("error")?,
-                        status,
-                        resets_at,
-                    });
-                } else if kind == "user"
-                    || message
-                        .as_ref()
-                        .map(|m| m.string("model"))
+                        .flatten();
+                    if hook
+                        .map(|v| crate::projection::string_prefix(v, 13))
                         .transpose()?
                         .flatten()
                         .as_deref()
-                        != Some(SYNTHETIC_MODEL)
-                {
-                    end.api_error = None;
-                }
-            }
-            "attachment" => {
-                let hook = head
-                    .top
-                    .get("attachment")
-                    .map(|v| v.get("hookEvent"))
-                    .transpose()?
-                    .flatten();
-                if hook
-                    .map(|v| crate::projection::string_prefix(v, 13))
-                    .transpose()?
-                    .flatten()
-                    .as_deref()
-                    == Some("SubagentStop")
-                {
-                    if let Some(ts) = ts {
-                        end.stopped_at = Some(end.stopped_at.map_or(ts, |t: DateTime<Utc>| t.max(ts)));
+                        == Some("SubagentStop")
+                    {
+                        if let Some(ts) = ts {
+                            end.stopped_at = Some(end.stopped_at.map_or(ts, |t: DateTime<Utc>| t.max(ts)));
+                        }
                     }
                 }
+                _ => {}
             }
-            _ => {}
-        }
-        Ok(Flow::Continue)
-    });
-    result?;
+            Ok(Flow::Continue)
+        })?;
+    }
     Ok(end)
 }
 
@@ -1415,14 +1508,23 @@ pub fn task_notices(parent_path: &std::path::Path) -> Result<std::collections::H
 /// The cached metadata scan of one transcript: `Ok(None)` only when the cache refuses the
 /// result, `Err` with the reason a scan failed.
 fn cached_metadata(path: &Path) -> Result<Option<SessionRef>> {
-    crate::discover_cache::cached_scan_continued(path, metadata::LAYER, |from| {
-        let (reference, checkpoint) = scan_at(path, from)?;
+    let before_paths = chain::predecessors_with_probe(path, None);
+    let mut reads = crate::source::ReadSet::default();
+    for segment in &before_paths {
+        reads.record(segment);
+    }
+    crate::discover_cache::cached_scan_continued_with_reads(path, metadata::LAYER, reads, |from| {
+        let (reference, checkpoint, deps) = scan_at(path, from)?;
         let continuation = checkpoint.and_then(|checkpoint| {
             let head = crate::resume::MarkHead::of(path, &checkpoint, metadata::LAYER)?;
+            let mut dependencies = crate::source::ReadSet::default();
+            for segment in &deps {
+                dependencies.record(segment);
+            }
             Some(crate::discover_cache::ScanContinuation {
                 head,
                 checkpoint,
-                dependencies: Default::default(),
+                dependencies,
             })
         });
         Ok((Some(reference), continuation))
@@ -1434,20 +1536,36 @@ fn scan(path: &Path) -> Result<SessionRef> {
     Ok(scan_at(path, None)?.0)
 }
 
-fn scan_at(path: &Path, from: Option<&Checkpoint>) -> Result<(SessionRef, Option<Checkpoint>)> {
+/// The scan from `from`, and the distinct predecessor segment files consulted before `path`.
+fn scan_at(path: &Path, from: Option<&Checkpoint>) -> Result<(SessionRef, Option<Checkpoint>, Vec<PathBuf>)> {
     let read = jsonl::Read::open(path)?;
     let source = read.source();
-    let (mut scan, offset) = metadata::Scan::restore(path, from);
+    let (prefix_runs, tail_start) = chain::prefix_and_tail(path);
+    let (mut scan, offset) = metadata::Scan::restore(path, from, tail_start);
     anyhow::ensure!(offset <= source.len(), "discovery checkpoint outside source");
     #[cfg(test)]
     metadata::FRAMED.with(|frames| frames.borrow_mut().push((offset, source.len() - offset)));
     #[cfg(test)]
     record_forest_read("scan", path);
+    let mut deps = Vec::new();
+    let mut seen = HashSet::new();
+    for slice in &prefix_runs {
+        if slice.path != path && seen.insert(slice.path.clone()) {
+            deps.push(slice.path.clone());
+        }
+    }
+    if offset == tail_start && !prefix_runs.is_empty() {
+        for slice in &prefix_runs {
+            let seg_read = jsonl::Read::open(&slice.path)?;
+            scan.read_slice(&seg_read, slice.start, slice.end)?;
+        }
+        scan.note_before_turns();
+    }
     scan.read(&read, offset)?;
     let checkpoint = scan.checkpoint();
     let (session, writer_version) = scan.finish();
     crate::discover_cache::read::Context::current().observe_writer(&session, writer_version.as_deref());
-    Ok((session, checkpoint))
+    Ok((session, checkpoint, deps))
 }
 
 /// The classification shared by owned and borrowed records. Content storage never chooses kind.
@@ -3777,5 +3895,80 @@ mod tests {
             coordinator.content = vec![Block::Text { text: wrapped.clone().into() }];
             assert_eq!(ROOTLESS.delivered_body(&coordinator, &wrapped), Some("ship wave 2"));
         }
+    }
+
+    #[test]
+    fn split_subagent_join_counts_malformed_lines_across_segments() {
+        let world = crate::test_world("claude-join-skipped-lines");
+        let s1 = world.proj.join("s1/subagents");
+        let s2 = world.proj.join("s2/subagents");
+        fs::create_dir_all(&s1).unwrap();
+        fs::create_dir_all(&s2).unwrap();
+        fs::write(world.proj.join("s1.jsonl"), "").unwrap();
+        fs::write(world.proj.join("s2.jsonl"), "").unwrap();
+        fs::write(
+            s1.join("agent-a1.jsonl"),
+            "{\"type\":\"user\",\"uuid\":\"u1\",\"parentUuid\":null,\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\ncorrupt_head_1\ncorrupt_head_2\n",
+        )
+        .unwrap();
+        let tail = s2.join("agent-a1.jsonl");
+        fs::write(
+            &tail,
+            "{\"type\":\"assistant\",\"uuid\":\"a1\",\"parentUuid\":\"u1\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]}}\ncorrupt_tail_1\n",
+        )
+        .unwrap();
+        let mut sink = CollectSink::default();
+        let r = SessionRef::new("agent-a1", Harness::Claude, &tail);
+        let session = ROOTLESS.stream(&r, &Demand::RICH, &mut sink).unwrap();
+        assert_eq!(sink.messages.len(), 2);
+        assert_eq!(
+            session.cv_extra().and_then(|b| b.get("skipped_lines")),
+            Some(&serde_json::json!(3)),
+            "2 corrupt lines in predecessor + 1 in tail = 3 skipped_lines"
+        );
+    }
+
+    #[test]
+    fn split_subagent_join_bridges_skipped_record_parent_across_segments() {
+        let world = crate::test_world("claude-join-skipped-parent-bridge");
+        let s1 = world.proj.join("s1/subagents");
+        let s2 = world.proj.join("s2/subagents");
+        fs::create_dir_all(&s1).unwrap();
+        fs::create_dir_all(&s2).unwrap();
+        fs::write(world.proj.join("s1.jsonl"), "").unwrap();
+        fs::write(world.proj.join("s2.jsonl"), "").unwrap();
+        fs::write(
+            s1.join("agent-a1.jsonl"),
+            concat!(
+                "{\"type\":\"user\",\"uuid\":\"x1\",\"parentUuid\":null,\"message\":{\"role\":\"user\",\"content\":\"investigate\"}}\n",
+                "{\"type\":\"assistant\",\"uuid\":\"x2\",\"parentUuid\":\"x1\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"looking\"}]}}\n",
+                "{\"type\":\"system\",\"subtype\":\"stop_hook_summary\",\"uuid\":\"s_end\",\"parentUuid\":\"x2\",\"hookCount\":1}\n",
+            ),
+        )
+        .unwrap();
+        let tail = s2.join("agent-a1.jsonl");
+        fs::write(
+            &tail,
+            "{\"type\":\"user\",\"uuid\":\"y1\",\"parentUuid\":\"s_end\",\"message\":{\"role\":\"user\",\"content\":\"continue\"}}\n",
+        )
+        .unwrap();
+        let mut sink = CollectSink::default();
+        let r = SessionRef::new("agent-a1", Harness::Claude, &tail);
+        ROOTLESS.stream(&r, &Demand::RICH, &mut sink).unwrap();
+        assert_eq!(sink.messages.len(), 3);
+        assert_eq!(sink.messages[0].id.as_deref(), Some("x1"));
+        assert_eq!(sink.messages[1].id.as_deref(), Some("x2"));
+        assert_eq!(sink.messages[2].id.as_deref(), Some("y1"));
+        assert_eq!(
+            sink.messages[2].parent_id.as_deref(),
+            Some("x2"),
+            "tail turn parentUuid s_end should bridge across predecessor's skipped stop_hook_summary to x2"
+        );
+
+        let mut complete_sink = CollectSink::default();
+        ROOTLESS.stream(&r, &Demand::COMPLETE, &mut complete_sink).unwrap();
+        assert_eq!(complete_sink.messages.len(), 4);
+        assert_eq!(complete_sink.messages[2].id.as_deref(), Some("s_end"));
+        assert_eq!(complete_sink.messages[3].parent_id.as_deref(), Some("s_end"));
     }
 }

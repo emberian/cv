@@ -772,6 +772,12 @@ pub trait Adapter: Send + Sync {
         Ok(std::collections::HashMap::new())
     }
 
+    /// The owning parent session for a sub-agent transcript path, when a forest member resolved to
+    /// a continuation segment under another session (an in-place resume). Default: none.
+    fn subagent_owner(&self, _subagent_path: &std::path::Path) -> Option<SessionRef> {
+        None
+    }
+
     /// The newest compaction boundary in the last `tail` bytes of `transcript`:
     /// `(trigger, tokens before)`. Default: the store records none a tail read can find.
     fn last_compact_boundary(

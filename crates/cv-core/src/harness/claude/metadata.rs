@@ -17,12 +17,18 @@ struct State {
     writer_version: Option<String>,
     session: SessionRef,
     custom_title: bool,
+    #[serde(default)]
+    before_turns: usize,
+    #[serde(default)]
+    tail_start: u64,
 }
 
 pub(super) struct Scan {
     writer_version: Option<String>,
     session: SessionRef,
     custom_title: bool,
+    before_turns: usize,
+    tail_start: u64,
     prefix: Option<(u64, State)>,
 }
 
@@ -41,28 +47,38 @@ impl Scan {
             },
             custom_title: false,
             writer_version: None,
+            before_turns: 0,
+            tail_start: 0,
             prefix: None,
         }
     }
 
-    pub(super) fn restore(path: &Path, checkpoint: Option<&Checkpoint>) -> (Self, u64) {
+    pub(super) fn restore(path: &Path, checkpoint: Option<&Checkpoint>, tail_start: u64) -> (Self, u64) {
         let mut scan = Self::new(path);
-        if let Some(cp) = checkpoint {
+        scan.tail_start = tail_start;
+        if let Some(cp) = checkpoint.filter(|cp| cp.offset >= tail_start) {
             if let Some(state) = cp.get::<State>(LAYER) {
                 if state.session.id == scan.session.id
                     && state.session.path == scan.session.path
                     && state.session.harness == Harness::Claude
-                    // Each counted turn requires at least one source byte; reject impossible counts.
-                    && state.session.message_count.is_some_and(|n| n as u64 <= cp.offset)
+                    && state.tail_start == tail_start
+                    // Each turn in `path`'s own tail requires at least one source byte; turns
+                    // contributed by chained predecessor slices are tracked in `before_turns`.
+                    && state
+                        .session
+                        .message_count
+                        .and_then(|n| n.checked_sub(state.before_turns))
+                        .is_some_and(|own| own as u64 <= cp.offset - tail_start)
                 {
                     scan.writer_version = state.writer_version;
                     scan.session = state.session;
                     scan.custom_title = state.custom_title;
+                    scan.before_turns = state.before_turns;
                     return (scan, cp.offset);
                 }
             }
         }
-        (scan, 0)
+        (scan, tail_start)
     }
 
     fn save_prefix(&mut self, offset: u64) {
@@ -72,8 +88,14 @@ impl Scan {
                 writer_version: self.writer_version.clone(),
                 session: self.session.clone(),
                 custom_title: self.custom_title,
+                before_turns: self.before_turns,
+                tail_start: self.tail_start,
             },
         ));
+    }
+
+    pub(super) fn note_before_turns(&mut self) {
+        self.before_turns = self.session.message_count.unwrap_or(0);
     }
 
     pub(super) fn checkpoint(&self) -> Option<Checkpoint> {
@@ -81,6 +103,16 @@ impl Scan {
         let mut checkpoint = Checkpoint::new(*offset);
         checkpoint.put(LAYER, state);
         Some(checkpoint)
+    }
+
+    /// Fold lines `from..to` of a predecessor slice without taking checkpoints on it.
+    pub(super) fn read_slice(&mut self, read: &crate::harness::store::jsonl::Read, from: u64, to: u64) -> Result<()> {
+        read.snapshot(from, to, |line| {
+            if let Some(view) = line.view {
+                self.record(view)?;
+            }
+            Ok(Flow::Continue)
+        })
     }
 
     /// Fold lines `offset..` of the captured transcript. The continuation is the state after the
@@ -261,14 +293,14 @@ mod tests {
         for (tail, appended) in tails {
             let old = format!("{prefix}{tail}");
             fs::write(&path, &old).unwrap();
-            let (before, cp) = scan_at(&path, None).unwrap();
+            let (before, cp, _) = scan_at(&path, None).unwrap();
             assert_eq!(reading(before), frozen(old.as_bytes()));
             let cp = cp.unwrap();
             assert_eq!(cp.offset, prefix.len() as u64);
             let grown = format!("{old}{appended}");
             fs::write(&path, &grown).unwrap();
             FRAMED.with(|frames| frames.borrow_mut().clear());
-            let (resumed, next) = scan_at(&path, Some(&cp)).unwrap();
+            let (resumed, next, _) = scan_at(&path, Some(&cp)).unwrap();
             assert_eq!(reading(resumed), frozen(grown.as_bytes()));
             assert_eq!(
                 FRAMED.with(|frames| frames.borrow().clone()),
@@ -625,5 +657,55 @@ mod tests {
             "an empty transcript is counted: no turns"
         );
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(all(feature = "sqlite", unix))]
+    #[test]
+    fn split_subagent_checkpoint_resumes_when_predecessor_turns_exceed_tail_bytes() {
+        use std::io::Write;
+        let world = crate::test_world("claude-metadata-split-checkpoint");
+        let s1 = world.proj.join("s1/subagents");
+        let s2 = world.proj.join("s2/subagents");
+        fs::create_dir_all(&s1).unwrap();
+        fs::create_dir_all(&s2).unwrap();
+        fs::write(world.proj.join("s1.jsonl"), "").unwrap();
+        fs::write(world.proj.join("s2.jsonl"), "").unwrap();
+        // 120 turns in s1 (last uuid `u119`), then a tiny 60-byte first line in s2 (`cp.offset < 121`).
+        let mut head = String::new();
+        for i in 0..120 {
+            let parent = if i == 0 {
+                "null".to_string()
+            } else {
+                format!("\"u{}\"", i - 1)
+            };
+            head.push_str(&format!(
+                "{{\"type\":\"user\",\"uuid\":\"u{i}\",\"parentUuid\":{parent},\"message\":{{\"content\":\"t{i}\"}}}}\n"
+            ));
+        }
+        fs::write(s1.join("agent-a1.jsonl"), &head).unwrap();
+        let tail_path = s2.join("agent-a1.jsonl");
+        let line1 = "{\"type\":\"user\",\"uuid\":\"y1\",\"parentUuid\":\"u119\",\"message\":{\"content\":\"a\"}}\n";
+        assert!(line1.len() < 120);
+        fs::write(&tail_path, line1).unwrap();
+
+        assert_eq!(cached_metadata(&tail_path).unwrap().unwrap().message_count, Some(121));
+        crate::discover_cache::persist(false);
+        let conn = crate::catalog::open_db().unwrap();
+        crate::discover_cache::invalidate_interpretation(Path::new(conn.path().unwrap()));
+
+        let line2 = "{\"type\":\"user\",\"uuid\":\"y2\",\"parentUuid\":\"y1\",\"message\":{\"content\":\"b\"}}\n";
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&tail_path)
+            .unwrap()
+            .write_all(line2.as_bytes())
+            .unwrap();
+        FRAMED.with(|frames| frames.borrow_mut().clear());
+        assert_eq!(cached_metadata(&tail_path).unwrap().unwrap().message_count, Some(122));
+        assert_eq!(
+            FRAMED.with(|frames| frames.borrow().clone()),
+            vec![(line1.len() as u64, line2.len() as u64)],
+            "checkpoint accepted despite before_turns > cp.offset"
+        );
     }
 }

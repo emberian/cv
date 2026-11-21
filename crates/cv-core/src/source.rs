@@ -958,6 +958,12 @@ impl Probe {
         })
     }
 
+    /// Identity of `path` (`Some(Some(id))` when present, `Some(None)` when absent), cached once
+    /// per path in this probe.
+    pub(crate) fn file_id(&mut self, path: &Path) -> Option<Option<FileId>> {
+        Some(self.entry(path)?.state)
+    }
+
     /// Whether `path` exists, recording its identity for this operation; `None` when unreadable.
     pub fn exists(&mut self, path: &Path) -> Option<bool> {
         Some(self.entry(path)?.state.is_some())

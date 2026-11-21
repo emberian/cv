@@ -274,7 +274,20 @@ pub(crate) fn cached_scan_continued<F>(path: &Path, version: &str, scan: F) -> a
 where
     F: FnOnce(Option<&crate::stream::Checkpoint>) -> anyhow::Result<(Option<SessionRef>, Option<ScanContinuation>)>,
 {
-    cached_scan_inner(path, Some(version), Default::default(), |from| {
+    cached_scan_continued_with_reads(path, version, Default::default(), scan)
+}
+
+/// [`cached_scan_continued`] with auxiliary dependencies captured before exact-hit lookup.
+pub(crate) fn cached_scan_continued_with_reads<F>(
+    path: &Path,
+    version: &str,
+    reads: crate::source::ReadSet,
+    scan: F,
+) -> anyhow::Result<Option<SessionRef>>
+where
+    F: FnOnce(Option<&crate::stream::Checkpoint>) -> anyhow::Result<(Option<SessionRef>, Option<ScanContinuation>)>,
+{
+    cached_scan_inner(path, Some(version), reads, |from| {
         let (reference, continuation) = scan(from)?;
         Ok((reference.into_iter().collect(), continuation))
     })

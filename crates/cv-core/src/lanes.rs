@@ -1597,7 +1597,7 @@ struct AgentStateFacts {
 
 #[cfg(feature = "sqlite")]
 fn load_state_facts_for_forest(
-    parent_id: &str,
+    parent_ids: &[&str],
     scope: Option<StopScope>,
     subs: &[AgentRef],
 ) -> HashMap<String, AgentStateFacts> {
@@ -1616,12 +1616,14 @@ fn load_state_facts_for_forest(
         return out;
     };
 
-    // Build lookup sets covering root `parent_id`, every `sub.session.id` (including nested
+    // Build lookup sets covering owning `parent_ids`, every `sub.session.id` (including nested
     // workflow children), and every `sub.agent_id()`.
-    let mut session_keys: Vec<String> = Vec::with_capacity(1 + subs.len() * 2);
+    let mut session_keys: Vec<String> = Vec::with_capacity(parent_ids.len() + subs.len() * 2);
     let mut seen_session_keys: HashSet<String> = HashSet::new();
-    if seen_session_keys.insert(parent_id.to_string()) {
-        session_keys.push(parent_id.to_string());
+    for &parent_id in parent_ids {
+        if seen_session_keys.insert(parent_id.to_string()) {
+            session_keys.push(parent_id.to_string());
+        }
     }
     let mut agent_keys: Vec<String> = Vec::with_capacity(subs.len() * 2);
     let mut seen_agent_keys: HashSet<String> = HashSet::new();
@@ -1654,18 +1656,20 @@ fn load_state_facts_for_forest(
         }
         push_key(&mut key_to_aid, aid.clone(), &aid);
         push_key(&mut key_to_aid, prefixed.clone(), &aid);
-        if sid != parent_id {
+        if !parent_ids.contains(&sid.as_str()) {
             push_key(&mut key_to_aid, sid.clone(), &aid);
         }
-        for qualified in [
-            format!("{parent_id}/{sid}"),
-            format!("{parent_id}/{aid}"),
-            format!("{parent_id}/{prefixed}"),
-        ] {
-            if seen_session_keys.insert(qualified.clone()) {
-                session_keys.push(qualified.clone());
+        for &parent_id in parent_ids {
+            for qualified in [
+                format!("{parent_id}/{sid}"),
+                format!("{parent_id}/{aid}"),
+                format!("{parent_id}/{prefixed}"),
+            ] {
+                if seen_session_keys.insert(qualified.clone()) {
+                    session_keys.push(qualified.clone());
+                }
+                push_key(&mut key_to_aid, qualified, &aid);
             }
-            push_key(&mut key_to_aid, qualified, &aid);
         }
         path_to_aid.insert(sub.session.path.to_string_lossy().into_owned(), aid);
     }
@@ -1776,7 +1780,7 @@ fn load_state_facts_for_forest(
         }
         let matched_aids: Option<&[String]> = if let Some(ref raid) = run.agent_id {
             key_to_aid.get(raid).map(Vec::as_slice)
-        } else if run.session_id != parent_id {
+        } else if !parent_ids.contains(&run.session_id.as_str()) {
             key_to_aid.get(&run.session_id).map(Vec::as_slice)
         } else {
             None
@@ -2136,14 +2140,57 @@ fn lanes_of_inner(parent: &SessionRef, visited_ancestors: &HashSet<PathBuf>) -> 
     if subs.is_empty() {
         return Ok(Vec::new());
     }
-    let notices = crate::harness::rootless(parent.harness)
-        .map(|adapter| adapter.task_notices(parent))
-        .transpose()?
-        .unwrap_or_default();
-    let scope = crate::harness::rootless(parent.harness).and_then(|adapter| adapter.capabilities().lane_stops);
+    let adapter = crate::harness::rootless(parent.harness);
+    // A sub-agent split across an in-place resume resolves its forest entry to the tip segment's
+    // session, where `<task-notification>` and `SubagentStop` arrive after the move.
+    let mut extra_owners: Vec<SessionRef> = Vec::new();
+    if let Some(adapter) = adapter {
+        let mut seen_ids: HashSet<String> = HashSet::from([parent.id.clone()]);
+        for sub in &subs {
+            if let Some(owner) = adapter.subagent_owner(&sub.session.path) {
+                if seen_ids.insert(owner.id.clone()) {
+                    extra_owners.push(owner);
+                }
+            }
+        }
+    }
+    let mut notices = adapter.map(|a| a.task_notices(parent)).transpose()?.unwrap_or_default();
+    if let Some(adapter) = adapter {
+        for owner in &extra_owners {
+            match adapter.task_notices(owner) {
+                Ok(more) => {
+                    for (aid, notice) in more {
+                        let replace = match notices.get(&aid) {
+                            None => true,
+                            Some(prev) => match (prev.ts, notice.ts) {
+                                (Some(old), Some(new)) => new >= old,
+                                (None, _) => true,
+                                (Some(_), None) => false,
+                            },
+                        };
+                        if replace {
+                            notices.insert(aid, notice);
+                        }
+                    }
+                }
+                Err(error) if crate::harness::is_not_found(&error) => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    let parent_ids: Vec<&str> = std::iter::once(parent.id.as_str())
+        .chain(extra_owners.iter().map(|o| o.id.as_str()))
+        .collect();
+    let scope = adapter.and_then(|a| a.capabilities().lane_stops);
     let index = ledger_index();
     let ledger = match scope {
-        Some(StopScope::Parent) => ledger_stops(index.rows_of(&parent.id).iter().map(|&at| &index.rows[at]), |_| true),
+        Some(StopScope::Parent) => ledger_stops(
+            parent_ids
+                .iter()
+                .flat_map(|sid| index.rows_of(sid))
+                .map(|&at| &index.rows[at]),
+            |_| true,
+        ),
         Some(StopScope::Forest) => {
             let agents: HashSet<_> = subs.iter().map(|sub| sub.agent_id()).collect();
             agents
@@ -2154,7 +2201,7 @@ fn lanes_of_inner(parent: &SessionRef, visited_ancestors: &HashSet<PathBuf>) -> 
         None => HashMap::new(),
     };
     #[cfg(feature = "sqlite")]
-    let state_facts = load_state_facts_for_forest(&parent.id, scope, &subs);
+    let state_facts = load_state_facts_for_forest(&parent_ids, scope, &subs);
     #[cfg(not(feature = "sqlite"))]
     let state_facts: HashMap<String, AgentStateFacts> = HashMap::new();
 

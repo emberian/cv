@@ -229,6 +229,7 @@ impl Workflow {
         if !dir.is_dir() {
             return;
         }
+        let mut beside = None;
         for a in self
             .phases
             .iter_mut()
@@ -240,12 +241,14 @@ impl Workflow {
             }
             if let Some(id) = &a.agent_id {
                 let bare = id.strip_prefix("agent-").unwrap_or(id);
-                if let Some(ret) = super::claude::subagent_return(&dir.join(format!("agent-{bare}.jsonl")))
-                    .unwrap_or_else(|error| {
-                        crate::env::warn_once("workflow agent return", format!("{bare}: {error:#}"));
-                        None
-                    })
-                {
+                let raw = dir.join(format!("agent-{bare}.jsonl"));
+                let tip = beside
+                    .get_or_insert_with(|| super::claude::chain::Beside::of(parent_path))
+                    .tip(&raw);
+                if let Some(ret) = super::claude::subagent_return(&tip).unwrap_or_else(|error| {
+                    crate::env::warn_once("workflow agent return", format!("{bare}: {error:#}"));
+                    None
+                }) {
                     a.journal_result = Some(Value::String(ret));
                 }
             }

@@ -651,15 +651,23 @@ pub(crate) fn resolve_agent_parent_fleetwide(
     want: Option<Harness>,
 ) -> Result<Option<FleetwideSubagent>> {
     let parents = agent_parents_for_harness(cv_core::find_subagent_parents(agent_id), want);
-    // Copies of one agent across sessions (`cv adopt`) read through the newest parent's copy.
-    let parents = if parents.len() > 1 && cv_core::one_agent_across(&parents, agent_id)? {
-        eprintln!(
-            "✦ {} sessions hold a copy of this agent (adopted); reading the newest — `cv show <session> --agent {agent_id}` for another",
-            parents.len()
-        );
-        parents[..1].to_vec()
-    } else {
-        parents
+    // Copies of one agent across sessions (`cv adopt`) read through the newest parent's copy; a
+    // single agent split across sessions by `/resume` resolves to one tip and needs no copy note.
+    let parents = match (parents.len() > 1)
+        .then(|| cv_core::shared_agent_copies(&parents, agent_id))
+        .transpose()?
+        .flatten()
+    {
+        Some(copies) => {
+            if copies > 1 {
+                eprintln!(
+                    "✦ {} sessions hold a copy of this agent (adopted); reading the newest — `cv show <session> --agent {agent_id}` for another",
+                    parents.len()
+                );
+            }
+            parents[..1].to_vec()
+        }
+        None => parents,
     };
     match parents.as_slice() {
         [] => Ok(None),
