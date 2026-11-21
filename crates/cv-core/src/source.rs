@@ -253,7 +253,8 @@ impl std::hash::Hash for Entry {
 // 12: Antigravity revision replay, native usage/lineage and surviving child lanes.
 // 14: Pi reader, Claude synthetic/queued-command reading, skipped-parent bridging and split sub-agent chains.
 // 15: Sub-agent delegation prompt origin, Antigravity summary row certificates/empty-DB filtering and schedule/swarm decoding.
-pub const VERSION: u32 = 15;
+// 16: Antigravity 1.0.x-1.5.13 native steps/payloads/interactions/ImageData/side columns, raw summaries/pbtxt/swarm board, and Antigravity/Pi tool semantics.
+pub const VERSION: u32 = 16;
 
 /// Version identity for non-Record read state; keep the same interpretation authority.
 pub(crate) fn consumer_version(consumer: impl std::fmt::Display) -> String {

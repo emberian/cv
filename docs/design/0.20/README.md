@@ -1,7 +1,7 @@
 # 0.20 candidate: reliable live histories and trustworthy handoffs
 
-Status: candidate `0.20.0`, source-reader version 15, unreleased and untagged. The current
-feature set has passed local integration gates, including the source-selection and second-pass
+Status: candidate `0.20.0`, source-reader version 16, unreleased and untagged. The current
+feature set has passed local integration gates, including the source-selection and second/third-pass
 follow-ups recorded in [BACKLOG.md](BACKLOG.md). This remains the existing
 adapter, IR, query API and command surfaces.
 
@@ -9,15 +9,19 @@ adapter, IR, query API and command surfaces.
 
 1. **Antigravity histories from native stores and exports.** SQLite-only discovery
    (filtering empty shell databases), per-session `conversation_summaries.db` row
-   certificates, chunked/SQLite archive ingest, full/compact/chunked history,
-   decoded compaction checkpoints, revised steps and retained rendered output are
+   certificates, 1.5.13 `CascadeTrajectorySummary` (`raw_summary`) and `parent_references` /
+   `trajectory_meta` fallbacks, richer `.pbtxt` annotations, `<USER_SETTINGS_CHANGE>` model
+   fallbacks, chunked/SQLite archive ingest, full/compact/chunked history,
+   decoded compaction checkpoints, all 19 direct `1.0.x`–`1.5.13` `gemini_coder.Step` variants,
+   all 17 `exa.cortex.core.tools.*` `Any` payloads, non-permission `56`/`133`/`147` interactions,
+   stripped SQLite `steps` side-column fallbacks, revised steps and retained rendered output are
    supported. Historical enrichment requires matching evidence; timestamps alone
    cannot transfer usage between revisions. A local or cross-root native tail joins
    an export only across a verified overlap; conflicting or unanchored history is
    disclosed as `unreconciled_history`. Swarm `waiting`/`working` lane status,
-   `swarm add` spawn lineage and profile-aware `resume` plans are supported. Native
-   media and binary signatures retain explicit representations. This is reading
-   support, not native round-trip emission.
+   `swarm/board.jsonl` killed-worker title/summary recovery, `swarm add` spawn lineage and
+   profile-aware `resume` plans are supported. Native `Media`, legacy `ImageData` and binary
+   signatures retain explicit representations. This is reading support, not native round-trip emission.
 2. **Last-good search revisions survive failed updates.** Reads stage before
    publication; incomplete discovery updates healthy sessions without pruning
    unseen history, and empty unmounted mount-point directories on another `st_dev`
@@ -95,7 +99,9 @@ adapter, IR, query API and command surfaces.
 | fast_subagent_frozen_ls | `catalog::SCHEMA` 12 directory-stat-guarded sub-agent stem index and in-memory `--frozen` discovery refresh |
 | agy_native_fidelity | Checkpoint/payload decoding, per-session summary row certificates, cross-root native tails, chunked/SQLite zip ingest and `resume_env` |
 | agy_swarm_lanes_lifecycle | Swarm `waiting`/`working` lanes, `swarm add` spawn lineage, `schedule` reminder tracking and `Origin::Subagent` delegation prompts |
-| integration | Read/selection additions, source-routing follow-ups and Round 2/3 cross-branch integrations; local gates passed |
+| p3_agy_native_sidecars | 1.0.x–1.5.13 direct steps, 17/17 `Any` payloads, `56`/`133`/`147` interactions, `ImageData`, SQLite side columns, 1.5.13 `raw_summary`, `.pbtxt` and `swarm/board.jsonl` |
+| p3_classify_events | Antigravity 1.0/1.5 and Pi v3 tool classification, hunk fingerprints, compact lane labels and affordances |
+| integration | Read/selection additions, source-routing follow-ups and Round 2/3/Pass 3 cross-branch integrations; local gates passed |
 
 ## Acceptance evidence and its limits
 

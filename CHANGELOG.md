@@ -57,6 +57,9 @@
 - Archive ingest reads Antigravity chunked logs and native SQLite stores, and `cv resume` selects or clears Antigravity profile environment variables.
 - Antigravity tracks parked `waiting` swarm lanes, `post_message` summaries, `swarm add` lineage, and `schedule` reminders without false background-job completions.
 - Claude, Codex, and Antigravity mark parent-delegated sub-agent prompts as `Origin::Subagent`, keeping delegation briefs out of human overview requests.
+- Antigravity decodes 1.0.x–1.5.13 direct steps, all seventeen native tool payloads, legacy ImageData attachments, non-permission interactions, and stripped SQLite step side columns.
+- Antigravity reads 1.5.13 raw conversation summaries, richer pbtxt annotations, settings-change models, and swarm board logs to recover killed workers' titles and summaries.
+- Tool classification, event hunk hashes, lane labels, and affordances cover Antigravity 1.0/1.5 and Pi v3 file paths, searches, questions, schedules, and background jobs.
 
 ## 0.19.3 — 2026-11-13 — parser termination and malformed-input recovery
 
