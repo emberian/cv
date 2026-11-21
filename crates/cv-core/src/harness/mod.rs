@@ -1012,6 +1012,11 @@ pub trait Workflows: Sync {
     fn has_records(&self, r: &SessionRef) -> bool;
     /// Whether one of `r`'s sub-agent transcripts (either tier) has a file name starting `stem`.
     fn has_agent(&self, r: &SessionRef, stem: &str) -> bool;
+    /// Sidecar root (`<dir>/<sid>/`) holding `subagents/` and `subagents/workflows/` when this
+    /// workflow store lays out `agent-<id>.jsonl` stems under a session sidecar directory.
+    fn session_sidecar_dir(&self, _parent_path: &Path) -> Option<PathBuf> {
+        None
+    }
 }
 
 /// `parse` on a concrete adapter (`Claude::detect().parse(&r)`): the same

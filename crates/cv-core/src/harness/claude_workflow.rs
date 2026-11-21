@@ -342,6 +342,9 @@ impl crate::harness::Workflows for Runs {
                 .flatten()
                 .any(|run| has_match(&run.path()))
     }
+    fn session_sidecar_dir(&self, parent_path: &Path) -> Option<PathBuf> {
+        crate::harness::claude::sidecar::session_dir(parent_path)
+    }
 }
 
 /// Sort key placing a run newest first: the state file's mtime (the JSON carries an ISO

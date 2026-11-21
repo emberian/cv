@@ -1172,18 +1172,15 @@ mod imp {
     /// - `<sid>/subagents` present -> guard `subagents/` `FileId`, `Watched` of
     ///   `subagents/workflows`, and `FileId` of each `<run>` dir (`WATCH_FUDGE` = 2s).
     fn scan_subagent_parent(
-        h: Harness,
+        store: &dyn crate::harness::Workflows,
         parent_path: &Path,
         probe: &mut crate::source::Probe,
         now_ns: Option<u64>,
     ) -> (String, Vec<String>) {
-        if h != Harness::Claude {
-            return ("?".into(), Vec::new());
-        }
         let Some(proj) = parent_path.parent() else {
             return ("?".into(), Vec::new());
         };
-        let Some(sid_dir) = crate::harness::claude::sidecar::session_dir(parent_path) else {
+        let Some(sid_dir) = store.session_sidecar_dir(parent_path) else {
             return ("?".into(), Vec::new());
         };
         match probe.file_id(&sid_dir) {
@@ -1269,9 +1266,10 @@ mod imp {
     }
 
     pub(super) fn prepare_subagents(conn: &Connection, h: Harness, refs: &[SessionRef]) -> Option<PreparedSubagents> {
-        if crate::env::frozen() || crate::workflow_store(h).is_none() {
+        if crate::env::frozen() {
             return None;
         }
+        let store = crate::workflow_store(h)?;
         let existing: std::collections::HashMap<(String, String), String> = conn
             .prepare("SELECT parent_id, parent_path, guard FROM subagent_parents WHERE harness=?1")
             .and_then(|mut stmt| {
@@ -1291,7 +1289,7 @@ mod imp {
             if existing.get(&key).is_some_and(|g| guard_is_fresh(g, &mut probe)) {
                 continue;
             }
-            let (guard, stems) = scan_subagent_parent(h, &r.path, &mut probe, now_ns);
+            let (guard, stems) = scan_subagent_parent(store, &r.path, &mut probe, now_ns);
             scanned.push((key.0, key.1, guard, stems));
         }
         Some(PreparedSubagents { scanned })
@@ -1334,8 +1332,8 @@ mod imp {
         if probe.exists(&parent.path) != Some(true) {
             return false;
         }
-        if parent.harness == Harness::Claude && !matched_stem.ends_with(".flat") {
-            if let Some(sub_dir) = crate::harness::claude::sidecar::subagents_dir(&parent.path) {
+        if !matched_stem.ends_with(".flat") {
+            if let Some(sub_dir) = store.session_sidecar_dir(&parent.path).map(|d| d.join("subagents")) {
                 if probe.exists(&sub_dir.join(format!("{matched_stem}.jsonl"))) == Some(true) {
                     return true;
                 }
@@ -1477,7 +1475,7 @@ mod imp {
                     if stored_guards.get(&key).is_some_and(|g| guard_is_fresh(g, &mut probe)) {
                         guarded_refs.insert(key, r);
                     } else {
-                        let (guard, stems) = scan_subagent_parent(h, &r.path, &mut probe, now_ns);
+                        let (guard, stems) = scan_subagent_parent(store, &r.path, &mut probe, now_ns);
                         if stems
                             .iter()
                             .filter(|s| s.starts_with(want))
@@ -1577,7 +1575,7 @@ mod imp {
             if !to_scan.is_empty() {
                 let mut scanned = Vec::with_capacity(to_scan.len());
                 for (pid, ppath) in to_scan {
-                    let (guard, stems) = scan_subagent_parent(h, Path::new(&ppath), &mut probe, now_ns);
+                    let (guard, stems) = scan_subagent_parent(store, Path::new(&ppath), &mut probe, now_ns);
                     scanned.push((pid, ppath, guard, stems));
                 }
                 let prep = PreparedSubagents { scanned };
