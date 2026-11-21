@@ -576,6 +576,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[cfg(feature = "sqlite")]
     #[test]
     fn legacy_retired_jsonl_coexists_with_sqlite_under_frozen_chain_and_undo() {
         let world = crate::test_world("retired-legacy-jsonl-upgrade");

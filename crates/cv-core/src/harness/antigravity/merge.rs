@@ -255,6 +255,13 @@ fn embeds(text: JsonView<'_>, body: &Body) -> Result<bool> {
     Ok(found || live.iter().any(|candidate| candidate.complete(body)))
 }
 
+fn is_running_status(status: Option<&str>) -> bool {
+    matches!(
+        status,
+        Some("RUNNING" | "PENDING" | "GENERATING" | "WAITING" | "QUEUED")
+    )
+}
+
 /// `Some(equal)` when the exported and native rows at one index can be compared.
 fn compare(exported: JsonView<'_>, kind: Option<&str>, native: &NativeStep, print: &Print) -> Result<Option<bool>> {
     if fingerprint(exported)? == print.exact {
@@ -275,13 +282,12 @@ fn compare(exported: JsonView<'_>, kind: Option<&str>, native: &NativeStep, prin
         return Ok(None);
     }
     // A step exported while it ran is an earlier revision of the finished native row,
-    // and a request the export decorated (expanded mentions, several items) cannot be
-    // compared: neither is evidence of a divergent history, nor an identity.
-    let running = matches!(
-        string(exported, "status")?.as_deref(),
-        Some("RUNNING" | "PENDING" | "GENERATING" | "WAITING" | "QUEUED")
-    );
-    Ok((!running && kind != Some("USER_INPUT")).then_some(false))
+    // a request the export decorated (expanded mentions, several items), and a non-GENERIC
+    // direct tool step whose export formats line numbers or prose differently from native
+    // fields cannot be compared: none is evidence of a divergent history, nor a body match.
+    let running = is_running_status(string(exported, "status")?.as_deref());
+    let formatted_direct = kind.is_some_and(|k| k != "GENERIC" && is_tool_step_type(k));
+    Ok((!running && kind != Some("USER_INPUT") && !formatted_direct).then_some(false))
 }
 
 pub(super) fn verified(
@@ -324,8 +330,8 @@ pub(super) fn verified(
         Ok(Flow::Continue)
     })?;
     let mut verdicts = BTreeMap::new();
-    // Exported tool results at a native tool result's index and second.
-    let mut results = BTreeSet::new();
+    // Exported tool results at a native tool result's index and second (`index -> exported_running`).
+    let mut results = BTreeMap::new();
     let mut records = input.records();
     for (index, (at, end)) in &order.steps {
         let Some(step) = steps.get(index) else {
@@ -334,7 +340,7 @@ pub(super) fn verified(
         let verdict = records.read(*at, end - at, |view| {
             let kind = string(view, "type")?;
             if kind.as_deref().is_some_and(is_tool_step_type) && step.kind == kind && second(view)? == step.second {
-                results.insert(*index);
+                results.insert(*index, is_running_status(string(view, "status")?.as_deref()));
             }
             match &step.print {
                 Some(print) => compare(view, kind.as_deref(), step, print),
@@ -366,7 +372,11 @@ pub(super) fn verified(
     let mut native_records = native.records();
     let mut recovered_media = BTreeSet::new();
     for index in &order.missing_media {
-        let Some(step) = steps.get(index).filter(|_| verdicts.get(index) == Some(&true)) else {
+        let non_divergent_tool = !verdicts.contains_key(index) && results.get(index) == Some(&false);
+        let Some(step) = steps
+            .get(index)
+            .filter(|_| verdicts.get(index) == Some(&true) || non_divergent_tool)
+        else {
             continue;
         };
         let kept = native_records.read(step.at, step.end - step.at, |view| {
@@ -380,6 +390,18 @@ pub(super) fn verified(
     }
     for (index, step) in &steps {
         if accepted.contains(index) || recovered_media.contains(index) {
+            if step.kind.as_deref() == Some("PLANNER_RESPONSE") {
+                native_records.read(step.at, step.end - step.at, |view| {
+                    if let Some(calls) = view.get("tool_calls")?.map(JsonView::array).transpose()?.flatten() {
+                        for call in calls {
+                            if let Some(id) = string(call?, "id")?.filter(|id| !id.is_empty()) {
+                                known_calls.insert(id);
+                            }
+                        }
+                    }
+                    Ok(())
+                })?;
+            }
             native.snapshot(step.at, step.end, |line| {
                 native_only.ingest(&line)?;
                 Ok(Flow::Continue)
@@ -388,8 +410,11 @@ pub(super) fn verified(
         }
         if verdicts.get(index) != Some(&true) {
             // The call a result answers is a fact of its step, whichever revision of its
-            // body was exported: an id issued by a verified planner step is kept.
-            if results.contains(index) {
+            // body was exported: an id issued by a verified planner step is kept. Non-divergent
+            // direct tool steps (formatted differently or contentless on the wire) also keep
+            // their typed payload, structured result, and task details when terminal in export.
+            if let Some(&exported_running) = results.get(index) {
+                let non_divergent = !verdicts.contains_key(index) && !exported_running;
                 let revision = native_records.read(step.at, step.end - step.at, |view| {
                     let Some(id) = string(view, "native_tool_id")?.filter(|id| known_calls.contains(id)) else {
                         return Ok(None);
@@ -400,6 +425,21 @@ pub(super) fn verified(
                     Ok(Some(Match {
                         result: Some(id),
                         interaction: fields.value("native_interaction")?,
+                        payload: if non_divergent {
+                            fields.value("native_payload")?
+                        } else {
+                            None
+                        },
+                        structured_result: if non_divergent {
+                            fields.value("native_structured_result")?
+                        } else {
+                            None
+                        },
+                        task_details: if non_divergent {
+                            fields.value("native_task_details")?
+                        } else {
+                            None
+                        },
                         revised: Some(Revised {
                             status: fields.string("status")?.unwrap_or_default(),
                             task_details: fields.value("native_task_details")?,

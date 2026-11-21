@@ -388,16 +388,23 @@ impl Adapter for Antigravity {
         let bag = m.extra.get("antigravity");
         // A denial already surfaces through its refusal text; an approval leaves no
         // trace in the result body.
-        if let Some(interaction) = bag
-            .and_then(|v| v.get("interaction"))
-            .filter(|i| i.get("decision").and_then(Value::as_str) == Some("approved"))
-        {
+        if let Some(interaction) = bag.and_then(|v| v.get("interaction")).filter(|i| {
+            i.get("kind").and_then(Value::as_str) == Some("permission")
+                && i.get("decision").and_then(Value::as_str) == Some("approved")
+        }) {
             let part = |key: &str| interaction.get(key).and_then(Value::as_str).unwrap_or_default();
+            let action = part("action");
+            let target = part("target");
+            let summary = if target.is_empty() {
+                action.to_owned()
+            } else {
+                format!("{action} {target}")
+            };
             return vec![crate::affordance::BagHit {
                 kind: crate::affordance::Kind::Approval,
                 action: "approve",
                 tool: "permission",
-                summary: format!("{} {}", part("action"), part("target")),
+                summary,
             }];
         }
         let task = |key: &str| bag.and_then(|v| v.get(key)).and_then(Value::as_str);
@@ -1372,7 +1379,16 @@ impl Adapter for Antigravity {
                 .limitations
                 .remove(crate::coverage::ReadCoverage::INFERRED_TOOL_IDENTITY);
             let mut coverage_records = input.records();
-            for (at, end) in order.steps.values() {
+            for (index, (at, end)) in &order.steps {
+                #[cfg(feature = "sqlite")]
+                if native_only
+                    .as_ref()
+                    .is_some_and(|(_, found)| found.steps.contains_key(index))
+                {
+                    continue;
+                }
+                #[cfg(not(feature = "sqlite"))]
+                let _ = index;
                 coverage_records.read(*at, end - at, |view| {
                     if codec.inferred_identity(view)? {
                         order
@@ -4751,7 +4767,7 @@ fn summary_columns_sql(conn: &rusqlite::Connection) -> Result<Option<String>> {
     };
     let raw_col = if cols.contains("raw_summary") {
         format!(
-            "CASE WHEN length(raw_summary) <= {} THEN raw_summary ELSE NULL END AS raw_summary",
+            "CASE WHEN typeof(raw_summary) = 'blob' AND length(raw_summary) <= {} THEN raw_summary ELSE NULL END AS raw_summary",
             SummaryRow::MAX_RAW_SUMMARY_BYTES
         )
     } else {

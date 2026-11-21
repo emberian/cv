@@ -996,6 +996,7 @@ mod tests {
     /// Reading every conversation of an archive past the roster cache scans it once: the first
     /// selected read leaves the offset index, in this process and the catalog, that every later
     /// read (another process's too) finds its conversation by. A changed archive scans again.
+    #[cfg(feature = "sqlite")]
     #[test]
     fn selected_reads_past_the_roster_cache_scan_the_archive_once() {
         let world = crate::test_world("export-offsets");

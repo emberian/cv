@@ -128,10 +128,18 @@ fn read(path: &Path, complete: bool, limit: i64) -> Result<jsonl::Read> {
         let mut query = conn.prepare(&sql)?;
         let mut rows = query.query([limit])?;
         output.append(|mut out| {
+            let opt_u64 = |row: &rusqlite::Row<'_>, idx: usize| -> rusqlite::Result<Option<u64>> {
+                use rusqlite::types::ValueRef;
+                Ok(match row.get_ref(idx)? {
+                    ValueRef::Integer(v) => u64::try_from(v).ok(),
+                    ValueRef::Text(t) => std::str::from_utf8(t).ok().and_then(|s| s.trim().parse::<u64>().ok()),
+                    _ => None,
+                })
+            };
             while let Some(row) = rows.next()? {
                 let side_row = SideRow {
-                    step_type: row.get::<_, Option<i64>>(0)?.and_then(|v| u64::try_from(v).ok()),
-                    status: row.get::<_, Option<i64>>(1)?.and_then(|v| u64::try_from(v).ok()),
+                    step_type: opt_u64(row, 0)?,
+                    status: opt_u64(row, 1)?,
                     metadata_len: row.get(5)?,
                     error_len: row.get(6)?,
                     permissions_len: row.get(7)?,
