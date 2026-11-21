@@ -74,7 +74,7 @@
           " view_file": {
             "calls": 1,
             "edits": 0,
-            "reads": 0,
+            "reads": 1,
             "commands": 0,
             "errors": 1
           },
@@ -88,7 +88,7 @@
           "view_file": {
             "calls": 1,
             "edits": 0,
-            "reads": 0,
+            "reads": 1,
             "commands": 0,
             "errors": 0
           }
