@@ -124,25 +124,54 @@ fn agent_file(session: &SessionFile, path: PathBuf) -> Option<AgentFile> {
     if name.ends_with(".flat.jsonl") {
         return None;
     }
+    let sym = std::fs::symlink_metadata(&path).ok()?;
+    if !sym.file_type().is_file() {
+        return None;
+    }
     let agent_id = name.strip_prefix("agent-")?.strip_suffix(".jsonl")?.to_string();
-    let meta_path = path.with_file_name(format!("agent-{agent_id}.meta.json"));
-    let meta = read_meta(&meta_path);
+    let chain_runs = super::chain::runs(&path);
+
+    let (bytes, meta, meta_path) = if chain_runs.len() > 1 {
+        let total_bytes: u64 = chain_runs
+            .iter()
+            .map(|slice| {
+                if slice.end != u64::MAX {
+                    slice.end.saturating_sub(slice.start)
+                } else {
+                    std::fs::symlink_metadata(&slice.path)
+                        .ok()
+                        .map_or(0, |m| m.len().saturating_sub(slice.start))
+                }
+            })
+            .sum();
+        let (meta_val, resolved_path) = match super::chain::meta_spec(&path).ok().flatten() {
+            Some(super::chain::MetaSpec::Verbatim(p)) => (read_meta(&p), Some(p)),
+            Some(super::chain::MetaSpec::Merged { map, mode_from }) => (Some(Value::Object(map)), Some(mode_from)),
+            None => (None, None),
+        };
+        (total_bytes, meta_val, resolved_path)
+    } else {
+        let own_meta = path.with_file_name(format!("agent-{agent_id}.meta.json"));
+        let present = std::fs::symlink_metadata(&own_meta).is_ok_and(|m| m.file_type().is_file());
+        let meta_val = present.then(|| read_meta(&own_meta)).flatten();
+        (sym.len(), meta_val, present.then_some(own_meta))
+    };
+
     let field = |k: &str| {
         meta.as_ref()
             .and_then(|m| m.get(k))
             .and_then(Value::as_str)
             .map(String::from)
     };
-    let md = std::fs::metadata(&path).ok();
     Some(AgentFile {
         session_id: session.session_id.clone(),
         project_dir: session.project_dir.clone(),
-        bytes: md.as_ref().map(|m| m.len()).unwrap_or(0),
-        modified: md.and_then(|m| m.modified().ok()),
+        bytes,
+        modified: sym.modified().ok(),
         description: field("description"),
         agent_type: field("agentType"),
         model: field("model"),
-        meta_path: meta_path.is_file().then_some(meta_path),
+        meta_path,
         agent_id,
         path,
     })
@@ -276,6 +305,21 @@ fn execute_after_stage(
         refuse_destinations()?;
     }
     use crate::publish::{Claim, Staged};
+    let ensure_regular = |path: &Path| -> Result<()> {
+        let md = std::fs::symlink_metadata(path).with_context(|| format!("reading {}", path.display()))?;
+        anyhow::ensure!(
+            md.file_type().is_file(),
+            "{} is not a regular file (refusing symlink or special file)",
+            path.display()
+        );
+        Ok(())
+    };
+    ensure_regular(&p.agent.path)?;
+    let chain_runs = super::chain::runs(&p.agent.path);
+    if chain_runs.len() > 1 || chain_runs.first().is_some_and(|s| s.start != 0 || s.end != u64::MAX) {
+        return execute_chained(p, &chain_runs, write, force, refuse_destinations, after_stage);
+    }
+
     let source = crate::json::JsonSource::capture(&p.agent.path)
         .with_context(|| format!("reading {}", p.agent.path.display()))?;
     let file = std::fs::File::open(&p.agent.path)?;
@@ -290,10 +334,16 @@ fn execute_after_stage(
             .with_context(|| format!("adopting {}", p.agent.path.display()))?;
         transcript = Some(output.into_inner().map_err(|e| e.into_error())?);
         if let (Some(src), Some(dest)) = (&p.agent.meta_path, &p.dest_meta) {
+            ensure_regular(src)?;
             let meta_source =
                 crate::json::JsonSource::capture(src).with_context(|| format!("reading {}", src.display()))?;
             let mut meta_file = std::fs::File::open(src)?;
             meta_source.check_metadata(meta_file.metadata()?)?;
+            meta_source
+                .read(crate::json::ReadInput::Document, crate::json::Validation::Value, |_| {
+                    Ok(())
+                })
+                .with_context(|| format!("validating {}", src.display()))?;
             let mut output = Staged::create(dir, "adopt", 0o600)?;
             std::io::copy(&mut meta_file, &mut output)?;
             metadata = Some((meta_source, meta_file, output, dest));
@@ -339,6 +389,205 @@ fn execute_after_stage(
         lines: counts.lines,
         stamped: counts.stamped,
         bytes: counts.bytes,
+    })
+}
+
+fn execute_chained(
+    p: &Plan,
+    chain_runs: &[super::chain::RunSlice],
+    write: bool,
+    force: bool,
+    refuse_destinations: impl Fn() -> Result<()>,
+    after_stage: impl FnOnce() -> Result<()>,
+) -> Result<Adopted> {
+    use crate::harness::store::document::Fields;
+    use crate::harness::store::jsonl::ranges::{self, Range};
+    use crate::json::{JsonSource, ReadInput, Validation};
+    use crate::publish::{Claim, Set, Staged};
+    use std::collections::HashSet;
+
+    struct SliceInput {
+        source: JsonSource,
+        file: std::fs::File,
+        range: Range,
+        rows: Vec<crate::derive::Select>,
+    }
+
+    let identity = super::IDENTITY;
+    let mut slices = Vec::with_capacity(chain_runs.len());
+    let mut seen_uuids = HashSet::new();
+
+    for slice in chain_runs {
+        let md = std::fs::symlink_metadata(&slice.path).with_context(|| format!("reading {}", slice.path.display()))?;
+        anyhow::ensure!(
+            md.file_type().is_file(),
+            "{} is not a regular file (refusing symlink or special file)",
+            slice.path.display()
+        );
+        let source = JsonSource::capture(&slice.path).with_context(|| format!("reading {}", slice.path.display()))?;
+        let file = std::fs::File::open(&slice.path)?;
+        source.check_metadata(file.metadata()?)?;
+        let end = if slice.end == u64::MAX {
+            source.len()
+        } else {
+            slice.end.min(source.len())
+        };
+        let range = Range {
+            offset: slice.start,
+            len: end.saturating_sub(slice.start),
+        };
+        let raw_rows = ranges::records(&file, range)?.collect::<Result<Vec<(Range, bool)>>>()?;
+        let mut rows = Vec::with_capacity(raw_rows.len());
+        for (r, _) in raw_rows {
+            let sel = crate::derive::Select::read(&source, &file, r, true, true, &identity)
+                .with_context(|| format!("adopting {}", slice.path.display()))?;
+            let uuid = match &sel.record {
+                Some(rec) => rec.with_view(|view| {
+                    Ok(Fields::parse(view, &["uuid"])?
+                        .map(|f| f.string("uuid"))
+                        .transpose()?
+                        .flatten())
+                })?,
+                None => None,
+            };
+            if let Some(u) = uuid {
+                if !seen_uuids.insert(u) {
+                    continue;
+                }
+            } else if sel.blank {
+                continue;
+            }
+            rows.push(sel);
+        }
+        slices.push(SliceInput {
+            source,
+            file,
+            range,
+            rows,
+        });
+    }
+
+    let rewrite = crate::derive::Rewrite {
+        session_id: &p.into_session,
+        standalone: false,
+        identity,
+    };
+    let mut lines = 0usize;
+    let mut stamped = 0usize;
+    let mut bytes = 0usize;
+    let mut transcript = None;
+    let mut verbatim_meta = None;
+    let mut staged_meta = None;
+
+    if write {
+        let dir = p.dest.parent().context("destination has no parent dir")?;
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        let mut output = std::io::BufWriter::new(Staged::create(dir, "adopt", 0o600)?);
+        for seg in &mut slices {
+            let rows = std::mem::take(&mut seg.rows);
+            let c = crate::derive::derive(&seg.source, &seg.file, rows.into_iter().map(Ok), &rewrite, &mut output)
+                .with_context(|| format!("adopting {}", p.agent.path.display()))?;
+            lines += c.lines;
+            stamped += c.stamped;
+            bytes += c.bytes;
+        }
+        transcript = Some(output.into_inner().map_err(|e| e.into_error())?);
+
+        if let (Some(fallback_src), Some(dest)) = (&p.agent.meta_path, &p.dest_meta) {
+            match super::chain::meta_spec(&p.agent.path)? {
+                Some(super::chain::MetaSpec::Merged { map, mode_from }) => {
+                    let md = std::fs::symlink_metadata(&mode_from)?;
+                    anyhow::ensure!(
+                        md.file_type().is_file(),
+                        "{} is not a regular file",
+                        mode_from.display()
+                    );
+                    let mut out = Staged::create(dir, "adopt", 0o600)?;
+                    serde_json::to_writer(&mut out, &map)?;
+                    staged_meta = Some((out, dest, mode_from));
+                }
+                spec => {
+                    let src = match spec {
+                        Some(super::chain::MetaSpec::Verbatim(ref p)) => p,
+                        _ => fallback_src,
+                    };
+                    let md = std::fs::symlink_metadata(src).with_context(|| format!("reading {}", src.display()))?;
+                    anyhow::ensure!(md.file_type().is_file(), "{} is not a regular file", src.display());
+                    let meta_source = JsonSource::capture(src).with_context(|| format!("reading {}", src.display()))?;
+                    let mut meta_file = std::fs::File::open(src)?;
+                    meta_source.check_metadata(meta_file.metadata()?)?;
+                    meta_source
+                        .read(ReadInput::Document, Validation::Value, |_| Ok(()))
+                        .with_context(|| format!("validating {}", src.display()))?;
+                    let mut out = Staged::create(dir, "adopt", 0o600)?;
+                    std::io::copy(&mut meta_file, &mut out)?;
+                    verbatim_meta = Some((meta_source, meta_file));
+                    staged_meta = Some((out, dest, src.clone()));
+                }
+            }
+        }
+    } else {
+        for seg in &mut slices {
+            let rows = std::mem::take(&mut seg.rows);
+            let c = crate::derive::derive(
+                &seg.source,
+                &seg.file,
+                rows.into_iter().map(Ok),
+                &rewrite,
+                &mut std::io::sink(),
+            )
+            .with_context(|| format!("adopting {}", p.agent.path.display()))?;
+            lines += c.lines;
+            stamped += c.stamped;
+            bytes += c.bytes;
+        }
+    }
+
+    after_stage()?;
+    for seg in &slices {
+        seg.source.check_metadata(seg.file.metadata()?)?;
+        seg.source.check()?;
+    }
+    if let Some((meta_source, meta_file)) = &verbatim_meta {
+        meta_source.check_metadata(meta_file.metadata()?)?;
+        meta_source.check()?;
+    }
+    if let Some((_, _, ref mode_from)) = staged_meta {
+        anyhow::ensure!(
+            std::fs::symlink_metadata(mode_from)?.file_type().is_file(),
+            "{} is not a regular file",
+            mode_from.display()
+        );
+    }
+    if let Some(staged) = &transcript {
+        let source_refs: Vec<(&JsonSource, &std::fs::File, Range)> =
+            slices.iter().map(|s| (&s.source, &s.file, s.range)).collect();
+        super::verify_carried(
+            &source_refs,
+            None,
+            Some(&p.agent.agent_id),
+            staged.path(),
+            &p.dest,
+            Some(&p.agent.agent_id),
+        )?;
+    }
+    if write && !force {
+        refuse_destinations()?;
+    }
+    let claim = if force { Claim::Replace } else { Claim::New };
+    let mut set = Set::new();
+    if let Some((staged, destination, _)) = staged_meta {
+        set.add(staged, destination, claim);
+    }
+    if let Some(staged) = transcript {
+        set.add(staged, &p.dest, claim);
+    }
+    set.publish()?;
+    Ok(Adopted {
+        agent_id: p.agent.agent_id.clone(),
+        lines,
+        stamped,
+        bytes,
     })
 }
 
@@ -687,5 +936,89 @@ mod tests {
 
         let foreign_err = find_session(&format!("codex:{LIVE}")).unwrap_err().to_string();
         assert!(foreign_err.contains("Claude-only"), "{foreign_err}");
+    }
+
+    #[test]
+    fn adopt_from_split_resume_tail_materializes_root_chain_and_spawn_meta() {
+        const S1: &str = "11111111-1111-4111-8111-000000000001";
+        const S2: &str = "11111111-1111-4111-8111-000000000002";
+        const S3: &str = "11111111-1111-4111-8111-000000000003";
+        let w = crate::test_world("adopt-split-tail");
+        let proj = w.base.join("projects").join("-tmp-proj");
+        for sid in [S1, S2, S3] {
+            std::fs::create_dir_all(proj.join(sid).join("subagents")).unwrap();
+            std::fs::write(
+                proj.join(format!("{sid}.jsonl")),
+                format!("{{\"type\":\"user\",\"sessionId\":\"{sid}\",\"uuid\":\"u-{sid}\",\"message\":{{\"role\":\"user\",\"content\":\"hi\"}}}}\n"),
+            )
+            .unwrap();
+        }
+        let rec = |uuid: &str, parent: Option<&str>, sid: &str, role: &str, text: &str| {
+            serde_json::json!({
+                "type": role,
+                "uuid": uuid,
+                "parentUuid": parent,
+                "sessionId": sid,
+                "agentId": AGENT,
+                "isSidechain": true,
+                "message": {"role": role, "content": text}
+            })
+            .to_string()
+        };
+        std::fs::write(
+            proj.join(S1).join("subagents").join(format!("agent-{AGENT}.jsonl")),
+            format!(
+                "{}\n{}\n",
+                rec("x1", None, S1, "user", "brief"),
+                rec("x2", Some("x1"), S1, "assistant", "first half")
+            ),
+        )
+        .unwrap();
+        let spawn_meta = r#"{"agentType":"Explore","description":"split lane","model":"sonnet"}"#;
+        std::fs::write(
+            proj.join(S1).join("subagents").join(format!("agent-{AGENT}.meta.json")),
+            spawn_meta,
+        )
+        .unwrap();
+        // S2 is an in-place `/resume` tail: starts at `parentUuid: "x2"` and has NO `.meta.json`.
+        std::fs::write(
+            proj.join(S2).join("subagents").join(format!("agent-{AGENT}.jsonl")),
+            format!(
+                "{}\n{}\n",
+                rec("y1", Some("x2"), S2, "assistant", "second half"),
+                rec("y2", Some("y1"), S2, "user", "follow-up")
+            ),
+        )
+        .unwrap();
+
+        let from_s2 =
+            SessionFile::of(SessionRef::from_path(proj.join(format!("{S2}.jsonl")), Harness::Claude)).unwrap();
+        let into_s3 =
+            SessionFile::of(SessionRef::from_path(proj.join(format!("{S3}.jsonl")), Harness::Claude)).unwrap();
+        let agent = find_agent(AGENT, Some(&from_s2)).unwrap().remove(0);
+        assert_eq!(agent.agent_type.as_deref(), Some("Explore"));
+        assert_eq!(agent.description.as_deref(), Some("split lane"));
+        assert_eq!(agent.model.as_deref(), Some("sonnet"));
+        assert!(agent.meta_path.is_some());
+
+        let p = plan(agent, vec![], &into_s3);
+        let dry = execute(&p, false, false).unwrap();
+        let written = execute(&p, true, false).unwrap();
+        assert_eq!(
+            (dry.lines, dry.stamped, dry.bytes),
+            (written.lines, written.stamped, written.bytes)
+        );
+        assert_eq!(written.lines, 4);
+
+        let rows: Vec<Value> = std::fs::read_to_string(&p.dest)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let uuids: Vec<&str> = rows.iter().map(|r| r["uuid"].as_str().unwrap()).collect();
+        assert_eq!(uuids, ["x1", "x2", "y1", "y2"]);
+        assert!(rows[0]["parentUuid"].is_null(), "root parentUuid is null");
+        assert!(rows.iter().all(|r| r["sessionId"] == S3));
+        assert_eq!(std::fs::read_to_string(p.dest_meta.unwrap()).unwrap(), spawn_meta);
     }
 }

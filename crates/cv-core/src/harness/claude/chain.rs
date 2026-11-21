@@ -17,11 +17,14 @@
 use crate::harness::store::document::Fields;
 use crate::harness::store::jsonl;
 use crate::ir::{Harness, SessionRef};
+use crate::json::{JsonSource, ReadInput, Validation};
 use crate::source::{FileId, Probe};
 use crate::stream::Flow;
+use anyhow::{bail, Context};
 use chrono::{DateTime, Utc};
 use std::collections::{HashMap, HashSet};
-use std::fs;
+use std::fs::{self, File};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -225,6 +228,7 @@ struct Run {
     last_uuid: Option<String>,
     last_turn_uuid: Option<String>,
     uuids: HashSet<String>,
+    children: HashMap<String, Vec<String>>,
 }
 
 impl Run {
@@ -237,6 +241,7 @@ impl Run {
             last_uuid: None,
             last_turn_uuid: None,
             uuids: HashSet::new(),
+            children: HashMap::new(),
         }
     }
 
@@ -253,12 +258,16 @@ impl Run {
             self.last_turn_uuid = next.last_turn_uuid;
         }
         self.uuids.extend(next.uuids);
+        for (parent, kids) in next.children {
+            self.children.entry(parent).or_default().extend(kids);
+        }
     }
 }
 
 #[derive(Debug)]
 struct Segment {
     modified: Option<SystemTime>,
+    stopped: bool,
     raw_runs: Vec<Run>,
     uuids: HashSet<String>,
 }
@@ -355,6 +364,9 @@ fn scan_segment(path: &Path) -> Option<Arc<Segment>> {
                         cur.end = prev_end;
                         raw_runs.push(std::mem::replace(&mut cur, Run::starting_at(prev_end)));
                     }
+                    if let Some(p) = &parent {
+                        cur.children.entry(p.clone()).or_default().push(u.clone());
+                    }
                     if cur.first_uuid.is_none() {
                         cur.first_uuid = Some(u.clone());
                         cur.external_parent = parent.clone().filter(|p| !file_uuids.contains(p));
@@ -373,11 +385,12 @@ fn scan_segment(path: &Path) -> Option<Arc<Segment>> {
     })
     .ok()?;
 
-    let _ = (last_turn_at, stopped_at);
+    let stopped = stopped_at.is_some_and(|stop| last_turn_at.is_none_or(|turn| stop >= turn));
     cur.end = len;
     raw_runs.push(cur);
     let seg = Arc::new(Segment {
         modified,
+        stopped,
         raw_runs,
         uuids: file_uuids,
     });
@@ -588,6 +601,106 @@ pub(super) fn meta(path: &Path) -> PathBuf {
     own
 }
 
+/// How to materialize an agent's `.meta.json` when carrying or adopting a segment.
+#[derive(Debug, Clone)]
+pub(super) enum MetaSpec {
+    /// Copy a single `.meta.json` verbatim (`own` or the split chain's root).
+    Verbatim(PathBuf),
+    /// Merge the split chain root's `.meta.json` with a later `own` override (`cv adopt --model`
+    /// or a later spawn update), preserving `root`'s `agentType` when `own` defaulted to
+    /// `"general-purpose"` without `"description"` or `"toolUseId"`.
+    Merged {
+        map: serde_json::Map<String, serde_json::Value>,
+        mode_from: PathBuf,
+    },
+}
+
+fn read_meta_object(path: &Path) -> anyhow::Result<serde_json::Map<String, serde_json::Value>> {
+    let md = fs::symlink_metadata(path).with_context(|| format!("inspecting {}", path.display()))?;
+    anyhow::ensure!(
+        md.file_type().is_file(),
+        "{} is not a regular file (refusing symlink or special file)",
+        path.display()
+    );
+    let source = JsonSource::capture(path).with_context(|| format!("reading {}", path.display()))?;
+    let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    source.check_metadata(file.metadata()?)?;
+    source
+        .read(ReadInput::Document, Validation::Value, |_| Ok(()))
+        .with_context(|| format!("validating {}", path.display()))?;
+    let value: serde_json::Value =
+        serde_json::from_reader(&file).with_context(|| format!("parsing {}", path.display()))?;
+    source.check_metadata(file.metadata()?)?;
+    source.check()?;
+    match value {
+        serde_json::Value::Object(map) => Ok(map),
+        _ => bail!("{} is not a JSON object", path.display()),
+    }
+}
+
+/// Resolve the `.meta.json` to carry or adopt alongside `jsonl_path`: its own when unsplit, the
+/// split chain root's when `jsonl_path` is a `/resume` tail without a local sidecar, or a merged
+/// object when both `root` and `own` exist. Symlinked or non-regular local `.meta.json` files are
+/// refused.
+pub(super) fn meta_spec(jsonl_path: &Path) -> anyhow::Result<Option<MetaSpec>> {
+    let own = jsonl_path.with_extension("meta.json");
+    let own_present = match fs::symlink_metadata(&own) {
+        Ok(md) => {
+            anyhow::ensure!(
+                md.file_type().is_file(),
+                "{} is not a regular file (refusing symlink or special file)",
+                own.display()
+            );
+            true
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+        Err(e) => return Err(e).with_context(|| format!("checking {}", own.display())),
+    };
+
+    let all = runs(jsonl_path);
+    let root_meta = if all.len() > 1 {
+        let candidate = all[0].path.with_extension("meta.json");
+        if candidate != own && fs::symlink_metadata(&candidate).is_ok_and(|md| md.file_type().is_file()) {
+            Some(candidate)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    match (own_present, root_meta) {
+        (false, None) => Ok(None),
+        (true, None) => Ok(Some(MetaSpec::Verbatim(own))),
+        (false, Some(root)) => Ok(Some(MetaSpec::Verbatim(root))),
+        (true, Some(root)) => {
+            let own_map = read_meta_object(&own)?;
+            let Ok(root_map) = read_meta_object(&root) else {
+                return Ok(Some(MetaSpec::Verbatim(own)));
+            };
+            let preserve_root_type = own_map.get("agentType").and_then(|v| v.as_str()) == Some("general-purpose")
+                && !own_map.contains_key("description")
+                && !own_map.contains_key("toolUseId")
+                && root_map.contains_key("agentType");
+            let mut merged = root_map;
+            for (k, v) in &own_map {
+                if k == "agentType" && preserve_root_type {
+                    continue;
+                }
+                merged.insert(k.clone(), v.clone());
+            }
+            if merged == own_map {
+                Ok(Some(MetaSpec::Verbatim(own)))
+            } else {
+                Ok(Some(MetaSpec::Merged {
+                    map: merged,
+                    mode_from: own,
+                }))
+            }
+        }
+    }
+}
+
 /// Per-project lookup handle for resolving each forest member to its newest continuation.
 pub(crate) struct Beside {
     project: Option<Arc<ProjectAgents>>,
@@ -614,7 +727,7 @@ impl Beside {
         }
 
         let set = CandidateSet::load(project, below);
-        let Some((_, start_runs)) = set.get(path) else {
+        let Some((start_seg, start_runs)) = set.get(path) else {
             return path.to_path_buf();
         };
         let Some(last_run) = start_runs.last() else {
@@ -622,13 +735,15 @@ impl Beside {
         };
 
         let mut cur_path = path.to_path_buf();
+        let mut cur_seg = Arc::clone(start_seg);
         let mut cur_run = last_run.clone();
         let mut visited: HashSet<(PathBuf, u64)> = HashSet::new();
         visited.insert((cur_path.clone(), cur_run.start));
 
-        while let Some((next_path, next_run)) = self.next_run(&set, &cur_path, &cur_run, &visited) {
+        while let Some((next_path, next_seg, next_run)) = self.next_run(&set, &cur_path, &cur_seg, &cur_run, &visited) {
             visited.insert((next_path.clone(), next_run.start));
             cur_path = next_path;
+            cur_seg = next_seg;
             cur_run = next_run;
         }
         cur_path
@@ -638,23 +753,63 @@ impl Beside {
         &self,
         set: &CandidateSet,
         cur_path: &Path,
+        cur_seg: &Segment,
         cur_run: &Run,
         visited: &HashSet<(PathBuf, u64)>,
-    ) -> Option<(PathBuf, Run)> {
-        set.files
+    ) -> Option<(PathBuf, Arc<Segment>, Run)> {
+        // Rule 2(i): unjoined `/resume` split whose external_parent names a record in `cur_run`.
+        if let Some((cand_path, cand_seg, _, r)) = set
+            .files
             .iter()
             .filter(|(cand_path, _, _)| cand_path != cur_path)
             .flat_map(|(cand_path, cand_seg, cand_runs)| {
-                cand_runs.iter().map(move |r| (cand_path, cand_seg.modified, r))
+                cand_runs
+                    .iter()
+                    .map(move |r| (cand_path, cand_seg, cand_seg.modified, r))
             })
-            .filter(|(cand_path, _, r)| {
+            .filter(|(cand_path, _, _, r)| {
                 !visited.contains(&((*cand_path).clone(), r.start))
                     && r.external_parent
                         .as_deref()
                         .is_some_and(|parent| cur_run.uuids.contains(parent))
             })
-            .max_by_key(|(cand_path, mtime, r)| (mtime.is_some(), *mtime, *cand_path, r.start))
-            .map(|(cand_path, _, r)| (cand_path.clone(), r.clone()))
+            .max_by_key(|(cand_path, _, mtime, r)| (mtime.is_some(), *mtime, *cand_path, r.start))
+        {
+            return Some((cand_path.clone(), Arc::clone(cand_seg), r.clone()));
+        }
+
+        // Rule 2(ii): `--carry-agents` / `adopt --join` prepended `cur_run` into a resumed segment
+        // that also holds newer child records chaining from `cur_run`'s leaf. Only an unstopped
+        // head advances; uncontinued `cv adopt` copies (`r.uuids == cur_run.uuids`) stay distinct.
+        if cur_seg.stopped {
+            return None;
+        }
+        let (Some(first_uuid), Some(last_uuid)) = (cur_run.first_uuid.as_deref(), cur_run.last_uuid.as_deref()) else {
+            return None;
+        };
+        set.files
+            .iter()
+            .filter(|(cand_path, _, _)| cand_path != cur_path)
+            .flat_map(|(cand_path, cand_seg, cand_runs)| {
+                cand_runs
+                    .iter()
+                    .map(move |r| (cand_path, cand_seg, cand_seg.modified, r))
+            })
+            .filter(|(cand_path, _, _, r)| {
+                !visited.contains(&((*cand_path).clone(), r.start))
+                    && r.uuids.contains(first_uuid)
+                    && r.uuids.contains(last_uuid)
+                    && [Some(last_uuid), cur_run.last_turn_uuid.as_deref()]
+                        .into_iter()
+                        .flatten()
+                        .any(|leaf| {
+                            r.children
+                                .get(leaf)
+                                .is_some_and(|kids| kids.iter().any(|u| !cur_run.uuids.contains(u)))
+                        })
+            })
+            .max_by_key(|(cand_path, _, mtime, r)| (mtime.is_some(), *mtime, *cand_path, r.start))
+            .map(|(cand_path, cand_seg, _, r)| (cand_path.clone(), Arc::clone(cand_seg), r.clone()))
     }
 }
 
@@ -845,6 +1000,77 @@ mod tests {
         }
         assert_eq!(SEGMENT_SCANS.with(std::cell::Cell::get), 0);
         assert!(jsonl::OPENED.with(|o| o.borrow().is_empty()));
+    }
+
+    #[test]
+    fn joined_carry_advances_unstopped_head_while_leaving_stopped_and_uncontinued_copies_distinct() {
+        let w = crate::test_world("claude-agent-joined-next");
+        let project = w.base.join("projects").join("-p");
+
+        // Case 1: unstopped s1 (`[x1, x2]`) joined into s2 (`[x1, x2, y1, y2]`), plus an
+        // uncontinued `cv adopt` copy in s_copy (`[x1, x2]`).
+        let a1 = |s: &str| project.join(s).join("subagents").join("agent-a1.jsonl");
+        write(&a1("s1"), &[rec("x1", None, "one"), rec("x2", Some("x1"), "two")]);
+        write(&a1("s_copy"), &[rec("x1", None, "one"), rec("x2", Some("x1"), "two")]);
+        write(
+            &a1("s2"),
+            &[
+                rec("x1", None, "one"),
+                rec("x2", Some("x1"), "two"),
+                rec("y1", Some("x2"), "three"),
+                rec("y2", Some("y1"), "four"),
+            ],
+        );
+
+        // Case 2: stopped s_dead (`SubagentStop` >= last turn) adopted and continued in s_live
+        // stays distinct on s_dead because s_dead finished on its own.
+        let a2 = |s: &str| project.join(s).join("subagents").join("agent-a2.jsonl");
+        write(
+            &a2("s_dead"),
+            &[
+                json!({"type": "user", "uuid": "d1", "parentUuid": null, "isSidechain": true,
+                       "timestamp": "2026-10-01T10:00:00Z", "message": {"role": "user", "content": "brief"}}),
+                json!({"type": "assistant", "uuid": "d2", "parentUuid": "d1", "isSidechain": true,
+                       "timestamp": "2026-10-01T10:00:05Z", "message": {"role": "assistant", "content": "done"}}),
+                json!({"type": "attachment", "timestamp": "2026-10-01T10:00:06Z",
+                       "attachment": {"hookEvent": "SubagentStop"}}),
+            ],
+        );
+        write(
+            &a2("s_live"),
+            &[
+                json!({"type": "user", "uuid": "d1", "parentUuid": null, "isSidechain": true,
+                       "timestamp": "2026-10-01T10:00:00Z", "message": {"role": "user", "content": "brief"}}),
+                json!({"type": "assistant", "uuid": "d2", "parentUuid": "d1", "isSidechain": true,
+                       "timestamp": "2026-10-01T10:00:05Z", "message": {"role": "assistant", "content": "done"}}),
+                json!({"type": "user", "uuid": "d3", "parentUuid": "d2", "isSidechain": true,
+                       "timestamp": "2026-10-01T10:05:00Z", "message": {"role": "user", "content": "more"}}),
+            ],
+        );
+
+        for s in ["s1", "s_copy", "s2", "s_dead", "s_live"] {
+            fs::write(project.join(format!("{s}.jsonl")), "").unwrap();
+        }
+
+        let beside = Beside::of(&project.join("s1.jsonl"));
+        assert_eq!(beside.tip(&a1("s1")), a1("s2"), "unstopped head advances to joined tip");
+        assert_eq!(
+            beside.tip(&a2("s_dead")),
+            a2("s_dead"),
+            "stopped agent stays its own tip"
+        );
+
+        // An uncontinued `cv adopt` copy alone never advances s_solo -> s_adopted.
+        let a3 = |s: &str| project.join(s).join("subagents").join("agent-a3.jsonl");
+        write(&a3("s_solo"), &[rec("p1", None, "one"), rec("p2", Some("p1"), "two")]);
+        write(
+            &a3("s_adopted"),
+            &[rec("p1", None, "one"), rec("p2", Some("p1"), "two")],
+        );
+        fs::write(project.join("s_solo.jsonl"), "").unwrap();
+        fs::write(project.join("s_adopted.jsonl"), "").unwrap();
+        let beside3 = Beside::of(&project.join("s_solo.jsonl"));
+        assert_eq!(beside3.tip(&a3("s_solo")), a3("s_solo"));
     }
 
     fn jsonl_bytes(lines: &[Value]) -> Vec<u8> {

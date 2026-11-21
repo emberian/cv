@@ -1341,11 +1341,7 @@ impl<'a> Record<'a, '_> {
         // `queued`, `suggestion_accepted`, `system`), `turnOrigin`, `origin.kind`. Kept on lean
         // reads so a reader can grade how strongly a prompt is attested; rich and complete reads
         // capture the full `origin` object through `CLAUDE_EXTRA_TOP`.
-        if role == Role::User
-            && tier < Tier::Rich
-            && !matches!(tier, Tier::Facts | Tier::Usage)
-            && !opts.records
-        {
+        if role == Role::User && tier < Tier::Rich && !matches!(tier, Tier::Facts | Tier::Usage) && !opts.records {
             for key in ["promptSource", "turnOrigin"] {
                 if let Some(val) = self.top.string(key)? {
                     bag.insert(key.into(), Value::String(val));

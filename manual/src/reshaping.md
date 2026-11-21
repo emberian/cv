@@ -55,6 +55,29 @@ What a session wrote and read on disk is already a mechanical listing, paths fro
 `cv events <id> --kind file_edit` and `--kind file_read` (`--json`, `--subagents`), one streamed
 pass. It is worth pasting into the précis of whatever a plan drops.
 
+`--carry-agents[=meta|full]` on `prune`, `rewind` and `splice --session` takes the session's
+sub-agents along under the new session id (unlike `prune --copy-resources`, which copies
+`subagents/` and `workflows/` verbatim for `cv`'s forest views when resuming in a new process).
+Claude Code re-enters a background agent from the current session's `subagents/` folder, and a
+derived session has a new id: without its `agent-<id>.meta.json` the agent comes back on the
+parent's model as a general-purpose agent, and without its transcript it has no brief. `meta` copies
+the spawn records; `full` (the default) also copies each transcript with the session id restamped.
+A value needs `=` (`--carry-agents=meta`), so the bare flag never takes the session id after it.
+A transcript goes the way an adoption does: the source (including any `/resume`-split prefix) is
+checked while it is read, the staged copy is checked against the resume rules, and it is published
+with its meta as one set. A source whose last record is unfinished (its writer is mid-append) is
+carried up to that record, and the report says so. A transcript whose content is refused (a whole
+line that is not a record, or a copy the resume check will not pass) is skipped and named under the
+line; its spawn record still goes and every other agent is carried. The session is written, so
+`prune`, `rewind` and `splice` exit 0 with the warning; `cv adopt --join` exits 1.
+
+An agent that is mid-turn when its parent moves keeps running and writes its next records into
+the new session's folder: a file that begins mid-conversation, with no meta. So a transcript the
+new session already holds is joined, never skipped or replaced: the source's records first, then
+the records only the new file holds, and a missing meta is copied. `cv adopt --join --from <old>
+--into <new>` does the same after the fact, for every agent of the old session or the ids/prefixes
+named, and a repeat changes nothing.
+
 ## How Claude Code stores a sub-agent
 
 ```

@@ -624,6 +624,7 @@ cv prune 3b829648 --keep 0..400                    # …or keep an explicit turn
 cv prune 3b829648 --json                           # + the report as one JSON object on stdout
 cv prune 3b829648 --declassify --declassify-tokens-file terms.txt
 cv prune 3b829648 --plan plan.json                 # the caller's own keep / pointer / excerpt / drop
+cv prune 3b829648 --carry-agents                   # its sub-agents come along under the new id
 
 cv cat <new-id> toolu_abc123                       # fetch a stashed original back out
 ```
@@ -702,13 +703,17 @@ cv adopt a5d8 --into 7b2e19a4 --from c1e4d723
 cv adopt a5d8 --dry-run --json
 cv adopt a5d8 --model sonnet            # resume it on another model
 cv adopt a5d8 --into 7b2e19a4 --model claude-opus-5-5   # already in 7b2e19a4: retarget in place
+cv adopt --join --from c1e4d723 --into 7b2e19a4         # prepend earlier turns onto agents moved by /resume
 ```
 
 Defaults: `--into` the project's newest other session; `--from` everywhere, newest copy wins.
 `--model inherit` (or no `model`) runs on the live root's model. `--model` drops the meta's
 `pickedEffortModel`. An agent already in `--into` and nowhere else has nothing to copy: with
 `--model` its `agent-<id>.meta.json` is rewritten in place (the transcript untouched), which is how a
-lane that died on one model's usage limit resumes on another; without it, adopt refuses.
+lane that died on one model's usage limit resumes on another; without it, adopt refuses. `--join`
+runs [`--carry-agents`](reshaping.md) after an in-place `/resume`: it prepends `--from`'s earlier
+records before what `--into` already holds, copies missing `.meta.json` sidecars, accepts optional
+agent id prefixes, and is idempotent on repeat.
 
 ### `cv splice`
 
@@ -729,7 +734,8 @@ cv splice da9174f4:0..20 4f2a0c11:50.. --harness codex
 ```
 
 Sub-agent spans join the main thread. Without `--harness`/`--out` it only composes
-(`--export md|json` dumps). `--session` and `--agent-of` work as in [`distill`](#cv-distill). A call
+(`--export md|json` dumps). `--session` and `--agent-of` work as in [`distill`](#cv-distill);
+`--session --carry-agents` takes the sub-agents of each Claude session a span came from. A call
 whose result falls outside the spans is dropped ([the dangling-parent trap](reshaping.md#the-dangling-parent-trap)).
 
 A span emitted into its own harness is written back as it was read: each selected message keeps

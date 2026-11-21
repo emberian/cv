@@ -3,12 +3,103 @@
 use crate::cmd::port::emit_session;
 use crate::util::{dry_run_nulls, parse_harness, parse_range, report, short_id, usage};
 use anyhow::{bail, Context, Result};
+use cv_core::harness::claude::carry::{carry_agents, Carried, CarryAgents};
 use cv_core::harness::claude::skills::SkillsPolicy;
 use cv_core::ir::{human_bytes, Harness, Session};
 use cv_core::EmitOptions;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::PathBuf;
+
+// ---------- carrying agents (prune, rewind, splice) ----------
+
+/// `--carry-agents` copies a session's own `subagents/`; a sub-agent transcript has none.
+fn carry_source(mode: Option<CarryAgents>, r: &cv_core::ir::SessionRef) -> Result<()> {
+    if mode.is_some() && cv_core::rewind::is_subagent(r) {
+        return usage(format!(
+            "--carry-agents carries a top-level session's sub-agents; {} is itself a sub-agent",
+            short_id(&r.id)
+        ));
+    }
+    Ok(())
+}
+
+/// `--carry-agents`, after the new session is written: the report line, and the JSON's uniform
+/// `carried_agents` object (`dir: null` on an unpinned dry run).
+fn carry(
+    mode: CarryAgents,
+    sources: &[PathBuf],
+    new_path: &std::path::Path,
+    new_id: &str,
+    (dry_run, unnamed): (bool, bool),
+    h: &mut String,
+) -> Result<serde_json::Value> {
+    let carried = carry_agents(sources, new_path, new_id, mode, &[], dry_run).with_context(|| {
+        if dry_run {
+            "--carry-agents".to_string()
+        } else {
+            format!("the new session {new_id} is written; carrying its agents failed")
+        }
+    })?;
+    let mut v = serde_json::to_value(&carried)?;
+    if unnamed {
+        v["dir"] = serde_json::Value::Null;
+    }
+    if carried.is_empty() {
+        let _ = writeln!(h, "  agents:      the source has none to carry");
+    } else if unnamed {
+        let line = carried_line(&carried);
+        let did = line.split(" → ").next().unwrap_or_default();
+        let _ = writeln!(h, "  agents:      {did} → the new session's subagents/");
+        refused_lines(h, &carried);
+    } else {
+        let _ = writeln!(h, "  agents:      {}", carried_line(&carried));
+        refused_lines(h, &carried);
+    }
+    Ok(v)
+}
+
+/// What a carry did, in one line: what happened first, each clause only when it did, then where.
+pub(crate) fn carried_line(c: &Carried) -> String {
+    let clauses = [
+        (c.metas, "spawn record(s) copied"),
+        (c.transcripts, "transcript(s) copied"),
+        (
+            c.joined,
+            "transcript(s) joined (the source's records first, then what the session already held)",
+        ),
+        (c.unfinished, "transcript(s) carried up to an unfinished last record"),
+        (c.refused.len(), "transcript(s) refused"),
+        (c.already, "file(s) already there, left as they are"),
+    ];
+    let done: Vec<String> = clauses
+        .iter()
+        .filter(|(n, _)| *n > 0)
+        .map(|(n, what)| format!("{n} {what}"))
+        .collect();
+    let mut line = if done.is_empty() {
+        "nothing to carry".to_string()
+    } else {
+        done.join(", ")
+    };
+    let _ = write!(line, " → {}", c.dir.display());
+    if c.duplicates > 0 {
+        let _ = write!(line, " ({} file(s) another source already supplied)", c.duplicates);
+    }
+    line
+}
+
+/// One line per transcript a carry refused, under [`carried_line`]: a warning, the session is
+/// written either way.
+pub(crate) fn refused_lines(h: &mut String, c: &Carried) {
+    const SHOWN: usize = 8;
+    for r in c.refused.iter().take(SHOWN) {
+        let _ = writeln!(h, "  ⚠ agent {} not carried: {}", r.agent, r.why);
+    }
+    if c.refused.len() > SHOWN {
+        let _ = writeln!(h, "  ⚠ … and {} more (--json lists them)", c.refused.len() - SHOWN);
+    }
+}
 
 // ---------- prune ----------
 
@@ -52,6 +143,7 @@ pub(crate) struct PruneArgs<'a> {
     pub drop: bool,
     pub thinking: bool,
     pub copy_resources: bool,
+    pub carry_agents: Option<CarryAgents>,
     pub revive: bool,
     pub window: Option<u64>,
     pub keep: Option<String>,
@@ -84,6 +176,7 @@ pub(crate) fn cmd_prune(args: PruneArgs<'_>) -> Result<()> {
         drop,
         thinking,
         copy_resources,
+        carry_agents,
         revive,
         window,
         keep,
@@ -106,6 +199,7 @@ pub(crate) fn cmd_prune(args: PruneArgs<'_>) -> Result<()> {
     }
     let want = parse_harness(&harness)?;
     let (r, _adapter) = crate::cmd::distill::resolve_source(id, want)?;
+    carry_source(carry_agents, &r)?;
 
     if !cv_core::harness::has_derived_copies(r.harness) {
         bail!(
@@ -274,6 +368,13 @@ pub(crate) fn cmd_prune(args: PruneArgs<'_>) -> Result<()> {
         if let Some(rc) = &res.copied_resources {
             let _ = writeln!(h, "  resources:   copied subagents/workflows → {}", rc.display());
         }
+    }
+    if let Some(mode) = carry_agents {
+        let sources = std::slice::from_ref(&r.path);
+        let dry = (dry_run, dry_run && !pinned_id);
+        v["carried_agents"] = carry(mode, sources, &res.new_path, &res.new_id, dry, &mut h)?;
+    }
+    if !dry_run {
         let _ = writeln!(h, "  resume with: claude --resume {}", res.new_id);
     }
     report(json, &h, &v)
@@ -327,6 +428,7 @@ pub(crate) struct RewindArgs<'a> {
     pub full: bool,
     pub thinking: Option<cv_core::emit::ThinkingMode>,
     pub skills_policy: SkillsPolicy,
+    pub carry_agents: Option<CarryAgents>,
     pub dry_run: bool,
     pub json: bool,
     pub generator: &'a str,
@@ -343,6 +445,7 @@ pub(crate) fn cmd_rewind(args: RewindArgs<'_>) -> Result<()> {
         full,
         thinking,
         skills_policy,
+        carry_agents,
         dry_run,
         json,
         generator,
@@ -353,6 +456,7 @@ pub(crate) fn cmd_rewind(args: RewindArgs<'_>) -> Result<()> {
         Some(a) => crate::cmd::view::resolve_subagent(&r, a)?.session,
         None => r,
     };
+    carry_source(carry_agents, &r)?;
     if !cv_core::harness::has_derived_copies(r.harness) {
         return usage(format!(
             "cv rewind currently supports Claude Code sessions only (got {}) — `cv splice {}:..N` composes a \
@@ -460,6 +564,11 @@ pub(crate) fn cmd_rewind(args: RewindArgs<'_>) -> Result<()> {
             res.cut_cwd.as_deref().unwrap_or_default()
         );
     }
+    if let Some(mode) = carry_agents {
+        let sources = std::slice::from_ref(&r.path);
+        let dry = (res.dry_run, res.dry_run && !pinned);
+        v["carried_agents"] = carry(mode, sources, &res.new_path, &res.new_id, dry, &mut h)?;
+    }
     if !res.dry_run {
         let _ = writeln!(h, "  new session: {}", res.new_path.display());
         let _ = writeln!(h, "  provenance:  {}", res.provenance_path.display());
@@ -524,6 +633,7 @@ pub(crate) struct SpliceArgs<'a> {
     pub cwd: Option<PathBuf>,
     pub thinking: cv_core::emit::ThinkingMode,
     pub resumable: Option<crate::cmd::distill::Target>,
+    pub carry_agents: Option<CarryAgents>,
     pub json: bool,
 }
 
@@ -536,6 +646,7 @@ pub(crate) fn cmd_splice(args: SpliceArgs<'_>) -> Result<()> {
         cwd,
         thinking,
         resumable,
+        carry_agents,
         json,
     } = args;
     if let Some(format) = export.as_deref() {
@@ -554,9 +665,16 @@ pub(crate) fn cmd_splice(args: SpliceArgs<'_>) -> Result<()> {
 
     let mut composition = cv_core::splice::Composition::default();
     let mut first_path = None;
+    let mut agent_sources: Vec<PathBuf> = Vec::new();
     for sp in &parsed {
         let (reference, adapter) = crate::cmd::distill::resolve_source(&sp.id, None)?;
         first_path.get_or_insert_with(|| reference.path.clone());
+        if cv_core::harness::has_derived_copies(reference.harness)
+            && !cv_core::rewind::is_subagent(&reference)
+            && !agent_sources.contains(&reference.path)
+        {
+            agent_sources.push(reference.path.clone());
+        }
         let (session, total, grown) = if emitting {
             cv_core::emit::prepare_replayable(adapter.as_ref(), &reference, sp.start, sp.end)?
         } else {
@@ -602,10 +720,14 @@ pub(crate) fn cmd_splice(args: SpliceArgs<'_>) -> Result<()> {
         if let Some(p) = &e.path {
             let _ = writeln!(h, "  ↳ wrote {}", p.display());
         }
+        let mut v = serde_json::to_value(&e)?;
+        if let (Some(mode), Some(path), Some(id), None) = (carry_agents, &e.path, &e.session_id, &e.agent_id) {
+            v["carried_agents"] = carry(mode, &agent_sources, path, id, (false, false), &mut h)?;
+        }
         if let Some(r) = &e.resume {
             let _ = writeln!(h, "  ↳ resume: {r}");
         }
-        return report(json, &h, &serde_json::to_value(&e)?);
+        return report(json, &h, &v);
     }
     finish_composed(ComposedArgs {
         session: spliced,

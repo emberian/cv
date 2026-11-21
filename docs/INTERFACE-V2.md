@@ -130,6 +130,12 @@ hidden by default: finished lanes, archived sessions, terminal tasks).
 **Restored skills:** `prune`, `rewind`, and Claude-target `port` accept `--skills keep|drop|drop-stale`,
 parallel to `--thinking`. The default `keep` preserves existing transcript and report bytes.
 
+**Carried sub-agents:** `prune`, `rewind`, and `splice --session` accept `--carry-agents[=meta|full]`
+(bare flag defaults to `full`; `=` required for a value so a positional selector is never consumed)
+to copy a Claude session's `subagents/` spawn metadata and restamped transcripts under the new
+session id (joining any transcript the destination already started); `adopt --join --from <old>
+--into <new>` runs the same join after an in-place `/resume`.
+
 **Global:** `--frozen` (`CV_FROZEN=1`) leaves cv stores untouched; commands whose purpose is to
 write stores or sessions error with exit 2.
 

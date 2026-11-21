@@ -89,6 +89,25 @@ pub(crate) fn verify_derived(
     verify::verify_derived(source, file, source_agent, output, destination, agent)
 }
 
+pub(crate) fn verify_carried(
+    sources: &[(
+        &crate::json::JsonSource,
+        &fs::File,
+        crate::harness::store::jsonl::ranges::Range,
+    )],
+    joined_tail: Option<(
+        &crate::json::JsonSource,
+        &fs::File,
+        crate::harness::store::jsonl::ranges::Range,
+    )>,
+    source_agent: Option<&str>,
+    output: &Path,
+    destination: &Path,
+    agent: Option<&str>,
+) -> Result<()> {
+    verify::verify_carried(sources, joined_tail, source_agent, output, destination, agent)
+}
+
 /// The verbatim meta record a format-complete carrier message stashed (an object under
 /// `extra["_record"]`), or `None` for an ordinary message. See
 /// [`claude::carrier_record`](crate::ir::CARRIER_KEY).

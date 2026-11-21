@@ -13,6 +13,8 @@ use crate::source::{Dependencies, Probe};
 /// `cv adopt`: move a sub-agent stranded by a dead session into a live one — Claude-only byte
 /// surgery on this store's layout, so it lives beside the adapter that knows it.
 pub mod adopt;
+/// `--carry-agents` / `adopt --join`: carry or join sub-agents under a derived session id.
+pub mod carry;
 pub(super) mod chain;
 pub(crate) mod emit;
 mod fork;
@@ -36,8 +38,8 @@ use crate::lazy::Text;
 use crate::stream::{Checkpoint, CollectSink, Demand, Flow, MessageSink, Start, Tier};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-pub(crate) use emit::verify_derived;
 pub use emit::{emit, verify_claude_resumable};
+pub(crate) use emit::{verify_carried, verify_derived};
 use serde_json::{Map, Value};
 use std::collections::HashSet;
 use std::fs;

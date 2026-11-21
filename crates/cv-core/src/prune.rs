@@ -73,8 +73,11 @@ pub struct PruneOptions {
     /// Explicit new session id; otherwise a fresh UUIDv7.
     pub new_id: Option<String>,
     /// Also copy the session's `subagents/`/`workflows/` resource dir under the new id. Off by
-    /// default — `claude --resume` doesn't need it, and for big sessions it can be hundreds of MB /
-    /// thousands of files. Turn on if you want cv's forest features to work on the pruned session.
+    /// default — `claude --resume` in a new process doesn't need it, and for big sessions it can be
+    /// hundreds of MB / thousands of files. Turn on if you want cv's forest features to work on the
+    /// pruned session. A session resumed in place by the process that owns live sub-agents does
+    /// need their files under the new id: [`crate::harness::claude::carry::carry_agents`] copies
+    /// those.
     pub copy_resources: bool,
     /// After pruning, rewrite trailing `message.usage` records using an estimated post-prune
     /// prompt size. Claude Code's resume gate reads recorded usage before sending a new request
