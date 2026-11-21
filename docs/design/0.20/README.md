@@ -1,6 +1,6 @@
 # 0.20 candidate: reliable live histories and trustworthy handoffs
 
-Status: candidate `0.20.0`, source-reader version 13, unreleased and untagged. The current
+Status: candidate `0.20.0`, source-reader version 14, unreleased and untagged. The current
 feature set has passed local integration gates, including the source-selection follow-ups.
 Claude Fable's second review pass fixed
 further real-fleet defects, recorded in [BACKLOG.md](BACKLOG.md). This remains the existing
@@ -54,6 +54,13 @@ adapter, IR, query API and command surfaces.
    Doctor and resume accept individual transcript paths; Claude/Codex resume plans select
    the source's profile home relative to the caller's environment (Claude's default profile is
    left unnamed), while unsupported source selections fail explicitly.
+8. **Read Pi sessions, rejoin split Claude workers, and carry selective reshapes.**
+   Pi coding-agent v3 `.jsonl` transcripts discover, stream, ingest and produce `resume` plans as
+   the 23rd harness. Claude reads unrendered `queued_command` attachments and `isSynthetic` turns,
+   bridges skipped-record parents, and joins sub-agents split across in-place `/resume`s.
+   `dataset --format cycle`, replayable Claude `splice`, per-record `prune --plan` with
+   last-request context reporting, `--carry-agents[=meta|full]` / `adopt --join`, and `rewind`
+   same-stat prefix verification complete the reshape surface.
 
 ## Completed implementation lanes
 
@@ -69,7 +76,11 @@ adapter, IR, query API and command surfaces.
 | backlog_audit | Historical task reconciliation, corrected design claims and independent tool/web/desktop gates |
 | selected pack / overview | Explicit sources, optional-task overview, shared CLI/API/reader projection and source links |
 | context / worker following | Saved context rows, `lanes --follow` changes and non-launching resume JSON |
-| integration | Read/selection additions and source-routing follow-ups integrated; local gates passed |
+| pi_reader | Bounded 2-pass Pi v3 `.jsonl` reader, exact turn counts, compaction/context projection, ingest and resume |
+| dataset_claude_codec | Unrendered `queued_command` reading, `isSynthetic` turns, skipped-parent bridging and `dataset --format cycle` |
+| splice_prune_rewind | Replayable Claude `splice` carriers, per-record `prune --plan`, last-request context reporting and `rewind` prefix hash check |
+| claude_chain_carry | Split sub-agent chain joining across in-place `/resume`, `--carry-agents[=meta|full]` and `adopt --join` |
+| integration | Read/selection additions, source-routing follow-ups and Round 3 cross-branch integration; local gates passed |
 
 ## Acceptance evidence and its limits
 

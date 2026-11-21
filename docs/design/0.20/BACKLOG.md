@@ -24,6 +24,13 @@ Implemented in cv, with local workspace and focused integration gates completed.
 | Inspect `show --kind context` and API windows | Saved per-call usage and compaction rows retain original indexes, deduplicate repeated provider records and label saved estimates. Unknown limits remain null; no live remaining-context estimate | `cv-core/src/context.rs`; `tests/context.rs`; [context contract](../../../manual/src/cli.md#saved-token-usage---kind-context) |
 | Follow `lanes --follow [--for …] [--json]` | One parent's initial and changed rows, including final transitions after a selection filter stops matching; no idle duplicates; deadline/interrupt exits | `cmd/session_reports.rs`; `tests/worker_follow.rs`; [lanes manual](../../../manual/src/cli.md#cv-lanes) |
 | Read `resume --json` | Literal program/argument array, cwd, `env` to set and `unset_env` to remove relative to the caller's environment, hint and warning; GUI-only targets remain explicit. Claude's default profile is never named in `CLAUDE_CONFIG_DIR`. Never launches; conflicts with `--launch` | `cmd/port.rs` resume JSON tests, `tests/source_resume.rs`; [resume manual](../../../manual/src/cli.md#cv-resume) |
+| Read, ingest and resume Pi coding-agent v3 sessions | Bounded 2-pass `jsonl::Read` + `RangeSource` codec over `~/.pi/agent/sessions` (`PI_CODING_AGENT_DIR`), exact active-chain turn counts, compaction/context_edit projection, `Sniff::Pi` ingest and `pi --session <id>` resume plans | `harness/pi.rs`, `ingest.rs`, `cmd/port.rs`; `tests/{pi_synthetic,pi_mechanical_contract,pi_fixtures,source_resume}.rs` |
+| Read split Claude sub-agents across in-place `/resume` | Memoized `ProjectAgents` + exact parsed-`uuid` byte-range `RunSlice` joining (`A -> B` and `A -> B -> A` re-entry), cross-parent `task_notices` / `SubagentStop` merging in `lanes`, and checkpoint-aware `claude.discovery.v3` counting | `harness/claude/chain.rs`, `lanes.rs`, `cmd/view.rs`; `tests/{forest,selection}.rs` |
+| Export human-turn cycles with `dataset --format cycle` | Streaming `ByteStage` flat JSONL rows per post-initial human turn with `Adapter::human_turn` attestation, `JsonView` tool histograms, commit/push flags, and `spill::Ordered` `--active-branch` spooling; rejects `--clean-outcome` | `dataset/cycles.rs`, `cmd/reshape.rs`; `tests/cli.rs`; [dataset manual](../../../manual/src/cli.md#cv-dataset) |
+| Replay Claude system and attachment records in `splice` | Emitted splices read via `emit::prepare_replayable` (`Demand::records`), replaying Claude `system`/`attachment` `_record` carriers with threaded `parentUuid`s and restamped session IDs while keeping `--export json` free of `_record` | `harness/claude/emit.rs`, `splice.rs`, `cmd/reshape.rs`; `tests/selection.rs`; [splice manual](../../../manual/src/cli.md#cv-splice) |
+| Shape records and inspect context in `prune --plan` | Per-record `messages` alongside `results`, `pointer`/`drop` actions, 1-based inclusive `lines` excerpts, sidecar stashes recoverable via `cv cat`, and `resume_reads_tokens_before`/`_after` reporting the last surviving request's context size | `prune/plan.rs`, `prune.rs`, `cmd/reshape.rs`; `tests/selection.rs`; [reshaping manual](../../../manual/src/reshaping.md) |
+| Carry or join Claude sub-agents with `--carry-agents` and `adopt --join` | `--carry-agents[=meta\|full]` on `prune`, `rewind` and `splice --session` copies spawn records and restamped/joined root-to-tip transcripts with containment checks; `cv adopt --join` prepends earlier turns idempotently | `harness/claude/{carry,adopt}.rs`, `cmd/{reshape,adopt}.rs`; `tests/selection.rs`; [adopt manual](../../../manual/src/cli.md#cv-adopt) |
+| Verify `rewind` prefix hashes on same-stat rewrites | `PrefixReadGuard` verifies captured BLAKE3 prefix digests across `source.len()` even when `FileId` metadata matches (sub-jiffy same-size `O_TRUNC` rewrites) | `json.rs`, `rewind.rs` `prefix_read_guard_rejects_same_file_id_when_prefix_hash_differs` |
 
 **Separate Fleet consumer work:** `d58a1cce`, `6def5a7e` and `73586c1b` in the Fleet repository preserve distinct
 harness/ID/path sources, timestamp precision and unknown counts, use the configured cv binary
@@ -76,10 +83,13 @@ Still open after this pass, most consequential first:
    miss 2.0 s) against 0.05 s for a session id; `cv lanes` 0.49 s. Measured, not implemented: needs
    a by-id catalog table with directory guards (exact and prefix ids, ambiguity, new children,
    changed roots).
-2. **120 Claude launches stay unsettled despite an ending**: their task notifications are
-   `queued_command` attachments without a rendered body, or replayed as origin-less user text.
-   The Claude record codec should keep an unrendered task-notification attachment as injected
-   context; that changes corpus goldens.
+2. **Unrendered `queued_command` task notifications (closed; origin-less plain user text remains bounded)**:
+   Claude's record codec now reads unrendered `queued_command` attachments (`attachment.prompt`) as
+   `InjectedContext` with `commandMode` and `origin` under `extra["claude"]["attachment"]` at every
+   tier, settling lifecycle and `task_notices` while keeping task notifications out of `distill` and
+   affordance false positives (`unrendered_queued_commands_settle_lifecycle_without_polluting_distill_or_affordances`).
+   Replayed plain user text lacking any notification marker or non-human origin remains governed by
+   [HANDOFF.md](HANDOFF.md).
 3. **Antigravity**: `cv lanes` shows parked swarm workers as running (no writer evidence yet for
    what `wake_mode` means); `FileEdit.diff`, GenerateImage/DefineSubagent payloads and blob
    references are retained in COMPLETE only; non-permission interactions (`ask_question`) were not

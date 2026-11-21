@@ -42,6 +42,14 @@
 - Distill budgets measure what the target loads and say which; `--json` adds `budget` and `unsettled`; facts note a later identical run.
 - `cv show --around`, `cv tools` and live search no longer materialise inline image bytes.
 - `cv task show` prints the newest three notes (`--all` for every note); `cv task open` warns on a similar open title.
+- Pi coding-agent v3 sessions support bounded discovery, active-branch and compaction projection, format validation, archive ingest, and native resume plans.
+- Claude reads unrendered queued-command attachments as injected context, counts synthetic user records accurately, bridges skipped-record parents, and excludes task notifications from distill.
+- Claude rejoins sub-agent transcripts split across in-place parent resumes in reads, discovery, lanes, workflows, adoptions, and forest views.
+- `cv dataset --format cycle` streams flat human-turn cycle rows with tool histograms, commit and push flags, prompt attestation, and active-branch filtering.
+- `cv splice` into Claude replays native `system` and `attachment` records verbatim, restamping session IDs while keeping `--export json` free of carrier keys.
+- `cv prune --plan` adds per-record `messages`, `pointer`, `drop`, and inclusive `lines` excerpts recoverable via `cv cat`, and reports last-request resume context sizes.
+- `prune`, `rewind`, and `splice --session` add `--carry-agents[=meta|full]` to carry or join Claude sub-agents; `cv adopt --join` prepends earlier turns idempotently.
+- `cv rewind` verifies its captured source prefix hash even when a rewritten transcript keeps identical `stat` metadata.
 
 ## 0.19.3 — 2026-11-13 — parser termination and malformed-input recovery
 
