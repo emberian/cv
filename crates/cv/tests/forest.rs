@@ -614,3 +614,169 @@ fn split_agent_reentry_and_quoted_uuid_negative_controls() {
         assert!(!out.contains("log snippet quoting"), "decoy must never chain");
     }
 }
+
+#[test]
+fn subagent_catalog_lookup_covers_frozen_spawn_deletion_ambiguity_adopt_and_resume_split() {
+    let w = split_by_resume("subagent-catalog-cli");
+    cv_testkit::settle(&w.home);
+
+    // Warm catalog.db first.
+    let (ls_out, _) = w.cv_ok(&["ls", "--json"]);
+    let ls_rows: Vec<serde_json::Value> = serde_json::from_str(&ls_out).unwrap();
+    assert_eq!(ls_rows.len(), 2);
+
+    // Checkpoint catalog.db so `-wal`/`-shm` sidecars are absent before `--frozen` assertions.
+    {
+        let db = w.cv_home.join("catalog.db");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+    }
+    let snapshot_home = || {
+        let mut files = std::collections::BTreeMap::new();
+        for entry in fs::read_dir(&w.cv_home).unwrap() {
+            let p = entry.unwrap().path();
+            if p.is_file() {
+                files.insert(p.clone(), fs::read(&p).unwrap());
+            }
+        }
+        files
+    };
+    let before = snapshot_home();
+
+    // 1. Warm `/resume`-split multi-parent chain resolves whole via `agent-` AND bare prefix under `--frozen`
+    //    with no false `(adopted)` banner and zero catalog writes.
+    for selector in ["agent-a5f1170c0de000001", "a5f1170c"] {
+        let (out, err) = w.cv_ok(&["--frozen", "show", selector, "--json"]);
+        assert!(!err.contains("(adopted)"), "{selector}: {err}");
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let msg_ids: Vec<&str> = v["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|m| m["id"].as_str())
+            .collect();
+        assert_eq!(msg_ids, ["x-u1", "x-a1", "x-r1", "x-a2", "y-r2", "y-a3"]);
+    }
+    assert_eq!(snapshot_home(), before, "--frozen warm hit mutated cv_home");
+
+    // 2. Newly spawned sub-agents AFTER catalog build (both under existing parent and brand-new parent)
+    //    immediately resolve under `--frozen` show & distill without mutating `catalog.db`.
+    let side_line = |sid: &str, aid: &str, text: &str| {
+        serde_json::json!({
+            "type": "user",
+            "uuid": format!("u-{aid}"),
+            "sessionId": sid,
+            "isSidechain": true,
+            "agentId": aid,
+            "timestamp": "2026-06-07T12:10:00Z",
+            "cwd": "/work/proj",
+            "message": {"role": "user", "content": text}
+        })
+    };
+    let spawned_existing = w.write_agent(
+        "sess-first",
+        "af202e9999",
+        &serde_json::json!({"agentType": "general-purpose", "description": "existing parent spawn"}),
+        &[side_line(
+            "sess-first",
+            "af202e9999",
+            "spawned after warm under existing",
+        )],
+    );
+    w.write_session("sess-after-warm", &[user("aw-u0", None, "brand new parent")]);
+    let spawned_new_parent = w.write_agent(
+        "sess-after-warm",
+        "af202e8888",
+        &serde_json::json!({"agentType": "general-purpose", "description": "new parent spawn"}),
+        &[side_line(
+            "sess-after-warm",
+            "af202e8888",
+            "spawned after warm under new parent",
+        )],
+    );
+
+    let (out1, _) = w.cv_ok(&["--frozen", "show", "agent-af202e9999"]);
+    assert!(out1.contains("spawned after warm under existing"), "{out1}");
+    let (out2, _) = w.cv_ok(&["--frozen", "show", "af202e8888"]);
+    assert!(out2.contains("spawned after warm under new parent"), "{out2}");
+    let (distilled, _) = w.cv_ok(&["--frozen", "distill", "agent-af202e9999"]);
+    assert!(distilled.contains("spawned after warm under existing"), "{distilled}");
+    assert_eq!(
+        snapshot_home(),
+        before,
+        "--frozen post-warm spawn lookup mutated cv_home"
+    );
+
+    // 3. Prefix ambiguity across two parents AND within one parent exits 2 with candidate diagnostics.
+    let (ok, code, _, err) = w.cv(&["--frozen", "show", "agent-af202e"]);
+    assert!(
+        !ok && code == 2 && err.contains("ambiguous sub-agent id"),
+        "{code}: {err}"
+    );
+    assert!(err.contains("sess-first") && err.contains("sess-after-warm"), "{err}");
+
+    let (ok_d, code_d, _, err_d) = w.cv(&["--frozen", "distill", "af202e"]);
+    assert!(
+        !ok_d && code_d == 2 && err_d.contains("ambiguous sub-agent id"),
+        "{code_d}: {err_d}"
+    );
+
+    w.write_agent(
+        "sess-after-warm",
+        "ab0741",
+        &serde_json::json!({"agentType": "general-purpose"}),
+        &[side_line("sess-after-warm", "ab0741", "sibling one")],
+    );
+    w.write_agent(
+        "sess-after-warm",
+        "ab0742",
+        &serde_json::json!({"agentType": "general-purpose"}),
+        &[side_line("sess-after-warm", "ab0742", "sibling two")],
+    );
+    let (ok_sib, code_sib, _, err_sib) = w.cv(&["--frozen", "show", "agent-ab074"]);
+    assert!(
+        !ok_sib && code_sib == 2 && err_sib.contains("2 candidates under"),
+        "{code_sib}: {err_sib}"
+    );
+    assert!(
+        err_sib.contains("agent-ab0741") && err_sib.contains("agent-ab0742"),
+        "{err_sib}"
+    );
+
+    // 4. `cv adopt` copies one agent into a newer session: lookup returns both parents, picks the
+    //    newest copy, and surfaces the `(adopted)` note on stderr.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    w.write_session("sess-after-warm", &[user("aw-u0", None, "brand new parent newest")]);
+    w.cv_ok(&[
+        "adopt",
+        "af202e9999",
+        "--from",
+        "sess-first",
+        "--into",
+        "sess-after-warm",
+    ]);
+    w.cv_ok(&["ls", "--json"]);
+    let (adopted_out, adopted_err) = w.cv_ok(&["--frozen", "show", "agent-af202e9999"]);
+    assert!(
+        adopted_out.contains("spawned after warm under existing"),
+        "{adopted_out}"
+    );
+    assert!(
+        adopted_err.contains("2 sessions hold a copy of this agent (adopted)"),
+        "{adopted_err}"
+    );
+    let _ = spawned_existing;
+
+    // 5. Deleting a sub-agent transcript immediately invalidates lookup under both `--frozen` and normal mode (exit 2).
+    fs::remove_file(&spawned_new_parent).unwrap();
+    for args in [
+        &["--frozen", "show", "agent-af202e8888"][..],
+        &["show", "agent-af202e8888"][..],
+    ] {
+        let (ok_del, code_del, _, err_del) = w.cv(args);
+        assert!(
+            !ok_del && code_del == 2 && err_del.contains("no session (and no sub-agent) matching"),
+            "{args:?} -> {code_del}: {err_del}"
+        );
+    }
+}

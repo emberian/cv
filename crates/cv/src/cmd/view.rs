@@ -593,27 +593,55 @@ fn resolve_show_target(
         crate::util::require_session_file(&r, adapter.as_ref())?;
         return Ok((r, adapter, None));
     }
-    if id.starts_with("agent-") {
+    let found = if id.starts_with("agent-") {
         if let Some((sub, adapter)) = resolve_agent_fleetwide(id, want)? {
             return Ok((sub.session.clone(), adapter, Some(sub)));
         }
-    }
-    let found = match cv_core::find_cheap(id, want) {
-        Ok(Some(hit)) => Ok(Some(hit)),
-        Ok(None) => {
-            if let Some((sub, adapter)) = resolve_agent_fleetwide(id, want)? {
-                return Ok((sub.session.clone(), adapter, Some(sub)));
-            }
-            if let Some((parent_spec, agent_spec)) = id.split_once('/') {
-                let (parent, _parent_adapter) = resolve(parent_spec, want)?;
-                let sub = resolve_subagent(&parent, agent_spec)?;
-                let adapter = cv_core::harness::for_harness(sub.session.harness)
-                    .with_context(|| format!("no adapter for {}", sub.session.harness))?;
-                return Ok((sub.session.clone(), adapter, Some(sub)));
-            }
-            cv_core::find(id, want)
+        match cv_core::find_top_level_cheap(id, want) {
+            Ok((Some(hit), _)) => Ok(Some(hit)),
+            Ok((None, exhausted)) => match cv_core::find_top_level_escalate(id, want, exhausted) {
+                Ok(Some(hit)) => Ok(Some(hit)),
+                Ok(None) => {
+                    if !exhausted && want.is_none() && !cv_core::env::frozen() {
+                        if let Some((sub, adapter)) = resolve_agent_fleetwide(id, want)? {
+                            return Ok((sub.session.clone(), adapter, Some(sub)));
+                        }
+                    }
+                    Ok(None)
+                }
+                Err(e) => Err(e),
+            },
+            Err(e) => Err(e),
         }
-        Err(e) => Err(e),
+    } else {
+        match cv_core::find_top_level_cheap(id, want) {
+            Ok((Some(hit), _)) => Ok(Some(hit)),
+            Ok((None, exhausted)) => {
+                if let Some((sub, adapter)) = resolve_agent_fleetwide(id, want)? {
+                    return Ok((sub.session.clone(), adapter, Some(sub)));
+                }
+                if let Some((parent_spec, agent_spec)) = id.split_once('/') {
+                    let (parent, _parent_adapter) = resolve(parent_spec, want)?;
+                    let sub = resolve_subagent(&parent, agent_spec)?;
+                    let adapter = cv_core::harness::for_harness(sub.session.harness)
+                        .with_context(|| format!("no adapter for {}", sub.session.harness))?;
+                    return Ok((sub.session.clone(), adapter, Some(sub)));
+                }
+                match cv_core::find_top_level_escalate(id, want, exhausted) {
+                    Ok(Some(hit)) => Ok(Some(hit)),
+                    Ok(None) => {
+                        if !exhausted && want.is_none() && !cv_core::env::frozen() {
+                            if let Some((sub, adapter)) = resolve_agent_fleetwide(id, want)? {
+                                return Ok((sub.session.clone(), adapter, Some(sub)));
+                            }
+                        }
+                        Ok(None)
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            Err(e) => Err(e),
+        }
     };
     match found {
         Ok(Some((r, adapter))) => {

@@ -926,9 +926,8 @@ enum Observation {
 
 impl Probe {
     fn observation(&mut self, path: &Path) -> &Observation {
-        self.entries
-            .entry(path.to_path_buf())
-            .or_insert_with(|| match std::fs::metadata(path) {
+        if !self.entries.contains_key(path) {
+            let obs = match std::fs::metadata(path) {
                 Ok(md) => FileId::of(&md).map_or(Observation::Unidentified(md.len()), Observation::File),
                 Err(e)
                     if matches!(
@@ -939,7 +938,10 @@ impl Probe {
                     Observation::Absent
                 }
                 Err(_) => Observation::Unavailable,
-            })
+            };
+            self.entries.insert(path.to_path_buf(), obs);
+        }
+        &self.entries[path]
     }
 
     fn entry(&mut self, path: &Path) -> Option<Entry> {
@@ -960,8 +962,15 @@ impl Probe {
     }
 
     /// Identity of `path` (`Some(Some(id))` when present, `Some(None)` when absent), cached once
-    /// per path in this probe.
+    /// per path in this probe without allocating a `PathBuf` on absolute-path cache hits.
     pub(crate) fn file_id(&mut self, path: &Path) -> Option<Option<FileId>> {
+        if path.is_absolute() {
+            return match self.observation(path) {
+                Observation::File(id) => Some(Some(*id)),
+                Observation::Absent => Some(None),
+                Observation::Unidentified(_) | Observation::Unavailable => None,
+            };
+        }
         Some(self.entry(path)?.state)
     }
 

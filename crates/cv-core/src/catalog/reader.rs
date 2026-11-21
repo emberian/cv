@@ -98,6 +98,21 @@ impl Reader {
     pub(crate) fn publish_all(&mut self, rows: &[Publication<'_>]) {
         let _ = rows;
     }
+
+    pub(crate) fn probe_workflow_harnesses(&self, harnesses: &[Harness], max_stale: i64) -> Option<Vec<Harness>> {
+        let _ = (harnesses, max_stale);
+        None
+    }
+
+    pub(crate) fn lookup_subagent_parents(
+        &mut self,
+        want: &str,
+        harnesses: &[(Harness, &'static dyn crate::harness::Workflows)],
+        unpersisted: &std::collections::HashMap<Harness, Vec<SessionRef>>,
+    ) -> Option<Vec<SessionRef>> {
+        let _ = (want, harnesses, unpersisted);
+        None
+    }
 }
 
 #[cfg(feature = "sqlite")]
@@ -247,7 +262,9 @@ impl Reader {
             return false;
         }
         let sources = super::imp::prepare_sources(h, refs, before);
-        super::imp::replace_prepared_in(&mut self.conn.lock().unwrap(), h, refs, watches, &sources)
+        let mut conn = self.conn.lock().unwrap();
+        let subagents = super::imp::prepare_subagents(&conn, h, refs);
+        super::imp::replace_prepared_in(&mut conn, h, refs, watches, &sources, subagents.as_ref())
     }
 
     pub(crate) fn persist_discovery(&mut self, prune: bool) {
@@ -264,10 +281,33 @@ impl Reader {
     }
 
     pub(crate) fn publish_all(&mut self, rows: &[Publication<'_>]) {
+        if crate::env::frozen() {
+            return;
+        }
         let sources: Vec<_> = rows
             .iter()
             .map(|(h, refs, _, before)| super::imp::prepare_sources(*h, refs, before))
             .collect();
-        super::imp::publish_all_in(&mut self.conn.lock().unwrap(), rows, &sources);
+        let mut conn = self.conn.lock().unwrap();
+        let subagents: Vec<_> = rows
+            .iter()
+            .map(|(h, refs, _, _)| super::imp::prepare_subagents(&conn, *h, refs))
+            .collect();
+        super::imp::publish_all_in(&mut conn, rows, &sources, &subagents);
+    }
+
+    pub(crate) fn probe_workflow_harnesses(&self, harnesses: &[Harness], max_stale: i64) -> Option<Vec<Harness>> {
+        let conn = self.conn.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        super::imp::probe_workflow_harnesses_in(&conn, harnesses, max_stale)
+    }
+
+    pub(crate) fn lookup_subagent_parents(
+        &mut self,
+        want: &str,
+        harnesses: &[(Harness, &'static dyn crate::harness::Workflows)],
+        unpersisted: &std::collections::HashMap<Harness, Vec<SessionRef>>,
+    ) -> Option<Vec<SessionRef>> {
+        let mut conn = self.conn.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        super::imp::lookup_subagent_parents_in(&mut conn, want, harnesses, unpersisted)
     }
 }

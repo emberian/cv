@@ -91,31 +91,59 @@ fn resolve_source_with_note(
         return Ok((SessionRef::from_path(p, h), a));
     }
     let (want, id) = split_harness_id(spec, harness);
-    if id.starts_with("agent-") {
+    let found = if id.starts_with("agent-") {
         if let Some((sub, adapter)) = crate::cmd::view::resolve_agent_fleetwide(id, want)? {
             return Ok((sub.session, adapter));
         }
-    }
-    let found = match cv_core::find_cheap(id, want) {
-        Ok(Some(hit)) => Ok(Some(hit)),
-        Ok(None) => {
-            if let Some((sub, adapter)) = crate::cmd::view::resolve_agent_fleetwide(id, want)? {
-                return Ok((sub.session, adapter));
-            }
-            if !p.exists() {
-                if let Some((parent_spec, agent_spec)) = id.split_once('/') {
-                    let (parent, adapter) = if warn_shadowed {
-                        resolve(parent_spec, want)?
-                    } else {
-                        crate::util::resolve_quiet(parent_spec, want)?
-                    };
-                    let sub = crate::cmd::view::resolve_subagent(&parent, agent_spec)?;
+        match cv_core::find_top_level_cheap(id, want) {
+            Ok((Some(hit), _)) => Ok(Some(hit)),
+            Ok((None, exhausted)) => match cv_core::find_top_level_escalate(id, want, exhausted) {
+                Ok(Some(hit)) => Ok(Some(hit)),
+                Ok(None) => {
+                    if !exhausted && want.is_none() && !cv_core::env::frozen() {
+                        if let Some((sub, adapter)) = crate::cmd::view::resolve_agent_fleetwide(id, want)? {
+                            return Ok((sub.session, adapter));
+                        }
+                    }
+                    Ok(None)
+                }
+                Err(e) => Err(e),
+            },
+            Err(e) => Err(e),
+        }
+    } else {
+        match cv_core::find_top_level_cheap(id, want) {
+            Ok((Some(hit), _)) => Ok(Some(hit)),
+            Ok((None, exhausted)) => {
+                if let Some((sub, adapter)) = crate::cmd::view::resolve_agent_fleetwide(id, want)? {
                     return Ok((sub.session, adapter));
                 }
+                if !p.exists() {
+                    if let Some((parent_spec, agent_spec)) = id.split_once('/') {
+                        let (parent, adapter) = if warn_shadowed {
+                            resolve(parent_spec, want)?
+                        } else {
+                            crate::util::resolve_quiet(parent_spec, want)?
+                        };
+                        let sub = crate::cmd::view::resolve_subagent(&parent, agent_spec)?;
+                        return Ok((sub.session, adapter));
+                    }
+                }
+                match cv_core::find_top_level_escalate(id, want, exhausted) {
+                    Ok(Some(hit)) => Ok(Some(hit)),
+                    Ok(None) => {
+                        if !exhausted && want.is_none() && !cv_core::env::frozen() {
+                            if let Some((sub, adapter)) = crate::cmd::view::resolve_agent_fleetwide(id, want)? {
+                                return Ok((sub.session, adapter));
+                            }
+                        }
+                        Ok(None)
+                    }
+                    Err(e) => Err(e),
+                }
             }
-            cv_core::find(id, want)
+            Err(e) => Err(e),
         }
-        Err(e) => Err(e),
     };
     match found {
         Ok(Some((r, adapter))) => {

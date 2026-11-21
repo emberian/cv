@@ -306,7 +306,7 @@ mod imp {
     /// Physical DDL stamp for `catalog.db` (`PRAGMA user_version`), decoupled from
     /// [`crate::source::VERSION`]: codec and event version bumps invalidate only affected
     /// harness/consumer rows via `harness_versions` instead of dropping the whole catalog.
-    const SCHEMA: i64 = 11;
+    const SCHEMA: i64 = 12;
 
     #[cfg(test)]
     type ScopedVersionOverride = (std::collections::HashMap<Harness, u32>, Option<u32>);
@@ -442,6 +442,8 @@ mod imp {
         tx.execute("DELETE FROM resume_marks WHERE harness=?1", [name])?;
         tx.execute("DELETE FROM skipped_sources WHERE harness=?1", [name])?;
         tx.execute("DELETE FROM source_dependencies WHERE harness=?1", [name])?;
+        tx.execute("DELETE FROM subagent_parents WHERE harness=?1", [name])?;
+        tx.execute("DELETE FROM subagents WHERE harness=?1", [name])?;
         invalidate_events_for_harness(tx, h)?;
         Ok(())
     }
@@ -536,6 +538,8 @@ mod imp {
         if changed {
             tx.execute("DELETE FROM watched", [])?;
             tx.execute("DELETE FROM primary_sources", [])?;
+            tx.execute("DELETE FROM subagent_parents", [])?;
+            tx.execute("DELETE FROM subagents", [])?;
             tx.execute("DELETE FROM catalog_meta WHERE key='last_full_sync'", [])?;
             tx.execute(
                 "INSERT OR REPLACE INTO catalog_meta(key,value) VALUES('discovery_version',?1)",
@@ -650,7 +654,23 @@ mod imp {
                  path    TEXT NOT NULL,
                  why     TEXT NOT NULL,
                  PRIMARY KEY(harness, path)
-             );";
+             );
+             CREATE TABLE IF NOT EXISTS subagent_parents(
+                 harness     TEXT NOT NULL,
+                 parent_id   TEXT NOT NULL,
+                 parent_path TEXT NOT NULL,
+                 guard       TEXT NOT NULL,
+                 PRIMARY KEY(harness, parent_id, parent_path)
+             );
+             CREATE TABLE IF NOT EXISTS subagents(
+                 harness     TEXT NOT NULL,
+                 stem        TEXT NOT NULL,
+                 parent_id   TEXT NOT NULL,
+                 parent_path TEXT NOT NULL,
+                 PRIMARY KEY(harness, stem, parent_id, parent_path)
+             );
+             CREATE INDEX IF NOT EXISTS idx_subagents_stem ON subagents(stem);
+             CREATE INDEX IF NOT EXISTS idx_subagents_parent ON subagents(harness, parent_id, parent_path);";
 
     fn watch_is_fresh(path: &Path, recorded: Watched) -> bool {
         match std::fs::metadata(path) {
@@ -810,7 +830,8 @@ mod imp {
         before: &PrimaryReads,
     ) {
         let sources = prepare_sources(h, refs, before);
-        replace_prepared_in(conn, h, refs, watches, &sources);
+        let subagents = prepare_subagents(conn, h, refs);
+        replace_prepared_in(conn, h, refs, watches, &sources, subagents.as_ref());
     }
 
     pub(super) fn replace_prepared_in(
@@ -819,6 +840,7 @@ mod imp {
         refs: &[SessionRef],
         watches: &[(PathBuf, Watched)],
         sources: &SourceRows,
+        subagents: Option<&PreparedSubagents>,
     ) -> bool {
         if crate::env::frozen() {
             return false;
@@ -830,7 +852,7 @@ mod imp {
         else {
             return false;
         };
-        if publish_harness_in(&tx, h, refs, watches, sources)
+        if publish_harness_in(&tx, h, refs, watches, sources, subagents)
             .inspect_err(note_sql)
             .is_ok()
         {
@@ -876,7 +898,12 @@ mod imp {
         }
     }
 
-    pub(super) fn publish_all_in(conn: &mut Connection, rows: &[Publication<'_>], sources: &[SourceRows]) {
+    pub(super) fn publish_all_in(
+        conn: &mut Connection,
+        rows: &[Publication<'_>],
+        sources: &[SourceRows],
+        subagents: &[Option<PreparedSubagents>],
+    ) {
         if crate::env::frozen() {
             return;
         }
@@ -887,8 +914,8 @@ mod imp {
         else {
             return;
         };
-        for ((h, refs, watches, _), sources) in rows.iter().zip(sources) {
-            if publish_harness_in(&tx, *h, refs, watches, sources)
+        for (((h, refs, watches, _), sources), subagents) in rows.iter().zip(sources).zip(subagents) {
+            if publish_harness_in(&tx, *h, refs, watches, sources, subagents.as_ref())
                 .inspect_err(note_sql)
                 .is_err()
             {
@@ -964,8 +991,12 @@ mod imp {
         refs: &[SessionRef],
         watches: &[(PathBuf, Watched)],
         source_rows: &SourceRows,
+        subagents: Option<&PreparedSubagents>,
     ) -> rusqlite::Result<()> {
         order::publish(tx, h, refs)?;
+        if let Some(prep) = subagents {
+            apply_prepared_subagents_in(tx, h, prep)?;
+        }
         publish_writer_versions(tx, h)?;
         let watch_rows = watches
             .iter()
@@ -973,6 +1004,671 @@ mod imp {
             .collect();
         reconcile_rows(tx, h, "primary_sources", "reads", source_rows)?;
         reconcile_rows(tx, h, "watched", "id", &watch_rows)
+    }
+
+    pub(super) struct PreparedSubagents {
+        scanned: Vec<(String, String, String, Vec<String>)>,
+    }
+
+    fn current_now_ns() -> Option<u64> {
+        SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_nanos() as u64)
+    }
+
+    fn settled_file_id(id: FileId, now_ns: Option<u64>) -> Option<FileId> {
+        let fudge = WATCH_FUDGE.as_nanos() as u64;
+        now_ns
+            .and_then(|now| now.checked_sub(id.mtime_ns))
+            .is_some_and(|age| age >= fudge)
+            .then_some(id)
+    }
+
+    fn escape_guard_path(path: &Path) -> Option<String> {
+        let s = path.to_str()?;
+        if !s.contains(['\\', '\n']) {
+            return Some(s.to_owned());
+        }
+        let mut out = String::with_capacity(s.len() + 4);
+        for ch in s.chars() {
+            match ch {
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                _ => out.push(ch),
+            }
+        }
+        Some(out)
+    }
+
+    fn unescape_guard_path(raw: &str) -> std::borrow::Cow<'_, str> {
+        if !raw.contains('\\') {
+            return std::borrow::Cow::Borrowed(raw);
+        }
+        let mut out = String::with_capacity(raw.len());
+        let mut chars = raw.chars();
+        while let Some(ch) = chars.next() {
+            if ch == '\\' {
+                match chars.next() {
+                    Some('n') => out.push('\n'),
+                    Some('\\') => out.push('\\'),
+                    Some(other) => {
+                        out.push('\\');
+                        out.push(other);
+                    }
+                    None => out.push('\\'),
+                }
+            } else {
+                out.push(ch);
+            }
+        }
+        std::borrow::Cow::Owned(out)
+    }
+
+    fn encode_guard(entries: &[(&Path, Watched)]) -> String {
+        if entries.is_empty() {
+            return "?".into();
+        }
+        let mut out = String::new();
+        for (i, &(path, watched)) in entries.iter().enumerate() {
+            let Some(escaped) = escape_guard_path(path) else {
+                return "?".into();
+            };
+            if i > 0 {
+                out.push('\n');
+            }
+            match watched {
+                Watched::Unknown => return "?".into(),
+                Watched::Absent => {
+                    out.push_str("A ");
+                    out.push_str(&escaped);
+                }
+                Watched::Is(id) => {
+                    use std::fmt::Write as _;
+                    let _ = write!(
+                        out,
+                        "I {}:{}:{}:{}:{} {}",
+                        id.len, id.mtime_ns, id.dev, id.ino, id.ctime_ns, escaped
+                    );
+                }
+            }
+        }
+        out
+    }
+
+    fn parse_guard_file_id(nums: &str) -> Option<FileId> {
+        let mut parts = nums.split(':');
+        let len = parts.next()?.parse::<u64>().ok()?;
+        let mtime_ns = parts.next()?.parse::<u64>().ok()?;
+        let dev = parts.next()?.parse::<u64>().ok()?;
+        let ino = parts.next()?.parse::<u64>().ok()?;
+        let ctime_ns = parts.next()?.parse::<i64>().ok()?;
+        parts.next().is_none().then_some(FileId {
+            len,
+            mtime_ns,
+            dev,
+            ino,
+            ctime_ns,
+        })
+    }
+
+    fn guard_is_fresh(guard: &str, probe: &mut crate::source::Probe) -> bool {
+        if guard.is_empty() || guard == "?" {
+            return false;
+        }
+        for line in guard.lines() {
+            if let Some(raw_path) = line.strip_prefix("A ") {
+                let path = unescape_guard_path(raw_path);
+                if probe.file_id(Path::new(path.as_ref())) != Some(None) {
+                    return false;
+                }
+            } else if let Some(rest) = line.strip_prefix("I ") {
+                let Some((nums, raw_path)) = rest.split_once(' ') else {
+                    return false;
+                };
+                let Some(expected) = parse_guard_file_id(nums) else {
+                    return false;
+                };
+                let path = unescape_guard_path(raw_path);
+                if probe.file_id(Path::new(path.as_ref())) != Some(Some(expected)) {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn collect_stems_in_dir(dir: &Path, stems: &mut BTreeSet<String>) -> bool {
+        #[cfg(test)]
+        crate::note_subagent_read_dir();
+        let rd = match std::fs::read_dir(dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+            Err(_) => return false,
+        };
+        let mut ok = true;
+        for entry in rd {
+            let Ok(entry) = entry else {
+                ok = false;
+                continue;
+            };
+            if let Some(name) = entry.file_name().to_str() {
+                if let Some(stem) = name.strip_suffix(".jsonl") {
+                    if stem.starts_with("agent-") && !stem.ends_with(".flat") {
+                        stems.insert(stem.to_owned());
+                    }
+                }
+            }
+        }
+        ok
+    }
+
+    /// Scan a workflow-capable parent session's sub-agent sidecar directories and return its
+    /// compact directory-stat guard plus discovered `agent-*` stems:
+    /// - `<proj>/<sid>` absent -> guard `<proj>`'s `FileId` (shared across siblings via `probe`).
+    /// - `<sid>` present without `subagents/` -> guard `<sid>`'s `FileId`.
+    /// - `<sid>/subagents` present -> guard `subagents/` `FileId`, `Watched` of
+    ///   `subagents/workflows`, and `FileId` of each `<run>` dir (`WATCH_FUDGE` = 2s).
+    fn scan_subagent_parent(
+        h: Harness,
+        parent_path: &Path,
+        probe: &mut crate::source::Probe,
+        now_ns: Option<u64>,
+    ) -> (String, Vec<String>) {
+        if h != Harness::Claude {
+            return ("?".into(), Vec::new());
+        }
+        let Some(proj) = parent_path.parent() else {
+            return ("?".into(), Vec::new());
+        };
+        let Some(sid_dir) = crate::harness::claude::sidecar::session_dir(parent_path) else {
+            return ("?".into(), Vec::new());
+        };
+        match probe.file_id(&sid_dir) {
+            Some(None) => {
+                let guard = match probe.file_id(proj).flatten().and_then(|id| settled_file_id(id, now_ns)) {
+                    Some(proj_id) => encode_guard(&[(proj, Watched::Is(proj_id))]),
+                    None => "?".into(),
+                };
+                (guard, Vec::new())
+            }
+            None => ("?".into(), Vec::new()),
+            Some(Some(sid_id)) => {
+                let sub_dir = sid_dir.join("subagents");
+                match probe.file_id(&sub_dir) {
+                    Some(None) => {
+                        let guard = match settled_file_id(sid_id, now_ns) {
+                            Some(settled) => encode_guard(&[(&sid_dir, Watched::Is(settled))]),
+                            None => "?".into(),
+                        };
+                        (guard, Vec::new())
+                    }
+                    None => ("?".into(), Vec::new()),
+                    Some(Some(sub_id)) => {
+                        let mut stems = BTreeSet::new();
+                        let mut ok = collect_stems_in_dir(&sub_dir, &mut stems);
+                        let mut entries: Vec<(PathBuf, Watched)> = Vec::new();
+                        match settled_file_id(sub_id, now_ns) {
+                            Some(settled) => entries.push((sub_dir.clone(), Watched::Is(settled))),
+                            None => ok = false,
+                        }
+                        let wf_runs_dir = sub_dir.join("workflows");
+                        match probe.file_id(&wf_runs_dir) {
+                            Some(None) => entries.push((wf_runs_dir, Watched::Absent)),
+                            None => ok = false,
+                            Some(Some(wf_id)) => {
+                                match settled_file_id(wf_id, now_ns) {
+                                    Some(settled) => entries.push((wf_runs_dir.clone(), Watched::Is(settled))),
+                                    None => ok = false,
+                                }
+                                #[cfg(test)]
+                                crate::note_subagent_read_dir();
+                                match std::fs::read_dir(&wf_runs_dir) {
+                                    Ok(rd) => {
+                                        let mut run_dirs = Vec::new();
+                                        for entry in rd {
+                                            match entry {
+                                                Ok(e) => run_dirs.push(e.path()),
+                                                Err(_) => ok = false,
+                                            }
+                                        }
+                                        run_dirs.sort();
+                                        for run_dir in run_dirs {
+                                            let Ok(md) = std::fs::metadata(&run_dir) else {
+                                                ok = false;
+                                                continue;
+                                            };
+                                            if !md.is_dir() {
+                                                continue;
+                                            }
+                                            match FileId::of(&md).and_then(|id| settled_file_id(id, now_ns)) {
+                                                Some(settled) => entries.push((run_dir.clone(), Watched::Is(settled))),
+                                                None => ok = false,
+                                            }
+                                            ok &= collect_stems_in_dir(&run_dir, &mut stems);
+                                        }
+                                    }
+                                    Err(_) => ok = false,
+                                }
+                            }
+                        }
+                        let guard = if ok {
+                            let borrowed: Vec<(&Path, Watched)> =
+                                entries.iter().map(|(p, w)| (p.as_path(), *w)).collect();
+                            encode_guard(&borrowed)
+                        } else {
+                            "?".into()
+                        };
+                        (guard, stems.into_iter().collect())
+                    }
+                }
+            }
+        }
+    }
+
+    pub(super) fn prepare_subagents(conn: &Connection, h: Harness, refs: &[SessionRef]) -> Option<PreparedSubagents> {
+        if crate::env::frozen() || crate::workflow_store(h).is_none() {
+            return None;
+        }
+        let existing: std::collections::HashMap<(String, String), String> = conn
+            .prepare("SELECT parent_id, parent_path, guard FROM subagent_parents WHERE harness=?1")
+            .and_then(|mut stmt| {
+                stmt.query_map([h.as_str()], |r| Ok(((r.get(0)?, r.get(1)?), r.get(2)?)))?
+                    .collect::<rusqlite::Result<_>>()
+            })
+            .unwrap_or_default();
+        let mut probe = crate::source::Probe::default();
+        let now_ns = current_now_ns();
+        let mut seen = HashSet::new();
+        let mut scanned = Vec::new();
+        for r in refs {
+            let key = (r.id.clone(), r.path.to_string_lossy().into_owned());
+            if !seen.insert(key.clone()) {
+                continue;
+            }
+            if existing.get(&key).is_some_and(|g| guard_is_fresh(g, &mut probe)) {
+                continue;
+            }
+            let (guard, stems) = scan_subagent_parent(h, &r.path, &mut probe, now_ns);
+            scanned.push((key.0, key.1, guard, stems));
+        }
+        Some(PreparedSubagents { scanned })
+    }
+
+    fn apply_prepared_subagents_in(
+        tx: &rusqlite::Transaction,
+        h: Harness,
+        prep: &PreparedSubagents,
+    ) -> rusqlite::Result<()> {
+        if prep.scanned.is_empty() {
+            return Ok(());
+        }
+        let mut upsert_parent = tx.prepare_cached(
+            "INSERT OR REPLACE INTO subagent_parents(harness,parent_id,parent_path,guard) VALUES(?1,?2,?3,?4)",
+        )?;
+        let mut clear_stems =
+            tx.prepare_cached("DELETE FROM subagents WHERE harness=?1 AND parent_id=?2 AND parent_path=?3")?;
+        let mut insert_stem = tx.prepare_cached(
+            "INSERT OR IGNORE INTO subagents(harness,stem,parent_id,parent_path) VALUES(?1,?2,?3,?4)",
+        )?;
+        for (pid, ppath, guard, stems) in &prep.scanned {
+            upsert_parent.execute(params![h.as_str(), pid, ppath, guard])?;
+            clear_stems.execute(params![h.as_str(), pid, ppath])?;
+            for stem in stems {
+                insert_stem.execute(params![h.as_str(), stem, pid, ppath])?;
+            }
+        }
+        Ok(())
+    }
+
+    fn verify_subagent_candidate(
+        parent: &SessionRef,
+        store: &dyn crate::harness::Workflows,
+        want: &str,
+        matched_stem: &str,
+        guard: Option<&str>,
+        probe: &mut crate::source::Probe,
+    ) -> bool {
+        if probe.exists(&parent.path) != Some(true) {
+            return false;
+        }
+        if parent.harness == Harness::Claude && !matched_stem.ends_with(".flat") {
+            if let Some(sub_dir) = crate::harness::claude::sidecar::subagents_dir(&parent.path) {
+                if probe.exists(&sub_dir.join(format!("{matched_stem}.jsonl"))) == Some(true) {
+                    return true;
+                }
+                if let Some(guard) = guard.filter(|g| !g.is_empty() && *g != "?") {
+                    let wf_root = sub_dir.join("workflows");
+                    for line in guard.lines() {
+                        if let Some(rest) = line.strip_prefix("I ") {
+                            if let Some((_, raw_path)) = rest.split_once(' ') {
+                                let dir_str = unescape_guard_path(raw_path);
+                                let dir = Path::new(dir_str.as_ref());
+                                if dir != sub_dir
+                                    && dir != wf_root
+                                    && dir.starts_with(&wf_root)
+                                    && probe.exists(&dir.join(format!("{matched_stem}.jsonl"))) == Some(true)
+                                {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        store.has_agent(parent, want)
+    }
+
+    /// Check `watched` + `roots()` (and `max_stale`) ONLY for workflow-capable harnesses, skipping
+    /// the 10k `primary_sources` `ReadSet` JSON decodes across unrelated harnesses.
+    pub(super) fn probe_workflow_harnesses_in(
+        conn: &Connection,
+        harnesses: &[Harness],
+        max_stale: i64,
+    ) -> Option<Vec<Harness>> {
+        if max_stale <= 0 {
+            return Some(harnesses.to_vec());
+        }
+        if let Some(t) = last_full_sync_in(conn) {
+            if (chrono::Utc::now().timestamp() - t) >= max_stale {
+                return Some(harnesses.to_vec());
+            }
+        }
+        let mut stale = Vec::new();
+        let mut stmt = conn
+            .prepare("SELECT path, id FROM watched WHERE harness = ?1")
+            .inspect_err(note_sql)
+            .ok()?;
+        for &h in harnesses {
+            let mut watched_paths = HashSet::new();
+            let mut has_watches = false;
+            let mut condemned = false;
+            let rows = stmt
+                .query_map([h.as_str()], |r| {
+                    Ok((r.get::<_, String>(0)?, Watched::stored(r.get(1)?)))
+                })
+                .inspect_err(note_sql)
+                .ok()?;
+            for row in rows {
+                let (path, recorded) = row.inspect_err(note_sql).ok()?;
+                has_watches = true;
+                watched_paths.insert(path.clone());
+                if !condemned && !watch_is_fresh(Path::new(&path), recorded) {
+                    condemned = true;
+                }
+            }
+            if !condemned {
+                if let Some(a) = crate::harness::for_harness(h) {
+                    let roots = a.roots();
+                    let unwatched_root = roots
+                        .iter()
+                        .any(|r| r.exists() && !watched_paths.contains(r.to_string_lossy().as_ref()));
+                    let leftover_rows = roots.is_empty()
+                        && conn
+                            .query_row(
+                                "SELECT EXISTS(SELECT 1 FROM sessions WHERE harness=?1)",
+                                [h.as_str()],
+                                |r| r.get::<_, bool>(0),
+                            )
+                            .unwrap_or(false);
+                    if (!roots.is_empty() != has_watches) || unwatched_root || leftover_rows {
+                        condemned = true;
+                    }
+                }
+            }
+            if condemned {
+                stale.push(h);
+            }
+        }
+        Some(stale)
+    }
+
+    /// Resolve parent `SessionRef`s owning a sub-agent whose stem starts with `want`, re-scanning
+    /// only missing or guard-invalidated parents and merging any in-memory `--frozen` delta.
+    pub(super) fn lookup_subagent_parents_in(
+        conn: &mut Connection,
+        want: &str,
+        harnesses: &[(Harness, &'static dyn crate::harness::Workflows)],
+        unpersisted: &std::collections::HashMap<Harness, Vec<SessionRef>>,
+    ) -> Option<Vec<SessionRef>> {
+        let mut probe = crate::source::Probe::default();
+        let now_ns = current_now_ns();
+        let upper = prefix_end(want);
+        let stem_range = if upper.is_some() {
+            "sa.stem >= ?2 AND sa.stem < ?3"
+        } else {
+            "sa.stem >= ?2 AND ?3 IS NULL"
+        };
+        let mut results: Vec<SessionRef> = Vec::new();
+
+        for &(h, store) in harnesses {
+            if let Some(fresh_refs) = unpersisted.get(&h) {
+                let last: std::collections::HashMap<(String, String), usize> = fresh_refs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, r)| ((r.id.clone(), r.path.to_string_lossy().into_owned()), i))
+                    .collect();
+                let deduped: Vec<&SessionRef> = fresh_refs
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, r)| last.get(&(r.id.clone(), r.path.to_string_lossy().into_owned())) == Some(i))
+                    .map(|(_, r)| r)
+                    .collect();
+                let stored_guards: std::collections::HashMap<(String, String), String> = conn
+                    .prepare("SELECT parent_id, parent_path, guard FROM subagent_parents WHERE harness=?1")
+                    .inspect_err(note_sql)
+                    .ok()?
+                    .query_map([h.as_str()], |r| Ok(((r.get(0)?, r.get(1)?), r.get(2)?)))
+                    .inspect_err(note_sql)
+                    .ok()?
+                    .collect::<rusqlite::Result<_>>()
+                    .inspect_err(note_sql)
+                    .ok()?;
+
+                let mut guarded_refs: std::collections::HashMap<(String, String), &SessionRef> =
+                    std::collections::HashMap::new();
+                let mut matched_keys: HashSet<(String, String)> = HashSet::new();
+
+                for &r in &deduped {
+                    let key = (r.id.clone(), r.path.to_string_lossy().into_owned());
+                    if stored_guards.get(&key).is_some_and(|g| guard_is_fresh(g, &mut probe)) {
+                        guarded_refs.insert(key, r);
+                    } else {
+                        let (guard, stems) = scan_subagent_parent(h, &r.path, &mut probe, now_ns);
+                        if stems
+                            .iter()
+                            .filter(|s| s.starts_with(want))
+                            .any(|stem| verify_subagent_candidate(r, store, want, stem, Some(&guard), &mut probe))
+                        {
+                            matched_keys.insert(key);
+                        }
+                    }
+                }
+
+                if !guarded_refs.is_empty() {
+                    let sql = format!(
+                        "SELECT sa.parent_id, sa.parent_path, sa.stem
+                         FROM subagents sa
+                         WHERE sa.harness = ?1 AND {stem_range}"
+                    );
+                    let mut stmt = conn.prepare(&sql).inspect_err(note_sql).ok()?;
+                    let rows = stmt
+                        .query_map(params![h.as_str(), want, upper], |r| {
+                            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+                        })
+                        .inspect_err(note_sql)
+                        .ok()?;
+                    for row in rows {
+                        let (pid, ppath, stem) = row.inspect_err(note_sql).ok()?;
+                        let key = (pid, ppath);
+                        if matched_keys.contains(&key) || !stem.starts_with(want) {
+                            continue;
+                        }
+                        if let Some(&r) = guarded_refs.get(&key) {
+                            let guard = stored_guards.get(&key).map(String::as_str);
+                            if verify_subagent_candidate(r, store, want, &stem, guard, &mut probe) {
+                                matched_keys.insert(key);
+                            }
+                        }
+                    }
+                }
+
+                for r in deduped {
+                    let key = (r.id.clone(), r.path.to_string_lossy().into_owned());
+                    if matched_keys.contains(&key) {
+                        results.push(r.clone());
+                    }
+                }
+                continue;
+            }
+
+            // Standard path: `sessions` in `conn` is authoritative for `h`.
+            let mut seen_to_scan = HashSet::new();
+            let mut to_scan: Vec<(String, String)> = Vec::new();
+            {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT s.id, s.path FROM sessions s
+                         LEFT JOIN subagent_parents p
+                           ON p.harness = s.harness AND p.parent_id = s.id AND p.parent_path = s.path
+                         WHERE s.harness = ?1 AND p.parent_id IS NULL",
+                    )
+                    .inspect_err(note_sql)
+                    .ok()?;
+                let rows = stmt
+                    .query_map([h.as_str()], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                    .inspect_err(note_sql)
+                    .ok()?;
+                for row in rows {
+                    let key = row.inspect_err(note_sql).ok()?;
+                    if seen_to_scan.insert(key.clone()) {
+                        to_scan.push(key);
+                    }
+                }
+            }
+            {
+                let mut stmt = conn
+                    .prepare("SELECT parent_id, parent_path, guard FROM subagent_parents WHERE harness = ?1")
+                    .inspect_err(note_sql)
+                    .ok()?;
+                let mut rows = stmt.query([h.as_str()]).inspect_err(note_sql).ok()?;
+                while let Some(row) = rows.next().inspect_err(note_sql).ok()? {
+                    let guard_ok = row
+                        .get_ref(2)
+                        .ok()
+                        .and_then(|v| v.as_str().ok())
+                        .is_some_and(|g| guard_is_fresh(g, &mut probe));
+                    if !guard_ok {
+                        let pid: String = row.get(0).inspect_err(note_sql).ok()?;
+                        let ppath: String = row.get(1).inspect_err(note_sql).ok()?;
+                        let key = (pid, ppath);
+                        if seen_to_scan.insert(key.clone()) {
+                            to_scan.push(key);
+                        }
+                    }
+                }
+            }
+
+            let mut in_memory_scans: std::collections::HashMap<(String, String), (String, Vec<String>)> =
+                std::collections::HashMap::new();
+            if !to_scan.is_empty() {
+                let mut scanned = Vec::with_capacity(to_scan.len());
+                for (pid, ppath) in to_scan {
+                    let (guard, stems) = scan_subagent_parent(h, Path::new(&ppath), &mut probe, now_ns);
+                    scanned.push((pid, ppath, guard, stems));
+                }
+                let prep = PreparedSubagents { scanned };
+                let mut persisted = false;
+                if !crate::env::frozen() {
+                    if let Ok(tx) = conn
+                        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                        .inspect_err(note_sql)
+                    {
+                        if apply_prepared_subagents_in(&tx, h, &prep).inspect_err(note_sql).is_ok() {
+                            match tx.commit() {
+                                Ok(()) => persisted = true,
+                                Err(error) => note_sql(&error),
+                            }
+                        }
+                    }
+                }
+                if !persisted {
+                    for (pid, ppath, guard, stems) in prep.scanned {
+                        in_memory_scans.insert((pid, ppath), (guard, stems));
+                    }
+                }
+            }
+
+            let mut accepted_keys: HashSet<(String, String)> = HashSet::new();
+            {
+                let sql = format!(
+                    "SELECT s.harness,s.id,s.path,s.cwd,s.title,s.created_at,s.updated_at,s.message_count,s.created_ns,s.updated_ns,
+                            sa.stem, sp.guard
+                     FROM subagents sa
+                     JOIN sessions s ON s.harness = sa.harness AND s.id = sa.parent_id AND s.path = sa.parent_path
+                     LEFT JOIN subagent_parents sp ON sp.harness = sa.harness AND sp.parent_id = sa.parent_id AND sp.parent_path = sa.parent_path
+                     WHERE sa.harness = ?1 AND {stem_range}
+                     ORDER BY s.rowid"
+                );
+                let mut stmt = conn.prepare(&sql).inspect_err(note_sql).ok()?;
+                let rows = stmt
+                    .query_map(params![h.as_str(), want, upper], |r| {
+                        Ok((row_to_ref(r)?, r.get::<_, String>(10)?, r.get::<_, Option<String>>(11)?))
+                    })
+                    .inspect_err(note_sql)
+                    .ok()?;
+                for row in rows {
+                    let (Some(r), stem, guard) = row.inspect_err(note_sql).ok()? else {
+                        continue;
+                    };
+                    let key = (r.id.clone(), r.path.to_string_lossy().into_owned());
+                    if in_memory_scans.contains_key(&key) || accepted_keys.contains(&key) || !stem.starts_with(want) {
+                        continue;
+                    }
+                    if verify_subagent_candidate(&r, store, want, &stem, guard.as_deref(), &mut probe) {
+                        accepted_keys.insert(key);
+                        results.push(r);
+                    }
+                }
+            }
+
+            if !in_memory_scans.is_empty() {
+                let mut ref_stmt = conn
+                    .prepare(&format!(
+                        "SELECT {REF_COLUMNS} FROM sessions WHERE harness=?1 AND id=?2 AND path=?3"
+                    ))
+                    .inspect_err(note_sql)
+                    .ok()?;
+                for ((pid, ppath), (guard, stems)) in &in_memory_scans {
+                    let key = (pid.clone(), ppath.clone());
+                    if accepted_keys.contains(&key) || !stems.iter().any(|s| s.starts_with(want)) {
+                        continue;
+                    }
+                    let Ok(Some(r)) = ref_stmt
+                        .query_row(params![h.as_str(), pid, ppath], row_to_ref)
+                        .optional()
+                        .inspect_err(note_sql)
+                        .map(Option::flatten)
+                    else {
+                        continue;
+                    };
+                    if stems
+                        .iter()
+                        .filter(|s| s.starts_with(want))
+                        .any(|stem| verify_subagent_candidate(&r, store, want, stem, Some(guard), &mut probe))
+                    {
+                        accepted_keys.insert(key);
+                        results.push(r);
+                    }
+                }
+            }
+        }
+
+        results.sort_by_key(|r| std::cmp::Reverse(r.updated_at.or(r.created_at)));
+        Some(results)
     }
 
     /// Compute the watch set for one harness from a finished discovery: the harness roots, every
@@ -2502,9 +3198,16 @@ mod imp {
                     if full {
                         let before = PrimaryReads::default();
                         let rows = [(Harness::Claude, refs.as_slice(), Vec::new(), &before)];
-                        publish_all_in(&mut publishing, &rows, &[SourceRows::default()]);
+                        publish_all_in(&mut publishing, &rows, &[SourceRows::default()], &[None]);
                     } else {
-                        replace_prepared_in(&mut publishing, Harness::Claude, &refs, &[], &SourceRows::default());
+                        replace_prepared_in(
+                            &mut publishing,
+                            Harness::Claude,
+                            &refs,
+                            &[],
+                            &SourceRows::default(),
+                            None,
+                        );
                     }
                     finished
                         .send(matches_sessions_in(&publishing, refs.iter()).unwrap())
@@ -3294,7 +3997,7 @@ pub(crate) use imp::{note_counted_with_source, populate_subagent_facts, skipped_
 pub(crate) fn populate_subagent_facts(_r: &SessionRef, _facts: &mut SessionQueryFacts) {}
 
 #[cfg(all(feature = "sqlite", test))]
-pub(crate) use imp::replace_harness;
+pub(crate) use imp::{replace_harness, with_scoped_versions};
 
 #[cfg(all(feature = "sqlite", test))]
 pub(crate) fn last_full_sync() -> Option<i64> {

@@ -322,15 +322,21 @@ impl crate::harness::Workflows for Runs {
             return false;
         };
         let has_match = |dir: &Path| {
+            #[cfg(test)]
+            crate::note_subagent_read_dir();
             std::fs::read_dir(dir).into_iter().flatten().flatten().any(|e| {
                 e.file_name()
                     .to_str()
-                    .is_some_and(|n| n.ends_with(".jsonl") && n.starts_with(stem))
+                    .is_some_and(|n| n.ends_with(".jsonl") && !n.ends_with(".flat.jsonl") && n.starts_with(stem))
             })
         };
         has_match(&base)
             || sidecar::workflow_runs_dir(&r.path)
-                .and_then(|d| std::fs::read_dir(d).ok())
+                .and_then(|d| {
+                    #[cfg(test)]
+                    crate::note_subagent_read_dir();
+                    std::fs::read_dir(d).ok()
+                })
                 .into_iter()
                 .flatten()
                 .flatten()

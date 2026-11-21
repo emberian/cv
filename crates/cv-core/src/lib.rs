@@ -590,6 +590,13 @@ fn splice_refreshed_sessions(
 thread_local! {
     /// Scoped discoveries this thread ran: the agent-lookup test's counter.
     static HARNESS_DISCOVERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// `fs::read_dir` calls made while scanning or verifying sub-agent stems on this thread.
+    static SUBAGENT_READ_DIRS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn note_subagent_read_dir() {
+    SUBAGENT_READ_DIRS.with(|n| n.set(n.get() + 1));
 }
 
 /// Enumerate one complete harness scope without certifying freshness of the rest of the fleet.
@@ -748,7 +755,7 @@ pub fn subagent_tree_of(r: &SessionRef) -> Result<Vec<AgentRef>> {
 }
 
 /// The run store of `h`'s adapter, when it keeps one ([`harness::Adapter::workflows`]).
-fn workflow_store(h: Harness) -> Option<&'static dyn harness::Workflows> {
+pub(crate) fn workflow_store(h: Harness) -> Option<&'static dyn harness::Workflows> {
     harness::rootless(h)?.workflows()
 }
 
@@ -794,14 +801,47 @@ pub fn find_workflows_by_name(name: &str) -> Vec<(SessionRef, Workflow)> {
 
 /// Find the parent session(s) of a sub-agent by its `agent-…` id (or bare/prefix form) — so an
 /// agent can be opened directly (`cv show <agent-id>`) without first knowing which session
-/// spawned it. A filename scan of each cataloged run-store session's agent transcripts
-/// ([`harness::Workflows::has_agent`]), in parallel; nothing is parsed or rediscovered.
+/// spawned it. Served from `catalog.db`'s directory-stat-guarded `subagents` stem index when
+/// available, falling back to a parallel filename scan ([`harness::Workflows::has_agent`]) when
+/// the catalog cannot be opened or `sqlite` is disabled.
 pub fn find_subagent_parents(agent_id: &str) -> Vec<SessionRef> {
     let want = format!("agent-{}", agent_id.strip_prefix("agent-").unwrap_or(agent_id));
+    if let Some(parents) = lookup_subagent_parents_indexed(&want) {
+        return parents;
+    }
     let refs = workflow_sessions();
     let mut out = par_filter_map(refs, move |(r, store)| store.has_agent(&r, &want).then_some(r));
     out.sort_by_key(|r| std::cmp::Reverse(r.updated_at.or(r.created_at)));
     out
+}
+
+fn lookup_subagent_parents_indexed(want: &str) -> Option<Vec<SessionRef>> {
+    let mut reader = catalog::Reader::open()?;
+    let wf_harnesses: Vec<(Harness, &'static dyn harness::Workflows)> = Harness::ALL
+        .into_iter()
+        .filter_map(|h| workflow_store(h).map(|w| (h, w)))
+        .collect();
+    if wf_harnesses.is_empty() {
+        return Some(Vec::new());
+    }
+    let max_stale = env::var("CLUSTERVISION_MAX_STALE_SECS")
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(900);
+    let harness_ids: Vec<Harness> = wf_harnesses.iter().map(|(h, _)| *h).collect();
+    let stale = reader.probe_workflow_harnesses(&harness_ids, max_stale)?;
+    let mut unpersisted = std::collections::HashMap::new();
+    if !stale.is_empty() {
+        for h in stale {
+            if let Some((fresh_refs, persisted)) = discover_harness_inner(h, Some(&mut reader)) {
+                if !persisted {
+                    unpersisted.insert(h, fresh_refs);
+                }
+            }
+        }
+        reader.persist_discovery(false);
+    }
+    reader.lookup_subagent_parents(want, &wf_harnesses, &unpersisted)
 }
 
 /// Fleet-wide ghost hunt by name-prefix: [`workflow_ghosts_of`] across every session that
@@ -859,13 +899,19 @@ pub fn find(id: &str, harness: Option<Harness>) -> Result<Option<(SessionRef, Bo
         (Some(hit), _) => Ok(Some(hit)),
         // An unqualified probe-path miss escalates to the full scan (a session in one of the probe's documented
         // blind spots) — unless the probe path already was one (cold catalog): a miss is a miss.
-        // A qualified miss has exhausted its harness. An `agent-…` shaped id gets one last
-        // reading as a sub-agent transcript.
+        // A qualified miss has exhausted its harness. An `agent-…` shaped id checks the sub-agent
+        // index before paying a 23-harness full scan, and once more if the full scan ran.
         (None, true) => find_subagent_session(id, harness),
-        (None, false) => match resolve_id(discover_all(), id, harness)? {
-            Some(hit) => Ok(Some(hit)),
-            None => find_subagent_session(id, harness),
-        },
+        (None, false) => {
+            if let Some(sub) = find_subagent_session(id, harness)? {
+                return Ok(Some(sub));
+            }
+            match resolve_id(discover_all(), id, harness)? {
+                Some(hit) => Ok(Some(hit)),
+                None if !env::frozen() => find_subagent_session(id, harness),
+                None => Ok(None),
+            }
+        }
     }
 }
 
@@ -879,6 +925,23 @@ pub fn find_cheap(id: &str, harness: Option<Harness>) -> Result<Option<(SessionR
         Some(hit) => Ok(Some(hit)),
         None => find_subagent_session(id, harness),
     }
+}
+
+/// Top-level session resolution without sub-agent fallback or full-fleet escalation, returning
+/// `(hit, exhausted)` so CLI callers with their own sub-agent / `<parent>/<agent>` interpretations
+/// can interleave them once and escalate via [`find_top_level_escalate`] without repeating
+/// `sessions_impl()` or `find_subagent_parents()`.
+pub fn find_top_level_cheap(id: &str, harness: Option<Harness>) -> Result<(Option<FoundSession>, bool)> {
+    find_inner(id, harness)
+}
+
+/// Blind-spot full-fleet escalation for top-level sessions after [`find_top_level_cheap`] missed.
+/// Does nothing when `exhausted` is already `true` (cold catalog or `--harness`-qualified lookup).
+pub fn find_top_level_escalate(id: &str, harness: Option<Harness>, exhausted: bool) -> Result<Option<FoundSession>> {
+    if exhausted || harness.is_some() {
+        return Ok(None);
+    }
+    resolve_id(discover_all(), id, harness)
 }
 
 /// The sub-agent fallback behind [`find`]/[`find_cheap`]: an `agent-…` id no pool/catalog session
@@ -966,7 +1029,7 @@ pub fn shared_agent_copies(parents: &[SessionRef], id: &str) -> Result<Option<us
 }
 
 /// A resolved session: its catalog ref plus the harness adapter that reads it.
-type FoundSession = (SessionRef, Box<dyn Adapter>);
+pub type FoundSession = (SessionRef, Box<dyn Adapter>);
 
 /// The shared catalog-then-probe resolution behind [`find`]/[`find_cheap`]. The `bool` reports
 /// whether discovery already exhausted the requested scope (fleet or qualified harness).
@@ -1132,6 +1195,7 @@ mod copy_authority_tests {
         cv_testkit::settle(&world.home);
         assert_eq!(sessions().len(), 1, "a warm catalog");
         let before = HARNESS_DISCOVERIES.with(std::cell::Cell::get);
+        let before_dirs = SUBAGENT_READ_DIRS.with(std::cell::Cell::get);
         for _ in 0..3 {
             let parents = find_subagent_parents("agent-a1b2");
             assert_eq!(parents.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), ["parent"]);
@@ -1142,6 +1206,271 @@ mod copy_authority_tests {
             before,
             "a lookup by agent id rediscovered the harness"
         );
+        assert_eq!(
+            SUBAGENT_READ_DIRS.with(std::cell::Cell::get),
+            before_dirs,
+            "warm sub-agent hit and miss must perform zero read_dir calls"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "sqlite")]
+    fn subagent_stem_index_guards_warm_zero_readdirs_frozen_spawns_deletions_and_eviction() {
+        let world = crate::test_world("subagent-stem-index");
+        let msg =
+            |sid: &str| serde_json::json!({"type":"user","sessionId":sid,"message":{"role":"user","content":"hello"}});
+        let side_msg = |sid: &str| serde_json::json!({"type":"user","sessionId":sid,"isSidechain":true,"message":{"role":"user","content":"work"}});
+
+        // 16 childless sessions (`<proj>/<sid>` absent -> guarded by `<proj>` FileId),
+        // 1 session with `<sid>` dir only (`subagents/` absent -> guarded by `<sid>` FileId),
+        // 1 direct sub-agent parent, and 1 workflow sub-agent parent.
+        for i in 0..16 {
+            let sid = format!("childless-{i:02}");
+            world.write_session(&sid, &[msg(&sid)]);
+        }
+        world.write_session("sid-only", &[msg("sid-only")]);
+        std::fs::create_dir_all(world.proj.join("sid-only/workflows")).unwrap();
+
+        world.write_session("direct-parent", &[msg("direct-parent")]);
+        let direct_agent_file = world.write_agent(
+            "direct-parent",
+            "ad1ec70001",
+            &serde_json::json!({}),
+            &[side_msg("direct-parent")],
+        );
+        // A `.flat.jsonl` payload sidecar beside the agent must never be indexed as a separate stem.
+        std::fs::write(
+            world.proj.join("direct-parent/subagents/agent-ad1ec70001.flat.jsonl"),
+            "{}\n",
+        )
+        .unwrap();
+
+        let wf_parent_file = world.write_session("wf-parent", &[msg("wf-parent")]);
+        let wf_run_dir = world.proj.join("wf-parent/subagents/workflows/wf_run1");
+        std::fs::create_dir_all(&wf_run_dir).unwrap();
+        std::fs::write(
+            wf_run_dir.join("agent-a0f100002.jsonl"),
+            format!("{}\n", side_msg("wf-parent")),
+        )
+        .unwrap();
+
+        cv_testkit::settle(&world.home);
+        assert_eq!(discover_all().len(), 19);
+
+        // Warm hits (direct + workflow, exact + prefix, `agent-` + bare) and warm misses must all
+        // perform ZERO `fs::read_dir` calls and ZERO `HARNESS_DISCOVERIES`.
+        HARNESS_DISCOVERIES.with(|n| n.set(0));
+        SUBAGENT_READ_DIRS.with(|n| n.set(0));
+
+        assert_eq!(
+            find_subagent_parents("agent-ad1ec70001")
+                .iter()
+                .map(|r| r.id.as_str())
+                .collect::<Vec<_>>(),
+            ["direct-parent"]
+        );
+        assert_eq!(
+            find_subagent_parents("ad1ec7")
+                .iter()
+                .map(|r| r.id.as_str())
+                .collect::<Vec<_>>(),
+            ["direct-parent"]
+        );
+        assert_eq!(
+            find_subagent_parents("agent-a0f100002")
+                .iter()
+                .map(|r| r.id.as_str())
+                .collect::<Vec<_>>(),
+            ["wf-parent"]
+        );
+        assert_eq!(
+            find_subagent_parents("a0f10")
+                .iter()
+                .map(|r| r.id.as_str())
+                .collect::<Vec<_>>(),
+            ["wf-parent"]
+        );
+        assert!(find_subagent_parents("agent-ad1ec70001.flat").is_empty());
+        assert!(find_subagent_parents("agent-deadbeef").is_empty());
+
+        assert_eq!(HARNESS_DISCOVERIES.with(std::cell::Cell::get), 0);
+        assert_eq!(
+            SUBAGENT_READ_DIRS.with(std::cell::Cell::get),
+            0,
+            "warm sub-agent index hits and misses must not call read_dir"
+        );
+
+        // Checkpoint catalog.db and snapshot cv_home before testing `--frozen` live updates.
+        if let Some(conn) = catalog::open_db() {
+            let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+        }
+        let snapshot_cv_home = || {
+            let mut out = std::collections::BTreeMap::new();
+            for entry in std::fs::read_dir(&world.cv_home).unwrap() {
+                let p = entry.unwrap().path();
+                if p.is_file() {
+                    out.insert(p.clone(), std::fs::read(&p).unwrap());
+                }
+            }
+            out
+        };
+        let before_cv_home = snapshot_cv_home();
+
+        // 1) Spawn a sub-agent inside `sid-only` (mutates `<proj>/sid-only`, NOT `<proj>`!),
+        // 2) Spawn a workflow sub-agent under `childless-03`, and
+        // 3) Create a brand-new parent session `after-warm` with its own sub-agent.
+        world.write_agent("sid-only", "a11e0001", &serde_json::json!({}), &[side_msg("sid-only")]);
+        let live_wf = world.proj.join("childless-03/subagents/workflows/wf_live");
+        std::fs::create_dir_all(&live_wf).unwrap();
+        std::fs::write(
+            live_wf.join("agent-a11e0002.jsonl"),
+            format!("{}\n", side_msg("childless-03")),
+        )
+        .unwrap();
+        world.write_session("after-warm", &[msg("after-warm")]);
+        world.write_agent(
+            "after-warm",
+            "a11e0003",
+            &serde_json::json!({}),
+            &[side_msg("after-warm")],
+        );
+
+        {
+            let _frozen = env::Env::from_vars([
+                ("CLUSTERVISION_HOME", world.cv_home.as_os_str()),
+                ("HOME", world.home.as_os_str()),
+            ])
+            .with_frozen()
+            .enter();
+
+            assert_eq!(
+                find_subagent_parents("agent-a11e0001")
+                    .iter()
+                    .map(|r| r.id.as_str())
+                    .collect::<Vec<_>>(),
+                ["sid-only"]
+            );
+            assert_eq!(
+                find_subagent_parents("a11e0002")
+                    .iter()
+                    .map(|r| r.id.as_str())
+                    .collect::<Vec<_>>(),
+                ["childless-03"]
+            );
+            assert_eq!(
+                find_subagent_parents("agent-a11e0003")
+                    .iter()
+                    .map(|r| r.id.as_str())
+                    .collect::<Vec<_>>(),
+                ["after-warm"]
+            );
+        }
+        assert_eq!(
+            snapshot_cv_home(),
+            before_cv_home,
+            "--frozen sub-agent lookup must not mutate catalog.db"
+        );
+
+        // Delete `direct_agent_file`: both `--frozen` and writable lookups must immediately drop it.
+        std::fs::remove_file(&direct_agent_file).unwrap();
+        {
+            let _frozen = env::Env::from_vars([
+                ("CLUSTERVISION_HOME", world.cv_home.as_os_str()),
+                ("HOME", world.home.as_os_str()),
+            ])
+            .with_frozen()
+            .enter();
+            assert!(find_subagent_parents("agent-ad1ec70001").is_empty());
+        }
+        assert!(find_subagent_parents("agent-ad1ec70001").is_empty());
+
+        // Settle mtimes, refresh once so unsettled `< 2s` guards quiesce, then confirm 0 `read_dir`s again.
+        cv_testkit::settle(&world.home);
+        assert_eq!(find_subagent_parents("agent-a11e0003").len(), 1);
+        SUBAGENT_READ_DIRS.with(|n| n.set(0));
+        assert_eq!(find_subagent_parents("agent-a11e0001")[0].id, "sid-only");
+        assert_eq!(find_subagent_parents("agent-a11e0002")[0].id, "childless-03");
+        assert_eq!(find_subagent_parents("agent-a11e0003")[0].id, "after-warm");
+        assert!(find_subagent_parents("agent-ad1ec70001").is_empty());
+        assert_eq!(SUBAGENT_READ_DIRS.with(std::cell::Cell::get), 0);
+
+        // Delete `wf-parent` session transcript + sidecar dir: `sessions()` evicts its rows from
+        // `subagent_parents` and `subagents`, and `invalidate_harness_in` clears the harness cleanly.
+        std::fs::remove_file(&wf_parent_file).unwrap();
+        std::fs::remove_dir_all(world.proj.join("wf-parent")).unwrap();
+        cv_testkit::settle(&world.home);
+        let _ = sessions();
+        assert!(find_subagent_parents("agent-a0f100002").is_empty());
+        let conn = catalog::open_db().unwrap();
+        let leftover_parent: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM subagent_parents WHERE parent_id='wf-parent'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let leftover_stem: i64 = conn
+            .query_row("SELECT count(*) FROM subagents WHERE parent_id='wf-parent'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!((leftover_parent, leftover_stem), (0, 0));
+        drop(conn);
+
+        catalog::with_scoped_versions(&[(Harness::Claude, 9999)], None, || {
+            let conn = catalog::open_db().unwrap();
+            let p_cnt: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM subagent_parents WHERE harness='claude'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let s_cnt: i64 = conn
+                .query_row("SELECT count(*) FROM subagents WHERE harness='claude'", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!((p_cnt, s_cnt), (0, 0), "scoped codec bump must clear subagent tables");
+        });
+    }
+
+    #[test]
+    fn subagent_lookup_falls_back_cleanly_without_catalog_or_sqlite() {
+        let world = crate::test_world("subagent-fallback");
+        world.write_session(
+            "fallback-parent",
+            &[serde_json::json!({"type":"user","sessionId":"fallback-parent","message":{"role":"user","content":"spawn"}})],
+        );
+        world.write_agent(
+            "fallback-parent",
+            "afb00123",
+            &serde_json::json!({}),
+            &[serde_json::json!({"type":"user","sessionId":"fallback-parent","isSidechain":true,"message":{"role":"user","content":"task"}})],
+        );
+        // Point CLUSTERVISION_CACHE at a regular file so `catalog.db` cannot open even with `sqlite`
+        // enabled, exercising the parallel `workflow_sessions()` fallback under both feature sets.
+        let blocker = world.base.join("not-a-dir");
+        std::fs::write(&blocker, "file").unwrap();
+        let _unopenable = env::Env::from_vars([
+            ("CLUSTERVISION_CACHE", blocker.as_os_str()),
+            ("CLUSTERVISION_HOME", world.cv_home.as_os_str()),
+            ("HOME", world.home.as_os_str()),
+        ])
+        .enter();
+
+        assert_eq!(
+            find_subagent_parents("afb001")
+                .iter()
+                .map(|r| r.id.as_str())
+                .collect::<Vec<_>>(),
+            ["fallback-parent"]
+        );
+        assert_eq!(
+            find_cheap("agent-afb001", None).unwrap().unwrap().0.id,
+            "agent-afb00123"
+        );
+        assert!(find_subagent_parents("agent-missing").is_empty());
     }
 
     #[test]

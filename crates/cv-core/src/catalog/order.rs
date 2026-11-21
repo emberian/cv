@@ -182,6 +182,22 @@ pub(super) fn publish(tx: &rusqlite::Transaction, h: Harness, refs: &[SessionRef
             wrote();
         }
     }
+    if crate::workflow_store(h).is_some() {
+        let vanished: Vec<(String, String)> = {
+            let mut stmt = tx.prepare("SELECT parent_id, parent_path FROM subagent_parents WHERE harness=?1")?;
+            let rows = stmt.query_map([h.as_str()], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+                .into_iter()
+                .filter(|k| !last.contains_key(k))
+                .collect()
+        };
+        for (pid, ppath) in vanished {
+            tx.prepare_cached("DELETE FROM subagent_parents WHERE harness=?1 AND parent_id=?2 AND parent_path=?3")?
+                .execute(params![h.as_str(), pid, ppath])?;
+            tx.prepare_cached("DELETE FROM subagents WHERE harness=?1 AND parent_id=?2 AND parent_path=?3")?
+                .execute(params![h.as_str(), pid, ppath])?;
+        }
+    }
     for (((k, r), id), kept) in listed.iter().zip(ids).zip(kept) {
         let before = old.get(k);
         if !kept {
