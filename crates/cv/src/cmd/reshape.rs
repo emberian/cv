@@ -739,10 +739,13 @@ pub(crate) fn cmd_dataset(args: DatasetArgs<'_>) -> Result<()> {
         Some(f) => f,
         None => {
             return usage(format!(
-                "unknown format {format:?} (use chatml, sharegpt, or openai-tools)"
+                "unknown format {format:?} (use chatml, sharegpt, openai-tools, or cycle)"
             ))
         }
     };
+    if fmt == cv_core::dataset::Format::Cycle && clean_outcome {
+        return usage("--clean-outcome cannot be combined with --format cycle");
+    }
     let dataset_opts = cv_core::dataset::DatasetOptions {
         active_branch_only: active_branch,
         clean_outcome_only: clean_outcome,
@@ -914,16 +917,32 @@ impl EmitCtx<'_> {
         let Some(adapter) = cv_core::harness::for_harness(r.harness) else {
             return Ok(DatasetFlow::Continue);
         };
-        let record = match cv_core::dataset::stage_record_with_options(
-            adapter.as_ref(),
-            r,
-            self.fmt,
-            self.redact_opts,
-            self.min_messages,
-            self.query,
-            self.text_sets,
-            self.dataset_opts,
-        ) {
+        let staged = if self.fmt == cv_core::dataset::Format::Cycle {
+            let remaining = self.limit.map(|l| l.saturating_sub(*self.emitted));
+            cv_core::dataset::cycles::stage_cycles_bounded(
+                adapter.as_ref(),
+                r,
+                self.redact_opts,
+                self.min_messages,
+                self.query,
+                self.text_sets,
+                self.dataset_opts,
+                remaining,
+            )
+        } else {
+            cv_core::dataset::stage_record_with_options(
+                adapter.as_ref(),
+                r,
+                self.fmt,
+                self.redact_opts,
+                self.min_messages,
+                self.query,
+                self.text_sets,
+                self.dataset_opts,
+            )
+            .map(|record| record.map(|record| (record, 1)))
+        };
+        let record = match staged {
             Ok(record) => record,
             Err(error) if error.is::<cv_core::dataset::InputError>() => {
                 eprintln!("cv dataset: skipping {} ({}): {error:#}", r.id, r.harness);
@@ -931,9 +950,9 @@ impl EmitCtx<'_> {
             }
             Err(error) => return Err(error),
         };
-        if let Some(record) = record {
+        if let Some((record, records)) = record {
             record.publish(self.writer)?;
-            *self.emitted += 1;
+            *self.emitted += records;
             if self.limit.is_some_and(|l| *self.emitted >= l) {
                 return Ok(DatasetFlow::LimitHit);
             }

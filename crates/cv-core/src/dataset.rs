@@ -15,6 +15,7 @@
 
 #[cfg(test)]
 use crate::json::{ReadInput, Validation};
+pub mod cycles;
 mod deferred;
 
 use crate::ir::{Block, Message, MessageKind, Role, Session};
@@ -284,6 +285,7 @@ const fn record_header(format: Format) -> &'static [u8] {
     match format {
         Format::Chatml | Format::OpenAiTools => b"{\"messages\":[",
         Format::ShareGpt => b"{\"conversations\":[",
+        Format::Cycle => b"",
     }
 }
 
@@ -293,8 +295,10 @@ const RECORD_HEADER_BUF: usize = 32;
 const _: () = assert!(record_header(Format::Chatml).len() <= RECORD_HEADER_BUF);
 const _: () = assert!(record_header(Format::ShareGpt).len() <= RECORD_HEADER_BUF);
 const _: () = assert!(record_header(Format::OpenAiTools).len() <= RECORD_HEADER_BUF);
+const _: () = assert!(record_header(Format::Cycle).len() <= RECORD_HEADER_BUF);
 
-/// Which export shape — `Chatml`, `ShareGpt`, or native `OpenAiTools` (`tool_calls` + `tool_call_id`).
+/// Which export shape — `Chatml`, `ShareGpt`, `OpenAiTools` (`tool_calls` + `tool_call_id`), or
+/// `Cycle` (one flat row per human-turn cycle).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
     Chatml,
@@ -302,6 +306,8 @@ pub enum Format {
     /// Structured OpenAI tool-calling schema (`tool_calls` array on assistant messages and
     /// `role: "tool", tool_call_id` messages for tool outputs) for modern SFT/RL trainers.
     OpenAiTools,
+    /// One flat JSONL record per human-turn cycle after a session's opening prompt.
+    Cycle,
 }
 
 /// Canonical alias for [`Format`].
@@ -313,6 +319,7 @@ impl Format {
             Format::Chatml => "chatml",
             Format::ShareGpt => "sharegpt",
             Format::OpenAiTools => "openai-tools",
+            Format::Cycle => "cycle",
         }
     }
 
@@ -321,6 +328,7 @@ impl Format {
             "chatml" => Some(Format::Chatml),
             "sharegpt" => Some(Format::ShareGpt),
             "openai-tools" | "openai_tools" | "openaitools" => Some(Format::OpenAiTools),
+            "cycle" => Some(Format::Cycle),
             _ => None,
         }
     }
@@ -541,6 +549,9 @@ pub fn write_record_with_options<W: std::io::Write + ?Sized>(
     redact: Option<&crate::redact::RedactOptions>,
     opts: &DatasetOptions,
 ) -> std::io::Result<bool> {
+    if fmt == Format::Cycle {
+        return cycles::write_session_cycles(session, w, redact, opts);
+    }
     let Some(selected) = select_trajectory(&session.messages, opts) else {
         return Ok(false);
     };
@@ -850,7 +861,7 @@ impl<'a, W: std::io::Write + ?Sized> RecordWriter<'a, W> {
         render: impl FnOnce(&mut dyn FnMut(&str) -> anyhow::Result<()>) -> anyhow::Result<()>,
     ) -> std::io::Result<bool> {
         let (role_key, content_key) = match self.fmt {
-            Format::Chatml | Format::OpenAiTools => ("role", "content"),
+            Format::Chatml | Format::OpenAiTools | Format::Cycle => ("role", "content"),
             Format::ShareGpt => ("from", "value"),
         };
         // Keep the established lexicographic outer keys and insertion-ordered tool JSON.
@@ -1063,6 +1074,10 @@ pub fn stage_record_with_options(
     text_sets: &crate::query::TextSets,
     opts: &DatasetOptions,
 ) -> anyhow::Result<Option<StagedRecord>> {
+    if fmt == Format::Cycle {
+        return cycles::stage_cycles(adapter, r, redact, min_messages, query, text_sets, opts)
+            .map(|record| record.map(|(record, _)| record));
+    }
     use std::io::Write;
     let needs_trajectory_pass = opts.active_branch_only || opts.clean_outcome_only;
     struct Sink<'a> {
@@ -1947,7 +1962,7 @@ mod tests {
                 assert!(write_record(&fixture.session, &mut expected, format, None)?);
                 let parsed: Value = serde_json::from_slice(&expected)?;
                 let (array, role, content) = match format {
-                    Format::Chatml | Format::OpenAiTools => ("messages", "role", "content"),
+                    Format::Chatml | Format::OpenAiTools | Format::Cycle => ("messages", "role", "content"),
                     Format::ShareGpt => ("conversations", "from", "value"),
                 };
                 assert_eq!(parsed[array].as_array().unwrap().len(), turns);
@@ -2040,7 +2055,7 @@ mod tests {
             assert!(!std::str::from_utf8(&actual)?.contains("private@example.com"));
             let value: Value = serde_json::from_slice(&actual)?;
             let (array, content) = match format {
-                Format::Chatml | Format::OpenAiTools => ("messages", "content"),
+                Format::Chatml | Format::OpenAiTools | Format::Cycle => ("messages", "content"),
                 Format::ShareGpt => ("conversations", "value"),
             };
             assert_eq!(value[array].as_array().unwrap().len(), 1201);

@@ -891,6 +891,22 @@ pub trait Adapter: Send + Sync {
         None
     }
 
+    /// Whether `m` (whose joined plain text is `text`) is a turn a person sent to the agent for
+    /// `cv dataset --format cycle`, with any mid-run framing unwrapped and harness wrappers /
+    /// shell passthrough rejected. Default: a non-empty [`MessageKind::Prompt`](crate::ir::MessageKind::Prompt)
+    /// of [`Origin::Human`](crate::ir::Origin::Human) gives [`TurnProof::Adapter`].
+    fn human_turn<'a>(&self, m: &Message, text: &'a str) -> Option<HumanTurn<'a>> {
+        if m.kind == crate::ir::MessageKind::Prompt && m.origin == crate::ir::Origin::Human && !text.trim().is_empty() {
+            Some(HumanTurn {
+                text,
+                queued: false,
+                proof: TurnProof::Adapter,
+            })
+        } else {
+            None
+        }
+    }
+
     /// Whether thinking recorded under `model` came from the provider this harness replays
     /// natively (its signatures are valid as they are). [`crate::emit::ThinkingMode::replay_default`]
     /// replays natively only when every recorded model is one some adapter claims. Default: no.
@@ -1122,10 +1138,56 @@ pub fn attachment_kind(m: &Message) -> Option<&str> {
     bag_owners(m).find_map(|a| a.attachment_kind(m))
 }
 
+/// How strongly a human turn is attested ([`Adapter::human_turn`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnProof {
+    /// The native record carries an explicit field stating a person sent it.
+    Record,
+    /// Only the adapter's message classification attests it.
+    Adapter,
+}
+
+impl TurnProof {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Record => "record",
+            Self::Adapter => "adapter",
+        }
+    }
+}
+
+/// A turn a person sent to the agent (`cv dataset --format cycle`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HumanTurn<'a> {
+    pub text: &'a str,
+    pub queued: bool,
+    pub proof: TurnProof,
+}
+
 /// The unwrapped sender body of a message delivered mid-run ([`Adapter::delivered_body`]), asked
 /// of each bag's adapter and the session's adapter.
 pub fn delivered_body<'a>(h: Harness, m: &Message, text: &'a str) -> Option<&'a str> {
     bag_owners(m).chain(rootless(h)).find_map(|a| a.delivered_body(m, text))
+}
+
+/// Whether `m` is a turn a person sent to the agent ([`Adapter::human_turn`]), asked of the bag
+/// owner first (so exported OpenSession records keep their origin harness's rules) and else `h`'s
+/// rootless adapter.
+pub fn human_turn<'a>(h: Harness, m: &Message, text: &'a str) -> Option<HumanTurn<'a>> {
+    if let Some(a) = bag_owners(m).next().or_else(|| rootless(h)) {
+        a.human_turn(m, text)
+    } else if m.kind == crate::ir::MessageKind::Prompt
+        && m.origin == crate::ir::Origin::Human
+        && !text.trim().is_empty()
+    {
+        Some(HumanTurn {
+            text,
+            queued: false,
+            proof: TurnProof::Adapter,
+        })
+    } else {
+        None
+    }
 }
 
 /// The file edit `m`'s record states outside its tool blocks ([`Adapter::native_edit`]), asked

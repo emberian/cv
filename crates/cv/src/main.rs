@@ -884,11 +884,13 @@ enum Cmd {
         #[arg(long)]
         redact: bool,
     },
-    /// Export the corpus as a fine-tuning dataset (JSONL, one session per line).
+    /// Export the corpus as a fine-tuning dataset (JSONL, one session or human-turn cycle per line).
     /// `chatml`/`sharegpt`/`openai-tools` import directly into Unsloth Studio / TRL / HF — no adapter.
     Dataset {
-        /// `chatml` (default) → {"messages":[…]}, `sharegpt` → {"conversations":[…]}, or
-        /// `openai-tools` → structured OpenAI `tool_calls` + `tool_call_id`.
+        /// `chatml` (default) → {"messages":[…]}, `sharegpt` → {"conversations":[…]},
+        /// `openai-tools` → structured OpenAI `tool_calls` + `tool_call_id`, or
+        /// `cycle` → one flat row per subsequent human turn (`report`, `prompt`, `plan`, tool spans,
+        /// `commit_after`, `push_after`, `queued`, `proof`; incompatible with `--clean-outcome`).
         #[arg(long, default_value = "chatml")]
         format: String,
         /// Only this harness (claude, codex, hermes, …); omit for all.
@@ -910,7 +912,7 @@ enum Cmd {
         /// Skip sessions with fewer than this many messages (drops trivial/empty ones).
         #[arg(long, default_value_t = 2)]
         min_messages: usize,
-        /// Scrub secrets/PII from every session before emitting (cv_core::redact).
+        /// Scrub secrets/PII from turns and tool payloads before emitting (`--format cycle` keeps the session `cwd` field as recorded).
         #[arg(long)]
         redact: bool,
         /// Scrub only these secret classes (comma list: `private_key`, `api_key`, `jwt`, `email`,

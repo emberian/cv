@@ -492,6 +492,55 @@ impl Adapter for Claude {
         None
     }
 
+    fn human_turn<'a>(&self, m: &crate::ir::Message, text: &'a str) -> Option<super::HumanTurn<'a>> {
+        use super::{HumanTurn, TurnProof};
+        let bag = m.harness_extra(Harness::Claude);
+        match m.kind {
+            MessageKind::Prompt if m.origin == Origin::Human => {
+                let source = bag.and_then(|b| b.get("promptSource")).and_then(Value::as_str);
+                if source.is_some_and(|s| !matches!(s, "typed" | "queued" | "suggestion_accepted")) {
+                    return None;
+                }
+                let unwrapped = self.delivered_body(m, text);
+                let body = unwrapped.unwrap_or(text);
+                if !is_typed_claude_prompt(body) {
+                    return None;
+                }
+                let stated = source.is_some()
+                    || bag
+                        .and_then(|b| b.get("origin"))
+                        .and_then(|o| o.get("kind"))
+                        .and_then(Value::as_str)
+                        == Some("human")
+                    || bag.and_then(|b| b.get("turnOrigin")).and_then(Value::as_str) == Some("human");
+                Some(HumanTurn {
+                    text: body,
+                    queued: source == Some("queued") || unwrapped.is_some(),
+                    proof: if stated { TurnProof::Record } else { TurnProof::Adapter },
+                })
+            }
+            MessageKind::InjectedContext if self.attachment_kind(m) == Some("queued_command") => {
+                let body = self.delivered_body(m, text)?;
+                if !is_typed_claude_prompt(body) {
+                    return None;
+                }
+                let att = bag.and_then(|b| b.get("attachment"));
+                let stated = att.and_then(|a| a.get("commandMode")).and_then(Value::as_str) == Some("prompt")
+                    || att
+                        .and_then(|a| a.get("origin"))
+                        .and_then(|o| o.get("kind"))
+                        .and_then(Value::as_str)
+                        == Some("human");
+                Some(HumanTurn {
+                    text: body,
+                    queued: true,
+                    proof: if stated { TurnProof::Record } else { TurnProof::Adapter },
+                })
+            }
+            _ => None,
+        }
+    }
+
     fn dependencies(&self, r: &SessionRef, _probe: &mut Probe, deps: &mut Dependencies) -> Option<()> {
         if r.path
             .file_name()
@@ -826,6 +875,27 @@ const DELIVERED_TAILS: [&str; 3] = [
     "Address this before completing your current task.",
     "IMPORTANT: After completing your current task, you MUST address the user's message above. Do not ignore it.",
 ];
+
+/// Prompt heads in Claude Code that are shell passthrough (`!cmd`) or harness wrappers left
+/// attributed to the user in older versions, never prose typed to the agent.
+const NOT_TYPED_CLAUDE_HEADS: [&str; 11] = [
+    "<bash-input>",
+    "<bash-stdout>",
+    "<bash-stderr>",
+    "<command-name>",
+    "<command-message>",
+    "<command-args>",
+    "<local-command-stdout>",
+    "<local-command-stderr>",
+    "<local-command-caveat>",
+    "<task-notification>",
+    "[SYSTEM NOTIFICATION - NOT USER INPUT]",
+];
+
+fn is_typed_claude_prompt(text: &str) -> bool {
+    let t = text.trim_start();
+    !t.is_empty() && !NOT_TYPED_CLAUDE_HEADS.iter().any(|p| t.starts_with(p))
+}
 
 fn is_notification_body(s: &str) -> bool {
     let s = s.trim_start();

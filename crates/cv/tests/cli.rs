@@ -1538,6 +1538,54 @@ fn dataset_emits_parseable_jsonl() {
 
     let (_, err) = w.cv_fails(&["dataset", "--format", "parquet"]);
     assert!(err.contains("unknown format"), "{err}");
+
+    let (ok, code, _, err) = w.cv(&["dataset", "--format", "cycle", "--clean-outcome"]);
+    assert!(!ok && code == 2 && err.contains("--clean-outcome"), "{err}");
+}
+
+#[test]
+fn dataset_format_cycle_streams_turns_respects_limit_redacts_and_prunes_rewinds() {
+    let w = World::new("dataset-cycle");
+    let lines = [
+        r#"{"type":"user","sessionId":"cycsess","cwd":"/work/app","uuid":"u1","timestamp":"2026-10-01T00:00:00Z","promptSource":"typed","message":{"role":"user","content":"Build widget counter"}}"#,
+        r#"{"type":"assistant","sessionId":"cycsess","uuid":"a1_bad","parentUuid":"u1","timestamp":"2026-10-01T00:00:01Z","message":{"role":"assistant","model":"claude-fable-5-1","content":[{"type":"text","text":"Abandoned report"}]}}"#,
+        r#"{"type":"user","sessionId":"cycsess","uuid":"u2_bad","parentUuid":"a1_bad","timestamp":"2026-10-01T00:00:02Z","promptSource":"typed","message":{"role":"user","content":"Abandoned steer"}}"#,
+        r#"{"type":"attachment","sessionId":"cycsess","uuid":"perm1","parentUuid":"u1","timestamp":"2026-10-01T00:00:03Z","attachment":{"type":"command_permissions","allowedTools":["Bash"]}}"#,
+        r#"{"type":"assistant","sessionId":"cycsess","uuid":"a1","parentUuid":"perm1","timestamp":"2026-10-01T00:00:04Z","message":{"role":"assistant","model":"claude-fable-5-1","content":[{"type":"text","text":"Counted frobs."}]}}"#,
+        r#"{"type":"user","sessionId":"cycsess","uuid":"u2","parentUuid":"a1","timestamp":"2026-10-01T00:00:05Z","promptSource":"typed","message":{"role":"user","content":"Count widgets instead"}}"#,
+        r#"{"type":"assistant","sessionId":"cycsess","uuid":"a2","parentUuid":"u2","timestamp":"2026-10-01T00:00:06Z","message":{"role":"assistant","model":"claude-fable-5-1","content":[{"type":"text","text":"Switching to widgets."},{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"git commit -m widgets"}}]}}"#,
+        &format!(
+            r#"{{"type":"user","sessionId":"cycsess","uuid":"u3","parentUuid":"a2","timestamp":"2026-10-01T00:00:07Z","message":{{"role":"user","content":"looks good, key is {SECRET}"}}}}"#
+        ),
+    ];
+    w.write_session(
+        "cycsess",
+        &lines
+            .iter()
+            .map(|s| serde_json::from_str(s).unwrap())
+            .collect::<Vec<_>>(),
+    );
+
+    let (out, err) = w.cv_ok(&["dataset", "--format", "cycle", "--active-branch", "--redact"]);
+    assert!(err.contains("✦ cycle: wrote 2 record(s)"), "{err}");
+    assert!(!out.contains(SECRET), "secret leaked:\n{out}");
+    assert!(!out.contains("Abandoned"), "abandoned branch leaked:\n{out}");
+    let rows: Vec<serde_json::Value> = out
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("valid cycle json"))
+        .collect();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["report"], "Counted frobs.");
+    assert_eq!(rows[0]["prompt"], "Count widgets instead");
+    assert_eq!(rows[0]["plan"], "Switching to widgets.");
+    assert_eq!(rows[0]["commit_after"], true);
+    assert_eq!(rows[0]["proof"], "record");
+    assert_eq!(rows[1]["proof"], "adapter");
+
+    // `--limit 1` stops after 1 cycle record even when a single session holds 2+.
+    let (limited, lim_err) = w.cv_ok(&["dataset", "--format", "cycle", "--active-branch", "--limit", "1"]);
+    assert_eq!(limited.lines().count(), 1, "{limited}");
+    assert!(lim_err.contains("wrote 1 record(s)"), "{lim_err}");
 }
 
 #[test]

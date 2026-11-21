@@ -811,22 +811,26 @@ cv export da9174f4 --redact > safe.md         # secrets/PII scrubbed first; coun
 
 ### `cv dataset`
 
-Fine-tuning JSONL, one session per line: `chatml` (default, `{"messages":[…]}`), `sharegpt`
-(`{"conversations":[…]}`), or `openai-tools` (structured OpenAI `tool_calls` + `tool_call_id`),
-loadable by TRL, Unsloth and HuggingFace `datasets`.
+Fine-tuning JSONL, one session per line (`chatml` default `{"messages":[…]}`, `sharegpt`
+`{"conversations":[…]}`, or `openai-tools` structured OpenAI `tool_calls` + `tool_call_id`, loadable
+by TRL, Unsloth and HuggingFace `datasets`), or `--format cycle` for one flat row per human turn
+after a session's first (`report`, `prompt`, `plan`, tool histograms before/after, `commit_after`,
+`push_after`, `queued`, `proof`, `relayed`).
 
 ```sh
 cv dataset --file corpus.jsonl                              # whole corpus, chatml
 cv dataset --format sharegpt --harness claude                # one harness, ShareGPT shape
 cv dataset --format openai-tools --active-branch --clean-outcome --file tools.jsonl
+cv dataset --format cycle --active-branch --redact --file cycles.jsonl
 cv dataset -q "model:fable" --subagents --file fable.jsonl   # a queried slice + its forest
 cv dataset -q "harness:claude" --redact-only private_key     # strip PEM keys, keep the rest
 ```
 
 `--subagents` adds the forests (most model usage; a `model:` query wants it). `--active-branch`
 omits rewound turns and sidechains; `--clean-outcome` omits trajectories ending in errors or
-unanswered tool calls. `--redact-only` takes `private_key`, `api_key`, `jwt`, `email`, `blob`,
-`assignment`.
+unanswered tool calls (session formats only; rejected with `--format cycle`). `--redact` and
+`--redact-only` (`private_key`, `api_key`, `jwt`, `email`, `blob`, `assignment`) scrub prompt,
+report, plan and tool payloads; `--format cycle` still records each row's raw session `cwd`.
 
 ### `cv pack`
 
