@@ -9,7 +9,10 @@
 //! Field numbers are those of the 1.5.9 descriptors.
 use super::{File, Proto, Result};
 
-const STEP: &[u32] = &[1, 4, 5, 19, 20, 24, 30, 31, 114, 133, 140, 147, 148];
+const STEP: &[u32] = &[
+    1, 4, 5, 10, 12, 13, 14, 15, 19, 20, 23, 24, 28, 30, 31, 34, 37, 40, 42, 47, 56, 62, 63, 98, 103, 111, 114, 133,
+    140, 143, 147, 148, 154,
+];
 /// Read: created_at 1, source 3, tool_call 4, model_usage 9.
 const METADATA: &[u32] = &[
     1, 3, 4, 9, // read
@@ -17,7 +20,7 @@ const METADATA: &[u32] = &[
 ];
 /// Read: id 1, name 2, arguments 3 or invalid arguments 4, signatures 6 and 7.
 const TOOL_CALL: &[u32] = &[1, 2, 3, 4, 5, 6, 7];
-/// Read: query 1, items 3, media 9.
+/// Read: query 1, items 3, images 6, media 9.
 const USER_INPUT: &[u32] = &[1, 3, 9, 2, 4, 6, 8, 12, 13, 16, 17, 18, 19];
 /// Read: response 1, thinking 3-5, message ids 6 and 15, tool calls 7, duration 11,
 /// stop reason 12, binary signature 14, media 20.
@@ -39,6 +42,31 @@ const ERROR_DETAILS: &[u32] = &[1, 2, 3, 5, 9, 4, 6, 7, 11, 12];
 /// Read: id, log, progress, description, flags, title, time.
 const TASK: &[u32] = &[1, 2, 3, 4, 5, 6, 7, 8];
 
+// Direct `gemini_coder.Step` variants (`1.0.x`..`1.5.13`).
+const RUN_COMMAND: &[u32] = &[
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
+    32, 33, 34, 35, 36, 37, 38, 39,
+];
+const VIEW_FILE: &[u32] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+const LIST_DIRECTORY: &[u32] = &[1, 2, 3, 4, 5, 6];
+const CODE_ACTION: &[u32] = &[
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
+];
+const WRITE_TO_FILE: &[u32] = &[1, 2, 3, 4, 5, 6, 7, 8];
+const FILE_CHANGE: &[u32] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+const GREP_SEARCH: &[u32] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14];
+const FIND: &[u32] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+const COMMAND_STATUS: &[u32] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14];
+const READ_URL_CONTENT: &[u32] = &[1, 2, 3, 4, 5, 6, 7];
+const SEARCH_WEB: &[u32] = &[1, 2, 3, 4, 5, 6, 7, 8, 9];
+const MCP_TOOL: &[u32] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+const RESOURCE_STEP: &[u32] = &[1, 2, 3, 4, 5, 6, 7, 8];
+const FINISH: &[u32] = &[1, 2, 3, 4];
+const INVOKE_SUBAGENT: &[u32] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14];
+const ASK_QUESTION: &[u32] = &[1, 2, 3, 4];
+const EPHEMERAL_MESSAGE: &[u32] = &[1, 2, 3, 4, 5, 6];
+const CONVERSATION_HISTORY: &[u32] = &[1, 2, 3, 4, 5];
+
 fn unread(message: &Proto, known: &[u32]) -> bool {
     message.fields().iter().any(|field| !known.contains(&field.number))
 }
@@ -48,6 +76,23 @@ fn unread_in(file: &File, parent: &Proto, number: u32, known: &[u32]) -> Result<
         if unread(&field.message(file)?, known) {
             return Ok(true);
         }
+    }
+    Ok(false)
+}
+
+pub(super) fn unread_side(
+    file: &File,
+    metadata: Option<&Proto>,
+    error: Option<&Proto>,
+    task: Option<&Proto>,
+) -> Result<bool> {
+    if let Some(meta) = metadata {
+        if unread(meta, METADATA) || unread_in(file, meta, 4, TOOL_CALL)? {
+            return Ok(true);
+        }
+    }
+    if error.is_some_and(|e| unread(e, ERROR_DETAILS)) || task.is_some_and(|t| unread(t, TASK)) {
+        return Ok(true);
     }
     Ok(false)
 }
@@ -79,6 +124,24 @@ pub(super) fn unread_fields(file: &File, step: &Proto, kind: &str, payload: Opti
         "SYSTEM_MESSAGE" => unread(payload, SYSTEM_MESSAGE),
         "CHECKPOINT" => unread(payload, CHECKPOINT),
         "ERROR_MESSAGE" => unread(payload, ERROR_MESSAGE) || unread_in(file, payload, 3, ERROR_DETAILS)?,
+        "RUN_COMMAND" => unread(payload, RUN_COMMAND),
+        "VIEW_FILE" => unread(payload, VIEW_FILE),
+        "LIST_DIRECTORY" => unread(payload, LIST_DIRECTORY),
+        "CODE_ACTION" => unread(payload, CODE_ACTION),
+        "WRITE_TO_FILE" => unread(payload, WRITE_TO_FILE),
+        "FILE_CHANGE" => unread(payload, FILE_CHANGE),
+        "GREP_SEARCH" => unread(payload, GREP_SEARCH),
+        "FIND" => unread(payload, FIND),
+        "COMMAND_STATUS" => unread(payload, COMMAND_STATUS),
+        "READ_URL_CONTENT" => unread(payload, READ_URL_CONTENT),
+        "SEARCH_WEB" => unread(payload, SEARCH_WEB),
+        "MCP_TOOL" => unread(payload, MCP_TOOL),
+        "LIST_RESOURCES" | "READ_RESOURCE" => unread(payload, RESOURCE_STEP),
+        "FINISH" => unread(payload, FINISH),
+        "INVOKE_SUBAGENT" => unread(payload, INVOKE_SUBAGENT),
+        "ASK_QUESTION" => unread(payload, ASK_QUESTION),
+        "EPHEMERAL_MESSAGE" => unread(payload, EPHEMERAL_MESSAGE),
+        "CONVERSATION_HISTORY" => unread(payload, CONVERSATION_HISTORY),
         _ => true,
     })
 }

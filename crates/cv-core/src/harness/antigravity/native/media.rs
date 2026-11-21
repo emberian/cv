@@ -6,42 +6,96 @@ use std::fs::File;
 use std::io::{Read, Write};
 
 /// Returns whether any item names a local file that is gone and carries no bytes of its own.
-pub(super) fn project(file: &File, parent: &Message, number: u32, out: &mut impl Write) -> Result<bool> {
+/// Combines `Media` (`media_fields`: `1: mime_type, 2: inline_data, 4: description, 5: uri, 9: display_name`)
+/// and legacy `ImageData` (`image_fields`: `1: base64_data, 2: mime_type, 3: caption, 4: uri`) into one
+/// `"media":[...]` array without whole-image heap allocations.
+pub(super) fn project(
+    file: &File,
+    parent: &Message,
+    media_fields: &[u32],
+    image_fields: &[u32],
+    out: &mut impl Write,
+) -> Result<bool> {
     let mut missing = false;
+    let mut first = true;
     out.write_all(b",\"media\":[")?;
-    for (i, field) in parent.repeated(number).enumerate() {
-        if i != 0 {
-            out.write_all(b",")?;
+    for &number in media_fields {
+        for field in parent.repeated(number) {
+            if !std::mem::take(&mut first) {
+                out.write_all(b",")?;
+            }
+            let item = field.message(file)?;
+            missing |= project_media_item(file, &item, out)?;
         }
-        let item = field.message(file)?;
-        out.write_all(b"{\"native\":true")?;
-        super::text(file, &item, 1, "mime_type", out)?;
-        let link = item
-            .last(5)
-            .filter(|field| matches!(field.value, super::wire::Value::Bytes { len, .. } if len > 0));
-        // A prompt image is stored twice: inline, and as a file beside the exported
-        // logs. The file is the cheap reference while it exists; the bytes outlive it.
-        let gone = match link {
-            Some(link) => local_file_missing(file, link)?,
-            None => false,
-        };
-        let inline = item.last(2);
-        if link.is_some() && !(gone && inline.is_some()) {
-            super::text(file, &item, 5, "uri", out)?;
-            missing |= gone;
-        } else if let Some(data) = inline {
-            let mime = inline_mime(file, &item)?;
-            write!(out, ",\"uri\":\"data:{mime};base64,")?;
-            base64(data.reader(file)?, out)?;
-            out.write_all(b"\"")?;
+    }
+    for &number in image_fields {
+        for field in parent.repeated(number) {
+            if !std::mem::take(&mut first) {
+                out.write_all(b",")?;
+            }
+            let item = field.message(file)?;
+            missing |= project_image_item(file, &item, out)?;
         }
-        super::text(file, &item, 4, "description", out)?;
-        super::text(file, &item, 9, "display_name", out)?;
-        // A blobref has not been resolved here. Its original bytes remain in the
-        // COMPLETE wire record, with the adapter's unsupported-field coverage.
-        out.write_all(b"}")?;
     }
     out.write_all(b"]")?;
+    Ok(missing)
+}
+
+fn nonempty(field: super::wire::Field) -> bool {
+    matches!(field.value, super::wire::Value::Bytes { len, .. } if len > 0)
+}
+
+fn project_media_item(file: &File, item: &Message, out: &mut impl Write) -> Result<bool> {
+    let mut missing = false;
+    out.write_all(b"{\"native\":true")?;
+    super::text(file, item, 1, "mime_type", out)?;
+    let link = item.last(5).filter(|field| nonempty(*field));
+    // A prompt image is stored twice: inline, and as a file beside the exported
+    // logs. The file is the cheap reference while it exists; the bytes outlive it.
+    let gone = match link {
+        Some(link) => local_file_missing(file, link)?,
+        None => false,
+    };
+    let inline = item.last(2);
+    if link.is_some() && !(gone && inline.is_some()) {
+        super::text(file, item, 5, "uri", out)?;
+        missing |= gone;
+    } else if let Some(data) = inline {
+        let mime = inline_mime(file, item, 1)?;
+        write!(out, ",\"uri\":\"data:{mime};base64,")?;
+        base64(data.reader(file)?, out)?;
+        out.write_all(b"\"")?;
+    }
+    super::text(file, item, 4, "description", out)?;
+    super::text(file, item, 9, "display_name", out)?;
+    // A blobref has not been resolved here. Its original bytes remain in the
+    // COMPLETE wire record, with the adapter's unsupported-field coverage.
+    out.write_all(b"}")?;
+    Ok(missing)
+}
+
+fn project_image_item(file: &File, item: &Message, out: &mut impl Write) -> Result<bool> {
+    let mut missing = false;
+    out.write_all(b"{\"native\":true")?;
+    super::text(file, item, 2, "mime_type", out)?;
+    let link = item.last(4).filter(|field| nonempty(*field));
+    let gone = match link {
+        Some(link) => local_file_missing(file, link)?,
+        None => false,
+    };
+    let inline = item.last(1);
+    let has_inline_bytes = inline.is_some_and(nonempty);
+    if link.is_some() && !(gone && has_inline_bytes) {
+        super::text(file, item, 4, "uri", out)?;
+        missing |= gone;
+    } else if let Some(data) = inline {
+        let mime = inline_mime(file, item, 2)?;
+        write!(out, ",\"uri\":\"data:{mime};base64,")?;
+        base64_str(data.reader(file)?, out)?;
+        out.write_all(b"\"")?;
+    }
+    super::text(file, item, 3, "description", out)?;
+    out.write_all(b"}")?;
     Ok(missing)
 }
 
@@ -54,8 +108,8 @@ fn local_file_missing(file: &File, link: super::wire::Field) -> Result<bool> {
     Ok(crate::harness::antigravity::attachment_missing(&uri))
 }
 
-fn inline_mime(file: &File, item: &Message) -> Result<String> {
-    let Some(field) = item.last(1) else {
+fn inline_mime(file: &File, item: &Message, mime_field: u32) -> Result<String> {
+    let Some(field) = item.last(mime_field) else {
         return Ok("application/octet-stream".into());
     };
     let mut mime = String::new();
@@ -80,6 +134,49 @@ fn inline_mime(file: &File, item: &Message) -> Result<String> {
         "invalid native media MIME for data URI"
     );
     Ok(mime)
+}
+
+/// Stream an already-base64-encoded UTF-8 payload (`ImageData.base64_data`) in fixed stack
+/// chunks, stripping ASCII whitespace and rejecting bytes outside `A-Za-z0-9+/=` or malformed
+/// padding without allocating the whole string.
+fn base64_str(mut input: impl Read, out: &mut impl Write) -> Result<()> {
+    let mut raw = [0u8; 8192];
+    let mut clean = [0u8; 8192];
+    let mut total = 0u64;
+    let mut padding = 0u8;
+    loop {
+        let n = match input.read(&mut raw) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let mut written = 0;
+        for &b in &raw[..n] {
+            match b {
+                b' ' | b'\t' | b'\r' | b'\n' => continue,
+                b'=' => {
+                    padding += 1;
+                    ensure!(padding <= 2, "invalid native ImageData base64 padding");
+                    clean[written] = b;
+                    written += 1;
+                    total += 1;
+                }
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/' => {
+                    ensure!(padding == 0, "invalid native ImageData base64 data after padding");
+                    clean[written] = b;
+                    written += 1;
+                    total += 1;
+                }
+                _ => anyhow::bail!("invalid native ImageData base64 character"),
+            }
+        }
+        if written > 0 {
+            out.write_all(&clean[..written])?;
+        }
+    }
+    ensure!(total.is_multiple_of(4), "invalid native ImageData base64 length");
+    Ok(())
 }
 
 pub(super) fn base64(mut input: impl Read, out: &mut impl Write) -> Result<()> {
@@ -155,9 +252,26 @@ mod tests {
         let file = source.file()?;
         let parent = Message::read(&file, 0, bytes.len() as u64)?;
         let mut out = b"{\"test\":true".to_vec();
-        project(&file, &parent, 9, &mut out)?;
+        project(&file, &parent, &[9], &[], &mut out)?;
         out.push(b'}');
         Ok(serde_json::from_slice(&out)?)
+    }
+    fn projected_combined(
+        parent_bytes: &[u8],
+        media_fields: &[u32],
+        image_fields: &[u32],
+    ) -> Result<(bool, serde_json::Value)> {
+        let source = crate::harness::store::bytes::ByteSource::arena()?;
+        source.append(|out| {
+            out.write_all(parent_bytes)?;
+            Ok(())
+        })?;
+        let file = source.file()?;
+        let parent = Message::read(&file, 0, parent_bytes.len() as u64)?;
+        let mut out = b"{\"test\":true".to_vec();
+        let missing = project(&file, &parent, media_fields, image_fields, &mut out)?;
+        out.push(b'}');
+        Ok((missing, serde_json::from_slice(&out)?))
     }
     #[test]
     fn binary_inline_media_and_padding_are_preserved() {
@@ -215,5 +329,71 @@ mod tests {
             String::from_utf8(encoded).unwrap(),
             format!("{}Zm8=", "ZmZm".repeat(2048))
         );
+    }
+
+    #[test]
+    fn legacy_image_data_combines_with_media_prefers_existing_uri_and_validates_base64() {
+        let existing = std::env::current_exe().unwrap();
+        let existing = existing.to_str().unwrap();
+
+        let media_item = [bytes(1, b"image/png"), bytes(2, b"foo")].concat();
+        let image_inline = [
+            bytes(1, b"  aGVs\r\nbG8= \n"),
+            bytes(2, b"image/jpeg"),
+            bytes(3, b"legacy screenshot"),
+        ]
+        .concat();
+        let image_existing_uri = [
+            bytes(1, b"aGVsbG8="),
+            bytes(2, b"image/webp"),
+            bytes(4, existing.as_bytes()),
+        ]
+        .concat();
+        let image_gone_with_inline = [
+            bytes(1, b"aGVsbG8="),
+            bytes(2, b"image/gif"),
+            bytes(4, b"file:///nonexistent/cv-fixture/legacy.gif"),
+        ]
+        .concat();
+        let parent = [
+            bytes(9, &media_item),
+            bytes(6, &image_inline),
+            bytes(6, &image_existing_uri),
+            bytes(6, &image_gone_with_inline),
+        ]
+        .concat();
+        let (missing, val) = projected_combined(&parent, &[9], &[6]).unwrap();
+        assert!(!missing);
+        let items = val["media"].as_array().unwrap();
+        assert_eq!(items.len(), 4);
+        assert_eq!(items[0]["uri"], "data:image/png;base64,Zm9v");
+        assert_eq!(items[1]["uri"], "data:image/jpeg;base64,aGVsbG8=");
+        assert_eq!(items[1]["description"], "legacy screenshot");
+        assert_eq!(items[2]["uri"], existing);
+        assert_eq!(items[3]["uri"], "data:image/gif;base64,aGVsbG8=");
+
+        // Gone local file with empty/absent base64_data reports missing attachment.
+        let gone_only = bytes(
+            6,
+            &[
+                bytes(2, b"image/png"),
+                bytes(4, b"file:///nonexistent/cv-fixture/missing.png"),
+            ]
+            .concat(),
+        );
+        let (missing, val) = projected_combined(&gone_only, &[], &[6]).unwrap();
+        assert!(missing);
+        assert_eq!(val["media"][0]["uri"], "file:///nonexistent/cv-fixture/missing.png");
+
+        // Malformed base64 characters, bad padding, bad length, or bad MIME fail cleanly.
+        for bad in [
+            [bytes(1, b"evil\"}"), bytes(2, b"image/png")].concat(),
+            [bytes(1, b"abc"), bytes(2, b"image/png")].concat(),
+            [bytes(1, b"a==="), bytes(2, b"image/png")].concat(),
+            [bytes(1, b"ab=c"), bytes(2, b"image/png")].concat(),
+            [bytes(1, b"aGVsbG8="), bytes(2, b"image/png,evil")].concat(),
+        ] {
+            assert!(projected_combined(&bytes(6, &bad), &[], &[6]).is_err());
+        }
     }
 }

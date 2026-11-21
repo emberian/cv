@@ -399,13 +399,20 @@ mod native {
         let root = world.home.join(".gemini/antigravity-cli");
         let call_a = [bytes(1, "call-task"), bytes(2, "run_command"), bytes(3, "{}")].concat();
         let call_b = [bytes(1, "call-q"), bytes(2, "ask_question"), bytes(3, "{}")].concat();
+        let call_c = [bytes(1, "call-u"), bytes(2, "custom_tool"), bytes(3, "{}")].concat();
         let planner = [
             number(1, 15),
             number(4, 3),
             bytes(5, bytes(1, number(1, 1_700_000_000))),
             bytes(
                 20,
-                [bytes(1, "Running"), bytes(7, call_a.clone()), bytes(7, call_b.clone())].concat(),
+                [
+                    bytes(1, "Running"),
+                    bytes(7, call_a.clone()),
+                    bytes(7, call_b.clone()),
+                    bytes(7, call_c.clone()),
+                ]
+                .concat(),
             ),
         ]
         .concat();
@@ -421,19 +428,29 @@ mod native {
             bytes(148, [bytes(1, format!("{ID}/task-1")), number(6, 1)].concat()),
         ]
         .concat();
+        let opt = [bytes(1, "opt-a"), bytes(2, "Proceed")].concat();
+        let answered = [bytes(1, "Continue?"), bytes(2, opt), bytes(4, "opt-a")].concat();
         let res_b = [
             number(1, 132),
             number(4, 3),
             bytes(5, [bytes(1, number(1, 1_700_000_002)), bytes(4, call_b)].concat()),
             bytes(140, bytes(2, bytes(1, "answered"))),
-            bytes(147, bytes(1, bytes(22, []))),
+            bytes(147, bytes(2, bytes(22, bytes(1, answered)))),
         ]
         .concat();
-        let db_path = database(&root, &[planner, res_a, res_b]);
+        let res_c = [
+            number(1, 132),
+            number(4, 3),
+            bytes(5, [bytes(1, number(1, 1_700_000_003)), bytes(4, call_c)].concat()),
+            bytes(140, bytes(2, bytes(1, "future"))),
+            bytes(147, bytes(1, bytes(99, []))),
+        ]
+        .concat();
+        let db_path = database(&root, &[planner, res_a, res_b, res_c]);
         let adapter = Antigravity::with_home(&root);
 
         // Native-only at LEAN/FACTS keeps task_details, omits non-permission interaction,
-        // and surfaces non-permission interaction + structured_result on RICH.
+        // and surfaces ask_question + unsupported interaction + structured_result on RICH.
         let native_ref = SessionRef::new(ID, Harness::Antigravity, &db_path);
         for demand in [Demand::LEAN, Demand::FACTS] {
             let s = cv_core::stream::collect_with(&adapter, &native_ref, &demand).unwrap();
@@ -441,11 +458,13 @@ mod native {
                 s.messages[1].extra["antigravity"]["task_details"]["id"],
                 format!("{ID}/task-1")
             );
-            assert!(s.messages[2]
-                .extra
-                .get("antigravity")
-                .and_then(|v| v.get("interaction"))
-                .is_none());
+            for idx in [2, 3] {
+                assert!(s.messages[idx]
+                    .extra
+                    .get("antigravity")
+                    .and_then(|v| v.get("interaction"))
+                    .is_none());
+            }
         }
         let rich = cv_core::stream::collect_with(&adapter, &native_ref, &Demand::RICH).unwrap();
         let cv_core::Block::ToolResult { details: Some(d), .. } = &rich.messages[1].content[0] else {
@@ -454,21 +473,33 @@ mod native {
         assert_eq!(d["result"], json!({"exit": true}));
         assert_eq!(
             rich.messages[2].extra["antigravity"]["interaction"],
-            json!({"kind": "unsupported", "native_field": 22})
+            json!({
+                "kind": "ask_question",
+                "questions": [{
+                    "question": "Continue?",
+                    "options": [{"id": "opt-a", "text": "Proceed"}],
+                    "selected_option_ids": ["opt-a"]
+                }]
+            })
+        );
+        assert_eq!(
+            rich.messages[3].extra["antigravity"]["interaction"],
+            json!({"kind": "unsupported", "native_field": 99})
         );
         assert!(ReadCoverage::of_session(&rich)
             .unwrap()
             .limitations
             .contains(ReadCoverage::UNSUPPORTED_NATIVE_FIELDS));
 
-        // Verified export merge also preserves task_details at LEAN and structured_result at RICH.
+        // Verified export merge also preserves task_details at LEAN and structured_result + ask_question at RICH.
         let logs = root.join("brain").join(ID).join(".system_generated/logs");
         fs::create_dir_all(&logs).unwrap();
         let export = logs.join("transcript_full.jsonl");
         let lines = [
-            json!({"step_index":0,"type":"PLANNER_RESPONSE","status":"DONE","created_at":"2023-11-14T22:13:20Z","content":"Running","tool_calls":[{"name":"run_command","args":{}},{"name":"ask_question","args":{}}]}),
+            json!({"step_index":0,"type":"PLANNER_RESPONSE","status":"DONE","created_at":"2023-11-14T22:13:20Z","content":"Running","tool_calls":[{"name":"run_command","args":{}},{"name":"ask_question","args":{}},{"name":"custom_tool","args":{}}]}),
             json!({"step_index":1,"type":"GENERIC","status":"DONE","created_at":"2023-11-14T22:13:21Z","content":"Created At: 2023-11-14T22:13:21Z\ntask started"}),
             json!({"step_index":2,"type":"GENERIC","status":"DONE","created_at":"2023-11-14T22:13:22Z","content":"Created At: 2023-11-14T22:13:22Z\nanswered"}),
+            json!({"step_index":3,"type":"GENERIC","status":"DONE","created_at":"2023-11-14T22:13:23Z","content":"Created At: 2023-11-14T22:13:23Z\nfuture"}),
         ];
         fs::write(&export, lines.iter().map(|r| format!("{r}\n")).collect::<String>()).unwrap();
         let exp_ref = SessionRef::new(ID, Harness::Antigravity, &export);
@@ -482,6 +513,10 @@ mod native {
             panic!("expected merged structured result");
         };
         assert_eq!(d["result"], json!({"exit": true}));
+        assert_eq!(
+            rich_merged.messages[2].extra["antigravity"]["interaction"]["kind"],
+            "ask_question"
+        );
 
         // Oversized >256 KiB pbtxt annotation is safely ignored.
         let annotations = root.join("annotations");
@@ -493,5 +528,196 @@ mod native {
         .unwrap();
         let discovered = adapter.discover().unwrap();
         assert!(discovered[0].title.as_deref().is_none_or(|t| t.len() < 1024));
+    }
+
+    #[test]
+    fn legacy_image_data_interactions_side_columns_and_direct_subagent_spawns_compose() {
+        let world = World::in_process("agy-legacy-fidelity-e2e", cv_core::env::Env::enter_isolated);
+        let root = world.home.join(".gemini/antigravity-cli");
+        let child_id = "dddddddd-2222-4333-8444-555555555555";
+        let dir = root.join("conversations");
+        fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join(format!("{ID}.db"));
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE steps (
+                idx INTEGER PRIMARY KEY,
+                step_type INTEGER,
+                status INTEGER,
+                metadata BLOB,
+                error_details BLOB,
+                permissions BLOB,
+                task_details BLOB,
+                render_info BLOB,
+                step_payload BLOB,
+                step_format INTEGER DEFAULT 0
+            );",
+        )
+        .unwrap();
+
+        // Step 0: USER_INPUT with legacy ImageData (6) alongside Media (9) -> single media array, 0 unread fields.
+        let legacy_img = [
+            bytes(1, "c3RvcmVkIGlubGluZSBpbWFnZSBieXRlcw=="),
+            bytes(2, "image/jpeg"),
+            bytes(3, "legacy prompt screenshot"),
+        ]
+        .concat();
+        let modern_media = [bytes(1, "image/png"), bytes(5, "https://example.invalid/a.png")].concat();
+        let user_step = [
+            number(1, 14),
+            number(4, 3),
+            bytes(
+                19,
+                [
+                    bytes(3, bytes(1, "Inspect legacy screenshot")),
+                    bytes(6, legacy_img),
+                    bytes(9, modern_media),
+                ]
+                .concat(),
+            ),
+        ]
+        .concat();
+        conn.execute(
+            "INSERT INTO steps(idx, step_type, status, step_payload) VALUES (0, 14, 3, ?1)",
+            [&user_step],
+        )
+        .unwrap();
+
+        // Step 1: PLANNER_RESPONSE issuing file edit + direct invoke_subagent.
+        let call_file = [bytes(1, "call-file"), bytes(2, "write_file"), bytes(3, "{}")].concat();
+        let call_spawn = [bytes(1, "call-spawn-143"), bytes(2, "invoke_subagent"), bytes(3, "{}")].concat();
+        let planner = [
+            number(1, 15),
+            number(4, 3),
+            bytes(
+                20,
+                [
+                    bytes(1, "Editing and spawning"),
+                    bytes(7, call_file.clone()),
+                    bytes(7, call_spawn.clone()),
+                ]
+                .concat(),
+            ),
+        ]
+        .concat();
+        conn.execute(
+            "INSERT INTO steps(idx, step_type, status, step_payload) VALUES (1, 15, 3, ?1)",
+            [&planner],
+        )
+        .unwrap();
+
+        // Step 2: Cleared GENERIC row whose metadata, permissions, task_details, and render_info live in SQLite side columns.
+        let side_meta = [bytes(1, number(1, 1_700_000_010)), bytes(4, call_file)].concat();
+        let side_perm = bytes(2, bytes(1, [bytes(1, "file"), bytes(2, "/work/out.txt")].concat()));
+        let side_task = [bytes(1, format!("{ID}/task-side")), number(6, 0)].concat();
+        let side_render = bytes(2, "recovered from SQLite side column");
+        conn.execute(
+            "INSERT INTO steps(idx, step_type, status, metadata, permissions, task_details, render_info, step_payload)
+             VALUES (2, 132, 5, ?1, ?2, ?3, ?4, X'')",
+            rusqlite::params![side_meta, side_perm, side_task, side_render],
+        )
+        .unwrap();
+
+        // Step 3: Direct CortexStepInvokeSubagent (143) naming `child_id` via `conversation_id (5)`.
+        let spawn_step = [
+            number(1, 127),
+            number(4, 3),
+            bytes(5, bytes(4, call_spawn)),
+            bytes(143, [bytes(5, child_id), number(11, 1)].concat()),
+        ]
+        .concat();
+        conn.execute(
+            "INSERT INTO steps(idx, step_type, status, step_payload) VALUES (3, 127, 3, ?1)",
+            [&spawn_step],
+        )
+        .unwrap();
+        drop(conn);
+
+        // Child DB + subagent descriptor so `Antigravity::forest` exercises `native::spawn_calls` on `step.last(143)`.
+        let child_db = dir.join(format!("{child_id}.db"));
+        let child_conn = rusqlite::Connection::open(&child_db).unwrap();
+        child_conn
+            .execute_batch(
+                "CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_payload BLOB, step_format INTEGER DEFAULT 0);",
+            )
+            .unwrap();
+        let child_prompt = [
+            number(1, 14),
+            number(4, 3),
+            bytes(19, bytes(3, bytes(1, "Child brief"))),
+        ]
+        .concat();
+        child_conn
+            .execute("INSERT INTO steps(idx, step_payload) VALUES (0, ?1)", [&child_prompt])
+            .unwrap();
+        drop(child_conn);
+
+        let subagents_dir = root.join("brain").join(ID).join(".system_generated/subagents");
+        fs::create_dir_all(&subagents_dir).unwrap();
+        fs::write(
+            subagents_dir.join(format!("{child_id}.json")),
+            json!({
+                "conversationId": child_id,
+                "state": "SUBAGENT_STATE_ALIVE",
+                "subagentDescriptor": {"typeName": "helper", "role": "Check"}
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let adapter = Antigravity::with_home(&root);
+        let parent_ref = SessionRef::new(ID, Harness::Antigravity, &db_path);
+        let session = cv_core::stream::collect_with(&adapter, &parent_ref, &Demand::RICH).unwrap();
+        let coverage = ReadCoverage::of_session(&session).unwrap();
+        assert!(
+            !coverage.limitations.contains(ReadCoverage::UNSUPPORTED_NATIVE_FIELDS),
+            "all modeled legacy ImageData, side columns, and direct steps should have zero unread fields: {coverage:?}"
+        );
+        assert!(coverage.limitations.contains(ReadCoverage::MISSING_PAYLOADS));
+
+        let images: Vec<_> = session.messages[0]
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                cv_core::Block::Image { media_type, data_ref } => Some((media_type.as_deref(), data_ref.as_deref())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            images,
+            vec![
+                (Some("image/png"), Some("https://example.invalid/a.png")),
+                (
+                    Some("image/jpeg"),
+                    Some("data:image/jpeg;base64,c3RvcmVkIGlubGluZSBpbWFnZSBieXRlcw==")
+                ),
+            ]
+        );
+        assert_eq!(
+            session.messages[2].extra["antigravity"]["task_details"]["id"],
+            format!("{ID}/task-side")
+        );
+        assert_eq!(
+            session.messages[2].extra["antigravity"]["interaction"]["target"],
+            "/work/out.txt"
+        );
+        let cv_core::Block::ToolResult {
+            tool_use_id, content, ..
+        } = &session.messages[2].content[0]
+        else {
+            panic!("expected recovered side-column tool result");
+        };
+        assert_eq!(tool_use_id, "call-file");
+        assert_eq!(
+            content.try_resolve(&session.resolver()).unwrap().as_ref(),
+            "recovered from SQLite side column"
+        );
+
+        let forest = adapter
+            .forest(&parent_ref, cv_core::SubagentDemand::Rich, None, &|_, _| true)
+            .unwrap();
+        assert_eq!(forest.len(), 1);
+        assert_eq!(forest[0].session.id, child_id);
+        assert_eq!(forest[0].tool_use_id.as_deref(), Some("call-spawn-143"));
     }
 }

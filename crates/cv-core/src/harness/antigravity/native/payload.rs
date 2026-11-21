@@ -5,7 +5,7 @@
 use super::{wire, File, Proto, Result, Write};
 
 #[derive(Clone, Copy)]
-enum Kind {
+pub(super) enum Kind {
     Text,
     Texts,
     /// int32/int64: a negative value is a sign-extended varint.
@@ -17,7 +17,26 @@ enum Kind {
     /// A string field of each repeated message.
     TextOfEach(u32),
 }
-type Field = (u32, &'static str, Kind);
+pub(super) type Field = (u32, &'static str, Kind);
+
+pub(super) const DIFF_STATS_FIELDS: &[Field] = &[(1, "additions", Kind::Int), (2, "deletions", Kind::Int)];
+
+pub(super) const ASK_QUESTION_FIELDS: &[Field] = &[(
+    1,
+    "questions",
+    Kind::Messages(&[
+        (1, "question", Kind::Text),
+        (
+            2,
+            "options",
+            Kind::Messages(&[(1, "id", Kind::Text), (2, "text", Kind::Text)]),
+        ),
+        (3, "is_multi_select", Kind::Flag),
+        (4, "selected_option_ids", Kind::Texts),
+        (5, "write_in_response", Kind::Text),
+        (6, "skipped", Kind::Flag),
+    ]),
+)];
 
 const PREFIX: &str = "type.googleapis.com/";
 const TOOLS: &[(&str, &[Field])] = &[
@@ -53,11 +72,7 @@ const TOOLS: &[(&str, &[Field])] = &[
         &[
             (1, "kind", Kind::Uint),
             (2, "path", Kind::Text),
-            (
-                4,
-                "diff_stats",
-                Kind::Message(&[(1, "additions", Kind::Int), (2, "deletions", Kind::Int)]),
-            ),
+            (4, "diff_stats", Kind::Message(DIFF_STATS_FIELDS)),
             (6, "is_artifact_file", Kind::Flag),
         ],
     ),
@@ -80,7 +95,15 @@ const TOOLS: &[(&str, &[Field])] = &[
     ),
     (
         "exa.cortex.core.tools.ManageSubagents",
-        &[(1, "action", Kind::Text), (2, "conversation_ids", Kind::Texts)],
+        &[
+            (1, "action", Kind::Text),
+            (2, "conversation_ids", Kind::Texts),
+            (
+                3,
+                "subagents",
+                Kind::Messages(&[(1, "conversation_id", Kind::Text), (2, "step_index", Kind::Uint)]),
+            ),
+        ],
     ),
     (
         "exa.cortex.core.tools.InvokeSubagent",
@@ -119,33 +142,68 @@ const TOOLS: &[(&str, &[Field])] = &[
             (8, "image_name", Kind::Text),
         ],
     ),
-    (
-        "exa.cortex.core.tools.AskQuestion",
-        &[(
-            1,
-            "questions",
-            Kind::Messages(&[
-                (1, "question", Kind::Text),
-                (3, "is_multi_select", Kind::Flag),
-                (4, "selected_option_ids", Kind::Texts),
-                (5, "write_in_response", Kind::Text),
-                (6, "skipped", Kind::Flag),
-            ]),
-        )],
-    ),
+    ("exa.cortex.core.tools.AskQuestion", ASK_QUESTION_FIELDS),
     (
         "exa.cortex.core.tools.SearchWeb",
         &[(1, "query", Kind::Text), (2, "domain", Kind::Text)],
+    ),
+    ("exa.cortex.core.tools.MomaSearch", &[(1, "query", Kind::Text)]),
+    (
+        "exa.cortex.core.tools.Finish",
+        &[(1, "arguments_json", Kind::Text), (2, "has_result_schema", Kind::Flag)],
+    ),
+    (
+        "exa.cortex.core.tools.ListResources",
+        &[(1, "server_name", Kind::Text), (2, "uris", Kind::TextOfEach(1))],
+    ),
+    (
+        "exa.cortex.core.tools.ReadResource",
+        &[(1, "server_name", Kind::Text), (2, "uri", Kind::Text)],
+    ),
+    (
+        "exa.cortex.core.tools.McpTool",
+        &[
+            (1, "server_name", Kind::Text),
+            (4, "result_uri", Kind::Text),
+            (5, "progress_message", Kind::Text),
+        ],
     ),
 ];
 /// A result that wraps an earlier typed step: the member of `gemini_coder.Step.step` set.
 const STEPS: &[(u32, &str)] = &[
     (10, "code_action"),
+    (11, "git_commit"),
+    (12, "finish"),
     (13, "grep_search"),
     (14, "view_file"),
     (15, "list_directory"),
+    (23, "write_to_file"),
+    (28, "run_command"),
     (34, "find"),
+    (37, "command_status"),
+    (40, "read_url_content"),
+    (42, "search_web"),
+    (47, "mcp_tool"),
+    (62, "list_resources"),
+    (63, "read_resource"),
+    (98, "file_change"),
+    (143, "invoke_subagent"),
+    (154, "ask_question"),
 ];
+
+pub(super) fn write_typed(
+    file: &File,
+    type_name: &str,
+    message: &Proto,
+    fields: &[Field],
+    out: &mut impl Write,
+) -> Result<()> {
+    out.write_all(b",\"native_payload\":{\"type\":")?;
+    serde_json::to_writer(&mut *out, type_name)?;
+    members(file, message, fields, out, &mut false)?;
+    out.write_all(b"}")?;
+    Ok(())
+}
 
 /// Emits `native_payload` with the type name. Returns whether the schema is known; an
 /// unknown one keeps only its name here and its bytes in the COMPLETE record.
@@ -183,7 +241,13 @@ pub(super) fn project(file: &File, any: &Proto, out: &mut impl Write) -> Result<
     Ok(known)
 }
 
-fn members(file: &File, message: &Proto, fields: &[Field], out: &mut impl Write, first: &mut bool) -> Result<()> {
+pub(super) fn members(
+    file: &File,
+    message: &Proto,
+    fields: &[Field],
+    out: &mut impl Write,
+    first: &mut bool,
+) -> Result<()> {
     for (number, name, kind) in fields {
         let Some(field) = message.last(*number) else {
             continue;
@@ -368,7 +432,8 @@ mod tests {
         assert_eq!(payload["image_num_bytes"], 1024);
         assert_eq!(payload["model_name"], "imagen");
 
-        let question = [bytes(1, b"Proceed?"), number(3, 0), bytes(4, b"yes")].concat();
+        let option = [bytes(1, b"yes"), bytes(2, b"Yes, proceed")].concat();
+        let question = [bytes(1, b"Proceed?"), bytes(2, &option), number(3, 0), bytes(4, b"yes")].concat();
         let (known, payload) = projection(
             "type.googleapis.com/exa.cortex.core.tools.AskQuestion",
             &bytes(1, &question),
@@ -376,13 +441,86 @@ mod tests {
         assert!(known);
         assert_eq!(payload["questions"][0]["question"], "Proceed?");
         assert_eq!(
+            payload["questions"][0]["options"],
+            serde_json::json!([{"id": "yes", "text": "Yes, proceed"}])
+        );
+        assert_eq!(
             payload["questions"][0]["selected_option_ids"],
             serde_json::json!(["yes"])
         );
 
-        let (known, payload) = projection("type.googleapis.com/gemini_coder.Step", &bytes(14, b""));
+        let managed = [
+            bytes(1, b"list"),
+            bytes(2, b"child-a"),
+            bytes(3, &[bytes(1, b"child-a"), number(2, 9)].concat()),
+        ]
+        .concat();
+        let (known, payload) = projection("type.googleapis.com/exa.cortex.core.tools.ManageSubagents", &managed);
         assert!(known);
-        assert_eq!(payload["step"], "view_file");
+        assert_eq!(
+            payload["subagents"],
+            serde_json::json!([{"conversation_id": "child-a", "step_index": 9}])
+        );
+
+        for (url, wire_bytes, expected) in [
+            (
+                "type.googleapis.com/exa.cortex.core.tools.MomaSearch",
+                bytes(1, b"borglet"),
+                serde_json::json!({"type": "exa.cortex.core.tools.MomaSearch", "query": "borglet"}),
+            ),
+            (
+                "type.googleapis.com/exa.cortex.core.tools.Finish",
+                [bytes(1, b"{\"ok\":true}"), number(2, 1)].concat(),
+                serde_json::json!({
+                    "type": "exa.cortex.core.tools.Finish",
+                    "arguments_json": "{\"ok\":true}",
+                    "has_result_schema": true
+                }),
+            ),
+            (
+                "type.googleapis.com/exa.cortex.core.tools.ListResources",
+                [
+                    bytes(1, b"docs"),
+                    bytes(2, &[bytes(1, b"mcp://docs/a"), bytes(2, b"A")].concat()),
+                    bytes(2, &[bytes(1, b"mcp://docs/b"), bytes(2, b"B")].concat()),
+                ]
+                .concat(),
+                serde_json::json!({
+                    "type": "exa.cortex.core.tools.ListResources",
+                    "server_name": "docs",
+                    "uris": ["mcp://docs/a", "mcp://docs/b"]
+                }),
+            ),
+            (
+                "type.googleapis.com/exa.cortex.core.tools.ReadResource",
+                [bytes(1, b"docs"), bytes(2, b"mcp://docs/a")].concat(),
+                serde_json::json!({
+                    "type": "exa.cortex.core.tools.ReadResource",
+                    "server_name": "docs",
+                    "uri": "mcp://docs/a"
+                }),
+            ),
+            (
+                "type.googleapis.com/exa.cortex.core.tools.McpTool",
+                [bytes(1, b"docs"), bytes(4, b"file:///tmp/out.txt"), bytes(5, b"50%")].concat(),
+                serde_json::json!({
+                    "type": "exa.cortex.core.tools.McpTool",
+                    "server_name": "docs",
+                    "result_uri": "file:///tmp/out.txt",
+                    "progress_message": "50%"
+                }),
+            ),
+        ] {
+            let (known, payload) = projection(url, &wire_bytes);
+            assert!(known, "{url}");
+            assert_eq!(payload, expected);
+        }
+
+        for &(step_num, step_name) in STEPS {
+            let (known, payload) = projection("type.googleapis.com/gemini_coder.Step", &bytes(step_num as u64, b""));
+            assert!(known, "{step_name}");
+            assert_eq!(payload["step"], step_name);
+        }
 
         let (known, payload) = projection("type.googleapis.com/exa.cortex.core.tools.Future", &bytes(1, b"x"));
         assert!(!known);
