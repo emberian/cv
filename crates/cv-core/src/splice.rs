@@ -10,6 +10,13 @@
 //! sidechain identity are the Claude emitter's rules (`harness::claude::emit::emit`): a span's source
 //! parents that still resolve are kept, the cut points are re-linked, a span lifted from a sub-agent
 //! joins the main thread. `cv splice` calls this.
+//!
+//! A selected message keeps the record it was read from (`emit::prepare_replayable`,
+//! [`Demand::records`](crate::stream::Demand)) when emitted, so a span emitted into its own
+//! harness is written back as it was: a person's mid-turn message and an attached file are
+//! `attachment` records in a Claude transcript, and they arrive as those records. A record is
+//! only its own harness's: [`Composition::finish_for_emit`] drops the ones the target could not
+//! replay while preserving each span's source harness provenance (`loom`).
 
 use crate::ir::{GitInfo, Harness, Message, Principal, Session};
 use std::path::PathBuf;
@@ -24,6 +31,7 @@ struct Owner {
     title: Option<String>,
     model: Option<String>,
     git: Option<GitInfo>,
+    system_prompt: Option<String>,
 }
 
 /// Incremental composition of prepared windows. Each source owner is consumed immediately;
@@ -33,6 +41,8 @@ pub struct Composition {
     owner: Option<Owner>,
     messages: Vec<Message>,
     provenance: Vec<serde_json::Value>,
+    /// Each pushed window's harness and how many messages it contributed, in push order.
+    windows: Vec<(Harness, usize)>,
 }
 impl Composition {
     pub fn push(&mut self, mut source: Session, total: usize, start: usize, end: Option<usize>) {
@@ -41,6 +51,7 @@ impl Composition {
         self.provenance.push(serde_json::json!({
             "source_id": source.id, "harness": source.harness.as_str(), "start": start, "end": end,
         }));
+        self.windows.push((source.harness, source.messages.len()));
         self.messages.append(&mut source.messages);
         match &mut self.owner {
             Some(owner) => {
@@ -56,6 +67,7 @@ impl Composition {
                     title: source.title.take(),
                     model: source.model.take(),
                     git: source.git.take(),
+                    system_prompt: source.system_prompt.take(),
                 });
             }
         }
@@ -66,7 +78,31 @@ impl Composition {
         self.owner.as_ref().map(|owner| owner.harness)
     }
     pub fn finish(self, new_id: Option<String>, harness: Harness) -> Session {
-        let messages = self.messages;
+        self.build(new_id, harness, None)
+    }
+    /// Finish a composition that is about to be emitted to `target`: strips native records from
+    /// spans whose source harness differs from `target` while keeping the composed session's own
+    /// source harness provenance (and any foreign `system_prompt`), so `target`'s emitter and
+    /// fidelity check see where each span came from.
+    pub fn finish_for_emit(self, new_id: Option<String>, target: Harness) -> Session {
+        let source_harness = self.first_harness().unwrap_or(target);
+        self.build(new_id, source_harness, Some(target))
+    }
+    fn build(self, new_id: Option<String>, harness: Harness, emit_target: Option<Harness>) -> Session {
+        let mut messages = self.messages;
+        // A record replays only into the harness that wrote it; non-emit compositions (`--export`)
+        // drop every non-carrier `_record` so user-facing JSON stays pure IR.
+        let mut at = 0;
+        for (source, len) in self.windows {
+            if emit_target != Some(source) {
+                for message in &mut messages[at..at + len] {
+                    if message.kind != crate::ir::MessageKind::Carrier {
+                        message.extra.remove(crate::ir::CARRIER_KEY);
+                    }
+                }
+            }
+            at += len;
+        }
         // Provenance is cv's own fact about a session cv synthesized, not something read out of a
         // harness store, so it lives in the `cv` namespace — `Session::extra` has no flat keys
         // (docs/INTERFACE-V2.md §4).
@@ -75,15 +111,19 @@ impl Composition {
             crate::ir::CV_NAMESPACE.into(),
             serde_json::json!({ "loom": serde_json::Value::Array(self.provenance) }),
         );
-        let (principal, cwd, title, model, git) = match self.owner {
-            Some(mut owner) => (
-                owner.principal.take(),
-                owner.cwd.take(),
-                owner.title.take(),
-                owner.model.take(),
-                owner.git.take(),
-            ),
-            None => (None, None, None, None, None),
+        let (principal, cwd, title, model, git, system_prompt) = match self.owner {
+            Some(mut owner) => {
+                let carry_prompt = emit_target.is_some_and(|target| owner.harness != target);
+                (
+                    owner.principal.take(),
+                    owner.cwd.take(),
+                    owner.title.take(),
+                    owner.model.take(),
+                    owner.git.take(),
+                    carry_prompt.then(|| owner.system_prompt.take()).flatten(),
+                )
+            }
+            None => (None, None, None, None, None, None),
         };
         Session {
             // created_at = min, updated_at = max of the included messages' timestamps.
@@ -96,9 +136,28 @@ impl Composition {
             model,
             git,
             principal,
+            system_prompt,
             ..Session::new(new_id.unwrap_or_else(|| uuid::Uuid::now_v7().to_string()), harness)
         }
     }
+}
+
+/// Per-message source harness when `session` was assembled by [`Composition`] (`extra["cv"]["loom"]`),
+/// `None` when every message came from `session.harness`.
+pub(crate) fn message_harnesses(session: &Session) -> Option<Vec<Harness>> {
+    let spans = session.cv_extra()?.get("loom")?.as_array()?;
+    let mut out = Vec::with_capacity(session.messages.len());
+    for span in spans {
+        let h = span
+            .get("harness")
+            .and_then(serde_json::Value::as_str)
+            .and_then(Harness::parse)?;
+        let start = span.get("start").and_then(serde_json::Value::as_u64)?;
+        let end = span.get("end").and_then(serde_json::Value::as_u64)?;
+        let n = usize::try_from(end.saturating_sub(start)).ok()?;
+        out.extend(std::iter::repeat_n(h, n));
+    }
+    (out.len() == session.messages.len()).then_some(out)
 }
 
 #[cfg(test)]
@@ -304,5 +363,34 @@ pub(crate) mod tests {
             compose(&[(&first, 0, None)], None, Harness::OpenSession).principal,
             first.principal
         );
+    }
+
+    #[test]
+    fn finish_strips_carrier_keys_for_exports_and_finish_for_emit_keeps_matching_target_only() {
+        let mut codex = session("C", Harness::Codex, 1);
+        codex.system_prompt = Some("codex instructions".into());
+        codex.messages[0]
+            .extra
+            .insert(crate::ir::CARRIER_KEY.into(), serde_json::json!({"raw": 1}));
+        let mut claude = session("K", Harness::Claude, 1);
+        claude.messages[0]
+            .extra
+            .insert(crate::ir::CARRIER_KEY.into(), serde_json::json!({"type": "attachment"}));
+
+        let mut exported = Composition::default();
+        exported.push(codex.clone(), 1, 0, Some(1));
+        exported.push(claude.clone(), 1, 0, Some(1));
+        let exported = exported.finish(Some("exp".into()), Harness::Claude);
+        crate::harness::assert_no_flat_keys(&exported);
+
+        let mut emitted = Composition::default();
+        emitted.push(codex, 1, 0, Some(1));
+        emitted.push(claude, 1, 0, Some(1));
+        let emitted = emitted.finish_for_emit(Some("emit".into()), Harness::Claude);
+        assert_eq!(emitted.harness, Harness::Codex);
+        assert_eq!(emitted.system_prompt.as_deref(), Some("codex instructions"));
+        assert!(!emitted.messages[0].extra.contains_key(crate::ir::CARRIER_KEY));
+        assert!(emitted.messages[1].extra.contains_key(crate::ir::CARRIER_KEY));
+        assert_eq!(message_harnesses(&emitted), Some(vec![Harness::Codex, Harness::Claude]));
     }
 }

@@ -510,25 +510,44 @@ pub(crate) fn cmd_splice(args: SpliceArgs<'_>) -> Result<()> {
         }
     }
     let parsed: Vec<SpliceSpec> = specs.iter().map(|s| parse_splice_spec(s)).collect::<Result<_>>()?;
+    let explicit_h = match &harness {
+        Some(s) => {
+            Some(Harness::parse(s).ok_or_else(|| crate::util::UsageError(format!("unknown target harness: {s}")))?)
+        }
+        None => None,
+    };
+    let emitting = resumable.is_some() || explicit_h.is_some() || out.is_some();
 
     let mut composition = cv_core::splice::Composition::default();
     let mut first_path = None;
     for sp in &parsed {
         let (reference, adapter) = crate::cmd::distill::resolve_source(&sp.id, None)?;
         first_path.get_or_insert_with(|| reference.path.clone());
-        let (session, total, grown) = cv_core::emit::prepare_selected(adapter.as_ref(), &reference, sp.start, sp.end)?;
+        let (session, total, grown) = if emitting {
+            cv_core::emit::prepare_replayable(adapter.as_ref(), &reference, sp.start, sp.end)?
+        } else {
+            cv_core::emit::prepare_selected(adapter.as_ref(), &reference, sp.start, sp.end)?
+        };
         if let Some(grown) = grown {
             eprintln!("  ↳ {}: read {grown}", short_id(&reference.id));
         }
         composition.push(session, total, sp.start, sp.end);
     }
-    let to_h = match &harness {
-        Some(s) => Harness::parse(s).ok_or_else(|| crate::util::UsageError(format!("unknown target harness: {s}")))?,
-        None => composition
-            .first_harness()
-            .context("splice needs at least one session")?,
+    let first_h = composition
+        .first_harness()
+        .context("splice needs at least one session")?;
+    let to_h = explicit_h.unwrap_or(first_h);
+    let emit_target = if resumable.is_some() {
+        Some(cv_core::harness::derived_host())
+    } else if explicit_h.is_some() || out.is_some() {
+        Some(to_h)
+    } else {
+        None
     };
-    let spliced = composition.finish(None, to_h);
+    let spliced = match emit_target {
+        Some(target) => composition.finish_for_emit(None, target),
+        None => composition.finish(None, to_h),
+    };
     if let Some(target) = resumable {
         // `--session` / `--agent-of`: a resumable Claude transcript, the way `distill` writes one.
         // Nothing is elided (every selected message is carried whole), so there is no sidecar.

@@ -36,6 +36,7 @@ struct Record<'a> {
     mode: ThinkingMode,
     special: Option<MessageKind>,
     sidecar: Option<&'a Value>,
+    parent_override: Option<Option<String>>,
 }
 impl Record<'_> {
     fn with_fields<T>(&self, f: impl FnOnce(Object<'_>, Option<Object<'_>>) -> Result<T>) -> Result<T> {
@@ -278,11 +279,15 @@ impl Record<'_> {
                 return Ok(None);
             }
             let uuid = top.get("uuid").and_then(Value::as_str).map(str::to_owned);
-            let parent = top
-                .get("parentUuid")
-                .and_then(Value::as_str)
-                .filter(|p| !ids.contains(*p))
-                .map(|_| json!(previous));
+            let parent = match &self.parent_override {
+                Some(Some(p)) if ids.contains(p.as_str()) => Some(json!(p)),
+                Some(_) => Some(json!(previous)),
+                None => top
+                    .get("parentUuid")
+                    .and_then(Value::as_str)
+                    .filter(|p| !ids.contains(*p))
+                    .map(|_| json!(previous)),
+            };
             let identity = json!(c.session_id);
             let cwd = json!(c.cwd);
             let agent = json!(c.agent);
@@ -291,9 +296,13 @@ impl Record<'_> {
             if let Some(parent) = &parent {
                 top.set("parentUuid", parent);
             }
-            // Carriers only rewrite identity fields they originally held.
-            if top.get("sessionId").is_some() {
-                top.set("sessionId", &identity);
+            // Carriers only rewrite identity fields they originally held. Every spelling of
+            // the session id is this session's: a record replayed with its source's would name
+            // another session.
+            for key in crate::harness::claude::IDENTITY.session_keys {
+                if top.get(key).is_some() {
+                    top.set(key, &identity);
+                }
             }
             if top.get("cwd").is_some() {
                 top.set("cwd", &cwd);
@@ -458,19 +467,9 @@ impl ParentLinks {
         parent
     }
 }
-/// A foreign-session message written as one of Claude Code's special record kinds (a compaction
-/// boundary or summary, an injected-context attachment) rather than an ordinary turn.
-fn special_kind(session: &Session, message: &Message) -> Option<MessageKind> {
-    (session.harness != Harness::Claude
-        && matches!(
-            message.kind,
-            MessageKind::CompactionBoundary | MessageKind::CompactionSummary | MessageKind::InjectedContext
-        ))
-    .then_some(message.kind)
-}
-
 fn record<'a>(
     message: &'a Message,
+    source: Harness,
     c: &Context<'a>,
     uuid: Option<&str>,
     previous: &mut Option<String>,
@@ -478,24 +477,41 @@ fn record<'a>(
     resolver: &Resolver,
 ) -> Result<Option<Record<'a>>> {
     if let Some(carrier) = carrier_record_of(message) {
+        let base = carrier.as_object().unwrap();
+        let parent_override = base
+            .get("parentUuid")
+            .and_then(Value::as_str)
+            .filter(|p| dropped.links.contains_key(*p))
+            .map(|p| dropped.resolve(p.to_owned()));
+        let survives_title = !(c.agent.is_some() && base.get("type").and_then(Value::as_str) == Some("ai-title"));
+        if survives_title {
+            if let Some(u) = base.get("uuid").and_then(Value::as_str) {
+                *previous = Some(u.to_owned());
+            }
+        }
         return Ok(Some(Record {
             generated: false,
-            base: Cow::Borrowed(carrier.as_object().unwrap()),
+            base: Cow::Borrowed(base),
             extras: None,
             blocks: Vec::new(),
             role: message.role,
             mode: c.mode,
             special: None,
             sidecar: None,
+            parent_override,
         }));
     }
-    let special = special_kind(c.session, message);
+    let fate = system_fate(source, message);
+    let special = match fate {
+        SystemFate::Special(kind) => Some(kind),
+        _ => None,
+    };
     let parent = message
         .parent_id
         .clone()
         .map(|p| dropped.resolve(p))
         .unwrap_or_else(|| previous.clone());
-    if special.is_none() && message.role == Role::System {
+    if let SystemFate::Unwritten(_) = fate {
         if let Some(id) = &message.id {
             dropped.insert(id.clone(), parent);
         }
@@ -607,7 +623,7 @@ fn record<'a>(
     Ok(Some(Record {
         generated: true,
         base: Cow::Owned(base),
-        extras: (c.session.harness == Harness::Claude && special.is_none())
+        extras: (source == Harness::Claude && special.is_none())
             .then(|| message.harness_extra(Harness::Claude))
             .flatten(),
         blocks: projected(message, c.mode, resolver)?,
@@ -619,6 +635,7 @@ fn record<'a>(
         mode: c.mode,
         special,
         sidecar,
+        parent_override: None,
     }))
 }
 
@@ -648,20 +665,38 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Emi
         mode: opts.thinking,
     };
     let resolver = session.resolver();
+    let sources = crate::splice::message_harnesses(session);
+    let source_of = |i: usize| {
+        sources
+            .as_ref()
+            .and_then(|s| s.get(i).copied())
+            .unwrap_or(session.harness)
+    };
     let uuid: Vec<_> = session
         .messages
         .iter()
-        .map(|message| {
-            let special = special_kind(session, message).is_some();
-            (carrier_record_of(message).is_none() && (special || message.role != Role::System))
-                .then(|| message.id.clone().unwrap_or_else(|| Uuid::new_v4().to_string()))
+        .enumerate()
+        .map(|(i, message)| {
+            matches!(
+                system_fate(source_of(i), message),
+                SystemFate::Turn | SystemFate::Special(_)
+            )
+            .then(|| message.id.clone().unwrap_or_else(|| Uuid::new_v4().to_string()))
         })
         .collect();
     let mut answered = HashSet::new();
     let mut ids = HashSet::new();
     let (mut previous, mut dropped) = (None, ParentLinks::default());
-    for (message, uuid) in session.messages.iter().zip(&uuid) {
-        if let Some(record) = record(message, &c, uuid.as_deref(), &mut previous, &mut dropped, &resolver)? {
+    for (i, (message, uuid)) in session.messages.iter().zip(&uuid).enumerate() {
+        if let Some(record) = record(
+            message,
+            source_of(i),
+            &c,
+            uuid.as_deref(),
+            &mut previous,
+            &mut dropped,
+            &resolver,
+        )? {
             record.with_fields(|_, message| {
                 record.array_facts(message.as_ref(), None, |id, result| {
                     if result {
@@ -676,9 +711,17 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Emi
     dropped.clear();
     // This pass decides every record's survival once; the writing pass goes by its verdicts.
     let mut verdicts = Vec::with_capacity(session.messages.len());
-    for (message, uuid) in session.messages.iter().zip(&uuid) {
+    for (i, (message, uuid)) in session.messages.iter().zip(&uuid).enumerate() {
         let mut survives = false;
-        if let Some(record) = record(message, &c, uuid.as_deref(), &mut previous, &mut dropped, &resolver)? {
+        if let Some(record) = record(
+            message,
+            source_of(i),
+            &c,
+            uuid.as_deref(),
+            &mut previous,
+            &mut dropped,
+            &resolver,
+        )? {
             survives = record.with_fields(|top, message| {
                 let survives = record.survives(&top, message.as_ref(), &answered, c.agent.as_deref());
                 if survives {
@@ -739,8 +782,16 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Emi
     previous = None;
     dropped.clear();
     let mut surviving_previous = None;
-    for ((message, uuid), survives) in session.messages.iter().zip(&uuid).zip(&verdicts) {
-        if let Some(record) = record(message, &c, uuid.as_deref(), &mut previous, &mut dropped, &resolver)? {
+    for (i, ((message, uuid), survives)) in session.messages.iter().zip(&uuid).zip(&verdicts).enumerate() {
+        if let Some(record) = record(
+            message,
+            source_of(i),
+            &c,
+            uuid.as_deref(),
+            &mut previous,
+            &mut dropped,
+            &resolver,
+        )? {
             if !survives {
                 continue;
             }

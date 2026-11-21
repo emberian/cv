@@ -359,13 +359,7 @@ fn lossy_lines(report: &cv_core::emit::FidelityReport, sidechain: bool) -> Vec<S
         .deltas
         .iter()
         .filter(|d| d.what != "lineage" && !(sidechain && d.what == "session title"))
-        .map(|d| {
-            if d.expected {
-                format!("{} (expected: target format policy)", d.describe())
-            } else {
-                d.describe()
-            }
-        })
+        .map(cv_core::emit::Divergence::line)
         .collect()
 }
 
@@ -649,6 +643,7 @@ mod tests {
             a: "distilled: lane".into(),
             b: "(none)".into(),
             expected,
+            why: None,
             at: String::new(),
         };
         let report = cv_core::emit::FidelityReport {

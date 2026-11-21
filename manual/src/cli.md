@@ -727,6 +727,12 @@ Sub-agent spans join the main thread. Without `--harness`/`--out` it only compos
 (`--export md|json` dumps). `--session` and `--agent-of` work as in [`distill`](#cv-distill). A call
 whose result falls outside the spans is dropped ([the dangling-parent trap](reshaping.md#the-dangling-parent-trap)).
 
+A span emitted into its own harness is written back as it was read: each selected message keeps
+its record, so a Claude span's `attachment` and `system` records (a message typed while the agent
+worked, a file attached with `@`, hook output) arrive as those records, in place, under the new
+session id. A message that cannot be written is named by kind with the reason
+(`system:notice: 2 → 0 (the source harness's record has no Claude form)`).
+
 ### `cv port`
 
 Copy a session to run elsewhere: another harness (`--harness`), another directory (`--cwd`), or both.

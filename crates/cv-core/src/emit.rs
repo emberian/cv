@@ -502,6 +502,7 @@ pub fn emit_report(
                 a: "parseable".into(),
                 b: format!("re-parse failed ({e:#})"),
                 expected: false,
+                why: None,
                 at: target.as_str().to_string(),
             }],
         },
@@ -512,6 +513,7 @@ pub fn emit_report(
             a: "complete".into(),
             b: "rich (target reader policy)".into(),
             expected: true,
+            why: None,
             at: target.as_str().into(),
         });
     }
@@ -635,6 +637,25 @@ pub fn prepare_selected(
     let mut options = Demand::RICH;
     options.spans = true;
     prepare::selected(adapter, reference, &options, start, end)
+}
+
+/// [`prepare_selected`] for a window that is emitted as it stands (`cv splice`): the same
+/// messages at the same indices, each keeping its record ([`Demand::records`]), so a window
+/// written into its own harness comes back as the records it was read from. A consumer that
+/// rebuilds the session instead (distill) has no use for them and reads without.
+pub fn prepare_replayable(
+    adapter: &dyn crate::harness::Adapter,
+    reference: &SessionRef,
+    start: usize,
+    end: Option<usize>,
+) -> Result<(Session, usize, Option<Grown>)> {
+    prepare::selected(
+        adapter,
+        reference,
+        &Demand::RICH.with_spans().with_records(),
+        start,
+        end,
+    )
 }
 
 /// Parse at native emission fidelity. Registered writers accept guarded bodies, including
@@ -2619,6 +2640,7 @@ mod tests {
                 a: "1".into(),
                 b: "0".into(),
                 expected: true,
+                why: None,
                 at: "test".into(),
             }],
         };
@@ -2632,6 +2654,7 @@ mod tests {
                 a: "1".into(),
                 b: "0".into(),
                 expected: false,
+                why: None,
                 at: "test".into(),
             }],
         };
@@ -3275,6 +3298,7 @@ mod tests {
             a: format!("\n\nYou are an interactive agent{}\nand more\n", "…".repeat(4000)),
             b: "(none)".into(),
             expected: true,
+            why: None,
             at: "test".into(),
         };
         let line = d.describe();

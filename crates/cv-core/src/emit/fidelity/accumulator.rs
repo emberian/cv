@@ -9,14 +9,23 @@ pub(super) struct Accumulator {
     // The answered-call rule ([`WriteRules::answered_calls_only`]) needs future IDs, but not
     // argument/output bodies.
     answered_only: bool,
-    pending: Vec<Message>,
+    pending: Vec<(Message, Option<Harness>)>,
     answered: std::collections::HashSet<String>,
     resolver: crate::lazy::Resolver,
     latch: crate::stream::Latch,
+    /// The harness the session was read from, on the side a writer is about to write
+    /// ([`Features::note`]); `None` on the side read back.
+    written_from: Option<Harness>,
 }
 impl Accumulator {
-    pub(super) fn new(target: Harness, thinking: ThinkingMode, resolver: crate::lazy::Resolver) -> Self {
+    pub(super) fn new(
+        target: Harness,
+        thinking: ThinkingMode,
+        resolver: crate::lazy::Resolver,
+        written_from: Option<Harness>,
+    ) -> Self {
         Self {
+            written_from,
             target,
             thinking,
             features: Features::default(),
@@ -28,6 +37,9 @@ impl Accumulator {
         }
     }
     pub(super) fn note(&mut self, message: &Message) -> Result<()> {
+        self.note_from(message, self.written_from)
+    }
+    pub(super) fn note_from(&mut self, message: &Message, written_from: Option<Harness>) -> Result<()> {
         let facts = project(message, &self.resolver, self.target)?;
         if self.answered_only {
             for block in &facts.content {
@@ -37,22 +49,23 @@ impl Accumulator {
             }
         }
         if self.answered_only && facts.content.iter().any(|b| matches!(b, Block::ToolUse { .. })) {
-            self.pending.push(facts);
+            self.pending.push((facts, written_from));
         } else {
             self.features
-                .note(self.target, self.thinking, &facts, false, &|_| false);
+                .note(self.target, self.thinking, &facts, false, &|_| false, written_from);
         }
         Ok(())
     }
     pub(super) fn finish(mut self, metadata: &Session) -> Features {
         if self.answered_only {
-            for message in &self.pending {
+            for (message, written_from) in &self.pending {
                 self.features.note(
                     self.target,
                     self.thinking,
                     message,
                     metadata.model.is_some(),
                     &|b| matches!(b, Block::ToolUse { id, .. } if !self.answered.contains(id.as_str())),
+                    *written_from,
                 );
             }
         }
@@ -84,8 +97,24 @@ impl MessageSink for Accumulator {
     }
 }
 
+/// The features of `session` as `target`'s writer is about to write it.
 pub(in crate::emit) fn source_features(target: Harness, thinking: ThinkingMode, session: &Session) -> Result<Features> {
-    let mut accumulator = Accumulator::new(target, thinking, session.resolver());
+    let sources = crate::splice::message_harnesses(session);
+    let mut accumulator = Accumulator::new(target, thinking, session.resolver(), Some(session.harness));
+    for (i, message) in session.messages.iter().enumerate() {
+        let from = sources
+            .as_ref()
+            .and_then(|s| s.get(i).copied())
+            .unwrap_or(session.harness);
+        accumulator.note_from(message, Some(from))?;
+    }
+    Ok(accumulator.finish(session))
+}
+
+/// The features of `session` as `target`'s reader read it back.
+#[cfg(test)]
+pub(in crate::emit) fn read_features(target: Harness, thinking: ThinkingMode, session: &Session) -> Result<Features> {
+    let mut accumulator = Accumulator::new(target, thinking, session.resolver(), None);
     for message in &session.messages {
         accumulator.note(message)?;
     }
@@ -112,7 +141,12 @@ pub(super) fn marker(text: &crate::lazy::Text, resolver: &crate::lazy::Resolver)
 fn project(message: &Message, resolver: &crate::lazy::Resolver, target: Harness) -> Result<Message> {
     let rules = write_rules(target);
     let keep_ids = rules.answered_calls_only;
-    let mut facts = Message::new(message.role);
+    let mut facts = if message.is_synthesized() {
+        Message::synthesized(message.kind, message.origin)
+    } else {
+        Message::new(message.role)
+    };
+    facts.role = message.role;
     facts.id = message.id.as_ref().map(|_| String::new());
     facts.kind = message.kind;
     facts.origin = message.origin;
@@ -120,7 +154,10 @@ fn project(message: &Message, resolver: &crate::lazy::Resolver, target: Harness)
     facts.model = message.model.as_ref().map(|_| String::new());
     facts.usage = message.usage.clone();
     if message.is_carrier() {
-        facts.extra.insert(crate::ir::CARRIER_KEY.into(), Value::Null);
+        // An empty record: enough for `is_carrier` and for the Claude writer's `system_fate`.
+        facts
+            .extra
+            .insert(crate::ir::CARRIER_KEY.into(), Value::Object(Default::default()));
     }
     let mut text_started = false;
     for block in &message.content {

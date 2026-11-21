@@ -5,6 +5,7 @@
 
 use super::*;
 mod accumulator;
+use crate::harness::claude::emit::SystemFate;
 use crate::harness::grok::emit::grok_model_id;
 pub(super) use accumulator::source_features;
 use accumulator::Accumulator;
@@ -180,6 +181,10 @@ pub struct Divergence {
     pub a: String,
     pub b: String,
     pub expected: bool,
+    /// The writer's own stated reason for an expected loss, when it has one more exact than
+    /// "the target format cannot hold it".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub why: Option<&'static str>,
     #[serde(rename = "where")]
     pub at: String,
 }
@@ -190,6 +195,16 @@ impl Divergence {
     /// dumping it into the terminal buried every other delta. The struct keeps the full values.
     pub fn describe(&self) -> String {
         format!("{}: {} → {}", self.what, brief(&self.a), brief(&self.b))
+    }
+
+    /// The `⚠ lost` line: [`describe`](Self::describe), then the writer's reason when it gave
+    /// one, else for an expected loss that the target format cannot hold it.
+    pub fn line(&self) -> String {
+        match (self.why, self.expected) {
+            (Some(why), _) => format!("{} ({why})", self.describe()),
+            (None, true) => format!("{} (expected: target format policy)", self.describe()),
+            (None, false) => self.describe(),
+        }
     }
 }
 
@@ -223,16 +238,7 @@ impl FidelityReport {
     /// Render every delta as a human `⚠ lost` line (expected ones tagged so the reader knows the
     /// format simply cannot hold them). Both kinds are shown: the point is a complete picture.
     pub fn lost_lines(&self) -> Vec<String> {
-        self.deltas
-            .iter()
-            .map(|d| {
-                if d.expected {
-                    format!("{} (expected: target format policy)", d.describe())
-                } else {
-                    d.describe()
-                }
-            })
-            .collect()
+        self.deltas.iter().map(Divergence::line).collect()
     }
 }
 
@@ -298,6 +304,8 @@ pub(super) fn block_survives(target: Harness, thinking: ThinkingMode, b: &Block)
 }
 
 impl Features {
+    /// `written_from` is the harness the message was read from when these are the features of
+    /// what a writer is ABOUT to write (the source side), `None` for what a reader read back.
     fn note(
         &mut self,
         target: Harness,
@@ -305,8 +313,12 @@ impl Features {
         m: &Message,
         session_model: bool,
         orphan_call: &impl Fn(&Block) -> bool,
+        written_from: Option<Harness>,
     ) {
         let f = self;
+        let fate = written_from
+            .zip(write_rules(target).system_fate)
+            .map(|(source, fate)| fate(source, m));
         // Notes are presence facts (inline markers, `accumulator::project`), never source text.
         let unrepresentable = unrepresentable_checked(target, thinking, m, &crate::lazy::Resolver::new(None))
             .expect("noted facts are inline");
@@ -317,17 +329,24 @@ impl Features {
         // their timestamps/ids/model would have reported losses that no emitter could have avoided:
         //
         //  * a format-complete **carrier** (empty-content System message holding a verbatim meta
-        //    record) is bookkeeping the emitter replays byte-for-byte;
+        //    record) is bookkeeping the emitter replays byte-for-byte. A message that keeps its
+        //    record AND has content (a model-visible Claude attachment) or is a synthesized
+        //    boundary (`compact_boundary`) is counted on both sides;
         //  * a turn the target cannot represent AT ALL ([`unrepresentable_checked`]), or one whose only
         //    content is unanswered calls the Claude emitter drops.
-        if m.is_carrier() || unrepresentable || (!m.content.is_empty() && m.content.iter().all(&orphan_call)) {
+        let bookkeeping =
+            m.kind == MessageKind::Carrier || (m.is_carrier() && m.content.is_empty() && !m.is_synthesized());
+        if bookkeeping || unrepresentable || (!m.content.is_empty() && m.content.iter().all(&orphan_call)) {
             return;
         }
         // A store whose own reader re-tags a turn on the way back in is not LOSING it, and the
-        // verifier must not cry loss over a transformation the format defines. Model the known one
+        // verifier must not cry loss over a transformation the format defines. Model the known ones
         // here so both sides agree; anything else still shows up.
         let (role, kind) = if write_rules(target).reroles_client_commands && is_client_command(m) {
             ("system", MessageKind::InjectedContext.as_str())
+        } else if fate == Some(SystemFate::Special(MessageKind::CompactionSummary)) {
+            // Claude Code's compaction summary is a `user` record (`isCompactSummary`).
+            ("user", m.kind.as_str())
         } else {
             (role_str(m.role), m.kind.as_str())
         };
@@ -599,6 +618,12 @@ pub(crate) struct WriteRules {
     /// The writer pins a foreign session model to its own id ([`Field::SessionModelForeign`] in
     /// [`policy`]), as this function computes it.
     pub pinned_model: Option<fn(&Session) -> &str>,
+    /// The writer states what it does with each message of a session read from the given
+    /// harness, system-role ones included (`claude::emit::system_fate`). With it, each system
+    /// turn the writer does not write is reported by kind with the writer's reason, and a system
+    /// turn it said it writes and the output lacks is an unexpected loss. Without it a lost
+    /// system turn is format policy, as it always was.
+    pub system_fate: Option<fn(Harness, &Message) -> SystemFate>,
 }
 
 pub(crate) fn write_rules(h: Harness) -> WriteRules {
@@ -607,6 +632,7 @@ pub(crate) fn write_rules(h: Harness) -> WriteRules {
         Harness::Claude => WriteRules {
             portable_replay: true,
             answered_calls_only: true,
+            system_fate: Some(crate::harness::claude::emit::system_fate),
             ..none
         },
         Harness::Gemini | Harness::Qwen => WriteRules {
@@ -674,7 +700,7 @@ pub(super) fn diff_fidelity(
     reparsed: &Session,
 ) -> FidelityReport {
     let before = source_features(target, thinking, input).expect("source fidelity facts");
-    let after = source_features(target, thinking, reparsed).expect("reparsed fidelity facts");
+    let after = accumulator::read_features(target, thinking, reparsed).expect("reparsed fidelity facts");
     diff_features(target, thinking, input, reparsed, before, after)
 }
 
@@ -698,6 +724,7 @@ pub(super) fn diff_features(
                 a: b.to_string(),
                 b: a.to_string(),
                 expected: !holds(target, thinking, field),
+                why: None,
                 at: at(),
             });
         }
@@ -717,6 +744,7 @@ pub(super) fn diff_features(
                 a: b.unwrap_or_default(),
                 b: a.unwrap_or_else(|| "(none)".into()),
                 expected: !target_holds(target, field),
+                why: None,
                 at: target.as_str().to_string(),
             });
         }
@@ -728,19 +756,61 @@ pub(super) fn diff_features(
             a: dropped.to_string(),
             b: "0".into(),
             expected: true,
+            why: None,
             at: at(),
         });
     }
-    // Role / kind census. A lost *conversational* turn (user/assistant/tool) is always unexpected;
-    // a lost system turn is format-dependent (Claude has no standalone system turn), so expected.
+    // What the writer states it does not write, by kind and reason, in message order. The text,
+    // ids and timestamps those turns held are still counted below: where the format could have
+    // held them, their loss stays an unexpected one.
+    let stated = write_rules(target).system_fate;
+    let mut unwritten = 0;
+    if let Some(fate) = stated {
+        let sources = crate::splice::message_harnesses(input);
+        let mut kinds: Vec<(MessageKind, &'static str, usize)> = Vec::new();
+        for (i, m) in input.messages.iter().enumerate() {
+            if m.kind == MessageKind::Carrier {
+                continue;
+            }
+            let from = sources
+                .as_ref()
+                .and_then(|s| s.get(i).copied())
+                .unwrap_or(input.harness);
+            let SystemFate::Unwritten(why) = fate(from, m) else {
+                continue;
+            };
+            unwritten += 1;
+            match kinds.iter_mut().find(|(kind, w, _)| *kind == m.kind && *w == why) {
+                Some((_, _, n)) => *n += 1,
+                None => kinds.push((m.kind, why, 1)),
+            }
+        }
+        for (kind, why, n) in kinds {
+            deltas.push(Divergence {
+                what: format!("system:{}", kind.as_str()),
+                a: n.to_string(),
+                b: "0".into(),
+                expected: true,
+                why: Some(why),
+                at: at(),
+            });
+        }
+    }
+    // Role / kind census. A lost *conversational* turn (user/assistant/tool) is always unexpected.
+    // A lost system turn is format-dependent, so expected, unless the target's writer states its
+    // own fates: the ones it does not write were named above, and a system turn missing beyond
+    // those is one it said it writes.
     for (role, &b) in &before.role_counts {
+        let system = *role == "system";
+        let b = if system { b.saturating_sub(unwritten) } else { b };
         let a = after.role_counts.get(role).copied().unwrap_or(0);
         if a < b {
             deltas.push(Divergence {
                 what: format!("role:{role}"),
                 a: b.to_string(),
                 b: a.to_string(),
-                expected: *role == "system",
+                expected: system && stated.is_none(),
+                why: None,
                 at: at(),
             });
         }
@@ -760,16 +830,18 @@ pub(super) fn diff_features(
                 a: b.to_string(),
                 b: a.to_string(),
                 expected: false,
+                why: None,
                 at: at(),
             });
         }
     }
-    let meta_before: usize = before
+    let meta_before = before
         .kind_counts
         .iter()
         .filter(|(k, _)| !is_conversational(k))
         .map(|(_, n)| *n)
-        .sum();
+        .sum::<usize>()
+        .saturating_sub(unwritten);
     let meta_after: usize = after
         .kind_counts
         .iter()
@@ -782,6 +854,7 @@ pub(super) fn diff_features(
             a: meta_before.to_string(),
             b: meta_after.to_string(),
             expected: true,
+            why: None,
             at: at(),
         });
     }
@@ -884,6 +957,7 @@ pub(super) fn diff_features(
                 a: before.to_string(),
                 b: after.to_string(),
                 expected: true,
+                why: None,
                 at: at(),
             });
         }
@@ -907,6 +981,7 @@ pub(super) fn diff_features(
                     a: "(unknown)".into(),
                     b: after.to_rfc3339(),
                     expected: true,
+                    why: None,
                     at: at(),
                 });
             }
@@ -993,6 +1068,7 @@ pub(super) fn diff_features(
                 "changed".into()
             },
             expected: !target_holds(target, Field::Lineage),
+            why: None,
             at: at(),
         });
     }
@@ -1014,6 +1090,7 @@ pub(super) fn reparse_features(
         target,
         thinking,
         crate::lazy::Resolver::new(Some(result.path.clone())),
+        None,
     ));
     let metadata = reparse_with(target, result, &|adapter, reference| {
         crate::stream::stream_counted(

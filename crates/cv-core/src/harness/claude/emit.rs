@@ -96,6 +96,47 @@ fn carrier_record_of(m: &crate::ir::Message) -> Option<&Value> {
     m.extra.get(crate::ir::CARRIER_KEY).filter(|v| v.is_object())
 }
 
+/// What the Claude writer does with one message, decided here once for the writer and for the
+/// fidelity report ([`crate::emit::fidelity::WriteRules::system_fate`]), so what is reported as
+/// not written is exactly what was not written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SystemFate {
+    /// A user, assistant or tool turn: written as a turn.
+    Turn,
+    /// The message keeps its Claude record ([`crate::ir::CARRIER_KEY`]): replayed verbatim.
+    Record,
+    /// A foreign session's message of a kind Claude Code has a record for (a compaction
+    /// boundary or summary, injected context): written as that record.
+    Special(MessageKind),
+    /// Not written, and why. A system-role message is an `attachment` or `system` record in a
+    /// Claude transcript, and the IR holds only its text: without the record there is nothing
+    /// to write it back as.
+    Unwritten(&'static str),
+}
+
+/// [`SystemFate`] of `message` in a session read from `source`.
+pub(crate) fn system_fate(source: Harness, message: &crate::ir::Message) -> SystemFate {
+    if carrier_record_of(message).is_some() {
+        return SystemFate::Record;
+    }
+    if source != Harness::Claude
+        && matches!(
+            message.kind,
+            MessageKind::CompactionBoundary | MessageKind::CompactionSummary | MessageKind::InjectedContext
+        )
+    {
+        return SystemFate::Special(message.kind);
+    }
+    if message.role != Role::System {
+        return SystemFate::Turn;
+    }
+    SystemFate::Unwritten(if source == Harness::Claude {
+        "read without its record; a read that keeps records carries it"
+    } else {
+        "the source harness's record has no Claude form"
+    })
+}
+
 /// Internal `extra` keys the IR adds for its own bookkeeping — never part of the source record, so
 /// they must NOT be replayed into an emitted Claude line.
 fn is_internal_extra_key(k: &str) -> bool {
@@ -217,6 +258,163 @@ mod checked_verifier_tests {
             err.to_string().contains("tool_use t has no tool_result; the source"),
             "{err}"
         );
+        Ok(())
+    }
+
+    /// A system-role message that keeps its record is written back as that record, restamped
+    /// under every spelling of the session id. One without is named by kind with the writer's
+    /// reason, never folded into a count the reader is told to expect.
+    #[test]
+    fn a_system_message_is_replayed_from_its_record_or_named_as_unwritten() -> Result<()> {
+        use crate::ir::{Message, Origin, CARRIER_KEY};
+        let world = cv_testkit::World::new("claude-system-fate");
+        let text = |m: &mut Message, id: &str, parent: Option<&str>, text: &str| {
+            m.id = Some(id.into());
+            m.parent_id = parent.map(str::to_owned);
+            m.content.push(Block::Text { text: text.into() });
+        };
+        let mut session = Session::new("source", Harness::Claude);
+        let mut prompt = Message::new(Role::User);
+        text(&mut prompt, "u", None, "plan the beds");
+        let mut queued = Message::of_kind(Role::System, MessageKind::InjectedContext, Origin::Harness);
+        text(&mut queued, "k", Some("u"), "also water the ferns");
+        queued.extra.insert(
+            CARRIER_KEY.into(),
+            json!({"type": "attachment", "uuid": "k", "parentUuid": "u", "sessionId": "source", "session_id": "source",
+                "attachment": {"type": "queued_command", "prompt": "also water the ferns", "origin": {"kind": "human"}},
+                "rendered": [{"content": "also water the ferns"}], "renderedRole": "user"}),
+        );
+        let mut notice = Message::of_kind(Role::System, MessageKind::Notice, Origin::Harness);
+        text(&mut notice, "n", Some("k"), "compost turned");
+        let mut reply = Message::new(Role::Assistant);
+        text(&mut reply, "a", Some("n"), "done");
+        session.messages = vec![prompt, queued, notice, reply];
+        let opts = EmitOptions {
+            new_id: Some("derived".into()),
+            ..Default::default()
+        };
+        let (result, report) = crate::emit::emit_report(&session, Harness::Claude, &world.base.join("claude"), &opts)?;
+        let rows: Vec<Value> = fs::read_to_string(&result.path)?
+            .lines()
+            .map(serde_json::from_str)
+            .collect::<std::result::Result<_, _>>()?;
+        let types: Vec<&str> = rows.iter().filter_map(|r| r["type"].as_str()).collect();
+        assert_eq!(types, ["user", "attachment", "assistant"]);
+        assert_eq!(rows[1]["attachment"]["origin"]["kind"], "human");
+        assert_eq!(rows[1]["renderedRole"], "user");
+        assert_eq!(
+            (&rows[1]["sessionId"], &rows[1]["session_id"]),
+            (&json!("derived"), &json!("derived"))
+        );
+        assert_eq!(rows[2]["parentUuid"], "k", "relinked past the unwritten notice");
+        let stated: Vec<_> = report
+            .deltas
+            .iter()
+            .filter(|d| d.what.starts_with("system:") || d.what.starts_with("role:") || d.what.starts_with("kind:"))
+            .collect();
+        assert_eq!(stated.len(), 1, "{:?}", report.deltas);
+        assert_eq!(
+            stated[0].line(),
+            "system:notice: 1 → 0 (read without its record; a read that keeps records carries it)"
+        );
+        // Its text is still a loss the format could have held.
+        assert!(
+            report
+                .deltas
+                .iter()
+                .any(|d| d.what == "block:text" && !d.expected && d.a == "4" && d.b == "3"),
+            "{:?}",
+            report.deltas
+        );
+
+        // Without its record the mid-turn message is unwritten too, and says so; nothing here
+        // is the old `role:system: N → 0 (expected: target format policy)`.
+        session.messages[1].extra.remove(CARRIER_KEY);
+        let opts = EmitOptions {
+            new_id: Some("bare".into()),
+            ..Default::default()
+        };
+        let (_, report) = crate::emit::emit_report(&session, Harness::Claude, &world.base.join("claude"), &opts)?;
+        let lines = report.lost_lines();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("system:injected_context: 1 → 0 (read without its record")),
+            "{lines:?}"
+        );
+        assert!(!lines.iter().any(|l| l.contains("role:system")), "{lines:?}");
+
+        // Another harness's notice has no Claude record; its injected context does, and is written.
+        session.harness = Harness::Codex;
+        let opts = EmitOptions {
+            new_id: Some("foreign".into()),
+            ..Default::default()
+        };
+        let (result, report) = crate::emit::emit_report(&session, Harness::Claude, &world.base.join("claude"), &opts)?;
+        let written = fs::read_to_string(&result.path)?;
+        assert!(written.contains(r#""type":"injected_context""#), "{written}");
+        let lines = report.lost_lines();
+        assert!(
+            lines.contains(&"system:notice: 1 → 0 (the source harness's record has no Claude form)".to_string()),
+            "{lines:?}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.contains("role:system") || l.contains("kind:meta")),
+            "{lines:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn carrier_parent_resolves_through_unwritten_records_and_advances_previous() -> Result<()> {
+        use crate::ir::{Message, Origin, CARRIER_KEY};
+        let world = cv_testkit::World::new("claude-carrier-parents");
+        let text = |m: &mut Message, id: Option<&str>, parent: Option<&str>, body: &str| {
+            m.id = id.map(str::to_owned);
+            m.parent_id = parent.map(str::to_owned);
+            m.content.push(Block::Text { text: body.into() });
+        };
+        let mut session = Session::new("source", Harness::Claude);
+        let mut u1 = Message::new(Role::User);
+        text(&mut u1, Some("u1"), None, "root");
+        let mut branch = Message::new(Role::Assistant);
+        text(&mut branch, Some("branch"), Some("u1"), "side branch");
+        let mut unwritten = Message::of_kind(Role::System, MessageKind::Notice, Origin::Harness);
+        text(&mut unwritten, Some("n1"), Some("u1"), "unwritten notice");
+        let mut carrier = Message::of_kind(Role::System, MessageKind::InjectedContext, Origin::Harness);
+        text(&mut carrier, Some("c1"), Some("n1"), "queued");
+        carrier.extra.insert(
+            CARRIER_KEY.into(),
+            json!({"type": "attachment", "uuid": "c1", "parentUuid": "n1", "sessionId": "source",
+                "attachment": {"type": "queued_command"}, "rendered": [{"content": "queued"}]}),
+        );
+        // Next span's root (`parent_id: None`) must hang off `c1`, not `branch` or `u1`.
+        let mut span2 = Message::new(Role::User);
+        text(&mut span2, Some("b_u1"), None, "span 2");
+        session.messages = vec![u1, branch, unwritten, carrier, span2];
+
+        let res = emit(
+            &session,
+            &world.base.join("claude"),
+            &EmitOptions {
+                new_id: Some("derived".into()),
+                ..Default::default()
+            },
+        )?;
+        let rows: Vec<Value> = fs::read_to_string(&res.path)?
+            .lines()
+            .map(serde_json::from_str)
+            .collect::<std::result::Result<_, _>>()?;
+        let by: std::collections::HashMap<&str, &Value> = rows
+            .iter()
+            .filter_map(|r| Some((r.get("uuid")?.as_str()?, r)))
+            .collect();
+        // `c1` resolves `n1 -> u1` across the intervening `branch` record.
+        assert_eq!(by["c1"]["parentUuid"], "u1");
+        // `b_u1` links to `c1`, keeping `c1` on the resumed walk.
+        assert_eq!(by["b_u1"]["parentUuid"], "c1");
         Ok(())
     }
 
