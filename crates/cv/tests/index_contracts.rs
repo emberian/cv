@@ -342,3 +342,66 @@ fn facet_keys_match_a_failed_command_turn_while_snippets_stay_raw() {
     let (show, _) = w.cv_ok(&["show", "facetsess", "--json"]);
     assert!(!show.contains("error failed"));
 }
+
+/// #tooth A transcript rewritten in place and then grown past its old size reads like an append
+/// by length alone. The index must still retract the replaced text: no ghost hit survives,
+/// whether the rewrite shrank it first or replaced bytes at the same length.
+#[test]
+fn rewritten_then_grown_transcript_retracts_replaced_text_from_search() {
+    let w = World::new("rewrite-grow");
+    let line = |uuid: &str, text: &str| {
+        format!(
+            "{}\n",
+            serde_json::json!({"type": "user", "uuid": uuid, "timestamp": TS, "sessionId": "rwsess",
+                "message": {"role": "user", "content": text}})
+        )
+    };
+    let path = w.transcript("rwsess");
+    let filler = "padding words to make the line long enough ".repeat(40);
+    fs::write(
+        &path,
+        line("r1", &format!("quetzal {filler}")) + &line("r2", "second turn tapir"),
+    )
+    .unwrap();
+    w.cv_ok(&["index"]);
+    let total = |q: &str| {
+        let (out, _) = w.cv_ok(&["search", q, "--json"]);
+        serde_json::from_str::<serde_json::Value>(&out).unwrap()["total"]
+            .as_u64()
+            .unwrap()
+    };
+    assert_eq!(total("quetzal"), 1);
+    // Same length prefix, different first word, then more turns appended.
+    let rewritten = line("r1", &format!("iguanas {filler}")) + &line("r2", "second turn tapir");
+    fs::write(&path, rewritten.clone() + &line("r3", "third turn okapi")).unwrap();
+    let bumped = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+    fs::File::options()
+        .write(true)
+        .open(&path)
+        .and_then(|f| f.set_modified(bumped))
+        .unwrap();
+    w.cv_ok(&["index"]);
+    assert_eq!(total("quetzal"), 0, "the replaced word is retracted");
+    assert_eq!(total("iguanas"), 1);
+    assert_eq!(total("okapi"), 1);
+    assert_eq!(total("tapir"), 1);
+    // Shrink below the old prefix, then grow past it again.
+    fs::write(&path, line("r1", "short")).unwrap();
+    w.cv_ok(&["index"]);
+    fs::write(
+        &path,
+        line("r1", "short") + &line("r9", &format!("anteater {filler} {filler}")),
+    )
+    .unwrap();
+    let bumped = std::time::SystemTime::now() + std::time::Duration::from_secs(10);
+    fs::File::options()
+        .write(true)
+        .open(&path)
+        .and_then(|f| f.set_modified(bumped))
+        .unwrap();
+    w.cv_ok(&["index"]);
+    for gone in ["iguanas", "okapi", "tapir"] {
+        assert_eq!(total(gone), 0, "{gone} lingers as a ghost hit");
+    }
+    assert_eq!(total("anteater"), 1);
+}
