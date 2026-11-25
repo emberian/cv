@@ -7,12 +7,10 @@
 //! local Antigravity stores before refusing duplicate transmission.
 
 use super::{Adapter as _, Antigravity};
-use crate::harness::Parse as _;
 use crate::ir::Role;
 use crate::state::StateStore;
 use anyhow::{bail, ensure, Context, Result};
 use rusqlite::{OptionalExtension as _, TransactionBehavior};
-use serde::Serialize;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
@@ -90,11 +88,11 @@ impl Seed {
         format!("{trimmed}\n\n{}", self.tag)
     }
 
-    pub fn request_digest(&self, target_ls: &str) -> String {
+    /// Request identity digest independent of ephemeral local language-server ports so retrying
+    /// after an Antigravity LS restart on a new loopback port reconciles cleanly.
+    pub fn request_digest(&self) -> String {
         let mut h = blake3::Hasher::new();
-        h.update(b"cv-seed-delivery-v1\0");
-        h.update(target_ls.as_bytes());
-        h.update(b"\0");
+        h.update(b"cv-seed-delivery-v2\0");
         h.update(self.project_id.as_bytes());
         h.update(b"\0");
         h.update(self.model.as_bytes());
@@ -104,24 +102,7 @@ impl Seed {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(tag = "state", rename_all = "snake_case")]
-pub enum Delivery {
-    Created {
-        conversation_id: String,
-        tag: String,
-        reconciled: bool,
-    },
-    Refused {
-        status: u16,
-        tag: String,
-        detail: String,
-    },
-    Uncertain {
-        tag: String,
-        detail: String,
-    },
-}
+pub type Delivery = crate::harness::SeedDelivery;
 
 fn parse_loopback_target(raw_addr: &str) -> Result<(String, Vec<SocketAddr>)> {
     let trimmed = raw_addr.trim();
@@ -174,20 +155,30 @@ pub fn reconcile_local_seed(tag: &str, reserved_at_ms: i64) -> Result<Option<Str
         if !candidate_recent {
             continue;
         }
-        let Ok(session) = agy.parse(&r) else {
-            continue;
-        };
-        if let Some(first_user) = session.messages.iter().find(|m| m.role == Role::User) {
-            let resolver = session.resolver();
-            let mut text_parts = Vec::new();
-            for b in &first_user.content {
-                if let Some(t) = b.text() {
-                    if let Ok(resolved) = t.try_resolve(&resolver) {
-                        text_parts.push(resolved);
+        let resolver = crate::lazy::Resolver::new(Some(r.path.clone()));
+        let mut matched = false;
+        let streamed = agy.try_stream(
+            &r,
+            &crate::stream::Demand::LEAN.with_spans(),
+            &mut crate::stream::TryFnSink::new(|m: crate::ir::Message| {
+                if m.role != Role::User {
+                    return Ok(crate::stream::Flow::Continue);
+                }
+                for b in &m.content {
+                    if let Some(t) = b.text() {
+                        if let Ok(resolved) = t.try_resolve(&resolver) {
+                            if resolved.contains(tag) {
+                                matched = true;
+                                break;
+                            }
+                        }
                     }
                 }
-            }
-            if text_parts.iter().any(|t| t.contains(tag)) {
+                Ok(crate::stream::Flow::Stop)
+            }),
+        );
+        if let Ok(session) = streamed {
+            if matched {
                 return Ok(Some(session.id));
             }
         }
@@ -520,7 +511,7 @@ pub fn deliver_live_seed(
     );
 
     let now_ms = chrono::Utc::now().timestamp_millis();
-    let digest = seed.request_digest(&authority);
+    let digest = seed.request_digest();
     if let ReserveOutcome::Existing(existing) = reserve_delivery(store, &authority, seed, &digest, now_ms, force_retry)?
     {
         return Ok(existing);
@@ -676,5 +667,29 @@ pub fn deliver_live_seed(
                 detail: format!("HTTP reply interrupted ({err})"),
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn seed_request_digest_ignores_ephemeral_ls_port_across_restarts() {
+        // #tooth Restarting the local language server on a new ephemeral loopback port must not
+        // collide on `request_digest` for an uncertain reservation of the same `Seed`.
+        let world = crate::test_world("agy-deliver-port-rotate");
+        let store = StateStore::at_dir(&world.cv_home);
+        let seed = Seed::new("src-1", Some(1), "model-x", "distilled: x", "proj-1", "pack body");
+        let d1 = seed.request_digest();
+
+        // Simulate an interrupted reservation against port 51001, then retry against port 59999.
+        let r1 = reserve_delivery(&store, "127.0.0.1:51001", &seed, &d1, 1_700_000_000_000, false).unwrap();
+        assert!(matches!(r1, ReserveOutcome::Proceed));
+        let r2 = reserve_delivery(&store, "127.0.0.1:59999", &seed, &d1, 1_700_000_001_000, false).unwrap();
+        assert!(
+            matches!(r2, ReserveOutcome::Existing(Delivery::Uncertain { .. })),
+            "new loopback port must settle to Uncertain instead of digest-mismatch error"
+        );
     }
 }

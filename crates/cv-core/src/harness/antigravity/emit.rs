@@ -307,11 +307,11 @@ pub(crate) fn emit_staged(
     };
 
     let db_out = out_dir.join(&rel_db);
-    cold::publish_staged_app_root(stage, out_dir, &spec, claim, || {
-        // Readback verification through the Antigravity adapter before committing `conversation_summaries.db`
-        // (for existing roots) or returning success (for newly created roots).
-        let agy = Antigravity::with_home(out_dir);
-        let sref = SessionRef::new(&new_id, Harness::Antigravity, &db_out);
+    cold::publish_staged_app_root(stage, out_dir, &spec, claim, |root| {
+        // Readback verification through the Antigravity adapter before publishing `stage` (when
+        // `!out_dir.exists()`) or before committing `conversation_summaries.db` (existing roots).
+        let agy = Antigravity::with_home(root);
+        let sref = SessionRef::new(&new_id, Harness::Antigravity, root.join(&rel_db));
         let reparsed = agy
             .parse(&sref)
             .context("re-parsing emitted Antigravity SQLite trajectory")?;
@@ -383,5 +383,46 @@ pub(crate) fn retract(out_dir: &Path, out_existed: bool, out_was_empty: bool, re
                 [&res.new_id],
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_stage_verification_never_publishes_new_app_root() {
+        // #tooth When `!out.exists()`, `publish_staged_app_root` verifies `stage.path()` *before*
+        // `stage.publish(out, claim)` so a verification error never creates `out`.
+        let world = crate::test_world("agy-stage-verify-before-publish");
+        let out = world.base.join("fresh-agy-root");
+        let stage = StagedDir::beside(&out, "agy-verify-test").unwrap();
+        fs::create_dir_all(stage.path().join("conversations")).unwrap();
+        let new_id = crate::prune::new_uuid();
+        let trajectory_id = crate::prune::new_uuid();
+        let spec = SummarySpec {
+            new_id: &new_id,
+            trajectory_id: &trajectory_id,
+            title: "test",
+            step_count: 1,
+            last_user_input_step_index: Some(0),
+            cwd: None,
+            project_id: "",
+            modified: None,
+            last_user_time: None,
+            replace: false,
+        };
+        let mut saw_staged = false;
+        let err = cold::publish_staged_app_root(stage, &out, &spec, Claim::New, |verified_root| {
+            saw_staged = verified_root != out && verified_root.exists() && !out.exists();
+            anyhow::bail!("simulated readback failure")
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("simulated readback failure"));
+        assert!(
+            saw_staged,
+            "verifier must inspect staged root while `out` does not yet exist"
+        );
+        assert!(!out.exists(), "failed verification must leave `out` unpublished");
     }
 }

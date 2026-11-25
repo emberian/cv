@@ -93,16 +93,125 @@ fn edit_of(v: &Value) -> Option<(String, String, bool)> {
     Some((old, new, v.get("replace_all").and_then(Value::as_bool).unwrap_or(false)))
 }
 
-/// The arguments of a single-file write or edit call; anything else is `Payload::None`.
-fn payload(input: &Value, full_write: bool) -> Payload {
-    if full_write {
-        return str_field(input, &["content", "file_text"]).map_or(Payload::None, Payload::Write);
+/// Bounded string extraction from a `JsonView`, stopping immediately if the decoded length
+/// exceeds `MAX_STATE_BYTES` so oversized `Write`/`Edit` inputs are never materialized into `pending`.
+fn bounded_view_string(view: crate::json::JsonView<'_>) -> Result<Option<String>> {
+    let mut out = String::new();
+    let mut over = false;
+    let is_str = crate::projection::string_until(view, |chunk| {
+        if out.len().saturating_add(chunk.len()) > MAX_STATE_BYTES {
+            over = true;
+            return true;
+        }
+        out.push_str(chunk);
+        false
+    })?;
+    if !is_str || over {
+        return Ok(None);
     }
-    if let Some(edits) = input.get("edits").and_then(Value::as_array) {
-        let edits: Option<Vec<_>> = edits.iter().map(edit_of).collect();
-        return edits.map_or(Payload::None, Payload::Edits);
+    Ok(Some(out))
+}
+
+fn bounded_str_field(view: crate::json::JsonView<'_>, keys: &[&str]) -> Result<Option<String>> {
+    if view.is_string()? {
+        return Ok(None);
     }
-    edit_of(input).map_or(Payload::None, |e| Payload::Edits(vec![e]))
+    for key in keys {
+        if let Some(v) = view.get(key)? {
+            if v.is_string()? {
+                return bounded_view_string(v);
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Extract a bounded write/edit `Payload` through `JsonView` before resolving heap `Value`s.
+fn payload_from_json(input: &crate::json::Json, full_write: bool) -> Result<Payload> {
+    input.with_view(|view| {
+        if full_write {
+            return Ok(bounded_str_field(view, &["content", "file_text"])?.map_or(Payload::None, Payload::Write));
+        }
+        if !view.is_string()? {
+            if let Some(old_v) = view.get("old_string")?.or(view.get("old_str")?) {
+                if old_v.is_string()? {
+                    let Some(old) = bounded_view_string(old_v)? else {
+                        return Ok(Payload::None);
+                    };
+                    let Some(new_v) = view.get("new_string")?.or(view.get("new_str")?) else {
+                        return Ok(Payload::None);
+                    };
+                    let Some(new) = bounded_view_string(new_v)? else {
+                        return Ok(Payload::None);
+                    };
+                    let all = match view.get("replace_all")? {
+                        Some(b) => b.resolve()?.as_bool().unwrap_or(false),
+                        None => false,
+                    };
+                    return Ok(Payload::Edits(vec![(old, new, all)]));
+                }
+            }
+            if let Some(edits_v) = view.get("edits")? {
+                let resolved = edits_v.resolve()?;
+                if let Some(arr) = resolved.as_array() {
+                    let mut total = 0usize;
+                    let mut out = Vec::with_capacity(arr.len());
+                    for item in arr {
+                        let Some(e) = edit_of(item) else {
+                            return Ok(Payload::None);
+                        };
+                        total = total.saturating_add(e.0.len()).saturating_add(e.1.len());
+                        if total > MAX_STATE_BYTES {
+                            return Ok(Payload::None);
+                        }
+                        out.push(e);
+                    }
+                    return Ok(Payload::Edits(out));
+                }
+            }
+        }
+        Ok(Payload::None)
+    })
+}
+
+/// Read `abs` strictly when it is a regular non-symlink file inside `repo_root` or `cwd` and
+/// at most `MAX_STATE_BYTES` bytes (never reading special device nodes or paths outside workspace).
+fn read_contained_regular_file(abs: &str, repo_root: Option<&Path>, cwd: Option<&Path>) -> Option<Vec<u8>> {
+    let path = Path::new(abs);
+    if !path.is_absolute() {
+        return None;
+    }
+    let sym = std::fs::symlink_metadata(path).ok()?;
+    if sym.file_type().is_symlink() || !sym.file_type().is_file() || sym.len() > MAX_STATE_BYTES as u64 {
+        return None;
+    }
+    let canon = std::fs::canonicalize(path).ok()?;
+    let contained = [repo_root, cwd]
+        .into_iter()
+        .flatten()
+        .filter_map(|base| std::fs::canonicalize(base).ok())
+        .any(|canon_base| canon.starts_with(&canon_base));
+    if !contained {
+        return None;
+    }
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)
+            .ok()?
+    };
+    #[cfg(not(unix))]
+    let file = std::fs::File::open(path).ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.file_type().is_file() || meta.len() > MAX_STATE_BYTES as u64 {
+        return None;
+    }
+    let mut buf = Vec::with_capacity((meta.len() as usize).min(MAX_STATE_BYTES));
+    file.take(MAX_STATE_BYTES as u64 + 1).read_to_end(&mut buf).ok()?;
+    (buf.len() <= MAX_STATE_BYTES).then_some(buf)
 }
 
 fn lines(s: &str) -> usize {
@@ -193,12 +302,22 @@ impl Blobs {
         let (Some(size), Some(kind), Some(id)) = (fields.next(), fields.next(), fields.next()) else {
             return Err(std::io::ErrorKind::InvalidData.into());
         };
-        let size: usize = size.parse().map_err(|_| std::io::ErrorKind::InvalidData)?;
+        let size: u64 = size.parse().map_err(|_| std::io::ErrorKind::InvalidData)?;
+        // Drain oversized or non-blob payloads in bounded chunks so `cat-file --batch` stays synchronized.
+        if size > MAX_STATE_BYTES as u64 || kind != "blob" {
+            let to_drain = size.checked_add(1).ok_or(std::io::ErrorKind::InvalidData)?;
+            let drained = std::io::copy(&mut (&mut self.stdout).take(to_drain), &mut std::io::sink())?;
+            if drained != to_drain {
+                return Err(std::io::ErrorKind::UnexpectedEof.into());
+            }
+            return Ok(None);
+        }
+        let size = size as usize;
         // The body and its terminating newline follow whatever the type.
         let mut body = vec![0; size + 1];
         self.stdout.read_exact(&mut body)?;
         body.pop();
-        Ok((kind == "blob").then(|| (id.to_string(), body)))
+        Ok(Some((id.to_string(), body)))
     }
 }
 
@@ -341,7 +460,7 @@ pub fn read(adapter: &dyn crate::Adapter, r: &SessionRef) -> Result<Vec<FileTouc
                     let single = ops.len() == 1;
                     for (op, path) in ops {
                         let payload = if single && op != FileOp::Read {
-                            payload(input.resolve()?.as_ref(), op == FileOp::Write)
+                            payload_from_json(input, op == FileOp::Write)?
                         } else {
                             Payload::None
                         };
@@ -472,7 +591,7 @@ pub fn read(adapter: &dyn crate::Adapter, r: &SessionRef) -> Result<Vec<FileTouc
             v
         } else if let Some(content) = &after {
             let on_disk = (!frozen)
-                .then(|| std::fs::read(&abs).ok())
+                .then(|| read_contained_regular_file(&abs, repo.as_ref().map(|r| r.root.as_path()), cwd.as_deref()))
                 .flatten()
                 .filter(|disk| disk == content.as_bytes());
             match on_disk {
@@ -486,10 +605,10 @@ pub fn read(adapter: &dyn crate::Adapter, r: &SessionRef) -> Result<Vec<FileTouc
         };
         out.push(touch);
     }
-    // Disk verification describes the checkout now; only the last touch of a path can claim it.
+    // Disk verification describes the checkout now; only the last non-failed write/edit touch of a path can claim it.
     let mut last: HashMap<&str, usize> = HashMap::new();
     for (i, t) in out.iter().enumerate() {
-        if t.op != FileOp::Read {
+        if t.op != FileOp::Read && t.succeeded != Some(false) {
             last.insert(t.path.as_str(), i);
         }
     }
@@ -554,5 +673,112 @@ mod tests {
         assert_eq!(blobs.get("HEAD:d").unwrap(), None);
         assert_eq!(blobs.get("HEAD:a\nb").unwrap(), None);
         assert_eq!(body(blobs.get("HEAD:d/x.txt").unwrap()), want);
+    }
+
+    #[test]
+    fn disk_containment_oversized_blob_drain_and_failed_trailing_edit_preserve_verified_disk() {
+        // #tooth Oversized git blobs drain without desynchronizing `cat-file --batch`, paths outside
+        // `cwd`/`repo.root` or symlinks or `/dev/zero` are never read, oversized `Write` inputs stop
+        // in `JsonView`, and a trailing failed edit does not strip an earlier `VerifiedDisk`.
+        let world = crate::test_world("files-containment-and-failed-last");
+        let work = world.base.join("repo");
+        let outside = world.base.join("outside.txt");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::write(&outside, "secret").unwrap();
+        std::fs::write(work.join("good.rs"), "fn ok() {}\n").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, work.join("link.txt")).unwrap();
+
+        let run = |args: &[&str]| {
+            assert!(Command::new("git")
+                .arg("-C")
+                .arg(&work)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "T")
+                .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+                .env("GIT_COMMITTER_NAME", "T")
+                .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+                .output()
+                .unwrap()
+                .status
+                .success());
+        };
+        run(&["init", "-q"]);
+        std::fs::write(work.join("huge.bin"), vec![b'x'; MAX_STATE_BYTES + 64]).unwrap();
+        std::fs::write(work.join("small.txt"), "hello\n").unwrap();
+        run(&["add", "huge.bin", "small.txt"]);
+        run(&["-c", "commit.gpgsign=false", "commit", "-qm", "blobs"]);
+        std::fs::remove_file(work.join("huge.bin")).unwrap();
+
+        let mut blobs = Blobs::spawn(&work).unwrap();
+        assert_eq!(blobs.get("HEAD:huge.bin").unwrap(), None);
+        assert_eq!(
+            blobs.get("HEAD:small.txt").unwrap().map(|(_, b)| b),
+            Some(b"hello\n".to_vec())
+        );
+
+        assert_eq!(read_contained_regular_file("/dev/zero", Some(&work), Some(&work)), None);
+        assert_eq!(
+            read_contained_regular_file(outside.to_str().unwrap(), Some(&work), Some(&work)),
+            None
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            read_contained_regular_file(work.join("link.txt").to_str().unwrap(), Some(&work), Some(&work)),
+            None
+        );
+
+        let huge_json: crate::json::Json = serde_json::json!({
+            "file_path": work.join("huge.txt"),
+            "content": "a".repeat(MAX_STATE_BYTES + 16),
+        })
+        .into();
+        assert!(matches!(payload_from_json(&huge_json, true).unwrap(), Payload::None));
+
+        let proj = world.home.join(".claude/projects/-proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let sess_path = proj.join("s1.jsonl");
+        let lines = [
+            serde_json::json!({
+                "type": "user", "sessionId": "s1", "uuid": "u1", "cwd": work,
+                "timestamp": "2026-06-01T10:00:00Z",
+                "message": {"role": "user", "content": "write good.rs"}
+            }),
+            serde_json::json!({
+                "type": "assistant", "sessionId": "s1", "uuid": "a1", "cwd": work,
+                "timestamp": "2026-06-01T10:00:01Z",
+                "message": {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t_ok", "name": "Write",
+                     "input": {"file_path": work.join("good.rs"), "content": "fn ok() {}\n"}},
+                    {"type": "tool_use", "id": "t_out", "name": "Write",
+                     "input": {"file_path": outside, "content": "secret"}},
+                    {"type": "tool_use", "id": "t_fail", "name": "Edit",
+                     "input": {"file_path": work.join("good.rs"), "old_string": "missing", "new_string": "bad"}}
+                ]}
+            }),
+            serde_json::json!({
+                "type": "user", "sessionId": "s1", "uuid": "r1", "cwd": work,
+                "timestamp": "2026-06-01T10:00:02Z",
+                "message": {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t_ok", "content": "ok", "is_error": false},
+                    {"type": "tool_result", "tool_use_id": "t_out", "content": "ok", "is_error": false},
+                    {"type": "tool_result", "tool_use_id": "t_fail", "content": "not found", "is_error": true}
+                ]}
+            }),
+        ];
+        let raw: String = lines.iter().map(|v| format!("{v}\n")).collect();
+        std::fs::write(&sess_path, raw).unwrap();
+        let adapter = crate::harness::claude::Claude::detect();
+        let mut sref = SessionRef::from_path(&sess_path, crate::ir::Harness::Claude);
+        sref.cwd = Some(work.clone());
+        let touches = read(&adapter, &sref).unwrap();
+        assert_eq!(touches.len(), 3);
+        assert!(
+            matches!(touches[0].verification, FileVerification::VerifiedDisk { .. }),
+            "earlier succeeded write must stay VerifiedDisk when later edit failed: {:?}",
+            touches
+        );
+        assert_eq!(touches[1].verification, FileVerification::Reconstructed);
+        assert_eq!(touches[2].succeeded, Some(false));
     }
 }

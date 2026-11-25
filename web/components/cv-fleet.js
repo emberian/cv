@@ -297,6 +297,9 @@ class CvFleet extends HTMLElement {
     } finally {
       this._lanesInflight = false;
       this.render();
+      if (this._laneTarget() && this._laneTarget() !== target && !this._paused && !this._staticMode) {
+        this._pollLanes();
+      }
     }
   }
 

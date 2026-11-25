@@ -18,7 +18,7 @@ store = [
 protocol = "anthropic_messages"
 binary = "opencode"
 verified = "2.2.7"
-argv = ["run", "--standalone", "--session", "${session}", "--model", "anthropic/claude-sonnet-4-5", "--format", "json", "${prompt}"]
+argv = ["run", "--standalone", "--session", "${session}", "--format", "json", "${prompt}"]
 store_env = { XDG_DATA_HOME = "${home}/.local/share", XDG_CONFIG_HOME = "${home}/.config", XDG_STATE_HOME = "${home}/.local/state", XDG_CACHE_HOME = "${home}/.cache" }
 installed_dirs = ["${home}/.local/share/opencode/storage"]
 provider_env = { OPENCODE_CONFIG_CONTENT = "{\"provider\":{\"anthropic\":{\"options\":{\"baseURL\":\"${base_url}/v1\",\"apiKey\":\"${api_key}\"}}}}" }

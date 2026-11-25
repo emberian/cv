@@ -576,10 +576,17 @@ impl SessionPass<'_> {
     fn observe(&mut self, m: &Message) -> anyhow::Result<()> {
         #[cfg(feature = "sqlite")]
         self.observe_whispers(m)?;
-        let turn_key = (m.role == Role::Assistant)
-            .then(|| msg_usage_key(self.harness, m))
-            .flatten();
-        self.trajectory.observe(self.harness, turn_key, m, &self.resolver)?;
+        let inactive_branch = has_extra_bool(m, "inactive_branch");
+        let sidechain = has_extra_bool(m, "isSidechain");
+        let is_subagent_session = self.session_id.as_deref().is_some_and(|id| id.starts_with("agent-"));
+        if inactive_branch || (sidechain && !is_subagent_session) {
+            self.trajectory.skip_message();
+        } else {
+            let turn_key = (m.role == Role::Assistant)
+                .then(|| msg_usage_key(self.harness, m))
+                .flatten();
+            self.trajectory.observe(self.harness, turn_key, m, &self.resolver)?;
+        }
         let rep = &mut *self.rep;
         rep.messages += 1;
         let prompt_tokens = m.usage.as_ref().map(crate::ir::Usage::prompt_tokens).filter(|&t| t > 0);
@@ -595,8 +602,8 @@ impl SessionPass<'_> {
             role: m.role,
             kind: m.kind,
             visible: m.is_model_visible(),
-            inactive_branch: has_extra_bool(m, "inactive_branch"),
-            sidechain: has_extra_bool(m, "isSidechain"),
+            inactive_branch,
+            sidechain,
             prompt_tokens,
             compaction_summary: 0,
             user_text: 0,
@@ -1538,19 +1545,19 @@ mod tests {
             ),
             read("r1", "/r/a.rs"),
             read("r2", "/r/b.rs"),
-            // Four identical searches with a command between them: one spin of five calls.
+            // Two searches broken by a command (`end_spin`), then four consecutive searches before an edit.
             grep("g1"),
             grep("g2"),
             tool("c1", "Bash", json!({"command": "ls"})),
             grep("g3"),
             grep("g4"),
             grep("g5"),
+            grep("g6"),
             tool(
                 "e1",
                 "Edit",
                 json!({"file_path": "/r/a.rs", "old_string": "a", "new_string": "b"}),
             ),
-            grep("g6"),
             grep("g7"),
             grep("g8"),
             Message::of_kind(Role::System, MessageKind::CompactionBoundary, crate::Origin::Harness),
@@ -1620,9 +1627,9 @@ mod tests {
         let [spin] = rep.spin_episodes.as_slice() else {
             panic!("{:?}", rep.spin_episodes)
         };
-        assert_eq!((spin.index, spin.calls, spin.tool.as_str()), (4, 5, "Grep"));
+        assert_eq!((spin.index, spin.calls, spin.tool.as_str()), (7, 4, "Grep"));
         let json = rep.to_json();
-        assert_eq!(json["spin_episodes"][0]["calls"], 5);
+        assert_eq!(json["spin_episodes"][0]["calls"], 4);
         assert_eq!(json["post_compaction_churn"][0]["lossy"], true);
         assert_eq!(json["post_compaction_churn"][0]["windows"][1]["eviction_rereads"], 2);
 
@@ -2099,6 +2106,66 @@ mod tests {
             std::fs::read(&cat_path).unwrap(),
             before_bytes,
             "collect_store_health must never mutate or reset an older catalog.db"
+        );
+    }
+
+    #[test]
+    fn trajectory_fenced_commands_contiguous_match_path_suffixes_and_sidechain_skip() {
+        // #tooth Fenced commands in compaction summaries are scanned; bag-of-words scattered tokens
+        // do NOT witness a command; repo-relative path suffixes and SystemPrompt/InjectedContext
+        // ARE witnessed; and `isSidechain` / `inactive_branch` records are skipped in main sessions.
+        let mut rep = Report::default();
+        let mut pass = rep.session_with_harness(None, Some(crate::Harness::Claude));
+        let mut sys = Message::of_kind(Role::System, MessageKind::SystemPrompt, crate::Origin::Harness);
+        sys.content.push(Block::from_text(
+            "Workspace root: /work/proj/crates/app/src/config.rs".into(),
+        ));
+
+        let mut u1 = Message::of_kind(Role::User, MessageKind::Prompt, crate::Origin::Human);
+        u1.content.push(Block::from_text(
+            "We use git daily, push branches carefully, never force anything on main. Please run cargo check --bins."
+                .into(),
+        ));
+
+        // Embedded sidechain message containing a command that must NOT witness main-branch summaries
+        // or pollute main-branch spin/churn counts.
+        let mut side = Message::of_kind(Role::Assistant, MessageKind::Reply, crate::Origin::Model);
+        side.content
+            .push(Block::from_text("`rm -rf /tmp/sidechain_only`".into()));
+        side.harness_extra_mut(crate::Harness::Claude)
+            .insert("isSidechain".into(), json!(true));
+
+        let bound = Message::of_kind(Role::System, MessageKind::CompactionBoundary, crate::Origin::Harness);
+        let mut summary = Message::of_kind(Role::User, MessageKind::CompactionSummary, crate::Origin::Harness);
+        summary.content.push(Block::from_text(
+            concat!(
+                "Edited crates/app/src/config.rs and ran `cargo check --bins`.\n",
+                "Next steps:\n",
+                "```sh\n",
+                "git push --force main\n",
+                "rm -rf /tmp/sidechain_only\n",
+                "```\n",
+            )
+            .into(),
+        ));
+
+        for m in [sys, u1, side, bound, summary] {
+            assert!(matches!(pass.message(m), Flow::Continue));
+        }
+        pass.finish().unwrap();
+
+        let [contrast] = rep.summary_provenance_contrast.as_slice() else {
+            panic!("{:?}", rep.summary_provenance_contrast);
+        };
+        assert_eq!(contrast.index, 4, "sidechain skip must preserve message index");
+        assert_eq!(
+            contrast.unwitnessed,
+            vec![
+                "git push --force main",
+                "rm -rf /tmp/sidechain_only",
+                "/tmp/sidechain_only"
+            ],
+            "scattered words or sidechain text must not witness fenced commands or paths: {contrast:?}"
         );
     }
 }

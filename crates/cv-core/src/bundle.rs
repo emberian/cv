@@ -1036,7 +1036,7 @@ mod tests {
         // Pseudo-random 3 MiB file spans >1 2 MiB seekable frame; `Bundle::open` must not decode it!
         let mut big = vec![0u8; 3 * 1024 * 1024];
         let mut state = 0x1234_5678_9abc_def0u64;
-        for chunk in big.chunks_exact_mut(8) {
+        for chunk in big.as_chunks_mut::<8>().0 {
             state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
             chunk.copy_from_slice(&state.to_le_bytes());
         }

@@ -451,11 +451,12 @@ pub(crate) fn holds_fields(h: Harness) -> &'static [Field] {
 
 /// The fields whose classification is a decision about every target, not a fact about one store.
 /// `None` defers to [`holds_fields`].
-fn policy(field: Field) -> Option<bool> {
+fn policy(target: Harness, field: Field) -> Option<bool> {
     match field {
         // The effective per-message model: a target that records the model once per session still
-        // carries it (`Features::note`), so a drop is always one the emitter could have avoided.
-        Field::Model => Some(true),
+        // carries it (`Features::note`), so a drop is always one the emitter could have avoided —
+        // unless the target's store holds no session model either (Antigravity's one-step seed).
+        Field::Model => Some(holds_fields(target).contains(&Field::SessionModel)),
         // Grok resumes a session against `summary.json`'s `current_model_id`, so a foreign id
         // (`claude-fable-5-1`, `gpt-5.5`) would make it replay the history against a backend that
         // cannot serve it; [`grok_model_id`] pins those to `grok-build` on purpose. The verifier
@@ -471,7 +472,7 @@ fn policy(field: Field) -> Option<bool> {
 
 /// Whether `t`'s native format can carry `field`: [`policy`], else its [`holds_fields`] row.
 pub(super) fn target_holds(t: Harness, field: Field) -> bool {
-    policy(field).unwrap_or_else(|| holds_fields(t).contains(&field))
+    policy(t, field).unwrap_or_else(|| holds_fields(t).contains(&field))
 }
 
 /// Whether `target`'s store keeps a tool result **inside its originating call's record** rather
@@ -1324,5 +1325,34 @@ mod principal_tests {
                 .unwrap()
                 .expected
         );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn one_turn_strict_port_to_antigravity_treats_model_loss_as_expected() {
+        // #tooth A 1-turn user prompt carrying a session/message model passes `emit_verified`
+        // (`port --strict --harness antigravity`) because Antigravity's one-step seed holds no model.
+        let world = crate::test_world("agy-strict-model-1turn");
+        let mut s = Session::new("one-turn-src", Harness::Claude);
+        s.title = Some("One turn".into());
+        s.cwd = Some(world.base.join("proj"));
+        s.model = Some("claude-sonnet-4-6".into());
+        let mut m = crate::Message::of_kind(Role::User, MessageKind::Prompt, crate::ir::Origin::Human);
+        m.model = Some("claude-sonnet-4-6".into());
+        m.content.push(Block::from_text("Ship the feature.".into()));
+        s.messages.push(m);
+
+        let out_dir = world.base.join("agy-out");
+        let res = crate::emit::emit_verified(
+            &s,
+            Harness::Antigravity,
+            &out_dir,
+            &EmitOptions {
+                strict: true,
+                ..Default::default()
+            },
+        )
+        .expect("1-turn session with model must pass strict port to antigravity");
+        assert!(res.0.path.is_file());
     }
 }

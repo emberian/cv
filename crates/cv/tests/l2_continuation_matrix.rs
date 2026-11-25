@@ -629,9 +629,14 @@ fn run_bounded(mut cmd: std::process::Command, timeout: Duration) -> (Option<i32
         }
         if std::time::Instant::now() >= deadline {
             // Only the process group this test started.
-            let _ = std::process::Command::new("kill")
-                .args(["-KILL", &format!("-{pid}")])
-                .status();
+            if let Ok(pgid) = libc::pid_t::try_from(pid) {
+                if pgid > 0 {
+                    // SAFETY: `cmd.process_group(0)` placed `child` into its own process group `pgid`.
+                    unsafe {
+                        libc::kill(-pgid, libc::SIGKILL);
+                    }
+                }
+            }
             let _ = child.wait();
             break None;
         }

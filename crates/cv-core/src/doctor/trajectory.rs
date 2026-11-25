@@ -32,6 +32,8 @@ pub const SPIN_MIN_CALLS: usize = 4;
 const UNWITNESSED_SHOWN: usize = 12;
 /// Witness vocabulary cap; past it, further tokens are not recorded (biasing toward flagging).
 const WITNESS_CAP: usize = 500_000;
+/// Bounded normalized-whitespace corpus for contiguous command substring/n-gram matching.
+const WITNESS_CORPUS_CAP: usize = 4 * 1024 * 1024;
 
 /// What followed one compaction seam within its first `k` turns. Records re-emitted under an
 /// already-counted message id or tool call id count once.
@@ -159,6 +161,7 @@ pub(super) struct Trajectory {
     seam_pending_summary: bool,
     witness_tokens: HashSet<String>,
     witness_spans: HashSet<String>,
+    witness_corpus: String,
     spin: Option<(String, String, usize, usize)>,
     /// Instruction files seen, by path, in first-load order.
     instructions: Vec<InstructionBloat>,
@@ -224,8 +227,72 @@ fn is_url(t: &str) -> bool {
     t.starts_with("http://") || t.starts_with("https://")
 }
 
-/// URL, inline-command and path candidates in `text`, deduplicated in first-seen order.
-/// `(token, is_command)`: a multi-word inline code span is a command.
+fn norm_ws(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Extract non-comment lines inside CommonMark fenced code blocks (` ``` ` / `~~~`).
+fn fenced_code_lines(text: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut open: Option<(u8, usize)> = None;
+    for raw in text.lines() {
+        let trimmed = raw.trim_start_matches([' ', '\t', '>']);
+        let fence_byte = trimmed.as_bytes().first().copied();
+        if let Some(ch @ (b'`' | b'~')) = fence_byte {
+            let run = trimmed.bytes().take_while(|&b| b == ch).count();
+            if run >= 3 {
+                let rest = &trimmed[run..];
+                if let Some((open_ch, open_len)) = open {
+                    if ch == open_ch && run >= open_len && rest.trim().is_empty() {
+                        open = None;
+                        continue;
+                    }
+                } else if ch != b'`' || !rest.contains('`') {
+                    open = Some((ch, run));
+                    continue;
+                }
+            }
+        }
+        if open.is_some() {
+            let line = raw.trim().trim_start_matches("$ ").trim();
+            if line.len() >= 2 && line.len() <= 200 && !line.starts_with('#') && !line.starts_with("//") {
+                out.push(line);
+            }
+        }
+    }
+    out
+}
+
+fn is_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
+}
+
+/// True when `needle` (already whitespace-normalized) appears as a contiguous phrase in `haystack`
+/// without splitting an identifier/flag token at either end.
+fn contains_contiguous_phrase(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return false;
+    }
+    let hb = haystack.as_bytes();
+    let nb = needle.as_bytes();
+    let check_left = is_word_byte(nb[0]);
+    let check_right = is_word_byte(nb[nb.len() - 1]);
+    let mut from = 0usize;
+    while let Some(rel) = haystack[from..].find(needle) {
+        let pos = from + rel;
+        let end = pos + nb.len();
+        let left_ok = !check_left || pos == 0 || !is_word_byte(hb[pos - 1]);
+        let right_ok = !check_right || end == hb.len() || !is_word_byte(hb[end]);
+        if left_ok && right_ok {
+            return true;
+        }
+        from = pos + haystack[pos..].chars().next().map_or(1, char::len_utf8);
+    }
+    false
+}
+
+/// URL, inline/fenced-command and path candidates in `text`, deduplicated in first-seen order.
+/// `(token, is_command)`: a multi-word inline code span or fenced code line is a command.
 fn candidates(text: &str) -> Vec<(String, bool)> {
     let mut out: Vec<(String, bool)> = Vec::new();
     let mut push = |t: &str, cmd: bool| {
@@ -239,6 +306,11 @@ fn candidates(text: &str) -> Vec<(String, bool)> {
             push(span, true);
         }
     }
+    for line in fenced_code_lines(text) {
+        if line.split_whitespace().nth(1).is_some() {
+            push(line, true);
+        }
+    }
     for t in words(text) {
         if is_url(t) || (PATHLIKE.is_match(t) && t.chars().any(char::is_alphabetic)) {
             push(t, false);
@@ -248,17 +320,68 @@ fn candidates(text: &str) -> Vec<(String, bool)> {
 }
 
 impl Trajectory {
+    pub(super) fn skip_message(&mut self) {
+        self.idx += 1;
+    }
+
+    fn insert_path_and_suffixes(&mut self, token: &str) {
+        if self.witness_tokens.len() >= WITNESS_CAP {
+            return;
+        }
+        if !self.witness_tokens.contains(token) {
+            self.witness_tokens.insert(token.to_string());
+        }
+        let trimmed = token
+            .trim_start_matches("./")
+            .trim_start_matches("~/")
+            .trim_start_matches('/')
+            .trim_end_matches('/');
+        if !trimmed.is_empty() && trimmed != token && self.witness_tokens.len() < WITNESS_CAP {
+            self.witness_tokens.insert(trimmed.to_string());
+        }
+        let mut rest = trimmed;
+        while let Some((_, suffix)) = rest.split_once('/') {
+            if !suffix.is_empty() && self.witness_tokens.len() < WITNESS_CAP {
+                self.witness_tokens.insert(suffix.to_string());
+            }
+            rest = suffix;
+        }
+    }
+
+    fn append_corpus_line(&mut self, line: &str) {
+        let norm = norm_ws(line);
+        if norm.is_empty() || self.witness_corpus.len().saturating_add(norm.len() + 1) > WITNESS_CORPUS_CAP {
+            return;
+        }
+        if !self.witness_corpus.is_empty() {
+            self.witness_corpus.push('\n');
+        }
+        self.witness_corpus.push_str(&norm);
+    }
+
     fn witness(&mut self, text: &str) {
         for caps in INLINE_CODE.captures_iter(text) {
-            if self.witness_spans.len() < WITNESS_CAP {
-                self.witness_spans.insert(caps[1].trim().to_string());
+            let norm = norm_ws(caps[1].trim());
+            if !norm.is_empty() && self.witness_spans.len() < WITNESS_CAP {
+                self.witness_spans.insert(norm);
             }
+        }
+        for line in fenced_code_lines(text) {
+            let norm = norm_ws(line);
+            if !norm.is_empty() && self.witness_spans.len() < WITNESS_CAP {
+                self.witness_spans.insert(norm);
+            }
+        }
+        for raw_line in text.lines() {
+            self.append_corpus_line(raw_line);
         }
         for t in words(text) {
             if self.witness_tokens.len() >= WITNESS_CAP {
                 break;
             }
-            if !self.witness_tokens.contains(t) {
+            if t.contains('/') {
+                self.insert_path_and_suffixes(t);
+            } else if !self.witness_tokens.contains(t) {
                 self.witness_tokens.insert(t.to_string());
             }
         }
@@ -266,9 +389,13 @@ impl Trajectory {
 
     fn witnessed(&self, token: &str, command: bool) -> bool {
         if command {
-            self.witness_spans.contains(token) || words(token).all(|w| self.witness_tokens.contains(w))
+            let norm = norm_ws(token);
+            !norm.is_empty()
+                && (self.witness_spans.contains(&norm) || contains_contiguous_phrase(&self.witness_corpus, &norm))
         } else {
             self.witness_tokens.contains(token)
+                || self.witness_tokens.contains(token.trim_end_matches('/'))
+                || self.witness_tokens.contains(token.trim_start_matches("./"))
         }
     }
 
@@ -394,6 +521,7 @@ impl Trajectory {
                 if let Block::Text { text, .. } = b {
                     let text = text.try_resolve(resolver)?;
                     self.note_instructions(&text, index);
+                    self.witness(&text);
                 }
             }
         }
@@ -500,7 +628,12 @@ impl Trajectory {
                                         said.push(path.into_owned());
                                         kind = Some("edit");
                                     }
-                                    ToolOp::Command { cmd: Some(cmd), .. } => said.push(cmd.into_owned()),
+                                    ToolOp::Command { cmd, .. } => {
+                                        if let Some(cmd) = cmd {
+                                            said.push(cmd.into_owned());
+                                        }
+                                        kind = Some("command");
+                                    }
                                     _ => {}
                                 },
                             )
@@ -508,8 +641,9 @@ impl Trajectory {
                         // The assistant's own call arguments are its words, not tool output.
                         for s in &said {
                             self.witness(s);
-                            if self.witness_spans.len() < WITNESS_CAP {
-                                self.witness_spans.insert(s.trim().to_string());
+                            let norm = norm_ws(s.trim());
+                            if !norm.is_empty() && self.witness_spans.len() < WITNESS_CAP {
+                                self.witness_spans.insert(norm);
                             }
                         }
                         for (seam, _) in self.open.iter_mut().zip(&counting).filter(|(_, c)| **c) {
@@ -525,7 +659,7 @@ impl Trajectory {
                             turn.extend(reads);
                         }
                         match kind {
-                            Some("edit") => self.end_spin(),
+                            Some("edit" | "command") => self.end_spin(),
                             Some(_) => {
                                 let (canonical, _) = input.canonical_prefix(512)?;
                                 self.note_spin(name, canonical, index);

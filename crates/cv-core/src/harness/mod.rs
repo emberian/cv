@@ -47,6 +47,26 @@ pub mod wire;
 #[cfg(feature = "sqlite")]
 pub mod zed;
 
+/// Outcome of delivering a one-prompt seed conversation to a running harness server.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum SeedDelivery {
+    Created {
+        conversation_id: String,
+        tag: String,
+        reconciled: bool,
+    },
+    Refused {
+        status: u16,
+        tag: String,
+        detail: String,
+    },
+    Uncertain {
+        tag: String,
+        detail: String,
+    },
+}
+
 /// Parse an RFC3339 timestamp into UTC — the timestamp shape nearly every harness writes. Shared
 /// here so adapters don't each carry a copy.
 pub(crate) fn parse_ts(s: &str) -> Option<DateTime<Utc>> {
@@ -854,6 +874,43 @@ pub trait Adapter: Send + Sync {
     /// instead of as an IR projection. Default: none; sessions are projected.
     fn native_custody(&self) -> Option<NativeCustody> {
         None
+    }
+
+    /// Whether the environment configures live seed delivery for this harness, so
+    /// `cv distill --session=<harness>` defaults to `--delivery=live` when `--out` is omitted.
+    fn live_seed_configured(&self) -> bool {
+        false
+    }
+
+    /// Emit `pack` as a one-prompt cold seed conversation for this harness into `out` (or its
+    /// default store root when `None`).
+    fn emit_cold_seed(
+        &self,
+        _source: &Session,
+        _pack: &str,
+        _title: &str,
+        _cwd: Option<PathBuf>,
+        _out: Option<PathBuf>,
+        _opts: &crate::emit::EmitOptions,
+    ) -> Result<EmitResult> {
+        anyhow::bail!("{} does not support cold seed emission", self.harness())
+    }
+
+    /// Measure `pack` against `max_bytes` / `max_estimated_tokens` and deliver it as a live seed
+    /// conversation to this harness's running local server, returning `(delivery, resume_hint, measured)`.
+    #[allow(clippy::too_many_arguments)]
+    fn deliver_live_seed_pack(
+        &self,
+        _source: &Session,
+        _boundary_ordinal: Option<usize>,
+        _title: &str,
+        _pack: &str,
+        _cwd: Option<&Path>,
+        _force: bool,
+        _max_bytes: Option<usize>,
+        _max_estimated_tokens: Option<u64>,
+    ) -> Result<(SeedDelivery, Option<String>, crate::distill::Measured)> {
+        anyhow::bail!("{} does not support live seed delivery", self.harness())
     }
 
     /// A fresh session id in this harness's own spelling. Default: a UUIDv7.

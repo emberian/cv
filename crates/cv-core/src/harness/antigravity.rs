@@ -237,6 +237,88 @@ impl Adapter for Antigravity {
         cfg!(feature = "sqlite")
     }
 
+    fn live_seed_configured(&self) -> bool {
+        #[cfg(feature = "sqlite")]
+        {
+            seed::live_configured()
+        }
+        #[cfg(not(feature = "sqlite"))]
+        {
+            false
+        }
+    }
+
+    fn emit_cold_seed(
+        &self,
+        source: &Session,
+        pack: &str,
+        title: &str,
+        cwd: Option<PathBuf>,
+        out: Option<PathBuf>,
+        opts: &crate::emit::EmitOptions,
+    ) -> Result<super::EmitResult> {
+        #[cfg(feature = "sqlite")]
+        {
+            let seed_ir = seed::cold_session(source, pack, title, cwd);
+            let out_dir = match out {
+                Some(dir) => dir,
+                None => seed::default_root()?,
+            };
+            emit(&seed_ir, &out_dir, opts)
+        }
+        #[cfg(not(feature = "sqlite"))]
+        {
+            let _ = (source, pack, title, cwd, out, opts);
+            anyhow::bail!("Antigravity cold seed emission requires the `sqlite` feature")
+        }
+    }
+
+    fn deliver_live_seed_pack(
+        &self,
+        source: &Session,
+        boundary_ordinal: Option<usize>,
+        title: &str,
+        pack: &str,
+        cwd: Option<&Path>,
+        force: bool,
+        max_bytes: Option<usize>,
+        max_estimated_tokens: Option<u64>,
+    ) -> Result<(super::SeedDelivery, Option<String>, crate::distill::Measured)> {
+        #[cfg(feature = "sqlite")]
+        {
+            let request = seed::live_seed(source, boundary_ordinal, title, pack);
+            let framed = request.framed_body();
+            let measured = crate::distill::Measured {
+                what: "live seed",
+                bytes: framed.len(),
+                estimated_tokens: crate::ir::est_tokens_bytes(framed.len(), crate::ir::TokenKind::ToolInput),
+            };
+            measured.check(max_bytes, max_estimated_tokens)?;
+            let outcome = seed::deliver_from_env(&request, force)?;
+            let resume = match &outcome {
+                super::SeedDelivery::Created { conversation_id, .. } => {
+                    Some(super::resume_in(cwd, format!("agy --conversation {conversation_id}")))
+                }
+                _ => None,
+            };
+            Ok((outcome, resume, measured))
+        }
+        #[cfg(not(feature = "sqlite"))]
+        {
+            let _ = (
+                source,
+                boundary_ordinal,
+                title,
+                pack,
+                cwd,
+                force,
+                max_bytes,
+                max_estimated_tokens,
+            );
+            anyhow::bail!("Antigravity live seed delivery requires the `sqlite` feature")
+        }
+    }
+
     fn roots(&self) -> Vec<PathBuf> {
         self.roots.clone()
     }

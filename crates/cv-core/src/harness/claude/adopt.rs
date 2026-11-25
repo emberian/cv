@@ -618,36 +618,54 @@ fn short_unique_session_id(full: &str, sibling_stems: &[String]) -> String {
     full.to_owned()
 }
 
-/// A parent is safe to offer when it compacted or its last turn settled (assistant spoke last and
-/// no tool call is open).
-fn parent_turn_settled_or_compacted(session: &crate::ir::Session) -> bool {
+/// Stream a sibling parent candidate at `Demand::LEAN.with_spans()` (never full `adapter.parse`)
+/// and return `(cwd, safe_to_offer)`. A parent is safe to offer only when `open_tools` is empty
+/// and its *last* non-carrier conversational/compaction record is an assistant reply or a
+/// compaction boundary/summary (never `.any(CompactionBoundary)` over an earlier compaction!).
+fn inspect_sibling_parent(adapter: &dyn crate::harness::Adapter, sref: &SessionRef) -> Result<(Option<PathBuf>, bool)> {
     use crate::ir::{Block, MessageKind, Role};
-    if session
-        .messages
-        .iter()
-        .any(|m| matches!(m.kind, MessageKind::CompactionBoundary | MessageKind::CompactionSummary))
-    {
-        return true;
+    use crate::stream::{Demand, Flow, TryFnSink};
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum TailState {
+        Compacted,
+        Assistant,
+        Unsettled,
     }
-    let mut open_tools = std::collections::HashSet::new();
-    let mut last_conversational: Option<Role> = None;
-    for m in &session.messages {
-        for b in &m.content {
-            match b {
-                Block::ToolUse { id, .. } => {
-                    open_tools.insert(id.as_str());
-                }
-                Block::ToolResult { tool_use_id, .. } => {
-                    open_tools.remove(tool_use_id.as_str());
-                }
-                _ => {}
+    let mut open_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut tail_state: Option<TailState> = None;
+    let session = adapter.try_stream(
+        sref,
+        &Demand::LEAN.with_spans(),
+        &mut TryFnSink::new(|m: crate::ir::Message| {
+            if m.kind == MessageKind::Carrier {
+                return Ok(Flow::Continue);
             }
-        }
-        if matches!(m.role, Role::User | Role::Assistant) && m.kind != MessageKind::Carrier {
-            last_conversational = Some(m.role);
-        }
-    }
-    open_tools.is_empty() && last_conversational == Some(Role::Assistant)
+            if matches!(m.kind, MessageKind::CompactionBoundary | MessageKind::CompactionSummary) {
+                open_tools.clear();
+                tail_state = Some(TailState::Compacted);
+                return Ok(Flow::Continue);
+            }
+            for b in &m.content {
+                match b {
+                    Block::ToolUse { id, .. } if !id.is_empty() => {
+                        open_tools.insert(id.clone());
+                    }
+                    Block::ToolResult { tool_use_id, .. } if !tool_use_id.is_empty() => {
+                        open_tools.remove(tool_use_id);
+                    }
+                    _ => {}
+                }
+            }
+            if m.role == Role::Assistant {
+                tail_state = Some(TailState::Assistant);
+            } else if matches!(m.role, Role::User | Role::Tool) && m.is_model_visible() {
+                tail_state = Some(TailState::Unsettled);
+            }
+            Ok(Flow::Continue)
+        }),
+    )?;
+    let settled = open_tools.is_empty() && matches!(tail_state, Some(TailState::Compacted | TailState::Assistant));
+    Ok((session.cwd, settled))
 }
 
 /// [`crate::harness::Adapter::pending_adoption`] for Claude Code: the most recent sibling
@@ -710,13 +728,13 @@ pub(crate) fn pending_adoption(
 
     for (_, old_id, old_path) in candidates {
         let sref = SessionRef::new(&old_id, adapter.harness(), &old_path);
-        let Ok(parsed) = adapter.parse(&sref) else {
+        let Ok((old_cwd, settled)) = inspect_sibling_parent(adapter, &sref) else {
             continue;
         };
-        let Some(old_cwd) = parsed.cwd.as_deref() else {
+        let Some(old_cwd) = old_cwd.as_deref() else {
             continue;
         };
-        if normalize_dir(old_cwd) != want_cwd || !parent_turn_settled_or_compacted(&parsed) {
+        if normalize_dir(old_cwd) != want_cwd || !settled {
             continue;
         }
         let Ok(dry) = carry_agents(
@@ -1172,5 +1190,56 @@ mod tests {
         assert!(rows[0]["parentUuid"].is_null(), "root parentUuid is null");
         assert!(rows.iter().all(|r| r["sessionId"] == S3));
         assert_eq!(std::fs::read_to_string(p.dest_meta.unwrap()).unwrap(), spawn_meta);
+    }
+
+    #[test]
+    fn pending_adoption_rejects_sibling_with_earlier_compaction_but_unsettled_tail() {
+        // #tooth An earlier compaction boundary must NOT make a currently mid-turn sibling look settled.
+        const COMPACTED_MID_TURN: &str = "33333333-3333-4333-8333-000000000001";
+        const FRESH_LIVE: &str = "33333333-3333-4333-8333-000000000002";
+        let w = crate::test_world("adopt-compacted-unsettled");
+        let work_cwd = w.base.join("workspace");
+        std::fs::create_dir_all(&work_cwd).unwrap();
+        let proj = w.home.join(".claude/projects/-proj");
+        std::fs::create_dir_all(proj.join(COMPACTED_MID_TURN).join("subagents")).unwrap();
+        std::fs::write(
+            proj.join(COMPACTED_MID_TURN)
+                .join("subagents")
+                .join(format!("agent-{AGENT}.jsonl")),
+            format!("{{\"parentUuid\":null,\"isSidechain\":true,\"agentId\":\"{AGENT}\",\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"brief\"}},\"uuid\":\"u1\",\"sessionId\":\"{COMPACTED_MID_TURN}\"}}\n"),
+        )
+        .unwrap();
+        let live_path = proj.join(format!("{FRESH_LIVE}.jsonl"));
+        std::fs::write(
+            &live_path,
+            format!("{{\"type\":\"user\",\"sessionId\":\"{FRESH_LIVE}\",\"cwd\":{},\"uuid\":\"l1\",\"message\":{{\"role\":\"user\",\"content\":\"new\"}}}}\n", serde_json::json!(work_cwd)),
+        )
+        .unwrap();
+
+        // Sibling compacted earlier, then continued with an unanswered tool call -> NOT settled!
+        let mid_turn_lines = [
+            serde_json::json!({"type":"system","subtype":"compact_boundary","sessionId":COMPACTED_MID_TURN,"cwd":work_cwd,"uuid":"b1","timestamp":"2026-10-01T00:00:01Z"}),
+            serde_json::json!({"type":"user","isCompactSummary":true,"sessionId":COMPACTED_MID_TURN,"cwd":work_cwd,"uuid":"s1","parentUuid":"b1","message":{"role":"user","content":"summary"}}),
+            serde_json::json!({"type":"assistant","sessionId":COMPACTED_MID_TURN,"cwd":work_cwd,"uuid":"a1","parentUuid":"s1","message":{"role":"assistant","content":[{"type":"tool_use","id":"tu_open","name":"Bash","input":{"command":"sleep 10"}}]}}),
+        ];
+        let sib_path = proj.join(format!("{COMPACTED_MID_TURN}.jsonl"));
+        let raw: String = mid_turn_lines.iter().map(|v| format!("{v}\n")).collect();
+        std::fs::write(&sib_path, raw).unwrap();
+
+        let adapter = super::super::Claude::detect();
+        assert!(
+            pending_adoption(&adapter, FRESH_LIVE, &live_path, &work_cwd)
+                .unwrap()
+                .is_none(),
+            "mid-turn sibling after earlier compaction must NOT be offered"
+        );
+
+        // Sibling ending right at the compaction summary IS safe to offer.
+        let settled_raw = format!("{}\n{}\n", mid_turn_lines[0], mid_turn_lines[1]);
+        std::fs::write(&sib_path, settled_raw).unwrap();
+        let offered = pending_adoption(&adapter, FRESH_LIVE, &live_path, &work_cwd)
+            .unwrap()
+            .expect("compaction-ended sibling should be offered");
+        assert_eq!(offered.count, 1);
     }
 }

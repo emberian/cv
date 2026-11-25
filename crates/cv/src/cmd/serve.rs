@@ -409,10 +409,7 @@ fn handle(request: &mut Request<'_>, ctx: &Ctx) {
         && !is_task_post
         && auth.reader.is_some()
         && authorization.is_none()
-        && raw_origin.as_deref().is_none_or(|o| {
-            o.split_once("://")
-                .is_some_and(|(_, authority)| Some(authority) == raw_host.as_deref())
-        })
+        && (raw_origin.is_none() || origin.is_some())
         && header_value(request, "Cookie").is_some_and(|cookies| {
             cookies.split(';').any(|pair| {
                 pair.trim()
@@ -441,7 +438,6 @@ fn handle(request: &mut Request<'_>, ctx: &Ctx) {
         } else {
             let mut response = Response::bytes(200, br#"{"ok":true}"#.to_vec());
             cors_headers(&mut response, origin.as_deref());
-            response.add_header("Access-Control-Allow-Credentials", "true");
             response.add_header("Content-Type", "application/json");
             response.add_header("Cache-Control", "no-store");
             response.add_header(
@@ -1767,6 +1763,7 @@ fn cors_headers(response: &mut Response<'_>, origin: Option<&str>) {
     response.add_header("Vary", "Origin");
     if let Some(o) = origin {
         response.add_header("Access-Control-Allow-Origin", o);
+        response.add_header("Access-Control-Allow-Credentials", "true");
         response.add_header("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS");
         response.add_header("Access-Control-Allow-Headers", "Authorization, Content-Type");
         response.add_header("Access-Control-Expose-Headers", EXPOSED_HEADERS);
@@ -2129,46 +2126,62 @@ fn serve_stream(request: &mut Request<'_>, q: &Query, origin: Option<&str>, hub:
     let live = q.flag("follow")
         || last_event_id.is_some()
         || header_value(request, "Accept").is_some_and(|a| a.to_ascii_lowercase().contains("text/event-stream"));
-    let cur = hub.refresh();
     let follow = StreamFollow::parse(q);
-    let change = |offset, kinds: &[&str]| {
-        let id = hub.cursor_id(offset);
-        Event::default()
-            .id(&id)
-            .event("change")
-            .data(change_data(&id, kinds, &follow))
-    };
-    let (first, emitted, done) = match hub.resume_point(after.as_deref(), cur) {
-        StreamResume::Fresh => (Some(change(cur, &["ready"])), 0, !live || max_events == Some(0)),
-        StreamResume::Foreign => (
-            Some(change(cur, &["reset"])),
-            1,
-            !live || max_events.is_some_and(|n| n <= 1),
-        ),
-        StreamResume::At(prev) if cur > prev => (
-            Some(change(cur, &hub.changes_after(prev).1)),
-            1,
-            !live || max_events.is_some_and(|n| n <= 1),
-        ),
-        StreamResume::At(_) if !live => (
-            Some(Event::default().comment(format!("cursor {}", hub.cursor_id(cur)))),
-            0,
-            true,
-        ),
-        StreamResume::At(_) => (None, 0, false),
-    };
     let hub = hub.clone();
     let env = cv_core::env::Env::scoped();
     let started = std::time::Instant::now();
     let stream = futures_util::stream::unfold(
-        (first, cur, emitted, done, started),
-        move |(first, mut seen, mut emitted, mut done, mut last_write)| {
+        (true, 0u64, 0usize, false, started),
+        move |(init, mut seen, mut emitted, mut done, mut last_write)| {
             let hub = hub.clone();
             let env = env.clone();
             let follow = follow.clone();
+            let after = after.clone();
             async move {
-                if let Some(first) = first {
-                    return Some((Ok::<_, std::io::Error>(first), (None, seen, emitted, done, last_write)));
+                if init {
+                    let init_hub = hub.clone();
+                    let init_env = env.clone();
+                    let init_follow = follow.clone();
+                    let (first, cur, init_emitted, init_done) = tokio::task::spawn_blocking(move || {
+                        let _env = init_env.map(cv_core::env::Env::reenter);
+                        let cur = init_hub.refresh();
+                        let change = |offset, kinds: &[&str]| {
+                            let id = init_hub.cursor_id(offset);
+                            Event::default()
+                                .id(&id)
+                                .event("change")
+                                .data(change_data(&id, kinds, &init_follow))
+                        };
+                        let (first, init_emitted, init_done) = match init_hub.resume_point(after.as_deref(), cur) {
+                            StreamResume::Fresh => (Some(change(cur, &["ready"])), 0, !live || max_events == Some(0)),
+                            StreamResume::Foreign => (
+                                Some(change(cur, &["reset"])),
+                                1,
+                                !live || max_events.is_some_and(|n| n <= 1),
+                            ),
+                            StreamResume::At(prev) if cur > prev => (
+                                Some(change(cur, &init_hub.changes_after(prev).1)),
+                                1,
+                                !live || max_events.is_some_and(|n| n <= 1),
+                            ),
+                            StreamResume::At(_) if !live => (
+                                Some(Event::default().comment(format!("cursor {}", init_hub.cursor_id(cur)))),
+                                0,
+                                true,
+                            ),
+                            StreamResume::At(_) => (None, 0, false),
+                        };
+                        (first, cur, init_emitted, init_done)
+                    })
+                    .await
+                    .ok()?;
+                    seen = cur;
+                    emitted = init_emitted;
+                    done = init_done;
+                    if let Some(first) = first {
+                        last_write = std::time::Instant::now();
+                        return Some((Ok::<_, std::io::Error>(first), (false, seen, emitted, done, last_write)));
+                    }
                 }
                 loop {
                     if done {
@@ -2219,7 +2232,7 @@ fn serve_stream(request: &mut Request<'_>, q: &Query, origin: Option<&str>, hub:
                     };
                     if let Some(event) = event {
                         last_write = std::time::Instant::now();
-                        return Some((Ok(event), (None, seen, emitted, done, last_write)));
+                        return Some((Ok(event), (false, seen, emitted, done, last_write)));
                     }
                 }
             }

@@ -40,6 +40,7 @@ pub(crate) enum Target {
     /// `seed` is set when the `--session` harness takes the pack as a one-prompt seed conversation
     /// ([`cv_core::harness::Adapter::accepts_seed`]), and says how it is delivered.
     Session {
+        harness: Harness,
         seed: Option<DeliveryMode>,
         cwd: Option<PathBuf>,
         out: Option<PathBuf>,
@@ -100,10 +101,9 @@ pub(crate) fn target_for(
             Ok(Target::AgentOf { root, model })
         }
         (Some((harness, seeds)), None) => {
+            let live_ready = seeds && cv_core::harness::rootless(harness).is_some_and(|a| a.live_seed_configured());
             let seed = match (seeds, delivery.as_deref()) {
-                (true, None) if out.is_none() && cv_core::harness::antigravity::seed::live_configured() => {
-                    Some(DeliveryMode::Live)
-                }
+                (true, None) if out.is_none() && live_ready => Some(DeliveryMode::Live),
                 (true, None | Some("cold")) => Some(DeliveryMode::Cold),
                 (true, Some("live")) => {
                     if out.is_some() {
@@ -117,7 +117,12 @@ pub(crate) fn target_for(
                 }
                 (_, Some(other)) => return usage(format!("unknown --delivery {other:?} (use cold or live)")),
             };
-            Ok(Target::Session { seed, cwd, out })
+            Ok(Target::Session {
+                harness,
+                seed,
+                cwd,
+                out,
+            })
         }
         (None, None) => {
             if cwd.is_some() || out.is_some() || delivery.is_some() {
@@ -289,9 +294,9 @@ pub(crate) struct Emitted {
     pub(crate) transcript_bytes: Option<u64>,
     /// Size on disk of the elided outputs. `cv cat` reads them; the harness never loads them.
     pub(crate) sidecar_bytes: Option<u64>,
-    /// Live Antigravity language-server delivery journal record when `--delivery=live` was used.
+    /// Live seed-delivery journal record when `--delivery=live` was used.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) delivery: Option<cv_core::harness::antigravity::deliver::Delivery>,
+    pub(crate) delivery: Option<cv_core::harness::SeedDelivery>,
 }
 
 impl Emitted {
@@ -553,7 +558,7 @@ fn report_text(d: &Distilled, e: &Emitted, measured: &cv_core::distill::Measured
             on_disk(e.sidecar_bytes)
         );
     }
-    if let Some(cv_core::harness::antigravity::deliver::Delivery::Created {
+    if let Some(cv_core::harness::SeedDelivery::Created {
         conversation_id,
         tag,
         reconciled,
@@ -571,10 +576,11 @@ fn report_text(d: &Distilled, e: &Emitted, measured: &cv_core::distill::Measured
     h
 }
 
-/// Write the pack as a seed conversation: cold into an app-data root, or live to the running
-/// language server.
+/// Write the pack as a seed conversation via the target harness's [`cv_core::harness::Adapter`]:
+/// cold into a store root, or live to the running server.
 #[allow(clippy::too_many_arguments)]
 fn emit_seed(
+    harness: Harness,
     source: &Session,
     distilled: &Distilled,
     description: &str,
@@ -586,59 +592,50 @@ fn emit_seed(
     max_bytes: Option<usize>,
     max_estimated_tokens: Option<u64>,
 ) -> Result<(Emitted, cv_core::distill::Measured)> {
-    use cv_core::harness::antigravity::{deliver::Delivery, seed};
+    use cv_core::harness::SeedDelivery;
+    let adapter = cv_core::harness::for_harness(harness).with_context(|| format!("no adapter for {harness}"))?;
     let effective_cwd = cwd.clone().or_else(|| source.cwd.clone());
     match delivery {
         DeliveryMode::Live => {
-            let request = seed::live_seed(source, boundary_ordinal, description, &distilled.pack());
-            let framed = request.framed_body();
-            let measured = cv_core::distill::Measured {
-                what: "live seed",
-                bytes: framed.len(),
-                estimated_tokens: cv_core::ir::est_tokens_bytes(framed.len(), cv_core::ir::TokenKind::ToolInput),
-            };
-            measured.check(max_bytes, max_estimated_tokens)?;
-            let outcome = seed::deliver_from_env(&request, force)?;
+            let (outcome, resume, measured) = adapter.deliver_live_seed_pack(
+                source,
+                boundary_ordinal,
+                description,
+                &distilled.pack(),
+                effective_cwd.as_deref(),
+                force,
+                max_bytes,
+                max_estimated_tokens,
+            )?;
             match outcome {
-                Delivery::Created {
+                SeedDelivery::Created {
                     ref conversation_id, ..
-                } => {
-                    let resume = cv_core::harness::resume_in(
-                        effective_cwd.as_deref(),
-                        format!("agy --conversation {conversation_id}"),
-                    );
-                    Ok((
-                        Emitted {
-                            session_id: Some(conversation_id.clone()),
-                            resume: Some(resume),
-                            delivery: Some(outcome),
-                            ..Default::default()
-                        },
-                        measured,
-                    ))
+                } => Ok((
+                    Emitted {
+                        session_id: Some(conversation_id.clone()),
+                        resume,
+                        delivery: Some(outcome),
+                        ..Default::default()
+                    },
+                    measured,
+                )),
+                SeedDelivery::Refused { status, tag, detail } => {
+                    bail!("{harness} server refused seed delivery (HTTP {status}, tag {tag}): {detail}")
                 }
-                Delivery::Refused { status, tag, detail } => {
-                    bail!("Antigravity language server refused CreateConversation (HTTP {status}, tag {tag}): {detail}")
-                }
-                Delivery::Uncertain { tag, detail } => {
-                    bail!("Antigravity live delivery uncertain (tag {tag}): {detail}")
+                SeedDelivery::Uncertain { tag, detail } => {
+                    bail!("{harness} live delivery uncertain (tag {tag}): {detail}")
                 }
             }
         }
         DeliveryMode::Cold => {
             let measured = distilled.pack_load();
             measured.check(max_bytes, max_estimated_tokens)?;
-            let seed_ir = seed::cold_session(source, &distilled.pack(), description, effective_cwd);
-            let out_dir = match out {
-                Some(dir) => dir,
-                None => seed::default_root()?,
-            };
             let emit_opts = EmitOptions {
                 new_cwd: cwd,
                 force,
                 ..Default::default()
             };
-            let res = cv_core::harness::antigravity::emit(&seed_ir, &out_dir, &emit_opts)?;
+            let res = adapter.emit_cold_seed(source, &distilled.pack(), description, effective_cwd, out, &emit_opts)?;
             let sidecar = write_sidecar(&res.path, &distilled.elided)?;
             Ok((
                 Emitted {
@@ -789,13 +786,14 @@ pub(crate) fn cmd_distill(
         (
             Products::Pack(d),
             Target::Session {
+                harness,
                 seed: Some(delivery),
                 cwd,
                 out,
-                ..
             },
         ) => {
             let (emitted, measured) = emit_seed(
+                *harness,
                 &s,
                 &d,
                 &description,

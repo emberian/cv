@@ -2422,12 +2422,51 @@ fn stream_lane_and_file_pushes_need_the_same_token_as_their_routes() {
         let raw = raw_request(port, "GET", path, &bearer);
         assert_eq!(raw_status(&raw), 200, "{path}: {raw}");
     }
-    let auth = raw_request(port, "GET", "/api/auth", &bearer);
+    let auth = raw_request(
+        port,
+        "GET",
+        "/api/auth",
+        &[
+            ("Authorization", "Bearer lane-secret"),
+            ("Origin", "http://localhost:5173"),
+        ],
+    );
+    assert_eq!(raw_status(&auth), 200, "{auth}");
+    assert_eq!(
+        header_of(&auth, "Access-Control-Allow-Origin").as_deref(),
+        Some("http://localhost:5173")
+    );
+    assert_eq!(
+        header_of(&auth, "Access-Control-Allow-Credentials").as_deref(),
+        Some("true")
+    );
     let cookie = header_of(&auth, "Set-Cookie").unwrap();
     let cookie = cookie.split(';').next().unwrap();
-    let streamed = raw_request(port, "GET", follow, &[("Cookie", cookie)]);
+    let streamed = raw_request(
+        port,
+        "GET",
+        follow,
+        &[("Cookie", cookie), ("Origin", "http://localhost:5173")],
+    );
     assert_eq!(raw_status(&streamed), 200, "{streamed}");
+    assert_eq!(
+        header_of(&streamed, "Access-Control-Allow-Origin").as_deref(),
+        Some("http://localhost:5173")
+    );
+    assert_eq!(
+        header_of(&streamed, "Access-Control-Allow-Credentials").as_deref(),
+        Some("true")
+    );
     assert!(streamed.contains("asking-lane"), "{streamed}");
+
+    let evil_origin = raw_request(
+        port,
+        "GET",
+        follow,
+        &[("Cookie", cookie), ("Origin", "https://evil.example")],
+    );
+    assert_eq!(raw_status(&evil_origin), 401, "{evil_origin}");
+    assert!(!evil_origin.contains("asking-lane"), "{evil_origin}");
 }
 
 #[test]

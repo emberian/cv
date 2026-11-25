@@ -1444,7 +1444,12 @@ impl Lane {
 
     /// The lane's [`AttentionState`] at `now`, from its status, obligations and last turn.
     pub fn attention_at(&self, now: DateTime<Utc>) -> AttentionState {
-        if self.stranded || self.pending_ask || self.open_obligations.unanswered_decisions > 0 {
+        let terminal = self.is_done()
+            || matches!(
+                self.status.as_str(),
+                "failed" | "killed" | "completed" | "done" | "returned"
+            );
+        if self.stranded || (!terminal && self.pending_ask) || self.open_obligations.unanswered_decisions > 0 {
             return AttentionState::NeedsYou;
         }
         if self.is_running() {
@@ -2030,10 +2035,12 @@ fn load_state_facts_for_forest(
             if latest.exited_at.is_none() && latest.pid.is_some() {
                 if !is_run_process_alive(latest) {
                     facts.process_exited = true;
+                    facts.open_run_since = None;
                 }
             } else if let Some(exited_ms) = latest.exited_at {
                 if !is_clean_stop_exit_status(latest.exit_status.as_deref()) {
                     facts.process_exited = true;
+                    facts.open_run_since = None;
                     facts.process_exit_at = DateTime::from_timestamp_millis(exited_ms);
                 }
             }
@@ -2191,7 +2198,7 @@ fn lane_of(
     let divergence = witness_divergence(
         hook,
         TranscriptTail {
-            last_turn_at: end.last_turn_at.or(sub.session.updated_at),
+            last_turn_at: end.last_turn_at,
             open_tool_calls: p.open_tool_calls,
             ends_in_report: p.ends_in_report,
         },
@@ -3300,5 +3307,112 @@ mod tests {
                 assert!(res.is_err(), "EACCES child must error even after cache warm");
             }
         }
+    }
+
+    #[test]
+    fn terminal_lanes_with_pending_ask_are_done_and_mtime_never_forges_divergence() {
+        // #tooth A `failed`/`killed`/`completed`/`returned` lane with an unanswered `AskUserQuestion`
+        // in its history is `Done` (not `NeedsYou`), and filesystem `updated_at` alone never
+        // triggers a post-stop `witness_divergence`.
+        let now = "2026-06-01T12:10:00Z".parse::<DateTime<Utc>>().unwrap();
+        let stop = "2026-06-01T12:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        for status in [
+            LaneStatus::Recorded("failed".into()),
+            LaneStatus::Recorded("killed".into()),
+            LaneStatus::Recorded("completed".into()),
+            LaneStatus::Returned,
+        ] {
+            let lane = Lane {
+                baggage: None,
+                agent_id: "a1".into(),
+                session_id: "agent-a1".into(),
+                path: PathBuf::from("/tmp/agent-a1.jsonl"),
+                agent_type: None,
+                description: None,
+                tool_use_id: None,
+                workflow: None,
+                model: None,
+                started_at: Some(stop),
+                last_turn_at: Some(stop),
+                duration_ms: Some(0),
+                messages: 2,
+                tool_calls: 1,
+                tokens: LaneTokens::default(),
+                status: status.clone(),
+                status_source: StatusSource::TaskNotification,
+                last_text: None,
+                last_tool: None,
+                stranded: false,
+                open_obligations: OpenObligations::default(),
+                pending_ask: true,
+                attention: AttentionState::Done,
+                witness_divergence: None,
+                failure_cause: None,
+                resets_at: None,
+                failure_detail: None,
+                endpoint: None,
+                endpoint_source: None,
+                tasks: None,
+                lineage: None,
+            };
+            assert_eq!(
+                lane.attention_at(now),
+                AttentionState::Done,
+                "terminal status {status} with pending_ask must be Done"
+            );
+        }
+        // Stopped (parked) lane waiting on an ask STILL gets NeedsYou!
+        let mut parked_ask = Lane {
+            baggage: None,
+            agent_id: "a2".into(),
+            session_id: "agent-a2".into(),
+            path: PathBuf::from("/tmp/agent-a2.jsonl"),
+            agent_type: None,
+            description: None,
+            tool_use_id: None,
+            workflow: None,
+            model: None,
+            started_at: Some(stop),
+            last_turn_at: Some(stop),
+            duration_ms: Some(0),
+            messages: 2,
+            tool_calls: 1,
+            tokens: LaneTokens::default(),
+            status: LaneStatus::Stopped,
+            status_source: StatusSource::SubagentStop,
+            last_text: None,
+            last_tool: None,
+            stranded: false,
+            open_obligations: OpenObligations::default(),
+            pending_ask: true,
+            attention: AttentionState::Done,
+            witness_divergence: None,
+            failure_cause: None,
+            resets_at: None,
+            failure_detail: None,
+            endpoint: None,
+            endpoint_source: None,
+            tasks: None,
+            lineage: None,
+        };
+        parked_ask.attention = parked_ask.attention_at(now);
+        assert_eq!(parked_ask.attention, AttentionState::NeedsYou);
+
+        // With `end.last_turn_at == None`, hook stop + 0 open calls has no divergence.
+        assert_eq!(
+            witness_divergence(
+                HookWitness {
+                    stopped_at: Some(stop),
+                    open_run_since: None,
+                },
+                TranscriptTail {
+                    last_turn_at: None,
+                    open_tool_calls: 0,
+                    ends_in_report: true,
+                },
+                now,
+            ),
+            None
+        );
     }
 }

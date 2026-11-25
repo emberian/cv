@@ -176,17 +176,26 @@ enum MockBehavior {
     Refuse(u16, String),
 }
 
-fn read_http_request(stream: &mut TcpStream) -> CapturedRequest {
-    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    let mut reader = BufReader::new(stream.try_clone().unwrap());
+fn try_read_http_request(stream: &mut TcpStream) -> std::io::Result<Option<CapturedRequest>> {
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    let mut writer = stream.try_clone()?;
+    let mut reader = BufReader::new(stream);
     let mut req_line = String::new();
-    reader.read_line(&mut req_line).unwrap();
+    loop {
+        req_line.clear();
+        if reader.read_line(&mut req_line)? == 0 {
+            return Ok(None);
+        }
+        if !req_line.trim().is_empty() {
+            break;
+        }
+    }
     let path = req_line.split_whitespace().nth(1).unwrap_or("").to_owned();
     let mut headers = HashMap::new();
     let mut content_len = 0usize;
     loop {
         let mut line = String::new();
-        let n = reader.read_line(&mut line).unwrap();
+        let n = reader.read_line(&mut line)?;
         if n == 0 || line == "\r\n" || line == "\n" {
             break;
         }
@@ -199,10 +208,57 @@ fn read_http_request(stream: &mut TcpStream) -> CapturedRequest {
             headers.insert(key, val);
         }
     }
-    let mut buf = vec![0u8; content_len];
-    reader.read_exact(&mut buf).unwrap();
-    let body: Value = serde_json::from_slice(&buf).unwrap();
-    CapturedRequest { path, headers, body }
+    if headers
+        .get("expect")
+        .is_some_and(|v| v.eq_ignore_ascii_case("100-continue"))
+    {
+        writer.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
+        writer.flush()?;
+    }
+    let mut buf = Vec::new();
+    if headers
+        .get("transfer-encoding")
+        .is_some_and(|v| v.to_ascii_lowercase().contains("chunked"))
+    {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if reader.read_line(&mut line)? == 0 {
+                break;
+            }
+            let size = usize::from_str_radix(line.trim().split(';').next().unwrap_or(""), 16)
+                .map_err(|_| std::io::Error::other("bad chunk size"))?;
+            if size == 0 {
+                loop {
+                    line.clear();
+                    if reader.read_line(&mut line)? == 0 || line.trim().is_empty() {
+                        break;
+                    }
+                }
+                break;
+            }
+            let start = buf.len();
+            buf.resize(start + size, 0);
+            reader.read_exact(&mut buf[start..])?;
+            line.clear();
+            reader.read_line(&mut line)?;
+        }
+    } else if content_len > 0 {
+        buf.resize(content_len, 0);
+        reader.read_exact(&mut buf)?;
+    }
+    let body: Value = if buf.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&buf).unwrap_or(Value::Null)
+    };
+    Ok(Some(CapturedRequest { path, headers, body }))
+}
+
+fn read_http_request(stream: &mut TcpStream) -> CapturedRequest {
+    try_read_http_request(stream)
+        .expect("read http request")
+        .expect("non-empty http request")
 }
 
 fn write_local_agy_seed_transcript(app_root: &Path, conv_id: &str, prompt_text: &str) {
@@ -685,15 +741,25 @@ fn real_agy_loopback_gateway_resumes_cold_rewind_and_emitted_seed() {
     // a credential-free `127.0.0.1:0` `AGY_LLM_GATEWAY_URL` mock server to verify that both
     // `cv rewind --uncompact` (keeping `executor_metadata` row 0) and `cv port --harness antigravity`
     // produce trajectories that `agy --conversation <id>` genuinely loads and continues!
-    let Some(agy_bin) = find_agy_executable() else {
-        return;
-    };
-    if !Path::new("/usr/bin/sandbox-exec").is_file() {
+    let l2_required = std::env::var("CV_L2").ok().is_some_and(|v| {
+        v.split(',')
+            .map(str::trim)
+            .any(|s| matches!(s, "1" | "all" | "antigravity"))
+    });
+    if !l2_required {
+        eprintln!("real_agy_loopback_gateway: skipped: set CV_L2=1 (or antigravity) to run real binaries");
         return;
     }
+    let agy_bin = find_agy_executable().expect("CV_L2 requested antigravity, but `agy` was not found");
+    assert!(
+        Path::new("/usr/bin/sandbox-exec").is_file(),
+        "CV_L2 requested antigravity, but `/usr/bin/sandbox-exec` is absent"
+    );
 
     let w = World::new("real-agy-l2-gateway");
-    let sb_base = w.base.join("agy_sandbox");
+    let raw_sb = w.base.join("agy_sandbox");
+    fs::create_dir_all(&raw_sb).unwrap();
+    let sb_base = raw_sb.canonicalize().unwrap();
     for sub in ["home", "config", "data", "state", "cache", "tmp", "project"] {
         fs::create_dir_all(sb_base.join(sub)).unwrap();
     }
@@ -704,7 +770,8 @@ fn real_agy_loopback_gateway_resumes_cold_rewind_and_emitted_seed() {
             "(version 1)(allow default)(deny file-write*)\
              (allow file-write* (subpath {})(literal \"/dev/null\")\
              (literal \"/dev/ptmx\")(regex #\"^/dev/ttys[0-9]+$\"))\
-             (deny network*)(allow network* (remote ip \"localhost:*\")(local ip \"localhost:*\"))",
+             (deny network*)(allow network* (remote ip \"localhost:*\")(local ip \"localhost:*\"))\
+             (allow network* (remote unix-socket))",
             serde_json::to_string(sb_base.to_str().unwrap()).unwrap()
         ),
     )
@@ -719,45 +786,71 @@ fn real_agy_loopback_gateway_resumes_cold_rewind_and_emitted_seed() {
 
     gateway.set_nonblocking(true).unwrap();
     let gw_thread = thread::spawn(move || {
+        let mut workers = Vec::new();
         while !stop_srv.load(Ordering::Relaxed) {
             match gateway.accept() {
                 Ok((mut stream, _)) => {
-                    stream.set_nonblocking(false).unwrap();
-                    let req = read_http_request(&mut stream);
-                    let sys = serde_json::to_string(&req.body.get("systemInstruction")).unwrap_or_default();
-                    let reply_text = if sys.contains("title generator") {
-                        "Gateway fixture".to_owned()
-                    } else {
-                        seen_srv.lock().unwrap().push(req.body.clone());
-                        let body_dump = serde_json::to_string(&req.body["contents"]).unwrap_or_default();
-                        if body_dump.contains("/compact") {
-                            "GATEWAY_COMPACT_SUMMARY: pre-compaction context.".to_owned()
-                        } else {
-                            "GATEWAY_OK_REPLY".to_owned()
+                    let seen_conn = Arc::clone(&seen_srv);
+                    workers.push(thread::spawn(move || {
+                        let _ = stream.set_nonblocking(false);
+                        let Ok(Some(req)) = try_read_http_request(&mut stream) else {
+                            return;
+                        };
+                        if req.body.is_null() {
+                            let list = json!({"models": []}).to_string();
+                            let http = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                list.len(),
+                                list
+                            );
+                            let _ = stream.write_all(http.as_bytes());
+                            let _ = stream.flush();
+                            return;
                         }
-                    };
-                    let sse = format!(
-                        "data: {}\n\n",
-                        json!({
+                        let sys = serde_json::to_string(&req.body.get("systemInstruction")).unwrap_or_default();
+                        let reply_text = if sys.contains("title generator") {
+                            "Gateway fixture".to_owned()
+                        } else {
+                            seen_conn.lock().unwrap().push(req.body.clone());
+                            let body_dump = serde_json::to_string(&req.body["contents"]).unwrap_or_default();
+                            if body_dump.contains("/compact") {
+                                "GATEWAY_COMPACT_SUMMARY: pre-compaction context.".to_owned()
+                            } else {
+                                "GATEWAY_OK_REPLY".to_owned()
+                            }
+                        };
+                        let candidate = json!({
                             "candidates": [{
                                 "content": {"role": "model", "parts": [{"text": reply_text}]},
-                                "finishReason": "STOP"
-                            }]
-                        })
-                    );
-                    let http = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        sse.len(),
-                        sse
-                    );
-                    let _ = stream.write_all(http.as_bytes());
-                    let _ = stream.flush();
+                                "finishReason": "STOP",
+                                "index": 0
+                            }],
+                            "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 1, "totalTokenCount": 2},
+                            "modelVersion": "loopback"
+                        });
+                        let (ctype, payload) = if req.path.contains(":generateContent")
+                            && !req.path.contains(":streamGenerateContent")
+                        {
+                            ("application/json", candidate.to_string())
+                        } else {
+                            ("text/event-stream", format!("data: {candidate}\n\n"))
+                        };
+                        let http = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                            payload.len()
+                        );
+                        let _ = stream.write_all(http.as_bytes());
+                        let _ = stream.flush();
+                    }));
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(15));
                 }
                 Err(_) => break,
             }
+        }
+        for w in workers {
+            let _ = w.join();
         }
     });
 
@@ -774,7 +867,10 @@ fn real_agy_loopback_gateway_resumes_cold_rewind_and_emitted_seed() {
             .arg("stream-json")
             .current_dir(sb_base.join("project"))
             .env_clear()
-            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+            .env(
+                "PATH",
+                std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin:/usr/sbin:/sbin".into()),
+            )
             .env("HOME", sb_base.join("home"))
             .env("TMPDIR", sb_base.join("tmp"))
             .env("TERM", "dumb")
@@ -783,7 +879,7 @@ fn real_agy_loopback_gateway_resumes_cold_rewind_and_emitted_seed() {
             .env("XDG_STATE_HOME", sb_base.join("state"))
             .env("XDG_CACHE_HOME", sb_base.join("cache"))
             .env("ANTIGRAVITY_APP_DATA_DIR", app_dir)
-            .env("ANTIGRAVITY_GEMINI_DIR", sb_base.join("home/.gemini"))
+            .env("ANTIGRAVITY_GEMINI_DIR", app_dir.parent().unwrap_or(sb_base.as_path()))
             .env("AGY_CLI_DISABLE_AUTO_UPDATE", "1")
             .env("AGY_CLI_MODEL_API_MAX_RETRIES", "0")
             .env("AGY_LLM_GATEWAY_URL", format!("http://127.0.0.1:{gw_port}"))
@@ -812,11 +908,10 @@ fn real_agy_loopback_gateway_resumes_cold_rewind_and_emitted_seed() {
     // 1. Create a real session via `agy`, compact it, and add a post-compaction turn.
     let first = match run_agy(&live_root, &["--print", "PRE_COMPACT_REAL_AGY_MARKER"]) {
         Ok(res) => res,
-        Err(_) => {
-            // If an unverified future `agy` release changes gateway env vars, clean up gracefully.
+        Err(err) => {
             stop.store(true, Ordering::Relaxed);
             let _ = gw_thread.join();
-            return;
+            panic!("real agy failed under CV_L2: {err}");
         }
     };
     let orig_id = first["conversation_id"].as_str().unwrap().to_owned();
@@ -828,7 +923,7 @@ fn real_agy_loopback_gateway_resumes_cold_rewind_and_emitted_seed() {
     .unwrap();
 
     // Cold-rewind `--uncompact` into a clean app-data root inside `sb_base` and verify `executor_metadata` row 0!
-    let rewound_root = sb_base.join("rewound_root");
+    let rewound_root = sb_base.join("rewound_gemini/antigravity-cli");
     let orig_db = live_root.join("conversations").join(format!("{orig_id}.db"));
     let (ok_rw, _, out_rw, err_rw) = w.cv(&[
         "rewind",
@@ -877,7 +972,7 @@ fn real_agy_loopback_gateway_resumes_cold_rewind_and_emitted_seed() {
             ),
         ],
     );
-    let ported_root = sb_base.join("ported_root");
+    let ported_root = sb_base.join("ported_gemini/antigravity-cli");
     let (ok_pt, _, out_pt, err_pt) = w.cv(&[
         "port",
         "claude4agy",
@@ -889,7 +984,7 @@ fn real_agy_loopback_gateway_resumes_cold_rewind_and_emitted_seed() {
     ]);
     assert!(ok_pt, "port failed: {err_pt}");
     let pt_json: Value = serde_json::from_str(&out_pt).unwrap();
-    let ported_id = pt_json["new_id"].as_str().unwrap();
+    let ported_id = pt_json["id"].as_str().unwrap();
 
     seen_requests.lock().unwrap().clear();
     let resumed_pt = run_agy(

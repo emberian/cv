@@ -14,8 +14,9 @@ static HEADER: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 static HUNK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@").unwrap());
+static WHERE_CLAUSE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\swhere(?:\s|$)").unwrap());
 
-fn hunk(line: &str) -> Option<(Range<usize>, Range<usize>)> {
+pub(super) fn hunk(line: &str) -> Option<(Range<usize>, Range<usize>)> {
     let caps = HUNK.captures(line)?;
     let range = |i| -> Option<Range<usize>> {
         let start = caps.get(i)?.as_str().parse::<usize>().ok()?.saturating_sub(1);
@@ -23,6 +24,37 @@ fn hunk(line: &str) -> Option<(Range<usize>, Range<usize>)> {
         Some(start..start.checked_add(len)?)
     };
     Some((range(1)?, range(3)?))
+}
+
+/// Map a 1-based inclusive line range `(lo, hi)` from a post-image (`+`) revision backward across
+/// a unified diff to its 1-based inclusive pre-image (`-`) range.
+pub(super) fn map_range_new_to_old(range: (usize, usize), diff: &str) -> (usize, usize) {
+    let hunks: Vec<(Range<usize>, Range<usize>)> = diff.lines().filter_map(hunk).collect();
+    if hunks.is_empty() {
+        return range;
+    }
+    let lo0 = range.0.saturating_sub(1);
+    let hi0 = range.1.max(range.0);
+
+    let map_point = |p: usize, is_end: bool| -> usize {
+        let mut delta: isize = 0;
+        for (old, new) in &hunks {
+            if p < new.start {
+                break;
+            }
+            if p <= new.end && (p < new.end || (is_end && p == new.end && !new.is_empty())) {
+                return if is_end { old.end } else { old.start };
+            }
+            delta += new.end as isize - old.end as isize;
+        }
+        (p as isize - delta).max(0) as usize
+    };
+
+    let old_lo0 = map_point(lo0, false);
+    let old_hi0 = map_point(hi0, true);
+    let lo1 = old_lo0 + 1;
+    let hi1 = old_hi0.max(lo1);
+    (lo1, hi1)
 }
 
 struct Item<'a> {
@@ -71,7 +103,7 @@ fn decl_key(line: &str, caps: &regex::Captures<'_>) -> Option<String> {
     if rest.starts_with('<') {
         rest = rest[balanced_angles(rest)?..].trim_start();
     }
-    let end = [rest.find('{'), rest.find(" where ")]
+    let end = [rest.find('{'), WHERE_CLAUSE.find(rest).map(|m| m.start())]
         .into_iter()
         .flatten()
         .min()
@@ -91,28 +123,148 @@ fn decl_key(line: &str, caps: &regex::Captures<'_>) -> Option<String> {
 /// Character literals, strictly: one character or one escape. A Rust lifetime (`'a`,
 /// `'static`, `'_`) is not one, so `<'a, 'b>` never pairs its quotes across the signature.
 const CHAR_LITERAL: &str = r"'(?:\\(?:x[0-9a-fA-F]{2}|u\{[0-9a-fA-F_]{1,6}\}|.)|[^'\\\n])'";
+static CHAR_LIT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(&format!("^{CHAR_LITERAL}")).unwrap());
 
-/// Ignore braces in ordinary quoted literals and comments. Rust uses `'` only for characters
-/// and lifetimes; other languages also quote whole strings with it, on one line. An unclosed
-/// or unsupported declaration supplies no candidate.
-static BRACES_RUST: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(&format!(
-        r#""(?:\\.|[^"\\])*"|{CHAR_LITERAL}|//.*|/\*[\s\S]*?\*/|[{{}};]"#
-    ))
-    .unwrap()
-});
-static BRACES: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(&format!(
-        r#""(?:\\.|[^"\\])*"|{CHAR_LITERAL}|'(?:\\.|[^'\\\n])*'|//.*|/\*[\s\S]*?\*/|[{{}};]"#
-    ))
-    .unwrap()
-});
+/// Mask comments, quoted strings, character literals, and (when `rust`) raw string literals
+/// (`r#"..."#`, `br#"..."#`, `cr#"..."#`) and nested `/* ... */` comments across the whole file,
+/// replacing non-newline bytes inside them with spaces so line numbers and byte offsets of real
+/// `{`, `}`, and `;` delimiters remain 1:1 with `src`.
+fn mask_for_braces(src: &str, rust: bool) -> String {
+    let b = src.as_bytes();
+    let len = b.len();
+    let mut out = b.to_vec();
+    let blank = |out: &mut [u8], range: Range<usize>| {
+        for slot in &mut out[range] {
+            if *slot != b'\n' && *slot != b'\r' {
+                *slot = b' ';
+            }
+        }
+    };
+    let is_ident_prev = |idx: usize| -> bool {
+        idx > 0 && (b[idx - 1].is_ascii_alphanumeric() || b[idx - 1] == b'_' || b[idx - 1] == b'\'')
+    };
 
-fn item<'a>(lines: &[&'a str], start: usize, caps: regex::Captures<'a>, rust: bool) -> Option<Item<'a>> {
+    let mut i = 0usize;
+    while i < len {
+        // Line comment `// ...`
+        if i + 1 < len && b[i] == b'/' && b[i + 1] == b'/' {
+            let start = i;
+            i += 2;
+            while i < len && b[i] != b'\n' {
+                i += 1;
+            }
+            blank(&mut out, start..i);
+            continue;
+        }
+        // Block comment `/* ... */` (nested in Rust)
+        if i + 1 < len && b[i] == b'/' && b[i + 1] == b'*' {
+            let start = i;
+            i += 2;
+            let mut depth = 1usize;
+            while i < len && depth > 0 {
+                if rust && i + 1 < len && b[i] == b'/' && b[i + 1] == b'*' {
+                    depth += 1;
+                    i += 2;
+                } else if i + 1 < len && b[i] == b'*' && b[i + 1] == b'/' {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            blank(&mut out, start..i);
+            continue;
+        }
+        // Rust raw string literal: `r#"..."#`, `br#"..."#`, `cr#"..."#`
+        if rust && !is_ident_prev(i) {
+            let r_pos = if b[i] == b'r' {
+                Some(i)
+            } else if (b[i] == b'b' || b[i] == b'c') && i + 1 < len && b[i + 1] == b'r' {
+                Some(i + 1)
+            } else {
+                None
+            };
+            if let Some(rp) = r_pos {
+                let mut hashes = 0usize;
+                let mut k = rp + 1;
+                while k < len && b[k] == b'#' {
+                    hashes += 1;
+                    k += 1;
+                }
+                if hashes < 256 && k < len && b[k] == b'"' {
+                    let start = i;
+                    k += 1;
+                    while k < len {
+                        if b[k] == b'"' && k + 1 + hashes <= len && b[k + 1..k + 1 + hashes].iter().all(|&c| c == b'#')
+                        {
+                            k += 1 + hashes;
+                            break;
+                        }
+                        k += 1;
+                    }
+                    blank(&mut out, start..k);
+                    i = k;
+                    continue;
+                }
+            }
+        }
+        // Ordinary double-quoted string `"..."` (may span lines)
+        if b[i] == b'"' {
+            let start = i;
+            i += 1;
+            while i < len {
+                if b[i] == b'\\' {
+                    i = (i + 2).min(len);
+                } else if b[i] == b'"' {
+                    i += 1;
+                    break;
+                } else {
+                    i += 1;
+                }
+            }
+            blank(&mut out, start..i);
+            continue;
+        }
+        // Single-quoted character literal (Rust) or single-line string (non-Rust)
+        if b[i] == b'\'' {
+            if rust {
+                if let Some(m) = CHAR_LIT_RE.find(&src[i..]) {
+                    blank(&mut out, i..i + m.end());
+                    i += m.end();
+                    continue;
+                }
+            } else {
+                let start = i;
+                let mut k = i + 1;
+                let mut closed = false;
+                while k < len && b[k] != b'\n' {
+                    if b[k] == b'\\' {
+                        k = (k + 2).min(len);
+                    } else if b[k] == b'\'' {
+                        k += 1;
+                        closed = true;
+                        break;
+                    } else {
+                        k += 1;
+                    }
+                }
+                if closed {
+                    blank(&mut out, start..k);
+                    i = k;
+                    continue;
+                }
+            }
+        }
+        // Advance to next UTF-8 char boundary so `&src[i..]` is always valid UTF-8.
+        i += src[i..].chars().next().map_or(1, char::len_utf8);
+    }
+    String::from_utf8(out).expect("masking preserves valid UTF-8")
+}
+
+fn item<'a>(lines: &[&'a str], masked_lines: &[&str], start: usize, caps: regex::Captures<'a>) -> Option<Item<'a>> {
     let kind = caps.get(1)?.as_str();
     let header = lines[start];
     let key = decl_key(header, &caps)?;
-    let braces = if rust { &*BRACES_RUST } else { &*BRACES };
     let (end, body) = if matches!(&caps[1], "def" | "class") && header.contains(':') && !header.contains('{') {
         let indent = header.len() - header.trim_start().len();
         let mut tail = lines[start + 1..]
@@ -134,28 +286,28 @@ fn item<'a>(lines: &[&'a str], start: usize, caps: regex::Captures<'a>, rust: bo
         let mut depth = 0usize;
         let mut body = String::new();
         let mut end = None;
-        'scan: for (n, line) in lines.iter().enumerate().skip(start) {
-            if n > start && depth == 0 && HEADER.is_match(line) {
+        'scan: for (n, (line, masked)) in lines.iter().zip(masked_lines.iter()).enumerate().skip(start) {
+            if n > start && depth == 0 && HEADER.is_match(line) && !masked.trim().is_empty() {
                 return None;
             }
             let mut from = 0;
-            for m in braces.find_iter(line) {
-                match m.as_str() {
-                    "{" => {
+            for (pos, ch) in masked.bytes().enumerate() {
+                match ch {
+                    b'{' => {
                         if depth == 0 {
-                            from = m.end()
+                            from = pos + 1;
                         }
                         depth += 1;
                     }
-                    "}" => {
+                    b'}' => {
                         depth = depth.checked_sub(1)?;
                         if depth == 0 {
-                            body.push_str(&line[from..m.start()]);
+                            body.push_str(&line[from..pos]);
                             end = Some(n + 1);
                             break 'scan;
                         }
                     }
-                    ";" if depth == 0 => return None,
+                    b';' if depth == 0 => return None,
                     _ => (),
                 }
             }
@@ -175,16 +327,19 @@ fn item<'a>(lines: &[&'a str], start: usize, caps: regex::Captures<'a>, rust: bo
 }
 
 /// The `impl`, `trait` and `class` blocks of a file: their lines and keys.
-fn containers(lines: &[&str], rust: bool) -> Vec<(Range<usize>, String)> {
+fn containers(lines: &[&str], masked_lines: &[&str]) -> Vec<(Range<usize>, String)> {
     lines
         .iter()
         .enumerate()
         .filter_map(|(i, line)| {
+            if masked_lines.get(i).is_some_and(|m| m.trim().is_empty()) {
+                return None;
+            }
             let caps = HEADER.captures(line)?;
             if !matches!(caps.get(1)?.as_str(), "impl" | "trait" | "class") {
                 return None;
             }
-            let it = item(lines, i, caps, rust)?;
+            let it = item(lines, masked_lines, i, caps)?;
             Some((it.lines, it.key))
         })
         .collect()
@@ -293,7 +448,9 @@ pub(super) fn find(root: &Path, sha: &str, diff: &str, query: (usize, usize)) ->
         return Ok(None);
     }
     let dest = git_stdout(root, &["show", &format!("{sha}:{path}")])?;
+    let dest_masked = mask_for_braces(&dest, is_rust(path));
     let lines: Vec<_> = dest.lines().collect();
+    let masked_lines: Vec<_> = dest_masked.lines().collect();
     let Some(block) = lines.get(range.clone()) else {
         return Ok(None);
     };
@@ -302,12 +459,13 @@ pub(super) fn find(root: &Path, sha: &str, diff: &str, query: (usize, usize)) ->
         && block.iter().any(|l| l.chars().any(char::is_alphanumeric));
     let enclosing = (0..=range.start)
         .rev()
-        .filter_map(|i| item(&lines, i, HEADER.captures(lines[i])?, is_rust(path)))
+        .filter(|&i| !masked_lines.get(i).is_some_and(|m| m.trim().is_empty()))
+        .filter_map(|i| item(&lines, &masked_lines, i, HEADER.captures(lines[i])?))
         .find(|it| it.lines.end >= range.end);
     let target_tokens = enclosing.as_ref().map(|it| tokens(&it.body)).unwrap_or_default();
     let target_key = enclosing
         .as_ref()
-        .map(|it| qualify(&containers(&lines, is_rust(path)), it.lines.start, &it.key));
+        .map(|it| qualify(&containers(&lines, &masked_lines), it.lines.start, &it.key));
     let mut exact = Vec::new();
     let mut similar = Vec::new();
     let mut names = 0;
@@ -322,7 +480,9 @@ pub(super) fn find(root: &Path, sha: &str, diff: &str, query: (usize, usize)) ->
         if text.contains('\0') {
             continue;
         }
+        let old_masked = mask_for_braces(text, is_rust(old));
         let old_lines: Vec<_> = text.lines().collect();
+        let old_masked_lines: Vec<_> = old_masked.lines().collect();
         let normalized: Vec<_> = old_lines.iter().map(|l| norm(l)).collect();
         let candidate = |range| Candidate {
             path: old.into(),
@@ -337,8 +497,11 @@ pub(super) fn find(root: &Path, sha: &str, diff: &str, query: (usize, usize)) ->
             }
         }
         if let (Some(target), Some(target_key)) = (&enclosing, &target_key) {
-            let outer = containers(&old_lines, is_rust(old));
+            let outer = containers(&old_lines, &old_masked_lines);
             for (i, line) in old_lines.iter().enumerate() {
+                if old_masked_lines.get(i).is_some_and(|m| m.trim().is_empty()) {
+                    continue;
+                }
                 let Some(caps) = HEADER.captures(line) else { continue };
                 if caps.get(1).is_none_or(|k| k.as_str() != target.kind) {
                     continue;
@@ -362,7 +525,7 @@ pub(super) fn find(root: &Path, sha: &str, diff: &str, query: (usize, usize)) ->
                 if similar.len() >= 2 {
                     continue;
                 }
-                let Some(found) = item(&old_lines, i, caps, is_rust(old)) else {
+                let Some(found) = item(&old_lines, &old_masked_lines, i, caps) else {
                     continue;
                 };
                 if target.body.is_empty() || found.body.is_empty() {
@@ -441,11 +604,13 @@ pub(super) fn find(root: &Path, sha: &str, diff: &str, query: (usize, usize)) ->
 
 #[cfg(test)]
 mod tests {
-    use super::{creation_hunk, decl_key, item, tokens, HEADER};
+    use super::{creation_hunk, decl_key, item, map_range_new_to_old, mask_for_braces, tokens, HEADER};
 
     fn first_item(src: &str, rust: bool) -> Option<(String, std::ops::Range<usize>, String)> {
+        let masked = mask_for_braces(src, rust);
         let lines: Vec<&str> = src.lines().collect();
-        let it = item(&lines, 0, HEADER.captures(lines[0])?, rust)?;
+        let masked_lines: Vec<&str> = masked.lines().collect();
+        let it = item(&lines, &masked_lines, 0, HEADER.captures(lines[0])?)?;
         Some((it.key, it.lines, it.body))
     }
 
@@ -487,5 +652,34 @@ mod tests {
         assert_eq!(creation_hunk(diff, (6, 27)), None);
         assert_eq!(creation_hunk(diff, (12, 14)), None);
         assert_eq!(creation_hunk("@@ -0,0 +1,9 @@\n", (40, 41)), Some(0..9));
+    }
+
+    #[test]
+    fn multiline_comments_raw_strings_where_newline_and_diff_range_tracking_hold() {
+        // #tooth Multi-line `/* ... { ... */`, Rust raw strings `r#" ... } ... "#`, and
+        // `impl ... where\n` must never confuse brace depth or self-type extraction, and
+        // `map_range_new_to_old` tracks line shifts back to the creation commit.
+        let src = concat!(
+            "impl fmt::Display for Widget where\n",
+            "    Widget: Clone,\n",
+            "{\n",
+            "    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {\n",
+            "        /* multi-line comment with unmatched {\n",
+            "           and nested /* } */ still open {\n",
+            "        */\n",
+            "        let raw = r#\"unmatched }\n",
+            "        still inside raw string }};\"#;\n",
+            "        write!(f, \"{raw}\")\n",
+            "    }\n",
+            "}\n",
+            "fn trailing() {}\n",
+        );
+        let (key, lines, _) = first_item(src, true).unwrap();
+        assert_eq!(key, "Display for Widget");
+        assert_eq!(lines, 0..12);
+
+        let diff = "@@ -0,0 +1,22 @@\n+header\n@@ -4,5 +26,7 @@\n";
+        assert_eq!(map_range_new_to_old((26, 32), diff), (4, 8));
+        assert_eq!(map_range_new_to_old((48, 51), "@@ -0,0 +1,22 @@\n"), (26, 29));
     }
 }

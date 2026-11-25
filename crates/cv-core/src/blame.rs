@@ -456,7 +456,14 @@ fn line_commits_with_hunks(root: &Path, rel: &str, lo: u32, hi: u32) -> Result<(
             break;
         }
         let log = String::from_utf8_lossy(&output.stdout);
-        let mut terminal = None;
+        let spec_parts = spec.split_once(':');
+        let spec_range = spec_parts
+            .and_then(|(lines, _)| lines.split_once(','))
+            .and_then(|(lo, hi)| Some((lo.parse().ok()?, hi.parse().ok()?)))
+            .unwrap_or((lo as usize, hi as usize));
+        let cur_rel = spec_parts.map_or(rel, |(_, p)| p);
+        let mut tracked = spec_range;
+        let mut terminal: Option<(&str, &str, (usize, usize))> = None;
         for chunk in log.split("\0COMMIT\0").skip(1) {
             let Some((header, diff)) = chunk.split_once('\n') else {
                 continue;
@@ -479,9 +486,28 @@ fn line_commits_with_hunks(root: &Path, rel: &str, lo: u32, hi: u32) -> Result<(
                     relocated_from: relocation.clone(),
                 });
             }
-            terminal = Some((sha, diff));
+            let hunks: Vec<_> = diff.lines().filter_map(carve::hunk).collect();
+            let at_sha = match (
+                hunks.iter().filter(|(_, a)| !a.is_empty()).map(|(_, a)| a.start).min(),
+                hunks.iter().filter(|(_, a)| !a.is_empty()).map(|(_, a)| a.end).max(),
+            ) {
+                (Some(s), Some(e)) if hunks.len() == 1 => (s + 1, e.max(s + 1)),
+                _ => tracked,
+            };
+            terminal = Some((sha, diff, at_sha));
+            if hunks.iter().any(|(b, _)| !b.is_empty()) {
+                let b_start = hunks.iter().filter(|(b, _)| !b.is_empty()).map(|(b, _)| b.start).min();
+                let b_end = hunks.iter().filter(|(b, _)| !b.is_empty()).map(|(b, _)| b.end).max();
+                if let (Some(s), Some(e)) = (b_start, b_end) {
+                    tracked = if hunks.len() == 1 {
+                        (s + 1, e.max(s + 1))
+                    } else {
+                        carve::map_range_new_to_old(tracked, diff)
+                    };
+                }
+            }
         }
-        let Some((sha, diff)) = terminal else { break };
+        let Some((sha, diff, mut query)) = terminal else { break };
         if commits.len() >= MAX_COMMITS {
             break;
         }
@@ -492,11 +518,35 @@ fn line_commits_with_hunks(root: &Path, rel: &str, lo: u32, hi: u32) -> Result<(
         {
             break;
         }
-        let query = spec
-            .split_once(':')
-            .and_then(|(lines, _)| lines.split_once(','))
-            .and_then(|(lo, hi)| Some((lo.parse().ok()?, hi.parse().ok()?)))
-            .unwrap_or((lo as usize, hi as usize));
+        // When the terminal commit carries multiple pure-addition hunks and unlogged commits
+        // between `sha` and `rev` may have shifted line numbers, project `spec_range` across the
+        // exact `sha..rev` file diff so `carve::find` always receives `sha`'s line numbers.
+        if sha != rev
+            && diff
+                .lines()
+                .filter_map(carve::hunk)
+                .filter(|(b, a)| b.is_empty() && !a.is_empty())
+                .count()
+                > 1
+        {
+            if let Ok(full_diff) = git_stdout(
+                root,
+                &[
+                    "--literal-pathspecs",
+                    "diff",
+                    "--no-renames",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "-U0",
+                    sha,
+                    &rev,
+                    "--",
+                    cur_rel,
+                ],
+            ) {
+                query = carve::map_range_new_to_old(spec_range, &full_diff);
+            }
+        }
         let Some(source) = carve::find(root, sha, diff, query)? else {
             break;
         };
@@ -1152,6 +1202,125 @@ mod tests {
                 ("hunk-only", Strength::ContentHunk),
                 ("timed-only", Strength::Timed),
             ]
+        );
+    }
+
+    #[test]
+    fn line_blame_tracks_shifted_hunk_range_to_creation_commit_before_carve() {
+        // #tooth When a later commit inserts lines at the top of a file after a multi-hunk carve,
+        // `line_commits_with_hunks` must pass the creation commit's line numbers (not `HEAD`'s)
+        // to `carve::find` so the carved block bridges to the right ancestor item.
+        let world = crate::test_world("blame-shifted-carve");
+        let root = world.base.join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "T")
+                .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+                .env("GIT_COMMITTER_NAME", "T")
+                .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        std::fs::write(
+            root.join("origin.rs"),
+            concat!(
+                "pub fn alpha_carved(x: i32) -> i32 {\n",
+                "    let step = x + 10;\n",
+                "    step * 2\n",
+                "}\n",
+                "\n",
+                "pub fn beta_carved(y: i32) -> i32 {\n",
+                "    let other = y - 3;\n",
+                "    other * 5\n",
+                "}\n",
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("dest.rs"),
+            concat!(
+                "// top\n",
+                "pub fn stay_one() {}\n",
+                "// mid 1\n",
+                "// mid 2\n",
+                "// mid 3\n",
+                "// mid 4\n",
+                "// mid 5\n",
+                "// mid 6\n",
+                "// mid 7\n",
+                "// mid 8\n",
+                "// mid 9\n",
+                "// mid 10\n",
+                "pub fn stay_two() {}\n",
+            ),
+        )
+        .unwrap();
+        git(&["add", "."]);
+        git(&["-c", "commit.gpgsign=false", "commit", "-qm", "origin"]);
+
+        // Carve both `alpha_carved` and `beta_carved` out of `origin.rs` into two distinct hunks in `dest.rs`.
+        std::fs::remove_file(root.join("origin.rs")).unwrap();
+        std::fs::write(
+            root.join("dest.rs"),
+            concat!(
+                "// top\n",
+                "pub fn alpha_carved(x: i32) -> i32 {\n",
+                "    let step = x + 10;\n",
+                "    step * 2\n",
+                "}\n",
+                "pub fn stay_one() {}\n",
+                "// mid 1\n",
+                "// mid 2\n",
+                "// mid 3\n",
+                "// mid 4\n",
+                "// mid 5\n",
+                "// mid 6\n",
+                "// mid 7\n",
+                "// mid 8\n",
+                "// mid 9\n",
+                "// mid 10\n",
+                "pub fn stay_two() {}\n",
+                "pub fn beta_carved(y: i32) -> i32 {\n",
+                "    let other = y - 3;\n",
+                "    other * 5\n",
+                "}\n",
+            ),
+        )
+        .unwrap();
+        git(&["add", "-A"]);
+        git(&["-c", "commit.gpgsign=false", "commit", "-qm", "carve"]);
+
+        // Shift `alpha_carved` down by 16 lines so its `HEAD` lines (18..=21) collide with where
+        // `beta_carved` sat in the carve commit!
+        let mut prefix = String::new();
+        for i in 0..16 {
+            prefix.push_str(&format!("// header shift {i}\n"));
+        }
+        let prev_dest = std::fs::read_to_string(root.join("dest.rs")).unwrap();
+        std::fs::write(root.join("dest.rs"), format!("{prefix}{prev_dest}")).unwrap();
+        git(&["add", "dest.rs"]);
+        git(&["-c", "commit.gpgsign=false", "commit", "-qm", "shift"]);
+
+        let (commits, _) = line_commits_with_hunks(&root, "dest.rs", 18, 21).unwrap();
+        let relocated = commits
+            .iter()
+            .find_map(|c| c.relocated_from.as_ref())
+            .expect("must bridge carve across line shift");
+        assert_eq!(relocated.path, "origin.rs");
+        assert_eq!(
+            relocated.lines,
+            (1, 4),
+            "must relocate alpha_carved (1..=4), not beta_carved"
         );
     }
 }

@@ -705,7 +705,7 @@ fn publish(stage: StagedDir, out: &Path, r: &Derived, session: &Session) -> Resu
         last_user_time,
         replace: false,
     };
-    publish_staged_app_root(stage, out, &spec, Claim::New, || Ok(()))
+    publish_staged_app_root(stage, out, &spec, Claim::New, |_| Ok(()))
 }
 
 fn summary_key_taken(index: &Path, id: &str) -> Result<bool> {
@@ -735,15 +735,16 @@ pub(super) fn publish_staged_app_root(
     out: &Path,
     spec: &SummarySpec<'_>,
     claim: Claim,
-    verify_installed: impl FnOnce() -> Result<()>,
+    verify_installed: impl FnOnce(&Path) -> Result<()>,
 ) -> Result<()> {
     if !out.exists() {
         summary_tx(
             &mut Connection::open(stage.path().join("conversation_summaries.db"))?,
             spec,
         )?;
+        verify_installed(stage.path())?;
         stage.publish(out, claim)?;
-        return verify_installed();
+        return Ok(());
     }
     // Existing offline root: stage/hard-link artifacts and run verification outside the SQLite
     // write transaction so `conversation_summaries.db`'s `BEGIN IMMEDIATE` lock is held only for
@@ -826,7 +827,7 @@ pub(super) fn publish_staged_app_root(
             fs::hard_link(stage.path().join(&path), out.join(&path))?;
             installed.push(path);
         }
-        verify_installed()?;
+        verify_installed(out)?;
         let mut conn = Connection::open(&index)?;
         summary_tx(&mut conn, spec)
     })();

@@ -499,6 +499,7 @@ pub fn emit_verified_with_sidecar(
             crate::publish::refuse_existing(&top_sc, "")?;
         }
     }
+    #[cfg_attr(not(feature = "sqlite"), allow(unused_mut))]
     let mut written_in_verify: Option<PathBuf> = None;
     let emit_res = emit_checked(
         session,
