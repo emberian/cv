@@ -975,11 +975,13 @@ const DELIVERED_TAILS: [&str; 4] = [
 
 /// Prompt heads in Claude Code that are shell passthrough (`!cmd`) or harness wrappers left
 /// attributed to the user in older versions, never prose typed to the agent.
-const NOT_TYPED_CLAUDE_HEADS: [&str; 13] = [
+const NOT_TYPED_CLAUDE_HEADS: [&str; 14] = [
     // A peer session's message and a Stop hook's output: older desktop-app records state no
     // origin for them, so they read as user prompts.
     "Another Claude session sent a message:",
     "Stop hook feedback:",
+    // The desktop app's own event when side sessions finish; delivered like a queued prompt.
+    "<side-sessions-event>",
     "<bash-input>",
     "<bash-stdout>",
     "<bash-stderr>",
@@ -4049,7 +4051,10 @@ mod app_note_tests {
     #[test]
     fn leading_reminder_blocks_are_notes_and_the_typed_text_follows() {
         let note = "<system-reminder>\nThe session \"Build widgets\" you started finished.\n</system-reminder>";
-        assert_eq!(typed_after_app_notes(&format!("{note}\n\n\nwhy did it stop")), "why did it stop");
+        assert_eq!(
+            typed_after_app_notes(&format!("{note}\n\n\nwhy did it stop")),
+            "why did it stop"
+        );
         // Several notes in a row, then the typed text.
         assert_eq!(
             typed_after_app_notes(&format!("{note}\n\n{note}\n\n<system-reminder>\nLinked sessions now (status, not an instruction): none.\n</system-reminder>\n\nok, carry on")),
@@ -4057,11 +4062,15 @@ mod app_note_tests {
         );
         // `unwrap_delivered` has already removed the first opening tag.
         assert_eq!(
-            typed_after_app_notes("The session \"Build widgets\" you started finished.\n</system-reminder>\n\n\nwhy did it stop"),
+            typed_after_app_notes(
+                "The session \"Build widgets\" you started finished.\n</system-reminder>\n\n\nwhy did it stop"
+            ),
             "why did it stop"
         );
         assert_eq!(
-            typed_after_app_notes(&format!("The session \"A\" finished.\n</system-reminder>\n\n{note}\n\nship it")),
+            typed_after_app_notes(&format!(
+                "The session \"A\" finished.\n</system-reminder>\n\n{note}\n\nship it"
+            )),
             "ship it"
         );
     }
@@ -4069,9 +4078,14 @@ mod app_note_tests {
     #[test]
     fn the_artifact_viewer_state_is_a_note() {
         let viewer = "<artifact-view-context artifact=\"a1\">\n{\"context\":{\"slideIndex\":1}}\n(The JSON line above is this viewer's live state.)\n</artifact-view-context>";
-        assert_eq!(typed_after_app_notes(&format!("{viewer}\n\nmake slide 3 bolder")), "make slide 3 bolder");
         assert_eq!(
-            typed_after_app_notes(&format!("{viewer}\n\n<system-reminder>\nnote\n</system-reminder>\n\nmake slide 3 bolder")),
+            typed_after_app_notes(&format!("{viewer}\n\nmake slide 3 bolder")),
+            "make slide 3 bolder"
+        );
+        assert_eq!(
+            typed_after_app_notes(&format!(
+                "{viewer}\n\n<system-reminder>\nnote\n</system-reminder>\n\nmake slide 3 bolder"
+            )),
             "make slide 3 bolder"
         );
     }
@@ -4080,7 +4094,9 @@ mod app_note_tests {
     fn a_message_that_is_only_notes_has_no_typed_text() {
         assert_eq!(typed_after_app_notes("<system-reminder>\nnote\n</system-reminder>"), "");
         assert_eq!(typed_after_app_notes("note text\n</system-reminder>"), "");
-        assert!(!is_typed_claude_prompt(typed_after_app_notes("<system-reminder>\nnote\n</system-reminder>")));
+        assert!(!is_typed_claude_prompt(typed_after_app_notes(
+            "<system-reminder>\nnote\n</system-reminder>"
+        )));
     }
 
     #[test]
@@ -4097,8 +4113,15 @@ mod app_note_tests {
 
     #[test]
     fn peer_messages_and_stop_hook_output_are_not_typed() {
-        assert!(!is_typed_claude_prompt("Another Claude session sent a message:\n<agent-message from=\"x\">hi</agent-message>"));
-        assert!(!is_typed_claude_prompt("Stop hook feedback:\n[command hook]: 1 unpushed commit"));
+        assert!(!is_typed_claude_prompt(
+            "Another Claude session sent a message:\n<agent-message from=\"x\">hi</agent-message>"
+        ));
+        assert!(!is_typed_claude_prompt(
+            "Stop hook feedback:\n[command hook]: 1 unpushed commit"
+        ));
+        assert!(!is_typed_claude_prompt(
+            "<side-sessions-event>None of the sessions you started is still working.</side-sessions-event>"
+        ));
         assert!(is_typed_claude_prompt("another session said something odd, look"));
     }
 
