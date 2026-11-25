@@ -27,6 +27,10 @@ use std::path::{Path, PathBuf};
 pub(crate) const EXCERPT_BYTES: usize = 1600;
 /// How many distinct files to keep per source section (curation over completeness).
 const MAX_FILES_PER_SOURCE: usize = 8;
+/// How many distinct commands to keep per source section.
+const MAX_COMMANDS_PER_SOURCE: usize = 12;
+/// Maximum UTF-8 bytes of one command shown in `Commands run:` / `You ran:`.
+const MAX_COMMAND_BYTES: usize = 200;
 /// Rows of the cross-source file rollup.
 const MAX_ROLLUP: usize = 12;
 
@@ -185,6 +189,8 @@ pub(crate) fn cmd_pack(args: PackArgs<'_>) -> Result<()> {
                 s.overview = None;
                 s.excerpt.clear();
                 s.commands.clear();
+                s.commands_cut = 0;
+                s.commands_dropped = 0;
                 s.session.title = None;
                 s.edits.retain(|p, _| !review::runner(p));
                 s.reads.retain(|p, _| !review::runner(p));
@@ -547,8 +553,12 @@ struct PackSource {
     edits: BTreeMap<String, i64>,
     /// `path → read count`, from `file_read` events.
     reads: BTreeMap<String, i64>,
-    /// Distinct commands run, in first-seen order (whole, no arbitrary command count/char cap).
+    /// Distinct bounded commands run, in first-seen order, capped at [`MAX_COMMANDS_PER_SOURCE`].
     commands: Vec<String>,
+    /// Kept commands in `commands` that were shortened (heredoc body elided or cut at [`MAX_COMMAND_BYTES`]).
+    commands_cut: usize,
+    /// Distinct commands beyond [`MAX_COMMANDS_PER_SOURCE`] left out of `commands`.
+    commands_dropped: usize,
 }
 
 fn resolve_hit(hit: &cv_search::Hit) -> Result<(cv_core::SessionRef, Box<dyn cv_core::Adapter>)> {
@@ -579,7 +589,13 @@ fn build_source(
     let (excerpt, excerpt_range) =
         best_window_and_ingest_meta(adapter, &session, task, excerpt_bytes, Some(&mut resolved))?;
     let rows = cv_core::events::read_ref(&session, None)?;
-    let EventFacts { edits, reads, commands } = event_facts(&rows);
+    let EventFacts {
+        edits,
+        reads,
+        commands,
+        commands_cut,
+        commands_dropped,
+    } = event_facts(&rows);
 
     Ok(PackSource {
         verified: Default::default(),
@@ -592,6 +608,8 @@ fn build_source(
         edits,
         reads,
         commands,
+        commands_cut,
+        commands_dropped,
     })
 }
 
@@ -622,6 +640,8 @@ fn build_overview_source(
         edits: facts.edits,
         reads: facts.reads,
         commands: Vec::new(),
+        commands_cut: 0,
+        commands_dropped: 0,
     })
 }
 
@@ -630,13 +650,119 @@ struct EventFacts {
     edits: BTreeMap<String, i64>,
     reads: BTreeMap<String, i64>,
     commands: Vec<String>,
+    commands_cut: usize,
+    commands_dropped: usize,
+}
+
+/// True when `line` contains an unquoted shell heredoc operator (`<<EOF`, `<<'EOF'`, `<<"EOF"`,
+/// `<<-EOF`, `<< 'EOF'`, `<<\EOF`), distinguishing heredocs from `<<<` here-strings and quoted `<<`.
+fn has_heredoc_operator(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    let (mut in_single, mut in_double, mut i) = (false, false, 0);
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_single {
+            if b == b'\'' {
+                in_single = false;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'\\' {
+            i += 2;
+            continue;
+        }
+        if in_double {
+            if b == b'"' {
+                in_double = false;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'\'' => in_single = true,
+            b'"' => in_double = true,
+            b'<' if bytes.get(i + 1) == Some(&b'<')
+                && bytes.get(i + 2) != Some(&b'<')
+                && (i == 0 || bytes[i - 1] != b'<') =>
+            {
+                let mut j = i + 2;
+                if bytes.get(j) == Some(&b'-') {
+                    j += 1;
+                }
+                while matches!(bytes.get(j), Some(b' ' | b'\t')) {
+                    j += 1;
+                }
+                if matches!(
+                    bytes.get(j),
+                    Some(b'\'' | b'"' | b'\\' | b'A'..=b'Z' | b'a'..=b'z' | b'_')
+                ) {
+                    return true;
+                }
+                i += 2;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Bound one shell command for `Commands run:` / `You ran:`:
+/// 1. Multiline shell heredocs keep the first line (command head + heredoc operator) and elide the
+///    body with ` …`.
+/// 2. Every command is capped at [`MAX_COMMAND_BYTES`] UTF-8 bytes on a char boundary (`…` when
+///    cut) and remaining internal newlines collapse to single spaces without allocating long tails.
+fn bound_command(raw: &str) -> (String, bool) {
+    let trimmed = raw.trim();
+    if let Some((first_line, _)) = trimmed.split_once('\n') {
+        if has_heredoc_operator(first_line) {
+            let head = first_line.trim_end_matches('\r').trim_end();
+            if head.len() > MAX_COMMAND_BYTES {
+                let cut = head[..floor_char(head, MAX_COMMAND_BYTES)].trim_end();
+                return (format!("{cut}…"), true);
+            }
+            return (format!("{head} …"), true);
+        }
+    }
+    let mut out = String::with_capacity(trimmed.len().min(MAX_COMMAND_BYTES + 8));
+    let mut pending_nl = false;
+    let mut truncated = false;
+    for ch in trimmed.chars() {
+        if matches!(ch, '\n' | '\r') {
+            pending_nl = true;
+            continue;
+        }
+        if pending_nl {
+            pending_nl = false;
+            if out.len() + 1 > MAX_COMMAND_BYTES {
+                truncated = true;
+                break;
+            }
+            out.push(' ');
+        }
+        if out.len() + ch.len_utf8() > MAX_COMMAND_BYTES {
+            truncated = true;
+            break;
+        }
+        out.push(ch);
+    }
+    if truncated {
+        let cut = out.trim_end();
+        (format!("{cut}…"), true)
+    } else {
+        (out, false)
+    }
 }
 
 fn event_facts(rows: &[cv_core::events::EventRow]) -> EventFacts {
     let mut edits: BTreeMap<String, i64> = BTreeMap::new();
     let mut reads: BTreeMap<String, i64> = BTreeMap::new();
     let mut commands: Vec<String> = Vec::new();
-    let mut seen: HashSet<&str> = HashSet::new();
+    let mut commands_cut = 0usize;
+    let mut commands_dropped = 0usize;
+    let mut seen: HashSet<String> = HashSet::new();
     for e in rows {
         match e.kind.as_str() {
             "file_edit" => {
@@ -651,8 +777,16 @@ fn event_facts(rows: &[cv_core::events::EventRow]) -> EventFacts {
             }
             "command" => {
                 if let Some(c) = &e.target {
-                    if seen.insert(c.as_str()) {
-                        commands.push(c.replace('\n', " "));
+                    let (bounded, was_cut) = bound_command(c);
+                    if !bounded.is_empty() && seen.insert(bounded.clone()) {
+                        if commands.len() < MAX_COMMANDS_PER_SOURCE {
+                            if was_cut {
+                                commands_cut += 1;
+                            }
+                            commands.push(bounded);
+                        } else {
+                            commands_dropped += 1;
+                        }
                     }
                 }
             }
@@ -660,7 +794,13 @@ fn event_facts(rows: &[cv_core::events::EventRow]) -> EventFacts {
         }
     }
 
-    EventFacts { edits, reads, commands }
+    EventFacts {
+        edits,
+        reads,
+        commands,
+        commands_cut,
+        commands_dropped,
+    }
 }
 
 /// Stream the session once (lazy spans, head-capped per message) and return a compact window of
@@ -899,9 +1039,12 @@ fn bounds_line(sources: &[PackSource], bounds: &Bounds) -> String {
         .iter()
         .map(|s| s.excerpt.iter().filter(|(_, _, _, cut)| *cut).count())
         .sum();
+    let commands_cut: usize = sources.iter().map(|s| s.commands_cut).sum();
+    let commands_dropped: usize = sources.iter().map(|s| s.commands_dropped).sum();
     let files_dropped: usize = sources.iter().map(files_dropped).sum();
     format!(
         "Bounds: each excerpt message to {} bytes (`--excerpt-bytes`; {excerpts_cut} cut, marked …); \
+         {MAX_COMMANDS_PER_SOURCE} commands per source to {MAX_COMMAND_BYTES} bytes ({commands_cut} cut, {commands_dropped} left out); \
          {MAX_FILES_PER_SOURCE} files per source ({files_dropped} left out); {MAX_ROLLUP} rollup files ({} left out).",
         bounds.excerpt_bytes, bounds.rollup_dropped
     )
@@ -1555,6 +1698,28 @@ mod tests {
         let facts = event_facts(&rows);
         assert_eq!(facts.commands.len(), 10, "all 10 distinct commands kept");
         assert!(facts.commands.iter().all(|c| c.len() > 150), "no 90-char truncation");
+        assert_eq!((facts.commands_cut, facts.commands_dropped), (0, 0));
+    }
+
+    #[test]
+    fn bound_command_elides_heredocs_and_bounds_long_commands_on_char_boundaries() {
+        for op in ["<<EOF", "<<'EOF'", "<<\"EOF\"", "<<-EOF", "<< 'EOF'", "<<\\EOF"] {
+            let cmd = format!("cat {op} > /tmp/out.json\n{}\nEOF", "payload ".repeat(1024));
+            let (bounded, cut) = bound_command(&cmd);
+            assert!(cut, "{op}");
+            assert_eq!(bounded, format!("cat {op} > /tmp/out.json …"));
+        }
+        // Quoted bitshift is not a shell heredoc.
+        let (bitshift, cut) = bound_command("python3 -c \"x = a << b\nprint(x)\"");
+        assert!(!cut);
+        assert_eq!(bitshift, "python3 -c \"x = a << b print(x)\"");
+
+        // Multibyte UTF-8 boundary + 200-byte cap.
+        let long_utf8 = format!("python3 -c \"print('{}')\"", "λ".repeat(150));
+        let (bounded, cut) = bound_command(&long_utf8);
+        assert!(cut);
+        assert!(bounded.ends_with('…'));
+        assert!(bounded.strip_suffix('…').unwrap().len() <= MAX_COMMAND_BYTES);
     }
 
     #[test]
@@ -1694,6 +1859,8 @@ mod tests {
             edits: BTreeMap::new(),
             reads: BTreeMap::new(),
             commands: Vec::new(),
+            commands_cut: 0,
+            commands_dropped: 0,
         };
         let bounds = Bounds {
             excerpt_bytes: EXCERPT_BYTES,

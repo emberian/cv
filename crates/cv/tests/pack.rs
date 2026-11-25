@@ -136,7 +136,7 @@ fn pack_header_states_its_bounds_and_what_they_cut() {
     pack_corpus(&w);
     let (out, _) = w.cv_ok(&["pack", "wombat caching layer"]);
     assert!(
-        out.contains("Bounds: each excerpt message to 1600 bytes (`--excerpt-bytes`; 0 cut, marked …)"),
+        out.contains("Bounds: each excerpt message to 1600 bytes (`--excerpt-bytes`; 0 cut, marked …); 12 commands per source to 200 bytes (0 cut, 0 left out);"),
         "{out}"
     );
     let (out, _) = w.cv_ok(&["pack", "wombat caching layer", "--excerpt-bytes", "20"]);
@@ -737,4 +737,76 @@ fn pack_current_failures_survive_abandonment_and_explicit_resolution_is_inspecta
     let (history, _) = w.cv_ok(&["pack", id, "--all"]);
     assert!(history.contains("Stale findings") && history.contains("retired experiment"));
     assert!(history.contains("Addressed findings") && history.contains("empty input crashes"));
+}
+
+#[test]
+fn pack_bounds_348kb_heredoc_and_caps_commands_per_source() {
+    let w = World::new("pack-heredoc-bounds");
+    let heredoc_body = "x".repeat(348 * 1024);
+    let heredoc_cmd = format!("cat <<'EOF' > /work/proj/giant.txt\n{heredoc_body}\nEOF");
+    w.write_session(
+        "heredocsess",
+        &[
+            serde_json::json!({"type": "ai-title", "aiTitle": "heredoc command bound"}),
+            user_line(
+                "heredocsess",
+                "h1",
+                "2026-02-01T10:00:00Z",
+                "materialize giant fixture safely",
+            ),
+            assistant_line(
+                "h2",
+                "2026-02-01T10:01:00Z",
+                serde_json::json!([
+                    {"type": "text", "text": "wrote the fixture with a heredoc"},
+                    {"type": "tool_use", "id": "ht1", "name": "Bash", "input": {"command": heredoc_cmd}}
+                ]),
+            ),
+        ],
+    );
+    let (out, _) = w.cv_ok(&["pack", "materialize giant fixture safely"]);
+    let cmd_line = out
+        .lines()
+        .find(|l| l.starts_with("Commands run:"))
+        .expect("Commands run line present");
+    assert!(
+        cmd_line.chars().count() <= 250,
+        "Commands run line must stay compact (got {} chars):\n{cmd_line}",
+        cmd_line.chars().count()
+    );
+    assert!(cmd_line.contains("cat <<'EOF' > /work/proj/giant.txt …"), "{cmd_line}");
+    assert!(!out.contains(&"x".repeat(64)), "heredoc body leaked into pack");
+    assert!(
+        out.contains("12 commands per source to 200 bytes (1 cut, 0 left out)"),
+        "{out}"
+    );
+
+    // Also verify >12 distinct commands + long `-c` scripts cap at 12 and report both cut & left out.
+    let mut tool_blocks = vec![serde_json::json!({"type": "text", "text": "ran fifteen commands for bandicoot suite"})];
+    tool_blocks.push(serde_json::json!({
+        "type": "tool_use", "id": "bt0", "name": "Bash",
+        "input": {"command": format!("python3 -c \"{}\"", "y = 1; ".repeat(80))}
+    }));
+    for i in 1..15 {
+        tool_blocks.push(serde_json::json!({
+            "type": "tool_use", "id": format!("bt{i}"), "name": "Bash",
+            "input": {"command": format!("cargo test -p bandicoot-crate-{i}")}
+        }));
+    }
+    w.write_session(
+        "manycmds",
+        &[
+            user_line("manycmds", "m1", "2026-02-02T10:00:00Z", "bandicoot suite commands"),
+            assistant_line("m2", "2026-02-02T10:01:00Z", serde_json::Value::Array(tool_blocks)),
+        ],
+    );
+    for format in ["md", "prompt"] {
+        let (out, _) = w.cv_ok(&["pack", "bandicoot suite commands", "--format", format]);
+        assert!(
+            out.contains("12 commands per source to 200 bytes (1 cut, 3 left out)"),
+            "{format}:\n{out}"
+        );
+        assert!(out.contains("cargo test -p bandicoot-crate-11"), "{out}");
+        assert!(!out.contains("cargo test -p bandicoot-crate-12"), "{out}");
+    }
 }
