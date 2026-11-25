@@ -61,6 +61,9 @@ pub const CLEARED_ENV: &[&str] = &[
     "GOOSE_PATH_ROOT",
     "ANTIGRAVITY_APP_DATA_DIR",
     "ANTIGRAVITY_GEMINI_DIR",
+    // A seat inside Antigravity names its live language server; a test must never deliver to it.
+    "ANTIGRAVITY_LS_ADDRESS",
+    "ANTIGRAVITY_CSRF_TOKEN",
     "JETSKI_APP_DATA_DIR",
     "OPENCLAW_STATE_DIR",
     "PI_CODING_AGENT_DIR",

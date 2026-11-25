@@ -241,6 +241,8 @@ fn emitter_for(target: Harness) -> Result<StagedEmitFn, &'static str> {
         Harness::Gemini => crate::harness::gemini::emit_staged,
         #[cfg(feature = "sqlite")]
         Harness::Hermes => crate::harness::hermes::emit_staged,
+        #[cfg(feature = "sqlite")]
+        Harness::Antigravity => crate::harness::antigravity::emit_staged,
         Harness::LmStudio => crate::harness::lmstudio::emit_staged,
         Harness::Cline => crate::harness::cline::emit_staged,
         Harness::Roo => crate::harness::roo::emit_staged,
@@ -249,12 +251,11 @@ fn emitter_for(target: Harness) -> Result<StagedEmitFn, &'static str> {
         // gemini-cli recording it no longer reads.
         Harness::Qwen => crate::harness::qwen::emit_staged,
         #[cfg(not(feature = "sqlite"))]
-        Harness::Hermes => return Err("requires the `sqlite` feature"),
+        Harness::Hermes | Harness::Antigravity => return Err("requires the `sqlite` feature"),
         // Parse-only harnesses (Cursor, Goose, desktop apps, …) aren't conversion targets. Kimi
         // (`~/.kimi`) is not one either: kimi-cli froze that store in 2026-06 and migrates it to
         // `~/.kimi-code` on open, so a session written there was a port to nowhere.
         Harness::Cursor
-        | Harness::Antigravity
         | Harness::Pi
         | Harness::Goose
         | Harness::Zed
@@ -552,6 +553,42 @@ fn emit_checked(
     Ok((result, report))
 }
 
+/// Undoes one fresh publication: `(out_dir, out_existed, out_was_empty, result)`.
+type RetractFn = fn(&Path, bool, bool, &EmitResult);
+
+/// The emitters whose publication spans more than one file own their retraction; every other
+/// target is undone by [`retract_emitted`]'s shared file-or-database removal.
+fn retractor_for(target: Harness) -> Option<RetractFn> {
+    match target {
+        #[cfg(feature = "sqlite")]
+        Harness::Antigravity => Some(crate::harness::antigravity::emit::retract),
+        #[cfg(not(feature = "sqlite"))]
+        Harness::Antigravity => None,
+        Harness::Claude
+        | Harness::Codex
+        | Harness::Grok
+        | Harness::OpenCode
+        | Harness::OpenClaw
+        | Harness::Gemini
+        | Harness::Hermes
+        | Harness::LmStudio
+        | Harness::Cline
+        | Harness::Roo
+        | Harness::Continue
+        | Harness::Qwen
+        | Harness::Cursor
+        | Harness::Pi
+        | Harness::Goose
+        | Harness::Zed
+        | Harness::Devin
+        | Harness::Kimi
+        | Harness::KimiCode
+        | Harness::ChatGptExport
+        | Harness::ClaudeExport
+        | Harness::OpenSession => None,
+    }
+}
+
 /// Undo a fresh [`emit`] publication when a companion post-step (such as carrying tool artifacts)
 /// fails, so a failed port never leaves a partial target transcript behind.
 pub fn retract_emitted(
@@ -567,6 +604,10 @@ pub fn retract_emitted(
         if sdir != res.path {
             let _ = fs::remove_dir(&sdir);
         }
+    }
+    if let Some(retract) = retractor_for(target) {
+        retract(out_dir, out_existed, out_was_empty, res);
+        return Ok(());
     }
     let is_db = matches!(
         res.path.extension().and_then(|v| v.to_str()),
@@ -3626,7 +3667,8 @@ mod tests {
             };
             let out = temp_dir();
             let pinned = EmitOptions {
-                new_id: Some("pinned-session".into()),
+                // A UUID, which every target accepts (Antigravity requires one).
+                new_id: Some("0b0e5f4e-6a53-4d55-9f27-5e2f3c1a9d01".into()),
                 ..Default::default()
             };
             let session = sample_session(Harness::Claude);

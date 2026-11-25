@@ -53,11 +53,21 @@ use std::path::{Path, PathBuf};
 
 #[cfg(feature = "sqlite")]
 pub mod cold;
+#[cfg(feature = "sqlite")]
+pub mod deliver;
+#[cfg(feature = "sqlite")]
+pub mod emit;
+#[cfg(feature = "sqlite")]
+pub use emit::emit;
+#[cfg(feature = "sqlite")]
+pub(crate) use emit::emit_staged;
 mod lifecycle;
 #[cfg(feature = "sqlite")]
 mod merge;
 #[cfg(feature = "sqlite")]
 mod native;
+#[cfg(feature = "sqlite")]
+pub mod seed;
 
 const APP_DATA_SUBDIRS: &[&str] = &["antigravity-cli", "antigravity", "antigravity-ide"];
 
@@ -220,6 +230,10 @@ impl Adapter for Antigravity {
     }
 
     fn has_cold_rewind(&self) -> bool {
+        cfg!(feature = "sqlite")
+    }
+
+    fn accepts_seed(&self) -> bool {
         cfg!(feature = "sqlite")
     }
 
@@ -4233,6 +4247,28 @@ fn parse_user_settings_model(block: &str) -> Option<String> {
         }
     }
     result
+}
+
+#[cfg(feature = "sqlite")]
+pub(crate) fn path_to_file_uri(path: &Path) -> String {
+    const FILE_URI_SET: &percent_encoding::AsciiSet = &percent_encoding::CONTROLS
+        .add(b' ')
+        .add(b'"')
+        .add(b'#')
+        .add(b'%')
+        .add(b'<')
+        .add(b'>')
+        .add(b'?')
+        .add(b'`')
+        .add(b'{')
+        .add(b'}');
+    let raw = path.to_string_lossy();
+    let encoded = percent_encoding::utf8_percent_encode(&raw, FILE_URI_SET);
+    if raw.starts_with('/') {
+        format!("file://{encoded}")
+    } else {
+        format!("file:///{encoded}")
+    }
 }
 
 pub(crate) fn file_uri_to_path(uri: &str) -> Option<PathBuf> {

@@ -193,10 +193,32 @@ impl Sent {
 
     /// The source conversation arrived whole: the first prompt, the call and its paired result,
     /// the agent's reply, the working directory, and the new prompt last.
-    fn assert_continues_source(&self, raw: &Value, cwd: &str, what: &str) {
+    /// `seeded`: the target holds the source as one seed prompt (the adapter's `accepts_seed`), so
+    /// the call and its result arrive as rendered text rather than as a paired tool exchange.
+    fn assert_continues_source(&self, raw: &Value, cwd: &str, what: &str, seeded: bool) {
         let all = self.texts.join("\n");
         assert!(all.contains(FIRST), "{what}: first prompt missing:\n{self:#?}");
         assert!(all.contains(SAID), "{what}: agent reply missing:\n{self:#?}");
+        if seeded {
+            assert!(
+                all.contains(COMMAND) && all.contains(OUTPUT),
+                "{what}: the seed lacks the call or its output:\n{self:#?}"
+            );
+        } else {
+            self.assert_paired_call(what);
+        }
+        assert!(
+            self.last_user.contains(PROMPT),
+            "{what}: the new prompt is not the last user turn:\n{self:#?}"
+        );
+        // The harness tells the model where it runs; that is how the cwd travels.
+        assert!(
+            raw.to_string().contains(&json_escaped(cwd)),
+            "{what}: the working directory {cwd} never reached the model"
+        );
+    }
+
+    fn assert_paired_call(&self, what: &str) {
         let call = self
             .calls
             .iter()
@@ -208,15 +230,6 @@ impl Sent {
                 .any(|(id, out)| id == &call.0 && out.contains(OUTPUT)),
             "{what}: call {} has no paired result with the output:\n{self:#?}",
             call.0
-        );
-        assert!(
-            self.last_user.contains(PROMPT),
-            "{what}: the new prompt is not the last user turn:\n{self:#?}"
-        );
-        // The harness tells the model where it runs; that is how the cwd travels.
-        assert!(
-            raw.to_string().contains(&json_escaped(cwd)),
-            "{what}: the working directory {cwd} never reached the model"
         );
     }
 }
@@ -260,11 +273,7 @@ fn load_tables_name_a_resumable_loopback_invocation() {
         let load = load(h);
         load.validate().unwrap_or_else(|e| panic!("{h}: {e:#}"));
         assert_eq!(load.protocol, protocol, "{h}");
-        assert_eq!(
-            cv_core::emit::supported_targets().contains(&h),
-            h != Harness::Antigravity,
-            "{h}: emit target"
-        );
+        assert!(cv_core::emit::supported_targets().contains(&h), "{h}: emit target");
         let argv = load.argv_with(&vars);
         let env = load.env_with(&vars);
         assert!(argv.iter().any(|a| a == "sess-0001"), "{h}: {argv:?}");
@@ -434,7 +443,7 @@ fn loopback_answers_every_wire_and_records_the_continued_conversation() {
         assert_eq!(recorded.streamed, stream, "{path}");
         assert_eq!(recorded.target, path);
         let body = recorded.body.as_ref().expect("JSON body recorded");
-        Sent::read(wire, body).assert_continues_source(body, cwd, path);
+        Sent::read(wire, body).assert_continues_source(body, cwd, path, false);
     }
 
     // A tool call the codec wrote is read back by the codec: same id, name and input.
@@ -721,9 +730,10 @@ fn l2(h: Harness) {
         .filter(|(sent, _)| sent.last_user.contains(PROMPT))
         .max_by_key(|(sent, _)| sent.calls.len())
         .unwrap_or_else(|| panic!("{h}: no {wire:?} request carried the prompt\n{}", report()));
+    let seeded = cv_core::harness::rootless(h).is_some_and(|a| a.accepts_seed());
     continued
         .0
-        .assert_continues_source(&continued.1, project.to_str().unwrap(), h.as_str());
+        .assert_continues_source(&continued.1, project.to_str().unwrap(), h.as_str(), seeded);
 
     // The harness appended its continuation to the store, and cv reads it back.
     let (ok, code, md, err) = w.cv_env(&["export", &format!("{h}:{id}"), "--format", "md"], &env_refs);

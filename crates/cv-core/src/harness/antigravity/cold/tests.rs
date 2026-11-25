@@ -260,3 +260,190 @@ fn antigravity_uncompact_1516_cold_successor_and_field_coverage() -> Result<()> 
         .ends_with("<truncated 129210 bytes>"));
     Ok(())
 }
+
+#[test]
+fn cold_rewind_copies_executor_row_zero_and_strips_parent_references() -> Result<()> {
+    // #tooth: executor_metadata idx=0 carries model/agent configuration and must survive verbatim,
+    // while idx>0, parent_references, battle_mode_infos, and blob field 5 are omitted for standalone roots.
+    let world = crate::test_world("antigravity-cold-exec-parent");
+    let (db, _) = fixture(&world.base.join("source"))?;
+    {
+        let conn = Connection::open(&db.path)?;
+        conn.execute(
+            "INSERT INTO executor_metadata VALUES(0, ?1), (1, ?2)",
+            params![b"exec-row-0-config".as_slice(), b"exec-row-1-stale".as_slice()],
+        )?;
+        conn.execute(
+            "INSERT INTO parent_references VALUES(0, ?1)",
+            params![b"parent-link".as_slice()],
+        )?;
+        conn.execute(
+            "INSERT INTO battle_mode_infos VALUES(0, ?1)",
+            params![b"battle-row".as_slice()],
+        )?;
+        let ws_uri = field(1, b"file:///tmp/space%20dir");
+        let parent_ref = field(1, b"99999999-9999-4999-8999-999999999999");
+        let blob = [
+            field(1, &ws_uri),
+            field(5, &parent_ref),
+            field(6, b"99999999-9999-4999-8999-999999999999"),
+        ]
+        .concat();
+        conn.execute("UPDATE trajectory_metadata_blob SET data=?1 WHERE id='main'", [blob])?;
+    }
+    let out = world.base.join("standalone");
+    let res = rewind(&db, &options(&out), true, None)?;
+    assert_eq!(res.executor_rows_kept, 1);
+    assert_eq!(res.executor_rows_omitted, 1);
+    assert_eq!(res.parent_references_omitted, 1);
+    assert_eq!(res.battle_mode_rows_omitted, 1);
+    assert_eq!(res.warnings.len(), 2, "{:?}", res.warnings);
+
+    let dst = Connection::open(res.new_path.as_ref().unwrap())?;
+    let exec_rows: Vec<(i64, Vec<u8>)> = dst
+        .prepare("SELECT idx, data FROM executor_metadata ORDER BY idx")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    assert_eq!(exec_rows, vec![(0, b"exec-row-0-config".to_vec())]);
+    assert_eq!(
+        dst.query_row("SELECT COUNT(*) FROM parent_references", [], |r| r.get::<_, i64>(0))?,
+        0
+    );
+    assert_eq!(
+        dst.query_row("SELECT COUNT(*) FROM battle_mode_infos", [], |r| r.get::<_, i64>(0))?,
+        0
+    );
+    let rewritten_blob: Vec<u8> =
+        dst.query_row("SELECT data FROM trajectory_metadata_blob WHERE id='main'", [], |r| {
+            r.get(0)
+        })?;
+    assert!(
+        proto::nested(&rewritten_blob, 5).is_err(),
+        "field 5 parent ref must be stripped"
+    );
+    assert_eq!(proto::nested(&rewritten_blob, 6)?, res.new_id.as_bytes());
+    Ok(())
+}
+
+#[test]
+fn cold_rewind_n2_excludes_build_trees_and_enforces_closure_budget() -> Result<()> {
+    // #tooth: multi-gigabyte scratch/target-* Cargo dirs, nested worktrees, .git, CACHEDIR.TAG caches,
+    // and files exceeding the closure budget must never be copied into the cold successor's brain dir.
+    let world = crate::test_world("antigravity-cold-n2-budget");
+    let src_root = world.base.join("source");
+    let (db, _) = fixture(&src_root)?;
+    let brain = src_root.join("brain").join(OLD);
+
+    fs::create_dir_all(brain.join("scratch/target-wt2/debug/deps"))?;
+    fs::write(
+        brain.join("scratch/target-wt2/CACHEDIR.TAG"),
+        b"Signature: 8a477f597d28d172789f06886806bc55\n",
+    )?;
+    fs::write(
+        brain.join("scratch/target-wt2/debug/deps/libgiant.rlib"),
+        vec![b'R'; 32_768],
+    )?;
+
+    fs::create_dir_all(brain.join("scratch/custom_cache"))?;
+    fs::write(
+        brain.join("scratch/custom_cache/CACHEDIR.TAG"),
+        b"Signature: 8a477f597d28d172789f06886806bc55\n",
+    )?;
+    fs::write(brain.join("scratch/custom_cache/blob.bin"), vec![b'C'; 4096])?;
+
+    fs::create_dir_all(brain.join("scratch/worktrees/exp/.git"))?;
+    fs::write(brain.join("scratch/worktrees/exp/main.rs"), b"fn main() {}")?;
+
+    fs::create_dir_all(brain.join(".git"))?;
+    fs::write(brain.join(".git/HEAD"), b"ref: refs/heads/main\n")?;
+
+    fs::write(brain.join("scratch/over_budget.bin"), vec![b'B'; 4096])?;
+
+    let out = world.base.join("bounded");
+    let res = rewind_with_closure_budget(&db, &options(&out), true, None, 1024)?;
+    let dst_brain = out.join("brain").join(&res.new_id);
+    assert_eq!(fs::read(dst_brain.join("scratch/notes.txt"))?, b"source artifact");
+    assert_eq!(res.closure_bytes, "source artifact".len() as u64);
+    assert!(!dst_brain.join("scratch/target-wt2").exists());
+    assert!(!dst_brain.join("scratch/custom_cache").exists());
+    assert!(!dst_brain.join("scratch/worktrees").exists());
+    assert!(!dst_brain.join(".git").exists());
+    assert!(!dst_brain.join("scratch/over_budget.bin").exists());
+
+    let omitted_paths: BTreeMap<&str, (Option<u64>, &str)> = res
+        .uncaptured
+        .iter()
+        .map(|u| (u.path.as_str(), (u.bytes, u.why)))
+        .collect();
+    assert!(omitted_paths.contains_key(".git"), "{omitted_paths:?}");
+    assert!(omitted_paths.contains_key("scratch/target-wt2"), "{omitted_paths:?}");
+    assert!(omitted_paths.contains_key("scratch/custom_cache"), "{omitted_paths:?}");
+    assert!(omitted_paths.contains_key("scratch/worktrees"), "{omitted_paths:?}");
+    assert_eq!(
+        omitted_paths.get("scratch/over_budget.bin"),
+        Some(&(Some(4096), "exceeds brain closure byte budget"))
+    );
+    Ok(())
+}
+
+#[test]
+fn cold_rewind_offline_root_without_out_and_live_or_locked_refusal() -> Result<()> {
+    // #tooth: omitting --out publishes into the offline source root when no LS env is set,
+    // percent-encodes workspace_uris spaces, and refuses active LS env or a locked summary DB.
+    let env_guard = crate::env::Env::enter_isolated(Vec::new(), Vec::new());
+    env_guard.remove("ANTIGRAVITY_LS_ADDRESS");
+    env_guard.remove("ANTIGRAVITY_CSRF_TOKEN");
+
+    let world = crate::test_world("antigravity-cold-offline-root");
+    let src_root = world.base.join("app_root");
+    let (db, _) = fixture(&src_root)?;
+    let space_ws = world.base.join("work dir#1");
+    fs::create_dir_all(&space_ws)?;
+    {
+        let conn = Connection::open(&db.path)?;
+        let ws_uri = super::super::path_to_file_uri(&space_ws);
+        assert!(ws_uri.contains("work%20dir%231"), "{ws_uri}");
+        let blob = [field(1, &field(1, ws_uri.as_bytes())), field(6, OLD.as_bytes())].concat();
+        conn.execute("UPDATE trajectory_metadata_blob SET data=?1 WHERE id='main'", [blob])?;
+    }
+
+    let mut in_place_opts = options(&src_root);
+    in_place_opts.out_dir = None;
+    let res = rewind(&db, &in_place_opts, true, None)?;
+    let written = res.new_path.as_ref().unwrap();
+    assert_eq!(
+        written,
+        &src_root.join("conversations").join(format!("{}.db", res.new_id))
+    );
+    assert!(written.is_file());
+
+    let sum_conn = Connection::open(src_root.join("conversation_summaries.db"))?;
+    let uris_json: String = sum_conn.query_row(
+        "SELECT workspace_uris FROM conversation_summaries WHERE conversation_id=?1",
+        [&res.new_id],
+        |r| r.get(0),
+    )?;
+    assert!(uris_json.contains("work%20dir%231"), "{uris_json}");
+    drop(sum_conn);
+
+    // Live LS environment refuses implicit root writes.
+    env_guard.set("ANTIGRAVITY_LS_ADDRESS", "127.0.0.1:42424");
+    let err = rewind(&db, &in_place_opts, true, None)
+        .err()
+        .expect("live LS must refuse");
+    assert!(
+        err.to_string().contains("active Antigravity language server"),
+        "{err:#}"
+    );
+    env_guard.remove("ANTIGRAVITY_LS_ADDRESS");
+
+    // Locked conversation_summaries.db refuses immediately without hanging.
+    let mut lock_conn = Connection::open(src_root.join("conversation_summaries.db"))?;
+    let hold_tx = lock_conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let err = rewind(&db, &in_place_opts, true, None)
+        .err()
+        .expect("locked DB must refuse");
+    assert!(err.to_string().contains("locked by another writer"), "{err:#}");
+    drop(hold_tx);
+    Ok(())
+}

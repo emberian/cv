@@ -79,7 +79,11 @@ impl Plan {
             open_calls: Default::default(),
             undelivered_jobs: Default::default(),
         };
-        for (i, m) in session.messages.iter().enumerate().skip(boundary + 1) {
+        for &i in &branch {
+            if i <= boundary {
+                continue;
+            }
+            let m = &session.messages[i];
             if m.kind == Prompt && m.origin == Origin::Human {
                 plan.excluded_prompts.push(ExcludedPrompt {
                     message_index: i,
@@ -400,6 +404,48 @@ mod tests {
         let crossed = Plan::select(&r, &s, None)?;
         assert!(crossed.grafts.is_empty());
         assert!(crossed.ensure_closed().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn excluded_prompts_follow_the_selected_continuation_branch() -> Result<()> {
+        // #tooth: abandoned off-branch prompts placed after the boundary index must not leak into excluded_prompts.
+        let mut s = Session::new("branch-prompts", Harness::Claude);
+        let r = SessionRef::new("branch-prompts", Harness::Claude, "branch-prompts.jsonl");
+        let prompt = |id: &str, parent: Option<&str>, body: &str| {
+            let mut m = Message::of_kind(Role::User, MessageKind::Prompt, Origin::Human);
+            m.id = Some(id.to_owned());
+            m.parent_id = parent.map(str::to_owned);
+            m.content.push(Block::from_text(body.into()));
+            m
+        };
+        let node = |kind, id: &str, parent: Option<&str>| {
+            let mut m = Message::synthesized(kind, Origin::Harness);
+            m.id = Some(id.to_owned());
+            m.parent_id = parent.map(str::to_owned);
+            m
+        };
+        s.messages = vec![
+            prompt("u0", None, "initial quest"),
+            node(MessageKind::CompactionBoundary, "cut", Some("u0")),
+            prompt("abandoned", Some("u0"), "off-branch abandoned prompt"),
+            prompt("active1", Some("cut"), "first active post-compaction prompt"),
+            node(MessageKind::Reply, "r1", Some("active1")),
+            prompt("active2", Some("r1"), "second active post-compaction prompt"),
+        ];
+        let p = Plan::select(&r, &s, None)?;
+        let got: Vec<(&str, &str)> = p
+            .excluded_prompts
+            .iter()
+            .map(|ep| (ep.record_id.as_deref().unwrap_or(""), ep.text.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("active1", "first active post-compaction prompt"),
+                ("active2", "second active post-compaction prompt"),
+            ]
+        );
         Ok(())
     }
 }

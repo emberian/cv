@@ -326,7 +326,7 @@ fn ran_pointer(command: &str, pointer: &str) -> bool {
     let expected: Vec<_> = expected.collect();
     matches!(
         expected.as_slice(),
-        ["show" | "cat" | "lanes", ..] | ["task", "inbox" | "events", ..]
+        ["show" | "cat" | "lanes" | "adopt", ..] | ["task", "inbox" | "events", ..]
     ) && expected.into_iter().all(|part| actual.next() == Some(part))
 }
 

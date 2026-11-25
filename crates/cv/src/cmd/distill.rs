@@ -26,19 +26,49 @@ use serde_json::{json, Value};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DeliveryMode {
+    Cold,
+    Live,
+}
+
 /// Where a reshaped session goes.
 pub(crate) enum Target {
     /// Only the pack (stdout / `--pack`).
     PackOnly,
     /// A new main-thread session under the harness store (or `--out`), rehomed to `cwd` if given.
-    Session { cwd: Option<PathBuf>, out: Option<PathBuf> },
+    /// `seed` is set when the `--session` harness takes the pack as a one-prompt seed conversation
+    /// ([`cv_core::harness::Adapter::accepts_seed`]), and says how it is delivered.
+    Session {
+        seed: Option<DeliveryMode>,
+        cwd: Option<PathBuf>,
+        out: Option<PathBuf>,
+    },
     /// A new sub-agent transcript of this root session; `model` overrides its meta's `model`.
     AgentOf { root: String, model: Option<String> },
 }
 
-/// The destination the flags name.
+/// The destination the flags name (shared with `splice`, where `--session` is boolean).
 pub(crate) fn target(
     session: bool,
+    agent_of: Option<String>,
+    model: Option<String>,
+    cwd: Option<PathBuf>,
+    out: Option<PathBuf>,
+) -> Result<Target> {
+    target_for(
+        session.then(|| cv_core::harness::derived_host().as_str().to_owned()),
+        None,
+        agent_of,
+        model,
+        cwd,
+        out,
+    )
+}
+
+pub(crate) fn target_for(
+    session: Option<String>,
+    delivery: Option<String>,
     agent_of: Option<String>,
     model: Option<String>,
     cwd: Option<PathBuf>,
@@ -48,17 +78,50 @@ pub(crate) fn target(
         // clap's `requires` yields to `--session`'s conflict with `--agent-of`, so say it here.
         return usage("--model sets the new sub-agent's meta; it needs --agent-of");
     }
-    match (session, agent_of) {
+    let host = match session.as_deref() {
+        Some(raw) => {
+            let h = Harness::parse(raw)
+                .ok_or_else(|| crate::util::UsageError(format!("unknown --session harness: {raw}")))?;
+            let seeds = cv_core::harness::rootless(h).is_some_and(|a| a.accepts_seed());
+            if h != cv_core::harness::derived_host() && !seeds {
+                return usage(format!("--session does not support {h}"));
+            }
+            Some((h, seeds))
+        }
+        None => None,
+    };
+    match (host, agent_of) {
         (_, Some(root)) => {
-            if cwd.is_some() || out.is_some() {
-                return usage("--cwd/--out apply to --session; --agent-of writes next to the root transcript");
+            if cwd.is_some() || out.is_some() || delivery.is_some() {
+                return usage(
+                    "--cwd/--out/--delivery apply to --session; --agent-of writes next to the root transcript",
+                );
             }
             Ok(Target::AgentOf { root, model })
         }
-        (true, None) => Ok(Target::Session { cwd, out }),
-        (false, None) => {
-            if cwd.is_some() || out.is_some() {
-                return usage("--cwd/--out need --session");
+        (Some((harness, seeds)), None) => {
+            let seed = match (seeds, delivery.as_deref()) {
+                (true, None) if out.is_none() && cv_core::harness::antigravity::seed::live_configured() => {
+                    Some(DeliveryMode::Live)
+                }
+                (true, None | Some("cold")) => Some(DeliveryMode::Cold),
+                (true, Some("live")) => {
+                    if out.is_some() {
+                        return usage("--out applies to cold emission; omit --out with --delivery=live");
+                    }
+                    Some(DeliveryMode::Live)
+                }
+                (false, None | Some("cold")) => None,
+                (false, Some("live")) => {
+                    return usage(format!("--delivery=live is not supported with --session={harness}"));
+                }
+                (_, Some(other)) => return usage(format!("unknown --delivery {other:?} (use cold or live)")),
+            };
+            Ok(Target::Session { seed, cwd, out })
+        }
+        (None, None) => {
+            if cwd.is_some() || out.is_some() || delivery.is_some() {
+                return usage("--cwd/--out/--delivery need --session");
             }
             Ok(Target::PackOnly)
         }
@@ -226,6 +289,9 @@ pub(crate) struct Emitted {
     pub(crate) transcript_bytes: Option<u64>,
     /// Size on disk of the elided outputs. `cv cat` reads them; the harness never loads them.
     pub(crate) sidecar_bytes: Option<u64>,
+    /// Live Antigravity language-server delivery journal record when `--delivery=live` was used.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) delivery: Option<cv_core::harness::antigravity::deliver::Delivery>,
 }
 
 impl Emitted {
@@ -271,7 +337,10 @@ pub(crate) fn emit_to(
 ) -> Result<Emitted> {
     match target {
         Target::PackOnly => Ok(Emitted::default()),
-        Target::Session { cwd, out } => {
+        Target::Session { seed: Some(_), .. } => bail!("internal error: seed session targets emit via emit_seed"),
+        Target::Session {
+            seed: None, cwd, out, ..
+        } => {
             let out_dir = match out {
                 Some(d) => d.clone(),
                 None => cv_core::harness::for_harness(cv_core::harness::derived_host())
@@ -484,10 +553,106 @@ fn report_text(d: &Distilled, e: &Emitted, measured: &cv_core::distill::Measured
             on_disk(e.sidecar_bytes)
         );
     }
+    if let Some(cv_core::harness::antigravity::deliver::Delivery::Created {
+        conversation_id,
+        tag,
+        reconciled,
+    }) = &e.delivery
+    {
+        let _ = writeln!(
+            h,
+            "  ↳ delivered live conversation {conversation_id} (tag {tag}{})",
+            if *reconciled { ", reconciled" } else { "" }
+        );
+    }
     if let Some(r) = &e.resume {
         let _ = writeln!(h, "  ↳ resume: {r}");
     }
     h
+}
+
+/// Write the pack as a seed conversation: cold into an app-data root, or live to the running
+/// language server.
+#[allow(clippy::too_many_arguments)]
+fn emit_seed(
+    source: &Session,
+    distilled: &Distilled,
+    description: &str,
+    boundary_ordinal: Option<usize>,
+    delivery: DeliveryMode,
+    cwd: Option<PathBuf>,
+    out: Option<PathBuf>,
+    force: bool,
+    max_bytes: Option<usize>,
+    max_estimated_tokens: Option<u64>,
+) -> Result<(Emitted, cv_core::distill::Measured)> {
+    use cv_core::harness::antigravity::{deliver::Delivery, seed};
+    let effective_cwd = cwd.clone().or_else(|| source.cwd.clone());
+    match delivery {
+        DeliveryMode::Live => {
+            let request = seed::live_seed(source, boundary_ordinal, description, &distilled.pack());
+            let framed = request.framed_body();
+            let measured = cv_core::distill::Measured {
+                what: "live seed",
+                bytes: framed.len(),
+                estimated_tokens: cv_core::ir::est_tokens_bytes(framed.len(), cv_core::ir::TokenKind::ToolInput),
+            };
+            measured.check(max_bytes, max_estimated_tokens)?;
+            let outcome = seed::deliver_from_env(&request, force)?;
+            match outcome {
+                Delivery::Created {
+                    ref conversation_id, ..
+                } => {
+                    let resume = cv_core::harness::resume_in(
+                        effective_cwd.as_deref(),
+                        format!("agy --conversation {conversation_id}"),
+                    );
+                    Ok((
+                        Emitted {
+                            session_id: Some(conversation_id.clone()),
+                            resume: Some(resume),
+                            delivery: Some(outcome),
+                            ..Default::default()
+                        },
+                        measured,
+                    ))
+                }
+                Delivery::Refused { status, tag, detail } => {
+                    bail!("Antigravity language server refused CreateConversation (HTTP {status}, tag {tag}): {detail}")
+                }
+                Delivery::Uncertain { tag, detail } => {
+                    bail!("Antigravity live delivery uncertain (tag {tag}): {detail}")
+                }
+            }
+        }
+        DeliveryMode::Cold => {
+            let measured = distilled.pack_load();
+            measured.check(max_bytes, max_estimated_tokens)?;
+            let seed_ir = seed::cold_session(source, &distilled.pack(), description, effective_cwd);
+            let out_dir = match out {
+                Some(dir) => dir,
+                None => seed::default_root()?,
+            };
+            let emit_opts = EmitOptions {
+                new_cwd: cwd,
+                force,
+                ..Default::default()
+            };
+            let res = cv_core::harness::antigravity::emit(&seed_ir, &out_dir, &emit_opts)?;
+            let sidecar = write_sidecar(&res.path, &distilled.elided)?;
+            Ok((
+                Emitted {
+                    session_id: Some(res.new_id),
+                    path: Some(res.path),
+                    sidecar_path: sidecar,
+                    resume: res.resume_hint,
+                    ..Default::default()
+                }
+                .sized(),
+                measured,
+            ))
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -508,6 +673,9 @@ pub(crate) fn cmd_distill(
     allow_unsettled: bool,
 ) -> Result<()> {
     let want = parse_harness(&harness)?;
+    if force && pack.is_none() && !matches!(target, Target::Session { seed: Some(_), .. }) {
+        return usage("the argument '--pack <FILE>' (or a seed `--session`) is required for '--force'");
+    }
     if let Some(path) = &pack {
         crate::util::user_file_claim(path, force)?;
     }
@@ -544,7 +712,7 @@ pub(crate) fn cmd_distill(
         Pack(Distilled),
         Resume(PreparedDistillation),
     }
-    let mut products = if matches!(target, Target::PackOnly) {
+    let mut products = if matches!(target, Target::PackOnly | Target::Session { seed: Some(_), .. }) {
         Products::Pack(distill_pack(&s, &opts)?)
     } else {
         Products::Resume(prepare_distill(&s, &opts)?)
@@ -553,6 +721,17 @@ pub(crate) fn cmd_distill(
         Products::Pack(d) => d,
         Products::Resume(prepared) => &mut prepared.distilled,
     };
+    if let Some(plan) = &plan {
+        // A launch whose every open job is a child `--uncompact` recovered ended: the recovered
+        // output is its terminal evidence, carried into the pack below.
+        d.unsettled.retain(|call| {
+            !call.why.split("; ").all(|why| {
+                plan.recovered_children
+                    .iter()
+                    .any(|c| c.launch == call.id && why == format!("job `{}` not seen to end", c.child))
+            })
+        });
+    }
     if !matches!(target, Target::PackOnly) && !allow_unsettled && (!d.unsettled.is_empty() || grown.is_some()) {
         let mut refusal = format!(
             "source has {} calls without terminal evidence{}; resumable handoff refused before emission; inspect the source or use --allow-unsettled for an intentional snapshot",
@@ -581,6 +760,20 @@ pub(crate) fn cmd_distill(
             }
             d.append_findings(&finding);
         }
+        if !plan.excluded_prompts.is_empty() {
+            let mut section = String::from("\n## Post-Compaction User Turns (Excluded from Pre-Compaction Prefix)\n");
+            for p in &plan.excluded_prompts {
+                let rec = p.record_id.as_deref().unwrap_or("?");
+                let rec_span = cv_core::render::inline_code_span(rec);
+                let body = cv_core::render::fenced_block(&p.text, "text");
+                let _ = write!(
+                    section,
+                    "\n### Message {} (record {rec_span})\n\n{body}\n",
+                    p.message_index
+                );
+            }
+            d.append_findings(&section);
+        }
     }
     let mut with_sources: Vec<(String, String)> = Vec::new();
     for other in with {
@@ -589,15 +782,39 @@ pub(crate) fn cmd_distill(
         d.append_findings(&findings(&o, &opts)?);
     }
     let description = format!("distilled: {}", d.label());
+    let boundary_ordinal = plan.as_ref().map(|p| p.pre_compaction).or(recovery.pre_compaction);
     // The ceiling applies to what the target loads: the pack itself, or the session about to be
     // emitted. Either is measured whole, after every --with source, before anything is written.
-    let (d, emitted, measured) = match products {
-        Products::Pack(d) => {
+    let (d, emitted, measured) = match (products, &target) {
+        (
+            Products::Pack(d),
+            Target::Session {
+                seed: Some(delivery),
+                cwd,
+                out,
+                ..
+            },
+        ) => {
+            let (emitted, measured) = emit_seed(
+                &s,
+                &d,
+                &description,
+                boundary_ordinal,
+                *delivery,
+                cwd.clone(),
+                out.clone(),
+                force,
+                max_bytes,
+                max_estimated_tokens,
+            )?;
+            (d, emitted, measured)
+        }
+        (Products::Pack(d), _) => {
             let measured = d.pack_load();
             measured.check(max_bytes, max_estimated_tokens)?;
             (d, Emitted::default(), measured)
         }
-        Products::Resume(prepared) => {
+        (Products::Resume(prepared), _) => {
             let (d, ir) = prepared.into_resumable_session(&s);
             let measured = cv_core::distill::session_load(&ir)?;
             measured.check(max_bytes, max_estimated_tokens)?;
@@ -778,6 +995,7 @@ mod tests {
             .transpose()?;
         let target = match mode.as_str() {
             "resume" => Target::Session {
+                seed: None,
                 cwd: None,
                 out: Some(destination.join("resume")),
             },

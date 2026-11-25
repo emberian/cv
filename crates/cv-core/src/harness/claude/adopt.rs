@@ -599,6 +599,150 @@ fn execute_chained(
     })
 }
 
+/// How recently a sibling's transcript must have changed to be offered at session start.
+const PENDING_LOOKBACK_SECS: u64 = 24 * 60 * 60;
+
+fn normalize_dir(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// The 8-hex prefix of a UUID id when no other sibling shares it, else the full id.
+fn short_unique_session_id(full: &str, sibling_stems: &[String]) -> String {
+    if full.len() == 36 && full.as_bytes().get(8) == Some(&b'-') && full[..8].bytes().all(|b| b.is_ascii_hexdigit()) {
+        let prefix = &full[..8];
+        let matches = sibling_stems.iter().filter(|s| s.starts_with(prefix)).count();
+        if matches == 1 && crate::hooks::valid_id(prefix) {
+            return prefix.to_owned();
+        }
+    }
+    full.to_owned()
+}
+
+/// A parent is safe to offer when it compacted or its last turn settled (assistant spoke last and
+/// no tool call is open).
+fn parent_turn_settled_or_compacted(session: &crate::ir::Session) -> bool {
+    use crate::ir::{Block, MessageKind, Role};
+    if session
+        .messages
+        .iter()
+        .any(|m| matches!(m.kind, MessageKind::CompactionBoundary | MessageKind::CompactionSummary))
+    {
+        return true;
+    }
+    let mut open_tools = std::collections::HashSet::new();
+    let mut last_conversational: Option<Role> = None;
+    for m in &session.messages {
+        for b in &m.content {
+            match b {
+                Block::ToolUse { id, .. } => {
+                    open_tools.insert(id.as_str());
+                }
+                Block::ToolResult { tool_use_id, .. } => {
+                    open_tools.remove(tool_use_id.as_str());
+                }
+                _ => {}
+            }
+        }
+        if matches!(m.role, Role::User | Role::Assistant) && m.kind != MessageKind::Carrier {
+            last_conversational = Some(m.role);
+        }
+    }
+    open_tools.is_empty() && last_conversational == Some(Role::Assistant)
+}
+
+/// [`crate::harness::Adapter::pending_adoption`] for Claude Code: the most recent sibling
+/// transcript in `transcript`'s project dir, with the same cwd and a settled last turn, whose
+/// `subagents/` a dry-run [`carry_agents`] would carry into `session`.
+pub(crate) fn pending_adoption(
+    adapter: &dyn crate::harness::Adapter,
+    session: &str,
+    transcript: &Path,
+    cwd: &Path,
+) -> Result<Option<crate::harness::PendingAdoption>> {
+    use super::carry::{carry_agents, CarryAgents};
+    let Some(proj_dir) = transcript.parent() else {
+        return Ok(None);
+    };
+    if !proj_dir.symlink_metadata().is_ok_and(|m| m.file_type().is_dir()) {
+        return Ok(None);
+    }
+    let want_cwd = normalize_dir(cwd);
+    let now = SystemTime::now();
+
+    let mut sibling_stems = Vec::new();
+    let mut candidates: Vec<(SystemTime, String, PathBuf)> = Vec::new();
+    for entry in std::fs::read_dir(proj_dir)? {
+        let Ok(entry) = entry else { continue };
+        let Ok(ft) = entry.file_type() else { continue };
+        if !ft.is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if stem.ends_with(".flat") || stem.starts_with("agent-") || !crate::hooks::valid_id(stem) {
+            continue;
+        }
+        sibling_stems.push(stem.to_owned());
+        if stem == session {
+            continue;
+        }
+        let sub_dir = proj_dir.join(stem).join("subagents");
+        if !sub_dir.symlink_metadata().is_ok_and(|m| m.file_type().is_dir()) {
+            continue;
+        }
+        let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) else {
+            continue;
+        };
+        if now
+            .duration_since(mtime)
+            .is_ok_and(|age| age.as_secs() > PENDING_LOOKBACK_SECS)
+        {
+            continue;
+        }
+        candidates.push((mtime, stem.to_owned(), path));
+    }
+    candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+
+    for (_, old_id, old_path) in candidates {
+        let sref = SessionRef::new(&old_id, adapter.harness(), &old_path);
+        let Ok(parsed) = adapter.parse(&sref) else {
+            continue;
+        };
+        let Some(old_cwd) = parsed.cwd.as_deref() else {
+            continue;
+        };
+        if normalize_dir(old_cwd) != want_cwd || !parent_turn_settled_or_compacted(&parsed) {
+            continue;
+        }
+        let Ok(dry) = carry_agents(
+            std::slice::from_ref(&old_path),
+            transcript,
+            session,
+            CarryAgents::Full,
+            &[],
+            true,
+        ) else {
+            continue;
+        };
+        let count = dry.transcripts + dry.joined;
+        if count == 0 {
+            continue;
+        }
+        let rev = format!("adopt:{old_id}:{count}:{}", dry.transcript_bytes);
+        return Ok(Some(crate::harness::PendingAdoption {
+            count: u32::try_from(count)?,
+            from: short_unique_session_id(&old_id, &sibling_stems),
+            rev,
+        }));
+    }
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

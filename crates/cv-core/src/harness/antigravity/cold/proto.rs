@@ -52,11 +52,11 @@ fn varint(buf: &mut Vec<u8>, mut n: u64) {
     }
     buf.push(n as u8);
 }
-pub(super) fn scalar(buf: &mut Vec<u8>, n: u32, v: u64) {
+pub(in super::super) fn scalar(buf: &mut Vec<u8>, n: u32, v: u64) {
     varint(buf, u64::from(n) << 3);
     varint(buf, v);
 }
-pub(super) fn bytes(buf: &mut Vec<u8>, n: u32, v: &[u8]) {
+pub(in super::super) fn bytes(buf: &mut Vec<u8>, n: u32, v: &[u8]) {
     varint(buf, (u64::from(n) << 3) | 2);
     varint(buf, v.len() as u64);
     buf.extend(v);
@@ -169,10 +169,26 @@ pub(super) fn payload(data: &[u8], new: &Reference<'_>, old: &str) -> Result<Vec
         _ => Ok(None),
     })
 }
-pub(super) fn trajectory(data: &[u8], old: &str, new: &str) -> Result<Vec<u8>> {
-    transform(data, |f| {
-        Ok((matches!(f.number, 5 | 6) && f.value == old.as_bytes()).then(|| new.as_bytes().to_vec()))
-    })
+pub(super) fn trajectory_standalone(data: &[u8], old: &str, new: &str) -> Result<(Vec<u8>, bool)> {
+    let mut stripped_parent = false;
+    let mut out = Vec::new();
+    walk(data, |f| {
+        if f.number == 5 {
+            stripped_parent = true;
+            return Ok(());
+        }
+        if f.number == 6 {
+            ensure!(f.wire == 2, "expected length-delimited field 6");
+            if f.value != old.as_bytes() {
+                stripped_parent = true;
+            }
+            bytes(&mut out, 6, new.as_bytes());
+            return Ok(());
+        }
+        out.extend(f.raw);
+        Ok(())
+    })?;
+    Ok((out, stripped_parent))
 }
 
 /// Compare all payload fields outside the two metadata carriers to the source,

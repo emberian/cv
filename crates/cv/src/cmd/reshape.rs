@@ -517,12 +517,31 @@ pub(crate) fn cmd_rewind(args: RewindArgs<'_>) -> Result<()> {
         let result =
             cv_core::harness::antigravity::cold::rewind(&r, &opts, recovery.uncompact, recovery.pre_compaction)?;
         let mut h = format!(
-            "  {} native steps · {} generations retained · {} omitted · {} executor snapshots omitted\n",
+            "  {} native steps · {} generations retained · {} omitted · {} executor snapshots retained ({} omitted)\n",
             result.selected_steps.len(),
             result.generations_kept,
             result.generations_omitted,
+            result.executor_rows_kept,
             result.executor_rows_omitted
         );
+        if !result.uncaptured.is_empty() {
+            let _ = writeln!(
+                h,
+                "  brain closure: {} captured · {} item(s) omitted ({})",
+                human_bytes(result.closure_bytes),
+                result.uncaptured.len(),
+                result
+                    .uncaptured
+                    .iter()
+                    .take(4)
+                    .map(|u| format!("{}: {}", u.path, u.why))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            );
+        }
+        for w in &result.warnings {
+            let _ = writeln!(h, "  ⚠ {w}");
+        }
         if let Some(plan) = &result.recovery {
             h.push_str(&plan.report());
         }

@@ -80,6 +80,8 @@ fn reparse_with(
         Harness::OpenCode => reparse_opencode(result, collect),
         #[cfg(feature = "sqlite")]
         Harness::Hermes => reparse_hermes(result, collect),
+        #[cfg(feature = "sqlite")]
+        Harness::Antigravity => reparse_antigravity(result, collect),
         // The emitters whose output is parseable directly from the EmitResult path.
         Harness::LmStudio => collect(
             &crate::harness::lmstudio::LmStudio::detect(),
@@ -102,9 +104,8 @@ fn reparse_with(
             &sref(result.new_id.clone(), result.path.clone()),
         ),
         #[cfg(not(feature = "sqlite"))]
-        Harness::Hermes => anyhow::bail!("re-parse for {target} not supported"),
+        Harness::Hermes | Harness::Antigravity => anyhow::bail!("re-parse for {target} not supported"),
         Harness::Cursor
-        | Harness::Antigravity
         | Harness::Pi
         | Harness::Goose
         | Harness::Zed
@@ -163,6 +164,26 @@ fn reparse_hermes(
                 .and_then(|r| collect(&h, &r).ok())
         })
         .context("re-discovering emitted hermes session")
+}
+
+#[cfg(feature = "sqlite")]
+fn reparse_antigravity(
+    result: &EmitResult,
+    collect: &impl Fn(&dyn crate::harness::Adapter, &SessionRef) -> Result<Session>,
+) -> Result<Session> {
+    use crate::harness::Adapter;
+    let app_root = result
+        .path
+        .parent()
+        .and_then(|p| p.parent())
+        .context("locating Antigravity app-data root from emitted conversation path")?;
+    let agy = crate::harness::antigravity::Antigravity::with_home(app_root);
+    let r = agy
+        .discover()?
+        .into_iter()
+        .find(|r| r.id == result.new_id)
+        .unwrap_or_else(|| SessionRef::new(&result.new_id, agy.harness(), &result.path));
+    collect(&agy, &r)
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -414,9 +435,9 @@ pub(crate) fn holds_fields(h: Harness) -> &'static [Field] {
         Harness::Roo => &[Text, ThinkingText, Image, ToolUse, ToolResult, IsError, UsageCacheCreation, Timestamp, TimestampToolTurn, Id, IdToolTurn, Title, Cwd, SessionModel, CompleteReparse],
         Harness::Continue => &[Text, Image, ToolUse, ToolResult, IsError, Usage, Cost, Timestamp, TimestampToolTurn, Title, Cwd, SessionModel, CompleteReparse],
         Harness::Qwen => &[Text, ThinkingText, Image, File, ToolUse, ToolResult, ToolName, IsError, Usage, UsageCacheCreation, Timestamp, TimestampToolTurn, Id, IdToolTurn, Title, Cwd, SessionModel, CompleteReparse],
+        Harness::Antigravity => &[Text, ToolUse, ToolResult, Title, Cwd, CompleteReparse],
         Harness::OpenSession => &[Principal, Opaque],
         Harness::Cursor
-        | Harness::Antigravity
         | Harness::Pi
         | Harness::Kimi
         | Harness::KimiCode

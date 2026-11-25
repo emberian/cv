@@ -42,12 +42,14 @@ struct Offer {
 enum Pointer {
     Inbox { count: u32, source: crate::source::FileId },
     Compact(u32),
+    Adopt { count: u32, from: String },
 }
 impl Pointer {
     fn kind(&self) -> &'static str {
         match self {
             Self::Compact(_) => "compaction",
             Self::Inbox { .. } => "decisions",
+            Self::Adopt { .. } => "adopt",
         }
     }
     fn command(&self, harness: Harness, session: &str) -> Option<String> {
@@ -56,6 +58,9 @@ impl Pointer {
                 Some(format!("cv show {harness}:{session} --pre-compaction {n}"))
             }
             Self::Inbox { count, .. } if *count > 0 => Some("cv task inbox".into()),
+            Self::Adopt { count, from } if *count > 0 && valid_id(from) && valid_id(session) => {
+                Some(format!("cv adopt --join --from {from} --into {session}"))
+            }
             _ => None,
         }
     }
@@ -128,7 +133,7 @@ pub fn observe(hook: &str, harness: Harness, payload: &Value) -> Option<String> 
         }
         let command = w.pointer.command(harness, session)?;
         Some(match w.pointer {
-            Pointer::Inbox { count, .. } => format!("{count} · {command}"),
+            Pointer::Inbox { count, .. } | Pointer::Adopt { count, .. } => format!("{count} · {command}"),
             Pointer::Compact(_) => command,
         })
     });
@@ -162,6 +167,15 @@ pub fn observe(hook: &str, harness: Harness, payload: &Value) -> Option<String> 
                 );
             }
             Some(Value::Object(fields))
+        }
+        "start" => {
+            let mut fields = serde_json::Map::new();
+            for k in ["transcript_path", "cwd"] {
+                if let Some(v) = payload.get(k) {
+                    fields.insert(k.into(), v.clone());
+                }
+            }
+            (!fields.is_empty()).then_some(Value::Object(fields))
         }
         "compact" => payload.get("transcript_path").cloned(),
         _ => None,
@@ -315,27 +329,16 @@ fn consume(store: &StateStore, mut obs: Observation) -> Result<()> {
             )
         }
         "start" | "decisions" => {
-            let Some(source) = task_source() else { return Ok(()) };
-            let model = crate::task::fold()?.model;
-            if task_source() != Some(source) {
+            if let Some(cand) = inbox_candidate()? {
+                cand
+            } else if obs.hook == "start" {
+                let Some(cand) = adopt_candidate(&obs)? else {
+                    return Ok(());
+                };
+                cand
+            } else {
                 return Ok(());
             }
-            let mut ids: Vec<_> = crate::task::inbox(&model, &crate::task::actor(None, "cv"))
-                .into_iter()
-                .filter(|e| matches!(e.reason, crate::task::InboxReason::DecisionOwed))
-                .map(|e| &e.task.task_id)
-                .collect();
-            if ids.is_empty() {
-                return Ok(());
-            }
-            ids.sort_unstable();
-            (
-                Pointer::Inbox {
-                    count: u32::try_from(ids.len())?,
-                    source,
-                },
-                blake3::hash(&serde_json::to_vec(&ids)?).to_hex().to_string(),
-            )
         }
         _ => return Ok(()),
     };
@@ -371,6 +374,58 @@ fn consume(store: &StateStore, mut obs: Observation) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn inbox_candidate() -> Result<Option<(Pointer, String)>> {
+    let Some(source) = task_source() else { return Ok(None) };
+    let model = crate::task::fold()?.model;
+    if task_source() != Some(source) {
+        return Ok(None);
+    }
+    let mut ids: Vec<_> = crate::task::inbox(&model, &crate::task::actor(None, "cv"))
+        .into_iter()
+        .filter(|e| matches!(e.reason, crate::task::InboxReason::DecisionOwed))
+        .map(|e| &e.task.task_id)
+        .collect();
+    if ids.is_empty() {
+        return Ok(None);
+    }
+    ids.sort_unstable();
+    Ok(Some((
+        Pointer::Inbox {
+            count: u32::try_from(ids.len())?,
+            source,
+        },
+        blake3::hash(&serde_json::to_vec(&ids)?).to_hex().to_string(),
+    )))
+}
+
+fn adopt_candidate(obs: &Observation) -> Result<Option<(Pointer, String)>> {
+    if obs.session.starts_with("agent-") {
+        return Ok(None);
+    }
+    let Some(details) = obs.payload.as_ref().and_then(Value::as_object) else {
+        return Ok(None);
+    };
+    let Some(transcript) = details.get("transcript_path").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    let Some(cwd) = details.get("cwd").and_then(Value::as_str).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let Some(adapter) = crate::harness::rootless(obs.harness) else {
+        return Ok(None);
+    };
+    let pending = adapter.pending_adoption(&obs.session, Path::new(transcript), Path::new(cwd))?;
+    Ok(pending.map(|p| {
+        (
+            Pointer::Adopt {
+                count: p.count,
+                from: p.from,
+            },
+            p.rev,
+        )
+    }))
 }
 
 fn task_source() -> Option<crate::source::FileId> {

@@ -262,6 +262,10 @@ fn projects_dir(entry: PathBuf) -> Option<PathBuf> {
 }
 
 impl Adapter for Claude {
+    fn pending_adoption(&self, session: &str, transcript: &Path, cwd: &Path) -> Result<Option<super::PendingAdoption>> {
+        adopt::pending_adoption(self, session, transcript, cwd)
+    }
+
     /// `claude --resume <id>` reads `<config dir>/projects/<project>/<id>.jsonl`.
     ///
     /// Claude Code treats "unset" and "set to `~/.claude`" as different profiles: with

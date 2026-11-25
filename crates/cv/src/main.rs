@@ -738,12 +738,15 @@ enum Cmd {
         /// Write the markdown pack to this file (instead of stdout).
         #[arg(long, value_name = "FILE")]
         pack: Option<PathBuf>,
-        /// Replace an existing --pack file by atomic rename (otherwise a taken name exits 2).
-        #[arg(long, requires = "pack")]
+        /// Replace an existing --pack file by atomic rename, or retry an uncertain/refused live delivery.
+        #[arg(long)]
         force: bool,
-        /// Emit a resumable main-thread session (new id) under the Claude store or --out.
-        #[arg(long, conflicts_with = "agent_of")]
-        session: bool,
+        /// Emit a resumable main-thread session (new id) under the target store or `--out` (`claude` by default, or `--session=antigravity`).
+        #[arg(long, value_name = "HARNESS", num_args = 0..=1, require_equals = true, default_missing_value = "claude", conflicts_with = "agent_of")]
+        session: Option<String>,
+        /// With `--session=antigravity`: `cold` writes an offline root; `live` posts to the local language server.
+        #[arg(long, value_name = "cold|live", value_parser = ["cold", "live"], requires = "session")]
+        delivery: Option<String>,
         /// Emit a new sub-agent transcript owned by this ROOT session (id or transcript path).
         #[arg(long, visible_alias = "into", value_name = "ROOT")]
         agent_of: Option<String>,
@@ -1322,12 +1325,13 @@ fn run() -> Result<()> {
             }
             Cmd::Distill {
                 session,
+                delivery,
                 agent_of,
                 pack,
                 out,
                 ..
-            } => (*session || agent_of.is_some() || pack.is_some() || out.is_some())
-                .then_some("omit --session/--agent-of/--pack/--out to print to stdout, or run with CV_FROZEN=0"),
+            } => (session.is_some() || delivery.is_some() || agent_of.is_some() || pack.is_some() || out.is_some())
+                .then_some("omit --session/--delivery/--agent-of/--pack/--out to print to stdout, or run with CV_FROZEN=0"),
             Cmd::Splice {
                 session,
                 agent_of,
@@ -1813,6 +1817,7 @@ fn run() -> Result<()> {
             pack,
             force,
             session,
+            delivery,
             agent_of,
             model,
             keep_source,
@@ -1828,7 +1833,7 @@ fn run() -> Result<()> {
                 ledger: !no_ledger,
                 retrieve_ref: None,
             };
-            let target = cmd::distill::target(session, agent_of, model, cwd, out)?;
+            let target = cmd::distill::target_for(session, delivery, agent_of, model, cwd, out)?;
             let retire = !keep_source && upto.is_none() && !recovery.uncompact && recovery.pre_compaction.is_none();
             cmd::distill::cmd_distill(
                 &id,

@@ -44,7 +44,7 @@ argv = ["--dangerously-skip-permissions", "--conversation", "${session}", "--pri
 store_env = { ANTIGRAVITY_APP_DATA_DIR = "${home}/.gemini/antigravity-cli", ANTIGRAVITY_GEMINI_DIR = "${home}/.gemini" }
 provider_env = { AGY_LLM_GATEWAY_URL = "${base_url}", AGY_LLM_GATEWAY_API_KEY = "${api_key}" }
 env = { AGY_CLI_DISABLE_AUTO_UPDATE = "1", AGY_CLI_MODEL_API_MAX_RETRIES = "0" }
-note = "cv has no antigravity emitter yet, so cv port cannot write the store this resumes"
+note = "cv port writes one seed prompt; earlier turns and tool calls arrive rendered in it"
 
 [upstream]
 repo = "Google Antigravity (agy CLI + Antigravity 2.0 / IDE Cortex trajectory_store; corpus 1.0.x–1.5.13)"

@@ -596,6 +596,17 @@ pub struct ResumeEnv {
 
 /// `Send + Sync` so [`crate::discover_all`] can fan discovery across adapters in parallel. Every
 /// adapter holds only path data (connections are opened per call), so this bound is always satisfied.
+/// A sibling session's sub-agents that `cv adopt --join` could carry ([`Adapter::pending_adoption`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingAdoption {
+    /// Transcripts and joins the dry run would carry.
+    pub count: u32,
+    /// The sibling's id, shortened to a unique prefix when one exists.
+    pub from: String,
+    /// Changes when what is pending changes, so a whisper repeats only on news.
+    pub rev: String,
+}
+
 pub trait Adapter: Send + Sync {
     /// Decode provider-native asynchronous result envelopes into shared lifecycle evidence.
     fn tool_result_lifecycle(&self, result: &lifecycle::ToolResult<'_>) -> lifecycle::Observation {
@@ -820,6 +831,20 @@ pub trait Adapter: Send + Sync {
     /// without inline JSONL identity restamping. Default: false.
     fn has_cold_rewind(&self) -> bool {
         false
+    }
+
+    /// Whether `cv distill --session=<harness>` writes a distilled pack here as a new one-prompt
+    /// conversation (cold, or live with `--delivery=live`). Default: false; only the derived host
+    /// takes `--session`.
+    fn accepts_seed(&self) -> bool {
+        false
+    }
+
+    /// At session start, a recent sibling session in the same project and cwd whose sub-agent
+    /// transcripts `cv adopt --join` could carry into `session` (whose transcript is `transcript`).
+    /// Default: none; the harness has no adoptable sub-agents.
+    fn pending_adoption(&self, _session: &str, _transcript: &Path, _cwd: &Path) -> Result<Option<PendingAdoption>> {
+        Ok(None)
     }
 
     /// The [`Rows`](crate::source::Rows) certificate of every session the shared SQLite store
