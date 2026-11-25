@@ -11,6 +11,8 @@
 - Rewind and prune accept Codex, Gemini, OpenCode, Qwen and OpenSession sessions, by selection and verified emission; prune's sidecar answers `cv cat`.
 - Prune reports `cache_break_even_turns` from the cached suffix it invalidates and warns when a low-bloat prune needs over 30 turns to pay back.
 - Distill `--handoff peer|escalate|downshift` writes the pack for its successor, with a continuation-state badge; `--bricks` adds cache-stable extractive prefix bricks.
+- Distill bricks freeze 16-turn epochs, so a power-of-two rollover keeps the cached prefix, and carry span handles and read symbols.
+- Distill `--handoff escalate` keeps headings or definitions of reads behind later edits and errors, with `cv cat` pointers.
 - Line-range blame follows unique carved blocks and edited declarations into their parent files and reports the relocation evidence.
 - Session overviews count validation repairs and immediate verbatim reversals separately, with message indices for each recent episode.
 - OpenSession preserves unknown block types, message kinds, and nested fields through export and reports opaque content in read coverage.

@@ -5617,7 +5617,7 @@ fn rewind_and_prune_reshape_codex_gemini_and_opensession_by_selection() {
 #[test]
 fn export_bundle_survives_source_deletion_and_reports_uncaptured() {
     let w = World::new("export-bundle");
-    let spill = w.proj.join("bundle-lane/tool-results/spill.txt");
+    let spill = w.proj.join("bundle-work/tool-results/spill.txt");
     fs::create_dir_all(spill.parent().unwrap()).unwrap();
     fs::write(&spill, "the full spilled log\n").unwrap();
     let stub = |path: &std::path::Path| {
@@ -5626,7 +5626,7 @@ fn export_bundle_survives_source_deletion_and_reports_uncaptured() {
             path.display()
         )
     };
-    let gone = w.proj.join("bundle-lane/tool-results/gone.txt");
+    let gone = w.proj.join("bundle-work/tool-results/gone.txt");
     let call = |id: &str, cmd: &str, uuid: &str| {
         claude::assistant(
             uuid,
@@ -5637,9 +5637,9 @@ fn export_bundle_survives_source_deletion_and_reports_uncaptured() {
     };
     let big = "row\n".repeat(600);
     w.write_session(
-        "bundle-lane",
+        "bundle-work",
         &[
-            claude::user("bundle-lane", "u1", "2026-01-01T10:00:00Z", "Bundle this lane."),
+            claude::user("bundle-work", "u1", "2026-01-01T10:00:00Z", "Bundle this work."),
             call("toolu_big", "make all", "a1"),
             claude::tool_result("r1", "2026-01-01T10:00:02Z", "toolu_big", &big),
             call("toolu_spill", "make spill", "a2"),
@@ -5656,7 +5656,7 @@ fn export_bundle_survives_source_deletion_and_reports_uncaptured() {
     );
     w.cv_ok(&[
         "prune",
-        "claude:bundle-lane",
+        "claude:bundle-work",
         "--to",
         "bundle-pruned",
         "--min-size",
@@ -5703,7 +5703,7 @@ fn export_bundle_survives_source_deletion_and_reports_uncaptured() {
     let path = bundle.to_str().unwrap();
     let (shown, _) = w.cv_ok(&["show", path]);
     assert!(
-        shown.contains("Bundle this lane.") && shown.contains("All three ran."),
+        shown.contains("Bundle this work.") && shown.contains("All three ran."),
         "{shown}"
     );
     let (cat, _) = w.cv_ok(&["cat", path, "toolu_big"]);

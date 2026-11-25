@@ -156,21 +156,28 @@ the last pass).
 - `escalate`, for a stronger model after repeated failures: the agent's own narrative leaves the
   timeline, which keeps every prompt and message to it in order (the user specification) and the
   decisions recorded. Commits, branches, files edited, verdicts, errors, unresolved calls and the
-  ledger stay. Its last message, its grounding and the notes it wrote move under
+  ledger stay. `## 4c. Reads behind later edits and errors` keeps the headings or definition lines
+  of the newest read of each file the lane later edited or named in an error, with its `cv cat`
+  pointer. Its last message, its grounding and the notes it wrote move under
   `## 5b. [UNVERIFIED PREDECESSOR NOTES — VERIFY AGAINST SOURCE & TESTS]`. `--keep-last`
   defaults to 0.
 - `downshift`, for a cheaper model: the specification, a `## 4b. Verified progress` checklist (an
   edit is `[x]` once a later validation passed) and a 6-call tail; no ledger.
 
-`--bricks` renders the turns before the tail as extractive **prefix bricks**: power-of-two turn
-epochs aligned like a binary counter (24 turns are `[0..16) [16..24)`, 25 add `[24..25)`), each
-holding that span's human instructions verbatim, the files it touched and each command's
-`exit 0`/`FAILED` with its `cv cat` pointer. The bricks follow a source line without counts, and
-the resume preamble drops its counts, so the bytes through every sealed brick stay identical as
-the session grows and a provider's prompt cache keeps serving them.
+`--bricks` renders the turns before the tail as extractive **prefix bricks**: frozen 16-turn
+epochs, then the rest in power-of-two spans aligned like a binary counter (24 turns are
+`[0..16) [16..24)`, 25 add `[24..25)`, 32 are `[0..16) [16..32)`; epochs never merge). Each
+brick names its `cv show <id> --range A..B` span and holds that span's human instructions
+verbatim, the files it touched, each read with its `cv cat` pointer and up to 8 distinctive names
+from the elided outputs (headings in prose, definitions in code), and each command's
+`exit 0`/`FAILED` with its `cv cat` pointer. The bricks follow a source line without counts, the
+continuation-state badge comes after them, and the resume preamble drops its counts, so the bytes
+through every sealed brick stay identical as the session grows and a provider's prompt cache
+keeps serving them.
 
-What a distilled lane cannot answer, by design: a detail that lived only in a file the lane *read*
-(the read is elided; a resumed lane has tools and `cv cat`, so it can re-read), and a "why" the
+What a distilled lane cannot answer, by design: a detail that lived only in the body of a file the
+lane *read* (the read is elided beyond the names above; a resumed lane has tools and `cv cat`, so
+it can re-read), and a "why" the
 lane never wrote down (it was in signature-only thinking).
 
 ## Budgets and unfinished work

@@ -602,9 +602,11 @@ enum Re {
     Decision,
     InPlace,
     GateFailed,
+    Heading,
+    Definition,
 }
 
-static RES: [OnceLock<Regex>; 21] = [const { OnceLock::new() }; 21];
+static RES: [OnceLock<Regex>; 23] = [const { OnceLock::new() }; 23];
 
 fn re(which: Re) -> &'static Regex {
     let (cell, pat) = match which {
@@ -663,6 +665,13 @@ fn re(which: Re) -> &'static Regex {
         Re::GateFailed => (
             &RES[20],
             r"(?m)test result: FAILED|^error(?:\[E\d+\])?:|^FAILED\b|\b[1-9]\d* failed\b|^FAIL\b|Exit code [1-9]",
+        ),
+        // A markdown heading, behind an optional `cat -n`-style line number.
+        Re::Heading => (&RES[21], r"(?m)^\s*(?:\d+(?:→|\t))?\s*#{1,6}[ \t]+(\S[^\n]*?)[ \t#]*$"),
+        // A definition's name in common languages.
+        Re::Definition => (
+            &RES[22],
+            r"\b(?:fn|struct|enum|trait|union|impl|class|def|interface|func|function|type|mod|module|macro_rules!)\s+([A-Za-z_][A-Za-z0-9_]{2,})",
         ),
         // The message file of `git commit … -F <file>` (also `-qF`, `--file=`).
         Re::CommitFile => (
@@ -1598,6 +1607,8 @@ fn analyze_with_policy(
     let mut elided: Vec<Elided> = Vec::new();
     let mut elided_outputs = 0usize;
     let mut delivered_bodies: HashSet<String> = HashSet::new();
+    // Escalation: every non-empty file read before the tail, as (index, id, path, excerpt).
+    let mut file_reads: Vec<(usize, String, String, String)> = Vec::new();
     // The lane's last text block anywhere (tail included): its own hand-off.
     let mut last_words: Option<(usize, String)> = None;
 
@@ -1706,6 +1717,20 @@ fn analyze_with_policy(
                     &mut facts,
                 )
             };
+            if opts.handoff == Some(HandoffMode::Escalate) && !in_tail && !*is_error && !out.trim().is_empty() {
+                let command = summary
+                    .ops
+                    .iter()
+                    .any(|sem| matches!(sem.op, crate::tools::classify::ToolOp::Command { .. }));
+                let read = summary.ops.iter().find_map(|sem| match &sem.op {
+                    crate::tools::classify::ToolOp::FileRead { path } => Some(path.as_ref().to_owned()),
+                    _ => None,
+                });
+                if let (Some(path), false) = (read, command) {
+                    let excerpt = read_excerpt(&path, out, opts.note_max.min(READ_EXCERPT_MAX));
+                    file_reads.push((i, tool_use_id.clone(), path, excerpt));
+                }
+            }
             if let Some(p) = doc_reads.get(tool_use_id.as_str()) {
                 if !in_tail && demand != Demand::Findings && last_read_of.get(p) == Some(&tool_use_id.as_str()) {
                     let excerpt = head_tail(out, opts.note_max, &format!("cv cat {retrieve_ref} {tool_use_id}"));
@@ -2227,6 +2252,9 @@ fn analyze_with_policy(
         let files: Vec<String> = facts.edited.iter().map(|(i, p)| format!("`{p}` [{i}]")).collect();
         let _ = writeln!(h, "- **Files edited** (first edit order): {}\n", files.join(" · "));
     }
+    if escalate {
+        render_reads(&mut h, &file_reads, &facts, &retrieve_ref);
+    }
     if mode == Some(HandoffMode::Downshift) {
         render_progress(&mut h, &facts);
     }
@@ -2331,6 +2359,7 @@ const TAIL_HEAD: &str = "## 6. The last ";
 const BRICKS_HEAD: &str = "## 0a. Prefix bricks";
 const STATE_HEAD: &str = "## 0b. Continuation state";
 const PROGRESS_HEAD: &str = "## 4b. Verified progress";
+const READS_HEAD: &str = "## 4c. Reads behind later edits and errors";
 const QUARANTINE_HEAD: &str = "## 5b. [UNVERIFIED PREDECESSOR NOTES — VERIFY AGAINST SOURCE & TESTS]";
 
 /// Timeline headings for what the agent said, sent, wrote or spawned itself.
@@ -2471,15 +2500,26 @@ pub struct Brick {
     pub text: String,
 }
 
-/// The dyadic decomposition of `turns` turns: the binary carry tree's sealed nodes, highest bit
-/// first. `24 → [0,16) [16,24)`; `25 → [0,16) [16,24) [24,25)`. Appending a turn changes only the
-/// bricks below its lowest zero bit; every higher brick keeps its span.
+/// The widest sealed brick, in turns. Bricks never merge past it: a full epoch of
+/// `MAX_BRICK_TURNS` turns is frozen, so `[0..16)` and `[16..32)` stay siblings at `T = 32`
+/// instead of becoming `[0..32)` and rewriting the pack from its first brick on.
+pub const MAX_BRICK_TURNS: usize = 16;
+
+/// The brick decomposition of `turns` turns: frozen epochs of [`MAX_BRICK_TURNS`] turns, then the
+/// binary carry tree of the remainder, highest bit first. `24 → [0,16) [16,24)`;
+/// `25 → [0,16) [16,24) [24,25)`; `32 → [0,16) [16,32)`. Appending a turn changes only the bricks
+/// of the open epoch below its lowest zero bit; every sealed epoch keeps its span and its bytes.
 pub fn dyadic_spans(turns: usize) -> Vec<(usize, usize)> {
-    let mut spans = Vec::new();
-    let mut start = 0usize;
+    let sealed = turns / MAX_BRICK_TURNS * MAX_BRICK_TURNS;
+    let mut spans: Vec<(usize, usize)> = (0..sealed)
+        .step_by(MAX_BRICK_TURNS)
+        .map(|a| (a, a + MAX_BRICK_TURNS))
+        .collect();
+    let mut start = sealed;
+    let rest = turns - sealed;
     for bit in (0..usize::BITS).rev() {
         let size = 1usize << bit;
-        if turns & size != 0 {
+        if rest & size != 0 {
             spans.push((start, start + size));
             start += size;
         }
@@ -2527,6 +2567,8 @@ fn build_bricks(
         let mut prompts = String::new();
         let mut files: Vec<String> = Vec::new();
         let mut commands = String::new();
+        let mut reads = String::new();
+        let mut symbols: Vec<String> = Vec::new();
         for (i, m) in msgs.iter().enumerate().take(m1).skip(m0) {
             if m.role == Role::User && m.kind == MessageKind::Prompt && m.origin == Origin::Human {
                 if let Some(text) = cache.incoming_text(session.harness, i)? {
@@ -2535,7 +2577,7 @@ fn build_bricks(
                     }
                 }
             }
-            for block in &m.content {
+            for (bi, block) in m.content.iter().enumerate() {
                 match block {
                     Block::ToolUse { name, input, .. } if m.role == Role::Assistant => {
                         let summary = ToolInput::new(session.harness, name, input, false, false)?;
@@ -2555,6 +2597,26 @@ fn build_bricks(
                         };
                         let summary = ToolInput::new(session.harness, call.name, call.input, false, true)?;
                         let command = summary.ops.iter().any(|sem| matches!(sem.op, ToolOp::Command { .. }));
+                        let read = summary.ops.iter().find_map(|sem| match &sem.op {
+                            ToolOp::FileRead { path } => Some(path.as_ref()),
+                            _ => None,
+                        });
+                        if let (Some(path), false, false) = (read, command, *is_error) {
+                            // The elided output's distinctive names keep it findable by recall.
+                            let out = cache.resolve_tool_result(i, bi)?;
+                            let names = read_symbols(path, &out, BRICK_SYMBOLS - symbols.len(), &mut symbols);
+                            let names = if names.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" — {}", names.join(" · "))
+                            };
+                            let _ = writeln!(
+                                reads,
+                                "  - [{i}] {} · `cv cat {} {tool_use_id}`{names}",
+                                crate::render::inline_code_span(path),
+                                session.id
+                            );
+                        }
                         if command {
                             let outcome = if *is_error { "FAILED" } else { "exit 0" };
                             let label = summary.label(session.harness, call.name);
@@ -2571,11 +2633,18 @@ fn build_bricks(
             }
         }
         let mut text = String::new();
-        let _ = writeln!(text, "### Brick [{a}..{b}) · messages [{m0}..{m1})\n");
+        let _ = writeln!(
+            text,
+            "### Brick [{a}..{b}) · messages [{m0}..{m1}) · `cv show {} --range {m0}..{m1}`\n",
+            session.id
+        );
         text.push_str(&prompts);
         if !files.is_empty() {
             let shown: Vec<String> = files.iter().map(|p| crate::render::inline_code_span(p)).collect();
             let _ = writeln!(text, "- **Files touched**: {}", shown.join(" · "));
+        }
+        if !reads.is_empty() {
+            let _ = writeln!(text, "- **Reads** (output elided):\n{}", reads.trim_end());
         }
         if !commands.is_empty() {
             let _ = writeln!(text, "- **Commands**:\n{}", commands.trim_end());
@@ -2594,14 +2663,124 @@ fn build_bricks(
     Ok(out)
 }
 
+/// Cap, in bytes, for one read's excerpt in an escalation pack, below `note_max`.
+const READ_EXCERPT_MAX: usize = 1500;
+/// Reads an escalation pack keeps excerpts of, newest first.
+const READ_EXCERPTS: usize = 8;
+
+/// A read's high-signal lines: its headings (prose) or definition lines (code), as they appear,
+/// up to `max` bytes. Without any, its head and tail.
+fn read_excerpt(path: &str, out: &str, max: usize) -> String {
+    let which = if is_prose_path(path) {
+        Re::Heading
+    } else {
+        Re::Definition
+    };
+    let mut kept = String::new();
+    for line in out.lines().filter(|l| re(which).is_match(l)) {
+        if kept.len() + line.len() + 1 > max {
+            break;
+        }
+        kept.push_str(line);
+        kept.push('\n');
+    }
+    if kept.is_empty() {
+        head_tail(out, max, "the full output is behind the pointer above")
+    } else {
+        kept
+    }
+}
+
+/// `## 4c`: for escalation, the newest read of each file the session later edited or named in an
+/// error, as its high-signal lines and a `cv cat` pointer: what the replaced lane knew of the code
+/// it changed, which the ledger alone loses.
+fn render_reads(h: &mut String, reads: &[(usize, String, String, String)], f: &Facts, retrieve_ref: &str) {
+    let later_edit = |i: usize, path: &str| {
+        f.steps
+            .iter()
+            .any(|(at, step)| *at > i && matches!(step, Step::Edit(p) if p == path))
+    };
+    let later_error = |i: usize, path: &str| {
+        let name = basename(path);
+        f.errors
+            .iter()
+            .any(|(at, label, line)| *at > i && (label.contains(name) || line.contains(name)))
+    };
+    let mut shown: Vec<&(usize, String, String, String)> = Vec::new();
+    for r in reads.iter().rev() {
+        if shown.len() == READ_EXCERPTS {
+            break;
+        }
+        if shown.iter().any(|s| s.2 == r.2) || !(later_edit(r.0, &r.2) || later_error(r.0, &r.2)) {
+            continue;
+        }
+        shown.push(r);
+    }
+    if shown.is_empty() {
+        return;
+    }
+    let _ = writeln!(
+        h,
+        "{READS_HEAD} — the newest read of each, its headings or definitions only; `cv cat` prints it whole\n"
+    );
+    for (i, id, path, excerpt) in shown.into_iter().rev() {
+        let safe = crate::render::neutralize_forged_headers(excerpt);
+        let _ = writeln!(
+            h,
+            "- [{i}] {} · `cv cat {retrieve_ref} {id}`\n\n{}\n",
+            crate::render::inline_code_span(path),
+            crate::render::fenced_block(safe.trim_end(), "")
+        );
+    }
+}
+
+/// Distinctive names carried per brick from the `Read` outputs it elides.
+const BRICK_SYMBOLS: usize = 8;
+
+/// Prose files, whose distinctive names are their headings rather than code definitions.
+fn is_prose_path(path: &str) -> bool {
+    let ext = path.rsplit_once('.').map_or("", |(_, e)| e).to_ascii_lowercase();
+    matches!(ext.as_str(), "md" | "markdown" | "txt" | "rst" | "adoc" | "org")
+}
+
+/// Up to `max` names from a file read's output, in order of appearance and not already in
+/// `seen`: markdown headings in a prose file, definition names (`fn`, `struct`, `class`, `def`, …)
+/// in code. Each comes back as an inline code span; `seen` gains the raw names.
+fn read_symbols(path: &str, out: &str, max: usize, seen: &mut Vec<String>) -> Vec<String> {
+    let mut names = Vec::new();
+    let which = if is_prose_path(path) {
+        Re::Heading
+    } else {
+        Re::Definition
+    };
+    for c in re(which).captures_iter(out) {
+        let name = &c[1];
+        if names.len() >= max {
+            break;
+        }
+        let name = truncate(crate::sanitize::sanitize_line(name).trim(), 80);
+        if name.is_empty() || COMMON_NAMES.contains(&name.as_str()) || seen.contains(&name) {
+            continue;
+        }
+        names.push(crate::render::inline_code_span(&name));
+        seen.push(name);
+    }
+    names
+}
+
+/// Definition names too common to tell one file from another.
+const COMMON_NAMES: &[&str] = &[
+    "main", "new", "default", "fmt", "from", "init", "test", "tests", "run", "self",
+];
+
 fn render_bricks(h: &mut String, bricks: &[Brick]) {
     if bricks.is_empty() {
         return;
     }
     let _ = writeln!(
         h,
-        "{BRICKS_HEAD} — the transcript before the tail in power-of-two turn epochs; a sealed brick stays \
-         byte-identical as the session grows\n"
+        "{BRICKS_HEAD} — the transcript before the tail in power-of-two turn spans of at most \
+         {MAX_BRICK_TURNS}; a sealed brick stays byte-identical as the session grows\n"
     );
     for brick in bricks {
         h.push_str(&brick.text);
@@ -2765,10 +2944,12 @@ fn unwrap_session_pack(session: &Session, msg_idx: usize, msg: &Message, text: &
             .unwrap_or_else(|| meta.get("brief").and_then(Value::as_str).is_some_and(|s| !s.is_empty()));
         let brief = if has_brief {
             let structured_brief = meta.get("brief").and_then(Value::as_str).filter(|s| !s.is_empty());
+            // Without a recorded origin, the rendered brief heading says; only then is it human.
             let origin = meta
                 .get("brief_origin")
                 .and_then(Value::as_str)
                 .and_then(Origin::parse)
+                .or_else(|| legacy.as_ref().and_then(|u| u.brief.as_ref()).map(|(_, o)| *o))
                 .unwrap_or(Origin::Human);
             structured_brief
                 .map(|b| (b.to_owned(), origin))
@@ -4588,6 +4769,196 @@ pub(crate) mod tests {
         assert_eq!(dyadic_spans(24), vec![(0, 16), (16, 24)]);
         assert_eq!(dyadic_spans(25), vec![(0, 16), (16, 24), (24, 25)]);
         assert_eq!(dyadic_spans(7), vec![(0, 4), (4, 6), (6, 7)]);
+        assert_eq!(dyadic_spans(31), vec![(0, 16), (16, 24), (24, 28), (28, 30), (30, 31)]);
+        assert_eq!(dyadic_spans(32), vec![(0, 16), (16, 32)]);
+        assert_eq!(dyadic_spans(63)[..3], [(0, 16), (16, 32), (32, 48)]);
+        assert_eq!(dyadic_spans(64), vec![(0, 16), (16, 32), (32, 48), (48, 64)]);
+    }
+
+    fn read(id: &str, path: &str) -> Block {
+        Block::ToolUse {
+            id: id.into(),
+            name: "Read".into(),
+            input: (json!({"file_path": path})).into(),
+            namespace: None,
+            extensions: Default::default(),
+        }
+    }
+
+    // #tooth At a power-of-two rollover (T=31 → 32, T=63 → 64) the sealed epochs do not merge:
+    // with bricks and the state badge, the pack is byte-identical from byte 0 through [0..16).
+    #[test]
+    fn frozen_epochs_keep_the_pack_prefix_across_power_of_two_rollovers() -> anyhow::Result<()> {
+        let full = rounds(70, |k| {
+            let id = format!("c{k}");
+            if k % 3 == 0 {
+                (edit(&id, &format!("/w/src/m{}.rs", k % 5)), result(&id, "ok", false))
+            } else {
+                (
+                    call(&id, &format!("cargo test -p m{k}"), "gate"),
+                    result(&id, "test result: ok", k % 7 == 0),
+                )
+            }
+        });
+        let starts = turn_starts(&full.messages);
+        let at = |turns: usize| {
+            let mut s = full.clone();
+            s.messages.truncate(starts[turns]);
+            s
+        };
+        let opts = DistillOptions {
+            keep_last: 0,
+            dyadic_bricks: true,
+            state_header: true,
+            ..Default::default()
+        };
+        for (before, after) in [(31, 32), (63, 64)] {
+            let (a, b) = (distill_pack(&at(before), &opts)?, distill_pack(&at(after), &opts)?);
+            let (ba, bb) = (a.stats.bricks.as_ref().unwrap(), b.stats.bricks.as_ref().unwrap());
+            let sealed = before / MAX_BRICK_TURNS;
+            assert_eq!(ba[..sealed], bb[..sealed], "T={before} → {after}");
+            assert_eq!((bb[0].start_turn, bb[0].end_turn), (0, 16));
+            let (pa, pb) = (a.pack(), b.pack());
+            let end = pa.find(&ba[sealed - 1].text).unwrap() + ba[sealed - 1].text.len();
+            assert_eq!(pa[..end], pb[..end], "T={before} → {after}");
+            // The badge, which changes as the session grows, sits after every brick.
+            let state = pb.find(STATE_HEAD).unwrap();
+            assert!(state > pb.find(&bb.last().unwrap().text).unwrap());
+        }
+        Ok(())
+    }
+
+    // #tooth A brick names its span's zoom handle and carries the distinctive names of the reads
+    // it elides, with their `cv cat` pointers, so recall survives the elision.
+    #[test]
+    fn bricks_carry_span_handles_and_read_symbols() -> anyhow::Result<()> {
+        let code = "    1→use std::io;\n    2→pub fn parse_header(b: &[u8]) {}\n    3→struct FrameDecoder;\n    4→fn main() {}\n";
+        let doc = "# Wire format\n\nbody\n\n## Frame header layout\n";
+        let session = rounds(4, |k| match k {
+            0 => (read("r0", "/w/src/frame.rs"), result("r0", code, false)),
+            1 => (read("r1", "/w/docs/WIRE.md"), result("r1", doc, false)),
+            k => (
+                call(&format!("c{k}"), "ls /w", "list"),
+                result(&format!("c{k}"), "a b", false),
+            ),
+        });
+        let d = distill_pack(
+            &session,
+            &DistillOptions {
+                keep_last: 0,
+                dyadic_bricks: true,
+                ..Default::default()
+            },
+        )?;
+        let brick = &d.stats.bricks.as_ref().unwrap()[0].text;
+        let (m0, m1) = (
+            d.stats.bricks.as_ref().unwrap()[0].start_msg,
+            d.stats.bricks.as_ref().unwrap()[0].end_msg,
+        );
+        assert!(
+            brick.contains(&format!("`cv show agent-handoff --range {m0}..{m1}`")),
+            "{brick}"
+        );
+        assert!(
+            brick.contains("- [2] `/w/src/frame.rs` · `cv cat agent-handoff r0` — `parse_header` · `FrameDecoder`"),
+            "{brick}"
+        );
+        assert!(
+            brick.contains("`/w/docs/WIRE.md` · `cv cat agent-handoff r1` — `Wire format` · `Frame header layout`"),
+            "{brick}"
+        );
+        assert!(!brick.contains("`main`"), "{brick}");
+        Ok(())
+    }
+
+    // #tooth Escalation keeps the high-signal lines of reads of files later edited or named in an
+    // error, with `cv cat` pointers; a read nothing came back to stays out.
+    #[test]
+    fn escalate_keeps_excerpts_of_reads_behind_later_edits_and_errors() -> anyhow::Result<()> {
+        let session = rounds(8, |k| match k {
+            0 => (
+                read("r0", "/w/src/lib.rs"),
+                result(
+                    "r0",
+                    "    1→use x;\n    2→pub fn settle_window() {}\n    3→// noise\n",
+                    false,
+                ),
+            ),
+            1 => (
+                read("r1", "/w/src/unrelated.rs"),
+                result("r1", "pub fn never_touched() {}\n", false),
+            ),
+            2 => (
+                read("r2", "/w/src/parse.rs"),
+                result("r2", "pub struct Lexer;\n", false),
+            ),
+            4 => (edit("e", "/w/src/lib.rs"), result("e", "ok", false)),
+            5 => (
+                call("g", "cargo test", "gate"),
+                result("g", "error[E0412]: cannot find type in src/parse.rs", true),
+            ),
+            k => (
+                call(&format!("c{k}"), "ls /w", "list"),
+                result(&format!("c{k}"), "a b", false),
+            ),
+        });
+        let d = distill_pack(
+            &session,
+            &DistillOptions {
+                keep_last: 0,
+                handoff: Some(HandoffMode::Escalate),
+                ..Default::default()
+            },
+        )?;
+        let pack = d.pack();
+        let reads = &pack[pack.find(READS_HEAD).expect("reads section")..pack.find(LEDGER_HEAD).unwrap()];
+        assert!(reads.contains("`/w/src/lib.rs` · `cv cat agent-handoff r0`"), "{reads}");
+        assert!(reads.contains("2→pub fn settle_window() {}"), "{reads}");
+        assert!(!reads.contains("noise"), "{reads}");
+        assert!(
+            reads.contains("`/w/src/parse.rs` · `cv cat agent-handoff r2`"),
+            "{reads}"
+        );
+        assert!(!reads.contains("unrelated.rs"), "{reads}");
+        Ok(())
+    }
+
+    // #tooth An imported carrier is never a human prompt in the consolidated specification: the
+    // brief is marked non-human and the carried human prompts leave it out.
+    #[test]
+    fn escalate_never_promotes_an_imported_carrier_to_a_human_prompt() -> anyhow::Result<()> {
+        let mut session = rounds(4, |k| {
+            (
+                call(&format!("c{k}"), "ls /w", "list"),
+                result(&format!("c{k}"), "a b", false),
+            )
+        });
+        let mut seed = Message::of_kind(Role::User, MessageKind::Prompt, Origin::Import);
+        seed.content = vec![text("[cv pack] Imported context from another lane.")];
+        session.messages[0] = seed;
+        let mut later = Message::of_kind(Role::User, MessageKind::Prompt, Origin::Import);
+        later.content = vec![text("Imported follow-up note.")];
+        session.messages.insert(3, later);
+        let d = distill_pack(
+            &session,
+            &DistillOptions {
+                keep_last: 0,
+                handoff: Some(HandoffMode::Escalate),
+                ..Default::default()
+            },
+        )?;
+        let pack = d.pack();
+        assert!(pack.contains("] · non-human (`import`)"), "{pack}");
+        let spec = &pack[pack.find(TIMELINE_HEAD).unwrap()..pack.find(FACTS_HEAD).unwrap()];
+        assert!(
+            spec.contains("· message to this agent\n\nImported follow-up note."),
+            "{spec}"
+        );
+        assert!(!d.human_prompts.iter().any(|p| p.text.contains("Imported")));
+        let unwrapped = unwrap_pack_full(&pack).expect("pack unwraps");
+        assert_eq!(unwrapped.brief.unwrap().1, Origin::Import);
+        assert!(unwrapped.human_prompts.iter().all(|p| !p.text.contains("Imported")));
+        Ok(())
     }
 
     // #tooth A 32-turn lane distilled with bricks at T=24 and at T=25: the pack's bytes through the
