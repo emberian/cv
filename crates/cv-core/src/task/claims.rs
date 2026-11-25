@@ -201,21 +201,27 @@ impl FileDigests {
             let Some(root) = repo else {
                 return Applicability::Unknown;
             };
-            let stripped = p.strip_prefix(root).ok().or_else(|| {
-                let canon_root = root.canonicalize().ok()?;
-                let canon_p = p.canonicalize().ok()?;
-                canon_p.strip_prefix(canon_root).ok().map(Path::to_path_buf)?;
-                None
-            });
-            if let Some(rel) = stripped.and_then(|r| r.to_str()) {
+            if let Some(rel) = p.strip_prefix(root).ok().and_then(Path::to_str) {
                 return self.at(repo, rel, blob);
             }
-            if let (Ok(canon_root), Ok(canon_p)) = (root.canonicalize(), p.canonicalize()) {
-                if let Ok(rel) = canon_p.strip_prefix(&canon_root) {
-                    if let Some(rel_s) = rel.to_str() {
-                        return self.at(Some(&canon_root), rel_s, blob);
+            let Ok(canon_root) = root.canonicalize() else {
+                return Applicability::Unknown;
+            };
+            let resolved = p.canonicalize().ok().or_else(|| {
+                p.ancestors().skip(1).find_map(|anc| {
+                    let tail = p.strip_prefix(anc).ok()?.to_str()?;
+                    if !relative(tail) {
+                        return None;
                     }
-                }
+                    Some(anc.canonicalize().ok()?.join(tail))
+                })
+            });
+            if let Some(rel_s) = resolved
+                .as_deref()
+                .and_then(|cp| cp.strip_prefix(&canon_root).ok())
+                .and_then(Path::to_str)
+            {
+                return self.at(Some(&canon_root), rel_s, blob);
             }
             return Applicability::Unknown;
         }
@@ -503,11 +509,10 @@ pub fn populate_auto_conditions(
                                 }
                             }
                         }
-                        None if file_blobs.is_empty() => anyhow::bail!(
+                        None => anyhow::bail!(
                             "--scope {s} holds more than {MAX_SCOPE_DIR_FILES} files; scope the claim to files or \
                              pass explicit any_of conditions"
                         ),
-                        None => {}
                     }
                 }
             }
@@ -774,6 +779,38 @@ mod tests {
         let (mut claim, explicit) = Claim::parse_spec(Some("fact"), &["big".into()], &[]).unwrap().unwrap();
         let err = populate_auto_conditions(&mut claim, explicit, &model, &open.id, None, None).unwrap_err();
         assert!(err.to_string().contains("more than 16 files"), "{err}");
+
+        // Even when an earlier scope entry already populated `file_blobs`, an oversized sibling
+        // scope directory still fails closed rather than dropping its files silently.
+        std::fs::write(w.base.join("small.rs"), "pub fn ok() {}\n").unwrap();
+        let (mut mixed, explicit) = Claim::parse_spec(Some("fact"), &["small.rs".into(), "big".into()], &[])
+            .unwrap()
+            .unwrap();
+        let err = populate_auto_conditions(&mut mixed, explicit, &model, &open.id, None, None).unwrap_err();
+        assert!(err.to_string().contains("more than 16 files"), "{err}");
+
+        #[cfg(unix)]
+        {
+            let real_repo = w.base.join("real-repo");
+            std::fs::create_dir_all(real_repo.join("sub")).unwrap();
+            let linked_repo = w.base.join("linked-repo");
+            std::os::unix::fs::symlink(&real_repo, &linked_repo).unwrap();
+            let file_in_real = real_repo.join("sub/gone.rs");
+            std::fs::write(&file_in_real, b"v1").unwrap();
+            let blob = blake3::hash(b"v1").to_hex().to_string();
+            let mut digests = FileDigests::default();
+            assert_eq!(
+                digests.check_path(Some(&linked_repo), file_in_real.to_str().unwrap(), &blob),
+                Applicability::Current
+            );
+            std::fs::remove_file(&file_in_real).unwrap();
+            let mut digests = FileDigests::default();
+            assert_eq!(
+                digests.check_path(Some(&linked_repo), file_in_real.to_str().unwrap(), &blob),
+                Applicability::Stale,
+                "deleted file under a symlinked repo root must be Stale, not Unknown"
+            );
+        }
     }
 
     #[test]

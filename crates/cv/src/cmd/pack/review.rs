@@ -53,33 +53,76 @@ fn clean(text: &str) -> String {
         .join("\n")
 }
 
+/// True when the slice after an opening `'` starts with a valid character literal (`'<char>'` or
+/// `'\\...'`), never a multi-character Rust lifetime (`'a`, `'static`, `'_`).
+fn starts_char_literal(rest: &str) -> bool {
+    let mut it = rest.chars();
+    match it.next() {
+        None | Some('\'' | '\n' | '\r') => false,
+        Some('\\') => {
+            let Some(esc) = it.next() else {
+                return false;
+            };
+            if it.clone().next() == Some('\'') {
+                return true;
+            }
+            match esc {
+                'x' => {
+                    it.next().is_some_and(|c| c.is_ascii_hexdigit())
+                        && it.next().is_some_and(|c| c.is_ascii_hexdigit())
+                        && it.next() == Some('\'')
+                }
+                'u' if it.clone().next() == Some('{') => {
+                    it.next();
+                    let body: String = it.by_ref().take_while(|&c| c != '}').collect();
+                    !body.is_empty()
+                        && body.len() <= 6
+                        && body.chars().all(|c| c.is_ascii_hexdigit() || c == '_')
+                        && it.next() == Some('\'')
+                }
+                'u' => (0..4).all(|_| it.next().is_some_and(|c| c.is_ascii_hexdigit())) && it.next() == Some('\''),
+                'U' => (0..8).all(|_| it.next().is_some_and(|c| c.is_ascii_hexdigit())) && it.next() == Some('\''),
+                '0'..='7' => {
+                    let rem = it.as_str();
+                    let oct = rem.bytes().take(2).take_while(|b| matches!(b, b'0'..=b'7')).count();
+                    rem[oct..].starts_with('\'')
+                }
+                _ => false,
+            }
+        }
+        Some(_) => it.next() == Some('\''),
+    }
+}
+
 /// Remove comments while retaining quoted strings, including URLs and regex fragments.
 /// Old and new source each have their own multiline-comment state.
 fn source_line(line: &str, block: &mut bool, hash_comments: bool) -> String {
     let mut code = String::new();
-    let mut chars = line.chars().peekable();
+    let mut chars = line.char_indices().peekable();
     let mut quote = None;
-    while let Some(c) = chars.next() {
+    while let Some((idx, c)) = chars.next() {
         if *block {
-            if c == '*' && chars.next_if_eq(&'/').is_some() {
+            if c == '*' && chars.next_if(|&(_, n)| n == '/').is_some() {
                 *block = false;
             }
         } else if let Some(q) = quote {
             code.push(c);
             if c == '\\' {
-                if let Some(next) = chars.next() {
+                if let Some((_, next)) = chars.next() {
                     code.push(next);
                 }
             } else if c == q {
                 quote = None;
             }
-        } else if c == '/' && chars.next_if_eq(&'*').is_some() {
+        } else if c == '/' && chars.next_if(|&(_, n)| n == '*').is_some() {
             *block = true;
-        } else if c == '/' && !hash_comments && chars.peek() == Some(&'/') || c == '#' && hash_comments {
+        } else if c == '/' && !hash_comments && chars.peek().map(|&(_, n)| n) == Some('/') || c == '#' && hash_comments
+        {
             break;
         } else {
-            if matches!(c, '"' | '\'' | '`') {
-                quote = Some(c)
+            let rest = &line[idx + c.len_utf8()..];
+            if matches!(c, '"' | '`') || c == '\'' && (hash_comments || starts_char_literal(rest)) {
+                quote = Some(c);
             }
             code.push(c);
         }
@@ -188,4 +231,34 @@ pub(super) fn bundle(
         out.push_str("\nNo reviewable tracked changes in the selected checkout.\n");
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rust_lifetimes_never_hide_trailing_line_or_block_comments() {
+        // #tooth Rust `'a` / `'static` / `'_` lifetimes must not leave `'` open and leak trailing
+        // author or verdict comments, while valid character literals still shield `/` and `*`.
+        let mut block = false;
+        let line = source_line("pub struct View<'a> { // authored by model, PASS }", &mut block, false);
+        assert_eq!(line.trim_end(), "pub struct View<'a> {");
+        assert!(!block);
+
+        let inline_block = source_line(
+            "pub fn span<'a, 'static>(s: &'a str) -> &'_ str { /* authored by model, PASS */ s }",
+            &mut block,
+            false,
+        );
+        assert_eq!(inline_block, "pub fn span<'a, 'static>(s: &'a str) -> &'_ str {  s }");
+        assert!(!block);
+
+        let chars_kept = source_line(
+            r#"let sep = ('/', '\'', '\x2f', '\u{2f}'); // strip trailing comment"#,
+            &mut block,
+            false,
+        );
+        assert_eq!(chars_kept.trim_end(), r#"let sep = ('/', '\'', '\x2f', '\u{2f}');"#);
+    }
 }
