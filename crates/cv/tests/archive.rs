@@ -205,8 +205,11 @@ fn archive_frozen_search_show_pack_and_strict_port_keep_profile_twins_separate()
         assert_eq!(hits.len(), 1, "{results}");
         hits[0]["session_key"].as_str().unwrap().to_owned()
     };
-    // Cold frozen reads use the pack without creating a persistent Tantivy index.
-    let key = hit("zebrafish");
+    // Cold frozen reads use `--scan` over the pack without creating a persistent Tantivy index.
+    let cold = json(&["--frozen", "search", "--scan", "zebrafish", "--json"]);
+    let cold_hits = cold["hits"].as_array().unwrap();
+    assert_eq!(cold_hits.len(), 1, "{cold}");
+    let key = cold_hits[0]["session_key"].as_str().unwrap().to_owned();
     assert!(!w.cv_home.join("tantivy/meta.json").exists());
     run(&["index"]);
     fs::remove_file(&original).unwrap();
@@ -578,8 +581,19 @@ fn archive_native_frozen_reads_leave_tmpdir_untouched() {
     w.cv_ok(&["archive", "sync"]);
     assert_eq!(custody_of(&w, "betasess")["kind"], "native_extents");
     fs::remove_file(w.transcript("betasess")).unwrap();
+    {
+        let conn = rusqlite::Connection::open(w.cv_home.join("state.db")).unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+    }
+    let _ = fs::remove_file(w.cv_home.join("state.db-wal"));
+    let _ = fs::remove_file(w.cv_home.join("state.db-shm"));
     let tmp = w.base.join("tmpdir");
     fs::create_dir_all(&tmp).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o500)).unwrap();
+    }
     let tmp_s = tmp.to_str().unwrap();
     let run = |args: &[&str]| {
         let (ok, code, out, err) = w.cv_env(args, &[("TMPDIR", tmp_s)]);
@@ -590,10 +604,167 @@ fn archive_native_frozen_reads_leave_tmpdir_untouched() {
     let key = hits["hits"][0]["session_key"].as_str().unwrap().to_owned();
     assert!(run(&["--frozen", "show", &key, "--json"]).contains("seventeen"));
     assert!(run(&["--frozen", "pack", "--session", &key, "--json"]).contains("quokka"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o700)).unwrap();
+    }
     let left: Vec<_> = fs::read_dir(&tmp)
         .unwrap()
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .collect();
     assert!(left.is_empty(), "{left:?}");
+}
+
+/// #tooth Mutating byte 8,192 (strictly outside the 4 KiB head/tail boundary windows) of a
+/// 16+ KiB `.opensession.json` at identical file length re-archives a fresh document extent so
+/// `--frozen show` serves the updated text after the live file is deleted, and atomic temp-file
+/// replacement (`(dev, ino)` change) or same-length middle edits on 16+ KiB JSONL start a fresh
+/// 1-extent chain instead of appending to a stale prefix.
+#[test]
+fn archive_opensession_middle_edit_and_jsonl_inode_or_same_size_edit_recapture_cleanly() {
+    let w = world("archive-middle-and-inode");
+    let exports = w.base.join("exports");
+    fs::create_dir_all(&exports).unwrap();
+    w.cv_ok(&["config", "--add-export", exports.to_str().unwrap()]);
+
+    // 1. Build a >16 KiB `.opensession.json` with >8 KiB padding on both sides of the target word
+    //    so byte 8,192 sits strictly outside the first and last 4,096 bytes.
+    let doc_path = exports.join("mid-doc.opensession.json");
+    let make_doc = |middle: &str| {
+        assert_eq!(middle.len(), 7);
+        let pad_head = "h".repeat(8192);
+        let pad_tail = "t".repeat(8192);
+        let mut session = cv_core::ir::Session::new("mid-doc", cv_core::ir::Harness::OpenSession);
+        let mut m = cv_core::ir::Message::new(cv_core::ir::Role::User);
+        m.content.push(cv_core::ir::Block::from_text(
+            format!("{pad_head} {middle} {pad_tail}").into(),
+        ));
+        session.messages.push(m);
+        serde_json::to_vec(&cv_core::harness::opensession::document(&session)).unwrap()
+    };
+    let doc_v1 = make_doc("echidna");
+    let doc_v2 = make_doc("wallaby");
+    assert_eq!(doc_v1.len(), doc_v2.len(), "identical document length");
+    assert!(doc_v1.len() > 16 * 1024);
+    assert_eq!(&doc_v1[..4096], &doc_v2[..4096], "first 4 KiB identical");
+    assert_eq!(
+        &doc_v1[doc_v1.len() - 4096..],
+        &doc_v2[doc_v2.len() - 4096..],
+        "last 4 KiB identical"
+    );
+    assert_ne!(doc_v1[8300..8500], doc_v2[8300..8500]);
+
+    fs::write(&doc_path, &doc_v1).unwrap();
+    w.cv_ok(&["archive", "sync"]);
+
+    fs::write(&doc_path, &doc_v2).unwrap();
+    let bumped = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+    fs::File::options()
+        .write(true)
+        .open(&doc_path)
+        .and_then(|f| f.set_modified(bumped))
+        .unwrap();
+    let (sync_out, _) = w.cv_ok(&["archive", "sync"]);
+    assert!(
+        sync_out.contains("1 archived"),
+        "same-length middle edit in >16 KiB OpenSession doc must re-archive: {sync_out}"
+    );
+    fs::remove_file(&doc_path).unwrap();
+
+    let json = |args: &[&str]| serde_json::from_str::<Value>(&w.cv_ok(args).0).unwrap();
+    let ls = json(&["--frozen", "ls", "--json"]);
+    let doc_key = ls
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["harness"] == "opensession")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let shown = json(&["--frozen", "show", &doc_key, "--json"]).to_string();
+    assert!(shown.contains("wallaby") && !shown.contains("echidna"), "{shown}");
+
+    // 2. JSONL `(dev, ino)` replacement via temp-file rename (`to > total_bytes` with identical
+    //    head/boundary 4 KiB windows, mutated at ~8 KiB) must start a fresh 1-extent chain!
+    let jsonl_path = w.transcript("alphasess");
+    let make_jsonl = |middle: &str, extra_tail: bool| {
+        assert_eq!(middle.len(), 7);
+        let head = json!({"type": "user", "uuid": "h1", "timestamp": "2026-02-01T00:00:00Z",
+                          "message": {"role": "user", "content": "a".repeat(6000)}});
+        let mid = json!({"type": "assistant", "uuid": "m1", "timestamp": "2026-02-01T00:00:01Z",
+                         "message": {"role": "assistant", "content": format!("middle-{middle}")}});
+        let tail = json!({"type": "user", "uuid": "t1", "timestamp": "2026-02-01T00:00:02Z",
+                          "message": {"role": "user", "content": "z".repeat(6000)}});
+        let mut s = format!("{head}\n{mid}\n{tail}\n");
+        if extra_tail {
+            let grown = json!({"type": "assistant", "uuid": "g1", "timestamp": "2026-02-01T00:00:03Z",
+                               "message": {"role": "assistant", "content": "post-rename-tail"}});
+            s.push_str(&format!("{grown}\n"));
+        }
+        s
+    };
+    let j_v1 = make_jsonl("caracal", false);
+    fs::write(&jsonl_path, &j_v1).unwrap();
+    let bumped2 = std::time::SystemTime::now() + std::time::Duration::from_secs(10);
+    fs::File::options()
+        .write(true)
+        .open(&jsonl_path)
+        .and_then(|f| f.set_modified(bumped2))
+        .unwrap();
+    w.cv_ok(&["archive", "sync"]);
+
+    // Same-length in-place middle edit first: must recapture whole as 1 extent.
+    let j_v2_same_len = make_jsonl("servals", false);
+    assert_eq!(j_v1.len(), j_v2_same_len.len());
+    fs::write(&jsonl_path, &j_v2_same_len).unwrap();
+    let bumped3 = std::time::SystemTime::now() + std::time::Duration::from_secs(15);
+    fs::File::options()
+        .write(true)
+        .open(&jsonl_path)
+        .and_then(|f| f.set_modified(bumped3))
+        .unwrap();
+    let (out_same, _) = w.cv_ok(&["archive", "sync"]);
+    assert!(out_same.contains("1 archived"), "{out_same}");
+    assert_eq!(custody_of(&w, "alphasess")["extents"].as_array().unwrap().len(), 1);
+
+    // Atomic temp-file rename (`new (dev, ino)`) that is ALSO longer (`to > total_bytes`) while
+    // matching `[0..4096)` and `[old_len - 4096..old_len)`: must NOT reuse the old inode's prefix!
+    let j_v3_renamed = make_jsonl("ocelots", true);
+    assert_eq!(&j_v2_same_len.as_bytes()[..4096], &j_v3_renamed.as_bytes()[..4096]);
+    assert_eq!(
+        &j_v2_same_len.as_bytes()[j_v2_same_len.len() - 4096..],
+        &j_v3_renamed.as_bytes()[j_v2_same_len.len() - 4096..j_v2_same_len.len()]
+    );
+    let tmp_replace = jsonl_path.with_extension("jsonl.tmp");
+    fs::write(&tmp_replace, &j_v3_renamed).unwrap();
+    fs::rename(&tmp_replace, &jsonl_path).unwrap();
+    let (out_ren, _) = w.cv_ok(&["archive", "sync"]);
+    assert!(out_ren.contains("1 archived"), "{out_ren}");
+    let cust = custody_of(&w, "alphasess");
+    assert_eq!(
+        cust["extents"].as_array().unwrap().len(),
+        1,
+        "inode replacement must start a fresh 1-extent chain: {cust}"
+    );
+    fs::remove_file(&jsonl_path).unwrap();
+    let ls2 = json(&["--frozen", "ls", "--json"]);
+    let alpha_key = ls2
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"].as_str().unwrap().starts_with("alphasess@"))
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let alpha_shown = json(&["--frozen", "show", &alpha_key, "--json"]).to_string();
+    assert!(
+        alpha_shown.contains("middle-ocelots")
+            && alpha_shown.contains("post-rename-tail")
+            && !alpha_shown.contains("middle-servals"),
+        "{alpha_shown}"
+    );
 }
