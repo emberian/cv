@@ -814,6 +814,7 @@ mod tests {
                 "id",
                 "message_count",
                 "path",
+                "session_key",
                 "size_bytes",
                 "title",
                 "updated_at"

@@ -333,6 +333,10 @@ fn session_envelope(session: &Session) -> Value {
         "updated_at": session.updated_at.map(|t| t.to_rfc3339()),
         "message_count": msg_count,
     });
+    if let Some(path) = &session.source_path {
+        let reference = crate::SessionRef::new(&session.id, session.harness, path);
+        env["profile"] = json!(crate::SessionKey::local(&reference).profile);
+    }
     if let Some(cv_meta) = session.extra.get("cv") {
         if let Some(obj) = env.as_object_mut() {
             obj.insert("metadata".into(), json!({ "cv": cv_meta }));
@@ -759,6 +763,9 @@ impl Shipper {
                 let env_cwd = commit.envelope.get("cwd").and_then(Value::as_str).map(PathBuf::from);
                 let raw_repo_root = profile.repo_root.as_deref().or(env_cwd.as_deref());
                 let mut scrubbed_envelope = commit.envelope.clone();
+                if let Some(profile) = commit.envelope["profile"].as_str() {
+                    scrubbed_envelope["profile"] = json!(crate::blake3_hex(profile.as_bytes()));
+                }
                 let mut env_stats = ScrubStats::default();
                 scrub_json_value_in_place(
                     &mut scrubbed_envelope,
@@ -1242,6 +1249,19 @@ fn scrub_json_value_in_place(
     repo_root: Option<&Path>,
     stats: &mut ScrubStats,
 ) {
+    scrub_json_children(val, compiled, profile, repo_root, stats);
+    if profile.classes.assignments {
+        stats.secrets.assignments += crate::redact::secrets::fields(val, "");
+    }
+}
+
+fn scrub_json_children(
+    val: &mut Value,
+    compiled: &CompiledProfile,
+    profile: &ScrubProfile,
+    repo_root: Option<&Path>,
+    stats: &mut ScrubStats,
+) {
     match val {
         Value::String(s) => {
             if let std::borrow::Cow::Owned(clean) = compiled.scrub_text_cow(s, repo_root, stats) {
@@ -1250,7 +1270,7 @@ fn scrub_json_value_in_place(
         }
         Value::Array(items) => {
             for item in items {
-                scrub_json_value_in_place(item, compiled, profile, repo_root, stats);
+                scrub_json_children(item, compiled, profile, repo_root, stats);
             }
         }
         Value::Object(map) => {
@@ -1276,7 +1296,7 @@ fn scrub_json_value_in_place(
                 if k == "principal" && !matches!(profile.principal, PrincipalPolicy::Keep) {
                     continue;
                 }
-                scrub_json_value_in_place(v, compiled, profile, repo_root, stats);
+                scrub_json_children(v, compiled, profile, repo_root, stats);
             }
         }
         _ => {}
@@ -1371,6 +1391,9 @@ fn build_scrubbed_envelope(
         "message_count": msg_count,
     });
 
+    if let Some(local_profile) = raw_envelope["profile"].as_str() {
+        out["profile"] = json!(crate::blake3_hex(local_profile.as_bytes()));
+    }
     if let Some(meta) = raw_envelope.get("metadata") {
         let mut clean_meta = meta.clone();
         scrub_json_value_in_place(&mut clean_meta, compiled, profile, repo_root, stats);

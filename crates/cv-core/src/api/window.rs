@@ -22,6 +22,8 @@ pub struct WindowSink {
     budget: Option<usize>,
     bytes: usize,
     pub selected: usize,
+    /// Selected messages that are verbatim non-conversational carriers (counted in `selected`).
+    pub carriers: usize,
     /// The first in-window message the budget rejected: the continuation point.
     pub next: Option<usize>,
     /// Stop at `end` after noting a message exists there (`more`), instead of reading on to EOF
@@ -50,6 +52,7 @@ impl WindowSink {
             budget: None,
             bytes: 0,
             selected: 0,
+            carriers: 0,
             next: None,
             stop_at_end: false,
             more: false,
@@ -141,6 +144,7 @@ impl WindowSink {
         }
         self.bytes = self.bytes.checked_add(size).context("JSON budget size overflow")?;
         self.selected += 1;
+        self.carriers += usize::from(message.is_carrier());
         if let Some(kept) = self.kept.as_mut() {
             kept.push(message);
         }

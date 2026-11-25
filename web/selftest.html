@@ -1645,8 +1645,14 @@ await acheck("bearer token auth propagates to headers, export links, and 401 unl
     const tr = renderTranscript(s);
     const hrefs = [];
     HTMLAnchorElement.prototype.click = function () { hrefs.push(this.href); };
+    globalThis.fetch = async (url, opts) => {
+      has(String(url), "/api/auth", "browser reader cookie exchange");
+      eq(opts.headers.Authorization, "Bearer s3cr3t", "header-only exchange");
+      return { ok: true };
+    };
     tr.querySelector("[data-export-md]").click();
-    has(hrefs[0], "token=s3cr3t", "remote export appends encoded token");
+    await Promise.resolve();
+    eq(new URL(hrefs[0]).searchParams.has("token"), false, "download URL has no bearer");
     tr.remove();
 
     setAuthToken("");

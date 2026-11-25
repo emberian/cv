@@ -1065,7 +1065,7 @@ enum Cmd {
         /// Replicate sealed custody packs and events to this hub URL or `[replication.<target>]` profile.
         #[arg(long, value_name = "TARGET")]
         to: Option<String>,
-        /// Bearer credential for `--to` hub replication (overrides $CV_SERVE_TOKEN and profile token).
+        /// Bearer credential for `--to` hub replication (overrides $CV_HUB_PRODUCER_TOKEN and profile token).
         #[arg(long, value_name = "TOKEN", requires = "to")]
         token: Option<String>,
     },
@@ -1092,7 +1092,7 @@ enum Cmd {
         /// Also host the browser dashboard from this directory (the repo's `web/`).
         #[arg(long, value_name = "DIR")]
         web: Option<PathBuf>,
-        /// Require `Authorization: Bearer <token>` on every /api/* request ($CV_SERVE_TOKEN works too).
+        /// Reader bearer credential (or $CV_SERVE_READ_TOKEN / $CV_SERVE_TOKEN).
         #[arg(long, value_name = "TOKEN")]
         token: Option<String>,
         /// Allow a non-loopback --host without a token. The transcript corpus can contain
@@ -1225,7 +1225,7 @@ enum ArchiveCmd {
         /// Replicate sealed custody packs and events to this hub URL or `[replication.<target>]` profile.
         #[arg(long, value_name = "TARGET")]
         to: Option<String>,
-        /// Bearer credential for `--to` hub replication (overrides $CV_SERVE_TOKEN and profile token).
+        /// Bearer credential for `--to` hub replication (overrides $CV_HUB_PRODUCER_TOKEN and profile token).
         #[arg(long, value_name = "TOKEN", requires = "to")]
         token: Option<String>,
     },

@@ -376,3 +376,34 @@ impl<'a> Response<'a> {
         Ok(())
     }
 }
+
+/// Drive a small buffered request through the synchronous handler without binding a socket.
+#[cfg(test)]
+pub(crate) fn test_request(
+    method: &str,
+    uri: &str,
+    headers: &[(&str, &str)],
+    handler: impl FnOnce(&mut Request<'_>),
+) -> axum::response::Response {
+    let mut builder = axum::http::Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("Host", "localhost");
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
+    let (parts, _) = builder.body(()).unwrap().into_parts();
+    let (tx, rx) = oneshot::channel();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    let _entered = runtime.enter();
+    let mut body = io::empty();
+    handler(&mut Request {
+        parts,
+        reader: &mut body,
+        response: Some(tx),
+    });
+    rx.blocking_recv().unwrap()
+}

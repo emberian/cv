@@ -39,12 +39,21 @@ fn text_sets_within(query: &SessionQuery, live: cv_search::LiveRead) -> Result<T
     if needles.is_empty() {
         return Ok(TextSets::empty());
     }
-    if live == cv_search::LiveRead::Frozen && !cv_search::default_tantivy_dir().exists() {
+    if live == cv_search::LiveRead::Frozen
+        && !cv_search::default_tantivy_dir().exists()
+        && cv_core::custody::inventory()?.is_empty()
+    {
         return usage("`text:` needs a full-text index; build it with `cv index`");
     }
     let borrowed: Vec<_> = needles.iter().map(String::as_str).collect();
-    let (matches, suffix) = cv_search::text_search_ids_suffixed(None, &borrowed, live, &cv_core::sessions())
-        .context("opening full-text query index")?;
+    let (matches, suffix) = cv_search::fts::text_search_keys_suffixed(
+        &cv_search::default_tantivy_dir(),
+        &borrowed,
+        cv_search::Scope::Exchange,
+        live,
+        &cv_core::sessions(),
+    )
+    .context("opening full-text query index")?;
     if suffix.no_index && suffix.unread() > 0 {
         return usage(format!(
             "`text:` needs a full-text index: {} of {} session(s) were not read live; build it with `cv index`",

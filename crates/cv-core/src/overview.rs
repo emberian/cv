@@ -95,6 +95,12 @@ pub struct Overview {
 /// Read the parent once, retaining bounded previews. A failed/changed parent read never returns
 /// a partial overview. Worker discovery is independent and failures are disclosed in warnings.
 pub fn read(r: &SessionRef, opts: &OverviewOptions) -> Result<Overview> {
+    #[cfg(feature = "sqlite")]
+    if let Some(backing) = crate::custody::backing_for(r)? {
+        let mut overview = from_session(&backing.parse(r)?, opts)?;
+        overview.session["session_key"] = r.id.clone().into();
+        return Ok(overview);
+    }
     let adapter = crate::harness::rootless(r.harness).context("harness reader unavailable")?;
     let mut sink = Collector::new(r, opts);
     let streamed = crate::stream::stream_counted(

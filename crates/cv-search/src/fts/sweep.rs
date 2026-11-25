@@ -210,10 +210,10 @@ impl Feed<'_> {
         let mut by_id: HashMap<String, usize> = HashMap::new();
         let mut groups: Vec<Vec<Job>> = Vec::new();
         for j in jobs {
-            match by_id.get(&j.r.id) {
+            match by_id.get(&j.r.session_selector()) {
                 Some(&g) => groups[g].push(j),
                 None => {
-                    by_id.insert(j.r.id.clone(), groups.len());
+                    by_id.insert(j.r.session_selector(), groups.len());
                     groups.push(vec![j]);
                 }
             }
@@ -316,10 +316,10 @@ pub(super) fn run_fed(
                                 match delete {
                                     Delete::Nothing => {}
                                     Delete::All => {
-                                        writer.delete_term(Term::from_field_text(f.id, &job.r.id));
+                                        writer.delete_term(Term::from_field_text(f.id, &job.r.session_selector()));
                                     }
                                     Delete::From(n) => {
-                                        writer.delete_query(Box::new(resumed_docs(f, &job.r.id, n)))?;
+                                        writer.delete_query(Box::new(resumed_docs(f, &job.r.session_selector(), n)))?;
                                     }
                                 }
                                 batch.replay(|doc| {
@@ -485,7 +485,7 @@ pub(super) fn run_fed(
                         if job.fts {
                             ran.dependencies.push((job.r.clone(), read_at(&fts_reads)));
                             ran.changed += 1;
-                            ran.completed.insert(job.r.id.clone());
+                            ran.completed.insert(job.r.session_selector());
                         }
                     }
                     Out::Failed { job, err, transient } => {

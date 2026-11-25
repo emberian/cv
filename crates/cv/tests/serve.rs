@@ -306,6 +306,7 @@ fn serve_endpoints() {
             "id",
             "message_count",
             "path",
+            "session_key",
             "size_bytes",
             "title",
             "updated_at"
@@ -2130,7 +2131,7 @@ fn serve_exposed_headers_and_lan_same_origin_post_with_token() {
     let (port, _server) = spawn_serve_cfg(
         &w,
         &["--host", "0.0.0.0", "--token", "lan-secret", "--who", "alice"],
-        &[],
+        &[("CV_TASK_WRITE_TOKEN", "lan-write")],
     );
 
     // X-Cv-Search-Total must be exposed for cross-origin dashboards.
@@ -2170,7 +2171,7 @@ fn serve_exposed_headers_and_lan_same_origin_post_with_token() {
         &claim_path,
         &lan_host,
         &lan_origin,
-        Some("Bearer lan-secret"),
+        Some("Bearer lan-write"),
         r#"{"who":"alice"}"#,
     );
     assert_eq!(raw_status(&ok_resp), 200, "same-origin LAN POST failed:\n{ok_resp}");
@@ -2186,7 +2187,7 @@ fn serve_exposed_headers_and_lan_same_origin_post_with_token() {
         &note_path,
         &lan_host,
         "https://evil.example",
-        Some("Bearer lan-secret"),
+        Some("Bearer lan-write"),
         r#"{"who":"alice","text":"spoof"}"#,
     );
     assert_eq!(raw_status(&evil_resp), 403, "{evil_resp}");
@@ -2224,12 +2225,22 @@ fn serve_sse_stream_auth_and_live_cursor_wakeup() {
         .expect("seed open");
     let id = opened.task_id;
 
-    let (port, _server) = spawn_serve_cfg(&w, &["--token", "stream-secret", "--who", "alice"], &[]);
+    let (port, _server) = spawn_serve_cfg(
+        &w,
+        &["--token", "stream-secret", "--who", "alice"],
+        &[("CV_TASK_WRITE_TOKEN", "stream-writer")],
+    );
 
     let unauth = raw_request(port, "GET", "/api/stream", &[]);
     assert_eq!(raw_status(&unauth), 401, "{unauth}");
 
-    let init = raw_request(port, "GET", "/api/stream?token=stream-secret", &[]);
+    let query = raw_request(port, "GET", "/api/stream?token=stream-secret", &[]);
+    assert_eq!(raw_status(&query), 401, "{query}");
+    let auth = raw_request(port, "GET", "/api/auth", &[("Authorization", "Bearer stream-secret")]);
+    let header = header_of(&auth, "Set-Cookie").unwrap();
+    assert!(header.contains("HttpOnly"));
+    let cookie = header.split(';').next().unwrap();
+    let init = raw_request(port, "GET", "/api/stream", &[("Cookie", cookie)]);
     assert_eq!(raw_status(&init), 200, "{init}");
     assert!(
         header_of(&init, "Content-Type")
@@ -2291,7 +2302,7 @@ fn serve_sse_stream_auth_and_live_cursor_wakeup() {
     write!(
         post_stream,
         "POST /api/task/{id}/note HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\
-         Authorization: Bearer stream-secret\r\nContent-Type: application/json\r\n\
+         Authorization: Bearer stream-writer\r\nContent-Type: application/json\r\n\
          Content-Length: {}\r\nConnection: close\r\n\r\n{payload}",
         payload.len()
     )

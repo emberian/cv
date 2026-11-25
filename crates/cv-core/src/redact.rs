@@ -37,6 +37,16 @@
 //!
 //! OWNED BY the redact work.
 
+pub mod pii;
+pub(crate) mod secrets;
+
+/// Scrub an arbitrary JSON credential envelope with the canonical wire marker.
+pub fn redact_secrets_json(value: &mut serde_json::Value) -> usize {
+    secrets::structured(value, "")
+}
+
+pub const SECRET_RULESET: &str = "secrets@2";
+
 use crate::ir::{Block, Message, Session};
 #[cfg(test)]
 use crate::json::{ReadInput, Validation};
@@ -302,7 +312,7 @@ pub struct ScrubProfile {
     /// Hub endpoint URL (`http://host:port`) when configured under `[replication.<target>]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
-    /// Bearer credential for `[replication.<target>]` (overridden by `--token` or `$CV_SERVE_TOKEN`).
+    /// Bearer credential for `[replication.<target>]` (overridden by `--token` or `$CV_HUB_PRODUCER_TOKEN`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
     /// Explicit producer identity enrolled on `[replication.<target>]` (default: `$CV_PRODUCER_ID` or persistent `prod-<12hex>`).
@@ -552,8 +562,11 @@ pub fn redact_with(session: &Session, opts: &RedactOptions) -> anyhow::Result<(S
             *remote = scrubbed;
         }
     }
-    for (_k, v) in out.extra.iter_mut() {
+    for (k, v) in out.extra.iter_mut() {
         scrub_value(v, opts, &mut stats);
+        if opts.classes.assignments {
+            stats.assignments += secrets::fields(v, k);
+        }
     }
     for msg in &mut out.messages {
         redact_message(msg, opts, &mut stats, &resolver)?;
@@ -571,6 +584,9 @@ pub fn redact_text(s: &str) -> String {
 /// Zero-allocation pre-scan over a single `&str`: returns `true` iff [`scrub_cow`] would redact at
 /// least one non-placeholder span under `opts`.
 pub fn str_needs_scrub(s: &str, opts: &RedactOptions) -> bool {
+    if secrets::additional(s, &opts.classes).is_some() {
+        return true;
+    }
     if s.is_empty() {
         return false;
     }
@@ -654,7 +670,7 @@ fn json_view_any_str(view: crate::json::JsonView<'_>, pred: &mut dyn FnMut(&str)
     let mut found = false;
     let _ = crate::stream::stopped(
         view.for_each_entry(|key, val| {
-            if pred(key) || json_view_any_str(val, pred)? {
+            if secrets::context_key(key) || pred(key) || json_view_any_str(val, pred)? {
                 found = true;
                 return Err(crate::stream::Stop.into());
             }
@@ -700,6 +716,12 @@ pub fn redact_message(
         if let Some(fields) = block.extensions_mut() {
             for value in fields.values_mut() {
                 scrub_value(value, opts, stats);
+            }
+        }
+        if let Block::Thinking { signature, .. } = block {
+            if signature.as_ref().is_some_and(|sig| str_needs_scrub(sig, opts)) {
+                *signature = None;
+                stats.assignments += 1;
             }
         }
         match block {
@@ -756,8 +778,11 @@ pub fn redact_message(
     }
     // Harness-specific passthrough fields can carry anything the harness logged (env snapshots,
     // request metadata) — scrub their string leaves too.
-    for (_k, v) in msg.extra.iter_mut() {
+    for (k, v) in msg.extra.iter_mut() {
         scrub_value(v, opts, stats);
+        if opts.classes.assignments {
+            stats.assignments += secrets::fields(v, k);
+        }
     }
     Ok(())
 }
@@ -848,8 +873,11 @@ impl CompiledProfile {
                         }
                         crate::ir::Principal::Object(map) => {
                             scrub_object_keys(map, |key| self.scrub_text_cow(key, repo_root, &mut stats).into_owned());
-                            for (_k, val) in map.iter_mut() {
+                            for (key, val) in map.iter_mut() {
                                 self.scrub_value(val, repo_root, &mut stats);
+                                if self.profile.classes.assignments {
+                                    stats.secrets.assignments += secrets::fields(val, key);
+                                }
                             }
                         }
                     }
@@ -868,8 +896,11 @@ impl CompiledProfile {
             }
         }
 
-        for (_k, v) in out.extra.iter_mut() {
+        for (k, v) in out.extra.iter_mut() {
             self.scrub_value(v, repo_root, &mut stats);
+            if self.profile.classes.assignments {
+                stats.secrets.assignments += secrets::fields(v, k);
+            }
         }
         for msg in &mut out.messages {
             self.scrub_message(msg, repo_root, &mut stats, &resolver)?;
@@ -911,6 +942,15 @@ impl CompiledProfile {
             if let Some(fields) = block.extensions_mut() {
                 for value in fields.values_mut() {
                     self.scrub_value(value, repo_root, stats);
+                }
+            }
+            if let Block::Thinking { signature, .. } = block {
+                if signature
+                    .as_ref()
+                    .is_some_and(|sig| self.text_needs_scrub(sig, repo_root))
+                {
+                    *signature = None;
+                    stats.secrets.assignments += 1;
                 }
             }
             match block {
@@ -961,13 +1001,23 @@ impl CompiledProfile {
                 self.scrub_value(record.value.make_owned()?, repo_root, stats);
             }
         }
-        for (_k, v) in msg.extra.iter_mut() {
+        for (k, v) in msg.extra.iter_mut() {
             self.scrub_value(v, repo_root, stats);
+            if self.profile.classes.assignments {
+                stats.secrets.assignments += secrets::fields(v, k);
+            }
         }
         Ok(())
     }
 
-    fn scrub_value(&self, v: &mut Value, repo_root: Option<&Path>, stats: &mut ScrubStats) {
+    pub(crate) fn scrub_value(&self, v: &mut Value, repo_root: Option<&Path>, stats: &mut ScrubStats) {
+        self.scrub_leaves(v, repo_root, stats);
+        if self.profile.classes.assignments {
+            stats.secrets.assignments += secrets::fields(v, "");
+        }
+    }
+
+    fn scrub_leaves(&self, v: &mut Value, repo_root: Option<&Path>, stats: &mut ScrubStats) {
         match v {
             Value::String(s) => {
                 if let Cow::Owned(scrubbed) = self.scrub_text_cow(s, repo_root, stats) {
@@ -976,13 +1026,22 @@ impl CompiledProfile {
             }
             Value::Array(arr) => {
                 for item in arr {
-                    self.scrub_value(item, repo_root, stats);
+                    self.scrub_leaves(item, repo_root, stats);
                 }
             }
             Value::Object(map) => {
+                if map.get("type").and_then(Value::as_str) == Some("thinking")
+                    && map
+                        .get("signature")
+                        .and_then(Value::as_str)
+                        .is_some_and(|s| self.text_needs_scrub(s, repo_root))
+                {
+                    map.remove("signature");
+                    stats.secrets.assignments += 1;
+                }
                 scrub_object_keys(map, |key| self.scrub_text_cow(key, repo_root, stats).into_owned());
                 for val in map.values_mut() {
-                    self.scrub_value(val, repo_root, stats);
+                    self.scrub_leaves(val, repo_root, stats);
                 }
             }
             _ => {}
@@ -1425,6 +1484,14 @@ fn scrub_ssh_principals_cow<'a>(s: &'a str, count: &mut usize) -> Cow<'a, str> {
 /// Crate-visible so per-block redacting renderers (dataset export) can scrub a tool input without
 /// going through [`redact_message`] on a cloned message.
 pub(crate) fn scrub_value(v: &mut Value, opts: &RedactOptions, stats: &mut RedactStats) {
+    // Patterns first, so a recognized credential keeps its specific label.
+    scrub_leaves(v, opts, stats);
+    if opts.classes.assignments {
+        stats.assignments += secrets::fields(v, "");
+    }
+}
+
+fn scrub_leaves(v: &mut Value, opts: &RedactOptions, stats: &mut RedactStats) {
     match v {
         Value::String(s) => {
             if let Cow::Owned(scrubbed) = scrub_cow(s, opts, stats) {
@@ -1433,13 +1500,22 @@ pub(crate) fn scrub_value(v: &mut Value, opts: &RedactOptions, stats: &mut Redac
         }
         Value::Array(arr) => {
             for item in arr {
-                scrub_value(item, opts, stats);
+                scrub_leaves(item, opts, stats);
             }
         }
         Value::Object(map) => {
+            if map.get("type").and_then(Value::as_str) == Some("thinking")
+                && map
+                    .get("signature")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| str_needs_scrub(s, opts))
+            {
+                map.remove("signature");
+                stats.assignments += 1;
+            }
             scrub_object_keys(map, |key| scrub_cow(key, opts, stats).into_owned());
             for val in map.values_mut() {
-                scrub_value(val, opts, stats);
+                scrub_leaves(val, opts, stats);
             }
         }
         // numbers, bools, null: nothing to scrub.
@@ -1466,6 +1542,15 @@ fn scrub(s: &str, opts: &RedactOptions, stats: &mut RedactStats) -> String {
 /// rule (the order of [`rules`]) wins. An existing placeholder is a rule too (the first), consumed
 /// verbatim, which is what makes the transform idempotent.
 pub(crate) fn scrub_cow<'a>(s: &'a str, opts: &RedactOptions, stats: &mut RedactStats) -> Cow<'a, str> {
+    let base = legacy_cow(s, opts, stats);
+    if let Some(changed) = secrets::additional(&base, &opts.classes) {
+        stats.assignments += 1;
+        return Cow::Owned(changed);
+    }
+    base
+}
+
+fn legacy_cow<'a>(s: &'a str, opts: &RedactOptions, stats: &mut RedactStats) -> Cow<'a, str> {
     if s.is_empty() {
         return Cow::Borrowed(s);
     }
@@ -1713,7 +1798,10 @@ fn rules() -> &'static [Rule] {
                 Kind::Assignment,
                 r#"(?i)(?:password|passwd|secret|api_key|apikey|api-key|access_token|secret_key|client_secret|auth_token|token)[ \t]*[=:][ \t]*(?:"([^"]*)"|'([^']*)'|([^ \t\r\n,;)]+))"#,
                 |s, c| {
-                    boundary_before(s, c.get(0)?.start()).then_some(())?;
+                    let start = c.get(0)?.start();
+                    // The query recognizer owns URL values and stops at the next parameter.
+                    if s[..start].ends_with(['?', '&']) || s[..start].ends_with("&amp;") {return None}
+                    boundary_before(s,start).then_some(())?;
                     let v = match c.get(1).or_else(|| c.get(2)) {
                         Some(quoted) => quoted,
                         None => {
@@ -1935,6 +2023,49 @@ mod tests {
     fn empty_session() -> Session {
         Session {
             ..Session::new("t", Harness::Claude)
+        }
+    }
+
+    #[test]
+    fn redact_thinking_signature_is_atomic_and_structured_tool_values_are_scrubbed() {
+        let input = serde_json::json!({"id":"s","harness":"claude","messages":[{"role":"assistant","kind":"reply","origin":"model",
+            "content":[{"type":"thinking","text":"a","signature":"opaque-CLEAN"},
+                {"type":"thinking","text":"b","signature":"prefix ?token=abcDEF123456 suffix"},
+                {"type":"tool_use","id":"x","name":"call","input":{"secret":{"name":"authorization","value":"opaque-private"},"cookies":[{"name":"id","value":"opaque-private"}],"client_secret":"opaque-private"}}]}]});
+        let session: Session = serde_json::from_value(input).unwrap();
+        for clean in [
+            redact(&session).unwrap(),
+            scrub_session_with_profile(&session, &ScrubProfile::default())
+                .unwrap()
+                .0,
+        ] {
+            let out = serde_json::to_value(clean).unwrap();
+            let blocks = &out["messages"][0]["content"];
+            assert_eq!(blocks[0]["signature"], "opaque-CLEAN");
+            assert!(blocks[1].get("signature").is_none());
+            assert!(!out.to_string().contains("opaque-private"));
+        }
+    }
+
+    #[test]
+    fn redact_secrets_before_rendering_nested_json_and_short_query_arguments() {
+        let secret = "opaque-real-value";
+        for key in [
+            "api_key",
+            "access_token",
+            "client_secret",
+            "private_key",
+            "password",
+            "authorization",
+        ] {
+            let object = serde_json::json!({key:secret});
+            let escaped = serde_json::to_string(&object.to_string()).unwrap();
+            assert!(!redact_text(&escaped).contains(secret), "{key}");
+        }
+        for key in ["key", "token", "sig", "X-Amz-Signature"] {
+            let url = format!("https://example.test/file?{key}=q49&public=ok");
+            let result = redact_text(&url);
+            assert!(!result.contains("q49") && result.ends_with("&public=ok"), "{result}");
         }
     }
 

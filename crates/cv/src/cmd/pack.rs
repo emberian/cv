@@ -83,12 +83,12 @@ pub(crate) fn cmd_pack(args: PackArgs<'_>) -> Result<()> {
             .map(|spec| {
                 let (harness, id) = crate::util::split_harness_id(spec, None);
                 let (session, adapter) = crate::cmd::distill::resolve_source(id, harness)?;
-                let selector = Path::new(id)
-                    .is_file()
-                    .then(|| crate::util::source_selector(session.harness, id));
-                if selector.is_some() {
+                let is_path = Path::new(id).is_file();
+                if is_path {
                     crate::util::require_session_file(&session, adapter.as_ref())?;
                 }
+                let selector = (is_path || cv_core::SessionKey::split_selector(id).is_some())
+                    .then(|| crate::util::source_selector(session.harness, id));
                 Ok((session, adapter, selector))
             })
             .collect::<Result<Vec<_>>>()?;
@@ -120,8 +120,10 @@ pub(crate) fn cmd_pack(args: PackArgs<'_>) -> Result<()> {
             return Ok(());
         }
         for hit in hits {
-            let source = resolve_hit(&hit)
-                .and_then(|(session, adapter)| build_source(session, adapter.as_ref(), query, excerpt_bytes, None));
+            let source = resolve_hit(&hit).and_then(|(session, adapter)| {
+                let selector = hit.session_key.as_ref().map(|key| format!("{}:{key}", session.harness));
+                build_source(session, adapter.as_ref(), query, excerpt_bytes, selector)
+            });
             match source {
                 Ok(source) => sources.push(source),
                 Err(error) => eprintln!("cv pack: skipping {} ({}): {error:#}", short_id(&hit.id), hit.harness),
@@ -298,7 +300,7 @@ fn fuse(ranked: Vec<(f32, Vec<cv_search::Hit>)>, limit: usize) -> Vec<cv_search:
         let mut seen = HashSet::new();
         let mut rank = 0;
         for h in list {
-            let key = (h.harness.clone(), h.id.clone());
+            let key = (h.harness.clone(), h.session_key.as_ref().unwrap_or(&h.id).clone());
             // One session contributes once per recall channel; multiple fragments must not
             // inflate its weight or push later distinct sessions down the session ranking.
             if seen.insert(key.clone()) {
@@ -334,6 +336,7 @@ fn fuse(ranked: Vec<(f32, Vec<cv_search::Hit>)>, limit: usize) -> Vec<cv_search:
         b.0.total_cmp(&a.0)
             .then_with(|| a.1.harness.cmp(&b.1.harness))
             .then_with(|| a.1.id.cmp(&b.1.id))
+            .then_with(|| a.1.session_key.cmp(&b.1.session_key))
     });
 
     // Near-duplicate suppression: one source per (title, cwd). Untitled sessions never collapse.
@@ -424,12 +427,18 @@ struct PackSource {
 
 fn resolve_hit(hit: &cv_search::Hit) -> Result<(cv_core::SessionRef, Box<dyn cv_core::Adapter>)> {
     if let Some(session) = &hit.session {
+        if let Some(adapter) = cv_core::custody::backing_for(session)? {
+            return Ok((session.clone(), adapter));
+        }
         let adapter = cv_core::harness::for_harness(session.harness)
             .with_context(|| format!("no adapter for {}", session.harness))?;
         return Ok((session.clone(), adapter));
     }
-    cv_core::find(&hit.id, Harness::parse(&hit.harness))?
-        .with_context(|| format!("session {} no longer on disk", short_id(&hit.id)))
+    cv_core::find(
+        hit.session_key.as_deref().unwrap_or(&hit.id),
+        Harness::parse(&hit.harness),
+    )?
+    .with_context(|| format!("session {} no longer on disk", short_id(&hit.id)))
 }
 
 fn build_source(
@@ -1424,6 +1433,7 @@ mod tests {
 
     fn hit(id: &str, snippet: &str) -> cv_search::Hit {
         cv_search::Hit {
+            session_key: None,
             id: id.into(),
             harness: "claude".into(),
             cwd: None,

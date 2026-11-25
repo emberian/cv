@@ -45,11 +45,16 @@ impl Drop for Reaper {
     }
 }
 
+fn reader(url: &str) -> HttpClient {
+    HttpClient::new(url, Some("hub-reader-test".into())).unwrap()
+}
+
 fn spawn_hub_serve(w: &World, token: Option<&str>) -> (String, u16, Reaper) {
     let mut cmd = w.cv_command();
     cmd.args(["serve", "--port", "0"]);
     if let Some(tok) = token {
-        cmd.args(["--token", tok]);
+        cmd.args(["--token", "hub-reader-test"]);
+        cmd.env("CV_HUB_PRODUCER_TOKEN", tok);
     }
     cmd.env("CV_SERVE_HUB", "1");
 
@@ -242,7 +247,7 @@ fn fleet_hub_out_of_order_frontier_and_publish_before_reference() {
         }
         other => panic!("expected Transport(424), got {other:?}"),
     }
-    let (status_raw, _) = shipper.client().get("/api/hub/status").unwrap();
+    let (status_raw, _) = reader(&hub_url).get("/api/hub/status").unwrap();
     let st0: HubStatusResponse = status_raw.json().unwrap();
     assert!(st0.frontiers.is_empty(), "failed batch must not mutate frontiers");
     assert!(st0.latest_snapshot.is_none(), "failed batch must not publish snapshot");
@@ -274,7 +279,7 @@ fn fleet_hub_out_of_order_frontier_and_publish_before_reference() {
         "buffered future events 5..=8 must NOT leak into Snapshot #1"
     );
 
-    let (st1_raw, _) = shipper.client().get("/api/hub/status").unwrap();
+    let (st1_raw, _) = reader(&hub_url).get("/api/hub/status").unwrap();
     assert_eq!(st1_raw.header("X-Cv-Snapshot"), Some(snap1.publication_id.as_str()));
     assert_eq!(st1_raw.header("X-Cv-Hub-Generation"), Some("1"));
     let st1: HubStatusResponse = st1_raw.json().unwrap();
@@ -284,7 +289,7 @@ fn fleet_hub_out_of_order_frontier_and_publish_before_reference() {
     assert_eq!(st1.frontiers[0].buffered_count, 4);
     assert_eq!(st1.frontiers[0].missing_ranges, vec![(1, 4)]);
 
-    let (sess1_raw, _) = shipper.client().get("/api/hub/sessions").unwrap();
+    let (sess1_raw, _) = reader(&hub_url).get("/api/hub/sessions").unwrap();
     let sess1_page: HubSessionsPage = sess1_raw.json().unwrap();
     assert_eq!(sess1_page.total, 0);
 
@@ -307,13 +312,13 @@ fn fleet_hub_out_of_order_frontier_and_publish_before_reference() {
     assert_ne!(snap2.publication_id, snap1.publication_id);
     assert_eq!(snap2.session_revisions.len(), 8);
 
-    let (st2_raw, _) = shipper.client().get("/api/hub/status").unwrap();
+    let (st2_raw, _) = reader(&hub_url).get("/api/hub/status").unwrap();
     let st2: HubStatusResponse = st2_raw.json().unwrap();
     assert_eq!(st2.frontiers[0].contiguous_seq, 8);
     assert_eq!(st2.frontiers[0].buffered_count, 0);
     assert!(st2.frontiers[0].missing_ranges.is_empty());
 
-    let (sess2_raw, _) = shipper.client().get("/api/hub/sessions").unwrap();
+    let (sess2_raw, _) = reader(&hub_url).get("/api/hub/sessions").unwrap();
     assert_eq!(sess2_raw.header("X-Cv-Snapshot"), Some(snap2.publication_id.as_str()));
     assert_eq!(sess2_raw.header("X-Cv-Hub-Generation"), Some("2"));
     let sess2_page: HubSessionsPage = sess2_raw.json().unwrap();
@@ -520,7 +525,7 @@ fn fleet_hub_conflict_quarantine_freezes_frontier() {
 
     // Verify `GET /api/hub/status`: quarantine recorded, `first_conflict_seq == Some(4)`,
     // `contiguous_seq == 3`, and `"forged-hijack"` NEVER entered `hub_sessions`!
-    let (st_raw, _) = shipper.client().get("/api/hub/status").unwrap();
+    let (st_raw, _) = reader(&hub_url).get("/api/hub/status").unwrap();
     let st: HubStatusResponse = st_raw.json().unwrap();
     assert_eq!(st.quarantine.count, 1);
     assert_eq!(st.quarantine.entries[0].event_id, EventId::new("prod-quar", "ep-1", 4));
@@ -529,7 +534,7 @@ fn fleet_hub_conflict_quarantine_freezes_frontier() {
     assert_eq!(st.frontiers[0].contiguous_seq, 3);
     assert_eq!(st.frontiers[0].first_conflict_seq, Some(4));
 
-    let (sess_raw, _) = shipper.client().get("/api/hub/sessions").unwrap();
+    let (sess_raw, _) = reader(&hub_url).get("/api/hub/sessions").unwrap();
     let page: HubSessionsPage = sess_raw.json().unwrap();
     let ids: Vec<&str> = page.sessions.iter().map(|r| r.id.as_str()).collect();
     assert!(!ids.contains(&"forged-hijack"), "forged event must never materialize");
@@ -663,7 +668,7 @@ fn fleet_hub_offline_hydration_pinned_snapshots_and_pagination() {
     assert_eq!(rep_b2.hub_generation, Some(3));
     let pub_3 = rep_b2.hub_snapshot_id.expect("pub_3");
 
-    let client = shipper_b.client();
+    let client = reader(&hub_url);
 
     // A. Sleeping/Offline Producer Hydration: `laptop-alpha` is deleted from disk, yet
     //    `GET /api/hub/session/laptop-alpha/alpha-pelican?snapshot=<pub_1>` hydrates the full IR
@@ -964,13 +969,13 @@ tags = ["team-share"]
     );
 
     // Verify hub sessions & hydrated scrubbed payload!
-    let (page_raw, _) = shipper.client().get("/api/hub/sessions").unwrap();
+    let (page_raw, _) = reader(&hub_url).get("/api/hub/sessions").unwrap();
     let page: HubSessionsPage = page_raw.json().unwrap();
     assert_eq!(page.total, 1, "only admitted session may appear on hub");
     assert_eq!(page.sessions[0].id, "sess-admitted");
     assert_eq!(page.sessions[0].cwd.as_deref(), Some("$REPO"));
 
-    let (hyd_raw, _) = shipper.client().get("/api/hub/session/prod-sec/sess-admitted").unwrap();
+    let (hyd_raw, _) = reader(&hub_url).get("/api/hub/session/prod-sec/sess-admitted").unwrap();
     assert_eq!(hyd_raw.status, 200);
     let hyd: Value = hyd_raw.json().unwrap();
     let hyd_text = serde_json::to_string(&hyd).unwrap();
@@ -1161,7 +1166,7 @@ fn fleet_hub_rebuild_from_raw_matches_incremental_bit_for_bit() {
     });
     assert!(conflict_res.is_err());
 
-    let client = shipper_a.client();
+    let client = reader(&hub_url);
 
     // Capture incremental ground truth from live HTTP endpoints BEFORE wiping!
     let (status_before_raw, _) = client.get("/api/hub/status").unwrap();
@@ -1466,14 +1471,14 @@ deny_cwds = ["/work/secret-ops"]
 
     // Check hub sessions: ONLY `sess-keep` exists (no `"unknown"` row), and its title,
     // message_count (2), metadata (`$REPO/src/main.rs`), and mirrored pack hydration stayed intact!
-    let (page_raw, _) = client.get("/api/hub/sessions").unwrap();
+    let (page_raw, _) = reader(&hub_url).get("/api/hub/sessions").unwrap();
     let page: HubSessionsPage = page_raw.json().unwrap();
     assert_eq!(page.total, 1);
     assert_eq!(page.sessions[0].id, "sess-keep");
     assert_eq!(page.sessions[0].title.as_deref(), Some("Preserved Session Title"));
     assert_eq!(page.sessions[0].message_count, 2);
 
-    let (snap_raw, _) = client.get("/api/hub/snapshot").unwrap();
+    let (snap_raw, _) = reader(&hub_url).get("/api/hub/snapshot").unwrap();
     let snap: HubSnapshotResponse = snap_raw.json().unwrap();
     assert_eq!(
         snap.frontiers[0].contiguous_seq, 4,
@@ -1489,13 +1494,13 @@ deny_cwds = ["/work/secret-ops"]
     assert!(!rev_meta_str.contains(quoted_secret));
     assert!(!rev_meta_str.contains("alice-raw-principal"));
 
-    let (hyd_raw, _) = client.get("/api/hub/session/prod-mixed/sess-keep").unwrap();
+    let (hyd_raw, _) = reader(&hub_url).get("/api/hub/session/prod-mixed/sess-keep").unwrap();
     assert_eq!(hyd_raw.status, 200);
     let hyd_json: Value = hyd_raw.json().unwrap();
     assert_eq!(hyd_json["messages"].as_array().unwrap().len(), 2);
 
     // Check enrolled producer metadata & raw hub sqlite bytes: zero leaks anywhere!
-    let (status_raw, _) = client.get("/api/hub/status").unwrap();
+    let (status_raw, _) = reader(&hub_url).get("/api/hub/status").unwrap();
     let status: HubStatusResponse = status_raw.json().unwrap();
     let status_text = serde_json::to_string(&status).unwrap();
     let db_bytes = fs::read(hub_home.join("state.db")).unwrap();
@@ -1887,8 +1892,8 @@ fn cli_archive_sync_to_hub_ships_scrubbed_packs_and_respects_frozen() {
 
     // Query the hub and verify both hosts' sessions arrived under distinct producers with secrets
     // and home paths scrubbed!
-    let client = HttpClient::new(&hub_url, Some("cli-ship-tok".into())).unwrap();
-    let (page_raw, _) = client.get("/api/hub/sessions").unwrap();
+    let client = reader(&hub_url);
+    let (page_raw, _) = reader(&hub_url).get("/api/hub/sessions").unwrap();
     assert_eq!(page_raw.status, 200);
     let page: HubSessionsPage = page_raw.json().unwrap();
     assert_eq!(page.sessions.len(), 2);
@@ -2324,7 +2329,7 @@ fn shipper_reconstructs_legacy_archive_packs_drains_inbox_cleans_outbound_and_in
 
     // 3) All 3 events (`seq = 1..=3`) reached contiguous frontier `3`, and `[privacy]`'s
     //    `rewrite_home = true` scrubbed `cwd` to `$HOME/repo`!
-    let client = HttpClient::new(&hub_url, Some("legacy-tok".into())).unwrap();
+    let client = reader(&hub_url);
     let (st_raw, _) = client.get("/api/hub/status").unwrap();
     let st: HubStatusResponse = st_raw.json().unwrap();
     assert_eq!(st.frontiers[0].contiguous_seq, 3);
@@ -2333,5 +2338,57 @@ fn shipper_reconstructs_legacy_archive_packs_drains_inbox_cleans_outbound_and_in
     assert_eq!(page.total, 2);
     for row in &page.sessions {
         assert_eq!(row.cwd.as_deref(), Some("$HOME/repo"));
+    }
+}
+
+/// #tooth Offline session reads use the snapshot's verified payload for each producer and profile.
+#[test]
+fn hub_snapshot_custody_hydrates_same_id_across_profiles_and_hosts() {
+    let world = World::in_process("hub-custody-read", Env::enter_isolated);
+    let hub = HubStore::at_home(&world.cv_home);
+    let stage = world.base.join("stage");
+    for (i, (producer, profile, text)) in [
+        ("host-a", "primary", "albatross"),
+        ("host-a", "alternate", "pelican"),
+        ("host-b", "primary", "sandpiper"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        hub.enroll_producer(producer, producer, &json!({})).unwrap();
+        let pack = format!("pack-{i}");
+        let session = make_session("shared", "/work", text, text, "ok", 0);
+        let addr = build_pack_with_sessions(&stage, &pack, &[session])[0].1.clone();
+        hub.upload_pack_bytes(
+            &pack,
+            Some(producer),
+            None,
+            &fs::read(stage.join(format!("{pack}.pack.idx.json"))).unwrap(),
+            &fs::read(stage.join(format!("{pack}.pack.zst"))).unwrap(),
+        )
+        .unwrap();
+        let seq = if i == 1 { 2 } else { 1 };
+        let event = IngestEventRecord::new(
+            EventId::new(producer, "epoch", seq),
+            format!("event-{i}"),
+            json!({"kind":"session_upsert","session_id":"shared","profile":profile,"harness":"claude","title":text}),
+            Some(addr),
+        )
+        .unwrap();
+        hub.ingest_batch(&IngestBatchRequest { events: vec![event] }).unwrap();
+    }
+    let refs = cv_core::sessions();
+    assert_eq!(refs.len(), 3);
+    for reference in refs {
+        let (r, adapter) = cv_core::find(&reference.id, Some(Harness::Claude)).unwrap().unwrap();
+        let hydrated = adapter.parse(&r).unwrap();
+        assert_eq!(hydrated.title, r.title);
+        assert!(cv_core::coverage::ReadCoverage::of_session(&hydrated)
+            .unwrap()
+            .sources
+            .contains("hub_snapshot"));
+        let (out, _) = world.cv_ok(&["--frozen", "search", r.title.as_deref().unwrap(), "--json"]);
+        let response: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(response["hits"][0]["session_key"], r.id);
     }
 }

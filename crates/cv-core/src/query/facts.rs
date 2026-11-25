@@ -39,9 +39,19 @@ impl TextSets {
         TextSets(map)
     }
 
+    fn contains_ref(&self, needle: &str, r: &SessionRef) -> bool {
+        self.0
+            .get(needle)
+            .is_some_and(|s| s.contains(&r.id) || s.contains(&r.session_selector()))
+    }
+
     /// Whether `id` matched `needle` (already lowercased by the parser, matching the map keys).
     pub fn contains(&self, needle: &str, id: &str) -> bool {
-        self.0.get(needle).is_some_and(|s| s.contains(id))
+        self.0.get(needle).is_some_and(|s| {
+            s.contains(id)
+                || s.iter()
+                    .any(|key| crate::SessionKey::split_selector(key).is_some_and(|(native, _)| native == id))
+        })
     }
 }
 
@@ -174,7 +184,7 @@ impl ExtFacts for SessionFacts<'_> {
         }))
     }
     fn text(&self, needle: &str) -> anyhow::Result<Tri> {
-        Ok(Tri::of(self.text_sets.contains(needle, &self.session.id)))
+        Ok(Tri::of(self.text_sets.contains_ref(needle, self.r)))
     }
     fn tool(&self, name: &str) -> anyhow::Result<Tri> {
         if let Some(facts) = self.reduced {
@@ -636,7 +646,7 @@ fn reduce_streamed(
 /// Facts available before parsing: indexed text membership and fresh catalog counts + session facts.
 /// Other external predicates stay `Unknown`, preserving the query's three-valued evaluation.
 struct RefFacts<'a> {
-    id: &'a str,
+    reference: &'a SessionRef,
     text_sets: &'a TextSets,
     counted: Option<&'a crate::catalog::Counted>,
     subagents_fresh: bool,
@@ -681,7 +691,7 @@ impl ExtFacts for RefFacts<'_> {
     }
 
     fn text(&self, needle: &str) -> anyhow::Result<Tri> {
-        Ok(Tri::of(self.text_sets.contains(needle, self.id)))
+        Ok(Tri::of(self.text_sets.contains_ref(needle, self.reference)))
     }
 
     fn has(&self, flag: &str) -> anyhow::Result<Tri> {
@@ -771,7 +781,7 @@ impl<'a> RefQuery<'a> {
             r,
             session: None,
             ext: &RefFacts {
-                id: &r.id,
+                reference: r,
                 text_sets: self.text_sets,
                 counted: None,
                 subagents_fresh: false,
@@ -802,7 +812,7 @@ impl<'a> RefQuery<'a> {
             r,
             session: None,
             ext: &RefFacts {
-                id: &r.id,
+                reference: r,
                 text_sets: self.text_sets,
                 counted: admitted.as_ref().map(|(_, c)| c),
                 subagents_fresh,
@@ -860,7 +870,7 @@ impl<'a> RefQuery<'a> {
                 r,
                 session: None,
                 ext: &RefFacts {
-                    id: &r.id,
+                    reference: r,
                     text_sets: self.text_sets,
                     counted: Some(&counted),
                     subagents_fresh: true,
@@ -1267,7 +1277,7 @@ mod tests {
             let query = SessionQuery::parse(source).unwrap();
             let texts = text_sets(&query, &r);
             let ext = RefFacts {
-                id: &r.id,
+                reference: &r,
                 text_sets: &texts,
                 counted: None,
                 subagents_fresh: false,

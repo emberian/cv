@@ -403,6 +403,41 @@ pub fn live_search_filtered(
         total: 0,
         unreadable: Vec::new(),
     };
+    let mut scan = |out: &mut LiveSearch, adapter: &dyn crate::Adapter, r: SessionRef| {
+        if !select(&r) {
+            return;
+        }
+        // One session that cannot be read is skipped and named, never the end of the scan; one
+        // that vanished since discovery is simply gone.
+        let mut sink = ScanSink::new(&r.path, Matcher::new(vec![needle.clone()], 1));
+        let meta = match adapter
+            .try_stream(&r, &Demand::LEAN.with_spans(), &mut sink)
+            .with_context(|| format!("scanning {}:{}", r.harness, r.id))
+        {
+            Ok(meta) => meta,
+            Err(error) => {
+                out.unreadable.extend(crate::Skipped::of(&r.path, &error));
+                return;
+            }
+        };
+        let excerpt = sink.matcher.finish();
+        if !sink.matcher.anchored() {
+            return;
+        }
+        out.total += 1;
+        if out.hits.len() < limit {
+            out.hits.push(LiveHit {
+                title: crate::label_from(meta.title.as_deref(), sink.first_prompt.as_deref()),
+                snippet: snippet(&excerpt.text, excerpt.at, excerpt.len),
+                session: r,
+            });
+        }
+    };
+    #[cfg(feature = "sqlite")]
+    let mut custody: std::collections::HashMap<_, _> = crate::custody::inventory()?
+        .into_iter()
+        .map(|b| (b.reference.id.clone(), b))
+        .collect();
     for adapter in crate::harness::all() {
         if want.is_some_and(|h| adapter.harness() != h) || adapter.roots().is_empty() {
             continue;
@@ -410,35 +445,19 @@ pub fn live_search_filtered(
         let found = adapter.discover()?;
         out.unreadable.extend(found.skipped);
         for r in found.refs {
-            if !select(&r) {
-                continue;
+            #[cfg(feature = "sqlite")]
+            if !custody.is_empty() {
+                custody.remove(&r.session_selector());
             }
-            // One session that cannot be read is skipped and named, never the end of the scan; one
-            // that vanished since discovery is simply gone.
-            let mut sink = ScanSink::new(&r.path, Matcher::new(vec![needle.clone()], 1));
-            let meta = match adapter
-                .try_stream(&r, &Demand::LEAN.with_spans(), &mut sink)
-                .with_context(|| format!("scanning {}:{}", r.harness, r.id))
-            {
-                Ok(meta) => meta,
-                Err(error) => {
-                    out.unreadable.extend(crate::Skipped::of(&r.path, &error));
-                    continue;
-                }
-            };
-            let excerpt = sink.matcher.finish();
-            if !sink.matcher.anchored() {
-                continue;
-            }
-            out.total += 1;
-            if out.hits.len() < limit {
-                out.hits.push(LiveHit {
-                    title: crate::label_from(meta.title.as_deref(), sink.first_prompt.as_deref()),
-                    snippet: snippet(&excerpt.text, excerpt.at, excerpt.len),
-                    session: r,
-                });
-            }
+            scan(&mut out, adapter.as_ref(), r);
         }
+    }
+    #[cfg(feature = "sqlite")]
+    for backing in custody
+        .into_values()
+        .filter(|b| want.is_none_or(|h| h == b.reference.harness))
+    {
+        scan(&mut out, &backing, backing.reference.clone());
     }
     Ok(out)
 }

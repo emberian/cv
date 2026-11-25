@@ -100,15 +100,24 @@ the real one:
 cv serve on http://127.0.0.1:54573 — inbox at /, API at /api/* (no --web)
 ```
 
-- **It reads live sessions, not the archive**; archived snapshots never appear in the API or `cv index`.
+- Session listings include sealed local archives and mirrored sessions from the latest hub snapshot. Use the
+  `session_key` from list or search JSON to select a particular profile or producer in `show`, `pack`, or `port`.
+  Hydrated transcripts record `custody_pack` or `hub_snapshot` in `extra.cv.read_coverage.sources`.
 - **Transcripts can hold secrets; access is local by default.**
   - **CORS is an allow-list, never `*`:** only `http://localhost:*`, `http://127.0.0.1:*`,
     `[::1]`, your `--host` and the desktop app's Tauri origins get `Access-Control-Allow-Origin`.
     `OPTIONS` preflight answers `204`.
   - **`Host` must name this machine** (`127.0.0.1`, `localhost`, `[::1]` or `--host`), else
     `403`; this defeats DNS rebinding.
-  - **Bearer token:** with `--token <t>` (or `$CV_SERVE_TOKEN`), `/api/*` without
-    `Authorization: Bearer <t>` is a `401`.
+  - Send the reader credential in `Authorization: Bearer <t>`. Set it with `CV_SERVE_READ_TOKEN`, `--token`, or
+    `CV_SERVE_TOKEN`. Browsers can exchange that header at `GET /api/auth` for an HttpOnly, SameSite=Strict cookie.
+    API requests containing a `token` query parameter receive HTTP 401.
+  - Set `CV_SERVE_READ_TIER` to `presence`, `activity`, `conversation`, or `full` (0–3) to enable projected reads. Without a tier or scope, the regular API is available.
+    Presence returns session identity. Activity adds timestamps. Conversation adds user and assistant text.
+    A restricted grant can read the session listing and individual session route. `CV_SERVE_READ_SCOPE`
+    restricts these to sessions under an absolute working directory.
+  - Configure distinct `CV_HUB_PRODUCER_TOKEN` and `CV_TASK_WRITE_TOKEN` values to grant replication and
+    inbox writes respectively. A configured reader token grants read access only.
   - **Writes:** `POST /api/task/<id>/<verb>` must be `application/json` with an allowed `Origin`
     (if any), else `403` before the store is touched.
   - **Non-loopback binds need a token or `--insecure-expose`**, and warn either way.

@@ -2128,7 +2128,7 @@ pub fn search(
             }
         }
         if let Some(ids) = allowed_ids {
-            let admitted = ids.contains(&r.id) || prov.parent_id.as_ref().is_some_and(|p| ids.contains(p));
+            let admitted = admitted_ref(ids, &r, prov.parent_id.as_deref());
             if !admitted {
                 continue;
             }
@@ -2191,6 +2191,7 @@ pub fn search(
                                 r.cwd = m.cwd.as_deref().map(PathBuf::from);
                             }
                             hits.push(Hit {
+                                session_key: Some(r.session_selector()),
                                 id: r.id.clone(),
                                 harness: r.harness.as_str().to_string(),
                                 cwd: m.cwd,
@@ -2246,6 +2247,7 @@ pub fn search(
                                 r.cwd = m.cwd.as_deref().map(PathBuf::from);
                             }
                             hits.push(Hit {
+                                session_key: Some(r.session_selector()),
                                 id: r.id.clone(),
                                 harness: r.harness.as_str().to_string(),
                                 cwd: m.cwd,
@@ -2330,8 +2332,9 @@ pub fn search(
                             }
                         }
                         if let Some(ids) = allowed_ids {
-                            let admitted =
-                                ids.contains(&meta.id) || meta.parent_id.as_ref().is_some_and(|p| ids.contains(p));
+                            let admitted = meta
+                                .to_session_ref()
+                                .is_some_and(|r| admitted_ref(ids, &r, meta.parent_id.as_deref()));
                             if !admitted {
                                 continue;
                             }
@@ -2354,6 +2357,7 @@ pub fn search(
                         ) {
                             Ok(VerifyOutcome::Matched(m)) => {
                                 hits.push(Hit {
+                                    session_key: Some(doc_ref.session_selector()),
                                     id: meta.id.clone(),
                                     harness: meta.harness.clone(),
                                     cwd: meta.cwd.clone(),
@@ -2413,6 +2417,7 @@ pub fn search(
                                                 suffix.read += 1;
                                                 suffix.bytes += spent;
                                                 hits.push(Hit {
+                                                    session_key: Some(doc_ref.session_selector()),
                                                     id: meta.id.clone(),
                                                     harness: meta.harness.clone(),
                                                     cwd: m.cwd.or_else(|| meta.cwd.clone()),
@@ -2530,6 +2535,17 @@ pub fn search_ids(
     )?;
     let ids = found.hits.into_iter().map(|h| h.id).collect();
     Ok((ids, found.suffix))
+}
+
+fn admitted_ref(ids: &HashSet<String>, r: &cv_core::SessionRef, parent: Option<&str>) -> bool {
+    if ids.contains(&r.id) || ids.contains(&r.session_selector()) {
+        return true;
+    }
+    parent.is_some_and(|id| {
+        let mut key = cv_core::SessionKey::local(r);
+        key.native_id = id.to_owned();
+        ids.contains(id) || ids.contains(&key.selector())
+    })
 }
 
 #[cfg(test)]

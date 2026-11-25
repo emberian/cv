@@ -71,6 +71,10 @@ pub const CLEARED_ENV: &[&str] = &[
     "CLAURDVOYANT_MAX_STALE_SECS",
     "CV_PACK_LLM",
     "CV_SERVE_TOKEN",
+    "CV_SERVE_READ_TOKEN",
+    "CV_SERVE_READ_TIER",
+    "CV_SERVE_READ_SCOPE",
+    "CV_TASK_WRITE_TOKEN",
     "CVD_TOKEN",
 ];
 

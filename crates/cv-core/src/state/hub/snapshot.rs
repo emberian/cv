@@ -136,6 +136,8 @@ pub struct HubSnapshotResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HubSessionRow {
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_key: Option<String>,
     pub producer_id: String,
     pub harness: String,
     pub revision: String,
@@ -154,7 +156,8 @@ pub struct HubSessionRow {
 impl From<&SessionRevisionEntry> for HubSessionRow {
     fn from(entry: &SessionRevisionEntry) -> Self {
         Self {
-            id: entry.session_id.clone(),
+            id: entry.metadata["native_id"].as_str().unwrap_or(&entry.session_id).into(),
+            session_key: entry.metadata["profile"].as_str().map(|_| entry.session_id.clone()),
             producer_id: entry.producer_id.clone(),
             harness: entry.harness.clone(),
             revision: entry.revision.clone(),
@@ -526,6 +529,19 @@ fn str_field<'a>(primary: &'a Value, secondary: Option<&'a Value>, key: &str) ->
         .filter(|s| !s.is_empty())
 }
 
+fn scoped_session_id(producer: &str, harness: &str, native: &str, profile: Option<&str>) -> String {
+    match (Harness::parse(harness), profile) {
+        (Some(harness), Some(profile)) => crate::SessionKey {
+            producer: producer.into(),
+            profile: profile.into(),
+            harness,
+            native_id: native.into(),
+        }
+        .selector(),
+        _ => native.to_string(),
+    }
+}
+
 fn parse_envelope_op(
     producer_id: &str,
     epoch: &str,
@@ -545,7 +561,12 @@ fn parse_envelope_op(
                 .filter(|s| !s.is_empty())
             {
                 return ParsedEnvelopeOp::Delete {
-                    session_id: sid.to_string(),
+                    session_id: scoped_session_id(
+                        producer_id,
+                        envelope["harness"].as_str().unwrap_or(""),
+                        sid,
+                        envelope["profile"].as_str(),
+                    ),
                 };
             }
             return ParsedEnvelopeOp::Ignore;
@@ -586,11 +607,21 @@ fn parse_envelope_op(
         .or_else(|| payload_addr.as_ref().map(PayloadAddr::digest_hex))
         .unwrap_or_else(|| event_digest.to_string());
 
-    let metadata = envelope
+    let mut metadata = envelope
         .get("metadata")
         .cloned()
         .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
 
+    let session_id = if let Some(profile) = envelope["profile"].as_str() {
+        if !metadata.is_object() {
+            metadata = json!({});
+        }
+        metadata["native_id"] = json!(session_id);
+        metadata["profile"] = json!(profile);
+        scoped_session_id(producer_id, &harness, &session_id, Some(profile))
+    } else {
+        session_id
+    };
     ParsedEnvelopeOp::Upsert(Box::new(SessionRevisionEntry {
         producer_id: producer_id.to_string(),
         session_id,
@@ -1291,7 +1322,7 @@ fn read_quarantine_in_conn(conn: &Connection) -> Result<QuarantineSummary, HubEr
     Ok(QuarantineSummary { count, entries })
 }
 
-fn decode_packed_session(bytes: &[u8]) -> Result<Session, HubError> {
+pub(crate) fn decode_packed_session(bytes: &[u8]) -> Result<Session, HubError> {
     if let Ok(session) = serde_json::from_slice::<Session>(bytes) {
         return Ok(session);
     }
@@ -1722,12 +1753,23 @@ impl HubStore {
             .get_snapshot(snapshot_id)?
             .ok_or_else(|| HubError::NotFound("no hub snapshot published yet".into()))?;
         let key = encode_pair_key(producer_id, session_id);
-        let entry = manifest.session_revisions.get(&key).cloned().ok_or_else(|| {
-            HubError::NotFound(format!(
-                "session `{producer_id}/{session_id}` not found in snapshot `{}`",
-                manifest.publication_id
-            ))
-        })?;
+        let mut matching = manifest.session_revisions.values().filter(|entry| {
+            entry.producer_id == producer_id && entry.metadata["native_id"].as_str() == Some(session_id)
+        });
+        let entry = manifest
+            .session_revisions
+            .get(&key)
+            .or_else(|| {
+                let first = matching.next()?;
+                matching.next().is_none().then_some(first)
+            })
+            .cloned()
+            .ok_or_else(|| {
+                HubError::NotFound(format!(
+                    "session `{producer_id}/{session_id}` not found in snapshot `{}`",
+                    manifest.publication_id
+                ))
+            })?;
 
         let Some(ref addr) = entry.payload_addr else {
             let unavailable = HydratedHubSession::PayloadUnavailable {

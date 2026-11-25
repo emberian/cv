@@ -139,7 +139,7 @@
     who: '', pane: 'decisions', page: null, lanes: null, backlog: null, events: null,
     requests: {}, eventsError: null, busy: false, expanded: {}, sel: 0, filter: '', lanesSession: '', help: false,
     backlogRepo: '', backlogState: '', backlogAll: false, eventsMine: false, drafts: {}, discussOpen: {}, doneOpen: {},
-    token: '', authNeeded: false, cursor: '', streamLive: false
+    token: '', writer: '', authNeeded: false, cursor: '', streamLive: false
   };
   const $ = (s) => document.querySelector(s);
   const el = (tag, attrs, children) => {
@@ -190,13 +190,10 @@
   }
   function params() {
     const p = new URLSearchParams(location.search);
-    const hp = new URLSearchParams((location.hash || '').replace(/^#/, ''));
-    const urlTok = hp.get('token') || p.get('token');
-    if (urlTok) {
-      saveToken(urlTok);
-    } else {
-      try { S.token = sessionStorage.getItem('cv.token') || ''; } catch (e) {}
-    }
+    try {
+      S.token = sessionStorage.getItem('cv.token') || '';
+      S.writer = sessionStorage.getItem('cv.writer') || '';
+    } catch (e) {}
     S.who = p.get('who') || localStorage.getItem('cv.who') || '';
     S.pane = p.get('pane') || localStorage.getItem('cv.pane') || 'decisions';
     S.lanesSession = p.get('lanes') || localStorage.getItem('cv.lanes') || '';
@@ -438,7 +435,7 @@
     if (S.busy) return;
     S.busy = true; body.who = S.who;
     document.querySelectorAll('.btn').forEach((b) => { b.disabled = true; });
-    fetch('/api/task/' + encodeURIComponent(i.id) + '/' + verb, { method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify(body) })
+    fetch('/api/task/' + encodeURIComponent(i.id) + '/' + verb, { method: 'POST', headers: Object.assign({ 'Content-Type': 'application/json' }, S.writer ? { Authorization: 'Bearer ' + S.writer } : {}), body: JSON.stringify(body) })
       .then((r) => { if (r.status === 401) S.authNeeded = true; return r.json(); }).then((res) => {
         S.busy = false;
         if (S.authNeeded) { render(); return; }
@@ -460,7 +457,10 @@
       placeholder: 'cv serve --token value', 'aria-label': 'bearer token',
       onkeydown: (ev) => { if (ev.key === 'Enter') submit(); }
     });
+    const writer = el('input', {class:'filter mono',type:'password',value:S.writer,placeholder:'Inbox write token', 'aria-label':'Inbox write token'});
     const submit = () => {
+      S.writer = writer.value.trim();
+      try { sessionStorage.setItem('cv.writer',S.writer); } catch (e) {}
       saveToken(inp.value);
       S.authNeeded = false;
       connectStream();
@@ -470,7 +470,7 @@
       el('p', { class: 'title', text: 'Bearer token required' }),
       el('p', { class: 'body', text: 'This server requires Authorization: Bearer <token>. Stored in sessionStorage for this tab only.' }),
       el('div', { class: 'notebox' }, [
-        inp,
+        inp, writer,
         el('button', { class: 'btn primary', text: 'Unlock', onclick: submit }),
         S.token ? el('button', { class: 'btn quiet', text: 'Clear', onclick: () => { saveToken(''); inp.value = ''; } }) : null
       ])
@@ -646,16 +646,19 @@
 
   let es = null;
   let streamRetryT = null;
-  function connectStream() {
+  async function connectStream() {
     clearTimeout(streamRetryT);
     if (es) { try { es.close(); } catch (e) {} es = null; }
     S.streamLive = false;
     if (typeof EventSource === 'undefined' || S.authNeeded) return;
     const q = new URLSearchParams();
     if (S.cursor) q.set('after', String(S.cursor));
-    if (S.token) q.set('token', S.token);
     const qs = q.toString();
     try {
+      if (S.token) {
+        const reply = await fetch('/api/auth', {headers:authHeaders(),credentials:'same-origin'});
+        if (!reply.ok) return;
+      }
       es = new EventSource('/api/stream' + (qs ? '?' + qs : ''));
       es.addEventListener('change', (ev) => {
         S.streamLive = true;

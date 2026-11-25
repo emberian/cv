@@ -637,7 +637,7 @@ mod tests {
     fn data_schema_names_the_session_row_keys() {
         let v = data_schema_json();
         assert_eq!(v["block"]["tag"], "type");
-        assert_eq!(v["session_row"]["keys"].as_array().unwrap().len(), 9);
+        assert_eq!(v["session_row"]["keys"].as_array().unwrap().len(), 10);
         assert!(v["query"].is_object());
         let routes: Vec<&str> = v["routes"]
             .as_array()

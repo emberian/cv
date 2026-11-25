@@ -28,9 +28,7 @@ function bootstrapUrlToken() {
   try {
     const sp = new URLSearchParams(location.search || "");
     const hp = new URLSearchParams((location.hash || "").replace(/^#/, ""));
-    const tok = hp.get("token") || sp.get("token");
-    if (tok) {
-      setAuthToken(tok);
+    if (sp.has("token") || hp.has("token")) {
       sp.delete("token");
       hp.delete("token");
       if (typeof history !== "undefined" && typeof history.replaceState === "function") {

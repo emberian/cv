@@ -122,7 +122,10 @@ fn sync_batches_into_sealed_pack_is_idempotent_and_verifies_blake3() {
     let raw_ir = pack.read_payload(&addr).unwrap();
     let archived: Value = serde_json::from_slice(&raw_ir).expect("archived payload is valid IR JSON");
     assert_eq!(archived["id"], "alphasess");
-    assert_eq!(archived["messages"].as_array().unwrap().len(), 3);
+    // Complete-tier custody keeps the verbatim `ai-title` carrier; the visible count excludes it.
+    let messages = archived["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 4);
+    assert_eq!(messages.iter().filter(|m| m["kind"] != "carrier").count(), 3);
 
     // Checkpoint & drop `-wal`/`-shm` (or verify `--frozen` on populated `state.db`) so `cv --frozen
     // archive ls|path` proves zero `-wal`/`-shm` creation inside `$CLUSTERVISION_HOME`.
@@ -174,4 +177,73 @@ fn ls_and_path_on_empty_archive_are_read_only_under_frozen() {
         !w.cv_home.join("packs").exists(),
         "read-only archive ls/path must not create packs/"
     );
+}
+
+/// #tooth A packed revision and its live namesake remain independently selectable after a sweep.
+#[test]
+fn archive_frozen_search_show_pack_and_strict_port_keep_profile_twins_separate() {
+    let w = world("archive-profile-twins");
+    let second = w.home.join(".claude-alt");
+    let project = second.join("projects/test");
+    fs::create_dir_all(&project).unwrap();
+    let twin = project.join("alphasess.jsonl");
+    let original = w.transcript("alphasess");
+    fs::write(
+        &twin,
+        fs::read_to_string(&original).unwrap().replace("zebrafish", "swordfish"),
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        let (ok, _, out, err) = w.cv_env(args, &[("CLUSTERVISION_CLAUDE_ROOTS", second.to_str().unwrap())]);
+        assert!(ok, "{args:?}: {out}\n{err}");
+        out
+    };
+    let json = |args: &[&str]| serde_json::from_str::<Value>(&run(args)).unwrap();
+    run(&["archive", "sync"]);
+    let hit = |word| {
+        let results = json(&["--frozen", "search", word, "--json"]);
+        let hits = results["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 1, "{results}");
+        hits[0]["session_key"].as_str().unwrap().to_owned()
+    };
+    // Cold frozen reads use the pack without creating a persistent Tantivy index.
+    let key = hit("zebrafish");
+    assert!(!w.cv_home.join("tantivy/meta.json").exists());
+    run(&["index"]);
+    fs::remove_file(&original).unwrap();
+    assert_eq!(hit("zebrafish"), key);
+    run(&["index"]);
+    assert_eq!(hit("zebrafish"), key);
+    let live_key = hit("swordfish");
+    assert_ne!(key, live_key);
+    let show = json(&["--frozen", "show", &key, "--json"]);
+    assert!(show.to_string().contains("zebrafish"));
+    assert!(show["extra"]["cv"]["read_coverage"]["sources"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("custody_pack")));
+    let pack = json(&["--frozen", "pack", "--session", &key, "--json"]);
+    assert!(pack["content"].as_str().unwrap().contains("zebrafish"));
+    assert!(pack["content"]
+        .as_str()
+        .unwrap()
+        .contains(&format!("cv show claude:{key}")));
+    let target = w.base.join("ported");
+    let port = json(&[
+        "port",
+        &key,
+        "--strict",
+        "--harness",
+        "claude",
+        "--out",
+        target.to_str().unwrap(),
+        "--json",
+    ]);
+    assert!(fs::read_to_string(port["path"].as_str().unwrap())
+        .unwrap()
+        .contains("zebrafish"));
+    let live = json(&["--frozen", "show", &live_key, "--json"]);
+    assert!(live.to_string().contains("swordfish"));
+    assert_eq!(live["source_path"], json!(twin));
+    assert!(!original.exists());
 }

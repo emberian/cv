@@ -30,12 +30,14 @@ fn resolve_allowed_ids(
         return Ok(None);
     };
     let text = crate::cmd::query::text_sets(&sq)?;
-    let mut candidates = cv_core::sessions_for(want);
+    let mut candidates = cv_core::try_sessions_for(want)?;
     if let Some(needle) = cwd {
         candidates.retain(|r| r.cwd.as_ref().is_some_and(|p| p.to_string_lossy().contains(needle)));
     }
     crate::cmd::query::filter_refs(&mut candidates, &sq, &text)?;
-    Ok(Some(candidates.into_iter().map(|r| r.id).collect()))
+    Ok(Some(
+        candidates.iter().map(cv_core::SessionRef::session_selector).collect(),
+    ))
 }
 
 pub(crate) fn cmd_search(args: SearchArgs<'_>) -> Result<()> {

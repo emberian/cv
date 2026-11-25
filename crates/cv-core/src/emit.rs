@@ -827,6 +827,12 @@ pub fn prepare_for_emit(
     target: Harness,
 ) -> Result<(Session, Option<Grown>)> {
     let mut options = ParsedAt::for_port(reference.harness, target).demand();
+    #[cfg(feature = "sqlite")]
+    if crate::custody::is_pack_ref(reference) {
+        let mut session = crate::stream::collect_with(adapter, reference, &options)?;
+        session.materialize()?;
+        return Ok((session, None));
+    }
     if emitter_for(target).is_ok() {
         options.spans = true;
         return prepare::parse(adapter, reference, &options);

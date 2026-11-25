@@ -2431,6 +2431,11 @@ mod imp {
         harness: Option<Harness>,
         overrides: [bool; 2],
     ) -> Option<SessionRef> {
+        if let Some((native, _)) = crate::SessionKey::split_selector(id) {
+            return lookup_in(conn, native, harness)
+                .into_iter()
+                .find(|r| r.session_selector() == id);
+        }
         let mut stmt = conn
             .prepare_cached(&format!(
                 "SELECT {REF_COLUMNS} FROM sessions WHERE id=?1 AND (?2 IS NULL OR harness=?2) ORDER BY rowid"
@@ -2451,6 +2456,12 @@ mod imp {
     /// harness. Order: exact-id matches first. Empty on any error or a cold catalog.
     pub fn lookup(id: &str, harness: Option<Harness>) -> Vec<SessionRef> {
         let Some(conn) = open() else { return Vec::new() };
+        if let Some((native_id, _)) = crate::SessionKey::split_selector(id) {
+            return lookup_in(&conn, native_id, harness)
+                .into_iter()
+                .filter(|r| r.session_selector() == id)
+                .collect();
+        }
         lookup_in(&conn, id, harness)
     }
 

@@ -13,7 +13,7 @@ import {
 } from "./util.js";
 import { canInvokeNative, invoke } from "../tauri.js";
 import { renderMarkdown, renderCodeBlock } from "../markdown.js";
-import { getSubagents, getSubagent, getEvents, getOverview, getMessages, hydrateSession, getAuthToken, PAGE, CVD_BASE } from "./hydrate.js";
+import { getSubagents, getSubagent, getEvents, getOverview, getMessages, hydrateSession, getAuthToken, authHeaders, PAGE, CVD_BASE } from "./hydrate.js";
 
 /** Collapse whitespace and cut to `max` — for one-line peeks and rule details. */
 function truncateLine(s, max) {
@@ -512,10 +512,16 @@ class CvTranscript extends HTMLElement {
           if (!canInvokeNative()) {
             // Let the browser's download manager consume the attachment. No response Blob,
             // full transcript JSON parsing, or mutation of the paged browsing cache.
-            const tok = getAuthToken();
-            const tokParam = tok ? `&token=${encodeURIComponent(tok)}` : "";
+            if (getAuthToken()) {
+              const auth = await fetch(`${CVD_BASE}/api/auth`, { headers: authHeaders(), credentials: "include" });
+              if (!auth.ok) {
+                const note = this.querySelector(".export-note");
+                if (note) note.textContent = "Reader authentication failed.";
+                return;
+              }
+            }
             const link = document.createElement("a");
-            link.href = `${CVD_BASE}/api/session/${encodeURIComponent(s.harness)}/${encodeURIComponent(s.id)}/export?format=${format}${tokParam}`;
+            link.href = `${CVD_BASE}/api/session/${encodeURIComponent(s.harness)}/${encodeURIComponent(s.id)}/export?format=${format}`;
             link.target = "_blank"; link.rel = "noopener";
             document.body.appendChild(link); link.click(); link.remove();
             return;

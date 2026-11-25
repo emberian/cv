@@ -112,8 +112,17 @@ fn pack_md_no_index_fallback_and_content() {
     // The cross-source rollup section exists and ranks the edited file.
     assert!(out.contains("## Files that keep appearing"), "{out}");
     assert!(out.contains("edit(s)"), "{out}");
-    // A qualified pointer back into the full transcript uses the supported range syntax.
-    assert!(out.contains("cv show claude:wombatsess --range 0..2"), "{out}");
+    // A profile-qualified pointer back into the full transcript uses the supported range syntax
+    // and resolves.
+    let pointer = out
+        .split("`cv show ")
+        .nth(1)
+        .and_then(|rest| rest.split('`').next())
+        .unwrap_or_else(|| panic!("no transcript pointer:\n{out}"));
+    let (selector, range) = pointer.split_once(" --range ").expect("range pointer");
+    assert!(selector.starts_with("claude:wombatsess@"), "{out}");
+    assert_eq!(range, "0..2");
+    w.cv_ok(&["show", selector, "--range", range]);
     // The irrelevant session is NOT packed.
     assert!(
         !out.contains("quokkas"),

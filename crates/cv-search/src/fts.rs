@@ -70,7 +70,9 @@ use tantivy::{Index, TantivyDocument, Term};
 
 #[derive(Clone)]
 struct Fields {
+    /// Composite identity for grouping, metadata lookup and deletion.
     id: Field,
+    native_id: Field,
     kind: Field,
     first_msg: Field,
     harness: Field,
@@ -100,8 +102,9 @@ fn build_schema() -> Schema {
 
 fn build_schema_with_consumer(consumer: Option<&str>) -> Schema {
     let mut b = Schema::builder();
-    b.add_text_field("id", STRING | STORED);
+    b.add_text_field("session_key", STRING | STORED);
     b.add_text_field("kind", STRING | STORED);
+    b.add_text_field("id", STRING | STORED);
     b.add_i64_field("first_msg", INDEXED | STORED);
     b.add_text_field("harness", STRING | STORED);
     b.add_text_field("cwd", TEXT | STORED);
@@ -129,13 +132,14 @@ fn build_schema_with_consumer(consumer: Option<&str>) -> Schema {
 /// An index built under another version lacks it, so [`schema_current`] refuses it: the indexing
 /// path rebuilds it whole, a query asks for `cv index`. No document of an older layout is read.
 fn format_field() -> String {
-    format!("cv_format_v{}", cv_core::source::VERSION)
+    format!("cv_format_scoped_v{}", cv_core::source::VERSION)
 }
 
 fn fields_of(schema: &Schema) -> Result<Fields> {
     let get = |name: &str| schema.get_field(name);
     Ok(Fields {
-        id: get("id")?,
+        id: get("session_key")?,
+        native_id: get("id")?,
         kind: get("kind")?,
         first_msg: get("first_msg")?,
         harness: get("harness")?,
@@ -165,6 +169,7 @@ fn schema_current(schema: &Schema) -> bool {
 
 fn fields_current(schema: &Schema) -> bool {
     [
+        "session_key",
         "kind",
         "first_msg",
         "path",
@@ -465,7 +470,7 @@ fn sweep_decoded(dir: &Path, rebuild: bool, decoded: cv_core::codex_handoff::Rec
             let mut jobs = Vec::new();
             let mut item = Some(handed);
             while let Some((r, bytes)) = item {
-                if ids.insert(r.id.clone()) {
+                if ids.insert(r.session_selector()) {
                     if let (_, Some(mut job)) = state.job(&r, &top, rebuild) {
                         job.decoded = Some(bytes);
                         jobs.push(job);
@@ -765,7 +770,7 @@ fn preferred_index_candidates<'a>(
     let mut slots: HashMap<String, usize> = HashMap::new();
     let mut selected: Vec<(&cv_core::SessionRef, &cv_core::events::Provenance)> = Vec::new();
     for (r, prov) in refs {
-        if let Some(&slot) = slots.get(&r.id) {
+        if let Some(&slot) = slots.get(&r.session_selector()) {
             let (old, old_prov) = selected[slot];
             // Keep source errors meaningful if no live copy exists.
             if (!r.path.exists())
@@ -777,7 +782,7 @@ fn preferred_index_candidates<'a>(
                 selected[slot] = (r, prov);
             }
         } else {
-            slots.insert(r.id.clone(), selected.len());
+            slots.insert(r.session_selector(), selected.len());
             selected.push((r, prov));
         }
     }
@@ -847,7 +852,7 @@ fn sweep_refs_after(
 ) -> Result<Swept> {
     let (index, f) = open_or_create(dir)?;
     let total = refs.len();
-    let copies = total - refs.iter().map(|r| &r.id).collect::<HashSet<_>>().len();
+    let copies = total - refs.iter().map(|r| r.session_selector()).collect::<HashSet<_>>().len();
     let planner = SweepPlanner {
         index: &index,
         f: &f,
@@ -903,9 +908,17 @@ fn sweep_refs_after(
     for id in &missing {
         writer.delete_term(Term::from_field_text(f.id, id));
     }
-    if !missing.is_empty() && !cv_core::env::frozen() {
+    // Columnar events still group copies by native ID. Retain their shared rows while a twin exists.
+    let native = |s: &String| {
+        cv_core::SessionKey::split_selector(s)
+            .map_or(s.as_str(), |(id, _)| id)
+            .to_owned()
+    };
+    let retained: HashSet<_> = retained.iter().map(native).collect();
+    let missing_events: Vec<_> = missing.iter().map(native).filter(|id| !retained.contains(id)).collect();
+    if !missing_events.is_empty() && !cv_core::env::frozen() {
         crate::columnar_events::ColumnarEventStore::open(crate::default_columnar_events_dir())
-            .and_then(|mut cs| cs.remove_sessions_by_id(&missing))
+            .and_then(|mut cs| cs.remove_sessions_by_id(&missing_events))
             .context("reaping vanished sessions from columnar events")?;
     }
     let removed = missing.len();
@@ -1013,8 +1026,8 @@ impl SweepPlanner<'_> {
             .chain(folded_candidates.iter().map(|(r, prov)| (r, prov)))
             .collect();
         for (r, prov) in preferred_index_candidates(candidates) {
-            seen.insert(r.id.clone());
-            let (fts_fresh, job) = state.job(r, prov, rebuild && !rebuilt.contains(&r.id));
+            seen.insert(r.session_selector());
+            let (fts_fresh, job) = state.job(r, prov, rebuild && !rebuilt.contains(&r.session_selector()));
             unchanged += usize::from(fts_fresh);
             jobs.extend(job);
         }
@@ -1144,9 +1157,11 @@ impl PlanState {
             fresh: fts_fresh,
             dependencies_fresh,
         } = Freshness::of(existing, metadata, dependencies, probe, r, prov, &source);
+        let is_pack = cv_core::custody::is_pack_ref(r);
         let fts_fresh = fts_fresh && !force;
-        let sql_events = event_sync.needs_ingest(r, &source, prov, probe);
-        let col_events_needed = !cv_core::env::frozen()
+        let sql_events = !is_pack && event_sync.needs_ingest(r, &source, prov, probe);
+        let col_events_needed = !is_pack
+            && !cv_core::env::frozen()
             && col_events
                 .as_ref()
                 .is_none_or(|cs| cs.needs_ingest_with_probe(r, &source, prov, probe));
@@ -1156,7 +1171,7 @@ impl PlanState {
         // freshness suffices, while top-level sessions also need certified counts.
         if fts_fresh
             && !events
-            && (prov.parent_id.is_some() || affordances.counts_with_probe(r, &source, probe).is_some())
+            && (prov.parent_id.is_some() || is_pack || affordances.counts_with_probe(r, &source, probe).is_some())
         {
             return (fts_fresh, None);
         }
@@ -1168,10 +1183,10 @@ impl PlanState {
             events,
             sql_events,
             col_events: col_events_needed,
-            existing: existing.contains_key(&r.id),
+            existing: existing.contains_key(&r.session_selector()),
             grew: !force
                 && existing
-                    .get(&r.id)
+                    .get(&r.session_selector())
                     .is_some_and(|&(_, old_size)| old_size > 0 && size > old_size)
                 && (!sql_events || event_sync.can_resume(r, prov))
                 && (!col_events_needed || col_events.as_ref().is_some_and(|cs| cs.can_resume(r, prov))),
@@ -1215,7 +1230,7 @@ impl Freshness {
         // Auxiliary inputs are judged across primary growth, against the tuple the docs were
         // indexed at; the adapter's checkpoint then decides whether the growth resumes.
         let baseline = dependencies.get(r).map(|record| &record.baseline);
-        let indexed = existing.get(&r.id).copied().unwrap_or((mtime, size));
+        let indexed = existing.get(&r.session_selector()).copied().unwrap_or((mtime, size));
         let dependencies_fresh =
             baseline.is_some_and(|old| sig(old.primary) == indexed && old.dependencies_fresh(source, probe));
         // A session of a shared SQLite store keeps its docs while its rows certify unchanged,
@@ -1223,10 +1238,10 @@ impl Freshness {
         let by_rows = dependencies.get(r).is_some_and(|record| record.baseline.rows.is_some());
         let fresh = mtime != 0
             && existing
-                .get(&r.id)
+                .get(&r.session_selector())
                 .is_some_and(|&stamp| stamp == (mtime, size) || by_rows)
             && dependencies.admit(r, source, probe).is_some()
-            && metadata.get(&r.id) == Some(&DiscoveryMetadata::new(r, prov));
+            && metadata.get(&r.session_selector()) == Some(&DiscoveryMetadata::new(r, prov));
         Freshness {
             mtime,
             size,
@@ -1258,8 +1273,17 @@ fn resumed_docs(f: &Fields, id: &str, n: usize) -> tantivy::query::BooleanQuery 
 
 /// Read one job and send what it found; `false` when the writer hung up.
 fn run_job(mut job: Job, f: &Fields, tx: &std::sync::mpsc::SyncSender<Out>, marks: &cv_core::resume::Reader) -> bool {
-    let Some(adapter) = cv_core::harness::for_harness(job.r.harness) else {
-        return true;
+    let adapter = match cv_core::custody::backing_for(&job.r) {
+        Ok(Some(backing)) => backing,
+        Ok(None) => match cv_core::harness::for_harness(job.r.harness) {
+            Some(a) => a,
+            None => return true,
+        },
+        Err(err) => {
+            let failure_source = job.source.clone();
+            let transient = !job.r.path.exists() || !cv_core::source::unchanged(&job.r, &failure_source);
+            return tx.send(Out::Failed { job, err, transient }).is_ok();
+        }
     };
     // Bytes discovery decoded stay alive for this pass only.
     let out = match job.decoded.take() {
@@ -1793,7 +1817,7 @@ impl<'w> ChunkSink<'w> {
             out,
             f,
             discovery_metadata: DiscoveryMetadata::new(r, &prov),
-            id: r.id.clone(),
+            id: r.session_selector(),
             harness: r.harness.as_str().to_string(),
             cwd: r.cwd.as_ref().map(|p| p.display().to_string()),
             path: r.path.display().to_string(),
@@ -1879,6 +1903,7 @@ impl<'w> ChunkSink<'w> {
         let mut doc = TantivyDocument::default();
         doc.add_text(self.f.id, &self.id);
         doc.add_text(self.f.kind, kind);
+        doc.add_text(self.f.native_id, crate::native_id(&self.id));
         doc.add_text(self.f.harness, &self.harness);
         if let Some(cwd) = &self.cwd {
             doc.add_text(self.f.cwd, cwd);
@@ -2529,10 +2554,15 @@ fn metadata_matches(
         })
         && allowed_ids.is_none_or(|ids| {
             ids.contains(id)
+                || cv_core::SessionKey::split_selector(id).is_some_and(|(native, _)| ids.contains(native))
                 || doc
                     .get_first(fields.parent_id)
                     .and_then(|value| value.as_str())
-                    .is_some_and(|parent| ids.contains(parent))
+                    .is_some_and(|parent| {
+                        ids.contains(parent)
+                            || cv_core::SessionKey::split_selector(id)
+                                .is_some_and(|(_, scope)| ids.contains(&format!("{parent}@{scope}")))
+                    })
         })
 }
 
@@ -2646,12 +2676,14 @@ fn pass_needed_with_catalog(
         .into_iter()
         .map(|(r, _)| r)
         .collect();
-    let live_ids: HashSet<&str> = candidates.iter().map(|r| r.id.as_str()).collect();
+    let mut live_ids = HashSet::new();
+    let aliases = Default::default();
     for r in &candidates {
         if cv_core::harness::for_harness(r.harness).is_none() {
             continue;
         }
-        let r = &*live::as_indexed(r, &metadata);
+        let r = &*live::as_indexed(r, &metadata, &aliases);
+        live_ids.insert(r.session_selector());
         let source = probe.snapshot(r);
         if !landable(sig(source.primary)) {
             continue;
@@ -3059,11 +3091,28 @@ pub fn text_search_ids_suffixed_scoped(
     live: LiveRead,
     refs: &[cv_core::SessionRef],
 ) -> Result<(Vec<Result<HashSet<String>>>, Suffix)> {
-    let indexed = if dir.join("meta.json").exists() || live == LiveRead::Frozen {
-        Some(query_index(dir)?)
-    } else {
-        None
-    };
+    let (sets, suffix) = text_search_keys_suffixed(dir, queries, scope, live, refs)?;
+    Ok((
+        sets.into_iter()
+            .map(|set| set.map(|ids| ids.into_iter().map(|id| crate::native_id(&id).to_owned()).collect()))
+            .collect(),
+        suffix,
+    ))
+}
+
+pub fn text_search_keys_suffixed(
+    dir: &Path,
+    queries: &[&str],
+    scope: crate::Scope,
+    live: LiveRead,
+    refs: &[cv_core::SessionRef],
+) -> Result<(Vec<Result<HashSet<String>>>, Suffix)> {
+    let indexed =
+        if dir.join("meta.json").exists() || (live == LiveRead::Frozen && cv_core::custody::inventory()?.is_empty()) {
+            Some(query_index(dir)?)
+        } else {
+            None
+        };
     let (live, suffix) = live::read(
         dir,
         indexed.as_ref().map(|(_, f, searcher)| live::Indexed { searcher, f }),
@@ -3107,9 +3156,10 @@ fn matching_ids(
     scope: crate::Scope,
 ) -> Result<HashSet<String>> {
     let parsed = parse_text_query(index, f, query, scope)?;
-    searcher
+    let ids = searcher
         .search(&parsed, &crate::session_collector::SessionIds(f.id))
-        .context("matching session IDs")
+        .context("matching session IDs")?;
+    Ok(ids.into_iter().map(|id| crate::native_id(&id).to_owned()).collect())
 }
 
 /// Add live snippets to selected ranked hits. Only these source transcripts are read; unavailable
@@ -3153,11 +3203,17 @@ fn enrich_snippets_from(
 ) -> Result<Option<String>> {
     let (mut unreadable, mut first) = (0usize, None);
     for hit in hits {
-        let path = path_of(&hit.id)?;
+        let path = path_of(hit.session_key.as_deref().unwrap_or(&hit.id))?;
         let path = path.as_str();
         // The stored preview stands in when the live read cannot: marked when the source is
         // gone, returned as the search's note when it is there but cannot be read.
-        match live_snippet(path, &hit.id, &hit.harness, query, scope) {
+        match live_snippet(
+            path,
+            hit.session_key.as_deref().unwrap_or(&hit.id),
+            &hit.harness,
+            query,
+            scope,
+        ) {
             Ok(snippet) if !snippet.is_empty() => hit.snippet = snippet,
             Ok(_) => {}
             Err(_) if !Path::new(path).exists() => {
@@ -3277,7 +3333,7 @@ pub(crate) fn search_suffixed(
     live: LiveRead,
     refs: &[cv_core::SessionRef],
 ) -> Result<Searched> {
-    search_suffixed_allowed(dir, query, limit, filter, None, live, || refs)
+    search_suffixed_allowed(dir, query, limit, filter, None, live, || Ok(refs))
 }
 
 pub(crate) fn search_suffixed_allowed<R: AsRef<[cv_core::SessionRef]>>(
@@ -3287,15 +3343,16 @@ pub(crate) fn search_suffixed_allowed<R: AsRef<[cv_core::SessionRef]>>(
     filter: crate::SearchFilter<'_>,
     allowed_ids: Option<std::sync::Arc<HashSet<String>>>,
     live: LiveRead,
-    discover: impl FnOnce() -> R,
+    discover: impl FnOnce() -> Result<R>,
 ) -> Result<Searched> {
-    let indexed = if dir.join("meta.json").exists() || live == LiveRead::Frozen {
-        Some(query_index(dir)?)
-    } else {
-        None
-    };
+    let indexed =
+        if dir.join("meta.json").exists() || (live == LiveRead::Frozen && cv_core::custody::inventory()?.is_empty()) {
+            Some(query_index(dir)?)
+        } else {
+            None
+        };
     // Validate/open first: an unusable index must not trigger expensive discovery.
-    let refs = discover();
+    let refs = discover()?;
     let (live, suffix) = live::read(
         dir,
         indexed.as_ref().map(|(_, f, searcher)| live::Indexed { searcher, f }),
@@ -3550,8 +3607,10 @@ fn meta_hit(
 fn hit_of(doc: &TantivyDocument, f: &Fields, id: String, score: f32) -> Hit {
     let get_str =
         |field: Field| -> Option<String> { doc.get_first(field).and_then(|v| v.as_str()).map(|s| s.to_string()) };
+    let key = cv_core::SessionKey::split_selector(&id);
     Hit {
-        id,
+        session_key: key.map(|_| id.clone()),
+        id: key.map_or(id.as_str(), |(native, _)| native).to_owned(),
         harness: get_str(f.harness).unwrap_or_default(),
         cwd: get_str(f.cwd),
         title: get_str(f.title),
@@ -3623,14 +3682,33 @@ fn live_snippet(path: &str, id: &str, harness: &str, query: &str, scope: crate::
     use cv_core::scan::Matcher;
     use cv_core::{Block, Demand, Flow, Message, MessageSink, SessionRef};
     let h = cv_core::Harness::parse(harness).with_context(|| format!("unknown harness {harness:?}"))?;
-    let adapter = cv_core::harness::for_harness(h).with_context(|| format!("no adapter for {harness}"))?;
     let sref = SessionRef {
         cwd: None,
         title: None,
         created_at: None,
         updated_at: None,
         message_count: None,
-        ..SessionRef::new(id.to_owned(), h, PathBuf::from(path))
+        ..SessionRef::new(
+            cv_core::SessionKey::split_selector(id).map_or(id, |(native, _)| native),
+            h,
+            PathBuf::from(path),
+        )
+    };
+
+    let (sref, adapter) = if path.ends_with(".pack.zst") || !Path::new(path).exists() {
+        let backing = cv_core::custody::inventory()?
+            .into_iter()
+            .find(|b| b.reference.id == id)
+            .context("session source unavailable")?;
+        (
+            backing.reference.clone(),
+            Box::new(backing) as Box<dyn cv_core::Adapter>,
+        )
+    } else {
+        (
+            sref,
+            cv_core::harness::for_harness(h).with_context(|| format!("no adapter for {harness}"))?,
+        )
     };
 
     struct Acc {
@@ -5143,7 +5221,7 @@ mod tests {
                 crate::SearchFilter::default(),
                 None,
                 live,
-                || -> Vec<cv_core::SessionRef> { panic!("discovery must not run before index validation") },
+                || -> Result<Vec<cv_core::SessionRef>> { panic!("discovery must not run before index validation") },
             );
             assert!(result.is_err());
         }
@@ -5161,7 +5239,7 @@ mod tests {
             crate::SearchFilter::default(),
             None,
             LiveRead::Frozen,
-            || -> Vec<cv_core::SessionRef> { panic!("old schema must fail before discovery") },
+            || -> Result<Vec<cv_core::SessionRef>> { panic!("old schema must fail before discovery") },
         );
         assert!(format!("{:#}", result.err().unwrap()).contains("older cv"));
     }
@@ -5186,7 +5264,7 @@ mod tests {
             || {
                 write_claude(&sources, "changing", "newneedle with a longer replacement");
                 index_refs(&index, &refs, false).unwrap();
-                &refs
+                Ok(&refs)
             },
         )
         .unwrap();
@@ -5232,7 +5310,7 @@ mod tests {
                     .unwrap();
                 index_refs(&index, &refs, false).unwrap();
                 assert_eq!(indexed_consumer(&index.join("cv-index-id")).unwrap(), consumer);
-                &refs
+                Ok(&refs)
             })
             .unwrap();
             assert_eq!(answer.total, 1, "the selected frozen/live revision must match");
@@ -5303,7 +5381,7 @@ mod tests {
                     held.generation().segments().keys().collect::<Vec<_>>()
                 );
                 assert_ne!(&current, held.generation().segments());
-                &refs
+                Ok(&refs)
             },
         )
         .unwrap();
@@ -5456,10 +5534,12 @@ mod tests {
         let dir = tmpdir();
         let source = tmpdir();
         let path = write_claude(&source, "metadata-error", "fixture text");
-        index_refs(&dir, &[sref("metadata-error", "fixture", path)], false).unwrap();
+        let reference = sref("metadata-error", "fixture", path);
+        let key = reference.session_selector();
+        index_refs(&dir, &[reference], false).unwrap();
         let (index, fields) = open_existing(&dir).unwrap();
         let searcher = index.reader().unwrap().searcher();
-        assert!(meta_doc(&searcher, &fields, "metadata-error").unwrap().is_some());
+        assert!(meta_doc(&searcher, &fields, &key).unwrap().is_some());
         assert!(meta_doc(&searcher, &fields, "absent").unwrap().is_none());
         let mut broken = fields.clone();
         broken.id = fields.preview; // Stored-only field: a term lookup must fail.
@@ -8101,7 +8181,7 @@ mod tests {
         // instead of skipping a truncation stamped fresh.
         let (sigs, _) = read_indexed_sigs(&index, &f).unwrap();
         assert!(
-            !sigs.contains_key("victim"),
+            !sigs.contains_key(&r.session_selector()),
             "a failed session must not enter the freshness skip-set (B1)"
         );
     }
@@ -8121,9 +8201,7 @@ mod tests {
         let mut newer = sref("s0", "t", write_claude(&dup, "s0", "zqdupword common"));
         newer.updated_at = chrono::DateTime::from_timestamp(3, 0);
         refs.push(newer.clone());
-        let mut canonical = refs[..40].to_vec();
-        canonical[0] = newer;
-        index_refs(&seq, &canonical, false).unwrap();
+        index_refs(&seq, &refs, false).unwrap();
         sweep(&par, refs.clone(), true, false).unwrap();
         let docs = |d: &Path| {
             let (index, f) = open_existing(d).unwrap();
@@ -8135,8 +8213,8 @@ mod tests {
         assert_eq!(docs(&seq), docs(&par));
         assert_eq!(
             docs(&par).0,
-            2 * 40,
-            "a body and a meta doc per logical ID, from its preferred copy"
+            2 * 41,
+            "each distinct profile has its own body and metadata"
         );
         for q in (0..40)
             .map(|i| format!("zqword{i}"))
@@ -8297,12 +8375,13 @@ mod tests {
             "parent b",
             write_claude_msgs(&home.home, "parent-b", &[("user", "parent b")]),
         );
-        write_subagent(a.path.to_str().unwrap(), "shared", "sapphire agent a");
+        let path = write_subagent(a.path.to_str().unwrap(), "shared", "sapphire agent a");
+        let key = cv_core::SessionRef::new("agent-shared", cv_core::Harness::Claude, path).session_selector();
         write_subagent(b.path.to_str().unwrap(), "shared", "amber agent b");
         let first = sweep(&dir, vec![b.clone(), a.clone()], true, true).unwrap();
         assert_eq!(first.changed, 3);
         let (index, fields) = open_existing(&dir).unwrap();
-        let meta = meta_doc(&index.reader().unwrap().searcher(), &fields, "agent-shared")
+        let meta = meta_doc(&index.reader().unwrap().searcher(), &fields, &key)
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -8324,7 +8403,7 @@ mod tests {
             1
         );
         let (index, fields) = open_existing(&dir).unwrap();
-        let meta = meta_doc(&index.reader().unwrap().searcher(), &fields, "agent-shared")
+        let meta = meta_doc(&index.reader().unwrap().searcher(), &fields, &key)
             .unwrap()
             .unwrap();
         assert!(meta.get_first(fields.parent_id).is_none());
@@ -9902,7 +9981,7 @@ mod tests {
             let mut writer = open_writer(&index, 15_000_000).unwrap();
             for _ in 1..TIER_FANOUT {
                 let mut doc = TantivyDocument::default();
-                doc.add_text(f.id, "warm");
+                doc.add_text(f.id, refs[0].session_selector());
                 doc.add_text(f.kind, KIND_BODY);
                 doc.add_text(f.body, "zqpending");
                 writer.add_document(doc).unwrap();

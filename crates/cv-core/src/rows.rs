@@ -31,6 +31,7 @@ pub fn session_row(r: &SessionRef, size_bytes: Option<u64>) -> Value {
         "updated_at": r.updated_at.map(|t| t.to_rfc3339()),
         "message_count": r.message_count,
         "size_bytes": size_bytes,
+        "session_key": r.session_selector(),
     })
 }
 
@@ -66,6 +67,8 @@ pub struct SearchRow<'a> {
 /// statement, without a daemon cache or a retained second collection of hit metadata.
 pub struct SearchRowContext {
     catalog: std::cell::OnceCell<Option<crate::catalog::Reader>>,
+    #[cfg(feature = "sqlite")]
+    custody: std::cell::OnceCell<Vec<crate::custody::Backing>>,
     /// One probe per search response: chunked hits repeat a session's path within a response.
     probe: std::cell::RefCell<crate::source::Probe>,
 }
@@ -74,6 +77,8 @@ impl SearchRowContext {
     pub fn new() -> Self {
         Self {
             catalog: std::cell::OnceCell::new(),
+            #[cfg(feature = "sqlite")]
+            custody: Default::default(),
             probe: std::cell::RefCell::new(crate::source::Probe::default()),
         }
     }
@@ -104,6 +109,20 @@ impl SearchRow<'_> {
                 )
             });
         let reference = cataloged.as_ref();
+        #[cfg(feature = "sqlite")]
+        let reference = if crate::SessionKey::split_selector(self.id).is_some()
+            && reference.is_none_or(|r| !r.path.is_file() && !r.path.is_dir())
+        {
+            context
+                .custody
+                .get_or_init(|| crate::custody::inventory().unwrap_or_default())
+                .iter()
+                .find(|b| b.reference.id == self.id)
+                .map(|b| &b.reference)
+                .or(reference)
+        } else {
+            reference
+        };
         // Index cwd/title and valid dates win when present; the catalog supplies their fallbacks
         // plus canonical identity, path and count. Out-of-range index dates use the catalog too.
         let created = rfc3339(self.created_at).or_else(|| reference.and_then(|r| r.created_at).map(|t| t.to_rfc3339()));
@@ -118,6 +137,7 @@ impl SearchRow<'_> {
             "updated_at": updated,
             "message_count": reference.map(|r| r.message_count),
             "size_bytes": reference.and_then(|r| context.probe.borrow_mut().ref_size(r)),
+            "session_key": crate::SessionKey::split_selector(self.id).map(|_| self.id.to_owned()).or_else(|| reference.map(SessionRef::session_selector)),
             "score": self.score,
             "snippet": self.snippet,
             "agent_id": self.agent_id,
@@ -196,7 +216,8 @@ const fn joined<const N: usize>(head: &[&'static str], tail: &[&'static str]) ->
 }
 
 /// The keys a §3 session row carries, in order: [`SessionRef::FIELDS`] plus `size_bytes`.
-pub const SESSION_ROW_KEYS: [&str; SessionRef::FIELDS.len() + 1] = joined(SessionRef::FIELDS, &["size_bytes"]);
+pub const SESSION_ROW_KEYS: [&str; SessionRef::FIELDS.len() + 2] =
+    joined(SessionRef::FIELDS, &["size_bytes", "session_key"]);
 
 /// The keys a sub-agent forest row carries (`/api/session/{harness}/{id}/subagents`), in order:
 /// the session row plus the sidecar enrichment the forest view groups by.

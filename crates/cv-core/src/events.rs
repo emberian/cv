@@ -605,7 +605,8 @@ impl Provenance {
 /// directly so the answer stays current without publishing either events or certified counts.
 pub fn read_ref(r: &crate::SessionRef, kind: Option<&str>) -> Result<Vec<EventRow>> {
     let mut rows = read_ref_rows(r, kind)?;
-    let baggage = crate::hooks::Baggage::for_session(r.harness.as_str(), &r.id);
+    let native_id = crate::SessionKey::split_selector(&r.id).map_or(r.id.as_str(), |(n, _)| n);
+    let baggage = crate::hooks::Baggage::for_session(r.harness.as_str(), native_id);
     for row in &mut rows {
         row.baggage.clone_from(&baggage)
     }
@@ -613,9 +614,14 @@ pub fn read_ref(r: &crate::SessionRef, kind: Option<&str>) -> Result<Vec<EventRo
 }
 
 fn read_ref_rows(r: &crate::SessionRef, kind: Option<&str>) -> Result<Vec<EventRow>> {
-    if needs_ingest(r) {
-        if crate::env::frozen() {
-            let adapter = crate::harness::for_harness(r.harness)
+    #[cfg(feature = "sqlite")]
+    let backing = crate::custody::backing_for(r)?;
+    #[cfg(not(feature = "sqlite"))]
+    let backing: Option<Box<dyn crate::Adapter>> = None;
+    if backing.is_some() || needs_ingest(r) {
+        if backing.is_some() || crate::env::frozen() {
+            let adapter = backing
+                .or_else(|| crate::harness::for_harness(r.harness))
                 .ok_or_else(|| anyhow::anyhow!("no adapter for {}", r.harness))?;
             let mut sink = EventSink::new(r.cwd.clone()).with_source(r.path.clone());
             adapter.try_stream(r, &crate::Demand::LEAN.with_spans(), &mut sink)?;

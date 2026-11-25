@@ -501,6 +501,7 @@ fn tooth_file_targets_stage_before_publish_leaving_zero_files_and_preserving_for
             &live_out,
             &force_strict,
             Some(&mut |staged_src| {
+                #[allow(irrefutable_let_patterns)]
                 if let StagedSource::Files { result } = staged_src {
                     // Corrupt 1 byte in the staged transcript file before re-parsing!
                     let transcript = if result.path.is_dir() {
@@ -598,6 +599,7 @@ fn tooth_claude_skills_policy_rewrites_inside_stage_before_verification_and_publ
         &out_dir,
         &opts,
         Some(&mut |staged_src| {
+            #[allow(irrefutable_let_patterns)]
             if let StagedSource::Files { result } = staged_src {
                 staged_blake3 = Some(blake3::hash(&fs::read(&result.path)?));
             }

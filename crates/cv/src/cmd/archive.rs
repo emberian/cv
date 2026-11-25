@@ -20,45 +20,13 @@
 use crate::util::{fmt_local, parse_harness, poll_interval, short_id};
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
-use cv_core::packs::{
-    pack_idx_path, pack_zst_path, CodecCheckpoint, PackBuilder, PackManifest as PackFileManifest, PayloadAddr,
-};
+use cv_core::packs::{pack_zst_path, CodecCheckpoint, PackBuilder, PackManifest as PackFileManifest};
 use cv_core::publish::Claim;
 use cv_core::state::{AppendRequest, PackManifest as StatePackManifest, StateStore};
 use cv_core::{Harness, SessionRef};
-use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
-
-/// Per-session custody metadata persisted inside `pack_manifests.index_meta["sessions"]` and
-/// backed by the companion `.pack.idx.json` `RecordIndex`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ArchivedSessionEntry {
-    pub producer_id: String,
-    pub harness: String,
-    pub id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub title: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cwd: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub created_at: Option<DateTime<Utc>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub updated_at: Option<DateTime<Utc>>,
-    pub message_count: usize,
-    pub archived_at: DateTime<Utc>,
-    /// Hex BLAKE3 digest of the serialized Session IR JSON stored in `addr`.
-    pub content_blake3: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_len: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_mtime_ns: Option<i128>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub baseline: Option<cv_core::source::Baseline>,
-    pub addr: PayloadAddr,
-}
 
 /// Summary of one batched `sync_refs` pass.
 #[derive(Debug, Clone, Default)]
@@ -76,8 +44,7 @@ pub struct Archive {
     pub home: PathBuf,
 }
 
-pub type ArchiveSessionKey = (String, String, String);
-pub type ArchiveSessionMap = BTreeMap<ArchiveSessionKey, ArchivedSessionEntry>;
+use cv_core::custody::{ArchiveSessionMap, ArchivedSessionEntry};
 
 impl Archive {
     /// Resolve archive home: explicit `--dir` > `$CLUSTERVISION_HOME` > `~/.clustervision`.
@@ -101,67 +68,8 @@ impl Archive {
         StateStore::at_dir(&self.home)
     }
 
-    /// Read-only deduplicated map of `(producer_id, harness, id) -> ArchivedSessionEntry` across
-    /// all published `pack_manifests` (ascending commit order so newer packs supersede older ones).
-    /// Also validates any present `.pack.idx.json` record spans. Safe under `--frozen`.
     pub fn entries_by_key(&self) -> Result<(ArchiveSessionMap, usize)> {
-        let manifests =
-            cv_core::list_pack_manifests_frozen_safe(&self.home).context("reading pack manifests from state.db")?;
-        let packs_dir = self.packs_dir();
-        let mut distinct_packs = std::collections::BTreeSet::new();
-        let mut idx_cache: std::collections::HashMap<String, Option<PackFileManifest>> =
-            std::collections::HashMap::new();
-        let mut by_key = BTreeMap::new();
-
-        for m in manifests {
-            distinct_packs.insert(m.pack_path.clone());
-            let phys_pack_id = m
-                .index_meta
-                .get("physical_pack_id")
-                .and_then(serde_json::Value::as_str)
-                .or_else(|| m.pack_id.split_once("--r").map(|(base, _)| base))
-                .unwrap_or(&m.pack_id)
-                .to_string();
-
-            if let Some(sessions_val) = m.index_meta.get("sessions") {
-                let entries: Vec<ArchivedSessionEntry> = serde_json::from_value(sessions_val.clone())
-                    .with_context(|| format!("decoding index_meta.sessions for pack {}", m.pack_id))?;
-                for entry in entries {
-                    let target_pack_id = if !entry.addr.pack_id.is_empty() {
-                        entry.addr.pack_id.as_str()
-                    } else {
-                        phys_pack_id.as_str()
-                    };
-                    if !idx_cache.contains_key(target_pack_id) {
-                        let idx_file = pack_idx_path(&packs_dir, target_pack_id)?;
-                        let loaded = if idx_file.is_file() {
-                            let raw =
-                                std::fs::read(&idx_file).with_context(|| format!("reading {}", idx_file.display()))?;
-                            Some(PackFileManifest::from_json_slice(&raw)?)
-                        } else {
-                            None
-                        };
-                        idx_cache.insert(target_pack_id.to_string(), loaded);
-                    }
-                    if let Some(Some(idx)) = idx_cache.get(target_pack_id) {
-                        let anchor = record_anchor(&entry.producer_id, &entry.harness, &entry.id);
-                        if let Some(span) = idx.record_index.get(&anchor) {
-                            anyhow::ensure!(
-                                span.decoded_offset == entry.addr.decoded_offset
-                                    && span.length == entry.addr.length
-                                    && span.blake3_digest == entry.addr.blake3_digest,
-                                "pack {} record span mismatch for {}",
-                                target_pack_id,
-                                anchor
-                            );
-                        }
-                    }
-                    let key = (entry.producer_id.clone(), entry.harness.clone(), entry.id.clone());
-                    by_key.insert(key, entry);
-                }
-            }
-        }
-        Ok((by_key, distinct_packs.len()))
+        cv_core::custody::archive_entries(&self.home)
     }
 
     /// Deduplicated archived sessions, newest `archived_at` first. Read-only (`--frozen` safe).
@@ -177,24 +85,6 @@ impl Archive {
         Ok((rows, pack_count))
     }
 
-    /// Hydrate the raw Session IR JSON bytes of `(harness, id)` from its sealed `.pack.zst`,
-    /// verifying both Zstd-Seekable XXH64 frame checksums and the record's 32-byte BLAKE3 digest.
-    #[cfg(test)]
-    pub fn read_session_bytes(&self, harness: &str, id: &str) -> Result<Option<Vec<u8>>> {
-        use cv_core::packs::SealedPack;
-        let (by_key, _) = self.entries_by_key()?;
-        let found = by_key
-            .values()
-            .filter(|e| e.harness == harness && e.id == id)
-            .max_by_key(|e| e.archived_at);
-        let Some(entry) = found else {
-            return Ok(None);
-        };
-        let pack = SealedPack::open(&self.packs_dir(), &entry.addr.pack_id)?;
-        let bytes = pack.read_payload(&entry.addr)?;
-        Ok(Some(bytes))
-    }
-
     /// Batch-archive `refs`: unchanged sessions are skipped; all new or modified sessions in this
     /// pass are packed together into **one** sealed `.pack.zst` + `.pack.idx.json`, recorded in
     /// `capture_inbox`, and published atomically into `pack_manifests` (`publish-before-reference`).
@@ -208,6 +98,7 @@ impl Archive {
         let (known, _) = self.entries_by_key()?;
 
         struct StagedSession {
+            key: cv_core::SessionKey,
             harness: String,
             id: String,
             title: Option<String>,
@@ -231,7 +122,7 @@ impl Archive {
             let mut probe = cv_core::source::Probe::default();
             for r in chunk {
                 let harness_str = r.harness.as_str().to_string();
-                let key = (producer_id.clone(), harness_str.clone(), r.id.clone());
+                let key = cv_core::SessionKey::local(r);
                 if !seen_in_pass.insert(key.clone()) {
                     summary.skipped += 1;
                     continue;
@@ -240,7 +131,7 @@ impl Archive {
                 let primary = probe.primary_path(r);
                 let (source_len, source_mtime_ns) = source_stat_ref(r, &primary);
 
-                if let Some(prev) = known.get(&key) {
+                if let Some(prev) = known.get(&key.selector()) {
                     let unchanged = if let Some(ref prev_base) = prev.baseline {
                         let now = probe.snapshot_from(r, &primary);
                         prev_base.fresh(&now, &mut probe) || prev_base.rows_fresh(r, &now, &mut probe)
@@ -269,12 +160,13 @@ impl Archive {
                     let read = cv_core::stream::stream_counted(
                         adapter.as_ref(),
                         r,
-                        &cv_core::Demand::RICH.with_spans(),
+                        &cv_core::Demand::COMPLETE.with_spans(),
                         &mut sink,
                         pass,
                     )?;
                     let frames = sink.finish()?;
                     let total = sink.selected;
+                    let turns = total - sink.carriers;
                     let mut buf = Vec::new();
                     super::session_json::write_session(&mut buf, &read.session, &frames, None, None, total)?;
                     buf.push(b'\n');
@@ -282,7 +174,7 @@ impl Archive {
                         Some(guard) => Some(guard.verify_baseline(r)?),
                         None => None,
                     };
-                    Ok((read.session, total, buf, baseline))
+                    Ok((read.session, turns, buf, baseline))
                 })();
 
                 let (session_meta, message_count, payload, baseline) = match rendered {
@@ -294,10 +186,12 @@ impl Archive {
                 };
                 let blake3_hex = cv_core::blake3_hex(&payload);
 
-                if let Some(prev) = known.get(&key) {
+                if let Some(prev) = known.get(&key.selector()) {
                     if prev.content_blake3 == blake3_hex {
                         if let Some(base) = baseline {
-                            summary.verified_baselines.push((harness_str, r.id.clone(), base));
+                            summary
+                                .verified_baselines
+                                .push((harness_str, r.session_selector(), base));
                         }
                         summary.skipped += 1;
                         continue;
@@ -305,6 +199,7 @@ impl Archive {
                 }
 
                 staged.push(StagedSession {
+                    key,
                     harness: harness_str,
                     id: r.id.clone(),
                     title: session_meta.title.or_else(|| r.title.clone()),
@@ -338,7 +233,7 @@ impl Archive {
         let mut entries = Vec::with_capacity(staged.len());
 
         for item in &staged {
-            let anchor = record_anchor(&producer_id, &item.harness, &item.id);
+            let anchor = item.key.selector();
             let addr = builder.append_record(&anchor, &item.payload)?;
             builder.record_checkpoint(CodecCheckpoint {
                 anchor: anchor.clone(),
@@ -353,6 +248,7 @@ impl Archive {
             })?;
             entries.push(ArchivedSessionEntry {
                 producer_id: producer_id.clone(),
+                profile: item.key.profile.clone(),
                 harness: item.harness.clone(),
                 id: item.id.clone(),
                 title: item.title.clone(),
@@ -382,12 +278,13 @@ impl Archive {
         //    archived session's exact `local_commit_pos` + `(epoch, seq)` for `Shipper::sync`.
         let mut committed = Vec::with_capacity(entries.len());
         for (item, entry) in staged.iter().zip(entries.iter()) {
-            let op_id = format!("archive:{pack_id}:{producer_id}:{}:{}", item.harness, item.id);
+            let op_id = format!("archive:{pack_id}:{}", item.key.selector());
             let envelope = json!({
                 "kind": "session_archive",
                 "producer_id": producer_id,
                 "harness": item.harness,
                 "session_id": item.id,
+                "profile": item.key.profile,
                 "title": item.title,
                 "cwd": item.cwd,
                 "created_at": item.created_at.map(|t| t.to_rfc3339()),
@@ -524,6 +421,7 @@ fn publish_contiguous_archive_runs(
     Ok(())
 }
 
+#[cfg(test)]
 fn record_anchor(producer_id: &str, harness: &str, id: &str) -> String {
     format!("{producer_id}:{harness}:{id}")
 }
@@ -629,8 +527,8 @@ fn seed_watch_baselines(
         let mut probe = cv_core::source::Probe::default();
         for r in chunk {
             let key = (r.harness, r.id.clone(), r.path.clone());
-            if let (Some(known), Some(prod)) = (known, producer_id) {
-                let akey = (prod.to_string(), r.harness.as_str().to_string(), r.id.clone());
+            if let (Some(known), Some(_)) = (known, producer_id) {
+                let akey = r.session_selector();
                 if let Some(base) = known.get(&akey).and_then(|e| e.baseline.as_ref()) {
                     let now = probe.snapshot(r);
                     if base.fresh(&now, &mut probe) || base.rows_fresh(r, &now, &mut probe) {
@@ -689,7 +587,7 @@ fn evict_failed_watch_baselines(refs: &[SessionRef], failed: &[(String, String)]
 fn reconcile_watch_baselines(candidates: &[SessionRef], summary: &SyncSummary, seen: &mut WatchBaselineMap) {
     for (harness, id, base) in &summary.verified_baselines {
         for c in candidates {
-            if c.harness.as_str() == harness && &c.id == id {
+            if c.harness.as_str() == harness && &c.session_selector() == id {
                 seen.insert((c.harness, c.id.clone(), c.path.clone()), base.clone());
             }
         }
@@ -697,7 +595,10 @@ fn reconcile_watch_baselines(candidates: &[SessionRef], summary: &SyncSummary, s
     for entry in &summary.archived_entries {
         if let Some(ref base) = entry.baseline {
             for c in candidates {
-                if c.harness.as_str() == entry.harness && c.id == entry.id {
+                if c.harness.as_str() == entry.harness
+                    && c.id == entry.id
+                    && cv_core::SessionKey::local(c).profile == entry.profile
+                {
                     seen.insert((c.harness, c.id.clone(), c.path.clone()), base.clone());
                 }
             }
@@ -722,8 +623,10 @@ fn source_stat(path: &Path) -> (Option<u64>, Option<i128>) {
 }
 
 fn discover_filtered(harness: Option<Harness>, cwd_sub: Option<&str>) -> Vec<SessionRef> {
+    // Custody-backed refs are this archive's own packs (or hub mirrors): never re-archive them.
     cv_core::discover_all()
         .into_iter()
+        .filter(|r| !cv_core::custody::is_pack_ref(r))
         .filter(|r| harness.is_none_or(|h| r.harness == h))
         .filter(|r| match cwd_sub {
             None => true,
@@ -767,7 +670,7 @@ fn resolve_shipper(
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .or_else(|| {
-            cv_core::env::var("CV_SERVE_TOKEN")
+            cv_core::env::var("CV_HUB_PRODUCER_TOKEN")
                 .ok()
                 .filter(|s| !s.trim().is_empty())
         })
@@ -1087,8 +990,7 @@ mod tests {
         assert_eq!(store.list_pack_manifests().unwrap().len(), 1);
 
         // 4. Hydrate payload from sealed pack (verifying BLAKE3 + XXH64) and check content.
-        let alpha_bytes = archive
-            .read_session_bytes("claude", "sess-alpha")
+        let alpha_bytes = cv_core::custody::read_session_bytes(&archive.home, "claude", "sess-alpha")
             .unwrap()
             .expect("alpha present");
         let alpha_ir: serde_json::Value = serde_json::from_slice(&alpha_bytes).unwrap();
@@ -1201,6 +1103,7 @@ mod tests {
         assert_eq!(r2.local_commit_pos, 5);
 
         let entry_1 = ArchivedSessionEntry {
+            profile: Default::default(),
             producer_id: producer.clone(),
             harness: "claude".into(),
             id: "s-one".into(),
@@ -1265,8 +1168,12 @@ mod tests {
         let (rows, pack_count) = archive.entries().unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(pack_count, 2);
-        assert!(archive.read_session_bytes("claude", "s-one").unwrap().is_some());
-        assert!(archive.read_session_bytes("claude", "s-two").unwrap().is_some());
+        assert!(cv_core::custody::read_session_bytes(&archive.home, "claude", "s-one")
+            .unwrap()
+            .is_some());
+        assert!(cv_core::custody::read_session_bytes(&archive.home, "claude", "s-two")
+            .unwrap()
+            .is_some());
     }
 
     #[test]
@@ -1415,9 +1322,7 @@ mod tests {
         let pack_id = "pack-claude-baseline-proof";
         let mut builder = PackBuilder::create(&archive.packs_dir(), pack_id).unwrap();
         let dummy_ir = br#"{"id":"sess-no-parse","harness":"claude","messages":[]}"#;
-        let addr = builder
-            .append_record(record_anchor(&prod, "claude", "sess-no-parse"), dummy_ir)
-            .unwrap();
+        let addr = builder.append_record(claude_ref.session_selector(), dummy_ir).unwrap();
         let pfm = builder.seal(Claim::New).unwrap();
         let zst = std::fs::read(pack_zst_path(&archive.packs_dir(), pack_id).unwrap()).unwrap();
         let append = store
@@ -1442,6 +1347,7 @@ mod tests {
                 op_id: format!("archive:{pack_id}:{prod}:claude:sess-no-parse"),
                 envelope: json!({"kind": "session_archive", "session_id": "sess-no-parse"}),
                 entry: ArchivedSessionEntry {
+                    profile: cv_core::SessionKey::local(&claude_ref).profile,
                     producer_id: prod.clone(),
                     harness: "claude".into(),
                     id: "sess-no-parse".into(),

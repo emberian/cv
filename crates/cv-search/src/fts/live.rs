@@ -279,9 +279,37 @@ pub(super) fn read(
         no_index: indexed.is_none(),
         ..Default::default()
     };
-    let mut pending = plan(dir, indexed, refs, &mut suffix)?;
+    let native: Vec<_> = refs
+        .iter()
+        .filter(|r| !cv_core::custody::is_pack_ref(r))
+        .cloned()
+        .collect();
+    let native_keys: HashSet<_> = native.iter().map(|r| r.session_selector()).collect();
+    let mut archived = Vec::new();
+    for backing in cv_core::custody::inventory()? {
+        let key = &backing.reference.id;
+        if native_keys.contains(key) && live != LiveRead::Frozen {
+            continue;
+        }
+        let in_index = indexed
+            .as_ref()
+            .map(|i| meta_addr(i.searcher, i.f, key))
+            .transpose()?
+            .flatten()
+            .is_some();
+        if in_index {
+            continue;
+        }
+        if live == LiveRead::Frozen && indexed.is_some() {
+            suffix.stale += 1;
+            suffix.cut += 1;
+            continue;
+        }
+        archived.push(backing);
+    }
+    let mut pending = plan(dir, indexed, &native, &mut suffix)?;
     let budget = match live {
-        LiveRead::Frozen => return Ok((None, suffix)),
+        LiveRead::Frozen => 0,
         LiveRead::All => u64::MAX,
         LiveRead::Within(budget, _) => budget,
     };
@@ -302,7 +330,7 @@ pub(super) fn read(
             Cost::Metered => admitted.push(p),
         }
     }
-    if admitted.is_empty() {
+    if admitted.is_empty() && archived.is_empty() {
         return Ok((None, suffix));
     }
     let ram = Index::create_from_tempdir(build_schema()).context("creating the live suffix's index")?;
@@ -332,16 +360,22 @@ pub(super) fn read(
             .flat_map(|h| h.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic)))
             .collect()
     });
+    let mut shadows = HashMap::new();
+    for backing in archived {
+        let r = &backing.reference;
+        let mut out = |doc| writer.add_admitted(writer.admission.document(doc)?).map(|_| ());
+        index_session(&mut out, &f, &backing, r, 0, 0, None, Default::default(), None)?;
+        shadows.insert(r.id.clone(), 0);
+    }
     writer.commit().context("committing the live suffix")?;
     drop(writer);
-    let mut shadows = HashMap::new();
     for (i, outcome) in outcomes {
         match outcome {
             Outcome::Read { bytes, resumed } => {
                 suffix.read += 1;
                 suffix.bytes += bytes;
                 suffix.resumed += usize::from(resumed.is_some());
-                shadows.insert(admitted[i].job.r.id.clone(), resumed.unwrap_or(0));
+                shadows.insert(admitted[i].job.r.session_selector(), resumed.unwrap_or(0));
             }
             Outcome::Cut { bytes } => {
                 suffix.cut += 1;
@@ -416,11 +450,12 @@ fn plan(
     let mut newest_on_disk = 0i64;
     let prov = cv_core::events::Provenance::default();
     let mut pending = Vec::new();
+    let aliases = Default::default();
     for (r, _) in preferred_index_candidates(refs.iter().map(|r| (r, &prov)).collect()) {
         let Some(adapter) = cv_core::harness::for_harness(r.harness) else {
             continue;
         };
-        let r = &*as_indexed(r, &metadata);
+        let r = &*as_indexed(r, &metadata, &aliases);
         let source = probe.snapshot(r);
         let fresh = Freshness::of(&existing, &metadata, &dependencies, &mut probe, r, &prov, &source);
         newest_on_disk = newest_on_disk.max(fresh.mtime);
@@ -441,8 +476,10 @@ fn plan(
             events: false,
             sql_events: false,
             col_events: false,
-            existing: existing.contains_key(&r.id),
-            grew: existing.get(&r.id).is_some_and(|&(_, old)| old > 0 && fresh.size > old),
+            existing: existing.contains_key(&r.session_selector()),
+            grew: existing
+                .get(&r.session_selector())
+                .is_some_and(|&(_, old)| old > 0 && fresh.size > old),
             source,
             dependencies_fresh: fresh.dependencies_fresh,
             prov: prov.clone(),
@@ -472,12 +509,29 @@ fn plan(
 /// one whole on every query. The same file (device and inode) is the same session: it is judged,
 /// and when grown resumed, as the index keys it. A different file under another path (a copy, a
 /// move) is not, and is read as it is.
-pub(super) fn as_indexed<'r>(
+type Aliases<'a> = std::cell::OnceCell<HashMap<&'a str, Vec<&'a cv_core::SessionRef>>>;
+
+pub(super) fn as_indexed<'r, 'i>(
     r: &'r cv_core::SessionRef,
-    metadata: &HashMap<String, DiscoveryMetadata>,
+    metadata: &'i HashMap<String, DiscoveryMetadata>,
+    aliases: &Aliases<'i>,
 ) -> std::borrow::Cow<'r, cv_core::SessionRef> {
     use std::borrow::Cow;
-    let Some(indexed) = metadata.get(&r.id).map(|m| &m.session) else {
+    let candidate = metadata.get(&r.session_selector()).map(|m| &m.session).or_else(|| {
+        let by_id = aliases.get_or_init(|| {
+            let mut grouped = HashMap::<_, Vec<_>>::new();
+            for m in metadata.values() {
+                grouped.entry(m.session.id.as_str()).or_default().push(&m.session);
+            }
+            grouped
+        });
+        by_id
+            .get(r.id.as_str())?
+            .iter()
+            .copied()
+            .find(|other| other.harness == r.harness && same_file(&r.path, &other.path))
+    });
+    let Some(indexed) = candidate else {
         return Cow::Borrowed(r);
     };
     if indexed.path == r.path || indexed.harness != r.harness || !same_file(&indexed.path, &r.path) {
@@ -566,7 +620,7 @@ fn read_one(p: &Pending, writer: &Writer, f: &Fields, remaining: &AtomicU64) -> 
             resumed,
         },
         Err(error) => {
-            writer.delete_term(Term::from_field_text(f.id, &job.r.id));
+            writer.delete_term(Term::from_field_text(f.id, &job.r.session_selector()));
             if error.chain().any(|cause| cause.is::<OverBudget>()) {
                 Outcome::Cut { bytes: charged.get() }
             } else {

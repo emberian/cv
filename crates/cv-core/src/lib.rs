@@ -27,6 +27,7 @@ pub mod bytes {
 pub mod codex_handoff;
 pub mod dataset;
 pub mod digest;
+pub mod disclose;
 pub mod discover_cache;
 pub mod distill;
 pub mod doctor;
@@ -38,9 +39,13 @@ pub mod formats;
 pub mod harness;
 pub mod hooks;
 pub mod html;
+mod identity;
 pub mod ingest;
 pub mod io_admission;
 pub mod ir;
+pub use identity::SessionKey;
+#[cfg(feature = "sqlite")]
+pub mod custody;
 mod ir_json;
 pub use ir_json::PrettyJson;
 mod derive;
@@ -436,15 +441,22 @@ fn discover_all_with_catalog(mut catalog: Option<catalog::Reader>) -> DiscoveryI
         catalog.record_skipped(&skipped);
     }
     drop((publications, skipped));
-    let errors = results
+    #[allow(unused_mut)]
+    let mut errors: usize = results
         .iter()
         .map(|(_, _, found, _)| found.as_ref().map_or(1, |f| f.skipped.len()))
         .sum();
-    let refs = results
+    #[allow(unused_mut)]
+    let mut refs: Vec<SessionRef> = results
         .into_iter()
         .filter_map(|(_, _, found, _)| found)
         .flat_map(|found| found.refs)
         .collect();
+    #[cfg(feature = "sqlite")]
+    if let Err(error) = extend_with_custody(&mut refs, None) {
+        eprintln!("cv: could not read session custody: {error:#}");
+        errors += 1;
+    }
     DiscoveryInventory { refs, errors }
 }
 
@@ -474,7 +486,7 @@ fn note_skipped(skipped: &[(Harness, &[Skipped])]) {
 /// by the time backstop. Metadata identities do not hash file contents. `cv ls --fresh` or
 /// `CLUSTERVISION_MAX_STALE_SECS=0` forces full discovery.
 pub fn sessions() -> Vec<SessionRef> {
-    sessions_impl().0
+    with_custody(sessions_impl().0, None)
 }
 
 /// Enumerate the requested harness without opening unrelated stores. A qualified scope uses
@@ -491,6 +503,56 @@ pub fn sessions_for(harness: Option<Harness>) -> Vec<SessionRef> {
         reader.persist_discovery(false);
     } else {
         discover_cache::persist(false);
+    }
+    with_custody(refs, Some(harness))
+}
+
+/// Like [`sessions_for`], propagating custody-store read errors instead of falling back to live
+/// refs alone.
+pub fn try_sessions_for(harness: Option<Harness>) -> Result<Vec<SessionRef>> {
+    #[allow(unused_mut)]
+    let mut refs = match harness {
+        None => sessions_impl().0,
+        Some(h) => {
+            let mut reader = catalog::Reader::open();
+            let refs = discover_harness(h, reader.as_mut()).unwrap_or_default();
+            if let Some(reader) = &mut reader {
+                reader.persist_discovery(false);
+            } else {
+                discover_cache::persist(false);
+            }
+            refs
+        }
+    };
+    #[cfg(feature = "sqlite")]
+    extend_with_custody(&mut refs, harness)?;
+    Ok(refs)
+}
+
+#[cfg(feature = "sqlite")]
+fn extend_with_custody(refs: &mut Vec<SessionRef>, harness: Option<Harness>) -> Result<()> {
+    let backings = custody::inventory()?;
+    if !backings.is_empty() {
+        refs.retain(|r| r.path.exists());
+        let live: std::collections::HashSet<_> = refs.iter().map(SessionRef::session_selector).collect();
+        refs.extend(
+            backings
+                .into_iter()
+                .map(|b| b.reference)
+                .filter(|r| harness.is_none_or(|h| h == r.harness) && !live.contains(&r.id)),
+        );
+    }
+    Ok(())
+}
+
+fn with_custody(mut refs: Vec<SessionRef>, harness: Option<Harness>) -> Vec<SessionRef> {
+    #[cfg(feature = "sqlite")]
+    if let Err(error) = extend_with_custody(&mut refs, harness) {
+        eprintln!("cv: could not read session custody: {error:#}");
+    }
+    #[cfg(not(feature = "sqlite"))]
+    {
+        let _ = (&mut refs, harness);
     }
     refs
 }
@@ -1047,6 +1109,16 @@ fn find_inner(id: &str, harness: Option<Harness>) -> Result<(Option<FoundSession
         }
     }
 
+    // A selector can identify an archived twin even when a live session shares its native ID.
+    #[cfg(feature = "sqlite")]
+    let archived = custody::inventory()?
+        .into_iter()
+        .filter(|b| {
+            harness.is_none_or(|h| h == b.reference.harness)
+                && (b.reference.id == id
+                    || SessionKey::split_selector(&b.reference.id).is_some_and(|(native, _)| native.starts_with(id)))
+        })
+        .collect::<Vec<_>>();
     // A qualified lookup's universe is one harness. Its complete enumeration resolves prefixes
     // without opening unrelated stores; scoped publication must not stamp a full-fleet sync.
     if let Some(h) = harness {
@@ -1057,13 +1129,19 @@ fn find_inner(id: &str, harness: Option<Harness>) -> Result<(Option<FoundSession
         } else {
             discover_cache::persist(false);
         }
-        return Ok((resolve_id(refs, id, Some(h))?, true));
+        let live = resolve_id(refs, id, Some(h))?;
+        #[cfg(feature = "sqlite")]
+        let live = custody::or_archived(live, archived, id)?;
+        return Ok((live, true));
     }
 
     // Slow path (cold/stale catalog): freshen via the probe — usually a few hundred stats plus at
     // most a scoped re-discovery, and it re-warms the catalog.
     let (refs, was_full) = sessions_impl();
-    Ok((resolve_id(refs, id, harness)?, was_full))
+    let live = resolve_id(refs, id, harness)?;
+    #[cfg(feature = "sqlite")]
+    let live = custody::or_archived(live, archived, id)?;
+    Ok((live, was_full))
 }
 
 /// Match `id` (exact first, then as a prefix) against `refs` — `find`'s matching contract.
@@ -1075,7 +1153,7 @@ fn resolve_id(
 ) -> Result<Option<(SessionRef, Box<dyn Adapter>)>> {
     let hits: Vec<SessionRef> = refs
         .into_iter()
-        .filter(|r| harness.is_none_or(|h| r.harness == h) && r.id.starts_with(id))
+        .filter(|r| harness.is_none_or(|h| r.harness == h) && (r.id.starts_with(id) || r.session_selector() == id))
         // Mirror the fast path: never return a session whose file has vanished (deleted between
         // the scan and now, or a stale probe-path catalog row). Stat only the id matches — cheap.
         .filter(|r| r.path.exists())

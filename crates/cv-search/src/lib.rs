@@ -32,6 +32,8 @@ pub mod trigram;
 /// A single search result.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Hit {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_key: Option<String>,
     pub id: String,
     pub harness: String,
     pub cwd: Option<String>,
@@ -67,6 +69,7 @@ impl From<cv_core::scan::LiveHit> for Hit {
     fn from(hit: cv_core::scan::LiveHit) -> Self {
         let r = hit.session;
         Hit {
+            session_key: Some(r.session_selector()),
             id: r.id.clone(),
             harness: r.harness.as_str().to_string(),
             cwd: r.cwd.as_ref().map(|p| p.to_string_lossy().into_owned()),
@@ -89,8 +92,8 @@ pub fn row(hit: &Hit, context: &cv_core::rows::SearchRowContext) -> serde_json::
     if let Some(session) = &hit.session {
         return cv_core::rows::live_search_row(session, hit.title.as_deref().unwrap_or_default(), &hit.snippet);
     }
-    cv_core::rows::SearchRow {
-        id: &hit.id,
+    let mut row = cv_core::rows::SearchRow {
+        id: hit.session_key.as_deref().unwrap_or(&hit.id),
         harness: &hit.harness,
         cwd: hit.cwd.as_deref(),
         title: hit.title.as_deref(),
@@ -102,7 +105,16 @@ pub fn row(hit: &Hit, context: &cv_core::rows::SearchRowContext) -> serde_json::
         parent_id: hit.parent_id.as_deref(),
         workflow: hit.workflow.as_deref(),
     }
-    .to_json_with(context)
+    .to_json_with(context);
+    row["id"] = hit.id.clone().into();
+    if let Some(key) = &hit.session_key {
+        row["session_key"] = key.clone().into();
+    }
+    row
+}
+
+fn native_id(selector: &str) -> &str {
+    cv_core::SessionKey::split_selector(selector).map_or(selector, |(id, _)| id)
 }
 
 /// Which path answers a search: the index (authoritative; an empty result is "no match") or a live
@@ -240,7 +252,7 @@ impl Searcher {
         match source {
             Source::Live => {
                 let live = cv_core::scan::live_search_filtered(query, harness, limit, |r| {
-                    allowed_ids.is_none_or(|ids| ids.contains(&r.id))
+                    allowed_ids.is_none_or(|ids| ids.contains(&r.id) || ids.contains(&r.session_selector()))
                         && filter.cwd.is_none_or(|needle| {
                             r.cwd
                                 .as_ref()
@@ -269,11 +281,11 @@ impl Searcher {
                     note,
                     suffix,
                 } = fts::search_suffixed_allowed(dir, query, limit, filter, shared_allowed, live, || {
-                    let mut refs = cv_core::sessions_for(harness);
+                    let mut refs = cv_core::try_sessions_for(harness)?;
                     if let Some(ids) = allowed_ids {
-                        refs.retain(|r| ids.contains(&r.id));
+                        refs.retain(|r| ids.contains(&r.id) || ids.contains(&r.session_selector()));
                     }
-                    refs
+                    Ok(refs)
                 })?;
                 found.hits = hits;
                 found.total = total;

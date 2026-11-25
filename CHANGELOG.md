@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Search hits carry profile-qualified session selectors; list, search, show, pack, and port fall back to archived packs and hub snapshots.
+- Serve enforces scoped disclosure tiers, separates reader, producer, and inbox credentials, and accepts HttpOnly reader cookies on browser streams and downloads.
+- Redaction recognizes structured credentials, cookie jars, and signed URL parameters, and drops secret-bearing reasoning signatures atomically.
 - Port verifies ordered content, tool links, and skill rewrites before publishing staged files or committing SQLite transactions, rolling back cleanly under `--strict`.
 - Line-range blame follows unique carved blocks and edited declarations into their parent files and reports the relocation evidence.
 - Session overviews count validation repairs and immediate verbatim reversals separately, with message indices for each recent episode.

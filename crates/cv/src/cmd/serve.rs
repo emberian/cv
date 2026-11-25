@@ -62,14 +62,114 @@ struct Ctx {
     /// The configured bind host, accepted in `Host`/`Origin` checks alongside the loopback names.
     bind_host: String,
     web_root: Option<PathBuf>,
-    /// When set, every `/api/*` request must carry `Authorization: Bearer <token>` (or `?token=`
-    /// on browser `EventSource` / download GETs that cannot attach custom headers).
-    token: Option<String>,
+    auth: Credentials,
     default_who: Option<String>,
     /// Whether Fleet Hub endpoints (`/api/hub/*`) are enabled on this server instance.
     hub: bool,
     searcher: cv_search::Searcher,
     stream: std::sync::Arc<StreamHub>,
+}
+
+struct Credentials {
+    reader: Option<String>,
+    producer: Option<String>,
+    task_writer: Option<String>,
+    cookie: String,
+    tier: Option<cv_core::disclose::DisclosureTier>,
+    scope: Option<PathBuf>,
+}
+
+impl Credentials {
+    fn load(reader: Option<String>) -> Result<Self> {
+        let configured = |name| cv_core::env::var(name).ok().filter(|s| !s.is_empty());
+        let reader = reader
+            .or_else(|| configured("CV_SERVE_READ_TOKEN"))
+            .or_else(|| configured("CV_SERVE_TOKEN"));
+        let producer = configured("CV_HUB_PRODUCER_TOKEN");
+        let task_writer = configured("CV_TASK_WRITE_TOKEN");
+        let mut values = std::collections::HashSet::new();
+        for value in [&reader, &producer, &task_writer].into_iter().flatten() {
+            anyhow::ensure!(
+                !value.is_empty() && values.insert(value),
+                "each serve capability needs a distinct nonempty credential"
+            );
+        }
+        let tier = configured("CV_SERVE_READ_TIER").map(|s| s.parse()).transpose()?;
+        let scope = configured("CV_SERVE_READ_SCOPE").map(PathBuf::from);
+        anyhow::ensure!(
+            scope
+                .as_ref()
+                .is_none_or(|p| p.is_absolute() && !p.components().any(|c| c == std::path::Component::ParentDir)),
+            "reader scope must be an absolute directory"
+        );
+        Ok(Self {
+            reader,
+            producer,
+            task_writer,
+            tier,
+            scope,
+            cookie: uuid::Uuid::new_v4().to_string(),
+        })
+    }
+
+    fn restricted(&self) -> bool {
+        self.tier.is_some() || self.scope.is_some()
+    }
+
+    fn in_scope(&self, cwd: Option<&Path>) -> bool {
+        self.scope.as_ref().is_none_or(|scope| {
+            cwd.is_some_and(|p| p.starts_with(scope) && !p.components().any(|c| c == std::path::Component::ParentDir))
+        })
+    }
+
+    fn projected_read(&self, parts: &[&str]) -> Result<(u16, Value)> {
+        use cv_core::disclose::{disclose, DisclosureTier};
+        let tier = self.tier.unwrap_or(DisclosureTier::Full);
+        match parts {
+            ["api", "sessions"] => {
+                let tier = if tier == DisclosureTier::Presence {
+                    tier
+                } else {
+                    DisclosureTier::Activity
+                };
+                let mut rows = Vec::new();
+                let mut references = cv_core::sessions();
+                references.sort_by_cached_key(cv_core::SessionRef::session_selector);
+                for r in references.into_iter().filter(|r| self.in_scope(r.cwd.as_deref())) {
+                    let mut header = cv_core::Session::new(r.session_selector(), r.harness);
+                    header.created_at = r.created_at;
+                    header.updated_at = r.updated_at;
+                    rows.push(disclose(tier, &header)?);
+                }
+                Ok((200, serde_json::to_value(rows)?))
+            }
+            ["api", "session", harness, id] => {
+                let missing = || (404, json!({"error":"session not found"}));
+                let Some(harness) = cv_core::Harness::parse(harness) else {
+                    return Ok(missing());
+                };
+                let Some((r, adapter)) = cv_core::find(id, Some(harness))? else {
+                    return Ok(missing());
+                };
+                if !self.in_scope(r.cwd.as_deref()) {
+                    return Ok(missing());
+                }
+                if matches!(tier, DisclosureTier::Presence | DisclosureTier::Activity) {
+                    let mut session = cv_core::Session::new(r.session_selector(), r.harness);
+                    session.created_at = r.created_at;
+                    session.updated_at = r.updated_at;
+                    return Ok((200, serde_json::to_value(disclose(tier, &session)?)?));
+                }
+                let mut session = adapter.parse(&r)?;
+                session.id = r.session_selector();
+                if !self.in_scope(session.cwd.as_deref()) {
+                    return Ok(missing());
+                }
+                Ok((200, serde_json::to_value(disclose(tier, &session)?)?))
+            }
+            _ => Ok((403, json!({"error":"route outside reader grant"}))),
+        }
+    }
 }
 
 fn validate_bind_exposure(host: &str, port: u16, token: Option<&str>, insecure_expose: bool, hub: bool) -> Result<()> {
@@ -109,12 +209,18 @@ pub(crate) fn cmd_serve(opts: ServeOpts) -> Result<()> {
 
 /// Like [`cmd_serve`], with an explicit Fleet Hub enablement flag (for `--hub` CLI wiring).
 pub(crate) fn cmd_serve_with_hub(opts: ServeOpts, hub: bool) -> Result<()> {
-    let token = opts
-        .token
-        .or_else(|| cv_core::env::var("CV_SERVE_TOKEN").ok())
-        .filter(|t| !t.is_empty());
-    validate_bind_exposure(&opts.host, opts.port, token.as_deref(), opts.insecure_expose, hub)?;
-    run(&opts.host, opts.port, opts.web, token, opts.who, opts.open, hub)
+    let auth = Credentials::load(opts.token)?;
+    validate_bind_exposure(
+        &opts.host,
+        opts.port,
+        auth.reader
+            .as_deref()
+            .or(auth.producer.as_deref())
+            .or(auth.task_writer.as_deref()),
+        opts.insecure_expose,
+        hub,
+    )?;
+    run(&opts.host, opts.port, opts.web, auth, opts.who, opts.open, hub)
 }
 
 /// Run the HTTP server until the process is killed. Never returns under normal operation.
@@ -122,7 +228,7 @@ fn run(
     host: &str,
     port: u16,
     web_root: Option<PathBuf>,
-    token: Option<String>,
+    auth: Credentials,
     who: Option<String>,
     open: bool,
     hub: bool,
@@ -173,7 +279,7 @@ fn run(
     let ctx = Ctx {
         bind_host: host.to_string(),
         web_root,
-        token,
+        auth,
         default_who: who,
         hub,
         searcher: cv_search::Searcher,
@@ -189,14 +295,23 @@ fn handle(request: &mut Request<'_>, ctx: &Ctx) {
     // same-origin, but it can't forge the Host header — reject anything that isn't our own name.
     // Non-browser API/Hub callers presenting a valid `Authorization: Bearer <token>` header (never
     // `?token=`, HTML pages, or `OPTIONS` preflights) may use reverse-proxy or container aliases.
-    if !host_allowed_for_request(
-        raw_host.as_deref(),
-        &ctx.bind_host,
-        request.method(),
-        request.url(),
-        header_value(request, "Authorization").as_deref(),
-        ctx.token.as_deref(),
-    ) {
+    let authorization = header_value(request, "Authorization");
+    if ![
+        ctx.auth.reader.as_deref(),
+        ctx.auth.task_writer.as_deref(),
+        ctx.auth.producer.as_deref(),
+    ]
+    .into_iter()
+    .any(|expected| {
+        host_allowed_for_request(
+            raw_host.as_deref(),
+            &ctx.bind_host,
+            request.method(),
+            request.url(),
+            authorization.as_deref(),
+            expected,
+        )
+    }) {
         request.respond(json_response(403, &json!({"error": "forbidden host"}), None, &[]));
         return;
     }
@@ -266,32 +381,88 @@ fn handle(request: &mut Request<'_>, ctx: &Ctx) {
     }
 
     let q = cv_core::api::Query::parse(query);
-    if is_hub_write && !is_loopback_host(&ctx.bind_host) && ctx.token.is_none() {
+    if q.raw("token").is_some() {
         request.respond(json_response(
             401,
-            &json!({"error": "hub network writes require a bearer token"}),
+            &json!({"error":"URL credentials are unsupported"}),
             origin.as_deref(),
             &[],
         ));
         return;
     }
-    if let Some(token) = &ctx.token {
-        let header_ok = header_value(request, "Authorization")
-            .and_then(|v| v.strip_prefix("Bearer ").map(str::to_string))
-            .is_some_and(|t| token_matches(&t, token));
-        let query_ok = method == "GET"
-            && (parts.as_slice() == ["api", "stream"]
-                || matches!(parts.as_slice(), ["api", "session", _, _, "export"]))
-            && q.get("token").is_some_and(|t| token_matches(&t, token));
-        if !(header_ok || query_ok) {
+    let auth = &ctx.auth;
+    let expected = if is_hub_write {
+        &auth.producer
+    } else if is_task_post {
+        &auth.task_writer
+    } else {
+        &auth.reader
+    };
+    let configured = auth.reader.is_some() || auth.producer.is_some() || auth.task_writer.is_some();
+    let header_ok = expected.as_ref().is_some_and(|secret| {
+        authorization
+            .as_deref()
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .is_some_and(|provided| token_matches(provided, secret))
+    });
+    let cookie_ok = !is_hub_write
+        && !is_task_post
+        && auth.reader.is_some()
+        && authorization.is_none()
+        && raw_origin.as_deref().is_none_or(|o| {
+            o.split_once("://")
+                .is_some_and(|(_, authority)| Some(authority) == raw_host.as_deref())
+        })
+        && header_value(request, "Cookie").is_some_and(|cookies| {
+            cookies.split(';').any(|pair| {
+                pair.trim()
+                    .strip_prefix("cv_reader=")
+                    .is_some_and(|provided| token_matches(provided, &auth.cookie))
+            })
+        });
+    let local = !configured && is_loopback_host(&ctx.bind_host);
+    if !(header_ok || cookie_ok || local || (!configured && !is_hub_write && !is_task_post)) {
+        request.respond(json_response(
+            401,
+            &json!({"error":"missing or invalid credential for this route"}),
+            origin.as_deref(),
+            &[],
+        ));
+        return;
+    }
+    if parts.as_slice() == ["api", "auth"] && method == "GET" {
+        if !header_ok || (raw_origin.is_some() && origin.is_none()) {
             request.respond(json_response(
                 401,
-                &json!({"error": "missing or invalid bearer token"}),
-                origin.as_deref(),
+                &json!({"error":"reader bearer required"}),
+                None,
                 &[],
             ));
-            return;
+        } else {
+            let mut response = Response::bytes(200, br#"{"ok":true}"#.to_vec());
+            cors_headers(&mut response, origin.as_deref());
+            response.add_header("Access-Control-Allow-Credentials", "true");
+            response.add_header("Content-Type", "application/json");
+            response.add_header("Cache-Control", "no-store");
+            response.add_header(
+                "Set-Cookie",
+                &format!("cv_reader={}; Path=/api/; HttpOnly; SameSite=Strict", auth.cookie),
+            );
+            request.respond(response);
         }
+        return;
+    }
+    if !is_hub_write && !is_task_post && auth.restricted() {
+        let (status, body) = auth
+            .projected_read(&parts)
+            .unwrap_or_else(|_| (500, json!({"error":"session read failed"})));
+        // Snapshot identifiers reflect above-tier activity. Omit them from a projected read.
+        let mut response = Response::bytes(status, serde_json::to_vec(&body).unwrap_or_default());
+        response.add_header("Content-Type", "application/json");
+        response.add_header("Cache-Control", "no-store");
+        cors_headers(&mut response, origin.as_deref());
+        request.respond(response);
+        return;
     }
 
     if is_hub_write {
@@ -1015,7 +1186,9 @@ fn json_response(
         }
         resp.add_header(field, value);
     }
-    stamp_latest_snapshot(&mut resp, has_snapshot_hdr);
+    if status < 400 {
+        stamp_latest_snapshot(&mut resp, has_snapshot_hdr);
+    }
     resp.add_header("Content-Type", "application/json");
     resp
 }
@@ -2004,6 +2177,50 @@ mod staged_tests {
 #[cfg(test)]
 mod search_service_tests {
     use super::*;
+
+    /// #tooth Authenticate each request at the dispatch boundary, including native browser downloads.
+    #[test]
+    fn serve_credential_matrix_rejects_url_credentials_and_cross_capability_requests() {
+        let world = crate::test_world("serve-capabilities");
+        world.scope.set("CV_HUB_PRODUCER_TOKEN", "producer");
+        world.scope.set("CV_TASK_WRITE_TOKEN", "writer");
+        world.scope.set("CV_SERVE_READ_TIER", "presence");
+        let ctx = Ctx {
+            bind_host: "127.0.0.1".into(),
+            web_root: None,
+            auth: Credentials::load(Some("reader".into())).unwrap(),
+            default_who: None,
+            hub: true,
+            searcher: cv_search::Searcher,
+            stream: std::sync::Arc::new(StreamHub::new()),
+        };
+        let request = |method: &str, path: &str, headers: &[(&str, &str)]| {
+            crate::http::test_request(method, path, headers, |req| handle(req, &ctx))
+        };
+        for (method, path, credential) in [
+            ("GET", "/api/sessions?token=reader", "reader"),
+            ("GET", "/api/sessions", "producer"),
+            ("GET", "/api/sessions", "writer"),
+            ("POST", "/api/hub/enroll", "reader"),
+            ("POST", "/api/hub/enroll", "writer"),
+            ("POST", "/api/task/x/note", "reader"),
+            ("POST", "/api/task/x/note", "producer"),
+        ] {
+            assert_eq!(
+                request(method, path, &[("Authorization", &format!("Bearer {credential}"))]).status(),
+                401
+            );
+        }
+        let response = request("GET", "/api/auth", &[("Authorization", "Bearer reader")]);
+        assert_eq!(response.status(), 200);
+        let mut cookie = response.headers()["Set-Cookie"].to_str().unwrap().split(';');
+        let cookie_value = cookie.next().unwrap();
+        assert!(cookie.any(|s| s.trim() == "HttpOnly"));
+        let cookie_header = [("Cookie", cookie_value)];
+        assert_eq!(request("GET", "/api/sessions", &cookie_header).status(), 200);
+        assert_eq!(request("GET", "/api/search?q=secret", &cookie_header).status(), 403);
+        assert_eq!(request("POST", "/api/task/x/note", &cookie_header).status(), 401);
+    }
 
     #[test]
     fn search_rejects_cli_conflicts_before_reading_sources() {

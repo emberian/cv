@@ -41,6 +41,8 @@ impl ReadCoverage {
     pub fn summary(&self) -> String {
         let source = |s: &str| match s {
             Self::EXPORTED_HISTORY => "exported history".to_owned(),
+            "custody_pack" => "local custody pack".to_owned(),
+            "hub_snapshot" => "hub snapshot".to_owned(),
             Self::NATIVE_STORE => "native store".to_owned(),
             Self::MEMBER_REGISTRY => "member registry".to_owned(),
             _ => "unrecognized source (see JSON metadata)".to_owned(),
