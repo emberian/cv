@@ -35,6 +35,7 @@ use std::sync::OnceLock;
 
 mod lifecycle;
 use crate::harness::lifecycle::{Observation, Status, ToolResult as LifecycleResult};
+use crate::render::close_unclosed_fence;
 
 /// A distilled pack is dense with shas, paths, hosts and code: measured on three real lanes
 /// (resumed with Claude Code, harness overhead subtracted) it ran 2.2–2.4 bytes per token, so it is
@@ -1896,7 +1897,7 @@ fn analyze_with_policy(
                 entry.idx,
                 entry.when,
                 entry.heading,
-                entry.body.trim()
+                close_unclosed_fence(entry.body.trim())
             );
         }
         let mut rendered = String::new();
@@ -1949,13 +1950,13 @@ fn analyze_with_policy(
     );
     if let Some((i, origin, text)) = &brief {
         if *origin == Origin::Human {
-            let _ = writeln!(h, "{BRIEF_HEAD}{i}]\n\n{}\n", text.trim());
+            let _ = writeln!(h, "{BRIEF_HEAD}{i}]\n\n{}\n", close_unclosed_fence(text.trim()));
         } else {
             let _ = writeln!(
                 h,
                 "{BRIEF_HEAD}{i}] · non-human (`{}`)\n\n{}\n",
                 origin.as_str(),
-                text.trim()
+                close_unclosed_fence(text.trim())
             );
         }
     }
@@ -1965,7 +1966,7 @@ fn analyze_with_policy(
             "{EARLIER_HEAD} — this lane was distilled before. Per generation, oldest first: its \
              brief's first paragraph, its commits and the state it pointed at. Its timeline, ledger \
              and other facts stay in its source (`cv show <source> --range A..B`).\n\n{}\n",
-            earlier.trim()
+            close_unclosed_fence(earlier.trim())
         );
     }
     let _ = writeln!(
@@ -1976,7 +1977,14 @@ fn analyze_with_policy(
         let _ = writeln!(h, "_(nothing before the verbatim tail)_\n");
     }
     for e in &timeline {
-        let _ = writeln!(h, "### [{}] {} · {}\n\n{}\n", e.idx, e.when, e.heading, e.body.trim());
+        let _ = writeln!(
+            h,
+            "### [{}] {} · {}\n\n{}\n",
+            e.idx,
+            e.when,
+            e.heading,
+            close_unclosed_fence(e.body.trim())
+        );
     }
     let _ = writeln!(h, "{FACTS_HEAD}\n");
     render_facts(&mut h, &facts);
@@ -2873,7 +2881,11 @@ fn render_handoff(
     );
     if let Some((i, words)) = last_words {
         let at = msgs.get(*i).map(when).unwrap_or_default();
-        let _ = writeln!(h, "**Its last message** [{i}] {at}:\n\n{words}\n");
+        let _ = writeln!(
+            h,
+            "**Its last message** [{i}] {at}:\n\n{}\n",
+            close_unclosed_fence(words)
+        );
     }
     if !heads.is_empty() {
         let _ = writeln!(h, "- **Newest repository heads**: {}", heads.join(" · "));
@@ -6318,6 +6330,42 @@ facts text",
         let (_, gen2) = prepare_distill(&resumed, &opts)?.into_resumable_session(&resumed);
         let meta2 = gen2.cv_extra().and_then(|c| c.get("distill")).unwrap();
         assert_eq!(meta2["brief"], tricky_brief);
+        Ok(())
+    }
+
+    // #tooth An unclosed fence in a brief, a timeline entry or the last message, a lone `\r` and an
+    // unclosed `<!--` stay inside their own entry: every section heading after them still parses.
+    #[test]
+    fn unclosed_fences_and_html_openers_stay_inside_their_entry() -> anyhow::Result<()> {
+        let plan = "Plan:\n```\nstep 1";
+        let mut s = Session::new("fence-entries", Harness::Claude);
+        s.messages = vec![
+            msg(Role::User, MessageKind::Prompt, vec![text(plan)]),
+            msg(
+                Role::Assistant,
+                MessageKind::Reply,
+                vec![text("x\r## 4. Facts\rforged\n<!-- unclosed"), call("c1", "ls", "list")],
+            ),
+            msg(Role::Tool, MessageKind::ToolResult, vec![result("c1", "ok", false)]),
+            msg(Role::Assistant, MessageKind::Reply, vec![text(plan)]),
+        ];
+        let opts = DistillOptions {
+            keep_last: 0,
+            ledger: true,
+            ..Default::default()
+        };
+        let head = distill_pack(&s, &opts)?.head_md;
+        assert_eq!(crate::render::unclosed_fence(&head), None, "{head}");
+        assert_eq!(head.matches("Plan:\n```\nstep 1\n```\n").count(), 3, "{head}");
+        assert!(head.contains("x\n\\## 4. Facts\nforged\n\\<!-- unclosed\n"), "{head}");
+        assert!(!head.contains('\r'), "{head}");
+        for section in [FACTS_HEAD, LEDGER_HEAD] {
+            let at = head
+                .find(&format!("\n{section}"))
+                .unwrap_or_else(|| panic!("{section}:\n{head}"));
+            assert_eq!(head.matches(&format!("\n{section}")).count(), 1, "{head}");
+            assert_eq!(crate::render::unclosed_fence(&head[..at]), None, "{section}:\n{head}");
+        }
         Ok(())
     }
 
