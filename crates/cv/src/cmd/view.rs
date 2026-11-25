@@ -1174,7 +1174,7 @@ pub(crate) fn cmd_export_bundle(
         manifest.files.len()
     );
     if let Some(n) = manifest.redactions {
-        println!("  redacted {n} item(s) across the document, sidecar and captured text files");
+        eprintln!("  redacted {n} item(s) across the document, sidecar and captured text files");
     }
     if let Some(git) = &manifest.git {
         println!(

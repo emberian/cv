@@ -228,6 +228,8 @@ pub const CACHE_WRITE: f64 = 1.25;
 pub const CACHE_READ: f64 = 0.10;
 /// The share of a warm session's prompt a turn reads from cache.
 pub const CACHE_HIT_RATE: f64 = 0.90;
+/// Default Anthropic prompt-cache TTL (5 minutes) when no 1-hour ephemeral cache tokens were seen.
+pub const CACHE_TTL_DEFAULT: std::time::Duration = std::time::Duration::from_secs(300);
 /// The longest prompt-cache TTL (the 1-hour tier; the default is 5 minutes). A session idle
 /// longer has no cache left to invalidate.
 pub const CACHE_TTL_MAX: std::time::Duration = std::time::Duration::from_secs(3600);
@@ -254,15 +256,25 @@ pub fn cache_break_even_turns(before: u64, kept_after: u64, cold: bool) -> Optio
     Some((turns as u64).saturating_add(1))
 }
 
-/// Whether `last` (an RFC 3339 record timestamp) is older than [`CACHE_TTL_MAX`] at `now`. An
-/// absent or unreadable timestamp is not evidence of a cold cache.
-pub fn cache_is_cold(last: Option<&str>, now: chrono::DateTime<chrono::Utc>) -> bool {
+/// Whether `last` (an RFC 3339 record timestamp) is older than `ttl` at `now`. An absent or
+/// unreadable timestamp is not evidence of a cold cache.
+pub fn cache_is_cold_with_ttl(
+    last: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+    ttl: std::time::Duration,
+) -> bool {
     last.and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
         .is_some_and(|t| {
             (now - t.with_timezone(&chrono::Utc))
                 .to_std()
-                .is_ok_and(|age| age > CACHE_TTL_MAX)
+                .is_ok_and(|age| age > ttl)
         })
+}
+
+/// Whether `last` (an RFC 3339 record timestamp) is older than [`CACHE_TTL_MAX`] at `now`. An
+/// absent or unreadable timestamp is not evidence of a cold cache.
+pub fn cache_is_cold(last: Option<&str>, now: chrono::DateTime<chrono::Utc>) -> bool {
+    cache_is_cold_with_ttl(last, now, CACHE_TTL_MAX)
 }
 
 /// Below this share of the active prompt saved, a prune is low-bloat.
@@ -873,20 +885,19 @@ fn prune_session_after_stage(
     // The last kept main-thread request's recorded context: what a resume sizes the session by.
     let mut active_saving = 0i128;
     let mut active_prompt = None;
-    // The recorded prompt before the first record whose estimate the prune changed: the cached
-    // prefix that survives. Read one record late, at the start of the next iteration.
+    // The recorded prompt at the first mutated record in the active compaction segment: the cached
+    // prefix that survives. On an assistant record `k`, `k`'s own `orig_ctx.or(usage_in)` measures
+    // the prompt sent *into* `k` (strictly before `k`'s mutated output), so it stays cached.
     let mut first_mutation_prefix: Option<u64> = None;
-    let mut prompt_before_previous: Option<u64> = None;
+    let mut attachment_prefix_by_uuid: HashMap<String, u64> = HashMap::new();
+    let mut first_attachment_prefix: Option<u64> = None;
     let mut last_request_tokens = None;
     let mut last_request_rewritable = false;
-    // The newest main-thread timestamp: how long the provider's cache has been idle.
+    // The newest main-thread API-turn timestamp: how long the provider's cache has been idle.
     let mut last_timestamp: Option<String> = None;
+    let mut saw_ephemeral_1h = false;
 
     for (idx, (facts, range)) in parsed.into_iter().zip(lines.iter()).enumerate() {
-        if first_mutation_prefix.is_none() && active_saving != 0 {
-            first_mutation_prefix = Some(prompt_before_previous.unwrap_or(0));
-        }
-        prompt_before_previous = active_prompt;
         let Some(facts) = facts else {
             // Blank records (the parse loop refused every other unreadable row) use the same
             // writer with no accepted rewrite nodes.
@@ -929,14 +940,26 @@ fn prune_session_after_stage(
             active_saving = 0;
             active_prompt = None;
             first_mutation_prefix = None;
-            prompt_before_previous = None;
+            attachment_prefix_by_uuid.clear();
+            first_attachment_prefix = None;
         }
         if !facts.sidechain() {
             active_prompt = facts.facts.orig_ctx.or(facts.facts.usage_in).or(active_prompt);
-            if facts.facts.timestamp.is_some() {
+            saw_ephemeral_1h |= facts.facts.ephemeral_1h;
+            if (facts.facts.usage_in.is_some() || assistant) && facts.facts.timestamp.is_some() {
                 last_timestamp.clone_from(&facts.facts.timestamp);
             }
+            if opts.skills_policy != SkillsPolicy::Keep && facts.facts.ty == "attachment" {
+                let prefix_here = active_prompt.unwrap_or(0);
+                first_attachment_prefix.get_or_insert(prefix_here);
+                if let Some(uuid) = &facts.facts.uuid {
+                    attachment_prefix_by_uuid.insert(uuid.clone(), prefix_here);
+                }
+            }
         }
+        let saving_before = active_saving;
+        let pruned_before = pruned_count;
+        let dropped_before = dropped_records.len();
         let is_old = is_turn_line && this_turn < keep_from;
 
         // `--window`/`--range`: drop turns outside the kept range. Non-turn records (system lines,
@@ -959,6 +982,9 @@ fn prune_session_after_stage(
             if drop_line {
                 if !facts.sidechain() {
                     active_saving += i128::from(facts.est.total());
+                    if first_mutation_prefix.is_none() {
+                        first_mutation_prefix = Some(active_prompt.unwrap_or(0));
+                    }
                 }
                 if is_turn {
                     dropped_turns += 1;
@@ -1114,6 +1140,19 @@ fn prune_session_after_stage(
             },
             &mut scan,
         )?;
+        let sidechain_record = facts.sidechain();
+        let mutated_this_record = !sidechain_record
+            && (active_saving != saving_before
+                || pruned_count != pruned_before
+                || dropped_records.len() != dropped_before
+                || stashed_input
+                || scan.found
+                || emptied_by_thinking
+                || emptied_by_plan
+                || (opts.thinking && facts.empty_content_array));
+        if first_mutation_prefix.is_none() && mutated_this_record {
+            first_mutation_prefix = Some(active_prompt.unwrap_or(0));
+        }
         let gone = facts.facts.uuid.as_ref().is_some_and(|u| dropped_records.contains(u))
             || emptied_by_plan
             || emptied_by_thinking
@@ -1160,6 +1199,33 @@ fn prune_session_after_stage(
         output
     };
     let (output, skills) = skills::apply(output, opts.skills_policy, skills::config_dir_of(src_path).as_deref())?;
+    if skills.records > 0 {
+        let mut active_skill_prefix: Option<u64> = None;
+        let mut active_skill_bytes = 0usize;
+        for (uuid, bytes) in &skills.rewritten_records {
+            match uuid.as_deref() {
+                Some(u) => {
+                    if let Some(&p) = attachment_prefix_by_uuid.get(u) {
+                        active_skill_prefix = Some(active_skill_prefix.map_or(p, |cur| cur.min(p)));
+                        active_skill_bytes += *bytes;
+                    }
+                }
+                None => {
+                    if let Some(p) = first_attachment_prefix {
+                        active_skill_prefix = Some(active_skill_prefix.map_or(p, |cur| cur.min(p)));
+                        active_skill_bytes += *bytes;
+                    }
+                }
+            }
+        }
+        let skill_prefix = active_skill_prefix.or(first_attachment_prefix).unwrap_or(0);
+        first_mutation_prefix = Some(first_mutation_prefix.map_or(skill_prefix, |cur| cur.min(skill_prefix)));
+        if active_skill_bytes > 0 {
+            let skill_tok = crate::ir::est_tokens_bytes(active_skill_bytes, TokenKind::Text);
+            est_tokens_saved += skill_tok;
+            active_saving += i128::from(skill_tok);
+        }
+    }
     let new_size = output.byte_len()?;
     let sidecar = sidecar_stage.into_inner().map_err(|e| e.into_error())?.finish()?;
 
@@ -1224,14 +1290,16 @@ fn prune_session_after_stage(
         );
     }
 
-    if first_mutation_prefix.is_none() && active_saving != 0 {
-        first_mutation_prefix = Some(prompt_before_previous.unwrap_or(0));
-    }
     let invalidated_suffix_tokens = active_prompt
         .zip(first_mutation_prefix)
         .map(|(prompt, prefix)| prompt.saturating_sub(prefix));
     let saved_now = u64::try_from(active_saving.max(0)).unwrap_or(u64::MAX);
-    let cache_cold = cache_is_cold(last_timestamp.as_deref(), chrono::Utc::now());
+    let cache_ttl = if saw_ephemeral_1h {
+        CACHE_TTL_MAX
+    } else {
+        CACHE_TTL_DEFAULT
+    };
+    let cache_cold = cache_is_cold_with_ttl(last_timestamp.as_deref(), chrono::Utc::now(), cache_ttl);
     let cache_break_even_turns = invalidated_suffix_tokens
         .map(|suffix| suffix.max(saved_now))
         .and_then(|before| cache_break_even_turns(before, before - saved_now, cache_cold));

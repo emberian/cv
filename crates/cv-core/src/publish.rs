@@ -51,9 +51,9 @@ pub fn refuse_existing(path: &Path, hint: &'static str) -> Result<()> {
     }
 }
 
-/// Raw transform output ids also become filenames/resource directory names. Keep them within the
-/// selected output directory; this does not restrict ids stored in arbitrary IR or restamped text.
-pub(crate) fn validate_output_id(id: &str) -> anyhow::Result<()> {
+/// Validate a caller-supplied session identifier before using it as a filename or directory
+/// component in an output store. Rejects empty strings, path separators, NULs, `.`, and `..`.
+pub fn validate_session_id(id: &str) -> anyhow::Result<()> {
     let mut components = std::path::Path::new(id).components();
     anyhow::ensure!(
         !id.is_empty()
@@ -63,6 +63,12 @@ pub(crate) fn validate_output_id(id: &str) -> anyhow::Result<()> {
         "new session id must be a nonempty filename component, not a path: {id:?}"
     );
     Ok(())
+}
+
+/// Raw transform output ids also become filenames/resource directory names. Keep them within the
+/// selected output directory; this does not restrict ids stored in arbitrary IR or restamped text.
+pub(crate) fn validate_output_id(id: &str) -> anyhow::Result<()> {
+    validate_session_id(id)
 }
 
 /// An exclusively created temporary that only this operation owns; dropped unpublished, it is

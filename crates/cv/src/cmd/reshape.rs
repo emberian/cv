@@ -193,6 +193,11 @@ pub(crate) fn cmd_prune(args: PruneArgs<'_>) -> Result<()> {
         json,
     } = args;
     let plan = plan.as_deref().map(read_plan).transpose()?;
+    if let Some(id) = to.as_deref() {
+        if let Err(e) = cv_core::harness::validate_session_id(id) {
+            return usage(e.to_string());
+        }
+    }
     let keep_range = keep.as_deref().map(parse_range).transpose()?;
     let declassify_tokens = resolve_declassify_tokens(declassify_tokens, declassify_tokens_file)?;
     if declassify && declassify_tokens.is_empty() {
@@ -477,9 +482,11 @@ fn emit_ir(
     target: Harness,
     out: Option<PathBuf>,
     new_id: &str,
-) -> Result<(PathBuf, Vec<String>)> {
+    sidecar: &[cv_core::distill::Elided],
+) -> Result<(PathBuf, Option<PathBuf>, Vec<String>)> {
+    cv_core::harness::validate_session_id(new_id)?;
     if let Some(adapter) = cv_core::harness::rootless(target).filter(|a| a.writes_selection()) {
-        return adapter.write_selection(source, session, out.as_deref(), new_id);
+        return adapter.write_selection(source, session, out.as_deref(), new_id, sidecar);
     }
     let out_dir = ir_out_dir(target, out)?;
     let opts = EmitOptions {
@@ -487,8 +494,8 @@ fn emit_ir(
         thinking: cv_core::emit::ThinkingMode::Native,
         ..Default::default()
     };
-    let (res, lost) = cv_core::emit::emit_verified(session, target, &out_dir, &opts)?;
-    Ok((res.path, lost))
+    let (res, sc, lost) = cv_core::emit::emit_verified_with_sidecar(session, target, &out_dir, &opts, sidecar)?;
+    Ok((res.path, sc, lost))
 }
 
 /// The `<new_id>.flat.jsonl` sidecar beside an IR-emitted session: where `cv cat` looks for
@@ -535,6 +542,9 @@ fn prune_ir(r: &cv_core::ir::SessionRef, args: IrPruneArgs) -> Result<()> {
     }
     let pinned = to.is_some();
     let new_id = to.unwrap_or_else(|| cv_core::emit::fresh_session_id(r.harness));
+    if let Err(e) = cv_core::harness::validate_session_id(&new_id) {
+        return usage(e.to_string());
+    }
     let opts = cv_core::prune::PruneOptions {
         min_size,
         keep_last,
@@ -569,12 +579,7 @@ fn prune_ir(r: &cv_core::ir::SessionRef, args: IrPruneArgs) -> Result<()> {
         "lost": [],
     });
     if !dry_run {
-        let (path, lost) = emit_ir(&pruned.session, &r.path, r.harness, out, &new_id)?;
-        let sidecar = (!pruned.stashed.is_empty()).then(|| ir_sidecar_path(&path, &new_id));
-        if let Some(sc) = &sidecar {
-            cv_core::distill::write_sidecar(sc, &pruned.stashed, cv_core::publish::Claim::New)
-                .with_context(|| format!("the new session {} is written; its sidecar failed", path.display()))?;
-        }
+        let (path, sidecar, lost) = emit_ir(&pruned.session, &r.path, r.harness, out, &new_id, &pruned.stashed)?;
         let _ = writeln!(h, "  new session: {}", path.display());
         if let Some(sc) = &sidecar {
             let _ = writeln!(
@@ -627,6 +632,9 @@ fn rewind_ir(
     session.lineage.forked_from = Some(r.id.clone());
     let pinned = to.is_some();
     let new_id = to.unwrap_or_else(|| cv_core::emit::fresh_session_id(r.harness));
+    if let Err(e) = cv_core::harness::validate_session_id(&new_id) {
+        return usage(e.to_string());
+    }
     let mut h = String::new();
     let tag = if dry_run { " (dry run — nothing written)" } else { "" };
     let _ = writeln!(h, "✦ rewound {} → {}{tag}", short_id(&r.id), short_id(&new_id));
@@ -657,7 +665,7 @@ fn rewind_ir(
         "lost": [],
     });
     if !dry_run {
-        let (path, lost) = emit_ir(&session, &r.path, r.harness, out, &new_id)?;
+        let (path, _, lost) = emit_ir(&session, &r.path, r.harness, out, &new_id, &[])?;
         let _ = writeln!(h, "  new session: {}", path.display());
         for line in &lost {
             let _ = writeln!(h, "  ⚠ lost {line}");
@@ -748,6 +756,11 @@ pub(crate) fn cmd_rewind(args: RewindArgs<'_>) -> Result<()> {
         generator,
     } = args;
     let cut = parse_cut(at)?;
+    if let Some(id) = to.as_deref() {
+        if let Err(e) = cv_core::harness::validate_session_id(id) {
+            return usage(e.to_string());
+        }
+    }
     let (r, _adapter) = crate::cmd::distill::resolve_source(id, parse_harness(&harness)?)?;
     let r = match &agent {
         Some(a) => crate::cmd::view::resolve_subagent(&r, a)?.session,

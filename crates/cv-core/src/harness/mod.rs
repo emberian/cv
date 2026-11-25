@@ -615,6 +615,8 @@ pub struct PendingAdoption {
     pub rev: String,
 }
 
+pub use crate::publish::validate_session_id;
+
 pub trait Adapter: Send + Sync {
     /// Decode provider-native asynchronous result envelopes into shared lifecycle evidence.
     fn tool_result_lifecycle(&self, result: &lifecycle::ToolResult<'_>) -> lifecycle::Observation {
@@ -866,15 +868,17 @@ pub trait Adapter: Send + Sync {
     }
 
     /// Write `selected`, an IR selection read from `source`, as session `new_id` into `out` (or
-    /// this harness's own place for it). Returns the written path and what the read-back did not
-    /// reproduce. Called only when [`Adapter::writes_selection`] is true.
+    /// this harness's own place for it), staging any `sidecar` elisions before publishing the
+    /// reshaped transcript. Returns `(written_path, sidecar_path, readback_losses)`.
+    /// Called only when [`Adapter::writes_selection`] is true.
     fn write_selection(
         &self,
         _source: &Path,
         _selected: &Session,
         _out: Option<&Path>,
         _new_id: &str,
-    ) -> Result<(PathBuf, Vec<String>)> {
+        _sidecar: &[crate::distill::Elided],
+    ) -> Result<(PathBuf, Option<PathBuf>, Vec<String>)> {
         anyhow::bail!("{} writes selections through its emitter", self.harness())
     }
 

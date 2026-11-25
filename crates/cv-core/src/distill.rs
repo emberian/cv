@@ -468,6 +468,34 @@ pub fn prepare_distill_with_policy(
     analyze_with_policy(session, opts, live_fs, Demand::Full)
 }
 
+/// Stage elided outputs beside `path` without claiming `path` yet, so callers publishing both a
+/// sidecar and a reshaped transcript can commit them as one atomic [`crate::publish::Set`] with
+/// the sidecar first.
+pub fn stage_sidecar(path: &std::path::Path, elided: &[Elided]) -> anyhow::Result<crate::publish::Staged> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut staged = crate::publish::Staged::beside(path, "sidecar", 0o600)?;
+    {
+        use std::io::Write as _;
+        let mut w = std::io::BufWriter::with_capacity(64 * 1024, staged.file());
+        for entry in elided {
+            serde_json::to_writer(
+                &mut w,
+                &crate::prune::BorrowedSidecarEntry::text(
+                    &entry.tool_use_id,
+                    &entry.tool_name,
+                    &entry.input,
+                    &entry.content,
+                ),
+            )?;
+            w.write_all(b"\n")?;
+        }
+        w.flush()?;
+    }
+    Ok(staged)
+}
+
 /// Serialize elided outputs through the shared bounded JSONL stage, then publish the sidecar
 /// whole under `claim`. Inputs and content are borrowed from the existing elision roster; no
 /// artifact-sized copy is made.

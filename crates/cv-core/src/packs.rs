@@ -488,6 +488,12 @@ enum PackBacking {
         path: PathBuf,
         file: std::fs::File,
     },
+    FileSlice {
+        path: PathBuf,
+        file: std::fs::File,
+        base_offset: u64,
+        len: u64,
+    },
     #[cfg(feature = "mmap")]
     Mapped {
         path: PathBuf,
@@ -500,6 +506,7 @@ impl PositionedRead for PackBacking {
     fn byte_len(&self) -> io::Result<u64> {
         match self {
             Self::File { file, .. } => file.byte_len(),
+            Self::FileSlice { len, .. } => Ok(*len),
             #[cfg(feature = "mmap")]
             Self::Mapped { mmap, .. } => mmap.byte_len(),
             Self::Memory(bytes) => bytes.byte_len(),
@@ -509,6 +516,26 @@ impl PositionedRead for PackBacking {
     fn read_exact_at(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
         match self {
             Self::File { path, file } => IoAdmission::global().admit_path(path, || file.read_exact_at(offset, out)),
+            Self::FileSlice {
+                path,
+                file,
+                base_offset,
+                len,
+            } => {
+                let end = offset
+                    .checked_add(out.len() as u64)
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "file slice end overflow"))?;
+                if end > *len {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "file slice read past pack end",
+                    ));
+                }
+                let abs = base_offset
+                    .checked_add(offset)
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "file slice offset overflow"))?;
+                IoAdmission::global().admit_path(path, || file.read_exact_at(abs, out))
+            }
             #[cfg(feature = "mmap")]
             Self::Mapped { path, mmap } => IoAdmission::global().admit_path(path, || mmap.read_exact_at(offset, out)),
             Self::Memory(bytes) => bytes.read_exact_at(offset, out),
@@ -592,6 +619,37 @@ impl SealedPack {
             manifest,
             reader,
             policy_used: actual_policy,
+        })
+    }
+
+    /// Open a `SealedPack` embedded at `[base_offset .. base_offset + len)` inside an open `file`,
+    /// reading only the trailing seek table now and decoding frames on demand via positioned I/O.
+    pub fn open_file_slice(
+        path: &Path,
+        file: std::fs::File,
+        base_offset: u64,
+        len: u64,
+        idx_bytes: &[u8],
+    ) -> Result<Self> {
+        let manifest = PackManifest::from_json_slice(idx_bytes)?;
+        let reader = SeekableReader::open(PackBacking::FileSlice {
+            path: path.to_path_buf(),
+            file,
+            base_offset,
+            len,
+        })
+        .with_context(|| format!("validating zstd seek table of {}", path.display()))?;
+        anyhow::ensure!(
+            reader.index().total_decoded_len() == manifest.total_decoded_len,
+            "pack {} seek table decoded length {} mismatches manifest {}",
+            manifest.pack_id,
+            reader.index().total_decoded_len(),
+            manifest.total_decoded_len
+        );
+        Ok(Self {
+            manifest,
+            reader,
+            policy_used: ByteSourcePolicy::Buffered,
         })
     }
 

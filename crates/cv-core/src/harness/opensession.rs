@@ -181,14 +181,17 @@ impl Adapter for OpenSession {
         true
     }
 
-    /// Written into `out`, else the first registered export source, then read back.
+    /// Written into `out`, else the first registered export source, staging any `.flat.jsonl`
+    /// sidecar before publishing the document, then read back.
     fn write_selection(
         &self,
         _source: &Path,
         selected: &Session,
         out: Option<&Path>,
         new_id: &str,
-    ) -> Result<(PathBuf, Vec<String>)> {
+        sidecar: &[crate::distill::Elided],
+    ) -> Result<(PathBuf, Option<PathBuf>, Vec<String>)> {
+        crate::publish::validate_session_id(new_id)?;
         let out_dir = match out {
             Some(dir) => dir.to_path_buf(),
             None => self
@@ -202,8 +205,15 @@ impl Adapter for OpenSession {
         owned.id = new_id.to_string();
         std::fs::create_dir_all(&out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
         let path = out_dir.join(format!("{new_id}.opensession.json"));
+        let sidecar_path = (!sidecar.is_empty()).then(|| out_dir.join(format!("{new_id}.flat.jsonl")));
         let bytes = serde_json::to_vec_pretty(&document(&owned))?;
-        crate::publish::publish_reader(&path, "opensession", &bytes[..], crate::publish::Claim::New)?;
+        let mut set = crate::publish::Set::new();
+        if let Some(sc_path) = &sidecar_path {
+            let staged_sc = crate::distill::stage_sidecar(sc_path, sidecar)?;
+            set.add(staged_sc, sc_path, crate::publish::Claim::New);
+        }
+        set.stage(&path, "opensession", &bytes[..], crate::publish::Claim::New)?;
+        set.publish()?;
         let back = read_document(&path)?;
         let mut lost = Vec::new();
         if back.messages.len() != owned.messages.len() {
@@ -216,7 +226,7 @@ impl Adapter for OpenSession {
         if back.id != new_id {
             lost.push(format!("id: {new_id} → {} (read back)", back.id));
         }
-        Ok((path, lost))
+        Ok((path, sidecar_path, lost))
     }
 }
 

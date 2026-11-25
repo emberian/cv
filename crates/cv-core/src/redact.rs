@@ -557,9 +557,33 @@ pub fn redact_with(session: &Session, opts: &RedactOptions) -> anyhow::Result<(S
     {
         scrub_value(value, opts, &mut stats);
     }
-    if let Some(remote) = out.git.as_mut().and_then(|g| g.remote.as_mut()) {
-        if let Cow::Owned(scrubbed) = scrub_cow(remote, opts, &mut stats) {
-            *remote = scrubbed;
+    if let Some(git) = out.git.as_mut() {
+        if let Some(branch) = git.branch.as_mut() {
+            if let Cow::Owned(scrubbed) = scrub_cow(branch, opts, &mut stats) {
+                *branch = scrubbed;
+            }
+        }
+        if let Some(remote) = git.remote.as_mut() {
+            if let Cow::Owned(scrubbed) = scrub_cow(remote, opts, &mut stats) {
+                *remote = scrubbed;
+            }
+        }
+    }
+    if let Some(principal) = out.principal.as_mut() {
+        match principal {
+            crate::ir::Principal::String(s) => {
+                if let Cow::Owned(scrubbed) = scrub_cow(s, opts, &mut stats) {
+                    *s = scrubbed;
+                }
+            }
+            crate::ir::Principal::Object(map) => {
+                for (k, v) in map.iter_mut() {
+                    if opts.classes.assignments {
+                        stats.assignments += secrets::fields(v, k);
+                    }
+                    scrub_value(v, opts, &mut stats);
+                }
+            }
         }
     }
     for (k, v) in out.extra.iter_mut() {

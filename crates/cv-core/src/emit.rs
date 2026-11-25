@@ -473,8 +473,83 @@ pub fn emit_verified(
     out_dir: &Path,
     opts: &EmitOptions,
 ) -> Result<(EmitResult, Vec<String>)> {
-    let (result, report) = emit_checked(session, target, out_dir, opts, opts.strict)?;
+    let (result, report) = emit_checked(session, target, out_dir, opts, opts.strict, None)?;
     Ok((result, report.lost_lines()))
+}
+
+/// [`emit_verified`] paired with an IR-prune `.flat.jsonl` sidecar: stages/writes the sidecar
+/// before committing SQLite targets (or rolls back cleanly if sidecar publication fails) so a
+/// reshaped transcript never outlives a failed sidecar write.
+pub fn emit_verified_with_sidecar(
+    session: &Session,
+    target: Harness,
+    out_dir: &Path,
+    opts: &EmitOptions,
+    sidecar: &[crate::distill::Elided],
+) -> Result<(EmitResult, Option<PathBuf>, Vec<String>)> {
+    if sidecar.is_empty() {
+        let (res, lost) = emit_verified(session, target, out_dir, opts)?;
+        return Ok((res, None, lost));
+    }
+    let out_existed = out_dir.exists();
+    let out_was_empty = !out_existed || fs::read_dir(out_dir).is_ok_and(|mut d| d.next().is_none());
+    if let Some(id) = opts.new_id.as_deref() {
+        let top_sc = out_dir.join(format!("{id}.flat.jsonl"));
+        if opts.claim() == crate::publish::Claim::New {
+            crate::publish::refuse_existing(&top_sc, "")?;
+        }
+    }
+    let mut written_in_verify: Option<PathBuf> = None;
+    let emit_res = emit_checked(
+        session,
+        target,
+        out_dir,
+        opts,
+        opts.strict,
+        Some(&mut |staged_src| {
+            #[cfg(feature = "sqlite")]
+            if let stage::StagedSource::Sqlite { result, .. } = staged_src {
+                let sc = result
+                    .path
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .unwrap_or(Path::new("."))
+                    .join(format!("{}.flat.jsonl", result.new_id));
+                crate::distill::write_sidecar(&sc, sidecar, opts.claim())?;
+                written_in_verify = Some(sc);
+            }
+            #[cfg(not(feature = "sqlite"))]
+            let _ = staged_src;
+            Ok(())
+        }),
+    );
+    let (res, report) = match emit_res {
+        Ok(pair) => pair,
+        Err(err) => {
+            if let Some(sc) = written_in_verify {
+                let _ = fs::remove_file(sc);
+            }
+            return Err(err);
+        }
+    };
+    let sidecar_path = match written_in_verify {
+        Some(sc) => sc,
+        None => {
+            let sc = res
+                .path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."))
+                .join(format!("{}.flat.jsonl", res.new_id));
+            if let Err(err) = crate::distill::write_sidecar(&sc, sidecar, opts.claim()) {
+                let anchor = crate::harness::claude::artifacts::anchor(&res.path, &res.new_id);
+                let _ = retract_emitted(target, out_dir, out_existed, out_was_empty, &res, &anchor);
+                return Err(err);
+            }
+            sc
+        }
+    };
+    Ok((res, Some(sidecar_path), report.lost_lines()))
 }
 
 /// Like [`emit_verified`] but returns the structured [`FidelityReport`] instead of rendered strings,
@@ -487,7 +562,7 @@ pub fn emit_report(
     out_dir: &Path,
     opts: &EmitOptions,
 ) -> Result<(EmitResult, FidelityReport)> {
-    emit_checked(session, target, out_dir, opts, false)
+    emit_checked(session, target, out_dir, opts, false, None)
 }
 
 fn emit_checked(
@@ -496,6 +571,7 @@ fn emit_checked(
     out_dir: &Path,
     opts: &EmitOptions,
     bail_on_strict: bool,
+    mut extra_stage_hook: Option<stage::VerifyFn<'_>>,
 ) -> Result<(EmitResult, FidelityReport)> {
     use anyhow::Context as _;
     opts.validate_ids()?;
@@ -510,8 +586,22 @@ fn emit_checked(
         opts,
         Some(&mut |staged_src| {
             let before = before_slot.take().context("verifier callback invoked more than once")?;
-            let mut report = match reparse_staged_projected(target, opts.thinking, staged_src, &opts.parsed_at.demand())
-            {
+            let reparsed_res = match &staged_src {
+                stage::StagedSource::Files { result } => reparse_staged_projected(
+                    target,
+                    opts.thinking,
+                    stage::StagedSource::Files { result },
+                    &opts.parsed_at.demand(),
+                ),
+                #[cfg(feature = "sqlite")]
+                stage::StagedSource::Sqlite { conn, result } => reparse_staged_projected(
+                    target,
+                    opts.thinking,
+                    stage::StagedSource::Sqlite { conn, result },
+                    &opts.parsed_at.demand(),
+                ),
+            };
+            let mut report = match reparsed_res {
                 Ok((reparsed, after)) => diff_projected(target, opts.thinking, session, &reparsed, before, after),
                 Err(e) => FidelityReport {
                     deltas: vec![Divergence {
@@ -544,6 +634,9 @@ fn emit_checked(
                         unexpected.len()
                     );
                 }
+            }
+            if let Some(hook) = extra_stage_hook.as_deref_mut() {
+                hook(staged_src)?;
             }
             report_slot = Some(report);
             Ok(())

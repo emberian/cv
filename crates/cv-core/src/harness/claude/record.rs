@@ -296,6 +296,8 @@ pub(crate) struct Facts {
     /// The context size `message.usage` records, read the way Claude Code reads it
     /// ([`usage_context`]); `None` without a usage object.
     pub usage_in: Option<u64>,
+    /// Whether `message.usage` observed `ephemeral_1h_input_tokens > 0` (1-hour prompt cache tier).
+    pub ephemeral_1h: bool,
     pub blocks: Vec<FactBlock>,
     /// `compactMetadata.preservedSegment.headUuid`.
     pub compact_head: Option<String>,
@@ -386,7 +388,10 @@ impl Facts {
             facts.message = true;
             facts.message_id = message.string("id")?;
             facts.model = message.string("model")?;
-            facts.usage_in = message.get("usage").map(usage_context).transpose()?.flatten();
+            if let Some(usage) = message.get("usage") {
+                facts.usage_in = usage_context(usage)?;
+                facts.ephemeral_1h = usage_has_ephemeral_1h(usage)?;
+            }
             body.content = message.get("content");
             if let Some(blocks) = body.content.map(|c| c.array()).transpose()?.flatten() {
                 for block in blocks {
@@ -589,6 +594,58 @@ pub(crate) fn usage_context(usage: JsonView<'_>) -> Result<Option<u64>> {
         }
     }
     Ok(Some(top))
+}
+
+fn usage_has_ephemeral_1h(usage: JsonView<'_>) -> Result<bool> {
+    let check_obj = |v: JsonView<'_>| -> Result<bool> {
+        let Some(f) = Fields::parse(v, &["ephemeral_1h_input_tokens", "cache_creation"])? else {
+            return Ok(false);
+        };
+        if f.get("ephemeral_1h_input_tokens")
+            .map(|n| n.as_number())
+            .transpose()?
+            .flatten()
+            .and_then(|n| n.as_u64())
+            .is_some_and(|n| n > 0)
+        {
+            return Ok(true);
+        }
+        if let Some(cc) = f
+            .get("cache_creation")
+            .map(|c| Fields::parse(c, &["ephemeral_1h_input_tokens"]))
+            .transpose()?
+            .flatten()
+        {
+            if cc
+                .get("ephemeral_1h_input_tokens")
+                .map(|n| n.as_number())
+                .transpose()?
+                .flatten()
+                .and_then(|n| n.as_u64())
+                .is_some_and(|n| n > 0)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    };
+    if check_obj(usage)? {
+        return Ok(true);
+    }
+    if let Some(iterations) = usage.get("iterations")?.map(|v| v.array()).transpose()?.flatten() {
+        for it in iterations {
+            let it = it?;
+            if let Some(ty) = it.get("type")?.map(|v| v.string()).transpose()?.flatten() {
+                if matches!(ty.as_str(), "advisor_message" | "compaction") {
+                    continue;
+                }
+            }
+            if check_obj(it)? {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 /// One record: update `session` and hand its message (if any) to `sink`. `at` is the record's

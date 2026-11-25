@@ -48,6 +48,9 @@ pub(crate) fn cmd_cat(session: &str, tool_use_id: &str, harness: Option<String>,
         }
     }
     let mut out = std::io::BufWriter::new(std::io::stdout().lock());
+    let bundle = cv_core::bundle::is_bundle(&r.path)
+        .then(|| cv_core::bundle::Bundle::open(&r.path))
+        .transpose()?;
 
     if input {
         for m in &parsed.messages {
@@ -65,7 +68,12 @@ pub(crate) fn cmd_cat(session: &str, tool_use_id: &str, harness: Option<String>,
                             match marker.as_deref() {
                                 Some("dropped") => return usage(format!("input for {id:?} was removed with --drop")),
                                 Some(cmd) if cmd.starts_with("cv cat ") => {
-                                    return print_stashed_input(&sidecar, id, &mut out)
+                                    if let Some(bundle) = &bundle {
+                                        if print_bundled_input(bundle, id, &mut out)? {
+                                            return Ok(());
+                                        }
+                                    }
+                                    return print_stashed_input(&sidecar, id, &mut out);
                                 }
                                 _ => {}
                             }
@@ -74,6 +82,11 @@ pub(crate) fn cmd_cat(session: &str, tool_use_id: &str, harness: Option<String>,
                         return Ok(());
                     }
                 }
+            }
+        }
+        if let Some(bundle) = &bundle {
+            if print_bundled_input(bundle, tool_use_id, &mut out)? {
+                return Ok(());
             }
         }
         if sidecar.try_exists()? {
@@ -86,13 +99,37 @@ pub(crate) fn cmd_cat(session: &str, tool_use_id: &str, harness: Option<String>,
         ));
     }
 
-    if cv_core::bundle::is_bundle(&r.path) {
-        let bundle = cv_core::bundle::Bundle::open(&r.path)?;
-        if print_bundled(&parsed, &bundle, tool_use_id, &mut out)? {
+    if let Some(bundle) = &bundle {
+        if print_bundled(&parsed, bundle, tool_use_id, &mut out)? {
             return Ok(());
         }
     }
     print_result(&parsed, &r.id, tool_use_id, &sidecar, Some(&anchor), &mut out)
+}
+
+fn print_bundled_input(bundle: &cv_core::bundle::Bundle, id: &str, out: &mut impl Write) -> Result<bool> {
+    let call_id = format!("{id}#call");
+    let found = match bundle.stashed_slot(id, "input")? {
+        Some(v) => Some((true, v)),
+        None => match bundle.stashed_slot(&call_id, "input")? {
+            Some(v) => Some((true, v)),
+            None => bundle.stashed_slot(&call_id, "content")?.map(|v| (false, v)),
+        },
+    };
+    let Some((is_input_slot, val)) = found else {
+        return Ok(false);
+    };
+    match val.as_str() {
+        Some(raw) => out.write_all(raw.as_bytes())?,
+        None if is_input_slot => writeln!(out, "{}", serde_json::to_string_pretty(&val)?)?,
+        None => writeln!(
+            out,
+            "{}",
+            serde_json::to_string_pretty(val.get("input").context("stashed call has no input")?)?
+        )?,
+    }
+    out.flush()?;
+    Ok(true)
 }
 
 /// A `.cvbundle` answers from its own records: a persisted output by the path the transcript

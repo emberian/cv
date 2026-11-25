@@ -93,6 +93,7 @@ fn is_jsonl_file(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| e.eq_ignore_ascii_case("jsonl"))
+        && !super::is_cv_sidecar(path)
 }
 
 impl Adapter for Pi {
@@ -112,9 +113,10 @@ impl Adapter for Pi {
         selected: &Session,
         out: Option<&Path>,
         new_id: &str,
-    ) -> Result<(PathBuf, Vec<String>)> {
+        sidecar: &[crate::distill::Elided],
+    ) -> Result<(PathBuf, Option<PathBuf>, Vec<String>)> {
         let dir = out.unwrap_or_else(|| source.parent().unwrap_or(Path::new(".")));
-        branch::write(source, selected, dir, new_id)
+        branch::write_with_sidecar(source, selected, dir, new_id, sidecar)
     }
 
     fn roots(&self) -> Vec<PathBuf> {
@@ -272,5 +274,34 @@ mod tests {
             let roundtrip: Session = serde_json::from_value(serde_json::to_value(&s).unwrap()).unwrap();
             crate::harness::assert_no_flat_keys(&roundtrip);
         }
+    }
+
+    // #tooth `Pi::discover` skips `.flat.jsonl` prune/distill sidecars written beside Pi sessions.
+    #[test]
+    fn discover_skips_flat_jsonl_sidecars() {
+        let world = crate::test_world("pi-skip-sidecar");
+        let dir = world.base.join("sessions");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("s1.jsonl"),
+            jsonl(&[
+                json!({"type":"session","version":3,"id":"s1","cwd":"/work","timestamp":"2026-11-19T10:00:00Z"}),
+                json!({"type":"message","id":"m1","parentId":"s1","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}),
+            ]),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("s1.flat.jsonl"),
+            format!(
+                "{}\n",
+                crate::prune::sidecar_line("t1", "read", &serde_json::Value::Null, "stashed")
+            ),
+        )
+        .unwrap();
+
+        let discovered = Pi::with_roots(vec![dir]).discover().unwrap();
+        assert_eq!(discovered.refs.len(), 1);
+        assert_eq!(discovered.refs[0].id, "s1");
+        assert!(discovered.skipped.is_empty(), "{:?}", discovered.skipped);
     }
 }

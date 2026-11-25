@@ -5733,7 +5733,7 @@ fn export_bundle_survives_source_deletion_and_reports_uncaptured() {
     ]);
     // --redact scrubs the document and the sidecar's stashed original before sealing.
     let clean = w.base.join("clean.cvbundle");
-    let (out, _) = w.cv_ok(&[
+    let (out, redact_err) = w.cv_ok(&[
         "export",
         "claude:bundle-pruned",
         "--format",
@@ -5742,7 +5742,8 @@ fn export_bundle_survives_source_deletion_and_reports_uncaptured() {
         clean.to_str().unwrap(),
         "--redact",
     ]);
-    assert!(out.contains("redacted "), "{out}");
+    assert!(!out.contains("redacted "), "redaction summary belongs on stderr: {out}");
+    assert!(redact_err.contains("redacted "), "{redact_err}");
 
     fs::remove_dir_all(w.home.join(".claude")).unwrap();
     let (cat, _) = w.cv_ok(&["cat", clean.to_str().unwrap(), "toolu_big"]);
@@ -5761,4 +5762,55 @@ fn export_bundle_survives_source_deletion_and_reports_uncaptured() {
     assert!(cat.contains("<persisted-output>"), "{cat}");
     let (_, err) = w.cv_fails(&["export", "claude:bundle-pruned", "--format", "bundle"]);
     assert!(err.contains("pass -o"), "{err}");
+
+    // #tooth `cv cat <bundle> <id> --input` resolves stashed `Write` inputs from the bundled
+    // sidecar after the source store is deleted, and `prune`/`rewind --to` rejects path traversal.
+    let w2 = World::new("export-bundle-input-and-reshape-id");
+    let big_input =
+        serde_json::json!({"file_path": "/work/proj/gen.rs", "content": "pub const X: u32 = 1;\n".repeat(80)});
+    w2.write_session(
+        "bundle-input",
+        &[
+            claude::user("bundle-input", "u1", "2026-01-01T10:00:00Z", "Write gen.rs"),
+            claude::assistant(
+                "a1",
+                "2026-01-01T10:00:01Z",
+                "claude-sonnet-4-5",
+                serde_json::json!([claude::tool_use("toolu_write", "Write", big_input.clone())]),
+            ),
+            claude::tool_result("r1", "2026-01-01T10:00:02Z", "toolu_write", "wrote gen.rs"),
+            claude::user("bundle-input", "u2", "2026-01-01T10:00:03Z", "Done?"),
+            claude::assistant(
+                "a2",
+                "2026-01-01T10:00:04Z",
+                "claude-sonnet-4-5",
+                serde_json::json!([{"type": "text", "text": "Yes."}]),
+            ),
+        ],
+    );
+    let (_, bad_to_err) = w2.cv_fails(&["prune", "claude:bundle-input", "--to", "../escape"]);
+    assert!(bad_to_err.contains("filename component"), "{bad_to_err}");
+    w2.cv_ok(&[
+        "prune",
+        "claude:bundle-input",
+        "--to",
+        "bundle-input-pruned",
+        "--min-size",
+        "256",
+        "--keep-last",
+        "1",
+    ]);
+    let input_bundle = w2.base.join("input.cvbundle");
+    w2.cv_ok(&[
+        "export",
+        "claude:bundle-input-pruned",
+        "--format",
+        "bundle",
+        "-o",
+        input_bundle.to_str().unwrap(),
+    ]);
+    fs::remove_dir_all(w2.home.join(".claude")).unwrap();
+    let (cat_in, _) = w2.cv_ok(&["cat", input_bundle.to_str().unwrap(), "toolu_write", "--input"]);
+    let parsed_in: serde_json::Value = serde_json::from_str(&cat_in).unwrap();
+    assert_eq!(parsed_in, big_input);
 }

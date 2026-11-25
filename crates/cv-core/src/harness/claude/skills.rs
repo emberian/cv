@@ -73,6 +73,9 @@ pub struct SkillsReport {
     pub dropped_chars: usize,
     /// Entries kept in the records the policy read.
     pub kept: usize,
+    /// Per rewritten `invoked_skills` record: `(uuid, dropped_utf8_bytes)`.
+    #[serde(skip)]
+    pub(crate) rewritten_records: Vec<(Option<String>, usize)>,
 }
 
 impl SkillsReport {
@@ -129,13 +132,14 @@ pub(crate) fn apply(
             return copy(&source, row, &mut output);
         };
         let before = skills.len();
+        let mut row_dropped_bytes = 0usize;
         skills.retain(|entry| {
             let keep = policy == SkillsPolicy::DropStale && current(entry, config, cwd.as_deref());
             if !keep {
-                report.dropped_chars += entry
-                    .get("content")
-                    .and_then(Value::as_str)
-                    .map_or(0, |c| c.chars().count());
+                if let Some(c) = entry.get("content").and_then(Value::as_str) {
+                    report.dropped_chars += c.chars().count();
+                    row_dropped_bytes += c.len();
+                }
             }
             keep
         });
@@ -145,6 +149,8 @@ pub(crate) fn apply(
         }
         report.dropped += before - skills.len();
         report.records += 1;
+        let uuid = record.get("uuid").and_then(Value::as_str).map(str::to_owned);
+        report.rewritten_records.push((uuid, row_dropped_bytes));
         if let Some(fields) = record.as_object_mut() {
             for key in RENDERED {
                 fields.remove(key);

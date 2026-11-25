@@ -2694,3 +2694,144 @@ fn prune_write_input_respects_size_and_keep_last() -> Result<()> {
     assert_eq!(written[3]["message"]["content"][0]["input"], big);
     Ok(())
 }
+
+// #tooth Assistant-turn mutations (`Write`/`Edit` input stubbing or `--drop-thinking`) preserve
+// that assistant turn's own recorded input prompt in `first_mutation_prefix`, `skills::apply`
+// latches `first_mutation_prefix`, `last_timestamp` ignores trailing non-API bookkeeping, and
+// 300s default TTL switches to 3600s only when 1h ephemeral cache tokens were observed.
+#[test]
+fn prune_assistant_mutation_prefix_skills_latch_and_ephemeral_cache_ttl() -> Result<()> {
+    use serde_json::json;
+    let now = chrono::Utc::now();
+    let stamp = |age: i64| (now - chrono::Duration::seconds(age)).to_rfc3339();
+
+    // 1. Mutating `a0`'s `Write` input preserves `a0`'s 50,000-token input prompt as cached prefix.
+    let world = crate::test_world("prune-asst-prefix-ttl");
+    let path = fixture(&world.proj, "ok");
+    let mut rows: Vec<Value> = std::fs::read_to_string(&path)?
+        .lines()
+        .map(serde_json::from_str)
+        .collect::<Result<_, _>>()?;
+    let big_write = json!({"file_path":"src/lib.rs","content":"pub fn f() {}\n".repeat(400)});
+    rows[1]["message"]["content"][0] = json!({"type":"tool_use","name":"Write","id":"toolu_1","input":big_write});
+    rows[1]["message"]["usage"] = json!({"input_tokens": 50_000, "output_tokens": 100});
+    rows[3]["message"]["usage"] = json!({"input_tokens": 60_000, "output_tokens": 50});
+    for row in &mut rows {
+        row["timestamp"] = Value::from(stamp(60));
+    }
+    std::fs::write(&path, rows.iter().map(|v| format!("{v}\n")).collect::<String>())?;
+
+    let res = prune_session(
+        crate::Harness::Claude,
+        &path,
+        &PruneOptions {
+            min_size: 512,
+            keep_last: 1,
+            dry_run: true,
+            ..Default::default()
+        },
+    )?;
+    assert_eq!(res.invalidated_suffix_tokens, Some(10_000), "{res:?}");
+    assert!(!res.cache_cold);
+
+    // 2. Trailing `last-prompt` / `custom-title` 10s ago does NOT mask a 10-minute-old API turn
+    //    under the 300s default TTL; observing `ephemeral_1h_input_tokens > 0` extends TTL to 1h.
+    for row in &mut rows {
+        row["timestamp"] = Value::from(stamp(600));
+    }
+    rows.push(json!({
+        "type": "last-prompt",
+        "sessionId": "test-session",
+        "timestamp": stamp(10),
+        "lastPrompt": "recent ui bookkeeping"
+    }));
+    std::fs::write(&path, rows.iter().map(|v| format!("{v}\n")).collect::<String>())?;
+    let cold_default = prune_session(
+        crate::Harness::Claude,
+        &path,
+        &PruneOptions {
+            min_size: 512,
+            keep_last: 1,
+            dry_run: true,
+            ..Default::default()
+        },
+    )?;
+    assert!(
+        cold_default.cache_cold,
+        "600s API age must be cold under 300s default TTL despite 10s bookkeeping row"
+    );
+
+    rows[1]["message"]["usage"] = json!({
+        "input_tokens": 50_000,
+        "output_tokens": 100,
+        "cache_creation_input_tokens": 1_000,
+        "cache_creation": {"ephemeral_1h_input_tokens": 1_000, "ephemeral_5m_input_tokens": 0}
+    });
+    std::fs::write(&path, rows.iter().map(|v| format!("{v}\n")).collect::<String>())?;
+    let warm_1h = prune_session(
+        crate::Harness::Claude,
+        &path,
+        &PruneOptions {
+            min_size: 512,
+            keep_last: 1,
+            dry_run: true,
+            ..Default::default()
+        },
+    )?;
+    assert!(
+        !warm_1h.cache_cold,
+        "600s API age must stay warm when 1h ephemeral cache tokens were observed"
+    );
+
+    // 3. `--skills drop` alone latches `first_mutation_prefix` when `skills.records > 0`.
+    let skill_path = world.proj.join("skills-only.jsonl");
+    let skill_rows = [
+        json!({
+            "type": "attachment",
+            "uuid": "sk1",
+            "parentUuid": null,
+            "sessionId": "skills-only",
+            "isSidechain": false,
+            "attachment": {
+                "type": "invoked_skills",
+                "skills": [{"name": "demo", "path": "userSettings:demo", "content": "skill body ".repeat(200)}]
+            }
+        }),
+        json!({
+            "type": "user",
+            "uuid": "u0",
+            "parentUuid": "sk1",
+            "sessionId": "skills-only",
+            "timestamp": stamp(30),
+            "message": {"role": "user", "content": "hi"}
+        }),
+        json!({
+            "type": "assistant",
+            "uuid": "a0",
+            "parentUuid": "u0",
+            "sessionId": "skills-only",
+            "timestamp": stamp(30),
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "hello"}],
+                "usage": {"input_tokens": 25_000, "output_tokens": 10}
+            }
+        }),
+    ];
+    std::fs::write(
+        &skill_path,
+        skill_rows.iter().map(|v| format!("{v}\n")).collect::<String>(),
+    )?;
+    let skill_res = prune_session(
+        crate::Harness::Claude,
+        &skill_path,
+        &PruneOptions {
+            skills_policy: crate::harness::claude::skills::SkillsPolicy::Drop,
+            dry_run: true,
+            ..Default::default()
+        },
+    )?;
+    assert_eq!(skill_res.skills.records, 1);
+    assert_eq!(skill_res.invalidated_suffix_tokens, Some(25_000), "{skill_res:?}");
+    Ok(())
+}
