@@ -848,6 +848,30 @@ pub trait Adapter: Send + Sync {
         false
     }
 
+    /// A fresh session id in this harness's own spelling. Default: a UUIDv7.
+    fn fresh_session_id(&self) -> String {
+        uuid::Uuid::now_v7().to_string()
+    }
+
+    /// Whether `cv rewind` and `cv prune` write an IR selection of this harness's sessions through
+    /// [`Adapter::write_selection`] rather than through its emitter. Default: false.
+    fn writes_selection(&self) -> bool {
+        false
+    }
+
+    /// Write `selected`, an IR selection read from `source`, as session `new_id` into `out` (or
+    /// this harness's own place for it). Returns the written path and what the read-back did not
+    /// reproduce. Called only when [`Adapter::writes_selection`] is true.
+    fn write_selection(
+        &self,
+        _source: &Path,
+        _selected: &Session,
+        _out: Option<&Path>,
+        _new_id: &str,
+    ) -> Result<(PathBuf, Vec<String>)> {
+        anyhow::bail!("{} writes selections through its emitter", self.harness())
+    }
+
     /// At session start, a recent sibling session in the same project and cwd whose sub-agent
     /// transcripts `cv adopt --join` could carry into `session` (whose transcript is `transcript`).
     /// Default: none; the harness has no adoptable sub-agents.
@@ -1149,6 +1173,11 @@ pub fn has_derived_copies(h: Harness) -> bool {
 /// ([`Adapter::has_cold_rewind`]).
 pub fn has_cold_rewind(h: Harness) -> bool {
     rootless(h).is_some_and(|a| a.has_cold_rewind())
+}
+
+/// Whether `h`'s adapter writes reshaped selections itself ([`Adapter::writes_selection`]).
+pub fn writes_selection(h: Harness) -> bool {
+    rootless(h).is_some_and(|a| a.writes_selection())
 }
 
 /// Resolve an explicit file path via [`Adapter::resolve_path`], restricted to `want` when given.

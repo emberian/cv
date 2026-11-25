@@ -100,6 +100,23 @@ impl Adapter for Pi {
         Harness::Pi
     }
 
+    /// A Pi selection is a native branch of its own file.
+    fn writes_selection(&self) -> bool {
+        true
+    }
+
+    /// Written beside `source` unless `out` says otherwise.
+    fn write_selection(
+        &self,
+        source: &Path,
+        selected: &Session,
+        out: Option<&Path>,
+        new_id: &str,
+    ) -> Result<(PathBuf, Vec<String>)> {
+        let dir = out.unwrap_or_else(|| source.parent().unwrap_or(Path::new(".")));
+        branch::write(source, selected, dir, new_id)
+    }
+
     fn roots(&self) -> Vec<PathBuf> {
         self.roots.clone()
     }

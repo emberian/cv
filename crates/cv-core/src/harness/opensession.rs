@@ -170,6 +170,49 @@ impl Adapter for OpenSession {
     fn resolve_path(&self, path: &Path) -> Option<(SessionRef, Box<dyn Adapter>)> {
         bundle_ref(path).map(|r| (r, Box::new(OpenSession) as Box<dyn Adapter>))
     }
+
+    /// An OpenSession document is the IR's own serialization: a selection is written whole.
+    fn writes_selection(&self) -> bool {
+        true
+    }
+
+    /// Written into `out`, else the first registered export source, then read back.
+    fn write_selection(
+        &self,
+        _source: &Path,
+        selected: &Session,
+        out: Option<&Path>,
+        new_id: &str,
+    ) -> Result<(PathBuf, Vec<String>)> {
+        let out_dir = match out {
+            Some(dir) => dir.to_path_buf(),
+            None => self
+                .roots()
+                .into_iter()
+                .next()
+                .context("opensession doesn't appear installed; pass --out <dir> to write somewhere")?,
+        };
+        let mut owned = selected.clone();
+        owned.materialize()?;
+        owned.id = new_id.to_string();
+        std::fs::create_dir_all(&out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
+        let path = out_dir.join(format!("{new_id}.opensession.json"));
+        let bytes = serde_json::to_vec_pretty(&document(&owned))?;
+        crate::publish::publish_reader(&path, "opensession", &bytes[..], crate::publish::Claim::New)?;
+        let back = read_document(&path)?;
+        let mut lost = Vec::new();
+        if back.messages.len() != owned.messages.len() {
+            lost.push(format!(
+                "messages: {} → {} (read back)",
+                owned.messages.len(),
+                back.messages.len()
+            ));
+        }
+        if back.id != new_id {
+            lost.push(format!("id: {new_id} → {} (read back)", back.id));
+        }
+        Ok((path, lost))
+    }
 }
 
 /// The [`SessionRef`] of a `.cvbundle` at `path`, `None` when it is not one.

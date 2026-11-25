@@ -451,12 +451,12 @@ pub(crate) fn cmd_prune(args: PruneArgs<'_>) -> Result<()> {
 }
 
 /// Harnesses rewound and pruned by IR selection and verified emission: every target with an
-/// emitter that is not Claude (record derivation) or native Antigravity (cold rewind), and Pi,
-/// whose selection is written as a native branch of its own file.
+/// emitter that is not Claude (record derivation) or native Antigravity (cold rewind), and those
+/// whose adapter writes a selection itself (Pi's native branch, an OpenSession document).
 fn ir_reshapeable(h: Harness) -> bool {
     !cv_core::harness::has_derived_copies(h)
         && !cv_core::harness::has_cold_rewind(h)
-        && (matches!(h, Harness::OpenSession | Harness::Pi) || cv_core::emit::supported_targets().contains(&h))
+        && (cv_core::harness::writes_selection(h) || cv_core::emit::supported_targets().contains(&h))
 }
 
 /// Where a selected session is written: `--out`, else the harness's own store.
@@ -478,35 +478,10 @@ fn emit_ir(
     out: Option<PathBuf>,
     new_id: &str,
 ) -> Result<(PathBuf, Vec<String>)> {
-    if target == Harness::Pi {
-        // A branch of the source file, written beside it unless `--out` says otherwise.
-        let dir = out.unwrap_or_else(|| source.parent().unwrap_or(std::path::Path::new(".")).to_path_buf());
-        return cv_core::harness::pi::branch::write(source, session, &dir, new_id);
+    if let Some(adapter) = cv_core::harness::rootless(target).filter(|a| a.writes_selection()) {
+        return adapter.write_selection(source, session, out.as_deref(), new_id);
     }
     let out_dir = ir_out_dir(target, out)?;
-    if target == Harness::OpenSession {
-        // An OpenSession document is the IR's own serialization: written whole, then read back.
-        let mut owned = session.clone();
-        owned.materialize()?;
-        owned.id = new_id.to_string();
-        fs::create_dir_all(&out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
-        let path = out_dir.join(format!("{new_id}.opensession.json"));
-        let bytes = serde_json::to_vec_pretty(&cv_core::harness::opensession::document(&owned))?;
-        cv_core::publish::publish_reader(&path, "opensession", &bytes[..], cv_core::publish::Claim::New)?;
-        let back = cv_core::harness::opensession::read_document(&path)?;
-        let mut lost = Vec::new();
-        if back.messages.len() != owned.messages.len() {
-            lost.push(format!(
-                "messages: {} → {} (read back)",
-                owned.messages.len(),
-                back.messages.len()
-            ));
-        }
-        if back.id != new_id {
-            lost.push(format!("id: {new_id} → {} (read back)", back.id));
-        }
-        return Ok((path, lost));
-    }
     let opts = EmitOptions {
         new_id: Some(new_id.to_string()),
         thinking: cv_core::emit::ThinkingMode::Native,

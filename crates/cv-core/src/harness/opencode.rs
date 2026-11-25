@@ -244,6 +244,11 @@ fn resolve_db(_data: &Path) -> Result<Option<PathBuf>> {
 }
 
 impl Adapter for OpenCode {
+    /// OpenCode spells session ids `ses_<uuid v7, simple>`.
+    fn fresh_session_id(&self) -> String {
+        format!("ses_{}", uuid::Uuid::now_v7().simple())
+    }
+
     /// A synthetic turn whose metadata names the `shell` source: a shell command finished.
     fn record_affordance(
         &self,

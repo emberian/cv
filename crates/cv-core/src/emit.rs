@@ -724,12 +724,9 @@ pub fn supported_targets() -> &'static [Harness] {
     })
 }
 
-/// A fresh session id in `h`'s own spelling: OpenCode's `ses_…`, a UUIDv7 elsewhere.
+/// A fresh session id in `h`'s own spelling ([`crate::harness::Adapter::fresh_session_id`]).
 pub fn fresh_session_id(h: Harness) -> String {
-    match h {
-        Harness::OpenCode => format!("ses_{}", uuid::Uuid::now_v7().simple()),
-        _ => uuid::Uuid::now_v7().to_string(),
-    }
+    crate::harness::rootless(h).map_or_else(|| uuid::Uuid::now_v7().to_string(), |a| a.fresh_session_id())
 }
 
 /// Effective cwd after applying any rehome override.
