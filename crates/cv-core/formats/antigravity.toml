@@ -34,6 +34,18 @@ store = [
   "…/conversation_summaries.db",
 ]
 
+# How the harness continues a session from its store (crates/cv/tests/l2_continuation_matrix.rs).
+# The gateway env is the one tools/harness-corpus/antigravity/generate.py drives.
+[load]
+protocol = "antigravity_gateway"
+binary = "agy"
+verified = ""
+argv = ["--dangerously-skip-permissions", "--conversation", "${session}", "--print", "${prompt}", "--output-format", "stream-json"]
+store_env = { ANTIGRAVITY_APP_DATA_DIR = "${home}/.gemini/antigravity-cli", ANTIGRAVITY_GEMINI_DIR = "${home}/.gemini" }
+provider_env = { AGY_LLM_GATEWAY_URL = "${base_url}", AGY_LLM_GATEWAY_API_KEY = "${api_key}" }
+env = { AGY_CLI_DISABLE_AUTO_UPDATE = "1", AGY_CLI_MODEL_API_MAX_RETRIES = "0" }
+note = "cv has no antigravity emitter yet, so cv port cannot write the store this resumes"
+
 [upstream]
 repo = "Google Antigravity (agy CLI + Antigravity 2.0 / IDE Cortex trajectory_store; corpus 1.0.x–1.5.13)"
 commit = "1.5.13"

@@ -17,6 +17,17 @@ store = [
   "~/.gemini/history/<id>/.project_root",
 ]
 
+# How the harness continues a session from its store (crates/cv/tests/l2_continuation_matrix.rs).
+[load]
+protocol = "gemini_generate_content"
+binary = "gemini"
+verified = ""
+argv = ["--resume", "${session}", "--prompt", "${prompt}"]
+store_env = { GEMINI_CLI_HOME = "${home}" }
+provider_env = { GOOGLE_GEMINI_BASE_URL = "${base_url}", GEMINI_API_KEY = "${api_key}" }
+env = { GEMINI_TELEMETRY_ENABLED = "false" }
+note = "variables read from gemini-cli source (9b6e026); never run: no gemini binary was installed"
+
 [upstream]
 repo = "https://github.com/google-gemini/gemini-cli (~/pug/gemini-cli)"
 commit = "573846625 (tag v0.63.0, on a release branch; also diffed: v0.46.0 85b0c55c1, main 9b6e026)"

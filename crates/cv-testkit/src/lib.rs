@@ -6,6 +6,7 @@
 //! - the real binary, spawned with `HOME`, `CLUSTERVISION_HOME` and the XDG dirs pointing into it,
 //!   and every variable in [`CLEARED_ENV`] removed, so an agent seat's own identity, Claude config
 //!   dir or server token never leaks into a test;
+//! - a loopback model provider ([`loopback`]) for continuing sessions in real harnesses;
 //! - error-path honesty: [`World::cv_fails`] asserts a nonzero exit, a non-empty stderr and no
 //!   panic.
 //!
@@ -19,6 +20,7 @@
 
 pub mod heap;
 pub mod http;
+pub mod loopback;
 
 use serde_json::Value;
 use std::ffi::{OsStr, OsString};

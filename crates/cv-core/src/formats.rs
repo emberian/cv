@@ -123,6 +123,9 @@ pub struct Manifest {
     /// per harness (a dotted prefix disambiguates where a harness reuses a word).
     #[serde(default)]
     pub types: BTreeMap<String, TypeEntry>,
+    /// How the harness continues a session from its store against a caller-chosen provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load: Option<Load>,
 }
 
 impl Manifest {
@@ -166,6 +169,184 @@ impl Manifest {
     }
 }
 
+/// The provider wire a harness speaks when it continues a loaded session: what a loopback
+/// provider must answer for an L2 continuation test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Protocol {
+    /// Anthropic Messages, `POST /v1/messages` (JSON or SSE).
+    AnthropicMessages,
+    /// OpenAI Responses, `POST /v1/responses` (JSON or SSE).
+    OpenaiResponses,
+    /// OpenAI Chat Completions, `POST /v1/chat/completions` (JSON or SSE).
+    OpenaiChat,
+    /// Gemini `POST /v1beta/models/<model>:generateContent` or `:streamGenerateContent`.
+    GeminiGenerateContent,
+    /// Antigravity's LLM gateway (`AGY_LLM_GATEWAY_URL`): Gemini `contents` bodies, SSE replies.
+    AntigravityGateway,
+}
+
+impl Protocol {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Protocol::AnthropicMessages => "anthropic_messages",
+            Protocol::OpenaiResponses => "openai_responses",
+            Protocol::OpenaiChat => "openai_chat",
+            Protocol::GeminiGenerateContent => "gemini_generate_content",
+            Protocol::AntigravityGateway => "antigravity_gateway",
+        }
+    }
+}
+
+/// `[load]`: how the harness itself continues a session in its store, with every store and
+/// provider location supplied by the caller. `${name}` in `argv` and env values expands from
+/// [`LoadVars`]; nothing else is a placeholder, so JSON or TOML values stay literal.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Load {
+    pub protocol: Protocol,
+    /// The executable, looked up on `PATH`.
+    pub binary: String,
+    /// The harness version this invocation was last run against (empty: never run).
+    #[serde(default)]
+    pub verified: String,
+    /// Arguments after `binary`; must name `${session}` and `${prompt}`.
+    pub argv: Vec<String>,
+    /// Variables that relocate every store the harness reads or writes.
+    #[serde(default)]
+    pub store_env: BTreeMap<String, String>,
+    /// Directories a first run of the harness creates; `cv port` takes their presence as the
+    /// harness being installed.
+    #[serde(default)]
+    pub installed_dirs: Vec<String>,
+    /// Variables that point the model client at the provider (`${base_url}`, `${api_key}`).
+    #[serde(default)]
+    pub provider_env: BTreeMap<String, String>,
+    /// Variables that turn off updates, telemetry and other traffic beside the model call.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub note: String,
+}
+
+/// The values a [`Load`] template expands.
+#[derive(Debug, Clone, Copy)]
+pub struct LoadVars<'a> {
+    /// The id the harness resumes (`cv port --json`'s `id`).
+    pub session: &'a str,
+    pub prompt: &'a str,
+    /// The provider origin, no trailing slash (`http://127.0.0.1:4100`).
+    pub base_url: &'a str,
+    pub api_key: &'a str,
+    /// The isolated `$HOME`.
+    pub home: &'a str,
+}
+
+impl Load {
+    pub const PLACEHOLDERS: &'static [&'static str] = &["session", "prompt", "base_url", "api_key", "home"];
+
+    /// Every `${name}` is a known placeholder, `argv` names the session and the prompt, the
+    /// provider location is supplied, and each variable is set by one table only.
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(!self.binary.trim().is_empty(), "[load] binary is empty");
+        let fields: Vec<&String> = self
+            .argv
+            .iter()
+            .chain(&self.installed_dirs)
+            .chain(self.all_env().map(|(_, v)| v))
+            .collect();
+        for field in &fields {
+            for name in placeholders(field)? {
+                anyhow::ensure!(
+                    Self::PLACEHOLDERS.contains(&name),
+                    "[load] unknown placeholder ${{{name}}} in {field:?}"
+                );
+            }
+        }
+        for required in ["session", "prompt"] {
+            anyhow::ensure!(
+                self.argv.iter().any(|a| a.contains(&format!("${{{required}}}"))),
+                "[load] argv never names ${{{required}}}"
+            );
+        }
+        anyhow::ensure!(
+            fields.iter().any(|f| f.contains("${base_url}")),
+            "[load] neither argv nor an env value names ${{base_url}}"
+        );
+        anyhow::ensure!(!self.store_env.is_empty(), "[load] store_env relocates no store");
+        let mut seen = BTreeSet::new();
+        for (key, _) in self.all_env() {
+            anyhow::ensure!(
+                !key.is_empty()
+                    && key
+                        .bytes()
+                        .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_'),
+                "[load] {key:?} is not an environment variable name"
+            );
+            anyhow::ensure!(seen.insert(key), "[load] {key} is set by two tables");
+        }
+        Ok(())
+    }
+
+    /// `argv` expanded.
+    pub fn argv_with(&self, vars: &LoadVars<'_>) -> Vec<String> {
+        self.argv.iter().map(|a| expand(a, vars)).collect()
+    }
+
+    /// `installed_dirs` expanded.
+    pub fn installed_dirs_with(&self, vars: &LoadVars<'_>) -> Vec<String> {
+        self.installed_dirs.iter().map(|d| expand(d, vars)).collect()
+    }
+
+    /// Every variable expanded: store, then provider, then quieting.
+    pub fn env_with(&self, vars: &LoadVars<'_>) -> Vec<(String, String)> {
+        self.all_env().map(|(k, v)| (k.clone(), expand(v, vars))).collect()
+    }
+
+    fn all_env(&self) -> impl Iterator<Item = (&String, &String)> {
+        self.store_env.iter().chain(&self.provider_env).chain(&self.env)
+    }
+}
+
+/// The `${name}`s in `template`; an unterminated `${` is an error.
+fn placeholders(template: &str) -> Result<Vec<&str>> {
+    let mut out = Vec::new();
+    let mut rest = template;
+    while let Some(at) = rest.find("${") {
+        let after = &rest[at + 2..];
+        let end = after
+            .find('}')
+            .with_context(|| format!("[load] unterminated ${{ in {template:?}"))?;
+        out.push(&after[..end]);
+        rest = &after[end + 1..];
+    }
+    Ok(out)
+}
+
+fn expand(template: &str, vars: &LoadVars<'_>) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(at) = rest.find("${") {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + 2..];
+        let Some(end) = after.find('}') else {
+            out.push_str(&rest[at..]);
+            return out;
+        };
+        out.push_str(match &after[..end] {
+            "session" => vars.session,
+            "prompt" => vars.prompt,
+            "base_url" => vars.base_url,
+            "api_key" => vars.api_key,
+            "home" => vars.home,
+            _ => &rest[at..at + 2 + end + 1],
+        });
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// The embedded manifest for `h`.
 pub fn manifest(h: Harness) -> Result<Manifest> {
     let name = h.as_str();
@@ -175,6 +356,9 @@ pub fn manifest(h: Harness) -> Result<Manifest> {
         "formats/{name}.toml declares harness {:?}",
         m.harness
     );
+    if let Some(load) = &m.load {
+        load.validate().with_context(|| format!("formats/{name}.toml [load]"))?;
+    }
     Ok(m)
 }
 
@@ -816,6 +1000,61 @@ mod tests {
         assert_eq!(expected.len(), 128);
     }
 
+    // #tooth A [load] table that cannot address the session, the prompt or the provider, names
+    // an unknown placeholder, or sets one variable twice is a manifest that does not parse.
+    #[test]
+    fn load_tables_validate_and_expand_only_known_placeholders() {
+        let parse = |load: &str| -> Result<Load> {
+            let m: Manifest = toml::from_str(&format!("harness = \"t\"\n[load]\n{load}"))?;
+            let load = m.load.context("no [load]")?;
+            load.validate()?;
+            Ok(load)
+        };
+        let good = r#"protocol = "openai_chat"
+binary = "t"
+argv = ["--resume", "${session}", "${prompt}"]
+store_env = { T_HOME = "${home}/.t" }
+provider_env = { T_CONFIG = "{\"url\":\"${base_url}/v1\",\"key\":\"${api_key}\"}" }"#;
+        let load = parse(good).unwrap();
+        let vars = LoadVars {
+            session: "s1",
+            prompt: "go ${home}",
+            base_url: "http://127.0.0.1:1",
+            api_key: "k",
+            home: "/h",
+        };
+        assert_eq!(load.argv_with(&vars), ["--resume", "s1", "go ${home}"]);
+        assert_eq!(
+            load.env_with(&vars),
+            [
+                ("T_HOME".to_owned(), "/h/.t".to_owned()),
+                (
+                    "T_CONFIG".to_owned(),
+                    r#"{"url":"http://127.0.0.1:1/v1","key":"k"}"#.to_owned()
+                ),
+            ]
+        );
+        for (bad, why) in [
+            (good.replace("${prompt}", "${promt}"), "unknown placeholder"),
+            (good.replace("\"${session}\", ", ""), "never names ${session}"),
+            (good.replace("${base_url}", "http://x"), "${base_url}"),
+            (
+                good.replace("${home}/.t\" }", "${home}/.t\", T_CONFIG = \"x\" }"),
+                "two tables",
+            ),
+            (good.replace("T_HOME", "t-home"), "not an environment variable"),
+            (
+                good.replace("store_env = { T_HOME = \"${home}/.t\" }", ""),
+                "relocates no store",
+            ),
+            (good.replace("${session}", "${session"), "unterminated"),
+            (format!("{good}\nextra = 1"), "unknown field"),
+        ] {
+            let err = format!("{:#}", parse(&bad).unwrap_err());
+            assert!(err.contains(why), "{why}: {err}");
+        }
+    }
+
     #[test]
     fn lookup_prefers_exact_entries_then_the_most_specific_family() {
         let m: Manifest = toml::from_str(
@@ -948,6 +1187,7 @@ mod tests {
             store: vec![],
             upstream: Upstream::default(),
             types: BTreeMap::new(),
+            load: None,
         };
         m.types.insert(
             "record.context.append_message".into(),
@@ -982,6 +1222,7 @@ mod tests {
             store: vec![],
             upstream: Upstream::default(),
             types: BTreeMap::new(),
+            load: None,
         };
         m.types.insert(
             "table.transcript_events".into(),
@@ -1041,6 +1282,7 @@ mod tests {
             store: vec![],
             upstream: Upstream::default(),
             types: BTreeMap::new(),
+            load: None,
         };
         m.types.insert(
             "user".into(),

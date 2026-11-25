@@ -113,6 +113,25 @@ vocabulary. `source_files` includes the wire codec.
 appear in the source, none restates an arm, every `ignore_literals` entry is an arm literal.
 [`cv formats`](cli.md#cv-formats) names record types real sessions carry that the manifest lacks.
 
+A harness `cv port` writes can add `[load]`: how the harness itself continues a session, with
+`${session}`, `${prompt}`, `${base_url}`, `${api_key}` and `${home}` filled in by the caller.
+
+```toml
+[load]
+protocol = "anthropic_messages"   # or openai_responses, openai_chat, gemini_generate_content, antigravity_gateway
+binary = "yours"
+verified = "1.2.3"                # the version last run
+argv = ["--resume", "${session}", "--print", "${prompt}"]
+store_env = { YOURS_HOME = "${home}/.yours" }
+installed_dirs = ["${home}/.yours/sessions"]
+provider_env = { YOURS_BASE_URL = "${base_url}", YOURS_API_KEY = "${api_key}" }
+env = { YOURS_NO_UPDATE = "1" }
+```
+
+`CV_L2=yours cargo test -p clustervision --test l2_continuation_matrix` ports a session into a
+scratch store, runs that command against a loopback provider, and checks the prior turns, the
+paired tool call and result, and the working directory reached the model.
+
 ## Send us your transcripts
 
 Open an issue or PR with a few real session files (`cv export --redact`); old format variants

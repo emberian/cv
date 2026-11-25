@@ -17,6 +17,17 @@ store = [
   "~/.claude/sessions/<pid>.json",
 ]
 
+# How the harness continues a session from its store (crates/cv/tests/l2_continuation_matrix.rs).
+[load]
+protocol = "anthropic_messages"
+binary = "claude"
+verified = "2.1.330"
+argv = ["--bare", "--print", "--resume", "${session}", "--output-format", "json", "${prompt}"]
+store_env = { CLAUDE_CONFIG_DIR = "${home}/.claude" }
+provider_env = { ANTHROPIC_BASE_URL = "${base_url}", ANTHROPIC_API_KEY = "${api_key}" }
+env = { DISABLE_AUTOUPDATER = "1", DISABLE_TELEMETRY = "1", DISABLE_ERROR_REPORTING = "1", CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1" }
+note = "--bare reads auth only from ANTHROPIC_API_KEY: no OAuth, no keychain"
+
 [upstream]
 repo = "Claude Code (Bun binary, ~/.local/share/claude/versions/<v>; npm @anthropic-ai/claude-code)"
 commit = "2.1.323 (corpus tests/corpus/claude/2.1.304; earlier 2.1.296, 2.1.278)"

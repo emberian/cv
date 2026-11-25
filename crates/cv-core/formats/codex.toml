@@ -14,6 +14,24 @@ store = [
   "~/.codex/session_index.jsonl",
 ]
 
+# How the harness continues a session from its store (crates/cv/tests/l2_continuation_matrix.rs).
+# Resume keeps the rollout's provider (`openai`), so `openai_base_url` redirects that provider;
+# OPENAI_BASE_URL does not redirect the model client.
+[load]
+protocol = "openai_responses"
+binary = "codex"
+verified = "0.171.0"
+argv = [
+  "exec", "--skip-git-repo-check",
+  "-c", "openai_base_url=\"${base_url}/v1\"",
+  "-c", "features.enable_request_compression=false",
+  "-c", "check_for_update_on_startup=false",
+  "resume", "${session}", "${prompt}",
+]
+store_env = { CODEX_HOME = "${home}/.codex" }
+installed_dirs = ["${home}/.codex/sessions"]
+provider_env = { CODEX_API_KEY = "${api_key}", OPENAI_API_KEY = "${api_key}" }
+
 [upstream]
 repo = "https://github.com/openai/codex (~/pug/codex)"
 commit = "092d3acd6 (tag rust-v0.162.1, on a release branch; also diffed: rust-v0.161.0 979011409)"

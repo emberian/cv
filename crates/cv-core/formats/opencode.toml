@@ -12,6 +12,18 @@ store = [
   "~/.local/share/opencode/storage/{session,message,part}/** (dead JSON tree, fallback)",
 ]
 
+# How the harness continues a session from its store (crates/cv/tests/l2_continuation_matrix.rs).
+# `run --session` creates a missing session, so a test must see the prior turns arrive.
+[load]
+protocol = "anthropic_messages"
+binary = "opencode"
+verified = "2.2.7"
+argv = ["run", "--standalone", "--session", "${session}", "--model", "anthropic/claude-sonnet-4-5", "--format", "json", "${prompt}"]
+store_env = { XDG_DATA_HOME = "${home}/.local/share", XDG_CONFIG_HOME = "${home}/.config", XDG_STATE_HOME = "${home}/.local/state", XDG_CACHE_HOME = "${home}/.cache" }
+installed_dirs = ["${home}/.local/share/opencode/storage"]
+provider_env = { OPENCODE_CONFIG_CONTENT = "{\"provider\":{\"anthropic\":{\"options\":{\"baseURL\":\"${base_url}/v1\",\"apiKey\":\"${api_key}\"}}}}" }
+env = { OPENCODE_DISABLE_AUTOUPDATE = "1", OPENCODE_DISABLE_MODELS_FETCH = "1", OPENCODE_DISABLE_LSP_DOWNLOAD = "1" }
+
 [upstream]
 repo = "https://github.com/anomalyco/opencode (~/pug/opencode)"
 commit = "b44eea9e20 (tag v2.0.25; also diffed: v1.18.20 7248bc1964, and the earlier pin fee476bb)"
