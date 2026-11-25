@@ -1327,6 +1327,96 @@ mod db {
         touching(&abs, None, true)
     }
 
+    #[derive(Default, Clone)]
+    struct CatalogSessionMeta {
+        title: Option<String>,
+        cwd: Option<String>,
+        created_at: Option<i64>,
+        updated_at: Option<i64>,
+    }
+
+    impl CatalogSessionMeta {
+        fn merge(&mut self, other: Self) {
+            if let Some(t) = other.title {
+                if self.title.as_deref().is_none_or(|cur| t.as_str() > cur) {
+                    self.title = Some(t);
+                }
+            }
+            if let Some(c) = other.cwd {
+                if self.cwd.as_deref().is_none_or(|cur| c.as_str() > cur) {
+                    self.cwd = Some(c);
+                }
+            }
+            if let Some(ts) = other.created_at {
+                self.created_at = Some(self.created_at.map_or(ts, |cur| cur.max(ts)));
+            }
+            if let Some(ts) = other.updated_at {
+                self.updated_at = Some(self.updated_at.map_or(ts, |cur| cur.max(ts)));
+            }
+        }
+    }
+
+    struct CatalogMetaLookup {
+        by_selector: std::collections::HashMap<(String, String), CatalogSessionMeta>,
+        by_native: std::collections::HashMap<(String, String), CatalogSessionMeta>,
+    }
+
+    impl CatalogMetaLookup {
+        fn load<'a>(conn: &Connection, pairs: impl IntoIterator<Item = (&'a str, &'a str)>) -> Result<Self> {
+            let mut seen = std::collections::HashSet::new();
+            let mut by_selector: std::collections::HashMap<(String, String), CatalogSessionMeta> =
+                std::collections::HashMap::new();
+            let mut by_native: std::collections::HashMap<(String, String), CatalogSessionMeta> =
+                std::collections::HashMap::new();
+            if !table_has_column(conn, "sessions", "path") {
+                return Ok(Self { by_selector, by_native });
+            }
+            let mut stmt = conn.prepare_cached(
+                "SELECT path, title, cwd, created_at, updated_at
+                 FROM sessions WHERE harness = ?1 AND id = ?2",
+            )?;
+            for (harness, native_id) in pairs {
+                if !seen.insert((harness.to_owned(), native_id.to_owned())) {
+                    continue;
+                }
+                let parsed_harness = crate::Harness::parse(harness);
+                let rows = stmt.query_map(params![harness, native_id], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        CatalogSessionMeta {
+                            title: r.get(1)?,
+                            cwd: r.get(2)?,
+                            created_at: r.get(3)?,
+                            updated_at: r.get(4)?,
+                        },
+                    ))
+                })?;
+                for row in rows {
+                    let (path, meta) = row?;
+                    if let Some(h) = parsed_harness {
+                        let selector = SessionRef::new(native_id, h, Path::new(&path)).session_selector();
+                        by_selector
+                            .entry((harness.to_owned(), selector))
+                            .or_default()
+                            .merge(meta.clone());
+                    }
+                    by_native
+                        .entry((harness.to_owned(), native_id.to_owned()))
+                        .or_default()
+                        .merge(meta);
+                }
+            }
+            Ok(Self { by_selector, by_native })
+        }
+
+        fn get(&self, harness: &str, native_id: &str, selector: Option<&str>) -> Option<&CatalogSessionMeta> {
+            match selector {
+                Some(sel) => self.by_selector.get(&(harness.to_owned(), sel.to_owned())),
+                None => self.by_native.get(&(harness.to_owned(), native_id.to_owned())),
+            }
+        }
+    }
+
     fn touching(abs: &str, suffix: Option<&str>, edits_only: bool) -> Result<Vec<TouchedSession>> {
         let conn = open().context("the event catalog cannot be opened")?;
         let having = if edits_only { "HAVING edits > 0" } else { "" };
@@ -1337,13 +1427,13 @@ mod db {
             Some(_) => "target = ?1 OR target LIKE ?2 ESCAPE '\\'",
             None => "target = ?1",
         };
+        let selector_expr = if has_selector(&conn) { "es.selector" } else { "NULL" };
         let sql = format!(
             "SELECT es.harness, es.session_id,
                     SUM(e.kind='file_edit') AS edits,
                     SUM(e.kind='file_read') AS reads,
                     MAX(e.ts) AS last_ts,
-                    (SELECT MAX(s.title) FROM sessions s
-                     WHERE s.harness = es.harness AND s.id = es.session_id) AS title,
+                    {selector_expr},
                     es.parent_id, es.agent_id, es.workflow
              FROM events e
              JOIN event_sessions es ON es.id = e.session
@@ -1356,23 +1446,40 @@ mod db {
         let mut stmt = conn.prepare(&sql)?;
         // rusqlite refuses a parameter the SQL never references, so bind exactly what it names.
         let map = |row: &rusqlite::Row| {
-            Ok(TouchedSession {
-                harness: row.get(0)?,
-                session_id: row.get(1)?,
-                edits: row.get(2)?,
-                reads: row.get(3)?,
-                last_ts: row.get(4)?,
-                title: row.get(5)?,
-                parent_id: row.get(6)?,
-                agent_id: row.get(7)?,
-                workflow: row.get(8)?,
+            Ok((
+                row.get::<_, Option<String>>(5)?,
+                TouchedSession {
+                    harness: row.get(0)?,
+                    session_id: row.get(1)?,
+                    edits: row.get(2)?,
+                    reads: row.get(3)?,
+                    last_ts: row.get(4)?,
+                    title: None,
+                    parent_id: row.get(6)?,
+                    agent_id: row.get(7)?,
+                    workflow: row.get(8)?,
+                },
+            ))
+        };
+        let raw: Vec<(Option<String>, TouchedSession)> = match suffix {
+            Some(sfx) => stmt
+                .query_map(params![abs, sfx], map)?
+                .collect::<rusqlite::Result<_>>()?,
+            None => stmt.query_map(params![abs], map)?.collect::<rusqlite::Result<_>>()?,
+        };
+        let lookup = CatalogMetaLookup::load(
+            &conn,
+            raw.iter().map(|(_, s)| (s.harness.as_str(), s.session_id.as_str())),
+        )?;
+        Ok(raw
+            .into_iter()
+            .map(|(selector, mut s)| {
+                s.title = lookup
+                    .get(&s.harness, &s.session_id, selector.as_deref())
+                    .and_then(|m| m.title.clone());
+                s
             })
-        };
-        let rows = match suffix {
-            Some(sfx) => stmt.query_map(params![abs, sfx], map)?,
-            None => stmt.query_map(params![abs], map)?,
-        };
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+            .collect())
     }
 
     /// Every `file_edit` event on one file, with session metadata riding along, oldest first.
@@ -1380,43 +1487,63 @@ mod db {
     /// Matched two ways, mirroring [`sessions_touching`]: exactly by `abs` (the file's absolute
     /// path in the *current* checkout) and by repo-relative suffix `rel` (target equals `rel` or
     /// ends with `/<rel>`), so edits recorded by a session whose checkout lived at a different
-    /// path still surface. The LEFT JOIN is grouped per event row because a session may be
-    /// cataloged at more than one path. Empty on a cold catalog; a catalog error is an error.
+    /// path still surface. Grouped per `event_sessions` row so profile twins sharing `(harness, id)`
+    /// stay distinct and resolve their own `sessions` metadata by selector.
     pub fn edits_touching_file(abs: &str, rel: &str) -> Result<Vec<EditEvent>> {
         let abs = absolutize(abs, None);
         let conn = open().context("the event catalog cannot be opened")?;
         let escaped = rel.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
         let suffix = format!("%/{escaped}");
+        let selector_expr = if has_selector(&conn) { "es.selector" } else { "NULL" };
         // IN-subquery for the same plan-pinning reason as [`sessions_touching`]; the extra join
         // back to event_targets only resolves the matched rows' target strings by rowid.
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             "SELECT es.harness, es.session_id, e.msg_idx, e.ts, t.target,
-                    MAX(s.title), MAX(s.cwd), MAX(s.created_at), MAX(s.updated_at), MAX(es.parent_id)
+                    MAX(es.parent_id), {selector_expr}
              FROM events e
              JOIN event_targets t ON t.id = e.target_id
              JOIN event_sessions es ON es.id = e.session
-             LEFT JOIN sessions s ON s.harness = es.harness AND s.id = es.session_id
              WHERE e.kind = 'file_edit'
                AND e.target_id IN (SELECT id FROM event_targets
                                    WHERE target = ?1 OR target = ?2 OR target LIKE ?3 ESCAPE '\\')
-             GROUP BY es.harness, es.session_id, e.msg_idx, e.ts, t.target
-             ORDER BY e.ts, e.msg_idx",
+             GROUP BY es.id, e.msg_idx, e.ts, t.target
+             ORDER BY e.ts, e.msg_idx, es.id"
+        ))?;
+        let raw: Vec<(Option<String>, EditEvent)> = stmt
+            .query_map(params![&abs, rel, suffix], |row| {
+                Ok((
+                    row.get::<_, Option<String>>(6)?,
+                    EditEvent {
+                        harness: row.get(0)?,
+                        session_id: row.get(1)?,
+                        msg_idx: row.get(2)?,
+                        ts: row.get(3)?,
+                        target: row.get(4)?,
+                        title: None,
+                        cwd: None,
+                        created_at: None,
+                        updated_at: None,
+                        parent_id: row.get(5)?,
+                    },
+                ))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        let lookup = CatalogMetaLookup::load(
+            &conn,
+            raw.iter().map(|(_, e)| (e.harness.as_str(), e.session_id.as_str())),
         )?;
-        let rows = stmt.query_map(params![&abs, rel, suffix], |row| {
-            Ok(EditEvent {
-                harness: row.get(0)?,
-                session_id: row.get(1)?,
-                msg_idx: row.get(2)?,
-                ts: row.get(3)?,
-                target: row.get(4)?,
-                title: row.get(5)?,
-                cwd: row.get(6)?,
-                created_at: row.get(7)?,
-                updated_at: row.get(8)?,
-                parent_id: row.get(9)?,
+        Ok(raw
+            .into_iter()
+            .map(|(selector, mut e)| {
+                if let Some(m) = lookup.get(&e.harness, &e.session_id, selector.as_deref()) {
+                    e.title.clone_from(&m.title);
+                    e.cwd.clone_from(&m.cwd);
+                    e.created_at = m.created_at;
+                    e.updated_at = m.updated_at;
+                }
+                e
             })
-        })?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+            .collect())
     }
 
     /// Same file-matching and ordering semantics as [`edits_touching_file`], additionally
@@ -1426,52 +1553,61 @@ mod db {
         let conn = open().context("the event catalog cannot be opened")?;
         let escaped = rel.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
         let suffix = format!("%/{escaped}");
-        let mut stmt = conn.prepare(
-            "SELECT es.harness, es.session_id, e.msg_idx, e.ts, t.target,
-                    MAX(s.title), MAX(s.cwd), MAX(s.created_at), MAX(s.updated_at), MAX(es.parent_id),
-                    e.hunk_hashes
+        let selector_expr = if has_selector(&conn) { "es.selector" } else { "NULL" };
+        let mut stmt = conn.prepare(&format!(
+            "SELECT es.id, es.harness, es.session_id, e.msg_idx, e.ts, t.target,
+                    es.parent_id, e.hunk_hashes, {selector_expr}
              FROM events e
              JOIN event_targets t ON t.id = e.target_id
              JOIN event_sessions es ON es.id = e.session
-             LEFT JOIN sessions s ON s.harness = es.harness AND s.id = es.session_id
              WHERE e.kind = 'file_edit'
                AND e.target_id IN (SELECT id FROM event_targets
                                    WHERE target = ?1 OR target = ?2 OR target LIKE ?3 ESCAPE '\\')
-             GROUP BY e.rowid
-             ORDER BY e.ts, e.msg_idx, e.rowid",
+             ORDER BY e.ts, e.msg_idx, es.id, e.rowid"
+        ))?;
+        let raw_rows: Vec<(i64, Option<String>, EditHunkEvent)> = stmt
+            .query_map(params![&abs, rel, suffix], |row| {
+                let blob: Option<Vec<u8>> = row.get(7)?;
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<String>>(8)?,
+                    EditHunkEvent {
+                        edit: EditEvent {
+                            harness: row.get(1)?,
+                            session_id: row.get(2)?,
+                            msg_idx: row.get(3)?,
+                            ts: row.get(4)?,
+                            target: row.get(5)?,
+                            title: None,
+                            cwd: None,
+                            created_at: None,
+                            updated_at: None,
+                            parent_id: row.get(6)?,
+                        },
+                        hunk_hashes: decode_hunk_hashes(blob.as_deref()),
+                    },
+                ))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        let lookup = CatalogMetaLookup::load(
+            &conn,
+            raw_rows
+                .iter()
+                .map(|(_, _, item)| (item.edit.harness.as_str(), item.edit.session_id.as_str())),
         )?;
-        let raw_rows = stmt.query_map(params![&abs, rel, suffix], |row| {
-            let blob: Option<Vec<u8>> = row.get(10)?;
-            Ok(EditHunkEvent {
-                edit: EditEvent {
-                    harness: row.get(0)?,
-                    session_id: row.get(1)?,
-                    msg_idx: row.get(2)?,
-                    ts: row.get(3)?,
-                    target: row.get(4)?,
-                    title: row.get(5)?,
-                    cwd: row.get(6)?,
-                    created_at: row.get(7)?,
-                    updated_at: row.get(8)?,
-                    parent_id: row.get(9)?,
-                },
-                hunk_hashes: decode_hunk_hashes(blob.as_deref()),
-            })
-        })?;
-        // Merge rows that share the same `(harness, session_id, msg_idx, ts, target)` key so row
-        // cardinality matches [`edits_touching_file`] 1:1 while preserving all hunk fingerprints.
-        type EditMergeKey = (String, String, i64, Option<i64>, Option<String>);
+        // Merge rows that share the same `(es.id, msg_idx, ts, target)` key so row cardinality
+        // matches [`edits_touching_file`] 1:1 while keeping profile twins apart.
+        type EditMergeKey = (i64, i64, Option<i64>, Option<String>);
         let mut merged: Vec<EditHunkEvent> = Vec::new();
         let mut key_to_idx: std::collections::HashMap<EditMergeKey, usize> = std::collections::HashMap::new();
-        for item in raw_rows {
-            let item = item?;
-            let key = (
-                item.edit.harness.clone(),
-                item.edit.session_id.clone(),
-                item.edit.msg_idx,
-                item.edit.ts,
-                item.edit.target.clone(),
-            );
+        for (es_id, selector, mut item) in raw_rows {
+            if let Some(m) = lookup.get(&item.edit.harness, &item.edit.session_id, selector.as_deref()) {
+                item.edit.title.clone_from(&m.title);
+                item.edit.cwd.clone_from(&m.cwd);
+                item.edit.created_at = m.created_at;
+                item.edit.updated_at = m.updated_at;
+            }
+            let key = (es_id, item.edit.msg_idx, item.edit.ts, item.edit.target.clone());
             if let Some(&idx) = key_to_idx.get(&key) {
                 let dst = &mut merged[idx].hunk_hashes;
                 for h in item.hunk_hashes {
@@ -2316,6 +2452,37 @@ await tools.view_image({ path: "docs/arch.png" });
         }
         let sources = db::preferred_sources([(a.clone(), Provenance::default()), (b.clone(), Provenance::default())]);
         assert_eq!(sources.len(), 2, "each twin is its own output");
+
+        // #tooth Profile twins sharing `(harness, id)` keep separate `title`, `cwd`, and
+        // timestamps across `sessions_touching`, `edits_touching_file`, and `edits_with_hunks_touching_file`.
+        let mut a_cat = a.clone();
+        a_cat.title = Some("Alpha Title".into());
+        a_cat.cwd = Some("/work/alpha".into());
+        a_cat.created_at = chrono::DateTime::from_timestamp(100, 0);
+        a_cat.updated_at = chrono::DateTime::from_timestamp(200, 0);
+        let mut b_cat = b.clone();
+        b_cat.title = Some("Zeta Title".into());
+        b_cat.cwd = Some("/work/zeta".into());
+        b_cat.created_at = chrono::DateTime::from_timestamp(300, 0);
+        b_cat.updated_at = chrono::DateTime::from_timestamp(400, 0);
+        crate::catalog::sync(&[a_cat, b_cat]);
+
+        let touched_a = sessions_editing("/repo/alpha_twin.rs").unwrap();
+        assert_eq!(touched_a[0].title.as_deref(), Some("Alpha Title"));
+        let touched_b = sessions_editing("/repo/beta_twin.rs").unwrap();
+        assert_eq!(touched_b[0].title.as_deref(), Some("Zeta Title"));
+
+        let edits_a = edits_touching_file("/repo/alpha_twin.rs", "alpha_twin.rs").unwrap();
+        assert_eq!(edits_a.len(), 1);
+        assert_eq!(edits_a[0].title.as_deref(), Some("Alpha Title"));
+        assert_eq!(edits_a[0].cwd.as_deref(), Some("/work/alpha"));
+        assert_eq!(edits_a[0].created_at, Some(100));
+        assert_eq!(edits_a[0].updated_at, Some(200));
+
+        let hunks_a = edits_with_hunks_touching_file("/repo/alpha_twin.rs", "alpha_twin.rs").unwrap();
+        assert_eq!(hunks_a.len(), 1);
+        assert_eq!(hunks_a[0].edit.title.as_deref(), Some("Alpha Title"));
+        assert_eq!(hunks_a[0].edit.cwd.as_deref(), Some("/work/alpha"));
     }
 
     #[cfg(feature = "sqlite")]

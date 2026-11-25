@@ -1449,13 +1449,26 @@ impl ColumnarEventStore {
     fn catalog_session_lookup(&self) -> HashMap<(String, String), SessionMetaSnapshot> {
         let mut out = HashMap::new();
         for r in cv_core::cataloged_sessions() {
+            let selector = r.session_selector();
+            let incoming = SessionMetaSnapshot::from_ref(&r);
             let entry = out
-                .entry((r.harness.as_str().to_string(), r.id.clone()))
-                .or_insert_with(|| SessionMetaSnapshot::from_ref(&r));
-            if let Some(t) = r.title {
+                .entry((r.harness.as_str().to_string(), selector))
+                .or_insert_with(|| incoming.clone());
+            if let Some(t) = incoming.title {
                 if entry.title.as_deref().is_none_or(|cur| t.as_str() > cur) {
                     entry.title = Some(t);
                 }
+            }
+            if let Some(c) = incoming.cwd {
+                if entry.cwd.as_deref().is_none_or(|cur| c.as_str() > cur) {
+                    entry.cwd = Some(c);
+                }
+            }
+            if let Some(ts) = incoming.created_at {
+                entry.created_at = Some(entry.created_at.map_or(ts, |cur| cur.max(ts)));
+            }
+            if let Some(ts) = incoming.updated_at {
+                entry.updated_at = Some(entry.updated_at.map_or(ts, |cur| cur.max(ts)));
             }
         }
         out
@@ -1503,17 +1516,17 @@ impl ColumnarEventStore {
             }
 
             let mut out = Vec::with_capacity(grouped.len());
-            for ((harness, session_id), acc) in grouped {
+            for ((harness, selector), acc) in grouped {
                 if edits_only && acc.edits == 0 {
                     continue;
                 }
-                let s_key = session_key(&harness, &session_id);
+                let s_key = session_key(&harness, &selector);
                 let state = manifest.sessions.get(&s_key);
-                let session_id = native_of(&session_id).to_owned();
                 let title = cat
-                    .get(&(harness.clone(), session_id.clone()))
+                    .get(&(harness.clone(), selector.clone()))
                     .and_then(|m| m.title.clone())
                     .or_else(|| state.and_then(|s| s.meta.title.clone()));
+                let session_id = native_of(&selector).to_owned();
                 out.push(TouchedSession {
                     harness,
                     session_id,
@@ -1554,7 +1567,7 @@ impl ColumnarEventStore {
         let suffix = format!("/{rel}");
         let cat = self.catalog_session_lookup();
         self.with_manifest_retry(|manifest| {
-            let mut raw: Vec<(EditSortKey, EditHunkEvent)> = Vec::new();
+            let mut raw: Vec<(EditSortKey, String, EditHunkEvent)> = Vec::new();
             for (seg_ord, seg_entry) in manifest.segments.iter().enumerate() {
                 let reader = ClevReader::open(&self.dir.join(&seg_entry.file))?;
                 let ords = reader.matching_target_ords(&[abs, rel], Some(&suffix));
@@ -1568,13 +1581,16 @@ impl ColumnarEventStore {
                 let edit_rows = (target_bm & reader.by_kind("file_edit")?) - seg_entry.superseded()?;
                 for row_id in edit_rows {
                     let r = reader.materialize_row(row_id)?;
+                    let selector = r.session_id.clone();
                     let item = Self::build_edit_hunk_event(manifest, r, &cat);
                     let sort_key = (item.edit.ts, item.edit.msg_idx, seg_ord, row_id);
-                    raw.push((sort_key, item));
+                    raw.push((sort_key, selector, item));
                 }
             }
             raw.sort_by_key(|a| a.0);
-            Ok(merge_edit_hunk_events(raw.into_iter().map(|(_, item)| item)))
+            Ok(merge_edit_hunk_events(
+                raw.into_iter().map(|(_, sel, item)| (sel, item)),
+            ))
         })
     }
 
@@ -1613,7 +1629,7 @@ impl ColumnarEventStore {
     pub fn edits_matching_hunk(&self, hunk_hash: u64) -> Result<Vec<EditHunkEvent>> {
         let cat = self.catalog_session_lookup();
         self.with_manifest_retry(|manifest| {
-            let mut raw: Vec<(EditSortKey, EditHunkEvent)> = Vec::new();
+            let mut raw: Vec<(EditSortKey, String, EditHunkEvent)> = Vec::new();
             for (seg_ord, seg_entry) in manifest.segments.iter().enumerate() {
                 let reader = ClevReader::open(&self.dir.join(&seg_entry.file))?;
                 let rows = reader.by_hunk_hash(hunk_hash)? - seg_entry.superseded()?;
@@ -1622,13 +1638,16 @@ impl ColumnarEventStore {
                     if r.kind != "file_edit" {
                         continue;
                     }
+                    let selector = r.session_id.clone();
                     let item = Self::build_edit_hunk_event(manifest, r, &cat);
                     let sort_key = (item.edit.ts, item.edit.msg_idx, seg_ord, row_id);
-                    raw.push((sort_key, item));
+                    raw.push((sort_key, selector, item));
                 }
             }
             raw.sort_by_key(|a| a.0);
-            Ok(merge_edit_hunk_events(raw.into_iter().map(|(_, item)| item)))
+            Ok(merge_edit_hunk_events(
+                raw.into_iter().map(|(_, sel, item)| (sel, item)),
+            ))
         })
     }
 
@@ -1757,8 +1776,8 @@ impl ColumnarEventStore {
     ) -> EditHunkEvent {
         let s_key = session_key(&r.harness, &r.session_id);
         let state = manifest.sessions.get(&s_key);
+        let cat_meta = cat.get(&(r.harness.clone(), r.session_id.clone()));
         let session_id = native_of(&r.session_id).to_owned();
-        let cat_meta = cat.get(&(r.harness.clone(), session_id.clone()));
         let title = cat_meta
             .and_then(|m| m.title.clone())
             .or_else(|| state.and_then(|s| s.meta.title.clone()));
@@ -1794,13 +1813,13 @@ impl ColumnarEventStore {
 type EditSortKey = (Option<i64>, i64, usize, u32);
 type EditMergeKey = (String, String, i64, Option<i64>, Option<String>);
 
-fn merge_edit_hunk_events(items: impl IntoIterator<Item = EditHunkEvent>) -> Vec<EditHunkEvent> {
+fn merge_edit_hunk_events(items: impl IntoIterator<Item = (String, EditHunkEvent)>) -> Vec<EditHunkEvent> {
     let mut merged: Vec<EditHunkEvent> = Vec::new();
     let mut key_to_idx: HashMap<EditMergeKey, usize> = HashMap::new();
-    for item in items {
+    for (selector, item) in items {
         let key = (
             item.edit.harness.clone(),
-            item.edit.session_id.clone(),
+            selector,
             item.edit.msg_idx,
             item.edit.ts,
             item.edit.target.clone(),
@@ -3014,5 +3033,76 @@ mod tests {
         assert_eq!(chunked.events_for("claude", "c2", None).unwrap().len(), 1);
         assert_eq!(chunked.events_for("claude", "c3", None).unwrap().len(), 1);
         assert!(!chunked.compact_inner_with_chunk_cap(true, 2).unwrap());
+    }
+
+    /// #tooth `catalog_session_lookup` keys by `(harness, selector)` rather than bare `native_id`
+    /// so profile twins sharing `(harness, id)` never overwrite each other's `title`, `cwd`, or timestamps.
+    #[test]
+    fn tooth_columnar_profile_twins_preserve_distinct_catalog_metadata() {
+        let world = cv_testkit::World::in_process("col-twin-meta", cv_core::env::Env::enter_isolated);
+        let mk_twin = |profile: &str, target: &str, title: &str, cwd: &str, ts: i64| {
+            let dir = world.base.join(profile).join("projects/p");
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("twin.jsonl");
+            let mut r = write_claude_session(
+                &path,
+                "twin",
+                cwd,
+                &[json!({
+                    "type": "assistant", "sessionId": "twin", "cwd": cwd, "uuid": "a1",
+                    "timestamp": "2026-10-05T10:00:00Z",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{
+                            "type": "tool_use", "id": "t1", "name": "Edit",
+                            "input": {"file_path": target, "old_string": "old()", "new_string": "new_twin_line();"}
+                        }]
+                    }
+                })],
+            );
+            r.title = Some(title.into());
+            r.cwd = Some(cwd.into());
+            r.created_at = chrono::DateTime::from_timestamp(ts, 0);
+            r.updated_at = chrono::DateTime::from_timestamp(ts + 50, 0);
+            r
+        };
+        let twin_a = mk_twin(".claude", "/work/alpha/src/mod.rs", "Alpha Twin", "/work/alpha", 1_000);
+        let twin_b = mk_twin(".claude-alt", "/work/zeta/src/mod.rs", "Zeta Twin", "/work/zeta", 9_000);
+        cv_core::catalog::sync(&[twin_a.clone(), twin_b.clone()]);
+
+        let store_dir = world.base.join("clev-twins");
+        let mut store = ColumnarEventStore::open(&store_dir).unwrap();
+        store
+            .sync_sessions(&[twin_a.clone(), twin_b.clone()], false, false)
+            .unwrap();
+
+        let touched_a = store.sessions_editing("/work/alpha/src/mod.rs").unwrap();
+        assert_eq!(touched_a.len(), 1);
+        assert_eq!(touched_a[0].title.as_deref(), Some("Alpha Twin"));
+
+        let touched_b = store.sessions_editing("/work/zeta/src/mod.rs").unwrap();
+        assert_eq!(touched_b.len(), 1);
+        assert_eq!(touched_b[0].title.as_deref(), Some("Zeta Twin"));
+
+        let edits_a = store
+            .edits_touching_file("/work/alpha/src/mod.rs", "alpha/src/mod.rs")
+            .unwrap();
+        assert_eq!(edits_a.len(), 1);
+        assert_eq!(edits_a[0].title.as_deref(), Some("Alpha Twin"));
+        assert_eq!(edits_a[0].cwd.as_deref(), Some("/work/alpha"));
+        assert_eq!(edits_a[0].created_at, Some(1_000));
+        assert_eq!(edits_a[0].updated_at, Some(1_050));
+
+        // Relative suffix matching BOTH twins (`src/mod.rs`) keeps TWO distinct EditEvent rows,
+        // each carrying its own profile's metadata.
+        let both = store
+            .edits_touching_file("/elsewhere/src/mod.rs", "src/mod.rs")
+            .unwrap();
+        assert_eq!(both.len(), 2, "{both:?}");
+        let titles: Vec<_> = both.iter().filter_map(|e| e.title.as_deref()).collect();
+        assert!(
+            titles.contains(&"Alpha Twin") && titles.contains(&"Zeta Twin"),
+            "{titles:?}"
+        );
     }
 }
