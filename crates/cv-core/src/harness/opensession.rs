@@ -380,6 +380,14 @@ fn stream_document(path: &Path, opts: &Demand, sink: &mut dyn MessageSink) -> Re
         let v: Value = serde_json::from_slice(&document).context("bundled OpenSession document")?;
         return read((&v).into(), None, opts, sink);
     }
+    if let Some(stand_in) = crate::harness::store::jsonl::substitute(path) {
+        let source = stand_in.source;
+        let len = stand_in.bytes.byte_len()?;
+        anyhow::ensure!(len != 0, "an OpenSession document is a JSON object");
+        return source.read(ReadInput::Backing(stand_in.bytes, 0, len), Validation::Value, |view| {
+            read(view, Some((path, &source)), opts, sink)
+        });
+    }
     let source = JsonSource::capture(path)?;
     source.read(ReadInput::Document, Validation::Value, |view| {
         read(view, Some((path, &source)), opts, sink)

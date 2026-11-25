@@ -236,6 +236,11 @@ impl At for fs::File {
         crate::harness::store::bytes::read_at(self, bytes, at)
     }
 }
+impl At for dyn super::super::bytes::Positioned + '_ {
+    fn read_at(&self, bytes: &mut [u8], at: u64) -> io::Result<usize> {
+        super::super::bytes::Positioned::read_at(self, bytes, at)
+    }
+}
 impl At for [u8] {
     fn read_at(&self, bytes: &mut [u8], at: u64) -> io::Result<usize> {
         let start = usize::try_from(at).map_or(self.len(), |at| at.min(self.len()));

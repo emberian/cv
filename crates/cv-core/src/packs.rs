@@ -647,6 +647,18 @@ impl SealedPack {
         })
     }
 
+    /// The decoded frame holding `decoded_offset`: its first byte's decoded offset and its bytes,
+    /// XXH64-checked. One frame (at most [`DEFAULT_SEEKABLE_FRAME_SIZE`]) is decoded.
+    pub fn decoded_frame_at(&self, decoded_offset: u64) -> Result<(u64, Vec<u8>)> {
+        let index = self.reader.index();
+        let frame = index
+            .frames_for_range(decoded_offset, 1)?
+            .find(|&i| index.frames()[i].decoded_size > 0)
+            .with_context(|| format!("no frame holds offset {decoded_offset} of pack {}", self.pack_id()))?;
+        let start = index.frames()[frame].decoded_offset;
+        Ok((start, self.reader.decode_frame(frame)?))
+    }
+
     /// Read a content-addressed [`PayloadAddr`] and verify its 32-byte BLAKE3 digest.
     pub fn read_payload(&self, addr: &PayloadAddr) -> Result<Vec<u8>> {
         anyhow::ensure!(

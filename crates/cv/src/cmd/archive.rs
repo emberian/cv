@@ -112,6 +112,7 @@ impl Archive {
                 prior: Vec<PayloadAddr>,
                 checkpoint: SourceCheckpoint,
                 file_name: String,
+                layout: Vec<String>,
             },
         }
         struct StagedSession {
@@ -242,6 +243,7 @@ impl Archive {
                             prior,
                             checkpoint,
                         })) => Content::Native {
+                            layout: cv_core::custody::NativeName::layout_of(&path),
                             path,
                             from,
                             to,
@@ -319,6 +321,7 @@ impl Archive {
                     prior,
                     checkpoint,
                     file_name,
+                    layout,
                 } => {
                     let file = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
                     // The prefix the delta extends must still be the archived one, and the
@@ -375,6 +378,7 @@ impl Archive {
                             total_bytes: *to,
                             prefix_blake3: checkpoint.boundary_blake3.clone(),
                             file_name: file_name.clone(),
+                            layout: layout.clone(),
                         },
                     )
                 }

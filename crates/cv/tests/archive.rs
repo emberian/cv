@@ -470,3 +470,50 @@ fn archive_projects_claude_sessions_that_read_companions() {
     assert_eq!(kind("alphasess"), "portable_projection");
     assert_eq!(kind("betasess"), "native_extents");
 }
+
+/// The kind and custody of each archived session in the newest manifest that names it.
+fn custody_of(w: &cv_testkit::World, id: &str) -> Value {
+    let store = StateStore::at_dir(&w.cv_home);
+    store
+        .list_pack_manifests()
+        .unwrap()
+        .iter()
+        .rev()
+        .find_map(|m| {
+            m.index_meta["sessions"]
+                .as_array()?
+                .iter()
+                .find(|e| e["id"] == id)
+                .map(|e| e["custody"].clone())
+        })
+        .unwrap_or_else(|| panic!("{id} is archived"))
+}
+
+/// #tooth Frozen show and pack of a native session leave nothing behind in `TMPDIR` (the
+/// adapter reads the chain by position; the in-process tooth in `custody.rs` checks that
+/// nothing is staged while it streams).
+#[test]
+fn archive_native_frozen_reads_leave_tmpdir_untouched() {
+    let w = world("archive-native-tmpdir");
+    w.cv_ok(&["archive", "sync"]);
+    assert_eq!(custody_of(&w, "betasess")["kind"], "native_extents");
+    fs::remove_file(w.transcript("betasess")).unwrap();
+    let tmp = w.base.join("tmpdir");
+    fs::create_dir_all(&tmp).unwrap();
+    let tmp_s = tmp.to_str().unwrap();
+    let run = |args: &[&str]| {
+        let (ok, code, out, err) = w.cv_env(args, &[("TMPDIR", tmp_s)]);
+        assert!(ok, "cv {args:?} exited {code}: {err}");
+        out
+    };
+    let hits: Value = serde_json::from_str(&run(&["--frozen", "search", "quokka", "--json"])).unwrap();
+    let key = hits["hits"][0]["session_key"].as_str().unwrap().to_owned();
+    assert!(run(&["--frozen", "show", &key, "--json"]).contains("seventeen"));
+    assert!(run(&["--frozen", "pack", "--session", &key, "--json"]).contains("quokka"));
+    let left: Vec<_> = fs::read_dir(&tmp)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .collect();
+    assert!(left.is_empty(), "{left:?}");
+}

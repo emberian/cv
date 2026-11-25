@@ -5,6 +5,7 @@
 - Search hits carry profile-qualified session selectors; list, search, show, pack, and port fall back to archived packs and hub snapshots.
 - Serve enforces scoped disclosure tiers, separates reader, producer, and inbox credentials, and accepts HttpOnly reader cookies on browser streams and downloads.
 - Archive keeps single-file Claude and Codex sessions as their native bytes, packing only appended lines on each sync; rewritten files start fresh.
+- Archived native sessions read straight from their packs, writing no temporary copy, even under `--frozen`.
 - Indexed file events keep sessions sharing an ID across profiles apart; indexing or reaping one copy no longer erases the other's.
 - Search matches turns by touched file names, tools, commands, and failures; snippets and stored text stay verbatim. Rebuilds the index once.
 - Redaction recognizes structured credentials, cookie jars, and signed URL parameters, and drops secret-bearing reasoning signatures atomically.

@@ -3,7 +3,8 @@
 //! An archived session is held in one of two shapes ([`CustodyKind`]). A single append-only
 //! native file keeps its own bytes as a chain of pack extents, each archive pass adding only the
 //! bytes appended since the last one; reading it back runs the harness's own adapter over the
-//! chain, so verbatim `_record` carriers survive the live file. Every other store, and every
+//! chain by position ([`ExtentChain`]), so verbatim `_record` carriers survive the live file and
+//! nothing is staged on disk. Every other store, and every
 //! entry written before native custody existed, keeps one portable Session IR JSON projection.
 use crate::packs::{pack_idx_path, pack_zst_path, PackManifest as PackFileManifest, PayloadAddr, SealedPack};
 use crate::{Adapter, Demand, Discovered, Harness, MessageSink, Session, SessionKey, SessionRef};
@@ -62,6 +63,9 @@ pub enum CustodyKind {
         prefix_blake3: String,
         /// The live file's name, kept so the adapter reads the same kind of file back.
         file_name: String,
+        /// The names of up to [`NativeName::LAYOUT`] directories above it, outermost first.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        layout: Vec<String>,
     },
 }
 
@@ -105,87 +109,237 @@ impl SourceCheckpoint {
     }
 }
 
-/// Sequential reader over a native extent chain. Pack frames decode one bounded chunk at a time
-/// and every extent's BLAKE3 digest and record span are verified before its last byte is
-/// returned, so a corrupt or substituted extent fails the read instead of feeding an adapter.
+/// A native extent chain as one immutable byte string `[0, len)`, read by position straight
+/// from its packs: no copy of the file is staged in memory or on disk. Each extent's logical
+/// start is precomputed, so a read binary-searches its extent and decodes only the pack frame
+/// holding it; the last [`Self::FRAMES`] decoded frames are kept, so a sequential pass decodes
+/// each frame once. An extent's span must match its pack's record index when the chain opens,
+/// and its whole BLAKE3 digest is checked the first time any of its bytes is read: a corrupt or
+/// substituted extent fails that read instead of feeding an adapter.
+pub struct ExtentChain {
+    /// `(logical start, extent, index into packs)`, ascending; empty extents are left out.
+    spans: Vec<(u64, PayloadAddr, usize)>,
+    packs: Vec<SealedPack>,
+    len: u64,
+    state: std::sync::Mutex<ChainState>,
+}
+
+#[derive(Default)]
+struct ChainState {
+    verified: Vec<bool>,
+    /// Recently decoded frames, newest last: `(pack, frame start, bytes)`.
+    frames: std::collections::VecDeque<(usize, u64, std::sync::Arc<Vec<u8>>)>,
+    /// Frames decoded so far, for tests of the cache.
+    decoded: u64,
+}
+
+impl std::fmt::Debug for ExtentChain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExtentChain")
+            .field("extents", &self.spans.len())
+            .field("len", &self.len)
+            .finish()
+    }
+}
+
+impl ExtentChain {
+    const FRAMES: usize = 2;
+
+    /// Open the packs `extents` live in and check each extent's span against the record index
+    /// of `key`'s anchor there.
+    pub fn open(directory: &Path, key: &SessionKey, extents: &[PayloadAddr]) -> Result<Self> {
+        let anchor = archive_anchor(key);
+        let mut packs: Vec<SealedPack> = Vec::new();
+        let mut spans = Vec::with_capacity(extents.len());
+        let mut start = 0u64;
+        for addr in extents {
+            let at = match packs.iter().position(|p| p.pack_id() == addr.pack_id) {
+                Some(at) => at,
+                None => {
+                    packs.push(SealedPack::open(directory, &addr.pack_id)?);
+                    packs.len() - 1
+                }
+            };
+            let span = packs[at]
+                .record_index()
+                .get(&anchor)
+                .with_context(|| format!("missing custody extent {anchor} in {}", addr.pack_id))?;
+            anyhow::ensure!(
+                span.blake3_digest == addr.blake3_digest
+                    && span.decoded_offset == addr.decoded_offset
+                    && span.length == addr.length,
+                "pack {} extent span mismatch for {anchor}",
+                addr.pack_id
+            );
+            if addr.length == 0 {
+                anyhow::ensure!(
+                    addr.blake3_digest == *blake3::hash(&[]).as_bytes(),
+                    "BLAKE3 digest mismatch in empty custody extent of pack {}",
+                    addr.pack_id
+                );
+                continue;
+            }
+            spans.push((start, addr.clone(), at));
+            start = start
+                .checked_add(addr.length)
+                .context("custody chain length overflows")?;
+        }
+        Ok(Self {
+            state: std::sync::Mutex::new(ChainState {
+                verified: vec![false; spans.len()],
+                ..Default::default()
+            }),
+            spans,
+            packs,
+            len: start,
+        })
+    }
+
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Pack frames decoded so far (a sequential pass decodes each once).
+    pub fn frames_decoded(&self) -> u64 {
+        self.state.lock().map_or(0, |s| s.decoded)
+    }
+
+    /// The decoded frame of `pack` holding `offset`, from the cache or decoded into it.
+    fn frame(&self, state: &mut ChainState, pack: usize, offset: u64) -> Result<(u64, std::sync::Arc<Vec<u8>>)> {
+        if let Some((_, start, bytes)) = state
+            .frames
+            .iter()
+            .find(|(p, start, bytes)| *p == pack && *start <= offset && offset < start + bytes.len() as u64)
+        {
+            return Ok((*start, bytes.clone()));
+        }
+        let (start, bytes) = self.packs[pack].decoded_frame_at(offset)?;
+        let bytes = std::sync::Arc::new(bytes);
+        state.decoded += 1;
+        if state.frames.len() == Self::FRAMES {
+            state.frames.pop_front();
+        }
+        state.frames.push_back((pack, start, bytes.clone()));
+        Ok((start, bytes))
+    }
+
+    /// Hash span `i` whole against its recorded digest, once.
+    fn verify(&self, state: &mut ChainState, i: usize) -> Result<()> {
+        if state.verified[i] {
+            return Ok(());
+        }
+        let (_, addr, pack) = &self.spans[i];
+        let mut hash = blake3::Hasher::new();
+        let (mut at, end) = (addr.decoded_offset, addr.decoded_offset + addr.length);
+        while at < end {
+            let (start, bytes) = self.frame(state, *pack, at)?;
+            let from = (at - start) as usize;
+            let to = bytes.len().min((end - start) as usize);
+            anyhow::ensure!(from < to, "pack {} frame does not advance", addr.pack_id);
+            hash.update(&bytes[from..to]);
+            at = start + to as u64;
+        }
+        anyhow::ensure!(
+            *hash.finalize().as_bytes() == addr.blake3_digest,
+            "BLAKE3 digest mismatch in custody extent of pack {}",
+            addr.pack_id
+        );
+        state.verified[i] = true;
+        Ok(())
+    }
+
+    /// Fill `out` from logical offset `at` until it is full or the chain ends.
+    fn read_into(&self, out: &mut [u8], at: u64) -> Result<usize> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| std::io::Error::other("custody chain poisoned"))?;
+        let mut filled = 0;
+        while filled < out.len() && at + (filled as u64) < self.len {
+            let pos = at + filled as u64;
+            let i = self.spans.partition_point(|(start, ..)| *start <= pos) - 1;
+            self.verify(&mut state, i)?;
+            let (start, addr, pack) = &self.spans[i];
+            let within = pos - start;
+            let offset = addr.decoded_offset + within;
+            let (frame_start, bytes) = self.frame(&mut state, *pack, offset)?;
+            let from = (offset - frame_start) as usize;
+            let n = (out.len() - filled)
+                .min((addr.length - within) as usize)
+                .min(bytes.len() - from);
+            out[filled..filled + n].copy_from_slice(&bytes[from..from + n]);
+            filled += n;
+        }
+        Ok(filled)
+    }
+}
+
+impl crate::harness::store::bytes::Positioned for ExtentChain {
+    fn len(&self) -> u64 {
+        self.len
+    }
+    fn read_at(&self, out: &mut [u8], at: u64) -> std::io::Result<usize> {
+        self.read_into(out, at).map_err(std::io::Error::other)
+    }
+}
+
+impl crate::packs::PositionedRead for ExtentChain {
+    fn byte_len(&self) -> std::io::Result<u64> {
+        Ok(self.len)
+    }
+    fn read_exact_at(&self, offset: u64, out: &mut [u8]) -> std::io::Result<()> {
+        let n = self.read_into(out, offset).map_err(std::io::Error::other)?;
+        if n < out.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "read past the end of a custody chain",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// A cursor over an [`ExtentChain`]: `Read` + `Seek`, sharing the chain's frame cache.
 pub struct ExtentChainReader {
-    directory: PathBuf,
-    anchor: String,
-    extents: std::vec::IntoIter<PayloadAddr>,
-    current: Option<(PayloadAddr, u64, blake3::Hasher)>,
-    pack: Option<SealedPack>,
-    chunk: Vec<u8>,
-    at: usize,
+    chain: std::sync::Arc<ExtentChain>,
+    position: u64,
 }
 
 impl ExtentChainReader {
-    const CHUNK: u64 = 1 << 20;
-
-    pub fn new(directory: &Path, key: &SessionKey, extents: Vec<PayloadAddr>) -> Self {
-        Self {
-            directory: directory.to_owned(),
-            anchor: archive_anchor(key),
-            extents: extents.into_iter(),
-            current: None,
-            pack: None,
-            chunk: Vec::new(),
-            at: 0,
-        }
-    }
-
-    fn refill(&mut self) -> Result<bool> {
-        loop {
-            if let Some((addr, read, hash)) = &mut self.current {
-                if *read < addr.length {
-                    let pack = self.pack.as_ref().context("extent pack not open")?;
-                    let len = (addr.length - *read).min(Self::CHUNK);
-                    self.chunk = pack.read_decoded_range(addr.decoded_offset + *read, len)?;
-                    hash.update(&self.chunk);
-                    *read += len;
-                    self.at = 0;
-                    if *read == addr.length {
-                        anyhow::ensure!(
-                            *hash.finalize().as_bytes() == addr.blake3_digest,
-                            "BLAKE3 digest mismatch in custody extent of pack {}",
-                            addr.pack_id
-                        );
-                    }
-                    return Ok(true);
-                }
-            }
-            let Some(next) = self.extents.next() else {
-                return Ok(false);
-            };
-            if self.pack.as_ref().is_none_or(|p| p.pack_id() != next.pack_id) {
-                self.pack = Some(SealedPack::open(&self.directory, &next.pack_id)?);
-            }
-            let pack = self.pack.as_ref().context("extent pack not open")?;
-            let span = pack
-                .record_index()
-                .get(&self.anchor)
-                .with_context(|| format!("missing custody extent {} in {}", self.anchor, next.pack_id))?;
-            anyhow::ensure!(
-                span.blake3_digest == next.blake3_digest
-                    && span.decoded_offset == next.decoded_offset
-                    && span.length == next.length,
-                "pack {} extent span mismatch for {}",
-                next.pack_id,
-                self.anchor
-            );
-            self.current = Some((next, 0, blake3::Hasher::new()));
-        }
+    pub fn new(chain: std::sync::Arc<ExtentChain>) -> Self {
+        Self { chain, position: 0 }
     }
 }
 
 impl std::io::Read for ExtentChainReader {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
-        if self.at == self.chunk.len() && !self.refill().map_err(std::io::Error::other)? {
-            return Ok(0);
-        }
-        let n = out.len().min(self.chunk.len() - self.at);
-        out[..n].copy_from_slice(&self.chunk[self.at..self.at + n]);
-        self.at += n;
+        let n = self
+            .chain
+            .read_into(out, self.position)
+            .map_err(std::io::Error::other)?;
+        self.position += n as u64;
         Ok(n)
+    }
+}
+
+impl std::io::Seek for ExtentChainReader {
+    fn seek(&mut self, to: std::io::SeekFrom) -> std::io::Result<u64> {
+        let target = match to {
+            std::io::SeekFrom::Start(at) => Some(at),
+            std::io::SeekFrom::End(delta) => self.chain.len.checked_add_signed(delta),
+            std::io::SeekFrom::Current(delta) => self.position.checked_add_signed(delta),
+        };
+        self.position = target.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "seek before the start of a custody chain",
+            )
+        })?;
+        Ok(self.position)
     }
 }
 
@@ -329,11 +483,9 @@ pub fn read_session_bytes(home: &Path, harness: &str, id: &str) -> Result<Option
     Ok(Some(match &entry.custody {
         CustodyKind::PortableProjection => SealedPack::open(&packs, &entry.addr.pack_id)?.read_payload(&entry.addr)?,
         CustodyKind::NativeExtents { extents, .. } => {
-            let mut out = Vec::new();
-            std::io::Read::read_to_end(
-                &mut ExtentChainReader::new(&packs, &entry.key()?, extents.clone()),
-                &mut out,
-            )?;
+            let chain = std::sync::Arc::new(ExtentChain::open(&packs, &entry.key()?, extents)?);
+            let mut out = Vec::with_capacity(usize::try_from(chain.len()).unwrap_or(0));
+            std::io::Read::read_to_end(&mut ExtentChainReader::new(chain), &mut out)?;
             out
         }
     }))
@@ -348,47 +500,39 @@ pub struct Backing {
     source: &'static str,
 }
 
-/// A private directory holding one native file rebuilt from its extent chain, removed on drop.
-struct Staging(PathBuf);
-impl Drop for Staging {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 impl Backing {
-    /// Rebuild the native file from its chain into a private temporary directory and read it
-    /// with the harness's own adapter: the same parser, carriers and lifecycle as the live file.
-    /// The chain streams through bounded chunks; nothing holds the whole file in memory.
+    /// Read the native file with the harness's own adapter, its bytes served by position from
+    /// the extent chain: the same parser, carriers and lifecycle as the live file, with nothing
+    /// written anywhere. The adapter is handed a path that does not exist (the file's own name
+    /// under the layout it was archived from, inside the packs directory), so a sibling it looks
+    /// for beside the file is absent, and its open of that path reads the chain instead.
     fn stream_native(
         &self,
         extents: &[PayloadAddr],
-        file_name: &str,
+        total_bytes: u64,
+        native: &NativeName,
         demand: &Demand,
         sink: &mut dyn MessageSink,
     ) -> Result<Session> {
         let adapter = crate::harness::for_harness(self.key.harness)
             .with_context(|| format!("no adapter for {}", self.key.harness))?;
-        let staging = Staging(std::env::temp_dir().join(format!("cv-custody-{}", uuid::Uuid::new_v4().simple())));
-        let mut builder = std::fs::DirBuilder::new();
-        #[cfg(unix)]
-        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
-        builder.create(&staging.0)?;
-        crate::publish::validate_output_id(file_name).context("archived native file name")?;
-        let path = staging.0.join(file_name);
-        {
-            let mut out = std::fs::File::create_new(&path)?;
-            std::io::copy(
-                &mut ExtentChainReader::new(&self.directory, &self.key, extents.to_vec()),
-                &mut out,
-            )?;
-        }
+        let chain = ExtentChain::open(&self.directory, &self.key, extents)?;
+        anyhow::ensure!(chain.len() == total_bytes, "custody chain length mismatch");
+        let newest = &extents.last().context("empty native custody chain")?.pack_id;
+        let source = crate::json::JsonSource::capture(&pack_zst_path(&self.directory, newest)?)?;
+        let path = native.view_path(&self.directory)?;
         let native = SessionRef {
             id: self.key.native_id.clone(),
-            path,
+            path: path.clone(),
             ..self.reference.clone()
         };
-        let mut session = adapter.stream(&native, demand, sink)?;
+        let stand_in = crate::harness::store::jsonl::Substitute {
+            path,
+            source,
+            bytes: std::sync::Arc::new(crate::harness::store::bytes::ByteSource::positioned(chain)),
+        };
+        let mut session =
+            crate::harness::store::jsonl::with_substitute(stand_in, || adapter.stream(&native, demand, sink))?;
         anyhow::ensure!(
             session.id == self.key.native_id && session.harness == self.key.harness,
             "custody record identity mismatch"
@@ -398,6 +542,43 @@ impl Backing {
         coverage.sources.insert(self.source.to_string());
         coverage.attach(&mut session);
         Ok(session)
+    }
+}
+
+/// Where a native file lived, as far as its adapter reads meaning into it: the file's name and
+/// up to [`NativeName::LAYOUT`] parent directory names (Qwen tells a session from a sub-agent
+/// transcript by `projects/<project>/chats/`).
+pub struct NativeName<'a> {
+    pub file_name: &'a str,
+    pub layout: &'a [String],
+}
+
+impl NativeName<'_> {
+    pub const LAYOUT: usize = 4;
+
+    /// The parent directory names of `path` an archive keeps beside its file name.
+    pub fn layout_of(path: &Path) -> Vec<String> {
+        let mut names: Vec<String> = path
+            .parent()
+            .into_iter()
+            .flat_map(Path::ancestors)
+            .take(Self::LAYOUT)
+            .map_while(|dir| dir.file_name()?.to_str().map(str::to_owned))
+            .collect();
+        names.reverse();
+        names
+    }
+
+    /// `<packs>/.custody-view/<layout…>/<file name>`: a path no file is at.
+    fn view_path(&self, packs: &Path) -> Result<PathBuf> {
+        let mut path = packs.join(".custody-view");
+        for name in self.layout.iter().map(String::as_str).chain([self.file_name]) {
+            crate::publish::validate_output_id(name).context("archived native file name")?;
+            anyhow::ensure!(name != "..", "archived native file name");
+            path.push(name);
+        }
+        anyhow::ensure!(!path.exists(), "{} exists; custody views must not", path.display());
+        Ok(path)
     }
 }
 
@@ -412,8 +593,16 @@ impl Adapter for Backing {
         Ok(Default::default())
     }
     fn stream(&self, _: &SessionRef, demand: &Demand, sink: &mut dyn MessageSink) -> Result<Session> {
-        if let CustodyKind::NativeExtents { extents, file_name, .. } = &self.custody {
-            return self.stream_native(extents, file_name, demand, sink);
+        if let CustodyKind::NativeExtents {
+            extents,
+            total_bytes,
+            file_name,
+            layout,
+            ..
+        } = &self.custody
+        {
+            let name = NativeName { file_name, layout };
+            return self.stream_native(extents, *total_bytes, &name, demand, sink);
         }
         let pack = SealedPack::open(&self.directory, &self.addr.pack_id)?;
         if self.source == "custody_pack" {
@@ -589,4 +778,180 @@ pub fn backing_for(r: &SessionRef) -> Result<Option<Box<dyn Adapter>>> {
 
 pub fn is_pack_ref(r: &SessionRef) -> bool {
     SessionKey::split_selector(&r.id).is_some() && r.path.to_string_lossy().ends_with(".pack.zst")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Seek, SeekFrom};
+
+    fn key() -> SessionKey {
+        SessionKey {
+            producer: "producer-a".into(),
+            profile: PathBuf::new(),
+            harness: Harness::Claude,
+            native_id: "chainsess".into(),
+        }
+    }
+
+    /// A Claude transcript big enough to span many 4 KiB pack frames, with a native carrier.
+    fn transcript() -> Vec<u8> {
+        let mut body = String::new();
+        body.push_str(&format!(
+            "{}\n",
+            serde_json::json!({"type": "file-history-snapshot", "messageId": "snap-1",
+                               "snapshot": {"marker": "carrier-heron-19", "trackedFileBackups": {}}})
+        ));
+        for i in 0..120 {
+            body.push_str(&format!(
+                "{}\n",
+                serde_json::json!({"type": "user", "uuid": format!("u{i}"), "parentUuid": null,
+                                   "timestamp": "2026-01-03T10:00:00Z", "carrierNote": format!("carrier-ibis-{i}"),
+                                   "message": {"role": "user",
+                                               "content": format!("turn {i} {}", "wren ".repeat(60))}})
+            ));
+        }
+        body.into_bytes()
+    }
+
+    /// `bytes` archived as a chain split at `cut`, its two extents in two packs.
+    fn chain(dir: &Path, bytes: &[u8], cut: usize) -> Vec<PayloadAddr> {
+        let anchor = archive_anchor(&key());
+        let mut extents = Vec::new();
+        for (i, part) in [&bytes[..cut], &bytes[cut..]].into_iter().enumerate() {
+            let mut builder = crate::packs::PackBuilder::with_frame_size(dir, format!("pack-{i}"), 4096, 1).unwrap();
+            let mut input = part;
+            extents.push(builder.append_reader(&anchor, &mut input, part.len() as u64).unwrap());
+            builder.seal(crate::publish::Claim::New).unwrap();
+        }
+        extents
+    }
+
+    /// #tooth A chain reads by position: any range across extent and frame boundaries equals
+    /// the file's bytes, seeking lands exactly, and a sequential pass decodes each frame a
+    /// bounded number of times instead of staging the file.
+    #[test]
+    fn extent_chain_reads_by_position_across_extents_and_seeks() {
+        let dir = cv_testkit::temp_dir("custody-chain");
+        let bytes = transcript();
+        let extents = chain(&dir, &bytes, bytes.len() / 3 + 7);
+        let chain = std::sync::Arc::new(ExtentChain::open(&dir, &key(), &extents).unwrap());
+        assert_eq!(chain.len(), bytes.len() as u64);
+        for (at, len) in [
+            (0usize, 10usize),
+            (4090, 20),
+            (bytes.len() / 3, 64),
+            (bytes.len() - 5, 5),
+        ] {
+            let mut out = vec![0; len];
+            crate::packs::PositionedRead::read_exact_at(chain.as_ref(), at as u64, &mut out).unwrap();
+            assert_eq!(out, bytes[at..at + len], "range {at}+{len}");
+        }
+        let mut reader = ExtentChainReader::new(chain.clone());
+        reader.seek(SeekFrom::Start(bytes.len() as u64 / 2)).unwrap();
+        let mut tail = Vec::new();
+        reader.read_to_end(&mut tail).unwrap();
+        assert_eq!(tail, bytes[bytes.len() / 2..]);
+        assert_eq!(reader.seek(SeekFrom::End(-3)).unwrap(), bytes.len() as u64 - 3);
+
+        let fresh = std::sync::Arc::new(ExtentChain::open(&dir, &key(), &extents).unwrap());
+        let mut all = Vec::new();
+        ExtentChainReader::new(fresh.clone()).read_to_end(&mut all).unwrap();
+        assert_eq!(all, bytes);
+        let frames = bytes.len().div_ceil(4096) as u64 + 2;
+        assert!(
+            fresh.frames_decoded() <= 2 * frames,
+            "{} frames decoded for {frames} frames",
+            fresh.frames_decoded()
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// #tooth An extent whose bytes do not hash to its recorded digest fails the first read
+    /// that touches it.
+    #[test]
+    fn extent_chain_rejects_an_extent_with_another_digest() {
+        let dir = cv_testkit::temp_dir("custody-chain-digest");
+        let bytes = transcript();
+        let mut extents = chain(&dir, &bytes, 100);
+        extents[1].blake3_digest[0] ^= 1;
+        assert!(
+            ExtentChain::open(&dir, &key(), &extents).is_err(),
+            "the span check refuses it"
+        );
+        // The same bytes under an index forged to agree with the wrong digest: the span check
+        // passes, the content check does not.
+        let idx = crate::packs::pack_idx_path(&dir, "pack-1").unwrap();
+        let mut manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&idx).unwrap()).unwrap();
+        for span in manifest["record_index"]["records"].as_array_mut().unwrap() {
+            span["blake3_digest"] = extents[1].digest_hex().into();
+        }
+        std::fs::write(&idx, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let chain = ExtentChain::open(&dir, &key(), &extents).unwrap();
+        let mut out = vec![0; 8];
+        assert!(crate::packs::PositionedRead::read_exact_at(&chain, 0, &mut out).is_ok());
+        assert!(crate::packs::PositionedRead::read_exact_at(&chain, 200, &mut out).is_err());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// #tooth The harness adapter reads an archived native file straight from its chain: the
+    /// path it opens is a view no file is at, no byte spill is created, no staging directory
+    /// appears while it streams, and the verbatim carrier record survives.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn native_custody_streams_through_the_adapter_without_staging() {
+        let dir = cv_testkit::temp_dir("custody-stream");
+        let bytes = transcript();
+        let extents = chain(&dir, &bytes, bytes.len() / 2);
+        let key = key();
+        let reference = SessionRef::new(key.selector(), Harness::Claude, pack_zst_path(&dir, "pack-1").unwrap());
+        let backing = Backing {
+            reference: reference.clone(),
+            key,
+            directory: dir.clone(),
+            addr: extents[1].clone(),
+            custody: CustodyKind::NativeExtents {
+                extents,
+                total_bytes: bytes.len() as u64,
+                prefix_blake3: String::new(),
+                file_name: "chainsess.jsonl".into(),
+                layout: vec!["projects".into(), "-work-proj".into()],
+            },
+            source: "custody_pack",
+        };
+        let staging = || {
+            std::fs::read_dir(std::env::temp_dir())
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_string_lossy().starts_with("cv-custody-"))
+                .count()
+        };
+        let before = staging();
+        let spills = crate::harness::store::bytes::spills_created();
+        crate::harness::store::jsonl::OPENED.with(|o| o.borrow_mut().clear());
+        let mut texts = Vec::new();
+        let mut during = 0;
+        let mut sink = |m: crate::Message| {
+            during = during.max(staging());
+            texts.push(serde_json::to_string(&m).unwrap());
+            crate::Flow::Continue
+        };
+        let session = Adapter::stream(&backing, &reference, &Demand::RICH.with_records(), &mut sink).unwrap();
+        assert_eq!(session.id, "chainsess");
+        assert_eq!(texts.len(), 120, "every turn reads");
+        assert!(texts.iter().any(|t| t.contains("turn 119 wren")));
+        assert!(
+            texts.iter().any(|t| t.contains("carrier-ibis-77")),
+            "each message keeps its verbatim record"
+        );
+        assert_eq!(during, before, "no staging directory while streaming");
+        assert_eq!(crate::harness::store::bytes::spills_created(), spills, "no byte spill");
+        let opened = crate::harness::store::jsonl::OPENED.with(|o| o.borrow().clone());
+        assert!(!opened.is_empty());
+        for path in opened {
+            assert!(path.starts_with(dir.join(".custody-view")), "{}", path.display());
+            assert!(!path.exists(), "{} is a view, not a file", path.display());
+        }
+        std::fs::remove_dir_all(dir).ok();
+    }
 }

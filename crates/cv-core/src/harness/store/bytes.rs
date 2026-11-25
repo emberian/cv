@@ -105,6 +105,15 @@ enum Bytes {
     Memory(Vec<u8>),
     File(Spill),
     Arena { spill: Spill, append: std::sync::Mutex<()> },
+    Positioned(Box<dyn Positioned>),
+}
+
+/// Immutable bytes that are neither in memory nor a file of their own, read by position: an
+/// archived native file served from its pack extents ([`crate::custody`]). Reads may be short;
+/// 0 is the end.
+pub trait Positioned: Send + Sync + std::fmt::Debug {
+    fn len(&self) -> u64;
+    fn read_at(&self, out: &mut [u8], at: u64) -> std::io::Result<usize>;
 }
 
 /// Writable until finish, then immutable. Partial/failed operations own and remove their spill.
@@ -198,6 +207,18 @@ impl ByteStage {
     }
 }
 impl ByteSource {
+    /// Bytes served by `source`: nothing is copied, staged or spilled.
+    pub fn positioned(source: impl Positioned + 'static) -> Self {
+        Self {
+            bytes: Bytes::Positioned(Box::new(source)),
+        }
+    }
+    pub(crate) fn as_positioned(&self) -> Option<&dyn Positioned> {
+        match &self.bytes {
+            Bytes::Positioned(source) => Some(source.as_ref()),
+            _ => None,
+        }
+    }
     pub(crate) fn is_arena(&self) -> bool {
         matches!(self.bytes, Bytes::Arena { .. })
     }
@@ -250,13 +271,14 @@ impl ByteSource {
             Bytes::Memory(bytes) => Ok(bytes.len() as u64),
             Bytes::File(spill) => Ok(spill.file.as_ref().unwrap().metadata()?.len()),
             Bytes::Arena { .. } => Ok(self.file()?.metadata()?.len()),
+            Bytes::Positioned(source) => Ok(source.len()),
         }
     }
     pub(crate) fn file(&self) -> std::io::Result<std::fs::File> {
         match &self.bytes {
             Bytes::File(spill) => spill.file.as_ref().unwrap().try_clone(),
             Bytes::Arena { spill, .. } => spill.file.as_ref().unwrap().try_clone(),
-            Bytes::Memory(_) => Err(std::io::Error::other("expected file-backed bytes")),
+            Bytes::Memory(_) | Bytes::Positioned(_) => Err(std::io::Error::other("expected file-backed bytes")),
         }
     }
 
@@ -279,7 +301,7 @@ impl ByteSource {
     pub(crate) fn with_bytes<T>(&self, f: impl FnOnce(&[u8]) -> T) -> std::io::Result<Option<T>> {
         match &self.bytes {
             Bytes::Memory(bytes) => Ok(Some(f(bytes))),
-            Bytes::Arena { .. } => Ok(None),
+            Bytes::Arena { .. } | Bytes::Positioned(_) => Ok(None),
             Bytes::File(spill) => {
                 let file = spill.file.as_ref().unwrap();
                 if file.metadata()?.len() == 0 {
@@ -302,6 +324,13 @@ impl ByteSource {
                 file: spill.file.as_ref().unwrap(),
                 position: 0,
             }))),
+            Bytes::Positioned(source) => Ok(Box::new(std::io::BufReader::with_capacity(
+                super::IO_CHUNK,
+                PositionedReader {
+                    source: source.as_ref(),
+                    position: 0,
+                },
+            ))),
         }
     }
     /// Publish only after the owning operation has validated its successful completion.
@@ -311,8 +340,19 @@ impl ByteSource {
                 out.write_all(bytes)?;
                 Ok(bytes.len() as u64)
             }
-            Bytes::File(_) | Bytes::Arena { .. } => std::io::copy(&mut self.reader()?, out),
+            Bytes::File(_) | Bytes::Arena { .. } | Bytes::Positioned(_) => std::io::copy(&mut self.reader()?, out),
         }
+    }
+}
+struct PositionedReader<'a> {
+    source: &'a dyn Positioned,
+    position: u64,
+}
+impl std::io::Read for PositionedReader<'_> {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.source.read_at(bytes, self.position)?;
+        self.position += n as u64;
+        Ok(n)
     }
 }
 struct FileReader<F> {

@@ -4,7 +4,7 @@
 //! in-memory build keeps memchr speed. Offsets count consumed bytes, never underlying reads or
 //! serde lookahead. Scalar/depth acceptance stays in `store::json`.
 
-use super::super::bytes::{read_at, ByteSource};
+use super::super::bytes::{read_at, ByteSource, Positioned};
 use crate::lazy::INLINE_MAX;
 use anyhow::{Context, Result};
 use std::borrow::Cow;
@@ -78,6 +78,22 @@ enum Backing<'a> {
     /// to be UTF-8 (a `str`), so borrowed strings and keys need no second check.
     Bytes(&'a [u8], u64, bool),
     File(File),
+    Positioned(&'a dyn Positioned),
+}
+
+/// A positioned backing a cursor reads windows from.
+#[derive(Clone, Copy)]
+enum At<'a> {
+    File(&'a File),
+    Positioned(&'a dyn Positioned),
+}
+impl At<'_> {
+    fn read_at(self, bytes: &mut [u8], at: u64) -> io::Result<usize> {
+        match self {
+            At::File(file) => read_at(file, bytes, at),
+            At::Positioned(source) => source.read_at(bytes, at),
+        }
+    }
 }
 
 /// One source of bytes shared by all projected fields in an operation: the captured original (a
@@ -127,9 +143,10 @@ impl<'a> RangeSource<'a> {
     }
     fn of_bytes(captured: Option<crate::json::JsonSource>, bytes: &'a ByteSource, original: bool) -> Result<Self> {
         let len = bytes.byte_len()?;
-        let backing = match bytes.memory_bytes() {
-            Some(memory) => Backing::Bytes(memory, 0, false),
-            None => Backing::File(bytes.file()?),
+        let backing = match (bytes.memory_bytes(), bytes.as_positioned()) {
+            (Some(memory), _) => Backing::Bytes(memory, 0, false),
+            (None, Some(source)) => Backing::Positioned(source),
+            (None, None) => Backing::File(bytes.file()?),
         };
         Ok(Self {
             backing,
@@ -207,7 +224,8 @@ impl<'a> RangeSource<'a> {
         Ok(Cursor {
             backing: match &self.backing {
                 Backing::Bytes(bytes, base, _) => CursorBacking::Bytes(bytes, *base),
-                Backing::File(file) => CursorBacking::File(file),
+                Backing::File(file) => CursorBacking::File(At::File(file)),
+                Backing::Positioned(source) => CursorBacking::File(At::Positioned(*source)),
             },
             index: Some(&self.index),
             end: range.end()?,
@@ -226,12 +244,14 @@ impl<'a> RangeSource<'a> {
         if let Some(bytes) = self.borrow(Range { len: 1, ..range }) {
             return Ok(Some(bytes[0]));
         }
-        let Backing::File(file) = &self.backing else {
-            unreachable!()
+        let at = match &self.backing {
+            Backing::File(file) => At::File(file),
+            Backing::Positioned(source) => At::Positioned(*source),
+            Backing::Bytes(..) => unreachable!(),
         };
         let mut byte = [0];
         loop {
-            match read_at(file, &mut byte, range.offset) {
+            match at.read_at(&mut byte, range.offset) {
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) => return Err(e.into()),
                 Ok(0) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "JSON source was truncated").into()),
@@ -272,8 +292,10 @@ pub(crate) fn scoped<T>(
     f: impl FnOnce(&RangeSource<'_>) -> Result<T>,
 ) -> Result<T> {
     #[cfg(feature = "mmap")]
-    if decoded.is_some()
-        || crate::io_admission::byte_source_policy(captured.path()) == crate::io_admission::ByteSourcePolicy::Mapped
+    if decoded.is_some_and(|bytes| bytes.as_positioned().is_none())
+        || (decoded.is_none()
+            && crate::io_admission::byte_source_policy(captured.path())
+                == crate::io_admission::ByteSourcePolicy::Mapped)
     {
         let mut callback = Some(f);
         if let Some(bytes) = decoded {
@@ -339,7 +361,7 @@ pub(crate) fn scoped<T>(
 
 enum CursorBacking<'a> {
     Bytes(&'a [u8], u64),
-    File(&'a File),
+    File(At<'a>),
 }
 pub(crate) struct Cursor<'a> {
     backing: CursorBacking<'a>,
@@ -548,7 +570,7 @@ impl BufRead for Cursor<'_> {
                 let n = (self.end - self.position).min(WINDOW as u64) as usize;
                 self.window.resize(n, 0);
                 let n = loop {
-                    match read_at(file, &mut self.window, self.position) {
+                    match file.read_at(&mut self.window, self.position) {
                         Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                         Err(e) => {
                             self.read_error = Some(e.kind());

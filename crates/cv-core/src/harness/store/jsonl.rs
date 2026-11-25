@@ -42,10 +42,47 @@ impl ranges::At for Read {
 #[cfg(test)]
 thread_local! { pub(crate) static OPENED: std::cell::RefCell<Vec<std::path::PathBuf>> = const { std::cell::RefCell::new(Vec::new()) }; }
 
+thread_local! {
+    static SUBSTITUTE: std::cell::RefCell<Option<Substitute>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Bytes standing in for a session file that is not on disk: an archived native file read from
+/// its pack extents. `source` is the capture its views carry (the immutable pack that holds the
+/// newest extent), `bytes` the file's own bytes, read by position.
+#[derive(Clone)]
+pub(crate) struct Substitute {
+    pub path: std::path::PathBuf,
+    pub source: crate::json::JsonSource,
+    pub bytes: std::sync::Arc<super::bytes::ByteSource>,
+}
+
+/// Run `f` with `substitute` answering this thread's opens of its path, for an adapter that reads
+/// the file by path ([`Read::open`], OpenSession's document read).
+#[cfg(feature = "sqlite")]
+pub(crate) fn with_substitute<T>(substitute: Substitute, f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<Substitute>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SUBSTITUTE.with(|s| *s.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore = Restore(SUBSTITUTE.with(|s| s.replace(Some(substitute))));
+    f()
+}
+
+/// The substitute standing in for `path` on this thread, if any.
+pub(crate) fn substitute(path: &Path) -> Option<Substitute> {
+    SUBSTITUTE.with(|s| s.borrow().as_ref().filter(|s| s.path == path).cloned())
+}
+
 impl Read {
     pub(crate) fn open(path: &Path) -> anyhow::Result<Self> {
         #[cfg(test)]
         OPENED.with(|paths| paths.borrow_mut().push(path.to_path_buf()));
+        if let Some(stand_in) = substitute(path) {
+            let len = stand_in.bytes.byte_len()?;
+            return Ok(Self::with(stand_in.source)?.decoded(stand_in.bytes, len));
+        }
         Self::with(crate::json::JsonSource::capture(path)?)
     }
 
@@ -469,7 +506,7 @@ fn for_each_line(
     to: u64,
     visit: impl FnMut(Line<'_>) -> anyhow::Result<crate::stream::Flow>,
 ) -> anyhow::Result<()> {
-    lines(source, file, None, from, to, visit)
+    lines(source, file, Some(file), None, from, to, visit)
 }
 
 /// [`for_each_line`] over the source's private decoded bytes (a decompressed copy, `len` bytes
@@ -481,14 +518,21 @@ fn for_each_decoded_line(
     from: u64,
     visit: impl FnMut(Line<'_>) -> anyhow::Result<crate::stream::Flow>,
 ) -> anyhow::Result<()> {
-    lines(source, &backing.file()?, Some((backing, len)), from, len, visit)
+    if let Some(positioned) = backing.as_positioned() {
+        // Served by position (an archived native file's extents): framed in windows, never mapped.
+        return lines(source, positioned, None, Some((backing, len)), from, len, visit);
+    }
+    let file = backing.file()?;
+    lines(source, &file, Some(&file), Some((backing, len)), from, len, visit)
 }
 
 type Decoded<'b> = Option<(&'b std::sync::Arc<super::bytes::ByteSource>, u64)>;
 
-fn lines(
+/// `file` frames the lines; `map`, the same bytes as a file, may be mapped instead.
+fn lines<S: ranges::At + ?Sized>(
     source: &crate::json::JsonSource,
-    file: &File,
+    file: &S,
+    map: Option<&File>,
     decoded: Decoded<'_>,
     from: u64,
     to: u64,
@@ -496,13 +540,16 @@ fn lines(
 ) -> anyhow::Result<()> {
     use crate::stream::Flow;
     #[cfg(feature = "mmap")]
-    if decoded.is_some()
-        || crate::io_admission::byte_source_policy(source.path()) == crate::io_admission::ByteSourcePolicy::Mapped
-    {
-        if let Some(mapped) = mapped_lines(source, file, decoded, from, to, &mut visit) {
+    if let Some(map) = map.filter(|_| {
+        decoded.is_some()
+            || crate::io_admission::byte_source_policy(source.path()) == crate::io_admission::ByteSourcePolicy::Mapped
+    }) {
+        if let Some(mapped) = mapped_lines(source, map, decoded, from, to, &mut visit) {
             return mapped;
         }
     }
+    #[cfg(not(feature = "mmap"))]
+    let _ = map;
     let mut frames = ranges::records(
         file,
         ranges::Range {
