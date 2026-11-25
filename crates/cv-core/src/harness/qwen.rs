@@ -807,7 +807,8 @@ mod tests {
         assert!(resumed.messages.iter().flat_map(|m| &m.content).any(|b| matches!(
             b,
             Block::Text {
-                text: crate::Text::Source(_)
+                text: crate::Text::Source(_),
+                ..
             }
         )));
         assert_eq!(

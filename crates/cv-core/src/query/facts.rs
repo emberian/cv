@@ -1480,10 +1480,12 @@ mod tests {
             name: "Edit".into(),
             namespace: None,
             input: serde_json::json!({"file_path":"./a.rs","rich":"discarded rich argument".repeat(8192)}).into(),
+            extensions: Default::default(),
         });
         m.content.push(Block::Image {
             media_type: None,
             data_ref: Some("discarded image reference".repeat(8192)),
+            extensions: Default::default(),
         });
         for i in 0..1000 {
             m.model = Some(format!("EarlyModel-{i}"));
@@ -1576,6 +1578,7 @@ mod tests {
             name: "Edit".into(),
             namespace: None,
             input,
+            extensions: Default::default(),
         });
         std::fs::remove_file(&path).unwrap();
         let r = SessionRef::new("facts", crate::Harness::Claude, world.transcript("missing"));

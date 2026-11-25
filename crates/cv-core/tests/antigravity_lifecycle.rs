@@ -95,7 +95,7 @@ fn text(session: &Session) -> String {
         .iter()
         .flat_map(|m| &m.content)
         .filter_map(|block| {
-            if let Block::Text { text } = block {
+            if let Block::Text { text, .. } = block {
                 Some(text.try_resolve(&resolver).unwrap().into_owned())
             } else {
                 None
@@ -505,12 +505,14 @@ fn real_writer_native_background_completion_and_image_survive() {
     assert_eq!(session.messages.len(), 7);
     assert!(text(&session).contains("background fixture done"));
     let expected = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLbtAAAAABJRU5ErkJggg==";
-    assert!(session
-        .messages
-        .iter()
-        .flat_map(|m| &m.content)
-        .any(|block| matches!(block,
-        Block::Image { media_type: Some(mime), data_ref: Some(data) } if mime == "image/png" && data == expected)));
+    assert!(
+        session
+            .messages
+            .iter()
+            .flat_map(|m| &m.content)
+            .any(|block| matches!(block,
+        Block::Image { media_type: Some(mime), data_ref: Some(data) , .. } if mime == "image/png" && data == expected))
+    );
     let limitations = session.extra["cv"]["read_coverage"]["limitations"].as_array().unwrap();
     assert!(limitations.iter().all(|v| v != "missing_attachments"));
 

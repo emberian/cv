@@ -100,17 +100,17 @@ fn fixture(base: &Path) -> Result<Session> {
     let input = Json::source(&path, 0, bytes.len() as u64)?;
     let mut user = Message::new(Role::User);
     user.content = vec![
-        Block::Text {
-            text: source_text(&base.join("prompt.json"), &"prompt λ\n".repeat(1000))?,
-        },
+        Block::from_text(source_text(&base.join("prompt.json"), &"prompt λ\n".repeat(1000))?),
         Block::Image {
             media_type: Some("image/png".into()),
             data_ref: Some("file:image".into()),
+            extensions: Default::default(),
         },
         Block::File {
             mime: Some("text/plain".into()),
             path: Some("report λ.txt".into()),
             source: None,
+            extensions: Default::default(),
         },
     ];
     let mut assistant = Message::new(Role::Assistant);
@@ -128,37 +128,41 @@ fn fixture(base: &Path) -> Result<Session> {
             signature: Some("sig".into()),
             encrypted: None,
             redacted: false,
+            extensions: Default::default(),
         },
         Block::Thinking {
             text: " ".into(),
             signature: Some("signature-only".into()),
             encrypted: None,
             redacted: false,
+            extensions: Default::default(),
         },
         Block::Thinking {
             text: "".into(),
             signature: None,
             encrypted: Some("opaque".into()),
             redacted: true,
+            extensions: Default::default(),
         },
-        Block::Text {
-            text: "answer \"\\\t".into(),
-        },
+        Block::from_text("answer \"\\\t".into()),
         Block::ToolUse {
             id: "deferred".into(),
             name: "inner".into(),
             namespace: Some(crate::affordance::DEFERRED.into()),
             input: input.clone(),
+            extensions: Default::default(),
         },
         Block::ToolUse {
             id: "ordinary".into(),
             name: "ordinary".into(),
             namespace: None,
             input,
+            extensions: Default::default(),
         },
         Block::Image {
             media_type: None,
             data_ref: None,
+            extensions: Default::default(),
         },
         Block::ToolResult {
             tool_use_id: "ignored".into(),
@@ -167,6 +171,7 @@ fn fixture(base: &Path) -> Result<Session> {
             tool_name: None,
             status: None,
             details: None,
+            extensions: Default::default(),
         },
     ];
     let mut tool = Message::new(Role::Tool);
@@ -177,24 +182,22 @@ fn fixture(base: &Path) -> Result<Session> {
         tool_name: Some("inner".into()),
         status: Some("completed".into()),
         details: None,
+        extensions: Default::default(),
     }];
     let mut summary = Message::of_kind(Role::System, MessageKind::CompactionSummary, Origin::Harness);
     summary.content = vec![
-        Block::Text { text: "".into() },
-        Block::Text {
-            text: "summary\nλ".into(),
-        },
+        Block::from_text("".into()),
+        Block::from_text("summary\nλ".into()),
         Block::Thinking {
             text: "summary reasoning".into(),
             signature: None,
             encrypted: None,
             redacted: false,
+            extensions: Default::default(),
         },
     ];
     let mut branch = Message::of_kind(Role::System, MessageKind::Branch, Origin::Harness);
-    branch.content.push(Block::Text {
-        text: "unused branch body".into(),
-    });
+    branch.content.push(Block::from_text("unused branch body".into()));
     let mut model = Message::of_kind(Role::System, MessageKind::ModelChange, Origin::Harness);
     model.model = Some("changed-model".into());
     let mut empty = Message::new(Role::Assistant);
@@ -203,6 +206,7 @@ fn fixture(base: &Path) -> Result<Session> {
         signature: None,
         encrypted: None,
         redacted: false,
+        extensions: Default::default(),
     });
     session.messages = vec![
         user,
@@ -254,6 +258,7 @@ fn checked_openclaw_borrowed_wrapper_matches_replay_definition_and_none() -> Res
             name: "inner".into(),
             input: input.clone(),
             namespace: namespace.map(str::to_owned),
+            extensions: Default::default(),
         };
         let rewrapped = crate::affordance::rewrap_deferred(crate::harness::openclaw::DEFERRED_WRAPPER, &block)?;
         assert_eq!(rewrapped.is_some(), namespace == Some(crate::affordance::DEFERRED));
@@ -280,25 +285,22 @@ fn checked_openclaw_title_policy_matches_frozen_explicit_and_meaningful_prompt()
             session.title = title.map(str::to_owned);
             let mut first = Message::new(Role::User);
             first.content = vec![
-                Block::Text { text: "".into() },
-                Block::Text { text: " \n".into() },
-                Block::Text {
-                    text: if meaningful {
-                        "λ\n".repeat(50).into()
-                    } else {
-                        "".into()
-                    },
-                },
+                Block::from_text("".into()),
+                Block::from_text(" \n".into()),
+                Block::from_text(if meaningful {
+                    "λ\n".repeat(50).into()
+                } else {
+                    "".into()
+                }),
             ];
             let mut second = Message::new(Role::User);
-            second.content.push(Block::Text {
-                text: "later meaningful prompt".into(),
-            });
+            second.content.push(Block::from_text("later meaningful prompt".into()));
             first.content.push(Block::Thinking {
                 text: "user reasoning".into(),
                 signature: None,
                 encrypted: None,
                 redacted: false,
+                extensions: Default::default(),
             });
             session.messages = vec![first, second];
             for mode in ThinkingMode::ALL {
@@ -474,7 +476,8 @@ fn checked_openclaw_complete_preparation_preserves_ir_wire_report_and_late_failu
     assert!(checked.messages.iter().any(|m| m.content.iter().any(|b| matches!(
         b,
         Block::Text {
-            text: crate::Text::Source(_)
+            text: crate::Text::Source(_),
+            ..
         }
     ))));
     let mut materialized = checked.clone();
@@ -532,10 +535,12 @@ fn tool_export_preserves_every_result_structured_details_and_images() -> Result<
             tool_name: Some("first".into()),
             status: None,
             details: Some(json!({"patch":{"path":"file","lines":[1,2]}})),
+            extensions: Default::default(),
         },
         Block::Image {
             media_type: Some("image/png".into()),
             data_ref: Some("https://example.test/image".into()),
+            extensions: Default::default(),
         },
         Block::ToolResult {
             tool_use_id: "b".into(),
@@ -544,6 +549,7 @@ fn tool_export_preserves_every_result_structured_details_and_images() -> Result<
             tool_name: Some("second".into()),
             status: None,
             details: Some(json!({"failure":"rejected"})),
+            extensions: Default::default(),
         },
     ];
     source.messages.push(tool);
@@ -690,9 +696,7 @@ fn native_complete_export_preserves_records_branch_links_and_one_compaction_pair
         .iter_mut()
         .find(|m| m.id.as_deref() == Some("u1"))
         .unwrap();
-    user.content[0] = Block::Text {
-        text: "edited prompt".into(),
-    };
+    user.content[0] = Block::from_text("edited prompt".into());
     let result = emit(&edited, &world.base.join("edited"), &EmitOptions::default())?;
     let emitted = crate::SessionRef::new(&result.new_id, Harness::OpenClaw, &result.path);
     let parsed = crate::stream::collect_with(adapter.as_ref(), &emitted, &Demand::RICH)?;

@@ -126,7 +126,7 @@ fn ensure_regular_source(path: &Path) -> Result<()> {
 
 /// Verify destination `path` is either absent (`Ok(false)`) or a regular file (`Ok(true)`),
 /// refusing symlinks, directories, FIFOs, and other special files.
-fn check_regular_dest_file(path: &Path) -> Result<bool> {
+pub(super) fn check_regular_dest_file(path: &Path) -> Result<bool> {
     match fs::symlink_metadata(path) {
         Ok(md) => {
             anyhow::ensure!(
@@ -685,7 +685,16 @@ fn transcript(
         _ => None,
     };
 
+    let mut artifacts = super::artifacts::Artifacts::default();
+    for slice in &chain_slices {
+        artifacts.collect(&slice.path)?;
+    }
     if !missing {
+        if !dry_run {
+            let mut set = Set::new();
+            artifacts.stage(to, &mut set, Claim::New)?;
+            set.publish()?;
+        }
         if let (Some((spec, meta_to)), false) = (meta_needed, dry_run) {
             ensure_contained_dest_dir(session_dir, rel_parent, true)?;
             let staged_meta = stage_meta_spec(spec, meta_to)?.into_staged()?;
@@ -834,6 +843,7 @@ fn transcript(
         let staged_meta = stage_meta_spec(spec, meta_to)?.into_staged()?;
         set.add(staged_meta, meta_to, Claim::New);
     }
+    artifacts.stage(to, &mut set, Claim::New)?;
     set.add(staged, to, if existing { Claim::Replace } else { Claim::New });
     set.publish()?;
 
@@ -1044,7 +1054,8 @@ mod tests {
             r#"{"agentType":"builder"}"#
         );
         assert!(!dst.join("workflows/run-1/journal.jsonl").exists());
-        assert_eq!(fs::read_dir(&dst)?.count(), 4);
+        assert_eq!(fs::read_to_string(dst.join("agent-a1.flat.jsonl"))?, "{}\n");
+        assert_eq!(fs::read_dir(&dst)?.count(), 5);
         let out = fs::read_to_string(dst.join("agent-a1.jsonl"))?;
         assert_eq!(
             (carried.transcript_bytes, dry.transcript_bytes),

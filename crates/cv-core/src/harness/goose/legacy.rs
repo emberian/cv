@@ -392,7 +392,8 @@ mod tests {
         assert!(matches!(
             &message.content[0],
             Block::Text {
-                text: crate::lazy::Text::Source(_)
+                text: crate::lazy::Text::Source(_),
+                ..
             }
         ));
         assert!(matches!(
@@ -404,7 +405,7 @@ mod tests {
         ));
         let mut copy = message.clone();
         copy.materialize(&crate::lazy::Resolver::new(None)).unwrap();
-        assert!(matches!(&copy.content[0], Block::Text { text } if text.inline_str() == Some(giant.as_str())));
+        assert!(matches!(&copy.content[0], Block::Text { text , .. } if text.inline_str() == Some(giant.as_str())));
         // Header changes invalidate retained fields even when their own message bytes are stable.
         use std::io::Write;
         std::fs::OpenOptions::new()

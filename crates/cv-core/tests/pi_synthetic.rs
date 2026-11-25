@@ -44,7 +44,7 @@ fn text(m: &Message) -> String {
     m.content
         .iter()
         .filter_map(|b| match b {
-            Block::Text { text } => Some(text.inline_str().unwrap_or_default().to_string()),
+            Block::Text { text, .. } => Some(text.inline_str().unwrap_or_default().to_string()),
             Block::ToolResult { content, .. } => Some(content.inline_str().unwrap_or_default().to_string()),
             _ => None,
         })

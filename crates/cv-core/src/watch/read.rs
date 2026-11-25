@@ -319,7 +319,7 @@ impl stream::MessageSink for Tail<'_> {
                 // identity (record_message_reads, below, records them), so a ToolUse span is
                 // never an implicit-source span needing the materialization guard.
                 match block {
-                    crate::Block::Text { text } | crate::Block::Thinking { text, .. } => text.as_span(),
+                    crate::Block::Text { text, .. } | crate::Block::Thinking { text, .. } => text.as_span(),
                     crate::Block::ToolResult { content, .. } => content.as_span(),
                     _ => None,
                 }
@@ -626,7 +626,7 @@ mod tests {
         let text = value.with_view(|view| view.source_text()).unwrap().unwrap();
         assert!(matches!(text, crate::Text::Source(_)));
         let mut message = Message::new(crate::Role::Assistant);
-        message.content.push(crate::Block::Text { text });
+        message.content.push(crate::Block::from_text(text));
         let mut text_reads = source::ReadSet::default();
         source::record_message_reads(&message, Some(&path), &mut text_reads);
         message.content = vec![crate::Block::ToolUse {
@@ -634,6 +634,7 @@ mod tests {
             name: "test".into(),
             namespace: None,
             input: value,
+            extensions: Default::default(),
         }];
         let mut input_reads = source::ReadSet::default();
         source::record_message_reads(&message, Some(&path), &mut input_reads);
@@ -731,6 +732,7 @@ mod tests {
                     name: "opaque".into(),
                     namespace: None,
                     input: crate::Json::source(&self.0, 0, 2)?,
+                    extensions: Default::default(),
                 });
                 sink.try_message(message)?;
                 std::fs::remove_file(&self.0)?;

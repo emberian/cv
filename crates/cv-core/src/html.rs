@@ -285,7 +285,7 @@ pub fn share_message(m: &Message, idx: usize, out: &mut String, resolver: &crate
 fn share_block(b: &Block, out: &mut String, resolver: &crate::Resolver) -> anyhow::Result<()> {
     use std::fmt::Write as _;
     match b {
-        Block::Text { text } => {
+        Block::Text { text, .. } => {
             let text = text.try_resolve(resolver)?;
             out.push_str("<div class=\"text\">");
             render_text(&text, out);
@@ -362,6 +362,7 @@ fn share_block(b: &Block, out: &mut String, resolver: &crate::Resolver) -> anyho
             out.push_str(&escape(label));
             out.push_str("</code></div>\n");
         }
+        Block::Opaque { .. } => {}
         Block::Image { media_type, .. } => {
             out.push_str("<div class=\"attach\">🖼 [image]");
             if let Some(mt) = media_type {
@@ -694,9 +695,9 @@ mod tests {
 
     fn sample_session() -> Session {
         let mut user = Message::new(Role::User);
-        user.content.push(Block::Text {
-            text: "Hello & welcome. Try <script>alert(1)</script> please.\n\nSecond para with `inline` code.".into(),
-        });
+        user.content.push(Block::from_text(
+            "Hello & welcome. Try <script>alert(1)</script> please.\n\nSecond para with `inline` code.".into(),
+        ));
 
         let mut assistant = Message::new(Role::Assistant);
         assistant.content.push(Block::Thinking {
@@ -704,15 +705,17 @@ mod tests {
             signature: None,
             encrypted: None,
             redacted: false,
+            extensions: Default::default(),
         });
-        assistant.content.push(Block::Text {
-            text: "Sure! Here is code:\n\n```rust\nfn main() { println!(\"<hi>\"); }\n```".into(),
-        });
+        assistant.content.push(Block::from_text(
+            "Sure! Here is code:\n\n```rust\nfn main() { println!(\"<hi>\"); }\n```".into(),
+        ));
         assistant.content.push(Block::ToolUse {
             id: "t1".into(),
             name: "Bash".into(),
             input: (serde_json::json!({ "command": "echo <x> & done" })).into(),
             namespace: None,
+            extensions: Default::default(),
         });
         assistant.usage = Some(Usage {
             input_tokens: Some(42),
@@ -721,6 +724,7 @@ mod tests {
             cache_creation_tokens: None,
             reasoning_tokens: None,
             cost_usd: None,
+            ..Default::default()
         });
 
         let mut tool = Message::new(Role::Tool);
@@ -731,21 +735,24 @@ mod tests {
             tool_name: Some("Bash".into()),
             status: Some("error".into()),
             details: None,
+            extensions: Default::default(),
         });
         tool.content.push(Block::File {
             mime: None,
             path: Some("/tmp/<weird>&.txt".into()),
             source: None,
+            extensions: Default::default(),
         });
         tool.content.push(Block::Image {
             media_type: Some("image/png".into()),
             data_ref: None,
+            extensions: Default::default(),
         });
 
         let mut system = Message::new(Role::System);
-        system.content.push(Block::Text {
-            text: "You are a helpful assistant.".into(),
-        });
+        system
+            .content
+            .push(Block::from_text("You are a helpful assistant.".into()));
 
         Session {
             cwd: Some("/home/<user>/proj".into()),
@@ -755,6 +762,7 @@ mod tests {
                 branch: Some("dev".into()),
                 commit: Some("deadbeef".into()),
                 remote: None,
+                ..Default::default()
             }),
             messages: vec![system, user, assistant, tool],
             ..Session::new("abc123", Harness::Claude)
@@ -920,12 +928,13 @@ mod tests {
             .unwrap();
         let mut lazy = Message::new(Role::Assistant);
         lazy.content = vec![
-            Block::Text { text: text.clone() },
+            Block::from_text(text.clone()),
             Block::Thinking {
                 text: text.clone(),
                 signature: None,
                 encrypted: None,
                 redacted: false,
+                extensions: Default::default(),
             },
             Block::ToolResult {
                 tool_use_id: "call".into(),
@@ -934,6 +943,7 @@ mod tests {
                 tool_name: None,
                 status: None,
                 details: None,
+                extensions: Default::default(),
             },
         ];
         let mut owned = lazy.clone();

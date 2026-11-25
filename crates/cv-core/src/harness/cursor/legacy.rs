@@ -119,7 +119,7 @@ fn bubble(view: JsonView<'_>, spans: bool) -> Result<Option<Message>> {
     let mut m = Message::new(role);
     if let Some(text) = fields.get("text").map(|v| v.lazy_text(spans)).transpose()?.flatten() {
         if !matches!(&text, crate::lazy::Text::Inline(s) if s.is_empty()) {
-            m.content.push(Block::Text { text });
+            m.content.push(Block::from_text(text));
         }
     }
     Ok((!m.content.is_empty()).then_some(m))

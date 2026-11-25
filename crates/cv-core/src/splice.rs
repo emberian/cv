@@ -38,6 +38,7 @@ struct Owner {
 /// selected messages move into the composition without cloning their bodies.
 #[derive(Default)]
 pub struct Composition {
+    coverage: Option<crate::coverage::ReadCoverage>,
     owner: Option<Owner>,
     messages: Vec<Message>,
     provenance: Vec<serde_json::Value>,
@@ -51,6 +52,11 @@ impl Composition {
         self.provenance.push(serde_json::json!({
             "source_id": source.id, "harness": source.harness.as_str(), "start": start, "end": end,
         }));
+        if let Some(source_coverage) = crate::coverage::ReadCoverage::of_session(&source) {
+            let coverage = self.coverage.get_or_insert_with(Default::default);
+            coverage.sources.extend(source_coverage.sources);
+            coverage.limitations.extend(source_coverage.limitations);
+        }
         self.windows.push((source.harness, source.messages.len()));
         self.messages.append(&mut source.messages);
         match &mut self.owner {
@@ -125,7 +131,7 @@ impl Composition {
             }
             None => (None, None, None, None, None, None),
         };
-        Session {
+        let mut result = Session {
             // created_at = min, updated_at = max of the included messages' timestamps.
             created_at: messages.iter().filter_map(|m| m.timestamp).min(),
             updated_at: messages.iter().filter_map(|m| m.timestamp).max(),
@@ -138,7 +144,11 @@ impl Composition {
             principal,
             system_prompt,
             ..Session::new(new_id.unwrap_or_else(|| uuid::Uuid::now_v7().to_string()), harness)
+        };
+        if let Some(coverage) = self.coverage {
+            coverage.attach(&mut result);
         }
+        result
     }
 }
 
@@ -190,9 +200,7 @@ pub(crate) mod tests {
             m.id = Some(mid.clone());
             m.parent_id = prev.take();
             m.timestamp = Some(Utc.timestamp_opt(1_000 + i as i64, 0).unwrap());
-            m.content = vec![Block::Text {
-                text: format!("{id}#{i}").into(),
-            }];
+            m.content = vec![Block::from_text(format!("{id}#{i}").into())];
             prev = Some(mid);
             messages.push(m);
         }
@@ -222,6 +230,7 @@ pub(crate) mod tests {
             .map(|message| match &message.content[0] {
                 Block::Text {
                     text: crate::Text::Inline(text),
+                    ..
                 } => text.as_ptr(),
                 _ => unreachable!(),
             })
@@ -231,6 +240,7 @@ pub(crate) mod tests {
         for (message, pointer) in actual.messages.iter().zip(pointers) {
             let Block::Text {
                 text: crate::Text::Inline(text),
+                ..
             } = &message.content[0]
             else {
                 unreachable!()

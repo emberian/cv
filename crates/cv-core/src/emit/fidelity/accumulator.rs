@@ -162,7 +162,7 @@ fn project(message: &Message, resolver: &crate::lazy::Resolver, target: Harness)
     let mut text_started = false;
     for block in &message.content {
         facts.content.push(match block {
-            Block::Text { text } => {
+            Block::Text { text, .. } => {
                 let mut value = if rules.reroles_client_commands && message.kind == MessageKind::Prompt {
                     marker(text, resolver)?
                 } else {
@@ -175,18 +175,20 @@ fn project(message: &Message, resolver: &crate::lazy::Resolver, target: Harness)
                 } else {
                     text_started = !value.is_empty();
                 }
-                Block::Text { text: value.into() }
+                Block::from_text(value.into())
             }
             Block::Thinking {
                 text,
                 signature,
                 encrypted,
                 redacted,
+                ..
             } => Block::Thinking {
                 text: marker(text, resolver)?.into(),
                 signature: signature.as_ref().map(|_| String::new()),
                 encrypted: encrypted.as_ref().map(|_| String::new()),
                 redacted: *redacted,
+                extensions: Default::default(),
             },
             Block::ToolUse { id, input, .. } => {
                 // Preserve the old source-error boundary even though feature counts ignore args.
@@ -196,6 +198,7 @@ fn project(message: &Message, resolver: &crate::lazy::Resolver, target: Harness)
                     name: String::new(),
                     input: Value::Null.into(),
                     namespace: None,
+                    extensions: Default::default(),
                 }
             }
             Block::ToolResult {
@@ -216,16 +219,23 @@ fn project(message: &Message, resolver: &crate::lazy::Resolver, target: Harness)
                     is_error: *is_error,
                     status: None,
                     details: details.as_ref().map(|_| Value::Null),
+                    extensions: Default::default(),
                 }
             }
+            Block::Opaque { block_type, .. } => Block::Opaque {
+                block_type: block_type.clone(),
+                value: Value::Null,
+            },
             Block::Image { .. } => Block::Image {
                 media_type: None,
                 data_ref: None,
+                extensions: Default::default(),
             },
             Block::File { .. } => Block::File {
                 mime: None,
                 path: None,
                 source: None,
+                extensions: Default::default(),
             },
         });
     }
@@ -255,6 +265,7 @@ mod tests {
             name: "tool".into(),
             input: serde_json::json!({"large": "ignored"}).into(),
             namespace: None,
+            extensions: Default::default(),
         });
         let mut orphan = call.clone();
         if let Block::ToolUse { id, .. } = &mut orphan.content[0] {
@@ -268,12 +279,10 @@ mod tests {
             is_error: true,
             status: None,
             details: Some(Value::Null),
+            extensions: Default::default(),
         });
         let mut command = Message::new(Role::User);
-        command.content = vec![
-            Block::Text { text: " \n".into() },
-            Block::Text { text: " ?help".into() },
-        ];
+        command.content = vec![Block::from_text(" \n".into()), Block::from_text(" ?help".into())];
         command.model = Some("explicit".into());
         let mut signed = Message::new(Role::Assistant);
         signed.content.push(Block::Thinking {
@@ -281,6 +290,7 @@ mod tests {
             signature: Some(String::new()),
             encrypted: None,
             redacted: true,
+            extensions: Default::default(),
         });
         let mut carrier = Message::new(Role::System);
         carrier.kind = MessageKind::Carrier;

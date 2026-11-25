@@ -182,7 +182,7 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Emi
                         ThinkingFate::Keep => {}
                     }
                     match b {
-                        Block::Text { text } => {
+                        Block::Text { text, .. } => {
                             writer::text(&mut lines, &ts, text, &resolver)?;
                         }
                         Block::Thinking { text, encrypted, .. } => {
@@ -219,6 +219,7 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Emi
                             name,
                             namespace,
                             input,
+                            ..
                         } => {
                             let is_custom = writer::is_custom_tool_input(name, input)?;
                             if is_custom {
@@ -260,7 +261,7 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Emi
                                 }),
                             )?;
                         }
-                        Block::ToolResult { .. } | Block::Image { .. } => {}
+                        Block::ToolResult { .. } | Block::Image { .. } | Block::Opaque { .. } => {}
                     }
                 }
                 // Per-turn token usage → Codex's own `token_count` event, the ONLY record its parser
@@ -437,6 +438,7 @@ mod staged_tests {
             name: "send_message".into(),
             namespace: Some("collaboration".into()),
             input: json!({"target":"worker","message":"payload λ"}).into(),
+            extensions: Default::default(),
         });
         let mut result = Message::new(Role::Tool);
         result
@@ -450,6 +452,7 @@ mod staged_tests {
             // A Codex output record has no status of its own, so none survives the round trip.
             status: None,
             details: None,
+            extensions: Default::default(),
         });
         session.messages = vec![call, result];
         let emitted = emit(
@@ -524,6 +527,7 @@ mod staged_tests {
             name: "exec".into(),
             namespace: Some("functions".into()),
             input: json!(script).into(),
+            extensions: Default::default(),
         });
         let mut r1 = Message::new(Role::Tool);
         r1.content.push(Block::ToolResult {
@@ -533,6 +537,7 @@ mod staged_tests {
             tool_name: Some("exec".into()),
             status: None,
             details: None,
+            extensions: Default::default(),
         });
 
         let mut c2 = Message::new(Role::Assistant);
@@ -541,6 +546,7 @@ mod staged_tests {
             name: "apply_patch".into(),
             namespace: None,
             input: json!({ "raw": patch }).into(),
+            extensions: Default::default(),
         });
         let mut r2 = Message::new(Role::Tool);
         r2.content.push(Block::ToolResult {
@@ -550,6 +556,7 @@ mod staged_tests {
             tool_name: Some("apply_patch".into()),
             status: None,
             details: None,
+            extensions: Default::default(),
         });
 
         session.messages = vec![c1, r1, c2, r2];

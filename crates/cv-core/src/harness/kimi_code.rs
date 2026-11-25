@@ -1177,6 +1177,7 @@ impl<'a> Ctx<'a> {
                             name,
                             input,
                             namespace: None,
+                            extensions: Default::default(),
                         });
                 }
                 Flow::Continue
@@ -1360,6 +1361,7 @@ impl<'a> Ctx<'a> {
             tool_name: self.call_names.get(&id).cloned(),
             status: None,
             details: (!details.is_empty()).then(|| Value::Object(details)),
+            extensions: Default::default(),
         });
         if self.opts.tier >= Tier::Facts {
             if let Some(trace) = fields.value("traceId")? {
@@ -1617,9 +1619,7 @@ impl<'a> Ctx<'a> {
             m.extra.insert(CARRIER_KEY.into(), v.clone());
         }
         m.timestamp = ts;
-        m.content.push(Block::Text {
-            text: Text::from(prompt),
-        });
+        m.content.push(Block::from_text(Text::from(prompt)));
         let bag = m.harness_extra_mut(Harness::KimiCode);
         bag.insert("event".into(), Value::String(ty.to_string()));
         if self.opts.tier >= Tier::Facts {
@@ -1874,7 +1874,7 @@ fn note(text: String, ts: Option<DateTime<Utc>>, kind: MessageKind, origin: Orig
     let mut m = Message::of_kind(Role::System, kind, origin);
     m.timestamp = ts;
     if !text.is_empty() {
-        m.content.push(Block::Text { text: Text::from(text) });
+        m.content.push(Block::from_text(Text::from(text)));
     }
     m.harness_extra_mut(Harness::KimiCode)
         .insert("event".into(), Value::String(event.to_string()));

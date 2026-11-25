@@ -86,7 +86,7 @@ pub(crate) fn blocks_from_view(
         return Ok(if text.is_empty() {
             Vec::new()
         } else {
-            vec![Block::Text { text }]
+            vec![Block::from_text(text)]
         });
     }
     let mut blocks = Vec::new();
@@ -136,6 +136,7 @@ pub(crate) fn part_from_view(
                 },
                 encrypted,
                 redacted: false,
+                extensions: Default::default(),
             }));
         }
     }
@@ -200,7 +201,11 @@ pub(crate) fn part_from_view(
                 (None, Some(value))
             }
         };
-        return Ok(Some(Block::Image { media_type, data_ref }));
+        return Ok(Some(Block::Image {
+            media_type,
+            data_ref,
+            extensions: Default::default(),
+        }));
     }
     if matches!(ty.as_str(), "audio_url" | "video_url") {
         let source = part
@@ -215,6 +220,7 @@ pub(crate) fn part_from_view(
             mime: None,
             path: None,
             source,
+            extensions: Default::default(),
         }));
     }
     Ok(match fields.get("text") {
@@ -222,7 +228,7 @@ pub(crate) fn part_from_view(
         None => None,
     }
     .filter(|text| !q.skip_empty_text || !text.is_empty())
-    .map(|text| Block::Text { text }))
+    .map(Block::from_text))
 }
 
 /// One `tool_calls[]` entry → a [`Block::ToolUse`]: `{id, function: {name, arguments}}` (chat) or
@@ -269,6 +275,7 @@ pub(crate) fn tool_call_from_view(call: crate::json::JsonView<'_>, spans: bool) 
         name,
         input,
         namespace: None,
+        extensions: Default::default(),
     })
 }
 
@@ -395,15 +402,15 @@ mod tests {
         ]);
         let plain = blocks_from(Some(&parts), &OPENAI);
         assert_eq!(plain.len(), 6);
-        assert!(matches!(&plain[1], Block::Text { text } if text.is_empty()));
+        assert!(matches!(&plain[1], Block::Text { text , .. } if text.is_empty()));
         assert!(
-            matches!(&plain[3], Block::Image { media_type: None, data_ref: Some(u) } if u == "data:image/png;base64,AAA")
+            matches!(&plain[3], Block::Image { media_type: None, data_ref: Some(u) , .. } if u == "data:image/png;base64,AAA")
         );
         assert!(matches!(&plain[5], Block::Image { data_ref: Some(u), .. } if u == "https://x/z.png"));
         let codex = blocks_from(Some(&parts), &CODEX);
         assert_eq!(codex.len(), 5, "Codex drops the empty text");
         assert!(
-            matches!(&codex[2], Block::Image { media_type: Some(m), data_ref: Some(r) } if m == "image/png" && r == "base64:inline")
+            matches!(&codex[2], Block::Image { media_type: Some(m), data_ref: Some(r) , .. } if m == "image/png" && r == "base64:inline")
         );
         let url = format!("https://x/{}", "a".repeat(200));
         let long = json!([{"type": "image_url", "image_url": {"url": url}}]);

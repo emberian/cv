@@ -109,7 +109,7 @@ pub(super) fn build(
             let mut m = new(Role::User, MessageKind::Prompt, Origin::Human);
             let mut bag = Map::new();
             if let Some(text) = text_of("text")? {
-                m.content.push(Block::Text { text });
+                m.content.push(Block::from_text(text));
             }
             if let Some(files) = data.get("files")?.map(JsonView::array).transpose()?.flatten() {
                 for file in files {
@@ -119,9 +119,7 @@ pub(super) fn build(
             if let Some(agents) = nonempty_array(data.get("agents")?)? {
                 for agent in agents.array()?.into_iter().flatten() {
                     if let Some(name) = string(agent?.get("name")?)? {
-                        m.content.push(Block::Text {
-                            text: format!("@{name}").into(),
-                        });
+                        m.content.push(Block::from_text(format!("@{name}").into()));
                     }
                 }
                 bag.insert("agent_refs".into(), agents.resolve()?.into_owned());
@@ -145,7 +143,7 @@ pub(super) fn build(
                     new(role, MessageKind::InjectedContext, Origin::Harness)
                 };
             if let Some(text) = text_of("text")? {
-                m.content.push(Block::Text { text });
+                m.content.push(Block::from_text(text));
             }
             let mut bag = Map::new();
             bag.insert("message_type".into(), json!(ty));
@@ -156,13 +154,11 @@ pub(super) fn build(
         "shell" => {
             let mut m = new(Role::User, MessageKind::InjectedContext, Origin::Human);
             if let Some(command) = data.get("command")?.filter(|c| nonempty(*c).unwrap_or(false)) {
-                m.content.push(Block::Text {
-                    text: ctx.generated(|writer| {
-                        writer.push("$ ")?;
-                        anyhow::ensure!(writer.push_string(command)?, "expected shell command string");
-                        Ok(())
-                    })?,
-                });
+                m.content.push(Block::from_text(ctx.generated(|writer| {
+                    writer.push("$ ")?;
+                    anyhow::ensure!(writer.push_string(command)?, "expected shell command string");
+                    Ok(())
+                })?));
             }
             if let Some(output) = data.get("output")?.filter(|o| !o.is_null().unwrap_or(true)) {
                 // `Shell.Output`: `{output, cursor, size, truncated?}`. Presence wins before type:
@@ -182,7 +178,7 @@ pub(super) fn build(
                     None => Some(ctx.generated(|writer| writer.push_json(output))?),
                 };
                 if let Some(text) = text {
-                    m.content.push(Block::Text { text });
+                    m.content.push(Block::from_text(text));
                 }
             }
             let mut bag = Map::new();
@@ -215,7 +211,7 @@ pub(super) fn build(
                 // differs from its boundary. Native prefixed IDs do not contain `#`.
                 s.id = Some(format!("{id}#summary"));
                 if let Some(text) = text_of("summary")? {
-                    s.content.push(Block::Text { text });
+                    s.content.push(Block::from_text(text));
                 }
                 let model = data.get("model")?;
                 s.model = string(get(model, "id")?)?;
@@ -251,7 +247,7 @@ pub(super) fn build(
                 .map(|l| format!("location: {l}"))
             };
             if let Some(t) = note {
-                m.content.push(Block::Text { text: t.into() });
+                m.content.push(Block::from_text(t.into()));
             }
             let mut bag = Map::new();
             bag.insert("message_type".into(), json!(ty));
@@ -304,7 +300,7 @@ fn assistant(mut m: Message, data: JsonView<'_>, ctx: Ctx<'_>) -> Result<Vec<Mes
             "text" => {
                 if let Some(text) = c.get("text")?.filter(|t| nonempty(*t).unwrap_or(false)) {
                     if let Some(text) = ctx.text(text)? {
-                        m.content.push(Block::Text { text });
+                        m.content.push(Block::from_text(text));
                     }
                 }
             }
@@ -320,6 +316,7 @@ fn assistant(mut m: Message, data: JsonView<'_>, ctx: Ctx<'_>) -> Result<Vec<Mes
                         signature,
                         encrypted: None,
                         redacted: false,
+                        extensions: Default::default(),
                     });
                 }
             }
@@ -365,7 +362,7 @@ fn assistant(mut m: Message, data: JsonView<'_>, ctx: Ctx<'_>) -> Result<Vec<Mes
         // An error turn often carries no content; its message is what the user saw.
         if m.content.is_empty() {
             if let Some(t) = string(get(error, "message")?)? {
-                m.content.push(Block::Text { text: t.into() });
+                m.content.push(Block::from_text(t.into()));
             }
         }
     }
@@ -399,6 +396,7 @@ fn tool_blocks(c: JsonView<'_>, ctx: Ctx<'_>) -> Result<(Block, Vec<Block>)> {
         name: name.clone(),
         input,
         namespace: None,
+        extensions: Default::default(),
     };
     // The result is its `text` items (and any other non-`file` item as JSON), joined by newlines.
     let mut parts = Vec::new();
@@ -468,6 +466,7 @@ fn tool_blocks(c: JsonView<'_>, ctx: Ctx<'_>) -> Result<(Block, Vec<Block>)> {
                 Some(details) => Some(details),
                 None => (!details.is_empty()).then_some(Value::Object(details)),
             },
+            extensions: Default::default(),
         });
     }
     out.extend(files);
@@ -522,12 +521,14 @@ fn file_block(f: JsonView<'_>) -> Result<Block> {
         Block::Image {
             media_type: mime,
             data_ref: uri.or(name),
+            extensions: Default::default(),
         }
     } else {
         Block::File {
             mime,
             path: name,
             source: uri,
+            extensions: Default::default(),
         }
     })
 }
@@ -540,12 +541,14 @@ fn result_file(f: JsonView<'_>) -> Result<Block> {
         Block::Image {
             media_type: mime,
             data_ref: uri,
+            extensions: Default::default(),
         }
     } else {
         Block::File {
             mime,
             path: string(f.get("name")?)?,
             source: uri,
+            extensions: Default::default(),
         }
     })
 }

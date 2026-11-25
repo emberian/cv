@@ -139,6 +139,7 @@ fn tool_use(view: JsonView<'_>, spans: bool) -> Result<Block> {
             .transpose()?
             .unwrap_or_default(),
         namespace: None,
+        extensions: Default::default(),
     })
 }
 
@@ -185,7 +186,7 @@ fn legacy(
             msg.content.extend(block);
         }
     } else if let Some(text) = nonempty(text(fields, "text", spans)?) {
-        msg.content.push(Block::Text { text });
+        msg.content.push(Block::from_text(text));
     }
     if let Some(uses) = fields.get("tool_uses").map(|v| v.array()).transpose()?.flatten() {
         for value in uses {
@@ -199,7 +200,7 @@ fn legacy(
     // otherwise the turn stays a prompt and the preamble is noted in `extra["zed"]`.
     if let Some(context) = nonempty(text(fields, "context", spans)?) {
         if msg.content.is_empty() {
-            msg.content.push(Block::Text { text: context });
+            msg.content.push(Block::from_text(context));
         } else {
             msg.harness_extra_mut(Harness::Zed).insert(
                 "context".into(),
@@ -273,6 +274,7 @@ fn tool_result(
             .unwrap_or(false),
         details: nonnull(&fields, "output")?,
         status: None,
+        extensions: Default::default(),
     }))
 }
 
@@ -362,7 +364,7 @@ fn modern(fields: &Fields<'_>, source: &JsonSource, spans: bool, f: &mut dyn FnM
             if let Some(text) = text(&compaction, "Summary", spans)? {
                 if !text_is_blank(&text, &Resolver::new(None))? {
                     let mut msg = Message::of_kind(Role::System, MessageKind::CompactionSummary, Origin::Harness);
-                    msg.content.push(Block::Text { text });
+                    msg.content.push(Block::from_text(text));
                     return Ok(f(msg));
                 }
             }
@@ -376,7 +378,7 @@ fn user_block(view: JsonView<'_>, spans: bool) -> Result<Option<Block>> {
         return Ok(None);
     };
     if let Some(text) = text(&item, "Text", spans)? {
-        return Ok(nonempty(Some(text)).map(|text| Block::Text { text }));
+        return Ok(nonempty(Some(text)).map(Block::from_text));
     }
     if let Some(mention) = item.get("Mention") {
         // The mention's resolved `content` (an attached file's whole body) is dropped — the URI
@@ -391,6 +393,7 @@ fn user_block(view: JsonView<'_>, spans: bool) -> Result<Option<Block>> {
             mime: None,
             path: None,
             source,
+            extensions: Default::default(),
         }));
     }
     if let Some(image) = item.get("Image") {
@@ -406,6 +409,7 @@ fn user_block(view: JsonView<'_>, spans: bool) -> Result<Option<Block>> {
         return Ok(Some(Block::Image {
             media_type: None,
             data_ref,
+            extensions: Default::default(),
         }));
     }
     Ok(None)
@@ -416,7 +420,7 @@ fn agent_block(view: JsonView<'_>, spans: bool) -> Result<Option<Block>> {
         return Ok(None);
     };
     if let Some(text) = text(&item, "Text", spans)? {
-        return Ok(nonempty(Some(text)).map(|text| Block::Text { text }));
+        return Ok(nonempty(Some(text)).map(Block::from_text));
     }
     if let Some(thinking) = item.get("Thinking") {
         let fields = Fields::parse(thinking, &["text", "signature"])?;
@@ -430,6 +434,7 @@ fn agent_block(view: JsonView<'_>, spans: bool) -> Result<Option<Block>> {
             signature: nonempty(fields.as_ref().map(|v| v.string("signature")).transpose()?.flatten()),
             encrypted: None,
             redacted: false,
+            extensions: Default::default(),
         }));
     }
     if let Some(data) = item.string("RedactedThinking")? {
@@ -438,6 +443,7 @@ fn agent_block(view: JsonView<'_>, spans: bool) -> Result<Option<Block>> {
             signature: None,
             encrypted: Some(data),
             redacted: true,
+            extensions: Default::default(),
         }));
     }
     item.get("ToolUse").map(|v| tool_use(v, spans)).transpose()

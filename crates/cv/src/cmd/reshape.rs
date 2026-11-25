@@ -134,7 +134,8 @@ pub(crate) fn resolve_declassify_tokens(csv: Option<String>, file: Option<PathBu
 }
 
 pub(crate) struct PruneArgs<'a> {
-    pub id: &'a str,
+    pub agent: Option<String>,
+    pub id: Option<&'a str>,
     pub harness: Option<String>,
     pub min_size: usize,
     pub keep_last: usize,
@@ -167,6 +168,7 @@ fn read_plan(path: &std::path::Path) -> Result<cv_core::prune::Plan> {
 
 pub(crate) fn cmd_prune(args: PruneArgs<'_>) -> Result<()> {
     let PruneArgs {
+        agent,
         id,
         harness,
         min_size,
@@ -198,7 +200,20 @@ pub(crate) fn cmd_prune(args: PruneArgs<'_>) -> Result<()> {
         );
     }
     let want = parse_harness(&harness)?;
-    let (r, _adapter) = crate::cmd::distill::resolve_source(id, want)?;
+    let r = match (id, agent.as_deref()) {
+        (Some(id), agent) => {
+            let (parent, _) = crate::cmd::distill::resolve_source(id, want)?;
+            match agent {
+                Some(agent) => crate::cmd::view::resolve_subagent(&parent, agent)?.session,
+                None => parent,
+            }
+        }
+        (None, Some(agent)) => {
+            let spec = format!("agent-{}", agent.strip_prefix("agent-").unwrap_or(agent));
+            crate::cmd::distill::resolve_source(&spec, want)?.0
+        }
+        (None, None) => return usage("prune requires a source session or --agent"),
+    };
     carry_source(carry_agents, &r)?;
 
     if !cv_core::harness::has_derived_copies(r.harness) {
@@ -276,6 +291,13 @@ pub(crate) fn cmd_prune(args: PruneArgs<'_>) -> Result<()> {
         pct,
         res.est_context_tokens_saved,
     );
+    if dry_run || opts.plan.is_some() {
+        let _ = writeln!(
+            h,
+            "  cache break-even n* = {} ({})",
+            res.cache_break_even.n_star, res.cache_break_even.assumptions
+        );
+    }
     if res.dropped_turns > 0 {
         let sized = match res.window_real_tokens {
             Some(real) => format!(

@@ -161,7 +161,7 @@ impl<'a, W: Write> Cutter<'a, W> {
     fn raw_text(&self, m: &Message) -> Result<String> {
         let mut s = String::new();
         for b in &m.content {
-            if let Block::Text { text } = b {
+            if let Block::Text { text, .. } = b {
                 let t = text.try_resolve(self.resolver)?;
                 if t.trim().is_empty() {
                     continue;
@@ -179,7 +179,7 @@ impl<'a, W: Write> Cutter<'a, W> {
     fn assistant_text(&self, m: &Message) -> Result<Option<String>> {
         let mut s = String::new();
         for b in &m.content {
-            if let Block::Text { text } = b {
+            if let Block::Text { text, .. } = b {
                 if text
                     .inline_str()
                     .is_some_and(|inline| inline.trim_start().starts_with(crate::prune::MARKER_PREFIX))
@@ -756,7 +756,7 @@ mod tests {
     }
 
     fn text(t: &str) -> Block {
-        Block::Text { text: t.into() }
+        Block::from_text(t.into())
     }
 
     fn call(id: &str, name: &str, command: &str) -> Block {
@@ -765,6 +765,7 @@ mod tests {
             name: name.into(),
             input: serde_json::json!({ "command": command }).into(),
             namespace: None,
+            extensions: Default::default(),
         }
     }
 
@@ -959,12 +960,14 @@ mod tests {
             name: "Write".into(),
             input: crate::Json::source(&giant_path, 0, giant_payload.len() as u64).unwrap(),
             namespace: None,
+            extensions: Default::default(),
         };
         let codex_exec = Block::ToolUse {
             id: "e1".into(),
             name: "exec_command".into(),
             input: serde_json::json!({ "cmd": ["git", "-C", "/repo", "commit", "-m", "msg"] }).into(),
             namespace: None,
+            extensions: Default::default(),
         };
 
         let msgs = vec![

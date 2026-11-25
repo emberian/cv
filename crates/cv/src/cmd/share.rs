@@ -262,9 +262,7 @@ mod tests {
             }
             fn stream(&self, r: &cv_core::SessionRef, _: &Demand, sink: &mut dyn MessageSink) -> Result<Session> {
                 let mut message = Message::new(Role::User);
-                message.content.push(Block::Text {
-                    text: "partial output".into(),
-                });
+                message.content.push(Block::from_text("partial output".into()));
                 sink.try_message(message)?;
                 anyhow::bail!("source failed after a message from {}", r.id)
             }
@@ -316,6 +314,7 @@ mod tests {
             name: "Bash".into(),
             input,
             namespace: None,
+            extensions: Default::default(),
         });
         sink.try_message(message)?;
         sink.finish("test");

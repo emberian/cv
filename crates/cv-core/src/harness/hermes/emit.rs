@@ -475,7 +475,7 @@ fn content(projected: &[(&Block, ThinkingFate)], resolver: &crate::lazy::Resolve
         bytes.extend_from_slice(b"\0json:[");
         let mut first = true;
         for (block, fate) in projected {
-            let value = if let Block::Text { text } = block {
+            let value = if let Block::Text { text, .. } = block {
                 Some(std::borrow::Cow::Borrowed(text))
             } else {
                 crate::emit::thinking::text_with_fate(block, *fate)
@@ -505,7 +505,7 @@ fn content(projected: &[(&Block, ThinkingFate)], resolver: &crate::lazy::Resolve
     } else {
         let mut body = String::new();
         for (block, fate) in projected {
-            let value = if let Block::Text { text } = block {
+            let value = if let Block::Text { text, .. } = block {
                 Some(std::borrow::Cow::Borrowed(text))
             } else {
                 crate::emit::thinking::text_with_fate(block, *fate)
@@ -685,6 +685,7 @@ mod tests {
                 signature: None,
                 encrypted: Some("private encrypted".into()),
                 redacted: false,
+                extensions: Default::default(),
             });
             if role == Role::Tool {
                 message.content.push(Block::ToolResult {
@@ -694,11 +695,10 @@ mod tests {
                     tool_name: Some("terminal".into()),
                     status: None,
                     details: None,
+                    extensions: Default::default(),
                 });
             } else {
-                message.content.push(Block::Text {
-                    text: "public answer".into(),
-                });
+                message.content.push(Block::from_text("public answer".into()));
             }
             *message.harness_extra_mut(Harness::Hermes) = serde_json::from_value(json!({
                 "reasoning":"private summary","reasoning_content":"private scratchpad",
@@ -734,7 +734,7 @@ mod tests {
             .flat_map(|m| &m.content)
             .all(|b| !matches!(b, Block::Thinking { .. })));
         assert!(
-            matches!(&replay.messages[0].content[0], Block::Text { text } if text.matches_str("public answer") == Some(true))
+            matches!(&replay.messages[0].content[0], Block::Text { text , .. } if text.matches_str("public answer") == Some(true))
         );
         assert!(replay.messages.iter().all(|m| m
             .harness_extra(Harness::Hermes)
@@ -765,12 +765,11 @@ mod tests {
         let mut s = Session::new("src", Harness::Hermes);
         let mut u = Message::new(Role::User);
         u.content = vec![
-            Block::Text {
-                text: "check diagram".into(),
-            },
+            Block::from_text("check diagram".into()),
             Block::Image {
                 media_type: Some("image/png".into()),
                 data_ref: Some(data_uri.clone()),
+                extensions: Default::default(),
             },
         ];
         s.messages.push(u);

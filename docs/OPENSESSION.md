@@ -110,10 +110,10 @@ Missing `principal` and explicit `null` both mean unspecified. Writers omit unsp
 principals; older documents keep their existing output. Numbers, booleans, and arrays are invalid
 principal values. This is an additive 0.3 field, with no version change.
 
-Unknown object fields are accepted and ignored, not retained by cv's reader. They do not cause a
-crash. Thus older readers accept a document containing `principal` but drop it when rewriting;
-put harness-specific passthrough facts in namespaced `extra` bags. This tolerance does not make
-invalid values for known fields valid.
+cv retains unknown fields on messages, blocks, usage, git and lineage objects with their owner.
+Other unknown session-level keys are ignored. Unknown block types retain their full JSON object
+and position. Unknown message kinds round-trip through an OpenSession carrier at the original
+position. The IR records these limitations in `extra.cv.read_coverage`.
 
 Single-source distillation and cloned session transforms preserve principal. Splicing preserves
 it only when every supplied source specifies an equal principal, including empty spans; a

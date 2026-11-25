@@ -278,7 +278,7 @@ fn registered_emitter(target: Harness) -> Result<EmitFn> {
 /// already that mode). [`thinking_fate`] is the single decision function, shared with
 /// [`block_survives`] so the verifier's idea of what survives cannot drift from what is written.
 #[cfg(test)]
-fn apply_thinking_mode(session: &mut Session, target: Harness, mode: ThinkingMode) {
+pub(crate) fn apply_thinking_mode(session: &mut Session, target: Harness, mode: ThinkingMode) {
     if mode == ThinkingMode::Native {
         return;
     }
@@ -294,6 +294,7 @@ fn apply_thinking_mode(session: &mut Session, target: Harness, mode: ThinkingMod
                     signature,
                     encrypted,
                     redacted,
+                    ..
                 } => thinking_fate(
                     target,
                     mode,
@@ -316,6 +317,7 @@ fn apply_thinking_mode(session: &mut Session, target: Harness, mode: ThinkingMod
                         signature,
                         encrypted,
                         redacted,
+                        ..
                     } = b
                     else {
                         unreachable!("fate computed from a Thinking block")
@@ -325,7 +327,7 @@ fn apply_thinking_mode(session: &mut Session, target: Harness, mode: ThinkingMod
                     } else {
                         thinking_placeholder(signature.as_deref(), encrypted.as_deref(), redacted).into()
                     };
-                    out.push(Block::Text { text });
+                    out.push(Block::from_text(text));
                 }
             }
         }
@@ -518,6 +520,124 @@ pub fn emit_report(
         });
     }
     Ok((result, report))
+}
+
+/// Undo a fresh [`emit`] publication when a companion post-step (such as carrying tool artifacts)
+/// fails, so a failed port never leaves a partial target transcript behind.
+pub fn retract_emitted(
+    target: Harness,
+    out_dir: &Path,
+    out_existed: bool,
+    out_was_empty: bool,
+    res: &EmitResult,
+    anchor: &Path,
+) -> Result<()> {
+    if let Some(sdir) = crate::harness::claude::sidecar::session_dir(anchor) {
+        let _ = fs::remove_dir(sdir.join("tool-results"));
+        if sdir != res.path {
+            let _ = fs::remove_dir(&sdir);
+        }
+    }
+    let is_db = matches!(
+        res.path.extension().and_then(|v| v.to_str()),
+        Some("db" | "sqlite" | "sqlite3")
+    );
+    if is_db {
+        if out_was_empty {
+            for suffix in ["", "-wal", "-shm"] {
+                let mut p = res.path.as_os_str().to_os_string();
+                p.push(suffix);
+                let _ = fs::remove_file(PathBuf::from(p));
+            }
+        } else {
+            #[cfg(feature = "sqlite")]
+            {
+                let mut conn = rusqlite::Connection::open(&res.path)?;
+                let tx = conn.transaction()?;
+                for (table, col) in [
+                    ("messages", "session_id"),
+                    ("transcript_events", "session_id"),
+                    ("session_message", "session_id"),
+                    ("part", "session_id"),
+                    ("message", "session_id"),
+                    ("sessions", "id"),
+                    ("session_v2", "id"),
+                    ("session", "id"),
+                ] {
+                    let has_table: bool = tx.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                        [table],
+                        |r| r.get(0),
+                    )?;
+                    if has_table {
+                        tx.execute(&format!("DELETE FROM {table} WHERE {col} = ?1"), [&res.new_id])?;
+                    }
+                }
+                tx.commit()?;
+            }
+        }
+    } else if res.path.is_dir() {
+        fs::remove_dir_all(&res.path)?;
+    } else {
+        match target {
+            Harness::OpenClaw => {
+                if let Some(index_path) = res.path.parent().map(|d| d.join("sessions.json")) {
+                    if out_was_empty {
+                        let _ = fs::remove_file(&index_path);
+                    } else if let Ok(text) = fs::read_to_string(&index_path) {
+                        if let Ok(mut map) = serde_json::from_str::<serde_json::Map<String, Value>>(&text) {
+                            map.retain(|_, v| v.get("sessionId").and_then(Value::as_str) != Some(&res.new_id));
+                            if let Ok(bytes) = serde_json::to_vec_pretty(&map) {
+                                let _ = crate::publish::publish_reader(
+                                    &index_path,
+                                    "openclaw-retract",
+                                    bytes.as_slice(),
+                                    crate::publish::Claim::Replace,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            Harness::Claude
+            | Harness::Codex
+            | Harness::Grok
+            | Harness::OpenCode
+            | Harness::Gemini
+            | Harness::Antigravity
+            | Harness::Pi
+            | Harness::Kimi
+            | Harness::KimiCode
+            | Harness::Qwen
+            | Harness::LmStudio
+            | Harness::Cline
+            | Harness::Roo
+            | Harness::Continue
+            | Harness::ChatGptExport
+            | Harness::ClaudeExport
+            | Harness::OpenSession
+            | Harness::Hermes
+            | Harness::Cursor
+            | Harness::Goose
+            | Harness::Zed
+            | Harness::Devin => {}
+        }
+        fs::remove_file(&res.path)?;
+    }
+    let mut parent = res.path.parent();
+    while let Some(dir) = parent {
+        if dir == out_dir && out_existed {
+            break;
+        }
+        if fs::remove_dir(dir).is_err() {
+            break;
+        }
+        if dir == out_dir {
+            break;
+        }
+        parent = dir.parent();
+    }
+    Ok(())
 }
 
 /// Which targets [`emit`] can currently write — derived from [`emitter_for`] (the one registry),
@@ -735,14 +855,10 @@ mod tests {
 
     fn sample_session(harness: Harness) -> Session {
         let mut sys = Message::new(Role::System);
-        sys.content.push(Block::Text {
-            text: "you are a helpful assistant".into(),
-        });
+        sys.content.push(Block::from_text("you are a helpful assistant".into()));
 
         let mut user = Message::new(Role::User);
-        user.content.push(Block::Text {
-            text: "list the files please".into(),
-        });
+        user.content.push(Block::from_text("list the files please".into()));
 
         let mut asst = Message::new(Role::Assistant);
         asst.model = Some("test-model".into());
@@ -751,15 +867,15 @@ mod tests {
             signature: None,
             encrypted: None,
             redacted: false,
+            extensions: Default::default(),
         });
-        asst.content.push(Block::Text {
-            text: "Sure, listing now.".into(),
-        });
+        asst.content.push(Block::from_text("Sure, listing now.".into()));
         asst.content.push(Block::ToolUse {
             id: "call_1".into(),
             name: "run_shell".into(),
             input: (serde_json::json!({ "cmd": "ls" })).into(),
             namespace: None,
+            extensions: Default::default(),
         });
 
         let mut tool = Message::new(Role::Tool);
@@ -770,6 +886,7 @@ mod tests {
             tool_name: None,
             status: None,
             details: None,
+            extensions: Default::default(),
         });
 
         Session {
@@ -782,6 +899,7 @@ mod tests {
                 branch: Some("main".into()),
                 commit: None,
                 remote: None,
+                ..Default::default()
             }),
             messages: vec![sys, user, asst, tool],
             ..Session::new("orig-id", harness)
@@ -829,7 +947,7 @@ mod tests {
             message.model = None;
             for block in &mut message.content {
                 match block {
-                    Block::Text { text: value } | Block::Thinking { text: value, .. } => *value = text.clone(),
+                    Block::Text { text: value, .. } | Block::Thinking { text: value, .. } => *value = text.clone(),
                     Block::ToolUse { input: value, .. } => *value = input.clone(),
                     Block::ToolResult { content, is_error, .. } => {
                         *content = text.clone();
@@ -839,9 +957,9 @@ mod tests {
                 }
             }
         }
-        session.messages[1].content.insert(0, Block::Text { text: "".into() });
-        session.messages[1].content.push(Block::Text { text: "".into() });
-        session.messages[1].content.push(Block::Text { text: text.clone() });
+        session.messages[1].content.insert(0, Block::from_text("".into()));
+        session.messages[1].content.push(Block::from_text("".into()));
+        session.messages[1].content.push(Block::from_text(text.clone()));
         for role in [Role::User, Role::System] {
             let mut message = Message::new(role);
             message.content.push(Block::Thinking {
@@ -849,6 +967,7 @@ mod tests {
                 signature: Some("signature-only".into()),
                 encrypted: None,
                 redacted: false,
+                extensions: Default::default(),
             });
             session.messages.push(message);
         }
@@ -859,6 +978,7 @@ mod tests {
             signature: None,
             encrypted: None,
             redacted: true,
+            extensions: Default::default(),
         });
         session.messages.push(compact);
         let owned = materialized_session(&session)?;
@@ -938,13 +1058,9 @@ mod tests {
         let mut user = Message::new(Role::User);
         user.id = Some("u".into());
         user.content = vec![
-            Block::Text {
-                text: String::new().into(),
-            },
-            Block::Text { text: text.clone() },
-            Block::Text {
-                text: String::new().into(),
-            },
+            Block::from_text(String::new().into()),
+            Block::from_text(text.clone()),
+            Block::from_text(String::new().into()),
         ];
         session.messages.push(user);
         let mut dropped = Message::new(Role::System);
@@ -960,24 +1076,28 @@ mod tests {
                 signature: Some("signature".into()),
                 encrypted: None,
                 redacted: false,
+                extensions: Default::default(),
             },
             Block::Thinking {
                 text: String::new().into(),
                 signature: None,
                 encrypted: None,
                 redacted: true,
+                extensions: Default::default(),
             },
             Block::ToolUse {
                 id: "answered".into(),
                 name: "Read".into(),
                 input: args,
                 namespace: None,
+                extensions: Default::default(),
             },
             Block::ToolUse {
                 id: "orphan".into(),
                 name: "Read".into(),
                 input: Value::Null.into(),
                 namespace: None,
+                extensions: Default::default(),
             },
         ];
         assistant.harness_extra_mut(Harness::Claude).extend([
@@ -994,6 +1114,7 @@ mod tests {
             name: "Read".into(),
             input: Value::Null.into(),
             namespace: None,
+            extensions: Default::default(),
         });
         session.messages.push(orphan);
         let mut result = Message::new(Role::Tool);
@@ -1006,6 +1127,7 @@ mod tests {
             is_error: false,
             status: None,
             details: Some(json!({"kept":"detail","persistedOutput":"derived-only"})),
+            extensions: Default::default(),
         });
         session.messages.push(result);
         let mut carrier = Message::new(Role::System);
@@ -1024,6 +1146,7 @@ mod tests {
             name: "Read".into(),
             input: Value::Null.into(),
             namespace: None,
+            extensions: Default::default(),
         });
         session.messages.push(carrier_call);
         // Duplicate UUID/tool IDs, raw content overrides, and acyclic forward parents retain
@@ -1040,15 +1163,17 @@ mod tests {
         future.id = Some("future".into());
         future.parent_id = Some("u".into());
         future.content = vec![
-            Block::Text { text: "mixed".into() },
+            Block::from_text("mixed".into()),
             Block::Image {
                 media_type: Some("image/png".into()),
                 data_ref: Some("file:img".into()),
+                extensions: Default::default(),
             },
             Block::File {
                 mime: Some("text/plain".into()),
                 path: Some("doc".into()),
                 source: Some("https://example.invalid/doc".into()),
+                extensions: Default::default(),
             },
         ];
         session.messages.push(future);
@@ -1114,7 +1239,7 @@ mod tests {
                 let mut message = Message::new(role);
                 message.id = Some(id.into());
                 message.parent_id = parent.map(str::to_owned);
-                message.content.push(Block::Text { text: id.into() });
+                message.content.push(Block::from_text(id.into()));
                 session.messages.push(message);
             }
             // Without an explicit parent, the writer's chronological fallback would make
@@ -1179,10 +1304,9 @@ mod tests {
                     name: "Read".into(),
                     input: Value::Null.into(),
                     namespace: None,
+                    extensions: Default::default(),
                 },
-                Block::Text {
-                    text: "original text".into(),
-                },
+                Block::from_text("original text".into()),
             ];
             let bag = message.harness_extra_mut(Harness::Claude);
             bag.insert(
@@ -1237,6 +1361,7 @@ mod tests {
             signature: Some("sig".into()),
             encrypted: None,
             redacted: false,
+            extensions: Default::default(),
         });
         session.messages.push(message);
         fs::write(&source, serde_json::to_vec(&"changed body".repeat(3000))?)?;
@@ -1348,17 +1473,17 @@ mod tests {
     fn claude_round_trip_preserves_user_images_and_files() {
         let mut s = sample_session(Harness::Claude);
         let mut user = Message::new(Role::User);
-        user.content.push(Block::Text {
-            text: "look at this".into(),
-        });
+        user.content.push(Block::from_text("look at this".into()));
         user.content.push(Block::Image {
             media_type: Some("image/png".into()),
             data_ref: Some("https://example.com/x.png".into()),
+            extensions: Default::default(),
         });
         user.content.push(Block::File {
             mime: Some("application/pdf".into()),
             path: Some("spec.pdf".into()),
             source: Some("file:file_123".into()),
+            extensions: Default::default(),
         });
         s.messages.push(user);
 
@@ -1385,13 +1510,13 @@ mod tests {
         assert!(
             rich.content
                 .iter()
-                .any(|b| matches!(b, Block::Text { text } if text.matches_str("look at this") == Some(true))),
+                .any(|b| matches!(b, Block::Text { text , .. } if text.matches_str("look at this") == Some(true))),
             "user text block survives"
         );
         assert!(
             rich.content
                 .iter()
-                .any(|b| matches!(b, Block::Image { media_type, data_ref }
+                .any(|b| matches!(b, Block::Image { media_type, data_ref , .. }
                 if media_type.as_deref() == Some("image/png")
                     && data_ref.as_deref() == Some("https://example.com/x.png"))),
             "user image (media_type + data_ref) survives: {:?}",
@@ -1400,7 +1525,7 @@ mod tests {
         assert!(
             rich.content
                 .iter()
-                .any(|b| matches!(b, Block::File { mime, path, source }
+                .any(|b| matches!(b, Block::File { mime, path, source , .. }
                 if mime.as_deref() == Some("application/pdf")
                     && path.as_deref() == Some("spec.pdf")
                     && source.as_deref() == Some("file:file_123"))),
@@ -1799,6 +1924,7 @@ mod tests {
             tool_name: None,
             status: None,
             details: None,
+            extensions: Default::default(),
         });
         s.messages.push(failed);
 
@@ -1915,6 +2041,7 @@ mod tests {
             tool_name: None,
             status: None,
             details: None,
+            extensions: Default::default(),
         });
         s.messages.push(failed);
 
@@ -2175,17 +2302,14 @@ mod tests {
     /// only) should report the image as dropped.
     fn image_session() -> Session {
         let mut user = Message::new(Role::User);
-        user.content.push(Block::Text {
-            text: "look at this".into(),
-        });
+        user.content.push(Block::from_text("look at this".into()));
         user.content.push(Block::Image {
             media_type: Some("image/png".into()),
             data_ref: Some("data:image/png;base64,AAAA".into()),
+            extensions: Default::default(),
         });
         let mut asst = Message::new(Role::Assistant);
-        asst.content.push(Block::Text {
-            text: "nice picture".into(),
-        });
+        asst.content.push(Block::from_text("nice picture".into()));
 
         Session {
             cwd: Some(PathBuf::from("/Users/test/project")),
@@ -2678,6 +2802,7 @@ mod tests {
                     cache_creation_tokens: Some(2),
                     reasoning_tokens: Some(5),
                     cost_usd: Some(0.0123),
+                    ..Default::default()
                 });
             }
             // Give the tool result structured details.
@@ -2733,11 +2858,11 @@ mod tests {
         let mut s = sample_session(Harness::Codex);
         s.system_prompt = Some("You are a careful engineer.".into());
         let mut boundary = Message::of_kind(Role::System, MessageKind::CompactionBoundary, Origin::Harness);
-        boundary.content.push(Block::Text { text: "".into() });
+        boundary.content.push(Block::from_text("".into()));
         let mut summary = Message::of_kind(Role::System, MessageKind::CompactionSummary, Origin::Harness);
-        summary.content.push(Block::Text {
-            text: "earlier: set up the project".into(),
-        });
+        summary
+            .content
+            .push(Block::from_text("earlier: set up the project".into()));
         s.messages.push(boundary);
         s.messages.push(summary);
 
@@ -2778,17 +2903,13 @@ mod tests {
         let mut s = sample_session(Harness::Codex);
         s.system_prompt = Some("Follow the house style.".into());
         let mut injected = Message::of_kind(Role::System, MessageKind::InjectedContext, Origin::Harness);
-        injected.content.push(Block::Text {
-            text: "<environment_context>cwd=/x</environment_context>".into(),
-        });
+        injected.content.push(Block::from_text(
+            "<environment_context>cwd=/x</environment_context>".into(),
+        ));
         let mut boundary = Message::of_kind(Role::System, MessageKind::CompactionBoundary, Origin::Harness);
-        boundary.content.push(Block::Text {
-            text: "[history compacted]".into(),
-        });
+        boundary.content.push(Block::from_text("[history compacted]".into()));
         let mut summary = Message::of_kind(Role::User, MessageKind::CompactionSummary, Origin::Harness);
-        summary.content.push(Block::Text {
-            text: "summary seed".into(),
-        });
+        summary.content.push(Block::from_text("summary seed".into()));
         s.messages.push(injected);
         s.messages.push(boundary);
         s.messages.push(summary);
@@ -2852,9 +2973,7 @@ mod tests {
         let mut s = sample_session(Harness::OpenClaw);
         let mut mc = Message::of_kind(Role::System, MessageKind::ModelChange, Origin::Harness);
         mc.model = Some("claude-opus-4".into());
-        mc.content.push(Block::Text {
-            text: "[model changed]".into(),
-        });
+        mc.content.push(Block::from_text("[model changed]".into()));
         s.messages.push(mc);
 
         let out = temp_dir();
@@ -3033,6 +3152,7 @@ mod tests {
             signature: Some("SIGONLY".into()),
             encrypted: None,
             redacted: false,
+            extensions: Default::default(),
         });
         s.messages.insert(3, think);
 
@@ -3167,6 +3287,7 @@ mod tests {
             tool_name: Some("run_shell".into()),
             status: None,
             details: Some(serde_json::json!({ "title": "ls" })),
+            extensions: Default::default(),
         });
         s.messages.insert(0, orphan);
         s
@@ -3551,6 +3672,7 @@ mod tests {
                         cache_creation_tokens: Some(6),
                         reasoning_tokens: Some(7),
                         cost_usd: Some(0.5),
+                        ..Default::default()
                     });
                 }
             }
@@ -3722,6 +3844,7 @@ mod tests {
             signature: Some(sig.to_string()),
             encrypted: None,
             redacted: false,
+            extensions: Default::default(),
         };
         let mut base = sample_session(Harness::Claude);
         let mut think = Message::new(Role::Assistant);
@@ -3849,12 +3972,7 @@ mod tests {
                 source.system_prompt = Some("system instructions".into());
                 source.lineage.forked_from = Some("previous-session".into());
                 let mut command = Message::new(Role::User);
-                command.content = vec![
-                    Block::Text { text: "  ".into() },
-                    Block::Text {
-                        text: " /compact".into(),
-                    },
-                ];
+                command.content = vec![Block::from_text("  ".into()), Block::from_text(" /compact".into())];
                 source.messages.push(command);
                 let mut orphan = Message::new(Role::Assistant);
                 orphan.content.push(Block::ToolUse {
@@ -3862,6 +3980,7 @@ mod tests {
                     name: "unanswered".into(),
                     input: json!({"ignored": "body"}).into(),
                     namespace: None,
+                    extensions: Default::default(),
                 });
                 source.messages.push(orphan);
                 let mut signed = Message::new(Role::Assistant);
@@ -3870,6 +3989,7 @@ mod tests {
                     signature: Some("signature".into()),
                     encrypted: None,
                     redacted: true,
+                    extensions: Default::default(),
                 });
                 source.messages.push(signed);
                 let opts = EmitOptions {
@@ -3895,9 +4015,7 @@ mod tests {
         let mut session = Session::new("raw", Harness::Claude);
         let mut call = Message::new(Role::Assistant);
         call.id = Some("call".into());
-        call.content.push(Block::Text {
-            text: "IR projection".into(),
-        });
+        call.content.push(Block::from_text("IR projection".into()));
         call.harness_extra_mut(Harness::Claude).insert(
             "message.content".into(),
             serde_json::json!([
@@ -4090,6 +4208,7 @@ mod tests {
             name: "bash".into(),
             namespace: None,
             input: serde_json::json!({"command": "echo hi"}).into(),
+            extensions: Default::default(),
         }];
         with_tool.messages.push(tool_msg);
         let grok_pinned = EmitOptions {
@@ -4101,7 +4220,7 @@ mod tests {
         let mut plain = Session::new("plain", Harness::Grok);
         plain.cwd = with_tool.cwd.clone();
         let mut u = Message::new(Role::User);
-        u.content = vec![Block::Text { text: "hello".into() }];
+        u.content = vec![Block::from_text("hello".into())];
         plain.messages.push(u);
         let g2 = emit(
             &plain,
@@ -4122,7 +4241,7 @@ mod tests {
         // [C6] Gemini checked token addition rejects u64 overflow cleanly instead of panicking/wrapping.
         let mut overflow_sess = sample_session(Harness::Gemini);
         let mut asst = Message::new(Role::Assistant);
-        asst.content = vec![Block::Text { text: "reply".into() }];
+        asst.content = vec![Block::from_text("reply".into())];
         asst.usage = Some(crate::ir::Usage {
             input_tokens: Some(u64::MAX),
             cache_read_tokens: Some(1),

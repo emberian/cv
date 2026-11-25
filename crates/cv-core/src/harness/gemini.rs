@@ -1042,7 +1042,7 @@ fn parse_logs_with(value: Value, source_path: Option<PathBuf>, cwd: fn(&Path) ->
             }
             let mut m = Message::new(role);
             m.timestamp = e.get("timestamp").and_then(Value::as_str).and_then(parse_ts);
-            m.content.push(Block::Text { text: text.into() });
+            m.content.push(Block::from_text(text.into()));
             if role == Role::User {
                 type_user_turn(&mut m);
             }
@@ -1244,7 +1244,7 @@ fn checkpoint(
                 .content
                 .iter()
                 .take_while(
-                    |b| matches!(b, Block::Text { text } if is_ignored_user_content(text) && !text.trim().is_empty()),
+                    |b| matches!(b, Block::Text { text , .. } if is_ignored_user_content(text) && !text.trim().is_empty()),
                 )
                 .count();
             if lead > 0 && lead < m.content.len() {
@@ -2059,7 +2059,7 @@ mod tests {
         assert!(a3s[0]
             .content
             .iter()
-            .any(|b| matches!(b, Block::Text { text } if text.contains("exactly two files"))));
+            .any(|b| matches!(b, Block::Text { text , .. } if text.contains("exactly two files"))));
         // The cut itself is visible: one Branch marker, right before the re-appended a3.
         let branches: Vec<usize> = s
             .messages
@@ -2302,7 +2302,7 @@ mod tests {
             .messages
             .iter()
             .flat_map(|m| &m.content)
-            .any(|b| matches!(b, Block::Text { text } if text.is_lazy())));
+            .any(|b| matches!(b, Block::Text { text , .. } if text.is_lazy())));
         s.materialize().unwrap();
         assert_eq!(
             as_json(&s),

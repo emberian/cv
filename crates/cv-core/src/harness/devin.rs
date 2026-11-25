@@ -1021,9 +1021,7 @@ fn stream_session(
                 let mut b = Message::of_kind(Role::System, MessageKind::CompactionBoundary, Origin::Harness);
                 b.id = Some(bid.clone());
                 b.timestamp = m.timestamp;
-                b.content = vec![Block::Text {
-                    text: "context compacted".into(),
-                }];
+                b.content = vec![Block::from_text("context compacted".into())];
                 {
                     let bag = b.harness_extra_mut(Harness::Devin);
                     if let Some(facts) = compaction_facts.get(&sf) {
@@ -1177,7 +1175,8 @@ mod tests {
                     matches!(
                         b,
                         Block::Text {
-                            text: crate::Text::Source(_)
+                            text: crate::Text::Source(_),
+                            ..
                         }
                     )
                 })
@@ -1648,7 +1647,9 @@ mod tests {
         assert!(
             matches!(&a.content[0], Block::Thinking { signature, .. } if signature.as_deref() == Some("sealed.v1.fixture"))
         );
-        assert!(matches!(&a.content[1], Block::Text { text } if text.matches_str("I'll check both.") == Some(true)));
+        assert!(
+            matches!(&a.content[1], Block::Text { text , .. } if text.matches_str("I'll check both.") == Some(true))
+        );
         let tool_ids: Vec<&str> = a
             .content
             .iter()

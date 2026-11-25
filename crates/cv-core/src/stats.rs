@@ -367,6 +367,7 @@ impl Record for UsageHit {
                 cache_creation_tokens: fields[3],
                 reasoning_tokens: fields[4],
                 cost_usd: fields[5].map(f64::from_bits),
+                ..Default::default()
             },
         })
     }

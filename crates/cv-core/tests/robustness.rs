@@ -26,14 +26,10 @@ fn temp_dir() -> PathBuf {
 /// A small, representative IR session: system + user + assistant(text+thinking+tool_use) + tool.
 fn sample_session(harness: Harness) -> Session {
     let mut sys = Message::new(Role::System);
-    sys.content.push(Block::Text {
-        text: "you are a helpful assistant".into(),
-    });
+    sys.content.push(Block::from_text("you are a helpful assistant".into()));
 
     let mut user = Message::new(Role::User);
-    user.content.push(Block::Text {
-        text: "list the files please".into(),
-    });
+    user.content.push(Block::from_text("list the files please".into()));
 
     let mut asst = Message::new(Role::Assistant);
     asst.model = Some("test-model".into());
@@ -42,15 +38,15 @@ fn sample_session(harness: Harness) -> Session {
         signature: None,
         encrypted: None,
         redacted: false,
+        extensions: Default::default(),
     });
-    asst.content.push(Block::Text {
-        text: "Sure, listing now.".into(),
-    });
+    asst.content.push(Block::from_text("Sure, listing now.".into()));
     asst.content.push(Block::ToolUse {
         id: "call_1".into(),
         name: "run_shell".into(),
         input: serde_json::json!({ "cmd": "ls" }).into(),
         namespace: None,
+        extensions: Default::default(),
     });
 
     let mut tool = Message::new(Role::Tool);
@@ -61,6 +57,7 @@ fn sample_session(harness: Harness) -> Session {
         tool_name: Some("run_shell".into()),
         status: None,
         details: None,
+        extensions: Default::default(),
     });
 
     Session {
@@ -73,6 +70,7 @@ fn sample_session(harness: Harness) -> Session {
             branch: Some("main".into()),
             commit: None,
             remote: None,
+            ..Default::default()
         }),
         messages: vec![sys, user, asst, tool],
         ..Session::new("orig-id", harness)

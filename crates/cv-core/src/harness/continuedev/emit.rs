@@ -139,7 +139,7 @@ fn item(
                 for b in &msg.content {
                     let value = if mode == crate::emit::ThinkingMode::Native {
                         match b {
-                            Block::Text { text } => Some(std::borrow::Cow::Borrowed(text)),
+                            Block::Text { text, .. } => Some(std::borrow::Cow::Borrowed(text)),
                             Block::Thinking { text, .. }
                                 if crate::emit::thinking::first_character(text, resolver, false)?.is_some() =>
                             {
@@ -225,7 +225,7 @@ fn item(
         // Checking the role before traversing avoids rescanning R blocks for R items.
         if msg.role != Role::Tool {
             for b in &msg.content {
-                if let Block::File { path, source, mime } = b {
+                if let Block::File { path, source, mime, .. } = b {
                     if !first {
                         w.write_all(b",")?;
                     }
@@ -406,10 +406,12 @@ mod tests {
                 path: Some("/synthetic/input.txt".into()),
                 source: None,
                 mime: Some("text/plain".into()),
+                extensions: Default::default(),
             },
             Block::Image {
                 media_type: Some("image/png".into()),
                 data_ref: Some("https://synthetic/image.png".into()),
+                extensions: Default::default(),
             },
         ]);
         lazy.messages[1].content.push(Block::Thinking {
@@ -417,6 +419,7 @@ mod tests {
             signature: Some("empty-signature".into()),
             encrypted: None,
             redacted: false,
+            extensions: Default::default(),
         });
         let mut frozen = crate::emit::frozen::Frozen::new("continuedev-emit");
         for mode in [
@@ -458,9 +461,7 @@ mod tests {
         session.created_at =
             Some(chrono::DateTime::parse_from_rfc3339("2026-10-13T12:00:00Z")?.with_timezone(&chrono::Utc));
         let mut user = Message::new(Role::User);
-        user.content.push(Block::Text {
-            text: "inline prompt".into(),
-        });
+        user.content.push(Block::from_text("inline prompt".into()));
         session.messages.push(user);
         let mut assistant = Message::new(Role::Assistant);
         assistant.content.push(Block::ToolUse {
@@ -468,6 +469,7 @@ mod tests {
             name: "Read".into(),
             input,
             namespace: None,
+            extensions: Default::default(),
         });
         session.messages.push(assistant);
         let dest = world.base.join("output");
@@ -503,6 +505,7 @@ mod tests {
             signature: None,
             encrypted: None,
             redacted: false,
+            extensions: Default::default(),
         });
         session.messages.push(message);
         let opts = crate::emit::EmitOptions {
@@ -552,6 +555,7 @@ mod tests {
             name: "Read".into(),
             input: crate::Json::source(&path, 0, 2)?,
             namespace: None,
+            extensions: Default::default(),
         });
         session.messages.push(user);
         let dest = world.base.join("output");
@@ -588,6 +592,7 @@ mod tests {
                     tool_name: None,
                     status: None,
                     details: None,
+                    extensions: Default::default(),
                 });
             }
             // Tool attachments/prose were already omitted by the native writer; the
@@ -596,10 +601,9 @@ mod tests {
                 path: Some("ignored.txt".into()),
                 source: None,
                 mime: None,
+                extensions: Default::default(),
             });
-            tool.content.push(Block::Text {
-                text: "ignored prose".into(),
-            });
+            tool.content.push(Block::from_text("ignored prose".into()));
             session.messages.push(tool);
             let path = world.base.join(format!("wide-{count}.json"));
             let stage = transcript(&session, "copy", None, None, crate::emit::ThinkingMode::Native)?;
@@ -616,9 +620,7 @@ mod tests {
         let world = crate::test_world("continue-tool-without-result");
         let mut session = Session::new("source", Harness::Continue);
         let mut tool = Message::new(Role::Tool);
-        tool.content.push(Block::Text {
-            text: "prose only".into(),
-        });
+        tool.content.push(Block::from_text("prose only".into()));
         session.messages.push(tool);
         let dest = world.base.join("output");
         let opts = crate::emit::EmitOptions {

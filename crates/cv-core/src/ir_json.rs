@@ -226,10 +226,35 @@ impl<W: Write> Fields<'_, W> {
         self.writer.write_all(b"]").map_err(OutputError::from)
     }
 }
+impl<W: Write> serde::ser::SerializeMap for Fields<'_, W> {
+    type Ok = ();
+    type Error = OutputError;
+    fn serialize_key<T: ?Sized + Serialize>(&mut self, _: &T) -> Result<()> {
+        Err(error("IR fields must serialize key and value together"))
+    }
+    fn serialize_value<T: ?Sized + Serialize>(&mut self, _: &T) -> Result<()> {
+        Err(error("IR fields must serialize key and value together"))
+    }
+    fn serialize_entry<K: ?Sized + Serialize, V: ?Sized + Serialize>(&mut self, key: &K, value: &V) -> Result<()> {
+        let key = serde_json::to_value(key)?;
+        self.field(key.as_str().ok_or_else(|| error("expected string key"))?, value)
+    }
+    fn end(self) -> Result<()> {
+        self.finish()
+    }
+}
 impl<W: Write> SerializeStruct for Fields<'_, W> {
     type Ok = ();
     type Error = OutputError;
     fn serialize_field<T: ?Sized + Serialize>(&mut self, key: &'static str, value: &T) -> Result<()> {
+        self.field(key, value)
+    }
+    fn end(self) -> Result<()> {
+        self.finish()
+    }
+}
+impl<W: Write> Fields<'_, W> {
+    fn field<T: ?Sized + Serialize>(&mut self, key: &str, value: &T) -> Result<()> {
         if !self.first {
             self.writer.write_all(b",").map_err(OutputError::from)?;
         }
@@ -265,7 +290,7 @@ impl<W: Write> SerializeStruct for Fields<'_, W> {
                 }
             }
             (Context::Block(block), _) => match block {
-                Block::Text { text } | Block::Thinking { text, .. } => {
+                Block::Text { text, .. } | Block::Thinking { text, .. } => {
                     if key == "text" {
                         self.text(text)
                     } else {
@@ -286,12 +311,12 @@ impl<W: Write> SerializeStruct for Fields<'_, W> {
                         self.value(value)
                     }
                 }
-                Block::Image { .. } | Block::File { .. } => self.value(value),
+                Block::Opaque { .. } | Block::Image { .. } | Block::File { .. } => self.value(value),
             },
             _ => self.value(value),
         }
     }
-    fn end(self) -> Result<()> {
+    fn finish(self) -> Result<()> {
         if self.pretty && !self.first {
             self.writer.write_all(b"\n").map_err(OutputError::from)?;
             indent(self.writer, self.depth).map_err(OutputError::from)?;
@@ -313,7 +338,7 @@ impl<W: Write> Serializer for Fields<'_, W> {
     type SerializeTuple = Impossible<(), Self::Error>;
     type SerializeTupleStruct = Impossible<(), Self::Error>;
     type SerializeTupleVariant = Impossible<(), Self::Error>;
-    type SerializeMap = Impossible<(), Self::Error>;
+    type SerializeMap = Self;
     type SerializeStruct = Self;
     type SerializeStructVariant = Impossible<(), Self::Error>;
     fn serialize_struct(self, _: &'static str, _: usize) -> Result<Self> {
@@ -363,7 +388,7 @@ impl<W: Write> Serializer for Fields<'_, W> {
         Err(error("expected struct"))
     }
     fn serialize_map(self, _: Option<usize>) -> Result<Self::SerializeMap> {
-        Err(error("expected struct"))
+        self.serialize_struct("", 0)
     }
     fn serialize_struct_variant(
         self,
@@ -588,15 +613,14 @@ mod tests {
                 name: "tool".into(),
                 namespace: None,
                 input: Json::source(&source.0, 0, raw.len() as u64).unwrap(),
+                extensions: Default::default(),
             },
-            Block::Text {
-                text: Text::Span(Span {
-                    source: Some(text_source.0.clone()),
-                    offset: 1,
-                    len: body.len() as u64,
-                    escaped: true,
-                }),
-            },
+            Block::from_text(Text::Span(Span {
+                source: Some(text_source.0.clone()),
+                offset: 1,
+                len: body.len() as u64,
+                escaped: true,
+            })),
             Block::ToolResult {
                 tool_use_id: "id".into(),
                 content: Text::Span(Span {
@@ -609,6 +633,7 @@ mod tests {
                 tool_name: None,
                 status: None,
                 details: None,
+                extensions: Default::default(),
             },
         ];
         oracle(&message, &Resolver::new(None));
@@ -676,19 +701,18 @@ mod tests {
         let resolver = Resolver::new(None);
         let mut message = Message::new(Role::Assistant);
         for block in [
-            Block::Text {
-                text: Text::Span(Span {
-                    source: Some(text.0.clone()),
-                    offset: 1,
-                    len: 10000,
-                    escaped: false,
-                }),
-            },
+            Block::from_text(Text::Span(Span {
+                source: Some(text.0.clone()),
+                offset: 1,
+                len: 10000,
+                escaped: false,
+            })),
             Block::ToolUse {
                 id: "id".into(),
                 name: "tool".into(),
                 namespace: None,
                 input: Json::source(&args.0, 0, std::fs::metadata(&args.0).unwrap().len()).unwrap(),
+                extensions: Default::default(),
             },
         ] {
             message.content = vec![block];
@@ -705,14 +729,12 @@ mod tests {
         let resolver = Resolver::new(None);
         let source = Source::new(b"text");
         let mut message = Message::new(Role::User);
-        message.content.push(Block::Text {
-            text: Text::Span(Span {
-                source: Some(source.0.clone()),
-                offset: 0,
-                len: 100,
-                escaped: false,
-            }),
-        });
+        message.content.push(Block::from_text(Text::Span(Span {
+            source: Some(source.0.clone()),
+            offset: 0,
+            len: 100,
+            escaped: false,
+        })));
         assert!(message.write_json(&mut Vec::new(), &resolver).is_err());
         let json_source = Source::new(b"{\"a\":1}");
         message.content = vec![Block::ToolUse {
@@ -720,6 +742,7 @@ mod tests {
             name: "tool".into(),
             namespace: None,
             input: Json::source(&json_source.0, 0, 7).unwrap(),
+            extensions: Default::default(),
         }];
         std::fs::write(&json_source.0, b"{\"b\":2}").unwrap();
         assert!(message.write_json_pretty(&mut Vec::new(), &resolver).is_err());
@@ -751,7 +774,7 @@ mod output_freshness_tests {
             })?
             .unwrap();
         let mut message = Message::new(crate::Role::User);
-        message.content.push(Block::Text { text });
+        message.content.push(Block::from_text(text));
         message.extra.insert("mutate_marker".into(), serde_json::json!(true));
         struct Mutate<'a> {
             source: &'a std::path::Path,
@@ -780,13 +803,13 @@ mod output_freshness_tests {
             for fail in [false, true] {
                 std::fs::write(&path, &raw)?;
                 // Refresh capture after each deliberate source replacement.
-                message.content[0] = Block::Text {
-                    text: crate::json::JsonSource::capture(&path)?
+                message.content[0] = Block::from_text(
+                    crate::json::JsonSource::capture(&path)?
                         .read(ReadInput::Range(0, raw.len() as u64), Validation::Value, |v| {
                             v.source_text()
                         })?
                         .unwrap(),
-                };
+                );
                 let mut writer = Mutate {
                     source: &path,
                     done: false,

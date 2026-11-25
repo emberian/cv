@@ -539,9 +539,7 @@ mod tests {
             }
             fn stream(&self, r: &SessionRef, _: &Demand, sink: &mut dyn MessageSink) -> Result<Session> {
                 let mut message = Message::new(crate::Role::Assistant);
-                message.content.push(crate::Block::Text {
-                    text: "selected".into(),
-                });
+                message.content.push(crate::Block::from_text("selected".into()));
                 sink.try_message(message)?;
                 std::fs::write(&r.path, b"changed")?;
                 Ok(Session::new(r.id.clone(), r.harness))
@@ -1021,6 +1019,7 @@ mod tests {
                     name: "Bash".into(),
                     namespace: None,
                     input,
+                    extensions: Default::default(),
                 });
                 sink.message(message);
                 Ok(Session::new(&r.id, r.harness))

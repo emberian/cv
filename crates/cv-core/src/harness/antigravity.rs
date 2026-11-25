@@ -2713,6 +2713,7 @@ impl StepCodec {
                                 .value("thinking_redacted")?
                                 .and_then(|v| v.as_bool())
                                 .unwrap_or(false),
+                            extensions: Default::default(),
                         });
                     }
                 }
@@ -2767,6 +2768,7 @@ impl StepCodec {
                             name,
                             input,
                             namespace: None,
+                            extensions: Default::default(),
                         });
                     }
                 }
@@ -2987,6 +2989,7 @@ impl StepCodec {
                     tool_name,
                     status: norm_status,
                     details,
+                    extensions: Default::default(),
                 });
                 push_media_blocks(&mut m.content, fields.get("media"), media_marker)?;
                 attach_step_extras(&mut m, &fields, step_index, &source, status.as_deref(), want_extra)?;
@@ -3195,9 +3198,7 @@ impl StepCodec {
                     (true, true) => None,
                 };
                 if let Some(text) = combined {
-                    m.content.push(Block::Text {
-                        text: Text::Inline(text),
-                    });
+                    m.content.push(Block::from_text(Text::Inline(text)));
                 }
                 attach_step_extras(&mut m, &fields, step_index, &source, status.as_deref(), want_extra)?;
                 Ok(sink.message(m))
@@ -3335,7 +3336,7 @@ fn nonempty_view_text(view: JsonView<'_>, spans: bool) -> Result<Option<Text>> {
 fn push_nonempty_text(blocks: &mut Vec<Block>, view: Option<JsonView<'_>>, spans: bool) -> Result<()> {
     if let Some(view) = view {
         if let Some(text) = nonempty_view_text(view, spans)? {
-            blocks.push(Block::Text { text });
+            blocks.push(Block::from_text(text));
         }
     }
     Ok(())
@@ -3379,12 +3380,14 @@ fn push_media_blocks(blocks: &mut Vec<Block>, media_view: Option<JsonView<'_>>, 
                         Block::Image {
                             media_type: mime,
                             data_ref: Some("base64:inline".into()),
+                            extensions: Default::default(),
                         }
                     } else {
                         Block::File {
                             mime,
                             path: None,
                             source: Some("base64:inline".into()),
+                            extensions: Default::default(),
                         }
                     });
                     continue;
@@ -3402,12 +3405,14 @@ fn push_media_blocks(blocks: &mut Vec<Block>, media_view: Option<JsonView<'_>>, 
             blocks.push(Block::Image {
                 media_type: mime,
                 data_ref: Some(resolved),
+                extensions: Default::default(),
             });
         } else {
             blocks.push(Block::File {
                 mime,
                 path: Some(resolved),
                 source: None,
+                extensions: Default::default(),
             });
         }
     }
@@ -4572,6 +4577,7 @@ fn apply_native_db_metadata(conv_db: &Path, want_extra: bool, s: &mut Session, e
                     branch: Some(branch),
                     commit: None,
                     remote: None,
+                    ..Default::default()
                 });
             }
         }
@@ -4757,6 +4763,7 @@ fn apply_summary_to_session(s: &mut Session, sum: &SummaryRow, has_pbtxt_title: 
                 branch: Some(branch.clone()),
                 commit: None,
                 remote: None,
+                ..Default::default()
             });
         }
     }
@@ -5048,7 +5055,7 @@ mod tests {
         let session = adapter.parse(&discovered[0]).unwrap();
         assert_eq!(session.messages.len(), 2);
         assert_eq!(session.messages[0].id.as_deref(), Some("0"));
-        let Block::Text { text } = &session.messages[1].content[0] else {
+        let Block::Text { text, .. } = &session.messages[1].content[0] else {
             panic!("text")
         };
         assert_eq!(
@@ -5242,7 +5249,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(session.title.as_deref(), Some("before"));
-        let Block::Text { text } = &sink.messages[0].content[0] else {
+        let Block::Text { text, .. } = &sink.messages[0].content[0] else {
             panic!("text")
         };
         assert_eq!(

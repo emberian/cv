@@ -56,7 +56,9 @@ pub(crate) fn cmd_port(
         )
     });
     let new_cwd = cwd.clone();
-    let written = emit_session_output(
+    let mut artifacts = cv_core::harness::claude::artifacts::Artifacts::default();
+    artifacts.collect_source(&r, &session)?;
+    let written = emit_with_artifacts(
         &session,
         to_h,
         out,
@@ -68,6 +70,7 @@ pub(crate) fn cmd_port(
             ..Default::default()
         },
         json,
+        Some(&artifacts),
     )?;
     if let Some(grown) = grown {
         if json {
@@ -177,6 +180,17 @@ pub(crate) fn emit_session_output(
     opts: EmitOptions,
     json: bool,
 ) -> Result<PathBuf> {
+    emit_with_artifacts(session, to_h, out, opts, json, None)
+}
+
+fn emit_with_artifacts(
+    session: &Session,
+    to_h: Harness,
+    out: Option<PathBuf>,
+    opts: EmitOptions,
+    json: bool,
+    artifacts: Option<&cv_core::harness::claude::artifacts::Artifacts>,
+) -> Result<PathBuf> {
     if !cv_core::emit::supported_targets().contains(&to_h) {
         // A caller mistake, not a failure (exit 2): the source parsed, the target cannot be written.
         return usage(format!(
@@ -195,9 +209,33 @@ pub(crate) fn emit_session_output(
             .and_then(|a| a.root())
             .with_context(|| format!("{to_h} doesn't appear installed; pass --out <dir> to write somewhere"))?,
     };
+    let artifacts = artifacts.filter(|a| !a.is_empty());
+    if let Some(artifacts) = artifacts {
+        artifacts.validate().context("validating tool artifacts before port")?;
+    }
+    let out_existed = out_dir.exists();
+    let out_was_empty = !out_existed || fs::read_dir(&out_dir).is_ok_and(|mut d| d.next().is_none());
     // Verified emit: after writing, re-parse the output with the target's own adapter and diff it
     // against the source IR, so a lossy conversion is *visible* instead of silent.
     let (res, warnings) = cv_core::emit::emit_verified(session, to_h, &out_dir, &opts)?;
+    if let Some(artifacts) = artifacts {
+        let anchor = cv_core::harness::claude::artifacts::anchor(&res.path, &res.new_id);
+        let published = {
+            let mut set = cv_core::publish::Set::new();
+            artifacts
+                .stage(&anchor, &mut set, cv_core::publish::Claim::New)
+                .and_then(|()| set.publish())
+        };
+        if let Err(err) = published {
+            return match cv_core::emit::retract_emitted(to_h, &out_dir, out_existed, out_was_empty, &res, &anchor) {
+                Ok(()) => Err(err.context("carrying tool artifacts failed; retracted ported transcript")),
+                Err(undo) => Err(err.context(format!(
+                    "wrote {}, carrying tool artifacts failed and retracting output also failed ({undo:#})",
+                    res.path.display()
+                ))),
+            };
+        }
+    }
     if json {
         println!(
             "{}",
@@ -585,5 +623,86 @@ mod context_tests {
             resume_target(Harness::parse("opensession").unwrap(), "abc"),
             ResumeTarget::GuiOnly { .. }
         ));
+    }
+
+    // #tooth Corrupt source sidecars stop before emit, and destination artifact collisions retract
+    // the newly emitted transcript without touching pre-existing files.
+    #[test]
+    fn port_artifact_failure_leaves_no_partial_transcript() {
+        use cv_core::ir::{Block, Message, Role};
+        let world = cv_testkit::World::new("port-artifact-retract");
+        let src_transcript = world.base.join("src-session.jsonl");
+        fs::write(&src_transcript, "{}\n").unwrap();
+        let src_flat = world.base.join("src-session.flat.jsonl");
+        fs::write(&src_flat, "not valid json\n").unwrap();
+
+        let mut session = Session::new("src-session", Harness::Claude);
+        session.cwd = Some(world.base.join("proj"));
+        let mut user = Message::new(Role::User);
+        user.content.push(Block::from_text("hello".into()));
+        session.messages.push(user);
+
+        let mut bad_artifacts = cv_core::harness::claude::artifacts::Artifacts::default();
+        bad_artifacts.collect(&src_transcript).unwrap();
+        let fresh_out = world.base.join("fresh-out");
+        assert!(emit_with_artifacts(
+            &session,
+            Harness::Claude,
+            Some(fresh_out.clone()),
+            EmitOptions::default(),
+            true,
+            Some(&bad_artifacts),
+        )
+        .is_err());
+        assert!(
+            !fresh_out.exists(),
+            "corrupt artifact must fail before creating out_dir"
+        );
+
+        // Now make the source sidecar valid, but plant a conflicting sidecar at the destination.
+        fs::write(
+            &src_flat,
+            r#"{"id":"t1","slot":"content","name":"Bash","input":null,"content":"out","size":3,"line_count":1,"kind":"text"}"#,
+        )
+        .unwrap();
+        let mut good_artifacts = cv_core::harness::claude::artifacts::Artifacts::default();
+        good_artifacts.collect(&src_transcript).unwrap();
+
+        let slug = format!(
+            "-{}",
+            session
+                .cwd
+                .as_ref()
+                .unwrap()
+                .to_string_lossy()
+                .trim_start_matches('/')
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+                .collect::<String>()
+        );
+        let dest_proj = world.base.join("dest-out").join(slug);
+        fs::create_dir_all(&dest_proj).unwrap();
+        let conflicting_flat = dest_proj.join("pinned-port.flat.jsonl");
+        fs::write(&conflicting_flat, b"pre-existing sidecar").unwrap();
+
+        let err = emit_with_artifacts(
+            &session,
+            Harness::Claude,
+            Some(world.base.join("dest-out")),
+            EmitOptions {
+                new_id: Some("pinned-port".into()),
+                ..Default::default()
+            },
+            true,
+            Some(&good_artifacts),
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("retracted ported transcript"), "{msg}");
+        assert!(
+            !dest_proj.join("pinned-port.jsonl").exists(),
+            "ported transcript must be retracted on artifact failure"
+        );
+        assert_eq!(fs::read(&conflicting_flat).unwrap(), b"pre-existing sidecar");
     }
 }

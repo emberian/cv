@@ -285,9 +285,7 @@ mod tests {
     fn emit_round_trips_through_parser() {
         // ── build a small session ──
         let mut user = Message::new(Role::User);
-        user.content = vec![Block::Text {
-            text: "Please add a test.".into(),
-        }];
+        user.content = vec![Block::from_text("Please add a test.".into())];
 
         let mut asst = Message::new(Role::Assistant);
         asst.content = vec![
@@ -296,13 +294,15 @@ mod tests {
                 signature: Some("SIG==".into()),
                 encrypted: None,
                 redacted: false,
+                extensions: Default::default(),
             },
-            Block::Text { text: "On it.".into() },
+            Block::from_text("On it.".into()),
             Block::ToolUse {
                 id: "toolu_42".into(),
                 name: "write_to_file".into(),
                 input: serde_json::json!({ "path": "src/lib.rs" }).into(),
                 namespace: None,
+                extensions: Default::default(),
             },
         ];
 
@@ -314,6 +314,7 @@ mod tests {
             tool_name: None,
             status: None,
             details: None,
+            extensions: Default::default(),
         }];
 
         let session = Session {

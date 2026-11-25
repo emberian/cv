@@ -28,11 +28,15 @@ pub(crate) fn first_character(text: &Text, resolver: &Resolver, skip_whitespace:
     }
 }
 pub(crate) fn fate(block: &Block, target: Harness, mode: ThinkingMode, resolver: &Resolver) -> Result<ThinkingFate> {
+    if matches!(block, Block::Opaque { .. }) {
+        return Ok(ThinkingFate::Drop);
+    }
     let Block::Thinking {
         text,
         signature,
         encrypted,
         redacted,
+        ..
     } = block
     else {
         return Ok(ThinkingFate::Keep);
@@ -67,7 +71,7 @@ pub(crate) fn text<'a>(
     mode: ThinkingMode,
     resolver: &Resolver,
 ) -> Result<Option<Cow<'a, Text>>> {
-    if let Block::Text { text } = block {
+    if let Block::Text { text, .. } = block {
         return Ok(Some(Cow::Borrowed(text)));
     }
     Ok(text_with_fate(block, fate(block, target, mode, resolver)?))

@@ -747,7 +747,7 @@ mod tests {
             crate::stream::collect_with(&adapter, &reference, &crate::stream::Demand::LEAN.with_spans()).unwrap()
         };
         let first_text = |session: &crate::Session| match &session.messages[0].content[0] {
-            Block::Text { text } => text.clone(),
+            Block::Text { text, .. } => text.clone(),
             other => panic!("{other:?}"),
         };
         std::fs::write(&path, line("A")).unwrap();

@@ -2477,7 +2477,7 @@ mod tests {
             }
             o => panic!("expected thinking, got {o:?}"),
         }
-        assert!(matches!(&m.content[1], Block::Text { text } if text.matches_str("Let me look.") == Some(true)));
+        assert!(matches!(&m.content[1], Block::Text { text , .. } if text.matches_str("Let me look.") == Some(true)));
         match &m.content[2] {
             Block::ToolUse { id, name, input, .. } => {
                 assert_eq!(id, "tool_1");

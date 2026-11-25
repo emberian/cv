@@ -1542,7 +1542,7 @@ fn pass(r: &SessionRef) -> Result<Pass> {
                     .then(|| -> Result<String> {
                         let mut output = String::new();
                         for block in &m.content {
-                            if let Block::Text { text } = block {
+                            if let Block::Text { text, .. } = block {
                                 if !output.is_empty() {
                                     output.push('\n');
                                 }

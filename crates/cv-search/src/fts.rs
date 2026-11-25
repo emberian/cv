@@ -2285,7 +2285,7 @@ impl cv_core::MessageSink for ChunkSink<'_> {
         // The first prompt → the title fallback (the core title rule reads a bounded head).
         if self.first_prompt.is_none() && m.role == cv_core::Role::User {
             for b in &m.content {
-                if let Block::Text { text } = b {
+                if let Block::Text { text, .. } = b {
                     self.record_text(text);
                 }
             }
@@ -3664,7 +3664,7 @@ fn live_snippet(path: &str, id: &str, harness: &str, query: &str, scope: crate::
         fn block(&mut self, b: &Block) -> Result<()> {
             let none = &mut || Ok(());
             match b {
-                Block::Text { text } | Block::Thinking { text, .. } => {
+                Block::Text { text, .. } | Block::Thinking { text, .. } => {
                     self.feed_text(text)?;
                     self.matcher.push("\n");
                 }
@@ -3713,7 +3713,7 @@ fn live_snippet(path: &str, id: &str, harness: &str, query: &str, scope: crate::
                         self.matcher.push("\n");
                     }
                 }
-                Block::Image { .. } => {}
+                Block::Image { .. } | Block::Opaque { .. } => {}
             }
             Ok(())
         }
@@ -4798,6 +4798,7 @@ mod tests {
                 name: "Edit".into(),
                 input: input.into(),
                 namespace: None,
+                extensions: Default::default(),
             },
         );
         assert!(sink.buf.capacity() <= 2 * CHUNK_BYTES);
@@ -4828,15 +4829,14 @@ mod tests {
             guard.record(&conditional);
             let input = cv_core::json::Json::source_with_reads(&path, 0, raw.len() as u64, &guard).unwrap();
             let block = if source_text {
-                cv_core::Block::Text {
-                    text: input.with_view(|view| Ok(view.source_text()?.unwrap())).unwrap(),
-                }
+                cv_core::Block::from_text(input.with_view(|view| Ok(view.source_text()?.unwrap())).unwrap())
             } else {
                 cv_core::Block::ToolUse {
                     id: "call".into(),
                     name: "tool".into(),
                     input,
                     namespace: None,
+                    extensions: Default::default(),
                 }
             };
             let expected = if source_text {
@@ -4944,7 +4944,7 @@ mod tests {
         );
         assert!(sink.take_error().is_some());
         let mut later = cv_core::Message::new(cv_core::Role::User);
-        later.content.push(cv_core::Block::Text { text: "later".into() });
+        later.content.push(cv_core::Block::from_text("later".into()));
         assert!(matches!(sink.message(later), cv_core::Flow::Stop));
         assert!(sink.finish().is_err());
         drop(sink);
@@ -4964,6 +4964,7 @@ mod tests {
             name: "tool".into(),
             input,
             namespace: None,
+            extensions: Default::default(),
         };
         let f = fields_of(&build_schema()).unwrap();
         let r = cv_core::SessionRef::new("input", cv_core::Harness::Claude, &path);
@@ -5003,6 +5004,7 @@ mod tests {
                 name: "Edit".into(),
                 input: serde_json::json!({"content":"x".repeat(8 * CHUNK_BYTES)}).into(),
                 namespace: None,
+                extensions: Default::default(),
             },
         );
         assert!(sink
@@ -7867,23 +7869,24 @@ mod tests {
                 sink: &mut dyn cv_core::MessageSink,
             ) -> Result<cv_core::Session> {
                 let mut first = cv_core::Message::new(cv_core::Role::User);
-                first.content.push(cv_core::Block::Text {
-                    text: "zqspanpartial ".repeat(CHUNK_BYTES).into(),
-                });
+                first
+                    .content
+                    .push(cv_core::Block::from_text("zqspanpartial ".repeat(CHUNK_BYTES).into()));
                 first.content.push(cv_core::Block::ToolUse {
                     id: "call".into(),
                     name: "Edit".into(),
                     input: serde_json::json!({"file_path":"/span.rs","content":"staged"}).into(),
                     namespace: None,
+                    extensions: Default::default(),
                 });
                 let _ = sink.message(first);
                 let mut broken = cv_core::Message::new(cv_core::Role::Assistant);
-                broken.content.push(cv_core::Block::Text {
-                    text: cv_core::Text::Span(self.span.clone()),
-                });
+                broken
+                    .content
+                    .push(cv_core::Block::from_text(cv_core::Text::Span(self.span.clone())));
                 let _ = sink.message(broken);
                 let mut late = cv_core::Message::new(cv_core::Role::User);
-                late.content.push(cv_core::Block::Text { text: "late".into() });
+                late.content.push(cv_core::Block::from_text("late".into()));
                 let _ = sink.message(late);
                 Ok(cv_core::Session::new(&r.id, r.harness))
             }
@@ -7967,10 +7970,10 @@ mod tests {
                         name: "Edit".into(),
                         namespace: None,
                         input: serde_json::json!({"file_path":"/scratch/file.rs","new_string":"updated"}).into(),
+                        extensions: Default::default(),
                     });
-                    m.content.push(cv_core::Block::Text {
-                        text: "zqconsumer ".repeat(2 * CHUNK_BYTES).into(),
-                    });
+                    m.content
+                        .push(cv_core::Block::from_text("zqconsumer ".repeat(2 * CHUNK_BYTES).into()));
                     sink.message(m); // Ignore Stop deliberately: guard must suppress late output.
                     if sink.wants_checkpoint(n + 1) {
                         sink.checkpoint(&mut cv_core::stream::Checkpoint::new(n + 1));
@@ -8066,7 +8069,7 @@ mod tests {
             ) -> Result<cv_core::Session> {
                 let mut m = cv_core::Message::new(cv_core::Role::User);
                 let body = "zqpartial ".repeat(CHUNK_BYTES / 8); // > CHUNK_BYTES → flushed as the message ends
-                m.content.push(cv_core::Block::Text { text: body.into() });
+                m.content.push(cv_core::Block::from_text(body.into()));
                 let _ = sink.message(m);
                 anyhow::bail!("malformed line mid-transcript")
             }

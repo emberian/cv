@@ -564,9 +564,7 @@ mod tests {
         let mut opensess = Session::new("os-1", Harness::OpenSession);
         opensess.title = Some("OpenSession fixture".into());
         let mut om = cv_core::ir::Message::new(cv_core::ir::Role::User);
-        om.content.push(cv_core::ir::Block::Text {
-            text: "portable note".into(),
-        });
+        om.content.push(cv_core::ir::Block::from_text("portable note".into()));
         opensess.messages.push(om);
         let os_bytes = serde_json::to_vec(&cv_core::harness::opensession::document(&opensess)).unwrap();
 

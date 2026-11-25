@@ -66,7 +66,9 @@ fn image(session: &cv_core::Session) -> &str {
         .iter()
         .flat_map(|m| &m.content)
         .find_map(|block| match block {
-            Block::Image { media_type, data_ref } => {
+            Block::Image {
+                media_type, data_ref, ..
+            } => {
                 assert_eq!(media_type.as_deref(), Some("image/png"));
                 data_ref.as_deref()
             }
@@ -89,7 +91,10 @@ fn native_image_counter_is_bounded_and_public_payloads_remain_complete() {
         }
         fn message(&mut self, message: Message) -> Flow {
             for block in message.content {
-                if let Block::Image { media_type, data_ref } = block {
+                if let Block::Image {
+                    media_type, data_ref, ..
+                } = block
+                {
                     assert_eq!(media_type.as_deref(), Some("image/png"));
                     self.1 &= data_ref.as_deref() == Some("base64:inline");
                     self.0 += 1;

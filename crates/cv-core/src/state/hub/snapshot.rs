@@ -1358,7 +1358,7 @@ impl ExtFacts for PinnedSessionExt<'_> {
         for msg in &session.messages {
             for block in &msg.content {
                 match block {
-                    Block::Text { text } | Block::Thinking { text, .. } => {
+                    Block::Text { text, .. } | Block::Thinking { text, .. } => {
                         if text.to_lowercase().contains(needle) {
                             return Ok(Tri::True);
                         }
@@ -1378,7 +1378,7 @@ impl ExtFacts for PinnedSessionExt<'_> {
                             }
                         }
                     }
-                    Block::Image { .. } | Block::File { .. } => {}
+                    Block::Image { .. } | Block::File { .. } | Block::Opaque { .. } => {}
                 }
             }
         }

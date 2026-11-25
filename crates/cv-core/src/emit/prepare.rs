@@ -504,7 +504,10 @@ mod tests {
             super::super::parse_for_emit(&crate::harness::claude::Claude::detect(), &reference, Harness::Codex)?;
         assert!(matches!(
             &session.messages[0].content[0],
-            Block::Text { text: Text::Source(_) }
+            Block::Text {
+                text: Text::Source(_),
+                ..
+            }
         ));
         let output = world.base.join("output");
         let options = EmitOptions {
@@ -562,7 +565,10 @@ mod tests {
         let (selected, _, _) = super::super::prepare_selected(&adapter, &reference, 5, Some(6))?;
         assert!(matches!(
             &selected.messages[0].content[0],
-            Block::Text { text: Text::Source(_) }
+            Block::Text {
+                text: Text::Source(_),
+                ..
+            }
         ));
         let mut builder = crate::splice::Composition::default();
         builder.push(selected.clone(), 12, 5, Some(6));
@@ -617,14 +623,12 @@ mod tests {
             let len = fs::metadata(&self.path)?.len();
             let (offset, len) = self.range.unwrap_or((1, len - 1));
             let mut message = Message::new(Role::User);
-            message.content.push(Block::Text {
-                text: Text::Span(crate::lazy::Span {
-                    source: Some(self.path.clone()),
-                    offset,
-                    len,
-                    escaped: false,
-                }),
-            });
+            message.content.push(Block::from_text(Text::Span(crate::lazy::Span {
+                source: Some(self.path.clone()),
+                offset,
+                len,
+                escaped: false,
+            })));
             sink.try_message(message)?;
             if self.mutate {
                 fs::write(&self.path, b"changed after source callback")?;
@@ -640,7 +644,7 @@ mod tests {
         original.cwd = Some("/tmp/wrapped".into());
         for text in ["head", "selected", "tail"] {
             let mut message = Message::new(Role::User);
-            message.content.push(Block::Text { text: text.into() });
+            message.content.push(Block::from_text(text.into()));
             original.messages.push(message);
         }
         fs::write(

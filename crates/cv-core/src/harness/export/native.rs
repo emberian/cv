@@ -549,7 +549,7 @@ pub(super) fn stream(kind: Kind, r: &SessionRef, opts: &Demand, sink: &mut dyn M
                     if message.role == Role::User {
                         session.title = text_summary(
                             message.content.iter().filter_map(|b| match b {
-                                Block::Text { text } => Some(text),
+                                Block::Text { text, .. } => Some(text),
                                 _ => None,
                             }),
                             &resolver,
@@ -641,7 +641,7 @@ pub(super) fn parse_all_str(text: &str) -> Result<Vec<Session>> {
                     if message.role == Role::User {
                         session.title = text_summary(
                             message.content.iter().filter_map(|b| match b {
-                                Block::Text { text } => Some(text),
+                                Block::Text { text, .. } => Some(text),
                                 _ => None,
                             }),
                             &resolver,
@@ -736,7 +736,7 @@ fn claude_message(view: JsonView<'_>, spans: bool) -> Result<Option<Message>> {
             .flatten()
             .filter(|s| !s.is_empty())
         {
-            content.push(Block::Text { text });
+            content.push(Block::from_text(text));
         }
     }
     if content.is_empty() {
@@ -796,6 +796,7 @@ fn chatgpt_message(
             name: recipient.clone(),
             input: raw_content.map(|v| v.argument(spans)).transpose()?.unwrap_or_default(),
             namespace: None,
+            extensions: Default::default(),
         });
         calls.insert(recipient, id.clone());
     } else {
@@ -809,9 +810,10 @@ fn chatgpt_message(
                 tool_name: (!name.is_empty()).then_some(name),
                 status: None,
                 details: None,
+                extensions: Default::default(),
             });
         } else if text_summary(std::iter::once(&text), resolver, true).is_some() {
-            content.push(Block::Text { text });
+            content.push(Block::from_text(text));
         }
         if let Some(parts) = content_record
             .as_ref()
@@ -829,6 +831,7 @@ fn chatgpt_message(
                     content.push(Block::Image {
                         media_type: None,
                         data_ref: Some(pointer),
+                        extensions: Default::default(),
                     });
                 }
             }

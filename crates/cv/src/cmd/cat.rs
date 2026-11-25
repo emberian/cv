@@ -7,7 +7,7 @@
 //! `cat` checks all three so the caller never has to know which. `--input` prints the matching
 //! tool call's arguments instead. An unknown id is a usage error (exit 2).
 
-use crate::util::{parse_harness, resolve, short_id, usage};
+use crate::util::{parse_harness, short_id, usage};
 use anyhow::{Context, Result};
 use cv_core::ir::Block;
 use cv_core::Demand;
@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 
 pub(crate) fn cmd_cat(session: &str, tool_use_id: &str, harness: Option<String>, input: bool) -> Result<()> {
     let want = parse_harness(&harness)?;
-    let (r, adapter) = resolve(session, want)?;
+    let (r, adapter) = super::distill::resolve_source(session, want)?;
     // Lazy stream to the first message holding the block, then stop: giant results stay on disk
     // until the one block we print is resolved, and nothing before or after it is kept.
     let mut found = First {
@@ -33,7 +33,8 @@ pub(crate) fn cmd_cat(session: &str, tool_use_id: &str, harness: Option<String>,
     )?
     .session;
     parsed.messages = found.hit.into_iter().collect();
-    let sidecar = sidecar_path(&r.path);
+    let anchor = cv_core::harness::claude::artifacts::anchor(&r.path, &r.id);
+    let sidecar = sidecar_path(&anchor);
     let mut out = std::io::BufWriter::new(std::io::stdout().lock());
 
     if input {
@@ -42,11 +43,29 @@ pub(crate) fn cmd_cat(session: &str, tool_use_id: &str, harness: Option<String>,
                 if let Block::ToolUse { id, name, input, .. } = b {
                     if id == tool_use_id {
                         eprintln!("✦ {name} ({id}) — input");
+                        if matches!(name.as_str(), "Edit" | "Write") {
+                            let marker = input.with_view(|v| {
+                                let Some(value) = v.get("_cv_pruned_input")? else {
+                                    return Ok(None);
+                                };
+                                Ok(value.resolve()?.as_str().map(str::to_owned))
+                            })?;
+                            match marker.as_deref() {
+                                Some("dropped") => return usage(format!("input for {id:?} was removed with --drop")),
+                                Some(cmd) if cmd.starts_with("cv cat ") => {
+                                    return print_stashed_input(&sidecar, id, &mut out)
+                                }
+                                _ => {}
+                            }
+                        }
                         writeln!(out, "{}", serde_json::to_string_pretty(input)?)?;
                         return Ok(());
                     }
                 }
             }
+        }
+        if sidecar.try_exists()? {
+            return print_stashed_input(&sidecar, tool_use_id, &mut out);
         }
         return usage(format!(
             "no tool call {tool_use_id:?} in {} — `cv tools {} --timeline` lists its tool calls",
@@ -55,7 +74,21 @@ pub(crate) fn cmd_cat(session: &str, tool_use_id: &str, harness: Option<String>,
         ));
     }
 
-    print_result(&parsed, &r.id, tool_use_id, &sidecar, &mut out)
+    print_result(&parsed, &r.id, tool_use_id, &sidecar, Some(&anchor), &mut out)
+}
+
+fn print_stashed_input(sidecar: &Path, id: &str, out: &mut impl Write) -> Result<()> {
+    let call = cv_core::prune::retrieve(sidecar, &format!("{id}#call"))?;
+    match call.as_str() {
+        Some(raw) => out.write_all(raw.as_bytes())?,
+        None => writeln!(
+            out,
+            "{}",
+            serde_json::to_string_pretty(call.get("input").context("stashed call has no input")?)?
+        )?,
+    }
+    out.flush()?;
+    Ok(())
 }
 
 fn print_result(
@@ -63,6 +96,7 @@ fn print_result(
     session_id: &str,
     tool_use_id: &str,
     sidecar: &Path,
+    anchor: Option<&Path>,
     mut out: &mut impl Write,
 ) -> Result<()> {
     let resolver = parsed.resolver();
@@ -108,13 +142,16 @@ fn print_result(
             let text = content
                 .try_resolve(&resolver)
                 .context("reading transcript tool result")?;
+            if text.trim_start().starts_with("<persisted-output>") && print_captured(anchor, tool_use_id, &mut out)? {
+                return Ok(());
+            }
             // 2. A prune marker: the original lives in the sidecar next to the transcript.
             if text.trim_start().starts_with(cv_core::prune::MARKER_PREFIX) {
                 if sidecar.try_exists()? {
                     let v = cv_core::prune::retrieve(sidecar, tool_use_id)
                         .with_context(|| format!("reading prune sidecar {}", sidecar.display()))?;
                     eprintln!("✦ from prune sidecar {}", sidecar.display());
-                    return print_value(&mut out, &v);
+                    return print_sidecar_result(&mut out, &v, anchor, tool_use_id);
                 }
                 eprintln!(
                     "⚠ {} was pruned but no sidecar holds it (hard-dropped with `--drop`?) — printing the marker",
@@ -137,13 +174,44 @@ fn print_result(
         let v = cv_core::prune::retrieve(sidecar, tool_use_id)
             .with_context(|| format!("reading prune sidecar {}", sidecar.display()))?;
         eprintln!("✦ from prune sidecar {}", sidecar.display());
-        return print_value(&mut out, &v);
+        return print_sidecar_result(&mut out, &v, anchor, tool_use_id);
     }
     usage(format!(
         "no tool result {tool_use_id:?} in {} — `cv tools {} --timeline` lists its tool calls",
         short_id(session_id),
         short_id(session_id)
     ))
+}
+
+fn print_captured(anchor: Option<&Path>, id: &str, out: &mut impl Write) -> Result<bool> {
+    let Some(anchor) = anchor else { return Ok(false) };
+    let Some(path) = cv_core::harness::claude::artifacts::captured_output(anchor, id)? else {
+        return Ok(false);
+    };
+    std::io::copy(&mut std::fs::File::open(path)?, out)?;
+    out.flush()?;
+    Ok(true)
+}
+
+fn print_sidecar_result(
+    out: &mut impl Write,
+    value: &serde_json::Value,
+    anchor: Option<&Path>,
+    id: &str,
+) -> Result<()> {
+    let receipt = |v: &serde_json::Value| {
+        v.as_str()
+            .is_some_and(|s| s.trim_start().starts_with("<persisted-output>"))
+    };
+    if (receipt(value)
+        || value
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| receipt(&item["text"]))))
+        && print_captured(anchor, id, out)?
+    {
+        return Ok(());
+    }
+    print_value(out, value)
 }
 
 /// Keeps the first message carrying the wanted block — the `ToolUse` with that id under
@@ -203,7 +271,7 @@ mod tests {
         std::fs::write(&sidecar, [0xff, b'\n']).unwrap();
         let session = cv_core::Session::new("s", cv_core::Harness::Claude);
         let mut out = Vec::new();
-        let error = print_result(&session, "s", "tool", &sidecar, &mut out).unwrap_err();
+        let error = print_result(&session, "s", "tool", &sidecar, None, &mut out).unwrap_err();
         let error = format!("{error:#}");
         assert!(error.contains("s.flat.jsonl"), "{error}");
         assert!(!error.contains("--drop"));
@@ -232,6 +300,7 @@ mod tests {
             tool_name: None,
             status: None,
             details: None,
+            extensions: Default::default(),
         });
         let mut first = First {
             id: "call",
@@ -243,17 +312,17 @@ mod tests {
         session.messages = first.hit.into_iter().collect();
         let sidecar = world.base.join("absent.flat.jsonl");
         let mut output = Vec::new();
-        print_result(&session, &session.id, "call", &sidecar, &mut output).unwrap();
+        print_result(&session, &session.id, "call", &sidecar, None, &mut output).unwrap();
         assert_eq!(output, format!("{body}\n").as_bytes());
         let mut owned = session.clone();
         let resolver = owned.resolver();
         owned.messages[0].materialize(&resolver).unwrap();
         let mut expected = Vec::new();
-        print_result(&owned, &owned.id, "call", &sidecar, &mut expected).unwrap();
+        print_result(&owned, &owned.id, "call", &sidecar, None, &mut expected).unwrap();
         assert_eq!(output, expected);
         std::fs::remove_file(path).unwrap();
         let mut rejected = Vec::new();
-        assert!(print_result(&session, &session.id, "call", &sidecar, &mut rejected).is_err());
+        assert!(print_result(&session, &session.id, "call", &sidecar, None, &mut rejected).is_err());
         assert!(rejected.is_empty());
     }
 

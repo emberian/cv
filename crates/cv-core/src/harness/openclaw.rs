@@ -2301,7 +2301,8 @@ mod tests {
                 assert!(spans.messages.iter().any(|m| m.content.iter().any(|b| matches!(
                     b,
                     Block::Text {
-                        text: crate::Text::Source(_)
+                        text: crate::Text::Source(_),
+                        ..
                     }
                 ))));
                 spans.materialize().unwrap();
@@ -2362,7 +2363,8 @@ mod tests {
         assert!(actual.messages.iter().any(|m| m.content.iter().any(|b| matches!(
             b,
             Block::Text {
-                text: crate::Text::Source(_)
+                text: crate::Text::Source(_),
+                ..
             }
         ))));
         actual.materialize().unwrap();
@@ -3013,6 +3015,7 @@ mod tests {
                 Block::ToolResult { .. } => "toolresult",
                 Block::Image { .. } => "image",
                 Block::File { .. } => "file",
+                Block::Opaque { block_type, .. } => block_type.as_str(),
             })
             .collect();
         assert_eq!(kinds, ["thinking", "text", "toolcall"]);

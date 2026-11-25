@@ -369,9 +369,13 @@ pub(crate) fn stream_with_options(path: &Path, id: &str, opts: &Demand, sink: &m
             }
             if s.title.is_none() && m.kind == MessageKind::Prompt {
                 s.title = text_summary(
-                    m.content
-                        .iter()
-                        .filter_map(|b| if let Block::Text { text } = b { Some(text) } else { None }),
+                    m.content.iter().filter_map(|b| {
+                        if let Block::Text { text, .. } = b {
+                            Some(text)
+                        } else {
+                            None
+                        }
+                    }),
                     &resolver,
                     false,
                 );
@@ -418,7 +422,7 @@ fn view_message(view: JsonView<'_>, spans: bool, lead: bool, prompted: &mut bool
     let mut blocks = Vec::new();
     if let Some(content) = record.get(content_key) {
         if let Some(text) = content.lazy_text(spans)? {
-            blocks.push(Block::Text { text });
+            blocks.push(Block::from_text(text));
         } else if let Some(items) = content.array()? {
             for view in items {
                 let view = view?;
@@ -445,6 +449,7 @@ fn view_message(view: JsonView<'_>, spans: bool, lead: bool, prompted: &mut bool
                         tool_name: part.string("name")?,
                         status: None,
                         details: None,
+                        extensions: Default::default(),
                     });
                 } else if let Some(block) = anthropic::block_from_view_with(
                     view,

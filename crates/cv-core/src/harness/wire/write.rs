@@ -176,7 +176,7 @@ pub(crate) fn check_source_fields(session: &crate::ir::Session) -> Result<()> {
         }
         for block in &message.content {
             match block {
-                crate::ir::Block::Text { text }
+                crate::ir::Block::Text { text, .. }
                 | crate::ir::Block::Thinking { text, .. }
                 | crate::ir::Block::ToolResult { content: text, .. } => {
                     if let Text::Source(source) = text {
@@ -209,17 +209,15 @@ mod title_tests {
         use crate::ir::{Block, Message, MessageKind, Origin, Role, Session};
         let mut session = Session::new("synthetic", crate::Harness::Continue);
         let mut injected = Message::of_kind(Role::User, MessageKind::InjectedContext, Origin::Harness);
-        injected.content.push(Block::Text {
-            text: "harness bookkeeping".into(),
-        });
+        injected.content.push(Block::from_text("harness bookkeeping".into()));
         let mut noise = Message::new(Role::User);
-        noise.content.push(Block::Text {
-            text: "<command-name>/usage</command-name>".into(),
-        });
+        noise
+            .content
+            .push(Block::from_text("<command-name>/usage</command-name>".into()));
         let mut prompt = Message::new(Role::User);
-        prompt.content.push(Block::Text {
-            text: "<system-reminder>metadata</system-reminder> please fix the parser".into(),
-        });
+        prompt.content.push(Block::from_text(
+            "<system-reminder>metadata</system-reminder> please fix the parser".into(),
+        ));
         session.messages = vec![injected, noise, prompt];
         let resolver = Resolver::new(None);
         assert_eq!(

@@ -145,7 +145,8 @@ impl cv_core::MessageSink for TitleUsers {
             matches!(
                 block,
                 cv_core::Block::Text {
-                    text: cv_core::lazy::Text::Span(_) | cv_core::lazy::Text::Source(_)
+                    text: cv_core::lazy::Text::Span(_) | cv_core::lazy::Text::Source(_),
+                    ..
                 }
             )
         });
@@ -757,7 +758,7 @@ mod enrich_tests {
 
     fn user(texts: impl IntoIterator<Item = Text>) -> Message {
         let mut message = Message::new(Role::User);
-        message.content = texts.into_iter().map(|text| Block::Text { text }).collect();
+        message.content = texts.into_iter().map(Block::from_text).collect();
         message
     }
     // Independent prior collector: keeps every user turn and resolves only after EOF.
@@ -783,6 +784,7 @@ mod enrich_tests {
                     .filter_map(|block| {
                         if let Block::Text {
                             text: Text::Inline(text),
+                            ..
                         } = block
                         {
                             Some(text.len())

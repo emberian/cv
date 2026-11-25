@@ -587,7 +587,7 @@ impl MessageSink for IndexGramSink {
         let r = std::mem::replace(&mut self.resolver, cv_core::Resolver::new(None));
         if self.first_prompt.is_none() && m.role == cv_core::Role::User {
             for b in &m.content {
-                if let cv_core::Block::Text { text } = b {
+                if let cv_core::Block::Text { text, .. } = b {
                     self.record_text(text);
                 }
             }

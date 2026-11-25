@@ -1260,7 +1260,7 @@ mod tests {
             }
             b => panic!("expected thinking, got {b:?}"),
         }
-        assert!(matches!(&asst.content[1], Block::Text { text } if text.matches_str("Hello") == Some(true)));
+        assert!(matches!(&asst.content[1], Block::Text { text , .. } if text.matches_str("Hello") == Some(true)));
         assert!(matches!(&asst.content[2], Block::ToolUse { name, .. } if name == "bash"));
         assert_eq!((asst.kind, asst.origin), (MessageKind::Reply, Origin::Model));
         // message-level facts live in the harness bag only
@@ -1375,11 +1375,11 @@ mod tests {
         assert!(m
             .content
             .iter()
-            .any(|b| matches!(b, Block::Text { text } if text.matches_str("@oracle") == Some(true))));
+            .any(|b| matches!(b, Block::Text { text , .. } if text.matches_str("@oracle") == Some(true))));
         assert!(m
             .content
             .iter()
-            .any(|b| matches!(b, Block::Text { text } if text.contains("subtask → build"))));
+            .any(|b| matches!(b, Block::Text { text , .. } if text.contains("subtask → build"))));
     }
 
     #[test]
@@ -1394,7 +1394,7 @@ mod tests {
         let out = build_messages(&mv, &[]);
         assert_eq!(out.len(), 1);
         assert!(
-            matches!(&out[0].content[0], Block::Text { text } if text.matches_str("Removed debug comments.") == Some(true))
+            matches!(&out[0].content[0], Block::Text { text , .. } if text.matches_str("Removed debug comments.") == Some(true))
         );
         assert_eq!((out[0].kind, out[0].origin), (MessageKind::Prompt, Origin::Human));
         // diffs preserved in the bag
@@ -1433,7 +1433,9 @@ mod tests {
             "the kind says it"
         );
         // the boolean must NOT be rendered as a text body; the real text comes from parts
-        assert!(matches!(&m.content[0], Block::Text { text } if text.matches_str("compacted history…") == Some(true)));
+        assert!(
+            matches!(&m.content[0], Block::Text { text , .. } if text.matches_str("compacted history…") == Some(true))
+        );
     }
 
     #[test]
@@ -1620,7 +1622,8 @@ mod tests {
         assert!(matches!(
             &messages[0].content[0],
             Block::Text {
-                text: crate::Text::Source(_)
+                text: crate::Text::Source(_),
+                ..
             }
         ));
     }
@@ -1654,7 +1657,8 @@ mod tests {
             assert!(matches!(
                 actual.messages[0].content[1],
                 Block::Text {
-                    text: crate::Text::Source(_)
+                    text: crate::Text::Source(_),
+                    ..
                 }
             ));
             actual.materialize().unwrap();
@@ -1909,7 +1913,7 @@ mod tests {
         let mv: Value = serde_json::from_str(r#"{"id":"m","role":"user","time":{"created":1}}"#).unwrap();
         let p = parts(&[r#"{"type":"text","text":"[search-mode] ...","synthetic":true}"#]);
         let out = build_messages(&mv, &p);
-        assert!(matches!(&out[0].content[0], Block::Text { text } if text.starts_with("[search-mode]")));
+        assert!(matches!(&out[0].content[0], Block::Text { text , .. } if text.starts_with("[search-mode]")));
     }
 
     #[test]
@@ -1955,7 +1959,7 @@ mod tests {
             .messages
             .iter()
             .flat_map(|m| &m.content)
-            .any(|b| matches!(b, Block::Text { text } if text.contains("debug comments"))));
+            .any(|b| matches!(b, Block::Text { text , .. } if text.contains("debug comments"))));
     }
 
     #[test]
@@ -2278,7 +2282,7 @@ mod tests {
         adapter
             .stream(&reference, &Demand::LEAN.with_spans(), &mut sink)
             .unwrap();
-        let Block::Text { text } = &messages[0].content[0] else {
+        let Block::Text { text, .. } = &messages[0].content[0] else {
             panic!("selected text")
         };
         assert_eq!(
@@ -2475,7 +2479,7 @@ mod tests {
                 matches!(&s.messages[1].content[0], Block::Thinking { signature, .. } if signature.as_deref() == Some("SIG"))
             );
             assert!(
-                matches!(&s.messages[1].content[1], Block::Text { text } if text.matches_str("Reverted.") == Some(true))
+                matches!(&s.messages[1].content[1], Block::Text { text , .. } if text.matches_str("Reverted.") == Some(true))
             );
             assert!(
                 matches!(&s.messages[2].content[0], Block::ToolResult { content, .. } if content.matches_str("a\nb") == Some(true))

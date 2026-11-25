@@ -362,7 +362,7 @@ fn notice(view: JsonView<'_>, ty: &str, common: &Common, opts: &Demand, text: St
     let mut out = carrier(view, ty, common, opts)?;
     if let Some(m) = out.first_mut() {
         m.kind = MessageKind::Notice;
-        m.content.push(Block::Text { text: text.into() });
+        m.content.push(Block::from_text(text.into()));
     }
     Ok(out)
 }
@@ -424,7 +424,7 @@ fn control(view: JsonView<'_>, top: &Fields<'_>, ty: &str, common: &Common, span
         _ => text_parts(top.get("content"), spans)?,
     };
     if !text.is_empty() {
-        m.content.push(Block::Text { text });
+        m.content.push(Block::from_text(text));
     }
     let mut out = vec![m];
     let summary = top.get("summary");
@@ -432,9 +432,7 @@ fn control(view: JsonView<'_>, top: &Fields<'_>, ty: &str, common: &Common, span
         let mut sm = Message::of_kind(Role::System, MessageKind::CompactionSummary, Origin::Harness);
         sm.parent_id = common.id.clone();
         sm.timestamp = common.timestamp;
-        sm.content.push(Block::Text {
-            text: lazy(summary, spans)?,
-        });
+        sm.content.push(Block::from_text(lazy(summary, spans)?));
         sm.harness_extra_mut(Harness::OpenClaw)
             .insert("record_type".into(), Value::from(ty));
         out.push(sm);
@@ -500,6 +498,7 @@ fn message(top: &Fields<'_>, common: &Common, spans: bool) -> Result<Vec<Message
                 tool_name: body.string("toolName")?,
                 status: None,
                 details: present(body.get("details"))?,
+                extensions: Default::default(),
             });
             // Image parts in a tool result aren't captured by the text coercion; surface them.
             if let Some(items) = content.map(JsonView::array).transpose()?.flatten() {
@@ -518,9 +517,7 @@ fn message(top: &Fields<'_>, common: &Common, spans: bool) -> Result<Vec<Message
             crate::harness::wire::pi_assistant_metadata(&mut m, &body, Harness::OpenClaw)?;
         }
         "user" | "system" => match content {
-            Some(c) if c.is_string()? => m.content.push(Block::Text {
-                text: lazy(Some(c), keep_source)?,
-            }),
+            Some(c) if c.is_string()? => m.content.push(Block::from_text(lazy(Some(c), keep_source)?)),
             _ => blocks(&mut m, content, keep_source)?,
         },
         "bashExecution" => {
@@ -538,9 +535,8 @@ fn message(top: &Fields<'_>, common: &Common, spans: bool) -> Result<Vec<Message
                     pieces.extend([Piece::Literal("\n"), Piece::String(output)]);
                 }
             }
-            m.content.push(Block::Text {
-                text: joined(container, keep_source, &pieces)?,
-            });
+            m.content
+                .push(Block::from_text(joined(container, keep_source, &pieces)?));
             custom_role_bag(
                 &mut m,
                 "bashExecution",
@@ -555,9 +551,8 @@ fn message(top: &Fields<'_>, common: &Common, spans: bool) -> Result<Vec<Message
             )?;
         }
         "branchSummary" => {
-            m.content.push(Block::Text {
-                text: lazy(body.get("summary"), keep_source)?,
-            });
+            m.content
+                .push(Block::from_text(lazy(body.get("summary"), keep_source)?));
             let from_id = body.string("fromId")?;
             let bag = custom_role_bag(&mut m, "branchSummary", &body, &[])?;
             if let Some(from_id) = from_id {
@@ -565,9 +560,8 @@ fn message(top: &Fields<'_>, common: &Common, spans: bool) -> Result<Vec<Message
             }
         }
         "compactionSummary" => {
-            m.content.push(Block::Text {
-                text: lazy(body.get("summary"), keep_source)?,
-            });
+            m.content
+                .push(Block::from_text(lazy(body.get("summary"), keep_source)?));
             custom_role_bag(
                 &mut m,
                 "compactionSummary",
@@ -578,7 +572,7 @@ fn message(top: &Fields<'_>, common: &Common, spans: bool) -> Result<Vec<Message
         _ => {
             let text = text_parts(content, keep_source)?;
             if !text.is_empty() {
-                m.content.push(Block::Text { text });
+                m.content.push(Block::from_text(text));
             }
             let custom_type = body.string("customType")?;
             let details = present(body.get("details"))?;

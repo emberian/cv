@@ -1420,6 +1420,7 @@ mod json_read_tests {
             name: "Bash".into(),
             namespace: None,
             input: serde_json::json!({"command":"git revert abcdef1"}).into(),
+            extensions: Default::default(),
         });
         assert!(!sink.observe(&call, 0).unwrap());
         let mut failed = Message::new(crate::Role::Tool);
@@ -1430,6 +1431,7 @@ mod json_read_tests {
             details: None,
             is_error: true,
             content: "error: commit abcdef1 cannot be reverted because of conflicts".into(),
+            extensions: Default::default(),
         });
         assert!(!sink.observe(&failed, 1).unwrap());
         assert!(sink.found.is_empty());
@@ -1441,6 +1443,7 @@ mod json_read_tests {
             details: None,
             is_error: false,
             content: "[main abcdef1] created".into(),
+            extensions: Default::default(),
         });
         assert!(sink.observe(&succeeded, 2).unwrap());
         assert_eq!(sink.found.len(), 1);
@@ -1499,6 +1502,7 @@ mod json_read_tests {
             tool_name: None,
             status: None,
             details: None,
+            extensions: Default::default(),
         });
         let sink = || {
             let mut sink = CommitEvidenceSink::new(vec!["abcdef1234567".into()], None);
@@ -1537,6 +1541,7 @@ mod json_read_tests {
             tool_name: None,
             status: None,
             details: None,
+            extensions: Default::default(),
         });
         assert_eq!(sink.message(message), Flow::Stop);
         assert!(sink.take_error().is_some());
@@ -1556,6 +1561,7 @@ mod json_read_tests {
             name: "Bash".into(),
             namespace: None,
             input,
+            extensions: Default::default(),
         });
         std::fs::remove_file(path).unwrap();
         let mut evidence = CommitEvidenceSink::new(vec!["abcdef123".into()], None);

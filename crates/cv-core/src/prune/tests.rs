@@ -1682,6 +1682,7 @@ fn source_turn_projection_matches_frozen_composition() -> Result<()> {
                         0,
                         &HashMap::new(),
                         user,
+                        !user,
                         thinking && !user,
                         &HashSet::new(),
                     )?;
@@ -2557,4 +2558,59 @@ fn an_empty_source_is_refused_without_publication() {
 fn a_minted_session_id_is_v7() {
     let id = uuid::Uuid::parse_str(&new_uuid()).unwrap();
     assert_eq!(id.get_version_num(), 7);
+}
+
+#[test]
+fn prune_cache_break_even_uses_net_prompt_savings() {
+    assert_eq!(CacheBreakEven::estimate(None, 100).n_star, "unknown");
+    assert_eq!(CacheBreakEven::estimate(Some(1000), -10).n_star, "no_payback");
+    assert_eq!(CacheBreakEven::estimate(Some(1000), 0).n_star, "no_payback");
+    // (1000 - 180) * (1.0 - 0.1) / (180 * 0.1) = 41.
+    assert_eq!(CacheBreakEven::estimate(Some(1000), 180).n_star, 42);
+    assert_eq!(CacheBreakEven::estimate(Some(1000), 181).n_star, 42);
+}
+
+// #tooth Size and age independently protect inputs. Only the old large Write
+// contributes an argument entry and a saving in the recorded prompt.
+#[test]
+fn prune_write_input_respects_size_and_keep_last() -> Result<()> {
+    use serde_json::json;
+    let world = crate::test_world("prune-write-inputs");
+    let path = fixture(&world.proj, "ok");
+    let mut rows: Vec<Value> = std::fs::read_to_string(&path)?
+        .lines()
+        .map(serde_json::from_str)
+        .collect::<Result<_, _>>()?;
+    let big = json!({"file_path":"work.txt","content":"original ".repeat(1024)});
+    for (row, id) in [(1, "toolu_1"), (3, "toolu_2")] {
+        rows[row]["message"]["content"][0] = json!({"type":"tool_use","name":"Write","id":id,"input":big});
+    }
+    rows[1]["message"]["content"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"type":"tool_use","name":"Edit","id":"small","input":{"file_path":"x"}}));
+    rows[2]["message"]["content"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"type":"tool_result","tool_use_id":"small","content":"ok"}));
+    rows[3]["message"]["usage"] = json!({"input_tokens":10000});
+    std::fs::write(&path, rows.iter().map(|v| format!("{v}\n")).collect::<String>())?;
+    let options = PruneOptions {
+        min_size: 512,
+        keep_last: 2,
+        new_id: Some("continued".into()),
+        ..Default::default()
+    };
+    let result = prune_session(crate::Harness::Claude, &path, &options)?;
+    assert_eq!(result.pruned_count, 1);
+    assert!(result.cache_break_even.n_star.as_u64().is_some());
+    let flat = result.sidecar_path.unwrap();
+    assert_eq!(retrieve(&flat, "toolu_1#call")?, big.to_string());
+    let written: Vec<Value> = std::fs::read_to_string(result.new_path)?
+        .lines()
+        .map(serde_json::from_str)
+        .collect::<Result<_, _>>()?;
+    assert_eq!(written[1]["message"]["content"][1], rows[1]["message"]["content"][1]);
+    assert_eq!(written[3]["message"]["content"][0]["input"], big);
+    Ok(())
 }

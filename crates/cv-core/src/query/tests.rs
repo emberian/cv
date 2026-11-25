@@ -235,6 +235,7 @@ fn git_field_matches_branch() {
         branch: Some("lazy-content-ir".into()),
         commit: None,
         remote: None,
+        ..Default::default()
     });
     assert!(query.matches_session(&s));
 }
@@ -246,6 +247,7 @@ fn git_equality_matches_one_branch_or_remote() {
         branch: Some("Feature-Main".into()),
         remote: Some("https://host/Repo".into()),
         commit: None,
+        ..Default::default()
     });
     assert!(q("git:main").matches_session(&session));
     assert!(!q("git=main").matches_session(&session));
@@ -525,17 +527,8 @@ fn msgs_counts_user_assistant_only_in_matches_session() {
 
 fn bare_message(role: Role, model: Option<&str>) -> Message {
     Message {
-        complete_record: None,
-        id: None,
-        parent_id: None,
-        role,
-        timestamp: None,
         model: model.map(str::to_string),
-        content: vec![],
-        usage: None,
-        extra: serde_json::Map::new(),
-        kind: crate::ir::MessageKind::for_role(role),
-        origin: crate::ir::Origin::for_role(role),
+        ..Message::new(role)
     }
 }
 
@@ -559,6 +552,7 @@ fn has_an_affordance_reads_the_view() {
         name: "update_plan".into(),
         input: serde_json::json!({"plan": [{"step": "x", "status": "pending"}]}).into(),
         namespace: None,
+        extensions: Default::default(),
     });
     let s = Session {
         messages: vec![reply],

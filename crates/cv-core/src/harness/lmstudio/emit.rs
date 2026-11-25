@@ -27,7 +27,7 @@ fn projected<'a>(block: &'a Block, mode: ThinkingMode, resolver: &Resolver) -> R
             return Ok(Some(Projected {
                 block: match value {
                     Cow::Borrowed(_) => Cow::Borrowed(block),
-                    Cow::Owned(text) => Cow::Owned(Block::Text { text }),
+                    Cow::Owned(text) => Cow::Owned(Block::from_text(text)),
                 },
                 thinking: false,
             }));
@@ -50,7 +50,7 @@ fn projected<'a>(block: &'a Block, mode: ThinkingMode, resolver: &Resolver) -> R
 }
 fn part(w: &mut dyn Write, block: &Block, resolver: &Resolver) -> Result<()> {
     match block {
-        Block::Text { text: value } | Block::Thinking { text: value, .. } => {
+        Block::Text { text: value, .. } | Block::Thinking { text: value, .. } => {
             let mut o = ObjectWriter::new(w)?;
             o.field("type", "text")?;
             o.field_with("text", |w| text(w, value, resolver))?;
@@ -353,9 +353,9 @@ mod tests {
         assert_eq!(adapter.roots(), vec![home]);
         let mut session = Session::new("source", Harness::LmStudio);
         let mut prompt = Message::new(Role::User);
-        prompt.content.push(Block::Text {
-            text: "visible in the native store".into(),
-        });
+        prompt
+            .content
+            .push(Block::from_text("visible in the native store".into()));
         session.messages.push(prompt);
         for (root, id) in [
             (adapter.roots()[0].clone(), "primary"),
@@ -577,7 +577,7 @@ mod tests {
         let world = crate::test_world("lmstudio_variant_fallback");
         let mut session = Session::new("source", Harness::LmStudio);
         let mut primary = Message::new(Role::User);
-        primary.content.push(Block::Text { text: "primary".into() });
+        primary.content.push(Block::from_text("primary".into()));
         primary
             .harness_extra_mut(Harness::LmStudio)
             .insert("currentlySelected".into(), json!(5));
@@ -586,7 +586,7 @@ mod tests {
             .insert("version_count".into(), json!(2));
         let mut orphan = Message::new(Role::Assistant);
         orphan.kind = MessageKind::Branch;
-        orphan.content.push(Block::Text { text: "orphan".into() });
+        orphan.content.push(Block::from_text("orphan".into()));
         orphan
             .harness_extra_mut(Harness::LmStudio)
             .insert("variant".into(), json!(1));
@@ -628,10 +628,12 @@ mod tests {
                 path: Some("/synthetic/input.txt".into()),
                 source: None,
                 mime: Some("text/plain".into()),
+                extensions: Default::default(),
             },
             Block::Image {
                 media_type: Some("image/png".into()),
                 data_ref: Some("https://synthetic/image.png".into()),
+                extensions: Default::default(),
             },
         ]);
         lazy.messages[1].content.push(Block::Thinking {
@@ -639,6 +641,7 @@ mod tests {
             signature: Some("empty-signature".into()),
             encrypted: None,
             redacted: false,
+            extensions: Default::default(),
         });
         for message in &mut lazy.messages[..2] {
             message.content.push(Block::Thinking {
@@ -646,6 +649,7 @@ mod tests {
                 signature: None,
                 encrypted: None,
                 redacted: false,
+                extensions: Default::default(),
             });
         }
         let mut frozen = Frozen::new("lmstudio-emit");
@@ -688,9 +692,7 @@ mod tests {
         session.created_at =
             Some(chrono::DateTime::parse_from_rfc3339("2026-10-13T12:00:00Z")?.with_timezone(&chrono::Utc));
         let mut user = Message::new(Role::User);
-        user.content.push(Block::Text {
-            text: "inline prompt".into(),
-        });
+        user.content.push(Block::from_text("inline prompt".into()));
         session.messages.push(user);
         let mut assistant = Message::new(Role::Assistant);
         assistant.content.push(Block::ToolUse {
@@ -698,6 +700,7 @@ mod tests {
             name: "Read".into(),
             input,
             namespace: None,
+            extensions: Default::default(),
         });
         session.messages.push(assistant);
         let dest = world.base.join("output");
@@ -733,6 +736,7 @@ mod tests {
             signature: None,
             encrypted: None,
             redacted: false,
+            extensions: Default::default(),
         });
         session.messages.push(message);
         let opts = crate::emit::EmitOptions {

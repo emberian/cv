@@ -14,6 +14,7 @@ use std::io::{BufRead, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 pub struct WindowSink {
+    opensession: bool,
     resolver: Resolver,
     primary: PathBuf,
     window: MessageWindow<Message>,
@@ -41,6 +42,7 @@ impl WindowSink {
     /// A window over `primary`'s session, read to EOF, frames staged.
     pub fn new(primary: &Path, start: usize, end: Option<usize>) -> Self {
         Self {
+            opensession: false,
             resolver: Resolver::new(Some(primary.to_path_buf())),
             primary: primary.to_path_buf(),
             window: MessageWindow::new(start, end),
@@ -58,6 +60,12 @@ impl WindowSink {
             checkpoint: None,
             reads: ReadSet::default(),
         }
+    }
+
+    /// Emit original OpenSession carrier records in selected document frames.
+    pub fn for_document(mut self, document: bool) -> Self {
+        self.opensession = document;
+        self
     }
 
     /// The API's page: stops at `end`, may capture a checkpoint there for the next page.
@@ -110,7 +118,12 @@ impl WindowSink {
         // Pending bytes belong to the same spool; do not flush each frame.
         let before = stage.get_ref().len() + stage.buffer().len() as u64;
         let size = match self.kept.as_mut() {
-            None => crate::projection::write_frame(stage, &message, &self.resolver, remaining)?,
+            None => match crate::harness::opensession::opaque_message(&message).filter(|_| self.opensession) {
+                Some(original) => {
+                    crate::projection::write_frame_with(stage, remaining, |w| Ok(serde_json::to_writer(w, original)?))?
+                }
+                None => crate::projection::write_frame(stage, &message, &self.resolver, remaining)?,
+            },
             Some(_) => {
                 message.materialize(&self.resolver)?;
                 crate::projection::write_frame(&mut std::io::sink(), &message, &self.resolver, remaining)?

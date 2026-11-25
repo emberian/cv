@@ -248,6 +248,9 @@ pub struct Lineage {
     /// Sub-agent path or nickname when the harness has one (Codex `agent_path`, Kimi `agent-N`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_path: Option<String>,
+    /// Uninterpreted fields belong to this object when it is moved or cloned.
+    #[serde(flatten)]
+    pub extensions: serde_json::Map<String, serde_json::Value>,
 }
 
 impl Lineage {
@@ -424,6 +427,9 @@ pub struct GitInfo {
     pub commit: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remote: Option<String>,
+    /// Uninterpreted fields belong to this object when it is moved or cloned.
+    #[serde(flatten)]
+    pub extensions: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -688,6 +694,7 @@ pub const ORIGIN_NAMES: [&str; Origin::ALL.len()] = {
 /// One message/turn in a conversation.
 #[derive(Debug, Clone)]
 pub struct Message {
+    pub extensions: serde_json::Map<String, serde_json::Value>,
     pub id: Option<String>,
     pub parent_id: Option<String>,
     /// WHO speaks.
@@ -717,6 +724,7 @@ pub struct Message {
 impl Serialize for Message {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let Message {
+            extensions,
             id,
             parent_id,
             role,
@@ -748,6 +756,8 @@ impl Serialize for Message {
             usage: Option<&'a Usage>,
             #[serde(skip_serializing_if = "record::Extra::is_empty")]
             extra: record::Extra<'a>,
+            #[serde(flatten)]
+            extensions: &'a serde_json::Map<String, serde_json::Value>,
         }
         Wire {
             id: id.as_ref(),
@@ -760,6 +770,7 @@ impl Serialize for Message {
             content,
             usage: usage.as_ref(),
             extra: record::Extra(self),
+            extensions,
         }
         .serialize(serializer)
     }
@@ -788,6 +799,8 @@ impl<'de> Deserialize<'de> for Message {
             usage: Option<Usage>,
             #[serde(default)]
             extra: serde_json::Map<String, serde_json::Value>,
+            #[serde(flatten)]
+            extensions: serde_json::Map<String, serde_json::Value>,
         }
         let w = Wire::deserialize(d)?;
         Ok(Message {
@@ -801,6 +814,7 @@ impl<'de> Deserialize<'de> for Message {
             content: w.content,
             usage: w.usage,
             extra: w.extra,
+            extensions: w.extensions,
             complete_record: None,
         })
     }
@@ -849,6 +863,7 @@ impl Message {
             content: Vec::new(),
             usage: None,
             extra: serde_json::Map::new(),
+            extensions: Default::default(),
             complete_record: None,
         }
     }
@@ -937,7 +952,7 @@ impl Message {
     pub fn try_materialize_text(&mut self, resolver: &crate::lazy::Resolver) -> anyhow::Result<()> {
         for block in &mut self.content {
             let text = match block {
-                Block::Text { text } | Block::Thinking { text, .. } => text,
+                Block::Text { text, .. } | Block::Thinking { text, .. } => text,
                 Block::ToolResult { content, .. } => content,
                 _ => continue,
             };
@@ -954,7 +969,7 @@ impl Message {
     pub fn materialize_text(&mut self, resolver: &crate::lazy::Resolver) {
         for b in &mut self.content {
             let slot = match b {
-                Block::Text { text } | Block::Thinking { text, .. } => text,
+                Block::Text { text, .. } | Block::Thinking { text, .. } => text,
                 Block::ToolResult { content, .. } => content,
                 _ => continue,
             };
@@ -981,7 +996,7 @@ impl Message {
     pub fn text(&self) -> Option<String> {
         let mut s = String::new();
         for b in &self.content {
-            if let Block::Text { text } = b {
+            if let Block::Text { text, .. } = b {
                 if !s.is_empty() {
                     s.push('\n');
                 }
@@ -999,6 +1014,8 @@ impl Message {
 pub enum Block {
     Text {
         text: crate::lazy::Text,
+        #[serde(flatten)]
+        extensions: serde_json::Map<String, serde_json::Value>,
     },
     /// Extended reasoning / chain-of-thought. `encrypted` holds an opaque blob some providers emit.
     Thinking {
@@ -1010,6 +1027,8 @@ pub enum Block {
         /// Whether the provider redacted this reasoning content.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         redacted: bool,
+        #[serde(flatten)]
+        extensions: serde_json::Map<String, serde_json::Value>,
     },
     /// A tool/function invocation by the assistant.
     ToolUse {
@@ -1026,6 +1045,8 @@ pub enum Block {
         /// `name` stays the bare tool name so tool statistics keep grouping.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         namespace: Option<String>,
+        #[serde(flatten)]
+        extensions: serde_json::Map<String, serde_json::Value>,
     },
     /// The result of a tool/function call.
     ToolResult {
@@ -1042,6 +1063,8 @@ pub enum Block {
         /// Structured extra details about the result.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         details: Option<serde_json::Value>,
+        #[serde(flatten)]
+        extensions: serde_json::Map<String, serde_json::Value>,
     },
     Image {
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -1050,6 +1073,8 @@ pub enum Block {
         /// byte span; reducer reads may use a format's existing inline-media marker.
         #[serde(skip_serializing_if = "Option::is_none")]
         data_ref: Option<String>,
+        #[serde(flatten)]
+        extensions: serde_json::Map<String, serde_json::Value>,
     },
     /// A first-class file/dir/resource attachment.
     File {
@@ -1059,26 +1084,77 @@ pub enum Block {
         path: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         source: Option<String>,
+        #[serde(flatten)]
+        extensions: serde_json::Map<String, serde_json::Value>,
+    },
+    /// An uninterpreted OpenSession block, including its original discriminator.
+    #[serde(
+        untagged,
+        serialize_with = "serialize_opaque",
+        deserialize_with = "deserialize_opaque"
+    )]
+    Opaque {
+        block_type: String,
+        value: serde_json::Value,
     },
 }
 
+fn serialize_opaque<S: serde::Serializer>(_: &str, value: &serde_json::Value, s: S) -> Result<S::Ok, S::Error> {
+    value.serialize(s)
+}
+
+fn deserialize_opaque<'de, D: serde::Deserializer<'de>>(d: D) -> Result<(String, serde_json::Value), D::Error> {
+    let value = serde_json::Value::deserialize(d)?;
+    let tag = value
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| serde::de::Error::custom("expected a string block type"))?;
+    if matches!(tag, "text" | "thinking" | "tool_use" | "tool_result" | "file" | "image") {
+        return Err(serde::de::Error::custom("invalid known block"));
+    }
+    Ok((tag.to_owned(), value))
+}
+
 impl Block {
+    /// An ordinary text block, with no format extensions.
+    pub fn from_text(text: crate::lazy::Text) -> Self {
+        Self::Text {
+            text,
+            extensions: Default::default(),
+        }
+    }
+
+    pub(crate) fn extensions_mut(&mut self) -> Option<&mut serde_json::Map<String, serde_json::Value>> {
+        match self {
+            Self::Text { extensions, .. }
+            | Self::Thinking { extensions, .. }
+            | Self::ToolUse { extensions, .. }
+            | Self::ToolResult { extensions, .. }
+            | Self::Image { extensions, .. }
+            | Self::File { extensions, .. } => Some(extensions),
+            Self::Opaque { .. } => None,
+        }
+    }
     /// The text carried by this block, including thinking and tool output.
     pub fn text(&self) -> Option<&crate::lazy::Text> {
         match self {
-            Self::Text { text } | Self::Thinking { text, .. } | Self::ToolResult { content: text, .. } => Some(text),
+            Self::Text { text, .. } | Self::Thinking { text, .. } | Self::ToolResult { content: text, .. } => {
+                Some(text)
+            }
             _ => None,
         }
     }
     pub fn text_mut(&mut self) -> Option<&mut crate::lazy::Text> {
         match self {
-            Self::Text { text } | Self::Thinking { text, .. } | Self::ToolResult { content: text, .. } => Some(text),
+            Self::Text { text, .. } | Self::Thinking { text, .. } | Self::ToolResult { content: text, .. } => {
+                Some(text)
+            }
             _ => None,
         }
     }
 
     /// The block's serde `type` tag (`tool_use`, …): the one spelling of the wire word.
-    pub fn type_tag(&self) -> &'static str {
+    pub fn type_tag(&self) -> &str {
         match self {
             Block::Text { .. } => "text",
             Block::Thinking { .. } => "thinking",
@@ -1086,6 +1162,7 @@ impl Block {
             Block::ToolResult { .. } => "tool_result",
             Block::Image { .. } => "image",
             Block::File { .. } => "file",
+            Block::Opaque { block_type, .. } => block_type,
         }
     }
 
@@ -1146,13 +1223,17 @@ pub struct Usage {
     /// Provider-reported cost in USD, when the harness stores it (Goose, OpenCode, Codex).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<f64>,
+    /// Uninterpreted fields belong to this object when it is moved or cloned.
+    #[serde(flatten)]
+    pub extensions: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Equal iff serialized equal: a nonfinite cost serializes as `null`, so any two nonfinite costs
 /// are equal; an absent cost is omitted, so it stays distinct from one.
 impl PartialEq for Usage {
     fn eq(&self, other: &Self) -> bool {
-        self.input_tokens == other.input_tokens
+        self.extensions == other.extensions
+            && self.input_tokens == other.input_tokens
             && self.output_tokens == other.output_tokens
             && self.cache_read_tokens == other.cache_read_tokens
             && self.cache_creation_tokens == other.cache_creation_tokens
@@ -1239,7 +1320,7 @@ impl Message {
         }
         let mut s = String::new();
         for b in &self.content {
-            if let Block::Text { text } = b {
+            if let Block::Text { text, .. } = b {
                 if !s.is_empty() {
                     s.push('\n');
                 }
@@ -1805,7 +1886,7 @@ fn est_tokens_with(
     let b = est_tokens_bytes;
     Ok(BLOCK_TOKENS
         + match block {
-            Block::Text { text } => b(text_len(text)?, Text),
+            Block::Text { text, .. } => b(text_len(text)?, Text),
             Block::Thinking {
                 text,
                 signature,
@@ -1819,7 +1900,7 @@ fn est_tokens_with(
             Block::ToolUse { input, .. } => b(usize::try_from(input.canonical_len()?)?, ToolInput),
             Block::ToolResult { content, .. } => b(text_len(content)?, ToolResult),
             Block::Image { .. } => IMAGE_TOKENS,
-            Block::File { .. } => 0,
+            Block::File { .. } | Block::Opaque { .. } => 0,
         })
 }
 
@@ -1934,7 +2015,7 @@ mod tests {
         m.parent_id = Some("p".into());
         m.timestamp = Some(chrono::DateTime::from_timestamp(1, 0).unwrap());
         m.model = Some("m".into());
-        m.content.push(Block::Text { text: "t".into() });
+        m.content.push(Block::from_text("t".into()));
         m.usage = Some(Usage::default());
         m.extra.insert("claude".into(), serde_json::json!({"k": 1}));
         CompleteRecord::attach(
@@ -2075,22 +2156,18 @@ mod tests {
         let mut session = Session::new("label", Harness::Claude);
         session.title = Some("explicit title".into());
         let mut message = Message::new(Role::User);
-        message.content.push(Block::Text {
-            text: crate::Text::Span(crate::Span {
-                source: None,
-                offset: 0,
-                len: u64::MAX,
-                escaped: false,
-            }),
-        });
+        message.content.push(Block::from_text(crate::Text::Span(crate::Span {
+            source: None,
+            offset: 0,
+            len: u64::MAX,
+            escaped: false,
+        })));
         session.messages.push(message);
         assert_eq!(session.label(), "explicit title");
         session.title = None;
-        session.messages[0].content = vec![Block::Text { text: " \n".into() }];
+        session.messages[0].content = vec![Block::from_text(" \n".into())];
         let mut user = Message::new(Role::User);
-        user.content.push(Block::Text {
-            text: "actual prompt".into(),
-        });
+        user.content.push(Block::from_text("actual prompt".into()));
         session.messages.push(user);
         assert_eq!(session.label(), "actual prompt");
     }
@@ -2108,16 +2185,18 @@ mod tests {
         let mut session = Session::new("session", Harness::Claude);
         session.source_path = Some(path.clone());
         let mut message = Message::new(Role::Assistant);
-        message.content.push(Block::Text { text: span.clone() });
+        message.content.push(Block::from_text(span.clone()));
         session.messages.push(message);
         assert!(session.materialize().is_err());
-        assert!(matches!(&session.messages[0].content[0], Block::Text { text } if text == &span));
+        assert!(matches!(&session.messages[0].content[0], Block::Text { text , .. } if text == &span));
 
         std::fs::write(&path, "\"text\"").unwrap();
         let reads = session.source_reads();
         session.materialize().unwrap();
         assert!(reads.fresh(&mut crate::source::Probe::default()));
-        assert!(matches!(&session.messages[0].content[0], Block::Text { text } if text.inline_str() == Some("text")));
+        assert!(
+            matches!(&session.messages[0].content[0], Block::Text { text , .. } if text.inline_str() == Some("text"))
+        );
         std::fs::remove_file(&path).unwrap();
         assert!(!reads.fresh(&mut crate::source::Probe::default()));
     }
@@ -2132,12 +2211,13 @@ mod tests {
         let source = crate::Json::source(&path, 0, wire.len() as u64).unwrap();
         let text = source.with_view(|view| view.source_text()).unwrap().unwrap();
         let mut message = Message::new(Role::Assistant);
-        message.content.push(Block::Text { text });
+        message.content.push(Block::from_text(text));
         message.content.push(Block::ToolUse {
             id: "call".into(),
             name: "tool".into(),
             namespace: None,
             input: source,
+            extensions: Default::default(),
         });
         message.content.push(Block::Thinking {
             text: crate::Text::Span(crate::Span {
@@ -2149,10 +2229,11 @@ mod tests {
             signature: None,
             encrypted: None,
             redacted: false,
+            extensions: Default::default(),
         });
         let original = message.clone();
         message.try_materialize_text(&crate::Resolver::new(None)).unwrap();
-        assert!(matches!(&message.content[0], Block::Text { text: crate::Text::Inline(value) } if value == &body));
+        assert!(matches!(&message.content[0], Block::Text { text: crate::Text::Inline(value) , .. } if value == &body));
         assert!(matches!(
             &message.content[1],
             Block::ToolUse {
@@ -2169,7 +2250,8 @@ mod tests {
         assert!(matches!(
             &failed.content[0],
             Block::Text {
-                text: crate::Text::Source(_)
+                text: crate::Text::Source(_),
+                ..
             }
         ));
     }
@@ -2197,12 +2279,13 @@ mod tests {
                     escaped,
                 });
                 let blocks = vec![
-                    Block::Text { text: text.clone() },
+                    Block::from_text(text.clone()),
                     Block::Thinking {
                         text: text.clone(),
                         signature: Some("abc".into()),
                         encrypted: Some("π".into()),
                         redacted: false,
+                        extensions: Default::default(),
                     },
                     Block::ToolResult {
                         tool_use_id: "t".into(),
@@ -2211,6 +2294,7 @@ mod tests {
                         tool_name: None,
                         status: None,
                         details: None,
+                        extensions: Default::default(),
                     },
                 ];
                 for block in blocks {
@@ -2227,14 +2311,12 @@ mod tests {
         }
         let resolver = Resolver::new(Some(source));
         for (offset, len) in [(u64::MAX, 1), (1, u64::MAX - 2)] {
-            let block = Block::Text {
-                text: Text::Span(Span {
-                    source: None,
-                    offset,
-                    len,
-                    escaped: true,
-                }),
-            };
+            let block = Block::from_text(Text::Span(Span {
+                source: None,
+                offset,
+                len,
+                escaped: true,
+            }));
             let error = est_tokens_resolved(&block, &resolver).unwrap_err();
             assert!(error.to_string().contains("Text span is outside source"));
         }
@@ -2306,10 +2388,7 @@ mod tests {
             "CJK prose must not pay 3 UTF-8 bytes per scalar: {est_cjk} vs {raw_cjk}"
         );
         assert_eq!(
-            est_tokens(&Block::Text {
-                text: cjk.clone().into()
-            })
-            .unwrap(),
+            est_tokens(&Block::from_text(cjk.clone().into())).unwrap(),
             BLOCK_TOKENS + est_cjk
         );
 
@@ -2330,14 +2409,10 @@ mod tests {
         session.model = Some("custom-model-v1".into());
 
         let mut u1 = Message::new(Role::User);
-        u1.content.push(Block::Text {
-            text: "initial question".into(),
-        });
+        u1.content.push(Block::from_text("initial question".into()));
         let mut a1 = Message::new(Role::Assistant);
         // 500 ASCII bytes => ceil(500 / 2.5) = 200 tokens + 12 BLOCK_TOKENS = 212
-        a1.content.push(Block::Text {
-            text: "x".repeat(500).into(),
-        });
+        a1.content.push(Block::from_text("x".repeat(500).into()));
         a1.usage = Some(Usage {
             input_tokens: Some(1_000),
             output_tokens: Some(140),
@@ -2346,11 +2421,9 @@ mod tests {
 
         let mut u2 = Message::new(Role::User);
         // 500 ASCII bytes => 212 est tokens; total span est between a1..a2 = 424
-        u2.content.push(Block::Text {
-            text: "y".repeat(500).into(),
-        });
+        u2.content.push(Block::from_text("y".repeat(500).into()));
         let mut a2 = Message::new(Role::Assistant);
-        a2.content.push(Block::Text { text: "done".into() });
+        a2.content.push(Block::from_text("done".into()));
         // Prompt grew by 300 recorded tokens (1000 -> 1300) for 424 raw estimated tokens => ~1.4133
         a2.usage = Some(Usage {
             input_tokens: Some(300),
@@ -2395,6 +2468,7 @@ mod tests {
             name: "Edit".into(),
             input: crate::json::Json::source(&path, 0, raw.len() as u64).unwrap(),
             namespace: None,
+            extensions: Default::default(),
         });
         assert_eq!(
             est_tokens(&message.content[0]).unwrap(),
@@ -2541,7 +2615,7 @@ mod tests {
     fn synth_title_prefers_title_then_falls_back_then_none() {
         let user = |t: &str| {
             let mut m = Message::new(Role::User);
-            m.content.push(Block::Text { text: t.into() });
+            m.content.push(Block::from_text(t.into()));
             m
         };
         let mut s = Session {

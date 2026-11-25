@@ -214,6 +214,7 @@ pub(super) fn bubble(view: JsonView<'_>, cells: &Cells, spans: bool, ordinal: us
                 signature,
                 encrypted: None,
                 redacted: false,
+                extensions: Default::default(),
             });
         }
     }
@@ -224,10 +225,10 @@ pub(super) fn bubble(view: JsonView<'_>, cells: &Cells, spans: bool, ordinal: us
         .flatten()
         .filter(|text| !text.is_empty())
     {
-        message.content.push(Block::Text { text });
+        message.content.push(Block::from_text(text));
     } else if let Some(rich) = fields.get("richText") {
         if let Some(text) = lexical(rich, cells, spans)? {
-            message.content.push(Block::Text { text });
+            message.content.push(Block::from_text(text));
         }
     }
     if let Some(tool) = fields.get("toolFormerData") {
@@ -274,6 +275,7 @@ pub(super) fn bubble(view: JsonView<'_>, cells: &Cells, spans: bool, ordinal: us
             name: name.clone(),
             input: input.unwrap_or_else(|| Value::Null.into()),
             namespace: None,
+            extensions: Default::default(),
         });
         let status = text("status")?.unwrap_or_default();
         let error = get("error");
@@ -305,6 +307,7 @@ pub(super) fn bubble(view: JsonView<'_>, cells: &Cells, spans: bool, ordinal: us
                 tool_name: Some(name),
                 status: (!status.is_empty()).then_some(status),
                 details: None,
+                extensions: Default::default(),
             });
         }
     }

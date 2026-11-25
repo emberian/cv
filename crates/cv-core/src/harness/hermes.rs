@@ -1803,7 +1803,7 @@ fn session_lineage_root_to_tip(conn: &Connection, session_id: &str, probe: &Sele
 /// Plain text of a message iff it is exactly one Text block (the shape Hermes replays as a string).
 fn single_text(m: &Message) -> Option<&crate::Text> {
     match m.content.as_slice() {
-        [Block::Text { text }] => Some(text),
+        [Block::Text { text, .. }] => Some(text),
         _ => None,
     }
 }
@@ -2259,6 +2259,7 @@ fn read_row(
             signature: None,
             encrypted: reasoning.encrypted.take(),
             redacted: false,
+            extensions: Default::default(),
         })
     };
     let codex_message_items = if full {
@@ -2649,11 +2650,12 @@ impl MsgRow {
                 tool_name: self.tool_name,
                 status: None,
                 details: None,
+                extensions: Default::default(),
             });
             return Some(m);
         }
         match self.body {
-            Some(Body::Text(text)) => m.content.push(Block::Text { text }),
+            Some(Body::Text(text)) => m.content.push(Block::from_text(text)),
             Some(Body::Blocks(blocks)) => m.content.extend(blocks),
             None => {}
         }
@@ -2974,7 +2976,8 @@ mod tests {
             .all(|message| message.content.iter().any(|block| matches!(
                 block,
                 Block::Text {
-                    text: crate::Text::Source(_)
+                    text: crate::Text::Source(_),
+                    ..
                 } | Block::ToolResult {
                     content: crate::Text::Source(_),
                     ..
@@ -2984,7 +2987,8 @@ mod tests {
         assert!(matches!(
             checked.messages[6].content[0],
             Block::Text {
-                text: crate::Text::Source(_)
+                text: crate::Text::Source(_),
+                ..
             }
         ));
         let mut materialized = checked.clone();
@@ -3059,7 +3063,8 @@ mod tests {
             assert!(matches!(
                 message.content[0],
                 Block::Text {
-                    text: crate::Text::Source(_)
+                    text: crate::Text::Source(_),
+                    ..
                 }
             ));
         }
@@ -3067,7 +3072,7 @@ mod tests {
         materialized.materialize()?;
         assert_eq!(serde_json::to_value(materialized)?, serde_json::to_value(owned)?);
         std::fs::write(&path, "replaced producer")?;
-        let Block::Text { text } = &checked.messages[0].content[0] else {
+        let Block::Text { text, .. } = &checked.messages[0].content[0] else {
             unreachable!()
         };
         assert!(text.try_resolve(&checked.resolver()).is_err());
@@ -3139,7 +3144,8 @@ mod tests {
                 assert!(matches!(
                     actual.messages[1].content[0],
                     Block::Text {
-                        text: crate::Text::Source(_)
+                        text: crate::Text::Source(_),
+                        ..
                     }
                 ));
                 assert!(actual.messages.iter().flat_map(|m| &m.content).any(|block| matches!(
@@ -3204,7 +3210,7 @@ mod tests {
         let before_main = std::fs::read(&path)?;
         writer.execute("UPDATE messages SET content='changed' WHERE id=2", [])?;
         assert_eq!(std::fs::read(&path)?, before_main);
-        let Block::Text { text } = &lean.messages[1].content[0] else {
+        let Block::Text { text, .. } = &lean.messages[1].content[0] else {
             unreachable!()
         };
         assert!(text.try_resolve(&lean.resolver()).is_err());
@@ -3230,7 +3236,7 @@ mod tests {
         // the generic spill budgets this tests against live in `crate::spill`'s own suite.
         let mut dedup = ReplayDedup::default();
         let mut message = Message::new(Role::User);
-        message.content.push(Block::Text { text: "".into() });
+        message.content.push(Block::from_text("".into()));
         for _ in 0..40000 {
             dedup.admit(&message).unwrap();
         }
@@ -3485,7 +3491,7 @@ mod tests {
         let s = parse_conn(&conn, &sref(&conn, "s1")).unwrap();
         assert_eq!(s.messages.len(), 1);
         let blocks = &s.messages[0].content;
-        assert!(matches!(&blocks[0], Block::Text { text } if text.matches_str("see this") == Some(true)));
+        assert!(matches!(&blocks[0], Block::Text { text , .. } if text.matches_str("see this") == Some(true)));
         assert!(matches!(&blocks[1], Block::Image { data_ref: Some(u), .. } if u.starts_with("data:image/png")));
     }
 
@@ -3502,7 +3508,7 @@ mod tests {
         .unwrap();
         let s = parse_conn(&conn, &sref(&conn, "s1")).unwrap();
         let blocks = &s.messages[0].content;
-        assert!(matches!(&blocks[0], Block::Text { text } if text.matches_str("hi") == Some(true)));
+        assert!(matches!(&blocks[0], Block::Text { text , .. } if text.matches_str("hi") == Some(true)));
         assert!(matches!(&blocks[1], Block::Image { data_ref: Some(u), .. } if u.starts_with("data:image/jpeg")));
     }
 
@@ -4463,7 +4469,8 @@ mod tests {
         assert!(matches!(
             &checked.messages[0].content[0],
             Block::Text {
-                text: crate::Text::Source(_)
+                text: crate::Text::Source(_),
+                ..
             }
         ));
         checked.materialize()?;

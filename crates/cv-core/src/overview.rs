@@ -256,7 +256,7 @@ impl<'a> Collector<'a> {
                 let mut text = String::new();
                 let mut truncated = false;
                 for block in &m.content {
-                    if let Block::Text { text: source } = block {
+                    if let Block::Text { text: source, .. } = block {
                         if !text.is_empty() {
                             if text.len() < self.opts.excerpt_bytes {
                                 text.push('\n');
@@ -395,7 +395,7 @@ mod tests {
 
     fn prompt(text: &str) -> Message {
         let mut m = Message::new(Role::User);
-        m.content.push(Block::Text { text: text.into() });
+        m.content.push(Block::from_text(text.into()));
         m
     }
     fn call(name: &str, input: Value) -> Message {
@@ -405,6 +405,7 @@ mod tests {
             name: name.into(),
             input: Json::from(input),
             namespace: None,
+            extensions: Default::default(),
         });
         m
     }
@@ -504,6 +505,7 @@ mod tests {
             tool_name: Some("Bash".into()),
             status: None,
             details: None,
+            extensions: Default::default(),
         });
         session.messages.push(result);
         let overview = from_session(
@@ -581,14 +583,12 @@ mod tests {
         let path = dir.join("text.json");
         let mut session = Session::new("lazy", Harness::Claude);
         let mut message = prompt("");
-        message.content = vec![Block::Text {
-            text: crate::Text::Span(crate::Span {
-                source: Some(path),
-                offset: 0,
-                len: 8,
-                escaped: false,
-            }),
-        }];
+        message.content = vec![Block::from_text(crate::Text::Span(crate::Span {
+            source: Some(path),
+            offset: 0,
+            len: 8,
+            escaped: false,
+        }))];
         session.messages.push(prompt("valid earlier request"));
         session.messages.push(message);
         assert!(from_session(&session, &OverviewOptions::default()).is_err());

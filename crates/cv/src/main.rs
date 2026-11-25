@@ -518,9 +518,13 @@ enum Cmd {
     /// `claude --resume <new-id>`; fetch a stashed original back with `cv cat <new-id> <tool_use_id>`.
     Prune {
         /// Source session id, sub-agent's agent-<id>, or Claude transcript path.
-        id: String,
+        #[arg(required_unless_present = "agent")]
+        id: Option<String>,
         #[arg(long)]
         harness: Option<String>,
+        /// Select a child of the source session by agent ID.
+        #[arg(long)]
+        agent: Option<String>,
         /// Snip a tool payload only if it's larger than this many bytes.
         #[arg(long, default_value_t = 2048)]
         min_size: usize,
@@ -1550,6 +1554,7 @@ fn run() -> Result<()> {
         Cmd::Stats { query, json, tokens } => browse::cmd_stats(query, json, tokens),
         Cmd::Prune {
             id,
+            agent,
             harness,
             min_size,
             keep_last,
@@ -1570,7 +1575,8 @@ fn run() -> Result<()> {
             dry_run,
             json,
         } => reshape::cmd_prune(reshape::PruneArgs {
-            id: &id,
+            agent,
+            id: id.as_deref(),
             harness,
             min_size,
             keep_last,

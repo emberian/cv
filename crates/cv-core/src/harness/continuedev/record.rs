@@ -90,6 +90,7 @@ pub(super) fn messages(
                 tool_name: None,
                 status: Some("completed".into()),
                 details: None,
+                extensions: Default::default(),
             });
         } else {
             m.content = openai::blocks_from_view(message.get("content"), &openai::CONTINUE, &mut |v| v.text(spans))?;
@@ -188,6 +189,7 @@ fn context_item(item: JsonView<'_>) -> Result<Option<Block>> {
         mime: None,
         path,
         source,
+        extensions: Default::default(),
     }))
 }
 
@@ -238,6 +240,7 @@ fn tool_states(states: Option<JsonView<'_>>, spans: bool) -> Result<Option<Messa
             tool_name: function.map(|f| f.string("name")).transpose()?.flatten(),
             status,
             details: None,
+            extensions: Default::default(),
         });
     }
     Ok((!message.content.is_empty()).then_some(message))

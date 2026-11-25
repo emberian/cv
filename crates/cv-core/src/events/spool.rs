@@ -270,6 +270,7 @@ mod tests {
             name: "apply_patch".into(),
             namespace: None,
             input: serde_json::json!({"patch": patch}).into(),
+            extensions: Default::default(),
         });
         assert_eq!(sink.observe_message(&message), Flow::Continue);
         assert!(sink.inner.events.capacity() <= 64);
@@ -393,6 +394,7 @@ mod tests {
             name: "Edit".into(),
             input: serde_json::json!({"file_path":"a.rs"}).into(),
             namespace: None,
+            extensions: Default::default(),
         });
         legacy.message(message.clone());
         bounded.message(message.clone());

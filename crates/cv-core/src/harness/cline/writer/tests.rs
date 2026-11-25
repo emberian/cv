@@ -19,17 +19,17 @@ fn fixture() -> Result<Session> {
     session.model = Some("session-model".into());
     let mut user = Message::new(Role::User);
     user.content = vec![
-        Block::Text {
-            text: "prompt\n雪".into(),
-        },
+        Block::from_text("prompt\n雪".into()),
         Block::Image {
             media_type: Some("image/png".into()),
             data_ref: Some("file:img".into()),
+            extensions: Default::default(),
         },
         Block::File {
             mime: Some("text/plain".into()),
             path: Some("report λ.txt".into()),
             source: Some("https://report".into()),
+            extensions: Default::default(),
         },
     ];
     let mut assistant = Message::new(Role::Assistant);
@@ -39,39 +39,40 @@ fn fixture() -> Result<Session> {
             signature: Some("signature".into()),
             encrypted: None,
             redacted: false,
+            extensions: Default::default(),
         },
         Block::Thinking {
             text: " ".into(),
             signature: Some("signature-only".into()),
             encrypted: None,
             redacted: false,
+            extensions: Default::default(),
         },
         Block::Thinking {
             text: "".into(),
             signature: None,
             encrypted: Some("opaque".into()),
             redacted: true,
+            extensions: Default::default(),
         },
-        Block::Text {
-            text: "answer \"\\\t".into(),
-        },
+        Block::from_text("answer \"\\\t".into()),
         Block::ToolUse {
             id: "linked".into(),
             name: "tool".into(),
             namespace: None,
             input: json!({"β":[1,true,null]}).into(),
+            extensions: Default::default(),
         },
         Block::File {
             mime: None,
             path: None,
             source: Some("https://assistant/file".into()),
+            extensions: Default::default(),
         },
     ];
     let mut tools = Message::new(Role::Tool);
     tools.content = vec![
-        Block::Text {
-            text: "not emitted in a Tool turn".into(),
-        },
+        Block::from_text("not emitted in a Tool turn".into()),
         Block::ToolResult {
             tool_use_id: "linked".into(),
             content: "tool result λ".into(),
@@ -79,6 +80,7 @@ fn fixture() -> Result<Session> {
             tool_name: Some("tool".into()),
             status: None,
             details: None,
+            extensions: Default::default(),
         },
     ];
     let mut empty = Message::new(Role::Assistant);
@@ -87,6 +89,7 @@ fn fixture() -> Result<Session> {
         signature: None,
         encrypted: None,
         redacted: false,
+        extensions: Default::default(),
     });
     session.messages = vec![
         user,
@@ -166,15 +169,14 @@ fn checked_cline_guarded_failure_preserves_all_destination_files() -> Result<()>
         let mut session = Session::new("source", Harness::Claude);
         let mut message = Message::new(Role::Assistant);
         message.content.push(if text_leaf {
-            Block::Text {
-                text: json.with_view(|v| v.source_text())?.unwrap(),
-            }
+            Block::from_text(json.with_view(|v| v.source_text())?.unwrap())
         } else {
             Block::ToolUse {
                 id: "id".into(),
                 name: "name".into(),
                 namespace: None,
                 input: json,
+                extensions: Default::default(),
             }
         });
         session.messages.push(message);

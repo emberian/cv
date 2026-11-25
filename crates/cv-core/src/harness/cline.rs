@@ -751,7 +751,7 @@ fn record(view: JsonView<'_>, session: &mut Session, spans: bool) -> Result<(Opt
     let mut blocks = Vec::new();
     if let Some(content) = content {
         if let Some(text) = content.lazy_text(spans)? {
-            blocks.push(Block::Text { text });
+            blocks.push(Block::from_text(text));
         } else if let Some(parts) = content.array()? {
             for part in parts {
                 let part = part?;
@@ -775,6 +775,7 @@ fn record(view: JsonView<'_>, session: &mut Session, spans: bool) -> Result<(Opt
                         signature: None,
                         encrypted: None,
                         redacted: false,
+                        extensions: Default::default(),
                     })
                 } else {
                     anthropic::block_from_view_with(
@@ -805,9 +806,7 @@ fn condense_boundary(v: &Value, harness: Harness) -> Option<Message> {
     }
     let mut b = Message::of_kind(Role::System, MessageKind::CompactionBoundary, Origin::Harness);
     b.timestamp = v.get("ts").and_then(Value::as_i64).and_then(super::ts_from_epoch);
-    b.content = vec![Block::Text {
-        text: "context condensed".into(),
-    }];
+    b.content = vec![Block::from_text("context condensed".into())];
     if let Some(id) = v.get("condenseId") {
         b.id = id.as_str().map(|s| format!("{s}#boundary"));
         b.harness_extra_mut(harness).insert("condense_id".into(), id.clone());
@@ -1165,7 +1164,7 @@ mod tests {
         let mut source = Session::new("source", Harness::Claude);
         source.model = Some("selected-model".into());
         let mut user = Message::new(Role::User);
-        user.content.push(Block::Text { text: "prompt".into() });
+        user.content.push(Block::from_text("prompt".into()));
         source.messages.push(user);
         for harness in [Harness::Cline, Harness::Roo] {
             let out = world.base.join(harness.as_str());
@@ -1284,7 +1283,7 @@ mod tests {
                 if opts.spans {
                     assert!(actual.messages.iter().flat_map(|m| &m.content).any(|block| matches!(
                         block,
-                        Block::Text { text: crate::Text::Source(text) } if text.path() == history.as_path()
+                        Block::Text { text: crate::Text::Source(text) , .. } if text.path() == history.as_path()
                     )));
                 }
                 actual.materialize().unwrap();
@@ -1459,21 +1458,18 @@ mod tests {
         };
 
         let mut user = Message::new(Role::User);
-        user.content = vec![Block::Text {
-            text: "please fix it".to_string().into(),
-        }];
+        user.content = vec![Block::from_text("please fix it".to_string().into())];
         session.messages.push(user);
 
         let mut asst = Message::new(Role::Assistant);
         asst.content = vec![
-            Block::Text {
-                text: "on it".to_string().into(),
-            },
+            Block::from_text("on it".to_string().into()),
             Block::ToolUse {
                 id: "toolu_1".to_string(),
                 name: "read_file".to_string(),
                 input: json!({ "path": "a.rs" }).into(),
                 namespace: None,
+                extensions: Default::default(),
             },
         ];
         session.messages.push(asst);
@@ -1486,6 +1482,7 @@ mod tests {
             tool_name: None,
             status: None,
             details: None,
+            extensions: Default::default(),
         }];
         session.messages.push(tool);
 
@@ -1513,7 +1510,7 @@ mod tests {
 
         // Assistant text + tool_use blocks survive.
         assert!(
-            matches!(&parsed.messages[1].content[0], Block::Text { text } if text.matches_str("on it") == Some(true))
+            matches!(&parsed.messages[1].content[0], Block::Text { text , .. } if text.matches_str("on it") == Some(true))
         );
         assert!(matches!(
             &parsed.messages[1].content[1],

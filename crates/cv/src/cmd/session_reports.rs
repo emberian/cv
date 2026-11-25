@@ -76,7 +76,7 @@ fn collect_prompts(
             if prompts && m.kind == MessageKind::Prompt && m.origin == Origin::Human {
                 let mut text = String::new();
                 for block in &m.content {
-                    if let Block::Text { text: body } = block {
+                    if let Block::Text { text: body, .. } = block {
                         if !text.is_empty() {
                             text.push('\n');
                         }
@@ -753,25 +753,26 @@ mod tests {
             })
         };
         let mut assistant = Message::new(Role::Assistant);
-        assistant.content.push(Block::Text {
-            text: span(&world.base.join("not-demanded"), 8_000_000),
-        });
+        assistant
+            .content
+            .push(Block::from_text(span(&world.base.join("not-demanded"), 8_000_000)));
         assistant.content.push(Block::ToolUse {
             id: "question".into(),
             name: "AskUserQuestion".into(),
             input: serde_json::json!({"questions": []}).into(),
             namespace: None,
+            extensions: Default::default(),
         });
         assistant.content.push(Block::ToolUse {
             id: "bash".into(),
             name: "Bash".into(),
             input: serde_json::json!({"command": "echo hi"}).into(),
             namespace: None,
+            extensions: Default::default(),
         });
         let mut user = Message::new(Role::User);
-        user.content.push(Block::Text {
-            text: span(&prompt_path, prompt_json.len() - 2),
-        });
+        user.content
+            .push(Block::from_text(span(&prompt_path, prompt_json.len() - 2)));
         let mut tool = Message::new(Role::Tool);
         tool.content.push(Block::ToolResult {
             tool_use_id: "bash".into(),
@@ -780,6 +781,7 @@ mod tests {
             tool_name: None,
             status: None,
             details: None,
+            extensions: Default::default(),
         });
         tool.content.push(Block::ToolResult {
             tool_use_id: "question".into(),
@@ -788,6 +790,7 @@ mod tests {
             tool_name: None,
             status: None,
             details: None,
+            extensions: Default::default(),
         });
         let fixture = Fixture(cv_core::Harness::Claude, vec![assistant, user, tool]);
         let r = SessionRef::new("selection", cv_core::Harness::Claude, world.base.join("source"));
@@ -817,18 +820,21 @@ mod tests {
                 name: tool_name.into(),
                 input: serde_json::json!({}).into(),
                 namespace: None,
+                extensions: Default::default(),
             });
             ask.content.push(Block::ToolUse {
                 id: "q-err".into(),
                 name: tool_name.into(),
                 input: serde_json::json!({}).into(),
                 namespace: None,
+                extensions: Default::default(),
             });
             ask.content.push(Block::ToolUse {
                 id: "sh-1".into(),
                 name: "Bash".into(),
                 input: serde_json::json!({"command": "cat log"}).into(),
                 namespace: None,
+                extensions: Default::default(),
             });
             let mut res = Message::new(Role::Tool);
             res.content = vec![
@@ -839,6 +845,7 @@ mod tests {
                     tool_name: None,
                     status: None,
                     details: None,
+                    extensions: Default::default(),
                 },
                 Block::ToolResult {
                     tool_use_id: "q-err".into(),
@@ -847,6 +854,7 @@ mod tests {
                     tool_name: None,
                     status: None,
                     details: None,
+                    extensions: Default::default(),
                 },
                 Block::ToolResult {
                     tool_use_id: "q-1".into(),
@@ -855,6 +863,7 @@ mod tests {
                     tool_name: None,
                     status: None,
                     details: None,
+                    extensions: Default::default(),
                 },
             ];
             let fixture = Fixture(harness, vec![ask, res]);

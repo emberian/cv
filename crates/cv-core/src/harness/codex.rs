@@ -99,7 +99,7 @@ fn is_injected_text(t: &str) -> bool {
 fn note(kind: MessageKind, ts: Option<DateTime<Utc>>, text: String) -> Message {
     let mut m = Message::of_kind(Role::System, kind, Origin::Harness);
     m.timestamp = ts;
-    m.content.push(Block::Text { text: text.into() });
+    m.content.push(Block::from_text(text.into()));
     m
 }
 
@@ -2151,9 +2151,11 @@ mod tests {
     fn user_message_with_input_image() {
         let s = parse_fixture("user_message_with_input_image.jsonl");
         let m = &s.messages[0];
-        assert!(matches!(&m.content[0], Block::Text { text } if text.matches_str("see this") == Some(true)));
+        assert!(matches!(&m.content[0], Block::Text { text , .. } if text.matches_str("see this") == Some(true)));
         match &m.content[1] {
-            Block::Image { media_type, data_ref } => {
+            Block::Image {
+                media_type, data_ref, ..
+            } => {
                 assert_eq!(media_type.as_deref(), Some("image/png"));
                 assert_eq!(data_ref.as_deref(), Some("base64:inline"));
             }

@@ -274,7 +274,7 @@ fn write_database(
             let mut bytes = Vec::new();
             let mut part = crate::harness::wire::write::ObjectWriter::new(&mut bytes)?;
             match b {
-                Block::Text { text } => {
+                Block::Text { text, .. } => {
                     part.field("type", "text")?;
                     part.field_with("text", |w| crate::harness::wire::write::text(w, text, &resolver))?;
                 }
@@ -298,7 +298,10 @@ fn write_database(
                         tool_state(w, Some(input), tool_results.get(id.as_str()).copied(), &resolver)
                     })?;
                 }
-                Block::Image { media_type, data_ref } => {
+                Block::Opaque { .. } => continue,
+                Block::Image {
+                    media_type, data_ref, ..
+                } => {
                     part.field("type", "file")?;
                     if let Some(mt) = media_type {
                         part.field("mime", mt)?;
@@ -307,7 +310,7 @@ fn write_database(
                         part.field("url", url)?;
                     }
                 }
-                Block::File { mime, path, source } => {
+                Block::File { mime, path, source, .. } => {
                     part.field("type", "file")?;
                     if let Some(mt) = mime {
                         part.field("mime", mt)?;
@@ -409,7 +412,7 @@ mod tests {
         let world = crate::test_world("opencode-unknown-cwd");
         let mut session = Session::new("source", crate::Harness::Claude);
         let mut message = crate::Message::new(Role::User);
-        message.content.push(Block::Text { text: "hello".into() });
+        message.content.push(Block::from_text("hello".into()));
         session.messages.push(message);
         let (result, report) = crate::emit::emit_report(
             &session,
@@ -467,9 +470,7 @@ mod tests {
         let mut connection = rusqlite::Connection::open_in_memory()?;
         let mut session = Session::new("original", crate::Harness::Claude);
         let mut message = crate::Message::new(Role::User);
-        message.content.push(Block::Text {
-            text: "original body".into(),
-        });
+        message.content.push(Block::from_text("original body".into()));
         session.messages.push(message);
         let options = EmitOptions::default();
         write_database(&session, &options, "fixed", "/fixture", "project", &mut connection)?;

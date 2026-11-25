@@ -93,6 +93,7 @@ pub(super) fn message(
             tool_name: e.and_then(|e| e.title.clone()),
             status: e.and_then(|e| e.status.clone()),
             details: None,
+            extensions: Default::default(),
         });
         return Ok((false, Some(m)));
     }
@@ -113,6 +114,7 @@ pub(super) fn message(
             signature: None,
             encrypted,
             redacted: false,
+            extensions: Default::default(),
         });
         return Ok((true, Some(m)));
     }
@@ -146,12 +148,13 @@ pub(super) fn message(
                 signature: None,
                 encrypted,
                 redacted: false,
+                extensions: Default::default(),
             });
         }
     }
     m.model = top.string("model_id")?;
     if !content.is_empty() {
-        m.content.push(Block::Text { text: content });
+        m.content.push(Block::from_text(content));
     }
 
     // assistant tool_calls → ToolUse blocks (arguments is a JSON *string*).

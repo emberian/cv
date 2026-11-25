@@ -198,6 +198,7 @@ mod checked_tests {
             tool_name: None,
             status: None,
             details: None,
+            extensions: Default::default(),
         }
     }
     #[test]
@@ -214,21 +215,22 @@ mod checked_tests {
         let mut user = Message::new(Role::User);
         user.timestamp = Some(ts);
         user.content = vec![
-            Block::Text {
-                text: "prompt\n雪".into(),
-            },
+            Block::from_text("prompt\n雪".into()),
             Block::Image {
                 media_type: Some("image/png".into()),
                 data_ref: None,
+                extensions: Default::default(),
             },
             Block::Image {
                 media_type: None,
                 data_ref: None,
+                extensions: Default::default(),
             },
             Block::File {
                 mime: Some("text/plain".into()),
                 path: Some("fallback".into()),
                 source: Some("file://λ".into()),
+                extensions: Default::default(),
             },
         ];
         let mut assistant = Message::new(Role::Assistant);
@@ -246,33 +248,36 @@ mod checked_tests {
                 signature: Some("sig".into()),
                 encrypted: None,
                 redacted: false,
+                extensions: Default::default(),
             },
             Block::Thinking {
                 text: " ".into(),
                 signature: Some("only".into()),
                 encrypted: None,
                 redacted: false,
+                extensions: Default::default(),
             },
             Block::Thinking {
                 text: "".into(),
                 signature: None,
                 encrypted: Some("opaque".into()),
                 redacted: false,
+                extensions: Default::default(),
             },
             Block::Thinking {
                 text: "".into(),
                 signature: None,
                 encrypted: None,
                 redacted: true,
+                extensions: Default::default(),
             },
-            Block::Text {
-                text: "answer\"\\\t".into(),
-            },
+            Block::from_text("answer\"\\\t".into()),
             Block::ToolUse {
                 id: "paired".into(),
                 name: "tool".into(),
                 namespace: None,
                 input: json!({"β":[1,true,null],"a":{"z":"\""}}).into(),
+                extensions: Default::default(),
             },
         ];
         let mut tools = Message::new(Role::Tool);
@@ -288,6 +293,7 @@ mod checked_tests {
             signature: None,
             encrypted: None,
             redacted: false,
+            extensions: Default::default(),
         }];
         session.messages = vec![user, assistant, tools, Message::new(Role::System), thinking_only];
         session
@@ -337,15 +343,14 @@ mod checked_tests {
             let json = Json::source(&source, 0, raw.len() as u64)?;
             let mut message = Message::new(Role::Assistant);
             message.content.push(if text_leaf {
-                Block::Text {
-                    text: json.with_view(|v| v.source_text())?.unwrap(),
-                }
+                Block::from_text(json.with_view(|v| v.source_text())?.unwrap())
             } else {
                 Block::ToolUse {
                     id: "id".into(),
                     name: "name".into(),
                     namespace: None,
                     input: json,
+                    extensions: Default::default(),
                 }
             });
             let mut session = Session::new("source", Harness::Claude);
@@ -383,7 +388,7 @@ mod checked_tests {
         assert!(prepared.messages[0]
             .content
             .iter()
-            .any(|block| matches!(block,Block::Text {text} if text.is_lazy())));
+            .any(|block| matches!(block,Block::Text {text, .. } if text.is_lazy())));
         prepared.materialize()?;
         let full = crate::stream::collect_with(&adapter, &reference, &crate::Demand::RICH)?;
         assert_eq!(serde_json::to_value(&prepared)?, serde_json::to_value(&full)?);
@@ -391,7 +396,7 @@ mod checked_tests {
         assert!(complete.messages[0]
             .content
             .iter()
-            .all(|block| !matches!(block,Block::Text {text} if text.is_lazy())));
+            .all(|block| !matches!(block,Block::Text {text, .. } if text.is_lazy())));
         // Same-harness Gemini uses the existing complete/owned compatibility path.
         Ok(())
     }
@@ -407,14 +412,16 @@ mod checked_tests {
         session.cwd = Some("/synthetic/img-proj".into());
         let mut user = Message::new(Role::User);
         user.content = vec![
-            Block::Text { text: "inspect".into() },
+            Block::from_text("inspect".into()),
             Block::Image {
                 media_type: Some("image/png".into()),
                 data_ref: Some(data_uri.clone()),
+                extensions: Default::default(),
             },
             Block::Image {
                 media_type: Some("image/jpeg".into()),
                 data_ref: Some("https://example.invalid/remote.jpg".into()),
+                extensions: Default::default(),
             },
         ];
         session.messages.push(user);
@@ -443,7 +450,7 @@ mod checked_tests {
         let gem_back = gem.parse(&gem_refs[0])?;
         assert!(gem_back.messages[0].content.iter().any(|b| matches!(
             b,
-            Block::Image { media_type: Some(m), data_ref: Some(r) } if m == "image/png" && *r == data_uri
+            Block::Image { media_type: Some(m), data_ref: Some(r) , .. } if m == "image/png" && *r == data_uri
         )));
 
         // Rehoming a parsed `.jsonl` Gemini session into a fresh `out_dir` via `emit(...)` preserves `.jsonl`.
@@ -485,12 +492,12 @@ mod checked_tests {
         let qwen_disc = crate::stream::collect_with(&qwen, &qwen_ref, &crate::Demand::DISCOVERY)?;
         assert!(qwen_disc.messages[0].content.iter().any(|b| matches!(
             b,
-            Block::Image { media_type: Some(m), data_ref: None } if m == "image/png"
+            Block::Image { media_type: Some(m), data_ref: None , .. } if m == "image/png"
         )));
         let qwen_rich = qwen.parse(&qwen_ref)?;
         assert!(qwen_rich.messages[0].content.iter().any(|b| matches!(
             b,
-            Block::Image { media_type: Some(m), data_ref: Some(r) } if m == "image/png" && *r == data_uri
+            Block::Image { media_type: Some(m), data_ref: Some(r) , .. } if m == "image/png" && *r == data_uri
         )));
         Ok(())
     }

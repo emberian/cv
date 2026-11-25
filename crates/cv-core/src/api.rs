@@ -849,9 +849,7 @@ mod tests {
             ) -> anyhow::Result<Session> {
                 sink.dependency(&self.0);
                 let mut message = Message::new(crate::Role::User);
-                message.content.push(crate::Block::Text {
-                    text: "unpublished".into(),
-                });
+                message.content.push(crate::Block::from_text("unpublished".into()));
                 sink.try_message(message)?;
                 std::fs::write(&self.0, "changed while reading")?;
                 Ok(Session::new(&reference.id, reference.harness))
@@ -926,6 +924,7 @@ mod tests {
             name: "Bash".into(),
             namespace: None,
             input,
+            extensions: Default::default(),
         });
         std::fs::remove_file(path).unwrap();
         let mut selected = window(0, Some(1));

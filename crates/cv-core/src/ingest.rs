@@ -825,16 +825,14 @@ fn parse_cline_history_bytes(id: &str, harness: crate::ir::Harness, bytes: &[u8]
         let mut blocks = Vec::new();
         match item.get("content") {
             Some(serde_json::Value::String(s)) => {
-                blocks.push(Block::Text { text: s.clone().into() });
+                blocks.push(Block::from_text(s.clone().into()));
             }
             Some(serde_json::Value::Array(arr)) => {
                 for part in arr {
                     match part.get("type").and_then(serde_json::Value::as_str).unwrap_or("") {
                         "text" => {
                             if let Some(t) = part.get("text").and_then(serde_json::Value::as_str) {
-                                blocks.push(Block::Text {
-                                    text: t.to_owned().into(),
-                                });
+                                blocks.push(Block::from_text(t.to_owned().into()));
                             }
                         }
                         "thinking" => {
@@ -852,6 +850,7 @@ fn parse_cline_history_bytes(id: &str, harness: crate::ir::Harness, bytes: &[u8]
                                 signature,
                                 encrypted: None,
                                 redacted: false,
+                                extensions: Default::default(),
                             });
                         }
                         "redacted_thinking" => {
@@ -860,6 +859,7 @@ fn parse_cline_history_bytes(id: &str, harness: crate::ir::Harness, bytes: &[u8]
                                 signature: None,
                                 encrypted: part.get("data").and_then(serde_json::Value::as_str).map(str::to_owned),
                                 redacted: true,
+                                extensions: Default::default(),
                             });
                         }
                         "tool_use" => {
@@ -882,6 +882,7 @@ fn parse_cline_history_bytes(id: &str, harness: crate::ir::Harness, bytes: &[u8]
                                 name,
                                 input: input.into(),
                                 namespace: None,
+                                extensions: Default::default(),
                             });
                         }
                         "tool_result" => {
@@ -910,6 +911,7 @@ fn parse_cline_history_bytes(id: &str, harness: crate::ir::Harness, bytes: &[u8]
                                 tool_name: None,
                                 status: None,
                                 details: None,
+                                extensions: Default::default(),
                             });
                         }
                         _ => {}
@@ -981,9 +983,7 @@ fn parse_cline_ui_messages_bytes(id: &str, harness: crate::ir::Harness, bytes: &
         };
         let mut m = Message::of_kind(role, kind, origin);
         m.timestamp = ts;
-        m.content.push(Block::Text {
-            text: text.to_owned().into(),
-        });
+        m.content.push(Block::from_text(text.to_owned().into()));
         session.messages.push(m);
     }
     (!session.messages.is_empty()).then_some(session)
@@ -2416,9 +2416,7 @@ mod tests {
         let opensession_doc = {
             let mut s = Session::new("os-1", Harness::OpenSession);
             let mut m = crate::ir::Message::new(crate::ir::Role::User);
-            m.content.push(crate::ir::Block::Text {
-                text: "hello opensession".into(),
-            });
+            m.content.push(crate::ir::Block::from_text("hello opensession".into()));
             s.messages.push(m);
             serde_json::to_string(&crate::harness::opensession::document(&s)).unwrap()
         };
@@ -2517,9 +2515,8 @@ mod tests {
         let world = crate::test_world("ingest-sqlite-hermes");
         let mut s = Session::new("hermes-zip-1", Harness::Hermes);
         let mut m = crate::ir::Message::new(crate::ir::Role::User);
-        m.content.push(crate::ir::Block::Text {
-            text: "zipped sqlite prompt".into(),
-        });
+        m.content
+            .push(crate::ir::Block::from_text("zipped sqlite prompt".into()));
         s.messages.push(m);
         let emitted = crate::harness::hermes::emit(
             &s,
@@ -2702,9 +2699,8 @@ mod tests {
         let grok_out = world.base.join("grok-out");
         let mut grok_seed = Session::new("grok-zip-1", Harness::Grok);
         let mut gm = crate::ir::Message::new(crate::ir::Role::User);
-        gm.content.push(crate::ir::Block::Text {
-            text: "hi grok without sessions dir".into(),
-        });
+        gm.content
+            .push(crate::ir::Block::from_text("hi grok without sessions dir".into()));
         grok_seed.messages.push(gm);
         let grok_emitted = crate::harness::grok::emit(
             &grok_seed,

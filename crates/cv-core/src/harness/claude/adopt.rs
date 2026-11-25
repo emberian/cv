@@ -381,6 +381,9 @@ fn execute_after_stage(
         set.add(staged, destination, claim);
     }
     if let Some(staged) = transcript {
+        let mut artifacts = super::artifacts::Artifacts::default();
+        artifacts.collect(&p.agent.path)?;
+        artifacts.stage(&p.dest, &mut set, claim)?;
         set.add(staged, &p.dest, claim);
     }
     set.publish()?;
@@ -580,6 +583,11 @@ fn execute_chained(
         set.add(staged, destination, claim);
     }
     if let Some(staged) = transcript {
+        let mut artifacts = super::artifacts::Artifacts::default();
+        for slice in chain_runs {
+            artifacts.collect(&slice.path)?;
+        }
+        artifacts.stage(&p.dest, &mut set, claim)?;
         set.add(staged, &p.dest, claim);
     }
     set.publish()?;

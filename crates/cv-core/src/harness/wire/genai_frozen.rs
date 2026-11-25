@@ -22,7 +22,9 @@ pub(crate) fn row(mut blocks: Vec<Block>, flag: bool, resolver: &Resolver) -> Re
     let mut carriers = Vec::new();
     for block in &mut blocks {
         let text = match block {
-            Block::Text { text } | Block::Thinking { text, .. } | Block::ToolResult { content: text, .. } => Some(text),
+            Block::Text { text, .. } | Block::Thinking { text, .. } | Block::ToolResult { content: text, .. } => {
+                Some(text)
+            }
             _ => None,
         };
         if let Some(text) = text {

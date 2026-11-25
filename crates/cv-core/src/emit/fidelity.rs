@@ -253,6 +253,7 @@ pub(super) struct Features {
     tool_result: usize,
     image: usize,
     file: usize,
+    opaque: usize,
     thinking_text: usize,
     thinking_sig: usize,
     thinking_enc: usize,
@@ -286,6 +287,7 @@ pub(super) fn block_survives(target: Harness, thinking: ThinkingMode, b: &Block)
             signature,
             encrypted,
             redacted,
+            ..
         } => {
             thinking_fate(
                 target,
@@ -298,6 +300,7 @@ pub(super) fn block_survives(target: Harness, thinking: ThinkingMode, b: &Block)
         }
         Block::ToolUse { .. } => target_holds(target, Field::ToolUse),
         Block::ToolResult { .. } => target_holds(target, Field::ToolResult),
+        Block::Opaque { .. } => false,
         Block::Image { .. } => target_holds(target, Field::Image),
         Block::File { .. } => target_holds(target, Field::File),
     }
@@ -393,6 +396,7 @@ impl Features {
             match b {
                 Block::Text { .. } => f.text += 1,
                 Block::ToolUse { .. } => f.tool_use += 1,
+                Block::Opaque { .. } => f.opaque += 1,
                 Block::Image { .. } => f.image += 1,
                 Block::File { .. } => f.file += 1,
                 Block::ToolResult {
@@ -452,6 +456,7 @@ pub(crate) enum Field {
     ThinkingEncrypted,
     Image,
     File,
+    Opaque,
     ToolUse,
     ToolResult,
     /// A standalone tool name on a *result*, only where the format has a slot for it.
@@ -875,6 +880,7 @@ pub(super) fn diff_features(
         after.tool_result,
     );
     count_delta(&mut deltas, Field::Image, "block:image", before.image, after.image);
+    count_delta(&mut deltas, Field::Opaque, "block:opaque", before.opaque, after.opaque);
     count_delta(&mut deltas, Field::File, "block:file", before.file, after.file);
     count_delta(
         &mut deltas,
@@ -1143,6 +1149,7 @@ pub(crate) fn unrepresentable_checked(
                 signature,
                 encrypted,
                 redacted,
+                ..
             } => {
                 thinking_fate(
                     target,
@@ -1170,7 +1177,7 @@ mod principal_tests {
     fn target_added_timestamps_are_declared() {
         let mut input = Session::new("source", Harness::Claude);
         let mut message = crate::Message::new(Role::Assistant);
-        message.content.push(Block::Text { text: "answer".into() });
+        message.content.push(Block::from_text("answer".into()));
         input.messages.push(message);
         let mut output = input.clone();
         let timestamp = "2026-01-01T00:00:00Z".parse().unwrap();

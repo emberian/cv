@@ -168,6 +168,7 @@ pub(crate) fn block_from_view_with(
                 .transpose()?
                 .unwrap_or_default(),
             namespace: None,
+            extensions: Default::default(),
         }));
     }
     if matches!(ty.as_str(), "image" | "document") {
@@ -187,12 +188,14 @@ pub(crate) fn block_from_view_with(
                 Block::Image {
                     media_type: mime,
                     data_ref,
+                    extensions: Default::default(),
                 }
             } else {
                 Block::File {
                     mime,
                     path: record.string("name")?,
                     source: data.map(|_| "base64:inline".into()),
+                    extensions: Default::default(),
                 }
             }));
         }
@@ -221,12 +224,17 @@ pub(crate) fn block_from_view_with(
             None
         };
         return Ok(Some(if marker {
-            Block::Image { media_type, data_ref }
+            Block::Image {
+                media_type,
+                data_ref,
+                extensions: Default::default(),
+            }
         } else {
             Block::File {
                 mime: media_type,
                 path: record.string("title")?,
                 source: data_ref,
+                extensions: Default::default(),
             }
         }));
     }
@@ -240,7 +248,7 @@ pub(crate) fn block_from_view_with(
         if q.skip_empty_text && value.is_empty() {
             return Ok(None);
         }
-        return Ok(Some(Block::Text { text: value }));
+        return Ok(Some(Block::from_text(value)));
     }
     if ty == "thinking" {
         let (text_key, sig_key) = q.thinking;
@@ -251,6 +259,7 @@ pub(crate) fn block_from_view_with(
                 .filter(|s| !(q.empty_signature_is_none && s.is_empty())),
             encrypted: None,
             redacted: false,
+            extensions: Default::default(),
         }));
     }
     // Encrypted reasoning the API returns when thinking can't be shown in the clear. The plaintext
@@ -261,6 +270,7 @@ pub(crate) fn block_from_view_with(
             signature: None,
             encrypted: record.string("data")?,
             redacted: true,
+            extensions: Default::default(),
         }));
     }
     if ty != "tool_result" {
@@ -295,6 +305,7 @@ pub(crate) fn block_from_view_with(
         tool_name: None,
         status: None,
         details: None,
+        extensions: Default::default(),
     }))
 }
 
@@ -350,6 +361,7 @@ pub fn image_block(media_type: &Option<String>, data_ref: &Option<String>, q: &Q
         &Block::Image {
             media_type: media_type.clone(),
             data_ref: data_ref.clone(),
+            extensions: Default::default(),
         },
         q,
         false,
@@ -369,7 +381,7 @@ pub(crate) fn block_from(item: &Value, q: &Quirks) -> Option<Block> {
 #[cfg(test)]
 fn blocks_from(content: Option<&Value>, q: &Quirks) -> Vec<Block> {
     match content {
-        Some(Value::String(s)) => vec![Block::Text { text: s.clone().into() }],
+        Some(Value::String(s)) => vec![Block::from_text(s.clone().into())],
         Some(Value::Array(items)) => items.iter().filter_map(|i| block_from(i, q)).collect(),
         _ => Vec::new(),
     }
@@ -394,7 +406,7 @@ mod tests {
         ]);
         let b = blocks_from(Some(&items), &ANTHROPIC);
         assert_eq!(b.len(), 7, "unknown types are skipped, empty text is kept");
-        assert!(matches!(&b[0], Block::Text { text } if text.is_empty()));
+        assert!(matches!(&b[0], Block::Text { text , .. } if text.is_empty()));
         assert!(matches!(&b[1], Block::Thinking { signature: Some(s), redacted: false, .. } if s.is_empty()));
         assert!(matches!(&b[2], Block::Thinking { encrypted: Some(e), redacted: true, .. } if e == "BLOB"));
         assert!(matches!(&b[3], Block::ToolUse { name, .. } if name == "Read"));
@@ -418,7 +430,7 @@ mod tests {
         assert!(matches!(&b[0], Block::ToolUse { input, .. } if input.resolve().unwrap()["cmd"] == "ls"));
         assert!(matches!(&b[1], Block::Thinking { signature: Some(s), .. } if s == "S"));
         assert!(
-            matches!(&b[2], Block::Image { media_type: Some(m), data_ref: Some(d) } if m == "image/png" && d == "0123456789")
+            matches!(&b[2], Block::Image { media_type: Some(m), data_ref: Some(d) , .. } if m == "image/png" && d == "0123456789")
         );
         let zed = json!([{"type": "text", "text": ""}, {"type": "thinking", "text": "z", "signature": ""}, {"type": "RedactedThinking", "data": "D"}]);
         let b = blocks_from(Some(&zed), &ZED);
@@ -436,27 +448,31 @@ mod tests {
     #[test]
     fn writes_what_it_reads() {
         let blocks = vec![
-            Block::Text { text: "hi".into() },
+            Block::from_text("hi".into()),
             Block::Thinking {
                 text: "".into(),
                 signature: None,
                 encrypted: Some("BLOB".into()),
                 redacted: true,
+                extensions: Default::default(),
             },
             Block::ToolUse {
                 id: "t1".into(),
                 name: "Read".into(),
                 input: json!({"path": "x"}).into(),
                 namespace: None,
+                extensions: Default::default(),
             },
             Block::Image {
                 media_type: Some("image/png".into()),
                 data_ref: Some("base64:inline".into()),
+                extensions: Default::default(),
             },
             Block::File {
                 mime: None,
                 path: Some("a.pdf".into()),
                 source: Some("file:f9".into()),
+                extensions: Default::default(),
             },
             Block::ToolResult {
                 tool_use_id: "t1".into(),
@@ -465,6 +481,7 @@ mod tests {
                 tool_name: None,
                 status: None,
                 details: None,
+                extensions: Default::default(),
             },
         ];
         let a = assistant_blocks(&blocks, &ANTHROPIC).unwrap();
@@ -506,12 +523,13 @@ mod selected_media_tests {
             .unwrap();
         std::fs::write(&path, b"changed source")?;
         for block in [
-            Block::Text { text: text.clone() },
+            Block::from_text(text.clone()),
             Block::Thinking {
                 text: text.clone(),
                 signature: None,
                 encrypted: None,
                 redacted: false,
+                extensions: Default::default(),
             },
             Block::ToolResult {
                 tool_use_id: "call".into(),
@@ -520,6 +538,7 @@ mod selected_media_tests {
                 tool_name: None,
                 status: None,
                 details: None,
+                extensions: Default::default(),
             },
         ] {
             assert!(block_to(&block, &ANTHROPIC, true).is_err());

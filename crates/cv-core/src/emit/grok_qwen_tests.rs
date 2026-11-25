@@ -20,12 +20,13 @@ fn fixture(harness: Harness) -> Session {
         branch: Some("branch".into()),
         commit: Some("commit".into()),
         remote: Some("remote".into()),
+        ..Default::default()
     });
     session.lineage.forked_from = Some("parent-session".into());
     session
         .harness_extra_mut(Harness::Qwen)
         .insert("version".into(), json!("0.25.1"));
-    let text = |value: &str| Block::Text { text: value.into() };
+    let text = |value: &str| Block::from_text(value.into());
     let mut system = Message::new(Role::System);
     system.kind = crate::MessageKind::SystemPrompt;
     system.content.push(text("system"));
@@ -37,11 +38,13 @@ fn fixture(harness: Harness) -> Session {
         Block::Image {
             media_type: Some("image/png".into()),
             data_ref: Some("file:image".into()),
+            extensions: Default::default(),
         },
         Block::File {
             mime: Some("text/plain".into()),
             path: Some("path".into()),
             source: Some("https://source".into()),
+            extensions: Default::default(),
         },
     ];
     let mut assistant = Message::new(Role::Assistant);
@@ -59,18 +62,21 @@ fn fixture(harness: Harness) -> Session {
             signature: None,
             encrypted: Some("provider-bound".into()),
             redacted: true,
+            extensions: Default::default(),
         },
         Block::Thinking {
             text: "reasoning λ\n".into(),
             signature: Some("sig".into()),
             encrypted: Some("second-blob".into()),
             redacted: false,
+            extensions: Default::default(),
         },
         Block::Thinking {
             text: " ".into(),
             signature: Some("blank-signature".into()),
             encrypted: None,
             redacted: false,
+            extensions: Default::default(),
         },
         text("answer \"\\\t"),
         text(""),
@@ -79,21 +85,25 @@ fn fixture(harness: Harness) -> Session {
             name: "Read".into(),
             namespace: Some("tool_call".into()),
             input: json!({"β":[1,true,null,{"float":-0.0}]}).into(),
+            extensions: Default::default(),
         },
         Block::ToolUse {
             id: "second".into(),
             name: "Run".into(),
             namespace: None,
             input: json!({"command":"printf λ"}).into(),
+            extensions: Default::default(),
         },
         Block::Image {
             media_type: None,
             data_ref: None,
+            extensions: Default::default(),
         },
         Block::File {
             mime: None,
             path: Some("fallback-path".into()),
             source: None,
+            extensions: Default::default(),
         },
     ];
     let mut tool = Message::new(Role::Tool);
@@ -106,6 +116,7 @@ fn fixture(harness: Harness) -> Session {
             tool_name: Some("Read".into()),
             status: Some("failed".into()),
             details: None,
+            extensions: Default::default(),
         },
         Block::ToolResult {
             tool_use_id: "second".into(),
@@ -114,6 +125,7 @@ fn fixture(harness: Harness) -> Session {
             tool_name: None,
             status: None,
             details: None,
+            extensions: Default::default(),
         },
     ];
     let mut boundary = Message::new(Role::System);
@@ -394,6 +406,7 @@ fn checked_grok_qwen_source_failure_preserves_every_destination() -> Result<()> 
                         name: "Read".into(),
                         namespace: None,
                         input: json,
+                        extensions: Default::default(),
                     }
                 } else {
                     let text = json.with_view(|view| Ok(view.source_text()?.unwrap()))?;
@@ -403,9 +416,10 @@ fn checked_grok_qwen_source_failure_preserves_every_destination() -> Result<()> 
                             signature: None,
                             encrypted: None,
                             redacted: false,
+                            extensions: Default::default(),
                         }
                     } else {
-                        Block::Text { text }
+                        Block::from_text(text)
                     }
                 });
                 if variant == "omitted" {
@@ -483,12 +497,9 @@ fn checked_grok_qwen_large_source_matches_frozen_and_rejects_truncation() -> Res
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus");
     for (target, adapter) in grok_qwen_adapters(&root) {
         let mut session = fixture(target);
-        session.messages[2].content.insert(
-            0,
-            Block::Text {
-                text: "body \" λ\n".repeat(1024 * 128).into(),
-            },
-        );
+        session.messages[2]
+            .content
+            .insert(0, Block::from_text("body \" λ\n".repeat(1024 * 128).into()));
         for block in &mut session.messages[2].content {
             match block {
                 Block::ToolUse { input, .. } => {
@@ -531,7 +542,8 @@ fn checked_grok_qwen_large_source_matches_frozen_and_rejects_truncation() -> Res
             selected.messages.iter().flat_map(|m| &m.content).any(|b| matches!(
                 b,
                 Block::Text {
-                    text: crate::Text::Source(_)
+                    text: crate::Text::Source(_),
+                    ..
                 }
             )),
             "checked producer retains body {target}"

@@ -856,7 +856,7 @@ mod tests {
             ) -> Result<crate::Session> {
                 assert!(opts.tier == crate::stream::Tier::Complete && opts.spans);
                 let mut prompt = crate::Message::new(crate::Role::User);
-                prompt.content.push(Block::Text { text: "body".into() });
+                prompt.content.push(Block::from_text("body".into()));
                 sink.message(prompt);
                 let mut carrier =
                     crate::Message::of_kind(crate::Role::System, MessageKind::Carrier, crate::Origin::Harness);

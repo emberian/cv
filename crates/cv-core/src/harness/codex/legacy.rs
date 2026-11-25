@@ -218,9 +218,9 @@ mod tests {
         let meta = stream(&r, &stream::Demand::LEAN.with_spans(), &mut stop).unwrap();
         assert_eq!(meta.id, "legacy");
         let saved = saved.unwrap();
-        assert!(matches!(saved.content.first(), Some(Block::Text { text }) if text.inline_str().is_none()));
+        assert!(matches!(saved.content.first(), Some(Block::Text { text , .. }) if text.inline_str().is_none()));
         fs::write(&path, "replacement source").unwrap();
-        if let Block::Text { text } = &saved.content[0] {
+        if let Block::Text { text, .. } = &saved.content[0] {
             assert!(text.try_resolve(&crate::Resolver::new(Some(path.clone()))).is_err());
         }
         fs::write(&path, &raw).unwrap();

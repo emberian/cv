@@ -33,6 +33,7 @@ pub(super) fn content(writer: &mut dyn Write, blocks: &[Block], mode: ThinkingMo
                     name,
                     input,
                     namespace: Some(namespace),
+                    ..
                 } if namespace == crate::affordance::DEFERRED => {
                     // The adapter's own wrapper supplies OpenClaw's distinct {id,args} keys.
                     let crate::affordance::DeferredWrapper { name_key, args_key } =

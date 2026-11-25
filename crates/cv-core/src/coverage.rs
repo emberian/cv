@@ -46,6 +46,8 @@ impl ReadCoverage {
             _ => "unrecognized source (see JSON metadata)".to_owned(),
         };
         let limitation = |s: &str| match s {
+            "opaque_message_kind" => "uninterpreted OpenSession message kinds retained".into(),
+            "opaque_block_type" => "uninterpreted OpenSession block types retained".into(),
             Self::METADATA_ONLY => "metadata only; no conversation text".to_owned(),
             Self::MISSING_HISTORY => "some history is unavailable".to_owned(),
             Self::UNRECONCILED_HISTORY => "newer native history could not be reconciled".to_owned(),

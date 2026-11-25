@@ -38,6 +38,7 @@ impl CompleteRecord {
             messages
                 .iter()
                 .map(|message| Message {
+                    extensions: message.extensions.clone(),
                     id: message.id.clone(),
                     parent_id: message.parent_id.clone(),
                     role: message.role,
@@ -182,7 +183,8 @@ pub(crate) fn write_extra(message: &Message, writer: &mut dyn Write) -> Result<(
     out.finish()
 }
 pub(crate) fn same_envelope(a: &Message, b: &Message) -> bool {
-    a.id == b.id
+    a.extensions == b.extensions
+        && a.id == b.id
         && a.parent_id == b.parent_id
         && a.role == b.role
         && a.kind == b.kind

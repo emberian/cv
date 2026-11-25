@@ -19,15 +19,14 @@ impl Fixture {
         let mut owned = Session::new("fixture", Harness::Claude);
         owned.title = Some("fixture".into());
         let mut prompt = Message::new(Role::User);
-        prompt.content.push(Block::Text {
-            text: "Please run this command".into(),
-        });
+        prompt.content.push(Block::from_text("Please run this command".into()));
         let mut call = Message::new(Role::Assistant);
         call.content.push(Block::ToolUse {
             id: "call".into(),
             name: "Bash".into(),
             input: input.into(),
             namespace: None,
+            extensions: Default::default(),
         });
         owned.messages.extend([prompt, call]);
         let mut sourced = owned.clone();

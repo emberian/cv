@@ -960,7 +960,7 @@ impl<'a> Record<'a, '_> {
                     None => None,
                 };
                 if let Some(text) = text {
-                    blocks.push(Block::Text { text });
+                    blocks.push(Block::from_text(text));
                 }
             }
         }
@@ -969,7 +969,7 @@ impl<'a> Record<'a, '_> {
                 if prompt.may_be_string() {
                     if let Some(text) = prompt.lazy_text(self.opts.spans)? {
                         if !matches!(&text, Text::Inline(s) if s.is_empty()) {
-                            blocks.push(Block::Text { text });
+                            blocks.push(Block::from_text(text));
                         }
                     }
                 } else if let Some(items) = prompt.array()? {
@@ -1184,7 +1184,7 @@ impl<'a> Record<'a, '_> {
         let mut m = match text {
             Some(text) => {
                 let mut m = Message::of_kind(Role::System, kind, origin);
-                m.content.push(Block::Text { text });
+                m.content.push(Block::from_text(text));
                 m
             }
             None => Message::synthesized(kind, origin),
@@ -1243,9 +1243,7 @@ impl<'a> Record<'a, '_> {
                 if role == Role::User {
                     head = Some(classify_head(content, user_origin)?);
                 }
-                blocks.push(Block::Text {
-                    text: content.lazy_text(opts.spans)?.unwrap_or_default(),
-                });
+                blocks.push(Block::from_text(content.lazy_text(opts.spans)?.unwrap_or_default()));
             } else if let Some(items) = content.array()? {
                 for (index, item) in items.enumerate() {
                     let item = item?;
@@ -1421,6 +1419,7 @@ impl<'a> Record<'a, '_> {
             extra.insert(Harness::Claude.as_str().into(), Value::Object(bag));
         }
         Ok(Some(Message {
+            extensions: Default::default(),
             complete_record: None,
             id: self.top.string("uuid")?,
             parent_id: self.top.string("parentUuid")?,
@@ -1470,7 +1469,9 @@ const PERSISTED: &str = "<persisted-output>";
 fn contain_persisted_outputs(msg: &mut Message, transcript: Option<&Path>) {
     for block in &mut msg.content {
         let Block::ToolResult {
-            details: Some(details), ..
+            tool_use_id,
+            details: Some(details),
+            ..
         } = block
         else {
             continue;
@@ -1485,7 +1486,12 @@ fn contain_persisted_outputs(msg: &mut Message, transcript: Option<&Path>) {
             Some(Value::String(size)) => Some(size),
             _ => None,
         };
-        let resolved = transcript.and_then(|transcript| spilled_output(transcript, &claimed));
+        let resolved = transcript.and_then(|transcript| {
+            super::artifacts::captured_output(transcript, tool_use_id)
+                .ok()
+                .flatten()
+                .or_else(|| spilled_output(transcript, &claimed))
+        });
         details[super::PERSISTED_OUTPUT_KEY] = Block::persisted_output(resolved, &claimed, size);
     }
 }
@@ -1495,7 +1501,7 @@ fn contain_persisted_outputs(msg: &mut Message, transcript: Option<&Path>) {
 /// stubs that name the session it came from, in this project or another. The claim is resolved
 /// by those names beside the transcript, so a store copied elsewhere still finds its files, and
 /// nothing of any other shape is a persisted output.
-fn spilled_output(transcript: &Path, claimed: &str) -> Option<PathBuf> {
+pub(super) fn spilled_output(transcript: &Path, claimed: &str) -> Option<PathBuf> {
     // `<project>/<sid>.jsonl`, or a sub-agent's `<project>/<sid>/subagents/...`.
     let project = transcript
         .ancestors()
@@ -1541,7 +1547,7 @@ fn parse_usage(v: JsonView<'_>) -> Result<Usage> {
 
 /// The first `chars` characters of a string after its leading whitespace, decoded in place:
 /// classification never owns or windows a giant body.
-fn string_head(view: JsonView<'_>, chars: usize) -> Result<String> {
+pub(super) fn string_head(view: JsonView<'_>, chars: usize) -> Result<String> {
     let mut head = String::new();
     let mut n = 0;
     view.for_each_char(|c| {

@@ -53,9 +53,7 @@ struct HarmonyMsg<'a> {
 /// one from the call's position, [`crate::ir::derived_call_id`]).
 pub fn decode_content(text: &str, call_id: &mut dyn FnMut() -> String) -> Vec<Block> {
     if !looks_like_harmony(text) {
-        return vec![Block::Text {
-            text: text.to_string().into(),
-        }];
+        return vec![Block::from_text(text.to_string().into())];
     }
 
     let mut blocks = Vec::new();
@@ -69,15 +67,14 @@ pub fn decode_content(text: &str, call_id: &mut dyn FnMut() -> String) -> Vec<Bl
                         signature: None,
                         encrypted: None,
                         redacted: false,
+                        extensions: Default::default(),
                     });
                 }
             }
             Some("final") => {
                 let body = msg.body.trim();
                 if !body.is_empty() {
-                    blocks.push(Block::Text {
-                        text: body.to_string().into(),
-                    });
+                    blocks.push(Block::from_text(body.to_string().into()));
                 }
             }
             // Commentary (preamble/tool calls) and any unknown channel behave alike: a recipient
@@ -89,13 +86,12 @@ pub fn decode_content(text: &str, call_id: &mut dyn FnMut() -> String) -> Vec<Bl
                         name: strip_tool_prefix(recipient).to_string(),
                         input: parse_input(msg.body).into(),
                         namespace: None,
+                        extensions: Default::default(),
                     });
                 } else {
                     let body = msg.body.trim();
                     if !body.is_empty() {
-                        blocks.push(Block::Text {
-                            text: body.to_string().into(),
-                        });
+                        blocks.push(Block::from_text(body.to_string().into()));
                     }
                 }
             }
@@ -105,9 +101,7 @@ pub fn decode_content(text: &str, call_id: &mut dyn FnMut() -> String) -> Vec<Bl
     // If parsing produced nothing usable (e.g. only empty bodies), fall back to passthrough so the
     // content is never lost.
     if blocks.is_empty() {
-        return vec![Block::Text {
-            text: text.to_string().into(),
-        }];
+        return vec![Block::from_text(text.to_string().into())];
     }
     blocks
 }
@@ -312,7 +306,7 @@ mod tests {
             other => panic!("expected ToolUse, got {other:?}"),
         }
         match &blocks[2] {
-            Block::Text { text } => assert_eq!(text.inline_str(), Some("It is sunny in SF.")),
+            Block::Text { text, .. } => assert_eq!(text.inline_str(), Some("It is sunny in SF.")),
             other => panic!("expected Text, got {other:?}"),
         }
     }
@@ -323,7 +317,7 @@ mod tests {
         let blocks = decode(text);
         assert_eq!(blocks.len(), 1);
         match &blocks[0] {
-            Block::Text { text: t } => assert_eq!(t.inline_str(), Some(text)),
+            Block::Text { text: t, .. } => assert_eq!(t.inline_str(), Some(text)),
             other => panic!("expected Text, got {other:?}"),
         }
         assert!(!looks_like_harmony(text));
@@ -336,7 +330,7 @@ mod tests {
         let blocks = decode(text);
         assert_eq!(blocks.len(), 1);
         match &blocks[0] {
-            Block::Text { text } => assert_eq!(text.inline_str(), Some("partial answer with no end token")),
+            Block::Text { text, .. } => assert_eq!(text.inline_str(), Some("partial answer with no end token")),
             other => panic!("expected Text, got {other:?}"),
         }
     }
@@ -385,11 +379,11 @@ mod tests {
         let blocks = decode(text);
         assert_eq!(blocks.len(), 2);
         match &blocks[0] {
-            Block::Text { text } => assert_eq!(text.inline_str(), Some("Let me work through this.")),
+            Block::Text { text, .. } => assert_eq!(text.inline_str(), Some("Let me work through this.")),
             other => panic!("expected Text preamble, got {other:?}"),
         }
         match &blocks[1] {
-            Block::Text { text } => assert_eq!(text.inline_str(), Some("Done.")),
+            Block::Text { text, .. } => assert_eq!(text.inline_str(), Some("Done.")),
             other => panic!("expected final Text, got {other:?}"),
         }
     }
@@ -400,7 +394,7 @@ mod tests {
         let blocks = decode(text);
         assert_eq!(blocks.len(), 1);
         match &blocks[0] {
-            Block::Text { text } => assert_eq!(text.inline_str(), Some("café 日本語 🎉 emoji")),
+            Block::Text { text, .. } => assert_eq!(text.inline_str(), Some("café 日本語 🎉 emoji")),
             other => panic!("expected Text, got {other:?}"),
         }
     }

@@ -253,6 +253,7 @@ pub(crate) fn pi_assistant_metadata(
             cache_creation_tokens: get("cacheWrite"),
             reasoning_tokens: if openclaw { None } else { get("reasoning") },
             cost_usd: usage.pointer("/cost/total").and_then(Value::as_f64),
+            ..Default::default()
         };
         m.usage = (!u.is_empty()).then_some(u);
     }

@@ -225,7 +225,7 @@ impl Record {
             "text" => {
                 if let Some(text) = view.get("text")?.filter(|t| nonempty(*t).unwrap_or(false)) {
                     if let Some(text) = ctx.text(text)? {
-                        m.content.push(Block::Text { text });
+                        m.content.push(Block::from_text(text));
                     }
                 }
             }
@@ -252,6 +252,7 @@ impl Record {
                         signature,
                         encrypted: None,
                         redacted: false,
+                        extensions: Default::default(),
                     });
                 }
             }
@@ -266,9 +267,7 @@ impl Record {
                 // routes the prompt to that agent in a child session. No IR block fits; surface
                 // its name as text and keep the structured form in the bag.
                 if let Some(name) = string(view.get("name")?)? {
-                    m.content.push(Block::Text {
-                        text: format!("@{name}").into(),
-                    });
+                    m.content.push(Block::from_text(format!("@{name}").into()));
                 }
                 push_extra_array(bag, "agent_refs", hydrated()?);
                 self.spawn = true;
@@ -278,14 +277,14 @@ impl Record {
                 // it; keep the full record (agent/model/command/description) in the bag.
                 let agent = string(view.get("agent")?)?;
                 let prompt = string(view.get("prompt")?)?;
-                m.content.push(Block::Text {
-                    text: format!(
+                m.content.push(Block::from_text(
+                    format!(
                         "[subtask → {}] {}",
                         agent.as_deref().unwrap_or("agent"),
                         prompt.as_deref().unwrap_or("")
                     )
                     .into(),
-                });
+                ));
                 push_extra_array(bag, "subtasks", hydrated()?);
                 self.spawn = true;
             }
@@ -322,7 +321,7 @@ impl Record {
         // turn isn't blank.
         if m.content.is_empty() {
             if let Some(text) = summary {
-                m.content.push(Block::Text { text });
+                m.content.push(Block::from_text(text));
             }
         }
         // What the record IS, most specific first (module doc "Kinds").
@@ -391,6 +390,7 @@ fn tool_blocks(part: JsonView<'_>, ids: PartIds<'_>, ctx: Ctx<'_>) -> Result<(Bl
             None => Value::Null.into(),
         },
         namespace: None,
+        extensions: Default::default(),
     };
     // A completed tool carries `output`; an error tool carries `error`.
     let output = get(state, "output")?;
@@ -413,6 +413,7 @@ fn tool_blocks(part: JsonView<'_>, ids: PartIds<'_>, ctx: Ctx<'_>) -> Result<(Bl
             tool_name,
             status: status_field,
             details,
+            extensions: Default::default(),
         })
         .into_iter()
         .collect();
@@ -433,6 +434,7 @@ fn file_block(part: &Value) -> Block {
         Block::Image {
             media_type: (!mime.is_empty()).then(|| mime.to_string()),
             data_ref: part.get("url").and_then(Value::as_str).map(str::to_string),
+            extensions: Default::default(),
         }
     } else {
         // `source.path` is the workspace-relative path when present; `filename`/`url` are fallbacks.
@@ -445,6 +447,7 @@ fn file_block(part: &Value) -> Block {
             mime: (!mime.is_empty()).then(|| mime.to_string()),
             path,
             source: part.get("url").and_then(Value::as_str).map(str::to_string),
+            extensions: Default::default(),
         }
     }
 }
@@ -487,5 +490,6 @@ pub(super) fn usage(tokens: Option<JsonView<'_>>, cost: Option<JsonView<'_>>) ->
         cache_creation_tokens: get("/cache/write"),
         reasoning_tokens: get("/reasoning").filter(|&r| r > 0),
         cost_usd: cost,
+        ..Default::default()
     }))
 }

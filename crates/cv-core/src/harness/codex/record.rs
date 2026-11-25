@@ -430,6 +430,7 @@ impl Reader<'_> {
                     branch: str_at(Some(g), "branch")?,
                     commit: str_at(Some(g), "commit_hash")?,
                     remote: str_at(Some(g), "repository_url")?,
+                    ..Default::default()
                 });
             }
         }
@@ -506,7 +507,7 @@ impl Reader<'_> {
                     } else {
                         Message::new(Role::User)
                     };
-                    m.content.push(Block::Text { text });
+                    m.content.push(Block::from_text(text));
                     m.timestamp = ts;
                     if let Some(kind) = str_at(Some(p), "kind")? {
                         bag(&mut m).insert("kind".into(), Value::String(kind));
@@ -518,7 +519,7 @@ impl Reader<'_> {
                 if let Some(text) = p.get("message")?.map(|b| self.demand.text(b)).transpose()?.flatten() {
                     let mut m = Message::new(Role::Assistant);
                     m.timestamp = ts;
-                    m.content.push(Block::Text { text });
+                    m.content.push(Block::from_text(text));
                     self.out.push(m);
                 }
             }
@@ -529,6 +530,7 @@ impl Reader<'_> {
                 m.content.push(Block::Image {
                     media_type: None,
                     data_ref: str_at(Some(p), "path")?,
+                    extensions: Default::default(),
                 });
                 let call_id = str_at(Some(p), "call_id")?;
                 let b = bag(&mut m);
@@ -1064,6 +1066,7 @@ impl Reader<'_> {
                         signature: None,
                         encrypted,
                         redacted: false,
+                        extensions: Default::default(),
                     });
                     out.push(m);
                 }
@@ -1094,7 +1097,7 @@ impl Reader<'_> {
                             Some("input_text") => {
                                 if let Some(text) = it.get("text")?.map(|t| d.text(t)).transpose()?.flatten() {
                                     if !text.is_empty() {
-                                        m.content.push(Block::Text { text });
+                                        m.content.push(Block::from_text(text));
                                     }
                                 }
                             }
@@ -1166,6 +1169,7 @@ impl Reader<'_> {
                     name,
                     input,
                     namespace: str_at(Some(p), "namespace")?,
+                    extensions: Default::default(),
                 });
                 out.push(m);
             }
@@ -1219,6 +1223,7 @@ impl Reader<'_> {
                     // `output`, `id`); `is_error` already carries what cv can tell.
                     status: str_at(Some(p), "status")?,
                     details: None,
+                    extensions: Default::default(),
                 });
                 // Structured outputs can return image content items alongside text.
                 m.content.extend(images);
@@ -1238,6 +1243,7 @@ impl Reader<'_> {
                     name: "tool_search".into(),
                     input: Value::Object(input).into(),
                     namespace: None,
+                    extensions: Default::default(),
                 });
                 out.push(m);
             }
@@ -1255,6 +1261,7 @@ impl Reader<'_> {
                     tool_name: Some("tool_search".into()),
                     status: None,
                     details: None,
+                    extensions: Default::default(),
                 });
                 out.push(m);
             }
@@ -1278,6 +1285,7 @@ impl Reader<'_> {
                     name: "web_search".into(),
                     input: input.into(),
                     namespace: None,
+                    extensions: Default::default(),
                 });
                 out.push(m);
             }
@@ -1292,6 +1300,7 @@ impl Reader<'_> {
                 m.content.push(Block::Image {
                     media_type: None,
                     data_ref: result.then(|| "base64:inline".to_string()),
+                    extensions: Default::default(),
                 });
                 out.push(m);
             }
@@ -1358,6 +1367,7 @@ pub(super) fn parse_usage(v: Option<JsonView<'_>>) -> Result<Option<Usage>> {
         cache_creation_tokens: cache_write,
         reasoning_tokens: u64_at(v, "reasoning_output_tokens")?,
         cost_usd: None,
+        ..Default::default()
     };
     if u.input_tokens.is_none() && u.output_tokens.is_none() && u.cache_read_tokens.is_none() {
         return Ok(None);

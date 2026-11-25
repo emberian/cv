@@ -1433,7 +1433,13 @@ mod tests {
         for options in [Demand::FACTS.with_spans(), Demand::LEAN.with_spans()] {
             let collected = crate::stream::collect_with(&adapter, &r, &options).unwrap();
             let content = &collected.messages[1].content;
-            assert!(matches!(&content[1], Block::Text { text: Text::Source(_) }));
+            assert!(matches!(
+                &content[1],
+                Block::Text {
+                    text: Text::Source(_),
+                    ..
+                }
+            ));
             assert!(matches!(
                 &content[2],
                 Block::ToolUse {
@@ -1599,6 +1605,7 @@ mod tests {
         assert!(!wal.exists() && !shm.exists());
         let Block::Text {
             text: crate::lazy::Text::Source(text),
+            ..
         } = &retained.messages[0].content[0]
         else {
             panic!("source text required")
@@ -1634,6 +1641,7 @@ mod tests {
         std::fs::write(&wal, b"changed WAL").unwrap();
         let Block::Text {
             text: crate::lazy::Text::Source(text),
+            ..
         } = &sink.messages[0].content[0]
         else {
             panic!("expected source text")

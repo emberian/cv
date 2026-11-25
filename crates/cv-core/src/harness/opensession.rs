@@ -80,24 +80,6 @@ const MESSAGE_FIELDS: &[&str] = &[
     "model",
     "extra",
 ];
-const GIT_FIELDS: &[&str] = &["branch", "commit", "remote"];
-const LINEAGE_FIELDS: &[&str] = &[
-    "forked_from",
-    "parent",
-    "spawned_by_tool_use",
-    "continued_in",
-    "continues",
-    "agent_path",
-];
-const USAGE_FIELDS: &[&str] = &[
-    "input_tokens",
-    "output_tokens",
-    "cache_read_tokens",
-    "cache_creation_tokens",
-    "reasoning_tokens",
-    "cost_usd",
-];
-
 fn block_projection(ty: Option<&str>) -> (&'static [&'static str], Option<&'static str>) {
     match ty {
         Some("text") => (&["type"], Some("text")),
@@ -118,20 +100,49 @@ fn block_projection(ty: Option<&str>) -> (&'static [&'static str], Option<&'stat
 /// A session as an OpenSession document: the IR's own serialization, with `open_session` first.
 /// Produced by [`document`]; see [`VERSION`] for why the marker lives here and not on `Session`.
 #[derive(Serialize)]
-pub struct Document<'a> {
+struct Envelope<'a> {
     open_session: &'static str,
     #[serde(flatten)]
     session: &'a Session,
+}
+
+pub struct Document<'a>(&'a Session);
+
+pub(crate) fn opaque_message(message: &Message) -> Option<&Value> {
+    (message.kind == MessageKind::Carrier)
+        .then(|| message.harness_extra(Harness::OpenSession)?.get("message"))
+        .flatten()
+}
+
+impl Serialize for Document<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let envelope = Envelope {
+            open_session: VERSION,
+            session: self.0,
+        };
+        if self.0.messages.iter().all(|m| opaque_message(m).is_none()) {
+            return envelope.serialize(serializer);
+        }
+        let mut document = serde_json::to_value(envelope).map_err(serde::ser::Error::custom)?;
+        for (wire, message) in document["messages"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .zip(&self.0.messages)
+        {
+            if let Some(original) = opaque_message(message) {
+                wire.clone_from(original);
+            }
+        }
+        document.serialize(serializer)
+    }
 }
 
 /// Wrap `session` as an OpenSession [`Document`] for serialization. The session should be
 /// materialized (`Session::materialize`, which `Adapter::parse` already does) so its content
 /// serializes as text rather than as lazy spans into a file the reader will not have.
 pub fn document(session: &Session) -> Document<'_> {
-    Document {
-        open_session: VERSION,
-        session,
-    }
+    Document(session)
 }
 
 // ── The adapter ───────────────────────────────────────────────────────────────
@@ -328,8 +339,7 @@ fn read(
         .collect::<Vec<_>>();
     let record = Fields::parse(view, &keys)?.context("an OpenSession document is a JSON object")?;
     let mut meta = record.project(SESSION_FIELDS)?;
-    project_object(&record, &mut meta, "git", GIT_FIELDS)?;
-    project_object(&record, &mut meta, "lineage", LINEAGE_FIELDS)?;
+    meta.extend(record.project(&["git", "lineage"])?);
     meta.insert("messages".into(), Value::Array(Vec::new()));
     let mut session = from_object(meta)?;
     let messages = record
@@ -342,8 +352,24 @@ fn read(
     session.source_path = file.map(|(path, _)| path.to_path_buf());
     // Validate and discard one turn at a time before publishing even metadata. Keep payloads
     // lazy in this pass regardless of delivery demand; only their shape needs validation.
+    let mut coverage = crate::coverage::ReadCoverage::of_session(&session).unwrap_or_default();
+    let mut opaque = false;
     for view in messages.array()?.unwrap() {
-        ir_message(view?, true)?;
+        let message = ir_message(view?, true)?;
+        if opaque_message(&message).is_some() {
+            coverage.limitations.insert("opaque_message_kind".into());
+            opaque = true;
+        }
+        if message.content.iter().any(|b| matches!(b, Block::Opaque { .. })) {
+            coverage.limitations.insert("opaque_block_type".into());
+            opaque = true;
+        }
+    }
+    if opaque {
+        coverage
+            .sources
+            .insert(crate::coverage::ReadCoverage::EXPORTED_HISTORY.into());
+        coverage.attach(&mut session);
     }
     sink.meta(&session);
     for view in messages.array()?.unwrap() {
@@ -369,8 +395,19 @@ fn ir_message(view: JsonView<'_>, spans: bool) -> Result<Message> {
     let Some(record) = Fields::parse(view, &keys)? else {
         return serde_json::from_value(view.resolve()?.into_owned()).context("not an OpenSession message");
     };
+    if let Some(kind) = record.string("kind")? {
+        if !MessageKind::ALL.iter().any(|known| known.as_str() == kind) {
+            let mut message = Message::of_kind(Role::System, MessageKind::Carrier, Origin::Import);
+            message.id = record.string("id")?;
+            message
+                .harness_extra_mut(Harness::OpenSession)
+                .insert("message".into(), view.resolve()?.into_owned());
+            return Ok(message);
+        }
+    }
     let mut fields = record.project(MESSAGE_FIELDS)?;
-    project_object(&record, &mut fields, "usage", USAGE_FIELDS)?;
+    fields.extend(record.project(&["usage"])?);
+    fields.extend(extensions(view, &keys)?);
     let content = if let Some(content) = record.get("content") {
         if let Some(blocks) = content.array()? {
             blocks.map(|view| ir_block(view?, spans)).collect::<Result<Vec<_>>>()?
@@ -385,21 +422,15 @@ fn ir_message(view: JsonView<'_>, spans: bool) -> Result<Message> {
     Ok(message)
 }
 
-fn project_object(
-    record: &Fields<'_>,
-    fields: &mut serde_json::Map<String, Value>,
-    key: &str,
-    keys: &[&'static str],
-) -> Result<()> {
-    if let Some(view) = record.get(key) {
-        let value = if let Some(object) = Fields::parse(view, keys)? {
-            Value::Object(object.project(keys)?)
-        } else {
-            view.resolve()?.into_owned()
-        };
-        fields.insert(key.into(), value);
-    }
-    Ok(())
+fn extensions(view: JsonView<'_>, known: &[&str]) -> Result<serde_json::Map<String, Value>> {
+    let mut fields = serde_json::Map::new();
+    view.for_each_entry(|key, value| {
+        if !known.contains(&key) {
+            fields.insert(key.to_owned(), value.resolve()?.into_owned());
+        }
+        Ok(())
+    })?;
+    Ok(fields)
 }
 
 fn ir_block(view: JsonView<'_>, spans: bool) -> Result<Block> {
@@ -408,6 +439,12 @@ fn ir_block(view: JsonView<'_>, spans: bool) -> Result<Block> {
     };
     let ty = head.string("type")?;
     let (keys, text_key) = block_projection(ty.as_deref());
+    if let Some(block_type) = ty.as_ref().filter(|_| keys == ["type"] && text_key.is_none()) {
+        return Ok(Block::Opaque {
+            block_type: block_type.clone(),
+            value: view.resolve()?.into_owned(),
+        });
+    }
     let selected = keys.iter().copied().chain(text_key).collect::<Vec<_>>();
     let record = Fields::parse(view, &selected)?.unwrap();
     if ty.as_deref() == Some("tool_use") {
@@ -422,9 +459,11 @@ fn ir_block(view: JsonView<'_>, spans: bool) -> Result<Block> {
                 .map(serde_json::from_value)
                 .transpose()?
                 .flatten(),
+            extensions: extensions(view, &selected)?,
         });
     }
     let mut fields = record.project(keys)?;
+    fields.extend(extensions(view, &selected)?);
     let mut selected_text = None;
     if let Some(key) = text_key {
         if let Some(view) = record.get(key) {
@@ -442,7 +481,7 @@ fn ir_block(view: JsonView<'_>, spans: bool) -> Result<Block> {
     let mut block: Block = serde_json::from_value(Value::Object(fields)).context("not an OpenSession block")?;
     if let Some(selected) = selected_text {
         match &mut block {
-            Block::Text { text } | Block::Thinking { text, .. } | Block::ToolResult { content: text, .. } => {
+            Block::Text { text, .. } | Block::Thinking { text, .. } | Block::ToolResult { content: text, .. } => {
                 *text = selected
             }
             _ => unreachable!("text projection only selects text-bearing block variants"),

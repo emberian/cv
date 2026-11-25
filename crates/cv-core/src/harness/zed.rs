@@ -431,6 +431,7 @@ fn snapshot_git(t: &Value) -> Option<GitInfo> {
         branch: pick("current_branch"),
         commit: pick("head_sha"),
         remote: pick("remote_url"),
+        ..Default::default()
     };
     (info.branch.is_some() || info.commit.is_some() || info.remote.is_some()).then_some(info)
 }
@@ -856,7 +857,7 @@ mod tests {
         assert!(matches!(&a.content[0], Block::Thinking { text, signature, .. }
             if text.matches_str("let me look") == Some(true) && signature.as_deref() == Some("sig1")));
         assert!(
-            matches!(&a.content[1], Block::Text { text } if text.matches_str("Checking the test now.") == Some(true))
+            matches!(&a.content[1], Block::Text { text , .. } if text.matches_str("Checking the test now.") == Some(true))
         );
         assert!(matches!(&a.content[2], Block::ToolUse { id, name, input , ..}
             if id == "toolu_1" && name == "read_file"
@@ -913,7 +914,7 @@ mod tests {
         assert!(
             matches!(&a.content[0], Block::Thinking { text, .. } if text.matches_str("plan the split") == Some(true))
         );
-        assert!(matches!(&a.content[1], Block::Text { text } if text.matches_str("Splitting now.") == Some(true)));
+        assert!(matches!(&a.content[1], Block::Text { text , .. } if text.matches_str("Splitting now.") == Some(true)));
         assert!(matches!(&a.content[2], Block::ToolUse { id, name, .. } if id == "toolu_9" && name == "edit_file"));
         let t = &s.messages[2];
         assert_eq!(t.role, Role::Tool);
@@ -1173,7 +1174,7 @@ mod tests {
             serde_json::to_value(&lazy).unwrap()
         );
         let resolver = crate::lazy::Resolver::new(None);
-        let Block::Text { text } = &lazy.messages[0].content[0] else {
+        let Block::Text { text, .. } = &lazy.messages[0].content[0] else {
             panic!("text")
         };
         let Block::Thinking { text: thinking, .. } = &lazy.messages[1].content[0] else {
@@ -1520,7 +1521,7 @@ mod tests {
         reference.path = path;
         let mut sink = crate::stream::CollectSink::default();
         zed.stream(&reference, &Demand::LEAN.with_spans(), &mut sink).unwrap();
-        let Block::Text { text } = &sink.messages[0].content[0] else {
+        let Block::Text { text, .. } = &sink.messages[0].content[0] else {
             panic!("text")
         };
         assert!(matches!(text, crate::lazy::Text::Source(_)));

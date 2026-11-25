@@ -132,47 +132,53 @@ pub(crate) fn fixture(world: &cv_testkit::World) -> Result<(Session, PathBuf)> {
     session.updated_at = session.created_at;
     let mut user = Message::new(Role::User);
     user.content = vec![
-        Block::Text { text: "".into() },
-        Block::Text { text: text.clone() },
-        Block::Text { text: "".into() },
+        Block::from_text("".into()),
+        Block::from_text(text.clone()),
+        Block::from_text("".into()),
         Block::Image {
             media_type: Some("image/png".into()),
             data_ref: None,
+            extensions: Default::default(),
         },
         Block::File {
             mime: Some("text/plain".into()),
             path: Some("/synthetic/file".into()),
             source: Some("https://synthetic/file".into()),
+            extensions: Default::default(),
         },
     ];
     session.messages.push(user);
     let mut assistant = Message::new(Role::Assistant);
     assistant.model = Some("message model".into());
     assistant.content = vec![
-        Block::Text { text: text.clone() },
+        Block::from_text(text.clone()),
         Block::Thinking {
             text: text.clone(),
             signature: Some("signed".into()),
             encrypted: Some("encrypted".into()),
             redacted: false,
+            extensions: Default::default(),
         },
         Block::Thinking {
             text: " \n".into(),
             signature: None,
             encrypted: None,
             redacted: false,
+            extensions: Default::default(),
         },
         Block::Thinking {
             text: "".into(),
             signature: Some("signature only".into()),
             encrypted: None,
             redacted: true,
+            extensions: Default::default(),
         },
         Block::ToolUse {
             id: "paired".into(),
             name: "Read".into(),
             input,
             namespace: None,
+            extensions: Default::default(),
         },
     ];
     assistant.usage = Some(crate::Usage {
@@ -190,6 +196,7 @@ pub(crate) fn fixture(world: &cv_testkit::World) -> Result<(Session, PathBuf)> {
         name: "Read".into(),
         input: json!({"path":"/synthetic"}).into(),
         namespace: Some(crate::affordance::DEFERRED.into()),
+        extensions: Default::default(),
     });
     session.extra.insert("hermes".into(), json!({"session":{"source":"native","user_id":"user","model_config":"{\"temperature\":0}","end_reason":"stop","tool_call_count":9,"input_tokens":17,"output_tokens":19,"cache_read_tokens":23,"cache_write_tokens":29,"reasoning_tokens":31}}));
     session.messages.push(assistant);
@@ -210,14 +217,15 @@ pub(crate) fn fixture(world: &cv_testkit::World) -> Result<(Session, PathBuf)> {
             tool_name: Some("Read".into()),
             status: Some("completed".into()),
             details: Some(details),
+            extensions: Default::default(),
         });
     }
     session.messages.push(tools);
     let mut plain = Message::new(Role::System);
     plain.content = vec![
-        Block::Text { text: "".into() },
-        Block::Text { text },
-        Block::Text { text: "".into() },
+        Block::from_text("".into()),
+        Block::from_text(text),
+        Block::from_text("".into()),
     ];
     session.messages.push(plain);
     let mut raw = Message::new(Role::Assistant);
@@ -226,6 +234,7 @@ pub(crate) fn fixture(world: &cv_testkit::World) -> Result<(Session, PathBuf)> {
         signature: None,
         encrypted: None,
         redacted: false,
+        extensions: Default::default(),
     }];
     raw.extra.insert("hermes".into(), json!({"reasoning":"raw reasoning","reasoning_content":"raw second","reasoning_details":[{"type":"native"}],"codex_reasoning_items":[1],"codex_message_items":[2]}));
     session.messages.push(raw);

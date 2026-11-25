@@ -627,17 +627,19 @@ mod tests {
         let input = serde_json::json!({"content": "🌙\n".repeat(1 << 20)});
         let mut message = Message::new(Role::User);
         message.content = vec![
-            Block::Text { text: "prompt".into() },
+            Block::from_text("prompt".into()),
             Block::ToolUse {
                 id: "t".into(),
                 name: "Edit".into(),
                 input: input.into(),
                 namespace: None,
+                extensions: Default::default(),
             },
             Block::File {
                 mime: None,
                 path: Some(format!("{}ZQLAST tail", "later".repeat(1 << 20))),
                 source: None,
+                extensions: Default::default(),
             },
         ];
         assert_eq!(sink.message(message), Flow::Continue);
@@ -671,7 +673,7 @@ mod tests {
             let text = value.with_view(|view| Ok(view.source_text()?.unwrap())).unwrap();
             assert!(matches!(text, Text::Source(_)));
             let mut message = Message::new(Role::User);
-            message.content.push(Block::Text { text: text.clone() });
+            message.content.push(Block::from_text(text.clone()));
             let mut sink = ScanSink::new(&path, Matcher::new(vec!["zqend".into()], 1));
             assert_eq!(sink.message(message), Flow::Continue);
             assert!(sink.take_error().is_none());
@@ -682,7 +684,7 @@ mod tests {
             std::fs::write(&conditional, format!("dependency {late_whitespace}")).unwrap();
             let mut stale = ScanSink::new(&path, Matcher::new(vec!["zqend".into()], 1));
             let mut message = Message::new(Role::Assistant);
-            message.content.push(Block::Text { text });
+            message.content.push(Block::from_text(text));
             assert!(stale.try_message(message).is_err());
             assert!(stale.take_error().is_some());
         }
@@ -696,14 +698,12 @@ mod tests {
         for role in [Role::User, Role::Assistant] {
             let mut sink = ScanSink::new(&path, Matcher::new(vec!["x".into()], 1));
             let mut message = Message::new(role);
-            message.content.push(Block::Text {
-                text: Text::Span(crate::Span {
-                    source: Some(path.clone()),
-                    offset: 0,
-                    len: 8192,
-                    escaped: false,
-                }),
-            });
+            message.content.push(Block::from_text(Text::Span(crate::Span {
+                source: Some(path.clone()),
+                offset: 0,
+                len: 8192,
+                escaped: false,
+            })));
             assert!(sink.try_message(message).is_err());
             assert_eq!(sink.message(Message::new(Role::User)), Flow::Stop);
             assert!(sink.take_error().is_some());
@@ -726,6 +726,7 @@ mod tests {
             name: "Edit".into(),
             input,
             namespace: None,
+            extensions: Default::default(),
         });
         assert!(sink.try_message(message).is_err());
         assert_eq!(sink.message(Message::new(Role::User)), Flow::Stop);

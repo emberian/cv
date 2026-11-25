@@ -786,22 +786,21 @@ mod tests {
         std::fs::write(&path, format!("{quoted}\n{raw_input}")).unwrap();
         let resolver = cv_core::Resolver::new(Some(path.clone()));
         let mut inline = Message::new(cv_core::Role::Assistant);
-        inline.content.push(Block::Text { text: text.into() });
+        inline.content.push(Block::from_text(text.into()));
         inline.content.push(Block::ToolUse {
             id: "call".into(),
             name: "tool".into(),
             namespace: None,
             input: serde_json::from_str(r#"{"z":{"b":2,"a":1},"a":0}"#).unwrap(),
+            extensions: Default::default(),
         });
         let mut lazy = inline.clone();
-        lazy.content[0] = Block::Text {
-            text: cv_core::Text::Span(cv_core::Span {
-                source: None,
-                offset: 1,
-                len: quoted.len() as u64 - 2,
-                escaped: true,
-            }),
-        };
+        lazy.content[0] = Block::from_text(cv_core::Text::Span(cv_core::Span {
+            source: None,
+            offset: 1,
+            len: quoted.len() as u64 - 2,
+            escaped: true,
+        }));
         if let Block::ToolUse { input, .. } = &mut lazy.content[1] {
             *input = cv_core::Json::source(&path, quoted.len() as u64 + 1, raw_input.len() as u64).unwrap();
         }

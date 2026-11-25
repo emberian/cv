@@ -933,7 +933,7 @@ mod tests {
         let mut original = Session::new("wrapped", Harness::Codex);
         for text in ["prompt λ", "reply", "tail"] {
             let mut message = cv_core::Message::new(cv_core::Role::User);
-            message.content.push(cv_core::Block::Text { text: text.into() });
+            message.content.push(cv_core::Block::from_text(text.into()));
             original.messages.push(message);
         }
         std::fs::write(

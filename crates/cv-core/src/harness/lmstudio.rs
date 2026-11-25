@@ -496,12 +496,14 @@ fn projected_content(
                     message.content.push(Block::Image {
                         media_type: None,
                         data_ref: data_ref.or(name),
+                        extensions: Default::default(),
                     });
                 } else {
                     message.content.push(Block::File {
                         mime: part.string("fileType")?,
                         path: name,
                         source: data_ref,
+                        extensions: Default::default(),
                     });
                 }
             }
@@ -523,6 +525,7 @@ fn projected_text(view: JsonView<'_>, message: &mut Message, thinking: bool, opt
             signature: None,
             encrypted: None,
             redacted: false,
+            extensions: Default::default(),
         });
     } else {
         let harmony = if let Some(text) = text.inline_str() {
@@ -547,7 +550,7 @@ fn projected_text(view: JsonView<'_>, message: &mut Message, thinking: bool, opt
                 &mut call_id,
             ));
         } else {
-            message.content.push(Block::Text { text });
+            message.content.push(Block::from_text(text));
         }
     }
     Ok(())
@@ -619,7 +622,9 @@ fn emit_file_part(b: &Block) -> Option<Value> {
     let mut part = Map::new();
     part.insert("type".into(), json!("file"));
     match b {
-        Block::Image { media_type, data_ref } => {
+        Block::Image {
+            media_type, data_ref, ..
+        } => {
             part.insert("fileType".into(), json!("image"));
             if let Some(r) = data_ref {
                 part.insert("identifier".into(), json!(r));
@@ -629,7 +634,7 @@ fn emit_file_part(b: &Block) -> Option<Value> {
                 part.insert("mimeType".into(), json!(mt));
             }
         }
-        Block::File { mime, path, source } => {
+        Block::File { mime, path, source, .. } => {
             if let Some(mt) = mime {
                 part.insert("fileType".into(), json!(mt));
             }
@@ -970,7 +975,7 @@ mod tests {
         let lazy = crate::stream::collect_with(&LmStudio { root: None }, &r, &Demand::LEAN.with_spans()).unwrap();
         assert_eq!(lazy.messages.len(), 1);
         assert!(matches!(&lazy.messages[0].content[0], Block::Thinking { text, .. } if text.is_lazy()));
-        assert!(matches!(&lazy.messages[0].content[1], Block::Text { text } if text.is_lazy()));
+        assert!(matches!(&lazy.messages[0].content[1], Block::Text { text , .. } if text.is_lazy()));
         let full = crate::stream::collect_with(&LmStudio { root: None }, &r, &Demand::RICH).unwrap();
         let mut lazy = lazy;
         lazy.materialize().unwrap();
@@ -1244,9 +1249,7 @@ mod tests {
 
         // Build a small session: a user turn and an assistant turn with thinking + text.
         let mut user = Message::new(Role::User);
-        user.content.push(Block::Text {
-            text: "Hello there".to_string().into(),
-        });
+        user.content.push(Block::from_text("Hello there".to_string().into()));
         let mut assistant = Message::new(Role::Assistant);
         assistant.model = Some("openai/gpt-oss-120b".to_string());
         assistant.content.push(Block::Thinking {
@@ -1254,10 +1257,11 @@ mod tests {
             signature: None,
             encrypted: None,
             redacted: false,
+            extensions: Default::default(),
         });
-        assistant.content.push(Block::Text {
-            text: "Hi! How can I help?".to_string().into(),
-        });
+        assistant
+            .content
+            .push(Block::from_text("Hi! How can I help?".to_string().into()));
         assistant.usage = Some(Usage {
             input_tokens: Some(12),
             output_tokens: Some(34),
@@ -1347,7 +1351,7 @@ mod tests {
             other => panic!("expected ToolUse, got {other:?}"),
         }
         match &a.content[2] {
-            Block::Text { text } => {
+            Block::Text { text, .. } => {
                 assert!(text.contains("sunny"));
                 assert!(!text.contains("<|"));
             }

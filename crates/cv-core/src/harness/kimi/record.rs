@@ -72,9 +72,7 @@ pub(super) fn message(
         }
         "_system_prompt" => {
             let mut m = Message::of_kind(Role::System, MessageKind::SystemPrompt, Origin::Harness);
-            m.content.push(Block::Text {
-                text: join(fields.get("content"), spans)?,
-            });
+            m.content.push(Block::from_text(join(fields.get("content"), spans)?));
             m
         }
         "user" | "assistant" => {
@@ -114,6 +112,7 @@ pub(super) fn message(
                 is_error,
                 status: Some(if is_error { "error" } else { "completed" }.into()),
                 details,
+                extensions: Default::default(),
             });
             m
         }
@@ -144,7 +143,7 @@ pub(super) const COMPACTION_SUMMARY_TAG: &str = "<system>Previous context has be
 /// to the longest marker below.
 fn classify(message: &mut Message) -> Result<()> {
     const MARKERS: [&str; 4] = [COMPACTION_SUMMARY_TAG, "<notification", "<system>", "<system-reminder>"];
-    let Some(Block::Text { text }) = message.content.first() else {
+    let Some(Block::Text { text, .. }) = message.content.first() else {
         return Ok(());
     };
     let head_chars = MARKERS.iter().map(|marker| marker.chars().count()).max().unwrap_or(0);

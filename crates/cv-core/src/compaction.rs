@@ -222,7 +222,7 @@ fn summary_text(
     let mut nonempty = false;
     let mut nonblank = false;
     for b in &m.content {
-        if let Block::Text { text } = b {
+        if let Block::Text { text, .. } = b {
             if nonempty {
                 if let Some(prefix) = &mut prefix {
                     prefix.push("\n");
@@ -325,9 +325,7 @@ mod tests {
     fn bounded_summary_preview_matches_full_text_for_blank_and_multiblock_bodies() {
         for body in ["", "   ", "\nλ短\nsecond", "                                  late"] {
             let mut message = summary("b", body);
-            message.content.push(Block::Text {
-                text: "\ntrailing".into(),
-            });
+            message.content.push(Block::from_text("\ntrailing".into()));
             let full = summary_text(&message, None, None).unwrap();
             for cap in [0, 1, 8, 200] {
                 assert_eq!(
@@ -344,9 +342,7 @@ mod tests {
     fn boundary(uuid: &str, trigger: &str, pre: u64) -> Message {
         let mut m = Message::of_kind(Role::System, MessageKind::CompactionBoundary, Origin::Harness);
         m.id = Some(uuid.to_string());
-        m.content = vec![Block::Text {
-            text: "Conversation compacted".into(),
-        }];
+        m.content = vec![Block::from_text("Conversation compacted".into())];
         m.harness_extra_mut(Harness::Claude).insert(
             "compactMetadata".into(),
             serde_json::json!({"trigger": trigger, "preTokens": pre, "durationMs": 1234}),
@@ -358,13 +354,13 @@ mod tests {
     fn summary(parent: &str, body: &str) -> Message {
         let mut m = Message::of_kind(Role::User, MessageKind::CompactionSummary, Origin::Harness);
         m.parent_id = Some(parent.to_string());
-        m.content = vec![Block::Text { text: body.into() }];
+        m.content = vec![Block::from_text(body.into())];
         m
     }
 
     fn plain_user(body: &str) -> Message {
         let mut m = Message::new(Role::User);
-        m.content = vec![Block::Text { text: body.into() }];
+        m.content = vec![Block::from_text(body.into())];
         m
     }
 
@@ -419,14 +415,15 @@ mod tests {
             let make = |text| {
                 let mut session = Session::new("summary", Harness::Claude);
                 let mut message = summary("b", "");
-                message.content.push(Block::Text { text });
+                message.content.push(Block::from_text(text));
                 message.content.push(Block::Thinking {
                     text: "ignored".into(),
                     signature: None,
                     encrypted: None,
                     redacted: false,
+                    extensions: Default::default(),
                 });
-                message.content.push(Block::Text { text: "".into() });
+                message.content.push(Block::from_text("".into()));
                 session.messages = vec![boundary("b", "auto", 42), message];
                 session
             };
@@ -468,7 +465,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let mut message = summary("b", "");
-        message.content = vec![Block::Text { text }];
+        message.content = vec![Block::from_text(text)];
         let mut session = Session::new("source-summary", Harness::Claude);
         session.messages = vec![boundary("b", "auto", 42), message.clone()];
         std::fs::write(&path, "changed snapshot").unwrap();
@@ -498,7 +495,7 @@ mod tests {
             len: 8192,
             escaped: true,
         });
-        if let Block::Text { text } = &mut session.messages[1].content[0] {
+        if let Block::Text { text, .. } = &mut session.messages[1].content[0] {
             *text = missing;
         }
         let mut preview_message = summary("b", &"visible".repeat(100));
@@ -511,7 +508,7 @@ mod tests {
         assert_eq!(detect_in_session(&session, false).unwrap().len(), 1);
         // The driver is handed the failure itself (here an io::Error under context), not a
         // flattened copy that has lost its cause.
-        if let Block::Text { text } = &mut session.messages[1].content[0] {
+        if let Block::Text { text, .. } = &mut session.messages[1].content[0] {
             *text = crate::lazy::Text::Span(crate::lazy::Span {
                 source: Some(world.base.join("missing")),
                 offset: 1,

@@ -635,6 +635,7 @@ mod tests {
             namespace: None,
             input: serde_json::json!({"patch":"*** Begin Patch\n*** Add File: /repo/visible.txt\n+ok\n*** End Patch"})
                 .into(),
+            extensions: Default::default(),
         });
         messages.insert(0, visible);
         let all = ToolHistogram::from_messages(&messages, None).unwrap();
@@ -675,6 +676,7 @@ mod tests {
             name: name.into(),
             input: input.into(),
             namespace: None,
+            extensions: Default::default(),
         }
     }
 
@@ -861,6 +863,7 @@ mod tests {
                 name: "Bash".into(),
                 namespace: None,
                 input: excluded,
+                extensions: Default::default(),
             },
             with_id(tool_use("Read", json!({"file_path":"selected.rs"})), "selected"),
         ]);
@@ -903,6 +906,7 @@ mod tests {
                 tool_name: Some("Bash".into()),
                 status: None,
                 details: None,
+                extensions: Default::default(),
             },
             Block::ToolResult {
                 tool_use_id: "t2".into(),
@@ -911,6 +915,7 @@ mod tests {
                 tool_name: None, // unknown tool → only the total moves
                 status: None,
                 details: None,
+                extensions: Default::default(),
             },
         ];
         let h = ToolHistogram::from_messages(std::slice::from_ref(&m).iter(), None).unwrap();
@@ -980,6 +985,7 @@ mod tests {
             name: "Edit".into(),
             namespace: None,
             input,
+            extensions: Default::default(),
         }]);
         std::fs::remove_file(path).unwrap();
         assert!(ToolHistogram::from_messages([&message], None).is_err());

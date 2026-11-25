@@ -109,7 +109,7 @@ pub(super) fn content(
     let Some(items) = view.array()? else {
         if let Some(text) = view.lazy_text(spans)? {
             if !matches!(&text, Text::Inline(s) if s.is_empty()) {
-                d.blocks.push(Block::Text { text });
+                d.blocks.push(Block::from_text(text));
                 d.substantive = true;
             }
         }
@@ -189,7 +189,7 @@ fn control(item: JsonView<'_>, ty: Option<&str>, d: &mut Decoded, opts: &Demand,
         }
         b.push(suffix)
     })?;
-    d.blocks.push(Block::Text { text });
+    d.blocks.push(Block::from_text(text));
     if ty == Some("error") {
         if d.error.is_none() {
             d.error = Some(if opts.tier < Tier::Rich {
@@ -250,6 +250,7 @@ fn tool(view: JsonView<'_>, tools: &mut HashMap<String, String>, opts: &Demand, 
                 name: String::new(),
                 input,
                 namespace: None,
+                extensions: Default::default(),
             }));
         }
         let Some(value_view) = call.get("value") else {
@@ -276,6 +277,7 @@ fn tool(view: JsonView<'_>, tools: &mut HashMap<String, String>, opts: &Demand, 
             name,
             input,
             namespace: None,
+            extensions: Default::default(),
         }));
     }
     let Some(result_view) = item.get("toolResult") else {
@@ -336,6 +338,7 @@ fn tool(view: JsonView<'_>, tools: &mut HashMap<String, String>, opts: &Demand, 
         tool_name: tools.get(&id).cloned(),
         status: None,
         details: (!details.is_empty()).then_some(Value::Object(details)),
+        extensions: Default::default(),
     }))
 }
 
@@ -439,7 +442,7 @@ mod tests {
         assert_eq!(d.blocks.len(), 3);
         assert!(d.substantive && d.error.is_some() && d.control.len() == 1);
         assert!(d.blocks.iter().all(|b| match b {
-            Block::Text { text } | Block::ToolResult { content: text, .. } => text.is_empty(),
+            Block::Text { text, .. } | Block::ToolResult { content: text, .. } => text.is_empty(),
             _ => false,
         }));
     }

@@ -195,7 +195,7 @@ impl Record<'_> {
                 return crate::harness::wire::write::joined_text(
                     writer,
                     self.blocks.iter().filter_map(|b| {
-                        if let Block::Text { text } = b.as_ref() {
+                        if let Block::Text { text, .. } = b.as_ref() {
                             Some(text)
                         } else {
                             None
@@ -367,7 +367,7 @@ impl Record<'_> {
         crate::harness::wire::write::joined_text(
             writer,
             self.blocks.iter().filter_map(|b| {
-                if let Block::Text { text } = b.as_ref() {
+                if let Block::Text { text, .. } = b.as_ref() {
                     Some(text)
                 } else {
                     None
@@ -397,10 +397,9 @@ fn projected<'a>(message: &'a Message, mode: ThinkingMode, resolver: &Resolver) 
                 else {
                     unreachable!()
                 };
-                blocks.push(Cow::Owned(Block::Text {
-                    text: crate::emit::thinking_placeholder(signature.as_deref(), encrypted.as_deref(), *redacted)
-                        .into(),
-                }));
+                blocks.push(Cow::Owned(Block::from_text(
+                    crate::emit::thinking_placeholder(signature.as_deref(), encrypted.as_deref(), *redacted).into(),
+                )));
             }
             _ => blocks.push(Cow::Borrowed(block)),
         }
@@ -924,9 +923,7 @@ mod parent_tests {
         session.created_at = chrono::DateTime::from_timestamp(1, 0);
         let mut root = Message::new(Role::User);
         root.id = Some("root".into());
-        root.content.push(Block::Text {
-            text: "root prompt".into(),
-        });
+        root.content.push(Block::from_text("root prompt".into()));
         session.messages.push(root);
         for n in 0..128 {
             let mut dropped = Message::new(Role::System);
@@ -938,9 +935,7 @@ mod parent_tests {
             let mut child = Message::new(Role::User);
             child.id = Some(format!("child{n}"));
             child.parent_id = Some(format!("d{n}"));
-            child.content.push(Block::Text {
-                text: format!("child {n}").into(),
-            });
+            child.content.push(Block::from_text(format!("child {n}").into()));
             session.messages.push(child);
         }
         let opts = EmitOptions {

@@ -169,7 +169,7 @@ fn body(session: &Session, message: &Message) -> String {
         .content
         .iter()
         .filter_map(|block| match block {
-            Block::Text { text } => Some(text.try_resolve(&resolver).unwrap().into_owned()),
+            Block::Text { text, .. } => Some(text.try_resolve(&resolver).unwrap().into_owned()),
             Block::ToolResult { content, .. } => Some(content.try_resolve(&resolver).unwrap().into_owned()),
             _ => None,
         })
@@ -845,7 +845,9 @@ fn a_prompt_image_survives_the_loss_of_its_stored_upload() {
         .content
         .iter()
         .filter_map(|block| match block {
-            Block::Image { media_type, data_ref } => Some((media_type.as_deref(), data_ref.as_deref())),
+            Block::Image {
+                media_type, data_ref, ..
+            } => Some((media_type.as_deref(), data_ref.as_deref())),
             _ => None,
         })
         .collect();
@@ -1019,7 +1021,9 @@ fn an_exported_prompt_whose_upload_is_gone_reads_the_image_the_store_kept() {
         .content
         .iter()
         .filter_map(|block| match block {
-            Block::Image { media_type, data_ref } => Some((media_type.as_deref(), data_ref.as_deref())),
+            Block::Image {
+                media_type, data_ref, ..
+            } => Some((media_type.as_deref(), data_ref.as_deref())),
             _ => None,
         })
         .collect();

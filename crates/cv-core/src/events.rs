@@ -1812,6 +1812,7 @@ mod tests {
             name: name.into(),
             input: input.into(),
             namespace: None,
+            extensions: Default::default(),
         }
     }
 
@@ -1877,6 +1878,7 @@ mod tests {
                     name: name.into(),
                     namespace: None,
                     input: source,
+                    extensions: Default::default(),
                 },
             ]);
             std::fs::remove_file(&path).unwrap();
@@ -2111,6 +2113,7 @@ await tools.view_image({ path: "docs/arch.png" });
                 tool_name: Some("Bash".into()),
                 status: None,
                 details: None,
+                extensions: Default::default(),
             },
             Block::ToolResult {
                 tool_use_id: "t2".into(),
@@ -2124,6 +2127,7 @@ await tools.view_image({ path: "docs/arch.png" });
                 tool_name: None,
                 status: None,
                 details: None,
+                extensions: Default::default(),
             },
             // Non-error results emit nothing.
             Block::ToolResult {
@@ -2133,6 +2137,7 @@ await tools.view_image({ path: "docs/arch.png" });
                 tool_name: None,
                 status: None,
                 details: None,
+                extensions: Default::default(),
             },
         ];
         let ev = extract(&m, 3, None, &crate::lazy::Resolver::new(None)).unwrap();
@@ -2162,6 +2167,7 @@ await tools.view_image({ path: "docs/arch.png" });
             tool_name: None,
             status: None,
             details: None,
+            extensions: Default::default(),
         }];
         let ev = extract(&m, 0, None, &crate::lazy::Resolver::new(None)).unwrap();
         assert_eq!(ev[0].detail, Some("e".repeat(1000)));

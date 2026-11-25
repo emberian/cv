@@ -51,7 +51,7 @@ pub(crate) fn block(writer: &mut dyn Write, b: &Block, q: &Quirks, user: bool, r
 /// Compatibility entry points already request an owned Value. They buffer its encoded form
 /// before parsing it; hot emitters call `block` directly and never take this allocation path.
 pub(super) fn owned(b: &Block, q: &Quirks, user: bool) -> Result<Option<Value>> {
-    if !user && matches!(b, Block::ToolResult { .. }) {
+    if matches!(b, Block::Opaque { .. }) || (!user && matches!(b, Block::ToolResult { .. })) {
         return Ok(None);
     }
     let mut bytes = Vec::new();
@@ -62,7 +62,8 @@ pub(super) fn owned(b: &Block, q: &Quirks, user: bool) -> Result<Option<Value>> 
 fn publish(writer: &mut dyn Write, b: &Block, q: &Quirks, user: bool, leaf: LeafPublication<'_>) -> Result<()> {
     let mut o = ObjectWriter::new(writer)?;
     match b {
-        Block::Text { text } => {
+        Block::Opaque { .. } => anyhow::bail!("cannot encode an opaque OpenSession block in a native turn"),
+        Block::Text { text, .. } => {
             o.field("type", "text")?;
             o.field_with("text", |w| leaf.text(w, text))?;
         }
@@ -71,6 +72,7 @@ fn publish(writer: &mut dyn Write, b: &Block, q: &Quirks, user: bool, leaf: Leaf
             signature,
             encrypted,
             redacted,
+            ..
         } => match q.redacted_thinking {
             Some(t) if *redacted => {
                 o.field("type", t)?;
@@ -104,7 +106,9 @@ fn publish(writer: &mut dyn Write, b: &Block, q: &Quirks, user: bool, leaf: Leaf
             o.field_with("content", |w| leaf.text(w, content))?;
             o.field("is_error", is_error)?;
         }
-        Block::Image { media_type, data_ref } => {
+        Block::Image {
+            media_type, data_ref, ..
+        } => {
             o.field("type", "image")?;
             if q.flat_media.is_some() {
                 if let Some(mt) = media_type {
@@ -130,7 +134,7 @@ fn publish(writer: &mut dyn Write, b: &Block, q: &Quirks, user: bool, leaf: Leaf
                 })?;
             }
         }
-        Block::File { mime, path, source } if user && q.flat_media.is_none() => {
+        Block::File { mime, path, source, .. } if user && q.flat_media.is_none() => {
             o.field("type", "document")?;
             if let Some(p) = path {
                 o.field("title", p)?;
@@ -183,47 +187,51 @@ mod tests {
         });
         let resolver = Resolver::new(Some(path));
         let content = vec![
-            Block::Text {
-                text: "a\"\\\nλ".into(),
-            },
-            Block::Text { text: "".into() },
-            Block::Text { text: span.clone() },
-            Block::Text { text: source.clone() },
+            Block::from_text("a\"\\\nλ".into()),
+            Block::from_text("".into()),
+            Block::from_text(span.clone()),
+            Block::from_text(source.clone()),
             Block::Thinking {
                 text: "thought".into(),
                 signature: Some(String::new()),
                 encrypted: None,
                 redacted: false,
+                extensions: Default::default(),
             },
             Block::Thinking {
                 text: span.clone(),
                 signature: Some("signed".into()),
                 encrypted: None,
                 redacted: false,
+                extensions: Default::default(),
             },
             Block::Thinking {
                 text: source.clone(),
                 signature: None,
                 encrypted: Some("opaque".into()),
                 redacted: true,
+                extensions: Default::default(),
             },
             Block::Thinking {
                 text: "".into(),
                 signature: Some("hidden".into()),
                 encrypted: None,
                 redacted: true,
+                extensions: Default::default(),
             },
             Block::ToolUse {
                 id: "call".into(),
                 name: "Read".into(),
                 input: json!({"n":1.25,"s":"arg"}).into(),
                 namespace: None,
+                extensions: Default::default(),
             },
             Block::ToolUse {
                 id: "source-call".into(),
                 name: "Read".into(),
                 input: source_json,
                 namespace: None,
+                extensions: Default::default(),
             },
             Block::ToolResult {
                 tool_use_id: "call".into(),
@@ -232,6 +240,7 @@ mod tests {
                 is_error: true,
                 status: None,
                 details: None,
+                extensions: Default::default(),
             },
             Block::ToolResult {
                 tool_use_id: "span".into(),
@@ -240,6 +249,7 @@ mod tests {
                 is_error: false,
                 status: None,
                 details: None,
+                extensions: Default::default(),
             },
             Block::ToolResult {
                 tool_use_id: "source".into(),
@@ -248,37 +258,45 @@ mod tests {
                 is_error: false,
                 status: None,
                 details: None,
+                extensions: Default::default(),
             },
             Block::Image {
                 media_type: Some("image/png".into()),
                 data_ref: Some("file:image".into()),
+                extensions: Default::default(),
             },
             Block::Image {
                 media_type: None,
                 data_ref: Some("base64:inline".into()),
+                extensions: Default::default(),
             },
             Block::Image {
                 media_type: Some("image/webp".into()),
                 data_ref: Some("https://example.invalid/image".into()),
+                extensions: Default::default(),
             },
             Block::Image {
                 media_type: None,
                 data_ref: None,
+                extensions: Default::default(),
             },
             Block::File {
                 mime: Some("text/plain".into()),
                 path: Some("document λ".into()),
                 source: Some("https://example.invalid/doc".into()),
+                extensions: Default::default(),
             },
             Block::File {
                 mime: None,
                 path: None,
                 source: Some("file:doc".into()),
+                extensions: Default::default(),
             },
             Block::File {
                 mime: None,
                 path: None,
                 source: None,
+                extensions: Default::default(),
             },
         ];
         let mut observed = Vec::new();
@@ -350,7 +368,7 @@ mod source_failure_tests {
                     bytes: &changed,
                     done: false
                 },
-                &Block::Text { text },
+                &Block::from_text(text),
                 &ANTHROPIC,
                 false,
                 &Resolver::new(None)

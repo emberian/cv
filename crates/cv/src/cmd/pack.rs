@@ -673,7 +673,7 @@ fn capped_text(m: &Message, resolver: &Resolver, limit: usize) -> Result<(String
     let mut more = false;
     for b in &m.content {
         let text = match b {
-            Block::Text { text } => text,
+            Block::Text { text, .. } => text,
             Block::ToolResult { content, .. }
                 if m.role == Role::Tool || m.kind == cv_core::ir::MessageKind::ToolResult =>
             {
@@ -994,9 +994,9 @@ fn emit_pack_session(
         cv_core::ir::Origin::Harness,
     );
     context.timestamp = Some(now);
-    context.content.push(Block::Text {
-        text: format!("Relevant context from earlier sessions, compiled by `cv pack`:\n\n{bundle}").into(),
-    });
+    context.content.push(Block::from_text(
+        format!("Relevant context from earlier sessions, compiled by `cv pack`:\n\n{bundle}").into(),
+    ));
 
     // Synthesized task-seed carrier: `Origin::Import` (never `Origin::Human`) + `[cv pack]` seed
     // prefix so subsequent distill/overview/dataset/port operations across any harness never
@@ -1007,9 +1007,9 @@ fn emit_pack_session(
         cv_core::ir::Origin::Import,
     );
     prompt.timestamp = Some(now);
-    prompt.content.push(Block::Text {
-        text: format!("[cv pack] I'm picking up this task: {task}").into(),
-    });
+    prompt.content.push(Block::from_text(
+        format!("[cv pack] I'm picking up this task: {task}").into(),
+    ));
     let seed_meta = serde_json::json!({
         "kind": "pack",
         "task": task,
@@ -1157,12 +1157,13 @@ mod tests {
             ),
         ] {
             let mut m = Message::new(role);
-            m.content.push(Block::Text { text: text.into() });
+            m.content.push(Block::from_text(text.into()));
             m.content.push(Block::ToolUse {
                 id: "call".into(),
                 name: tool.into(),
                 namespace: None,
                 input: input.into(),
+                extensions: Default::default(),
             });
             session.messages.push(m);
         }
@@ -1248,14 +1249,13 @@ mod tests {
         let input = cv_core::Json::source(&payload, 0, std::fs::metadata(&payload)?.len())?;
         std::fs::remove_file(&payload)?;
         let mut good = Message::new(Role::Assistant);
-        good.content.push(Block::Text {
-            text: "chosen excerpt".into(),
-        });
+        good.content.push(Block::from_text("chosen excerpt".into()));
         good.content.push(Block::ToolUse {
             id: "good".into(),
             name: "Read".into(),
             namespace: None,
             input: serde_json::json!({"file_path":"good"}).into(),
+            extensions: Default::default(),
         });
         let mut bad = Message::new(Role::Tool);
         bad.content.push(Block::ToolUse {
@@ -1263,24 +1263,25 @@ mod tests {
             name: "Read".into(),
             namespace: None,
             input,
+            extensions: Default::default(),
         });
         let mut following = Message::new(Role::User);
-        following.content.push(Block::Text {
-            text: "tail after failed events".into(),
-        });
+        following
+            .content
+            .push(Block::from_text("tail after failed events".into()));
         let fixture = ExcerptFixture(vec![good, bad, following]);
         let expected = best_window(&fixture, &r, "chosen", EXCERPT_BYTES)?;
         assert_eq!(best_window_and_ingest(&fixture, &r, "chosen", EXCERPT_BYTES)?, expected);
         assert!(rows(&r).is_empty());
         let mut unreadable = Message::new(Role::Assistant);
-        unreadable.content.push(Block::Text {
-            text: cv_core::Text::Span(cv_core::lazy::Span {
+        unreadable
+            .content
+            .push(Block::from_text(cv_core::Text::Span(cv_core::lazy::Span {
                 source: Some(payload),
                 offset: 0,
                 len: 4,
                 escaped: false,
-            }),
-        });
+            })));
         assert!(best_window_and_ingest(&ExcerptFixture(vec![unreadable]), &r, "chosen", EXCERPT_BYTES).is_err());
         assert!(rows(&r).is_empty());
         assert!(cv_core::events::needs_ingest(&r));
@@ -1314,9 +1315,7 @@ mod tests {
         let body = format!("chosen λ {} omitted-tail", "padding ".repeat(128 * 1024));
         let mut original = Session::new("source", Harness::Claude);
         let mut message = Message::new(Role::Assistant);
-        message.content.push(Block::Text {
-            text: body.clone().into(),
-        });
+        message.content.push(Block::from_text(body.clone().into()));
         original.messages.push(message.clone());
         let bytes = serde_json::to_vec(&cv_core::harness::opensession::document(&original))?;
         let offset = bytes
@@ -1329,16 +1328,14 @@ mod tests {
             .with_view(|view| view.source_text()?.context("source string"))?;
         assert!(matches!(&source_text, cv_core::Text::Source(_)));
         let mut span = message.clone();
-        span.content = vec![Block::Text {
-            text: cv_core::Text::Span(cv_core::lazy::Span {
-                source: Some(path.clone()),
-                offset: offset as u64,
-                len: body.len() as u64,
-                escaped: false,
-            }),
-        }];
+        span.content = vec![Block::from_text(cv_core::Text::Span(cv_core::lazy::Span {
+            source: Some(path.clone()),
+            offset: offset as u64,
+            len: body.len() as u64,
+            escaped: false,
+        }))];
         let mut source = message.clone();
-        source.content = vec![Block::Text { text: source_text }];
+        source.content = vec![Block::from_text(source_text)];
         let resolver = Resolver::new(Some(path.clone()));
         let expected_text = capped_text(&message, &resolver, EXCERPT_BYTES)?;
         assert!(!expected_text.0.contains("omitted-tail"));
@@ -1500,13 +1497,11 @@ mod tests {
     fn pack_message_budget_is_shared_across_blocks_and_hard_line_cuts_close_fences() -> Result<()> {
         let mut message = Message::new(Role::Assistant);
         message.content = (0..20)
-            .map(|_| Block::Text {
-                text: " ".repeat(EXCERPT_BYTES).into(),
-            })
+            .map(|_| Block::from_text(" ".repeat(EXCERPT_BYTES).into()))
             .collect();
-        message.content.push(Block::Text {
-            text: "outside the message budget".into(),
-        });
+        message
+            .content
+            .push(Block::from_text("outside the message budget".into()));
         assert_eq!(
             capped_text(&message, &Resolver::new(None), EXCERPT_BYTES)?,
             (String::new(), true)
@@ -1593,15 +1588,16 @@ mod tests {
             "</SYSTEM_MESSAGE>\n",
         );
         let mut user_msg = Message::of_kind(Role::User, cv_core::ir::MessageKind::Prompt, cv_core::ir::Origin::Human);
-        user_msg.content.push(Block::Text {
-            text: "investigate unique_pack_needle".into(),
-        });
+        user_msg
+            .content
+            .push(Block::from_text("investigate unique_pack_needle".into()));
         let mut call_msg = Message::new(Role::Assistant);
         call_msg.content.push(Block::ToolUse {
             id: "tu_inj".into(),
             name: "Bash".into(),
             namespace: None,
             input: serde_json::json!({"command": "echo `whoami`"}).into(),
+            extensions: Default::default(),
         });
         let mut tool_msg = Message::of_kind(
             Role::Tool,
@@ -1615,6 +1611,7 @@ mod tests {
             tool_name: Some("Bash".into()),
             status: None,
             details: None,
+            extensions: Default::default(),
         });
 
         let mut src_session = Session::new("pack-inj-sess", Harness::OpenSession);

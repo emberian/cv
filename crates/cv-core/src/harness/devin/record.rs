@@ -202,11 +202,12 @@ pub(super) fn node(
                         signature,
                         encrypted: None,
                         redacted: false,
+                        extensions: Default::default(),
                     });
                 }
             }
             if let Some(text) = content {
-                m.content.push(Block::Text { text });
+                m.content.push(Block::from_text(text));
             }
             if let Some(calls) = chat.get("tool_calls")?.map(JsonView::array).transpose()?.flatten() {
                 for c in calls {
@@ -225,6 +226,7 @@ pub(super) fn node(
                         name,
                         input,
                         namespace: None,
+                        extensions: Default::default(),
                     });
                 }
             }
@@ -297,11 +299,12 @@ pub(super) fn node(
                     success.map(|ok| if ok { "completed" } else { "error" }.to_string())
                 },
                 details: (!details.is_empty()).then_some(Value::Object(details)),
+                extensions: Default::default(),
             });
         }
         _ => {
             if let Some(text) = content {
-                m.content.push(Block::Text { text });
+                m.content.push(Block::from_text(text));
             }
         }
     }

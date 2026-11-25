@@ -182,7 +182,7 @@ pub fn session_load(session: &Session) -> anyhow::Result<Measured> {
     for block in session.messages.iter().flat_map(|message| &message.content) {
         estimated_tokens += est_tokens(block)?;
         bytes += match block {
-            Block::Text { text } | Block::ToolResult { content: text, .. } => text.len(),
+            Block::Text { text, .. } | Block::ToolResult { content: text, .. } => text.len(),
             Block::Thinking { text, signature, .. } => text.len() + signature.as_ref().map_or(0, String::len),
             Block::ToolUse { input, .. } => serde_json::to_string(input.resolve()?.as_ref())?.len(),
             _ => 0,
@@ -1126,7 +1126,7 @@ impl<'a> TranscriptCache<'a> {
                             self.decoded_lens[mi][bi] = Some(inline.len());
                         }
                     }
-                    Block::Text { text } | Block::ToolResult { content: text, .. } => {
+                    Block::Text { text, .. } | Block::ToolResult { content: text, .. } => {
                         if let Some(inline) = text.inline_str() {
                             self.decoded_lens[mi][bi] = Some(inline.len());
                         }
@@ -1148,7 +1148,7 @@ impl<'a> TranscriptCache<'a> {
     }
 
     fn text_block(&mut self, mi: usize, bi: usize) -> anyhow::Result<&str> {
-        let Block::Text { text } = &self.msgs[mi].content[bi] else {
+        let Block::Text { text, .. } = &self.msgs[mi].content[bi] else {
             anyhow::bail!("distill text requested for a non-text block");
         };
         if let Some(inline) = text.inline_str() {
@@ -1236,7 +1236,7 @@ impl<'a> TranscriptCache<'a> {
         for (mi, m) in self.msgs.iter().enumerate() {
             for (bi, block) in m.content.iter().enumerate() {
                 match block {
-                    Block::Text { text } | Block::ToolResult { content: text, .. } => {
+                    Block::Text { text, .. } | Block::ToolResult { content: text, .. } => {
                         if self.decoded_lens[mi][bi].is_none() {
                             if text.is_lazy() {
                                 #[cfg(test)]
@@ -2182,7 +2182,7 @@ pub(crate) fn message_has_inline_cv_seed(m: &Message) -> bool {
     m.content
         .iter()
         .find_map(|b| match b {
-            Block::Text { text } => text.inline_str().filter(|s| !s.trim().is_empty()),
+            Block::Text { text, .. } => text.inline_str().filter(|s| !s.trim().is_empty()),
             _ => None,
         })
         .is_some_and(is_cv_seed_text)
@@ -3477,12 +3477,13 @@ fn resumable_tail(
                                     signature,
                                     encrypted,
                                     redacted,
+                                    extensions: Default::default(),
                                 });
                             }
                         }
                         Block::Text { .. } => {
                             let text = cache.text_block(mi, bi)?.to_string();
-                            content.push(Block::Text { text: text.into() });
+                            content.push(Block::from_text(text.into()));
                         }
                         other => content.push(other),
                     }
@@ -3505,7 +3506,7 @@ fn resumable_tail(
                                 already_clipped[bi] = true;
                             }
                         }
-                        Block::Text { text } => {
+                        Block::Text { text, .. } => {
                             *text = cache.text_block(mi, bi)?.to_string().into();
                         }
                         _ => {}
@@ -3536,7 +3537,7 @@ fn resumable_tail(
                 let mut owned = m.clone();
                 clear_resume_usage(&mut owned);
                 for (bi, b) in owned.content.iter_mut().enumerate() {
-                    if let Block::Text { text } = b {
+                    if let Block::Text { text, .. } = b {
                         *text = cache.text_block(mi, bi)?.to_string().into();
                     }
                 }
@@ -3547,7 +3548,7 @@ fn resumable_tail(
                         if !delivered_tail.insert(body.clone()) {
                             continue;
                         }
-                        owned.content = vec![Block::Text { text: body.into() }];
+                        owned.content = vec![Block::from_text(body.into())];
                     }
                 }
                 out.push(owned);
@@ -3559,7 +3560,7 @@ fn resumable_tail(
                         u.id = m.id.clone();
                         u.parent_id = m.parent_id.clone();
                         u.timestamp = m.timestamp;
-                        u.content.push(Block::Text { text: body.into() });
+                        u.content.push(Block::from_text(body.into()));
                         out.push(u);
                     }
                 }
@@ -3600,7 +3601,7 @@ fn render_prepared_tail(
     for m in tail {
         for b in &m.content {
             match b {
-                Block::Text { text } => {
+                Block::Text { text, .. } => {
                     let who = match (m.role, m.origin) {
                         (Role::Assistant, _) => "agent",
                         (_, Origin::Human) => "user",
@@ -3713,9 +3714,9 @@ fn session_with_tail(session: &Session, d: &Distilled, keep_last: usize, mut tai
         .get(d.tail_start)
         .and_then(|m| m.timestamp)
         .or(session.updated_at);
-    first.content.push(Block::Text {
-        text: format!("{}{}", resume_preamble(d, keep_last), d.head_md).into(),
-    });
+    first.content.push(Block::from_text(
+        format!("{}{}", resume_preamble(d, keep_last), d.head_md).into(),
+    ));
     first
         .cv_extra_mut()
         .insert("seed".into(), Value::Object(seed_meta.clone()));
@@ -3773,7 +3774,7 @@ pub(crate) mod tests {
         m
     }
     fn text(s: &str) -> Block {
-        Block::Text { text: s.into() }
+        Block::from_text(s.into())
     }
     fn call(id: &str, cmd: &str, desc: &str) -> Block {
         Block::ToolUse {
@@ -3781,6 +3782,7 @@ pub(crate) mod tests {
             name: "Bash".into(),
             input: (json!({"command": cmd, "description": desc})).into(),
             namespace: None,
+            extensions: Default::default(),
         }
     }
     fn result(id: &str, out: &str, err: bool) -> Block {
@@ -3791,6 +3793,7 @@ pub(crate) mod tests {
             tool_name: None,
             status: None,
             details: None,
+            extensions: Default::default(),
         }
     }
 
@@ -4053,6 +4056,7 @@ pub(crate) mod tests {
                     name: "manage_task".into(),
                     namespace: None,
                     input: json!({"Action":"status", "TaskId":"session/task-7"}).into(),
+                    extensions: Default::default(),
                 }],
             ),
             msg(
@@ -4097,6 +4101,7 @@ pub(crate) mod tests {
             name: name.into(),
             input: input.into(),
             namespace: None,
+            extensions: Default::default(),
         }
     }
 
@@ -4353,6 +4358,7 @@ body λ",
                 signature: Some("signature".into()),
                 encrypted: None,
                 redacted: false,
+                extensions: Default::default(),
             }],
         ));
         let fixed_time = chrono::DateTime::parse_from_rfc3339("2025-01-01T00:00:00Z")?.with_timezone(&chrono::Utc);
@@ -4386,6 +4392,7 @@ body λ",
                     .filter_map(|b| match b {
                         Block::Text {
                             text: crate::Text::Inline(text),
+                            ..
                         } => Some(text.as_ptr()),
                         _ => None,
                     })
@@ -4401,6 +4408,7 @@ body λ",
                     .filter_map(|b| match b {
                         Block::Text {
                             text: crate::Text::Inline(text),
+                            ..
                         } => Some(text.as_ptr()),
                         _ => None,
                     })
@@ -4479,11 +4487,9 @@ body λ",
             .with_view(|view| view.source_text())?
             .unwrap();
         let mut source = Session::new("guarded", Harness::Claude);
-        source.messages.push(msg(
-            Role::User,
-            MessageKind::Prompt,
-            vec![Block::Text { text: guarded }],
-        ));
+        source
+            .messages
+            .push(msg(Role::User, MessageKind::Prompt, vec![Block::from_text(guarded)]));
         std::fs::write(&path, b"changed")?;
         assert!(prepare_distill(&source, &opts).is_err());
         assert!(prepare_distill(&source, &opts).is_err());
@@ -4543,6 +4549,7 @@ facts text",
                     name: "Write".into(),
                     input: crate::Json::source(&input_path, 0, bytes.len() as u64)?,
                     namespace: None,
+                    extensions: Default::default(),
                 }],
             ),
         );
@@ -4577,6 +4584,7 @@ facts text",
                 signature: None,
                 encrypted: None,
                 redacted: false,
+                extensions: Default::default(),
             },
         );
         let mut frozen = Frozen::new("distill-complete-demand");
@@ -4656,14 +4664,12 @@ facts text",
             source.messages.push(msg(
                 Role::Assistant,
                 MessageKind::Reply,
-                vec![Block::Text {
-                    text: crate::Text::Span(crate::Span {
-                        source: Some(path.clone()),
-                        offset: 1,
-                        len: body.map_or(20, str::len) as u64,
-                        escaped: true,
-                    }),
-                }],
+                vec![Block::from_text(crate::Text::Span(crate::Span {
+                    source: Some(path.clone()),
+                    offset: 1,
+                    len: body.map_or(20, str::len) as u64,
+                    escaped: true,
+                }))],
             ));
             if body.is_none_or(|body| body.starts_with("malformed")) {
                 assert!(prepare_distill(&source, &opts).is_err());
@@ -4738,6 +4744,7 @@ facts text",
                         name: "Write".into(),
                         input: source,
                         namespace: None,
+                        extensions: Default::default(),
                     }],
                 ),
                 msg(
@@ -4778,7 +4785,9 @@ facts text",
             for (bi, block) in message.content.iter_mut().enumerate() {
                 let path = world.base.join(format!("{mi}-{bi}.json"));
                 match block {
-                    Block::Text { text } | Block::Thinking { text, .. } | Block::ToolResult { content: text, .. } => {
+                    Block::Text { text, .. }
+                    | Block::Thinking { text, .. }
+                    | Block::ToolResult { content: text, .. } => {
                         let bytes = serde_json::to_vec(text.inline_str().unwrap())?;
                         std::fs::write(&path, &bytes)?;
                         *text = crate::Json::source(&path, 0, bytes.len() as u64)?
@@ -4810,6 +4819,7 @@ facts text",
                     signature: None,
                     encrypted: None,
                     redacted: false,
+                    extensions: Default::default(),
                 }],
             ));
         }
@@ -4834,14 +4844,12 @@ facts text",
         source.messages.push(msg(
             Role::Assistant,
             MessageKind::Reply,
-            vec![Block::Text {
-                text: crate::Text::Span(crate::Span {
-                    source: Some(span_path),
-                    offset: 1,
-                    len: 17,
-                    escaped: false,
-                }),
-            }],
+            vec![Block::from_text(crate::Text::Span(crate::Span {
+                source: Some(span_path),
+                offset: 1,
+                len: 17,
+                escaped: false,
+            }))],
         ));
         let actual = findings(&source, &options)?;
         assert!(actual.contains("legacy span reply"));
@@ -4861,6 +4869,7 @@ facts text",
                 signature: None,
                 encrypted: None,
                 redacted: false,
+                extensions: Default::default(),
             }],
         ));
         assert!(findings(&wrong, &options).is_err());
@@ -5168,6 +5177,7 @@ facts text",
             name: "Write".into(),
             input: json!({"file_path": path, "content": content}).into(),
             namespace: None,
+            extensions: Default::default(),
         };
         let shell_msg = format!(
             "cat > /s/msg/e1.txt <<'EOF'\nedge: the shell subject\n\n{reasons}\n\nCo-Authored-By: A <a@b>\nEOF\n\
@@ -5301,12 +5311,14 @@ facts text",
             name: "Write".into(),
             input: json!({"file_path": path, "content": content}).into(),
             namespace: None,
+            extensions: Default::default(),
         };
         let send = |id: &str, message: &str| Block::ToolUse {
             id: id.into(),
             name: "SendMessage".into(),
             input: json!({"to": "main", "message": message}).into(),
             namespace: None,
+            extensions: Default::default(),
         };
         let turn = |blocks: Vec<Block>| msg(Role::Assistant, MessageKind::Reply, blocks);
         let ok = |id: &str| msg(Role::Tool, MessageKind::ToolResult, vec![result(id, "ok", false)]);
@@ -5673,6 +5685,7 @@ facts text",
                     signature: None,
                     encrypted: None,
                     redacted: false,
+                    extensions: Default::default(),
                 },
             ],
         ));
@@ -5720,6 +5733,7 @@ facts text",
                     name: "exec".into(),
                     input: json!("await tools.exec_command({ cmd: \"cat /srv/repo/SPEC.md\" });").into(),
                     namespace: None,
+                    extensions: Default::default(),
                 }],
             ),
             msg(
@@ -5735,6 +5749,7 @@ facts text",
                     name: "exec".into(),
                     input: script_source,
                     namespace: None,
+                    extensions: Default::default(),
                 }],
             ),
             msg(
@@ -5754,6 +5769,7 @@ facts text",
                     name: "collaboration:spawn_agent".into(),
                     input: json!({"task_name": "/root/verifier", "message": "Verify corpus summaries"}).into(),
                     namespace: Some("collaboration".into()),
+                    extensions: Default::default(),
                 }],
             ),
             msg(
@@ -5777,6 +5793,7 @@ facts text",
                     })
                     .into(),
                     namespace: Some("collaboration".into()),
+                    extensions: Default::default(),
                 }],
             ),
             msg(Role::Tool, MessageKind::ToolResult, vec![result("sm1", "sent", false)]),
@@ -5788,6 +5805,7 @@ facts text",
                     name: "exec_command".into(),
                     input: json!({"cmd": "git commit -m 'tools: unify'"}).into(),
                     namespace: None,
+                    extensions: Default::default(),
                 }],
             ),
             msg(
@@ -5807,6 +5825,7 @@ facts text",
                     name: "exec".into(),
                     input: json!("await tools.exec_command({ cmd: \"git status -s\" });").into(),
                     namespace: None,
+                    extensions: Default::default(),
                 }],
             ),
             msg(
@@ -5916,6 +5935,7 @@ facts text",
                     name: "read_file".into(),
                     input: json!({"Path": "/srv/ag/README.md"}).into(),
                     namespace: None,
+                    extensions: Default::default(),
                 }],
             ),
             msg(
@@ -5932,18 +5952,21 @@ facts text",
                         name: "write_file".into(),
                         input: write_code_src,
                         namespace: None,
+                        extensions: Default::default(),
                     },
                     Block::ToolUse {
                         id: "ed1".into(),
                         name: "edit_file".into(),
                         input: edit_src,
                         namespace: None,
+                        extensions: Default::default(),
                     },
                     Block::ToolUse {
                         id: "ws1".into(),
                         name: "write_file".into(),
                         input: state_src,
                         namespace: None,
+                        extensions: Default::default(),
                     },
                 ],
             ),
@@ -5968,6 +5991,7 @@ facts text",
                     })
                     .into(),
                     namespace: None,
+                    extensions: Default::default(),
                 }],
             ),
             msg(
@@ -5984,6 +6008,7 @@ facts text",
                         name: "invoke_subagent".into(),
                         input: json!({"Role": "Corpus Auditor", "Prompt": "Check golden summaries"}).into(),
                         namespace: None,
+                        extensions: Default::default(),
                     },
                     Block::ToolUse {
                         id: "msg1".into(),
@@ -5994,6 +6019,7 @@ facts text",
                         })
                         .into(),
                         namespace: None,
+                        extensions: Default::default(),
                     },
                 ],
             ),
@@ -6070,9 +6096,10 @@ facts text",
             msg(
                 Role::User,
                 MessageKind::Prompt,
-                vec![Block::Text {
-                    text: make_source_text("prompt.json", &format!("Inspect /srv/app/main.rs.{pad}"))?,
-                }],
+                vec![Block::from_text(make_source_text(
+                    "prompt.json",
+                    &format!("Inspect /srv/app/main.rs.{pad}"),
+                )?)],
             ),
             msg(
                 Role::Assistant,
@@ -6083,10 +6110,12 @@ facts text",
                         signature: None,
                         encrypted: None,
                         redacted: false,
+                        extensions: Default::default(),
                     },
-                    Block::Text {
-                        text: make_source_text("prose.json", &format!("Decided: decode each lazy block once.\n{pad}"))?,
-                    },
+                    Block::from_text(make_source_text(
+                        "prose.json",
+                        &format!("Decided: decode each lazy block once.\n{pad}"),
+                    )?),
                     call("b1", "cargo test", "Run tests"),
                 ],
             ),
@@ -6100,6 +6129,7 @@ facts text",
                     tool_name: None,
                     status: None,
                     details: None,
+                    extensions: Default::default(),
                 }],
             ),
             msg(
@@ -6111,6 +6141,7 @@ facts text",
                         signature: None,
                         encrypted: None,
                         redacted: false,
+                        extensions: Default::default(),
                     },
                     call("b2", "git status -s", "Status"),
                 ],
@@ -6125,6 +6156,7 @@ facts text",
                     tool_name: None,
                     status: None,
                     details: None,
+                    extensions: Default::default(),
                 }],
             ),
         ];
@@ -6217,6 +6249,7 @@ facts text",
                     name: "Edit".into(),
                     input: json!({"file_path": path_str}).into(),
                     namespace: None,
+                    extensions: Default::default(),
                 }],
             ),
             msg(Role::Tool, MessageKind::ToolResult, vec![result("e1", "ok", false)]),
@@ -6318,6 +6351,7 @@ facts text",
                     name: "Read".into(),
                     input: json!({"file_path": "/srv/doc.md"}).into(),
                     namespace: None,
+                    extensions: Default::default(),
                 }],
             ),
             msg(

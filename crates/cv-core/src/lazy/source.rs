@@ -277,13 +277,14 @@ mod tests {
         assert!(suffix.try_decoded_len(&resolver).is_err());
         assert!(suffix.try_resolve_prefix(&resolver, 0).is_err());
         let mut message = crate::ir::Message::new(crate::ir::Role::Assistant);
-        message.content.push(crate::ir::Block::Text { text: suffix });
+        message.content.push(crate::ir::Block::from_text(suffix));
         assert!(message.materialize(&resolver).is_err());
         message.materialize_text(&resolver);
         assert!(matches!(
             &message.content[0],
             crate::ir::Block::Text {
-                text: crate::lazy::Text::Source(_)
+                text: crate::lazy::Text::Source(_),
+                ..
             }
         ));
     }

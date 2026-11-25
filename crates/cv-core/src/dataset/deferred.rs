@@ -46,7 +46,7 @@ impl DeferredMessage {
         let mut sources = Vec::new();
         for (index, block) in message.content.iter_mut().enumerate() {
             let text = match &mut *block {
-                Block::Text { text } | Block::Thinking { text, .. } => Some(text),
+                Block::Text { text, .. } | Block::Thinking { text, .. } => Some(text),
                 Block::ToolResult { content, .. } => Some(content),
                 _ => None,
             };
@@ -82,7 +82,7 @@ impl DeferredMessage {
                 }
                 Block::Image { data_ref, .. } => *data_ref = None,
                 Block::File { source, .. } => *source = None,
-                Block::Text { .. } => {}
+                Block::Text { .. } | Block::Opaque { .. } => {}
             }
         }
         Self { message, sources }
@@ -112,7 +112,7 @@ impl DeferredMessage {
                 }
                 SourceSlot::Text { skip, .. } => {
                     let text = match block {
-                        Block::Text { text } | Block::Thinking { text, .. } => text,
+                        Block::Text { text, .. } | Block::Thinking { text, .. } => text,
                         Block::ToolResult { content, .. } => content,
                         _ => anyhow::bail!("invalid staged text block type"),
                     };
@@ -172,7 +172,7 @@ impl Record for DeferredMessage {
                 .content
                 .iter()
                 .map(|block| match block {
-                    Block::Text { text } | Block::Thinking { text, .. } => text_heap(text),
+                    Block::Text { text, .. } | Block::Thinking { text, .. } => text_heap(text),
                     Block::ToolUse { id, name, input, .. } => {
                         id.capacity()
                             + name.capacity()
@@ -187,6 +187,7 @@ impl Record for DeferredMessage {
                         tool_name,
                         ..
                     } => tool_use_id.capacity() + tool_name.as_ref().map_or(0, String::capacity) + text_heap(content),
+                    Block::Opaque { value, block_type } => value_heap(value) + block_type.capacity(),
                     Block::Image { media_type, .. } => media_type.as_ref().map_or(0, String::capacity),
                     Block::File { path, mime, .. } => {
                         path.as_ref().map_or(0, String::capacity) + mime.as_ref().map_or(0, String::capacity)
@@ -275,7 +276,7 @@ mod tests {
             .with_skipped_prefix(8)
             .unwrap();
         let mut original = Message::new(Role::Assistant);
-        original.content.push(Block::Text { text });
+        original.content.push(Block::from_text(text));
         let mut registry = SourceRegistry::default();
         let mut ordered = crate::spill::Ordered::default();
         for _ in 0..1000 {
@@ -290,7 +291,7 @@ mod tests {
         drop(backing);
         let resolver = crate::lazy::Resolver::new(None);
         let mut owned = Message::new(Role::Assistant);
-        owned.content.push(Block::Text { text: body[8..].into() });
+        owned.content.push(Block::from_text(body[8..].into()));
         let mut expected = Vec::new();
         let mut writer = RecordWriter::new(&mut expected, Format::Chatml, None);
         writer.message(&owned, &resolver).unwrap();
@@ -301,7 +302,8 @@ mod tests {
             assert!(matches!(
                 &restored.content[0],
                 Block::Text {
-                    text: crate::lazy::Text::Source(_)
+                    text: crate::lazy::Text::Source(_),
+                    ..
                 }
             ));
             if index != 0 && index != 999 {
@@ -341,6 +343,7 @@ mod tests {
             name: "Tool".into(),
             namespace: None,
             input: Json::source(&path, 0, body.len() as u64).unwrap(),
+            extensions: Default::default(),
         });
         let mut registry = SourceRegistry::default();
         let mut ordered = crate::spill::Ordered::default();
@@ -382,9 +385,7 @@ mod tests {
             let mut bytes = Vec::new();
             for size in [3, 65530, 100000, 7] {
                 let mut message = Message::new(Role::User);
-                message.content.push(Block::Text {
-                    text: "a\n\"🌙".repeat(size).into(),
-                });
+                message.content.push(Block::from_text("a\n\"🌙".repeat(size).into()));
                 DeferredMessage::stage(message, &mut SourceRegistry::default())
                     .write(&mut bytes)
                     .unwrap();
@@ -396,7 +397,7 @@ mod tests {
                     .unwrap()
                     .restore(&SourceRegistry::default())
                     .unwrap();
-                let Block::Text { text } = &message.content[0] else {
+                let Block::Text { text, .. } = &message.content[0] else {
                     panic!("text")
                 };
                 assert_eq!(text.inline_str(), Some("a\n\"🌙".repeat(size).as_str()));
@@ -417,6 +418,7 @@ mod tests {
             name: "Tool".into(),
             namespace: None,
             input: Json::source(&path, 0, 4).unwrap(),
+            extensions: Default::default(),
         });
         let mut registry = SourceRegistry::default();
         let staged = DeferredMessage::stage(message, &mut registry);

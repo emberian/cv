@@ -1,5 +1,7 @@
 //! Bounded text projections shared by search and API consumers.
 mod json_frames;
+#[cfg(feature = "sqlite")]
+pub(crate) use json_frames::write_frame_with;
 mod json_string;
 mod string;
 use crate::ir::truncate;
@@ -250,7 +252,7 @@ pub fn searchable(
             break;
         }
         match block {
-            crate::Block::Text { text }
+            crate::Block::Text { text, .. }
             | crate::Block::Thinking { text, .. }
             | crate::Block::ToolResult { content: text, .. } => {
                 out.text(text, resolver, check)?;
@@ -268,7 +270,7 @@ pub fn searchable(
                     out.str("\n");
                 }
             }
-            crate::Block::Image { .. } => {}
+            crate::Block::Image { .. } | crate::Block::Opaque { .. } => {}
         }
         if !out.full() {
             out.after_block(block)?;
@@ -403,20 +405,20 @@ mod tests {
     fn checked_searchable_projection_matches_owned_text_and_interrupts_chunks() {
         let mut message = crate::Message::new(crate::Role::Assistant);
         message.content = vec![
-            crate::Block::Text {
-                text: "λ ordinary\n".into(),
-            },
+            crate::Block::from_text("λ ordinary\n".into()),
             crate::Block::Thinking {
                 text: "thinking".into(),
                 signature: None,
                 encrypted: None,
                 redacted: false,
+                extensions: Default::default(),
             },
             crate::Block::ToolUse {
                 id: "call".into(),
                 name: "tool".into(),
                 input: serde_json::json!({"z":"λ", "a":2}).into(),
                 namespace: None,
+                extensions: Default::default(),
             },
             crate::Block::ToolResult {
                 tool_use_id: "call".into(),
@@ -425,6 +427,7 @@ mod tests {
                 tool_name: None,
                 details: None,
                 status: None,
+                extensions: Default::default(),
             },
         ];
         let mut expected = String::new();
@@ -433,9 +436,7 @@ mod tests {
             searchable_text_checked(&message, &Resolver::new(None), || Ok(())).unwrap(),
             expected
         );
-        message.content = vec![crate::Block::Text {
-            text: "λ".repeat(32 * 1024).into(),
-        }];
+        message.content = vec![crate::Block::from_text("λ".repeat(32 * 1024).into())];
         let mut checks = 0;
         let error = searchable_text_checked(&message, &Resolver::new(None), || {
             checks += 1;
@@ -465,7 +466,7 @@ mod tests {
         let resolver = Resolver::new(None);
         for body in [span, retained] {
             let mut message = crate::Message::new(crate::Role::Assistant);
-            message.content.push(crate::Block::Text { text: body });
+            message.content.push(crate::Block::from_text(body));
             let oracle = format!("{text}\n");
             for cap in [0, 1, 2, 3, 4, 7, 16000, oracle.len(), oracle.len() + 4] {
                 let (actual, truncated) = searchable_prefix(&message, &resolver, cap).unwrap();
@@ -484,14 +485,13 @@ mod tests {
     fn searchable_prefix_matches_owned_projection_at_every_unicode_boundary() {
         let mut message = crate::Message::new(crate::Role::Assistant);
         message.content = vec![
-            crate::Block::Text {
-                text: "月🌙é\n".into()
-            },
+            crate::Block::from_text("月🌙é\n".into()),
             crate::Block::ToolUse {
                 id: "c".into(),
                 name: "tool".into(),
                 input: serde_json::json!({"z":"🌙\n\"\\", "a":2}).into(),
                 namespace: None,
+                extensions: Default::default(),
             },
             crate::Block::ToolResult {
                 tool_use_id: "c".into(),
@@ -500,6 +500,7 @@ mod tests {
                 is_error: false,
                 details: None,
                 status: None,
+                extensions: Default::default(),
             },
         ];
         let mut oracle = String::new();

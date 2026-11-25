@@ -589,6 +589,7 @@ pub fn rewrap_deferred(wrapper: DeferredWrapper, b: &Block) -> Result<Option<Blo
             name,
             input,
             namespace: Some(ns),
+            ..
         } if ns == DEFERRED => {
             let DeferredWrapper { name_key, args_key } = wrapper;
             let mut wrapped = serde_json::Map::new();
@@ -599,6 +600,7 @@ pub fn rewrap_deferred(wrapper: DeferredWrapper, b: &Block) -> Result<Option<Blo
                 name: DEFERRED.to_string(),
                 input: Json::Owned(Value::Object(wrapped)),
                 namespace: None,
+                extensions: Default::default(),
             })
         }
         _ => None,
@@ -1101,7 +1103,7 @@ fn record(h: Harness, m: &Message, resolver: &crate::lazy::Resolver) -> Result<O
         return Ok(None);
     };
     let text = match m.content.first() {
-        Some(Block::Text { text }) => Some(text),
+        Some(Block::Text { text, .. }) => Some(text),
         _ => None,
     };
     adapter.record_affordance(m, &FirstText { text, resolver })
@@ -1113,7 +1115,7 @@ fn text_head(m: &Message, resolver: &crate::lazy::Resolver) -> Result<String> {
     m.content
         .iter()
         .find_map(|b| match b {
-            Block::Text { text } => Some(text),
+            Block::Text { text, .. } => Some(text),
             Block::ToolResult { content, .. } => Some(content),
             _ => None,
         })
@@ -1727,6 +1729,7 @@ mod tests {
             name: "new_task".into(),
             input: json!({}).into(),
             namespace: None,
+            extensions: Default::default(),
         });
         let mut mixed = Message::new(Role::User);
         mixed.content = vec![
@@ -1737,10 +1740,9 @@ mod tests {
                 tool_name: None,
                 status: None,
                 details: None,
+                extensions: Default::default(),
             },
-            Block::Text {
-                text: "environment metadata".into(),
-            },
+            Block::from_text("environment metadata".into()),
         ];
         let mut open = std::collections::HashMap::new();
         refine_spawn(Harness::Roo, &mut call, &mut open)?;
@@ -1765,9 +1767,9 @@ mod tests {
     #[test]
     fn leftovers_claude_slash_skill_body_is_not_a_second_tool_activation() -> Result<()> {
         let mut body = Message::of_kind(Role::User, MessageKind::InjectedContext, Origin::Harness);
-        body.content.push(Block::Text {
-            text: "Base directory for this skill: /skills/test\n\nDo the task".into(),
-        });
+        body.content.push(Block::from_text(
+            "Base directory for this skill: /skills/test\n\nDo the task".into(),
+        ));
         let resolver = crate::lazy::Resolver::new(None);
         assert_eq!(message_rows(Harness::Claude, &body, 0, &resolver)?[0].kind, Kind::Skill);
         body.harness_extra_mut(Harness::Claude)
@@ -1823,6 +1825,7 @@ mod tests {
                     name: "TodoWrite".into(),
                     namespace: None,
                     input: json!({"todos":[{"content":"preserve fidelity", "status":"pending"}]}).into(),
+                    extensions: Default::default(),
                 });
                 sink.message(call);
                 let mut hook = Message::new(Role::System);
@@ -1837,7 +1840,7 @@ mod tests {
                 } else {
                     serde_json::from_str::<String>(&std::fs::read_to_string(&self.text_path)?)?.into()
                 };
-                hook.content.push(Block::Text { text });
+                hook.content.push(Block::from_text(text));
                 sink.message(hook);
                 sink.message(result("denied", "Permission to use Bash has been denied", true, None));
                 sink.message(result(
@@ -1950,7 +1953,7 @@ mod tests {
                 match case {
                     0 => {
                         message.kind = MessageKind::InjectedContext;
-                        message.content.push(Block::Text { text });
+                        message.content.push(Block::from_text(text));
                     }
                     1 => message.content.push(Block::ToolResult {
                         tool_use_id: "call".into(),
@@ -1959,10 +1962,11 @@ mod tests {
                         is_error: true,
                         status: None,
                         details: None,
+                        extensions: Default::default(),
                     }),
                     _ => {
                         message.kind = MessageKind::SubagentReturn;
-                        message.content.push(Block::Text { text });
+                        message.content.push(Block::from_text(text));
                     }
                 }
                 message
@@ -2013,6 +2017,7 @@ mod tests {
                     name: "TodoWrite".into(),
                     namespace: None,
                     input,
+                    extensions: Default::default(),
                 });
                 session.messages.push(message);
                 session
@@ -2048,6 +2053,7 @@ mod tests {
             name: DEFERRED.into(),
             namespace: None,
             input: source.clone(),
+            extensions: Default::default(),
         };
         unwrap_deferred(NAME_ARGUMENTS, &mut block).unwrap();
         let Block::ToolUse {
@@ -2077,6 +2083,7 @@ mod tests {
             name: DEFERRED.into(),
             namespace: None,
             input: source,
+            extensions: Default::default(),
         });
         assert_eq!(sink.message(message), Flow::Stop);
         assert!(sink.take_error().is_some());
@@ -2228,6 +2235,7 @@ mod tests {
                 name: DEFERRED.into(),
                 input: wrapped.clone().into(),
                 namespace: None,
+                extensions: Default::default(),
             };
             let mut b = orig.clone();
             unwrap_deferred(wrapper, &mut b).unwrap();
@@ -2334,36 +2342,42 @@ mod tests {
                     ]
                 })
                 .into(),
+                extensions: Default::default(),
             },
             Block::ToolUse {
                 id: "sc1".into(),
                 name: "schedule".into(),
                 namespace: None,
                 input: json!({"DurationSeconds": 60, "Prompt": "Poll watcher"}).into(),
+                extensions: Default::default(),
             },
             Block::ToolUse {
                 id: "mt1".into(),
                 name: "manage_task".into(),
                 namespace: None,
                 input: json!({"Action": "list"}).into(),
+                extensions: Default::default(),
             },
             Block::ToolUse {
                 id: "mt2".into(),
                 name: "manage_task".into(),
                 namespace: None,
                 input: json!({"Action": "kill", "TaskId": "agy-aff/task-4"}).into(),
+                extensions: Default::default(),
             },
             Block::ToolUse {
                 id: "cs1".into(),
                 name: "command_status".into(),
                 namespace: None,
                 input: json!({"CommandId": "cmd-42"}).into(),
+                extensions: Default::default(),
             },
             Block::ToolUse {
                 id: "sci1".into(),
                 name: "send_command_input".into(),
                 namespace: None,
                 input: json!({"CommandId": "cmd-42", "Terminate": true}).into(),
+                extensions: Default::default(),
             },
         ];
         s.messages.push(m);
@@ -2391,6 +2405,7 @@ mod tests {
             tool_name: Some("Bash".into()),
             status: None,
             details,
+            extensions: Default::default(),
         });
         m
     }
@@ -2519,6 +2534,7 @@ mod tests {
                     name: "subagent".into(),
                     input: serde_json::json!({}).into(),
                     namespace: None,
+                    extensions: Default::default(),
                 });
                 sink.try_message(call).unwrap();
                 let mut result = Message::of_kind(Role::Tool, MessageKind::ToolResult, Origin::Harness);
@@ -2529,6 +2545,7 @@ mod tests {
                     tool_name: Some("subagent".into()),
                     status: None,
                     details: None,
+                    extensions: Default::default(),
                 });
                 sink.try_message(result).unwrap();
                 drop(sink);
@@ -2565,6 +2582,7 @@ mod tests {
                 name: "delegate_task".into(),
                 input: json!({}).into(),
                 namespace: None,
+                extensions: Default::default(),
             });
             sink.message(reply);
             let mut res = Message::new(Role::Tool);
@@ -2575,6 +2593,7 @@ mod tests {
                 tool_name: None,
                 status: None,
                 details: None,
+                extensions: Default::default(),
             });
             sink.message(res);
         }
@@ -2642,6 +2661,7 @@ mod tests {
                  await tools.write_stdin({ session_id: 99, chars: '' });"
             )
             .into(),
+            extensions: Default::default(),
         });
         s.messages.push(m);
         let rows = of_session(&s).unwrap();

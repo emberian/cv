@@ -94,7 +94,7 @@ fn chatgpt_tool_call_and_image() {
     assert!(m2
         .content
         .iter()
-        .any(|b| matches!(b, Block::Text { text } if text.to_string().contains("see image"))));
+        .any(|b| matches!(b, Block::Text { text , .. } if text.to_string().contains("see image"))));
 }
 
 #[test]
@@ -345,7 +345,8 @@ fn account_archive_full_output_oracle(payload_bytes: usize) {
                 actual.messages[1].content.iter().any(|block| matches!(
                     block,
                     Block::Text {
-                        text: crate::lazy::Text::Span(_) | crate::lazy::Text::Source(_)
+                        text: crate::lazy::Text::Span(_) | crate::lazy::Text::Source(_),
+                        ..
                     }
                 )),
                 opts.spans,
@@ -609,7 +610,8 @@ fn multipart_chatgpt_read_keeps_lazy_payloads_and_breaks_parent_cycles() -> Resu
         actual.messages.iter().all(|m| matches!(
             &m.content[0],
             Block::Text {
-                text: crate::Text::Source(_)
+                text: crate::Text::Source(_),
+                ..
             }
         )),
         "joined ordinary bodies remain checked backing"

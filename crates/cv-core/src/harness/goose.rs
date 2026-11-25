@@ -1177,7 +1177,7 @@ mod tests {
         assert!(
             matches!(&a.content[0], Block::Thinking { text, signature, .. } if text.matches_str("let me think") == Some(true) && signature.as_deref() == Some("sig"))
         );
-        assert!(matches!(&a.content[1], Block::Text { text } if text.matches_str("Working on it") == Some(true)));
+        assert!(matches!(&a.content[1], Block::Text { text , .. } if text.matches_str("Working on it") == Some(true)));
         assert!(
             matches!(&a.content[2], Block::ToolUse { name, id, input , ..} if name == "shell" && id == "call_1" && input.resolve().unwrap().get("command").and_then(Value::as_str) == Some("ls"))
         );
@@ -1292,7 +1292,7 @@ mod tests {
         assert_eq!(last.role, Role::Assistant);
         assert_eq!(last.kind, MessageKind::Reply);
         assert!(
-            matches!(&last.content[0], Block::Text { text } if text.starts_with("Maximum retry attempts (1) exceeded"))
+            matches!(&last.content[0], Block::Text { text , .. } if text.starts_with("Maximum retry attempts (1) exceeded"))
         );
         assert_nested_extra(&s);
         // The dead-endpoint session recorded no assistant row at all.
@@ -1612,9 +1612,9 @@ mod tests {
         assert_eq!(bag(m)["error"]["message"], "Maximum retry attempts (3) exceeded.");
         assert_eq!(m.content.len(), 2, "neither block is dropped");
         assert!(
-            matches!(&m.content[0], Block::Text { text } if text.matches_str("[error: contextLengthExceeded] Maximum retry attempts (3) exceeded.") == Some(true))
+            matches!(&m.content[0], Block::Text { text , .. } if text.matches_str("[error: contextLengthExceeded] Maximum retry attempts (3) exceeded.") == Some(true))
         );
-        assert!(matches!(&m.content[1], Block::File { mime, path, source }
+        assert!(matches!(&m.content[1], Block::File { mime, path, source , .. }
                 if mime.as_deref() == Some("application/pdf") && path.as_deref() == Some("q3-report.pdf") && source.as_deref() == Some("base64:inline")));
         assert_nested_extra(&s);
     }
@@ -2158,7 +2158,8 @@ mod tests {
         assert!(matches!(
             &m.content[0],
             Block::Text {
-                text: crate::lazy::Text::Source(_)
+                text: crate::lazy::Text::Source(_),
+                ..
             }
         ));
         assert!(matches!(

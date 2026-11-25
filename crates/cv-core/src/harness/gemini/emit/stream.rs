@@ -22,7 +22,10 @@ fn parts(writer: &mut dyn Write, message: &Message, fates: &[ThinkingFate], reso
     writer.write_all(b"[")?;
     let mut first = true;
     for (block, &projection) in message.content.iter().zip(fates) {
-        if matches!(block, Block::ToolUse { .. } | Block::ToolResult { .. }) {
+        if matches!(
+            block,
+            Block::Opaque { .. } | Block::ToolUse { .. } | Block::ToolResult { .. }
+        ) {
             continue;
         }
         if projection == ThinkingFate::Drop {
@@ -34,12 +37,13 @@ fn parts(writer: &mut dyn Write, message: &Message, fates: &[ThinkingFate], reso
         first = false;
         let mut object = ObjectWriter::new(writer)?;
         match block {
-            Block::Text { text } => genai::text_fields(&mut object, text, false, None, resolver)?,
+            Block::Text { text, .. } => genai::text_fields(&mut object, text, false, None, resolver)?,
             Block::Thinking {
                 text,
                 signature,
                 encrypted,
                 redacted,
+                ..
             } => {
                 if projection == ThinkingFate::Placeholder {
                     object.field(
@@ -50,13 +54,13 @@ fn parts(writer: &mut dyn Write, message: &Message, fates: &[ThinkingFate], reso
                     genai::text_fields(&mut object, text, projection == ThinkingFate::Keep, None, resolver)?;
                 }
             }
-            Block::Image { media_type, data_ref } => {
-                genai::image_fields(&mut object, media_type.as_deref(), data_ref.as_deref())?
-            }
-            Block::File { mime, path, source } => {
+            Block::Image {
+                media_type, data_ref, ..
+            } => genai::image_fields(&mut object, media_type.as_deref(), data_ref.as_deref())?,
+            Block::File { mime, path, source, .. } => {
                 genai::file_fields(&mut object, mime.as_deref(), path.as_deref(), source.as_deref())?
             }
-            Block::ToolUse { .. } | Block::ToolResult { .. } => unreachable!(),
+            Block::Opaque { .. } | Block::ToolUse { .. } | Block::ToolResult { .. } => unreachable!(),
         }
         object.finish()?;
     }

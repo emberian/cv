@@ -77,7 +77,7 @@ struct Out<'s> {
 impl Out<'_> {
     fn deliver(&mut self, m: Message, d: Demand<'_>) -> Result<Flow> {
         let sourced = m.content.iter().any(|b| match b {
-            Block::Text { text } | Block::Thinking { text, .. } | Block::ToolResult { content: text, .. } => {
+            Block::Text { text, .. } | Block::Thinking { text, .. } | Block::ToolResult { content: text, .. } => {
                 matches!(text, Text::Source(_))
             }
             Block::ToolUse { input, .. } => matches!(input, crate::Json::Source(_)),
@@ -135,6 +135,7 @@ fn message(view: JsonView<'_>, d: Demand<'_>, st: &mut EmitState, out: &mut Out<
                             signature: None,
                             encrypted: None,
                             redacted: false,
+                            extensions: Default::default(),
                         });
                     }
                 }
@@ -195,6 +196,7 @@ fn message(view: JsonView<'_>, d: Demand<'_>, st: &mut EmitState, out: &mut Out<
                     name: name.clone(),
                     input,
                     namespace: None,
+                    extensions: Default::default(),
                 });
                 let status = string("status")?;
                 let is_error = status.as_deref().is_some_and(|s| s.eq_ignore_ascii_case("error"));
@@ -219,6 +221,7 @@ fn message(view: JsonView<'_>, d: Demand<'_>, st: &mut EmitState, out: &mut Out<
                         tool_name: Some(name),
                         status,
                         details: None,
+                        extensions: Default::default(),
                     });
                 }
             }
@@ -273,9 +276,8 @@ fn message(view: JsonView<'_>, d: Demand<'_>, st: &mut EmitState, out: &mut Out<
             // message record, so it carries no id or timestamp of its own.
             let target = rec.string("rewindTo")?.unwrap_or_default();
             let mut m = Message::of_kind(Role::System, MessageKind::Branch, Origin::Harness);
-            m.content.push(Block::Text {
-                text: format!("[rewound to {target}]").into(),
-            });
+            m.content
+                .push(Block::from_text(format!("[rewound to {target}]").into()));
             let bag = m.harness_extra_mut(d.harness);
             bag.insert("record_type".into(), Value::String("rewind".into()));
             bag.insert("rewind_to".into(), Value::String(target));
@@ -319,7 +321,7 @@ fn message(view: JsonView<'_>, d: Demand<'_>, st: &mut EmitState, out: &mut Out<
             if m.content.len() > 1 {
                 let (hooked, rest): (Vec<Block>, Vec<Block>) = std::mem::take(&mut m.content)
                     .into_iter()
-                    .partition(|b| matches!(b, Block::Text { text } if d.is_hook(text)));
+                    .partition(|b| matches!(b, Block::Text { text , .. } if d.is_hook(text)));
                 m.content = rest;
                 hook.content = hooked;
                 if m.content.is_empty() {
@@ -381,7 +383,7 @@ fn tokens(v: JsonView<'_>) -> Result<Option<Usage>> {
 pub(super) fn content_blocks(view: JsonView<'_>, d: Demand<'_>, out: &mut Vec<Block>) -> Result<bool> {
     if let Some(text) = view.lazy_text(d.spans())? {
         if !text.is_empty() {
-            out.push(Block::Text { text });
+            out.push(Block::from_text(text));
         }
     } else if let Some(parts) = view.array()? {
         let mut present = false;
@@ -402,7 +404,7 @@ pub(super) fn content_blocks(view: JsonView<'_>, d: Demand<'_>, out: &mut Vec<Bl
 fn part_block(view: JsonView<'_>, d: Demand<'_>, out: &mut Vec<Block>) -> Result<bool> {
     if let Some(text) = view.lazy_text(d.spans())? {
         if !text.is_empty() {
-            out.push(Block::Text { text });
+            out.push(Block::from_text(text));
         }
         return Ok(false);
     }
@@ -420,6 +422,7 @@ fn part_block(view: JsonView<'_>, d: Demand<'_>, out: &mut Vec<Block>) -> Result
                         None => Value::Null.into(),
                     },
                     namespace: None,
+                    extensions: Default::default(),
                 });
             }
         }
@@ -437,6 +440,7 @@ fn part_block(view: JsonView<'_>, d: Demand<'_>, out: &mut Vec<Block>) -> Result
                     tool_name: Some(name),
                     status: None,
                     details: None,
+                    extensions: Default::default(),
                 });
             }
         }
@@ -700,7 +704,7 @@ impl Demand<'_> {
     /// Type a user turn by its text, and take the first real prompt as the fallback title.
     fn user_facts(self, m: &mut Message, st: &mut EmitState) {
         let info = self.inspect(m.content.iter().filter_map(|b| match b {
-            Block::Text { text } => Some(text),
+            Block::Text { text, .. } => Some(text),
             _ => None,
         }));
         type_user_turn_from(m, &info.trimmed);

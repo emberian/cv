@@ -591,7 +591,7 @@ pub(crate) fn record_message_reads(message: &crate::Message, primary: Option<&st
             captured(range.path(), range.dependencies(), primary, reads);
         }
         let text = match block {
-            crate::Block::Text { text } | crate::Block::Thinking { text, .. } => Some(text),
+            crate::Block::Text { text, .. } | crate::Block::Thinking { text, .. } => Some(text),
             crate::Block::ToolResult { content, .. } => Some(content),
             _ => None,
         };

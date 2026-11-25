@@ -111,10 +111,12 @@ fn embedded_v2_attachments_keep_bytes_external_references_report_loss() -> Resul
     user.content.push(Block::Image {
         media_type: Some("image/png".into()),
         data_ref: Some("data:image/png;base64,aGk=".into()),
+        extensions: Default::default(),
     });
     user.content.push(Block::Image {
         media_type: Some("image/png".into()),
         data_ref: Some("https://unavailable.invalid/image.png".into()),
+        extensions: Default::default(),
     });
     session.messages.push(user);
     let (result, report) = crate::emit::emit_report(&session, Harness::OpenCode, &root, &EmitOptions::default())?;
@@ -163,7 +165,7 @@ fn complete_v2_edits_groups_models_and_raw_only_sources_are_guarded() -> Result<
             let mut edited = baseline.clone();
             match case {
                 "text" => {
-                    if let Some(Block::Text { text }) = edited
+                    if let Some(Block::Text { text, .. }) = edited
                         .messages
                         .iter_mut()
                         .filter(|m| m.role == Role::User)

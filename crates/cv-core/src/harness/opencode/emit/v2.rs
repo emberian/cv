@@ -290,7 +290,7 @@ pub(super) fn write_database(
                     let mut values = Vec::new();
                     for block in &msg.content {
                         match block {
-                            Block::Text { text } => values.push(Cow::Borrowed(text)),
+                            Block::Text { text, .. } => values.push(Cow::Borrowed(text)),
                             Block::Thinking { .. } => {
                                 let fate = thinking::fate(block, Harness::OpenCode, opts.thinking, &resolver)?;
                                 if let Some(text) = thinking::text_with_fate(block, fate) {
@@ -302,15 +302,13 @@ pub(super) fn write_database(
                     }
                     for block in &msg.content {
                         let unavailable = match block {
-                            Block::Image { media_type, data_ref }
-                                if attachment(media_type.as_deref(), data_ref.as_deref()).is_none() =>
-                            {
-                                Some(format!(
-                                    "[Image attachment unavailable: {}]",
-                                    data_ref.as_deref().unwrap_or("no embedded data")
-                                ))
-                            }
-                            Block::File { mime, path, source }
+                            Block::Image {
+                                media_type, data_ref, ..
+                            } if attachment(media_type.as_deref(), data_ref.as_deref()).is_none() => Some(format!(
+                                "[Image attachment unavailable: {}]",
+                                data_ref.as_deref().unwrap_or("no embedded data")
+                            )),
+                            Block::File { mime, path, source, .. }
                                 if attachment(mime.as_deref(), source.as_deref().or(path.as_deref())).is_none() =>
                             {
                                 Some(format!(
@@ -333,8 +331,10 @@ pub(super) fn write_database(
                     .content
                     .iter()
                     .filter_map(|b| match b {
-                        Block::Image { media_type, data_ref } => attachment(media_type.as_deref(), data_ref.as_deref()),
-                        Block::File { mime, path, source } => {
+                        Block::Image {
+                            media_type, data_ref, ..
+                        } => attachment(media_type.as_deref(), data_ref.as_deref()),
+                        Block::File { mime, path, source, .. } => {
                             attachment(mime.as_deref(), source.as_deref().or(path.as_deref()))
                         }
                         _ => None,
@@ -408,7 +408,7 @@ fn write_replayed_view(
             return Ok(());
         }
         if key == "text" && matches!(ty, "user") {
-            if let Some(Block::Text { text }) = primary.content.first() {
+            if let Some(Block::Text { text, .. }) = primary.content.first() {
                 out.field_with(key, |w| write::text(w, text, resolver))?;
             } else {
                 out.field_with(key, |mut w| value.write_canonical(&mut w))?;
@@ -598,6 +598,7 @@ fn assistant_content(
     for block in &msg.content {
         let fate = thinking::fate(block, Harness::OpenCode, opts.thinking, resolver)?;
         if fate == ThinkingFate::Drop
+            || matches!(block, Block::Opaque { .. })
             || matches!(block,Block::ToolResult{tool_use_id,..} if called.contains(tool_use_id.as_str()))
         {
             continue;
@@ -608,7 +609,7 @@ fn assistant_content(
         first = false;
         let mut item = ObjectWriter::new(w)?;
         match block {
-            Block::Text { text } => {
+            Block::Text { text, .. } => {
                 item.field("type", "text")?;
                 item.field_with("text", |w| write::text(w, text, resolver))?;
             }
@@ -641,6 +642,7 @@ fn assistant_content(
                 tool_metadata(&mut item, Some(block), ts)?;
                 item.field_with("state", |w| tool_state(w, None, Some(block), resolver))?;
             }
+            Block::Opaque { .. } => unreachable!("opaque blocks filtered before publication"),
             // Native assistant content has no file variant. Preserve a visible URI as text.
             Block::Image { data_ref, .. } => {
                 item.field("type", "text")?;
@@ -784,10 +786,8 @@ mod tests {
         s.model = Some("fixture-model".into());
         s.title = Some("cv native v2 compatibility".into());
         let mut user = Message::new(Role::User);
-        user.content.push(Block::Text {
-            text: "fixture prompt".into(),
-        });
-        user.content.push(Block::Image{media_type:Some("image/png".into()),data_ref:Some("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==".into())});
+        user.content.push(Block::from_text("fixture prompt".into()));
+        user.content.push(Block::Image{media_type:Some("image/png".into()),data_ref:Some("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==".into()), extensions: Default::default(), });
         s.messages.push(user);
         let mut assistant = Message::new(Role::Assistant);
         assistant.content.push(Block::Thinking {
@@ -795,16 +795,16 @@ mod tests {
             signature: Some("fixture-signature".into()),
             encrypted: None,
             redacted: false,
+            extensions: Default::default(),
         });
         assistant.content.push(Block::ToolUse {
             id: "fixture-tool".into(),
             name: "bash".into(),
             input: json!({"command":"printf fixture"}).into(),
             namespace: None,
+            extensions: Default::default(),
         });
-        assistant.content.push(Block::Text {
-            text: "fixture answer".into(),
-        });
+        assistant.content.push(Block::from_text("fixture answer".into()));
         s.messages.push(assistant);
         let mut result = Message::new(Role::Tool);
         result.content.push(Block::ToolResult {
@@ -814,14 +814,15 @@ mod tests {
             tool_name: Some("bash".into()),
             status: Some("completed".into()),
             details: Some(json!({"metadata":{"exit":0},"time":{"created":1700000000000_i64}})),
+            extensions: Default::default(),
         });
         s.messages.push(result);
         // More rows than incidental startup events: missing native watermark cannot hide.
         for index in 0..16 {
             let mut historical = Message::new(Role::User);
-            historical.content.push(Block::Text {
-                text: format!("fixture historical prompt {index}").into(),
-            });
+            historical
+                .content
+                .push(Block::from_text(format!("fixture historical prompt {index}").into()));
             s.messages.push(historical);
         }
         let opts = EmitOptions {
@@ -922,7 +923,7 @@ mod tests {
                 let directory = root.join(kind);
                 std::fs::create_dir_all(&directory)?;
                 if kind == "complete-edited" {
-                    if let Block::Text { text } = &mut rehome.messages[0].content[0] {
+                    if let Block::Text { text, .. } = &mut rehome.messages[0].content[0] {
                         *text = "fixture prompt edited".into();
                     }
                 }

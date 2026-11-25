@@ -887,9 +887,9 @@ fn decode_entry(view: JsonView<'_>, replacement: Option<JsonView<'_>>, opts: &De
                 m.id = id.clone();
                 m.parent_id = parent.clone();
                 m.timestamp = ts;
-                m.content.push(Block::Text {
-                    text: format!("[session named: {}]", name.as_deref().unwrap_or("")).into(),
-                });
+                m.content.push(Block::from_text(
+                    format!("[session named: {}]", name.as_deref().unwrap_or("")).into(),
+                ));
                 m.harness_extra_mut(Harness::Pi)
                     .insert("record_type".into(), Value::from("session_info"));
                 vec![m]
@@ -982,6 +982,7 @@ fn decode_message(
             tool_name: body.string("toolName")?,
             status: None,
             details: present(body.get("details"))?,
+            extensions: Default::default(),
         });
         if let Some(items) = content.map(JsonView::array).transpose()?.flatten() {
             for item in items {
@@ -1001,9 +1002,7 @@ fn decode_message(
         }
     } else {
         match content {
-            Some(c) if c.is_string()? => msg.content.push(Block::Text {
-                text: lazy(Some(c), keep_source)?,
-            }),
+            Some(c) if c.is_string()? => msg.content.push(Block::from_text(lazy(Some(c), keep_source)?)),
             Some(c) => {
                 if let Some(items) = c.array()? {
                     for item in items {
@@ -1084,9 +1083,7 @@ fn decode_compaction(
         sm.id = None;
         sm.parent_id = out[0].id.clone();
         sm.timestamp = ts;
-        sm.content.push(Block::Text {
-            text: lazy(summary, spans)?,
-        });
+        sm.content.push(Block::from_text(lazy(summary, spans)?));
         sm.harness_extra_mut(Harness::Pi)
             .insert("record_type".into(), Value::from("compaction"));
         out.push(sm);
@@ -1140,7 +1137,7 @@ fn decode_model_change(
             _ => "[thinking level changed]".to_string(),
         }
     };
-    m.content.push(Block::Text { text: text.into() });
+    m.content.push(Block::from_text(text.into()));
     Ok(vec![m])
 }
 

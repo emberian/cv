@@ -4678,7 +4678,7 @@ fn resume_launch_refuses_gui_only_harnesses_with_exit_two() {
 
     let mut session = cv_core::ir::Session::new("gui-doc-1", cv_core::ir::Harness::OpenSession);
     let mut m = cv_core::ir::Message::new(cv_core::ir::Role::User);
-    m.content.push(cv_core::ir::Block::Text { text: "hello".into() });
+    m.content.push(cv_core::ir::Block::from_text("hello".into()));
     session.messages.push(m);
     fs::write(
         exports_dir.join("gui-doc-1.opensession.json"),
@@ -4907,4 +4907,153 @@ fn frozen_ls_and_show_observe_added_and_modified_sessions_without_mutating_catal
         before,
         "--frozen ls/show must not mutate catalog.db or create -wal/-shm sidecars"
     );
+}
+
+// #tooth A parent-only resolver, a pretty-printed argument stash, and a
+// successor that still opens its predecessor's files each fail a different assertion.
+#[test]
+fn prune_and_adopt_keep_retrievable_child_inputs_and_outputs() {
+    use serde_json::{json, Value};
+    let w = World::new("prune-adopt-closure");
+    let parent = "11111111-1111-4111-8111-111111111110";
+    let live = "22222222-2222-4222-8222-222222222220";
+    let ts = "2026-01-01T00:00:00Z";
+    for id in [parent, live] {
+        w.write_session(id, &[user_line(id, "root", ts, "parent")]);
+    }
+    let agent = "a0123456789abcdef";
+    let spilled = w.proj.join(parent).join("tool-results").join("job.txt");
+    fs::create_dir_all(spilled.parent().unwrap()).unwrap();
+    fs::write(&spilled, b"persisted bytes without final newline").unwrap();
+    let raw = format!(
+        r#"{{ "file_path" : "src/a", "new_string" : "{}\u0062" }}"#,
+        "a".repeat(2048)
+    );
+    let output = format!("Exit code 17\n{}", "failed output ".repeat(150));
+    let mut rows = vec![
+        user_line(parent, "a", ts, "child"),
+        assistant_line(
+            "b",
+            ts,
+            json!([{"type":"tool_use","id":"edit","name":"Edit","input":"PLACEHOLDER"}]),
+        ),
+        claude::tool_result("c", ts, "edit", "edited"),
+        assistant_line(
+            "d",
+            ts,
+            json!([{"type":"tool_use","id":"shell","name":"Bash","input":{"command":"cargo test\n--lib"}}]),
+        ),
+        claude::tool_result("e", ts, "shell", &output),
+        assistant_line(
+            "f",
+            ts,
+            json!([{"type":"tool_use","id":"spill","name":"Read","input":{}}]),
+        ),
+        claude::tool_result(
+            "g",
+            ts,
+            "spill",
+            &format!(
+                "<persisted-output>\nFull output saved to: {}\n</persisted-output>",
+                spilled.display()
+            ),
+        ),
+    ];
+    let mut previous = Value::Null;
+    for row in &mut rows {
+        row["sessionId"] = json!(parent);
+        row["agentId"] = json!(agent);
+        row["isSidechain"] = json!(true);
+        row["parentUuid"] = previous;
+        previous = row["uuid"].clone();
+    }
+    let child = w.write_agent(parent, agent, &json!({"agentType":"general-purpose"}), &rows);
+    fs::write(
+        &child,
+        fs::read_to_string(&child).unwrap().replace("\"PLACEHOLDER\"", &raw),
+    )
+    .unwrap();
+    let (preview, _) = w.cv_ok(&[
+        "prune",
+        child.to_str().unwrap(),
+        "--keep-last",
+        "0",
+        "--min-size",
+        "512",
+        "--dry-run",
+        "--json",
+    ]);
+    let preview: Value = serde_json::from_str(&preview).unwrap();
+    assert_eq!(preview["source_id"], format!("agent-{agent}"));
+    assert_eq!(preview["snipped_payloads"], 2);
+    let new = "pruned-child";
+    let (out, _) = w.cv_ok(&[
+        "prune",
+        parent,
+        "--agent",
+        agent,
+        "--to",
+        new,
+        "--keep-last",
+        "0",
+        "--min-size",
+        "512",
+        "--json",
+    ]);
+    let report: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(report["source_id"], format!("agent-{agent}"));
+    assert_eq!(report["cache_break_even"]["n_star"], "unknown");
+    let pruned = PathBuf::from(report["new_path"].as_str().unwrap());
+    let rows: Vec<Value> = fs::read_to_string(&pruned)
+        .unwrap()
+        .lines()
+        .map(|s| serde_json::from_str(s).unwrap())
+        .collect();
+    let receipt = rows.iter().find(|r| r["uuid"] == "e").unwrap()["message"]["content"][0]["content"]
+        .as_str()
+        .unwrap();
+    for part in [
+        "Bash",
+        "cargo test --lib",
+        "exit 17",
+        &format!("{}B", output.len()),
+        "cv cat pruned-child shell",
+    ] {
+        assert!(receipt.contains(part), "{receipt}");
+    }
+    assert_eq!(receipt.lines().count(), 1);
+    let edit = rows.iter().find(|r| r["uuid"] == "b").unwrap();
+    let input = &edit["message"]["content"][0]["input"];
+    assert_eq!(input["file_path"], "src/a");
+    assert_eq!(input["_cv_pruned_input"], "cv cat pruned-child edit --input");
+    assert!(input.get("new_string").is_none());
+
+    assert_eq!(w.cv_ok(&["cat", new, "edit", "--input"]).0, raw);
+    let (ported, _) = w.cv_ok(&["port", new, "--out", w.base.join("ported").to_str().unwrap(), "--json"]);
+    let ported: Value = serde_json::from_str(&ported).unwrap();
+    let ported = ported["path"].as_str().unwrap();
+
+    // Give the same stubs to the stranded agent, which still has native child identity.
+    let mut child_rows = rows;
+    for row in &mut child_rows {
+        row["sessionId"] = json!(parent);
+        row["agentId"] = json!(agent);
+        row["isSidechain"] = json!(true);
+    }
+    w.write_agent(parent, agent, &json!({}), &child_rows);
+    let flat = pruned.with_extension("flat.jsonl");
+    fs::copy(&flat, child.with_extension("flat.jsonl")).unwrap();
+    w.cv_ok(&["adopt", agent, "--from", parent, "--into", live]);
+    fs::remove_dir_all(w.proj.join(parent)).unwrap();
+    fs::remove_file(&flat).unwrap();
+    fs::remove_file(pruned).unwrap();
+    let adopted = w.proj.join(live).join("subagents").join(format!("agent-{agent}.jsonl"));
+    for path in [adopted.to_str().unwrap(), ported] {
+        assert_eq!(w.cv_ok(&["cat", path, "edit", "--input"]).0, raw);
+        assert_eq!(w.cv_ok(&["cat", path, "shell"]).0, format!("{output}\n"));
+        assert_eq!(
+            w.cv_ok(&["cat", path, "spill"]).0,
+            "persisted bytes without final newline"
+        );
+    }
 }

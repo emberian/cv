@@ -116,7 +116,7 @@ fn render_blocks_impl<'a>(
     };
     for b in blocks {
         match b {
-            Block::Text { text } => {
+            Block::Text { text, .. } => {
                 if let Some((opts, stats)) = redact.as_mut() {
                     let s = text.try_resolve(resolver)?;
                     if s.trim().is_empty() {
@@ -211,6 +211,7 @@ fn render_blocks_impl<'a>(
                 }
                 emit("\n```")?;
             }
+            Block::Opaque { .. } => {}
             Block::Image { media_type, .. } => {
                 sep(&mut started, emit)?;
                 emit("[image")?;
@@ -242,7 +243,8 @@ fn render_blocks_impl<'a>(
 /// turns are empty; any tool/image/file block, or any span, makes it non-empty).
 fn message_is_empty(m: &Message) -> bool {
     !m.content.iter().any(|b| match b {
-        Block::Text { text } => text.is_lazy() || text.inline_str().is_some_and(|s| !s.trim().is_empty()),
+        Block::Opaque { .. } => false,
+        Block::Text { text, .. } => text.is_lazy() || text.inline_str().is_some_and(|s| !s.trim().is_empty()),
         Block::Thinking { text, redacted, .. } => {
             !*redacted && (text.is_lazy() || text.inline_str().is_some_and(|s| !s.trim().is_empty()))
         }
@@ -268,7 +270,7 @@ fn represents_system_prompt(message: &Message, prompt: &str, resolver: &crate::R
     };
     let mut present = false;
     for block in &message.content {
-        if let Block::Text { text } = block {
+        if let Block::Text { text, .. } = block {
             if present {
                 compare("\n")?;
             }
@@ -481,7 +483,7 @@ fn trajectory_has_clean_outcome(messages: &[Message], indices: &[usize]) -> bool
         let mut assistant_called_tool = false;
         for b in &m.content {
             match b {
-                Block::Text { text } => {
+                Block::Text { text, .. } => {
                     if m.role == Role::Assistant
                         && (text.is_lazy() || text.inline_str().is_some_and(|s| !s.trim().is_empty()))
                     {
@@ -627,7 +629,7 @@ impl<'a, W: std::io::Write + ?Sized> RecordWriter<'a, W> {
         let mut blocks = Vec::new();
         for block in &message.content {
             let text = match block {
-                Block::Text { text } => Some(text),
+                Block::Text { text, .. } => Some(text),
                 Block::Thinking {
                     text, redacted: false, ..
                 } if self.include_thinking => Some(text),
@@ -688,7 +690,7 @@ impl<'a, W: std::io::Write + ?Sized> RecordWriter<'a, W> {
                     Block::ToolUse { id, name, input, .. } => calls.push((id.as_str(), name.as_str(), input)),
                     Block::ToolResult { .. } => extra_tool_results.push(b),
                     Block::Text { .. } | Block::Image { .. } | Block::File { .. } => content_blocks.push(b),
-                    Block::Thinking { .. } => {}
+                    Block::Thinking { .. } | Block::Opaque { .. } => {}
                 }
             }
             if thinking.is_empty() && content_blocks.is_empty() && calls.is_empty() && extra_tool_results.is_empty() {
@@ -1281,17 +1283,8 @@ mod tests {
 
     fn msg(role: Role, blocks: Vec<Block>) -> Message {
         Message {
-            complete_record: None,
-            id: None,
-            parent_id: None,
-            role,
-            timestamp: None,
-            model: None,
             content: blocks,
-            usage: None,
-            extra: serde_json::Map::new(),
-            kind: crate::ir::MessageKind::for_role(role),
-            origin: crate::ir::Origin::for_role(role),
+            ..Message::new(role)
         }
     }
 
@@ -1313,12 +1306,7 @@ mod tests {
     #[test]
     fn chatml_maps_roles_and_folds_tools() {
         let s = session(vec![
-            msg(
-                Role::User,
-                vec![Block::Text {
-                    text: "fix the bug".into(),
-                }],
-            ),
+            msg(Role::User, vec![Block::from_text("fix the bug".into())]),
             msg(
                 Role::Assistant,
                 vec![
@@ -1327,12 +1315,14 @@ mod tests {
                         signature: None,
                         encrypted: None,
                         redacted: false,
+                        extensions: Default::default(),
                     },
                     Block::ToolUse {
                         id: "1".into(),
                         name: "Bash".into(),
                         input: (json!({"cmd": "grep x"})).into(),
                         namespace: None,
+                        extensions: Default::default(),
                     },
                 ],
             ),
@@ -1345,6 +1335,7 @@ mod tests {
                     tool_name: None,
                     status: None,
                     details: None,
+                    extensions: Default::default(),
                 }],
             ),
         ]);
@@ -1362,7 +1353,7 @@ mod tests {
     #[test]
     fn empty_session_writes_nothing() {
         assert!(record(&session(vec![]), Format::Chatml).is_none());
-        let blank = session(vec![msg(Role::User, vec![Block::Text { text: "  ".into() }])]);
+        let blank = session(vec![msg(Role::User, vec![Block::from_text("  ".into())])]);
         assert!(record(&blank, Format::Chatml).is_none());
     }
 
@@ -1373,9 +1364,7 @@ mod tests {
         let s = session(vec![
             msg(
                 Role::User,
-                vec![Block::Text {
-                    text: "my key is sk-abcDEF1234567890ghijkl ok".into(),
-                }],
+                vec![Block::from_text("my key is sk-abcDEF1234567890ghijkl ok".into())],
             ),
             msg(
                 Role::Assistant,
@@ -1385,12 +1374,14 @@ mod tests {
                         signature: None,
                         encrypted: None,
                         redacted: false,
+                        extensions: Default::default(),
                     },
                     Block::ToolUse {
                         id: "1".into(),
                         name: "Bash".into(),
                         input: (json!({"command": "export TOKEN=plain", "auth": "Bearer abcdef1234567890XYZ"})).into(),
                         namespace: None,
+                        extensions: Default::default(),
                     },
                 ],
             ),
@@ -1403,6 +1394,7 @@ mod tests {
                     tool_name: None,
                     status: None,
                     details: None,
+                    extensions: Default::default(),
                 }],
             ),
             // An attached file whose reference carries a credential.
@@ -1412,15 +1404,11 @@ mod tests {
                     mime: None,
                     path: Some("https://files.example.com/r.pdf?token=ghp_0123456789abcdefABCDEF0123456789wxyz".into()),
                     source: None,
+                    extensions: Default::default(),
                 }],
             ),
             // A clean message: must render identically (and untouched) under redaction.
-            msg(
-                Role::User,
-                vec![Block::Text {
-                    text: "thanks, looks good".into(),
-                }],
-            ),
+            msg(Role::User, vec![Block::from_text("thanks, looks good".into())]),
         ]);
         let opts = crate::redact::RedactOptions::default();
 
@@ -1445,7 +1433,7 @@ mod tests {
 
     #[test]
     fn sharegpt_uses_from_value() {
-        let s = session(vec![msg(Role::User, vec![Block::Text { text: "hi".into() }])]);
+        let s = session(vec![msg(Role::User, vec![Block::from_text("hi".into())])]);
         let v = record(&s, Format::ShareGpt).unwrap();
         assert_eq!(v["conversations"][0]["from"], "human");
         assert_eq!(v["conversations"][0]["value"], "hi");
@@ -1517,22 +1505,12 @@ mod tests {
 
     #[test]
     fn incremental_record_spelling_is_byte_exact() {
-        let mut notice = msg(
-            Role::System,
-            vec![Block::Text {
-                text: "never trains".into(),
-            }],
-        );
+        let mut notice = msg(Role::System, vec![Block::from_text("never trains".into())]);
         notice.kind = MessageKind::Notice;
         let messages = vec![
             notice,
-            msg(Role::User, vec![Block::Text { text: " ".into() }]),
-            msg(
-                Role::User,
-                vec![Block::Text {
-                    text: "a\n\"🌙\"".into(),
-                }],
-            ),
+            msg(Role::User, vec![Block::from_text(" ".into())]),
+            msg(Role::User, vec![Block::from_text("a\n\"🌙\"".into())]),
             msg(
                 Role::Assistant,
                 vec![Block::ToolUse {
@@ -1540,6 +1518,7 @@ mod tests {
                     name: "Tool".into(),
                     namespace: None,
                     input: json!({"z":2,"a":"quoted\t"}).into(),
+                    extensions: Default::default(),
                 }],
             ),
         ];
@@ -1573,7 +1552,7 @@ mod tests {
             len: 8192,
             escaped: false,
         });
-        let session = session(vec![msg(Role::User, vec![Block::Text { text }])]);
+        let session = session(vec![msg(Role::User, vec![Block::from_text(text)])]);
         let opts = crate::redact::RedactOptions::default();
         for redact in [None, Some(&opts)] {
             assert!(write_record(&session, &mut Vec::new(), Format::Chatml, redact).is_err());
@@ -1595,6 +1574,7 @@ mod tests {
                 name: "Tool".into(),
                 namespace: None,
                 input,
+                extensions: Default::default(),
             }],
         )]);
         let opts = crate::redact::RedactOptions::default();
@@ -1661,11 +1641,9 @@ mod tests {
             .unwrap()
             .unwrap();
         let mut first = Message::new(Role::User);
-        first.content.push(Block::Text { text });
+        first.content.push(Block::from_text(text));
         let mut last = Message::new(Role::Assistant);
-        last.content.push(Block::Text {
-            text: "finished".into(),
-        });
+        last.content.push(Block::from_text("finished".into()));
         last.model = Some("present".into());
         let adapter = Backed(vec![first, last]);
         drop(source);
@@ -1724,14 +1702,12 @@ mod tests {
             ) -> anyhow::Result<Session> {
                 let mut message = msg(
                     Role::Assistant,
-                    vec![Block::Text {
-                        text: crate::lazy::Text::Span(crate::lazy::Span {
-                            source: Some(self.0.clone()),
-                            offset: 0,
-                            len: 8192,
-                            escaped: false,
-                        }),
-                    }],
+                    vec![Block::from_text(crate::lazy::Text::Span(crate::lazy::Span {
+                        source: Some(self.0.clone()),
+                        offset: 0,
+                        len: 8192,
+                        escaped: false,
+                    }))],
                 );
                 message.model = Some("present".into());
                 sink.try_message(message)?;
@@ -1781,12 +1757,7 @@ mod tests {
                 _: &crate::Demand,
                 sink: &mut dyn crate::MessageSink,
             ) -> anyhow::Result<Session> {
-                sink.try_message(msg(
-                    Role::User,
-                    vec![Block::Text {
-                        text: "valid prefix".into(),
-                    }],
-                ))?;
+                sink.try_message(msg(Role::User, vec![Block::from_text("valid prefix".into())]))?;
                 anyhow::bail!("late input unavailable")
             }
         }
@@ -1806,32 +1777,25 @@ mod tests {
         let whitespace = " \n\t\u{2003}".repeat(2048);
         let mut owned = Session::new("whitespace", Harness::Claude);
         owned.messages = vec![
-            msg(
-                Role::User,
-                vec![Block::Text {
-                    text: whitespace.clone().into(),
-                }],
-            ),
+            msg(Role::User, vec![Block::from_text(whitespace.clone().into())]),
             msg(
                 Role::Assistant,
                 vec![
-                    Block::Text {
-                        text: whitespace.clone().into(),
-                    },
+                    Block::from_text(whitespace.clone().into()),
                     Block::Thinking {
                         text: whitespace.clone().into(),
                         signature: None,
                         encrypted: None,
                         redacted: false,
+                        extensions: Default::default(),
                     },
-                    Block::Text {
-                        text: format!("{whitespace}answer").into(),
-                    },
+                    Block::from_text(format!("{whitespace}answer").into()),
                     Block::Thinking {
                         text: "reason".into(),
                         signature: None,
                         encrypted: None,
                         redacted: false,
+                        extensions: Default::default(),
                     },
                 ],
             ),
@@ -1844,6 +1808,7 @@ mod tests {
                     is_error: false,
                     status: None,
                     details: None,
+                    extensions: Default::default(),
                 }],
             ),
         ];
@@ -1851,7 +1816,7 @@ mod tests {
         for (mi, message) in lazy.messages.iter_mut().enumerate() {
             for (bi, block) in message.content.iter_mut().enumerate() {
                 let text = match block {
-                    Block::Text { text } | Block::Thinking { text, .. } => text,
+                    Block::Text { text, .. } | Block::Thinking { text, .. } => text,
                     Block::ToolResult { content, .. } => content,
                     _ => continue,
                 };
@@ -1915,7 +1880,7 @@ mod tests {
     fn system_message(texts: &[&str]) -> Message {
         let mut message = msg(
             Role::System,
-            texts.iter().map(|text| Block::Text { text: (*text).into() }).collect(),
+            texts.iter().map(|text| Block::from_text((*text).into())).collect(),
         );
         message.kind = MessageKind::SystemPrompt;
         message
@@ -1927,12 +1892,7 @@ mod tests {
         let path = world.base.join("source");
         std::fs::write(&path, "stable source")?;
         let reference = crate::SessionRef::new("system-metadata", Harness::OpenSession, path);
-        let user = msg(
-            Role::User,
-            vec![Block::Text {
-                text: "user prompt".into(),
-            }],
-        );
+        let user = msg(Role::User, vec![Block::from_text("user prompt".into())]);
         let cases = [
             ("metadata only", vec![user.clone()], 2),
             (
@@ -2022,7 +1982,7 @@ mod tests {
             .unwrap();
         let mut session = Session::new("checked-system", Harness::OpenSession);
         session.system_prompt = Some(prompt.clone());
-        let mut checked_message = msg(Role::System, vec![Block::Text { text: checked.clone() }]);
+        let mut checked_message = msg(Role::System, vec![Block::from_text(checked.clone())]);
         checked_message.kind = MessageKind::SystemPrompt;
         for _ in 0..1200 {
             session.messages.push(checked_message.clone());
@@ -2128,12 +2088,13 @@ mod tests {
         session.messages.push(msg(
             Role::Assistant,
             vec![
-                Block::Text { text: text.clone() },
+                Block::from_text(text.clone()),
                 Block::Thinking {
                     text,
                     signature: None,
                     encrypted: None,
                     redacted: false,
+                    extensions: Default::default(),
                 },
             ],
         ));
@@ -2155,12 +2116,7 @@ mod tests {
         let mut s = Session::new("oai-1", Harness::OpenSession);
         s.system_prompt = Some("You are a concise coding agent.".into());
         s.messages = vec![
-            msg(
-                Role::User,
-                vec![Block::Text {
-                    text: "Run grep and summarize.".into(),
-                }],
-            ),
+            msg(Role::User, vec![Block::from_text("Run grep and summarize.".into())]),
             msg(
                 Role::Assistant,
                 vec![
@@ -2169,12 +2125,14 @@ mod tests {
                         signature: None,
                         encrypted: None,
                         redacted: false,
+                        extensions: Default::default(),
                     },
                     Block::ToolUse {
                         id: "call_grep_1".into(),
                         name: "Bash".into(),
                         input: json!({"cmd": "rg -n foo src/", "secret": "sk-abcDEF1234567890ghijkl"}).into(),
                         namespace: None,
+                        extensions: Default::default(),
                     },
                 ],
             ),
@@ -2187,13 +2145,12 @@ mod tests {
                     tool_name: Some("Bash".into()),
                     status: None,
                     details: None,
+                    extensions: Default::default(),
                 }],
             ),
             msg(
                 Role::Assistant,
-                vec![Block::Text {
-                    text: "Found `foo` at `src/lib.rs:10`.".into(),
-                }],
+                vec![Block::from_text("Found `foo` at `src/lib.rs:10`.".into())],
             ),
         ];
 
@@ -2269,12 +2226,7 @@ mod tests {
 
     #[test]
     fn active_branch_and_clean_outcome_options_prune_rewinds_and_reject_broken_trajectories() -> anyhow::Result<()> {
-        let mut u1 = msg(
-            Role::User,
-            vec![Block::Text {
-                text: "v1 question".into(),
-            }],
-        );
+        let mut u1 = msg(Role::User, vec![Block::from_text("v1 question".into())]);
         u1.id = Some("m1".into());
 
         // Abandoned branch off m1: failed tool call with error result.
@@ -2285,6 +2237,7 @@ mod tests {
                 name: "Bash".into(),
                 input: json!({"cmd": "false"}).into(),
                 namespace: None,
+                extensions: Default::default(),
             }],
         );
         abandoned_a.id = Some("m2_abandoned".into());
@@ -2299,18 +2252,14 @@ mod tests {
                 tool_name: None,
                 status: None,
                 details: None,
+                extensions: Default::default(),
             }],
         );
         abandoned_tr.id = Some("m3_abandoned".into());
         abandoned_tr.parent_id = Some("m2_abandoned".into());
 
         // Active winning branch off m1: clean assistant completion.
-        let mut winning_a = msg(
-            Role::Assistant,
-            vec![Block::Text {
-                text: "clean final answer".into(),
-            }],
-        );
+        let mut winning_a = msg(Role::Assistant, vec![Block::from_text("clean final answer".into())]);
         winning_a.id = Some("m2_win".into());
         winning_a.parent_id = Some("m1".into());
 
@@ -2443,19 +2392,19 @@ mod tests {
         );
 
         // 3. Parentless and id-less `CompactionBoundary` on harnesses without boundary parent links.
-        let mut u1 = msg(Role::User, vec![Block::Text { text: "q".into() }]);
+        let mut u1 = msg(Role::User, vec![Block::from_text("q".into())]);
         u1.id = Some("u1".into());
-        let mut a1 = msg(Role::Assistant, vec![Block::Text { text: "a1".into() }]);
+        let mut a1 = msg(Role::Assistant, vec![Block::from_text("a1".into())]);
         a1.id = Some("a1".into());
         a1.parent_id = Some("u1".into());
         let mut boundary_idless = Message::synthesized(MessageKind::CompactionBoundary, crate::ir::Origin::Harness);
         boundary_idless.id = None;
         boundary_idless.parent_id = None;
-        let mut summary = msg(Role::User, vec![Block::Text { text: "summary".into() }]);
+        let mut summary = msg(Role::User, vec![Block::from_text("summary".into())]);
         summary.kind = MessageKind::CompactionSummary;
         summary.id = Some("s1".into());
         summary.parent_id = None;
-        let mut a2 = msg(Role::Assistant, vec![Block::Text { text: "a2".into() }]);
+        let mut a2 = msg(Role::Assistant, vec![Block::from_text("a2".into())]);
         a2.id = Some("a2".into());
         a2.parent_id = Some("s1".into());
         assert_eq!(
@@ -2465,18 +2414,13 @@ mod tests {
 
         // 4. Per-harness `inactive_branch`, embedded `isSidechain` in a main session, and
         //    all-`isSidechain` sub-agent transcripts (`--subagents --active-branch`).
-        let mut inactive = msg(
-            Role::Assistant,
-            vec![Block::Text {
-                text: "off-branch".into(),
-            }],
-        );
+        let mut inactive = msg(Role::Assistant, vec![Block::from_text("off-branch".into())]);
         inactive.id = Some("off".into());
         inactive.parent_id = Some("u1".into());
         inactive
             .extra
             .insert("openclaw".into(), json!({"inactive_branch": true}));
-        let mut embedded_side = msg(Role::Assistant, vec![Block::Text { text: "side".into() }]);
+        let mut embedded_side = msg(Role::Assistant, vec![Block::from_text("side".into())]);
         embedded_side.id = Some("sc".into());
         embedded_side.parent_id = Some("a1".into());
         embedded_side

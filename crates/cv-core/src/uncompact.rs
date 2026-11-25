@@ -40,7 +40,7 @@ fn text(s: &Session, m: &Message) -> Result<String> {
     let resolver = s.resolver();
     let mut parts = Vec::new();
     for block in &m.content {
-        if let Block::Text { text } = block {
+        if let Block::Text { text, .. } = block {
             parts.push(text.try_resolve(&resolver)?);
         }
     }
@@ -156,6 +156,7 @@ impl Plan {
                         status,
                         is_error,
                         details,
+                        ..
                     } => {
                         let closes = prefix || closing_group;
                         if closes {
@@ -366,6 +367,7 @@ mod tests {
                 name: "Read".into(),
                 namespace: None,
                 input: serde_json::json!({}).into(),
+                extensions: Default::default(),
             });
         }
         let result = |id: &str| {
@@ -377,6 +379,7 @@ mod tests {
                 tool_name: Some("Read".into()),
                 status: None,
                 details: None,
+                extensions: Default::default(),
             });
             m
         };

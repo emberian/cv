@@ -543,7 +543,7 @@ fn message(view: JsonView<'_>, demand: crate::stream::Demand) -> Result<Option<M
     let content = fields.get("content");
     if let Some(content) = text(content)? {
         if !content.is_empty() {
-            message.content.push(Block::Text { text: content });
+            message.content.push(Block::from_text(content));
         }
     } else if let Some(parts) = content.map(|v| v.array()).transpose()?.flatten() {
         for part in parts {
@@ -570,7 +570,7 @@ fn message(view: JsonView<'_>, demand: crate::stream::Demand) -> Result<Option<M
             let taken: &[&str] = match kind.as_str() {
                 "text" => {
                     if let Some(text) = text(fields.get("text"))?.filter(|text| !text.is_empty()) {
-                        message.content.push(Block::Text { text });
+                        message.content.push(Block::from_text(text));
                     }
                     &["text"]
                 }
@@ -580,6 +580,7 @@ fn message(view: JsonView<'_>, demand: crate::stream::Demand) -> Result<Option<M
                         signature: fields.string("signature")?,
                         encrypted: None,
                         redacted: kind == "redacted-reasoning",
+                        extensions: Default::default(),
                     });
                     &["text", "signature"]
                 }
@@ -592,6 +593,7 @@ fn message(view: JsonView<'_>, demand: crate::stream::Demand) -> Result<Option<M
                             None => Value::Null.into(),
                         },
                         namespace: None,
+                        extensions: Default::default(),
                     });
                     &["toolCallId", "toolName", "args"]
                 }
@@ -612,6 +614,7 @@ fn message(view: JsonView<'_>, demand: crate::stream::Demand) -> Result<Option<M
                         tool_name: fields.string("toolName")?,
                         status: None,
                         details: None,
+                        extensions: Default::default(),
                     });
                     &["result", "toolCallId", "toolName"]
                 }
@@ -619,6 +622,7 @@ fn message(view: JsonView<'_>, demand: crate::stream::Demand) -> Result<Option<M
                     message.content.push(Block::Image {
                         media_type: fields.string("mimeType")?,
                         data_ref: Some("inline:cursor-cli".into()),
+                        extensions: Default::default(),
                     });
                     &["mimeType"]
                 }
@@ -627,6 +631,7 @@ fn message(view: JsonView<'_>, demand: crate::stream::Demand) -> Result<Option<M
                         mime: fields.string("mimeType")?,
                         path: fields.string("filename")?,
                         source: None,
+                        extensions: Default::default(),
                     });
                     &["mimeType", "filename"]
                 }
@@ -861,12 +866,8 @@ mod tests {
         assert_eq!(count.title.as_deref(), Some(expected.as_str()));
         let only = Message {
             content: vec![
-                Block::Text {
-                    text: "  first line".into(),
-                },
-                Block::Text {
-                    text: format!("\n{}", "y".repeat(200)).into(),
-                },
+                Block::from_text("  first line".into()),
+                Block::from_text(format!("\n{}", "y".repeat(200)).into()),
             ],
             ..Message::new(Role::User)
         };
@@ -1025,6 +1026,7 @@ mod tests {
         assert!(!wal.exists() && !shm.exists());
         let Block::Text {
             text: crate::lazy::Text::Source(text),
+            ..
         } = &retained.messages[0].content[0]
         else {
             panic!("source text required")
@@ -1191,7 +1193,8 @@ mod tests {
                 assert!(matches!(
                     &retained.messages[1].content[0],
                     Block::Text {
-                        text: crate::lazy::Text::Source(_)
+                        text: crate::lazy::Text::Source(_),
+                        ..
                     }
                 ));
             } else {
@@ -1238,6 +1241,7 @@ mod tests {
         let text = match &retained.messages[0].content[1] {
             Block::Text {
                 text: crate::lazy::Text::Source(text),
+                ..
             } => text,
             _ => panic!("expected checked source text"),
         };

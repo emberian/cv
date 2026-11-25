@@ -62,7 +62,7 @@ fn parts<'a>(content: &'a [Block], mode: ThinkingMode, resolver: &Resolver) -> R
             continue;
         }
         let text = match block {
-            Block::Text { text } => Some(Cow::Borrowed(text)),
+            Block::Text { text, .. } => Some(Cow::Borrowed(text)),
             _ => crate::emit::thinking::text_with_fate(block, fate),
         };
         if let Some(text) = text {
@@ -98,10 +98,10 @@ fn write_parts(writer: &mut dyn Write, parts: &[Part<'_>], resolver: &Resolver) 
             Part::Thinking { text, signature } => {
                 genai::text_fields(&mut row, text, true, signature.as_deref(), resolver)?
             }
-            Part::Other(Block::Image { media_type, data_ref }) => {
-                genai::image_fields(&mut row, media_type.as_deref(), data_ref.as_deref())?
-            }
-            Part::Other(Block::File { mime, path, source }) => {
+            Part::Other(Block::Image {
+                media_type, data_ref, ..
+            }) => genai::image_fields(&mut row, media_type.as_deref(), data_ref.as_deref())?,
+            Part::Other(Block::File { mime, path, source, .. }) => {
                 genai::file_fields(&mut row, mime.as_deref(), path.as_deref(), source.as_deref())?
             }
             Part::Other(Block::ToolUse {
@@ -109,6 +109,7 @@ fn write_parts(writer: &mut dyn Write, parts: &[Part<'_>], resolver: &Resolver) 
                 name,
                 input,
                 namespace,
+                ..
             }) => row.field_with("functionCall", |w| {
                 let mut call = ObjectWriter::new(w)?;
                 call.field("id", id)?;
@@ -633,9 +634,7 @@ mod staged_tests {
         assert_eq!(fs::read(&empty.path)?, b"\n");
         for role in [Role::User, Role::Assistant] {
             let mut message = Message::new(role);
-            message.content.push(Block::Text {
-                text: "escaped\"\\\nλ".into(),
-            });
+            message.content.push(Block::from_text("escaped\"\\\nλ".into()));
             session.messages.push(message);
         }
         let result = emit(&session, &world.base, &opts)?;

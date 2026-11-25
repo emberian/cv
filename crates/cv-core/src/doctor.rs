@@ -667,7 +667,7 @@ impl SessionPass<'_> {
                     rep.images += t;
                     fact.images += t;
                 }
-                Block::File { .. } => {}
+                Block::File { .. } | Block::Opaque { .. } => {}
             }
         }
         self.msg_facts.push(fact);
@@ -1427,6 +1427,7 @@ mod tests {
             tool_name: None,
             status: None,
             details: None,
+            extensions: Default::default(),
         });
         m
     }
@@ -1438,6 +1439,7 @@ mod tests {
             name: name.into(),
             input: json!({}).into(),
             namespace: None,
+            extensions: Default::default(),
         });
         m
     }
@@ -1464,7 +1466,7 @@ mod tests {
             let mut report = Report::default();
             let mut pass = report.session(None);
             let mut message = Message::new(Role::Assistant);
-            message.content.push(Block::Text { text });
+            message.content.push(Block::from_text(text));
             assert!(matches!(pass.message(message), Flow::Stop));
             assert!(pass.finish().is_err());
         }
@@ -1505,20 +1507,20 @@ mod tests {
         ] {
             let mut message = Message::of_kind(Role::Assistant, kind, crate::Origin::Harness);
             message.content = vec![
-                Block::Text {
-                    text: "harness text".into(),
-                },
+                Block::from_text("harness text".into()),
                 Block::Thinking {
                     text: "harness thought".into(),
                     signature: Some("signature".into()),
                     encrypted: Some("opaque".into()),
                     redacted: false,
+                    extensions: Default::default(),
                 },
                 Block::ToolUse {
                     id: "hidden".into(),
                     name: "mcp__hidden__tool".into(),
                     input: json!({"argument":"hidden"}).into(),
                     namespace: None,
+                    extensions: Default::default(),
                 },
                 Block::ToolResult {
                     tool_use_id: "hidden".into(),
@@ -1527,10 +1529,12 @@ mod tests {
                     is_error: false,
                     status: None,
                     details: None,
+                    extensions: Default::default(),
                 },
                 Block::Image {
                     media_type: None,
                     data_ref: None,
+                    extensions: Default::default(),
                 },
             ];
             assert_eq!(pass.message(message), Flow::Continue);
@@ -1542,9 +1546,7 @@ mod tests {
         assert!(report.by_attachment.is_empty());
         let mut pass = report.session(None);
         let mut visible = Message::of_kind(Role::User, MessageKind::InjectedContext, crate::Origin::Harness);
-        visible.content.push(Block::Text {
-            text: "reminder".into(),
-        });
+        visible.content.push(Block::from_text("reminder".into()));
         pass.message(visible);
         pass.finish().unwrap();
         assert!(report.attachments > 0);
@@ -1558,9 +1560,7 @@ mod tests {
         // Pre-compaction heavy bloat: 40k bytes of tool result + 50k prompt usage.
         let mut u1 = Message::new(Role::User);
         u1.id = Some("m1".into());
-        u1.content.push(Block::Text {
-            text: "initial question".into(),
-        });
+        u1.content.push(Block::from_text("initial question".into()));
         let mut a1 = call("t-pre", "Bash");
         a1.id = Some("m2".into());
         a1.parent_id = Some("m1".into());
@@ -1584,17 +1584,13 @@ mod tests {
         let mut summary = Message::of_kind(Role::User, MessageKind::CompactionSummary, crate::Origin::Harness);
         summary.id = Some("s1".into());
         summary.parent_id = Some("b1".into());
-        summary.content.push(Block::Text {
-            text: "S".repeat(2500).into(),
-        });
+        summary.content.push(Block::from_text("S".repeat(2500).into()));
 
         // Post-compaction turn 1: user prompt + assistant reply with usage=20_000.
         let mut u2 = Message::new(Role::User);
         u2.id = Some("m4".into());
         u2.parent_id = Some("s1".into());
-        u2.content.push(Block::Text {
-            text: "U".repeat(500).into(),
-        });
+        u2.content.push(Block::from_text("U".repeat(500).into()));
 
         let mut a2 = Message::new(Role::Assistant);
         a2.id = Some("m5".into());
@@ -1603,17 +1599,13 @@ mod tests {
             input_tokens: Some(20_000),
             ..Default::default()
         });
-        a2.content.push(Block::Text {
-            text: "clean post-compaction answer".into(),
-        });
+        a2.content.push(Block::from_text("clean post-compaction answer".into()));
 
         // Post-compaction turn 2: user follow-up + assistant reply with usage=21_400.
         let mut u3 = Message::new(Role::User);
         u3.id = Some("m6".into());
         u3.parent_id = Some("m5".into());
-        u3.content.push(Block::Text {
-            text: "next step".into(),
-        });
+        u3.content.push(Block::from_text("next step".into()));
 
         let mut a3 = Message::new(Role::Assistant);
         a3.id = Some("m7".into());
@@ -1622,7 +1614,7 @@ mod tests {
             input_tokens: Some(21_400),
             ..Default::default()
         });
-        a3.content.push(Block::Text { text: "done".into() });
+        a3.content.push(Block::from_text("done".into()));
 
         for m in [u1, a1, tr1, boundary, summary, u2, a2, u3, a3] {
             assert_eq!(pass.message(m), Flow::Continue);
@@ -1659,23 +1651,21 @@ mod tests {
         {
             let mut p1 = rep.session(None);
             let mut u = Message::new(Role::User);
-            u.content.push(Block::Text {
-                text: "N".repeat(600).into(),
-            });
+            u.content.push(Block::from_text("N".repeat(600).into()));
             let mut a1 = Message::new(Role::Assistant);
             a1.usage = Some(crate::ir::Usage {
                 input_tokens: Some(25_000),
                 ..Default::default()
             });
-            a1.content.push(Block::Text { text: "ok".into() });
+            a1.content.push(Block::from_text("ok".into()));
             let mut u2 = Message::new(Role::User);
-            u2.content.push(Block::Text { text: "more".into() });
+            u2.content.push(Block::from_text("more".into()));
             let mut a2 = Message::new(Role::Assistant);
             a2.usage = Some(crate::ir::Usage {
                 input_tokens: Some(28_000),
                 ..Default::default()
             });
-            a2.content.push(Block::Text { text: "done".into() });
+            a2.content.push(Block::from_text("done".into()));
             for m in [u, a1, u2, a2] {
                 assert_eq!(p1.message(m), Flow::Continue);
             }
@@ -1688,13 +1678,13 @@ mod tests {
         {
             let mut p2 = rep.session(None);
             let mut u = Message::new(Role::User);
-            u.content.push(Block::Text { text: "hi".into() });
+            u.content.push(Block::from_text("hi".into()));
             let mut a = Message::new(Role::Assistant);
             a.usage = Some(crate::ir::Usage {
                 input_tokens: Some(15_000),
                 ..Default::default()
             });
-            a.content.push(Block::Text { text: "ok".into() });
+            a.content.push(Block::from_text("ok".into()));
             for m in [u, a] {
                 assert_eq!(p2.message(m), Flow::Continue);
             }
@@ -1705,13 +1695,13 @@ mod tests {
         {
             let mut p3 = rep.session(None);
             let mut u = Message::new(Role::User);
-            u.content.push(Block::Text { text: "hi".into() });
+            u.content.push(Block::from_text("hi".into()));
             let mut a = Message::new(Role::Assistant);
             a.usage = Some(crate::ir::Usage {
                 input_tokens: Some(19_000),
                 ..Default::default()
             });
-            a.content.push(Block::Text { text: "ok".into() });
+            a.content.push(Block::from_text("ok".into()));
             for m in [u, a] {
                 assert_eq!(p3.message(m), Flow::Continue);
             }
@@ -1742,7 +1732,7 @@ mod tests {
 
         // Turn 1: User + 3 streaming Assistant records sharing `message.id = "msg_call_1"` (20_000 prompt tokens).
         let mut u1 = Message::new(Role::User);
-        u1.content.push(Block::Text { text: "go".into() });
+        u1.content.push(Block::from_text("go".into()));
 
         let streaming_chunk = |msg_id: &str, pt: u64, text: &str| {
             let mut a = Message::new(Role::Assistant);
@@ -1751,7 +1741,7 @@ mod tests {
                 input_tokens: Some(pt),
                 ..Default::default()
             });
-            a.content.push(Block::Text { text: text.into() });
+            a.content.push(Block::from_text(text.into()));
             a
         };
 
@@ -1761,7 +1751,7 @@ mod tests {
 
         // Turn 2: User + 3 streaming Assistant records sharing `message.id = "msg_call_2"` (23_000 prompt tokens).
         let mut u2 = Message::new(Role::User);
-        u2.content.push(Block::Text { text: "next".into() });
+        u2.content.push(Block::from_text("next".into()));
         let a2_part1 = streaming_chunk("msg_call_2", 23_000, "step 1");
         let a2_part2 = streaming_chunk("msg_call_2", 23_000, "step 2");
         let a2_part3 = streaming_chunk("msg_call_2", 23_000, "final");
@@ -1785,9 +1775,7 @@ mod tests {
         // Abandoned Turn-1 root (`id = "root_old", parent_id = None`) carrying huge tool output.
         let mut u_old = Message::new(Role::User);
         u_old.id = Some("root_old".into());
-        u_old.content.push(Block::Text {
-            text: "wrong first question".into(),
-        });
+        u_old.content.push(Block::from_text("wrong first question".into()));
         let mut a_old = call("t_old", "Bash");
         a_old.id = Some("a_old".into());
         a_old.parent_id = Some("root_old".into());
@@ -1798,9 +1786,7 @@ mod tests {
         // Rewound Turn-1 root (`id = "root_new", parent_id = None`) — clean active root!
         let mut u_new = Message::new(Role::User);
         u_new.id = Some("root_new".into());
-        u_new.content.push(Block::Text {
-            text: "clean rewound prompt".into(),
-        });
+        u_new.content.push(Block::from_text("clean rewound prompt".into()));
         let mut a_new = Message::new(Role::Assistant);
         a_new.id = Some("a_new".into());
         a_new.parent_id = Some("root_new".into());
@@ -1808,9 +1794,7 @@ mod tests {
             input_tokens: Some(12_000),
             ..Default::default()
         });
-        a_new.content.push(Block::Text {
-            text: "clean answer".into(),
-        });
+        a_new.content.push(Block::from_text("clean answer".into()));
 
         // Message marked `inactive_branch: true` under harness namespace (`openclaw`).
         let mut inactive = result("t_inactive", &"I".repeat(20_000));
@@ -1829,9 +1813,7 @@ mod tests {
             input_tokens: Some(999_999),
             ..Default::default()
         });
-        side.content.push(Block::Text {
-            text: "S".repeat(20_000).into(),
-        });
+        side.content.push(Block::from_text("S".repeat(20_000).into()));
 
         for m in [u_old, a_old, tr_old, u_new, a_new, inactive, side] {
             assert_eq!(pass.message(m), Flow::Continue);

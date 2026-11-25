@@ -179,7 +179,7 @@ fn emit(
             let mut hooked = Vec::new();
             for block in blocks()? {
                 match &block {
-                    Block::Text { text }
+                    Block::Text { text, .. }
                         if text_head(text, &Resolver::new(None), 80, true)?
                             .0
                             .starts_with(HOOK_CONTEXT_TAG) =>
@@ -194,7 +194,7 @@ fn emit(
                     .content
                     .iter()
                     .find_map(|b| match b {
-                        Block::Text { text } => text_head(text, &Resolver::new(None), 512, true)
+                        Block::Text { text, .. } => text_head(text, &Resolver::new(None), 512, true)
                             .ok()
                             .map(|(head, _)| head)
                             .filter(|h| !h.is_empty()),
@@ -207,9 +207,13 @@ fn emit(
             }
             if st.first_prompt.is_none() {
                 st.first_prompt = text_summary(
-                    m.content
-                        .iter()
-                        .filter_map(|b| if let Block::Text { text } = b { Some(text) } else { None }),
+                    m.content.iter().filter_map(|b| {
+                        if let Block::Text { text, .. } = b {
+                            Some(text)
+                        } else {
+                            None
+                        }
+                    }),
                     &Resolver::new(None),
                     false,
                 );
@@ -470,6 +474,7 @@ fn content_blocks(message: Option<JsonView<'_>>, demand: Demand<'_>) -> Result<V
                     name,
                     input,
                     namespace,
+                    extensions: Default::default(),
                 });
             }
             Some(Part::Response(result)) => {
@@ -482,6 +487,7 @@ fn content_blocks(message: Option<JsonView<'_>>, demand: Demand<'_>) -> Result<V
                     tool_name: Some(name),
                     status: None,
                     details: None,
+                    extensions: Default::default(),
                 });
             }
             Some(Part::Media(block)) => out.push(block),
@@ -698,9 +704,7 @@ fn system_blocks(payload: Option<JsonView<'_>>, subtype: Option<&str>, demand: D
                 Some(message) => Piece::Value(message),
                 None => Piece::Json(error),
             };
-            return Ok(vec![Block::Text {
-                text: compose(&[piece], demand)?,
-            }]);
+            return Ok(vec![Block::from_text(compose(&[piece], demand)?)]);
         }
         _ => return Ok(Vec::new()),
     }
@@ -711,7 +715,7 @@ fn non_empty(text: Text) -> Vec<Block> {
     if text.is_empty() {
         Vec::new()
     } else {
-        vec![Block::Text { text }]
+        vec![Block::from_text(text)]
     }
 }
 
@@ -738,14 +742,14 @@ mod tests {
         })?;
         assert!(serde_json::to_vec(&blocks)?.len() < 2000);
         assert!(
-            matches!(&blocks[3], Block::ToolUse { id, name, namespace: Some(namespace), input }
+            matches!(&blocks[3], Block::ToolUse { id, name, namespace: Some(namespace), input , .. }
             if id == "call" && name == "agent" && namespace == "tool_call" && input.resolve()?.is_null())
         );
         assert!(
             matches!(&blocks[4], Block::ToolResult { tool_use_id, content, is_error: true, .. }
             if tool_use_id == "call" && content.is_empty())
         );
-        let Block::Text { text } = &blocks[1] else {
+        let Block::Text { text, .. } = &blocks[1] else {
             panic!("hook text")
         };
         assert_eq!(text.try_resolve(&Resolver::new(None))?.as_ref(), HOOK_CONTEXT_TAG);

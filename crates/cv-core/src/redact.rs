@@ -539,6 +539,14 @@ pub fn redact_with(session: &Session, opts: &RedactOptions) -> anyhow::Result<(S
             *prompt = scrubbed;
         }
     }
+    for value in out
+        .lineage
+        .extensions
+        .values_mut()
+        .chain(out.git.iter_mut().flat_map(|git| git.extensions.values_mut()))
+    {
+        scrub_value(value, opts, &mut stats);
+    }
     if let Some(remote) = out.git.as_mut().and_then(|g| g.remote.as_mut()) {
         if let Cow::Owned(scrubbed) = scrub_cow(remote, opts, &mut stats) {
             *remote = scrubbed;
@@ -681,9 +689,22 @@ pub fn redact_message(
             }
         }
     }
+    for value in msg
+        .extensions
+        .values_mut()
+        .chain(msg.usage.iter_mut().flat_map(|u| u.extensions.values_mut()))
+    {
+        scrub_value(value, opts, stats);
+    }
     for (idx, block) in msg.content.iter_mut().enumerate() {
+        if let Some(fields) = block.extensions_mut() {
+            for value in fields.values_mut() {
+                scrub_value(value, opts, stats);
+            }
+        }
         match block {
-            Block::Text { text } | Block::Thinking { text, .. } => {
+            Block::Opaque { value, .. } => scrub_value(value, opts, stats),
+            Block::Text { text, .. } | Block::Thinking { text, .. } => {
                 // `scrub_cow` borrows when clean, so untouched text (the common case) is not
                 // reallocated — only actually-redacted fields are rewritten.
                 if let Cow::Owned(scrubbed) = scrub_cow(text, opts, stats) {
@@ -787,6 +808,14 @@ impl CompiledProfile {
                 *prompt = s;
             }
         }
+        for value in out
+            .lineage
+            .extensions
+            .values_mut()
+            .chain(out.git.iter_mut().flat_map(|git| git.extensions.values_mut()))
+        {
+            self.scrub_value(value, repo_root, &mut stats);
+        }
         if let Some(remote) = out.git.as_mut().and_then(|g| g.remote.as_mut()) {
             if let Cow::Owned(s) = self.scrub_text_cow(remote, repo_root, &mut stats) {
                 *remote = s;
@@ -871,9 +900,22 @@ impl CompiledProfile {
                 }
             }
         }
+        for value in msg
+            .extensions
+            .values_mut()
+            .chain(msg.usage.iter_mut().flat_map(|u| u.extensions.values_mut()))
+        {
+            self.scrub_value(value, repo_root, stats);
+        }
         for (idx, block) in msg.content.iter_mut().enumerate() {
+            if let Some(fields) = block.extensions_mut() {
+                for value in fields.values_mut() {
+                    self.scrub_value(value, repo_root, stats);
+                }
+            }
             match block {
-                Block::Text { text } | Block::Thinking { text, .. } => {
+                Block::Opaque { value, .. } => self.scrub_value(value, repo_root, stats),
+                Block::Text { text, .. } | Block::Thinking { text, .. } => {
                     if let Cow::Owned(s) = self.scrub_text_cow(text, repo_root, stats) {
                         *text = s.into();
                     }
@@ -1972,9 +2014,7 @@ mod tests {
     fn emails_class_off_keeps_emails() {
         let mut sess = empty_session();
         let mut m = Message::new(Role::User);
-        m.content.push(Block::Text {
-            text: "ping a@b.com".into(),
-        });
+        m.content.push(Block::from_text("ping a@b.com".into()));
         sess.messages.push(m);
         let (out, _stats) = redact_with(
             &sess,
@@ -2123,6 +2163,7 @@ mod tests {
             name: "bash".into(),
             input: input.into(),
             namespace: None,
+            extensions: Default::default(),
         });
         sess.messages.push(m);
 
@@ -2157,6 +2198,7 @@ mod tests {
             tool_name: None,
             status: None,
             details: Some(serde_json::json!({ "stderr": "token ghp_0123456789abcdefABCDEF0123456789abcd" })),
+            extensions: Default::default(),
         });
         sess.messages.push(m);
 
@@ -2180,6 +2222,7 @@ mod tests {
             signature: None,
             encrypted: None,
             redacted: false,
+            extensions: Default::default(),
         });
         sess.messages.push(m);
 
@@ -2197,9 +2240,8 @@ mod tests {
     fn stats_count() {
         let mut sess = empty_session();
         let mut m = Message::new(Role::User);
-        m.content.push(Block::Text {
-            text: "sk-abcDEF1234567890ghijkl and a@b.com".into(),
-        });
+        m.content
+            .push(Block::from_text("sk-abcDEF1234567890ghijkl and a@b.com".into()));
         sess.messages.push(m);
         let (_out, stats) = redact_with(&sess, &RedactOptions::default()).unwrap();
         assert_eq!(stats.api_keys, 1);
@@ -2417,11 +2459,12 @@ mod tests {
             branch: Some("main".into()),
             commit: Some("abc1234".into()),
             remote: Some("https://x-access-token:ghs_0123456789abcdefABCD@github.com/o/r.git".into()),
+            ..Default::default()
         });
         sess.extra
             .insert("apiKey".into(), serde_json::json!("sk-abcDEF1234567890ghijkl"));
         let mut m = Message::new(Role::User);
-        m.content.push(Block::Text { text: "hi".into() });
+        m.content.push(Block::from_text("hi".into()));
         m.extra.insert(
             "env".into(),
             serde_json::json!({ "GITHUB_TOKEN": "ghp_0123456789abcdefABCDEF0123456789abcd" }),
@@ -2520,7 +2563,7 @@ mod tests {
         let mut session = Session::new("redaction", crate::Harness::OpenCode);
         session.system_prompt = Some(format!("Authorization: Bearer {secret}"));
         let mut message = Message::new(crate::Role::Assistant);
-        message.content.push(Block::Text { text });
+        message.content.push(Block::from_text(text));
         session.messages.push(message);
         crate::ir::CompleteRecord::attach_replay(
             &mut session.messages,
@@ -2569,14 +2612,14 @@ mod tests {
         let mut session = Session::new("implicit", crate::Harness::Claude);
         session.source_path = Some(path);
         let mut message = Message::new(crate::Role::User);
-        message.content.push(Block::Text {
-            text: crate::Text::Span(crate::lazy::Span {
+        message
+            .content
+            .push(Block::from_text(crate::Text::Span(crate::lazy::Span {
                 source: None,
                 offset: 1,
                 len: secret.len() as u64,
                 escaped: false,
-            }),
-        });
+            })));
         session.messages.push(message);
         assert!(!serde_json::to_string(&redact(&session)?)?.contains(&secret));
         let resolver = session.resolver();
@@ -2655,12 +2698,14 @@ mod tests {
             name: "Bash".into(),
             input: clean_json,
             namespace: None,
+            extensions: Default::default(),
         });
         msg.content.push(Block::ToolUse {
             id: "c2".into(),
             name: "Bash".into(),
             input: dirty_json,
             namespace: None,
+            extensions: Default::default(),
         });
         session.messages.push(msg);
 
@@ -2725,9 +2770,7 @@ mod tests {
         s.cv_extra_mut()
             .insert("tags".into(), serde_json::json!(["shareable", "rust"]));
         let mut m = Message::new(Role::User);
-        m.content.push(Block::Text {
-            text: "Connect via ssh deploy@bastion-01 to 10.42.0.19 or 100.88.1.5 (keep 127.0.0.1 and v10.2.3.4), check db.internal and node.tailnet.ts.net, read /Users/alice/dev/secret-proj/src/lib.rs, /Users/alice/.zshrc, and /mnt/nas/vol9/data. Keep alice@example.com.".into(),
-        });
+        m.content.push(Block::from_text("Connect via ssh deploy@bastion-01 to 10.42.0.19 or 100.88.1.5 (keep 127.0.0.1 and v10.2.3.4), check db.internal and node.tailnet.ts.net, read /Users/alice/dev/secret-proj/src/lib.rs, /Users/alice/.zshrc, and /mnt/nas/vol9/data. Keep alice@example.com.".into()));
         s.messages.push(m);
 
         let (scrubbed, stats) = filter_and_scrub_session(&s, &profile)?.expect("matching session should pass filter");
@@ -2781,20 +2824,23 @@ mod tests {
             text: "see `/Users/carol/notes.md`, <path>/home/bob/out.txt</path>, file:///Users/carol/a.png, \
                    log>/home/bob/build.log and {/Users/carol/x} | /home/bob/y; ls /home/bob /Users/carol; keep https://example.com/home/page"
                 .into(),
-        });
+         extensions: Default::default(), });
         m.content.push(Block::File {
             mime: Some("text/markdown".into()),
             path: Some("/Users/carol/work/secret-plan.md".into()),
             source: Some("http://10.20.30.40/files/secret-plan.md".into()),
+            extensions: Default::default(),
         });
         m.content.push(Block::Image {
             media_type: Some("image/png".into()),
             data_ref: Some("file:///home/bob/Desktop/screenshot.png".into()),
+            extensions: Default::default(),
         });
         let inline = format!("data:image/png;base64,{}", "QUJD".repeat(64));
         m.content.push(Block::Image {
             media_type: Some("image/png".into()),
             data_ref: Some(inline.clone()),
+            extensions: Default::default(),
         });
         s.messages.push(m);
 
@@ -2817,10 +2863,12 @@ mod tests {
             mime: None,
             path: Some("report.pdf".into()),
             source: Some(format!("https://files.example.com/report.pdf?api_key={key}")),
+            extensions: Default::default(),
         });
         m.content.push(Block::Image {
             media_type: None,
             data_ref: Some(format!("https://img.example.com/a.png?token={key}")),
+            extensions: Default::default(),
         });
         signed.messages.push(m);
         let wire = serde_json::to_string(&redact(&signed)?)?;

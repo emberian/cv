@@ -125,7 +125,7 @@ fn spawn_hub_serve(w: &World, token: Option<&str>) -> (String, u16, Reaper) {
 
 fn msg_text(role: Role, text: &str) -> Message {
     let mut m = Message::new(role);
-    m.content.push(Block::Text { text: text.into() });
+    m.content.push(Block::from_text(text.into()));
     m
 }
 
@@ -852,6 +852,7 @@ tags = ["team-share"]
         }))
         .unwrap(),
         namespace: None,
+        extensions: Default::default(),
     });
 
     // Session 2: Denied by `deny_cwds` (`~/secret-stealth/omega`).

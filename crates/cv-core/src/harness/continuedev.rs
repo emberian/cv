@@ -1148,18 +1148,17 @@ mod tests {
         };
 
         let mut user = Message::new(Role::User);
-        user.content.push(Block::Text {
-            text: "please read a.rs".into(),
-        });
+        user.content.push(Block::from_text("please read a.rs".into()));
         session.messages.push(user);
 
         let mut asst = Message::new(Role::Assistant);
-        asst.content.push(Block::Text { text: "on it".into() });
+        asst.content.push(Block::from_text("on it".into()));
         asst.content.push(Block::ToolUse {
             id: "call_1".into(),
             name: "read_file".into(),
             input: json!({ "path": "a.rs" }).into(),
             namespace: None,
+            extensions: Default::default(),
         });
         session.messages.push(asst);
 
@@ -1171,6 +1170,7 @@ mod tests {
             tool_name: None,
             status: None,
             details: None,
+            extensions: Default::default(),
         });
         session.messages.push(tool);
 

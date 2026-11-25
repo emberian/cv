@@ -276,7 +276,7 @@ fn projected<'a>(
     let mut thinking = Vec::new();
     for block in &message.content {
         let fate = crate::emit::thinking::fate(block, Harness::Grok, mode, resolver)?;
-        if let Block::Text { text } = block {
+        if let Block::Text { text, .. } = block {
             texts.push(Cow::Borrowed(text));
         } else if let Some(text) = crate::emit::thinking::text_with_fate(block, fate) {
             texts.push(text);
@@ -319,14 +319,16 @@ mod multi_thinking_tests {
                 signature: None,
                 encrypted: Some("enc-1".into()),
                 redacted: false,
+                extensions: Default::default(),
             },
             Block::Thinking {
                 text: "second step".into(),
                 signature: None,
                 encrypted: None,
                 redacted: false,
+                extensions: Default::default(),
             },
-            Block::Text { text: "final".into() },
+            Block::from_text("final".into()),
         ];
         session.messages.push(asst);
         let res = emit(&session, &world.base, &EmitOptions::default())?;

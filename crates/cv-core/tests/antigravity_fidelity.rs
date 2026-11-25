@@ -679,7 +679,9 @@ mod native {
             .content
             .iter()
             .filter_map(|b| match b {
-                cv_core::Block::Image { media_type, data_ref } => Some((media_type.as_deref(), data_ref.as_deref())),
+                cv_core::Block::Image {
+                    media_type, data_ref, ..
+                } => Some((media_type.as_deref(), data_ref.as_deref())),
                 _ => None,
             })
             .collect();
@@ -1098,7 +1100,7 @@ mod native {
         assert_eq!(det3["payload"]["path"], "file:///workspace/p3/README.md");
         assert!(session.messages[3].content.iter().any(|b| matches!(
             b,
-            cv_core::Block::Image { media_type: Some(mt), data_ref: Some(dr) }
+            cv_core::Block::Image { media_type: Some(mt), data_ref: Some(dr) , .. }
             if mt == "image/png" && dr == "data:image/png;base64,aGVsbG8="
         )));
 

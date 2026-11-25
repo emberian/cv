@@ -47,7 +47,7 @@ fn text(session: &Session) -> String {
         .iter()
         .flat_map(|m| &m.content)
         .filter_map(|block| match block {
-            Block::Text { text } => Some(text.try_resolve(&resolver).unwrap().into_owned()),
+            Block::Text { text, .. } => Some(text.try_resolve(&resolver).unwrap().into_owned()),
             _ => None,
         })
         .collect::<Vec<_>>()

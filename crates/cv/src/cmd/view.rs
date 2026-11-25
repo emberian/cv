@@ -477,7 +477,7 @@ fn staged_session_json_inner(
     document: bool,
     checked: bool,
 ) -> Result<(cv_core::bytes::ByteSource, Option<usize>)> {
-    let mut sink = window_sink(r, window, max_bytes)?;
+    let mut sink = window_sink(r, window, max_bytes)?.for_document(document);
     let pass = cv_core::stream::Pass {
         guard: checked,
         ..cv_core::stream::Pass::RECORD
@@ -763,7 +763,7 @@ fn subagent_final_return(r: &SessionRef) -> Result<Option<String>> {
             }
             let mut buf = String::new();
             for b in &m.content {
-                if let Block::Text { text } = b {
+                if let Block::Text { text, .. } = b {
                     match text.try_resolve(&self.resolver) {
                         Ok(s) => {
                             if !buf.is_empty() {
@@ -1733,7 +1733,7 @@ pub(crate) fn show_message(m: &Message) -> Result<String> {
     let mut s = format!("── {} ──\n", turn_label(m));
     for b in &m.content {
         match b {
-            Block::Text { text } => {
+            Block::Text { text, .. } => {
                 s.push_str(text);
                 s.push('\n');
             }
@@ -1764,6 +1764,7 @@ pub(crate) fn show_message(m: &Message) -> Result<String> {
                 "[file: {}]\n",
                 path.as_deref().or(source.as_deref()).unwrap_or("?")
             )),
+            Block::Opaque { .. } => {}
             Block::Image { .. } => s.push_str("[image]\n"),
         }
     }
@@ -1834,9 +1835,7 @@ mod tests {
                 sink.meta(&session);
                 if self.0 {
                     let mut message = Message::new(Role::Assistant);
-                    message.content.push(Block::Text {
-                        text: "body before late gap".into(),
-                    });
+                    message.content.push(Block::from_text("body before late gap".into()));
                     sink.message(message);
                     coverage.limitations.insert(ReadCoverage::MISSING_PAYLOADS.into());
                 } else {
@@ -2336,6 +2335,7 @@ mod tests {
                         name: "tool".into(),
                         namespace: None,
                         input: cv_core::Json::source(&self.path, 0, self.len)?,
+                        extensions: Default::default(),
                     });
                     sink.message(message);
                 }
@@ -2381,7 +2381,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let mut message = Message::new(Role::Assistant);
-        message.content.push(Block::Text { text });
+        message.content.push(Block::from_text(text));
         let mut session = Session::new("render-source", Harness::Codex);
         session.messages.push(message);
         struct Replay(Session);
@@ -2453,6 +2453,7 @@ mod tests {
                 name: "custom".into(),
                 input,
                 namespace: None,
+                extensions: Default::default(),
             });
             message
         };
@@ -2692,7 +2693,7 @@ mod tests {
                 sink.meta(&session);
                 for body in ["tiny".to_owned(), "giant\n🌙".repeat(1024 * 1024)] {
                     let mut message = Message::new(Role::User);
-                    message.content.push(Block::Text { text: body.into() });
+                    message.content.push(Block::from_text(body.into()));
                     assert_eq!(sink.message(message), cv_core::Flow::Continue);
                 }
                 session.title = Some("EOF title".into());
@@ -2740,9 +2741,8 @@ mod tests {
                     m.id = Some(format!("message-{i}"));
                     m.harness_extra_mut(r.harness)
                         .insert("full_detail".into(), serde_json::json!(i));
-                    m.content.push(Block::Text {
-                        text: "large discarded body".repeat(8192).into(),
-                    });
+                    m.content
+                        .push(Block::from_text("large discarded body".repeat(8192).into()));
                     assert_eq!(sink.message(m), cv_core::Flow::Continue);
                 }
                 s.title = Some("final title".into());
@@ -3053,9 +3053,7 @@ mod tests {
                     if i == 30 || i == 45 {
                         m.model = Some(format!("model-{i}"));
                     }
-                    m.content.push(Block::Text {
-                        text: format!("turn {i}").into(),
-                    });
+                    m.content.push(Block::from_text(format!("turn {i}").into()));
                     if sink.message(m) == cv_core::Flow::Stop {
                         break;
                     }
@@ -3114,18 +3112,14 @@ mod tests {
         sys.kind = MessageKind::InjectedContext;
         sys.harness_extra_mut(Harness::Claude)
             .insert("attachment_type".into(), serde_json::json!("hook_success"));
-        sys.content.push(Block::Text {
-            text: "reminder: run the gate".into(),
-        });
+        sys.content.push(Block::from_text("reminder: run the gate".into()));
         let mut summary = Message::new(Role::User);
         summary.kind = MessageKind::CompactionSummary;
-        summary.content.push(Block::Text {
-            text: "earlier we fixed the parser".into(),
-        });
+        summary
+            .content
+            .push(Block::from_text("earlier we fixed the parser".into()));
         let mut reply = Message::new(Role::Assistant);
-        reply.content.push(Block::Text {
-            text: "on it, editing ir.rs".into(),
-        });
+        reply.content.push(Block::from_text("on it, editing ir.rs".into()));
         for (m, label) in [
             (&sys, "system · injected_context/hook_success"),
             (&summary, "user · compaction_summary"),
@@ -3215,6 +3209,7 @@ mod tests {
             name: "TaskCreate".into(),
             namespace: None,
             input: serde_json::json!({"subject":"write tests"}).into(),
+            extensions: Default::default(),
         });
         let line = tree_line_with_preview(&ordinary_task_tool, None);
         assert!(
@@ -3228,6 +3223,7 @@ mod tests {
             name: "run_worker".into(),
             namespace: None,
             input: serde_json::json!({}).into(),
+            extensions: Default::default(),
         });
         let spawn_line = tree_line_with_preview(&spawn, Some("delegate".into()));
         assert!(spawn_line.contains("↳ sub-agent (run_worker)"), "{spawn_line}");
@@ -3240,6 +3236,7 @@ mod tests {
             tool_name: None,
             status: None,
             details: None,
+            extensions: Default::default(),
         });
         let ret_line = tree_line_with_preview(&ret, Some("finished".into()));
         assert!(ret_line.contains("↩ sub-agent"), "{ret_line}");
@@ -3266,17 +3263,12 @@ mod tests {
         let h = Harness::parse("opensession").unwrap();
         let mut session = Session::new("sub-1", h);
         let mut prompt = Message::new(Role::User);
-        prompt.content.push(Block::Text {
-            text: "investigate bug".into(),
-        });
+        prompt.content.push(Block::from_text("investigate bug".into()));
         let mut interim = Message::new(Role::Assistant);
-        interim.content.push(Block::Text {
-            text: "checking files".into(),
-        });
+        interim.content.push(Block::from_text("checking files".into()));
         let mut done = Message::new(Role::Assistant);
-        done.content.push(Block::Text {
-            text: "root cause found in parser.rs".into(),
-        });
+        done.content
+            .push(Block::from_text("root cause found in parser.rs".into()));
         session.messages = vec![prompt, interim, done];
         std::fs::write(
             &path,

@@ -290,7 +290,7 @@ mod checked_verifier_tests {
         let text = |m: &mut Message, id: &str, parent: Option<&str>, text: &str| {
             m.id = Some(id.into());
             m.parent_id = parent.map(str::to_owned);
-            m.content.push(Block::Text { text: text.into() });
+            m.content.push(Block::from_text(text.into()));
         };
         let mut session = Session::new("source", Harness::Claude);
         let mut prompt = Message::new(Role::User);
@@ -393,7 +393,7 @@ mod checked_verifier_tests {
         let text = |m: &mut Message, id: Option<&str>, parent: Option<&str>, body: &str| {
             m.id = id.map(str::to_owned);
             m.parent_id = parent.map(str::to_owned);
-            m.content.push(Block::Text { text: body.into() });
+            m.content.push(Block::from_text(body.into()));
         };
         let mut session = Session::new("source", Harness::Claude);
         let mut u1 = Message::new(Role::User);
@@ -459,7 +459,7 @@ mod checked_verifier_tests {
         session.cwd = Some(PathBuf::from("/Users/me/legacy_custom_dir"));
         session.source_path = Some(src_file);
         let mut u = crate::ir::Message::new(Role::User);
-        u.content.push(Block::Text { text: "hi".into() });
+        u.content.push(Block::from_text("hi".into()));
         session.messages.push(u);
 
         let res = emit(

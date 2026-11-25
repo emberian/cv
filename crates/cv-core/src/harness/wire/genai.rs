@@ -71,12 +71,17 @@ pub(crate) fn select_with_images(view: JsonView<'_>, dialect: Dialect, keep_imag
         } else {
             None
         };
-        Some(Part::Media(Block::Image { media_type, data_ref }))
+        Some(Part::Media(Block::Image {
+            media_type,
+            data_ref,
+            extensions: Default::default(),
+        }))
     } else if let Some(value) = payload(&fields, "fileData", dialect)? {
         Some(Part::Media(Block::File {
             mime: string(value, "mimeType")?,
             path: None,
             source: string(value, "fileUri")?,
+            extensions: Default::default(),
         }))
     } else if let Some(value) = fields.get("text") {
         Some(Part::Text {
@@ -99,9 +104,10 @@ pub(crate) fn text_block(text: Text, thought: bool, signature: Option<String>) -
             signature,
             encrypted: None,
             redacted: false,
+            extensions: Default::default(),
         }
     } else {
-        Block::Text { text }
+        Block::from_text(text)
     }
 }
 /// Write an already-selected text part; the consumer chooses thought and signature publication.

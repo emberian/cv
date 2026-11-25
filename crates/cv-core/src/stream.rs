@@ -1213,7 +1213,7 @@ mod tests {
 
     fn text_msg(t: &str) -> Message {
         let mut m = Message::new(Role::User);
-        m.content = vec![Block::Text { text: t.into() }];
+        m.content = vec![Block::from_text(t.into())];
         m
     }
 
@@ -1245,6 +1245,7 @@ mod tests {
             tool_name: None,
             status: None,
             details: Some(serde_json::json!({"restorable":["file.rs"]})),
+            extensions: Default::default(),
         });
         counter.message(result);
         let counted = counter

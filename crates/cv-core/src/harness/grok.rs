@@ -676,6 +676,7 @@ fn grok_git(summary: &Value) -> Option<GitInfo> {
         branch: branch.map(str::to_string),
         commit: commit.map(str::to_string),
         remote: remote.map(str::to_string),
+        ..Default::default()
     })
 }
 
@@ -1313,6 +1314,7 @@ mod tests {
                         if !lazy && stage == "message" {
                             let Block::Text {
                                 text: Text::Inline(text),
+                                ..
                             } = &sink.first.as_ref().unwrap().content[0]
                             else {
                                 panic!("owned text")

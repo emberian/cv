@@ -13,6 +13,7 @@ use crate::source::{Dependencies, Probe};
 /// `cv adopt`: move a sub-agent stranded by a dead session into a live one — Claude-only byte
 /// surgery on this store's layout, so it lives beside the adapter that knows it.
 pub mod adopt;
+pub mod artifacts;
 /// `--carry-agents` / `adopt --join`: carry or join sub-agents under a derived session id.
 pub mod carry;
 pub(super) mod chain;
@@ -2501,7 +2502,7 @@ mod tests {
         // image + document.
         let media = &s.messages[3];
         assert!(
-            matches!(&media.content[0], Block::Image { media_type: Some(m), data_ref: Some(r) } if m == "image/png" && r == "base64:inline")
+            matches!(&media.content[0], Block::Image { media_type: Some(m), data_ref: Some(r) , .. } if m == "image/png" && r == "base64:inline")
         );
         assert!(
             matches!(&media.content[1], Block::File { mime: Some(m), path: Some(p), .. } if m == "application/pdf" && p == "spec.pdf")
@@ -3309,7 +3310,7 @@ mod tests {
                             );
                             continue;
                         }
-                        let Block::Text { text } = &sink.held.as_ref().unwrap().content[0] else {
+                        let Block::Text { text, .. } = &sink.held.as_ref().unwrap().content[0] else {
                             panic!("first text")
                         };
                         assert_eq!(matches!(text, Text::Source(_)), spans);
@@ -3436,7 +3437,7 @@ mod tests {
         let mut s = stream_file(&r.id, &path, &Demand::LEAN.with_spans(), &mut sink);
         s.messages = sink.messages;
         match &s.messages[0].content[0] {
-            Block::Text { text } => {
+            Block::Text { text, .. } => {
                 assert!(text.is_lazy(), "large content should be a span");
                 let resolver = s.resolver();
                 assert_eq!(text.try_resolve(&resolver).unwrap(), big.as_str());
@@ -3446,7 +3447,7 @@ mod tests {
         // And materialize() makes it inline and equal.
         s.materialize().unwrap();
         match &s.messages[0].content[0] {
-            Block::Text { text } => {
+            Block::Text { text, .. } => {
                 assert!(!text.is_lazy());
                 assert_eq!(text.inline_str(), Some(big.as_str()));
             }
@@ -3904,7 +3905,7 @@ mod tests {
             (COORDINATOR_HEAD, "Address this before completing your current task."),
         ] {
             let wrapped = format!("<system-reminder>\n{head}\nship wave 2\n\n{tail}\n</system-reminder>");
-            coordinator.content = vec![Block::Text { text: wrapped.clone().into() }];
+            coordinator.content = vec![Block::from_text(wrapped.clone().into() )];
             assert_eq!(ROOTLESS.delivered_body(&coordinator, &wrapped), Some("ship wave 2"));
         }
     }

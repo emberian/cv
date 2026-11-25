@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- OpenSession preserves unknown block types, message kinds, and nested fields through export and reports opaque content in read coverage.
+- Prune accepts parent-scoped `--agent`, summarizes command outcomes, stashes stale Edit and Write arguments for `cat --input`, and estimates cache break-even.
+- Adopt, agent carry, and port copy Claude tool-result files and prune sidecars so originals remain retrievable from the continuation.
 - Rewind, splice, and distill recover pre-compaction history and late results with `--uncompact`, and report excluded human prompts.
 - Antigravity rewind writes selected native SQLite rows and artifacts to an offline app-data root with `--out`.
 - Antigravity fills truncated export fields from matching native steps while retaining exported bodies for cleared rows.

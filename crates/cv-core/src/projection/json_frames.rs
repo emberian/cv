@@ -22,6 +22,14 @@ pub fn write_frame(
     resolver: &crate::Resolver,
     remaining: Option<usize>,
 ) -> anyhow::Result<usize> {
+    write_frame_with(stage, remaining, |mut w| message.write_json(&mut w, resolver))
+}
+
+pub(crate) fn write_frame_with(
+    stage: &mut impl Write,
+    remaining: Option<usize>,
+    write: impl FnOnce(&mut dyn Write) -> anyhow::Result<()>,
+) -> anyhow::Result<usize> {
     struct Capped<'a, W> {
         stage: &'a mut W,
         count: usize,
@@ -51,7 +59,7 @@ pub fn write_frame(
         cap: remaining.map(|n| n.saturating_add(1)),
     };
     writer.write_all(&[0x1e])?;
-    message.write_json(&mut writer, resolver)?;
+    write(&mut writer)?;
     Ok(writer.count - 1)
 }
 
@@ -486,6 +494,7 @@ mod tests {
             name: "tool".into(),
             namespace: None,
             input: json!({"quoted": "🌙\n\\\"", "nested": [{"a": []}, true, 12]}).into(),
+            extensions: Default::default(),
         });
         let expected = serde_json::to_vec(&message).unwrap();
         let resolver = crate::Resolver::new(None);
