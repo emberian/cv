@@ -5667,7 +5667,8 @@ fn export_bundle_survives_source_deletion_and_reports_uncaptured() {
             serde_json::json!([claude::tool_use(id, "Bash", serde_json::json!({"command": cmd}))]),
         )
     };
-    let big = "row\n".repeat(600);
+    let key = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    let big = format!("ANTHROPIC_API_KEY={key}\n{}", "row\n".repeat(600));
     w.write_session(
         "bundle-work",
         &[
@@ -5730,8 +5731,22 @@ fn export_bundle_survives_source_deletion_and_reports_uncaptured() {
         bundle.to_str().unwrap(),
         "--force",
     ]);
+    // --redact scrubs the document and the sidecar's stashed original before sealing.
+    let clean = w.base.join("clean.cvbundle");
+    let (out, _) = w.cv_ok(&[
+        "export",
+        "claude:bundle-pruned",
+        "--format",
+        "bundle",
+        "-o",
+        clean.to_str().unwrap(),
+        "--redact",
+    ]);
+    assert!(out.contains("redacted "), "{out}");
 
     fs::remove_dir_all(w.home.join(".claude")).unwrap();
+    let (cat, _) = w.cv_ok(&["cat", clean.to_str().unwrap(), "toolu_big"]);
+    assert!(!cat.contains(key) && cat.contains("row\nrow\n"), "{cat}");
     let path = bundle.to_str().unwrap();
     let (shown, _) = w.cv_ok(&["show", path]);
     assert!(

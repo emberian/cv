@@ -12,6 +12,10 @@
 //! and `files/<n>` (local files the session references: persisted tool outputs, media), each
 //! under a size cap. A reference that is missing or over the cap is listed in
 //! [`Manifest::uncaptured`] instead of silently dropped. Every record is BLAKE3-verified on read.
+//!
+//! With [`Input::redact`], every text record is scrubbed before it is sealed: the document, each
+//! sidecar entry, each captured file that is UTF-8 text, and the recorded git remote. Binary files
+//! (images) are carried as they are; [`Manifest::redactions`] counts what was scrubbed.
 
 use crate::ir::{Block, Session};
 use crate::packs::{PackBuilder, PackManifest, SealedPack};
@@ -50,6 +54,10 @@ pub struct Manifest {
     pub uncaptured: Vec<UncapturedDep>,
     pub file_max_bytes: u64,
     pub total_max_bytes: u64,
+    /// Spans scrubbed, when the bundle was written redacted; absent when it carries the session
+    /// as recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redactions: Option<usize>,
 }
 
 /// The repository the session worked in, as the session recorded it and, when its working
@@ -90,6 +98,8 @@ pub struct Input<'a> {
     pub source_path: &'a Path,
     pub sidecar: Option<PathBuf>,
     pub git: Option<GitState>,
+    /// Scrub secrets from every text record before sealing (`cv export --format bundle --redact`).
+    pub redact: Option<&'a crate::redact::RedactOptions>,
 }
 
 /// Is `path` a bundle (by extension, then by its magic)?
@@ -141,7 +151,21 @@ fn expand(p: &str) -> PathBuf {
 
 /// Write `input` as a bundle at `dest`, published whole under `claim`.
 pub fn write(dest: &Path, input: Input<'_>, claim: Claim) -> Result<Manifest> {
-    let session = input.session;
+    let mut stats = crate::redact::RedactStats::default();
+    let redacted;
+    let session = match input.redact {
+        Some(opts) => {
+            let (clean, st) = crate::redact::redact_with(input.session, opts)?;
+            stats = st;
+            redacted = clean;
+            &redacted
+        }
+        None => input.session,
+    };
+    let mut git = input.git;
+    if let (Some(opts), Some(remote)) = (input.redact, git.as_mut().and_then(|g| g.remote.as_mut())) {
+        *remote = crate::redact::scrub_cow(remote, opts, &mut stats).into_owned();
+    }
     let staged = StagedDir::beside(dest, "bundle")?;
     let pack_id = "bundle";
     let mut pack = PackBuilder::create(staged.path(), pack_id)?;
@@ -154,15 +178,19 @@ pub fn write(dest: &Path, input: Input<'_>, claim: Claim) -> Result<Manifest> {
         harness: session.harness.as_str().to_owned(),
         source_path: input.source_path.display().to_string(),
         messages: session.messages.len(),
-        git: input.git,
+        git,
         sidecar: None,
         files: Vec::new(),
         uncaptured: Vec::new(),
         file_max_bytes: FILE_MAX_BYTES,
         total_max_bytes: TOTAL_MAX_BYTES,
+        redactions: None,
     };
     if let Some(sidecar) = input.sidecar.filter(|p| p.is_file()) {
-        let bytes = std::fs::read(&sidecar).with_context(|| format!("reading sidecar {}", sidecar.display()))?;
+        let mut bytes = std::fs::read(&sidecar).with_context(|| format!("reading sidecar {}", sidecar.display()))?;
+        if let Some(opts) = input.redact {
+            bytes = scrub_sidecar(&bytes, opts, &mut stats)?;
+        }
         let addr = pack.append_record(SIDECAR, &bytes)?;
         manifest.sidecar = Some(Captured {
             path: sidecar.display().to_string(),
@@ -196,7 +224,14 @@ pub fn write(dest: &Path, input: Input<'_>, claim: Claim) -> Result<Manifest> {
                 .push(uncaptured(format!("{size} bytes, over the size cap")));
             continue;
         }
-        let bytes = std::fs::read(&local).with_context(|| format!("reading {}", local.display()))?;
+        let mut bytes = std::fs::read(&local).with_context(|| format!("reading {}", local.display()))?;
+        if let Some(opts) = input.redact {
+            if let Ok(text) = std::str::from_utf8(&bytes) {
+                if let std::borrow::Cow::Owned(clean) = crate::redact::scrub_cow(text, opts, &mut stats) {
+                    bytes = clean.into_bytes();
+                }
+            }
+        }
         total += bytes.len() as u64;
         let anchor = format!("files/{}", manifest.files.len());
         let addr = pack.append_record(anchor.clone(), &bytes)?;
@@ -213,6 +248,9 @@ pub fn write(dest: &Path, input: Input<'_>, claim: Claim) -> Result<Manifest> {
             kind: "working_tree".into(),
             why: "the working tree is not bundled; git names the commit it stood on".into(),
         });
+    }
+    if input.redact.is_some() {
+        manifest.redactions = Some(stats.total());
     }
     pack.append_record(MANIFEST, &serde_json::to_vec_pretty(&manifest)?)?;
     pack.seal(Claim::New)?;
@@ -234,6 +272,29 @@ pub fn write(dest: &Path, input: Input<'_>, claim: Claim) -> Result<Manifest> {
         dest.display()
     );
     Ok(manifest)
+}
+
+/// A sidecar with each entry scrubbed as JSON (its `content` and `input` alike); a line that is
+/// not JSON is scrubbed as text. Lines stay one per entry.
+fn scrub_sidecar(
+    bytes: &[u8],
+    opts: &crate::redact::RedactOptions,
+    stats: &mut crate::redact::RedactStats,
+) -> Result<Vec<u8>> {
+    let text = std::str::from_utf8(bytes).context("sidecar is not UTF-8")?;
+    let mut out = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        let (body, nl) = line.strip_suffix('\n').map_or((line, ""), |b| (b, "\n"));
+        match serde_json::from_str::<Value>(body) {
+            Ok(mut entry) => {
+                crate::redact::scrub_value(&mut entry, opts, stats);
+                out.push_str(&serde_json::to_string(&entry)?);
+            }
+            Err(_) => out.push_str(&crate::redact::scrub_cow(body, opts, stats)),
+        }
+        out.push_str(nl);
+    }
+    Ok(out.into_bytes())
 }
 
 /// An open bundle: its manifest and its verified records.
@@ -359,6 +420,7 @@ mod tests {
                     remote: None,
                     from: "recorded".into(),
                 }),
+                redact: None,
             },
             Claim::New,
         )?;
@@ -384,7 +446,8 @@ mod tests {
                 session: &session,
                 source_path: Path::new("x"),
                 sidecar: None,
-                git: None
+                git: None,
+                redact: None,
             },
             Claim::New
         )
@@ -392,6 +455,61 @@ mod tests {
         let fake = world.base.join("fake.cvbundle");
         std::fs::write(&fake, "not a bundle")?;
         assert!(!is_bundle(&fake));
+        Ok(())
+    }
+
+    // #tooth A redacted bundle carries no secret in any record: the document, the sidecar's
+    // stashed original, a captured tool output and the git remote are all scrubbed before sealing.
+    #[test]
+    fn redacted_bundle_scrubs_document_sidecar_files_and_remote() -> Result<()> {
+        let world = crate::test_world("bundle-redact");
+        let src = world.base.join("src");
+        std::fs::create_dir_all(&src)?;
+        let key = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let persisted = src.join("out.txt");
+        std::fs::write(&persisted, format!("export ANTHROPIC_API_KEY={key}\n"))?;
+        let sidecar = src.join("s.flat.jsonl");
+        std::fs::write(
+            &sidecar,
+            crate::prune::sidecar_line("toolu_1", "Bash", &Value::Null, &format!("token {key}")) + "\n",
+        )?;
+        let mut session = Session::new("s", Harness::Codex);
+        let mut m = Message::of_kind(Role::Tool, MessageKind::ToolResult, Origin::for_role(Role::Tool));
+        m.content = vec![result(
+            "toolu_2",
+            &format!("printed {key}"),
+            Some(serde_json::json!({"persistedOutput": {"path": persisted.to_str().unwrap()}})),
+        )];
+        session.messages.push(m);
+        let dest = world.base.join("clean.cvbundle");
+        let opts = crate::redact::RedactOptions::default();
+        let manifest = write(
+            &dest,
+            Input {
+                session: &session,
+                source_path: &src.join("s.jsonl"),
+                sidecar: Some(sidecar),
+                git: Some(GitState {
+                    remote: Some(format!("https://x-access-token:{key}@example.com/o/r.git")),
+                    from: "recorded".into(),
+                    ..GitState::default()
+                }),
+                redact: Some(&opts),
+            },
+            Claim::New,
+        )?;
+        assert!(manifest.redactions.is_some_and(|n| n >= 4), "{manifest:?}");
+        let bundle = Bundle::open(&dest)?;
+        let doc = String::from_utf8(bundle.document()?)?;
+        assert!(!doc.contains(key) && doc.contains("printed"), "{doc}");
+        let stashed = bundle.stashed("toolu_1")?.unwrap();
+        assert!(!stashed.to_string().contains(key) && stashed.to_string().contains("token"));
+        let file = String::from_utf8(bundle.file(persisted.to_str().unwrap())?.unwrap())?;
+        assert!(
+            !file.contains(key) && file.starts_with("export ANTHROPIC_API_KEY="),
+            "{file}"
+        );
+        assert!(!bundle.manifest.git.unwrap().remote.unwrap().contains(key));
         Ok(())
     }
 }

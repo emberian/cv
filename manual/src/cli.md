@@ -831,6 +831,8 @@ session as an OpenSession document, the prune or distill sidecar beside it, the 
 references (persisted tool outputs, images, file attachments; 8 MiB each, 64 MiB in all), and its
 git head and branch, in a sealed seekable-zstd pack whose records are BLAKE3-checked on read. What
 it could not capture (a missing or oversized file, the working tree) is listed, never dropped.
+With `--redact` the same scrub runs on every text record before sealing: the document, each
+sidecar entry, each captured text file and the git remote (images are carried as they are).
 `cv show`, `cv cat` and the other readers open a `.cvbundle` path after the source is gone.
 
 ```sh

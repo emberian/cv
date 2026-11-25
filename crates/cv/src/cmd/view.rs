@@ -1040,9 +1040,6 @@ pub(crate) fn cmd_export_bundle(
     out: &std::path::Path,
     force: bool,
 ) -> Result<()> {
-    if redact {
-        return crate::util::usage("--redact does not apply to a bundle: it carries the session as recorded");
-    }
     let want = parse_harness(&harness)?;
     let (r, adapter) = resolve(id, want)?;
     if window.window_in(adapter.as_ref(), &r)?.is_some() || window.max_bytes.is_some() {
@@ -1072,6 +1069,7 @@ pub(crate) fn cmd_export_bundle(
             source_path: &r.path,
             sidecar,
             git,
+            redact: redact.then_some(&cv_core::redact::RedactOptions::default()),
         },
         claim,
     )?;
@@ -1087,6 +1085,9 @@ pub(crate) fn cmd_export_bundle(
         },
         manifest.files.len()
     );
+    if let Some(n) = manifest.redactions {
+        println!("  redacted {n} item(s) across the document, sidecar and captured text files");
+    }
     if let Some(git) = &manifest.git {
         println!(
             "  git ({}): {} {}",
