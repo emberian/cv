@@ -211,19 +211,58 @@ pub struct PruneResult {
     pub invalidated_suffix_tokens: Option<u64>,
     /// [`cache_break_even_turns`]: turns until the prune pays for rebuilding that suffix.
     pub cache_break_even_turns: Option<u64>,
+    /// Recorded prompt tokens the prune frees from the active prompt.
+    pub headroom_gained_tokens: u64,
+    /// The source's last main-thread record is older than the longest prompt-cache TTL
+    /// ([`CACHE_TTL_MAX`]): nothing is cached to lose, so the prune pays back at once.
+    pub cache_cold: bool,
     /// Set when a low-bloat prune (under 15% of the active prompt saved) needs more than 30
     /// turns to break even on the cache it invalidates. Advice, not a data-safety warning.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_warning: Option<String>,
 }
 
-/// The prompt-cache break-even turn count `n* = ceil(invalidated * 0.9 / saved) + 1`: rewriting
-/// the invalidated suffix once at full input price costs the 90% cache discount on it, and each
-/// later turn reads `saved` fewer tokens. `None` when nothing is saved.
-pub fn cache_break_even_turns(invalidated_suffix: u64, tokens_saved: u64) -> Option<u64> {
-    (tokens_saved > 0)
-        .then(|| (u128::from(invalidated_suffix) * 9).div_ceil(u128::from(tokens_saved) * 10) + 1)
-        .map(|n| u64::try_from(n).unwrap_or(u64::MAX))
+/// Prompt-cache write price, as a multiple of the input price.
+pub const CACHE_WRITE: f64 = 1.25;
+/// Prompt-cache read price, as a multiple of the input price.
+pub const CACHE_READ: f64 = 0.10;
+/// The share of a warm session's prompt a turn reads from cache.
+pub const CACHE_HIT_RATE: f64 = 0.90;
+/// The longest prompt-cache TTL (the 1-hour tier; the default is 5 minutes). A session idle
+/// longer has no cache left to invalidate.
+pub const CACHE_TTL_MAX: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// The prompt-cache break-even turn count for rewriting `before` tokens down to `kept_after`.
+/// A warm turn costs `p = h·r + (1 − h)·w` per prompt token (`w` [`CACHE_WRITE`], `r`
+/// [`CACHE_READ`], `h` [`CACHE_HIT_RATE`]; `p = 0.215`). The prune's first turn writes
+/// `kept_after` fresh, a penalty of `kept_after·w − before·p` over not pruning; each turn after
+/// saves `(before − kept_after)·p`. So `n* = 1 + ceil(max(penalty, 0) / saving)`, and `1` when the
+/// cache is `cold`. Pass the invalidated suffix as `before`: the cached prefix costs the same either
+/// way. `None` when nothing is saved.
+pub fn cache_break_even_turns(before: u64, kept_after: u64, cold: bool) -> Option<u64> {
+    if kept_after >= before {
+        return None;
+    }
+    if cold {
+        return Some(1);
+    }
+    let p = CACHE_HIT_RATE * CACHE_READ + (1.0 - CACHE_HIT_RATE) * CACHE_WRITE;
+    let penalty = kept_after as f64 * CACHE_WRITE - before as f64 * p;
+    let saving = (before - kept_after) as f64 * p;
+    let turns = (penalty.max(0.0) / saving).ceil();
+    // `as` saturates a float past u64::MAX.
+    Some((turns as u64).saturating_add(1))
+}
+
+/// Whether `last` (an RFC 3339 record timestamp) is older than [`CACHE_TTL_MAX`] at `now`. An
+/// absent or unreadable timestamp is not evidence of a cold cache.
+pub fn cache_is_cold(last: Option<&str>, now: chrono::DateTime<chrono::Utc>) -> bool {
+    last.and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+        .is_some_and(|t| {
+            (now - t.with_timezone(&chrono::Utc))
+                .to_std()
+                .is_ok_and(|age| age > CACHE_TTL_MAX)
+        })
 }
 
 /// Below this share of the active prompt saved, a prune is low-bloat.
@@ -840,6 +879,8 @@ fn prune_session_after_stage(
     let mut prompt_before_previous: Option<u64> = None;
     let mut last_request_tokens = None;
     let mut last_request_rewritable = false;
+    // The newest main-thread timestamp: how long the provider's cache has been idle.
+    let mut last_timestamp: Option<String> = None;
 
     for (idx, (facts, range)) in parsed.into_iter().zip(lines.iter()).enumerate() {
         if first_mutation_prefix.is_none() && active_saving != 0 {
@@ -892,6 +933,9 @@ fn prune_session_after_stage(
         }
         if !facts.sidechain() {
             active_prompt = facts.facts.orig_ctx.or(facts.facts.usage_in).or(active_prompt);
+            if facts.facts.timestamp.is_some() {
+                last_timestamp.clone_from(&facts.facts.timestamp);
+            }
         }
         let is_old = is_turn_line && this_turn < keep_from;
 
@@ -1187,15 +1231,20 @@ fn prune_session_after_stage(
         .zip(first_mutation_prefix)
         .map(|(prompt, prefix)| prompt.saturating_sub(prefix));
     let saved_now = u64::try_from(active_saving.max(0)).unwrap_or(u64::MAX);
-    let cache_break_even_turns = invalidated_suffix_tokens.and_then(|suffix| cache_break_even_turns(suffix, saved_now));
+    let cache_cold = cache_is_cold(last_timestamp.as_deref(), chrono::Utc::now());
+    let cache_break_even_turns = invalidated_suffix_tokens
+        .map(|suffix| suffix.max(saved_now))
+        .and_then(|before| cache_break_even_turns(before, before - saved_now, cache_cold));
     let mut cache_warning = None;
     if let (Some(n), Some(prompt)) = (cache_break_even_turns, active_prompt.filter(|p| *p > 0)) {
         let percent = saved_now.saturating_mul(100) / prompt;
         if percent < LOW_BLOAT_PERCENT && n > BREAK_EVEN_WARN_TURNS {
             cache_warning = Some(format!(
                 "low-bloat prune: saves ~{percent}% of the active prompt but invalidates ~{}k cached tokens; \
-                 it pays back only after {n} more turns (at a 90% cached-input discount)",
-                invalidated_suffix_tokens.unwrap_or(0) / 1000
+                 it pays back only after {n} more turns (cache write {CACHE_WRITE}×, read {CACHE_READ}×, \
+                 {:.0}% hit rate)",
+                invalidated_suffix_tokens.unwrap_or(0) / 1000,
+                CACHE_HIT_RATE * 100.0
             ));
         }
     }
@@ -1209,6 +1258,8 @@ fn prune_session_after_stage(
         cache_break_even: CacheBreakEven::estimate(active_prompt, active_saving),
         invalidated_suffix_tokens,
         cache_break_even_turns,
+        headroom_gained_tokens: saved_now,
+        cache_cold,
         cache_warning,
         source_id,
         parent_session_id,

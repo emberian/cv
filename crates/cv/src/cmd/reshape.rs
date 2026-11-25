@@ -327,6 +327,12 @@ pub(crate) fn cmd_prune(args: PruneArgs<'_>) -> Result<()> {
             res.cache_break_even.n_star, res.cache_break_even.assumptions
         );
         match (res.invalidated_suffix_tokens, res.cache_break_even_turns) {
+            (Some(_), Some(_)) if res.cache_cold => {
+                let _ = writeln!(
+                    h,
+                    "  cache rebuild: the cache is cold (idle over an hour), so it pays back at once"
+                );
+            }
             (Some(suffix), Some(n)) => {
                 let _ = writeln!(
                     h,

@@ -9,7 +9,7 @@
 - Antigravity supports cold one-step seed emission, journaled live CreateConversation delivery, bounded brain-closure rewinds, post-compaction prompt recovery, and SessionStart adopt pointers.
 - `cv export --format bundle --file x.cvbundle` writes a session's portable closure (sidecar, referenced files, git state, uncaptured list); `show` and `cat` read it.
 - Rewind and prune accept Codex, Gemini, OpenCode, Qwen and OpenSession sessions, by selection and verified emission; prune's sidecar answers `cv cat`.
-- Prune reports `cache_break_even_turns` from the cached suffix it invalidates and warns when a low-bloat prune needs over 30 turns to pay back.
+- Prune reports `cache_break_even_turns` from the cached suffix it invalidates, priced by cache write, read and hit rate, plus `headroom_gained_tokens` and `cache_cold`.
 - Distill `--handoff peer|escalate|downshift` writes the pack for its successor, with a continuation-state badge; `--bricks` adds cache-stable extractive prefix bricks.
 - Distill bricks freeze 16-turn epochs, so a power-of-two rollover keeps the cached prefix, and carry span handles and read symbols.
 - Distill `--handoff escalate` keeps headings or definitions of reads behind later edits and errors, with `cv cat` pointers.

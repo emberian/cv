@@ -2570,14 +2570,25 @@ fn prune_cache_break_even_uses_net_prompt_savings() {
     assert_eq!(CacheBreakEven::estimate(Some(1000), 181).n_star, 42);
 }
 
-// #tooth n* = ceil(invalidated * 0.9 / saved) + 1, from the cached suffix after the first pruned
-// record; a low-bloat prune that needs more than 30 turns to pay back is warned about.
+// #tooth n* = 1 + ceil(max(kept·w − before·p, 0) / ((before − kept)·p)) with w = 1.25, r = 0.1,
+// h = 0.9 (p = 0.215), from the cached suffix after the first pruned record; a cold cache pays
+// back at once; a low-bloat prune that needs more than 30 turns to pay back is warned about.
 #[test]
 fn prune_break_even_turns_price_the_invalidated_suffix() -> Result<()> {
-    assert_eq!(cache_break_even_turns(10_000, 0), None);
-    assert_eq!(cache_break_even_turns(10_000, 1_000), Some(10));
-    assert_eq!(cache_break_even_turns(10_001, 1_000), Some(11));
-    assert_eq!(cache_break_even_turns(0, 1_000), Some(1));
+    assert_eq!(cache_break_even_turns(10_000, 10_000, false), None);
+    // penalty 9000·1.25 − 10000·0.215 = 9100; saving 1000·0.215 = 215; 9100 / 215 = 42.3.
+    assert_eq!(cache_break_even_turns(10_000, 9_000, false), Some(44));
+    assert_eq!(cache_break_even_turns(10_000, 9_000, true), Some(1));
+    // Dropping most of the suffix costs less to rewrite than a warm turn reads: no penalty.
+    assert_eq!(cache_break_even_turns(10_000, 1_000, false), Some(1));
+    assert_eq!(cache_break_even_turns(1_000, 0, false), Some(1));
+    let now = chrono::Utc::now();
+    let stamp = |age: i64| (now - chrono::Duration::seconds(age)).to_rfc3339();
+    assert!(!cache_is_cold(Some(&stamp(60)), now));
+    assert!(!cache_is_cold(Some(&stamp(3000)), now));
+    assert!(cache_is_cold(Some(&stamp(3700)), now));
+    assert!(!cache_is_cold(None, now));
+    assert!(!cache_is_cold(Some("not a time"), now));
     for (last_prompt, warned) in [(60_000u64, false), (5_000_000, true)] {
         let world = crate::test_world("prune-break-even");
         let path = fixture(&world.proj, &"x".repeat(40_000));
@@ -2587,6 +2598,10 @@ fn prune_break_even_turns_price_the_invalidated_suffix() -> Result<()> {
             .collect::<Result<_, _>>()?;
         rows[1]["message"]["usage"] = serde_json::json!({"input_tokens": 1_000});
         rows[3]["message"]["usage"] = serde_json::json!({"input_tokens": last_prompt});
+        // A warm cache: the session's records are a minute old.
+        for row in &mut rows {
+            row["timestamp"] = Value::from(stamp(60));
+        }
         std::fs::write(&path, rows.iter().map(|v| format!("{v}\n")).collect::<String>())?;
         let options = PruneOptions {
             min_size: 1024,
@@ -2595,6 +2610,7 @@ fn prune_break_even_turns_price_the_invalidated_suffix() -> Result<()> {
             ..Default::default()
         };
         let result = prune_session(crate::Harness::Claude, &path, &options)?;
+        assert!(!result.cache_cold);
         assert!(result.pruned_count >= 1);
         // The prefix through the first call stays cached; everything after it is rebuilt.
         assert_eq!(result.invalidated_suffix_tokens, Some(last_prompt - 1_000));
@@ -2609,7 +2625,28 @@ fn prune_break_even_turns_price_the_invalidated_suffix() -> Result<()> {
         assert_eq!(low, warned, "{:?} (n* {n}, saved {saved})", result.cache_warning);
         let json = serde_json::to_value(&result)?;
         assert_eq!(json["cache_break_even_turns"], n);
+        assert_eq!(json["headroom_gained_tokens"], saved);
+        assert_eq!(json["cache_cold"], false);
     }
+    // The fixture's own timestamps are months old: the cache is cold, so n* = 1 and no warning.
+    let world = crate::test_world("prune-break-even-cold");
+    let path = fixture(&world.proj, &"x".repeat(40_000));
+    let mut rows: Vec<Value> = std::fs::read_to_string(&path)?
+        .lines()
+        .map(serde_json::from_str)
+        .collect::<Result<_, _>>()?;
+    rows[3]["message"]["usage"] = serde_json::json!({"input_tokens": 5_000_000});
+    std::fs::write(&path, rows.iter().map(|v| format!("{v}\n")).collect::<String>())?;
+    let options = PruneOptions {
+        min_size: 1024,
+        keep_last: 1,
+        dry_run: true,
+        ..Default::default()
+    };
+    let result = prune_session(crate::Harness::Claude, &path, &options)?;
+    assert!(result.cache_cold);
+    assert_eq!(result.cache_break_even_turns, Some(1));
+    assert_eq!(result.cache_warning, None);
     Ok(())
 }
 
