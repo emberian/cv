@@ -1669,15 +1669,17 @@ fn custody_heads_converge_on_a_store_whose_version_numbers_are_taken() {
         "the physical pack id is filled in"
     );
 
-    // Another branch of migrations took versions 4 and 5; this store never had the table.
+    // Another branch of migrations took higher versions; this store never had the table.
+    let v_next = STATE_SCHEMA_VERSION + 1;
+    let v_after = STATE_SCHEMA_VERSION + 2;
     let taken = |conn: &rusqlite::Connection| {
         conn.execute_batch(
             "DROP TABLE custody_heads; DROP TABLE custody_heads_through;
-             CREATE TABLE hook_observations(id INTEGER PRIMARY KEY);
-             CREATE TABLE file_versions(id INTEGER PRIMARY KEY);
-             PRAGMA user_version = 5;",
+             CREATE TABLE IF NOT EXISTS future_a(id INTEGER PRIMARY KEY);
+             CREATE TABLE IF NOT EXISTS future_b(id INTEGER PRIMARY KEY);",
         )
         .unwrap();
+        conn.pragma_update(None, "user_version", v_after).unwrap();
     };
     let tables = |conn: &rusqlite::Connection| -> i64 {
         conn.query_row(
@@ -1689,44 +1691,117 @@ fn custody_heads_converge_on_a_store_whose_version_numbers_are_taken() {
     };
     let mut later = schema::MIGRATIONS.to_vec();
     later.push((
-        4,
-        "v4_elsewhere",
-        "CREATE TABLE IF NOT EXISTS hook_observations(id INTEGER PRIMARY KEY);",
+        v_next,
+        "v_next_elsewhere",
+        "CREATE TABLE IF NOT EXISTS future_a(id INTEGER PRIMARY KEY);",
     ));
     later.push((
-        5,
-        "v5_elsewhere",
-        "CREATE TABLE IF NOT EXISTS file_versions(id INTEGER PRIMARY KEY);",
+        v_after,
+        "v_after_elsewhere",
+        "CREATE TABLE IF NOT EXISTS future_b(id INTEGER PRIMARY KEY);",
     ));
     {
         let mut conn = rusqlite::Connection::open(store.path()).unwrap();
         taken(&conn);
         assert_eq!(tables(&conn), 0);
-        schema::ensure_migrated_with(&mut conn, 5, &later).unwrap();
-        assert_eq!(current_schema_version(&conn).unwrap(), 5, "the version is left alone");
+        schema::ensure_migrated_with(&mut conn, v_after, &later).unwrap();
+        assert_eq!(
+            current_schema_version(&conn).unwrap(),
+            v_after,
+            "the version is left alone"
+        );
         assert_eq!(tables(&conn), 2);
         let selector: String = conn
             .query_row("SELECT selector FROM custody_heads", [], |r| r.get(0))
             .unwrap();
         assert!(!selector.is_empty(), "the head was rebuilt from the published manifest");
         // Converging again is a no-op read.
-        schema::ensure_migrated_with(&mut conn, 5, &later).unwrap();
+        schema::ensure_migrated_with(&mut conn, v_after, &later).unwrap();
         assert_eq!(tables(&conn), 2);
     }
 
-    // The same store at this binary's version: frozen reads fall back, a writable open converges.
+    // Store stamped with a much newer `user_version = 99`: `custody_heads` returns `Ok(None)`,
+    // and under `--frozen` both `head_entries` and `inventory` fall back to `pack_manifests`
+    // without erroring on `NewerSchema`.
     {
         let conn = rusqlite::Connection::open(store.path()).unwrap();
-        conn.execute_batch("DROP TABLE custody_heads; DROP TABLE custody_heads_through;")
-            .unwrap();
-        conn.pragma_update(None, "user_version", STATE_SCHEMA_VERSION).unwrap();
+        conn.execute_batch(
+            "PRAGMA user_version = 99;
+             PRAGMA wal_checkpoint(TRUNCATE);",
+        )
+        .unwrap();
     }
+    assert_eq!(
+        store.custody_heads().unwrap(),
+        None,
+        "newer schema falls back to manifests"
+    );
+    {
+        let _frozen = crate::env::Env::from_vars([("CLUSTERVISION_HOME", dir.as_os_str())])
+            .with_frozen()
+            .enter();
+        assert_eq!(
+            store.custody_heads().unwrap(),
+            None,
+            "frozen newer schema falls back to manifests"
+        );
+        assert_eq!(crate::custody::head_entries(&dir).unwrap().len(), 1);
+        assert_eq!(crate::custody::inventory().unwrap().len(), 1);
+    }
+
+    // The same store at this binary's version without `custody_heads`: frozen reads fall back,
+    // and on a checkpointed store without `-wal`/`-journal`, neither `custody_heads` nor
+    // `inventory` copies `state.db` into `TMPDIR`.
+    {
+        let conn = rusqlite::Connection::open(store.path()).unwrap();
+        conn.execute_batch(
+            "DROP TABLE custody_heads; DROP TABLE custody_heads_through;
+             PRAGMA wal_checkpoint(TRUNCATE);",
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", STATE_SCHEMA_VERSION).unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+    }
+    let _ = std::fs::remove_file(dir.join("state.db-wal"));
+    let _ = std::fs::remove_file(dir.join("state.db-shm"));
     {
         let _frozen = crate::env::Env::default().with_frozen().enter();
         assert_eq!(store.custody_heads().unwrap(), None, "absent table: read the manifests");
     }
     drop(store.open_writable().unwrap());
     assert_eq!(store.custody_heads().unwrap().map(|h| h.len()), Some(1));
+    {
+        let conn = rusqlite::Connection::open(store.path()).unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+    }
+    let _ = std::fs::remove_file(dir.join("state.db-wal"));
+    let _ = std::fs::remove_file(dir.join("state.db-shm"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let locked_tmp = dir.join("locked-tmp");
+        std::fs::create_dir_all(&locked_tmp).unwrap();
+        std::fs::set_permissions(&locked_tmp, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let _frozen = crate::env::Env::from_vars([
+            ("CLUSTERVISION_HOME", dir.as_os_str()),
+            ("TMPDIR", locked_tmp.as_os_str()),
+        ])
+        .with_frozen()
+        .enter();
+        let heads = store.custody_heads();
+        let inv = crate::custody::inventory();
+        std::fs::set_permissions(&locked_tmp, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            heads.unwrap().map(|h| h.len()),
+            Some(1),
+            "checkpointed frozen read must not copy to TMPDIR"
+        );
+        assert_eq!(
+            inv.unwrap().len(),
+            1,
+            "checkpointed frozen inventory must not copy to TMPDIR"
+        );
+    }
 
     // A manifest published by a binary that does not keep the heads leaves them stale: frozen
     // readers fall back, the next writable open rebuilds.

@@ -227,7 +227,9 @@ impl ExtentChain {
         Ok((start, bytes))
     }
 
-    /// Hash span `i` whole against its recorded digest, once.
+    /// Hash span `i` whole against its recorded digest, once, keeping its first
+    /// [`Self::FRAMES`] frames in the cache so a sequential pass from byte 0 does not decode
+    /// them a second time.
     fn verify(&self, state: &mut ChainState, i: usize) -> Result<()> {
         if state.verified[i] {
             return Ok(());
@@ -235,13 +237,36 @@ impl ExtentChain {
         let (_, addr, pack) = &self.spans[i];
         let mut hash = blake3::Hasher::new();
         let (mut at, end) = (addr.decoded_offset, addr.decoded_offset + addr.length);
+        let mut head_cached = 0usize;
         while at < end {
-            let (start, bytes) = self.frame(state, *pack, at)?;
-            let from = (at - start) as usize;
-            let to = bytes.len().min((end - start) as usize);
-            anyhow::ensure!(from < to, "pack {} frame does not advance", addr.pack_id);
-            hash.update(&bytes[from..to]);
-            at = start + to as u64;
+            if head_cached < Self::FRAMES {
+                let (start, bytes) = self.frame(state, *pack, at)?;
+                head_cached += 1;
+                let from = (at - start) as usize;
+                let to = bytes.len().min((end - start) as usize);
+                anyhow::ensure!(from < to, "pack {} frame does not advance", addr.pack_id);
+                hash.update(&bytes[from..to]);
+                at = start + to as u64;
+            } else if let Some((_, start, bytes)) = state
+                .frames
+                .iter()
+                .find(|(p, start, bytes)| *p == *pack && *start <= at && at < start + bytes.len() as u64)
+            {
+                let start = *start;
+                let from = (at - start) as usize;
+                let to = bytes.len().min((end - start) as usize);
+                anyhow::ensure!(from < to, "pack {} frame does not advance", addr.pack_id);
+                hash.update(&bytes[from..to]);
+                at = start + to as u64;
+            } else {
+                let (start, bytes) = self.packs[*pack].decoded_frame_at(at)?;
+                state.decoded += 1;
+                let from = (at - start) as usize;
+                let to = bytes.len().min((end - start) as usize);
+                anyhow::ensure!(from < to, "pack {} frame does not advance", addr.pack_id);
+                hash.update(&bytes[from..to]);
+                at = start + to as u64;
+            }
         }
         anyhow::ensure!(
             *hash.finalize().as_bytes() == addr.blake3_digest,
@@ -501,6 +526,14 @@ pub struct Backing {
 }
 
 impl Backing {
+    /// Decoded byte length of the custody payload (`addr.length` for projections, `total_bytes` for native chains).
+    pub fn byte_len(&self) -> u64 {
+        match &self.custody {
+            CustodyKind::PortableProjection => self.addr.length,
+            CustodyKind::NativeExtents { total_bytes, .. } => *total_bytes,
+        }
+    }
+
     /// Read the native file with the harness's own adapter, its bytes served by position from
     /// the extent chain: the same parser, carriers and lifecycle as the live file, with nothing
     /// written anywhere. The adapter is handed a path that does not exist (the file's own name
@@ -685,12 +718,52 @@ pub fn inventory() -> Result<Vec<Backing>> {
     let Some(home) = crate::env::Env::current().cv_home() else {
         return Ok(vec![]);
     };
-    if !home.join("state.db").try_exists()? {
+    let db_path = home.join("state.db");
+    let meta = match std::fs::metadata(&db_path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(e) => return Err(e.into()),
+    };
+    if !meta.is_file() || meta.len() == 0 {
         return Ok(vec![]);
     }
     let mut rows = BTreeMap::new();
     let hub = crate::state::hub::HubStore::at_home(&home);
-    if let Some(manifest) = hub.get_snapshot(None)? {
+    let hub_manifest = if crate::env::frozen() {
+        crate::harness::store::sqlite::read(&db_path, |conn, _| {
+            use rusqlite::OptionalExtension as _;
+            let ver = crate::state::current_schema_version(conn)?;
+            if ver == 0 || ver > crate::state::STATE_SCHEMA_VERSION {
+                return Ok(None);
+            }
+            let has_table: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'hub_snapshots')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(false);
+            if !has_table {
+                return Ok(None);
+            }
+            let raw: Option<String> = conn
+                .query_row(
+                    "SELECT manifest_json FROM hub_snapshots ORDER BY hub_generation DESC LIMIT 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            raw.map(|s| serde_json::from_str(&s).map_err(anyhow::Error::from))
+                .transpose()
+        })?
+    } else {
+        match hub.get_snapshot(None) {
+            Ok(m) => m,
+            Err(crate::state::hub::HubError::State(crate::state::StateError::NewerSchema { .. })) => None,
+            Err(e) => return Err(e.into()),
+        }
+    };
+    if let Some(manifest) = hub_manifest {
         for entry in manifest.session_revisions.into_values() {
             let Some(addr) = entry.payload_addr else { continue };
             let Some(harness) = Harness::parse(&entry.harness) else {
@@ -863,6 +936,28 @@ mod tests {
             fresh.frames_decoded() <= 2 * frames,
             "{} frames decoded for {frames} frames",
             fresh.frames_decoded()
+        );
+
+        // #tooth Whole-extent verification preserves the first FRAMES decoded frames so a
+        // sequential read from byte 0 hits the cache instead of decoding frames 0..FRAMES twice.
+        let two_frame = &bytes[..6000]; // 2 frames at 4096 B/frame
+        let mut single_builder = crate::packs::PackBuilder::with_frame_size(&dir, "pack-two-frame", 4096, 1).unwrap();
+        let mut input = two_frame;
+        let single_addr = single_builder
+            .append_reader(archive_anchor(&key()), &mut input, two_frame.len() as u64)
+            .unwrap();
+        single_builder.seal(crate::publish::Claim::New).unwrap();
+        let two_frame_chain = std::sync::Arc::new(ExtentChain::open(&dir, &key(), &[single_addr]).unwrap());
+        let mut two_frame_out = Vec::new();
+        ExtentChainReader::new(two_frame_chain.clone())
+            .read_to_end(&mut two_frame_out)
+            .unwrap();
+        assert_eq!(two_frame_out, two_frame);
+        assert_eq!(
+            two_frame_chain.frames_decoded(),
+            2,
+            "2-frame extent must decode each frame once (got {})",
+            two_frame_chain.frames_decoded()
         );
         std::fs::remove_dir_all(dir).ok();
     }

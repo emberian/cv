@@ -667,24 +667,49 @@ impl StateStore {
     }
 
     /// The newest custody entry of every archived session (`custody_heads`), as stored JSON.
-    /// `None` when the table is absent or its watermark no longer matches `pack_manifests` (a
+    /// `None` when the table is absent, its watermark no longer matches `pack_manifests` (a
     /// store no writable open has converged yet, or one a binary without the table published
-    /// to): the caller then reads `pack_manifests` instead. Read-only and `--frozen` safe.
+    /// to), or `state.db` carries a newer `user_version`: the caller then reads `pack_manifests`
+    /// instead. Read-only and `--frozen` safe; on a checkpointed store without `-wal`/`-journal`
+    /// frames, `--frozen` reads `state.db` directly via `immutable=1` without copying to `TMPDIR`.
     pub fn custody_heads(&self) -> Result<Option<Vec<Value>>, StateError> {
-        let Some(conn) = self.open_readonly()? else {
-            return Ok(Some(Vec::new()));
-        };
-        if !custody_heads_fresh(&conn)? {
-            return Ok(None);
+        if crate::env::frozen() {
+            let meta = match std::fs::metadata(&self.db_path) {
+                Ok(m) => m,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Some(Vec::new())),
+                Err(e) => return Err(StateError::Io(e)),
+            };
+            if !meta.is_file() {
+                return Err(StateError::Io(std::io::Error::other(format!(
+                    "{} is not a regular file",
+                    self.db_path.display()
+                ))));
+            }
+            if meta.len() == 0 {
+                return Ok(Some(Vec::new()));
+            }
+            return crate::harness::store::sqlite::read(&self.db_path, |conn, _| {
+                let ver = super::current_schema_version(conn)?;
+                if ver == 0 {
+                    return Ok(Some(Vec::new()));
+                }
+                if ver > super::STATE_SCHEMA_VERSION {
+                    return Ok(None);
+                }
+                read_custody_heads_in(conn).map_err(anyhow::Error::from)
+            })
+            .map_err(|e| match e.downcast::<StateError>() {
+                Ok(se) => se,
+                Err(other) => StateError::Io(std::io::Error::other(other)),
+            });
         }
-        let mut stmt = conn.prepare("SELECT entry_json FROM custody_heads ORDER BY selector")?;
-        let rows = stmt
-            .query_map([], |r| r.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()?;
-        rows.iter()
-            .map(|raw| serde_json::from_str(raw).map_err(StateError::from))
-            .collect::<Result<Vec<_>, _>>()
-            .map(Some)
+        let conn = match self.open_readonly() {
+            Ok(Some(conn)) => conn,
+            Ok(None) => return Ok(Some(Vec::new())),
+            Err(StateError::NewerSchema { .. }) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        read_custody_heads_in(&conn)
     }
 
     /// List all published pack manifests ordered by `min_commit_pos`.
@@ -1722,6 +1747,21 @@ fn upsert_custody_heads(
         )?;
     }
     Ok(())
+}
+
+/// Read `custody_heads` rows from `conn` when the table is present and fresh.
+fn read_custody_heads_in(conn: &rusqlite::Connection) -> Result<Option<Vec<Value>>, StateError> {
+    if !custody_heads_fresh(conn)? {
+        return Ok(None);
+    }
+    let mut stmt = conn.prepare("SELECT entry_json FROM custody_heads ORDER BY selector")?;
+    let rows = stmt
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    rows.iter()
+        .map(|raw| serde_json::from_str(raw).map_err(StateError::from))
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
 }
 
 /// Whether `custody_heads` exists and folds exactly the manifests `pack_manifests` holds now (its
