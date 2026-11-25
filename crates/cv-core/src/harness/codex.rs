@@ -153,10 +153,53 @@ fn rollout_names_thread(name: &str, id: &str) -> bool {
     thread == id && uuid::Uuid::parse_str(thread).is_ok() && uuid::Uuid::parse_str(rollout).is_ok()
 }
 
+/// Envelopes the Codex app puts at the head of a user message that are not the person's words:
+/// the ambient in-app browser state, the open-page marker, and an attached image's descriptor.
+/// Each is `<tag ...>` through its own `</tag>`.
+const AMBIENT_ENVELOPES: [&str; 3] = ["external_browser_tabs", "external_codex_apps_open_page", "image"];
+
+/// `text` with every leading ambient envelope removed: what the person typed, or empty when the
+/// message was only envelopes.
+fn typed_after_ambient(text: &str) -> &str {
+    let mut rest = text.trim();
+    'strip: loop {
+        for tag in AMBIENT_ENVELOPES {
+            let Some(after_open) = rest.strip_prefix('<').and_then(|r| r.strip_prefix(tag)) else {
+                continue;
+            };
+            // `<image` must not match `<images>`: the tag name ends at `>` or whitespace.
+            if !after_open.starts_with(['>', ' ', '\n', '\t']) {
+                continue;
+            }
+            let close = format!("</{tag}>");
+            let Some((_, after)) = after_open.split_once(close.as_str()) else {
+                return rest;
+            };
+            rest = after.trim_start();
+            continue 'strip;
+        }
+        return rest;
+    }
+}
+
 impl Adapter for Codex {
     /// A session transcript is append-only JSONL.
     fn native_custody(&self) -> Option<super::NativeCustody> {
         Some(super::NativeCustody::Jsonl)
+    }
+
+    /// A person's turn is what they typed after the app's ambient envelopes
+    /// ([`typed_after_ambient`]). A message that is only envelopes is not a turn.
+    fn human_turn<'a>(&self, m: &Message, text: &'a str) -> Option<super::HumanTurn<'a>> {
+        if m.kind != MessageKind::Prompt || m.origin != Origin::Human {
+            return None;
+        }
+        let body = typed_after_ambient(text);
+        (!body.is_empty()).then_some(super::HumanTurn {
+            text: body,
+            queued: false,
+            proof: super::TurnProof::Adapter,
+        })
     }
 
     /// `codex resume <id>` reads `$CODEX_HOME/sessions/YYYY/MM/DD/` and `archived_sessions/`.
@@ -3650,5 +3693,73 @@ mod tests {
                 ),
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod human_turn_tests {
+    use super::*;
+
+    fn turn(text: &str) -> Option<&str> {
+        let m = Message::of_kind(Role::User, MessageKind::Prompt, Origin::Human);
+        Codex { roots: Vec::new() }.human_turn(&m, text).map(|t| t.text)
+    }
+
+    #[test]
+    fn a_message_that_is_only_ambient_app_state_is_not_a_person_turn() {
+        let tabs = "<external_browser_tabs>\n<in-app-browser-context source=\"ambient-ui-state\">\n- Current URL: http://localhost:5173/\n</in-app-browser-context>\n</external_browser_tabs>";
+        assert_eq!(turn(tabs), None);
+        // The app can record the block more than once in one message.
+        assert_eq!(turn(&format!("{tabs}\n{tabs}")), None);
+        assert_eq!(
+            turn("<external_codex_apps_open_page>{\"page_id\":null}</external_codex_apps_open_page>"),
+            None
+        );
+    }
+
+    #[test]
+    fn leading_envelopes_are_stripped_and_the_typed_text_kept() {
+        let tabs = "<external_browser_tabs>\n- Current URL: http://localhost:5173/\n</external_browser_tabs>";
+        assert_eq!(
+            turn(&format!("{tabs}\nmake the header larger")),
+            Some("make the header larger")
+        );
+        assert_eq!(
+            turn("<image name=[Image #1] path=\"/tmp/shot.png\">\n</image>\nlook at this: [Image #1]"),
+            Some("look at this: [Image #1]")
+        );
+        assert_eq!(
+            turn("<image name=[Image #1] path=\"/a.png\">\n</image>\n<image name=[Image #2] path=\"/b.png\">\n</image>\ncompare these"),
+            Some("compare these")
+        );
+    }
+
+    #[test]
+    fn ordinary_text_and_look_alike_tags_are_left_alone() {
+        assert_eq!(turn("  ship it  "), Some("ship it"));
+        // Not at the head: the person is quoting the tag.
+        assert_eq!(
+            turn("why is <external_browser_tabs> in my prompt?"),
+            Some("why is <external_browser_tabs> in my prompt?")
+        );
+        // A different tag that merely starts with a known name.
+        assert_eq!(
+            turn("<images>\nfoo\n</images>\nbar"),
+            Some("<images>\nfoo\n</images>\nbar")
+        );
+        // An unclosed envelope is kept whole rather than guessed at.
+        assert_eq!(turn("<image name=x>\nno close"), Some("<image name=x>\nno close"));
+        // A question reply is the person's answer; it stays.
+        let reply = "<send_user_message_question_reply>\n[{\"question\":\"Both?\",\"answer\":\"Both\"}]\n</send_user_message_question_reply>";
+        assert_eq!(turn(reply), Some(reply));
+    }
+
+    #[test]
+    fn harness_and_subagent_messages_are_never_person_turns() {
+        let codex = Codex { roots: Vec::new() };
+        let injected = Message::of_kind(Role::User, MessageKind::InjectedContext, Origin::Harness);
+        assert!(codex.human_turn(&injected, "real-looking text").is_none());
+        let child = Message::of_kind(Role::User, MessageKind::Prompt, Origin::Subagent);
+        assert!(codex.human_turn(&child, "do the task").is_none());
     }
 }

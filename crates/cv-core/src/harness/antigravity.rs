@@ -213,6 +213,22 @@ impl Adapter for Antigravity {
         true
     }
 
+    /// A person's turn is the request inside the `<USER_REQUEST>` envelope. The
+    /// `<ADDITIONAL_METADATA>` block and the settings notices the writer appends after the closing
+    /// tag are the harness's, so they are not part of the turn. An envelope with nothing typed in
+    /// it is not a turn.
+    fn human_turn<'a>(&self, m: &Message, text: &'a str) -> Option<super::HumanTurn<'a>> {
+        if m.kind != MessageKind::Prompt || m.origin != Origin::Human {
+            return None;
+        }
+        let body = exported_user_request(text).unwrap_or(text).trim();
+        (!body.is_empty()).then_some(super::HumanTurn {
+            text: body,
+            queued: false,
+            proof: super::TurnProof::Adapter,
+        })
+    }
+
     fn tool_result_lifecycle(&self, result: &super::lifecycle::ToolResult<'_>) -> super::lifecycle::Observation {
         lifecycle::tool_result(result)
     }
@@ -6248,5 +6264,58 @@ mod tests {
             crate::lanes::lanes_of(&coord_ref).is_err(),
             "corrupt chunk entry must fail lanes_of"
         );
+    }
+}
+
+#[cfg(test)]
+mod human_turn_tests {
+    use super::*;
+
+    fn turn(text: &str) -> Option<&str> {
+        let m = Message::of_kind(Role::User, MessageKind::Prompt, Origin::Human);
+        ROOTLESS.human_turn(&m, text).map(|t| t.text)
+    }
+
+    #[test]
+    fn the_turn_is_the_request_inside_the_envelope() {
+        assert_eq!(
+            turn("<USER_REQUEST>\nfix the header\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-11-24.\n</ADDITIONAL_METADATA>"),
+            Some("fix the header")
+        );
+        // Settings notices the writer appends after the closing tag are not the person's words.
+        assert_eq!(
+            turn("<USER_REQUEST>\nship it\n</USER_REQUEST>\n<ADDITIONAL_METADATA>x</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>\nmodel changed\n</USER_SETTINGS_CHANGE>"),
+            Some("ship it")
+        );
+        // A request the person typed across several lines stays whole.
+        assert_eq!(
+            turn("<USER_REQUEST>\nline one\n\nline two\n</USER_REQUEST>"),
+            Some("line one\n\nline two")
+        );
+    }
+
+    #[test]
+    fn an_empty_envelope_is_not_a_turn_and_bare_text_is_kept() {
+        assert_eq!(
+            turn("<USER_REQUEST>\n\n</USER_REQUEST>\n<ADDITIONAL_METADATA>x</ADDITIONAL_METADATA>"),
+            None
+        );
+        assert_eq!(turn("   "), None);
+        assert_eq!(
+            turn("  plain request with no envelope  "),
+            Some("plain request with no envelope")
+        );
+    }
+
+    #[test]
+    fn harness_and_subagent_messages_are_never_person_turns() {
+        let injected = Message::of_kind(Role::User, MessageKind::InjectedContext, Origin::Harness);
+        assert!(ROOTLESS
+            .human_turn(&injected, "<USER_REQUEST>\nx\n</USER_REQUEST>")
+            .is_none());
+        let child = Message::of_kind(Role::User, MessageKind::Prompt, Origin::Subagent);
+        assert!(ROOTLESS
+            .human_turn(&child, "<USER_REQUEST>\nx\n</USER_REQUEST>")
+            .is_none());
     }
 }
