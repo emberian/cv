@@ -519,7 +519,21 @@ impl Adapter for Claude {
         match m.kind {
             MessageKind::Prompt if m.origin == Origin::Human => {
                 let source = bag.and_then(|b| b.get("promptSource")).and_then(Value::as_str);
-                if source.is_some_and(|s| !matches!(s, "typed" | "queued" | "suggestion_accepted")) {
+                let record_human = bag
+                    .and_then(|b| b.get("origin"))
+                    .and_then(|o| o.get("kind"))
+                    .and_then(Value::as_str)
+                    == Some("human")
+                    || bag.and_then(|b| b.get("turnOrigin")).and_then(Value::as_str) == Some("human");
+                // The Claude desktop app sends what the person types through the SDK transport, so
+                // its records say `promptSource: "sdk"`. That alone could be a program; it is a
+                // typed turn only when the record also states a human origin.
+                let typed_source = match source {
+                    None | Some("typed" | "queued" | "suggestion_accepted") => true,
+                    Some("sdk") => record_human,
+                    Some(_) => false,
+                };
+                if !typed_source {
                     return None;
                 }
                 let unwrapped = self.delivered_body(m, text);
@@ -527,13 +541,7 @@ impl Adapter for Claude {
                 if !is_typed_claude_prompt(body) {
                     return None;
                 }
-                let stated = source.is_some()
-                    || bag
-                        .and_then(|b| b.get("origin"))
-                        .and_then(|o| o.get("kind"))
-                        .and_then(Value::as_str)
-                        == Some("human")
-                    || bag.and_then(|b| b.get("turnOrigin")).and_then(Value::as_str) == Some("human");
+                let stated = source.is_some() || record_human;
                 Some(HumanTurn {
                     text: body,
                     queued: source == Some("queued") || unwrapped.is_some(),
