@@ -219,6 +219,10 @@ SHELL_DOCTOR_EXPECTED = {
         "tool_results_mcp": 0, "tool_results_builtin": 0, "by_tool": [],
     },
     "whisper_uptake": {},
+    "post_compaction_churn": [],
+    "summary_provenance_contrast": [],
+    "spin_episodes": [],
+    "instruction_bloat": [],
 }
 
 

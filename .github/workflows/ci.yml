@@ -89,6 +89,9 @@ jobs:
             --accept commands.pack.args.context_bytes \
             --accept commands.pack.args.task.required \
             --accept commands.prune.args.id.required \
+            --accept commands.distill.args.keep_last.default \
+            --accept commands.distill.args.session.kind \
+            --accept commands.distill.args.session.value_type \
             --accept commands.splice.args.generate \
             --accept commands.splice.args.gen_model \
             --accept commands.rewind.args.from_compaction \

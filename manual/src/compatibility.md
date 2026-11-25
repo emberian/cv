@@ -46,6 +46,12 @@ while `cv pack --session SOURCE` produces a bounded overview without a task. CI 
 while `cv prune --agent AGENT` selects a sub-agent directly. CI accepts
 `commands.prune.args.id.required`; existing session invocations retain their meaning.
 
+0.20 widens `cv distill --session` to `--session[=HARNESS]` (`claude` when bare) and computes
+`--keep-last`'s default from `--handoff` (`12` when `--handoff` is omitted). CI accepts
+`commands.distill.args.keep_last.default`, `commands.distill.args.session.kind`, and
+`commands.distill.args.session.value_type`; bare `--session` and omitted `--keep-last` retain
+their meaning.
+
 ## HTTP transport in 0.19.2
 
 HTTP parsing and response framing now use Hyper. Requests without a `Host` header receive
