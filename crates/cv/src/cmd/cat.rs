@@ -86,7 +86,60 @@ pub(crate) fn cmd_cat(session: &str, tool_use_id: &str, harness: Option<String>,
         ));
     }
 
+    if cv_core::bundle::is_bundle(&r.path) {
+        let bundle = cv_core::bundle::Bundle::open(&r.path)?;
+        if print_bundled(&parsed, &bundle, tool_use_id, &mut out)? {
+            return Ok(());
+        }
+    }
     print_result(&parsed, &r.id, tool_use_id, &sidecar, Some(&anchor), &mut out)
+}
+
+/// A `.cvbundle` answers from its own records: a persisted output by the path the transcript
+/// names, a pruned output from the bundled sidecar. False: the transcript's inline text serves.
+fn print_bundled(
+    parsed: &cv_core::Session,
+    bundle: &cv_core::bundle::Bundle,
+    tool_use_id: &str,
+    out: &mut impl Write,
+) -> Result<bool> {
+    let resolver = parsed.resolver();
+    let found = parsed.messages.iter().flat_map(|m| &m.content).find_map(|b| match b {
+        Block::ToolResult {
+            tool_use_id: tid,
+            content,
+            details,
+            ..
+        } if tid == tool_use_id => Some((content, details)),
+        _ => None,
+    });
+    let Some((content, details)) = found else {
+        return match bundle.stashed(tool_use_id)? {
+            Some(v) => print_value(out, &v).map(|()| true),
+            None => Ok(false),
+        };
+    };
+    if let Some(p) = details
+        .as_ref()
+        .and_then(|d| d.pointer("/persistedOutput/path"))
+        .and_then(|v| v.as_str())
+    {
+        if let Some(bytes) = bundle.file(p)? {
+            eprintln!("✦ persisted output (bundled): {p}");
+            out.write_all(&bytes)?;
+            out.flush()?;
+            return Ok(true);
+        }
+    }
+    let text = content.try_resolve(&resolver).context("reading bundled tool result")?;
+    if text.trim_start().starts_with(cv_core::prune::MARKER_PREFIX) {
+        if let Some(v) = bundle.stashed(tool_use_id)? {
+            eprintln!("✦ from the bundled sidecar");
+            print_value(out, &v)?;
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn print_stashed_input(sidecar: &Path, id: &str, out: &mut impl Write) -> Result<()> {
@@ -253,7 +306,7 @@ impl cv_core::MessageSink for First<'_> {
 ///
 /// `Path::parent` of a bare filename is `Some("")`, not `None`, so the empty parent has to be
 /// filtered out explicitly or `abc.jsonl` would yield a bare `abc.flat.jsonl` sibling-of-nothing.
-fn sidecar_path(transcript: &Path) -> PathBuf {
+pub(crate) fn sidecar_path(transcript: &Path) -> PathBuf {
     let stem = transcript.file_stem().and_then(|s| s.to_str()).unwrap_or("session");
     transcript
         .parent()

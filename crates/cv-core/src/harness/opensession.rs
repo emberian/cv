@@ -165,6 +165,23 @@ impl Adapter for OpenSession {
     fn stream(&self, r: &SessionRef, opts: &Demand, sink: &mut dyn MessageSink) -> Result<Session> {
         crate::stream::checked(sink, |sink| stream_document(&r.path, opts, sink))
     }
+
+    /// A `.cvbundle` is an OpenSession document in a sealed pack: it opens by its path.
+    fn resolve_path(&self, path: &Path) -> Option<(SessionRef, Box<dyn Adapter>)> {
+        bundle_ref(path).map(|r| (r, Box::new(OpenSession) as Box<dyn Adapter>))
+    }
+}
+
+/// The [`SessionRef`] of a `.cvbundle` at `path`, `None` when it is not one.
+fn bundle_ref(path: &Path) -> Option<SessionRef> {
+    if !crate::bundle::is_bundle(path) {
+        return None;
+    }
+    let manifest = crate::bundle::Bundle::open(path).ok()?.manifest;
+    Some(SessionRef {
+        message_count: Some(manifest.messages),
+        ..SessionRef::new(manifest.session_id, Harness::OpenSession, path.to_owned())
+    })
 }
 
 impl OpenSession {
@@ -315,6 +332,11 @@ pub fn read_document(path: &Path) -> Result<Session> {
 
 /// Traverse the document's IR messages without retaining a complete Session.
 fn stream_document(path: &Path, opts: &Demand, sink: &mut dyn MessageSink) -> Result<Session> {
+    if crate::bundle::is_bundle(path) {
+        let document = crate::bundle::Bundle::open(path)?.document()?;
+        let v: Value = serde_json::from_slice(&document).context("bundled OpenSession document")?;
+        return read((&v).into(), None, opts, sink);
+    }
     let source = JsonSource::capture(path)?;
     source.read(ReadInput::Document, Validation::Value, |view| {
         read(view, Some((path, &source)), opts, sink)

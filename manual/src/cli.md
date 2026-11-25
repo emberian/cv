@@ -826,6 +826,25 @@ cv export da9174f4 --redact > safe.md         # secrets/PII scrubbed first; coun
 
 `--redact` is [`cv share`](#cv-share)'s scrub (keys, JWTs, emails, blobs, `KEY=value`), tallied on stderr.
 
+`--format bundle --file <name>.cvbundle` (`-o`) writes the session's portable closure as one file: the
+session as an OpenSession document, the prune or distill sidecar beside it, the local files it
+references (persisted tool outputs, images, file attachments; 8 MiB each, 64 MiB in all), and its
+git head and branch, in a sealed seekable-zstd pack whose records are BLAKE3-checked on read. What
+it could not capture (a missing or oversized file, the working tree) is listed, never dropped.
+`cv show`, `cv cat` and the other readers open a `.cvbundle` path after the source is gone.
+
+```sh
+cv export da9174f4 --format bundle -o lane.cvbundle
+cv cat lane.cvbundle toolu_01…                # a pruned or persisted output, from the bundle
+```
+
+```text
+✦ bundled da9174f4 → lane.cvbundle · 214 message(s) · sidecar · 3 file(s) captured
+  git (recorded): main 4f2a9c1…
+  ⚠ not captured (persisted_output): /home/u/.claude/projects/p/s/tool-results/x.txt — missing: …
+  ⚠ not captured (working_tree): /work/proj — the working tree is not bundled; git names the commit it stood on
+```
+
 ### `cv dataset`
 
 Fine-tuning JSONL, one session per line (`chatml` default `{"messages":[…]}`, `sharegpt`

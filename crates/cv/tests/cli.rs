@@ -5610,3 +5610,108 @@ fn rewind_and_prune_reshape_codex_gemini_and_opensession_by_selection() {
         assert_eq!(fs::read(&source).unwrap(), source_bytes);
     }
 }
+
+// #tooth `export --format bundle` is a closure: after the whole Claude store is deleted, `show`
+// and `cat` read the bundle alone (a pruned output from its sidecar, a persisted output from its
+// captured file), and a reference it could not capture is reported.
+#[test]
+fn export_bundle_survives_source_deletion_and_reports_uncaptured() {
+    let w = World::new("export-bundle");
+    let spill = w.proj.join("bundle-lane/tool-results/spill.txt");
+    fs::create_dir_all(spill.parent().unwrap()).unwrap();
+    fs::write(&spill, "the full spilled log\n").unwrap();
+    let stub = |path: &std::path::Path| {
+        format!(
+            "<persisted-output>\nOutput too large (66KB). Full output saved to: {}\n\nPreview (first 2KB):\nhead\n</persisted-output>",
+            path.display()
+        )
+    };
+    let gone = w.proj.join("bundle-lane/tool-results/gone.txt");
+    let call = |id: &str, cmd: &str, uuid: &str| {
+        claude::assistant(
+            uuid,
+            "2026-01-01T10:00:01Z",
+            "claude-sonnet-4-5",
+            serde_json::json!([claude::tool_use(id, "Bash", serde_json::json!({"command": cmd}))]),
+        )
+    };
+    let big = "row\n".repeat(600);
+    w.write_session(
+        "bundle-lane",
+        &[
+            claude::user("bundle-lane", "u1", "2026-01-01T10:00:00Z", "Bundle this lane."),
+            call("toolu_big", "make all", "a1"),
+            claude::tool_result("r1", "2026-01-01T10:00:02Z", "toolu_big", &big),
+            call("toolu_spill", "make spill", "a2"),
+            claude::tool_result("r2", "2026-01-01T10:00:03Z", "toolu_spill", &stub(&spill)),
+            call("toolu_gone", "make gone", "a3"),
+            claude::tool_result("r3", "2026-01-01T10:00:04Z", "toolu_gone", &stub(&gone)),
+            claude::assistant(
+                "a4",
+                "2026-01-01T10:00:05Z",
+                "claude-sonnet-4-5",
+                serde_json::json!([{"type": "text", "text": "All three ran."}]),
+            ),
+        ],
+    );
+    w.cv_ok(&[
+        "prune",
+        "claude:bundle-lane",
+        "--to",
+        "bundle-pruned",
+        "--min-size",
+        "512",
+        "--keep-last",
+        "1",
+    ]);
+    let bundle = w.base.join("lane.cvbundle");
+    let (out, _) = w.cv_ok(&[
+        "export",
+        "claude:bundle-pruned",
+        "--format",
+        "bundle",
+        "-o",
+        bundle.to_str().unwrap(),
+    ]);
+    assert!(out.contains("· sidecar · 1 file(s) captured"), "{out}");
+    assert!(
+        out.contains(&format!("⚠ not captured (persisted_output): {}", gone.display())),
+        "{out}"
+    );
+    assert!(out.contains("⚠ not captured (working_tree): /work/proj"), "{out}");
+    // A taken name is refused; --force replaces it.
+    let (ok, _, _, _) = w.cv(&[
+        "export",
+        "claude:bundle-pruned",
+        "--format",
+        "bundle",
+        "-o",
+        bundle.to_str().unwrap(),
+    ]);
+    assert!(!ok);
+    w.cv_ok(&[
+        "export",
+        "claude:bundle-pruned",
+        "--format",
+        "bundle",
+        "-o",
+        bundle.to_str().unwrap(),
+        "--force",
+    ]);
+
+    fs::remove_dir_all(w.home.join(".claude")).unwrap();
+    let path = bundle.to_str().unwrap();
+    let (shown, _) = w.cv_ok(&["show", path]);
+    assert!(
+        shown.contains("Bundle this lane.") && shown.contains("All three ran."),
+        "{shown}"
+    );
+    let (cat, _) = w.cv_ok(&["cat", path, "toolu_big"]);
+    assert_eq!(cat.trim_end(), big.trim_end());
+    let (cat, _) = w.cv_ok(&["cat", path, "toolu_spill"]);
+    assert_eq!(cat, "the full spilled log\n");
+    let (cat, _) = w.cv_ok(&["cat", path, "toolu_gone"]);
+    assert!(cat.contains("<persisted-output>"), "{cat}");
+    let (_, err) = w.cv_fails(&["export", "claude:bundle-pruned", "--format", "bundle"]);
+    assert!(err.contains("pass -o"), "{err}");
+}

@@ -24,6 +24,7 @@ pub mod bytes {
     pub use crate::harness::store::bytes::{ByteSource, ByteStage};
 }
 
+pub mod bundle;
 pub mod codex_handoff;
 pub mod dataset;
 pub mod digest;

@@ -963,9 +963,18 @@ enum Cmd {
     /// Export a session to markdown or OpenSession JSON (stdout); `cv share` is the HTML artifact.
     Export {
         id: String,
-        /// Output format: `md` (default) or `json`.
+        /// Output format: `md` (default), `json`, or `bundle` (a `.cvbundle` file at `--file`: the
+        /// session, its prune sidecar, the local files it references under size caps, its git
+        /// head and branch, and a list of what was not captured; `cv show`/`cv cat` read it
+        /// after the source is gone).
         #[arg(long, default_value = "md")]
         format: String,
+        /// With `--format bundle`: the file to write (`<name>.cvbundle`).
+        #[arg(long, short = 'o', value_name = "FILE")]
+        file: Option<PathBuf>,
+        /// With `--format bundle`: replace an existing file at `--file` by atomic rename.
+        #[arg(long, requires = "file")]
+        force: bool,
         #[arg(long)]
         harness: Option<String>,
         #[command(flatten)]
@@ -1476,10 +1485,17 @@ fn run() -> Result<()> {
         Cmd::Export {
             id,
             format,
+            file,
+            force,
             harness,
             window,
             redact,
-        } => view::cmd_export(&id, &format, harness, &window, redact),
+        } => match (format.as_str(), file) {
+            ("bundle", Some(file)) => view::cmd_export_bundle(&id, harness, &window, redact, &file, force),
+            ("bundle", None) => util::usage("--format bundle writes a file: pass -o/--file <name>.cvbundle"),
+            (_, Some(_)) => util::usage("--file writes --format bundle; md and json print to stdout"),
+            (format, None) => view::cmd_export(&id, format, harness, &window, redact),
+        },
         Cmd::Dataset {
             format,
             harness,

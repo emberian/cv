@@ -1031,6 +1031,113 @@ pub(crate) fn cmd_export(
     Ok(())
 }
 
+/// `cv export <id> --format bundle -o <file>`: the session's portable closure ([`cv_core::bundle`]).
+pub(crate) fn cmd_export_bundle(
+    id: &str,
+    harness: Option<String>,
+    window: &WindowArgs,
+    redact: bool,
+    out: &std::path::Path,
+    force: bool,
+) -> Result<()> {
+    if redact {
+        return crate::util::usage("--redact does not apply to a bundle: it carries the session as recorded");
+    }
+    let want = parse_harness(&harness)?;
+    let (r, adapter) = resolve(id, want)?;
+    if window.window_in(adapter.as_ref(), &r)?.is_some() || window.max_bytes.is_some() {
+        return crate::util::usage("a bundle carries the whole session; window flags do not apply");
+    }
+    let mut session = adapter.parse(&r)?;
+    session.materialize()?;
+    // The sidecar `cv cat` would read: beside the transcript by its stem, or by its id.
+    let anchor = cv_core::harness::claude::artifacts::anchor(&r.path, &r.id);
+    let sidecar = [
+        crate::cmd::cat::sidecar_path(&anchor),
+        crate::cmd::reshape::ir_sidecar_path(&r.path, &r.id),
+        crate::cmd::reshape::ir_sidecar_path(&r.path, &session.id),
+    ]
+    .into_iter()
+    .find(|p| p.is_file());
+    let git = bundle_git(&session);
+    let claim = if force {
+        cv_core::publish::Claim::Replace
+    } else {
+        cv_core::publish::Claim::New
+    };
+    let manifest = cv_core::bundle::write(
+        out,
+        cv_core::bundle::Input {
+            session: &session,
+            source_path: &r.path,
+            sidecar,
+            git,
+        },
+        claim,
+    )?;
+    println!(
+        "✦ bundled {} → {} · {} message(s) · {} · {} file(s) captured",
+        crate::util::short_id(&r.id),
+        out.display(),
+        manifest.messages,
+        if manifest.sidecar.is_some() {
+            "sidecar"
+        } else {
+            "no sidecar"
+        },
+        manifest.files.len()
+    );
+    if let Some(git) = &manifest.git {
+        println!(
+            "  git ({}): {} {}",
+            git.from,
+            git.branch.as_deref().unwrap_or("(no branch)"),
+            git.head.as_deref().unwrap_or("(no head)")
+        );
+    }
+    for dep in &manifest.uncaptured {
+        println!("  ⚠ not captured ({}): {} — {}", dep.kind, dep.path, dep.why);
+    }
+    Ok(())
+}
+
+/// The git head and branch a bundle records: the session's own record, else what `git` reports
+/// in its working directory now.
+fn bundle_git(session: &Session) -> Option<cv_core::bundle::GitState> {
+    if let Some(g) = session
+        .git
+        .as_ref()
+        .filter(|g| g.branch.is_some() || g.commit.is_some())
+    {
+        return Some(cv_core::bundle::GitState {
+            head: g.commit.clone(),
+            branch: g.branch.clone(),
+            remote: g.remote.clone(),
+            from: "recorded".into(),
+        });
+    }
+    let cwd = session.cwd.as_ref().filter(|d| d.is_dir())?;
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(args)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    let head = git(&["rev-parse", "HEAD"])?;
+    Some(cv_core::bundle::GitState {
+        head: Some(head),
+        branch: git(&["rev-parse", "--abbrev-ref", "HEAD"]),
+        remote: git(&["remote", "get-url", "origin"]),
+        from: "observed".into(),
+    })
+}
+
 /// The one-line per-class tally `export --redact` and `share` print to stderr.
 pub(crate) fn redaction_summary(st: &cv_core::redact::RedactStats) -> String {
     format!(
