@@ -406,6 +406,23 @@ pub enum CutAt {
     End,
 }
 
+/// The exclusive end of an IR-level rewind of `r` (a harness rewound by selection and verified
+/// emission, not by native record derivation), and the commit evidence that placed it. `len` is
+/// the session's message count.
+pub fn ir_cut_end(r: &SessionRef, len: usize, at: &CutAt) -> Result<(usize, Option<CommitEvidence>)> {
+    match at {
+        CutAt::End => Ok((len, None)),
+        CutAt::Message(n) if *n < len => Ok((n + 1, None)),
+        CutAt::Message(n) => bail!("--at {n}: the session has {len} messages (0..{len})"),
+        CutAt::Commit(sha) => {
+            let found = commit_evidence(r, std::slice::from_ref(sha))?;
+            let evidence = CommitEvidenceSink::best(&found, sha)
+                .with_context(|| format!("no tool result in {} shows commit {sha} being made or pushed", r.id))?;
+            Ok((evidence.msg_idx + 1, Some(evidence)))
+        }
+    }
+}
+
 /// Knobs for [`rewind_session`].
 #[derive(Debug, Clone)]
 pub struct RewindOptions {

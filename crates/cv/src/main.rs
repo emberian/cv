@@ -538,6 +538,10 @@ enum Cmd {
         /// Replace an existing --to session (transcript and sidecar) by atomic rename.
         #[arg(long, requires = "to")]
         force: bool,
+        /// Sessions of other harnesses (pruned by selection and verified emission): write under
+        /// this directory instead of the harness's own store.
+        #[arg(long, value_name = "DIR")]
+        out: Option<PathBuf>,
         /// Hard-drop payloads (no sidecar, irreversible) instead of stashing them for retrieval.
         #[arg(long)]
         drop: bool,
@@ -1590,6 +1594,7 @@ fn run() -> Result<()> {
             keep_last,
             to,
             force,
+            out,
             drop,
             drop_thinking,
             copy_resources,
@@ -1612,6 +1617,7 @@ fn run() -> Result<()> {
             keep_last,
             to,
             force,
+            out,
             drop,
             thinking: drop_thinking,
             copy_resources,

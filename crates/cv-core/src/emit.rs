@@ -724,6 +724,14 @@ pub fn supported_targets() -> &'static [Harness] {
     })
 }
 
+/// A fresh session id in `h`'s own spelling: OpenCode's `ses_…`, a UUIDv7 elsewhere.
+pub fn fresh_session_id(h: Harness) -> String {
+    match h {
+        Harness::OpenCode => format!("ses_{}", uuid::Uuid::now_v7().simple()),
+        _ => uuid::Uuid::now_v7().to_string(),
+    }
+}
+
 /// Effective cwd after applying any rehome override.
 pub(crate) fn effective_cwd(session: &Session, opts: &EmitOptions) -> Option<PathBuf> {
     opts.new_cwd.clone().or_else(|| session.cwd.clone())

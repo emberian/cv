@@ -451,7 +451,7 @@ fn is_session_file(path: &Path) -> bool {
 /// Whether `path` is a session JSONL under `projects/`: `<cwd>/chats/<id>.jsonl` or
 /// `<cwd>/subagents/<parent>/agent-<id>.jsonl`.
 pub(crate) fn is_session_jsonl(path: &Path) -> bool {
-    if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+    if path.extension().and_then(|e| e.to_str()) != Some("jsonl") || super::is_cv_sidecar(path) {
         return false;
     }
     let dir_name = |p: Option<&Path>| {

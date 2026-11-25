@@ -3803,7 +3803,7 @@ fn rewind_validates_explicit_harness_for_direct_paths_before_writing() {
     ]);
     assert!(!ok && code == 2, "{error}");
     assert!(
-        error.contains("Claude Code and native Antigravity sessions (got codex)"),
+        error.contains("no messages read from") && error.contains("as a codex session"),
         "{error}"
     );
     assert!(!output.exists());
@@ -5478,4 +5478,135 @@ fn task_note_ergonomic_claim_infers_session_files_and_provisional_decisions() {
     assert_eq!(status(), "current");
     w.cv_ok(&["task", "resolve", &dec, "--choice", "recover", "--from", "owner"]);
     assert_eq!(status(), "stale");
+}
+
+/// A Claude lane with a large early tool output, a commit, and later turns: ported to other
+/// harnesses for the IR-selection routes of rewind and prune.
+fn reshape_lane(w: &World) -> PathBuf {
+    let big = "build line\n".repeat(400);
+    w.write_session(
+        "reshape-lane",
+        &[
+            claude::user("reshape-lane", "u1", "2026-01-01T10:00:00Z", "Ship the parser fix."),
+            claude::assistant(
+                "a1",
+                "2026-01-01T10:00:01Z",
+                "claude-sonnet-4-5",
+                serde_json::json!([claude::tool_use(
+                    "toolu_big",
+                    "Bash",
+                    serde_json::json!({"command": "make all"})
+                )]),
+            ),
+            claude::tool_result("r1", "2026-01-01T10:00:02Z", "toolu_big", &big),
+            claude::assistant(
+                "a2",
+                "2026-01-01T10:00:03Z",
+                "claude-sonnet-4-5",
+                serde_json::json!([claude::tool_use(
+                    "toolu_commit",
+                    "Bash",
+                    serde_json::json!({"command": "git commit -am fix"})
+                )]),
+            ),
+            claude::tool_result(
+                "r2",
+                "2026-01-01T10:00:04Z",
+                "toolu_commit",
+                "[main 4f2a9c1] fix the parser\n 1 file changed",
+            ),
+            claude::assistant(
+                "a3",
+                "2026-01-01T10:00:05Z",
+                "claude-sonnet-4-5",
+                serde_json::json!([{"type": "text", "text": "Later work after the commit."}]),
+            ),
+        ],
+    )
+}
+
+// #tooth Codex, Gemini and OpenSession sessions rewind and prune by IR selection and verified
+// emission: a rewind at a commit ends at its result; a prune's markers name the new id and its
+// `<new_id>.flat.jsonl` sidecar answers `cv cat` with the original output.
+#[test]
+fn rewind_and_prune_reshape_codex_gemini_and_opensession_by_selection() {
+    let w = World::new("reshape-ir");
+    reshape_lane(&w);
+    for harness in ["codex", "gemini", "opensession"] {
+        let ported = w.base.join(format!("port-{harness}"));
+        let source = if harness == "opensession" {
+            // OpenSession is a document format: `export --format json` writes it.
+            let (doc, _) = w.cv_ok(&["export", "claude:reshape-lane", "--format", "json"]);
+            fs::create_dir_all(&ported).unwrap();
+            let path = ported.join("lane.opensession.json");
+            fs::write(&path, doc).unwrap();
+            path.to_str().unwrap().to_string()
+        } else {
+            let (out, _) = w.cv_ok(&[
+                "port",
+                "claude:reshape-lane",
+                "--harness",
+                harness,
+                "--out",
+                ported.to_str().unwrap(),
+                "--json",
+            ]);
+            let port: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+            port["path"].as_str().unwrap().to_string()
+        };
+        let source_bytes = fs::read(&source).unwrap();
+
+        let rewound = w.base.join(format!("rewind-{harness}"));
+        let (out, err) = w.cv_ok(&[
+            "rewind",
+            &source,
+            "--harness",
+            harness,
+            "--at",
+            "4f2a9c1",
+            "--out",
+            rewound.to_str().unwrap(),
+            "--json",
+        ]);
+        let rw: serde_json::Value = serde_json::from_str(out.trim()).unwrap_or_else(|e| panic!("{e}: {out}{err}"));
+        assert_eq!(rw["route"], "ir", "{harness}: {rw}");
+        assert_eq!(rw["evidence"]["kind"], "created", "{harness}: {rw}");
+        let new_path = rw["new_path"].as_str().unwrap();
+        let (shown, _) = w.cv_ok(&["show", new_path, "--harness", harness]);
+        assert!(shown.contains("Ship the parser fix."), "{harness}: {shown}");
+        assert!(shown.contains("fix the parser"), "{harness}: {shown}");
+        assert!(!shown.contains("Later work after the commit."), "{harness}: {shown}");
+
+        let pruned = w.base.join(format!("prune-{harness}"));
+        let (out, err) = w.cv_ok(&[
+            "prune",
+            &source,
+            "--harness",
+            harness,
+            "--min-size",
+            "512",
+            "--keep-last",
+            "1",
+            "--out",
+            pruned.to_str().unwrap(),
+            "--json",
+        ]);
+        let pr: serde_json::Value = serde_json::from_str(out.trim()).unwrap_or_else(|e| panic!("{e}: {out}{err}"));
+        assert_eq!(pr["snipped_payloads"], 1, "{harness}: {pr}");
+        let new_id = pr["new_id"].as_str().unwrap();
+        let new_path = pr["new_path"].as_str().unwrap();
+        let sidecar = PathBuf::from(pr["sidecar_path"].as_str().unwrap());
+        assert_eq!(
+            sidecar.file_name().unwrap().to_str().unwrap(),
+            format!("{new_id}.flat.jsonl")
+        );
+        assert!(sidecar.is_file(), "{harness}: {pr}");
+        let (shown, _) = w.cv_ok(&["show", new_path, "--harness", harness]);
+        assert!(shown.contains("[PRUNED id="), "{harness}: {shown}");
+        assert!(!shown.contains(&"build line\n".repeat(400)), "{harness}");
+        let (cat, _) = w.cv_ok(&["cat", new_path, "toolu_big", "--harness", harness]);
+        assert_eq!(cat.trim_end(), "build line\n".repeat(400).trim_end(), "{harness}");
+        // The source is never touched, and the sidecar is not listed as a session of its own.
+        assert_eq!(fs::read(&source).unwrap(), source_bytes);
+    }
 }

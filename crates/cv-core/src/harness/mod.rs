@@ -303,6 +303,14 @@ pub(crate) fn read_dir_bulk_kept(
 /// returns [`std::io::ErrorKind::Unsupported`] (e.g. `wasm32`), ignores `NotFound`, handles a
 /// regular file passed as `root` when `min_depth == 0`, and records unreadable directories/entries
 /// into `skipped`.
+/// A `<stem>.flat.jsonl` payload sidecar cv writes beside a pruned or distilled session: never a
+/// harness transcript, whatever directory it sits in.
+pub(crate) fn is_cv_sidecar(path: &std::path::Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.ends_with(".flat.jsonl"))
+}
+
 pub(crate) fn walk_dir_bulk(
     root: &std::path::Path,
     min_depth: usize,

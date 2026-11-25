@@ -34,7 +34,19 @@ pub(crate) fn cmd_cat(session: &str, tool_use_id: &str, harness: Option<String>,
     .session;
     parsed.messages = found.hit.into_iter().collect();
     let anchor = cv_core::harness::claude::artifacts::anchor(&r.path, &r.id);
-    let sidecar = sidecar_path(&anchor);
+    let mut sidecar = sidecar_path(&anchor);
+    if !sidecar.try_exists()? {
+        // A session pruned by IR selection keeps its sidecar as `<id>.flat.jsonl` beside it.
+        // A path names the file, so its reference id can be the file stem; the sidecar is named
+        // by the session id the transcript records.
+        for id in [r.id.as_str(), parsed.id.as_str()] {
+            let by_id = crate::cmd::reshape::ir_sidecar_path(&r.path, id);
+            if by_id.try_exists()? {
+                sidecar = by_id;
+                break;
+            }
+        }
+    }
     let mut out = std::io::BufWriter::new(std::io::stdout().lock());
 
     if input {

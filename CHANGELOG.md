@@ -7,6 +7,7 @@
 - Redaction recognizes structured credentials, cookie jars, and signed URL parameters, and drops secret-bearing reasoning signatures atomically.
 - Port verifies ordered content, tool links, and skill rewrites before publishing staged files or committing SQLite transactions, rolling back cleanly under `--strict`.
 - Antigravity supports cold one-step seed emission, journaled live CreateConversation delivery, bounded brain-closure rewinds, post-compaction prompt recovery, and SessionStart adopt pointers.
+- Rewind and prune accept Codex, Gemini, OpenCode, Qwen and OpenSession sessions, by selection and verified emission; prune's sidecar answers `cv cat`.
 - Prune reports `cache_break_even_turns` from the cached suffix it invalidates and warns when a low-bloat prune needs over 30 turns to pay back.
 - Distill `--handoff peer|escalate|downshift` writes the pack for its successor, with a continuation-state badge; `--bricks` adds cache-stable extractive prefix bricks.
 - Line-range blame follows unique carved blocks and edited declarations into their parent files and reports the relocation evidence.

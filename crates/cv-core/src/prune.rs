@@ -263,6 +263,98 @@ impl PruneResult {
     }
 }
 
+/// What [`prune_ir`] selected: the new session, old tool outputs replaced by `[PRUNED …]` markers
+/// naming the new id, and the originals for its `<new_id>.flat.jsonl` sidecar.
+#[derive(Debug)]
+pub struct IrPruned {
+    pub session: crate::ir::Session,
+    pub stashed: Vec<crate::distill::Elided>,
+    pub pruned_count: usize,
+    pub bytes_saved: u64,
+    pub tokens_saved: u64,
+}
+
+/// The IR-level prune for harnesses whose native records cv does not derive (`--harness` targets
+/// with a verified emitter): a tool output larger than `min_size` before the last `keep_last`
+/// messages becomes a marker; the caller emits the session under `new_id` and writes the
+/// sidecar beside it. `drop` stashes nothing and says so in the marker. A selector: the emitter
+/// owns call/result pairing and identity.
+pub fn prune_ir(mut session: crate::ir::Session, opts: &PruneOptions, new_id: &str) -> Result<IrPruned> {
+    use crate::ir::{tool_index, Block};
+    let resolver = session.resolver();
+    let names: HashMap<String, (String, Value)> = tool_index(&session.messages)
+        .into_iter()
+        .map(|(id, call)| {
+            Ok((
+                id.to_owned(),
+                (call.name.to_owned(), call.input.resolve()?.into_owned()),
+            ))
+        })
+        .collect::<Result<_>>()?;
+    let keep_from = session.messages.len().saturating_sub(opts.keep_last);
+    let (mut stashed, mut pruned_count, mut bytes_saved, mut tokens_saved) = (Vec::new(), 0, 0u64, 0u64);
+    for message in &mut session.messages[..keep_from] {
+        for block in &mut message.content {
+            let Block::ToolResult {
+                tool_use_id,
+                content,
+                tool_name,
+                ..
+            } = block
+            else {
+                continue;
+            };
+            let text = content.try_resolve(&resolver)?.into_owned();
+            if text.len() <= opts.min_size || text.starts_with(MARKER_PREFIX) {
+                continue;
+            }
+            let (name, input) = names
+                .get(tool_use_id.as_str())
+                .cloned()
+                .unwrap_or_else(|| (tool_name.clone().unwrap_or_default(), Value::Null));
+            let marker = build_marker(
+                tool_use_id,
+                &name,
+                &input,
+                "text",
+                text.len(),
+                text.lines().count(),
+                new_id,
+                opts.drop,
+            );
+            let before = crate::ir::est_tokens(&Block::ToolResult {
+                tool_use_id: tool_use_id.clone(),
+                content: text.as_str().into(),
+                is_error: false,
+                tool_name: None,
+                status: None,
+                details: None,
+                extensions: Default::default(),
+            })?;
+            bytes_saved += (text.len() - marker.len().min(text.len())) as u64;
+            tokens_saved += before.saturating_sub(str_tokens(&marker));
+            *content = marker.into();
+            pruned_count += 1;
+            if !opts.drop {
+                stashed.push(crate::distill::Elided {
+                    tool_use_id: tool_use_id.clone(),
+                    tool_name: name,
+                    input,
+                    content: text,
+                });
+            }
+        }
+    }
+    session.lineage.forked_from = Some(session.id.clone());
+    Ok(IrPruned {
+        session,
+        stashed,
+        pruned_count,
+        bytes_saved,
+        tokens_saved,
+    })
+}
+
 /// One stashed payload, written as a line of `<new-id>.flat.jsonl` and read back by [`retrieve`].
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct SidecarEntry<S = String, I = Value, C = Value> {

@@ -2,7 +2,7 @@
 
 use crate::cmd::port::emit_session;
 use crate::util::{dry_run_nulls, parse_harness, parse_range, report, short_id, usage};
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use cv_core::harness::claude::carry::{carry_agents, Carried, CarryAgents};
 use cv_core::harness::claude::skills::SkillsPolicy;
 use cv_core::ir::{human_bytes, Harness, Session};
@@ -141,6 +141,7 @@ pub(crate) struct PruneArgs<'a> {
     pub keep_last: usize,
     pub to: Option<String>,
     pub force: bool,
+    pub out: Option<PathBuf>,
     pub drop: bool,
     pub thinking: bool,
     pub copy_resources: bool,
@@ -175,6 +176,7 @@ pub(crate) fn cmd_prune(args: PruneArgs<'_>) -> Result<()> {
         keep_last,
         to,
         force,
+        out,
         drop,
         thinking,
         copy_resources,
@@ -217,10 +219,37 @@ pub(crate) fn cmd_prune(args: PruneArgs<'_>) -> Result<()> {
     carry_source(carry_agents, &r)?;
 
     if !cv_core::harness::has_derived_copies(r.harness) {
-        bail!(
-            "cv prune currently supports Claude Code sessions only (got {})",
-            r.harness
+        let native_only = [
+            (plan.is_some(), "--plan"),
+            (window.is_some(), "--window"),
+            (keep_range.is_some(), "--range"),
+            (declassify, "--declassify"),
+            (thinking, "--drop-thinking"),
+            (copy_resources, "--copy-resources"),
+            (carry_agents.is_some(), "--carry-agents"),
+            (skills_policy != SkillsPolicy::Keep, "--skills"),
+        ];
+        if let Some((_, flag)) = native_only.iter().find(|(set, _)| *set) {
+            return usage(format!(
+                "{flag} prunes Claude Code records; {} sessions prune by selection",
+                r.harness
+            ));
+        }
+        return prune_ir(
+            &r,
+            IrPruneArgs {
+                min_size,
+                keep_last,
+                drop,
+                to,
+                out,
+                dry_run,
+                json,
+            },
         );
+    }
+    if out.is_some() {
+        return usage("--out writes a pruned session of another harness; a Claude prune writes beside its source");
     }
 
     let pinned_id = to.is_some(); // --to: the new id is caller-chosen, so a dry run can still report it
@@ -415,6 +444,244 @@ pub(crate) fn cmd_prune(args: PruneArgs<'_>) -> Result<()> {
     report(json, &h, &v)
 }
 
+/// Harnesses rewound and pruned by IR selection and verified emission: every target with an
+/// emitter that is not Claude (record derivation) or native Antigravity (cold rewind).
+fn ir_reshapeable(h: Harness) -> bool {
+    !cv_core::harness::has_derived_copies(h)
+        && !cv_core::harness::has_cold_rewind(h)
+        && (h == Harness::OpenSession || cv_core::emit::supported_targets().contains(&h))
+}
+
+/// Where a selected session is written: `--out`, else the harness's own store.
+fn ir_out_dir(h: Harness, out: Option<PathBuf>) -> Result<PathBuf> {
+    match out {
+        Some(dir) => Ok(dir),
+        None => cv_core::harness::for_harness(h)
+            .and_then(|a| a.root())
+            .with_context(|| format!("{h} doesn't appear installed; pass --out <dir> to write somewhere")),
+    }
+}
+
+/// Emit an IR selection under `new_id` to its own harness with read-back verification. Returns
+/// the written path and the conversion losses the target's reader reported.
+fn emit_ir(session: &Session, target: Harness, out: Option<PathBuf>, new_id: &str) -> Result<(PathBuf, Vec<String>)> {
+    let out_dir = ir_out_dir(target, out)?;
+    if target == Harness::OpenSession {
+        // An OpenSession document is the IR's own serialization: written whole, then read back.
+        let mut owned = session.clone();
+        owned.materialize()?;
+        owned.id = new_id.to_string();
+        fs::create_dir_all(&out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
+        let path = out_dir.join(format!("{new_id}.opensession.json"));
+        let bytes = serde_json::to_vec_pretty(&cv_core::harness::opensession::document(&owned))?;
+        cv_core::publish::publish_reader(&path, "opensession", &bytes[..], cv_core::publish::Claim::New)?;
+        let back = cv_core::harness::opensession::read_document(&path)?;
+        let mut lost = Vec::new();
+        if back.messages.len() != owned.messages.len() {
+            lost.push(format!(
+                "messages: {} → {} (read back)",
+                owned.messages.len(),
+                back.messages.len()
+            ));
+        }
+        if back.id != new_id {
+            lost.push(format!("id: {new_id} → {} (read back)", back.id));
+        }
+        return Ok((path, lost));
+    }
+    let opts = EmitOptions {
+        new_id: Some(new_id.to_string()),
+        thinking: cv_core::emit::ThinkingMode::Native,
+        ..Default::default()
+    };
+    let (res, lost) = cv_core::emit::emit_verified(session, target, &out_dir, &opts)?;
+    Ok((res.path, lost))
+}
+
+/// The `<new_id>.flat.jsonl` sidecar beside an IR-emitted session: where `cv cat` looks for
+/// a pruned output when the transcript's own stem names no sidecar.
+pub(crate) fn ir_sidecar_path(written: &std::path::Path, new_id: &str) -> PathBuf {
+    written
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(std::path::Path::new("."))
+        .join(format!("{new_id}.flat.jsonl"))
+}
+
+struct IrPruneArgs {
+    min_size: usize,
+    keep_last: usize,
+    drop: bool,
+    to: Option<String>,
+    out: Option<PathBuf>,
+    dry_run: bool,
+    json: bool,
+}
+
+fn prune_ir(r: &cv_core::ir::SessionRef, args: IrPruneArgs) -> Result<()> {
+    let IrPruneArgs {
+        min_size,
+        keep_last,
+        drop,
+        to,
+        out,
+        dry_run,
+        json,
+    } = args;
+    if !ir_reshapeable(r.harness) {
+        return usage(format!("cv prune has no verified emitter for {} sessions", r.harness));
+    }
+    let adapter = cv_core::harness::for_harness(r.harness).with_context(|| format!("no adapter for {}", r.harness))?;
+    let (session, total, grown) = cv_core::emit::prepare_replayable(adapter.as_ref(), r, 0, None)?;
+    if total == 0 {
+        return usage(format!(
+            "no messages read from {} as a {} session",
+            r.path.display(),
+            r.harness
+        ));
+    }
+    let pinned = to.is_some();
+    let new_id = to.unwrap_or_else(|| cv_core::emit::fresh_session_id(r.harness));
+    let opts = cv_core::prune::PruneOptions {
+        min_size,
+        keep_last,
+        drop,
+        ..Default::default()
+    };
+    let pruned = cv_core::prune::prune_ir(session, &opts, &new_id)?;
+    let mut h = String::new();
+    let tag = if dry_run { " (dry run — nothing written)" } else { "" };
+    let _ = writeln!(h, "✦ pruned {} → {}{tag}", short_id(&r.id), short_id(&new_id));
+    let _ = writeln!(
+        h,
+        "  {} tool output(s) replaced by markers · −{} · ~{} token equivalents removed (byte estimate) · by IR selection",
+        pruned.pruned_count,
+        human_bytes(pruned.bytes_saved),
+        pruned.tokens_saved
+    );
+    if let Some(grown) = grown {
+        let _ = writeln!(h, "  read {grown}");
+    }
+    let mut v = serde_json::json!({
+        "harness": r.harness.as_str(),
+        "route": "ir",
+        "source_id": r.id,
+        "new_id": new_id,
+        "snipped_payloads": pruned.pruned_count,
+        "bytes_saved": pruned.bytes_saved,
+        "tokens_freed": pruned.tokens_saved,
+        "dry_run": dry_run,
+        "new_path": null,
+        "sidecar_path": null,
+        "lost": [],
+    });
+    if !dry_run {
+        let (path, lost) = emit_ir(&pruned.session, r.harness, out, &new_id)?;
+        let sidecar = (!pruned.stashed.is_empty()).then(|| ir_sidecar_path(&path, &new_id));
+        if let Some(sc) = &sidecar {
+            cv_core::distill::write_sidecar(sc, &pruned.stashed, cv_core::publish::Claim::New)
+                .with_context(|| format!("the new session {} is written; its sidecar failed", path.display()))?;
+        }
+        let _ = writeln!(h, "  new session: {}", path.display());
+        if let Some(sc) = &sidecar {
+            let _ = writeln!(
+                h,
+                "  sidecar:     {} (fetch an original: cv cat {} <tool_use_id>)",
+                sc.display(),
+                short_id(&new_id)
+            );
+        }
+        for line in &lost {
+            let _ = writeln!(h, "  ⚠ lost {line}");
+        }
+        let resume = crate::cmd::port::resume_lines(r.harness, &new_id, pruned.session.cwd.as_deref());
+        for line in &resume {
+            let _ = writeln!(h, "  resume with: {line}");
+        }
+        v["new_path"] = path.display().to_string().into();
+        v["sidecar_path"] = sidecar.map(|p| p.display().to_string()).into();
+        v["lost"] = serde_json::json!(lost);
+        v["resume"] = serde_json::json!(resume);
+    } else if !pinned {
+        v["new_id"] = serde_json::Value::Null;
+    }
+    report(json, &h, &v)
+}
+
+/// `cv rewind` of a harness rewound by IR selection: the prefix through the cut, emitted under
+/// a fresh id to the source's harness (or `--out`), verified by reading it back.
+fn rewind_ir(
+    r: &cv_core::ir::SessionRef,
+    cut: &cv_core::rewind::CutAt,
+    out: Option<PathBuf>,
+    to: Option<String>,
+    dry_run: bool,
+    json: bool,
+) -> Result<()> {
+    let adapter = cv_core::harness::for_harness(r.harness).with_context(|| format!("no adapter for {}", r.harness))?;
+    // One read: the replayable window `[0..end)` is the whole read truncated.
+    let (mut session, total, grown) = cv_core::emit::prepare_replayable(adapter.as_ref(), r, 0, None)?;
+    if total == 0 {
+        return usage(format!(
+            "no messages read from {} as a {} session",
+            r.path.display(),
+            r.harness
+        ));
+    }
+    let (end, evidence) =
+        cv_core::rewind::ir_cut_end(r, total, cut).map_err(|e| crate::util::UsageError(format!("{e:#}")))?;
+    session.messages.truncate(end);
+    session.lineage.forked_from = Some(r.id.clone());
+    let pinned = to.is_some();
+    let new_id = to.unwrap_or_else(|| cv_core::emit::fresh_session_id(r.harness));
+    let mut h = String::new();
+    let tag = if dry_run { " (dry run — nothing written)" } else { "" };
+    let _ = writeln!(h, "✦ rewound {} → {}{tag}", short_id(&r.id), short_id(&new_id));
+    let why = match &evidence {
+        Some(e) => format!(" · {} — `{}`", e.kind.label(), cv_core::ir::truncate(&e.command, 80)),
+        None => String::new(),
+    };
+    let _ = writeln!(
+        h,
+        "  cut:     msg {} of {total}{why} · {} message(s) kept · by IR selection",
+        end.saturating_sub(1),
+        session.messages.len()
+    );
+    if let Some(grown) = grown {
+        let _ = writeln!(h, "  read {grown}");
+    }
+    let mut v = serde_json::json!({
+        "harness": r.harness.as_str(),
+        "route": "ir",
+        "source_id": r.id,
+        "source_path": r.path,
+        "new_id": new_id,
+        "cut_msg_idx": end.saturating_sub(1),
+        "messages": session.messages.len(),
+        "evidence": evidence,
+        "dry_run": dry_run,
+        "new_path": null,
+        "lost": [],
+    });
+    if !dry_run {
+        let (path, lost) = emit_ir(&session, r.harness, out, &new_id)?;
+        let _ = writeln!(h, "  new session: {}", path.display());
+        for line in &lost {
+            let _ = writeln!(h, "  ⚠ lost {line}");
+        }
+        let resume = crate::cmd::port::resume_lines(r.harness, &new_id, session.cwd.as_deref());
+        for line in &resume {
+            let _ = writeln!(h, "  resume with: {line}");
+        }
+        v["new_path"] = path.display().to_string().into();
+        v["lost"] = serde_json::json!(lost);
+        v["resume"] = serde_json::json!(resume);
+    } else if !pinned {
+        v["new_id"] = serde_json::Value::Null;
+    }
+    report(json, &h, &v)
+}
+
 /// Report only an explicitly selected policy; keep preserves existing output.
 pub(crate) fn skills_line(h: &mut String, s: &cv_core::harness::claude::skills::SkillsReport) {
     if !s.is_keep() {
@@ -500,10 +767,18 @@ pub(crate) fn cmd_rewind(args: RewindArgs<'_>) -> Result<()> {
     if recovery.uncompact && (at.is_some() || full) {
         return usage("--uncompact selects the rewind cut and conflicts with --at and --full");
     }
+    if ir_reshapeable(r.harness) {
+        if carry_agents.is_some() || skills_policy != SkillsPolicy::Keep || recovery.uncompact {
+            return usage(format!(
+                "--carry-agents, --skills and --uncompact rewind Claude Code records; {} sessions rewind by selection",
+                r.harness
+            ));
+        }
+        return rewind_ir(&r, &cut, out, to, dry_run, json);
+    }
     if !cv_core::harness::has_derived_copies(r.harness) && !cv_core::harness::has_cold_rewind(r.harness) {
         return usage(format!(
-            "cv rewind supports Claude Code and native Antigravity sessions (got {}) — `cv splice {}:..N` composes a \
-             prefix of any harness",
+            "cv rewind has no verified emitter for {} sessions — `cv splice {}:..N` composes a prefix of any harness",
             r.harness,
             short_id(&r.id)
         ));

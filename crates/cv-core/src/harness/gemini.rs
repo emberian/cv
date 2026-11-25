@@ -485,7 +485,7 @@ fn is_chat_recording(path: &Path) -> bool {
     let in_chats = path
         .components()
         .any(|c| c.as_os_str() == std::ffi::OsStr::new("chats"));
-    if !in_chats {
+    if !in_chats || super::is_cv_sidecar(path) {
         return false;
     }
     matches!(path.extension().and_then(|e| e.to_str()), Some("json") | Some("jsonl"))

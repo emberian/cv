@@ -51,6 +51,18 @@ its payload, or a result planned one way inside a record the plan drops refuses 
 kept reply whose turn's tool results were all dropped or pointered "rests on nothing kept"
 (`plan.rests_on_nothing` in `--json`).
 
+**Other harnesses.** Claude Code sessions are rewound and pruned record by record. Codex, Gemini,
+OpenCode, Qwen and OpenSession sessions (any harness with a verified emitter, and OpenSession
+documents) are rewound and pruned by selection: cv reads the session into the IR, selects the
+prefix through `--at` (a message index or a commit sha, as for Claude) or replaces each tool output
+over `--min-size` before the last `--keep-last` messages with a `[PRUNED …]` marker, and emits the
+result under a fresh id to the same harness (`--out <dir>`, else its store), reading it back to
+report what the target did not keep. A prune writes the originals to `<new_id>.flat.jsonl` beside
+the new session, so `cv cat <new-id> <tool_use_id>` answers every marker. Flags that edit Claude
+records (`--plan`, `--window`, `--range`, `--declassify`, `--drop-thinking`, `--carry-agents`,
+`--skills`, `--uncompact`) refuse there with exit 2. Pass `--harness` with a transcript path whose
+format cv would otherwise read as Claude's.
+
 What a session wrote and read on disk is already a mechanical listing, paths from its tool calls:
 `cv events <id> --kind file_edit` and `--kind file_read` (`--json`, `--subagents`), one streamed
 pass. It is worth pasting into the précis of whatever a plan drops.
