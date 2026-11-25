@@ -231,10 +231,7 @@ pub(crate) fn is_distill_section_heading(trimmed: &str) -> bool {
         return false;
     }
     let after_digits = &after_hashes[digits..];
-    let after_sub = after_digits
-        .strip_prefix('b')
-        .or_else(|| after_digits.strip_prefix('B'))
-        .unwrap_or(after_digits);
+    let after_sub = after_digits.strip_prefix(['a', 'b', 'A', 'B']).unwrap_or(after_digits);
     let Some(title) = after_sub.strip_prefix(". ") else {
         return false;
     };
@@ -247,6 +244,10 @@ pub(crate) fn is_distill_section_heading(trimmed: &str) -> bool {
         "facts",
         "ledger",
         "the last ",
+        "prefix bricks",
+        "continuation state",
+        "verified progress",
+        "[unverified predecessor notes",
     ]
     .iter()
     .any(|sec| {

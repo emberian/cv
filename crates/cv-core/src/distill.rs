@@ -61,6 +61,113 @@ pub struct DistillOptions {
     /// How the pack names the session that holds elided outputs, in its `cv cat <ref> <id>` hints.
     /// Defaults to the source session id.
     pub retrieve_ref: Option<String>,
+    /// Who the pack is for ([`HandoffMode`]). `None` renders the default pack.
+    pub handoff: Option<HandoffMode>,
+    /// Prepend the continuation-state badge ([`ContinuationState`]) without a hand-off mode.
+    /// Every hand-off mode includes it.
+    pub state_header: bool,
+    /// Render the pre-tail turns as extractive dyadic prefix bricks ([`dyadic_bricks`]) right
+    /// after the source line, and keep everything above them independent of the session's length.
+    pub dyadic_bricks: bool,
+}
+
+/// The successor a distilled pack is written for, relative to the lane it replaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HandoffMode {
+    /// A model of the same strength: the default pack plus the continuation-state badge.
+    Peer,
+    /// A stronger model, usually after repeated failures: the predecessor's narrative is left out
+    /// of the timeline (its hypotheses mislead), the user specification is consolidated, every
+    /// fact is kept, and what the predecessor wrote down is quarantined as unverified.
+    Escalate,
+    /// A weaker or cheaper model: the user specification, a verified-progress checklist and a
+    /// short verbatim tail; no ledger.
+    Downshift,
+}
+
+impl HandoffMode {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "peer" => Some(Self::Peer),
+            "escalate" => Some(Self::Escalate),
+            "downshift" => Some(Self::Downshift),
+            _ => None,
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Peer => "peer",
+            Self::Escalate => "escalate",
+            Self::Downshift => "downshift",
+        }
+    }
+    /// The verbatim tail when `--keep-last` is not given: none for escalation (the tail is the
+    /// predecessor's reasoning in motion), six calls for a downshift, the usual twelve for a peer.
+    pub fn default_keep_last(self) -> usize {
+        match self {
+            Self::Peer => 12,
+            Self::Escalate => 0,
+            Self::Downshift => 6,
+        }
+    }
+    /// Whether the agent's own narrative stays in the timeline.
+    fn keeps_narrative(self) -> bool {
+        self == Self::Peer
+    }
+}
+
+/// Where the transcript's last edit/validation sequence left the work. Computed from the
+/// build/test commands the facts index recognizes and from file-mutating tool calls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContinuationState {
+    /// The last validation failed and edits followed it that no validation has checked.
+    PostFailureEdit,
+    /// The last validation failed and nothing was edited after it.
+    FailingValidation,
+    /// The last validation passed and nothing was edited after it.
+    VerifiedClean,
+    /// No validation ran, or edits followed the last passing one.
+    InProgress,
+}
+
+impl ContinuationState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PostFailureEdit => "post_failure_edit",
+            Self::FailingValidation => "failing_validation",
+            Self::VerifiedClean => "verified_clean",
+            Self::InProgress => "in_progress",
+        }
+    }
+}
+
+/// One step of the edit/validation sequence, in transcript order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Step {
+    /// A file-mutating call: its path.
+    Edit(String),
+    /// A build/test command's result: its label, verdict and whether it passed.
+    Validate {
+        label: String,
+        verdict: String,
+        passed: bool,
+    },
+}
+
+fn continuation_state(steps: &[(usize, Step)]) -> ContinuationState {
+    let last = steps.iter().rposition(|(_, s)| matches!(s, Step::Validate { .. }));
+    let Some(at) = last else {
+        return ContinuationState::InProgress;
+    };
+    let edited_after = steps[at + 1..].iter().any(|(_, s)| matches!(s, Step::Edit(_)));
+    match (&steps[at].1, edited_after) {
+        (Step::Validate { passed: false, .. }, true) => ContinuationState::PostFailureEdit,
+        (Step::Validate { passed: false, .. }, false) => ContinuationState::FailingValidation,
+        (_, false) => ContinuationState::VerifiedClean,
+        (_, true) => ContinuationState::InProgress,
+    }
 }
 
 impl Default for DistillOptions {
@@ -72,6 +179,9 @@ impl Default for DistillOptions {
             keep_tail_thinking: false,
             ledger: true,
             retrieve_ref: None,
+            handoff: None,
+            state_header: false,
+            dyadic_bricks: false,
         }
     }
 }
@@ -125,6 +235,15 @@ pub struct DistillStats {
     pub commits: usize,
     pub errors: usize,
     pub elided_outputs: usize,
+    /// The continuation-state badge, when the pack carries one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub continuation_state: Option<ContinuationState>,
+    /// The hand-off mode the pack was written for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<HandoffMode>,
+    /// Dyadic prefix bricks rendered (`--bricks`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bricks: Option<Vec<Brick>>,
 }
 
 /// A source call whose history holds no terminal evidence.
@@ -223,6 +342,9 @@ pub struct Distilled {
     brief_origin: Option<Origin>,
     human_prompts: Vec<CarriedHumanPrompt>,
     earlier_md: String,
+    /// The pack opens with dyadic bricks: the resume preamble leaves out the counts that change
+    /// as the source grows, so the cached prefix reaches through the sealed bricks.
+    stable_prefix: bool,
 }
 
 impl Distilled {
@@ -400,6 +522,10 @@ struct Facts {
     /// The newest message at which each run finished without error, and the newest gate verdict's.
     ok_at: HashMap<String, usize>,
     gate_at: HashMap<String, usize>,
+    /// The edit/validation sequence the continuation state is read from.
+    steps: Vec<(usize, Step)>,
+    /// Files mutated by tool calls, first edit first, each once.
+    edited: Vec<(usize, String)>,
 }
 
 impl Facts {
@@ -421,6 +547,18 @@ impl Facts {
         match run.as_ref().and_then(|run| later.get(run)) {
             Some(at) if *at > i => format!(" ({what} [{at}])"),
             _ => String::new(),
+        }
+    }
+
+    fn note_edits(&mut self, i: usize, summary: &ToolInput<'_>) {
+        for sem in &summary.ops {
+            if let crate::tools::classify::ToolOp::FileEdit { path, .. } = &sem.op {
+                let path = path.as_ref();
+                if !self.edited.iter().any(|(_, p)| p == path) {
+                    self.edited.push((i, path.to_owned()));
+                }
+                self.steps.push((i, Step::Edit(path.to_owned())));
+            }
         }
     }
 
@@ -463,9 +601,10 @@ enum Re {
     OpenItem,
     Decision,
     InPlace,
+    GateFailed,
 }
 
-static RES: [OnceLock<Regex>; 20] = [const { OnceLock::new() }; 20];
+static RES: [OnceLock<Regex>; 21] = [const { OnceLock::new() }; 21];
 
 fn re(which: Re) -> &'static Regex {
     let (cell, pat) = match which {
@@ -519,6 +658,11 @@ fn re(which: Re) -> &'static Regex {
         Re::Decision => (
             &RES[18],
             r"(?i)\bdecided\b|\bruling\b|\bdecision:\s|\bmust\s+not\b|\bshall\s+not\b|\bdo\s+not\s+(?:edit|touch|modify|commit|push|delete|write)\b",
+        ),
+        // A build/test run that reported failure in output its tool did not flag as an error.
+        Re::GateFailed => (
+            &RES[20],
+            r"(?m)test result: FAILED|^error(?:\[E\d+\])?:|^FAILED\b|\b[1-9]\d* failed\b|^FAIL\b|Exit code [1-9]",
         ),
         // The message file of `git commit … -F <file>` (also `-qF`, `--file=`).
         Re::CommitFile => (
@@ -1809,6 +1953,7 @@ fn analyze_with_policy(
                             lifecycle.call(id);
                             let summary = ToolInput::new(session.harness, name, raw_input, !in_tail, false)?;
                             scan_input_facts(name, &summary, &mut facts);
+                            facts.note_edits(i, &summary);
                             let mut noted_cd = false;
                             for c in summary.commands() {
                                 facts.note_pid_files(i, c);
@@ -1917,37 +2062,85 @@ fn analyze_with_policy(
                 human_prompts: Vec::new(),
                 earlier_md: String::new(),
                 unsettled,
+                stable_prefix: false,
             },
             tail: Vec::new(),
             keep_last: opts.keep_last,
         });
     }
+    let mode = opts.handoff;
+    let narrative = mode.is_none_or(HandoffMode::keeps_narrative);
+    let escalate = mode == Some(HandoffMode::Escalate);
+    let state = (opts.state_header || mode.is_some()).then(|| continuation_state(&facts.steps));
+    let parent = session
+        .lineage
+        .parent
+        .as_deref()
+        .map(|p| format!(" (sub-agent of `{p}`)"))
+        .unwrap_or_default();
     let mut h = String::new();
     let _ = writeln!(h, "# Distilled context — {}\n", crate::sanitize::sanitize_line(&label));
-    let _ = writeln!(
-        h,
-        "Source: `{}:{}`{} · {} messages · {} tool calls. Distilled by `cv distill` (deterministic \
-         extraction, no model). Anything elided is retrievable: `cv cat {retrieve_ref} <tool_use_id>`; \
-         the full source stays readable with `cv show {} --range A..B` (bracketed numbers below are \
-         its message indices).\n",
-        session.harness.as_str(),
-        session.id,
-        session
-            .lineage
-            .parent
-            .as_deref()
-            .map(|p| format!(" (sub-agent of `{p}`)"))
-            .unwrap_or_default(),
-        msgs.len(),
-        tool_calls,
-        session.id,
-    );
+    let mut bricks = None;
+    if opts.dyadic_bricks {
+        // Everything up to the end of the sealed bricks must not depend on the session's length.
+        let _ = writeln!(
+            h,
+            "Source: `{}:{}`{parent}. Distilled by `cv distill` (deterministic extraction, no model). \
+             Anything elided is retrievable: `cv cat {retrieve_ref} <tool_use_id>`; the full source stays \
+             readable with `cv show {} --range A..B` (bracketed numbers below are its message indices).\n",
+            session.harness.as_str(),
+            session.id,
+            session.id,
+        );
+        let built = build_bricks(session, &msgs[..tail_start], &uses, &mut cache)?;
+        render_bricks(&mut h, &built);
+        let _ = writeln!(h, "This read: {} messages · {} tool calls.\n", msgs.len(), tool_calls);
+        bricks = Some(built);
+    } else {
+        let _ = writeln!(
+            h,
+            "Source: `{}:{}`{} · {} messages · {} tool calls. Distilled by `cv distill` (deterministic \
+             extraction, no model). Anything elided is retrievable: `cv cat {retrieve_ref} <tool_use_id>`; \
+             the full source stays readable with `cv show {} --range A..B` (bracketed numbers below are \
+             its message indices).\n",
+            session.harness.as_str(),
+            session.id,
+            parent,
+            msgs.len(),
+            tool_calls,
+            session.id,
+        );
+    }
+    if let Some(state) = state {
+        render_state(&mut h, state, &facts, mode);
+    }
     let elided_hint = (opts.ledger && elided_outputs > 0).then_some((retrieve_ref.as_str(), elided_outputs));
-    render_handoff(&mut h, last_words.as_ref(), &facts, msgs, elided_hint, &unsettled);
-    render_grounding(
-        &mut h,
-        &ground(session, msgs, &uses, &mut cache, live_fs, session.updated_at)?,
-    );
+    // Escalation quarantines what the predecessor wrote about itself: its last message, its own
+    // record of where it stands, and the notes it wrote to files.
+    let mut quarantine = String::new();
+    let shown_words = if escalate { None } else { last_words.as_ref() };
+    render_handoff(&mut h, shown_words, &facts, msgs, elided_hint, &unsettled);
+    let mut grounding = ground(session, msgs, &uses, &mut cache, live_fs, session.updated_at)?;
+    let decisions = if !narrative {
+        std::mem::take(&mut grounding.decisions)
+    } else {
+        Vec::new()
+    };
+    if escalate {
+        if let Some((i, words)) = &last_words {
+            let at = msgs.get(*i).map(when).unwrap_or_default();
+            let _ = writeln!(
+                quarantine,
+                "**Its last message** [{i}] {at}:\n\n{}\n",
+                close_unclosed_fence(words)
+            );
+        }
+        let mut own = String::new();
+        render_grounding(&mut own, &grounding);
+        quarantine.push_str(&own.replacen(GROUNDING_HEAD, "### Grounding — ", 1));
+    } else {
+        render_grounding(&mut h, &grounding);
+    }
     if let Some((i, origin, text)) = &brief {
         if *origin == Origin::Human {
             let _ = writeln!(h, "{BRIEF_HEAD}{i}]\n\n{}\n", close_unclosed_fence(text.trim()));
@@ -1969,26 +2162,75 @@ fn analyze_with_policy(
             close_unclosed_fence(earlier.trim())
         );
     }
-    let _ = writeln!(
-        h,
-        "{TIMELINE_HEAD}, and everything it said or wrote itself (verbatim)\n"
-    );
-    if timeline.is_empty() {
+    match mode {
+        None | Some(HandoffMode::Peer) => {
+            let _ = writeln!(
+                h,
+                "{TIMELINE_HEAD}, and everything it said or wrote itself (verbatim)\n"
+            );
+        }
+        Some(mode) => {
+            let _ = writeln!(
+                h,
+                "{TIMELINE_HEAD}, consolidated as the user specification: every prompt and message to it, \
+                 in order (verbatim; `--handoff {}` leaves the agent's own narrative out)\n",
+                mode.as_str()
+            );
+        }
+    }
+    let shown: Vec<&Entry> = timeline
+        .iter()
+        .filter(|e| narrative || !is_agent_authored(&e.heading))
+        .collect();
+    if shown.is_empty() {
         let _ = writeln!(h, "_(nothing before the verbatim tail)_\n");
     }
-    for e in &timeline {
+    for e in &shown {
         let _ = writeln!(
             h,
-            "### [{}] {} · {}\n\n{}\n",
+            "### [{}] {} · {}
+
+{}
+",
             e.idx,
             e.when,
             e.heading,
             close_unclosed_fence(e.body.trim())
         );
     }
+    if !decisions.is_empty() {
+        let _ = writeln!(
+            h,
+            "**Decisions recorded** (verbatim lines, newest {GROUNDING_LINES}):\n"
+        );
+        for (i, line) in &decisions {
+            let _ = writeln!(h, "- [{i}] {line}");
+        }
+        h.push('\n');
+    }
+    if escalate {
+        for e in timeline.iter().filter(|e| e.heading.starts_with("agent wrote")) {
+            let _ = writeln!(
+                quarantine,
+                "### [{}] {} · {}\n\n{}\n",
+                e.idx,
+                e.when,
+                e.heading,
+                close_unclosed_fence(e.body.trim())
+            );
+        }
+    }
     let _ = writeln!(h, "{FACTS_HEAD}\n");
     render_facts(&mut h, &facts);
-    if opts.ledger && !ledger.is_empty() {
+    if !narrative && !facts.edited.is_empty() {
+        h.pop();
+        let files: Vec<String> = facts.edited.iter().map(|(i, p)| format!("`{p}` [{i}]")).collect();
+        let _ = writeln!(h, "- **Files edited** (first edit order): {}\n", files.join(" · "));
+    }
+    if mode == Some(HandoffMode::Downshift) {
+        render_progress(&mut h, &facts);
+    }
+    if opts.ledger && mode != Some(HandoffMode::Downshift) && !ledger.is_empty() {
         let _ = writeln!(
             h,
             "{LEDGER_HEAD}, one line each (`[index] label → outcome · tool_use_id size`; ×N = repeated, \
@@ -2003,6 +2245,15 @@ fn analyze_with_policy(
             let rep = if *n > 1 { format!(" ×{n}") } else { String::new() };
             let _ = writeln!(h, "- {idx} {label}{rep} → {outcome} · `{id}` {}", size(*bytes));
         }
+        h.push('\n');
+    }
+    if !quarantine.is_empty() {
+        let _ = writeln!(
+            h,
+            "{QUARANTINE_HEAD}\n\nWhat the lane being replaced wrote about its own work. It failed to finish; \
+             treat every claim here as a hypothesis and check it against the source and the tests.\n\n{}",
+            quarantine.trim_end()
+        );
         h.push('\n');
     }
 
@@ -2040,6 +2291,9 @@ fn analyze_with_policy(
         commits: facts.commits.len(),
         errors: facts.errors.len(),
         elided_outputs,
+        continuation_state: state,
+        handoff: mode,
+        bricks,
     };
     Ok(PreparedDistillation {
         distilled: Distilled {
@@ -2055,6 +2309,7 @@ fn analyze_with_policy(
             human_prompts,
             earlier_md: earlier,
             unsettled,
+            stable_prefix: opts.dyadic_bricks,
         },
         tail,
         keep_last: opts.keep_last,
@@ -2073,6 +2328,286 @@ const TIMELINE_HEAD: &str = "## 3. Timeline — everything said to this agent";
 const FACTS_HEAD: &str = "## 4. Facts (mined from tool inputs and outputs)";
 const LEDGER_HEAD: &str = "## 5. Ledger — every tool call before the tail";
 const TAIL_HEAD: &str = "## 6. The last ";
+const BRICKS_HEAD: &str = "## 0a. Prefix bricks";
+const STATE_HEAD: &str = "## 0b. Continuation state";
+const PROGRESS_HEAD: &str = "## 4b. Verified progress";
+const QUARANTINE_HEAD: &str = "## 5b. [UNVERIFIED PREDECESSOR NOTES — VERIFY AGAINST SOURCE & TESTS]";
+
+/// Timeline headings for what the agent said, sent, wrote or spawned itself.
+fn is_agent_authored(heading: &str) -> bool {
+    ["agent said", "agent sent", "agent wrote", "agent spawned"]
+        .iter()
+        .any(|p| heading.starts_with(p))
+}
+
+/// `## 0b`: the continuation-state badge and the validation/edit evidence it rests on.
+fn render_state(h: &mut String, state: ContinuationState, f: &Facts, mode: Option<HandoffMode>) {
+    let mode = mode.map(|m| format!(" · handoff: {}", m.as_str())).unwrap_or_default();
+    let _ = writeln!(h, "{STATE_HEAD} — `state: {}`{mode}\n", state.as_str());
+    let last = f.steps.iter().rposition(|(_, s)| matches!(s, Step::Validate { .. }));
+    match last.map(|at| (at, &f.steps[at])) {
+        Some((at, (i, Step::Validate { label, verdict, passed }))) => {
+            let how = if *passed { "passed" } else { "FAILED" };
+            let _ = writeln!(
+                h,
+                "- **Last validation** [{i}] {} → {how}: {}",
+                truncate(first_line(label), 160),
+                crate::sanitize::sanitize_line(verdict)
+            );
+            let mut after: Vec<&str> = Vec::new();
+            for (_, s) in &f.steps[at + 1..] {
+                if let Step::Edit(p) = s {
+                    if !after.contains(&p.as_str()) {
+                        after.push(p);
+                    }
+                }
+            }
+            if !after.is_empty() {
+                let shown: Vec<String> = after.iter().take(12).map(|p| format!("`{p}`")).collect();
+                let more = after.len().saturating_sub(12);
+                let more = if more > 0 {
+                    format!(" (+{more} more)")
+                } else {
+                    String::new()
+                };
+                let _ = writeln!(
+                    h,
+                    "- **Edited since, not re-validated** ({}): {}{more}",
+                    after.len(),
+                    shown.join(" · ")
+                );
+            }
+        }
+        _ => {
+            let edits = f.steps.iter().filter(|(_, s)| matches!(s, Step::Edit(_))).count();
+            let _ = writeln!(
+                h,
+                "- **No validation run recorded** (no build or test command the facts index recognizes); {edits} edit(s)"
+            );
+        }
+    }
+    h.push('\n');
+}
+
+/// `## 4b`: the edit/validation sequence as a checklist. An edit is checked once a later
+/// validation passed; a validation is checked when it passed; commits are checked.
+fn render_progress(h: &mut String, f: &Facts) {
+    let mut rows: Vec<(usize, String)> = Vec::new();
+    let last_pass = f
+        .steps
+        .iter()
+        .rposition(|(_, s)| matches!(s, Step::Validate { passed: true, .. }));
+    let mut k = 0;
+    while k < f.steps.len() {
+        let (i, step) = &f.steps[k];
+        match step {
+            Step::Edit(path) => {
+                // One row per run of consecutive edits to the same file.
+                let mut n = 1;
+                while matches!(f.steps.get(k + n), Some((_, Step::Edit(p))) if p == path) {
+                    n += 1;
+                }
+                let verified = last_pass.is_some_and(|at| at > k);
+                let mark = if verified { "x" } else { " " };
+                let times = if n > 1 { format!(" ×{n}") } else { String::new() };
+                rows.push((*i, format!("- [{mark}] [{i}] edited `{path}`{times}")));
+                k += n;
+                continue;
+            }
+            Step::Validate { label, verdict, passed } => {
+                let mark = if *passed { "x" } else { " " };
+                let how = if *passed { "passed" } else { "FAILED" };
+                rows.push((
+                    *i,
+                    format!(
+                        "- [{mark}] [{i}] {} → {how}: {}",
+                        truncate(first_line(label), 160),
+                        crate::sanitize::sanitize_line(verdict)
+                    ),
+                ));
+            }
+        }
+        k += 1;
+    }
+    for (i, branch, sha, subject) in &f.commits {
+        rows.push((
+            *i,
+            format!(
+                "- [x] [{i}] committed `{branch}` `{sha}` {}",
+                truncate(subject.trim(), 120)
+            ),
+        ));
+    }
+    if rows.is_empty() {
+        return;
+    }
+    rows.sort_by_key(|(i, _)| *i);
+    let _ = writeln!(
+        h,
+        "{PROGRESS_HEAD} — edits, validations and commits in order (`[x]` is backed by a passing validation \
+         or a commit; `[ ]` is not)\n"
+    );
+    let skip = rows.len().saturating_sub(60);
+    if skip > 0 {
+        let _ = writeln!(h, "_({skip} earlier steps omitted)_");
+    }
+    for (_, row) in rows.into_iter().skip(skip) {
+        let _ = writeln!(h, "{row}");
+    }
+    h.push('\n');
+}
+
+/// A sealed epoch of the transcript: `2^k` turns starting at a multiple of `2^k`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Brick {
+    /// Turn range `[start_turn, end_turn)`.
+    pub start_turn: usize,
+    pub end_turn: usize,
+    /// Message range `[start_msg, end_msg)` in the source.
+    pub start_msg: usize,
+    pub end_msg: usize,
+    /// The rendered brick, without its section heading.
+    #[serde(skip)]
+    pub text: String,
+}
+
+/// The dyadic decomposition of `turns` turns: the binary carry tree's sealed nodes, highest bit
+/// first. `24 → [0,16) [16,24)`; `25 → [0,16) [16,24) [24,25)`. Appending a turn changes only the
+/// bricks below its lowest zero bit; every higher brick keeps its span.
+pub fn dyadic_spans(turns: usize) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut start = 0usize;
+    for bit in (0..usize::BITS).rev() {
+        let size = 1usize << bit;
+        if turns & size != 0 {
+            spans.push((start, start + size));
+            start += size;
+        }
+    }
+    spans
+}
+
+/// Message indices where a turn opens: the first message, and each model-visible non-assistant
+/// message that follows an assistant one. A boundary depends only on what precedes it, so an
+/// appended record never moves an earlier one.
+fn turn_starts(msgs: &[Message]) -> Vec<usize> {
+    let mut starts = Vec::new();
+    let mut prev_assistant = true;
+    for (i, m) in msgs.iter().enumerate() {
+        if !m.is_model_visible() {
+            continue;
+        }
+        if m.role != Role::Assistant && prev_assistant {
+            starts.push(i);
+        }
+        prev_assistant = m.role == Role::Assistant;
+    }
+    if starts.first().is_some_and(|&s| s > 0) {
+        starts[0] = 0;
+    }
+    if starts.is_empty() && !msgs.is_empty() {
+        starts.push(0);
+    }
+    starts
+}
+
+/// Extract each brick from its messages alone, with no model: the human instructions verbatim,
+/// the files touched (each once), and each command's outcome with its `cv cat` pointer.
+fn build_bricks(
+    session: &Session,
+    msgs: &[Message],
+    uses: &HashMap<&str, crate::ir::ToolCall<'_>>,
+    cache: &mut TranscriptCache<'_>,
+) -> anyhow::Result<Vec<Brick>> {
+    use crate::tools::classify::ToolOp;
+    let starts = turn_starts(msgs);
+    let mut out = Vec::new();
+    for (a, b) in dyadic_spans(starts.len()) {
+        let (m0, m1) = (starts[a], starts.get(b).copied().unwrap_or(msgs.len()));
+        let mut prompts = String::new();
+        let mut files: Vec<String> = Vec::new();
+        let mut commands = String::new();
+        for (i, m) in msgs.iter().enumerate().take(m1).skip(m0) {
+            if m.role == Role::User && m.kind == MessageKind::Prompt && m.origin == Origin::Human {
+                if let Some(text) = cache.incoming_text(session.harness, i)? {
+                    if !text.trim().is_empty() {
+                        let _ = writeln!(prompts, "**user** [{i}]:\n\n{}\n", text.trim());
+                    }
+                }
+            }
+            for block in &m.content {
+                match block {
+                    Block::ToolUse { name, input, .. } if m.role == Role::Assistant => {
+                        let summary = ToolInput::new(session.harness, name, input, false, false)?;
+                        for sem in &summary.ops {
+                            if let ToolOp::FileEdit { path, .. } | ToolOp::FileRead { path } = &sem.op {
+                                if !files.iter().any(|p| p == path.as_ref()) {
+                                    files.push(path.as_ref().to_owned());
+                                }
+                            }
+                        }
+                    }
+                    Block::ToolResult {
+                        tool_use_id, is_error, ..
+                    } => {
+                        let Some(call) = uses.get(tool_use_id.as_str()) else {
+                            continue;
+                        };
+                        let summary = ToolInput::new(session.harness, call.name, call.input, false, true)?;
+                        let command = summary.ops.iter().any(|sem| matches!(sem.op, ToolOp::Command { .. }));
+                        if command {
+                            let outcome = if *is_error { "FAILED" } else { "exit 0" };
+                            let label = summary.label(session.harness, call.name);
+                            let _ = writeln!(
+                                commands,
+                                "  - [{i}] {} → {outcome} · `cv cat {} {tool_use_id}`",
+                                crate::sanitize::sanitize_line(&truncate(first_line(&label), 160)),
+                                session.id
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let mut text = String::new();
+        let _ = writeln!(text, "### Brick [{a}..{b}) · messages [{m0}..{m1})\n");
+        text.push_str(&prompts);
+        if !files.is_empty() {
+            let shown: Vec<String> = files.iter().map(|p| crate::render::inline_code_span(p)).collect();
+            let _ = writeln!(text, "- **Files touched**: {}", shown.join(" · "));
+        }
+        if !commands.is_empty() {
+            let _ = writeln!(text, "- **Commands**:\n{}", commands.trim_end());
+        }
+        if prompts.is_empty() && files.is_empty() && commands.is_empty() {
+            let _ = writeln!(text, "_(no instructions, files or commands in this span)_");
+        }
+        out.push(Brick {
+            start_turn: a,
+            end_turn: b,
+            start_msg: m0,
+            end_msg: m1,
+            text,
+        });
+    }
+    Ok(out)
+}
+
+fn render_bricks(h: &mut String, bricks: &[Brick]) {
+    if bricks.is_empty() {
+        return;
+    }
+    let _ = writeln!(
+        h,
+        "{BRICKS_HEAD} — the transcript before the tail in power-of-two turn epochs; a sealed brick stays \
+         byte-identical as the session grows\n"
+    );
+    for brick in bricks {
+        h.push_str(&brick.text);
+        h.push('\n');
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct UnwrappedPack {
@@ -2727,6 +3262,33 @@ fn scan_result_facts(
     if let (false, Some(run)) = (is_error, &run) {
         f.ok_at.insert(run.clone(), i);
     }
+    let is_gate = if name == "Bash" {
+        command_of(&summary.fields).is_some_and(|c| re(Re::GateCmd).is_match(c))
+    } else {
+        summary
+            .ops
+            .iter()
+            .any(|sem| matches!(sem.op, crate::tools::classify::ToolOp::Command { .. }))
+            && cmds.iter().any(|c| re(Re::GateCmd).is_match(c))
+    };
+    if is_gate {
+        let passed = !is_error && !re(Re::GateFailed).is_match(out);
+        let verdict = out
+            .lines()
+            .rev()
+            .map(str::trim)
+            .find(|l| re(Re::Verdict).is_match(l))
+            .or_else(|| out.lines().rev().map(str::trim).find(|l| !l.is_empty()))
+            .unwrap_or("(no output)");
+        f.steps.push((
+            i,
+            Step::Validate {
+                label: label.to_string(),
+                verdict: truncate(verdict, 160),
+                passed,
+            },
+        ));
+    }
     let mut commit_outcome: Option<String> = None;
     for c in re(Re::Commit).captures_iter(out) {
         let (b, sha, subj) = (c[1].to_string(), c[2].to_string(), c[3].trim().to_string());
@@ -2782,15 +3344,6 @@ fn scan_result_facts(
     if let Some(c) = commit_outcome {
         return c;
     }
-    let is_gate = if name == "Bash" {
-        command_of(&summary.fields).is_some_and(|c| re(Re::GateCmd).is_match(c))
-    } else {
-        summary
-            .ops
-            .iter()
-            .any(|sem| matches!(sem.op, crate::tools::classify::ToolOp::Command { .. }))
-            && cmds.iter().any(|c| re(Re::GateCmd).is_match(c))
-    };
     if is_gate {
         let verdict = out
             .lines()
@@ -3664,6 +4217,17 @@ fn render_prepared_tail(
 
 /// The preamble a resumed distilled session opens with, ahead of the head of the pack.
 pub fn resume_preamble(d: &Distilled, keep_last: usize) -> String {
+    if d.stable_prefix {
+        return format!(
+            "[cv distill] You are resuming the agent whose history is distilled below; it was you. The \
+             earlier transcript was compressed: your instructions are verbatim, commits, paths, verdicts \
+             and errors are indexed, and older turns are kept as extractive bricks. Your last tool calls \
+             follow this message as real turns. Your earlier private reasoning did not survive, so \
+             re-derive rather than assume, and check live state (git status, running jobs) before \
+             acting. Elided tool output is retrievable with `cv cat {} <tool_use_id>`.\n\n",
+            d.retrieve_ref,
+        );
+    }
     format!(
         "[cv distill] You are resuming the agent whose history is distilled below; it was you. The \
          earlier transcript ({} messages, ~{} tokens) was compressed: your brief and every message \
@@ -3807,6 +4371,282 @@ pub(crate) mod tests {
             details: None,
             extensions: Default::default(),
         }
+    }
+
+    fn edit(id: &str, path: &str) -> Block {
+        Block::ToolUse {
+            id: id.into(),
+            name: "Edit".into(),
+            input: (json!({"file_path": path, "old_string": "a", "new_string": "b"})).into(),
+            namespace: None,
+            extensions: Default::default(),
+        }
+    }
+
+    /// A lane: brief, then rounds of (agent text + one call, its result), each round its own turn.
+    fn rounds(n: usize, step: impl Fn(usize) -> (Block, Block)) -> Session {
+        let mut msgs = vec![msg(Role::User, MessageKind::Prompt, vec![text("Make the gate green.")])];
+        for k in 0..n {
+            let (call, result) = step(k);
+            msgs.push(msg(
+                Role::Assistant,
+                MessageKind::Reply,
+                vec![text(&format!("I think the bug is in module {k}.")), call],
+            ));
+            msgs.push(msg(Role::Tool, MessageKind::ToolResult, vec![result]));
+            if k % 4 == 3 {
+                msgs.push(msg(
+                    Role::User,
+                    MessageKind::Prompt,
+                    vec![text(&format!("Requirement {k}: keep the API stable."))],
+                ));
+            }
+        }
+        let mut session = Session::new("agent-handoff", Harness::Claude);
+        session.messages = msgs;
+        session
+    }
+
+    fn state_of(session: &Session) -> ContinuationState {
+        let opts = DistillOptions {
+            keep_last: 0,
+            state_header: true,
+            ..Default::default()
+        };
+        distill_pack(session, &opts).unwrap().stats.continuation_state.unwrap()
+    }
+
+    // #tooth The badge reads the terminal edit/validation sequence, one state per ending.
+    #[test]
+    fn continuation_state_reads_the_terminal_edit_validation_sequence() {
+        let gate = |id: &str, ok: bool| {
+            let out = if ok {
+                "test result: ok. 3 passed; 0 failed"
+            } else {
+                "test result: FAILED. 1 passed; 2 failed"
+            };
+            (call(id, "cargo test -p gate", "gate"), result(id, out, false))
+        };
+        let ed = |id: &str| (edit(id, "/w/src/lib.rs"), result(id, "ok", false));
+        let seq = |steps: Vec<(Block, Block)>| {
+            let n = steps.len();
+            let steps = std::cell::RefCell::new(steps.into_iter());
+            rounds(n, |_| steps.borrow_mut().next().unwrap())
+        };
+        assert_eq!(state_of(&seq(vec![ed("e1")])), ContinuationState::InProgress);
+        assert_eq!(
+            state_of(&seq(vec![ed("e1"), gate("g1", false)])),
+            ContinuationState::FailingValidation
+        );
+        assert_eq!(
+            state_of(&seq(vec![ed("e1"), gate("g1", false), ed("e2")])),
+            ContinuationState::PostFailureEdit
+        );
+        assert_eq!(
+            state_of(&seq(vec![ed("e1"), gate("g1", false), ed("e2"), gate("g2", true)])),
+            ContinuationState::VerifiedClean
+        );
+        assert_eq!(
+            state_of(&seq(vec![gate("g1", true), ed("e2")])),
+            ContinuationState::InProgress
+        );
+        // A tool-flagged error fails the run whatever its output says.
+        let (c, _) = gate("g1", true);
+        assert_eq!(
+            state_of(&seq(vec![(c, result("g1", "test result: ok", true))])),
+            ContinuationState::FailingValidation
+        );
+        // Peer: the default pack plus the badge, nothing else changed.
+        let session = seq(vec![ed("e1"), gate("g1", false)]);
+        let plain = distill_pack(&session, &DistillOptions::default()).unwrap().pack();
+        let peer = distill_pack(
+            &session,
+            &DistillOptions {
+                handoff: Some(HandoffMode::Peer),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .pack();
+        assert!(!plain.contains(STATE_HEAD));
+        assert!(peer.contains("## 0b. Continuation state — `state: failing_validation` · handoff: peer"));
+        let badge = &peer[peer.find(STATE_HEAD).unwrap()..peer.find(HANDOFF_HEAD).unwrap()];
+        assert_eq!(
+            peer.replacen(badge, "", 1).replace(" (line ", ""),
+            plain.replace(" (line ", "")
+        );
+    }
+
+    // #tooth Escalation keeps every instruction and fact, drops the predecessor's narrative from
+    // the timeline, and quarantines what it wrote about itself.
+    #[test]
+    fn escalate_strips_narrative_keeps_spec_and_facts_and_quarantines_notes() -> anyhow::Result<()> {
+        let session = rounds(8, |k| match k {
+            2 => (
+                Block::ToolUse {
+                    id: "w".into(),
+                    name: "Write".into(),
+                    input: (json!({"file_path": "/w/docs/NOTES.md", "content": "Hypothesis: the cache is stale."}))
+                        .into(),
+                    namespace: None,
+                    extensions: Default::default(),
+                },
+                result("w", "ok", false),
+            ),
+            5 => (
+                call("g", "cargo test -p gate", "gate"),
+                result("g", "error: could not compile", true),
+            ),
+            7 => (edit("e", "/w/src/lib.rs"), result("e", "ok", false)),
+            k => (
+                call(&format!("c{k}"), "ls /w", "list"),
+                result(&format!("c{k}"), "a b", false),
+            ),
+        });
+        let opts = DistillOptions {
+            keep_last: HandoffMode::Escalate.default_keep_last(),
+            handoff: Some(HandoffMode::Escalate),
+            ..Default::default()
+        };
+        let d = distill_pack(&session, &opts)?;
+        let pack = d.pack();
+        assert_eq!(d.tail_md, "");
+        assert!(
+            pack.contains("`state: post_failure_edit` · handoff: escalate"),
+            "{pack}"
+        );
+        // (a) every human prompt, in one contiguous block, in order.
+        let tl = pack.find(TIMELINE_HEAD).unwrap();
+        let facts = pack.find(FACTS_HEAD).unwrap();
+        let spec = &pack[tl..facts];
+        let (r3, r7) = (spec.find("Requirement 3").unwrap(), spec.find("Requirement 7").unwrap());
+        assert!(r3 < r7);
+        assert!(!spec.contains("I think the bug"), "narrative leaked:\n{spec}");
+        assert!(!pack[..facts].contains("I think the bug"));
+        // (b) facts survive: the failing command, the edited file, the ledger.
+        assert!(pack.contains("error: could not compile"));
+        assert!(
+            pack.contains("- **Files edited** (first edit order): `/w/docs/NOTES.md` [5] · `/w/src/lib.rs` [16]"),
+            "{pack}"
+        );
+        assert!(pack.contains(LEDGER_HEAD));
+        // (c) the note it wrote and its last message are quarantined after the ledger.
+        let q = pack.find(QUARANTINE_HEAD).expect("quarantine");
+        assert!(q > pack.find(LEDGER_HEAD).unwrap());
+        assert!(pack[q..].contains("Hypothesis: the cache is stale."));
+        assert!(pack[q..].contains("**Its last message**"));
+        assert!(!pack[..q].contains("Hypothesis: the cache is stale."));
+        // A re-distill of the pack still recovers the brief and the carried human prompts.
+        let unwrapped = unwrap_pack_full(&pack).expect("pack unwraps");
+        assert_eq!(unwrapped.brief.unwrap().0, "Make the gate green.");
+        assert_eq!(unwrapped.human_prompts.len(), 2);
+        Ok(())
+    }
+
+    // #tooth Downshift: the specification, a checklist backed by validations, a short tail, no ledger.
+    #[test]
+    fn downshift_renders_spec_checklist_and_short_tail_without_ledger() -> anyhow::Result<()> {
+        let session = rounds(12, |k| match k {
+            1 => (edit("e1", "/w/src/a.rs"), result("e1", "ok", false)),
+            2 => (
+                call("g1", "cargo test -p gate", "gate"),
+                result("g1", "test result: ok. 4 passed", false),
+            ),
+            3 => (edit("e2", "/w/src/b.rs"), result("e2", "ok", false)),
+            k => (
+                call(&format!("c{k}"), "ls /w", "list"),
+                result(&format!("c{k}"), "a b", false),
+            ),
+        });
+        let mode = HandoffMode::Downshift;
+        let d = distill_pack(
+            &session,
+            &DistillOptions {
+                keep_last: mode.default_keep_last(),
+                handoff: Some(mode),
+                ..Default::default()
+            },
+        )?;
+        let pack = d.pack();
+        assert!(!pack.contains(LEDGER_HEAD));
+        assert!(!pack.contains(QUARANTINE_HEAD));
+        assert!(pack.contains("## 6. The last 6 tool calls"));
+        let progress = &pack[pack.find(PROGRESS_HEAD).expect("checklist")..];
+        assert!(progress.contains("- [x] [3] edited `/w/src/a.rs`"), "{progress}");
+        assert!(
+            progress.contains("- [x] [6] gate → passed: test result: ok. 4 passed"),
+            "{progress}"
+        );
+        assert!(progress.contains("- [ ] [7] edited `/w/src/b.rs`"), "{progress}");
+        assert!(pack.contains("`state: in_progress` · handoff: downshift"));
+        Ok(())
+    }
+
+    #[test]
+    fn dyadic_spans_are_the_binary_carry_tree() {
+        assert_eq!(dyadic_spans(0), vec![]);
+        assert_eq!(dyadic_spans(24), vec![(0, 16), (16, 24)]);
+        assert_eq!(dyadic_spans(25), vec![(0, 16), (16, 24), (24, 25)]);
+        assert_eq!(dyadic_spans(7), vec![(0, 4), (4, 6), (6, 7)]);
+    }
+
+    // #tooth A 32-turn lane distilled with bricks at T=24 and at T=25: the pack's bytes through the
+    // sealed bricks [0..16) and [16..24) are identical; only the active suffix after them differs.
+    #[test]
+    fn dyadic_bricks_stay_byte_identical_as_the_session_grows() -> anyhow::Result<()> {
+        let full = rounds(32, |k| {
+            let id = format!("c{k}");
+            if k % 3 == 0 {
+                (edit(&id, &format!("/w/src/m{}.rs", k % 5)), result(&id, "ok", false))
+            } else {
+                (
+                    call(&id, &format!("cargo test -p m{k}"), "gate"),
+                    result(&id, "test result: ok", k % 7 == 0),
+                )
+            }
+        });
+        let at = |turns: usize| {
+            let starts = turn_starts(&full.messages);
+            let mut s = full.clone();
+            s.messages.truncate(starts[turns]);
+            s
+        };
+        let opts = DistillOptions {
+            keep_last: 0,
+            dyadic_bricks: true,
+            ..Default::default()
+        };
+        let (a, b) = (distill_pack(&at(24), &opts)?, distill_pack(&at(25), &opts)?);
+        let spans = |d: &Distilled| {
+            d.stats
+                .bricks
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|b| (b.start_turn, b.end_turn))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(spans(&a), vec![(0, 16), (16, 24)]);
+        assert_eq!(spans(&b), vec![(0, 16), (16, 24), (24, 25)]);
+        let (ba, bb) = (a.stats.bricks.as_ref().unwrap(), b.stats.bricks.as_ref().unwrap());
+        assert_eq!(ba[..2], bb[..2]);
+        assert!(ba[0].text.contains("**user** [0]:\n\nMake the gate green."));
+        assert!(
+            ba[0].text.contains("→ FAILED · `cv cat agent-handoff c7`"),
+            "{}",
+            ba[0].text
+        );
+        assert!(ba[0]
+            .text
+            .contains("- **Files touched**: `/w/src/m0.rs` · `/w/src/m3.rs`"));
+        // The pack's leading bytes, through the second brick, are one shared prefix.
+        let (pa, pb) = (a.pack(), b.pack());
+        let end = pa.find(&ba[1].text).unwrap() + ba[1].text.len();
+        assert_eq!(pa[..end], pb[..end]);
+        assert_ne!(pa, pb);
+        // So is the resumable session's opening preamble.
+        assert_eq!(resume_preamble(&a, 0), resume_preamble(&b, 0));
+        Ok(())
     }
 
     #[test]

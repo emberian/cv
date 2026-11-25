@@ -703,9 +703,25 @@ enum Cmd {
         id: String,
         #[arg(long)]
         harness: Option<String>,
-        /// Keep the last N tool calls (and the turns around them) verbatim.
-        #[arg(long, default_value_t = 12)]
-        keep_last: usize,
+        /// Keep the last N tool calls (and the turns around them) verbatim. Default 12; 0 with
+        /// `--handoff escalate`, 6 with `--handoff downshift`.
+        #[arg(long)]
+        keep_last: Option<usize>,
+        /// Who the pack is for. `peer`: the default pack plus the continuation-state badge.
+        /// `escalate` (a stronger model after failures): the agent's own narrative is left out,
+        /// prompts and messages form one user specification, every fact is kept, and its notes
+        /// are quarantined as unverified. `downshift` (a cheaper model): the specification, a
+        /// verified-progress checklist and a short tail, no ledger.
+        #[arg(long, value_name = "MODE", value_parser = ["peer", "escalate", "downshift"])]
+        handoff: Option<String>,
+        /// Open the pack with the continuation-state badge (`post_failure_edit`,
+        /// `failing_validation`, `verified_clean`, `in_progress`). Every `--handoff` includes it.
+        #[arg(long)]
+        state_header: bool,
+        /// Render the turns before the tail as extractive power-of-two prefix bricks, placed so
+        /// the pack's leading bytes stay identical as the session grows (prompt-cache friendly).
+        #[arg(long)]
+        bricks: bool,
         /// Byte cap for one tool result inside the verbatim tail (head+tail kept, rest elided).
         #[arg(long, default_value_t = 6000)]
         tail_result_max: usize,
@@ -1805,6 +1821,9 @@ fn run() -> Result<()> {
             id,
             harness,
             keep_last,
+            handoff,
+            state_header,
+            bricks,
             tail_result_max,
             note_max,
             keep_tail_thinking,
@@ -1825,13 +1844,17 @@ fn run() -> Result<()> {
             out,
             json,
         } => {
+            let handoff = handoff.as_deref().and_then(cv_core::distill::HandoffMode::parse);
             let opts = cv_core::distill::DistillOptions {
-                keep_last,
+                keep_last: keep_last.unwrap_or_else(|| handoff.map_or(12, |m| m.default_keep_last())),
                 tail_result_max,
                 note_max,
                 keep_tail_thinking,
                 ledger: !no_ledger,
                 retrieve_ref: None,
+                handoff,
+                state_header,
+                dyadic_bricks: bricks,
             };
             let target = cmd::distill::target_for(session, delivery, agent_of, model, cwd, out)?;
             let retire = !keep_source && upto.is_none() && !recovery.uncompact && recovery.pre_compaction.is_none();

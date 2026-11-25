@@ -131,6 +131,32 @@ format, so `cv cat <new> <tool_use_id>` returns it. Harness reminders, hook reco
 dropped. Token estimates use cv's shared estimator; the pack itself is priced at the tool-input rate
 (2.1 bytes per token), since resumed distilled packs measured 2.2–2.4.
 
+### Who the pack is for: `--handoff`, `--state-header`, `--bricks`
+
+`--handoff peer|escalate|downshift` writes the pack for its successor. Every mode opens with the
+**continuation-state badge** (`--state-header` adds it alone), read from the last build/test
+command the facts index recognizes and the file edits around it: `post_failure_edit` (it failed,
+then edits nothing re-checked), `failing_validation` (it failed, nothing edited since),
+`verified_clean` (it passed, nothing edited since) or `in_progress` (no validation, or edits after
+the last pass).
+
+- `peer`: the default pack plus the badge.
+- `escalate`, for a stronger model after repeated failures: the agent's own narrative leaves the
+  timeline, which keeps every prompt and message to it in order (the user specification) and the
+  decisions recorded. Commits, branches, files edited, verdicts, errors, unresolved calls and the
+  ledger stay. Its last message, its grounding and the notes it wrote move under
+  `## 5b. [UNVERIFIED PREDECESSOR NOTES — VERIFY AGAINST SOURCE & TESTS]`. `--keep-last`
+  defaults to 0.
+- `downshift`, for a cheaper model: the specification, a `## 4b. Verified progress` checklist (an
+  edit is `[x]` once a later validation passed) and a 6-call tail; no ledger.
+
+`--bricks` renders the turns before the tail as extractive **prefix bricks**: power-of-two turn
+epochs aligned like a binary counter (24 turns are `[0..16) [16..24)`, 25 add `[24..25)`), each
+holding that span's human instructions verbatim, the files it touched and each command's
+`exit 0`/`FAILED` with its `cv cat` pointer. The bricks follow a source line without counts, and
+the resume preamble drops its counts, so the bytes through every sealed brick stay identical as
+the session grows and a provider's prompt cache keeps serving them.
+
 What a distilled lane cannot answer, by design: a detail that lived only in a file the lane *read*
 (the read is elided; a resumed lane has tools and `cv cat`, so it can re-read), and a "why" the
 lane never wrote down (it was in signature-only thinking).
