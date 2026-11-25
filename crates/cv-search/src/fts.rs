@@ -908,17 +908,10 @@ fn sweep_refs_after(
     for id in &missing {
         writer.delete_term(Term::from_field_text(f.id, id));
     }
-    // Columnar events still group copies by native ID. Retain their shared rows while a twin exists.
-    let native = |s: &String| {
-        cv_core::SessionKey::split_selector(s)
-            .map_or(s.as_str(), |(id, _)| id)
-            .to_owned()
-    };
-    let retained: HashSet<_> = retained.iter().map(native).collect();
-    let missing_events: Vec<_> = missing.iter().map(native).filter(|id| !retained.contains(id)).collect();
-    if !missing_events.is_empty() && !cv_core::env::frozen() {
+    // Columnar events are keyed by the same selectors: reap exactly the vanished copies.
+    if !missing.is_empty() && !cv_core::env::frozen() {
         crate::columnar_events::ColumnarEventStore::open(crate::default_columnar_events_dir())
-            .and_then(|mut cs| cs.remove_sessions_by_id(&missing_events))
+            .and_then(|mut cs| cs.remove_sessions_by_id(&missing))
             .context("reaping vanished sessions from columnar events")?;
     }
     let removed = missing.len();

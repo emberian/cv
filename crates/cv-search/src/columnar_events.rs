@@ -41,7 +41,7 @@ use tantivy_fst::{IntoStreamer, Map, MapBuilder, Streamer};
 const CLEV_MAGIC: &[u8; 8] = b"CVCLEV\x01\x00";
 const CLEV_FOOTER_MAGIC: &[u8; 4] = b"CLV1";
 const CLEV_FOOTER_BYTES: usize = 64;
-const MANIFEST_VERSION: u32 = 1;
+const MANIFEST_VERSION: u32 = 2;
 const ROW_GROUP_ROWS: u32 = 4096;
 const MAX_HUNK_HASHES_PER_EDIT: usize = 64;
 const BATCH_FLUSH_ROWS: usize = 16_384;
@@ -194,6 +194,32 @@ impl ColumnarManifest {
 
 fn session_key(harness: &str, session_id: &str) -> String {
     format!("{harness}\0{session_id}")
+}
+
+/// A session's identity in this store: its profile-qualified selector, so profile or host twins
+/// sharing a native ID never supersede each other's rows. Rows and session states carry it.
+fn identity(r: &cv_core::SessionRef) -> String {
+    r.session_selector()
+}
+
+/// The native ID an identity names: what query output reports, as the SQLite event store does.
+fn native_of(id: &str) -> &str {
+    cv_core::SessionKey::split_selector(id).map_or(id, |(native, _)| native)
+}
+
+/// The stored sessions `id` selects under `harness`: the one identity it is, or every copy of
+/// a native ID.
+fn keys_for(manifest: &ColumnarManifest, harness: &str, id: &str) -> Vec<String> {
+    let exact = session_key(harness, id);
+    if manifest.sessions.contains_key(&exact) {
+        return vec![exact];
+    }
+    manifest
+        .sessions
+        .iter()
+        .filter(|(_, s)| s.harness == harness && native_of(&s.session_id) == id)
+        .map(|(k, _)| k.clone())
+        .collect()
 }
 
 fn atomic_write_file(dir: &Path, file_name: &str, bytes: &[u8]) -> Result<()> {
@@ -947,7 +973,7 @@ impl ColumnarEventStore {
         prov: &Provenance,
         probe: &mut cv_core::source::Probe,
     ) -> bool {
-        let key = session_key(r.harness.as_str(), &r.id);
+        let key = session_key(r.harness.as_str(), &identity(r));
         let Some(state) = self.manifest.sessions.get(&key) else {
             return true;
         };
@@ -1003,7 +1029,7 @@ impl ColumnarEventStore {
         Ok(removed)
     }
 
-    /// Remove any session whose `session_id` is in `missing_ids` (used by `fts::sweep` reaping).
+    /// Remove every session whose identity (selector) is in `missing_ids` (`fts::sweep` reaping).
     pub fn remove_sessions_by_id(&mut self, missing_ids: &[String]) -> Result<usize> {
         if missing_ids.is_empty() {
             return Ok(0);
@@ -1051,7 +1077,7 @@ impl ColumnarEventStore {
     /// Whether a resumed event batch (`from > 0`) for `r` under `prov` matches the stored
     /// output authority in this columnar store.
     pub fn can_resume(&self, r: &cv_core::SessionRef, prov: &Provenance) -> bool {
-        let key = session_key(r.harness.as_str(), &r.id);
+        let key = session_key(r.harness.as_str(), &identity(r));
         self.manifest
             .sessions
             .get(&key)
@@ -1294,10 +1320,10 @@ impl ColumnarEventStore {
             }
         }
 
-        // Deduplicate by (harness, id) preferring existing/newest copy, matching events.rs.
+        // Deduplicate by identity preferring the existing/newest copy; twins stay apart.
         let mut dedup: HashMap<(cv_core::Harness, String), (cv_core::SessionRef, Provenance)> = HashMap::new();
         for (r, prov) in candidates {
-            let key = (r.harness, r.id.clone());
+            let key = (r.harness, identity(&r));
             match dedup.entry(key) {
                 std::collections::hash_map::Entry::Vacant(e) => {
                     e.insert((r, prov));
@@ -1350,12 +1376,9 @@ impl ColumnarEventStore {
 
     /// All persisted events of one session in transcript order (`ORDER BY msg_idx, kind`),
     /// optionally filtered by `kind`.
+    /// `session_id` is a selector (one copy) or a native ID (every copy of it).
     pub fn events_for(&self, harness: &str, session_id: &str, kind: Option<&str>) -> Result<Vec<EventRow>> {
-        let s_key = session_key(harness, session_id);
         self.with_manifest_retry(|manifest| {
-            let Some(state) = manifest.sessions.get(&s_key) else {
-                return Ok(Vec::new());
-            };
             let seg_lookup: HashMap<&str, (usize, &SegmentManifestEntry)> = manifest
                 .segments
                 .iter()
@@ -1364,37 +1387,40 @@ impl ColumnarEventStore {
                 .collect();
 
             let mut collected: Vec<((i64, String, usize, u32), EventRow)> = Vec::new();
-            for seg_file in &state.segments {
-                let Some(&(seg_ord, seg_entry)) = seg_lookup.get(seg_file.as_str()) else {
-                    continue;
-                };
-                let reader = ClevReader::open(&self.dir.join(&seg_entry.file))?;
-                let sup = seg_entry.superseded()?;
-                let mut rows = reader.by_session(&s_key)? - &sup;
-                if let Some(k) = kind {
-                    rows &= reader.by_kind(k)?;
-                }
-                for row_id in rows {
-                    let r = reader.materialize_row(row_id)?;
-                    let msg_idx = r.msg_idx as i64;
-                    let row_kind = r.kind.clone();
-                    collected.push((
-                        (msg_idx, row_kind, seg_ord, row_id),
-                        EventRow {
-                            baggage: None,
-                            harness: state.harness.clone(),
-                            session_id: state.session_id.clone(),
-                            msg_idx,
-                            ts: r.ts,
-                            kind: r.kind,
-                            tool: r.tool,
-                            target: r.target,
-                            detail: r.detail,
-                            parent_id: state.authority.parent_id.clone(),
-                            agent_id: state.authority.agent_id.clone(),
-                            workflow: state.authority.workflow.clone(),
-                        },
-                    ));
+            for s_key in keys_for(manifest, harness, session_id) {
+                let state = &manifest.sessions[&s_key];
+                for seg_file in &state.segments {
+                    let Some(&(seg_ord, seg_entry)) = seg_lookup.get(seg_file.as_str()) else {
+                        continue;
+                    };
+                    let reader = ClevReader::open(&self.dir.join(&seg_entry.file))?;
+                    let sup = seg_entry.superseded()?;
+                    let mut rows = reader.by_session(&s_key)? - &sup;
+                    if let Some(k) = kind {
+                        rows &= reader.by_kind(k)?;
+                    }
+                    for row_id in rows {
+                        let r = reader.materialize_row(row_id)?;
+                        let msg_idx = r.msg_idx as i64;
+                        let row_kind = r.kind.clone();
+                        collected.push((
+                            (msg_idx, row_kind, seg_ord, row_id),
+                            EventRow {
+                                baggage: None,
+                                harness: state.harness.clone(),
+                                session_id: native_of(&state.session_id).to_owned(),
+                                msg_idx,
+                                ts: r.ts,
+                                kind: r.kind,
+                                tool: r.tool,
+                                target: r.target,
+                                detail: r.detail,
+                                parent_id: state.authority.parent_id.clone(),
+                                agent_id: state.authority.agent_id.clone(),
+                                workflow: state.authority.workflow.clone(),
+                            },
+                        ));
+                    }
                 }
             }
             collected.sort_by(|a, b| a.0.cmp(&b.0));
@@ -1483,6 +1509,7 @@ impl ColumnarEventStore {
                 }
                 let s_key = session_key(&harness, &session_id);
                 let state = manifest.sessions.get(&s_key);
+                let session_id = native_of(&session_id).to_owned();
                 let title = cat
                     .get(&(harness.clone(), session_id.clone()))
                     .and_then(|m| m.title.clone())
@@ -1553,11 +1580,7 @@ impl ColumnarEventStore {
 
     /// Persisted `(msg_idx, target, hunk_hashes)` rows for `file_edit` events of one session.
     pub fn edit_hunks_for(&self, harness: &str, session_id: &str) -> Result<Vec<SessionEditHunkRow>> {
-        let s_key = session_key(harness, session_id);
         self.with_manifest_retry(|manifest| {
-            let Some(state) = manifest.sessions.get(&s_key) else {
-                return Ok(Vec::new());
-            };
             let seg_lookup: HashMap<&str, (usize, &SegmentManifestEntry)> = manifest
                 .segments
                 .iter()
@@ -1566,16 +1589,18 @@ impl ColumnarEventStore {
                 .collect();
 
             let mut rows_out: Vec<((i64, usize, u32), SessionEditHunkRow)> = Vec::new();
-            for seg_file in &state.segments {
-                let Some(&(seg_ord, seg_entry)) = seg_lookup.get(seg_file.as_str()) else {
-                    continue;
-                };
-                let reader = ClevReader::open(&self.dir.join(&seg_entry.file))?;
-                let rows = (reader.by_session(&s_key)? & reader.by_kind("file_edit")?) - seg_entry.superseded()?;
-                for row_id in rows {
-                    let r = reader.materialize_row(row_id)?;
-                    let msg_idx = r.msg_idx as i64;
-                    rows_out.push(((msg_idx, seg_ord, row_id), (msg_idx, r.target, r.hunk_hashes)));
+            for s_key in keys_for(manifest, harness, session_id) {
+                for seg_file in &manifest.sessions[&s_key].segments {
+                    let Some(&(seg_ord, seg_entry)) = seg_lookup.get(seg_file.as_str()) else {
+                        continue;
+                    };
+                    let reader = ClevReader::open(&self.dir.join(&seg_entry.file))?;
+                    let rows = (reader.by_session(&s_key)? & reader.by_kind("file_edit")?) - seg_entry.superseded()?;
+                    for row_id in rows {
+                        let r = reader.materialize_row(row_id)?;
+                        let msg_idx = r.msg_idx as i64;
+                        rows_out.push(((msg_idx, seg_ord, row_id), (msg_idx, r.target, r.hunk_hashes)));
+                    }
                 }
             }
             rows_out.sort_by_key(|a| a.0);
@@ -1656,13 +1681,19 @@ impl ColumnarEventStore {
                 let sup = seg_entry.superseded()?;
 
                 let scope_mask: Option<RoaringBitmap> = match (harness, session_id) {
-                    (Some(h), Some(sid)) => Some(reader.by_session(&session_key(h, sid))? - &sup),
+                    (Some(h), Some(sid)) => {
+                        let mut m = RoaringBitmap::new();
+                        for key in keys_for(manifest, h, sid) {
+                            m |= reader.by_session(&key)?;
+                        }
+                        Some(m - &sup)
+                    }
                     (Some(h), None) => Some(reader.by_harness(h)? - &sup),
                     (None, Some(sid)) => {
                         let mut m = RoaringBitmap::new();
-                        let suffix = format!("\0{sid}");
                         for (k, &(off, len)) in &reader.postings.by_session {
-                            if k.ends_with(&suffix) {
+                            let id = k.split_once('\0').map_or(k.as_str(), |(_, id)| id);
+                            if id == sid || native_of(id) == sid {
                                 m |= reader.decode_bm(Some((off, len)))?;
                             }
                         }
@@ -1726,7 +1757,8 @@ impl ColumnarEventStore {
     ) -> EditHunkEvent {
         let s_key = session_key(&r.harness, &r.session_id);
         let state = manifest.sessions.get(&s_key);
-        let cat_meta = cat.get(&(r.harness.clone(), r.session_id.clone()));
+        let session_id = native_of(&r.session_id).to_owned();
+        let cat_meta = cat.get(&(r.harness.clone(), session_id.clone()));
         let title = cat_meta
             .and_then(|m| m.title.clone())
             .or_else(|| state.and_then(|s| s.meta.title.clone()));
@@ -1744,7 +1776,7 @@ impl ColumnarEventStore {
         EditHunkEvent {
             edit: EditEvent {
                 harness: r.harness,
-                session_id: r.session_id,
+                session_id,
                 msg_idx: r.msg_idx as i64,
                 ts: r.ts,
                 target: r.target,
@@ -1825,11 +1857,12 @@ impl ColumnarBatch<'_> {
             return Ok(());
         }
         self.ensure_writer_lock()?;
-        let s_key = session_key(r.harness.as_str(), &r.id);
+        let id = identity(r);
+        let s_key = session_key(r.harness.as_str(), &id);
         if self.pending_session_segs.contains_key(&s_key) && !self.staged_rows.is_empty() {
             self.flush_chunk()?;
         }
-        if self.store.mask_session_all(r.harness.as_str(), &r.id)? {
+        if self.store.mask_session_all(r.harness.as_str(), &id)? {
             self.dirty = true;
         }
         Ok(())
@@ -1851,7 +1884,8 @@ impl ColumnarBatch<'_> {
         }
         self.ensure_writer_lock()?;
         let harness = r.harness.as_str().to_string();
-        let s_key = session_key(&harness, &r.id);
+        let id = identity(r);
+        let s_key = session_key(&harness, &id);
         let auth = AuthoritySnapshot::of(r, prov);
 
         if from > 0 {
@@ -1892,7 +1926,7 @@ impl ColumnarBatch<'_> {
             s_key.clone(),
             SessionState {
                 harness: harness.clone(),
-                session_id: r.id.clone(),
+                session_id: id.clone(),
                 authority: auth,
                 meta,
                 baseline: source.clone(),
@@ -1911,7 +1945,7 @@ impl ColumnarBatch<'_> {
             self.pending_session_segs.entry(s_key.clone()).or_default();
             self.staged_rows.push(StagedRow {
                 harness: harness.clone(),
-                session_id: r.id.clone(),
+                session_id: id.clone(),
                 msg_idx: ev.msg_idx as u64,
                 ts: ev.ts,
                 kind: ev.kind.to_string(),
@@ -2428,6 +2462,63 @@ mod tests {
         assert_eq!(store.segment_count(), 1);
         let reopened = ColumnarEventStore::open(&col_dir).unwrap();
         verify_oracle(&reopened, &rewound_a, &ev_b0);
+    }
+
+    /// #tooth Profile twins sharing a native ID keep separate event rows: indexing one never
+    /// supersedes the other's, a selector reads exactly one copy, and reaping one keeps the other.
+    #[test]
+    fn columnar_events_keep_profile_twins_with_one_native_id_apart() {
+        let tmp = ScratchDir::new();
+        let home = tmp.path().join("cv-home");
+        std::fs::create_dir_all(&home).unwrap();
+        let _env = cv_core::env::Env::from_vars([
+            ("CLUSTERVISION_HOME", home.to_str().unwrap()),
+            ("CLUSTERVISION_CACHE", home.to_str().unwrap()),
+        ])
+        .enter();
+        let edit = |file: &str| {
+            vec![
+                json!({"type": "user", "sessionId": "twin", "timestamp": "2026-10-02T09:00:00Z",
+                       "message": {"role": "user", "content": "edit it"}}),
+                json!({"type": "assistant", "sessionId": "twin", "timestamp": "2026-10-02T09:01:00Z",
+                       "message": {"role": "assistant", "content": [{
+                           "type": "tool_use", "id": "u1", "name": "Edit",
+                           "input": {"file_path": file, "old_string": "a", "new_string": "b"}}]}}),
+            ]
+        };
+        let refs: Vec<_> = [(".claude", "src/alpha_twin.rs"), (".claude-alt", "src/beta_twin.rs")]
+            .iter()
+            .map(|(profile, file)| {
+                let dir = tmp.path().join(profile).join("projects/p");
+                std::fs::create_dir_all(&dir).unwrap();
+                write_claude_session(&dir.join("twin.jsonl"), "twin", "/repo", &edit(file))
+            })
+            .collect();
+        assert_ne!(refs[0].session_selector(), refs[1].session_selector());
+        let tantivy_dir = crate::default_tantivy_dir();
+        crate::index_sessions(Some(tantivy_dir), &refs, false, false).unwrap();
+        let mut col = ColumnarEventStore::open(crate::default_columnar_events_dir()).unwrap();
+        for file in ["src/alpha_twin.rs", "src/beta_twin.rs"] {
+            let touched = col.sessions_touching(file, true).unwrap();
+            assert_eq!(touched.len(), 1, "{file}: {touched:?}");
+            assert_eq!(touched[0].session_id, "twin", "output keeps the native id");
+        }
+        let targets = |col: &ColumnarEventStore, r: &SessionRef| -> Vec<Option<String>> {
+            col.events_for("claude", &r.session_selector(), Some("file_edit"))
+                .unwrap()
+                .into_iter()
+                .map(|e| e.target)
+                .collect()
+        };
+        assert!(targets(&col, &refs[0])[0]
+            .as_deref()
+            .unwrap()
+            .ends_with("alpha_twin.rs"));
+        assert!(targets(&col, &refs[1])[0].as_deref().unwrap().ends_with("beta_twin.rs"));
+        assert_eq!(col.events_for("claude", "twin", Some("file_edit")).unwrap().len(), 2);
+        col.remove_sessions_by_id(&[refs[0].session_selector()]).unwrap();
+        assert!(targets(&col, &refs[0]).is_empty());
+        assert_eq!(targets(&col, &refs[1]).len(), 1);
     }
 
     #[test]
