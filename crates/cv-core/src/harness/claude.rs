@@ -537,7 +537,7 @@ impl Adapter for Claude {
                     return None;
                 }
                 let unwrapped = self.delivered_body(m, text);
-                let body = unwrapped.unwrap_or(text);
+                let body = typed_after_app_notes(unwrapped.unwrap_or(text));
                 if !is_typed_claude_prompt(body) {
                     return None;
                 }
@@ -549,7 +549,7 @@ impl Adapter for Claude {
                 })
             }
             MessageKind::InjectedContext if self.attachment_kind(m) == Some("queued_command") => {
-                let body = self.delivered_body(m, text)?;
+                let body = typed_after_app_notes(self.delivered_body(m, text)?);
                 if !is_typed_claude_prompt(body) {
                     return None;
                 }
@@ -966,15 +966,20 @@ const DELIVERED_HEADS: [&str; 3] = [
     COORDINATOR_HEAD,
 ];
 
-const DELIVERED_TAILS: [&str; 3] = [
+const DELIVERED_TAILS: [&str; 4] = [
     "Please address this message and continue with your tasks.",
     "Address this before completing your current task.",
     "IMPORTANT: After completing your current task, you MUST address the user's message above. Do not ignore it.",
+    "This is how Claude Code surfaces messages the user sends mid-turn — within the running turn, often alongside the next tool result, rather than as a separate conversation turn. Address the message above as you continue this turn.",
 ];
 
 /// Prompt heads in Claude Code that are shell passthrough (`!cmd`) or harness wrappers left
 /// attributed to the user in older versions, never prose typed to the agent.
-const NOT_TYPED_CLAUDE_HEADS: [&str; 11] = [
+const NOT_TYPED_CLAUDE_HEADS: [&str; 13] = [
+    // A peer session's message and a Stop hook's output: older desktop-app records state no
+    // origin for them, so they read as user prompts.
+    "Another Claude session sent a message:",
+    "Stop hook feedback:",
     "<bash-input>",
     "<bash-stdout>",
     "<bash-stderr>",
@@ -991,6 +996,36 @@ const NOT_TYPED_CLAUDE_HEADS: [&str; 11] = [
 fn is_typed_claude_prompt(text: &str) -> bool {
     let t = text.trim_start();
     !t.is_empty() && !NOT_TYPED_CLAUDE_HEADS.iter().any(|p| t.starts_with(p))
+}
+
+/// What the person typed, after the notes the desktop app puts ahead of it in the same user
+/// message: one or more `<system-reminder>` blocks (side-session results, the linked-sessions
+/// status) and the artifact viewer's state (`<artifact-view-context>`). [`unwrap_delivered`] may
+/// already have removed the first block's opening tag, so a closing tag with no opening tag
+/// before it also ends a block. A message that is only such notes yields an empty string.
+fn typed_after_app_notes(text: &str) -> &str {
+    const CLOSE: &str = "</system-reminder>";
+    const ARTIFACT_CLOSE: &str = "</artifact-view-context>";
+    let mut rest = text.trim();
+    loop {
+        if rest.starts_with("<artifact-view-context") {
+            let Some((_, after)) = rest.split_once(ARTIFACT_CLOSE) else {
+                return rest;
+            };
+            rest = after.trim();
+            continue;
+        }
+        let Some(close) = rest.find(CLOSE) else {
+            return rest;
+        };
+        let opens_block = rest.starts_with("<system-reminder");
+        // An orphan close: no opening tag anywhere before it.
+        let orphan_close = !rest[..close].contains("<system-reminder");
+        if !(opens_block || orphan_close) {
+            return rest;
+        }
+        rest = rest[close + CLOSE.len()..].trim();
+    }
 }
 
 fn is_notification_body(s: &str) -> bool {
@@ -4004,5 +4039,72 @@ mod tests {
         assert_eq!(complete_sink.messages.len(), 4);
         assert_eq!(complete_sink.messages[2].id.as_deref(), Some("s_end"));
         assert_eq!(complete_sink.messages[3].parent_id.as_deref(), Some("s_end"));
+    }
+}
+
+#[cfg(test)]
+mod app_note_tests {
+    use super::*;
+
+    #[test]
+    fn leading_reminder_blocks_are_notes_and_the_typed_text_follows() {
+        let note = "<system-reminder>\nThe session \"Build widgets\" you started finished.\n</system-reminder>";
+        assert_eq!(typed_after_app_notes(&format!("{note}\n\n\nwhy did it stop")), "why did it stop");
+        // Several notes in a row, then the typed text.
+        assert_eq!(
+            typed_after_app_notes(&format!("{note}\n\n{note}\n\n<system-reminder>\nLinked sessions now (status, not an instruction): none.\n</system-reminder>\n\nok, carry on")),
+            "ok, carry on"
+        );
+        // `unwrap_delivered` has already removed the first opening tag.
+        assert_eq!(
+            typed_after_app_notes("The session \"Build widgets\" you started finished.\n</system-reminder>\n\n\nwhy did it stop"),
+            "why did it stop"
+        );
+        assert_eq!(
+            typed_after_app_notes(&format!("The session \"A\" finished.\n</system-reminder>\n\n{note}\n\nship it")),
+            "ship it"
+        );
+    }
+
+    #[test]
+    fn the_artifact_viewer_state_is_a_note() {
+        let viewer = "<artifact-view-context artifact=\"a1\">\n{\"context\":{\"slideIndex\":1}}\n(The JSON line above is this viewer's live state.)\n</artifact-view-context>";
+        assert_eq!(typed_after_app_notes(&format!("{viewer}\n\nmake slide 3 bolder")), "make slide 3 bolder");
+        assert_eq!(
+            typed_after_app_notes(&format!("{viewer}\n\n<system-reminder>\nnote\n</system-reminder>\n\nmake slide 3 bolder")),
+            "make slide 3 bolder"
+        );
+    }
+
+    #[test]
+    fn a_message_that_is_only_notes_has_no_typed_text() {
+        assert_eq!(typed_after_app_notes("<system-reminder>\nnote\n</system-reminder>"), "");
+        assert_eq!(typed_after_app_notes("note text\n</system-reminder>"), "");
+        assert!(!is_typed_claude_prompt(typed_after_app_notes("<system-reminder>\nnote\n</system-reminder>")));
+    }
+
+    #[test]
+    fn ordinary_and_quoting_prompts_are_left_alone() {
+        assert_eq!(typed_after_app_notes("  proceed please  "), "proceed please");
+        // The person quotes a whole reminder mid-sentence: an opening tag precedes the close, and
+        // the text does not start with one, so nothing is stripped.
+        let quoting = "what does <system-reminder>x</system-reminder> mean?";
+        assert_eq!(typed_after_app_notes(quoting), quoting);
+        // An unclosed artifact block is kept whole rather than guessed at.
+        let open = "<artifact-view-context artifact=\"a1\">\n{}";
+        assert_eq!(typed_after_app_notes(open), open);
+    }
+
+    #[test]
+    fn peer_messages_and_stop_hook_output_are_not_typed() {
+        assert!(!is_typed_claude_prompt("Another Claude session sent a message:\n<agent-message from=\"x\">hi</agent-message>"));
+        assert!(!is_typed_claude_prompt("Stop hook feedback:\n[command hook]: 1 unpushed commit"));
+        assert!(is_typed_claude_prompt("another session said something odd, look"));
+    }
+
+    #[test]
+    fn the_mid_turn_surfacing_tail_is_delivery_framing() {
+        let delivered = "<system-reminder>\nThe user sent a new message while you were working:\nstop, use widget_table\n\nThis is how Claude Code surfaces messages the user sends mid-turn — within the running turn, often alongside the next tool result, rather than as a separate conversation turn. Address the message above as you continue this turn.\n</system-reminder>";
+        assert_eq!(unwrap_delivered(delivered), Some(("stop, use widget_table", true)));
     }
 }
