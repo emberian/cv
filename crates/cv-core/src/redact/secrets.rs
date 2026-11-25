@@ -716,7 +716,10 @@ mod tests {
             } else {
                 let _ = text(&input);
             }
-            if started.elapsed().as_millis() > u128::from(case["max_ms"].as_u64().unwrap()) {
+            // The upstream budgets target optimized code; unoptimized test builds on shared CI
+            // runners are several times slower while staying linear, and a blowup is far larger.
+            let budget = case["max_ms"].as_u64().unwrap() * if cfg!(debug_assertions) { 4 } else { 1 };
+            if started.elapsed().as_millis() > u128::from(budget) {
                 failures.push(format!("{} took {:?}", case["name"], started.elapsed()));
             }
         }
