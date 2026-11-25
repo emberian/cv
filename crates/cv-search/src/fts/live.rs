@@ -279,61 +279,128 @@ pub(super) fn read(
         no_index: indexed.is_none(),
         ..Default::default()
     };
+    let wanted_keys: HashSet<_> = refs.iter().map(|r| r.session_selector()).collect();
     let native: Vec<_> = refs
         .iter()
         .filter(|r| !cv_core::custody::is_pack_ref(r))
         .cloned()
         .collect();
-    let native_keys: HashSet<_> = native.iter().map(|r| r.session_selector()).collect();
+    let native_keys: HashSet<_> = native
+        .iter()
+        .filter(|r| r.path.exists())
+        .map(|r| r.session_selector())
+        .collect();
     let mut archived = Vec::new();
-    for backing in cv_core::custody::inventory()? {
-        let key = &backing.reference.id;
-        if native_keys.contains(key) && live != LiveRead::Frozen {
-            continue;
-        }
-        let in_index = indexed
-            .as_ref()
-            .map(|i| meta_addr(i.searcher, i.f, key))
-            .transpose()?
-            .flatten()
-            .is_some();
-        if in_index {
-            continue;
-        }
-        if live == LiveRead::Frozen && indexed.is_some() {
+    if wanted_keys.iter().any(|k| !native_keys.contains(k)) {
+        for backing in cv_core::custody::inventory()? {
+            let key = &backing.reference.id;
+            if !wanted_keys.contains(key) || native_keys.contains(key) {
+                continue;
+            }
+            let in_index = indexed
+                .as_ref()
+                .map(|i| meta_addr(i.searcher, i.f, key))
+                .transpose()?
+                .flatten()
+                .is_some();
+            if in_index {
+                continue;
+            }
             suffix.stale += 1;
-            suffix.cut += 1;
-            continue;
+            if live == LiveRead::Frozen && indexed.is_some() {
+                suffix.cut += 1;
+                continue;
+            }
+            archived.push(backing);
         }
-        archived.push(backing);
     }
+    let has_index = indexed.is_some();
     let mut pending = plan(dir, indexed, &native, &mut suffix)?;
+    if live == LiveRead::Frozen && has_index {
+        for p in pending {
+            suffix.cut += 1;
+            if let Cost::Known(cost) = p.cost {
+                suffix.cut_bytes += cost;
+            }
+        }
+        return Ok((None, suffix));
+    }
     let budget = match live {
         LiveRead::Frozen => 0,
         LiveRead::All => u64::MAX,
         LiveRead::Within(budget, _) => budget,
     };
-    // Newest first: what changed last is what a search most likely means.
-    pending.sort_by_key(|p| std::cmp::Reverse((p.job.mtime, p.job.r.updated_at)));
-    let mut remaining = budget;
-    let mut admitted = Vec::with_capacity(pending.len());
-    for p in pending {
-        match p.cost {
-            Cost::Known(cost) if cost > remaining => {
-                suffix.cut += 1;
-                suffix.cut_bytes += cost;
+    // Newest first across both live files and unindexed custody packs: what changed last is what
+    // a search most likely means.
+    enum Candidate {
+        Native(Pending),
+        Custody(cv_core::custody::Backing, u64),
+    }
+    impl Candidate {
+        fn recency(&self) -> (i64, Option<chrono::DateTime<chrono::Utc>>) {
+            match self {
+                Self::Native(p) => (p.job.mtime, p.job.r.updated_at),
+                Self::Custody(b, _) => (
+                    b.reference
+                        .updated_at
+                        .and_then(|t| t.timestamp_nanos_opt())
+                        .unwrap_or(0),
+                    b.reference.updated_at,
+                ),
             }
-            Cost::Known(cost) => {
-                remaining -= cost;
-                admitted.push(p);
-            }
-            Cost::Metered => admitted.push(p),
         }
     }
-    if admitted.is_empty() && archived.is_empty() {
+    pending.sort_by_key(|p| std::cmp::Reverse((p.job.mtime, p.job.r.updated_at)));
+    let mut candidates: Vec<Candidate> = pending.into_iter().map(Candidate::Native).collect();
+    for backing in archived {
+        let cost = backing.byte_len();
+        candidates.push(Candidate::Custody(backing, cost));
+    }
+    candidates.sort_by_key(|c| std::cmp::Reverse(c.recency()));
+
+    let mut remaining = budget;
+    let mut admitted = Vec::new();
+    let mut admitted_archived = Vec::new();
+    for cand in candidates {
+        match cand {
+            Candidate::Native(p) if live == LiveRead::Frozen => {
+                suffix.cut += 1;
+                if let Cost::Known(cost) = p.cost {
+                    suffix.cut_bytes += cost;
+                }
+            }
+            Candidate::Native(p) => match p.cost {
+                Cost::Known(cost) if cost > remaining => {
+                    suffix.cut += 1;
+                    suffix.cut_bytes += cost;
+                }
+                Cost::Known(cost) => {
+                    remaining -= cost;
+                    admitted.push(p);
+                }
+                Cost::Metered => admitted.push(p),
+            },
+            Candidate::Custody(backing, cost) => {
+                if live != LiveRead::Frozen && cost > remaining {
+                    suffix.cut += 1;
+                    suffix.cut_bytes += cost;
+                } else {
+                    if live != LiveRead::Frozen {
+                        remaining -= cost;
+                    }
+                    admitted_archived.push((backing, cost));
+                }
+            }
+        }
+    }
+    if admitted.is_empty() && admitted_archived.is_empty() {
         return Ok((None, suffix));
     }
-    let ram = Index::create_from_tempdir(build_schema()).context("creating the live suffix's index")?;
+    let ram = if live == LiveRead::Frozen {
+        Index::create_in_ram(build_schema())
+    } else {
+        Index::create_from_tempdir(build_schema()).context("creating the live suffix's index")?
+    };
     let f = fields_of(&ram.schema())?;
     let mut writer = open_writer(&ram, 50_000_000)?;
     // Metered reads draw on what the known costs left; known costs were reserved above.
@@ -361,11 +428,20 @@ pub(super) fn read(
             .collect()
     });
     let mut shadows = HashMap::new();
-    for backing in archived {
+    for (backing, cost) in admitted_archived {
         let r = &backing.reference;
         let mut out = |doc| writer.add_admitted(writer.admission.document(doc)?).map(|_| ());
-        index_session(&mut out, &f, &backing, r, 0, 0, None, Default::default(), None)?;
-        shadows.insert(r.id.clone(), 0);
+        match index_session(&mut out, &f, &backing, r, 0, 0, None, Default::default(), None) {
+            Ok(_) => {
+                suffix.read += 1;
+                suffix.bytes += cost;
+                shadows.insert(r.id.clone(), 0);
+            }
+            Err(_) => {
+                writer.delete_term(Term::from_field_text(f.id, &r.id));
+                suffix.failed += 1;
+            }
+        }
     }
     writer.commit().context("committing the live suffix")?;
     drop(writer);

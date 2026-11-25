@@ -2187,11 +2187,73 @@ const FACET_BOOST: f32 = 1.5;
 /// Facet text one doc carries at most: a few hundred keys.
 const FACET_BYTES: usize = 4096;
 
+/// Unwrap `<shell> -lc <script>` or `<shell> -c <script>` ONLY when the outer binary basename is
+/// `sh | bash | zsh | dash | ksh` (never on `git -c k=v` or `python3 -c`).
+fn unwrap_shell_command(command: &str) -> &str {
+    let mut rest = command.trim_start();
+    while let Some((tok, after)) = rest.split_once(char::is_whitespace) {
+        if tok.contains('=') && !tok.starts_with('-') {
+            rest = after.trim_start();
+            continue;
+        }
+        let base = tok.rsplit('/').next().unwrap_or(tok);
+        if matches!(base, "sh" | "bash" | "zsh" | "dash" | "ksh") {
+            let after = after.trim_start();
+            for flag in ["-lc", "-c"] {
+                if let Some(tail) = after.strip_prefix(flag) {
+                    if tail.starts_with(char::is_whitespace) {
+                        return tail.trim_start();
+                    }
+                }
+            }
+        }
+        break;
+    }
+    command
+}
+
+/// Skip top-level `git` options (`-C <dir>`, `-c <k=v>`, `--git-dir`, `--work-tree`, `--no-pager`, …)
+/// before matching the git subcommand.
+fn skip_git_global_opts<'b, 'a>(mut args: &'b [&'a str]) -> &'b [&'a str] {
+    while let Some((&first, rest)) = args.split_first() {
+        if matches!(
+            first,
+            "-C" | "-c" | "--git-dir" | "--work-tree" | "--namespace" | "--config-env"
+        ) {
+            args = rest.get(1..).unwrap_or(&[]);
+        } else if (first.starts_with("-C") && first.len() > 2)
+            || (first.starts_with("-c") && first.len() > 2)
+            || first.starts_with("--git-dir=")
+            || first.starts_with("--work-tree=")
+            || first.starts_with("--namespace=")
+            || first.starts_with("--config-env=")
+            || matches!(
+                first,
+                "--no-pager"
+                    | "-p"
+                    | "--paginate"
+                    | "--bare"
+                    | "--no-replace-objects"
+                    | "--literal-pathspecs"
+                    | "--glob-pathspecs"
+                    | "--noglob-pathspecs"
+                    | "--icase-pathspecs"
+                    | "--no-optional-locks"
+            )
+        {
+            args = rest;
+        } else {
+            break;
+        }
+    }
+    args
+}
+
 /// Append the structural keys of `blocks` to `out`, bounded by [`FACET_BYTES`]: each tool's name;
 /// each touched path, its file name and stem; each command's program and subcommand; and for a
 /// failed result `error failed` with any exit status. Keys come from small named input fields
 /// and result flags, never from bodies, so a doc's stored text and snippets are unchanged.
-fn facets_of(blocks: &[cv_core::Block], out: &mut String) {
+fn facets_of(r: &cv_core::Resolver, blocks: &[cv_core::Block], out: &mut String) {
     fn push(out: &mut String, key: &str) {
         let key = key.trim();
         if !key.is_empty() && out.len() + key.len() < FACET_BYTES {
@@ -2199,13 +2261,14 @@ fn facets_of(blocks: &[cv_core::Block], out: &mut String) {
             out.push(' ');
         }
     }
-    let text = input_text;
     for block in blocks {
         match block {
             cv_core::Block::ToolUse { name, input, .. } => {
                 push(out, name);
                 for key in ["file_path", "path", "notebook_path", "filePath"] {
-                    let Some(path) = text(input, key) else { continue };
+                    let Some(path) = input_text(r, input, key) else {
+                        continue;
+                    };
                     let p = Path::new(&path);
                     push(out, &path);
                     if let Some(file) = p.file_name().and_then(|n| n.to_str()) {
@@ -2216,18 +2279,33 @@ fn facets_of(blocks: &[cv_core::Block], out: &mut String) {
                     }
                 }
                 for key in ["command", "cmd"] {
-                    let Some(command) = text(input, key) else { continue };
-                    // `bash -lc "cargo clippy"` names its program inside the script.
-                    let script = command
-                        .split_once(" -lc ")
-                        .or_else(|| command.split_once(" -c "))
-                        .map_or(command.as_str(), |(_, s)| s);
-                    let mut words = script
+                    let Some(command) = input_text(r, input, key) else {
+                        continue;
+                    };
+                    let script = unwrap_shell_command(&command);
+                    let raw_tokens: Vec<&str> = script
                         .split(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ';' | '&' | '|'))
-                        .filter(|w| !w.is_empty() && !w.contains('='));
-                    if let Some(program) = words.next() {
-                        push(out, program.rsplit('/').next().unwrap_or(program));
-                        if let Some(sub) = words.next().filter(|w| !w.starts_with('-')) {
+                        .filter(|w| !w.is_empty())
+                        .collect();
+                    let mut idx = 0usize;
+                    while idx < raw_tokens.len() && raw_tokens[idx].contains('=') && !raw_tokens[idx].starts_with('-') {
+                        idx += 1;
+                    }
+                    if let Some(&program) = raw_tokens.get(idx) {
+                        let base = program.rsplit('/').next().unwrap_or(program);
+                        push(out, base);
+                        let sub = if base == "git" {
+                            skip_git_global_opts(&raw_tokens[idx + 1..])
+                                .first()
+                                .copied()
+                                .filter(|w| !w.starts_with('-') && !w.contains('='))
+                        } else {
+                            raw_tokens
+                                .get(idx + 1)
+                                .copied()
+                                .filter(|w| !w.starts_with('-') && !w.contains('='))
+                        };
+                        if let Some(sub) = sub {
                             push(out, sub);
                         }
                     }
@@ -2293,29 +2371,59 @@ fn commit_summary(output: &str) -> Option<(Option<&str>, &str)> {
 }
 
 /// The branch names a git command creates or switches to (`checkout -b X`, `switch -c X`,
-/// `branch X`), from its words.
+/// `branch X`), across every `git` invocation in `words` (including `git -C <dir> -c <k=v> …`).
 fn branches_named<'a>(words: &[&'a str]) -> Vec<&'a str> {
-    let Some(git) = words.iter().position(|w| *w == "git") else {
-        return Vec::new();
-    };
-    let args = &words[git + 1..];
-    let named = |flags: &[&str]| {
-        args.windows(2)
-            .find(|w| flags.contains(&w[0]))
-            .map(|w| w[1])
-            .filter(|b| !b.starts_with('-'))
-    };
-    match args.first().copied() {
-        Some("checkout") => named(&["-b", "-B"]).into_iter().collect(),
-        Some("switch") => named(&["-c", "-C", "--create"]).into_iter().collect(),
-        Some("branch") => args
-            .get(1)
-            .filter(|b| !b.starts_with('-'))
-            .copied()
-            .into_iter()
-            .collect(),
-        _ => Vec::new(),
+    let is_git = |w: &str| w.rsplit('/').next() == Some("git");
+    let is_sep = |w: &str| matches!(w, "&&" | "||" | ";" | "|");
+    let mut out = Vec::new();
+    for (i, &w) in words.iter().enumerate() {
+        if !is_git(w) {
+            continue;
+        }
+        let end = words[i + 1..]
+            .iter()
+            .position(|next| is_git(next) || is_sep(next))
+            .map_or(words.len(), |off| i + 1 + off);
+        let args = skip_git_global_opts(&words[i + 1..end]);
+        let named = |flags: &[&str]| {
+            args.get(1..)
+                .unwrap_or(&[])
+                .windows(2)
+                .find(|pair| flags.contains(&pair[0]))
+                .map(|pair| pair[1])
+                .filter(|b| !b.starts_with('-'))
+        };
+        let found = match args.first().copied() {
+            Some("checkout") => named(&["-b", "-B"]),
+            Some("switch") => named(&["-c", "-C", "--create"]),
+            Some("branch") => args.get(1).filter(|b| !b.starts_with('-')).copied(),
+            _ => None,
+        };
+        if let Some(branch) = found {
+            if !out.contains(&branch) {
+                out.push(branch);
+            }
+        }
     }
+    out
+}
+
+fn has_git_subcommand(words: &[&str], target_sub: &str) -> bool {
+    let is_git = |w: &str| w.rsplit('/').next() == Some("git");
+    let is_sep = |w: &str| matches!(w, "&&" | "||" | ";" | "|");
+    for (i, &w) in words.iter().enumerate() {
+        if !is_git(w) {
+            continue;
+        }
+        let end = words[i + 1..]
+            .iter()
+            .position(|next| is_git(next) || is_sep(next))
+            .map_or(words.len(), |off| i + 1 + off);
+        if skip_git_global_opts(&words[i + 1..end]).first().copied() == Some(target_sub) {
+            return true;
+        }
+    }
+    false
 }
 
 impl ChunkSink<'_> {
@@ -2334,19 +2442,21 @@ impl ChunkSink<'_> {
         for block in blocks {
             match block {
                 cv_core::Block::ToolUse { id, input, .. } => {
-                    let Some(command) = ["command", "cmd"].iter().find_map(|k| input_text(input, k)) else {
+                    let Some(command) = ["command", "cmd"].iter().find_map(|k| input_text(r, input, k)) else {
                         continue;
                     };
-                    let words: Vec<&str> = command
-                        .split(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ';' | '&' | '|'))
-                        .filter(|w| !w.is_empty())
-                        .collect();
-                    for branch in branches_named(&words) {
-                        git_facets_of(Some(branch), None, &mut self.facets);
+                    let script = unwrap_shell_command(&command);
+                    let mut commits = false;
+                    for clause in script.split([';', '&', '|', '\n']) {
+                        let words: Vec<&str> = clause
+                            .split(|c: char| c.is_whitespace() || matches!(c, '"' | '\''))
+                            .filter(|w| !w.is_empty())
+                            .collect();
+                        for branch in branches_named(&words) {
+                            git_facets_of(Some(branch), None, &mut self.facets);
+                        }
+                        commits |= has_git_subcommand(&words, "commit");
                     }
-                    // `git commit …`, also `git -C dir commit …`; a stray match only waits for a
-                    // result whose head has no commit summary.
-                    let commits = words.iter().skip_while(|w| **w != "git").any(|w| *w == "commit");
                     if commits && self.commit_calls.len() < PENDING {
                         self.commit_calls.push(id.clone());
                     }
@@ -2371,18 +2481,45 @@ impl ChunkSink<'_> {
     }
 }
 
-/// A tool input's string (or string-array, joined) field.
-fn input_text(input: &cv_core::Json, key: &str) -> Option<String> {
-    let value = input.select(key).ok()??;
-    let value = value.resolve().ok()?;
-    match &*value {
-        serde_json::Value::String(s) => Some(s.clone()),
-        serde_json::Value::Array(parts) => {
-            let words: Vec<&str> = parts.iter().filter_map(serde_json::Value::as_str).collect();
-            (!words.is_empty()).then(|| words.join(" "))
-        }
-        _ => None,
-    }
+/// Maximum bytes resolved from a single tool input field for structural facets.
+const INPUT_TEXT_PREFIX: u64 = 4096;
+
+/// A bounded prefix of a tool input's string (or string-array, joined) field, read without
+/// materializing multi-megabyte `Json::Source` heredocs onto the heap.
+fn input_text(r: &cv_core::Resolver, input: &cv_core::Json, key: &str) -> Option<String> {
+    input
+        .with_view(|view| {
+            let Some(field) = view.get(key)? else {
+                return Ok(None);
+            };
+            if let Some(text) = field.source_text()? {
+                return Ok(Some(text.try_resolve_prefix(r, INPUT_TEXT_PREFIX)?.into_owned()));
+            }
+            if let Some(arr) = field.array()? {
+                let mut out = String::new();
+                for item in arr {
+                    let item = item?;
+                    let Some(text) = item.source_text()? else {
+                        continue;
+                    };
+                    let remaining = (INPUT_TEXT_PREFIX as usize).saturating_sub(out.len());
+                    if remaining == 0 {
+                        break;
+                    }
+                    let part = text.try_resolve_prefix(r, remaining as u64)?;
+                    if !part.is_empty() {
+                        if !out.is_empty() {
+                            out.push(' ');
+                        }
+                        out.push_str(&part);
+                    }
+                }
+                return Ok((!out.is_empty()).then_some(out));
+            }
+            Ok(None)
+        })
+        .ok()
+        .flatten()
 }
 
 /// Collapse whitespace across formatter fragments, bounded in Unicode characters.
@@ -2564,7 +2701,7 @@ impl cv_core::MessageSink for ChunkSink<'_> {
         if !copied {
             self.switch_to(!m.kind.is_exchange());
             if !self.in_context {
-                facets_of(&m.content, &mut self.facets);
+                facets_of(&r, &m.content, &mut self.facets);
                 self.git_facets_in(&r, &m.content);
             }
             self.append_blocks(&r, &m.content);
@@ -3352,12 +3489,11 @@ pub fn text_search_keys_suffixed(
     live: LiveRead,
     refs: &[cv_core::SessionRef],
 ) -> Result<(Vec<Result<HashSet<String>>>, Suffix)> {
-    let indexed =
-        if dir.join("meta.json").exists() || (live == LiveRead::Frozen && cv_core::custody::inventory()?.is_empty()) {
-            Some(query_index(dir)?)
-        } else {
-            None
-        };
+    let indexed = if dir.join("meta.json").exists() {
+        Some(query_index(dir)?)
+    } else {
+        None
+    };
     let (live, suffix) = live::read(
         dir,
         indexed.as_ref().map(|(_, f, searcher)| live::Indexed { searcher, f }),
@@ -4407,9 +4543,52 @@ mod tests {
         assert_eq!(branches_named(&words("git branch topic")), ["topic"]);
         assert!(branches_named(&words("git branch -d topic")).is_empty());
         assert!(branches_named(&words("git checkout main")).is_empty());
+        assert_eq!(
+            branches_named(&words(
+                "git status && git -C /tmp/wt -c commit.gpgsign=false checkout -b feat/otter"
+            )),
+            ["feat/otter"]
+        );
+        assert_eq!(
+            branches_named(&words("echo hi ; /usr/bin/git -C dir --no-pager switch -c feat/heron")),
+            ["feat/heron"]
+        );
+        assert!(branches_named(&words("git branch && echo not_a_branch")).is_empty());
         let mut out = String::new();
         git_facets_of(Some("HEAD"), Some("0123456789abcdef0123456789abcdef01234567"), &mut out);
         assert_eq!(out, "0123456 0123456789abcdef0123456789abcdef01234567 ");
+
+        // #tooth `facets_of` unwraps `-lc`/`-c` only on real shells (`sh|bash|zsh|dash|ksh`), never
+        // on `git -c k=v` or `python3 -c`, and `input_text` caps `Json::Source` fields at 4 KiB.
+        let r = cv_core::Resolver::new(None);
+        let check_facets = |cmd: &str| {
+            let mut f = String::new();
+            let block = cv_core::Block::ToolUse {
+                id: "t1".into(),
+                name: "Bash".into(),
+                input: serde_json::json!({"command": cmd}).into(),
+                namespace: None,
+                extensions: Default::default(),
+            };
+            facets_of(&r, &[block], &mut f);
+            f
+        };
+        let git_f = check_facets("git -c commit.gpgsign=false -C /repo commit -m 'msg'");
+        assert!(git_f.contains(" git ") && git_f.contains(" commit "), "{git_f}");
+        let py_f = check_facets("python3 -c 'import sys; print(1)'");
+        assert!(py_f.contains(" python3 ") && !py_f.contains(" import "), "{py_f}");
+        let sh_f = check_facets("/bin/zsh -lc 'cargo clippy --workspace'");
+        assert!(sh_f.contains(" cargo ") && sh_f.contains(" clippy "), "{sh_f}");
+
+        let tmp = tmpdir();
+        let src_file = tmp.join("heredoc.json");
+        let giant_cmd = format!("cargo test <<'EOF'\n{}\nEOF", "x".repeat(128 * 1024));
+        let raw_json = serde_json::to_vec(&serde_json::json!({"command": giant_cmd})).unwrap();
+        std::fs::write(&src_file, &raw_json).unwrap();
+        let lazy_input = cv_core::Json::source(&src_file, 0, raw_json.len() as u64).unwrap();
+        let prefix = input_text(&r, &lazy_input, "command").unwrap();
+        assert_eq!(prefix.len(), INPUT_TEXT_PREFIX as usize);
+        assert!(prefix.starts_with("cargo test"));
     }
 
     use super::*;
@@ -11183,5 +11362,232 @@ mod tests {
         let filter = crate::SearchFilter::default();
         assert_eq!(reader.search("samevoltoken", 10, filter, None).unwrap().total, 0);
         assert_eq!(reader.search("unmountedvoltoken", 10, filter, None).unwrap().total, 1);
+    }
+
+    /// #tooth Live custody suffix filters packs against caller `refs`, honors `LiveRead::Within`
+    /// budget, isolates corrupt pack records into `suffix.failed`, never double-counts `stale`
+    /// when a session is both live and archived, and never creates a tempdir index under `Frozen`.
+    #[test]
+    fn tooth_live_custody_filters_refs_honors_budget_isolates_errors_and_respects_frozen() {
+        let w = cv_testkit::World::in_process("live-custody-contracts", cv_core::env::Env::enter_isolated);
+        let packs_dir = w.cv_home.join("packs");
+        let store = cv_core::state::StateStore::at_dir(&w.cv_home);
+        let prod = store.default_producer().to_string();
+        let dir = w.cv_home.join("tantivy");
+
+        // Pack 3 sessions: `c-wanted` (Claude, deleted live), `x-other` (Codex, deleted live),
+        // and `c-both` (Claude, ALSO present live on disk so native+archived overlap).
+        let pack_id = "pack-live-custody-1";
+        let mut builder = cv_core::packs::PackBuilder::create(&packs_dir, pack_id).unwrap();
+        let ir = |harness: cv_core::Harness, id: &str, text: &str| {
+            let mut s = cv_core::Session::new(id, harness);
+            let mut m = cv_core::Message::new(cv_core::Role::User);
+            m.content.push(cv_core::Block::from_text(text.to_owned().into()));
+            s.messages.push(m);
+            serde_json::to_vec(&s).unwrap()
+        };
+        let p_wanted = ir(
+            cv_core::Harness::Claude,
+            "c-wanted",
+            &format!("zqwanted {}", "pad ".repeat(200)),
+        );
+        let p_other = ir(cv_core::Harness::Codex, "x-other", "zqothercodex");
+        let p_both = ir(cv_core::Harness::Claude, "c-both", "zqbothliveandpacked");
+
+        let claude_live_dir = w.base.join("claude-live");
+        std::fs::create_dir_all(&claude_live_dir).unwrap();
+        let live_both_path = PathBuf::from(write_claude(&claude_live_dir, "c-both", "zqbothliveandpacked updated"));
+        let live_both_ref = cv_core::SessionRef::new("c-both", cv_core::Harness::Claude, &live_both_path);
+        let both_profile = cv_core::SessionKey::local(&live_both_ref).profile;
+
+        let key_wanted = cv_core::SessionKey {
+            producer: prod.clone(),
+            profile: PathBuf::new(),
+            harness: cv_core::Harness::Claude,
+            native_id: "c-wanted".into(),
+        };
+        let key_other = cv_core::SessionKey {
+            producer: prod.clone(),
+            profile: PathBuf::new(),
+            harness: cv_core::Harness::Codex,
+            native_id: "x-other".into(),
+        };
+        let key_both = cv_core::SessionKey {
+            producer: prod.clone(),
+            profile: both_profile.clone(),
+            harness: cv_core::Harness::Claude,
+            native_id: "c-both".into(),
+        };
+        let a_wanted = builder
+            .append_record(cv_core::custody::archive_anchor(&key_wanted), &p_wanted)
+            .unwrap();
+        let a_other = builder
+            .append_record(cv_core::custody::archive_anchor(&key_other), &p_other)
+            .unwrap();
+        let a_both = builder
+            .append_record(cv_core::custody::archive_anchor(&key_both), &p_both)
+            .unwrap();
+        let pfm = builder.seal(cv_core::publish::Claim::New).unwrap();
+        let zst_path = cv_core::packs::pack_zst_path(&packs_dir, pack_id).unwrap();
+        let zst_bytes = std::fs::read(&zst_path).unwrap();
+        let now = chrono::Utc::now();
+
+        let mut entries = Vec::new();
+        let mut pos_min = i64::MAX;
+        let mut pos_max = 0i64;
+        for (k, addr, payload) in [
+            (&key_wanted, a_wanted, &p_wanted),
+            (&key_other, a_other, &p_other),
+            (&key_both, a_both, &p_both),
+        ] {
+            let rec = store
+                .append(
+                    &format!("archive:{pack_id}:{}", k.selector()),
+                    &cv_core::blake3_hex(payload),
+                    &serde_json::json!({"kind": "session_archive", "session_id": k.native_id}),
+                )
+                .unwrap();
+            pos_min = pos_min.min(rec.local_commit_pos);
+            pos_max = pos_max.max(rec.local_commit_pos);
+            entries.push(cv_core::custody::ArchivedSessionEntry {
+                producer_id: prod.clone(),
+                profile: k.profile.clone(),
+                harness: k.harness.as_str().into(),
+                id: k.native_id.clone(),
+                title: None,
+                cwd: None,
+                created_at: None,
+                updated_at: Some(now),
+                message_count: 1,
+                archived_at: now,
+                content_blake3: addr.digest_hex(),
+                source_len: None,
+                source_mtime_ns: None,
+                baseline: None,
+                addr,
+                custody: cv_core::custody::CustodyKind::PortableProjection,
+            });
+        }
+        store
+            .publish_pack_range(&cv_core::state::PackManifest {
+                pack_id: pack_id.into(),
+                min_commit_pos: pos_min,
+                max_commit_pos: pos_max,
+                record_count: 3,
+                byte_len: zst_bytes.len() as u64,
+                digest: format!("blake3:{}", cv_core::blake3_hex(&zst_bytes)),
+                pack_path: format!("packs/{pack_id}.pack.zst"),
+                index_meta: serde_json::json!({
+                    "physical_pack_id": pack_id,
+                    "pack_version": pfm.version,
+                    "frame_count": pfm.frame_count,
+                    "total_decoded_len": pfm.total_decoded_len,
+                    "sessions": entries,
+                }),
+                published_at: now.timestamp_millis(),
+            })
+            .unwrap();
+
+        let ref_wanted = cv_core::SessionRef::new(key_wanted.selector(), cv_core::Harness::Claude, &zst_path);
+
+        // 1. Caller passes only `[ref_wanted]`: `x-other` and `c-both` MUST NOT be indexed!
+        let (sets, sfx_filtered) = text_search_keys_suffixed(
+            &dir,
+            &["zqwanted", "zqothercodex"],
+            crate::Scope::Exchange,
+            LiveRead::All,
+            std::slice::from_ref(&ref_wanted),
+        )
+        .unwrap();
+        assert_eq!(sfx_filtered.read, 1, "{sfx_filtered:?}");
+        assert!(sets[0].as_ref().unwrap().contains(&key_wanted.selector()));
+        assert!(
+            sets[1].as_ref().unwrap().is_empty(),
+            "unrelated custody pack outside `refs` must not be read or matched"
+        );
+
+        // 2. `LiveRead::Within(10)` cuts `ref_wanted` (`p_wanted.len() > 10`) instead of reading it!
+        let (cut_sets, sfx_cut) = text_search_keys_suffixed(
+            &dir,
+            &["zqwanted"],
+            crate::Scope::Exchange,
+            LiveRead::Within(10, Budget::Flag),
+            std::slice::from_ref(&ref_wanted),
+        )
+        .unwrap();
+        assert_eq!((sfx_cut.stale, sfx_cut.read, sfx_cut.cut), (1, 0, 1));
+        assert!(cut_sets[0].as_ref().unwrap().is_empty());
+
+        // 3. `LiveRead::Frozen` with `indexed.is_none()` NEVER creates `Index::create_from_tempdir`
+        //    (verified under an unwritable `0o500` `TMPDIR`), and with `indexed.is_some()` never
+        //    double-counts `live_both_ref` (which is both live and archived) in `suffix.stale`!
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let conn = rusqlite::Connection::open(w.cv_home.join("state.db")).unwrap();
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+            drop(conn);
+            let _ = std::fs::remove_file(w.cv_home.join("state.db-wal"));
+            let _ = std::fs::remove_file(w.cv_home.join("state.db-shm"));
+            let locked_tmp = w.base.join("locked-frozen-tmp");
+            std::fs::create_dir_all(&locked_tmp).unwrap();
+            std::fs::set_permissions(&locked_tmp, std::fs::Permissions::from_mode(0o500)).unwrap();
+            let prev_tmp = cv_core::env::var_os("TMPDIR");
+            w.scope.set("TMPDIR", &locked_tmp);
+            let res = text_search_keys_suffixed(
+                &dir,
+                &["zqwanted"],
+                crate::Scope::Exchange,
+                LiveRead::Frozen,
+                &[ref_wanted.clone(), live_both_ref.clone()],
+            );
+            w.scope.set("TMPDIR", prev_tmp.as_deref().unwrap_or_default());
+            std::fs::set_permissions(&locked_tmp, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let (frozen_sets, sfx_frozen) = res.unwrap();
+            assert!(
+                frozen_sets[0].as_ref().unwrap().contains(&key_wanted.selector()),
+                "cold frozen read over custody uses in-RAM index without touching TMPDIR"
+            );
+            assert_eq!(
+                (sfx_frozen.stale, sfx_frozen.read, sfx_frozen.unread()),
+                (2, 1, 1),
+                "c-wanted (pack, read in RAM) + c-both (live+pack, unread once) = 2 stale, never 3: {sfx_frozen:?}"
+            );
+        }
+
+        // Build an index on `dir` with an unrelated live session, then check `Frozen` stale count:
+        let indexed_path = PathBuf::from(write_claude(&claude_live_dir, "c-indexed", "zqindexed"));
+        let indexed_ref = cv_core::SessionRef::new("c-indexed", cv_core::Harness::Claude, &indexed_path);
+        index_refs(&dir, std::slice::from_ref(&indexed_ref), false).unwrap();
+        let ans_frozen = search_suffixed(
+            &dir,
+            "zqbothliveandpacked",
+            10,
+            crate::SearchFilter::default(),
+            LiveRead::Frozen,
+            std::slice::from_ref(&live_both_ref),
+        )
+        .unwrap();
+        assert_eq!(
+            ans_frozen.suffix.stale, 1,
+            "native+archived session must count as 1 stale under Frozen, not 2: {:?}",
+            ans_frozen.suffix
+        );
+
+        // 4. Corrupting `zst_path` isolates the custody failure into `suffix.failed` while live
+        //    `live_both_ref` still answers!
+        std::fs::write(&zst_path, b"corrupt-pack-bytes").unwrap();
+        let ans_degraded = search_suffixed(
+            &dir,
+            "zqbothliveandpacked",
+            10,
+            crate::SearchFilter::default(),
+            LiveRead::All,
+            &[ref_wanted, live_both_ref],
+        )
+        .unwrap();
+        assert_eq!(ans_degraded.suffix.failed, 1, "{:?}", ans_degraded.suffix);
+        assert_eq!(ans_degraded.suffix.read, 1, "{:?}", ans_degraded.suffix);
+        assert_eq!(ans_degraded.total, 1);
     }
 }

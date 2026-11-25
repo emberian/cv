@@ -449,3 +449,42 @@ fn git_branch_and_commit_sha_facets_find_the_session_and_the_committing_turn() {
     assert_eq!(ids("9e1d0c7"), ["gitsess"], "the short SHA the commit reported");
     assert_eq!(ids("kestrel"), ["gitsess"], "the branch the command created");
 }
+
+/// #tooth `git -c k=v` and `python3 -c` keep their real outer program facets instead of being
+/// misread as shell `-c` wrappers, and chained `git -C <dir> -c <k=v> switch -c <branch>` +
+/// `git -C <dir> commit` index both the created branch and commit SHA.
+#[test]
+fn git_and_python_dash_c_and_chained_git_dir_facets_index_accurately() {
+    let w = World::new("git-dash-c-facets");
+    let lines = [
+        serde_json::json!({"type": "user", "uuid": "m1", "timestamp": TS, "sessionId": "dashcsess",
+            "message": {"role": "user", "content": "ship the patch"}}),
+        serde_json::json!({"type": "assistant", "uuid": "m2", "timestamp": TS, "sessionId": "dashcsess",
+            "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "p1", "name": "Bash",
+                 "input": {"command": "python3 -c 'import math; print(42)'"}},
+                {"type": "tool_use", "id": "g1", "name": "Bash",
+                 "input": {"command": "git status && git -C /work/sub -c commit.gpgsign=false switch -c feat/kingfisher && git -C /work/sub -c commit.gpgsign=false commit -m 'done'"}}]}}),
+        serde_json::json!({"type": "user", "uuid": "m3", "timestamp": TS, "sessionId": "dashcsess",
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "p1", "content": "42"},
+                {"type": "tool_result", "tool_use_id": "g1",
+                 "content": "Switched to a new branch\n[feat/kingfisher 7a3f91e] done\n 1 file changed"}]}}),
+    ];
+    let body: String = lines.iter().map(|l| format!("{l}\n")).collect();
+    fs::write(w.transcript("dashcsess"), body).unwrap();
+    w.cv_ok(&["index"]);
+    let ids = |query: &str| -> Vec<String> {
+        let (out, _) = w.cv_ok(&["search", query, "--json"]);
+        let found: serde_json::Value = serde_json::from_str(&out).unwrap();
+        found["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["id"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    assert_eq!(ids("python3"), ["dashcsess"], "python3 -c keeps python3 facet");
+    assert_eq!(ids("kingfisher"), ["dashcsess"], "chained git -C -c switch -c branch");
+    assert_eq!(ids("7a3f91e"), ["dashcsess"], "git -C -c commit summary SHA");
+}
