@@ -18,6 +18,7 @@ pub mod compaction;
 pub mod config;
 pub mod context;
 pub mod coverage;
+pub mod uncompact;
 /// Bounded operation-owned staging and immutable byte replay, shared by output consumers.
 pub mod bytes {
     pub use crate::harness::store::bytes::{ByteSource, ByteStage};

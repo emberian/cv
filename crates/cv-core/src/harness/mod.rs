@@ -801,6 +801,19 @@ pub trait Adapter: Send + Sync {
         None
     }
 
+    /// Resolve an explicit file path into its canonical session reference and a root-scoped
+    /// adapter when the harness stores brain/sidecar layouts relative to an ancestor directory.
+    /// Default: none (caller uses [`SessionRef::from_path`]).
+    fn resolve_path(&self, _path: &Path) -> Option<(SessionRef, Box<dyn Adapter>)> {
+        None
+    }
+
+    /// Whether `cv rewind --out` can publish an offline native store copy for this harness
+    /// without inline JSONL identity restamping. Default: false.
+    fn has_cold_rewind(&self) -> bool {
+        false
+    }
+
     /// The [`Rows`](crate::source::Rows) certificate of every session the shared SQLite store
     /// at `store` holds, by session id, from one consistent read that copies no message body:
     /// what each session's own read consults (its rows' count and highest rowid, the flags and
@@ -1089,6 +1102,23 @@ pub fn all() -> Vec<Box<dyn Adapter>> {
 /// `cv rewind`, `cv adopt` and a distilled agent write.
 pub fn has_derived_copies(h: Harness) -> bool {
     rootless(h).is_some_and(|a| a.identity().is_some())
+}
+
+/// Whether `h`'s adapter supports offline native store publication on `cv rewind --out`
+/// ([`Adapter::has_cold_rewind`]).
+pub fn has_cold_rewind(h: Harness) -> bool {
+    rootless(h).is_some_and(|a| a.has_cold_rewind())
+}
+
+/// Resolve an explicit file path via [`Adapter::resolve_path`], restricted to `want` when given.
+pub fn resolve_file_source(path: &Path, want: Option<Harness>) -> Option<(SessionRef, Box<dyn Adapter>)> {
+    match want {
+        Some(h) => rootless(h)?.resolve_path(path),
+        None => Harness::ALL
+            .iter()
+            .copied()
+            .find_map(|h| rootless(h)?.resolve_path(path)),
+    }
 }
 
 /// The harness a derived session is written into when nothing names one (`cv distill --session |

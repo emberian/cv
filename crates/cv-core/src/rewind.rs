@@ -79,7 +79,7 @@ use crate::prune::new_uuid;
 use crate::stream::{Demand, Flow, MessageSink};
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -429,6 +429,8 @@ pub struct RewindOptions {
 /// What a rewind did (or, under `dry_run`, would do). Lines are 1-based source line numbers.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct RewindResult {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<crate::uncompact::Plan>,
     pub source_id: String,
     /// The `sessionId` the source's records carry (a sub-agent's is its parent's).
     pub source_session_id: Option<String>,
@@ -605,12 +607,18 @@ impl PrefixReadGuard {
 /// Derive the rewound session (see the module docs). Claude Code sessions only: the derivation
 /// copies raw records, and only Claude's records are resumable by id.
 pub fn rewind_session(r: &SessionRef, opts: &RewindOptions) -> Result<RewindResult> {
-    rewind_session_after_scan(r, opts, || Ok(()))
+    rewind_session_after_scan(r, opts, None, || Ok(()))
+}
+
+/// Native Claude recovery, reusing the byte copier, identity verifier and publication set.
+pub fn rewind_uncompact(r: &SessionRef, opts: &RewindOptions, ordinal: Option<usize>) -> Result<RewindResult> {
+    rewind_session_after_scan(r, opts, Some(ordinal), || Ok(()))
 }
 
 fn rewind_session_after_scan(
     r: &SessionRef,
     opts: &RewindOptions,
+    recover: Option<Option<usize>>,
     after_scan: impl FnOnce() -> Result<()>,
 ) -> Result<RewindResult> {
     anyhow::ensure!(
@@ -635,7 +643,17 @@ fn rewind_session_after_scan(
     let size = source_guard.source.len();
     let subagent = is_subagent(r);
 
-    let window = window(r, opts, &source_guard, &file, size, after_scan)?;
+    let recovery = recover
+        .map(|ordinal| {
+            let adapter = crate::harness::rootless(r.harness).context("missing source adapter")?;
+            let (s, _, grown) = crate::emit::prepare_selected(adapter, r, 0, None)?;
+            anyhow::ensure!(grown.is_none(), "source grew during uncompact selection");
+            let plan = crate::uncompact::Plan::select(r, &s, ordinal)?;
+            plan.ensure_closed()?;
+            Ok::<_, anyhow::Error>(plan)
+        })
+        .transpose()?;
+    let window = window(r, opts, &source_guard, &file, size, recovery.as_ref(), after_scan)?;
     // The destination, refused up front when taken, and the staged file pass 2 writes.
     let new_id = opts.new_id.clone().unwrap_or_else(new_uuid);
     let out_dir = opts.out_dir.clone().unwrap_or_else(|| project_dir(&r.path));
@@ -748,6 +766,7 @@ fn rewind_session_after_scan(
     }
 
     let res = RewindResult {
+        recovery,
         source_id: r.id.clone(),
         source_session_id,
         source_path: r.path.clone(),
@@ -763,7 +782,13 @@ fn rewind_session_after_scan(
         start_msg_idx,
         start_line,
         start_byte_offset: start_off,
-        start_mode: if opts.full { "full" } else { "from_compaction" },
+        start_mode: if recover.is_some() {
+            "uncompact"
+        } else if opts.full {
+            "full"
+        } else {
+            "from_compaction"
+        },
         boundary_msg_idx: boundary_idx,
         preserved_head,
         end_line,
@@ -840,6 +865,7 @@ fn rewind_session_after_scan(
 
 /// Pass 1's verdict: the records the copy spans and how it is written.
 struct Window {
+    selection: Option<BTreeSet<u64>>,
     cut_idx: usize,
     cut_off: u64,
     /// `End` cuts at the end of the file; an explicit cut stops at its message's record.
@@ -860,6 +886,7 @@ fn window(
     source_guard: &PrefixReadGuard,
     file: &std::fs::File,
     size: u64,
+    recovery: Option<&crate::uncompact::Plan>,
     after_scan: impl FnOnce() -> Result<()>,
 ) -> Result<Window> {
     let want_sha = match &opts.at {
@@ -919,6 +946,10 @@ fn window(
         }
     };
     let cut_idx = match (&opts.at, &evidence) {
+        _ if recovery.is_some() => *recovery
+            .and_then(|p| p.messages.last())
+            .filter(|i| **i < total)
+            .context("no native messages in selection")?,
         (CutAt::Message(n), _) => {
             if *n >= total {
                 bail!(
@@ -940,7 +971,7 @@ fn window(
 
     // Start: the last compaction boundary at or before the cut, moved back to its preserved
     // segment's head when that sits earlier; `--full` (or no boundary) starts at the top.
-    let boundary_idx = (!opts.full)
+    let boundary_idx = (!opts.full && recovery.is_none())
         .then(|| scan.boundaries.iter().rev().find(|b| **b <= cut_idx).copied())
         .flatten();
     let (start_off, preserved_head) = match boundary_idx {
@@ -966,6 +997,7 @@ fn window(
             crate::emit::ThinkingMode::Native
         });
     Ok(Window {
+        selection: recovery.map(|p| p.messages.iter().map(|i| scan.offsets[*i]).collect()),
         cut_idx,
         cut_off,
         to_eof,
@@ -1039,6 +1071,8 @@ fn copy(
         Done,
     }
     let mut phase = Phase::Before;
+    let mut kept_ids = BTreeSet::new();
+    let mut previous = None;
     use crate::harness::store::jsonl::ranges::{self, Range};
     let mut rows = ranges::records(file, Range { offset: 0, len: size })?.hashing();
     for row in rows.by_ref() {
@@ -1053,7 +1087,7 @@ fn copy(
         if phase == Phase::Before {
             continue;
         }
-        if phase == Phase::Done {
+        if phase == Phase::Done || w.selection.as_ref().is_some_and(|s| !s.contains(&at)) {
             omitted_lines += 1;
             omitted_bytes += n;
             continue;
@@ -1091,6 +1125,24 @@ fn copy(
             };
         if let Some(record) = &selected.record {
             let facts = record.with_view(|view| Ok(Facts::parse(view)?.0))?;
+            if w.selection.is_some() {
+                record.with_view(|v| {
+                    for key in ["parentUuid", "logicalParentUuid"] {
+                        if let Some(parent) = v.get(key)? {
+                            if parent.string()?.is_some_and(|id| !kept_ids.contains(&id)) {
+                                selected
+                                    .replacements
+                                    .push((parent.to_json()?, serde_json::json!(previous)));
+                            }
+                        }
+                    }
+                    Ok(())
+                })?;
+                if let Some(uuid) = &facts.uuid {
+                    kept_ids.insert(uuid.clone());
+                    previous = Some(uuid.clone());
+                }
+            }
             if source_session_id.is_none() {
                 source_session_id = facts.session_id.clone();
             }
@@ -1186,6 +1238,7 @@ fn copy(
 /// The provenance sidecar body (`<new-id>.rewind.json`).
 fn provenance(res: &RewindResult, opts: &RewindOptions) -> Value {
     let cut_by = match &opts.at {
+        _ if res.recovery.is_some() => "uncompact",
         CutAt::Message(_) => "msg_idx",
         CutAt::Commit(_) => "commit",
         CutAt::End => "end",
@@ -1236,6 +1289,9 @@ fn provenance(res: &RewindResult, opts: &RewindOptions) -> Value {
         "derived_at": chrono::Utc::now().to_rfc3339(),
         "cv_version": opts.generator,
     });
+    if let Some(plan) = &res.recovery {
+        value["recovery"] = serde_json::json!(plan);
+    }
     if !res.skills.is_keep() {
         value["skills"] = serde_json::json!(res.skills);
     }

@@ -4,6 +4,18 @@ use crate::ir::{Message, MessageKind};
 
 pub(super) fn tool_result(result: &ToolResult<'_>) -> Observation {
     let mut observation = Observation::result(result);
+    if !result.is_error {
+        if let Some(children) = result
+            .message
+            .and_then(|m| m.extra.get("antigravity"))
+            .and_then(|v| v.get("spawned_children"))
+            .and_then(|v| v.as_array())
+        {
+            observation
+                .started_jobs
+                .extend(children.iter().filter_map(|v| v.as_str().map(str::to_owned)));
+        }
+    }
     let native_task = result
         .message
         .and_then(|message| message.extra.get("antigravity"))
@@ -57,6 +69,26 @@ pub(super) fn tool_result(result: &ToolResult<'_>) -> Observation {
 }
 
 pub(super) fn message(message: &Message, body: &str) -> Observation {
+    if message.kind == MessageKind::SubagentReturn {
+        if let Some((child, reply)) = super::unwrap_system_message_body(body).and_then(super::idle_child) {
+            if message
+                .extra
+                .get("antigravity")
+                .and_then(|v| v.get("returned_child"))
+                .and_then(|v| v.as_str())
+                == Some(child)
+            {
+                return Observation {
+                    updates: vec![Update {
+                        target: Target::Job(child.into()),
+                        status: Status::Complete,
+                        output: Some(reply.into()),
+                    }],
+                    ..Default::default()
+                };
+            }
+        }
+    }
     if message.kind != MessageKind::InjectedContext {
         return Observation::default();
     }

@@ -86,6 +86,9 @@ fn resolve_source_with_note(
 ) -> Result<(SessionRef, Box<dyn cv_core::harness::Adapter>)> {
     let p = Path::new(spec);
     if p.is_file() {
+        if let Some(found) = cv_core::harness::resolve_file_source(p, harness) {
+            return Ok(found);
+        }
         let h = harness.unwrap_or_else(cv_core::harness::derived_host);
         let a = cv_core::harness::for_harness(h).with_context(|| format!("no adapter for {h}"))?;
         return Ok((SessionRef::from_path(p, h), a));
@@ -492,6 +495,7 @@ pub(crate) fn cmd_distill(
     spec: &str,
     harness: Option<String>,
     opts: DistillOptions,
+    recovery: crate::RecoveryArgs,
     upto: Option<usize>,
     with: &[String],
     pack: Option<PathBuf>,
@@ -507,7 +511,32 @@ pub(crate) fn cmd_distill(
     if let Some(path) = &pack {
         crate::util::user_file_claim(path, force)?;
     }
+    let requested = recovery.uncompact || recovery.pre_compaction.is_some();
+    if requested && upto.is_some() {
+        return usage("--upto and compaction selection name different cuts");
+    }
+    let mut plan = None;
     let (s, src_path, grown) = match upto {
+        None if requested => {
+            let (r, a) = resolve_source(spec, want)?;
+            let (mut s, _, grown) = cv_core::emit::prepare_selected(a.as_ref(), &r, 0, None)?;
+            if recovery.uncompact {
+                let p = cv_core::uncompact::Plan::select(&r, &s, recovery.pre_compaction)?;
+                p.apply(&mut s);
+                plan = Some(p);
+            } else {
+                let n = recovery.pre_compaction.context("missing compaction number")?;
+                let bounds = cv_core::compaction::detect_in_session(&s, false)?;
+                let (start, end) = n
+                    .checked_sub(1)
+                    .and_then(|i| cv_core::compaction::pre_compaction_span(&bounds, i))
+                    .with_context(|| format!("cannot select compaction {n} of {}", bounds.len()))?;
+                s.messages.truncate(end);
+                s.messages.drain(..start);
+            }
+            enrich_path_meta(&mut s, &r.path);
+            (s, r.path, grown)
+        }
         Some(n) => load_upto(spec, want, n)?,
         None => load_distill(spec, want)?,
     };
@@ -543,6 +572,15 @@ pub(crate) fn cmd_distill(
     }
     if let Some(grown) = &grown {
         d.note_grown(grown);
+    }
+    if let Some(plan) = &plan {
+        for child in &plan.recovered_children {
+            let mut finding = format!("\n### Recovered from child {} ({})\n\n", child.child, child.status);
+            for line in child.text.lines() {
+                let _ = writeln!(finding, "> {line}");
+            }
+            d.append_findings(&finding);
+        }
     }
     let mut with_sources: Vec<(String, String)> = Vec::new();
     for other in with {
@@ -624,6 +662,10 @@ pub(crate) fn cmd_distill(
     let mut out = json!({"stats": d.stats, "emitted": emitted, "pack_path": pack, "retired": retired, "unsettled": d.unsettled, "budget": measured});
     if let Some(grown) = grown {
         out["grown"] = json!(grown);
+    }
+    if let Some(plan) = plan {
+        h.push_str(&plan.report());
+        out["recovery"] = json!(plan);
     }
     report(json_out, &h, &out)?;
     if !json_out && pack.is_none() && matches!(target, Target::PackOnly) {
@@ -749,7 +791,20 @@ mod tests {
         let pack = (mode != "stdout").then(|| destination.join("pack.md"));
         let baseline = cv_testkit::heap::begin();
         let result = cmd_distill(
-            &source, None, opts, upto, &with, pack, false, target, false, json_out, None, None, true,
+            &source,
+            None,
+            opts,
+            Default::default(),
+            upto,
+            &with,
+            pack,
+            false,
+            target,
+            false,
+            json_out,
+            None,
+            None,
+            true,
         );
         let heap = cv_testkit::heap::end(baseline);
         eprintln!("CV_DISTILL_HEAP {}", serde_json::to_string(&heap)?);

@@ -17,6 +17,7 @@ use std::sync::Arc;
 use wire::Message as Proto;
 
 pub(super) use meta::read as metadata;
+pub(super) use wire::varint as read_varint;
 
 pub(super) fn open(path: &Path, complete: bool) -> Result<jsonl::Read> {
     read(path, complete, -1)
@@ -91,108 +92,111 @@ fn read(path: &Path, complete: bool, limit: i64) -> Result<jsonl::Read> {
     let source = crate::json::JsonSource::capture_with_reads(path, &reads)?;
     let input = jsonl::Read::with(source)?;
     let output = Arc::new(ByteSource::arena()?);
-    let mut stage = Stage::new()?;
-    sqlite::open_ro(path)?.read_snapshot(|conn, _| {
-        let columns = sqlite::Select::of(conn, "steps");
-        anyhow::ensure!(
-            columns.has("idx") && columns.has("step_payload") && columns.has("step_format"),
-            "unsupported Antigravity native steps schema"
-        );
-        let [meta_len, err_len, perm_len, task_len, render_len] = [
-            "metadata",
-            "error_details",
-            "permissions",
-            "task_details",
-            "render_info",
-        ]
-        .map(|col| {
-            if columns.has(col) {
-                format!("COALESCE(length({col}), 0)")
-            } else {
-                "0".into()
-            }
-        });
-        let select = columns.probed(&["step_type", "status"]).always(&[
-            "rowid",
-            "idx",
-            "step_format",
-            &meta_len,
-            &err_len,
-            &perm_len,
-            &task_len,
-            &render_len,
-            "step_payload IS NOT NULL",
-        ]);
-        // A negative LIMIT is no limit.
-        let sql = format!("SELECT {} FROM steps ORDER BY idx LIMIT ?1", select.list());
-        let mut query = conn.prepare(&sql)?;
-        let mut rows = query.query([limit])?;
-        output.append(|mut out| {
-            let opt_u64 = |row: &rusqlite::Row<'_>, idx: usize| -> rusqlite::Result<Option<u64>> {
-                use rusqlite::types::ValueRef;
-                Ok(match row.get_ref(idx)? {
-                    ValueRef::Integer(v) => u64::try_from(v).ok(),
-                    ValueRef::Text(t) => std::str::from_utf8(t).ok().and_then(|s| s.trim().parse::<u64>().ok()),
-                    _ => None,
-                })
-            };
-            while let Some(row) = rows.next()? {
-                let side_row = SideRow {
-                    step_type: opt_u64(row, 0)?,
-                    status: opt_u64(row, 1)?,
-                    metadata_len: row.get(5)?,
-                    error_len: row.get(6)?,
-                    permissions_len: row.get(7)?,
-                    task_len: row.get(8)?,
-                    render_len: row.get(9)?,
-                };
-                let rowid: i64 = row.get(2)?;
-                let index: i64 = row.get(3)?;
-                let format: i64 = row.get(4)?;
-                let has_payload: bool = row.get(10)?;
-                anyhow::ensure!(format == 0, "unsupported Antigravity native step format {format}");
-                anyhow::ensure!(index >= 0, "negative Antigravity step index");
-                // Each cell is privately staged, then projected with positioned bounded
-                // readers. Normal rows with `step_payload` do zero extra `stage.cell` reads.
-                if stage.used.get() >= Stage::RENEW {
-                    stage = Stage::new()?;
-                }
-                let (cell, step) = if has_payload {
-                    let cell = stage.cell(conn, "steps", "step_payload", rowid)?;
-                    let step = Proto::read(&stage.file, cell.0, cell.1)?;
-                    (cell, step)
-                } else {
-                    ((stage.used.get(), 0), Proto::default())
-                };
-                let mut side = SideCells {
-                    step_type: side_row.step_type,
-                    status: side_row.status,
-                    ..SideCells::default()
-                };
-                if step.last(5).is_none() {
-                    side.metadata = read_side_proto(&stage, conn, "metadata", rowid, side_row.metadata_len)?;
-                }
-                if step.last(31).is_none() {
-                    side.error = read_side_proto(&stage, conn, "error_details", rowid, side_row.error_len)?;
-                }
-                if step.last(56).is_none() && step.last(133).is_none() && step.last(147).is_none() {
-                    side.permissions = read_side_proto(&stage, conn, "permissions", rowid, side_row.permissions_len)?;
-                }
-                if step.last(148).is_none() {
-                    side.task = read_side_proto(&stage, conn, "task_details", rowid, side_row.task_len)?;
-                }
-                if side_row.render_len > 0 && !step_has_content_or_render(&stage.file, &step)? {
-                    side.render = read_side_proto(&stage, conn, "render_info", rowid, side_row.render_len)?;
-                }
-                project(&stage, &step, &side, cell, index as u64, complete, &mut out)?;
-            }
-            Ok(())
-        })?;
-        Ok(())
-    })?;
+    sqlite::open_ro(path)?.read_snapshot(|conn, _| project_rows(conn, complete, limit, &output))?;
     input.check()?;
     let len = output.byte_len()?;
     Ok(input.decoded(output, len))
+}
+
+/// Project rows through the caller's snapshot, including a successor before commit.
+pub(super) fn project_rows(conn: &rusqlite::Connection, complete: bool, limit: i64, output: &ByteSource) -> Result<()> {
+    let mut stage = Stage::new()?;
+    let columns = sqlite::Select::of(conn, "steps");
+    anyhow::ensure!(
+        columns.has("idx") && columns.has("step_payload") && columns.has("step_format"),
+        "unsupported Antigravity native steps schema"
+    );
+    let [meta_len, err_len, perm_len, task_len, render_len] = [
+        "metadata",
+        "error_details",
+        "permissions",
+        "task_details",
+        "render_info",
+    ]
+    .map(|col| {
+        if columns.has(col) {
+            format!("COALESCE(length({col}), 0)")
+        } else {
+            "0".into()
+        }
+    });
+    let select = columns.probed(&["step_type", "status"]).always(&[
+        "rowid",
+        "idx",
+        "step_format",
+        &meta_len,
+        &err_len,
+        &perm_len,
+        &task_len,
+        &render_len,
+        "step_payload IS NOT NULL",
+    ]);
+    // A negative LIMIT is no limit.
+    let sql = format!("SELECT {} FROM steps ORDER BY idx LIMIT ?1", select.list());
+    let mut query = conn.prepare(&sql)?;
+    let mut rows = query.query([limit])?;
+    output.append(|mut out| {
+        let opt_u64 = |row: &rusqlite::Row<'_>, idx: usize| -> rusqlite::Result<Option<u64>> {
+            use rusqlite::types::ValueRef;
+            Ok(match row.get_ref(idx)? {
+                ValueRef::Integer(v) => u64::try_from(v).ok(),
+                ValueRef::Text(t) => std::str::from_utf8(t).ok().and_then(|s| s.trim().parse::<u64>().ok()),
+                _ => None,
+            })
+        };
+        while let Some(row) = rows.next()? {
+            let side_row = SideRow {
+                step_type: opt_u64(row, 0)?,
+                status: opt_u64(row, 1)?,
+                metadata_len: row.get(5)?,
+                error_len: row.get(6)?,
+                permissions_len: row.get(7)?,
+                task_len: row.get(8)?,
+                render_len: row.get(9)?,
+            };
+            let rowid: i64 = row.get(2)?;
+            let index: i64 = row.get(3)?;
+            let format: i64 = row.get(4)?;
+            let has_payload: bool = row.get(10)?;
+            anyhow::ensure!(format == 0, "unsupported Antigravity native step format {format}");
+            anyhow::ensure!(index >= 0, "negative Antigravity step index");
+            // Each cell is privately staged, then projected with positioned bounded
+            // readers. Normal rows with `step_payload` do zero extra `stage.cell` reads.
+            if stage.used.get() >= Stage::RENEW {
+                stage = Stage::new()?;
+            }
+            let (cell, step) = if has_payload {
+                let cell = stage.cell(conn, "steps", "step_payload", rowid)?;
+                let step = Proto::read(&stage.file, cell.0, cell.1)?;
+                (cell, step)
+            } else {
+                ((stage.used.get(), 0), Proto::default())
+            };
+            let mut side = SideCells {
+                step_type: side_row.step_type,
+                status: side_row.status,
+                ..SideCells::default()
+            };
+            if step.last(5).is_none() {
+                side.metadata = read_side_proto(&stage, conn, "metadata", rowid, side_row.metadata_len)?;
+            }
+            if step.last(31).is_none() {
+                side.error = read_side_proto(&stage, conn, "error_details", rowid, side_row.error_len)?;
+            }
+            if step.last(56).is_none() && step.last(133).is_none() && step.last(147).is_none() {
+                side.permissions = read_side_proto(&stage, conn, "permissions", rowid, side_row.permissions_len)?;
+            }
+            if step.last(148).is_none() {
+                side.task = read_side_proto(&stage, conn, "task_details", rowid, side_row.task_len)?;
+            }
+            if side_row.render_len > 0 && !step_has_content_or_render(&stage.file, &step)? {
+                side.render = read_side_proto(&stage, conn, "render_info", rowid, side_row.render_len)?;
+            }
+            project(&stage, &step, &side, cell, index as u64, complete, &mut out)?;
+        }
+        Ok(())
+    })?;
+    Ok(())
 }
 
 fn step_has_content_or_render(file: &File, step: &Proto) -> Result<bool> {

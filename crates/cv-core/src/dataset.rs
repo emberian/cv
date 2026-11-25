@@ -378,7 +378,7 @@ pub(super) fn is_sidechain(m: &Message) -> bool {
 /// the trajectory.
 pub fn select_trajectory(messages: &[Message], opts: &DatasetOptions) -> Option<Vec<usize>> {
     let indices = if opts.active_branch_only {
-        select_active_branch_indices(messages)
+        select_active_branch_indices(messages, false)
     } else {
         (0..messages.len()).collect()
     };
@@ -388,7 +388,7 @@ pub fn select_trajectory(messages: &[Message], opts: &DatasetOptions) -> Option<
     Some(indices)
 }
 
-fn select_active_branch_indices(messages: &[Message]) -> Vec<usize> {
+pub(crate) fn select_active_branch_indices(messages: &[Message], include_trailing_records: bool) -> Vec<usize> {
     let has_main_visible = messages
         .iter()
         .any(|m| m.is_model_visible() && !is_inactive_branch(m) && !is_sidechain(m));
@@ -406,7 +406,7 @@ fn select_active_branch_indices(messages: &[Message]) -> Vec<usize> {
     let leaf = (0..messages.len()).rev().find(|&i| {
         let m = &messages[i];
         !excluded(m)
-            && (m.is_model_visible() || m.kind == MessageKind::Error)
+            && (include_trailing_records || m.is_model_visible() || m.kind == MessageKind::Error)
             && m.id.as_deref().is_some_and(|s| !s.is_empty())
     });
     let Some(leaf_idx) = leaf else {

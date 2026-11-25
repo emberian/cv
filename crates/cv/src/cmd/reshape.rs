@@ -419,6 +419,7 @@ pub(crate) fn parse_cut(at: Option<&str>) -> Result<cv_core::rewind::CutAt> {
 /// `<id>` is any session id, an `agent-…` sub-agent id, or a transcript path; `--agent` picks a
 /// sub-agent under `<id>` the way `cv show --agent` does.
 pub(crate) struct RewindArgs<'a> {
+    pub recovery: crate::RecoveryArgs,
     pub id: &'a str,
     pub harness: Option<String>,
     pub agent: Option<String>,
@@ -436,6 +437,7 @@ pub(crate) struct RewindArgs<'a> {
 
 pub(crate) fn cmd_rewind(args: RewindArgs<'_>) -> Result<()> {
     let RewindArgs {
+        recovery,
         id,
         harness,
         agent,
@@ -457,9 +459,15 @@ pub(crate) fn cmd_rewind(args: RewindArgs<'_>) -> Result<()> {
         None => r,
     };
     carry_source(carry_agents, &r)?;
-    if !cv_core::harness::has_derived_copies(r.harness) {
+    if recovery.pre_compaction.is_some() && !recovery.uncompact {
+        return usage("--pre-compaction needs --uncompact on rewind");
+    }
+    if recovery.uncompact && (at.is_some() || full) {
+        return usage("--uncompact selects the rewind cut and conflicts with --at and --full");
+    }
+    if !cv_core::harness::has_derived_copies(r.harness) && !cv_core::harness::has_cold_rewind(r.harness) {
         return usage(format!(
-            "cv rewind currently supports Claude Code sessions only (got {}) — `cv splice {}:..N` composes a \
+            "cv rewind supports Claude Code and native Antigravity sessions (got {}) — `cv splice {}:..N` composes a \
              prefix of any harness",
             r.harness,
             short_id(&r.id)
@@ -467,19 +475,52 @@ pub(crate) fn cmd_rewind(args: RewindArgs<'_>) -> Result<()> {
     }
 
     let pinned = to.is_some();
-    let res = cv_core::rewind::rewind_session(
-        &r,
-        &cv_core::rewind::RewindOptions {
-            at: cut,
-            skills_policy,
-            full,
-            thinking,
-            out_dir: out,
-            new_id: to,
-            dry_run,
-            generator: generator.to_string(),
-        },
-    )?;
+    let opts = cv_core::rewind::RewindOptions {
+        at: cut,
+        skills_policy,
+        full,
+        thinking,
+        out_dir: out,
+        new_id: to,
+        dry_run,
+        generator: generator.to_string(),
+    };
+    if cv_core::harness::has_cold_rewind(r.harness) {
+        if carry_agents.is_some()
+            || skills_policy != SkillsPolicy::Keep
+            || thinking.is_some_and(|t| t != cv_core::emit::ThinkingMode::Native)
+        {
+            return usage("cold Antigravity rewind uses native thinking and carries its own brain closure");
+        }
+        let result =
+            cv_core::harness::antigravity::cold::rewind(&r, &opts, recovery.uncompact, recovery.pre_compaction)?;
+        let mut h = format!(
+            "  {} native steps · {} generations retained · {} omitted · {} executor snapshots omitted\n",
+            result.selected_steps.len(),
+            result.generations_kept,
+            result.generations_omitted,
+            result.executor_rows_omitted
+        );
+        if let Some(plan) = &result.recovery {
+            h.push_str(&plan.report());
+        }
+        if let Some(path) = &result.new_path {
+            let _ = writeln!(
+                h,
+                "  {} {}",
+                if dry_run { "would write" } else { "wrote" },
+                path.display()
+            );
+        }
+        let mut v = serde_json::to_value(&result)?;
+        dry_run_nulls(&mut v, pinned, &["new_path"], &["new_id"]);
+        return report(json, &h, &v);
+    }
+    let res = if recovery.uncompact {
+        cv_core::rewind::rewind_uncompact(&r, &opts, recovery.pre_compaction)?
+    } else {
+        cv_core::rewind::rewind_session(&r, &opts)?
+    };
     let cwd = res.cwd.as_deref().map(std::path::Path::new);
     let resume = crate::cmd::port::resume_lines(r.harness, &res.new_id, cwd);
     // Claude Code finds a session by its project dir; a rewind written anywhere else must be moved
@@ -493,6 +534,9 @@ pub(crate) fn cmd_rewind(args: RewindArgs<'_>) -> Result<()> {
     dry_run_nulls(&mut v, pinned, &["new_path", "provenance_path"], &["new_id", "resume"]);
 
     let mut h = String::new();
+    if let Some(plan) = &res.recovery {
+        h.push_str(&plan.report());
+    }
     let tag = if res.dry_run {
         " (dry run — nothing written)"
     } else {
@@ -626,6 +670,7 @@ fn parse_splice_spec(spec: &str) -> Result<SpliceSpec> {
 /// resumes, shared with `distill`); otherwise `--harness`/`--out` emit to a harness and nothing at
 /// all prints a summary (with `--export md|json`, the composed session).
 pub(crate) struct SpliceArgs<'a> {
+    pub recovery: crate::RecoveryArgs,
     pub specs: &'a [String],
     pub harness: Option<String>,
     pub out: Option<PathBuf>,
@@ -639,6 +684,7 @@ pub(crate) struct SpliceArgs<'a> {
 
 pub(crate) fn cmd_splice(args: SpliceArgs<'_>) -> Result<()> {
     let SpliceArgs {
+        recovery,
         specs,
         harness,
         out,
@@ -654,6 +700,10 @@ pub(crate) fn cmd_splice(args: SpliceArgs<'_>) -> Result<()> {
             return usage(format!("unknown export format {format:?} (use md or json)"));
         }
     }
+    if recovery.pre_compaction.is_some() && !recovery.uncompact {
+        return usage("--pre-compaction needs --uncompact on splice");
+    }
+    let mut plans = Vec::new();
     let parsed: Vec<SpliceSpec> = specs.iter().map(|s| parse_splice_spec(s)).collect::<Result<_>>()?;
     let explicit_h = match &harness {
         Some(s) => {
@@ -675,13 +725,25 @@ pub(crate) fn cmd_splice(args: SpliceArgs<'_>) -> Result<()> {
         {
             agent_sources.push(reference.path.clone());
         }
-        let (session, total, grown) = if emitting {
+        if recovery.uncompact && (sp.start != 0 || sp.end.is_some()) {
+            return usage("--uncompact and a splice range name different cuts");
+        }
+        let (mut session, total, grown) = if emitting {
             cv_core::emit::prepare_replayable(adapter.as_ref(), &reference, sp.start, sp.end)?
         } else {
             cv_core::emit::prepare_selected(adapter.as_ref(), &reference, sp.start, sp.end)?
         };
         if let Some(grown) = grown {
             eprintln!("  ↳ {}: read {grown}", short_id(&reference.id));
+        }
+        if recovery.uncompact {
+            let p = cv_core::uncompact::Plan::select(&reference, &session, recovery.pre_compaction)?;
+            if emitting {
+                p.ensure_closed()?
+            }
+            eprint!("{}", p.report());
+            p.apply(&mut session);
+            plans.push(p);
         }
         composition.push(session, total, sp.start, sp.end);
     }
@@ -696,10 +758,15 @@ pub(crate) fn cmd_splice(args: SpliceArgs<'_>) -> Result<()> {
     } else {
         None
     };
-    let spliced = match emit_target {
+    let mut spliced = match emit_target {
         Some(target) => composition.finish_for_emit(None, target),
         None => composition.finish(None, to_h),
     };
+    if !plans.is_empty() {
+        spliced
+            .cv_extra_mut()
+            .insert("recovery".into(), serde_json::json!(plans));
+    }
     if let Some(target) = resumable {
         // `--session` / `--agent-of`: a resumable Claude transcript, the way `distill` writes one.
         // Nothing is elided (every selected message is carried whole), so there is no sidecar.
@@ -721,6 +788,9 @@ pub(crate) fn cmd_splice(args: SpliceArgs<'_>) -> Result<()> {
             let _ = writeln!(h, "  ↳ wrote {}", p.display());
         }
         let mut v = serde_json::to_value(&e)?;
+        if !plans.is_empty() {
+            v["recovery"] = serde_json::json!(plans);
+        }
         if let (Some(mode), Some(path), Some(id), None) = (carry_agents, &e.path, &e.session_id, &e.agent_id) {
             v["carried_agents"] = carry(mode, &agent_sources, path, id, (false, false), &mut h)?;
         }
@@ -728,6 +798,15 @@ pub(crate) fn cmd_splice(args: SpliceArgs<'_>) -> Result<()> {
             let _ = writeln!(h, "  ↳ resume: {r}");
         }
         return report(json, &h, &v);
+    }
+    if json && recovery.uncompact && !emitting && export.is_none() {
+        return report(
+            true,
+            "",
+            &serde_json::json!({
+                "session_id": spliced.id, "message_count": spliced.messages.len(), "recovery": plans
+            }),
+        );
     }
     finish_composed(ComposedArgs {
         session: spliced,

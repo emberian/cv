@@ -237,7 +237,7 @@ fn exact_at(file: &File, mut bytes: &mut [u8], mut at: u64) -> io::Result<()> {
     Ok(())
 }
 
-fn varint(bytes: &[u8], offset: &mut usize) -> Result<u64> {
+pub(in super::super) fn varint(bytes: &[u8], offset: &mut usize) -> Result<u64> {
     let mut value = 0;
     for shift in (0..70).step_by(7) {
         let byte = *bytes.get(*offset).context("truncated protobuf varint")?;

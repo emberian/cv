@@ -129,6 +129,16 @@ struct Cli {
     cmd: Cmd,
 }
 
+#[derive(clap::Args, Default, Clone, Copy)]
+pub(crate) struct RecoveryArgs {
+    /// Recover original turns through a compaction, plus matching late deliveries.
+    #[arg(long)]
+    uncompact: bool,
+    /// Select the Nth compaction (one-based). Recovery defaults to the latest.
+    #[arg(long, value_name = "N")]
+    pre_compaction: Option<usize>,
+}
+
 #[derive(Subcommand)]
 enum Cmd {
     /// List discovered sessions across all harnesses.
@@ -612,12 +622,13 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Rewind a Claude session to a past moment: a NEW resumable session holding the source's
-    /// records up to a message or the tool result that made a commit — the agent as it was when it
-    /// landed that code, ready for `claude --resume <new-id> --fork-session`. Starts at the last
-    /// compaction before the cut (the context the agent actually had); a sub-agent transcript comes
-    /// out as a standalone top-level session. Writes `<new-id>.rewind.json` provenance alongside.
+    /// Derive a Claude or native Antigravity session at a message, commit, or compaction.
+    /// An ordinary rewind begins at the last compaction before the cut. Claude writes
+    /// a resumable transcript and a provenance sidecar. Antigravity writes its native
+    /// SQLite trajectory, artifacts, and discovery row under an offline --out root.
     Rewind {
+        #[command(flatten)]
+        recovery: RecoveryArgs,
         /// Source session: an id (prefix, `harness:id`), a sub-agent's `agent-<id>`, or a transcript path.
         id: String,
         #[arg(long)]
@@ -631,7 +642,8 @@ enum Cmd {
         /// `cv show --agent` resolves it.
         #[arg(long)]
         agent: Option<String>,
-        /// Write under this directory instead of the source's project dir (where `claude --resume`
+        /// For Antigravity, publish into this private offline app-data root. For Claude,
+        /// write under this directory instead of the source's project dir (where `claude --resume`
         /// looks; a sub-agent's is its parent's).
         #[arg(long)]
         out: Option<PathBuf>,
@@ -642,10 +654,10 @@ enum Cmd {
         /// cut (the default: what a resume loads).
         #[arg(long)]
         full: bool,
-        /// Reasoning policy, two of the four `--thinking` values (a rewind writes Claude): `native`
-        /// keeps the source's reasoning and identifiers; `portable` demotes plaintext thinking to
-        /// text, removes signature-only reasoning and repairs tool IDs. `text` and `drop` are
-        /// refused here. Default: native when every model the window records is `claude-*`, else portable.
+        /// Native preserves recorded reasoning and identifiers. On Claude, portable converts
+        /// plaintext reasoning to text, removes signature-only reasoning, and repairs tool IDs;
+        /// `text` and `drop` are refused here. Claude defaults to portable when the selected
+        /// window includes a foreign model.
         #[arg(long, value_parser = ["native", "portable"])]
         thinking: Option<String>,
         /// Restored Claude skills: keep all, drop all, or drop entries whose files changed or disappeared.
@@ -681,6 +693,8 @@ enum Cmd {
     /// emits a resumable session (`claude -p --resume <id>`); `--agent-of <root>` emits a new
     /// sub-agent of that root, which the root resumes with SendMessage to the printed agent id.
     Distill {
+        #[command(flatten)]
+        recovery: RecoveryArgs,
         /// Session id, agent id (`agent-…`), `harness:id`, or a path to a transcript file.
         id: String,
         #[arg(long)]
@@ -819,6 +833,8 @@ enum Cmd {
     /// sub-agent of that root (as `distill` does); `--harness`/`--out` emit to any harness; with
     /// neither, a summary prints (`--export md|json` prints the composed session).
     Splice {
+        #[command(flatten)]
+        recovery: RecoveryArgs,
         /// One or more specs: `<id>:A..B`, `<id>:A..` (through the last), `<id>:..B`, or `<id>`
         /// (the whole session). Indices are 0-based, end-exclusive; `<id>` may be `harness:id` or a
         /// transcript path.
@@ -852,7 +868,7 @@ enum Cmd {
         /// Write under this directory instead of the target's real storage root.
         #[arg(long)]
         out: Option<PathBuf>,
-        /// With --session / --agent-of: report as JSON on stdout (what was written, how to resume).
+        /// Print a JSON report for --session, --agent-of, or an --uncompact selection preview.
         #[arg(long)]
         json: bool,
         /// What to do with the model's reasoning on the way out: `native` keeps it where the target
@@ -1576,6 +1592,7 @@ fn run() -> Result<()> {
             json,
         }),
         Cmd::Rewind {
+            recovery,
             id,
             harness,
             at,
@@ -1589,6 +1606,7 @@ fn run() -> Result<()> {
             dry_run,
             json,
         } => reshape::cmd_rewind(reshape::RewindArgs {
+            recovery,
             id: &id,
             harness,
             agent,
@@ -1763,6 +1781,7 @@ fn run() -> Result<()> {
             }
         }
         Cmd::Distill {
+            recovery,
             id,
             harness,
             keep_last,
@@ -1794,11 +1813,12 @@ fn run() -> Result<()> {
                 retrieve_ref: None,
             };
             let target = cmd::distill::target(session, agent_of, model, cwd, out)?;
-            let retire = !keep_source && upto.is_none();
+            let retire = !keep_source && upto.is_none() && !recovery.uncompact && recovery.pre_compaction.is_none();
             cmd::distill::cmd_distill(
                 &id,
                 harness,
                 opts,
+                recovery,
                 upto,
                 &with,
                 pack,
@@ -1831,6 +1851,7 @@ fn run() -> Result<()> {
             json,
         }),
         Cmd::Splice {
+            recovery,
             specs,
             session,
             carry_agents,
@@ -1850,6 +1871,7 @@ fn run() -> Result<()> {
                 None
             };
             reshape::cmd_splice(reshape::SpliceArgs {
+                recovery,
                 specs: &specs,
                 harness,
                 out,

@@ -3802,7 +3802,10 @@ fn rewind_validates_explicit_harness_for_direct_paths_before_writing() {
         output.to_str().unwrap(),
     ]);
     assert!(!ok && code == 2, "{error}");
-    assert!(error.contains("Claude Code sessions only (got codex)"), "{error}");
+    assert!(
+        error.contains("Claude Code and native Antigravity sessions (got codex)"),
+        "{error}"
+    );
     assert!(!output.exists());
     assert_eq!(fs::read(&source).unwrap(), original);
     let (ok, _, _, error) = w.cv(&["rewind", source.to_str().unwrap(), "--harness", "unknown-harness"]);

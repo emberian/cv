@@ -51,6 +51,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[cfg(feature = "sqlite")]
+pub mod cold;
 mod lifecycle;
 #[cfg(feature = "sqlite")]
 mod merge;
@@ -211,6 +213,14 @@ impl Adapter for Antigravity {
 
     fn harness(&self) -> Harness {
         Harness::Antigravity
+    }
+
+    fn resolve_path(&self, path: &Path) -> Option<(SessionRef, Box<dyn Adapter>)> {
+        source_for_path(path).map(|(r, a)| (r, Box::new(a) as Box<dyn Adapter>))
+    }
+
+    fn has_cold_rewind(&self) -> bool {
+        cfg!(feature = "sqlite")
     }
 
     fn roots(&self) -> Vec<PathBuf> {
@@ -1279,7 +1289,8 @@ impl Adapter for Antigravity {
                         codec: &mut StepCodec,
                         native_only: &mut Option<(jsonl::Read, StepOrder)>,
                     ) {
-                        if !verified.matches.is_empty()
+                        if !verified.repairs.is_empty()
+                            || !verified.matches.is_empty()
                             || !verified.native_only.steps.is_empty()
                             || verified.unreconciled
                         {
@@ -1295,6 +1306,7 @@ impl Adapter for Antigravity {
                             }
                         }
                         codec.enrich.verified = verified.matches;
+                        codec.enrich.repairs = verified.repairs;
                         for index in &verified.recovered_media {
                             order.missing_media.remove(index);
                         }
@@ -1323,6 +1335,7 @@ impl Adapter for Antigravity {
                             &cross_db,
                             opts.tier == Tier::Complete,
                             matches!(from, Start::Whole),
+                            false,
                         ) {
                             if verified.overlaps_verified && !verified.unreconciled {
                                 apply_native_db_metadata(
@@ -1346,6 +1359,7 @@ impl Adapter for Antigravity {
                             &local_db,
                             opts.tier == Tier::Complete,
                             matches!(from, Start::Whole),
+                            true,
                         ) {
                             Ok(verified) => adopt_verified(verified, &mut order, &mut codec, &mut native_only),
                             Err(_) => {
@@ -1781,6 +1795,17 @@ impl BrainLoc {
     }
 }
 
+/// Resolve the native conversation identity of an explicitly named store or brain export.
+pub fn source_for_path(path: &Path) -> Option<(SessionRef, Antigravity)> {
+    let loc = BrainLoc::from_transcript(path)?;
+    Some((
+        SessionRef::new(loc.id, Harness::Antigravity, path),
+        Antigravity {
+            roots: vec![loc.app_data_dir],
+        },
+    ))
+}
+
 fn select_session_source(root: &Path, id: &str) -> Option<PathBuf> {
     let log = select_brain_log(&root.join("brain").join(id));
     if let Some((rank, path)) = &log {
@@ -1925,6 +1950,8 @@ fn looks_like_antigravity_file(path: &Path) -> bool {
 struct SidecarEnrich {
     #[cfg(feature = "sqlite")]
     verified: BTreeMap<u64, merge::Match>,
+    #[cfg(feature = "sqlite")]
+    repairs: BTreeMap<u64, Map<String, Value>>,
     has_native_db: bool,
     step_models: BTreeMap<u64, String>,
     known_children: BTreeSet<String>,
@@ -2507,6 +2534,24 @@ impl jsonl::Codec for StepCodec {
             }
         }
         let record = (self.opts.tier == Tier::Complete).then(|| view.to_json()).transpose()?;
+        #[cfg(feature = "sqlite")]
+        let repaired;
+        #[cfg(feature = "sqlite")]
+        let view = if let Some(fields) = view
+            .get("step_index")?
+            .and_then(|v| v.as_number().ok().flatten())
+            .and_then(|n| n.as_u64())
+            .and_then(|i| self.enrich.repairs.remove(&i))
+        {
+            let mut step = view.resolve()?.into_owned();
+            step.as_object_mut()
+                .context("invalid Antigravity export")?
+                .extend(fields);
+            repaired = step;
+            JsonView::from(&repaired)
+        } else {
+            view
+        };
         self.decode(view, at, &mut Native { inner: sink, record })
     }
 
@@ -2856,7 +2901,12 @@ impl StepCodec {
                 } else {
                     Vec::new()
                 };
-                for child_id in typed.chain(named) {
+                let spawned: Vec<_> = typed.chain(named).collect();
+                if !spawned.is_empty() {
+                    m.harness_extra_mut(Harness::Antigravity)
+                        .insert("spawned_children".into(), json!(spawned));
+                }
+                for child_id in spawned {
                     self.state.child_ids.insert(child_id.clone());
                     self.state.spawned_children.insert(child_id, tool_use_id.clone());
                 }

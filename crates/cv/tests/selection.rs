@@ -1534,3 +1534,67 @@ fn resume_split_composes_with_carry_agents_adopt_join_and_lanes() {
     let lanes: Value = serde_json::from_str(lanes_out.trim()).unwrap();
     assert_eq!(lanes.as_array().unwrap().len(), 0, "S1 advances to joined S2: {lanes}");
 }
+
+#[test]
+fn compaction_selection_matches_rewind_splice_and_distill_across_five_boundaries() {
+    // #tooth: earlier genuine turns survive later summaries. A later prompt is
+    // reported even when a historical selection omits it from the successor.
+    let w = World::new("compaction-selection");
+    let mut source = Vec::new();
+    let mut parent = None;
+    for n in 1..=5 {
+        let human = format!("human-{n}");
+        let boundary = format!("boundary-{n}");
+        let summary = format!("summary-{n}");
+        let hook = format!("hook-{n}");
+        source.extend([
+            record("user",&human,parent.as_deref(),n,json!({"message":{"role":"user","content":format!("instruction {n}")}})),
+            record("system",&boundary,Some(&human),n,json!({"subtype":"compact_boundary","compactMetadata":{"trigger":"auto"}})),
+            record("user",&summary,Some(&boundary),n,json!({"isCompactSummary":true,"message":{"role":"user","content":"generated summary"}})),
+            record("attachment",&hook,Some(&summary),n,json!({"attachment":{"type":"hook_success","hookEvent":"SessionStart","hookName":"SessionStart:compact"},"rendered":[{"content":"compact hook"}]})),
+        ]);
+        parent = Some(hook);
+    }
+    source.push(record(
+        "user",
+        "later",
+        parent.as_deref(),
+        6,
+        json!({"message":{"role":"user","content":"later correction"}}),
+    ));
+    let path = w.write_session(SRC, &source);
+    let path = path.to_str().unwrap();
+    let read = |args: &[&str]| -> Value {
+        let (out, _) = w.cv_ok(args);
+        serde_json::from_str(&out).unwrap()
+    };
+    let rewind = read(&[
+        "rewind",
+        path,
+        "--uncompact",
+        "--json",
+        "--out",
+        w.base.to_str().unwrap(),
+    ]);
+    let written = Path::new(rewind["new_path"].as_str().unwrap());
+    assert_threaded(written);
+    let ids = rows(written).into_iter().map(|r| r["uuid"].clone()).collect::<Vec<_>>();
+    assert_eq!(
+        ids,
+        json!(["human-1", "human-2", "human-3", "human-4", "human-5"])
+            .as_array()
+            .unwrap()
+            .clone()
+    );
+    let splice = read(&["splice", path, "--uncompact", "--export", "json"]);
+    let distill = read(&["distill", path, "--uncompact", "--json"]);
+    let plan = &rewind["recovery"];
+    assert_eq!(plan["pre_compaction"], 5);
+    assert_eq!(plan["excluded_prompts"][0]["text"], "later correction");
+    assert_eq!(plan, &splice["extra"]["cv"]["recovery"][0]);
+    assert_eq!(plan, &distill["recovery"]);
+    assert_eq!(plan, &read(&["splice", path, "--uncompact", "--json"])["recovery"][0]);
+    let first = read(&["distill", path, "--pre-compaction", "1", "--uncompact", "--json"]);
+    assert_eq!(first["recovery"]["messages"], json!([0]));
+    assert_eq!(first["recovery"]["excluded_prompts"].as_array().unwrap().len(), 5);
+}

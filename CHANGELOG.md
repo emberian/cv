@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Rewind, splice, and distill recover pre-compaction history and late results with `--uncompact`, and report excluded human prompts.
+- Antigravity rewind writes selected native SQLite rows and artifacts to an offline app-data root with `--out`.
+- Antigravity fills truncated export fields from matching native steps while retaining exported bodies for cleared rows.
 - Observational hooks use bounded input and a nonblocking recorder queue. Quiet starts emit zero bytes, and actionable pointers are deduplicated per condition revision.
 - Doctor reports five-tool-turn follow-up counts by whisper kind.
 - Lane and event JSON expose validated causal identifiers supplied through `CV_BAGGAGE`.

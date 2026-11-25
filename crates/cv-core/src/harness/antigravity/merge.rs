@@ -33,6 +33,7 @@ pub(super) struct Revised {
 }
 pub(super) struct Verified {
     pub matches: BTreeMap<u64, Match>,
+    pub repairs: BTreeMap<u64, Map<String, Value>>,
     pub native: jsonl::Read,
     /// Native steps the export lacks, each beside verified exported steps.
     pub native_only: StepOrder,
@@ -290,12 +291,234 @@ fn compare(exported: JsonView<'_>, kind: Option<&str>, native: &NativeStep, prin
     Ok((!running && kind != Some("USER_INPUT") && !formatted_direct).then_some(false))
 }
 
+const TEXT_FIELDS: [&str; 3] = ["content", "thinking", "error"];
+
+fn marked(view: JsonView<'_>) -> Result<bool> {
+    // Keep only the undecided suffix when a marker straddles decoder chunks.
+    const MARKER: &str = "<truncated ";
+    let mut tail = String::new();
+    Ok(crate::stream::stopped(view.for_each_str_chunk(|chunk| {
+        if chunk.contains(MARKER) || {
+            tail.push_str(&chunk[..chunk.floor_char_boundary(chunk.len().min(MARKER.len()))]);
+            tail.contains(MARKER)
+        } {
+            return Err(crate::stream::Stop.into());
+        }
+        if chunk.len() >= MARKER.len() {
+            tail.clear();
+            tail.push_str(&chunk[chunk.ceil_char_boundary(chunk.len() - MARKER.len())..]);
+        } else {
+            tail.drain(..tail.floor_char_boundary(tail.len().saturating_sub(MARKER.len())));
+        }
+        Ok(())
+    }))?
+    .is_none())
+}
+
+fn has_marker(view: JsonView<'_>) -> Result<bool> {
+    if view.is_string()? {
+        return marked(view);
+    }
+    if let Some(items) = view.array()? {
+        for item in items {
+            if has_marker(item?)? {
+                return Ok(true);
+            }
+        }
+        return Ok(false);
+    }
+    Ok(crate::stream::stopped(view.for_each_entry(|_, v| {
+        if has_marker(v)? {
+            return Err(crate::stream::Stop.into());
+        }
+        Ok(())
+    }))?
+    .is_none())
+}
+
+fn truncated_fields(view: JsonView<'_>) -> Result<(Vec<String>, Vec<&'static str>)> {
+    let mut declared = Vec::new();
+    if let Some(names) = view
+        .get("truncated_fields")?
+        .map(JsonView::array)
+        .transpose()?
+        .flatten()
+    {
+        for name in names {
+            if let Some(name) = name?.string()? {
+                declared.push(name);
+            }
+        }
+    }
+    let mut truncated = Vec::new();
+    for key in TEXT_FIELDS {
+        if declared.iter().any(|s| s == key) || view.get(key)?.map(marked).transpose()?.unwrap_or(false) {
+            truncated.push(key);
+        }
+    }
+    if declared.iter().any(|s| s == "tool_calls")
+        || view.get("tool_calls")?.map(has_marker).transpose()?.unwrap_or(false)
+    {
+        truncated.push("tool_calls");
+    }
+    Ok((declared, truncated))
+}
+
+/// Check surviving text before choosing the native field. A declaration with no
+/// surviving text can only be filled from the companion of this very export.
+fn covers(rendered: &str, full: &str, declared: bool, local: bool) -> bool {
+    let cut = rendered.rmatch_indices("<truncated ").find_map(|(at, marker)| {
+        let (count, after) = rendered[at + marker.len()..].split_once(" bytes>")?;
+        count.parse::<usize>().ok().filter(|n| *n > 0).map(|_| (at, after))
+    });
+    if !declared && cut.is_none() || full.is_empty() || full == rendered {
+        return false;
+    }
+    let (at, after) = cut.unwrap_or((rendered.len(), ""));
+    let prefix = rendered[..at].trim_end();
+    if prefix.is_empty() || prefix == "truncated" {
+        return local && (declared || cut.is_some()) && (after.is_empty() || full.ends_with(after.trim()));
+    }
+    // A rendered USER_REQUEST or timestamp can precede the surviving prefix.
+    let head = &full[..full.floor_char_boundary(full.len().min(32))];
+    let start = if full.starts_with(prefix) {
+        Some(0)
+    } else {
+        prefix
+            .match_indices(head)
+            .find_map(|(at, _)| (at == 0 || prefix.as_bytes()[at - 1] == b'\n').then_some(at))
+    };
+    start.is_some_and(|start| {
+        let observed = &prefix[start..];
+        full.len() > observed.len()
+            && full.starts_with(observed)
+            && (after.trim().is_empty() || full.ends_with(after.trim()) || after.trim_start().starts_with("</"))
+    })
+}
+
+/// Change only elided argument leaves. A complete sibling belongs to its export
+/// revision even when the companion's value differs.
+fn repair_argument(old: &mut Value, native: &Value, declared: bool, local: bool) -> bool {
+    match (old, native) {
+        (Value::String(s), Value::String(full)) if covers(s, full, declared, local) => {
+            s.clone_from(full);
+            true
+        }
+        (Value::Object(a), Value::Object(b)) => {
+            let mut changed = false;
+            for (key, value) in a {
+                if let Some(other) = b.get(key) {
+                    changed |= repair_argument(value, other, false, local);
+                }
+            }
+            changed
+        }
+        (Value::Array(a), Value::Array(b)) if a.len() == b.len() => {
+            let mut changed = false;
+            for (v, other) in a.iter_mut().zip(b) {
+                changed |= repair_argument(v, other, false, local);
+            }
+            changed
+        }
+        _ => false,
+    }
+}
+
+fn repair_calls(export: JsonView<'_>, native: JsonView<'_>, declared: bool, local: bool) -> Result<Option<Value>> {
+    let (Some(a), Some(b)) = (export.get("tool_calls")?, native.get("tool_calls")?) else {
+        return Ok(None);
+    };
+    let mut calls = a.resolve()?.into_owned();
+    let Some(old) = calls.as_array_mut() else {
+        return Ok(None);
+    };
+    let Some(other) = b.array()? else { return Ok(None) };
+    let others = other.collect::<Result<Vec<_>>>()?;
+    if old.len() != others.len() {
+        return Ok(None);
+    }
+    let mut changed = false;
+    for (call, other) in old.iter_mut().zip(others) {
+        let name = string(other, "name")?;
+        let id = string(other, "id")?;
+        if name.is_none()
+            || call["name"].as_str() != name.as_deref()
+            || call["id"].as_str().is_some_and(|v| Some(v) != id.as_deref())
+        {
+            continue;
+        }
+        let Some(arg) = other.get("arguments")? else { continue };
+        if let Some(Value::String(old)) = call.get_mut("arguments") {
+            if let Some(full) = arg.string()?.filter(|s| covers(old, s, declared, local)) {
+                *old = full;
+                changed = true;
+            }
+        } else if let Some(old) = call.get_mut("args") {
+            let full = arg.encoded_argument()?;
+            changed |= repair_argument(old, full.resolve()?.as_ref(), false, local);
+        }
+    }
+    Ok(changed.then_some(calls))
+}
+
+fn repair_fields(
+    export: JsonView<'_>,
+    native: JsonView<'_>,
+    mut declared: Vec<String>,
+    truncated: &[&str],
+    local: bool,
+) -> Result<Map<String, Value>> {
+    let mut patch = Map::new();
+    for &key in truncated {
+        if key == "tool_calls" {
+            if let Some(calls) = repair_calls(export, native, declared.iter().any(|s| s == key), local)? {
+                patch.insert(key.into(), calls);
+            }
+            continue;
+        }
+        let rendered = string(export, key)?.unwrap_or_default();
+        let mut full = string(native, key)?;
+        if full.is_none() && key == "content" {
+            if let Some(parts) = native
+                .get("native_content")?
+                .map(JsonView::array)
+                .transpose()?
+                .flatten()
+            {
+                let mut joined = String::new();
+                for part in parts {
+                    joined.push_str(&part?.string()?.context("invalid native text item")?);
+                }
+                full = Some(joined);
+            }
+        }
+        if let Some(full) = full.filter(|f| covers(&rendered, f, declared.iter().any(|s| s == key), local)) {
+            patch.insert(key.into(), Value::String(full));
+        }
+    }
+    if !declared.is_empty() && !patch.is_empty() {
+        let mut remaining = Vec::new();
+        for key in declared {
+            if let Some(value) = patch.get(&key) {
+                if !has_marker(JsonView::from(value))? {
+                    continue;
+                }
+            }
+            remaining.push(key);
+        }
+        declared = remaining;
+        patch.insert("truncated_fields".into(), json!(declared));
+    }
+    Ok(patch)
+}
+
 pub(super) fn verified(
     input: &jsonl::Read,
     order: &StepOrder,
     path: &Path,
     complete: bool,
     include_native_only: bool,
+    local: bool,
 ) -> Result<Verified> {
     let native = super::native::open(path, complete)?;
     let mut steps = BTreeMap::new();
@@ -329,6 +552,8 @@ pub(super) fn verified(
         );
         Ok(Flow::Continue)
     })?;
+    let mut repairs = BTreeMap::new();
+    let mut native_fields = native.records();
     let mut verdicts = BTreeMap::new();
     // Exported tool results at a native tool result's index and second (`index -> exported_running`).
     let mut results = BTreeMap::new();
@@ -343,7 +568,27 @@ pub(super) fn verified(
                 results.insert(*index, is_running_status(string(view, "status")?.as_deref()));
             }
             match &step.print {
-                Some(print) => compare(view, kind.as_deref(), step, print),
+                Some(print) if step.kind == kind && second(view)? == step.second => {
+                    let (declared, truncated) = truncated_fields(view)?;
+                    if truncated.is_empty() {
+                        return compare(view, kind.as_deref(), step, print);
+                    }
+                    let patch = native_fields.read(step.at, step.end - step.at, |n| {
+                        repair_fields(view, n, declared, &truncated, local)
+                    })?;
+                    if !patch.is_empty() {
+                        let mut revised = view.resolve()?.into_owned();
+                        revised
+                            .as_object_mut()
+                            .context("expected exported step")?
+                            .extend(patch.clone());
+                        let verdict = compare(JsonView::from(&revised), kind.as_deref(), step, print)?;
+                        repairs.insert(*index, patch);
+                        return Ok(verdict);
+                    }
+                    compare(view, kind.as_deref(), step, print)
+                }
+                Some(_) => Ok(Some(false)),
                 None => Ok(None),
             }
         })?;
@@ -484,6 +729,7 @@ pub(super) fn verified(
     native.check()?;
     input.check()?;
     Ok(Verified {
+        repairs,
         matches,
         native,
         native_only,
@@ -497,6 +743,24 @@ pub(super) fn verified(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn antigravity_repairs_only_elided_fields_of_matching_calls() -> Result<()> {
+        let a = json!({"content":"stable", "thinking":"abc<truncated 3 bytes>", "tool_calls":[
+            {"id":"first","name":"write","args":{"text":"abc<truncated 3 bytes>","path":"export"}},
+            {"id":"other","name":"write","args":{"text":"abc<truncated 3 bytes>"}}]});
+        let b = json!({"content":"changed", "thinking":"abcdef","tool_calls":[
+            {"id":"first","name":"write","arguments":r#"{"text":"abcdef","path":"native"}"#},
+            {"id":"second","name":"write","arguments":r#"{"text":"abcdef"}"#}]});
+        let av = JsonView::from(&a);
+        let (declarations, fields) = truncated_fields(av)?;
+        let p = repair_fields(av, JsonView::from(&b), declarations, &fields, true)?;
+        assert_eq!(p["thinking"], "abcdef");
+        assert!(!p.contains_key("content"));
+        assert_eq!(p["tool_calls"][0]["args"], json!({"text":"abcdef","path":"export"}));
+        assert_eq!(p["tool_calls"][1], a["tool_calls"][1]);
+        Ok(())
+    }
 
     fn embedded(text: &str, native: &str) -> bool {
         let native = json!(native);

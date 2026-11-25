@@ -307,7 +307,6 @@ pub fn row(boundaries: &[Compaction], n: usize) -> Value {
 /// from an already-parsed session's messages, without re-streaming. Mirrors [`CompactionSink`]'s
 /// logic on `session.messages`, resolving retained lazy text against `session.source_path` and
 /// returning demanded summary read errors.
-#[cfg(test)]
 pub fn detect_in_session(session: &crate::ir::Session, keep_summaries: bool) -> anyhow::Result<Vec<Compaction>> {
     let mut sink = CompactionSink::new(keep_summaries);
     sink.resolver = Some(crate::lazy::Resolver::new(session.source_path.clone()));

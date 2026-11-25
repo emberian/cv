@@ -921,7 +921,7 @@ fn rewind_prefix_receipt_accepts_appends_and_rejects_source_mutations() {
             out_dir: Some(dir.clone()),
             ..opts(CutAt::End, &dir)
         };
-        let result = rewind_session_after_scan(&r, &opts, || {
+        let result = rewind_session_after_scan(&r, &opts, None, || {
             match mutation {
                 "append" => {
                     let mut writer = std::fs::OpenOptions::new().append(true).open(&path)?;
