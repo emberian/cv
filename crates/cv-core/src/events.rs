@@ -762,7 +762,10 @@ mod db {
     ///   rowid: `sessions` rows are `INSERT OR REPLACE`d on every sync, which deletes+reinserts
     ///   and so *changes* the rowid — events keyed on it would silently orphan. Its PK is also
     ///   `(harness, id, path)`, so one logical session at two paths would have two rowids.
-    ///   `UNIQUE(harness, session_id)` here is stable across syncs and tiny (~2.4k rows).
+    ///   `UNIQUE(selector)` here (the profile-qualified [`SessionRef::session_selector`]) is
+    ///   stable across syncs and tiny (~2.4k rows), and keeps two profiles' copies of one native
+    ///   id apart: indexing one never replaces the other's rows. A catalog keyed the old way, by
+    ///   `(harness, session_id)`, drops its event rows and their baselines once, and re-ingests.
     /// * `event_targets` interns the distinct target strings (~54k of ~145k events); event rows
     ///   carry a nullable integer. Re-ingest deletes a session's event rows but leaves its
     ///   interned targets — orphans are unreferenced cache rows, reclaimed only when a
@@ -776,16 +779,30 @@ mod db {
         if crate::env::frozen() {
             return Some(conn);
         }
+        if table_has_column(&conn, "event_sessions", "harness") && !has_selector(&conn) {
+            conn.execute_batch(
+                "BEGIN IMMEDIATE;
+                 DROP TABLE IF EXISTS events;
+                 DROP TABLE IF EXISTS event_sessions;
+                 COMMIT;",
+            )
+            .ok()?;
+            if table_has_column(&conn, "source_dependencies", "consumer") {
+                conn.execute("DELETE FROM source_dependencies WHERE consumer='events'", [])
+                    .ok()?;
+            }
+        }
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS event_sessions(
                  id         INTEGER PRIMARY KEY,
+                 selector   TEXT NOT NULL UNIQUE,
                  harness    TEXT NOT NULL,
                  session_id TEXT NOT NULL,
                  parent_id  TEXT,
                  agent_id   TEXT,
-                 workflow   TEXT,
-                 UNIQUE(harness, session_id)
+                 workflow   TEXT
              );
+             CREATE INDEX IF NOT EXISTS idx_event_sessions_native ON event_sessions(harness, session_id);
              CREATE TABLE IF NOT EXISTS event_targets(
                  id     INTEGER PRIMARY KEY,
                  target TEXT NOT NULL UNIQUE
@@ -815,6 +832,29 @@ mod db {
                 .ok()?;
         }
         Some(conn)
+    }
+
+    fn table_has_column(conn: &Connection, table: &str, column: &str) -> bool {
+        conn.prepare(&format!("PRAGMA table_info({table})"))
+            .and_then(|mut stmt| {
+                stmt.query_map([], |row| row.get::<_, String>(1))?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .is_ok_and(|names| names.iter().any(|n| n == column))
+    }
+
+    /// Whether `event_sessions` is keyed by selector (a frozen read of an older catalog is not).
+    fn has_selector(conn: &Connection) -> bool {
+        table_has_column(conn, "event_sessions", "selector")
+    }
+
+    /// The `WHERE` term naming one session by `?2`: a native id (every profile's copy) or a
+    /// selector (exactly one), or on an older catalog the native id alone.
+    fn session_named(conn: &Connection) -> &'static str {
+        match has_selector(conn) {
+            true => "es.harness=?1 AND (es.session_id=?2 OR es.selector=?2)",
+            false => "es.harness=?1 AND es.session_id=?2",
+        }
     }
 
     /// The `events` consumer's record payload: the provenance and cwd its rows were attributed
@@ -992,19 +1032,20 @@ mod db {
     ) -> Result<()> {
         let tx = publication_transaction(conn, r, from, prov)?;
         let harness = r.harness.as_str();
+        let selector = r.session_selector();
         tx.execute(
-            "INSERT OR IGNORE INTO event_sessions(harness, session_id) VALUES(?1,?2)",
-            params![harness, r.id],
+            "INSERT OR IGNORE INTO event_sessions(selector, harness, session_id) VALUES(?1,?2,?3)",
+            params![selector, harness, r.id],
         )?;
         // Stamp provenance on every record (idempotent re-ingest keeps it current); top-level
         // sessions write NULLs, which leaves the existing top-level rows exactly as before.
         tx.execute(
-            "UPDATE event_sessions SET parent_id=?3, agent_id=?4, workflow=?5 WHERE harness=?1 AND session_id=?2",
-            params![harness, r.id, prov.parent_id, prov.agent_id, prov.workflow],
+            "UPDATE event_sessions SET parent_id=?2, agent_id=?3, workflow=?4 WHERE selector=?1",
+            params![selector, prov.parent_id, prov.agent_id, prov.workflow],
         )?;
         let session = tx.query_row(
-            "SELECT id FROM event_sessions WHERE harness=?1 AND session_id=?2",
-            params![harness, r.id],
+            "SELECT id FROM event_sessions WHERE selector=?1",
+            params![selector],
             |row| row.get::<_, i64>(0),
         )?;
         tx.execute(
@@ -1056,11 +1097,24 @@ mod db {
                 ])?;
             }
         }
-        // One session's rows have one source copy: another path's baseline no longer describes them.
-        tx.execute(
-            "DELETE FROM source_dependencies WHERE consumer='events' AND harness=?1 AND id=?2",
-            params![harness, r.id],
-        )?;
+        // One session's rows have one source copy: another path of the same selector (the file
+        // moved within its profile) no longer describes them. Another profile's copy keeps its own.
+        let paths = {
+            let mut stmt =
+                tx.prepare("SELECT path FROM source_dependencies WHERE consumer='events' AND harness=?1 AND id=?2")?;
+            let paths = stmt
+                .query_map(params![harness, r.id], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            paths
+        };
+        for path in paths {
+            if SessionRef::new(r.id.clone(), r.harness, &path).session_selector() == selector {
+                tx.execute(
+                    "DELETE FROM source_dependencies WHERE consumer='events' AND harness=?1 AND id=?2 AND path=?3",
+                    params![harness, r.id, path],
+                )?;
+            }
+        }
         crate::source::publish_in(
             &tx,
             "events",
@@ -1162,14 +1216,15 @@ mod db {
         Ok(preferred_sources(sources))
     }
 
-    /// Events have one output per harness/id, independent of how many source copies discovery
-    /// returns. Resolve that output once before publication; direct attribution wins equal copies.
+    /// Events have one output per session selector, independent of how many source copies
+    /// discovery returns of it (two profiles' copies of one native id are two selectors, two
+    /// outputs). Resolve that output once before publication; direct attribution wins equal copies.
     pub(super) fn preferred_sources(
         sources: impl IntoIterator<Item = (SessionRef, Provenance)>,
     ) -> Vec<(SessionRef, Provenance)> {
         let mut copies: std::collections::HashMap<_, (SessionRef, Provenance)> = std::collections::HashMap::new();
         for (r, provenance) in sources {
-            let key = (r.harness, r.id.clone());
+            let key = r.session_selector();
             match copies.entry(key) {
                 std::collections::hash_map::Entry::Vacant(entry) => {
                     entry.insert((r, provenance));
@@ -1208,15 +1263,16 @@ mod db {
     /// Empty for an un-ingested session; an event catalog that cannot open or answer is an error.
     pub fn events_for(harness: &str, session_id: &str, kind: Option<&str>) -> Result<Vec<EventRow>> {
         let conn = open().context("the event catalog cannot be opened")?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             "SELECT es.harness, es.session_id, e.msg_idx, e.ts, e.kind, e.tool, t.target, e.detail,
                     es.parent_id, es.agent_id, es.workflow
              FROM events e
              JOIN event_sessions es ON es.id = e.session
              LEFT JOIN event_targets t ON t.id = e.target_id
-             WHERE es.harness=?1 AND es.session_id=?2 AND (?3 IS NULL OR e.kind=?3)
-             ORDER BY e.msg_idx, e.kind",
-        )?;
+             WHERE {} AND (?3 IS NULL OR e.kind=?3)
+             ORDER BY es.id, e.msg_idx, e.kind",
+            session_named(&conn)
+        ))?;
         let rows = stmt.query_map(params![harness, session_id, kind], |row| {
             Ok(EventRow {
                 baggage: None,
@@ -1286,14 +1342,14 @@ mod db {
                     SUM(e.kind='file_edit') AS edits,
                     SUM(e.kind='file_read') AS reads,
                     MAX(e.ts) AS last_ts,
-                    MAX(s.title) AS title,
+                    (SELECT MAX(s.title) FROM sessions s
+                     WHERE s.harness = es.harness AND s.id = es.session_id) AS title,
                     es.parent_id, es.agent_id, es.workflow
              FROM events e
              JOIN event_sessions es ON es.id = e.session
-             LEFT JOIN sessions s ON s.harness = es.harness AND s.id = es.session_id
              WHERE e.kind IN ('file_edit','file_read')
                AND e.target_id IN (SELECT id FROM event_targets WHERE {target_where})
-             GROUP BY es.harness, es.session_id
+             GROUP BY es.id
              {having}
              ORDER BY last_ts DESC, es.session_id"
         );
@@ -1434,14 +1490,15 @@ mod db {
     /// Persisted `(msg_idx, target, hunk_hashes)` rows for `file_edit` events of one session.
     pub fn edit_hunks_for(harness: &str, session_id: &str) -> Result<Vec<SessionEditHunkRow>> {
         let conn = open().context("the event catalog cannot be opened")?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             "SELECT e.msg_idx, t.target, e.hunk_hashes
              FROM events e
              JOIN event_sessions es ON es.id = e.session
              LEFT JOIN event_targets t ON t.id = e.target_id
-             WHERE es.harness=?1 AND es.session_id=?2 AND e.kind='file_edit'
-             ORDER BY e.msg_idx, e.rowid",
-        )?;
+             WHERE {} AND e.kind='file_edit'
+             ORDER BY es.id, e.msg_idx, e.rowid",
+            session_named(&conn)
+        ))?;
         let rows = stmt.query_map(params![harness, session_id], |row| {
             let blob: Option<Vec<u8>> = row.get(2)?;
             Ok((row.get(0)?, row.get(1)?, decode_hunk_hashes(blob.as_deref())))
@@ -1497,7 +1554,7 @@ mod db {
             .unwrap();
             let error = deferred
                 .execute(
-                    "INSERT OR IGNORE INTO event_sessions(harness,session_id) VALUES('claude','lock')",
+                    "INSERT OR IGNORE INTO event_sessions(selector,harness,session_id) VALUES('lock','claude','lock')",
                     [],
                 )
                 .unwrap_err();
@@ -1536,7 +1593,7 @@ mod db {
             );
             immediate
                 .execute(
-                    "INSERT OR IGNORE INTO event_sessions(harness,session_id) VALUES('claude','lock')",
+                    "INSERT OR IGNORE INTO event_sessions(selector,harness,session_id) VALUES('lock','claude','lock')",
                     [],
                 )
                 .unwrap();
@@ -2198,6 +2255,69 @@ await tools.view_image({ path: "docs/arch.png" });
         assert_eq!(rows, [("command", None), ("file_edit", Some("/w/a.rs"))]);
     }
 
+    /// #tooth Two profiles' copies of one native id are two event outputs: ingesting the second
+    /// leaves the first's rows, a selector reads exactly one copy, the native id reads both, and
+    /// a catalog keyed the old way by `(harness, session_id)` is rebuilt once instead of erroring.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn profile_twins_with_one_native_id_keep_separate_event_rows() {
+        let world = crate::test_world("events-twins");
+        {
+            // An event catalog from before selectors, with a row and its baseline.
+            let conn = crate::catalog::open_db().unwrap();
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS event_sessions(id INTEGER PRIMARY KEY, harness TEXT NOT NULL,
+                     session_id TEXT NOT NULL, parent_id TEXT, agent_id TEXT, workflow TEXT,
+                     UNIQUE(harness, session_id));
+                 INSERT INTO event_sessions(harness, session_id) VALUES('claude', 'legacy');",
+            )
+            .unwrap();
+        }
+        let twin = |profile: &str, target: &str| {
+            let dir = world.base.join(profile).join("projects/p");
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("twin.jsonl");
+            let line = serde_json::json!({"type":"assistant","uuid":"a","sessionId":"twin",
+                "message":{"role":"assistant","content":[{"type":"tool_use","id":"call","name":"Edit",
+                    "input":{"file_path":target,"old_string":"a","new_string":"b"}}]}});
+            std::fs::write(&path, format!("{line}\n")).unwrap();
+            SessionRef::new("twin", crate::Harness::Claude, path)
+        };
+        let a = twin(".claude", "/repo/alpha_twin.rs");
+        let b = twin(".claude-alt", "/repo/beta_twin.rs");
+        assert_ne!(a.session_selector(), b.session_selector());
+        let targets = |id: &str| -> Vec<String> {
+            events_for("claude", id, Some("file_edit"))
+                .unwrap()
+                .into_iter()
+                .filter_map(|e| e.target)
+                .collect()
+        };
+        ingest_ref(&a).unwrap();
+        ingest_ref(&b).unwrap();
+        assert_eq!(targets(&a.session_selector()), ["/repo/alpha_twin.rs"]);
+        assert_eq!(targets(&b.session_selector()), ["/repo/beta_twin.rs"]);
+        assert_eq!(targets("twin").len(), 2, "the native id reads every copy");
+        for file in ["/repo/alpha_twin.rs", "/repo/beta_twin.rs"] {
+            let touched = sessions_editing(file).unwrap();
+            assert_eq!(touched.len(), 1, "{file}: {touched:?}");
+            assert_eq!(touched[0].session_id, "twin", "output keeps the native id");
+            assert_eq!(touched[0].edits, 1);
+        }
+        assert!(
+            targets("legacy").is_empty(),
+            "the old-keyed rows were dropped, not kept"
+        );
+        let mut probe = crate::source::Probe::default();
+        let sync = SyncTable::load();
+        for r in [&a, &b] {
+            let source = probe.snapshot(r);
+            assert!(!sync.needs_ingest(r, &source, &Provenance::default(), &mut probe));
+        }
+        let sources = db::preferred_sources([(a.clone(), Provenance::default()), (b.clone(), Provenance::default())]);
+        assert_eq!(sources.len(), 2, "each twin is its own output");
+    }
+
     #[cfg(feature = "sqlite")]
     #[test]
     fn published_event_authority_tracks_copy_provenance_and_cwd_atomically() {
@@ -2356,9 +2476,10 @@ await tools.view_image({ path: "docs/arch.png" });
     fn event_forest_selection_keeps_unique_children_of_nonpreferred_parent_copies() {
         let world = crate::test_world("events-forest-selection");
         let mut parents = Vec::new();
+        // Two copies of one session in one profile (two of its project dirs): one event output.
         for (name, timestamp) in [("older", 1), ("newer", 2)] {
-            let dir = world.base.join(name);
-            std::fs::create_dir(&dir).unwrap();
+            let dir = world.base.join("profile/projects").join(name);
+            std::fs::create_dir_all(&dir).unwrap();
             let path = dir.join("parent.jsonl");
             std::fs::write(&path, []).unwrap();
             let mut parent = SessionRef::new("parent", crate::Harness::Claude, &path);

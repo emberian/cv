@@ -7,6 +7,7 @@
 - Archive keeps single-file Claude, Codex, Qwen, and OpenSession sessions as their native bytes, packing only appended lines; rewritten files start fresh.
 - Archived native sessions read straight from their packs, writing no temporary copy, even under `--frozen`.
 - Search finds sessions by git branch and turns by the branch or short SHA their `git commit` reported.
+- The SQLite event catalog keeps profile twins of one session ID apart; older catalogs re-ingest events once.
 - Indexed file events keep sessions sharing an ID across profiles apart; indexing or reaping one copy no longer erases the other's.
 - Search matches turns by touched file names, tools, commands, and failures; snippets and stored text stay verbatim. Rebuilds the index once.
 - Redaction recognizes structured credentials, cookie jars, and signed URL parameters, and drops secret-bearing reasoning signatures atomically.
