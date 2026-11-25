@@ -944,6 +944,55 @@ mod tests {
         }
     }
 
+    /// The Claude desktop app records what the person types as `promptSource: "sdk"` with a stated
+    /// human origin. Those are typed turns; an `sdk` prompt with no stated human origin is a program.
+    #[test]
+    fn claude_desktop_sdk_prompts_with_a_stated_human_origin_are_typed_turns() {
+        let jsonl = [
+            r#"{"type":"user","sessionId":"d","cwd":"/repo","uuid":"u1","timestamp":"2026-11-01T00:00:00Z","entrypoint":"claude-desktop","promptSource":"sdk","turnOrigin":"human","origin":{"kind":"human"},"message":{"role":"user","content":"Add widgets"}}"#,
+            r#"{"type":"assistant","sessionId":"d","uuid":"a1","parentUuid":"u1","timestamp":"2026-11-01T00:00:01Z","message":{"role":"assistant","model":"claude-fable-5-2","content":[{"type":"text","text":"Widgets added."}]}}"#,
+            // A program driving the SDK: same source, no stated human origin. Not a typed turn.
+            r#"{"type":"user","sessionId":"d","uuid":"p1","parentUuid":"a1","timestamp":"2026-11-01T00:00:02Z","promptSource":"sdk","message":{"role":"user","content":"automated follow-up"}}"#,
+            r#"{"type":"assistant","sessionId":"d","uuid":"a2","parentUuid":"p1","timestamp":"2026-11-01T00:00:03Z","message":{"role":"assistant","model":"claude-fable-5-2","content":[{"type":"text","text":"Follow-up handled."}]}}"#,
+            // The person again, through the desktop app: origin stated one way, then the other.
+            r#"{"type":"user","sessionId":"d","uuid":"u2","parentUuid":"a2","timestamp":"2026-11-01T00:00:04Z","entrypoint":"claude-desktop","promptSource":"sdk","origin":{"kind":"human"},"message":{"role":"user","content":"Yes, ship both"}}"#,
+            r#"{"type":"assistant","sessionId":"d","uuid":"a3","parentUuid":"u2","timestamp":"2026-11-01T00:00:05Z","message":{"role":"assistant","model":"claude-fable-5-2","content":[{"type":"text","text":"Shipping both."}]}}"#,
+            r#"{"type":"user","sessionId":"d","uuid":"u3","parentUuid":"a3","timestamp":"2026-11-01T00:00:06Z","entrypoint":"claude-desktop","promptSource":"sdk","turnOrigin":"human","message":{"role":"user","content":"now undo the second"}}"#,
+            r#"{"type":"assistant","sessionId":"d","uuid":"a4","parentUuid":"u3","timestamp":"2026-11-01T00:00:07Z","message":{"role":"assistant","model":"claude-fable-5-2","content":[{"type":"text","text":"Second one undone."}]}}"#,
+        ]
+        .join("\n");
+
+        let world = crate::test_world("cycles-claude-desktop-sdk");
+        let path = world.proj.join("d.jsonl");
+        std::fs::write(&path, &jsonl).unwrap();
+        let adapter = crate::harness::claude::Claude::with_config_dir(&world.proj);
+        let r = crate::ir::SessionRef::new("d", Harness::Claude, &path);
+
+        let (staged, count) = stage_cycles(&adapter, &r, None, 2, None, &Default::default(), &DatasetOptions::default())
+            .unwrap()
+            .expect("cycles staged");
+        let mut out = Vec::new();
+        staged.publish(&mut out).unwrap();
+        let rows: Vec<serde_json::Value> = std::str::from_utf8(&out)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        // The first typed prompt opens the session; each later one is a cycle.
+        assert_eq!(count, 2, "{rows:#?}");
+        assert_eq!(rows[0]["prompt"], "Yes, ship both");
+        assert_eq!(rows[0]["proof"], "record");
+        assert_eq!(rows[0]["queued"], false);
+        assert_eq!(rows[0]["report"], "Follow-up handled.");
+        assert_eq!(rows[0]["plan"], "Shipping both.");
+        assert_eq!(rows[1]["prompt"], "now undo the second");
+        assert_eq!(rows[1]["plan"], "Second one undone.");
+        assert!(
+            rows.iter().all(|row| row["prompt"] != "automated follow-up"),
+            "an sdk prompt with no stated human origin must not be a typed turn"
+        );
+    }
+
     #[test]
     fn sourced_non_shell_payloads_do_not_materialize_json_values_and_cross_harness_shells_classify() {
         let world = crate::test_world("cycles-jsonview-classify");
