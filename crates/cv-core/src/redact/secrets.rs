@@ -58,7 +58,7 @@ pub(super) fn context_key(name: &str) -> bool {
     matches!(low.as_str(), "name" | "key" | "value") || header(&low) || secret_name(name)
 }
 
-fn whole(name: &str, v: &str, text: &str) -> bool {
+fn whole(name: &str, v: &str, text: &str, wire: bool) -> bool {
     let low = name.to_ascii_lowercase();
     if name == "{jar}" {
         text.len() > 5
@@ -66,7 +66,7 @@ fn whole(name: &str, v: &str, text: &str) -> bool {
             && !standin(text)
             && !re!(r"(?s)^(?:[\p{L}\p{M}'’.-]+|https?://.*)$").is_match(text)
     } else if header(&low) {
-        !standin(v.trim()) || text != v
+        (!standin(v.trim()) && !v.contains("[REDACTED:") && (wire || !v.contains(MARK))) || text != v
     } else {
         secret_name(name) && !keep(name, v)
     }
@@ -137,7 +137,7 @@ fn walk(value: &mut Value, parent: &str, wire: bool) -> usize {
                 return 0;
             }
             let next = text(s);
-            if whole(parent, s, &next) {
+            if whole(parent, s, &next, wire) {
                 if s == MARK || redacted_marker(s) {
                     return 0;
                 }
@@ -428,7 +428,7 @@ fn close(frame: Frame<'_>, s: &str, offset: usize, cuts: &mut Cuts) {
             .iter()
             .map(|&(a, b)| (a - start - offset, b - start - offset))
             .collect();
-        if whole(name, v, &cut(v, inner)) {
+        if whole(name, v, &cut(v, inner), true) {
             cuts.push((offset + start, offset + end));
         }
     }
@@ -733,5 +733,43 @@ mod tests {
         let actual = text(input);
         assert_eq!(actual, "Authorization: Bearer [redacted]");
         assert!(!actual.contains("AAbcdef"), "{actual}");
+    }
+
+    /// #tooth Header values that already hold a redaction marker (and no remaining live secret)
+    /// keep their class-specific marker and do not re-trigger assignment counts.
+    #[test]
+    fn tooth_already_redacted_header_preserves_marker_and_counts_zero() {
+        let mut already = serde_json::json!({
+            "Authorization": "Bearer [REDACTED:github_token]",
+            "Cookie": "session=[redacted]"
+        });
+        assert_eq!(fields(&mut already, ""), 0);
+        assert_eq!(already["Authorization"], "Bearer [REDACTED:github_token]");
+        assert_eq!(already["Cookie"], "session=[redacted]");
+
+        // Embedded JSON string containing a GitHub token inside a non-Bearer Authorization
+        // scheme (`Token <ghp_...>`): `legacy_cow` redacts the token to `[REDACTED:api_key]`,
+        // and `secrets::additional` must not overwrite `"Token [REDACTED:api_key]"` with
+        // `"[REDACTED:secret]"` or double-count `stats.assignments`.
+        let mut session = crate::ir::Session::new("hdr-stats", crate::ir::Harness::Claude);
+        let mut msg = crate::ir::Message::new(crate::ir::Role::User);
+        let tok = format!("ghp_{}", "a1B2c3D4e5".repeat(4));
+        msg.content.push(crate::ir::Block::from_text(
+            format!(r#"{{"Authorization":"Token {tok}"}}"#).into(),
+        ));
+        msg.content.push(crate::ir::Block::from_text(
+            r#"{"Authorization":"Bearer [REDACTED:github_token]","nested":{"name":"Authorization","value":"Bearer [REDACTED:github_token]"}}"#.into(),
+        ));
+        session.messages.push(msg);
+        let (scrubbed, stats) = crate::redact::redact_with(&session, &crate::redact::RedactOptions::default()).unwrap();
+        let out0 = scrubbed.messages[0].content[0].text().unwrap();
+        let out1 = scrubbed.messages[0].content[1].text().unwrap();
+        assert_eq!(&**out0, r#"{"Authorization":"Token [REDACTED:api_key]"}"#);
+        assert_eq!(
+            &**out1,
+            r#"{"Authorization":"Bearer [REDACTED:github_token]","nested":{"name":"Authorization","value":"Bearer [REDACTED:github_token]"}}"#
+        );
+        assert_eq!(stats.api_keys, 1);
+        assert_eq!(stats.assignments, 0, "must not double-count header after token scrub");
     }
 }
