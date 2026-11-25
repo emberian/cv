@@ -290,3 +290,55 @@ fn an_unlistable_project_directory_does_not_prune_its_sessions() {
         "{back}"
     );
 }
+
+/// #tooth A query naming a turn by what it did (`file stem + command + failure`) finds that turn
+/// through its indexed facets (its raw text lacks `failed`), ranks it above a turn that mentions
+/// each word once, and the hit's snippet is still the transcript's own text. A turn repeating
+/// every word still outranks it: facets add recall and weight, not a guarantee of first place.
+#[test]
+fn facet_keys_match_a_failed_command_turn_while_snippets_stay_raw() {
+    let w = World::new("facet-keys");
+    let lines = [
+        serde_json::json!({"type": "user", "uuid": "f1", "timestamp": TS, "sessionId": "facetsess",
+            "message": {"role": "user", "content": "tidy the module"}}),
+        serde_json::json!({"type": "assistant", "uuid": "f2", "timestamp": TS, "sessionId": "facetsess",
+            "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "Edit",
+                 "input": {"file_path": "crates/cv-core/src/custody.rs", "old_string": "a", "new_string": "b"}},
+                {"type": "tool_use", "id": "t2", "name": "Bash",
+                 "input": {"command": "cargo clippy --workspace -- -D warnings"}}]}}),
+        serde_json::json!({"type": "user", "uuid": "f3", "timestamp": TS, "sessionId": "facetsess",
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t2", "is_error": true,
+                 "content": "warning: unused variable `x`"}]}}),
+    ];
+    let body: String = lines.iter().map(|l| format!("{l}\n")).collect();
+    fs::write(w.transcript("facetsess"), body).unwrap();
+    // A decoy whose words alone cover the query once each: it talks about a failure, did nothing.
+    let decoy = serde_json::json!({"type": "user", "uuid": "d1", "timestamp": TS, "sessionId": "decoysess",
+        "message": {"role": "user", "content": "yesterday custody rs went fine but cargo clippy failed on another branch"}});
+    fs::write(w.transcript("decoysess"), format!("{decoy}\n")).unwrap();
+    w.cv_ok(&["index"]);
+    let (out, err) = w.cv_ok(&["search", "custody.rs cargo clippy failed", "--json"]);
+    let found: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("{e}\n{out}\n{err}"));
+    let hits = found["hits"].as_array().unwrap();
+    let ids: Vec<_> = hits.iter().map(|h| h["id"].as_str().unwrap()).collect();
+    assert!(
+        ids.contains(&"facetsess"),
+        "the failed turn matches by its facets: {found}"
+    );
+    assert_eq!(
+        ids,
+        ["facetsess", "decoysess"],
+        "the turn that did it outranks talk about it"
+    );
+    let hit = hits.iter().find(|h| h["id"] == "facetsess").unwrap();
+    let snippet = hit["snippet"].as_str().unwrap();
+    assert!(
+        !snippet.contains("exit_") && !snippet.contains("error failed"),
+        "{snippet}"
+    );
+    // The facet field never leaks into what a reader sees of the session.
+    let (show, _) = w.cv_ok(&["show", "facetsess", "--json"]);
+    assert!(!show.contains("error failed"));
+}

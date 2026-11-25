@@ -6,6 +6,7 @@
 - Serve enforces scoped disclosure tiers, separates reader, producer, and inbox credentials, and accepts HttpOnly reader cookies on browser streams and downloads.
 - Archive keeps single-file Claude and Codex sessions as their native bytes, packing only appended lines on each sync; rewritten files start fresh.
 - Indexed file events keep sessions sharing an ID across profiles apart; indexing or reaping one copy no longer erases the other's.
+- Search matches turns by touched file names, tools, commands, and failures; snippets and stored text stay verbatim. Rebuilds the index once.
 - Redaction recognizes structured credentials, cookie jars, and signed URL parameters, and drops secret-bearing reasoning signatures atomically.
 - Port verifies ordered content, tool links, and skill rewrites before publishing staged files or committing SQLite transactions, rolling back cleanly under `--strict`.
 - Antigravity supports cold one-step seed emission, journaled live CreateConversation delivery, bounded brain-closure rewinds, post-compaction prompt recovery, and SessionStart adopt pointers.

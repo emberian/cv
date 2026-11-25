@@ -79,6 +79,9 @@ struct Fields {
     cwd: Field,
     title: Field,
     body: Field,
+    /// Structural keys of an exchange doc ([`facets_of`]): indexed beside `body`, never stored,
+    /// so a query can match a turn by what it did while snippets stay the verbatim text.
+    facets: Field,
     context: Field,
     path: Field,
     preview: Field,
@@ -110,6 +113,7 @@ fn build_schema_with_consumer(consumer: Option<&str>) -> Schema {
     b.add_text_field("cwd", TEXT | STORED);
     b.add_text_field("title", TEXT | STORED);
     b.add_text_field("body", TEXT);
+    b.add_text_field("facets", TEXT); // indexed, never stored: see `Fields::facets`
     b.add_text_field("context", TEXT); // what surrounds the exchange: searched only when asked
     b.add_text_field("path", STRING | STORED);
     b.add_text_field("preview", STORED); // stored-only: never searched, just the snippet fallback
@@ -146,6 +150,7 @@ fn fields_of(schema: &Schema) -> Result<Fields> {
         cwd: get("cwd")?,
         title: get("title")?,
         body: get("body")?,
+        facets: get("facets")?,
         context: get("context")?,
         path: get("path")?,
         preview: get("preview")?,
@@ -181,6 +186,7 @@ fn fields_current(schema: &Schema) -> bool {
         "size",
         "discovery_metadata",
         "context",
+        "facets",
     ]
     .iter()
     .all(|f| schema.get_field(f).is_ok())
@@ -1727,6 +1733,9 @@ struct ChunkSink<'w> {
     in_context: bool,
     other: String,
     other_first: usize,
+    /// [`facets_of`] the exchange messages in `buf` (or, swapped, `other`): written with it.
+    facets: String,
+    other_facets: String,
     /// Turns stamped before this were copied from another session ([`cv_core::Adapter::copied_before`]),
     /// which indexes them: they count as messages and add no text.
     copied_before: Option<chrono::DateTime<chrono::Utc>>,
@@ -1777,6 +1786,10 @@ struct Open {
     in_context: bool,
     other: String,
     other_first: usize,
+    #[serde(default)]
+    facets: String,
+    #[serde(default)]
+    other_facets: String,
 }
 
 /// The first message whose docs a pass resumed at `cp` replaces: the checkpoint's own, or the
@@ -1832,6 +1845,8 @@ impl<'w> ChunkSink<'w> {
             in_context: false,
             other: String::new(),
             other_first: 0,
+            facets: String::new(),
+            other_facets: String::new(),
             copied_before: None,
             boundary_due: false,
             keep_open: false,
@@ -1876,6 +1891,8 @@ impl<'w> ChunkSink<'w> {
             sink.in_context = open.in_context;
             sink.other = open.other;
             sink.other_first = open.other_first;
+            sink.facets = open.facets;
+            sink.other_facets = open.other_facets;
         }
         Some(sink)
     }
@@ -1944,9 +1961,13 @@ impl<'w> ChunkSink<'w> {
         }
         let mut doc = self.doc(KIND_BODY);
         doc.add_text(if self.in_context { self.f.context } else { self.f.body }, &self.buf);
+        if !self.in_context && !self.facets.is_empty() {
+            doc.add_text(self.f.facets, &self.facets);
+        }
         doc.add_i64(self.f.first_msg, self.buf_first as i64);
         self.emit(doc);
         self.buf.clear();
+        self.facets.clear();
     }
 
     /// Make `buf` the exchange's or the context's buffer.
@@ -1954,6 +1975,7 @@ impl<'w> ChunkSink<'w> {
         if self.in_context != context {
             std::mem::swap(&mut self.buf, &mut self.other);
             std::mem::swap(&mut self.buf_first, &mut self.other_first);
+            std::mem::swap(&mut self.facets, &mut self.other_facets);
             self.in_context = context;
         }
     }
@@ -2143,6 +2165,94 @@ impl cv_core::projection::Searchable for ChunkSink<'_> {
     }
 }
 
+/// Weight of a facet match relative to the same term in `body`.
+const FACET_BOOST: f32 = 1.5;
+/// Facet text one doc carries at most: a few hundred keys.
+const FACET_BYTES: usize = 4096;
+
+/// Append the structural keys of `blocks` to `out`, bounded by [`FACET_BYTES`]: each tool's name;
+/// each touched path, its file name and stem; each command's program and subcommand; and for a
+/// failed result `error failed` with any exit status. Keys come from small named input fields
+/// and result flags, never from bodies, so a doc's stored text and snippets are unchanged.
+fn facets_of(blocks: &[cv_core::Block], out: &mut String) {
+    fn push(out: &mut String, key: &str) {
+        let key = key.trim();
+        if !key.is_empty() && out.len() + key.len() < FACET_BYTES {
+            out.push_str(key);
+            out.push(' ');
+        }
+    }
+    fn text(input: &cv_core::Json, key: &str) -> Option<String> {
+        let value = input.select(key).ok()??;
+        let value = value.resolve().ok()?;
+        match &*value {
+            serde_json::Value::String(s) => Some(s.clone()),
+            serde_json::Value::Array(parts) => {
+                let words: Vec<&str> = parts.iter().filter_map(serde_json::Value::as_str).collect();
+                (!words.is_empty()).then(|| words.join(" "))
+            }
+            _ => None,
+        }
+    }
+    for block in blocks {
+        match block {
+            cv_core::Block::ToolUse { name, input, .. } => {
+                push(out, name);
+                for key in ["file_path", "path", "notebook_path", "filePath"] {
+                    let Some(path) = text(input, key) else { continue };
+                    let p = Path::new(&path);
+                    push(out, &path);
+                    if let Some(file) = p.file_name().and_then(|n| n.to_str()) {
+                        push(out, file);
+                    }
+                    if let Some(stem) = p.file_stem().and_then(|n| n.to_str()) {
+                        push(out, stem);
+                    }
+                }
+                for key in ["command", "cmd"] {
+                    let Some(command) = text(input, key) else { continue };
+                    // `bash -lc "cargo clippy"` names its program inside the script.
+                    let script = command
+                        .split_once(" -lc ")
+                        .or_else(|| command.split_once(" -c "))
+                        .map_or(command.as_str(), |(_, s)| s);
+                    let mut words = script
+                        .split(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ';' | '&' | '|'))
+                        .filter(|w| !w.is_empty() && !w.contains('='));
+                    if let Some(program) = words.next() {
+                        push(out, program.rsplit('/').next().unwrap_or(program));
+                        if let Some(sub) = words.next().filter(|w| !w.starts_with('-')) {
+                            push(out, sub);
+                        }
+                    }
+                }
+            }
+            cv_core::Block::ToolResult {
+                is_error,
+                status,
+                details,
+                ..
+            } => {
+                let code = details.as_ref().and_then(|d| {
+                    ["exit_code", "exitCode", "returncode", "exit"]
+                        .iter()
+                        .find_map(|k| d.get(*k).and_then(serde_json::Value::as_i64))
+                });
+                if *is_error || code.is_some_and(|c| c != 0) {
+                    push(out, "error failed");
+                }
+                if let Some(code) = code {
+                    push(out, &format!("exit {code} exit_{code}"));
+                }
+                if let Some(status) = status.as_deref().filter(|s| !s.eq_ignore_ascii_case("completed")) {
+                    push(out, status);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Collapse whitespace across formatter fragments, bounded in Unicode characters.
 struct Preview {
     chars: usize,
@@ -2272,6 +2382,8 @@ impl cv_core::MessageSink for ChunkSink<'_> {
             in_context: self.in_context,
             other: self.other.clone(),
             other_first: self.other_first,
+            facets: self.facets.clone(),
+            other_facets: self.other_facets.clone(),
         });
         if open.is_none() {
             self.flush_both();
@@ -2316,6 +2428,9 @@ impl cv_core::MessageSink for ChunkSink<'_> {
         let copied = matches!((m.timestamp, self.copied_before), (Some(at), Some(before)) if at < before);
         if !copied {
             self.switch_to(!m.kind.is_exchange());
+            if !self.in_context {
+                facets_of(&m.content, &mut self.facets);
+            }
             self.append_blocks(&r, &m.content);
         }
         self.resolver = r;
@@ -2982,12 +3097,13 @@ fn parse_text_query(
     scope: crate::Scope,
 ) -> Result<Box<dyn tantivy::query::Query>> {
     let fields = match scope {
-        crate::Scope::Exchange => vec![f.title, f.body, f.cwd],
+        crate::Scope::Exchange => vec![f.title, f.body, f.cwd, f.facets],
         crate::Scope::Context => vec![f.context],
-        crate::Scope::All => vec![f.title, f.body, f.cwd, f.context],
+        crate::Scope::All => vec![f.title, f.body, f.cwd, f.context, f.facets],
     };
     let mut parser = QueryParser::for_index(index, fields);
     parser.set_conjunction_by_default();
+    parser.set_field_boost(f.facets, FACET_BOOST);
     match parser.parse_query(query) {
         Ok(parsed) => Ok(parsed),
         Err(first_err) => {
