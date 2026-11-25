@@ -1999,7 +1999,8 @@ impl StreamHub {
             if cached_sessions.is_none() {
                 guard.stamp.sessions_digest = next.sessions_digest;
             }
-            kinds.push("sessions");
+            // A transcript that moved can change its lanes and its file timeline.
+            kinds.extend(["sessions", "lanes", "files"]);
         }
         if next.watch != guard.stamp.watch {
             guard.stamp.watch = next.watch;
@@ -2008,6 +2009,10 @@ impl StreamHub {
         if next.hub_state != guard.stamp.hub_state {
             guard.stamp.hub_state = next.hub_state;
             kinds.push("hub");
+            // Hook lane runs and stops live in state.db: the lane witnesses may have moved.
+            if !kinds.contains(&"lanes") {
+                kinds.push("lanes");
+            }
         }
         if !kinds.is_empty() {
             guard.record(kinds);
@@ -2026,6 +2031,92 @@ impl StreamHub {
     }
 }
 
+/// What a follower asked to have pushed with each change, beyond the kinds: `lanes=<session>`
+/// (compact lane rows, most urgent first) and `files=<harness>/<id>` (the timeline's size and
+/// latest touch). Absent, change events carry only the cursor and kinds.
+#[derive(Clone, Default)]
+struct StreamFollow {
+    lanes: Option<String>,
+    files: Option<(String, String)>,
+}
+
+impl StreamFollow {
+    fn parse(q: &Query) -> Self {
+        let files = q.get("files").and_then(|spec| {
+            let (h, id) = spec.split_once('/').or_else(|| spec.split_once(':'))?;
+            (!h.is_empty() && !id.is_empty()).then(|| (h.to_string(), id.to_string()))
+        });
+        Self {
+            lanes: q.get("lanes").filter(|s| !s.trim().is_empty()),
+            files,
+        }
+    }
+
+    fn wants(&self) -> bool {
+        self.lanes.is_some() || self.files.is_some()
+    }
+}
+
+/// The compact lane rows `/api/stream?lanes=` pushes: the `/api/lanes` counts plus, per lane,
+/// only what an attention board draws.
+fn compact_lanes(session: &str) -> Value {
+    let (status, body) = serve_tasks::lanes_report(session);
+    if status != 200 {
+        return json!({"error": body["error"]});
+    }
+    let rows: Vec<Value> = body["lanes"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .map(|l| {
+            let mut row = serde_json::Map::new();
+            for key in [
+                "agent_id",
+                "session_id",
+                "description",
+                "status",
+                "attention",
+                "stranded",
+                "pending_ask",
+                "witness_divergence",
+                "last_turn_at",
+                "last_tool",
+            ] {
+                if let Some(v) = l.get(key).filter(|v| !v.is_null()) {
+                    row.insert(key.into(), v.clone());
+                }
+            }
+            Value::Object(row)
+        })
+        .collect();
+    json!({"session": body["session"], "counts": body["counts"], "lanes": rows})
+}
+
+/// What `/api/stream?files=` pushes: how many touches, and the latest one.
+fn compact_files(harness: &str, id: &str) -> Value {
+    let (status, body) = cv_core::api::route_json(&["api", "session", harness, id, "files"], "");
+    if status != 200 {
+        return json!({"error": body["error"]});
+    }
+    let rows = body.as_array().map(Vec::as_slice).unwrap_or_default();
+    json!({"harness": harness, "id": id, "touches": rows.len(), "last": rows.last()})
+}
+
+/// One change event's data: the cursor and kinds, plus whatever the follower asked to have pushed
+/// for kinds that touch it (`ready` and `reset` touch everything).
+fn change_data(id: &str, kinds: &[&str], follow: &StreamFollow) -> String {
+    let mut v = json!({"cursor": id, "kinds": kinds});
+    let touches = |k: &str| kinds.iter().any(|x| *x == k || *x == "ready" || *x == "reset");
+    if let Some(session) = follow.lanes.as_deref().filter(|_| touches("lanes")) {
+        v["lanes"] = compact_lanes(session);
+    }
+    if let Some((harness, sid)) = follow.files.as_ref().filter(|_| touches("files")) {
+        v["files"] = compact_files(harness, sid);
+    }
+    v.to_string()
+}
+
 fn serve_stream(request: &mut Request<'_>, q: &Query, origin: Option<&str>, hub: &std::sync::Arc<StreamHub>) {
     use axum::response::sse::Event;
     let last_event_id = header_value(request, "Last-Event-ID");
@@ -2039,12 +2130,13 @@ fn serve_stream(request: &mut Request<'_>, q: &Query, origin: Option<&str>, hub:
         || last_event_id.is_some()
         || header_value(request, "Accept").is_some_and(|a| a.to_ascii_lowercase().contains("text/event-stream"));
     let cur = hub.refresh();
+    let follow = StreamFollow::parse(q);
     let change = |offset, kinds: &[&str]| {
         let id = hub.cursor_id(offset);
         Event::default()
             .id(&id)
             .event("change")
-            .data(json!({"cursor":id,"kinds":kinds}).to_string())
+            .data(change_data(&id, kinds, &follow))
     };
     let (first, emitted, done) = match hub.resume_point(after.as_deref(), cur) {
         StreamResume::Fresh => (Some(change(cur, &["ready"])), 0, !live || max_events == Some(0)),
@@ -2073,6 +2165,7 @@ fn serve_stream(request: &mut Request<'_>, q: &Query, origin: Option<&str>, hub:
         move |(first, mut seen, mut emitted, mut done, mut last_write)| {
             let hub = hub.clone();
             let env = env.clone();
+            let follow = follow.clone();
             async move {
                 if let Some(first) = first {
                     return Some((Ok::<_, std::io::Error>(first), (None, seen, emitted, done, last_write)));
@@ -2092,9 +2185,9 @@ fn serve_stream(request: &mut Request<'_>, q: &Query, origin: Option<&str>, hub:
                     // Disk polling is shared/throttled in StreamHub and happens on blocking workers;
                     // idle followers themselves hold no thread or blocking-worker permit.
                     let refresh = hub.clone();
-                    let env = env.clone();
+                    let scoped = env.clone();
                     tokio::task::spawn_blocking(move || {
-                        let _env = env.map(cv_core::env::Env::reenter);
+                        let _env = scoped.map(cv_core::env::Env::reenter);
                         refresh.refresh()
                     })
                     .await
@@ -2105,12 +2198,20 @@ fn serve_stream(request: &mut Request<'_>, q: &Query, origin: Option<&str>, hub:
                         emitted += 1;
                         done = max_events.is_some_and(|n| emitted >= n);
                         let id = hub.cursor_id(seen);
-                        Some(
-                            Event::default()
-                                .id(&id)
-                                .event("change")
-                                .data(json!({"cursor":id,"kinds":kinds}).to_string()),
-                        )
+                        // Pushed rows read transcripts and the task log: build them off the runtime.
+                        let data = if follow.wants() {
+                            let (id, follow) = (id.clone(), follow.clone());
+                            let env = env.clone();
+                            tokio::task::spawn_blocking(move || {
+                                let _env = env.map(cv_core::env::Env::reenter);
+                                change_data(&id, &kinds, &follow)
+                            })
+                            .await
+                            .ok()?
+                        } else {
+                            change_data(&id, &kinds, &follow)
+                        };
+                        Some(Event::default().id(&id).event("change").data(data))
                     } else if last_write.elapsed() >= SSE_KEEPALIVE {
                         Some(Event::default().comment("keepalive"))
                     } else {

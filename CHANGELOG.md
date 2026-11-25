@@ -30,6 +30,7 @@
 - Doctor reports post-compaction re-read churn, compaction-summary URLs, commands and paths nobody said earlier, and repeated identical read/search spins.
 - Lane and event JSON expose validated causal identifiers supplied through `CV_BAGGAGE`.
 - Lanes carry an `attention` state (needs_you, working, stale, idle, done), sorted most urgent first, and report hook/transcript `witness_divergence`.
+- `/api/stream` announces `lanes` and `files` changes and, given `lanes=` or `files=`, pushes that session's compact lane rows or latest file touch.
 - Harden Markdown fences, neutralize forged role and section headers, preserve non-human seed provenance across distills and ports, and omit titles from SessionStart hooks.
 - Task notes support conditional facts and failures that go stale when pinned files, sessions, or tasks move. Stall ordering exposes waiting work.
 - Task completion shows cited command outcomes, local receipt-chain anchors, red/green contrast, and discrepancies with reported validation.

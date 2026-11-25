@@ -109,7 +109,12 @@ fn api_lanes(q: &Query) -> (u16, Value) {
     let Some(session) = q.get("session") else {
         return (400, json!({"error": "which session? pass ?session=<id prefix>"}));
     };
-    let (r, _adapter) = match crate::util::resolve_quiet(&session, None) {
+    lanes_report(&session)
+}
+
+/// The `/api/lanes` body for one session (also what `/api/stream?lanes=` compacts).
+pub(crate) fn lanes_report(session: &str) -> (u16, Value) {
+    let (r, _adapter) = match crate::util::resolve_quiet(session, None) {
         Ok(x) => x,
         Err(e) => return (404, json!({"error": e.to_string()})),
     };

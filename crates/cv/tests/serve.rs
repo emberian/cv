@@ -2328,6 +2328,60 @@ fn serve_sse_stream_auth_and_live_cursor_wakeup() {
 }
 
 #[test]
+fn stream_pushes_compact_lanes_and_files_for_the_session_a_follower_names() {
+    // #tooth A follower naming a session gets its lanes (most urgent first) and file timeline in
+    // the event itself; one naming nothing gets only the cursor and kinds, as before.
+    let w = world("stream-lanes-files");
+    let lane = |agent: &str, extra: Value| {
+        let mut rows = vec![
+            json!({"type": "user", "uuid": format!("{agent}-u"), "timestamp": "2026-01-01T10:00:00Z",
+            "message": {"role": "user", "content": "work"}}),
+        ];
+        if !extra.is_null() {
+            rows.push(extra);
+        }
+        w.write_agent(
+            "betasess",
+            agent,
+            &json!({"agentType": "general-purpose", "description": agent}),
+            &rows,
+        );
+    };
+    lane("quiet-lane", Value::Null);
+    lane(
+        "asking-lane",
+        json!({"type": "assistant", "uuid": "ask-a", "timestamp": "2026-01-01T10:00:01Z",
+            "message": {"role": "assistant", "content": [{"type": "tool_use", "id": "q1", "name": "AskUserQuestion",
+                "input": {"questions": [{"question": "Ship?", "options": [{"label": "yes"}, {"label": "no"}]}]}}]}}),
+    );
+    let (port, _server) = spawn_serve(&w);
+    let data = |raw: &str| -> Value {
+        let line = raw
+            .lines()
+            .find_map(|l| l.strip_prefix("data: "))
+            .unwrap_or_else(|| panic!("SSE data in {raw}"));
+        serde_json::from_str(line).unwrap()
+    };
+    let raw = raw_request(port, "GET", "/api/stream?lanes=betasess&files=claude/betasess", &[]);
+    assert_eq!(raw_status(&raw), 200, "{raw}");
+    let event = data(&raw);
+    assert_eq!(event["kinds"], json!(["ready"]), "{event}");
+    let lanes = event["lanes"]["lanes"].as_array().unwrap();
+    assert_eq!(lanes.len(), 2, "{event}");
+    assert_eq!(lanes[0]["agent_id"], "asking-lane", "{event}");
+    assert_eq!(lanes[0]["attention"], "needs_you");
+    assert_eq!(lanes[0]["pending_ask"], true);
+    assert_eq!(lanes[1]["attention"], "stale");
+    assert!(lanes[0].get("tokens").is_none(), "compact rows only: {event}");
+    assert_eq!(event["lanes"]["counts"]["attention"]["needs_you"], 1);
+    assert_eq!(event["files"]["touches"], 0, "{event}");
+    assert_eq!(event["files"]["id"], "betasess");
+
+    let plain = data(&raw_request(port, "GET", "/api/stream", &[]));
+    assert!(plain.get("lanes").is_none() && plain.get("files").is_none(), "{plain}");
+}
+
+#[test]
 fn event_streams_do_not_exhaust_the_old_sixteen_follower_limit() {
     use std::io::BufRead;
     let w = world("many-sse-followers");
