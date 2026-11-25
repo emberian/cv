@@ -297,6 +297,19 @@ pub(crate) fn cmd_prune(args: PruneArgs<'_>) -> Result<()> {
             "  cache break-even n* = {} ({})",
             res.cache_break_even.n_star, res.cache_break_even.assumptions
         );
+        match (res.invalidated_suffix_tokens, res.cache_break_even_turns) {
+            (Some(suffix), Some(n)) => {
+                let _ = writeln!(
+                    h,
+                    "  cache rebuild: ~{}k cached tokens invalidated from the first pruned record on · break-even after {n} turn(s)",
+                    suffix / 1000
+                );
+            }
+            (Some(_), None) => {
+                let _ = writeln!(h, "  cache rebuild: nothing saved, so it never pays back");
+            }
+            _ => {}
+        }
     }
     if res.dropped_turns > 0 {
         let sized = match res.window_real_tokens {
@@ -374,7 +387,7 @@ pub(crate) fn cmd_prune(args: PruneArgs<'_>) -> Result<()> {
         }
     }
     skills_line(&mut h, &res.skills);
-    for w in &res.warnings {
+    for w in res.warnings.iter().chain(&res.cache_warning) {
         let _ = writeln!(h, "  ⚠ {w}");
     }
     if !dry_run {

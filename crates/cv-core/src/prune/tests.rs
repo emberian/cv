@@ -2570,6 +2570,49 @@ fn prune_cache_break_even_uses_net_prompt_savings() {
     assert_eq!(CacheBreakEven::estimate(Some(1000), 181).n_star, 42);
 }
 
+// #tooth n* = ceil(invalidated * 0.9 / saved) + 1, from the cached suffix after the first pruned
+// record; a low-bloat prune that needs more than 30 turns to pay back is warned about.
+#[test]
+fn prune_break_even_turns_price_the_invalidated_suffix() -> Result<()> {
+    assert_eq!(cache_break_even_turns(10_000, 0), None);
+    assert_eq!(cache_break_even_turns(10_000, 1_000), Some(10));
+    assert_eq!(cache_break_even_turns(10_001, 1_000), Some(11));
+    assert_eq!(cache_break_even_turns(0, 1_000), Some(1));
+    for (last_prompt, warned) in [(60_000u64, false), (5_000_000, true)] {
+        let world = crate::test_world("prune-break-even");
+        let path = fixture(&world.proj, &"x".repeat(40_000));
+        let mut rows: Vec<Value> = std::fs::read_to_string(&path)?
+            .lines()
+            .map(serde_json::from_str)
+            .collect::<Result<_, _>>()?;
+        rows[1]["message"]["usage"] = serde_json::json!({"input_tokens": 1_000});
+        rows[3]["message"]["usage"] = serde_json::json!({"input_tokens": last_prompt});
+        std::fs::write(&path, rows.iter().map(|v| format!("{v}\n")).collect::<String>())?;
+        let options = PruneOptions {
+            min_size: 1024,
+            keep_last: 1,
+            dry_run: true,
+            ..Default::default()
+        };
+        let result = prune_session(crate::Harness::Claude, &path, &options)?;
+        assert!(result.pruned_count >= 1);
+        // The prefix through the first call stays cached; everything after it is rebuilt.
+        assert_eq!(result.invalidated_suffix_tokens, Some(last_prompt - 1_000));
+        let saved = result.est_context_tokens_saved;
+        assert!(saved > 0);
+        let n = result.cache_break_even_turns.expect("n*");
+        assert!(n >= 1);
+        let low = result
+            .cache_warning
+            .as_deref()
+            .is_some_and(|w| w.starts_with("low-bloat prune"));
+        assert_eq!(low, warned, "{:?} (n* {n}, saved {saved})", result.cache_warning);
+        let json = serde_json::to_value(&result)?;
+        assert_eq!(json["cache_break_even_turns"], n);
+    }
+    Ok(())
+}
+
 // #tooth Size and age independently protect inputs. Only the old large Write
 // contributes an argument entry and a saving in the recorded prompt.
 #[test]

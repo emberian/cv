@@ -205,7 +205,31 @@ pub struct PruneResult {
     pub plan: Option<PlanReport>,
     pub dry_run: bool,
     pub cache_break_even: CacheBreakEven,
+    /// Recorded prompt tokens from the first mutated record onward: the cached suffix a prune
+    /// invalidates (the prefix before it stays cached). `None` without recorded usage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub invalidated_suffix_tokens: Option<u64>,
+    /// [`cache_break_even_turns`]: turns until the prune pays for rebuilding that suffix.
+    pub cache_break_even_turns: Option<u64>,
+    /// Set when a low-bloat prune (under 15% of the active prompt saved) needs more than 30
+    /// turns to break even on the cache it invalidates. Advice, not a data-safety warning.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_warning: Option<String>,
 }
+
+/// The prompt-cache break-even turn count `n* = ceil(invalidated * 0.9 / saved) + 1`: rewriting
+/// the invalidated suffix once at full input price costs the 90% cache discount on it, and each
+/// later turn reads `saved` fewer tokens. `None` when nothing is saved.
+pub fn cache_break_even_turns(invalidated_suffix: u64, tokens_saved: u64) -> Option<u64> {
+    (tokens_saved > 0)
+        .then(|| (u128::from(invalidated_suffix) * 9).div_ceil(u128::from(tokens_saved) * 10) + 1)
+        .map(|n| u64::try_from(n).unwrap_or(u64::MAX))
+}
+
+/// Below this share of the active prompt saved, a prune is low-bloat.
+const LOW_BLOAT_PERCENT: u64 = 15;
+/// A low-bloat prune that needs more turns than this to break even is warned about.
+const BREAK_EVEN_WARN_TURNS: u64 = 30;
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CacheBreakEven {
@@ -718,10 +742,18 @@ fn prune_session_after_stage(
     // The last kept main-thread request's recorded context: what a resume sizes the session by.
     let mut active_saving = 0i128;
     let mut active_prompt = None;
+    // The recorded prompt before the first record whose estimate the prune changed: the cached
+    // prefix that survives. Read one record late, at the start of the next iteration.
+    let mut first_mutation_prefix: Option<u64> = None;
+    let mut prompt_before_previous: Option<u64> = None;
     let mut last_request_tokens = None;
     let mut last_request_rewritable = false;
 
     for (idx, (facts, range)) in parsed.into_iter().zip(lines.iter()).enumerate() {
+        if first_mutation_prefix.is_none() && active_saving != 0 {
+            first_mutation_prefix = Some(prompt_before_previous.unwrap_or(0));
+        }
+        prompt_before_previous = active_prompt;
         let Some(facts) = facts else {
             // Blank records (the parse loop refused every other unreadable row) use the same
             // writer with no accepted rewrite nodes.
@@ -763,6 +795,8 @@ fn prune_session_after_stage(
         if facts.facts.is_compact_boundary() && !facts.sidechain() {
             active_saving = 0;
             active_prompt = None;
+            first_mutation_prefix = None;
+            prompt_before_previous = None;
         }
         if !facts.sidechain() {
             active_prompt = facts.facts.orig_ctx.or(facts.facts.usage_in).or(active_prompt);
@@ -1054,6 +1088,25 @@ fn prune_session_after_stage(
         );
     }
 
+    if first_mutation_prefix.is_none() && active_saving != 0 {
+        first_mutation_prefix = Some(prompt_before_previous.unwrap_or(0));
+    }
+    let invalidated_suffix_tokens = active_prompt
+        .zip(first_mutation_prefix)
+        .map(|(prompt, prefix)| prompt.saturating_sub(prefix));
+    let saved_now = u64::try_from(active_saving.max(0)).unwrap_or(u64::MAX);
+    let cache_break_even_turns = invalidated_suffix_tokens.and_then(|suffix| cache_break_even_turns(suffix, saved_now));
+    let mut cache_warning = None;
+    if let (Some(n), Some(prompt)) = (cache_break_even_turns, active_prompt.filter(|p| *p > 0)) {
+        let percent = saved_now.saturating_mul(100) / prompt;
+        if percent < LOW_BLOAT_PERCENT && n > BREAK_EVEN_WARN_TURNS {
+            cache_warning = Some(format!(
+                "low-bloat prune: saves ~{percent}% of the active prompt but invalidates ~{}k cached tokens; \
+                 it pays back only after {n} more turns (at a 90% cached-input discount)",
+                invalidated_suffix_tokens.unwrap_or(0) / 1000
+            ));
+        }
+    }
     let now = file.metadata()?.len();
     if now > original_size {
         warnings.push(format!(
@@ -1062,6 +1115,9 @@ fn prune_session_after_stage(
     }
     Ok(PruneResult {
         cache_break_even: CacheBreakEven::estimate(active_prompt, active_saving),
+        invalidated_suffix_tokens,
+        cache_break_even_turns,
+        cache_warning,
         source_id,
         parent_session_id,
         new_id,
