@@ -1381,6 +1381,7 @@ impl ColumnarEventStore {
                     collected.push((
                         (msg_idx, row_kind, seg_ord, row_id),
                         EventRow {
+                            baggage: None,
                             harness: state.harness.clone(),
                             session_id: state.session_id.clone(),
                             msg_idx,

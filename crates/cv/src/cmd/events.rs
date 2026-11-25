@@ -32,8 +32,10 @@ pub(crate) fn cmd_events(
                         let agent_id = s.agent_id().to_string();
                         let parent = r.id.clone();
                         let harness = r.harness.as_str().to_string();
+                        let baggage = cv_core::hooks::Baggage::for_session(&harness, &s.session.id);
                         evs.into_iter().map(move |e| {
                             cv_core::rows::event_row(&events::EventRow {
+                                baggage: baggage.clone(),
                                 harness: harness.clone(),
                                 session_id: parent.clone(),
                                 msg_idx: e.msg_idx as i64,

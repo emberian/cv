@@ -35,6 +35,8 @@ use std::process::{Command, Stdio};
 pub const CLEARED_ENV: &[&str] = &[
     "CLUSTERVISION_CACHE",
     "CV_ENDPOINT",
+    "CV_BAGGAGE",
+    "CV_HOOK_TIMING",
     "CV_FROZEN",
     "CV_LIVE_BYTES",
     "CV_SERVE_HUB",

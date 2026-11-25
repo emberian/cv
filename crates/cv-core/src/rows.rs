@@ -145,7 +145,7 @@ pub fn live_search_row(r: &SessionRef, title: &str, snippet: &str) -> Value {
 /// the catalog row with `ts` spelled RFC 3339 (the catalog stores unix seconds) and the sub-agent
 /// provenance trio always present (null for a top-level session).
 pub fn event_row(e: &EventRow) -> Value {
-    json!({
+    let mut row = json!({
         "msg_idx": e.msg_idx,
         "ts": rfc3339(e.ts),
         "kind": e.kind,
@@ -155,7 +155,11 @@ pub fn event_row(e: &EventRow) -> Value {
         "agent_id": e.agent_id,
         "parent_id": e.parent_id,
         "workflow": e.workflow,
-    })
+    });
+    if let Some(baggage) = &e.baggage {
+        row["baggage"] = json!(baggage);
+    }
+    row
 }
 
 /// One `cv touched --json` / `GET /api/touched` row: who touched the file, how often, when last

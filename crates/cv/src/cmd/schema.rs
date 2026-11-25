@@ -594,6 +594,7 @@ mod tests {
         let at: chrono::DateTime<chrono::Utc> = at.parse().unwrap();
         let some = |s: &str| Some(s.to_string());
         let lane = cv_core::lanes::Lane {
+            baggage: None,
             agent_id: "a".into(),
             session_id: "agent-a".into(),
             path: "/a".into(),

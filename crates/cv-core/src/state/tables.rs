@@ -129,6 +129,143 @@ pub struct LineageEdge {
 /// Domain prefix for `cv-receipt-v1` canonical SHA-256 chain hashes.
 pub const RECEIPT_DOMAIN: &str = "cv-receipt-v1";
 
+/// A single offered command and the observed extent of its five-turn window.
+pub struct Whisper {
+    pub session_id: String,
+    pub kind: String,
+    pub subject_key: String,
+    pub subject_rev: String,
+    pub command: String,
+    pub emitted_at: i64,
+    pub followed_up_at: Option<i64>,
+    pub unfollowed: bool,
+}
+
+impl StateStore {
+    #[cfg(unix)]
+    pub(super) fn offer_whisper(
+        &self,
+        harness: &str,
+        session: &str,
+        kind: &str,
+        subject: &str,
+        revision: &str,
+        command: &str,
+    ) -> Result<bool, StateError> {
+        // Keep the dedup keys for the recipient's lifetime. On saturation stop
+        // offering instead of evicting a key that could cause repeat delivery.
+        Ok(self.open_writable()?.execute(
+            "INSERT INTO whispers(session_id,kind,subject_key,subject_rev,command,status,harness)
+             SELECT ?1,?2,?3,?4,?5,'offered',?6
+             WHERE (SELECT COUNT(*) FROM whispers WHERE session_id=?1) < 256
+             ON CONFLICT DO NOTHING",
+            rusqlite::params![session, kind, subject, revision, command, harness],
+        )? == 1)
+    }
+
+    #[cfg(unix)]
+    pub(super) fn settle_offer(
+        &self,
+        session: &str,
+        kind: &str,
+        subject: &str,
+        revision: &str,
+        emitted_at: Option<i64>,
+    ) -> Result<(), StateError> {
+        let conn = self.open_writable()?;
+        if let Some(ts) = emitted_at {
+            conn.execute(
+                "UPDATE whispers SET status='emitted',emitted_at=?5
+                WHERE session_id=?1 AND kind=?2 AND subject_key=?3 AND subject_rev=?4 AND status='offered'",
+                rusqlite::params![session, kind, subject, revision, ts],
+            )?;
+        } else {
+            conn.execute("DELETE FROM whispers WHERE session_id=?1 AND kind=?2 AND subject_key=?3 AND subject_rev=?4 AND status='offered'",
+                [session,kind,subject,revision])?;
+        }
+        Ok(())
+    }
+
+    pub fn session_whispers(&self, harness: &str, session: &str) -> Result<Vec<Whisper>, StateError> {
+        let Some(conn) = self.open_readonly()? else {
+            return Ok(Vec::new());
+        };
+        if super::current_schema_version(&conn)? < 4 {
+            return Ok(Vec::new());
+        }
+        let mut stmt = conn.prepare(
+            "SELECT kind, subject_key, subject_rev, command, emitted_at, followed_up_at, status
+            FROM whispers WHERE session_id=?1 AND harness=?2 AND emitted_at IS NOT NULL ORDER BY emitted_at",
+        )?;
+        let rows = stmt.query_map([session, harness], |r| {
+            Ok(Whisper {
+                session_id: session.to_owned(),
+                kind: r.get(0)?,
+                subject_key: r.get(1)?,
+                subject_rev: r.get(2)?,
+                command: r.get(3)?,
+                emitted_at: r.get(4)?,
+                followed_up_at: r.get(5)?,
+                unfollowed: r.get::<_, String>(6)? == "unfollowed",
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn finish_whisper_window(&self, w: &Whisper) -> Result<(), StateError> {
+        self.open_writable()?.execute(
+            "UPDATE whispers SET status=?5, followed_up_at=?6
+            WHERE session_id=?1 AND kind=?2 AND subject_key=?3 AND subject_rev=?4 AND status='emitted'",
+            rusqlite::params![
+                w.session_id,
+                w.kind,
+                w.subject_key,
+                w.subject_rev,
+                if w.followed_up_at.is_some() {
+                    "followed_up"
+                } else {
+                    "unfollowed"
+                },
+                w.followed_up_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn session_baggage(&self, harness: &str, session: &str) -> Result<Option<crate::hooks::Baggage>, StateError> {
+        let Some(conn) = self.open_readonly()? else {
+            return Ok(None);
+        };
+        if super::current_schema_version(&conn)? < 4 {
+            return Ok(None);
+        }
+        let raw: Option<String> = conn
+            .query_row(
+                "SELECT baggage FROM session_baggage WHERE harness=?1 AND session_id=?2",
+                [harness, session],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(raw.as_deref().and_then(crate::hooks::Baggage::parse))
+    }
+}
+
+pub(super) fn record_baggage(
+    conn: &rusqlite::Connection,
+    harness: &str,
+    session: &str,
+    raw: &str,
+) -> Result<(), StateError> {
+    if crate::hooks::Baggage::parse(raw).is_some() && !session.is_empty() {
+        conn.execute(
+            "INSERT INTO session_baggage(harness,session_id,baggage) VALUES(?1,?2,?3)
+            ON CONFLICT(harness,session_id) DO NOTHING",
+            [harness, session, raw],
+        )?;
+    }
+    Ok(())
+}
+
 impl StateStore {
     // ───────────────────────── Producers & Writer Epochs ─────────────────────────
 
@@ -782,6 +919,26 @@ impl StateStore {
                 run.last_text,
             ],
         )?;
+        if let Some(raw) = crate::env::var("CV_BAGGAGE")
+            .ok()
+            .filter(|s| crate::hooks::Baggage::parse(s).is_some())
+        {
+            tx.execute(
+                "UPDATE lane_runs SET baggage=?2 WHERE run_id=?1 AND baggage IS NULL",
+                rusqlite::params![run.run_id, raw],
+            )?;
+            if let Some(harness) = run.harness.as_deref() {
+                let child = run
+                    .agent_transcript_path
+                    .as_deref()
+                    .and_then(|p| std::path::Path::new(p).file_stem())
+                    .and_then(|s| s.to_str())
+                    .filter(|s| s.starts_with("agent-"))
+                    .or(run.agent_id.as_deref())
+                    .unwrap_or(&run.session_id);
+                record_baggage(&tx, harness, child, &raw)?;
+            }
+        }
         tx.commit()?;
         Ok(())
     }

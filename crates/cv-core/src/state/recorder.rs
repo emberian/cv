@@ -426,6 +426,8 @@ pub struct RecorderServer {
     acceptor_thread: Option<JoinHandle<()>>,
     #[cfg(unix)]
     committer_thread: Option<JoinHandle<()>>,
+    #[cfg(unix)]
+    hooks_thread: Option<JoinHandle<()>>,
     #[cfg(not(unix))]
     _owner_lock: Option<File>,
 }
@@ -468,6 +470,8 @@ impl RecorderServer {
             let listener = bind_restrictive_0600(&sock_path)?;
             listener.set_nonblocking(true)?;
 
+            let hooks = super::observations::HookReceiver::bind(store.clone()).map_err(std::io::Error::other)?;
+            let stop_hooks = stop.clone();
             let (tx, rx) = mpsc::channel::<BatchWork>();
             let stop_accept = Arc::clone(&stop);
             let accept_sock_path = sock_path.clone();
@@ -591,15 +595,22 @@ impl RecorderServer {
                     drop(owner_lock);
                 })?;
 
-            Ok(Self {
+            let mut owner = Self {
                 store,
                 epoch,
                 fault_mode,
                 stop,
                 sock_path,
+                hooks_thread: None,
                 acceptor_thread: Some(acceptor_thread),
                 committer_thread: Some(committer_thread),
-            })
+            };
+            owner.hooks_thread = Some(
+                std::thread::Builder::new()
+                    .name("cv-hook-observations".into())
+                    .spawn(crate::env::carry(move || hooks.run(stop_hooks)))?,
+            );
+            Ok(owner)
         }
 
         #[cfg(not(unix))]
@@ -646,6 +657,9 @@ impl RecorderServer {
         self.stop.store(true, Ordering::Release);
         #[cfg(unix)]
         {
+            if let Some(h) = self.hooks_thread.take() {
+                let _ = h.join();
+            }
             if let Some(h) = self.acceptor_thread.take() {
                 let _ = h.join();
             }

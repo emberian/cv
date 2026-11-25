@@ -11,13 +11,14 @@ use super::StateError;
 use rusqlite::Connection;
 
 /// Current authoritative `state.db` schema version.
-pub const STATE_SCHEMA_VERSION: i64 = 3;
+pub const STATE_SCHEMA_VERSION: i64 = 4;
 
 /// Ordered forward migrations `(target_version, name, ddl)`.
 pub const MIGRATIONS: &[(i64, &str, &str)] = &[
     (1, "v1_authoritative_state_spine", MIGRATION_V1),
     (2, "v2_fleet_hub", MIGRATION_V2),
     (3, "v3_hub_delta_and_snapshot_bounds", MIGRATION_V3),
+    (4, "v4_hook_observations", MIGRATION_V4),
 ];
 
 const MIGRATION_V1: &str = r#"
@@ -312,6 +313,28 @@ CREATE TABLE IF NOT EXISTS hub_frontier_packs (
     pack_id     TEXT NOT NULL,
     PRIMARY KEY(producer_id, epoch, pack_id)
 );
+"#;
+
+const MIGRATION_V4: &str = r#"
+CREATE TABLE whispers (
+    harness TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    subject_key TEXT NOT NULL,
+    subject_rev TEXT NOT NULL,
+    command TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('offered','emitted','followed_up','unfollowed')),
+    emitted_at INTEGER,
+    followed_up_at INTEGER,
+    PRIMARY KEY(session_id, kind, subject_key, subject_rev)
+) WITHOUT ROWID;
+ALTER TABLE lane_runs ADD COLUMN baggage TEXT;
+CREATE TABLE session_baggage (
+    harness TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    baggage TEXT NOT NULL,
+    PRIMARY KEY(harness, session_id)
+) WITHOUT ROWID;
 "#;
 
 /// Read `PRAGMA user_version` from `conn`.

@@ -1244,6 +1244,23 @@ fn main() {
 }
 
 fn run() -> Result<()> {
+    let mut args = std::env::args_os().skip(1);
+    if args.next().as_deref() == Some(std::ffi::OsStr::new("hook")) {
+        if let Some(name) = args
+            .next()
+            .as_deref()
+            .and_then(|s| s.to_str())
+            .and_then(HookName::parse)
+        {
+            match (args.next(), args.next(), args.next()) {
+                (None, None, None) => return hooks::cmd_hook(name, None),
+                (Some(flag), Some(harness), None) if flag == "--harness" && harness.to_str().is_some() => {
+                    return hooks::cmd_hook(name, harness.into_string().ok())
+                }
+                _ => {}
+            }
+        }
+    }
     let mut tree = build_cli();
     let matches = tree.get_matches_mut();
     let cli = match Cli::from_arg_matches(&matches) {

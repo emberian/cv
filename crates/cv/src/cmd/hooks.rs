@@ -9,27 +9,29 @@
 //! `async: true` nothing waits for them. Every hook is `cv hook <name>` with an absolute binary
 //! path; the entries are recognized by that command shape, so `remove` deletes exactly them.
 //!
-//! Design constraint from the maintainer: agents set this up for themselves; not fancy; no daemon.
-//! Every body reads the catalog or the index (never a fleet scan) and must finish well under 100 ms
-//! on a cold cache — the latencies are measured in the lane report, not assumed.
+//! Observation hooks only enqueue to the resident recorder and claim a prepared pointer.
+//! Policy hooks can inspect authoritative state before returning a decision.
 
 // Hook commands do local bookkeeping; bound how long they can hold up the harness.
 const HOOK_TIMEOUT_SECS: u64 = 10;
 
 use std::collections::HashMap;
+#[cfg(not(unix))]
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use clap::{Subcommand, ValueEnum};
 use cv_core::hooks::Event;
-use cv_core::ir::{home_rel, Harness, SessionRef};
-use cv_core::lanes::LaneEvent;
+#[cfg(test)]
+use cv_core::ir::SessionRef;
+use cv_core::ir::{home_rel, Harness};
+
 use cv_core::sanitize::sanitize_line;
 use serde_json::{json, Map, Value};
 
+use crate::util::shell_quote;
 use crate::util::short_id;
-use crate::util::{fmt_int, shell_quote};
 
 /// The skill installed beside the hooks. It lives inside this crate (`crates/cv/skill/SKILL.md`) so the
 /// published package carries it; a path outside the crate builds in the repo and nowhere else.
@@ -37,15 +39,6 @@ const SKILL: &str = include_str!("../../skill/SKILL.md");
 
 /// A session whose transcript changed within this many minutes is *live* for the edit guard.
 const LIVE_MINUTES: i64 = 30;
-/// How many of this directory's sessions the start pack lists.
-const START_SESSIONS: usize = 6;
-/// The hooks' one latency budget, in transcript bytes. A hook answers inside the harness's turn
-/// (100 ms cold), and streaming a transcript costs ~4.5 ms/MB (release, warm; 16.5 MB measured at
-/// 70–90 ms), so a hook reads at most this much and its output names what it left unread. The
-/// compact hook streams a transcript up to it whole, else reads its last this-many bytes; the
-/// start pack splits it across the sessions it lists.
-const HOOK_READ_BYTES: u64 = 8 * 1024 * 1024;
-
 #[derive(Subcommand)]
 pub(crate) enum HooksCmd {
     /// Merge cv's five hooks into the harness's settings file and copy the `cv` skill beside them.
@@ -102,9 +95,9 @@ pub(crate) enum Scope {
 /// The five hook bodies. The name is what the installed command ends with (`cv hook compact`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, ValueEnum)]
 pub(crate) enum HookName {
-    /// `SessionStart` matcher `compact`: what was compacted and the three commands that read it back.
+    /// Record a compaction and offer its recovery selector.
     Compact,
-    /// `SessionStart` matcher `startup|resume`: a capped pack of this directory's last sessions.
+    /// Collect a pending pointer on startup or resume.
     Start,
     /// `SubagentStart` / `SubagentStop` (async): a row in the lane ledger `cv lanes` reads.
     Lane,
@@ -133,7 +126,7 @@ impl HookName {
             HookName::Receipt => "receipt",
         }
     }
-    fn parse(s: &str) -> Option<HookName> {
+    pub(crate) fn parse(s: &str) -> Option<HookName> {
         [
             HookName::Compact,
             HookName::Start,
@@ -1292,10 +1285,121 @@ pub(crate) fn doctor_json() -> Value {
 
 // ───────────────────────────── the hook bodies ─────────────────────────────
 
+fn invalid_frame(name: HookName, parse_err: Option<&serde_json::Error>) {
+    if name == HookName::Retired
+        || (name == HookName::Receipt && cv_core::env::var("CV_RECEIPT_STRICT").as_deref() == Ok("1"))
+    {
+        println!(
+            "{}",
+            json!({"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny",
+            "permissionDecisionReason":"cv could not verify this hook frame"}})
+        );
+    } else if !matches!(
+        name,
+        HookName::Compact | HookName::Start | HookName::Decisions | HookName::Lane
+    ) {
+        match parse_err {
+            Some(e) => eprintln!(
+                "cv hook {}: stdin is not the hook JSON ({e}); nothing to do",
+                name.as_str()
+            ),
+            None => eprintln!("cv hook {}: stdin is not the hook JSON; nothing to do", name.as_str()),
+        }
+    }
+}
+
+const INPUT_CAP: usize = 256 * 1024;
+
+#[cfg(unix)]
+fn read_frame() -> Option<Vec<u8>> {
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + Duration::from_millis(8);
+    let mut fd = libc::pollfd {
+        fd: libc::STDIN_FILENO,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // stdin can share its open-file description with the parent. Restore its
+    // flags on every exit, including malformed input and deadline expiry.
+    struct RestoreFlags(i32);
+    impl Drop for RestoreFlags {
+        fn drop(&mut self) {
+            unsafe {
+                libc::fcntl(libc::STDIN_FILENO, libc::F_SETFL, self.0);
+            }
+        }
+    }
+    let flags = unsafe { libc::fcntl(fd.fd, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(fd.fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return None;
+    }
+    let _restore = RestoreFlags(flags);
+    let mut raw = Vec::new();
+    let mut chunk = [0; 8192];
+    loop {
+        let left = deadline.checked_duration_since(Instant::now())?;
+        let ready = unsafe { libc::poll(&mut fd, 1, left.as_millis() as i32 + 1) };
+        if ready < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        if ready <= 0 {
+            return None;
+        }
+        let n = unsafe { libc::read(fd.fd, chunk.as_mut_ptr().cast(), chunk.len()) };
+        if n < 0
+            && matches!(
+                std::io::Error::last_os_error().kind(),
+                std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+            )
+        {
+            continue;
+        }
+        let n = usize::try_from(n).ok()?;
+        if n == 0 {
+            return Some(raw);
+        }
+        if raw.len() + n > INPUT_CAP {
+            return None;
+        }
+        raw.extend_from_slice(&chunk[..n]);
+    }
+}
+
+#[cfg(not(unix))]
+fn read_frame() -> Option<Vec<u8>> {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if std::io::stdin()
+            .take(INPUT_CAP as u64 + 1)
+            .read_to_end(&mut bytes)
+            .is_ok()
+            && bytes.len() <= INPUT_CAP
+        {
+            let _ = tx.send(bytes);
+        }
+    });
+    rx.recv_timeout(std::time::Duration::from_millis(8)).ok()
+}
+
 /// `cv hook <name>`: read stdin, run the body, print its one-line JSON (or nothing). A body that
 /// fails prints its error on stderr and still exits 0 — a hook must never block the harness. A
 /// terminal on stdin means no harness is calling: usage, exit 2, instead of waiting for JSON.
 pub(crate) fn cmd_hook(name: HookName, harness: Option<String>) -> Result<()> {
+    let started = std::time::Instant::now();
+    // A recorder closing its FIFO between open and write is normal pressure.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    }
+    let result = handle_hook(name, harness);
+    if std::env::var_os("CV_HOOK_TIMING").as_deref() == Some(std::ffi::OsStr::new("1")) {
+        eprintln!("hook_handler_us={}", started.elapsed().as_micros());
+    }
+    result
+}
+
+fn handle_hook(name: HookName, harness: Option<String>) -> Result<()> {
     if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
         return crate::util::usage(format!(
             "cv hook {} reads the harness's hook JSON on stdin, and stdin is a terminal; \
@@ -1316,18 +1420,42 @@ pub(crate) fn cmd_hook(name: HookName, harness: Option<String>) -> Result<()> {
         );
         return Ok(());
     };
-    let mut raw = String::new();
-    let _ = std::io::stdin().read_to_string(&mut raw);
-    let payload: Value = match serde_json::from_str(&raw) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!(
-                "cv hook {}: stdin is not the hook JSON ({e}); nothing to do",
-                name.as_str()
-            );
+    let payload = match read_frame() {
+        Some(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+            Ok(v) if v.is_object() => v,
+            Ok(_) => {
+                invalid_frame(name, None);
+                return Ok(());
+            }
+            Err(e) => {
+                invalid_frame(name, Some(&e));
+                return Ok(());
+            }
+        },
+        None => {
+            invalid_frame(name, None);
             return Ok(());
         }
     };
+    if matches!(
+        name,
+        HookName::Compact | HookName::Start | HookName::Decisions | HookName::Lane
+    ) {
+        #[cfg(unix)]
+        if let Some(hint) = cv_core::state::observations::observe(name.as_str(), harness, &payload) {
+            let event = if name == HookName::Decisions {
+                "UserPromptSubmit"
+            } else {
+                "SessionStart"
+            };
+            println!("{}", context(event, hint));
+        }
+        return Ok(());
+    }
+    #[cfg(unix)]
+    if cv_core::env::var_os("CV_BAGGAGE").is_some() {
+        let _ = cv_core::state::observations::observe(name.as_str(), harness, &payload);
+    }
     let decoded = cv_core::harness::rootless(harness)
         .context("no adapter")
         .and_then(|adapter| adapter.hook_event(&payload))
@@ -1345,15 +1473,15 @@ pub(crate) fn cmd_hook(name: HookName, harness: Option<String>) -> Result<()> {
     let out = match decoded {
         Ok(None) => Ok(None),
         Ok(Some(event)) => match name {
-            HookName::Compact => hook_compact(&event),
-            HookName::Start => hook_start(&event),
-            HookName::Lane => hook_lane(&event, &payload),
-            HookName::Decisions => hook_decisions(&event),
+            HookName::Compact | HookName::Start | HookName::Decisions | HookName::Lane => unreachable!(),
             HookName::Edit => hook_edit(&event),
             HookName::Retired => hook_retired(&event, &payload),
             HookName::Receipt => hook_receipt(&event, &payload),
         },
-        Err(e) => Err(e),
+        Err(e) => {
+            invalid_frame(name, None);
+            Err(e)
+        }
     };
     match out {
         Ok(Some(v)) => println!("{v}"),
@@ -1393,589 +1521,10 @@ fn selector(harness: Harness, id: &str) -> String {
     }
 }
 
-fn adapter_of(ev: &Event) -> Result<&'static dyn cv_core::harness::Adapter> {
-    cv_core::harness::rootless(ev.harness).with_context(|| format!("no {} adapter", ev.harness))
-}
-
 fn context(event: &str, text: String) -> Value {
     json!({"hookSpecificOutput": {"hookEventName": event, "additionalContext": text}})
 }
 
-fn is_compressed_store(path: &Path) -> bool {
-    if path
-        .extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|ext| matches!(ext.to_ascii_lowercase().as_str(), "zst" | "gz" | "xz" | "bz2" | "lz4"))
-    {
-        return true;
-    }
-    let Ok(mut f) = std::fs::File::open(path) else {
-        return false;
-    };
-    let mut magic = [0u8; 4];
-    let n = f.read(&mut magic).unwrap_or(0);
-    // Zstandard frame (0xFD2FB528), Zstandard skippable frame (0x184D2A50..=0x184D2A5F), or gzip (0x1F 0x8B).
-    (n >= 4 && (magic == [0x28, 0xB5, 0x2F, 0xFD] || ((magic[0] & 0xF0) == 0x50 && magic[1..4] == [0x2A, 0x4D, 0x18])))
-        || (n >= 2 && magic[..2] == [0x1F, 0x8B])
-}
-
-fn is_binary_or_compressed_store(path: &Path) -> bool {
-    let Ok(meta) = std::fs::metadata(path) else {
-        return false;
-    };
-    if !meta.is_file() {
-        return true;
-    }
-    if path.extension().and_then(|e| e.to_str()).is_some_and(|ext| {
-        matches!(
-            ext.to_ascii_lowercase().as_str(),
-            "db" | "sqlite" | "sqlite3" | "vscdb" | "zst" | "gz" | "xz" | "bz2" | "lz4"
-        )
-    }) {
-        return true;
-    }
-    let Ok(mut f) = std::fs::File::open(path) else {
-        return false;
-    };
-    let mut magic = [0u8; 16];
-    let n = f.read(&mut magic).unwrap_or(0);
-    (n >= 16 && &magic == b"SQLite format 3\0")
-        || (n >= 4
-            && (magic[..4] == [0x28, 0xB5, 0x2F, 0xFD]
-                || ((magic[0] & 0xF0) == 0x50 && magic[1..4] == [0x2A, 0x4D, 0x18])))
-        || (n >= 2 && magic[..2] == [0x1F, 0x8B])
-}
-
-/// Read the last `bytes` of a plain-text transcript `path` as raw bytes without allocating a
-/// `String`. Binary SQLite databases and compressed archives return `None` so callers never seek
-/// raw mid-file binary/compressed bytes.
-fn tail_bytes(path: &Path, bytes: u64) -> Option<Vec<u8>> {
-    use std::io::{Seek, SeekFrom};
-    if is_binary_or_compressed_store(path) {
-        return None;
-    }
-    let mut f = std::fs::File::open(path).ok()?;
-    let len = f.metadata().ok()?.len();
-    let start = len.saturating_sub(bytes);
-    f.seek(SeekFrom::Start(start)).ok()?;
-    let mut buf = Vec::with_capacity((len - start) as usize);
-    f.read_to_end(&mut buf).ok()?;
-    Some(buf)
-}
-
-fn not_recorded_yet(id: &str) -> Value {
-    context(
-        "SessionStart",
-        format!(
-            "context compacted; the transcript has not recorded the boundary yet — `cv show {id} --kind compaction_boundary,compaction_summary` \
-             lists every boundary once it has, `cv show {id} --pre-compaction N` reads the span the Nth discarded."
-        ),
-    )
-}
-
-/// `SessionStart` (`compact`): the boundary the harness just wrote and the commands that read what
-/// it discarded. A transcript up to [`HOOK_READ_BYTES`] is streamed the way `cv show --kind
-/// compaction_boundary` does it (exact message index and ordinal); a larger one is read from its
-/// tail (trigger and size exact, the index left to that view, and the text says how much it
-/// read), so the hook stays inside its budget however long the session has run.
-fn hook_compact(ev: &Event) -> Result<Option<Value>> {
-    let Some(path) = ev.transcript() else {
-        return Ok(None);
-    };
-    let adapter = adapter_of(ev)?;
-    let id = selector(ev.harness, &ev.session.id);
-    // `cv rewind` writes a derived copy: only a harness with derived copies is pointed at it.
-    let rewinds = adapter.identity().is_some();
-    let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-    if size > HOOK_READ_BYTES {
-        // A tail without a boundary (one far back in a long transcript) still gets the pointers.
-        let read = format!(
-            "the hook read the last {} of this {} transcript",
-            cv_core::ir::human_bytes(HOOK_READ_BYTES),
-            cv_core::ir::human_bytes(size)
-        );
-        let what = match adapter.last_compact_boundary(path, HOOK_READ_BYTES)? {
-            Some((trigger, pre_tokens)) => format!(
-                " ({}, {}; {read}, so the index is not given)",
-                trigger.as_deref().unwrap_or("compaction"),
-                pre_tokens
-                    .map(|t| format!("{} tokens", fmt_int(t)))
-                    .unwrap_or_else(|| "size unrecorded".into())
-            ),
-            None => format!(" (no boundary recorded in what {read})"),
-        };
-        return Ok(Some(context(
-            "SessionStart",
-            format!(
-                "context compacted{what}. `cv show {id} --kind compaction_boundary,compaction_summary` lists this session's \
-                 boundaries with their message indexes; `cv show {id} --pre-compaction N` reads what the Nth discarded (`cv show \
-                 {id} --kind prompt,answer --pre-compaction N` just its prompts); {rewind} \
-                 {AFFORDANCE_POINTER}",
-                rewind = if rewinds { format!("`cv rewind {id} --at <msg>` resumes the agent as of a message.") } else { String::new() },
-                AFFORDANCE_POINTER = affordance_pointer(&id)
-            ),
-        )));
-    }
-    let comps = cv_core::compaction::detect(&ev.session, false)?;
-    let Some(last) = comps.last() else {
-        return Ok(Some(not_recorded_yet(&id)));
-    };
-    let k = comps.len();
-    let trigger = last.trigger.as_deref().unwrap_or("compaction");
-    let pre = last
-        .pre_tokens
-        .map(|t| format!("{} tokens", fmt_int(t)))
-        .unwrap_or_else(|| "size unrecorded".into());
-    let idx = last.boundary_msg_idx;
-    let mut text = format!(
-        "context compacted ({trigger}, {pre}) at message {idx} — compaction #{k} of this session. \
-         `cv show {id} --pre-compaction {k}` reads what was lost (`cv show {id} --kind prompt,answer --pre-compaction {k}` just its prompts)"
-    );
-    if idx > 0 && rewinds {
-        text.push_str(&format!(
-            "; `cv rewind {id} --at {}` resumes the agent as of before it.",
-            idx - 1
-        ));
-    } else {
-        text.push('.');
-    }
-    text.push(' ');
-    text.push_str(&affordance_pointer(&id));
-    Ok(Some(context("SessionStart", text)))
-}
-
-/// The one command that reads back what a compaction summary tends to flatten: the session's plan
-/// (with the task list beside the transcript), its schedules and its background jobs.
-fn affordance_pointer(id: &str) -> String {
-    format!("`cv show {id} --kind plan,schedule,background_job` lists the plan, schedules and background jobs this session holds.")
-}
-
-fn commit_re() -> &'static regex::bytes::Regex {
-    static RE: std::sync::OnceLock<regex::bytes::Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| {
-        regex::bytes::Regex::new(r#"\[([^\]\s\\"]+)(?: \([^)]*\))? ([0-9a-f]{7,40})\] "#).expect("static regex")
-    })
-}
-
-/// What the start pack says of a session's last commit: the short sha of the last
-/// `[branch sha] subject` (a `git commit` result) in the last `bytes` of its transcript — never
-/// a parse of the whole file — or, when none is there and the transcript is longer, how far back
-/// it looked.
-fn last_commit(path: &Path, bytes: u64) -> String {
-    let re = commit_re();
-    let Some(buf) = tail_bytes(path, bytes) else {
-        return String::new();
-    };
-    match re.captures_iter(&buf).last() {
-        Some(c) => {
-            let sha = std::str::from_utf8(&c[2]).unwrap_or("");
-            match validated_short_hex_sha(sha) {
-                Some(short) => format!(" · last commit {short}"),
-                None => String::new(),
-            }
-        }
-        None if std::fs::metadata(path).is_ok_and(|m| m.len() > bytes) => {
-            format!(" · no commit in its last {}", cv_core::ir::human_bytes(bytes))
-        }
-        None => String::new(),
-    }
-}
-
-fn validated_short_hex_sha(sha: &str) -> Option<&str> {
-    (sha.len() >= 7 && sha.bytes().all(|b| b.is_ascii_hexdigit())).then(|| &sha[..7])
-}
-
-fn is_validated_session_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= 128
-        && id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
-}
-
-fn is_validated_actor_id(who: &str) -> bool {
-    !who.is_empty()
-        && who.len() <= 64
-        && who
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b':' | b'-' | b'_' | b'.' | b'@' | b'/'))
-}
-
-fn is_git_commit_command(cmd: &str) -> bool {
-    let has_git = cmd
-        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '/'))
-        .any(|tok| tok == "git" || tok.ends_with("/git"));
-    if !has_git {
-        return false;
-    }
-    cmd.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
-        .any(|tok| matches!(tok, "commit" | "cherry-pick" | "merge" | "revert" | "rebase" | "am"))
-}
-
-fn scan_messages_rev_for_commit<'a>(
-    msgs: impl Iterator<Item = &'a cv_core::Message>,
-    resolver: &cv_core::Resolver,
-    mut remaining: u64,
-) -> Option<String> {
-    let re = commit_re();
-    for m in msgs {
-        for block in m.content.iter().rev() {
-            let text = match block {
-                cv_core::Block::ToolResult { content, .. } => content,
-                _ => continue,
-            };
-            if remaining == 0 {
-                return None;
-            }
-            let mut block_sha: Option<String> = None;
-            let mut overlap: [u8; 96] = [0; 96];
-            let mut overlap_len: usize = 0;
-            let _ = text.try_for_each_chunk(resolver, 64 * 1024, |chunk| {
-                if remaining == 0 {
-                    return Ok(());
-                }
-                let raw = chunk.as_bytes();
-                let take = raw.len().min(remaining as usize);
-                let slice = &raw[..take];
-                remaining = remaining.saturating_sub(take as u64);
-                if overlap_len == 0 {
-                    if let Some(c) = re.captures_iter(slice).last() {
-                        if let Ok(s) = std::str::from_utf8(&c[2]) {
-                            block_sha = Some(s[..7.min(s.len())].to_string());
-                        }
-                    }
-                } else {
-                    let mut combined = Vec::with_capacity(overlap_len + slice.len());
-                    combined.extend_from_slice(&overlap[..overlap_len]);
-                    combined.extend_from_slice(slice);
-                    if let Some(c) = re.captures_iter(&combined).last() {
-                        if let Ok(s) = std::str::from_utf8(&c[2]) {
-                            block_sha = Some(s[..7.min(s.len())].to_string());
-                        }
-                    }
-                }
-                let keep = slice.len().min(overlap.len());
-                overlap[..keep].copy_from_slice(&slice[slice.len() - keep..]);
-                overlap_len = keep;
-                Ok(())
-            });
-            if block_sha.is_some() {
-                return block_sha;
-            }
-        }
-    }
-    None
-}
-
-/// Session-aware commit lookup for `hook_start`: plain-text logs tail raw bytes directly; binary
-/// SQLite stores and compressed rollouts inspect the tail ring backwards first (newest message
-/// first, so giant intermediate `ToolResult`s never starve a newer commit) and fall back to narrow
-/// `[cmd_idx ..= cmd_idx + 4]` windows around indexed `git commit` events when the last commit sits
-/// >`TAIL_MESSAGES` before EOF.
-fn last_commit_session(r: &SessionRef, bytes: u64) -> String {
-    if !is_binary_or_compressed_store(&r.path) {
-        return last_commit(&r.path, bytes);
-    }
-    if bytes == 0 {
-        return String::new();
-    }
-    if is_compressed_store(&r.path) && std::fs::metadata(&r.path).is_ok_and(|m| m.len() > bytes) {
-        return String::new();
-    }
-    let Some(adapter) = cv_core::harness::rootless(r.harness) else {
-        return String::new();
-    };
-    const TAIL_MESSAGES: usize = 256;
-    const COMMIT_RESULT_WINDOW: u64 = 4;
-
-    let mut cmd_indices: Vec<u64> = cv_core::events::events_for(r.harness.as_str(), &r.id, Some("command"))
-        .ok()
-        .map(|evs| {
-            let mut idxs: Vec<u64> = evs
-                .iter()
-                .filter(|e| e.target.as_deref().is_some_and(is_git_commit_command))
-                .map(|e| e.msg_idx.max(0) as u64)
-                .collect();
-            idxs.sort_unstable();
-            idxs.dedup();
-            if idxs.len() > 8 {
-                idxs.drain(..idxs.len() - 8);
-            }
-            idxs
-        })
-        .unwrap_or_default();
-    cmd_indices.shrink_to_fit();
-
-    let tail_start = r.message_count.map(|n| n.saturating_sub(TAIL_MESSAGES) as u64);
-
-    struct CommitWindowSink {
-        cmd_windows: Vec<(u64, u64, Vec<cv_core::Message>)>,
-        tail_start: Option<u64>,
-        tail_ring: std::collections::VecDeque<cv_core::Message>,
-        seen_msgs: u64,
-    }
-    impl cv_core::MessageSink for CommitWindowSink {
-        fn message(&mut self, m: cv_core::Message) -> cv_core::Flow {
-            let idx = self.seen_msgs;
-            self.seen_msgs += 1;
-            let in_tail = self.tail_start.is_none_or(|ts| idx >= ts);
-            for (lo, hi, buf) in &mut self.cmd_windows {
-                if idx >= *lo && idx <= *hi {
-                    buf.push(m.clone());
-                }
-            }
-            if in_tail {
-                if self.tail_ring.len() == TAIL_MESSAGES {
-                    self.tail_ring.pop_front();
-                }
-                self.tail_ring.push_back(m);
-            }
-            cv_core::Flow::Continue
-        }
-    }
-
-    let mut sink = CommitWindowSink {
-        cmd_windows: cmd_indices
-            .into_iter()
-            .map(|c| (c, c.saturating_add(COMMIT_RESULT_WINDOW), Vec::new()))
-            .collect(),
-        tail_start,
-        tail_ring: std::collections::VecDeque::with_capacity(TAIL_MESSAGES),
-        seen_msgs: 0,
-    };
-    let _ = cv_core::stream::stream_counted(
-        adapter,
-        r,
-        &cv_core::Demand::LEAN.with_spans(),
-        &mut sink,
-        cv_core::stream::Pass::default(),
-    );
-
-    let resolver = cv_core::Resolver::new(Some(r.path.clone()));
-    // 1. Newest messages in the tail ring win first (scanning backwards from EOF so intermediate
-    //    megabytes of tool output never starve a recent commit).
-    let sha = scan_messages_rev_for_commit(sink.tail_ring.iter().rev(), &resolver, bytes).or_else(|| {
-        // 2. Fall back to narrow `[cmd_idx ..= cmd_idx + 4]` windows around indexed `git commit`
-        //    commands (newest command window first, each with its own `bytes` budget).
-        sink.cmd_windows
-            .iter()
-            .rev()
-            .find_map(|(_, _, win)| scan_messages_rev_for_commit(win.iter().rev(), &resolver, bytes))
-    });
-    sha.as_deref()
-        .and_then(validated_short_hex_sha)
-        .map_or_else(String::new, |sha| format!(" · last commit {sha}"))
-}
-
-fn ago(t: Option<chrono::DateTime<chrono::Utc>>) -> String {
-    t.map(|t| format!("{} ago", cv_core::task::age_short(t, chrono::Utc::now())))
-        .unwrap_or_else(|| "undated".into())
-}
-
-/// `(who, n)` when the task log owes `n > 0` decisions to the identity `cv task inbox` would use.
-/// The one policy for both hooks that mention them: an unreadable task log is said on stderr and
-/// owes nothing, so it never costs the start pack its sessions.
-fn owed_decisions(hook: HookName) -> Option<(Option<String>, usize)> {
-    let who = cv_core::task::actor(None, "cv");
-    // Every prompt asks: the stored fold and the events appended since, never the whole log.
-    let outcome = match cv_core::task::fold() {
-        Ok(outcome) => outcome,
-        Err(e) => {
-            eprintln!("cv hook {}: {e:#}", hook.as_str());
-            return None;
-        }
-    };
-    let n = cv_core::task::inbox(&outcome.model, &who)
-        .iter()
-        .filter(|e| matches!(e.reason, cv_core::task::InboxReason::DecisionOwed))
-        .count();
-    let validated_who = is_validated_actor_id(&who).then_some(who);
-    (n > 0).then_some((validated_who, n))
-}
-
-/// `SessionStart` (`startup|resume`): pointers only — validated session selectors, relative ages,
-/// message counts, validated short hex commit SHAs, and owed decision counts. Session titles are
-/// untrusted/agent-authored prose and never enter hook context.
-fn hook_start(ev: &Event) -> Result<Option<Value>> {
-    let cwd = match ev.normalized_cwd() {
-        Some(c) => c,
-        None => cv_core::tools::classify::normalize_path(&std::env::current_dir()?, None),
-    };
-    let raw_cwd = ev.cwd.as_deref();
-    let mut rows: Vec<SessionRef> = cv_core::cataloged_sessions()
-        .into_iter()
-        .filter(|r| r.id != ev.session.id && !r.id.starts_with("agent-") && is_validated_session_id(&r.id))
-        .filter(|r| {
-            r.cwd.as_deref().is_some_and(|c| {
-                c == cwd || raw_cwd == Some(c) || cv_core::tools::classify::normalize_path(c, None) == cwd
-            })
-        })
-        .collect();
-    rows.sort_by_key(|r| std::cmp::Reverse(r.updated_at.or(r.created_at)));
-    rows.truncate(START_SESSIONS);
-    let owed = owed_decisions(HookName::Start);
-    if rows.is_empty() && owed.is_none() {
-        return Ok(None);
-    }
-    let mut lines = Vec::new();
-    // The hooks' read budget, split across the transcripts listed.
-    let tail = HOOK_READ_BYTES / rows.len().max(1) as u64;
-    if !rows.is_empty() {
-        lines.push(format!(
-            "cv: {} earlier session(s) in this directory (catalog as of the last `cv ls`; newest first). \
-             `cv show <id>` reads one.",
-            rows.len()
-        ));
-        for r in &rows {
-            let commit = last_commit_session(r, tail);
-            let id = selector(r.harness, &r.id);
-            lines.push(format!(
-                "- {id} · {} · {} msgs{commit}",
-                ago(r.updated_at.or(r.created_at)),
-                r.message_count.map_or("–".to_string(), |n| n.to_string())
-            ));
-        }
-    }
-    if let Some((who, owed)) = owed {
-        match who {
-            Some(who) => lines.push(format!(
-                "- {owed} decision(s) owed to {who}: `cv task inbox` lists them."
-            )),
-            None => lines.push(format!("- {owed} decision(s) owed: `cv task inbox` lists them.")),
-        }
-    }
-    Ok(Some(context("SessionStart", lines.join("\n"))))
-}
-
-/// `SubagentStart` / `SubagentStop`: record the lane run in `state.db` (`lane_runs` +
-/// `lane_endpoints`) and append one row to the lane ledger; no output, no model action.
-/// Under `--frozen` (`CV_FROZEN=1`), telemetry writes are skipped silently.
-fn hook_lane(ev: &Event, payload: &Value) -> Result<Option<Value>> {
-    let event = match ev.event.as_deref() {
-        Some("SubagentStart") => cv_core::lanes::LaneEventKind::Start,
-        Some("SubagentStop") => cv_core::lanes::LaneEventKind::Stop,
-        _ => return Ok(None),
-    };
-    let Some(agent) = ev.agent.as_ref() else {
-        return Ok(None);
-    };
-    if cv_core::env::frozen() {
-        return Ok(None);
-    }
-    let now = chrono::Utc::now();
-    let now_ms = now.timestamp_millis();
-    let last_text = agent
-        .last_message
-        .as_deref()
-        .and_then(|t| t.lines().find(|l| !l.trim().is_empty()))
-        .map(|l| cv_core::ir::truncate(l.trim(), 200));
-    let norm_cwd = ev.normalized_cwd();
-
-    let resolved_cwd = norm_cwd.or_else(|| ev.cwd.clone());
-    cv_core::lanes::append_lane_event(&LaneEvent {
-        ts: now,
-        event,
-        session_id: ev.session.id.clone(),
-        agent_id: agent.id.clone(),
-        agent_type: agent.kind.clone(),
-        transcript_path: ev.transcript().map(Path::to_path_buf),
-        agent_transcript_path: agent.transcript.clone(),
-        cwd: resolved_cwd.clone(),
-        last_text: last_text.clone(),
-    })
-    .context("appending to the lane ledger")?;
-
-    if let Ok(store) = cv_core::state::StateStore::default_store() {
-        let bare_id = cv_core::retired::bare(&agent.id).to_string();
-        let pid = payload.get("pid").and_then(Value::as_i64).or_else(|| {
-            #[cfg(unix)]
-            {
-                let ppid = unsafe { libc::getppid() } as i64;
-                (ppid > 1).then_some(ppid)
-            }
-            #[cfg(not(unix))]
-            {
-                None
-            }
-        });
-        let proc_start_time = pid.and_then(cv_core::state::tables::proc_start_time_of);
-        let derived_agent_tp = agent.transcript.clone().or_else(|| {
-            cv_core::harness::rootless(ev.harness).and_then(|a| a.agent_transcript(&ev.session, &bare_id, None))
-        });
-        let existing = store
-            .list_lane_runs_for_session(&ev.session.id)
-            .unwrap_or_default()
-            .into_iter()
-            .rev()
-            .find(|r| r.agent_id.as_deref() == Some(bare_id.as_str()));
-
-        let target_run_id = match event {
-            cv_core::lanes::LaneEventKind::Start => {
-                let active_existing = existing.filter(|r| r.exited_at.is_none());
-                let rid = active_existing
-                    .as_ref()
-                    .map(|r| r.run_id.clone())
-                    .unwrap_or_else(|| format!("{}:{bare_id}", ev.session.id));
-                let _ = store.record_lane_start(&cv_core::state::LaneRun {
-                    run_id: rid.clone(),
-                    session_id: ev.session.id.clone(),
-                    agent_id: Some(bare_id),
-                    agent_type: agent.kind.clone(),
-                    harness: Some(ev.harness.as_str().to_string()),
-                    pid,
-                    proc_start_time,
-                    boot_id: active_existing
-                        .and_then(|r| r.boot_id)
-                        .or_else(cv_core::lanes::current_boot_id),
-                    transcript_path: ev.transcript().map(|p| p.to_string_lossy().into_owned()),
-                    agent_transcript_path: derived_agent_tp.map(|p| p.to_string_lossy().into_owned()),
-                    cwd: resolved_cwd.as_ref().map(|p| p.to_string_lossy().into_owned()),
-                    started_at: now_ms,
-                    exited_at: None,
-                    exit_status: None,
-                    last_text: None,
-                });
-                rid
-            }
-            cv_core::lanes::LaneEventKind::Stop => {
-                let rid = existing
-                    .as_ref()
-                    .map(|r| r.run_id.clone())
-                    .unwrap_or_else(|| format!("{}:{bare_id}", ev.session.id));
-                let updated = store
-                    .record_lane_exit(&rid, now_ms, Some("hook_stop"), last_text.as_deref())
-                    .unwrap_or(false);
-                if !updated {
-                    let _ = store.record_lane_start(&cv_core::state::LaneRun {
-                        run_id: rid.clone(),
-                        session_id: ev.session.id.clone(),
-                        agent_id: Some(bare_id),
-                        agent_type: agent.kind.clone(),
-                        harness: Some(ev.harness.as_str().to_string()),
-                        pid,
-                        proc_start_time,
-                        boot_id: None,
-                        transcript_path: ev.transcript().map(|p| p.to_string_lossy().into_owned()),
-                        agent_transcript_path: derived_agent_tp.map(|p| p.to_string_lossy().into_owned()),
-                        cwd: resolved_cwd.as_ref().map(|p| p.to_string_lossy().into_owned()),
-                        started_at: now_ms,
-                        exited_at: Some(now_ms),
-                        exit_status: Some("stop_only".into()),
-                        last_text,
-                    });
-                }
-                rid
-            }
-        };
-        if let Ok(ep) = cv_core::env::var("CV_ENDPOINT") {
-            let ep = ep.trim();
-            if !ep.is_empty() {
-                let _ = store.bind_lane_endpoint(&target_run_id, ep);
-            }
-        }
-    }
-    Ok(None)
-}
 
 /// Extract cross-harness target agent identifiers addressed by a tool call (via `tools::classify`),
 /// covering Claude `SendMessage` (`to`), Codex `send_input` (`id`) and Code Mode `exec`, OpenCode /
@@ -2135,6 +1684,12 @@ fn hook_receipt(ev: &Event, payload: &Value) -> Result<Option<Value>> {
     }
     let field = |k: &str| payload.get(k).cloned().unwrap_or(Value::Null);
     let mut body = Map::new();
+    if let Some(baggage) = cv_core::env::var("CV_BAGGAGE")
+        .ok()
+        .and_then(|raw| cv_core::hooks::Baggage::parse(&raw))
+    {
+        body.insert("baggage".into(), json!(baggage));
+    }
     body.insert("v".into(), json!(1));
     body.insert("kind".into(), json!(kind));
     body.insert("session".into(), json!(ev.session.id));
@@ -2170,20 +1725,6 @@ fn hook_receipt(ev: &Event, payload: &Value) -> Result<Option<Value>> {
     }
 }
 
-/// `UserPromptSubmit`: one line when decisions are owed, else nothing at all.
-fn hook_decisions(_ev: &Event) -> Result<Option<Value>> {
-    let Some((who, n)) = owed_decisions(HookName::Decisions) else {
-        return Ok(None);
-    };
-    let owed_to = match who {
-        Some(who) => format!(" to {who}"),
-        None => String::new(),
-    };
-    Ok(Some(context(
-        "UserPromptSubmit",
-        format!("cv: {n} decision(s) owed{owed_to} — `cv task inbox` lists them; `cv task resolve <id> --accept-default` or `--choice <option>` answers one."),
-    )))
-}
 
 fn minutes_since_modified(path: &Path) -> Option<i64> {
     let m = std::fs::metadata(path).ok()?.modified().ok()?;
@@ -2508,110 +2049,6 @@ mod tests {
         assert_eq!(shell_quote(""), "''");
     }
 
-    fn claude_tail(p: &Path) -> Result<Option<(Option<String>, Option<u64>)>> {
-        cv_core::harness::rootless(Harness::Claude)
-            .unwrap()
-            .last_compact_boundary(p, HOOK_READ_BYTES)
-    }
-
-    #[test]
-    fn the_large_transcript_path_reads_the_newest_boundary_from_the_tail() {
-        let dir = std::env::temp_dir().join(format!("cv-hooks-{}", uuid::Uuid::now_v7()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let p = dir.join("t.jsonl");
-        let b = |trig: &str, pre: u64| {
-            json!({"type": "system", "subtype": "compact_boundary", "compactMetadata": {"trigger": trig, "preTokens": pre}})
-                .to_string()
-        };
-        // A user turn that merely quotes the word is not a boundary record.
-        let quote = json!({"type": "user", "message": {"content": "grep \"compact_boundary\" x"}}).to_string();
-        std::fs::write(&p, format!("{}\n{}\n{quote}\n", b("manual", 1), b("auto", 180_412))).unwrap();
-        assert_eq!(claude_tail(&p).unwrap(), Some((Some("auto".into()), Some(180_412))));
-        std::fs::write(&p, format!("{}\n{quote}\n", b("auto", 5))).unwrap();
-        assert_eq!(claude_tail(&p).unwrap(), Some((Some("auto".into()), Some(5))));
-        std::fs::write(&p, format!("{quote}\n")).unwrap();
-        assert_eq!(claude_tail(&p).unwrap(), None);
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn last_commit_reads_the_tail_and_nothing_else() {
-        let dir = std::env::temp_dir().join(format!("cv-hooks-{}", uuid::Uuid::now_v7()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let p = dir.join("t.jsonl");
-        std::fs::write(
-            &p,
-            concat!(
-                "{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"content\":\"[main 3e6a269] docs\\n 1 file\"}]}}\n",
-                "{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"content\":\"[p3-hooks 0abec0fd1] later\\n\"}]}}\n",
-                "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"see [1] and [2]\"}]}}\n",
-            ),
-        )
-        .unwrap();
-        assert_eq!(last_commit(&p, HOOK_READ_BYTES), " · last commit 0abec0f");
-        // None in the tail it read of a longer transcript: it says how far back it looked.
-        assert_eq!(last_commit(&p, 64), " · no commit in its last 64 B");
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn last_commit_guards_binary_sqlite_and_compressed_stores_from_raw_byte_tailing() {
-        let _world = crate::test_world("hooks-binary-tail-guard");
-        let dir = std::env::temp_dir().join(format!("cv-hooks-bin-{}", uuid::Uuid::now_v7()));
-        std::fs::create_dir_all(&dir).unwrap();
-
-        // 1. Multi-session Hermes SQLite DB: another session has a commit at the end of the DB,
-        // while our target session has its own commit (and a quiet session has none).
-        let db_path = dir.join("state.db");
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE sessions (id TEXT PRIMARY KEY, model TEXT, started_at REAL, ended_at REAL, message_count INTEGER, title TEXT);
-             CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, role TEXT, content TEXT, tool_call_id TEXT, tool_calls TEXT, tool_name TEXT, timestamp REAL);
-             INSERT INTO sessions VALUES ('target-sess', 'm', 100.0, 101.0, 2, 'target');
-             INSERT INTO sessions VALUES ('quiet-sess', 'm', 100.0, 101.0, 1, 'quiet');
-             INSERT INTO sessions VALUES ('other-sess', 'm', 102.0, 103.0, 1, 'other');
-             INSERT INTO messages (session_id, role, content, tool_call_id, tool_name, timestamp)
-                 VALUES ('target-sess', 'tool', '[main a1b2c3d4] target commit\n 1 file changed', 'tc1', 'bash', 100.5);
-             INSERT INTO messages (session_id, role, content, timestamp)
-                 VALUES ('quiet-sess', 'user', 'just reading', 100.5);
-             INSERT INTO messages (session_id, role, content, tool_call_id, tool_name, timestamp)
-                 VALUES ('other-sess', 'tool', '[other 99999999] wrong session commit\n', 'tc2', 'bash', 102.5);",
-        )
-        .unwrap();
-        drop(conn);
-
-        // Raw `tail_bytes` / `last_commit` refuses binary SQLite files (even with tiny byte cap).
-        assert!(tail_bytes(&db_path, 64).is_none());
-        assert_eq!(last_commit(&db_path, 64), "");
-
-        // Session-aware lookup extracts ONLY that session's commit via the adapter, never leaking
-        // `other-sess`'s commit or reporting DB file size as "no commit in its last ...".
-        let target_ref = SessionRef::new("target-sess", Harness::Hermes, &db_path);
-        assert_eq!(
-            last_commit_session(&target_ref, HOOK_READ_BYTES),
-            " · last commit a1b2c3d"
-        );
-        let quiet_ref = SessionRef::new("quiet-sess", Harness::Hermes, &db_path);
-        assert_eq!(last_commit_session(&quiet_ref, 64), "");
-
-        // 2. Compressed `.zst` store (zstd magic bytes + fake `[leak deadbeef] ` suffix):
-        // raw `tail_bytes` / `last_commit` never reads raw bytes from `.zst` or zstd-magic files.
-        let zst_path = dir.join("rollout.jsonl.zst");
-        let mut fake_zst = vec![0x28, 0xB5, 0x2F, 0xFD];
-        fake_zst.extend_from_slice(&vec![b'x'; 256]);
-        fake_zst.extend_from_slice(b"[leak deadbeef] raw tail must never match\n");
-        std::fs::write(&zst_path, &fake_zst).unwrap();
-        assert!(tail_bytes(&zst_path, HOOK_READ_BYTES).is_none());
-        assert_eq!(last_commit(&zst_path, 64), "");
-
-        let magic_only = dir.join("extensionless-compressed");
-        std::fs::write(&magic_only, &fake_zst).unwrap();
-        assert!(tail_bytes(&magic_only, HOOK_READ_BYTES).is_none());
-        assert_eq!(last_commit(&magic_only, 64), "");
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
     #[test]
     fn hook_receipt_honors_scoped_cv_receipt_strict_env_override() {
         let dir = std::env::temp_dir().join(format!("cv-hooks-strict-{}", uuid::Uuid::now_v7()));
@@ -2659,144 +2096,17 @@ mod tests {
     }
 
     #[test]
-    fn last_commit_session_finds_indexed_early_commit_over_300_msgs_and_giant_tool_results() {
-        let _world = crate::test_world("hooks-sqlite-indexed-commit-window");
-        let dir = std::env::temp_dir().join(format!("cv-hooks-idx-{}", uuid::Uuid::now_v7()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let db_path = dir.join("state.db");
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE sessions (id TEXT PRIMARY KEY, model TEXT, started_at REAL, ended_at REAL, message_count INTEGER, title TEXT);
-             CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, role TEXT, content TEXT, tool_call_id TEXT, tool_calls TEXT, tool_name TEXT, timestamp REAL);
-             INSERT INTO sessions VALUES ('early-commit-sess', 'm', 100.0, 500.0, 323, 'early');
-             INSERT INTO sessions VALUES ('tail-wins-sess', 'm', 100.0, 500.0, 325, 'tail');",
-        )
-        .unwrap();
-
-        let big_output = "x".repeat(64 * 1024); // 64 KiB * 6 = 384 KiB > HOOK_READ_BYTES (256 KiB)
-        let early_call = r#"[{"id":"tc_early","type":"function","function":{"name":"terminal","arguments":"{\"command\":\"cd /repo && git commit -m 'early fix'\"}"}}]"#;
-        let late_call = r#"[{"id":"tc_late","type":"function","function":{"name":"terminal","arguments":"{\"command\":\"git commit -m 'late fix'\"}"}}]"#;
-
-        // Populate `early-commit-sess`: commit at msg 1..2 (>315 msgs before EOF!), followed by
-        // 384 KiB of non-commit tool results and >300 conversational messages.
-        conn.execute(
-            "INSERT INTO messages (session_id, role, content, timestamp) VALUES ('early-commit-sess', 'user', 'start', 100.0)",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO messages (session_id, role, content, tool_calls, timestamp) VALUES ('early-commit-sess', 'assistant', '', ?1, 101.0)",
-            [early_call],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO messages (session_id, role, content, tool_call_id, tool_name, timestamp) VALUES ('early-commit-sess', 'tool', '[main 778899aa] early fix\n 1 file changed', 'tc_early', 'terminal', 102.0)",
-            [],
-        )
-        .unwrap();
-        for i in 0..6 {
-            let tcid = format!("tc_big_{i}");
-            let tc_json = format!(
-                r#"[{{"id":"{tcid}","type":"function","function":{{"name":"terminal","arguments":"{{\"command\":\"cargo test\"}}"}}}}]"#
-            );
-            conn.execute(
-                "INSERT INTO messages (session_id, role, content, tool_calls, timestamp) VALUES ('early-commit-sess', 'assistant', '', ?1, ?2)",
-                rusqlite::params![tc_json, 110.0 + i as f64],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO messages (session_id, role, content, tool_call_id, tool_name, timestamp) VALUES ('early-commit-sess', 'tool', ?1, ?2, 'terminal', ?3)",
-                rusqlite::params![&big_output, tcid, 110.5 + i as f64],
-            )
-            .unwrap();
-        }
-        for i in 0..308 {
-            let role = if i % 2 == 0 { "user" } else { "assistant" };
-            conn.execute(
-                "INSERT INTO messages (session_id, role, content, timestamp) VALUES ('early-commit-sess', ?1, ?2, ?3)",
-                rusqlite::params![role, format!("turn {i}"), 130.0 + i as f64],
-            )
-            .unwrap();
-        }
-
-        // Populate `tail-wins-sess`: early commit (11223344) + 384 KiB of tool results + >300 turns +
-        // unindexed late commit (deadbeef) near EOF!
-        conn.execute(
-            "INSERT INTO messages (session_id, role, content, timestamp) VALUES ('tail-wins-sess', 'user', 'start', 100.0)",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO messages (session_id, role, content, tool_calls, timestamp) VALUES ('tail-wins-sess', 'assistant', '', ?1, 101.0)",
-            [early_call],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO messages (session_id, role, content, tool_call_id, tool_name, timestamp) VALUES ('tail-wins-sess', 'tool', '[main 11223344] early commit\n', 'tc_early', 'terminal', 102.0)",
-            [],
-        )
-        .unwrap();
-        for i in 0..308 {
-            let role = if i % 2 == 0 { "user" } else { "assistant" };
-            conn.execute(
-                "INSERT INTO messages (session_id, role, content, timestamp) VALUES ('tail-wins-sess', ?1, ?2, ?3)",
-                rusqlite::params![role, format!("turn {i}"), 130.0 + i as f64],
-            )
-            .unwrap();
-        }
-        for i in 0..6 {
-            let tcid = format!("tc_tail_big_{i}");
-            let tc_json = format!(
-                r#"[{{"id":"{tcid}","type":"function","function":{{"name":"terminal","arguments":"{{\"command\":\"cargo test\"}}"}}}}]"#
-            );
-            conn.execute(
-                "INSERT INTO messages (session_id, role, content, tool_calls, timestamp) VALUES ('tail-wins-sess', 'assistant', '', ?1, ?2)",
-                rusqlite::params![tc_json, 450.0 + i as f64],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO messages (session_id, role, content, tool_call_id, tool_name, timestamp) VALUES ('tail-wins-sess', 'tool', ?1, ?2, 'terminal', ?3)",
-                rusqlite::params![&big_output, tcid, 450.5 + i as f64],
-            )
-            .unwrap();
-        }
-        // Index `tail-wins-sess` BEFORE the final commit is appended so `deadbeef` is unindexed!
-        let mut tail_ref = SessionRef::new("tail-wins-sess", Harness::Hermes, &db_path);
-        tail_ref.message_count = Some(323);
-        cv_core::events::ingest_ref(&tail_ref).unwrap();
-
-        conn.execute(
-            "INSERT INTO messages (session_id, role, content, tool_calls, timestamp) VALUES ('tail-wins-sess', 'assistant', '', ?1, 490.0)",
-            [late_call],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO messages (session_id, role, content, tool_call_id, tool_name, timestamp) VALUES ('tail-wins-sess', 'tool', '[main deadbeef] late fix\n 2 files changed', 'tc_late', 'terminal', 491.0)",
-            [],
-        )
-        .unwrap();
-        drop(conn);
-
-        let mut early_ref = SessionRef::new("early-commit-sess", Harness::Hermes, &db_path);
-        early_ref.message_count = Some(323);
-        cv_core::events::ingest_ref(&early_ref).unwrap();
-        assert_eq!(
-            last_commit_session(&early_ref, HOOK_READ_BYTES),
-            " · last commit 778899a"
-        );
-
-        tail_ref.message_count = Some(325);
-        assert_eq!(
-            last_commit_session(&tail_ref, HOOK_READ_BYTES),
-            " · last commit deadbee"
-        );
-
-        std::fs::remove_dir_all(&dir).ok();
+    fn skill_fits_in_agent_context() {
+        // #tooth: front matter and blank lines count too.
+        assert!(SKILL.lines().count() < 80);
     }
 
     #[test]
+    #[cfg(unix)]
     fn hook_start_emits_zero_bytes_of_catalog_session_title() {
         let world = crate::test_world("hook-start-no-title-injection");
+        let store = cv_core::state::StateStore::default_store().unwrap();
+        let mut rx = cv_core::state::observations::HookReceiver::bind(store).unwrap();
         let workdir = world.base.join("proj");
         std::fs::create_dir_all(&workdir).unwrap();
         let cwd_str = workdir.to_str().unwrap();
@@ -2814,30 +2124,6 @@ mod tests {
                     "message": {"role": "user", "content": title_injection}
                 }),
                 serde_json::json!({
-                    "type": "assistant",
-                    "uuid": "a1",
-                    "parentUuid": "u1",
-                    "sessionId": "prevsess12345678",
-                    "timestamp": "2026-10-01T12:00:01Z",
-                    "cwd": cwd_str,
-                    "message": {
-                        "role": "assistant",
-                        "content": [{"type": "tool_use", "id": "tu1", "name": "Bash", "input": {"command": "git commit"}}]
-                    }
-                }),
-                serde_json::json!({
-                    "type": "user",
-                    "uuid": "u2",
-                    "parentUuid": "a1",
-                    "sessionId": "prevsess12345678",
-                    "timestamp": "2026-10-01T12:00:02Z",
-                    "cwd": cwd_str,
-                    "message": {
-                        "role": "user",
-                        "content": [{"type": "tool_result", "tool_use_id": "tu1", "content": "[main a1b2c3d4] ship fix\n"}]
-                    }
-                }),
-                serde_json::json!({
                     "type": "ai-title",
                     "sessionId": "prevsess12345678",
                     "aiTitle": title_injection
@@ -2852,24 +2138,21 @@ mod tests {
             .expect("cataloged session");
         assert_eq!(row.title.as_deref(), Some(title_injection));
 
-        let ev = Event {
-            harness: Harness::Claude,
-            event: Some("SessionStart".into()),
-            session: SessionRef::new("currsess", Harness::Claude, world.base.join("curr.jsonl")),
-            cwd: Some(workdir),
-            agent: None,
-            edits: Vec::new(),
-        };
-        let out = hook_start(&ev).unwrap().expect("must emit pointer context");
-        let ctx = out["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
-        assert!(ctx.contains("- prevsess · "), "{ctx}");
-        assert!(ctx.contains(" · last commit a1b2c3d"), "{ctx}");
-        assert!(ctx.contains("`cv show <id>`"), "{ctx}");
-        for needle in ["IMPERATIVE_PAYLOAD", "rm -rf", "exfiltrate", title_injection] {
-            assert!(
-                !ctx.contains(needle),
-                "hook_start leaked title substring {needle:?}:\n{ctx}"
-            );
-        }
+        let payload = serde_json::json!({
+            "session_id": "currsess",
+            "cwd": cwd_str,
+            "hook_event_name": "SessionStart",
+            "source": "startup"
+        });
+        assert_eq!(
+            cv_core::state::observations::observe("start", Harness::Claude, &payload),
+            None
+        );
+        rx.read_one().unwrap();
+        assert_eq!(
+            cv_core::state::observations::observe("start", Harness::Claude, &payload),
+            None
+        );
+        rx.read_one().unwrap();
     }
 }

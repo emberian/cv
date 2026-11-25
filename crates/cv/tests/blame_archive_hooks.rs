@@ -155,8 +155,11 @@ fn state_store_receipt_chain_handles_over_64kib_multibyte_tamper_detection_and_s
 }
 
 #[test]
+#[cfg(unix)]
 fn hook_lane_records_lane_run_pid_endpoint_and_exit_in_state_store() {
-    let w = World::new("hook-lane-statestore");
+    let w = World::in_process("hook-lane-statestore", cv_core::env::Env::enter_isolated);
+    let mut rx =
+        cv_core::state::observations::HookReceiver::bind(cv_core::state::StateStore::at_dir(&w.cv_home)).unwrap();
     let start_payload = json!({
         "session_id": "parent-sess-1",
         "transcript_path": w.transcript("parent-sess-1"),
@@ -172,6 +175,7 @@ fn hook_lane_records_lane_run_pid_endpoint_and_exit_in_state_store() {
     );
     assert!(ok && out.trim().is_empty(), "err: {err}");
 
+    rx.read_one().unwrap();
     let store = StateStore::at_dir(&w.cv_home);
     let runs = store.list_lane_runs_for_session("parent-sess-1").unwrap();
     assert_eq!(runs.len(), 1, "SubagentStart coalesces into a single LaneRun: {runs:?}");
@@ -213,6 +217,7 @@ fn hook_lane_records_lane_run_pid_endpoint_and_exit_in_state_store() {
     );
     assert!(ok && out.trim().is_empty(), "err: {err}");
 
+    rx.read_one().unwrap();
     let runs_after = store.list_lane_runs_for_session("parent-sess-1").unwrap();
     assert_eq!(
         runs_after.len(),
@@ -368,15 +373,9 @@ fn hooks_show_reports_seven_hooks_codex_post_tool_use_start_over_2000_msgs_and_c
         Some(&start_in.to_string()),
     );
     assert!(ok);
-    let start_json: Value = serde_json::from_str(start_out.trim()).unwrap();
-    let start_ctx = start_json["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
-    assert!(
-        start_ctx.contains("last commit deadbee"),
-        "commit past 2,000 messages must be surfaced:\n{start_ctx}"
-    );
-    assert!(
-        !start_ctx.contains("cv pack"),
-        "hook_start must never inject `cv pack` prompt bloat:\n{start_ctx}"
+    assert_eq!(
+        start_out, "",
+        "historical session titles and commit subjects must stay out of hook output"
     );
 
     // 4) Cross-harness `hook retired`: retiring `old-lane` blocks both:

@@ -8,6 +8,55 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
+/// Four positional identifiers in `CV_BAGGAGE`, separated by commas. A tuple
+/// is accepted as a whole so a truncated value cannot attribute an unrelated run.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Baggage {
+    pub root_task_id: String,
+    pub parent_session_id: String,
+    pub spawn_tool_use_id: String,
+    pub branch_id: String,
+}
+
+pub fn valid_id(s: &str) -> bool {
+    s.len() <= 128
+        && s.as_bytes().first().is_some_and(u8::is_ascii_alphanumeric)
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+impl Baggage {
+    pub fn parse(raw: &str) -> Option<Self> {
+        if raw.len() > 128 {
+            return None;
+        }
+        let mut ids = raw.split(',');
+        let mut next = || ids.next().filter(|id| valid_id(id)).map(str::to_owned);
+        let tuple = Self {
+            root_task_id: next()?,
+            parent_session_id: next()?,
+            spawn_tool_use_id: next()?,
+            branch_id: next()?,
+        };
+        ids.next().is_none().then_some(tuple)
+    }
+
+    pub fn for_session(harness: &str, session: &str) -> Option<Self> {
+        #[cfg(feature = "sqlite")]
+        {
+            crate::state::StateStore::default_store()
+                .ok()?
+                .session_baggage(harness, session)
+                .ok()?
+        }
+        #[cfg(not(feature = "sqlite"))]
+        {
+            let _ = (harness, session);
+            None
+        }
+    }
+}
+
 /// One hook call, as the harness's adapter decoded it.
 #[derive(Debug, Clone)]
 pub struct Event {
@@ -302,5 +351,29 @@ mod tests {
         touched.parent_id = Some("parent".into());
         touched.harness = "codex".into();
         assert!(!exempts(Some("self"), &touched));
+    }
+}
+
+#[cfg(test)]
+mod baggage_tests {
+    use super::Baggage;
+
+    /// #tooth: accept an exact-budget tuple, reject truncation and metacharacters.
+    #[test]
+    fn hooks_baggage_validates_all_four_fields_and_the_wire_budget() {
+        let full = format!("root,parent,spawn,{}", "x".repeat(110));
+        assert_eq!(full.len(), 128);
+        assert_eq!(Baggage::parse(&full).unwrap().parent_session_id, "parent");
+        for bad in [
+            full + "x",
+            "a,b,c".into(),
+            "a,b,c,d,e".into(),
+            "a,,c,d".into(),
+            "a,b,c,é".into(),
+            "a,b,c,x;y".into(),
+            "a,b,c,-flag".into(),
+        ] {
+            assert!(Baggage::parse(&bad).is_none(), "{bad}");
+        }
     }
 }

@@ -1084,6 +1084,8 @@ impl SubagentEnd {
 /// One sub-agent, summarized.
 #[derive(Debug, Clone, Serialize)]
 pub struct Lane {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub baggage: Option<crate::hooks::Baggage>,
     /// The bare `agentId` (the `agent-` prefix stripped) — what `SendMessage` and the journal use.
     pub agent_id: String,
     /// The transcript's session id (`agent-<agent_id>`), as `cv show` resolves it.
@@ -1607,6 +1609,7 @@ fn pass(r: &SessionRef) -> Result<Pass> {
 /// Per-agent `state.db` facts resolved in one batch per `lanes_of` call.
 #[derive(Default, Clone)]
 struct AgentStateFacts {
+    baggage: Option<crate::hooks::Baggage>,
     /// Explicit endpoint bound via `StateStore::bind_lane_endpoint` (`lane_endpoints`).
     bound_endpoint: Option<String>,
     /// Clean stop timestamp recorded in `lane_runs` (`hook_stop`, `stopped`, `subagent_stop`, …).
@@ -1698,10 +1701,10 @@ fn load_state_facts_for_forest(
         path_to_aid.insert(sub.session.path.to_string_lossy().into_owned(), aid);
     }
 
-    let Ok((runs, endpoints_by_run)) = reader.read_snapshot(|conn, _reads| {
+    let Ok((runs, endpoints_by_run, baggage_by_run)) = reader.read_snapshot(|conn, _reads| {
         let ver: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap_or(0);
         if ver == 0 {
-            return Ok((Vec::new(), HashMap::new()));
+            return Ok((Vec::new(), HashMap::new(), HashMap::new()));
         }
         let mut by_run_id: HashMap<String, (i64, crate::state::LaneRun)> = HashMap::new();
         let map_run = |r: &rusqlite::Row<'_>| -> rusqlite::Result<(i64, crate::state::LaneRun)> {
@@ -1784,7 +1787,17 @@ fn load_state_facts_for_forest(
                 }
             }
         }
-        Ok((all_runs, ep_map))
+        let mut baggage = HashMap::new();
+        if ver >= 4 {
+            let mut stmt = conn.prepare("SELECT baggage FROM lane_runs WHERE run_id=?1")?;
+            for run in &all_runs {
+                let raw: Option<String> = stmt.query_row([&run.run_id], |r| r.get(0))?;
+                if let Some(tuple) = raw.as_deref().and_then(crate::hooks::Baggage::parse) {
+                    baggage.insert(run.run_id.clone(), tuple);
+                }
+            }
+        }
+        Ok((all_runs, ep_map, baggage))
     }) else {
         return out;
     };
@@ -1837,6 +1850,7 @@ fn load_state_facts_for_forest(
             .rev()
             .find(|r| r.exit_status.as_deref() != Some("stop_only"))
         {
+            facts.baggage = baggage_by_run.get(&latest.run_id).cloned();
             if latest.exited_at.is_none() && latest.pid.is_some() {
                 if !is_run_process_alive(latest) {
                     facts.process_exited = true;
@@ -2015,6 +2029,9 @@ fn lane_of(
     let lineage = (!lineage.is_empty()).then_some(lineage);
 
     Ok(Lane {
+        baggage: state_facts
+            .and_then(|s| s.baggage.clone())
+            .or_else(|| crate::hooks::Baggage::for_session(sub.session.harness.as_str(), &sub.session.id)),
         agent_id,
         session_id: sub.session.id.clone(),
         path: sub.session.path.clone(),
@@ -2394,6 +2411,7 @@ mod tests {
         use crate::task::{new_event, TaskEventKind, TaskReducer};
 
         let make_lane = |status: LaneStatus, source: StatusSource, last_text: &str, open_tool_calls: usize| Lane {
+            baggage: None,
             agent_id: "a1".into(),
             session_id: "agent-a1".into(),
             path: PathBuf::new(),
@@ -2563,6 +2581,7 @@ mod tests {
             .collect();
         let model = TaskReducer::reduce(&events).unwrap();
         let lane = |endpoint: Option<&str>, source: Option<EndpointSource>, description: Option<&str>| Lane {
+            baggage: None,
             agent_id: "agent".into(),
             session_id: "session".into(),
             path: PathBuf::new(),

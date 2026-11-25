@@ -6,6 +6,8 @@
 //! [`crate::source::VERSION`].
 
 pub mod hub;
+#[cfg(unix)]
+pub mod observations;
 pub mod recorder;
 pub mod schema;
 pub mod tables;

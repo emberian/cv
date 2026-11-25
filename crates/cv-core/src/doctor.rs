@@ -152,10 +152,26 @@ impl ActiveWindowReport {
     }
 }
 
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct WhisperUptake {
+    pub emitted: u64,
+    pub followed_up: u64,
+    pub unfollowed: u64,
+}
+
+#[cfg(feature = "sqlite")]
+struct Window {
+    whisper: crate::state::tables::Whisper,
+    turns: u8,
+    last_turn: Option<String>,
+    changed: bool,
+}
+
 /// A context-attribution report. Accumulate sessions with [`Report::session`], then render
 /// (CLI) or serialize ([`Report::to_json`], for `--json` and the MCP tool).
 #[derive(Default, Debug, Clone, Serialize)]
 pub struct Report {
+    pub whisper_uptake: BTreeMap<String, WhisperUptake>,
     /// Explicit coverage evidence only; absent sessions have not been assessed.
     pub read_coverage: Vec<crate::coverage::SessionCoverage>,
     pub sessions: u64,
@@ -205,6 +221,8 @@ impl Report {
         SessionPass {
             rep: self,
             coverage: None,
+            #[cfg(feature = "sqlite")]
+            windows: Vec::new(),
             harness,
             resolver: crate::lazy::Resolver::new(source),
             names: HashMap::new(),
@@ -273,6 +291,7 @@ impl Report {
         });
         json!({
             "read_coverage": self.read_coverage,
+            "whisper_uptake": self.whisper_uptake,
             "sessions": self.sessions,
             "messages": self.messages,
             "compactions": self.compactions,
@@ -289,6 +308,26 @@ impl Report {
             "history": history,
         })
     }
+}
+
+#[cfg(feature = "sqlite")]
+fn ran_pointer(command: &str, pointer: &str) -> bool {
+    let mut actual = command.split_ascii_whitespace();
+    let mut expected = pointer.split_ascii_whitespace();
+    if expected.next() != Some("cv")
+        || actual
+            .next()
+            .and_then(|p| std::path::Path::new(p).file_name())
+            .and_then(|s| s.to_str())
+            != Some("cv")
+    {
+        return false;
+    }
+    let expected: Vec<_> = expected.collect();
+    matches!(
+        expected.as_slice(),
+        ["show" | "cat" | "lanes", ..] | ["task", "inbox" | "events", ..]
+    ) && expected.into_iter().all(|part| actual.next() == Some(part))
 }
 
 fn has_extra_bool(m: &Message, key: &str) -> bool {
@@ -363,6 +402,8 @@ impl MsgFact {
 /// One session streaming into a [`Report`] (see [`Report::session`]): content attribution, the
 /// usage-derived context sizing and the compaction tally, folded per message.
 pub struct SessionPass<'a> {
+    #[cfg(feature = "sqlite")]
+    windows: Vec<Window>,
     rep: &'a mut Report,
     coverage: Option<crate::coverage::SessionCoverage>,
     harness: Option<crate::Harness>,
@@ -382,10 +423,102 @@ pub struct SessionPass<'a> {
 }
 
 impl SessionPass<'_> {
+    /// Load just this recipient's deliveries before streaming its transcript.
+    #[cfg(feature = "sqlite")]
+    pub fn track_whispers(&mut self, session: &crate::SessionRef) -> anyhow::Result<()> {
+        self.windows = crate::state::StateStore::default_store()?
+            .session_whispers(session.harness.as_str(), &session.id)?
+            .into_iter()
+            .map(|whisper| Window {
+                whisper,
+                turns: 0,
+                last_turn: None,
+                changed: false,
+            })
+            .collect();
+        Ok(())
+    }
+
+    #[cfg(feature = "sqlite")]
+    fn observe_whispers(&mut self, m: &Message) -> anyhow::Result<()> {
+        if self.windows.is_empty()
+            || m.role != Role::Assistant
+            || !m.is_model_visible()
+            || !m.content.iter().any(|b| matches!(b, Block::ToolUse { .. }))
+        {
+            return Ok(());
+        }
+        let Some(ts) = m.timestamp.map(|ts| ts.timestamp_millis()) else {
+            return Ok(());
+        };
+        let turn = msg_usage_key(self.harness, m);
+        let mut commands = None;
+        for window in &mut self.windows {
+            let w = &mut window.whisper;
+            if w.followed_up_at.is_some() || w.unfollowed || ts <= w.emitted_at {
+                continue;
+            }
+            if turn.is_none() || window.last_turn != turn {
+                if window.turns == 5 {
+                    w.unfollowed = true;
+                    window.changed = true;
+                    continue;
+                }
+                window.turns += 1;
+                window.last_turn.clone_from(&turn);
+            }
+            if commands.is_none() {
+                use crate::tools::classify::{visit_tool_ops, ClassifyOpts, ToolOp};
+                let mut found = Vec::new();
+                for b in &m.content {
+                    if let Block::ToolUse { name, input, .. } = b {
+                        input.with_view(|view| {
+                            visit_tool_ops(
+                                self.harness,
+                                name,
+                                view,
+                                ClassifyOpts {
+                                    command_limit: Some(4096),
+                                    ..ClassifyOpts::EVENTS
+                                },
+                                |op| {
+                                    if let ToolOp::Command { cmd: Some(cmd), .. } = op.op {
+                                        found.push(cmd.into_owned())
+                                    }
+                                },
+                            )
+                        })?;
+                    }
+                }
+                commands = Some(found);
+            }
+            if commands.iter().flatten().any(|cmd| ran_pointer(cmd, &w.command)) {
+                w.followed_up_at = Some(ts);
+                window.changed = true;
+            }
+        }
+        Ok(())
+    }
+
     /// Fold the session's compactions, active-window slice, and overhead estimates into the report.
     pub fn finish(mut self) -> anyhow::Result<()> {
         if let Some(error) = self.latch.take("doctor source read") {
             return Err(error);
+        }
+        #[cfg(feature = "sqlite")]
+        for mut window in self.windows {
+            let w = &mut window.whisper;
+            if window.turns == 5 && w.followed_up_at.is_none() && !w.unfollowed {
+                w.unfollowed = true;
+                window.changed = true;
+            }
+            if window.changed && !crate::env::frozen() {
+                crate::state::StateStore::default_store()?.finish_whisper_window(w)?;
+            }
+            let counts = self.rep.whisper_uptake.entry(w.kind.clone()).or_default();
+            counts.emitted += 1;
+            counts.followed_up += u64::from(w.followed_up_at.is_some());
+            counts.unfollowed += u64::from(w.unfollowed);
         }
         let rep = &mut *self.rep;
         if let Some(coverage) = self.coverage.take() {
@@ -413,6 +546,8 @@ impl SessionPass<'_> {
     }
 
     fn observe(&mut self, m: &Message) -> anyhow::Result<()> {
+        #[cfg(feature = "sqlite")]
+        self.observe_whispers(m)?;
         let rep = &mut *self.rep;
         rep.messages += 1;
         let prompt_tokens = m.usage.as_ref().map(crate::ir::Usage::prompt_tokens).filter(|&t| t > 0);
@@ -1240,6 +1375,25 @@ pub fn collect_store_health() -> StoreHealthReport {
 
 #[cfg(test)]
 mod tests {
+    // #tooth: only an invocation of the offered command earns credit.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn doctor_recognizes_each_whisper_command() {
+        for command in [
+            "cv show claude:abc --pre-compaction 1",
+            "cv cat abc tu9",
+            "cv lanes abc",
+            "cv task inbox",
+            "cv task events --since event7",
+        ] {
+            assert!(super::ran_pointer(command, command));
+            assert!(super::ran_pointer(&format!("/usr/local/bin/{command} --json"), command));
+            assert!(!super::ran_pointer(&format!("echo '{command}'"), command));
+        }
+        assert!(!super::ran_pointer("cv show claude:xyz", "cv show claude:abc"));
+        assert!(!super::ran_pointer("cv task inbox-other", "cv task inbox"));
+    }
+
     use super::*;
 
     #[test]

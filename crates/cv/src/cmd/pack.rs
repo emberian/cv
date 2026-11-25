@@ -1383,6 +1383,7 @@ mod tests {
     fn event_facts_keeps_all_distinct_commands_whole_without_magic_caps() {
         let rows: Vec<cv_core::events::EventRow> = (0..10)
             .map(|i| cv_core::events::EventRow {
+                baggage: None,
                 harness: "claude".into(),
                 session_id: "s".into(),
                 msg_idx: i,

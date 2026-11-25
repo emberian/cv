@@ -694,8 +694,11 @@ fn frozen_lanes_resolves_state_tasks_with_zero_filesystem_mutations() {
 }
 
 #[test]
+#[cfg(unix)]
 fn hook_lane_exit_coalesces_with_append_stop_and_child_session_runs_bind() {
-    let w = World::new("lanes-hook-coalesce-and-child-sid");
+    let w = World::in_process("lanes-hook-coalesce-and-child-sid", cv_core::env::Env::enter_isolated);
+    let mut rx =
+        cv_core::state::observations::HookReceiver::bind(cv_core::state::StateStore::at_dir(&w.cv_home)).unwrap();
     let sid = "coalsess01";
     let now = now_rfc3339();
 
@@ -776,6 +779,7 @@ fn hook_lane_exit_coalesces_with_append_stop_and_child_session_runs_bind() {
         assert!(ok, "cv hook lane exited {code}: {out} {err}");
     }
 
+    rx.read_one().unwrap();
     let runs_for_parent = store.list_lane_runs_for_session(sid).unwrap();
     let cleanhook_runs: Vec<_> = runs_for_parent
         .iter()

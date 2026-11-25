@@ -604,6 +604,15 @@ impl Provenance {
 /// Read current events, refreshing stale rows on use. Frozen commands stream stale sources
 /// directly so the answer stays current without publishing either events or certified counts.
 pub fn read_ref(r: &crate::SessionRef, kind: Option<&str>) -> Result<Vec<EventRow>> {
+    let mut rows = read_ref_rows(r, kind)?;
+    let baggage = crate::hooks::Baggage::for_session(r.harness.as_str(), &r.id);
+    for row in &mut rows {
+        row.baggage.clone_from(&baggage)
+    }
+    Ok(rows)
+}
+
+fn read_ref_rows(r: &crate::SessionRef, kind: Option<&str>) -> Result<Vec<EventRow>> {
     if needs_ingest(r) {
         if crate::env::frozen() {
             let adapter = crate::harness::for_harness(r.harness)
@@ -617,6 +626,7 @@ pub fn read_ref(r: &crate::SessionRef, kind: Option<&str>) -> Result<Vec<EventRo
                 .into_iter()
                 .filter(|e| kind.is_none_or(|k| e.kind == k))
                 .map(|e| EventRow {
+                    baggage: None,
                     harness: r.harness.as_str().into(),
                     session_id: r.id.clone(),
                     msg_idx: e.msg_idx as i64,
@@ -639,6 +649,7 @@ pub fn read_ref(r: &crate::SessionRef, kind: Option<&str>) -> Result<Vec<EventRo
 /// One persisted event row, as read back from the catalog.
 #[derive(Debug, Clone)]
 pub struct EventRow {
+    pub baggage: Option<crate::hooks::Baggage>,
     pub harness: String,
     pub session_id: String,
     pub msg_idx: i64,
@@ -1200,6 +1211,7 @@ mod db {
         )?;
         let rows = stmt.query_map(params![harness, session_id, kind], |row| {
             Ok(EventRow {
+                baggage: None,
                 harness: row.get(0)?,
                 session_id: row.get(1)?,
                 msg_idx: row.get(2)?,

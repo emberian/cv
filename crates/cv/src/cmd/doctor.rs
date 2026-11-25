@@ -86,6 +86,9 @@ pub(crate) fn cmd_doctor(id: Option<String>, harness: Option<String>, recent: us
             ),
         };
         let mut pass = rep.session_with_harness(Some(rr.path.clone()), Some(rr.harness));
+        if let Err(err) = pass.track_whispers(&rr) {
+            eprintln!("cv doctor: whisper history unavailable: {err}");
+        }
         let read = cv_core::stream::stream_counted(
             adapter.as_ref(),
             &rr,

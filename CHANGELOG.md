@@ -2,7 +2,11 @@
 
 ## Unreleased
 
+- Observational hooks use bounded input and a nonblocking recorder queue. Quiet starts emit zero bytes, and actionable pointers are deduplicated per condition revision.
+- Doctor reports five-tool-turn follow-up counts by whisper kind.
+- Lane and event JSON expose validated causal identifiers supplied through `CV_BAGGAGE`.
 - Harden Markdown fences, neutralize forged role and section headers, preserve non-human seed provenance across distills and ports, and omit titles from SessionStart hooks.
+
 - CLI, API, and reader overviews collect initial and recent requests, worker replies, referenced files, and commands with links to their messages.
 - Pack accepts explicit sessions or transcript paths, with bounded overviews or task-focused excerpts, without searching other conversations or requiring an index.
 - Show recorded context usage, cache tokens, and compaction boundaries with `show --kind context` and the shared read API.
