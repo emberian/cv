@@ -23,6 +23,7 @@
 - Pack includes current findings, decisions, and open obligations, separates observed edits from reads, quarantines test-runner changes, and supports blind checkout review.
 - Related writers receive advisory edit pointers. Tool receipts capture file versions for stale-read diagnostics in hooks, adoption, and splice.
 - Markdown and distill treat a lone carriage return as a line break, escape HTML block openers and thinking headers, and close per-entry open fences.
+- Port to OpenCode names the provider from the model family, so ported sessions resume without `--model`.
 
 - CLI, API, and reader overviews collect initial and recent requests, worker replies, referenced files, and commands with links to their messages.
 - Pack accepts explicit sessions or transcript paths, with bounded overviews or task-focused excerpts, without searching other conversations or requiring an index.

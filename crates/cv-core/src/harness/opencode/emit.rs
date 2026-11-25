@@ -230,7 +230,7 @@ fn write_database_with_verify(
     let model_json = session
         .model
         .as_deref()
-        .map(|m| json!({ "id": m, "providerID": "clustervision" }).to_string());
+        .map(|m| json!({ "id": m, "providerID": provider_id(session, m) }).to_string());
     let mut session_insert = tx.prepare(
         "INSERT INTO session \
          (id, project_id, slug, directory, title, version, model, time_created, time_updated) \
@@ -562,8 +562,58 @@ mod tests {
     }
 }
 
+/// The `providerID` OpenCode pairs with a session's model. A session read from OpenCode keeps
+/// its recorded provider; otherwise the provider is inferred from the model's family, because
+/// OpenCode refuses to resume a session whose provider it has no credentials for. Unknown
+/// families fall back to `clustervision`.
+#[cfg(feature = "sqlite")]
+fn provider_id<'a>(session: &'a Session, model: &str) -> &'a str {
+    session
+        .harness_extra(crate::harness::Harness::OpenCode)
+        .and_then(|b| b.get("model"))
+        .and_then(|v| v.get("providerID"))
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| provider_for_model(model))
+}
+
+/// The OpenCode provider for a model id, by family prefix; `clustervision` when unknown.
+#[cfg(feature = "sqlite")]
+fn provider_for_model(model: &str) -> &'static str {
+    let m = model.rsplit('/').next().unwrap_or(model).to_ascii_lowercase();
+    let has = |prefixes: &[&str]| prefixes.iter().any(|p| m.starts_with(p));
+    if has(&["claude-"]) {
+        "anthropic"
+    } else if has(&["gpt-", "o1", "o3", "o4", "codex"]) {
+        "openai"
+    } else if has(&["gemini-"]) {
+        "google"
+    } else if has(&["grok-"]) {
+        "xai"
+    } else {
+        "clustervision"
+    }
+}
+
 #[cfg(feature = "sqlite")]
 mod v2;
 
 #[cfg(all(test, feature = "sqlite"))]
 mod complete_tests;
+
+#[cfg(all(test, feature = "sqlite"))]
+mod provider_tests {
+    use super::provider_for_model;
+
+    #[test]
+    fn provider_is_inferred_from_the_model_family() {
+        assert_eq!(provider_for_model("claude-sonnet-4-5"), "anthropic");
+        assert_eq!(provider_for_model("gpt-5.1-codex"), "openai");
+        assert_eq!(provider_for_model("o3-mini"), "openai");
+        assert_eq!(provider_for_model("o4-mini"), "openai");
+        assert_eq!(provider_for_model("codex-mini-latest"), "openai");
+        assert_eq!(provider_for_model("gemini-2.5-pro"), "google");
+        assert_eq!(provider_for_model("grok-4"), "xai");
+        assert_eq!(provider_for_model("anthropic/claude-sonnet-4-5"), "anthropic");
+        assert_eq!(provider_for_model("qwen3-coder"), "clustervision");
+    }
+}

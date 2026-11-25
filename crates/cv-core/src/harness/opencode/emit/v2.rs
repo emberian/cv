@@ -98,11 +98,7 @@ pub(super) fn write_database_with_verify(
         params![project, cwd, created],
     )?;
     let bag = session.harness_extra(Harness::OpenCode);
-    let provider = bag
-        .and_then(|b| b.get("model"))
-        .and_then(|v| v.get("providerID"))
-        .and_then(Value::as_str)
-        .unwrap_or("clustervision");
+    let provider = super::provider_id(session, session.model.as_deref().unwrap_or_default());
     let model = session
         .model
         .as_ref()
