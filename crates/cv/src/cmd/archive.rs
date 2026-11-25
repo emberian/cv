@@ -169,6 +169,24 @@ impl Archive {
                     continue;
                 };
                 let native = native_file(r, adapter.as_ref(), &mut probe);
+                // A native file's delta is measured before any parse: an unchanged chain (a touch,
+                // a companion's stat) costs two bounded checkpoint reads, never a re-read.
+                let delta = match &native {
+                    Some(native) => match native_delta(native, prev) {
+                        Ok(Some(delta)) => Some(delta),
+                        Ok(None) => {
+                            summary.skipped += 1;
+                            continue;
+                        }
+                        Err(e) => {
+                            summary
+                                .failed
+                                .push((format!("{}:{}", r.harness, r.id), format!("{e:#}")));
+                            continue;
+                        }
+                    },
+                    None => None,
+                };
 
                 let rendered = (|| -> Result<Rendered> {
                     let pass = cv_core::stream::Pass {
@@ -223,8 +241,8 @@ impl Archive {
                     }
                 };
 
-                let content = match (payload, native) {
-                    (Some(payload), _) => {
+                let content = match (payload, native, delta) {
+                    (Some(payload), _, _) => {
                         if prev.is_some_and(|p| p.content_blake3 == cv_core::blake3_hex(&payload)) {
                             if let Some(base) = baseline {
                                 summary
@@ -236,38 +254,30 @@ impl Archive {
                         }
                         Content::Projection(payload)
                     }
-                    (None, Some((path, file_name))) => match native_delta(&path, prev) {
-                        Ok(Some(Delta {
-                            from,
-                            to,
-                            prior,
-                            checkpoint,
-                        })) => Content::Native {
-                            layout: cv_core::custody::NativeName::layout_of(&path),
+                    (
+                        None,
+                        Some(NativeFile {
                             path,
+                            file_name,
+                            layout,
+                            ..
+                        }),
+                        Some(Delta {
                             from,
                             to,
                             prior,
                             checkpoint,
-                            file_name,
-                        },
-                        Ok(None) => {
-                            if let Some(base) = baseline {
-                                summary
-                                    .verified_baselines
-                                    .push((harness_str, r.session_selector(), base));
-                            }
-                            summary.skipped += 1;
-                            continue;
-                        }
-                        Err(e) => {
-                            summary
-                                .failed
-                                .push((format!("{}:{}", r.harness, r.id), format!("{e:#}")));
-                            continue;
-                        }
+                        }),
+                    ) => Content::Native {
+                        path,
+                        from,
+                        to,
+                        prior,
+                        checkpoint,
+                        file_name,
+                        layout,
                     },
-                    (None, None) => unreachable!("a projection read always renders its payload"),
+                    _ => unreachable!("a projection read renders its payload; a native one has its delta"),
                 };
 
                 staged.push(StagedSession {
@@ -477,20 +487,34 @@ impl Archive {
     }
 }
 
-/// A session held natively: one append-only JSONL file with at least one finished line, none of
-/// whose declared companions ([`cv_core::Adapter::dependencies`]: Claude's tasks, spilled tool
-/// results, an agent's meta) exists, returned with its file name. Anything else is projected,
-/// since a chain of the transcript alone would drop what the read also consults.
+/// A session held natively: one file, none of whose declared companions
+/// ([`cv_core::Adapter::dependencies`]: Claude's tasks, spilled tool results, an agent's meta)
+/// exists. Anything else is projected, since a chain of the file alone would drop what the read
+/// also consults.
+struct NativeFile {
+    path: PathBuf,
+    file_name: String,
+    layout: Vec<String>,
+    /// A whole JSON document (OpenSession), rewritten whole: held through its last byte, and
+    /// recaptured whole when it changes. Otherwise append-only JSONL, held through its last LF.
+    document: bool,
+}
+
+/// [`NativeFile`] of `r`, when its harness writes one self-contained file: append-only JSONL for
+/// Claude, Codex and Qwen session transcripts, a whole document for OpenSession. A JSONL file
+/// without one finished line yet has nothing native to hold; it is projected as it reads.
 fn native_file(
     r: &SessionRef,
     adapter: &dyn cv_core::Adapter,
     probe: &mut cv_core::source::Probe,
-) -> Option<(PathBuf, String)> {
-    // The adapter names a native form ([`cv_core::Adapter::native_custody`]); JSONL here.
-    adapter.native_custody()?;
+) -> Option<NativeFile> {
     let path = &r.path;
+    let ext = path.extension().and_then(|e| e.to_str());
+    // The adapter names the native form ([`cv_core::Adapter::native_custody`]).
+    let form = adapter.native_custody().filter(|f| ext == Some(f.extension()))?;
+    let document = form == cv_core::harness::NativeCustody::Document;
     let meta = std::fs::symlink_metadata(path).ok()?;
-    if !meta.is_file() || path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+    if !meta.is_file() || meta.len() == 0 {
         return None;
     }
     let mut deps = cv_core::source::Dependencies::default();
@@ -499,12 +523,15 @@ fn native_file(
     if companions.iter().flatten().any(|p| p != path && p.exists()) {
         return None;
     }
-    // A file without one finished line yet has nothing native to hold; project what it reads as.
-    let file = std::fs::File::open(path).ok()?;
-    if last_complete_line_end(&file).ok()? == 0 {
+    if !document && last_complete_line_end(&std::fs::File::open(path).ok()?).ok()? == 0 {
         return None;
     }
-    Some((path.clone(), path.file_name()?.to_str()?.to_owned()))
+    Some(NativeFile {
+        path: path.clone(),
+        file_name: path.file_name()?.to_str()?.to_owned(),
+        layout: cv_core::custody::NativeName::layout_of(path),
+        document,
+    })
 }
 
 /// One session's read for archiving: its metadata, message count, IR payload when projected,
@@ -525,19 +552,27 @@ struct Delta {
     checkpoint: SourceCheckpoint,
 }
 
-/// The byte range a native capture must add: `None` when the archived chain already ends at the
-/// file's last complete line. A prefix that no longer matches (rewrite, truncation) or a
-/// projected predecessor starts a fresh chain at 0.
-fn native_delta(path: &Path, prev: Option<&ArchivedSessionEntry>) -> Result<Option<Delta>> {
+/// The byte range a native capture must add: `None` when the archived chain already ends where
+/// the file's held bytes do (its last complete line; a document's last byte). A JSONL prefix that
+/// no longer matches (rewrite, truncation), a changed document, or a projected predecessor starts
+/// a fresh chain at 0.
+fn native_delta(native: &NativeFile, prev: Option<&ArchivedSessionEntry>) -> Result<Option<Delta>> {
+    let path = &native.path;
     let file = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    let to = last_complete_line_end(&file)?;
+    let to = match native.document {
+        true => file.metadata()?.len(),
+        false => last_complete_line_end(&file)?,
+    };
     let (from, prior) = match prev.map(|p| &p.custody) {
         Some(cv_core::custody::CustodyKind::NativeExtents {
             extents,
             total_bytes,
             prefix_blake3,
             ..
-        }) if *total_bytes <= to && SourceCheckpoint::read(&file, *total_bytes)?.boundary_blake3 == *prefix_blake3 => {
+        }) if *total_bytes <= to
+            && (!native.document || *total_bytes == to)
+            && SourceCheckpoint::read(&file, *total_bytes)?.boundary_blake3 == *prefix_blake3 =>
+        {
             (*total_bytes, extents.clone())
         }
         _ => (0, Vec::new()),

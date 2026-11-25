@@ -489,6 +489,86 @@ fn custody_of(w: &cv_testkit::World, id: &str) -> Value {
         .unwrap_or_else(|| panic!("{id} is archived"))
 }
 
+/// #tooth Qwen session JSONL and OpenSession documents are held natively too: each chain alone
+/// serves frozen search and show once its file is gone, Qwen's read recognizes the session by
+/// the `projects/<p>/chats/` layout the archive kept, and a rewritten document is recaptured
+/// whole as a fresh one-extent chain.
+#[test]
+fn archive_native_qwen_and_opensession_read_back_from_the_chain_alone() {
+    let w = world("archive-native-more");
+    let chats = w.home.join(".qwen/projects/-work-proj/chats");
+    fs::create_dir_all(&chats).unwrap();
+    let qwen = chats.join("qsess1.jsonl");
+    let rec = |uuid: &str, ts: u32, body: &str| {
+        format!(
+            r#"{{"uuid":"{uuid}","parentUuid":null,"sessionId":"qsess1","cwd":"/work/proj","version":"0.25.1","timestamp":"2026-10-11T00:00:{ts:02}.000Z",{body}}}"#
+        )
+    };
+    let lines = [
+        rec(
+            "u1",
+            1,
+            r#""type":"user","message":{"role":"user","parts":[{"text":"count the capybara herd"}]}"#,
+        ),
+        rec(
+            "a1",
+            2,
+            r#""type":"assistant","model":"m","message":{"role":"model","parts":[{"text":"forty capybaras"}]}"#,
+        ),
+    ];
+    fs::write(&qwen, lines.iter().map(|l| format!("{l}\n")).collect::<String>()).unwrap();
+
+    let exports = w.base.join("exports");
+    fs::create_dir_all(&exports).unwrap();
+    w.cv_ok(&["config", "--add-export", exports.to_str().unwrap()]);
+    let doc_path = exports.join("doc-1.opensession.json");
+    let write_doc = |text: &str| {
+        let mut session = cv_core::ir::Session::new("doc-1", cv_core::ir::Harness::OpenSession);
+        let mut m = cv_core::ir::Message::new(cv_core::ir::Role::User);
+        m.content.push(cv_core::ir::Block::from_text(text.into()));
+        session.messages.push(m);
+        fs::write(
+            &doc_path,
+            serde_json::to_vec(&cv_core::harness::opensession::document(&session)).unwrap(),
+        )
+        .unwrap();
+    };
+    write_doc("the marmot ledger");
+
+    w.cv_ok(&["archive", "sync"]);
+    let q = custody_of(&w, "qsess1");
+    assert_eq!(q["kind"], "native_extents", "{q}");
+    assert_eq!(q["layout"], json!([".qwen", "projects", "-work-proj", "chats"]), "{q}");
+    let d = custody_of(&w, "doc-1");
+    assert_eq!(d["kind"], "native_extents", "{d}");
+    assert_eq!(d["total_bytes"], json!(fs::metadata(&doc_path).unwrap().len()));
+
+    // A rewritten document is a fresh chain of its new bytes, not an append to the old one.
+    write_doc("the marmot ledger, amended with a wombat");
+    let bumped = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+    fs::File::options()
+        .write(true)
+        .open(&doc_path)
+        .and_then(|f| f.set_modified(bumped))
+        .unwrap();
+    w.cv_ok(&["archive", "sync"]);
+    let d = custody_of(&w, "doc-1");
+    assert_eq!(d["extents"].as_array().unwrap().len(), 1, "{d}");
+    assert_eq!(d["total_bytes"], json!(fs::metadata(&doc_path).unwrap().len()));
+
+    fs::remove_file(&qwen).unwrap();
+    fs::remove_file(&doc_path).unwrap();
+    let json = |args: &[&str]| serde_json::from_str::<Value>(&w.cv_ok(args).0).unwrap();
+    for (word, expect) in [("capybara", "forty capybaras"), ("wombat", "amended with a wombat")] {
+        let hits = json(&["--frozen", "search", word, "--json"]);
+        let hits = hits["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 1, "{word}: {hits:?}");
+        let key = hits[0]["session_key"].as_str().unwrap().to_owned();
+        let show = json(&["--frozen", "show", &key, "--json"]).to_string();
+        assert!(show.contains(expect), "{word}: {show}");
+    }
+}
+
 /// #tooth Frozen show and pack of a native session leave nothing behind in `TMPDIR` (the
 /// adapter reads the chain by position; the in-process tooth in `custody.rs` checks that
 /// nothing is staged while it streams).

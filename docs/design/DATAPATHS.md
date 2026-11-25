@@ -276,17 +276,23 @@ Audited against `git log v0.17.0..HEAD` on 2026-10-21; a closure below names its
   BM25, all of it unless `--live-bytes`/`$CV_LIVE_BYTES`/config bounds it (`fts/live.rs`); a SQLite write rereads only moved `source::Rows`.
 - **Archive inventory.** `archive sync` uses `index_all`'s references; `cv/src/cmd/archive` owns
   its checked artifact projection. An unavailable index falls back to discovery with a diagnostic.
-- **Archive custody, two shapes.** A Claude or Codex JSONL file with no existing companion
-  (`Adapter::dependencies`) is held as `NativeExtents`: a chain of pack extents, each sync packing
-  only the complete lines past the archived prefix, which a bounded boundary digest
-  (`custody::SourceCheckpoint`) must still match; a mismatch starts a fresh chain. Readback streams
-  the chain through `ExtentChainReader` (1 MiB chunks, per-extent BLAKE3) into a private temporary
-  file the harness adapter reads, so carriers survive the live file. Everything else, and every
-  older entry, stays a `PortableProjection`. `custody_heads` holds one row per session; the
-  inventory reads it, falling back to `pack_manifests` on a store not yet backfilled. Open: the
-  sync still parses the whole session for its metadata and baseline (O(file) read, O(Δ) write),
-  the hub ships an IR projection rebuilt from the chain, and other single-file harnesses stay
-  projected until their adapters' readback from a relocated file is tested.
+- **Archive custody, two shapes.** A single self-contained file with no existing companion
+  (`Adapter::dependencies`) is held as `NativeExtents`, a chain of pack extents: Claude, Codex and
+  Qwen session JSONL through their last complete line, each sync packing only the lines past the
+  archived prefix, which a bounded boundary digest (`custody::SourceCheckpoint`) must still match
+  (a mismatch starts a fresh chain); an OpenSession document whole, recaptured whole when it
+  changes. The delta is measured before any parse, so an unchanged chain costs two bounded reads.
+  Readback serves the chain by position (`custody::ExtentChain`: per-extent logical offsets, the
+  one pack frame holding a byte decoded, two frames cached, each extent's BLAKE3 checked on first
+  touch) as a `ByteSource` standing in for the file (`jsonl::Substitute`) at a view path that does
+  not exist (`<packs>/.custody-view/<layout>/<file>`, the layout being the four directory names
+  above the file), so the harness's own adapter reads it, carriers survive the live file, and
+  nothing is written. Everything else, and every older entry, stays a `PortableProjection`.
+  `custody_heads` (one row per session) and its watermark converge by presence on every writable
+  open, independent of `user_version`; a reader whose watermark disagrees with `pack_manifests`
+  reads the manifests. Open: a changed native session is still parsed whole for its metadata and
+  baseline (O(file) CPU at the lean demand, O(1) memory, O(Δ) write), and the hub ships an IR
+  projection rebuilt from the chain.
 - **Three message windowings, closed.** JSON, text rendering and pack relevance excerpts share
   `api::MessageWindow`; renderers retain their own byte accounting and metadata timing.
   CLI and HTTP search share `cv_search::Searcher::search`, including notes and snippets.

@@ -1185,8 +1185,22 @@ pub fn has_cold_rewind(h: Harness) -> bool {
 /// ([`Adapter::native_custody`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NativeCustody {
-    /// Append-only JSONL, held through its last LF; each sync packs only the appended lines.
+    /// Append-only JSONL (`*.jsonl`), held through its last LF; each sync packs only the
+    /// appended lines.
     Jsonl,
+    /// A whole JSON document (`*.json`), rewritten whole: held through its last byte, and
+    /// recaptured whole when it changes.
+    Document,
+}
+
+impl NativeCustody {
+    /// The file extension a session file in this form carries; any other file is projected.
+    pub fn extension(self) -> &'static str {
+        match self {
+            NativeCustody::Jsonl => "jsonl",
+            NativeCustody::Document => "json",
+        }
+    }
 }
 
 /// Whether `h`'s adapter writes reshaped selections itself ([`Adapter::writes_selection`]).

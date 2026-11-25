@@ -77,6 +77,11 @@ impl Qwen {
 }
 
 impl Adapter for Qwen {
+    /// A Qwen Code session is append-only JSONL.
+    fn native_custody(&self) -> Option<super::NativeCustody> {
+        Some(super::NativeCustody::Jsonl)
+    }
+
     fn harness(&self) -> Harness {
         Harness::Qwen
     }

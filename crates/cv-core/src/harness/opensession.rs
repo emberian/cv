@@ -154,6 +154,11 @@ impl Adapter for OpenSession {
         Harness::OpenSession
     }
 
+    /// A document is one whole JSON file.
+    fn native_custody(&self) -> Option<super::NativeCustody> {
+        Some(super::NativeCustody::Document)
+    }
+
     fn roots(&self) -> Vec<PathBuf> {
         super::export::export_dirs()
     }
@@ -239,6 +244,9 @@ struct RootedOpenSession {
 impl Adapter for RootedOpenSession {
     fn harness(&self) -> Harness {
         Harness::OpenSession
+    }
+    fn native_custody(&self) -> Option<super::NativeCustody> {
+        Some(super::NativeCustody::Document)
     }
     fn roots(&self) -> Vec<PathBuf> {
         self.roots.clone()
