@@ -119,14 +119,37 @@ struct Candidate {
     range: Range<usize>,
 }
 
-pub(super) fn find(root: &Path, sha: &str, diff: &str) -> Result<Option<Relocation>> {
-    let mut hunks = diff.lines().filter_map(hunk);
-    let Some((before, range)) = hunks.next() else {
-        return Ok(None);
-    };
-    if !before.is_empty() || range.is_empty() || hunks.next().is_some() {
+/// The one pure-addition hunk of `diff` the walk follows. A single addition hunk is taken as is;
+/// among several, exactly one must overlap `query` (1-based inclusive lines of the tracked
+/// range), or the walk stops rather than guess.
+fn creation_hunk(diff: &str, query: (usize, usize)) -> Option<Range<usize>> {
+    let added: Vec<Range<usize>> = diff
+        .lines()
+        .filter_map(hunk)
+        .filter(|(before, after)| before.is_empty() && !after.is_empty())
+        .map(|(_, after)| after)
+        .collect();
+    if let [only] = added.as_slice() {
+        return Some(only.clone());
+    }
+    let want = query.0.saturating_sub(1)..query.1.max(query.0);
+    let mut covering = added.into_iter().filter(|r| r.start < want.end && want.start < r.end);
+    let found = covering.next()?;
+    covering.next().is_none().then_some(found)
+}
+
+pub(super) fn find(root: &Path, sha: &str, diff: &str, query: (usize, usize)) -> Result<Option<Relocation>> {
+    // A hunk that also removes lines is an edit, not a carve: only pure additions bridge.
+    if diff
+        .lines()
+        .filter_map(hunk)
+        .any(|(before, after)| !before.is_empty() && !after.is_empty())
+    {
         return Ok(None);
     }
+    let Some(range) = creation_hunk(diff, query) else {
+        return Ok(None);
+    };
     let Some(path) = diff.lines().find_map(|l| l.strip_prefix("+++ b/")) else {
         return Ok(None);
     };
@@ -142,7 +165,9 @@ pub(super) fn find(root: &Path, sha: &str, diff: &str) -> Result<Option<Relocati
         &[
             "diff",
             "--no-renames",
-            "--diff-filter=M",
+            // `D` covers the split refactor: `foo.rs` deleted while `foo/a.rs` and `foo/b.rs`
+            // are created in the same commit.
+            "--diff-filter=MD",
             "--name-only",
             "-z",
             parent,
@@ -280,4 +305,20 @@ pub(super) fn find(root: &Path, sha: &str, diff: &str) -> Result<Option<Relocati
         lines: (candidate.range.start + 1, candidate.range.end),
         method: method.into(),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::creation_hunk;
+
+    #[test]
+    fn creation_hunk_selects_the_one_addition_covering_the_query() {
+        // #tooth Two addition hunks: the query picks one; a query touching both, or neither, refuses.
+        let diff = "+++ b/x.rs\n@@ -3,0 +4,5 @@\n+a\n@@ -20,0 +26,4 @@\n+b\n";
+        assert_eq!(creation_hunk(diff, (5, 6)), Some(3..8));
+        assert_eq!(creation_hunk(diff, (27, 29)), Some(25..29));
+        assert_eq!(creation_hunk(diff, (6, 27)), None);
+        assert_eq!(creation_hunk(diff, (12, 14)), None);
+        assert_eq!(creation_hunk("@@ -0,0 +1,9 @@\n", (40, 41)), Some(0..9));
+    }
 }

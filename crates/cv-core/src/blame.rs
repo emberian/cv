@@ -492,7 +492,12 @@ fn line_commits_with_hunks(root: &Path, rel: &str, lo: u32, hi: u32) -> Result<(
         {
             break;
         }
-        let Some(source) = carve::find(root, sha, diff)? else {
+        let query = spec
+            .split_once(':')
+            .and_then(|(lines, _)| lines.split_once(','))
+            .and_then(|(lo, hi)| Some((lo.parse().ok()?, hi.parse().ok()?)))
+            .unwrap_or((lo as usize, hi as usize));
+        let Some(source) = carve::find(root, sha, diff, query)? else {
             break;
         };
         rev.clone_from(&source.parent);

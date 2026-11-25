@@ -477,3 +477,60 @@ fn blame_carved_method_attributes_parent_path_and_refuses_ambiguous_names() {
     let ambiguous = result("new.rs", "2");
     assert_eq!(ambiguous["commits"].as_array().unwrap().len(), 1, "{ambiguous}");
 }
+
+#[test]
+fn blame_follows_a_split_whose_source_file_was_deleted() {
+    // #tooth `monolith.rs` is split into `part_a.rs` + `part_b.rs` and removed with `git rm` in
+    // one commit. Only the session that wrote `monolith.rs` authored `beta`; a donor lookup that
+    // considers modified files alone never sees the deleted parent and stops at the split.
+    let w = World::in_process("blame-split", cv_core::env::Env::enter_isolated);
+    let repo = w.base.canonicalize().unwrap().join("project");
+    fs::create_dir(&repo).unwrap();
+    git(&repo, &["init", "-q"], None);
+    git(&repo, &["config", "user.name", "Tester"], None);
+    git(&repo, &["config", "user.email", "tester@example.invalid"], None);
+    git(&repo, &["config", "commit.gpgsign", "false"], None);
+    let alpha =
+        "fn alpha_total(xs: &[u32]) -> u32 {\n    let start = 3u32;\n    xs.iter().fold(start, |acc, x| acc + x)\n}\n";
+    let beta = "fn beta_scaled(xs: &[u32]) -> Vec<u32> {\n    let factor = 7u32;\n    xs.iter().map(|x| x * factor).collect()\n}\n";
+    // `part_a.rs` keeps most of the file, so Git's own rename detection pairs it with the deleted
+    // `monolith.rs`; `part_b.rs` is a fresh file only the carve can connect.
+    let gamma: String = (0..12)
+        .map(|i| format!("fn gamma_{i}(x: u32) -> u32 {{\n    x.wrapping_mul({i}) ^ 0x5a5a\n}}\n"))
+        .collect();
+    let monolith = format!("{alpha}{gamma}{beta}");
+    fs::write(repo.join("monolith.rs"), &monolith).unwrap();
+    git(&repo, &["add", "monolith.rs"], None);
+    git(&repo, &["commit", "-qm", "monolith"], Some(COMMIT1_TS));
+    let first = git(&repo, &["rev-parse", "HEAD"], None);
+    fs::write(repo.join("part_a.rs"), format!("{alpha}{gamma}")).unwrap();
+    fs::write(repo.join("part_b.rs"), format!("// split out of monolith\n{beta}")).unwrap();
+    git(&repo, &["add", "part_a.rs", "part_b.rs"], None);
+    git(&repo, &["rm", "-q", "monolith.rs"], None);
+    git(&repo, &["commit", "-qm", "split monolith"], Some(COMMIT2_TS));
+    let second = git(&repo, &["rev-parse", "HEAD"], None);
+
+    let transcript = w.write_session(
+        "S-mono",
+        &[
+            serde_json::json!({"type":"assistant","uuid":"msg-mono","sessionId":"S-mono","cwd":repo,
+            "message":{"role":"assistant","content":[{"type":"tool_use","id":"write","name":"Write",
+                "input":{"file_path":repo.join("monolith.rs"),"content":monolith}}]}}),
+        ],
+    );
+    let r = cv_core::SessionRef::new("S-mono", cv_core::Harness::Claude, transcript);
+    cv_core::events::ingest_ref(&r).unwrap();
+    cv_core::catalog::sync(&[r]);
+
+    let (out, err) = cv(&w, &repo, &["blame", "part_b.rs", "-L", "3,4", "--json"]);
+    let report: Value = serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}\n{err}"));
+    let commits = report["commits"].as_array().unwrap();
+    assert_eq!(commits.len(), 2, "{report}");
+    assert_eq!(commits[0]["sha"], second);
+    assert_eq!(commits[1]["sha"], first, "{report}");
+    let source = &commits[1]["relocated_from"];
+    assert_eq!(source["path"], "monolith.rs", "{report}");
+    assert_eq!(source["commit"], second);
+    assert_eq!(source["method"], "exact_block");
+    assert_eq!(commits[1]["matches"][0]["session_id"], "S-mono", "{report}");
+}
