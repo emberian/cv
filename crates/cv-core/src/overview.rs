@@ -1,5 +1,8 @@
 //! Bounded orientation over the existing message stream, event classifier and worker forest.
 //! Excerpts are pointers into evidence, not a summary or a claim that reported work was integrated.
+mod episodes;
+pub use episodes::{Episode, RepairEpisodes};
+
 use crate::events::EventExtractor;
 use crate::ir::{Block, Message, MessageKind, Origin, Role, Session, SessionRef};
 use crate::stream::{Demand, Flow, MessageSink, Pass, Tier};
@@ -82,6 +85,7 @@ pub struct Overview {
     pub workers: Vec<Worker>,
     pub files: Vec<File>,
     pub commands: Vec<Command>,
+    pub repair_episodes: RepairEpisodes,
     pub omitted: Omitted,
     pub warnings: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -227,6 +231,8 @@ struct Collector<'a> {
     requests: VecDeque<Request>,
     files: VecDeque<File>,
     commands: VecDeque<Command>,
+    episodes: episodes::Detector,
+    seen: crate::spill::ExactStrings,
     extractor: EventExtractor,
     scratch: Vec<crate::events::Event>,
     error: Option<anyhow::Error>,
@@ -244,12 +250,20 @@ impl<'a> Collector<'a> {
             requests: VecDeque::new(),
             files: VecDeque::new(),
             commands: VecDeque::new(),
+            episodes: Default::default(),
+            seen: Default::default(),
             extractor: EventExtractor::default(),
             scratch: Vec::new(),
             error: None,
         }
     }
     fn observe(&mut self, m: &Message) -> Result<()> {
+        if let Some(id) = &m.id {
+            if !self.seen.insert(format!("{}:{id}", m.role.as_str()))? {
+                self.index += 1;
+                return Ok(());
+            }
+        }
         if m.role == Role::User && m.kind == MessageKind::Prompt && m.origin == Origin::Human {
             self.totals.requests += 1;
             if self.opts.request_limit > 0 {
@@ -306,37 +320,43 @@ impl<'a> Collector<'a> {
         }
         crate::events::release_scratch(&mut self.scratch);
         for block in &m.content {
-            if let Block::ToolUse { name, input, .. } = block {
+            if let Block::ToolUse { id, name, input, .. } = block {
                 input.with_view(|view| {
+                    let mut ops = Vec::new();
                     crate::tools::classify::visit_tool_ops(
                         Some(self.harness),
                         name,
                         view,
                         crate::tools::classify::ClassifyOpts {
-                            commands: self.opts.command_limit > 0,
-                            command_limit: Some(self.opts.excerpt_bytes.saturating_add(4)),
+                            commands: true,
+                            command_limit: Some(self.opts.excerpt_bytes.saturating_add(4).max(4100)),
                             summaries: false,
                         },
                         |sem| {
-                            if let crate::tools::classify::ToolOp::Command { cmd, .. } = sem.op {
+                            if let crate::tools::classify::ToolOp::Command { cmd, .. } = &sem.op {
                                 self.totals.commands += 1;
                                 let (command, truncated) =
-                                    optional_excerpt(cmd.map(|c| c.into_owned()), self.opts.excerpt_bytes);
+                                    optional_excerpt(cmd.as_deref().map(str::to_owned), self.opts.excerpt_bytes);
                                 recent(
                                     &mut self.commands,
                                     Command {
                                         msg_idx: self.index,
                                         ts: m.timestamp,
-                                        tool: sem.tool.into_owned(),
+                                        tool: sem.tool.to_string(),
                                         command,
                                         truncated,
                                     },
                                     self.opts.command_limit,
                                 );
                             }
+                            ops.push(sem.into_owned());
                         },
-                    )
+                    )?;
+                    self.episodes.call(id, self.index, view, ops)
                 })?;
+            } else {
+                self.episodes
+                    .result(m, block, self.index, self.harness, &self.resolver)?;
             }
         }
         self.index += 1;
@@ -356,6 +376,7 @@ impl<'a> Collector<'a> {
             workers: Vec::new(),
             files: self.files.into(),
             commands: self.commands.into(),
+            repair_episodes: self.episodes.report,
             omitted,
             warnings: Vec::new(),
             read_coverage: session.cv_extra().and_then(|v| v.get("read_coverage")).cloned(),

@@ -446,6 +446,7 @@ dependencies = [
  "serde",
  "serde_json",
  "simdutf8",
+ "strsim",
  "syn 2.0.117",
  "thiserror 2.0.18",
  "toml",

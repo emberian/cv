@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Line-range blame follows unique carved blocks and edited declarations into their parent files and reports the relocation evidence.
+- Session overviews count validation repairs and immediate verbatim reversals separately, with message indices for each recent episode.
 - OpenSession preserves unknown block types, message kinds, and nested fields through export and reports opaque content in read coverage.
 - Prune accepts parent-scoped `--agent`, summarizes command outcomes, stashes stale Edit and Write arguments for `cat --input`, and estimates cache break-even.
 - Adopt, agent carry, and port copy Claude tool-result files and prune sidecars so originals remain retrievable from the continuation.

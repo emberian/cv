@@ -1525,7 +1525,6 @@ fn context(event: &str, text: String) -> Value {
     json!({"hookSpecificOutput": {"hookEventName": event, "additionalContext": text}})
 }
 
-
 /// Extract cross-harness target agent identifiers addressed by a tool call (via `tools::classify`),
 /// covering Claude `SendMessage` (`to`), Codex `send_input` (`id`) and Code Mode `exec`, OpenCode /
 /// Antigravity `send_message`, `Task`/`Agent` `resume`, and `write_stdin`/`wait_agent`.
@@ -1724,7 +1723,6 @@ fn hook_receipt(ev: &Event, payload: &Value) -> Result<Option<Value>> {
         Err(e) => Err(e),
     }
 }
-
 
 fn minutes_since_modified(path: &Path) -> Option<i64> {
     let m = std::fs::metadata(path).ok()?.modified().ok()?;

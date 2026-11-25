@@ -47,6 +47,8 @@ const DEPENDENCY_ALLOWLIST: &[&str] = &[
     "serde_json",
     // Pure-Rust vectorized UTF-8 validation; portable fallback on non-simd wasm32/i686.
     "simdutf8",
+    // Pure-Rust generic Jaro-Winkler token similarity for blame carve relocation; no I/O, wasm-safe.
+    "strsim",
     "thiserror",
     "toml",
     // Native synchronous hub replication with verified HTTPS; gated by sqlite, absent on wasm.

@@ -89,11 +89,12 @@ pub(crate) fn data_schema_json() -> Value {
         },
         "overview": {
             "description": "bounded session orientation (`show --kind overview --json`, `/api/session/{harness}/{id}/overview`)",
-            "keys": ["session", "requests", "workers", "files", "commands", "omitted", "warnings", "read_coverage"],
+            "keys": ["session", "requests", "workers", "files", "commands", "repair_episodes", "omitted", "warnings", "read_coverage"],
             "session": "the existing session_row shape; size_bytes may be null",
             "request": ["msg_idx", "ts", "text", "truncated"],
             "file": ["msg_idx", "ts", "kind", "path", "present"],
             "command": ["msg_idx", "ts", "tool", "command", "truncated"],
+            "repair_episodes": "repairs and reverted_checks counts, plus the twelve latest cycles with fail_msg_idx, first_edit_msg_idx, pass_msg_idx, edits, and reverted_check",
             "worker": ["session_id", "agent_id", "path", "status", "status_source", "description", "last_text", "truncated"],
             "selection": "first and four most recent human requests, twelve recent file events, eight recent commands, twelve newest discoverable workers",
             "indices": "zero-based source message indices, not positions in the overview",

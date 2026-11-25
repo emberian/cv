@@ -36,6 +36,9 @@ pub fn cmd_blame(file: &str, lines: Option<&str>, show: bool, json: bool) -> Res
             &c.summary
         };
         println!("◆ {} {}  {summary}", c.short_sha, date(c.time));
+        if let Some(r) = &c.relocated_from {
+            println!("  relocated from {}:{}–{} ({})", r.path, r.lines.0, r.lines.1, r.method);
+        }
         if c.matches.is_empty() {
             println!("  (no agent session found)");
             continue;

@@ -186,13 +186,19 @@ every command of the clap tree on a pipe under this contract.
 ### Session overview
 
 `show --kind overview --json` and `/api/session/{harness}/{id}/overview` return one object:
-`session, requests, workers, files, commands, omitted, warnings`, with optional `read_coverage`.
+`session, requests, workers, files, commands, repair_episodes, omitted, warnings`, with optional `read_coverage`.
 `session` keeps the existing session-row shape. Requests, files and commands carry zero-based
 source `msg_idx` and nullable RFC 3339 `ts`; those indices open the full surrounding exchange.
 Requests contain `text, truncated`; commands contain `tool, command, truncated`, with a null
 command when the tool's dynamic input cannot be reconstructed statically. File entries contain
 `kind, path, present`: `present` describes current local metadata, not the file's state when the
 agent read it, and is null when unavailable or unchecked. No file bodies are read for this view.
+
+`repair_episodes` counts a failed validation followed by a successful file edit and a successful
+rerun of the same command and working directory. A commit-creating command ends the interval.
+`reverted_checks` counts immediate verbatim replacement reversals separately from `repairs`.
+`recent` retains the twelve latest episodes with failure, first edit and pass message indices.
+Repeated message IDs keep their first occurrence and all indices refer to the original stream.
 
 The default selects the first and last four human requests without duplication, twelve recent
 file-event occurrences, eight recent commands, and twelve newest discoverable workers. Worker

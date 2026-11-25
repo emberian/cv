@@ -420,3 +420,60 @@ fn blame_end_to_end() {
     assert!(err.contains("run `cv index`"), "stdout:\n{out}\nstderr:\n{err}");
     assert!(out.contains("(no agent session found)"), "{out}");
 }
+
+#[test]
+fn blame_carved_method_attributes_parent_path_and_refuses_ambiguous_names() {
+    // #tooth Session S1 touched only the old file. Using destination events for
+    // both halves of the walk would lose S1 even if the Git bridge succeeded.
+    let w = World::in_process("blame-carve", cv_core::env::Env::enter_isolated);
+    let repo = w.base.canonicalize().unwrap().join("project");
+    fs::create_dir(&repo).unwrap();
+    git(&repo, &["init", "-q"], None);
+    git(&repo, &["config", "user.name", "Tester"], None);
+    git(&repo, &["config", "user.email", "tester@example.invalid"], None);
+    git(&repo, &["config", "commit.gpgsign", "false"], None);
+    let original = "fn compute_checksum(bytes: &[u8]) -> u64 {\n    let seed = 17u64;\n    bytes.iter().fold(seed, |sum, byte| sum + u64::from(*byte))\n}\n";
+    let tweaked = original.replace("17u64", "19u64");
+    let duplicate = "fn new() -> usize {\n    let capacity = 4096;\n    capacity + 1\n}\n";
+    fs::write(repo.join("big.rs"), format!("fn keep() {{}}\n{original}{duplicate}")).unwrap();
+    fs::write(repo.join("other.rs"), format!("fn retain() {{}}\n{duplicate}")).unwrap();
+    git(&repo, &["add", "."], None);
+    git(&repo, &["commit", "-qm", "introduce checksum"], Some(COMMIT1_TS));
+    let first = git(&repo, &["rev-parse", "HEAD"], None);
+    fs::write(repo.join("big.rs"), "fn keep() {}\nmod checksum;\n").unwrap();
+    fs::write(repo.join("other.rs"), "fn retain() {}\n").unwrap();
+    fs::write(repo.join("checksum.rs"), &tweaked).unwrap();
+    fs::write(repo.join("new.rs"), duplicate.replace("4096", "4097")).unwrap();
+    git(&repo, &["add", "."], None);
+    git(&repo, &["commit", "-qm", "extract checksum"], Some(COMMIT2_TS));
+    let second = git(&repo, &["rev-parse", "HEAD"], None);
+
+    let refs:Vec<_> = [("S1","big.rs",original),("S2","checksum.rs",&tweaked)].into_iter().map(|(id,path,body)| {
+        let transcript = w.write_session(id,&[serde_json::json!({"type":"assistant","uuid":format!("msg-{id}"),"sessionId":id,"cwd":repo,
+            "message":{"role":"assistant","content":[{"type":"tool_use","id":"write","name":"Write","input":{"file_path":repo.join(path),"content":body}}]}})]);
+        let r = cv_core::SessionRef::new(id,cv_core::Harness::Claude,transcript);
+        cv_core::events::ingest_ref(&r).unwrap();
+        r
+    }).collect();
+    cv_core::catalog::sync(&refs);
+    let result = |file, range| {
+        let (out, err) = cv(&w, &repo, &["blame", file, "-L", range, "--json"]);
+        serde_json::from_str::<Value>(&out).unwrap_or_else(|_| panic!("{out}\n{err}"))
+    };
+    let report = result("checksum.rs", "2");
+    let commits = report["commits"].as_array().unwrap();
+    assert_eq!(commits.len(), 2, "{report}");
+    assert_eq!(commits[0]["sha"], second);
+    assert_eq!(commits[0]["matches"][0]["session_id"], "S2");
+    assert_eq!(commits[1]["sha"], first);
+    assert_eq!(commits[1]["matches"][0]["session_id"], "S1");
+    let source = &commits[1]["relocated_from"];
+    assert_eq!(source["method"], "item_body");
+    assert_eq!(source["path"], "big.rs");
+    assert_eq!(source["lines"], serde_json::json!([2, 5]));
+    assert_eq!(source["commit"], second);
+    let exact = result("checksum.rs", "3,4");
+    assert_eq!(exact["commits"][1]["relocated_from"]["method"], "exact_block");
+    let ambiguous = result("new.rs", "2");
+    assert_eq!(ambiguous["commits"].as_array().unwrap().len(), 1, "{ambiguous}");
+}

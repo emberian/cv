@@ -34,6 +34,7 @@ rayon = { workspace = true, optional = true }
 dirs.workspace = true
 uuid.workspace = true
 regex.workspace = true
+strsim = { version = "0.11", optional = true }
 toml.workspace = true
 # Line splitting on the parse paths (a byte loop was a quarter of a codex parse). Already in the
 # tree through regex.
@@ -78,7 +79,7 @@ mmap = ["dep:memmap2"]
 # `sqlite` pulls in rusqlite (native C SQLite) for the SQLite-backed adapters (Hermes, Cursor,
 # Goose, Zed, Devin) and the FTS index, plus a zstd decoder for compressed rollouts and blobs.
 # Disable it (e.g. `--no-default-features`) to compile cv-core for wasm32.
-sqlite = ["dep:rusqlite", "dep:ureq", "zstd"]
+sqlite = ["dep:rusqlite", "dep:strsim", "dep:ureq", "zstd"]
 # Compressed sources are independent of SQL stores; native libzstd, portable ruzstd.
 zstd = ["dep:ruzstd", "dep:zstd"]
 # `parallel` fans discovery across adapters/files with rayon. Off for wasm32 (no threads); the code

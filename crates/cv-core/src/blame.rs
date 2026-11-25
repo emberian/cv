@@ -14,6 +14,8 @@
 //! 5. [`Strength::SessionSpan`] (`"weak: session span"`) — session span covers commit time when
 //!    individual event timestamps are absent.
 
+mod carve;
+
 use crate::events::{self, EditEvent, EditHunkEvent};
 use crate::ir::Harness;
 use crate::rewind::{CommitEvidence, CommitEvidenceSink, EvidenceKind};
@@ -108,6 +110,17 @@ pub struct SessionAttribution {
     pub range: (usize, usize),
 }
 
+/// Evidence for a cross-file continuation at a line-history boundary.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Relocation {
+    pub commit: String,
+    pub parent: String,
+    pub path: String,
+    /// Inclusive, one-based source range in the parent.
+    pub lines: (usize, usize),
+    pub method: String,
+}
+
 /// One commit touching the blamed file or `-L` line range, with its top session attributions.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CommitBlame {
@@ -116,6 +129,8 @@ pub struct CommitBlame {
     pub time: i64,
     pub summary: String,
     pub matches: Vec<SessionAttribution>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relocated_from: Option<Relocation>,
 }
 
 /// Event-only session match when `file` lies outside any git worktree.
@@ -186,6 +201,7 @@ pub struct CommitTarget {
     pub time: i64,
     pub summary: String,
     pub hunk_hashes: HashSet<u64>,
+    pub relocated_from: Option<Relocation>,
 }
 
 fn run_git(dir: &Path, args: &[&str]) -> Result<std::process::Output> {
@@ -316,6 +332,7 @@ fn file_commits_with_hunks(root: &Path, rel: &str) -> Result<(Vec<CommitTarget>,
             time,
             summary: summary.unwrap_or("").to_string(),
             hunk_hashes: collect_commit_diff_hashes(diff),
+            relocated_from: None,
         });
     }
     Ok((commits, total))
@@ -404,31 +421,6 @@ fn line_commits_with_hunks(root: &Path, rel: &str, lo: u32, hi: u32) -> Result<(
     }
     flush_run(&mut run_sha, &mut run_lines, &mut metas);
 
-    // Enrich owning commits with `git log -L lo,hi:<rel>` diff hunks (scoped strictly to `lo..=hi`).
-    let log_l_spec = format!("{lo},{hi}:{rel}");
-    if let Ok(log_out) = run_git(
-        root,
-        &[
-            "log",
-            "-L",
-            &log_l_spec,
-            "-n15",
-            "--no-ext-diff",
-            "--format=%x00COMMIT%x00%H",
-        ],
-    ) {
-        if log_out.status.success() {
-            let text = String::from_utf8_lossy(&log_out.stdout);
-            for chunk in text.split("\0COMMIT\0").skip(1) {
-                let (sha_line, diff) = chunk.split_once('\n').unwrap_or((chunk, ""));
-                let sha = sha_line.trim();
-                if let Some(meta) = metas.get_mut(sha) {
-                    meta.hashes.extend(collect_commit_diff_hashes(diff));
-                }
-            }
-        }
-    }
-
     let mut commits: Vec<CommitTarget> = order
         .into_iter()
         .map(|sha| {
@@ -438,11 +430,75 @@ fn line_commits_with_hunks(root: &Path, rel: &str, lo: u32, hi: u32) -> Result<(
                 time: m.committer_time.or(m.author_time).unwrap_or(0),
                 summary: m.summary.unwrap_or_default(),
                 hunk_hashes: m.hashes,
+                relocated_from: None,
                 sha,
             }
         })
         .collect();
     commits.sort_by_key(|c| std::cmp::Reverse(c.time));
+    let mut spec = format!("{lo},{hi}:{rel}");
+    let mut rev = "HEAD".to_string();
+    let mut relocation: Option<Relocation> = None;
+    loop {
+        let output = run_git(
+            root,
+            &[
+                "log",
+                "-L",
+                &spec,
+                "--no-ext-diff",
+                "--no-textconv",
+                "--format=%x00COMMIT%x00%H%x1f%ct%x1f%h%x1f%s",
+                &rev,
+            ],
+        )?;
+        if !output.status.success() {
+            break;
+        }
+        let log = String::from_utf8_lossy(&output.stdout);
+        let mut terminal = None;
+        for chunk in log.split("\0COMMIT\0").skip(1) {
+            let Some((header, diff)) = chunk.split_once('\n') else {
+                continue;
+            };
+            let mut fields = header.splitn(4, '\x1f');
+            let (Some(sha), Some(time), Some(short), Some(summary)) =
+                (fields.next(), fields.next(), fields.next(), fields.next())
+            else {
+                continue;
+            };
+            if let Some(c) = commits.iter_mut().find(|c| c.sha == sha) {
+                c.hunk_hashes.extend(collect_commit_diff_hashes(diff));
+            } else if relocation.is_some() {
+                commits.push(CommitTarget {
+                    sha: sha.into(),
+                    short: short.into(),
+                    time: time.parse()?,
+                    summary: summary.into(),
+                    hunk_hashes: collect_commit_diff_hashes(diff),
+                    relocated_from: relocation.clone(),
+                });
+            }
+            terminal = Some((sha, diff));
+        }
+        let Some((sha, diff)) = terminal else { break };
+        if commits.len() >= MAX_COMMITS {
+            break;
+        }
+        if relocation.is_none()
+            && !run_git(root, &["--literal-pathspecs", "diff", "--quiet", "HEAD", "--", rel])?
+                .status
+                .success()
+        {
+            break;
+        }
+        let Some(source) = carve::find(root, sha, diff)? else {
+            break;
+        };
+        rev.clone_from(&source.parent);
+        spec = format!("{},{}:{}", source.lines.0, source.lines.1, source.path);
+        relocation = Some(source);
+    }
     let total = commits.len();
     commits.truncate(MAX_COMMITS);
     Ok((commits, total))
@@ -866,16 +922,24 @@ pub fn blame(file: &str, lines: Option<&str>) -> Result<BlameReport> {
         });
     }
 
-    let edits = events::edits_with_hunks_touching_file(&abs_str, &rel)?;
-    let cold_catalog = edits.is_empty() && !events::catalog_has_events();
-    let exact = exact_sha_matches(&commits_raw, &edits, &root)?;
+    let mut sources = HashMap::new();
+    for c in &commits_raw {
+        let path = c.relocated_from.as_ref().map_or(rel.as_str(), |r| r.path.as_str());
+        if let std::collections::hash_map::Entry::Vacant(entry) = sources.entry(path) {
+            let edits = events::edits_with_hunks_touching_file(&root.join(path).to_string_lossy(), path)?;
+            let exact = exact_sha_matches(&commits_raw, &edits, &root)?;
+            entry.insert((edits, exact));
+        }
+    }
+    let cold_catalog = sources.values().all(|(edits, _)| edits.is_empty()) && !events::catalog_has_events();
     let line_scoped = parsed_lines.is_some();
-
     let mut matched_commits = 0usize;
     let mut commits_out = Vec::with_capacity(commits_raw.len());
     for c in &commits_raw {
-        let edit_cands = correlate_hunks(c.time, &c.hunk_hashes, &edits, &root, line_scoped);
-        let mut ranked = rank_attributions(&c.sha, &exact, edit_cands, &edits, line_scoped);
+        let path = c.relocated_from.as_ref().map_or(rel.as_str(), |r| r.path.as_str());
+        let (edits, exact) = &sources[path];
+        let edit_cands = correlate_hunks(c.time, &c.hunk_hashes, edits, &root, line_scoped);
+        let mut ranked = rank_attributions(&c.sha, exact, edit_cands, edits, line_scoped);
         if !ranked.is_empty() {
             matched_commits += 1;
         }
@@ -886,6 +950,7 @@ pub fn blame(file: &str, lines: Option<&str>) -> Result<BlameReport> {
             time: c.time,
             summary: c.summary.clone(),
             matches: ranked,
+            relocated_from: c.relocated_from.clone(),
         });
     }
 
