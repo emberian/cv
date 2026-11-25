@@ -615,3 +615,77 @@ fn claude_wrapped_notices_and_results_beside_text_reach_the_analysis() {
     );
     assert!(ledger_row(&pack, "search").contains("ToolSearch"), "{pack}");
 }
+
+// #tooth `--handoff`, `--state-header` and `--bricks` reach the pack from the command line, and
+// the mode picks the tail's default size.
+#[test]
+fn distill_handoff_modes_shape_the_pack() {
+    let w = World::new("distill-handoff");
+    let call = |uuid: &str, ts: &str, text: &str, tool: serde_json::Value| {
+        claude::assistant(uuid, ts, "test", json!([{"type": "text", "text": text}, tool]))
+    };
+    w.write_session(
+        "handoff-lane",
+        &[
+            claude::user("handoff-lane", "u", "2026-10-01T00:00:00Z", "Make the gate green."),
+            call(
+                "a1",
+                "2026-10-01T00:00:01Z",
+                "My theory: the cache is stale.",
+                claude::tool_use("g1", "Bash", json!({"command": "cargo test -p gate"})),
+            ),
+            claude::tool_result(
+                "r1",
+                "2026-10-01T00:00:02Z",
+                "g1",
+                "test result: FAILED. 0 passed; 1 failed",
+            ),
+            call(
+                "a2",
+                "2026-10-01T00:00:03Z",
+                "Trying a fix.",
+                claude::tool_use(
+                    "e1",
+                    "Edit",
+                    json!({"file_path": "/w/src/lib.rs", "old_string": "a", "new_string": "b"}),
+                ),
+            ),
+            claude::tool_result("r2", "2026-10-01T00:00:04Z", "e1", "ok"),
+        ],
+    );
+    let pack = |extra: &[&str]| {
+        let mut args = vec!["distill", "handoff-lane"];
+        args.extend_from_slice(extra);
+        let (ok, _, out, err) = w.cv(&args);
+        assert!(ok, "{args:?}: {err}");
+        out
+    };
+    let plain = pack(&[]);
+    assert!(!plain.contains("## 0b. Continuation state"));
+    let peer = pack(&["--handoff", "peer"]);
+    assert!(peer.contains("`state: post_failure_edit` · handoff: peer"), "{peer}");
+    assert!(peer.contains("My theory: the cache is stale."));
+    let escalate = pack(&["--handoff", "escalate"]);
+    let quarantine = escalate
+        .find("## 5b. [UNVERIFIED PREDECESSOR NOTES")
+        .expect("quarantine");
+    assert!(!escalate[..quarantine].contains("My theory"), "{escalate}");
+    assert!(escalate.contains("test result: FAILED"));
+    assert!(
+        !escalate.contains("## 6. The last"),
+        "escalation keeps no tail by default"
+    );
+    assert!(pack(&["--handoff", "escalate", "--keep-last", "1"]).contains("## 6. The last 1 tool calls"));
+    let downshift = pack(&["--handoff", "downshift"]);
+    assert!(downshift.contains("## 4b. Verified progress") && !downshift.contains("## 5. Ledger"));
+    let header = pack(&["--state-header"]);
+    assert!(header.contains("`state: post_failure_edit`\n"), "{header}");
+    assert!(pack(&["--bricks", "--keep-last", "0"]).contains("## 0a. Prefix bricks"));
+    let (ok, code, _, err) = w.cv(&["distill", "handoff-lane", "--handoff", "sideways"]);
+    assert!(!ok && code == 2, "{err}");
+    let (ok, _, report, err) = w.cv(&["distill", "handoff-lane", "--handoff", "escalate", "--json"]);
+    assert!(ok, "{err}");
+    let report: serde_json::Value = serde_json::from_str(&report).unwrap();
+    assert_eq!(report["stats"]["continuation_state"], "post_failure_edit", "{report}");
+    assert_eq!(report["stats"]["handoff"], "escalate", "{report}");
+}
