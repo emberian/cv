@@ -1639,6 +1639,8 @@ fn index_session(
         ))?,
     };
     let Some(done) = done else { return Ok(None) };
+    // The pass's session carries the git facts the records named, metadata callback or not.
+    sink.note_git(done.session.git.as_ref());
     sink.finish()?;
     Ok(Some((sink.docs, done, sink.dependencies)))
 }
@@ -1736,6 +1738,10 @@ struct ChunkSink<'w> {
     /// [`facets_of`] the exchange messages in `buf` (or, swapped, `other`): written with it.
     facets: String,
     other_facets: String,
+    /// The session's own git facets ([`git_facets_of`]): its branch and short commit, on the meta doc.
+    git_facets: String,
+    /// Ids of `git commit` calls whose results have not arrived ([`ChunkSink::git_facets_in`]).
+    commit_calls: Vec<String>,
     /// Turns stamped before this were copied from another session ([`cv_core::Adapter::copied_before`]),
     /// which indexes them: they count as messages and add no text.
     copied_before: Option<chrono::DateTime<chrono::Utc>>,
@@ -1767,6 +1773,10 @@ struct FtsState {
     meta_received: bool,
     first_prompt: Option<String>,
     preview: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    git_facets: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    commit_calls: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     open: Option<Open>,
 }
@@ -1847,6 +1857,8 @@ impl<'w> ChunkSink<'w> {
             other_first: 0,
             facets: String::new(),
             other_facets: String::new(),
+            git_facets: String::new(),
+            commit_calls: Vec::new(),
             copied_before: None,
             boundary_due: false,
             keep_open: false,
@@ -1882,6 +1894,8 @@ impl<'w> ChunkSink<'w> {
         sink.meta_received = st.meta_received;
         sink.first_prompt = st.first_prompt;
         sink.preview = st.preview;
+        sink.git_facets = st.git_facets;
+        sink.commit_calls = st.commit_calls;
         sink.last_checkpoint = cp.offset;
         if let Some(open) = st.open {
             sink.last_checkpoint = open.last_checkpoint;
@@ -1997,6 +2011,9 @@ impl<'w> ChunkSink<'w> {
             let mut doc = self.doc(KIND_META);
             if !self.preview.is_empty() {
                 doc.add_text(self.f.preview, &self.preview);
+            }
+            if !self.git_facets.is_empty() {
+                doc.add_text(self.f.facets, &self.git_facets);
             }
             doc.add_i64(self.f.mtime, self.mtime);
             // `size` is the primary incremental freshness key for append-only transcript logs.
@@ -2182,18 +2199,7 @@ fn facets_of(blocks: &[cv_core::Block], out: &mut String) {
             out.push(' ');
         }
     }
-    fn text(input: &cv_core::Json, key: &str) -> Option<String> {
-        let value = input.select(key).ok()??;
-        let value = value.resolve().ok()?;
-        match &*value {
-            serde_json::Value::String(s) => Some(s.clone()),
-            serde_json::Value::Array(parts) => {
-                let words: Vec<&str> = parts.iter().filter_map(serde_json::Value::as_str).collect();
-                (!words.is_empty()).then(|| words.join(" "))
-            }
-            _ => None,
-        }
-    }
+    let text = input_text;
     for block in blocks {
         match block {
             cv_core::Block::ToolUse { name, input, .. } => {
@@ -2250,6 +2256,132 @@ fn facets_of(blocks: &[cv_core::Block], out: &mut String) {
             }
             _ => {}
         }
+    }
+}
+
+/// Push a branch name and a commit's short SHA as facet keys: the branch whole (its words are
+/// tokens of their own too), the commit's first 7 hex digits and the commit as written.
+fn git_facets_of(branch: Option<&str>, commit: Option<&str>, out: &mut String) {
+    let mut push = |key: &str| {
+        let key = key.trim();
+        if !key.is_empty() && out.len() + key.len() < FACET_BYTES {
+            out.push_str(key);
+            out.push(' ');
+        }
+    };
+    if let Some(branch) = branch.filter(|b| !b.is_empty() && *b != "HEAD") {
+        push(branch);
+    }
+    if let Some(commit) = commit.filter(|c| c.len() >= 7 && c.bytes().all(|b| b.is_ascii_hexdigit())) {
+        push(&commit[..7]);
+        if commit.len() > 7 {
+            push(commit);
+        }
+    }
+}
+
+/// The branch and commit of `git commit`'s summary line (`[main 1a2b3c4] subject`, also
+/// `[main (root-commit) 1a2b3c4]` and `[detached HEAD 1a2b3c4]`) in the head of its output.
+fn commit_summary(output: &str) -> Option<(Option<&str>, &str)> {
+    output.lines().take(8).find_map(|line| {
+        let inner = line.trim_start().strip_prefix('[')?.split_once(']')?.0;
+        let words: Vec<&str> = inner.split_whitespace().collect();
+        let (&sha, rest) = words.split_last()?;
+        (sha.len() >= 7 && sha.bytes().all(|b| b.is_ascii_hexdigit()) && !rest.is_empty())
+            .then(|| (Some(rest[0]).filter(|b| *b != "detached"), sha))
+    })
+}
+
+/// The branch names a git command creates or switches to (`checkout -b X`, `switch -c X`,
+/// `branch X`), from its words.
+fn branches_named<'a>(words: &[&'a str]) -> Vec<&'a str> {
+    let Some(git) = words.iter().position(|w| *w == "git") else {
+        return Vec::new();
+    };
+    let args = &words[git + 1..];
+    let named = |flags: &[&str]| {
+        args.windows(2)
+            .find(|w| flags.contains(&w[0]))
+            .map(|w| w[1])
+            .filter(|b| !b.starts_with('-'))
+    };
+    match args.first().copied() {
+        Some("checkout") => named(&["-b", "-B"]).into_iter().collect(),
+        Some("switch") => named(&["-c", "-C", "--create"]).into_iter().collect(),
+        Some("branch") => args
+            .get(1)
+            .filter(|b| !b.starts_with('-'))
+            .copied()
+            .into_iter()
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+impl ChunkSink<'_> {
+    /// The session's branch and commit, the meta doc's facets ([`git_facets_of`]).
+    fn note_git(&mut self, git: Option<&cv_core::ir::GitInfo>) {
+        if let Some(git) = git {
+            self.git_facets.clear();
+            git_facets_of(git.branch.as_deref(), git.commit.as_deref(), &mut self.git_facets);
+        }
+    }
+
+    /// Git facets of one exchange message: branches a command names, and the branch and short SHA
+    /// a `git commit` call's result reports, read from a bounded head of that result only.
+    fn git_facets_in(&mut self, r: &cv_core::Resolver, blocks: &[cv_core::Block]) {
+        const PENDING: usize = 64;
+        for block in blocks {
+            match block {
+                cv_core::Block::ToolUse { id, input, .. } => {
+                    let Some(command) = ["command", "cmd"].iter().find_map(|k| input_text(input, k)) else {
+                        continue;
+                    };
+                    let words: Vec<&str> = command
+                        .split(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ';' | '&' | '|'))
+                        .filter(|w| !w.is_empty())
+                        .collect();
+                    for branch in branches_named(&words) {
+                        git_facets_of(Some(branch), None, &mut self.facets);
+                    }
+                    // `git commit …`, also `git -C dir commit …`; a stray match only waits for a
+                    // result whose head has no commit summary.
+                    let commits = words.iter().skip_while(|w| **w != "git").any(|w| *w == "commit");
+                    if commits && self.commit_calls.len() < PENDING {
+                        self.commit_calls.push(id.clone());
+                    }
+                }
+                cv_core::Block::ToolResult {
+                    tool_use_id, content, ..
+                } => {
+                    let Some(at) = self.commit_calls.iter().position(|c| c == tool_use_id) else {
+                        continue;
+                    };
+                    self.commit_calls.swap_remove(at);
+                    let Ok(head) = content.try_resolve_prefix(r, 1024) else {
+                        continue;
+                    };
+                    if let Some((branch, sha)) = commit_summary(&head) {
+                        git_facets_of(branch, Some(sha), &mut self.facets);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// A tool input's string (or string-array, joined) field.
+fn input_text(input: &cv_core::Json, key: &str) -> Option<String> {
+    let value = input.select(key).ok()??;
+    let value = value.resolve().ok()?;
+    match &*value {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Array(parts) => {
+            let words: Vec<&str> = parts.iter().filter_map(serde_json::Value::as_str).collect();
+            (!words.is_empty()).then(|| words.join(" "))
+        }
+        _ => None,
     }
 }
 
@@ -2338,6 +2470,7 @@ impl cv_core::MessageSink for ChunkSink<'_> {
     fn meta(&mut self, s: &cv_core::Session) {
         self.meta_title = s.title.clone();
         self.meta_received = true;
+        self.note_git(s.git.as_ref());
         // Keep discovery cwd (the indexed filter identity) when present; parsed title above
         // is authoritative for display, with title() supplying its first-prompt fallback.
         if self.cwd.is_none() {
@@ -2401,6 +2534,8 @@ impl cv_core::MessageSink for ChunkSink<'_> {
                 meta_received: self.meta_received,
                 first_prompt: self.first_prompt.clone(),
                 preview: self.preview.clone(),
+                git_facets: self.git_facets.clone(),
+                commit_calls: self.commit_calls.clone(),
                 open,
             },
         );
@@ -2430,6 +2565,7 @@ impl cv_core::MessageSink for ChunkSink<'_> {
             self.switch_to(!m.kind.is_exchange());
             if !self.in_context {
                 facets_of(&m.content, &mut self.facets);
+                self.git_facets_in(&r, &m.content);
             }
             self.append_blocks(&r, &m.content);
         }
@@ -4254,6 +4390,28 @@ fn head(s: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The git keys a commit's summary line and a branch-creating command give.
+    #[test]
+    fn git_facets_parse_commit_summaries_and_created_branches() {
+        assert_eq!(commit_summary("[main 1a2b3c4] fix"), Some((Some("main"), "1a2b3c4")));
+        assert_eq!(
+            commit_summary("noise\n[feat/x (root-commit) 0123456789ab] init"),
+            Some((Some("feat/x"), "0123456789ab"))
+        );
+        assert_eq!(commit_summary("[detached HEAD 1a2b3c4] wip"), Some((None, "1a2b3c4")));
+        assert_eq!(commit_summary("[warn] not a commit"), None);
+        assert_eq!(commit_summary("[abcdef1]"), None, "a SHA alone names no commit line");
+        let words = |c: &'static str| c.split_whitespace().collect::<Vec<_>>();
+        assert_eq!(branches_named(&words("git checkout -b topic")), ["topic"]);
+        assert_eq!(branches_named(&words("git switch -c topic")), ["topic"]);
+        assert_eq!(branches_named(&words("git branch topic")), ["topic"]);
+        assert!(branches_named(&words("git branch -d topic")).is_empty());
+        assert!(branches_named(&words("git checkout main")).is_empty());
+        let mut out = String::new();
+        git_facets_of(Some("HEAD"), Some("0123456789abcdef0123456789abcdef01234567"), &mut out);
+        assert_eq!(out, "0123456 0123456789abcdef0123456789abcdef01234567 ");
+    }
+
     use super::*;
 
     fn ingest_job(r: cv_core::SessionRef) -> Job {

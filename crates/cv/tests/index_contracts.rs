@@ -405,3 +405,47 @@ fn rewritten_then_grown_transcript_retracts_replaced_text_from_search() {
     }
     assert_eq!(total("anteater"), 1);
 }
+
+/// #tooth A session is found by its git branch (session metadata, on its meta doc) and a turn
+/// by the short SHA its `git commit` reported, neither of which is in any message's text.
+#[test]
+fn git_branch_and_commit_sha_facets_find_the_session_and_the_committing_turn() {
+    let w = World::new("git-facets");
+    let lines = [
+        serde_json::json!({"type": "user", "uuid": "g1", "timestamp": TS, "sessionId": "gitsess",
+            "gitBranch": "feat/heron-otter", "message": {"role": "user", "content": "save the work"}}),
+        serde_json::json!({"type": "assistant", "uuid": "g2", "timestamp": TS, "sessionId": "gitsess",
+            "gitBranch": "feat/heron-otter", "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "c1", "name": "Bash",
+                 "input": {"command": "git checkout -b topic-kestrel && git commit -am 'tidy'"}}]}}),
+        serde_json::json!({"type": "user", "uuid": "g3", "timestamp": TS, "sessionId": "gitsess",
+            "gitBranch": "feat/heron-otter", "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "c1",
+                 "content": "Switched to a new branch\n[topic-kestrel 9e1d0c7] tidy\n 1 file changed"}]}}),
+    ];
+    let body: String = lines.iter().map(|l| format!("{l}\n")).collect();
+    fs::write(w.transcript("gitsess"), body).unwrap();
+    fs::write(
+        w.transcript("othersess"),
+        format!(
+            "{}\n",
+            serde_json::json!({"type": "user", "uuid": "o1", "timestamp": TS, "sessionId": "othersess",
+                "message": {"role": "user", "content": "nothing about version control"}})
+        ),
+    )
+    .unwrap();
+    w.cv_ok(&["index"]);
+    let ids = |query: &str| -> Vec<String> {
+        let (out, _) = w.cv_ok(&["search", query, "--json"]);
+        let found: serde_json::Value = serde_json::from_str(&out).unwrap();
+        found["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["id"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    assert_eq!(ids("heron otter"), ["gitsess"], "the session branch");
+    assert_eq!(ids("9e1d0c7"), ["gitsess"], "the short SHA the commit reported");
+    assert_eq!(ids("kestrel"), ["gitsess"], "the branch the command created");
+}
