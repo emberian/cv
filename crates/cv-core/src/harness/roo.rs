@@ -208,6 +208,15 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &crate::emit::EmitOptions) 
     emit_with_harness(session, out_dir, opts, Harness::Roo)
 }
 
+pub(crate) fn emit_staged(
+    session: &Session,
+    out_dir: &Path,
+    opts: &crate::emit::EmitOptions,
+    verify: Option<crate::emit::stage::VerifyFn<'_>>,
+) -> Result<crate::harness::EmitResult> {
+    super::cline::emit_with_harness_staged(session, out_dir, opts, Harness::Roo, verify)
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::cline::{parse_history_str, parse_task_dir};

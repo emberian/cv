@@ -64,6 +64,30 @@
 use crate::json::{ReadInput, Validation};
 mod emit;
 pub use emit::emit;
+pub(crate) use emit::emit_staged;
+
+pub(crate) fn stream_conn_verified(
+    conn: &Connection,
+    r: &SessionRef,
+    opts: &stream::Demand,
+    sink: &mut dyn MessageSink,
+) -> Result<Session> {
+    let guard = crate::json::SqliteSessionGuard::new(|| false);
+    let result = crate::stream::checked(sink, |sink| {
+        let mut spawns =
+            crate::affordance::AffordanceSink::new(Harness::Hermes, sink).unwrapping(Some(DEFERRED_WRAPPER));
+        stream_conn_with_reads(
+            conn,
+            r,
+            opts,
+            &mut spawns,
+            &crate::source::ReadSet::default(),
+            Some(&guard),
+        )
+    });
+    guard.end_pass();
+    result
+}
 
 use super::store::sqlite::{open_ro, table_exists, Cells, Select};
 use super::wire::openai;

@@ -10,7 +10,9 @@ pub(crate) mod json;
 pub(crate) mod jsonl;
 mod jsonl_write;
 pub(crate) mod selection;
-pub(crate) use jsonl_write::{publish_stage, publish_stage_checked, stage_into, JsonlStage};
+#[cfg(test)]
+pub(crate) use jsonl_write::publish_stage;
+pub(crate) use jsonl_write::JsonlStage;
 pub(crate) mod text;
 
 #[cfg(feature = "sqlite")]

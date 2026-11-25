@@ -130,15 +130,31 @@ fn tool_result(writer: &mut dyn Write, blocks: &[Block], timestamp: i64, resolve
     inner.finish()
 }
 
-pub(super) fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<EmitResult> {
-    emit_after_stage(session, out_dir, opts, || Ok(()))
+pub(super) fn emit(
+    session: &Session,
+    out_dir: &Path,
+    opts: &EmitOptions,
+    verify: Option<crate::emit::stage::VerifyFn<'_>>,
+) -> Result<EmitResult> {
+    emit_after_stage_with_verify(session, out_dir, opts, || Ok(()), verify)
 }
 
+#[cfg(test)]
 pub(super) fn emit_after_stage(
     session: &Session,
     out_dir: &Path,
     opts: &EmitOptions,
     after_stage: impl FnOnce() -> Result<()>,
+) -> Result<EmitResult> {
+    emit_after_stage_with_verify(session, out_dir, opts, after_stage, None)
+}
+
+fn emit_after_stage_with_verify(
+    session: &Session,
+    out_dir: &Path,
+    opts: &EmitOptions,
+    after_stage: impl FnOnce() -> Result<()>,
+    verify: Option<crate::emit::stage::VerifyFn<'_>>,
 ) -> Result<EmitResult> {
     opts.validate_ids()?;
     wire::check_source_fields(session)?;
@@ -336,10 +352,12 @@ pub(super) fn emit_after_stage(
             &cwd_str,
             created,
             &sql_events,
+            verify,
         );
     }
-    // All source demands complete before opening the transcript or changing its index.
-    fs::create_dir_all(&sessions_dir).with_context(|| format!("creating {}", sessions_dir.display()))?;
+    if !opts.force {
+        crate::publish::refuse_existing(&file_path, "")?;
+    }
     let index_path = sessions_dir.join("sessions.json");
     // cv's update replaces OpenClaw's index whole, so an index it cannot read as one is refused,
     // never replaced by one holding only this session.
@@ -378,11 +396,34 @@ pub(super) fn emit_after_stage(
     index.insert(session_key, Value::Object(entry));
     let mut index_stage = crate::harness::store::bytes::ByteStage::new();
     serde_json::to_writer_pretty(&mut index_stage, &index)?;
+    let lines_source = lines.into_source()?;
+    let index_source = index_stage.finish()?;
+    let resume = Some(format!(
+        "openclaw agent --session-id {new_id} --message \"<your prompt>\" --local"
+    ));
+
+    if let Some(verify_fn) = verify {
+        let ws = crate::emit::stage::StageWorkspace::beside(out_dir, "openclaw")?;
+        let rel_dir = Path::new("agents/main/sessions");
+        let staged_path = ws.write_source(rel_dir.join(format!("{new_id}.jsonl")), &lines_source)?;
+        ws.write_source(rel_dir.join("sessions.json"), &index_source)?;
+        let staged_result = EmitResult {
+            path: staged_path,
+            new_id: new_id.clone(),
+            resume_hint: resume.clone(),
+            ..Default::default()
+        };
+        verify_fn(crate::emit::stage::StagedSource::Files { result: &staged_result })?;
+    }
+
+    // All source demands and staged verification complete before creating directories or opening
+    // the destination transcript or its index.
+    fs::create_dir_all(&sessions_dir).with_context(|| format!("creating {}", sessions_dir.display()))?;
     // The transcript and its index entry publish as one set, the index last: a crash between
     // leaves an unlisted transcript, never an entry naming a missing one.
     let mut set = crate::publish::Set::new();
-    lines.stage_into(&mut set, &file_path, opts.claim())?;
-    crate::harness::store::stage_into(&mut set, index_stage, &index_path, crate::publish::Claim::Replace)?;
+    crate::emit::stage::stage_source_into(&mut set, &lines_source, &file_path, opts.claim())?;
+    crate::emit::stage::stage_source_into(&mut set, &index_source, &index_path, crate::publish::Claim::Replace)?;
     after_stage()?;
     // Another writer's index update since the read would be lost under ours: refuse, publish nothing.
     if crate::source::FileId::at(&index_path) != read {
@@ -394,10 +435,9 @@ pub(super) fn emit_after_stage(
     set.publish()?;
     Ok(EmitResult {
         path: file_path,
-        new_id: new_id.clone(),
-        resume_hint: Some(format!(
-            "openclaw agent --session-id {new_id} --message \"<your prompt>\" --local"
-        )),
+        new_id,
+        resume_hint: resume,
+        ..Default::default()
     })
 }
 
@@ -467,15 +507,15 @@ fn emit_to_sqlite(
     cwd_str: &str,
     created: chrono::DateTime<Utc>,
     events: &[String],
+    verify: Option<crate::emit::stage::VerifyFn<'_>>,
 ) -> Result<EmitResult> {
-    if let Some(parent) = db_path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-    }
+    let mut guard = crate::emit::stage::SqliteRollbackGuard::prepare(db_path)?;
     let mut conn = rusqlite::Connection::open(db_path).with_context(|| format!("opening {}", db_path.display()))?;
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
-    conn.execute_batch(
-        "PRAGMA foreign_keys = ON;
-         CREATE TABLE IF NOT EXISTS session_nodes (
+    conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS session_nodes (
            session_key TEXT NOT NULL PRIMARY KEY, current_session_id TEXT NOT NULL,
            entry_json TEXT NOT NULL, legacy_acp_migration_json TEXT,
            entry_valid INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL, status TEXT,
@@ -498,8 +538,6 @@ fn emit_to_sqlite(
            FOREIGN KEY (session_id) REFERENCES session_windows(session_id) ON DELETE CASCADE) STRICT;",
     )
     .with_context(|| format!("initializing OpenClaw SQLite schema in {}", db_path.display()))?;
-
-    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let exists: bool = tx
         .query_row("SELECT 1 FROM session_windows WHERE session_id = ?1", [new_id], |_| {
             Ok(true)
@@ -574,12 +612,21 @@ fn emit_to_sqlite(
             insert_ev.execute(rusqlite::params![new_id, seq as i64, ev, created_ms])?;
         }
     }
-    tx.commit()?;
-    Ok(EmitResult {
+    let result = EmitResult {
         path: db_path.to_path_buf(),
         new_id: new_id.to_string(),
         resume_hint: Some(format!(
             "openclaw agent --session-id {new_id} --message \"<your prompt>\" --local"
         )),
-    })
+        ..Default::default()
+    };
+    if let Some(verify_fn) = verify {
+        verify_fn(crate::emit::stage::StagedSource::Sqlite {
+            conn: &tx,
+            result: &result,
+        })?;
+    }
+    tx.commit()?;
+    guard.disarm();
+    Ok(result)
 }

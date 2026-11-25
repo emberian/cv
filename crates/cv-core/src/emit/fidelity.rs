@@ -7,8 +7,8 @@ use super::*;
 mod accumulator;
 use crate::harness::claude::emit::SystemFate;
 use crate::harness::grok::emit::grok_model_id;
-pub(super) use accumulator::source_features;
-use accumulator::Accumulator;
+pub(super) use accumulator::{source_features, source_projected_with_opts, Projected};
+use accumulator::{Accumulator, Unit, UnitKind};
 #[cfg(feature = "sqlite")]
 use anyhow::Context;
 
@@ -229,8 +229,7 @@ pub struct FidelityReport {
 }
 
 impl FidelityReport {
-    /// Any loss the target could have avoided — what `port --strict` fails on.
-    #[cfg(test)]
+    /// Any loss or corruption the target could have avoided — what `port --strict` fails on.
     pub fn has_unexpected(&self) -> bool {
         self.deltas.iter().any(|d| !d.expected)
     }
@@ -279,6 +278,7 @@ pub(super) struct Features {
 /// Whether `target`’s format can hold this block at all (the block-level half of
 /// [`holds_fields`]), under the requested [`ThinkingMode`]. A thinking block survives if
 /// [`thinking_fate`] writes anything for it — structurally, as text, or as a placeholder.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn block_survives(target: Harness, thinking: ThinkingMode, b: &Block) -> bool {
     match b {
         Block::Text { .. } => true,
@@ -300,140 +300,9 @@ pub(super) fn block_survives(target: Harness, thinking: ThinkingMode, b: &Block)
         }
         Block::ToolUse { .. } => target_holds(target, Field::ToolUse),
         Block::ToolResult { .. } => target_holds(target, Field::ToolResult),
-        Block::Opaque { .. } => false,
+        Block::Opaque { .. } => target_holds(target, Field::Opaque),
         Block::Image { .. } => target_holds(target, Field::Image),
         Block::File { .. } => target_holds(target, Field::File),
-    }
-}
-
-impl Features {
-    /// `written_from` is the harness the message was read from when these are the features of
-    /// what a writer is ABOUT to write (the source side), `None` for what a reader read back.
-    fn note(
-        &mut self,
-        target: Harness,
-        thinking: ThinkingMode,
-        m: &Message,
-        session_model: bool,
-        orphan_call: &impl Fn(&Block) -> bool,
-        written_from: Option<Harness>,
-    ) {
-        let f = self;
-        let fate = written_from
-            .zip(write_rules(target).system_fate)
-            .map(|(source, fate)| fate(source, m));
-        // Notes are presence facts (inline markers, `accumulator::project`), never source text.
-        let unrepresentable = unrepresentable_checked(target, thinking, m, &crate::lazy::Resolver::new(None))
-            .expect("noted facts are inline");
-        if !m.is_carrier() && unrepresentable {
-            f.dropped += 1;
-        }
-        // Two kinds of message are not *turns* for this comparison and are skipped whole — counting
-        // their timestamps/ids/model would have reported losses that no emitter could have avoided:
-        //
-        //  * a format-complete **carrier** (empty-content System message holding a verbatim meta
-        //    record) is bookkeeping the emitter replays byte-for-byte. A message that keeps its
-        //    record AND has content (a model-visible Claude attachment) or is a synthesized
-        //    boundary (`compact_boundary`) is counted on both sides;
-        //  * a turn the target cannot represent AT ALL ([`unrepresentable_checked`]), or one whose only
-        //    content is unanswered calls the Claude emitter drops.
-        let bookkeeping =
-            m.kind == MessageKind::Carrier || (m.is_carrier() && m.content.is_empty() && !m.is_synthesized());
-        if bookkeeping || unrepresentable || (!m.content.is_empty() && m.content.iter().all(&orphan_call)) {
-            return;
-        }
-        // A store whose own reader re-tags a turn on the way back in is not LOSING it, and the
-        // verifier must not cry loss over a transformation the format defines. Model the known ones
-        // here so both sides agree; anything else still shows up.
-        let (role, kind) = if write_rules(target).reroles_client_commands && is_client_command(m) {
-            ("system", MessageKind::InjectedContext.as_str())
-        } else if fate == Some(SystemFate::Special(MessageKind::CompactionSummary)) {
-            // Claude Code's compaction summary is a `user` record (`isCompactSummary`).
-            ("user", m.kind.as_str())
-        } else {
-            (role_str(m.role), m.kind.as_str())
-        };
-        *f.role_counts.entry(role).or_default() += 1;
-        *f.kind_counts.entry(kind).or_default() += 1;
-        // A Tool turn's timestamp/id are counted apart from every other turn's: two of our targets
-        // have no record to hang them on, and blanket-excusing ids or timestamps would have hidden
-        // a real loss on a normal turn.
-        let tool_turn = m.role == Role::Tool;
-        if m.timestamp.is_some() {
-            if tool_turn {
-                f.timestamps_tool += 1;
-            } else {
-                f.timestamps += 1;
-            }
-        }
-        if m.id.is_some() {
-            if tool_turn {
-                f.ids_tool += 1;
-            } else {
-                f.ids += 1;
-            }
-        }
-        // Usage is a property of a MODEL turn, and that is the only place a store keeps it (Codex
-        // attaches `token_count` to the assistant message it trails; OpenCode to the assistant
-        // part). Claude also writes a `usage` block on its synthetic client-side error notices,
-        // which parse as System turns — counting those made every real port report 13 lost usages
-        // that no target has a slot for.
-        if let (Role::Assistant, Some(usage)) = (m.role, &m.usage) {
-            f.usage += 1;
-            if !target_holds(target, Field::UsageCacheCreation) && usage.cache_creation_tokens.is_some() {
-                f.unheld_cache_creation += 1;
-            }
-            if usage.cost_usd.is_some() {
-                f.cost += 1;
-            }
-        }
-        // Effective model: a turn's own model, else the session default (a target that records the
-        // model once per session still carries it, so raw `Message::model` would flag non-losses).
-        if m.model.is_some() || session_model {
-            f.model_eff += 1;
-        }
-        for b in m.content.iter().filter(|b| !orphan_call(b)) {
-            match b {
-                Block::Text { .. } => f.text += 1,
-                Block::ToolUse { .. } => f.tool_use += 1,
-                Block::Opaque { .. } => f.opaque += 1,
-                Block::Image { .. } => f.image += 1,
-                Block::File { .. } => f.file += 1,
-                Block::ToolResult {
-                    tool_name,
-                    is_error,
-                    details,
-                    ..
-                } => {
-                    f.tool_result += 1;
-                    if tool_name.as_deref().is_some_and(|n| !n.is_empty()) {
-                        f.results_with_name += 1;
-                    }
-                    if *is_error {
-                        f.results_is_error += 1;
-                    }
-                    if details.is_some() {
-                        f.results_with_details += 1;
-                    }
-                }
-                Block::Thinking {
-                    text,
-                    signature,
-                    encrypted,
-                    ..
-                } => {
-                    if !text.trim().is_empty() {
-                        f.thinking_text += 1;
-                    }
-                    if signature.is_some() {
-                        f.thinking_sig += 1;
-                    }
-                    if encrypted.is_some() {
-                        f.thinking_enc += 1;
-                    }
-                }
-            }
-        }
     }
 }
 
@@ -545,7 +414,7 @@ pub(crate) fn holds_fields(h: Harness) -> &'static [Field] {
         Harness::Roo => &[Text, ThinkingText, Image, ToolUse, ToolResult, IsError, UsageCacheCreation, Timestamp, TimestampToolTurn, Id, IdToolTurn, Title, Cwd, SessionModel, CompleteReparse],
         Harness::Continue => &[Text, Image, ToolUse, ToolResult, IsError, Usage, Cost, Timestamp, TimestampToolTurn, Title, Cwd, SessionModel, CompleteReparse],
         Harness::Qwen => &[Text, ThinkingText, Image, File, ToolUse, ToolResult, ToolName, IsError, Usage, UsageCacheCreation, Timestamp, TimestampToolTurn, Id, IdToolTurn, Title, Cwd, SessionModel, CompleteReparse],
-        Harness::OpenSession => &[Principal],
+        Harness::OpenSession => &[Principal, Opaque],
         Harness::Cursor
         | Harness::Antigravity
         | Harness::Pi
@@ -670,17 +539,6 @@ pub(crate) fn write_rules(h: Harness) -> WriteRules {
     }
 }
 
-/// A human-typed client command (`/compact`, `?help`) rather than a prompt for the model.
-pub(super) fn is_client_command(m: &Message) -> bool {
-    m.kind == MessageKind::Prompt
-        && m.text()
-            .map(|t| {
-                let t = t.trim_start();
-                t.starts_with('/') || t.starts_with('?')
-            })
-            .unwrap_or(false)
-}
-
 /// [`target_holds`] under the requested [`ThinkingMode`]: `drop` is the user saying "lose the
 /// reasoning", so a thinking loss there is expected no matter what the target could have held.
 /// (`text` needs no override — the text lands in a [`Block::Text`] and the structured payloads are
@@ -704,19 +562,29 @@ pub(super) fn diff_fidelity(
     input: &Session,
     reparsed: &Session,
 ) -> FidelityReport {
-    let before = source_features(target, thinking, input).expect("source fidelity facts");
-    let after = accumulator::read_features(target, thinking, reparsed).expect("reparsed fidelity facts");
-    diff_features(target, thinking, input, reparsed, before, after)
+    let before = source_projected_with_opts(
+        target,
+        input,
+        &EmitOptions {
+            thinking,
+            ..Default::default()
+        },
+    )
+    .expect("source fidelity facts");
+    let after = accumulator::read_projected(target, thinking, reparsed).expect("reparsed fidelity facts");
+    diff_projected(target, thinking, input, reparsed, before, after)
 }
 
-pub(super) fn diff_features(
+pub(super) fn diff_projected(
     target: Harness,
     thinking: ThinkingMode,
     input: &Session,
     reparsed: &Session,
-    before: Features,
-    after: Features,
+    before_proj: Projected,
+    after_proj: Projected,
 ) -> FidelityReport {
+    let before = before_proj.features;
+    let after = after_proj.features;
     let dropped = before.dropped;
     let mut deltas = Vec::new();
 
@@ -762,6 +630,16 @@ pub(super) fn diff_features(
             b: "0".into(),
             expected: true,
             why: None,
+            at: at(),
+        });
+    }
+    if before_proj.skills_stripped > 0 {
+        deltas.push(Divergence {
+            what: "system:invoked_skills".into(),
+            a: before_proj.skills_stripped.to_string(),
+            b: "0".into(),
+            expected: true,
+            why: Some("dropped by --skills policy"),
             at: at(),
         });
     }
@@ -1079,15 +957,222 @@ pub(super) fn diff_features(
         });
     }
 
+    // Ordered canonical unit equivalence (`parse_B(emit_B(S)) ≡_ρ π_B(S)`): verify exact unit
+    // ordering, BLAKE3 content digests (text, thinking, canonical tool_use JSON arguments,
+    // tool_result payloads), excess/duplicated units, and injective tool_use_id ↔ tool_result
+    // pairing `ρ`. Only suppressed when an unexpected count loss already indicted the round-trip,
+    // or emitted alongside to pinpoint the exact `turn[i].block[j]` when counts matched or grew.
+    let already_has_unexpected_loss = deltas.iter().any(|d| !d.expected);
+    if !already_has_unexpected_loss {
+        diff_units(target, &before_proj.units, &after_proj.units, &mut deltas);
+    }
+
     FidelityReport { deltas }
 }
 
-pub(super) fn reparse_features(
+fn hex4(hash: &[u8; 32]) -> String {
+    format!("{:02x}{:02x}{:02x}{:02x}", hash[0], hash[1], hash[2], hash[3])
+}
+
+fn diff_units(target: Harness, before: &[Unit], after: &[Unit], deltas: &mut Vec<Divergence>) {
+    let at = || target.as_str().to_string();
+    let common = before.len().min(after.len());
+    for k in 0..common {
+        let u = &before[k];
+        let v = &after[k];
+        if u.kind == v.kind {
+            continue;
+        }
+        let (what, a, b) = match (&u.kind, &v.kind) {
+            (UnitKind::Text { hash: ha, .. }, UnitKind::Text { hash: hb, .. }) => (
+                format!("{} text", u.loc),
+                format!("{} [blake3:{}]", u.kind.summary(), hex4(ha)),
+                format!("{} [blake3:{}]", v.kind.summary(), hex4(hb)),
+            ),
+            (UnitKind::Thinking { .. }, UnitKind::Thinking { .. }) => {
+                (format!("{} thinking", u.loc), u.kind.summary(), v.kind.summary())
+            }
+            (
+                UnitKind::ToolUse {
+                    call_rho: ra,
+                    name: na,
+                    input_hash: ia,
+                    ..
+                },
+                UnitKind::ToolUse {
+                    call_rho: rb,
+                    name: nb,
+                    input_hash: ib,
+                    ..
+                },
+            ) => {
+                if ra != rb {
+                    (
+                        format!("{} tool_use.id (ρ)", u.loc),
+                        format!("ρ#{ra} ({na})"),
+                        format!("ρ#{rb} ({nb})"),
+                    )
+                } else if na != nb {
+                    (format!("{} tool_use.name", u.loc), na.clone(), nb.clone())
+                } else {
+                    (
+                        format!("{} tool_use.input", u.loc),
+                        format!("{} [blake3:{}]", u.kind.summary(), hex4(ia)),
+                        format!("{} [blake3:{}]", v.kind.summary(), hex4(ib)),
+                    )
+                }
+            }
+            (
+                UnitKind::ToolResult {
+                    call_rho: ra,
+                    content_hash: ca,
+                    is_error: ea,
+                    ..
+                },
+                UnitKind::ToolResult {
+                    call_rho: rb,
+                    content_hash: cb,
+                    is_error: eb,
+                    ..
+                },
+            ) => {
+                if ra != rb {
+                    (
+                        format!("{} tool_result.tool_use_id (ρ)", u.loc),
+                        format!("ρ#{ra}"),
+                        format!("ρ#{rb}"),
+                    )
+                } else if ea != eb {
+                    (
+                        format!("{} tool_result.is_error", u.loc),
+                        format!("{ea:?}"),
+                        format!("{eb:?}"),
+                    )
+                } else {
+                    (
+                        format!("{} tool_result.content", u.loc),
+                        format!("{} [blake3:{}]", u.kind.summary(), hex4(ca)),
+                        format!("{} [blake3:{}]", v.kind.summary(), hex4(cb)),
+                    )
+                }
+            }
+            (UnitKind::Image { hash: ha, .. }, UnitKind::Image { hash: hb, .. }) => (
+                format!("{} image", u.loc),
+                format!("{} [blake3:{}]", u.kind.summary(), hex4(ha)),
+                format!("{} [blake3:{}]", v.kind.summary(), hex4(hb)),
+            ),
+            (UnitKind::File { hash: ha, .. }, UnitKind::File { hash: hb, .. }) => (
+                format!("{} file", u.loc),
+                format!("{} [blake3:{}]", u.kind.summary(), hex4(ha)),
+                format!("{} [blake3:{}]", v.kind.summary(), hex4(hb)),
+            ),
+            (UnitKind::Opaque { hash: ha, .. }, UnitKind::Opaque { hash: hb, .. }) => (
+                format!("{} opaque", u.loc),
+                format!("{} [blake3:{}]", u.kind.summary(), hex4(ha)),
+                format!("{} [blake3:{}]", v.kind.summary(), hex4(hb)),
+            ),
+            _ => (format!("{} unit order", u.loc), u.kind.summary(), v.kind.summary()),
+        };
+        deltas.push(Divergence {
+            what,
+            a,
+            b,
+            expected: false,
+            why: None,
+            at: at(),
+        });
+        return;
+    }
+    if after.len() > before.len() {
+        let extra = &after[common];
+        deltas.push(Divergence {
+            what: format!("{} unexpected extra {}", extra.loc, extra.kind.label()),
+            a: "(absent)".into(),
+            b: extra.kind.summary(),
+            expected: false,
+            why: None,
+            at: at(),
+        });
+    } else if before.len() > after.len() {
+        let missing = &before[common];
+        deltas.push(Divergence {
+            what: format!("{} missing {}", missing.loc, missing.kind.label()),
+            a: missing.kind.summary(),
+            b: "(absent)".into(),
+            expected: false,
+            why: None,
+            at: at(),
+        });
+    }
+}
+
+pub(super) fn reparse_staged_projected(
+    target: Harness,
+    thinking: ThinkingMode,
+    staged: super::stage::StagedSource<'_>,
+    opts: &Demand,
+) -> Result<(Session, Projected)> {
+    match staged {
+        super::stage::StagedSource::Files { result } => reparse_projected(target, thinking, result, opts),
+        #[cfg(feature = "sqlite")]
+        super::stage::StagedSource::Sqlite { conn, result } => {
+            reparse_sqlite_projected(target, thinking, conn, result, opts)
+        }
+    }
+}
+
+#[cfg(feature = "sqlite")]
+fn reparse_sqlite_projected(
+    target: Harness,
+    thinking: ThinkingMode,
+    conn: &rusqlite::Connection,
+    result: &EmitResult,
+    opts: &Demand,
+) -> Result<(Session, Projected)> {
+    let mut opts = reparse_options(target, opts);
+    opts.spans = true;
+    let mut sink = Accumulator::new(
+        target,
+        thinking,
+        crate::lazy::Resolver::new(Some(result.path.clone())),
+        None,
+    );
+    let r = SessionRef::new(result.new_id.clone(), target, result.path.clone());
+    let metadata = match target {
+        Harness::OpenCode => crate::harness::opencode::stream_conn(conn, &r, &opts, &mut sink)?,
+        Harness::Hermes => crate::harness::hermes::stream_conn_verified(conn, &r, &opts, &mut sink)?,
+        Harness::OpenClaw => crate::harness::openclaw::stream_sqlite_conn(conn, &r, &opts, &mut sink)?,
+        Harness::Claude
+        | Harness::Codex
+        | Harness::Grok
+        | Harness::Gemini
+        | Harness::LmStudio
+        | Harness::Cline
+        | Harness::Roo
+        | Harness::Continue
+        | Harness::Qwen
+        | Harness::Cursor
+        | Harness::Antigravity
+        | Harness::Pi
+        | Harness::Kimi
+        | Harness::KimiCode
+        | Harness::Goose
+        | Harness::Zed
+        | Harness::Devin
+        | Harness::ChatGptExport
+        | Harness::ClaudeExport
+        | Harness::OpenSession => anyhow::bail!("same-transaction SQLite reparse is not supported for {target}"),
+    };
+    let projected = sink.finish(&metadata)?;
+    Ok((metadata, projected))
+}
+
+pub(super) fn reparse_projected(
     target: Harness,
     thinking: ThinkingMode,
     result: &EmitResult,
     opts: &Demand,
-) -> Result<(Session, Features)> {
+) -> Result<(Session, Projected)> {
     let mut opts = reparse_options(target, opts);
     // Verification retains the same full/complete metadata and roles, but consumes bodies
     // through checked lazy views; complete-mode adapters may still require owned raw carriers.
@@ -1108,8 +1193,8 @@ pub(super) fn reparse_features(
         )
         .map(|read| read.session)
     })?;
-    let features = sink.into_inner().finish(&metadata);
-    Ok((metadata, features))
+    let projected = sink.into_inner().finish(&metadata)?;
+    Ok((metadata, projected))
 }
 
 fn reparse_options(target: Harness, opts: &Demand) -> Demand {

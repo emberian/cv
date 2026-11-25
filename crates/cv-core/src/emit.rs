@@ -22,10 +22,13 @@ use std::path::{Path, PathBuf};
 
 pub(crate) mod fidelity;
 mod prepare;
+pub(crate) mod stage;
 pub(crate) mod thinking;
-use fidelity::{diff_features, reparse_features, source_features, target_holds, Field};
 #[cfg(test)]
 use fidelity::{diff_fidelity, reparse_emitted};
+use fidelity::{
+    diff_projected, reparse_staged_projected, source_features, source_projected_with_opts, target_holds, Field,
+};
 pub use fidelity::{Divergence, FidelityReport};
 
 /// The root transcript a Claude sub-agent emission lives beside, and the agent id it is written as.
@@ -66,6 +69,12 @@ pub struct EmitOptions {
     /// The demand the caller read `session` at. [`emit_report`] re-reads the target's output at the
     /// same one, so both sides of the diff hold the same records.
     pub parsed_at: ParsedAt,
+    /// Claude only: what to do with restored `invoked_skills` records before verification and
+    /// publication (`--skills`). Default: [`crate::harness::claude::skills::SkillsPolicy::Keep`].
+    pub skills_policy: crate::harness::claude::skills::SkillsPolicy,
+    /// Claude only: fallback Claude config directory (`<config>/skills/`) for `--skills drop-stale`
+    /// when the output path does not sit under `<config>/projects/`.
+    pub skills_config: Option<PathBuf>,
 }
 
 /// The demand a session handed to [`emit`] was read at, declared by whoever read it.
@@ -213,32 +222,32 @@ impl std::fmt::Display for ThinkingMode {
     }
 }
 
-/// An emitter: writes one IR session into one harness's native on-disk format.
-/// Registered writers must accept guarded lazy fields and apply thinking policy per block.
-type EmitFn = fn(&Session, &Path, &EmitOptions) -> Result<EmitResult>;
+/// A staged emitter: builds and checks target output in isolation, invokes the optional
+/// pre-publication verifier on the exact staged bytes or uncommitted SQLite transaction, and
+/// publishes / commits only when verification succeeds.
+type StagedEmitFn = fn(&Session, &Path, &EmitOptions, Option<stage::VerifyFn<'_>>) -> Result<EmitResult>;
 
-/// A check an emitter runs on what it wrote (the written path, the sub-agent id it wrote as).
 /// The ONE emit registry: which harnesses can be written, and by what. [`emit`] dispatches through
 /// it and [`supported_targets`] is derived from it, so the dispatcher and the CLI's `--to` list can
 /// never drift apart. Adding a target = adding an arm here (nothing else to keep in sync). A
 /// harness with no emitter in this build answers why, as the tail of `emit to <target> …`.
-fn emitter_for(target: Harness) -> Result<EmitFn, &'static str> {
+fn emitter_for(target: Harness) -> Result<StagedEmitFn, &'static str> {
     Ok(match target {
-        Harness::Claude => crate::harness::claude::emit,
-        Harness::Codex => crate::harness::codex::emit,
-        Harness::Grok => crate::harness::grok::emit,
-        Harness::OpenCode => crate::harness::opencode::emit,
-        Harness::OpenClaw => crate::harness::openclaw::emit,
-        Harness::Gemini => crate::harness::gemini::emit,
+        Harness::Claude => crate::harness::claude::emit_staged,
+        Harness::Codex => crate::harness::codex::emit_staged,
+        Harness::Grok => crate::harness::grok::emit_staged,
+        Harness::OpenCode => crate::harness::opencode::emit_staged,
+        Harness::OpenClaw => crate::harness::openclaw::emit_staged,
+        Harness::Gemini => crate::harness::gemini::emit_staged,
         #[cfg(feature = "sqlite")]
-        Harness::Hermes => crate::harness::hermes::emit,
-        Harness::LmStudio => crate::harness::lmstudio::emit,
-        Harness::Cline => crate::harness::cline::emit,
-        Harness::Roo => crate::harness::roo::emit,
-        Harness::Continue => crate::harness::continuedev::emit,
+        Harness::Hermes => crate::harness::hermes::emit_staged,
+        Harness::LmStudio => crate::harness::lmstudio::emit_staged,
+        Harness::Cline => crate::harness::cline::emit_staged,
+        Harness::Roo => crate::harness::roo::emit_staged,
+        Harness::Continue => crate::harness::continuedev::emit_staged,
         // Qwen Code 0.25's session JSONL (`~/.qwen/projects/<cwd>/chats/<id>.jsonl`), not the
         // gemini-cli recording it no longer reads.
-        Harness::Qwen => crate::harness::qwen::emit,
+        Harness::Qwen => crate::harness::qwen::emit_staged,
         #[cfg(not(feature = "sqlite"))]
         Harness::Hermes => return Err("requires the `sqlite` feature"),
         // Parse-only harnesses (Cursor, Goose, desktop apps, …) aren't conversion targets. Kimi
@@ -265,11 +274,11 @@ pub fn emit(session: &Session, target: Harness, out_dir: &Path, opts: &EmitOptio
     let f = registered_emitter(target)?;
     // Every registered writer consumes guarded fields and projects thinking per block.
     // Keep that contract at the writer boundary so direct and dispatched emission agree.
-    f(session, out_dir, opts)
+    f(session, out_dir, opts, None)
 }
 
 /// The target's registered writer, with the registry's refusal spelling.
-fn registered_emitter(target: Harness) -> Result<EmitFn> {
+fn registered_emitter(target: Harness) -> Result<StagedEmitFn> {
     emitter_for(target).map_err(|why| anyhow::anyhow!("emit to {target} {why}"))
 }
 
@@ -463,62 +472,83 @@ pub fn emit_verified(
     out_dir: &Path,
     opts: &EmitOptions,
 ) -> Result<(EmitResult, Vec<String>)> {
-    let (result, report) = emit_report(session, target, out_dir, opts)?;
-    if opts.strict {
-        let unexpected: Vec<&Divergence> = report.deltas.iter().filter(|d| !d.expected).collect();
-        if !unexpected.is_empty() {
-            let joined = unexpected.iter().map(|d| d.describe()).collect::<Vec<_>>().join("; ");
-            anyhow::bail!(
-                "--strict: {} unexpected fidelity loss(es) porting to {target}: {joined}",
-                unexpected.len()
-            );
-        }
-    }
+    let (result, report) = emit_checked(session, target, out_dir, opts, opts.strict)?;
     Ok((result, report.lost_lines()))
 }
 
 /// Like [`emit_verified`] but returns the structured [`FidelityReport`] instead of rendered strings,
 /// and never fails on a delta (the caller decides what `strict` means). This is the field-by-field
-/// diff between the source IR and what the target's own adapter reads back — the v2 verifier.
+/// diff between the source IR and what the target's own adapter reads back — verified on staged
+/// output before publication.
 pub fn emit_report(
     session: &Session,
     target: Harness,
     out_dir: &Path,
     opts: &EmitOptions,
 ) -> Result<(EmitResult, FidelityReport)> {
+    emit_checked(session, target, out_dir, opts, false)
+}
+
+fn emit_checked(
+    session: &Session,
+    target: Harness,
+    out_dir: &Path,
+    opts: &EmitOptions,
+    bail_on_strict: bool,
+) -> Result<(EmitResult, FidelityReport)> {
+    use anyhow::Context as _;
+    opts.validate_ids()?;
     // Refuse an unregistered target before projecting the source: the projection materializes.
-    registered_emitter(target)?;
-    let before = source_features(target, opts.thinking, session)?;
-    // An emitter that owns a check on its output (Claude's three resumability rules) runs it on
-    // the staged file, before publishing.
-    let result = emit(session, target, out_dir, opts)?;
-    // Re-parse at the fidelity the SOURCE was parsed at, as its reader declared. Re-parsing a
-    // complete session plainly compared it against a lean one: impossible deltas such as
-    // `per-message model: 2106 → 836` on an 836-message session, because the source's carriers (and
-    // the complete-mode roles of synthetic notices) had no counterpart.
-    let mut report = match reparse_features(target, opts.thinking, &result, &opts.parsed_at.demand()) {
-        Ok((reparsed, after)) => diff_features(target, opts.thinking, session, &reparsed, before, after),
-        Err(e) => FidelityReport {
-            deltas: vec![Divergence {
-                what: "round_trip".into(),
-                a: "parseable".into(),
-                b: format!("re-parse failed ({e:#})"),
-                expected: false,
-                why: None,
-                at: target.as_str().to_string(),
-            }],
-        },
-    };
-    if opts.parsed_at == ParsedAt::Complete && !fidelity::target_holds(target, fidelity::Field::CompleteReparse) {
-        report.deltas.push(Divergence {
-            what: "verification demand".into(),
-            a: "complete".into(),
-            b: "rich (target reader policy)".into(),
-            expected: true,
-            why: None,
-            at: target.as_str().into(),
-        });
-    }
+    let emitter = registered_emitter(target)?;
+    let before = source_projected_with_opts(target, session, opts)?;
+    let mut report_slot: Option<FidelityReport> = None;
+    let mut before_slot = Some(before);
+    let result = emitter(
+        session,
+        out_dir,
+        opts,
+        Some(&mut |staged_src| {
+            let before = before_slot.take().context("verifier callback invoked more than once")?;
+            let mut report = match reparse_staged_projected(target, opts.thinking, staged_src, &opts.parsed_at.demand())
+            {
+                Ok((reparsed, after)) => diff_projected(target, opts.thinking, session, &reparsed, before, after),
+                Err(e) => FidelityReport {
+                    deltas: vec![Divergence {
+                        what: "round_trip".into(),
+                        a: "parseable".into(),
+                        b: format!("re-parse failed ({e:#})"),
+                        expected: false,
+                        why: None,
+                        at: target.as_str().to_string(),
+                    }],
+                },
+            };
+            if opts.parsed_at == ParsedAt::Complete && !fidelity::target_holds(target, fidelity::Field::CompleteReparse)
+            {
+                report.deltas.push(Divergence {
+                    what: "verification demand".into(),
+                    a: "complete".into(),
+                    b: "rich (target reader policy)".into(),
+                    expected: true,
+                    why: None,
+                    at: target.as_str().into(),
+                });
+            }
+            if bail_on_strict {
+                let unexpected: Vec<&Divergence> = report.deltas.iter().filter(|d| !d.expected).collect();
+                if !unexpected.is_empty() {
+                    let joined = unexpected.iter().map(|d| d.describe()).collect::<Vec<_>>().join("; ");
+                    anyhow::bail!(
+                        "--strict: {} unexpected fidelity loss(es) porting to {target}: {joined}",
+                        unexpected.len()
+                    );
+                }
+            }
+            report_slot = Some(report);
+            Ok(())
+        }),
+    )?;
+    let report = report_slot.context("staged emitter did not invoke verifier")?;
     Ok((result, report))
 }
 
@@ -810,6 +840,8 @@ pub fn prepare_for_emit(
 pub(crate) mod frozen;
 #[cfg(test)]
 pub(crate) mod grok_qwen_tests;
+#[cfg(test)]
+mod tooth_tests;
 
 #[cfg(test)]
 mod tests {

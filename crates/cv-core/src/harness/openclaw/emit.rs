@@ -18,7 +18,16 @@ use uuid::Uuid;
 /// a `sessions.json` index entry. Mirrors `harness/openclaw/record.rs`: a `{type:session,…}`
 /// header line followed by `{type:message,id,parentId,timestamp,message:{role,content,…}}` lines.
 pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<EmitResult> {
-    stream::emit(session, out_dir, opts)
+    stream::emit(session, out_dir, opts, None)
+}
+
+pub(crate) fn emit_staged(
+    session: &Session,
+    out_dir: &Path,
+    opts: &EmitOptions,
+    verify: Option<crate::emit::stage::VerifyFn<'_>>,
+) -> Result<EmitResult> {
+    stream::emit(session, out_dir, opts, verify)
 }
 
 mod replay;

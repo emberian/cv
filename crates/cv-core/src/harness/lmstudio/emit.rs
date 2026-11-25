@@ -5,7 +5,7 @@ use crate::{
         ThinkingMode,
     },
     harness::{
-        store::{bytes::ByteStage, publish_stage, text::generate_string},
+        store::{bytes::ByteStage, text::generate_string},
         wire::write::{append_text, text, ObjectWriter},
     },
     ir_json::PrettyJson,
@@ -227,7 +227,12 @@ fn native_versions(message: &Message) -> Option<(usize, usize)> {
     (selected < count && message.kind != MessageKind::Branch).then_some((selected, count))
 }
 
-pub(super) fn emit(session: &Session, out_dir: &Path, opts: &crate::emit::EmitOptions) -> Result<EmitResult> {
+pub(super) fn emit(
+    session: &Session,
+    out_dir: &Path,
+    opts: &crate::emit::EmitOptions,
+    verify: Option<crate::emit::stage::VerifyFn<'_>>,
+) -> Result<EmitResult> {
     opts.validate_ids()?;
     super::super::wire::write::check_source_fields(session)?;
     let resolver = Resolver::new(session.source_path.clone());
@@ -239,7 +244,11 @@ pub(super) fn emit(session: &Session, out_dir: &Path, opts: &crate::emit::EmitOp
     // `--out` naming convention (same as qwen's `projects_dir`): the flag may name the CLI's
     // store root or the store dir inside it; accept either and write where the CLI reads.
     let conversations = crate::emit::out_dir_within(out_dir, "conversations");
-    let file_path = conversations.join(format!("{new_id}.conversation.json"));
+    let file_name = format!("{new_id}.conversation.json");
+    let file_path = conversations.join(&file_name);
+    if !opts.force {
+        crate::publish::refuse_existing(&file_path, "")?;
+    }
     let title = super::super::wire::write::fallback_title(session, &resolver)?.unwrap_or_else(|| "Untitled".into());
     let mut stage = BufWriter::with_capacity(64 * 1024, ByteStage::new());
     {
@@ -326,12 +335,25 @@ pub(super) fn emit(session: &Session, out_dir: &Path, opts: &crate::emit::EmitOp
         root.finish()?;
     }
     let stage = stage.into_inner().map_err(|e| e.into_error())?;
-    fs::create_dir_all(file_path.parent().unwrap())?;
-    publish_stage(stage, &file_path, opts.claim())?;
+    let source = stage.finish()?;
+    let resume = Some("open the chat in LM Studio".to_string());
+    if let Some(verify_fn) = verify {
+        let ws = crate::emit::stage::StageWorkspace::beside(out_dir, "lmstudio")?;
+        let staged_path = ws.write_source(Path::new("conversations").join(&file_name), &source)?;
+        let staged_result = EmitResult {
+            path: staged_path,
+            new_id: new_id.clone(),
+            resume_hint: resume.clone(),
+            ..Default::default()
+        };
+        verify_fn(crate::emit::stage::StagedSource::Files { result: &staged_result })?;
+    }
+    crate::emit::stage::publish_source(&source, &file_path, opts.claim())?;
     Ok(EmitResult {
         path: file_path,
         new_id,
-        resume_hint: Some("open the chat in LM Studio".into()),
+        resume_hint: resume,
+        ..Default::default()
     })
 }
 #[cfg(test)]

@@ -840,6 +840,15 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &crate::emit::EmitOptions) 
     emit_with_harness(session, out_dir, opts, Harness::Cline)
 }
 
+pub(crate) fn emit_staged(
+    session: &Session,
+    out_dir: &Path,
+    opts: &crate::emit::EmitOptions,
+    verify: Option<crate::emit::stage::VerifyFn<'_>>,
+) -> Result<crate::harness::EmitResult> {
+    emit_with_harness_staged(session, out_dir, opts, Harness::Cline, verify)
+}
+
 /// The emit core for both harnesses that write this layout: Cline and Roo (`roo::emit` passes
 /// `Harness::Roo`). The per-task bytes are identical; `harness` only names, in the resume hint,
 /// which editor extension opens the task.
@@ -848,6 +857,16 @@ pub fn emit_with_harness(
     out_dir: &Path,
     opts: &crate::emit::EmitOptions,
     harness: Harness,
+) -> Result<crate::harness::EmitResult> {
+    emit_with_harness_staged(session, out_dir, opts, harness, None)
+}
+
+pub(crate) fn emit_with_harness_staged(
+    session: &Session,
+    out_dir: &Path,
+    opts: &crate::emit::EmitOptions,
+    harness: Harness,
+    verify: Option<crate::emit::stage::VerifyFn<'_>>,
 ) -> Result<crate::harness::EmitResult> {
     opts.validate_ids()?;
     let extension = match harness {
@@ -866,12 +885,12 @@ pub fn emit_with_harness(
 
     // Complete checked production before opening any destination transcript or sidecar.
     let stage = writer::history(session, opts, harness, cwd_str.as_deref())?;
+    let history_source = stage.finish()?;
     let task_dir = out_dir.join("tasks").join(&new_id);
-    fs::create_dir_all(&task_dir).with_context(|| format!("creating {}", task_dir.display()))?;
     let history_path = task_dir.join("api_conversation_history.json");
-    // The three files publish as one set, the transcript last: discovery finds a task by its
-    // transcript, so a crash midway leaves nothing listed.
-    let mut set = crate::publish::Set::new();
+    if !opts.force {
+        crate::publish::refuse_existing(&history_path, "")?;
+    }
 
     // ── task_metadata.json (cwd + model hints; sidecar the parser falls back to for cwd) ──
     let mut meta = Map::new();
@@ -884,7 +903,6 @@ pub fn emit_with_harness(
     }
     let meta_path = task_dir.join("task_metadata.json");
     let meta = serde_json::to_string_pretty(&Value::Object(meta))?;
-    set.stage(&meta_path, "stage", meta.as_bytes(), opts.claim())?;
 
     // ── ui_messages.json (minimal event log carrying created/updated timestamps) ──
     let created_ms = created.timestamp_millis();
@@ -904,9 +922,6 @@ pub fn emit_with_harness(
     }
     let ui_path = task_dir.join("ui_messages.json");
     let ui = serde_json::to_string_pretty(&Value::Array(ui))?;
-    set.stage(&ui_path, "stage", ui.as_bytes(), opts.claim())?;
-    super::store::stage_into(&mut set, stage, &history_path, opts.claim())?;
-    set.publish()?;
 
     let resume = match &cwd {
         Some(c) => format!(
@@ -916,10 +931,37 @@ pub fn emit_with_harness(
         ),
         None => format!("open {} in {extension} (task {new_id})", task_dir.display()),
     };
+
+    if let Some(verify_fn) = verify {
+        let ws = crate::emit::stage::StageWorkspace::beside(out_dir, "cline")?;
+        let rel_task = Path::new("tasks").join(&new_id);
+        let staged_task_dir = ws.path(&rel_task);
+        ws.write_bytes(rel_task.join("task_metadata.json"), meta.as_bytes())?;
+        ws.write_bytes(rel_task.join("ui_messages.json"), ui.as_bytes())?;
+        ws.write_source(rel_task.join("api_conversation_history.json"), &history_source)?;
+        let staged_result = crate::harness::EmitResult {
+            path: staged_task_dir,
+            new_id: new_id.clone(),
+            resume_hint: Some(resume.clone()),
+            ..Default::default()
+        };
+        verify_fn(crate::emit::stage::StagedSource::Files { result: &staged_result })?;
+    }
+
+    fs::create_dir_all(&task_dir).with_context(|| format!("creating {}", task_dir.display()))?;
+    // The three files publish as one set, the transcript last: discovery finds a task by its
+    // transcript, so a crash midway leaves nothing listed.
+    let mut set = crate::publish::Set::new();
+    set.stage(&meta_path, "stage", meta.as_bytes(), opts.claim())?;
+    set.stage(&ui_path, "stage", ui.as_bytes(), opts.claim())?;
+    crate::emit::stage::stage_source_into(&mut set, &history_source, &history_path, opts.claim())?;
+    set.publish()?;
+
     Ok(crate::harness::EmitResult {
         path: task_dir,
         new_id,
         resume_hint: Some(resume),
+        ..Default::default()
     })
 }
 

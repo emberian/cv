@@ -42,6 +42,7 @@
 use crate::json::{ReadInput, Validation};
 mod emit;
 mod record;
+pub(crate) use emit::emit_staged;
 pub use emit::{emit, emit_jsonl};
 
 use super::{parse_ts, Adapter};

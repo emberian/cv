@@ -516,7 +516,7 @@ pub fn resume_in(cwd: Option<&Path>, command: String) -> String {
 }
 
 /// Result of emitting an IR session into a harness's native on-disk format.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct EmitResult {
     /// Primary file (or directory) written.
     pub path: PathBuf,
@@ -524,6 +524,8 @@ pub struct EmitResult {
     pub new_id: String,
     /// A human hint for how to resume it, if known (e.g. `claude --resume <id>`).
     pub resume_hint: Option<String>,
+    /// What `--skills` did to the staged transcript before verification and publication.
+    pub skills: claude::skills::SkillsReport,
 }
 
 /// The keys of a native record that carry its identity, as a derived copy rewrites them

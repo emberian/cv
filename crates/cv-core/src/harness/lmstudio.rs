@@ -612,7 +612,15 @@ fn projected_harmony(view: JsonView<'_>) -> Result<bool> {
 /// LM Studio is a chat app with no working directory, so `opts.new_cwd` / `session.cwd` are not
 /// written into the file; we surface the chosen cwd only in the resume hint.
 pub fn emit(session: &Session, out_dir: &Path, opts: &crate::emit::EmitOptions) -> Result<EmitResult> {
-    emit::emit(session, out_dir, opts)
+    emit::emit(session, out_dir, opts, None)
+}
+pub(crate) fn emit_staged(
+    session: &Session,
+    out_dir: &Path,
+    opts: &crate::emit::EmitOptions,
+    verify: Option<crate::emit::stage::VerifyFn<'_>>,
+) -> Result<EmitResult> {
+    emit::emit(session, out_dir, opts, verify)
 }
 mod emit;
 

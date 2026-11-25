@@ -32,6 +32,7 @@ use walkdir::WalkDir;
 pub(crate) mod emit;
 mod record;
 pub use emit::emit;
+pub(crate) use emit::emit_staged;
 
 /// The deferred-tool invoker (`ToolNames.TOOL_CALL`).
 const TOOL_CALL: &str = "tool_call";

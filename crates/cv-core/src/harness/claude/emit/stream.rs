@@ -642,6 +642,15 @@ fn record<'a>(
 }
 
 pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<EmitResult> {
+    emit_staged(session, out_dir, opts, None)
+}
+
+pub(crate) fn emit_staged(
+    session: &Session,
+    out_dir: &Path,
+    opts: &EmitOptions,
+    verify: Option<crate::emit::stage::VerifyFn<'_>>,
+) -> Result<EmitResult> {
     opts.validate_ids()?;
     crate::emit::validate_native_source(session, Harness::Claude, opts.thinking)?;
     let (session_id, agent) = match &opts.sidechain_of {
@@ -808,10 +817,7 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Emi
         }
     }
     let file_path = match &c.agent {
-        Some(agent) => {
-            fs::create_dir_all(out_dir)?;
-            out_dir.join(format!("agent-{agent}.jsonl"))
-        }
+        Some(agent) => out_dir.join(format!("agent-{agent}.jsonl")),
         None => {
             let in_place_project = (opts.new_cwd.is_none() && session.harness == Harness::Claude)
                 .then_some(session.source_path.as_deref())
@@ -824,19 +830,11 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Emi
                 });
             let project = in_place_project
                 .unwrap_or_else(|| out_dir.join(cwd.as_deref().map(claude_encode_cwd).unwrap_or_else(|| "-".into())));
-            fs::create_dir_all(&project)?;
             project.join(format!("{new_id}.jsonl"))
         }
     };
-    // The three rules hold before the file is published: a violation is a bug in cv, and it
-    // leaves nothing behind.
-    let check = |staged: &Path| super::verify::verify_as(staged, &file_path, c.agent.as_deref());
-    if opts.thinking != ThinkingMode::Native {
-        let source = lines.into_source()?;
-        let (stage, _) = crate::harness::claude::replay::normalize(source, opts.thinking)?;
-        crate::harness::store::publish_stage_checked(stage, &file_path, opts.claim(), check)?;
-    } else {
-        lines.publish_checked(&file_path, opts.claim(), check)?;
+    if !opts.force {
+        crate::publish::refuse_existing(&file_path, "")?;
     }
     let resume = match (&c.agent, &cwd) {
         (Some(agent), _) => format!(
@@ -848,10 +846,45 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Emi
             format!("claude --resume {}", crate::harness::shell_quote(&new_id)),
         ),
     };
+    let mut source = lines.into_source()?;
+    if opts.thinking != ThinkingMode::Native {
+        let (stage, _) = crate::harness::claude::replay::normalize(source, opts.thinking)?;
+        source = stage.finish()?;
+    }
+    let config = crate::harness::claude::skills::config_dir_of(&file_path)
+        .or_else(|| opts.skills_config.clone())
+        .or_else(|| {
+            session
+                .source_path
+                .as_deref()
+                .and_then(crate::harness::claude::skills::config_dir_of)
+        });
+    let (source, skills) = crate::harness::claude::skills::apply(source, opts.skills_policy, config.as_deref())?;
+
+    // Stage the final post-transform bytes in an isolated workspace before creating or touching
+    // anything in `out_dir`: both Claude's three resumability rules and `--strict` read-back
+    // verification inspect the exact bytes that will be published.
+    {
+        let ws = crate::emit::stage::StageWorkspace::beside(&file_path, "claude")?;
+        let rel_name = file_path.file_name().and_then(|n| n.to_str()).unwrap_or("staged.jsonl");
+        let staged_path = ws.write_source(rel_name, &source)?;
+        super::verify::verify_as(&staged_path, &file_path, c.agent.as_deref())?;
+        if let Some(verify_fn) = verify {
+            let staged_result = EmitResult {
+                path: staged_path,
+                new_id: new_id.clone(),
+                resume_hint: Some(resume.clone()),
+                skills: skills.clone(),
+            };
+            verify_fn(crate::emit::stage::StagedSource::Files { result: &staged_result })?;
+        }
+    }
+    crate::emit::stage::publish_source(&source, &file_path, opts.claim())?;
     Ok(EmitResult {
         path: file_path,
         new_id,
         resume_hint: Some(resume),
+        skills,
     })
 }
 

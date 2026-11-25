@@ -8,7 +8,6 @@ use crate::ir::{Block, Harness, MessageKind, Role, Session};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use serde_json::{json, Value};
-use std::fs;
 use std::path::Path;
 use uuid::Uuid;
 
@@ -17,6 +16,15 @@ use uuid::Uuid;
 /// (role/content/tool_calls JSON/reasoning/timestamps as REAL unix secs). Multimodal content uses
 /// the `\x00json:` sentinel prefix.
 pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<EmitResult> {
+    emit_staged(session, out_dir, opts, None)
+}
+
+pub(crate) fn emit_staged(
+    session: &Session,
+    out_dir: &Path,
+    opts: &EmitOptions,
+    verify: Option<crate::emit::stage::VerifyFn<'_>>,
+) -> Result<EmitResult> {
     use rusqlite::Connection;
 
     opts.validate_ids()?;
@@ -27,14 +35,18 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Emi
     // `out_dir` is a directory — the Hermes home or a profile dir, which is what the adapter's
     // first root names — and the store is its `state.db`.
     let db_path = out_dir.join("state.db");
-    fs::create_dir_all(out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
-    let mut conn = Connection::open(&db_path).with_context(|| format!("opening {}", db_path.display()))?;
-    write_database(session, opts, &new_id, &mut conn)?;
-    Ok(EmitResult {
-        path: db_path,
+    let mut guard = crate::emit::stage::SqliteRollbackGuard::prepare(&db_path)?;
+    let result = EmitResult {
+        path: db_path.clone(),
         new_id: new_id.clone(),
         resume_hint: Some(format!("hermes --resume {new_id}")),
-    })
+        ..Default::default()
+    };
+    let mut conn = Connection::open(&db_path).with_context(|| format!("opening {}", db_path.display()))?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    write_database_with_verify(session, opts, &new_id, &mut conn, Some((&result, verify)))?;
+    guard.disarm();
+    Ok(result)
 }
 
 /// One Hermes FTS5 index over `messages` and its three sync triggers, as `hermes_state.py`
@@ -62,10 +74,21 @@ fn fts_sql(table: &str, tokenize: &str) -> String {
     )
 }
 
+#[cfg(test)]
 fn write_database(session: &Session, opts: &EmitOptions, new_id: &str, conn: &mut rusqlite::Connection) -> Result<()> {
-    use rusqlite::params;
+    write_database_with_verify(session, opts, new_id, conn, None)
+}
+
+fn write_database_with_verify(
+    session: &Session,
+    opts: &EmitOptions,
+    new_id: &str,
+    conn: &mut rusqlite::Connection,
+    verify_ctx: Option<(&EmitResult, Option<crate::emit::stage::VerifyFn<'_>>)>,
+) -> Result<()> {
+    use rusqlite::{params, TransactionBehavior};
     let resolver = session.resolver();
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
     // Bootstrap the historical core, then reconcile optional columns like Hermes itself.
     // Appending to an older store must preserve the modern fields too.
@@ -412,6 +435,9 @@ fn write_database(session: &Session, opts: &EmitOptions, new_id: &str, conn: &mu
     // Hermes counts active native rows, excluding archived generations and synthetic IR markers.
     update_message_count(&tx, new_id)?;
     crate::harness::wire::write::check_source_fields(session)?;
+    if let Some((result, Some(verify_fn))) = verify_ctx {
+        verify_fn(crate::emit::stage::StagedSource::Sqlite { conn: &tx, result })?;
+    }
     tx.commit()?;
     Ok(())
 }

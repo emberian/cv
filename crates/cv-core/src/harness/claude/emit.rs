@@ -64,6 +64,7 @@ mod stream;
 ///
 /// [`verify_claude_resumable`] checks the same three on a written file.
 pub use stream::emit;
+pub(crate) use stream::emit_staged;
 
 /// Check a written Claude transcript against the three rules [`emit`] establishes: no
 /// dangling `parentUuid`, no `tool_use` without its `tool_result`, and one identity (`agent`

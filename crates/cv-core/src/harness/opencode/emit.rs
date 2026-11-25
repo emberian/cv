@@ -6,13 +6,14 @@ use crate::emit::*;
 use crate::harness::EmitResult;
 use crate::ir::Session;
 use anyhow::Result;
+#[cfg(all(feature = "sqlite", test))]
+use std::fs;
 use std::path::Path;
 #[cfg(feature = "sqlite")]
 use {
     crate::ir::{Block, Role},
     anyhow::Context,
     serde_json::{json, Map, Value},
-    std::fs,
     std::path::PathBuf,
     uuid::Uuid,
 };
@@ -39,9 +40,18 @@ fn opencode_db_path(out_dir: &Path) -> PathBuf {
 /// `session_v2`/`session_message`. Fresh bootstrap and row publication are atomic.
 /// Tool results fold onto assistant tools; native v2 uses content[] and structured errors.
 pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<EmitResult> {
+    emit_staged(session, out_dir, opts, None)
+}
+
+pub(crate) fn emit_staged(
+    session: &Session,
+    out_dir: &Path,
+    opts: &EmitOptions,
+    verify: Option<crate::emit::stage::VerifyFn<'_>>,
+) -> Result<EmitResult> {
     #[cfg(not(feature = "sqlite"))]
     {
-        let _ = (session, out_dir, opts);
+        let _ = (session, out_dir, opts, verify);
         anyhow::bail!("emit to opencode requires the `sqlite` feature (opencode.db is SQLite)");
     }
     #[cfg(feature = "sqlite")]
@@ -49,12 +59,17 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Emi
         opts.validate_ids()?;
         // Reject unreadable sources before creating output; each store also guards its commit.
         crate::harness::wire::write::check_source_fields(session)?;
-        emit_opencode_db(session, out_dir, opts)
+        emit_opencode_db(session, out_dir, opts, verify)
     }
 }
 
 #[cfg(feature = "sqlite")]
-fn emit_opencode_db(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<EmitResult> {
+fn emit_opencode_db(
+    session: &Session,
+    out_dir: &Path,
+    opts: &EmitOptions,
+    verify: Option<crate::emit::stage::VerifyFn<'_>>,
+) -> Result<EmitResult> {
     use rusqlite::Connection;
 
     let new_id = opts
@@ -73,10 +88,15 @@ fn emit_opencode_db(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Re
     };
 
     let db_path = opencode_db_path(out_dir);
-    if let Some(parent) = db_path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-    }
+    let mut guard = crate::emit::stage::SqliteRollbackGuard::prepare(&db_path)?;
+    let result = EmitResult {
+        path: db_path.clone(),
+        new_id: new_id.clone(),
+        resume_hint: Some(format!("opencode --session {new_id}")),
+        ..Default::default()
+    };
     let mut conn = Connection::open(&db_path).with_context(|| format!("opening {}", db_path.display()))?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
     let empty: bool = conn.query_row(
         "SELECT NOT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%')",
         [],
@@ -89,7 +109,7 @@ fn emit_opencode_db(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Re
     )?;
     if v2 || empty {
         // Empty is the store's unknown-directory sentinel, as on the v1 path.
-        v2::write_database(session, opts, &new_id, &cwd_str, &mut conn).context(
+        v2::write_database_with_verify(session, opts, &new_id, &cwd_str, &mut conn, &result, verify).context(
             "exporting native OpenCode 2.x store (requires complete session_v2/session_message/project schema)",
         )?;
     } else {
@@ -102,16 +122,21 @@ fn emit_opencode_db(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Re
             v1,
             "unsupported partial OpenCode database; initialize an empty store with OpenCode before exporting"
         );
-        write_database(session, opts, &new_id, &cwd_str, &project_id, &mut conn)?;
+        write_database_with_verify(
+            session,
+            opts,
+            &new_id,
+            &cwd_str,
+            &project_id,
+            &mut conn,
+            Some((&result, verify)),
+        )?;
     }
-    Ok(EmitResult {
-        path: db_path,
-        new_id: new_id.clone(),
-        resume_hint: Some(format!("opencode --session {new_id}")),
-    })
+    guard.disarm();
+    Ok(result)
 }
 
-#[cfg(feature = "sqlite")]
+#[cfg(all(feature = "sqlite", test))]
 fn write_database(
     session: &Session,
     opts: &EmitOptions,
@@ -120,9 +145,22 @@ fn write_database(
     project_id: &str,
     conn: &mut rusqlite::Connection,
 ) -> Result<()> {
-    use rusqlite::params;
+    write_database_with_verify(session, opts, new_id, cwd_str, project_id, conn, None)
+}
+
+#[cfg(feature = "sqlite")]
+fn write_database_with_verify(
+    session: &Session,
+    opts: &EmitOptions,
+    new_id: &str,
+    cwd_str: &str,
+    project_id: &str,
+    conn: &mut rusqlite::Connection,
+    verify_ctx: Option<(&EmitResult, Option<crate::emit::stage::VerifyFn<'_>>)>,
+) -> Result<()> {
+    use rusqlite::{params, TransactionBehavior};
     let resolver = session.resolver();
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     // FK enforcement stays off (rusqlite's default) so a fresh db needs no `project` row and an
     // append into a real store isn't rejected for the synthetic project_id. Create the reader's
     // schema when absent (`IF NOT EXISTS` no-ops against a real store; our INSERTs name only columns
@@ -170,6 +208,23 @@ fn write_database(
 
     let created = epoch_ms(session.created_at.or(session.updated_at));
     let updated = epoch_ms(session.updated_at.or(session.created_at));
+
+    let exists: bool = tx
+        .query_row("SELECT 1 FROM session WHERE id = ?1", [new_id], |_| Ok(true))
+        .unwrap_or(false);
+    if exists && !opts.force {
+        let db_path = tx.path().map(PathBuf::from).unwrap_or_default();
+        return Err(crate::publish::Exists {
+            path: db_path,
+            hint: "",
+        }
+        .into());
+    }
+    if exists {
+        tx.execute("DELETE FROM part WHERE session_id = ?1", [new_id])?;
+        tx.execute("DELETE FROM message WHERE session_id = ?1", [new_id])?;
+        tx.execute("DELETE FROM session WHERE id = ?1", [new_id])?;
+    }
 
     // Session row. `model` is `{id, providerID}` (the reader reads `model.id`); `title` is NOT NULL.
     let model_json = session
@@ -338,8 +393,11 @@ fn write_database(
     drop(part_insert);
     drop(message_insert);
     drop(session_insert);
-    // Revalidate after source reads and before committing any staged database changes.
+    // Revalidate after source reads and run same-transaction readback verification before committing.
     crate::harness::wire::write::check_source_fields(session)?;
+    if let Some((result, Some(verify_fn))) = verify_ctx {
+        verify_fn(crate::emit::stage::StagedSource::Sqlite { conn: &tx, result })?;
+    }
     tx.commit()?;
     Ok(())
 }

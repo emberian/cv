@@ -17,13 +17,22 @@ use uuid::Uuid;
 /// `.jsonl` Gemini recording; otherwise `chats/session-<sessionId>.json`. Both formats round-trip
 /// through `harness/gemini.rs`.
 pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<EmitResult> {
-    stream::emit(session, out_dir, opts, None)
+    stream::emit(session, out_dir, opts, None, None)
+}
+
+pub(crate) fn emit_staged(
+    session: &Session,
+    out_dir: &Path,
+    opts: &EmitOptions,
+    verify: Option<crate::emit::stage::VerifyFn<'_>>,
+) -> Result<EmitResult> {
+    stream::emit(session, out_dir, opts, None, verify)
 }
 
 /// Emit a modern append-only gemini-cli `.jsonl` recording (`chats/session-<sessionId>.jsonl`, or
 /// directly to `out_dir` if `out_dir` ends with `.jsonl`).
 pub fn emit_jsonl(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<EmitResult> {
-    stream::emit(session, out_dir, opts, Some(true))
+    stream::emit(session, out_dir, opts, Some(true), None)
 }
 
 mod stream;

@@ -8,14 +8,25 @@ use crate::emit::*;
 use crate::harness::store::JsonlStage;
 use crate::harness::EmitResult;
 use crate::ir::{Block, GitInfo, Harness, MessageKind, Role, Session};
-use anyhow::{Context, Result};
+use anyhow::Context;
+use anyhow::Result;
 use chrono::{SecondsFormat, Utc};
 use serde_json::{json, Map, Value};
+#[cfg(test)]
 use std::fs;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<EmitResult> {
+    emit_staged(session, out_dir, opts, None)
+}
+
+pub(crate) fn emit_staged(
+    session: &Session,
+    out_dir: &Path,
+    opts: &EmitOptions,
+    verify: Option<crate::emit::stage::VerifyFn<'_>>,
+) -> Result<EmitResult> {
     opts.validate_ids()?;
     crate::emit::validate_native_source(session, Harness::Codex, opts.thinking)?;
     let resolver = session.resolver();
@@ -44,9 +55,12 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Emi
         .join(local.format("%Y").to_string())
         .join(local.format("%m").to_string())
         .join(local.format("%d").to_string());
-    fs::create_dir_all(&date_dir).with_context(|| format!("creating {}", date_dir.display()))?;
     let stamp = local.format("%Y-%m-%dT%H-%M-%S").to_string();
-    let file_path = date_dir.join(format!("rollout-{stamp}-{new_id}.jsonl"));
+    let file_name = format!("rollout-{stamp}-{new_id}.jsonl");
+    let file_path = date_dir.join(&file_name);
+    if !opts.force {
+        crate::publish::refuse_existing(&file_path, "")?;
+    }
 
     let ts_str = created.to_rfc3339_opts(SecondsFormat::Millis, true);
 
@@ -357,12 +371,26 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Emi
         }
     }
 
-    lines.publish(&file_path, opts.claim())?;
+    let resume = Some(format!("codex resume {new_id}"));
+    let source = lines.into_source()?;
+    if let Some(verify_fn) = verify {
+        let ws = crate::emit::stage::StageWorkspace::beside(out_dir, "codex")?;
+        let staged_path = ws.write_source(&file_name, &source)?;
+        let staged_result = EmitResult {
+            path: staged_path,
+            new_id: new_id.clone(),
+            resume_hint: resume.clone(),
+            ..Default::default()
+        };
+        verify_fn(crate::emit::stage::StagedSource::Files { result: &staged_result })?;
+    }
+    crate::emit::stage::publish_source(&source, &file_path, opts.claim())?;
 
     Ok(EmitResult {
         path: file_path,
-        new_id: new_id.clone(),
-        resume_hint: Some(format!("codex resume {new_id}")),
+        new_id,
+        resume_hint: resume,
+        ..Default::default()
     })
 }
 

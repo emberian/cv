@@ -25,6 +25,15 @@ use uuid::Uuid;
 const GROK_ENCODE: &AsciiSet = &CONTROLS.add(b'/').add(b' ').add(b'.').add(b'%').add(b':').add(b'\\');
 
 pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<EmitResult> {
+    emit_staged(session, out_dir, opts, None)
+}
+
+pub(crate) fn emit_staged(
+    session: &Session,
+    out_dir: &Path,
+    opts: &EmitOptions,
+    verify: Option<crate::emit::stage::VerifyFn<'_>>,
+) -> Result<EmitResult> {
     opts.validate_ids()?;
     crate::emit::validate_native_source(session, Harness::Grok, opts.thinking)?;
     let resolver = session.resolver();
@@ -37,6 +46,9 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Emi
     let enc_cwd = utf8_percent_encode(&cwd_str, GROK_ENCODE).to_string();
 
     let session_dir = out_dir.join(&enc_cwd).join(&new_id);
+    if !opts.force {
+        crate::publish::refuse_existing(&session_dir.join("summary.json"), "")?;
+    }
 
     let created = session
         .created_at
@@ -240,14 +252,44 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Emi
     // Checked source production completes before any destination file or directory is touched.
     // The three files publish as one set, `summary.json` last: discovery finds a session by its
     // summary, so a crash midway leaves nothing Grok or cv would list.
-    fs::create_dir_all(&session_dir).with_context(|| format!("creating {}", session_dir.display()))?;
     let summary = serde_json::to_string_pretty(&summary)?;
-    let mut set = crate::publish::Set::new();
-    lines.stage_into(&mut set, &session_dir.join("chat_history.jsonl"), opts.claim())?;
-    let updates_path = session_dir.join("updates.jsonl");
+    let lines_source = lines.into_source()?;
     let no_updates = updates.is_empty();
-    if !no_updates {
-        updates.stage_into(&mut set, &updates_path, opts.claim())?;
+    let updates_source = (!no_updates).then(|| updates.into_source()).transpose()?;
+    let resume = Some(format!("grok --resume {new_id}"));
+    if let Some(verify_fn) = verify {
+        let ws = crate::emit::stage::StageWorkspace::beside(out_dir, "grok")?;
+        let staged_dir = ws.path(&enc_cwd).join(&new_id);
+        ws.write_source(
+            Path::new(&enc_cwd).join(&new_id).join("chat_history.jsonl"),
+            &lines_source,
+        )?;
+        if let Some(upd) = &updates_source {
+            ws.write_source(Path::new(&enc_cwd).join(&new_id).join("updates.jsonl"), upd)?;
+        }
+        ws.write_bytes(
+            Path::new(&enc_cwd).join(&new_id).join("summary.json"),
+            summary.as_bytes(),
+        )?;
+        let staged_result = EmitResult {
+            path: staged_dir,
+            new_id: new_id.clone(),
+            resume_hint: resume.clone(),
+            ..Default::default()
+        };
+        verify_fn(crate::emit::stage::StagedSource::Files { result: &staged_result })?;
+    }
+    fs::create_dir_all(&session_dir).with_context(|| format!("creating {}", session_dir.display()))?;
+    let mut set = crate::publish::Set::new();
+    crate::emit::stage::stage_source_into(
+        &mut set,
+        &lines_source,
+        &session_dir.join("chat_history.jsonl"),
+        opts.claim(),
+    )?;
+    let updates_path = session_dir.join("updates.jsonl");
+    if let Some(upd) = &updates_source {
+        crate::emit::stage::stage_source_into(&mut set, upd, &updates_path, opts.claim())?;
     }
     set.stage(&summary_path, "stage", summary.as_bytes(), opts.claim())?;
     set.publish()?;
@@ -261,8 +303,9 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Emi
 
     Ok(EmitResult {
         path: session_dir,
-        new_id: new_id.clone(),
-        resume_hint: Some(format!("grok --resume {new_id}")),
+        new_id,
+        resume_hint: resume,
+        ..Default::default()
     })
 }
 

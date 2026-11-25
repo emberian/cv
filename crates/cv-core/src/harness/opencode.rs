@@ -61,6 +61,30 @@ mod record;
 #[cfg(any(feature = "sqlite", test))]
 mod v2;
 pub use emit::emit;
+pub(crate) use emit::emit_staged;
+
+#[cfg(feature = "sqlite")]
+pub(crate) fn stream_conn(
+    conn: &rusqlite::Connection,
+    r: &SessionRef,
+    opts: &Demand,
+    sink: &mut dyn MessageSink,
+) -> Result<Session> {
+    let guard = crate::json::SqliteSessionGuard::new(|| false);
+    let result = crate::stream::checked(sink, |sink| {
+        let mut spawns = crate::affordance::AffordanceSink::new(Harness::OpenCode, sink);
+        db::stream_snapshot_with_guard(
+            r,
+            opts,
+            &mut spawns,
+            &crate::source::ReadSet::default(),
+            conn,
+            Some(&guard),
+        )
+    });
+    guard.end_pass();
+    result
+}
 
 use super::Adapter;
 use crate::ir::*;
@@ -841,12 +865,23 @@ mod db {
         conn.read(|reader, reads| stream_snapshot(r, opts, sink, reads, reader))
     }
 
-    fn stream_snapshot(
+    pub(super) fn stream_snapshot(
         r: &SessionRef,
         opts: &Demand,
         sink: &mut dyn MessageSink,
         reads: &crate::source::ReadSet,
         conn: &rusqlite::Connection,
+    ) -> Result<Session> {
+        stream_snapshot_with_guard(r, opts, sink, reads, conn, None)
+    }
+
+    pub(super) fn stream_snapshot_with_guard(
+        r: &SessionRef,
+        opts: &Demand,
+        sink: &mut dyn MessageSink,
+        reads: &crate::source::ReadSet,
+        conn: &rusqlite::Connection,
+        guard: Option<&std::sync::Arc<crate::json::SqliteSessionGuard>>,
     ) -> Result<Session> {
         let _snapshot = crate::harness::store::sqlite::snapshot(conn)?;
         // The 2.x tables win for a session in both (a migrated database; module doc of `v2`).
@@ -921,18 +956,16 @@ mod db {
             s.harness_extra_mut(Harness::OpenCode).extend(bag);
         }
         sink.meta(&s);
+        let make_cells = |table: &str| match guard {
+            Some(guard) => Cells::for_session(conn, &r.path, reads, guard, table),
+            None => Cells::new(conn, &r.path, reads, table),
+        };
         if v2 {
-            return stream_v2(
-                conn,
-                s,
-                opts,
-                sink,
-                &Cells::new(conn, &r.path, reads, "session_message")?,
-            );
+            return stream_v2(conn, s, opts, sink, &make_cells("session_message")?);
         }
         // Each `message` cell with its `part` cells (ordered by id), one record at a time.
-        let messages = Cells::new(conn, &r.path, reads, "message")?;
-        let parts = Cells::new(conn, &r.path, reads, "part")?;
+        let messages = make_cells("message")?;
+        let parts = make_cells("part")?;
         fn ctx<'a>(spans: bool, cells: &'a Cells) -> record::Ctx<'a> {
             let (source, arena) = cells.out();
             record::Ctx::new(spans, source, arena)

@@ -63,6 +63,7 @@ impl JsonlStage {
         publish_stage(self.into_stage()?, path, claim)
     }
     /// [`Self::publish`], running `check` on the staged file before it claims `path`.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn publish_checked(
         self,
         path: &Path,
@@ -72,6 +73,7 @@ impl JsonlStage {
         publish_stage_checked(self.into_stage()?, path, claim, check)
     }
     /// Stage the records for `path` as one member of `set`.
+    #[allow(dead_code)]
     pub(crate) fn stage_into(self, set: &mut Set, path: &Path, claim: Claim) -> Result<()> {
         stage_into(set, self.into_stage()?, path, claim)
     }
@@ -84,12 +86,14 @@ impl JsonlStage {
 /// Publish fully produced bytes through [`crate::publish`], never through an existing inode;
 /// `Claim::Replace` replaces the destination name with the staged file.
 /// Checked serialization must complete before calling.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn publish_stage(stage: ByteStage, path: &Path, claim: Claim) -> Result<()> {
     publish_stage_checked(stage, path, claim, |_| Ok(()))
 }
 
 /// [`publish_stage`], running `check` on the staged file before it claims `path`; on an error the
 /// staged file is removed and `path` keeps what it held.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn publish_stage_checked(
     stage: ByteStage,
     path: &Path,
@@ -105,6 +109,7 @@ pub(crate) fn publish_stage_checked(
 }
 
 /// [`publish_stage`] as one member of `set`.
+#[allow(dead_code)]
 pub(crate) fn stage_into(set: &mut Set, stage: ByteStage, path: &Path, claim: Claim) -> Result<()> {
     let source = stage.finish()?;
     let reader = BufReader::with_capacity(super::COPY_CHUNK, source.reader()?);

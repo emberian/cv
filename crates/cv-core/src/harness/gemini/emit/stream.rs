@@ -3,7 +3,7 @@ use super::*;
 use crate::harness::wire::genai;
 use crate::{
     harness::{
-        store::{bytes::ByteStage, stage_into},
+        store::bytes::ByteStage,
         wire::write::{self, ObjectWriter},
     },
     ir::Message,
@@ -339,6 +339,7 @@ pub(super) fn emit(
     out_dir: &Path,
     opts: &EmitOptions,
     force_jsonl: Option<bool>,
+    verify: Option<crate::emit::stage::VerifyFn<'_>>,
 ) -> Result<EmitResult> {
     opts.validate_ids()?;
     crate::emit::validate_native_source(session, Harness::Gemini, opts.thinking)?;
@@ -416,26 +417,56 @@ pub(super) fn emit(
     // project registration publish as one set, the transcript first: a crash between them leaves
     // a session Gemini re-registers from its directory, never a registration with no session.
     let stage = stage.into_inner().map_err(|error| error.into_error())?;
-    fs::create_dir_all(&chats).with_context(|| format!("creating {}", chats.display()))?;
+    let source = stage.finish()?;
+    let file_name = if use_jsonl {
+        format!("session-{new_id}.jsonl")
+    } else {
+        format!("session-{new_id}.json")
+    };
     let path = if direct_jsonl {
         out_dir.to_path_buf()
-    } else if use_jsonl {
-        chats.join(format!("session-{new_id}.jsonl"))
     } else {
-        chats.join(format!("session-{new_id}.json"))
+        chats.join(&file_name)
     };
+    if !opts.force {
+        crate::publish::refuse_existing(&path, "")?;
+    }
+    let resume = Some(crate::harness::resume_in(
+        cwd.as_deref(),
+        format!("gemini --resume {}", crate::harness::shell_quote(&new_id)),
+    ));
+    if let Some(verify_fn) = verify {
+        let ws = crate::emit::stage::StageWorkspace::beside(out_dir, "gemini")?;
+        let staged_path = match &slug {
+            Some(slug) => {
+                ws.write_bytes(Path::new("tmp").join(slug).join(".project_root"), cwd_str.as_bytes())?;
+                let reg = serde_json::json!({ "projects": { &cwd_str: slug } });
+                ws.write_bytes("projects.json", serde_json::to_string_pretty(&reg)?.as_bytes())?;
+                ws.write_source(Path::new("tmp").join(slug).join("chats").join(&file_name), &source)?
+            }
+            None => ws.write_source(Path::new("chats").join(&file_name), &source)?,
+        };
+        let staged_result = EmitResult {
+            path: staged_path,
+            new_id: new_id.clone(),
+            resume_hint: resume.clone(),
+            ..Default::default()
+        };
+        verify_fn(crate::emit::stage::StagedSource::Files { result: &staged_result })?;
+    }
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
     let mut set = crate::publish::Set::new();
-    stage_into(&mut set, stage, &path, opts.claim())?;
+    crate::emit::stage::stage_source_into(&mut set, &source, &path, opts.claim())?;
     if let Some(slug) = &slug {
         stage_project(out_dir, slug, &cwd_str, &mut set)?;
     }
     set.publish()?;
     Ok(EmitResult {
         path,
-        new_id: new_id.clone(),
-        resume_hint: Some(crate::harness::resume_in(
-            cwd.as_deref(),
-            format!("gemini --resume {}", crate::harness::shell_quote(&new_id)),
-        )),
+        new_id,
+        resume_hint: resume,
+        ..Default::default()
     })
 }

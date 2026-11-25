@@ -24,12 +24,26 @@ fn bootstrap(tx: &rusqlite::Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn write_database(
     session: &Session,
     opts: &EmitOptions,
     id: &str,
     cwd: &str,
     conn: &mut Connection,
+) -> Result<()> {
+    let dummy = crate::harness::EmitResult::default();
+    write_database_with_verify(session, opts, id, cwd, conn, &dummy, None)
+}
+
+pub(super) fn write_database_with_verify(
+    session: &Session,
+    opts: &EmitOptions,
+    id: &str,
+    cwd: &str,
+    conn: &mut Connection,
+    result: &crate::harness::EmitResult,
+    verify: Option<crate::emit::stage::VerifyFn<'_>>,
 ) -> Result<()> {
     anyhow::ensure!(id.starts_with("ses"), "OpenCode 2.x session IDs must start with 'ses'");
     let message_ids: Vec<String> = session
@@ -56,7 +70,7 @@ pub(super) fn write_database(
         })
         .collect();
     let resolver = session.resolver();
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let empty: bool = tx.query_row(
         "SELECT NOT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%')",
         [],
@@ -93,7 +107,22 @@ pub(super) fn write_database(
         .model
         .as_ref()
         .map(|m| json!({"id":m,"providerID":provider}).to_string());
-    // INSERT deliberately rejects a reused id: replacing a native session would strand its history.
+    let exists: bool = tx
+        .query_row("SELECT 1 FROM session_v2 WHERE id = ?1", [id], |_| Ok(true))
+        .unwrap_or(false);
+    if exists && !opts.force {
+        let db_path = tx.path().map(std::path::PathBuf::from).unwrap_or_default();
+        return Err(crate::publish::Exists {
+            path: db_path,
+            hint: "",
+        }
+        .into());
+    }
+    if exists {
+        tx.execute("DELETE FROM session_message WHERE session_id = ?1", [id])?;
+        tx.execute("DELETE FROM event_sequence WHERE aggregate_id = ?1", [id])?;
+        tx.execute("DELETE FROM session_v2 WHERE id = ?1", [id])?;
+    }
     tx.execute("INSERT INTO session_v2 (id,project_id,slug,directory,title,version,model,agent,time_created,time_updated) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
         params![id,project,short_hash(id),cwd,session.title,env!("CARGO_PKG_VERSION"),model,"build",created,updated])?;
     if session.harness == Harness::OpenCode {
@@ -359,6 +388,9 @@ pub(super) fn write_database(
         params![id, seq - 1],
     )?;
     write::check_source_fields(session)?;
+    if let Some(verify_fn) = verify {
+        verify_fn(crate::emit::stage::StagedSource::Sqlite { conn: &tx, result })?;
+    }
     tx.commit()?;
     Ok(())
 }

@@ -119,6 +119,7 @@ mod emit;
 mod record;
 mod registry;
 pub use emit::emit;
+pub(crate) use emit::emit_staged;
 
 #[cfg(feature = "sqlite")]
 use super::store::sqlite::open_ro;
@@ -1378,7 +1379,19 @@ impl Events {
     const TABLE: &'static str = "transcript_events";
 
     fn new(conn: &rusqlite::Connection, path: &Path, reads: &crate::source::ReadSet) -> Result<Self> {
-        let cells = super::store::sqlite::Cells::new(conn, path, reads, Self::TABLE)?;
+        Self::with_guard(conn, path, reads, None)
+    }
+
+    fn with_guard(
+        conn: &rusqlite::Connection,
+        path: &Path,
+        reads: &crate::source::ReadSet,
+        guard: Option<&std::sync::Arc<crate::json::SqliteSessionGuard>>,
+    ) -> Result<Self> {
+        let cells = match guard {
+            Some(guard) => super::store::sqlite::Cells::for_session(conn, path, reads, guard, Self::TABLE)?,
+            None => super::store::sqlite::Cells::new(conn, path, reads, Self::TABLE)?,
+        };
         let compressed = if super::store::sqlite::columns(conn, Self::TABLE).contains("event_zstd") {
             cells.select("event_zstd")
         } else {
@@ -1488,61 +1501,97 @@ static SQLITE_DISCOVERED: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new
 /// JSONL path uses — `event_json` IS the JSONL line. Branch selection reads the navigation fields
 /// of every cell, then decodes only the selected ones.
 #[cfg(feature = "sqlite")]
+pub(crate) fn stream_sqlite_conn(
+    conn: &rusqlite::Connection,
+    r: &SessionRef,
+    opts: &Demand,
+    sink: &mut dyn MessageSink,
+) -> Result<Session> {
+    let guard = crate::json::SqliteSessionGuard::new(|| false);
+    let result = crate::stream::checked(sink, |sink| {
+        let mut spawns =
+            crate::affordance::AffordanceSink::new(Harness::OpenClaw, sink).unwrapping(Some(DEFERRED_WRAPPER));
+        stream_sqlite_with_reads(
+            conn,
+            r,
+            opts,
+            &mut spawns,
+            &crate::source::ReadSet::default(),
+            Some(&guard),
+        )
+    });
+    guard.end_pass();
+    result
+}
+
+#[cfg(feature = "sqlite")]
 fn stream_sqlite(r: &SessionRef, opts: &Demand, sink: &mut dyn MessageSink) -> Result<Session> {
     super::store::sqlite::read(&r.path, |conn, reads| {
-        // Navigation and payload reads must see the same history: a concurrent leaf update cannot
-        // change which rows the second pass emits. A deferred read transaction writes no store data.
-        let _snapshot = super::store::sqlite::snapshot(conn)?;
-        let events = Events::new(conn, &r.path, reads)?;
-        let facts = sqlite_key_facts(conn, r, reads, &events)?;
-        // The whole transcript's diagnostics, even if the sink stops at its first turn.
-        let mut cells = Vec::new();
-        let mut skipped = 0;
-        let mut tree = false;
-        events.each(conn, &r.id, |cell| {
-            match cell
-                .map(|cell| events.cells.read(cell, is_leaf_entry))
-                .transpose()?
-                .flatten()
-            {
-                Some(leaf) => {
-                    cells.push(cell.expect("read cell"));
-                    tree |= leaf;
-                }
-                None => skipped += 1,
+        stream_sqlite_with_reads(conn, r, opts, sink, reads, None)
+    })
+}
+
+#[cfg(feature = "sqlite")]
+fn stream_sqlite_with_reads(
+    conn: &rusqlite::Connection,
+    r: &SessionRef,
+    opts: &Demand,
+    sink: &mut dyn MessageSink,
+    reads: &crate::source::ReadSet,
+    guard: Option<&std::sync::Arc<crate::json::SqliteSessionGuard>>,
+) -> Result<Session> {
+    // Navigation and payload reads must see the same history: a concurrent leaf update cannot
+    // change which rows the second pass emits. A deferred read transaction writes no store data.
+    let _snapshot = super::store::sqlite::snapshot(conn)?;
+    let events = Events::with_guard(conn, &r.path, reads, guard)?;
+    let facts = sqlite_key_facts(conn, r, reads, &events)?;
+    // The whole transcript's diagnostics, even if the sink stops at its first turn.
+    let mut cells = Vec::new();
+    let mut skipped = 0;
+    let mut tree = false;
+    events.each(conn, &r.id, |cell| {
+        match cell
+            .map(|cell| events.cells.read(cell, is_leaf_entry))
+            .transpose()?
+            .flatten()
+        {
+            Some(leaf) => {
+                cells.push(cell.expect("read cell"));
+                tree |= leaf;
             }
-            Ok(Flow::Continue)
-        })?;
-        let mut fold = Fold::new(r, &facts, opts);
-        let mut emit = |index: usize, active: bool, parent: Option<Option<String>>| -> Result<Flow> {
-            Ok(
-                match events.cells.read(cells[index], |view| record::record(view, opts))? {
-                    Some(record) => fold.push(record, active, parent, sink)?,
-                    None => Flow::Continue,
-                },
-            )
-        };
-        if tree {
-            let mut descriptors = Vec::with_capacity(cells.len());
-            for cell in &cells {
-                descriptors.push(events.cells.read(*cell, record::navigation)?.unwrap_or(Value::Null));
-            }
-            for row in select_navigation(&descriptors, opts.tier == Tier::Complete) {
-                if emit(row.index, row.active, row.parent)? == Flow::Stop {
-                    break;
-                }
-            }
-        } else {
-            for index in 0..cells.len() {
-                if emit(index, true, None)? == Flow::Stop {
-                    break;
-                }
+            None => skipped += 1,
+        }
+        Ok(Flow::Continue)
+    })?;
+    let mut fold = Fold::new(r, &facts, opts);
+    let mut emit = |index: usize, active: bool, parent: Option<Option<String>>| -> Result<Flow> {
+        Ok(
+            match events.cells.read(cells[index], |view| record::record(view, opts))? {
+                Some(record) => fold.push(record, active, parent, sink)?,
+                None => Flow::Continue,
+            },
+        )
+    };
+    if tree {
+        let mut descriptors = Vec::with_capacity(cells.len());
+        for cell in &cells {
+            descriptors.push(events.cells.read(*cell, record::navigation)?.unwrap_or(Value::Null));
+        }
+        for row in select_navigation(&descriptors, opts.tier == Tier::Complete) {
+            if emit(row.index, row.active, row.parent)? == Flow::Stop {
+                break;
             }
         }
-        let mut s = fold.finish(sink);
-        super::Unparsed(skipped).note(&mut s);
-        Ok(s)
-    })
+    } else {
+        for index in 0..cells.len() {
+            if emit(index, true, None)? == Flow::Stop {
+                break;
+            }
+        }
+    }
+    let mut s = fold.finish(sink);
+    super::Unparsed(skipped).note(&mut s);
+    Ok(s)
 }
 
 #[cfg(not(feature = "sqlite"))]

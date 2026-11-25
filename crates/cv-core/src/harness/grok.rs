@@ -34,6 +34,7 @@ use crate::json::{ReadInput, Validation};
 pub(crate) mod emit;
 mod record;
 pub use emit::emit;
+pub(crate) use emit::emit_staged;
 
 use super::store::document::{self, Fields};
 use super::store::jsonl;

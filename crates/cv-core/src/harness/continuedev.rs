@@ -300,6 +300,15 @@ fn optional_string(view: Option<JsonView<'_>>) -> Result<Option<String>> {
 /// The parser backfills `cwd`/`title` from the transcript itself, so writing the index is for
 /// `discover()` fidelity, not correctness; we still write it.
 pub fn emit(session: &Session, out_dir: &Path, opts: &crate::emit::EmitOptions) -> Result<super::EmitResult> {
+    emit_staged(session, out_dir, opts, None)
+}
+
+pub(crate) fn emit_staged(
+    session: &Session,
+    out_dir: &Path,
+    opts: &crate::emit::EmitOptions,
+    verify: Option<crate::emit::stage::VerifyFn<'_>>,
+) -> Result<super::EmitResult> {
     opts.validate_ids()?;
     super::wire::write::check_source_fields(session)?;
     use anyhow::Context;
@@ -325,15 +334,16 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &crate::emit::EmitOptions) 
         Err(error) => return Err(error).with_context(|| format!("reading {}", index_path.display())),
     };
 
-    fs::create_dir_all(out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
-
     // ── transcript: <sessionId>.json ──
     let resolver = crate::lazy::Resolver::new(session.source_path.clone());
     let title = super::wire::write::fallback_title(session, &resolver)?;
-    let file_path = out_dir.join(format!("{new_id}.json"));
-    let mut set = crate::publish::Set::new();
+    let file_name = format!("{new_id}.json");
+    let file_path = out_dir.join(&file_name);
+    if !opts.force {
+        crate::publish::refuse_existing(&file_path, "")?;
+    }
     let transcript = emit::transcript(session, &new_id, title.as_deref(), cwd_str.as_deref(), opts.thinking)?;
-    super::store::stage_into(&mut set, transcript, &file_path, opts.claim())?;
+    let transcript_source = transcript.finish()?;
 
     // ── index: sessions.json (merge-or-create) ──
     // Drop any stale entry for this id, then append a fresh one.
@@ -356,15 +366,34 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &crate::emit::EmitOptions) 
     entries.push(Value::Object(entry));
     let mut stage = super::store::bytes::ByteStage::new();
     serde_json::to_writer_pretty(&mut stage, &entries)?;
+    let index_source = stage.finish()?;
+
+    if let Some(verify_fn) = verify {
+        let ws = crate::emit::stage::StageWorkspace::beside(out_dir, "continue")?;
+        let staged_path = ws.write_source(&file_name, &transcript_source)?;
+        ws.write_source("sessions.json", &index_source)?;
+        let staged_result = super::EmitResult {
+            path: staged_path,
+            new_id: new_id.clone(),
+            resume_hint: None,
+            ..Default::default()
+        };
+        verify_fn(crate::emit::stage::StagedSource::Files { result: &staged_result })?;
+    }
+
+    fs::create_dir_all(out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
     // Continue's own index: cv's update replaces it whole. Transcript and index publish as one
     // set, the index last: a crash between leaves an unlisted transcript.
-    super::store::stage_into(&mut set, stage, &index_path, crate::publish::Claim::Replace)?;
+    let mut set = crate::publish::Set::new();
+    crate::emit::stage::stage_source_into(&mut set, &transcript_source, &file_path, opts.claim())?;
+    crate::emit::stage::stage_source_into(&mut set, &index_source, &index_path, crate::publish::Claim::Replace)?;
     set.publish()?;
 
     Ok(super::EmitResult {
         path: file_path,
         new_id,
         resume_hint: None,
+        ..Default::default()
     })
 }
 

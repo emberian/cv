@@ -78,7 +78,7 @@ pub struct SkillsReport {
 impl SkillsReport {
     /// The default policy leaves both transcript and report output unchanged.
     pub fn is_keep(&self) -> bool {
-        self.policy == "keep"
+        self.policy.is_empty() || self.policy == "keep"
     }
 }
 
@@ -157,16 +157,56 @@ pub(crate) fn apply(
     Ok((output.finish()?, report))
 }
 
-/// Apply the policy to a session file cv just wrote (a port's output), replacing it.
-/// `config` is the Claude config dir whose user skills the session is judged against.
-pub fn rewrite_file(path: &Path, policy: SkillsPolicy, config: Option<&Path>) -> Result<SkillsReport> {
-    let mut stage = ByteStage::new();
-    std::io::copy(&mut std::fs::File::open(path)?, &mut stage)?;
-    let (output, report) = apply(stage.finish()?, policy, config)?;
-    if report.records > 0 {
-        crate::publish::publish_reader(path, "skills", output.reader()?, crate::publish::Claim::Replace)?;
+/// Whether [`apply`] will rewrite `message`'s carried main-thread `invoked_skills` record (and
+/// therefore strip its `rendered*` fields), so the fidelity projection and the byte rewriter agree.
+pub(crate) fn strips_rendered(
+    message: &crate::ir::Message,
+    policy: SkillsPolicy,
+    config: Option<&Path>,
+    effective_cwd: Option<&Path>,
+) -> bool {
+    if policy == SkillsPolicy::Keep || message.content.is_empty() {
+        return false;
     }
-    Ok(report)
+    let record = message.extra.get(crate::ir::CARRIER_KEY);
+    let claude_bag = message.harness_extra(crate::ir::Harness::Claude);
+    let is_invoked_skills = record
+        .and_then(|r| {
+            if r.get("type").and_then(Value::as_str) != Some("attachment") {
+                return None;
+            }
+            if r.get("isSidechain") == Some(&Value::Bool(true)) {
+                return Some(false);
+            }
+            Some(r.pointer("/attachment/type").and_then(Value::as_str) == Some("invoked_skills"))
+        })
+        .or_else(|| {
+            claude_bag.map(|b| {
+                b.get("isSidechain") != Some(&Value::Bool(true))
+                    && (b.get("attachment_type").and_then(Value::as_str) == Some("invoked_skills")
+                        || b.get("attachment").and_then(|a| a.get("type")).and_then(Value::as_str)
+                            == Some("invoked_skills"))
+            })
+        })
+        .unwrap_or(false);
+    if !is_invoked_skills {
+        return false;
+    }
+    let skills = record
+        .and_then(|r| r.pointer("/attachment/skills"))
+        .or_else(|| claude_bag.and_then(|b| b.get("attachment").and_then(|a| a.get("skills"))))
+        .and_then(Value::as_array);
+    let Some(skills) = skills else {
+        return false;
+    };
+    let cwd = record
+        .and_then(|r| r.get("cwd"))
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .or_else(|| effective_cwd.map(Path::to_path_buf));
+    skills
+        .iter()
+        .any(|entry| !(policy == SkillsPolicy::DropStale && current(entry, config, cwd.as_deref())))
 }
 
 /// A main-thread `attachment` record of type `invoked_skills`.

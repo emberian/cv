@@ -43,6 +43,7 @@ mod legacy;
 mod lifecycle;
 mod record;
 pub use emit::emit;
+pub(crate) use emit::emit_staged;
 
 use super::store::{bytes::ByteSource, jsonl};
 use super::wire::openai;

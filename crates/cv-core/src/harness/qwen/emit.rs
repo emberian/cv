@@ -279,6 +279,15 @@ fn message_parts(writer: &mut dyn Write, role: &str, parts: &[Part<'_>], resolve
 
 /// Emit Qwen Code 0.25 session JSONL under `out_dir` (see the module doc for what it may be).
 pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<EmitResult> {
+    emit_staged(session, out_dir, opts, None)
+}
+
+pub(crate) fn emit_staged(
+    session: &Session,
+    out_dir: &Path,
+    opts: &EmitOptions,
+    verify: Option<crate::emit::stage::VerifyFn<'_>>,
+) -> Result<EmitResult> {
     opts.validate_ids()?;
     crate::emit::validate_native_source(session, Harness::Qwen, opts.thinking)?;
     let resolver = session.resolver();
@@ -290,6 +299,9 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Emi
         .context("a Qwen Code session is filed under its cwd; this session has none (pass --cwd)")?;
     let chats = projects_dir(out_dir).join(sanitize_cwd(&cwd_str)).join("chats");
     let path = chats.join(format!("{new_id}.jsonl"));
+    if !opts.force {
+        crate::publish::refuse_existing(&path, "")?;
+    }
 
     let stamp = |t: Option<chrono::DateTime<Utc>>| t.map(|t| t.to_rfc3339_opts(SecondsFormat::Millis, true));
     let mut w = Writer {
@@ -502,21 +514,46 @@ pub fn emit(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Emi
             payload.finish()
         })?;
     }
-    // Complete all checked record production before creating or opening the destination.
+    // Complete all checked record production and staged verification before creating or opening the destination.
+    let resume = Some(crate::harness::resume_in(
+        cwd.as_deref(),
+        format!("qwen --resume {}", crate::harness::shell_quote(&new_id)),
+    ));
+    let empty_lines = w.lines.is_empty();
+    let source = (!empty_lines).then(|| w.lines.into_source()).transpose()?;
+    if let Some(verify_fn) = verify {
+        let ws = crate::emit::stage::StageWorkspace::beside(out_dir, "qwen")?;
+        let rel = Path::new("projects")
+            .join(sanitize_cwd(&cwd_str))
+            .join("chats")
+            .join(format!("{new_id}.jsonl"));
+        let staged_path = match &source {
+            Some(src) => ws.write_source(&rel, src)?,
+            None => ws.write_bytes(&rel, b"\n")?,
+        };
+        let staged_result = EmitResult {
+            path: staged_path,
+            new_id: new_id.clone(),
+            resume_hint: resume.clone(),
+            ..Default::default()
+        };
+        verify_fn(crate::emit::stage::StagedSource::Files { result: &staged_result })?;
+    }
     fs::create_dir_all(&chats).with_context(|| format!("creating {}", chats.display()))?;
-    if w.lines.is_empty() {
-        // The original Qwen writer emits one blank line even for an empty session.
-        crate::publish::publish_reader(&path, "stage", &b"\n"[..], opts.claim())?;
-    } else {
-        w.lines.publish(&path, opts.claim())?;
+    match &source {
+        None => {
+            // The original Qwen writer emits one blank line even for an empty session.
+            crate::publish::publish_reader(&path, "stage", &b"\n"[..], opts.claim())?;
+        }
+        Some(src) => {
+            crate::emit::stage::publish_source(src, &path, opts.claim())?;
+        }
     }
     Ok(EmitResult {
         path,
-        new_id: new_id.clone(),
-        resume_hint: Some(crate::harness::resume_in(
-            cwd.as_deref(),
-            format!("qwen --resume {}", crate::harness::shell_quote(&new_id)),
-        )),
+        new_id,
+        resume_hint: resume,
+        ..Default::default()
     })
 }
 

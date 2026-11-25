@@ -40,7 +40,7 @@ use crate::stream::{Checkpoint, CollectSink, Demand, Flow, MessageSink, Start, T
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 pub use emit::{emit, verify_claude_resumable};
-pub(crate) use emit::{verify_carried, verify_derived};
+pub(crate) use emit::{emit_staged, verify_carried, verify_derived};
 use serde_json::{Map, Value};
 use std::collections::HashSet;
 use std::fs;

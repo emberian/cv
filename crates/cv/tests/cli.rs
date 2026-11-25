@@ -5057,3 +5057,223 @@ fn prune_and_adopt_keep_retrievable_child_inputs_and_outputs() {
         );
     }
 }
+
+#[test]
+fn cli_port_strict_stages_before_publish_and_runs_skills_in_stage() {
+    use serde_json::{json, Value};
+    let w = World::new("port-strict-stage-tooth");
+
+    // 1. `cv port --skills drop --strict` applies `SkillsPolicy` inside the stage BEFORE
+    //    `verify_claude_resumable` and strict fidelity read-back, so the published transcript
+    //    is the exact post-skills transcript and `--strict` passes cleanly.
+    w.write_session(
+        "skills-strict-src",
+        &[
+            user_line("skills-strict-src", "u1", "2026-10-01T12:00:00Z", "run skill"),
+            json!({
+                "type": "attachment",
+                "uuid": "att1",
+                "parentUuid": "u1",
+                "isSidechain": false,
+                "cwd": "/work/proj",
+                "attachment": {
+                    "type": "invoked_skills",
+                    "skills": [
+                        {"name": "gone", "path": "userSettings:gone", "content": "Gone skill body."}
+                    ]
+                },
+                "rendered": [{"content": "<system-reminder>Gone skill body.</system-reminder>"}],
+                "renderedRole": "system"
+            }),
+            claude::with(
+                assistant_line("a1", "2026-10-01T12:00:02Z", json!([{"type": "text", "text": "Done."}])),
+                json!({"parentUuid": "att1"}),
+            ),
+        ],
+    );
+    let skills_out = w.base.join("skills-strict-out");
+    let (stdout, _) = w.cv_ok(&[
+        "port",
+        "claude:skills-strict-src",
+        "--out",
+        skills_out.to_str().unwrap(),
+        "--skills",
+        "drop",
+        "--strict",
+        "--thinking",
+        "native",
+        "--no-context",
+    ]);
+    assert!(
+        stdout.contains("skills (drop): dropped 1"),
+        "expected skills summary line, got:\n{stdout}"
+    );
+    let proj_dir = fs::read_dir(&skills_out).unwrap().next().unwrap().unwrap().path();
+    let ported_jsonl = fs::read_dir(&proj_dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|e| e == "jsonl"))
+        .unwrap();
+    let records: Vec<Value> = fs::read_to_string(&ported_jsonl)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let att = records
+        .iter()
+        .find(|r| r.pointer("/attachment/type") == Some(&json!("invoked_skills")))
+        .unwrap();
+    assert_eq!(att["attachment"]["skills"], json!([]));
+    assert!(att.get("rendered").is_none());
+
+    // 2. Plant an OpenSession export with both a foreign plain `Role::System` Notice turn and a
+    //    `Role::Tool` turn carrying non-result `Block::Text`, so porting with `--strict` fails
+    //    across Claude, Codex, OpenCode, and Hermes BEFORE publishing a single file or SQLite row.
+    let exports_dir = w.base.join("exports");
+    fs::create_dir_all(&exports_dir).unwrap();
+    w.cv_ok(&["config", "--add-export", exports_dir.to_str().unwrap()]);
+
+    let mut clean = cv_core::ir::Session::new("clean-port", cv_core::ir::Harness::OpenSession);
+    clean.cwd = Some(PathBuf::from("/work/proj"));
+    let mut cu = cv_core::ir::Message::new(cv_core::ir::Role::User);
+    cu.content.push(cv_core::ir::Block::from_text("seed prompt".into()));
+    let mut ca = cv_core::ir::Message::new(cv_core::ir::Role::Assistant);
+    ca.content
+        .push(cv_core::ir::Block::from_text("seed reply searchablekeep".into()));
+    clean.messages = vec![cu, ca];
+    fs::write(
+        exports_dir.join("clean-port.opensession.json"),
+        serde_json::to_vec(&cv_core::harness::opensession::document(&clean)).unwrap(),
+    )
+    .unwrap();
+
+    let mut lossy = clean.clone();
+    lossy.id = "lossy-port".into();
+    let mut sys = cv_core::ir::Message::new(cv_core::ir::Role::System);
+    sys.content
+        .push(cv_core::ir::Block::from_text("unwritten system notice".into()));
+    let mut tool = cv_core::ir::Message::new(cv_core::ir::Role::Tool);
+    tool.content = vec![
+        cv_core::ir::Block::from_text("unwritten tool text".into()),
+        cv_core::ir::Block::ToolResult {
+            tool_use_id: "orphan_call".into(),
+            content: "tool result".into(),
+            is_error: false,
+            tool_name: Some("Read".into()),
+            status: None,
+            details: None,
+            extensions: Default::default(),
+        },
+    ];
+    lossy.messages.insert(0, sys);
+    lossy.messages.push(tool);
+    fs::write(
+        exports_dir.join("lossy-port.opensession.json"),
+        serde_json::to_vec(&cv_core::harness::opensession::document(&lossy)).unwrap(),
+    )
+    .unwrap();
+
+    // File targets: non-existent `--out` stays absent and leaves zero `.cv-stage-*` directories.
+    let stage_parent = w.base.join("file-stage-parent");
+    fs::create_dir_all(&stage_parent).unwrap();
+    for target in ["claude", "codex"] {
+        let missing_out = stage_parent.join(format!("missing-{target}"));
+        let (_, err) = w.cv_fails(&[
+            "port",
+            "opensession:lossy-port",
+            "--harness",
+            target,
+            "--out",
+            missing_out.to_str().unwrap(),
+            "--strict",
+            "--no-context",
+        ]);
+        assert!(err.contains("--strict"), "{target}: {err}");
+        assert!(
+            !missing_out.exists(),
+            "{target}: failed --strict port must not create out_dir"
+        );
+    }
+    assert_eq!(
+        fs::read_dir(&stage_parent).unwrap().count(),
+        0,
+        "zero .cv-stage-* directories left behind in parent"
+    );
+
+    // SQLite targets: seed a clean session into `opencode` and `hermes`, then verify a failed
+    // `--strict` port leaves live rows and FTS5 index entries completely untouched.
+    let oc_dir = w.base.join("opencode-live");
+    w.cv_ok(&[
+        "port",
+        "opensession:clean-port",
+        "--harness",
+        "opencode",
+        "--out",
+        oc_dir.to_str().unwrap(),
+        "--no-context",
+    ]);
+    let oc_db = oc_dir.join("opencode.db");
+    let count_oc = || -> i64 {
+        let conn = rusqlite::Connection::open(&oc_db).unwrap();
+        conn.query_row("SELECT COUNT(*) FROM session_message", [], |r| r.get(0))
+            .unwrap()
+    };
+    let oc_before = count_oc();
+    assert_eq!(oc_before, 2);
+    let (_, oc_err) = w.cv_fails(&[
+        "port",
+        "opensession:lossy-port",
+        "--harness",
+        "opencode",
+        "--out",
+        oc_dir.to_str().unwrap(),
+        "--strict",
+        "--no-context",
+    ]);
+    assert!(oc_err.contains("--strict"), "{oc_err}");
+    assert_eq!(
+        count_oc(),
+        oc_before,
+        "OpenCode transaction must roll back on --strict failure"
+    );
+
+    let hermes_dir = w.base.join("hermes-live");
+    w.cv_ok(&[
+        "port",
+        "opensession:clean-port",
+        "--harness",
+        "hermes",
+        "--out",
+        hermes_dir.to_str().unwrap(),
+        "--no-context",
+    ]);
+    let hermes_db = hermes_dir.join("state.db");
+    let count_hermes = || -> (i64, i64) {
+        let conn = rusqlite::Connection::open(&hermes_db).unwrap();
+        let m: i64 = conn
+            .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+            .unwrap();
+        let f: i64 = conn
+            .query_row("SELECT COUNT(*) FROM messages_fts", [], |r| r.get(0))
+            .unwrap();
+        (m, f)
+    };
+    let hermes_before = count_hermes();
+    assert_eq!(hermes_before, (2, 2));
+    let (_, h_err) = w.cv_fails(&[
+        "port",
+        "opensession:lossy-port",
+        "--harness",
+        "hermes",
+        "--out",
+        hermes_dir.to_str().unwrap(),
+        "--strict",
+        "--no-context",
+    ]);
+    assert!(h_err.contains("--strict"), "{h_err}");
+    assert_eq!(
+        count_hermes(),
+        hermes_before,
+        "Hermes transaction & FTS5 triggers must roll back on --strict failure"
+    );
+}

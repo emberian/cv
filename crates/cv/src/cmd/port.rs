@@ -58,7 +58,10 @@ pub(crate) fn cmd_port(
     let new_cwd = cwd.clone();
     let mut artifacts = cv_core::harness::claude::artifacts::Artifacts::default();
     artifacts.collect_source(&r, &session)?;
-    let written = emit_with_artifacts(
+    let skills_config = (skills_policy != SkillsPolicy::Keep)
+        .then(|| cv_core::harness::claude::skills::config_dir_of(&r.path))
+        .flatten();
+    let res = emit_session_result(
         &session,
         to_h,
         out,
@@ -67,6 +70,8 @@ pub(crate) fn cmd_port(
             strict,
             thinking,
             parsed_at: cv_core::emit::ParsedAt::for_port(r.harness, to_h),
+            skills_policy,
+            skills_config,
             ..Default::default()
         },
         json,
@@ -80,12 +85,9 @@ pub(crate) fn cmd_port(
         }
     }
 
-    if skills_policy != SkillsPolicy::Keep {
-        use cv_core::harness::claude::skills::{config_dir_of, rewrite_file};
-        let config = config_dir_of(&written).or_else(|| config_dir_of(&r.path));
-        let report = rewrite_file(&written, skills_policy, config.as_deref())?;
+    if !res.skills.is_keep() {
         let mut h = String::new();
-        crate::cmd::reshape::skills_line(&mut h, &report);
+        crate::cmd::reshape::skills_line(&mut h, &res.skills);
         if json {
             eprint!("{h}");
         } else {
@@ -180,17 +182,17 @@ pub(crate) fn emit_session_output(
     opts: EmitOptions,
     json: bool,
 ) -> Result<PathBuf> {
-    emit_with_artifacts(session, to_h, out, opts, json, None)
+    Ok(emit_session_result(session, to_h, out, opts, json, None)?.path)
 }
 
-fn emit_with_artifacts(
+fn emit_session_result(
     session: &Session,
     to_h: Harness,
     out: Option<PathBuf>,
     opts: EmitOptions,
     json: bool,
     artifacts: Option<&cv_core::harness::claude::artifacts::Artifacts>,
-) -> Result<PathBuf> {
+) -> Result<cv_core::EmitResult> {
     if !cv_core::emit::supported_targets().contains(&to_h) {
         // A caller mistake, not a failure (exit 2): the source parsed, the target cannot be written.
         return usage(format!(
@@ -244,14 +246,14 @@ fn emit_with_artifacts(
         );
     } else {
         println!("✦ wrote {} ({})", res.path.display(), res.new_id);
-        if let Some(hint) = res.resume_hint {
+        if let Some(hint) = &res.resume_hint {
             println!("  ↳ {hint}");
         }
     }
     for w in &warnings {
         eprintln!("  ⚠ lossy: {w}");
     }
-    Ok(res.path)
+    Ok(res)
 }
 
 // ---------- resume ----------
@@ -645,7 +647,7 @@ mod context_tests {
         let mut bad_artifacts = cv_core::harness::claude::artifacts::Artifacts::default();
         bad_artifacts.collect(&src_transcript).unwrap();
         let fresh_out = world.base.join("fresh-out");
-        assert!(emit_with_artifacts(
+        assert!(emit_session_result(
             &session,
             Harness::Claude,
             Some(fresh_out.clone()),
@@ -685,7 +687,7 @@ mod context_tests {
         let conflicting_flat = dest_proj.join("pinned-port.flat.jsonl");
         fs::write(&conflicting_flat, b"pre-existing sidecar").unwrap();
 
-        let err = emit_with_artifacts(
+        let err = emit_session_result(
             &session,
             Harness::Claude,
             Some(world.base.join("dest-out")),
