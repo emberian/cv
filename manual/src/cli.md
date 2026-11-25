@@ -493,6 +493,13 @@ or its process exited mid-turn (`open_obligations` in `--json`). Decided from re
 never from what its last text says. Nothing will wake it; it never counts as done, and
 `--stranded` lists it with a resume hint.
 
+**Attention** (`attention` in `--json`) orders lanes by what they ask of you: `needs_you` (an
+unresolved decision, an open question or approval call, or stranded), `working` (running, a turn
+in the last five minutes), `stale` (running but quieter), `idle` (stopped, nothing owed), `done`.
+**`witness_divergence`** appears when the hook record and the transcript disagree: a hook stop
+followed by transcript activity more than 500 ms later (Claude flushes about 100 ms after `Stop`),
+a stop with unsettled tool calls, or an open run whose transcript already ended in a report.
+
 **`--tasks`** shows up to five tasks each lane's endpoint holds (id, state, title, last note). The
 endpoint is the first `CV_ENDPOINT=<kind>:<name>` the lane's own shell exported
 (`endpoint_source: transcript`, always in `--json`), else its description's leading token matched

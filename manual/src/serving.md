@@ -275,7 +275,8 @@ body, else `?who=`, else `--who`).
   14-day window, `since=` narrows it.
 - **`GET /api/events?since=&kind=&by=&not_by=&assignee=&task=`**: JSON lines, as `cv task
   events`; an unknown `kind` is a `400` naming the known kinds.
-- **`GET /api/lanes?session=<id>`**: `cv lanes --tasks`.
+- **`GET /api/lanes?session=<id>`**: `cv lanes --tasks`, most urgent `attention` first, with
+  per-attention counts and how many lanes show a `witness_divergence`.
 - **`GET /api/tasks?detail=1&repo=&state=&tag=&all=1`**: every task with backlog columns (owner,
   blockers, age), newest first. `GET /api/backlog` answers `410` with this pointer.
 - **`POST /api/task/{id}/{resolve,done,note,discuss,claim,release}`**: `{choice}`,

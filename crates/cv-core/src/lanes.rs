@@ -92,6 +92,93 @@ pub enum StatusSource {
 /// inferred when no OS process identity or stop hook is recorded.
 pub const RETURNED_QUIET_SECS: i64 = 600;
 
+/// A running lane with no turn for this long reads as [`AttentionState::Stale`].
+pub const STALE_AFTER_SECS: i64 = 300;
+
+/// Claude flushes a turn's last records about 100 ms after its `Stop` hook fires; transcript
+/// activity within this window of a hook stop is the same stop, not a divergence.
+pub const STOP_FLUSH_GRACE_MS: i64 = 500;
+
+/// What a lane asks of its operator, most urgent first: sorting by it puts [`Self::NeedsYou`] on top.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttentionState {
+    /// An unresolved decision, an open question or approval call, or stranded on obligations.
+    NeedsYou,
+    /// Running, with a turn in the last [`STALE_AFTER_SECS`].
+    Working,
+    /// Running by every record, but quiet for [`STALE_AFTER_SECS`] or longer.
+    Stale,
+    /// Parked (stopped) with nothing owed.
+    Idle,
+    /// Finished: completed, returned, failed or killed, with nothing owed.
+    Done,
+}
+
+impl AttentionState {
+    pub const ALL: [AttentionState; 5] = [Self::NeedsYou, Self::Working, Self::Stale, Self::Idle, Self::Done];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NeedsYou => "needs_you",
+            Self::Working => "working",
+            Self::Stale => "stale",
+            Self::Idle => "idle",
+            Self::Done => "done",
+        }
+    }
+}
+
+/// What the hooks recorded for a lane (`state.db` `lane_runs` and the hook ledger).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HookWitness {
+    /// The latest stop a hook recorded.
+    pub stopped_at: Option<DateTime<Utc>>,
+    /// The latest run a hook started that has no exit or stop recorded at or after its start.
+    pub open_run_since: Option<DateTime<Utc>>,
+}
+
+/// What the transcript's tail says.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TranscriptTail {
+    pub last_turn_at: Option<DateTime<Utc>>,
+    pub open_tool_calls: usize,
+    pub ends_in_report: bool,
+}
+
+/// Where the two witnesses disagree, in words, or `None` when they agree, when there is no hook
+/// record to compare, or while a hook stop is younger than [`STOP_FLUSH_GRACE_MS`].
+pub fn witness_divergence(hook: HookWitness, tail: TranscriptTail, now: DateTime<Utc>) -> Option<String> {
+    if let Some(stop) = hook
+        .stopped_at
+        .filter(|s| hook.open_run_since.is_none_or(|run| *s >= run))
+    {
+        if (now - stop).num_milliseconds() < STOP_FLUSH_GRACE_MS {
+            return None;
+        }
+        let after_ms = tail.last_turn_at.map(|t| (t - stop).num_milliseconds());
+        if after_ms.is_some_and(|ms| ms > STOP_FLUSH_GRACE_MS) {
+            return Some(format!(
+                "hook stop at {} but the transcript advanced {} ms later",
+                stop.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                after_ms.unwrap_or_default()
+            ));
+        }
+        if tail.open_tool_calls > 0 {
+            return Some(format!(
+                "hook stop at {} but the transcript has {} unsettled tool call(s)",
+                stop.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                tail.open_tool_calls
+            ));
+        }
+        return None;
+    }
+    let run = hook.open_run_since?;
+    let quiet = tail.last_turn_at.map(|t| (now - t).num_seconds())?;
+    (tail.ends_in_report && tail.open_tool_calls == 0 && quiet >= STALE_AFTER_SECS && tail.last_turn_at >= Some(run))
+        .then(|| format!("hooks show the run open but the transcript ended in a final report {quiet} s ago"))
+}
+
 /// Structural unfinished obligations held by a lane. A parked or exited lane with any non-zero
 /// obligation (or that died mid-turn on OS process exit) is `stranded == true`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1148,6 +1235,14 @@ pub struct Lane {
     /// Exact structural obligations held by this lane (`unreturned_subagents`, `open_tool_calls`,
     /// `open_claimed_tasks`, `unanswered_decisions`).
     pub open_obligations: OpenObligations,
+    /// An open question or approval tool call waits on the operator.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pending_ask: bool,
+    /// What the lane asks of its operator ([`Lane::attention_at`]).
+    pub attention: AttentionState,
+    /// Where the hook record and the transcript tail disagree ([`witness_divergence`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub witness_divergence: Option<String>,
     /// Why a `failed` / `killed` lane died, read from its transcript's last API-error notice.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_cause: Option<String>,
@@ -1273,6 +1368,7 @@ fn populate_task_obligations(lanes: &mut [Lane], model: &crate::task::TaskReadMo
         lane.open_obligations.unanswered_decisions = unanswered_decisions;
         let crashed_mid_turn = lane.status_source == StatusSource::ProcessExit && lane.status == LaneStatus::Stopped;
         lane.stranded = compute_stranded(&lane.status, &lane.open_obligations, crashed_mid_turn);
+        lane.attention = lane.attention_at(Utc::now());
     }
 }
 
@@ -1345,6 +1441,34 @@ impl Lane {
     pub fn is_running(&self) -> bool {
         self.status == LaneStatus::Running
     }
+
+    /// The lane's [`AttentionState`] at `now`, from its status, obligations and last turn.
+    pub fn attention_at(&self, now: DateTime<Utc>) -> AttentionState {
+        if self.stranded || self.pending_ask || self.open_obligations.unanswered_decisions > 0 {
+            return AttentionState::NeedsYou;
+        }
+        if self.is_running() {
+            let last = self.last_turn_at.or(self.started_at);
+            return match last {
+                Some(t) if now.signed_duration_since(t).num_seconds() < STALE_AFTER_SECS => AttentionState::Working,
+                _ => AttentionState::Stale,
+            };
+        }
+        if self.status == LaneStatus::Stopped || self.status.as_str() == "stopped" {
+            return AttentionState::Idle;
+        }
+        AttentionState::Done
+    }
+}
+
+/// Order lanes by operator urgency ([`AttentionState`]), then most recent turn first.
+pub fn sort_by_attention(lanes: &mut [Lane]) {
+    lanes.sort_by(|a, b| {
+        a.attention
+            .cmp(&b.attention)
+            .then_with(|| b.last_turn_at.or(b.started_at).cmp(&a.last_turn_at.or(a.started_at)))
+            .then_with(|| a.agent_id.cmp(&b.agent_id))
+    });
 }
 
 /// Classify a dead lane's cause from its transcript's last uncleared API-error notice (see
@@ -1515,6 +1639,27 @@ struct Pass {
     ends_in_report: bool,
     /// The first `CV_ENDPOINT=…` a shell command of this lane exported.
     endpoint: Option<String>,
+    /// An open tool call is a question or approval for the operator.
+    pending_ask: bool,
+}
+
+/// A question or approval call: answering it is the operator's move.
+fn is_ask(harness: crate::ir::Harness, name: &str, input: &crate::json::Json) -> Result<bool> {
+    use crate::affordance::Kind;
+    use crate::tools::classify::{visit_tool_ops, ClassifyOpts, ToolOp};
+    let mut ask = false;
+    input.with_view(|view| {
+        visit_tool_ops(Some(harness), name, view, ClassifyOpts::COUNTS, |op| {
+            if let ToolOp::Affordance {
+                kind: Kind::Question | Kind::Approval,
+                ..
+            } = op.op
+            {
+                ask = true;
+            }
+        })
+    })?;
+    Ok(ask)
 }
 
 fn pass(r: &SessionRef) -> Result<Pass> {
@@ -1523,6 +1668,7 @@ fn pass(r: &SessionRef) -> Result<Pass> {
     let mut last_board_post: Option<String> = None;
     let mut seen = HashSet::new();
     let mut open_tools: HashSet<String> = HashSet::new();
+    let mut asks: HashSet<String> = HashSet::new();
     // Only response identity is needed beyond the ordinary IR. Keep source-backed arguments
     // without unrelated raw result metadata; demanded assistant reports retain their full text.
     let opts = Demand::USAGE.with_spans();
@@ -1533,13 +1679,17 @@ fn pass(r: &SessionRef) -> Result<Pass> {
         &mut crate::stream::TryFnSink::new(|m: Message| {
             if m.kind == MessageKind::CompactionBoundary {
                 open_tools.clear();
+                asks.clear();
                 p.ends_in_report = false;
             }
             if m.is_model_visible() {
                 for b in &m.content {
                     match b {
-                        Block::ToolUse { id, .. } if !id.is_empty() => {
+                        Block::ToolUse { id, name, input, .. } if !id.is_empty() => {
                             open_tools.insert(id.clone());
+                            if is_ask(r.harness, name, input)? {
+                                asks.insert(id.clone());
+                            }
                         }
                         Block::ToolResult { tool_use_id, .. } if !tool_use_id.is_empty() => {
                             open_tools.remove(tool_use_id);
@@ -1623,6 +1773,7 @@ fn pass(r: &SessionRef) -> Result<Pass> {
         p.last_text = last_board_post;
     }
     p.open_tool_calls = open_tools.len();
+    p.pending_ask = asks.iter().any(|id| open_tools.contains(id));
     Ok(p)
 }
 
@@ -1640,6 +1791,8 @@ struct AgentStateFacts {
     /// When `record_lane_exit` recorded a non-hook exit timestamp, used to verify the lane wasn't
     /// resumed after that exit.
     process_exit_at: Option<DateTime<Utc>>,
+    /// The latest hook-started run's start, when it has no exit recorded.
+    open_run_since: Option<DateTime<Utc>>,
 }
 
 #[cfg(feature = "sqlite")]
@@ -1871,6 +2024,9 @@ fn load_state_facts_for_forest(
             .find(|r| r.exit_status.as_deref() != Some("stop_only"))
         {
             facts.baggage = baggage_by_run.get(&latest.run_id).cloned();
+            if latest.exited_at.is_none() {
+                facts.open_run_since = DateTime::from_timestamp_millis(latest.started_at);
+            }
             if latest.exited_at.is_none() && latest.pid.is_some() {
                 if !is_run_process_alive(latest) {
                     facts.process_exited = true;
@@ -2027,6 +2183,20 @@ fn lane_of(
     };
     let crashed_mid_turn = status_source == StatusSource::ProcessExit && status == LaneStatus::Stopped;
     let stranded = compute_stranded(&status, &open_obligations, crashed_mid_turn);
+    let now = Utc::now();
+    let hook = HookWitness {
+        stopped_at: effective_ledger_stop,
+        open_run_since: state_facts.and_then(|sf| sf.open_run_since),
+    };
+    let divergence = witness_divergence(
+        hook,
+        TranscriptTail {
+            last_turn_at: end.last_turn_at.or(sub.session.updated_at),
+            open_tool_calls: p.open_tool_calls,
+            ends_in_report: p.ends_in_report,
+        },
+        now,
+    );
 
     let cause = failure_cause(status.as_str(), &end);
     let notice = end
@@ -2048,7 +2218,7 @@ fn lane_of(
     }
     let lineage = (!lineage.is_empty()).then_some(lineage);
 
-    Ok(Lane {
+    let mut lane = Lane {
         baggage: state_facts
             .and_then(|s| s.baggage.clone())
             .or_else(|| crate::hooks::Baggage::for_session(sub.session.harness.as_str(), &sub.session.id)),
@@ -2072,6 +2242,9 @@ fn lane_of(
         last_tool: p.last_tool,
         stranded,
         open_obligations,
+        pending_ask: p.pending_ask,
+        attention: AttentionState::Done,
+        witness_divergence: divergence,
         failure_cause: cause.map(str::to_string),
         resets_at: notice.and_then(|n| n.resets_at),
         failure_detail: notice.map(|n| n.text.clone()),
@@ -2079,7 +2252,9 @@ fn lane_of(
         endpoint_source,
         tasks: None,
         lineage,
-    })
+    };
+    lane.attention = lane.attention_at(now);
+    Ok(lane)
 }
 
 fn lane_or_vanished(
@@ -2379,6 +2554,146 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    fn bare_lane(id: &str, status: LaneStatus, last_turn_at: Option<DateTime<Utc>>) -> Lane {
+        Lane {
+            baggage: None,
+            agent_id: id.into(),
+            session_id: format!("agent-{id}"),
+            path: PathBuf::new(),
+            agent_type: None,
+            description: None,
+            tool_use_id: None,
+            workflow: None,
+            model: None,
+            started_at: None,
+            last_turn_at,
+            duration_ms: None,
+            messages: 1,
+            tool_calls: 0,
+            tokens: LaneTokens::default(),
+            status,
+            status_source: StatusSource::Transcript,
+            last_text: None,
+            last_tool: None,
+            stranded: false,
+            open_obligations: OpenObligations::default(),
+            pending_ask: false,
+            attention: AttentionState::Done,
+            witness_divergence: None,
+            failure_cause: None,
+            resets_at: None,
+            failure_detail: None,
+            endpoint: None,
+            endpoint_source: None,
+            tasks: None,
+            lineage: None,
+        }
+    }
+
+    #[test]
+    fn attention_sorts_needs_you_first_and_ages_running_lanes_to_stale() {
+        // #tooth A quiet running lane, a parked one, a finished one and three kinds of "needs you",
+        // shuffled: the sort is by urgency, then newest turn, and is the same every time.
+        let now: DateTime<Utc> = "2026-11-24T12:00:00Z".parse().unwrap();
+        let ago = |s: i64| Some(now - chrono::Duration::seconds(s));
+        let mut decision = bare_lane("decision", LaneStatus::Running, ago(5));
+        decision.open_obligations.unanswered_decisions = 1;
+        let mut ask = bare_lane("ask", LaneStatus::Running, ago(1));
+        ask.pending_ask = true;
+        let mut stranded = bare_lane("stranded", LaneStatus::Stopped, ago(900));
+        stranded.stranded = true;
+        let mut lanes = vec![
+            bare_lane("done", LaneStatus::Recorded("completed".into()), ago(2)),
+            bare_lane("stale", LaneStatus::Running, ago(STALE_AFTER_SECS)),
+            decision,
+            bare_lane("idle", LaneStatus::Stopped, ago(30)),
+            bare_lane("failed", LaneStatus::Recorded("failed".into()), ago(3)),
+            ask,
+            bare_lane("working", LaneStatus::Running, ago(STALE_AFTER_SECS - 1)),
+            stranded,
+        ];
+        for lane in &mut lanes {
+            lane.attention = lane.attention_at(now);
+        }
+        sort_by_attention(&mut lanes);
+        let got: Vec<(&str, &str)> = lanes
+            .iter()
+            .map(|l| (l.agent_id.as_str(), l.attention.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("ask", "needs_you"),
+                ("decision", "needs_you"),
+                ("stranded", "needs_you"),
+                ("working", "working"),
+                ("stale", "stale"),
+                ("idle", "idle"),
+                ("done", "done"),
+                ("failed", "done"),
+            ]
+        );
+        assert_eq!(serde_json::to_value(AttentionState::NeedsYou).unwrap(), "needs_you");
+        assert!(AttentionState::ALL.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn witnesses_diverge_only_outside_the_stop_flush_grace() {
+        // #tooth Claude's transcript lands ~100 ms after its Stop hook: inside 500 ms is agreement.
+        let stop: DateTime<Utc> = "2026-11-24T12:00:00Z".parse().unwrap();
+        let ms = |n: i64| stop + chrono::Duration::milliseconds(n);
+        let hook = HookWitness {
+            stopped_at: Some(stop),
+            open_run_since: Some(ms(-60_000)),
+        };
+        let tail = |last: i64, open: usize| TranscriptTail {
+            last_turn_at: Some(ms(last)),
+            open_tool_calls: open,
+            ends_in_report: open == 0,
+        };
+        let later = ms(10_000);
+        assert_eq!(witness_divergence(hook, tail(100, 0), later), None);
+        assert_eq!(witness_divergence(hook, tail(100, 1), ms(200)), None, "still flushing");
+        let open = witness_divergence(hook, tail(100, 2), later).unwrap();
+        assert!(open.contains("2 unsettled tool call(s)"), "{open}");
+        let advanced = witness_divergence(hook, tail(2_000, 0), later).unwrap();
+        assert!(advanced.contains("advanced 2000 ms later"), "{advanced}");
+        // A run started after the stop: the stop is history, and the open run is judged instead.
+        let reopened = HookWitness {
+            stopped_at: Some(stop),
+            open_run_since: Some(ms(1_000)),
+        };
+        assert_eq!(witness_divergence(reopened, tail(2_000, 0), ms(60_000)), None);
+        let lost = witness_divergence(reopened, tail(2_000, 0), ms(2_000 + STALE_AFTER_SECS * 1000)).unwrap();
+        assert!(lost.contains("ended in a final report"), "{lost}");
+        assert_eq!(witness_divergence(HookWitness::default(), tail(0, 3), later), None);
+    }
+
+    #[test]
+    fn an_open_question_call_is_a_pending_ask_and_an_answered_one_is_not() {
+        let world = crate::test_world("lane-pending-ask");
+        let write = |name: &str, answered: bool| {
+            let path = world.proj.join(format!("{name}.jsonl"));
+            let mut records = vec![
+                serde_json::json!({"type":"user","uuid":"u","message":{"role":"user","content":"go"}}),
+                serde_json::json!({"type":"assistant","uuid":"a","message":{"id":"r1","role":"assistant","content":[
+                    {"type":"tool_use","id":"q","name":"AskUserQuestion","input":{"questions":[{"question":"Ship it?","options":[{"label":"yes"},{"label":"no"}]}]}}
+                ]}}),
+            ];
+            if answered {
+                records.push(
+                    serde_json::json!({"type":"user","uuid":"r","message":{"role":"user","content":[
+                        {"type":"tool_result","tool_use_id":"q","content":"yes"}
+                    ]}}),
+                );
+            }
+            std::fs::write(&path, records.iter().map(|r| format!("{r}\n")).collect::<String>()).unwrap();
+            SessionRef::new(name, crate::Harness::Claude, path)
+        };
+        assert!(pass(&write("open", false)).unwrap().pending_ask);
+        assert!(!pass(&write("answered", true)).unwrap().pending_ask);
+    }
+
     #[test]
     fn lane_pass_preserves_full_report_while_skipping_unrelated_large_content() {
         let world = crate::test_world("lane-pass-projections");
@@ -2462,6 +2777,9 @@ mod tests {
                 open_tool_calls,
                 ..Default::default()
             },
+            pending_ask: false,
+            attention: AttentionState::Done,
+            witness_divergence: None,
             failure_cause: None,
             resets_at: None,
             failure_detail: None,
@@ -2622,6 +2940,9 @@ mod tests {
             last_tool: None,
             stranded: false,
             open_obligations: OpenObligations::default(),
+            pending_ask: false,
+            attention: AttentionState::Done,
+            witness_divergence: None,
             failure_cause: None,
             resets_at: None,
             failure_detail: None,

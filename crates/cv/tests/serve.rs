@@ -2020,6 +2020,10 @@ fn lanes_task_enrichment_reports_degraded_replay_and_skips_empty_forests() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["counts"]["total"], 1, "{body}");
     assert_eq!(body["lanes"][0]["description"], "useful lane", "{body}");
+    // Running by every record but quiet since 2026-01-01: stale, and counted so.
+    assert_eq!(body["lanes"][0]["attention"], "stale", "{body}");
+    assert_eq!(body["counts"]["attention"]["stale"], 1, "{body}");
+    assert_eq!(body["counts"]["attention"]["needs_you"], 0, "{body}");
     assert!(!body["warnings"].as_array().unwrap().is_empty(), "{body}");
     fs::remove_file(&log).unwrap();
     fs::create_dir(&log).unwrap(); // task replay now fails, rather than warning and continuing

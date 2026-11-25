@@ -16,7 +16,7 @@
 //! - `GET /api/events?since=&kind=&by=&not_by=&assignee=&task=`  JSON lines — the same query as
 //!   `cv task events`, so a poller and the page see one feed.
 //! - `GET /api/lanes?session=<id>`        the sub-agent forest of a session (`cv lanes --tasks`),
-//!   running first, each lane with the `tasks` its endpoint holds.
+//!   most urgent attention first, each lane with the `tasks` its endpoint holds.
 //!
 //! The backlog pane reads the read API's `GET /api/tasks?detail=1`.
 //!
@@ -100,8 +100,10 @@ fn api_inbox(default_who: Option<&str>, q: &Query) -> (u16, Value) {
     })
 }
 
-/// `cv lanes <session>` as JSON: every sub-agent, running first, then by start time (newest
-/// first). The page polls this beside the inbox so the orchestrator's forest and the human's
+/// `cv lanes <session>` as JSON: every sub-agent, most urgent [`AttentionState`] first, then by
+/// latest turn (newest first).
+///
+/// [`AttentionState`]: cv_core::lanes::AttentionState The page polls this beside the inbox so the orchestrator's forest and the human's
 /// decisions sit on one screen.
 fn api_lanes(q: &Query) -> (u16, Value) {
     let Some(session) = q.get("session") else {
@@ -127,19 +129,26 @@ fn api_lanes(q: &Query) -> (u16, Value) {
             Err(error) => warnings.push(format!("task enrichment unavailable: {error:#}")),
         }
     }
-    lanes.sort_by(|a, b| {
-        b.is_running()
-            .cmp(&a.is_running())
-            .then_with(|| b.started_at.cmp(&a.started_at))
-    });
+    cv_core::lanes::sort_by_attention(&mut lanes);
     let running = lanes.iter().filter(|l| l.is_running()).count();
     let stranded = lanes.iter().filter(|l| l.stranded).count();
     let done = lanes.iter().filter(|l| l.is_done()).count();
+    let attention: serde_json::Map<String, Value> = cv_core::lanes::AttentionState::ALL
+        .iter()
+        .map(|a| {
+            (
+                a.as_str().to_string(),
+                json!(lanes.iter().filter(|l| l.attention == *a).count()),
+            )
+        })
+        .collect();
+    let diverged = lanes.iter().filter(|l| l.witness_divergence.is_some()).count();
     (
         200,
         json!({
             "session": r.id,
-            "counts": {"total": lanes.len(), "running": running, "done": done, "stranded": stranded},
+            "counts": {"total": lanes.len(), "running": running, "done": done, "stranded": stranded,
+                       "attention": attention, "witness_divergence": diverged},
             "lanes": lanes,
             "warnings": warnings,
         }),
