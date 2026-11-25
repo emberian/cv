@@ -631,6 +631,8 @@ pub fn retract_emitted(
                     ("session_message", "session_id"),
                     ("part", "session_id"),
                     ("message", "session_id"),
+                    ("session_windows", "session_id"),
+                    ("session_nodes", "current_session_id"),
                     ("sessions", "id"),
                     ("session_v2", "id"),
                     ("session", "id"),
