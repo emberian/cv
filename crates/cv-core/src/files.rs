@@ -4,7 +4,8 @@
 //! Verification, strongest first:
 //! - `verified_git`: a commit at or after the touch, in the session's repository, holds exactly the
 //!   reconstructed post-touch content, or (for an edit whose base is unknown) contains its
-//!   replacement text.
+//!   replacement text. The blob is read at that commit (`<commit>:<path>`), never at `HEAD`, so a
+//!   later commit that changes the file again leaves the claim standing.
 //! - `verified_disk`: the checkout's current file equals the reconstructed content. Skipped under
 //!   `--frozen`, which promises no reads outside the stores.
 //! - `reconstructed`: the content follows from a `Write` and the exact `Edit` replacements after it
@@ -22,7 +23,9 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 /// Reconstructed content beyond this size is dropped (the touch degrades to `unverified`).
 const MAX_STATE_BYTES: usize = 8 << 20;
@@ -127,12 +130,12 @@ fn apply(base: &str, edits: &[(String, String, bool)]) -> Option<(String, usize,
 }
 
 fn git(root: &Path, args: &[&str]) -> Option<Vec<u8>> {
-    let out = std::process::Command::new("git")
+    let out = Command::new("git")
         .arg("-C")
         .arg(root)
         .args(args)
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
         .output()
         .ok()?;
     out.status.success().then_some(out.stdout)
@@ -145,6 +148,67 @@ fn git_root(cwd: &Path) -> Option<PathBuf> {
     (!root.is_empty()).then(|| PathBuf::from(root))
 }
 
+/// One `git cat-file --batch` for the whole timeline: every blob is a request on the same
+/// process, not two processes per commit.
+struct Blobs {
+    child: Child,
+    stdin: Option<ChildStdin>,
+    stdout: BufReader<ChildStdout>,
+}
+
+impl Blobs {
+    fn spawn(root: &Path) -> Option<Self> {
+        let mut child = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["cat-file", "--batch"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        let stdin = child.stdin.take();
+        let stdout = BufReader::new(child.stdout.take()?);
+        Some(Blobs { child, stdin, stdout })
+    }
+
+    /// `(blob id, content)` of `spec` (`<commit>:<path>`); `None` when it names no blob. `Err`
+    /// when the process stopped answering in protocol, after which it is not asked again.
+    fn get(&mut self, spec: &str) -> std::io::Result<Option<(String, Vec<u8>)>> {
+        if spec.contains('\n') {
+            return Ok(None);
+        }
+        let stdin = self.stdin.as_mut().ok_or(std::io::ErrorKind::BrokenPipe)?;
+        writeln!(stdin, "{spec}")?;
+        stdin.flush()?;
+        let mut header = String::new();
+        if self.stdout.read_line(&mut header)? == 0 {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        let header = header.trim_end_matches('\n');
+        if header.ends_with(" missing") || header.ends_with(" ambiguous") {
+            return Ok(None);
+        }
+        let mut fields = header.rsplitn(3, ' ');
+        let (Some(size), Some(kind), Some(id)) = (fields.next(), fields.next(), fields.next()) else {
+            return Err(std::io::ErrorKind::InvalidData.into());
+        };
+        let size: usize = size.parse().map_err(|_| std::io::ErrorKind::InvalidData)?;
+        // The body and its terminating newline follow whatever the type.
+        let mut body = vec![0; size + 1];
+        self.stdout.read_exact(&mut body)?;
+        body.pop();
+        Ok((kind == "blob").then(|| (id.to_string(), body)))
+    }
+}
+
+impl Drop for Blobs {
+    fn drop(&mut self) {
+        drop(self.stdin.take());
+        let _ = self.child.wait();
+    }
+}
+
 /// Later commits of one path, oldest first, each read at most once.
 struct PathHistory {
     commits: Vec<(String, i64)>,
@@ -154,6 +218,8 @@ struct PathHistory {
 struct Repo {
     root: PathBuf,
     paths: HashMap<String, PathHistory>,
+    /// Spawned on the first blob read; `None` again once it fails.
+    blobs: Option<Option<Blobs>>,
 }
 
 impl Repo {
@@ -195,8 +261,10 @@ impl Repo {
         since: DateTime<Utc>,
         matches: impl Fn(&[u8]) -> bool,
     ) -> Option<FileVerification> {
+        self.history(rel);
         let root = self.root.clone();
-        let h = self.history(rel);
+        let blobs = &mut self.blobs;
+        let h = self.paths.get_mut(rel).expect("history() was called");
         let later: Vec<String> = h
             .commits
             .iter()
@@ -206,11 +274,14 @@ impl Repo {
             .collect();
         for sha in later {
             let blob = h.blobs.entry(sha.clone()).or_insert_with(|| {
-                let spec = format!("{sha}:{rel}");
-                let id = String::from_utf8(git(&root, &["rev-parse", &spec])?).ok()?;
-                let id = id.trim().to_string();
-                let body = git(&root, &["cat-file", "blob", &id])?;
-                Some((id, body))
+                let batch = blobs.get_or_insert_with(|| Blobs::spawn(&root)).as_mut()?;
+                match batch.get(&format!("{sha}:{rel}")) {
+                    Ok(found) => found,
+                    Err(_) => {
+                        *blobs = Some(None);
+                        None
+                    }
+                }
             });
             if let Some((id, body)) = blob {
                 if matches(body) {
@@ -332,6 +403,7 @@ pub fn read(adapter: &dyn crate::Adapter, r: &SessionRef) -> Result<Vec<FileTouc
     let mut repo = cwd.as_deref().and_then(git_root).map(|root| Repo {
         root,
         paths: HashMap::new(),
+        blobs: None,
     });
     let frozen = crate::env::frozen();
     let mut state: HashMap<String, Option<String>> = HashMap::new();
@@ -447,5 +519,40 @@ mod tests {
             Some(("x\nb\nx\n".into(), 2, 2))
         );
         assert_eq!(apply("a", &[e("zz", "x", false)]), None);
+    }
+
+    #[test]
+    fn one_batch_process_answers_blobs_misses_and_trees_in_order() {
+        // #tooth A tree or a miss in between must not desynchronize the next blob's read.
+        let world = crate::test_world("files-batch");
+        let root = world.base.as_path();
+        let run = |args: &[&str]| {
+            let ok = Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "T")
+                .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+                .env("GIT_COMMITTER_NAME", "T")
+                .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        run(&["init", "-q"]);
+        std::fs::create_dir(root.join("d")).unwrap();
+        std::fs::write(root.join("d/x.txt"), "line one\nline two\n").unwrap();
+        run(&["add", "."]);
+        run(&["-c", "commit.gpgsign=false", "commit", "-qm", "x"]);
+        let mut blobs = Blobs::spawn(root).unwrap();
+        let body = |b: Option<(String, Vec<u8>)>| b.map(|(id, body)| (id.len(), body));
+        let want = Some((40, b"line one\nline two\n".to_vec()));
+        assert_eq!(body(blobs.get("HEAD:d/x.txt").unwrap()), want);
+        assert_eq!(blobs.get("HEAD:nope.txt").unwrap(), None);
+        assert_eq!(blobs.get("HEAD:d").unwrap(), None);
+        assert_eq!(blobs.get("HEAD:a\nb").unwrap(), None);
+        assert_eq!(body(blobs.get("HEAD:d/x.txt").unwrap()), want);
     }
 }

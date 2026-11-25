@@ -187,3 +187,35 @@ fn files_view_verifies_touches_against_git_disk_and_the_transcript() {
     assert!(text.contains("edit  ERR src/a.rs"), "{text}");
     assert!(text.contains("notes.txt  +1 -0  disk"), "{text}");
 }
+
+#[test]
+fn files_view_keeps_the_recorded_commit_after_later_changes_and_skips_disk_when_frozen() {
+    // #tooth A later commit rewrites src/a.rs: the edit stays verified at the commit that held
+    // it, not at HEAD. Frozen, the checkout is never read: the disk-only write is reconstructed.
+    let w = World::in_process("files-view-later", cv_core::env::Env::enter_isolated);
+    let repo = scene(&w);
+    let head = |repo: &Path| {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    };
+    let recorded = head(&repo);
+    std::fs::write(repo.join("src/a.rs"), "fn a() {}\n").unwrap();
+    git(&repo, &["commit", "-qam", "human rewrite"], Some(T0 + 7200));
+    assert_ne!(head(&repo), recorded);
+
+    let verification = |all: &Value, i: usize| all[i]["verification"].clone();
+    let all = rows(&w, &[]);
+    assert_eq!(verification(&all, 1)["kind"], "verified_git", "{all:#}");
+    assert_eq!(verification(&all, 1)["commit"], recorded.as_str());
+    assert_eq!(verification(&all, 5)["kind"], "verified_disk");
+
+    let frozen = rows(&w, &["--frozen"]);
+    assert_eq!(verification(&frozen, 1), verification(&all, 1));
+    assert_eq!(verification(&frozen, 2), verification(&all, 2));
+    assert_eq!(verification(&frozen, 5)["kind"], "reconstructed", "{frozen:#}");
+}
