@@ -13,7 +13,7 @@ import {
 } from "./util.js";
 import { canInvokeNative, invoke } from "../tauri.js";
 import { renderMarkdown, renderCodeBlock } from "../markdown.js";
-import { getSubagents, getSubagent, getEvents, getOverview, getMessages, hydrateSession, getAuthToken, authHeaders, PAGE, CVD_BASE } from "./hydrate.js";
+import { getSubagents, getSubagent, getEvents, getOverview, getFiles, getMessages, hydrateSession, getAuthToken, authHeaders, PAGE, CVD_BASE } from "./hydrate.js";
 
 /** Collapse whitespace and cut to `max` — for one-line peeks and rule details. */
 function truncateLine(s, max) {
@@ -276,6 +276,53 @@ class CvTranscript extends HTMLElement {
     }
   }
 
+  // ---- on-demand file timeline --------------------------------------------
+  async _toggleFiles(session) {
+    let panel = this.querySelector(".files-panel");
+    if (panel) {
+      panel.hidden = !panel.hidden;
+      this.querySelector("[data-files]")?.setAttribute("aria-expanded", String(!panel.hidden));
+      return;
+    }
+    const generation = this._generation;
+    panel = document.createElement("section");
+    panel.className = "files-panel sub-panel";
+    panel.setAttribute("aria-label", "Files touched");
+    panel.innerHTML = `<div class="sub-list muted" role="status">Loading files…</div>`;
+    this.querySelector(".transcript-header")?.insertAdjacentElement("afterend", panel);
+    this.querySelector("[data-files]")?.setAttribute("aria-expanded", "true");
+    try {
+      const files = await getFiles(session);
+      if (generation !== this._generation || this._session !== session) return;
+      panel.innerHTML = this._filesHtml(files);
+      panel.querySelectorAll("[data-overview-message]").forEach((button) => {
+        button.addEventListener("click", () => this._overviewContext(session, panel, +button.dataset.overviewMessage));
+      });
+    } catch (error) {
+      if (generation !== this._generation || this._session !== session) return;
+      panel.innerHTML = `<div class="sub-list"><p class="muted" role="status">Couldn't load files: ${esc(error?.message || error)}</p><button type="button" class="mini-btn">Retry files</button></div>`;
+      panel.querySelector("button").addEventListener("click", () => { panel.remove(); this._toggleFiles(session); });
+    }
+  }
+
+  /** `{ rows, verified }` from `getFiles` as a list: op, result, path, lines, verification. */
+  _filesHtml({ rows, verified }) {
+    const verification = (v) => {
+      switch (v?.kind) {
+        case "verified_git": return `git ${esc(String(v.commit || "").slice(0, 9))}`;
+        case "verified_disk": return "on disk";
+        case "reconstructed": return "reconstructed";
+        default: return "unverified";
+      }
+    };
+    const ok = (r) => (r.succeeded === true ? "ok" : r.succeeded === false ? "failed" : "no result");
+    const lines = (r) => (Array.isArray(r.lines_changed) && r.lines_changed.length === 2
+      ? ` <span class="muted">+${esc(r.lines_changed[0])} −${esc(r.lines_changed[1])}</span>` : "");
+    const items = (rows || []).map((r) => `<li><button type="button" class="overview-excerpt" title="Show surrounding messages" data-overview-message="${esc(r.msg_idx)}"><span class="muted">#${esc(r.msg_idx)}${r.timestamp ? ` · ${esc(fmtTime(r.timestamp))}` : ""}</span> ${esc(r.op)}: ${esc(r.path)}</button>${lines(r)}<span class="muted"> · ${esc(ok(r))}${r.op === "read" ? "" : ` · ${verification(r.verification)}`}</span></li>`);
+    const note = verified ? "" : `<p class="muted">Offline: read from the loaded messages; connect to <code>cv serve</code> to verify against git and the checkout.</p>`;
+    return `<div class="sub-list"><h3>Files <span class="muted">${(rows || []).length}</span></h3>${note}${items.length ? `<ul>${items.join("")}</ul>` : '<p class="muted">No file reads, writes or edits.</p>'}<div class="overview-context" aria-live="polite"></div></div>`;
+  }
+
   _overviewHtml(overview) {
     const excerpt = (row, text) => `<button type="button" class="overview-excerpt" title="Show surrounding messages" data-overview-message="${esc(row.msg_idx)}"><span class="muted">#${esc(row.msg_idx)}${row.ts ? ` · ${esc(fmtTime(row.ts))}` : ""}</span> ${esc(text)}${row.truncated ? "…" : ""}</button>`;
     const sections = [
@@ -505,6 +552,9 @@ class CvTranscript extends HTMLElement {
     const overview = this.querySelector("[data-overview]");
     overview?.setAttribute("aria-expanded", String(!!this.querySelector(".overview-panel:not([hidden])")));
     overview?.addEventListener("click", () => this._toggleOverview(s));
+    const files = this.querySelector("[data-files]");
+    files?.setAttribute("aria-expanded", String(!!this.querySelector(".files-panel:not([hidden])")));
+    files?.addEventListener("click", () => this._toggleFiles(s));
     for (const [format, selector] of [["opensession", "[data-export-json]"], ["markdown", "[data-export-md]"]]) {
       this.querySelector(selector)?.addEventListener("click", async (e) => {
         const button = e.currentTarget;
@@ -707,6 +757,7 @@ class CvTranscript extends HTMLElement {
           <h2>${esc(sessionLabel(s))}</h2>
           <div class="th-actions">
             <button type="button" class="mini-btn" data-overview aria-expanded="false">Overview</button>
+            <button type="button" class="mini-btn" data-files aria-expanded="false" title="Every file read, write and edit, with how far it is verified">Files</button>
             <button type="button" class="mini-btn" data-export-md title="Download complete transcript as Markdown">⬇ .md</button>
             <button type="button" class="mini-btn" data-export-json title="Download complete transcript as OpenSession JSON">⬇ .json</button>
           </div>

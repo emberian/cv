@@ -7,9 +7,13 @@
 // Endpoints (base URL default http://localhost:7777):
 //   GET /api/health                 → { ok, version?, ... }
 //   GET /api/sessions?limit=N       → Session[] (IR) — recent activity feed
+//   GET /api/lanes?session=ID       → { counts, lanes } — one session's sub-agents, most urgent first
+//   GET /api/stream?follow=1&lanes=ID → SSE `change` events carrying compact lane rows
 //
-// Renders the recent-sessions activity feed, auto-refreshing with a pause
-// toggle. If the API is unreachable, a friendly "start `cv serve`" hint (and a
+// Renders the recent-sessions activity feed and the lanes of one session (the
+// most recent, or the one clicked) with an attention filter, auto-refreshing
+// with a pause toggle. Lanes arrive over SSE when the browser and server allow
+// it, else by polling. If the API is unreachable, a friendly "start `cv serve`" hint (and a
 // static sessions .json loader) is shown instead. (The board, claims and
 // presence panels went with the coordination board in 0.15.0; the task log is
 // the fleet's record — `cv task events`.)
@@ -26,6 +30,15 @@ const BASE_LS = "cv-fleet-base";
 const DEFAULT_BASE = "http://localhost:7777";
 const POLL_MS = 2000;
 const SESSION_LIMIT = 25;
+const LANES_LS = "cv-fleet-lanes";
+// Operator urgency, most urgent first — the order `cv_core::lanes::AttentionState` sorts by.
+export const ATTENTION = [
+  ["needs_you", "Needs you"],
+  ["working", "Working"],
+  ["stale", "Stale"],
+  ["idle", "Idle"],
+  ["done", "Done"],
+];
 
 // ---- injected styles (swarm-safe: never touch styles.css) -----------------
 // These AUGMENT the global .fleet-* rules already in styles.css with the app's
@@ -73,6 +86,20 @@ const FLEET_STYLES = `
     border: 2px solid var(--ok); opacity: 0;
   }
 
+  cv-fleet .fleet-lanes { grid-column: 1 / -1; }
+  cv-fleet .fleet-attn-bar { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 8px; }
+  cv-fleet .fleet-attn-bar .mini-btn[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
+  cv-fleet .fleet-lane-feed { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; max-height: 360px; overflow: auto; }
+  cv-fleet .fleet-lane { display: grid; grid-template-columns: 92px 1fr; gap: 4px 10px; padding: 6px 8px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg-sunk); font-size: 13px; }
+  cv-fleet .fleet-attn { font-family: var(--mono); font-size: 11.5px; font-weight: 650; }
+  cv-fleet .fleet-attn-needs_you { color: var(--error); }
+  cv-fleet .fleet-attn-working { color: var(--ok); }
+  cv-fleet .fleet-attn-stale { color: var(--warn); }
+  cv-fleet .fleet-attn-idle, cv-fleet .fleet-attn-done { color: var(--fg-muted); }
+  cv-fleet .fleet-lane-meta { grid-column: 2; font-size: 12px; }
+  cv-fleet .fleet-diverge { grid-column: 2; font-size: 12px; color: var(--warn); }
+  cv-fleet .fleet-session[data-session] { cursor: pointer; }
+  cv-fleet .fleet-session.on { border-color: var(--accent); }
   cv-fleet .fleet-session { transition: border-color 0.2s ease, box-shadow 0.2s ease; }
   cv-fleet .fleet-session:hover {
     border-color: color-mix(in srgb, var(--accent) 35%, var(--border));
@@ -113,6 +140,17 @@ class CvFleet extends HTMLElement {
     this._lastUpdate = 0;
     this._staticMode = false; // loaded a sessions .json instead of live polling
 
+    // Lanes of one session: chosen by click (remembered), else the most recent.
+    this._lanesSession = this._read(LANES_LS);
+    this._lanes = [];
+    this._laneCounts = null;
+    this._lanesErr = "";
+    this._attn = "all";       // attention filter: "all" or an ATTENTION id
+    this._es = null;          // EventSource on /api/stream, when available
+    this._opening = null;     // the pending reader-cookie exchange that precedes the stream
+    this._live = false;       // the stream is open: lanes arrive pushed, not polled
+    this._lanesInflight = false;
+
     // Shell built? + per-section signatures of what's currently in the DOM, so
     // each poll can diff and skip untouched sections.
     this._shell = false;
@@ -135,11 +173,16 @@ class CvFleet extends HTMLElement {
   _start() {
     this._stop();
     this._staticMode = false;
-    this._poll();
-    this._timer = setInterval(() => { if (!this._paused) this._poll(); }, POLL_MS);
+    this._poll().then(() => { this._openStream(); if (!this._live) this._pollLanes(); });
+    this._timer = setInterval(() => {
+      if (this._paused) return;
+      this._poll();
+      if (!this._live) this._pollLanes();
+    }, POLL_MS);
   }
   _stop() {
     if (this._timer) { clearInterval(this._timer); this._timer = null; }
+    this._closeStream();
     // Abort any in-flight poll so its late resolution can't clobber the UI
     // after we've torn down / reconnected.
     if (this._ctrl) { try { this._ctrl.abort(); } catch { /* ignore */ } this._ctrl = null; }
@@ -190,6 +233,97 @@ class CvFleet extends HTMLElement {
     }
   }
 
+  // ---- lanes: SSE first, polling as the fallback --------------------------
+
+  /** The session whose lanes are shown: the clicked one, else the most recent. */
+  _laneTarget() {
+    return this._lanesSession || this._sessions[0]?.id || "";
+  }
+
+  _streamUrl() {
+    const target = this._laneTarget();
+    return this._base.replace(/\/+$/, "") + "/api/stream?follow=1"
+      + (target ? `&lanes=${encodeURIComponent(target)}` : "");
+  }
+
+  _openStream() {
+    this._closeStream();
+    // A static export has no server; an environment without EventSource polls instead.
+    if (this._staticMode || typeof EventSource !== "function" || !this._laneTarget()) return;
+    if (!getAuthToken()) { this._attachStream(); return; }
+    // EventSource sends no headers, and the server refuses a query-string bearer: exchange the
+    // bearer for the HttpOnly reader cookie first. Until then (or if refused) lanes are polled.
+    const opening = this._opening = {};
+    fetch(this._base.replace(/\/+$/, "") + "/api/auth", { headers: authHeaders(), credentials: "include" })
+      .then((resp) => { if (resp.ok && this._opening === opening && !this._es) this._attachStream(); })
+      .catch(() => {});
+  }
+
+  _attachStream() {
+    let es;
+    try { es = new EventSource(this._streamUrl(), { withCredentials: true }); } catch { return; }
+    this._es = es;
+    es.onopen = () => { if (this._es === es) this._live = true; };
+    // EventSource retries on its own; until it reconnects, the poll timer fetches lanes.
+    es.onerror = () => { if (this._es === es) this._live = false; };
+    es.addEventListener("change", (e) => {
+      if (this._es !== es) return;
+      this._live = true;
+      let data;
+      try { data = JSON.parse(e.data); } catch { return; }
+      if (data?.lanes) this._applyLanes(data.lanes);
+      const kinds = Array.isArray(data?.kinds) ? data.kinds : [];
+      if (kinds.includes("sessions") || kinds.includes("reset")) this._poll();
+      else this.render();
+    });
+  }
+
+  _closeStream() {
+    this._opening = null;
+    if (this._es) { try { this._es.close(); } catch { /* ignore */ } }
+    this._es = null;
+    this._live = false;
+  }
+
+  async _pollLanes() {
+    const target = this._laneTarget();
+    if (!target || this._lanesInflight || this._staticMode) return;
+    this._lanesInflight = true;
+    try {
+      const body = await this._fetchJson(`/api/lanes?session=${encodeURIComponent(target)}`);
+      if (target === this._laneTarget()) this._applyLanes(body);
+    } catch (err) {
+      if (target === this._laneTarget()) this._lanesErr = err?.message || String(err);
+    } finally {
+      this._lanesInflight = false;
+      this.render();
+    }
+  }
+
+  /** Accept a `/api/lanes` body or the compact `lanes` object an SSE change carries. */
+  _applyLanes(body) {
+    if (!body || typeof body !== "object" || body.error) {
+      this._lanesErr = String(body?.error || "lanes unavailable");
+      return;
+    }
+    this._lanesErr = "";
+    this._lanes = Array.isArray(body.lanes) ? body.lanes : [];
+    this._laneCounts = body.counts && typeof body.counts === "object" ? body.counts : null;
+  }
+
+  _selectLanes(id) {
+    if (!id || id === this._laneTarget()) return;
+    this._lanesSession = id;
+    this._write(LANES_LS, id);
+    this._lanes = [];
+    this._laneCounts = null;
+    this._lanesErr = "";
+    this.render();
+    if (this._staticMode) return;
+    this._openStream();
+    this._pollLanes();
+  }
+
   // ---- response normalizers (tolerant of small shape differences) --------
 
   _asSessions(data) {
@@ -221,6 +355,7 @@ class CvFleet extends HTMLElement {
       this._patchOffline();
     } else {
       this._patchSessions();
+      this._patchLanes();
     }
   }
 
@@ -299,7 +434,8 @@ class CvFleet extends HTMLElement {
         <p>Start the daemon's HTTP API and make sure CORS is enabled:</p>
         <pre><code>cv serve</code></pre>
         <p class="muted">Then click <strong>reconnect</strong>. The dashboard polls
-        <code>/api/health</code> and <code>/api/sessions</code> every ${POLL_MS / 1000}s.</p>
+        <code>/api/health</code> and <code>/api/sessions</code> every ${POLL_MS / 1000}s and follows
+        lanes over <code>/api/stream</code>.</p>
         <div class="fo-static">
           <span class="muted">No server handy? Load a static sessions export:</span>
           <input type="file" class="fleet-static-input" accept=".json,application/json" aria-label="Load static sessions JSON" />
@@ -320,6 +456,11 @@ class CvFleet extends HTMLElement {
   _dashShellHtml() {
     return `
       <div class="fleet-grid">
+        <section class="fleet-card fleet-lanes">
+          <h3>Lanes <span class="muted fleet-lanes-of"></span></h3>
+          <div class="fleet-attn-bar" role="toolbar" aria-label="Filter lanes by attention"></div>
+          <div class="fleet-lanes-body"></div>
+        </section>
         <section class="fleet-card fleet-sessions">
           <h3>Recent sessions <span class="muted fleet-sessions-n"></span></h3>
           <div class="fleet-sessions-body"></div>
@@ -338,7 +479,48 @@ class CvFleet extends HTMLElement {
     this._content.querySelector(".fleet-sessions-body").innerHTML = this._sessionsHtml();
   }
 
+  _patchLanes() {
+    const sig = JSON.stringify([this._laneTarget(), this._attn, this._lanesErr, this._live, this._laneCounts, this._lanes]);
+    if (this._last.lanes === sig) return;
+    this._last.lanes = sig;
+    const of = this._content.querySelector(".fleet-lanes-of");
+    if (of) of.textContent = this._laneTarget() ? `of ${this._laneTarget().slice(0, 8)} · ${this._live ? "live" : "polling"}` : "";
+    const bar = this._content.querySelector(".fleet-attn-bar");
+    if (bar) bar.innerHTML = this._attnBarHtml();
+    const body = this._content.querySelector(".fleet-lanes-body");
+    if (body) body.innerHTML = this._lanesHtml();
+  }
+
   // ---- section HTML builders ---------------------------------------------
+
+  _attnBarHtml() {
+    const counts = this._laneCounts?.attention || {};
+    const count = (id) => (Number.isSafeInteger(counts[id]) ? counts[id] : this._lanes.filter((l) => l.attention === id).length);
+    const button = (id, label, n) =>
+      `<button type="button" class="mini-btn" data-attn="${esc(id)}" aria-pressed="${this._attn === id}">${esc(label)} <span class="muted">${n}</span></button>`;
+    return button("all", "All", this._lanes.length) + ATTENTION.map(([id, label]) => button(id, label, count(id))).join("");
+  }
+
+  _lanesHtml() {
+    if (!this._laneTarget()) return `<p class="muted fleet-empty">No session selected.</p>`;
+    if (this._lanesErr) return `<p class="muted fleet-empty">Lanes unavailable: ${esc(this._lanesErr)}</p>`;
+    const rank = (a) => { const i = ATTENTION.findIndex(([id]) => id === a); return i < 0 ? ATTENTION.length : i; };
+    const shown = this._lanes
+      .filter((l) => this._attn === "all" || l.attention === this._attn)
+      .slice()
+      .sort((a, b) => rank(a.attention) - rank(b.attention));
+    if (!shown.length) {
+      return `<p class="muted fleet-empty">${this._lanes.length ? "No lanes in this state." : "No sub-agents in this session."}</p>`;
+    }
+    const label = (id) => ATTENTION.find(([a]) => a === id)?.[1] || id || "—";
+    return `<ul class="fleet-lane-feed">${shown.map((l) => `
+      <li class="fleet-lane" data-attention="${esc(l.attention || "")}">
+        <span class="fleet-attn fleet-attn-${esc(l.attention || "none")}">${esc(label(l.attention))}</span>
+        <span class="fs-title" title="${esc(l.description || l.agent_id || "")}">${esc(l.description || l.agent_id || "(lane)")}</span>
+        <span class="fleet-lane-meta muted">${esc(l.status || "")}${l.pending_ask ? " · waiting on an answer" : ""}${l.stranded ? " · stranded" : ""}${l.last_tool ? ` · ${esc(l.last_tool)}` : ""}${l.last_turn_at ? ` · ${esc(fmtTime(l.last_turn_at).replace(/^.*?, /, ""))}` : ""}</span>
+        ${l.witness_divergence ? `<span class="fleet-diverge" title="hook record and transcript disagree">⚠ ${esc(l.witness_divergence)}</span>` : ""}
+      </li>`).join("")}</ul>`;
+  }
 
   _sessionsHtml() {
     if (!this._sessions.length) return `<p class="muted fleet-empty">No recent sessions reported.</p>`;
@@ -346,8 +528,9 @@ class CvFleet extends HTMLElement {
       const h = (s.harness || "").toLowerCase();
       const when = fmtTime(s.updated_at || s.created_at);
       const n = msgCount(s);
+      const on = s.id === this._laneTarget() ? " on" : "";
       return `
-        <li class="fleet-session">
+        <li class="fleet-session${on}" data-session="${esc(s.id)}" title="Show this session's lanes">
           <cv-harness-badge harness="${esc(h)}"></cv-harness-badge>
           <div class="fs-body">
             <div class="fs-title" title="${esc(sessionLabel(s))}">${esc(sessionLabel(s))}</div>
@@ -395,6 +578,16 @@ class CvFleet extends HTMLElement {
   }
 
   _wireContent() {
+    // Delegated, once: section bodies are re-rendered by innerHTML, the content root is not.
+    if (!this._contentWired) {
+      this._contentWired = true;
+      this._content.addEventListener("click", (e) => {
+        const attn = e.target.closest?.("[data-attn]");
+        if (attn) { this._attn = attn.dataset.attn; this.render(); return; }
+        const row = e.target.closest?.("[data-session]");
+        if (row) this._selectLanes(row.dataset.session);
+      });
+    }
     const fileEl = this._content.querySelector(".fleet-static-input");
     fileEl?.addEventListener("change", async () => {
       const f = fileEl.files?.[0];
@@ -417,6 +610,11 @@ class CvFleet extends HTMLElement {
     this._state = "ok";
     this._err = "";
     this._sessions = this._asSessions(Array.isArray(data) ? data : data?.sessions ?? []);
+    // A saved `/api/lanes` body (`{ session, counts, lanes }`) may ride along.
+    if (Array.isArray(data?.lanes)) {
+      if (data.session) this._lanesSession = String(data.session);
+      this._applyLanes(data);
+    }
     this._lastUpdate = Date.now();
     this.render();
   }

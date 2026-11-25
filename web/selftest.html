@@ -68,6 +68,7 @@ import {
 import {
   getAuthToken, setAuthToken, authHeaders, registerWasmStore,
   hydrateSession, getMessages, getSessionHead, getOverview, searchSessions, probeSearch, getCorpusStats,
+  localFileTouches,
 } from "./components/hydrate.js";
 import { canInvokeNative, listen } from "./tauri.js";
 import { blockToText, messagesToChat, generate, getKey, setKey, MODEL_PRESETS, DEFAULT_MODEL } from "./openrouter.js";
@@ -79,6 +80,7 @@ import "./components/cv-compare.js";
 import "./components/cv-forest.js";
 import "./components/cv-splice.js";
 import "./components/cv-app.js";
+import "./components/cv-fleet.js";
 
 // ---------------------------------------------------------------------------
 // Tiny harness. No dependencies, no build step: a check is a name and a body
@@ -1430,6 +1432,93 @@ await acheck("Fleet publishes only its current poll and does not mask failed ses
     await fleet._poll(); eq(fleet._state, "error", "failed sessions route surfaces error");
     eq(fleet._sessions[0].id, "fresh", "failed poll does not invent an empty fleet");
   } finally { fleet._stop(); globalThis.fetch = original; }
+});
+check("Fleet lanes sort most urgent first, filter by attention, and escape what lanes report", () => {
+  const fleet = document.createElement("cv-fleet");
+  fleet._sessions = [{ id: "parent-1", harness: "claude" }];
+  fleet._applyLanes({ session: "parent-1", counts: { attention: { needs_you: 1, working: 1, done: 1 } }, lanes: [
+    { agent_id: "d", attention: "done", status: "completed" },
+    { agent_id: "w", attention: "working", status: "running", last_tool: "Bash · ls" },
+    { agent_id: "n", attention: "needs_you", status: "running", pending_ask: true, witness_divergence: "<img id=bad-div src=x>" },
+  ] });
+  const order = () => {
+    const probe = document.createElement("div"); probe.innerHTML = fleet._lanesHtml();
+    eq(probe.querySelectorAll("img, #bad-div").length, 0, "divergence text is escaped");
+    return [...probe.querySelectorAll("[data-attention]")].map((li) => li.dataset.attention).join(",");
+  };
+  eq(order(), "needs_you,working,done", "urgency order");
+  has(fleet._lanesHtml(), "waiting on an answer", "pending ask said");
+  has(fleet._attnBarHtml(), 'Needs you <span class="muted">1</span>', "server counts in the filter bar");
+  fleet._attn = "needs_you"; eq(order(), "needs_you", "filtered to one state");
+  fleet._attn = "stale"; has(fleet._lanesHtml(), "No lanes in this state", "empty state said");
+  fleet._applyLanes({ error: "no such session" }); has(fleet._lanesHtml(), "Lanes unavailable", "error surfaced");
+});
+check("Fleet follows lanes over SSE and polls when EventSource is unavailable", () => {
+  const fleet = document.createElement("cv-fleet"); fleet.render = () => {}; fleet._poll = async () => {};
+  fleet._base = "http://localhost:7777/"; fleet._lanesSession = ""; fleet._sessions = [{ id: "p 1" }];
+  has(fleet._streamUrl(), "http://localhost:7777/api/stream?follow=1&lanes=p%201", "stream names the session");
+  const saved = globalThis.EventSource;
+  class FakeSource {
+    constructor(url) { this.url = url; this.on = {}; FakeSource.last = this; }
+    addEventListener(kind, fn) { this.on[kind] = fn; }
+    close() { this.closed = true; }
+  }
+  try {
+    globalThis.EventSource = undefined; fleet._openStream();
+    eq(fleet._es, null, "no stream without EventSource"); eq(fleet._live, false, "lanes fall back to polling");
+    globalThis.EventSource = FakeSource; fleet._openStream();
+    eq(fleet._es, FakeSource.last, "stream opened");
+    FakeSource.last.on.change({ data: JSON.stringify({ kinds: ["lanes"], lanes: { counts: {}, lanes: [{ agent_id: "x", attention: "stale" }] } }) });
+    eq(fleet._live, true, "live after a pushed change"); eq(fleet._lanes[0].attention, "stale", "pushed lanes applied");
+    FakeSource.last.onerror(); eq(fleet._live, false, "an error returns to polling until reconnected");
+    const first = FakeSource.last; fleet._selectLanes("other"); truthy(first.closed, "switching sessions reopens the stream");
+    has(FakeSource.last.url, "lanes=other", "new stream names the new session");
+    fleet._closeStream(); truthy(FakeSource.last.closed, "closed");
+  } finally { globalThis.EventSource = saved; fleet._stop(); }
+});
+await acheck("Fleet stream exchanges a bearer for the reader cookie, never a query token", async () => {
+  const fleet = document.createElement("cv-fleet"); fleet.render = () => {}; fleet._poll = async () => {};
+  fleet._base = "http://localhost:7777"; fleet._lanesSession = ""; fleet._sessions = [{ id: "p1" }];
+  const saved = { es: globalThis.EventSource, fetch: globalThis.fetch };
+  class FakeSource {
+    constructor(url, init) { this.url = url; this.init = init; this.on = {}; FakeSource.last = this; }
+    addEventListener(kind, fn) { this.on[kind] = fn; }
+    close() { this.closed = true; }
+  }
+  const asked = [];
+  try {
+    setAuthToken("s3cr3t");
+    globalThis.EventSource = FakeSource;
+    globalThis.fetch = async (url, opts) => { asked.push([String(url), opts]); return { ok: true }; };
+    fleet._openStream();
+    eq(fleet._es, null, "no stream before the cookie exchange");
+    await Promise.resolve(); await Promise.resolve();
+    has(asked[0][0], "/api/auth", "bearer exchanged at /api/auth");
+    eq(asked[0][1].headers.Authorization, "Bearer s3cr3t", "bearer sent as a header");
+    eq(fleet._es, FakeSource.last, "stream opened after the exchange");
+    eq(new URL(FakeSource.last.url).searchParams.has("token"), false, "stream URL has no bearer");
+    eq(FakeSource.last.init?.withCredentials, true, "stream carries the cookie");
+  } finally {
+    setAuthToken(""); globalThis.EventSource = saved.es; globalThis.fetch = saved.fetch; fleet._stop();
+  }
+});
+check("Files panel reads an offline timeline from loaded messages and escapes paths", () => {
+  const s = normalizeSession({ id: "files-1", harness: "claude", messages: [
+    { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "Edit", input: { file_path: "<img id=bad-path src=x>", old_string: "a", new_string: "b" } }] },
+    { role: "tool", content: [{ type: "tool_result", tool_use_id: "t1", is_error: true, content: "no" }] },
+    { role: "assistant", content: [{ type: "tool_use", id: "t2", name: "Read", input: { file_path: "src/a.rs" } }] },
+    { role: "assistant", content: [{ type: "tool_use", id: "t3", name: "Bash", input: { command: "cat src/a.rs" } }] },
+  ] });
+  const rows = localFileTouches(s);
+  eq(rows.length, 2, "file tools only"); eq(rows[0].op, "edit", "edit op"); eq(rows[0].succeeded, false, "error result");
+  eq(rows[1].msg_idx, 2, "transcript index"); eq(rows[1].succeeded, null, "no result yet"); eq(rows[1].verification.kind, "unverified", "offline never verifies");
+  const el = renderTranscript(s);
+  truthy(el.querySelector("[data-files]"), "Files button in the header");
+  const html = el._filesHtml({ rows: [...rows, { msg_idx: 5, op: "write", path: "x.rs", succeeded: true, lines_changed: [3, 1], verification: { kind: "verified_git", commit: "abcdef0123456" } }], verified: false });
+  const probe = document.createElement("div"); probe.innerHTML = html;
+  eq(probe.querySelectorAll("img, #bad-path").length, 0, "paths escaped");
+  has(html, "git abcdef012", "git verification named"); has(html, "+3 −1", "lines shown"); has(html, "Offline", "offline provenance said");
+  el.remove();
 });
 await acheck("overlapping touched queries cannot replace a newer answer", async () => {
   const original = globalThis.fetch; const old = deferred(), fresh = deferred();

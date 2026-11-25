@@ -200,6 +200,48 @@ export async function getOverview(session) {
   return JSON.parse(wasmStoreRef.overview_json(JSON.stringify(session)));
 }
 
+// File tools whose single path argument the offline timeline can read, by operation.
+const FILE_TOOLS = {
+  read: ["Read", "read_file", "view_file", "view"],
+  write: ["Write", "write_file", "create_file", "save-file"],
+  edit: ["Edit", "MultiEdit", "NotebookEdit", "replace", "edit_file", "str_replace_based_edit_tool", "str_replace_editor"],
+};
+
+/** A file timeline from messages already in memory, for a session no server can verify: the same
+ *  row shape as `/files`, every row `unverified` and without line counts. */
+export function localFileTouches(session) {
+  const opOf = (name) => Object.keys(FILE_TOOLS).find((op) => FILE_TOOLS[op].includes(name));
+  const results = new Map();
+  const rows = [];
+  (session?.messages || []).forEach((m, msg_idx) => {
+    for (const b of m?.content || []) {
+      if (b?.type === "tool_result" && b.tool_use_id) results.set(b.tool_use_id, !b.is_error);
+      if (b?.type !== "tool_use") continue;
+      const op = opOf(b.name);
+      const input = b.input && typeof b.input === "object" ? b.input : {};
+      const path = input.file_path ?? input.path ?? input.notebook_path ?? input.absolute_path;
+      if (!op || typeof path !== "string" || !path) continue;
+      rows.push({
+        msg_idx, timestamp: m.timestamp ?? null, op, path, tool: b.name, tool_use_id: b.id ?? "",
+        succeeded: null, lines_changed: null, verification: { kind: "unverified" },
+      });
+    }
+  });
+  for (const row of rows) if (results.has(row.tool_use_id)) row.succeeded = results.get(row.tool_use_id);
+  return rows;
+}
+
+/** The session's file touches: `/files` (verified against git and the checkout) when a server
+ *  holds the session, else derived from the loaded messages. `{ rows, verified }`. */
+export async function getFiles(session) {
+  if (!session?.harness || !session?.id) throw new Error("No session selected.");
+  if (!session._wasm && (session._remote || session._stub || session._paged)) {
+    const rows = await apiGet(sessionPath(session.harness, session.id, "/files"));
+    return { rows: Array.isArray(rows) ? rows : [], verified: true };
+  }
+  return { rows: localFileTouches(session), verified: false };
+}
+
 /** The session's extracted tool events (file edits/reads, commands, errors), in transcript
  *  order, optionally filtered by kind. Empty on any error — the events panel simply doesn't
  *  appear. Each row's `ts` is an RFC 3339 string. */
