@@ -262,6 +262,11 @@ fn projects_dir(entry: PathBuf) -> Option<PathBuf> {
 }
 
 impl Adapter for Claude {
+    /// A session transcript is append-only JSONL.
+    fn native_custody(&self) -> Option<super::NativeCustody> {
+        Some(super::NativeCustody::Jsonl)
+    }
+
     fn pending_adoption(&self, session: &str, transcript: &Path, cwd: &Path) -> Result<Option<super::PendingAdoption>> {
         adopt::pending_adoption(self, session, transcript, cwd)
     }

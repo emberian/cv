@@ -80,12 +80,12 @@ fn sync_batches_into_sealed_pack_is_idempotent_and_verifies_blake3() {
     // Append a turn to `alphasess`: only `alphasess` re-archives into a second delta pack;
     // `betasess` is skipped, and `archive ls` deduplicates to 2 sessions with updated msg count.
     let mut body = fs::read_to_string(w.transcript("alphasess")).unwrap();
-    body.push_str(
-        &json!({"type": "user", "uuid": "u9", "timestamp": "2026-06-02T10:00:00Z",
+    let appended = format!(
+        "{}\n",
+        json!({"type": "user", "uuid": "u9", "timestamp": "2026-06-02T10:00:00Z",
                 "message": {"role": "user", "content": "one more thing"}})
-        .to_string(),
     );
-    body.push('\n');
+    body.push_str(&appended);
     fs::write(w.transcript("alphasess"), body).unwrap();
     // Bump mtime explicitly so sub-second filesystems always register the mutation.
     let bumped = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
@@ -119,13 +119,12 @@ fn sync_batches_into_sealed_pack_is_idempotent_and_verifies_blake3() {
     assert_eq!(alpha_entry["id"], "alphasess");
     let addr: PayloadAddr = serde_json::from_value(alpha_entry["addr"].clone()).unwrap();
     let pack = SealedPack::open(&packs_dir, &latest.pack_id).unwrap();
-    let raw_ir = pack.read_payload(&addr).unwrap();
-    let archived: Value = serde_json::from_slice(&raw_ir).expect("archived payload is valid IR JSON");
-    assert_eq!(archived["id"], "alphasess");
-    // Complete-tier custody keeps the verbatim `ai-title` carrier; the visible count excludes it.
-    let messages = archived["messages"].as_array().unwrap();
-    assert_eq!(messages.len(), 4);
-    assert_eq!(messages.iter().filter(|m| m["kind"] != "carrier").count(), 3);
+    // Native custody: the second pack holds exactly the appended line, chained after the first.
+    assert_eq!(pack.read_payload(&addr).unwrap(), appended.as_bytes());
+    assert_eq!(alpha_entry["custody"]["kind"], "native_extents");
+    assert_eq!(alpha_entry["custody"]["extents"].as_array().unwrap().len(), 2);
+    // The verbatim `ai-title` carrier is held, but the visible count excludes it.
+    assert_eq!(alpha_entry["message_count"], 3, "{alpha_entry}");
 
     // Checkpoint & drop `-wal`/`-shm` (or verify `--frozen` on populated `state.db`) so `cv --frozen
     // archive ls|path` proves zero `-wal`/`-shm` creation inside `$CLUSTERVISION_HOME`.
@@ -246,4 +245,228 @@ fn archive_frozen_search_show_pack_and_strict_port_keep_profile_twins_separate()
     assert!(live.to_string().contains("swordfish"));
     assert_eq!(live["source_path"], json!(twin));
     assert!(!original.exists());
+}
+
+/// The `.pack.zst` files of the archive, oldest first by name order of their v7 ids.
+fn pack_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut packs: Vec<_> = fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.to_string_lossy().ends_with(".pack.zst"))
+        .collect();
+    packs.sort();
+    packs
+}
+
+/// #tooth Re-archiving an appended native session packs only the appended bytes, and the chain
+/// alone serves frozen show, search, pack and strict port with its carriers once the file is gone.
+#[test]
+fn archive_native_extents_appends_only_delta_bytes_and_preserves_native_records() {
+    let w = world("archive-native-extents");
+    let path = w.transcript("alphasess");
+    let mut body = fs::read_to_string(&path).unwrap();
+    body.push_str(&format!(
+        "{}\n",
+        json!({"type": "file-history-snapshot", "messageId": "snap-1",
+               "snapshot": {"marker": "carrier-okapi-77", "trackedFileBackups": {}}})
+    ));
+    let filler = "lorem ipsum dolor sit amet ".repeat(18);
+    for i in 0..400 {
+        body.push_str(&format!(
+            "{}\n",
+            json!({"type": "user", "uuid": format!("fu{i}"), "parentUuid": null,
+                   "timestamp": "2026-01-03T10:00:00Z",
+                   "message": {"role": "user", "content": format!("turn {i} {filler}")}})
+        ));
+    }
+    fs::write(&path, &body).unwrap();
+    assert!(body.len() > 200 * 1024, "{}", body.len());
+    w.cv_ok(&["archive", "sync"]);
+    let packs_dir = w.cv_home.join("packs");
+    let first = pack_files(&packs_dir);
+    assert_eq!(first.len(), 1);
+
+    let appended = format!(
+        "{}\n",
+        json!({"type": "user", "uuid": "late-1", "timestamp": "2026-01-04T10:00:00Z",
+               "message": {"role": "user",
+                           "content": format!("narwhal: custody.rs cargo clippy failed {}", "x".repeat(900))}})
+    );
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, appended.as_bytes()))
+        .unwrap();
+    let bumped = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+    fs::File::options()
+        .write(true)
+        .open(&path)
+        .and_then(|f| f.set_modified(bumped))
+        .unwrap();
+    let (out, _) = w.cv_ok(&["archive", "sync"]);
+    assert!(out.contains("1 archived, 1 skipped"), "{out}");
+    let second: Vec<_> = pack_files(&packs_dir)
+        .into_iter()
+        .filter(|p| !first.contains(p))
+        .collect();
+    assert_eq!(second.len(), 1);
+    let on_disk = fs::metadata(&second[0]).unwrap().len();
+    assert!(on_disk < 4096, "delta pack is {on_disk} bytes on disk");
+    let store = StateStore::at_dir(&w.cv_home);
+    let manifests = store.list_pack_manifests().unwrap();
+    let entry = &manifests.last().unwrap().index_meta["sessions"][0];
+    let delta: PayloadAddr = serde_json::from_value(entry["addr"].clone()).unwrap();
+    assert_eq!(
+        delta.length,
+        appended.len() as u64,
+        "only the appended line is captured"
+    );
+    assert_eq!(entry["custody"]["total_bytes"], json!(body.len() + appended.len()));
+
+    fs::remove_file(&path).unwrap();
+    let json = |args: &[&str]| serde_json::from_str::<Value>(&w.cv_ok(args).0).unwrap();
+    let hits = json(&["--frozen", "search", "narwhal", "--json"]);
+    let hits = hits["hits"].as_array().unwrap();
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    let key = hits[0]["session_key"].as_str().unwrap().to_owned();
+    let show = json(&["--frozen", "show", &key, "--json"]).to_string();
+    assert!(
+        show.contains("narwhal") && show.contains("turn 0 lorem"),
+        "both extents read"
+    );
+    let pack = json(&["--frozen", "pack", "--session", &key, "--json"]);
+    assert!(pack["content"].as_str().unwrap().contains("narwhal"));
+    let target = w.base.join("ported-native");
+    let port = json(&[
+        "port",
+        &key,
+        "--strict",
+        "--harness",
+        "claude",
+        "--out",
+        target.to_str().unwrap(),
+        "--json",
+    ]);
+    let ported = fs::read_to_string(port["path"].as_str().unwrap()).unwrap();
+    assert!(
+        ported.contains("carrier-okapi-77"),
+        "the native carrier record survives"
+    );
+    assert!(ported.contains("narwhal"));
+}
+
+/// #tooth A native file rewritten shorter in place starts a fresh one-extent chain, and the
+/// overwritten tail stops matching search.
+#[test]
+fn archive_native_rewrite_below_prefix_starts_fresh_chain_and_retracts_tail() {
+    let w = world("archive-native-rewrite");
+    let path = w.transcript("alphasess");
+    let original = fs::read_to_string(&path).unwrap();
+    let mut grown = original.clone();
+    grown.push_str(&format!(
+        "{}\n",
+        json!({"type": "user", "uuid": "tail-1", "timestamp": "2026-01-05T10:00:00Z",
+               "message": {"role": "user", "content": "the axolotl tail"}})
+    ));
+    fs::write(&path, &grown).unwrap();
+    w.cv_ok(&["archive", "sync"]);
+    w.cv_ok(&["index"]);
+    let json = |args: &[&str]| serde_json::from_str::<Value>(&w.cv_ok(args).0).unwrap();
+    let count = |word: &str| json(&["search", word, "--json"])["hits"].as_array().unwrap().len();
+    assert_eq!(count("axolotl"), 1);
+
+    // Rewind in place: shorter than the archived prefix, different bytes.
+    let rewound = original.replace("zebrafish", "pangolin");
+    fs::write(&path, &rewound).unwrap();
+    let bumped = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+    fs::File::options()
+        .write(true)
+        .open(&path)
+        .and_then(|f| f.set_modified(bumped))
+        .unwrap();
+    let (out, _) = w.cv_ok(&["archive", "sync"]);
+    assert!(out.contains("1 archived"), "{out}");
+    let store = StateStore::at_dir(&w.cv_home);
+    let manifests = store.list_pack_manifests().unwrap();
+    let entry = &manifests.last().unwrap().index_meta["sessions"][0];
+    assert_eq!(entry["custody"]["extents"].as_array().unwrap().len(), 1, "{entry}");
+    assert_eq!(entry["custody"]["total_bytes"], json!(rewound.len()));
+
+    w.cv_ok(&["index"]);
+    assert_eq!(count("axolotl"), 0, "the retracted tail is no longer a hit");
+    assert_eq!(count("zebrafish"), 0);
+    assert_eq!(count("pangolin"), 1);
+    fs::remove_file(&path).unwrap();
+    let hits = json(&["--frozen", "search", "pangolin", "--json"]);
+    assert_eq!(hits["hits"].as_array().unwrap().len(), 1, "{hits}");
+    assert_eq!(
+        json(&["--frozen", "search", "axolotl", "--json"])["hits"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+}
+
+/// #tooth The custody inventory reads one head row per archived session; a store without the
+/// heads (one no writable open of this binary has converged yet) falls back to the manifests
+/// under `--frozen`, and its next writable open rebuilds every head.
+#[test]
+fn custody_heads_track_newest_entry_and_fall_back_then_backfill() {
+    let w = world("custody-heads");
+    w.cv_ok(&["archive", "sync"]);
+    let heads = |w: &cv_testkit::World| -> i64 {
+        let conn = rusqlite::Connection::open(w.cv_home.join("state.db")).unwrap();
+        conn.query_row("SELECT COUNT(*) FROM custody_heads", [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(heads(&w), 2);
+    fs::remove_file(w.transcript("alphasess")).unwrap();
+    let ls = |w: &cv_testkit::World| w.cv_ok(&["--frozen", "ls", "--json"]).0;
+    assert!(ls(&w).contains("alpha adventures"));
+    {
+        let conn = rusqlite::Connection::open(w.cv_home.join("state.db")).unwrap();
+        conn.execute_batch(
+            "DROP TABLE custody_heads; DROP TABLE custody_heads_through;
+             PRAGMA wal_checkpoint(TRUNCATE);",
+        )
+        .unwrap();
+    }
+    assert!(ls(&w).contains("alpha adventures"), "frozen fallback to pack_manifests");
+    let mut body = fs::read_to_string(w.transcript("betasess")).unwrap();
+    body.push_str(&format!(
+        "{}\n",
+        json!({"type": "user", "uuid": "b9", "timestamp": "2026-03-02T09:00:00Z",
+               "message": {"role": "user", "content": "recount"}})
+    ));
+    fs::write(w.transcript("betasess"), body).unwrap();
+    w.cv_ok(&["archive", "sync"]);
+    assert_eq!(heads(&w), 2, "rebuilt the archived-only session beside the new head");
+    assert!(ls(&w).contains("alpha adventures"));
+}
+
+/// #tooth A Claude session whose read also consults a companion (`tasks/<sid>/`) keeps a
+/// projection: a native chain of the transcript alone would drop the companion.
+#[test]
+fn archive_projects_claude_sessions_that_read_companions() {
+    let w = world("archive-companion");
+    let tasks = w.home.join(".claude/tasks/alphasess");
+    fs::create_dir_all(&tasks).unwrap();
+    fs::write(
+        tasks.join("1.json"),
+        r#"{"id":"1","subject":"Check companion","status":"pending"}"#,
+    )
+    .unwrap();
+    w.cv_ok(&["archive", "sync"]);
+    let store = StateStore::at_dir(&w.cv_home);
+    let sessions = store.list_pack_manifests().unwrap()[0].index_meta["sessions"].clone();
+    let kind = |id: &str| {
+        let e = sessions.as_array().unwrap().iter().find(|e| e["id"] == id).unwrap();
+        e["custody"]["kind"]
+            .as_str()
+            .unwrap_or("portable_projection")
+            .to_owned()
+    };
+    assert_eq!(kind("alphasess"), "portable_projection");
+    assert_eq!(kind("betasess"), "native_extents");
 }

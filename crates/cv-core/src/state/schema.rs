@@ -365,6 +365,29 @@ CREATE TABLE IF NOT EXISTS horizons (
 DELETE FROM task_folds;
 "#;
 
+/// Tables that converge by presence rather than by `user_version`: every writable open creates
+/// what is missing, whatever version numbering other migrations use, so a store at any version
+/// (including one whose numbers another branch of migrations claimed) gains them exactly once.
+///
+/// `custody_heads` holds the newest custody entry per session selector, so reading the custody
+/// inventory costs one row per archived session rather than every historical manifest.
+/// `custody_heads_through` is its one-row watermark: the `pack_manifests` count and newest
+/// position it folds. A reader that sees another signature (the table is absent, or a binary
+/// without it published since) reads `pack_manifests` instead; the next writable open rebuilds.
+const CONVERGED: &str = r#"
+CREATE TABLE IF NOT EXISTS custody_heads (
+    selector    TEXT PRIMARY KEY,
+    commit_pos  INTEGER NOT NULL,
+    pack_id     TEXT NOT NULL,
+    entry_json  TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS custody_heads_through (
+    id        INTEGER PRIMARY KEY CHECK (id = 1),
+    manifests INTEGER NOT NULL,
+    through   INTEGER NOT NULL
+);
+"#;
+
 /// Read `PRAGMA user_version` from `conn`.
 pub fn current_schema_version(conn: &Connection) -> Result<i64, StateError> {
     Ok(conn.query_row("PRAGMA user_version", [], |r| r.get(0))?)
@@ -376,7 +399,32 @@ pub fn current_schema_version(conn: &Connection) -> Result<i64, StateError> {
 /// pay zero DDL overhead. Refuses `user_version > STATE_SCHEMA_VERSION` rather than clobbering a
 /// newer binary's authoritative state.
 pub fn ensure_migrated(conn: &mut Connection) -> Result<(), StateError> {
-    apply_migrations_with(conn, STATE_SCHEMA_VERSION, MIGRATIONS)
+    ensure_migrated_with(conn, STATE_SCHEMA_VERSION, MIGRATIONS)
+}
+
+/// [`apply_migrations_with`], then [`converge`].
+pub fn ensure_migrated_with(
+    conn: &mut Connection,
+    target_version: i64,
+    migrations: &[(i64, &str, &str)],
+) -> Result<(), StateError> {
+    apply_migrations_with(conn, target_version, migrations)?;
+    converge(conn)
+}
+
+/// Create the [`CONVERGED`] tables a store lacks and rebuild `custody_heads` when its watermark
+/// no longer matches `pack_manifests`. One read on the fast path; independent of `user_version`.
+pub fn converge(conn: &mut Connection) -> Result<(), StateError> {
+    if super::tables::custody_heads_fresh(conn)? {
+        return Ok(());
+    }
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    tx.execute_batch(CONVERGED)?;
+    if !super::tables::custody_heads_fresh(&tx)? {
+        super::tables::rebuild_custody_heads(&tx)?;
+    }
+    tx.commit()?;
+    Ok(())
 }
 
 /// Apply forward migrations up to `target_version` inside an `IMMEDIATE` transaction.

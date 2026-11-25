@@ -1108,6 +1108,22 @@ fn collect_local_commits(store: &StateStore, local_packs_dir: &Path) -> Result<V
 }
 
 fn load_commit_session(commit: &SealedCommitEntry, local_packs_dir: &Path) -> Result<Option<Session>, HubError> {
+    if let Some(custody) = commit.envelope.get("custody") {
+        let custody: crate::custody::CustodyKind = serde_json::from_value(custody.clone())?;
+        let text = |k: &str| commit.envelope[k].as_str().unwrap_or_default().to_owned();
+        let harness = crate::Harness::parse(&text("harness"))
+            .ok_or_else(|| HubError::Pack(format!("unknown archived harness in `{}`", commit.op_id)))?;
+        let key = crate::SessionKey {
+            producer: text("producer_id"),
+            profile: text("profile").into(),
+            harness,
+            native_id: text("session_id"),
+        };
+        let mut session = crate::custody::collect_native(local_packs_dir, key, custody)
+            .map_err(|e| HubError::Pack(format!("reading native custody of `{}`: {e:#}", commit.op_id)))?;
+        session.source_path = None;
+        return Ok(Some(session));
+    }
     if let Some(ref addr) = commit.payload_addr {
         let pack = SealedPack::open(local_packs_dir, &addr.pack_id)
             .map_err(|e| HubError::Pack(format!("opening local pack `{}`: {e:#}", addr.pack_id)))?;

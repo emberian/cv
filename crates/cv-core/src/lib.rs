@@ -98,6 +98,13 @@ pub fn blake3_hex(bytes: &[u8]) -> String {
     blake3::hash(bytes).to_hex().to_string()
 }
 
+/// [`blake3_hex`] of everything `input` yields, streamed, with its length.
+pub fn blake3_hex_reader(mut input: impl std::io::Read) -> std::io::Result<(u64, String)> {
+    let mut hasher = blake3::Hasher::new();
+    let len = std::io::copy(&mut input, &mut hasher)?;
+    Ok((len, hasher.finalize().to_hex().to_string()))
+}
+
 /// Read `pack_manifests` from `<cv_home>/state.db` without creating `-wal`/`-shm` sidecars when
 /// `--frozen` is active (delegating to [`harness::store::sqlite::open_ro`]).
 #[cfg(feature = "sqlite")]

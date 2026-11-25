@@ -154,6 +154,11 @@ fn rollout_names_thread(name: &str, id: &str) -> bool {
 }
 
 impl Adapter for Codex {
+    /// A session transcript is append-only JSONL.
+    fn native_custody(&self) -> Option<super::NativeCustody> {
+        Some(super::NativeCustody::Jsonl)
+    }
+
     /// `codex resume <id>` reads `$CODEX_HOME/sessions/YYYY/MM/DD/` and `archived_sessions/`.
     /// Codex canonicalizes `CODEX_HOME` itself, and its default named explicitly is the same home.
     fn resume_env(&self, r: &SessionRef) -> Option<Result<super::ResumeEnv, String>> {

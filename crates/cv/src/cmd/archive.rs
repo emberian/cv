@@ -20,7 +20,8 @@
 use crate::util::{fmt_local, parse_harness, poll_interval, short_id};
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
-use cv_core::packs::{pack_zst_path, CodecCheckpoint, PackBuilder, PackManifest as PackFileManifest};
+use cv_core::custody::SourceCheckpoint;
+use cv_core::packs::{pack_zst_path, CodecCheckpoint, PackBuilder, PackManifest as PackFileManifest, PayloadAddr};
 use cv_core::publish::Claim;
 use cv_core::state::{AppendRequest, PackManifest as StatePackManifest, StateStore};
 use cv_core::{Harness, SessionRef};
@@ -88,6 +89,11 @@ impl Archive {
     /// Batch-archive `refs`: unchanged sessions are skipped; all new or modified sessions in this
     /// pass are packed together into **one** sealed `.pack.zst` + `.pack.idx.json`, recorded in
     /// `capture_inbox`, and published atomically into `pack_manifests` (`publish-before-reference`).
+    ///
+    /// A single append-only native file ([`native_file`]) is held as its own bytes: when the
+    /// archived prefix still matches ([`SourceCheckpoint`]), the pass reads and packs only the
+    /// complete lines appended since; a shrunk or rewritten file starts a fresh chain. Every
+    /// other store is projected to Session IR JSON, as before.
     pub fn sync_refs(&self, refs: &[SessionRef]) -> Result<SyncSummary> {
         if cv_core::env::frozen() {
             bail!("--frozen forbids writing archive packs");
@@ -95,8 +101,19 @@ impl Archive {
 
         let store = self.state_store();
         let producer_id = store.default_producer().to_string();
-        let (known, _) = self.entries_by_key()?;
+        let known = cv_core::custody::head_entries(&self.home)?;
 
+        enum Content {
+            Projection(Vec<u8>),
+            Native {
+                path: PathBuf,
+                from: u64,
+                to: u64,
+                prior: Vec<PayloadAddr>,
+                checkpoint: SourceCheckpoint,
+                file_name: String,
+            },
+        }
         struct StagedSession {
             key: cv_core::SessionKey,
             harness: String,
@@ -109,8 +126,7 @@ impl Archive {
             source_len: Option<u64>,
             source_mtime_ns: Option<i128>,
             baseline: Option<cv_core::source::Baseline>,
-            payload: Vec<u8>,
-            blake3_hex: String,
+            content: Content,
         }
 
         let mut summary = SyncSummary::default();
@@ -130,8 +146,9 @@ impl Archive {
 
                 let primary = probe.primary_path(r);
                 let (source_len, source_mtime_ns) = source_stat_ref(r, &primary);
+                let prev = known.get(&key.selector());
 
-                if let Some(prev) = known.get(&key.selector()) {
+                if let Some(prev) = prev {
                     let unchanged = if let Some(ref prev_base) = prev.baseline {
                         let now = probe.snapshot_from(r, &primary);
                         prev_base.fresh(&now, &mut probe) || prev_base.rows_fresh(r, &now, &mut probe)
@@ -150,31 +167,51 @@ impl Archive {
                         .push((format!("{}:{}", r.harness, r.id), "no adapter registered".into()));
                     continue;
                 };
+                let native = native_file(r, adapter.as_ref(), &mut probe);
 
-                let rendered = (|| -> Result<(cv_core::Session, usize, Vec<u8>, Option<cv_core::source::Baseline>)> {
-                    let mut sink = cv_core::api::WindowSink::new(&r.path, 0, None);
+                let rendered = (|| -> Result<Rendered> {
                     let pass = cv_core::stream::Pass {
                         guard: true,
                         ..cv_core::stream::Pass::RECORD
                     };
-                    let read = cv_core::stream::stream_counted(
-                        adapter.as_ref(),
-                        r,
-                        &cv_core::Demand::COMPLETE.with_spans(),
-                        &mut sink,
-                        pass,
-                    )?;
-                    let frames = sink.finish()?;
-                    let total = sink.selected;
-                    let turns = total - sink.carriers;
-                    let mut buf = Vec::new();
-                    super::session_json::write_session(&mut buf, &read.session, &frames, None, None, total)?;
-                    buf.push(b'\n');
+                    let (read, turns, payload) = if native.is_some() {
+                        // Native custody keeps the bytes; the read only certifies and describes them.
+                        // Verbatim carriers are not turns: the visible count excludes them.
+                        let mut total = 0usize;
+                        let mut count = |m: cv_core::Message| {
+                            total += usize::from(m.kind != cv_core::MessageKind::Carrier);
+                            cv_core::Flow::Continue
+                        };
+                        let read = cv_core::stream::stream_counted(
+                            adapter.as_ref(),
+                            r,
+                            &cv_core::Demand::LEAN,
+                            &mut count,
+                            pass,
+                        )?;
+                        (read, total, None)
+                    } else {
+                        let mut sink = cv_core::api::WindowSink::new(&r.path, 0, None);
+                        let read = cv_core::stream::stream_counted(
+                            adapter.as_ref(),
+                            r,
+                            &cv_core::Demand::COMPLETE.with_spans(),
+                            &mut sink,
+                            pass,
+                        )?;
+                        let frames = sink.finish()?;
+                        let total = sink.selected;
+                        let turns = total - sink.carriers;
+                        let mut buf = Vec::new();
+                        super::session_json::write_session(&mut buf, &read.session, &frames, None, None, total)?;
+                        buf.push(b'\n');
+                        (read, turns, Some(buf))
+                    };
                     let baseline = match read.guard {
                         Some(guard) => Some(guard.verify_baseline(r)?),
                         None => None,
                     };
-                    Ok((read.session, turns, buf, baseline))
+                    Ok((read.session, turns, payload, baseline))
                 })();
 
                 let (session_meta, message_count, payload, baseline) = match rendered {
@@ -184,19 +221,52 @@ impl Archive {
                         continue;
                     }
                 };
-                let blake3_hex = cv_core::blake3_hex(&payload);
 
-                if let Some(prev) = known.get(&key.selector()) {
-                    if prev.content_blake3 == blake3_hex {
-                        if let Some(base) = baseline {
-                            summary
-                                .verified_baselines
-                                .push((harness_str, r.session_selector(), base));
+                let content = match (payload, native) {
+                    (Some(payload), _) => {
+                        if prev.is_some_and(|p| p.content_blake3 == cv_core::blake3_hex(&payload)) {
+                            if let Some(base) = baseline {
+                                summary
+                                    .verified_baselines
+                                    .push((harness_str, r.session_selector(), base));
+                            }
+                            summary.skipped += 1;
+                            continue;
                         }
-                        summary.skipped += 1;
-                        continue;
+                        Content::Projection(payload)
                     }
-                }
+                    (None, Some((path, file_name))) => match native_delta(&path, prev) {
+                        Ok(Some(Delta {
+                            from,
+                            to,
+                            prior,
+                            checkpoint,
+                        })) => Content::Native {
+                            path,
+                            from,
+                            to,
+                            prior,
+                            checkpoint,
+                            file_name,
+                        },
+                        Ok(None) => {
+                            if let Some(base) = baseline {
+                                summary
+                                    .verified_baselines
+                                    .push((harness_str, r.session_selector(), base));
+                            }
+                            summary.skipped += 1;
+                            continue;
+                        }
+                        Err(e) => {
+                            summary
+                                .failed
+                                .push((format!("{}:{}", r.harness, r.id), format!("{e:#}")));
+                            continue;
+                        }
+                    },
+                    (None, None) => unreachable!("a projection read always renders its payload"),
+                };
 
                 staged.push(StagedSession {
                     key,
@@ -213,8 +283,7 @@ impl Archive {
                     source_len,
                     source_mtime_ns,
                     baseline,
-                    payload,
-                    blake3_hex,
+                    content,
                 });
             }
         }
@@ -231,21 +300,85 @@ impl Archive {
         //    (`publish-before-reference`: immutable pack bytes land before SQLite references them).
         let mut builder = PackBuilder::create(&packs_dir, &pack_id)?;
         let mut entries = Vec::with_capacity(staged.len());
+        let mut written = Vec::with_capacity(staged.len());
 
-        for item in &staged {
-            let anchor = item.key.selector();
-            let addr = builder.append_record(&anchor, &item.payload)?;
-            builder.record_checkpoint(CodecCheckpoint {
-                anchor: anchor.clone(),
-                decoded_offset: addr.decoded_offset + addr.length,
-                codec_version: 1,
-                settled: true,
-                dependencies: Vec::new(),
-                continuation_state: json!({
-                    "message_count": item.message_count,
-                    "updated_at": item.updated_at,
-                }),
-            })?;
+        for item in staged {
+            let anchor = cv_core::custody::archive_anchor(&cv_core::SessionKey {
+                producer: producer_id.clone(),
+                ..item.key.clone()
+            });
+            let (addr, custody) = match &item.content {
+                Content::Projection(payload) => (
+                    builder.append_record(&anchor, payload)?,
+                    cv_core::custody::CustodyKind::PortableProjection,
+                ),
+                Content::Native {
+                    path,
+                    from,
+                    to,
+                    prior,
+                    checkpoint,
+                    file_name,
+                } => {
+                    let file = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+                    // The prefix the delta extends must still be the archived one, and the
+                    // captured range must still end where it was measured.
+                    let still = |at: u64, expect: &str| {
+                        SourceCheckpoint::read(&file, at).is_ok_and(|c| c.boundary_blake3 == expect)
+                    };
+                    let prefix_ok = match prior.is_empty() {
+                        true => true,
+                        false => known
+                            .get(&item.key.selector())
+                            .and_then(|p| match &p.custody {
+                                cv_core::custody::CustodyKind::NativeExtents { prefix_blake3, .. } => {
+                                    Some(still(*from, prefix_blake3))
+                                }
+                                _ => None,
+                            })
+                            .unwrap_or(false),
+                    };
+                    if !prefix_ok {
+                        summary.failed.push((
+                            format!("{}:{}", item.harness, item.id),
+                            "source rewritten during archive".into(),
+                        ));
+                        continue;
+                    }
+                    let mut reader = &file;
+                    std::io::Seek::seek(&mut reader, std::io::SeekFrom::Start(*from))?;
+                    let addr = builder.append_reader(&anchor, &mut reader, to - from)?;
+                    if !still(*to, &checkpoint.boundary_blake3) {
+                        summary.failed.push((
+                            format!("{}:{}", item.harness, item.id),
+                            "source rewritten during archive".into(),
+                        ));
+                        continue;
+                    }
+                    builder.record_checkpoint(CodecCheckpoint {
+                        anchor: anchor.clone(),
+                        decoded_offset: addr.decoded_offset + addr.length,
+                        codec_version: 1,
+                        settled: true,
+                        dependencies: Vec::new(),
+                        continuation_state: json!({
+                            "source_offset": to,
+                            "boundary_blake3": checkpoint.boundary_blake3,
+                        }),
+                    })?;
+                    let mut extents = prior.clone();
+                    extents.push(addr.clone());
+                    (
+                        addr,
+                        cv_core::custody::CustodyKind::NativeExtents {
+                            extents,
+                            total_bytes: *to,
+                            prefix_blake3: checkpoint.boundary_blake3.clone(),
+                            file_name: file_name.clone(),
+                        },
+                    )
+                }
+            };
             entries.push(ArchivedSessionEntry {
                 producer_id: producer_id.clone(),
                 profile: item.key.profile.clone(),
@@ -257,46 +390,53 @@ impl Archive {
                 updated_at: item.updated_at,
                 message_count: item.message_count,
                 archived_at,
-                content_blake3: item.blake3_hex.clone(),
+                content_blake3: addr.digest_hex(),
                 source_len: item.source_len,
                 source_mtime_ns: item.source_mtime_ns,
                 baseline: item.baseline.clone(),
                 addr,
+                custody,
             });
+            written.push(item.key);
+        }
+        if entries.is_empty() {
+            return Ok(summary);
         }
 
         let pack_file_manifest = builder.seal(Claim::New)?;
         let zst_path = pack_zst_path(&packs_dir, &pack_id)?;
-        let zst_bytes =
-            std::fs::read(&zst_path).with_context(|| format!("reading sealed pack {}", zst_path.display()))?;
-        let byte_len = zst_bytes.len() as u64;
-        let pack_blake3 = cv_core::blake3_hex(&zst_bytes);
+        let (byte_len, pack_blake3) = cv_core::blake3_hex_reader(
+            std::fs::File::open(&zst_path).with_context(|| format!("reading sealed pack {}", zst_path.display()))?,
+        )?;
         let rel_pack_path = format!("packs/{pack_id}.pack.zst");
 
         // 2. Append capture envelopes to `StateStore` (`capture_inbox`) with pack-scoped `op_id`s
         //    (preventing retry wedges if an earlier pack failed before publishing) and record each
         //    archived session's exact `local_commit_pos` + `(epoch, seq)` for `Shipper::sync`.
         let mut committed = Vec::with_capacity(entries.len());
-        for (item, entry) in staged.iter().zip(entries.iter()) {
-            let op_id = format!("archive:{pack_id}:{}", item.key.selector());
-            let envelope = json!({
+        for (key, entry) in written.iter().zip(entries.iter()) {
+            let op_id = format!("archive:{pack_id}:{}", key.selector());
+            let mut envelope = json!({
                 "kind": "session_archive",
                 "producer_id": producer_id,
-                "harness": item.harness,
-                "session_id": item.id,
-                "profile": item.key.profile,
-                "title": item.title,
-                "cwd": item.cwd,
-                "created_at": item.created_at.map(|t| t.to_rfc3339()),
-                "updated_at": item.updated_at.map(|t| t.to_rfc3339()),
-                "message_count": item.message_count,
-                "content_blake3": item.blake3_hex,
+                "harness": entry.harness,
+                "session_id": entry.id,
+                "profile": key.profile,
+                "title": entry.title,
+                "cwd": entry.cwd,
+                "created_at": entry.created_at.map(|t| t.to_rfc3339()),
+                "updated_at": entry.updated_at.map(|t| t.to_rfc3339()),
+                "message_count": entry.message_count,
+                "content_blake3": entry.content_blake3,
                 "pack_id": pack_id,
                 "decoded_offset": entry.addr.decoded_offset,
                 "length": entry.addr.length,
             });
+            if !entry.custody.is_projection() {
+                envelope["custody"] = serde_json::to_value(&entry.custody)?;
+            }
             let payload_ref_json = serde_json::to_string(&entry.addr)?;
-            let req = AppendRequest::new(op_id.clone(), item.blake3_hex.clone(), envelope.clone())
+            let req = AppendRequest::new(op_id.clone(), entry.content_blake3.clone(), envelope.clone())
                 .with_producer(producer_id.clone())
                 .with_payload_ref(payload_ref_json);
             let receipt = store
@@ -331,6 +471,100 @@ impl Archive {
         summary.archived_entries = entries;
         Ok(summary)
     }
+}
+
+/// A session held natively: one append-only JSONL file with at least one finished line, none of
+/// whose declared companions ([`cv_core::Adapter::dependencies`]: Claude's tasks, spilled tool
+/// results, an agent's meta) exists, returned with its file name. Anything else is projected,
+/// since a chain of the transcript alone would drop what the read also consults.
+fn native_file(
+    r: &SessionRef,
+    adapter: &dyn cv_core::Adapter,
+    probe: &mut cv_core::source::Probe,
+) -> Option<(PathBuf, String)> {
+    // The adapter names a native form ([`cv_core::Adapter::native_custody`]); JSONL here.
+    adapter.native_custody()?;
+    let path = &r.path;
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if !meta.is_file() || path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+        return None;
+    }
+    let mut deps = cv_core::source::Dependencies::default();
+    adapter.dependencies(r, probe, &mut deps)?;
+    let companions = [deps.files, deps.directories, deps.resumable, deps.growing];
+    if companions.iter().flatten().any(|p| p != path && p.exists()) {
+        return None;
+    }
+    // A file without one finished line yet has nothing native to hold; project what it reads as.
+    let file = std::fs::File::open(path).ok()?;
+    if last_complete_line_end(&file).ok()? == 0 {
+        return None;
+    }
+    Some((path.clone(), path.file_name()?.to_str()?.to_owned()))
+}
+
+/// One session's read for archiving: its metadata, message count, IR payload when projected,
+/// and the verified baseline.
+type Rendered = (
+    cv_core::Session,
+    usize,
+    Option<Vec<u8>>,
+    Option<cv_core::source::Baseline>,
+);
+
+/// The bytes `[from, to)` a native capture appends to the chain `prior`, and the checkpoint of
+/// the prefix through `to`.
+struct Delta {
+    from: u64,
+    to: u64,
+    prior: Vec<PayloadAddr>,
+    checkpoint: SourceCheckpoint,
+}
+
+/// The byte range a native capture must add: `None` when the archived chain already ends at the
+/// file's last complete line. A prefix that no longer matches (rewrite, truncation) or a
+/// projected predecessor starts a fresh chain at 0.
+fn native_delta(path: &Path, prev: Option<&ArchivedSessionEntry>) -> Result<Option<Delta>> {
+    let file = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let to = last_complete_line_end(&file)?;
+    let (from, prior) = match prev.map(|p| &p.custody) {
+        Some(cv_core::custody::CustodyKind::NativeExtents {
+            extents,
+            total_bytes,
+            prefix_blake3,
+            ..
+        }) if *total_bytes <= to && SourceCheckpoint::read(&file, *total_bytes)?.boundary_blake3 == *prefix_blake3 => {
+            (*total_bytes, extents.clone())
+        }
+        _ => (0, Vec::new()),
+    };
+    if to == from && !prior.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(Delta {
+        from,
+        to,
+        prior,
+        checkpoint: SourceCheckpoint::read(&file, to)?,
+    }))
+}
+
+/// The offset just past the file's last LF: lines a writer has not finished wait for a later pass.
+fn last_complete_line_end(file: &std::fs::File) -> Result<u64> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut end = file.metadata()?.len();
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut f = file;
+    while end > 0 {
+        let len = end.min(buf.len() as u64);
+        f.seek(SeekFrom::Start(end - len))?;
+        f.read_exact(&mut buf[..len as usize])?;
+        if let Some(i) = buf[..len as usize].iter().rposition(|&b| b == b'\n') {
+            return Ok(end - len + i as u64 + 1);
+        }
+        end -= len;
+    }
+    Ok(0)
 }
 
 struct CommittedArchiveRecord {
@@ -984,7 +1218,7 @@ mod tests {
         let third = archive.sync_refs(&refs).unwrap();
         assert_eq!(
             third.archived, 0,
-            "identical IR bytes must deduplicate even if mtime moved"
+            "identical native bytes must deduplicate even if mtime moved"
         );
         assert_eq!(third.skipped, 2);
         assert_eq!(store.list_pack_manifests().unwrap().len(), 1);
@@ -993,9 +1227,8 @@ mod tests {
         let alpha_bytes = cv_core::custody::read_session_bytes(&archive.home, "claude", "sess-alpha")
             .unwrap()
             .expect("alpha present");
-        let alpha_ir: serde_json::Value = serde_json::from_slice(&alpha_bytes).unwrap();
-        assert_eq!(alpha_ir["id"], "sess-alpha");
-        assert_eq!(alpha_ir["messages"].as_array().unwrap().len(), 2);
+        // A single-file Claude session is held as its own bytes.
+        assert_eq!(alpha_bytes, std::fs::read(&a_path).unwrap());
 
         // 5. `--frozen` allows `entries()`, `cmd_ls`, and `cmd_path` while refusing `sync_refs`.
         {
@@ -1118,12 +1351,14 @@ mod tests {
             source_mtime_ns: None,
             baseline: None,
             addr: addr_1,
+            custody: Default::default(),
         };
         let entry_2 = ArchivedSessionEntry {
             id: "s-two".into(),
             title: Some("Two".into()),
             content_blake3: cv_core::blake3_hex(payload_2),
             addr: addr_2,
+            custody: Default::default(),
             ..entry_1.clone()
         };
 
@@ -1362,6 +1597,7 @@ mod tests {
                     source_mtime_ns: None,
                     baseline: Some(captured_base),
                     addr,
+                    custody: Default::default(),
                 },
             }],
         )

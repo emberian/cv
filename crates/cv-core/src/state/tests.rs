@@ -1625,3 +1625,133 @@ fn state_v4_upgrades_to_v5_and_records_pre_receipt_files() {
     assert!((now - 90010..=now - 89990).contains(&horizon), "{horizon} vs {now}");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// #tooth `custody_heads` converges by presence, not by `user_version`: a store whose numbers
+/// other migrations already claimed (here 4 and 5) and that lacks the table gains it, filled
+/// from every published manifest, on its next writable open; under `--frozen` a store without
+/// the table, or with a stale one, reads as "fall back to the manifests", never as an error.
+#[test]
+fn custody_heads_converge_on_a_store_whose_version_numbers_are_taken() {
+    let dir = tmp_state_dir("custody-converge");
+    let store = StateStore::at_dir(&dir);
+    let server = RecorderServer::start(store.clone(), "converge-node").unwrap();
+    for i in 1..=2 {
+        store
+            .append(&format!("op-{i}"), &format!("d-{i}"), &json!({"i": i}))
+            .unwrap();
+    }
+    server.shutdown();
+    let entry = json!({
+        "producer_id": "prod-a", "harness": "claude", "id": "s1", "message_count": 2,
+        "archived_at": "2026-11-24T00:00:00Z", "content_blake3": "00".repeat(32),
+        "addr": {"pack_id": "", "decoded_offset": 0, "length": 4, "blake3_digest": "00".repeat(32)}
+    });
+    store
+        .publish_pack_range(&PackManifest {
+            pack_id: "pack-c1".into(),
+            min_commit_pos: 1,
+            max_commit_pos: 2,
+            record_count: 2,
+            byte_len: 10,
+            digest: "sha256:c1".into(),
+            pack_path: "packs/pack-c1.pack.zst".into(),
+            index_meta: json!({"sessions": [entry]}),
+            published_at: 1,
+        })
+        .unwrap();
+    let heads = store
+        .custody_heads()
+        .unwrap()
+        .expect("heads are fresh after a publication");
+    assert_eq!(heads.len(), 1);
+    assert_eq!(
+        heads[0]["addr"]["pack_id"], "pack-c1",
+        "the physical pack id is filled in"
+    );
+
+    // Another branch of migrations took versions 4 and 5; this store never had the table.
+    let taken = |conn: &rusqlite::Connection| {
+        conn.execute_batch(
+            "DROP TABLE custody_heads; DROP TABLE custody_heads_through;
+             CREATE TABLE hook_observations(id INTEGER PRIMARY KEY);
+             CREATE TABLE file_versions(id INTEGER PRIMARY KEY);
+             PRAGMA user_version = 5;",
+        )
+        .unwrap();
+    };
+    let tables = |conn: &rusqlite::Connection| -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_schema WHERE name IN ('custody_heads', 'custody_heads_through')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    let mut later = schema::MIGRATIONS.to_vec();
+    later.push((
+        4,
+        "v4_elsewhere",
+        "CREATE TABLE IF NOT EXISTS hook_observations(id INTEGER PRIMARY KEY);",
+    ));
+    later.push((
+        5,
+        "v5_elsewhere",
+        "CREATE TABLE IF NOT EXISTS file_versions(id INTEGER PRIMARY KEY);",
+    ));
+    {
+        let mut conn = rusqlite::Connection::open(store.path()).unwrap();
+        taken(&conn);
+        assert_eq!(tables(&conn), 0);
+        schema::ensure_migrated_with(&mut conn, 5, &later).unwrap();
+        assert_eq!(current_schema_version(&conn).unwrap(), 5, "the version is left alone");
+        assert_eq!(tables(&conn), 2);
+        let selector: String = conn
+            .query_row("SELECT selector FROM custody_heads", [], |r| r.get(0))
+            .unwrap();
+        assert!(!selector.is_empty(), "the head was rebuilt from the published manifest");
+        // Converging again is a no-op read.
+        schema::ensure_migrated_with(&mut conn, 5, &later).unwrap();
+        assert_eq!(tables(&conn), 2);
+    }
+
+    // The same store at this binary's version: frozen reads fall back, a writable open converges.
+    {
+        let conn = rusqlite::Connection::open(store.path()).unwrap();
+        conn.execute_batch("DROP TABLE custody_heads; DROP TABLE custody_heads_through;")
+            .unwrap();
+        conn.pragma_update(None, "user_version", STATE_SCHEMA_VERSION).unwrap();
+    }
+    {
+        let _frozen = crate::env::Env::default().with_frozen().enter();
+        assert_eq!(store.custody_heads().unwrap(), None, "absent table: read the manifests");
+    }
+    drop(store.open_writable().unwrap());
+    assert_eq!(store.custody_heads().unwrap().map(|h| h.len()), Some(1));
+
+    // A manifest published by a binary that does not keep the heads leaves them stale: frozen
+    // readers fall back, the next writable open rebuilds.
+    {
+        let conn = rusqlite::Connection::open(store.path()).unwrap();
+        conn.execute(
+            "INSERT INTO pack_manifests(pack_id, min_commit_pos, max_commit_pos, record_count, byte_len,
+                 digest, pack_path, index_meta_json, published_at)
+             VALUES ('pack-c2', 3, 3, 0, 1, 'sha256:c2', 'packs/pack-c2.pack.zst', ?1, 2)",
+            [
+                json!({"sessions": [json!({"producer_id": "prod-a", "harness": "claude", "id": "s2",
+                "message_count": 1, "archived_at": "2026-11-24T00:00:00Z",
+                "content_blake3": "00".repeat(32),
+                "addr": {"pack_id": "", "decoded_offset": 0, "length": 4,
+                         "blake3_digest": "00".repeat(32)}})]})
+                .to_string(),
+            ],
+        )
+        .unwrap();
+    }
+    {
+        let _frozen = crate::env::Env::default().with_frozen().enter();
+        assert_eq!(store.custody_heads().unwrap(), None, "stale heads: read the manifests");
+    }
+    drop(store.open_writable().unwrap());
+    assert_eq!(store.custody_heads().unwrap().map(|h| h.len()), Some(2));
+    std::fs::remove_dir_all(&dir).ok();
+}

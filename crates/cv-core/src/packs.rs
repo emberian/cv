@@ -402,6 +402,40 @@ impl PackBuilder {
         Ok(span.into_addr(self.pack_id.clone()))
     }
 
+    /// Stream exactly `length` bytes from `input` as one record under `anchor`, hashing as it
+    /// writes: memory stays one copy buffer whatever the record's size.
+    pub fn append_reader(
+        &mut self,
+        anchor: impl Into<String>,
+        input: &mut dyn io::Read,
+        length: u64,
+    ) -> Result<PayloadAddr> {
+        let anchor = anchor.into();
+        let decoded_offset = self.writer.decoded_offset();
+        let mut hasher = blake3::Hasher::new();
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut left = length;
+        while left > 0 {
+            let want = usize::try_from(left.min(buf.len() as u64)).unwrap_or(buf.len());
+            input
+                .read_exact(&mut buf[..want])
+                .with_context(|| format!("reading record {anchor:?} input for pack {}", self.pack_id))?;
+            hasher.update(&buf[..want]);
+            self.writer
+                .write_all(&buf[..want])
+                .with_context(|| format!("writing record {anchor:?} to pack {}", self.pack_id))?;
+            left -= want as u64;
+        }
+        let span = RecordSpan {
+            anchor,
+            decoded_offset,
+            length,
+            blake3_digest: *hasher.finalize().as_bytes(),
+        };
+        self.record_index.insert(span.clone())?;
+        Ok(span.into_addr(self.pack_id.clone()))
+    }
+
     /// Record a settled codec continuation checkpoint at or before the current decoded offset.
     pub fn record_checkpoint(&mut self, checkpoint: CodecCheckpoint) -> Result<()> {
         anyhow::ensure!(

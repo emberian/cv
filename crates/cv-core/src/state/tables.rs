@@ -627,6 +627,7 @@ impl StateStore {
             )));
         }
 
+        let heads_were_fresh = custody_heads_fresh(&tx)?;
         let index_meta_json = serde_json::to_string(&manifest.index_meta)?;
         tx.execute(
             "INSERT INTO pack_manifests(
@@ -652,8 +653,38 @@ impl StateStore {
             rusqlite::params![manifest.min_commit_pos, manifest.max_commit_pos],
         )?;
 
+        // Heads that folded every manifest before this one take it incrementally; heads another
+        // binary left behind are rebuilt from every manifest, this one included.
+        if heads_were_fresh {
+            upsert_custody_heads(&tx, &manifest.pack_id, manifest.min_commit_pos, &manifest.index_meta)?;
+            mark_custody_heads(&tx)?;
+        } else {
+            rebuild_custody_heads(&tx)?;
+        }
+
         tx.commit()?;
         Ok(deleted)
+    }
+
+    /// The newest custody entry of every archived session (`custody_heads`), as stored JSON.
+    /// `None` when the table is absent or its watermark no longer matches `pack_manifests` (a
+    /// store no writable open has converged yet, or one a binary without the table published
+    /// to): the caller then reads `pack_manifests` instead. Read-only and `--frozen` safe.
+    pub fn custody_heads(&self) -> Result<Option<Vec<Value>>, StateError> {
+        let Some(conn) = self.open_readonly()? else {
+            return Ok(Some(Vec::new()));
+        };
+        if !custody_heads_fresh(&conn)? {
+            return Ok(None);
+        }
+        let mut stmt = conn.prepare("SELECT entry_json FROM custody_heads ORDER BY selector")?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.iter()
+            .map(|raw| serde_json::from_str(raw).map_err(StateError::from))
+            .collect::<Result<Vec<_>, _>>()
+            .map(Some)
     }
 
     /// List all published pack manifests ordered by `min_commit_pos`.
@@ -1647,4 +1678,103 @@ fn repack_uuid_v7_key122(key122: u128) -> u128 {
     let rand_a12 = (key122 >> 62) & 0x0fff;
     let rand_b62 = key122 & 0x3fff_ffff_ffff_ffff;
     (ts48 << 80) | (0x7u128 << 76) | (rand_a12 << 64) | (0x2u128 << 62) | rand_b62
+}
+
+/// Upsert the custody entries a manifest's `index_meta.sessions` carries, keeping the one with
+/// the highest commit position per session selector. A manifest without sessions (hub inbox
+/// seals) changes nothing.
+fn upsert_custody_heads(
+    tx: &rusqlite::Transaction<'_>,
+    pack_id: &str,
+    commit_pos: i64,
+    index_meta: &Value,
+) -> Result<(), StateError> {
+    let Some(sessions) = index_meta.get("sessions").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    let physical = index_meta
+        .get("physical_pack_id")
+        .and_then(Value::as_str)
+        .or_else(|| pack_id.split_once("--r").map(|(base, _)| base))
+        .unwrap_or(pack_id);
+    for entry in sessions {
+        let mut entry = entry.clone();
+        if entry["addr"]["pack_id"].as_str().is_some_and(str::is_empty) {
+            entry["addr"]["pack_id"] = json!(physical);
+        }
+        let text = |k: &str| entry.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
+        let Some(harness) = crate::Harness::parse(&text("harness")) else {
+            continue;
+        };
+        let selector = crate::SessionKey {
+            producer: text("producer_id"),
+            profile: text("profile").into(),
+            harness,
+            native_id: text("id"),
+        }
+        .selector();
+        tx.execute(
+            "INSERT INTO custody_heads(selector, commit_pos, pack_id, entry_json) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(selector) DO UPDATE SET
+                 commit_pos = excluded.commit_pos, pack_id = excluded.pack_id, entry_json = excluded.entry_json
+             WHERE excluded.commit_pos >= custody_heads.commit_pos",
+            rusqlite::params![selector, commit_pos, physical, serde_json::to_string(&entry)?],
+        )?;
+    }
+    Ok(())
+}
+
+/// Whether `custody_heads` exists and folds exactly the manifests `pack_manifests` holds now (its
+/// watermark's count and newest position). False on a store without the tables.
+pub(super) fn custody_heads_fresh(conn: &rusqlite::Connection) -> Result<bool, StateError> {
+    let exists: bool = conn.query_row(
+        "SELECT COUNT(*) = 2 FROM sqlite_schema
+         WHERE type = 'table' AND name IN ('custody_heads', 'custody_heads_through')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !exists {
+        return Ok(false);
+    }
+    let fresh: Option<bool> = conn
+        .query_row(
+            "SELECT w.manifests = m.n AND w.through = m.pos
+             FROM custody_heads_through w,
+                  (SELECT COUNT(*) AS n, COALESCE(MAX(min_commit_pos), 0) AS pos FROM pack_manifests) m
+             WHERE w.id = 1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(fresh == Some(true))
+}
+
+/// Record that `custody_heads` folds every manifest `pack_manifests` holds now.
+fn mark_custody_heads(tx: &rusqlite::Transaction<'_>) -> Result<(), StateError> {
+    tx.execute(
+        "INSERT OR REPLACE INTO custody_heads_through(id, manifests, through)
+         SELECT 1, COUNT(*), COALESCE(MAX(min_commit_pos), 0) FROM pack_manifests",
+        [],
+    )?;
+    Ok(())
+}
+
+/// Refold `custody_heads` from every published manifest in commit order, then mark it fresh.
+/// Runs once per upgrade (or after a binary without the table published), never per append.
+pub(super) fn rebuild_custody_heads(tx: &rusqlite::Transaction<'_>) -> Result<(), StateError> {
+    tx.execute("DELETE FROM custody_heads", [])?;
+    let mut stmt = tx.prepare(
+        "SELECT pack_id, min_commit_pos, index_meta_json FROM pack_manifests
+         ORDER BY min_commit_pos ASC, pack_id ASC",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?))
+    })?;
+    for row in rows {
+        let (pack_id, pos, meta) = row?;
+        let meta: Value = serde_json::from_str(&meta).unwrap_or_else(|_| json!({}));
+        upsert_custody_heads(tx, &pack_id, pos, &meta)?;
+    }
+    drop(stmt);
+    mark_custody_heads(tx)
 }

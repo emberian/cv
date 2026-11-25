@@ -848,6 +848,12 @@ pub trait Adapter: Send + Sync {
         false
     }
 
+    /// How `cv archive` may hold one of this harness's session files natively, byte for byte,
+    /// instead of as an IR projection. Default: none; sessions are projected.
+    fn native_custody(&self) -> Option<NativeCustody> {
+        None
+    }
+
     /// A fresh session id in this harness's own spelling. Default: a UUIDv7.
     fn fresh_session_id(&self) -> String {
         uuid::Uuid::now_v7().to_string()
@@ -1173,6 +1179,14 @@ pub fn has_derived_copies(h: Harness) -> bool {
 /// ([`Adapter::has_cold_rewind`]).
 pub fn has_cold_rewind(h: Harness) -> bool {
     rootless(h).is_some_and(|a| a.has_cold_rewind())
+}
+
+/// The form in which a harness's session file is archived natively
+/// ([`Adapter::native_custody`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeCustody {
+    /// Append-only JSONL, held through its last LF; each sync packs only the appended lines.
+    Jsonl,
 }
 
 /// Whether `h`'s adapter writes reshaped selections itself ([`Adapter::writes_selection`]).
