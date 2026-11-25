@@ -17,6 +17,7 @@
 - Distill `--handoff escalate` keeps headings or definitions of reads behind later edits and errors, with `cv cat` pointers.
 - Line-range blame follows unique carved blocks and edited declarations into their parent files and reports the relocation evidence.
 - Line-range blame follows blocks split out of files deleted in the same commit, and picks the one added hunk covering the queried lines.
+- Carved-block blame reads Rust lifetimes correctly and tells apart trait impls, and their methods, for different types.
 - Session overviews count validation repairs and immediate verbatim reversals separately, with message indices for each recent episode.
 - OpenSession preserves unknown block types, message kinds, and nested fields through export and reports opaque content in read coverage.
 - Prune accepts parent-scoped `--agent`, summarizes command outcomes, stashes stale Edit and Write arguments for `cat --input`, and estimates cache break-even.

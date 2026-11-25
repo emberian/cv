@@ -9,7 +9,7 @@ use std::sync::LazyLock;
 static HEADER: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(concat!(
         r"^\s*(?:(?:pub(?:\([^)]*\))?|async|unsafe|const|export|abstract|public|private|static)\s+)*",
-        r"(fn|def|func|struct|enum|class|trait|impl)(?:<[^>]+>)?\s+(?:\([^)]*\)\s*)?(\w+)\b"
+        r"(fn|def|func|struct|enum|class|trait|impl)(?:<(?:[^<>]|<[^<>]*>)+>)?\s+(?:\([^)]*\)\s*)?(\w+)\b"
     ))
     .unwrap()
 });
@@ -26,21 +26,93 @@ fn hunk(line: &str) -> Option<(Range<usize>, Range<usize>)> {
 }
 
 struct Item<'a> {
-    name: &'a str,
+    key: String,
     kind: &'a str,
     lines: Range<usize>,
     body: String,
 }
 
-// Ignore braces in ordinary quoted literals and line comments. An unclosed or
-// unsupported declaration supplies no candidate.
-static BRACES: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#""(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|//.*|/\*[\s\S]*?\*/|[{};]"#).unwrap());
+/// The text from `s`'s start through its balanced `<…>` run, or `None` when unbalanced.
+fn balanced_angles(s: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    for (i, c) in s.char_indices() {
+        match c {
+            '<' => depth += 1,
+            '>' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            _ => (),
+        }
+    }
+    None
+}
 
-fn item<'a>(lines: &[&'a str], start: usize, caps: regex::Captures<'a>) -> Option<Item<'a>> {
+/// The last `::` segment of a path, generics kept but whitespace dropped (`fmt::Display` →
+/// `Display`, `From< A >` → `From<A>`).
+fn last_segment(path: &str) -> String {
+    let compact: String = path.split_whitespace().collect();
+    let head = compact.find('<').unwrap_or(compact.len());
+    let start = compact[..head].rfind("::").map_or(0, |i| i + 2);
+    compact[start..].to_owned()
+}
+
+/// What identifies a declaration among its siblings: the name, or for an `impl` its trait and
+/// self type (`Display for Widget`), or the bare self type of an inherent `impl`. Two types
+/// implementing one trait are different items.
+fn decl_key(line: &str, caps: &regex::Captures<'_>) -> Option<String> {
+    let kind = caps.get(1)?;
+    if kind.as_str() != "impl" {
+        return Some(caps.get(2)?.as_str().to_owned());
+    }
+    let mut rest = line[kind.end()..].trim_start();
+    if rest.starts_with('<') {
+        rest = rest[balanced_angles(rest)?..].trim_start();
+    }
+    let end = [rest.find('{'), rest.find(" where ")]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(rest.len());
+    let rest = rest[..end].trim().trim_start_matches('!');
+    let self_type = |t: &str| {
+        let t = last_segment(t);
+        let base = t.find('<').unwrap_or(t.len());
+        t[..base].to_owned()
+    };
+    Some(match rest.split_once(" for ") {
+        Some((tr, ty)) => format!("{} for {}", last_segment(tr), self_type(ty)),
+        None => self_type(rest),
+    })
+}
+
+/// Character literals, strictly: one character or one escape. A Rust lifetime (`'a`,
+/// `'static`, `'_`) is not one, so `<'a, 'b>` never pairs its quotes across the signature.
+const CHAR_LITERAL: &str = r"'(?:\\(?:x[0-9a-fA-F]{2}|u\{[0-9a-fA-F_]{1,6}\}|.)|[^'\\\n])'";
+
+/// Ignore braces in ordinary quoted literals and comments. Rust uses `'` only for characters
+/// and lifetimes; other languages also quote whole strings with it, on one line. An unclosed
+/// or unsupported declaration supplies no candidate.
+static BRACES_RUST: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(&format!(
+        r#""(?:\\.|[^"\\])*"|{CHAR_LITERAL}|//.*|/\*[\s\S]*?\*/|[{{}};]"#
+    ))
+    .unwrap()
+});
+static BRACES: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(&format!(
+        r#""(?:\\.|[^"\\])*"|{CHAR_LITERAL}|'(?:\\.|[^'\\\n])*'|//.*|/\*[\s\S]*?\*/|[{{}};]"#
+    ))
+    .unwrap()
+});
+
+fn item<'a>(lines: &[&'a str], start: usize, caps: regex::Captures<'a>, rust: bool) -> Option<Item<'a>> {
     let kind = caps.get(1)?.as_str();
-    let name = caps.get(2)?.as_str();
     let header = lines[start];
+    let key = decl_key(header, &caps)?;
+    let braces = if rust { &*BRACES_RUST } else { &*BRACES };
     let (end, body) = if matches!(&caps[1], "def" | "class") && header.contains(':') && !header.contains('{') {
         let indent = header.len() - header.trim_start().len();
         let mut tail = lines[start + 1..]
@@ -67,7 +139,7 @@ fn item<'a>(lines: &[&'a str], start: usize, caps: regex::Captures<'a>) -> Optio
                 return None;
             }
             let mut from = 0;
-            for m in BRACES.find_iter(line) {
+            for m in braces.find_iter(line) {
                 match m.as_str() {
                     "{" => {
                         if depth == 0 {
@@ -95,16 +167,55 @@ fn item<'a>(lines: &[&'a str], start: usize, caps: regex::Captures<'a>) -> Optio
         (end?, body)
     };
     Some(Item {
-        name,
+        key,
         kind,
         lines: start..end,
         body: body.trim().to_owned(),
     })
 }
 
-// Token boundaries survive formatting changes. Quoted strings retain their whitespace.
-static TOKEN: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#""(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\w+|::|->|=>|==|!=|<=|>=|&&|\|\||\S"#).unwrap());
+/// The `impl`, `trait` and `class` blocks of a file: their lines and keys.
+fn containers(lines: &[&str], rust: bool) -> Vec<(Range<usize>, String)> {
+    lines
+        .iter()
+        .enumerate()
+        .filter_map(|(i, line)| {
+            let caps = HEADER.captures(line)?;
+            if !matches!(caps.get(1)?.as_str(), "impl" | "trait" | "class") {
+                return None;
+            }
+            let it = item(lines, i, caps, rust)?;
+            Some((it.lines, it.key))
+        })
+        .collect()
+}
+
+/// `key` qualified by the innermost container strictly around line `at`, so the `fmt` of
+/// `Display for Widget` and the `fmt` of `Display for Gadget` are different items.
+fn qualify(containers: &[(Range<usize>, String)], at: usize, key: &str) -> String {
+    containers
+        .iter()
+        .filter(|(r, _)| r.start < at && at < r.end)
+        .min_by_key(|(r, _)| r.len())
+        .map_or_else(|| key.to_owned(), |(_, outer)| format!("{outer}::{key}"))
+}
+
+// Token boundaries survive formatting changes. Quoted strings and character literals retain
+// their whitespace; a lifetime is a `'` token and a word.
+static TOKEN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(&format!(
+        r#""(?:\\.|[^"\\])*"|{CHAR_LITERAL}|\w+|::|->|=>|==|!=|<=|>=|&&|\|\||\S"#
+    ))
+    .unwrap()
+});
+
+/// Bodies whose token counts differ by more than this factor are never similar enough: the
+/// check skips the O(n·m) similarity measure for them.
+const MAX_TOKEN_RATIO: usize = 3;
+
+fn is_rust(path: &str) -> bool {
+    path.ends_with(".rs")
+}
 
 fn tokens(text: &str) -> Vec<&str> {
     TOKEN.find_iter(text).map(|m| m.as_str()).collect()
@@ -191,9 +302,12 @@ pub(super) fn find(root: &Path, sha: &str, diff: &str, query: (usize, usize)) ->
         && block.iter().any(|l| l.chars().any(char::is_alphanumeric));
     let enclosing = (0..=range.start)
         .rev()
-        .filter_map(|i| item(&lines, i, HEADER.captures(lines[i])?))
+        .filter_map(|i| item(&lines, i, HEADER.captures(lines[i])?, is_rust(path)))
         .find(|it| it.lines.end >= range.end);
     let target_tokens = enclosing.as_ref().map(|it| tokens(&it.body)).unwrap_or_default();
+    let target_key = enclosing
+        .as_ref()
+        .map(|it| qualify(&containers(&lines, is_rust(path)), it.lines.start, &it.key));
     let mut exact = Vec::new();
     let mut similar = Vec::new();
     let mut names = 0;
@@ -222,14 +336,24 @@ pub(super) fn find(root: &Path, sha: &str, diff: &str, query: (usize, usize)) ->
                 }
             }
         }
-        if let Some(target) = &enclosing {
+        if let (Some(target), Some(target_key)) = (&enclosing, &target_key) {
+            let outer = containers(&old_lines, is_rust(old));
             for (i, line) in old_lines.iter().enumerate() {
                 let Some(caps) = HEADER.captures(line) else { continue };
                 if caps.get(1).is_none_or(|k| k.as_str() != target.kind) {
                     continue;
                 }
-                let same = caps.get(2).is_some_and(|n| n.as_str() == target.name);
-                if same {
+                let Some(bare) = decl_key(line, &caps) else { continue };
+                let same = qualify(&outer, i, &bare) == *target_key;
+                // An `impl` is identified by its key, and a method by its container's, so another
+                // key (`Display for Gadget`, `Display for Gadget::fmt`) is never the ancestor.
+                // Inherent `impl Foo` blocks repeat legitimately; body similarity decides
+                // among them, and two similar ones refuse below.
+                let is_impl = target.kind == "impl";
+                if !same && (is_impl || bare == target.key) {
+                    continue;
+                }
+                if same && !is_impl {
                     names += 1;
                     if names > 1 {
                         return Ok(None);
@@ -238,13 +362,20 @@ pub(super) fn find(root: &Path, sha: &str, diff: &str, query: (usize, usize)) ->
                 if similar.len() >= 2 {
                     continue;
                 }
-                let Some(found) = item(&old_lines, i, caps) else {
+                let Some(found) = item(&old_lines, i, caps, is_rust(old)) else {
                     continue;
                 };
                 if target.body.is_empty() || found.body.is_empty() {
                     continue;
                 }
                 let found_tokens = tokens(&found.body);
+                let (short, long) = (
+                    target_tokens.len().min(found_tokens.len()),
+                    target_tokens.len().max(found_tokens.len()),
+                );
+                if long > short.saturating_mul(MAX_TOKEN_RATIO) {
+                    continue;
+                }
                 let normalized_len = |tokens: &[&str]| tokens.iter().map(|t| t.chars().count()).sum::<usize>();
                 let threshold = if normalized_len(&target_tokens).min(normalized_len(&found_tokens)) < 20 {
                     0.95
@@ -287,12 +418,13 @@ pub(super) fn find(root: &Path, sha: &str, diff: &str, query: (usize, usize)) ->
         .filter_map(hunk)
         .any(|(r, _)| r.start <= candidate.range.start && r.end >= candidate.range.end);
     // Moving the same declaration elsewhere within the source file can leave a
-    // deletion hunk too. Its re-addition makes the cross-file ancestry uncertain.
+    // deletion hunk too. Its re-addition makes the cross-file ancestry uncertain. Added lines
+    // carry no enclosing block, so the unqualified key decides (refusing more, never less).
     let retained = patch.lines().filter_map(|line| line.strip_prefix('+')).any(|line| {
         enclosing.as_ref().is_some_and(|target| {
             HEADER
                 .captures(line)
-                .is_some_and(|c| &c[1] == target.kind && &c[2] == target.name)
+                .is_some_and(|c| &c[1] == target.kind && decl_key(line, &c).is_some_and(|k| k == target.key))
         })
     });
     if !removed || retained {
@@ -309,7 +441,42 @@ pub(super) fn find(root: &Path, sha: &str, diff: &str, query: (usize, usize)) ->
 
 #[cfg(test)]
 mod tests {
-    use super::creation_hunk;
+    use super::{creation_hunk, decl_key, item, tokens, HEADER};
+
+    fn first_item(src: &str, rust: bool) -> Option<(String, std::ops::Range<usize>, String)> {
+        let lines: Vec<&str> = src.lines().collect();
+        let it = item(&lines, 0, HEADER.captures(lines[0])?, rust)?;
+        Some((it.key, it.lines, it.body))
+    }
+
+    #[test]
+    fn lifetimes_never_pair_into_a_character_literal() {
+        // #tooth `'a … 'b` once read as one quoted literal, swallowing the `(` … `{` between them.
+        let pick = "let pick = |s: &'a str| if s.is_empty() { '-' } else { '{' };";
+        let src = format!("pub fn merge<'a, 'b>(left: &'a str, right: &'b str) -> (&'a str, &'b str) {{\n    {pick}\n    (left, right)\n}}\nfn next() {{}}\n");
+        let (key, lines, body) = first_item(&src, true).unwrap();
+        assert_eq!((key.as_str(), lines), ("merge", 0..4));
+        assert_eq!(body, format!("{pick}\n    (left, right)"));
+        let toks = tokens("fn f<'a>(x: &'a str) -> char { '\\u{7b}' }");
+        assert!(toks.contains(&"'\\u{7b}'") && toks.contains(&"a"), "{toks:?}");
+        // Elsewhere a single-quoted string still hides its braces.
+        let js = "class F {\n  s = '}{';\n}\n";
+        assert_eq!(first_item(js, false).unwrap().1, 0..3);
+    }
+
+    #[test]
+    fn impl_keys_name_the_trait_and_the_self_type() {
+        // #tooth Two types implementing one trait were one name (`Display`), so either refused.
+        let key = |line: &str| decl_key(line, &HEADER.captures(line).unwrap()).unwrap();
+        assert_eq!(key("impl fmt::Display for Widget {"), "Display for Widget");
+        assert_eq!(
+            key("impl<'a, T: Into<String>> From<T> for Wrapper<'a> where T: Clone {"),
+            "From<T> for Wrapper"
+        );
+        assert_eq!(key("impl Widget {"), "Widget");
+        assert_eq!(key("impl<T> crate::Gadget<T> {"), "Gadget");
+        assert_eq!(key("pub fn widget() {"), "widget");
+    }
 
     #[test]
     fn creation_hunk_selects_the_one_addition_covering_the_query() {

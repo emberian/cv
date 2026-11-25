@@ -534,3 +534,103 @@ fn blame_follows_a_split_whose_source_file_was_deleted() {
     assert_eq!(source["method"], "exact_block");
     assert_eq!(commits[1]["matches"][0]["session_id"], "S-mono", "{report}");
 }
+
+/// One carve: `donor` (written by session `S-donor`) loses `moved` in commit 2, which creates
+/// `dest` holding a lightly edited copy (written by `S-dest`). Returns the blame of `dest`
+/// lines `range` and the two commit shas.
+fn carve_scene(name: &str, donor: (&str, &str, &str), dest: (&str, &str), range: &str) -> (Value, String, String) {
+    let w = World::in_process(name, cv_core::env::Env::enter_isolated);
+    let repo = w.base.canonicalize().unwrap().join("project");
+    fs::create_dir(&repo).unwrap();
+    git(&repo, &["init", "-q"], None);
+    git(&repo, &["config", "user.name", "Tester"], None);
+    git(&repo, &["config", "user.email", "tester@example.invalid"], None);
+    git(&repo, &["config", "commit.gpgsign", "false"], None);
+    let (donor_path, before, after) = donor;
+    fs::write(repo.join(donor_path), before).unwrap();
+    git(&repo, &["add", "."], None);
+    git(&repo, &["commit", "-qm", "donor"], Some(COMMIT1_TS));
+    let first = git(&repo, &["rev-parse", "HEAD"], None);
+    fs::write(repo.join(donor_path), after).unwrap();
+    fs::write(repo.join(dest.0), dest.1).unwrap();
+    git(&repo, &["add", "."], None);
+    git(&repo, &["commit", "-qm", "carve"], Some(COMMIT2_TS));
+    let second = git(&repo, &["rev-parse", "HEAD"], None);
+    let refs: Vec<_> = [("S-donor", donor_path, before), ("S-dest", dest.0, dest.1)]
+        .into_iter()
+        .map(|(id, path, body)| {
+            let transcript = w.write_session(id, &[serde_json::json!({"type":"assistant","uuid":format!("msg-{id}"),"sessionId":id,"cwd":repo,
+                "message":{"role":"assistant","content":[{"type":"tool_use","id":"write","name":"Write","input":{"file_path":repo.join(path),"content":body}}]}})]);
+            let r = cv_core::SessionRef::new(id, cv_core::Harness::Claude, transcript);
+            cv_core::events::ingest_ref(&r).unwrap();
+            r
+        })
+        .collect();
+    cv_core::catalog::sync(&refs);
+    let (out, err) = cv(&w, &repo, &["blame", dest.0, "-L", range, "--json"]);
+    let report = serde_json::from_str::<Value>(&out).unwrap_or_else(|_| panic!("{out}\n{err}"));
+    (report, first, second)
+}
+
+fn assert_carved(report: &Value, first: &str, second: &str, path: &str, lines: [u64; 2]) {
+    let commits = report["commits"].as_array().unwrap();
+    assert_eq!(commits.len(), 2, "{report:#}");
+    assert_eq!(commits[0]["sha"], second);
+    assert_eq!(commits[0]["matches"][0]["session_id"], "S-dest", "{report:#}");
+    assert_eq!(commits[1]["sha"], first, "{report:#}");
+    assert_eq!(commits[1]["matches"][0]["session_id"], "S-donor", "{report:#}");
+    let source = &commits[1]["relocated_from"];
+    assert_eq!(source["method"], "item_body", "{report:#}");
+    assert_eq!(source["path"], path);
+    assert_eq!(source["lines"], serde_json::json!(lines), "{report:#}");
+}
+
+#[test]
+fn blame_carves_a_function_with_several_lifetimes_out_of_a_deleted_file() {
+    // #tooth The closure line pairs `'a …'-'` and `'…'+'` as two quoted literals under a
+    // lifetime-blind scan, which ends `merge` early and leaves the carve no item to match.
+    let merge = |sep: &str| {
+        format!(
+            "pub fn merge<'a, 'b>(left: &'a str, right: &'b str) -> (&'a str, &'b str) {{\n    \
+             let pick = |s: &'a str| if s.is_empty() {{ '-' }} else {{ '+' }};\n    \
+             let joined = format!(\"{{}}{sep}{{}}\", pick(left), pick(right));\n    \
+             (left, right)\n}}\n"
+        )
+    };
+    let keep = "pub fn keep() -> u8 {\n    7\n}\n";
+    let (report, first, second) = carve_scene(
+        "blame-carve-lifetimes",
+        ("text.rs", &format!("{keep}{}", merge(",")), keep),
+        ("merge.rs", &merge(";")),
+        "3",
+    );
+    assert_carved(&report, &first, &second, "text.rs", [4, 8]);
+}
+
+#[test]
+fn blame_carves_one_trait_impl_while_another_type_keeps_the_same_trait() {
+    // #tooth `impl fmt::Display for Widget` and `… for Gadget` once shared one name, and so did
+    // their two `fmt` methods, so the second declaration made the carve refuse as ambiguous.
+    let widget = |unit: &str| {
+        format!(
+            "impl fmt::Display for Widget {{\n    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {{\n        \
+             write!(f, \"widget {{}} {unit}\", self.width)\n    }}\n}}\n"
+        )
+    };
+    let gadget =
+        "impl fmt::Display for Gadget {\n    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {\n        \
+                  write!(f, \"gadget {} volts\", self.charge)\n    }\n}\n";
+    let head = "use std::fmt;\npub struct Widget { width: u32 }\npub struct Gadget { charge: u32 }\n";
+    let (report, first, second) = carve_scene(
+        "blame-carve-impls",
+        (
+            "shapes.rs",
+            &format!("{head}{}{gadget}", widget("mm")),
+            &format!("{head}{gadget}"),
+        ),
+        ("widget.rs", &widget("cm")),
+        "3",
+    );
+    // The innermost item is `Widget`'s `fmt` (lines 5-7 of its impl at 4-8), not `Gadget`'s at 10-12.
+    assert_carved(&report, &first, &second, "shapes.rs", [5, 7]);
+}
